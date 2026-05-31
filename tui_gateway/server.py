@@ -786,11 +786,19 @@ def _clear_pending(sid: str | None = None) -> None:
     None, every pending prompt is released (used during shutdown).
     """
     # Same lock as _respond / _block so releasing a prompt can't race the
-    # timeout-expiry decision.
+    # timeout-expiry decision. Pop _pending (and its payload) while holding the
+    # lock, not just _answers/ev — otherwise a user response that lands before
+    # the blocked thread runs its finally can acquire the lock, find the entry
+    # still pending, overwrite the empty answer, and return ok, reviving a
+    # prompt that interrupt/shutdown meant to cancel. Removing it makes a later
+    # _respond get 4009 instead. _block's own finally pop is then a harmless
+    # no-op (pop(rid, None)), and it still returns the empty answer we staged.
     with _pending_lock:
         for rid, (owner_sid, ev) in list(_pending.items()):
             if sid is None or owner_sid == sid:
                 _answers[rid] = ""
+                _pending.pop(rid, None)
+                _pending_prompt_payloads.pop(rid, None)
                 ev.set()
 
 

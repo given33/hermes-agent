@@ -2992,6 +2992,47 @@ def test_clear_pending_without_sid_clears_all():
             server._answers.pop(key, None)
 
 
+def test_clear_pending_removes_entry_so_late_respond_cannot_revive():
+    """_clear_pending must POP _pending, not just set the empty answer.
+
+    Otherwise a user response that lands after interrupt/shutdown cleared the
+    prompt can acquire _pending_lock, find the still-pending entry, overwrite
+    the empty answer with real input, and return ok — reviving a prompt that
+    was meant to be cancelled. (Copilot review on PR #35987.)
+    """
+    ev = threading.Event()
+    server._pending["rid-clear"] = ("sid_clear", ev)
+    server._pending_prompt_payloads["rid-clear"] = ("clarify.request", {})
+    server._answers.pop("rid-clear", None)
+    try:
+        server._clear_pending("sid_clear")
+
+        # Entry must be gone from _pending (and its payload), with the empty
+        # answer staged and the blocked thread released.
+        assert ev.is_set()
+        assert server._answers.get("rid-clear") == ""
+        assert "rid-clear" not in server._pending
+        assert "rid-clear" not in server._pending_prompt_payloads
+
+        # A late response for the cleared request must now be rejected (4009),
+        # NOT silently accepted (which would overwrite the empty answer).
+        resp = server.handle_request(
+            {
+                "id": "x",
+                "method": "clarify.respond",
+                "params": {"request_id": "rid-clear", "answer": "too late"},
+            }
+        )
+        assert resp and resp.get("error"), f"late respond should 4009, got {resp!r}"
+        assert resp["error"].get("code") == 4009
+        # The empty answer staged by the clear must survive intact.
+        assert server._answers.get("rid-clear") == ""
+    finally:
+        server._pending.pop("rid-clear", None)
+        server._pending_prompt_payloads.pop("rid-clear", None)
+        server._answers.pop("rid-clear", None)
+
+
 def test_respond_unpacks_sid_tuple_correctly():
     """After the (sid, Event) tuple change, _respond must still work."""
     ev = threading.Event()

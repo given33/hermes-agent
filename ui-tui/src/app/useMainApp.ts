@@ -609,18 +609,22 @@ export function useMainApp(gw: GatewayClient) {
             tools: [buildToolTrailLine('clarify', clarify.question)]
           })
           appendMessage({ role: 'user', text: answer })
-          patchUiState({ status: 'running…' })
         } else {
           sys('prompt cancelled')
         }
 
-        // Guard the clear by request id: _respond() sets the server event
-        // (unblocking the agent) BEFORE this RPC response is delivered, so the
-        // agent can emit a fresh clarify.request before this callback runs.
-        // Clearing unconditionally would wipe that new prompt. (Same guard the
-        // failure path above uses.)
+        // Guard BOTH the overlay clear AND the status update by request id:
+        // _respond() sets the server event (unblocking the agent) BEFORE this
+        // RPC response is delivered, so the agent can emit a fresh
+        // clarify.request before this callback runs. Clearing the overlay would
+        // wipe that new prompt, and setting status to 'running…' would clobber
+        // its prompt-specific status. Only touch UI for the request we own.
+        // (Same guard the failure path above uses.)
         if (getOverlayState().clarify?.requestId === clarify.requestId) {
           patchOverlayState({ clarify: null })
+          if (answer) {
+            patchUiState({ status: 'running…' })
+          }
         }
       })
     },
