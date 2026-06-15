@@ -91,7 +91,7 @@ jobs:
       - name: Upload installer artifact
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
-          name: Hermes-Setup
+          name: hermes-installer-${{ runner.os }}-${{ hashFiles('package-lock.json', 'apps/bootstrap-installer/**', '!apps/bootstrap-installer/src-tauri/target/**') }}
           path: Hermes-Setup.exe
           if-no-files-found: error
 
@@ -112,7 +112,7 @@ jobs:
       - name: Download installer artifact
         uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
         with:
-          name: Hermes-Setup
+          name: hermes-installer-${{ runner.os }}-${{ hashFiles('package-lock.json', 'apps/bootstrap-installer/**', '!apps/bootstrap-installer/src-tauri/target/**') }}
 
       - name: Install AutoHotkey v2
         shell: pwsh
@@ -205,7 +205,7 @@ jobs:
           '@
           $ahk | Out-File -Encoding utf8 "capture-button.ahk"
 
-          $ahkProc = Start-Process -FilePath "$env:RUNNER_TEMP\AutoHotkey64.exe" `
+          $ahkProc = Start-Process AutoHotkey64
             -ArgumentList '"capture-button.ahk"' -PassThru -NoNewWindow `
             -RedirectStandardOutput ahk-stdout.log -RedirectStandardError ahk-stderr.log
 
