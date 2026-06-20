@@ -79,7 +79,7 @@ ClickCenterOfImageInWindow(winTitle, imageFile, timeoutMs := 10000, intervalMs :
         ToolTip(Format("Searching for button {} in window {}...  {}s left", imageFile, winTitle, timeLeft / 1000))
     }
 
-    throw Error("failed to find button in window.")
+    throw Error(Format("Failed to find button {} in window {}", imageFile, winTitle))
 }
 
 
