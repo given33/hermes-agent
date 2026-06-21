@@ -108,7 +108,7 @@ Log(Format("Window found at x={1} y={2} w={3} h={4}`n", x, y, w, h))
 
 ClickCenterOfImageInWindow(winTitle, "install-button.png")
 
-ClickCenterOfImageInWindow(winTitle, "install-button.png", 1000 * 60 * 8)
+ClickCenterOfImageInWindow(winTitle, "launch-button.png", 1000 * 60 * 8)
 
 
 ; done

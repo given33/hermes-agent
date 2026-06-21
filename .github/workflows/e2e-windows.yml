@@ -253,35 +253,6 @@ jobs:
             } else {
               Write-Host "autohotkey helper exited"
             }
-
-            Add-Type -AssemblyName System.Windows.Forms
-            Add-Type -AssemblyName System.Drawing
-
-            $screens = [System.Windows.Forms.Screen]::AllScreens
-            $top    = ($screens | ForEach-Object { $_.Bounds.Top }    | Measure-Object -Minimum).Minimum
-            $left   = ($screens | ForEach-Object { $_.Bounds.Left }   | Measure-Object -Minimum).Minimum
-            $width  = ($screens | ForEach-Object { $_.Bounds.Right }  | Measure-Object -Maximum).Maximum - $left
-            $height = ($screens | ForEach-Object { $_.Bounds.Bottom } | Measure-Object -Maximum).Maximum - $top
-
-            $bounds = [System.Drawing.Rectangle]::FromLTRB($left, $top, $left + $width, $top + $height)
-            $bitmap = New-Object System.Drawing.Bitmap $bounds.Width, $bounds.Height
-            $graphics = [System.Drawing.Graphics]::FromImage($bitmap)
-            $graphics.CopyFromScreen($bounds.Location, [System.Drawing.Point]::Empty, $bounds.Size)
-
-            New-Item -ItemType Directory -Force -Path screenshots | Out-Null
-            $bitmap.Save("screenshot.png", [System.Drawing.Imaging.ImageFormat]::Png)
-
-            $graphics.Dispose()
-            $bitmap.Dispose()
-
-            # Installer should have exited
-            if ($proc.HasExited) {
-              # TODO check exit code once we add exit code in installer
-              $installerSuccess = $true
-            } else {
-              Write-Host "Installer is still running. Force-killing it."
-              Stop-Process -Id $proc.Id -Force -ErrorAction SilentlyContinue
-            }
           }
 
           finally {
@@ -302,7 +273,15 @@ jobs:
               }
             }
             Write-Host "ffmpeg stopped"
-
+            
+            # Installer should have exited
+            if ($proc.HasExited) {
+              # TODO check exit code once we add exit code in installer
+              $installerSuccess = $true
+            } else {
+              Stop-Process -Id $proc.Id -Force -ErrorAction SilentlyContinue
+              throw "Installer is still running. Install did not succeed."
+            }
             if (-not $installerSuccess) {
               throw "Installer did not exit after autohotkey script finished. Check installer logs!"
             }
