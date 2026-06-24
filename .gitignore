@@ -4,6 +4,8 @@
 /_pycache/
 *.pyc*
 __pycache__/
+act/
+.act-sandbox-agent.*
 .venv/
 .venv
 .vscode/
