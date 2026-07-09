@@ -103,12 +103,15 @@ export function NarrowOverlays() {
       {revealed && (
         <div
           className={cn(
-            'absolute inset-y-0 z-40 flex w-[min(20rem,85vw)] flex-col overflow-hidden bg-(--ui-sidebar-surface-background) shadow-2xl',
+            'absolute inset-y-0 z-40 flex flex-col overflow-hidden bg-(--ui-sidebar-surface-background) shadow-2xl',
             sideOf(revealed) === 'left'
               ? 'left-0 border-r border-(--ui-stroke-secondary)'
               : 'right-0 border-l border-(--ui-stroke-secondary)'
           )}
           onMouseLeave={() => setReveal(current => (current?.pinned ? current : null))}
+          // Match the pane's docked width (sessions ~237px, files its rail
+          // width) instead of a fat fixed 20rem — capped for tiny screens.
+          style={{ width: `min(${(revealed.data as { width?: string } | undefined)?.width ?? '18rem'}, 85vw)` }}
         >
           <ContribBoundary id={revealed.id}>{revealed.render?.()}</ContribBoundary>
         </div>
