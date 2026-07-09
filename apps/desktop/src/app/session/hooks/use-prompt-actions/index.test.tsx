@@ -1,4 +1,4 @@
-import { cleanup, render, waitFor } from '@testing-library/react'
+import { act, cleanup, render, waitFor } from '@testing-library/react'
 import type { MutableRefObject } from 'react'
 import { useEffect, useRef } from 'react'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
@@ -41,6 +41,18 @@ function sessionInfo(overrides: Partial<SessionInfo> = {}): SessionInfo {
     tool_call_count: 0,
     ...overrides
   }
+}
+
+// Wrap render() in act() so the Harness's useEffect (onReady callback +
+// internal state from usePromptActions) flushes synchronously instead of
+// spilling async state updates outside act().
+async function actRender(ui: React.ReactElement) {
+  let result: ReturnType<typeof render>
+  await act(async () => {
+    result = render(ui)
+  })
+
+  return result!
 }
 
 interface HarnessHandle {
@@ -118,10 +130,14 @@ function Harness({
 
   useEffect(() => {
     onReady({
-      cancelRun: actions.cancelRun,
-      restoreToMessage: actions.restoreToMessage,
-      steerPrompt: actions.steerPrompt,
-      submitText: actions.submitText
+      cancelRun: (...args: Parameters<typeof actions.cancelRun>) =>
+        act(async () => actions.cancelRun(...args)) as Promise<void>,
+      restoreToMessage: (...args: Parameters<typeof actions.restoreToMessage>) =>
+        act(async () => actions.restoreToMessage(...args)) as Promise<void>,
+      steerPrompt: (...args: Parameters<typeof actions.steerPrompt>) =>
+        act(async () => actions.steerPrompt(...args)) as Promise<boolean>,
+      submitText: (...args: Parameters<typeof actions.submitText>) =>
+        act(async () => actions.submitText(...args)) as Promise<boolean>
     })
   }, [actions.cancelRun, actions.restoreToMessage, actions.steerPrompt, actions.submitText, onReady])
 
@@ -146,7 +162,9 @@ describe('usePromptActions /title', () => {
     )
 
     let handle: HarnessHandle | null = null
-    render(<Harness onReady={h => (handle = h)} refreshSessions={refreshSessions} requestGateway={requestGateway} />)
+    await actRender(
+      <Harness onReady={h => (handle = h)} refreshSessions={refreshSessions} requestGateway={requestGateway} />
+    )
 
     await handle!.submitText('/title New title')
 
@@ -170,7 +188,9 @@ describe('usePromptActions /title', () => {
     )
 
     let handle: HarnessHandle | null = null
-    render(<Harness onReady={h => (handle = h)} refreshSessions={refreshSessions} requestGateway={requestGateway} />)
+    await actRender(
+      <Harness onReady={h => (handle = h)} refreshSessions={refreshSessions} requestGateway={requestGateway} />
+    )
 
     await handle!.submitText('/title Fresh chat')
 
@@ -188,7 +208,9 @@ describe('usePromptActions /title', () => {
     const requestGateway = vi.fn(async () => ({ output: 'Title: Old title' }) as never)
 
     let handle: HarnessHandle | null = null
-    render(<Harness onReady={h => (handle = h)} refreshSessions={refreshSessions} requestGateway={requestGateway} />)
+    await actRender(
+      <Harness onReady={h => (handle = h)} refreshSessions={refreshSessions} requestGateway={requestGateway} />
+    )
 
     await handle!.submitText('/title')
 
@@ -208,7 +230,9 @@ describe('usePromptActions /title', () => {
     })
 
     let handle: HarnessHandle | null = null
-    render(<Harness onReady={h => (handle = h)} refreshSessions={refreshSessions} requestGateway={requestGateway} />)
+    await actRender(
+      <Harness onReady={h => (handle = h)} refreshSessions={refreshSessions} requestGateway={requestGateway} />
+    )
 
     await handle!.submitText('/title way too long title')
 
@@ -247,7 +271,7 @@ describe('usePromptActions slash.exec dispatch payloads', () => {
     })
 
     let handle: HarnessHandle | null = null
-    render(
+    await actRender(
       <Harness
         onReady={h => (handle = h)}
         onSeedState={s => states.push(s)}
@@ -297,7 +321,7 @@ describe('usePromptActions slash.exec dispatch payloads', () => {
     })
 
     let handle: HarnessHandle | null = null
-    render(
+    await actRender(
       <Harness
         onReady={h => (handle = h)}
         onSeedState={s => states.push(s)}
@@ -335,7 +359,7 @@ describe('usePromptActions slash.exec dispatch payloads', () => {
     const requestGateway = vi.fn(async () => ({}) as never)
 
     let handle: HarnessHandle | null = null
-    render(
+    await actRender(
       <Harness onReady={h => (handle = h)} refreshSessions={async () => undefined} requestGateway={requestGateway} />
     )
 
@@ -365,7 +389,7 @@ describe('usePromptActions desktop slash pickers', () => {
     const requestGateway = vi.fn(async () => ({}) as never)
 
     let handle: HarnessHandle | null = null
-    render(
+    await actRender(
       <Harness
         onReady={h => (handle = h)}
         refreshSessions={async () => undefined}
@@ -385,7 +409,7 @@ describe('usePromptActions desktop slash pickers', () => {
     const requestGateway = vi.fn(async () => ({}) as never)
 
     let handle: HarnessHandle | null = null
-    render(
+    await actRender(
       <Harness
         onReady={h => (handle = h)}
         openMemoryGraph={openMemoryGraph}
@@ -418,7 +442,7 @@ describe('usePromptActions desktop slash pickers', () => {
     })
 
     let handle: HarnessHandle | null = null
-    render(
+    await actRender(
       <Harness onReady={h => (handle = h)} refreshSessions={async () => undefined} requestGateway={requestGateway} />
     )
 
@@ -448,7 +472,7 @@ describe('usePromptActions submit / queue drain semantics', () => {
     const requestGateway = vi.fn(async () => ({}) as never)
 
     let handle: HarnessHandle | null = null
-    render(
+    await actRender(
       <Harness
         onReady={h => (handle = h)}
         onSeedState={s => seeds.push(s)}
@@ -481,7 +505,7 @@ describe('usePromptActions submit / queue drain semantics', () => {
     const requestGateway = vi.fn(async () => ({}) as never)
 
     let handle: HarnessHandle | null = null
-    render(
+    await actRender(
       <Harness
         busyRef={busyRef}
         onReady={h => (handle = h)}
@@ -523,7 +547,7 @@ describe('usePromptActions submit / queue drain semantics', () => {
     })
 
     let handle: HarnessHandle | null = null
-    render(
+    await actRender(
       <Harness
         onReady={h => (handle = h)}
         refreshSessions={async () => undefined}
@@ -567,7 +591,7 @@ describe('usePromptActions submit / queue drain semantics', () => {
     })
 
     let handle: HarnessHandle | null = null
-    render(
+    await actRender(
       <Harness
         onReady={h => (handle = h)}
         onSeedState={s => seeds.push(s)}
@@ -589,7 +613,7 @@ describe('usePromptActions submit / queue drain semantics', () => {
     const requestGateway = vi.fn(async () => ({}) as never)
 
     let handle: HarnessHandle | null = null
-    render(
+    await actRender(
       <Harness
         busyRef={busyRef}
         onReady={h => (handle = h)}
@@ -615,7 +639,7 @@ describe('usePromptActions steerPrompt', () => {
     const requestGateway = vi.fn(async () => ({ status: 'queued' }) as never)
 
     let handle: HarnessHandle | null = null
-    render(
+    await actRender(
       <Harness onReady={h => (handle = h)} refreshSessions={async () => undefined} requestGateway={requestGateway} />
     )
 
@@ -634,7 +658,7 @@ describe('usePromptActions steerPrompt', () => {
     const requestGateway = vi.fn(async () => ({ status: 'rejected' }) as never)
 
     let handle: HarnessHandle | null = null
-    render(
+    await actRender(
       <Harness onReady={h => (handle = h)} refreshSessions={async () => undefined} requestGateway={requestGateway} />
     )
 
@@ -647,7 +671,7 @@ describe('usePromptActions steerPrompt', () => {
     })
 
     let handle: HarnessHandle | null = null
-    render(
+    await actRender(
       <Harness onReady={h => (handle = h)} refreshSessions={async () => undefined} requestGateway={requestGateway} />
     )
 
@@ -658,7 +682,7 @@ describe('usePromptActions steerPrompt', () => {
     const requestGateway = vi.fn(async () => ({ status: 'queued' }) as never)
 
     let handle: HarnessHandle | null = null
-    render(
+    await actRender(
       <Harness onReady={h => (handle = h)} refreshSessions={async () => undefined} requestGateway={requestGateway} />
     )
 
@@ -690,7 +714,7 @@ describe('usePromptActions restoreToMessage', () => {
     let lastState: Record<string, unknown> = {}
 
     let handle: HarnessHandle | null = null
-    render(
+    await actRender(
       <Harness
         onReady={h => (handle = h)}
         onSeedState={state => (lastState = state)}
@@ -725,7 +749,7 @@ describe('usePromptActions restoreToMessage', () => {
     let lastState: Record<string, unknown> = {}
     let handle: HarnessHandle | null = null
 
-    render(
+    await actRender(
       <Harness
         onReady={h => (handle = h)}
         onSeedState={state => (lastState = state)}
@@ -758,7 +782,7 @@ describe('usePromptActions restoreToMessage', () => {
     })
 
     let handle: HarnessHandle | null = null
-    render(
+    await actRender(
       <Harness
         onReady={h => (handle = h)}
         refreshSessions={async () => undefined}
@@ -786,7 +810,7 @@ describe('usePromptActions restoreToMessage', () => {
     const requestGateway = vi.fn(async () => ({}) as never)
 
     let handle: HarnessHandle | null = null
-    render(
+    await actRender(
       <Harness onReady={h => (handle = h)} refreshSessions={async () => undefined} requestGateway={requestGateway} />
     )
 
@@ -801,7 +825,7 @@ describe('usePromptActions restoreToMessage', () => {
 
     let lastState: Record<string, unknown> = {}
     let handle: HarnessHandle | null = null
-    render(
+    await actRender(
       <Harness
         onReady={h => (handle = h)}
         onSeedState={state => (lastState = state)}
@@ -875,7 +899,7 @@ describe('usePromptActions file attachment sync', () => {
     })
 
     let handle: HarnessHandle | null = null
-    render(
+    await actRender(
       <Harness onReady={h => (handle = h)} refreshSessions={async () => undefined} requestGateway={requestGateway} />
     )
 
@@ -929,7 +953,7 @@ describe('usePromptActions file attachment sync', () => {
     })
 
     let handle: HarnessHandle | null = null
-    render(
+    await actRender(
       <Harness onReady={h => (handle = h)} refreshSessions={async () => undefined} requestGateway={requestGateway} />
     )
 
@@ -958,7 +982,7 @@ describe('usePromptActions file attachment sync', () => {
     })
 
     let handle: HarnessHandle | null = null
-    render(
+    await actRender(
       <Harness onReady={h => (handle = h)} refreshSessions={async () => undefined} requestGateway={requestGateway} />
     )
 
@@ -1018,7 +1042,7 @@ describe('usePromptActions eager-upload races', () => {
     })
 
     let handle: HarnessHandle | null = null
-    render(
+    await actRender(
       <Harness onReady={h => (handle = h)} refreshSessions={async () => undefined} requestGateway={requestGateway} />
     )
     await waitFor(() => expect(handle).not.toBeNull())
@@ -1076,7 +1100,7 @@ describe('usePromptActions sleep/wake session recovery', () => {
     })
 
     let handle: HarnessHandle | null = null
-    render(
+    await actRender(
       <Harness
         onReady={h => (handle = h)}
         refreshSessions={async () => undefined}
@@ -1119,7 +1143,7 @@ describe('usePromptActions sleep/wake session recovery', () => {
     })
 
     let handle: HarnessHandle | null = null
-    render(
+    await actRender(
       <Harness
         onReady={h => (handle = h)}
         refreshSessions={async () => undefined}
@@ -1152,7 +1176,7 @@ describe('usePromptActions sleep/wake session recovery', () => {
     })
 
     let handle: HarnessHandle | null = null
-    render(
+    await actRender(
       <Harness
         onReady={h => (handle = h)}
         onSeedState={s => states.push(s)}
@@ -1182,7 +1206,7 @@ describe('usePromptActions sleep/wake session recovery', () => {
     })
 
     let handle: HarnessHandle | null = null
-    render(
+    await actRender(
       <Harness
         onReady={h => (handle = h)}
         refreshSessions={async () => undefined}
@@ -1226,7 +1250,7 @@ describe('usePromptActions sleep/wake session recovery', () => {
     })
 
     let handle: HarnessHandle | null = null
-    render(
+    await actRender(
       <Harness
         onReady={h => (handle = h)}
         refreshSessions={async () => undefined}
@@ -1266,7 +1290,7 @@ describe('usePromptActions sleep/wake session recovery', () => {
     })
 
     let handle: HarnessHandle | null = null
-    render(
+    await actRender(
       <Harness
         activeSessionId={null}
         createBackendSessionForSend={createBackendSessionForSend}
@@ -1297,7 +1321,7 @@ describe('usePromptActions sleep/wake session recovery', () => {
     })
 
     let handle: HarnessHandle | null = null
-    render(
+    await actRender(
       <Harness
         activeSessionId={null}
         createBackendSessionForSend={createBackendSessionForSend}
@@ -1353,7 +1377,7 @@ describe('usePromptActions eager attachment upload (drop-time)', () => {
       { id: 'file:devis', kind: 'file', label: 'DEVIS_signed.pdf', path: '/Users/mahmoud/Downloads/DEVIS_signed.pdf' }
     ])
 
-    render(
+    await actRender(
       <Harness onReady={() => undefined} refreshSessions={async () => undefined} requestGateway={requestGateway} />
     )
 
@@ -1383,7 +1407,7 @@ describe('usePromptActions eager attachment upload (drop-time)', () => {
 
     $composerAttachments.set([{ id: 'file:x', kind: 'file', label: 'x.pdf', path: '/abs/x.pdf' }])
 
-    render(
+    await actRender(
       <Harness onReady={() => undefined} refreshSessions={async () => undefined} requestGateway={requestGateway} />
     )
 
@@ -1407,7 +1431,7 @@ describe('usePromptActions eager attachment upload (drop-time)', () => {
       }
     ])
 
-    render(
+    await actRender(
       <Harness onReady={() => undefined} refreshSessions={async () => undefined} requestGateway={requestGateway} />
     )
 
