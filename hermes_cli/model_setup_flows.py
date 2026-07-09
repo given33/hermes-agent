@@ -2563,11 +2563,17 @@ def _model_flow_api_key_provider(config, provider_id, current_model=""):
         if existing_key:
             break
 
-    existing_key, abort = _prompt_api_key(
-        pconfig, existing_key, provider_id=provider_id
-    )
-    if abort:
-        return
+    if provider_id == "ollama":
+        # Local Ollama servers are unauthenticated — there is no key to
+        # prompt for. The runtime substitutes a placeholder bearer; a key
+        # for a reverse-proxied server can be set via model.api_key.
+        pass
+    else:
+        existing_key, abort = _prompt_api_key(
+            pconfig, existing_key, provider_id=provider_id
+        )
+        if abort:
+            return
 
     # Gemini free-tier gate: free-tier daily quotas (<= 250 RPD for Flash)
     # are exhausted in a handful of agent turns, so refuse to wire up the
@@ -2659,13 +2665,17 @@ def _model_flow_api_key_provider(config, provider_id, current_model=""):
         except (KeyboardInterrupt, EOFError):
             print()
             override = ""
-        if override and base_url_env:
+        if override:
             if not override.startswith(("http://", "https://")):
                 print(
                     "  Invalid URL — must start with http:// or https://. Keeping current value."
                 )
-            else:
+            elif base_url_env:
                 save_env_value(base_url_env, override)
+                effective_base = override
+            else:
+                # No env var for this provider (e.g. ollama): the override
+                # still takes effect via model.base_url, written below.
                 effective_base = override
 
     # Model selection — resolution order:
@@ -2690,6 +2700,15 @@ def _model_flow_api_key_provider(config, provider_id, current_model=""):
             model_list = []
         if model_list:
             print(f"  Found {len(model_list)} model(s) from LM Studio")
+    elif provider_id == "ollama":
+        from hermes_cli.models import fetch_ollama_local_models
+
+        model_list = fetch_ollama_local_models(base_url=effective_base, timeout=3.0)
+        if model_list:
+            print(f"  Found {len(model_list)} installed model(s) on the Ollama server")
+        else:
+            print(f"  No models found — is Ollama running at {effective_base}?")
+            print("  Pull one first (e.g. `ollama pull qwen3:8b`) or enter a name below.")
     elif provider_id == "ollama-cloud":
         from hermes_cli.models import fetch_ollama_cloud_models
 
