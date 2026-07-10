@@ -15432,6 +15432,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                         continue
                     try:
                         await self._inject_watch_notification(synth_text, evt)
+                        from tools.async_delegation import mark_completion_delivered
+                        mark_completion_delivered(str(evt.get("delegation_id") or ""))
                     except Exception as e:
                         logger.error("Async delegation injection error: %s", e)
             except Exception as e:
