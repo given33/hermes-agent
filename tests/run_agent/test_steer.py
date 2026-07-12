@@ -35,6 +35,10 @@ def _bare_agent() -> AIAgent:
     agent._active_children_lock = threading.Lock()
     agent._tool_worker_threads = None
     agent._tool_worker_threads_lock = None
+    agent._current_streamed_reasoning_text = ""
+    agent._current_streamed_assistant_text = ""
+    agent._stream_needs_break = False
+    agent._strip_think_blocks = lambda content: content
     agent.quiet_mode = True
     agent.api_mode = "chat_completions"
     return agent
@@ -216,6 +220,28 @@ class TestActiveTurnRedirect:
         assert agent._pending_redirect is None
         assert agent._pending_steer == "also check migrations"
         assert agent._interrupt_requested is False
+
+
+class TestActiveTurnRedirectCheckpoint:
+    def test_assistant_tail_puts_correction_last(self):
+        from agent.conversation_loop import _apply_active_turn_redirect
+
+        agent = _bare_agent()
+        agent._current_streamed_reasoning_text = "Shown reasoning."
+        agent._current_streamed_assistant_text = "Visible draft."
+        messages = [
+            {"role": "user", "content": "start"},
+            {"role": "assistant", "content": "committed assistant item"},
+        ]
+
+        _apply_active_turn_redirect(agent, messages, "Use Postgres instead.")
+
+        assert messages[-1]["role"] == "user"
+        assert messages[-1]["content"].endswith("Use Postgres instead.")
+        assert "committed assistant item" not in messages
+        assert "Shown reasoning." in messages[-1]["content"]
+        assert "Visible draft." in messages[-1]["content"]
+        assert "Context from the interrupted assistant response" in messages[-1]["content"]
 
 
 class TestSteerInjection:

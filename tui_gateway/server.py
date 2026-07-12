@@ -5092,7 +5092,8 @@ def _handle_busy_submit(rid, sid: str, session: dict, text: Any, transport: Any)
     """
     mode = _load_busy_input_mode()
     agent = session.get("agent")
-    if mode == "steer" and agent is not None and hasattr(agent, "steer"):
+    text = _coerce_message_text(text).strip()
+    if mode == "steer" and agent is not None and hasattr(agent, "steer") and text:
         try:
             if agent.steer(text):
                 session["last_active"] = time.time()
@@ -5101,6 +5102,7 @@ def _handle_busy_submit(rid, sid: str, session: dict, text: Any, transport: Any)
             pass  # fall through to queue
     if (
         mode == "interrupt"
+        and text
         and agent is not None
         and getattr(agent, "_supports_active_turn_redirect", False) is True
         and hasattr(agent, "redirect")

@@ -115,6 +115,29 @@ def test_busy_steer_mode_falls_back_to_queue_when_rejected(monkeypatch):
     assert session["queued_prompt"]["text"] == "nudge"
 
 
+def test_busy_interrupt_mode_normalizes_rich_text_before_redirect(monkeypatch):
+    monkeypatch.setattr(server, "_load_busy_input_mode", lambda: "interrupt")
+    seen = []
+    agent = types.SimpleNamespace(
+        _supports_active_turn_redirect=True,
+        redirect=lambda text: seen.append(text) or True,
+        interrupt=lambda *a, **k: None,
+    )
+    session = _session(agent=agent)
+
+    resp = server._handle_busy_submit(
+        "r1",
+        "sid",
+        session,
+        [{"type": "text", "text": "  redirect me  "}],
+        "ws-1",
+    )
+
+    assert resp["result"]["status"] == "redirected"
+    assert seen == ["redirect me"]
+    assert session.get("queued_prompt") is None
+
+
 # ── _drain_queued_prompt ───────────────────────────────────────────────────
 
 def test_drain_fires_queued_prompt_and_claims_running(monkeypatch):

@@ -112,9 +112,9 @@ def _apply_active_turn_redirect(agent: Any, messages: List[Dict[str, Any]], text
     # correction instead of creating assistant→assistant.
     if messages and messages[-1].get("role") == "assistant":
         correction = (
-            f"{text}\n\n"
             "[Context from the interrupted assistant response]\n"
-            f"{checkpoint}"
+            f"{checkpoint}\n\n"
+            f"{text}"
         )
         messages.append({"role": "user", "content": correction})
     else:
