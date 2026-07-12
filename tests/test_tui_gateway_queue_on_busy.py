@@ -124,18 +124,35 @@ def test_busy_interrupt_mode_normalizes_rich_text_before_redirect(monkeypatch):
         interrupt=lambda *a, **k: None,
     )
     session = _session(agent=agent)
+    rich = [{"type": "text", "text": "  redirect me  "}]
 
     resp = server._handle_busy_submit(
         "r1",
         "sid",
         session,
-        [{"type": "text", "text": "  redirect me  "}],
+        rich,
         "ws-1",
     )
 
     assert resp["result"]["status"] == "redirected"
     assert seen == ["redirect me"]
     assert session.get("queued_prompt") is None
+
+
+def test_busy_queue_fallback_preserves_original_structured_text(monkeypatch):
+    monkeypatch.setattr(server, "_load_busy_input_mode", lambda: "interrupt")
+    rich = [{"type": "text", "text": "  keep me  "}]
+    agent = types.SimpleNamespace(
+        _supports_active_turn_redirect=True,
+        redirect=lambda text: False,
+        interrupt=lambda *a, **k: None,
+    )
+    session = _session(agent=agent)
+
+    resp = server._handle_busy_submit("r1", "sid", session, rich, "ws-1")
+
+    assert resp["result"]["status"] == "queued"
+    assert session["queued_prompt"]["text"] == rich
 
 
 # ── _drain_queued_prompt ───────────────────────────────────────────────────
