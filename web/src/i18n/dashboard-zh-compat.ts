@@ -2,6 +2,11 @@ const EXACT_TRANSLATIONS: Record<string, string> = {
   Files: "文件",
   Channels: "消息渠道",
   Webhooks: "网络钩子",
+  Jobs: "任务",
+  Blueprints: "任务模板",
+  Profile: "执行身份",
+  "All profiles": "所有执行身份",
+  "Loading chat…": "正在加载会话…",
   Pairing: "设备配对",
   System: "系统监控",
   Mcp: "MCP",
@@ -54,6 +59,9 @@ const EXACT_TRANSLATIONS: Record<string, string> = {
   "Auxiliary tasks": "辅助任务",
   "MIXTURE OF AGENTS": "多智能体混合",
   "Mixture of Agents": "多智能体混合",
+  "7d": "7天",
+  "30d": "30天",
+  "90d": "90天",
   CHANGE: "更改",
   Change: "更改",
   CONFIGURE: "配置",
@@ -70,7 +78,22 @@ const EXACT_TRANSLATIONS: Record<string, string> = {
   "Add reference model": "添加参考模型",
   Aggregator: "聚合模型",
   Cancel: "取消",
+  Close: "关闭",
+  Save: "保存",
+  "Saving…": "正在保存…",
+  "Save & enable": "保存并启用",
+  "Save and restart": "保存并重启",
   Config: "配置",
+  "Reset auxiliary models": "重置辅助模型",
+  "Presets appear as models under the Mixture of Agents provider. References produce perspectives; the aggregator is the acting model that answers and calls tools.":
+    "预设会作为多智能体混合提供方下的模型显示。参考模型提供不同视角，聚合模型负责回答并调用工具。",
+  "Default:": "默认：",
+  "Custom endpoint": "自定义端点",
+  "Alibaba Cloud (Coding Plan)": "阿里云（Coding Plan）",
+  "Qwen OAuth (Portal)": "通义千问 OAuth（门户）",
+  "Kimi / Moonshot (China)": "Kimi / Moonshot（中国区）",
+  "MiniMax (OAuth)": "MiniMax（OAuth）",
+  "MiniMax (China)": "MiniMax（中国区）",
   "Token & cost analytics are hidden because the local counts exclude auxiliary calls (compression, vision, web extract ...) and provider retries, so they diverge from your provider bill. Enable dashboard.show_token_analytics in Config to show the local debug estimate anyway.":
     "Token 与费用分析已隐藏，因为本地统计不包含压缩、视觉、网页提取等辅助调用及供应商重试，与实际账单可能不同。可在配置中启用 dashboard.show_token_analytics 查看本地调试估算。",
 
@@ -119,16 +142,51 @@ const EXACT_TRANSLATIONS: Record<string, string> = {
   "channels configured. Credentials are written to":
     "个消息渠道已配置。凭据写入",
   Connected: "已连接",
+  "Restart to apply": "重启后生效",
+  "Start failed": "启动失败",
+  Disconnected: "已断开",
   Disabled: "已禁用",
+  expired: "已过期",
+  "Gateway restarting…": "网关正在重启…",
   Test: "测试",
   Mode: "模式",
   "Allowed WhatsApp numbers": "允许的 WhatsApp 号码",
+  "Feishu / Lark": "飞书 / Lark",
+  "SMS (Twilio)": "短信（Twilio）",
+  DingTalk: "钉钉",
+  "WeCom (group bot)": "企业微信（群机器人）",
+  "WeCom (app)": "企业微信（应用）",
+  "Weixin / WeChat (Personal)": "微信 / WeChat（个人）",
+  "QQ Bot": "QQ 机器人",
+  "Yuanbao (元宝)": "腾讯元宝",
+  "API server": "API 服务",
+  Irc: "IRC",
+  Line: "LINE",
+  "Msgraph Webhook": "Microsoft Graph 网络钩子",
+  "Whatsapp Cloud": "WhatsApp Cloud",
   "Set up with QR": "使用二维码设置",
   "Pair with QR": "使用二维码配对",
   "; the gateway connects each enabled channel on its next restart.":
     "；网关会在下次重启时连接每个已启用的渠道。",
   "SET UP WITH QR": "使用二维码设置",
   "PAIR WITH QR": "使用二维码配对",
+  "Waiting for WhatsApp to provide a QR code…": "正在等待 WhatsApp 生成二维码…",
+  "Scan with WhatsApp Linked Devices, not the camera app.":
+    "请使用 WhatsApp 的“已连接设备”扫描，不要使用系统相机。",
+  "WhatsApp QR setup expired. Start a new QR setup to try again.":
+    "WhatsApp 二维码已过期，请重新开始二维码设置。",
+  "Telegram pairing expired. Start a new QR setup to try again.":
+    "Telegram 配对已过期，请重新开始二维码设置。",
+  "WhatsApp is linked but Hermes is not listening yet. Save and restart the gateway to finish setup.":
+    "WhatsApp 已连接，但 Hermes 尚未监听。请保存并重启网关以完成设置。",
+  "Preparing the WhatsApp bridge. The QR code will appear here when it is ready.":
+    "正在准备 WhatsApp 桥接，二维码就绪后会显示在这里。",
+  "Starting the WhatsApp pairing bridge. The QR code will appear here when it is ready.":
+    "正在启动 WhatsApp 配对桥接，二维码就绪后会显示在这里。",
+  "Open WhatsApp on your phone, then go to Linked Devices and scan from there. This QR is not a browser URL.":
+    "请在手机上打开 WhatsApp，进入“已连接设备”后扫描。该二维码不是网页地址。",
+  "Hermes is logged into the WhatsApp account that scanned the QR code.":
+    "Hermes 已登录扫描该二维码的 WhatsApp 账号。",
   MODE: "模式",
   Bot: "机器人",
   "Self-chat": "自聊",
@@ -185,6 +243,15 @@ const EXACT_TRANSLATIONS: Record<string, string> = {
   "Subscription changes hot-reload once the webhook receiver is running. Disabled subscriptions reject incoming events.":
     "网络钩子接收器运行后，订阅变更会热加载。已禁用的订阅会拒绝传入事件。",
   "No webhook subscriptions yet.": "暂无网络钩子订阅。",
+
+  "No toolsets available.": "没有可用工具集。",
+  "No messaging platforms configured. Set one up under Channels to deliver reports.":
+    "尚未配置消息平台。请先在“消息渠道”中设置，以便投递报告。",
+  "No skills installed for this profile.": "该 Profile 尚未安装 Skill。",
+  "Cron job": "定时任务",
+  "Saved changes ✓": "更改已保存 ✓",
+  "Edit job": "编辑定时任务",
+  "Save changes": "保存更改",
 
   "Pending requests": "待处理请求",
   "Pending requests (": "待处理请求（",
@@ -609,7 +676,10 @@ function translatePattern(text: string): string | null {
       Reveal: "显示",
       Hide: "隐藏",
     };
-    return `${verbs[match[1]]} ${match[2]}`;
+    const translatedSubject = EXACT_TRANSLATIONS[match[2]];
+    if (!translatedSubject) return `${verbs[match[1]]} ${match[2]}`;
+    const separator = /^[A-Za-z0-9]/.test(translatedSubject) ? " " : "";
+    return `${verbs[match[1]]}${separator}${translatedSubject}`;
   }
 
   match = text.match(/^(Open|Delete|Download) (.+)$/);
@@ -627,6 +697,17 @@ function translatePattern(text: string): string | null {
 
   match = text.match(/^(.+) timed out$/);
   if (match) return `${match[1]} 响应超时`;
+
+  match = text.match(/^(.+) must start with (.+)$/);
+  if (match) return `${match[1]} 必须以 ${match[2]} 开头`;
+
+  match = text.match(
+    /^(.+) does not look like a Slack member ID\. Use IDs like (.+)\.$/,
+  );
+  if (match) return `${match[1]} 不是有效的 Slack 成员 ID，请使用 ${match[2]} 这类 ID。`;
+
+  match = text.match(/^Gateway restart failed \(exit (.+)\) — restart manually$/);
+  if (match) return `网关重启失败（退出码 ${match[1]}），请手动重启`;
 
   match = text.match(/^Installing (.+)…$/);
   if (match) return `正在安装 ${match[1]}…`;
@@ -655,7 +736,7 @@ function translatePattern(text: string): string | null {
   match = text.match(/^(\d+) tasks · all auto$/);
   if (match) return `${match[1]} 项任务 · 全部自动`;
 
-  match = text.match(/^(\d+) references · (.+)$/);
+  match = text.match(/^(\d+) references? · (.+)$/);
   if (match) return `${match[1]} 个参考模型 · ${match[2]}`;
 
   match = text.match(/^(\d+) of (\d+) channels configured\.(.*)$/);

@@ -71,7 +71,7 @@ describe("translateDashboardText", () => {
 
   it("translates accessibility labels while preserving channel names and keys", () => {
     expect(translateDashboardText("Enable Feishu / Lark")).toBe(
-      "启用 Feishu / Lark",
+      "启用飞书 / Lark",
     );
     expect(translateDashboardText("Edit codex")).toBe("编辑 codex");
     expect(translateDashboardText("Reveal SHURANIMA_API_KEY")).toBe(
@@ -164,5 +164,46 @@ describe("translateDashboardText", () => {
       "github, official 响应超时",
     );
     expect(translateDashboardText("Open pptx")).toBe("打开 pptx");
+  });
+
+  it("translates model, channel onboarding, and cron modal leftovers", () => {
+    expect(translateDashboardText("Restart to apply")).toBe("重启后生效");
+    expect(translateDashboardText("Save & enable")).toBe("保存并启用");
+    expect(translateDashboardText("Gateway restarting…")).toBe("网关正在重启…");
+    expect(translateDashboardText("Reset auxiliary models")).toBe("重置辅助模型");
+    expect(translateDashboardText("No toolsets available.")).toBe("没有可用工具集。");
+    expect(translateDashboardText("Edit job")).toBe("编辑定时任务");
+    expect(translateDashboardText("Save changes")).toBe("保存更改");
+    expect(translateDashboardText("SLACK_APP_TOKEN must start with xapp-")).toBe(
+      "SLACK_APP_TOKEN 必须以 xapp- 开头",
+    );
+    expect(
+      translateDashboardText(
+        "ABC does not look like a Slack member ID. Use IDs like U01ABC2DEF3.",
+      ),
+    ).toBe("ABC 不是有效的 Slack 成员 ID，请使用 U01ABC2DEF3 这类 ID。");
+    expect(translateDashboardText("Jobs")).toBe("任务");
+    expect(translateDashboardText("Blueprints")).toBe("任务模板");
+    expect(translateDashboardText("Profile")).toBe("执行身份");
+    expect(translateDashboardText("All profiles")).toBe("所有执行身份");
+    expect(translateDashboardText("7d")).toBe("7天");
+    expect(
+      translateDashboardText("1 reference · custom:hubway/gpt-5.6-sol"),
+    ).toBe("1 个参考模型 · custom:hubway/gpt-5.6-sol");
+    expect(translateDashboardText("Custom endpoint")).toBe("自定义端点");
+    expect(translateDashboardText("Alibaba Cloud (Coding Plan)")).toBe(
+      "阿里云（Coding Plan）",
+    );
+    expect(translateDashboardText("Enable Email")).toBe("启用电子邮件");
+    expect(translateDashboardText("Enable Feishu / Lark")).toBe(
+      "启用飞书 / Lark",
+    );
+    expect(translateDashboardText("Enable WeCom (group bot)")).toBe(
+      "启用企业微信（群机器人）",
+    );
+    expect(translateDashboardText("API server")).toBe("API 服务");
+    expect(translateDashboardText("Enable API server")).toBe("启用 API 服务");
+    expect(translateDashboardText("Enable Webhooks")).toBe("启用网络钩子");
+    expect(translateDashboardText("Loading chat…")).toBe("正在加载会话…");
   });
 });

@@ -1,3 +1,4 @@
+import asyncio
 import importlib.util
 import json
 import subprocess
@@ -682,9 +683,61 @@ class CollaborationDashboardTests(unittest.TestCase):
         self.assertTrue(manifest["tab"]["hidden"])
         self.assertEqual(manifest["api"], "plugin_api.py")
         self.assertIn("chat:top", manifest["slots"])
-        self.assertEqual(manifest["version"], "2.1.28")
-        self.assertEqual(manifest["entry"], "dist/index.js?v=2.1.28")
-        self.assertEqual(manifest["css"], "dist/style.css?v=2.1.28")
+        self.assertEqual(manifest["version"], "2.1.31")
+        self.assertEqual(manifest["entry"], "dist/index.js?v=2.1.31")
+        self.assertEqual(manifest["css"], "dist/style.css?v=2.1.31")
+
+    def test_dbb3_release_installer_uses_private_snapshot_and_health_files(self):
+        installer = (
+            MODULE_PATH.parents[3]
+            / "deploy"
+            / "dbb3"
+            / "install-collaboration-release.sh"
+        ).read_text(encoding="utf-8")
+
+        self.assertIn("health_file=\"$(mktemp", installer)
+        self.assertIn(
+            'release_snapshot="$(mktemp -d /run/hermes-collaboration-release.',
+            installer,
+        )
+        self.assertIn(
+            "/usr/bin/setpriv",
+            installer,
+        )
+        self.assertIn(
+            "--reuid=hermes --regid=hermes --init-groups --",
+            installer,
+        )
+        self.assertIn(
+            '${release_snapshot}/plugin/plugin_api.py',
+            installer,
+        )
+        self.assertIn(
+            'install -d -o root -g root -m 0755 "${web_target}/assets"',
+            installer,
+        )
+        self.assertIn(
+            'find "${web_target}/assets" -type f -exec chmod 0644 {} +',
+            installer,
+        )
+        self.assertNotIn(
+            'install -m 0755 "${stage}/plugin/plugin_api.py"',
+            installer,
+        )
+        self.assertNotIn(">/tmp/hermes-dashboard-status.json", installer)
+
+        sudoers = (
+            MODULE_PATH.parents[3]
+            / "deploy"
+            / "dbb3"
+            / "hermes-collaboration-deploy.sudoers"
+        ).read_text(encoding="utf-8")
+        self.assertEqual(
+            sudoers.strip(),
+            "hermes ALL=(root) NOPASSWD: "
+            "/usr/local/sbin/hermes-install-collaboration-release",
+        )
+        self.assertNotIn("NOPASSWD: ALL", sudoers)
 
     def test_frontend_exposes_unified_streaming_chat_and_workflow_router(self):
         bundle = (MODULE_PATH.parent / "dist" / "index.js").read_text(
@@ -799,7 +852,63 @@ class CollaborationDashboardTests(unittest.TestCase):
         self.assertIn("started_at: modelPhaseStartedAt || Date.now(),", bundle)
         self.assertIn("modelPhaseStartedAt = endedAt;", bundle)
 
-    def test_frontend_workflow_runs_roles_serially_and_publishes_one_final_report(self):
+    def test_backend_hosted_workflow_runs_roles_serially_and_publishes_one_final_report(self):
+        module = load_module()
+        conversation = module.create_single_conversation("default")
+        state = {"conversations": [conversation]}
+        module.load_single_state = lambda: state
+        module.save_single_state = lambda _state: None
+        self.assertTrue(hasattr(module, "create_hosted_turn_record"))
+        module.create_hosted_turn_record(
+            conversation,
+            turn_id="turn-hosted-1",
+            content="检查服务并修复问题",
+            title="检查并修复服务",
+            profiles=["default", "dbb3-worker", "reviewer"],
+            artifact_required=False,
+        )
+        calls = []
+
+        def runner(profile, prompt):
+            calls.append((profile, prompt))
+            return {
+                "dbb3-worker": "执行完成，服务已恢复",
+                "reviewer": "审阅通过，证据完整",
+                "default": "最终汇报：任务完成",
+            }[profile]
+
+        module.execute_hosted_workflow(
+            conversation["id"],
+            "turn-hosted-1",
+            runner=runner,
+            task_creator=lambda **_kwargs: {
+                "task_id": "root-1",
+                "child_ids": ["child-1"],
+                "fanout": True,
+            },
+        )
+
+        self.assertEqual([profile for profile, _prompt in calls], [
+            "dbb3-worker",
+            "reviewer",
+            "default",
+        ])
+        assistant_messages = [
+            message
+            for message in conversation["messages"]
+            if message.get("role") == "assistant"
+        ]
+        self.assertEqual(
+            sum(bool(message.get("meta", {}).get("final_report")) for message in assistant_messages),
+            1,
+        )
+        self.assertEqual(assistant_messages[-1]["content"], "最终汇报：任务完成")
+        self.assertEqual(
+            conversation["hosted_turns"]["turn-hosted-1"]["status"],
+            "completed",
+        )
+
+    def test_frontend_submits_complex_workflow_once_to_dbb3_hosting(self):
         bundle = (MODULE_PATH.parent / "dist" / "index.js").read_text(
             encoding="utf-8"
         )
@@ -807,26 +916,172 @@ class CollaborationDashboardTests(unittest.TestCase):
         work_end = bundle.index("} else {", work_start)
         workflow = bundle[work_start:work_end]
 
-        self.assertNotIn("await Promise.all(", workflow)
-        self.assertIn('roleStage: "worker"', workflow)
-        self.assertIn('roleStage: "reviewer"', workflow)
-        self.assertIn('roleStage: "reporter"', workflow)
-        self.assertIn("collapseActivities: true", workflow)
-        self.assertIn("publishAttachments: false", workflow)
-        self.assertIn("workerResult.text", workflow)
-        self.assertIn("reviewerResult.text", workflow)
-        self.assertIn("workerResult.attachments", workflow)
-        self.assertIn("你是唯一最终汇报者", workflow)
+        self.assertIn('"/hosted-turns"', workflow)
+        self.assertIn("turn_id: hostedTurnId", workflow)
+        self.assertIn("setHostedRunning(true)", workflow)
+        self.assertNotIn("await runProfile(", workflow)
 
-    def test_frontend_only_collects_outputs_for_explicit_artifact_tasks(self):
+    def test_unfinished_hosted_turn_is_resumed_during_dashboard_startup(self):
+        module = load_module()
+        conversation = module.create_single_conversation("default")
+        run = module.create_hosted_turn_record(
+            conversation,
+            turn_id="turn-resume-1",
+            content="继续后台任务",
+            title="继续后台任务",
+            profiles=["default", "dbb3-worker", "reviewer"],
+            artifact_required=False,
+        )
+        run.update({"status": "running", "stage": "reviewer"})
+        started = []
+        module.start_hosted_workflow = (
+            lambda conversation_id, turn_id: started.append((conversation_id, turn_id))
+        )
+        module.load_single_state = lambda: {"conversations": [conversation]}
+
+        async def run_lifespan():
+            async with module.collaboration_dashboard_lifespan(None):
+                pass
+
+        asyncio.run(run_lifespan())
+
+        self.assertEqual(started, [(conversation["id"], "turn-resume-1")])
+        run["status"] = "completed"
+        asyncio.run(run_lifespan())
+        self.assertEqual(len(started), 1)
+
+    def test_hosted_workflow_only_publishes_outputs_for_explicit_artifact_tasks(self):
+        module = load_module()
+        conversation = module.create_single_conversation("default")
+        state = {"conversations": [conversation]}
+        module.load_single_state = lambda: state
+        module.save_single_state = lambda _state: None
+        attachment_lookups = []
+
+        def list_attachments(conversation_id):
+            attachment_lookups.append(conversation_id)
+            return [
+                {
+                    "id": "output-1",
+                    "bucket": "outputs",
+                    "name": "result.pptx",
+                    "updated_at": 10**15,
+                }
+            ]
+
+        module._list_conversation_attachments = list_attachments
+        task_creator = lambda **kwargs: {
+            "task_id": f"root-{kwargs['turn_id']}",
+            "child_ids": [],
+            "fanout": False,
+        }
+        prompts = []
+
+        def runner(profile, prompt):
+            prompts.append((profile, prompt))
+            return f"{profile} 完成"
+
+        module.create_hosted_turn_record(
+            conversation,
+            turn_id="turn-no-file",
+            content="检查服务状态",
+            title="检查服务状态",
+            profiles=["default", "dbb3-worker", "reviewer"],
+            artifact_required=False,
+        )
+        module.execute_hosted_workflow(
+            conversation["id"],
+            "turn-no-file",
+            runner=runner,
+            task_creator=task_creator,
+        )
+
+        self.assertEqual(attachment_lookups, [])
+        self.assertTrue(
+            any("不要创建、复制或上传文件" in prompt for _profile, prompt in prompts)
+        )
+
+        module.create_hosted_turn_record(
+            conversation,
+            turn_id="turn-with-file",
+            content="制作并交付 PPT",
+            title="制作 PPT",
+            profiles=["default", "dbb3-worker", "reviewer"],
+            artifact_required=True,
+            delivery_context="请将 PPT 放入会话输出目录。",
+        )
+        module.execute_hosted_workflow(
+            conversation["id"],
+            "turn-with-file",
+            runner=runner,
+            task_creator=task_creator,
+        )
+
+        self.assertEqual(attachment_lookups, [conversation["id"]])
+        final_message = next(
+            message
+            for message in reversed(conversation["messages"])
+            if message.get("meta", {}).get("runtime_turn_id") == "turn-with-file"
+            and message.get("meta", {}).get("final_report")
+        )
+        self.assertEqual(
+            [item["name"] for item in final_message["meta"]["attachments"]],
+            ["result.pptx"],
+        )
+
         bundle = (MODULE_PATH.parent / "dist" / "index.js").read_text(
             encoding="utf-8"
         )
-
         self.assertIn("route.artifact_required", bundle)
-        self.assertIn("collectArtifacts: artifactRequired", bundle)
-        self.assertIn("本任务未要求交付文件", bundle)
-        self.assertIn("不要创建、复制或上传文件", bundle)
+        self.assertIn("artifact_required: artifactRequired", bundle)
+
+    def test_hosted_workflow_stops_before_the_next_role_when_cancelled(self):
+        module = load_module()
+        conversation = module.create_single_conversation("default")
+        state = {"conversations": [conversation]}
+        module.load_single_state = lambda: state
+        module.save_single_state = lambda _state: None
+        module.create_hosted_turn_record(
+            conversation,
+            turn_id="turn-cancel-1",
+            content="执行后续检查",
+            title="执行后续检查",
+            profiles=["default", "dbb3-worker", "reviewer"],
+            artifact_required=False,
+        )
+        calls = []
+
+        def runner(profile, _prompt):
+            calls.append(profile)
+            module.request_hosted_turn_cancellation(
+                conversation["id"],
+                "turn-cancel-1",
+                reason="用户取消",
+            )
+            return "执行者已停止"
+
+        module.execute_hosted_workflow(
+            conversation["id"],
+            "turn-cancel-1",
+            runner=runner,
+            task_creator=lambda **_kwargs: {
+                "task_id": "root-cancel-1",
+                "child_ids": [],
+                "fanout": False,
+            },
+        )
+
+        run = conversation["hosted_turns"]["turn-cancel-1"]
+        self.assertEqual(calls, ["dbb3-worker"])
+        self.assertEqual(run["status"], "cancelled")
+        self.assertEqual(run["stage"], "cancelled")
+        self.assertEqual(
+            sum(
+                bool(message.get("meta", {}).get("final_report"))
+                for message in conversation["messages"]
+            ),
+            1,
+        )
 
     def test_frontend_does_not_label_plain_chat_as_a_final_report(self):
         bundle = (MODULE_PATH.parent / "dist" / "index.js").read_text(
@@ -873,6 +1128,49 @@ class CollaborationDashboardTests(unittest.TestCase):
         self.assertIn("工具事件流", chat_sidebar)
         self.assertNotIn("重新连接工具事件流", chat_sidebar)
 
+    def test_model_switch_rebinds_the_next_turn_without_replacing_web_history(self):
+        bundle = (MODULE_PATH.parent / "dist" / "index.js").read_text(
+            encoding="utf-8"
+        )
+        chat_sidebar = (
+            MODULE_PATH.parents[3]
+            / "web"
+            / "src"
+            / "components"
+            / "ChatSidebar.tsx"
+        ).read_text(encoding="utf-8")
+
+        self.assertIn('new CustomEvent("hermes:model-changed"', chat_sidebar)
+        self.assertGreaterEqual(chat_sidebar.count('new CustomEvent("hermes:model-changed"'), 2)
+        self.assertIn('profile: profile || "default"', chat_sidebar)
+        self.assertNotIn("setPendingReloadModel", chat_sidebar)
+        self.assertNotIn("执行 /new 或刷新页面后应用到当前对话", chat_sidebar)
+        self.assertIn('window.addEventListener("hermes:model-changed"', bundle)
+        self.assertIn("delete nextRuntimeSessions[changedProfile]", bundle)
+        self.assertIn('session_id: ""', bundle)
+        self.assertIn('event.type === "session.info"', bundle)
+        self.assertIn("actual_model", bundle)
+        self.assertIn("actual_provider", bundle)
+        self.assertIn("hc-runtime-model", bundle)
+
+    def test_model_picker_is_chinese_and_uses_a_single_column_on_iphone(self):
+        picker = (
+            MODULE_PATH.parents[3]
+            / "web"
+            / "src"
+            / "components"
+            / "ModelPickerDialog.tsx"
+        ).read_text(encoding="utf-8")
+
+        self.assertIn('import { useI18n } from "@/i18n"', picker)
+        self.assertIn('title: "切换模型"', picker)
+        self.assertIn('filter: "筛选提供方和模型…"', picker)
+        self.assertIn('refresh: "刷新模型"', picker)
+        self.assertIn('switchModel: "切换"', picker)
+        self.assertIn("grid-rows-[minmax(110px,0.7fr)_minmax(160px,1.3fr)]", picker)
+        self.assertIn("sm:grid-cols-[200px_1fr]", picker)
+        self.assertIn("max-h-[calc(var(--hermes-viewport-height,100dvh)-1rem)]", picker)
+
     def test_unified_sidebar_merges_official_sessions_before_restoring_selection(self):
         bundle = (MODULE_PATH.parent / "dist" / "index.js").read_text(
             encoding="utf-8"
@@ -886,6 +1184,34 @@ class CollaborationDashboardTests(unittest.TestCase):
         )
 
         self.assertLess(merge_index, remembered_index)
+
+    def test_stale_background_refresh_cannot_overwrite_a_new_conversation(self):
+        bundle = (MODULE_PATH.parent / "dist" / "index.js").read_text(
+            encoding="utf-8"
+        )
+
+        self.assertIn('const activeConversationRef = useRef("");', bundle)
+        self.assertIn("const conversationLoadSequenceRef = useRef(0);", bundle)
+        self.assertIn(
+            "const loadSequence = ++conversationLoadSequenceRef.current;",
+            bundle,
+        )
+        self.assertIn(
+            "conversationId !== activeConversationRef.current ||",
+            bundle,
+        )
+        self.assertIn(
+            "loadSequence !== conversationLoadSequenceRef.current",
+            bundle,
+        )
+        create_start = bundle.index("const createConversation = useCallback")
+        create_end = bundle.index("const selectConversation = useCallback", create_start)
+        create_source = bundle[create_start:create_end]
+        self.assertIn(
+            "activeConversationRef.current = data.conversation.id;",
+            create_source,
+        )
+        self.assertIn("conversationLoadSequenceRef.current += 1;", create_source)
 
     def test_mobile_header_hides_route_picker_and_main_nav_hides_files(self):
         bundle = (MODULE_PATH.parent / "dist" / "index.js").read_text(
@@ -929,6 +1255,40 @@ class CollaborationDashboardTests(unittest.TestCase):
         self.assertIn("hc-connection-state", bundle)
         self.assertNotIn("reject(new Error(`${profile} 流式连接失败`))", bundle)
 
+    def test_frontend_recovery_never_reuses_an_answer_before_the_current_turn(self):
+        bundle = (MODULE_PATH.parent / "dist" / "index.js").read_text(
+            encoding="utf-8"
+        )
+        self.assertIn("function latestAssistantTextAfter(", bundle)
+        start = bundle.index("function latestAssistantTextAfter(")
+        end = bundle.index("\n  async function streamProfileTurn", start)
+        function_source = bundle[start:end]
+        script = (
+            function_source
+            + "\nconsole.log(JSON.stringify(["
+            + "latestAssistantTextAfter(["
+            + "{role:'user',content:'旧问题'},"
+            + "{role:'assistant',content:'旧回答'},"
+            + "{role:'user',content:'当前问题'}"
+            + "],2),"
+            + "latestAssistantTextAfter(["
+            + "{role:'user',content:'旧问题'},"
+            + "{role:'assistant',content:'旧回答'},"
+            + "{role:'user',content:'当前问题'},"
+            + "{role:'assistant',content:'当前回答'}"
+            + "],2)"
+            + "]));"
+        )
+        result = subprocess.run(
+            ["node", "-e", script],
+            check=True,
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+        )
+
+        self.assertEqual(json.loads(result.stdout), ["", "当前回答"])
+
     def test_frontend_pauses_retries_offline_and_wakes_after_ios_resume(self):
         bundle = (MODULE_PATH.parent / "dist" / "index.js").read_text(
             encoding="utf-8"
@@ -945,6 +1305,8 @@ class CollaborationDashboardTests(unittest.TestCase):
             bundle,
         )
         self.assertIn("STREAM_BACKGROUND_STALE_MS", bundle)
+        self.assertIn('window.addEventListener("hermes:app-resume", refreshNow)', bundle)
+        self.assertIn('window.removeEventListener("hermes:app-resume", refreshNow)', bundle)
         self.assertIn("设备离线，等待网络恢复；已提交任务会继续运行", bundle)
         self.assertIn('window.removeEventListener("offline", handleOffline)', bundle)
         self.assertIn('window.removeEventListener("online", handleOnline)', bundle)

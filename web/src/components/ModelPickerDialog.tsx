@@ -5,6 +5,7 @@ import { Spinner } from "@nous-research/ui/ui/components/spinner";
 import { Input } from "@nous-research/ui/ui/components/input";
 import { Label } from "@nous-research/ui/ui/components/label";
 import { ConfirmDialog } from "@/components/ConfirmDialog";
+import { useI18n } from "@/i18n";
 import type { GatewayClient } from "@/lib/gatewayClient";
 import { Check, RefreshCw, Search, X } from "lucide-react";
 import { useEffect, useMemo, useRef, useState } from "react";
@@ -64,6 +65,79 @@ interface PendingExpensiveConfirm {
   provider: string;
 }
 
+interface ModelPickerCopy {
+  cancel: string;
+  close: string;
+  current: string;
+  currentTag: string;
+  expensiveFallback: string;
+  expensiveTitle: string;
+  filter: string;
+  loading: string;
+  models: string;
+  noAuthenticatedProviders: string;
+  noMatches: string;
+  noModelsListed: string;
+  noModelsMatch: string;
+  persistGlobal: string;
+  persistHint: string;
+  pickProvider: string;
+  refresh: string;
+  switchAnyway: string;
+  switchModel: string;
+  title: string;
+  unknown: string;
+}
+
+const MODEL_PICKER_COPY: Record<"zh" | "en", ModelPickerCopy> = {
+  zh: {
+    title: "切换模型",
+    current: "当前",
+    unknown: "未知",
+    filter: "筛选提供方和模型…",
+    persistHint: "保存到 config.yaml，下一条消息立即使用新模型。",
+    persistGlobal: "设为全局默认（否则仅用于当前会话）",
+    refresh: "刷新模型",
+    cancel: "取消",
+    switchModel: "切换",
+    expensiveTitle: "高费用模型提醒",
+    switchAnyway: "仍然切换",
+    expensiveFallback: "该模型的已知价格明显较高。",
+    loading: "正在加载…",
+    noMatches: "没有匹配项",
+    noAuthenticatedProviders: "没有已认证的提供方",
+    models: "个模型",
+    pickProvider: "请先选择提供方",
+    noModelsMatch: "没有模型符合筛选条件",
+    noModelsListed: "该提供方没有可用模型",
+    currentTag: "当前",
+    close: "关闭",
+  },
+  en: {
+    title: "Switch Model",
+    current: "current",
+    unknown: "unknown",
+    filter: "Filter providers and models…",
+    persistHint: "Saves to config.yaml and applies to the next message.",
+    persistGlobal: "Persist globally (otherwise this session only)",
+    refresh: "Refresh Models",
+    cancel: "Cancel",
+    switchModel: "Switch",
+    expensiveTitle: "Expensive Model Warning",
+    switchAnyway: "Switch anyway",
+    expensiveFallback: "This model has unusually high known pricing.",
+    loading: "loading…",
+    noMatches: "no matches",
+    noAuthenticatedProviders: "no authenticated providers",
+    models: "models",
+    pickProvider: "pick a provider",
+    noModelsMatch: "no models match your filter",
+    noModelsListed: "no models listed for this provider",
+    currentTag: "current",
+    close: "Close",
+  },
+};
+
 interface Props {
   /** Chat-mode: when present, picker emits a slash command via onSubmit. */
   gw?: GatewayClient;
@@ -89,6 +163,8 @@ interface Props {
 }
 
 export function ModelPickerDialog(props: Props) {
+  const { locale } = useI18n();
+  const copy = MODEL_PICKER_COPY[locale.startsWith("zh") ? "zh" : "en"];
   const {
     gw,
     sessionId,
@@ -96,7 +172,7 @@ export function ModelPickerDialog(props: Props) {
     loader,
     onApply,
     onClose,
-    title = "Switch Model",
+    title: titleProp,
     alwaysGlobal = false,
   } = props;
   const standalone = !!loader && !!onApply;
@@ -266,7 +342,7 @@ export function ModelPickerDialog(props: Props) {
             message:
               result.confirm_message ||
               result.warning ||
-              "This model has unusually high known pricing.",
+              copy.expensiveFallback,
           });
           return;
         }
@@ -294,7 +370,7 @@ export function ModelPickerDialog(props: Props) {
             message:
               result.confirm_message ||
               result.warning ||
-              "This model has unusually high known pricing.",
+              copy.expensiveFallback,
           });
           return;
         }
@@ -325,19 +401,19 @@ export function ModelPickerDialog(props: Props) {
   // Toast.tsx for the same pattern.
   return createPortal(
     <div
-      className="fixed inset-0 z-[100] flex items-center justify-center bg-background/85 p-4"
+      className="fixed inset-0 z-[100] flex items-center justify-center bg-background/85 p-2 sm:p-4"
       onClick={(e) => e.target === e.currentTarget && onClose()}
       role="dialog"
       aria-modal="true"
       aria-labelledby="model-picker-title"
     >
-      <div className={cn(themedBody, "relative w-full max-w-3xl max-h-[80vh] border border-border bg-card shadow-2xl flex flex-col")}>
+      <div className={cn(themedBody, "relative flex max-h-[calc(var(--hermes-viewport-height,100dvh)-1rem)] w-full max-w-3xl flex-col overflow-hidden border border-border bg-card text-base shadow-2xl sm:max-h-[80vh]")}>
         <Button
           ghost
           size="icon"
           onClick={onClose}
           className="absolute right-2 top-2 text-muted-foreground hover:text-foreground"
-          aria-label="Close"
+          aria-label={copy.close}
         >
           <X />
         </Button>
@@ -347,10 +423,10 @@ export function ModelPickerDialog(props: Props) {
             id="model-picker-title"
             className="font-mondwest text-display text-base tracking-wider"
           >
-            {title}
+            {titleProp || copy.title}
           </h2>
           <p className="text-xs text-muted-foreground mt-1 font-mono">
-            current: {currentModel || "(unknown)"}
+            {copy.current}: {currentModel || `(${copy.unknown})`}
             {currentProviderSlug && ` · ${currentProviderSlug}`}
           </p>
         </header>
@@ -360,7 +436,7 @@ export function ModelPickerDialog(props: Props) {
             <Search className="absolute left-2 top-1/2 -translate-y-1/2 h-3.5 w-3.5 text-muted-foreground" />
             <Input
               autoFocus
-              placeholder="Filter providers and models…"
+              placeholder={copy.filter}
               value={query}
               onChange={(e) => setQuery(e.target.value)}
               className="pl-7 h-8 text-sm"
@@ -368,8 +444,9 @@ export function ModelPickerDialog(props: Props) {
           </div>
         </div>
 
-        <div className="flex-1 min-h-0 grid grid-cols-[200px_1fr] overflow-hidden">
+        <div className="grid min-h-0 flex-1 grid-cols-1 grid-rows-[minmax(110px,0.7fr)_minmax(160px,1.3fr)] overflow-hidden sm:grid-cols-[200px_1fr] sm:grid-rows-1">
           <ProviderColumn
+            copy={copy}
             loading={loading}
             error={error}
             providers={filteredProviders}
@@ -383,6 +460,7 @@ export function ModelPickerDialog(props: Props) {
           />
 
           <ModelColumn
+            copy={copy}
             provider={selectedProvider}
             models={filteredModels}
             allModels={models}
@@ -402,10 +480,10 @@ export function ModelPickerDialog(props: Props) {
           />
         </div>
 
-        <footer className="border-t border-border p-3 flex items-center justify-between gap-3 flex-wrap">
+        <footer className="flex flex-col items-stretch gap-2 border-t border-border p-3 sm:flex-row sm:items-center sm:justify-between">
           {alwaysGlobal ? (
-            <span className="text-xs text-muted-foreground">
-              Saves to config.yaml — applies to new sessions.
+            <span className="min-w-0 text-xs leading-relaxed text-muted-foreground">
+              {copy.persistHint}
             </span>
           ) : (
             <div className="flex items-center gap-2">
@@ -421,36 +499,37 @@ export function ModelPickerDialog(props: Props) {
                 className="font-mondwest normal-case tracking-normal text-xs text-muted-foreground cursor-pointer"
                 htmlFor="model-picker-persist-global"
               >
-                Persist globally (otherwise this session only)
+                {copy.persistGlobal}
               </Label>
             </div>
           )}
 
-          <div className="flex items-center gap-2 ml-auto">
+          <div className="grid w-full grid-cols-3 gap-2 sm:ml-auto sm:flex sm:w-auto sm:items-center">
             <Button
               outlined
               onClick={refreshOptions}
               disabled={applying || loading || refreshing}
+              className="min-w-0 px-2 text-xs"
             >
               {refreshing ? <Spinner /> : <RefreshCw className="h-3.5 w-3.5" />}
-              Refresh Models
+              <span className="truncate">{copy.refresh}</span>
             </Button>
-            <Button outlined onClick={onClose} disabled={applying}>
-              Cancel
+            <Button outlined onClick={onClose} disabled={applying} className="min-w-0 px-2 text-xs">
+              {copy.cancel}
             </Button>
-            <Button onClick={confirm} disabled={!canConfirm}>
-              {applying ? <Spinner /> : "Switch"}
+            <Button onClick={confirm} disabled={!canConfirm} className="min-w-0 px-2 text-xs">
+              {applying ? <Spinner /> : copy.switchModel}
             </Button>
           </div>
         </footer>
       </div>
       <ConfirmDialog
         open={!!pendingConfirm}
-        title="Expensive Model Warning"
+        title={copy.expensiveTitle}
         description={pendingConfirm?.message}
         destructive
-        confirmLabel="Switch anyway"
-        cancelLabel="Cancel"
+        confirmLabel={copy.switchAnyway}
+        cancelLabel={copy.cancel}
         loading={applying}
         onCancel={() => setPendingConfirm(null)}
         onConfirm={() => {
@@ -470,6 +549,7 @@ export function ModelPickerDialog(props: Props) {
 /* ------------------------------------------------------------------ */
 
 function ProviderColumn({
+  copy,
   loading,
   error,
   providers,
@@ -478,6 +558,7 @@ function ProviderColumn({
   query,
   onSelect,
 }: {
+  copy: ModelPickerCopy;
   loading: boolean;
   error: string | null;
   providers: ModelOptionProvider[];
@@ -487,10 +568,10 @@ function ProviderColumn({
   onSelect(slug: string): void;
 }) {
   return (
-    <div className="border-r border-border overflow-y-auto">
+    <div className="overflow-y-auto border-b border-border sm:border-b-0 sm:border-r">
       {loading && (
         <div className="flex items-center gap-2 p-4 text-xs text-muted-foreground">
-          <Spinner className="text-xs" /> loading…
+          <Spinner className="text-xs" /> {copy.loading}
         </div>
       )}
 
@@ -499,10 +580,10 @@ function ProviderColumn({
       {!loading && !error && providers.length === 0 && (
         <div className="p-4 text-xs text-muted-foreground italic">
           {query
-            ? "no matches"
+            ? copy.noMatches
             : total === 0
-              ? "no authenticated providers"
-              : "no matches"}
+              ? copy.noAuthenticatedProviders
+              : copy.noMatches}
         </div>
       )}
 
@@ -520,10 +601,10 @@ function ProviderColumn({
             <div className="flex-1 min-w-0">
               <div className="flex items-center gap-1.5">
                 <span className="font-medium truncate">{p.name}</span>
-                {p.is_current && <CurrentTag />}
+                {p.is_current && <CurrentTag copy={copy} />}
               </div>
               <div className="text-xs text-text-secondary font-mono truncate">
-                {p.slug} · {p.total_models ?? p.models?.length ?? 0} models
+                {p.slug} · {p.total_models ?? p.models?.length ?? 0} {copy.models}
               </div>
             </div>
           </ListItem>
@@ -538,6 +619,7 @@ function ProviderColumn({
 /* ------------------------------------------------------------------ */
 
 function ModelColumn({
+  copy,
   provider,
   models,
   allModels,
@@ -547,6 +629,7 @@ function ModelColumn({
   onSelect,
   onConfirm,
 }: {
+  copy: ModelPickerCopy;
   provider: ModelOptionProvider | null;
   models: { model: string; positions: number[] }[];
   allModels: string[];
@@ -560,7 +643,7 @@ function ModelColumn({
     return (
       <div className="overflow-y-auto">
         <div className="p-4 text-xs text-muted-foreground italic">
-          pick a provider →
+          {copy.pickProvider}
         </div>
       </div>
     );
@@ -577,8 +660,8 @@ function ModelColumn({
       {models.length === 0 ? (
         <div className="p-4 text-xs text-muted-foreground italic">
           {allModels.length
-            ? "no models match your filter"
-            : "no models listed for this provider"}
+            ? copy.noModelsMatch
+            : copy.noModelsListed}
         </div>
       ) : (
         models.map(({ model: m, positions }) => {
@@ -600,7 +683,7 @@ function ModelColumn({
               <span className="flex-1 truncate">
                 <HighlightedText text={m} positions={positions} />
               </span>
-              {isCurrent && <CurrentTag />}
+              {isCurrent && <CurrentTag copy={copy} />}
             </ListItem>
           );
         })
@@ -609,10 +692,10 @@ function ModelColumn({
   );
 }
 
-function CurrentTag() {
+function CurrentTag({ copy }: { copy: ModelPickerCopy }) {
   return (
     <span className="text-display text-xs tracking-wider text-primary shrink-0">
-      current
+      {copy.currentTag}
     </span>
   );
 }

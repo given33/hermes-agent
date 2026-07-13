@@ -10,7 +10,9 @@ from __future__ import annotations
 
 import asyncio
 from collections import Counter
+from contextlib import asynccontextmanager
 import json
+import logging
 import mimetypes
 import os
 import re
@@ -30,8 +32,24 @@ from hermes_cli.config import get_hermes_home
 from hermes_cli.profiles import list_profiles
 
 
-router = APIRouter()
+@asynccontextmanager
+async def collaboration_dashboard_lifespan(_app):
+    """Resume persisted work as soon as the dashboard process starts."""
+    try:
+        state = load_single_state()
+        resume_unfinished_hosted_workflows(state.get("conversations") or [])
+    except Exception:
+        logging.getLogger(__name__).exception(
+            "Failed to resume collaboration hosted workflows during startup"
+        )
+    yield
+
+
+router = APIRouter(lifespan=collaboration_dashboard_lifespan)
 _STATE_LOCK = threading.RLock()
+_HOSTED_THREADS_LOCK = threading.Lock()
+_HOSTED_THREADS: dict[str, threading.Thread] = {}
+_HOSTED_TERMINAL_STATUSES = {"completed", "failed", "cancelled"}
 _MAX_MESSAGES = 200
 _PROMPT_HISTORY = 24
 _MAX_ATTACHMENT_BYTES = 64 * 1024 * 1024
@@ -245,6 +263,8 @@ def load_single_state(path: Optional[Path] = None) -> dict[str, Any]:
             conversation["messages"] = normalize_stored_conversation_messages(
                 messages
             )
+        if not isinstance(conversation.get("hosted_turns"), dict):
+            conversation["hosted_turns"] = {}
     return {"conversations": normalized_conversations}
 
 
@@ -405,6 +425,7 @@ def create_single_conversation(
         "profile": profile.strip() or "default",
         "runtime_sessions": {},
         "runtime_runs": {},
+        "hosted_turns": {},
         "messages": [],
         "created_at": now,
         "updated_at": now,
@@ -1352,6 +1373,559 @@ def run_single_turn(
     return response
 
 
+def create_hosted_turn_record(
+    conversation: dict[str, Any],
+    *,
+    turn_id: str,
+    content: str,
+    title: str,
+    profiles: list[str],
+    artifact_required: bool,
+    attachment_context: str = "",
+    delivery_context: str = "",
+) -> dict[str, Any]:
+    normalized_turn_id = str(turn_id or "").strip()
+    if not normalized_turn_id:
+        raise ValueError("turn_id is required")
+    hosted_turns = conversation.get("hosted_turns")
+    if not isinstance(hosted_turns, dict):
+        hosted_turns = {}
+        conversation["hosted_turns"] = hosted_turns
+    existing = hosted_turns.get(normalized_turn_id)
+    if isinstance(existing, dict):
+        return existing
+    now = int(time.time() * 1000)
+    record = {
+        "turn_id": normalized_turn_id,
+        "status": "queued",
+        "stage": "queued",
+        "content": str(content or "").strip(),
+        "title": str(title or "").strip() or summarize_task_title(content),
+        "profiles": list(
+            dict.fromkeys(str(item).strip() for item in profiles if str(item).strip())
+        ),
+        "artifact_required": bool(artifact_required),
+        "attachment_context": str(attachment_context or "").strip(),
+        "delivery_context": str(delivery_context or "").strip(),
+        "cancel_requested": False,
+        "created_at": now,
+        "updated_at": now,
+    }
+    hosted_turns[normalized_turn_id] = record
+    conversation["updated_at"] = now
+    return record
+
+
+def create_hosted_kanban_task(
+    *,
+    conversation_id: str,
+    turn_id: str,
+    title: str,
+    content: str,
+) -> dict[str, Any]:
+    from hermes_cli import kanban_db, kanban_decompose
+
+    kanban_db.init_db()
+    conn = kanban_db.connect()
+    try:
+        task_id = kanban_db.create_task(
+            conn,
+            title=title,
+            body=content,
+            created_by="unified-webui-hosted",
+            workspace_kind="scratch",
+            triage=True,
+            idempotency_key=f"collaboration:{conversation_id}:{turn_id}",
+            goal_mode=True,
+        )
+    finally:
+        conn.close()
+    try:
+        outcome = kanban_decompose.decompose_task(
+            task_id,
+            author="unified-webui-hosted",
+        )
+        return {
+            "task_id": task_id,
+            "fanout": bool(outcome.fanout),
+            "child_ids": outcome.child_ids or [],
+            "reason": outcome.reason,
+        }
+    except Exception as exc:
+        return {
+            "task_id": task_id,
+            "fanout": False,
+            "child_ids": [],
+            "reason": f"任务拆分暂时失败：{exc}",
+        }
+
+
+def _persist_hosted_turn(
+    conversation_id: str,
+    turn_id: str,
+    *,
+    patch: Optional[dict[str, Any]] = None,
+    message: Optional[dict[str, Any]] = None,
+) -> dict[str, Any]:
+    with _STATE_LOCK:
+        state = load_single_state()
+        conversation = _conversation_by_id(state, conversation_id)
+        run = (conversation.get("hosted_turns") or {}).get(turn_id)
+        if not isinstance(run, dict):
+            raise RuntimeError("托管任务记录不存在")
+        now = int(time.time() * 1000)
+        if patch:
+            run.update(patch)
+        run["updated_at"] = now
+        conversation["updated_at"] = now
+        if message:
+            message_meta = dict(message.get("meta") or {})
+            message_meta.setdefault("runtime_turn_id", turn_id)
+            role_stage = str(message_meta.get("role_stage") or "")
+            existing = next(
+                (
+                    item
+                    for item in conversation.get("messages") or []
+                    if isinstance(item.get("meta"), dict)
+                    and item["meta"].get("runtime_turn_id") == turn_id
+                    and str(item["meta"].get("role_stage") or "") == role_stage
+                    and str(item.get("kind") or "message")
+                    == str(message.get("kind") or "message")
+                ),
+                None,
+            )
+            if existing is None:
+                existing = _append_message(
+                    conversation,
+                    role=str(message.get("role") or "assistant"),
+                    name=str(message.get("name") or "default"),
+                    content=str(message.get("content") or "").strip(),
+                    status=str(message.get("status") or "completed"),
+                    kind=str(message.get("kind") or "message"),
+                    meta=message_meta,
+                )
+            else:
+                existing.update(
+                    {
+                        "content": str(message.get("content") or "").strip(),
+                        "status": str(message.get("status") or "completed"),
+                        "meta": {**existing.get("meta", {}), **message_meta},
+                        "created_at": now,
+                    }
+                )
+        save_single_state(state)
+        return dict(run)
+
+
+def request_hosted_turn_cancellation(
+    conversation_id: str,
+    turn_id: str,
+    *,
+    reason: str = "用户取消",
+) -> dict[str, Any]:
+    with _STATE_LOCK:
+        state = load_single_state()
+        conversation = _conversation_by_id(state, conversation_id)
+        run = (conversation.get("hosted_turns") or {}).get(turn_id)
+        if not isinstance(run, dict):
+            raise RuntimeError("托管任务记录不存在")
+        if run.get("status") in _HOSTED_TERMINAL_STATUSES:
+            return dict(run)
+        now = int(time.time() * 1000)
+        run.update(
+            {
+                "cancel_requested": True,
+                "cancel_reason": str(reason or "用户取消").strip() or "用户取消",
+                "cancel_requested_at": now,
+                "updated_at": now,
+            }
+        )
+        conversation["updated_at"] = now
+        save_single_state(state)
+        return dict(run)
+
+
+def _finish_hosted_turn_if_cancelled(
+    conversation_id: str,
+    turn_id: str,
+) -> bool:
+    with _STATE_LOCK:
+        state = load_single_state()
+        conversation = _conversation_by_id(state, conversation_id)
+        run = (conversation.get("hosted_turns") or {}).get(turn_id)
+        if not isinstance(run, dict) or not run.get("cancel_requested"):
+            return False
+        if run.get("status") in {"completed", "cancelled"}:
+            return run.get("status") == "cancelled"
+        reason = str(run.get("cancel_reason") or "用户取消")
+    now = int(time.time() * 1000)
+    _persist_hosted_turn(
+        conversation_id,
+        turn_id,
+        patch={
+            "status": "cancelled",
+            "stage": "cancelled",
+            "cancelled_at": now,
+            "completed_at": now,
+        },
+        message={
+            "role": "assistant",
+            "name": "default",
+            "content": f"任务已取消：{reason}",
+            "status": "cancelled",
+            "kind": "message",
+            "meta": {
+                "role_stage": "reporter",
+                "role_label": "Hermes · 任务取消",
+                "final_report": True,
+            },
+        },
+    )
+    return True
+
+
+def execute_hosted_workflow(
+    conversation_id: str,
+    turn_id: str,
+    *,
+    runner: Callable[[str, str], str] = run_profile_turn,
+    task_creator: Callable[..., dict[str, Any]] = create_hosted_kanban_task,
+) -> None:
+    with _STATE_LOCK:
+        state = load_single_state()
+        conversation = _conversation_by_id(state, conversation_id)
+        run = (conversation.get("hosted_turns") or {}).get(turn_id)
+        if not isinstance(run, dict):
+            raise RuntimeError("托管任务记录不存在")
+        if run.get("status") in _HOSTED_TERMINAL_STATUSES:
+            return
+        run["status"] = "running"
+        run["stage"] = str(run.get("stage") or "preparing")
+        run.setdefault("started_at", int(time.time() * 1000))
+        run["updated_at"] = int(time.time() * 1000)
+        save_single_state(state)
+        run = dict(run)
+
+    if _finish_hosted_turn_if_cancelled(conversation_id, turn_id):
+        return
+
+    content = str(run.get("content") or "").strip()
+    title = str(run.get("title") or summarize_task_title(content))
+    profiles = list(run.get("profiles") or ["default", "dbb3-worker", "reviewer"])
+    ordered = collaboration_execution_order(profiles)
+    worker_profile = next(
+        (item for item in ordered if collaboration_role(item) == "worker"),
+        "dbb3-worker",
+    )
+    reviewer_profile = next(
+        (item for item in ordered if collaboration_role(item) == "reviewer"),
+        "reviewer",
+    )
+    reporter_profile = next(
+        (item for item in ordered if collaboration_role(item) == "reporter"),
+        "default",
+    )
+    artifact_required = bool(run.get("artifact_required"))
+    artifact_instruction = (
+        str(run.get("delivery_context") or "")
+        if artifact_required
+        else "本任务未要求交付文件。不要创建、复制或上传文件，只提交文字结果和必要证据。"
+    )
+    attachment_context = str(run.get("attachment_context") or "")
+
+    task_id = str(run.get("task_id") or "")
+    if not task_id:
+        _persist_hosted_turn(
+            conversation_id,
+            turn_id,
+            patch={"stage": "decomposing"},
+        )
+        task_info = task_creator(
+            conversation_id=conversation_id,
+            turn_id=turn_id,
+            title=title,
+            content=content,
+        )
+        task_id = str(task_info.get("task_id") or "")
+        child_ids = list(task_info.get("child_ids") or [])
+        workflow_text = (
+            f"DBB3 已创建根任务并拆分为 {len(child_ids)} 个执行步骤。"
+            if task_info.get("fanout")
+            else "DBB3 已创建根任务，正在按能力编排执行。"
+        )
+        _persist_hosted_turn(
+            conversation_id,
+            turn_id,
+            patch={
+                "task_id": task_id,
+                "child_ids": child_ids,
+                "stage": "dispatching",
+            },
+            message={
+                "role": "system",
+                "name": "工作流已启动",
+                "content": workflow_text,
+                "status": "completed",
+                "kind": "workflow",
+                "meta": {
+                    "role_stage": "workflow",
+                    "task_id": task_id,
+                    "child_ids": child_ids,
+                },
+            },
+        )
+        if _finish_hosted_turn_if_cancelled(conversation_id, turn_id):
+            return
+
+    _persist_hosted_turn(
+        conversation_id,
+        turn_id,
+        patch={"stage": "worker"},
+        message={
+            "role": "assistant",
+            "name": reporter_profile,
+            "content": (
+                f"任务已由 DBB3 托管并派发给 {worker_profile}。"
+                f"完成后由 {reviewer_profile} 验收，再由我统一汇报。"
+            ),
+            "status": "completed",
+            "kind": "message",
+            "meta": {
+                "role_stage": "dispatch",
+                "role_label": "Hermes · 调度",
+                "final_report": False,
+            },
+        },
+    )
+    if _finish_hosted_turn_if_cancelled(conversation_id, turn_id):
+        return
+
+    worker_result = str(run.get("worker_result") or "")
+    worker_status = str(run.get("worker_status") or "")
+    if not worker_result:
+        worker_prompt = "\n".join(
+            item
+            for item in (
+                "你正在 DBB3 唯一控制面的服务端托管工作流中。",
+                f"你的 Profile：{worker_profile}",
+                f"官方 Kanban 根任务：{task_id}" if task_id else "",
+                "你是任务执行者。负责实际执行、工具调用、证据收集和必要产物创建。",
+                "不要做最终总结；把结果、证据、耗时和遗留问题提交给审阅者。",
+                f"用户任务：{content}",
+                attachment_context,
+                artifact_instruction,
+            )
+            if item
+        )
+        try:
+            worker_result = runner(worker_profile, worker_prompt)
+            worker_status = "completed"
+        except Exception as exc:
+            worker_result = f"执行失败：{exc}"
+            worker_status = "failed"
+        _persist_hosted_turn(
+            conversation_id,
+            turn_id,
+            patch={
+                "worker_result": worker_result,
+                "worker_status": worker_status,
+                "stage": "reviewer",
+            },
+            message={
+                "role": "assistant",
+                "name": worker_profile,
+                "content": worker_result,
+                "status": worker_status,
+                "kind": "message",
+                "meta": {
+                    "role_stage": "worker",
+                    "role_label": f"{worker_profile} · 执行",
+                    "collapse_activities": True,
+                    "final_report": False,
+                },
+            },
+        )
+        if _finish_hosted_turn_if_cancelled(conversation_id, turn_id):
+            return
+
+    reviewer_result = str(run.get("reviewer_result") or "")
+    reviewer_status = str(run.get("reviewer_status") or "")
+    if not reviewer_result:
+        reviewer_prompt = "\n".join(
+            item
+            for item in (
+                "你正在 DBB3 唯一控制面的服务端托管工作流中。",
+                f"你的 Profile：{reviewer_profile}",
+                f"官方 Kanban 根任务：{task_id}" if task_id else "",
+                "你是结果审阅者。只基于执行者结果做验收、风险检查和通过或退回判断。",
+                "不要重复执行任务，不要创建文件，也不要向用户做最终总结。",
+                f"用户任务：{content}",
+                "执行者提交：",
+                worker_result,
+            )
+            if item
+        )
+        try:
+            reviewer_result = runner(reviewer_profile, reviewer_prompt)
+            reviewer_status = "completed"
+        except Exception as exc:
+            reviewer_result = f"审阅失败：{exc}"
+            reviewer_status = "failed"
+        _persist_hosted_turn(
+            conversation_id,
+            turn_id,
+            patch={
+                "reviewer_result": reviewer_result,
+                "reviewer_status": reviewer_status,
+                "stage": "reporter",
+            },
+            message={
+                "role": "assistant",
+                "name": reviewer_profile,
+                "content": reviewer_result,
+                "status": reviewer_status,
+                "kind": "message",
+                "meta": {
+                    "role_stage": "reviewer",
+                    "role_label": f"{reviewer_profile} · 审阅",
+                    "collapse_activities": True,
+                    "final_report": False,
+                },
+            },
+        )
+        if _finish_hosted_turn_if_cancelled(conversation_id, turn_id):
+            return
+
+    reporter_result = str(run.get("reporter_result") or "")
+    reporter_status = str(run.get("reporter_status") or "")
+    if not reporter_result:
+        reporter_prompt = "\n".join(
+            item
+            for item in (
+                "你是这个服务端托管任务唯一的最终汇报者。",
+                f"你的 Profile：{reporter_profile}",
+                f"官方 Kanban 根任务：{task_id}" if task_id else "",
+                "综合执行者和审阅者的信息，只汇报一次完成状态、关键结果、证据、问题与下一步。",
+                "不要重复执行工作，也不要重新生成执行者已经创建的文件。",
+                f"用户任务：{content}",
+                "执行者提交：",
+                worker_result,
+                "审阅者结论：",
+                reviewer_result,
+                artifact_instruction,
+            )
+            if item
+        )
+        try:
+            reporter_result = runner(reporter_profile, reporter_prompt)
+            reporter_status = "completed"
+        except Exception as exc:
+            reporter_result = f"最终汇报失败：{exc}"
+            reporter_status = "failed"
+
+    if _finish_hosted_turn_if_cancelled(conversation_id, turn_id):
+        return
+
+    attachments = []
+    if artifact_required:
+        started_at = int(run.get("started_at") or 0)
+        attachments = [
+            item
+            for item in _list_conversation_attachments(conversation_id)
+            if item.get("bucket") == "outputs"
+            and int(item.get("updated_at") or 0) >= started_at - 1000
+        ]
+    final_status = "completed" if reporter_status == "completed" else "failed"
+    now = int(time.time() * 1000)
+    _persist_hosted_turn(
+        conversation_id,
+        turn_id,
+        patch={
+            "reporter_result": reporter_result,
+            "reporter_status": reporter_status,
+            "status": final_status,
+            "stage": "completed" if final_status == "completed" else "failed",
+            "completed_at": now,
+        },
+        message={
+            "role": "assistant",
+            "name": reporter_profile,
+            "content": reporter_result,
+            "status": final_status,
+            "kind": "message",
+            "meta": {
+                "role_stage": "reporter",
+                "role_label": "Hermes · 最终汇报",
+                "final_report": True,
+                "attachments": attachments,
+                "task_id": task_id,
+            },
+        },
+    )
+
+
+def start_hosted_workflow(conversation_id: str, turn_id: str) -> threading.Thread:
+    key = f"{conversation_id}:{turn_id}"
+    with _HOSTED_THREADS_LOCK:
+        existing = _HOSTED_THREADS.get(key)
+        if existing is not None and existing.is_alive():
+            return existing
+
+        def run_and_release() -> None:
+            try:
+                execute_hosted_workflow(conversation_id, turn_id)
+            except Exception as exc:
+                try:
+                    _persist_hosted_turn(
+                        conversation_id,
+                        turn_id,
+                        patch={
+                            "status": "failed",
+                            "stage": "failed",
+                            "error": str(exc),
+                            "completed_at": int(time.time() * 1000),
+                        },
+                        message={
+                            "role": "assistant",
+                            "name": "default",
+                            "content": f"服务端托管任务失败：{exc}",
+                            "status": "failed",
+                            "kind": "message",
+                            "meta": {
+                                "role_stage": "reporter",
+                                "role_label": "Hermes · 最终汇报",
+                                "final_report": True,
+                            },
+                        },
+                    )
+                except Exception:
+                    pass
+            finally:
+                with _HOSTED_THREADS_LOCK:
+                    _HOSTED_THREADS.pop(key, None)
+
+        thread = threading.Thread(
+            target=run_and_release,
+            name=f"hermes-hosted-{turn_id[-12:]}",
+            daemon=True,
+        )
+        _HOSTED_THREADS[key] = thread
+        thread.start()
+        return thread
+
+
+def resume_unfinished_hosted_workflows(
+    conversations: list[dict[str, Any]],
+) -> None:
+    for conversation in conversations:
+        conversation_id = str(conversation.get("id") or "").strip()
+        if not conversation_id:
+            continue
+        for turn_id, run in (conversation.get("hosted_turns") or {}).items():
+            if isinstance(run, dict) and run.get("status") in {"queued", "running"}:
+                start_hosted_workflow(conversation_id, str(turn_id))
+
+
 def _room_by_id(state: dict[str, Any], room_id: str) -> dict[str, Any]:
     for room in state.get("rooms") or []:
         if room.get("id") == room_id:
@@ -1445,6 +2019,20 @@ class RuntimeSessionBody(BaseModel):
     status: str = "running"
 
 
+class HostedTurnBody(BaseModel):
+    turn_id: str
+    content: str
+    title: str = ""
+    profiles: list[str] = Field(default_factory=list)
+    artifact_required: bool = False
+    attachment_context: str = ""
+    delivery_context: str = ""
+
+
+class HostedTurnCancellationBody(BaseModel):
+    reason: str = "用户取消"
+
+
 @router.get("/profiles")
 def get_profiles():
     return {"profiles": available_profiles()}
@@ -1494,6 +2082,7 @@ def get_single_conversations():
             }
             for conversation in conversations
         ]
+    resume_unfinished_hosted_workflows(conversations)
     return {"conversations": summaries}
 
 
@@ -1546,7 +2135,9 @@ def get_single_conversation(conversation_id: str):
         changed = compact_conversation_title(conversation) or changed
         if changed:
             save_single_state(state)
-        return {"conversation": conversation}
+        result = {"conversation": conversation}
+    resume_unfinished_hosted_workflows([conversation])
+    return result
 
 
 @router.get("/single/conversations/{conversation_id}/attachments")
@@ -1735,6 +2326,51 @@ def save_runtime_session(
         runtime_sessions = conversation.get("runtime_sessions") or {}
         save_single_state(state)
     return {"runtime_sessions": runtime_sessions}
+
+
+@router.post("/single/conversations/{conversation_id}/hosted-turns")
+def create_hosted_turn(conversation_id: str, payload: HostedTurnBody):
+    turn_id = payload.turn_id.strip()
+    if not turn_id:
+        raise HTTPException(status_code=400, detail="turn_id 不能为空")
+    if not payload.content.strip():
+        raise HTTPException(status_code=400, detail="任务内容不能为空")
+    with _STATE_LOCK:
+        state = load_single_state()
+        conversation = _conversation_by_id(state, conversation_id)
+        run = create_hosted_turn_record(
+            conversation,
+            turn_id=turn_id,
+            content=payload.content,
+            title=payload.title,
+            profiles=payload.profiles
+            or ["default", "dbb3-worker", "reviewer"],
+            artifact_required=payload.artifact_required,
+            attachment_context=payload.attachment_context,
+            delivery_context=payload.delivery_context,
+        )
+        save_single_state(state)
+    start_hosted_workflow(conversation_id, turn_id)
+    return {"hosted_turn": run}
+
+
+@router.post(
+    "/single/conversations/{conversation_id}/hosted-turns/{turn_id}/cancel"
+)
+def cancel_hosted_turn(
+    conversation_id: str,
+    turn_id: str,
+    payload: HostedTurnCancellationBody,
+):
+    try:
+        run = request_hosted_turn_cancellation(
+            conversation_id,
+            turn_id,
+            reason=payload.reason,
+        )
+    except RuntimeError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    return {"hosted_turn": run}
 
 
 @router.delete("/single/conversations/{conversation_id}")

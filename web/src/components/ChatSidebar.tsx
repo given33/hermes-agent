@@ -28,7 +28,6 @@ import { Badge } from "@nous-research/ui/ui/components/badge";
 import { Card } from "@nous-research/ui/ui/components/card";
 
 import { ModelPickerDialog } from "@/components/ModelPickerDialog";
-import { ModelReloadConfirm } from "@/components/ModelReloadConfirm";
 import { ReasoningPicker } from "@/components/ReasoningPicker";
 import { useI18n } from "@/i18n";
 import { GatewayClient, type ConnectionState } from "@/lib/gatewayClient";
@@ -134,14 +133,9 @@ export function ChatSidebar({
   // Bumped on model change/save so ReasoningPicker re-reads the saved effort
   // (config is profile-scoped the same way the model badge is).
   const [modelRefreshKey, setModelRefreshKey] = useState(0);
-  // Set after the picker saves a model and the user declines the reload: config
-  // is updated but the running session keeps its model until rebuilt.
+  // The unified chat listens for the model-change event and rebuilds only its
+  // Hermes runtime session, preserving the visible Web conversation history.
   const [modelNotice, setModelNotice] = useState<string | null>(null);
-  // Short name of a just-saved model awaiting confirm to reload (a fresh chat
-  // session is how the running chat adopts it; we confirm before discarding it).
-  const [pendingReloadModel, setPendingReloadModel] = useState<string | null>(
-    null,
-  );
 
   const refreshEffectiveModel = useCallback(() => {
     void api
@@ -484,13 +478,18 @@ export function ChatSidebar({
             currentModel={modelName}
             profile={profile}
             refreshKey={modelRefreshKey}
-            onChanged={(effort) =>
+            onChanged={(effort) => {
+              window.dispatchEvent(
+                new CustomEvent("hermes:model-changed", {
+                  detail: { profile: profile || "default" },
+                }),
+              );
               setModelNotice(
                 isChinese
-                  ? `推理强度已设为 ${effort}。执行 /new 或刷新页面后应用到当前对话。`
-                  : `Reasoning effort set to ${effort}. Run /new or refresh the page to apply it to this chat.`,
-              )
-            }
+                  ? `推理强度已设为 ${effort}，下一条消息立即生效。`
+                  : `Reasoning effort set to ${effort}. It applies to the next message.`,
+              );
+            }}
           />
         </Card>
       )}
@@ -522,7 +521,6 @@ export function ChatSidebar({
           alwaysGlobal
           onApply={async ({ provider, model, confirmExpensiveModel }) => {
             setModelNotice(null);
-            setPendingReloadModel(null);
             const result = await api.setModelAssignment(
               {
                 confirm_expensive_model: confirmExpensiveModel,
@@ -536,8 +534,21 @@ export function ChatSidebar({
             // and calls back; don't announce until the user confirms.
             if (!result.confirm_required) {
               refreshEffectiveModel();
-              // Ask before reloading: applying the model starts a fresh chat.
-              setPendingReloadModel(model.split("/").slice(-1)[0]);
+              window.dispatchEvent(
+                new CustomEvent("hermes:model-changed", {
+                  detail: {
+                    model,
+                    profile: profile || "default",
+                    provider,
+                  },
+                }),
+              );
+              const shortModel = model.split("/").slice(-1)[0];
+              setModelNotice(
+                isChinese
+                  ? `模型已切换为 ${shortModel}，下一条消息立即使用新模型。`
+                  : `Model set to ${shortModel}. The next message uses it immediately.`,
+              );
             }
             return result;
           }}
@@ -547,19 +558,6 @@ export function ChatSidebar({
           }}
         />
       )}
-
-      <ModelReloadConfirm
-        model={pendingReloadModel}
-        onCancel={() => {
-          const m = pendingReloadModel;
-          setPendingReloadModel(null);
-          setModelNotice(
-            isChinese
-              ? `模型已切换为 ${m}。执行 /new 或刷新页面后应用到当前对话。`
-              : `Model set to ${m}. Run /new or refresh the page to apply it to this chat.`,
-          );
-        }}
-      />
     </aside>
   );
 }

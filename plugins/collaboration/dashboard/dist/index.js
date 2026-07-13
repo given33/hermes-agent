@@ -65,8 +65,9 @@
   const STREAM_TURN_TIMEOUT_MS = 30 * 60 * 1000;
   const STREAM_BACKGROUND_STALE_MS = 30000;
 
-  function latestAssistantText(messages) {
-    const latest = [...(messages || [])]
+  function latestAssistantTextAfter(messages, baselineMessageCount = 0) {
+    const baseline = Math.max(0, Number(baselineMessageCount) || 0);
+    const latest = [...(messages || []).slice(baseline)]
       .reverse()
       .find(
         (message) =>
@@ -95,6 +96,7 @@
       let rejectCurrentPending = null;
       let waitingForNetwork = false;
       let hiddenAt = document.hidden ? Date.now() : 0;
+      let submittedBaselineMessageCount = 0;
 
       const clearConnectTimer = () => {
         if (connectTimer) clearTimeout(connectTimer);
@@ -345,15 +347,24 @@
               !resumePayload.running &&
               resumePayload.status !== "streaming"
             ) {
+              const recoveredText = latestAssistantTextAfter(
+                resumePayload.messages,
+                submittedBaselineMessageCount,
+              );
               finish({
-                status: "completed",
-                text: latestAssistantText(resumePayload.messages),
+                status: recoveredText ? "completed" : "error",
+                text:
+                  recoveredText ||
+                  "本轮任务已结束，但 Hermes 没有返回新的回复。请查看错误详情后重试。",
                 recovered: true,
               });
             }
             return;
           }
 
+          submittedBaselineMessageCount = Array.isArray(resumePayload?.messages)
+            ? resumePayload.messages.length
+            : 0;
           const submission = request(activeSocket, connectionPending, "prompt.submit", {
             session_id: sessionId,
             text: prompt,
@@ -531,9 +542,13 @@
   }
 
   function hasHostedRuntimeRuns(conversation) {
-    return Object.values(conversation?.runtime_runs || {}).some(
+    const runtimeActive = Object.values(conversation?.runtime_runs || {}).some(
       (run) => run?.status === "running" && run?.session_id,
     );
+    const workflowActive = Object.values(conversation?.hosted_turns || {}).some(
+      (run) => ["queued", "running"].includes(run?.status),
+    );
+    return runtimeActive || workflowActive;
   }
 
   function withHostedRuntimeMessages(conversation) {
@@ -574,6 +589,44 @@
           connection: {
             status: "hosted",
             text: "DBB3 服务端持续执行",
+          },
+        },
+      });
+    }
+    const stageLabels = {
+      queued: "任务已进入 DBB3 队列",
+      preparing: "DBB3 正在准备执行环境",
+      decomposing: "正在创建并拆分根任务",
+      dispatching: "正在匹配设备能力并派发",
+      worker: "执行端正在处理任务",
+      reviewer: "审阅端正在验收结果",
+      reporter: "Hermes 正在整理最终汇报",
+    };
+    for (const run of Object.values(conversation?.hosted_turns || {})) {
+      if (
+        !["queued", "running"].includes(run?.status) ||
+        !run?.turn_id ||
+        representedTurnIds.has(run.turn_id)
+      ) {
+        continue;
+      }
+      messages.push({
+        id: `hosted-workflow-${run.turn_id}`,
+        role: "assistant",
+        name: "default",
+        content:
+          stageLabels[run.stage] || "DBB3 正在服务端持续执行这项任务",
+        status: "streaming",
+        kind: "message",
+        created_at: run.updated_at || run.started_at || Date.now(),
+        meta: {
+          runtime_turn_id: run.turn_id,
+          role_stage: "dispatch",
+          role_label: "DBB3 · 后台托管",
+          final_report: false,
+          connection: {
+            status: "hosted",
+            text: "App 可切到后台，任务完成后自动恢复结果",
           },
         },
       });
@@ -1125,6 +1178,12 @@
     const collapseActivities = Boolean(message.meta?.collapse_activities);
     const useOfficialAvatar = !isUser && !["worker", "reviewer"].includes(roleStage);
     const displayName = isUser ? "你" : profileDisplayName(message.name);
+    const runtimeModel = [
+      message.meta?.actual_provider,
+      message.meta?.actual_model,
+    ]
+      .filter(Boolean)
+      .join(" · ");
     return h(
       "article",
       {
@@ -1166,6 +1225,16 @@
           h("strong", null, displayName),
           !isUser && roleStage !== "chat"
             ? h("span", { className: "hc-role-label" }, roleLabel)
+            : null,
+          !isUser && runtimeModel
+            ? h(
+                "span",
+                {
+                  className: "hc-runtime-model",
+                  title: `本轮实际模型：${runtimeModel}`,
+                },
+                runtimeModel,
+              )
             : null,
         ),
         connection
@@ -1225,6 +1294,8 @@
     const expandedInputRef = useRef(null);
     const pinnedToBottomRef = useRef(true);
     const runtimeSessionsRef = useRef({});
+    const activeConversationRef = useRef("");
+    const conversationLoadSequenceRef = useRef(0);
 
     const measureComposerOverlap = useCallback((forceScroll = false) => {
       const stream = streamRef.current;
@@ -1252,10 +1323,17 @@
         setMessages([]);
         return null;
       }
+      const loadSequence = ++conversationLoadSequenceRef.current;
       pinnedToBottomRef.current = true;
       const data = await collabApi(
         "/single/conversations/" + encodeURIComponent(conversationId),
       );
+      if (
+        conversationId !== activeConversationRef.current ||
+        loadSequence !== conversationLoadSequenceRef.current
+      ) {
+        return data.conversation;
+      }
       setMessages(withHostedRuntimeMessages(data.conversation));
       setHostedRunning(hasHostedRuntimeRuns(data.conversation));
       setSelectedProfile(data.conversation.profile || "default");
@@ -1319,6 +1397,8 @@
           nextConversations[0]?.id ||
           "";
         setConversations(nextConversations);
+        activeConversationRef.current = nextId;
+        conversationLoadSequenceRef.current += 1;
         setActiveId(nextId);
         if (nextId) {
           rememberConversationId(nextId);
@@ -1345,7 +1425,7 @@
     useEffect(() => {
       if (!activeId || !hostedRunning) return undefined;
       let inFlight = false;
-      const timer = setInterval(async () => {
+      const refreshNow = async () => {
         if (inFlight) return;
         inFlight = true;
         try {
@@ -1367,8 +1447,14 @@
         } finally {
           inFlight = false;
         }
-      }, 3000);
-      return () => clearInterval(timer);
+      };
+      const timer = setInterval(refreshNow, 3000);
+      window.addEventListener("hermes:app-resume", refreshNow);
+      void refreshNow();
+      return () => {
+        clearInterval(timer);
+        window.removeEventListener("hermes:app-resume", refreshNow);
+      };
     }, [activeId, hostedRunning, loadConversation]);
 
     useEffect(() => {
@@ -1450,6 +1536,8 @@
           title: "新对话",
         }),
       });
+      activeConversationRef.current = data.conversation.id;
+      conversationLoadSequenceRef.current += 1;
       setActiveId(data.conversation.id);
       rememberConversationId(data.conversation.id);
       setMessages([]);
@@ -1464,6 +1552,8 @@
       async (conversationId) => {
         if (!conversationId) return;
         pinnedToBottomRef.current = true;
+        activeConversationRef.current = conversationId;
+        conversationLoadSequenceRef.current += 1;
         setLoading(true);
         setError("");
         setPendingAttachments([]);
@@ -1477,12 +1567,15 @@
               ...current.filter(
                 (item) =>
                   item.id !== conversationId && item.id !== conversation.id,
-              ),
+                ),
             ]);
+            activeConversationRef.current = conversation.id;
+            conversationLoadSequenceRef.current += 1;
             setActiveId(conversation.id);
             rememberConversationId(conversation.id);
             await loadConversation(conversation.id);
           } else {
+            activeConversationRef.current = conversationId;
             setActiveId(conversationId);
             rememberConversationId(conversationId);
             await loadConversation(conversationId);
@@ -1514,6 +1607,39 @@
         );
       };
     }, [createConversation, sending]);
+
+    useEffect(() => {
+      const resetRuntimeSessionForModel = (event) => {
+        const changedProfile = String(event?.detail?.profile || "default");
+        const nextRuntimeSessions = { ...runtimeSessionsRef.current };
+        delete nextRuntimeSessions[changedProfile];
+        runtimeSessionsRef.current = nextRuntimeSessions;
+        if (!activeId) return;
+        void collabApi(
+          "/single/conversations/" +
+            encodeURIComponent(activeId) +
+            "/runtime-session",
+          {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({
+              profile: changedProfile,
+              session_id: "",
+              status: "reset",
+            }),
+          },
+        ).catch(() => {
+          setError("模型已切换，但旧运行会话解绑失败；请重新打开当前会话后再发送。 ");
+        });
+      };
+      window.addEventListener("hermes:model-changed", resetRuntimeSessionForModel);
+      return () => {
+        window.removeEventListener(
+          "hermes:model-changed",
+          resetRuntimeSessionForModel,
+        );
+      };
+    }, [activeId]);
 
     useEffect(() => {
       const resumeFromOfficialSession = async (event) => {
@@ -1635,6 +1761,8 @@
       let activeReasoningId = "";
       let activitySequence = 0;
       let modelPhaseStartedAt = turnStartedAt;
+      let actualModel = "";
+      let actualProvider = "";
       const roleMeta = {
         role_stage: options.roleStage || "",
         role_label: options.roleLabel || "",
@@ -1780,6 +1908,13 @@
                   status: "restored",
                   text: "连接已恢复，任务继续执行",
                 };
+                return { ...message, meta };
+              }
+              if (event.type === "session.info") {
+                actualModel = String(payload.model || actualModel || "");
+                actualProvider = String(payload.provider || actualProvider || "");
+                meta.actual_model = actualModel;
+                meta.actual_provider = actualProvider;
                 return { ...message, meta };
               }
               if (event.type === "message.delta") {
@@ -1954,6 +2089,8 @@
             activities,
             attachments: publishedAttachments,
             connection: null,
+            actual_model: actualModel,
+            actual_provider: actualProvider,
             ...roleMeta,
           },
         }));
@@ -1971,6 +2108,8 @@
               runtimeSessionsRef.current[profile] ||
               "",
             runtime_turn_id: streamId,
+            actual_model: actualModel,
+            actual_provider: actualProvider,
             ...roleMeta,
           },
         });
@@ -2119,177 +2258,55 @@
         await record(conversationId, routeMessage);
 
         if (route.mode === "work") {
-          const workflowId = `workflow-${Date.now()}`;
+          const hostedTurnId = `hosted-${Date.now()}-${Math.random()
+            .toString(36)
+            .slice(2, 8)}`;
+          const workflowId = `workflow-${hostedTurnId}`;
           addMessage({
             id: workflowId,
             role: "system",
-            name: "正在创建工作流",
-            content: "DBB3 正在创建根任务并调用官方拆分器。",
+            name: "任务已提交 DBB3",
+            content: "服务端正在创建根任务；关闭 App 或锁屏不会中断后续执行。",
             status: "streaming",
             kind: "workflow",
-            meta: {},
+            meta: { runtime_turn_id: hostedTurnId },
           });
-          const created = await kanbanApi("/tasks", {
+          await collabApi(
+            "/single/conversations/" +
+              encodeURIComponent(conversationId) +
+              "/hosted-turns",
+            {
             method: "POST",
             headers: { "Content-Type": "application/json" },
             body: JSON.stringify({
+              turn_id: hostedTurnId,
+              content: userContent,
               title: route.title,
-              body: userContent,
-              triage: true,
-              workspace_kind: "scratch",
-              goal_mode: true,
+              profiles: route.profiles || [
+                "default",
+                "dbb3-worker",
+                "reviewer",
+              ],
+              artifact_required: artifactRequired,
+              attachment_context: attachmentContext,
+              delivery_context: deliveryContext,
             }),
-          });
-          const task = created.task;
-          let decomposition = null;
-          if (task?.id) {
-            patchMessage(workflowId, (message) => ({
-              ...message,
-              name: "根任务已创建",
-              content: "正在分析依赖并拆分执行步骤。",
-              meta: { task_id: task.id },
-            }));
-            decomposition = await kanbanApi(
-              "/tasks/" + encodeURIComponent(task.id) + "/decompose",
-              {
-                method: "POST",
-                headers: { "Content-Type": "application/json" },
-                body: JSON.stringify({ author: "unified-webui" }),
-              },
-            );
-          }
-          const workflowText = decomposition?.fanout
-            ? `已拆分为 ${decomposition.child_ids.length} 个子任务，Dispatcher 将按 Profile 能力执行。`
-            : "根任务已进入官方 Kanban，Dispatcher 将继续处理。";
+            },
+          );
+          setHostedRunning(true);
           patchMessage(workflowId, (message) => ({
             ...message,
-            name: "工作流已启动",
-            content: workflowText,
-            status: "completed",
-            meta: { task_id: task?.id, child_ids: decomposition?.child_ids || [] },
-          }));
-          await record(conversationId, {
-            role: "system",
-            name: "工作流已启动",
-            content: workflowText,
-            status: "completed",
-            kind: "workflow",
-            meta: { task_id: task?.id, child_ids: decomposition?.child_ids || [] },
-          });
-          const workflowProfiles = route.profiles || [
-            "default",
-            "dbb3-worker",
-            "reviewer",
-          ];
-          const reporterProfile =
-            workflowProfiles.find(
-              (profile) => !/worker|review/i.test(String(profile)),
-            ) || "default";
-          const workerProfile =
-            workflowProfiles.find((profile) => /worker/i.test(String(profile))) ||
-            "dbb3-worker";
-          const reviewerProfile =
-            workflowProfiles.find((profile) => /review/i.test(String(profile))) ||
-            "reviewer";
-          const dispatchMessage = {
-            id: `dispatch-${Date.now()}`,
-            role: "assistant",
-            name: reporterProfile,
-            content: `任务已派发给 ${profileDisplayName(workerProfile)}。执行完成后将由 ${profileDisplayName(reviewerProfile)} 验收，再由我统一汇报。`,
-            status: "completed",
-            kind: "message",
+            name: "DBB3 服务端托管中",
+            content: "执行、审阅和最终汇报将在服务器继续完成。",
             meta: {
-              role_stage: "dispatch",
-              role_label: "Hermes · 调度",
-              final_report: false,
+              ...(message.meta || {}),
+              connection: {
+                status: "hosted",
+                text: "可安全切到后台，返回后自动恢复进度",
+              },
             },
-            created_at: Date.now(),
-          };
-          addMessage(dispatchMessage);
-          await record(conversationId, dispatchMessage);
-
-          const workerPrompt = [
-            "你正在 DBB3 唯一控制面的协作任务中。",
-            `你的 Profile：${workerProfile}`,
-            task?.id ? `官方 Kanban 根任务：${task.id}` : "",
-            "你是任务执行者。负责实际执行、工具调用、证据收集和产物创建。",
-            "不要做最终总结，不要替审阅者下结论；完成后把结果、证据、耗时和遗留问题提交给审阅者。",
-            "不要创建第二控制面；实际任务状态以官方 Kanban 为准。",
-            `用户任务：${userContent}`,
-            attachmentContext,
-            artifactInstruction,
-          ].filter(Boolean).join("\n");
-          const workerResult = await runProfile(
-            conversationId,
-            workerProfile,
-            workerPrompt,
-            workerPrompt,
-            route.title,
-            {
-              roleStage: "worker",
-              roleLabel: `${profileDisplayName(workerProfile)} · 执行`,
-              collapseActivities: true,
-              finalReport: false,
-              collectArtifacts: artifactRequired,
-              publishAttachments: false,
-            },
-          );
-
-          const reviewerPrompt = [
-            "你正在 DBB3 唯一控制面的协作任务中。",
-            `你的 Profile：${reviewerProfile}`,
-            task?.id ? `官方 Kanban 根任务：${task.id}` : "",
-            "你是结果审阅者。只基于执行者提交的结果做验收、风险检查和通过或退回判断。",
-            "不要重复执行任务，不要创建或上传文件，也不要向用户做最终总结。",
-            `用户任务：${userContent}`,
-            "执行者提交：",
-            workerResult.text,
-          ].filter(Boolean).join("\n");
-          const reviewerResult = await runProfile(
-            conversationId,
-            reviewerProfile,
-            reviewerPrompt,
-            reviewerPrompt,
-            route.title,
-            {
-              roleStage: "reviewer",
-              roleLabel: `${profileDisplayName(reviewerProfile)} · 审阅`,
-              collapseActivities: true,
-              finalReport: false,
-              collectArtifacts: false,
-              publishAttachments: false,
-            },
-          );
-
-          const reporterPrompt = [
-            "你是唯一最终汇报者，也是本任务唯一可以向用户给出最终结论的角色。",
-            `你的 Profile：${reporterProfile}`,
-            task?.id ? `官方 Kanban 根任务：${task.id}` : "",
-            "综合执行者和审阅者的信息，只汇报一次：完成状态、关键结果、证据、问题与下一步。",
-            "不要重复执行已经完成的工作，不要重新生成执行者已经创建的文件。",
-            `用户任务：${userContent}`,
-            "执行者提交：",
-            workerResult.text,
-            "审阅者结论：",
-            reviewerResult.text,
-            artifactInstruction,
-          ].filter(Boolean).join("\n");
-          await runProfile(
-            conversationId,
-            reporterProfile,
-            reporterPrompt,
-            reporterPrompt,
-            route.title,
-            {
-              roleStage: "reporter",
-              roleLabel: "Hermes · 最终汇报",
-              collapseActivities: false,
-              finalReport: true,
-              collectArtifacts: false,
-              publishAttachments: artifactRequired,
-              attachments: workerResult.attachments,
-            },
-          );
+          }));
+          await loadConversation(conversationId);
         } else {
           await runProfile(
             conversationId,

@@ -2096,6 +2096,17 @@ div[data-layout-variant]:has([data-chat-active="true"] .hc-single-chat)
   font-weight: 650;
 }
 
+.hc-runtime-model {
+  max-width: min(46vw, 260px);
+  overflow: hidden;
+  color: var(--hc-muted);
+  font-family: var(--font-mono);
+  font-size: 9px;
+  line-height: 1.35;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
 .hc-message.is-user header strong {
   color: #737c78;
 }
