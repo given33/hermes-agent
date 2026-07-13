@@ -76,9 +76,58 @@ def _restore_app_state(application, snapshot) -> None:
             setattr(application.state, name, value)
 
 
+def test_auth_registry_snapshot_restore_is_exact():
+    from hermes_cli.dashboard_auth import registry
+
+    original = _snapshot_auth_registries()
+    existing_provider = object()
+    temporary_provider = object()
+    existing_name = f"snapshot-existing-{id(existing_provider)}"
+    temporary_name = f"snapshot-temporary-{id(temporary_provider)}"
+    existing_exact = f"/__snapshot_existing_{id(existing_provider)}"
+    temporary_exact = f"/__snapshot_temporary_{id(temporary_provider)}"
+    existing_prefix = f"/__snapshot_existing_prefix_{id(existing_provider)}"
+    temporary_prefix = f"/__snapshot_temporary_prefix_{id(temporary_provider)}"
+
+    try:
+        with registry._lock:
+            registry._providers[existing_name] = existing_provider
+        with token_auth._lock:
+            token_auth._token_routes.add(existing_exact)
+            token_auth._optional_token_prefixes.add(existing_prefix)
+        pre_test = _snapshot_auth_registries()
+
+        with registry._lock:
+            registry._providers.pop(existing_name)
+            registry._providers[temporary_name] = temporary_provider
+        with token_auth._lock:
+            token_auth._token_routes.discard(existing_exact)
+            token_auth._token_routes.add(temporary_exact)
+            token_auth._optional_token_prefixes.discard(existing_prefix)
+            token_auth._optional_token_prefixes.add(temporary_prefix)
+
+        _restore_auth_registries(pre_test)
+        restored_providers, restored_exact, restored_prefixes = (
+            _snapshot_auth_registries()
+        )
+
+        assert restored_providers[existing_name] is existing_provider
+        assert temporary_name not in restored_providers
+        assert existing_exact in restored_exact
+        assert temporary_exact not in restored_exact
+        assert existing_prefix in restored_prefixes
+        assert temporary_prefix not in restored_prefixes
+        assert _snapshot_auth_registries() == pre_test
+    finally:
+        _restore_auth_registries(original)
+
+    assert _snapshot_auth_registries() == original
+
+
 @pytest.fixture
 def mobile_app(tmp_path, monkeypatch):
     """Load the real dashboard app from an isolated server .env."""
+    auth_snapshot = _snapshot_auth_registries()
     hermes_home = tmp_path / "hermes-home"
     hermes_home.mkdir()
     (hermes_home / ".env").write_text(
@@ -103,7 +152,6 @@ def mobile_app(tmp_path, monkeypatch):
         token_auth.register_optional_token_prefix("/api")
     assert get_provider("mobile-api") is not None
     assert token_auth.is_optional_token_path("/api/sessions") is True
-    auth_snapshot = _snapshot_auth_registries()
     register_provider(StubAuthProvider())
 
     state_names = ("bound_host", "bound_port", "auth_required")
