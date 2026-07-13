@@ -342,6 +342,19 @@ class TestBuildCallKwargsMaxTokens:
         )
         assert kwargs["max_tokens"] == 4096
 
+    def test_keeps_max_tokens_for_hubway_gpt_56(self):
+        from agent.auxiliary_client import _build_call_kwargs
+
+        kwargs = _build_call_kwargs(
+            provider="custom",
+            model="gpt-5.6-sol",
+            messages=[{"role": "user", "content": "hi"}],
+            max_tokens=4096,
+            base_url="https://hubway.cc/v1",
+        )
+
+        assert kwargs["max_tokens"] == 4096
+
 
 class TestNousTagsScoping:
     def test_tags_injected_when_provider_is_nous(self, monkeypatch):

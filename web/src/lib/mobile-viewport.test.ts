@@ -115,6 +115,16 @@ describe("mobile viewport CSS contract", () => {
     );
     expect(stylesheet).toContain("bottom: auto;");
     expect(stylesheet).toContain('html[data-hermes-keyboard="open"]');
-    expect(stylesheet).toContain("padding-bottom: 6px !important;");
+    expect(stylesheet).toContain("padding-bottom: 3px !important;");
+    expect(stylesheet).toContain("var(--hc-composer-overlap, 0px)");
+  });
+
+  it("notifies the collaboration surface after viewport geometry changes", () => {
+    const component = readFileSync(
+      new URL("../components/MobileViewportCompat.tsx", import.meta.url),
+      "utf8",
+    );
+
+    expect(component).toContain('new CustomEvent("hermes:viewport-change"');
   });
 });

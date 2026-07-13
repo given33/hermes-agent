@@ -567,6 +567,38 @@ class CollaborationDashboardTests(unittest.TestCase):
         self.assertIn("pc-worker", work["profiles"])
         self.assertIn("reviewer", work["profiles"])
 
+    def test_artifact_delivery_requires_an_explicit_file_deliverable(self):
+        module = load_module()
+
+        for request in (
+            "帮我做一个季度汇报 PPT",
+            "把分析结果导出成 PDF 给我下载",
+            "生成一份 Excel 表格和 Word 文档",
+            "请压缩成 zip 文件发给我",
+        ):
+            self.assertTrue(module.requires_artifact_delivery(request), request)
+
+        for request in (
+            "检查项目里的文件并运行测试",
+            "分析日志，直接告诉我结论",
+            "修改代码后汇报结果",
+            "搜索网页并总结重点",
+            "分析我上传的 PDF，只在会话里告诉我结论",
+        ):
+            self.assertFalse(module.requires_artifact_delivery(request), request)
+
+    def test_collaboration_execution_order_ends_with_single_reporter(self):
+        module = load_module()
+
+        ordered = module.collaboration_execution_order(
+            ["default", "dbb3-worker", "reviewer"]
+        )
+
+        self.assertEqual(ordered, ["dbb3-worker", "reviewer", "default"])
+        self.assertEqual(module.collaboration_role("dbb3-worker"), "worker")
+        self.assertEqual(module.collaboration_role("reviewer"), "reviewer")
+        self.assertEqual(module.collaboration_role("default"), "reporter")
+
     def test_ambiguous_intent_uses_model_classifier_and_keeps_rule_fallback(self):
         module = load_module()
         calls = []
@@ -607,6 +639,40 @@ class CollaborationDashboardTests(unittest.TestCase):
         self.assertIn("default: 初步分析", prompt)
         self.assertIn("请继续复核", prompt)
 
+    def test_group_prompts_enforce_distinct_worker_reviewer_reporter_roles(self):
+        module = load_module()
+        room = module.create_room_record(
+            "交付协作", ["default", "dbb3-worker", "reviewer"]
+        )
+
+        worker = module.build_group_prompt(
+            room,
+            "dbb3-worker",
+            "检查服务并汇报",
+            artifact_required=False,
+        )
+        reviewer = module.build_group_prompt(
+            room,
+            "reviewer",
+            "检查服务并汇报",
+            artifact_required=False,
+        )
+        reporter = module.build_group_prompt(
+            room,
+            "default",
+            "检查服务并汇报",
+            artifact_required=False,
+        )
+
+        self.assertIn("你是执行者", worker)
+        self.assertIn("不要向用户做最终总结", worker)
+        self.assertIn("不得创建或上传交付文件", worker)
+        self.assertIn("你是审阅者", reviewer)
+        self.assertIn("不要重复执行者的工作", reviewer)
+        self.assertIn("不得创建或上传交付文件", reviewer)
+        self.assertIn("你是唯一最终汇报者", reporter)
+        self.assertIn("综合执行者和审阅者", reporter)
+
     def test_manifest_registers_one_official_collaboration_tab(self):
         manifest_path = MODULE_PATH.parent / "manifest.json"
         manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
@@ -616,9 +682,9 @@ class CollaborationDashboardTests(unittest.TestCase):
         self.assertTrue(manifest["tab"]["hidden"])
         self.assertEqual(manifest["api"], "plugin_api.py")
         self.assertIn("chat:top", manifest["slots"])
-        self.assertEqual(manifest["version"], "2.1.26")
-        self.assertEqual(manifest["entry"], "dist/index.js?v=2.1.26")
-        self.assertEqual(manifest["css"], "dist/style.css?v=2.1.26")
+        self.assertEqual(manifest["version"], "2.1.28")
+        self.assertEqual(manifest["entry"], "dist/index.js?v=2.1.28")
+        self.assertEqual(manifest["css"], "dist/style.css?v=2.1.28")
 
     def test_frontend_exposes_unified_streaming_chat_and_workflow_router(self):
         bundle = (MODULE_PATH.parent / "dist" / "index.js").read_text(
@@ -721,7 +787,7 @@ class CollaborationDashboardTests(unittest.TestCase):
 
         self.assertEqual(
             json.loads(result.stdout),
-            ["耗时未记录", "0 ms", "2.0 s"],
+            ["耗时未记录", "< 1 ms", "2.0 s"],
         )
 
     def test_frontend_realtime_reasoning_uses_model_phase_start_boundary(self):
@@ -732,6 +798,63 @@ class CollaborationDashboardTests(unittest.TestCase):
         self.assertIn("let modelPhaseStartedAt = turnStartedAt;", bundle)
         self.assertIn("started_at: modelPhaseStartedAt || Date.now(),", bundle)
         self.assertIn("modelPhaseStartedAt = endedAt;", bundle)
+
+    def test_frontend_workflow_runs_roles_serially_and_publishes_one_final_report(self):
+        bundle = (MODULE_PATH.parent / "dist" / "index.js").read_text(
+            encoding="utf-8"
+        )
+        work_start = bundle.index('if (route.mode === "work")')
+        work_end = bundle.index("} else {", work_start)
+        workflow = bundle[work_start:work_end]
+
+        self.assertNotIn("await Promise.all(", workflow)
+        self.assertIn('roleStage: "worker"', workflow)
+        self.assertIn('roleStage: "reviewer"', workflow)
+        self.assertIn('roleStage: "reporter"', workflow)
+        self.assertIn("collapseActivities: true", workflow)
+        self.assertIn("publishAttachments: false", workflow)
+        self.assertIn("workerResult.text", workflow)
+        self.assertIn("reviewerResult.text", workflow)
+        self.assertIn("workerResult.attachments", workflow)
+        self.assertIn("你是唯一最终汇报者", workflow)
+
+    def test_frontend_only_collects_outputs_for_explicit_artifact_tasks(self):
+        bundle = (MODULE_PATH.parent / "dist" / "index.js").read_text(
+            encoding="utf-8"
+        )
+
+        self.assertIn("route.artifact_required", bundle)
+        self.assertIn("collectArtifacts: artifactRequired", bundle)
+        self.assertIn("本任务未要求交付文件", bundle)
+        self.assertIn("不要创建、复制或上传文件", bundle)
+
+    def test_frontend_does_not_label_plain_chat_as_a_final_report(self):
+        bundle = (MODULE_PATH.parent / "dist" / "index.js").read_text(
+            encoding="utf-8"
+        )
+
+        self.assertIn('message.meta?.role_stage || "chat"', bundle)
+        self.assertIn('roleStage !== "chat"', bundle)
+
+    def test_frontend_keeps_latest_message_above_the_ios_composer(self):
+        bundle = (MODULE_PATH.parent / "dist" / "index.js").read_text(
+            encoding="utf-8"
+        )
+        stylesheet = (MODULE_PATH.parent / "dist" / "style.css").read_text(
+            encoding="utf-8"
+        )
+
+        self.assertIn("measureComposerOverlap", bundle)
+        self.assertIn("hermes:viewport-change", bundle)
+        self.assertIn("--hc-composer-overlap", bundle)
+        self.assertIn("hc-stream-end", bundle)
+        self.assertIn("hc-role-activity-group", bundle)
+        self.assertIn("var(--hc-composer-overlap, 0px)", stylesheet)
+        self.assertIn(
+            'html[data-hermes-keyboard="open"] .hc-single-composer',
+            stylesheet,
+        )
+        self.assertIn("padding-bottom: 3px !important", stylesheet)
 
     def test_model_tools_only_keeps_new_chat_model_and_event_status(self):
         chat_page = (

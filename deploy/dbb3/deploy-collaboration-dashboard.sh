@@ -2,7 +2,7 @@
 set -euo pipefail
 
 remote="${HERMES_DBB3_REMOTE:-dbb3-hermes}"
-version="2.1.24"
+version="2.1.28"
 repo="${HERMES_REPO:-/mnt/d/Hermes/hermes-agent}"
 stage="/home/hermes/.hermes/deploy/collaboration-${version}"
 plugin_target="/usr/local/lib/hermes-agent/plugins/collaboration/dashboard"

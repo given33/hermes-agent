@@ -101,6 +101,46 @@ _SIMPLE_CHAT_MARKERS = (
     "聊聊",
 )
 _MULTI_STEP_MARKERS = ("然后", "接着", "并且", "同时", "最后", "之后", "以及")
+_DIRECT_ARTIFACT_MARKERS = (
+    "ppt",
+    "pptx",
+    "演示文稿",
+    "幻灯片",
+    "powerpoint",
+    "word",
+    "docx",
+    "pdf",
+    "excel",
+    "xlsx",
+    "csv",
+    "压缩包",
+    "zip文件",
+    "zip 文件",
+)
+_ARTIFACT_ACTION_MARKERS = (
+    "生成",
+    "制作",
+    "做一个",
+    "做个",
+    "写一个",
+    "写个",
+    "导出",
+    "保存为",
+    "保存成",
+    "打包",
+    "下载",
+    "发给我",
+    "上传给我",
+    "交付",
+)
+_ARTIFACT_NOUN_MARKERS = (
+    "文档",
+    "报告",
+    "表格",
+    "图片",
+    "文件",
+    "附件",
+)
 
 
 def state_path() -> Path:
@@ -982,6 +1022,48 @@ def _work_profiles(lowered: str) -> list[str]:
     return list(dict.fromkeys(profiles))
 
 
+def requires_artifact_delivery(content: str) -> bool:
+    """Return true only when the user explicitly asks for a file deliverable."""
+    lowered = re.sub(r"\s+", " ", str(content or "").strip().lower())
+    has_action = any(marker in lowered for marker in _ARTIFACT_ACTION_MARKERS)
+    has_noun = any(
+        marker in lowered
+        for marker in (*_DIRECT_ARTIFACT_MARKERS, *_ARTIFACT_NOUN_MARKERS)
+    )
+    return has_action and has_noun
+
+
+def collaboration_role(profile: str) -> str:
+    normalized = str(profile or "").strip().lower()
+    if normalized == "reviewer" or "review" in normalized:
+        return "reviewer"
+    if normalized.endswith("worker") or "worker" in normalized:
+        return "worker"
+    return "reporter"
+
+
+def collaboration_execution_order(profiles: list[str]) -> list[str]:
+    """Order one worker, reviewer, then exactly one final reporter."""
+    selected = list(dict.fromkeys(str(item).strip() for item in profiles if str(item).strip()))
+    if not selected:
+        return []
+    reporter = next(
+        (item for item in selected if collaboration_role(item) == "reporter"),
+        selected[0],
+    )
+    workers = [
+        item
+        for item in selected
+        if item != reporter and collaboration_role(item) == "worker"
+    ]
+    reviewers = [
+        item
+        for item in selected
+        if item != reporter and collaboration_role(item) == "reviewer"
+    ]
+    return [*workers, *reviewers, reporter]
+
+
 def _rule_based_user_intent(content: str) -> dict[str, Any]:
     text = content.strip()
     lowered = text.lower()
@@ -1023,6 +1105,7 @@ def _rule_based_user_intent(content: str) -> dict[str, Any]:
             "confidence": confidence,
             "source": "rules",
             "profiles": ["default"],
+            "artifact_required": requires_artifact_delivery(text),
         }
 
     return {
@@ -1033,6 +1116,7 @@ def _rule_based_user_intent(content: str) -> dict[str, Any]:
         "confidence": 0.95 if score >= 7 else 0.86,
         "source": "rules",
         "profiles": _work_profiles(lowered),
+        "artifact_required": requires_artifact_delivery(text),
     }
 
 
@@ -1122,17 +1206,48 @@ def _message_line(message: dict[str, Any]) -> str:
     return f"{name}: {content}"
 
 
-def build_group_prompt(room: dict[str, Any], profile: str, user_message: str) -> str:
+def build_group_prompt(
+    room: dict[str, Any],
+    profile: str,
+    user_message: str,
+    *,
+    artifact_required: bool = False,
+) -> str:
     history = room.get("messages") if isinstance(room.get("messages"), list) else []
     recent = "\n".join(_message_line(item) for item in history[-_PROMPT_HISTORY:])
     members = "、".join(str(item) for item in room.get("profiles") or [])
+    role = collaboration_role(profile)
+    role_instruction = {
+        "worker": (
+            "你是执行者。只负责实际执行、调用工具并提交证据、结果和遗留问题；"
+            "不要向用户做最终总结，也不要替审阅者下结论。"
+        ),
+        "reviewer": (
+            "你是审阅者。基于执行者已经提交的结果做验收、风险检查和通过/退回判断；"
+            "不要重复执行者的工作，不要向用户做最终总结。"
+        ),
+        "reporter": (
+            "你是唯一最终汇报者。综合执行者和审阅者的信息，向用户给出一次清晰的最终结论、"
+            "完成状态、关键证据、问题和下一步；不要重新执行已经完成的工作。"
+        ),
+    }[role]
+    if artifact_required:
+        artifact_instruction = (
+            "用户明确要求文件交付。只有执行者可以创建所需的最终文件；审阅者只核验，"
+            "最终汇报者只引用执行者产物，不得重复生成同一文件。"
+        )
+    else:
+        artifact_instruction = (
+            "本任务没有文件交付要求。不得创建或上传交付文件，直接在会话中报告文字结果。"
+        )
     return (
         "你正在 Hermes 官方 WebUI 的多智能体群聊中。\n"
         f"群聊名称：{room.get('name') or '群聊'}\n"
         f"当前身份：{profile}\n"
         f"参与 Profiles：{members}\n"
-        "请使用简体中文回复。结合已有讨论推进任务，明确你的判断、动作和风险；"
-        "不要机械重复其他成员。如果需要其他执行端协作，请明确指出。\n\n"
+        f"{role_instruction}\n"
+        f"{artifact_instruction}\n"
+        "请使用简体中文，避免机械重复其他成员。\n\n"
         f"最近讨论：\n{recent or '暂无'}\n\n"
         f"用户的新消息：\n{user_message.strip()}"
     )
@@ -1744,18 +1859,46 @@ async def send_message(room_id: str, payload: SendMessageBody):
         room = _room_by_id(state, room_id)
         known_profiles = set(room.get("profiles") or [])
         requested = payload.profiles or list(room.get("profiles") or [])
-        targets = [name for name in requested if name in known_profiles]
+        targets = collaboration_execution_order(
+            [name for name in requested if name in known_profiles]
+        )
         if not targets:
             raise HTTPException(status_code=400, detail="没有可执行的群聊成员")
         _append_message(room, role="user", name="用户", content=content)
+        reporter = targets[-1]
+        worker_names = [
+            name for name in targets if collaboration_role(name) == "worker"
+        ]
+        dispatch = _append_message(
+            room,
+            role="assistant",
+            name=reporter,
+            content=(
+                "任务已派发给 "
+                + ("、".join(worker_names) if worker_names else "协作成员")
+                + "，完成后将交由审阅并由我统一汇报。"
+            ),
+            meta={
+                "collaboration_role": "reporter",
+                "role_stage": "dispatch",
+                "collapse_activities": False,
+                "final_report": False,
+            },
+        )
         save_state(state)
 
-    responses = []
+    responses = [dispatch]
+    artifact_required = requires_artifact_delivery(content)
     for profile in targets:
         with _STATE_LOCK:
             state = load_state()
             room = _room_by_id(state, room_id)
-            prompt = build_group_prompt(room, profile, content)
+            prompt = build_group_prompt(
+                room,
+                profile,
+                content,
+                artifact_required=artifact_required,
+            )
         try:
             reply = await asyncio.to_thread(run_profile_turn, profile, prompt)
             status = "completed"
@@ -1771,6 +1914,14 @@ async def send_message(room_id: str, payload: SendMessageBody):
                 name=profile,
                 content=reply,
                 status=status,
+                meta={
+                    "collaboration_role": collaboration_role(profile),
+                    "role_stage": collaboration_role(profile),
+                    "collapse_activities": collaboration_role(profile)
+                    != "reporter",
+                    "final_report": collaboration_role(profile) == "reporter",
+                    "artifact_required": artifact_required,
+                },
             )
             save_state(state)
         responses.append(message)

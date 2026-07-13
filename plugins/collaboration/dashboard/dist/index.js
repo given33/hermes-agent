@@ -934,6 +934,7 @@
         ? "耗时未记录"
         : "";
     }
+    if (duration === 0) return "< 1 ms";
     if (duration < 1000) return `${Math.round(duration)} ms`;
     if (duration < 60000) return `${(duration / 1000).toFixed(duration < 10000 ? 1 : 0)} s`;
     return `${Math.floor(duration / 60000)}m ${Math.round((duration % 60000) / 1000)}s`;
@@ -987,6 +988,34 @@
           ),
         );
       }),
+    );
+  }
+
+  function RoleActivityGroup({ activities, roleLabel }) {
+    if (!activities.length) return null;
+    const running = activities.some((activity) => activity.status === "running");
+    const failed = activities.some((activity) => activity.status === "failed");
+    return h(
+      "details",
+      {
+        className:
+          "hc-role-activity-group" +
+          (running ? " is-running" : failed ? " is-failed" : " is-completed"),
+        open: running,
+      },
+      h(
+        "summary",
+        null,
+        h("i", { "aria-hidden": "true" }),
+        h("strong", null, `${roleLabel || "协作成员"} · 详情`),
+        h(
+          "span",
+          null,
+          running ? "实时执行中" : `${activities.length} 条动态`,
+        ),
+        h("span", { className: "hc-role-activity-chevron", "aria-hidden": "true" }, "›"),
+      ),
+      h(ActivityTimeline, { activities }),
     );
   }
 
@@ -1082,6 +1111,19 @@
     const attachments = message.meta?.attachments || [];
     const connection = message.meta?.connection || null;
     const isUser = message.role === "user";
+    const roleStage = isUser ? "user" : message.meta?.role_stage || "chat";
+    const roleLabel =
+      message.meta?.role_label ||
+      {
+        dispatch: "任务调度",
+        worker: "任务执行",
+        reviewer: "结果审阅",
+        reporter: "最终汇报",
+        chat: "Hermes Agent",
+      }[roleStage] ||
+      "Hermes Agent";
+    const collapseActivities = Boolean(message.meta?.collapse_activities);
+    const useOfficialAvatar = !isUser && !["worker", "reviewer"].includes(roleStage);
     const displayName = isUser ? "你" : profileDisplayName(message.name);
     return h(
       "article",
@@ -1090,27 +1132,42 @@
           "hc-message " +
           (isUser ? "is-user" : "is-agent") +
           (message.status === "failed" ? " is-failed" : "") +
-          (message.status === "streaming" ? " is-streaming" : ""),
+          (message.status === "streaming" ? " is-streaming" : "") +
+          ` is-role-${roleStage}`,
       },
       h(
         "span",
         {
           className:
-            "hc-avatar " + (isUser ? "is-user-avatar" : "is-hermes-avatar"),
+            "hc-avatar " +
+            (isUser
+              ? "is-user-avatar"
+              : useOfficialAvatar
+                ? "is-hermes-avatar"
+                : `is-${roleStage}-avatar`),
           "aria-hidden": "true",
         },
         isUser
           ? profileAvatar(message.name, message.role)
-          : h("img", {
-            className: "hc-official-avatar",
-            src: "/hermes-official.png",
-            alt: "",
-            }),
+          : useOfficialAvatar
+            ? h("img", {
+                className: "hc-official-avatar",
+                src: "/hermes-official.png",
+                alt: "",
+              })
+            : profileAvatar(message.name, message.role),
       ),
       h(
         "div",
         { className: "hc-message-stack" },
-        h("header", null, h("strong", null, displayName)),
+        h(
+          "header",
+          null,
+          h("strong", null, displayName),
+          !isUser && roleStage !== "chat"
+            ? h("span", { className: "hc-role-label" }, roleLabel)
+            : null,
+        ),
         connection
           ? h(
               "div",
@@ -1122,7 +1179,9 @@
               h("span", null, connection.text),
             )
           : null,
-        h(ActivityTimeline, { activities }),
+        collapseActivities
+          ? h(RoleActivityGroup, { activities, roleLabel })
+          : h(ActivityTimeline, { activities }),
         h(
           "div",
           { className: "hc-message-body" },
@@ -1159,11 +1218,34 @@
     const [pendingAttachments, setPendingAttachments] = useState([]);
     const [error, setError] = useState("");
     const streamRef = useRef(null);
+    const streamEndRef = useRef(null);
+    const composerRef = useRef(null);
     const fileInputRef = useRef(null);
     const composerInputRef = useRef(null);
     const expandedInputRef = useRef(null);
     const pinnedToBottomRef = useRef(true);
     const runtimeSessionsRef = useRef({});
+
+    const measureComposerOverlap = useCallback((forceScroll = false) => {
+      const stream = streamRef.current;
+      const composer = composerRef.current;
+      if (!stream || !composer) return;
+      const streamRect = stream.getBoundingClientRect();
+      const composerRect = composer.getBoundingClientRect();
+      const viewport = window.visualViewport;
+      const viewportBottom = viewport
+        ? viewport.offsetTop + viewport.height
+        : window.innerHeight;
+      const overlap = Math.max(
+        0,
+        Math.ceil(streamRect.bottom - Math.min(composerRect.top, viewportBottom)),
+      );
+      stream.style.setProperty("--hc-composer-overlap", `${overlap}px`);
+      if (forceScroll || pinnedToBottomRef.current) {
+        streamEndRef.current?.scrollIntoView({ block: "end", behavior: "auto" });
+        stream.scrollTop = stream.scrollHeight;
+      }
+    }, []);
 
     const loadConversation = useCallback(async (conversationId) => {
       if (!conversationId) {
@@ -1293,18 +1375,46 @@
       const stream = streamRef.current;
       if (!stream || !pinnedToBottomRef.current) return;
       window.requestAnimationFrame(() => {
+        measureComposerOverlap();
         stream.scrollTop = stream.scrollHeight;
       });
-    }, [messages, sending]);
+    }, [messages, sending, measureComposerOverlap]);
 
     useEffect(() => {
       pinnedToBottomRef.current = true;
       const frame = window.requestAnimationFrame(() => {
         const stream = streamRef.current;
-        if (stream) stream.scrollTop = stream.scrollHeight;
+        if (stream) measureComposerOverlap(true);
       });
       return () => window.cancelAnimationFrame(frame);
-    }, [activeId]);
+    }, [activeId, measureComposerOverlap]);
+
+    useEffect(() => {
+      let frame = 0;
+      const sync = () => {
+        window.cancelAnimationFrame(frame);
+        frame = window.requestAnimationFrame(() => measureComposerOverlap(true));
+      };
+      const composer = composerRef.current;
+      const observer =
+        composer && typeof ResizeObserver !== "undefined"
+          ? new ResizeObserver(sync)
+          : null;
+      observer?.observe(composer);
+      window.addEventListener("hermes:viewport-change", sync);
+      window.visualViewport?.addEventListener("resize", sync);
+      document.addEventListener("focusin", sync);
+      document.addEventListener("focusout", sync);
+      sync();
+      return () => {
+        window.cancelAnimationFrame(frame);
+        observer?.disconnect();
+        window.removeEventListener("hermes:viewport-change", sync);
+        window.visualViewport?.removeEventListener("resize", sync);
+        document.removeEventListener("focusin", sync);
+        document.removeEventListener("focusout", sync);
+      };
+    }, [measureComposerOverlap]);
 
     const resizeComposer = useCallback((node = composerInputRef.current) => {
       if (!node) return;
@@ -1515,6 +1625,7 @@
       prompt,
       continuedPrompt = prompt,
       sessionTitle = "",
+      options = {},
     ) => {
       const streamId = `stream-${profile}-${Date.now()}-${Math.random()}`;
       const turnStartedAt = Date.now();
@@ -1524,6 +1635,12 @@
       let activeReasoningId = "";
       let activitySequence = 0;
       let modelPhaseStartedAt = turnStartedAt;
+      const roleMeta = {
+        role_stage: options.roleStage || "",
+        role_label: options.roleLabel || "",
+        collapse_activities: Boolean(options.collapseActivities),
+        final_report: Boolean(options.finalReport),
+      };
       const closeReasoning = () => {
         if (!activeReasoningId) return;
         const endedAt = Date.now();
@@ -1607,7 +1724,7 @@
         content: "",
         status: "streaming",
         kind: "message",
-        meta: { activities: [], runtime_turn_id: streamId },
+        meta: { activities: [], runtime_turn_id: streamId, ...roleMeta },
       });
       let finalPayload = {};
       try {
@@ -1802,21 +1919,32 @@
         }
         closeReasoning();
         const finalText = finalPayload.text || "";
-        let outputAttachments = [];
-        try {
-          const artifactData = await collabApi(
-            "/single/conversations/" +
-              encodeURIComponent(conversationId) +
-              "/attachments",
-          );
-          outputAttachments = (artifactData.attachments || []).filter(
-            (attachment) =>
-              attachment.bucket === "outputs" &&
-              Number(attachment.updated_at || 0) >= turnStartedAt - 1000,
-          );
-        } catch {
-          outputAttachments = [];
+        let createdAttachments = [];
+        if (options.collectArtifacts) {
+          try {
+            const artifactData = await collabApi(
+              "/single/conversations/" +
+                encodeURIComponent(conversationId) +
+                "/attachments",
+            );
+            createdAttachments = (artifactData.attachments || []).filter(
+              (attachment) =>
+                attachment.bucket === "outputs" &&
+                Number(attachment.updated_at || 0) >= turnStartedAt - 1000,
+            );
+          } catch {
+            createdAttachments = [];
+          }
         }
+        const outputAttachments = [
+          ...(Array.isArray(options.attachments) ? options.attachments : []),
+          ...createdAttachments,
+        ].filter(
+          (attachment, index, all) =>
+            all.findIndex((item) => item.id === attachment.id) === index,
+        );
+        const publishedAttachments =
+          options.publishAttachments === false ? [] : outputAttachments;
         patchMessage(streamId, (message) => ({
           ...message,
           content: finalText || accumulatedText || message.content,
@@ -1824,8 +1952,9 @@
           meta: {
             ...(message.meta || {}),
             activities,
-            attachments: outputAttachments,
+            attachments: publishedAttachments,
             connection: null,
+            ...roleMeta,
           },
         }));
         await record(conversationId, {
@@ -1836,14 +1965,21 @@
           kind: "message",
           meta: {
             activities,
-            attachments: outputAttachments,
+            attachments: publishedAttachments,
             runtime_session_id:
               finalPayload.stored_session_id ||
               runtimeSessionsRef.current[profile] ||
               "",
             runtime_turn_id: streamId,
+            ...roleMeta,
           },
         });
+        return {
+          text: finalText || accumulatedText || "执行完成",
+          activities,
+          attachments: outputAttachments,
+          status: finalPayload.status === "error" ? "failed" : "completed",
+        };
       } catch (err) {
         if (err.submitted && err.stored_session_id) {
           runtimeSessionsRef.current = {
@@ -1852,7 +1988,7 @@
           };
           setHostedRunning(true);
           await loadConversation(conversationId).catch(() => {});
-          return;
+          return { text: "任务已转为后台执行", activities, attachments: [], status: "hosted" };
         }
         patchMessage(streamId, (message) => ({
           ...message,
@@ -1865,8 +2001,14 @@
           content: `执行失败：${err.message || err}`,
           status: "failed",
           kind: "message",
-          meta: { runtime_turn_id: streamId },
+          meta: { runtime_turn_id: streamId, ...roleMeta },
         });
+        return {
+          text: `执行失败：${err.message || err}`,
+          activities,
+          attachments: [],
+          status: "failed",
+        };
       }
     };
 
@@ -1881,6 +2023,7 @@
       ) return;
       setComposerExpanded(false);
       setContent("");
+      pinnedToBottomRef.current = true;
       setSending(true);
       setError("");
       try {
@@ -1949,6 +2092,13 @@
           body: JSON.stringify({ content: userContent, mode: routeMode }),
         });
         if (route.mode === "chat") route.profiles = [selectedProfile || "default"];
+        const artifactRequired = Boolean(route.artifact_required);
+        const artifactInstruction = artifactRequired
+          ? deliveryContext
+          : [
+              "本任务未要求交付文件。",
+              "不要创建、复制或上传文件，只在会话中提交文字结果和必要证据。",
+            ].join("\n");
         const routeMessage = {
           id: routeMessageId,
           role: "system",
@@ -1961,6 +2111,7 @@
             confidence: route.confidence,
             source: route.source,
             profiles: route.profiles || [],
+            artifact_required: artifactRequired,
           },
           created_at: Date.now(),
         };
@@ -2025,26 +2176,119 @@
             kind: "workflow",
             meta: { task_id: task?.id, child_ids: decomposition?.child_ids || [] },
           });
-          await Promise.all(
-            (route.profiles || ["default", "reviewer"]).map((profile) => {
-              const workPrompt = [
-                  "你正在 DBB3 统一智能会话的工作任务中。",
-                  `你的 Profile：${profile}`,
-                  task?.id ? `官方 Kanban 根任务：${task.id}` : "",
-                  "请实时分析该任务。经理负责计划和协调，执行端说明执行方案，reviewer 负责风险与验收。",
-                  "不要创建第二控制面；实际任务状态以官方 Kanban 为准。",
-                  `用户任务：${userContent}`,
-                  attachmentContext,
-                  deliveryContext,
-                ].filter(Boolean).join("\n");
-              return runProfile(
-                conversationId,
-                profile,
-                workPrompt,
-                workPrompt,
-                route.title,
-              );
-            }),
+          const workflowProfiles = route.profiles || [
+            "default",
+            "dbb3-worker",
+            "reviewer",
+          ];
+          const reporterProfile =
+            workflowProfiles.find(
+              (profile) => !/worker|review/i.test(String(profile)),
+            ) || "default";
+          const workerProfile =
+            workflowProfiles.find((profile) => /worker/i.test(String(profile))) ||
+            "dbb3-worker";
+          const reviewerProfile =
+            workflowProfiles.find((profile) => /review/i.test(String(profile))) ||
+            "reviewer";
+          const dispatchMessage = {
+            id: `dispatch-${Date.now()}`,
+            role: "assistant",
+            name: reporterProfile,
+            content: `任务已派发给 ${profileDisplayName(workerProfile)}。执行完成后将由 ${profileDisplayName(reviewerProfile)} 验收，再由我统一汇报。`,
+            status: "completed",
+            kind: "message",
+            meta: {
+              role_stage: "dispatch",
+              role_label: "Hermes · 调度",
+              final_report: false,
+            },
+            created_at: Date.now(),
+          };
+          addMessage(dispatchMessage);
+          await record(conversationId, dispatchMessage);
+
+          const workerPrompt = [
+            "你正在 DBB3 唯一控制面的协作任务中。",
+            `你的 Profile：${workerProfile}`,
+            task?.id ? `官方 Kanban 根任务：${task.id}` : "",
+            "你是任务执行者。负责实际执行、工具调用、证据收集和产物创建。",
+            "不要做最终总结，不要替审阅者下结论；完成后把结果、证据、耗时和遗留问题提交给审阅者。",
+            "不要创建第二控制面；实际任务状态以官方 Kanban 为准。",
+            `用户任务：${userContent}`,
+            attachmentContext,
+            artifactInstruction,
+          ].filter(Boolean).join("\n");
+          const workerResult = await runProfile(
+            conversationId,
+            workerProfile,
+            workerPrompt,
+            workerPrompt,
+            route.title,
+            {
+              roleStage: "worker",
+              roleLabel: `${profileDisplayName(workerProfile)} · 执行`,
+              collapseActivities: true,
+              finalReport: false,
+              collectArtifacts: artifactRequired,
+              publishAttachments: false,
+            },
+          );
+
+          const reviewerPrompt = [
+            "你正在 DBB3 唯一控制面的协作任务中。",
+            `你的 Profile：${reviewerProfile}`,
+            task?.id ? `官方 Kanban 根任务：${task.id}` : "",
+            "你是结果审阅者。只基于执行者提交的结果做验收、风险检查和通过或退回判断。",
+            "不要重复执行任务，不要创建或上传文件，也不要向用户做最终总结。",
+            `用户任务：${userContent}`,
+            "执行者提交：",
+            workerResult.text,
+          ].filter(Boolean).join("\n");
+          const reviewerResult = await runProfile(
+            conversationId,
+            reviewerProfile,
+            reviewerPrompt,
+            reviewerPrompt,
+            route.title,
+            {
+              roleStage: "reviewer",
+              roleLabel: `${profileDisplayName(reviewerProfile)} · 审阅`,
+              collapseActivities: true,
+              finalReport: false,
+              collectArtifacts: false,
+              publishAttachments: false,
+            },
+          );
+
+          const reporterPrompt = [
+            "你是唯一最终汇报者，也是本任务唯一可以向用户给出最终结论的角色。",
+            `你的 Profile：${reporterProfile}`,
+            task?.id ? `官方 Kanban 根任务：${task.id}` : "",
+            "综合执行者和审阅者的信息，只汇报一次：完成状态、关键结果、证据、问题与下一步。",
+            "不要重复执行已经完成的工作，不要重新生成执行者已经创建的文件。",
+            `用户任务：${userContent}`,
+            "执行者提交：",
+            workerResult.text,
+            "审阅者结论：",
+            reviewerResult.text,
+            artifactInstruction,
+          ].filter(Boolean).join("\n");
+          await runProfile(
+            conversationId,
+            reporterProfile,
+            reporterPrompt,
+            reporterPrompt,
+            route.title,
+            {
+              roleStage: "reporter",
+              roleLabel: "Hermes · 最终汇报",
+              collapseActivities: false,
+              finalReport: true,
+              collectArtifacts: false,
+              publishAttachments: artifactRequired,
+              attachments: workerResult.attachments,
+            },
           );
         } else {
           await runProfile(
@@ -2054,7 +2298,7 @@
             [
               userContent,
               attachmentContext,
-              deliveryContext,
+              artifactInstruction,
             ]
               .filter(Boolean)
               .join("\n\n"),
@@ -2196,11 +2440,16 @@
               : messages.map((message) =>
                   h(UnifiedMessage, { key: message.id, message }),
                 ),
+          h("span", {
+            ref: streamEndRef,
+            className: "hc-stream-end",
+            "aria-hidden": "true",
+          }),
         ),
         error ? h("div", { className: "hc-error hc-single-error" }, error) : null,
         h(
           "div",
-          { className: "hc-single-composer" },
+          { className: "hc-single-composer", ref: composerRef },
           h(AttachmentList, { attachments: pendingAttachments }),
           h("input", {
             ref: fileInputRef,
@@ -2234,6 +2483,10 @@
               value: content,
               rows: 1,
               placeholder: "输入消息",
+              onFocus: () => {
+                pinnedToBottomRef.current = true;
+                window.requestAnimationFrame(() => measureComposerOverlap(true));
+              },
               onChange: (event) => {
                 setContent(event.target.value);
                 resizeComposer(event.currentTarget);

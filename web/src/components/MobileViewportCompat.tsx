@@ -27,6 +27,9 @@ export function MobileViewportCompat() {
       document.documentElement.dataset.hermesKeyboard = metrics.keyboardOpen
         ? "open"
         : "closed";
+      window.dispatchEvent(
+        new CustomEvent("hermes:viewport-change", { detail: metrics }),
+      );
     };
     const scheduler = createViewportResyncScheduler(sync);
     const settle = () => scheduler.settle();

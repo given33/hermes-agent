@@ -6259,9 +6259,18 @@ def _build_call_kwargs(
             _provider_norm in {"nvidia", "nvidia-nim", "nim", "build-nvidia", "nemotron"}
             or base_url_host_matches(_effective_base, "integrate.api.nvidia.com")
         )
+        # Hubway's GPT-5.6 compatibility route returns an upstream 502 for
+        # uncapped chat-completion requests, while the same request succeeds
+        # when max_tokens is present. Keep this endpoint-specific contract
+        # scoped to its 5.6 models so other GPT-5 providers remain uncapped.
+        _is_hubway_gpt_56 = (
+            base_url_host_matches(_effective_base, "hubway.cc")
+            and "gpt-5.6" in str(model or "").lower()
+        )
         if (
             _is_anthropic_compat_endpoint(provider, _effective_base)
             or _is_nvidia_nim
+            or _is_hubway_gpt_56
         ):
             kwargs["max_tokens"] = max_tokens
 
