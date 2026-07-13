@@ -8,8 +8,45 @@
   const React = SDK.React;
   const h = React.createElement;
   const { useCallback, useEffect, useMemo, useRef, useState } = SDK.hooks;
-  const collabApi = (path, options) =>
-    SDK.fetchJSON("/api/plugins/collaboration" + path, options);
+
+  function sanitizeClientError(error) {
+    const raw = String(error?.message || error || "Hermes 请求失败");
+    const lowered = raw.toLowerCase();
+    const status = lowered.match(/(?:http\s*)?(429|5\d\d)/)?.[1] || "";
+    if (status === "429") return "模型服务请求过多，已保留当前进度。";
+    if (
+      ["500", "502", "503", "504", "520", "522", "524"].includes(status) ||
+      /bad gateway|cloudflare|origin web server|upstream/.test(lowered)
+    ) {
+      return "网络或模型服务短暂波动，DBB3 上的任务仍在继续。";
+    }
+    if (/timeout|timed out|connection reset|network request failed/.test(lowered)) {
+      return "网络连接暂时中断，已保留当前进度。";
+    }
+    return raw.replace(/<[^>]+>/g, " ").replace(/\s+/g, " ").trim().slice(0, 300);
+  }
+
+  function finalizeStreamText(payload, accumulatedText) {
+    const streamed = String(accumulatedText || "").trim();
+    const returned = String(payload?.text || "").trim();
+    if (payload?.status !== "error") return returned || streamed;
+    const cleanError = sanitizeClientError(returned || "Hermes 执行失败");
+    return streamed
+      ? `${streamed}\n\n本阶段未完成：${cleanError}`
+      : `执行失败：${cleanError}`;
+  }
+
+  const collabApi = async (path, options) => {
+    try {
+      return await SDK.fetchJSON("/api/plugins/collaboration" + path, options);
+    } catch (error) {
+      const clean = new Error(sanitizeClientError(error));
+      clean.transient = /429|5\d\d|gateway|cloudflare|timeout|network/i.test(
+        String(error?.message || error || ""),
+      );
+      throw clean;
+    }
+  };
   const kanbanApi = (path, options) =>
     SDK.fetchJSON("/api/plugins/kanban" + path, options);
 
@@ -95,7 +132,10 @@
       let connectionGeneration = 0;
       let rejectCurrentPending = null;
       let waitingForNetwork = false;
+      let appBackgrounded = document.hidden;
+      let pendingForegroundReconnect = false;
       let hiddenAt = document.hidden ? Date.now() : 0;
+      let lastForegroundRecoveryAt = 0;
       let submittedBaselineMessageCount = 0;
 
       const clearConnectTimer = () => {
@@ -146,6 +186,8 @@
         window.removeEventListener("offline", handleOffline);
         window.removeEventListener("online", handleOnline);
         window.removeEventListener("pageshow", handlePageShow);
+        window.removeEventListener("hermes:app-background", handleAppBackground);
+        window.removeEventListener("hermes:app-resume", handleAppResume);
         document.removeEventListener("visibilitychange", handleVisibilityChange);
       };
 
@@ -184,6 +226,10 @@
 
       const scheduleReconnect = (reason, immediate = false) => {
         if (completed || reconnectTimer) return;
+        if (document.hidden || appBackgrounded) {
+          pendingForegroundReconnect = true;
+          return;
+        }
         if (navigator.onLine === false) {
           if (!waitingForNetwork) {
             waitingForNetwork = true;
@@ -253,6 +299,10 @@
 
       const connect = async () => {
         if (completed) return;
+        if (document.hidden || appBackgrounded) {
+          pendingForegroundReconnect = true;
+          return;
+        }
         if (navigator.onLine === false) {
           scheduleReconnect(new Error("设备当前离线"));
           return;
@@ -438,30 +488,54 @@
         restartConnection(new Error("网络已恢复"));
       }
 
-      function handleVisibilityChange() {
-        if (document.hidden) {
-          hiddenAt = Date.now();
-          return;
-        }
-        const backgroundDuration = hiddenAt ? Date.now() - hiddenAt : 0;
+      function handleAppBackground() {
+        appBackgrounded = true;
+        hiddenAt = hiddenAt || Date.now();
+        if (reconnectTimer) clearTimeout(reconnectTimer);
+        reconnectTimer = null;
+        pendingForegroundReconnect = pendingForegroundReconnect || !socket;
+      }
+
+      function recoverForeground(reason) {
+        const now = Date.now();
+        if (now - lastForegroundRecoveryAt < 750) return;
+        const backgroundDuration = hiddenAt ? now - hiddenAt : 0;
         hiddenAt = 0;
+        appBackgrounded = false;
         if (
+          pendingForegroundReconnect ||
           backgroundDuration >= STREAM_BACKGROUND_STALE_MS ||
           (!socket && navigator.onLine !== false)
         ) {
-          restartConnection(new Error("应用已回到前台"));
+          pendingForegroundReconnect = false;
+          lastForegroundRecoveryAt = now;
+          restartConnection(new Error(reason));
         }
       }
 
+      function handleAppResume() {
+        recoverForeground("应用已回到前台");
+      }
+
+      function handleVisibilityChange() {
+        if (document.hidden) {
+          handleAppBackground();
+          return;
+        }
+        recoverForeground("页面已恢复");
+      }
+
       function handlePageShow(event) {
-        if (event.persisted || (!socket && navigator.onLine !== false)) {
-          restartConnection(new Error("页面已恢复"));
+        if (!document.hidden && (event.persisted || (!socket && navigator.onLine !== false))) {
+          recoverForeground("页面已恢复");
         }
       }
 
       window.addEventListener("offline", handleOffline);
       window.addEventListener("online", handleOnline);
       window.addEventListener("pageshow", handlePageShow);
+      window.addEventListener("hermes:app-background", handleAppBackground);
+      window.addEventListener("hermes:app-resume", handleAppResume);
       document.addEventListener("visibilitychange", handleVisibilityChange);
 
       void connect();
@@ -797,10 +871,27 @@
     return "other";
   }
 
+  function removeDuplicatedFinalReasoning(activities, finalContent) {
+    const normalize = (value) => String(value || "").replace(/\s+/g, " ").trim();
+    const finalText = normalize(finalContent);
+    if (!finalText) return activities;
+    return activities.filter(
+      (activity) => {
+        if (activity.kind !== "reasoning") return true;
+        const reasoning = normalize(activity.output);
+        const repeatsFinal =
+          reasoning === finalText ||
+          (reasoning.length >= 8 && finalText.startsWith(reasoning)) ||
+          (finalText.length >= 8 && reasoning.startsWith(finalText));
+        return !repeatsFinal;
+      },
+    );
+  }
+
   function buildActivityTimeline(source) {
     const meta = source?.meta || source || {};
     if (Array.isArray(meta.activities)) {
-      return meta.activities.map((activity, index) => ({
+      const activities = meta.activities.map((activity, index) => ({
         id: activity.id || `activity-${index}`,
         kind: activity.kind || "tool",
         category: activity.category || activityCategory(activity.name),
@@ -818,6 +909,7 @@
           activity.duration_ms ??
           (Number.isFinite(activity.duration_s) ? activity.duration_s * 1000 : null),
       }));
+      return removeDuplicatedFinalReasoning(activities, source?.content);
     }
     const activities = [];
     if (meta.reasoning) {
@@ -844,7 +936,7 @@
         duration_ms: tool.duration_ms || null,
       });
     }
-    return activities;
+    return removeDuplicatedFinalReasoning(activities, source?.content);
   }
 
   function normalizeOfficialMessages(messages, profile) {
@@ -1009,7 +1101,7 @@
           {
             key: activity.id,
             className: `hc-activity-card is-${activity.status || "completed"} is-${activity.category}`,
-            open: activity.status === "running",
+            defaultOpen: activity.status === "running",
           },
           h(
             "summary",
@@ -1054,7 +1146,7 @@
         className:
           "hc-role-activity-group" +
           (running ? " is-running" : failed ? " is-failed" : " is-completed"),
-        open: running,
+        defaultOpen: running,
       },
       h(
         "summary",
@@ -1175,7 +1267,7 @@
         chat: "Hermes Agent",
       }[roleStage] ||
       "Hermes Agent";
-    const collapseActivities = Boolean(message.meta?.collapse_activities);
+    const collapseActivities = !isUser && activities.length > 0;
     const useOfficialAvatar = !isUser && !["worker", "reviewer"].includes(roleStage);
     const displayName = isUser ? "你" : profileDisplayName(message.name);
     const runtimeModel = [
@@ -1424,36 +1516,134 @@
 
     useEffect(() => {
       if (!activeId || !hostedRunning) return undefined;
+      let disposed = false;
       let inFlight = false;
+      let eventSource = null;
+      let fallbackTimer = null;
+      let workflowStillRunning = true;
+
+      const closeEventSource = () => {
+        eventSource?.close();
+        eventSource = null;
+      };
+
+      const refreshConversationIndex = async () => {
+        const [indexData, officialData] = await Promise.all([
+          collabApi("/single/conversations"),
+          SDK.fetchJSON("/api/sessions?limit=50&offset=0&order=recent"),
+        ]);
+        if (disposed) return;
+        setConversations(
+          mergeConversationIndex(
+            indexData.conversations || [],
+            officialData.sessions || [],
+          ),
+        );
+      };
+
+      const applyHostedConversation = (conversation) => {
+        if (
+          disposed ||
+          !conversation ||
+          conversation.id !== activeConversationRef.current
+        ) return;
+        setMessages(withHostedRuntimeMessages(conversation));
+        const stillRunning = hasHostedRuntimeRuns(conversation);
+        workflowStillRunning = stillRunning;
+        setHostedRunning(stillRunning);
+        setSelectedProfile(conversation.profile || "default");
+        runtimeSessionsRef.current = {
+          ...(conversation.runtime_sessions || {}),
+        };
+        if (!stillRunning) {
+          closeEventSource();
+          void refreshConversationIndex().catch(() => {});
+        }
+      };
+
+      const scheduleFallback = (delay = 5000) => {
+        if (fallbackTimer) clearTimeout(fallbackTimer);
+        fallbackTimer = null;
+        if (disposed || document.hidden) return;
+        fallbackTimer = setTimeout(async () => {
+          fallbackTimer = null;
+          await refreshNow();
+          if (!disposed && workflowStillRunning && !eventSource && !document.hidden) {
+            scheduleFallback();
+          }
+        }, delay);
+      };
+
+      const openEventStream = () => {
+        if (disposed || !workflowStillRunning || document.hidden || eventSource) return;
+        if (typeof EventSource === "undefined") {
+          scheduleFallback(0);
+          return;
+        }
+        const url =
+          "/api/plugins/collaboration/single/conversations/" +
+          encodeURIComponent(activeId) +
+          "/hosted-events";
+        const source = new EventSource(url);
+        eventSource = source;
+        source.addEventListener("conversation", (event) => {
+          try {
+            const data = JSON.parse(event.data || "{}");
+            applyHostedConversation(data.conversation);
+          } catch {
+            // A later event or foreground snapshot will recover malformed frames.
+          }
+        });
+        source.onopen = () => {
+          if (fallbackTimer) clearTimeout(fallbackTimer);
+          fallbackTimer = null;
+        };
+        source.onerror = () => {
+          if (eventSource === source) closeEventSource();
+          scheduleFallback();
+        };
+      };
+
       const refreshNow = async () => {
-        if (inFlight) return;
+        if (inFlight || disposed || document.hidden) return;
         inFlight = true;
         try {
           const conversation = await loadConversation(activeId);
+          applyHostedConversation(conversation);
           if (!hasHostedRuntimeRuns(conversation)) {
-            const [indexData, officialData] = await Promise.all([
-              collabApi("/single/conversations"),
-              SDK.fetchJSON("/api/sessions?limit=50&offset=0&order=recent"),
-            ]);
-            setConversations(
-              mergeConversationIndex(
-                indexData.conversations || [],
-                officialData.sessions || [],
-              ),
-            );
+            await refreshConversationIndex();
           }
         } catch (err) {
-          setError(err.message || "后台任务状态刷新失败");
+          if (!err.transient) {
+            setError(err.message || "后台任务状态刷新失败");
+          }
         } finally {
           inFlight = false;
+          if (!disposed && !document.hidden && workflowStillRunning) openEventStream();
         }
       };
-      const timer = setInterval(refreshNow, 3000);
+
+      const handleBackground = () => {
+        closeEventSource();
+        if (fallbackTimer) clearTimeout(fallbackTimer);
+        fallbackTimer = null;
+      };
+      const handleVisibility = () => {
+        if (document.hidden) handleBackground();
+        else void refreshNow();
+      };
+
       window.addEventListener("hermes:app-resume", refreshNow);
-      void refreshNow();
+      window.addEventListener("hermes:app-background", handleBackground);
+      document.addEventListener("visibilitychange", handleVisibility);
+      openEventStream();
       return () => {
-        clearInterval(timer);
+        disposed = true;
+        closeEventSource();
+        if (fallbackTimer) clearTimeout(fallbackTimer);
         window.removeEventListener("hermes:app-resume", refreshNow);
+        window.removeEventListener("hermes:app-background", handleBackground);
+        document.removeEventListener("visibilitychange", handleVisibility);
       };
     }, [activeId, hostedRunning, loadConversation]);
 
@@ -1763,6 +1953,10 @@
       let modelPhaseStartedAt = turnStartedAt;
       let actualModel = "";
       let actualProvider = "";
+      let fallbackReasoning = "";
+      let sawStreamedReasoning = false;
+      let streamRenderTimer = null;
+      let lastStreamRenderAt = 0;
       const roleMeta = {
         role_stage: options.roleStage || "",
         role_label: options.roleLabel || "",
@@ -1845,6 +2039,27 @@
         activities = [...activities, activity];
         return activity;
       };
+      const flushStreamRender = () => {
+        if (streamRenderTimer) clearTimeout(streamRenderTimer);
+        streamRenderTimer = null;
+        lastStreamRenderAt = performance.now();
+        patchMessage(streamId, (message) => ({
+          ...message,
+          content: accumulatedText || message.content,
+          meta: {
+            ...(message.meta || {}),
+            activities: [...activities],
+          },
+        }));
+      };
+      const scheduleStreamRender = () => {
+        if (streamRenderTimer) return;
+        const elapsed = performance.now() - lastStreamRenderAt;
+        streamRenderTimer = setTimeout(
+          flushStreamRender,
+          Math.max(0, 80 - elapsed),
+        );
+      };
       addMessage({
         id: streamId,
         role: "assistant",
@@ -1887,6 +2102,25 @@
               }
               return;
             }
+            if (event.type === "message.delta") {
+              closeReasoning();
+              accumulatedText += payload.text || "";
+              scheduleStreamRender();
+              return;
+            }
+            if (event.type === "reasoning.available") {
+              if (!sawStreamedReasoning) {
+                fallbackReasoning = structuredText(payload.text || "");
+              }
+              return;
+            }
+            if (event.type === "reasoning.delta") {
+              sawStreamedReasoning = true;
+              appendReasoning(payload.text || "");
+              scheduleStreamRender();
+              return;
+            }
+            flushStreamRender();
             patchMessage(streamId, (message) => {
               const meta = { ...(message.meta || {}) };
               if (event.type === "connection.waiting") {
@@ -1917,19 +2151,6 @@
                 meta.actual_provider = actualProvider;
                 return { ...message, meta };
               }
-              if (event.type === "message.delta") {
-                closeReasoning();
-                accumulatedText += payload.text || "";
-                meta.activities = activities;
-                return { ...message, content: accumulatedText, meta };
-              }
-              if (
-                event.type === "reasoning.delta" ||
-                event.type === "thinking.delta" ||
-                event.type === "reasoning.available"
-              ) {
-                appendReasoning(payload.text || "");
-              }
               if (event.type === "tool.start") {
                 closeReasoning();
                 modelPhaseStartedAt = 0;
@@ -1944,7 +2165,9 @@
                   (activity) => activity.kind === "tool" && activity.status === "running" && activity.name === name,
                   { preview },
                 );
-                if (!matched) addToolActivity(payload, { preview });
+                if (!matched && event.type !== "tool.generating") {
+                  addToolActivity(payload, { preview });
+                }
               }
               if (event.type === "tool.complete") {
                 const endedAt = Date.now();
@@ -2053,7 +2276,36 @@
           };
         }
         closeReasoning();
-        const finalText = finalPayload.text || "";
+        const finalText = finalizeStreamText(finalPayload, accumulatedText);
+        if (fallbackReasoning && !sawStreamedReasoning) {
+          const fallbackEndedAt = Date.now();
+          const fallbackActivities = removeDuplicatedFinalReasoning(
+            [
+              {
+                id: `reasoning-${fallbackEndedAt}-${++activitySequence}`,
+                kind: "reasoning",
+                category: "reasoning",
+                name: "模型思考",
+                input: "",
+                output: fallbackReasoning,
+                status: "completed",
+                started_at: modelPhaseStartedAt || turnStartedAt,
+                ended_at: fallbackEndedAt,
+                duration_ms: Math.max(
+                  0,
+                  fallbackEndedAt - (modelPhaseStartedAt || turnStartedAt),
+                ),
+              },
+            ],
+            finalText,
+          );
+          activities = [...activities, ...fallbackActivities];
+        }
+        activities = removeDuplicatedFinalReasoning(
+          activities,
+          finalText || accumulatedText,
+        );
+        flushStreamRender();
         let createdAttachments = [];
         if (options.collectArtifacts) {
           try {
@@ -2120,6 +2372,8 @@
           status: finalPayload.status === "error" ? "failed" : "completed",
         };
       } catch (err) {
+        if (streamRenderTimer) clearTimeout(streamRenderTimer);
+        streamRenderTimer = null;
         if (err.submitted && err.stored_session_id) {
           runtimeSessionsRef.current = {
             ...runtimeSessionsRef.current,
@@ -2129,21 +2383,22 @@
           await loadConversation(conversationId).catch(() => {});
           return { text: "任务已转为后台执行", activities, attachments: [], status: "hosted" };
         }
+        const cleanError = sanitizeClientError(err);
         patchMessage(streamId, (message) => ({
           ...message,
-          content: `执行失败：${err.message || err}`,
+          content: `执行失败：${cleanError}`,
           status: "failed",
         }));
         await record(conversationId, {
           role: "assistant",
           name: profile,
-          content: `执行失败：${err.message || err}`,
+          content: `执行失败：${cleanError}`,
           status: "failed",
           kind: "message",
           meta: { runtime_turn_id: streamId, ...roleMeta },
         });
         return {
-          text: `执行失败：${err.message || err}`,
+          text: `执行失败：${cleanError}`,
           activities,
           attachments: [],
           status: "failed",

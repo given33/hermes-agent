@@ -49,7 +49,8 @@ class TestBuildSSHCommand:
         env = SSHEnvironment(host="h", user="u")
         cmd = " ".join(env._build_ssh_command())
         for flag in ("ControlMaster=auto", "ControlPersist=300",
-                      "BatchMode=yes", "StrictHostKeyChecking=accept-new"):
+                      "BatchMode=yes", "StrictHostKeyChecking=accept-new",
+                      "ConnectionAttempts=3"):
             assert flag in cmd
 
     def test_custom_port(self):

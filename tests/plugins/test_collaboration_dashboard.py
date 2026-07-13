@@ -397,6 +397,103 @@ class CollaborationDashboardTests(unittest.TestCase):
         self.assertIn("active", tools[0]["output"])
         self.assertEqual(tools[0]["status"], "completed")
 
+    def test_runtime_activity_timeline_drops_reasoning_repeated_by_final_answer(self):
+        module = load_module()
+        activities = module.build_runtime_activity_timeline(
+            [
+                {
+                    "role": "assistant",
+                    "reasoning_content": "先检查服务，再整理结果。",
+                    "timestamp": 10.0,
+                },
+                {
+                    "role": "assistant",
+                    "content": "服务已经恢复。",
+                    "reasoning_content": "\n服务已经恢复。\n",
+                    "timestamp": 12.0,
+                },
+                {
+                    "role": "assistant",
+                    "content": "本地电脑已经连接，处理器监控也已经恢复。",
+                    "reasoning_content": "本地电脑已经连接，",
+                    "timestamp": 14.0,
+                },
+            ]
+        )
+
+        self.assertEqual(
+            [item["output"] for item in activities if item["kind"] == "reasoning"],
+            ["先检查服务，再整理结果。"],
+        )
+
+    def test_provider_html_error_is_replaced_with_concise_chinese_status(self):
+        module = load_module()
+        raw_error = (
+            "API call failed after 3 retries: HTTP 502: "
+            "<html><head><title>502 Bad Gateway</title></head>"
+            "<body><h1>502 Bad Gateway</h1><center>nginx</center></body></html>"
+        )
+
+        cleaned = module.sanitize_runtime_error(raw_error)
+
+        self.assertEqual(
+            cleaned,
+            "模型服务暂时繁忙（HTTP 502），已保留当前进度。",
+        )
+        self.assertNotIn("<html>", cleaned.lower())
+        self.assertNotIn("nginx", cleaned.lower())
+
+    def test_profile_event_stream_uses_structured_json_and_keeps_tool_details(self):
+        module = load_module()
+        events = []
+        response = module.consume_profile_event_stream(
+            [
+                "not a json log line\n",
+                json.dumps(
+                    {
+                        "type": "tool.start",
+                        "payload": {
+                            "tool_id": "tool-1",
+                            "name": "mcp__memory__search",
+                            "args": {"query": "Hermes"},
+                        },
+                    },
+                    ensure_ascii=False,
+                )
+                + "\n",
+                json.dumps(
+                    {
+                        "type": "tool.complete",
+                        "payload": {
+                            "tool_id": "tool-1",
+                            "name": "mcp__memory__search",
+                            "result_text": "找到 2 条记录",
+                            "duration_s": 1.25,
+                        },
+                    },
+                    ensure_ascii=False,
+                )
+                + "\n",
+                json.dumps(
+                    {
+                        "type": "message.complete",
+                        "payload": {"text": "任务完成", "status": "completed"},
+                    },
+                    ensure_ascii=False,
+                )
+                + "\n",
+            ],
+            events.append,
+        )
+
+        self.assertEqual(response, "任务完成")
+        self.assertEqual([event["type"] for event in events], [
+            "tool.start",
+            "tool.complete",
+            "message.complete",
+        ])
+        self.assertEqual(events[1]["payload"]["duration_s"], 1.25)
+
     def test_reasoning_duration_uses_previous_message_as_model_start_boundary(self):
         module = load_module()
         activities = module.build_runtime_activity_timeline(
@@ -683,9 +780,9 @@ class CollaborationDashboardTests(unittest.TestCase):
         self.assertTrue(manifest["tab"]["hidden"])
         self.assertEqual(manifest["api"], "plugin_api.py")
         self.assertIn("chat:top", manifest["slots"])
-        self.assertEqual(manifest["version"], "2.1.31")
-        self.assertEqual(manifest["entry"], "dist/index.js?v=2.1.31")
-        self.assertEqual(manifest["css"], "dist/style.css?v=2.1.31")
+        self.assertEqual(manifest["version"], "2.1.33")
+        self.assertEqual(manifest["entry"], "dist/index.js?v=2.1.33")
+        self.assertEqual(manifest["css"], "dist/style.css?v=2.1.33")
 
     def test_dbb3_release_installer_uses_private_snapshot_and_health_files(self):
         installer = (
@@ -804,7 +901,7 @@ class CollaborationDashboardTests(unittest.TestCase):
         )
         self.assertIn("hc-activity-timeline", bundle)
         self.assertIn("hc-activity-card", bundle)
-        self.assertIn('event.type === "thinking.delta"', bundle)
+        self.assertNotIn('event.type === "thinking.delta"', bundle)
         self.assertIn('event.type === "tool.progress"', bundle)
         self.assertIn('event.type === "subagent.tool"', bundle)
         self.assertNotIn("hc-streaming-label", bundle)
@@ -843,6 +940,78 @@ class CollaborationDashboardTests(unittest.TestCase):
             ["耗时未记录", "< 1 ms", "2.0 s"],
         )
 
+    def test_frontend_removes_final_answer_prefix_from_reasoning_but_keeps_real_thoughts(self):
+        bundle = (MODULE_PATH.parent / "dist" / "index.js").read_text(
+            encoding="utf-8"
+        )
+        start = bundle.index("function removeDuplicatedFinalReasoning(")
+        end = bundle.index("\n  function buildActivityTimeline", start)
+        function_source = bundle[start:end]
+        script = (
+            function_source
+            + "\nconsole.log(JSON.stringify([removeDuplicatedFinalReasoning(["
+            + "{id:'real',kind:'reasoning',output:'先检查服务'},"
+            + "{id:'prefix',kind:'reasoning',output:'服务已经恢复，'},"
+            + "{id:'duplicate',kind:'reasoning',output:'  服务已恢复  '},"
+            + "{id:'tool',kind:'tool',output:'服务已恢复'}"
+            + "], '\\n服务已恢复\\n').map((item) => item.id),"
+            + "removeDuplicatedFinalReasoning(["
+            + "{id:'prefix',kind:'reasoning',output:'本地电脑已经连接，'},"
+            + "{id:'tool',kind:'tool',output:'ok'}"
+            + "], '本地电脑已经连接，处理器监控也已经恢复。').map((item) => item.id)"
+            + "]));"
+        )
+        result = subprocess.run(
+            ["node", "-e", script],
+            check=True,
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+        )
+
+        self.assertEqual(
+            json.loads(result.stdout),
+            [["real", "prefix", "tool"], ["tool"]],
+        )
+        self.assertIn(
+            "removeDuplicatedFinalReasoning(activities, source?.content)",
+            bundle,
+        )
+
+    def test_frontend_sanitizes_stream_error_and_preserves_partial_output(self):
+        bundle = (MODULE_PATH.parent / "dist" / "index.js").read_text(
+            encoding="utf-8"
+        )
+        start = bundle.index("function sanitizeClientError(error)")
+        end = bundle.index("\n\n  const collabApi", start)
+        helper_source = bundle[start:end]
+        script = (
+            helper_source
+            + "\nconsole.log(JSON.stringify(["
+            + "finalizeStreamText({status:'error',text:'HTTP 502: <html><h1>Bad Gateway</h1></html>'}, '已经完成初步检查。'),"
+            + "finalizeStreamText({status:'completed',text:'正常结果'}, '流式片段')"
+            + "]));"
+        )
+        result = subprocess.run(
+            ["node", "-e", script],
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+        )
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(
+            json.loads(result.stdout),
+            [
+                "已经完成初步检查。\n\n本阶段未完成：网络或模型服务短暂波动，DBB3 上的任务仍在继续。",
+                "正常结果",
+            ],
+        )
+        self.assertIn(
+            "const finalText = finalizeStreamText(finalPayload, accumulatedText);",
+            bundle,
+        )
+
     def test_frontend_realtime_reasoning_uses_model_phase_start_boundary(self):
         bundle = (MODULE_PATH.parent / "dist" / "index.js").read_text(
             encoding="utf-8"
@@ -851,6 +1020,65 @@ class CollaborationDashboardTests(unittest.TestCase):
         self.assertIn("let modelPhaseStartedAt = turnStartedAt;", bundle)
         self.assertIn("started_at: modelPhaseStartedAt || Date.now(),", bundle)
         self.assertIn("modelPhaseStartedAt = endedAt;", bundle)
+
+    def test_hosted_event_reducer_ignores_spinner_text_but_keeps_real_reasoning(self):
+        module = load_module()
+        state = {"content": "", "status": "streaming", "activities": []}
+
+        module.apply_profile_event(
+            state,
+            {"type": "thinking.delta", "payload": {"text": "reflecting..."}},
+        )
+        module.apply_profile_event(
+            state,
+            {"type": "reasoning.delta", "payload": {"text": "正在检查服务。"}},
+        )
+
+        reasoning = [
+            item for item in state["activities"] if item["kind"] == "reasoning"
+        ]
+        self.assertEqual([item["output"] for item in reasoning], ["正在检查服务。"])
+
+    def test_tool_generating_does_not_create_a_duplicate_running_activity(self):
+        module = load_module()
+        state = {"content": "", "status": "streaming", "activities": []}
+
+        module.apply_profile_event(
+            state,
+            {"type": "tool.generating", "payload": {"name": "terminal"}},
+        )
+        module.apply_profile_event(
+            state,
+            {
+                "type": "tool.start",
+                "payload": {
+                    "tool_id": "call-terminal-1",
+                    "name": "terminal",
+                    "args": {"command": "hostname"},
+                },
+            },
+        )
+        module.apply_profile_event(
+            state,
+            {
+                "type": "tool.complete",
+                "payload": {
+                    "tool_id": "call-terminal-1",
+                    "name": "terminal",
+                    "result_text": "ok",
+                },
+            },
+        )
+
+        tools = [item for item in state["activities"] if item["kind"] == "tool"]
+        self.assertEqual(len(tools), 1)
+        self.assertEqual(tools[0]["id"], "call-terminal-1")
+        self.assertEqual(tools[0]["status"], "completed")
+
+        bundle = (MODULE_PATH.parent / "dist" / "index.js").read_text(
+            encoding="utf-8"
+        )
+        self.assertIn('if (!matched && event.type !== "tool.generating")', bundle)
 
     def test_backend_hosted_workflow_runs_roles_serially_and_publishes_one_final_report(self):
         module = load_module()
@@ -906,6 +1134,171 @@ class CollaborationDashboardTests(unittest.TestCase):
         self.assertEqual(
             conversation["hosted_turns"]["turn-hosted-1"]["status"],
             "completed",
+        )
+        for _profile, prompt in calls:
+            self.assertIn("Kanban ID 仅用于关联追踪", prompt)
+            self.assertIn("不要主动查询或修改 Kanban 内部状态", prompt)
+
+    def test_hosted_roles_persist_separate_live_messages_with_nested_activities(self):
+        module = load_module()
+        conversation = module.create_single_conversation("default")
+        state = {"conversations": [conversation]}
+        module.load_single_state = lambda: state
+        module.save_single_state = lambda _state: None
+        module.create_hosted_turn_record(
+            conversation,
+            turn_id="turn-live-roles",
+            content="检查两个设备并汇报",
+            title="检查两个设备",
+            profiles=["default", "pc-worker", "reviewer"],
+            artifact_required=False,
+        )
+        observed_running_messages = []
+
+        def runner(profile, _prompt, *, event_callback=None):
+            event_callback(
+                {
+                    "type": "session.info",
+                    "payload": {"provider": "hubway", "model": "gpt-5.6-sol"},
+                }
+            )
+            event_callback(
+                {
+                    "type": "reasoning.delta",
+                    "payload": {"text": f"{profile} 正在分析。"},
+                }
+            )
+            event_callback(
+                {
+                    "type": "tool.start",
+                    "payload": {
+                        "tool_id": f"tool-{profile}",
+                        "name": "terminal",
+                        "args": {"command": "hostname"},
+                        "started_at": 1000,
+                    },
+                }
+            )
+            event_callback(
+                {
+                    "type": "message.delta",
+                    "payload": {"text": f"{profile} 已取得第一条结果。"},
+                }
+            )
+            role_message = next(
+                message
+                for message in conversation["messages"]
+                if message.get("meta", {}).get("runtime_turn_id") == "turn-live-roles"
+                and message.get("name") == profile
+                and message.get("status") == "streaming"
+            )
+            observed_running_messages.append(role_message["content"])
+            event_callback(
+                {
+                    "type": "tool.complete",
+                    "payload": {
+                        "tool_id": f"tool-{profile}",
+                        "name": "terminal",
+                        "result_text": "dbb3-hermes",
+                        "duration_s": 0.42,
+                    },
+                }
+            )
+            return f"{profile} 阶段完成"
+
+        module.execute_hosted_workflow(
+            conversation["id"],
+            "turn-live-roles",
+            runner=runner,
+            task_creator=lambda **_kwargs: {
+                "task_id": "root-live",
+                "child_ids": ["child-live"],
+                "fanout": True,
+            },
+        )
+
+        role_messages = [
+            message
+            for message in conversation["messages"]
+            if message.get("meta", {}).get("runtime_turn_id") == "turn-live-roles"
+            and message.get("meta", {}).get("role_stage")
+            in {"dispatch", "worker", "reviewer", "reporter"}
+        ]
+        self.assertEqual(
+            [message["meta"]["role_stage"] for message in role_messages],
+            ["dispatch", "worker", "reviewer", "reporter"],
+        )
+        self.assertEqual(len(observed_running_messages), 3)
+        for message in role_messages[1:]:
+            self.assertTrue(message["meta"]["collapse_activities"])
+            self.assertEqual(message["meta"]["actual_model"], "gpt-5.6-sol")
+            self.assertEqual(message["meta"]["activities"][1]["category"], "command")
+            self.assertEqual(message["meta"]["activities"][1]["duration_ms"], 420)
+
+    def test_hosted_workflow_retries_transient_502_without_losing_partial_progress(self):
+        module = load_module()
+        conversation = module.create_single_conversation("default")
+        state = {"conversations": [conversation]}
+        module.load_single_state = lambda: state
+        module.save_single_state = lambda _state: None
+        module.create_hosted_turn_record(
+            conversation,
+            turn_id="turn-retry-502",
+            content="检查服务",
+            title="检查服务",
+            profiles=["default", "dbb3-worker", "reviewer"],
+            artifact_required=False,
+        )
+        worker_attempts = 0
+
+        def runner(profile, _prompt, *, event_callback=None):
+            nonlocal worker_attempts
+            if profile == "dbb3-worker":
+                worker_attempts += 1
+                if worker_attempts == 1:
+                    event_callback(
+                        {
+                            "type": "reasoning.delta",
+                            "payload": {"text": "已经完成初步检查。"},
+                        }
+                    )
+                    raise RuntimeError(
+                        "HTTP 502: <html><body><h1>Bad Gateway</h1></body></html>"
+                    )
+                event_callback(
+                    {
+                        "type": "message.delta",
+                        "payload": {"text": "重试后服务恢复。"},
+                    }
+                )
+                return "执行恢复完成"
+            return "审阅通过" if profile == "reviewer" else "最终汇报完成"
+
+        module.execute_hosted_workflow(
+            conversation["id"],
+            "turn-retry-502",
+            runner=runner,
+            task_creator=lambda **_kwargs: {
+                "task_id": "root-retry",
+                "child_ids": [],
+                "fanout": False,
+            },
+        )
+
+        worker_message = next(
+            message
+            for message in conversation["messages"]
+            if message.get("meta", {}).get("role_stage") == "worker"
+        )
+        self.assertEqual(worker_attempts, 2)
+        self.assertEqual(worker_message["content"], "执行恢复完成")
+        self.assertNotIn("<html>", json.dumps(worker_message, ensure_ascii=False).lower())
+        self.assertTrue(
+            any(
+                activity.get("kind") == "reasoning"
+                and "初步检查" in activity.get("output", "")
+                for activity in worker_message["meta"]["activities"]
+            )
         )
 
     def test_frontend_submits_complex_workflow_once_to_dbb3_hosting(self):
@@ -1250,7 +1643,8 @@ class CollaborationDashboardTests(unittest.TestCase):
         self.assertIn("representedTurnIds", bundle)
         self.assertIn("DBB3 服务端持续执行", bundle)
         self.assertIn("任务已由 DBB3 托管", bundle)
-        self.assertIn("setInterval", bundle)
+        self.assertIn("new EventSource", bundle)
+        self.assertNotIn("setInterval(refreshNow, 3000)", bundle)
         self.assertIn("latestAssistantText", bundle)
         self.assertIn("hc-connection-state", bundle)
         self.assertNotIn("reject(new Error(`${profile} 流式连接失败`))", bundle)
@@ -1305,6 +1699,10 @@ class CollaborationDashboardTests(unittest.TestCase):
             bundle,
         )
         self.assertIn("STREAM_BACKGROUND_STALE_MS", bundle)
+        self.assertIn("appBackgrounded", bundle)
+        self.assertIn("pendingForegroundReconnect", bundle)
+        self.assertIn("document.hidden || appBackgrounded", bundle)
+        self.assertIn('window.addEventListener("hermes:app-background"', bundle)
         self.assertIn('window.addEventListener("hermes:app-resume", refreshNow)', bundle)
         self.assertIn('window.removeEventListener("hermes:app-resume", refreshNow)', bundle)
         self.assertIn("设备离线，等待网络恢复；已提交任务会继续运行", bundle)
@@ -1315,6 +1713,7 @@ class CollaborationDashboardTests(unittest.TestCase):
             'document.removeEventListener("visibilitychange", handleVisibilityChange)',
             bundle,
         )
+        self.assertNotIn("setInterval(refreshNow, 3000)", bundle)
 
     def test_frontend_css_constrains_group_chat_on_mobile(self):
         stylesheet = (MODULE_PATH.parent / "dist" / "style.css").read_text(
@@ -1365,6 +1764,18 @@ class CollaborationDashboardTests(unittest.TestCase):
         self.assertIn(".hc-activity-timeline", stylesheet)
         self.assertIn(".hc-activity-card", stylesheet)
         self.assertIn(".hc-activity-detail", stylesheet)
+
+    def test_release_installer_keeps_existing_hashed_assets_during_deploy(self):
+        installer = (
+            MODULE_PATH.parents[3]
+            / "deploy"
+            / "dbb3"
+            / "install-collaboration-release.sh"
+        ).read_text(encoding="utf-8")
+
+        self.assertNotIn('mv "${web_target}/assets"', installer)
+        self.assertIn('install -d -o root -g root -m 0755 "${web_target}/assets"', installer)
+        self.assertIn('"${release_snapshot}/web/assets/." "${web_target}/assets/"', installer)
 
     def test_official_chat_shell_routes_new_session_to_unified_chat(self):
         repo_root = MODULE_PATH.parents[3]

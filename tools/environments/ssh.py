@@ -87,6 +87,7 @@ class SSHEnvironment(BaseEnvironment):
         cmd.extend(["-o", "ControlPersist=300"])
         cmd.extend(["-o", "BatchMode=yes"])
         cmd.extend(["-o", "StrictHostKeyChecking=accept-new"])
+        cmd.extend(["-o", "ConnectionAttempts=3"])
         cmd.extend(["-o", "ConnectTimeout=10"])
         if self.port != 22:
             cmd.extend(["-p", str(self.port)])

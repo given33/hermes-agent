@@ -116,9 +116,6 @@ install -m 0755 "${release_snapshot}/plugin/plugin_api.py" "${plugin_target}/plu
 install -m 0644 "${release_snapshot}/plugin/dist/index.js" "${plugin_target}/dist/index.js"
 install -m 0644 "${release_snapshot}/plugin/dist/style.css" "${plugin_target}/dist/style.css"
 
-if [[ -d "${web_target}/assets" ]]; then
-  mv "${web_target}/assets" "${web_target}/assets.before-${stamp}"
-fi
 install -d -o root -g root -m 0755 "${web_target}/assets"
 cp -R --no-preserve=mode,ownership \
   "${release_snapshot}/web/assets/." "${web_target}/assets/"

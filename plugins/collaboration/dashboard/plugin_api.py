@@ -10,13 +10,16 @@ from __future__ import annotations
 
 import asyncio
 from collections import Counter
-from contextlib import asynccontextmanager
+from contextlib import asynccontextmanager, redirect_stderr, redirect_stdout
+import inspect
 import json
 import logging
 import mimetypes
 import os
+import queue
 import re
 import subprocess
+import sys
 import threading
 import time
 import uuid
@@ -25,7 +28,7 @@ from typing import Any, Callable, Optional
 from urllib.parse import quote, unquote
 
 from fastapi import APIRouter, HTTPException, Request
-from fastapi.responses import FileResponse
+from fastapi.responses import FileResponse, StreamingResponse
 from pydantic import BaseModel, Field
 
 from hermes_cli.config import get_hermes_home
@@ -49,7 +52,11 @@ router = APIRouter(lifespan=collaboration_dashboard_lifespan)
 _STATE_LOCK = threading.RLock()
 _HOSTED_THREADS_LOCK = threading.Lock()
 _HOSTED_THREADS: dict[str, threading.Thread] = {}
+_HOSTED_UPDATE_CONDITION = threading.Condition()
+_HOSTED_UPDATE_REVISION = 0
 _HOSTED_TERMINAL_STATUSES = {"completed", "failed", "cancelled"}
+_HOSTED_TRANSIENT_RETRIES = 1
+_HOSTED_EVENT_FLUSH_SECONDS = 0.45
 _MAX_MESSAGES = 200
 _PROMPT_HISTORY = 24
 _MAX_ATTACHMENT_BYTES = 64 * 1024 * 1024
@@ -633,6 +640,49 @@ def _structured_text(value: Any) -> str:
     return str(value).strip()
 
 
+def sanitize_runtime_error(error: Any) -> str:
+    """Return a short user-facing error without upstream HTML or proxy internals."""
+    text = _structured_text(error)
+    lowered = text.lower()
+    status_match = re.search(r"(?:http\s*)?(4\d\d|5\d\d)", lowered)
+    status = status_match.group(1) if status_match else ""
+    if status == "429" or "rate limit" in lowered:
+        return "模型服务请求过多（HTTP 429），已保留当前进度。"
+    if status in {"500", "502", "503", "504", "520", "522", "524"} or any(
+        marker in lowered
+        for marker in ("bad gateway", "cloudflare", "origin web server", "upstream")
+    ):
+        visible_status = status or "502"
+        return f"模型服务暂时繁忙（HTTP {visible_status}），已保留当前进度。"
+    if any(
+        marker in lowered
+        for marker in ("timed out", "timeout", "connection reset", "connection aborted")
+    ):
+        return "模型服务连接超时，已保留当前进度。"
+    without_html = re.sub(r"<[^>]+>", " ", text)
+    without_html = re.sub(r"\s+", " ", without_html).strip()
+    return (without_html or "Hermes 执行失败")[:400]
+
+
+def _is_transient_runtime_error(error: Any) -> bool:
+    text = _structured_text(error).lower()
+    return bool(
+        re.search(r"(?:http\s*)?(429|500|502|503|504|520|522|524)", text)
+        or any(
+            marker in text
+            for marker in (
+                "bad gateway",
+                "cloudflare",
+                "timed out",
+                "timeout",
+                "connection reset",
+                "connection aborted",
+                "temporarily unavailable",
+            )
+        )
+    )
+
+
 def _reasoning_text(message: dict[str, Any]) -> str:
     for key in ("reasoning_content", "reasoning", "thinking"):
         text = _structured_text(message.get(key))
@@ -642,6 +692,23 @@ def _reasoning_text(message: dict[str, Any]) -> str:
     if isinstance(meta, dict):
         return _structured_text(meta.get("reasoning"))
     return ""
+
+
+def _reasoning_repeats_final(reasoning: Any, final_content: Any) -> bool:
+    reasoning_text = re.sub(r"\s+", " ", _structured_text(reasoning)).strip()
+    final_text = re.sub(r"\s+", " ", _structured_text(final_content)).strip()
+    if not reasoning_text or not final_text:
+        return False
+    if reasoning_text == final_text:
+        return True
+    minimum_prefix = 8
+    return (
+        len(reasoning_text) >= minimum_prefix
+        and final_text.startswith(reasoning_text)
+    ) or (
+        len(final_text) >= minimum_prefix
+        and reasoning_text.startswith(final_text)
+    )
 
 
 def _tool_category(name: str) -> str:
@@ -682,7 +749,8 @@ def build_runtime_activity_timeline(
         message_timestamp = _timestamp_ms(message)
         if role == "assistant":
             reasoning = _reasoning_text(message)
-            if reasoning:
+            final_content = _message_content_text(message)
+            if reasoning and not _reasoning_repeats_final(reasoning, final_content):
                 sequence += 1
                 activity = {
                     "id": f"reasoning-{sequence}",
@@ -1295,12 +1363,45 @@ def build_single_prompt(
     )
 
 
-def run_profile_turn(
+def consume_profile_event_stream(
+    lines: Any,
+    event_callback: Optional[Callable[[dict[str, Any]], None]] = None,
+) -> str:
+    """Consume the profile runner's JSONL protocol without parsing display logs."""
+    final_response = ""
+    for raw_line in lines:
+        line = str(raw_line or "").strip()
+        if not line:
+            continue
+        try:
+            event = json.loads(line)
+        except (TypeError, ValueError):
+            continue
+        if not isinstance(event, dict) or not isinstance(event.get("type"), str):
+            continue
+        payload = event.get("payload")
+        if not isinstance(payload, dict):
+            event["payload"] = {}
+            payload = event["payload"]
+        if event_callback is not None:
+            event_callback(event)
+        if event["type"] == "message.complete":
+            final_response = _structured_text(payload.get("text"))
+            if str(payload.get("status") or "").lower() == "error":
+                raise RuntimeError(
+                    sanitize_runtime_error(final_response or "Hermes 执行失败")
+                )
+        elif event["type"] == "error":
+            raise RuntimeError(sanitize_runtime_error(payload.get("message")))
+    return final_response
+
+
+def _legacy_profile_turn(
     profile: str,
     prompt: str,
     *,
-    runner: Callable[..., Any] = subprocess.run,
-    hermes_bin: str = "/usr/local/bin/hermes",
+    runner: Callable[..., Any],
+    hermes_bin: str,
 ) -> str:
     command = [
         hermes_bin,
@@ -1324,9 +1425,102 @@ def run_profile_turn(
         env={**os.environ, "HOME": os.environ.get("HOME", "/home/hermes")},
     )
     if result.returncode != 0:
-        error = (result.stderr or result.stdout or "Hermes profile execution failed").strip()
-        raise RuntimeError(error[-2000:])
+        error = result.stderr or result.stdout or "Hermes profile execution failed"
+        raise RuntimeError(sanitize_runtime_error(error))
     response = (result.stdout or "").strip()
+    if not response:
+        raise RuntimeError("Hermes profile returned an empty response")
+    return response
+
+
+def run_profile_turn(
+    profile: str,
+    prompt: str,
+    *,
+    runner: Optional[Callable[..., Any]] = None,
+    hermes_bin: str = "/usr/local/bin/hermes",
+    event_callback: Optional[Callable[[dict[str, Any]], None]] = None,
+    process_factory: Callable[..., Any] = subprocess.Popen,
+    timeout: float = 600,
+) -> str:
+    """Run a profile through a structured JSONL child event channel."""
+    if runner is not None:
+        return _legacy_profile_turn(
+            profile,
+            prompt,
+            runner=runner,
+            hermes_bin=hermes_bin,
+        )
+
+    from hermes_cli.profiles import resolve_profile_env
+
+    env = {
+        **os.environ,
+        "HOME": os.environ.get("HOME", "/home/hermes"),
+        "HERMES_HOME": resolve_profile_env(profile),
+        "HERMES_SESSION_SOURCE": "dashboard-group",
+    }
+    command = [sys.executable, str(Path(__file__).resolve()), "--profile-event-runner"]
+    process = process_factory(
+        command,
+        shell=False,
+        stdin=subprocess.PIPE,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        encoding="utf-8",
+        bufsize=1,
+        env=env,
+    )
+    if process.stdin is None or process.stdout is None:
+        process.kill()
+        raise RuntimeError("Hermes 结构化执行通道启动失败")
+    process.stdin.write(json.dumps({"prompt": prompt}, ensure_ascii=False))
+    process.stdin.close()
+
+    line_queue: queue.Queue[Optional[str]] = queue.Queue()
+
+    def _read_stdout() -> None:
+        try:
+            for line in process.stdout:
+                line_queue.put(line)
+        finally:
+            line_queue.put(None)
+
+    reader = threading.Thread(target=_read_stdout, daemon=True)
+    reader.start()
+    deadline = time.monotonic() + timeout
+
+    def _iter_lines():
+        while True:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise TimeoutError("Hermes profile execution timed out")
+            try:
+                line = line_queue.get(timeout=min(1.0, remaining))
+            except queue.Empty:
+                if process.poll() is not None and line_queue.empty():
+                    return
+                continue
+            if line is None:
+                return
+            yield line
+
+    try:
+        response = consume_profile_event_stream(_iter_lines(), event_callback)
+        remaining = max(0.1, deadline - time.monotonic())
+        return_code = process.wait(timeout=remaining)
+    except Exception:
+        if process.poll() is None:
+            process.terminate()
+            try:
+                process.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                process.kill()
+        raise
+    stderr = process.stderr.read().strip() if process.stderr is not None else ""
+    if return_code != 0:
+        raise RuntimeError(sanitize_runtime_error(stderr or "Hermes profile execution failed"))
     if not response:
         raise RuntimeError("Hermes profile returned an empty response")
     return response
@@ -1371,6 +1565,479 @@ def run_single_turn(
     if not response:
         raise RuntimeError("Hermes profile returned an empty response")
     return response
+
+
+def _append_event_delta(current: str, delta: Any) -> str:
+    text = str(delta or "")
+    if not text:
+        return current
+    if current and text.startswith(current):
+        return text
+    return current + text
+
+
+def _activity_by_id_or_name(
+    activities: list[dict[str, Any]],
+    activity_id: str,
+    name: str,
+) -> Optional[dict[str, Any]]:
+    if activity_id:
+        for activity in reversed(activities):
+            if str(activity.get("id") or "") == activity_id:
+                return activity
+    for activity in reversed(activities):
+        if activity.get("status") == "running" and activity.get("name") == name:
+            return activity
+    return None
+
+
+def _new_activity_id(prefix: str, activities: list[dict[str, Any]]) -> str:
+    return f"{prefix}-{int(time.time() * 1000)}-{len(activities) + 1}"
+
+
+def apply_profile_event(
+    state: dict[str, Any],
+    event: dict[str, Any],
+) -> dict[str, Any]:
+    """Reduce one structured Hermes event into a persistable role snapshot."""
+    event_type = str(event.get("type") or "")
+    payload = event.get("payload")
+    payload = payload if isinstance(payload, dict) else {}
+    activities = state.setdefault("activities", [])
+    now = int(time.time() * 1000)
+
+    if event_type == "session.info":
+        state["actual_model"] = str(payload.get("model") or state.get("actual_model") or "")
+        state["actual_provider"] = str(
+            payload.get("provider") or state.get("actual_provider") or ""
+        )
+    elif event_type in {"reasoning.delta", "reasoning.available"}:
+        text = _structured_text(payload.get("text"))
+        if text:
+            activity = next(
+                (
+                    item
+                    for item in reversed(activities)
+                    if item.get("kind") == "reasoning" and item.get("status") == "running"
+                ),
+                None,
+            )
+            if activity is None:
+                activity = {
+                    "id": _new_activity_id("reasoning", activities),
+                    "kind": "reasoning",
+                    "category": "reasoning",
+                    "name": "模型思考",
+                    "input": "",
+                    "output": "",
+                    "status": "running",
+                    "started_at": payload.get("started_at") or now,
+                    "ended_at": None,
+                }
+                activities.append(activity)
+            activity["output"] = _append_event_delta(
+                str(activity.get("output") or ""), text
+            )[-20_000:]
+            if event_type == "reasoning.available":
+                activity["status"] = "completed"
+                activity["ended_at"] = payload.get("ended_at") or now
+                activity["duration_ms"] = max(
+                    0,
+                    int(activity["ended_at"]) - int(activity["started_at"]),
+                )
+    elif event_type == "message.delta":
+        for activity in reversed(activities):
+            if activity.get("kind") == "reasoning" and activity.get("status") == "running":
+                activity["status"] = "completed"
+                activity["ended_at"] = now
+                activity["duration_ms"] = max(
+                    0,
+                    now - int(activity.get("started_at") or now),
+                )
+                break
+        state["content"] = _append_event_delta(
+            str(state.get("content") or ""), payload.get("text")
+        )
+    elif event_type in {"tool.generating", "tool.progress"}:
+        name = str(payload.get("name") or "工具调用")
+        activity = _activity_by_id_or_name(
+            activities,
+            str(payload.get("tool_id") or ""),
+            name,
+        )
+        if activity is None and event_type == "tool.generating":
+            state["updated_at"] = now
+            return state
+        if activity is None:
+            activity = {
+                "id": str(payload.get("tool_id") or _new_activity_id("tool", activities)),
+                "kind": "tool",
+                "category": _tool_category(name),
+                "name": name,
+                "input": "",
+                "output": "",
+                "status": "running",
+                "started_at": now,
+                "ended_at": None,
+            }
+            activities.append(activity)
+        activity["preview"] = _structured_text(
+            payload.get("preview") or payload.get("message")
+        )[:1000]
+    elif event_type == "tool.start":
+        name = str(payload.get("name") or "工具调用")
+        activity_id = str(payload.get("tool_id") or "")
+        activity = _activity_by_id_or_name(activities, activity_id, name)
+        if activity is None:
+            activity = {
+                "id": activity_id or _new_activity_id("tool", activities),
+                "kind": "tool",
+                "category": _tool_category(name),
+                "name": name,
+                "input": "",
+                "output": "",
+                "status": "running",
+                "started_at": payload.get("started_at") or now,
+                "ended_at": None,
+            }
+            activities.append(activity)
+        activity.update(
+            {
+                "id": activity_id or activity.get("id"),
+                "category": _tool_category(name),
+                "name": name,
+                "input": _structured_text(
+                    payload.get("args") or payload.get("input") or payload.get("context")
+                )[:8000],
+                "status": "running",
+                "started_at": activity.get("started_at") or payload.get("started_at") or now,
+                "ended_at": None,
+            }
+        )
+    elif event_type == "tool.complete":
+        name = str(payload.get("name") or "工具调用")
+        activity_id = str(payload.get("tool_id") or "")
+        activity = _activity_by_id_or_name(activities, activity_id, name)
+        if activity is None:
+            activity = {
+                "id": activity_id or _new_activity_id("tool", activities),
+                "kind": "tool",
+                "category": _tool_category(name),
+                "name": name,
+                "input": _structured_text(payload.get("args"))[:8000],
+                "started_at": payload.get("started_at") or now,
+            }
+            activities.append(activity)
+        error = _structured_text(payload.get("error"))
+        activity.update(
+            {
+                "output": _structured_text(
+                    payload.get("result_text")
+                    or payload.get("result")
+                    or payload.get("summary")
+                )[-20_000:],
+                "preview": _structured_text(payload.get("summary"))[:1000],
+                "error": sanitize_runtime_error(error) if error else "",
+                "status": "failed" if error else "completed",
+                "ended_at": payload.get("ended_at") or now,
+            }
+        )
+        if isinstance(payload.get("duration_s"), (int, float)):
+            activity["duration_ms"] = round(float(payload["duration_s"]) * 1000)
+        elif activity.get("started_at"):
+            activity["duration_ms"] = max(
+                0,
+                int(activity["ended_at"]) - int(activity["started_at"]),
+            )
+    elif event_type.startswith("subagent."):
+        name = str(payload.get("name") or payload.get("model") or "子 Agent")
+        activity_id = str(payload.get("subagent_id") or "")
+        activity = _activity_by_id_or_name(activities, activity_id, name)
+        if activity is None:
+            activity = {
+                "id": activity_id or _new_activity_id("subagent", activities),
+                "kind": "subagent",
+                "category": "subagent",
+                "name": name,
+                "input": _structured_text(payload.get("goal") or payload.get("args"))[:8000],
+                "output": "",
+                "status": "running",
+                "started_at": now,
+                "ended_at": None,
+            }
+            activities.append(activity)
+        text = _structured_text(
+            payload.get("text") or payload.get("preview") or payload.get("summary")
+        )
+        if event_type == "subagent.complete":
+            activity.update(
+                {
+                    "output": text[-20_000:],
+                    "status": "failed"
+                    if str(payload.get("status") or "").lower() in {"failed", "error"}
+                    else "completed",
+                    "ended_at": now,
+                    "duration_ms": round(float(payload.get("duration_seconds") or 0) * 1000),
+                }
+            )
+        else:
+            activity["preview"] = text[:1000]
+    elif event_type == "status.update":
+        text = _structured_text(payload.get("text") or payload.get("status"))
+        if text:
+            activities.append(
+                {
+                    "id": _new_activity_id("status", activities),
+                    "kind": "status",
+                    "category": "other",
+                    "name": "运行状态",
+                    "output": text[:4000],
+                    "status": "completed",
+                    "started_at": now,
+                    "ended_at": now,
+                    "duration_ms": 0,
+                }
+            )
+    elif event_type == "connection.retry":
+        activities.append(
+            {
+                "id": _new_activity_id("retry", activities),
+                "kind": "status",
+                "category": "other",
+                "name": "模型服务重试",
+                "output": sanitize_runtime_error(payload.get("message")),
+                "status": "completed",
+                "started_at": now,
+                "ended_at": now,
+                "duration_ms": 0,
+            }
+        )
+    elif event_type == "message.complete":
+        final_text = _structured_text(payload.get("text"))
+        if final_text:
+            state["content"] = final_text
+        state["status"] = (
+            "failed" if str(payload.get("status") or "").lower() == "error" else "completed"
+        )
+    elif event_type == "error":
+        state["error"] = sanitize_runtime_error(payload.get("message"))
+        state["status"] = "failed"
+
+    state["updated_at"] = now
+    return state
+
+
+def _remove_duplicate_reasoning_activities(
+    activities: list[dict[str, Any]],
+    final_content: str,
+) -> list[dict[str, Any]]:
+    if not _structured_text(final_content):
+        return activities
+    return [
+        activity
+        for activity in activities
+        if not (
+            activity.get("kind") == "reasoning"
+            and _reasoning_repeats_final(activity.get("output"), final_content)
+        )
+    ]
+
+
+def _runner_supports_events(runner: Callable[..., Any]) -> bool:
+    try:
+        parameters = inspect.signature(runner).parameters.values()
+    except (TypeError, ValueError):
+        return False
+    return any(
+        parameter.name == "event_callback"
+        or parameter.kind == inspect.Parameter.VAR_KEYWORD
+        for parameter in parameters
+    )
+
+
+def _invoke_profile_runner(
+    runner: Callable[..., str],
+    profile: str,
+    prompt: str,
+    event_callback: Callable[[dict[str, Any]], None],
+) -> str:
+    if _runner_supports_events(runner):
+        return str(runner(profile, prompt, event_callback=event_callback))
+    return str(runner(profile, prompt))
+
+
+def _persist_hosted_role_state(
+    conversation_id: str,
+    turn_id: str,
+    *,
+    profile: str,
+    role_stage: str,
+    role_label: str,
+    state: dict[str, Any],
+    content_fallback: str,
+    final_report: bool = False,
+) -> None:
+    content = str(state.get("content") or "").strip() or content_fallback
+    activities = [dict(item) for item in state.get("activities") or []]
+    snapshot = {
+        "profile": profile,
+        "content": content,
+        "status": str(state.get("status") or "streaming"),
+        "activities": activities,
+        "actual_model": str(state.get("actual_model") or ""),
+        "actual_provider": str(state.get("actual_provider") or ""),
+        "updated_at": int(time.time() * 1000),
+    }
+    _persist_hosted_turn(
+        conversation_id,
+        turn_id,
+        patch={"role_events": {role_stage: snapshot}},
+        message={
+            "role": "assistant",
+            "name": profile,
+            "content": content,
+            "status": snapshot["status"],
+            "kind": "message",
+            "meta": {
+                "role_stage": role_stage,
+                "role_label": role_label,
+                "collapse_activities": True,
+                "final_report": final_report,
+                "activities": activities,
+                "actual_model": snapshot["actual_model"],
+                "actual_provider": snapshot["actual_provider"],
+            },
+        },
+    )
+
+
+def _run_hosted_role(
+    conversation_id: str,
+    turn_id: str,
+    *,
+    profile: str,
+    role_stage: str,
+    role_label: str,
+    prompt: str,
+    runner: Callable[..., str],
+    start_text: str,
+    final_report: bool = False,
+    previous_state: Optional[dict[str, Any]] = None,
+) -> tuple[str, str, dict[str, Any]]:
+    state = {
+        "content": "",
+        "status": "streaming",
+        "activities": [],
+        "actual_model": "",
+        "actual_provider": "",
+    }
+    if isinstance(previous_state, dict):
+        state.update(
+            {
+                "content": str(previous_state.get("content") or ""),
+                "activities": [dict(item) for item in previous_state.get("activities") or []],
+                "actual_model": str(previous_state.get("actual_model") or ""),
+                "actual_provider": str(previous_state.get("actual_provider") or ""),
+            }
+        )
+    _persist_hosted_role_state(
+        conversation_id,
+        turn_id,
+        profile=profile,
+        role_stage=role_stage,
+        role_label=role_label,
+        state=state,
+        content_fallback=start_text,
+        final_report=final_report,
+    )
+    last_persisted_at = 0.0
+
+    def persist() -> None:
+        nonlocal last_persisted_at
+        _persist_hosted_role_state(
+            conversation_id,
+            turn_id,
+            profile=profile,
+            role_stage=role_stage,
+            role_label=role_label,
+            state=state,
+            content_fallback=start_text,
+            final_report=final_report,
+        )
+        last_persisted_at = time.monotonic()
+
+    def on_event(event: dict[str, Any]) -> None:
+        event_type = str(event.get("type") or "")
+        if event_type == "thinking.delta":
+            return
+        had_content = bool(str(state.get("content") or ""))
+        had_reasoning = any(
+            activity.get("kind") == "reasoning"
+            for activity in state.get("activities") or []
+        )
+        apply_profile_event(state, event)
+        first_visible_delta = (
+            event_type == "message.delta" and not had_content
+        ) or (
+            event_type == "reasoning.delta" and not had_reasoning
+        )
+        if (
+            event_type not in {"message.delta", "reasoning.delta"}
+            or first_visible_delta
+            or time.monotonic() - last_persisted_at >= _HOSTED_EVENT_FLUSH_SECONDS
+        ):
+            persist()
+
+    attempts = _HOSTED_TRANSIENT_RETRIES + 1
+    for attempt in range(1, attempts + 1):
+        try:
+            result = _invoke_profile_runner(runner, profile, prompt, on_event).strip()
+            if not result:
+                raise RuntimeError("Hermes profile returned an empty response")
+            state["content"] = result
+            state["status"] = "completed"
+            state["activities"] = _remove_duplicate_reasoning_activities(
+                state.get("activities") or [],
+                result,
+            )
+            persist()
+            return result, "completed", state
+        except Exception as exc:
+            transient = _is_transient_runtime_error(exc)
+            has_tool_activity = any(
+                activity.get("kind") in {"tool", "subagent"}
+                for activity in state.get("activities") or []
+            )
+            if transient and not has_tool_activity and attempt < attempts:
+                apply_profile_event(
+                    state,
+                    {
+                        "type": "connection.retry",
+                        "payload": {"message": str(exc), "attempt": attempt + 1},
+                    },
+                )
+                state["status"] = "streaming"
+                persist()
+                time.sleep(0.5 * attempt)
+                continue
+            clean_error = sanitize_runtime_error(exc)
+            partial = str(state.get("content") or "").strip()
+            result = (
+                f"{partial}\n\n本阶段未完成：{clean_error}"
+                if partial
+                else f"本阶段未完成：{clean_error}"
+            )
+            state["content"] = result
+            state["status"] = "failed"
+            state["error"] = clean_error
+            state["activities"] = _remove_duplicate_reasoning_activities(
+                state.get("activities") or [],
+                result,
+            )
+            persist()
+            return result, "failed", state
+
+    raise RuntimeError("Hermes 托管角色执行状态异常")
 
 
 def create_hosted_turn_record(
@@ -1460,6 +2127,21 @@ def create_hosted_kanban_task(
         }
 
 
+def _notify_hosted_update() -> int:
+    global _HOSTED_UPDATE_REVISION
+    with _HOSTED_UPDATE_CONDITION:
+        _HOSTED_UPDATE_REVISION += 1
+        _HOSTED_UPDATE_CONDITION.notify_all()
+        return _HOSTED_UPDATE_REVISION
+
+
+def _wait_for_hosted_update(revision: int, timeout: float = 15.0) -> int:
+    with _HOSTED_UPDATE_CONDITION:
+        if _HOSTED_UPDATE_REVISION <= revision:
+            _HOSTED_UPDATE_CONDITION.wait(timeout=timeout)
+        return _HOSTED_UPDATE_REVISION
+
+
 def _persist_hosted_turn(
     conversation_id: str,
     turn_id: str,
@@ -1475,7 +2157,15 @@ def _persist_hosted_turn(
             raise RuntimeError("托管任务记录不存在")
         now = int(time.time() * 1000)
         if patch:
-            run.update(patch)
+            for key, value in patch.items():
+                if key == "role_events" and isinstance(value, dict):
+                    role_events = run.get("role_events")
+                    if not isinstance(role_events, dict):
+                        role_events = {}
+                        run["role_events"] = role_events
+                    role_events.update(value)
+                else:
+                    run[key] = value
         run["updated_at"] = now
         conversation["updated_at"] = now
         if message:
@@ -1510,11 +2200,13 @@ def _persist_hosted_turn(
                         "content": str(message.get("content") or "").strip(),
                         "status": str(message.get("status") or "completed"),
                         "meta": {**existing.get("meta", {}), **message_meta},
-                        "created_at": now,
+                        "updated_at": now,
                     }
                 )
         save_single_state(state)
-        return dict(run)
+        persisted = dict(run)
+    _notify_hosted_update()
+    return persisted
 
 
 def request_hosted_turn_cancellation(
@@ -1542,7 +2234,9 @@ def request_hosted_turn_cancellation(
         )
         conversation["updated_at"] = now
         save_single_state(state)
-        return dict(run)
+        persisted = dict(run)
+    _notify_hosted_update()
+    return persisted
 
 
 def _finish_hosted_turn_if_cancelled(
@@ -1632,6 +2326,10 @@ def execute_hosted_workflow(
         else "本任务未要求交付文件。不要创建、复制或上传文件，只提交文字结果和必要证据。"
     )
     attachment_context = str(run.get("attachment_context") or "")
+    kanban_tracking_instruction = (
+        "Kanban ID 仅用于关联追踪。不要主动查询或修改 Kanban 内部状态，"
+        "除非用户明确要求你操作看板。"
+    )
 
     task_id = str(run.get("task_id") or "")
     if not task_id:
@@ -1709,6 +2407,7 @@ def execute_hosted_workflow(
                 "你正在 DBB3 唯一控制面的服务端托管工作流中。",
                 f"你的 Profile：{worker_profile}",
                 f"官方 Kanban 根任务：{task_id}" if task_id else "",
+                kanban_tracking_instruction,
                 "你是任务执行者。负责实际执行、工具调用、证据收集和必要产物创建。",
                 "不要做最终总结；把结果、证据、耗时和遗留问题提交给审阅者。",
                 f"用户任务：{content}",
@@ -1717,12 +2416,17 @@ def execute_hosted_workflow(
             )
             if item
         )
-        try:
-            worker_result = runner(worker_profile, worker_prompt)
-            worker_status = "completed"
-        except Exception as exc:
-            worker_result = f"执行失败：{exc}"
-            worker_status = "failed"
+        worker_result, worker_status, _worker_state = _run_hosted_role(
+            conversation_id,
+            turn_id,
+            profile=worker_profile,
+            role_stage="worker",
+            role_label=f"{worker_profile} · 执行",
+            prompt=worker_prompt,
+            runner=runner,
+            start_text="我已接收任务，正在检查执行环境并开始处理。",
+            previous_state=(run.get("role_events") or {}).get("worker"),
+        )
         _persist_hosted_turn(
             conversation_id,
             turn_id,
@@ -1730,19 +2434,6 @@ def execute_hosted_workflow(
                 "worker_result": worker_result,
                 "worker_status": worker_status,
                 "stage": "reviewer",
-            },
-            message={
-                "role": "assistant",
-                "name": worker_profile,
-                "content": worker_result,
-                "status": worker_status,
-                "kind": "message",
-                "meta": {
-                    "role_stage": "worker",
-                    "role_label": f"{worker_profile} · 执行",
-                    "collapse_activities": True,
-                    "final_report": False,
-                },
             },
         )
         if _finish_hosted_turn_if_cancelled(conversation_id, turn_id):
@@ -1757,6 +2448,7 @@ def execute_hosted_workflow(
                 "你正在 DBB3 唯一控制面的服务端托管工作流中。",
                 f"你的 Profile：{reviewer_profile}",
                 f"官方 Kanban 根任务：{task_id}" if task_id else "",
+                kanban_tracking_instruction,
                 "你是结果审阅者。只基于执行者结果做验收、风险检查和通过或退回判断。",
                 "不要重复执行任务，不要创建文件，也不要向用户做最终总结。",
                 f"用户任务：{content}",
@@ -1765,12 +2457,17 @@ def execute_hosted_workflow(
             )
             if item
         )
-        try:
-            reviewer_result = runner(reviewer_profile, reviewer_prompt)
-            reviewer_status = "completed"
-        except Exception as exc:
-            reviewer_result = f"审阅失败：{exc}"
-            reviewer_status = "failed"
+        reviewer_result, reviewer_status, _reviewer_state = _run_hosted_role(
+            conversation_id,
+            turn_id,
+            profile=reviewer_profile,
+            role_stage="reviewer",
+            role_label=f"{reviewer_profile} · 审阅",
+            prompt=reviewer_prompt,
+            runner=runner,
+            start_text="我已收到执行结果，正在独立验收证据与风险。",
+            previous_state=(run.get("role_events") or {}).get("reviewer"),
+        )
         _persist_hosted_turn(
             conversation_id,
             turn_id,
@@ -1778,19 +2475,6 @@ def execute_hosted_workflow(
                 "reviewer_result": reviewer_result,
                 "reviewer_status": reviewer_status,
                 "stage": "reporter",
-            },
-            message={
-                "role": "assistant",
-                "name": reviewer_profile,
-                "content": reviewer_result,
-                "status": reviewer_status,
-                "kind": "message",
-                "meta": {
-                    "role_stage": "reviewer",
-                    "role_label": f"{reviewer_profile} · 审阅",
-                    "collapse_activities": True,
-                    "final_report": False,
-                },
             },
         )
         if _finish_hosted_turn_if_cancelled(conversation_id, turn_id):
@@ -1805,6 +2489,7 @@ def execute_hosted_workflow(
                 "你是这个服务端托管任务唯一的最终汇报者。",
                 f"你的 Profile：{reporter_profile}",
                 f"官方 Kanban 根任务：{task_id}" if task_id else "",
+                kanban_tracking_instruction,
                 "综合执行者和审阅者的信息，只汇报一次完成状态、关键结果、证据、问题与下一步。",
                 "不要重复执行工作，也不要重新生成执行者已经创建的文件。",
                 f"用户任务：{content}",
@@ -1816,12 +2501,18 @@ def execute_hosted_workflow(
             )
             if item
         )
-        try:
-            reporter_result = runner(reporter_profile, reporter_prompt)
-            reporter_status = "completed"
-        except Exception as exc:
-            reporter_result = f"最终汇报失败：{exc}"
-            reporter_status = "failed"
+        reporter_result, reporter_status, _reporter_state = _run_hosted_role(
+            conversation_id,
+            turn_id,
+            profile=reporter_profile,
+            role_stage="reporter",
+            role_label="Hermes · 最终汇报",
+            prompt=reporter_prompt,
+            runner=runner,
+            start_text="执行与审阅信息已齐，正在整理唯一的最终汇报。",
+            final_report=True,
+            previous_state=(run.get("role_events") or {}).get("reporter"),
+        )
 
     if _finish_hosted_turn_if_cancelled(conversation_id, turn_id):
         return
@@ -1835,7 +2526,16 @@ def execute_hosted_workflow(
             if item.get("bucket") == "outputs"
             and int(item.get("updated_at") or 0) >= started_at - 1000
         ]
-    final_status = "completed" if reporter_status == "completed" else "failed"
+    reporter_state_snapshot = (
+        _reporter_state
+        if "_reporter_state" in locals()
+        else (run.get("role_events") or {}).get("reporter") or {}
+    )
+    final_status = (
+        "completed"
+        if worker_status == reviewer_status == reporter_status == "completed"
+        else "failed"
+    )
     now = int(time.time() * 1000)
     _persist_hosted_turn(
         conversation_id,
@@ -1856,9 +2556,15 @@ def execute_hosted_workflow(
             "meta": {
                 "role_stage": "reporter",
                 "role_label": "Hermes · 最终汇报",
+                "collapse_activities": True,
                 "final_report": True,
                 "attachments": attachments,
                 "task_id": task_id,
+                "activities": list(reporter_state_snapshot.get("activities") or []),
+                "actual_model": str(reporter_state_snapshot.get("actual_model") or ""),
+                "actual_provider": str(
+                    reporter_state_snapshot.get("actual_provider") or ""
+                ),
             },
         },
     )
@@ -1875,6 +2581,7 @@ def start_hosted_workflow(conversation_id: str, turn_id: str) -> threading.Threa
             try:
                 execute_hosted_workflow(conversation_id, turn_id)
             except Exception as exc:
+                clean_error = sanitize_runtime_error(exc)
                 try:
                     _persist_hosted_turn(
                         conversation_id,
@@ -1882,13 +2589,13 @@ def start_hosted_workflow(conversation_id: str, turn_id: str) -> threading.Threa
                         patch={
                             "status": "failed",
                             "stage": "failed",
-                            "error": str(exc),
+                            "error": clean_error,
                             "completed_at": int(time.time() * 1000),
                         },
                         message={
                             "role": "assistant",
                             "name": "default",
-                            "content": f"服务端托管任务失败：{exc}",
+                            "content": f"服务端托管任务失败：{clean_error}",
                             "status": "failed",
                             "kind": "message",
                             "meta": {
@@ -2328,6 +3035,48 @@ def save_runtime_session(
     return {"runtime_sessions": runtime_sessions}
 
 
+@router.get("/single/conversations/{conversation_id}/hosted-events")
+async def stream_hosted_conversation_events(
+    conversation_id: str,
+    request: Request,
+):
+    with _STATE_LOCK:
+        _conversation_by_id(load_single_state(), conversation_id)
+
+    async def event_stream():
+        revision = -1
+        while not await request.is_disconnected():
+            with _STATE_LOCK:
+                state = load_single_state()
+                conversation = _conversation_by_id(state, conversation_id)
+                current_revision = _HOSTED_UPDATE_REVISION
+                payload = json.dumps(
+                    {"conversation": conversation},
+                    ensure_ascii=False,
+                    separators=(",", ":"),
+                )
+            if current_revision != revision:
+                yield f"event: conversation\ndata: {payload}\n\n"
+                revision = current_revision
+            next_revision = await asyncio.to_thread(
+                _wait_for_hosted_update,
+                revision,
+                15.0,
+            )
+            if next_revision == revision:
+                yield ": keepalive\n\n"
+
+    return StreamingResponse(
+        event_stream(),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache, no-transform",
+            "Connection": "keep-alive",
+            "X-Accel-Buffering": "no",
+        },
+    )
+
+
 @router.post("/single/conversations/{conversation_id}/hosted-turns")
 def create_hosted_turn(conversation_id: str, payload: HostedTurnBody):
     turn_id = payload.turn_id.strip()
@@ -2563,3 +3312,204 @@ async def send_message(room_id: str, payload: SendMessageBody):
         responses.append(message)
 
     return {"ok": True, "messages": responses}
+
+
+def _profile_runner_result_error(result: Any) -> str:
+    text = _structured_text(result)
+    if not text:
+        return ""
+    try:
+        data = json.loads(text)
+    except (TypeError, ValueError):
+        data = None
+    if isinstance(data, dict):
+        if data.get("error"):
+            return _structured_text(data.get("error"))
+        if data.get("success") is False:
+            return _structured_text(data.get("message") or text)
+    if re.match(r"^(?:error|failed|exception)\s*[:：]", text, re.IGNORECASE):
+        return text
+    return ""
+
+
+def _profile_event_runner_main() -> int:
+    """Child-process entrypoint that emits only structured Hermes JSONL events."""
+    real_stdout = sys.stdout
+    emit_lock = threading.Lock()
+
+    def emit(event_type: str, payload: Optional[dict[str, Any]] = None) -> None:
+        event = {"type": event_type, "payload": payload or {}}
+        line = json.dumps(event, ensure_ascii=False, separators=(",", ":"), default=str)
+        with emit_lock:
+            real_stdout.write(line + "\n")
+            real_stdout.flush()
+
+    try:
+        request_payload = json.loads(sys.stdin.read() or "{}")
+        prompt = _structured_text(request_payload.get("prompt"))
+        if not prompt:
+            raise ValueError("任务内容为空")
+
+        os.environ["HERMES_YOLO_MODE"] = "1"
+        os.environ["HERMES_ACCEPT_HOOKS"] = "1"
+        from hermes_cli.config import load_config
+        from hermes_cli.env_loader import load_hermes_dotenv
+        from hermes_cli.fallback_config import get_fallback_chain
+        from hermes_cli.runtime_provider import resolve_runtime_provider
+        from hermes_cli.tools_config import _get_platform_tools
+        from hermes_state import SessionDB
+        from run_agent import AIAgent
+
+        load_hermes_dotenv(hermes_home=os.environ.get("HERMES_HOME"))
+        cfg = load_config()
+        model_cfg = cfg.get("model") or {}
+        if isinstance(model_cfg, str):
+            model = model_cfg
+            provider = None
+        else:
+            model = str(model_cfg.get("default") or model_cfg.get("model") or "")
+            provider = str(model_cfg.get("provider") or "").strip() or None
+        runtime = resolve_runtime_provider(
+            requested=provider,
+            target_model=model or None,
+        )
+        enabled_toolsets = sorted(_get_platform_tools(cfg, "cli"))
+        fallback = get_fallback_chain(cfg)
+        tool_started_at: dict[str, float] = {}
+
+        def tool_start(tool_id: str, name: str, args: Any) -> None:
+            tool_started_at[str(tool_id)] = time.monotonic()
+            emit(
+                "tool.start",
+                {
+                    "tool_id": str(tool_id or ""),
+                    "name": str(name or "工具调用"),
+                    "args": args,
+                    "started_at": int(time.time() * 1000),
+                },
+            )
+
+        def tool_complete(tool_id: str, name: str, args: Any, result: Any) -> None:
+            started = tool_started_at.pop(str(tool_id), time.monotonic())
+            error = _profile_runner_result_error(result)
+            emit(
+                "tool.complete",
+                {
+                    "tool_id": str(tool_id or ""),
+                    "name": str(name or "工具调用"),
+                    "args": args,
+                    "result_text": _structured_text(result),
+                    "error": error,
+                    "duration_s": max(0.0, time.monotonic() - started),
+                    "ended_at": int(time.time() * 1000),
+                },
+            )
+
+        def tool_progress(
+            event_type: str,
+            name: Optional[str] = None,
+            preview: Optional[str] = None,
+            args: Any = None,
+            **kwargs: Any,
+        ) -> None:
+            if event_type in {"tool.started", "tool.completed", "_thinking"}:
+                return
+            if event_type == "reasoning.available":
+                # This fallback is assistant content, not a distinct thought.
+                # Genuine reasoning is emitted by the dedicated callbacks.
+                return
+            if event_type.startswith("subagent.") or event_type == "subagent_progress":
+                normalized_type = (
+                    "subagent.progress"
+                    if event_type == "subagent_progress"
+                    else event_type
+                )
+                emit(
+                    normalized_type,
+                    {
+                        "name": name or kwargs.get("model") or "子 Agent",
+                        "preview": preview or "",
+                        "args": args,
+                        **kwargs,
+                    },
+                )
+                return
+            emit(
+                "tool.progress",
+                {
+                    "name": name or "工具调用",
+                    "preview": preview or "",
+                    "args": args,
+                    "event": event_type,
+                },
+            )
+
+        session_db = SessionDB()
+        agent = AIAgent(
+            api_key=runtime.get("api_key"),
+            base_url=runtime.get("base_url"),
+            provider=runtime.get("provider"),
+            api_mode=runtime.get("api_mode"),
+            model=model,
+            max_iterations=45,
+            enabled_toolsets=enabled_toolsets,
+            quiet_mode=True,
+            platform="cli",
+            session_db=session_db,
+            credential_pool=runtime.get("credential_pool"),
+            fallback_model=fallback or None,
+            stream_delta_callback=lambda text: (
+                emit("message.delta", {"text": text}) if text is not None else None
+            ),
+            reasoning_callback=lambda text: emit("reasoning.delta", {"text": text}),
+            tool_start_callback=tool_start,
+            tool_complete_callback=tool_complete,
+            tool_progress_callback=tool_progress,
+            tool_gen_callback=lambda name: emit(
+                "tool.generating", {"name": str(name or "工具调用")}
+            ),
+            status_callback=lambda kind, text=None: emit(
+                "status.update",
+                {"status": str(kind), "text": str(text or kind)},
+            ),
+        )
+        agent.suppress_status_output = True
+        emit(
+            "session.info",
+            {
+                "session_id": str(getattr(agent, "session_id", "") or ""),
+                "model": str(getattr(agent, "model", model) or model),
+                "provider": str(
+                    getattr(agent, "provider", runtime.get("provider"))
+                    or runtime.get("provider")
+                    or ""
+                ),
+            },
+        )
+        with open(os.devnull, "w", encoding="utf-8") as devnull:
+            with redirect_stdout(devnull), redirect_stderr(devnull):
+                result = agent.run_conversation(prompt)
+        final_response = _structured_text(result.get("final_response"))
+        status = "error" if result.get("failed") else "completed"
+        emit(
+            "message.complete",
+            {
+                "text": final_response,
+                "status": status,
+                "session_id": _structured_text(result.get("session_id")),
+            },
+        )
+        return 0 if final_response and status == "completed" else 1
+    except BaseException as exc:
+        emit(
+            "error",
+            {
+                "message": sanitize_runtime_error(exc),
+                "transient": _is_transient_runtime_error(exc),
+            },
+        )
+        return 1
+
+
+if __name__ == "__main__" and "--profile-event-runner" in sys.argv:
+    raise SystemExit(_profile_event_runner_main())
