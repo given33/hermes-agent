@@ -329,6 +329,13 @@ from hermes_cli.dashboard_auth.public_paths import (
 )
 
 
+def _has_valid_legacy_bearer_token(request: Request) -> bool:
+    """True only for the exact legacy ``Authorization`` Bearer credential."""
+    auth = request.headers.get("authorization", "")
+    expected = f"Bearer {_SESSION_TOKEN}"
+    return hmac.compare_digest(auth.encode(), expected.encode())
+
+
 def _has_valid_session_token(request: Request) -> bool:
     """True if the request carries a valid dashboard session token.
 
@@ -344,9 +351,7 @@ def _has_valid_session_token(request: Request) -> bool:
     ):
         return True
 
-    auth = request.headers.get("authorization", "")
-    expected = f"Bearer {_SESSION_TOKEN}"
-    return hmac.compare_digest(auth.encode(), expected.encode())
+    return _has_valid_legacy_bearer_token(request)
 
 
 # Routes that may also authenticate via a ``?token=`` query param, for download
@@ -618,7 +623,23 @@ async def _token_auth_seam(request: Request, call_next):
     cookie/session gates skip enforcement. Non-token routes pass straight
     through untouched.
     """
-    from hermes_cli.dashboard_auth.token_auth import token_auth_middleware
+    from hermes_cli.dashboard_auth.token_auth import (
+        is_optional_token_path,
+        is_token_route,
+        token_auth_middleware,
+    )
+
+    path = request.url.path
+    if (
+        not getattr(request.app.state, "auth_required", False)
+        and is_optional_token_path(path)
+        and not is_token_route(path)
+        and _has_valid_legacy_bearer_token(request)
+    ):
+        # Preserve the pre-mobile loopback contract. The downstream legacy
+        # middleware performs the same constant-time check again and remains
+        # authoritative; public/gated and exact-token routes never enter here.
+        return await call_next(request)
     return await token_auth_middleware(request, call_next)
 
 

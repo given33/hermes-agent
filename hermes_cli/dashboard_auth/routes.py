@@ -612,7 +612,7 @@ async def api_auth_me(request: Request):
 
 @router.post("/api/auth/ws-ticket", name="auth_ws_ticket")
 async def api_auth_ws_ticket(request: Request):
-    """Mint a short-lived single-use ticket for the authenticated session.
+    """Mint a short-lived single-use ticket for a session or admin token.
 
     Browsers cannot set ``Authorization`` on a WebSocket upgrade, so in
     gated mode the SPA POSTs this endpoint to get a ``?ticket=`` value to
@@ -624,19 +624,31 @@ async def api_auth_ws_ticket(request: Request):
     expected pattern.
     """
     sess = getattr(request.state, "session", None)
-    if sess is None:
-        # Middleware should already have rejected, but check defensively.
-        raise HTTPException(status_code=401, detail="Unauthorized")
+    if sess is not None:
+        user_id = sess.user_id
+        provider = sess.provider
+    else:
+        principal = getattr(request.state, "token_principal", None)
+        token_is_admin = (
+            getattr(request.state, "token_authenticated", False)
+            and principal is not None
+            and "dashboard:admin" in principal.scopes
+        )
+        if not token_is_admin:
+            # Middleware should already have rejected, but check defensively.
+            raise HTTPException(status_code=401, detail="Unauthorized")
+        user_id = principal.principal
+        provider = principal.provider
 
     # Import here so the routes module stays usable in test contexts that
     # don't load the ticket store.
     from hermes_cli.dashboard_auth.ws_tickets import TTL_SECONDS, mint_ticket
 
-    ticket = mint_ticket(user_id=sess.user_id, provider=sess.provider)
+    ticket = mint_ticket(user_id=user_id, provider=provider)
     audit_log(
         AuditEvent.WS_TICKET_MINTED,
-        provider=sess.provider,
-        user_id=sess.user_id,
+        provider=provider,
+        user_id=user_id,
         ip=_client_ip(request),
     )
     return {"ticket": ticket, "ttl_seconds": TTL_SECONDS}
