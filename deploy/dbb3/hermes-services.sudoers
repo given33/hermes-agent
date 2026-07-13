@@ -1,0 +1,21 @@
+Cmnd_Alias HERMES_DASHBOARD_SERVICE = \
+    /usr/bin/systemctl start hermes-dashboard.service, \
+    /usr/bin/systemctl stop hermes-dashboard.service, \
+    /usr/bin/systemctl restart hermes-dashboard.service, \
+    /usr/bin/systemctl reset-failed hermes-dashboard.service, \
+    /usr/bin/systemctl --no-ask-password start hermes-dashboard.service, \
+    /usr/bin/systemctl --no-ask-password stop hermes-dashboard.service, \
+    /usr/bin/systemctl --no-ask-password restart hermes-dashboard.service, \
+    /usr/bin/systemctl --no-ask-password reset-failed hermes-dashboard.service
+
+Cmnd_Alias HERMES_GATEWAY_SERVICE = \
+    /usr/bin/systemctl start hermes-gateway.service, \
+    /usr/bin/systemctl stop hermes-gateway.service, \
+    /usr/bin/systemctl restart hermes-gateway.service, \
+    /usr/bin/systemctl reset-failed hermes-gateway.service, \
+    /usr/bin/systemctl --no-ask-password start hermes-gateway.service, \
+    /usr/bin/systemctl --no-ask-password stop hermes-gateway.service, \
+    /usr/bin/systemctl --no-ask-password restart hermes-gateway.service, \
+    /usr/bin/systemctl --no-ask-password reset-failed hermes-gateway.service
+
+hermes ALL=(root) NOPASSWD: HERMES_DASHBOARD_SERVICE, HERMES_GATEWAY_SERVICE
