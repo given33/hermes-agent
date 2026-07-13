@@ -7,7 +7,8 @@
  * 4. Waits for plugins to call register() and resolves them
  */
 
-import { useState, useEffect, useRef } from "react";
+import { useState, useEffect, useMemo, useRef } from "react";
+import { useLocation } from "react-router-dom";
 import { api, HERMES_BASE_PATH } from "@/lib/api";
 import type { PluginManifest, RegisteredPlugin } from "./types";
 import {
@@ -17,11 +18,28 @@ import {
   setPluginLoadError,
 } from "./registry";
 
+function normalizePluginPath(path: string | undefined): string {
+  if (!path || path === "/") return path || "";
+  return path.replace(/\/+$/, "");
+}
+
 export function usePlugins() {
+  const { pathname } = useLocation();
+  const normalizedPath = normalizePluginPath(pathname);
   const [manifests, setManifests] = useState<PluginManifest[]>([]);
   const [plugins, setPlugins] = useState<RegisteredPlugin[]>([]);
   const [loading, setLoading] = useState(true);
   const loadedScripts = useRef<Set<string>>(new Set());
+  const requiredManifests = useMemo(
+    () =>
+      manifests.filter(
+        (manifest) =>
+          (manifest.slots && manifest.slots.length > 0) ||
+          normalizePluginPath(manifest.tab.path) === normalizedPath ||
+          normalizePluginPath(manifest.tab.override) === normalizedPath,
+      ),
+    [manifests, normalizedPath],
+  );
 
   // Fetch manifests on mount.
   useEffect(() => {
@@ -37,10 +55,14 @@ export function usePlugins() {
   // Load plugin assets when manifests arrive.
   useEffect(() => {
     if (manifests.length === 0) return;
+    if (requiredManifests.length === 0) {
+      const timeout = window.setTimeout(() => setLoading(false), 0);
+      return () => window.clearTimeout(timeout);
+    }
 
     const injectedScripts: HTMLScriptElement[] = [];
 
-    for (const manifest of manifests) {
+    for (const manifest of requiredManifests) {
       // Inject CSS if specified.
       if (manifest.css) {
         const cssUrl = `${HERMES_BASE_PATH}/dashboard-plugins/${manifest.name}/${manifest.css}`;
@@ -105,7 +127,7 @@ export function usePlugins() {
         }
       }
     };
-  }, [manifests]);
+  }, [manifests, requiredManifests]);
 
   // Listen for plugin registrations and resolve them against manifests.
   useEffect(() => {
@@ -118,8 +140,13 @@ export function usePlugins() {
         }
       }
       setPlugins(resolved);
-      // If all plugins registered, stop loading early.
-      if (resolved.length === manifests.length && manifests.length > 0) {
+      // Only slot and active-route plugins block the current first paint.
+      if (
+        requiredManifests.length > 0 &&
+        requiredManifests.every((manifest) =>
+          Boolean(getPluginComponent(manifest.name)),
+        )
+      ) {
         setLoading(false);
       }
     }
@@ -127,7 +154,7 @@ export function usePlugins() {
     resolvePlugins();
     const unsub = onPluginRegistered(resolvePlugins);
     return unsub;
-  }, [manifests]);
+  }, [manifests, requiredManifests]);
 
   return { plugins, manifests, loading };
 }

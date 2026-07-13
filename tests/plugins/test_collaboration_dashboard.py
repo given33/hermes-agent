@@ -54,6 +54,7 @@ class CollaborationDashboardTests(unittest.TestCase):
             "检查本地电脑",
             runner=runner,
             hermes_bin="/usr/local/bin/hermes",
+            kanban_task_id="t_worker_child",
         )
 
         self.assertEqual(response, "执行完成")
@@ -75,6 +76,10 @@ class CollaborationDashboardTests(unittest.TestCase):
         )
         self.assertFalse(captured["kwargs"]["shell"])
         self.assertEqual(captured["kwargs"]["timeout"], 600)
+        self.assertEqual(
+            captured["kwargs"]["env"]["HERMES_KANBAN_TASK"],
+            "t_worker_child",
+        )
 
     def test_single_chat_store_and_prompt_keep_conversation_context(self):
         module = load_module()
@@ -780,9 +785,9 @@ class CollaborationDashboardTests(unittest.TestCase):
         self.assertTrue(manifest["tab"]["hidden"])
         self.assertEqual(manifest["api"], "plugin_api.py")
         self.assertIn("chat:top", manifest["slots"])
-        self.assertEqual(manifest["version"], "2.1.33")
-        self.assertEqual(manifest["entry"], "dist/index.js?v=2.1.33")
-        self.assertEqual(manifest["css"], "dist/style.css?v=2.1.33")
+        self.assertEqual(manifest["version"], "2.1.36")
+        self.assertEqual(manifest["entry"], "dist/index.js?v=2.1.36")
+        self.assertEqual(manifest["css"], "dist/style.css?v=2.1.36")
 
     def test_dbb3_release_installer_uses_private_snapshot_and_health_files(self):
         installer = (
@@ -1135,9 +1140,93 @@ class CollaborationDashboardTests(unittest.TestCase):
             conversation["hosted_turns"]["turn-hosted-1"]["status"],
             "completed",
         )
-        for _profile, prompt in calls:
-            self.assertIn("Kanban ID 仅用于关联追踪", prompt)
-            self.assertIn("不要主动查询或修改 Kanban 内部状态", prompt)
+        worker_prompt = calls[0][1]
+        reviewer_prompt = calls[1][1]
+        reporter_prompt = calls[2][1]
+
+        self.assertIn("可以使用所有已配置的 Skill、MCP 和工具", worker_prompt)
+        self.assertIn("可以读取根任务和已分配工作项", worker_prompt)
+        self.assertIn("可以向已分配工作项写入进度、证据和交接评论", worker_prompt)
+        self.assertNotIn("不要主动查询或修改 Kanban 内部状态", worker_prompt)
+
+        self.assertIn("独立抽样复核", reviewer_prompt)
+        self.assertIn("正常的 Skill、MCP、命令和取证调用不属于过度执行", reviewer_prompt)
+        self.assertNotIn("不要主动查询或修改 Kanban 内部状态", reviewer_prompt)
+
+        self.assertIn("不得创建、改派、关闭或删除根任务", reporter_prompt)
+
+    def test_conversation_index_compacts_hosted_role_event_payloads(self):
+        module = load_module()
+        conversation = module.create_single_conversation("default")
+        conversation["hosted_turns"] = {
+            "turn-heavy": {
+                "turn_id": "turn-heavy",
+                "status": "running",
+                "stage": "worker",
+                "started_at": 1000,
+                "updated_at": 2000,
+                "task_id": "root-heavy",
+                "worker_result": "x" * 20_000,
+                "role_events": {
+                    "worker": {
+                        "activities": [{"result": "y" * 20_000}],
+                    },
+                },
+            },
+        }
+        state = {"conversations": [conversation]}
+        module.load_single_state = lambda: state
+        module.save_single_state = lambda _state: None
+        module.reconcile_conversation_runtime_results = lambda _conversation: False
+        module.compact_conversation_title = lambda _conversation: False
+        module.resume_unfinished_hosted_workflows = lambda _conversations: None
+
+        response = module.get_single_conversations()
+
+        summary = response["conversations"][0]
+        hosted = summary["hosted_turns"]["turn-heavy"]
+        self.assertEqual(hosted["status"], "running")
+        self.assertEqual(hosted["stage"], "worker")
+        self.assertEqual(hosted["task_id"], "root-heavy")
+        self.assertNotIn("worker_result", hosted)
+        self.assertNotIn("role_events", hosted)
+        self.assertIn("role_events", conversation["hosted_turns"]["turn-heavy"])
+
+    def test_hosted_roles_run_with_non_root_kanban_task_scopes(self):
+        module = load_module()
+        conversation = module.create_single_conversation("default")
+        state = {"conversations": [conversation]}
+        module.load_single_state = lambda: state
+        module.save_single_state = lambda _state: None
+        module.create_hosted_turn_record(
+            conversation,
+            turn_id="turn-scoped",
+            content="检查设备并验收",
+            title="检查设备",
+            profiles=["default", "pc-worker", "reviewer"],
+            artifact_required=False,
+        )
+        calls = []
+
+        def runner(profile, _prompt, **kwargs):
+            calls.append((profile, kwargs.get("kanban_task_id")))
+            return f"{profile} 完成"
+
+        module.execute_hosted_workflow(
+            conversation["id"],
+            "turn-scoped",
+            runner=runner,
+            task_creator=lambda **_kwargs: {
+                "task_id": "root-scoped",
+                "child_ids": ["child-worker", "child-reviewer"],
+                "fanout": True,
+            },
+        )
+
+        self.assertEqual(calls[0], ("pc-worker", "child-worker"))
+        self.assertEqual(calls[1], ("reviewer", "child-reviewer"))
+        self.assertTrue(calls[2][1].startswith("hosted-reporter-"))
+        self.assertNotIn("root-scoped", [scope for _profile, scope in calls])
 
     def test_hosted_roles_persist_separate_live_messages_with_nested_activities(self):
         module = load_module()

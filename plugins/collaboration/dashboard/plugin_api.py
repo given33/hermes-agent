@@ -1402,6 +1402,7 @@ def _legacy_profile_turn(
     *,
     runner: Callable[..., Any],
     hermes_bin: str,
+    kanban_task_id: Optional[str] = None,
 ) -> str:
     command = [
         hermes_bin,
@@ -1416,13 +1417,18 @@ def _legacy_profile_turn(
         "--max-turns",
         "45",
     ]
+    env = {**os.environ, "HOME": os.environ.get("HOME", "/home/hermes")}
+    if kanban_task_id:
+        env["HERMES_KANBAN_TASK"] = kanban_task_id
+    else:
+        env.pop("HERMES_KANBAN_TASK", None)
     result = runner(
         command,
         shell=False,
         capture_output=True,
         text=True,
         timeout=600,
-        env={**os.environ, "HOME": os.environ.get("HOME", "/home/hermes")},
+        env=env,
     )
     if result.returncode != 0:
         error = result.stderr or result.stdout or "Hermes profile execution failed"
@@ -1442,6 +1448,7 @@ def run_profile_turn(
     event_callback: Optional[Callable[[dict[str, Any]], None]] = None,
     process_factory: Callable[..., Any] = subprocess.Popen,
     timeout: float = 600,
+    kanban_task_id: Optional[str] = None,
 ) -> str:
     """Run a profile through a structured JSONL child event channel."""
     if runner is not None:
@@ -1450,6 +1457,7 @@ def run_profile_turn(
             prompt,
             runner=runner,
             hermes_bin=hermes_bin,
+            kanban_task_id=kanban_task_id,
         )
 
     from hermes_cli.profiles import resolve_profile_env
@@ -1460,6 +1468,10 @@ def run_profile_turn(
         "HERMES_HOME": resolve_profile_env(profile),
         "HERMES_SESSION_SOURCE": "dashboard-group",
     }
+    if kanban_task_id:
+        env["HERMES_KANBAN_TASK"] = kanban_task_id
+    else:
+        env.pop("HERMES_KANBAN_TASK", None)
     command = [sys.executable, str(Path(__file__).resolve()), "--profile-event-runner"]
     process = process_factory(
         command,
@@ -1843,16 +1855,20 @@ def _remove_duplicate_reasoning_activities(
     ]
 
 
-def _runner_supports_events(runner: Callable[..., Any]) -> bool:
+def _runner_supports_keyword(runner: Callable[..., Any], keyword: str) -> bool:
     try:
         parameters = inspect.signature(runner).parameters.values()
     except (TypeError, ValueError):
         return False
     return any(
-        parameter.name == "event_callback"
+        parameter.name == keyword
         or parameter.kind == inspect.Parameter.VAR_KEYWORD
         for parameter in parameters
     )
+
+
+def _runner_supports_events(runner: Callable[..., Any]) -> bool:
+    return _runner_supports_keyword(runner, "event_callback")
 
 
 def _invoke_profile_runner(
@@ -1860,10 +1876,14 @@ def _invoke_profile_runner(
     profile: str,
     prompt: str,
     event_callback: Callable[[dict[str, Any]], None],
+    kanban_task_id: str,
 ) -> str:
+    kwargs: dict[str, Any] = {}
     if _runner_supports_events(runner):
-        return str(runner(profile, prompt, event_callback=event_callback))
-    return str(runner(profile, prompt))
+        kwargs["event_callback"] = event_callback
+    if _runner_supports_keyword(runner, "kanban_task_id"):
+        kwargs["kanban_task_id"] = kanban_task_id
+    return str(runner(profile, prompt, **kwargs))
 
 
 def _persist_hosted_role_state(
@@ -1920,6 +1940,7 @@ def _run_hosted_role(
     role_label: str,
     prompt: str,
     runner: Callable[..., str],
+    kanban_task_id: str,
     start_text: str,
     final_report: bool = False,
     previous_state: Optional[dict[str, Any]] = None,
@@ -1991,7 +2012,13 @@ def _run_hosted_role(
     attempts = _HOSTED_TRANSIENT_RETRIES + 1
     for attempt in range(1, attempts + 1):
         try:
-            result = _invoke_profile_runner(runner, profile, prompt, on_event).strip()
+            result = _invoke_profile_runner(
+                runner,
+                profile,
+                prompt,
+                on_event,
+                kanban_task_id,
+            ).strip()
             if not result:
                 raise RuntimeError("Hermes profile returned an empty response")
             state["content"] = result
@@ -2326,12 +2353,23 @@ def execute_hosted_workflow(
         else "本任务未要求交付文件。不要创建、复制或上传文件，只提交文字结果和必要证据。"
     )
     attachment_context = str(run.get("attachment_context") or "")
-    kanban_tracking_instruction = (
-        "Kanban ID 仅用于关联追踪。不要主动查询或修改 Kanban 内部状态，"
-        "除非用户明确要求你操作看板。"
+    worker_kanban_instruction = (
+        "官方 Kanban 是 DBB3 的唯一控制面。你可以读取根任务和已分配工作项，"
+        "也可以向已分配工作项写入进度、证据和交接评论；"
+        "不得创建、改派、关闭或删除根任务，也不得替 Manager 改变任务生命周期。"
+    )
+    reviewer_kanban_instruction = (
+        "官方 Kanban 是 DBB3 的唯一控制面。你可以读取任务、证据和评论，"
+        "并向已分配的审阅工作项写入验收结论；"
+        "不得创建、改派、关闭或删除根任务。"
+    )
+    reporter_kanban_instruction = (
+        "官方 Kanban 是 DBB3 的唯一控制面。你可以读取任务链用于最终汇总；"
+        "不得创建、改派、关闭或删除根任务，也不要替执行者重复工作。"
     )
 
     task_id = str(run.get("task_id") or "")
+    child_ids = [str(item) for item in run.get("child_ids") or [] if item]
     if not task_id:
         _persist_hosted_turn(
             conversation_id,
@@ -2345,7 +2383,7 @@ def execute_hosted_workflow(
             content=content,
         )
         task_id = str(task_info.get("task_id") or "")
-        child_ids = list(task_info.get("child_ids") or [])
+        child_ids = [str(item) for item in task_info.get("child_ids") or [] if item]
         workflow_text = (
             f"DBB3 已创建根任务并拆分为 {len(child_ids)} 个执行步骤。"
             if task_info.get("fanout")
@@ -2398,6 +2436,14 @@ def execute_hosted_workflow(
     if _finish_hosted_turn_if_cancelled(conversation_id, turn_id):
         return
 
+    worker_task_scope = (
+        child_ids[0] if child_ids else f"hosted-worker-{turn_id}"
+    )
+    reviewer_task_scope = (
+        child_ids[1] if len(child_ids) > 1 else f"hosted-reviewer-{turn_id}"
+    )
+    reporter_task_scope = f"hosted-reporter-{turn_id}"
+
     worker_result = str(run.get("worker_result") or "")
     worker_status = str(run.get("worker_status") or "")
     if not worker_result:
@@ -2407,8 +2453,9 @@ def execute_hosted_workflow(
                 "你正在 DBB3 唯一控制面的服务端托管工作流中。",
                 f"你的 Profile：{worker_profile}",
                 f"官方 Kanban 根任务：{task_id}" if task_id else "",
-                kanban_tracking_instruction,
+                worker_kanban_instruction,
                 "你是任务执行者。负责实际执行、工具调用、证据收集和必要产物创建。",
+                "可以使用所有已配置的 Skill、MCP 和工具；正常的搜索、命令、取证和验证属于执行过程。",
                 "不要做最终总结；把结果、证据、耗时和遗留问题提交给审阅者。",
                 f"用户任务：{content}",
                 attachment_context,
@@ -2424,6 +2471,7 @@ def execute_hosted_workflow(
             role_label=f"{worker_profile} · 执行",
             prompt=worker_prompt,
             runner=runner,
+            kanban_task_id=worker_task_scope,
             start_text="我已接收任务，正在检查执行环境并开始处理。",
             previous_state=(run.get("role_events") or {}).get("worker"),
         )
@@ -2448,9 +2496,11 @@ def execute_hosted_workflow(
                 "你正在 DBB3 唯一控制面的服务端托管工作流中。",
                 f"你的 Profile：{reviewer_profile}",
                 f"官方 Kanban 根任务：{task_id}" if task_id else "",
-                kanban_tracking_instruction,
-                "你是结果审阅者。只基于执行者结果做验收、风险检查和通过或退回判断。",
-                "不要重复执行任务，不要创建文件，也不要向用户做最终总结。",
+                reviewer_kanban_instruction,
+                "你是结果审阅者。基于执行者结果做验收、风险检查和通过或退回判断。",
+                "允许使用 Skill、MCP 和工具做必要的独立抽样复核，但不要完整重做整个任务。",
+                "正常的 Skill、MCP、命令和取证调用不属于过度执行；只有明显超出用户目标、增加风险或无效成本时才指出越界。",
+                "不要创建新的交付文件，也不要向用户做最终总结。",
                 f"用户任务：{content}",
                 "执行者提交：",
                 worker_result,
@@ -2465,6 +2515,7 @@ def execute_hosted_workflow(
             role_label=f"{reviewer_profile} · 审阅",
             prompt=reviewer_prompt,
             runner=runner,
+            kanban_task_id=reviewer_task_scope,
             start_text="我已收到执行结果，正在独立验收证据与风险。",
             previous_state=(run.get("role_events") or {}).get("reviewer"),
         )
@@ -2489,7 +2540,7 @@ def execute_hosted_workflow(
                 "你是这个服务端托管任务唯一的最终汇报者。",
                 f"你的 Profile：{reporter_profile}",
                 f"官方 Kanban 根任务：{task_id}" if task_id else "",
-                kanban_tracking_instruction,
+                reporter_kanban_instruction,
                 "综合执行者和审阅者的信息，只汇报一次完成状态、关键结果、证据、问题与下一步。",
                 "不要重复执行工作，也不要重新生成执行者已经创建的文件。",
                 f"用户任务：{content}",
@@ -2509,6 +2560,7 @@ def execute_hosted_workflow(
             role_label="Hermes · 最终汇报",
             prompt=reporter_prompt,
             runner=runner,
+            kanban_task_id=reporter_task_scope,
             start_text="执行与审阅信息已齐，正在整理唯一的最终汇报。",
             final_report=True,
             previous_state=(run.get("role_events") or {}).get("reporter"),
@@ -2770,6 +2822,34 @@ def route_message(payload: RouteMessageBody):
     )
 
 
+_HOSTED_TURN_INDEX_FIELDS = (
+    "turn_id",
+    "status",
+    "stage",
+    "started_at",
+    "updated_at",
+    "completed_at",
+    "task_id",
+    "cancel_requested",
+)
+
+
+def compact_hosted_turns_for_index(
+    hosted_turns: Any,
+) -> dict[str, dict[str, Any]]:
+    if not isinstance(hosted_turns, dict):
+        return {}
+    return {
+        str(turn_id): {
+            key: run.get(key)
+            for key in _HOSTED_TURN_INDEX_FIELDS
+            if key in run
+        }
+        for turn_id, run in hosted_turns.items()
+        if isinstance(run, dict)
+    }
+
+
 @router.get("/single/conversations")
 def get_single_conversations():
     with _STATE_LOCK:
@@ -2786,6 +2866,9 @@ def get_single_conversations():
                 **conversation,
                 "messages": (conversation.get("messages") or [])[-1:],
                 "message_count": len(conversation.get("messages") or []),
+                "hosted_turns": compact_hosted_turns_for_index(
+                    conversation.get("hosted_turns")
+                ),
             }
             for conversation in conversations
         ]
