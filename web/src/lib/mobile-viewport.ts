@@ -10,6 +10,12 @@ export interface CssVariableTarget {
   setProperty(name: string, value: string): void;
 }
 
+export interface MobileViewportMetrics {
+  height: number;
+  offsetTop: number;
+  keyboardOpen: boolean;
+}
+
 const VIEWPORT_SETTLE_DELAYS_MS = [120, 360, 700] as const;
 
 function roundedPositive(value: number, fallback: number): number {
@@ -20,16 +26,22 @@ function roundedPositive(value: number, fallback: number): number {
 export function applyMobileViewportMetrics(
   source: MobileViewportSource,
   target: CssVariableTarget,
-): void {
+): MobileViewportMetrics {
   const viewport = source.visualViewport;
   const height = roundedPositive(
     viewport?.height ?? source.innerHeight,
     source.innerHeight,
   );
   const offsetTop = Math.max(0, Math.round(viewport?.offsetTop ?? 0));
+  const occludedHeight = Math.max(
+    0,
+    Math.round(source.innerHeight - height - offsetTop),
+  );
+  const keyboardOpen = Boolean(viewport && occludedHeight >= 120);
 
   target.setProperty("--hermes-viewport-height", `${height}px`);
   target.setProperty("--hermes-viewport-offset-top", `${offsetTop}px`);
+  return { height, offsetTop, keyboardOpen };
 }
 
 export function createViewportResyncScheduler(sync: () => void) {

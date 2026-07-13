@@ -538,9 +538,14 @@
 
   function withHostedRuntimeMessages(conversation) {
     const messages = [...(conversation?.messages || [])];
-    const represented = new Set(
+    const representedSessionIds = new Set(
       messages
         .map((message) => message.meta?.runtime_session_id)
+        .filter(Boolean),
+    );
+    const representedTurnIds = new Set(
+      messages
+        .map((message) => message.meta?.runtime_turn_id)
         .filter(Boolean),
     );
     for (const [profile, run] of Object.entries(
@@ -549,12 +554,14 @@
       if (
         run?.status !== "running" ||
         !run?.session_id ||
-        represented.has(run.session_id)
+        (run.turn_id
+          ? representedTurnIds.has(run.turn_id)
+          : representedSessionIds.has(run.session_id))
       ) {
         continue;
       }
       messages.push({
-        id: `hosted-${profile}-${run.session_id}`,
+        id: `hosted-${profile}-${run.turn_id || run.session_id}`,
         role: "assistant",
         name: profile,
         content: "任务已由 DBB3 托管，关闭页面或锁屏不会中断执行。",
@@ -563,6 +570,7 @@
         created_at: run.started_at || Date.now(),
         meta: {
           runtime_session_id: run.session_id,
+          runtime_turn_id: run.turn_id || "",
           connection: {
             status: "hosted",
             text: "DBB3 服务端持续执行",
@@ -582,43 +590,120 @@
   }
 
   function AttachmentList({ attachments = [] }) {
+    const [previewing, setPreviewing] = useState(null);
     if (!attachments.length) return null;
+    const mimeType = String(previewing?.mime_type || "");
+    const previewUrl = previewing
+      ? `${previewing.download_url}${previewing.download_url.includes("?") ? "&" : "?"}preview=1`
+      : "";
+    const previewContent = !previewing
+      ? null
+      : mimeType.startsWith("image/")
+        ? h("img", { src: previewUrl, alt: previewing.name })
+        : mimeType.startsWith("video/")
+          ? h("video", { src: previewUrl, controls: true })
+          : mimeType.startsWith("audio/")
+            ? h("audio", { src: previewUrl, controls: true })
+            : h("iframe", {
+                src: previewUrl,
+                title: `预览 ${previewing.name}`,
+              });
     return h(
-      "div",
-      { className: "hc-attachment-list" },
-      attachments.map((attachment) => {
-        const isImage = String(attachment.mime_type || "").startsWith("image/");
-        return h(
-          "a",
-          {
-            key: attachment.id || attachment.download_url,
-            className: "hc-attachment-card",
-            href: attachment.download_url,
-            target: "_blank",
-            rel: "noopener",
-            download: attachment.name,
-          },
-          isImage
-            ? h("img", {
-                className: "hc-attachment-preview",
-                src: attachment.download_url,
-                alt: attachment.name,
-              })
-            : h("span", { className: "hc-attachment-file-icon" }, "FILE"),
-          h(
-            "span",
-            { className: "hc-attachment-copy" },
-            h("strong", null, attachment.name),
+      React.Fragment,
+      null,
+      h(
+        "div",
+        { className: "hc-attachment-list" },
+        attachments.map((attachment) => {
+          const isImage = String(attachment.mime_type || "").startsWith("image/");
+          return h(
+            "article",
+            {
+              key: attachment.id || attachment.download_url,
+              className: "hc-attachment-card",
+            },
+            isImage
+              ? h("img", {
+                  className: "hc-attachment-preview",
+                  src: `${attachment.download_url}?preview=1`,
+                  alt: attachment.name,
+                })
+              : h("span", { className: "hc-attachment-file-icon" }, "FILE"),
             h(
-              "small",
-              null,
-              attachment.size
-                ? `${Math.max(1, Math.round(attachment.size / 1024))} KB`
-                : "下载文件",
+              "span",
+              { className: "hc-attachment-copy" },
+              h("strong", null, attachment.name),
+              h(
+                "small",
+                null,
+                attachment.size
+                  ? `${Math.max(1, Math.round(attachment.size / 1024))} KB`
+                  : "交付文件",
+              ),
             ),
-          ),
-        );
-      }),
+            h(
+              "span",
+              { className: "hc-attachment-actions" },
+              h(
+                "a",
+                {
+                  href: attachment.download_url,
+                  download: attachment.name,
+                  "aria-label": `下载 ${attachment.name}`,
+                },
+                "下载",
+              ),
+              h(
+                "button",
+                { type: "button", onClick: () => setPreviewing(attachment) },
+                "预览",
+              ),
+            ),
+          );
+        }),
+      ),
+      previewing
+        ? h(
+            "div",
+            {
+              className: "hc-attachment-preview-modal",
+              role: "dialog",
+              "aria-modal": "true",
+              "aria-label": `预览 ${previewing.name}`,
+              onClick: (event) => {
+                if (event.target === event.currentTarget) setPreviewing(null);
+              },
+            },
+            h(
+              "section",
+              null,
+              h(
+                "header",
+                null,
+                h("strong", null, previewing.name),
+                h(
+                  "button",
+                  {
+                    type: "button",
+                    onClick: () => setPreviewing(null),
+                    "aria-label": "关闭预览",
+                  },
+                  "×",
+                ),
+              ),
+              h("div", { className: "hc-attachment-preview-stage" }, previewContent),
+              h(
+                "footer",
+                null,
+                h(
+                  "a",
+                  { href: previewing.download_url, download: previewing.name },
+                  "下载到文件",
+                ),
+              ),
+            ),
+          )
+        : null,
     );
   }
 
@@ -1055,7 +1140,7 @@
     const [activeId, setActiveId] = useState("");
     const [messages, setMessages] = useState([]);
     const [selectedProfile, setSelectedProfile] = useState("default");
-    const [routeMode, setRouteMode] = useState("auto");
+    const [routeMode] = useState("auto");
     const [content, setContent] = useState("");
     const [composerOverflow, setComposerOverflow] = useState(false);
     const [composerExpanded, setComposerExpanded] = useState(false);
@@ -1133,16 +1218,16 @@
         if (pendingStoredSessionId) {
           window.sessionStorage.removeItem(PENDING_STORED_SESSION_KEY);
         }
+        nextConversations = mergeConversationIndex(
+          nextConversations,
+          officialSessionData.sessions || [],
+        );
         const rememberedId = loadRememberedConversationId();
         const nextId =
           pendingConversation?.id ||
           nextConversations.find((item) => item.id === rememberedId)?.id ||
           nextConversations[0]?.id ||
           "";
-        nextConversations = mergeConversationIndex(
-          nextConversations,
-          officialSessionData.sessions || [],
-        );
         setConversations(nextConversations);
         setActiveId(nextId);
         if (nextId) {
@@ -1513,7 +1598,7 @@
         content: "",
         status: "streaming",
         kind: "message",
-        meta: { activities: [] },
+        meta: { activities: [], runtime_turn_id: streamId },
       });
       let finalPayload = {};
       try {
@@ -1540,6 +1625,7 @@
                     body: JSON.stringify({
                       profile,
                       session_id: runtimeSessionId,
+                      turn_id: streamId,
                       status: "running",
                     }),
                   },
@@ -1744,6 +1830,7 @@
               finalPayload.stored_session_id ||
               runtimeSessionsRef.current[profile] ||
               "",
+            runtime_turn_id: streamId,
           },
         });
       } catch (err) {
@@ -1767,6 +1854,7 @@
           content: `执行失败：${err.message || err}`,
           status: "failed",
           kind: "message",
+          meta: { runtime_turn_id: streamId },
         });
       }
     };
@@ -2055,18 +2143,6 @@
           h(
             "div",
             { className: "hc-header-controls" },
-            h(
-              "select",
-              {
-                className: "hc-route-select",
-                value: routeMode,
-                onChange: (event) => setRouteMode(event.target.value),
-                "aria-label": "任务识别方式",
-              },
-              h("option", { value: "auto" }, "自动判断"),
-              h("option", { value: "chat" }, "普通对话"),
-              h("option", { value: "work" }, "工作任务"),
-            ),
             h(
               "button",
               {

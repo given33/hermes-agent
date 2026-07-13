@@ -31,14 +31,12 @@ import { createPortal } from "react-dom";
 import { useSearchParams } from "react-router-dom";
 
 import { ChatSidebar } from "@/components/ChatSidebar";
-import { ChatSessionList } from "@/components/ChatSessionList";
 import { usePageHeader } from "@/contexts/usePageHeader";
 import { useI18n } from "@/i18n";
 import { api } from "@/lib/api";
 import { normalizeSessionTitle } from "@/lib/chat-title";
 import {
   PENDING_UNIFIED_SESSION_KEY,
-  queueUnifiedSessionResume,
 } from "@/lib/unified-session";
 import {
   PTY_CONNECTING_TIMEOUT_MS,
@@ -1358,18 +1356,6 @@ export default function ChatPage({ isActive = true }: { isActive?: boolean }) {
   const visibleBanner = banner ?? reconnectBanner;
   const showReconnectOverlay =
     ptyState === "reconnecting" || (ptyState === "closed" && !banner);
-  const openOfficialSession = useCallback(
-    (sessionId: string) => {
-      closeMobilePanel();
-      queueUnifiedSessionResume(window.sessionStorage, sessionId);
-      window.dispatchEvent(
-        new CustomEvent("hermes:resume-unified-session", {
-          detail: { sessionId },
-        }),
-      );
-    },
-    [closeMobilePanel],
-  );
   const mobileModelToolsPortal =
     isActive &&
     (narrow || unifiedChatActive) &&
@@ -1437,21 +1423,14 @@ export default function ChatPage({ isActive = true }: { isActive?: boolean }) {
               "border-t border-current/10",
             )}
           >
-            <div className="border-b border-current/10 px-1 py-2">
+            <div className="px-1 py-2">
               <ChatSidebar
                 channel={channel}
-                profile={scopedProfile}
+              profile={scopedProfile}
                 onDashboardNewSessionRequest={startFreshDashboardChat}
                 onSessionTitleChange={handleSessionTitleChange}
               />
             </div>
-            <ChatSessionList
-              activeSessionId={resumeParam}
-              profile={scopedProfile}
-              onPicked={closeMobilePanel}
-              onOpenOfficialSession={openOfficialSession}
-              onNewChat={startFreshDashboardChat}
-            />
           </div>
         </div>
       </>,
@@ -1557,23 +1536,12 @@ export default function ChatPage({ isActive = true }: { isActive?: boolean }) {
             aria-label={modelToolsLabel}
             className="flex min-h-0 shrink-0 flex-col gap-3 overflow-hidden lg:h-full lg:w-60"
           >
-            {/* Model picker — keeps the rail thin. */}
-            <div className="shrink-0">
+            <div className="min-h-0 flex-1">
               <ChatSidebar
                 channel={channel}
                 profile={scopedProfile}
                 onDashboardNewSessionRequest={startFreshDashboardChat}
                 onSessionTitleChange={handleSessionTitleChange}
-              />
-            </div>
-
-            {/* Session switcher fills the remaining height below the model box. */}
-            <div className="min-h-0 flex-1 overflow-hidden">
-              <ChatSessionList
-                activeSessionId={resumeParam}
-                profile={scopedProfile}
-                onOpenOfficialSession={openOfficialSession}
-                onNewChat={startFreshDashboardChat}
               />
             </div>
           </div>

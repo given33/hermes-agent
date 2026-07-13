@@ -184,6 +184,147 @@ class CollaborationDashboardTests(unittest.TestCase):
         )
         self.assertEqual(conversation["messages"], [])
 
+    def test_same_runtime_session_keeps_each_completed_turn(self):
+        module = load_module()
+        conversation = module.create_single_conversation("default")
+        state = {"conversations": [conversation]}
+        module.load_single_state = lambda: state
+        module.save_single_state = lambda _state: None
+
+        for turn_id, content in (
+            ("turn-one", "第一轮回答"),
+            ("turn-two", "第二轮回答"),
+        ):
+            module.record_single_message(
+                conversation["id"],
+                SimpleNamespace(
+                    role="assistant",
+                    name="default",
+                    content=content,
+                    status="completed",
+                    kind="message",
+                    meta={
+                        "runtime_session_id": "shared-session",
+                        "runtime_turn_id": turn_id,
+                    },
+                ),
+            )
+
+        self.assertEqual(
+            [message["content"] for message in conversation["messages"]],
+            ["第一轮回答", "第二轮回答"],
+        )
+
+    def test_runtime_recovery_matches_turn_id_not_reused_session_id(self):
+        module = load_module()
+        conversation = module.create_single_conversation("default")
+        conversation["messages"].append(
+            {
+                "id": "old-answer",
+                "role": "assistant",
+                "name": "default",
+                "content": "旧轮次回答",
+                "status": "completed",
+                "kind": "message",
+                "created_at": 1000,
+                "meta": {
+                    "runtime_session_id": "shared-session",
+                    "runtime_turn_id": "turn-old",
+                },
+            }
+        )
+        module.mark_conversation_runtime_run(
+            conversation,
+            "default",
+            "shared-session",
+            turn_id="turn-new",
+            baseline_message_count=2,
+            started_at=1500,
+        )
+
+        changed = module.reconcile_conversation_runtime_results(
+            conversation,
+            loader=lambda _profile, _session_id: [
+                {"role": "user", "content": "旧问题"},
+                {"role": "assistant", "content": "旧轮次回答"},
+                {"role": "user", "content": "新问题"},
+                {"role": "assistant", "content": "新轮次回答"},
+            ],
+            now_ms=2000,
+        )
+
+        self.assertTrue(changed)
+        self.assertEqual(
+            [message["content"] for message in conversation["messages"]],
+            ["旧轮次回答", "新轮次回答"],
+        )
+        self.assertEqual(
+            conversation["messages"][-1]["meta"]["runtime_turn_id"],
+            "turn-new",
+        )
+
+    def test_mapped_runtime_session_backfills_missing_assistant_turns(self):
+        module = load_module()
+        conversation = module.create_single_conversation("default")
+        module.set_conversation_runtime_session(
+            conversation,
+            "default",
+            "shared-session",
+        )
+        conversation["messages"] = [
+            {
+                "id": "user-one",
+                "role": "user",
+                "name": "你",
+                "content": "第一个问题",
+                "created_at": 1000,
+                "meta": {},
+            },
+            {
+                "id": "user-two",
+                "role": "user",
+                "name": "你",
+                "content": "第二个问题",
+                "created_at": 2000,
+                "meta": {},
+            },
+            {
+                "id": "answer-two",
+                "role": "assistant",
+                "name": "default",
+                "content": "第二个回答",
+                "created_at": 2500,
+                "meta": {"runtime_session_id": "shared-session"},
+            },
+        ]
+        runtime_messages = [
+            {"role": "user", "content": "第一个问题", "timestamp": 1.0},
+            {"role": "assistant", "content": "第一个回答", "timestamp": 1.5},
+            {"role": "user", "content": "第二个问题", "timestamp": 2.0},
+            {"role": "assistant", "content": "第二个回答", "timestamp": 2.5},
+        ]
+
+        changed = module.reconcile_conversation_mapped_sessions(
+            conversation,
+            loader=lambda _profile, _session_id: runtime_messages,
+        )
+
+        self.assertTrue(changed)
+        self.assertEqual(
+            [message["content"] for message in conversation["messages"]],
+            ["第一个问题", "第一个回答", "第二个问题", "第二个回答"],
+        )
+        self.assertEqual(
+            conversation["messages"][1]["meta"]["runtime_session_id"],
+            "shared-session",
+        )
+        self.assertFalse(
+            module.reconcile_conversation_mapped_sessions(
+                conversation,
+                loader=lambda _profile, _session_id: runtime_messages,
+            )
+        )
+
     def test_runtime_activity_timeline_restores_reasoning_and_tool_details(self):
         module = load_module()
         messages = [
@@ -418,9 +559,9 @@ class CollaborationDashboardTests(unittest.TestCase):
         self.assertTrue(manifest["tab"]["hidden"])
         self.assertEqual(manifest["api"], "plugin_api.py")
         self.assertIn("chat:top", manifest["slots"])
-        self.assertEqual(manifest["version"], "2.1.24")
-        self.assertEqual(manifest["entry"], "dist/index.js?v=2.1.24")
-        self.assertEqual(manifest["css"], "dist/style.css?v=2.1.24")
+        self.assertEqual(manifest["version"], "2.1.25")
+        self.assertEqual(manifest["entry"], "dist/index.js?v=2.1.25")
+        self.assertEqual(manifest["css"], "dist/style.css?v=2.1.25")
 
     def test_frontend_exposes_unified_streaming_chat_and_workflow_router(self):
         bundle = (MODULE_PATH.parent / "dist" / "index.js").read_text(
@@ -471,6 +612,9 @@ class CollaborationDashboardTests(unittest.TestCase):
         self.assertIn("body: file", bundle)
         self.assertIn("/attachments", bundle)
         self.assertIn("hc-attachment-list", bundle)
+        self.assertIn("hc-attachment-preview-modal", bundle)
+        self.assertIn('"预览"', bundle)
+        self.assertIn('"下载"', bundle)
         self.assertIn("hc-nav-toggle", bundle)
         self.assertIn('src: "/hermes-official.png"', bundle)
         self.assertIn('className: "hc-official-avatar"', bundle)
@@ -495,6 +639,49 @@ class CollaborationDashboardTests(unittest.TestCase):
         self.assertIn('await record(conversationId, routeMessage)', bundle)
         self.assertNotIn('className: "hc-header-profile"', bundle)
 
+    def test_model_tools_only_keeps_new_chat_model_and_event_status(self):
+        chat_page = (
+            MODULE_PATH.parents[3] / "web" / "src" / "pages" / "ChatPage.tsx"
+        ).read_text(encoding="utf-8")
+        chat_sidebar = (
+            MODULE_PATH.parents[3]
+            / "web"
+            / "src"
+            / "components"
+            / "ChatSidebar.tsx"
+        ).read_text(encoding="utf-8")
+
+        self.assertNotIn("ChatSessionList", chat_page)
+        self.assertIn("新建对话", chat_sidebar)
+        self.assertIn("工具事件流", chat_sidebar)
+        self.assertNotIn("重新连接工具事件流", chat_sidebar)
+
+    def test_unified_sidebar_merges_official_sessions_before_restoring_selection(self):
+        bundle = (MODULE_PATH.parent / "dist" / "index.js").read_text(
+            encoding="utf-8"
+        )
+        load_index = bundle.index("const loadIndex = useCallback")
+        merge_index = bundle.index(
+            "nextConversations = mergeConversationIndex(", load_index
+        )
+        remembered_index = bundle.index(
+            "const rememberedId = loadRememberedConversationId()", load_index
+        )
+
+        self.assertLess(merge_index, remembered_index)
+
+    def test_mobile_header_hides_route_picker_and_main_nav_hides_files(self):
+        bundle = (MODULE_PATH.parent / "dist" / "index.js").read_text(
+            encoding="utf-8"
+        )
+        app_source = (
+            MODULE_PATH.parents[3] / "web" / "src" / "App.tsx"
+        ).read_text(encoding="utf-8")
+
+        self.assertNotIn('className: "hc-route-select"', bundle)
+        self.assertIn('collabApi("/route"', bundle)
+        self.assertNotIn('{ path: "/files",', app_source)
+
     def test_frontend_recovers_transient_stream_disconnects_without_resubmitting(self):
         bundle = (MODULE_PATH.parent / "dist" / "index.js").read_text(
             encoding="utf-8"
@@ -513,9 +700,11 @@ class CollaborationDashboardTests(unittest.TestCase):
         self.assertIn("await onEvent", bundle)
         self.assertIn('status: "running"', bundle)
         self.assertIn("runtime_session_id", bundle)
+        self.assertGreaterEqual(bundle.count("runtime_turn_id: streamId"), 2)
         self.assertIn("error.submitted = submitted", bundle)
         self.assertIn("err.submitted && err.stored_session_id", bundle)
         self.assertIn("hostedRunning", bundle)
+        self.assertIn("representedTurnIds", bundle)
         self.assertIn("DBB3 服务端持续执行", bundle)
         self.assertIn("任务已由 DBB3 托管", bundle)
         self.assertIn("setInterval", bundle)

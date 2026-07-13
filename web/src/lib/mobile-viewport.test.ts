@@ -11,7 +11,7 @@ describe("applyMobileViewportMetrics", () => {
   it("uses the visual viewport while the iOS keyboard changes the visible area", () => {
     const setProperty = vi.fn();
 
-    applyMobileViewportMetrics(
+    const metrics = applyMobileViewportMetrics(
       {
         innerHeight: 844,
         visualViewport: {
@@ -30,12 +30,13 @@ describe("applyMobileViewportMetrics", () => {
       "--hermes-viewport-offset-top",
       "2px",
     );
+    expect(metrics.keyboardOpen).toBe(true);
   });
 
   it("falls back to the layout viewport when visualViewport is unavailable", () => {
     const setProperty = vi.fn();
 
-    applyMobileViewportMetrics(
+    const metrics = applyMobileViewportMetrics(
       {
         innerHeight: 932,
         visualViewport: null,
@@ -51,6 +52,7 @@ describe("applyMobileViewportMetrics", () => {
       "--hermes-viewport-offset-top",
       "0px",
     );
+    expect(metrics.keyboardOpen).toBe(false);
   });
 });
 
@@ -112,5 +114,7 @@ describe("mobile viewport CSS contract", () => {
       "top: var(--hermes-viewport-offset-top, 0px);",
     );
     expect(stylesheet).toContain("bottom: auto;");
+    expect(stylesheet).toContain('html[data-hermes-keyboard="open"]');
+    expect(stylesheet).toContain("padding-bottom: 6px !important;");
   });
 });

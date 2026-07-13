@@ -3,7 +3,7 @@
   "label": "群聊与工作流",
   "description": "Hermes 多 Profile 群聊与 Kanban 工作流界面。",
   "icon": "MessagesSquare",
-  "version": "2.1.24",
+  "version": "2.1.25",
   "tab": {
     "path": "/collaboration",
     "position": "after:chat",
@@ -12,7 +12,7 @@
   "slots": [
     "chat:top"
   ],
-  "entry": "dist/index.js?v=2.1.24",
-  "css": "dist/style.css?v=2.1.24",
+  "entry": "dist/index.js?v=2.1.25",
+  "css": "dist/style.css?v=2.1.25",
   "api": "plugin_api.py"
 }

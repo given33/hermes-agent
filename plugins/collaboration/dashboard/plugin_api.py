@@ -9,6 +9,7 @@ Kanban dashboard API rather than introducing a second scheduler.
 from __future__ import annotations
 
 import asyncio
+from collections import Counter
 import json
 import mimetypes
 import os
@@ -479,6 +480,7 @@ def mark_conversation_runtime_run(
     profile: str,
     session_id: str,
     *,
+    turn_id: str = "",
     baseline_message_count: int = 0,
     started_at: Optional[int] = None,
 ) -> dict[str, Any]:
@@ -501,6 +503,7 @@ def mark_conversation_runtime_run(
     now = int(time.time() * 1000) if started_at is None else int(started_at)
     runtime_runs[profile_name] = {
         "session_id": normalized_session_id,
+        "turn_id": str(turn_id).strip(),
         "status": "running",
         "baseline_message_count": max(0, int(baseline_message_count or 0)),
         "started_at": now,
@@ -743,6 +746,138 @@ def normalize_stored_conversation_messages(
     return normalized
 
 
+def _runtime_assistant_turns(
+    messages: list[dict[str, Any]],
+) -> list[tuple[str, dict[str, Any], list[dict[str, Any]]]]:
+    turns: list[tuple[str, dict[str, Any], list[dict[str, Any]]]] = []
+    pending: list[dict[str, Any]] = []
+
+    def flush() -> None:
+        if not pending:
+            return
+        assistants = [
+            item
+            for item in pending
+            if str(item.get("role") or "").lower() == "assistant"
+        ]
+        source = assistants[-1] if assistants else pending[-1]
+        content = next(
+            (
+                text
+                for text in reversed(
+                    [_message_content_text(item) for item in assistants]
+                )
+                if text
+            ),
+            "",
+        )
+        if content:
+            turns.append((content, source, list(pending)))
+        pending.clear()
+
+    for message in messages:
+        role = str(message.get("role") or "assistant").lower()
+        if role == "user":
+            flush()
+        elif role in {"assistant", "tool"}:
+            pending.append(message)
+    flush()
+    return turns
+
+
+def reconcile_conversation_mapped_sessions(
+    conversation: dict[str, Any],
+    *,
+    loader: Callable[[str, str], list[dict[str, Any]]] = _load_runtime_messages,
+) -> bool:
+    """Backfill assistant turns lost by legacy session-level replacement."""
+    runtime_sessions = conversation.get("runtime_sessions")
+    if not isinstance(runtime_sessions, dict):
+        return False
+    runtime_runs = conversation.get("runtime_runs")
+    runtime_runs = runtime_runs if isinstance(runtime_runs, dict) else {}
+    sync_counts = conversation.get("runtime_sync_counts")
+    if not isinstance(sync_counts, dict):
+        sync_counts = {}
+        conversation["runtime_sync_counts"] = sync_counts
+
+    changed = False
+    for profile, raw_session_id in runtime_sessions.items():
+        session_id = str(raw_session_id or "").strip()
+        if not session_id:
+            continue
+        active_run = runtime_runs.get(profile)
+        if (
+            isinstance(active_run, dict)
+            and active_run.get("status") == "running"
+            and active_run.get("session_id") == session_id
+        ):
+            continue
+        try:
+            runtime_messages = loader(str(profile), session_id)
+        except Exception:
+            continue
+        sync_key = f"{profile}:{session_id}"
+        if sync_counts.get(sync_key) == len(runtime_messages):
+            continue
+
+        existing_counts: Counter[str] = Counter()
+        for message in conversation.get("messages") or []:
+            if str(message.get("role") or "").lower() != "assistant":
+                continue
+            meta = message.get("meta")
+            meta = meta if isinstance(meta, dict) else {}
+            belongs_to_session = meta.get("runtime_session_id") == session_id
+            belongs_to_profile = (
+                not meta.get("runtime_session_id")
+                and str(message.get("name") or "") == str(profile)
+            )
+            content = _message_content_text(message)
+            if content and (belongs_to_session or belongs_to_profile):
+                existing_counts[content] += 1
+
+        matched_counts: Counter[str] = Counter()
+        for ordinal, (content, source, turn_messages) in enumerate(
+            _runtime_assistant_turns(runtime_messages),
+            start=1,
+        ):
+            if matched_counts[content] < existing_counts[content]:
+                matched_counts[content] += 1
+                continue
+            recovered = _append_message(
+                conversation,
+                role="assistant",
+                name=str(profile),
+                content=content,
+                status="completed",
+                meta={
+                    "runtime_session_id": session_id,
+                    "runtime_turn_id": f"recovered:{session_id}:{ordinal}",
+                    "runtime_recovered": True,
+                    "activities": build_runtime_activity_timeline(turn_messages),
+                },
+            )
+            timestamp = _timestamp_ms(source)
+            if timestamp:
+                recovered["created_at"] = timestamp
+            changed = True
+
+        sync_counts[sync_key] = len(runtime_messages)
+        changed = True
+
+    if changed:
+        conversation["messages"] = sorted(
+            conversation.get("messages") or [],
+            key=lambda message: int(message.get("created_at") or 0),
+        )[-_MAX_MESSAGES:]
+        if conversation["messages"]:
+            conversation["updated_at"] = max(
+                int(message.get("created_at") or 0)
+                for message in conversation["messages"]
+            )
+    return changed
+
+
 def reconcile_conversation_runtime_results(
     conversation: dict[str, Any],
     *,
@@ -782,7 +917,11 @@ def reconcile_conversation_runtime_results(
                 message
                 for message in conversation.get("messages") or []
                 if isinstance(message.get("meta"), dict)
-                and message["meta"].get("runtime_session_id") == session_id
+                and (
+                    message["meta"].get("runtime_turn_id") == run.get("turn_id")
+                    if run.get("turn_id")
+                    else message["meta"].get("runtime_session_id") == session_id
+                )
             ),
             None,
         )
@@ -796,6 +935,7 @@ def reconcile_conversation_runtime_results(
                 status="completed",
                 meta={
                     "runtime_session_id": session_id,
+                    "runtime_turn_id": str(run.get("turn_id") or ""),
                     "recovered": True,
                     "activities": activities,
                 },
@@ -1178,6 +1318,7 @@ class RecordMessageBody(BaseModel):
 class RuntimeSessionBody(BaseModel):
     profile: str = "default"
     session_id: str
+    turn_id: str = ""
     status: str = "running"
 
 
@@ -1278,6 +1419,7 @@ def get_single_conversation(conversation_id: str):
         state = load_single_state()
         conversation = _conversation_by_id(state, conversation_id)
         changed = reconcile_conversation_runtime_results(conversation)
+        changed = reconcile_conversation_mapped_sessions(conversation) or changed
         changed = compact_conversation_title(conversation) or changed
         if changed:
             save_single_state(state)
@@ -1345,6 +1487,7 @@ def download_conversation_attachment(
     conversation_id: str,
     bucket: str,
     relative_path: str,
+    preview: bool = False,
 ):
     with _STATE_LOCK:
         _conversation_by_id(load_single_state(), conversation_id)
@@ -1359,6 +1502,7 @@ def download_conversation_attachment(
         filename=target.name,
         media_type=mimetypes.guess_type(target.name)[0]
         or "application/octet-stream",
+        content_disposition_type="inline" if preview else "attachment",
     )
 
 
@@ -1375,15 +1519,22 @@ def record_single_message(
         runtime_session_id = str(
             payload.meta.get("runtime_session_id") or ""
         ).strip()
+        runtime_turn_id = str(
+            payload.meta.get("runtime_turn_id") or ""
+        ).strip()
         message = None
-        if payload.role == "assistant" and runtime_session_id:
+        if payload.role == "assistant" and (runtime_turn_id or runtime_session_id):
             message = next(
                 (
                     item
                     for item in conversation.get("messages") or []
                     if isinstance(item.get("meta"), dict)
-                    and item["meta"].get("runtime_session_id")
-                    == runtime_session_id
+                    and (
+                        item["meta"].get("runtime_turn_id") == runtime_turn_id
+                        if runtime_turn_id
+                        else item["meta"].get("runtime_session_id")
+                        == runtime_session_id
+                    )
                 ),
                 None,
             )
@@ -1412,7 +1563,12 @@ def record_single_message(
             conversation["updated_at"] = message["created_at"]
         if runtime_session_id:
             for run in (conversation.get("runtime_runs") or {}).values():
-                if run.get("session_id") == runtime_session_id:
+                same_turn = (
+                    run.get("turn_id") == runtime_turn_id
+                    if runtime_turn_id
+                    else run.get("session_id") == runtime_session_id
+                )
+                if same_turn:
                     run["status"] = "completed"
                     run["completed_at"] = message["created_at"]
                     run["updated_at"] = message["created_at"]
@@ -1444,6 +1600,7 @@ def save_runtime_session(
                 conversation,
                 payload.profile,
                 payload.session_id,
+                turn_id=payload.turn_id,
                 baseline_message_count=baseline_message_count,
             )
         else:
