@@ -614,30 +614,35 @@ def build_runtime_activity_timeline(
     activities: list[dict[str, Any]] = []
     tools_by_id: dict[str, dict[str, Any]] = {}
     sequence = 0
+    previous_timestamp: Optional[int] = None
 
     for message in messages:
         role = str(message.get("role") or "").lower()
+        message_timestamp = _timestamp_ms(message)
         if role == "assistant":
             reasoning = _reasoning_text(message)
             if reasoning:
                 sequence += 1
-                activities.append(
-                    {
-                        "id": f"reasoning-{sequence}",
-                        "kind": "reasoning",
-                        "category": "reasoning",
-                        "name": "模型思考",
-                        "input": "",
-                        "output": reasoning,
-                        "status": "completed",
-                        "started_at": _timestamp_ms(message),
-                        "ended_at": _timestamp_ms(message),
-                    }
-                )
+                activity = {
+                    "id": f"reasoning-{sequence}",
+                    "kind": "reasoning",
+                    "category": "reasoning",
+                    "name": "模型思考",
+                    "input": "",
+                    "output": reasoning,
+                    "status": "completed",
+                    "started_at": previous_timestamp,
+                    "ended_at": message_timestamp,
+                }
+                if (
+                    previous_timestamp is not None
+                    and message_timestamp is not None
+                    and message_timestamp >= previous_timestamp
+                ):
+                    activity["duration_ms"] = message_timestamp - previous_timestamp
+                activities.append(activity)
             tool_calls = message.get("tool_calls")
-            if not isinstance(tool_calls, list):
-                continue
-            for call in tool_calls:
+            for call in (tool_calls if isinstance(tool_calls, list) else []):
                 if not isinstance(call, dict):
                     continue
                 function = call.get("function")
@@ -655,7 +660,7 @@ def build_runtime_activity_timeline(
                     ),
                     "output": "",
                     "status": "running",
-                    "started_at": _timestamp_ms(message),
+                    "started_at": message_timestamp,
                     "ended_at": None,
                 }
                 activities.append(activity)
@@ -689,12 +694,15 @@ def build_runtime_activity_timeline(
                 if message.get("error") or str(message.get("status") or "").lower() in {"error", "failed"}
                 else "completed"
             )
-            activity["ended_at"] = _timestamp_ms(message)
+            activity["ended_at"] = message_timestamp
             if activity.get("started_at") and activity.get("ended_at"):
                 activity["duration_ms"] = max(
                     0,
                     activity["ended_at"] - activity["started_at"],
                 )
+
+        if message_timestamp is not None:
+            previous_timestamp = message_timestamp
 
     return activities
 

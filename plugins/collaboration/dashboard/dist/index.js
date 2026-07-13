@@ -921,11 +921,19 @@
   };
 
   function formatActivityDuration(activity) {
-    let duration = Number(activity.duration_ms);
+    const hasExplicitDuration =
+      activity.duration_ms !== null &&
+      activity.duration_ms !== undefined &&
+      activity.duration_ms !== "";
+    let duration = hasExplicitDuration ? Number(activity.duration_ms) : Number.NaN;
     if (!Number.isFinite(duration) && activity.started_at && activity.ended_at) {
       duration = Number(activity.ended_at) - Number(activity.started_at);
     }
-    if (!Number.isFinite(duration) || duration < 0) return "";
+    if (!Number.isFinite(duration) || duration < 0) {
+      return activity.kind === "reasoning" && activity.status !== "running"
+        ? "耗时未记录"
+        : "";
+    }
     if (duration < 1000) return `${Math.round(duration)} ms`;
     if (duration < 60000) return `${(duration / 1000).toFixed(duration < 10000 ? 1 : 0)} s`;
     return `${Math.floor(duration / 60000)}m ${Math.round((duration % 60000) / 1000)}s`;
@@ -1515,6 +1523,7 @@
       let activities = [];
       let activeReasoningId = "";
       let activitySequence = 0;
+      let modelPhaseStartedAt = turnStartedAt;
       const closeReasoning = () => {
         if (!activeReasoningId) return;
         const endedAt = Date.now();
@@ -1545,7 +1554,7 @@
               input: "",
               output: value,
               status: "running",
-              started_at: Date.now(),
+              started_at: modelPhaseStartedAt || Date.now(),
               ended_at: null,
             },
           ];
@@ -1671,6 +1680,7 @@
               }
               if (event.type === "tool.start") {
                 closeReasoning();
+                modelPhaseStartedAt = 0;
                 addToolActivity(payload);
               }
               if (event.type === "tool.progress" || event.type === "tool.generating") {
@@ -1686,6 +1696,7 @@
               }
               if (event.type === "tool.complete") {
                 const endedAt = Date.now();
+                modelPhaseStartedAt = endedAt;
                 const output = structuredText(
                   payload.result_text || payload.summary || payload.inline_diff,
                 );

@@ -1,5 +1,6 @@
 import importlib.util
 import json
+import subprocess
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
@@ -395,6 +396,62 @@ class CollaborationDashboardTests(unittest.TestCase):
         self.assertIn("active", tools[0]["output"])
         self.assertEqual(tools[0]["status"], "completed")
 
+    def test_reasoning_duration_uses_previous_message_as_model_start_boundary(self):
+        module = load_module()
+        activities = module.build_runtime_activity_timeline(
+            [
+                {"role": "user", "content": "check", "timestamp": 10.0},
+                {
+                    "role": "assistant",
+                    "reasoning_content": "first pass",
+                    "timestamp": 12.0,
+                    "tool_calls": [
+                        {
+                            "id": "call-1",
+                            "function": {"name": "terminal", "arguments": "{}"},
+                        }
+                    ],
+                },
+                {
+                    "role": "tool",
+                    "tool_call_id": "call-1",
+                    "content": "ok",
+                    "timestamp": 13.0,
+                },
+                {
+                    "role": "assistant",
+                    "reasoning_content": "second pass",
+                    "timestamp": 15.0,
+                },
+            ]
+        )
+
+        reasoning = [item for item in activities if item["kind"] == "reasoning"]
+        self.assertEqual(
+            [
+                (item["started_at"], item["ended_at"], item["duration_ms"])
+                for item in reasoning
+            ],
+            [(10_000, 12_000, 2_000), (13_000, 15_000, 2_000)],
+        )
+
+    def test_reasoning_without_start_boundary_is_not_recorded_as_zero_ms(self):
+        module = load_module()
+        activities = module.build_runtime_activity_timeline(
+            [
+                {
+                    "role": "assistant",
+                    "reasoning_content": "restored thought",
+                    "timestamp": 12.0,
+                }
+            ]
+        )
+
+        reasoning = activities[0]
+        self.assertIsNone(reasoning["started_at"])
+        self.assertEqual(reasoning["ended_at"], 12_000)
+        self.assertNotIn("duration_ms", reasoning)
+
     def test_old_standalone_tool_messages_are_folded_into_assistant_activity(self):
         module = load_module()
         messages = [
@@ -559,9 +616,9 @@ class CollaborationDashboardTests(unittest.TestCase):
         self.assertTrue(manifest["tab"]["hidden"])
         self.assertEqual(manifest["api"], "plugin_api.py")
         self.assertIn("chat:top", manifest["slots"])
-        self.assertEqual(manifest["version"], "2.1.25")
-        self.assertEqual(manifest["entry"], "dist/index.js?v=2.1.25")
-        self.assertEqual(manifest["css"], "dist/style.css?v=2.1.25")
+        self.assertEqual(manifest["version"], "2.1.26")
+        self.assertEqual(manifest["entry"], "dist/index.js?v=2.1.26")
+        self.assertEqual(manifest["css"], "dist/style.css?v=2.1.26")
 
     def test_frontend_exposes_unified_streaming_chat_and_workflow_router(self):
         bundle = (MODULE_PATH.parent / "dist" / "index.js").read_text(
@@ -638,6 +695,43 @@ class CollaborationDashboardTests(unittest.TestCase):
         self.assertIn('name: route.label', bundle)
         self.assertIn('await record(conversationId, routeMessage)', bundle)
         self.assertNotIn('className: "hc-header-profile"', bundle)
+
+    def test_frontend_activity_duration_distinguishes_missing_data_from_zero(self):
+        bundle = (MODULE_PATH.parent / "dist" / "index.js").read_text(
+            encoding="utf-8"
+        )
+        start = bundle.index("function formatActivityDuration(activity)")
+        end = bundle.index("\n  function ActivityTimeline", start)
+        function_source = bundle[start:end]
+        script = (
+            function_source
+            + "\nconsole.log(JSON.stringify(["
+            + "formatActivityDuration({kind:'reasoning',status:'completed',duration_ms:null}),"
+            + "formatActivityDuration({kind:'reasoning',status:'completed',duration_ms:0}),"
+            + "formatActivityDuration({kind:'reasoning',status:'completed',started_at:1000,ended_at:3000})"
+            + "]));"
+        )
+        result = subprocess.run(
+            ["node", "-e", script],
+            check=True,
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+        )
+
+        self.assertEqual(
+            json.loads(result.stdout),
+            ["耗时未记录", "0 ms", "2.0 s"],
+        )
+
+    def test_frontend_realtime_reasoning_uses_model_phase_start_boundary(self):
+        bundle = (MODULE_PATH.parent / "dist" / "index.js").read_text(
+            encoding="utf-8"
+        )
+
+        self.assertIn("let modelPhaseStartedAt = turnStartedAt;", bundle)
+        self.assertIn("started_at: modelPhaseStartedAt || Date.now(),", bundle)
+        self.assertIn("modelPhaseStartedAt = endedAt;", bundle)
 
     def test_model_tools_only_keeps_new_chat_model_and_event_status(self):
         chat_page = (
