@@ -15793,6 +15793,14 @@ def mount_spa(application: FastAPI):
             html = html.replace('href="/assets/', f'href="{prefix}/assets/')
             html = html.replace('src="/assets/', f'src="{prefix}/assets/')
             html = html.replace('href="/favicon.ico"', f'href="{prefix}/favicon.ico"')
+            html = html.replace(
+                'href="/apple-touch-icon.png"',
+                f'href="{prefix}/apple-touch-icon.png"',
+            )
+            html = html.replace(
+                'href="/manifest.webmanifest"',
+                f'href="{prefix}/manifest.webmanifest"',
+            )
             html = html.replace('href="/fonts/', f'href="{prefix}/fonts/')
             html = html.replace('href="/ds-assets/', f'href="{prefix}/ds-assets/')
             html = html.replace('src="/ds-assets/', f'src="{prefix}/ds-assets/')
@@ -17135,7 +17143,12 @@ def start_server(
         # trigger a false disconnect; a genuinely dead local client is still
         # reaped via the WebSocketDisconnect → disconnect/reap path.
         ws_ping_interval=None if _is_loopback else 20.0,
-        ws_ping_timeout=None if _is_loopback else 20.0,
+        # iOS may pause network traffic for tens of seconds while handing off
+        # between Wi-Fi and cellular. Keep sending pings frequently enough for
+        # proxies, but allow a longer pong window before declaring the socket
+        # half-open; the browser reconnect layer resumes the stored session if
+        # the transport really did disappear.
+        ws_ping_timeout=None if _is_loopback else 60.0,
     )
     server = uvicorn.Server(config)
 

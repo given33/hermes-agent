@@ -86,6 +86,8 @@
      these as `--series-input-token` / `--series-output-token`. */
   --series-input-token: #ffe6cb;
   --series-output-token: #34d399;
+  --hermes-viewport-height: 100dvh;
+  --hermes-viewport-offset-top: 0px;
 }
 
 /* Theme tokens cascade into the document root so every descendant inherits
@@ -95,9 +97,11 @@ html {
   font-size: var(--theme-base-size);
   line-height: var(--theme-line-height);
   letter-spacing: var(--theme-letter-spacing);
-  height: 100dvh;
-  max-height: 100dvh;
+  height: var(--hermes-viewport-height, 100dvh);
+  max-height: var(--hermes-viewport-height, 100dvh);
   overflow: hidden;
+  background: var(--background-base);
+  overscroll-behavior: none;
 }
 
 body {
@@ -106,6 +110,8 @@ body {
   height: 100%;
   margin: 0;
   overflow: hidden;
+  background: var(--background-base);
+  overscroll-behavior: none;
 }
 
 code, kbd, pre, samp, .font-mono, .font-mono-ui {
@@ -127,17 +133,30 @@ code, kbd, pre, samp, .font-mono, .font-mono-ui {
   height: 100%;
   max-height: 100%;
   overflow: hidden;
+  background: var(--background-base);
 }
 
 @media (max-width: 768px) {
   html,
   body,
   #root {
-    min-height: 100dvh;
-    height: auto;
-    max-height: none;
+    min-height: var(--hermes-viewport-height, 100dvh);
+    height: var(--hermes-viewport-height, 100dvh);
+    max-height: var(--hermes-viewport-height, 100dvh);
     overflow-x: hidden;
-    overflow-y: auto;
+    overflow-y: hidden;
+  }
+}
+
+@media (display-mode: standalone) and (max-width: 768px) {
+  html,
+  body,
+  #root {
+    min-height: var(--hermes-viewport-height, 100dvh);
+    height: var(--hermes-viewport-height, 100dvh);
+    max-height: var(--hermes-viewport-height, 100dvh);
+    overflow: hidden;
+    background: var(--background-base);
   }
 }
 
@@ -244,4 +263,3 @@ code { font-size: 0.875rem; }
   background: repeating-conic-gradient(currentColor 0% 25%, #0000 0% 50%) 0 0 /
     2px 2px;
 }
-

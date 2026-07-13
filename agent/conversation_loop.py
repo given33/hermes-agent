@@ -60,6 +60,7 @@ from agent.process_bootstrap import _install_safe_stdio
 from agent.prompt_caching import apply_anthropic_cache_control
 from agent.retry_utils import (
     adaptive_rate_limit_backoff,
+    cloudflare_origin_retry_delay,
     is_zai_coding_overload_error,
     jittered_backoff,
     zai_coding_overload_retry_ceiling,
@@ -4118,9 +4119,12 @@ def run_conversation(
                         "failure_reason": classified.reason.value,
                     }
 
-                # For rate limits, respect the Retry-After header if present
-                _retry_after = None
-                if is_rate_limited:
+                # Respect Cloudflare origin retry hints carried in JSON bodies.
+                # Unlike rate-limit responses, these 502s commonly omit the
+                # Retry-After header and explicitly ask clients to wait 60s.
+                _cloudflare_origin_delay = cloudflare_origin_retry_delay(api_error)
+                _retry_after = _cloudflare_origin_delay
+                if is_rate_limited and _retry_after is None:
                     _resp_headers = getattr(getattr(api_error, "response", None), "headers", None)
                     if _resp_headers and hasattr(_resp_headers, "get"):
                         _ra_raw = _resp_headers.get("retry-after") or _resp_headers.get("Retry-After")
@@ -4144,7 +4148,14 @@ def run_conversation(
                         error=api_error,
                         default_wait=wait_time,
                     )
-                if is_rate_limited or _is_zai_coding_overload:
+                if _cloudflare_origin_delay is not None:
+                    _backoff_policy = "cloudflare_origin_bad_gateway"
+                    _origin_status = (
+                        f"Upstream origin unavailable. Waiting {wait_time:.1f}s "
+                        f"(attempt {retry_count + 1}/{max_retries})..."
+                    )
+                    agent._emit_status(_origin_status)
+                elif is_rate_limited or _is_zai_coding_overload:
                     _policy_note = ""
                     if _backoff_policy == "zai_coding_overload_long":
                         _policy_note = " (Z.AI Coding overload adaptive long backoff)"

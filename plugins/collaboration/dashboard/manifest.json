@@ -1,0 +1,18 @@
+{
+  "name": "collaboration",
+  "label": "群聊与工作流",
+  "description": "Hermes 多 Profile 群聊与 Kanban 工作流界面。",
+  "icon": "MessagesSquare",
+  "version": "2.1.24",
+  "tab": {
+    "path": "/collaboration",
+    "position": "after:chat",
+    "hidden": true
+  },
+  "slots": [
+    "chat:top"
+  ],
+  "entry": "dist/index.js?v=2.1.24",
+  "css": "dist/style.css?v=2.1.24",
+  "api": "plugin_api.py"
+}

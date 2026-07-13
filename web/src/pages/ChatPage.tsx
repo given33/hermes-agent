@@ -37,6 +37,10 @@ import { useI18n } from "@/i18n";
 import { api } from "@/lib/api";
 import { normalizeSessionTitle } from "@/lib/chat-title";
 import {
+  PENDING_UNIFIED_SESSION_KEY,
+  queueUnifiedSessionResume,
+} from "@/lib/unified-session";
+import {
   PTY_CONNECTING_TIMEOUT_MS,
   PTY_RECONNECT_INPUT_MESSAGE,
   PTY_RESUME_RECONNECT_THROTTLE_MS,
@@ -232,7 +236,17 @@ export default function ChatPage({ isActive = true }: { isActive?: boolean }) {
     setPtyState("connecting");
     setReconnectNonce((n) => n + 1);
   }, [clearReconnectTimer]);
+  const [mobilePanelOpenRaw, setMobilePanelOpenRaw] = useState(false);
+  const [unifiedChatActive, setUnifiedChatActive] = useState(false);
   const startFreshDashboardChat = useCallback(() => {
+    if (unifiedChatActive) {
+      window.dispatchEvent(
+        new CustomEvent("hermes:new-unified-conversation"),
+      );
+      setMobilePanelOpenRaw(false);
+      return;
+    }
+
     const next = new URLSearchParams(searchParams);
 
     next.delete("resume");
@@ -247,7 +261,12 @@ export default function ChatPage({ isActive = true }: { isActive?: boolean }) {
     setLastCloseCode(null);
     setPtyState("connecting");
     setReconnectNonce((n) => n + 1);
-  }, [clearReconnectTimer, searchParams, setSearchParams]);
+  }, [
+    clearReconnectTimer,
+    searchParams,
+    setSearchParams,
+    unifiedChatActive,
+  ]);
   // Raw state for the mobile side-sheet + a derived value that force-
   // closes whenever the chat tab isn't active.  The *derived* value is
   // what side-effects (body-scroll lock, keydown listener, portal render)
@@ -256,7 +275,6 @@ export default function ChatPage({ isActive = true }: { isActive?: boolean }) {
   // /chat re-runs the effect (derived flips back to true) and re-locks.
   // Keying on the raw state would leak the body.overflow="hidden" across
   // tabs because the dep wouldn't change on tab switch.
-  const [mobilePanelOpenRaw, setMobilePanelOpenRaw] = useState(false);
   const mobilePanelOpen = isActive && mobilePanelOpenRaw;
   const { setEnd, setTitle } = usePageHeader();
   const [sessionTitleState, setSessionTitleState] = useState<{
@@ -277,6 +295,38 @@ export default function ChatPage({ isActive = true }: { isActive?: boolean }) {
       ? window.matchMedia("(max-width: 1023px)").matches
       : false,
   );
+
+  useEffect(() => {
+    const syncUnifiedChat = () => {
+      setUnifiedChatActive(
+        Boolean(
+          document.querySelector(
+            '[data-chat-active="true"] .hc-single-chat',
+          ),
+        ),
+      );
+    };
+    syncUnifiedChat();
+    const observer = new MutationObserver(syncUnifiedChat);
+    observer.observe(document.body, { childList: true, subtree: true });
+    return () => observer.disconnect();
+  }, []);
+
+  useEffect(() => {
+    if (!isActive) return;
+    const frame = window.requestAnimationFrame(() => {
+      const pendingSessionId = window.sessionStorage.getItem(
+        PENDING_UNIFIED_SESSION_KEY,
+      );
+      if (!pendingSessionId) return;
+      window.dispatchEvent(
+        new CustomEvent("hermes:resume-unified-session", {
+          detail: { sessionId: pendingSessionId },
+        }),
+      );
+    });
+    return () => window.cancelAnimationFrame(frame);
+  }, [isActive]);
 
   const { theme } = useTheme();
   const terminalBg = theme.terminalBackground ?? DEFAULT_TERMINAL_BACKGROUND;
@@ -385,6 +435,20 @@ export default function ChatPage({ isActive = true }: { isActive?: boolean }) {
       document.body.style.overflow = prevOverflow;
     };
   }, [mobilePanelOpen, closeMobilePanel]);
+
+  useEffect(() => {
+    const openUnifiedModelTools = () => setMobilePanelOpenRaw(true);
+    window.addEventListener(
+      "hermes:open-model-tools",
+      openUnifiedModelTools,
+    );
+    return () => {
+      window.removeEventListener(
+        "hermes:open-model-tools",
+        openUnifiedModelTools,
+      );
+    };
+  }, []);
 
   useEffect(() => {
     const mql = window.matchMedia("(min-width: 1024px)");
@@ -1294,9 +1358,21 @@ export default function ChatPage({ isActive = true }: { isActive?: boolean }) {
   const visibleBanner = banner ?? reconnectBanner;
   const showReconnectOverlay =
     ptyState === "reconnecting" || (ptyState === "closed" && !banner);
+  const openOfficialSession = useCallback(
+    (sessionId: string) => {
+      closeMobilePanel();
+      queueUnifiedSessionResume(window.sessionStorage, sessionId);
+      window.dispatchEvent(
+        new CustomEvent("hermes:resume-unified-session", {
+          detail: { sessionId },
+        }),
+      );
+    },
+    [closeMobilePanel],
+  );
   const mobileModelToolsPortal =
     isActive &&
-    narrow &&
+    (narrow || unifiedChatActive) &&
     portalRoot &&
     createPortal(
       <>
@@ -1331,7 +1407,8 @@ export default function ChatPage({ isActive = true }: { isActive?: boolean }) {
         >
           <div
             className={cn(
-              "flex h-14 shrink-0 items-center justify-between gap-2 border-b border-current/20 px-5",
+              "flex min-h-14 shrink-0 items-center justify-between gap-2 border-b border-current/20 px-5",
+              "pt-[env(safe-area-inset-top,0px)]",
             )}
           >
             <Typography
@@ -1372,6 +1449,7 @@ export default function ChatPage({ isActive = true }: { isActive?: boolean }) {
               activeSessionId={resumeParam}
               profile={scopedProfile}
               onPicked={closeMobilePanel}
+              onOpenOfficialSession={openOfficialSession}
               onNewChat={startFreshDashboardChat}
             />
           </div>
@@ -1494,6 +1572,7 @@ export default function ChatPage({ isActive = true }: { isActive?: boolean }) {
               <ChatSessionList
                 activeSessionId={resumeParam}
                 profile={scopedProfile}
+                onOpenOfficialSession={openOfficialSession}
                 onNewChat={startFreshDashboardChat}
               />
             </div>

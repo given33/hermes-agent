@@ -58,6 +58,11 @@ import {
   DialogTitle,
 } from "@nous-research/ui/ui/components/dialog";
 import { cn } from "@/lib/utils";
+import {
+  localizedSkillDescription,
+  localizedToolsetDescription,
+  localizedToolsetLabel,
+} from "@/lib/localized-metadata";
 import { Input } from "@nous-research/ui/ui/components/input";
 import { useI18n } from "@/i18n";
 import { usePageHeader } from "@/contexts/usePageHeader";
@@ -138,7 +143,7 @@ export default function SkillsPage() {
   const [editorOpen, setEditorOpen] = useState(false);
   const [editorSkill, setEditorSkill] = useState<string | null>(null);
   const { toast, showToast } = useToast();
-  const { t } = useI18n();
+  const { locale, t } = useI18n();
   const { setAfterTitle, setEnd } = usePageHeader();
 
   // ── Profile scoping ──
@@ -493,6 +498,7 @@ export default function SkillsPage() {
                     {searchMatchedSkills.map((skill) => (
                       <SkillRow
                         key={skill.name}
+                        locale={locale}
                         skill={skill}
                         toggling={togglingSkills.has(skill.name)}
                         onToggle={() => handleToggleSkill(skill)}
@@ -555,6 +561,7 @@ export default function SkillsPage() {
                     {activeSkills.map((skill) => (
                       <SkillRow
                         key={skill.name}
+                        locale={locale}
                         skill={skill}
                         toggling={togglingSkills.has(skill.name)}
                         onToggle={() => handleToggleSkill(skill)}
@@ -579,7 +586,10 @@ export default function SkillsPage() {
                 <div className="grid gap-3 sm:grid-cols-2 lg:grid-cols-3">
                   {filteredToolsets.map((ts) => {
                     const TsIcon = toolsetIcon(ts.name);
-                    const labelText = ts.label.trim() || ts.name;
+                    const labelText = localizedToolsetLabel(
+                      ts.label.trim() || ts.name,
+                      locale,
+                    );
 
                     return (
                       <Card key={ts.name} className="relative rounded-none">
@@ -601,7 +611,7 @@ export default function SkillsPage() {
                                 </Badge>
                               </div>
                               <p className="text-xs text-text-secondary mb-2">
-                                {ts.description}
+                                {localizedToolsetDescription(ts.description, locale)}
                               </p>
                               {ts.enabled && !ts.configured && (
                                 <p className="text-xs text-amber-300 mb-2">
@@ -735,6 +745,7 @@ export default function SkillsPage() {
 
 function SkillRow({
   skill,
+  locale,
   toggling,
   onToggle,
   onEdit,
@@ -760,7 +771,7 @@ function SkillRow({
           </span>
         </div>
         <p className="text-xs text-muted-foreground leading-relaxed line-clamp-2">
-          {skill.description || noDescriptionLabel}
+          {localizedSkillDescription(skill, locale) || noDescriptionLabel}
         </p>
       </div>
       <Button
@@ -802,6 +813,7 @@ interface PanelItemProps {
 }
 
 interface SkillRowProps {
+  locale: string;
   noDescriptionLabel: string;
   onToggle: () => void;
   onEdit: () => void;
@@ -863,6 +875,7 @@ function HubBrowser({
   /** Optional profile scoping installs + installed-state badges. */
   profile?: string;
 }) {
+  const { locale } = useI18n();
   const [query, setQuery] = useState("");
   const [results, setResults] = useState<SkillHubResult[]>([]);
   const [searching, setSearching] = useState(false);
@@ -1093,6 +1106,7 @@ function HubBrowser({
                 <HubResultCard
                   key={r.identifier}
                   result={r}
+                  locale={locale}
                   installed={isInstalled(r.identifier)}
                   onOpen={() => setDetail(r)}
                   onInstall={() => void install(r.identifier)}
@@ -1137,6 +1151,7 @@ function HubBrowser({
               <HubResultCard
                 key={r.identifier}
                 result={r}
+                locale={locale}
                 installed={isInstalled(r.identifier)}
                 onOpen={() => setDetail(r)}
                 onInstall={() => void install(r.identifier)}
@@ -1150,6 +1165,7 @@ function HubBrowser({
       {detail && (
         <SkillDetailDialog
           result={detail}
+          locale={locale}
           installed={isInstalled(detail.identifier)}
           onClose={() => setDetail(null)}
           onInstall={() => void install(detail.identifier)}
@@ -1254,11 +1270,13 @@ function SearchMeta({
 /* ---- One result card ---- */
 function HubResultCard({
   result,
+  locale,
   installed,
   onOpen,
   onInstall,
 }: {
   result: SkillHubResult;
+  locale: string;
   installed: boolean;
   onOpen: () => void;
   onInstall: () => void;
@@ -1290,7 +1308,7 @@ function HubResultCard({
             )}
           </div>
           <p className="text-xs text-text-secondary line-clamp-2">
-            {result.description}
+            {localizedSkillDescription(result, locale)}
           </p>
           <div className="flex flex-wrap items-center gap-1 mt-1">
             {result.tags.slice(0, 5).map((tag) => (
@@ -1337,12 +1355,14 @@ function HubResultCard({
 /* ---- Detail dialog: SKILL.md preview + on-demand security scan ---- */
 function SkillDetailDialog({
   result,
+  locale,
   installed,
   onClose,
   onInstall,
   showToast,
 }: {
   result: SkillHubResult;
+  locale: string;
   installed: boolean;
   onClose: () => void;
   onInstall: () => void;
@@ -1409,7 +1429,9 @@ function SkillDetailDialog({
         </DialogHeader>
 
         <div className="mt-1 flex flex-col gap-1">
-          <p className="text-xs text-text-secondary">{result.description}</p>
+          <p className="text-xs text-text-secondary">
+            {localizedSkillDescription(result, locale)}
+          </p>
           <p className="text-xs font-mono text-text-tertiary truncate">
             {result.identifier}
           </p>

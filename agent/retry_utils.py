@@ -5,9 +5,12 @@ thundering-herd retry spikes when multiple sessions hit the same
 rate-limited provider concurrently.
 """
 
+import json
+import math
 import random
 import threading
 import time
+from collections.abc import Mapping
 from typing import Any
 
 # Monotonic counter for jitter seed uniqueness within the same process.
@@ -83,6 +86,77 @@ def _error_text(error: Any) -> str:
         getattr(error, "response", None),
     ]
     return " ".join(str(part) for part in parts if part is not None).lower()
+
+
+def is_cloudflare_origin_bad_gateway_error(error: Any) -> bool:
+    """Return True for Cloudflare 502 responses caused by its origin server."""
+    status = getattr(error, "status_code", None)
+    if status is None:
+        status = getattr(getattr(error, "response", None), "status_code", None)
+    if status != 502:
+        return False
+
+    text = _error_text(error)
+    return (
+        "origin_bad_gateway" in text
+        or (
+            "cloudflare" in text
+            and "origin web server returned an invalid or incomplete response" in text
+        )
+    )
+
+
+def _retry_after_from_value(value: Any) -> float | None:
+    if isinstance(value, Mapping):
+        for key in ("retry_after", "retry-after", "Retry-After"):
+            if key in value:
+                try:
+                    parsed = float(value[key])
+                except (TypeError, ValueError):
+                    continue
+                if math.isfinite(parsed) and parsed > 0:
+                    return parsed
+        for nested in value.values():
+            parsed = _retry_after_from_value(nested)
+            if parsed is not None:
+                return parsed
+        return None
+
+    if isinstance(value, (list, tuple)):
+        for nested in value:
+            parsed = _retry_after_from_value(nested)
+            if parsed is not None:
+                return parsed
+        return None
+
+    if isinstance(value, str) and value.lstrip().startswith(("{", "[")):
+        try:
+            return _retry_after_from_value(json.loads(value))
+        except (TypeError, ValueError, json.JSONDecodeError):
+            return None
+    return None
+
+
+def cloudflare_origin_retry_delay(
+    error: Any,
+    *,
+    minimum: float = 60.0,
+    maximum: float = 600.0,
+) -> float | None:
+    """Read Cloudflare's JSON retry hint and apply a conservative delay floor."""
+    if not is_cloudflare_origin_bad_gateway_error(error):
+        return None
+
+    candidates = (
+        getattr(error, "body", None),
+        getattr(getattr(error, "response", None), "body", None),
+        getattr(getattr(error, "response", None), "text", None),
+    )
+    delay = next(
+        (parsed for value in candidates if (parsed := _retry_after_from_value(value)) is not None),
+        minimum,
+    )
+    return min(max(delay, minimum), maximum)
 
 
 def is_zai_coding_overload_error(*, base_url: str | None, model: str | None, error: Any) -> bool:

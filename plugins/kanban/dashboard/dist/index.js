@@ -397,17 +397,57 @@
   // standard `drop` event and our `hermes-kanban:drop` event.
   // -------------------------------------------------------------------------
 
+  const TOUCH_DRAG_HOLD_MS = 360;
+  const TOUCH_SCROLL_CANCEL_PX = 12;
+
   function attachTouchDrag(el, taskId) {
     if (!el) return;
     function onDown(e) {
       if (e.pointerType !== "touch") return;
-      e.preventDefault();
-      const proxy = el.cloneNode(true);
-      proxy.classList.add("hermes-kanban-touch-proxy");
-      document.body.appendChild(proxy);
+      if (
+        e.target &&
+        e.target.closest &&
+        e.target.closest("button, input, label, a, textarea, select")
+      ) return;
+
+      const startX = e.clientX;
+      const startY = e.clientY;
+      let dragging = false;
+      let proxy = null;
       let lastTarget = null;
 
+      function cleanup() {
+        clearTimeout(holdTimer);
+        document.removeEventListener("pointermove", move);
+        document.removeEventListener("pointerup", up);
+        document.removeEventListener("pointercancel", up);
+      }
+
+      function activate() {
+        dragging = true;
+        proxy = el.cloneNode(true);
+        proxy.classList.add("hermes-kanban-touch-proxy");
+        document.body.appendChild(proxy);
+        proxy.style.position = "fixed";
+        proxy.style.pointerEvents = "none";
+        proxy.style.opacity = "0.85";
+        proxy.style.zIndex = "9999";
+        proxy.style.width = `${el.offsetWidth}px`;
+        proxy.style.left = `${startX - el.offsetWidth / 2}px`;
+        proxy.style.top = `${startY - 24}px`;
+        if (navigator.vibrate) navigator.vibrate(18);
+      }
+
       function move(ev) {
+        if (!dragging) {
+          const distance = Math.hypot(
+            ev.clientX - startX,
+            ev.clientY - startY,
+          );
+          if (distance > TOUCH_SCROLL_CANCEL_PX) cleanup();
+          return;
+        }
+        ev.preventDefault();
         proxy.style.left = `${ev.clientX - proxy.offsetWidth / 2}px`;
         proxy.style.top = `${ev.clientY - 24}px`;
         proxy.style.display = "none";
@@ -423,9 +463,8 @@
         }
       }
       function up() {
-        document.removeEventListener("pointermove", move);
-        document.removeEventListener("pointerup", up);
-        document.removeEventListener("pointercancel", up);
+        cleanup();
+        if (!dragging) return;
         if (lastTarget) {
           lastTarget.classList.remove("hermes-kanban-column--drop");
           const status = lastTarget.getAttribute("data-kanban-column");
@@ -442,17 +481,10 @@
             }));
           }
         }
-        proxy.remove();
+        if (proxy) proxy.remove();
       }
-      // Kick off proxy at the pointer origin.
-      proxy.style.position = "fixed";
-      proxy.style.pointerEvents = "none";
-      proxy.style.opacity = "0.85";
-      proxy.style.zIndex = "9999";
-      proxy.style.width = `${el.offsetWidth}px`;
-      proxy.style.left = `${e.clientX - el.offsetWidth / 2}px`;
-      proxy.style.top = `${e.clientY - 24}px`;
-      document.addEventListener("pointermove", move);
+      const holdTimer = setTimeout(activate, TOUCH_DRAG_HOLD_MS);
+      document.addEventListener("pointermove", move, { passive: false });
       document.addEventListener("pointerup", up);
       document.addEventListener("pointercancel", up);
     }

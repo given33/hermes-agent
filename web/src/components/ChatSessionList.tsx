@@ -38,6 +38,8 @@ interface ChatSessionListProps {
   className?: string;
   /** Optional callback fired after a row is picked (e.g. close mobile sheet). */
   onPicked?: () => void;
+  /** Opens an official stored session in the session transcript page. */
+  onOpenOfficialSession?: (id: string) => void;
   /**
    * Starts a fresh chat. ChatPage supplies its `startFreshDashboardChat`,
    * which clears `?resume` AND bumps the reconnect nonce so a brand-new PTY
@@ -60,9 +62,10 @@ export function ChatSessionList({
   profile,
   className,
   onPicked,
+  onOpenOfficialSession,
   onNewChat,
 }: ChatSessionListProps) {
-  const { t } = useI18n();
+  const { locale, t } = useI18n();
   const [, setSearchParams] = useSearchParams();
   const [sessions, setSessions] = useState<SessionInfo[] | null>(null);
   const [loading, setLoading] = useState(false);
@@ -115,6 +118,10 @@ export function ChatSessionList({
   const pick = useCallback(
     (id: string) => {
       onPicked?.();
+      if (onOpenOfficialSession) {
+        onOpenOfficialSession(id);
+        return;
+      }
       if (id === activeSessionId) return;
       setSearchParams(
         (prev) => {
@@ -125,7 +132,7 @@ export function ChatSessionList({
         { replace: false },
       );
     },
-    [activeSessionId, onPicked, setSearchParams],
+    [activeSessionId, onOpenOfficialSession, onPicked, setSearchParams],
   );
 
   // "New chat" prefers ChatPage's robust handler (clears resume + forces a
@@ -198,11 +205,13 @@ export function ChatSessionList({
                 {rowLabel(s, t.sessions.untitledSession)}
               </span>
               <span className="flex w-full items-center gap-1.5 text-[0.6875rem] text-text-tertiary">
-                <span>{timeAgo(s.last_active)}</span>
+                <span>{timeAgo(s.last_active, locale)}</span>
                 {s.message_count > 0 && (
                   <>
                     <span aria-hidden>·</span>
-                    <span>{s.message_count} msgs</span>
+                    <span>
+                      {s.message_count} {t.common.msgs}
+                    </span>
                   </>
                 )}
                 {s.source && s.source !== "cli" && (
@@ -217,7 +226,7 @@ export function ChatSessionList({
         })}
       </div>
     );
-  }, [activeSessionId, error, loading, pick, reload, sessions, t]);
+  }, [activeSessionId, error, loading, locale, pick, reload, sessions, t]);
 
   return (
     <aside

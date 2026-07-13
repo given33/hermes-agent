@@ -27,6 +27,7 @@ import { Toast } from "@nous-research/ui/ui/components/toast";
 import { useI18n } from "@/i18n";
 import { PluginSlot } from "@/plugins";
 import { cn } from "@/lib/utils";
+import { localizedPluginDescription } from "@/lib/localized-metadata";
 import { usePageHeader } from "@/contexts/usePageHeader";
 
 /** Select value for built-in memory (`config` uses empty string). Never use `""` — UI Select maps empty value to an empty label. */
@@ -299,7 +300,7 @@ export default function PluginsPage() {
   const [rowBusy, setRowBusy] = useState<string | null>(null);
 
   const { toast, showToast } = useToast();
-  const { t } = useI18n();
+  const { locale, t } = useI18n();
   const { setAfterTitle } = usePageHeader();
 
   const loadHub = useCallback((memorySelection?: string) => {
@@ -582,7 +583,7 @@ export default function PluginsPage() {
 
                   {selectedMemoryName && selectedMemoryInfo?.description && (
                     <p className="text-xs text-muted-foreground">
-                      {selectedMemoryInfo.description}
+                      {localizedPluginDescription(selectedMemoryInfo, locale)}
                     </p>
                   )}
 
@@ -848,7 +849,7 @@ export default function PluginsPage() {
 
 
                   <PluginRowCard
-                    {...{ row, rowBusy, setRuntimeLoading, showToast, t }}
+                    {...{ locale, row, rowBusy, setRuntimeLoading, showToast, t }}
                   />
 
                 </li>
@@ -873,7 +874,9 @@ export default function PluginsPage() {
                 <li className="text-xs text-text-secondary" key={m.name}>
 
 
-                  {m.label ?? m.name} — {m.description || m.tab?.path}
+                  {m.label ?? m.name} — {m.description
+                    ? localizedPluginDescription(m, locale)
+                    : m.tab?.path}
 
 
                   {!m.tab?.hidden ? (
@@ -901,6 +904,7 @@ export default function PluginsPage() {
 }
 
 interface PluginRowCardProps {
+  locale: string;
 
   row: HubAgentPluginRow;
   rowBusy: string | null;
@@ -916,6 +920,7 @@ interface PluginRowCardProps {
 function PluginRowCard(props: PluginRowCardProps) {
   const {
     row,
+    locale,
     rowBusy,
     setRuntimeLoading,
     showToast,
@@ -1066,7 +1071,14 @@ function PluginRowCard(props: PluginRowCardProps) {
 
         {row.description ? (
           <p className="min-w-0 w-full text-xs tracking-[0.06em] text-text-secondary break-words">
-            {row.description}
+            {localizedPluginDescription(
+              {
+                name: row.name,
+                label: row.dashboard_manifest?.label,
+                description: row.description,
+              },
+              locale,
+            )}
           </p>
         ) : null}
 

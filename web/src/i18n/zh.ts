@@ -67,17 +67,22 @@ export const zh: Translations = {
     },
     nav: {
       analytics: "分析",
-      chat: "对话",
+      channels: "消息渠道",
+      chat: "单聊",
       config: "配置",
       cron: "定时任务",
       documentation: "文档",
+      files: "文件",
       keys: "密钥",
       logs: "日志",
       models: "模型",
+      pairing: "设备配对",
       profiles: "多Agent配置",
       plugins: "插件管理",
       sessions: "会话",
       skills: "技能",
+      system: "系统监控",
+      webhooks: "网络钩子",
     },
     modelToolsSheetSubtitle: "与工具",
     modelToolsSheetTitle: "模型",
@@ -89,6 +94,10 @@ export const zh: Translations = {
     statusOverview: "状态概览",
     system: "系统",
     webUi: "管理面板",
+    managingProfile: "当前管理配置",
+    currentProfileOption: "本机面板（{name}）",
+    managingProfileBanner:
+      "正在管理“{name}”配置；配置、密钥、技能、MCP、模型和新对话都会应用到该配置。",
   },
 
   status: {
@@ -491,7 +500,7 @@ export const zh: Translations = {
   achievements: {
     hero: {
       kicker: "Agentic Gamerscore",
-      title: "Hermes Achievements",
+      title: "Hermes 成就",
       subtitle:
         "从真实会话历史中获得的 Hermes 可收集徽章。已知尚未达成的成就显示为「已发现」；秘密成就在首次出现匹配行为之前保持隐藏。",
       scan_subtitle:

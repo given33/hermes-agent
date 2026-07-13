@@ -25,6 +25,7 @@
 
 import { useEffect, useState } from "react";
 import { api, type AuthMeResponse } from "@/lib/api";
+import { useI18n } from "@/i18n";
 import { cn } from "@/lib/utils";
 import { LogOut } from "lucide-react";
 
@@ -41,6 +42,8 @@ function truncateUserId(id: string): string {
 }
 
 export function AuthWidget({ className }: AuthWidgetProps) {
+  const { locale } = useI18n();
+  const isChinese = locale.startsWith("zh");
   const [me, setMe] = useState<AuthMeResponse | null>(null);
   const [hidden, setHidden] = useState(false);
   const [error, setError] = useState<string | null>(null);
@@ -65,12 +68,12 @@ export function AuthWidget({ className }: AuthWidgetProps) {
           setHidden(true);
           return;
         }
-        setError("auth status unavailable");
+        setError(isChinese ? "无法获取登录状态" : "auth status unavailable");
       });
     return () => {
       cancelled = true;
     };
-  }, []);
+  }, [isChinese]);
 
   if (hidden) return null;
 
@@ -122,14 +125,14 @@ export function AuthWidget({ className }: AuthWidgetProps) {
         className,
       )}
       role="status"
-      aria-label={`Logged in as ${label}`}
+      aria-label={isChinese ? `当前登录用户：${label}` : `Logged in as ${label}`}
     >
       <div className="flex min-w-0 flex-col">
         <span className="truncate font-mono text-foreground/90" title={me.user_id}>
           {label}
         </span>
         <span className="truncate text-muted-foreground/70">
-          via {me.provider}
+          {isChinese ? `登录方式：${me.provider}` : `via ${me.provider}`}
         </span>
       </div>
       <button
@@ -140,8 +143,8 @@ export function AuthWidget({ className }: AuthWidgetProps) {
           "transition-colors hover:bg-current/10 hover:text-foreground",
           "focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-current/40",
         )}
-        aria-label="Log out"
-        title="Log out"
+        aria-label={isChinese ? "退出登录" : "Log out"}
+        title={isChinese ? "退出登录" : "Log out"}
       >
         <LogOut className="h-3.5 w-3.5" />
       </button>

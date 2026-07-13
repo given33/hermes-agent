@@ -34,11 +34,17 @@ from hermes_cli.dashboard_auth import list_session_providers
 # are doubled (``{{`` / ``}}``).
 _LOGIN_HTML_TEMPLATE = """\
 <!doctype html>
-<html lang="en">
+<html lang="zh-CN">
 <head>
 <meta charset="utf-8">
-<meta name="viewport" content="width=device-width, initial-scale=1">
-<title>Sign in — Hermes Agent</title>
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="theme-color" content="#170d02">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+<meta name="apple-mobile-web-app-title" content="Hermes Agent">
+<link rel="apple-touch-icon" sizes="180x180" href="/apple-touch-icon.png">
+<link rel="manifest" href="/manifest.webmanifest">
+<title>登录 — Hermes Agent</title>
 <style>
   /* Brand fonts shipped by @nous-research/ui — same files the SPA loads. */
   @font-face {{
@@ -304,14 +310,14 @@ _LOGIN_HTML_TEMPLATE = """\
 <main>
   <div class="brand">Nous<span class="dot"></span>Research</div>
   <div class="card">
-    <h1>Sign in</h1>
-    <p class="subtitle">Choose a sign-in method to continue to the Hermes Agent dashboard.</p>
+    <h1>登录</h1>
+    <p class="subtitle">登录后继续使用 Hermes Agent 管理面板。</p>
     <div class="provider-list">
 {provider_buttons}
     </div>
   </div>
   <footer>
-    <span class="sep"></span>Public bind &middot; Auth required<span class="sep"></span>
+    <span class="sep"></span>公网访问 &middot; 需要身份验证<span class="sep"></span>
   </footer>
 </main>
 {password_script}
@@ -321,11 +327,11 @@ _LOGIN_HTML_TEMPLATE = """\
 
 _EMPTY_HTML = """\
 <!doctype html>
-<html lang="en">
+<html lang="zh-CN">
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>Sign-in unavailable — Hermes Agent</title>
+<title>暂时无法登录 — Hermes Agent</title>
 <style>
   @font-face {
     font-family: 'Collapse';
@@ -389,12 +395,10 @@ _EMPTY_HTML = """\
 </head>
 <body>
 <main>
-<h1>Sign-in unavailable</h1>
-<p>This dashboard is bound to a non-loopback host but no authentication
-providers are installed.</p>
-<p>Install <code>plugins/dashboard-auth-nous</code> (default) or another
-auth provider, or restart with <code>--insecure</code> to bypass the
-auth gate (not recommended on untrusted networks).</p>
+<h1>暂时无法登录</h1>
+<p>此管理面板已开放到非本机地址，但尚未安装身份验证提供程序。</p>
+<p>请安装默认的 <code>plugins/dashboard-auth-nous</code> 或其他身份验证插件。
+不建议在公网环境使用 <code>--insecure</code> 绕过登录验证。</p>
 </main>
 </body>
 </html>
@@ -437,13 +441,13 @@ _PASSWORD_FORM_SCRIPT = """\
           });
         }
         var msg = resp.status === 429
-          ? 'Too many attempts. Please wait and try again.'
-          : (resp.status === 401 ? 'Invalid username or password.'
-                                 : 'Sign-in failed. Please try again.');
+          ? '尝试次数过多，请稍后再试。'
+          : (resp.status === 401 ? '用户名或密码错误。'
+                                 : '登录失败，请重试。');
         if (err) { err.textContent = msg; err.hidden = false; }
         if (btn) { btn.disabled = false; }
       }).catch(function () {
-        if (err) { err.textContent = 'Network error. Please try again.'; err.hidden = false; }
+        if (err) { err.textContent = '网络连接失败，请重试。'; err.hidden = false; }
         if (btn) { btn.disabled = false; }
       });
     });
@@ -489,7 +493,7 @@ def render_login_html(*, next_path: str = "") -> str:
             buttons.append(
                 f'      <a class="provider-btn" '
                 f'href="/auth/login?provider={html.escape(p.name, quote=True)}{next_qs}">'
-                f'Sign in with {html.escape(p.display_name)}</a>'
+                f'使用 {html.escape(p.display_name)} 登录</a>'
             )
     script = _PASSWORD_FORM_SCRIPT if needs_password_script else ""
     return _LOGIN_HTML_TEMPLATE.format(
@@ -515,20 +519,20 @@ def _render_password_form(provider, next_path: str) -> str:
     return (
         f'      <form class="provider-form" data-provider="{pname}" '
         f'autocomplete="on">\n'
-        f'        <div class="form-title">Sign in with {plabel}</div>\n'
+        f'        <div class="form-title">使用 {plabel} 登录</div>\n'
         f'        <input type="hidden" name="next" value="{safe_next}">\n'
         f'        <label class="field">\n'
-        f'          <span class="field-label">Username</span>\n'
+        f'          <span class="field-label">用户名</span>\n'
         f'          <input class="field-input" type="text" name="username" '
         f'autocomplete="username" autocapitalize="none" '
         f'autocorrect="off" spellcheck="false" required>\n'
         f'        </label>\n'
         f'        <label class="field">\n'
-        f'          <span class="field-label">Password</span>\n'
+        f'          <span class="field-label">密码</span>\n'
         f'          <input class="field-input" type="password" name="password" '
         f'autocomplete="current-password" required>\n'
         f'        </label>\n'
         f'        <div class="form-error" role="alert" hidden></div>\n'
-        f'        <button class="provider-btn" type="submit">Sign in</button>\n'
+        f'        <button class="provider-btn" type="submit">登录</button>\n'
         f'      </form>'
     )

@@ -5,7 +5,13 @@ import threading
 import agent.retry_utils as retry_utils
 from types import SimpleNamespace
 
-from agent.retry_utils import adaptive_rate_limit_backoff, is_zai_coding_overload_error, jittered_backoff
+from agent.retry_utils import (
+    adaptive_rate_limit_backoff,
+    cloudflare_origin_retry_delay,
+    is_cloudflare_origin_bad_gateway_error,
+    is_zai_coding_overload_error,
+    jittered_backoff,
+)
 
 
 def test_backoff_is_exponential():
@@ -210,6 +216,57 @@ def test_non_zai_backoff_returns_default_wait():
     )
     assert wait == 12.0
     assert policy is None
+
+
+def _cloudflare_origin_bad_gateway_error(*, retry_after=60):
+    return SimpleNamespace(
+        status_code=502,
+        body={
+            "type": "https://developers.cloudflare.com/support/troubleshooting/http-status-codes/cloudflare-5xx-errors/error-502/",
+            "title": "Error 502: Bad gateway",
+            "status": 502,
+            "detail": "The origin web server returned an invalid or incomplete response to Cloudflare.",
+            "error_name": "origin_bad_gateway",
+            "retryable": True,
+            "retry_after": retry_after,
+        },
+    )
+
+
+def test_cloudflare_origin_bad_gateway_classifier_is_narrow():
+    assert is_cloudflare_origin_bad_gateway_error(
+        _cloudflare_origin_bad_gateway_error()
+    )
+    assert not is_cloudflare_origin_bad_gateway_error(
+        SimpleNamespace(status_code=502, body={"error": "ordinary upstream failure"})
+    )
+    assert not is_cloudflare_origin_bad_gateway_error(
+        SimpleNamespace(
+            status_code=503,
+            body={"error_name": "origin_bad_gateway", "retry_after": 60},
+        )
+    )
+
+
+def test_cloudflare_origin_retry_delay_honors_json_body_and_bounds_values():
+    assert cloudflare_origin_retry_delay(
+        _cloudflare_origin_bad_gateway_error(retry_after=90)
+    ) == 90.0
+    assert cloudflare_origin_retry_delay(
+        _cloudflare_origin_bad_gateway_error(retry_after=5)
+    ) == 60.0
+    assert cloudflare_origin_retry_delay(
+        _cloudflare_origin_bad_gateway_error(retry_after=9999)
+    ) == 600.0
+
+
+def test_cloudflare_origin_retry_delay_defaults_to_sixty_seconds():
+    error = _cloudflare_origin_bad_gateway_error()
+    del error.body["retry_after"]
+    assert cloudflare_origin_retry_delay(error) == 60.0
+    assert cloudflare_origin_retry_delay(
+        SimpleNamespace(status_code=502, body={"error": "ordinary upstream failure"})
+    ) is None
 
 
 def test_zai_overload_retry_ceiling_exceeds_short_attempts():

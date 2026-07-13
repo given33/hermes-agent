@@ -208,6 +208,17 @@ class TestProviderListFlag:
         assert '<form class="provider-form" data-provider="testpw"' in login.text
         assert "/auth/password-login" in login.text
 
+    def test_password_login_page_is_localized_in_simplified_chinese(self, gated_app):
+        login = gated_app.get("/login")
+
+        assert login.status_code == 200
+        assert '<html lang="zh-CN">' in login.text
+        assert "<title>登录 — Hermes Agent</title>" in login.text
+        assert "<h1>登录</h1>" in login.text
+        assert "用户名" in login.text
+        assert "密码" in login.text
+        assert "登录后继续使用 Hermes Agent 管理面板" in login.text
+
     def test_password_provider_auth_login_redirects_to_login_form(self, gated_app):
         resp = gated_app.get(
             "/auth/login?provider=testpw&next=%2F",

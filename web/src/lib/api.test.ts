@@ -49,6 +49,21 @@ describe("api.getModelOptions", () => {
   });
 });
 
+describe("api.getSessions", () => {
+  it("orders conversations by latest activity by default", async () => {
+    vi.stubGlobal("window", {});
+    const fetchMock = jsonFetchMock({ sessions: [], total: 0 });
+    vi.stubGlobal("fetch", fetchMock);
+
+    await api.getSessions();
+
+    expect(fetchMock).toHaveBeenCalledWith(
+      "/api/sessions?limit=20&offset=0&order=recent",
+      expect.objectContaining({ credentials: "include" }),
+    );
+  });
+});
+
 describe("api OAuth helpers", () => {
   it("starts OAuth login in gated mode without requiring an injected session token", async () => {
     vi.stubGlobal("window", { __HERMES_AUTH_REQUIRED__: true });

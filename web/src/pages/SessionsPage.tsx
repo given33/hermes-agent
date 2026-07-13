@@ -66,6 +66,7 @@ import { useI18n } from "@/i18n";
 import { usePageHeader } from "@/contexts/usePageHeader";
 import { PluginSlot } from "@/plugins";
 import { isDashboardEmbeddedChatEnabled } from "@/lib/dashboard-flags";
+import { queueUnifiedSessionResume } from "@/lib/unified-session";
 
 const SOURCE_CONFIG: Record<string, { icon: typeof Terminal; color: string }> =
   {
@@ -209,7 +210,7 @@ function MessageBubble({
   msg: SessionMessage;
   highlight?: string;
 }) {
-  const { t } = useI18n();
+  const { locale, t } = useI18n();
 
   const ROLE_STYLES: Record<
     string,
@@ -316,7 +317,7 @@ function MessageBubble({
         )}
         {msg.timestamp && (
           <span className="text-xs text-text-tertiary">
-            {timeAgo(msg.timestamp)}
+            {timeAgo(msg.timestamp, locale)}
           </span>
         )}
       </div>
@@ -384,6 +385,7 @@ function SessionRow({
   onDelete,
   onRename,
   onExport,
+  onResume,
   resumeInChatEnabled,
 }: SessionRowProps) {
   const [messages, setMessages] = useState<SessionMessage[] | null>(null);
@@ -392,8 +394,7 @@ function SessionRow({
   const [renaming, setRenaming] = useState(false);
   const [renameValue, setRenameValue] = useState(session.title ?? "");
   const [renameSaving, setRenameSaving] = useState(false);
-  const { t } = useI18n();
-  const navigate = useNavigate();
+  const { locale, t } = useI18n();
 
   useEffect(() => {
     if (isExpanded && messages === null && !loading) {
@@ -442,12 +443,26 @@ function SessionRow({
           title={t.sessions.resumeInChat}
           onClick={(e) => {
             e.stopPropagation();
-            navigate(`/chat?resume=${encodeURIComponent(session.id)}`);
+            onResume();
           }}
         >
           <Play />
         </Button>
       )}
+
+      <Button
+        ghost
+        size="icon"
+        className="text-muted-foreground hover:text-foreground"
+        aria-label={isExpanded ? t.common.collapse : t.common.expand}
+        title={isExpanded ? t.common.collapse : t.common.expand}
+        onClick={(e) => {
+          e.stopPropagation();
+          onToggle();
+        }}
+      >
+        {isExpanded ? <ChevronDown /> : <ChevronRight />}
+      </Button>
 
       <Button
         ghost
@@ -526,7 +541,7 @@ function SessionRow({
     >
       <div
         className="flex cursor-pointer items-start gap-3 p-3 transition-colors hover:bg-secondary/30"
-        onClick={onToggle}
+        onClick={onResume}
       >
         <span className="flex shrink-0 items-center pt-0.5">
           <Checkbox
@@ -621,7 +636,9 @@ function SessionRow({
                   </>
                 )}
                 <span className="text-border">&#183;</span>
-                <span className="shrink-0">{timeAgo(session.last_active)}</span>
+                <span className="shrink-0">
+                  {timeAgo(session.last_active, locale)}
+                </span>
               </div>
               {snippet && <SnippetHighlight snippet={snippet} />}
             </div>
@@ -758,10 +775,18 @@ export default function SessionsPage() {
   const [pruneDays, setPruneDays] = useState("90");
   const [pruning, setPruning] = useState(false);
   const { toast, showToast } = useToast();
-  const { t } = useI18n();
+  const { locale, t } = useI18n();
   const { setAfterTitle, setEnd } = usePageHeader();
   const { activeAction, actionStatus, dismissLog } = useSystemActions();
   const resumeInChatEnabled = isDashboardEmbeddedChatEnabled();
+  const navigate = useNavigate();
+  const resumeSessionInChat = useCallback(
+    (sessionId: string) => {
+      if (!queueUnifiedSessionResume(window.sessionStorage, sessionId)) return;
+      navigate("/chat");
+    },
+    [navigate],
+  );
 
   const refreshEmptyCount = useCallback(() => {
     api
@@ -1639,6 +1664,7 @@ export default function SessionsPage() {
                   onDelete={() => sessionDelete.requestDelete(s.id)}
                   onRename={handleRename}
                   onExport={handleExport}
+                  onResume={() => resumeSessionInChat(s.id)}
                   resumeInChatEnabled={resumeInChatEnabled}
                 />
               ))}
@@ -1672,9 +1698,11 @@ export default function SessionsPage() {
 
               <CardContent className="grid min-w-0 gap-3">
                 {recentSessions.map((s) => (
-                  <div
+                  <button
+                    type="button"
                     key={s.id}
-                    className="flex min-w-0 max-w-full flex-col gap-2 border border-border p-3 sm:flex-row sm:items-center sm:justify-between"
+                    onClick={() => resumeSessionInChat(s.id)}
+                    className="flex min-w-0 max-w-full flex-col gap-2 border border-border p-3 text-left transition-colors hover:bg-secondary/30 sm:flex-row sm:items-center sm:justify-between"
                   >
                     <div className="flex min-w-0 flex-1 flex-col gap-1">
                       <span className="font-mondwest normal-case min-w-0 truncate text-sm font-medium">
@@ -1686,7 +1714,7 @@ export default function SessionsPage() {
                           {(s.model ?? t.common.unknown).split("/").pop()}
                         </span>{" "}
                         · {s.message_count} {t.common.msgs} ·{" "}
-                        {timeAgo(s.last_active)}
+                        {timeAgo(s.last_active, locale)}
                       </span>
 
                       {s.preview && (
@@ -1703,7 +1731,7 @@ export default function SessionsPage() {
                       <Database className="mr-1 h-3 w-3" />
                       {s.source ?? "local"}
                     </Badge>
-                  </div>
+                  </button>
                 ))}
               </CardContent>
             </Card>
@@ -1722,6 +1750,7 @@ interface SessionRowProps {
   onDelete: () => void;
   onExport: (id: string) => void;
   onRename: (id: string, title: string) => Promise<void>;
+  onResume: () => void;
   onSelectClick: (event: React.MouseEvent) => void;
   onToggle: () => void;
   resumeInChatEnabled: boolean;

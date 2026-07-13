@@ -7,9 +7,25 @@ Config + Server + asyncio.run to capture kwargs without starting an event loop.
 import asyncio
 import contextlib
 
+import pytest
 import uvicorn
 
 from hermes_cli import web_server
+
+
+@pytest.fixture(autouse=True)
+def _restore_dashboard_bind_state():
+    names = ("bound_host", "bound_port", "auth_required")
+    previous = {
+        name: (hasattr(web_server.app.state, name), getattr(web_server.app.state, name, None))
+        for name in names
+    }
+    yield
+    for name, (existed, value) in previous.items():
+        if existed:
+            setattr(web_server.app.state, name, value)
+        elif hasattr(web_server.app.state, name):
+            delattr(web_server.app.state, name)
 
 
 def _stub_uvicorn(monkeypatch):
@@ -114,6 +130,10 @@ def test_start_server_enables_ws_ping_for_half_open_detection(monkeypatch):
     assert captured["ws_ping_interval"] and captured["ws_ping_interval"] > 0
     assert captured["ws_ping_timeout"] and captured["ws_ping_timeout"] > 0
     assert captured["ws_ping_timeout"] >= captured["ws_ping_interval"]
+    # iOS radio handoffs can pause WebSocket traffic for 20-40 seconds. Keep
+    # half-open detection enabled, but do not kill a recoverable mobile socket
+    # on uvicorn's old 20-second pong deadline.
+    assert captured["ws_ping_timeout"] >= 60
 
 
 def test_start_server_runs_on_uvicorns_loop_factory(monkeypatch):

@@ -88,17 +88,22 @@ export interface Translations {
     };
     nav: {
       analytics: string;
+      channels?: string;
       chat: string;
       config: string;
       cron: string;
       documentation: string;
+      files?: string;
       keys: string;
       logs: string;
       models: string;
+      pairing?: string;
       profiles: string;
       plugins: string;
       sessions: string;
       skills: string;
+      system?: string;
+      webhooks?: string;
     };
     modelToolsSheetSubtitle: string;
     modelToolsSheetTitle: string;

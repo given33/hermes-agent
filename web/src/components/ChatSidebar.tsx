@@ -30,6 +30,7 @@ import { Card } from "@nous-research/ui/ui/components/card";
 import { ModelPickerDialog } from "@/components/ModelPickerDialog";
 import { ModelReloadConfirm } from "@/components/ModelReloadConfirm";
 import { ReasoningPicker } from "@/components/ReasoningPicker";
+import { useI18n } from "@/i18n";
 import { GatewayClient, type ConnectionState } from "@/lib/gatewayClient";
 import { api, buildWsUrl } from "@/lib/api";
 import { titleFromSessionInfoPayload } from "@/lib/chat-title";
@@ -86,6 +87,17 @@ export function ChatSidebar({
   onDashboardNewSessionRequest,
   onSessionTitleChange,
 }: ChatSidebarProps) {
+  const { locale } = useI18n();
+  const isChinese = locale.startsWith("zh");
+  const stateLabel: Record<ConnectionState, string> = isChinese
+    ? {
+        idle: "空闲",
+        connecting: "连接中",
+        open: "在线",
+        closed: "已断开",
+        error: "错误",
+      }
+    : STATE_LABEL;
   // `version` bumps on reconnect; gw is derived so we never call setState
   // for it inside an effect (React 19's set-state-in-effect rule). The
   // counter is the dependency on purpose — it's not read in the memo body,
@@ -315,7 +327,7 @@ export function ChatSidebar({
       <Card className="flex items-center justify-between gap-2 px-3 py-2">
         <div className="min-w-0 flex-1">
           <div className="text-display text-xs tracking-wider text-text-tertiary">
-            model
+            {isChinese ? "模型" : "model"}
           </div>
 
           <Button
@@ -327,7 +339,13 @@ export function ChatSidebar({
               "self-start normal-case tracking-normal text-sm font-medium",
               "hover:underline disabled:no-underline",
             )}
-            title={modelName === "—" ? "switch model" : modelName}
+            title={
+              modelName === "—"
+                ? isChinese
+                  ? "切换模型"
+                  : "switch model"
+                : modelName
+            }
           >
             <span className="flex min-w-0 max-w-full items-center gap-1">
               <span className="truncate">{modelLabel}</span>
@@ -338,7 +356,7 @@ export function ChatSidebar({
         </div>
 
         <Badge tone={STATE_TONE[state]} className="shrink-0">
-          {STATE_LABEL[state]}
+          {stateLabel[state]}
         </Badge>
       </Card>
 
@@ -350,7 +368,9 @@ export function ChatSidebar({
             refreshKey={modelRefreshKey}
             onChanged={(effort) =>
               setModelNotice(
-                `Reasoning effort set to ${effort}. Run /new or refresh the page to apply it to this chat.`,
+                isChinese
+                  ? `推理强度已设为 ${effort}。执行 /new 或刷新页面后应用到当前对话。`
+                  : `Reasoning effort set to ${effort}. Run /new or refresh the page to apply it to this chat.`,
               )
             }
           />
@@ -382,7 +402,7 @@ export function ChatSidebar({
                 onClick={reconnect}
                 prefix={<RefreshCw />}
               >
-                reconnect tools feed
+                {isChinese ? "重新连接工具事件流" : "reconnect tools feed"}
               </Button>
             )}
           </div>
@@ -430,7 +450,9 @@ export function ChatSidebar({
           const m = pendingReloadModel;
           setPendingReloadModel(null);
           setModelNotice(
-            `Model set to ${m}. Run /new or refresh the page to apply it to this chat.`,
+            isChinese
+              ? `模型已切换为 ${m}。执行 /new 或刷新页面后应用到当前对话。`
+              : `Model set to ${m}. Run /new or refresh the page to apply it to this chat.`,
           );
         }}
       />
