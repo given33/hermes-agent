@@ -258,6 +258,19 @@ def _get_pty_active_session_files(app: "FastAPI") -> dict[str, Path]:
 
 app = FastAPI(title="Hermes Agent", version=__version__, lifespan=_lifespan)
 
+# Assemble built-in mobile auth before Starlette builds the middleware stack.
+# An unset/blank secret leaves both the provider and optional /api prefix
+# disabled, preserving the existing auth surface for non-mobile deployments.
+from hermes_cli.dashboard_auth.registry import (  # noqa: E402
+    register_mobile_api_provider_if_configured,
+)
+from hermes_cli.dashboard_auth.token_auth import (  # noqa: E402
+    register_optional_token_prefix,
+)
+
+if register_mobile_api_provider_if_configured():
+    register_optional_token_prefix("/api")
+
 # Memory-provider OAuth connect routes live in the memory layer, not here.
 from hermes_cli.memory_oauth import router as _memory_oauth_router  # noqa: E402
 
@@ -368,6 +381,10 @@ def _require_token(request: Request) -> None:
       making plugin install/enable/disable and the other ``_require_token``
       endpoints permanently unreachable behind the gate. Defer to the gate.
     """
+    if getattr(request.state, "token_authenticated", False):
+        principal = getattr(request.state, "token_principal", None)
+        if principal is not None and "dashboard:admin" in principal.scopes:
+            return
     if getattr(request.app.state, "auth_required", False):
         # Gate is authoritative. It attaches ``request.state.session`` on
         # success and 401s otherwise, so a request that reached us is already
@@ -2550,6 +2567,30 @@ def _collect_profile_gateway_topology() -> Dict[str, Any]:
         mode = "none"
 
     return {"profiles": profile_names, "gateway_mode": mode, "gateways": gateways}
+
+
+_MOBILE_API_CAPABILITIES: tuple[str, ...] = (
+    "chat",
+    "profiles",
+    "sessions",
+    "config",
+)
+
+
+@app.get("/api/mobile/v1/handshake")
+async def get_mobile_handshake():
+    """Return the stable native-client API contract without credentials."""
+    topology = await asyncio.get_running_loop().run_in_executor(
+        None,
+        _collect_profile_gateway_topology,
+    )
+    return {
+        "api_version": 1,
+        "hermes_version": __version__,
+        "profiles": topology["profiles"],
+        "capabilities": list(_MOBILE_API_CAPABILITIES),
+        "server_time": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
+    }
 
 
 @app.get("/api/status")
@@ -6048,6 +6089,9 @@ def _catalog_provider_env_metadata() -> dict:
     return meta
 
 
+_NEVER_RETURN_ENV_VALUES: frozenset[str] = frozenset({"HERMES_MOBILE_API_KEY"})
+
+
 @app.get("/api/env")
 async def get_env_vars(profile: Optional[str] = None):
     with _profile_scope(profile):
@@ -6062,7 +6106,11 @@ async def get_env_vars(profile: Optional[str] = None):
         # gaps (description/url) and always supplies provider grouping hints.
         return {
             "is_set": bool(value),
-            "redacted_value": redact_key(value) if value else None,
+            "redacted_value": (
+                redact_key(value)
+                if value and var_name not in _NEVER_RETURN_ENV_VALUES
+                else None
+            ),
             "description": info.get("description") or cat_meta.get("description", ""),
             "url": info.get("url") if info.get("url") is not None else cat_meta.get("url"),
             "category": info.get("category") or cat_meta.get("category", ""),
@@ -6263,6 +6311,12 @@ async def reveal_env_var(
     """
     # --- Token check ---
     _require_token(request)
+
+    if body.key in _NEVER_RETURN_ENV_VALUES:
+        raise HTTPException(
+            status_code=403,
+            detail="This credential cannot be returned by the API.",
+        )
 
     # --- Rate limit ---
     now = time.time()

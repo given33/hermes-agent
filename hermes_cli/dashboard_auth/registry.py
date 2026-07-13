@@ -7,6 +7,7 @@ The auth gate middleware iterates ``list_providers()`` and uses
 from __future__ import annotations
 
 import logging
+import os
 import threading
 from typing import List, Optional
 
@@ -18,6 +19,43 @@ from hermes_cli.dashboard_auth.base import (
 _log = logging.getLogger(__name__)
 _lock = threading.Lock()
 _providers: dict[str, DashboardAuthProvider] = {}
+
+
+def register_mobile_api_provider_if_configured() -> bool:
+    """Register the built-in mobile provider when its secret is configured.
+
+    Registration is idempotent so app assembly and startup checks may safely
+    call this from different threads. The provider reads the current secret at
+    verification time; the registry never stores or logs the value.
+    """
+    from hermes_cli.dashboard_auth.mobile_api_provider import (
+        MOBILE_API_KEY_ENV,
+        MobileApiKeyProvider,
+    )
+
+    if not os.environ.get(MOBILE_API_KEY_ENV, "").strip():
+        return False
+
+    provider = MobileApiKeyProvider()
+    assert_protocol_compliance(type(provider))
+    registered = False
+    with _lock:
+        existing = _providers.get(provider.name)
+        if existing is None:
+            _providers[provider.name] = provider
+            registered = True
+        elif not isinstance(existing, MobileApiKeyProvider):
+            raise ValueError(
+                f"dashboard-auth provider already registered: {provider.name!r}"
+            )
+
+    if registered:
+        _log.info(
+            "dashboard-auth: registered provider %r (%s)",
+            provider.name,
+            provider.display_name,
+        )
+    return True
 
 
 def register_provider(provider: DashboardAuthProvider) -> None:

@@ -3329,6 +3329,14 @@ REQUIRED_ENV_VARS = {}
 
 # Optional environment variables that enhance functionality
 OPTIONAL_ENV_VARS = {
+    "HERMES_MOBILE_API_KEY": {
+        "description": "Bearer API key for Hermes native mobile clients",
+        "prompt": "Hermes mobile API key",
+        "url": None,
+        "password": True,
+        "category": "setting",
+        "advanced": True,
+    },
     # ── Provider (handled in provider selection, not shown in checklists) ──
     "NOUS_BASE_URL": {
         "description": "Nous Portal base URL override",
