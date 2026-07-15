@@ -310,8 +310,8 @@ _LOGIN_HTML_TEMPLATE = """\
 <main>
   <div class="brand">Nous<span class="dot"></span>Research</div>
   <div class="card">
-    <h1>登录</h1>
-    <p class="subtitle">登录后继续使用 Hermes Agent 管理面板。</p>
+    <h1>{page_heading}</h1>
+    <p class="subtitle">{page_subtitle}</p>
     <div class="provider-list">
 {provider_buttons}
     </div>
@@ -458,6 +458,56 @@ _PASSWORD_FORM_SCRIPT = """\
 </script>
 """
 
+_OWNER_REGISTRATION_SCRIPT = """\
+<script>
+(function () {
+  var form = document.querySelector('form.owner-registration-form');
+  if (!form) { return; }
+  form.addEventListener('submit', function (ev) {
+    ev.preventDefault();
+    var err = form.querySelector('.form-error');
+    var btn = form.querySelector('button[type=submit]');
+    var username = (form.querySelector('input[name=username]') || {}).value || '';
+    var password = (form.querySelector('input[name=password]') || {}).value || '';
+    var confirmation = (form.querySelector('input[name=confirmation]') || {}).value || '';
+    var next = (form.querySelector('input[name=next]') || {}).value || '';
+    if (err) { err.hidden = true; err.textContent = ''; }
+    if (password !== confirmation) {
+      if (err) { err.textContent = '两次输入的密码不一致。'; err.hidden = false; }
+      return;
+    }
+    if (btn) { btn.disabled = true; }
+    fetch('/auth/mobile/register', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ username: username, password: password }),
+      credentials: 'same-origin'
+    }).then(function (resp) {
+      if (!resp.ok) {
+        throw new Error(resp.status === 409 ? '所有者账号已经存在。' : '注册失败，请检查账号和密码。');
+      }
+      return fetch('/auth/password-login', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          provider: 'basic', username: username, password: password, next: next
+        }),
+        credentials: 'same-origin'
+      });
+    }).then(function (resp) {
+      if (!resp.ok) { throw new Error('账号已创建，但登录失败，请重新登录。'); }
+      return resp.json();
+    }).then(function (data) {
+      window.location.assign((data && data.next) || '/');
+    }).catch(function (error) {
+      if (err) { err.textContent = error.message || '注册失败，请重试。'; err.hidden = false; }
+      if (btn) { btn.disabled = false; }
+    });
+  });
+})();
+</script>
+"""
+
 
 def render_login_html(*, next_path: str = "") -> str:
     """Return the full HTML for ``GET /login``.
@@ -471,6 +521,15 @@ def render_login_html(*, next_path: str = "") -> str:
     """
     providers = list_session_providers()
     if not providers:
+        from hermes_cli.dashboard_auth.owner_mobile import owner_registration_open
+
+        if owner_registration_open():
+            return _LOGIN_HTML_TEMPLATE.format(
+                page_heading="注册",
+                page_subtitle="创建此 Hermes 服务器的所有者账号。",
+                provider_buttons=_render_owner_registration_form(next_path),
+                password_script=_OWNER_REGISTRATION_SCRIPT,
+            )
         return _EMPTY_HTML
 
     if next_path:
@@ -497,8 +556,37 @@ def render_login_html(*, next_path: str = "") -> str:
             )
     script = _PASSWORD_FORM_SCRIPT if needs_password_script else ""
     return _LOGIN_HTML_TEMPLATE.format(
+        page_heading="登录",
+        page_subtitle="登录后继续使用 Hermes Agent 管理面板。",
         provider_buttons="\n".join(buttons),
         password_script=script,
+    )
+
+
+def _render_owner_registration_form(next_path: str) -> str:
+    safe_next = html.escape(next_path, quote=True) if next_path else ""
+    return (
+        '      <form class="provider-form owner-registration-form" autocomplete="on">\n'
+        f'        <input type="hidden" name="next" value="{safe_next}">\n'
+        '        <label class="field">\n'
+        '          <span class="field-label">账号</span>\n'
+        '          <input class="field-input" type="text" name="username" '
+        'autocomplete="username" autocapitalize="none" autocorrect="off" '
+        'spellcheck="false" required>\n'
+        '        </label>\n'
+        '        <label class="field">\n'
+        '          <span class="field-label">密码</span>\n'
+        '          <input class="field-input" type="password" name="password" '
+        'autocomplete="new-password" minlength="8" required>\n'
+        '        </label>\n'
+        '        <label class="field">\n'
+        '          <span class="field-label">确认密码</span>\n'
+        '          <input class="field-input" type="password" name="confirmation" '
+        'autocomplete="new-password" minlength="8" required>\n'
+        '        </label>\n'
+        '        <div class="form-error" role="alert" hidden></div>\n'
+        '        <button class="provider-btn" type="submit">注册并登录</button>\n'
+        '      </form>'
     )
 
 

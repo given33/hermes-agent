@@ -17227,6 +17227,13 @@ _mount_plugin_api_routes()
 # not whether the routes exist.
 from hermes_cli.dashboard_auth.routes import router as _dashboard_auth_router  # noqa: E402
 app.include_router(_dashboard_auth_router)
+from hermes_cli.dashboard_auth.owner_mobile import (  # noqa: E402
+    ensure_owner_provider as _ensure_owner_provider,
+    owner_registration_open as _owner_registration_open,
+    router as _owner_mobile_router,
+)
+app.include_router(_owner_mobile_router)
+_ensure_owner_provider()
 
 mount_spa(app)
 
@@ -17378,7 +17385,8 @@ def start_server(
         # provider to be registered, else fail closed — there is no longer an
         # escape hatch that serves the dashboard without authentication.
         from hermes_cli.dashboard_auth import list_providers
-        if not list_providers():
+        providers = list_providers()
+        if not providers and not _owner_registration_open():
             # Surface the *specific* reason any bundled provider declined
             # to register (e.g. missing HERMES_DASHBOARD_OAUTH_CLIENT_ID).
             # Each provider plugin that ships with Hermes Agent exposes a
@@ -17423,11 +17431,18 @@ def start_server(
                 f"engages on non-loopback binds, but no auth providers are "
                 f"registered.\n\n" + _fix_hint
             )
-        _log.info(
-            "Dashboard binding to %s with auth gate enabled. Providers: %s",
-            host,
-            ", ".join(p.name for p in list_providers()),
-        )
+        if providers:
+            _log.info(
+                "Dashboard binding to %s with auth gate enabled. Providers: %s",
+                host,
+                ", ".join(p.name for p in providers),
+            )
+        else:
+            _log.warning(
+                "Dashboard binding to %s in first-owner registration mode; "
+                "protected APIs remain unavailable until registration completes",
+                host,
+            )
 
     # Record the bound host so host_header_middleware can validate incoming
     # Host headers against it. Defends against DNS rebinding (GHSA-ppp5-vxwm-4cf7).
