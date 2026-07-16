@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import base64
 import secrets
+import time
 
 import pytest
 from fastapi import HTTPException
@@ -12,7 +13,7 @@ from hermes_cli.dashboard_auth import (
     clear_providers,
     get_provider,
 )
-from hermes_cli.dashboard_auth import token_auth
+from hermes_cli.dashboard_auth import owner_mobile, token_auth
 from hermes_cli.dashboard_auth.owner_mobile import (
     MobileDeviceBody,
     MobileLoginBody,
@@ -51,7 +52,17 @@ def _isolated_owner_account(tmp_path, monkeypatch):
     monkeypatch.delenv("HERMES_DASHBOARD_BASIC_AUTH_PASSWORD_HASH", raising=False)
     monkeypatch.delenv("HERMES_DASHBOARD_BASIC_AUTH_SECRET", raising=False)
     monkeypatch.delenv("HERMES_OWNER_SETUP_TOKEN", raising=False)
+    monkeypatch.setenv("HERMES_OWNER_EMAIL", "2821961676@qq.com")
+    monkeypatch.setenv("HERMES_MOBILE_REGISTRATION_ENABLED", "1")
+    monkeypatch.setenv("HERMES_QQ_SMTP_USERNAME", "2821961676@qq.com")
+    monkeypatch.setenv("HERMES_QQ_SMTP_AUTH_CODE", "test-only-auth-code")
+    owner_mobile._REGISTRATION_CODES.clear()
+    owner_mobile._REGISTRATION_SENDS_BY_IP.clear()
+    owner_mobile._REGISTRATION_SENDS_BY_EMAIL.clear()
     yield
+    owner_mobile._REGISTRATION_CODES.clear()
+    owner_mobile._REGISTRATION_SENDS_BY_IP.clear()
+    owner_mobile._REGISTRATION_SENDS_BY_EMAIL.clear()
     clear_providers()
     token_auth.clear_optional_token_prefixes()
     _reset_password_rate_limit()
@@ -60,14 +71,17 @@ def _isolated_owner_account(tmp_path, monkeypatch):
 def _register(
     username: str = "owner",
     password: str = "correct-horse-42",
-    setup_token: str = "",
+    email: str = "2821961676@qq.com",
+    verification_code: str = "123456",
 ):
+    _seed_registration_code(email, verification_code)
     return mobile_register(
         _Request(),
         MobileRegisterBody(
+            email=email,
+            verification_code=verification_code,
             username=username,
             password=password,
-            setup_token=setup_token,
             device=MobileDeviceBody(
                 id="ios-owner-device",
                 name="Owner iPhone",
@@ -77,6 +91,31 @@ def _register(
             ),
         ),
     )
+
+
+def _seed_registration_code(
+    email: str = "2821961676@qq.com",
+    code: str = "123456",
+) -> None:
+    normalized_email = email.strip().lower()
+    now = time.monotonic()
+    owner_mobile._REGISTRATION_CODES[normalized_email] = owner_mobile._RegistrationCode(
+        digest=owner_mobile._registration_code_digest(normalized_email, code),
+        expires_at=now + 600,
+        sent_at=now - 61,
+    )
+
+
+def _registration_payload(**overrides):
+    payload = {
+        "email": "2821961676@qq.com",
+        "verification_code": "123456",
+        "username": "owner",
+        "password": "correct-horse-42",
+    }
+    payload.update(overrides)
+    _seed_registration_code(payload["email"], payload["verification_code"])
+    return payload
 
 
 def test_first_registration_persists_only_scrypt_hash_and_stable_secret():
@@ -93,7 +132,8 @@ def test_first_registration_persists_only_scrypt_hash_and_stable_secret():
     assert before == {
         "registration_open": True,
         "account_configured": False,
-        "setup_token_required": False,
+        "email_verification_required": True,
+        "owner_email_configured": True,
     }
     assert "创建此 Hermes 服务器的所有者账号" in registration_page
     assert "owner-registration-form" in registration_page
@@ -102,7 +142,8 @@ def test_first_registration_persists_only_scrypt_hash_and_stable_secret():
     assert after == {
         "registration_open": False,
         "account_configured": True,
-        "setup_token_required": False,
+        "email_verification_required": True,
+        "owner_email_configured": True,
     }
     assert section["username"] == "owner"
     assert section["password_hash"].startswith("scrypt$")
@@ -146,40 +187,81 @@ def test_second_registration_is_rejected_without_overwriting_owner():
 
     from hermes_cli.config import load_config
 
-    assert exc.value.status_code == 409
+    assert exc.value.status_code == 403
     assert load_config()["dashboard"]["basic_auth"]["username"] == "owner"
 
 
-def test_public_first_owner_registration_requires_configured_setup_token(monkeypatch):
+def test_owner_registration_switch_stays_closed_until_enabled(monkeypatch):
     from hermes_cli.dashboard_auth.login_page import render_login_html
 
-    monkeypatch.setenv("HERMES_OWNER_SETUP_TOKEN", "server-only-bootstrap-code")
+    monkeypatch.setenv("HERMES_MOBILE_REGISTRATION_ENABLED", "0")
 
     status = mobile_registration_status()
     registration_page = render_login_html()
-    assert status["registration_open"] is True
-    assert status["setup_token_required"] is True
-    assert "服务器初始化码" in registration_page
-    assert 'type="password" name="setup_token"' in registration_page
-    assert "setup_token: setupToken" in registration_page
-    assert "初始化码错误。" in registration_page
-    assert "server-only-bootstrap-code" not in registration_page
+    assert status["registration_open"] is False
+    assert status["account_configured"] is False
+    assert "owner-registration-form" not in registration_page
 
-    with pytest.raises(HTTPException) as missing:
+    with pytest.raises(HTTPException) as send_error:
+        owner_mobile.send_mobile_registration_code(
+            _Request(),
+            owner_mobile.MobileRegistrationCodeBody(email="2821961676@qq.com"),
+        )
+    with pytest.raises(HTTPException) as registration_error:
         _register()
+
+    assert send_error.value.status_code == 403
+    assert registration_error.value.status_code == 403
+
+
+def test_qq_email_code_is_hashed_rate_limited_and_single_use(monkeypatch):
+    sent: list[tuple[str, str]] = []
+    monkeypatch.setattr(owner_mobile.secrets, "randbelow", lambda _: 123456)
+    monkeypatch.setattr(
+        owner_mobile,
+        "_send_qq_verification_email",
+        lambda email, code: sent.append((email, code)),
+    )
+
+    response = owner_mobile.send_mobile_registration_code(
+        _Request(),
+        owner_mobile.MobileRegistrationCodeBody(email="2821961676@qq.com"),
+    )
+    stored = owner_mobile._REGISTRATION_CODES["2821961676@qq.com"]
+
+    assert response == {"ok": True, "expires_in": 600, "resend_after": 60}
+    assert sent == [("2821961676@qq.com", "123456")]
+    assert stored.digest != b"123456"
+    assert not hasattr(stored, "code")
+
     with pytest.raises(HTTPException) as wrong:
-        _register(setup_token="wrong-code")
-
-    assert missing.value.status_code == 403
+        mobile_register(
+            _Request(),
+            MobileRegisterBody(
+                email="2821961676@qq.com",
+                verification_code="654321",
+                username="owner",
+                password="correct-horse-42",
+            ),
+        )
     assert wrong.value.status_code == 403
-    registered = _register(setup_token="server-only-bootstrap-code")
+
+    registered = mobile_register(
+        _Request(),
+        MobileRegisterBody(
+            email="2821961676@qq.com",
+            verification_code="123456",
+            username="owner",
+            password="correct-horse-42",
+        ),
+    )
     assert registered["account"]["username"] == "owner"
+    assert "2821961676@qq.com" not in owner_mobile._REGISTRATION_CODES
 
 
-def test_web_owner_registration_submits_required_setup_token(monkeypatch):
+def test_web_owner_registration_uses_qq_email_verification():
     from hermes_cli import web_server
 
-    monkeypatch.setenv("HERMES_OWNER_SETUP_TOKEN", "web-bootstrap-code")
     previous = {
         name: getattr(web_server.app.state, name, None)
         for name in ("bound_host", "bound_port", "auth_required")
@@ -190,25 +272,10 @@ def test_web_owner_registration_submits_required_setup_token(monkeypatch):
     client = TestClient(web_server.app, base_url="https://owner.test")
     try:
         login = client.get("/login")
-        missing = client.post(
-            "/auth/mobile/register",
-            json={"username": "owner", "password": "correct-horse-42"},
-        )
-        wrong = client.post(
-            "/auth/mobile/register",
-            json={
-                "username": "owner",
-                "password": "correct-horse-42",
-                "setup_token": "wrong-code",
-            },
-        )
+        payload = _registration_payload()
         registered = client.post(
             "/auth/mobile/register",
-            json={
-                "username": "owner",
-                "password": "correct-horse-42",
-                "setup_token": "web-bootstrap-code",
-            },
+            json=payload,
         )
     finally:
         client.close()
@@ -216,14 +283,11 @@ def test_web_owner_registration_submits_required_setup_token(monkeypatch):
             setattr(web_server.app.state, name, value)
 
     assert login.status_code == 200
-    assert "服务器初始化码" in login.text
-    assert 'name="setup_token"' in login.text
-    assert "初始化码错误。" in login.text
-    assert "web-bootstrap-code" not in login.text
-    assert missing.status_code == 403
-    assert missing.json()["detail"] == "Invalid owner setup token"
-    assert wrong.status_code == 403
-    assert wrong.json()["detail"] == "Invalid owner setup token"
+    assert "QQ 邮箱" in login.text
+    assert 'name="email"' in login.text
+    assert 'name="verification_code"' in login.text
+    assert "/auth/mobile/registration-code" in login.text
+    assert "setup_token" not in login.text
     assert registered.status_code == 200
     assert registered.json()["account"]["username"] == "owner"
 
@@ -313,17 +377,15 @@ def test_real_dashboard_routes_register_login_refresh_and_authorize_api():
         status = client.get("/auth/mobile/status")
         registered = client.post(
             "/auth/mobile/register",
-            json={
-                "username": "owner",
-                "password": "correct-horse-42",
-                "device": {
+            json=_registration_payload(
+                device={
                     "id": "route-ios-device",
                     "name": "Route iPhone",
                     "model": "iPhone17,1",
                     "os_version": "18.6",
                     "app_version": "2.0.0",
                 },
-            },
+            ),
             follow_redirects=False,
         )
         assert registered.status_code == 200, (
@@ -414,11 +476,9 @@ def test_same_owner_devices_read_and_write_one_cloud_workspace():
     try:
         first = client.post(
             "/auth/mobile/register",
-            json={
-                "username": "owner",
-                "password": "correct-horse-42",
-                "device": {"id": "shared-iphone", "name": "Owner iPhone"},
-            },
+            json=_registration_payload(
+                device={"id": "shared-iphone", "name": "Owner iPhone"},
+            ),
         )
         second = client.post(
             "/auth/mobile/token",
@@ -500,11 +560,9 @@ def test_http_refresh_replay_revokes_the_rotated_session():
     try:
         registered = client.post(
             "/auth/mobile/register",
-            json={
-                "username": "owner",
-                "password": "correct-horse-42",
-                "device": {"id": "refresh-ios-device", "name": "Owner iPhone"},
-            },
+            json=_registration_payload(
+                device={"id": "refresh-ios-device", "name": "Owner iPhone"},
+            ),
         )
         assert registered.status_code == 200
         original = registered.json()
@@ -563,11 +621,9 @@ def test_http_device_revoke_is_isolated_and_apns_is_current_device_only():
     try:
         phone = client.post(
             "/auth/mobile/register",
-            json={
-                "username": "owner",
-                "password": "correct-horse-42",
-                "device": {"id": "owner-phone-device", "name": "Owner iPhone"},
-            },
+            json=_registration_payload(
+                device={"id": "owner-phone-device", "name": "Owner iPhone"},
+            ),
         ).json()
         tablet = client.post(
             "/auth/mobile/token",

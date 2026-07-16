@@ -463,6 +463,36 @@ _OWNER_REGISTRATION_SCRIPT = """\
 (function () {
   var form = document.querySelector('form.owner-registration-form');
   if (!form) { return; }
+  var sendCode = form.querySelector('button.send-code');
+  if (sendCode) {
+    sendCode.addEventListener('click', function () {
+      var err = form.querySelector('.form-error');
+      var email = (form.querySelector('input[name=email]') || {}).value || '';
+      if (err) { err.hidden = true; err.textContent = ''; }
+      sendCode.disabled = true;
+      fetch('/auth/mobile/registration-code', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ email: email }),
+        credentials: 'same-origin'
+      }).then(function (resp) {
+        if (!resp.ok) {
+          var message = resp.status === 429
+            ? '验证码发送过于频繁，请稍后再试。'
+            : '验证码发送失败，请检查 QQ 邮箱。';
+          throw new Error(message);
+        }
+        sendCode.textContent = '验证码已发送';
+        window.setTimeout(function () {
+          sendCode.disabled = false;
+          sendCode.textContent = '发送验证码';
+        }, 60000);
+      }).catch(function (error) {
+        if (err) { err.textContent = error.message || '验证码发送失败。'; err.hidden = false; }
+        sendCode.disabled = false;
+      });
+    });
+  }
   form.addEventListener('submit', function (ev) {
     ev.preventDefault();
     var err = form.querySelector('.form-error');
@@ -470,7 +500,8 @@ _OWNER_REGISTRATION_SCRIPT = """\
     var username = (form.querySelector('input[name=username]') || {}).value || '';
     var password = (form.querySelector('input[name=password]') || {}).value || '';
     var confirmation = (form.querySelector('input[name=confirmation]') || {}).value || '';
-    var setupToken = (form.querySelector('input[name=setup_token]') || {}).value || '';
+    var email = (form.querySelector('input[name=email]') || {}).value || '';
+    var verificationCode = (form.querySelector('input[name=verification_code]') || {}).value || '';
     var next = (form.querySelector('input[name=next]') || {}).value || '';
     if (err) { err.hidden = true; err.textContent = ''; }
     if (password !== confirmation) {
@@ -482,15 +513,16 @@ _OWNER_REGISTRATION_SCRIPT = """\
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({
+        email: email,
+        verification_code: verificationCode,
         username: username,
-        password: password,
-        setup_token: setupToken
+        password: password
       }),
       credentials: 'same-origin'
     }).then(function (resp) {
       if (!resp.ok) {
         var message = resp.status === 403
-          ? '初始化码错误。'
+          ? '验证码错误、已过期或注册暂未开放。'
           : (resp.status === 409
               ? '所有者账号已经存在。'
               : '注册失败，请检查账号和密码。');
@@ -531,19 +563,13 @@ def render_login_html(*, next_path: str = "") -> str:
     """
     providers = list_session_providers()
     if not providers:
-        from hermes_cli.dashboard_auth.owner_mobile import (
-            owner_registration_open,
-            owner_setup_token_required,
-        )
+        from hermes_cli.dashboard_auth.owner_mobile import owner_registration_open
 
         if owner_registration_open():
             return _LOGIN_HTML_TEMPLATE.format(
                 page_heading="注册",
                 page_subtitle="创建此 Hermes 服务器的所有者账号。",
-                provider_buttons=_render_owner_registration_form(
-                    next_path,
-                    setup_token_required=owner_setup_token_required(),
-                ),
+                provider_buttons=_render_owner_registration_form(next_path),
                 password_script=_OWNER_REGISTRATION_SCRIPT,
             )
         return _EMPTY_HTML
@@ -581,24 +607,24 @@ def render_login_html(*, next_path: str = "") -> str:
 
 def _render_owner_registration_form(
     next_path: str,
-    *,
-    setup_token_required: bool,
 ) -> str:
     safe_next = html.escape(next_path, quote=True) if next_path else ""
-    setup_token_field = ""
-    if setup_token_required:
-        setup_token_field = (
-            '        <label class="field">\n'
-            '          <span class="field-label">服务器初始化码</span>\n'
-            '          <input class="field-input" type="password" name="setup_token" '
-            'autocomplete="off" autocapitalize="none" autocorrect="off" '
-            'spellcheck="false" required>\n'
-            '        </label>\n'
-        )
     return (
         '      <form class="provider-form owner-registration-form" autocomplete="on">\n'
         f'        <input type="hidden" name="next" value="{safe_next}">\n'
-        f'{setup_token_field}'
+        '        <label class="field">\n'
+        '          <span class="field-label">QQ 邮箱</span>\n'
+        '          <input class="field-input" type="email" name="email" '
+        'autocomplete="email" autocapitalize="none" autocorrect="off" '
+        'spellcheck="false" required>\n'
+        '        </label>\n'
+        '        <label class="field">\n'
+        '          <span class="field-label">邮箱验证码</span>\n'
+        '          <input class="field-input" type="text" name="verification_code" '
+        'autocomplete="one-time-code" inputmode="numeric" pattern="[0-9]{6}" '
+        'maxlength="6" required>\n'
+        '        </label>\n'
+        '        <button class="provider-btn send-code" type="button">发送验证码</button>\n'
         '        <label class="field">\n'
         '          <span class="field-label">账号</span>\n'
         '          <input class="field-input" type="text" name="username" '

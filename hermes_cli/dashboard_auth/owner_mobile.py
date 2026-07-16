@@ -7,11 +7,16 @@ clients never replicate the session or configuration database locally.
 from __future__ import annotations
 
 import base64
+from dataclasses import dataclass
+from email.message import EmailMessage
 import hmac
 import os
 import re
 import secrets
+import smtplib
+import ssl
 import threading
+import time
 from typing import Any
 
 from fastapi import APIRouter, HTTPException, Request
@@ -46,7 +51,26 @@ from plugins.dashboard_auth.basic import (
 
 router = APIRouter()
 _REGISTRATION_LOCK = threading.Lock()
+_VERIFICATION_LOCK = threading.Lock()
 _USERNAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]{2,63}$")
+_QQ_EMAIL_RE = re.compile(r"^[1-9][0-9]{4,11}@qq\.com$", re.IGNORECASE)
+_VERIFICATION_CODE_TTL_SECONDS = 10 * 60
+_VERIFICATION_CODE_RESEND_SECONDS = 60
+_VERIFICATION_CODE_MAX_ATTEMPTS = 5
+_VERIFICATION_PEPPER = secrets.token_bytes(32)
+
+
+@dataclass
+class _RegistrationCode:
+    digest: bytes
+    expires_at: float
+    sent_at: float
+    attempts: int = 0
+
+
+_REGISTRATION_CODES: dict[str, _RegistrationCode] = {}
+_REGISTRATION_SENDS_BY_IP: dict[str, float] = {}
+_REGISTRATION_SENDS_BY_EMAIL: dict[str, float] = {}
 
 
 class MobileDeviceBody(BaseModel):
@@ -58,10 +82,15 @@ class MobileDeviceBody(BaseModel):
 
 
 class MobileRegisterBody(BaseModel):
+    email: str
+    verification_code: str
     username: str
     password: str
-    setup_token: str = ""
     device: MobileDeviceBody | None = None
+
+
+class MobileRegistrationCodeBody(BaseModel):
+    email: str
 
 
 class MobileLoginBody(BaseModel):
@@ -118,19 +147,92 @@ def owner_account_configured() -> bool:
     return bool(username and (password_hash or plaintext))
 
 
+def _env_enabled(name: str, *, default: bool = False) -> bool:
+    value = os.environ.get(name)
+    if value is None:
+        return default
+    return value.strip().lower() in {"1", "true", "yes", "on"}
+
+
+def owner_email() -> str:
+    return os.environ.get("HERMES_OWNER_EMAIL", "").strip().lower()
+
+
 def owner_registration_open() -> bool:
+    if not _env_enabled("HERMES_MOBILE_REGISTRATION_ENABLED"):
+        return False
+    if not _QQ_EMAIL_RE.fullmatch(owner_email()):
+        return False
     username, password_hash, plaintext = _configured_credentials()
     return not any((username, password_hash, plaintext))
 
 
-def owner_setup_token_required() -> bool:
-    return bool(os.environ.get("HERMES_OWNER_SETUP_TOKEN", "").strip())
+def _normalize_registration_email(value: str) -> str:
+    email = value.strip().lower()
+    if not _QQ_EMAIL_RE.fullmatch(email):
+        raise HTTPException(status_code=422, detail="A valid QQ email address is required")
+    expected = owner_email()
+    if not expected or not hmac.compare_digest(email, expected):
+        raise HTTPException(status_code=403, detail="Email is not enabled for owner registration")
+    return email
 
 
-def _validate_owner_setup_token(value: str) -> None:
-    expected = os.environ.get("HERMES_OWNER_SETUP_TOKEN", "").strip()
-    if expected and not hmac.compare_digest(value.strip(), expected):
-        raise HTTPException(status_code=403, detail="Invalid owner setup token")
+def _registration_code_digest(email: str, code: str) -> bytes:
+    return hmac.digest(_VERIFICATION_PEPPER, f"{email}:{code}".encode("utf-8"), "sha256")
+
+
+def _send_qq_verification_email(email: str, code: str) -> None:
+    username = os.environ.get("HERMES_QQ_SMTP_USERNAME", "").strip() or owner_email()
+    auth_code = os.environ.get("HERMES_QQ_SMTP_AUTH_CODE", "").strip()
+    if not username or not auth_code:
+        raise HTTPException(status_code=503, detail="QQ email delivery is not configured")
+
+    host = os.environ.get("HERMES_QQ_SMTP_HOST", "smtp.qq.com").strip() or "smtp.qq.com"
+    try:
+        port = int(os.environ.get("HERMES_QQ_SMTP_PORT", "465"))
+    except ValueError as exc:
+        raise HTTPException(status_code=500, detail="QQ SMTP port is invalid") from exc
+
+    message = EmailMessage()
+    message["Subject"] = "Hermes Agent 注册验证码"
+    message["From"] = username
+    message["To"] = email
+    message.set_content(
+        f"你的 Hermes Agent 注册验证码是：{code}\n\n"
+        "验证码 10 分钟内有效，仅可使用一次。"
+    )
+    try:
+        with smtplib.SMTP_SSL(
+            host,
+            port,
+            timeout=10,
+            context=ssl.create_default_context(),
+        ) as smtp:
+            smtp.login(username, auth_code)
+            smtp.send_message(message)
+    except (OSError, smtplib.SMTPException) as exc:
+        raise HTTPException(status_code=502, detail="QQ verification email delivery failed") from exc
+
+
+def _consume_registration_code(email: str, code: str) -> None:
+    normalized_code = code.strip()
+    if not re.fullmatch(r"[0-9]{6}", normalized_code):
+        raise HTTPException(status_code=422, detail="Verification code must contain 6 digits")
+    now = time.monotonic()
+    with _VERIFICATION_LOCK:
+        entry = _REGISTRATION_CODES.get(email)
+        if entry is None or entry.expires_at <= now:
+            _REGISTRATION_CODES.pop(email, None)
+            raise HTTPException(status_code=403, detail="Verification code is invalid or expired")
+        if entry.attempts >= _VERIFICATION_CODE_MAX_ATTEMPTS:
+            _REGISTRATION_CODES.pop(email, None)
+            raise HTTPException(status_code=429, detail="Too many verification attempts")
+        if not hmac.compare_digest(entry.digest, _registration_code_digest(email, normalized_code)):
+            entry.attempts += 1
+            if entry.attempts >= _VERIFICATION_CODE_MAX_ATTEMPTS:
+                _REGISTRATION_CODES.pop(email, None)
+            raise HTTPException(status_code=403, detail="Verification code is invalid or expired")
+        _REGISTRATION_CODES.pop(email, None)
 
 
 def _validate_registration(username: str, password: str) -> tuple[str, str]:
@@ -237,7 +339,55 @@ def mobile_registration_status() -> dict[str, bool]:
     return {
         "registration_open": owner_registration_open(),
         "account_configured": owner_account_configured(),
-        "setup_token_required": owner_setup_token_required(),
+        "email_verification_required": True,
+        "owner_email_configured": bool(owner_email()),
+    }
+
+
+@router.post("/auth/mobile/registration-code")
+def send_mobile_registration_code(
+    request: Request,
+    body: MobileRegistrationCodeBody,
+) -> dict[str, int | bool]:
+    if not owner_registration_open():
+        raise HTTPException(status_code=403, detail="Owner registration is closed")
+    ip = _client_ip(request)
+    if _password_rate_limited(ip):
+        raise HTTPException(status_code=429, detail="Too many attempts")
+    email = _normalize_registration_email(body.email)
+    now = time.monotonic()
+    with _VERIFICATION_LOCK:
+        previous_ip_send = _REGISTRATION_SENDS_BY_IP.get(ip, 0)
+        previous_email_send = _REGISTRATION_SENDS_BY_EMAIL.get(email, 0)
+        if (
+            now - previous_email_send < _VERIFICATION_CODE_RESEND_SECONDS
+            or now - previous_ip_send < _VERIFICATION_CODE_RESEND_SECONDS
+        ):
+            raise HTTPException(status_code=429, detail="Verification code was sent recently")
+        _REGISTRATION_SENDS_BY_EMAIL[email] = now
+        _REGISTRATION_SENDS_BY_IP[ip] = now
+
+    code = f"{secrets.randbelow(1_000_000):06d}"
+    try:
+        _send_qq_verification_email(email, code)
+    except Exception:
+        with _VERIFICATION_LOCK:
+            if _REGISTRATION_SENDS_BY_EMAIL.get(email) == now:
+                _REGISTRATION_SENDS_BY_EMAIL.pop(email, None)
+            if _REGISTRATION_SENDS_BY_IP.get(ip) == now:
+                _REGISTRATION_SENDS_BY_IP.pop(ip, None)
+        raise
+    delivered_at = time.monotonic()
+    with _VERIFICATION_LOCK:
+        _REGISTRATION_CODES[email] = _RegistrationCode(
+            digest=_registration_code_digest(email, code),
+            expires_at=delivered_at + _VERIFICATION_CODE_TTL_SECONDS,
+            sent_at=delivered_at,
+        )
+    return {
+        "ok": True,
+        "expires_in": _VERIFICATION_CODE_TTL_SECONDS,
+        "resend_after": _VERIFICATION_CODE_RESEND_SECONDS,
     }
 
 
@@ -246,12 +396,15 @@ def mobile_register(request: Request, body: MobileRegisterBody):
     ip = _client_ip(request)
     if _password_rate_limited(ip):
         raise HTTPException(status_code=429, detail="Too many attempts")
+    if not owner_registration_open():
+        raise HTTPException(status_code=403, detail="Owner registration is closed")
+    email = _normalize_registration_email(body.email)
     username, password = _validate_registration(body.username, body.password)
 
     with _REGISTRATION_LOCK:
         if not owner_registration_open():
-            raise HTTPException(status_code=409, detail="Owner account already exists")
-        _validate_owner_setup_token(body.setup_token)
+            raise HTTPException(status_code=403, detail="Owner registration is closed")
+        _consume_registration_code(email, body.verification_code)
 
         from hermes_cli.config import load_config, save_config
 
