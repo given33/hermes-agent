@@ -214,7 +214,7 @@ def _send_qq_verification_email(email: str, code: str) -> None:
         raise HTTPException(status_code=502, detail="QQ verification email delivery failed") from exc
 
 
-def _consume_registration_code(email: str, code: str) -> None:
+def _validate_registration_code(email: str, code: str) -> None:
     normalized_code = code.strip()
     if not re.fullmatch(r"[0-9]{6}", normalized_code):
         raise HTTPException(status_code=422, detail="Verification code must contain 6 digits")
@@ -231,7 +231,12 @@ def _consume_registration_code(email: str, code: str) -> None:
             entry.attempts += 1
             if entry.attempts >= _VERIFICATION_CODE_MAX_ATTEMPTS:
                 _REGISTRATION_CODES.pop(email, None)
+                raise HTTPException(status_code=429, detail="Too many verification attempts")
             raise HTTPException(status_code=403, detail="Verification code is invalid or expired")
+
+
+def _discard_registration_code(email: str) -> None:
+    with _VERIFICATION_LOCK:
         _REGISTRATION_CODES.pop(email, None)
 
 
@@ -404,7 +409,7 @@ def mobile_register(request: Request, body: MobileRegisterBody):
     with _REGISTRATION_LOCK:
         if not owner_registration_open():
             raise HTTPException(status_code=403, detail="Owner registration is closed")
-        _consume_registration_code(email, body.verification_code)
+        _validate_registration_code(email, body.verification_code)
 
         from hermes_cli.config import load_config, save_config
 
@@ -421,6 +426,7 @@ def mobile_register(request: Request, body: MobileRegisterBody):
             }
         )
         save_config(config)
+        _discard_registration_code(email)
         provider = ensure_owner_provider()
         if provider is None:
             raise HTTPException(status_code=500, detail="Owner account unavailable")

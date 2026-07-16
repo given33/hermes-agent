@@ -259,6 +259,79 @@ def test_qq_email_code_is_hashed_rate_limited_and_single_use(monkeypatch):
     assert "2821961676@qq.com" not in owner_mobile._REGISTRATION_CODES
 
 
+def test_registration_code_expires_and_locks_after_five_wrong_attempts():
+    email = "2821961676@qq.com"
+    owner_mobile._REGISTRATION_CODES[email] = owner_mobile._RegistrationCode(
+        digest=owner_mobile._registration_code_digest(email, "123456"),
+        expires_at=time.monotonic() - 1,
+        sent_at=time.monotonic() - 601,
+    )
+    with pytest.raises(HTTPException) as expired:
+        mobile_register(
+            _Request(),
+            MobileRegisterBody(
+                email=email,
+                verification_code="123456",
+                username="owner",
+                password="correct-horse-42",
+            ),
+        )
+    assert expired.value.status_code == 403
+    assert email not in owner_mobile._REGISTRATION_CODES
+
+    _seed_registration_code(email, "123456")
+    for _ in range(4):
+        with pytest.raises(HTTPException) as wrong:
+            mobile_register(
+                _Request(),
+                MobileRegisterBody(
+                    email=email,
+                    verification_code="654321",
+                    username="owner",
+                    password="correct-horse-42",
+                ),
+            )
+        assert wrong.value.status_code == 403
+    with pytest.raises(HTTPException) as locked:
+        mobile_register(
+            _Request(),
+            MobileRegisterBody(
+                email=email,
+                verification_code="654321",
+                username="owner",
+                password="correct-horse-42",
+            ),
+        )
+    assert locked.value.status_code == 429
+    assert email not in owner_mobile._REGISTRATION_CODES
+
+
+def test_valid_code_survives_transient_config_persistence_failure(monkeypatch):
+    from hermes_cli import config as hermes_config
+
+    email = "2821961676@qq.com"
+    _seed_registration_code(email, "123456")
+
+    def fail_save(_config):
+        raise RuntimeError("temporary write failure")
+
+    monkeypatch.setattr(hermes_config, "save_config", fail_save)
+
+    with pytest.raises(RuntimeError, match="temporary write failure"):
+        mobile_register(
+            _Request(),
+            MobileRegisterBody(
+                email=email,
+                verification_code="123456",
+                username="owner",
+                password="correct-horse-42",
+            ),
+        )
+
+    assert email in owner_mobile._REGISTRATION_CODES
+    assert mobile_registration_status()["registration_open"] is True
+
+
 def test_web_owner_registration_uses_qq_email_verification():
     from hermes_cli import web_server
 
