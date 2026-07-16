@@ -179,6 +179,53 @@ def test_existing_basic_provider_enables_mobile_prefix_after_restart():
     assert token_auth.is_optional_token_path("/api/sessions") is True
 
 
+def test_plugin_loaded_basic_provider_is_reused_across_module_boundary():
+    from hermes_cli.dashboard_auth import (
+        DashboardAuthProvider,
+        LoginStart,
+        Session,
+        register_provider,
+    )
+
+    class PluginLoadedBasicProvider(DashboardAuthProvider):
+        name = "basic"
+        display_name = "Plugin-loaded basic"
+        supports_password = True
+
+        def start_login(self, *, redirect_uri: str) -> LoginStart:
+            raise NotImplementedError
+
+        def complete_login(
+            self,
+            *,
+            code: str,
+            state: str,
+            code_verifier: str,
+            redirect_uri: str,
+        ) -> Session:
+            raise NotImplementedError
+
+        def complete_password_login(self, *, username: str, password: str) -> Session:
+            raise NotImplementedError
+
+        def verify_session(self, *, access_token: str) -> Session | None:
+            return None
+
+        def refresh_session(self, *, refresh_token: str) -> Session:
+            raise NotImplementedError
+
+        def revoke_session(self, *, refresh_token: str) -> None:
+            return None
+
+    plugin_provider = PluginLoadedBasicProvider()
+    register_provider(plugin_provider)
+
+    provider = ensure_owner_provider()
+
+    assert provider is plugin_provider
+    assert token_auth.is_optional_token_path("/api/sessions") is True
+
+
 def test_second_registration_is_rejected_without_overwriting_owner():
     _register()
 

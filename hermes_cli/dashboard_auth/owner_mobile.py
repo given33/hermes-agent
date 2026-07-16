@@ -23,6 +23,7 @@ from fastapi import APIRouter, HTTPException, Request
 from pydantic import BaseModel
 
 from hermes_cli.dashboard_auth import (
+    DashboardAuthProvider,
     InvalidCredentialsError,
     get_provider,
     register_provider,
@@ -305,13 +306,24 @@ def ensure_mobile_token_provider() -> OwnerMobileTokenProvider:
     return provider
 
 
-def ensure_owner_provider() -> BasicAuthProvider | None:
+def _compatible_password_provider(
+    provider: DashboardAuthProvider | None,
+) -> DashboardAuthProvider | None:
+    if (
+        provider is not None
+        and provider.name == BasicAuthProvider.name
+        and provider.supports_password
+        and callable(getattr(provider, "complete_password_login", None))
+    ):
+        return provider
+    return None
+
+
+def ensure_owner_provider() -> DashboardAuthProvider | None:
     ensure_mobile_token_provider()
     existing = get_provider("basic")
     if existing is not None:
-        if not isinstance(existing, BasicAuthProvider):
-            return None
-        return existing
+        return _compatible_password_provider(existing)
     provider = _build_provider_from_config()
     if provider is None:
         return None
@@ -319,7 +331,7 @@ def ensure_owner_provider() -> BasicAuthProvider | None:
         register_provider(provider)
     except ValueError:
         existing = get_provider("basic")
-        return existing if isinstance(existing, BasicAuthProvider) else None
+        return _compatible_password_provider(existing)
     return provider
 
 
