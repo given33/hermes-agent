@@ -19,7 +19,7 @@ from hermes_cli.dashboard_auth.mobile_device_store import MobileDeviceStore
 
 _log = logging.getLogger(__name__)
 _MAX_PAYLOAD_BYTES = 4096
-_DEFAULT_BUNDLE_ID = "com.given33.hermesagent.nativebeta"
+_DEFAULT_BUNDLE_ID = "app.sunstone1029.fig1171"
 
 
 def apns_configured() -> bool:
