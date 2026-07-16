@@ -73,7 +73,6 @@ from hermes_cli.dashboard_auth import (
     LoginStart,
     RefreshExpiredError,
     Session,
-    TokenPrincipal,
 )
 
 logger = logging.getLogger(__name__)
@@ -205,7 +204,6 @@ class BasicAuthProvider(DashboardAuthProvider):
     name = "basic"
     display_name = "账号与密码"
     supports_password = True
-    supports_token = True
 
     def __init__(
         self,
@@ -271,17 +269,6 @@ class BasicAuthProvider(DashboardAuthProvider):
         ):
             return None
         return self._session_from_payload(access_token, "", payload)
-
-    def verify_token(self, *, token: str) -> Optional[TokenPrincipal]:
-        """Accept the same short-lived access token for native API calls."""
-        session = self.verify_session(access_token=token)
-        if session is None:
-            return None
-        return TokenPrincipal(
-            principal=session.user_id,
-            provider=self.name,
-            scopes=("dashboard:admin",),
-        )
 
     def refresh_session(self, *, refresh_token: str) -> Session:
         if not refresh_token:

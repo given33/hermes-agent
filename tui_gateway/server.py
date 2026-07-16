@@ -5199,6 +5199,62 @@ def _inflight_snapshot(session: dict) -> dict | None:
     }
 
 
+def _set_mobile_notification_context(session: dict, params: dict) -> None:
+    """Attach the cloud conversation turn that owns this agent run.
+
+    These identifiers route an eventual APNs deep link. They never select a
+    Hermes home or partition server-side business data.
+    """
+    conversation_id = str(params.get("conversation_id") or "").strip()
+    turn_id = str(params.get("turn_id") or "").strip()
+    if not conversation_id or not turn_id:
+        return
+    session["mobile_notification_context"] = {
+        "conversation_id": conversation_id[:256],
+        "turn_id": turn_id[:256],
+    }
+
+
+def _schedule_mobile_turn_notification(
+    session: dict,
+    *,
+    status: str,
+    result: str,
+) -> bool:
+    """Schedule at most one completion push for the current mobile turn."""
+    context = session.get("mobile_notification_context")
+    if not isinstance(context, dict):
+        return False
+    conversation_id = str(context.get("conversation_id") or "").strip()
+    turn_id = str(context.get("turn_id") or "").strip()
+    if not conversation_id or not turn_id:
+        return False
+    if session.get("mobile_notification_sent_turn_id") == turn_id:
+        return False
+
+    normalized_status = {
+        "complete": "completed",
+        "completed": "completed",
+        "error": "failed",
+    }.get(str(status or "").strip().lower(), str(status or "failed").strip().lower())
+    try:
+        from hermes_cli.dashboard_auth.mobile_notifications import (
+            schedule_task_completion_push,
+        )
+
+        schedule_task_completion_push(
+            conversation_id=conversation_id,
+            turn_id=turn_id,
+            status=normalized_status,
+            result=str(result or ""),
+        )
+    except Exception as exc:
+        logger.warning("mobile turn notification scheduling failed: %s", exc)
+        return False
+    session["mobile_notification_sent_turn_id"] = turn_id
+    return True
+
+
 # ── Methods: session ─────────────────────────────────────────────────
 
 
@@ -8491,6 +8547,7 @@ def _(rid, params: dict) -> dict:
         # the upgrade resumes the child's transcript as a normal conversation.
         if session.get("lazy") and _child_run_active(str(session.get("session_key") or "")):
             return _err(rid, 4009, "subagent still running — wait for it to finish")
+        _set_mobile_notification_context(session, params)
         if truncate_user_ordinal is not None:
             try:
                 ordinal = int(truncate_user_ordinal)
@@ -9275,6 +9332,13 @@ def _run_prompt_submit(rid, sid: str, session: dict, text: Any) -> None:
                         file=sys.stderr,
                     )
 
+            if not goal_followup:
+                _schedule_mobile_turn_notification(
+                    session,
+                    status=status,
+                    result=raw if isinstance(raw, str) else str(raw or ""),
+                )
+
             # Apply pending_title now that the DB row exists.
             _pending = session.get("pending_title")
             if _pending and status == "complete":
@@ -9362,6 +9426,11 @@ def _run_prompt_submit(rid, sid: str, session: dict, text: Any) -> None:
                 f"[gateway-turn] {type(e).__name__}: {e}", file=sys.stderr, flush=True
             )
             _emit("error", sid, {"message": str(e)})
+            _schedule_mobile_turn_notification(
+                session,
+                status="failed",
+                result=str(e),
+            )
         finally:
             try:
                 if approval_token is not None:

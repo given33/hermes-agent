@@ -2634,7 +2634,10 @@ def _collect_profile_gateway_topology() -> Dict[str, Any]:
 
 
 _MOBILE_API_CAPABILITIES: tuple[str, ...] = (
+    "auth.owner",
     "chat",
+    "devices",
+    "notifications.apns",
     "profiles",
     "sessions",
     "config",

@@ -1101,6 +1101,10 @@ class CollaborationDashboardTests(unittest.TestCase):
             artifact_required=False,
         )
         calls = []
+        notifications = []
+        module._schedule_mobile_completion_notification = (
+            lambda *args: notifications.append(args)
+        )
 
         def runner(profile, prompt):
             calls.append((profile, prompt))
@@ -1139,6 +1143,15 @@ class CollaborationDashboardTests(unittest.TestCase):
         self.assertEqual(
             conversation["hosted_turns"]["turn-hosted-1"]["status"],
             "completed",
+        )
+        self.assertEqual(
+            notifications,
+            [(
+                conversation["id"],
+                "turn-hosted-1",
+                "completed",
+                "最终汇报：任务完成",
+            )],
         )
         worker_prompt = calls[0][1]
         reviewer_prompt = calls[1][1]

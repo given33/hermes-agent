@@ -82,6 +82,7 @@ class TestProvider:
 
     def test_supports_password_true(self, basic):
         assert basic.BasicAuthProvider.supports_password is True
+        assert basic.BasicAuthProvider.supports_token is False
 
     def test_login_mints_session(self, basic):
         p = self._make(basic)

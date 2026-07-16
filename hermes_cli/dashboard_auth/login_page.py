@@ -470,6 +470,7 @@ _OWNER_REGISTRATION_SCRIPT = """\
     var username = (form.querySelector('input[name=username]') || {}).value || '';
     var password = (form.querySelector('input[name=password]') || {}).value || '';
     var confirmation = (form.querySelector('input[name=confirmation]') || {}).value || '';
+    var setupToken = (form.querySelector('input[name=setup_token]') || {}).value || '';
     var next = (form.querySelector('input[name=next]') || {}).value || '';
     if (err) { err.hidden = true; err.textContent = ''; }
     if (password !== confirmation) {
@@ -480,11 +481,20 @@ _OWNER_REGISTRATION_SCRIPT = """\
     fetch('/auth/mobile/register', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ username: username, password: password }),
+      body: JSON.stringify({
+        username: username,
+        password: password,
+        setup_token: setupToken
+      }),
       credentials: 'same-origin'
     }).then(function (resp) {
       if (!resp.ok) {
-        throw new Error(resp.status === 409 ? '所有者账号已经存在。' : '注册失败，请检查账号和密码。');
+        var message = resp.status === 403
+          ? '初始化码错误。'
+          : (resp.status === 409
+              ? '所有者账号已经存在。'
+              : '注册失败，请检查账号和密码。');
+        throw new Error(message);
       }
       return fetch('/auth/password-login', {
         method: 'POST',
@@ -521,13 +531,19 @@ def render_login_html(*, next_path: str = "") -> str:
     """
     providers = list_session_providers()
     if not providers:
-        from hermes_cli.dashboard_auth.owner_mobile import owner_registration_open
+        from hermes_cli.dashboard_auth.owner_mobile import (
+            owner_registration_open,
+            owner_setup_token_required,
+        )
 
         if owner_registration_open():
             return _LOGIN_HTML_TEMPLATE.format(
                 page_heading="注册",
                 page_subtitle="创建此 Hermes 服务器的所有者账号。",
-                provider_buttons=_render_owner_registration_form(next_path),
+                provider_buttons=_render_owner_registration_form(
+                    next_path,
+                    setup_token_required=owner_setup_token_required(),
+                ),
                 password_script=_OWNER_REGISTRATION_SCRIPT,
             )
         return _EMPTY_HTML
@@ -563,11 +579,26 @@ def render_login_html(*, next_path: str = "") -> str:
     )
 
 
-def _render_owner_registration_form(next_path: str) -> str:
+def _render_owner_registration_form(
+    next_path: str,
+    *,
+    setup_token_required: bool,
+) -> str:
     safe_next = html.escape(next_path, quote=True) if next_path else ""
+    setup_token_field = ""
+    if setup_token_required:
+        setup_token_field = (
+            '        <label class="field">\n'
+            '          <span class="field-label">服务器初始化码</span>\n'
+            '          <input class="field-input" type="password" name="setup_token" '
+            'autocomplete="off" autocapitalize="none" autocorrect="off" '
+            'spellcheck="false" required>\n'
+            '        </label>\n'
+        )
     return (
         '      <form class="provider-form owner-registration-form" autocomplete="on">\n'
         f'        <input type="hidden" name="next" value="{safe_next}">\n'
+        f'{setup_token_field}'
         '        <label class="field">\n'
         '          <span class="field-label">账号</span>\n'
         '          <input class="field-input" type="text" name="username" '

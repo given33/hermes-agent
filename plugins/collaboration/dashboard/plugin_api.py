@@ -2162,6 +2162,29 @@ def _notify_hosted_update() -> int:
         return _HOSTED_UPDATE_REVISION
 
 
+def _schedule_mobile_completion_notification(
+    conversation_id: str,
+    turn_id: str,
+    status: str,
+    result: str,
+) -> None:
+    """Best-effort APNs notification; never blocks or fails a hosted turn."""
+    try:
+        from hermes_cli.dashboard_auth.mobile_notifications import (
+            schedule_task_completion_push,
+        )
+
+        schedule_task_completion_push(
+            conversation_id=conversation_id,
+            turn_id=turn_id,
+            status=status,
+            result=result,
+        )
+    except Exception:
+        # Optional mobile delivery must not change the task result.
+        return
+
+
 def _wait_for_hosted_update(revision: int, timeout: float = 15.0) -> int:
     with _HOSTED_UPDATE_CONDITION:
         if _HOSTED_UPDATE_REVISION <= revision:
@@ -2620,6 +2643,12 @@ def execute_hosted_workflow(
             },
         },
     )
+    _schedule_mobile_completion_notification(
+        conversation_id,
+        turn_id,
+        final_status,
+        reporter_result,
+    )
 
 
 def start_hosted_workflow(conversation_id: str, turn_id: str) -> threading.Thread:
@@ -2659,6 +2688,12 @@ def start_hosted_workflow(conversation_id: str, turn_id: str) -> threading.Threa
                     )
                 except Exception:
                     pass
+                _schedule_mobile_completion_notification(
+                    conversation_id,
+                    turn_id,
+                    "failed",
+                    clean_error,
+                )
             finally:
                 with _HOSTED_THREADS_LOCK:
                     _HOSTED_THREADS.pop(key, None)

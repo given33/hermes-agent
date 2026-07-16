@@ -6362,6 +6362,65 @@ def test_prompt_submit_auto_titles_session_on_complete(monkeypatch):
     assert args[3] == "Rome was founded in 753 BC."
 
 
+def test_prompt_submit_schedules_one_mobile_completion_push(monkeypatch):
+    class _Agent:
+        def run_conversation(
+            self, prompt, conversation_history=None, stream_callback=None
+        ):
+            return {
+                "final_response": "The requested report is ready.",
+                "messages": [
+                    {"role": "user", "content": prompt},
+                    {"role": "assistant", "content": "The requested report is ready."},
+                ],
+            }
+
+    pushes = []
+    sid = "ios-mobile-notification"
+    server._sessions[sid] = _session(agent=_Agent())
+    monkeypatch.setattr(server.threading, "Thread", _ImmediateThread)
+    monkeypatch.setattr(server, "_emit", lambda *args, **kwargs: None)
+    monkeypatch.setattr(server, "make_stream_renderer", lambda cols: None)
+    monkeypatch.setattr(server, "render_message", lambda raw, cols: None)
+    monkeypatch.setattr(server, "_get_db", lambda: None)
+    monkeypatch.setattr(
+        "hermes_cli.dashboard_auth.mobile_notifications.schedule_task_completion_push",
+        lambda **kwargs: pushes.append(kwargs),
+    )
+
+    try:
+        response = server.handle_request(
+            {
+                "id": "mobile-turn",
+                "method": "prompt.submit",
+                "params": {
+                    "conversation_id": "conversation-42",
+                    "session_id": sid,
+                    "text": "Build the report",
+                    "turn_id": "turn-9",
+                },
+            }
+        )
+
+        assert response["result"]["status"] == "streaming"
+        assert pushes == [
+            {
+                "conversation_id": "conversation-42",
+                "turn_id": "turn-9",
+                "status": "completed",
+                "result": "The requested report is ready.",
+            }
+        ]
+        assert server._schedule_mobile_turn_notification(
+            server._sessions[sid],
+            status="complete",
+            result="duplicate",
+        ) is False
+        assert len(pushes) == 1
+    finally:
+        server._sessions.pop(sid, None)
+
+
 def test_prompt_submit_skips_auto_title_when_interrupted(monkeypatch):
     """maybe_auto_title must NOT be called when the agent was interrupted."""
 

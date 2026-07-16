@@ -7,6 +7,8 @@ clients never replicate the session or configuration database locally.
 from __future__ import annotations
 
 import base64
+import hmac
+import os
 import re
 import secrets
 import threading
@@ -17,13 +19,21 @@ from pydantic import BaseModel
 
 from hermes_cli.dashboard_auth import (
     InvalidCredentialsError,
-    RefreshExpiredError,
     get_provider,
     register_provider,
 )
 from hermes_cli.dashboard_auth.audit import AuditEvent, audit_log
+from hermes_cli.dashboard_auth.mobile_device_store import (
+    MobileDeviceInfo,
+    MobileDeviceStore,
+    MobileTokenPair,
+    OwnerMobileTokenProvider,
+)
 from hermes_cli.dashboard_auth.routes import _client_ip, _password_rate_limited
-from hermes_cli.dashboard_auth.token_auth import register_optional_token_prefix
+from hermes_cli.dashboard_auth.token_auth import (
+    extract_bearer_token,
+    register_optional_token_prefix,
+)
 from plugins.dashboard_auth.basic import (
     BasicAuthProvider,
     _DEFAULT_TTL_SECONDS,
@@ -39,18 +49,55 @@ _REGISTRATION_LOCK = threading.Lock()
 _USERNAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]{2,63}$")
 
 
+class MobileDeviceBody(BaseModel):
+    id: str = ""
+    name: str = ""
+    model: str = ""
+    os_version: str = ""
+    app_version: str = ""
+
+
 class MobileRegisterBody(BaseModel):
     username: str
     password: str
+    setup_token: str = ""
+    device: MobileDeviceBody | None = None
 
 
 class MobileLoginBody(BaseModel):
     username: str
     password: str
+    device: MobileDeviceBody | None = None
 
 
 class MobileRefreshBody(BaseModel):
     refresh_token: str
+
+
+class MobileLogoutBody(BaseModel):
+    refresh_token: str = ""
+
+
+class MobileApnsBody(BaseModel):
+    token: str
+    environment: str
+    bundle_id: str
+
+
+def _store() -> MobileDeviceStore:
+    return MobileDeviceStore()
+
+
+def _device_info(body: MobileDeviceBody | None) -> MobileDeviceInfo:
+    if body is None:
+        return MobileDeviceInfo()
+    return MobileDeviceInfo(
+        id=body.id,
+        name=body.name,
+        model=body.model,
+        os_version=body.os_version,
+        app_version=body.app_version,
+    )
 
 
 def _configured_credentials() -> tuple[str, str, str]:
@@ -74,6 +121,16 @@ def owner_account_configured() -> bool:
 def owner_registration_open() -> bool:
     username, password_hash, plaintext = _configured_credentials()
     return not any((username, password_hash, plaintext))
+
+
+def owner_setup_token_required() -> bool:
+    return bool(os.environ.get("HERMES_OWNER_SETUP_TOKEN", "").strip())
+
+
+def _validate_owner_setup_token(value: str) -> None:
+    expected = os.environ.get("HERMES_OWNER_SETUP_TOKEN", "").strip()
+    if expected and not hmac.compare_digest(value.strip(), expected):
+        raise HTTPException(status_code=403, detail="Invalid owner setup token")
 
 
 def _validate_registration(username: str, password: str) -> tuple[str, str]:
@@ -122,12 +179,31 @@ def _build_provider_from_config() -> BasicAuthProvider | None:
     )
 
 
+def ensure_mobile_token_provider() -> OwnerMobileTokenProvider:
+    existing = get_provider(OwnerMobileTokenProvider.name)
+    if existing is not None:
+        if not isinstance(existing, OwnerMobileTokenProvider):
+            raise RuntimeError("owner-mobile auth provider name is already in use")
+        register_optional_token_prefix("/api")
+        return existing
+    provider = OwnerMobileTokenProvider()
+    try:
+        register_provider(provider)
+    except ValueError:
+        existing = get_provider(OwnerMobileTokenProvider.name)
+        if not isinstance(existing, OwnerMobileTokenProvider):
+            raise RuntimeError("owner-mobile auth provider registration failed")
+        provider = existing
+    register_optional_token_prefix("/api")
+    return provider
+
+
 def ensure_owner_provider() -> BasicAuthProvider | None:
+    ensure_mobile_token_provider()
     existing = get_provider("basic")
     if existing is not None:
         if not isinstance(existing, BasicAuthProvider):
             return None
-        register_optional_token_prefix("/api")
         return existing
     provider = _build_provider_from_config()
     if provider is None:
@@ -137,19 +213,21 @@ def ensure_owner_provider() -> BasicAuthProvider | None:
     except ValueError:
         existing = get_provider("basic")
         return existing if isinstance(existing, BasicAuthProvider) else None
-    register_optional_token_prefix("/api")
     return provider
 
 
-def _token_response(session) -> dict[str, Any]:
+def _token_response(tokens: MobileTokenPair) -> dict[str, Any]:
     return {
-        "access_token": session.access_token,
-        "refresh_token": session.refresh_token,
+        "access_token": tokens.access_token,
+        "refresh_token": tokens.refresh_token,
         "token_type": "Bearer",
-        "expires_at": session.expires_at,
+        "expires_at": tokens.session.access_expires_at,
+        "refresh_expires_at": tokens.session.refresh_expires_at,
+        "session_id": tokens.session.session_id,
+        "device_id": tokens.session.device_id,
         "account": {
-            "username": session.user_id,
-            "display_name": session.display_name,
+            "username": tokens.session.user_id,
+            "display_name": tokens.session.user_id,
         },
     }
 
@@ -159,6 +237,7 @@ def mobile_registration_status() -> dict[str, bool]:
     return {
         "registration_open": owner_registration_open(),
         "account_configured": owner_account_configured(),
+        "setup_token_required": owner_setup_token_required(),
     }
 
 
@@ -172,6 +251,7 @@ def mobile_register(request: Request, body: MobileRegisterBody):
     with _REGISTRATION_LOCK:
         if not owner_registration_open():
             raise HTTPException(status_code=409, detail="Owner account already exists")
+        _validate_owner_setup_token(body.setup_token)
 
         from hermes_cli.config import load_config, save_config
 
@@ -192,14 +272,18 @@ def mobile_register(request: Request, body: MobileRegisterBody):
         if provider is None:
             raise HTTPException(status_code=500, detail="Owner account unavailable")
 
-    session = provider.complete_password_login(username=username, password=password)
+    provider.complete_password_login(username=username, password=password)
+    tokens = _store().create_session(
+        user_id=username,
+        device=_device_info(body.device),
+    )
     audit_log(
         AuditEvent.LOGIN_SUCCESS,
         provider=provider.name,
-        user_id=session.user_id,
+        user_id=username,
         ip=ip,
     )
-    return _token_response(session)
+    return _token_response(tokens)
 
 
 @router.post("/auth/mobile/token")
@@ -229,7 +313,12 @@ def mobile_login(request: Request, body: MobileLoginBody):
         user_id=session.user_id,
         ip=ip,
     )
-    return _token_response(session)
+    return _token_response(
+        _store().create_session(
+            user_id=session.user_id,
+            device=_device_info(body.device),
+        )
+    )
 
 
 @router.post("/auth/mobile/refresh")
@@ -237,18 +326,82 @@ def mobile_refresh(request: Request, body: MobileRefreshBody):
     ip = _client_ip(request)
     if _password_rate_limited(ip):
         raise HTTPException(status_code=429, detail="Too many attempts")
-    provider = ensure_owner_provider()
-    if provider is None:
+    if ensure_owner_provider() is None:
         raise HTTPException(status_code=409, detail="Owner account is not configured")
-    try:
-        session = provider.refresh_session(refresh_token=body.refresh_token)
-    except RefreshExpiredError:
+    tokens = _store().rotate_refresh(body.refresh_token)
+    if tokens is None:
         raise HTTPException(status_code=401, detail="Invalid refresh token")
-    return _token_response(session)
+    return _token_response(tokens)
 
 
 @router.post("/auth/mobile/logout")
-def mobile_logout() -> dict[str, bool]:
-    # BasicAuthProvider tokens are stateless. The native client removes both
-    # tokens from Keychain; their bounded server-side expiry remains unchanged.
+def mobile_logout(request: Request, body: MobileLogoutBody) -> dict[str, bool]:
+    revoked = _store().revoke_session(
+        access_token=extract_bearer_token(request),
+        refresh_token=body.refresh_token.strip(),
+        reason="logout",
+    )
+    return {"ok": True, "revoked": revoked}
+
+
+def _current_mobile_session(request: Request):
+    token = extract_bearer_token(request)
+    return _store().verify_access(token, touch=False) if token else None
+
+
+@router.get("/api/mobile/v1/devices")
+def mobile_devices(request: Request) -> dict[str, Any]:
+    current = _current_mobile_session(request)
+    return {
+        "devices": _store().list_devices(
+            current_device_id=current.device_id if current else "",
+        )
+    }
+
+
+@router.delete("/api/mobile/v1/devices/{device_id}")
+def revoke_mobile_device(device_id: str) -> dict[str, bool]:
+    if not _store().revoke_device(device_id, reason="owner_revoked_device"):
+        raise HTTPException(status_code=404, detail="Device not found")
     return {"ok": True}
+
+
+@router.put("/api/mobile/v1/devices/{device_id}/apns")
+def register_mobile_apns(
+    request: Request,
+    device_id: str,
+    body: MobileApnsBody,
+) -> dict[str, Any]:
+    current = _current_mobile_session(request)
+    if current is None or current.device_id != device_id:
+        raise HTTPException(status_code=403, detail="APNs registration must use the current device")
+    try:
+        registration = _store().register_apns(
+            device_id=device_id,
+            token=body.token,
+            environment=body.environment,
+            bundle_id=body.bundle_id,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail="Device not found") from exc
+    return {"ok": True, "registration": registration}
+
+
+@router.delete("/api/mobile/v1/devices/{device_id}/apns")
+def unregister_mobile_apns(
+    request: Request,
+    device_id: str,
+    environment: str = "",
+    bundle_id: str = "",
+) -> dict[str, Any]:
+    current = _current_mobile_session(request)
+    if current is None or current.device_id != device_id:
+        raise HTTPException(status_code=403, detail="APNs removal must use the current device")
+    count = _store().unregister_apns(
+        device_id=device_id,
+        environment=environment,
+        bundle_id=bundle_id,
+    )
+    return {"ok": True, "removed": count}
