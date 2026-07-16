@@ -616,6 +616,56 @@ class CollaborationDashboardTests(unittest.TestCase):
         )
         self.assertEqual(conversation["messages"][0]["created_at"], 123500)
 
+    def test_adopted_official_session_keeps_more_than_two_hundred_messages(self):
+        module = load_module()
+        source = [
+            {
+                "role": "user" if index % 2 == 0 else "assistant",
+                "content": f"message-{index}",
+                "timestamp": index + 1,
+            }
+            for index in range(250)
+        ]
+
+        conversation = module.create_adopted_single_conversation(
+            "default",
+            "stored-session-long",
+            "完整历史",
+            source,
+        )
+
+        self.assertEqual(len(conversation["messages"]), 250)
+        self.assertEqual(conversation["messages"][0]["content"], "message-0")
+        self.assertEqual(conversation["messages"][-1]["content"], "message-249")
+
+    def test_deleting_adopted_conversation_removes_mapped_official_session(self):
+        module = load_module()
+        conversation = module.create_single_conversation("default", "待删除")
+        conversation["runtime_sessions"] = {
+            "default": "official-session-1",
+            "worker": "official-session-2",
+        }
+        state = {"conversations": [conversation]}
+        deleted = []
+        saved = []
+        module.load_single_state = lambda: state
+        module.save_single_state = lambda value: saved.append(value)
+        module._delete_runtime_session = (
+            lambda profile, session_id: deleted.append((profile, session_id))
+        )
+
+        response = module.delete_single_conversation(conversation["id"])
+
+        self.assertEqual(response, {"ok": True})
+        self.assertEqual(
+            deleted,
+            [
+                ("default", "official-session-1"),
+                ("worker", "official-session-2"),
+            ],
+        )
+        self.assertEqual(saved[-1]["conversations"], [])
+
     def test_single_turn_uses_official_profile_and_dashboard_source(self):
         module = load_module()
         captured = {}
@@ -1935,6 +1985,23 @@ class CollaborationDashboardTests(unittest.TestCase):
         ).read_text(encoding="utf-8")
         self.assertIn("window.sessionStorage.getItem(", chat_page)
         self.assertIn("PENDING_UNIFIED_SESSION_KEY", chat_page)
+
+
+    def test_single_conversation_rename_updates_the_persisted_record(self):
+        module = load_module()
+        conversation = module.create_single_conversation("default", "Old title")
+        state = {"conversations": [conversation]}
+        saved = []
+        module.load_single_state = lambda: state
+        module.save_single_state = lambda value: saved.append(value)
+
+        result = module.rename_single_conversation(
+            conversation["id"],
+            module.RenameSingleConversationBody(title="  New   title  "),
+        )
+
+        self.assertEqual(result["conversation"]["title"], "New title")
+        self.assertEqual(saved[-1]["conversations"][0]["title"], "New title")
 
 
 if __name__ == "__main__":

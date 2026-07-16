@@ -839,6 +839,87 @@ class TestWebServerEndpoints:
         assert all(set(slot) == {"provider", "model"} for slot in data["reference_models"])
         assert set(data["aggregator"]) == {"provider", "model"}
 
+    def test_custom_model_endpoint_persists_complete_runtime_contract(self):
+        from hermes_cli.config import load_config
+
+        response = self.client.put(
+            "/api/model/custom",
+            json={
+                "base_url": "https://model.example/v1",
+                "api_key": "private-model-key",
+                "model": "model-a",
+                "api_mode": "codex_responses",
+                "context_length": 200000,
+                "reasoning_effort": "high",
+            },
+        )
+
+        assert response.status_code == 200
+        body = response.json()
+        assert body["ok"] is True
+        assert body["api_key_configured"] is True
+        assert "private-model-key" not in json.dumps(body)
+        cfg = load_config()
+        assert cfg["model"]["provider"] == "custom"
+        assert cfg["model"]["default"] == "model-a"
+        assert cfg["model"]["base_url"] == "https://model.example/v1"
+        assert cfg["model"]["api_mode"] == "codex_responses"
+        assert cfg["model"]["context_length"] == 200000
+        assert cfg["agent"]["reasoning_effort"] == "high"
+
+    def test_custom_model_endpoint_rejects_unsupported_protocol(self):
+        response = self.client.put(
+            "/api/model/custom",
+            json={
+                "base_url": "https://model.example/v1",
+                "model": "model-a",
+                "api_mode": "unknown_protocol",
+            },
+        )
+
+        assert response.status_code == 400
+        assert response.json()["detail"] == "unsupported api_mode"
+
+    def test_custom_model_connection_test_uses_selected_protocol(self):
+        from unittest.mock import AsyncMock
+
+        response = SimpleNamespace(is_success=True, status_code=200)
+        with patch("tools.url_safety.is_safe_url", return_value=True), \
+             patch("httpx.AsyncClient.post", new=AsyncMock(return_value=response)) as post:
+            result = self.client.post(
+                "/api/model/custom/test",
+                json={
+                    "base_url": "https://model.example/v1",
+                    "api_key": "private-model-key",
+                    "model": "model-a",
+                    "api_mode": "codex_responses",
+                },
+            )
+
+        assert result.status_code == 200
+        assert result.json()["ok"] is True
+        assert post.await_args.args[0] == "https://model.example/v1/responses"
+        assert post.await_args.kwargs["json"] == {
+            "model": "model-a",
+            "input": "Reply OK",
+            "max_output_tokens": 16,
+        }
+        assert post.await_args.kwargs["headers"]["Authorization"] == "Bearer private-model-key"
+
+    def test_custom_model_connection_blocks_private_and_metadata_targets(self):
+        with patch("tools.url_safety.is_safe_url", return_value=False):
+            result = self.client.post(
+                "/api/model/custom/test",
+                json={
+                    "base_url": "http://169.254.169.254/latest",
+                    "model": "model-a",
+                    "api_mode": "chat_completions",
+                },
+            )
+
+        assert result.status_code == 400
+        assert "blocked" in result.json()["detail"]
+
     def test_put_moa_models_persists_provider_model_slots(self):
         from hermes_cli.config import load_config
 

@@ -1027,8 +1027,28 @@ class ModelAssignment(BaseModel):
     # ``hermes model`` custom flow collects. Honored only on the main slot for
     # custom/local providers.
     api_key: str = ""
+    # Explicit wire protocol for custom endpoints. Empty keeps Hermes'
+    # endpoint-based auto detection.
+    api_mode: str = ""
+    # Per-model context override. Zero restores automatic model metadata.
+    context_length: int = 0
+    # Main-agent reasoning effort. Empty preserves the current setting.
+    reasoning_effort: str = ""
     confirm_expensive_model: bool = False
     profile: Optional[str] = None
+
+
+class CustomModelConnectionTest(BaseModel):
+    base_url: str
+    api_key: str = ""
+    model: str
+    api_mode: str = "chat_completions"
+    profile: Optional[str] = None
+
+
+class CustomModelConfiguration(CustomModelConnectionTest):
+    context_length: int = 0
+    reasoning_effort: str = "medium"
 
 
 class MoaModelSlot(BaseModel):
@@ -3005,6 +3025,17 @@ async def get_system_stats():
             pass
 
     return info
+
+
+@app.get("/api/managed-nodes/status")
+async def get_managed_nodes_status():
+    """Return live, redacted health for configured private Hermes nodes."""
+    from hermes_cli.managed_nodes import fetch_managed_nodes
+
+    try:
+        return await asyncio.to_thread(fetch_managed_nodes)
+    except ValueError as exc:
+        raise HTTPException(status_code=500, detail=str(exc)) from exc
 
 
 # ---------------------------------------------------------------------------
@@ -5556,6 +5587,164 @@ def get_model_info(profile: Optional[str] = None):
         return dict(_EMPTY_MODEL_INFO)
 
 
+@app.get("/api/model/custom")
+def get_custom_model(profile: Optional[str] = None):
+    """Return the active custom-model configuration without exposing its key."""
+    with _profile_scope(profile):
+        cfg = load_config()
+    model_cfg = cfg.get("model") if isinstance(cfg, dict) else {}
+    if not isinstance(model_cfg, dict):
+        model_cfg = {}
+    agent_cfg = cfg.get("agent") if isinstance(cfg, dict) else {}
+    if not isinstance(agent_cfg, dict):
+        agent_cfg = {}
+    api_key = str(model_cfg.get("api_key") or model_cfg.get("api") or "")
+    return {
+        "provider": str(model_cfg.get("provider") or ""),
+        "model": str(model_cfg.get("default") or model_cfg.get("name") or ""),
+        "base_url": str(model_cfg.get("base_url") or ""),
+        "api_mode": str(model_cfg.get("api_mode") or "chat_completions"),
+        "context_length": int(model_cfg.get("context_length") or 0),
+        "reasoning_effort": str(agent_cfg.get("reasoning_effort") or "medium"),
+        "api_key_configured": bool(api_key),
+        "api_key_preview": (
+            f"{api_key[:3]}{'*' * min(12, max(4, len(api_key) - 6))}{api_key[-3:]}"
+            if len(api_key) > 8
+            else ("********" if api_key else "")
+        ),
+    }
+
+
+@app.put("/api/model/custom")
+async def set_custom_model(
+    body: CustomModelConfiguration,
+    profile: Optional[str] = None,
+):
+    """Persist one OpenAI/Responses/Anthropic-compatible custom endpoint."""
+    if not body.base_url.strip() or not body.model.strip():
+        raise HTTPException(status_code=400, detail="base_url and model are required")
+
+    def _apply():
+        with _profile_scope(body.profile or profile):
+            return _apply_model_assignment_sync(
+                "main",
+                "custom",
+                body.model.strip(),
+                "",
+                body.base_url.strip(),
+                body.api_key.strip(),
+                body.api_mode.strip().lower(),
+                body.context_length,
+                body.reasoning_effort.strip().lower(),
+            )
+
+    await asyncio.to_thread(_apply)
+    return {"ok": True, **get_custom_model(body.profile or profile)}
+
+
+@app.post("/api/model/custom/test")
+async def test_custom_model_connection(
+    body: CustomModelConnectionTest,
+    profile: Optional[str] = None,
+):
+    """Exercise the selected wire protocol with a bounded one-token request."""
+    import httpx
+    from urllib.parse import urlsplit
+
+    base_url = body.base_url.strip().rstrip("/")
+    model = body.model.strip()
+    api_mode = body.api_mode.strip().lower() or "chat_completions"
+    if not base_url or not model:
+        raise HTTPException(status_code=400, detail="base_url and model are required")
+    parsed = urlsplit(base_url)
+    if parsed.scheme not in {"http", "https"} or not parsed.hostname or parsed.username:
+        raise HTTPException(status_code=400, detail="base_url must be an HTTP(S) URL without userinfo")
+    if api_mode not in {"chat_completions", "codex_responses", "anthropic_messages"}:
+        raise HTTPException(status_code=400, detail="unsupported api_mode")
+
+    api_key = body.api_key.strip()
+    if not api_key:
+        with _profile_scope(body.profile or profile):
+            cfg = load_config()
+        configured = cfg.get("model") if isinstance(cfg, dict) else {}
+        if isinstance(configured, dict):
+            api_key = str(configured.get("api_key") or configured.get("api") or "").strip()
+
+    headers = {"Accept": "application/json", "Content-Type": "application/json"}
+    if api_mode == "anthropic_messages":
+        if api_key:
+            headers["x-api-key"] = api_key
+        headers["anthropic-version"] = "2023-06-01"
+        endpoint = f"{base_url}/messages"
+        payload = {
+            "model": model,
+            "messages": [{"role": "user", "content": "Reply OK"}],
+            "max_tokens": 1,
+        }
+    elif api_mode == "codex_responses":
+        if api_key:
+            headers["Authorization"] = f"Bearer {api_key}"
+        endpoint = f"{base_url}/responses"
+        payload = {"model": model, "input": "Reply OK", "max_output_tokens": 16}
+    else:
+        if api_key:
+            headers["Authorization"] = f"Bearer {api_key}"
+        endpoint = f"{base_url}/chat/completions"
+        payload = {
+            "model": model,
+            "messages": [{"role": "user", "content": "Reply OK"}],
+            "max_tokens": 1,
+            "stream": False,
+        }
+
+    from tools.url_safety import is_safe_url
+    if not is_safe_url(endpoint):
+        raise HTTPException(
+            status_code=400,
+            detail="base_url resolves to a blocked private or metadata address",
+        )
+
+    started = time.perf_counter()
+    try:
+        async with httpx.AsyncClient(
+            timeout=httpx.Timeout(15.0),
+            follow_redirects=False,
+        ) as client:
+            response = await client.post(endpoint, headers=headers, json=payload)
+    except (httpx.TimeoutException, httpx.NetworkError):
+        return {
+            "ok": False,
+            "reachable": False,
+            "status": 0,
+            "latency_ms": round((time.perf_counter() - started) * 1000),
+            "message": "Endpoint is unreachable.",
+        }
+    latency_ms = round((time.perf_counter() - started) * 1000)
+    if response.is_success:
+        return {
+            "ok": True,
+            "reachable": True,
+            "status": response.status_code,
+            "latency_ms": latency_ms,
+            "message": "Connection and model protocol verified.",
+        }
+    if response.status_code in {401, 403}:
+        message = "The endpoint rejected the API key."
+    elif response.status_code == 404:
+        message = "The selected protocol path is not available at this Base URL."
+    elif response.status_code == 429:
+        message = "The endpoint is reachable but currently rate limited."
+    else:
+        message = f"The endpoint rejected the test request with HTTP {response.status_code}."
+    return {
+        "ok": False,
+        "reachable": True,
+        "status": response.status_code,
+        "latency_ms": latency_ms,
+        "message": message,
+    }
+
+
 # ---------------------------------------------------------------------------
 # Model assignment — pick provider+model for main slot or auxiliary slots.
 # Mirrors the model.options JSON-RPC from tui_gateway but uses REST so the
@@ -5854,6 +6043,8 @@ async def set_model_assignment(body: ModelAssignment, profile: Optional[str] = N
     task = (body.task or "").strip().lower()
     base_url = (body.base_url or "").strip()
     api_key = (body.api_key or "").strip()
+    api_mode = (body.api_mode or "").strip().lower()
+    reasoning_effort = (body.reasoning_effort or "").strip().lower()
 
     if scope not in {"main", "auxiliary"}:
         raise HTTPException(status_code=400, detail="scope must be 'main' or 'auxiliary'")
@@ -5890,7 +6081,15 @@ async def set_model_assignment(body: ModelAssignment, profile: Optional[str] = N
         def _apply_assignment():
             with _profile_scope(body.profile or profile):
                 return _apply_model_assignment_sync(
-                    scope, provider, model, task, base_url, api_key
+                    scope,
+                    provider,
+                    model,
+                    task,
+                    base_url,
+                    api_key,
+                    api_mode,
+                    body.context_length,
+                    reasoning_effort,
                 )
 
         return await asyncio.to_thread(_apply_assignment)
@@ -5902,7 +6101,15 @@ async def set_model_assignment(body: ModelAssignment, profile: Optional[str] = N
 
 
 def _apply_model_assignment_sync(
-    scope: str, provider: str, model: str, task: str, base_url: str, api_key: str = ""
+    scope: str,
+    provider: str,
+    model: str,
+    task: str,
+    base_url: str,
+    api_key: str = "",
+    api_mode: str = "",
+    context_length: int = 0,
+    reasoning_effort: str = "",
 ):
     """Synchronous body of POST /api/model/set.
 
@@ -5915,11 +6122,33 @@ def _apply_model_assignment_sync(
     if scope == "main":
         if not provider or not model:
             raise HTTPException(status_code=400, detail="provider and model required for main")
+        if api_mode and api_mode not in {
+            "chat_completions",
+            "codex_responses",
+            "anthropic_messages",
+        }:
+            raise HTTPException(status_code=400, detail="unsupported api_mode")
+        if context_length < 0 or context_length > 10_000_000:
+            raise HTTPException(status_code=400, detail="context_length is out of range")
+        if reasoning_effort and reasoning_effort not in {
+            "none", "minimal", "low", "medium", "high", "xhigh", "max", "ultra",
+        }:
+            raise HTTPException(status_code=400, detail="unsupported reasoning_effort")
         provider, model = _normalize_main_model_assignment(provider, model)
         model_cfg = _apply_main_model_assignment(
             cfg.get("model", {}), provider, model, base_url, api_key
         )
+        if api_mode:
+            model_cfg["api_mode"] = api_mode
+        if context_length > 0:
+            model_cfg["context_length"] = context_length
         cfg["model"] = model_cfg
+        if reasoning_effort:
+            agent_cfg = cfg.get("agent")
+            if not isinstance(agent_cfg, dict):
+                agent_cfg = {}
+            agent_cfg["reasoning_effort"] = reasoning_effort
+            cfg["agent"] = agent_cfg
 
         # When switching the main provider to Nous, mirror the CLI's
         # post-model-selection behaviour (hermes_cli/main.py

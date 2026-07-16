@@ -18,6 +18,7 @@ import mimetypes
 import os
 import queue
 import re
+import shutil
 import subprocess
 import sys
 import threading
@@ -57,7 +58,6 @@ _HOSTED_UPDATE_REVISION = 0
 _HOSTED_TERMINAL_STATUSES = {"completed", "failed", "cancelled"}
 _HOSTED_TRANSIENT_RETRIES = 1
 _HOSTED_EVENT_FLUSH_SECONDS = 0.45
-_MAX_MESSAGES = 200
 _PROMPT_HISTORY = 24
 _MAX_ATTACHMENT_BYTES = 64 * 1024 * 1024
 _MAX_CONVERSATION_TITLE_CHARS = 18
@@ -490,7 +490,7 @@ def create_adopted_single_conversation(
                 message["created_at"] = int(timestamp * 1000)
         pending_assistant.clear()
 
-    for source in messages[-_MAX_MESSAGES:]:
+    for source in messages:
         role = str(source.get("role") or "assistant").strip().lower()
         if role == "user":
             flush_assistant_turn()
@@ -595,6 +595,24 @@ def _load_runtime_messages(profile: str, session_id: str) -> list[dict[str, Any]
             return []
         resolved = db.resolve_resume_session_id(resolved)
         return db.get_messages(resolved)
+    finally:
+        db.close()
+
+
+def _delete_runtime_session(profile: str, session_id: str) -> bool:
+    from hermes_cli.profiles import get_profile_dir
+    from hermes_state import SessionDB
+
+    normalized_session_id = session_id.strip()
+    if not normalized_session_id:
+        return False
+    db_path = get_profile_dir(profile.strip() or "default") / "state.db"
+    if not db_path.exists():
+        return False
+    db = SessionDB(db_path=db_path)
+    try:
+        resolved = db.resolve_session_id(normalized_session_id)
+        return bool(resolved and db.delete_session(resolved))
     finally:
         db.close()
 
@@ -1006,7 +1024,7 @@ def reconcile_conversation_mapped_sessions(
         conversation["messages"] = sorted(
             conversation.get("messages") or [],
             key=lambda message: int(message.get("created_at") or 0),
-        )[-_MAX_MESSAGES:]
+        )
         if conversation["messages"]:
             conversation["updated_at"] = max(
                 int(message.get("created_at") or 0)
@@ -2760,8 +2778,6 @@ def _append_message(
         message["meta"] = meta
     messages = room.setdefault("messages", [])
     messages.append(message)
-    if len(messages) > _MAX_MESSAGES:
-        del messages[:-_MAX_MESSAGES]
     room["updated_at"] = message["created_at"]
     return message
 
@@ -2779,6 +2795,10 @@ class SendMessageBody(BaseModel):
 class CreateSingleConversationBody(BaseModel):
     profile: str = "default"
     title: str = "新对话"
+
+
+class RenameSingleConversationBody(BaseModel):
+    title: str
 
 
 class AdoptSingleConversationBody(BaseModel):
@@ -2963,6 +2983,23 @@ def get_single_conversation(conversation_id: str):
         result = {"conversation": conversation}
     resume_unfinished_hosted_workflows([conversation])
     return result
+
+
+@router.patch("/single/conversations/{conversation_id}")
+def rename_single_conversation(
+    conversation_id: str,
+    payload: RenameSingleConversationBody,
+):
+    title = " ".join(payload.title.split()).strip()[:120]
+    if not title:
+        raise HTTPException(status_code=400, detail="Conversation title is required")
+    with _STATE_LOCK:
+        state = load_single_state()
+        conversation = _conversation_by_id(state, conversation_id)
+        conversation["title"] = title
+        conversation["updated_at"] = int(time.time() * 1000)
+        save_single_state(state)
+        return {"conversation": conversation}
 
 
 @router.get("/single/conversations/{conversation_id}/attachments")
@@ -3244,15 +3281,18 @@ def cancel_hosted_turn(
 def delete_single_conversation(conversation_id: str):
     with _STATE_LOCK:
         state = load_single_state()
-        before = len(state.get("conversations") or [])
+        conversation = _conversation_by_id(state, conversation_id)
+        for profile, session_id in (
+            conversation.get("runtime_sessions") or {}
+        ).items():
+            _delete_runtime_session(str(profile), str(session_id))
         state["conversations"] = [
             conversation
             for conversation in state.get("conversations") or []
             if conversation.get("id") != conversation_id
         ]
-        if len(state["conversations"]) == before:
-            raise HTTPException(status_code=404, detail="单聊会话不存在")
         save_single_state(state)
+    shutil.rmtree(conversation_files_root(conversation_id), ignore_errors=True)
     return {"ok": True}
 
 
