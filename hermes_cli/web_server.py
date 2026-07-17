@@ -4257,8 +4257,9 @@ def get_profiles_sessions(
     source_filter = source or None
     exclude_list = [s for s in (exclude_sources or "").split(",") if s.strip()]
     # Over-fetch per profile so the merged+sorted window is correct for the
-    # requested page. Capped so a huge profile can't blow up the response.
-    per_profile = min(max(limit + offset, limit), 500)
+    # requested page. This must reach offset + limit: capping it at 500 made
+    # every later aggregate page empty even when profile_totals reported more.
+    per_profile = max(limit + offset, limit)
 
     merged: List[Dict[str, Any]] = []
     total = 0

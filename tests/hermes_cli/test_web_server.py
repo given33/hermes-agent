@@ -1550,6 +1550,38 @@ class TestWebServerEndpoints:
         assert row["is_default_profile"] is True
         assert isinstance(data.get("errors"), list)
 
+    def test_profiles_sessions_paginates_beyond_the_old_500_row_cutoff(self):
+        from hermes_state import SessionDB
+
+        db = SessionDB()
+        try:
+            for index in range(525):
+                db.create_session(
+                    session_id=f"aggregate-page-{index:04d}",
+                    source="cli",
+                )
+        finally:
+            db.close()
+
+        response = self.client.get(
+            "/api/profiles/sessions",
+            params={
+                "profile": "default",
+                "limit": 20,
+                "offset": 500,
+                "min_messages": 0,
+                "order": "created",
+            },
+        )
+
+        assert response.status_code == 200
+        data = response.json()
+        assert data["sessions"]
+        assert any(
+            str(item["id"]).startswith("aggregate-page-")
+            for item in data["sessions"]
+        )
+
     def test_profiles_sessions_rejects_unknown_archived_value(self):
         resp = self.client.get("/api/profiles/sessions?archived=bogus")
         assert resp.status_code == 400

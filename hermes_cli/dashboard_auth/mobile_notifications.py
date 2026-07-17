@@ -104,17 +104,20 @@ def _bounded_identifier(value: Any, fallback: str) -> str:
 
 def schedule_task_completion_push(
     *,
+    owner_id: str,
     conversation_id: str,
     turn_id: str,
     status: str,
     result: str,
 ) -> None:
     """Queue delivery on a daemon thread and return immediately."""
-    if not apns_configured():
+    normalized_owner_id = str(owner_id or "").strip()
+    if not normalized_owner_id or not apns_configured():
         return
     thread = threading.Thread(
         target=_deliver_task_completion_push,
         kwargs={
+            "owner_id": normalized_owner_id,
             "conversation_id": conversation_id,
             "turn_id": turn_id,
             "status": status,
@@ -128,6 +131,7 @@ def schedule_task_completion_push(
 
 def _deliver_task_completion_push(
     *,
+    owner_id: str,
     conversation_id: str,
     turn_id: str,
     status: str,
@@ -155,7 +159,10 @@ def _deliver_task_completion_push(
             result=result,
         )
         store = MobileDeviceStore()
-        registrations = store.list_active_apns_registrations(environment=environment)
+        registrations = store.list_active_apns_registrations(
+            user_id=owner_id,
+            environment=environment,
+        )
         if not registrations:
             return
         with httpx.Client(http2=True, timeout=10.0) as client:

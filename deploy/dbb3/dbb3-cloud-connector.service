@@ -1,0 +1,23 @@
+[Unit]
+Description=DBB3 Hermes cloud collaboration connector
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=/opt/dbb3-team
+EnvironmentFile=%h/.config/dbb3-team/cloud_connector.env
+Environment=LANG=C.UTF-8
+Environment=LC_ALL=C.UTF-8
+Environment=PYTHONUTF8=1
+ExecStart=/usr/bin/python3 /opt/dbb3-team/dbb3_cloud_connector.py --interval 2 --quiet --state-file %h/.local/state/dbb3-cloud-connector/checkpoint.json
+Restart=on-failure
+RestartSec=5
+RestartPreventExitStatus=65 78
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ReadWritePaths=%h/.hermes %h/.local/state/dbb3-cloud-connector
+
+[Install]
+WantedBy=default.target

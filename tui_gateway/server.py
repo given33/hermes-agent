@@ -5207,9 +5207,11 @@ def _set_mobile_notification_context(session: dict, params: dict) -> None:
     """
     conversation_id = str(params.get("conversation_id") or "").strip()
     turn_id = str(params.get("turn_id") or "").strip()
-    if not conversation_id or not turn_id:
+    owner_id = str(params.get("owner_id") or "").strip()
+    if not conversation_id or not turn_id or not owner_id:
         return
     session["mobile_notification_context"] = {
+        "owner_id": owner_id[:512],
         "conversation_id": conversation_id[:256],
         "turn_id": turn_id[:256],
     }
@@ -5227,7 +5229,8 @@ def _schedule_mobile_turn_notification(
         return False
     conversation_id = str(context.get("conversation_id") or "").strip()
     turn_id = str(context.get("turn_id") or "").strip()
-    if not conversation_id or not turn_id:
+    owner_id = str(context.get("owner_id") or "").strip()
+    if not conversation_id or not turn_id or not owner_id:
         return False
     if session.get("mobile_notification_sent_turn_id") == turn_id:
         return False
@@ -5243,6 +5246,7 @@ def _schedule_mobile_turn_notification(
         )
 
         schedule_task_completion_push(
+            owner_id=owner_id,
             conversation_id=conversation_id,
             turn_id=turn_id,
             status=normalized_status,

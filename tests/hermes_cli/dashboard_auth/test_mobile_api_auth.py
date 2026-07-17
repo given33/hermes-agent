@@ -41,13 +41,14 @@ def _snapshot_auth_registries():
     with token_auth._lock:
         exact_routes = set(token_auth._token_routes)
         optional_prefixes = set(token_auth._optional_token_prefixes)
-    return providers, exact_routes, optional_prefixes
+        optional_scopes = dict(token_auth._optional_token_scopes)
+    return providers, exact_routes, optional_prefixes, optional_scopes
 
 
 def _restore_auth_registries(snapshot) -> None:
     from hermes_cli.dashboard_auth import registry
 
-    providers, exact_routes, optional_prefixes = snapshot
+    providers, exact_routes, optional_prefixes, optional_scopes = snapshot
     with registry._lock:
         registry._providers.clear()
         registry._providers.update(providers)
@@ -56,6 +57,8 @@ def _restore_auth_registries(snapshot) -> None:
         token_auth._token_routes.update(exact_routes)
         token_auth._optional_token_prefixes.clear()
         token_auth._optional_token_prefixes.update(optional_prefixes)
+        token_auth._optional_token_scopes.clear()
+        token_auth._optional_token_scopes.update(optional_scopes)
 
 
 def _snapshot_app_state(application, names):
@@ -107,7 +110,7 @@ def test_auth_registry_snapshot_restore_is_exact():
             token_auth._optional_token_prefixes.add(temporary_prefix)
 
         _restore_auth_registries(pre_test)
-        restored_providers, restored_exact, restored_prefixes = (
+        restored_providers, restored_exact, restored_prefixes, restored_scopes = (
             _snapshot_auth_registries()
         )
 
@@ -117,6 +120,7 @@ def test_auth_registry_snapshot_restore_is_exact():
         assert temporary_exact not in restored_exact
         assert existing_prefix in restored_prefixes
         assert temporary_prefix not in restored_prefixes
+        assert restored_scopes == pre_test[3]
         assert _snapshot_auth_registries() == pre_test
     finally:
         _restore_auth_registries(original)
@@ -453,6 +457,19 @@ def test_optional_prefix_does_not_match_apix(mobile_app):
     )
 
     assert response.status_code != 401
+
+
+def test_optional_prefix_uses_the_longest_registered_scope():
+    token_auth.register_optional_token_prefix("/api", required_scope="dashboard:admin")
+    token_auth.register_optional_token_prefix(
+        "/api/plugins/collaboration/connector",
+        required_scope="collaboration:connector",
+    )
+
+    assert token_auth.optional_token_scope("/api/sessions") == "dashboard:admin"
+    assert token_auth.optional_token_scope(
+        "/api/plugins/collaboration/connector/runs/pull"
+    ) == "collaboration:connector"
 
 
 def test_exact_token_route_keeps_token_only_behavior(mobile_app):

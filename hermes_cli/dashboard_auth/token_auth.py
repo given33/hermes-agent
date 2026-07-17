@@ -55,6 +55,10 @@ _log = logging.getLogger(__name__)
 # that optionally accept an admin bearer and otherwise preserve cookie auth.
 _token_routes: set[str] = set()
 _optional_token_prefixes: set[str] = set()
+# Keep the legacy set public for test fixtures and plugins that only need the
+# default admin scope. A separate map lets narrowly-scoped service prefixes
+# coexist with the broad /api bearer prefix without granting extra access.
+_optional_token_scopes: dict[str, str] = {}
 _lock = threading.Lock()
 _OPTIONAL_PREFIX_SCOPE = "dashboard:admin"
 
@@ -70,11 +74,22 @@ def register_token_route(path: str) -> None:
         _token_routes.add(path)
 
 
-def register_optional_token_prefix(prefix: str) -> None:
-    """Allow an admin bearer under ``prefix`` while preserving cookie auth."""
+def register_optional_token_prefix(
+    prefix: str,
+    *,
+    required_scope: str = _OPTIONAL_PREFIX_SCOPE,
+) -> None:
+    """Allow a bearer under ``prefix`` while preserving cookie auth.
+
+    The most specific matching prefix supplies the required scope. Existing
+    callers retain the dashboard-admin default; service plugins can register a
+    narrower scope for their own route subtree.
+    """
     normalized = "/" + prefix.strip("/")
+    scope = str(required_scope or _OPTIONAL_PREFIX_SCOPE).strip()
     with _lock:
         _optional_token_prefixes.add(normalized)
+        _optional_token_scopes[normalized] = scope or _OPTIONAL_PREFIX_SCOPE
 
 
 def is_token_route(path: str) -> bool:
@@ -93,6 +108,20 @@ def is_optional_token_path(path: str) -> bool:
     )
 
 
+def optional_token_scope(path: str) -> str:
+    """Return the required scope for the longest matching optional prefix."""
+    with _lock:
+        matches = [
+            prefix
+            for prefix in _optional_token_prefixes
+            if path == prefix or path.startswith(f"{prefix}/")
+        ]
+        if not matches:
+            return _OPTIONAL_PREFIX_SCOPE
+        prefix = max(matches, key=len)
+        return _optional_token_scopes.get(prefix, _OPTIONAL_PREFIX_SCOPE)
+
+
 def clear_token_routes() -> None:
     """Test-only: drop all registered token routes."""
     with _lock:
@@ -103,6 +132,7 @@ def clear_optional_token_prefixes() -> None:
     """Test-only: drop all optional token prefixes."""
     with _lock:
         _optional_token_prefixes.clear()
+        _optional_token_scopes.clear()
 
 
 def _client_ip(request: Request) -> str:
@@ -244,7 +274,7 @@ async def token_auth_middleware(
 
     principal, unreachable = authenticate_token(
         request,
-        required_scope=None if exact_route else _OPTIONAL_PREFIX_SCOPE,
+        required_scope=None if exact_route else optional_token_scope(path),
     )
     if principal is not None:
         request.state.token_principal = principal

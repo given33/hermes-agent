@@ -185,11 +185,11 @@ def test_logout_disables_apns_delivery_for_last_active_session(tmp_path):
         environment="production",
         bundle_id="com.given33.hermesagent.nativebeta",
     )
-    assert len(store.list_active_apns_registrations()) == 1
+    assert len(store.list_active_apns_registrations(user_id="owner")) == 1
 
     assert store.revoke_session(refresh_token=tokens.refresh_token) is True
 
-    assert store.list_active_apns_registrations() == []
+    assert store.list_active_apns_registrations(user_id="owner") == []
     assert store.list_devices()[0]["apns"] == []
 
 
@@ -214,6 +214,27 @@ def test_apns_unregister_can_target_one_bundle(tmp_path):
 
     assert removed == 1
     assert store.list_devices()[0]["apns"] == []
+
+
+def test_active_apns_delivery_is_strictly_scoped_to_one_account(tmp_path):
+    store = MobileDeviceStore(tmp_path / "mobile-auth.db")
+    for owner, device_id, token in (
+        ("owner-a", "owner-a-phone", "a1" * 32),
+        ("owner-b", "owner-b-phone", "b2" * 32),
+    ):
+        store.create_session(user_id=owner, device=_device(device_id, owner))
+        store.register_apns(
+            device_id=device_id,
+            token=token,
+            environment="production",
+            bundle_id="com.given33.hermesagent.nativebeta",
+        )
+
+    owner_a = store.list_active_apns_registrations(user_id="owner-a")
+    owner_b = store.list_active_apns_registrations(user_id="owner-b")
+    assert [item["device_id"] for item in owner_a] == ["owner-a-phone"]
+    assert [item["device_id"] for item in owner_b] == ["owner-b-phone"]
+    assert store.list_active_apns_registrations(user_id="") == []
 
 
 def test_schema_initialization_is_idempotent_and_preserves_rows(tmp_path):

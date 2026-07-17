@@ -683,18 +683,23 @@ class MobileDeviceStore:
     def list_active_apns_registrations(
         self,
         *,
+        user_id: str,
         environment: str = "",
     ) -> list[dict[str, Any]]:
         """Return internal delivery records; public APIs never expose tokens."""
+        normalized_user_id = str(user_id or "").strip()
+        if not normalized_user_id:
+            return []
         now = self._clock()
         clauses = [
             "p.disabled_at IS NULL",
             "d.revoked_at IS NULL",
+            "d.user_id=?",
             "EXISTS (SELECT 1 FROM mobile_sessions AS s "
             "WHERE s.device_id=d.id AND s.revoked_at IS NULL "
             "AND s.refresh_expires_at>?)",
         ]
-        values: list[Any] = [now]
+        values: list[Any] = [normalized_user_id, now]
         if environment:
             clauses.append("p.environment=?")
             values.append(environment.strip().lower())

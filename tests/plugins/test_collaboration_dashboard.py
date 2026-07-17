@@ -1,10 +1,15 @@
 import asyncio
 import importlib.util
 import json
+import os
 import subprocess
+import threading
+import time
 import unittest
+from tempfile import TemporaryDirectory
 from pathlib import Path
 from types import SimpleNamespace
+from unittest.mock import patch
 
 
 MODULE_PATH = (
@@ -39,6 +44,117 @@ class CollaborationDashboardTests(unittest.TestCase):
         self.assertEqual(loaded["rooms"][0]["name"], "研发讨论")
         self.assertEqual(loaded["rooms"][0]["profiles"], ["default", "pc-worker"])
         self.assertEqual(loaded["rooms"][0]["messages"], [])
+
+    def test_single_store_recovers_atomic_backup_and_quarantines_corruption(self):
+        module = load_module()
+
+        with TemporaryDirectory() as tmp:
+            state_path = Path(tmp) / "single.json"
+            first = module.create_single_conversation("default", "first")
+            second = module.create_single_conversation("default", "second")
+            module.save_single_state({"conversations": [first]}, state_path)
+            module.save_single_state({"conversations": [second]}, state_path)
+
+            backup_path = state_path.with_name("single.json.bak")
+            self.assertEqual(
+                json.loads(backup_path.read_text(encoding="utf-8"))["conversations"][0]["id"],
+                first["id"],
+            )
+            state_path.write_text('{"conversations": [', encoding="utf-8")
+
+            recovered = module.load_single_state(state_path)
+            quarantines = list(Path(tmp).glob("single.json.corrupt.*"))
+
+            self.assertEqual(recovered["conversations"][0]["id"], first["id"])
+            self.assertEqual(
+                json.loads(state_path.read_text(encoding="utf-8"))["conversations"][0]["id"],
+                first["id"],
+            )
+            self.assertEqual(len(quarantines), 1)
+            self.assertEqual(
+                quarantines[0].read_text(encoding="utf-8"),
+                '{"conversations": [',
+            )
+
+    def test_corrupt_store_without_backup_remains_blocked_after_isolation(self):
+        module = load_module()
+
+        with TemporaryDirectory() as tmp:
+            state_path = Path(tmp) / "single.json"
+            state_path.write_text('{"conversations": "not-a-list"}', encoding="utf-8")
+
+            with self.assertRaises(module.StateStoreError):
+                module.load_single_state(state_path)
+            quarantines = list(Path(tmp).glob("single.json.corrupt.*"))
+            self.assertEqual(len(quarantines), 1)
+            self.assertFalse(state_path.exists())
+
+            with self.assertRaises(module.StateStoreError):
+                module.load_single_state(state_path)
+            with self.assertRaises(module.StateStoreError):
+                module.save_single_state({"conversations": []}, state_path)
+            self.assertFalse(state_path.exists())
+            self.assertEqual(
+                quarantines[0].read_text(encoding="utf-8"),
+                '{"conversations": "not-a-list"}',
+            )
+
+    def test_room_store_read_error_recovers_backup_without_returning_empty(self):
+        module = load_module()
+
+        with TemporaryDirectory() as tmp:
+            state_path = Path(tmp) / "rooms.json"
+            first = module.create_room_record("first", ["default"])
+            second = module.create_room_record("second", ["default"])
+            module.save_state({"rooms": [first]}, state_path)
+            module.save_state({"rooms": [second]}, state_path)
+            original_reader = module._read_state_document
+
+            def fail_primary_once(target, collection_key):
+                if target == state_path:
+                    raise OSError("simulated primary read failure")
+                return original_reader(target, collection_key)
+
+            with patch.object(module, "_read_state_document", fail_primary_once):
+                recovered = module.load_state(state_path)
+
+            self.assertEqual(recovered["rooms"][0]["id"], first["id"])
+            self.assertEqual(len(list(Path(tmp).glob("rooms.json.corrupt.*"))), 1)
+            self.assertEqual(
+                json.loads(state_path.read_text(encoding="utf-8"))["rooms"][0]["id"],
+                first["id"],
+            )
+
+    def test_atomic_primary_replace_failure_keeps_previous_store_and_backup(self):
+        module = load_module()
+
+        with TemporaryDirectory() as tmp:
+            state_path = Path(tmp) / "single.json"
+            first = module.create_single_conversation("default", "first")
+            second = module.create_single_conversation("default", "second")
+            module.save_single_state({"conversations": [first]}, state_path)
+            original_replace = module.os.replace
+
+            def fail_primary_replace(source, destination):
+                if Path(destination) == state_path:
+                    raise OSError("simulated atomic replace failure")
+                return original_replace(source, destination)
+
+            with patch.object(module.os, "replace", fail_primary_replace):
+                with self.assertRaises(OSError):
+                    module.save_single_state({"conversations": [second]}, state_path)
+
+            self.assertEqual(
+                module.load_single_state(state_path)["conversations"][0]["id"],
+                first["id"],
+            )
+            self.assertEqual(
+                json.loads(
+                    state_path.with_name("single.json.bak").read_text(encoding="utf-8")
+                )["conversations"][0]["id"],
+                first["id"],
+            )
+            self.assertEqual(list(Path(tmp).glob(".*.tmp")), [])
 
     def test_profile_turn_uses_argument_array_without_shell(self):
         module = load_module()
@@ -720,6 +836,110 @@ class CollaborationDashboardTests(unittest.TestCase):
         self.assertIn("pc-worker", work["profiles"])
         self.assertIn("reviewer", work["profiles"])
 
+    def test_worker_target_constraints_honor_only_and_negative_wording(self):
+        module = load_module()
+
+        pc_requests = (
+            "On the local Windows WSL PC only. Do not run this worker step on DBB3.",
+            "只在 WSL 本地电脑执行，不要在 DBB3 运行。",
+            "请在 PC 完成，别在网关执行。",
+        )
+        for request in pc_requests:
+            routed = module._rule_based_user_intent(
+                f"Implement, test, and deploy this multi-step task. {request}"
+            )
+            self.assertEqual(
+                routed["profiles"],
+                ["default", "pc-worker", "reviewer"],
+                request,
+            )
+            self.assertEqual(routed["targets"], ["pc"], request)
+            self.assertIn("dbb3", routed["target_constraints"]["excluded"])
+
+        dbb3_requests = (
+            "Run this deployment on DBB3 only, not on the local PC.",
+            "仅在 DBB3 执行，不在本地电脑运行。",
+            "只用网关处理，别在 WSL 执行。",
+        )
+        for request in dbb3_requests:
+            routed = module._rule_based_user_intent(
+                f"Implement, test, and deploy this multi-step task. {request}"
+            )
+            self.assertEqual(
+                routed["profiles"],
+                ["default", "dbb3-worker", "reviewer"],
+                request,
+            )
+            self.assertEqual(routed["targets"], ["dbb3"], request)
+            self.assertIn("pc", routed["target_constraints"]["excluded"])
+
+        for request in (
+            "Do not run on DBB3 or the local PC.",
+            "不要在 DBB3 执行，也不要在本地电脑或 WSL 执行。",
+        ):
+            workers, constraints = module._constrained_worker_profiles(request)
+            self.assertEqual(workers, [], request)
+            self.assertEqual(set(constraints["excluded"]), {"dbb3", "pc"})
+            with self.assertRaises(module.HTTPException) as raised:
+                module._hosted_route_parameters(
+                    route_metadata={"mode": "work"},
+                    content=request,
+                    requested_mode="work",
+                )
+            self.assertEqual(raised.exception.status_code, 422)
+
+    def test_explicit_worker_constraint_overrides_model_profiles(self):
+        module = load_module()
+
+        pc_only = module.classify_user_intent(
+            "On the local Windows WSL PC only. Do not run this worker step on DBB3.",
+            model_classifier=lambda _text: {
+                "mode": "work",
+                "confidence": 0.99,
+                "profiles": ["dbb3-worker"],
+                "targets": ["dbb3"],
+                "artifact": {"decision": "none"},
+            },
+        )
+        self.assertEqual(pc_only["profiles"], ["default", "pc-worker", "reviewer"])
+        self.assertEqual(pc_only["targets"], ["pc"])
+
+        dbb3_only = module.classify_user_intent(
+            "仅在 DBB3 完成部署，不要在本地电脑或 WSL 执行。",
+            model_classifier=lambda _text: {
+                "mode": "work",
+                "confidence": 0.99,
+                "profiles": ["pc-worker"],
+                "targets": ["pc"],
+                "artifact": {"decision": "none"},
+            },
+        )
+        self.assertEqual(
+            dbb3_only["profiles"],
+            ["default", "dbb3-worker", "reviewer"],
+        )
+        self.assertEqual(dbb3_only["targets"], ["dbb3"])
+
+    def test_hosted_route_reapplies_worker_target_constraint(self):
+        module = load_module()
+
+        route, mode, profiles, artifact_required = module._hosted_route_parameters(
+            route_metadata={
+                "mode": "work",
+                "profiles": ["default", "dbb3-worker", "reviewer"],
+                "targets": ["dbb3"],
+            },
+            content="Only execute on the local PC; do not run on DBB3.",
+            requested_mode="work",
+            requested_profiles=["default", "dbb3-worker", "reviewer"],
+        )
+
+        self.assertEqual(mode, "work")
+        self.assertEqual(profiles, ["default", "pc-worker", "reviewer"])
+        self.assertEqual(route["profiles"], profiles)
+        self.assertEqual(route["targets"], ["pc"])
+        self.assertFalse(artifact_required)
+
     def test_artifact_delivery_requires_an_explicit_file_deliverable(self):
         module = load_module()
 
@@ -728,6 +948,7 @@ class CollaborationDashboardTests(unittest.TestCase):
             "把分析结果导出成 PDF 给我下载",
             "生成一份 Excel 表格和 Word 文档",
             "请压缩成 zip 文件发给我",
+            "Create and deliver a UTF-8 text file named result.txt",
         ):
             self.assertTrue(module.requires_artifact_delivery(request), request)
 
@@ -737,6 +958,9 @@ class CollaborationDashboardTests(unittest.TestCase):
             "修改代码后汇报结果",
             "搜索网页并总结重点",
             "分析我上传的 PDF，只在会话里告诉我结论",
+            "Inspect the uploaded file and summarize it in chat",
+            "Do not create, upload, or deliver a file; report only in chat.",
+            "不要创建、上传或交付文件，只在会话中汇报。",
         ):
             self.assertFalse(module.requires_artifact_delivery(request), request)
 
@@ -835,9 +1059,11 @@ class CollaborationDashboardTests(unittest.TestCase):
         self.assertTrue(manifest["tab"]["hidden"])
         self.assertEqual(manifest["api"], "plugin_api.py")
         self.assertIn("chat:top", manifest["slots"])
-        self.assertEqual(manifest["version"], "2.1.36")
-        self.assertEqual(manifest["entry"], "dist/index.js?v=2.1.36")
-        self.assertEqual(manifest["css"], "dist/style.css?v=2.1.36")
+        version = manifest["version"]
+        self.assertEqual(len(version.split(".")), 3)
+        self.assertTrue(all(part.isdigit() for part in version.split(".")))
+        self.assertEqual(manifest["entry"], f"dist/index.js?v={version}")
+        self.assertEqual(manifest["css"], f"dist/style.css?v={version}")
 
     def test_dbb3_release_installer_uses_private_snapshot_and_health_files(self):
         installer = (
@@ -2002,6 +2228,464 @@ class CollaborationDashboardTests(unittest.TestCase):
 
         self.assertEqual(result["conversation"]["title"], "New title")
         self.assertEqual(saved[-1]["conversations"][0]["title"], "New title")
+
+    def test_hosted_chat_uses_only_default_hermes_without_kanban(self):
+        module = load_module()
+        conversation = module.create_single_conversation("default")
+        conversation["owner_id"] = "owner-a"
+        state = {"conversations": [conversation]}
+        module.load_single_state = lambda: state
+        module.save_single_state = lambda _state: None
+        module._schedule_mobile_completion_notification = lambda *_args: None
+        module.create_hosted_turn_record(
+            conversation,
+            turn_id="turn-chat-hosted",
+            content="你好",
+            title="你好",
+            profiles=["default"],
+            artifact_required=False,
+            attachment_ids=["file_report"],
+            attachment_context="客户端伪造路径：/tmp/not-authoritative.pdf",
+            mode="chat",
+            route_metadata={"mode": "chat", "confidence": 0.98},
+        )
+        persisted_attachment = (
+            Path.cwd() / "account-files" / "report.pdf"
+        ).resolve()
+        module._file_library = lambda: SimpleNamespace(
+            resolve_download=lambda owner_id, file_id: (
+                {
+                    "id": file_id,
+                    "mime_type": "application/pdf",
+                    "name": "report.pdf",
+                    "owner_id": owner_id,
+                    "size": 4096,
+                    "status": "available",
+                },
+                persisted_attachment,
+            )
+        )
+        calls = []
+
+        def runner(profile, prompt, **kwargs):
+            calls.append((profile, prompt, kwargs))
+            return "你好，我在。"
+
+        module.execute_hosted_workflow(
+            conversation["id"],
+            "turn-chat-hosted",
+            runner=runner,
+            task_creator=lambda **_kwargs: self.fail("chat must not create Kanban tasks"),
+        )
+
+        run = conversation["hosted_turns"]["turn-chat-hosted"]
+        self.assertEqual([profile for profile, _prompt, _kwargs in calls], ["default"])
+        self.assertNotIn("kanban_task_id", calls[0][2])
+        self.assertIn("report.pdf", calls[0][1])
+        self.assertIn(str(persisted_attachment), calls[0][1])
+        self.assertIn("file_report", calls[0][1])
+        self.assertNotIn("/tmp/not-authoritative.pdf", calls[0][1])
+        self.assertEqual(run["mode"], "chat")
+        self.assertEqual(run["status"], "completed")
+        final = next(
+            message
+            for message in conversation["messages"]
+            if message.get("meta", {}).get("role_stage") == "chat"
+        )
+        self.assertEqual(final["role"], "assistant")
+        self.assertEqual(final["sender_role"], "hermes")
+        self.assertEqual(final["profile"], "default")
+        self.assertIn("created_at", final)
+        self.assertIn("completed_at", final)
+
+    def test_two_hosted_workers_run_concurrently_before_reviewer_and_reporter(self):
+        module = load_module()
+        conversation = module.create_single_conversation("default")
+        state = {"conversations": [conversation]}
+        module.load_single_state = lambda: state
+        module.save_single_state = lambda _state: None
+        module._schedule_mobile_completion_notification = lambda *_args: None
+        module.create_hosted_turn_record(
+            conversation,
+            turn_id="turn-dual-workers",
+            content="在 DBB3 部署，并在本地电脑验证",
+            title="部署与验证",
+            profiles=["default", "dbb3-worker", "pc-worker", "reviewer"],
+            artifact_required=False,
+            mode="work",
+            route_metadata={
+                "mode": "work",
+                "profiles": ["dbb3-worker", "pc-worker"],
+                "targets": ["dbb3", "pc"],
+            },
+        )
+        barrier = threading.Barrier(2, timeout=2)
+        worker_finished = set()
+        calls = []
+        call_lock = threading.Lock()
+
+        def runner(profile, _prompt, *, event_callback=None, kanban_task_id=None):
+            with call_lock:
+                calls.append((profile, "start", time.monotonic(), kanban_task_id))
+            if profile in {"dbb3-worker", "pc-worker"}:
+                barrier.wait()
+                event_callback(
+                    {
+                        "type": "session.info",
+                        "payload": {"model": f"model-{profile}", "provider": "test-provider"},
+                    }
+                )
+                event_callback(
+                    {
+                        "type": "tool.start",
+                        "payload": {
+                            "tool_id": f"tool-{profile}",
+                            "name": "terminal",
+                            "args": {"command": "hostname"},
+                            "started_at": 1000,
+                        },
+                    }
+                )
+                time.sleep(0.05)
+                event_callback(
+                    {
+                        "type": "tool.complete",
+                        "payload": {
+                            "tool_id": f"tool-{profile}",
+                            "name": "terminal",
+                            "result_text": "ok",
+                            "duration_s": 0.05,
+                        },
+                    }
+                )
+                with call_lock:
+                    worker_finished.add(profile)
+                return f"{profile} 完成"
+            if profile == "reviewer":
+                self.assertEqual(worker_finished, {"dbb3-worker", "pc-worker"})
+                return "全部执行结果审阅通过"
+            self.assertEqual(worker_finished, {"dbb3-worker", "pc-worker"})
+            return "最终汇报完成"
+
+        module.execute_hosted_workflow(
+            conversation["id"],
+            "turn-dual-workers",
+            runner=runner,
+            task_creator=lambda **_kwargs: {
+                "task_id": "root-dual",
+                "child_ids": ["child-dbb3", "child-pc", "child-review"],
+                "fanout": True,
+            },
+        )
+
+        run = conversation["hosted_turns"]["turn-dual-workers"]
+        self.assertEqual(run["status"], "completed")
+        self.assertEqual(set(run["worker_results"]), {"dbb3-worker", "pc-worker"})
+        self.assertTrue(all(value == "completed" for value in run["worker_statuses"].values()))
+        start_profiles = [profile for profile, phase, _at, _scope in calls if phase == "start"]
+        self.assertEqual(set(start_profiles[:2]), {"dbb3-worker", "pc-worker"})
+        self.assertEqual(start_profiles[2:], ["reviewer", "default"])
+
+        worker_messages = [
+            message
+            for message in conversation["messages"]
+            if message.get("sender_role") == "worker"
+        ]
+        self.assertEqual(
+            {message["profile"] for message in worker_messages},
+            {"dbb3-worker", "pc-worker"},
+        )
+        self.assertGreaterEqual(len(worker_messages), 4)
+        self.assertEqual(
+            len({message["meta"]["message_key"] for message in worker_messages}),
+            len(worker_messages),
+        )
+        final_workers = [
+            message
+            for message in worker_messages
+            if message.get("meta", {}).get("phase") == "handoff"
+        ]
+        self.assertEqual(len(final_workers), 2)
+        for message in final_workers:
+            self.assertEqual(message["role"], "assistant")
+            self.assertEqual(message["handoff_to"], ["reviewer"])
+            self.assertEqual(message["activity_count"], 1)
+            self.assertEqual(message["activities"][0]["tool_name"], "terminal")
+            self.assertEqual(message["activities"][0]["duration_ms"], 50)
+            self.assertTrue(message["model"].startswith("model-"))
+            self.assertEqual(message["provider"], "test-provider")
+        self.assertEqual(
+            sum(bool(message.get("meta", {}).get("final_report")) for message in conversation["messages"]),
+            1,
+        )
+
+    def test_reviewer_rework_runs_workers_again_before_final_report(self):
+        module = load_module()
+        conversation = module.create_single_conversation("default")
+        state = {"conversations": [conversation]}
+        module.load_single_state = lambda: state
+        module.save_single_state = lambda _state: None
+        module._schedule_mobile_completion_notification = lambda *_args: None
+        module.create_hosted_turn_record(
+            conversation,
+            turn_id="turn-review-rework",
+            content="修复并验证部署",
+            title="修复部署",
+            profiles=["default", "dbb3-worker", "reviewer"],
+            artifact_required=False,
+            mode="work",
+            route_metadata={"mode": "work", "targets": ["dbb3"]},
+        )
+        calls = []
+        worker_attempt = 0
+        reviewer_attempt = 0
+
+        def runner(profile, prompt, **_kwargs):
+            nonlocal worker_attempt, reviewer_attempt
+            calls.append(profile)
+            if profile == "dbb3-worker":
+                worker_attempt += 1
+                if worker_attempt == 2:
+                    self.assertIn("审阅者退回意见", prompt)
+                return f"执行结果 {worker_attempt}"
+            if profile == "reviewer":
+                reviewer_attempt += 1
+                if reviewer_attempt == 1:
+                    return "证据不足，需要返工。\nHERMES_REVIEW: REWORK"
+                self.assertIn("返工后的执行者提交", prompt)
+                return "证据已补齐，审阅通过。\nHERMES_REVIEW: PASS"
+            self.assertEqual(reviewer_attempt, 2)
+            return "最终汇报"
+
+        module.execute_hosted_workflow(
+            conversation["id"],
+            "turn-review-rework",
+            runner=runner,
+            task_creator=lambda **_kwargs: {
+                "task_id": "root-rework",
+                "child_ids": ["child-worker", "child-review"],
+                "fanout": True,
+            },
+        )
+
+        run = conversation["hosted_turns"]["turn-review-rework"]
+        self.assertEqual(
+            calls,
+            ["dbb3-worker", "reviewer", "dbb3-worker", "reviewer", "default"],
+        )
+        self.assertEqual(run["rework_round"], 1)
+        self.assertEqual(run["status"], "completed")
+        self.assertIn("HERMES_REVIEW: PASS", run["reviewer_result"])
+        rework_request = next(
+            message
+            for message in conversation["messages"]
+            if message.get("meta", {}).get("role_stage")
+            == "reviewer:rework-request:1"
+        )
+        self.assertEqual(rework_request["handoff_to"], ["dbb3-worker"])
+        self.assertTrue(
+            any(
+                message.get("meta", {}).get("role_stage")
+                == "worker:dbb3-worker:rework:1"
+                for message in conversation["messages"]
+            )
+        )
+
+    def test_intent_classifier_is_model_first_and_adjudicates_low_confidence(self):
+        module = load_module()
+        calls = []
+        answers = [
+            {"mode": "chat", "confidence": 0.4, "reason": "uncertain"},
+            {
+                "mode": "work",
+                "confidence": 0.92,
+                "reason": "requires execution",
+                "profiles": ["pc-worker"],
+                "targets": ["pc"],
+                "artifact": {"decision": "none", "types": [], "reason": "repo edit"},
+            },
+        ]
+
+        routed = module.classify_user_intent(
+            "你好",
+            model_classifier=lambda text: calls.append(text) or answers.pop(0),
+        )
+
+        self.assertEqual(calls, ["你好", "你好"])
+        self.assertEqual(routed["mode"], "work")
+        self.assertEqual(routed["source"], "model")
+        self.assertEqual(routed["profiles"], ["default", "pc-worker", "reviewer"])
+        self.assertFalse(routed["artifact_required"])
+
+    def test_hosted_turn_record_persists_route_contract(self):
+        module = load_module()
+        conversation = module.create_single_conversation("default")
+        route_metadata = {
+            "mode": "work",
+            "reason": "needs both targets",
+            "confidence": 0.94,
+            "source": "model",
+            "profiles": ["dbb3-worker", "pc-worker"],
+            "artifact": {
+                "decision": "required",
+                "types": ["ipa"],
+                "producer_profiles": ["pc-worker"],
+            },
+        }
+
+        record = module.create_hosted_turn_record(
+            conversation,
+            turn_id="turn-route-contract",
+            content="构建 IPA",
+            title="构建 IPA",
+            profiles=["default", "dbb3-worker", "pc-worker", "reviewer"],
+            artifact_required=True,
+            mode="work",
+            route_metadata=route_metadata,
+            delivery_context="Absolute output directory: C:/outputs",
+            output_dir="C:/outputs",
+        )
+
+        self.assertEqual(record["mode"], "work")
+        self.assertEqual(record["route_metadata"], route_metadata)
+        self.assertEqual(record["artifact"]["decision"], "required")
+        self.assertEqual(record["artifact_producer_profiles"], ["pc-worker"])
+        self.assertIn("C:/outputs", record["delivery_context"])
+        self.assertEqual(record["output_dir"], "C:/outputs")
+        self.assertEqual(
+            module._artifact_producer_profiles(
+                {"artifact": {"decision": "required"}},
+                ["dbb3-worker", "pc-worker"],
+                required=True,
+            ),
+            ["dbb3-worker"],
+        )
+
+    def test_hosted_kanban_decompose_persists_profile_task_assignments(self):
+        with TemporaryDirectory() as tmp, patch.dict(
+            os.environ,
+            {
+                "HERMES_HOME": tmp,
+                "HERMES_KANBAN_DB": str(Path(tmp) / "kanban.db"),
+                "HERMES_KANBAN_WORKSPACES_ROOT": str(Path(tmp) / "workspaces"),
+            },
+        ):
+            module = load_module()
+            from hermes_cli import kanban_db, kanban_decompose
+
+            def fake_decompose(task_id, *, author=None):
+                with kanban_db.connect_closing() as conn:
+                    child_ids = kanban_db.decompose_triage_task(
+                        conn,
+                        task_id,
+                        root_assignee="default",
+                        author=author,
+                        children=[
+                            {"title": "DBB3", "body": "server", "assignee": "dbb3-worker"},
+                            {"title": "PC", "body": "local", "assignee": "pc-worker"},
+                            {
+                                "title": "Review",
+                                "body": "review both",
+                                "assignee": "reviewer",
+                                "parents": [0, 1],
+                            },
+                        ],
+                    )
+                return SimpleNamespace(
+                    fanout=True,
+                    child_ids=child_ids,
+                    reason="planned",
+                )
+
+            with patch.object(kanban_decompose, "decompose_task", fake_decompose):
+                result = module.create_hosted_kanban_task(
+                    conversation_id="conversation-kanban",
+                    turn_id="turn-kanban",
+                    title="Deploy and verify",
+                    content="Do the work",
+                    profiles=["dbb3-worker", "pc-worker", "reviewer"],
+                    output_dir="C:/absolute/output",
+                )
+
+            self.assertEqual(
+                set(result["profile_task_ids"]),
+                {"dbb3-worker", "pc-worker", "reviewer"},
+            )
+            with kanban_db.connect_closing() as conn:
+                root = kanban_db.get_task(conn, result["task_id"])
+            self.assertEqual(root.session_id, "conversation-kanban")
+            self.assertIn("Required execution lanes", root.body)
+            self.assertIn("C:/absolute/output", root.body)
+
+    def test_hosted_role_keeps_natural_mid_task_milestone_as_separate_message(self):
+        module = load_module()
+        conversation = module.create_single_conversation("default")
+        state = {"conversations": [conversation]}
+        module.load_single_state = lambda: state
+        module.save_single_state = lambda _state: None
+        module._schedule_mobile_completion_notification = lambda *_args: None
+        module.create_hosted_turn_record(
+            conversation,
+            turn_id="turn-milestone",
+            content="检查并修复服务",
+            title="修复服务",
+            profiles=["default", "dbb3-worker", "reviewer"],
+            artifact_required=False,
+            mode="work",
+        )
+
+        def runner(profile, _prompt, *, event_callback=None, **_kwargs):
+            if profile == "dbb3-worker":
+                event_callback(
+                    {
+                        "type": "message.delta",
+                        "payload": {"text": "我已完成环境检查，发现两处配置问题。"},
+                    }
+                )
+                event_callback(
+                    {
+                        "type": "tool.start",
+                        "payload": {"tool_id": "fix-1", "name": "terminal"},
+                    }
+                )
+                event_callback(
+                    {
+                        "type": "tool.complete",
+                        "payload": {"tool_id": "fix-1", "name": "terminal", "result_text": "ok"},
+                    }
+                )
+                return "配置修复和验证已经完成。"
+            return "审阅通过。" if profile == "reviewer" else "最终汇报。"
+
+        module.execute_hosted_workflow(
+            conversation["id"],
+            "turn-milestone",
+            runner=runner,
+            task_creator=lambda **_kwargs: {
+                "task_id": "root-milestone",
+                "child_ids": ["worker-milestone", "review-milestone"],
+                "fanout": True,
+            },
+        )
+
+        worker_messages = [
+            message
+            for message in conversation["messages"]
+            if message.get("sender_role") == "worker"
+        ]
+        phases = [message.get("meta", {}).get("phase") for message in worker_messages]
+        self.assertIn("opening", phases)
+        self.assertIn("milestone", phases)
+        self.assertIn("handoff", phases)
+        milestone = next(
+            message
+            for message in worker_messages
+            if message.get("meta", {}).get("phase") == "milestone"
+        )
+        self.assertEqual(
+            milestone["content"],
+            "我已完成环境检查，发现两处配置问题。",
+        )
 
 
 if __name__ == "__main__":

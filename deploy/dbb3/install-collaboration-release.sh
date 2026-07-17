@@ -48,6 +48,7 @@ required_files=(
   "plugin/plugin_api.py"
   "plugin/dist/index.js"
   "plugin/dist/style.css"
+  "core/hermes_cli/cloud_file_library.py"
   "web/index.html"
 )
 required_directories=("web/assets")
@@ -100,9 +101,12 @@ python3 -c 'import json,sys; data=json.load(open(sys.argv[1])); assert data["ver
   "${release_snapshot}/plugin/manifest.json" "${version}"
 python3 -c 'import pathlib,sys; source=pathlib.Path(sys.argv[1]).read_text(encoding="utf-8"); compile(source, sys.argv[1], "exec")' \
   "${release_snapshot}/plugin/plugin_api.py"
+python3 -c 'import pathlib,sys; source=pathlib.Path(sys.argv[1]).read_text(encoding="utf-8"); compile(source, sys.argv[1], "exec")' \
+  "${release_snapshot}/core/hermes_cli/cloud_file_library.py"
 node --check "${release_snapshot}/plugin/dist/index.js"
 
 plugin_target="/usr/local/lib/hermes-agent/plugins/collaboration/dashboard"
+cloud_file_target="/usr/local/lib/hermes-agent/hermes_cli/cloud_file_library.py"
 web_target="/usr/local/lib/hermes-agent/hermes_cli/web_dist"
 stamp="$(date +%Y%m%d-%H%M%S)"
 backup="/home/hermes/.hermes/backups/collaboration-${version}-${stamp}"
@@ -110,11 +114,18 @@ backup="/home/hermes/.hermes/backups/collaboration-${version}-${stamp}"
 mkdir -p "${backup}"
 cp -a "${plugin_target}" "${backup}/dashboard"
 cp -a "${web_target}" "${backup}/web_dist"
+install -d -m 0755 "${backup}/hermes_cli"
+if [[ -f "${cloud_file_target}" ]]; then
+  cp -a "${cloud_file_target}" "${backup}/hermes_cli/cloud_file_library.py"
+fi
 
 install -m 0644 "${release_snapshot}/plugin/manifest.json" "${plugin_target}/manifest.json"
 install -m 0755 "${release_snapshot}/plugin/plugin_api.py" "${plugin_target}/plugin_api.py"
 install -m 0644 "${release_snapshot}/plugin/dist/index.js" "${plugin_target}/dist/index.js"
 install -m 0644 "${release_snapshot}/plugin/dist/style.css" "${plugin_target}/dist/style.css"
+install -m 0644 \
+  "${release_snapshot}/core/hermes_cli/cloud_file_library.py" \
+  "${cloud_file_target}"
 
 install -d -o root -g root -m 0755 "${web_target}/assets"
 cp -R --no-preserve=mode,ownership \

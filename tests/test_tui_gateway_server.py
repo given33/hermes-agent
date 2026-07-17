@@ -6395,6 +6395,7 @@ def test_prompt_submit_schedules_one_mobile_completion_push(monkeypatch):
                 "method": "prompt.submit",
                 "params": {
                     "conversation_id": "conversation-42",
+                    "owner_id": "owner-42",
                     "session_id": sid,
                     "text": "Build the report",
                     "turn_id": "turn-9",
@@ -6405,6 +6406,7 @@ def test_prompt_submit_schedules_one_mobile_completion_push(monkeypatch):
         assert response["result"]["status"] == "streaming"
         assert pushes == [
             {
+                "owner_id": "owner-42",
                 "conversation_id": "conversation-42",
                 "turn_id": "turn-9",
                 "status": "completed",
@@ -7260,7 +7262,8 @@ def test_browser_manage_connect_default_local_retries_after_launch(monkeypatch):
     monkeypatch.setattr(urllib.request, "urlopen", _opener)
     with patch.dict(sys.modules, {"tools.browser_tool": fake}):
         with patch(
-            "hermes_cli.browser_connect.try_launch_chrome_debug", return_value=True
+            "hermes_cli.browser_connect.launch_chrome_debug",
+            return_value=ChromeDebugLaunch(launched=True),
         ):
             resp = server.handle_request(
                 {"id": "1", "method": "browser.manage", "params": {"action": "connect"}}

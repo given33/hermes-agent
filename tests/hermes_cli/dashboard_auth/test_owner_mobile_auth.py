@@ -784,7 +784,9 @@ def test_http_device_revoke_is_isolated_and_apns_is_current_device_only():
             "/api/mobile/v1/devices",
             headers=tablet_headers,
         )
-        active_pushes = MobileDeviceStore().list_active_apns_registrations()
+        active_pushes = MobileDeviceStore().list_active_apns_registrations(
+            user_id="owner",
+        )
     finally:
         client.close()
         for name, value in previous.items():

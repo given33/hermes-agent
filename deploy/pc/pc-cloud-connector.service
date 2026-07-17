@@ -1,0 +1,20 @@
+[Unit]
+Description=Hermes PC cloud collaboration connector
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+EnvironmentFile=%h/.config/pc-team/cloud_connector.env
+ExecStart=/usr/bin/python3 /opt/pc-team/pc_cloud_connector.py --interval 2 --quiet
+Restart=always
+RestartSec=3
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=read-only
+ReadWritePaths=%h/.local/state/pc-cloud-connector /mnt/d/Hermes/home
+UMask=0077
+
+[Install]
+WantedBy=default.target
