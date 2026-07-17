@@ -728,6 +728,7 @@ class CloudFileLibrary:
         file_type: str = "",
         status: str = "",
         conversation_id: str = "",
+        turn_id: str = "",
         limit: int = 100,
         offset: int = 0,
     ) -> tuple[list[dict[str, Any]], int]:
@@ -780,6 +781,9 @@ class CloudFileLibrary:
         if conversation_id:
             clauses.append("conversation_id=?")
             values.append(self._clean_metadata(conversation_id))
+        if turn_id:
+            clauses.append("turn_id=?")
+            values.append(self._clean_metadata(turn_id))
         where = " AND ".join(clauses)
         limit = max(1, min(int(limit), 200))
         offset = max(0, int(offset))
@@ -873,14 +877,17 @@ class CloudFileLibrary:
         *,
         source: str,
         conversation_id: str,
+        turn_id: str = "",
         profile: str = "",
         origin_prefix: str = "",
+        strict: bool = False,
     ) -> list[dict[str, Any]]:
         root = Path(directory)
         if not root.exists():
             return []
         resolved_root = root.resolve(strict=True)
         records: list[dict[str, Any]] = []
+        errors: list[str] = []
         for candidate in sorted(root.rglob("*")):
             if (
                 candidate.is_symlink()
@@ -889,23 +896,42 @@ class CloudFileLibrary:
             ):
                 continue
             try:
+                before = candidate.stat()
                 resolved = candidate.resolve(strict=True)
                 if not resolved.is_relative_to(resolved_root):
                     continue
                 relative = resolved.relative_to(resolved_root).as_posix()
+                origin_key = f"{origin_prefix}:{relative}" if origin_prefix else relative
+                effective_turn_id = str(turn_id or "").strip()
+                if not effective_turn_id and origin_key:
+                    existing = self.get_file_by_origin(owner_id, origin_key)
+                    if existing is not None:
+                        effective_turn_id = str(existing.get("turn_id") or "").strip()
                 record = self.ingest_file(
                     owner_id,
                     resolved,
                     name=candidate.name,
                     source=source,
                     conversation_id=conversation_id,
+                    turn_id=effective_turn_id,
                     profile=profile,
-                    origin_key=f"{origin_prefix}:{relative}" if origin_prefix else relative,
+                    origin_key=origin_key,
                     allowed_roots=[resolved_root],
                     restore_deleted=False,
                 )
                 if record is not None:
                     records.append(record)
-            except (OSError, ValueError):
+                after = candidate.stat()
+                if (
+                    before.st_size != after.st_size
+                    or before.st_mtime_ns != after.st_mtime_ns
+                ):
+                    errors.append(f"{candidate}: changed during indexing")
+            except (OSError, ValueError) as exc:
+                errors.append(f"{candidate}: {exc}")
                 continue
+        if strict and errors:
+            raise OSError(
+                "Directory indexing was incomplete: " + "; ".join(errors[:8])
+            )
         return records

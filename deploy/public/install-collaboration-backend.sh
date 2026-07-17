@@ -10,6 +10,23 @@ umask 077
 die() { printf 'install-collaboration-backend: %s\n' "$*" >&2; exit 1; }
 [[ "$(id -u)" == 0 ]] || die "must run as root"
 
+install_lock="${HERMES_INSTALL_LOCK_FILE:-/run/lock/hermes-agent/collaboration-install.lock}"
+install_lock_dir="$(dirname "${install_lock}")"
+if [[ ! -d "${install_lock_dir}" ]]; then
+  install -d -o root -g root -m 0755 "${install_lock_dir}"
+fi
+[[ -d "${install_lock_dir}" && ! -L "${install_lock_dir}" ]] || die "unsafe install lock directory"
+[[ "$(stat -c '%u' "${install_lock_dir}")" == 0 ]] || die "install lock directory must be root-owned"
+lock_dir_mode="$(stat -c '%a' "${install_lock_dir}")"
+(( (8#${lock_dir_mode} & 0022) == 0 )) || die "install lock directory must not be group/world-writable"
+if [[ -e "${install_lock}" || -L "${install_lock}" ]]; then
+  [[ -f "${install_lock}" && ! -L "${install_lock}" ]] || die "unsafe install lock file"
+  [[ "$(stat -c '%u' "${install_lock}")" == 0 ]] || die "install lock file must be root-owned"
+fi
+exec 8>"${install_lock}"
+chmod 0600 "${install_lock}"
+flock -n 8 || die "another collaboration deployment is already running"
+
 version="${1:-}"
 stage="${2:-}"
 [[ "${version}" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] || die "invalid release version"
@@ -26,6 +43,7 @@ esac
 required=(
   "plugins/collaboration/dashboard/plugin_api.py"
   "plugins/collaboration/dashboard/manifest.json"
+  "plugins/collaboration/dashboard/dist/index.js"
   "hermes_cli/cloud_file_library.py"
   "hermes_cli/dashboard_auth/token_auth.py"
   "hermes_cli/dashboard_auth/mobile_device_store.py"
@@ -41,26 +59,6 @@ done
 target_root="${HERMES_AGENT_ROOT:-/opt/hermes-agent}"
 runtime_python="${HERMES_RUNTIME_PYTHON:-${target_root}/.venv/bin/python}"
 [[ -x "${runtime_python}" ]] || die "Hermes runtime Python is missing: ${runtime_python}"
-
-manifest_version="$("${runtime_python}" - "${stage_root}/plugins/collaboration/dashboard/manifest.json" <<'PY'
-import json, sys
-with open(sys.argv[1], encoding="utf-8") as handle:
-    print(json.load(handle).get("version", ""))
-PY
-)"
-[[ "${manifest_version}" == "${version}" ]] || die "manifest version ${manifest_version@Q} does not match ${version}"
-"${runtime_python}" - \
-  "${stage_root}/plugins/collaboration/dashboard/plugin_api.py" \
-  "${stage_root}/hermes_cli/cloud_file_library.py" \
-  "${stage_root}/hermes_cli/dashboard_auth/token_auth.py" \
-  "${stage_root}/hermes_cli/dashboard_auth/mobile_device_store.py" \
-  "${stage_root}/hermes_cli/dashboard_auth/mobile_notifications.py" \
-  "${stage_root}/hermes_cli/web_server.py" \
-  "${stage_root}/tui_gateway/server.py" <<'PY'
-import pathlib, sys
-for name in sys.argv[1:]:
-    compile(pathlib.Path(name).read_text(encoding="utf-8"), name, "exec")
-PY
 
 # Copy through a root-owned snapshot. Reading the admin-owned stage through a
 # lower-privileged tar process prevents a symlink swap during privileged copy.
@@ -78,6 +76,29 @@ fi
 for relative in "${required[@]}"; do
   [[ -f "${snapshot}/${relative}" && ! -L "${snapshot}/${relative}" ]] || die "unsafe snapshot ${relative}"
 done
+
+# Validate the immutable root-owned snapshot that will actually be installed.
+# Validating the admin-owned stage before this copy would leave a write window
+# in which the staged source could diverge from the checked content.
+manifest_version="$("${runtime_python}" - "${snapshot}/plugins/collaboration/dashboard/manifest.json" <<'PY'
+import json, sys
+with open(sys.argv[1], encoding="utf-8") as handle:
+    print(json.load(handle).get("version", ""))
+PY
+)"
+[[ "${manifest_version}" == "${version}" ]] || die "manifest version ${manifest_version@Q} does not match ${version}"
+"${runtime_python}" - \
+  "${snapshot}/plugins/collaboration/dashboard/plugin_api.py" \
+  "${snapshot}/hermes_cli/cloud_file_library.py" \
+  "${snapshot}/hermes_cli/dashboard_auth/token_auth.py" \
+  "${snapshot}/hermes_cli/dashboard_auth/mobile_device_store.py" \
+  "${snapshot}/hermes_cli/dashboard_auth/mobile_notifications.py" \
+  "${snapshot}/hermes_cli/web_server.py" \
+  "${snapshot}/tui_gateway/server.py" <<'PY'
+import pathlib, sys
+for name in sys.argv[1:]:
+    compile(pathlib.Path(name).read_text(encoding="utf-8"), name, "exec")
+PY
 
 service="${HERMES_AGENT_SERVICE:-hermes-agent.service}"
 service_user="${HERMES_AGENT_USER:-hermes-agent}"
@@ -105,6 +126,15 @@ if [[ -z "${token_file}" && -r "${env_file}" ]]; then
   token_file="${token_file#\'}"; token_file="${token_file%\'}"
 fi
 [[ -n "${token_file}" && -r "${token_file}" ]] || die "connector token file is not readable; health preflight refused"
+runtime_home=""
+if [[ -r "${env_file}" ]]; then
+  runtime_home="$(sed -n 's/^HERMES_HOME=//p' "${env_file}" | tail -n 1)"
+  runtime_home="${runtime_home#\"}"; runtime_home="${runtime_home%\"}"
+  runtime_home="${runtime_home#\'}"; runtime_home="${runtime_home%\'}"
+fi
+service_home="$(getent passwd "${service_user}" | cut -d: -f6)"
+runtime_home="${HERMES_HOME_DIR:-${runtime_home:-${service_home}/.hermes}}"
+state_target="${HERMES_COLLABORATION_STATE_FILE:-${runtime_home}/collaboration/single.json}"
 token="$(cat -- "${token_file}")"
 [[ -n "${token}" ]] || die "connector token file is empty"
 curl_cfg="$(mktemp /run/hermes-agent-health.XXXXXX)"
@@ -139,30 +169,37 @@ if [[ -f "${plugin_target}/plugin_api.py" ]] \
 fi
 rm -f -- "${preflight_health}"
 
-stamp="$(date +%Y%m%d-%H%M%S)"
+stamp="$(date +%Y%m%d-%H%M%S)-$$"
 backup_root="${HERMES_BACKUP_ROOT:-/var/backups/hermes-agent}"
-backup="${backup_root}/collaboration-${version}-${stamp}"
-install -d -o root -g root -m 0700 "${backup}"
+install -d -o root -g root -m 0700 "${backup_root}"
+backup="$(mktemp -d "${backup_root}/collaboration-${version}-${stamp}.XXXXXX")"
+chown root:root "${backup}"
+chmod 0700 "${backup}"
 install -d -o "${service_user}" -g "${service_group}" -m 0755 "${plugin_target}"
 install -d -o "${service_user}" -g "${service_group}" -m 0755 "${plugin_target}/dist"
 install -d -o "${service_user}" -g "${service_group}" -m 0755 "${target_root}/hermes_cli/dashboard_auth"
 install -d -o "${service_user}" -g "${service_group}" -m 0755 "${target_root}/tui_gateway"
 mkdir -p \
-  "${backup}/plugins/collaboration/dashboard" \
+  "${backup}/plugins/collaboration/dashboard/dist" \
   "${backup}/hermes_cli/dashboard_auth" \
-  "${backup}/tui_gateway"
+  "${backup}/tui_gateway" \
+  "${backup}/state"
 
 backup_one() {
   local source="$1" destination="$2"
+  local temporary="${destination}.new.$$"
+  rm -f -- "${temporary}"
   if [[ -e "${source}" || -L "${source}" ]]; then
     [[ ! -L "${source}" ]] || die "refusing to back up symlink ${source}"
-    cp -a -- "${source}" "${destination}"
+    cp -a -- "${source}" "${temporary}"
+    mv -f -- "${temporary}" "${destination}"
   else
     : >"${destination}.missing"
   fi
 }
 backup_one "${plugin_target}/plugin_api.py" "${backup}/plugins/collaboration/dashboard/plugin_api.py"
 backup_one "${plugin_target}/manifest.json" "${backup}/plugins/collaboration/dashboard/manifest.json"
+backup_one "${plugin_target}/dist/index.js" "${backup}/plugins/collaboration/dashboard/dist/index.js"
 backup_one "${core_target}" "${backup}/hermes_cli/cloud_file_library.py"
 backup_one "${token_auth_target}" "${backup}/hermes_cli/dashboard_auth/token_auth.py"
 backup_one "${mobile_device_store_target}" "${backup}/hermes_cli/dashboard_auth/mobile_device_store.py"
@@ -174,16 +211,27 @@ transaction="$(mktemp -d "${target_root}/.collaboration-install.XXXXXX")"
 installed=0
 rollback() {
   local exit_code=$?
-  [[ "${installed}" == 1 ]] && exit "${exit_code}"
-  restore_one "${backup}/plugins/collaboration/dashboard/plugin_api.py" "${plugin_target}/plugin_api.py"
-  restore_one "${backup}/plugins/collaboration/dashboard/manifest.json" "${plugin_target}/manifest.json"
-  restore_one "${backup}/hermes_cli/cloud_file_library.py" "${core_target}"
-  restore_one "${backup}/hermes_cli/dashboard_auth/token_auth.py" "${token_auth_target}"
-  restore_one "${backup}/hermes_cli/dashboard_auth/mobile_device_store.py" "${mobile_device_store_target}"
-  restore_one "${backup}/hermes_cli/dashboard_auth/mobile_notifications.py" "${mobile_notifications_target}"
-  restore_one "${backup}/hermes_cli/web_server.py" "${web_server_target}"
-  restore_one "${backup}/tui_gateway/server.py" "${tui_gateway_target}"
-  systemctl restart "${service}" >/dev/null 2>&1 || true
+  trap - EXIT INT TERM HUP
+  set +e
+  if [[ "${installed}" != 1 ]]; then
+    systemctl stop "${service}" >/dev/null 2>&1 || true
+    restore_one "${backup}/plugins/collaboration/dashboard/plugin_api.py" "${plugin_target}/plugin_api.py"
+    restore_one "${backup}/plugins/collaboration/dashboard/manifest.json" "${plugin_target}/manifest.json"
+    restore_one "${backup}/plugins/collaboration/dashboard/dist/index.js" "${plugin_target}/dist/index.js"
+    restore_one "${backup}/hermes_cli/cloud_file_library.py" "${core_target}"
+    restore_one "${backup}/hermes_cli/dashboard_auth/token_auth.py" "${token_auth_target}"
+    restore_one "${backup}/hermes_cli/dashboard_auth/mobile_device_store.py" "${mobile_device_store_target}"
+    restore_one "${backup}/hermes_cli/dashboard_auth/mobile_notifications.py" "${mobile_notifications_target}"
+    restore_one "${backup}/hermes_cli/web_server.py" "${web_server_target}"
+    restore_one "${backup}/tui_gateway/server.py" "${tui_gateway_target}"
+    restore_state "${backup}/state/single.json" "${state_target}"
+    systemctl start "${service}" >/dev/null 2>&1 || true
+  fi
+  rm -rf -- "${transaction}"
+  [[ -z "${health_file:-}" ]] || rm -f -- "${health_file}"
+  [[ -z "${connector_health_file:-}" ]] || rm -f -- "${connector_health_file}"
+  rm -f -- "${curl_cfg}"
+  cleanup_snapshot
   exit "${exit_code}"
 }
 restore_one() {
@@ -197,7 +245,28 @@ restore_one() {
     rm -f -- "${destination}"
   fi
 }
-trap rollback ERR
+restore_state() {
+  local source="$1"
+  local destination="$2"
+  local temporary="${destination}.rollback.$$"
+  install -d -o "${service_user}" -g "${service_group}" -m 0700 "$(dirname "${destination}")"
+  if [[ -f "${source}" ]]; then
+    install -o "${service_user}" -g "${service_group}" -m 0600 "${source}" "${temporary}"
+    mv -f -- "${temporary}" "${destination}"
+  elif [[ -f "${source}.missing" ]]; then
+    rm -f -- "${destination}"
+  fi
+}
+trap rollback EXIT
+trap 'exit 130' INT
+trap 'exit 143' TERM
+trap 'exit 129' HUP
+
+# Quiesce the state writer before taking the transactional state snapshot.
+# Keep the service stopped until every runtime file has been atomically placed;
+# rollback also stops it before restoring this snapshot.
+systemctl stop "${service}"
+backup_one "${state_target}" "${backup}/state/single.json"
 
 install_atomic() {
   local source="$1"
@@ -208,13 +277,14 @@ install_atomic() {
 }
 install_atomic "${snapshot}/plugins/collaboration/dashboard/plugin_api.py" "${plugin_target}/plugin_api.py"
 install_atomic "${snapshot}/plugins/collaboration/dashboard/manifest.json" "${plugin_target}/manifest.json"
+install_atomic "${snapshot}/plugins/collaboration/dashboard/dist/index.js" "${plugin_target}/dist/index.js"
 install_atomic "${snapshot}/hermes_cli/cloud_file_library.py" "${core_target}"
 install_atomic "${snapshot}/hermes_cli/dashboard_auth/token_auth.py" "${token_auth_target}"
 install_atomic "${snapshot}/hermes_cli/dashboard_auth/mobile_device_store.py" "${mobile_device_store_target}"
 install_atomic "${snapshot}/hermes_cli/dashboard_auth/mobile_notifications.py" "${mobile_notifications_target}"
 install_atomic "${snapshot}/hermes_cli/web_server.py" "${web_server_target}"
 install_atomic "${snapshot}/tui_gateway/server.py" "${tui_gateway_target}"
-systemctl restart "${service}"
+systemctl start "${service}"
 
 health_file="$(mktemp /run/hermes-agent-status.XXXXXX)"
 healthy=0

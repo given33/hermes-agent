@@ -81,6 +81,15 @@ def test_deployment_shell_scripts_have_valid_syntax():
         assert result.returncode == 0, (path, result.stderr)
 
 
+def test_transactional_installers_serialize_deployments_and_use_unique_backups():
+    public = (PUBLIC / "install-collaboration-backend.sh").read_text(encoding="utf-8")
+    connector = (DBB3 / "install-dbb3-cloud-connector-user.sh").read_text(encoding="utf-8")
+
+    assert 'flock -n 8 || die "another collaboration deployment is already running"' in public
+    assert 'mktemp -d "${backup_root}/collaboration-${version}-${stamp}.XXXXXX"' in public
+    assert 'flock -n 8 || die "another connector deployment is already running"' in connector
+
+
 def test_pc_connector_delegates_complete_runtime_contract(tmp_path):
     layout = tmp_path / "deploy"
     pc = layout / "pc"
@@ -182,6 +191,7 @@ printf '%s|%s\n' "$(basename "$0")" "$*" >>"$DEPLOY_CAPTURE"
     for relative in (
         "plugins/collaboration/dashboard/plugin_api.py",
         "plugins/collaboration/dashboard/manifest.json",
+        "plugins/collaboration/dashboard/dist/index.js",
         "hermes_cli/cloud_file_library.py",
         "hermes_cli/dashboard_auth/token_auth.py",
         "hermes_cli/dashboard_auth/mobile_device_store.py",
@@ -219,6 +229,60 @@ def test_public_installer_rolls_back_and_installs_every_runtime_file():
     )
     assert result.returncode == 0, result.stdout + "\n" + result.stderr
     assert "public installer transaction test passed" in result.stdout
+
+
+def test_public_installer_quiesces_state_during_snapshot_and_rollback():
+    installer = (PUBLIC / "install-collaboration-backend.sh").read_text(encoding="utf-8")
+    stop = installer.index('systemctl stop "${service}"', installer.index("trap rollback EXIT"))
+    state_backup = installer.index('backup_one "${state_target}"', stop)
+    first_install = installer.index("install_atomic()", state_backup)
+    start = installer.index('systemctl start "${service}"', first_install)
+
+    assert stop < state_backup < first_install < start
+    rollback = installer[installer.index("rollback() {"):installer.index("restore_one() {")]
+    assert rollback.index('systemctl stop "${service}"') < rollback.index("restore_one")
+    assert rollback.index("restore_state") < rollback.index('systemctl start "${service}"')
+
+
+def test_public_installer_uses_only_a_root_controlled_install_lock():
+    installer = (PUBLIC / "install-collaboration-backend.sh").read_text(encoding="utf-8")
+
+    assert "install lock directory must be root-owned" in installer
+    assert "install lock directory must not be group/world-writable" in installer
+    assert '[[ -f "${install_lock}" && ! -L "${install_lock}" ]]' in installer
+    assert "install lock file must be root-owned" in installer
+    assert 'chmod 0600 "${install_lock}"' in installer
+
+
+def test_public_installer_validates_the_root_owned_snapshot_it_installs():
+    installer = (PUBLIC / "install-collaboration-backend.sh").read_text(
+        encoding="utf-8"
+    )
+    snapshot_copy = installer.index('tar --no-same-owner -C "${snapshot}" -xf -')
+    snapshot_check = installer.index('[[ -f "${snapshot}/${relative}"')
+    manifest_check = installer.index(
+        '"${snapshot}/plugins/collaboration/dashboard/manifest.json"'
+    )
+    compile_check = installer.index(
+        '"${snapshot}/plugins/collaboration/dashboard/plugin_api.py"'
+    )
+    first_install = installer.index("install_atomic()")
+
+    assert snapshot_copy < snapshot_check < manifest_check < compile_check < first_install
+    validation_section = installer[snapshot_check:first_install]
+    assert '"${stage_root}/plugins/collaboration/dashboard/manifest.json"' not in validation_section
+
+
+def test_dbb3_installer_uses_only_a_root_controlled_install_lock():
+    installer = (DBB3 / "install-dbb3-cloud-connector-user.sh").read_text(
+        encoding="utf-8"
+    )
+
+    assert "install lock directory must be root-owned" in installer
+    assert "install lock directory must not be group/world-writable" in installer
+    assert '[[ -f "${install_lock}" && ! -L "${install_lock}" ]]' in installer
+    assert "install lock file must be root-owned" in installer
+    assert 'chmod 0600 "${install_lock}"' in installer
 
 
 def test_dbb3_user_installer_rolls_back_each_mutating_failure_stage():
@@ -1006,9 +1070,13 @@ def test_official_session_export_projects_reasoning_tools_model_and_timing():
         "OPENAI_API_KEY=private-openai-key",
         "DATABASE_PASSWORD='private-database-password'",
         "TOKEN: private-token-value",
+        'password="private secret password"',
+        "credential='private credential phrase'",
     ):
         redacted = connector._redact_sensitive(raw_secret)
         assert "private-" not in redacted
+        assert "private secret password" not in redacted
+        assert "private credential phrase" not in redacted
         assert "[REDACTED]" in redacted
 
 

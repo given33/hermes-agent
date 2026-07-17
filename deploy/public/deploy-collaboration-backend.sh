@@ -15,6 +15,7 @@ installer="${repo}/deploy/public/install-collaboration-backend.sh"
 [[ -f "${installer}" ]] || die "installer is missing"
 [[ -f "${repo}/plugins/collaboration/dashboard/plugin_api.py" ]] || die "plugin_api.py is missing"
 [[ -f "${repo}/plugins/collaboration/dashboard/manifest.json" ]] || die "manifest.json is missing"
+[[ -f "${repo}/plugins/collaboration/dashboard/dist/index.js" ]] || die "dist/index.js is missing"
 [[ -f "${repo}/hermes_cli/cloud_file_library.py" ]] || die "cloud_file_library.py is missing"
 [[ -f "${repo}/hermes_cli/dashboard_auth/token_auth.py" ]] || die "token_auth.py is missing"
 [[ -f "${repo}/hermes_cli/dashboard_auth/mobile_device_store.py" ]] || die "mobile_device_store.py is missing"
@@ -39,11 +40,14 @@ if [[ -n "${HERMES_SSH_IDENTITY:-}" ]]; then
   ssh_args+=(-i "${HERMES_SSH_IDENTITY}" -o IdentitiesOnly=yes)
 fi
 
-ssh "${ssh_args[@]}" "${remote}" "install -d -m 0700 '${stage}' '${stage}/plugins/collaboration/dashboard' '${stage}/hermes_cli' '${stage}/hermes_cli/dashboard_auth' '${stage}/tui_gateway'"
+ssh "${ssh_args[@]}" "${remote}" "install -d -m 0700 '${stage}' '${stage}/plugins/collaboration/dashboard/dist' '${stage}/hermes_cli' '${stage}/hermes_cli/dashboard_auth' '${stage}/tui_gateway'"
 scp "${ssh_args[@]}" \
   "${repo}/plugins/collaboration/dashboard/plugin_api.py" \
   "${repo}/plugins/collaboration/dashboard/manifest.json" \
   "${remote}:${stage}/plugins/collaboration/dashboard/"
+scp "${ssh_args[@]}" \
+  "${repo}/plugins/collaboration/dashboard/dist/index.js" \
+  "${remote}:${stage}/plugins/collaboration/dashboard/dist/"
 scp "${ssh_args[@]}" \
   "${repo}/hermes_cli/cloud_file_library.py" \
   "${repo}/hermes_cli/web_server.py" \

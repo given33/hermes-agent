@@ -88,9 +88,19 @@ router = APIRouter(lifespan=collaboration_dashboard_lifespan)
 _STATE_LOCK = threading.RLock()
 _HOSTED_THREADS_LOCK = threading.Lock()
 _HOSTED_THREADS: dict[str, threading.Thread] = {}
+_HOSTED_CONVERSATION_LOCKS_LOCK = threading.Lock()
+_HOSTED_CONVERSATION_LOCKS: dict[str, threading.Lock] = {}
+_MOBILE_NOTIFICATION_DISPATCH_CONDITION = threading.Condition()
+_MOBILE_NOTIFICATION_DISPATCH_THREAD: Optional[threading.Thread] = None
+_MOBILE_NOTIFICATION_PENDING: dict[str, tuple[str, str, int]] = {}
 _HOSTED_UPDATE_CONDITION = threading.Condition()
 _HOSTED_UPDATE_REVISION = 0
 _HOSTED_TERMINAL_STATUSES = {"completed", "failed", "cancelled"}
+_MOBILE_NOTIFICATION_TERMINAL_STATUSES = {
+    "delivered",
+    "no_recipients",
+    "permanent_failure",
+}
 _HOSTED_TRANSIENT_RETRIES = 1
 _HOSTED_REWORK_LIMIT = 2
 _HOSTED_EVENT_FLUSH_SECONDS = 0.45
@@ -102,6 +112,8 @@ _PROMPT_HISTORY = 24
 _MAX_ATTACHMENT_BYTES = 64 * 1024 * 1024
 _MAX_CONVERSATION_TITLE_CHARS = 18
 _ATTACHMENT_BUCKETS = {"uploads", "outputs"}
+_ACCOUNT_FILE_MIGRATION_LOCK = threading.Lock()
+_ACCOUNT_FILE_MIGRATION_VERSION = "conversation-files-v1"
 _WORK_MARKERS = (
     "完成",
     "执行",
@@ -416,6 +428,69 @@ def _conversation_file_dir(conversation_id: str, bucket: str) -> Path:
     return target
 
 
+def _hosted_turn_output_dir(conversation_id: str, turn_id: str) -> Path:
+    normalized_turn_id = str(turn_id or "").strip()
+    if not normalized_turn_id:
+        raise ValueError("turn_id is required")
+    turn_key = hashlib.sha256(normalized_turn_id.encode("utf-8")).hexdigest()[:32]
+    target = _conversation_file_dir(conversation_id, "outputs") / "turns" / turn_key
+    target.mkdir(parents=True, exist_ok=True)
+    return target
+
+
+def _hosted_output_paths(
+    conversation_id: str,
+    run: dict[str, Any],
+) -> tuple[Path, Path]:
+    output_root = _conversation_file_dir(conversation_id, "outputs").resolve()
+    configured = str(run.get("output_dir") or "").strip()
+    output_dir = Path(configured).resolve() if configured else output_root
+    if not output_dir.is_relative_to(output_root):
+        raise RuntimeError("Hosted output directory escapes the conversation output root")
+    output_dir.mkdir(parents=True, exist_ok=True)
+    return output_root, output_dir
+
+
+def _output_file_signatures(directory: Path) -> dict[str, str]:
+    """Hash a stable output snapshot so adjacent turns cannot share artifacts."""
+
+    if not directory.exists():
+        return {}
+    resolved_root = directory.resolve(strict=True)
+    signatures: dict[str, str] = {}
+    for candidate in sorted(directory.rglob("*")):
+        if (
+            candidate.is_symlink()
+            or not candidate.is_file()
+            or (candidate.name.startswith(".") and candidate.name.endswith(".upload"))
+        ):
+            continue
+        before = candidate.stat()
+        resolved = candidate.resolve(strict=True)
+        if not resolved.is_relative_to(resolved_root):
+            continue
+        digest = hashlib.sha256()
+        with resolved.open("rb") as handle:
+            for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+                digest.update(chunk)
+        after = candidate.stat()
+        if before.st_size != after.st_size or before.st_mtime_ns != after.st_mtime_ns:
+            raise OSError(f"Output changed while its turn baseline was captured: {candidate}")
+        signatures[resolved.relative_to(resolved_root).as_posix()] = digest.hexdigest()
+    return signatures
+
+
+def _ensure_hosted_output_baseline(
+    conversation_id: str,
+    run: dict[str, Any],
+) -> None:
+    if not bool(run.get("artifact_required")) or "output_baseline" in run:
+        return
+    _output_root, output_dir = _hosted_output_paths(conversation_id, run)
+    run["output_baseline"] = _output_file_signatures(output_dir)
+    run["output_baseline_captured_at"] = int(time.time() * 1000)
+
+
 def _attachment_record(
     conversation_id: str,
     bucket: str,
@@ -433,7 +508,6 @@ def _attachment_record(
         "name": path.name,
         "bucket": bucket,
         "relative_path": relative_path.as_posix(),
-        "path": str(path.resolve()),
         "size": stat.st_size,
         "mime_type": mime_type,
         "updated_at": int(stat.st_mtime * 1000),
@@ -466,11 +540,16 @@ def _list_conversation_attachments(conversation_id: str) -> list[dict[str, Any]]
                 else ""
             )
         if owner_id and isinstance(conversation, dict):
-            _sync_conversation_files(owner_id, conversation)
+            try:
+                _sync_conversation_files(owner_id, conversation)
+            except Exception:
+                logging.getLogger(__name__).exception(
+                    "Failed to publish conversation files into account library"
+                )
             return _conversation_library_attachments(owner_id, conversation_id)
     except Exception:
         logging.getLogger(__name__).exception(
-            "Failed to publish conversation files into account library"
+            "Failed to resolve conversation file ownership"
         )
 
     attachments: list[dict[str, Any]] = []
@@ -481,6 +560,104 @@ def _list_conversation_attachments(conversation_id: str) -> list[dict[str, Any]]
                 attachments.append(
                     _attachment_record(conversation_id, bucket, path)
                 )
+    return attachments
+
+
+def _hosted_turn_output_attachments(
+    conversation_id: str,
+    turn_id: str,
+    started_at: int,
+) -> list[dict[str, Any]]:
+    """Publish and return outputs owned by exactly one hosted turn."""
+
+    del started_at  # Timestamp proximity is not proof that a turn created a file.
+    normalized_turn_id = str(turn_id or "").strip()
+    if not normalized_turn_id:
+        return []
+    with _STATE_LOCK:
+        state = load_single_state()
+        conversation = _conversation_by_id(state, conversation_id)
+        run = (conversation.get("hosted_turns") or {}).get(normalized_turn_id)
+        if not isinstance(run, dict):
+            return []
+        run_snapshot = dict(run)
+        owner_id = str(conversation.get("owner_id") or LOCAL_OWNER_ID).strip()
+        profile = next(
+            (
+                str(item).strip()
+                for item in run.get("profiles") or []
+                if str(item).strip()
+            ),
+            str(conversation.get("profile") or "default").strip() or "default",
+        )
+
+    output_root, output_dir = _hosted_output_paths(conversation_id, run_snapshot)
+    baseline = run_snapshot.get("output_baseline")
+    library = _file_library()
+    if isinstance(baseline, dict):
+        normalized_baseline = {
+            str(relative): str(digest)
+            for relative, digest in baseline.items()
+            if str(relative) and re.fullmatch(r"[0-9a-f]{64}", str(digest))
+        }
+        if len(normalized_baseline) == len(baseline):
+            current = _output_file_signatures(output_dir)
+            origin_root = f"conversation:{conversation_id}:outputs"
+            output_relative = output_dir.relative_to(output_root).as_posix()
+            origin_prefix = (
+                f"{origin_root}:{output_relative}"
+                if output_relative != "."
+                else origin_root
+            )
+            if not normalized_baseline:
+                library.sync_directory(
+                    owner_id,
+                    output_dir,
+                    source="model_output",
+                    conversation_id=conversation_id,
+                    turn_id=normalized_turn_id,
+                    profile=profile,
+                    origin_prefix=origin_prefix,
+                    strict=True,
+                )
+            else:
+                for relative, digest in current.items():
+                    if normalized_baseline.get(relative) == digest:
+                        continue
+                    candidate = (output_dir / relative).resolve(strict=True)
+                    if not candidate.is_relative_to(output_dir):
+                        continue
+                    record = library.ingest_file(
+                        owner_id,
+                        candidate,
+                        name=candidate.name,
+                        source="model_output",
+                        conversation_id=conversation_id,
+                        turn_id=normalized_turn_id,
+                        profile=profile,
+                        origin_key=f"{origin_prefix}:{relative}",
+                        allowed_roots=[output_dir],
+                        restore_deleted=False,
+                    )
+                    if record is not None and str(record.get("sha256") or "") != digest:
+                        raise OSError(f"Output changed while it was indexed: {candidate}")
+
+    attachments: list[dict[str, Any]] = []
+    offset = 0
+    while True:
+        page, total = library.list_files(
+            owner_id,
+            source="model_output",
+            status="available",
+            conversation_id=conversation_id,
+            turn_id=normalized_turn_id,
+            limit=200,
+            offset=offset,
+        )
+        attachments.extend(_library_attachment(record) for record in page)
+        offset += len(page)
+        if not page or offset >= total:
+            break
     return attachments
 
 
@@ -1073,7 +1250,7 @@ _INLINE_BEARER_RE = re.compile(r"(?i)\b(Bearer)\s+[A-Za-z0-9._~+/=-]{8,}")
 _INLINE_SECRET_RE = re.compile(
     r"(?i)\b(Authorization|Proxy-Authorization|Cookie|Set-Cookie|"
     r"X-Api-Key|Api-Key|API[_ -]?Key|Access[_ -]?Token|Refresh[_ -]?Token|"
-    r"Password|Passwd|Secret|Credential)\b\s*[:=]\s*([^\s,;]+|\"[^\"]*\"|'[^']*')"
+    r"Password|Passwd|Secret|Credential)\b\s*[:=]\s*(\"[^\"]*\"|'[^']*'|[^\s,;]+)"
 )
 _INLINE_ENV_SECRET_RE = re.compile(
     r"(?i)(?<![A-Za-z0-9_])((?:[A-Za-z][A-Za-z0-9_]*_)?(?:"
@@ -2148,13 +2325,19 @@ def build_single_prompt(
     conversation: dict[str, Any],
     profile: str,
     user_message: str,
+    *,
+    include_projected_history: bool = True,
 ) -> str:
     history = (
         conversation.get("messages")
         if isinstance(conversation.get("messages"), list)
         else []
     )
-    recent = "\n".join(_message_line(item) for item in history[-_PROMPT_HISTORY:])
+    recent = (
+        "\n".join(_message_line(item) for item in history[-_PROMPT_HISTORY:])
+        if include_projected_history
+        else ""
+    )
     return (
         "你正在 Hermes 官方 WebUI 单聊中。\n"
         f"当前 Hermes Profile：{profile}\n"
@@ -2251,6 +2434,7 @@ def run_profile_turn(
     process_factory: Callable[..., Any] = subprocess.Popen,
     timeout: float = 600,
     kanban_task_id: Optional[str] = None,
+    session_id: str = "",
 ) -> str:
     """Run a profile through a structured JSONL child event channel."""
     if runner is not None:
@@ -2289,7 +2473,12 @@ def run_profile_turn(
     if process.stdin is None or process.stdout is None:
         process.kill()
         raise RuntimeError("Hermes 结构化执行通道启动失败")
-    process.stdin.write(json.dumps({"prompt": prompt}, ensure_ascii=False))
+    process.stdin.write(
+        json.dumps(
+            {"prompt": prompt, "session_id": str(session_id or "").strip()},
+            ensure_ascii=False,
+        )
+    )
     process.stdin.close()
 
     line_queue: queue.Queue[Optional[str]] = queue.Queue()
@@ -2421,6 +2610,9 @@ def apply_profile_event(
     now = int(time.time() * 1000)
 
     if event_type == "session.info":
+        state["runtime_session_id"] = str(
+            payload.get("session_id") or state.get("runtime_session_id") or ""
+        ).strip()
         state["actual_model"] = str(payload.get("model") or state.get("actual_model") or "")
         state["actual_provider"] = str(
             payload.get("provider") or state.get("actual_provider") or ""
@@ -2630,6 +2822,9 @@ def apply_profile_event(
         final_text = _structured_text(payload.get("text"))
         if final_text:
             state["content"] = final_text
+        state["runtime_session_id"] = str(
+            payload.get("session_id") or state.get("runtime_session_id") or ""
+        ).strip()
         state["status"] = (
             "failed" if str(payload.get("status") or "").lower() == "error" else "completed"
         )
@@ -2679,12 +2874,15 @@ def _invoke_profile_runner(
     prompt: str,
     event_callback: Callable[[dict[str, Any]], None],
     kanban_task_id: str,
+    session_id: str = "",
 ) -> str:
     kwargs: dict[str, Any] = {}
     if _runner_supports_events(runner):
         kwargs["event_callback"] = event_callback
     if kanban_task_id and _runner_supports_keyword(runner, "kanban_task_id"):
         kwargs["kanban_task_id"] = kanban_task_id
+    if session_id and _runner_supports_keyword(runner, "session_id"):
+        kwargs["session_id"] = session_id
     return str(runner(profile, prompt, **kwargs))
 
 
@@ -2742,6 +2940,9 @@ def _persist_hosted_role_state(
         "activities": activities,
         "actual_model": str(state.get("actual_model") or ""),
         "actual_provider": str(state.get("actual_provider") or ""),
+        "runtime_session_id": str(
+            state.get("runtime_session_id") or ""
+        ).strip(),
         "started_at": int(state.get("started_at") or now),
         "completed_at": now if str(state.get("status") or "") in _HOSTED_TERMINAL_STATUSES else None,
         "milestone_count": int(state.get("milestone_count") or 0),
@@ -2752,6 +2953,10 @@ def _persist_hosted_role_state(
         conversation_id,
         turn_id,
         patch={"role_events": {role_stage: snapshot}},
+        runtime_session=(
+            profile,
+            str(state.get("runtime_session_id") or "").strip(),
+        ),
         message={
             "role": "assistant",
             "name": profile,
@@ -2773,6 +2978,9 @@ def _persist_hosted_role_state(
                 "activities": activities,
                 "actual_model": snapshot["actual_model"],
                 "actual_provider": snapshot["actual_provider"],
+                "runtime_session_id": str(
+                    state.get("runtime_session_id") or ""
+                ).strip(),
             },
         },
     )
@@ -2790,6 +2998,7 @@ def _run_hosted_role(
     kanban_task_id: str,
     start_text: str,
     runtime_profile: str = "",
+    runtime_session_id: str = "",
     final_report: bool = False,
     previous_state: Optional[dict[str, Any]] = None,
 ) -> tuple[str, str, dict[str, Any]]:
@@ -2799,6 +3008,7 @@ def _run_hosted_role(
         "activities": [],
         "actual_model": "",
         "actual_provider": "",
+        "runtime_session_id": str(runtime_session_id or "").strip(),
         "started_at": int(time.time() * 1000),
         "milestone_count": 0,
         "milestone_content": "",
@@ -2810,6 +3020,12 @@ def _run_hosted_role(
                 "activities": [dict(item) for item in previous_state.get("activities") or []],
                 "actual_model": str(previous_state.get("actual_model") or ""),
                 "actual_provider": str(previous_state.get("actual_provider") or ""),
+                "runtime_session_id": str(
+                    previous_state.get("runtime_session_id")
+                    or runtime_session_id
+                    or ""
+                ).strip(),
+                "status": str(previous_state.get("status") or "streaming"),
                 "started_at": int(
                     previous_state.get("started_at")
                     or state["started_at"]
@@ -2817,6 +3033,15 @@ def _run_hosted_role(
                 "milestone_count": int(previous_state.get("milestone_count") or 0),
                 "milestone_content": str(previous_state.get("milestone_content") or ""),
             }
+        )
+    if (
+        str(state.get("status") or "") in _HOSTED_TERMINAL_STATUSES
+        and str(state.get("content") or "").strip()
+    ):
+        return (
+            str(state["content"]).strip(),
+            str(state["status"]),
+            state,
         )
     _persist_hosted_role_state(
         conversation_id,
@@ -2915,6 +3140,7 @@ def _run_hosted_role(
                 prompt,
                 on_event,
                 kanban_task_id,
+                str(state.get("runtime_session_id") or ""),
             ).strip()
             if not result:
                 raise RuntimeError("Hermes profile returned an empty response")
@@ -3229,12 +3455,13 @@ def create_hosted_kanban_task(
     conn = kanban_db.connect()
     try:
         lane_context = ", ".join(profiles or [])
+        # The execution path stays in the hosted run and role prompt. Kanban
+        # bodies are user-visible and must not expose server filesystem paths.
         task_body = "\n\n".join(
             item
             for item in (
                 content,
                 f"Required execution lanes: {lane_context}." if lane_context else "",
-                f"Absolute output directory: {output_dir}." if output_dir else "",
             )
             if item
         )
@@ -3291,34 +3518,272 @@ def _notify_hosted_update() -> int:
         return _HOSTED_UPDATE_REVISION
 
 
+def _completion_notification_record(
+    conversation_id: str,
+    turn_id: str,
+    status: str,
+    result: str,
+) -> dict[str, Any]:
+    now = int(time.time() * 1000)
+    collapse_id = "hermes-turn-" + hashlib.sha256(
+        f"{conversation_id}\0{turn_id}".encode("utf-8")
+    ).hexdigest()[:40]
+    return {
+        "id": collapse_id,
+        "state": "queued",
+        "task_status": str(status or "completed").strip().lower(),
+        "result": str(result or "").strip()[:50_000],
+        "collapse_id": collapse_id,
+        "attempts": 0,
+        "deliveries": {},
+        "last_error": "",
+        "next_attempt_at": now,
+        "created_at": now,
+        "updated_at": now,
+    }
+
+
 def _schedule_mobile_completion_notification(
     conversation_id: str,
     turn_id: str,
     status: str,
     result: str,
 ) -> None:
-    """Best-effort APNs notification; never blocks or fails a hosted turn."""
+    """Queue a persisted notification on the process-wide APNs dispatcher."""
+
+    global _MOBILE_NOTIFICATION_DISPATCH_THREAD
+
     try:
         with _STATE_LOCK:
             state = load_single_state()
             conversation = _conversation_by_id(state, conversation_id)
+            run = (conversation.get("hosted_turns") or {}).get(turn_id)
+            if not isinstance(run, dict):
+                return
             owner_id = str(conversation.get("owner_id") or "").strip()
-        if not owner_id:
+            notification = run.get("notification")
+            if not isinstance(notification, dict):
+                notification = _completion_notification_record(
+                    conversation_id,
+                    turn_id,
+                    status,
+                    result,
+                )
+                run["notification"] = notification
+                save_single_state(state)
+            notification_state = str(notification.get("state") or "queued")
+        if notification_state in _MOBILE_NOTIFICATION_TERMINAL_STATUSES:
             return
-        from hermes_cli.dashboard_auth.mobile_notifications import (
-            schedule_task_completion_push,
+        if not owner_id:
+            _persist_notification_outcome(
+                conversation_id,
+                turn_id,
+                {
+                    "state": "no_recipients",
+                    "deliveries": {},
+                    "error": "notification_owner_missing",
+                },
+            )
+            return
+        key = f"{conversation_id}:{turn_id}"
+        due_at = max(
+            int(time.time() * 1000),
+            int(notification.get("next_attempt_at") or 0),
+        )
+        with _MOBILE_NOTIFICATION_DISPATCH_CONDITION:
+            current = _MOBILE_NOTIFICATION_PENDING.get(key)
+            if current is None or due_at < current[2]:
+                _MOBILE_NOTIFICATION_PENDING[key] = (
+                    conversation_id,
+                    turn_id,
+                    due_at,
+                )
+            if (
+                _MOBILE_NOTIFICATION_DISPATCH_THREAD is None
+                or not _MOBILE_NOTIFICATION_DISPATCH_THREAD.is_alive()
+            ):
+                _MOBILE_NOTIFICATION_DISPATCH_THREAD = threading.Thread(
+                    target=_mobile_notification_dispatch_loop,
+                    name="hermes-apns-dispatcher",
+                    # Claims and per-device outcomes are durable before each
+                    # network step, so process exit leaves replayable work.
+                    daemon=True,
+                )
+                _MOBILE_NOTIFICATION_DISPATCH_THREAD.start()
+            _MOBILE_NOTIFICATION_DISPATCH_CONDITION.notify()
+    except Exception:
+        # The persisted outbox remains available for startup replay.
+        return
+
+
+def _mobile_notification_dispatch_loop() -> None:
+    """Deliver all persistent APNs jobs without allocating one thread per job."""
+
+    while True:
+        with _MOBILE_NOTIFICATION_DISPATCH_CONDITION:
+            while not _MOBILE_NOTIFICATION_PENDING:
+                _MOBILE_NOTIFICATION_DISPATCH_CONDITION.wait()
+            key, pending = min(
+                _MOBILE_NOTIFICATION_PENDING.items(),
+                key=lambda item: item[1][2],
+            )
+            conversation_id, turn_id, due_at = pending
+            remaining_ms = due_at - int(time.time() * 1000)
+            if remaining_ms > 0:
+                _MOBILE_NOTIFICATION_DISPATCH_CONDITION.wait(
+                    timeout=remaining_ms / 1000
+                )
+                continue
+            _MOBILE_NOTIFICATION_PENDING.pop(key, None)
+
+        try:
+            retry_delay_ms = _deliver_persisted_completion_notification(
+                conversation_id,
+                turn_id,
+            )
+        except Exception:
+            retry_delay_ms = 60_000
+        if retry_delay_ms is not None:
+            with _MOBILE_NOTIFICATION_DISPATCH_CONDITION:
+                _MOBILE_NOTIFICATION_PENDING[key] = (
+                    conversation_id,
+                    turn_id,
+                    int(time.time() * 1000) + max(0, retry_delay_ms),
+                )
+                _MOBILE_NOTIFICATION_DISPATCH_CONDITION.notify()
+
+
+def _deliver_persisted_completion_notification(
+    conversation_id: str,
+    turn_id: str,
+) -> Optional[int]:
+    with _STATE_LOCK:
+        state = load_single_state()
+        conversation = _conversation_by_id(state, conversation_id)
+        run = (conversation.get("hosted_turns") or {}).get(turn_id)
+        if not isinstance(run, dict):
+            return None
+        notification = run.get("notification")
+        if not isinstance(notification, dict):
+            return None
+        notification_state = str(notification.get("state") or "queued")
+        if notification_state in _MOBILE_NOTIFICATION_TERMINAL_STATUSES:
+            return None
+        now = int(time.time() * 1000)
+        next_attempt_at = int(notification.get("next_attempt_at") or 0)
+        if notification_state == "retry" and next_attempt_at > now:
+            return next_attempt_at - now
+        owner_id = str(conversation.get("owner_id") or "").strip()
+        claimed = {
+            **notification,
+            "state": "delivering",
+            "attempts": int(notification.get("attempts") or 0) + 1,
+            "updated_at": now,
+        }
+        run["notification"] = claimed
+        save_single_state(state)
+
+    if not owner_id:
+        return _persist_notification_outcome(
+            conversation_id,
+            turn_id,
+            {
+                "state": "no_recipients",
+                "deliveries": dict(claimed.get("deliveries") or {}),
+                "error": "notification_owner_missing",
+            },
         )
 
-        schedule_task_completion_push(
+    def persist_progress(deliveries: dict[str, dict[str, Any]]) -> None:
+        with _STATE_LOCK:
+            current_state = load_single_state()
+            current_conversation = _conversation_by_id(current_state, conversation_id)
+            current_run = (current_conversation.get("hosted_turns") or {}).get(turn_id)
+            if not isinstance(current_run, dict):
+                return
+            current = current_run.get("notification")
+            if not isinstance(current, dict):
+                return
+            current_run["notification"] = {
+                **current,
+                "deliveries": deliveries,
+                "updated_at": int(time.time() * 1000),
+            }
+            save_single_state(current_state)
+
+    try:
+        from hermes_cli.dashboard_auth.mobile_notifications import (
+            deliver_task_completion_push,
+        )
+
+        outcome = deliver_task_completion_push(
             owner_id=owner_id,
             conversation_id=conversation_id,
             turn_id=turn_id,
-            status=status,
-            result=result,
+            status=str(claimed.get("task_status") or "completed"),
+            result=str(claimed.get("result") or ""),
+            collapse_id=str(claimed.get("collapse_id") or claimed.get("id") or ""),
+            previous_deliveries=dict(claimed.get("deliveries") or {}),
+            progress_callback=persist_progress,
         )
-    except Exception:
-        # Optional mobile delivery must not change the task result.
-        return
+    except Exception as exc:
+        outcome = {
+            "state": "retry",
+            "deliveries": dict(claimed.get("deliveries") or {}),
+            "error": f"notification_delivery_failed:{type(exc).__name__}"[:240],
+        }
+    return _persist_notification_outcome(conversation_id, turn_id, outcome)
+
+
+def _persist_notification_outcome(
+    conversation_id: str,
+    turn_id: str,
+    outcome: dict[str, Any],
+) -> Optional[int]:
+    with _STATE_LOCK:
+        state = load_single_state()
+        conversation = _conversation_by_id(state, conversation_id)
+        run = (conversation.get("hosted_turns") or {}).get(turn_id)
+        if not isinstance(run, dict):
+            return None
+        notification = run.get("notification")
+        if not isinstance(notification, dict):
+            return None
+        now = int(time.time() * 1000)
+        outcome_state = str(outcome.get("state") or "retry")
+        error = str(outcome.get("error") or "")[:240]
+        next_attempt_at = 0
+        retry_delay_ms: Optional[int] = None
+        if outcome_state == "retry":
+            retry_delay_ms = _notification_retry_delay_ms(
+                int(notification.get("attempts") or 1)
+            )
+            if error == "apns_not_configured":
+                retry_delay_ms = 5 * 60 * 1000
+            next_attempt_at = now + retry_delay_ms
+        run["notification"] = {
+            **notification,
+            "state": outcome_state,
+            "deliveries": dict(outcome.get("deliveries") or {}),
+            "last_error": error,
+            "next_attempt_at": next_attempt_at,
+            "updated_at": now,
+            **(
+                {"completed_at": now}
+                if outcome_state in _MOBILE_NOTIFICATION_TERMINAL_STATUSES
+                else {}
+            ),
+        }
+        save_single_state(state)
+    _notify_hosted_update()
+    if outcome_state != "retry":
+        return None
+    return retry_delay_ms
+
+
+def _notification_retry_delay_ms(attempts: int) -> int:
+    exponent = max(0, min(int(attempts) - 1, 8))
+    return min(60 * 60 * 1000, 15_000 * (2**exponent))
 
 
 def _wait_for_hosted_update(revision: int, timeout: float = 15.0) -> int:
@@ -3334,6 +3799,7 @@ def _persist_hosted_turn(
     *,
     patch: Optional[dict[str, Any]] = None,
     message: Optional[dict[str, Any]] = None,
+    runtime_session: Optional[tuple[str, str]] = None,
 ) -> dict[str, Any]:
     with _STATE_LOCK:
         state = load_single_state()
@@ -3354,6 +3820,14 @@ def _persist_hosted_turn(
                     run[key] = value
         run["updated_at"] = now
         conversation["updated_at"] = now
+        if runtime_session:
+            runtime_profile, runtime_session_id = runtime_session
+            if str(runtime_session_id or "").strip():
+                set_conversation_runtime_session(
+                    conversation,
+                    str(runtime_profile or "default"),
+                    str(runtime_session_id),
+                )
         if message:
             message_meta = dict(message.get("meta") or {})
             message_meta.setdefault("runtime_turn_id", turn_id)
@@ -3769,40 +4243,75 @@ def execute_hosted_chat(
         now = int(time.time() * 1000)
         run.update({"status": "running", "stage": "chat", "updated_at": now})
         run.setdefault("started_at", now)
+        _ensure_hosted_output_baseline(conversation_id, run)
         save_single_state(state)
         conversation_snapshot = dict(conversation)
         run = dict(run)
     if _finish_hosted_turn_if_cancelled(conversation_id, turn_id):
         return
     content = str(run.get("content") or "").strip()
+    selected_profiles = [
+        str(item).strip() for item in run.get("profiles") or [] if str(item).strip()
+    ]
+    profile = selected_profiles[0] if selected_profiles else str(
+        conversation_snapshot.get("profile") or "default"
+    )
     attachment_context = _hosted_chat_attachment_context(
         conversation_snapshot,
         run,
     )
-    if attachment_context:
-        content = (
-            f"{content}\n\n{attachment_context}\n"
-            "这些附件是本轮输入；请先读取实际文件，再根据用户要求回答。"
+    delivery_context = str(run.get("delivery_context") or "").strip()
+    content = "\n\n".join(
+        item
+        for item in (
+            content,
+            (
+                f"{attachment_context}\n"
+                "这些附件是本轮输入；请先读取实际文件，再根据用户要求回答。"
+                if attachment_context
+                else ""
+            ),
+            delivery_context,
         )
+        if item
+    )
+    runtime_session_id = str(
+        (conversation_snapshot.get("runtime_sessions") or {}).get(profile) or ""
+    ).strip()
     result, status, _role_state = _run_hosted_role(
         conversation_id,
         turn_id,
-        profile="default",
+        profile=profile,
         role_stage="chat",
         role_label="Hermes",
         prompt=build_single_prompt(
             conversation_snapshot,
-            "default",
+            profile,
             content,
+            include_projected_history=not bool(runtime_session_id),
         ),
         runner=runner,
         kanban_task_id="",
+        runtime_session_id=runtime_session_id,
         start_text="收到消息，正在处理。",
         previous_state=(run.get("role_events") or {}).get("chat"),
     )
     if _finish_hosted_turn_if_cancelled(conversation_id, turn_id):
         return
     final_status = "completed" if status == "completed" else "failed"
+    published_attachments: list[dict[str, Any]] = []
+    if bool(run.get("artifact_required")) and final_status == "completed":
+        published_attachments = _hosted_turn_output_attachments(
+            conversation_id,
+            turn_id,
+            int(run.get("started_at") or 0),
+        )
+        if not published_attachments:
+            final_status = "failed"
+            status = "failed"
+            result = (
+                f"{result}\n\n文件交付失败：Hermes 未在指定输出目录生成可下载文件。"
+            ).strip()
     now = int(time.time() * 1000)
     _persist_hosted_turn(
         conversation_id,
@@ -3813,6 +4322,35 @@ def execute_hosted_chat(
             "status": final_status,
             "stage": final_status,
             "completed_at": now,
+            "notification": _completion_notification_record(
+                conversation_id,
+                turn_id,
+                final_status,
+                result,
+            ),
+        },
+        runtime_session=(
+            profile,
+            str(_role_state.get("runtime_session_id") or "").strip(),
+        ),
+        message={
+            "role": "assistant",
+            "name": profile,
+            "content": result,
+            "status": final_status,
+            "kind": "message",
+            "meta": {
+                "role_stage": "chat",
+                "base_role_stage": "chat",
+                "phase": "completed",
+                "message_key": f"{turn_id}:chat:completed",
+                "role_label": "Hermes",
+                "profile": profile,
+                "attachments": published_attachments,
+                "runtime_session_id": str(
+                    _role_state.get("runtime_session_id") or ""
+                ).strip(),
+            },
         },
     )
     _schedule_mobile_completion_notification(
@@ -3842,7 +4380,9 @@ def execute_hosted_workflow(
         run["stage"] = str(run.get("stage") or "preparing")
         run.setdefault("started_at", int(time.time() * 1000))
         run["updated_at"] = int(time.time() * 1000)
+        _ensure_hosted_output_baseline(conversation_id, run)
         save_single_state(state)
+        conversation_snapshot = dict(conversation)
         run = dict(run)
 
     if str(run.get("mode") or "work").lower() == "chat":
@@ -3889,7 +4429,7 @@ def execute_hosted_workflow(
         run,
         remote_workers=remote_workers,
     )
-    attachment_context = str(run.get("attachment_context") or "")
+    attachment_context = _hosted_chat_attachment_context(conversation_snapshot, run)
     worker_kanban_instruction = (
         "官方 Kanban 是 DBB3 的唯一控制面。你可以读取根任务和已分配工作项，"
         "也可以向已分配工作项写入进度、证据和交接评论；"
@@ -4444,13 +4984,11 @@ def execute_hosted_workflow(
 
     attachments = []
     if artifact_required:
-        started_at = int(run.get("started_at") or 0)
-        attachments = [
-            item
-            for item in _list_conversation_attachments(conversation_id)
-            if item.get("bucket") == "outputs"
-            and int(item.get("updated_at") or 0) >= started_at - 1000
-        ]
+        attachments = _hosted_turn_output_attachments(
+            conversation_id,
+            turn_id,
+            int(run.get("started_at") or 0),
+        )
     missing_required_artifact = artifact_required and not attachments
     reporter_state_snapshot = (
         _reporter_state
@@ -4484,6 +5022,12 @@ def execute_hosted_workflow(
             "status": final_status,
             "stage": "completed" if final_status == "completed" else "failed",
             "completed_at": now,
+            "notification": _completion_notification_record(
+                conversation_id,
+                turn_id,
+                final_status,
+                reporter_result,
+            ),
         },
         message={
             "role": "assistant",
@@ -4514,61 +5058,146 @@ def execute_hosted_workflow(
     )
 
 
+def _next_hosted_turn_id(
+    conversation_id: str,
+    *,
+    excluded: Optional[set[str]] = None,
+) -> str:
+    """Return the oldest durable unfinished turn for one conversation."""
+
+    with _STATE_LOCK:
+        state = load_single_state()
+        conversation = next(
+            (
+                item
+                for item in state.get("conversations") or []
+                if isinstance(item, dict) and item.get("id") == conversation_id
+            ),
+            None,
+        )
+        # Deleting a conversation is also the cancellation boundary for its
+        # serial hosted consumer. The consumer can race with deletion between
+        # turns, so a missing record is a normal empty-queue result.
+        if conversation is None:
+            return ""
+        candidates = [
+            (
+                int(run.get("created_at") or 0),
+                index,
+                str(candidate_turn_id),
+            )
+            for index, (candidate_turn_id, run) in enumerate(
+                (conversation.get("hosted_turns") or {}).items()
+            )
+            if isinstance(run, dict)
+            and str(run.get("status") or "queued") in {"queued", "running"}
+            and str(candidate_turn_id) not in (excluded or set())
+        ]
+    if not candidates:
+        return ""
+    return min(candidates)[2]
+
+
 def start_hosted_workflow(conversation_id: str, turn_id: str) -> threading.Thread:
-    key = f"{conversation_id}:{turn_id}"
+    del turn_id  # The per-conversation consumer selects the oldest durable turn.
+    key = str(conversation_id)
     with _HOSTED_THREADS_LOCK:
         existing = _HOSTED_THREADS.get(key)
         if existing is not None and existing.is_alive():
             return existing
 
         def run_and_release() -> None:
+            attempted_turn_ids: set[str] = set()
             try:
-                execute_hosted_workflow(conversation_id, turn_id)
-            except Exception as exc:
-                clean_error = sanitize_runtime_error(exc)
-                try:
-                    _persist_hosted_turn(
+                while True:
+                    current_turn_id = _next_hosted_turn_id(
                         conversation_id,
-                        turn_id,
-                        patch={
-                            "status": "failed",
-                            "stage": "failed",
-                            "error": clean_error,
-                            "completed_at": int(time.time() * 1000),
-                        },
-                        message={
-                            "role": "assistant",
-                            "name": "default",
-                            "content": f"服务端托管任务失败：{clean_error}",
-                            "status": "failed",
-                            "kind": "message",
-                            "meta": {
-                                "role_stage": "reporter",
-                                "role_label": "Hermes · 最终汇报",
-                                "final_report": True,
-                            },
-                        },
+                        excluded=attempted_turn_ids,
                     )
-                except Exception:
-                    pass
-                _schedule_mobile_completion_notification(
-                    conversation_id,
-                    turn_id,
-                    "failed",
-                    clean_error,
-                )
+                    if not current_turn_id:
+                        break
+                    attempted_turn_ids.add(current_turn_id)
+                    try:
+                        with _hosted_conversation_execution_lock(conversation_id):
+                            execute_hosted_workflow(
+                                conversation_id,
+                                current_turn_id,
+                            )
+                    except Exception as exc:
+                        clean_error = sanitize_runtime_error(exc)
+                        try:
+                            _persist_hosted_turn(
+                                conversation_id,
+                                current_turn_id,
+                                patch={
+                                    "status": "failed",
+                                    "stage": "failed",
+                                    "error": clean_error,
+                                    "completed_at": int(time.time() * 1000),
+                                    "notification": _completion_notification_record(
+                                        conversation_id,
+                                        current_turn_id,
+                                        "failed",
+                                        clean_error,
+                                    ),
+                                },
+                                message={
+                                    "role": "assistant",
+                                    "name": "default",
+                                    "content": f"服务端托管任务失败：{clean_error}",
+                                    "status": "failed",
+                                    "kind": "message",
+                                    "meta": {
+                                        "role_stage": "reporter",
+                                        "role_label": "Hermes · 最终汇报",
+                                        "final_report": True,
+                                    },
+                                },
+                            )
+                        except Exception:
+                            pass
+                        _schedule_mobile_completion_notification(
+                            conversation_id,
+                            current_turn_id,
+                            "failed",
+                            clean_error,
+                        )
             finally:
                 with _HOSTED_THREADS_LOCK:
                     _HOSTED_THREADS.pop(key, None)
+                try:
+                    _finalize_pending_conversation_deletion(conversation_id)
+                except Exception:
+                    pass
+                # A turn can be committed while the consumer is between its
+                # final empty check and removal. Rescan after removal so that
+                # this handoff window never strands durable queued work.
+                try:
+                    pending_turn_id = _next_hosted_turn_id(
+                        conversation_id,
+                        excluded=attempted_turn_ids,
+                    )
+                except Exception:
+                    pending_turn_id = ""
+                if pending_turn_id:
+                    start_hosted_workflow(conversation_id, pending_turn_id)
 
         thread = threading.Thread(
             target=run_and_release,
-            name=f"hermes-hosted-{turn_id[-12:]}",
+            name=f"hermes-hosted-{conversation_id[-12:]}",
             daemon=True,
         )
         _HOSTED_THREADS[key] = thread
         thread.start()
         return thread
+
+
+def _hosted_conversation_execution_lock(conversation_id: str) -> threading.Lock:
+    with _HOSTED_CONVERSATION_LOCKS_LOCK:
+        return _HOSTED_CONVERSATION_LOCKS.setdefault(
+            str(conversation_id),
+            threading.Lock(),
+        )
 
 
 def resume_unfinished_hosted_workflows(
@@ -4579,8 +5208,23 @@ def resume_unfinished_hosted_workflows(
         if not conversation_id:
             continue
         for turn_id, run in (conversation.get("hosted_turns") or {}).items():
-            if isinstance(run, dict) and run.get("status") in {"queued", "running"}:
+            if not isinstance(run, dict):
+                continue
+            if run.get("status") in {"queued", "running"}:
                 start_hosted_workflow(conversation_id, str(turn_id))
+                continue
+            notification = run.get("notification")
+            if (
+                isinstance(notification, dict)
+                and str(notification.get("state") or "queued")
+                not in _MOBILE_NOTIFICATION_TERMINAL_STATUSES
+            ):
+                _schedule_mobile_completion_notification(
+                    conversation_id,
+                    str(turn_id),
+                    str(notification.get("task_status") or run.get("status") or "failed"),
+                    str(notification.get("result") or ""),
+                )
 
 
 def _room_by_id(state: dict[str, Any], room_id: str) -> dict[str, Any]:
@@ -4588,6 +5232,28 @@ def _room_by_id(state: dict[str, Any], room_id: str) -> dict[str, Any]:
         if room.get("id") == room_id:
             return room
     raise HTTPException(status_code=404, detail="群聊不存在")
+
+
+def _configured_legacy_owner_id() -> str:
+    """Return the only account allowed to adopt pre-account local data."""
+
+    explicit = os.environ.get("HERMES_LEGACY_OWNER_ID", "").strip()
+    if explicit:
+        return explicit[:512]
+    return os.environ.get("HERMES_OWNER_EMAIL", "").strip().lower()[:512]
+
+
+def _legacy_owner_claim_allowed(existing_owner: str, owner_id: str) -> bool:
+    """Require an explicit server-side binding before migrating local data."""
+
+    existing = str(existing_owner or "").strip()
+    requested = str(owner_id or "").strip()
+    if existing not in {"", LOCAL_OWNER_ID} or not requested:
+        return False
+    if requested == LOCAL_OWNER_ID:
+        return True
+    configured = _configured_legacy_owner_id()
+    return bool(configured and hmac.compare_digest(configured, requested))
 
 
 def _claim_legacy_rooms_in_state(
@@ -4604,20 +5270,18 @@ def _claim_legacy_rooms_in_state(
     if requested_room_id:
         requested_room = _room_by_id(state, requested_room_id)
         requested_owner = str(requested_room.get("owner_id") or "").strip()
-        if requested_owner and not (
-            requested_owner == LOCAL_OWNER_ID
-            and normalized_owner != LOCAL_OWNER_ID
-        ):
+        if requested_owner == normalized_owner:
+            return False
+        if not _legacy_owner_claim_allowed(requested_owner, normalized_owner):
             return False
     claimed = False
     for room in state.get("rooms") or []:
         if not isinstance(room, dict):
             continue
         existing_owner = str(room.get("owner_id") or "").strip()
-        if existing_owner and not (
-            existing_owner == LOCAL_OWNER_ID
-            and normalized_owner != LOCAL_OWNER_ID
-        ):
+        if existing_owner == normalized_owner:
+            continue
+        if not _legacy_owner_claim_allowed(existing_owner, normalized_owner):
             continue
         room["owner_id"] = normalized_owner
         claimed = True
@@ -4643,16 +5307,20 @@ def _room_conversation_in_state(
 ) -> tuple[dict[str, Any], bool]:
     conversation_id = str(room.get("conversation_id") or "").strip()
     if conversation_id:
-        try:
-            conversation, claimed = _owned_conversation_in_state(
+        mapped = next(
+            (
+                item
+                for item in single_state.get("conversations") or []
+                if isinstance(item, dict) and item.get("id") == conversation_id
+            ),
+            None,
+        )
+        if mapped is not None:
+            return _owned_conversation_in_state(
                 single_state,
                 conversation_id,
                 owner_id,
             )
-            return conversation, claimed
-        except HTTPException as exc:
-            if exc.status_code != 404:
-                raise
     room_id = str(room.get("id") or uuid.uuid4().hex[:12])
     conversation = create_single_conversation(
         "default",
@@ -4675,6 +5343,22 @@ def _room_conversation_in_state(
     return conversation, True
 
 
+def _room_maps_to_deleting_conversation(
+    room: dict[str, Any],
+    single_state: dict[str, Any],
+) -> bool:
+    conversation_id = str(room.get("conversation_id") or "").strip()
+    return bool(
+        conversation_id
+        and any(
+            isinstance(item, dict)
+            and item.get("id") == conversation_id
+            and item.get("delete_requested")
+            for item in single_state.get("conversations") or []
+        )
+    )
+
+
 def _room_projection(
     room: dict[str, Any],
     single_state: dict[str, Any],
@@ -4691,6 +5375,7 @@ def _room_projection(
             for item in single_state.get("conversations") or []
             if isinstance(item, dict)
             and item.get("id") == conversation_id
+            and not item.get("delete_requested")
             and str(item.get("owner_id") or room_owner).strip()
             in {room_owner, LOCAL_OWNER_ID}
         ),
@@ -4704,11 +5389,61 @@ def _room_projection(
     projected["messages"] = messages[-1:] if summary else messages
     projected["message_count"] = len(messages)
     if isinstance(conversation, dict):
-        projected["hosted_turns"] = dict(conversation.get("hosted_turns") or {})
+        projected["hosted_turns"] = _public_hosted_turns(
+            conversation.get("hosted_turns")
+        )
         projected["updated_at"] = max(
             int(projected.get("updated_at") or 0),
             int(conversation.get("updated_at") or 0),
         )
+    return projected
+
+
+def _public_hosted_turn(run: dict[str, Any]) -> dict[str, Any]:
+    """Remove server-only execution paths and baselines from an API response."""
+
+    projected = dict(run)
+    user_delivery_context = str(projected.pop("user_delivery_context", "") or "").strip()
+    for key in (
+        "output_dir",
+        "output_baseline",
+        "output_baseline_captured_at",
+        "room_request",
+    ):
+        projected.pop(key, None)
+    if user_delivery_context:
+        projected["delivery_context"] = user_delivery_context
+    else:
+        projected.pop("delivery_context", None)
+    remote_runs = projected.get("remote_runs")
+    if isinstance(remote_runs, dict):
+        projected["remote_runs"] = {
+            str(role): {
+                key: value
+                for key, value in remote.items()
+                if key not in {"delivery_context", "attachment_context"}
+            }
+            for role, remote in remote_runs.items()
+            if isinstance(remote, dict)
+        }
+    return projected
+
+
+def _public_hosted_turns(hosted_turns: Any) -> dict[str, dict[str, Any]]:
+    if not isinstance(hosted_turns, dict):
+        return {}
+    return {
+        str(turn_id): _public_hosted_turn(run)
+        for turn_id, run in hosted_turns.items()
+        if isinstance(run, dict)
+    }
+
+
+def _public_conversation(conversation: dict[str, Any]) -> dict[str, Any]:
+    projected = dict(conversation)
+    projected["hosted_turns"] = _public_hosted_turns(
+        conversation.get("hosted_turns")
+    )
     return projected
 
 
@@ -4731,15 +5466,14 @@ def _owned_conversation_in_state(
 
     conversation = _conversation_by_id(state, conversation_id)
     existing_owner = str(conversation.get("owner_id") or "").strip()
-    legacy_local_owner = (
-        existing_owner == LOCAL_OWNER_ID and owner_id != LOCAL_OWNER_ID
-    )
-    if existing_owner and existing_owner != owner_id and not legacy_local_owner:
+    if conversation.get("delete_requested"):
         raise HTTPException(status_code=404, detail="Conversation not found")
-    claimed = not existing_owner or legacy_local_owner
-    if claimed:
-        conversation["owner_id"] = owner_id
-    return conversation, claimed
+    if existing_owner == owner_id:
+        return conversation, False
+    if not _legacy_owner_claim_allowed(existing_owner, owner_id):
+        raise HTTPException(status_code=404, detail="Conversation not found")
+    conversation["owner_id"] = owner_id
+    return conversation, True
 
 
 def _native_activity_projection(
@@ -4951,6 +5685,7 @@ class EnqueueHostedTurnBody(BaseModel):
     turn_id: str
     message: dict[str, Any]
     recent_messages: list[dict[str, Any]] = Field(default_factory=list)
+    profiles: list[str] = Field(default_factory=list)
     attachment_ids: list[str] = Field(default_factory=list)
     attachment_context: str = ""
     delivery_context: str = ""
@@ -5139,6 +5874,8 @@ def _apply_remote_checkpoint(
         persisted,
         role_label=role_label,
     )
+    if expected_terminal:
+        _finalize_pending_conversation_deletion(conversation_id)
     return persisted, True
 
 
@@ -5608,7 +6345,12 @@ def get_single_conversations(request: Request = None):
         changed = False
         for conversation in conversations:
             existing_owner = str(conversation.get("owner_id") or "").strip()
-            if not existing_owner:
+            if conversation.get("delete_requested"):
+                continue
+            if existing_owner != owner_id and _legacy_owner_claim_allowed(
+                existing_owner,
+                owner_id,
+            ):
                 conversation["owner_id"] = owner_id
                 existing_owner = owner_id
                 changed = True
@@ -5658,14 +6400,17 @@ def create_single_chat(payload: CreateSingleConversationBody, request: Request =
                 existing_owner = str(existing.get("owner_id") or LOCAL_OWNER_ID)
                 if existing_owner != owner_id:
                     raise HTTPException(status_code=404, detail="Conversation not found")
-                return {"conversation": existing, "created": False}
+                return {
+                    "conversation": _public_conversation(existing),
+                    "created": False,
+                }
         conversation = create_single_conversation(payload.profile, payload.title)
         if client_id:
             conversation["id"] = client_id
         conversation["owner_id"] = owner_id
         state["conversations"].insert(0, conversation)
         save_single_state(state)
-    return {"conversation": conversation, "created": True}
+    return {"conversation": _public_conversation(conversation), "created": True}
 
 
 @router.post("/single/conversations/adopt")
@@ -5683,16 +6428,23 @@ def adopt_single_chat(
     with _STATE_LOCK:
         state = load_single_state()
         for conversation in state.get("conversations") or []:
-            if session_id in (
-                conversation.get("runtime_sessions") or {}
-            ).values():
+            runtime_sessions = conversation.get("runtime_sessions") or {}
+            if runtime_sessions.get(payload.profile) == session_id:
                 existing_owner = str(conversation.get("owner_id") or "").strip()
-                if existing_owner and existing_owner != owner_id:
+                if conversation.get("delete_requested"):
                     raise HTTPException(status_code=404, detail="Conversation not found")
-                if not existing_owner:
+                if existing_owner != owner_id and not _legacy_owner_claim_allowed(
+                    existing_owner,
+                    owner_id,
+                ):
+                    raise HTTPException(status_code=404, detail="Conversation not found")
+                if existing_owner != owner_id:
                     conversation["owner_id"] = owner_id
                     save_single_state(state)
-                return {"conversation": conversation, "created": False}
+                return {
+                    "conversation": _public_conversation(conversation),
+                    "created": False,
+                }
         conversation = create_adopted_single_conversation(
             payload.profile,
             session_id,
@@ -5702,7 +6454,7 @@ def adopt_single_chat(
         conversation["owner_id"] = owner_id
         state["conversations"].insert(0, conversation)
         save_single_state(state)
-    return {"conversation": conversation, "created": True}
+    return {"conversation": _public_conversation(conversation), "created": True}
 
 
 @router.get("/single/conversations/{conversation_id}")
@@ -5723,7 +6475,7 @@ def get_single_conversation(
         changed = compact_conversation_title(conversation) or changed
         if changed:
             save_single_state(state)
-        result = {"conversation": conversation}
+        result = {"conversation": _public_conversation(conversation)}
     resume_unfinished_hosted_workflows([conversation])
     return result
 
@@ -5747,7 +6499,7 @@ def rename_single_conversation(
         conversation["title"] = title
         conversation["updated_at"] = int(time.time() * 1000)
         save_single_state(state)
-        return {"conversation": conversation}
+        return {"conversation": _public_conversation(conversation)}
 
 
 @router.get("/single/conversations/{conversation_id}/attachments")
@@ -5761,8 +6513,6 @@ def get_conversation_attachments(conversation_id: str, request: Request):
             owner_id,
             conversation_id,
         ),
-        "uploads_dir": str(uploads_dir.resolve()),
-        "output_dir": str(outputs_dir.resolve()),
     }
 
 
@@ -5821,12 +6571,7 @@ async def upload_conversation_attachment(
         )
     finally:
         temp.unlink(missing_ok=True)
-    return {
-        "attachment": _library_attachment(record),
-        "output_dir": str(
-            _conversation_file_dir(conversation_id, "outputs").resolve()
-        ),
-    }
+    return {"attachment": _library_attachment(record)}
 
 
 @router.get(
@@ -6014,7 +6759,7 @@ async def stream_hosted_conversation_events(
                 )
                 current_revision = _HOSTED_UPDATE_REVISION
                 payload = json.dumps(
-                    {"conversation": conversation},
+                    {"conversation": _public_conversation(conversation)},
                     ensure_ascii=False,
                     separators=(",", ":"),
                 )
@@ -6054,7 +6799,15 @@ def _hosted_route_parameters(
         raise HTTPException(status_code=400, detail="mode must be chat or work")
     selected_profiles = list(requested_profiles or route.get("profiles") or [])
     if mode == "chat":
-        selected_profiles = ["default"]
+        selected_profile = next(
+            (str(item).strip() for item in selected_profiles if str(item).strip()),
+            "default",
+        )
+        known_profiles = {str(item.get("name") or "") for item in available_profiles()}
+        if selected_profile not in known_profiles:
+            raise HTTPException(status_code=400, detail="Hermes Profile does not exist")
+        selected_profiles = [selected_profile]
+        route["profiles"] = selected_profiles
     else:
         requested_workers = [
             profile
@@ -6150,7 +6903,7 @@ def _enqueued_turn_response(
         "message": user_message,
         "route": dict(request_record.get("route") or {}),
         "route_message": route_message or None,
-        "hosted_turn": hosted,
+        "hosted_turn": _public_hosted_turn(hosted),
     }
 
 
@@ -6194,6 +6947,7 @@ def enqueue_hosted_turn(
             conversation_id,
             owner_id,
         )
+        conversation_profile = str(conversation.get("profile") or "default").strip() or "default"
         requests = conversation.get("enqueue_requests")
         requests = requests if isinstance(requests, dict) else {}
         existing_request = requests.get(request_id)
@@ -6255,10 +7009,14 @@ def enqueue_hosted_turn(
         route_metadata=route,
         content=message_content,
         requested_mode=str(route.get("mode") or ""),
-        requested_profiles=list(route.get("profiles") or []),
+        requested_profiles=(
+            [conversation_profile]
+            if str(route.get("mode") or "").strip().lower() == "chat"
+            else list(route.get("profiles") or [])
+        ),
         requested_artifact=bool(route.get("artifact_required")),
     )
-    output_dir = _conversation_file_dir(conversation_id, "outputs").resolve()
+    output_dir = _hosted_turn_output_dir(conversation_id, turn_id).resolve()
     delivery_context = payload.delivery_context.strip()
     if artifact_required:
         delivery_context = "\n".join(
@@ -6266,7 +7024,7 @@ def enqueue_hosted_turn(
             for item in (
                 delivery_context,
                 f"Absolute output directory: `{output_dir}`.",
-                "Write every generated deliverable to this exact directory and report its absolute path.",
+                "Write every generated deliverable to this exact directory, but mention only file names in user-facing text.",
             )
             if item
         )
@@ -6425,14 +7183,39 @@ def create_hosted_turn(
         raise HTTPException(status_code=400, detail="turn_id 不能为空")
     if not payload.content.strip():
         raise HTTPException(status_code=400, detail="任务内容不能为空")
+    owner_id = owner_id_from_request(request)
+    with _STATE_LOCK:
+        state = load_single_state()
+        conversation, claimed = _owned_conversation_in_state(
+            state,
+            conversation_id,
+            owner_id,
+        )
+        conversation_profile = str(
+            conversation.get("profile") or "default"
+        ).strip() or "default"
+        if claimed:
+            save_single_state(state)
+    requested_mode = str(
+        payload.mode
+        or (
+            payload.route_metadata.get("mode")
+            if isinstance(payload.route_metadata, dict)
+            else ""
+        )
+        or "work"
+    ).strip().lower()
     route_metadata, mode, selected_profiles, artifact_required = _hosted_route_parameters(
         route_metadata=payload.route_metadata,
         content=payload.content,
         requested_mode=payload.mode,
-        requested_profiles=payload.profiles,
+        requested_profiles=(
+            [conversation_profile]
+            if requested_mode == "chat"
+            else payload.profiles
+        ),
         requested_artifact=payload.artifact_required,
     )
-    owner_id = owner_id_from_request(request)
     attachment_ids = list(
         dict.fromkeys(str(item).strip() for item in payload.attachment_ids)
     )
@@ -6440,7 +7223,7 @@ def create_hosted_turn(
         not item.startswith("file_") for item in attachment_ids
     ):
         raise HTTPException(status_code=422, detail="Invalid attachment_ids")
-    output_dir = _conversation_file_dir(conversation_id, "outputs").resolve()
+    output_dir = _hosted_turn_output_dir(conversation_id, turn_id).resolve()
     delivery_context = payload.delivery_context.strip()
     if artifact_required:
         delivery_context = "\n".join(
@@ -6448,7 +7231,7 @@ def create_hosted_turn(
             for item in (
                 delivery_context,
                 f"Absolute output directory: `{output_dir}`.",
-                "Write every generated deliverable to this exact directory and report its absolute path.",
+                "Write every generated deliverable to this exact directory, but mention only file names in user-facing text.",
             )
             if item
         )
@@ -6488,7 +7271,7 @@ def create_hosted_turn(
             profile=str(conversation.get("profile") or "default"),
         )
     start_hosted_workflow(conversation_id, turn_id)
-    return {"hosted_turn": run}
+    return {"hosted_turn": _public_hosted_turn(run)}
 
 
 @router.post(
@@ -6509,7 +7292,98 @@ def cancel_hosted_turn(
         )
     except RuntimeError as exc:
         raise HTTPException(status_code=404, detail=str(exc)) from exc
-    return {"hosted_turn": run}
+    return {"hosted_turn": _public_hosted_turn(run)}
+
+
+def _conversation_deletion_ready(conversation: dict[str, Any]) -> bool:
+    """Return true once no local or remote work still needs cancellation state."""
+
+    for run in (conversation.get("hosted_turns") or {}).values():
+        if not isinstance(run, dict):
+            continue
+        if str(run.get("status") or "queued") not in _HOSTED_TERMINAL_STATUSES:
+            return False
+        if any(
+            isinstance(remote, dict)
+            and str(remote.get("status") or "queued")
+            not in _REMOTE_TERMINAL_STATUSES
+            for remote in (run.get("remote_runs") or {}).values()
+        ):
+            return False
+    return True
+
+
+def _remove_room_index_for_conversation(
+    conversation_id: str,
+    owner_id: str,
+) -> bool:
+    """Remove the room alias so a deleted chat cannot be recreated by room ID."""
+
+    room_state = load_state()
+    rooms = room_state.get("rooms") or []
+    kept: list[dict[str, Any]] = []
+    removed = False
+    for room in rooms:
+        if not isinstance(room, dict):
+            continue
+        room_owner = str(room.get("owner_id") or "").strip()
+        matches_owner = room_owner == owner_id or _legacy_owner_claim_allowed(
+            room_owner,
+            owner_id,
+        )
+        if room.get("conversation_id") == conversation_id and matches_owner:
+            removed = True
+            continue
+        kept.append(room)
+    if removed:
+        room_state["rooms"] = kept
+        save_state(room_state)
+    return removed
+
+
+def _finalize_pending_conversation_deletion(conversation_id: str) -> bool:
+    """Purge a hidden deletion tombstone after workers no longer need it."""
+
+    runtime_sessions: list[tuple[str, str]] = []
+    owner_id = ""
+    with _STATE_LOCK:
+        state = load_single_state()
+        conversation = next(
+            (
+                item
+                for item in state.get("conversations") or []
+                if isinstance(item, dict) and item.get("id") == conversation_id
+            ),
+            None,
+        )
+        if (
+            not isinstance(conversation, dict)
+            or not conversation.get("delete_requested")
+            or not _conversation_deletion_ready(conversation)
+        ):
+            return False
+        runtime_sessions = [
+            (str(profile), str(session_id))
+            for profile, session_id in (
+                conversation.get("runtime_sessions") or {}
+            ).items()
+            if str(session_id or "").strip()
+        ]
+        owner_id = str(conversation.get("owner_id") or LOCAL_OWNER_ID)
+        state["conversations"] = [
+            item
+            for item in state.get("conversations") or []
+            if item.get("id") != conversation_id
+        ]
+        save_single_state(state)
+    _remove_room_index_for_conversation(conversation_id, owner_id)
+    for profile, session_id in runtime_sessions:
+        try:
+            _delete_runtime_session(profile, session_id)
+        except Exception:
+            pass
+    shutil.rmtree(conversation_files_root(conversation_id), ignore_errors=True)
+    return True
 
 
 @router.delete("/single/conversations/{conversation_id}")
@@ -6517,24 +7391,52 @@ def delete_single_conversation(
     conversation_id: str,
     request: Request = None,
 ):
+    pending_turn_ids: list[str] = []
+    owner_id = owner_id_from_request(request)
     with _STATE_LOCK:
         state = load_single_state()
         conversation, _claimed = _owned_conversation_in_state(
             state,
             conversation_id,
-            owner_id_from_request(request),
+            owner_id,
         )
-        for profile, session_id in (
-            conversation.get("runtime_sessions") or {}
-        ).items():
-            _delete_runtime_session(str(profile), str(session_id))
-        state["conversations"] = [
-            conversation
-            for conversation in state.get("conversations") or []
-            if conversation.get("id") != conversation_id
-        ]
+        _remove_room_index_for_conversation(conversation_id, owner_id)
+        now = int(time.time() * 1000)
+        conversation.update(
+            {
+                "delete_requested": True,
+                "delete_requested_at": now,
+                "updated_at": now,
+            }
+        )
+        for turn_id, run in (conversation.get("hosted_turns") or {}).items():
+            if not isinstance(run, dict):
+                continue
+            has_active_remote = any(
+                isinstance(remote, dict)
+                and str(remote.get("status") or "queued")
+                not in _REMOTE_TERMINAL_STATUSES
+                for remote in (run.get("remote_runs") or {}).values()
+            )
+            if (
+                str(run.get("status") or "queued")
+                not in _HOSTED_TERMINAL_STATUSES
+                or has_active_remote
+            ):
+                run.update(
+                    {
+                        "cancel_requested": True,
+                        "cancel_reason": "conversation_deleted",
+                        "cancel_requested_at": now,
+                        "updated_at": now,
+                    }
+                )
+                pending_turn_ids.append(str(turn_id))
         save_single_state(state)
-    shutil.rmtree(conversation_files_root(conversation_id), ignore_errors=True)
+    _notify_hosted_update()
+    if not _finalize_pending_conversation_deletion(conversation_id):
+        for turn_id in pending_turn_ids:
+            start_hosted_workflow(conversation_id, turn_id)
     return {"ok": True}
 
 
@@ -6599,12 +7501,13 @@ def get_rooms(request: Request):
         state = load_state()
         if _claim_legacy_rooms_in_state(state, owner_id):
             save_state(state)
+        single_state = load_single_state()
         rooms = [
             room
             for room in state.get("rooms") or []
             if str(room.get("owner_id") or "") == owner_id
+            and not _room_maps_to_deleting_conversation(room, single_state)
         ]
-        single_state = load_single_state()
         summaries = [
             _room_projection(room, single_state, summary=True)
             for room in rooms
@@ -6642,10 +7545,13 @@ def get_room(room_id: str, request: Request):
         ):
             save_state(state)
         room = _owned_room_in_state(state, room_id, owner_id)
+        single_state = load_single_state()
+        if _room_maps_to_deleting_conversation(room, single_state):
+            raise HTTPException(status_code=404, detail="Room not found")
         return {
             "room": _room_projection(
                 room,
-                load_single_state(),
+                single_state,
                 summary=False,
             )
         }
@@ -6663,22 +7569,19 @@ def delete_room(room_id: str, request: Request):
         )
         room = _owned_room_in_state(state, room_id, owner_id)
         conversation_id = str(room.get("conversation_id") or "")
+        if conversation_id:
+            try:
+                delete_single_conversation(conversation_id, request)
+                return {"ok": True}
+            except HTTPException as exc:
+                if exc.status_code != 404:
+                    raise
         before = len(state.get("rooms") or [])
         state["rooms"] = [
             room for room in state.get("rooms") or [] if room.get("id") != room_id
         ]
         if len(state["rooms"]) == before:
             raise HTTPException(status_code=404, detail="群聊不存在")
-        single_state = load_single_state()
-        single_state["conversations"] = [
-            conversation
-            for conversation in single_state.get("conversations") or []
-            if not (
-                conversation.get("id") == conversation_id
-                and str(conversation.get("owner_id") or LOCAL_OWNER_ID) == owner_id
-            )
-        ]
-        save_single_state(single_state)
         save_state(state)
     return {"ok": True}
 
@@ -6729,6 +7632,33 @@ def send_message(room_id: str, payload: SendMessageBody, request: Request):
             room_requests = {}
             room["hosted_requests"] = room_requests
         existing = room_requests.get(request_id)
+        if not isinstance(existing, dict):
+            # The conversation and room indexes live in separate atomic files.
+            # If the process stopped after the conversation commit, recover the
+            # room-side idempotency record from the hosted turn before appending
+            # another user message.
+            recovered_run = (conversation.get("hosted_turns") or {}).get(turn_id)
+            recovered_request = (
+                recovered_run.get("room_request")
+                if isinstance(recovered_run, dict)
+                else None
+            )
+            if (
+                isinstance(recovered_request, dict)
+                and str(recovered_request.get("request_id") or "") == request_id
+                and str(recovered_request.get("room_id") or "") == room_id
+            ):
+                existing = {
+                    "fingerprint": str(recovered_request.get("fingerprint") or ""),
+                    "message_id": str(recovered_request.get("message_id") or request_id),
+                    "turn_id": turn_id,
+                    "created_at": int(
+                        recovered_request.get("created_at")
+                        or recovered_run.get("created_at")
+                        or time.time() * 1000
+                    ),
+                }
+                room_requests[request_id] = existing
         if isinstance(existing, dict):
             if str(existing.get("fingerprint") or "") != fingerprint:
                 raise HTTPException(
@@ -6753,7 +7683,7 @@ def send_message(room_id: str, payload: SendMessageBody, request: Request):
                 "conversation_id": conversation["id"],
                 "message": message,
                 "messages": [message] if message else [],
-                "hosted_turn": hosted,
+                "hosted_turn": _public_hosted_turn(hosted),
             }
             save_single_state(single_state)
             save_state(state)
@@ -6801,8 +7731,17 @@ def send_message(room_id: str, payload: SendMessageBody, request: Request):
                 artifact_required=artifact_required,
                 mode=mode,
                 route_metadata=route_metadata,
-                output_dir=str(_conversation_file_dir(conversation["id"], "outputs").resolve()),
+                output_dir=str(
+                    _hosted_turn_output_dir(conversation["id"], turn_id).resolve()
+                ),
             )
+            run["room_request"] = {
+                "room_id": room_id,
+                "request_id": request_id,
+                "fingerprint": fingerprint,
+                "message_id": request_id,
+                "created_at": int(time.time() * 1000),
+            }
             room_requests[request_id] = {
                 "fingerprint": fingerprint,
                 "message_id": request_id,
@@ -6820,7 +7759,7 @@ def send_message(room_id: str, payload: SendMessageBody, request: Request):
                 "conversation_id": conversation["id"],
                 "message": user_message,
                 "messages": [user_message],
-                "hosted_turn": run,
+                "hosted_turn": _public_hosted_turn(run),
             }
     start_hosted_workflow(str(response["conversation_id"]), str(response["turn_id"]))
     _notify_hosted_update()
@@ -6861,7 +7800,7 @@ def cancel_room_hosted_turn(
         )
     except RuntimeError as exc:
         raise HTTPException(status_code=404, detail=str(exc)) from exc
-    return {"hosted_turn": hosted}
+    return {"hosted_turn": _public_hosted_turn(hosted)}
 
 
 def _profile_runner_result_error(result: Any) -> str:
@@ -6897,6 +7836,9 @@ def _profile_event_runner_main() -> int:
     try:
         request_payload = json.loads(sys.stdin.read() or "{}")
         prompt = _structured_text(request_payload.get("prompt"))
+        requested_session_id = _structured_text(
+            request_payload.get("session_id")
+        ).strip()
         if not prompt:
             raise ValueError("任务内容为空")
 
@@ -6995,6 +7937,27 @@ def _profile_event_runner_main() -> int:
             )
 
         session_db = SessionDB()
+        resolved_session_id = ""
+        conversation_history: list[dict[str, Any]] = []
+        if requested_session_id:
+            resolved_session_id = str(
+                session_db.resolve_resume_session_id(requested_session_id) or ""
+            ).strip()
+            if resolved_session_id and session_db.get_session(resolved_session_id):
+                conversation_history = [
+                    message
+                    for message in session_db.get_messages_as_conversation(
+                        resolved_session_id
+                    )
+                    if message.get("role") != "session_meta"
+                ]
+                session_db._conn.execute(
+                    "UPDATE sessions SET ended_at = NULL, end_reason = NULL WHERE id = ?",
+                    (resolved_session_id,),
+                )
+                session_db._conn.commit()
+            else:
+                resolved_session_id = ""
         agent = AIAgent(
             api_key=runtime.get("api_key"),
             base_url=runtime.get("base_url"),
@@ -7006,6 +7969,7 @@ def _profile_event_runner_main() -> int:
             quiet_mode=True,
             platform="cli",
             session_db=session_db,
+            session_id=resolved_session_id or None,
             credential_pool=runtime.get("credential_pool"),
             fallback_model=fallback or None,
             stream_delta_callback=lambda text: (
@@ -7023,6 +7987,8 @@ def _profile_event_runner_main() -> int:
                 {"status": str(kind), "text": str(text or kind)},
             ),
         )
+        if resolved_session_id:
+            agent._session_db_created = True
         agent.suppress_status_output = True
         emit(
             "session.info",
@@ -7038,7 +8004,10 @@ def _profile_event_runner_main() -> int:
         )
         with open(os.devnull, "w", encoding="utf-8") as devnull:
             with redirect_stdout(devnull), redirect_stderr(devnull):
-                result = agent.run_conversation(prompt)
+                result = agent.run_conversation(
+                    prompt,
+                    conversation_history=conversation_history,
+                )
         final_response = _structured_text(result.get("final_response"))
         status = "error" if result.get("failed") else "completed"
         emit(
@@ -7100,6 +8069,8 @@ def _sync_conversation_files(
     conversation: dict[str, Any],
     uploads_dir: Path | None = None,
     outputs_dir: Path | None = None,
+    *,
+    strict: bool = False,
 ) -> None:
     conversation_id = str(conversation.get("id") or "").strip()
     if not conversation_id:
@@ -7108,6 +8079,7 @@ def _sync_conversation_files(
     uploads = uploads_dir or _conversation_file_dir(conversation_id, "uploads")
     outputs = outputs_dir or _conversation_file_dir(conversation_id, "outputs")
     library = _file_library()
+    sync_options = {"strict": True} if strict else {}
     library.sync_directory(
         owner_id,
         uploads,
@@ -7115,6 +8087,7 @@ def _sync_conversation_files(
         conversation_id=conversation_id,
         profile=profile,
         origin_prefix=f"conversation:{conversation_id}:uploads",
+        **sync_options,
     )
     library.sync_directory(
         owner_id,
@@ -7123,11 +8096,12 @@ def _sync_conversation_files(
         conversation_id=conversation_id,
         profile=profile,
         origin_prefix=f"conversation:{conversation_id}:outputs",
+        **sync_options,
     )
 
 
-def _sync_account_conversations(owner_id: str) -> None:
-    """Claim legacy unowned conversations and discover model outputs."""
+def _sync_account_conversations(owner_id: str, *, strict: bool = False) -> None:
+    """Migrate explicitly bound legacy conversations and discover outputs."""
 
     with _STATE_LOCK:
         state = load_single_state()
@@ -7135,31 +8109,58 @@ def _sync_account_conversations(owner_id: str) -> None:
         changed = False
         for conversation in state.get("conversations") or []:
             existing_owner = str(conversation.get("owner_id") or "").strip()
-            if existing_owner and existing_owner != owner_id:
+            if conversation.get("delete_requested"):
                 continue
-            if not existing_owner:
+            if existing_owner != owner_id and not _legacy_owner_claim_allowed(
+                existing_owner,
+                owner_id,
+            ):
+                continue
+            if existing_owner != owner_id:
                 conversation["owner_id"] = owner_id
                 changed = True
             conversations.append(conversation)
         if changed:
             save_single_state(state)
     for conversation in conversations:
-        _sync_conversation_files(owner_id, conversation)
+        _sync_conversation_files(owner_id, conversation, strict=strict)
+
+
+def _account_file_migration_marker(owner_id: str) -> Path:
+    owner_hash = hashlib.sha256(owner_id.encode("utf-8")).hexdigest()[:32]
+    return (
+        _file_library().root
+        / "migrations"
+        / f"{_ACCOUNT_FILE_MIGRATION_VERSION}-{owner_hash}.done"
+    )
+
+
+def _migrate_account_conversation_files_once(owner_id: str) -> None:
+    """Index pre-library conversation files once for the account that claims them."""
+
+    marker = _account_file_migration_marker(owner_id)
+    if marker.is_file():
+        return
+    with _ACCOUNT_FILE_MIGRATION_LOCK:
+        if marker.is_file():
+            return
+        _sync_account_conversations(owner_id, strict=True)
+        marker.parent.mkdir(parents=True, exist_ok=True)
+        temporary = marker.with_name(f".{marker.name}.{uuid.uuid4().hex}.tmp")
+        try:
+            with temporary.open("x", encoding="utf-8", newline="\n") as handle:
+                os.chmod(temporary, 0o600)
+                handle.write(f"{int(time.time() * 1000)}\n")
+                handle.flush()
+                os.fsync(handle.fileno())
+            os.replace(temporary, marker)
+        finally:
+            temporary.unlink(missing_ok=True)
 
 
 def _library_attachment(record: dict[str, Any]) -> dict[str, Any]:
     file_id = str(record.get("id") or "")
     source = str(record.get("source") or "")
-    path = ""
-    if record.get("status") == "available":
-        try:
-            _owned_record, stored_path = _file_library().resolve_download(
-                str(record.get("owner_id") or LOCAL_OWNER_ID),
-                file_id,
-            )
-            path = str(stored_path)
-        except (KeyError, FileNotFoundError, ValueError):
-            path = ""
     return {
         key: record.get(key)
         for key in (
@@ -7183,7 +8184,6 @@ def _library_attachment(record: dict[str, Any]) -> dict[str, Any]:
         )
     } | {
         "bucket": "outputs" if source == "model_output" else "uploads",
-        "path": path,
         "download_url": f"/api/plugins/collaboration/files/{quote(file_id, safe='')}/download",
     }
 
@@ -7363,7 +8363,7 @@ def list_account_files(
     offset: int = 0,
 ):
     owner_id = owner_id_from_request(request)
-    _sync_account_conversations(owner_id)
+    _migrate_account_conversation_files_once(owner_id)
     try:
         start_ms = parse_date_filter(date_from)
         end_ms = parse_date_filter(date_to, end_of_day=True)

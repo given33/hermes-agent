@@ -1,12 +1,14 @@
 from __future__ import annotations
 
 import importlib.util
+import json
 from pathlib import Path
 import sys
 from types import SimpleNamespace
 import uuid
 
-from fastapi import FastAPI, Request
+import pytest
+from fastapi import FastAPI, HTTPException, Request
 from fastapi.testclient import TestClient
 
 
@@ -30,6 +32,9 @@ def _load_module():
 
 
 def _client(module, owner: str = "owner-a") -> TestClient:
+    # Production migrations are bound by HERMES_LEGACY_OWNER_ID or
+    # HERMES_OWNER_EMAIL. Most fixtures model that configured primary account.
+    module._configured_legacy_owner_id = lambda: owner
     app = FastAPI()
 
     @app.middleware("http")
@@ -68,11 +73,13 @@ def test_account_file_routes_cover_upload_artifact_link_download_and_delete(
         )
         assert upload.status_code == 200
         uploaded = upload.json()["attachment"]
+        assert "output_dir" not in upload.json()
         assert uploaded["source"] == "user_upload"
         assert uploaded["bucket"] == "uploads"
         assert uploaded["status"] == "available"
         assert uploaded["sha256"]
-        assert Path(uploaded["path"]).read_bytes() == b"user upload"
+        assert "path" not in uploaded
+        assert client.get(f"{prefix}/files/{uploaded['id']}/download").content == b"user upload"
 
         replayed_upload = client.post(
             f"{prefix}/single/conversations/{conversation['id']}/attachments",
@@ -97,7 +104,7 @@ def test_account_file_routes_cover_upload_artifact_link_download_and_delete(
             },
         )
         assert conflicting_upload.status_code == 409
-        assert Path(uploaded["path"]).read_bytes() == b"user upload"
+        assert client.get(f"{prefix}/files/{uploaded['id']}/download").content == b"user upload"
 
         own_list = client.get(f"{prefix}/files", params={"q": "notes"})
         assert own_list.status_code == 200
@@ -128,9 +135,9 @@ def test_account_file_routes_cover_upload_artifact_link_download_and_delete(
         assert reserve.status_code == 200
         reserved = reserve.json()["file"]
         assert reserved["status"] == "uploading"
-        assert reserved["path"] == ""
+        assert "path" not in reserved
 
-        output_path = Path(upload.json()["output_dir"]) / "result.pdf"
+        output_path = module._conversation_file_dir(conversation["id"], "outputs") / "result.pdf"
         output_path.write_bytes(b"%PDF-model-result")
         publish = client.post(
             f"{prefix}/single/conversations/{conversation['id']}/artifacts",
@@ -199,6 +206,136 @@ def test_account_file_routes_cover_upload_artifact_link_download_and_delete(
         assert after_delete.json()["files"] == []
 
 
+def test_account_file_listing_uses_only_the_index_and_hides_server_paths(
+    tmp_path,
+    monkeypatch,
+):
+    module = _load_module()
+    monkeypatch.setattr(module, "get_hermes_home", lambda: tmp_path)
+    monkeypatch.setattr(
+        module,
+        "_sync_account_conversations",
+        lambda _owner_id: (_ for _ in ()).throw(AssertionError("unexpected file scan")),
+    )
+    library = module._file_library()
+    incoming = tmp_path / "incoming-fixture"
+    incoming.mkdir()
+    source = incoming / "indexed.txt"
+    source.write_text("indexed", encoding="utf-8")
+    record = library.ingest_file(
+        "owner-index",
+        source,
+        name="indexed.txt",
+        source="user_upload",
+        allowed_roots=[incoming],
+    )
+    marker = module._account_file_migration_marker("owner-index")
+    marker.parent.mkdir(parents=True, exist_ok=True)
+    marker.write_text("done\n", encoding="utf-8")
+    prefix = "/api/plugins/collaboration"
+
+    with _client(module, owner="owner-index") as client:
+        response = client.get(f"{prefix}/files")
+
+    assert response.status_code == 200
+    assert response.json()["files"][0]["id"] == record["id"]
+    assert "path" not in response.json()["files"][0]
+
+
+def test_legacy_conversation_files_are_indexed_once_before_file_listing(
+    tmp_path,
+    monkeypatch,
+):
+    module = _load_module()
+    monkeypatch.setattr(module, "get_hermes_home", lambda: tmp_path)
+    conversation = module.create_single_conversation("default", "Legacy files")
+    conversation["owner_id"] = module.LOCAL_OWNER_ID
+    state = {"conversations": [conversation]}
+    monkeypatch.setattr(module, "load_single_state", lambda: state)
+    monkeypatch.setattr(module, "save_single_state", lambda _state: None)
+    output = module._conversation_file_dir(conversation["id"], "outputs") / "legacy.txt"
+    output.parent.mkdir(parents=True, exist_ok=True)
+    output.write_text("legacy bytes", encoding="utf-8")
+    prefix = "/api/plugins/collaboration"
+
+    with _client(module, owner="owner-migration") as client:
+        first = client.get(f"{prefix}/files")
+        assert first.status_code == 200
+        assert [item["name"] for item in first.json()["files"]] == ["legacy.txt"]
+        assert "path" not in first.json()["files"][0]
+        assert conversation["owner_id"] == "owner-migration"
+        assert module._account_file_migration_marker("owner-migration").is_file()
+
+        monkeypatch.setattr(
+            module,
+            "_sync_account_conversations",
+            lambda _owner_id: (_ for _ in ()).throw(AssertionError("migration repeated")),
+        )
+        second = client.get(f"{prefix}/files")
+
+    assert second.status_code == 200
+    assert second.json()["files"][0]["id"] == first.json()["files"][0]["id"]
+
+
+def test_unconfigured_account_cannot_claim_legacy_conversations_or_rooms(
+    tmp_path,
+    monkeypatch,
+):
+    module = _load_module()
+    monkeypatch.setattr(module, "get_hermes_home", lambda: tmp_path)
+    monkeypatch.setattr(module, "_configured_legacy_owner_id", lambda: "")
+    conversation = module.create_single_conversation("default", "Legacy private")
+    room = module.create_room_record("Legacy room", ["default"])
+    state = {"conversations": [conversation]}
+    room_state = {"rooms": [room]}
+    monkeypatch.setattr(module, "load_single_state", lambda: state)
+    monkeypatch.setattr(module, "save_single_state", lambda _state: None)
+
+    module._sync_account_conversations("owner-unbound", strict=True)
+
+    assert conversation.get("owner_id", "") != "owner-unbound"
+    with pytest.raises(HTTPException) as denied:
+        module._owned_conversation_in_state(
+            state,
+            conversation["id"],
+            "owner-unbound",
+        )
+    assert getattr(denied.value, "status_code", None) == 404
+    assert not module._claim_legacy_rooms_in_state(room_state, "owner-unbound")
+    assert room["owner_id"] == module.LOCAL_OWNER_ID
+
+
+def test_incomplete_legacy_file_migration_does_not_write_completion_marker(
+    tmp_path,
+    monkeypatch,
+):
+    module = _load_module()
+    monkeypatch.setattr(module, "get_hermes_home", lambda: tmp_path)
+    attempts = []
+
+    def fail_once(owner_id, *, strict=False):
+        attempts.append((owner_id, strict))
+        raise OSError("file changed during indexing")
+
+    monkeypatch.setattr(module, "_sync_account_conversations", fail_once)
+    marker = module._account_file_migration_marker("owner-retry")
+
+    with pytest.raises(OSError, match="changed during indexing"):
+        module._migrate_account_conversation_files_once("owner-retry")
+
+    assert attempts == [("owner-retry", True)]
+    assert not marker.exists()
+
+    monkeypatch.setattr(
+        module,
+        "_sync_account_conversations",
+        lambda owner_id, *, strict=False: attempts.append((owner_id, strict)),
+    )
+    module._migrate_account_conversation_files_once("owner-retry")
+    assert attempts[-1] == ("owner-retry", True)
+    assert marker.is_file()
+
+
 def test_rooms_are_account_scoped_and_enqueue_the_durable_hosted_workflow(
     tmp_path,
     monkeypatch,
@@ -239,6 +376,7 @@ def test_rooms_are_account_scoped_and_enqueue_the_durable_hosted_workflow(
         )
         assert created.status_code == 200
         room = created.json()["room"]
+        stored_room = rooms_state["rooms"][0]
         assert "owner_id" not in room
         assert room["conversation_id"].startswith("chat_room_")
 
@@ -267,6 +405,12 @@ def test_rooms_are_account_scoped_and_enqueue_the_durable_hosted_workflow(
         assert conversation["owner_id"] == "owner-a"
         assert conversation["messages"][-1]["content"] == "Run the PC checks"
         assert conversation["hosted_turns"]["room-turn-stable-001"]["status"] == "queued"
+        assert "room_request" not in body["hosted_turn"]
+
+        # Simulate a stop after single.json committed but before the separate
+        # room index commit. Replaying must reconstruct hosted_requests from the
+        # durable turn instead of appending the user message a second time.
+        rooms_state["rooms"][0]["hosted_requests"] = {}
 
         replayed = client.post(
             f"{prefix}/rooms/{room['id']}/messages",
@@ -287,6 +431,26 @@ def test_rooms_are_account_scoped_and_enqueue_the_durable_hosted_workflow(
         )
         assert cancelled.status_code == 200
         assert cancelled.json()["hosted_turn"]["cancel_requested"] is True
+
+        deleted = client.delete(
+            f"{prefix}/single/conversations/{room['conversation_id']}"
+        )
+        assert deleted.status_code == 200
+        assert rooms_state["rooms"] == []
+        assert conversation["delete_requested"] is True
+        assert single_state["conversations"] == [conversation]
+        assert started[-1] == (room["conversation_id"], "room-turn-stable-001")
+        with pytest.raises(HTTPException) as deleted_mapping:
+            module._room_conversation_in_state(
+                stored_room,
+                single_state,
+                "owner-a",
+            )
+        assert deleted_mapping.value.status_code == 404
+
+        conversation["hosted_turns"]["room-turn-stable-001"]["status"] = "cancelled"
+        assert module._finalize_pending_conversation_deletion(room["conversation_id"])
+        assert single_state["conversations"] == []
 
 
 def test_first_account_claims_legacy_rooms_once_and_other_accounts_stay_isolated(
@@ -355,6 +519,14 @@ def test_client_conversation_identity_is_idempotent_and_account_scoped(
 
     with _client(module, owner="owner-a") as client:
         first = client.post(f"{prefix}/single/conversations", json=payload)
+        state["conversations"][0]["hosted_turns"] = {
+            "turn-private": {
+                "turn_id": "turn-private",
+                "output_dir": str(tmp_path / "private-output"),
+                "output_baseline": {"secret.txt": "hash"},
+                "room_request": {"fingerprint": "private"},
+            }
+        }
         replay = client.post(f"{prefix}/single/conversations", json=payload)
         other = client.post(
             f"{prefix}/single/conversations",
@@ -367,6 +539,10 @@ def test_client_conversation_identity_is_idempotent_and_account_scoped(
     assert replay.status_code == 200
     assert replay.json()["created"] is False
     assert replay.json()["conversation"]["id"] == "chat_client-stable-001"
+    replayed_turn = replay.json()["conversation"]["hosted_turns"]["turn-private"]
+    assert "output_dir" not in replayed_turn
+    assert "output_baseline" not in replayed_turn
+    assert "room_request" not in replayed_turn
     assert other.status_code == 404
     assert len(state["conversations"]) == 1
 
@@ -394,6 +570,8 @@ def test_attachment_get_auto_registers_outputs(tmp_path, monkeypatch):
             if item["bucket"] == "outputs"
         ]
         assert len(outputs) == 1
+        assert "uploads_dir" not in response.json()
+        assert "output_dir" not in response.json()
         assert outputs[0]["name"] == "summary.csv"
         assert outputs[0]["source"] == "model_output"
 
@@ -410,6 +588,27 @@ def test_attachment_get_auto_registers_outputs(tmp_path, monkeypatch):
         assert hosted_collection[0]["download_url"].startswith(
             f"{prefix}/files/"
         )
+
+
+def test_attachment_sync_failure_never_falls_back_to_server_paths(tmp_path, monkeypatch):
+    module = _load_module()
+    monkeypatch.setattr(module, "get_hermes_home", lambda: tmp_path)
+    conversation = module.create_single_conversation("default", "Output failure")
+    conversation["owner_id"] = "owner-a"
+    state = {"conversations": [conversation]}
+    monkeypatch.setattr(module, "load_single_state", lambda: state)
+    output_dir = module._conversation_file_dir(conversation["id"], "outputs")
+    (output_dir / "private.txt").write_text("private", encoding="utf-8")
+    monkeypatch.setattr(
+        module,
+        "_sync_conversation_files",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(OSError("index unavailable")),
+    )
+
+    attachments = module._list_conversation_attachments(conversation["id"])
+
+    assert attachments == []
+    assert str(output_dir.resolve()) not in json.dumps(attachments)
 
 
 def test_account_file_upload_does_not_require_a_conversation(tmp_path, monkeypatch):
@@ -551,6 +750,65 @@ def test_single_conversation_routes_are_private_to_the_account(tmp_path, monkeyp
             headers=other,
         ).json()["conversations"] == []
         assert state["conversations"][0]["owner_id"] == "owner-a"
+
+
+def test_official_session_adoption_is_keyed_by_profile_and_session(
+    tmp_path,
+    monkeypatch,
+):
+    module = _load_module()
+    monkeypatch.setattr(module, "get_hermes_home", lambda: tmp_path)
+    state = {"conversations": []}
+    monkeypatch.setattr(module, "load_single_state", lambda: state)
+    monkeypatch.setattr(module, "save_single_state", lambda _state: None)
+    monkeypatch.setattr(
+        module,
+        "available_profiles",
+        lambda: [{"name": "default"}, {"name": "reviewer"}],
+    )
+    prefix = "/api/plugins/collaboration"
+
+    with _client(module, owner="owner-a") as client:
+        first = client.post(
+            f"{prefix}/single/conversations/adopt",
+            json={
+                "profile": "default",
+                "session_id": "shared-session",
+                "title": "Default history",
+                "messages": [{"role": "user", "content": "default message"}],
+            },
+        )
+        second = client.post(
+            f"{prefix}/single/conversations/adopt",
+            json={
+                "profile": "reviewer",
+                "session_id": "shared-session",
+                "title": "Reviewer history",
+                "messages": [{"role": "user", "content": "reviewer message"}],
+            },
+        )
+        replay = client.post(
+            f"{prefix}/single/conversations/adopt",
+            json={
+                "profile": "default",
+                "session_id": "shared-session",
+                "title": "Ignored replay",
+            },
+        )
+
+    assert first.status_code == second.status_code == replay.status_code == 200
+    assert first.json()["created"] is True
+    assert second.json()["created"] is True
+    assert replay.json()["created"] is False
+    assert first.json()["conversation"]["id"] != second.json()["conversation"]["id"]
+    assert first.json()["conversation"]["runtime_sessions"] == {
+        "default": "shared-session"
+    }
+    assert second.json()["conversation"]["runtime_sessions"] == {
+        "reviewer": "shared-session"
+    }
+    assert first.json()["conversation"]["messages"][0]["content"] == "default message"
+    assert second.json()["conversation"]["messages"][0]["content"] == "reviewer message"
 
 
 def test_connector_downloads_only_files_bound_to_its_remote_run(tmp_path, monkeypatch):
@@ -704,6 +962,95 @@ def test_connector_cancellation_includes_current_cursor_and_reaches_terminal_sta
         assert persisted_remote["checkpoint_cursor"] == 8
 
 
+def test_deleting_active_remote_conversation_retains_cancellation_until_ack(
+    tmp_path,
+    monkeypatch,
+):
+    module = _load_module()
+    monkeypatch.setattr(module, "get_hermes_home", lambda: tmp_path)
+    monkeypatch.setattr(module, "_configured_connector_token", lambda: "connector-secret")
+    conversation = module.create_single_conversation("default", "Delete active work")
+    conversation["owner_id"] = "owner-a"
+    state = {"conversations": [conversation]}
+    monkeypatch.setattr(module, "load_single_state", lambda: state)
+    monkeypatch.setattr(module, "save_single_state", lambda _state: None)
+    starts = []
+    monkeypatch.setattr(
+        module,
+        "start_hosted_workflow",
+        lambda *args: starts.append(args),
+    )
+    hosted = module.create_hosted_turn_record(
+        conversation,
+        turn_id="turn-delete-active",
+        content="long remote work",
+        title="Long remote work",
+        profiles=["dbb3-worker"],
+        artifact_required=False,
+    )
+    hosted["status"] = "running"
+    remote = module._ensure_remote_run(
+        conversation["id"],
+        "turn-delete-active",
+        role_stage="worker",
+        profile="dbb3-worker",
+        title="Long remote work",
+        objective="long remote work",
+        local_task_id="task-delete-active",
+        artifact_required=False,
+        delivery_context="",
+        attachment_context="",
+    )
+    hosted["remote_runs"]["worker"]["status"] = "running"
+    starts.clear()
+    prefix = "/api/plugins/collaboration"
+    auth = {
+        "authorization": "Bearer connector-secret",
+        "x-connector-id": "dbb3-primary",
+    }
+
+    with _client(module, owner="owner-a") as client:
+        starts.clear()
+        deleted = client.delete(
+            f"{prefix}/single/conversations/{conversation['id']}"
+        )
+        assert deleted.status_code == 200
+        assert deleted.json() == {"ok": True}
+        assert state["conversations"] == [conversation]
+        assert conversation["delete_requested"] is True
+        assert hosted["cancel_requested"] is True
+        assert starts == [(conversation["id"], "turn-delete-active")]
+        assert client.get(
+            f"{prefix}/single/conversations/{conversation['id']}"
+        ).status_code == 404
+
+        pulled = client.post(
+            f"{prefix}/connector/cancellations/pull",
+            headers=auth,
+            json={"connector_id": "dbb3-primary", "limit": 5, "lease_seconds": 30},
+        )
+        assert pulled.status_code == 200
+        assert pulled.json()["cancellations"][0]["remote_run_id"] == remote["id"]
+
+        acknowledged = client.post(
+            f"{prefix}/connector/runs/{remote['id']}/cancel-ack",
+            headers=auth,
+            json={
+                "connector_id": "dbb3-primary",
+                "checkpoint_cursor": 1,
+                "summary": "cancelled before deletion",
+            },
+        )
+        assert acknowledged.status_code == 200
+        assert acknowledged.json()["run"]["status"] == "cancelled"
+        assert state["conversations"] == [conversation]
+
+        hosted["status"] = "cancelled"
+        assert module._finalize_pending_conversation_deletion(conversation["id"])
+
+    assert state["conversations"] == []
+
+
 def test_connector_releases_running_run_after_lease_for_terminal_poll(
     tmp_path,
     monkeypatch,
@@ -845,6 +1192,7 @@ def test_atomic_enqueue_is_idempotent_and_persists_message_route_and_turn_togeth
             "created_at": 1234,
         },
         "recent_messages": [],
+        "profiles": ["default"],
         "attachment_ids": [],
         "attachment_context": "",
         "delivery_context": "由服务端判断交付范围",
@@ -888,6 +1236,264 @@ def test_atomic_enqueue_is_idempotent_and_persists_message_route_and_turn_togeth
         (conversation["id"], "turn-atomic-1"),
         (conversation["id"], "turn-atomic-1"),
     ]
+
+
+def test_atomic_chat_enqueue_falls_back_to_the_authenticated_conversation_profile(
+    tmp_path,
+    monkeypatch,
+):
+    module = _load_module()
+    monkeypatch.setattr(module, "get_hermes_home", lambda: tmp_path)
+    conversation = module.create_single_conversation("reviewer", "Reviewer chat")
+    conversation["owner_id"] = "owner-a"
+    state = {"conversations": [conversation]}
+    monkeypatch.setattr(module, "load_single_state", lambda: state)
+    monkeypatch.setattr(module, "save_single_state", lambda _state: None)
+    monkeypatch.setattr(module, "start_hosted_workflow", lambda *_args: None)
+    monkeypatch.setattr(
+        module,
+        "available_profiles",
+        lambda: [{"name": "default"}, {"name": "reviewer"}],
+    )
+    monkeypatch.setattr(
+        module,
+        "route_message",
+        lambda _payload: {
+            "mode": "chat",
+            "label": "简单任务",
+            "reason": "single profile",
+            "confidence": 1.0,
+            "source": "test",
+            "profiles": ["default"],
+            "artifact_required": False,
+        },
+    )
+    prefix = "/api/plugins/collaboration"
+    body = {
+        "request_id": "request-reviewer-chat",
+        "turn_id": "turn-reviewer-chat",
+        "message": {
+            "id": "message-reviewer-chat",
+            "role": "user",
+            "name": "User",
+            "content": "continue reviewer chat",
+        },
+        "recent_messages": [],
+        "profiles": ["default"],
+        "attachment_ids": [],
+    }
+
+    with _client(module, owner="owner-a") as client:
+        response = client.post(
+            f"{prefix}/single/conversations/{conversation['id']}/enqueue",
+            json=body,
+        )
+
+    assert response.status_code == 200
+    assert response.json()["hosted_turn"]["profiles"] == ["reviewer"]
+    replay_body = {**body, "profiles": ["reviewer"]}
+    with _client(module, owner="owner-a") as client:
+        replay = client.post(
+            f"{prefix}/single/conversations/{conversation['id']}/enqueue",
+            json=replay_body,
+        )
+    assert replay.status_code == 200
+    assert replay.json()["replayed"] is True
+    calls = []
+
+    def runner(profile, prompt, **kwargs):
+        calls.append((profile, prompt, kwargs))
+        return "reviewer response"
+
+    monkeypatch.setattr(module, "_schedule_mobile_completion_notification", lambda *_args: None)
+    module.execute_hosted_workflow(
+        conversation["id"],
+        "turn-reviewer-chat",
+        runner=runner,
+    )
+    assert [profile for profile, _prompt, _kwargs in calls] == ["reviewer"]
+
+
+def test_hosted_chat_rejects_a_recent_unbound_output_when_this_turn_creates_nothing(
+    tmp_path,
+    monkeypatch,
+):
+    module = _load_module()
+    monkeypatch.setattr(module, "get_hermes_home", lambda: tmp_path)
+    monkeypatch.setattr(
+        module,
+        "_schedule_mobile_completion_notification",
+        lambda *_args: None,
+    )
+    conversation = module.create_single_conversation("default", "Artifact isolation")
+    conversation["owner_id"] = "owner-a"
+    state = {"conversations": [conversation]}
+    monkeypatch.setattr(module, "load_single_state", lambda: state)
+    monkeypatch.setattr(module, "save_single_state", lambda _state: None)
+    output_dir = module._conversation_file_dir(conversation["id"], "outputs")
+    (output_dir / "old-report.pdf").write_bytes(b"previous turn")
+    module._sync_conversation_files("owner-a", conversation)
+    unbound, total = module._file_library().list_files(
+        "owner-a",
+        conversation_id=conversation["id"],
+    )
+    assert total == 1
+    assert unbound[0]["turn_id"] == ""
+
+    hosted = module.create_hosted_turn_record(
+        conversation,
+        turn_id="turn-no-current-file",
+        content="Create a fresh report",
+        title="Fresh report",
+        profiles=["default"],
+        artifact_required=True,
+        mode="chat",
+        output_dir=str(output_dir),
+    )
+    module.execute_hosted_chat(
+        conversation["id"],
+        "turn-no-current-file",
+        runner=lambda _profile, _prompt, **_kwargs: "No file was created",
+    )
+
+    assert hosted["status"] == "failed"
+    assert module._file_library().list_files(
+        "owner-a",
+        conversation_id=conversation["id"],
+        turn_id="turn-no-current-file",
+    )[1] == 0
+    final_message = next(
+        item
+        for item in reversed(conversation["messages"])
+        if item.get("meta", {}).get("message_key")
+        == "turn-no-current-file:chat:completed"
+    )
+    assert final_message["meta"]["attachments"] == []
+
+
+def test_hosted_turn_output_directories_are_stable_and_isolated(tmp_path, monkeypatch):
+    module = _load_module()
+    monkeypatch.setattr(module, "get_hermes_home", lambda: tmp_path)
+    conversation_id = "chat-output-isolation"
+
+    first = module._hosted_turn_output_dir(conversation_id, "turn-one").resolve()
+    replay = module._hosted_turn_output_dir(conversation_id, "turn-one").resolve()
+    second = module._hosted_turn_output_dir(conversation_id, "turn-two").resolve()
+
+    assert first == replay
+    assert first != second
+    assert first.parent == second.parent
+    assert first.is_relative_to(
+        module._conversation_file_dir(conversation_id, "outputs").resolve()
+    )
+
+
+def test_hosted_chat_delivers_only_the_file_created_after_its_output_baseline(
+    tmp_path,
+    monkeypatch,
+):
+    module = _load_module()
+    monkeypatch.setattr(module, "get_hermes_home", lambda: tmp_path)
+    monkeypatch.setattr(
+        module,
+        "_schedule_mobile_completion_notification",
+        lambda *_args: None,
+    )
+    conversation = module.create_single_conversation("default", "Artifact isolation")
+    conversation["owner_id"] = "owner-a"
+    state = {"conversations": [conversation]}
+    monkeypatch.setattr(module, "load_single_state", lambda: state)
+    monkeypatch.setattr(module, "save_single_state", lambda _state: None)
+    output_dir = module._conversation_file_dir(conversation["id"], "outputs")
+    (output_dir / "old-report.pdf").write_bytes(b"previous turn")
+    module._sync_conversation_files("owner-a", conversation)
+    hosted = module.create_hosted_turn_record(
+        conversation,
+        turn_id="turn-current-file",
+        content="Create a fresh report",
+        title="Fresh report",
+        profiles=["default"],
+        artifact_required=True,
+        mode="chat",
+        output_dir=str(output_dir),
+    )
+
+    def runner(_profile, _prompt, **_kwargs):
+        (output_dir / "current-report.pdf").write_bytes(b"current turn")
+        return "The current report is ready"
+
+    module.execute_hosted_chat(
+        conversation["id"],
+        "turn-current-file",
+        runner=runner,
+    )
+
+    assert hosted["status"] == "completed"
+    current_files, total = module._file_library().list_files(
+        "owner-a",
+        conversation_id=conversation["id"],
+        turn_id="turn-current-file",
+    )
+    assert total == 1
+    assert [item["name"] for item in current_files] == ["current-report.pdf"]
+    final_message = next(
+        item
+        for item in reversed(conversation["messages"])
+        if item.get("meta", {}).get("message_key") == "turn-current-file:chat:completed"
+    )
+    assert [item["name"] for item in final_message["meta"]["attachments"]] == [
+        "current-report.pdf"
+    ]
+
+    module._sync_conversation_files("owner-a", conversation)
+    preserved, preserved_total = module._file_library().list_files(
+        "owner-a",
+        conversation_id=conversation["id"],
+        turn_id="turn-current-file",
+    )
+    assert preserved_total == 1
+    assert preserved[0]["name"] == "current-report.pdf"
+
+
+def test_public_hosted_turn_projection_never_exposes_server_execution_paths():
+    module = _load_module()
+    internal = {
+        "turn_id": "turn-private-paths",
+        "status": "running",
+        "delivery_context": "Absolute output directory: /srv/hermes/private/turn.",
+        "user_delivery_context": "Please provide a PDF.",
+        "output_dir": "/srv/hermes/private/turn",
+        "output_baseline": {"old.pdf": "a" * 64},
+        "output_baseline_captured_at": 1234,
+        "remote_runs": {
+            "worker": {
+                "id": "remote-1",
+                "status": "running",
+                "delivery_context": "Write to /opt/worker/private",
+                "attachment_context": "Read /opt/worker/input",
+            }
+        },
+    }
+
+    projected = module._public_hosted_turn(internal)
+    encoded = json.dumps(projected, ensure_ascii=False)
+
+    assert projected["delivery_context"] == "Please provide a PDF."
+    assert projected["remote_runs"]["worker"] == {
+        "id": "remote-1",
+        "status": "running",
+    }
+    assert "output_dir" not in projected
+    assert "output_baseline" not in projected
+    assert "output_baseline_captured_at" not in projected
+    assert "/srv/hermes" not in encoded
+    assert "/opt/worker" not in encoded
+    assert internal["output_dir"] == "/srv/hermes/private/turn"
+
+    conversation = {"id": "conversation-1", "hosted_turns": {"turn-1": internal}}
+    public_conversation = module._public_conversation(conversation)
+    assert public_conversation["hosted_turns"]["turn-1"] == projected
+    assert conversation["hosted_turns"]["turn-1"] is internal
 
 
 def test_connector_credentials_and_profiles_are_bound_to_devices(tmp_path, monkeypatch):
@@ -1166,9 +1772,13 @@ def test_remote_progress_creates_semantic_milestones_and_redacts_activity_secret
         "OPENAI_API_KEY=private-openai-key",
         "DATABASE_PASSWORD='private-database-password'",
         "TOKEN: private-token-value",
+        'password="private secret password"',
+        "credential='private credential phrase'",
     ):
         redacted = module._redact_sensitive(raw_secret)
         assert "private-" not in redacted
+        assert "private secret password" not in redacted
+        assert "private credential phrase" not in redacted
         assert "[REDACTED]" in redacted
     stored_activity = conversation["hosted_turns"]["turn-milestones"]["remote_runs"]["worker"]["activities"][0]
     assert stored_activity["input"]["token_count"] == 12

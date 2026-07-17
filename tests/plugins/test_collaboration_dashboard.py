@@ -940,6 +940,25 @@ class CollaborationDashboardTests(unittest.TestCase):
         self.assertEqual(route["targets"], ["pc"])
         self.assertFalse(artifact_required)
 
+    def test_hosted_chat_preserves_one_valid_selected_profile(self):
+        module = load_module()
+        module.available_profiles = lambda: [
+            {"name": "default"},
+            {"name": "reviewer"},
+        ]
+
+        route, mode, profiles, artifact_required = module._hosted_route_parameters(
+            route_metadata={"mode": "chat", "profiles": ["reviewer"]},
+            content="继续之前的审阅会话",
+            requested_mode="chat",
+            requested_profiles=["reviewer"],
+        )
+
+        self.assertEqual(mode, "chat")
+        self.assertEqual(profiles, ["reviewer"])
+        self.assertEqual(route["profiles"], ["reviewer"])
+        self.assertFalse(artifact_required)
+
     def test_artifact_delivery_requires_an_explicit_file_deliverable(self):
         module = load_module()
 
@@ -1132,7 +1151,8 @@ class CollaborationDashboardTests(unittest.TestCase):
         self.assertIn("/api/plugins/collaboration", bundle)
         self.assertIn('collabApi("/rooms"', bundle)
         self.assertIn('collabApi("/single/conversations"', bundle)
-        self.assertIn('collabApi("/route"', bundle)
+        self.assertIn("submitBrowserEnqueue", bundle)
+        self.assertIn('"/enqueue"', bundle)
         self.assertIn("hc-single-chat", bundle)
         self.assertIn('placeholder: "输入消息"', bundle)
         self.assertIn('SDK.buildWsUrl("/api/ws")', bundle)
@@ -1143,7 +1163,7 @@ class CollaborationDashboardTests(unittest.TestCase):
         self.assertIn('kanbanApi("/tasks"', bundle)
         self.assertIn("/decompose", bundle)
         self.assertIn("sessionStorage", bundle)
-        self.assertIn("buildContinuousPrompt", bundle)
+        self.assertIn("recent_messages: messages.slice(-20)", bundle)
         self.assertIn("existingSessionId", bundle)
         self.assertIn("runtimeSessionsRef", bundle)
         self.assertIn("/runtime-session", bundle)
@@ -1190,7 +1210,8 @@ class CollaborationDashboardTests(unittest.TestCase):
         self.assertIn("hc-route-event", bundle)
         self.assertIn('kind: "route"', bundle)
         self.assertIn('name: route.label', bundle)
-        self.assertIn('await record(conversationId, routeMessage)', bundle)
+        self.assertIn("const route = enqueued.route || {};", bundle)
+        self.assertNotIn('await record(conversationId, routeMessage)', bundle)
         self.assertNotIn('className: "hc-header-profile"', bundle)
 
     def test_frontend_activity_duration_distinguishes_missing_data_from_zero(self):
@@ -1302,6 +1323,50 @@ class CollaborationDashboardTests(unittest.TestCase):
         self.assertIn("started_at: modelPhaseStartedAt || Date.now(),", bundle)
         self.assertIn("modelPhaseStartedAt = endedAt;", bundle)
 
+    def test_web_chat_uses_one_persistent_atomic_enqueue(self):
+        bundle = (MODULE_PATH.parent / "dist" / "index.js").read_text(
+            encoding="utf-8"
+        )
+        send_start = bundle.index("const send = async () =>")
+        send_end = bundle.index("\n    return h(", send_start)
+        send_source = bundle[send_start:send_end]
+
+        self.assertIn("BROWSER_ENQUEUE_OUTBOX_PREFIX", bundle)
+        self.assertIn("saveBrowserEnqueue(conversationId, enqueuePayload);", send_source)
+        self.assertIn("submitBrowserEnqueue(", send_source)
+        self.assertIn("currentRequestAccepted = true;", send_source)
+        self.assertIn("if (currentRequestAccepted)", send_source)
+        self.assertIn('"/enqueue"', bundle)
+        self.assertNotIn("await record(conversationId, userMessage)", send_source)
+        self.assertNotIn('collabApi("/route"', send_source)
+        self.assertNotIn('"/hosted-turns"', send_source)
+        self.assertLess(
+            send_source.index("saveBrowserEnqueue(conversationId, enqueuePayload);"),
+            send_source.index("const enqueued = await submitBrowserEnqueue("),
+        )
+
+    def test_browser_room_recovers_pending_send_and_refreshes_hosted_messages(self):
+        bundle = (MODULE_PATH.parent / "dist" / "index.js").read_text(
+            encoding="utf-8"
+        )
+        room_start = bundle.index("function RoomView({ roomId, onBack })")
+        room_end = bundle.index("\n  function GroupMode()", room_start)
+        room_source = bundle[room_start:room_end]
+
+        self.assertIn("BROWSER_ROOM_OUTBOX_PREFIX", bundle)
+        self.assertIn("saveBrowserRoomRequest(roomId, roomRequest);", room_source)
+        self.assertIn("submitBrowserRoomRequest(roomId, roomRequest)", room_source)
+        self.assertIn("loadBrowserRoomRequest(roomId)", room_source)
+        self.assertIn("roomRunning", room_source)
+        self.assertIn("currentRequestAccepted = true;", room_source)
+        self.assertIn("if (currentRequestAccepted)", room_source)
+        self.assertIn("timer = setTimeout(refresh, 900);", room_source)
+        self.assertIn('document.addEventListener("visibilitychange"', room_source)
+        self.assertLess(
+            room_source.index("saveBrowserRoomRequest(roomId, roomRequest);"),
+            room_source.index("await submitBrowserRoomRequest(roomId, roomRequest);"),
+        )
+
     def test_hosted_event_reducer_ignores_spinner_text_but_keeps_real_reasoning(self):
         module = load_module()
         state = {"content": "", "status": "streaming", "activities": []}
@@ -1378,9 +1443,16 @@ class CollaborationDashboardTests(unittest.TestCase):
         )
         calls = []
         notifications = []
-        module._schedule_mobile_completion_notification = (
-            lambda *args: notifications.append(args)
-        )
+
+        def capture_notification(*args):
+            persisted = conversation["hosted_turns"]["turn-hosted-1"].get(
+                "notification"
+            )
+            self.assertIsInstance(persisted, dict)
+            self.assertEqual(persisted["state"], "queued")
+            notifications.append(args)
+
+        module._schedule_mobile_completion_notification = capture_notification
 
         def runner(profile, prompt):
             calls.append((profile, prompt))
@@ -1420,6 +1492,10 @@ class CollaborationDashboardTests(unittest.TestCase):
             conversation["hosted_turns"]["turn-hosted-1"]["status"],
             "completed",
         )
+        notification = conversation["hosted_turns"]["turn-hosted-1"]["notification"]
+        self.assertEqual(notification["state"], "queued")
+        self.assertEqual(notification["task_status"], "completed")
+        self.assertTrue(notification["collapse_id"].startswith("hermes-turn-"))
         self.assertEqual(
             notifications,
             [(
@@ -1441,8 +1517,234 @@ class CollaborationDashboardTests(unittest.TestCase):
         self.assertIn("独立抽样复核", reviewer_prompt)
         self.assertIn("正常的 Skill、MCP、命令和取证调用不属于过度执行", reviewer_prompt)
         self.assertNotIn("不要主动查询或修改 Kanban 内部状态", reviewer_prompt)
-
         self.assertIn("不得创建、改派、关闭或删除根任务", reporter_prompt)
+
+    def test_notification_delivery_progress_and_terminal_state_are_persisted(self):
+        module = load_module()
+        conversation = module.create_single_conversation("default")
+        conversation["owner_id"] = "owner-a"
+        run = module.create_hosted_turn_record(
+            conversation,
+            turn_id="turn-notification",
+            content="finish",
+            title="finish",
+            profiles=["default"],
+            artifact_required=False,
+        )
+        run.update(
+            {
+                "status": "completed",
+                "notification": module._completion_notification_record(
+                    conversation["id"],
+                    "turn-notification",
+                    "completed",
+                    "finished",
+                ),
+            }
+        )
+        state = {"conversations": [conversation]}
+        module.load_single_state = lambda: state
+        module.save_single_state = lambda _state: None
+        observed = {}
+
+        def deliver(**kwargs):
+            observed.update(kwargs)
+            deliveries = {
+                "registration-hash": {
+                    "state": "delivered",
+                    "attempts": 1,
+                    "last_error": "",
+                    "updated_at": 1234,
+                }
+            }
+            kwargs["progress_callback"](deliveries)
+            return {"state": "delivered", "deliveries": deliveries, "error": ""}
+
+        with patch(
+            "hermes_cli.dashboard_auth.mobile_notifications.deliver_task_completion_push",
+            side_effect=deliver,
+        ):
+            delay = module._deliver_persisted_completion_notification(
+                conversation["id"],
+                "turn-notification",
+            )
+
+        self.assertIsNone(delay)
+        persisted = run["notification"]
+        self.assertEqual(persisted["state"], "delivered")
+        self.assertEqual(persisted["attempts"], 1)
+        self.assertIn("completed_at", persisted)
+        self.assertEqual(
+            persisted["deliveries"]["registration-hash"]["state"],
+            "delivered",
+        )
+        self.assertEqual(observed["collapse_id"], persisted["collapse_id"])
+
+    def test_startup_replays_a_persisted_terminal_notification_outbox(self):
+        module = load_module()
+        conversation = module.create_single_conversation("default")
+        run = module.create_hosted_turn_record(
+            conversation,
+            turn_id="turn-notification-replay",
+            content="finish",
+            title="finish",
+            profiles=["default"],
+            artifact_required=False,
+        )
+        run.update(
+            {
+                "status": "completed",
+                "notification": {
+                    **module._completion_notification_record(
+                        conversation["id"],
+                        "turn-notification-replay",
+                        "completed",
+                        "finished",
+                    ),
+                    "state": "retry",
+                },
+            }
+        )
+        hosted_starts = []
+        notification_starts = []
+        module.start_hosted_workflow = lambda *args: hosted_starts.append(args)
+        module._schedule_mobile_completion_notification = (
+            lambda *args: notification_starts.append(args)
+        )
+
+        module.resume_unfinished_hosted_workflows([conversation])
+
+        self.assertEqual(hosted_starts, [])
+        self.assertEqual(
+            notification_starts,
+            [(
+                conversation["id"],
+                "turn-notification-replay",
+                "completed",
+                "finished",
+            )],
+        )
+
+    def test_persistent_notifications_share_one_process_dispatcher(self):
+        module = load_module()
+        conversations = []
+        for index in range(2):
+            conversation = module.create_single_conversation("default")
+            conversation["owner_id"] = "owner-a"
+            run = module.create_hosted_turn_record(
+                conversation,
+                turn_id=f"turn-dispatch-{index}",
+                content="finish",
+                title="finish",
+                profiles=["default"],
+                artifact_required=False,
+            )
+            run.update(
+                {
+                    "status": "completed",
+                    "notification": module._completion_notification_record(
+                        conversation["id"],
+                        f"turn-dispatch-{index}",
+                        "completed",
+                        "finished",
+                    ),
+                }
+            )
+            conversations.append(conversation)
+        state = {"conversations": conversations}
+        module.load_single_state = lambda: state
+        module.save_single_state = lambda _state: None
+        created_threads = []
+
+        class FakeThread:
+            def __init__(self, *, target, name, daemon):
+                self.target = target
+                self.name = name
+                self.daemon = daemon
+                self.started = False
+                created_threads.append(self)
+
+            def start(self):
+                self.started = True
+
+            def is_alive(self):
+                return self.started
+
+        module._MOBILE_NOTIFICATION_DISPATCH_THREAD = None
+        module._MOBILE_NOTIFICATION_PENDING.clear()
+        try:
+            with patch.object(module.threading, "Thread", FakeThread):
+                for index, conversation in enumerate(conversations):
+                    module._schedule_mobile_completion_notification(
+                        conversation["id"],
+                        f"turn-dispatch-{index}",
+                        "completed",
+                        "finished",
+                    )
+
+            self.assertEqual(len(created_threads), 1)
+            self.assertEqual(created_threads[0].name, "hermes-apns-dispatcher")
+            self.assertTrue(created_threads[0].daemon)
+            self.assertEqual(len(module._MOBILE_NOTIFICATION_PENDING), 2)
+        finally:
+            module._MOBILE_NOTIFICATION_DISPATCH_THREAD = None
+            module._MOBILE_NOTIFICATION_PENDING.clear()
+
+    def test_hosted_workflow_consumer_preserves_durable_turn_order(self):
+        module = load_module()
+        conversation = module.create_single_conversation("default")
+        conversation["owner_id"] = "owner-a"
+        newer = module.create_hosted_turn_record(
+            conversation,
+            turn_id="turn-newer",
+            content="newer",
+            title="newer",
+            profiles=["default"],
+            artifact_required=False,
+        )
+        older = module.create_hosted_turn_record(
+            conversation,
+            turn_id="turn-older",
+            content="older",
+            title="older",
+            profiles=["default"],
+            artifact_required=False,
+        )
+        newer["created_at"] = 200
+        older["created_at"] = 100
+        state = {"conversations": [conversation]}
+        module.load_single_state = lambda: state
+        observed = []
+
+        def execute(conversation_id, turn_id):
+            observed.append((conversation_id, turn_id))
+            conversation["hosted_turns"][turn_id]["status"] = "completed"
+
+        module.execute_hosted_workflow = execute
+        thread = module.start_hosted_workflow(conversation["id"], "turn-newer")
+        thread.join(timeout=2)
+
+        self.assertFalse(thread.is_alive())
+        self.assertEqual(
+            observed,
+            [
+                (conversation["id"], "turn-older"),
+                (conversation["id"], "turn-newer"),
+            ],
+        )
+
+    def test_hosted_workflow_consumer_exits_after_conversation_deletion(self):
+        module = load_module()
+        conversation = module.create_single_conversation("default")
+        state = {"conversations": [conversation]}
+        module.load_single_state = lambda: state
+
+        state["conversations"] = []
+        thread = module.start_hosted_workflow(conversation["id"], "turn-deleted")
+        thread.join(timeout=2)
+
+        self.assertFalse(thread.is_alive())
+        self.assertNotIn(conversation["id"], module._HOSTED_THREADS)
 
     def test_conversation_index_compacts_hosted_role_event_payloads(self):
         module = load_module()
@@ -1679,16 +1981,20 @@ class CollaborationDashboardTests(unittest.TestCase):
             )
         )
 
-    def test_frontend_submits_complex_workflow_once_to_dbb3_hosting(self):
+    def test_frontend_submits_chat_and_work_with_file_ids_to_server_hosting(self):
         bundle = (MODULE_PATH.parent / "dist" / "index.js").read_text(
             encoding="utf-8"
         )
-        work_start = bundle.index('if (route.mode === "work")')
-        work_end = bundle.index("} else {", work_start)
-        workflow = bundle[work_start:work_end]
+        send_start = bundle.index("const send = async () =>")
+        send_end = bundle.index("return h(", send_start)
+        workflow = bundle[send_start:send_end]
 
-        self.assertIn('"/hosted-turns"', workflow)
+        self.assertIn("submitBrowserEnqueue(", workflow)
+        self.assertIn("request_id: requestId", workflow)
         self.assertIn("turn_id: hostedTurnId", workflow)
+        self.assertIn("attachment_ids: attachmentIds", workflow)
+        self.assertIn("recent_messages: messages.slice(-20)", workflow)
+        self.assertIn("saveBrowserEnqueue(conversationId, enqueuePayload)", workflow)
         self.assertIn("setHostedRunning(true)", workflow)
         self.assertNotIn("await runProfile(", workflow)
 
@@ -1729,18 +2035,18 @@ class CollaborationDashboardTests(unittest.TestCase):
         module.save_single_state = lambda _state: None
         attachment_lookups = []
 
-        def list_attachments(conversation_id):
+        def list_attachments(conversation_id, turn_id, _started_at):
             attachment_lookups.append(conversation_id)
             return [
                 {
                     "id": "output-1",
                     "bucket": "outputs",
                     "name": "result.pptx",
-                    "updated_at": 10**15,
+                    "turn_id": turn_id,
                 }
             ]
 
-        module._list_conversation_attachments = list_attachments
+        module._hosted_turn_output_attachments = list_attachments
         task_creator = lambda **kwargs: {
             "task_id": f"root-{kwargs['turn_id']}",
             "child_ids": [],
@@ -1993,7 +2299,7 @@ class CollaborationDashboardTests(unittest.TestCase):
         ).read_text(encoding="utf-8")
 
         self.assertNotIn('className: "hc-route-select"', bundle)
-        self.assertIn('collabApi("/route"', bundle)
+        self.assertIn('"/enqueue"', bundle)
         self.assertNotIn('{ path: "/files",', app_source)
 
     def test_frontend_recovers_transient_stream_disconnects_without_resubmitting(self):
@@ -2229,9 +2535,9 @@ class CollaborationDashboardTests(unittest.TestCase):
         self.assertEqual(result["conversation"]["title"], "New title")
         self.assertEqual(saved[-1]["conversations"][0]["title"], "New title")
 
-    def test_hosted_chat_uses_only_default_hermes_without_kanban(self):
+    def test_hosted_chat_uses_selected_profile_and_secure_file_ids_without_kanban(self):
         module = load_module()
-        conversation = module.create_single_conversation("default")
+        conversation = module.create_single_conversation("reviewer")
         conversation["owner_id"] = "owner-a"
         state = {"conversations": [conversation]}
         module.load_single_state = lambda: state
@@ -2242,7 +2548,7 @@ class CollaborationDashboardTests(unittest.TestCase):
             turn_id="turn-chat-hosted",
             content="你好",
             title="你好",
-            profiles=["default"],
+            profiles=["reviewer"],
             artifact_required=False,
             attachment_ids=["file_report"],
             attachment_context="客户端伪造路径：/tmp/not-authoritative.pdf",
@@ -2279,7 +2585,7 @@ class CollaborationDashboardTests(unittest.TestCase):
         )
 
         run = conversation["hosted_turns"]["turn-chat-hosted"]
-        self.assertEqual([profile for profile, _prompt, _kwargs in calls], ["default"])
+        self.assertEqual([profile for profile, _prompt, _kwargs in calls], ["reviewer"])
         self.assertNotIn("kanban_task_id", calls[0][2])
         self.assertIn("report.pdf", calls[0][1])
         self.assertIn(str(persisted_attachment), calls[0][1])
@@ -2294,9 +2600,163 @@ class CollaborationDashboardTests(unittest.TestCase):
         )
         self.assertEqual(final["role"], "assistant")
         self.assertEqual(final["sender_role"], "hermes")
-        self.assertEqual(final["profile"], "default")
+        self.assertEqual(final["profile"], "reviewer")
         self.assertIn("created_at", final)
         self.assertIn("completed_at", final)
+
+    def test_hosted_chat_reuses_and_updates_the_profile_runtime_session(self):
+        module = load_module()
+        conversation = module.create_single_conversation("reviewer")
+        conversation["owner_id"] = "owner-a"
+        conversation["runtime_sessions"] = {"reviewer": "session-existing"}
+        state = {"conversations": [conversation]}
+        module.load_single_state = lambda: state
+        module.save_single_state = lambda _state: None
+        module._schedule_mobile_completion_notification = lambda *_args: None
+        module.create_hosted_turn_record(
+            conversation,
+            turn_id="turn-session-continuity",
+            content="继续",
+            title="继续",
+            profiles=["reviewer"],
+            artifact_required=False,
+            mode="chat",
+            route_metadata={"mode": "chat"},
+        )
+        calls = []
+
+        def runner(profile, prompt, *, event_callback=None, session_id=""):
+            calls.append((profile, prompt, session_id))
+            event_callback(
+                {
+                    "type": "session.info",
+                    "payload": {
+                        "session_id": "session-resolved-tip",
+                        "model": "model-a",
+                        "provider": "provider-a",
+                    },
+                }
+            )
+            event_callback(
+                {
+                    "type": "message.complete",
+                    "payload": {
+                        "text": "连续回复",
+                        "status": "completed",
+                        "session_id": "session-resolved-tip",
+                    },
+                }
+            )
+            return "连续回复"
+
+        module.execute_hosted_chat(
+            conversation["id"],
+            "turn-session-continuity",
+            runner=runner,
+        )
+
+        self.assertEqual(calls[0][0], "reviewer")
+        self.assertEqual(calls[0][2], "session-existing")
+        self.assertNotIn("最近对话：\n你:", calls[0][1])
+        self.assertEqual(
+            conversation["runtime_sessions"]["reviewer"],
+            "session-resolved-tip",
+        )
+
+    def test_completed_hosted_chat_role_is_not_executed_again_after_restart(self):
+        module = load_module()
+        conversation = module.create_single_conversation("default")
+        state = {"conversations": [conversation]}
+        module.load_single_state = lambda: state
+        module.save_single_state = lambda _state: None
+        module._schedule_mobile_completion_notification = lambda *_args: None
+        run = module.create_hosted_turn_record(
+            conversation,
+            turn_id="turn-completed-role",
+            content="执行一次",
+            title="执行一次",
+            profiles=["default"],
+            artifact_required=False,
+            mode="chat",
+            route_metadata={"mode": "chat"},
+        )
+        run["status"] = "running"
+        run["role_events"] = {
+            "chat": {
+                "profile": "default",
+                "content": "已经完成",
+                "status": "completed",
+                "activities": [],
+                "runtime_session_id": "session-completed",
+                "started_at": 1000,
+                "completed_at": 2000,
+            }
+        }
+
+        module.execute_hosted_chat(
+            conversation["id"],
+            "turn-completed-role",
+            runner=lambda *_args, **_kwargs: self.fail("completed role reran"),
+        )
+
+        self.assertEqual(run["status"], "completed")
+        self.assertEqual(run["chat_result"], "已经完成")
+        self.assertEqual(
+            conversation["runtime_sessions"]["default"],
+            "session-completed",
+        )
+
+    def test_simple_chat_file_delivery_is_in_prompt_and_published(self):
+        module = load_module()
+        conversation = module.create_single_conversation("default")
+        conversation["owner_id"] = "owner-a"
+        state = {"conversations": [conversation]}
+        module.load_single_state = lambda: state
+        module.save_single_state = lambda _state: None
+        module._schedule_mobile_completion_notification = lambda *_args: None
+        output_dir = module._hosted_turn_output_dir(
+            conversation["id"],
+            "turn-chat-file",
+        )
+        delivery_context = (
+            f"Absolute output directory: `{output_dir.resolve()}`.\n"
+            "Write every generated deliverable to this exact directory."
+        )
+        run = module.create_hosted_turn_record(
+            conversation,
+            turn_id="turn-chat-file",
+            content="生成一个 PDF",
+            title="生成 PDF",
+            profiles=["default"],
+            artifact_required=True,
+            delivery_context=delivery_context,
+            mode="chat",
+            route_metadata={"mode": "chat", "artifact_required": True},
+            output_dir=str(output_dir.resolve()),
+        )
+        prompts = []
+
+        def runner(_profile, prompt, **_kwargs):
+            prompts.append(prompt)
+            (output_dir / "report.pdf").write_bytes(b"%PDF-fixture")
+            return "已生成 report.pdf"
+
+        module.execute_hosted_chat(
+            conversation["id"],
+            "turn-chat-file",
+            runner=runner,
+        )
+
+        self.assertIn(str(output_dir.resolve()), prompts[0])
+        self.assertEqual(run["status"], "completed")
+        final = next(
+            message
+            for message in conversation["messages"]
+            if message.get("meta", {}).get("message_key")
+            == "turn-chat-file:chat:completed"
+        )
+        self.assertEqual([item["name"] for item in final["meta"]["attachments"]], ["report.pdf"])
+        self.assertNotIn("path", final["meta"]["attachments"][0])
 
     def test_two_hosted_workers_run_concurrently_before_reviewer_and_reporter(self):
         module = load_module()
@@ -2615,7 +3075,8 @@ class CollaborationDashboardTests(unittest.TestCase):
                 root = kanban_db.get_task(conn, result["task_id"])
             self.assertEqual(root.session_id, "conversation-kanban")
             self.assertIn("Required execution lanes", root.body)
-            self.assertIn("C:/absolute/output", root.body)
+            self.assertNotIn("C:/absolute/output", root.body)
+            self.assertNotIn("Absolute output directory", root.body)
 
     def test_hosted_role_keeps_natural_mid_task_milestone_as_separate_message(self):
         module = load_module()

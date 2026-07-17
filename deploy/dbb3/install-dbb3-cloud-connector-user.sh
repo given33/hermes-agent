@@ -9,6 +9,23 @@ umask 077
 die() { printf 'install-dbb3-cloud-connector-user: %s\n' "$*" >&2; exit 1; }
 [[ "$(id -u)" == 0 ]] || die "must run as root"
 
+install_lock="${HERMES_CONNECTOR_INSTALL_LOCK_FILE:-/run/lock/hermes-agent/cloud-connector-install.lock}"
+install_lock_dir="$(dirname "${install_lock}")"
+if [[ ! -d "${install_lock_dir}" ]]; then
+  install -d -o root -g root -m 0755 "${install_lock_dir}"
+fi
+[[ -d "${install_lock_dir}" && ! -L "${install_lock_dir}" ]] || die "unsafe install lock directory"
+[[ "$(stat -c '%u' "${install_lock_dir}")" == 0 ]] || die "install lock directory must be root-owned"
+lock_dir_mode="$(stat -c '%a' "${install_lock_dir}")"
+(( (8#${lock_dir_mode} & 0022) == 0 )) || die "install lock directory must not be group/world-writable"
+if [[ -e "${install_lock}" || -L "${install_lock}" ]]; then
+  [[ -f "${install_lock}" && ! -L "${install_lock}" ]] || die "unsafe install lock file"
+  [[ "$(stat -c '%u' "${install_lock}")" == 0 ]] || die "install lock file must be root-owned"
+fi
+exec 8>"${install_lock}"
+chmod 0600 "${install_lock}"
+flock -n 8 || die "another connector deployment is already running"
+
 source_file="${1:-$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/dbb3_cloud_connector.py}"
 cloud_url="${HERMES_CLOUD_URL:-https://daxueshenmai.top/api/plugins/collaboration}"
 connector_user="${DBB3_CONNECTOR_USER:-hermes}"

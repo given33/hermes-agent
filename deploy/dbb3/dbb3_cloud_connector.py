@@ -60,7 +60,7 @@ _INLINE_SECRET_PATTERNS = (
     re.compile(
         r"(?i)\b(Authorization|Proxy-Authorization|Cookie|Set-Cookie|"
         r"X-Api-Key|Api-Key|API[_ -]?Key|Access[_ -]?Token|Refresh[_ -]?Token|"
-        r"Password|Passwd|Secret|Credential)\b\s*[:=]\s*([^\s,;]+|\"[^\"]*\"|'[^']*')"
+        r"Password|Passwd|Secret|Credential)\b\s*[:=]\s*(\"[^\"]*\"|'[^']*'|[^\s,;]+)"
     ),
     re.compile(
         r"(?i)(?<![A-Za-z0-9_])((?:[A-Za-z][A-Za-z0-9_]*_)?(?:"

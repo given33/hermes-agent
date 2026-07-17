@@ -167,6 +167,7 @@ def test_sync_outputs_is_idempotent_and_updates_changed_artifact(tmp_path):
         output_root,
         source="model_output",
         conversation_id="chat-sync",
+        turn_id="turn-sync",
         origin_prefix="chat-sync:outputs",
     )
     second = library.sync_directory(
@@ -178,6 +179,8 @@ def test_sync_outputs_is_idempotent_and_updates_changed_artifact(tmp_path):
     )
     assert len(first) == len(second) == 1
     assert first[0]["id"] == second[0]["id"]
+    assert first[0]["turn_id"] == second[0]["turn_id"] == "turn-sync"
+    assert library.list_files("account", turn_id="turn-sync")[1] == 1
     assert library.list_files("account")[1] == 1
 
     artifact.write_bytes(b"a,b\n3,4\n")

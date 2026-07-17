@@ -545,6 +545,10 @@
   const ACTIVE_CONVERSATION_KEY = "hermes.unified.activeConversation";
   const PENDING_STORED_SESSION_KEY =
     "hermes.unified.pendingStoredSession";
+  const BROWSER_ENQUEUE_OUTBOX_PREFIX =
+    "hermes.unified.enqueueOutbox.v1";
+  const BROWSER_ROOM_OUTBOX_PREFIX =
+    "hermes.collaboration.roomOutbox.v1";
 
   function loadRememberedConversationId() {
     try {
@@ -574,6 +578,122 @@
     }
   }
 
+  function browserEnqueueOutboxKey(conversationId) {
+    return `${BROWSER_ENQUEUE_OUTBOX_PREFIX}:${window.location.origin}:${conversationId}`;
+  }
+
+  function loadBrowserEnqueue(conversationId) {
+    if (!conversationId) return null;
+    try {
+      const parsed = JSON.parse(
+        window.localStorage.getItem(browserEnqueueOutboxKey(conversationId)) || "null",
+      );
+      if (
+        !parsed ||
+        typeof parsed.request_id !== "string" ||
+        typeof parsed.turn_id !== "string" ||
+        !parsed.message ||
+        typeof parsed.message.content !== "string"
+      ) return null;
+      return parsed;
+    } catch {
+      return null;
+    }
+  }
+
+  function saveBrowserEnqueue(conversationId, payload) {
+    try {
+      window.localStorage.setItem(
+        browserEnqueueOutboxKey(conversationId),
+        JSON.stringify(payload),
+      );
+    } catch {
+      // The atomic server endpoint still protects this live submission.
+    }
+  }
+
+  function clearBrowserEnqueue(conversationId, requestId) {
+    try {
+      const pending = loadBrowserEnqueue(conversationId);
+      if (!pending || pending.request_id === requestId) {
+        window.localStorage.removeItem(browserEnqueueOutboxKey(conversationId));
+      }
+    } catch {
+      // The server-side request remains idempotent if browser storage is unavailable.
+    }
+  }
+
+  async function submitBrowserEnqueue(conversationId, payload) {
+    const response = await collabApi(
+      "/single/conversations/" +
+        encodeURIComponent(conversationId) +
+        "/enqueue",
+      {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(payload),
+      },
+    );
+    clearBrowserEnqueue(conversationId, payload.request_id);
+    return response;
+  }
+
+  function browserRoomOutboxKey(roomId) {
+    return `${BROWSER_ROOM_OUTBOX_PREFIX}:${window.location.origin}:${roomId}`;
+  }
+
+  function loadBrowserRoomRequest(roomId) {
+    try {
+      const parsed = JSON.parse(
+        window.localStorage.getItem(browserRoomOutboxKey(roomId)) || "null",
+      );
+      if (
+        !parsed ||
+        typeof parsed.request_id !== "string" ||
+        typeof parsed.turn_id !== "string" ||
+        typeof parsed.content !== "string"
+      ) return null;
+      return parsed;
+    } catch {
+      return null;
+    }
+  }
+
+  function saveBrowserRoomRequest(roomId, payload) {
+    try {
+      window.localStorage.setItem(
+        browserRoomOutboxKey(roomId),
+        JSON.stringify(payload),
+      );
+    } catch {
+      // Server-side room idempotency still protects the active submission.
+    }
+  }
+
+  function clearBrowserRoomRequest(roomId, requestId) {
+    try {
+      const pending = loadBrowserRoomRequest(roomId);
+      if (!pending || pending.request_id === requestId) {
+        window.localStorage.removeItem(browserRoomOutboxKey(roomId));
+      }
+    } catch {
+      // The pending payload stays available for a later explicit retry.
+    }
+  }
+
+  async function submitBrowserRoomRequest(roomId, payload) {
+    const response = await collabApi(
+      "/rooms/" + encodeURIComponent(roomId) + "/messages",
+      {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(payload),
+      },
+    );
+    clearBrowserRoomRequest(roomId, payload.request_id);
+    return response;
+  }
+
   function profileDisplayName(profile) {
     const names = {
       default: "Hermes",
@@ -590,29 +710,6 @@
     if (profile === "pc-worker") return "PC";
     if (profile === "dbb3-worker") return "DB";
     return "H";
-  }
-
-  function buildContinuousPrompt(profile, nextMessage, history) {
-    const recent = (history || [])
-      .filter((message) => message.kind === "message" && message.content)
-      .slice(-24)
-      .map((message) => {
-        const speaker =
-          message.role === "user" ? "用户" : profileDisplayName(message.name);
-        return `${speaker}: ${message.content}`;
-      })
-      .join("\n");
-    if (!recent) return nextMessage;
-    return [
-      "你正在同一个 Hermes 对话会话中继续交流。",
-      `当前 Profile：${profile}`,
-      "请结合以下会话历史理解指代、上下文和用户偏好，不要把这条消息当成新会话。",
-      "",
-      "最近会话：",
-      recent,
-      "",
-      `用户的新消息：${nextMessage}`,
-    ].join("\n");
   }
 
   function hasHostedRuntimeRuns(conversation) {
@@ -1368,7 +1465,6 @@
     const [activeId, setActiveId] = useState("");
     const [messages, setMessages] = useState([]);
     const [selectedProfile, setSelectedProfile] = useState("default");
-    const [routeMode] = useState("auto");
     const [content, setContent] = useState("");
     const [composerOverflow, setComposerOverflow] = useState(false);
     const [composerExpanded, setComposerExpanded] = useState(false);
@@ -1497,11 +1593,22 @@
         } else {
           rememberConversationId("");
         }
+        let enqueueRecoveryError = "";
+        const pendingEnqueue = loadBrowserEnqueue(nextId);
+        if (pendingEnqueue) {
+          try {
+            await submitBrowserEnqueue(nextId, pendingEnqueue);
+          } catch (err) {
+            enqueueRecoveryError = err.message || "待发送消息恢复失败";
+          }
+        }
         await loadConversation(nextId);
         if (pendingStoredSessionId && !pendingConversation) {
           setError(
             pendingResumeError || "该官方历史会话暂时无法继续。",
           );
+        } else if (enqueueRecoveryError) {
+          setError(enqueueRecoveryError);
         }
       } catch (err) {
         setError(err.message || "智能会话加载失败");
@@ -1768,6 +1875,10 @@
             activeConversationRef.current = conversationId;
             setActiveId(conversationId);
             rememberConversationId(conversationId);
+            const pendingEnqueue = loadBrowserEnqueue(conversationId);
+            if (pendingEnqueue) {
+              await submitBrowserEnqueue(conversationId, pendingEnqueue);
+            }
             await loadConversation(conversationId);
           }
         } catch (err) {
@@ -2409,6 +2520,7 @@
     const send = async () => {
       const value = content.trim();
       const attachmentsForTurn = [...pendingAttachments];
+      let currentRequestAccepted = false;
       if (
         (!value && !attachmentsForTurn.length) ||
         sending ||
@@ -2423,40 +2535,46 @@
       try {
         const conversation = await ensureConversation();
         const conversationId = conversation.id;
-        const workspaceData = await collabApi(
-          "/single/conversations/" +
-            encodeURIComponent(conversationId) +
-            "/attachments",
-        );
+        const attachmentIds = attachmentsForTurn
+          .map((attachment) => attachment.id)
+          .filter((id) => typeof id === "string" && id.startsWith("file_"));
         const attachmentContext = attachmentsForTurn.length
           ? [
               "用户为本轮上传了以下附件：",
               ...attachmentsForTurn.map(
                 (attachment) =>
-                  `- ${attachment.name}: ${attachment.path}`,
+                  `- ${attachment.name}`,
               ),
             ].join("\n")
           : "";
         const deliveryContext = [
-          `本会话交付文件目录：${workspaceData.output_dir}`,
-          "如果用户要求 PPT、Word、PDF、表格、图片、压缩包或其他文件，必须把最终文件保存到该目录。",
-          "如果实际工作在远程 PC Worker 上完成，请在回复前把交付文件复制回这个 DBB3 目录。",
+          "如果用户要求 PPT、Word、PDF、表格、图片、压缩包或其他文件，必须通过服务端交付文件流程保存。",
+          "远程 Worker 必须在完成前声明全部交付文件，由服务器上传到账户文件库。",
         ].join("\n");
         const userContent = value || "请处理我上传的附件。";
-        const continuousPrompt = buildContinuousPrompt(
-          selectedProfile || "default",
-          userContent,
-          messages,
+        const matchingPending = loadBrowserEnqueue(conversationId);
+        const canReplayPending = Boolean(
+          matchingPending &&
+          matchingPending.message?.content === userContent &&
+          JSON.stringify(matchingPending.attachment_ids || []) ===
+            JSON.stringify(attachmentIds),
         );
-        const promptWithFiles = [
-          continuousPrompt,
-          attachmentContext,
-          deliveryContext,
-        ]
-          .filter(Boolean)
-          .join("\n\n");
+        if (matchingPending && !canReplayPending) {
+          await submitBrowserEnqueue(conversationId, matchingPending);
+          await loadConversation(conversationId);
+          setContent(value);
+          setPendingAttachments(attachmentsForTurn);
+          setError("上一条待发送消息已恢复，请确认当前内容后再次发送。");
+          return;
+        }
+        const requestId = canReplayPending
+          ? matchingPending.request_id
+          : `web-request-${Date.now()}-${Math.random().toString(36).slice(2, 10)}`;
+        const hostedTurnId = canReplayPending
+          ? matchingPending.turn_id
+          : `hosted-${Date.now()}-${Math.random().toString(36).slice(2, 10)}`;
         const userMessage = {
-          id: `user-${Date.now()}`,
+          id: requestId,
           role: "user",
           name: "你",
           content: userContent,
@@ -2465,34 +2583,43 @@
           meta: { attachments: attachmentsForTurn },
           created_at: Date.now(),
         };
-        addMessage(userMessage);
-        await record(conversationId, userMessage);
-        setPendingAttachments([]);
+        if (!messages.some((message) => message.id === requestId)) {
+          addMessage(userMessage);
+        }
 
-        const routeMessageId = `route-${Date.now()}`;
-        addMessage({
-          id: routeMessageId,
-          role: "system",
-          name: "正在判断任务类型",
-          content: "",
-          status: "streaming",
-          kind: "route",
-          meta: { mode: "pending" },
-          created_at: Date.now(),
-        });
-        const route = await collabApi("/route", {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ content: userContent, mode: routeMode }),
-        });
-        if (route.mode === "chat") route.profiles = [selectedProfile || "default"];
+        const routeMessageId = `route-${requestId}`;
+        if (!messages.some((message) => message.id === routeMessageId)) {
+          addMessage({
+            id: routeMessageId,
+            role: "system",
+            name: "正在判断任务类型",
+            content: "",
+            status: "streaming",
+            kind: "route",
+            meta: { mode: "pending" },
+            created_at: Date.now(),
+          });
+        }
+        const enqueuePayload = canReplayPending
+          ? matchingPending
+          : {
+              request_id: requestId,
+              turn_id: hostedTurnId,
+              message: userMessage,
+              recent_messages: messages.slice(-20),
+              profiles: [selectedProfile || "default"],
+              attachment_ids: attachmentIds,
+              attachment_context: attachmentContext,
+              delivery_context: deliveryContext,
+            };
+        saveBrowserEnqueue(conversationId, enqueuePayload);
+        const enqueued = await submitBrowserEnqueue(
+          conversationId,
+          enqueuePayload,
+        );
+        currentRequestAccepted = true;
+        const route = enqueued.route || {};
         const artifactRequired = Boolean(route.artifact_required);
-        const artifactInstruction = artifactRequired
-          ? deliveryContext
-          : [
-              "本任务未要求交付文件。",
-              "不要创建、复制或上传文件，只在会话中提交文字结果和必要证据。",
-            ].join("\n");
         const routeMessage = {
           id: routeMessageId,
           role: "system",
@@ -2510,72 +2637,39 @@
           created_at: Date.now(),
         };
         patchMessage(routeMessageId, () => routeMessage);
-        await record(conversationId, routeMessage);
 
-        if (route.mode === "work") {
-          const hostedTurnId = `hosted-${Date.now()}-${Math.random()
-            .toString(36)
-            .slice(2, 8)}`;
-          const workflowId = `workflow-${hostedTurnId}`;
+        const workflowId = `workflow-${hostedTurnId}`;
+        const isWork = route.mode === "work";
+        if (!messages.some((message) => message.id === workflowId)) {
           addMessage({
             id: workflowId,
             role: "system",
-            name: "任务已提交 DBB3",
-            content: "服务端正在创建根任务；关闭 App 或锁屏不会中断后续执行。",
+            name: isWork ? "任务已提交 DBB3" : "对话已提交服务器",
+            content: isWork
+              ? "服务端正在创建根任务；关闭 App 或锁屏不会中断后续执行。"
+              : "Hermes 将在服务器继续回复；关闭 App 或锁屏不会中断。",
             status: "streaming",
             kind: "workflow",
             meta: { runtime_turn_id: hostedTurnId },
           });
-          await collabApi(
-            "/single/conversations/" +
-              encodeURIComponent(conversationId) +
-              "/hosted-turns",
-            {
-            method: "POST",
-            headers: { "Content-Type": "application/json" },
-            body: JSON.stringify({
-              turn_id: hostedTurnId,
-              content: userContent,
-              title: route.title,
-              profiles: route.profiles || [
-                "default",
-                "dbb3-worker",
-                "reviewer",
-              ],
-              artifact_required: artifactRequired,
-              attachment_context: attachmentContext,
-              delivery_context: deliveryContext,
-            }),
-            },
-          );
-          setHostedRunning(true);
-          patchMessage(workflowId, (message) => ({
-            ...message,
-            name: "DBB3 服务端托管中",
-            content: "执行、审阅和最终汇报将在服务器继续完成。",
-            meta: {
-              ...(message.meta || {}),
-              connection: {
-                status: "hosted",
-                text: "可安全切到后台，返回后自动恢复进度",
-              },
-            },
-          }));
-          await loadConversation(conversationId);
-        } else {
-          await runProfile(
-            conversationId,
-            route.profiles[0],
-            promptWithFiles,
-            [
-              userContent,
-              attachmentContext,
-              artifactInstruction,
-            ]
-              .filter(Boolean)
-              .join("\n\n"),
-          );
         }
+        setPendingAttachments([]);
+        setHostedRunning(true);
+        patchMessage(workflowId, (message) => ({
+          ...message,
+          name: isWork ? "DBB3 服务端托管中" : "Hermes 服务端回复中",
+          content: isWork
+            ? "执行、审阅和最终汇报将在服务器继续完成。"
+            : "回复将在服务器继续完成。",
+          meta: {
+            ...(message.meta || {}),
+            connection: {
+              status: "hosted",
+              text: "可安全切到后台，返回后自动恢复进度",
+            },
+          },
+        }));
+        await loadConversation(conversationId);
         const [indexData, officialData] = await Promise.all([
           collabApi("/single/conversations"),
           SDK.fetchJSON("/api/sessions?limit=50&offset=0&order=recent"),
@@ -2587,7 +2681,16 @@
           ),
         );
       } catch (err) {
-        setError(err.message || "统一会话执行失败");
+        if (currentRequestAccepted) {
+          setHostedRunning(true);
+          setError("消息已由服务器接收，状态刷新暂时失败。");
+        } else {
+          setContent(value);
+          setPendingAttachments((current) => (
+            current.length ? current : attachmentsForTurn
+          ));
+          setError(err.message || "统一会话执行失败");
+        }
       } finally {
         setSending(false);
       }
@@ -3013,6 +3116,12 @@
     const [content, setContent] = useState("");
     const [sending, setSending] = useState(false);
     const [error, setError] = useState("");
+    const roomRunning = useMemo(
+      () => Object.values(room?.hosted_turns || {}).some(
+        (turn) => ["queued", "running"].includes(turn?.status),
+      ),
+      [room],
+    );
 
     const load = useCallback(async () => {
       const data = await collabApi("/rooms/" + encodeURIComponent(roomId));
@@ -3020,44 +3129,118 @@
     }, [roomId]);
 
     useEffect(() => {
-      load().catch((err) => setError(err.message || "群聊加载失败"));
-    }, [load]);
+      let disposed = false;
+      const recover = async () => {
+        const pending = loadBrowserRoomRequest(roomId);
+        if (pending) {
+          setContent(pending.content);
+          setSending(true);
+          try {
+            await submitBrowserRoomRequest(roomId, pending);
+            if (!disposed) setContent("");
+          } catch (err) {
+            if (!disposed) setError(err.message || "群聊恢复失败");
+          } finally {
+            if (!disposed) setSending(false);
+          }
+        }
+        try {
+          await load();
+        } catch (err) {
+          if (!disposed) setError(err.message || "群聊加载失败");
+        }
+      };
+      void recover();
+      return () => {
+        disposed = true;
+      };
+    }, [load, roomId]);
+
+    useEffect(() => {
+      if (!roomRunning) return undefined;
+      let disposed = false;
+      let timer = null;
+      let inFlight = false;
+
+      const refresh = async () => {
+        if (disposed || inFlight || document.hidden) return;
+        inFlight = true;
+        try {
+          await load();
+        } catch (err) {
+          if (!err.transient && !disposed) {
+            setError(err.message || "群聊状态刷新失败");
+          }
+        } finally {
+          inFlight = false;
+          if (!disposed) timer = setTimeout(refresh, 900);
+        }
+      };
+      const handleVisibility = () => {
+        if (!document.hidden) void refresh();
+      };
+      timer = setTimeout(refresh, 350);
+      document.addEventListener("visibilitychange", handleVisibility);
+      return () => {
+        disposed = true;
+        if (timer) clearTimeout(timer);
+        document.removeEventListener("visibilitychange", handleVisibility);
+      };
+    }, [load, roomRunning]);
 
     const send = async () => {
       if (!content.trim() || sending) return;
       const value = content.trim();
-      setContent("");
+      let currentRequestAccepted = false;
       setSending(true);
       setError("");
-      setRoom((current) =>
-        current
-          ? {
-              ...current,
-              messages: [
-                ...(current.messages || []),
-                {
-                  id: "optimistic-" + Date.now(),
-                  role: "user",
-                  name: "用户",
-                  content: value,
-                  created_at: Date.now(),
-                },
-              ],
-            }
-          : current,
-      );
       try {
-        await collabApi(
-          "/rooms/" + encodeURIComponent(roomId) + "/messages",
-          {
-            method: "POST",
-            headers: { "Content-Type": "application/json" },
-            body: JSON.stringify({ content: value }),
-          },
+        const pending = loadBrowserRoomRequest(roomId);
+        if (pending && pending.content !== value) {
+          await submitBrowserRoomRequest(roomId, pending);
+          await load();
+          setError("上一条待发送群聊消息已恢复，请再次确认当前内容。");
+          return;
+        }
+        const now = Date.now();
+        const roomRequest = pending || {
+          request_id: `room-request-${now}-${Math.random().toString(36).slice(2, 10)}`,
+          turn_id: `room-turn-${now}-${Math.random().toString(36).slice(2, 10)}`,
+          content: value,
+        };
+        saveBrowserRoomRequest(roomId, roomRequest);
+        setContent("");
+        setRoom((current) =>
+          current
+            ? {
+                ...current,
+                messages: (current.messages || []).some(
+                  (message) => message.id === roomRequest.request_id,
+                )
+                  ? current.messages
+                  : [
+                      ...(current.messages || []),
+                      {
+                        id: roomRequest.request_id,
+                        role: "user",
+                        name: "用户",
+                        content: value,
+                        created_at: now,
+                      },
+                    ],
+              }
+            : current,
         );
+        await submitBrowserRoomRequest(roomId, roomRequest);
+        currentRequestAccepted = true;
         await load();
       } catch (err) {
-        setError(err.message || "群聊执行失败");
+        if (currentRequestAccepted) {
+          setError("群聊消息已由服务器接收，状态刷新暂时失败。");
+        } else {
+          setError(err.message || "群聊执行失败");
+          setContent(value);
+        }
         await load().catch(() => {});
       } finally {
         setSending(false);
@@ -3087,7 +3270,7 @@
           h("h2", null, room.name),
           h("p", null, (room.profiles || []).join(" · ")),
         ),
-        h("span", { className: "hc-live" }, h("i"), sending ? "执行中" : "实时"),
+        h("span", { className: "hc-live" }, h("i"), sending || roomRunning ? "执行中" : "实时"),
       ),
       h(
         "div",
@@ -3100,7 +3283,7 @@
           : room.messages.map((message) =>
               h(Message, { key: message.id, message }),
             ),
-        sending
+        sending || roomRunning
           ? h(
               "div",
               { className: "hc-thinking" },
