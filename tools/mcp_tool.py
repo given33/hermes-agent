@@ -327,6 +327,12 @@ _MCP_LOG_LEVEL_MAP = {
 
 _DEFAULT_TOOL_TIMEOUT = 300      # seconds for tool calls
 _DEFAULT_CONNECT_TIMEOUT = 60    # seconds for initial connection per server
+# Bound cold-start fan-out so each server's connect timeout measures actual
+# connection work rather than time spent starved behind dozens of concurrent
+# Python/HTTP handshakes. Four keeps multi-server startup parallel without the
+# thundering herd that cancels every connection on small two-core hosts.
+_MAX_PARALLEL_DISCOVERY = 4
+_DISCOVERY_TIMEOUT_MARGIN = 30   # loop scheduling and result-publication slack
 _MAX_RECONNECT_RETRIES = 5
 _MAX_INITIAL_CONNECT_RETRIES = 3 # retries for the very first connection attempt
 _MAX_BACKOFF_SECONDS = 60
@@ -3068,6 +3074,14 @@ class MCPServerTask:
         # there's no race where the helper misses the shutdown flag after
         # returning "reconnect".
         self._reconnect_event.set()
+        # A blue-green reload must not tear down a session while a tool call is
+        # using its JSON-RPC stream. Wait for the per-server RPC gate to drain;
+        # this is the in-flight counter for both stdio and HTTP transports.
+        if self._rpc_lock.locked():
+            try:
+                await asyncio.wait_for(self._wait_for_rpc_drain(), timeout=30)
+            except asyncio.TimeoutError:
+                logger.warning("MCP server '%s' RPC drain timed out", self.name)
         if self._task and not self._task.done():
             try:
                 await asyncio.wait_for(self._task, timeout=10)
@@ -3088,6 +3102,10 @@ class MCPServerTask:
             self._pending_refresh_tasks.clear()
         self._deregister_tools()
         self.session = None
+
+    async def _wait_for_rpc_drain(self) -> None:
+        await self._rpc_lock.acquire()
+        self._rpc_lock.release()
 
     def _deregister_tools(self) -> None:
         """Drop this server's tools from the global registry (idempotent).
@@ -3129,6 +3147,7 @@ class MCPServerTask:
 # ---------------------------------------------------------------------------
 
 _servers: Dict[str, MCPServerTask] = {}
+_server_config_fingerprints: Dict[str, str] = {}
 _server_connecting: set[str] = set()
 _server_connect_errors: Dict[str, str] = {}
 
@@ -5062,6 +5081,9 @@ async def _discover_and_register_server(name: str, config: dict) -> List[str]:
         _server_connecting.discard(name)
         _server_connect_errors.pop(name, None)
         _servers[name] = server
+        _server_config_fingerprints[name] = json.dumps(
+            config, sort_keys=True, separators=(",", ":"), default=str,
+        )
 
     registered_names = _register_server_tools(name, server, config)
     server._registered_tool_names = list(registered_names)
@@ -5073,6 +5095,25 @@ async def _discover_and_register_server(name: str, config: dict) -> List[str]:
         ", ".join(registered_names),
     )
     return registered_names
+
+
+def _discovery_outer_timeout(servers: Dict[str, dict]) -> float:
+    """Return a batch-aware deadline for bounded cold-start discovery."""
+    if not servers:
+        return float(_DISCOVERY_TIMEOUT_MARGIN)
+
+    connect_timeouts: List[float] = []
+    for config in servers.values():
+        try:
+            timeout = float(config.get("connect_timeout", _DEFAULT_CONNECT_TIMEOUT))
+        except (TypeError, ValueError):
+            timeout = float(_DEFAULT_CONNECT_TIMEOUT)
+        connect_timeouts.append(max(timeout, 0.0))
+
+    batches = (
+        len(servers) + _MAX_PARALLEL_DISCOVERY - 1
+    ) // _MAX_PARALLEL_DISCOVERY
+    return batches * max(connect_timeouts) + _DISCOVERY_TIMEOUT_MARGIN
 
 
 # ---------------------------------------------------------------------------
@@ -5099,6 +5140,33 @@ def register_mcp_servers(servers: Dict[str, dict]) -> List[str]:
     if not servers:
         logger.debug("No explicit MCP servers provided")
         return []
+
+    def _fingerprint(config: dict) -> str:
+        return json.dumps(config, sort_keys=True, separators=(",", ":"), default=str)
+
+    # An endpoint/transport change must replace the old MCPServerTask. Existing
+    # chats otherwise keep the old URL after a blue-green cutover.
+    with _lock:
+        changed_names = [
+            name for name, config in servers.items()
+            if name in _servers and _server_config_fingerprints.get(name) != _fingerprint(config)
+        ]
+    if changed_names:
+        _ensure_mcp_loop()
+
+        async def _reload_changed() -> None:
+            with _lock:
+                old = [_servers[name] for name in changed_names if name in _servers]
+            await asyncio.gather(*(server.shutdown() for server in old), return_exceptions=True)
+            with _lock:
+                for name in changed_names:
+                    _servers.pop(name, None)
+                    _server_config_fingerprints.pop(name, None)
+
+        try:
+            _run_on_mcp_loop(_reload_changed, timeout=30)
+        except Exception:
+            logger.exception("MCP configuration reload failed")
 
     # Only attempt servers that aren't already connected and are enabled
     # (enabled: false skips the server entirely without removing its config)
@@ -5137,15 +5205,27 @@ def register_mcp_servers(servers: Dict[str, dict]) -> List[str]:
     # Start the background event loop for MCP connections
     _ensure_mcp_loop()
 
-    async def _discover_one(name: str, cfg: dict) -> List[str]:
+    async def _discover_one(
+        name: str,
+        cfg: dict,
+        semaphore: asyncio.Semaphore,
+    ) -> List[str]:
         """Connect to a single server and return its registered tool names."""
-        return await _discover_and_register_server(name, cfg)
+        # Acquire before _discover_and_register_server starts its per-server
+        # wait_for timer. Otherwise queued cold starts consume connect_timeout
+        # without receiving CPU or opening a socket.
+        async with semaphore:
+            return await _discover_and_register_server(name, cfg)
 
     async def _discover_all():
         server_names = list(new_servers.keys())
+        semaphore = asyncio.Semaphore(_MAX_PARALLEL_DISCOVERY)
         # Connect to all servers in PARALLEL
         results = await asyncio.gather(
-            *(_discover_one(name, cfg) for name, cfg in new_servers.items()),
+            *(
+                _discover_one(name, cfg, semaphore)
+                for name, cfg in new_servers.items()
+            ),
             return_exceptions=True,
         )
         for name, result in zip(server_names, results):
@@ -5167,7 +5247,8 @@ def register_mcp_servers(servers: Dict[str, dict]) -> List[str]:
                     _server_connect_errors.pop(name, None)
 
     # Per-server timeouts are handled inside _discover_and_register_server.
-    # The outer timeout is generous: 120s total for parallel discovery.
+    # The outer deadline must cover every bounded batch. A fixed 120-second
+    # deadline races the sixth 20-second batch when all 21 iOS MCPs are down.
     #
     # Temporarily clear the interrupt flag on the current thread so that MCP
     # discovery is never cancelled by a stale interrupt from a prior agent
@@ -5177,7 +5258,10 @@ def register_mcp_servers(servers: Dict[str, dict]) -> List[str]:
     if _was_interrupted:
         _set_interrupt(False)
     try:
-        _run_on_mcp_loop(_discover_all, timeout=120)
+        _run_on_mcp_loop(
+            _discover_all,
+            timeout=_discovery_outer_timeout(new_servers),
+        )
     finally:
         if _was_interrupted:
             _set_interrupt(True)

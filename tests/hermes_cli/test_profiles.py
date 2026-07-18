@@ -784,6 +784,21 @@ class TestResolveProfileEnv:
         result = resolve_profile_env("coder")
         assert result == str(tmp_path / ".hermes" / "profiles" / "coder")
 
+    def test_profile_activation_installs_managed_ios_mcp_and_preserves_overrides(self, profile_env):
+        profile_dir = create_profile("coder", no_alias=True)
+        (profile_dir / "config.yaml").write_text(
+            "mcp_servers:\n  ios-motion:\n    enabled: false\n"
+            "    granted_scopes: [motion:read]\n",
+            encoding="utf-8",
+        )
+
+        resolve_profile_env("coder")
+
+        config = yaml.safe_load((profile_dir / "config.yaml").read_text(encoding="utf-8"))
+        assert len(config["mcp_servers"]) == 21
+        assert config["mcp_servers"]["ios-motion"]["enabled"] is False
+        assert config["mcp_servers"]["ios-motion"]["granted_scopes"] == ["motion:read"]
+
     def test_default_returns_default_home(self, profile_env):
         tmp_path = profile_env
         result = resolve_profile_env("default")

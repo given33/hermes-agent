@@ -9,7 +9,15 @@ from hermes_cli.dashboard_auth.mobile_notifications import (
     _MAX_PAYLOAD_BYTES,
     _apns_provider_token,
     _send_apns,
+    account_deletion_collapse_id,
+    account_notification_collapse_id,
+    build_account_deletion_payload,
+    build_account_notification_payload,
+    build_device_relay_wake_payload,
     build_task_completion_payload,
+    deliver_account_background_wake,
+    deliver_account_deletion_push,
+    deliver_account_notification_push,
     deliver_task_completion_push,
     task_completion_collapse_id,
 )
@@ -63,6 +71,140 @@ def test_multibyte_results_are_truncated_by_final_utf8_payload_size():
         "hermes-agent://conversation/conversation%2Fwith%20spaces"
         "?turn=turn%3Funsafe%3Dvalue"
     )
+
+
+def test_generic_account_notification_is_bounded_and_routes_to_weather():
+    payload = build_account_notification_payload(
+        title="出行天气提醒",
+        body="预计外出时段有雨" * 20_000,
+        category="smart-weather",
+        deep_link="hermes-agent://weather",
+        data={
+            "forecast_id": "forecast-1",
+            "expires_at": 1_800_000_000_000,
+            "ignored": {"nested": "objects"},
+        },
+    )
+
+    encoded = json.dumps(payload, ensure_ascii=False, separators=(",", ":")).encode()
+    assert len(encoded) <= _MAX_PAYLOAD_BYTES
+    assert payload["aps"]["thread-id"] == "smart-weather"
+    assert payload["aps"]["content-available"] == 1
+    assert payload["hermes"]["deep_link"] == "hermes-agent://weather"
+    assert payload["hermes"]["data"] == {
+        "forecast_id": "forecast-1",
+        "expires_at": 1_800_000_000_000,
+    }
+
+
+def test_generic_account_notification_uses_stable_collapse_and_delivery(monkeypatch):
+    monkeypatch.setenv("HERMES_APNS_BUNDLE_ID", "app.sunstone1029.fig1171")
+    store = _DeviceStore(
+        [{
+            "id": "registration-weather",
+            "token": "ee" * 16,
+            "bundle_id": "app.sunstone1029.fig1171",
+        }]
+    )
+    calls = []
+
+    result = deliver_account_notification_push(
+        owner_id="owner-a",
+        notification_id="forecast-1",
+        title="出行天气提醒",
+        body="预计九点有小雨",
+        category="smart-weather",
+        deep_link="hermes-agent://weather",
+        data={"forecast_id": "forecast-1"},
+        device_store=store,
+        sender=lambda registration, payload, collapse_id: (
+            calls.append((registration["id"], payload, collapse_id)) or (200, "")
+        ),
+    )
+
+    assert result["state"] == "delivered"
+    assert calls[0][0] == "registration-weather"
+    assert calls[0][1]["hermes"]["category"] == "smart-weather"
+    assert calls[0][2] == account_notification_collapse_id(
+        "smart-weather",
+        "forecast-1",
+    )
+
+
+def test_device_relay_wake_is_silent_and_uses_background_delivery():
+    payload = build_device_relay_wake_payload(
+        command_id="command-1",
+        expires_at=1_900_000_000,
+    )
+    assert payload == {
+        "aps": {"content-available": 1},
+        "hermes": {
+            "category": "device-relay",
+            "data": {
+                "command_id": "command-1",
+                "valid_until": 1_900_000_000,
+            },
+        },
+    }
+
+    calls = []
+    result = deliver_account_background_wake(
+        owner_id="owner-a",
+        command_id="command-1",
+        expires_at=1_900_000_000,
+        device_store=_DeviceStore([{
+            "id": "registration-relay",
+            "token": "ef" * 16,
+            "bundle_id": "app.sunstone1029.fig1171",
+        }]),
+        sender=lambda registration, current_payload, collapse_id: (
+            calls.append((registration, current_payload, collapse_id)) or (200, "")
+        ),
+    )
+    assert result["state"] == "delivered"
+    assert calls[0][1]["aps"] == {"content-available": 1}
+    assert calls[0][2].startswith("hermes-relay-")
+
+
+def test_account_deletion_push_is_silent_and_targets_every_active_device(monkeypatch):
+    monkeypatch.setenv("HERMES_APNS_BUNDLE_ID", "app.sunstone1029.fig1171")
+    calls = []
+    result = deliver_account_deletion_push(
+        owner_id="owner-a",
+        owner_scope="https://hermes.example|owner-a",
+        valid_until=1_900_000_000,
+        device_store=_DeviceStore([
+            {
+                "id": "registration-a",
+                "token": "aa" * 16,
+                "bundle_id": "app.sunstone1029.fig1171",
+            },
+            {
+                "id": "registration-b",
+                "token": "bb" * 16,
+                "bundle_id": "app.sunstone1029.fig1171",
+            },
+        ]),
+        sender=lambda registration, payload, collapse_id: (
+            calls.append((registration["id"], payload, collapse_id)) or (200, "")
+        ),
+    )
+
+    assert result["state"] == "delivered"
+    assert [item[0] for item in calls] == ["registration-a", "registration-b"]
+    assert all(
+        item[1] == build_account_deletion_payload(
+            owner_scope="https://hermes.example|owner-a",
+            valid_until=1_900_000_000,
+        )
+        for item in calls
+    )
+    assert all(
+        item[1]["hermes"]["data"]["owner_scope"]
+        == "https://hermes.example|owner-a"
+        for item in calls
+    )
+    assert all(item[2] == account_deletion_collapse_id("owner-a") for item in calls)
 
 
 class _DeviceStore:
@@ -194,7 +336,7 @@ def test_missing_provider_configuration_keeps_the_notification_retryable(monkeyp
     }
 
 
-def test_default_sender_sets_the_stable_apns_collapse_header(monkeypatch, tmp_path):
+def _configure_fake_apns_request(monkeypatch, tmp_path):
     captured = {}
 
     class _Response:
@@ -229,17 +371,42 @@ def test_default_sender_sets_the_stable_apns_collapse_header(monkeypatch, tmp_pa
     key_path = tmp_path / "provider-key.p8"
     key_path.write_text("fixture-provider-key", encoding="utf-8")
     monkeypatch.setenv("HERMES_APNS_PRIVATE_KEY", str(key_path))
+    return captured
+
+
+def test_default_sender_sets_the_stable_apns_collapse_header(monkeypatch, tmp_path):
+    captured = _configure_fake_apns_request(monkeypatch, tmp_path)
     collapse_id = task_completion_collapse_id("conversation-a", "turn-a")
 
     status, reason = _send_apns(
         {"token": "dd" * 16},
-        {"aps": {"alert": "done"}},
+        {
+            "aps": {"alert": "done"},
+            "hermes": {"data": {"valid_until": 1_900_000_000_000}},
+        },
         collapse_id,
     )
 
     assert (status, reason) == (200, "")
     assert captured["headers"]["apns-collapse-id"] == collapse_id
     assert captured["headers"]["apns-topic"] == "app.sunstone1029.fig1171"
+    assert captured["headers"]["apns-expiration"] == "1900000000"
+
+
+def test_default_sender_uses_background_headers_for_device_relay(monkeypatch, tmp_path):
+    captured = _configure_fake_apns_request(monkeypatch, tmp_path)
+
+    status, reason = _send_apns(
+        {"token": "ab" * 16},
+        build_device_relay_wake_payload(command_id="command-1"),
+        "hermes-relay-owner",
+        push_type="background",
+        priority="5",
+    )
+
+    assert (status, reason) == (200, "")
+    assert captured["headers"]["apns-push-type"] == "background"
+    assert captured["headers"]["apns-priority"] == "5"
 
 
 def test_provider_token_is_reused_until_the_cache_window_expires(monkeypatch):

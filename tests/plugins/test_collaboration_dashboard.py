@@ -30,6 +30,26 @@ def load_module():
 
 
 class CollaborationDashboardTests(unittest.TestCase):
+    def test_profile_toolsets_connect_mcp_before_resolving_agent_snapshot(self):
+        module = load_module()
+        calls = []
+        config = {"mcp_servers": {"ios-location": {"enabled": True}}}
+
+        with patch(
+            "tools.mcp_tool.discover_mcp_tools",
+            side_effect=lambda: calls.append("discover") or ["current_location"],
+        ), patch(
+            "hermes_cli.tools_config._get_platform_tools",
+            side_effect=lambda current, platform: (
+                calls.append(("resolve", current, platform)) or {"ios-location"}
+            ),
+        ):
+            resolved = module._discover_profile_toolsets(config)
+
+        self.assertEqual(resolved, ["ios-location"])
+        self.assertEqual(calls[0], "discover")
+        self.assertEqual(calls[1], ("resolve", config, "cli"))
+
     def test_room_store_round_trip(self):
         module = load_module()
         from tempfile import TemporaryDirectory

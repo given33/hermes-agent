@@ -7821,6 +7821,16 @@ def _profile_runner_result_error(result: Any) -> str:
     return ""
 
 
+def _discover_profile_toolsets(config: dict[str, Any]) -> list[str]:
+    """Connect configured MCPs before resolving the hosted agent tool snapshot."""
+
+    from hermes_cli.tools_config import _get_platform_tools
+    from tools.mcp_tool import discover_mcp_tools
+
+    discover_mcp_tools()
+    return sorted(_get_platform_tools(config, "cli"))
+
+
 def _profile_event_runner_main() -> int:
     """Child-process entrypoint that emits only structured Hermes JSONL events."""
     real_stdout = sys.stdout
@@ -7848,12 +7858,15 @@ def _profile_event_runner_main() -> int:
         from hermes_cli.env_loader import load_hermes_dotenv
         from hermes_cli.fallback_config import get_fallback_chain
         from hermes_cli.runtime_provider import resolve_runtime_provider
-        from hermes_cli.tools_config import _get_platform_tools
         from hermes_state import SessionDB
         from run_agent import AIAgent
 
         load_hermes_dotenv(hermes_home=os.environ.get("HERMES_HOME"))
         cfg = load_config()
+        # This runner is a fresh process for a hosted chat turn. MCP names in
+        # enabled_toolsets are only registry aliases; discovery must connect
+        # and register their schemas before AIAgent snapshots its tool list.
+        enabled_toolsets = _discover_profile_toolsets(cfg)
         model_cfg = cfg.get("model") or {}
         if isinstance(model_cfg, str):
             model = model_cfg
@@ -7865,7 +7878,6 @@ def _profile_event_runner_main() -> int:
             requested=provider,
             target_model=model or None,
         )
-        enabled_toolsets = sorted(_get_platform_tools(cfg, "cli"))
         fallback = get_fallback_chain(cfg)
         tool_started_at: dict[str, float] = {}
 

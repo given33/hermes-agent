@@ -536,6 +536,29 @@ def _migrate_profile_config_if_outdated(profile_dir: Path) -> None:
         pass
 
 
+def _install_managed_ios_mcp_for_profile(profile_dir: Path) -> None:
+    """Merge the managed iOS MCP fleet into one profile's config.
+
+    Profiles are independent HERMES_HOME roots; installing the fleet only in
+    the root profile leaves a newly-created profile without the 21 servers.
+    The merge is idempotent and keeps explicit enabled/scope overrides.
+    """
+
+    try:
+        from hermes_constants import reset_hermes_home_override, set_hermes_home_override
+        from hermes_cli.ios_mcp_server import install_ios_mcp_servers
+
+        token = set_hermes_home_override(str(profile_dir))
+        try:
+            install_ios_mcp_servers()
+        finally:
+            reset_hermes_home_override(token)
+    except Exception:
+        # A profile can still be used without the optional iOS MCP runtime; a
+        # later startup retry repairs the managed entries.
+        return
+
+
 def find_alias_for_profile(profile_name: str) -> Optional[str]:
     """Return the alias name of the wrapper that activates *profile_name*, or None.
 
@@ -1817,6 +1840,11 @@ def set_active_profile(name: str) -> None:
             f"Create it with: hermes profile create {canon}"
         )
 
+    # Profile switching is also a lifecycle boundary for managed services.
+    # Repair profiles cloned before the iOS MCP fleet was installed before
+    # making one the sticky target for subsequent Hermes processes.
+    _install_managed_ios_mcp_for_profile(get_profile_dir(canon))
+
     path = _get_active_profile_path()
     path.parent.mkdir(parents=True, exist_ok=True)
     if canon == "default":
@@ -2222,4 +2250,5 @@ def resolve_profile_env(profile_name: str) -> str:
             f"Create it with: hermes profile create {canon}"
         )
 
+    _install_managed_ios_mcp_for_profile(profile_dir)
     return str(profile_dir)

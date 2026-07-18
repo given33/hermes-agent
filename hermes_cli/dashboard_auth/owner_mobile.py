@@ -27,6 +27,7 @@ from hermes_cli.dashboard_auth import (
     InvalidCredentialsError,
     get_provider,
     register_provider,
+    unregister_provider,
 )
 from hermes_cli.dashboard_auth.audit import AuditEvent, audit_log
 from hermes_cli.dashboard_auth.mobile_device_store import (
@@ -132,6 +133,8 @@ def _device_info(body: MobileDeviceBody | None) -> MobileDeviceInfo:
 
 def _configured_credentials() -> tuple[str, str, str]:
     section = _load_config_basic_auth_section()
+    if section.get("disabled") is True:
+        return "", "", ""
     return (
         _resolve("HERMES_DASHBOARD_BASIC_AUTH_USERNAME", section, "username"),
         _resolve(
@@ -145,7 +148,11 @@ def _configured_credentials() -> tuple[str, str, str]:
 
 def owner_account_configured() -> bool:
     username, password_hash, plaintext = _configured_credentials()
-    return bool(username and (password_hash or plaintext))
+    return bool(
+        username
+        and (password_hash or plaintext)
+        and _store().account_deletion_status(username) is None
+    )
 
 
 def _env_enabled(name: str, *, default: bool = False) -> bool:
@@ -165,7 +172,53 @@ def owner_registration_open() -> bool:
     if not _QQ_EMAIL_RE.fullmatch(owner_email()):
         return False
     username, password_hash, plaintext = _configured_credentials()
-    return not any((username, password_hash, plaintext))
+    return not any((username, password_hash, plaintext)) or (
+        bool(username) and _store().account_deletion_status(username) is not None
+    )
+
+
+def delete_owner_account_credentials(user_id: str) -> dict[str, Any]:
+    """Disable the configured owner and revoke the in-process password provider."""
+
+    normalized = str(user_id or "").strip()
+    if not normalized:
+        raise ValueError("user_id is required")
+    configured_username, _password_hash, _plaintext = _configured_credentials()
+    if configured_username and not hmac.compare_digest(
+        configured_username.casefold(), normalized.casefold()
+    ):
+        raise ValueError("configured owner does not match deletion account")
+
+    provider = get_provider(BasicAuthProvider.name)
+    unregister_provider(BasicAuthProvider.name, expected=provider)
+    config_cleared = False
+    try:
+        from hermes_cli.config import load_config, save_config
+
+        config = load_config()
+        dashboard = config.setdefault("dashboard", {})
+        dashboard["basic_auth"] = {"disabled": True}
+        save_config(config)
+        config_cleared = True
+    except Exception:
+        # The mobile deletion tombstone remains the cross-process authority;
+        # the scheduler will retry this config cleanup.
+        config_cleared = False
+    with _VERIFICATION_LOCK:
+        _REGISTRATION_CODES.clear()
+    return {"disabled": True, "config_cleared": config_cleared}
+
+
+def reconcile_deleted_owner_credentials() -> dict[str, Any]:
+    """Retry config cleanup for an owner protected by a durable tombstone."""
+
+    section = _load_config_basic_auth_section()
+    if section.get("disabled") is True:
+        return {"disabled": True, "config_cleared": True}
+    username = _resolve("HERMES_DASHBOARD_BASIC_AUTH_USERNAME", section, "username")
+    if not username or _store().account_deletion_status(username) is None:
+        return {"disabled": False, "config_cleared": False}
+    return delete_owner_account_credentials(username)
 
 
 def _normalize_registration_email(value: str) -> str:
@@ -321,9 +374,15 @@ def _compatible_password_provider(
 
 def ensure_owner_provider() -> DashboardAuthProvider | None:
     ensure_mobile_token_provider()
-    existing = get_provider("basic")
+    existing = get_provider(BasicAuthProvider.name)
     if existing is not None:
+        if isinstance(existing, BasicAuthProvider) and not owner_account_configured():
+            unregister_provider(BasicAuthProvider.name, expected=existing)
+            return None
         return _compatible_password_provider(existing)
+    if not owner_account_configured():
+        unregister_provider(BasicAuthProvider.name, expected=existing)
+        return None
     provider = _build_provider_from_config()
     if provider is None:
         return None
@@ -426,6 +485,30 @@ def mobile_register(request: Request, body: MobileRegisterBody):
         from hermes_cli.config import load_config, save_config
 
         config = load_config()
+        deletion = _store().account_deletion_status(username)
+        try:
+            from hermes_cli.ios_intelligence import IOSIntelligenceStore
+
+            intelligence_deletion = IOSIntelligenceStore().account_deletion_status(username)
+        except Exception:
+            intelligence_deletion = None
+        if deletion is not None or intelligence_deletion is not None:
+            deletion_state = str(
+                (deletion or intelligence_deletion or {}).get("state")
+                or (deletion or intelligence_deletion or {}).get("status")
+                or "pending"
+            )
+            if deletion_state not in {
+                "delivered", "no_recipients", "permanent_failure"
+            }:
+                raise HTTPException(status_code=409, detail="Account deletion is still pending")
+            # A terminal deletion is a permanent account-generation boundary.
+            # Reusing the same owner id would make late encrypted uploads from
+            # the old generation indistinguishable from the new account.
+            raise HTTPException(status_code=409, detail="The deleted account name is permanently retired")
+        # Do not mutate the configured account until all deletion-boundary
+        # checks have passed. A rejected re-registration must leave disabled
+        # owner credentials untouched.
         dashboard = config.setdefault("dashboard", {})
         basic = dashboard.setdefault("basic_auth", {})
         basic.update(
@@ -435,8 +518,11 @@ def mobile_register(request: Request, body: MobileRegisterBody):
                 "password": "",
                 "secret": base64.b64encode(secrets.token_bytes(32)).decode("ascii"),
                 "session_ttl_seconds": _DEFAULT_TTL_SECONDS,
+                "disabled": False,
             }
         )
+        existing = get_provider(BasicAuthProvider.name)
+        unregister_provider(BasicAuthProvider.name, expected=existing)
         save_config(config)
         _discard_registration_code(email)
         provider = ensure_owner_provider()

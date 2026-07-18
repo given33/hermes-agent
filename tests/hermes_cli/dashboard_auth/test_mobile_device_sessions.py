@@ -1,14 +1,20 @@
 """Durable mobile device session, rotation, revocation, and APNs contracts."""
 from __future__ import annotations
 
+import contextlib
 import sqlite3
+import threading
 
 import pytest
 
+import hermes_cli.dashboard_auth.mobile_device_store as mobile_device_store
 from hermes_cli.dashboard_auth.mobile_device_store import (
     MobileDeviceInfo,
     MobileDeviceStore,
     OwnerMobileTokenProvider,
+)
+from hermes_cli.dashboard_auth.mobile_notifications import (
+    process_account_deletion_outbox,
 )
 
 
@@ -235,6 +241,326 @@ def test_active_apns_delivery_is_strictly_scoped_to_one_account(tmp_path):
     assert [item["device_id"] for item in owner_a] == ["owner-a-phone"]
     assert [item["device_id"] for item in owner_b] == ["owner-b-phone"]
     assert store.list_active_apns_registrations(user_id="") == []
+
+
+def test_account_deletion_outbox_retries_then_purges_retained_apns_rows(
+    tmp_path,
+    monkeypatch,
+):
+    now = [1_800_000_000]
+    bundle_id = "app.sunstone1029.fig1171"
+    monkeypatch.setenv("HERMES_APNS_BUNDLE_ID", bundle_id)
+    store = MobileDeviceStore(tmp_path / "mobile-auth.db", clock=lambda: now[0])
+    tokens = store.create_session(
+        user_id="owner",
+        device=_device("device-primary", "Owner iPhone"),
+    )
+    store.register_apns(
+        device_id="device-primary",
+        token="a1" * 32,
+        environment="production",
+        bundle_id=bundle_id,
+    )
+
+    deletion = store.begin_account_deletion(
+        "owner",
+        "https://hermes.example|owner",
+    )
+
+    assert deletion["state"] == "pending"
+    assert deletion["devices"] == deletion["sessions"] == deletion["apns"] == 1
+    assert store.verify_access(tokens.access_token, touch=False) is None
+    assert store.rotate_refresh(tokens.refresh_token) is None
+    assert store.list_active_apns_registrations(user_id="owner") == []
+    assert len(store.list_account_deletion_apns_registrations(user_id="owner")) == 1
+
+    payloads = []
+    first = process_account_deletion_outbox(
+        device_store=store,
+        owner_id="owner",
+        sender=lambda _registration, payload, _collapse_id: (
+            payloads.append(payload) or (503, "Shutdown")
+        ),
+    )
+
+    assert first[0]["state"] == "retry"
+    assert first[0]["cleanup"]["state"] == "retry"
+    assert payloads[0]["hermes"]["data"]["owner_scope"] == (
+        "https://hermes.example|owner"
+    )
+    assert payloads[0]["hermes"]["data"]["valid_until"] > now[0]
+    assert len(store.list_account_deletion_apns_registrations(user_id="owner")) == 1
+    assert store.account_deletion_status("owner")["state"] == "retry"
+
+    now[0] += 60
+    second = process_account_deletion_outbox(
+        device_store=MobileDeviceStore(store.db_path, clock=lambda: now[0]),
+        owner_id="owner",
+        sender=lambda _registration, _payload, _collapse_id: (200, ""),
+    )
+
+    assert second[0]["state"] == "delivered"
+    assert second[0]["cleanup"] == {
+        "updated": True,
+        "state": "delivered",
+        "devices": 1,
+        "sessions": 1,
+        "apns": 1,
+    }
+    assert store.list_devices() == []
+    status = store.account_deletion_status("owner")
+    assert status["state"] == "delivered"
+    assert status["attempts"] == 2
+    assert status["completed_at"] == now[0]
+
+
+def test_account_deletion_claim_recovers_after_worker_lease_expiry(tmp_path):
+    now = [1_800_000_000]
+    store = MobileDeviceStore(tmp_path / "mobile-auth.db", clock=lambda: now[0])
+    store.begin_account_deletion("owner", "https://hermes.example|owner")
+
+    first = store.claim_account_deletions(lease_seconds=30)
+    assert len(first) == 1
+    assert store.claim_account_deletions(lease_seconds=30) == []
+
+    now[0] += 30
+    recovered = MobileDeviceStore(
+        store.db_path,
+        clock=lambda: now[0],
+    ).claim_account_deletions(lease_seconds=30)
+    assert len(recovered) == 1
+    assert recovered[0]["id"] == first[0]["id"]
+    assert recovered[0]["lease_token"] != first[0]["lease_token"]
+    assert recovered[0]["attempts"] == 2
+
+
+@pytest.mark.parametrize(
+    "state",
+    [
+        "pending",
+        "retry",
+        "delivering",
+        "delivered",
+        "no_recipients",
+        "permanent_failure",
+    ],
+)
+def test_account_deletion_tombstone_blocks_session_recreation_until_cleared(
+    tmp_path,
+    state,
+):
+    store = MobileDeviceStore(tmp_path / "mobile-auth.db")
+    original = store.create_session(
+        user_id="owner",
+        device=_device("device-primary", "Owner iPhone"),
+    )
+    store.begin_account_deletion("owner", "https://hermes.example|owner")
+    with sqlite3.connect(store.db_path) as conn:
+        conn.execute(
+            "UPDATE mobile_account_deletion_outbox SET state=? WHERE user_id='owner'",
+            (state,),
+        )
+
+    with pytest.raises(PermissionError, match="deletion tombstone"):
+        store.create_session(
+            user_id="owner",
+            device=_device("device-primary", "Owner iPhone"),
+        )
+
+    assert store.verify_access(original.access_token, touch=False) is None
+    with sqlite3.connect(store.db_path) as conn:
+        assert conn.execute(
+            "SELECT COUNT(*) FROM mobile_devices WHERE revoked_at IS NULL"
+        ).fetchone()[0] == 0
+        assert conn.execute(
+            "SELECT COUNT(*) FROM mobile_sessions WHERE revoked_at IS NULL"
+        ).fetchone()[0] == 0
+
+    terminal = state in {"delivered", "no_recipients", "permanent_failure"}
+    assert store.clear_completed_account_deletion("owner") is terminal
+    if terminal:
+        replacement = store.create_session(
+            user_id="owner",
+            device=_device("device-primary", "Owner iPhone"),
+        )
+        assert store.verify_access(replacement.access_token, touch=False) is not None
+
+
+@pytest.mark.parametrize("first_writer", ["delete", "login"])
+def test_account_deletion_and_session_creation_serialize_fail_closed(
+    tmp_path,
+    monkeypatch,
+    first_writer,
+):
+    store = MobileDeviceStore(tmp_path / "mobile-auth.db")
+    old_tokens = store.create_session(
+        user_id="owner",
+        device=_device("device-primary", "Owner iPhone"),
+    )
+    real_write_txn = mobile_device_store.write_txn
+    attempted = {name: threading.Event() for name in ("delete", "login")}
+    acquired = {name: threading.Event() for name in ("delete", "login")}
+    release_first = threading.Event()
+
+    @contextlib.contextmanager
+    def ordered_write_txn(conn):
+        actor = threading.current_thread().name
+        attempted[actor].set()
+        with real_write_txn(conn):
+            acquired[actor].set()
+            if actor == first_writer:
+                assert release_first.wait(timeout=5)
+            yield conn
+
+    monkeypatch.setattr(mobile_device_store, "write_txn", ordered_write_txn)
+    results = {}
+    errors = {}
+
+    def delete_account():
+        try:
+            results["delete"] = store.begin_account_deletion(
+                "owner",
+                "https://hermes.example|owner",
+            )
+        except BaseException as exc:  # pragma: no cover - asserted below
+            errors["delete"] = exc
+
+    def create_login():
+        try:
+            results["login"] = store.create_session(
+                user_id="owner",
+                device=_device("device-primary", "Owner iPhone"),
+            )
+        except BaseException as exc:
+            errors["login"] = exc
+
+    workers = {
+        "delete": threading.Thread(target=delete_account, name="delete"),
+        "login": threading.Thread(target=create_login, name="login"),
+    }
+    second_writer = "login" if first_writer == "delete" else "delete"
+    workers[first_writer].start()
+    assert acquired[first_writer].wait(timeout=5)
+    workers[second_writer].start()
+    assert attempted[second_writer].wait(timeout=5)
+    assert not acquired[second_writer].is_set()
+    release_first.set()
+    for worker in workers.values():
+        worker.join(timeout=5)
+        assert not worker.is_alive()
+
+    assert "delete" not in errors
+    assert store.account_deletion_status("owner")["state"] == "pending"
+    if first_writer == "delete":
+        assert isinstance(errors.get("login"), PermissionError)
+    else:
+        assert "login" not in errors
+        assert store.verify_access(
+            results["login"].access_token,
+            touch=False,
+        ) is None
+    assert store.verify_access(old_tokens.access_token, touch=False) is None
+    with sqlite3.connect(store.db_path) as conn:
+        assert conn.execute(
+            "SELECT COUNT(*) FROM mobile_devices WHERE revoked_at IS NULL"
+        ).fetchone()[0] == 0
+        assert conn.execute(
+            "SELECT COUNT(*) FROM mobile_sessions WHERE revoked_at IS NULL"
+        ).fetchone()[0] == 0
+
+
+def test_account_deletion_progress_heartbeats_prevent_slow_batch_reclaim(
+    tmp_path,
+    monkeypatch,
+):
+    now = [1_800_000_000]
+    bundle_id = "app.sunstone1029.fig1171"
+    monkeypatch.setenv("HERMES_APNS_BUNDLE_ID", bundle_id)
+    store = MobileDeviceStore(tmp_path / "mobile-auth.db", clock=lambda: now[0])
+    for index in range(7):
+        device_id = f"device-{index}"
+        store.create_session(
+            user_id="owner",
+            device=_device(device_id, f"Owner iPhone {index}"),
+        )
+        store.register_apns(
+            device_id=device_id,
+            token=f"{index + 1:02x}" * 32,
+            environment="production",
+            bundle_id=bundle_id,
+        )
+    store.begin_account_deletion("owner", "https://hermes.example|owner")
+    second_store = MobileDeviceStore(store.db_path, clock=lambda: now[0])
+    sends = []
+    second_claims = []
+
+    def slow_sender(registration, _payload, _collapse_id):
+        sends.append(registration["device_id"])
+        now[0] += 11
+        if len(sends) == 6:
+            second_claims.extend(second_store.claim_account_deletions())
+        return 200, ""
+
+    outcomes = process_account_deletion_outbox(
+        device_store=store,
+        owner_id="owner",
+        sender=slow_sender,
+    )
+
+    assert second_claims == []
+    assert len(sends) == 7
+    assert outcomes[0]["state"] == "delivered"
+    assert outcomes[0]["cleanup"]["updated"] is True
+    status = store.account_deletion_status("owner")
+    assert status["state"] == "delivered"
+    assert status["attempts"] == 1
+
+
+def test_account_deletion_worker_stops_after_lease_is_reclaimed(
+    tmp_path,
+    monkeypatch,
+):
+    now = [1_800_000_000]
+    bundle_id = "app.sunstone1029.fig1171"
+    monkeypatch.setenv("HERMES_APNS_BUNDLE_ID", bundle_id)
+    store = MobileDeviceStore(tmp_path / "mobile-auth.db", clock=lambda: now[0])
+    for index in range(3):
+        device_id = f"device-{index}"
+        store.create_session(
+            user_id="owner",
+            device=_device(device_id, f"Owner iPhone {index}"),
+        )
+        store.register_apns(
+            device_id=device_id,
+            token=f"{index + 1:02x}" * 32,
+            environment="production",
+            bundle_id=bundle_id,
+        )
+    store.begin_account_deletion("owner", "https://hermes.example|owner")
+    second_store = MobileDeviceStore(store.db_path, clock=lambda: now[0])
+    sends = []
+    reclaimed = []
+
+    def stalled_sender(registration, _payload, _collapse_id):
+        sends.append(registration["device_id"])
+        now[0] += mobile_device_store.ACCOUNT_DELETION_LEASE_SECONDS + 1
+        reclaimed.extend(second_store.claim_account_deletions())
+        return 200, ""
+
+    outcomes = process_account_deletion_outbox(
+        device_store=store,
+        owner_id="owner",
+        sender=stalled_sender,
+    )
+
+    assert len(reclaimed) == 1
+    assert len(sends) == 1
+    assert outcomes[0]["state"] == "retry"
+    assert outcomes[0]["error"] == "account deletion lease lost"
+    assert outcomes[0]["cleanup"]["updated"] is False
+    status = store.account_deletion_status("owner")
+    assert status["state"] == "delivering"
+    assert status["attempts"] == 2
 
 
 def test_schema_initialization_is_idempotent_and_preserves_rows(tmp_path):

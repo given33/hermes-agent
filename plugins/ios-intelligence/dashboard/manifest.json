@@ -1,0 +1,13 @@
+{
+  "name": "ios-intelligence",
+  "label": "iOS 智能上下文",
+  "description": "iPhone 与 Apple Watch 的位置、行为、健康、天气和原生能力中继。",
+  "icon": "MapPinned",
+  "version": "1.0.0",
+  "tab": {
+    "path": "/smart-weather",
+    "position": "after:analytics",
+    "hidden": true
+  },
+  "api": "plugin_api.py"
+}

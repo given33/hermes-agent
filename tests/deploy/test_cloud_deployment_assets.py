@@ -198,6 +198,15 @@ printf '%s|%s\n' "$(basename "$0")" "$*" >>"$DEPLOY_CAPTURE"
         "hermes_cli/dashboard_auth/mobile_notifications.py",
         "hermes_cli/web_server.py",
         "tui_gateway/server.py",
+        "hermes_cli/ios_intelligence.py",
+        "hermes_cli/ios_intelligence_config.py",
+        "hermes_cli/ios_intelligence_scheduler.py",
+        "hermes_cli/ios_intelligence_supervisor.py",
+        "hermes_cli/ios_mcp_supervisor.py",
+        "hermes_cli/ios_mcp_server.py",
+        "plugins/ios-intelligence/dashboard/plugin_api.py",
+        "plugins/ios-intelligence/dashboard/manifest.json",
+        "tools/mcp_tool.py",
     ):
         assert f"{_posix_path(ROOT)}/{relative}" in deployed
 
@@ -235,13 +244,33 @@ def test_public_installer_quiesces_state_during_snapshot_and_rollback():
     installer = (PUBLIC / "install-collaboration-backend.sh").read_text(encoding="utf-8")
     stop = installer.index('systemctl stop "${service}"', installer.index("trap rollback EXIT"))
     state_backup = installer.index('backup_one "${state_target}"', stop)
+    intelligence_backup = installer.index(
+        'backup_sqlite "${ios_database_target}"', state_backup
+    )
+    supervisor_backup = installer.index(
+        'backup_sqlite "${ios_supervisor_target}"', intelligence_backup
+    )
     first_install = installer.index("install_atomic()", state_backup)
     start = installer.index('systemctl start "${service}"', first_install)
 
-    assert stop < state_backup < first_install < start
+    assert (
+        stop
+        < state_backup
+        < intelligence_backup
+        < supervisor_backup
+        < first_install
+        < start
+    )
     rollback = installer[installer.index("rollback() {"):installer.index("restore_one() {")]
     assert rollback.index('systemctl stop "${service}"') < rollback.index("restore_one")
+    assert 'restore_sqlite "${backup}/state/ios-intelligence.db"' in rollback
+    assert 'restore_sqlite "${backup}/state/ios-mcp-supervisor.db"' in rollback
+    assert 'restore_sqlite "${backup}/state/mobile-auth.db"' in rollback
+    assert 'backup_sqlite "${mobile_auth_target}" "${backup}/state/mobile-auth.db"' in installer
     assert rollback.index("restore_state") < rollback.index('systemctl start "${service}"')
+    assert '/api/plugins/ios-intelligence/health' in installer
+    assert 'healthy_count") == 21' in installer
+    assert 'sum(len(item.get("tools") or []) for item in services) == 44' in installer
 
 
 def test_public_installer_uses_only_a_root_controlled_install_lock():
@@ -271,6 +300,48 @@ def test_public_installer_validates_the_root_owned_snapshot_it_installs():
     assert snapshot_copy < snapshot_check < manifest_check < compile_check < first_install
     validation_section = installer[snapshot_check:first_install]
     assert '"${stage_root}/plugins/collaboration/dashboard/manifest.json"' not in validation_section
+
+
+def test_public_installer_registers_ios_mcps_in_the_service_hermes_home():
+    installer = (PUBLIC / "install-collaboration-backend.sh").read_text(
+        encoding="utf-8"
+    )
+
+    assert (
+        'sudo -u "${service_user}" -- env HERMES_HOME="${runtime_home}" \\\n'
+        '    "${runtime_python}" -m hermes_cli.ios_mcp_server --install'
+    ) in installer
+    assert (
+        'sudo -u "${service_user}" -- env HERMES_HOME="${runtime_home}" \\\n'
+        '    "${runtime_python}" -m hermes_cli.ios_mcp_supervisor --register'
+    ) in installer
+    assert "AESGCM" in installer
+    assert "from agent.plugin_llm import PluginLlm" in installer
+
+
+def test_public_installer_transactions_mcp_discovery_with_ios_release():
+    installer = (PUBLIC / "install-collaboration-backend.sh").read_text(
+        encoding="utf-8"
+    )
+    ios_assets = installer[
+        installer.index("ios_optional=("):installer.index(
+            'for relative in "${required[@]}"'
+        )
+    ]
+
+    assert '"tools/mcp_tool.py"' in ios_assets
+    assert '"${snapshot}/tools/mcp_tool.py"' in installer
+    assert '"${target_root}/tools"' in installer
+    assert '"${backup}/tools"' in installer
+    assert (
+        'backup_one "${destination}" "${backup}/${relative}"'
+    ) in installer
+    assert (
+        'restore_one "${backup}/${relative}" "${target_root}/${relative}"'
+    ) in installer
+    assert (
+        'install_atomic "${snapshot}/${relative}" "${target_root}/${relative}"'
+    ) in installer
 
 
 def test_dbb3_installer_uses_only_a_root_controlled_install_lock():

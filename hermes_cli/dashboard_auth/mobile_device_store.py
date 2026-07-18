@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import contextlib
 import hashlib
+import json
 import secrets
 import sqlite3
 import time
@@ -29,7 +30,8 @@ from hermes_constants import get_hermes_home
 
 ACCESS_TTL_SECONDS = 15 * 60
 REFRESH_TTL_SECONDS = 30 * 24 * 60 * 60
-SCHEMA_VERSION = 2
+ACCOUNT_DELETION_LEASE_SECONDS = 300
+SCHEMA_VERSION = 3
 
 _SCHEMA_SQL = """
 CREATE TABLE IF NOT EXISTS mobile_devices (
@@ -95,6 +97,25 @@ CREATE INDEX IF NOT EXISTS idx_mobile_apns_active
     ON mobile_apns_tokens(disabled_at, environment);
 CREATE INDEX IF NOT EXISTS idx_mobile_apns_token_hash
     ON mobile_apns_tokens(token_hash);
+
+CREATE TABLE IF NOT EXISTS mobile_account_deletion_outbox (
+    id                      TEXT PRIMARY KEY,
+    user_id                 TEXT NOT NULL UNIQUE,
+    owner_scope             TEXT NOT NULL,
+    state                   TEXT NOT NULL DEFAULT 'pending',
+    device_deliveries_json  TEXT NOT NULL DEFAULT '{}',
+    attempts                INTEGER NOT NULL DEFAULT 0,
+    available_at            INTEGER NOT NULL,
+    lease_token             TEXT NOT NULL DEFAULT '',
+    leased_until            INTEGER NOT NULL DEFAULT 0,
+    requested_at            INTEGER NOT NULL,
+    updated_at              INTEGER NOT NULL,
+    completed_at            INTEGER,
+    last_error              TEXT NOT NULL DEFAULT ''
+);
+
+CREATE INDEX IF NOT EXISTS idx_mobile_account_deletion_due
+    ON mobile_account_deletion_outbox(state, available_at, leased_until);
 """
 
 
@@ -208,6 +229,9 @@ class MobileDeviceStore:
         user_id: str,
         device: Optional[MobileDeviceInfo] = None,
     ) -> MobileTokenPair:
+        normalized_user_id = str(user_id or "").strip()
+        if not normalized_user_id:
+            raise ValueError("user_id is required")
         now = self._clock()
         normalized = self._normalize_device(device)
         access_token = _new_access_token()
@@ -216,11 +240,17 @@ class MobileDeviceStore:
         record = MobileSessionRecord(
             session_id=session_id,
             device_id=normalized.id,
-            user_id=user_id,
+            user_id=normalized_user_id,
             access_expires_at=now + ACCESS_TTL_SECONDS,
             refresh_expires_at=now + REFRESH_TTL_SECONDS,
         )
         with self.connection() as conn, write_txn(conn):
+            deletion = conn.execute(
+                "SELECT state FROM mobile_account_deletion_outbox WHERE user_id=?",
+                (normalized_user_id,),
+            ).fetchone()
+            if deletion is not None:
+                raise PermissionError("account deletion tombstone is active")
             conn.execute(
                 """
                 INSERT INTO mobile_devices (
@@ -240,7 +270,7 @@ class MobileDeviceStore:
                 """,
                 (
                     normalized.id,
-                    user_id,
+                    normalized_user_id,
                     normalized.name,
                     normalized.model,
                     normalized.os_version,
@@ -269,7 +299,7 @@ class MobileDeviceStore:
                 (
                     session_id,
                     normalized.id,
-                    user_id,
+                    normalized_user_id,
                     _token_hash(access_token),
                     _token_hash(refresh_token),
                     record.access_expires_at,
@@ -716,6 +746,296 @@ class MobileDeviceStore:
                 tuple(values),
             ).fetchall()
         return [dict(row) for row in rows]
+
+    def list_account_deletion_apns_registrations(
+        self,
+        *,
+        user_id: str,
+        environment: str = "",
+    ) -> list[dict[str, Any]]:
+        """Return retained APNs rows after account sessions are revoked."""
+
+        normalized_user_id = str(user_id or "").strip()
+        if not normalized_user_id:
+            return []
+        clauses = ["p.disabled_at IS NULL", "d.user_id=?"]
+        values: list[Any] = [normalized_user_id]
+        if environment:
+            clauses.append("p.environment=?")
+            values.append(environment.strip().lower())
+        with self.connection() as conn:
+            rows = conn.execute(
+                f"""
+                SELECT p.id, p.device_id, p.token, p.environment, p.bundle_id,
+                       p.created_at, p.updated_at
+                FROM mobile_apns_tokens AS p
+                JOIN mobile_devices AS d ON d.id=p.device_id
+                WHERE {' AND '.join(clauses)}
+                ORDER BY p.updated_at DESC
+                """,
+                tuple(values),
+            ).fetchall()
+        return [dict(row) for row in rows]
+
+    def begin_account_deletion(self, user_id: str, owner_scope: str) -> dict[str, Any]:
+        """Revoke access immediately and persist APNs cleanup until terminal."""
+
+        normalized_user_id = str(user_id or "").strip()
+        normalized_scope = str(owner_scope or "").strip()
+        if not normalized_user_id:
+            raise ValueError("user_id is required")
+        if not normalized_scope:
+            raise ValueError("owner_scope is required")
+        now = self._clock()
+        identifier = "account_delete_" + uuid.uuid4().hex
+        with self.connection() as conn, write_txn(conn):
+            device_rows = conn.execute(
+                "SELECT id FROM mobile_devices WHERE user_id=?",
+                (normalized_user_id,),
+            ).fetchall()
+            device_ids = [str(row["id"]) for row in device_rows]
+            sessions = 0
+            apns = 0
+            if device_ids:
+                placeholders = ",".join("?" for _ in device_ids)
+                sessions = int(conn.execute(
+                    f"SELECT COUNT(*) FROM mobile_sessions WHERE device_id IN ({placeholders})",
+                    tuple(device_ids),
+                ).fetchone()[0])
+                apns = int(conn.execute(
+                    f"SELECT COUNT(*) FROM mobile_apns_tokens WHERE device_id IN ({placeholders})",
+                    tuple(device_ids),
+                ).fetchone()[0])
+                conn.execute(
+                    f"UPDATE mobile_sessions SET revoked_at=COALESCE(revoked_at,?),"
+                    f"revoke_reason=CASE WHEN revoked_at IS NULL THEN 'account_deleted' ELSE revoke_reason END,"
+                    f"updated_at=? WHERE device_id IN ({placeholders})",
+                    (now, now, *device_ids),
+                )
+                conn.execute(
+                    f"UPDATE mobile_devices SET revoked_at=COALESCE(revoked_at,?),"
+                    f"revoke_reason=CASE WHEN revoked_at IS NULL THEN 'account_deleted' ELSE revoke_reason END,"
+                    f"updated_at=? WHERE id IN ({placeholders})",
+                    (now, now, *device_ids),
+                )
+            conn.execute(
+                "INSERT INTO mobile_account_deletion_outbox("
+                "id,user_id,owner_scope,state,device_deliveries_json,attempts,"
+                "available_at,lease_token,leased_until,requested_at,updated_at,completed_at,last_error"
+                ") VALUES(?,?,?,'pending','{}',0,?,'',0,?,?,NULL,'') "
+                "ON CONFLICT(user_id) DO UPDATE SET "
+                "owner_scope=excluded.owner_scope,state='pending',available_at=excluded.available_at,"
+                "lease_token='',leased_until=0,updated_at=excluded.updated_at,completed_at=NULL,last_error=''",
+                (identifier, normalized_user_id, normalized_scope, now, now, now),
+            )
+            row = conn.execute(
+                "SELECT id,state FROM mobile_account_deletion_outbox WHERE user_id=?",
+                (normalized_user_id,),
+            ).fetchone()
+        return {
+            "id": str(row["id"]),
+            "state": str(row["state"]),
+            "devices": len(device_ids),
+            "sessions": sessions,
+            "apns": apns,
+        }
+
+    def claim_account_deletions(
+        self,
+        *,
+        limit: int = 100,
+        lease_seconds: int = ACCOUNT_DELETION_LEASE_SECONDS,
+        user_id: str = "",
+    ) -> list[dict[str, Any]]:
+        now = self._clock()
+        lease_until = now + max(15, min(int(lease_seconds), 3600))
+        clauses = [
+            "available_at<=?",
+            "(state IN ('pending','retry') OR (state='delivering' AND leased_until<=?))",
+        ]
+        values: list[Any] = [now, now]
+        if str(user_id or "").strip():
+            clauses.append("user_id=?")
+            values.append(str(user_id).strip())
+        values.append(max(1, min(int(limit), 1000)))
+        with self.connection() as conn, write_txn(conn):
+            rows = conn.execute(
+                "SELECT * FROM mobile_account_deletion_outbox "
+                f"WHERE {' AND '.join(clauses)} ORDER BY requested_at LIMIT ?",
+                tuple(values),
+            ).fetchall()
+            claimed: list[dict[str, Any]] = []
+            for row in rows:
+                lease_token = uuid.uuid4().hex
+                changed = conn.execute(
+                    "UPDATE mobile_account_deletion_outbox SET "
+                    "state='delivering',attempts=attempts+1,lease_token=?,leased_until=?,updated_at=? "
+                    "WHERE id=? AND (state IN ('pending','retry') OR (state='delivering' AND leased_until<=?))",
+                    (lease_token, lease_until, now, row["id"], now),
+                ).rowcount
+                if not changed:
+                    continue
+                item = dict(row)
+                item["state"] = "delivering"
+                item["attempts"] = int(row["attempts"]) + 1
+                item["lease_token"] = lease_token
+                try:
+                    deliveries = json.loads(str(row["device_deliveries_json"] or "{}"))
+                except (TypeError, ValueError):
+                    deliveries = {}
+                item["device_deliveries"] = deliveries if isinstance(deliveries, dict) else {}
+                claimed.append(item)
+        return claimed
+
+    def update_account_deletion_progress(
+        self,
+        deletion_id: str,
+        deliveries: dict[str, dict[str, Any]],
+        *,
+        lease_token: str,
+        lease_seconds: int = ACCOUNT_DELETION_LEASE_SECONDS,
+    ) -> bool:
+        with self.connection() as conn, write_txn(conn):
+            now = self._clock()
+            lease_until = now + max(15, min(int(lease_seconds), 3600))
+            changed = conn.execute(
+                "UPDATE mobile_account_deletion_outbox SET "
+                "device_deliveries_json=?,leased_until=?,updated_at=? "
+                "WHERE id=? AND state='delivering' AND lease_token=? AND leased_until>?",
+                (
+                    json.dumps(deliveries, ensure_ascii=False, separators=(",", ":")),
+                    lease_until,
+                    now,
+                    str(deletion_id),
+                    str(lease_token),
+                    now,
+                ),
+            ).rowcount
+        return bool(changed)
+
+    def finish_account_deletion(
+        self,
+        deletion_id: str,
+        state: str,
+        *,
+        deliveries: dict[str, dict[str, Any]],
+        lease_token: str,
+        error: str = "",
+        retry_seconds: int = 60,
+    ) -> dict[str, Any]:
+        normalized_state = str(state or "retry").strip().lower()
+        terminal = normalized_state in {"delivered", "no_recipients", "permanent_failure"}
+        if not terminal:
+            normalized_state = "retry"
+        removed = {"devices": 0, "sessions": 0, "apns": 0}
+        with self.connection() as conn, write_txn(conn):
+            now = self._clock()
+            row = conn.execute(
+                "SELECT user_id FROM mobile_account_deletion_outbox "
+                "WHERE id=? AND state='delivering' AND lease_token=? AND leased_until>?",
+                (str(deletion_id), str(lease_token), now),
+            ).fetchone()
+            if row is None:
+                return {"updated": False, "state": normalized_state, **removed}
+            user_id = str(row["user_id"])
+            if terminal:
+                device_rows = conn.execute(
+                    "SELECT id FROM mobile_devices WHERE user_id=?",
+                    (user_id,),
+                ).fetchall()
+                device_ids = [str(item["id"]) for item in device_rows]
+                if device_ids:
+                    placeholders = ",".join("?" for _ in device_ids)
+                    removed["sessions"] = int(conn.execute(
+                        f"SELECT COUNT(*) FROM mobile_sessions WHERE device_id IN ({placeholders})",
+                        tuple(device_ids),
+                    ).fetchone()[0])
+                    removed["apns"] = int(conn.execute(
+                        f"SELECT COUNT(*) FROM mobile_apns_tokens WHERE device_id IN ({placeholders})",
+                        tuple(device_ids),
+                    ).fetchone()[0])
+                    conn.execute(
+                        f"DELETE FROM mobile_devices WHERE id IN ({placeholders})",
+                        tuple(device_ids),
+                    )
+                    removed["devices"] = len(device_ids)
+            conn.execute(
+                "UPDATE mobile_account_deletion_outbox SET state=?,device_deliveries_json=?,"
+                "available_at=?,lease_token='',leased_until=0,updated_at=?,completed_at=?,last_error=? "
+                "WHERE id=? AND state='delivering' AND lease_token=? AND leased_until>?",
+                (
+                    normalized_state,
+                    json.dumps(deliveries, ensure_ascii=False, separators=(",", ":")),
+                    now if terminal else now + max(5, min(int(retry_seconds), 86400)),
+                    now,
+                    now if terminal else None,
+                    _bounded(error, 240),
+                    str(deletion_id),
+                    str(lease_token),
+                    now,
+                ),
+            )
+        return {"updated": True, "state": normalized_state, **removed}
+
+    def account_deletion_status(self, user_id: str) -> dict[str, Any] | None:
+        normalized_user_id = str(user_id or "").strip()
+        if not normalized_user_id:
+            return None
+        with self.connection() as conn:
+            row = conn.execute(
+                "SELECT * FROM mobile_account_deletion_outbox WHERE user_id=?",
+                (normalized_user_id,),
+            ).fetchone()
+        if row is None:
+            return None
+        result = dict(row)
+        result.pop("device_deliveries_json", None)
+        return result
+
+    def clear_completed_account_deletion(self, user_id: str) -> bool:
+        """Release a terminal tombstone before an explicitly verified re-registration."""
+
+        normalized_user_id = str(user_id or "").strip()
+        if not normalized_user_id:
+            return False
+        with self.connection() as conn, write_txn(conn):
+            changed = conn.execute(
+                "DELETE FROM mobile_account_deletion_outbox WHERE user_id=? "
+                "AND state IN ('delivered','no_recipients','permanent_failure')",
+                (normalized_user_id,),
+            ).rowcount
+        return bool(changed)
+
+    def delete_user(self, user_id: str) -> dict[str, int]:
+        """Remove a user's device, session, refresh-history and APNs rows."""
+
+        normalized_user_id = str(user_id or "").strip()
+        if not normalized_user_id:
+            raise ValueError("user_id is required")
+        with self.connection() as conn, write_txn(conn):
+            device_rows = conn.execute(
+                "SELECT id FROM mobile_devices WHERE user_id=?",
+                (normalized_user_id,),
+            ).fetchall()
+            device_ids = [str(row["id"]) for row in device_rows]
+            if not device_ids:
+                return {"devices": 0, "sessions": 0, "apns": 0}
+            placeholders = ",".join("?" for _ in device_ids)
+            sessions = conn.execute(
+                f"SELECT COUNT(*) FROM mobile_sessions WHERE device_id IN ({placeholders})",
+                tuple(device_ids),
+            ).fetchone()[0]
+            apns = conn.execute(
+                f"SELECT COUNT(*) FROM mobile_apns_tokens WHERE device_id IN ({placeholders})",
+                tuple(device_ids),
+            ).fetchone()[0]
+            conn.execute(
+                f"DELETE FROM mobile_devices WHERE id IN ({placeholders})",
+                tuple(device_ids),
+            )
+        return {"devices": len(device_ids), "sessions": int(sessions), "apns": int(apns)}
+
+    delete_account = delete_user
 
     @staticmethod
     def normalize_apns_token(token: str) -> str:

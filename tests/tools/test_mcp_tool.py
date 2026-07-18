@@ -928,6 +928,53 @@ class TestRunOnMCPLoopInterrupts:
 # ---------------------------------------------------------------------------
 
 class TestDiscoverAndRegister:
+    def test_changed_endpoint_reloads_existing_server_task(self, monkeypatch):
+        from tools import mcp_tool
+
+        old = SimpleNamespace(
+            session=object(),
+            shutdown=AsyncMock(),
+            _registered_tool_names=[],
+        )
+        new = mcp_tool.MCPServerTask("ios-power")
+        new.session = object()
+        config = {"url": "http://127.0.0.1:9001/mcp", "enabled": True}
+        mcp_tool._servers["ios-power"] = old
+        mcp_tool._server_config_fingerprints["ios-power"] = json.dumps(
+            {"url": "http://127.0.0.1:9000/mcp", "enabled": True},
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+
+        async def discover(name, discovered_config):
+            assert (name, discovered_config) == ("ios-power", config)
+            new._registered_tool_names = ["mcp__ios_power__ios_power_get_latest"]
+            mcp_tool._servers[name] = new
+            mcp_tool._server_config_fingerprints[name] = json.dumps(
+                discovered_config,
+                sort_keys=True,
+                separators=(",", ":"),
+            )
+            return ["mcp__ios_power__ios_power_get_latest"]
+
+        monkeypatch.setattr(mcp_tool, "_MCP_AVAILABLE", True)
+        monkeypatch.setattr(mcp_tool, "_filter_suspicious_mcp_servers", lambda value: value)
+        monkeypatch.setattr(mcp_tool, "_ensure_mcp_loop", lambda: None)
+        monkeypatch.setattr(
+            mcp_tool,
+            "_run_on_mcp_loop",
+            lambda factory, timeout=30: asyncio.run(factory()),
+        )
+        monkeypatch.setattr(mcp_tool, "_discover_and_register_server", discover)
+        try:
+            names = mcp_tool.register_mcp_servers({"ios-power": config})
+            old.shutdown.assert_awaited_once()
+            assert mcp_tool._servers["ios-power"] is new
+            assert names == ["mcp__ios_power__ios_power_get_latest"]
+        finally:
+            mcp_tool._servers.pop("ios-power", None)
+            mcp_tool._server_config_fingerprints.pop("ios-power", None)
+
     def test_tools_registered_in_registry(self):
         """_discover_and_register_server registers tools with correct names."""
         from tools.registry import ToolRegistry
@@ -1708,14 +1755,15 @@ class TestBuildSafeEnv:
         with patch.dict("os.environ", fake_env, clear=True):
             result = _build_safe_env(None)
 
-        assert result["ProgramFiles"] == r"C:\Program Files"
-        assert result["ProgramData"] == r"C:\ProgramData"
-        assert result["ProgramW6432"] == r"C:\Program Files"
-        assert result["LOCALAPPDATA"].endswith("Local")
-        assert result["APPDATA"].endswith("Roaming")
-        assert result["USERPROFILE"] == r"C:\Users\alice"
-        assert "GITHUB_TOKEN" not in result
-        assert "OPENAI_API_KEY" not in result
+        normalized = {key.upper(): value for key, value in result.items()}
+        assert normalized["PROGRAMFILES"] == r"C:\Program Files"
+        assert normalized["PROGRAMDATA"] == r"C:\ProgramData"
+        assert normalized["PROGRAMW6432"] == r"C:\Program Files"
+        assert normalized["LOCALAPPDATA"].endswith("Local")
+        assert normalized["APPDATA"].endswith("Roaming")
+        assert normalized["USERPROFILE"] == r"C:\Users\alice"
+        assert "GITHUB_TOKEN" not in normalized
+        assert "OPENAI_API_KEY" not in normalized
 
 
 # ---------------------------------------------------------------------------
@@ -4223,6 +4271,91 @@ class TestRegisterMcpServers:
 
         assert "mcp__my_server__tool1" in result
         _servers.pop("my_server", None)
+
+    def test_cold_start_discovery_is_bounded_before_connect_timeout_starts(self):
+        """Large MCP sets never start every expensive handshake at once."""
+        import threading
+
+        from tools import mcp_tool
+        from tools.mcp_tool import register_mcp_servers, _servers, _ensure_mcp_loop
+
+        active = 0
+        peak = 0
+        state_lock = threading.Lock()
+        configs = {
+            f"server-{index}": {"url": f"http://127.0.0.1:{19000 + index}/mcp"}
+            for index in range(21)
+        }
+
+        async def fake_register(name, cfg):
+            nonlocal active, peak
+            with state_lock:
+                active += 1
+                peak = max(peak, active)
+            try:
+                await asyncio.sleep(0.01)
+                server = _make_mock_server(name)
+                server._registered_tool_names = [f"mcp__{name.replace('-', '_')}__tool"]
+                with mcp_tool._lock:
+                    _servers[name] = server
+                return list(server._registered_tool_names)
+            finally:
+                with state_lock:
+                    active -= 1
+
+        try:
+            with patch("tools.mcp_tool._MCP_AVAILABLE", True), \
+                 patch("tools.mcp_tool._discover_and_register_server", side_effect=fake_register), \
+                 patch("tools.mcp_tool._existing_tool_names", return_value=[]):
+                _ensure_mcp_loop()
+                register_mcp_servers(configs)
+
+            assert peak == mcp_tool._MAX_PARALLEL_DISCOVERY
+            assert set(configs) <= set(_servers)
+        finally:
+            for name in configs:
+                _servers.pop(name, None)
+
+    def test_all_cold_start_failures_use_batch_aware_outer_timeout(self):
+        """The outer deadline outlives every bounded per-server timeout batch."""
+        from tools import mcp_tool
+        from tools.mcp_tool import register_mcp_servers, _ensure_mcp_loop
+
+        configs = {
+            f"failed-{index}": {
+                "url": f"http://127.0.0.1:{19100 + index}/mcp",
+                "connect_timeout": 20,
+            }
+            for index in range(21)
+        }
+
+        async def fail_register(name, cfg):
+            raise TimeoutError(f"{name} timed out")
+
+        try:
+            with patch("tools.mcp_tool._MCP_AVAILABLE", True), \
+                 patch(
+                     "tools.mcp_tool._discover_and_register_server",
+                     side_effect=fail_register,
+                 ), \
+                 patch("tools.mcp_tool._existing_tool_names", return_value=[]), \
+                 patch(
+                     "tools.mcp_tool._run_on_mcp_loop",
+                     wraps=mcp_tool._run_on_mcp_loop,
+                 ) as run_on_loop:
+                _ensure_mcp_loop()
+                assert register_mcp_servers(configs) == []
+
+            assert run_on_loop.call_args.kwargs["timeout"] == 150
+            with mcp_tool._lock:
+                assert set(configs) <= set(mcp_tool._server_connect_errors)
+                assert not (set(configs) & mcp_tool._server_connecting)
+        finally:
+            with mcp_tool._lock:
+                for name in configs:
+                    mcp_tool._servers.pop(name, None)
+                    mcp_tool._server_connect_errors.pop(name, None)
+                    mcp_tool._server_connecting.discard(name)
 
     def test_logs_summary_on_success(self):
         from tools.mcp_tool import register_mcp_servers, _servers, _ensure_mcp_loop

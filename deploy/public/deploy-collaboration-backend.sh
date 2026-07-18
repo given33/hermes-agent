@@ -23,6 +23,25 @@ installer="${repo}/deploy/public/install-collaboration-backend.sh"
 [[ -f "${repo}/hermes_cli/web_server.py" ]] || die "web_server.py is missing"
 [[ -f "${repo}/tui_gateway/server.py" ]] || die "tui_gateway/server.py is missing"
 
+ios_hermes_assets=(
+  "hermes_cli/ios_intelligence.py"
+  "hermes_cli/ios_intelligence_config.py"
+  "hermes_cli/ios_intelligence_scheduler.py"
+  "hermes_cli/ios_intelligence_supervisor.py"
+  "hermes_cli/ios_mcp_supervisor.py"
+  "hermes_cli/ios_mcp_server.py"
+)
+ios_plugin_assets=(
+  "plugins/ios-intelligence/dashboard/plugin_api.py"
+  "plugins/ios-intelligence/dashboard/manifest.json"
+)
+ios_tool_assets=(
+  "tools/mcp_tool.py"
+)
+for relative in "${ios_hermes_assets[@]}" "${ios_plugin_assets[@]}" "${ios_tool_assets[@]}"; do
+  [[ -f "${repo}/${relative}" && ! -L "${repo}/${relative}" ]] || die "${relative} is missing"
+done
+
 if [[ -z "${version}" ]]; then
   version="$(python3 - "${repo}/plugins/collaboration/dashboard/manifest.json" <<'PY'
 import json, sys
@@ -40,7 +59,7 @@ if [[ -n "${HERMES_SSH_IDENTITY:-}" ]]; then
   ssh_args+=(-i "${HERMES_SSH_IDENTITY}" -o IdentitiesOnly=yes)
 fi
 
-ssh "${ssh_args[@]}" "${remote}" "install -d -m 0700 '${stage}' '${stage}/plugins/collaboration/dashboard/dist' '${stage}/hermes_cli' '${stage}/hermes_cli/dashboard_auth' '${stage}/tui_gateway'"
+ssh "${ssh_args[@]}" "${remote}" "install -d -m 0700 '${stage}' '${stage}/plugins/collaboration/dashboard/dist' '${stage}/hermes_cli' '${stage}/hermes_cli/dashboard_auth' '${stage}/tui_gateway' '${stage}/plugins/ios-intelligence/dashboard' '${stage}/tools'"
 scp "${ssh_args[@]}" \
   "${repo}/plugins/collaboration/dashboard/plugin_api.py" \
   "${repo}/plugins/collaboration/dashboard/manifest.json" \
@@ -60,6 +79,21 @@ scp "${ssh_args[@]}" \
 scp "${ssh_args[@]}" \
   "${repo}/tui_gateway/server.py" \
   "${remote}:${stage}/tui_gateway/"
+scp "${ssh_args[@]}" \
+  "${repo}/hermes_cli/ios_intelligence.py" \
+  "${repo}/hermes_cli/ios_intelligence_config.py" \
+  "${repo}/hermes_cli/ios_intelligence_scheduler.py" \
+  "${repo}/hermes_cli/ios_intelligence_supervisor.py" \
+  "${repo}/hermes_cli/ios_mcp_supervisor.py" \
+  "${repo}/hermes_cli/ios_mcp_server.py" \
+  "${remote}:${stage}/hermes_cli/"
+scp "${ssh_args[@]}" \
+  "${repo}/plugins/ios-intelligence/dashboard/plugin_api.py" \
+  "${repo}/plugins/ios-intelligence/dashboard/manifest.json" \
+  "${remote}:${stage}/plugins/ios-intelligence/dashboard/"
+scp "${ssh_args[@]}" \
+  "${repo}/tools/mcp_tool.py" \
+  "${remote}:${stage}/tools/"
 scp "${ssh_args[@]}" "${installer}" "${remote}:${stage}/install-collaboration-backend.sh"
 ssh "${ssh_args[@]}" "${remote}" "chmod 0700 '${stage}/install-collaboration-backend.sh'; sudo -n /bin/bash '${stage}/install-collaboration-backend.sh' '${version}' '${stage}'"
 ssh "${ssh_args[@]}" "${remote}" "rm -rf -- '${stage}'"

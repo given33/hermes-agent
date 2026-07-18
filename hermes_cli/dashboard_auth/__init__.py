@@ -23,6 +23,7 @@ from hermes_cli.dashboard_auth.base import (
 from hermes_cli.dashboard_auth.registry import (
     register_provider,
     get_provider,
+    unregister_provider,
     list_providers,
     list_token_providers,
     list_session_providers,
@@ -41,6 +42,7 @@ __all__ = [
     "assert_protocol_compliance",
     "register_provider",
     "get_provider",
+    "unregister_provider",
     "list_providers",
     "list_token_providers",
     "list_session_providers",

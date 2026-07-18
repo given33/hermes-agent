@@ -89,6 +89,26 @@ url="${!#}"
 if [[ "${url}" == */api/status ]]; then
   [[ "${FAKE_STATUS_FAIL:-0}" != 1 ]] || exit 22
   payload='{"status":"ok"}'
+elif [[ "${url}" == */api/plugins/ios-intelligence/health ]]; then
+  payload="$(python3 - <<'PY'
+import json
+services = [
+    {"name": f"service-{index}", "ok": True, "tools": ["read", "write"] + (["extra"] if index < 2 else [])}
+    for index in range(21)
+]
+print(json.dumps({
+    "ok": True,
+    "scheduler_running": True,
+    "mcp_runtime": {
+        "ok": True,
+        "running": True,
+        "healthy_count": 21,
+        "required_count": 21,
+        "services": services,
+    },
+}))
+PY
+)"
 else
   payload='{"ok":true,"contract_version":1,"connector_id":"dbb3-primary","capabilities":["artifact-upload","attachment-download"]}'
 fi

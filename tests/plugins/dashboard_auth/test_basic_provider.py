@@ -165,6 +165,19 @@ class TestProvider:
 
 
 class TestRegister:
+    def test_skips_explicitly_disabled_config_even_when_env_is_present(self, basic, monkeypatch):
+        monkeypatch.setenv("HERMES_DASHBOARD_BASIC_AUTH_USERNAME", "admin")
+        monkeypatch.setenv("HERMES_DASHBOARD_BASIC_AUTH_PASSWORD", "hunter2")
+        monkeypatch.setattr(
+            basic,
+            "_load_config_basic_auth_section",
+            lambda: {"disabled": True},
+        )
+        ctx = MagicMock()
+        basic.register(ctx)
+        ctx.register_dashboard_auth_provider.assert_not_called()
+        assert "disabled" in basic.LAST_SKIP_REASON
+
     def test_skips_when_no_username(self, basic, monkeypatch):
         monkeypatch.setattr(basic, "_load_config_basic_auth_section", lambda: {})
         ctx = MagicMock()

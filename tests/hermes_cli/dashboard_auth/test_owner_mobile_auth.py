@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import base64
 import secrets
+import sqlite3
 import time
 
 import pytest
@@ -177,6 +178,69 @@ def test_existing_basic_provider_enables_mobile_prefix_after_restart():
 
     assert provider is get_provider("basic")
     assert token_auth.is_optional_token_path("/api/sessions") is True
+
+
+def test_account_deletion_revokes_password_provider_and_persisted_credentials():
+    _register()
+    provider = get_provider("basic")
+    store = owner_mobile._store()
+    store.begin_account_deletion("owner", "https://hermes.example|owner")
+
+    cleanup = owner_mobile.delete_owner_account_credentials("owner")
+
+    from hermes_cli.config import load_config
+
+    assert cleanup == {"disabled": True, "config_cleared": True}
+    section = load_config()["dashboard"]["basic_auth"]
+    assert section["disabled"] is True
+    assert section["username"] == ""
+    assert section["password_hash"] == ""
+    assert get_provider("basic") is None
+    assert owner_mobile.owner_account_configured() is False
+    assert owner_mobile.owner_registration_open() is True
+    with pytest.raises(owner_mobile.InvalidCredentialsError):
+        provider.complete_password_login(
+            username="owner",
+            password="correct-horse-42",
+        )
+    with pytest.raises(HTTPException) as login_error:
+        mobile_login(
+            _Request(),
+            MobileLoginBody(username="owner", password="correct-horse-42"),
+        )
+    assert login_error.value.status_code == 409
+
+
+def test_terminally_deleted_username_is_permanently_retired():
+    _register()
+    store = owner_mobile._store()
+    store.begin_account_deletion("owner", "https://hermes.example|owner")
+    with sqlite3.connect(store.db_path) as conn:
+        conn.execute(
+            "UPDATE mobile_account_deletion_outbox SET state='delivered',completed_at=1 "
+            "WHERE user_id='owner'"
+        )
+    owner_mobile.delete_owner_account_credentials("owner")
+    from hermes_cli.config import load_config
+
+    before_rejected_registration = load_config()
+    _seed_registration_code()
+
+    with pytest.raises(HTTPException) as error:
+        mobile_register(
+            _Request(),
+            MobileRegisterBody(
+                email="2821961676@qq.com",
+                verification_code="123456",
+                username="owner",
+                password="new-correct-horse-42",
+                device=MobileDeviceBody(id="new-device", name="New iPhone"),
+            ),
+        )
+
+    assert error.value.status_code == 409
+    assert "permanently retired" in str(error.value.detail)
+    assert load_config() == before_rejected_registration
 
 
 def test_plugin_loaded_basic_provider_is_reused_across_module_boundary():

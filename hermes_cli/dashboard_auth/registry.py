@@ -84,6 +84,22 @@ def get_provider(name: str) -> Optional[DashboardAuthProvider]:
         return _providers.get(name)
 
 
+def unregister_provider(
+    name: str,
+    *,
+    expected: DashboardAuthProvider | None = None,
+) -> bool:
+    """Remove one provider without disturbing a concurrent replacement."""
+
+    with _lock:
+        current = _providers.get(name)
+        if current is None or (expected is not None and current is not expected):
+            return False
+        del _providers[name]
+    _log.info("dashboard-auth: unregistered provider %r", name)
+    return True
+
+
 def list_providers() -> List[DashboardAuthProvider]:
     """All registered providers, in registration order."""
     with _lock:
