@@ -530,6 +530,7 @@ ios_health_file=""
 if [[ "${ios_enabled}" == 1 ]]; then
   ios_health_file="$(mktemp /run/hermes-agent-ios-status.XXXXXX)"
   if ! curl --fail --silent --show-error --max-time 10 \
+    --config "${curl_cfg}" \
     http://127.0.0.2:9119/api/plugins/ios-intelligence/health >"${ios_health_file}"; then
     printf '%s\n' "iOS intelligence health endpoint did not respond" >&2
     false

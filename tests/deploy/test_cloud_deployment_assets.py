@@ -274,6 +274,7 @@ def test_public_installer_quiesces_state_during_snapshot_and_rollback():
     assert 'backup_sqlite "${mobile_auth_target}" "${backup}/state/mobile-auth.db"' in installer
     assert rollback.index("restore_state") < rollback.index('systemctl start "${service}"')
     assert '/api/plugins/ios-intelligence/health' in installer
+    assert '--config "${curl_cfg}"' in installer[installer.index('/api/plugins/ios-intelligence/health') - 160:]
     assert 'healthy_count") == 21' in installer
     assert 'sum(len(item.get("tools") or []) for item in services) == 44' in installer
 
