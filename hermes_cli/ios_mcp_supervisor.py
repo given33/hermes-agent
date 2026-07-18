@@ -1013,7 +1013,33 @@ class IOSMCPRuntimeSupervisor:
                         result = await session.list_tools()
                         return [tool.name for tool in result.tools]
 
-        return asyncio.run(asyncio.wait_for(probe(), timeout=5.0))
+        async def bounded_probe() -> list[str]:
+            return await asyncio.wait_for(probe(), timeout=5.0)
+
+        # Dashboard health checks run on the web server's asyncio loop. Running
+        # asyncio.run() directly there raises and leaks the probe coroutine;
+        # execute the short-lived MCP client loop in a helper thread instead.
+        try:
+            asyncio.get_running_loop()
+        except RuntimeError:
+            return asyncio.run(bounded_probe())
+        result: list[list[str]] = []
+        failure: list[BaseException] = []
+
+        def run_probe() -> None:
+            try:
+                result.append(asyncio.run(bounded_probe()))
+            except BaseException as exc:
+                failure.append(exc)
+
+        worker = threading.Thread(target=run_probe, name="ios-mcp-health-probe", daemon=True)
+        worker.start()
+        worker.join(6.0)
+        if worker.is_alive():
+            raise TimeoutError("MCP tools/list probe timed out")
+        if failure:
+            raise failure[0]
+        return result[0] if result else []
 
     def run_once(self) -> list[dict[str, Any]]:
         results: list[dict[str, Any]] = []
