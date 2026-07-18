@@ -38,7 +38,15 @@ ios_plugin_assets=(
 ios_tool_assets=(
   "tools/mcp_tool.py"
 )
-for relative in "${ios_hermes_assets[@]}" "${ios_plugin_assets[@]}" "${ios_tool_assets[@]}"; do
+ios_support_assets=(
+  "hermes_cli/dashboard_auth/__init__.py"
+  "hermes_cli/dashboard_auth/owner_mobile.py"
+  "hermes_cli/dashboard_auth/registry.py"
+  "hermes_cli/profiles.py"
+  "plugins/dashboard_auth/basic/__init__.py"
+)
+for relative in "${ios_hermes_assets[@]}" "${ios_plugin_assets[@]}" \
+  "${ios_tool_assets[@]}" "${ios_support_assets[@]}"; do
   [[ -f "${repo}/${relative}" && ! -L "${repo}/${relative}" ]] || die "${relative} is missing"
 done
 
@@ -59,7 +67,7 @@ if [[ -n "${HERMES_SSH_IDENTITY:-}" ]]; then
   ssh_args+=(-i "${HERMES_SSH_IDENTITY}" -o IdentitiesOnly=yes)
 fi
 
-ssh "${ssh_args[@]}" "${remote}" "install -d -m 0700 '${stage}' '${stage}/plugins/collaboration/dashboard/dist' '${stage}/hermes_cli' '${stage}/hermes_cli/dashboard_auth' '${stage}/tui_gateway' '${stage}/plugins/ios-intelligence/dashboard' '${stage}/tools'"
+ssh "${ssh_args[@]}" "${remote}" "install -d -m 0700 '${stage}' '${stage}/plugins/collaboration/dashboard/dist' '${stage}/hermes_cli' '${stage}/hermes_cli/dashboard_auth' '${stage}/tui_gateway' '${stage}/plugins/ios-intelligence/dashboard' '${stage}/plugins/dashboard_auth/basic' '${stage}/tools'"
 scp "${ssh_args[@]}" \
   "${repo}/plugins/collaboration/dashboard/plugin_api.py" \
   "${repo}/plugins/collaboration/dashboard/manifest.json" \
@@ -94,6 +102,17 @@ scp "${ssh_args[@]}" \
 scp "${ssh_args[@]}" \
   "${repo}/tools/mcp_tool.py" \
   "${remote}:${stage}/tools/"
+scp "${ssh_args[@]}" \
+  "${repo}/hermes_cli/dashboard_auth/__init__.py" \
+  "${repo}/hermes_cli/dashboard_auth/owner_mobile.py" \
+  "${repo}/hermes_cli/dashboard_auth/registry.py" \
+  "${remote}:${stage}/hermes_cli/dashboard_auth/"
+scp "${ssh_args[@]}" \
+  "${repo}/hermes_cli/profiles.py" \
+  "${remote}:${stage}/hermes_cli/"
+scp "${ssh_args[@]}" \
+  "${repo}/plugins/dashboard_auth/basic/__init__.py" \
+  "${remote}:${stage}/plugins/dashboard_auth/basic/"
 scp "${ssh_args[@]}" "${installer}" "${remote}:${stage}/install-collaboration-backend.sh"
 ssh "${ssh_args[@]}" "${remote}" "chmod 0700 '${stage}/install-collaboration-backend.sh'; sudo -n /bin/bash '${stage}/install-collaboration-backend.sh' '${version}' '${stage}'"
 ssh "${ssh_args[@]}" "${remote}" "rm -rf -- '${stage}'"

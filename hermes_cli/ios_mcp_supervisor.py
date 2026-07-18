@@ -830,7 +830,19 @@ class IOSMCPRuntimeSupervisor:
         save_config(config)
 
     @staticmethod
-    def _reload_chat_client(name: str) -> bool:
+    def _chat_client_registered(name: str) -> bool:
+        """Return whether this process currently has a live client slot."""
+
+        try:
+            from tools import mcp_tool
+
+            with mcp_tool._lock:
+                return name in mcp_tool._servers
+        except Exception:
+            return False
+
+    @staticmethod
+    def _reload_chat_client(name: str, *, required: bool = False) -> bool:
         """Reload the in-process Hermes MCP client after discovery cutover.
 
         The runtime supervisor and Hermes tool registry can share a process,
@@ -844,15 +856,29 @@ class IOSMCPRuntimeSupervisor:
 
         try:
             from hermes_cli.config import read_raw_config
-            from tools.mcp_tool import register_mcp_servers
+            from tools import mcp_tool
 
             config = read_raw_config() or {}
             servers = config.get("mcp_servers") if isinstance(config, Mapping) else None
             entry = servers.get(name) if isinstance(servers, Mapping) else None
             if not isinstance(entry, Mapping):
+                return not required
+            with mcp_tool._lock:
+                had_client = name in mcp_tool._servers
+            if not had_client and not required:
                 return True
-            register_mcp_servers({name: dict(entry)})
-            return True
+            mcp_tool.register_mcp_servers({name: dict(entry)})
+            # register_mcp_servers deliberately reports per-server connection
+            # failures without raising. Verify the replacement directly so a
+            # failed green connection cannot be mistaken for a successful
+            # cutover and followed by terminating the healthy blue process.
+            with mcp_tool._lock:
+                server = mcp_tool._servers.get(name)
+                return bool(
+                    server is not None
+                    and getattr(server, "session", None) is not None
+                    and getattr(server, "_registered_tool_names", ())
+                )
         except Exception:
             logger.exception("MCP chat client reload failed for %s", name)
             return False
@@ -920,12 +946,16 @@ class IOSMCPRuntimeSupervisor:
             with self._lock:
                 if self._processes.get(service) is not old_process:
                     raise RuntimeError("active MCP changed during blue-green upgrade")
+                chat_client_registered = self._chat_client_registered(service)
                 self._persist_discovery_endpoint(
                     service,
                     green_port,
                     version=str(new_version),
                 )
-                if not self._reload_chat_client(service):
+                if not self._reload_chat_client(
+                    service,
+                    required=chat_client_registered,
+                ):
                     # Restore blue discovery before reporting the upgrade as a
                     # rollback. The green process remains owned by the caller
                     # and is cleaned up by the failure path below.
@@ -934,6 +964,8 @@ class IOSMCPRuntimeSupervisor:
                         old_port,
                         version=str(_old_version),
                     )
+                    if chat_client_registered:
+                        self._reload_chat_client(service, required=True)
                     raise RuntimeError("Hermes MCP client failed to reload green endpoint")
                 self._processes[service] = green["process"]
                 self._log_handles[service] = green["handle"]

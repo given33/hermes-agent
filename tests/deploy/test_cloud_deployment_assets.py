@@ -206,6 +206,11 @@ printf '%s|%s\n' "$(basename "$0")" "$*" >>"$DEPLOY_CAPTURE"
         "hermes_cli/ios_mcp_server.py",
         "plugins/ios-intelligence/dashboard/plugin_api.py",
         "plugins/ios-intelligence/dashboard/manifest.json",
+        "hermes_cli/dashboard_auth/__init__.py",
+        "hermes_cli/dashboard_auth/owner_mobile.py",
+        "hermes_cli/dashboard_auth/registry.py",
+        "hermes_cli/profiles.py",
+        "plugins/dashboard_auth/basic/__init__.py",
         "tools/mcp_tool.py",
     ):
         assert f"{_posix_path(ROOT)}/{relative}" in deployed
@@ -330,6 +335,10 @@ def test_public_installer_transactions_mcp_discovery_with_ios_release():
     ]
 
     assert '"tools/mcp_tool.py"' in ios_assets
+    assert '"hermes_cli/dashboard_auth/owner_mobile.py"' in ios_assets
+    assert '"hermes_cli/dashboard_auth/registry.py"' in ios_assets
+    assert '"hermes_cli/profiles.py"' in ios_assets
+    assert '"plugins/dashboard_auth/basic/__init__.py"' in ios_assets
     assert '"${snapshot}/tools/mcp_tool.py"' in installer
     assert '"${target_root}/tools"' in installer
     assert '"${backup}/tools"' in installer

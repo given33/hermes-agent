@@ -64,6 +64,11 @@ ios_optional=(
   "hermes_cli/ios_mcp_server.py"
   "plugins/ios-intelligence/dashboard/plugin_api.py"
   "plugins/ios-intelligence/dashboard/manifest.json"
+  "hermes_cli/dashboard_auth/__init__.py"
+  "hermes_cli/dashboard_auth/owner_mobile.py"
+  "hermes_cli/dashboard_auth/registry.py"
+  "hermes_cli/profiles.py"
+  "plugins/dashboard_auth/basic/__init__.py"
   "tools/mcp_tool.py"
 )
 for relative in "${required[@]}"; do
@@ -142,6 +147,11 @@ if [[ "${ios_enabled}" == 1 ]]; then
     "${snapshot}/hermes_cli/ios_intelligence_supervisor.py" \
     "${snapshot}/hermes_cli/ios_mcp_supervisor.py" \
     "${snapshot}/hermes_cli/ios_mcp_server.py" \
+    "${snapshot}/hermes_cli/dashboard_auth/__init__.py" \
+    "${snapshot}/hermes_cli/dashboard_auth/owner_mobile.py" \
+    "${snapshot}/hermes_cli/dashboard_auth/registry.py" \
+    "${snapshot}/hermes_cli/profiles.py" \
+    "${snapshot}/plugins/dashboard_auth/basic/__init__.py" \
     "${snapshot}/plugins/ios-intelligence/dashboard/plugin_api.py" \
     "${snapshot}/tools/mcp_tool.py" <<'PY'
 import pathlib, sys
@@ -353,11 +363,14 @@ if [[ "${ios_enabled}" == 1 ]]; then
   install -d -o "${service_user}" -g "${service_group}" -m 0755 \
     "${target_root}/plugins/ios-intelligence/dashboard"
   install -d -o "${service_user}" -g "${service_group}" -m 0755 \
+    "${target_root}/plugins/dashboard_auth/basic"
+  install -d -o "${service_user}" -g "${service_group}" -m 0755 \
     "${target_root}/hermes_cli"
   install -d -o "${service_user}" -g "${service_group}" -m 0755 \
     "${target_root}/tools"
   mkdir -p \
     "${backup}/plugins/ios-intelligence/dashboard" \
+    "${backup}/plugins/dashboard_auth/basic" \
     "${backup}/hermes_cli" \
     "${backup}/tools"
   mkdir -p "${backup}/config"

@@ -426,6 +426,44 @@ def test_runtime_start_reports_false_when_required_service_fails(tmp_path, monke
         runtime.stop()
 
 
+def test_runtime_chat_client_reload_requires_a_live_replacement(tmp_path, monkeypatch):
+    from hermes_cli import config as config_module
+    from hermes_cli.ios_mcp_supervisor import IOSMCPRuntimeSupervisor
+    from tools import mcp_tool
+
+    runtime = IOSMCPRuntimeSupervisor(
+        tmp_path / "runtime.db",
+        capabilities=("ios-power",),
+        log_directory=tmp_path / "logs",
+    )
+    old = SimpleNamespace(
+        session=object(),
+        _registered_tool_names=["mcp__ios_power__ios_power_get_latest"],
+    )
+    with mcp_tool._lock:
+        mcp_tool._servers["ios-power"] = old
+    monkeypatch.setattr(config_module, "read_raw_config", lambda: {
+        "mcp_servers": {
+            "ios-power": {
+                "enabled": True,
+                "url": "http://127.0.0.1:9000/mcp",
+            },
+        },
+    })
+
+    def failed_registration(_servers):
+        with mcp_tool._lock:
+            mcp_tool._servers.pop("ios-power", None)
+        return []
+
+    monkeypatch.setattr(mcp_tool, "register_mcp_servers", failed_registration)
+    try:
+        assert runtime._reload_chat_client("ios-power", required=True) is False
+    finally:
+        with mcp_tool._lock:
+            mcp_tool._servers.pop("ios-power", None)
+
+
 def test_runtime_supervisor_starts_probes_and_blue_green_upgrades_a_real_mcp_process(tmp_path, monkeypatch):
     from hermes_cli.ios_mcp_supervisor import IOSMCPRuntimeSupervisor
 
