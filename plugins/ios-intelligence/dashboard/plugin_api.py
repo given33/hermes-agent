@@ -121,6 +121,20 @@ async def ios_intelligence_lifespan(_app):
 
 router = APIRouter(lifespan=ios_intelligence_lifespan)
 
+# The deployment gate uses the server-side connector credential to verify the
+# scheduler and MCP fleet before publishing a release. Keep this single health
+# route bearer-authable without making the rest of the personal data API a
+# service-token surface.
+try:
+    from hermes_cli.dashboard_auth.token_auth import register_optional_token_prefix
+
+    register_optional_token_prefix(
+        "/api/plugins/ios-intelligence/health",
+        required_scope="collaboration:connector",
+    )
+except Exception:
+    pass
+
 
 class ContextEvent(BaseModel):
     id: str = Field(min_length=1, max_length=256)
@@ -449,8 +463,9 @@ def delete_account(request: Request, body: AccountDeleteBody) -> dict[str, Any]:
         key: int(mobile_deletion.get(key) or 0)
         for key in ("devices", "sessions", "apns")
     }
+    device_cleanup_state = str(cleanup_delivery.get("state") or "retry")
     result["device_cleanup"] = {
-        "state": str(cleanup_delivery.get("state") or "retry"),
+        "state": device_cleanup_state,
         "devices": len(cleanup_delivery.get("deliveries") or {}),
         "error": str(cleanup_delivery.get("error") or "")[:256],
     }
@@ -460,8 +475,7 @@ def delete_account(request: Request, body: AccountDeleteBody) -> dict[str, Any]:
         "complete"
         if result.get("state") == "complete"
         and credential_cleanup.get("config_cleared") is True
-        and result["device_cleanup"]["state"]
-        in {"delivered", "no_recipients", "permanent_failure"}
+        and device_cleanup_state in {"delivered", "no_recipients", "permanent_failure"}
         else "pending"
     )
     return result

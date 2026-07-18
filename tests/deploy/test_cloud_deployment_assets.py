@@ -275,6 +275,11 @@ def test_public_installer_quiesces_state_during_snapshot_and_rollback():
     assert rollback.index("restore_state") < rollback.index('systemctl start "${service}"')
     assert '/api/plugins/ios-intelligence/health' in installer
     assert '--config "${curl_cfg}"' in installer[installer.index('/api/plugins/ios-intelligence/health') - 160:]
+    ios_plugin = (
+        ROOT / "plugins" / "ios-intelligence" / "dashboard" / "plugin_api.py"
+    ).read_text(encoding="utf-8")
+    assert '"/api/plugins/ios-intelligence/health"' in ios_plugin
+    assert 'required_scope="collaboration:connector"' in ios_plugin
     assert 'healthy_count") == 21' in installer
     assert 'sum(len(item.get("tools") or []) for item in services) == 44' in installer
 
