@@ -430,18 +430,28 @@ def test_mobile_key_is_not_returned_by_env_endpoints(mobile_app):
 
 
 def test_handshake_reports_versioned_capabilities_without_secret(mobile_app, caplog):
+    # Public contract: native clients may probe without a cookie/bearer so
+    # post-login verify does not bounce to reason=no_cookie.
+    anonymous = mobile_app.client.get("/api/mobile/v1/handshake")
     response = mobile_app.client.get(
         "/api/mobile/v1/handshake",
         headers=_bearer(mobile_app.key),
     )
 
+    assert anonymous.status_code == 200
     assert response.status_code == 200
     body = response.json()
+    anonymous_body = anonymous.json()
+    # server_time advances between sequential requests; compare the stable
+    # contract fields rather than full body equality.
+    for key in ("api_version", "hermes_version", "profiles", "capabilities"):
+        assert body[key] == anonymous_body[key]
     assert body["api_version"] == 1
     assert body["hermes_version"]
     assert isinstance(body["profiles"], list)
     assert "chat" in body["capabilities"]
     assert body["server_time"]
+    assert anonymous_body["server_time"]
     assert mobile_app.key not in response.text
     assert mobile_app.key not in str(response.request.url)
     assert mobile_app.key not in caplog.text

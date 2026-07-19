@@ -544,6 +544,7 @@ def test_real_dashboard_routes_register_login_refresh_and_authorize_api():
     from hermes_cli.dashboard_auth.middleware import _path_is_public
 
     assert _path_is_public("/auth/mobile/register") is True
+    assert _path_is_public("/api/mobile/v1/handshake") is True
     assert any(
         getattr(route, "path", None) == "/auth/mobile/register"
         for route in web_server.app.routes
@@ -578,6 +579,11 @@ def test_real_dashboard_routes_register_login_refresh_and_authorize_api():
             registered.text[:240],
         )
         token = registered.json()["access_token"]
+        handshake = client.get("/api/mobile/v1/handshake")
+        handshake_authed = client.get(
+            "/api/mobile/v1/handshake",
+            headers={"Authorization": f"Bearer {token}"},
+        )
         protected = client.get(
             "/api/sessions",
             headers={"Authorization": f"Bearer {token}"},
@@ -627,6 +633,10 @@ def test_real_dashboard_routes_register_login_refresh_and_authorize_api():
 
     assert status.json()["registration_open"] is True
     assert registered.status_code == 200
+    assert handshake.status_code == 200
+    assert handshake.json()["api_version"] == 1
+    assert handshake_authed.status_code == 200
+    assert handshake_authed.json()["api_version"] == 1
     assert protected.status_code == 200
     assert rejected.status_code == 401
     assert login.status_code == 200
