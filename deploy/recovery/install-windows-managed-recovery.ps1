@@ -28,6 +28,7 @@ Copy-Item (Join-Path $SourceRoot 'hermes_constants.py') $lib -Force
 Copy-Item (Join-Path $PSScriptRoot 'run-windows-recovery-receiver.ps1') $InstallRoot -Force
 Copy-Item (Join-Path $PSScriptRoot 'run-windows-recovery-watchdog.ps1') $InstallRoot -Force
 Copy-Item (Join-Path $PSScriptRoot 'run-windows-recovery-tunnel.ps1') $InstallRoot -Force
+Copy-Item (Join-Path $PSScriptRoot 'run-pc-cloud-connector-hidden.vbs') $InstallRoot -Force
 Copy-Item (Join-Path $PSScriptRoot 'recover-wsl.ps1') $InstallRoot -Force
 Copy-Item -LiteralPath $CloudAdminKey -Destination (Join-Path $InstallRoot 'cloud-admin.key') -Force
 
@@ -59,7 +60,7 @@ $config = [ordered]@{
         token_file = (Join-Path $InstallRoot 'recovery.token')
         command = @(
             'C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe',
-            '-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass', '-File',
+            '-NoProfile', '-NonInteractive', '-WindowStyle', 'Hidden', '-ExecutionPolicy', 'Bypass', '-File',
             (Join-Path $InstallRoot 'recover-wsl.ps1')
         )
         state_file = (Join-Path $InstallRoot 'receiver-state.json')
@@ -79,10 +80,10 @@ icacls (Join-Path $InstallRoot 'cloud-admin.key') /inheritance:r /grant:r "${acc
 $powershell = (Get-Command powershell.exe).Source
 function Register-HermesTask([string]$name, [string]$script) {
     Stop-ScheduledTask -TaskName $name -ErrorAction SilentlyContinue
-    $action = New-ScheduledTaskAction -Execute $powershell -Argument "-NoProfile -NonInteractive -ExecutionPolicy Bypass -File `"$script`""
+    $action = New-ScheduledTaskAction -Execute $powershell -Argument "-NoProfile -NonInteractive -WindowStyle Hidden -ExecutionPolicy Bypass -File `"$script`""
     $trigger = New-ScheduledTaskTrigger -AtLogOn -User $env:USERNAME
     $principal = New-ScheduledTaskPrincipal -UserId $env:USERNAME -LogonType Interactive -RunLevel Limited
-    $settings = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries -RestartCount 10 -RestartInterval (New-TimeSpan -Minutes 1)
+    $settings = New-ScheduledTaskSettingsSet -Hidden -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries -RestartCount 10 -RestartInterval (New-TimeSpan -Minutes 1)
     Register-ScheduledTask -TaskName $name -Action $action -Trigger $trigger -Principal $principal -Settings $settings -Force | Out-Null
     Start-ScheduledTask -TaskName $name
 }
@@ -90,9 +91,21 @@ Register-HermesTask 'Hermes Managed Recovery Receiver' (Join-Path $InstallRoot '
 Register-HermesTask 'Hermes Managed Recovery Watchdog' (Join-Path $InstallRoot 'run-windows-recovery-watchdog.ps1')
 Register-HermesTask 'Hermes Managed Recovery Tunnel' (Join-Path $InstallRoot 'run-windows-recovery-tunnel.ps1')
 
+$pcTask = 'Hermes PC Cloud Connector'
+Stop-ScheduledTask -TaskName $pcTask -ErrorAction SilentlyContinue
+$wscript = Join-Path $env:WINDIR 'System32\wscript.exe'
+$pcScript = Join-Path $InstallRoot 'run-pc-cloud-connector-hidden.vbs'
+$pcAction = New-ScheduledTaskAction -Execute $wscript -Argument ('//B //NoLogo "' + $pcScript + '"')
+$pcTrigger = New-ScheduledTaskTrigger -AtLogOn -User $env:USERNAME
+$pcPrincipal = New-ScheduledTaskPrincipal -UserId $env:USERNAME -LogonType Interactive -RunLevel Limited
+$pcSettings = New-ScheduledTaskSettingsSet -Hidden -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries -RestartCount 10 -RestartInterval (New-TimeSpan -Minutes 1) -ExecutionTimeLimit ([TimeSpan]::Zero)
+Register-ScheduledTask -TaskName $pcTask -Action $pcAction -Trigger $pcTrigger -Principal $pcPrincipal -Settings $pcSettings -Force | Out-Null
+Start-ScheduledTask -TaskName $pcTask
+
 [pscustomobject]@{
     InstallRoot = $InstallRoot
     Receiver = 'Hermes Managed Recovery Receiver'
     Watchdog = 'Hermes Managed Recovery Watchdog'
     Tunnel = 'Hermes Managed Recovery Tunnel'
+    PcConnector = $pcTask
 }
