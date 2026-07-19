@@ -75,12 +75,33 @@ def test_screen_time_server_exposes_native_monitor_controls(tmp_path):
     } <= names
 
 
+def test_behavior_predict_applies_feature_weights(monkeypatch, tmp_path):
+    store = IOSIntelligenceStore(tmp_path)
+    now = 1_800_000_000
+    store.record_snapshot("alice", "motion", {"state": "walking"}, observed_at=now)
+    monkeypatch.setattr(
+        ios_mcp_server_module,
+        "load_ios_feature_weights",
+        lambda supervisor=None: {"ios-motion": 0.0, "ios-calendar": 0.0},
+    )
+    monkeypatch.setattr(
+        ios_mcp_server_module,
+        "load_ios_intelligence_config",
+        lambda: SimpleNamespace(timezone="Asia/Shanghai"),
+    )
+    server = create_mcp_server("ios-behavior", store=store)
+    result = _call(server, "behavior_predict", {"owner_id": "alice"})
+    assert result["feature_weights"]["ios-motion"] == 0.0
+    assert result["motion_weight"] == 0.0
+    assert result["leave_probability"] == 0.15
+
+
 def test_external_mcp_clients_honor_plugin_base_urls(monkeypatch, tmp_path):
     captured = {}
 
     class FakeWeatherClient:
-        def __init__(self, store, *, base_url):
-            captured["qweather"] = (store, base_url)
+        def __init__(self, store, *, base_url, timezone=None):
+            captured["qweather"] = (store, base_url, timezone)
 
     class FakeAMapClient:
         def __init__(self, *, base_url):
@@ -89,10 +110,13 @@ def test_external_mcp_clients_honor_plugin_base_urls(monkeypatch, tmp_path):
     monkeypatch.setattr(
         ios_mcp_server_module,
         "load_ios_intelligence_config",
-        lambda: SimpleNamespace(weather=SimpleNamespace(
-            qweather_base_url="https://weather.example",
-            amap_base_url="https://amap.example",
-        )),
+        lambda: SimpleNamespace(
+            timezone="Asia/Shanghai",
+            weather=SimpleNamespace(
+                qweather_base_url="https://weather.example",
+                amap_base_url="https://amap.example",
+            ),
+        ),
     )
     monkeypatch.setattr(ios_mcp_server_module, "QWeatherClient", FakeWeatherClient)
     monkeypatch.setattr(ios_mcp_server_module, "AMapClient", FakeAMapClient)
@@ -102,7 +126,7 @@ def test_external_mcp_clients_honor_plugin_base_urls(monkeypatch, tmp_path):
     create_mcp_server("amap-route", store=store)
 
     assert captured == {
-        "qweather": (store, "https://weather.example"),
+        "qweather": (store, "https://weather.example", "Asia/Shanghai"),
         "amap": "https://amap.example",
     }
 

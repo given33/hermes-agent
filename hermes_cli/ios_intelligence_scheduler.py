@@ -27,13 +27,12 @@ from hermes_cli.ios_intelligence import (
     QWeatherClient,
     _distance_meters,
     _epoch,
+    load_ios_feature_weights,
 )
 from hermes_cli.ios_intelligence_config import IOSIntelligenceConfig, load_ios_intelligence_config
 
 
 logger = logging.getLogger(__name__)
-FIXED_STUDY_PLACE_ID = "study-quanzhou-91-bainaohui"
-FIXED_STUDY_PLACE_NAME = "泉州九一百脑汇"
 
 
 @dataclass(frozen=True)
@@ -310,7 +309,6 @@ class IOSIntelligenceScheduler:
         # cheap and gives a cloud learner stable features and labels to refine.
         try:
             self.store.save_model(owner_id, "behavior", behavior)
-            self._ensure_fixed_study_place(owner_id, instant)
             self._learn_graph(owner_id)
             self.store.learn_home(owner_id, self.config.timezone)
         except Exception:
@@ -356,6 +354,7 @@ class IOSIntelligenceScheduler:
         result["weather_window"] = window.as_dict()
         forecast = self._query_weather(owner_id, destination, window, route)
         result["weather_queried"] = bool(forecast.get("queried"))
+        result["weather_queried_partial"] = bool(forecast.get("queried_partial"))
         result["weather"] = forecast
         decision = self._weather_decision(forecast, window)
         value_model = behavior.get("notification_value") or {}
@@ -368,6 +367,12 @@ class IOSIntelligenceScheduler:
             decision["threshold"] = round(learned_threshold, 3)
             decision["should_notify"] = float(decision.get("score") or 0.0) >= learned_threshold
             decision["reason"] = "weather_event" if decision["should_notify"] else "learned_threshold"
+        # Incomplete multi-location weather must not page the user as if the
+        # full origin/destination/route picture is known.
+        if forecast.get("queried_partial") and not forecast.get("critical_complete"):
+            decision["should_notify"] = False
+            decision["reason"] = "partial_weather_query"
+            decision["suppressed"] = True
         result["alert"] = decision
         if self._is_quiet(local):
             result["weather_reconciliation"] = self._expire_stale_weather(owner_id, instant)
@@ -392,7 +397,11 @@ class IOSIntelligenceScheduler:
             notification = self._enqueue_weather_notification(owner_id, destination, route, window, decision, instant)
             result["notification"] = notification
         else:
-            if forecast.get("queried") and not forecast.get("errors"):
+            if (
+                forecast.get("queried")
+                and not forecast.get("errors")
+                and not forecast.get("queried_partial")
+            ):
                 result["weather_reconciliation"] = self._expire_stale_weather(owner_id, instant)
             result["suppressed_reason"] = decision.get("reason") or "low_weather_impact"
         return result
@@ -432,31 +441,9 @@ class IOSIntelligenceScheduler:
             logger.debug("predicted-departure location command unavailable", exc_info=True)
 
     def _feature_weights(self) -> dict[str, float]:
-        """Down-weight only the feature owned by an unhealthy MCP."""
+        """Down-weight features owned by unhealthy MCPs; fail closed if supervisor is unread."""
 
-        supervisor = self.supervisor
-        if supervisor is None:
-            try:
-                from hermes_cli.ios_mcp_supervisor import IOSMCPSupervisor
-
-                supervisor = IOSMCPSupervisor()
-            except Exception:
-                return {}
-        try:
-            statuses = supervisor.statuses()
-        except Exception:
-            return {}
-        weights: dict[str, float] = {}
-        for item in statuses:
-            state = str(item.get("state") or "RUNNING")
-            weights[str(item.get("name") or "")] = {
-                "DISABLED": 0.0,
-                "QUARANTINED": 0.2,
-                "DEGRADED": 0.5,
-                "RECOVERING": 0.6,
-                "UPGRADING": 0.8,
-            }.get(state, 1.0)
-        return weights
+        return load_ios_feature_weights(self.supervisor)
 
     def _maybe_semantic_enrich(
         self,
@@ -850,41 +837,6 @@ class IOSIntelligenceScheduler:
         places = [place for place in self.store.list_places(owner_id, limit=20) if place.get("place_id") != current_id]
         return places[0] if places else None
 
-    def _ensure_fixed_study_place(self, owner_id: str, observed_at: int) -> None:
-        existing = self.store.get_place(owner_id, FIXED_STUDY_PLACE_ID)
-        if (
-            existing
-            and existing.get("latitude") is not None
-            and existing.get("longitude") is not None
-        ):
-            return
-        latitude = longitude = None
-        if self.amap is not None:
-            try:
-                search = getattr(self.amap, "search_poi", None)
-                if callable(search):
-                    result = search(FIXED_STUDY_PLACE_NAME, city="泉州")
-                    pois = result.get("pois") or []
-                    location = str(pois[0].get("location") or "") if pois else ""
-                    if "," in location:
-                        longitude_text, latitude_text = location.split(",", 1)
-                        longitude, latitude = float(longitude_text), float(latitude_text)
-            except Exception:
-                logger.debug("fixed study-room POI resolution unavailable", exc_info=True)
-        if existing and (latitude is None or longitude is None):
-            # Keep retrying resolution on later evaluations instead of leaving
-            # a permanent coordinate-less sentinel after one transient outage.
-            return
-        self.store.learn_place(
-            owner_id,
-            FIXED_STUDY_PLACE_ID,
-            name=FIXED_STUDY_PLACE_NAME,
-            latitude=latitude,
-            longitude=longitude,
-            arrived_at=observed_at,
-            metadata={"fixed": True, "kind": "study-room"},
-        )
-
     def _estimate_route(self, owner_id: str, behavior: Mapping[str, Any], destination: Mapping[str, Any]) -> RouteEstimate:
         current = behavior.get("current_place") or {}
         effective_motion_state = (
@@ -1008,10 +960,20 @@ class IOSIntelligenceScheduler:
         window: WeatherWindow,
         route: RouteEstimate,
     ) -> dict[str, Any]:
-        result: dict[str, Any] = {"queried": False, "locations": [], "events": []}
+        result: dict[str, Any] = {
+            "queried": False,
+            "queried_partial": False,
+            "queried_complete": False,
+            "critical_complete": False,
+            "locations": [],
+            "events": [],
+            "errors": [],
+            "attempted_labels": [],
+            "success_labels": [],
+        }
         if not self.qweather:
             return result
-        quota = self.store.weather_quota_status()
+        quota = self.store.weather_quota_status(timezone=self.config.timezone)
         if quota.get("exhausted"):
             logger.warning("QWeather hard monthly limit reached; evaluation skipped")
             return result
@@ -1035,11 +997,14 @@ class IOSIntelligenceScheduler:
         # Avoid duplicate API calls for the same coordinate while retaining the
         # semantic location labels in the result.
         seen: set[tuple[float, float]] = set()
+        attempted_labels: list[str] = []
+        success_labels: list[str] = []
         for latitude, longitude, label in locations:
             key = (round(latitude, 4), round(longitude, 4))
             if key in seen:
                 continue
             seen.add(key)
+            attempted_labels.append(label)
             try:
                 minute = self.qweather.minutely(latitude, longitude)
                 hourly = {} if soft_throttled else self.qweather.hourly(latitude, longitude, 24)
@@ -1048,14 +1013,30 @@ class IOSIntelligenceScheduler:
                 current_method = getattr(self.qweather, "current", None)
                 if callable(current_method) and not soft_throttled:
                     current_weather = current_method(latitude, longitude)
-                result["queried"] = True
-                result["locations"].append({"label": label, "latitude": latitude, "longitude": longitude,
-                                             "minutely": minute, "hourly": hourly, "warnings": warning, "current": current_weather})
+                success_labels.append(label)
+                result["locations"].append({
+                    "label": label,
+                    "latitude": latitude,
+                    "longitude": longitude,
+                    "minutely": minute,
+                    "hourly": hourly,
+                    "warnings": warning,
+                    "current": current_weather,
+                })
                 result["events"].extend(self._extract_events(minute, hourly, warning, window, current_weather))
                 if isinstance(minute.get("events"), list):
                     result["events"].extend(dict(item) for item in minute["events"] if isinstance(item, Mapping))
             except Exception as exc:
-                result.setdefault("errors", []).append(str(exc)[:300])
+                result["errors"].append({"label": label, "error": str(exc)[:300]})
+        result["attempted_labels"] = attempted_labels
+        result["success_labels"] = success_labels
+        result["queried"] = bool(success_labels)
+        result["queried_complete"] = bool(success_labels) and not result["errors"] and (
+            len(success_labels) == len(attempted_labels)
+        )
+        result["queried_partial"] = bool(success_labels) and not result["queried_complete"]
+        critical_needed = {label for label in attempted_labels if label in {"origin", "destination"}}
+        result["critical_complete"] = critical_needed.issubset(set(success_labels))
         if result["queried"]:
             condition = self._weather_condition(result["events"])
             context_payload = {
@@ -1067,6 +1048,8 @@ class IOSIntelligenceScheduler:
                 }),
                 "route_mode": route.mode,
                 "window": window.as_dict(),
+                "queried_partial": result["queried_partial"],
+                "critical_complete": result["critical_complete"],
             }
             context_hash = hashlib.sha256(
                 f"{owner_id}:{window.departure_at}:{condition}".encode()
@@ -1537,6 +1520,6 @@ class IOSIntelligenceScheduler:
 WeatherScheduler = IOSIntelligenceScheduler
 
 __all__ = [
-    "FIXED_STUDY_PLACE_ID", "FIXED_STUDY_PLACE_NAME", "IOSIntelligenceScheduler",
+    "IOSIntelligenceScheduler",
     "RouteEstimate", "WeatherScheduler", "WeatherWindow",
 ]

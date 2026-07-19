@@ -8,6 +8,7 @@ from datetime import datetime
 from pathlib import Path
 import sqlite3
 import threading
+from types import SimpleNamespace
 from zoneinfo import ZoneInfo
 
 import pytest
@@ -15,9 +16,11 @@ import pytest
 from hermes_cli.ios_intelligence import (
     AMapClient,
     IOSIntelligenceStore,
+    KNOWN_FEATURE_CAPABILITIES,
     QWeatherClient,
     WEATHER_MONTHLY_LIMIT,
     WEATHER_SOFT_LIMIT,
+    load_ios_feature_weights,
 )
 
 
@@ -1840,3 +1843,86 @@ def test_amap_validates_mode_and_status():
         failed_v4.route("118,24", "119,25", "cycling")
     assert "server-only" not in str(error.value)
     assert "/v4/direction/bicycling" in failed_v4.client.calls[0][0]
+
+
+def test_schema_status_reports_code_and_db_user_version(store):
+    status = store.schema_status()
+    assert status["code_schema_version"] == IOSIntelligenceStore.schema_version
+    assert status["db_user_version"] == IOSIntelligenceStore.schema_version
+    assert status["schema_version"] == IOSIntelligenceStore.schema_version
+    assert status["migrated"] is True
+    assert status["compatible"] is True
+
+
+def test_weather_quota_month_bucket_follows_timezone(store):
+    # 2026-07-31 23:30 UTC is already August 1 in Asia/Shanghai.
+    instant = int(datetime(2026, 7, 31, 23, 30, tzinfo=ZoneInfo("UTC")).timestamp())
+    shanghai = store.weather_month(instant, timezone="Asia/Shanghai")
+    utc = store.weather_month(instant, timezone="UTC")
+    assert shanghai == "2026-08"
+    assert utc == "2026-07"
+    reserved = store.reserve_weather_requests(1, now=instant, timezone="Asia/Shanghai")
+    assert reserved["allowed"] is True
+    assert reserved["month"] == "2026-08"
+    assert store.weather_quota_status(now=instant, timezone="Asia/Shanghai")["used"] == 1
+    assert store.weather_quota_status(now=instant, timezone="UTC")["used"] == 0
+
+
+def test_qweather_client_reserves_quota_in_configured_timezone(store):
+    class _HTTPClient:
+        def __init__(self, payload):
+            self.payload = payload
+            self.calls = []
+
+        def get(self, url, params=None):
+            self.calls.append((url, dict(params or {})))
+            return SimpleNamespace(
+                status_code=200,
+                json=lambda: self.payload,
+                raise_for_status=lambda: None,
+            )
+
+    import time as time_module
+
+    instant = int(datetime(2026, 7, 31, 23, 30, tzinfo=ZoneInfo("UTC")).timestamp())
+    # Pin wall clock so request() uses the configured timezone for month buckets.
+    original_time = time_module.time
+    try:
+        time_module.time = lambda: float(instant)
+        client = QWeatherClient(
+            store,
+            api_key="server-only",
+            client=_HTTPClient({"code": "200", "now": {"temp": "28"}}),
+            timezone="Asia/Shanghai",
+        )
+        client.request("/v7/weather/now", {"location": "118.6,24.9"})
+    finally:
+        time_module.time = original_time
+    assert store.weather_quota_status(now=instant, timezone="Asia/Shanghai")["used"] == 1
+    assert store.weather_quota_status(now=instant, timezone="UTC")["used"] == 0
+
+
+def test_load_ios_feature_weights_fail_closed_and_state_map():
+    healthy = load_ios_feature_weights(
+        SimpleNamespace(statuses=lambda: [{"name": "ios-motion", "state": "RUNNING"}])
+    )
+    assert healthy["ios-motion"] == 1.0
+
+    degraded = load_ios_feature_weights(
+        SimpleNamespace(
+            statuses=lambda: [
+                {"name": "ios-motion", "state": "DISABLED"},
+                {"name": "ios-power", "state": "QUARANTINED"},
+                {"name": "ios-calendar", "state": "DEGRADED"},
+            ]
+        )
+    )
+    assert degraded["ios-motion"] == 0.0
+    assert degraded["ios-power"] == 0.2
+    assert degraded["ios-calendar"] == 0.5
+
+    unavailable = load_ios_feature_weights(
+        SimpleNamespace(statuses=lambda: (_ for _ in ()).throw(RuntimeError("down")))
+    )
+    assert set(KNOWN_FEATURE_CAPABILITIES) <= set(unavailable)
+    assert all(weight == 0.5 for weight in unavailable.values())

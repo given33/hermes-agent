@@ -20,7 +20,12 @@ import sys
 import time
 from typing import TYPE_CHECKING, Any, Callable, Iterable, Mapping
 
-from hermes_cli.ios_intelligence import AMapClient, IOSIntelligenceStore, QWeatherClient
+from hermes_cli.ios_intelligence import (
+    AMapClient,
+    IOSIntelligenceStore,
+    QWeatherClient,
+    load_ios_feature_weights,
+)
 from hermes_cli.ios_intelligence_config import load_ios_intelligence_config
 
 if TYPE_CHECKING:
@@ -593,20 +598,22 @@ def create_mcp_server(
         return mcp
 
     if capability == "ios-trajectory":
-        def trajectory_today(owner_id: str = "", timezone: str = "Asia/Shanghai") -> dict[str, Any]:
+        def trajectory_today(owner_id: str = "", timezone: str = "") -> dict[str, Any]:
             """Use automatically when the user asks where they traveled today, what path they took, or when route history is relevant."""
             owner_id = _resolve_owner(store, owner_id)
-            today = store.today_snapshot(owner_id, timezone)
+            tz = timezone or load_ios_intelligence_config().timezone
+            today = store.today_snapshot(owner_id, tz)
             return {"date": today["date"], "timezone": today["timezone"], "trajectory": today["trajectory"]}
 
         _register_scoped_tool(mcp, enforcer, capability, trajectory_today)
         return mcp
 
     if capability == "ios-places":
-        def places_today(owner_id: str = "", timezone: str = "Asia/Shanghai") -> dict[str, Any]:
+        def places_today(owner_id: str = "", timezone: str = "") -> dict[str, Any]:
             """Use automatically when a chat request depends on places the user visited today or their arrival, departure, and dwell times."""
             owner_id = _resolve_owner(store, owner_id)
-            today = store.today_snapshot(owner_id, timezone)
+            tz = timezone or load_ios_intelligence_config().timezone
+            today = store.today_snapshot(owner_id, tz)
             return {"date": today["date"], "timezone": today["timezone"], "places": today["places"]}
 
         _register_scoped_tool(mcp, enforcer, capability, places_today)
@@ -615,15 +622,32 @@ def create_mcp_server(
     if capability == "ios-behavior":
         def behavior_predict(owner_id: str = "") -> dict[str, Any]:
             """Use automatically for proactive weather decisions and normal chat that needs the user's learned routine, likely departure, or behavior context."""
-            return store.evaluate_behavior(_resolve_owner(store, owner_id))
+            owner_id = _resolve_owner(store, owner_id)
+            config = load_ios_intelligence_config()
+            # Align with the scheduler path: apply MCP health weights and fail
+            # closed when the supervisor is unavailable so stale sensors are
+            # not treated as full trust.
+            feature_weights = load_ios_feature_weights()
+            behavior = store.evaluate_behavior(
+                owner_id,
+                feature_weights=feature_weights,
+                timezone=config.timezone,
+            )
+            behavior["feature_weights"] = feature_weights
+            return behavior
 
         _register_scoped_tool(mcp, enforcer, capability, behavior_predict)
         return mcp
 
     if capability == "qweather":
         if qweather is None:
-            policy = load_ios_intelligence_config().weather
-            qweather = QWeatherClient(store, base_url=policy.qweather_base_url)
+            config = load_ios_intelligence_config()
+            policy = config.weather
+            qweather = QWeatherClient(
+                store,
+                base_url=policy.qweather_base_url,
+                timezone=config.timezone,
+            )
 
         def weather_minutely(owner_id: str = "", latitude: float | None = None, longitude: float | None = None) -> dict[str, Any]:
             """Use automatically when the user asks whether rain will start or stop soon, or a location-aware plan needs minute-level precipitation."""
@@ -678,9 +702,11 @@ def create_mcp_server(
         return mcp
 
     if capability == "ios-map":
-        def ios_map_get_today(owner_id: str = "", timezone: str = "Asia/Shanghai") -> dict[str, Any]:
+        def ios_map_get_today(owner_id: str = "", timezone: str = "") -> dict[str, Any]:
             """Use when the user asks to show or reason over today's standard-map location, visited-place markers, and movement polyline."""
-            return store.today_snapshot(_resolve_owner(store, owner_id), timezone)
+            owner_id = _resolve_owner(store, owner_id)
+            tz = timezone or load_ios_intelligence_config().timezone
+            return store.today_snapshot(owner_id, tz)
 
         _register_scoped_tool(mcp, enforcer, capability, ios_map_get_today)
         return mcp

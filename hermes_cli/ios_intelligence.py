@@ -508,6 +508,63 @@ def _feature_weight(feature_weights: Mapping[str, Any] | None, capability: str) 
         return 1.0
 
 
+_FEATURE_WEIGHT_STATE_MULTIPLIER = {
+    "DISABLED": 0.0,
+    "QUARANTINED": 0.2,
+    "DEGRADED": 0.5,
+    "RECOVERING": 0.6,
+    "UPGRADING": 0.8,
+}
+
+# Capabilities whose snapshots feed behavior_predict / evaluate_behavior.
+KNOWN_FEATURE_CAPABILITIES = tuple(sorted({
+    *_FEATURE_WEIGHT_CAPABILITY_BY_KIND.values(),
+    "ios-motion",
+    "ios-calendar",
+}))
+
+# When the MCP supervisor cannot be read, never fail open to full trust.
+_SUPERVISOR_UNAVAILABLE_FEATURE_WEIGHT = 0.5
+
+
+def load_ios_feature_weights(supervisor: Any | None = None) -> dict[str, float]:
+    """Map MCP supervisor service health onto per-capability feature weights.
+
+    Healthy / unknown services default to full trust (1.0) via
+    :func:`_feature_weight` when the capability is absent from the map.
+    Supervisor construction or status-read failures return a conservative
+    fail-closed map so behavior_predict does not treat stale sensors as truth.
+    """
+
+    if supervisor is None:
+        try:
+            from hermes_cli.ios_mcp_supervisor import IOSMCPSupervisor
+
+            supervisor = IOSMCPSupervisor()
+        except Exception:
+            return {
+                capability: _SUPERVISOR_UNAVAILABLE_FEATURE_WEIGHT
+                for capability in KNOWN_FEATURE_CAPABILITIES
+            }
+    try:
+        statuses = supervisor.statuses()
+    except Exception:
+        return {
+            capability: _SUPERVISOR_UNAVAILABLE_FEATURE_WEIGHT
+            for capability in KNOWN_FEATURE_CAPABILITIES
+        }
+    weights: dict[str, float] = {}
+    for item in statuses or ():
+        if not isinstance(item, Mapping):
+            continue
+        name = str(item.get("name") or "").strip()
+        if not name:
+            continue
+        state = str(item.get("state") or "RUNNING").upper()
+        weights[name] = _FEATURE_WEIGHT_STATE_MULTIPLIER.get(state, 1.0)
+    return weights
+
+
 class IOSIntelligenceStore:
     """SQLite source of truth shared by the independent iOS MCP processes."""
 
@@ -889,6 +946,20 @@ class IOSIntelligenceStore:
         except Exception:
             conn.close()
             raise
+
+    def schema_status(self) -> dict[str, Any]:
+        """Report code schema vs live SQLite ``user_version`` for /health."""
+
+        with self._connect() as conn:
+            db_user_version = int(conn.execute("PRAGMA user_version").fetchone()[0])
+        code_schema_version = int(self.schema_version)
+        return {
+            "code_schema_version": code_schema_version,
+            "db_user_version": db_user_version,
+            "schema_version": code_schema_version,
+            "migrated": db_user_version >= code_schema_version,
+            "compatible": db_user_version == code_schema_version,
+        }
 
     def _secure_compact(self, conn: sqlite3.Connection) -> None:
         """Erase legacy free pages and WAL copies after an encryption migration."""
@@ -3353,12 +3424,18 @@ class QWeatherClient:
     api_key: str | None = None
     base_url: str | None = None
     client: httpx.Client | None = None
+    timezone: str | None = None
 
     def __post_init__(self) -> None:
         self.api_key = _configured_secret(
             self.api_key, os.getenv("HERMES_QWEATHER_API_KEY"), os.getenv("QWEATHER_API_KEY")
         )
-        self.base_url = (self.base_url or os.getenv("HERMES_QWEATHER_API_BASE_URL") or "https://devapi.qweather.com").rstrip("/")
+        self.base_url = (
+            self.base_url
+            or os.getenv("HERMES_QWEATHER_API_BASE_URL")
+            or "https://api.qweather.com"
+        ).rstrip("/")
+        self.timezone = str(self.timezone or DEFAULT_TIMEZONE)
 
     def request(self, endpoint: str, params: Mapping[str, Any], *, cache_seconds: int = 300) -> dict[str, Any]:
         if not self.api_key:
@@ -3368,9 +3445,11 @@ class QWeatherClient:
         cached = self.store.get_cache("qweather", cache_key)
         if cached is not None:
             return {**cached, "_cache": True}
-        if self.store.weather_quota_status()["soft_limited"]:
+        # Monthly quota buckets follow the configured product timezone, not the
+        # process host TZ, so UTC hosts do not roll the counter early/late.
+        if self.store.weather_quota_status(timezone=self.timezone)["soft_limited"]:
             cache_seconds = max(int(cache_seconds), 1800)
-        quota = self.store.reserve_weather_requests()
+        quota = self.store.reserve_weather_requests(timezone=self.timezone)
         if not quota["allowed"]:
             raise RuntimeError("QWeather monthly request limit reached")
         try:
@@ -3517,6 +3596,12 @@ class AMapClient:
 
 
 __all__ = [
-    "AMapClient", "DEFAULT_TIMEZONE", "IOSIntelligenceStore", "QWeatherClient",
-    "WEATHER_MONTHLY_LIMIT", "WEATHER_SOFT_LIMIT",
+    "AMapClient",
+    "DEFAULT_TIMEZONE",
+    "IOSIntelligenceStore",
+    "KNOWN_FEATURE_CAPABILITIES",
+    "QWeatherClient",
+    "WEATHER_MONTHLY_LIMIT",
+    "WEATHER_SOFT_LIMIT",
+    "load_ios_feature_weights",
 ]

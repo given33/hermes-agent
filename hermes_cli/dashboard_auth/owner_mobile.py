@@ -530,10 +530,13 @@ def mobile_register(request: Request, body: MobileRegisterBody):
             raise HTTPException(status_code=500, detail="Owner account unavailable")
 
     provider.complete_password_login(username=username, password=password)
-    tokens = _store().create_session(
-        user_id=username,
-        device=_device_info(body.device),
-    )
+    try:
+        tokens = _store().create_session(
+            user_id=username,
+            device=_device_info(body.device),
+        )
+    except PermissionError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
     audit_log(
         AuditEvent.LOGIN_SUCCESS,
         provider=provider.name,
@@ -564,18 +567,20 @@ def mobile_login(request: Request, body: MobileLoginBody):
             ip=ip,
         )
         raise HTTPException(status_code=401, detail="Invalid credentials")
+    try:
+        tokens = _store().create_session(
+            user_id=session.user_id,
+            device=_device_info(body.device),
+        )
+    except PermissionError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
     audit_log(
         AuditEvent.LOGIN_SUCCESS,
         provider=provider.name,
         user_id=session.user_id,
         ip=ip,
     )
-    return _token_response(
-        _store().create_session(
-            user_id=session.user_id,
-            device=_device_info(body.device),
-        )
-    )
+    return _token_response(tokens)
 
 
 @router.post("/auth/mobile/refresh")
@@ -609,16 +614,26 @@ def _current_mobile_session(request: Request):
 @router.get("/api/mobile/v1/devices")
 def mobile_devices(request: Request) -> dict[str, Any]:
     current = _current_mobile_session(request)
+    if current is None:
+        raise HTTPException(status_code=401, detail="A valid mobile device token is required")
     return {
         "devices": _store().list_devices(
-            current_device_id=current.device_id if current else "",
+            user_id=current.user_id,
+            current_device_id=current.device_id,
         )
     }
 
 
 @router.delete("/api/mobile/v1/devices/{device_id}")
-def revoke_mobile_device(device_id: str) -> dict[str, bool]:
-    if not _store().revoke_device(device_id, reason="owner_revoked_device"):
+def revoke_mobile_device(request: Request, device_id: str) -> dict[str, bool]:
+    current = _current_mobile_session(request)
+    if current is None:
+        raise HTTPException(status_code=401, detail="A valid mobile device token is required")
+    if not _store().revoke_device(
+        device_id,
+        user_id=current.user_id,
+        reason="owner_revoked_device",
+    ):
         raise HTTPException(status_code=404, detail="Device not found")
     return {"ok": True}
 

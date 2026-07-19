@@ -251,42 +251,63 @@ class MobileDeviceStore:
             ).fetchone()
             if deletion is not None:
                 raise PermissionError("account deletion tombstone is active")
-            conn.execute(
-                """
-                INSERT INTO mobile_devices (
-                    id, user_id, name, model, os_version, app_version,
-                    created_at, updated_at, last_seen_at, revoked_at, revoke_reason
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, '')
-                ON CONFLICT(id) DO UPDATE SET
-                    user_id=excluded.user_id,
-                    name=excluded.name,
-                    model=excluded.model,
-                    os_version=excluded.os_version,
-                    app_version=excluded.app_version,
-                    updated_at=excluded.updated_at,
-                    last_seen_at=excluded.last_seen_at,
-                    revoked_at=NULL,
-                    revoke_reason=''
-                """,
-                (
-                    normalized.id,
-                    normalized_user_id,
-                    normalized.name,
-                    normalized.model,
-                    normalized.os_version,
-                    normalized.app_version,
-                    now,
-                    now,
-                    now,
-                ),
-            )
+            existing = conn.execute(
+                "SELECT id, user_id FROM mobile_devices WHERE id=?",
+                (normalized.id,),
+            ).fetchone()
+            if existing is not None:
+                existing_user = str(existing["user_id"] or "")
+                if existing_user and existing_user != normalized_user_id:
+                    # Never rebind a device row across accounts — that would
+                    # revoke the legitimate owner's sessions for the same id.
+                    raise PermissionError(
+                        "device_id is already bound to another account"
+                    )
+                conn.execute(
+                    """
+                    UPDATE mobile_devices
+                    SET name=?, model=?, os_version=?, app_version=?,
+                        updated_at=?, last_seen_at=?, revoked_at=NULL, revoke_reason=''
+                    WHERE id=? AND user_id=?
+                    """,
+                    (
+                        normalized.name,
+                        normalized.model,
+                        normalized.os_version,
+                        normalized.app_version,
+                        now,
+                        now,
+                        normalized.id,
+                        normalized_user_id,
+                    ),
+                )
+            else:
+                conn.execute(
+                    """
+                    INSERT INTO mobile_devices (
+                        id, user_id, name, model, os_version, app_version,
+                        created_at, updated_at, last_seen_at, revoked_at, revoke_reason
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, '')
+                    """,
+                    (
+                        normalized.id,
+                        normalized_user_id,
+                        normalized.name,
+                        normalized.model,
+                        normalized.os_version,
+                        normalized.app_version,
+                        now,
+                        now,
+                        now,
+                    ),
+                )
             conn.execute(
                 """
                 UPDATE mobile_sessions
                 SET revoked_at=?, revoke_reason='replaced_by_login', updated_at=?
-                WHERE device_id=? AND revoked_at IS NULL
+                WHERE device_id=? AND user_id=? AND revoked_at IS NULL
                 """,
-                (now, now, normalized.id),
+                (now, now, normalized.id, normalized_user_id),
             )
             conn.execute(
                 """
@@ -510,29 +531,62 @@ class MobileDeviceStore:
                     )
         return result.rowcount > 0
 
-    def list_devices(self, *, current_device_id: str = "") -> list[dict[str, Any]]:
+    def list_devices(
+        self,
+        *,
+        user_id: str = "",
+        current_device_id: str = "",
+    ) -> list[dict[str, Any]]:
         now = self._clock()
+        normalized_user_id = str(user_id or "").strip()
         with self.connection() as conn:
-            device_rows = conn.execute(
-                """
-                SELECT d.*,
-                       COUNT(CASE WHEN s.revoked_at IS NULL
-                                      AND s.refresh_expires_at>? THEN 1 END) AS active_sessions
-                FROM mobile_devices AS d
-                LEFT JOIN mobile_sessions AS s ON s.device_id=d.id
-                GROUP BY d.id
-                ORDER BY d.last_seen_at DESC, d.created_at DESC
-                """,
-                (now,),
-            ).fetchall()
-            push_rows = conn.execute(
-                """
-                SELECT id, device_id, environment, bundle_id, token, updated_at
-                FROM mobile_apns_tokens
-                WHERE disabled_at IS NULL
-                ORDER BY updated_at DESC
-                """
-            ).fetchall()
+            if normalized_user_id:
+                device_rows = conn.execute(
+                    """
+                    SELECT d.*,
+                           COUNT(CASE WHEN s.revoked_at IS NULL
+                                          AND s.refresh_expires_at>? THEN 1 END) AS active_sessions
+                    FROM mobile_devices AS d
+                    LEFT JOIN mobile_sessions AS s ON s.device_id=d.id
+                    WHERE d.user_id=?
+                    GROUP BY d.id
+                    ORDER BY d.last_seen_at DESC, d.created_at DESC
+                    """,
+                    (now, normalized_user_id),
+                ).fetchall()
+                push_rows = conn.execute(
+                    """
+                    SELECT t.id, t.device_id, t.environment, t.bundle_id, t.token, t.updated_at
+                    FROM mobile_apns_tokens AS t
+                    INNER JOIN mobile_devices AS d ON d.id=t.device_id
+                    WHERE t.disabled_at IS NULL AND d.user_id=?
+                    ORDER BY t.updated_at DESC
+                    """,
+                    (normalized_user_id,),
+                ).fetchall()
+            else:
+                # Unscoped listing is retained only for internal admin tooling;
+                # owner-facing routes must pass user_id.
+                device_rows = conn.execute(
+                    """
+                    SELECT d.*,
+                           COUNT(CASE WHEN s.revoked_at IS NULL
+                                          AND s.refresh_expires_at>? THEN 1 END) AS active_sessions
+                    FROM mobile_devices AS d
+                    LEFT JOIN mobile_sessions AS s ON s.device_id=d.id
+                    GROUP BY d.id
+                    ORDER BY d.last_seen_at DESC, d.created_at DESC
+                    """,
+                    (now,),
+                ).fetchall()
+                push_rows = conn.execute(
+                    """
+                    SELECT id, device_id, environment, bundle_id, token, updated_at
+                    FROM mobile_apns_tokens
+                    WHERE disabled_at IS NULL
+                    ORDER BY updated_at DESC
+                    """
+                ).fetchall()
         pushes: dict[str, list[dict[str, Any]]] = {}
         for row in push_rows:
             token = str(row["token"])
@@ -562,33 +616,66 @@ class MobileDeviceStore:
             for row in device_rows
         ]
 
-    def revoke_device(self, device_id: str, *, reason: str = "device_revoked") -> bool:
+    def revoke_device(
+        self,
+        device_id: str,
+        *,
+        user_id: str = "",
+        reason: str = "device_revoked",
+    ) -> bool:
         now = self._clock()
+        normalized_user_id = str(user_id or "").strip()
         with self.connection() as conn, write_txn(conn):
-            device = conn.execute(
-                "SELECT id FROM mobile_devices WHERE id=?",
-                (device_id,),
-            ).fetchone()
+            if normalized_user_id:
+                device = conn.execute(
+                    "SELECT id FROM mobile_devices WHERE id=? AND user_id=?",
+                    (device_id, normalized_user_id),
+                ).fetchone()
+            else:
+                device = conn.execute(
+                    "SELECT id FROM mobile_devices WHERE id=?",
+                    (device_id,),
+                ).fetchone()
             if device is None:
                 return False
-            conn.execute(
-                """
-                UPDATE mobile_devices
-                SET revoked_at=?, revoke_reason=?, updated_at=?
-                WHERE id=?
-                """,
-                (now, _bounded(reason, 120), now, device_id),
-            )
-            conn.execute(
-                """
-                UPDATE mobile_sessions
-                SET revoked_at=COALESCE(revoked_at, ?),
-                    revoke_reason=CASE WHEN revoked_at IS NULL THEN ? ELSE revoke_reason END,
-                    updated_at=?
-                WHERE device_id=?
-                """,
-                (now, _bounded(reason, 120), now, device_id),
-            )
+            if normalized_user_id:
+                conn.execute(
+                    """
+                    UPDATE mobile_devices
+                    SET revoked_at=?, revoke_reason=?, updated_at=?
+                    WHERE id=? AND user_id=?
+                    """,
+                    (now, _bounded(reason, 120), now, device_id, normalized_user_id),
+                )
+                conn.execute(
+                    """
+                    UPDATE mobile_sessions
+                    SET revoked_at=COALESCE(revoked_at, ?),
+                        revoke_reason=CASE WHEN revoked_at IS NULL THEN ? ELSE revoke_reason END,
+                        updated_at=?
+                    WHERE device_id=? AND user_id=?
+                    """,
+                    (now, _bounded(reason, 120), now, device_id, normalized_user_id),
+                )
+            else:
+                conn.execute(
+                    """
+                    UPDATE mobile_devices
+                    SET revoked_at=?, revoke_reason=?, updated_at=?
+                    WHERE id=?
+                    """,
+                    (now, _bounded(reason, 120), now, device_id),
+                )
+                conn.execute(
+                    """
+                    UPDATE mobile_sessions
+                    SET revoked_at=COALESCE(revoked_at, ?),
+                        revoke_reason=CASE WHEN revoked_at IS NULL THEN ? ELSE revoke_reason END,
+                        updated_at=?
+                    WHERE device_id=?
+                    """,
+                    (now, _bounded(reason, 120), now, device_id),
+                )
             conn.execute(
                 "UPDATE mobile_apns_tokens SET disabled_at=?, updated_at=? WHERE device_id=? AND disabled_at IS NULL",
                 (now, now, device_id),

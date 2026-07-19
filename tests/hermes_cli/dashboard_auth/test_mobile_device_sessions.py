@@ -142,6 +142,46 @@ def test_relogin_same_device_replaces_prior_session(tmp_path):
     assert devices[0]["name"] == "New name"
 
 
+def test_device_id_cannot_rebind_across_accounts(tmp_path):
+    store = MobileDeviceStore(tmp_path / "mobile-auth.db")
+    first = store.create_session(
+        user_id="owner-a",
+        device=_device("shared-device", "Owner A phone"),
+    )
+
+    with pytest.raises(PermissionError, match="already bound"):
+        store.create_session(
+            user_id="owner-b",
+            device=_device("shared-device", "Owner B phone"),
+        )
+
+    assert store.verify_access(first.access_token, touch=False) is not None
+    assert [item["id"] for item in store.list_devices(user_id="owner-a")] == ["shared-device"]
+    assert store.list_devices(user_id="owner-b") == []
+
+
+def test_list_and_revoke_devices_are_scoped_to_user(tmp_path):
+    store = MobileDeviceStore(tmp_path / "mobile-auth.db")
+    owner_a = store.create_session(
+        user_id="owner-a",
+        device=_device("owner-a-phone", "A"),
+    )
+    owner_b = store.create_session(
+        user_id="owner-b",
+        device=_device("owner-b-phone", "B"),
+    )
+
+    listed_a = store.list_devices(user_id="owner-a", current_device_id="owner-a-phone")
+    listed_b = store.list_devices(user_id="owner-b", current_device_id="owner-b-phone")
+    assert [item["id"] for item in listed_a] == ["owner-a-phone"]
+    assert [item["id"] for item in listed_b] == ["owner-b-phone"]
+
+    assert store.revoke_device("owner-b-phone", user_id="owner-a") is False
+    assert store.verify_access(owner_b.access_token, touch=False) is not None
+    assert store.revoke_device("owner-a-phone", user_id="owner-a") is True
+    assert store.verify_access(owner_a.access_token, touch=False) is None
+
+
 def test_apns_registration_is_redacted_rotated_and_disabled_on_revoke(tmp_path):
     store = MobileDeviceStore(tmp_path / "mobile-auth.db")
     store.create_session(

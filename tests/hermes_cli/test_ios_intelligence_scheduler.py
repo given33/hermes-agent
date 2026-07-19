@@ -1618,3 +1618,94 @@ def test_account_delete_route_rejects_a_tombstone_for_another_owner(monkeypatch)
 
     assert exc_info.value.status_code == 400
     assert exc_info.value.detail == "owner_scope does not match account"
+
+
+class _PartialWeather:
+    """Succeeds for origin, fails for destination — partial commercial path."""
+
+    def __init__(self):
+        self.calls: list[tuple[str, float, float]] = []
+
+    def minutely(self, latitude: float, longitude: float):
+        self.calls.append(("minutely", latitude, longitude))
+        if abs(longitude - 119.0) < 0.01:
+            raise RuntimeError("destination weather unavailable")
+        return {"minutely": [{"fxTime": "2026-07-18T10:10:00+08:00", "precip": 1.0, "text": "rain"}]}
+
+    def hourly(self, latitude: float, longitude: float, hours: int = 24):
+        self.calls.append(("hourly", latitude, longitude))
+        if abs(longitude - 119.0) < 0.01:
+            raise RuntimeError("destination weather unavailable")
+        return {"hourly": []}
+
+    def warnings(self, latitude: float, longitude: float):
+        self.calls.append(("warnings", latitude, longitude))
+        if abs(longitude - 119.0) < 0.01:
+            raise RuntimeError("destination weather unavailable")
+        return {"warning": []}
+
+
+def test_partial_weather_query_suppresses_notification(tmp_path):
+    store = IOSIntelligenceStore(tmp_path)
+    tz = ZoneInfo("Asia/Shanghai")
+    now = int(datetime(2026, 7, 18, 10, 0, tzinfo=tz).timestamp())
+    store.ingest_events(
+        "alice",
+        "iphone",
+        [
+            _visit("old-home", "home", now - 3 * 86400, now - 3 * 86400 + 1800),
+            _visit("old-study", "study", now - 3 * 86400 + 2400, now - 3 * 86400 + 4200),
+            _visit("current", "home", now - 900, None),
+        ],
+        "visits",
+    )
+    store.record_snapshot("alice", "location", {"latitude": 24.9, "longitude": 118.6}, observed_at=now)
+    weather = _PartialWeather()
+    scheduler = IOSIntelligenceScheduler(
+        store=store,
+        qweather=weather,
+        config={"ios_intelligence": {"timezone": "Asia/Shanghai"}},
+        clock=lambda: now,
+    )
+    # Force destination coordinates that fail while origin succeeds.
+    scheduler._choose_destination = lambda owner_id, behavior: {
+        "place_id": "study",
+        "name": "study",
+        "latitude": 24.95,
+        "longitude": 119.0,
+    }
+
+    result = scheduler.evaluate_account("alice", force=True, now=now)
+
+    assert result["weather_queried"] is True
+    assert result["weather_queried_partial"] is True
+    assert result["weather"]["queried_partial"] is True
+    assert result["weather"]["critical_complete"] is False
+    assert result["notification"] is None
+    assert result["suppressed_reason"] == "partial_weather_query"
+    assert result["alert"]["should_notify"] is False
+
+
+def test_feature_weights_fail_closed_when_supervisor_unavailable(tmp_path):
+    store = IOSIntelligenceStore(tmp_path)
+    now = 1_800_000_000
+    store.record_snapshot("alice", "motion", {"state": "walking"}, observed_at=now)
+    broken = SimpleNamespace(statuses=lambda: (_ for _ in ()).throw(RuntimeError("supervisor down")))
+    scheduler = IOSIntelligenceScheduler(
+        store=store,
+        config={
+            "ios_intelligence": {
+                "weather": {"enabled": False},
+                "semantic": {"enabled": False},
+            },
+        },
+        supervisor=broken,
+    )
+
+    result = scheduler.evaluate_account("alice", now=now)
+    weights = result["behavior"]["feature_weights"]
+
+    assert weights["ios-motion"] == 0.5
+    assert result["behavior"]["motion_weight"] == 0.5
+    # Fail-closed weight must not full-trust the walking sensor into >=0.9.
+    assert result["behavior"]["leave_probability"] < 0.9

@@ -43,6 +43,7 @@ ios_support_assets=(
   "hermes_cli/dashboard_auth/owner_mobile.py"
   "hermes_cli/dashboard_auth/registry.py"
   "hermes_cli/profiles.py"
+  "hermes_cli/managed_nodes.py"
   "plugins/dashboard_auth/basic/__init__.py"
 )
 for relative in "${ios_hermes_assets[@]}" "${ios_plugin_assets[@]}" \
@@ -109,6 +110,7 @@ scp "${ssh_args[@]}" \
   "${remote}:${stage}/hermes_cli/dashboard_auth/"
 scp "${ssh_args[@]}" \
   "${repo}/hermes_cli/profiles.py" \
+  "${repo}/hermes_cli/managed_nodes.py" \
   "${remote}:${stage}/hermes_cli/"
 scp "${ssh_args[@]}" \
   "${repo}/plugins/dashboard_auth/basic/__init__.py" \

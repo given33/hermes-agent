@@ -22,7 +22,9 @@ class WeatherPolicy:
     route_buffer_minutes: int = 20
     maximum_window_minutes: int = 180
     dedupe_window_seconds: int = 6 * 3600
-    qweather_base_url: str = "https://devapi.qweather.com"
+    # Commercial default is the production QWeather host. Development API
+    # (devapi.qweather.com) must be set explicitly via config/env for local work.
+    qweather_base_url: str = "https://api.qweather.com"
     amap_base_url: str = "https://restapi.amap.com"
 
 

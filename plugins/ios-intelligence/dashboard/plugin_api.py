@@ -84,7 +84,11 @@ async def ios_intelligence_lifespan(_app):
         scheduler = IOSIntelligenceScheduler(
             store=store,
             qweather=(
-                QWeatherClient(store, base_url=config.weather.qweather_base_url)
+                QWeatherClient(
+                    store,
+                    base_url=config.weather.qweather_base_url,
+                    timezone=config.timezone,
+                )
                 if config.enabled
                 else None
             ),
@@ -223,9 +227,21 @@ def health() -> dict[str, Any]:
         "required_count": 0,
         "services": [],
     }
-    return {
-        "ok": bool(runtime_health["ok"]),
+    schema = store.schema_status() if hasattr(store, "schema_status") else {
+        "code_schema_version": int(getattr(store, "schema_version", 1)),
+        "db_user_version": int(getattr(store, "schema_version", 1)),
         "schema_version": int(getattr(store, "schema_version", 1)),
+        "migrated": True,
+        "compatible": True,
+    }
+    return {
+        "ok": bool(runtime_health["ok"]) and bool(schema.get("compatible", True)),
+        # Keep schema_version as the code contract; also expose live DB PRAGMA.
+        "schema_version": int(schema.get("code_schema_version") or schema.get("schema_version") or 1),
+        "code_schema_version": int(schema.get("code_schema_version") or 1),
+        "db_user_version": int(schema.get("db_user_version") or 0),
+        "schema_migrated": bool(schema.get("migrated")),
+        "schema_compatible": bool(schema.get("compatible")),
         "scheduler_running": bool(_SCHEDULER and _SCHEDULER.running),
         "mcp_supervisor_running": bool(runtime_health["running"]),
         "mcp_runtime": runtime_health,
@@ -347,7 +363,13 @@ def evaluate_now(request: Request) -> dict[str, Any]:
     owner_id = owner_id_from_request(request)
     if _SCHEDULER is not None:
         return _SCHEDULER.evaluate_account(owner_id, force=True)
-    return intelligence_store().evaluate_behavior(owner_id)
+    # Scheduler-less fallbacks (rollback / health-only mounts) must still honor
+    # the configured account timezone so weekday/holiday features stay correct.
+    config = load_ios_intelligence_config()
+    return intelligence_store().evaluate_behavior(
+        owner_id,
+        timezone=config.timezone,
+    )
 
 
 @router.get("/places")

@@ -68,6 +68,7 @@ ios_optional=(
   "hermes_cli/dashboard_auth/owner_mobile.py"
   "hermes_cli/dashboard_auth/registry.py"
   "hermes_cli/profiles.py"
+  "hermes_cli/managed_nodes.py"
   "plugins/dashboard_auth/basic/__init__.py"
   "tools/mcp_tool.py"
 )
