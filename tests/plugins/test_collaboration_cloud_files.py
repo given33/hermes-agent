@@ -48,6 +48,71 @@ def _client(module, owner: str = "owner-a") -> TestClient:
     return TestClient(app)
 
 
+def test_delete_owner_account_data_removes_only_owned_collaboration_state(
+    tmp_path,
+    monkeypatch,
+):
+    module = _load_module()
+    owner_conversation = {
+        "id": "conversation-owner-a",
+        "owner_id": "owner-a",
+        "runtime_sessions": {"default": "session-owner-a"},
+        "hosted_turns": {"turn-a": {"state": "running"}},
+    }
+    peer_conversation = {
+        "id": "conversation-owner-b",
+        "owner_id": "owner-b",
+        "runtime_sessions": {},
+        "hosted_turns": {},
+    }
+    single_state = {"conversations": [owner_conversation, peer_conversation]}
+    room_state = {"rooms": [
+        {"id": "room-owner-a", "owner_id": "owner-a"},
+        {"id": "room-owner-b", "owner_id": "owner-b"},
+    ]}
+    conversation_root = tmp_path / "conversation-owner-a"
+    conversation_root.mkdir()
+    (conversation_root / "attachment.txt").write_text("delete", encoding="utf-8")
+    sessions = []
+    file_owners = []
+
+    monkeypatch.setattr(module, "load_single_state", lambda: single_state)
+    monkeypatch.setattr(module, "save_single_state", lambda _state: None)
+    monkeypatch.setattr(module, "load_state", lambda: room_state)
+    monkeypatch.setattr(module, "save_state", lambda _state: None)
+    monkeypatch.setattr(
+        module,
+        "conversation_files_root",
+        lambda conversation_id: tmp_path / conversation_id,
+    )
+    monkeypatch.setattr(
+        module,
+        "_delete_runtime_session",
+        lambda profile, session_id: sessions.append((profile, session_id)) or True,
+    )
+    monkeypatch.setattr(
+        module,
+        "_file_library",
+        lambda: SimpleNamespace(
+            delete_owner=lambda owner_id: file_owners.append(owner_id) or {"files": 1}
+        ),
+    )
+
+    result = module.delete_owner_account_data("owner-a")
+
+    assert result == {
+        "conversations": 1,
+        "rooms": 1,
+        "runtime_sessions": 1,
+        "files": {"files": 1},
+    }
+    assert single_state["conversations"] == [peer_conversation]
+    assert room_state["rooms"] == [{"id": "room-owner-b", "owner_id": "owner-b"}]
+    assert sessions == [("default", "session-owner-a")]
+    assert file_owners == ["owner-a"]
+    assert conversation_root.exists() is False
+
+
 def test_account_file_routes_cover_upload_artifact_link_download_and_delete(
     tmp_path,
     monkeypatch,

@@ -50,11 +50,15 @@ PUBLIC_API_PATHS: frozenset[str] = frozenset({
     # hermes_version, profile names, capability labels, and server_time —
     # no session content, secrets, or owner identity. The iOS client calls
     # this immediately after password login to verify the server speaks the
-    # mobile v1 contract. Must bypass the cookie gate so a just-minted
+    # mobile v1 contract. Anonymous responses expose only the profile count;
+    # authenticated bearer/session requests receive profile names. Must bypass the cookie gate so a just-minted
     # bearer (or an unauthenticated capability check) is not bounced to
     # ``login_url`` with reason=no_cookie, which the app maps to the generic
     # "无法验证 Hermes 连接" failure despite correct credentials.
     "/api/mobile/v1/handshake",
+    # Peer recovery callback. It is cookie-independent but validates its own
+    # shared secret before launching a fixed, locally configured argv command.
+    "/api/managed-nodes/recovery-hook",
     # Chronos managed-cron fire webhook (NAS -> agent). NOT cookie-gated: it
     # carries its own short-lived NAS-minted JWT (purpose=cron_fire), which the
     # handler verifies as the real auth. Must bypass the dashboard auth gate so

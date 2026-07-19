@@ -243,6 +243,33 @@ def test_terminally_deleted_username_is_permanently_retired():
     assert load_config() == before_rejected_registration
 
 
+def test_registration_fails_closed_when_intelligence_tombstone_lookup_errors(monkeypatch):
+    class BrokenIntelligenceStore:
+        def account_deletion_status(self, _username):
+            raise sqlite3.OperationalError("database unavailable")
+
+    monkeypatch.setattr(
+        "hermes_cli.ios_intelligence.IOSIntelligenceStore",
+        BrokenIntelligenceStore,
+    )
+    _seed_registration_code()
+
+    with pytest.raises(HTTPException) as error:
+        mobile_register(
+            _Request(),
+            MobileRegisterBody(
+                email="2821961676@qq.com",
+                verification_code="123456",
+                username="owner",
+                password="correct-horse-42",
+                device=MobileDeviceBody(id="new-device", name="New iPhone"),
+            ),
+        )
+
+    assert error.value.status_code == 503
+    assert "deletion boundary" in str(error.value.detail)
+
+
 def test_plugin_loaded_basic_provider_is_reused_across_module_boundary():
     from hermes_cli.dashboard_auth import (
         DashboardAuthProvider,

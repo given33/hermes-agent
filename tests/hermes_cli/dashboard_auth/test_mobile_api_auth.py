@@ -444,8 +444,11 @@ def test_handshake_reports_versioned_capabilities_without_secret(mobile_app, cap
     anonymous_body = anonymous.json()
     # server_time advances between sequential requests; compare the stable
     # contract fields rather than full body equality.
-    for key in ("api_version", "hermes_version", "profiles", "capabilities"):
+    for key in ("api_version", "hermes_version", "profile_count", "capabilities"):
         assert body[key] == anonymous_body[key]
+    assert anonymous_body["profiles"] == []
+    assert body["profiles"] == ["default"]
+    assert anonymous_body["profile_count"] == 1
     assert body["api_version"] == 1
     assert body["hermes_version"]
     assert isinstance(body["profiles"], list)

@@ -490,8 +490,11 @@ def mobile_register(request: Request, body: MobileRegisterBody):
             from hermes_cli.ios_intelligence import IOSIntelligenceStore
 
             intelligence_deletion = IOSIntelligenceStore().account_deletion_status(username)
-        except Exception:
-            intelligence_deletion = None
+        except Exception as exc:
+            raise HTTPException(
+                status_code=503,
+                detail="Account deletion boundary is temporarily unavailable",
+            ) from exc
         if deletion is not None or intelligence_deletion is not None:
             deletion_state = str(
                 (deletion or intelligence_deletion or {}).get("state")

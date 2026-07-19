@@ -74,6 +74,39 @@ def test_owner_scope_applies_to_read_list_download_and_delete(tmp_path):
     assert library.delete_file("account-a", record["id"]) is False
 
 
+def test_delete_owner_removes_index_tombstones_and_objects_without_touching_peers(tmp_path):
+    library = CloudFileLibrary(tmp_path / "cloud")
+    owner_a = library.ingest_file(
+        "account-a",
+        _write(tmp_path / "a.txt", b"owner-a"),
+        source="user_upload",
+        origin_key="account-a:upload",
+    )
+    owner_b = library.ingest_file(
+        "account-b",
+        _write(tmp_path / "b.txt", b"owner-b"),
+        source="user_upload",
+        origin_key="account-b:upload",
+    )
+    assert library.delete_file("account-a", owner_a["id"]) is True
+    library.ingest_file(
+        "account-a",
+        _write(tmp_path / "a-new.txt", b"owner-a-new"),
+        source="model_output",
+    )
+
+    deleted = library.delete_owner("account-a")
+
+    assert deleted == {"files": 1, "deleted_origins": 1, "object_buckets": 1}
+    assert library.list_files("account-a")[0] == []
+    assert library.get_file("account-b", owner_b["id"]) is not None
+    assert library.delete_owner("account-a") == {
+        "files": 0,
+        "deleted_origins": 0,
+        "object_buckets": 0,
+    }
+
+
 def test_keyword_date_source_and_type_filters(tmp_path):
     now = [parse_date_filter("2026-07-15T10:00:00Z")]
     assert now[0] is not None

@@ -290,6 +290,23 @@ def test_cleanup_only_cycle_retries_deletions_without_prediction_or_weather(monk
             calls.append(f"cold:{limit}")
             return [{"owner_id": "alice", "state": "complete"}]
 
+        def account_deletion_sagas(self, *, limit):
+            assert limit == 1000
+            return [{
+                "owner_id": "alice",
+                "owner_scope": "https://hermes.example|alice",
+            }]
+
+    class CleanupMobileStore:
+        def account_deletion_status(self, owner_id):
+            assert owner_id == "alice"
+            return {"state": "pending"}
+
+    monkeypatch.setattr(
+        "hermes_cli.dashboard_auth.mobile_device_store.MobileDeviceStore",
+        CleanupMobileStore,
+    )
+
     monkeypatch.setattr(
         "hermes_cli.dashboard_auth.mobile_notifications.process_account_deletion_outbox",
         lambda *, limit: calls.append(f"mobile:{limit}") or [{"state": "complete"}],
@@ -297,6 +314,10 @@ def test_cleanup_only_cycle_retries_deletions_without_prediction_or_weather(monk
     monkeypatch.setattr(
         "hermes_cli.dashboard_auth.owner_mobile.reconcile_deleted_owner_credentials",
         lambda: calls.append("credentials") or {"disabled": True, "config_cleared": True},
+    )
+    monkeypatch.setattr(
+        "hermes_cli.account_cleanup.purge_account_owned_cloud_data",
+        lambda owner_id: calls.append(f"cloud:{owner_id}") or {"profiles": []},
     )
     scheduler = IOSIntelligenceScheduler(
         store=CleanupStore(),
@@ -320,7 +341,12 @@ def test_cleanup_only_cycle_retries_deletions_without_prediction_or_weather(monk
     assert result["account_deletions"]["cold"][0]["state"] == "complete"
     assert result["account_deletions"]["mobile"][0]["state"] == "complete"
     assert result["account_deletions"]["credentials"]["config_cleared"] is True
-    assert calls == ["cold:100", "mobile:100", "credentials"]
+    assert result["account_deletions"]["cloud"] == [{
+        "owner_id": "alice",
+        "state": "complete",
+        "profiles": [],
+    }]
+    assert calls == ["cold:100", "cloud:alice", "mobile:100", "credentials"]
 
 
 def test_cleanup_reconciles_mobile_intent_after_cross_database_process_exit(
@@ -345,6 +371,10 @@ def test_cleanup_reconciles_mobile_intent_after_cross_database_process_exit(
         "hermes_cli.dashboard_auth.owner_mobile.reconcile_deleted_owner_credentials",
         lambda: {"disabled": True, "config_cleared": True},
     )
+    monkeypatch.setattr(
+        "hermes_cli.account_cleanup.purge_account_owned_cloud_data",
+        lambda owner_id: {"owner_id": owner_id, "profiles": []},
+    )
     scheduler = IOSIntelligenceScheduler(
         store=intelligence,
         config={"ios_intelligence": {"enabled": False}},
@@ -359,6 +389,48 @@ def test_cleanup_reconciles_mobile_intent_after_cross_database_process_exit(
     status = mobile.account_deletion_status("alice")
     assert status is not None
     assert status["owner_scope"] == "https://hermes.example|alice"
+
+
+def test_cloud_account_cleanup_retries_even_when_mobile_store_is_unavailable(monkeypatch):
+    class CleanupStore:
+        def retry_account_deletions(self, *, limit):
+            assert limit == 100
+            return []
+
+        def account_deletion_sagas(self, *, limit):
+            assert limit == 1000
+            return [{"owner_id": "alice", "owner_scope": "scope|alice"}]
+
+    def unavailable_mobile_store():
+        raise sqlite3.OperationalError("mobile database unavailable")
+
+    monkeypatch.setattr(
+        "hermes_cli.dashboard_auth.mobile_device_store.MobileDeviceStore",
+        unavailable_mobile_store,
+    )
+    monkeypatch.setattr(
+        "hermes_cli.account_cleanup.purge_account_owned_cloud_data",
+        lambda owner_id: {"owner_id": owner_id, "profiles": ["default"]},
+    )
+    monkeypatch.setattr(
+        "hermes_cli.dashboard_auth.owner_mobile.reconcile_deleted_owner_credentials",
+        lambda: {"disabled": True, "config_cleared": True},
+    )
+    scheduler = IOSIntelligenceScheduler(
+        store=CleanupStore(),
+        config={"ios_intelligence": {"enabled": False}},
+        cleanup_only=True,
+    )
+
+    result = scheduler._resume_account_deletions()
+
+    assert result["mobile"] == []
+    assert result["cloud"] == [{
+        "owner_id": "alice",
+        "state": "complete",
+        "profiles": ["default"],
+    }]
+    assert result["credentials"]["config_cleared"] is True
 
 
 def test_semantic_configuration_is_bounded():
@@ -615,7 +687,7 @@ def test_future_weather_notification_does_not_bypass_not_before(tmp_path):
     assert store.pending_notifications(now=window.starts_at - 900)[0]["id"] == result["id"]
 
 
-def test_future_weather_notification_waits_until_quiet_hours_end(tmp_path):
+def test_future_weather_notification_uses_exposure_window_at_night(tmp_path):
     tz = ZoneInfo("Asia/Shanghai")
     now = int(datetime(2026, 7, 18, 22, 0, tzinfo=tz).timestamp())
     quiet_end = int(datetime(2026, 7, 19, 8, 0, tzinfo=tz).timestamp())
@@ -639,8 +711,8 @@ def test_future_weather_notification_waits_until_quiet_hours_end(tmp_path):
     )
 
     assert result["state"] == "pending"
-    assert store.pending_notifications(now=quiet_end - 1) == []
-    assert store.pending_notifications(now=quiet_end)[0]["id"] == result["id"]
+    assert store.pending_notifications(now=now) == []
+    assert store.pending_notifications(now=window.starts_at - 15 * 60)[0]["id"] == result["id"]
 
 
 def test_behavior_suppression_retracts_a_stale_future_weather_alert(tmp_path):
@@ -698,7 +770,7 @@ def test_scheduler_moves_old_trajectory_to_encrypted_cold_storage(tmp_path):
         ).fetchone()[0] == 0
 
 
-def test_quiet_hours_save_and_morning_flush_are_idempotent(tmp_path):
+def test_nighttime_weather_uses_live_behavior_and_retires_legacy_summary(tmp_path):
     store = IOSIntelligenceStore(tmp_path)
     tz = ZoneInfo("Asia/Shanghai")
     quiet_now = int(datetime(2026, 7, 18, 23, 30, tzinfo=tz).timestamp())
@@ -723,25 +795,58 @@ def test_quiet_hours_save_and_morning_flush_are_idempotent(tmp_path):
         {"window": {"arrival_at": quiet_now + 12 * 3600}},
     )
     quiet_result = scheduler.evaluate_account("alice", force=True, now=quiet_now)
-    assert quiet_result["suppressed_reason"] == "quiet_hours"
+    assert quiet_result["suppressed_reason"] is None
     assert quiet_result["weather_queried"] is True
     assert weather.calls
-    assert store.pending_notifications() == []
-    assert store.mark_quiet_summary_delivered("alice", "2026-07-18") is True
+    assert quiet_result["notification"]["state"] == "pending"
+    assert quiet_result["quiet_summary_notification"] is None
+    assert store.get_quiet_summary("alice", "2026-07-18") is None
 
     morning = int(datetime(2026, 7, 19, 8, 0, tzinfo=tz).timestamp())
     morning_result = scheduler.evaluate_account("alice", force=False, now=morning)
-    assert morning_result["quiet_summary_notification"]["state"] == "pending"
-    assert morning_result["notification"] is None
-    summary = store.active_forecast("alice", morning)[0]["data"]
-    assert summary["title"] == "今早出行天气汇总"
-    assert summary["body"].startswith("夜间天气风险")
+    assert morning_result["quiet_summary_notification"] is None
     assert store.get_quiet_summary("alice", "2026-07-18") is None
     assert store.get_quiet_summary("alice", "2026-07-19") is None
-    assert scheduler.evaluate_account("alice", force=False, now=morning).get("quiet_summary_notification") is None
 
 
-def test_quiet_hours_clear_cached_summary_when_risk_disappears(tmp_path):
+def test_nighttime_weather_distinguishes_indoor_stationary_from_leaving(tmp_path):
+    store = IOSIntelligenceStore(tmp_path)
+    tz = ZoneInfo("Asia/Shanghai")
+    now = int(datetime(2026, 7, 18, 23, 30, tzinfo=tz).timestamp())
+    store.ingest_events(
+        "alice",
+        "iphone",
+        [
+            _visit("old-home", "home", now - 7 * 86400, now - 7 * 86400 + 10 * 3600),
+            _visit("old-study", "study", now - 7 * 86400 + 10 * 3600 + 1200, now - 7 * 86400 + 12 * 3600),
+            _visit("current", "home", now - 60, None),
+        ],
+        "visits",
+    )
+    weather = FakeWeather("2026-07-19T09:30:00+08:00")
+    scheduler = IOSIntelligenceScheduler(store=store, qweather=weather)
+
+    staying = scheduler.evaluate_account("alice", force=False, now=now)
+
+    assert staying["suppressed_reason"] in {"low_leave_probability", "indoor_stationary"}
+    assert staying["weather_queried"] is False
+    assert weather.calls == []
+
+    store.record_snapshot(
+        "alice",
+        "motion",
+        {"state": "walking", "confidence": "high"},
+        observed_at=now + 1,
+    )
+    leaving = scheduler.evaluate_account("alice", force=False, now=now + 1)
+
+    assert leaving["behavior"]["leave_probability"] >= 0.9
+    assert leaving["weather_queried"] is True
+    assert leaving["notification"]["state"] == "pending"
+    assert weather.calls
+
+
+def test_nighttime_weather_retracts_alert_when_risk_disappears(tmp_path):
     store = IOSIntelligenceStore(tmp_path)
     tz = ZoneInfo("Asia/Shanghai")
     now = int(datetime(2026, 7, 18, 23, 30, tzinfo=tz).timestamp())
@@ -763,7 +868,8 @@ def test_quiet_hours_clear_cached_summary_when_risk_disappears(tmp_path):
         wet["weather_window"]["departure_at"],
         tz,
     ).date().isoformat()
-    assert store.get_quiet_summary("alice", summary_date) is not None
+    assert wet["notification"]["state"] == "pending"
+    assert store.get_quiet_summary("alice", summary_date) is None
 
     weather.fx_time = "2026-07-20T09:30:00+08:00"
     dry = scheduler.evaluate_account("alice", force=True, now=now + 60)
@@ -838,7 +944,7 @@ def test_weather_outbox_retry_skips_devices_already_delivered(monkeypatch, tmp_p
     assert store.pending_notifications(now=now + 1) == []
 
 
-def test_quiet_summary_retry_preserves_per_device_delivery(monkeypatch, tmp_path):
+def test_legacy_quiet_summary_is_retired_without_delivery(monkeypatch, tmp_path):
     from hermes_cli.dashboard_auth import mobile_notifications
 
     store = IOSIntelligenceStore(tmp_path)
@@ -886,22 +992,10 @@ def test_quiet_summary_retry_preserves_per_device_delivery(monkeypatch, tmp_path
 
     scheduler._flush_quiet_summary("alice", datetime.fromtimestamp(now, tz), now, result)
 
-    assert result["quiet_summary_notification"]["duplicate"] is False
-    assert calls == ["registration-a", "registration-b"]
-    pending = store.pending_notifications(now=now)
-    assert len(pending) == 1
-    assert {item["state"] for item in pending[0]["device_deliveries"].values()} == {
-        "delivered",
-        "retry",
-    }
-
-    calls.clear()
-    retrying["value"] = False
-    delivered = scheduler.deliver_pending_notifications(now=now + 1)
-
-    assert delivered[0]["state"] == "delivered"
-    assert calls == ["registration-b"]
-    assert store.pending_notifications(now=now + 1) == []
+    assert result["quiet_summary_notification"] is None
+    assert calls == []
+    assert store.get_quiet_summary("alice", "2026-07-18") is None
+    assert store.pending_notifications(now=now) == []
 
 
 def test_concurrent_schedulers_deliver_each_notification_once(monkeypatch, tmp_path):
@@ -944,11 +1038,7 @@ def test_concurrent_schedulers_deliver_each_notification_once(monkeypatch, tmp_p
     assert store.pending_notifications(now=now) == []
 
 
-def test_quiet_summary_flush_and_outbox_worker_share_one_delivery_lease(
-    monkeypatch, tmp_path
-):
-    from hermes_cli.dashboard_auth import mobile_notifications
-
+def test_legacy_quiet_summary_retirement_is_idempotent(tmp_path):
     store = IOSIntelligenceStore(tmp_path)
     timezone = ZoneInfo("Asia/Shanghai")
     now = int(datetime(2026, 7, 19, 8, 0, tzinfo=timezone).timestamp())
@@ -957,61 +1047,24 @@ def test_quiet_summary_flush_and_outbox_worker_share_one_delivery_lease(
         "2026-07-18",
         {"window": {"arrival_at": now + 3600, "ends_at": now + 3600}},
     )
-
-    enqueued = threading.Event()
-    delivery_started = threading.Event()
-    release_delivery = threading.Event()
-    calls: list[str] = []
-    calls_lock = threading.Lock()
-    original_enqueue = store.enqueue_notification
-
-    def enqueue(*args, **kwargs):
-        result = original_enqueue(*args, **kwargs)
-        enqueued.set()
-        assert delivery_started.wait(timeout=5)
-        return result
-
-    def deliver(**kwargs):
-        with calls_lock:
-            calls.append(str(kwargs["notification_id"]))
-            call_number = len(calls)
-        if call_number == 1:
-            delivery_started.set()
-            assert release_delivery.wait(timeout=5)
-        return {"state": "delivered", "deliveries": {}}
-
-    monkeypatch.setattr(store, "enqueue_notification", enqueue)
-    monkeypatch.setattr(
-        mobile_notifications,
-        "deliver_account_notification_push",
-        deliver,
-    )
-    flush_scheduler = IOSIntelligenceScheduler(store=store, clock=lambda: now)
-    outbox_scheduler = IOSIntelligenceScheduler(store=store, clock=lambda: now)
+    scheduler = IOSIntelligenceScheduler(store=store, clock=lambda: now)
     result: dict = {}
 
-    def run_outbox_worker():
-        assert enqueued.wait(timeout=5)
-        return outbox_scheduler.deliver_pending_notifications(now=now)
+    scheduler._flush_quiet_summary(
+        "alice",
+        datetime.fromtimestamp(now, timezone),
+        now,
+        result,
+    )
+    scheduler._flush_quiet_summary(
+        "alice",
+        datetime.fromtimestamp(now, timezone),
+        now,
+        result,
+    )
 
-    with ThreadPoolExecutor(max_workers=2) as pool:
-        worker_future = pool.submit(run_outbox_worker)
-        flush_future = pool.submit(
-            flush_scheduler._flush_quiet_summary,
-            "alice",
-            datetime.fromtimestamp(now, timezone),
-            now,
-            result,
-        )
-        try:
-            assert delivery_started.wait(timeout=5)
-            flush_future.result(timeout=5)
-        finally:
-            release_delivery.set()
-        worker_future.result(timeout=5)
-
-    assert result["quiet_summary_notification"]["duplicate"] is False
-    assert len(calls) == 1
+    assert result["quiet_summary_notification"] is None
+    assert store.get_quiet_summary("alice", "2026-07-18") is None
     assert store.pending_notifications(now=now) == []
 
 
@@ -1459,7 +1512,7 @@ def test_account_delete_route_always_purges_cold_and_mobile_data(monkeypatch):
 
         def delete_account(self, owner_id, *, delete_cold):
             calls["store"] = (owner_id, delete_cold)
-            return {"owner_id": owner_id}
+            return {"owner_id": owner_id, "state": "complete"}
 
     class FakeMobileStore:
         def begin_account_deletion(self, owner_id, owner_scope):
@@ -1479,6 +1532,11 @@ def test_account_delete_route_always_purges_cold_and_mobile_data(monkeypatch):
     monkeypatch.setattr(module, "intelligence_store", lambda: FakeStore())
     monkeypatch.setattr(module, "MobileDeviceStore", FakeMobileStore)
     monkeypatch.setattr(module, "process_account_deletion_outbox", deliver_cleanup)
+    def purge_cloud(owner_id):
+        calls["cloud"] = owner_id
+        return {"profiles": ["default"], "conversations": 2, "cloud_files": 1}
+
+    monkeypatch.setattr(module, "purge_account_owned_cloud_data", purge_cloud)
     def delete_credentials(owner_id):
         calls["credentials"] = owner_id
         return {"disabled": True, "config_cleared": True}
@@ -1497,6 +1555,7 @@ def test_account_delete_route_always_purges_cold_and_mobile_data(monkeypatch):
     assert "delete_cold" not in module.AccountDeleteBody.model_fields
     assert calls == {
         "cleanup": ("alice", 1, "FakeMobileStore"),
+        "cloud": "alice",
         "credentials": "alice",
         "intent": ("alice", "https://hermes.example|alice"),
         "store": ("alice", True),
@@ -1508,7 +1567,14 @@ def test_account_delete_route_always_purges_cold_and_mobile_data(monkeypatch):
         "devices": 1,
         "error": "",
     }
+    assert result["cloud_cleanup"] == {
+        "state": "complete",
+        "profiles": ["default"],
+        "conversations": 2,
+        "cloud_files": 1,
+    }
     assert result["accepted"] is True
+    assert result["state"] == "complete"
 
 
 def test_account_delete_route_keeps_intent_and_returns_pending_when_cleanup_fails(
@@ -1559,6 +1625,11 @@ def test_account_delete_route_keeps_intent_and_returns_pending_when_cleanup_fail
     monkeypatch.setattr(intelligence, "delete_account", fail_first_cleanup)
     monkeypatch.setattr(module, "intelligence_store", lambda: intelligence)
     monkeypatch.setattr(module, "MobileDeviceStore", lambda: mobile)
+    monkeypatch.setattr(
+        module,
+        "purge_account_owned_cloud_data",
+        lambda owner_id: {"owner_id": owner_id, "profiles": []},
+    )
     monkeypatch.setattr(
         module,
         "delete_owner_account_credentials",
@@ -1800,8 +1871,8 @@ def test_soft_throttle_marks_destination_partial_not_complete(tmp_path):
     assert result["notification"] is None
 
 
-def test_quiet_hours_partial_weather_preserves_overnight_summary(tmp_path):
-    """Incomplete vendor coverage must not tombstone a pending quiet summary."""
+def test_partial_nighttime_weather_retires_legacy_summary(tmp_path):
+    """Incomplete coverage suppresses notification without restoring clock rules."""
 
     store = IOSIntelligenceStore(tmp_path)
     tz = ZoneInfo("Asia/Shanghai")
@@ -1843,12 +1914,10 @@ def test_quiet_hours_partial_weather_preserves_overnight_summary(tmp_path):
 
     result = scheduler.evaluate_account("alice", force=True, now=quiet_now)
 
-    assert result["suppressed_reason"] == "quiet_hours"
+    assert result["suppressed_reason"] == "partial_weather_query"
     assert result["alert"]["reason"] == "partial_weather_query"
     assert result.get("quiet_summary") is None
-    # The overnight risk summary must survive until a complete evaluate can
-    # either replace it or intentionally clear it after full vendor coverage.
-    assert store.get_quiet_summary("alice", "2026-07-19") is not None
+    assert store.get_quiet_summary("alice", "2026-07-19") is None
 
 
 def test_feature_weights_fail_closed_when_supervisor_unavailable(tmp_path):

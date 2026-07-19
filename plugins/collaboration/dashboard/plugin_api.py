@@ -985,6 +985,98 @@ def save_single_state(state: dict[str, Any], path: Optional[Path] = None) -> Non
     _save_state_store(target, state, "conversations")
 
 
+def delete_owner_account_data(owner_id: str) -> dict[str, Any]:
+    """Idempotently remove all collaboration data for an account."""
+
+    normalized_owner = str(owner_id or "").strip()
+    if not normalized_owner:
+        raise ValueError("owner_id is required")
+    runtime_sessions: list[tuple[str, str]] = []
+    conversation_ids: list[str] = []
+    now = int(time.time() * 1000)
+
+    with _STATE_LOCK:
+        state = load_single_state()
+        owned: list[dict[str, Any]] = []
+        for conversation in state.get("conversations") or []:
+            if not isinstance(conversation, dict):
+                continue
+            existing_owner = str(conversation.get("owner_id") or "").strip()
+            if existing_owner != normalized_owner and not _legacy_owner_claim_allowed(
+                existing_owner,
+                normalized_owner,
+            ):
+                continue
+            owned.append(conversation)
+            conversation_ids.append(str(conversation.get("id") or ""))
+            runtime_sessions.extend(
+                (str(profile), str(session_id))
+                for profile, session_id in (conversation.get("runtime_sessions") or {}).items()
+                if str(session_id or "").strip()
+            )
+            conversation["delete_requested"] = True
+            conversation["delete_requested_at"] = now
+            for run in (conversation.get("hosted_turns") or {}).values():
+                if isinstance(run, dict):
+                    run["cancel_requested"] = True
+                    run["cancel_requested_at"] = now
+        if owned:
+            save_single_state(state)
+
+    # Delete external/runtime state before dropping the only persisted list of
+    # identifiers. A failure leaves the conversation tombstones for retry.
+    for profile, session_id in runtime_sessions:
+        _delete_runtime_session(profile, session_id)
+    for conversation_id in conversation_ids:
+        if not conversation_id:
+            continue
+        root = conversation_files_root(conversation_id)
+        if root.exists():
+            shutil.rmtree(root)
+
+    with _STATE_LOCK:
+        state = load_single_state()
+        state["conversations"] = [
+            conversation
+            for conversation in state.get("conversations") or []
+            if not (
+                isinstance(conversation, dict)
+                and (
+                    str(conversation.get("owner_id") or "").strip() == normalized_owner
+                    or _legacy_owner_claim_allowed(
+                        str(conversation.get("owner_id") or "").strip(),
+                        normalized_owner,
+                    )
+                )
+            )
+        ]
+        save_single_state(state)
+
+        room_state = load_state()
+        removed_rooms = 0
+        kept_rooms: list[dict[str, Any]] = []
+        for room in room_state.get("rooms") or []:
+            if not isinstance(room, dict):
+                continue
+            room_owner = str(room.get("owner_id") or "").strip()
+            if room_owner == normalized_owner or _legacy_owner_claim_allowed(
+                room_owner,
+                normalized_owner,
+            ):
+                removed_rooms += 1
+                continue
+            kept_rooms.append(room)
+        room_state["rooms"] = kept_rooms
+        save_state(room_state)
+
+    return {
+        "conversations": len(conversation_ids),
+        "rooms": removed_rooms,
+        "runtime_sessions": len(runtime_sessions),
+        "files": _file_library().delete_owner(normalized_owner),
+    }
+
+
 def create_room_record(
     name: str,
     profiles: list[str],

@@ -1,0 +1,20 @@
+[Unit]
+Description=Hermes managed-node recovery receiver (DBB3)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart=/usr/local/lib/hermes-agent/venv/bin/python -m hermes_cli.managed_node_recovery_service --host 10.66.0.2 --port 9121 --config /home/hermes/.hermes/managed-nodes.json
+Restart=always
+RestartSec=5
+User=root
+Group=root
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=read-only
+ReadWritePaths=/home/hermes/.hermes /var/lib/hermes-managed-node-recovery
+
+[Install]
+WantedBy=multi-user.target

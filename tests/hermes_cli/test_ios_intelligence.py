@@ -1804,8 +1804,31 @@ def test_qweather_rejects_and_does_not_cache_business_errors(store):
         client.current(24.9, 118.6)
 
     assert len(http.calls) == 2
-    # Failed vendor responses must not burn commercial monthly quota.
-    assert store.weather_quota_status()["used"] == 0
+    # The provider counts each outbound request even when its business code
+    # rejects the operation, so the hard cap must reserve both attempts.
+    assert store.weather_quota_status()["used"] == 2
+
+
+def test_qweather_concurrent_cache_misses_cannot_cross_hard_quota(store):
+    store.reserve_weather_requests(WEATHER_MONTHLY_LIMIT - 1)
+    http = _HTTPClient({"code": "200", "now": {"text": "clear"}})
+    client = QWeatherClient(store, api_key="server-only", client=http)
+    barrier = threading.Barrier(2)
+
+    def request(longitude):
+        barrier.wait(timeout=5)
+        try:
+            return client.current(24.9, longitude)
+        except RuntimeError as exc:
+            return str(exc)
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        outcomes = list(pool.map(request, [118.6, 118.7]))
+
+    assert sum(isinstance(item, dict) for item in outcomes) == 1
+    assert sum("monthly request limit" in item for item in outcomes if isinstance(item, str)) == 1
+    assert len(http.calls) == 1
+    assert store.weather_quota_status()["used"] == WEATHER_MONTHLY_LIMIT
 
 
 def test_external_clients_require_server_credentials(store, monkeypatch):

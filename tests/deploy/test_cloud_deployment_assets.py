@@ -199,6 +199,7 @@ printf '%s|%s\n' "$(basename "$0")" "$*" >>"$DEPLOY_CAPTURE"
         "hermes_cli/dashboard_auth/mobile_notifications.py",
         "hermes_cli/web_server.py",
         "tui_gateway/server.py",
+        "hermes_cli/account_cleanup.py",
         "hermes_cli/ios_intelligence.py",
         "hermes_cli/ios_intelligence_config.py",
         "hermes_cli/ios_intelligence_scheduler.py",
@@ -211,6 +212,8 @@ printf '%s|%s\n' "$(basename "$0")" "$*" >>"$DEPLOY_CAPTURE"
         "hermes_cli/dashboard_auth/owner_mobile.py",
         "hermes_cli/dashboard_auth/registry.py",
         "hermes_cli/profiles.py",
+        "hermes_cli/managed_nodes.py",
+        "hermes_cli/managed_node_recovery_service.py",
         "plugins/dashboard_auth/basic/__init__.py",
         "tools/mcp_tool.py",
     ):
@@ -375,6 +378,9 @@ def test_public_installer_transactions_mcp_discovery_with_ios_release():
     assert '"hermes_cli/dashboard_auth/owner_mobile.py"' in ios_assets
     assert '"hermes_cli/dashboard_auth/registry.py"' in ios_assets
     assert '"hermes_cli/profiles.py"' in ios_assets
+    assert '"hermes_cli/account_cleanup.py"' in ios_assets
+    assert '"hermes_cli/managed_nodes.py"' in ios_assets
+    assert '"hermes_cli/managed_node_recovery_service.py"' in ios_assets
     assert '"plugins/dashboard_auth/basic/__init__.py"' in ios_assets
     assert '"${snapshot}/tools/mcp_tool.py"' in installer
     assert '"${target_root}/tools"' in installer

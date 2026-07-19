@@ -226,10 +226,37 @@ class IOSIntelligenceScheduler:
         return result
 
     def _resume_account_deletions(self) -> dict[str, Any]:
-        """Retry both cold-storage and device tombstones after any restart."""
+        """Retry every account-owned store after any restart."""
 
         cold = self.store.retry_account_deletions(limit=100)
         reconciled = 0
+        cloud: list[dict[str, Any]] = []
+        saga_loader = getattr(self.store, "account_deletion_sagas", None)
+        sagas = saga_loader(limit=1000) if callable(saga_loader) else []
+        for saga in sagas:
+            owner_id = str(saga.get("owner_id") or "")
+            if not owner_id:
+                continue
+            try:
+                from hermes_cli.account_cleanup import (  # noqa: PLC0415
+                    purge_account_owned_cloud_data,
+                )
+
+                cloud.append({
+                    "owner_id": owner_id,
+                    "state": "complete",
+                    **purge_account_owned_cloud_data(owner_id),
+                })
+            except Exception as exc:
+                logger.exception(
+                    "account-owned cloud cleanup recovery failed for %s",
+                    owner_id,
+                )
+                cloud.append({
+                    "owner_id": owner_id,
+                    "state": "pending",
+                    "error": type(exc).__name__,
+                })
         try:
             from hermes_cli.dashboard_auth.mobile_device_store import MobileDeviceStore
             from hermes_cli.dashboard_auth.mobile_notifications import (
@@ -237,9 +264,6 @@ class IOSIntelligenceScheduler:
             )
 
             mobile_store = MobileDeviceStore()
-            reconciled = 0
-            saga_loader = getattr(self.store, "account_deletion_sagas", None)
-            sagas = saga_loader(limit=1000) if callable(saga_loader) else []
             for saga in sagas:
                 owner_id = str(saga.get("owner_id") or "")
                 owner_scope = str(saga.get("owner_scope") or "")
@@ -251,20 +275,24 @@ class IOSIntelligenceScheduler:
                     mobile_store.begin_account_deletion(owner_id, owner_scope)
                     reconciled += 1
             mobile = process_account_deletion_outbox(limit=100)
+        except Exception:
+            logger.exception("mobile account deletion recovery failed")
+            mobile = []
+        try:
             from hermes_cli.dashboard_auth.owner_mobile import (
                 reconcile_deleted_owner_credentials,
             )
 
             credentials = reconcile_deleted_owner_credentials()
         except Exception:
-            logger.exception("mobile account deletion recovery failed")
-            mobile = []
+            logger.exception("owner credential deletion recovery failed")
             credentials = {"disabled": False, "config_cleared": False}
         return {
             "cold": cold,
             "mobile": mobile,
             "mobile_intents_reconciled": reconciled,
             "credentials": credentials,
+            "cloud": cloud,
         }
 
     # ------------------------------------------------------------------
@@ -374,27 +402,6 @@ class IOSIntelligenceScheduler:
             decision["reason"] = "partial_weather_query"
             decision["suppressed"] = True
         result["alert"] = decision
-        if self._is_quiet(local):
-            result["weather_reconciliation"] = self._expire_stale_weather(owner_id, instant)
-            result["suppressed_reason"] = "quiet_hours"
-            if decision["should_notify"]:
-                result["quiet_summary"] = self._save_quiet_summary(
-                    owner_id,
-                    destination,
-                    route,
-                    window,
-                    instant,
-                    decision,
-                )
-            elif decision.get("reason") != "partial_weather_query":
-                # Incomplete vendor coverage must not tombstone an overnight risk
-                # summary that still needs the morning flush delivery path.
-                summary_date = datetime.fromtimestamp(
-                    window.departure_at,
-                    ZoneInfo(self.config.timezone),
-                ).date().isoformat()
-                self.store.mark_quiet_summary_delivered(owner_id, summary_date)
-            return result
         if decision["should_notify"]:
             notification = self._enqueue_weather_notification(owner_id, destination, route, window, decision, instant)
             result["notification"] = notification
@@ -1217,10 +1224,6 @@ class IOSIntelligenceScheduler:
             self._expire_stale_weather(owner_id, now)
             return {"id": "", "state": "expired", "duplicate": False, "reason": "travel_window_elapsed"}
         delivery_not_before = max(now, window.starts_at - 15 * 60)
-        delivery_not_before = self._next_non_quiet_at(delivery_not_before)
-        if delivery_not_before >= expires:
-            self._expire_stale_weather(owner_id, now)
-            return {"id": "", "state": "expired", "duplicate": False, "reason": "quiet_window_elapsed"}
         self._expire_stale_weather(owner_id, now, keep_event_key=event_hash)
         result = self.store.enqueue_notification(
             owner_id,
@@ -1252,25 +1255,12 @@ class IOSIntelligenceScheduler:
         return result
 
     def _next_non_quiet_at(self, timestamp: int) -> int:
-        timezone = ZoneInfo(self.config.timezone)
-        local = datetime.fromtimestamp(timestamp, timezone)
-        if not self._is_quiet(local):
-            return timestamp
-        start = int(self.config.weather.quiet_start_hour)
-        end = int(self.config.weather.quiet_end_hour)
-        if start > end and local.hour >= start:
-            target_date = local.date() + timedelta(days=1)
-        else:
-            target_date = local.date()
-        target = datetime.combine(target_date, datetime.min.time(), timezone).replace(hour=end)
-        return max(timestamp, int(target.timestamp()))
+        # Retained for mixed-version callers. Notification timing is governed
+        # by predicted exposure and behavior, never a fixed wall-clock window.
+        return timestamp
 
     def _is_quiet(self, local: datetime) -> bool:
-        start = self.config.weather.quiet_start_hour
-        end = self.config.weather.quiet_end_hour
-        if start == end:
-            return False
-        return local.hour >= start or local.hour < end if start > end else start <= local.hour < end
+        return False
 
     def _save_quiet_summary(
         self,
@@ -1298,57 +1288,17 @@ class IOSIntelligenceScheduler:
         return self.store.save_quiet_summary(owner_id, local_date, payload)
 
     def _flush_quiet_summary(self, owner_id: str, local: datetime, now: int, result: dict[str, Any]) -> None:
-        # At 08:00, deliver a summary accumulated in the previous quiet period.
+        # Retire summaries created by older versions. New evaluations use live
+        # context at every hour and never defer an actionable risk to 08:00.
         result.setdefault("quiet_summary_notification", None)
-        if self._is_quiet(local):
-            return
-        candidates = [(local.date() - timedelta(days=1)).isoformat(), local.date().isoformat()]
-        summary = None
-        summary_date = ""
+        candidates = [
+            (local.date() - timedelta(days=1)).isoformat(),
+            local.date().isoformat(),
+            (local.date() + timedelta(days=1)).isoformat(),
+        ]
         for candidate in candidates:
-            item = self.store.get_quiet_summary(owner_id, candidate)
-            if item:
-                payload = dict(item.get("payload") or {})
-                window = payload.get("window") or {}
-                if int(window.get("arrival_at") or window.get("ends_at") or 0) > now:
-                    summary, summary_date = item, candidate
-                    break
+            if self.store.get_quiet_summary(owner_id, candidate):
                 self.store.mark_quiet_summary_delivered(owner_id, candidate)
-        if not summary:
-            return
-        payload = dict(summary.get("payload") or {})
-        window = payload.get("window") or {}
-        valid_until = int(window.get("arrival_at") or window.get("ends_at") or now)
-        if valid_until <= now:
-            self.store.mark_quiet_summary_delivered(owner_id, summary_date)
-            return
-        key = f"weather:quiet:{owner_id}:{summary_date}"
-        summary_title = "今早出行天气汇总"
-        summary_body = "夜间天气风险仍可能影响今天的出行，请查看当前天气并准备相应装备。"
-        self._expire_stale_weather(owner_id, now)
-        notification = self.store.enqueue_notification(owner_id, {
-            "category": "smart-weather", "title": summary_title,
-            "body": summary_body,
-            "event_type": "overnight-summary", "valid_from": now, "valid_until": valid_until,
-            "suggestion": "请根据天气调整出行装备或路线。",
-        }, idempotency_key=key, expires_at=max(now + 60, valid_until), not_before=now, now=now)
-        self.store.mark_quiet_summary_delivered(owner_id, summary_date)
-        result["quiet_summary_notification"] = notification
-        if not notification.get("duplicate"):
-            self.store.record_active_forecast(owner_id, {
-                "id": notification.get("id") or key,
-                "category": "smart-weather",
-                "title": summary_title,
-                "body": summary_body,
-                "summary": summary_body,
-                "valid_from": now,
-                "valid_until": valid_until,
-            })
-            if self.notifier is None:
-                # Reuse the durable claim/lease worker even for the immediate
-                # 08:00 flush. A direct APNs call here races the scheduler's
-                # normal outbox pass and can deliver the same summary twice.
-                self.deliver_pending_notifications(now=now)
 
     def _learn_graph(self, owner_id: str) -> None:
         visits = self.store.list_visit_history(owner_id, limit=1000)

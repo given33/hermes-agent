@@ -11,6 +11,7 @@ from typing import Any, Literal, Optional
 from fastapi import APIRouter, HTTPException, Query, Request
 from pydantic import BaseModel, Field
 
+from hermes_cli.account_cleanup import purge_account_owned_cloud_data
 from hermes_cli.cloud_file_library import owner_id_from_request
 from hermes_cli.config import get_hermes_home
 from hermes_cli.dashboard_auth.mobile_device_store import MobileDeviceStore
@@ -480,6 +481,17 @@ def delete_account(request: Request, body: AccountDeleteBody) -> dict[str, Any]:
             "error": type(exc).__name__,
         }
     try:
+        cloud_cleanup = {
+            "state": "complete",
+            **purge_account_owned_cloud_data(owner_id),
+        }
+    except Exception as exc:
+        logger.exception("account-owned cloud data cleanup deferred")
+        cloud_cleanup = {
+            "state": "pending",
+            "error": type(exc).__name__,
+        }
+    try:
         credential_cleanup = delete_owner_account_credentials(owner_id)
     except Exception as exc:
         logger.exception("owner credential cleanup deferred")
@@ -499,11 +511,13 @@ def delete_account(request: Request, body: AccountDeleteBody) -> dict[str, Any]:
         "error": str(cleanup_delivery.get("error") or "")[:256],
     }
     result["credential_cleanup"] = credential_cleanup
+    result["cloud_cleanup"] = cloud_cleanup
     result["accepted"] = True
     result["state"] = (
         "complete"
         if result.get("state") == "complete"
         and credential_cleanup.get("config_cleared") is True
+        and cloud_cleanup.get("state") == "complete"
         and device_cleanup_state in {"delivered", "no_recipients", "permanent_failure"}
         else "pending"
     )

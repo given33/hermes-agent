@@ -870,6 +870,35 @@ class CloudFileLibrary:
         self._remove_object_path(str(row["stored_relpath"] or ""))
         return True
 
+    def delete_owner(self, owner_id: str) -> dict[str, int]:
+        """Delete every index row and object belonging to one account."""
+
+        owner_id = normalize_owner_id(owner_id)
+        bucket = (self.objects_root / self._owner_bucket(owner_id)).resolve()
+        objects_root = self.objects_root.resolve()
+        if not bucket.is_relative_to(objects_root):
+            raise ValueError("Account object bucket escapes the library")
+        with self._lock:
+            with self.connection() as conn, write_txn(conn):
+                file_count = int(conn.execute(
+                    "SELECT COUNT(*) FROM account_files WHERE owner_id=?",
+                    (owner_id,),
+                ).fetchone()[0])
+                origin_count = int(conn.execute(
+                    "SELECT COUNT(*) FROM deleted_file_origins WHERE owner_id=?",
+                    (owner_id,),
+                ).fetchone()[0])
+                conn.execute("DELETE FROM account_files WHERE owner_id=?", (owner_id,))
+                conn.execute("DELETE FROM deleted_file_origins WHERE owner_id=?", (owner_id,))
+            objects_removed = int(bucket.exists())
+            if bucket.exists():
+                shutil.rmtree(bucket)
+        return {
+            "files": file_count,
+            "deleted_origins": origin_count,
+            "object_buckets": objects_removed,
+        }
+
     def sync_directory(
         self,
         owner_id: str,

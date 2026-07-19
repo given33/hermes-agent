@@ -946,7 +946,7 @@ class TestWebServerEndpoints:
             result = self.client.post(
                 "/api/model/custom/test",
                 json={
-                    "base_url": "http://169.254.169.254/latest",
+                    "base_url": "https://169.254.169.254/latest",
                     "model": "model-a",
                     "api_mode": "chat_completions",
                 },
@@ -954,6 +954,40 @@ class TestWebServerEndpoints:
 
         assert result.status_code == 400
         assert "blocked" in result.json()["detail"]
+
+    def test_custom_model_endpoints_reject_non_loopback_http_before_using_key(self):
+        payload = {
+            "base_url": "http://models.example/v1",
+            "api_key": "private-model-key",
+            "model": "model-a",
+            "api_mode": "chat_completions",
+        }
+
+        saved = self.client.put("/api/model/custom", json=payload)
+        tested = self.client.post("/api/model/custom/test", json=payload)
+
+        assert saved.status_code == 400
+        assert tested.status_code == 400
+        assert "HTTPS" in saved.json()["detail"]
+        assert "HTTPS" in tested.json()["detail"]
+
+    def test_custom_model_connection_allows_http_loopback(self):
+        from unittest.mock import AsyncMock
+
+        response = SimpleNamespace(is_success=True, status_code=200)
+        with patch("tools.url_safety.is_safe_url", return_value=False), \
+             patch("httpx.AsyncClient.post", new=AsyncMock(return_value=response)) as post:
+            result = self.client.post(
+                "/api/model/custom/test",
+                json={
+                    "base_url": "http://127.0.0.1:11434/v1",
+                    "model": "model-a",
+                    "api_mode": "chat_completions",
+                },
+            )
+
+        assert result.status_code == 200
+        assert post.await_args.args[0] == "http://127.0.0.1:11434/v1/chat/completions"
 
     def test_put_moa_models_persists_provider_model_slots(self):
         from hermes_cli.config import load_config

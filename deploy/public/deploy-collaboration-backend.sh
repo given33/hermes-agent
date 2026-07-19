@@ -25,6 +25,7 @@ installer="${repo}/deploy/public/install-collaboration-backend.sh"
 [[ -f "${repo}/tui_gateway/server.py" ]] || die "tui_gateway/server.py is missing"
 
 ios_hermes_assets=(
+  "hermes_cli/account_cleanup.py"
   "hermes_cli/ios_intelligence.py"
   "hermes_cli/ios_intelligence_config.py"
   "hermes_cli/ios_intelligence_scheduler.py"
@@ -45,6 +46,7 @@ ios_support_assets=(
   "hermes_cli/dashboard_auth/registry.py"
   "hermes_cli/profiles.py"
   "hermes_cli/managed_nodes.py"
+  "hermes_cli/managed_node_recovery_service.py"
   "plugins/dashboard_auth/basic/__init__.py"
 )
 for relative in "${ios_hermes_assets[@]}" "${ios_plugin_assets[@]}" \
@@ -91,6 +93,7 @@ scp "${ssh_args[@]}" \
   "${repo}/tui_gateway/server.py" \
   "${remote}:${stage}/tui_gateway/"
 scp "${ssh_args[@]}" \
+  "${repo}/hermes_cli/account_cleanup.py" \
   "${repo}/hermes_cli/ios_intelligence.py" \
   "${repo}/hermes_cli/ios_intelligence_config.py" \
   "${repo}/hermes_cli/ios_intelligence_scheduler.py" \
@@ -113,6 +116,7 @@ scp "${ssh_args[@]}" \
 scp "${ssh_args[@]}" \
   "${repo}/hermes_cli/profiles.py" \
   "${repo}/hermes_cli/managed_nodes.py" \
+  "${repo}/hermes_cli/managed_node_recovery_service.py" \
   "${remote}:${stage}/hermes_cli/"
 scp "${ssh_args[@]}" \
   "${repo}/plugins/dashboard_auth/basic/__init__.py" \

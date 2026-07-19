@@ -57,6 +57,7 @@ required=(
 # stage can still be installed, while a stage containing the plugin is copied
 # as one transaction with all of its runtime dependencies.
 ios_optional=(
+  "hermes_cli/account_cleanup.py"
   "hermes_cli/ios_intelligence.py"
   "hermes_cli/ios_intelligence_config.py"
   "hermes_cli/ios_intelligence_scheduler.py"
@@ -70,6 +71,7 @@ ios_optional=(
   "hermes_cli/dashboard_auth/registry.py"
   "hermes_cli/profiles.py"
   "hermes_cli/managed_nodes.py"
+  "hermes_cli/managed_node_recovery_service.py"
   "plugins/dashboard_auth/basic/__init__.py"
   "tools/mcp_tool.py"
 )
@@ -144,7 +146,8 @@ for name in sys.argv[1:]:
     compile(pathlib.Path(name).read_text(encoding="utf-8"), name, "exec")
 PY
 if [[ "${ios_enabled}" == 1 ]]; then
-  "${runtime_python}" - "${snapshot}/hermes_cli/ios_intelligence.py" \
+  "${runtime_python}" - "${snapshot}/hermes_cli/account_cleanup.py" \
+    "${snapshot}/hermes_cli/ios_intelligence.py" \
     "${snapshot}/hermes_cli/ios_intelligence_config.py" \
     "${snapshot}/hermes_cli/ios_intelligence_scheduler.py" \
     "${snapshot}/hermes_cli/ios_intelligence_supervisor.py" \
@@ -154,6 +157,8 @@ if [[ "${ios_enabled}" == 1 ]]; then
     "${snapshot}/hermes_cli/dashboard_auth/owner_mobile.py" \
     "${snapshot}/hermes_cli/dashboard_auth/registry.py" \
     "${snapshot}/hermes_cli/profiles.py" \
+    "${snapshot}/hermes_cli/managed_nodes.py" \
+    "${snapshot}/hermes_cli/managed_node_recovery_service.py" \
     "${snapshot}/plugins/dashboard_auth/basic/__init__.py" \
     "${snapshot}/plugins/ios-intelligence/dashboard/plugin_api.py" \
     "${snapshot}/tools/mcp_tool.py" <<'PY'
@@ -404,6 +409,7 @@ rollback() {
     restore_one "${backup}/hermes_cli/dashboard_auth/mobile_notifications.py" "${mobile_notifications_target}"
     restore_one "${backup}/hermes_cli/web_server.py" "${web_server_target}"
     restore_one "${backup}/tui_gateway/server.py" "${tui_gateway_target}"
+    restore_sqlite "${backup}/state/mobile-auth.db" "${mobile_auth_target}"
     if [[ "${ios_enabled}" == 1 ]]; then
       for relative in "${ios_optional[@]}"; do
         restore_one "${backup}/${relative}" "${target_root}/${relative}"
@@ -411,7 +417,6 @@ rollback() {
       restore_one "${backup}/config/config.yaml" "${config_target}"
       restore_sqlite "${backup}/state/ios-intelligence.db" "${ios_database_target}"
       restore_sqlite "${backup}/state/ios-mcp-supervisor.db" "${ios_supervisor_target}"
-      restore_sqlite "${backup}/state/mobile-auth.db" "${mobile_auth_target}"
     fi
     restore_state "${backup}/state/single.json" "${state_target}"
     systemctl start "${service}" >/dev/null 2>&1 || true
@@ -475,10 +480,10 @@ trap 'exit 129' HUP
 # rollback also stops it before restoring this snapshot.
 systemctl stop "${service}"
 backup_one "${state_target}" "${backup}/state/single.json"
+backup_sqlite "${mobile_auth_target}" "${backup}/state/mobile-auth.db"
 if [[ "${ios_enabled}" == 1 ]]; then
   backup_sqlite "${ios_database_target}" "${backup}/state/ios-intelligence.db"
   backup_sqlite "${ios_supervisor_target}" "${backup}/state/ios-mcp-supervisor.db"
-  backup_sqlite "${mobile_auth_target}" "${backup}/state/mobile-auth.db"
 fi
 
 install_atomic() {

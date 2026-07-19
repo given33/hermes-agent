@@ -23,6 +23,7 @@ import hashlib
 import hmac
 import inspect
 import importlib.util
+import ipaddress
 import json
 import logging
 import mimetypes
@@ -2665,16 +2666,21 @@ _MOBILE_API_CAPABILITIES: tuple[str, ...] = (
 
 
 @app.get("/api/mobile/v1/handshake")
-async def get_mobile_handshake():
+async def get_mobile_handshake(request: Request):
     """Return the stable native-client API contract without credentials."""
     topology = await asyncio.get_running_loop().run_in_executor(
         None,
         _collect_profile_gateway_topology,
     )
+    authenticated = bool(
+        getattr(request.state, "token_authenticated", False)
+        or getattr(request.state, "session", None) is not None
+    )
     return {
         "api_version": 1,
         "hermes_version": __version__,
-        "profiles": topology["profiles"],
+        "profiles": topology["profiles"] if authenticated else [],
+        "profile_count": len(topology["profiles"]),
         "capabilities": list(_MOBILE_API_CAPABILITIES),
         "server_time": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
     }
@@ -3036,6 +3042,52 @@ async def get_managed_nodes_status():
         return await asyncio.to_thread(fetch_managed_nodes)
     except ValueError as exc:
         raise HTTPException(status_code=500, detail=str(exc)) from exc
+
+
+class ManagedNodeRecoveryRequest(BaseModel):
+    node_id: str = ""
+
+
+@app.post("/api/managed-nodes/recover")
+async def recover_managed_node(body: ManagedNodeRecoveryRequest):
+    """Request idempotent peer recovery for DBB3, WSL, or both."""
+
+    from hermes_cli.managed_nodes import recover_managed_nodes
+
+    try:
+        return await asyncio.to_thread(recover_managed_nodes, body.node_id)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+class ManagedNodeRecoveryHookRequest(BaseModel):
+    action: str
+    idempotency_key: str
+    reason: str = ""
+    targets: list[str]
+
+
+@app.post("/api/managed-nodes/recovery-hook")
+async def managed_node_recovery_hook(
+    request: Request,
+    body: ManagedNodeRecoveryHookRequest,
+):
+    """Receive a token-authenticated recovery request from the peer node."""
+
+    from hermes_cli.managed_nodes import accept_managed_node_recovery
+
+    try:
+        return await asyncio.to_thread(
+            accept_managed_node_recovery,
+            body.model_dump(),
+            request.headers.get("X-DBB3-Token", ""),
+        )
+    except PermissionError as exc:
+        raise HTTPException(status_code=401, detail="Invalid recovery credential") from exc
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except RuntimeError as exc:
+        raise HTTPException(status_code=503, detail=str(exc)) from exc
 
 
 # ---------------------------------------------------------------------------
@@ -5658,6 +5710,10 @@ async def set_custom_model(
     """Persist one OpenAI/Responses/Anthropic-compatible custom endpoint."""
     if not body.base_url.strip() or not body.model.strip():
         raise HTTPException(status_code=400, detail="base_url and model are required")
+    try:
+        base_url, _loopback = _validated_custom_model_base_url(body.base_url)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
 
     def _apply():
         with _profile_scope(body.profile or profile):
@@ -5666,7 +5722,7 @@ async def set_custom_model(
                 "custom",
                 body.model.strip(),
                 "",
-                body.base_url.strip(),
+                base_url,
                 body.api_key.strip(),
                 body.api_mode.strip().lower(),
                 body.context_length,
@@ -5684,16 +5740,14 @@ async def test_custom_model_connection(
 ):
     """Exercise the selected wire protocol with a bounded one-token request."""
     import httpx
-    from urllib.parse import urlsplit
-
-    base_url = body.base_url.strip().rstrip("/")
     model = body.model.strip()
     api_mode = body.api_mode.strip().lower() or "chat_completions"
-    if not base_url or not model:
+    if not body.base_url.strip() or not model:
         raise HTTPException(status_code=400, detail="base_url and model are required")
-    parsed = urlsplit(base_url)
-    if parsed.scheme not in {"http", "https"} or not parsed.hostname or parsed.username:
-        raise HTTPException(status_code=400, detail="base_url must be an HTTP(S) URL without userinfo")
+    try:
+        base_url, loopback = _validated_custom_model_base_url(body.base_url)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
     if api_mode not in {"chat_completions", "codex_responses", "anthropic_messages"}:
         raise HTTPException(status_code=400, detail="unsupported api_mode")
 
@@ -5733,7 +5787,7 @@ async def test_custom_model_connection(
         }
 
     from tools.url_safety import is_safe_url
-    if not is_safe_url(endpoint):
+    if not loopback and not is_safe_url(endpoint):
         raise HTTPException(
             status_code=400,
             detail="base_url resolves to a blocked private or metadata address",
@@ -5778,6 +5832,34 @@ async def test_custom_model_connection(
         "latency_ms": latency_ms,
         "message": message,
     }
+
+
+def _validated_custom_model_base_url(value: str) -> tuple[str, bool]:
+    base_url = str(value or "").strip().rstrip("/")
+    parsed = urllib.parse.urlsplit(base_url)
+    if (
+        parsed.scheme not in {"http", "https"}
+        or not parsed.hostname
+        or parsed.username is not None
+        or parsed.password is not None
+        or parsed.query
+        or parsed.fragment
+    ):
+        raise ValueError("base_url must be an HTTP(S) URL without userinfo, query, or fragment")
+    try:
+        parsed.port
+    except ValueError as exc:
+        raise ValueError("base_url contains an invalid port") from exc
+    hostname = parsed.hostname.rstrip(".").lower()
+    loopback = hostname == "localhost" or hostname.endswith(".localhost")
+    if not loopback:
+        try:
+            loopback = ipaddress.ip_address(hostname).is_loopback
+        except ValueError:
+            loopback = False
+    if parsed.scheme == "http" and not loopback:
+        raise ValueError("HTTP model endpoints are limited to loopback; use HTTPS otherwise")
+    return base_url, loopback
 
 
 # ---------------------------------------------------------------------------

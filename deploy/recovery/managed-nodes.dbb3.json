@@ -1,0 +1,25 @@
+{
+  "nodes": [
+    {
+      "id": "hermes-fabric",
+      "label": "DBB3 + Windows PC + WSL",
+      "status_url": "http://127.0.0.1:8766/status",
+      "token_file": "/etc/dbb3-team/status_token",
+      "recovery_urls": {
+        "dbb3": "https://daxueshenmai.top/_hermes/recovery/dbb3",
+        "wsl": "https://daxueshenmai.top/_hermes/recovery/wsl"
+      },
+      "auto_recover": true,
+      "timeout_seconds": 8,
+      "recovery_cooldown_seconds": 90
+    }
+  ],
+  "recovery_receiver": {
+    "node_id": "dbb3",
+    "token_file": "/etc/dbb3-team/status_token",
+    "command": [
+      "/usr/local/sbin/hermes-recover-dbb3"
+    ],
+    "state_file": "/var/lib/hermes-managed-node-recovery/receiver-state.json"
+  }
+}

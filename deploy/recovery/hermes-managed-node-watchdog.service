@@ -1,0 +1,21 @@
+[Unit]
+Description=Hermes managed-node recovery watchdog (DBB3)
+After=network-online.target hermes-managed-node-recovery.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart=/usr/local/lib/hermes-agent/venv/bin/python -m hermes_cli.managed_node_recovery_watchdog --config /home/hermes/.hermes/managed-nodes.json --interval 30 --state-file /var/lib/hermes-managed-node-recovery/watchdog.json
+Restart=always
+RestartSec=5
+User=hermes
+Group=hermes
+Environment=HOME=/home/hermes
+Environment=HERMES_HOME=/home/hermes/.hermes
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=read-only
+ReadWritePaths=/home/hermes/.hermes /var/lib/hermes-managed-node-recovery
+
+[Install]
+WantedBy=multi-user.target
