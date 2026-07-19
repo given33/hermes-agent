@@ -386,7 +386,9 @@ class IOSIntelligenceScheduler:
                     instant,
                     decision,
                 )
-            else:
+            elif decision.get("reason") != "partial_weather_query":
+                # Incomplete vendor coverage must not tombstone an overnight risk
+                # summary that still needs the morning flush delivery path.
                 summary_date = datetime.fromtimestamp(
                     window.departure_at,
                     ZoneInfo(self.config.timezone),
@@ -397,11 +399,10 @@ class IOSIntelligenceScheduler:
             notification = self._enqueue_weather_notification(owner_id, destination, route, window, decision, instant)
             result["notification"] = notification
         else:
-            if (
-                forecast.get("queried")
-                and not forecast.get("errors")
-                and not forecast.get("queried_partial")
-            ):
+            # Retract prior forecasts whenever this evaluate cycle decided not to
+            # page — including partial multi-location coverage so stale outbox
+            # rows and map cards cannot outlive an incomplete weather picture.
+            if forecast.get("queried") or decision.get("reason") == "partial_weather_query":
                 result["weather_reconciliation"] = self._expire_stale_weather(owner_id, instant)
             result["suppressed_reason"] = decision.get("reason") or "low_weather_impact"
         return result
@@ -982,28 +983,36 @@ class IOSIntelligenceScheduler:
             logger.info("QWeather soft monthly limit reached; reducing evaluation requests")
         # The current location is queried through the latest location snapshot;
         # destination and route waypoints are queried when coordinates exist.
-        locations: list[tuple[float, float, str]] = []
+        planned: list[tuple[float, float, str]] = []
         current = self.store.latest_snapshot(owner_id, "location")
         if current:
             data = current.get("data", {})
             if data.get("latitude") is not None and data.get("longitude") is not None:
-                locations.append((float(data["latitude"]), float(data["longitude"]), "origin"))
+                planned.append((float(data["latitude"]), float(data["longitude"]), "origin"))
         if destination.get("latitude") is not None and destination.get("longitude") is not None:
-            locations.append((float(destination["latitude"]), float(destination["longitude"]), "destination"))
+            planned.append((float(destination["latitude"]), float(destination["longitude"]), "destination"))
         for index, (latitude, longitude) in enumerate(route.waypoints, start=1):
-            locations.append((latitude, longitude, f"route-{index}"))
+            planned.append((latitude, longitude, f"route-{index}"))
+        # Deduplicate planned coordinates once so soft-throttle completeness is
+        # judged against the full commercial trip picture, not only the subset
+        # that still runs under the monthly soft limit.
+        planned_unique: list[tuple[float, float, str]] = []
+        planned_seen: set[tuple[float, float]] = set()
+        for latitude, longitude, label in planned:
+            key = (round(latitude, 4), round(longitude, 4))
+            if key in planned_seen:
+                continue
+            planned_seen.add(key)
+            planned_unique.append((latitude, longitude, label))
+        planned_labels = [label for _, _, label in planned_unique]
+        planned_critical = {label for label in planned_labels if label in {"origin", "destination"}}
+        locations = planned_unique
         if soft_throttled:
-            locations = locations[:1]
-        # Avoid duplicate API calls for the same coordinate while retaining the
-        # semantic location labels in the result.
-        seen: set[tuple[float, float]] = set()
+            locations = planned_unique[:1]
+            result["soft_throttled"] = True
         attempted_labels: list[str] = []
         success_labels: list[str] = []
         for latitude, longitude, label in locations:
-            key = (round(latitude, 4), round(longitude, 4))
-            if key in seen:
-                continue
-            seen.add(key)
             attempted_labels.append(label)
             try:
                 minute = self.qweather.minutely(latitude, longitude)
@@ -1028,15 +1037,20 @@ class IOSIntelligenceScheduler:
                     result["events"].extend(dict(item) for item in minute["events"] if isinstance(item, Mapping))
             except Exception as exc:
                 result["errors"].append({"label": label, "error": str(exc)[:300]})
+        result["planned_labels"] = planned_labels
         result["attempted_labels"] = attempted_labels
         result["success_labels"] = success_labels
         result["queried"] = bool(success_labels)
-        result["queried_complete"] = bool(success_labels) and not result["errors"] and (
-            len(success_labels) == len(attempted_labels)
+        # Completeness is against the planned trip locations. Soft-throttle that
+        # drops destination/route must remain partial even when the single
+        # remaining origin call succeeds without HTTP errors.
+        result["queried_complete"] = (
+            bool(success_labels)
+            and not result["errors"]
+            and set(planned_labels).issubset(set(success_labels))
         )
         result["queried_partial"] = bool(success_labels) and not result["queried_complete"]
-        critical_needed = {label for label in attempted_labels if label in {"origin", "destination"}}
-        result["critical_complete"] = critical_needed.issubset(set(success_labels))
+        result["critical_complete"] = planned_critical.issubset(set(success_labels))
         if result["queried"]:
             condition = self._weather_condition(result["events"])
             context_payload = {

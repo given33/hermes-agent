@@ -13,7 +13,7 @@ from zoneinfo import ZoneInfo
 
 import pytest
 
-from hermes_cli.ios_intelligence import IOSIntelligenceStore
+from hermes_cli.ios_intelligence import IOSIntelligenceStore, WEATHER_SOFT_LIMIT
 from hermes_cli.dashboard_auth.mobile_device_store import MobileDeviceInfo, MobileDeviceStore
 from hermes_cli.ios_intelligence_scheduler import (
     CloudBehaviorSemanticAnalyzer,
@@ -1620,6 +1620,55 @@ def test_account_delete_route_rejects_a_tombstone_for_another_owner(monkeypatch)
     assert exc_info.value.detail == "owner_scope does not match account"
 
 
+def test_evaluate_fallback_applies_feature_weights(monkeypatch, tmp_path):
+    """Scheduler-less /evaluate must still fail-closed on MCP sensor weights."""
+
+    plugin_path = (
+        Path(__file__).resolve().parents[2]
+        / "plugins"
+        / "ios-intelligence"
+        / "dashboard"
+        / "plugin_api.py"
+    )
+    spec = importlib.util.spec_from_file_location(
+        "test_ios_intelligence_evaluate_fallback_plugin", plugin_path
+    )
+    assert spec and spec.loader
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+
+    store = IOSIntelligenceStore(tmp_path)
+    now = 1_800_000_000
+    store.record_snapshot("alice", "motion", {"state": "walking"}, observed_at=now)
+    captured: dict[str, object] = {}
+
+    def evaluate_behavior(owner_id, **kwargs):
+        captured["owner_id"] = owner_id
+        captured.update(kwargs)
+        return {
+            "owner_id": owner_id,
+            "leave_probability": 0.4,
+            "applied_feature_weights": kwargs.get("feature_weights") or {},
+        }
+
+    monkeypatch.setattr(module, "_SCHEDULER", None)
+    monkeypatch.setattr(module, "owner_id_from_request", lambda _request: "alice")
+    monkeypatch.setattr(module, "intelligence_store", lambda: SimpleNamespace(
+        evaluate_behavior=evaluate_behavior,
+    ))
+    monkeypatch.setattr(
+        "hermes_cli.ios_intelligence.load_ios_feature_weights",
+        lambda: {"ios-motion": 0.5, "ios-location": 0.5},
+    )
+
+    result = module.evaluate_now(object())
+
+    assert captured["owner_id"] == "alice"
+    assert captured["feature_weights"]["ios-motion"] == 0.5
+    assert result["feature_weights"]["ios-motion"] == 0.5
+    assert result["leave_probability"] == 0.4
+
+
 class _PartialWeather:
     """Succeeds for origin, fails for destination — partial commercial path."""
 
@@ -1660,6 +1709,18 @@ def test_partial_weather_query_suppresses_notification(tmp_path):
         "visits",
     )
     store.record_snapshot("alice", "location", {"latitude": 24.9, "longitude": 118.6}, observed_at=now)
+    # A prior full-coverage alert must be retracted once the multi-location
+    # picture becomes incomplete so stale map cards cannot linger.
+    store.record_active_forecast(
+        "alice",
+        {
+            "id": "stale-rain",
+            "category": "smart-weather",
+            "valid_from": now - 600,
+            "valid_until": now + 3600,
+            "summary": "previous full-coverage rain",
+        },
+    )
     weather = _PartialWeather()
     scheduler = IOSIntelligenceScheduler(
         store=store,
@@ -1684,6 +1745,110 @@ def test_partial_weather_query_suppresses_notification(tmp_path):
     assert result["notification"] is None
     assert result["suppressed_reason"] == "partial_weather_query"
     assert result["alert"]["should_notify"] is False
+    # Outbox may already be empty; map cards still must be retracted.
+    assert result["weather_reconciliation"]["forecasts_removed"] >= 1
+    assert store.active_forecast("alice", now) == []
+
+
+def test_soft_throttle_marks_destination_partial_not_complete(tmp_path):
+    """Monthly soft limit may query origin only, but critical_complete stays false."""
+
+    store = IOSIntelligenceStore(tmp_path)
+    tz = ZoneInfo("Asia/Shanghai")
+    now = int(datetime(2026, 7, 18, 10, 0, tzinfo=tz).timestamp())
+    store.ingest_events(
+        "alice",
+        "iphone",
+        [
+            _visit("old-home", "home", now - 3 * 86400, now - 3 * 86400 + 1800),
+            _visit("old-study", "study", now - 3 * 86400 + 2400, now - 3 * 86400 + 4200),
+            _visit("current", "home", now - 900, None),
+        ],
+        "visits",
+    )
+    store.record_snapshot("alice", "location", {"latitude": 24.9, "longitude": 118.6}, observed_at=now)
+    store.reserve_weather_requests(WEATHER_SOFT_LIMIT, timezone="Asia/Shanghai")
+    weather = FakeWeather("2026-07-18T10:15:00+08:00")
+    scheduler = IOSIntelligenceScheduler(
+        store=store,
+        qweather=weather,
+        config={"ios_intelligence": {"timezone": "Asia/Shanghai"}},
+        clock=lambda: now,
+    )
+    scheduler._choose_destination = lambda owner_id, behavior: {
+        "place_id": "study",
+        "name": "study",
+        "latitude": 24.95,
+        "longitude": 119.0,
+    }
+    # Isolate soft-throttle completeness from learned route waypoints.
+    scheduler._estimate_route = lambda owner_id, behavior, destination: RouteEstimate(
+        duration_seconds=20 * 60,
+        waypoints=(),
+    )
+
+    result = scheduler.evaluate_account("alice", force=True, now=now)
+
+    assert result["weather"]["soft_throttled"] is True
+    assert result["weather"]["planned_labels"] == ["origin", "destination"]
+    assert result["weather"]["attempted_labels"] == ["origin"]
+    assert result["weather"]["success_labels"] == ["origin"]
+    assert result["weather"]["queried_partial"] is True
+    assert result["weather"]["critical_complete"] is False
+    assert result["weather"]["queried_complete"] is False
+    assert result["suppressed_reason"] == "partial_weather_query"
+    assert result["notification"] is None
+
+
+def test_quiet_hours_partial_weather_preserves_overnight_summary(tmp_path):
+    """Incomplete vendor coverage must not tombstone a pending quiet summary."""
+
+    store = IOSIntelligenceStore(tmp_path)
+    tz = ZoneInfo("Asia/Shanghai")
+    quiet_now = int(datetime(2026, 7, 18, 23, 30, tzinfo=tz).timestamp())
+    store.ingest_events(
+        "alice",
+        "iphone",
+        [
+            _visit("old-home", "home", quiet_now - 7 * 86400, quiet_now - 7 * 86400 + 10 * 3600),
+            _visit("old-study", "study", quiet_now - 7 * 86400 + 2400, quiet_now - 7 * 86400 + 4200),
+            _visit("current", "home", quiet_now - 60, None),
+        ],
+        "1",
+    )
+    store.record_snapshot(
+        "alice",
+        "location",
+        {"latitude": 24.9, "longitude": 118.6},
+        observed_at=quiet_now,
+    )
+    store.save_quiet_summary(
+        "alice",
+        "2026-07-19",
+        {"window": {"arrival_at": quiet_now + 12 * 3600, "departure_at": quiet_now + 9 * 3600}},
+    )
+    weather = _PartialWeather()
+    scheduler = IOSIntelligenceScheduler(
+        store=store,
+        qweather=weather,
+        config={"ios_intelligence": {"timezone": "Asia/Shanghai"}},
+        clock=lambda: quiet_now,
+    )
+    scheduler._choose_destination = lambda owner_id, behavior: {
+        "place_id": "study",
+        "name": "study",
+        "latitude": 24.95,
+        "longitude": 119.0,
+    }
+
+    result = scheduler.evaluate_account("alice", force=True, now=quiet_now)
+
+    assert result["suppressed_reason"] == "quiet_hours"
+    assert result["alert"]["reason"] == "partial_weather_query"
+    assert result.get("quiet_summary") is None
+    # The overnight risk summary must survive until a complete evaluate can
+    # either replace it or intentionally clear it after full vendor coverage.
+    assert store.get_quiet_summary("alice", "2026-07-19") is not None
 
 
 def test_feature_weights_fail_closed_when_supervisor_unavailable(tmp_path):

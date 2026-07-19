@@ -1804,7 +1804,8 @@ def test_qweather_rejects_and_does_not_cache_business_errors(store):
         client.current(24.9, 118.6)
 
     assert len(http.calls) == 2
-    assert store.weather_quota_status()["used"] == 2
+    # Failed vendor responses must not burn commercial monthly quota.
+    assert store.weather_quota_status()["used"] == 0
 
 
 def test_external_clients_require_server_credentials(store, monkeypatch):

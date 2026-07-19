@@ -3447,11 +3447,13 @@ class QWeatherClient:
             return {**cached, "_cache": True}
         # Monthly quota buckets follow the configured product timezone, not the
         # process host TZ, so UTC hosts do not roll the counter early/late.
-        if self.store.weather_quota_status(timezone=self.timezone)["soft_limited"]:
-            cache_seconds = max(int(cache_seconds), 1800)
-        quota = self.store.reserve_weather_requests(timezone=self.timezone)
-        if not quota["allowed"]:
+        # Charge only after a successful response so timeouts / 5xx / bad codes
+        # do not burn commercial monthly budget.
+        status = self.store.weather_quota_status(timezone=self.timezone)
+        if status.get("exhausted"):
             raise RuntimeError("QWeather monthly request limit reached")
+        if status.get("soft_limited"):
+            cache_seconds = max(int(cache_seconds), 1800)
         try:
             if self.client is not None:
                 response = self.client.get(
@@ -3478,6 +3480,11 @@ class QWeatherClient:
                     self.api_key,
                 )
             )
+        quota = self.store.reserve_weather_requests(timezone=self.timezone)
+        if not quota.get("allowed"):
+            # Concurrent reservation race after a successful vendor call: return
+            # the paid network response without caching so the next call blocks.
+            return {**result, "_cache": False, "_quota_raced": True}
         self.store.put_cache("qweather", cache_key, result, cache_seconds)
         return {**result, "_cache": False}
 

@@ -364,12 +364,19 @@ def evaluate_now(request: Request) -> dict[str, Any]:
     if _SCHEDULER is not None:
         return _SCHEDULER.evaluate_account(owner_id, force=True)
     # Scheduler-less fallbacks (rollback / health-only mounts) must still honor
-    # the configured account timezone so weekday/holiday features stay correct.
+    # the configured account timezone and the same MCP health weights as the
+    # primary scheduler path — never fail open to full sensor trust.
+    from hermes_cli.ios_intelligence import load_ios_feature_weights
+
     config = load_ios_intelligence_config()
-    return intelligence_store().evaluate_behavior(
+    feature_weights = load_ios_feature_weights()
+    behavior = intelligence_store().evaluate_behavior(
         owner_id,
+        feature_weights=feature_weights,
         timezone=config.timezone,
     )
+    behavior["feature_weights"] = feature_weights
+    return behavior
 
 
 @router.get("/places")
