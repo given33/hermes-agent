@@ -7462,6 +7462,13 @@ def _finalize_pending_conversation_deletion(conversation_id: str) -> bool:
             if str(session_id or "").strip()
         ]
         owner_id = str(conversation.get("owner_id") or LOCAL_OWNER_ID)
+        # Account-file rows are a separate durable store.  Remove them before
+        # dropping the conversation tombstone so a crash leaves a retryable
+        # deletion intent rather than an orphaned file index/object.
+        try:
+            _file_library().delete_conversation(owner_id, conversation_id)
+        except Exception:
+            return False
         state["conversations"] = [
             item
             for item in state.get("conversations") or []

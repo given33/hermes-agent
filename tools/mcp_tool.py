@@ -635,14 +635,9 @@ def _wrap_command_with_watchdog(command: str, args: list) -> tuple[str, list]:
     See ``tools/mcp_stdio_watchdog.py`` module docstring for the full
     rationale. Returns the (command, args) unchanged on any platform/failure
     where the wrap can't safely apply, so this can never be the reason a
-    previously-working MCP server stops starting.
+    previously-working MCP server stops starting. The watchdog uses process
+    groups on POSIX and falls back to terminating the direct child on Windows.
     """
-    if os.name != "posix":
-        # Relies on process groups (os.getpgid/os.killpg); no POSIX
-        # equivalent wired up here yet, matching the existing killpg-based
-        # orphan cleanup's platform scope (Windows falls back to plain
-        # os.kill there too).
-        return command, args
     try:
         my_pid = os.getpid()
         try:
@@ -996,7 +991,13 @@ def _resolve_client_cert(server_name: str, config: dict):
                 f"MCP server '{server_name}': {label} must be a non-empty "
                 f"string path (got {type(path).__name__})"
             )
-        expanded = os.path.expanduser(path.strip())
+        clean_path = path.strip()
+        home = os.environ.get("HOME")
+        if home and (clean_path == "~" or clean_path.startswith(("~/", "~\\"))):
+            suffix = clean_path[2:] if len(clean_path) > 1 else ""
+            expanded = os.path.join(home, suffix) if suffix else home
+        else:
+            expanded = os.path.expanduser(clean_path)
         if not os.path.isfile(expanded):
             raise FileNotFoundError(
                 f"MCP server '{server_name}': {label} not found at "
@@ -2281,8 +2282,8 @@ class MCPServerTask:
         # mcp-remote's spawned `node`) running forever. On a clean exit,
         # MCPServerTask.shutdown() / _kill_orphaned_mcp_children() still do
         # the reaping as before -- this only covers the case where that code
-        # never gets to run. POSIX-only (relies on process groups); no-op
-        # elsewhere, matching existing killpg-based cleanup's platform scope.
+        # never gets to run. POSIX uses process groups; Windows falls back to
+        # terminating the direct child through the same watchdog process.
         # Applied AFTER the OSV preflight so the check inspects the real
         # package, not the watchdog wrapper.
         command, args = _wrap_command_with_watchdog(command, args)

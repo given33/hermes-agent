@@ -870,6 +870,48 @@ class CloudFileLibrary:
         self._remove_object_path(str(row["stored_relpath"] or ""))
         return True
 
+    def delete_conversation(self, owner_id: str, conversation_id: str) -> dict[str, int]:
+        """Delete every indexed object produced by one owned conversation."""
+
+        owner_id = normalize_owner_id(owner_id)
+        conversation_id = str(conversation_id or "").strip()
+        if not conversation_id:
+            raise ValueError("Conversation id is required")
+        with self._lock, self.connection() as conn, write_txn(conn):
+            rows = conn.execute(
+                """
+                SELECT id, origin_key, sha256, stored_relpath
+                FROM account_files
+                WHERE owner_id=? AND conversation_id=?
+                """,
+                (owner_id, conversation_id),
+            ).fetchall()
+            for row in rows:
+                if row["origin_key"]:
+                    conn.execute(
+                        """
+                        INSERT INTO deleted_file_origins (
+                            owner_id, origin_key, sha256, deleted_at
+                        ) VALUES (?, ?, ?, ?)
+                        ON CONFLICT(owner_id, origin_key) DO UPDATE SET
+                            sha256=excluded.sha256,
+                            deleted_at=excluded.deleted_at
+                        """,
+                        (
+                            owner_id,
+                            row["origin_key"],
+                            row["sha256"],
+                            self._clock_ms(),
+                        ),
+                    )
+            conn.execute(
+                "DELETE FROM account_files WHERE owner_id=? AND conversation_id=?",
+                (owner_id, conversation_id),
+            )
+        for row in rows:
+            self._remove_object_path(str(row["stored_relpath"] or ""))
+        return {"files": len(rows)}
+
     def delete_owner(self, owner_id: str) -> dict[str, int]:
         """Delete every index row and object belonging to one account."""
 

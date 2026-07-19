@@ -270,6 +270,15 @@ def test_account_file_routes_cover_upload_artifact_link_download_and_delete(
         assert after_delete.status_code == 200
         assert after_delete.json()["files"] == []
 
+        deleted_conversation = client.delete(
+            f"{prefix}/single/conversations/{conversation['id']}"
+        )
+        assert deleted_conversation.status_code == 200
+        assert client.get(f"{prefix}/files").json()["files"] == []
+        assert client.get(
+            f"{prefix}/single/conversations/{conversation['id']}"
+        ).status_code == 404
+
 
 def test_account_file_listing_uses_only_the_index_and_hides_server_paths(
     tmp_path,

@@ -88,10 +88,9 @@ def _is_orphaned(original_ppid: int, parent_create_time: float, getppid=os.getpp
 def _terminate_process_group(proc: subprocess.Popen) -> None:
     """Best-effort SIGTERM-then-SIGKILL of the child's process group.
 
-    This module only ever runs on POSIX (the wrap site in tools/mcp_tool.py
-    gates on ``os.name == "posix"``), but guard the POSIX-only primitives
-    anyway so an accidental Windows import/execute degrades to a plain
-    child kill instead of AttributeError.
+    POSIX uses a process group so descendants are terminated together.
+    Windows has no ``killpg`` and deliberately falls back to terminating the
+    direct child, which still prevents the common orphaned stdio server case.
     """
     killpg = getattr(os, "killpg", None)
     if killpg is None:  # windows-footgun: ok — non-POSIX fallback
@@ -142,9 +141,9 @@ def main(argv: list[str] | None = None) -> int:
         print("mcp_stdio_watchdog: no command given after '--'", file=sys.stderr)
         return 2
 
-    # New process group so we can killpg() the whole tree the real command
-    # may spawn (e.g. mcp-remote's own child `node` process), without
-    # touching our own group or the (already-gone) original parent's.
+    # On POSIX, the new process group lets killpg() stop the whole tree the
+    # command may spawn without touching the watchdog or original parent.
+    # Windows accepts start_new_session and uses the direct-child fallback.
     proc = subprocess.Popen(
         real_argv,
         stdin=sys.stdin,
