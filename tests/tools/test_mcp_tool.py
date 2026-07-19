@@ -931,11 +931,9 @@ class TestDiscoverAndRegister:
     def test_changed_endpoint_reloads_existing_server_task(self, monkeypatch):
         from tools import mcp_tool
 
-        old = SimpleNamespace(
-            session=object(),
-            shutdown=AsyncMock(),
-            _registered_tool_names=[],
-        )
+        old = mcp_tool.MCPServerTask("ios-power")
+        old.session = object()
+        old._registered_tool_names = []
         new = mcp_tool.MCPServerTask("ios-power")
         new.session = object()
         config = {"url": "http://127.0.0.1:9001/mcp", "enabled": True}
@@ -946,16 +944,9 @@ class TestDiscoverAndRegister:
             separators=(",", ":"),
         )
 
-        async def discover(name, discovered_config):
+        async def connect(name, discovered_config):
             assert (name, discovered_config) == ("ios-power", config)
-            new._registered_tool_names = ["mcp__ios_power__ios_power_get_latest"]
-            mcp_tool._servers[name] = new
-            mcp_tool._server_config_fingerprints[name] = json.dumps(
-                discovered_config,
-                sort_keys=True,
-                separators=(",", ":"),
-            )
-            return ["mcp__ios_power__ios_power_get_latest"]
+            return new
 
         monkeypatch.setattr(mcp_tool, "_MCP_AVAILABLE", True)
         monkeypatch.setattr(mcp_tool, "_filter_suspicious_mcp_servers", lambda value: value)
@@ -965,15 +956,94 @@ class TestDiscoverAndRegister:
             "_run_on_mcp_loop",
             lambda factory, timeout=30: asyncio.run(factory()),
         )
-        monkeypatch.setattr(mcp_tool, "_discover_and_register_server", discover)
+        monkeypatch.setattr(mcp_tool, "_connect_server", connect)
+        monkeypatch.setattr(
+            mcp_tool,
+            "_register_server_tools",
+            lambda name, server, cfg: ["mcp__ios_power__ios_power_get_latest"],
+        )
         try:
             names = mcp_tool.register_mcp_servers({"ios-power": config})
-            old.shutdown.assert_awaited_once()
+            assert old.accepting_calls is False
+            assert old._shutdown_event.is_set()
             assert mcp_tool._servers["ios-power"] is new
             assert names == ["mcp__ios_power__ios_power_get_latest"]
         finally:
             mcp_tool._servers.pop("ios-power", None)
             mcp_tool._server_config_fingerprints.pop("ios-power", None)
+
+    def test_blue_green_routes_new_calls_while_pre_cutover_lease_drains(self, monkeypatch):
+        """A selected blue call drains while post-swap calls use green."""
+        from tools import mcp_tool
+
+        name = "ios-power-interleaving"
+        old = mcp_tool.MCPServerTask(name)
+        old.session = object()
+        old._registered_tool_names = ["mcp__ios_power_interleaving__latest"]
+        new = mcp_tool.MCPServerTask(name)
+        new.session = object()
+        config = {"url": "http://127.0.0.1:9002/mcp", "enabled": True}
+        old_config = {"url": "http://127.0.0.1:9001/mcp", "enabled": True}
+        mcp_tool._servers[name] = old
+        mcp_tool._server_config_fingerprints[name] = json.dumps(
+            old_config, sort_keys=True, separators=(",", ":"),
+        )
+
+        async def connect(server_name, discovered_config):
+            assert (server_name, discovered_config) == (name, config)
+            return new
+
+        monkeypatch.setattr(mcp_tool, "_MCP_AVAILABLE", True)
+        monkeypatch.setattr(mcp_tool, "_filter_suspicious_mcp_servers", lambda value: value)
+        monkeypatch.setattr(mcp_tool, "_ensure_mcp_loop", lambda: None)
+        monkeypatch.setattr(
+            mcp_tool,
+            "_run_on_mcp_loop",
+            lambda factory, timeout=30: asyncio.run(factory()),
+        )
+        monkeypatch.setattr(mcp_tool, "_connect_server", connect)
+        monkeypatch.setattr(
+            mcp_tool,
+            "_register_server_tools",
+            lambda server_name, server, cfg: list(old._registered_tool_names),
+        )
+
+        # This models a handler that selected blue but has not yet entered its
+        # asyncio RPC lock. The routing lease must still protect it.
+        selected_blue = mcp_tool._get_connected_server_for_call(name)
+        assert selected_blue is old
+        outcome = []
+        worker = threading.Thread(
+            target=lambda: outcome.append(mcp_tool.register_mcp_servers({name: config})),
+            daemon=True,
+        )
+        worker.start()
+        try:
+            deadline = time.monotonic() + 2
+            while time.monotonic() < deadline:
+                with mcp_tool._lock:
+                    if mcp_tool._servers.get(name) is new:
+                        break
+                time.sleep(0.01)
+            assert mcp_tool._servers[name] is new
+            assert worker.is_alive(), "blue retirement must wait for the selected call"
+            assert not old._shutdown_event.is_set()
+
+            selected_green = mcp_tool._get_connected_server_for_call(name)
+            assert selected_green is new
+            mcp_tool._release_server_call(selected_green)
+
+            mcp_tool._release_server_call(selected_blue)
+            worker.join(timeout=2)
+            assert not worker.is_alive()
+            assert old._shutdown_event.is_set()
+            assert outcome and outcome[0] == list(new._registered_tool_names)
+        finally:
+            if worker.is_alive():
+                mcp_tool._release_server_call(selected_blue)
+                worker.join(timeout=2)
+            mcp_tool._servers.pop(name, None)
+            mcp_tool._server_config_fingerprints.pop(name, None)
 
     def test_tools_registered_in_registry(self):
         """_discover_and_register_server registers tools with correct names."""
@@ -1285,6 +1355,44 @@ class TestMCPServerTask:
 
                 assert server.session is None
                 assert server._task.done()
+
+        asyncio.run(_test())
+
+    def test_shutdown_drains_inflight_rpc_before_transport_teardown(self):
+        """Blue-green retirement cannot close the stream under a long call."""
+        from tools.mcp_tool import MCPServerTask
+
+        async def _test():
+            server = MCPServerTask("srv")
+            server.session = object()
+            call_started = asyncio.Event()
+            release_call = asyncio.Event()
+            call_finished = asyncio.Event()
+
+            async def in_flight_call():
+                async with server._rpc_lock:
+                    call_started.set()
+                    await release_call.wait()
+                    call_finished.set()
+
+            async def transport_lifecycle():
+                await server._shutdown_event.wait()
+                assert call_finished.is_set()
+
+            server._task = asyncio.create_task(transport_lifecycle())
+            call_task = asyncio.create_task(in_flight_call())
+            await call_started.wait()
+
+            shutdown_task = asyncio.create_task(server.shutdown())
+            await asyncio.sleep(0)
+            assert server.accepting_calls is False
+            assert not server._shutdown_event.is_set()
+            assert not shutdown_task.done()
+
+            release_call.set()
+            await call_task
+            await shutdown_task
+            assert server._shutdown_event.is_set()
 
         asyncio.run(_test())
 

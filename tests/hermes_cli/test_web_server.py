@@ -867,6 +867,41 @@ class TestWebServerEndpoints:
         assert cfg["model"]["context_length"] == 200000
         assert cfg["agent"]["reasoning_effort"] == "high"
 
+    def test_model_credentials_expose_only_masked_model_editor_keys_and_delete_them(self):
+        from hermes_cli.config import load_config
+
+        saved = self.client.put(
+            "/api/model/custom",
+            json={
+                "base_url": "https://model.example/v1",
+                "api_key": "private-model-key",
+                "model": "model-a",
+                "api_mode": "chat_completions",
+                "context_length": 131072,
+            },
+        )
+        assert saved.status_code == 200
+
+        listed = self.client.get("/api/model/credentials")
+        assert listed.status_code == 200
+        body = listed.json()
+        assert body == {
+            "credentials": [{
+                "id": "custom-main",
+                "provider": "custom",
+                "model": "model-a",
+                "base_url": "https://model.example/v1",
+                "masked_value": body["credentials"][0]["masked_value"],
+            }],
+        }
+        assert "private-model-key" not in json.dumps(body)
+
+        removed = self.client.delete("/api/model/credentials/custom-main")
+        assert removed.status_code == 200
+        assert removed.json() == {"ok": True, "removed": True}
+        assert "api_key" not in load_config()["model"]
+        assert self.client.get("/api/model/credentials").json() == {"credentials": []}
+
     def test_custom_model_endpoint_rejects_unsupported_protocol(self):
         response = self.client.put(
             "/api/model/custom",
@@ -4288,6 +4323,14 @@ class TestNewEndpoints:
 
         created = self.client.post("/api/profiles", json={"name": "test-prof"})
         assert created.status_code == 200
+        from hermes_constants import get_hermes_home
+        from hermes_cli.ios_mcp_server import CAPABILITIES
+        profile_config = yaml.safe_load(
+            (get_hermes_home() / "profiles" / "test-prof" / "config.yaml").read_text(
+                encoding="utf-8",
+            )
+        )
+        assert set(CAPABILITIES).issubset(profile_config["mcp_servers"])
 
         renamed = self.client.patch(
             "/api/profiles/test-prof",
@@ -4417,7 +4460,12 @@ class TestNewEndpoints:
 
         assert resp.status_code == 200
         target_dir = get_hermes_home() / "profiles" / "full-copy"
-        assert (target_dir / "config.yaml").read_text(encoding="utf-8") == "model:\n  provider: source-only\n"
+        from hermes_cli.ios_mcp_server import CAPABILITIES
+        target_config = yaml.safe_load(
+            (target_dir / "config.yaml").read_text(encoding="utf-8")
+        )
+        assert target_config["model"]["provider"] == "source-only"
+        assert set(CAPABILITIES).issubset(target_config["mcp_servers"])
         assert (target_dir / "workspace" / "artifact.txt").read_text(encoding="utf-8") == "copied"
 
     def test_profiles_create_without_clone_seeds_bundled_skills(self, monkeypatch):
@@ -4520,7 +4568,10 @@ class TestNewEndpoints:
             cfg = load_config()
             assert cfg["model"]["default"] == "anthropic/claude-sonnet-4.6"
             assert cfg["model"]["provider"] == "openrouter"
-            assert sorted((cfg.get("mcp_servers") or {}).keys()) == ["ctx7"]
+            from hermes_cli.ios_mcp_server import CAPABILITIES
+            configured_servers = cfg.get("mcp_servers") or {}
+            assert configured_servers["ctx7"]["url"] == "https://mcp.context7.com/mcp"
+            assert set(CAPABILITIES).issubset(configured_servers)
             disabled = get_disabled_skills(cfg)
             assert "drop-me" in disabled
             assert "keep-me" not in disabled

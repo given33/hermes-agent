@@ -387,7 +387,13 @@ def _resolve_location(store: IOSIntelligenceStore, owner_id: str, latitude: floa
 
 
 def _resolve_owner(store: IOSIntelligenceStore, owner_id: str = "") -> str:
-    """Resolve the chat's account without making ordinary users supply an ID."""
+    """Resolve the account for an MCP tool call.
+
+    Multi-user hosts must bind each MCP process with HERMES_IOS_OWNER_ID (or
+    HERMES_OWNER_EMAIL). Auto-picking the only active account is fail-closed:
+    private calendar/health/location must never leak across chat owners when a
+    host later gains a second account or serves multiple users from one DB.
+    """
 
     explicit = str(owner_id or "").strip()
     configured = str(os.getenv("HERMES_IOS_OWNER_ID") or os.getenv("HERMES_OWNER_EMAIL") or "").strip()
@@ -396,18 +402,17 @@ def _resolve_owner(store: IOSIntelligenceStore, owner_id: str = "") -> str:
             raise PermissionError("This MCP process is bound to a different account")
         return configured
     if explicit:
+        # Unbound process: require the tool argument and never invent an owner
+        # from active_accounts(). Verify the account has synchronized data so
+        # typos fail closed rather than creating ghost queues.
         accounts = store.active_accounts()
-        if len(accounts) > 1:
-            raise RuntimeError("Multiple iOS accounts are active; bind this MCP process to HERMES_IOS_OWNER_ID")
-        if accounts and explicit != accounts[0]:
+        if accounts and explicit not in accounts:
             raise PermissionError("This MCP process is bound to a different account")
         return explicit
-    accounts = store.active_accounts()
-    if len(accounts) == 1:
-        return accounts[0]
-    if not accounts:
-        raise RuntimeError("No synchronized iOS account is available")
-    raise RuntimeError("Multiple iOS accounts are active; bind this MCP process to HERMES_IOS_OWNER_ID")
+    raise RuntimeError(
+        "iOS MCP owner is unbound; set HERMES_IOS_OWNER_ID on the MCP process "
+        "or pass owner_id for a single-account operator binding"
+    )
 
 
 def _register_latest(

@@ -541,12 +541,84 @@ def _install_managed_ios_mcp_for_profile(profile_dir: Path) -> None:
 
     Profiles are independent HERMES_HOME roots; installing the fleet only in
     the root profile leaves a newly-created profile without the 21 servers.
-    The merge is idempotent and keeps explicit enabled/scope overrides.
+    The merge is idempotent and keeps explicit enabled/scope overrides. The
+    root profile is also the discovery source for transport endpoints: a
+    production streamable-HTTP fleet (including blue-green port changes) must
+    not be replaced by the install helper's stdio defaults.
     """
 
     try:
+        import copy
+
+        from hermes_cli import config as config_module
         from hermes_constants import reset_hermes_home_override, set_hermes_home_override
-        from hermes_cli.ios_mcp_server import install_ios_mcp_servers
+        from hermes_cli.ios_mcp_server import (
+            CAPABILITIES,
+            install_ios_mcp_servers,
+            normalize_mcp_scope_grants,
+        )
+
+        profile_dir = profile_dir.resolve()
+        default_home = _get_default_hermes_home().resolve()
+
+        def _read_config(home: Path) -> dict:
+            token = set_hermes_home_override(str(home))
+            try:
+                return dict(config_module.read_raw_config() or {})
+            finally:
+                reset_hermes_home_override(token)
+
+        source_config = _read_config(default_home)
+        source_servers = source_config.get("mcp_servers")
+        has_managed_source = (
+            isinstance(source_servers, dict)
+            and all(isinstance(source_servers.get(name), dict) for name in CAPABILITIES)
+        )
+
+        # The default profile already owns the canonical managed endpoints.
+        # Do not run the stdio installer over a complete HTTP fleet.
+        if profile_dir == default_home and has_managed_source:
+            return
+
+        if has_managed_source:
+            target_config = _read_config(profile_dir)
+            raw_target_servers = target_config.get("mcp_servers")
+            target_servers = (
+                copy.deepcopy(raw_target_servers)
+                if isinstance(raw_target_servers, dict)
+                else {}
+            )
+            changed = False
+            for capability in CAPABILITIES:
+                desired = copy.deepcopy(source_servers[capability])
+                prior = target_servers.get(capability)
+                if isinstance(prior, dict):
+                    desired["enabled"] = prior.get(
+                        "enabled", desired.get("enabled", True),
+                    )
+                    if "granted_scopes" in prior:
+                        grants = normalize_mcp_scope_grants(
+                            capability,
+                            prior.get("granted_scopes") or (),
+                        )
+                        desired["granted_scopes"] = list(grants)
+                        if "command" in desired:
+                            args = ["-m", "hermes_cli.ios_mcp_server"]
+                            for scope in grants:
+                                args.extend(["--grant-scope", scope])
+                            args.append(capability)
+                            desired["args"] = args
+                if prior != desired:
+                    target_servers[capability] = desired
+                    changed = True
+            if changed:
+                target_config["mcp_servers"] = target_servers
+                token = set_hermes_home_override(str(profile_dir))
+                try:
+                    config_module.save_config(target_config)
+                finally:
+                    reset_hermes_home_override(token)
+            return
 
         token = set_hermes_home_override(str(profile_dir))
         try:
@@ -1191,6 +1263,13 @@ def create_profile(
             )
         except Exception:
             pass  # non-fatal — user can describe later with `hermes profile describe`
+
+    # Install the managed iOS MCP fleet before returning the new profile.  A
+    # profile can be selected by a multiplexed gateway immediately after this
+    # function returns, so waiting for a later profile switch/startup leaves a
+    # window where ordinary chats cannot discover the managed tools.  The
+    # helper is idempotent and preserves explicit enabled/scope overrides.
+    _install_managed_ios_mcp_for_profile(profile_dir)
 
     # Phase 4: when running inside a container under s6, register the
     # new profile's gateway as a runtime s6 service so

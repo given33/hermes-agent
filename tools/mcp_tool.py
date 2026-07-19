@@ -92,6 +92,7 @@ Thread safety:
 import asyncio
 import contextvars
 import concurrent.futures
+import functools
 import inspect
 import json
 import logging
@@ -1696,7 +1697,8 @@ class MCPServerTask:
         "_lifecycle_started_at", "_last_tool_call_at",
         "_idle_timeout_seconds", "_max_lifetime_seconds", "_recycled_reason",
         "initialize_result", "_ping_unsupported",
-        "_reconnect_retries",
+        "_reconnect_retries", "_accepting_calls",
+        "_call_state_lock", "_inflight_calls", "_inflight_zero",
     )
 
     def __init__(self, name: str):
@@ -1728,6 +1730,20 @@ class MCPServerTask:
         # client-initiated RPCs per server. The lock is also applied to HTTP
         # transports for conservative per-server ordering.
         self._rpc_lock = asyncio.Lock()
+        # Blue-green replacement marks the old task non-accepting before it
+        # waits for the RPC gate. Existing handlers already holding a server
+        # reference are allowed to finish; new lookups fail closed instead of
+        # starting work on a connection that is about to be retired.
+        self._accepting_calls = True
+        # Routing happens on caller threads while the actual RPC is queued on
+        # the dedicated MCP loop. A plain asyncio lock cannot cover the gap
+        # between those two operations. This thread-safe lease count does:
+        # blue-green cutover atomically stops new leases, publishes green, and
+        # then waits for every pre-cutover lease before closing blue.
+        self._call_state_lock = threading.Lock()
+        self._inflight_calls = 0
+        self._inflight_zero = threading.Event()
+        self._inflight_zero.set()
         self._pending_refresh_tasks: set[asyncio.Task] = set()
         # contextvars snapshot of the agent task that's currently in
         # session.call_tool(). The MCP recv loop dispatches incoming
@@ -1789,6 +1805,42 @@ class MCPServerTask:
     def mark_tool_call(self) -> None:
         """Record that a user-visible MCP operation is starting."""
         self._last_tool_call_at = time.monotonic()
+
+    @property
+    def accepting_calls(self) -> bool:
+        """Whether this task may receive newly-dispatched RPCs."""
+        with self._call_state_lock:
+            return bool(self._accepting_calls)
+
+    def try_acquire_call(self) -> bool:
+        """Atomically claim this task for one user-visible operation."""
+        with self._call_state_lock:
+            if not self._accepting_calls:
+                return False
+            self._inflight_calls += 1
+            if self._inflight_calls == 1:
+                self._inflight_zero.clear()
+            return True
+
+    def release_call(self) -> None:
+        """Release a lease obtained by :meth:`try_acquire_call`."""
+        with self._call_state_lock:
+            if self._inflight_calls <= 0:
+                logger.error("MCP server '%s': unbalanced call lease", self.name)
+                return
+            self._inflight_calls -= 1
+            if self._inflight_calls == 0:
+                self._inflight_zero.set()
+
+    def begin_drain(self) -> None:
+        """Stop new dispatches while preserving already-started RPCs.
+
+        This method is synchronous because the registry lookup happens from
+        worker threads. The actual transport teardown remains on the MCP
+        event loop and waits for ``_rpc_lock`` in :meth:`shutdown`.
+        """
+        with self._call_state_lock:
+            self._accepting_calls = False
 
     def _mark_lifecycle_started(self) -> None:
         now = time.monotonic()
@@ -3065,23 +3117,51 @@ class MCPServerTask:
         if self._error:
             raise self._error
 
-    async def shutdown(self):
-        """Signal the Task to exit and wait for clean resource teardown."""
+    async def shutdown(self, *, drain_timeout: Optional[float] = None):
+        """Drain in-flight RPCs, then signal the task to exit.
+
+        ``drain_timeout`` is opt-in. The previous fixed 30-second wait could
+        cancel a legitimate MCP call whose configured timeout is 60 seconds
+        (or longer), after which blue-green cutover terminated the endpoint
+        while that call was still using it. An unbounded default is
+        intentionally fail-closed: if a call never releases the gate, the
+        upgrade remains on the old process instead of interrupting user work.
+        """
+        self.begin_drain()
+        # A handler can select this task on a caller thread before its
+        # coroutine reaches ``_rpc_lock``. Wait for those routing leases as
+        # well as the asyncio lock so teardown cannot overtake a queued call.
+        if not self._inflight_zero.is_set():
+            wait_for_leases = asyncio.to_thread(self._inflight_zero.wait)
+            if drain_timeout is None:
+                await wait_for_leases
+            else:
+                await asyncio.wait_for(
+                    wait_for_leases,
+                    timeout=max(0.0, float(drain_timeout)),
+                )
+        # A blue-green reload must not tear down a session while a tool call is
+        # using its JSON-RPC stream. Always acquire the gate, even when it was
+        # unlocked at the initial check: begin_drain() prevents new lookups,
+        # while a handler that already captured this task may still be queued.
+        if drain_timeout is None:
+            await self._wait_for_rpc_drain()
+        else:
+            await asyncio.wait_for(
+                self._wait_for_rpc_drain(),
+                timeout=max(0.0, float(drain_timeout)),
+            )
+        # Only signal transport teardown after the RPC gate is clear. Setting
+        # this event earlier lets the background run() coroutine close its
+        # async transport while a call still owns the stream, defeating the
+        # drain guarantee even if we await the lock here.
         self._shutdown_event.set()
         # Defensive: if _wait_for_lifecycle_event is blocking, we need ANY
         # event to unblock it. _shutdown_event alone is sufficient (the
         # helper checks shutdown first), but setting reconnect too ensures
-        # there's no race where the helper misses the shutdown flag after
+        # there is no race where the helper misses the shutdown flag after
         # returning "reconnect".
         self._reconnect_event.set()
-        # A blue-green reload must not tear down a session while a tool call is
-        # using its JSON-RPC stream. Wait for the per-server RPC gate to drain;
-        # this is the in-flight counter for both stdio and HTTP transports.
-        if self._rpc_lock.locked():
-            try:
-                await asyncio.wait_for(self._wait_for_rpc_drain(), timeout=30)
-            except asyncio.TimeoutError:
-                logger.warning("MCP server '%s' RPC drain timed out", self.name)
         if self._task and not self._task.done():
             try:
                 await asyncio.wait_for(self._task, timeout=10)
@@ -3118,9 +3198,16 @@ class MCPServerTask:
         """
         from tools.registry import registry
 
-        for tool_name in list(getattr(self, "_registered_tool_names", [])):
-            registry.deregister(tool_name)
-            _forget_mcp_tool_server(tool_name)
+        # A retired blue task may finish after its green replacement has
+        # registered the same tool names. Only the task currently published in
+        # the server map owns global registry cleanup.
+        with _lock:
+            current = _servers.get(self.name)
+            owns_registry = current is None or current is self
+        if owns_registry:
+            for tool_name in list(getattr(self, "_registered_tool_names", [])):
+                registry.deregister(tool_name)
+                _forget_mcp_tool_server(tool_name)
         self._registered_tool_names = []
 
     async def _wait_for_lazy_reconnect(self) -> None:
@@ -3626,7 +3713,7 @@ _mcp_thread: Optional[threading.Thread] = None
 
 # Protects _mcp_loop, _mcp_thread, _servers, MCP connection status maps,
 # _parallel_safe_servers, _mcp_tool_server_names, and _stdio_pids.
-_lock = threading.Lock()
+_lock = threading.RLock()
 
 # PIDs of stdio MCP server subprocesses.  Tracked so we can force-kill
 # them on shutdown if the graceful cleanup (SDK context-manager teardown)
@@ -3794,7 +3881,7 @@ def _wrap_with_home_override(coro: "Coroutine") -> "Coroutine":
     return _scoped()
 
 
-def _run_on_mcp_loop(coro_or_factory, timeout: float = 30):
+def _run_on_mcp_loop(coro_or_factory, timeout: Optional[float] = 30):
     """Schedule a coroutine on the MCP event loop and block until done.
 
     Accepts either a coroutine object or a zero-arg callable that returns one.
@@ -4022,14 +4109,52 @@ def _request_lazy_reconnect(server_name: str, server: MCPServerTask) -> bool:
 
 
 def _get_connected_server_for_call(server_name: str) -> Optional[MCPServerTask]:
-    """Return a connected server, lazily reconnecting recycled stdio state."""
+    """Claim the current server, lazily reconnecting recycled stdio state.
+
+    The returned task owns one routing lease. Callers must invoke
+    :func:`_release_server_call` exactly once after the complete operation,
+    including any retry path.
+    """
     with _lock:
         server = _servers.get(server_name)
     if server is not None and server.session is None and server._is_recycled_stdio():
         _request_lazy_reconnect(server_name, server)
-        with _lock:
-            server = _servers.get(server_name)
-    return server
+    with _lock:
+        server = _servers.get(server_name)
+        if server is None:
+            return None
+        acquire = getattr(server, "try_acquire_call", None)
+        if callable(acquire) and not acquire():
+            return None
+        if not callable(acquire) and not getattr(server, "accepting_calls", True):
+            return None
+        return server
+
+
+def _release_server_call(server: Any) -> None:
+    """Release a routing lease when supported by the server task."""
+    release = getattr(server, "release_call", None)
+    if callable(release):
+        release()
+
+
+def _lease_server_call_handler(server_name: str, handler: Callable):
+    """Wrap one MCP handler in an atomic server-routing lease."""
+
+    @functools.wraps(handler)
+    def _leased(args: dict, **kwargs) -> str:
+        server = _get_connected_server_for_call(server_name)
+        if server is None:
+            _bump_server_error(server_name)
+            return json.dumps({
+                "error": f"MCP server '{server_name}' is not connected"
+            }, ensure_ascii=False)
+        try:
+            return handler(server, args, **kwargs)
+        finally:
+            _release_server_call(server)
+
+    return _leased
 
 
 def _mark_server_call_started(server: Any) -> None:
@@ -4046,7 +4171,7 @@ def _make_tool_handler(server_name: str, tool_name: str, tool_timeout: float):
     ``handler(args_dict, **kwargs) -> str``
     """
 
-    def _handler(args: dict, **kwargs) -> str:
+    def _handler(server: MCPServerTask, args: dict, **kwargs) -> str:
         # Circuit breaker: if this server has failed too many times
         # consecutively, short-circuit with a clear message so the model
         # stops retrying and uses alternative approaches (#10447).
@@ -4072,13 +4197,6 @@ def _make_tool_handler(server_name: str, tool_name: str, tool_timeout: float):
                     )
                 }, ensure_ascii=False)
             # Cooldown elapsed → fall through as a half-open probe.
-
-        server = _get_connected_server_for_call(server_name)
-        if not server:
-            _bump_server_error(server_name)
-            return json.dumps({
-                "error": f"MCP server '{server_name}' is not connected"
-            }, ensure_ascii=False)
 
         if not server.session:
             # No live session. A reconnect may already be completing (the
@@ -4257,15 +4375,14 @@ def _make_tool_handler(server_name: str, tool_name: str, tool_timeout: float):
                 )
             }, ensure_ascii=False)
 
-    return _handler
+    return _lease_server_call_handler(server_name, _handler)
 
 
 def _make_list_resources_handler(server_name: str, tool_timeout: float):
     """Return a sync handler that lists resources from an MCP server."""
 
-    def _handler(args: dict, **kwargs) -> str:
-        server = _get_connected_server_for_call(server_name)
-        if not server or not server.session:
+    def _handler(server: MCPServerTask, args: dict, **kwargs) -> str:
+        if not server.session:
             return json.dumps({
                 "error": f"MCP server '{server_name}' is not connected"
             }, ensure_ascii=False)
@@ -4315,17 +4432,16 @@ def _make_list_resources_handler(server_name: str, tool_timeout: float):
                 )
             }, ensure_ascii=False)
 
-    return _handler
+    return _lease_server_call_handler(server_name, _handler)
 
 
 def _make_read_resource_handler(server_name: str, tool_timeout: float):
     """Return a sync handler that reads a resource by URI from an MCP server."""
 
-    def _handler(args: dict, **kwargs) -> str:
+    def _handler(server: MCPServerTask, args: dict, **kwargs) -> str:
         from tools.registry import tool_error
 
-        server = _get_connected_server_for_call(server_name)
-        if not server or not server.session:
+        if not server.session:
             return json.dumps({
                 "error": f"MCP server '{server_name}' is not connected"
             }, ensure_ascii=False)
@@ -4382,15 +4498,14 @@ def _make_read_resource_handler(server_name: str, tool_timeout: float):
                 )
             }, ensure_ascii=False)
 
-    return _handler
+    return _lease_server_call_handler(server_name, _handler)
 
 
 def _make_list_prompts_handler(server_name: str, tool_timeout: float):
     """Return a sync handler that lists prompts from an MCP server."""
 
-    def _handler(args: dict, **kwargs) -> str:
-        server = _get_connected_server_for_call(server_name)
-        if not server or not server.session:
+    def _handler(server: MCPServerTask, args: dict, **kwargs) -> str:
+        if not server.session:
             return json.dumps({
                 "error": f"MCP server '{server_name}' is not connected"
             }, ensure_ascii=False)
@@ -4445,17 +4560,16 @@ def _make_list_prompts_handler(server_name: str, tool_timeout: float):
                 )
             }, ensure_ascii=False)
 
-    return _handler
+    return _lease_server_call_handler(server_name, _handler)
 
 
 def _make_get_prompt_handler(server_name: str, tool_timeout: float):
     """Return a sync handler that gets a prompt by name from an MCP server."""
 
-    def _handler(args: dict, **kwargs) -> str:
+    def _handler(server: MCPServerTask, args: dict, **kwargs) -> str:
         from tools.registry import tool_error
 
-        server = _get_connected_server_for_call(server_name)
-        if not server or not server.session:
+        if not server.session:
             return json.dumps({
                 "error": f"MCP server '{server_name}' is not connected"
             }, ensure_ascii=False)
@@ -4516,7 +4630,7 @@ def _make_get_prompt_handler(server_name: str, tool_timeout: float):
                 )
             }, ensure_ascii=False)
 
-    return _handler
+    return _lease_server_call_handler(server_name, _handler)
 
 
 def _make_check_fn(server_name: str):
@@ -4527,6 +4641,7 @@ def _make_check_fn(server_name: str):
             server = _servers.get(server_name)
         return (
             server is not None
+            and getattr(server, "accepting_calls", True)
             and (server.session is not None or server._is_recycled_stdio())
         )
 
@@ -5144,27 +5259,102 @@ def register_mcp_servers(servers: Dict[str, dict]) -> List[str]:
     def _fingerprint(config: dict) -> str:
         return json.dumps(config, sort_keys=True, separators=(",", ":"), default=str)
 
-    # An endpoint/transport change must replace the old MCPServerTask. Existing
-    # chats otherwise keep the old URL after a blue-green cutover.
+    # An endpoint/transport change must replace the old MCPServerTask. Prepare
+    # every green connection first, then publish it atomically while blue is
+    # marked draining. New calls route to green immediately; calls that
+    # claimed blue before the swap retain a lease and finish before teardown.
     with _lock:
         changed_names = [
             name for name, config in servers.items()
-            if name in _servers and _server_config_fingerprints.get(name) != _fingerprint(config)
+            if name in _servers
+            and (
+                _server_config_fingerprints.get(name) != _fingerprint(config)
+                or not getattr(_servers[name], "accepting_calls", True)
+            )
         ]
+        changed_old = {name: _servers[name] for name in changed_names}
     if changed_names:
         _ensure_mcp_loop()
 
         async def _reload_changed() -> None:
-            with _lock:
-                old = [_servers[name] for name in changed_names if name in _servers]
-            await asyncio.gather(*(server.shutdown() for server in old), return_exceptions=True)
-            with _lock:
-                for name in changed_names:
-                    _servers.pop(name, None)
-                    _server_config_fingerprints.pop(name, None)
+            from tools.registry import registry
+
+            semaphore = asyncio.Semaphore(_MAX_PARALLEL_DISCOVERY)
+
+            async def _prepare(name: str, config: dict) -> MCPServerTask:
+                async with semaphore:
+                    connect_timeout = config.get(
+                        "connect_timeout", _DEFAULT_CONNECT_TIMEOUT,
+                    )
+                    return await asyncio.wait_for(
+                        _connect_server(name, config),
+                        timeout=connect_timeout,
+                    )
+
+            results = await asyncio.gather(
+                *(_prepare(name, servers[name]) for name in changed_names),
+                return_exceptions=True,
+            )
+            retired: list[MCPServerTask] = []
+            unused: list[MCPServerTask] = []
+            for name, result in zip(changed_names, results):
+                if isinstance(result, BaseException):
+                    with _lock:
+                        _server_connect_errors[name] = _format_connect_error(result)
+                    logger.warning(
+                        "Failed to prepare replacement MCP server '%s': %s",
+                        name,
+                        _format_connect_error(result),
+                    )
+                    continue
+
+                replacement = result
+                old = changed_old[name]
+                config = servers[name]
+                fingerprint = _fingerprint(config)
+                with _lock:
+                    current = _servers.get(name)
+                    if current is not old:
+                        # A concurrent refresh won ownership. Never overwrite
+                        # that newer generation with this stale preparation.
+                        unused.append(replacement)
+                        continue
+
+                    old.begin_drain()
+                    old_tool_names = set(
+                        getattr(old, "_registered_tool_names", ())
+                    )
+                    registered_names = _register_server_tools(
+                        name, replacement, config,
+                    )
+                    replacement._registered_tool_names = list(registered_names)
+                    for stale_name in old_tool_names - set(registered_names):
+                        registry.deregister(stale_name)
+                        _forget_mcp_tool_server(stale_name)
+                    _servers[name] = replacement
+                    _server_config_fingerprints[name] = fingerprint
+                    _server_connect_errors.pop(name, None)
+                    _server_connecting.discard(name)
+                    retired.append(old)
+
+                logger.info(
+                    "MCP server '%s': routed new calls to replacement with %d tool(s)",
+                    name,
+                    len(replacement._registered_tool_names),
+                )
+
+            # Do not impose a fixed timeout: configured MCP call deadlines may
+            # exceed 30 seconds. New calls already use green while this waits.
+            cleanup = [*(server.shutdown() for server in retired),
+                       *(server.shutdown() for server in unused)]
+            if cleanup:
+                outcomes = await asyncio.gather(*cleanup, return_exceptions=True)
+                for outcome in outcomes:
+                    if isinstance(outcome, BaseException):
+                        logger.warning("Retired MCP client cleanup failed: %s", outcome)
 
         try:
-            _run_on_mcp_loop(_reload_changed, timeout=30)
+            _run_on_mcp_loop(_reload_changed, timeout=None)
         except Exception:
             logger.exception("MCP configuration reload failed")
 

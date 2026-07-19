@@ -46,6 +46,7 @@ from hermes_cli.profiles import (
     profiles_to_serve,
 )
 from hermes_cli.config import DEFAULT_CONFIG
+from hermes_cli.ios_mcp_server import CAPABILITIES as IOS_MCP_CAPABILITIES
 
 
 # ---------------------------------------------------------------------------
@@ -170,6 +171,67 @@ class TestCreateProfile:
                         "plans", "workspace", "cron"]:
             assert (profile_dir / subdir).is_dir(), f"Missing subdir: {subdir}"
 
+    def test_create_installs_managed_mcp_before_return(self, profile_env, monkeypatch):
+        """A newly-created profile is immediately discoverable by the MCP fleet."""
+        calls = []
+        monkeypatch.setattr(
+            profiles,
+            "_install_managed_ios_mcp_for_profile",
+            lambda path: calls.append(path),
+        )
+
+        profile_dir = create_profile("coder", no_alias=True)
+
+        assert calls == [profile_dir]
+
+    def test_managed_mcp_install_copies_runtime_endpoints_and_keeps_overrides(
+        self,
+        profile_env,
+    ):
+        from hermes_cli.ios_mcp_server import CAPABILITIES, merge_ios_mcp_servers
+
+        default_home = profile_env / ".hermes"
+        source, _ = merge_ios_mcp_servers(
+            {},
+            transport="streamable-http",
+            host="127.0.0.1",
+            base_port=9500,
+        )
+        (default_home / "config.yaml").write_text(
+            yaml.safe_dump(source, sort_keys=False),
+            encoding="utf-8",
+        )
+        profile_dir = default_home / "profiles" / "coder"
+        profile_dir.mkdir(parents=True)
+        (profile_dir / "config.yaml").write_text(
+            yaml.safe_dump({
+                "mcp_servers": {
+                    "ios-power": {
+                        "enabled": False,
+                        "granted_scopes": [],
+                    },
+                    "custom": {"enabled": True, "url": "https://custom.invalid/mcp"},
+                },
+            }, sort_keys=False),
+            encoding="utf-8",
+        )
+
+        profiles._install_managed_ios_mcp_for_profile(profile_dir)
+
+        result = yaml.safe_load((profile_dir / "config.yaml").read_text(encoding="utf-8"))
+        servers = result["mcp_servers"]
+        assert set(CAPABILITIES).issubset(servers)
+        assert all("url" in servers[name] and "command" not in servers[name] for name in CAPABILITIES)
+        assert servers["ios-power"]["enabled"] is False
+        assert servers["ios-power"]["granted_scopes"] == []
+        assert servers["custom"]["url"] == "https://custom.invalid/mcp"
+
+        # Resolving the default profile must not rewrite its HTTP fleet to the
+        # installer default (stdio).
+        profiles._install_managed_ios_mcp_for_profile(default_home)
+        root = yaml.safe_load((default_home / "config.yaml").read_text(encoding="utf-8"))
+        assert all("url" in root["mcp_servers"][name] for name in CAPABILITIES)
+
     def test_seeds_placeholder_env_file(self, profile_env):
         """Fresh profiles get their own .env (owner-only) so channel/env
         writes are profile-scoped from day one instead of falling through
@@ -185,7 +247,13 @@ class TestCreateProfile:
             for line in content.splitlines()
         )
         mode = stat.S_IMODE(env_path.stat().st_mode)
-        assert mode == 0o600
+        if os.name == "posix":
+            assert mode == 0o600
+        else:
+            # Windows does not expose owner/group/other ACLs through POSIX
+            # mode bits. Verify the file remains writable by its owner; the
+            # Unix permission contract is covered on Linux and macOS CI.
+            assert mode & stat.S_IWUSR
 
     def test_seeded_env_does_not_clobber_cloned_env(self, profile_env):
         tmp_path = profile_env
@@ -217,7 +285,9 @@ class TestCreateProfile:
 
         profile_dir = create_profile("coder", clone_config=True, no_alias=True)
 
-        cloned_config = yaml.safe_load((profile_dir / "config.yaml").read_text())
+        cloned_config = yaml.safe_load(
+            (profile_dir / "config.yaml").read_text(encoding="utf-8")
+        )
         assert cloned_config["_config_version"] == DEFAULT_CONFIG["_config_version"]
         assert cloned_config["model"] == "test"
         assert (profile_dir / ".env").read_text().strip() == "KEY=val"
@@ -232,7 +302,9 @@ class TestCreateProfile:
         )
 
         profile_dir = create_profile("coder", clone_config=True, no_alias=True)
-        cloned_config = yaml.safe_load((profile_dir / "config.yaml").read_text())
+        cloned_config = yaml.safe_load(
+            (profile_dir / "config.yaml").read_text(encoding="utf-8")
+        )
 
         assert cloned_config["_config_version"] == DEFAULT_CONFIG["_config_version"]
         assert cloned_config["model"]["provider"] == "openrouter"
@@ -270,7 +342,11 @@ class TestCreateProfile:
 
         # Content should be copied
         assert (profile_dir / "memories" / "note.md").read_text() == "remember this"
-        assert (profile_dir / "config.yaml").read_text() == "model: gpt-4"
+        cloned_config = yaml.safe_load(
+            (profile_dir / "config.yaml").read_text(encoding="utf-8")
+        )
+        assert cloned_config["model"] == "gpt-4"
+        assert set(cloned_config["mcp_servers"]) >= set(IOS_MCP_CAPABILITIES)
         # Runtime files should be stripped
         assert not (profile_dir / "gateway.pid").exists()
         assert not (profile_dir / "gateway_state.json").exists()
@@ -343,7 +419,11 @@ class TestCreateProfile:
         assert not (profile_dir / "skills" / "my-skill" / "module.pyo").exists()
         # All profile data must be present
         assert (profile_dir / "skills" / "my-skill" / "SKILL.md").read_text() == "skill"
-        assert (profile_dir / "config.yaml").read_text() == "model: gpt-4"
+        cloned_config = yaml.safe_load(
+            (profile_dir / "config.yaml").read_text(encoding="utf-8")
+        )
+        assert cloned_config["model"] == "gpt-4"
+        assert set(cloned_config["mcp_servers"]) >= set(IOS_MCP_CAPABILITIES)
         assert (profile_dir / ".env").read_text() == "KEY=val"
         assert (profile_dir / "logs" / "gateway.log").read_text() == "log"
 
@@ -374,8 +454,18 @@ class TestCreateProfile:
             "state.db", "state.db-wal", "state.db-shm",
             "sessions", "backups", "state-snapshots", "checkpoints",
         ):
-            assert not (profile_dir / history).exists(), history
-        assert (profile_dir / "config.yaml").read_text() == "model: gpt-4"
+            if history == "sessions":
+                # Installing the managed MCP fleet initializes the normal
+                # profile directory skeleton. The source session data must
+                # still be absent from the fresh profile.
+                assert not (profile_dir / history / "20260101_old").exists()
+            else:
+                assert not (profile_dir / history).exists(), history
+        cloned_config = yaml.safe_load(
+            (profile_dir / "config.yaml").read_text(encoding="utf-8")
+        )
+        assert cloned_config["model"] == "gpt-4"
+        assert set(cloned_config["mcp_servers"]) >= set(IOS_MCP_CAPABILITIES)
         # Root-only: nested same-name dirs survive
         assert (profile_dir / "workspace" / "backups" / "user-data.txt").read_text() == "mine"
 
@@ -383,7 +473,10 @@ class TestCreateProfile:
         """Clone config gracefully skips files that don't exist in source."""
         profile_dir = create_profile("coder", clone_config=True, no_alias=True)
         # No error; optional files just not copied
-        assert not (profile_dir / "config.yaml").exists()
+        config = yaml.safe_load(
+            (profile_dir / "config.yaml").read_text(encoding="utf-8")
+        )
+        assert set(config["mcp_servers"]) >= set(IOS_MCP_CAPABILITIES)
         # .env is always seeded (placeholder) so the profile has its own
         # credentials file even when the clone source lacked one.
         assert (profile_dir / ".env").exists()
@@ -525,7 +618,11 @@ class TestBackfillProfileEnvs:
         assert sorted(backfilled) == ["old1", "old2"]
         for p in (p1, p2):
             assert (p / ".env").read_text() == "OPENROUTER_API_KEY=root-key\n"
-            assert stat.S_IMODE((p / ".env").stat().st_mode) == 0o600
+            mode = stat.S_IMODE((p / ".env").stat().st_mode)
+            if os.name == "posix":
+                assert mode == 0o600
+            else:
+                assert mode & stat.S_IWUSR
 
     def test_never_overwrites_existing_profile_env(self, profile_env):
         tmp_path = profile_env
@@ -1451,7 +1548,12 @@ class TestExportImport:
         # following and crashing.
         broken_dir = default_dir / "skills" / "with-broken-links"
         broken_dir.mkdir(parents=True)
-        (broken_dir / "broken_link").symlink_to("/nonexistent/path")
+        try:
+            (broken_dir / "broken_link").symlink_to("/nonexistent/path")
+        except OSError as exc:
+            if os.name == "nt" and getattr(exc, "winerror", None) == 1314:
+                pytest.skip("Windows developer mode or symlink privilege is required")
+            raise
         # Valid symlink for comparison
         (broken_dir / "valid_target.txt").write_text("real data")
         (broken_dir / "valid_link").symlink_to(
@@ -1850,7 +1952,9 @@ class TestEdgeCases:
         target_dir = create_profile(
             "target", clone_from="source", clone_config=True, no_alias=True,
         )
-        cloned_config = yaml.safe_load((target_dir / "config.yaml").read_text())
+        cloned_config = yaml.safe_load(
+            (target_dir / "config.yaml").read_text(encoding="utf-8")
+        )
         assert cloned_config["_config_version"] == DEFAULT_CONFIG["_config_version"]
         assert cloned_config["model"] == "cloned"
         assert (target_dir / ".env").read_text().strip() == "SECRET=yes"

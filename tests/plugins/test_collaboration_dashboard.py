@@ -30,6 +30,13 @@ def load_module():
 
 
 class CollaborationDashboardTests(unittest.TestCase):
+    def test_short_chinese_greeting_keeps_its_first_character_in_title(self):
+        module = load_module()
+
+        self.assertEqual(module.summarize_task_title("你好"), "你好")
+        self.assertEqual(module.summarize_task_title("你好吗"), "你好吗")
+        self.assertEqual(module.summarize_task_title("你帮我检查服务"), "检查服务")
+
     def test_profile_toolsets_connect_mcp_before_resolving_agent_snapshot(self):
         module = load_module()
         calls = []

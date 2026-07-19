@@ -219,6 +219,69 @@ def test_disabled_motion_mcp_is_removed_from_behavior_prediction(tmp_path):
     assert behavior["suppress_weather_query"] is True
 
 
+def test_disabled_context_mcps_are_removed_from_behavior_prediction(tmp_path):
+    store = IOSIntelligenceStore(tmp_path)
+    now = 1_800_000_000
+    store.record_snapshot(
+        "alice",
+        "calendar",
+        {"title": "今天休息", "start": now, "end": now + 3600},
+        observed_at=now,
+    )
+    store.record_snapshot(
+        "alice",
+        "power",
+        {"battery_level": 0.08},
+        observed_at=now,
+    )
+    store.record_snapshot(
+        "alice",
+        "screen-time",
+        {"total_minutes": 300},
+        observed_at=now,
+    )
+    store.record_snapshot(
+        "alice",
+        "motion",
+        {"state": "walking"},
+        observed_at=now,
+    )
+    supervisor = SimpleNamespace(
+        statuses=lambda: [
+            {"name": "ios-calendar", "state": "DISABLED"},
+            {"name": "ios-power", "state": "QUARANTINED"},
+            {"name": "ios-screen-time", "state": "DISABLED"},
+            {"name": "ios-motion", "state": "RUNNING"},
+        ],
+    )
+    scheduler = IOSIntelligenceScheduler(
+        store=store,
+        config={
+            "ios_intelligence": {
+                "weather": {"enabled": False},
+                "semantic": {"enabled": False},
+            },
+        },
+        supervisor=supervisor,
+    )
+
+    result = scheduler.evaluate_account("alice", now=now)
+    behavior = result["behavior"]
+
+    assert behavior["feature_weights"]["ios-calendar"] == 0.0
+    assert behavior["feature_weights"]["ios-power"] == 0.2
+    assert behavior["feature_weights"]["ios-screen-time"] == 0.0
+    assert behavior["calendar_weight"] == 0.0
+    assert behavior["calendar_context"]["is_holiday"] is False
+    # QUARANTINED is weight 0.2 (>0) so power stays annotated; DISABLED screen-time is excluded.
+    assert behavior["context_features"]["power"]["feature_weight"] == 0.2
+    assert behavior["context_features"]["power"]["capability"] == "ios-power"
+    assert "screen_time" not in behavior["context_features"]
+    assert "screen_time" in behavior["excluded_context_features"]
+    assert behavior["motion_weight"] == 1.0
+    assert behavior["leave_probability"] >= 0.9
+
+
 def test_cleanup_only_cycle_retries_deletions_without_prediction_or_weather(monkeypatch):
     calls: list[str] = []
 
@@ -383,6 +446,27 @@ def test_scheduler_suppresses_stationary_indoor_account_without_weather(tmp_path
     assert weather.calls == []
 
 
+def test_scheduler_does_not_query_weather_when_current_place_is_unknown(tmp_path):
+    store = IOSIntelligenceStore(tmp_path)
+    now = 1_784_313_600
+    store.record_snapshot(
+        "alice",
+        "location",
+        {"latitude": 24.9, "longitude": 118.6},
+        observed_at=now,
+    )
+    weather = FakeWeather("2026-07-18T10:10:00+08:00")
+    scheduler = IOSIntelligenceScheduler(store=store, qweather=weather, clock=lambda: now)
+
+    result = scheduler.evaluate_account("alice", force=False, now=now)
+
+    assert result["behavior"]["current_place"] is None
+    assert result["behavior"]["leave_probability"] == 0.15
+    assert result["weather_queried"] is False
+    assert result["suppressed_reason"] == "low_leave_probability"
+    assert weather.calls == []
+
+
 def test_predicted_departure_command_matches_native_timestamp_contract(tmp_path):
     store = IOSIntelligenceStore(tmp_path)
     scheduler = IOSIntelligenceScheduler(store=store)
@@ -520,6 +604,10 @@ def test_future_weather_notification_does_not_bypass_not_before(tmp_path):
         {"event_types": ["precipitation"]},
         now,
     )
+    alert_payload = store.active_forecast("alice", now=now)[0]["data"]
+    assert "destination_name" not in alert_payload
+    assert "destination_place_id" not in alert_payload
+    assert "expected_departure_at" not in alert_payload
 
     assert result["state"] == "pending"
     assert delivered == []

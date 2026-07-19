@@ -5616,6 +5616,40 @@ def get_custom_model(profile: Optional[str] = None):
     }
 
 
+@app.get("/api/model/credentials")
+def get_model_credentials(profile: Optional[str] = None):
+    """Return masked metadata for credentials created by the model editor."""
+    current = get_custom_model(profile)
+    if not current.get("api_key_configured"):
+        return {"credentials": []}
+    return {
+        "credentials": [{
+            "id": "custom-main",
+            "provider": str(current.get("provider") or "custom"),
+            "model": str(current.get("model") or ""),
+            "base_url": str(current.get("base_url") or ""),
+            "masked_value": str(current.get("api_key_preview") or "********"),
+        }],
+    }
+
+
+@app.delete("/api/model/credentials/{credential_id}")
+def delete_model_credential(credential_id: str, profile: Optional[str] = None):
+    if credential_id != "custom-main":
+        raise HTTPException(status_code=404, detail="Model credential not found")
+    with _profile_scope(profile):
+        cfg = load_config()
+        model_cfg = cfg.get("model") if isinstance(cfg, dict) else None
+        if not isinstance(model_cfg, dict):
+            raise HTTPException(status_code=404, detail="Model credential not found")
+        removed = bool(model_cfg.get("api_key") or model_cfg.get("api"))
+        model_cfg.pop("api_key", None)
+        model_cfg.pop("api", None)
+        cfg["model"] = model_cfg
+        save_config(cfg)
+    return {"ok": True, "removed": removed}
+
+
 @app.put("/api/model/custom")
 async def set_custom_model(
     body: CustomModelConfiguration,

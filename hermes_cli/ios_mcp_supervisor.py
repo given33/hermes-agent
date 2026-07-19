@@ -806,28 +806,85 @@ class IOSMCPRuntimeSupervisor:
         *,
         version: str | None = None,
     ) -> None:
-        from hermes_cli.config import read_raw_config, save_config
+        from hermes_cli import config as config_module
+        from hermes_cli.profiles import (
+            _get_default_hermes_home,
+            _get_profiles_root,
+            validate_profile_name,
+        )
+        from hermes_constants import (
+            get_config_path,
+            reset_hermes_home_override,
+            set_hermes_home_override,
+        )
+        from utils import atomic_yaml_write
 
         service = self.supervisor._name(name)
-        config = dict(read_raw_config() or {})
-        raw_servers = config.get("mcp_servers")
-        servers = dict(raw_servers) if isinstance(raw_servers, Mapping) else {}
-        entry = dict(servers.get(service) or {})
         endpoint = f"http://{self.host}:{int(port)}/mcp"
-        entry["enabled"] = entry.get("enabled", True)
-        entry["url"] = endpoint
-        manifest = dict(entry.get("manifest") or {})
-        manifest.update({
-            "endpoint": endpoint,
-            "name": service,
-            "transport": "streamable-http",
-        })
-        if version:
-            manifest["version"] = str(version)
-        entry["manifest"] = manifest
-        servers[service] = entry
-        config["mcp_servers"] = servers
-        save_config(config)
+        default_home = _get_default_hermes_home()
+        homes = [default_home]
+        profiles_root = _get_profiles_root()
+        if profiles_root.is_dir():
+            for candidate in sorted(profiles_root.iterdir(), key=lambda item: item.name):
+                if not candidate.is_dir():
+                    continue
+                try:
+                    validate_profile_name(candidate.name)
+                except ValueError:
+                    continue
+                homes.append(candidate)
+
+        updates: list[tuple[Path, dict[str, Any], dict[str, Any]]] = []
+        for home in homes:
+            token = set_hermes_home_override(str(home))
+            try:
+                config = dict(config_module.read_raw_config() or {})
+            finally:
+                reset_hermes_home_override(token)
+            raw_servers = config.get("mcp_servers")
+            if not isinstance(raw_servers, Mapping) or service not in raw_servers:
+                continue
+            servers = dict(raw_servers)
+            entry = dict(servers.get(service) or {})
+            entry["enabled"] = entry.get("enabled", True)
+            entry["url"] = endpoint
+            manifest = dict(entry.get("manifest") or {})
+            manifest.update({
+                "endpoint": endpoint,
+                "name": service,
+                "transport": "streamable-http",
+            })
+            if version:
+                manifest["version"] = str(version)
+            entry["manifest"] = manifest
+            servers[service] = entry
+            updated = dict(config)
+            updated["mcp_servers"] = servers
+            updates.append((home, config, updated))
+
+        written: list[tuple[Path, dict[str, Any]]] = []
+        try:
+            for home, original, updated in updates:
+                token = set_hermes_home_override(str(home))
+                try:
+                    config_module.save_config(updated)
+                finally:
+                    reset_hermes_home_override(token)
+                written.append((home, original))
+        except BaseException:
+            # Each individual save is atomic. Restore previously-written
+            # profiles directly so a failed later save cannot leave discovery
+            # split between blue and green endpoints.
+            for home, original in reversed(written):
+                token = set_hermes_home_override(str(home))
+                try:
+                    path = get_config_path()
+                    atomic_yaml_write(path, original)
+                    config_module._RAW_CONFIG_CACHE.pop(str(path), None)
+                    config_module._LAST_EXPANDED_CONFIG_BY_PATH.pop(str(path), None)
+                finally:
+                    reset_hermes_home_override(token)
+            raise
 
     @staticmethod
     def _chat_client_registered(name: str) -> bool:
@@ -872,12 +929,23 @@ class IOSMCPRuntimeSupervisor:
             # failures without raising. Verify the replacement directly so a
             # failed green connection cannot be mistaken for a successful
             # cutover and followed by terminating the healthy blue process.
+            expected_fingerprint = json.dumps(
+                dict(entry), sort_keys=True, separators=(",", ":"), default=str,
+            )
             with mcp_tool._lock:
                 server = mcp_tool._servers.get(name)
+                actual_fingerprint = mcp_tool._server_config_fingerprints.get(name)
+                live_config = getattr(server, "_config", None) if server else None
+                endpoint_matches = True
+                if isinstance(live_config, Mapping) and "url" in entry:
+                    endpoint_matches = live_config.get("url") == entry.get("url")
                 return bool(
                     server is not None
+                    and getattr(server, "accepting_calls", True)
                     and getattr(server, "session", None) is not None
                     and getattr(server, "_registered_tool_names", ())
+                    and actual_fingerprint == expected_fingerprint
+                    and endpoint_matches
                 )
         except Exception:
             logger.exception("MCP chat client reload failed for %s", name)

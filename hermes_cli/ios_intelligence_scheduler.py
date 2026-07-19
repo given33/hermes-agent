@@ -302,6 +302,7 @@ class IOSIntelligenceScheduler:
             owner_id,
             instant,
             feature_weights=feature_weights,
+            timezone=self.config.timezone,
         )
         behavior["feature_weights"] = feature_weights
         behavior["semantic"] = self._maybe_semantic_enrich(owner_id, behavior, instant)
@@ -1214,7 +1215,6 @@ class IOSIntelligenceScheduler:
             "valid_until": expires,
             "impact_until": window.ends_at,
             "suggestion": "请根据天气调整出行装备或路线。",
-            "destination_name": str(destination.get("name") or "目的地"),
         }
         if expires <= now:
             self._expire_stale_weather(owner_id, now)

@@ -466,6 +466,48 @@ def _distance_meters(latitude_a: float, longitude_a: float, latitude_b: float, l
     return radius * 2 * math.atan2(math.sqrt(value), math.sqrt(max(0.0, 1 - value)))
 
 
+# Map behavior snapshot kinds / logical features onto the MCP capability that
+# owns them. When that capability is DISABLED/QUARANTINED the scheduler passes a
+# reduced weight so evaluate_behavior stops treating the stale snapshot as truth.
+_FEATURE_WEIGHT_CAPABILITY_BY_KIND = {
+    "motion": "ios-motion",
+    "power": "ios-power",
+    "health-sleep": "ios-health-sleep",
+    "health-heart": "ios-health-heart",
+    "health-oxygen": "ios-health-oxygen",
+    "health-activity": "ios-health-activity",
+    "screen-time": "ios-screen-time",
+    "device": "ios-device",
+    "watch": "ios-watch",
+    "reminder": "ios-reminders",
+    "calendar": "ios-calendar",
+}
+
+_CONTEXT_FEATURE_KINDS = {
+    "power": "power",
+    "sleep": "health-sleep",
+    "heart": "health-heart",
+    "oxygen": "health-oxygen",
+    "activity": "health-activity",
+    "screen_time": "screen-time",
+    "device": "device",
+    "watch": "watch",
+    "reminder": "reminder",
+}
+
+
+def _feature_weight(feature_weights: Mapping[str, Any] | None, capability: str) -> float:
+    """Clamp a per-MCP weight to [0, 1]; missing capabilities default to full trust."""
+
+    if not feature_weights:
+        return 1.0
+    raw = feature_weights.get(capability, 1.0)
+    try:
+        return max(0.0, min(1.0, float(raw)))
+    except (TypeError, ValueError):
+        return 1.0
+
+
 class IOSIntelligenceStore:
     """SQLite source of truth shared by the independent iOS MCP processes."""
 
@@ -980,6 +1022,17 @@ class IOSIntelligenceStore:
                     or payload.get("source_device_id")
                     or device_id
                 ) or device_id
+                # Independent devices (ones that upload under their own cursor)
+                # may only be written by themselves. Companion/watch ids that
+                # never self-uploaded may still be attributed by a relay phone.
+                if event_device_id != device_id:
+                    owns_cursor = conn.execute(
+                        "SELECT 1 FROM ios_upload_cursors "
+                        "WHERE owner_id=? AND device_id=?",
+                        (owner_id, event_device_id),
+                    ).fetchone()
+                    if owns_cursor is not None:
+                        event_device_id = device_id
                 inserted = conn.execute(
                     "INSERT OR IGNORE INTO ios_events VALUES(?,?,?,?,?,?,?)",
                     (
@@ -1345,8 +1398,10 @@ class IOSIntelligenceStore:
         owner_id = _owner(owner_id)
         tz = _timezone(timezone_name)
         now = datetime.now(tz)
-        start = int(now.replace(hour=0, minute=0, second=0, microsecond=0).timestamp())
-        end = start + 26 * 3600  # DST-safe filtering is additionally date checked below.
+        day_start = now.replace(hour=0, minute=0, second=0, microsecond=0)
+        next_day_start = day_start + timedelta(days=1)
+        start = int(day_start.timestamp())
+        end = int(next_day_start.timestamp())
         with self._connect() as conn:
             tracks = conn.execute(
                 "SELECT observed_at,latitude,longitude,horizontal_accuracy,speed,motion "
@@ -1356,8 +1411,9 @@ class IOSIntelligenceStore:
             ).fetchall()
             places = conn.execute(
                 "SELECT place_id,name,latitude,longitude,arrived_at,departed_at,indoor,payload_json "
-                "FROM ios_places WHERE owner_id=? AND arrived_at>=? AND arrived_at<? ORDER BY arrived_at",
-                (owner_id, start, end),
+                "FROM ios_places WHERE owner_id=? AND arrived_at<? "
+                "AND (departed_at IS NULL OR departed_at>?) ORDER BY arrived_at",
+                (owner_id, end, start),
             ).fetchall()
         local_date = now.date()
         track_result = []
@@ -1376,8 +1432,6 @@ class IOSIntelligenceStore:
             )
         place_result = []
         for row in places:
-            if datetime.fromtimestamp(row["arrived_at"], tz).date() != local_date:
-                continue
             item = dict(row)
             item["name"] = self._open_text(owner_id, item["name"], "ios_places.name")
             item["latitude"] = self._open_number(owner_id, item["latitude"], "ios_places.latitude")
@@ -1600,6 +1654,7 @@ class IOSIntelligenceStore:
         now: Any = None,
         *,
         feature_weights: Mapping[str, Any] | None = None,
+        timezone: str | None = None,
     ) -> dict[str, Any]:
         """Return an explainable, lightweight leave/place prediction.
 
@@ -1610,7 +1665,7 @@ class IOSIntelligenceStore:
 
         owner_id = _owner(owner_id)
         current_time = _epoch(now)
-        local_tz = _timezone(DEFAULT_TIMEZONE)
+        local_tz = _timezone(timezone or DEFAULT_TIMEZONE)
         local_now = datetime.fromtimestamp(current_time, local_tz)
         weekday = local_now.weekday()
         with self._connect() as conn:
@@ -1661,12 +1716,21 @@ class IOSIntelligenceStore:
             delta = expected_departure - current_time
             leave_probability = max(0.02, min(0.98, 0.5 - delta / 7200.0))
         elif current is None:
-            leave_probability = 0.65
-        raw_motion_weight = (feature_weights or {}).get("ios-motion", 1.0)
-        try:
-            motion_weight = max(0.0, min(1.0, float(raw_motion_weight)))
-        except (TypeError, ValueError):
-            motion_weight = 1.0
+            # A missing CLVisit means the current place is unknown, not that a
+            # departure is imminent. Motion or another learned signal may
+            # still raise this baseline below.
+            leave_probability = 0.15
+        applied_feature_weights: dict[str, float] = {}
+        for capability in sorted({
+            *_FEATURE_WEIGHT_CAPABILITY_BY_KIND.values(),
+            "ios-motion",
+            "ios-calendar",
+        }):
+            applied_feature_weights[capability] = round(
+                _feature_weight(feature_weights, capability),
+                3,
+            )
+        motion_weight = _feature_weight(feature_weights, "ios-motion")
         motion = self.latest_snapshot(owner_id, "motion")
         motion_state = str((motion or {}).get("data", {}).get("state") or "").lower()
         motion_is_moving = motion_state in {
@@ -1707,7 +1771,12 @@ class IOSIntelligenceStore:
         confidence = min(0.95, 0.25 + min(len(same_place), 14) * 0.05)
         indoor = current is not None and current["indoor"] == 1
         effective_motion_state = motion_state if motion_weight > 0.0 else ""
-        calendar_items = self.list_snapshots(owner_id, "calendar", limit=50)
+        calendar_weight = _feature_weight(feature_weights, "ios-calendar")
+        calendar_items = (
+            self.list_snapshots(owner_id, "calendar", limit=50)
+            if calendar_weight > 0.0
+            else []
+        )
         holiday_words = ("holiday", "festival", "节", "假期", "休息")
         day_start = int(local_now.replace(hour=0, minute=0, second=0, microsecond=0).timestamp())
         day_end = int((local_now.replace(hour=0, minute=0, second=0, microsecond=0) + timedelta(days=1)).timestamp())
@@ -1734,21 +1803,21 @@ class IOSIntelligenceStore:
             else "autumn" if 9 <= month <= 11
             else "winter"
         )
-        context_features = {}
-        for feature, kind in {
-            "power": "power",
-            "sleep": "health-sleep",
-            "heart": "health-heart",
-            "oxygen": "health-oxygen",
-            "activity": "health-activity",
-            "screen_time": "screen-time",
-            "device": "device",
-            "watch": "watch",
-            "reminder": "reminder",
-        }.items():
+        context_features: dict[str, Any] = {}
+        excluded_context_features: list[str] = []
+        for feature, kind in _CONTEXT_FEATURE_KINDS.items():
+            capability = _FEATURE_WEIGHT_CAPABILITY_BY_KIND.get(kind, "")
+            weight = _feature_weight(feature_weights, capability) if capability else 1.0
+            if weight <= 0.0:
+                excluded_context_features.append(feature)
+                continue
             snapshot = self.latest_snapshot(owner_id, kind)
             if snapshot is not None:
-                context_features[feature] = snapshot
+                context_features[feature] = {
+                    **snapshot,
+                    "feature_weight": round(weight, 3),
+                    "capability": capability,
+                }
         useful_feedback = 0
         for row in feedback_rows:
             payload = self._open_json(owner_id, row["payload_json"], "ios_behavior_feedback.payload_json")
@@ -1770,6 +1839,8 @@ class IOSIntelligenceStore:
             "motion_state": motion_state or None,
             "effective_motion_state": effective_motion_state or None,
             "motion_weight": round(motion_weight, 3),
+            "calendar_weight": round(calendar_weight, 3),
+            "applied_feature_weights": applied_feature_weights,
             "likely_to_leave": leave_probability >= 0.6,
             "leave_probability": round(leave_probability, 3),
             "expected_departure_at": expected_departure,
@@ -1778,6 +1849,7 @@ class IOSIntelligenceStore:
             "suppress_weather_query": bool(indoor and leave_probability < 0.6),
             "confidence": round(confidence, 3),
             "samples": len(same_place),
+            "timezone": str(local_tz.key if hasattr(local_tz, "key") else timezone or DEFAULT_TIMEZONE),
             "calendar_context": {
                 "local_hour": local_now.hour,
                 "weekday": weekday,
@@ -1785,8 +1857,10 @@ class IOSIntelligenceStore:
                 "is_holiday": bool(is_weekend or calendar_holiday),
                 "day_type": "holiday" if calendar_holiday else "weekend" if is_weekend else "weekday",
                 "season": season,
+                "calendar_weight": round(calendar_weight, 3),
             },
             "context_features": context_features,
+            "excluded_context_features": excluded_context_features,
             "notification_value": {
                 "samples": feedback_count,
                 "useful": useful_feedback,
@@ -1927,8 +2001,10 @@ class IOSIntelligenceStore:
         expired_ids: list[str] = []
         removed_forecasts: list[str] = []
         with self._connect() as conn, write_txn(conn):
+            # Never steal an in-flight 'delivering' lease: a worker mid-APNs
+            # must finish under CAS. Only reclaim after leased_until has passed.
             outbox_rows = conn.execute(
-                "SELECT id,payload_json FROM ios_notification_outbox "
+                "SELECT id,payload_json,state,leased_until FROM ios_notification_outbox "
                 "WHERE owner_id=? AND state IN ('pending','retry','delivering')",
                 (owner_id,),
             ).fetchall()
@@ -1938,6 +2014,8 @@ class IOSIntelligenceStore:
                     continue
                 if keep and str(payload.get("event_key") or "") == keep:
                     continue
+                if str(row["state"]) == "delivering" and int(row["leased_until"] or 0) > instant:
+                    continue
                 expired_ids.append(str(row["id"]))
             if expired_ids:
                 placeholders = ",".join("?" for _ in expired_ids)
@@ -1945,8 +2023,9 @@ class IOSIntelligenceStore:
                     f"UPDATE ios_notification_outbox SET state='expired',lease_token='',"
                     f"leased_until=0,updated_at=? WHERE owner_id=? "
                     f"AND state IN ('pending','retry','delivering') "
-                    f"AND id IN ({placeholders})",
-                    (instant, owner_id, *expired_ids),
+                    f"AND id IN ({placeholders}) "
+                    f"AND (state!='delivering' OR leased_until<=?)",
+                    (instant, owner_id, *expired_ids, instant),
                 )
 
             delivered_rows = conn.execute(
@@ -2019,8 +2098,8 @@ class IOSIntelligenceStore:
                 placeholders = ",".join("?" for _ in delivered_weather_ids)
                 conn.execute(
                     f"UPDATE ios_notification_outbox SET state='expired',lease_token='',"
-                    f"leased_until=0,updated_at=? WHERE owner_id=? AND state='delivered' "
-                    f"AND state IN ('delivered','retry') AND id IN ({placeholders})",
+                    f"leased_until=0,updated_at=? WHERE owner_id=? "
+                    f"AND state IN ('delivered','retry','expired') AND id IN ({placeholders})",
                     (instant, owner_id, *delivered_weather_ids),
                 )
 
@@ -2271,12 +2350,20 @@ class IOSIntelligenceStore:
         return bool(changed)
 
     @staticmethod
-    def weather_month(now: Any = None) -> str:
-        instant = datetime.fromtimestamp(_epoch(now), _timezone(DEFAULT_TIMEZONE))
+    def weather_month(now: Any = None, timezone: str | None = None) -> str:
+        instant = datetime.fromtimestamp(
+            _epoch(now),
+            _timezone(timezone or DEFAULT_TIMEZONE),
+        )
         return instant.strftime("%Y-%m")
 
-    def weather_quota_status(self, now: Any = None) -> dict[str, Any]:
-        month = self.weather_month(now)
+    def weather_quota_status(
+        self,
+        now: Any = None,
+        *,
+        timezone: str | None = None,
+    ) -> dict[str, Any]:
+        month = self.weather_month(now, timezone=timezone)
         with self._connect() as conn:
             row = conn.execute("SELECT request_count FROM ios_weather_usage WHERE month=?", (month,)).fetchone()
         count = 0 if row is None else int(row["request_count"])
@@ -2285,11 +2372,17 @@ class IOSIntelligenceStore:
             "soft_limited": count >= WEATHER_SOFT_LIMIT, "exhausted": count >= WEATHER_MONTHLY_LIMIT,
         }
 
-    def reserve_weather_requests(self, count: int = 1, now: Any = None) -> dict[str, Any]:
+    def reserve_weather_requests(
+        self,
+        count: int = 1,
+        now: Any = None,
+        *,
+        timezone: str | None = None,
+    ) -> dict[str, Any]:
         count = int(count)
         if count < 1 or count > WEATHER_MONTHLY_LIMIT:
             raise ValueError("count must be between 1 and 30000")
-        month = self.weather_month(now)
+        month = self.weather_month(now, timezone=timezone)
         timestamp = int(time.time())
         with self._connect() as conn, write_txn(conn):
             row = conn.execute("SELECT request_count FROM ios_weather_usage WHERE month=?", (month,)).fetchone()

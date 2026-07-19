@@ -356,6 +356,81 @@ def test_today_snapshot_returns_only_local_calendar_day(store):
     assert today["places"][0]["indoor"] is True
 
 
+def test_today_snapshot_includes_visit_overlapping_local_midnight(store, monkeypatch):
+    tz = ZoneInfo("Asia/Shanghai")
+    fixed_now = datetime(2026, 7, 18, 0, 6, tzinfo=tz)
+    arrived_at = int(datetime(2026, 7, 17, 23, 51, tzinfo=tz).timestamp())
+    departed_at = int(fixed_now.timestamp())
+
+    class FixedDateTime(datetime):
+        @classmethod
+        def now(cls, current_tz=None):
+            return fixed_now if current_tz is None else fixed_now.astimezone(current_tz)
+
+    store.ingest_events(
+        "alice",
+        "iphone",
+        [{
+            "event_id": "overnight-visit",
+            "kind": "place-visit",
+            "observed_at": arrived_at,
+            "payload": {
+                "place_id": "home",
+                "name": "Home",
+                "latitude": 24.9,
+                "longitude": 118.6,
+                "arrived_at": arrived_at,
+                "departed_at": departed_at,
+                "indoor": True,
+            },
+        }],
+        "1",
+    )
+    monkeypatch.setattr("hermes_cli.ios_intelligence.datetime", FixedDateTime)
+
+    today = store.today_snapshot("alice", "Asia/Shanghai")
+
+    assert today["date"] == "2026-07-18"
+    assert [(place["place_id"], place["arrived_at"], place["departed_at"]) for place in today["places"]] == [
+        ("home", arrived_at, departed_at),
+    ]
+
+
+def test_today_snapshot_excludes_visit_that_ended_at_local_midnight(store, monkeypatch):
+    tz = ZoneInfo("Asia/Shanghai")
+    fixed_now = datetime(2026, 7, 18, 0, 6, tzinfo=tz)
+    arrived_at = int(datetime(2026, 7, 17, 23, 51, tzinfo=tz).timestamp())
+    midnight = int(datetime(2026, 7, 18, 0, 0, tzinfo=tz).timestamp())
+
+    class FixedDateTime(datetime):
+        @classmethod
+        def now(cls, current_tz=None):
+            return fixed_now if current_tz is None else fixed_now.astimezone(current_tz)
+
+    store.ingest_events(
+        "alice",
+        "iphone",
+        [{
+            "event_id": "previous-day-visit",
+            "kind": "place-visit",
+            "observed_at": arrived_at,
+            "payload": {
+                "place_id": "previous-place",
+                "name": "Previous Place",
+                "latitude": 24.9,
+                "longitude": 118.6,
+                "arrived_at": arrived_at,
+                "departed_at": midnight,
+                "indoor": True,
+            },
+        }],
+        "1",
+    )
+    monkeypatch.setattr("hermes_cli.ios_intelligence.datetime", FixedDateTime)
+
+    assert store.today_snapshot("alice", "Asia/Shanghai")["places"] == []
+
+
 def test_coordinate_only_visits_cluster_into_a_stable_learned_place(store):
     now = int(datetime.now().timestamp())
     visits = [
@@ -731,6 +806,54 @@ def test_watch_source_device_is_preserved_in_the_merged_timeline(store):
     assert store.get_upload_cursor("alice", "iphone-relay") == "watch-cursor"
 
 
+def test_source_device_id_cannot_overwrite_another_self_uploading_device(store):
+    store.ingest_events(
+        "alice",
+        "device-a",
+        [{
+            "event_id": "a-location",
+            "kind": "location",
+            "observed_at": 1_700_000_000,
+            "payload": {"latitude": 24.9, "longitude": 118.6},
+        }],
+        "a-cursor",
+    )
+    store.ingest_events(
+        "alice",
+        "device-b",
+        [{
+            "event_id": "b-spoof",
+            "kind": "location",
+            "observed_at": 1_700_000_100,
+            "payload": {
+                "latitude": 1.0,
+                "longitude": 2.0,
+                "source_device_id": "device-a",
+            },
+        }],
+        "b-cursor",
+    )
+
+    # Spoof is attributed to device-b, not device-a.
+    points = store.list_trajectory_between("alice", 1_699_999_999, 1_700_000_200)
+    spoof = next(point for point in points if point["event_id"] == "b-spoof")
+    assert spoof["device_id"] == "device-b"
+    assert store.latest_snapshot("alice", "location")["device_id"] == "device-b"
+    with sqlite3.connect(store.path) as conn:
+        a_observed = conn.execute(
+            "SELECT observed_at FROM ios_snapshots "
+            "WHERE owner_id=? AND kind=? AND device_id=?",
+            ("alice", "location", "device-a"),
+        ).fetchone()[0]
+        b_observed = conn.execute(
+            "SELECT observed_at FROM ios_snapshots "
+            "WHERE owner_id=? AND kind=? AND device_id=?",
+            ("alice", "location", "device-b"),
+        ).fetchone()[0]
+    assert a_observed == 1_700_000_000
+    assert b_observed == 1_700_000_100
+
+
 def test_active_accounts_tracks_ingest_and_command_activity(store):
     store.record_snapshot("alice", "power", {"level": 0.5})
     store.queue_device_command("bob", "ios-location", "refresh")
@@ -849,6 +972,21 @@ def test_home_learning_requires_distinct_overnight_visits(store, monkeypatch):
     assert store.learn_home("alice", "Asia/Shanghai") is None
 
 
+def test_behavior_prediction_honors_configured_timezone(store):
+    # 2024-01-07 23:00 America/New_York is Sunday; Shanghai is already Monday 12:00.
+    instant = int(datetime(2024, 1, 8, 4, 0, tzinfo=ZoneInfo("UTC")).timestamp())
+    shanghai = store.evaluate_behavior("alice", instant, timezone="Asia/Shanghai")
+    new_york = store.evaluate_behavior("alice", instant, timezone="America/New_York")
+    assert shanghai["timezone"] == "Asia/Shanghai"
+    assert new_york["timezone"] == "America/New_York"
+    assert shanghai["calendar_context"]["weekday"] == 0  # Monday
+    assert new_york["calendar_context"]["weekday"] == 6  # Sunday
+    assert shanghai["calendar_context"]["is_weekend"] is False
+    assert new_york["calendar_context"]["is_weekend"] is True
+    assert store.weather_month(instant, timezone="America/New_York") == "2024-01"
+    assert store.weather_month(instant, timezone="Asia/Shanghai") == "2024-01"
+
+
 def test_behavior_prediction_uses_visits_and_motion(store):
     base = 1_700_000_000
     events = []
@@ -899,6 +1037,104 @@ def test_calendar_holiday_feature_only_uses_events_overlapping_today(store):
     holiday = store.evaluate_behavior("alice", now)
     assert holiday["calendar_context"]["is_holiday"] is True
     assert holiday["calendar_context"]["day_type"] == "holiday"
+
+
+def test_disabled_non_motion_mcp_features_are_excluded_from_behavior_prediction(store):
+    """V4 §11: unhealthy MCPs must not poison leave/calendar/context features."""
+
+    tz = ZoneInfo("Asia/Shanghai")
+    now = int(datetime(2026, 7, 20, 10, 0, tzinfo=tz).timestamp())  # Monday
+    store.record_snapshot(
+        "alice",
+        "calendar",
+        {"title": "今天休息", "start": now, "end": now + 3600},
+        observed_at=now,
+    )
+    store.record_snapshot(
+        "alice",
+        "power",
+        {"battery_level": 0.12, "low_power_mode": True},
+        observed_at=now,
+    )
+    store.record_snapshot(
+        "alice",
+        "screen-time",
+        {"total_minutes": 240},
+        observed_at=now,
+    )
+    store.record_snapshot(
+        "alice",
+        "health-sleep",
+        {"hours": 7.5},
+        observed_at=now,
+    )
+    store.record_snapshot(
+        "alice",
+        "watch",
+        {"connected": True},
+        observed_at=now,
+    )
+    store.record_snapshot(
+        "alice",
+        "motion",
+        {"state": "walking"},
+        observed_at=now,
+    )
+
+    full = store.evaluate_behavior("alice", now)
+    assert full["calendar_context"]["is_holiday"] is True
+    assert "power" in full["context_features"]
+    assert "screen_time" in full["context_features"]
+    assert "sleep" in full["context_features"]
+    assert "watch" in full["context_features"]
+    assert full["motion_weight"] == 1.0
+    assert full["leave_probability"] >= 0.9
+
+    disabled = store.evaluate_behavior(
+        "alice",
+        now,
+        feature_weights={
+            "ios-calendar": 0.0,
+            "ios-power": 0.0,
+            "ios-screen-time": 0.0,
+            "ios-health-sleep": 0.0,
+            "ios-watch": 0.0,
+            "ios-motion": 0.0,
+        },
+    )
+    assert disabled["calendar_weight"] == 0.0
+    assert disabled["calendar_context"]["is_holiday"] is False
+    assert disabled["calendar_context"]["day_type"] == "weekday"
+    assert disabled["calendar_context"]["calendar_weight"] == 0.0
+    assert "power" not in disabled["context_features"]
+    assert "screen_time" not in disabled["context_features"]
+    assert "sleep" not in disabled["context_features"]
+    assert "watch" not in disabled["context_features"]
+    assert set(disabled["excluded_context_features"]) >= {
+        "power",
+        "screen_time",
+        "sleep",
+        "watch",
+    }
+    assert disabled["motion_state"] == "walking"
+    assert disabled["motion_weight"] == 0.0
+    assert disabled["effective_motion_state"] is None
+    assert disabled["leave_probability"] == 0.15
+    assert disabled["applied_feature_weights"]["ios-calendar"] == 0.0
+    assert disabled["applied_feature_weights"]["ios-power"] == 0.0
+
+    degraded = store.evaluate_behavior(
+        "alice",
+        now,
+        feature_weights={
+            "ios-power": 0.5,
+            "ios-screen-time": 0.2,
+        },
+    )
+    assert degraded["context_features"]["power"]["feature_weight"] == 0.5
+    assert degraded["context_features"]["power"]["capability"] == "ios-power"
+    assert degraded["context_features"]["screen_time"]["feature_weight"] == 0.2
+    assert "sleep" in degraded["context_features"]
 
 
 @pytest.mark.parametrize("kind", ["calendar", "reminder"])
@@ -1238,7 +1474,7 @@ def test_weather_outbox_reconciliation_expires_delivery_and_removes_map_card(sto
     assert store.active_forecast("alice", now) == []
 
 
-def test_weather_reconciliation_revokes_claim_before_old_worker_completion(store):
+def test_weather_reconciliation_preserves_active_delivery_lease(store):
     now = 1_700_000_000
     queued = store.enqueue_notification(
         "alice",
@@ -1253,27 +1489,59 @@ def test_weather_reconciliation_revokes_claim_before_old_worker_completion(store
     )
     claimed = store.claim_pending_notifications(now=now, lease_seconds=30)
     assert [item["id"] for item in claimed] == [queued["id"]]
+    old_token = claimed[0]["lease_token"]
 
+    # Active delivering lease must not be stolen mid-APNs.
     result = store.expire_pending_weather_notifications(
         "alice",
         now=now + 1,
         keep_event_key="rain-B",
     )
-    old_token = claimed[0]["lease_token"]
-
-    assert result == {"expired": 1, "forecasts_removed": 0}
-    assert store.update_notification_device_deliveries(
-        queued["id"],
-        {"device-a": {"state": "delivered"}},
-        lease_token=old_token,
-        now=now + 1,
-    ) is False
+    assert result == {"expired": 0, "forecasts_removed": 0}
     assert store.update_notification_delivery(
         queued["id"],
         "delivered",
         1,
         lease_token=old_token,
         now=now + 1,
+    ) is True
+    with sqlite3.connect(store.path) as conn:
+        state = conn.execute(
+            "SELECT state FROM ios_notification_outbox WHERE id=?",
+            (queued["id"],),
+        ).fetchone()[0]
+    assert state == "delivered"
+
+
+def test_weather_reconciliation_expires_stale_delivery_lease_after_timeout(store):
+    now = 1_700_000_000
+    queued = store.enqueue_notification(
+        "alice",
+        {
+            "category": "smart-weather",
+            "event_key": "rain-A",
+            "title": "Rain",
+        },
+        idempotency_key="weather:claim-expire-stale:1",
+        expires_at=now + 300,
+        now=now,
+    )
+    claimed = store.claim_pending_notifications(now=now, lease_seconds=15)
+    assert [item["id"] for item in claimed] == [queued["id"]]
+    old_token = claimed[0]["lease_token"]
+
+    result = store.expire_pending_weather_notifications(
+        "alice",
+        now=now + 15,
+        keep_event_key="rain-B",
+    )
+    assert result == {"expired": 1, "forecasts_removed": 0}
+    assert store.update_notification_delivery(
+        queued["id"],
+        "delivered",
+        1,
+        lease_token=old_token,
+        now=now + 15,
     ) is False
     with sqlite3.connect(store.path) as conn:
         state, lease_token, leased_until = conn.execute(
@@ -1284,7 +1552,7 @@ def test_weather_reconciliation_revokes_claim_before_old_worker_completion(store
     assert (state, lease_token, leased_until) == ("expired", "", 0)
 
 
-def test_weather_reconciliation_wins_forced_worker_interleaving(store):
+def test_weather_reconciliation_does_not_race_active_worker_completion(store):
     now = 1_700_000_000
     queued = store.enqueue_notification(
         "alice",
@@ -1330,14 +1598,14 @@ def test_weather_reconciliation_wins_forced_worker_interleaving(store):
         worker_future.result(timeout=10)
         reconcile_future.result(timeout=10)
 
-    assert outcome["expiration"] == {"expired": 1, "forecasts_removed": 0}
-    assert outcome["worker_update"] is False
+    assert outcome["expiration"] == {"expired": 0, "forecasts_removed": 0}
+    assert outcome["worker_update"] is True
     with sqlite3.connect(store.path) as conn:
         state, deliveries = conn.execute(
             "SELECT state,deliveries FROM ios_notification_outbox WHERE id=?",
             (queued["id"],),
         ).fetchone()
-    assert (state, deliveries) == ("expired", 0)
+    assert (state, deliveries) == ("delivered", 1)
 
 
 def test_delivered_weather_expiry_records_one_negative_value_label(store):
@@ -1359,6 +1627,36 @@ def test_delivered_weather_expiry_records_one_negative_value_label(store):
         "useful": 0,
         "score": 0.0,
     }
+
+
+def test_expired_partial_delivery_reaches_terminal_state_when_event_is_kept(store):
+    now = int(datetime.now().timestamp())
+    queued = store.enqueue_notification(
+        "alice",
+        {"category": "smart-weather", "event_key": "rain", "title": "Rain"},
+        idempotency_key="weather:partial-expired:1",
+        expires_at=now + 60,
+        now=now,
+    )
+    deliveries = {
+        "device-a": {"state": "delivered", "attempts": 1},
+        "device-b": {"state": "retry", "attempts": 1, "last_error": "timeout"},
+    }
+    assert store.update_notification_delivery(
+        queued["id"], "retry", 1, "timeout", deliveries
+    ) is True
+
+    result = store.expire_pending_weather_notifications(
+        "alice", now=now + 61, keep_event_key="rain"
+    )
+
+    assert result["expired"] == 0
+    with sqlite3.connect(store.path) as conn:
+        state, lease_token, leased_until = conn.execute(
+            "SELECT state,lease_token,leased_until FROM ios_notification_outbox WHERE id=?",
+            (queued["id"],),
+        ).fetchone()
+    assert (state, lease_token, leased_until) == ("expired", "", 0)
 
 
 def test_partially_delivered_weather_expiry_records_negative_value_label(store):

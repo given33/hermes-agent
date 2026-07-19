@@ -119,14 +119,29 @@ def test_location_tool_reads_snapshot_and_queues_refresh_when_missing(tmp_path):
     assert present["location"]["data"]["latitude"] == 24.9
 
 
-def test_ordinary_chat_tool_resolves_single_active_account_without_owner_argument(tmp_path):
+def test_ordinary_chat_tool_requires_bound_owner_or_explicit_argument(tmp_path, monkeypatch):
     store = IOSIntelligenceStore(tmp_path)
     store.record_snapshot("alice", "power", {"level": 0.76, "charging": True})
     server = create_mcp_server("ios-power", store=store)
-    result = _call(server, "ios_power_get_latest", {})
-    assert result["snapshot"]["data"]["level"] == 0.76
     tool = _tools(server)[0]
     assert "owner_id" not in tool.parameters.get("required", [])
+
+    # Unbound process + no owner_id must fail closed even with one active account.
+    monkeypatch.delenv("HERMES_IOS_OWNER_ID", raising=False)
+    monkeypatch.delenv("HERMES_OWNER_EMAIL", raising=False)
+    with pytest.raises(Exception, match=r"unbound|HERMES_IOS_OWNER_ID"):
+        _call(server, "ios_power_get_latest", {})
+
+    # Explicit owner_id is accepted without process binding.
+    result = _call(server, "ios_power_get_latest", {"owner_id": "alice"})
+    assert result["snapshot"]["data"]["level"] == 0.76
+
+    # Bound process auto-resolves and rejects a mismatched explicit owner.
+    monkeypatch.setenv("HERMES_IOS_OWNER_ID", "alice")
+    bound = _call(server, "ios_power_get_latest", {})
+    assert bound["snapshot"]["data"]["level"] == 0.76
+    with pytest.raises(Exception, match=r"different account"):
+        _call(server, "ios_power_get_latest", {"owner_id": "bob"})
 
 
 def test_calendar_create_queues_native_device_command(tmp_path):
@@ -462,6 +477,99 @@ def test_runtime_chat_client_reload_requires_a_live_replacement(tmp_path, monkey
     finally:
         with mcp_tool._lock:
             mcp_tool._servers.pop("ios-power", None)
+
+
+def test_runtime_discovery_cutover_updates_all_profiles_atomically(tmp_path, monkeypatch):
+    import yaml
+
+    from hermes_cli import config as config_module
+    from hermes_cli.ios_mcp_supervisor import IOSMCPRuntimeSupervisor
+    from utils import atomic_yaml_write
+
+    root = tmp_path / "hermes-home"
+    reviewer = root / "profiles" / "reviewer"
+    unrelated = root / "profiles" / "unrelated"
+    monkeypatch.setenv("HERMES_HOME", str(root))
+    root.mkdir()
+    reviewer.mkdir(parents=True)
+    unrelated.mkdir(parents=True)
+    root_config = {
+        "mcp_servers": {
+            "ios-power": {
+                "enabled": False,
+                "granted_scopes": ["power:read"],
+                "url": "http://127.0.0.1:8768/mcp",
+            },
+        },
+    }
+    reviewer_config = {
+        "mcp_servers": {
+            "ios-power": {
+                "enabled": True,
+                "granted_scopes": ["power:read", "power:write"],
+                "url": "http://127.0.0.1:8768/mcp",
+            },
+        },
+    }
+    unrelated_config = {
+        "mcp_servers": {
+            "custom": {"enabled": True, "url": "https://example.test/mcp"},
+        },
+    }
+    atomic_yaml_write(root / "config.yaml", root_config)
+    atomic_yaml_write(reviewer / "config.yaml", reviewer_config)
+    atomic_yaml_write(unrelated / "config.yaml", unrelated_config)
+    config_module._RAW_CONFIG_CACHE.clear()
+    runtime = IOSMCPRuntimeSupervisor(
+        tmp_path / "runtime.db",
+        capabilities=("ios-power",),
+        log_directory=tmp_path / "logs",
+    )
+
+    runtime._persist_discovery_endpoint("ios-power", 9868, version="2.0.0")
+
+    persisted_root = yaml.safe_load((root / "config.yaml").read_text(encoding="utf-8"))
+    persisted_reviewer = yaml.safe_load(
+        (reviewer / "config.yaml").read_text(encoding="utf-8")
+    )
+    persisted_unrelated = yaml.safe_load(
+        (unrelated / "config.yaml").read_text(encoding="utf-8")
+    )
+    for persisted, expected_enabled, expected_scopes in (
+        (persisted_root, False, ["power:read"]),
+        (persisted_reviewer, True, ["power:read", "power:write"]),
+    ):
+        power = persisted["mcp_servers"]["ios-power"]
+        assert power["url"] == "http://127.0.0.1:9868/mcp"
+        assert power["manifest"]["endpoint"] == "http://127.0.0.1:9868/mcp"
+        assert power["manifest"]["version"] == "2.0.0"
+        assert power["enabled"] is expected_enabled
+        assert power["granted_scopes"] == expected_scopes
+    assert persisted_unrelated == unrelated_config
+
+    before_root = yaml.safe_load((root / "config.yaml").read_text(encoding="utf-8"))
+    before_reviewer = yaml.safe_load(
+        (reviewer / "config.yaml").read_text(encoding="utf-8")
+    )
+    original_save = config_module.save_config
+
+    def fail_reviewer_save(config, **kwargs):
+        from hermes_constants import get_config_path
+
+        if get_config_path().parent == reviewer:
+            raise OSError("profile config is read-only")
+        return original_save(config, **kwargs)
+
+    monkeypatch.setattr(config_module, "save_config", fail_reviewer_save)
+    with pytest.raises(OSError, match="read-only"):
+        runtime._persist_discovery_endpoint("ios-power", 9968, version="3.0.0")
+
+    assert yaml.safe_load((root / "config.yaml").read_text(encoding="utf-8")) == before_root
+    assert yaml.safe_load(
+        (reviewer / "config.yaml").read_text(encoding="utf-8")
+    ) == before_reviewer
+    assert str(root / "config.yaml") not in config_module._RAW_CONFIG_CACHE
+    assert str(root / "config.yaml") not in config_module._LAST_EXPANDED_CONFIG_BY_PATH
 
 
 def test_runtime_supervisor_starts_probes_and_blue_green_upgrades_a_real_mcp_process(tmp_path, monkeypatch):
