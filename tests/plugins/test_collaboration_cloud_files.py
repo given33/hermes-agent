@@ -32,8 +32,8 @@ def _load_module():
 
 
 def _client(module, owner: str = "owner-a") -> TestClient:
-    # Production migrations are bound by HERMES_LEGACY_OWNER_ID or
-    # HERMES_OWNER_EMAIL. Most fixtures model that configured primary account.
+    # Production migrations are bound only by explicit HERMES_LEGACY_OWNER_ID.
+    # Most fixtures model that configured primary account.
     module._configured_legacy_owner_id = lambda: owner
     app = FastAPI()
 
@@ -377,6 +377,50 @@ def test_unconfigured_account_cannot_claim_legacy_conversations_or_rooms(
     assert getattr(denied.value, "status_code", None) == 404
     assert not module._claim_legacy_rooms_in_state(room_state, "owner-unbound")
     assert room["owner_id"] == module.LOCAL_OWNER_ID
+
+
+def test_owner_email_never_implicitly_authorizes_legacy_claim(monkeypatch):
+    module = _load_module()
+    monkeypatch.delenv("HERMES_LEGACY_OWNER_ID", raising=False)
+    monkeypatch.setenv("HERMES_OWNER_EMAIL", "mobile-owner@example.com")
+
+    assert module._configured_legacy_owner_id() == ""
+    assert not module._legacy_owner_claim_allowed(
+        module.LOCAL_OWNER_ID,
+        "mobile-owner@example.com",
+    )
+
+    monkeypatch.setenv("HERMES_LEGACY_OWNER_ID", "explicit-owner")
+    assert module._configured_legacy_owner_id() == "explicit-owner"
+    assert module._legacy_owner_claim_allowed(
+        module.LOCAL_OWNER_ID,
+        "explicit-owner",
+    )
+
+
+def test_mobile_conversation_list_does_not_claim_owner_email_legacy_data(
+    monkeypatch,
+):
+    module = _load_module()
+    monkeypatch.delenv("HERMES_LEGACY_OWNER_ID", raising=False)
+    monkeypatch.setenv("HERMES_OWNER_EMAIL", "mobile-owner@example.com")
+    conversation = module.create_single_conversation("default", "Old E2E")
+    conversation["owner_id"] = module.LOCAL_OWNER_ID
+    state = {"conversations": [conversation]}
+    saves = []
+    monkeypatch.setattr(module, "load_single_state", lambda: state)
+    monkeypatch.setattr(module, "save_single_state", lambda value: saves.append(value))
+    request = SimpleNamespace(
+        state=SimpleNamespace(
+            session=SimpleNamespace(user_id="mobile-owner@example.com")
+        )
+    )
+
+    response = module.get_single_conversations(request)
+
+    assert response == {"conversations": []}
+    assert conversation["owner_id"] == module.LOCAL_OWNER_ID
+    assert saves == []
 
 
 def test_incomplete_legacy_file_migration_does_not_write_completion_marker(

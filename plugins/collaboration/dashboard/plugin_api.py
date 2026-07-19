@@ -76,7 +76,13 @@ async def collaboration_dashboard_lifespan(_app):
     """Resume persisted work as soon as the dashboard process starts."""
     try:
         state = load_single_state()
-        resume_unfinished_hosted_workflows(state.get("conversations") or [])
+        conversations = state.get("conversations") or []
+        changed = False
+        for conversation in conversations:
+            changed = reconcile_stale_hosted_turns(conversation) or changed
+        if changed:
+            save_single_state(state)
+        resume_unfinished_hosted_workflows(conversations)
     except Exception:
         logging.getLogger(__name__).exception(
             "Failed to resume collaboration hosted workflows during startup"
@@ -104,6 +110,8 @@ _MOBILE_NOTIFICATION_TERMINAL_STATUSES = {
 _HOSTED_TRANSIENT_RETRIES = 1
 _HOSTED_REWORK_LIMIT = 2
 _HOSTED_EVENT_FLUSH_SECONDS = 0.45
+_RUNTIME_RUN_STALE_AFTER_MS = 30 * 60 * 1000
+_HOSTED_TURN_STALE_AFTER_MS = 36 * 60 * 60 * 1000
 _REMOTE_CONTRACT_VERSION = 1
 _REMOTE_TERMINAL_STATUSES = {"completed", "failed", "cancelled"}
 _REMOTE_RUN_LEASE_SECONDS = 60
@@ -1807,12 +1815,32 @@ def reconcile_conversation_runtime_results(
     for profile, run in runtime_runs.items():
         if not isinstance(run, dict) or run.get("status") != "running":
             continue
+        run_updated_at = int(run.get("updated_at") or run.get("started_at") or 0)
+        stale = run_updated_at <= 0 or now - run_updated_at >= _RUNTIME_RUN_STALE_AFTER_MS
         session_id = str(run.get("session_id") or "").strip()
         if not session_id:
+            if stale:
+                run.update({
+                    "status": "failed",
+                    "error": "Runtime result was unavailable after the recovery window",
+                    "completed_at": now,
+                    "updated_at": now,
+                })
+                conversation["updated_at"] = now
+                changed = True
             continue
         try:
             messages = loader(str(profile), session_id)
         except Exception:
+            if stale:
+                run.update({
+                    "status": "failed",
+                    "error": "Runtime session could not be recovered",
+                    "completed_at": now,
+                    "updated_at": now,
+                })
+                conversation["updated_at"] = now
+                changed = True
             continue
         baseline = max(0, int(run.get("baseline_message_count") or 0))
         candidates = [
@@ -1825,6 +1853,15 @@ def reconcile_conversation_runtime_results(
             "",
         )
         if not final_text:
+            if stale:
+                run.update({
+                    "status": "failed",
+                    "error": "Runtime result was unavailable after the recovery window",
+                    "completed_at": now,
+                    "updated_at": now,
+                })
+                conversation["updated_at"] = now
+                changed = True
             continue
         existing = next(
             (
@@ -1858,6 +1895,93 @@ def reconcile_conversation_runtime_results(
         run["status"] = "completed"
         run["completed_at"] = now
         run["updated_at"] = now
+        conversation["updated_at"] = now
+        changed = True
+    return changed
+
+
+def reconcile_stale_hosted_turns(
+    conversation: dict[str, Any],
+    *,
+    now_ms: Optional[int] = None,
+) -> bool:
+    """Close persisted hosted work that outlived its recovery window."""
+
+    hosted_turns = conversation.get("hosted_turns")
+    if not isinstance(hosted_turns, dict):
+        return False
+    now = int(time.time() * 1000) if now_ms is None else int(now_ms)
+    changed = False
+    for stored_turn_id, run in hosted_turns.items():
+        if not isinstance(run, dict):
+            continue
+        if str(run.get("status") or "queued") not in {"queued", "running"}:
+            continue
+        updated_at = int(
+            run.get("updated_at") or run.get("started_at") or run.get("created_at") or 0
+        )
+        if updated_at > 0 and now - updated_at < _HOSTED_TURN_STALE_AFTER_MS:
+            continue
+        run.update({
+            "status": "failed",
+            "stage": "failed",
+            "error": "Hosted task expired before recovery completed",
+            "completed_at": now,
+            "updated_at": now,
+        })
+        turn_id = str(run.get("turn_id") or stored_turn_id).strip()
+        for key in ("role_events", "remote_runs"):
+            states = run.get(key)
+            if not isinstance(states, dict):
+                continue
+            for state in states.values():
+                if not isinstance(state, dict):
+                    continue
+                if str(state.get("status") or "") in {
+                    "pending", "queued", "running", "starting", "streaming"
+                }:
+                    state["status"] = "failed"
+                    state["completed_at"] = now
+                    state["updated_at"] = now
+        for message in conversation.get("messages") or []:
+            if not isinstance(message, dict):
+                continue
+            meta = message.get("meta")
+            meta = meta if isinstance(meta, dict) else {}
+            message_key = str(meta.get("message_key") or "")
+            if (
+                str(meta.get("runtime_turn_id") or "").strip() != turn_id
+                and not message_key.startswith(f"{turn_id}:")
+            ):
+                continue
+            if str(message.get("status") or "") not in {
+                "pending", "queued", "running", "starting", "streaming"
+            }:
+                continue
+            message["status"] = "failed"
+            message["completed_at"] = now
+            message["updated_at"] = now
+            meta["phase"] = "failed"
+            message["meta"] = meta
+            activity_lists = []
+            if isinstance(message.get("activities"), list):
+                activity_lists.append(message["activities"])
+            if isinstance(meta.get("activities"), list):
+                activity_lists.append(meta["activities"])
+            seen_activity_lists: set[int] = set()
+            for activities in activity_lists:
+                if id(activities) in seen_activity_lists:
+                    continue
+                seen_activity_lists.add(id(activities))
+                for activity in activities:
+                    if not isinstance(activity, dict):
+                        continue
+                    if str(activity.get("status") or "") in {
+                        "pending", "queued", "running", "starting", "streaming"
+                    }:
+                        activity["status"] = "failed"
+                        activity["completed_at"] = now
+                        activity["updated_at"] = now
         conversation["updated_at"] = now
         changed = True
     return changed
@@ -5329,10 +5453,10 @@ def _room_by_id(state: dict[str, Any], room_id: str) -> dict[str, Any]:
 def _configured_legacy_owner_id() -> str:
     """Return the only account allowed to adopt pre-account local data."""
 
-    explicit = os.environ.get("HERMES_LEGACY_OWNER_ID", "").strip()
-    if explicit:
-        return explicit[:512]
-    return os.environ.get("HERMES_OWNER_EMAIL", "").strip().lower()[:512]
+    # Migration must be an explicit operator action. HERMES_OWNER_EMAIL is an
+    # authentication setting and must not make a normal mobile account inherit
+    # local development or E2E records merely by listing conversations.
+    return os.environ.get("HERMES_LEGACY_OWNER_ID", "").strip()[:512]
 
 
 def _legacy_owner_claim_allowed(existing_owner: str, owner_id: str) -> bool:
@@ -5631,17 +5755,24 @@ def _project_native_message(message: dict[str, Any]) -> dict[str, Any]:
     profile = str(meta.get("profile") or message.get("name") or "default")
     model = str(meta.get("actual_model") or message.get("model") or "")
     provider = str(meta.get("actual_provider") or message.get("provider") or "")
+    created_at = message.get("created_at") or int(time.time() * 1000)
+    updated_at = message.get("updated_at") or created_at
+    message_status = str(message.get("status") or "completed")
+    terminal = message_status in {"completed", "failed", "cancelled", "blocked"}
     activities = [
         _native_activity_projection(item, message_model=model, message_provider=provider)
         for item in meta.get("activities") or []
         if isinstance(item, dict)
     ]
+    if terminal:
+        terminal_activity_status = "completed" if message_status == "completed" else message_status
+        for activity in activities:
+            if str(activity.get("status") or "") in {
+                "pending", "queued", "running", "starting", "streaming"
+            }:
+                activity["status"] = terminal_activity_status
+                activity["completed_at"] = updated_at
     meta["activities"] = activities
-    created_at = message.get("created_at") or int(time.time() * 1000)
-    updated_at = message.get("updated_at") or created_at
-    terminal = str(message.get("status") or "") in {
-        "completed", "failed", "cancelled", "blocked"
-    }
     handoff_to = meta.get("handoff_to") or []
     if isinstance(handoff_to, str):
         handoff_to = [handoff_to]
@@ -5659,7 +5790,7 @@ def _project_native_message(message: dict[str, Any]) -> dict[str, Any]:
             "sender_role": logical_role,
             "profile": profile,
             "avatar": str(meta.get("avatar") or f"role:{logical_role}"),
-            "status": str(message.get("status") or "completed"),
+            "status": message_status,
             "model": model,
             "provider": provider,
             "handoff_to": list(handoff_to),
@@ -6449,6 +6580,7 @@ def get_single_conversations(request: Request = None):
             if existing_owner != owner_id:
                 continue
             changed = reconcile_conversation_runtime_results(conversation) or changed
+            changed = reconcile_stale_hosted_turns(conversation) or changed
             changed = compact_conversation_title(conversation) or changed
             owned.append(conversation)
         if changed:
@@ -6563,6 +6695,7 @@ def get_single_conversation(
             owner_id,
         )
         changed = claimed or reconcile_conversation_runtime_results(conversation)
+        changed = reconcile_stale_hosted_turns(conversation) or changed
         changed = reconcile_conversation_mapped_sessions(conversation) or changed
         changed = compact_conversation_title(conversation) or changed
         if changed:

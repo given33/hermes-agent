@@ -334,6 +334,93 @@ class CollaborationDashboardTests(unittest.TestCase):
         )
         self.assertEqual(conversation["messages"], [])
 
+    def test_stale_runtime_run_without_result_converges_to_failed(self):
+        module = load_module()
+        conversation = module.create_single_conversation("default")
+        module.mark_conversation_runtime_run(
+            conversation,
+            "pc-worker",
+            "missing-session",
+            started_at=1_000,
+        )
+
+        now = 1_000 + module._RUNTIME_RUN_STALE_AFTER_MS
+        changed = module.reconcile_conversation_runtime_results(
+            conversation,
+            loader=lambda _profile, _session_id: [],
+            now_ms=now,
+        )
+
+        self.assertTrue(changed)
+        run = conversation["runtime_runs"]["pc-worker"]
+        self.assertEqual(run["status"], "failed")
+        self.assertEqual(run["completed_at"], now)
+
+    def test_stale_hosted_roles_and_terminal_message_activities_stop_running(self):
+        module = load_module()
+        conversation = module.create_single_conversation("default")
+        run = module.create_hosted_turn_record(
+            conversation,
+            turn_id="turn-stale-review",
+            content="old e2e",
+            title="old e2e",
+            profiles=["pc-worker", "reviewer"],
+            artifact_required=False,
+        )
+        run.update({
+            "status": "running",
+            "updated_at": 1_000,
+            "role_events": {
+                "worker": {"status": "running"},
+                "reviewer": {"status": "streaming"},
+            },
+        })
+        running_message = {
+            "role": "assistant",
+            "name": "pc-worker",
+            "content": "partial output must be preserved",
+            "status": "running",
+            "created_at": 1_500,
+            "activities": [{"kind": "tool", "status": "running"}],
+            "meta": {
+                "runtime_turn_id": "turn-stale-review",
+                "activities": [{"kind": "reasoning", "status": "streaming"}],
+            },
+        }
+        unrelated_message = {
+            "role": "assistant",
+            "name": "reviewer",
+            "content": "different active turn",
+            "status": "running",
+            "meta": {"runtime_turn_id": "turn-current"},
+        }
+        conversation["messages"] = [running_message, unrelated_message]
+
+        now = 1_000 + module._HOSTED_TURN_STALE_AFTER_MS
+        self.assertTrue(module.reconcile_stale_hosted_turns(conversation, now_ms=now))
+        self.assertEqual(run["status"], "failed")
+        self.assertEqual(run["role_events"]["worker"]["status"], "failed")
+        self.assertEqual(run["role_events"]["reviewer"]["status"], "failed")
+        self.assertEqual(running_message["status"], "failed")
+        self.assertEqual(running_message["content"], "partial output must be preserved")
+        self.assertEqual(running_message["completed_at"], now)
+        self.assertEqual(running_message["updated_at"], now)
+        self.assertEqual(running_message["activities"][0]["status"], "failed")
+        self.assertEqual(running_message["meta"]["activities"][0]["status"], "failed")
+        self.assertEqual(unrelated_message["status"], "running")
+
+        message = {
+            "role": "assistant",
+            "name": "reviewer",
+            "content": "done",
+            "status": "completed",
+            "created_at": now,
+            "meta": {"activities": [{"kind": "status", "status": "running"}]},
+        }
+        module._project_native_message(message)
+        self.assertEqual(message["activities"][0]["status"], "completed")
+        self.assertEqual(message["activities"][0]["completed_at"], now)
+
     def test_same_runtime_session_keeps_each_completed_turn(self):
         module = load_module()
         conversation = module.create_single_conversation("default")
@@ -1776,13 +1863,14 @@ class CollaborationDashboardTests(unittest.TestCase):
     def test_conversation_index_compacts_hosted_role_event_payloads(self):
         module = load_module()
         conversation = module.create_single_conversation("default")
+        now = int(time.time() * 1000)
         conversation["hosted_turns"] = {
             "turn-heavy": {
                 "turn_id": "turn-heavy",
                 "status": "running",
                 "stage": "worker",
-                "started_at": 1000,
-                "updated_at": 2000,
+                "started_at": now - 1000,
+                "updated_at": now,
                 "task_id": "root-heavy",
                 "worker_result": "x" * 20_000,
                 "role_events": {
