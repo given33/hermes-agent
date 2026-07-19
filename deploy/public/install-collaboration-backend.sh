@@ -45,6 +45,7 @@ required=(
   "plugins/collaboration/dashboard/manifest.json"
   "plugins/collaboration/dashboard/dist/index.js"
   "hermes_cli/cloud_file_library.py"
+  "hermes_cli/dashboard_auth/public_paths.py"
   "hermes_cli/dashboard_auth/token_auth.py"
   "hermes_cli/dashboard_auth/mobile_device_store.py"
   "hermes_cli/dashboard_auth/mobile_notifications.py"
@@ -132,6 +133,7 @@ PY
 "${runtime_python}" - \
   "${snapshot}/plugins/collaboration/dashboard/plugin_api.py" \
   "${snapshot}/hermes_cli/cloud_file_library.py" \
+  "${snapshot}/hermes_cli/dashboard_auth/public_paths.py" \
   "${snapshot}/hermes_cli/dashboard_auth/token_auth.py" \
   "${snapshot}/hermes_cli/dashboard_auth/mobile_device_store.py" \
   "${snapshot}/hermes_cli/dashboard_auth/mobile_notifications.py" \
@@ -172,6 +174,7 @@ service_user="${HERMES_AGENT_USER:-hermes-agent}"
 service_group="${HERMES_AGENT_GROUP:-hermes-agent}"
 plugin_target="${target_root}/plugins/collaboration/dashboard"
 core_target="${target_root}/hermes_cli/cloud_file_library.py"
+public_paths_target="${target_root}/hermes_cli/dashboard_auth/public_paths.py"
 token_auth_target="${target_root}/hermes_cli/dashboard_auth/token_auth.py"
 mobile_device_store_target="${target_root}/hermes_cli/dashboard_auth/mobile_device_store.py"
 mobile_notifications_target="${target_root}/hermes_cli/dashboard_auth/mobile_notifications.py"
@@ -355,6 +358,7 @@ backup_one "${plugin_target}/plugin_api.py" "${backup}/plugins/collaboration/das
 backup_one "${plugin_target}/manifest.json" "${backup}/plugins/collaboration/dashboard/manifest.json"
 backup_one "${plugin_target}/dist/index.js" "${backup}/plugins/collaboration/dashboard/dist/index.js"
 backup_one "${core_target}" "${backup}/hermes_cli/cloud_file_library.py"
+backup_one "${public_paths_target}" "${backup}/hermes_cli/dashboard_auth/public_paths.py"
 backup_one "${token_auth_target}" "${backup}/hermes_cli/dashboard_auth/token_auth.py"
 backup_one "${mobile_device_store_target}" "${backup}/hermes_cli/dashboard_auth/mobile_device_store.py"
 backup_one "${mobile_notifications_target}" "${backup}/hermes_cli/dashboard_auth/mobile_notifications.py"
@@ -394,6 +398,7 @@ rollback() {
     restore_one "${backup}/plugins/collaboration/dashboard/manifest.json" "${plugin_target}/manifest.json"
     restore_one "${backup}/plugins/collaboration/dashboard/dist/index.js" "${plugin_target}/dist/index.js"
     restore_one "${backup}/hermes_cli/cloud_file_library.py" "${core_target}"
+    restore_one "${backup}/hermes_cli/dashboard_auth/public_paths.py" "${public_paths_target}"
     restore_one "${backup}/hermes_cli/dashboard_auth/token_auth.py" "${token_auth_target}"
     restore_one "${backup}/hermes_cli/dashboard_auth/mobile_device_store.py" "${mobile_device_store_target}"
     restore_one "${backup}/hermes_cli/dashboard_auth/mobile_notifications.py" "${mobile_notifications_target}"
@@ -413,6 +418,7 @@ rollback() {
   fi
   rm -rf -- "${transaction}"
   [[ -z "${health_file:-}" ]] || rm -f -- "${health_file}"
+  [[ -z "${handshake_file:-}" ]] || rm -f -- "${handshake_file}"
   [[ -z "${ios_health_file:-}" ]] || rm -f -- "${ios_health_file}"
   [[ -z "${connector_health_file:-}" ]] || rm -f -- "${connector_health_file}"
   rm -f -- "${curl_cfg}"
@@ -486,6 +492,7 @@ install_atomic "${snapshot}/plugins/collaboration/dashboard/plugin_api.py" "${pl
 install_atomic "${snapshot}/plugins/collaboration/dashboard/manifest.json" "${plugin_target}/manifest.json"
 install_atomic "${snapshot}/plugins/collaboration/dashboard/dist/index.js" "${plugin_target}/dist/index.js"
 install_atomic "${snapshot}/hermes_cli/cloud_file_library.py" "${core_target}"
+install_atomic "${snapshot}/hermes_cli/dashboard_auth/public_paths.py" "${public_paths_target}"
 install_atomic "${snapshot}/hermes_cli/dashboard_auth/token_auth.py" "${token_auth_target}"
 install_atomic "${snapshot}/hermes_cli/dashboard_auth/mobile_device_store.py" "${mobile_device_store_target}"
 install_atomic "${snapshot}/hermes_cli/dashboard_auth/mobile_notifications.py" "${mobile_notifications_target}"
@@ -527,6 +534,21 @@ import json, sys
 data = json.load(open(sys.argv[1], encoding="utf-8"))
 assert isinstance(data, dict)
 PY
+handshake_file="$(mktemp /run/hermes-agent-mobile-handshake.XXXXXX)"
+if ! curl --fail --silent --show-error --max-time 3 \
+  http://127.0.0.2:9119/api/mobile/v1/handshake >"${handshake_file}"; then
+  printf '%s\n' "anonymous mobile handshake did not respond" >&2
+  false
+fi
+"${runtime_python}" - "${handshake_file}" <<'PY'
+import json, sys
+data = json.load(open(sys.argv[1], encoding="utf-8"))
+assert data.get("api_version") == 1
+assert isinstance(data.get("hermes_version"), str) and data["hermes_version"]
+assert isinstance(data.get("profiles"), list)
+assert isinstance(data.get("capabilities"), list)
+assert isinstance(data.get("server_time"), str) and data["server_time"]
+PY
 ios_health_file=""
 if [[ "${ios_enabled}" == 1 ]]; then
   ios_health_file="$(mktemp /run/hermes-agent-ios-status.XXXXXX)"
@@ -556,5 +578,6 @@ validate_connector_health "${connector_health_file}" || {
   false
 }
 installed=1
-rm -rf -- "${transaction}" "${health_file}" "${ios_health_file}" "${connector_health_file}" "${curl_cfg}"
+rm -rf -- "${transaction}" "${health_file}" "${handshake_file}" \
+  "${ios_health_file}" "${connector_health_file}" "${curl_cfg}"
 printf 'service=active\nversion=%s\nbackup=%s\n' "${version}" "${backup}"

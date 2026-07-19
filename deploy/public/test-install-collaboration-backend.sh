@@ -27,6 +27,7 @@ runtime_files=(
   "plugins/collaboration/dashboard/manifest.json"
   "plugins/collaboration/dashboard/dist/index.js"
   "hermes_cli/cloud_file_library.py"
+  "hermes_cli/dashboard_auth/public_paths.py"
   "hermes_cli/dashboard_auth/token_auth.py"
   "hermes_cli/dashboard_auth/mobile_device_store.py"
   "hermes_cli/dashboard_auth/mobile_notifications.py"
@@ -89,6 +90,9 @@ url="${!#}"
 if [[ "${url}" == */api/status ]]; then
   [[ "${FAKE_STATUS_FAIL:-0}" != 1 ]] || exit 22
   payload='{"status":"ok"}'
+elif [[ "${url}" == */api/mobile/v1/handshake ]]; then
+  [[ "${FAKE_HANDSHAKE_FAIL:-0}" != 1 ]] || exit 22
+  payload='{"api_version":1,"hermes_version":"test","profiles":[],"capabilities":[],"server_time":"2026-07-19T12:00:00Z"}'
 elif [[ "${url}" == */api/plugins/ios-intelligence/health ]]; then
   payload="$(python3 - <<'PY'
 import json
@@ -125,6 +129,7 @@ run_installer() {
     PATH="${fake_bin}:${PATH}" \
     FAKE_STATUS_FAIL="$1" \
     FAKE_SIGNAL_ON_START="${2:-0}" \
+    FAKE_HANDSHAKE_FAIL="${3:-0}" \
     HERMES_AGENT_ROOT="${target}" \
     HERMES_RUNTIME_PYTHON="$(command -v python3)" \
     HERMES_AGENT_SERVICE="hermes-agent-test.service" \
@@ -132,6 +137,7 @@ run_installer() {
     HERMES_AGENT_GROUP="root" \
     HERMES_STAGE_OWNER="root" \
     HERMES_BACKUP_ROOT="${backup}" \
+    HERMES_INSTALL_LOCK_FILE="${work}/collaboration-install.lock" \
     HERMES_COLLABORATION_STATE_FILE="${state_file}" \
     HERMES_COLLABORATION_CONNECTOR_TOKEN_FILE="${token_file}" \
     FAKE_SYSTEMCTL_LOG="${work}/systemctl.log" \
@@ -158,6 +164,24 @@ grep -Fq '"id":"old-state"' "${state_file}"
 [[ "$(sed -n '3p' "${work}/systemctl.log")" == "is-active" ]]
 [[ "$(tail -n 2 "${work}/systemctl.log" | sed -n '1p')" == "stop" ]]
 [[ "$(tail -n 1 "${work}/systemctl.log")" == "start" ]]
+
+: >"${work}/systemctl.log"
+set +e
+run_installer 0 0 1 >"${work}/handshake.stdout" 2>"${work}/handshake.stderr"
+handshake_status=$?
+set -e
+[[ "${handshake_status}" -ne 0 ]] || {
+  printf '%s\n' "forced mobile handshake failure unexpectedly succeeded" >&2
+  exit 1
+}
+grep -Fq "anonymous mobile handshake did not respond" "${work}/handshake.stderr"
+for relative in "${runtime_files[@]}"; do
+  [[ "$(<"${target}/${relative}")" == "old:${relative}" ]] || {
+    printf 'handshake rollback mismatch: %s\n' "${relative}" >&2
+    exit 1
+  }
+done
+grep -Fq '"id":"old-state"' "${state_file}"
 
 : >"${work}/systemctl.log"
 set +e

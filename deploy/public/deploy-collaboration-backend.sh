@@ -17,6 +17,7 @@ installer="${repo}/deploy/public/install-collaboration-backend.sh"
 [[ -f "${repo}/plugins/collaboration/dashboard/manifest.json" ]] || die "manifest.json is missing"
 [[ -f "${repo}/plugins/collaboration/dashboard/dist/index.js" ]] || die "dist/index.js is missing"
 [[ -f "${repo}/hermes_cli/cloud_file_library.py" ]] || die "cloud_file_library.py is missing"
+[[ -f "${repo}/hermes_cli/dashboard_auth/public_paths.py" ]] || die "public_paths.py is missing"
 [[ -f "${repo}/hermes_cli/dashboard_auth/token_auth.py" ]] || die "token_auth.py is missing"
 [[ -f "${repo}/hermes_cli/dashboard_auth/mobile_device_store.py" ]] || die "mobile_device_store.py is missing"
 [[ -f "${repo}/hermes_cli/dashboard_auth/mobile_notifications.py" ]] || die "mobile_notifications.py is missing"
@@ -81,6 +82,7 @@ scp "${ssh_args[@]}" \
   "${repo}/hermes_cli/web_server.py" \
   "${remote}:${stage}/hermes_cli/"
 scp "${ssh_args[@]}" \
+  "${repo}/hermes_cli/dashboard_auth/public_paths.py" \
   "${repo}/hermes_cli/dashboard_auth/token_auth.py" \
   "${repo}/hermes_cli/dashboard_auth/mobile_device_store.py" \
   "${repo}/hermes_cli/dashboard_auth/mobile_notifications.py" \

@@ -193,6 +193,7 @@ printf '%s|%s\n' "$(basename "$0")" "$*" >>"$DEPLOY_CAPTURE"
         "plugins/collaboration/dashboard/manifest.json",
         "plugins/collaboration/dashboard/dist/index.js",
         "hermes_cli/cloud_file_library.py",
+        "hermes_cli/dashboard_auth/public_paths.py",
         "hermes_cli/dashboard_auth/token_auth.py",
         "hermes_cli/dashboard_auth/mobile_device_store.py",
         "hermes_cli/dashboard_auth/mobile_notifications.py",
@@ -243,6 +244,36 @@ def test_public_installer_rolls_back_and_installs_every_runtime_file():
     )
     assert result.returncode == 0, result.stdout + "\n" + result.stderr
     assert "public installer transaction test passed" in result.stdout
+
+
+def test_public_paths_is_transactional_deployment_asset():
+    installer = (PUBLIC / "install-collaboration-backend.sh").read_text(
+        encoding="utf-8"
+    )
+    deployer = (PUBLIC / "deploy-collaboration-backend.sh").read_text(
+        encoding="utf-8"
+    )
+
+    assert '"${repo}/hermes_cli/dashboard_auth/public_paths.py"' in deployer
+    assert '"hermes_cli/dashboard_auth/public_paths.py"' in installer
+    assert '"${snapshot}/hermes_cli/dashboard_auth/public_paths.py"' in installer
+    assert (
+        'public_paths_target="${target_root}/hermes_cli/dashboard_auth/public_paths.py"'
+        in installer
+    )
+    assert 'backup_one "${public_paths_target}"' in installer
+    assert (
+        'restore_one "${backup}/hermes_cli/dashboard_auth/public_paths.py"' in installer
+    )
+    assert (
+        'install_atomic "${snapshot}/hermes_cli/dashboard_auth/public_paths.py"'
+        in installer
+    )
+    assert "api/mobile/v1/handshake" in installer
+    assert 'data.get("api_version") == 1' in installer
+    assert 'isinstance(data.get("profiles"), list)' in installer
+    assert 'isinstance(data.get("capabilities"), list)' in installer
+    assert 'data.get("server_time")' in installer
 
 
 def test_public_installer_quiesces_state_during_snapshot_and_rollback():
