@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import concurrent.futures
 import socket
+import threading
 import time
 from types import SimpleNamespace
 
@@ -462,6 +463,43 @@ def test_runtime_start_reports_false_when_required_service_fails(tmp_path, monke
         assert health["required_count"] == 1
         assert health["services"][0]["error"] == "process_missing"
     finally:
+        runtime.stop()
+
+
+def test_runtime_async_start_exposes_starting_until_required_service_is_ready(
+    tmp_path, monkeypatch
+):
+    from hermes_cli.ios_mcp_supervisor import IOSMCPRuntimeSupervisor
+
+    runtime = IOSMCPRuntimeSupervisor(
+        tmp_path / "runtime-async-start.db",
+        capabilities=("ios-power",),
+        log_directory=tmp_path / "logs",
+    )
+    entered = threading.Event()
+    release = threading.Event()
+
+    def start_service(_name, verify=True):
+        entered.set()
+        assert release.wait(5)
+        return True
+
+    monkeypatch.setattr(runtime, "start_service", start_service)
+    monkeypatch.setattr(runtime, "stop_service", lambda _name: True)
+
+    try:
+        startup = runtime.start_async()
+        assert entered.wait(5)
+        health = runtime.health()
+        assert health["starting"] is True
+        assert health["running"] is False
+        release.set()
+        startup.join(5)
+        assert startup.is_alive() is False
+        assert runtime.starting is False
+        assert runtime.running is True
+    finally:
+        release.set()
         runtime.stop()
 
 

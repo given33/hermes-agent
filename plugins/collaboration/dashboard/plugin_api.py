@@ -110,6 +110,8 @@ _MOBILE_NOTIFICATION_TERMINAL_STATUSES = {
 _HOSTED_TRANSIENT_RETRIES = 1
 _HOSTED_REWORK_LIMIT = 2
 _HOSTED_EVENT_FLUSH_SECONDS = 0.45
+_MODEL_NOT_CONFIGURED_CODE = "model_not_configured"
+_MODEL_NOT_CONFIGURED_MESSAGE = "尚未配置可用模型。请先在“模型”中添加并选择模型后重试。"
 _RUNTIME_RUN_STALE_AFTER_MS = 30 * 60 * 1000
 _HOSTED_TURN_STALE_AFTER_MS = 36 * 60 * 60 * 1000
 _REMOTE_CONTRACT_VERSION = 1
@@ -2391,6 +2393,177 @@ def classify_intent_with_context_model(
     }
 
 
+def _runtime_has_usable_credentials(runtime: dict[str, Any]) -> bool:
+    api_key = runtime.get("api_key")
+    if callable(api_key):
+        return True
+    if str(api_key or "").strip():
+        return True
+    pool = runtime.get("credential_pool")
+    if pool is None:
+        return False
+    try:
+        return bool(pool.has_credentials())
+    except (AttributeError, RuntimeError, TypeError, ValueError):
+        return False
+
+
+def _profile_runtime_readiness(
+    profile: str,
+    model: str,
+    provider: str,
+) -> dict[str, Any]:
+    """Resolve the same credential path used by the hosted child process."""
+
+    from hermes_cli.config import load_config
+    from hermes_cli.moa_config import resolve_moa_preset
+    from hermes_cli.profiles import resolve_profile_env
+    from hermes_cli.runtime_provider import resolve_runtime_provider
+    from hermes_constants import reset_hermes_home_override, set_hermes_home_override
+
+    token = set_hermes_home_override(resolve_profile_env(profile))
+    try:
+        config = load_config()
+        slots = [{"provider": provider, "model": model}]
+        if provider.lower() == "moa":
+            preset = resolve_moa_preset(config.get("moa") or {}, model)
+            slots = [
+                *list(preset.get("reference_models") or []),
+                dict(preset.get("aggregator") or {}),
+            ]
+        for slot in slots:
+            slot_provider = str(slot.get("provider") or "").strip()
+            slot_model = str(slot.get("model") or "").strip()
+            if not slot_provider or not slot_model:
+                return {
+                    "ready": False,
+                    "code": _MODEL_NOT_CONFIGURED_CODE,
+                    "message": _MODEL_NOT_CONFIGURED_MESSAGE,
+                }
+            try:
+                runtime = resolve_runtime_provider(
+                    requested=slot_provider,
+                    target_model=slot_model,
+                )
+            except Exception:
+                return {
+                    "ready": False,
+                    "code": "model_credentials_missing",
+                    "message": _MODEL_NOT_CONFIGURED_MESSAGE,
+                }
+            if not _runtime_has_usable_credentials(runtime):
+                return {
+                    "ready": False,
+                    "code": "model_credentials_missing",
+                    "message": _MODEL_NOT_CONFIGURED_MESSAGE,
+                }
+    finally:
+        reset_hermes_home_override(token)
+    return {"ready": True, "code": "ready", "message": ""}
+
+
+def profile_model_readiness(profile: str) -> dict[str, Any]:
+    """Return whether one hosted-chat profile can reach its selected model."""
+
+    normalized = str(profile or "default").strip() or "default"
+    record = next(
+        (
+            item
+            for item in available_profiles()
+            if str(item.get("name") or "").strip() == normalized
+        ),
+        None,
+    )
+    if record is None:
+        return {
+            "ready": False,
+            "code": "profile_not_found",
+            "message": "Hermes Profile 不存在。",
+            "profile": normalized,
+        }
+    model = str(record.get("model") or "").strip()
+    if not model:
+        return {
+            "ready": False,
+            "code": _MODEL_NOT_CONFIGURED_CODE,
+            "message": _MODEL_NOT_CONFIGURED_MESSAGE,
+            "profile": normalized,
+        }
+    readiness = _profile_runtime_readiness(
+        normalized,
+        model,
+        str(record.get("provider") or "").strip(),
+    )
+    return {
+        **readiness,
+        "profile": normalized,
+        "model": model,
+        "provider": str(record.get("provider") or "").strip(),
+    }
+
+
+def _fail_hosted_turn_preflight(
+    conversation: dict[str, Any],
+    run: dict[str, Any],
+    readiness: dict[str, Any],
+) -> None:
+    """Persist one idempotent terminal error without a running placeholder."""
+
+    turn_id = str(run.get("turn_id") or "").strip()
+    profile = str(readiness.get("profile") or "default").strip() or "default"
+    error = str(readiness.get("message") or _MODEL_NOT_CONFIGURED_MESSAGE).strip()
+    code = str(readiness.get("code") or _MODEL_NOT_CONFIGURED_CODE).strip()
+    now = int(time.time() * 1000)
+    run.update(
+        {
+            "status": "failed",
+            "stage": "failed",
+            "error": error,
+            "error_code": code,
+            "retryable": False,
+            "completed_at": now,
+            "updated_at": now,
+        }
+    )
+    message_key = f"{turn_id}:chat:preflight-failed"
+    messages = conversation.setdefault("messages", [])
+    existing = next(
+        (
+            item
+            for item in messages
+            if isinstance(item, dict)
+            and str((item.get("meta") or {}).get("message_key") or "") == message_key
+        ),
+        None,
+    )
+    payload = {
+        "role": "assistant",
+        "name": profile,
+        "content": error,
+        "status": "failed",
+        "kind": "message",
+        "meta": {
+            "role_stage": "chat",
+            "base_role_stage": "chat",
+            "phase": "failed",
+            "message_key": message_key,
+            "role_label": "Hermes",
+            "profile": profile,
+            "error_code": code,
+            "retryable": False,
+            "completed_at": now,
+        },
+    }
+    if existing is None:
+        message = _append_message(conversation, **payload)
+    else:
+        existing.update(payload)
+        existing["updated_at"] = now
+        message = existing
+    _project_native_message(message)
+    conversation["updated_at"] = now
+
+
 def classify_user_intent(
     content: str,
     *,
@@ -2825,7 +2998,7 @@ def apply_profile_event(
     activities = state.setdefault("activities", [])
     now = int(time.time() * 1000)
 
-    if event_type == "session.info":
+    if event_type in {"session.info", "request.accepted"}:
         state["runtime_session_id"] = str(
             payload.get("session_id") or state.get("runtime_session_id") or ""
         ).strip()
@@ -3115,7 +3288,13 @@ def _persist_hosted_role_state(
     semantic_milestone: str = "",
 ) -> None:
     state_content = str(state.get("content") or "").strip()
-    content = state_content or content_fallback
+    state_status = str(state.get("status") or "streaming")
+    state_error = str(state.get("error") or "").strip()
+    content = state_content or (
+        f"本阶段未完成：{state_error}"
+        if state_status == "failed" and state_error
+        else content_fallback
+    )
     activities = [
         _redact_sensitive(dict(item))
         for item in state.get("activities") or []
@@ -3128,7 +3307,6 @@ def _persist_hosted_role_state(
         "dispatch": ["worker"],
     }.get(base_stage, [])
     now = int(time.time() * 1000)
-    state_status = str(state.get("status") or "streaming")
     if state_status in _HOSTED_TERMINAL_STATUSES:
         phase = "handoff" if base_stage in {"worker", "reviewer"} else "completed"
     elif state_content or activities:
@@ -3163,12 +3341,17 @@ def _persist_hosted_role_state(
         "completed_at": now if str(state.get("status") or "") in _HOSTED_TERMINAL_STATUSES else None,
         "milestone_count": int(state.get("milestone_count") or 0),
         "milestone_content": str(state.get("milestone_content") or ""),
+        "request_accepted": bool(state.get("request_accepted")),
         "updated_at": now,
     }
+    patch = {"role_events": {role_stage: snapshot}}
+    if snapshot["request_accepted"]:
+        patch["request_accepted"] = True
+        patch["request_accepted_at"] = now
     _persist_hosted_turn(
         conversation_id,
         turn_id,
-        patch={"role_events": {role_stage: snapshot}},
+        patch=patch,
         runtime_session=(
             profile,
             str(state.get("runtime_session_id") or "").strip(),
@@ -3228,6 +3411,7 @@ def _run_hosted_role(
         "started_at": int(time.time() * 1000),
         "milestone_count": 0,
         "milestone_content": "",
+        "request_accepted": False,
     }
     if isinstance(previous_state, dict):
         state.update(
@@ -3248,6 +3432,7 @@ def _run_hosted_role(
                 ),
                 "milestone_count": int(previous_state.get("milestone_count") or 0),
                 "milestone_content": str(previous_state.get("milestone_content") or ""),
+                "request_accepted": bool(previous_state.get("request_accepted")),
             }
         )
     if (
@@ -3259,20 +3444,47 @@ def _run_hosted_role(
             str(state["status"]),
             state,
         )
-    _persist_hosted_role_state(
-        conversation_id,
-        turn_id,
-        profile=profile,
-        role_stage=role_stage,
-        role_label=role_label,
-        state=state,
-        content_fallback=start_text,
-        final_report=final_report,
-    )
+    if role_stage.split(":", 1)[0] != "chat":
+        _persist_hosted_role_state(
+            conversation_id,
+            turn_id,
+            profile=profile,
+            role_stage=role_stage,
+            role_label=role_label,
+            state=state,
+            content_fallback=start_text,
+            final_report=final_report,
+        )
     last_persisted_at = 0.0
 
     def persist() -> None:
         nonlocal last_persisted_at
+        base_stage = role_stage.split(":", 1)[0]
+        if (
+            base_stage == "chat"
+            and not str(state.get("content") or "").strip()
+            and not state.get("activities")
+            and str(state.get("status") or "") not in _HOSTED_TERMINAL_STATUSES
+        ):
+            patch: dict[str, Any] = {}
+            if state.get("request_accepted"):
+                patch.update(
+                    {
+                        "request_accepted": True,
+                        "request_accepted_at": int(time.time() * 1000),
+                    }
+                )
+            _persist_hosted_turn(
+                conversation_id,
+                turn_id,
+                patch=patch,
+                runtime_session=(
+                    profile,
+                    str(state.get("runtime_session_id") or "").strip(),
+                ),
+            )
+            last_persisted_at = time.monotonic()
+            return
         _persist_hosted_role_state(
             conversation_id,
             turn_id,
@@ -3335,15 +3547,25 @@ def _run_hosted_role(
             for activity in state.get("activities") or []
         )
         apply_profile_event(state, event)
+        if event_type == "request.accepted":
+            state["request_accepted"] = True
         first_visible_delta = (
             event_type == "message.delta" and not had_content
         ) or (
             event_type == "reasoning.delta" and not had_reasoning
         )
         if (
-            event_type not in {"message.delta", "reasoning.delta"}
+            event_type == "request.accepted"
+            or event_type in {"error", "message.complete"}
+            or (
+                bool(state.get("request_accepted"))
+                and event_type not in {"message.delta", "reasoning.delta"}
+            )
             or first_visible_delta
-            or time.monotonic() - last_persisted_at >= _HOSTED_EVENT_FLUSH_SECONDS
+            or (
+                bool(state.get("request_accepted"))
+                and time.monotonic() - last_persisted_at >= _HOSTED_EVENT_FLUSH_SECONDS
+            )
         ):
             persist()
 
@@ -4456,6 +4678,20 @@ def execute_hosted_chat(
             raise RuntimeError("Hosted turn record does not exist")
         if run.get("status") in _HOSTED_TERMINAL_STATUSES:
             return
+        selected_profiles = [
+            str(item).strip()
+            for item in run.get("profiles") or []
+            if str(item).strip()
+        ]
+        profile = selected_profiles[0] if selected_profiles else str(
+            conversation.get("profile") or "default"
+        )
+        if runner is run_profile_turn:
+            readiness = profile_model_readiness(profile)
+            if not readiness["ready"]:
+                _fail_hosted_turn_preflight(conversation, run, readiness)
+                save_single_state(state)
+                return
         now = int(time.time() * 1000)
         run.update({"status": "running", "stage": "chat", "updated_at": now})
         run.setdefault("started_at", now)
@@ -7120,8 +7356,15 @@ def _enqueued_turn_response(
     hosted = (conversation.get("hosted_turns") or {}).get(turn_id)
     if not isinstance(hosted, dict):
         hosted = {}
+    error = None
+    if str(hosted.get("status") or "") == "failed" and hosted.get("error"):
+        error = {
+            "code": str(hosted.get("error_code") or "hosted_turn_failed"),
+            "message": str(hosted.get("error") or "Hermes 执行失败"),
+            "retryable": bool(hosted.get("retryable")),
+        }
     return {
-        "accepted": True,
+        "accepted": bool(request_record.get("accepted", True)),
         "replayed": replayed,
         "request_id": str(request_record.get("request_id") or ""),
         "conversation_id": str(conversation.get("id") or ""),
@@ -7129,6 +7372,7 @@ def _enqueued_turn_response(
         "route": dict(request_record.get("route") or {}),
         "route_message": route_message or None,
         "hosted_turn": _public_hosted_turn(hosted),
+        "error": error,
     }
 
 
@@ -7240,6 +7484,11 @@ def enqueue_hosted_turn(
             else list(route.get("profiles") or [])
         ),
         requested_artifact=bool(route.get("artifact_required")),
+    )
+    model_readiness = (
+        profile_model_readiness(selected_profiles[0])
+        if mode == "chat"
+        else {"ready": True}
     )
     output_dir = _hosted_turn_output_dir(conversation_id, turn_id).resolve()
     delivery_context = payload.delivery_context.strip()
@@ -7355,6 +7604,12 @@ def enqueue_hosted_turn(
                 output_dir=str(output_dir),
                 attachment_ids=attachment_ids,
             )
+            if not model_readiness["ready"]:
+                _fail_hosted_turn_preflight(
+                    conversation,
+                    hosted,
+                    model_readiness,
+                )
             if conversation.get("title") in {"", "新对话", None}:
                 conversation["title"] = summarize_task_title(message_content)
             now = int(time.time() * 1000)
@@ -7365,6 +7620,7 @@ def enqueue_hosted_turn(
                 "message_id": message_id,
                 "route_message_id": route_message_id,
                 "route": route,
+                "accepted": bool(model_readiness["ready"]),
                 "created_at": now,
             }
             requests[request_id] = request_record
@@ -7391,7 +7647,9 @@ def enqueue_hosted_turn(
             turn_id=turn_id,
             profile=str(conversation.get("profile") or "default"),
         )
-    start_hosted_workflow(conversation_id, turn_id)
+    hosted_response = response.get("hosted_turn") or {}
+    if str(hosted_response.get("status") or "") not in _HOSTED_TERMINAL_STATUSES:
+        start_hosted_workflow(conversation_id, turn_id)
     if accepted:
         _notify_hosted_update()
     return response
@@ -7441,6 +7699,11 @@ def create_hosted_turn(
         ),
         requested_artifact=payload.artifact_required,
     )
+    model_readiness = (
+        profile_model_readiness(selected_profiles[0])
+        if mode == "chat"
+        else {"ready": True}
+    )
     attachment_ids = list(
         dict.fromkeys(str(item).strip() for item in payload.attachment_ids)
     )
@@ -7486,6 +7749,8 @@ def create_hosted_turn(
             output_dir=str(output_dir),
             attachment_ids=attachment_ids,
         )
+        if not model_readiness["ready"]:
+            _fail_hosted_turn_preflight(conversation, run, model_readiness)
         save_single_state(state)
     if attachment_ids:
         _file_library().update_links(
@@ -7495,7 +7760,8 @@ def create_hosted_turn(
             turn_id=turn_id,
             profile=str(conversation.get("profile") or "default"),
         )
-    start_hosted_workflow(conversation_id, turn_id)
+    if str(run.get("status") or "") not in _HOSTED_TERMINAL_STATUSES:
+        start_hosted_workflow(conversation_id, turn_id)
     return {"hosted_turn": _public_hosted_turn(run)}
 
 
@@ -8236,6 +8502,18 @@ def _profile_event_runner_main() -> int:
         agent.suppress_status_output = True
         emit(
             "session.info",
+            {
+                "session_id": str(getattr(agent, "session_id", "") or ""),
+                "model": str(getattr(agent, "model", model) or model),
+                "provider": str(
+                    getattr(agent, "provider", runtime.get("provider"))
+                    or runtime.get("provider")
+                    or ""
+                ),
+            },
+        )
+        emit(
+            "request.accepted",
             {
                 "session_id": str(getattr(agent, "session_id", "") or ""),
                 "model": str(getattr(agent, "model", model) or model),

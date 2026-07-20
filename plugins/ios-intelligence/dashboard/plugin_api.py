@@ -37,6 +37,7 @@ _STORE_LOCK = threading.Lock()
 _STORE: Optional[IOSIntelligenceStore] = None
 _SCHEDULER: Optional[Any] = None
 _MCP_RUNTIME: Optional[IOSMCPRuntimeSupervisor] = None
+_MCP_STARTUP_THREAD: Optional[threading.Thread] = None
 
 
 def intelligence_store(database_path: str = "") -> IOSIntelligenceStore:
@@ -52,7 +53,7 @@ def intelligence_store(database_path: str = "") -> IOSIntelligenceStore:
 
 @asynccontextmanager
 async def ios_intelligence_lifespan(_app):
-    global _MCP_RUNTIME, _SCHEDULER
+    global _MCP_RUNTIME, _MCP_STARTUP_THREAD, _SCHEDULER
     scheduler = None
     runtime = None
     if IOSIntelligenceScheduler is not None:
@@ -80,7 +81,6 @@ async def ios_intelligence_lifespan(_app):
                 ),
             )
             if config.supervisor.enabled:
-                runtime.start()
                 _MCP_RUNTIME = runtime
         scheduler = IOSIntelligenceScheduler(
             store=store,
@@ -113,6 +113,12 @@ async def ios_intelligence_lifespan(_app):
         )
         scheduler.start()
         _SCHEDULER = scheduler
+        if runtime is not None and config.supervisor.enabled:
+            # Fleet startup is intentionally outside the blocking lifespan
+            # path. The HTTP API and deletion-recovery scheduler become
+            # available first, while /health truthfully reports starting until
+            # all 21 isolated endpoints pass tools/list.
+            _MCP_STARTUP_THREAD = runtime.start_async()
     try:
         yield
     finally:
@@ -121,6 +127,7 @@ async def ios_intelligence_lifespan(_app):
         if runtime is not None:
             runtime.stop()
         _MCP_RUNTIME = None
+        _MCP_STARTUP_THREAD = None
         _SCHEDULER = None
 
 
@@ -245,6 +252,7 @@ def health() -> dict[str, Any]:
         "schema_compatible": bool(schema.get("compatible")),
         "scheduler_running": bool(_SCHEDULER and _SCHEDULER.running),
         "mcp_supervisor_running": bool(runtime_health["running"]),
+        "mcp_supervisor_starting": bool(runtime_health.get("starting")),
         "mcp_runtime": runtime_health,
     }
 

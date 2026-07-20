@@ -1344,6 +1344,10 @@ def test_plugin_lifespan_wires_real_weather_route_and_mcp_runtime(monkeypatch, t
         def start(self):
             self.running = True
 
+        def start_async(self):
+            self.start()
+            return object()
+
         def stop(self):
             self.running = False
 

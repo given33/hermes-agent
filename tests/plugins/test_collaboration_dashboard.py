@@ -9,6 +9,7 @@ import unittest
 from tempfile import TemporaryDirectory
 from pathlib import Path
 from types import SimpleNamespace
+from typing import Any
 from unittest.mock import patch
 
 
@@ -56,6 +57,147 @@ class CollaborationDashboardTests(unittest.TestCase):
         self.assertEqual(resolved, ["ios-location"])
         self.assertEqual(calls[0], "discover")
         self.assertEqual(calls[1], ("resolve", config, "cli"))
+
+    def test_profile_model_readiness_rejects_virtual_moa_without_real_credentials(self):
+        module = load_module()
+        profile = SimpleNamespace(
+            name="default",
+            description="",
+            model="default",
+            provider="moa",
+            gateway_running=False,
+        )
+        preset = {
+            "reference_models": [
+                {"provider": "openai-codex", "model": "gpt-test"},
+                {"provider": "openrouter", "model": "reference-test"},
+            ],
+            "aggregator": {"provider": "openrouter", "model": "aggregate-test"},
+        }
+
+        with TemporaryDirectory() as tmp, patch.object(
+            module, "list_profiles", return_value=[profile]
+        ), patch(
+            "hermes_cli.profiles.resolve_profile_env", return_value=tmp
+        ), patch(
+            "hermes_cli.config.load_config", return_value={"moa": {}}
+        ), patch(
+            "hermes_cli.moa_config.resolve_moa_preset", return_value=preset
+        ), patch(
+            "hermes_cli.runtime_provider.resolve_runtime_provider",
+            side_effect=[RuntimeError("missing codex credential")],
+        ) as resolver:
+            readiness = module.profile_model_readiness("default")
+
+        self.assertFalse(readiness["ready"])
+        self.assertEqual(readiness["code"], "model_credentials_missing")
+        self.assertEqual(resolver.call_count, 1)
+        self.assertNotIn("missing codex credential", readiness["message"])
+
+    def test_profile_model_readiness_accepts_only_a_resolved_credential_path(self):
+        module = load_module()
+        profile = SimpleNamespace(
+            name="default",
+            description="",
+            model="model-test",
+            provider="custom",
+            gateway_running=False,
+        )
+
+        with TemporaryDirectory() as tmp, patch.object(
+            module, "list_profiles", return_value=[profile]
+        ), patch(
+            "hermes_cli.profiles.resolve_profile_env", return_value=tmp
+        ), patch(
+            "hermes_cli.config.load_config", return_value={}
+        ), patch(
+            "hermes_cli.runtime_provider.resolve_runtime_provider",
+            return_value={
+                "provider": "custom",
+                "base_url": "https://models.test/v1",
+                "api_key": "configured-test-key",
+                "credential_pool": None,
+            },
+        ):
+            readiness = module.profile_model_readiness("default")
+
+        self.assertTrue(readiness["ready"])
+        self.assertEqual(readiness["model"], "model-test")
+        self.assertEqual(readiness["provider"], "custom")
+
+    def test_enqueue_without_real_model_credentials_is_terminal_and_never_starts(self):
+        module = load_module()
+        module.RouteMessageBody.model_rebuild(_types_namespace={"Any": Any})
+        conversation = module.create_single_conversation("default")
+        conversation["owner_id"] = "owner-a"
+        state = {"conversations": [conversation]}
+        starts = []
+        payload = SimpleNamespace(
+            request_id="request-no-model",
+            turn_id="turn-no-model",
+            message={
+                "id": "message-no-model",
+                "role": "user",
+                "name": "user",
+                "content": "你好",
+                "status": "completed",
+            },
+            recent_messages=[],
+            profiles=[],
+            attachment_ids=[],
+            attachment_context="",
+            delivery_context="",
+        )
+        route = {
+            "mode": "chat",
+            "label": "单聊",
+            "reason": "普通对话",
+            "title": "你好",
+            "profiles": ["default"],
+            "artifact_required": False,
+            "artifact": {"decision": "none", "types": []},
+            "source": "deterministic",
+            "confidence": 1.0,
+        }
+        readiness = {
+            "ready": False,
+            "code": "model_credentials_missing",
+            "message": module._MODEL_NOT_CONFIGURED_MESSAGE,
+            "profile": "default",
+            "model": "default",
+            "provider": "moa",
+        }
+
+        with patch.object(module, "load_single_state", return_value=state), patch.object(
+            module, "save_single_state", side_effect=lambda _state: None
+        ), patch.object(
+            module, "owner_id_from_request", return_value="owner-a"
+        ), patch.object(
+            module, "route_message", return_value=route
+        ), patch.object(
+            module, "profile_model_readiness", return_value=readiness
+        ), patch.object(
+            module,
+            "start_hosted_workflow",
+            side_effect=lambda *args: starts.append(args),
+        ):
+            first = module.enqueue_hosted_turn(conversation["id"], payload, SimpleNamespace())
+            replay = module.enqueue_hosted_turn(conversation["id"], payload, SimpleNamespace())
+
+        self.assertFalse(first["accepted"])
+        self.assertFalse(replay["accepted"])
+        self.assertTrue(replay["replayed"])
+        self.assertEqual(first["error"]["code"], "model_credentials_missing")
+        self.assertFalse(first["error"]["retryable"])
+        self.assertEqual(starts, [])
+        hosted = conversation["hosted_turns"]["turn-no-model"]
+        self.assertEqual(hosted["status"], "failed")
+        assistant_messages = [
+            item for item in conversation["messages"] if item.get("role") == "assistant"
+        ]
+        self.assertEqual(len(assistant_messages), 1)
+        self.assertEqual(assistant_messages[0]["content"], module._MODEL_NOT_CONFIGURED_MESSAGE)
+        self.assertNotIn("正在处理", assistant_messages[0]["content"])
 
     def test_room_store_round_trip(self):
         module = load_module()
@@ -2776,6 +2918,60 @@ class CollaborationDashboardTests(unittest.TestCase):
         self.assertEqual(
             conversation["runtime_sessions"]["reviewer"],
             "session-resolved-tip",
+        )
+
+    def test_hosted_chat_does_not_publish_a_processing_message_before_model_output(self):
+        module = load_module()
+        conversation = module.create_single_conversation("default")
+        state = {"conversations": [conversation]}
+        module.load_single_state = lambda: state
+        module.save_single_state = lambda _state: None
+        module._schedule_mobile_completion_notification = lambda *_args: None
+        module.create_hosted_turn_record(
+            conversation,
+            turn_id="turn-no-fake-processing",
+            content="你好",
+            title="你好",
+            profiles=["default"],
+            artifact_required=False,
+            mode="chat",
+            route_metadata={"mode": "chat"},
+        )
+        visible_before_output = []
+
+        def runner(_profile, _prompt, *, event_callback=None, **_kwargs):
+            event_callback(
+                {
+                    "type": "request.accepted",
+                    "payload": {
+                        "session_id": "session-real-request",
+                        "model": "model-a",
+                        "provider": "provider-a",
+                    },
+                }
+            )
+            visible_before_output.extend(
+                message
+                for message in conversation["messages"]
+                if message.get("meta", {}).get("role_stage") == "chat"
+            )
+            return "真实模型回复"
+
+        module.execute_hosted_chat(
+            conversation["id"],
+            "turn-no-fake-processing",
+            runner=runner,
+        )
+
+        self.assertEqual(visible_before_output, [])
+        chat_messages = [
+            message
+            for message in conversation["messages"]
+            if message.get("meta", {}).get("role_stage") == "chat"
+        ]
+        self.assertEqual([message["content"] for message in chat_messages], ["真实模型回复"])
+        self.assertFalse(
+            any("收到消息" in message.get("content", "") for message in chat_messages)
         )
 
     def test_completed_hosted_chat_role_is_not_executed_again_after_restart(self):

@@ -34,13 +34,20 @@ runtime_files=(
   "hermes_cli/web_server.py"
   "tui_gateway/server.py"
 )
+nginx_files=(
+  "deploy/public/nginx-00-hermes-security.conf"
+  "deploy/public/nginx-daxueshenmai.top.conf"
+)
 
 target="${work}/target"
 backup="${work}/backups"
 fake_bin="${work}/bin"
 token_file="${work}/connector.token"
 state_file="${work}/state/single.json"
-install -d -m 0700 "${stage}" "${target}" "${backup}" "${fake_bin}"
+nginx_dir="${work}/nginx"
+nginx_security_target="${nginx_dir}/00-hermes-security.conf"
+nginx_site_target="${nginx_dir}/daxueshenmai.top.conf"
+install -d -m 0700 "${stage}" "${target}" "${backup}" "${fake_bin}" "${nginx_dir}"
 install -d -m 0700 "$(dirname "${state_file}")"
 printf '%s' "connector-test-token" >"${token_file}"
 printf '%s\n' '{"conversations":[{"id":"old-state"}]}' >"${state_file}"
@@ -49,10 +56,17 @@ for relative in "${runtime_files[@]}"; do
   install -D -m 0644 /dev/null "${target}/${relative}"
   printf 'old:%s\n' "${relative}" >"${target}/${relative}"
 done
+for relative in "${nginx_files[@]}"; do
+  install -D -m 0644 "${repo}/${relative}" "${stage}/${relative}"
+done
+printf '%s\n' "old:nginx-security" >"${nginx_security_target}"
+printf '%s\n' "old:nginx-site" >"${nginx_site_target}"
 
 cat >"${fake_bin}/systemctl" <<'SH'
 #!/usr/bin/env bash
-printf '%s\n' "${1:-}" >>"${FAKE_SYSTEMCTL_LOG}"
+if [[ "${1:-}" != "show" ]]; then
+  printf '%s\n' "${1:-}" >>"${FAKE_SYSTEMCTL_LOG}"
+fi
 if [[ "${1:-}" == "start" && "${FAKE_STATUS_FAIL:-0}" == 1 \
   && ! -e "${HERMES_COLLABORATION_STATE_FILE}.mutated" ]]; then
   printf '%s\n' '{"conversations":[{"id":"new-state"}]}' >"${HERMES_COLLABORATION_STATE_FILE}"
@@ -65,9 +79,18 @@ if [[ "${1:-}" == "start" && "${FAKE_SIGNAL_ON_START:-0}" == 1 \
   kill -TERM "${PPID}"
 fi
 case "${1:-}" in
-  stop|start|is-active) exit 0 ;;
+  show)
+    printf '%s\n' "${FAKE_SYSTEMD_ENVIRONMENT:-}"
+    exit 0
+    ;;
+  stop|start|is-active|reload) exit 0 ;;
   *) exit 0 ;;
 esac
+SH
+cat >"${fake_bin}/nginx" <<'SH'
+#!/usr/bin/env bash
+printf '%s\n' "$*" >>"${FAKE_NGINX_LOG}"
+[[ "${FAKE_NGINX_FAIL:-0}" != 1 ]]
 SH
 cat >"${fake_bin}/sleep" <<'SH'
 #!/usr/bin/env bash
@@ -122,7 +145,7 @@ else
   printf '%s\n' "${payload}"
 fi
 SH
-chmod 0755 "${fake_bin}/systemctl" "${fake_bin}/sleep" "${fake_bin}/curl"
+chmod 0755 "${fake_bin}/systemctl" "${fake_bin}/nginx" "${fake_bin}/sleep" "${fake_bin}/curl"
 
 run_installer() {
   env \
@@ -130,6 +153,7 @@ run_installer() {
     FAKE_STATUS_FAIL="$1" \
     FAKE_SIGNAL_ON_START="${2:-0}" \
     FAKE_HANDSHAKE_FAIL="${3:-0}" \
+    FAKE_NGINX_FAIL="${4:-0}" \
     HERMES_AGENT_ROOT="${target}" \
     HERMES_RUNTIME_PYTHON="$(command -v python3)" \
     HERMES_AGENT_SERVICE="hermes-agent-test.service" \
@@ -140,7 +164,12 @@ run_installer() {
     HERMES_INSTALL_LOCK_FILE="${work}/collaboration-install.lock" \
     HERMES_COLLABORATION_STATE_FILE="${state_file}" \
     HERMES_COLLABORATION_CONNECTOR_TOKEN_FILE="${token_file}" \
+    HERMES_NGINX_SECURITY_TARGET="${nginx_security_target}" \
+    HERMES_NGINX_SITE_TARGET="${nginx_site_target}" \
+    HERMES_NGINX_SERVICE="nginx-test.service" \
+    HERMES_NGINX_BINARY="${fake_bin}/nginx" \
     FAKE_SYSTEMCTL_LOG="${work}/systemctl.log" \
+    FAKE_NGINX_LOG="${work}/nginx.log" \
     /bin/bash "${installer}" "${version}" "${stage}"
 }
 
@@ -158,11 +187,33 @@ for relative in "${runtime_files[@]}"; do
     exit 1
   }
 done
+[[ "$(<"${nginx_security_target}")" == "old:nginx-security" ]]
+[[ "$(<"${nginx_site_target}")" == "old:nginx-site" ]]
 grep -Fq '"id":"old-state"' "${state_file}"
 [[ "$(sed -n '1p' "${work}/systemctl.log")" == "stop" ]]
 [[ "$(sed -n '2p' "${work}/systemctl.log")" == "start" ]]
 [[ "$(sed -n '3p' "${work}/systemctl.log")" == "is-active" ]]
 [[ "$(tail -n 2 "${work}/systemctl.log" | sed -n '1p')" == "stop" ]]
+[[ "$(tail -n 1 "${work}/systemctl.log")" == "start" ]]
+
+: >"${work}/systemctl.log"
+: >"${work}/nginx.log"
+set +e
+run_installer 0 0 0 1 >"${work}/nginx-failure.stdout" 2>"${work}/nginx-failure.stderr"
+nginx_failure_status=$?
+set -e
+[[ "${nginx_failure_status}" -ne 0 ]] || {
+  printf '%s\n' "forced nginx validation failure unexpectedly succeeded" >&2
+  exit 1
+}
+grep -Fq "nginx configuration validation failed" "${work}/nginx-failure.stderr"
+[[ "$(<"${nginx_security_target}")" == "old:nginx-security" ]]
+[[ "$(<"${nginx_site_target}")" == "old:nginx-site" ]]
+for relative in "${runtime_files[@]}"; do
+  [[ "$(<"${target}/${relative}")" == "old:${relative}" ]]
+done
+[[ "$(sed -n '1p' "${work}/systemctl.log")" == "stop" ]]
+[[ "$(sed -n '2p' "${work}/systemctl.log")" == "stop" ]]
 [[ "$(tail -n 1 "${work}/systemctl.log")" == "start" ]]
 
 : >"${work}/systemctl.log"
@@ -213,8 +264,11 @@ run_installer 0 0 >"${work}/success.stdout" 2>"${work}/success.stderr" || {
 for relative in "${runtime_files[@]}"; do
   cmp -- "${stage}/${relative}" "${target}/${relative}"
 done
+cmp -- "${stage}/deploy/public/nginx-00-hermes-security.conf" "${nginx_security_target}"
+cmp -- "${stage}/deploy/public/nginx-daxueshenmai.top.conf" "${nginx_site_target}"
 grep -Fq "service=active" "${work}/success.stdout"
 [[ "$(sed -n '1p' "${work}/systemctl.log")" == "stop" ]]
 [[ "$(sed -n '2p' "${work}/systemctl.log")" == "start" ]]
 [[ "$(sed -n '3p' "${work}/systemctl.log")" == "is-active" ]]
+[[ "$(tail -n 1 "${work}/systemctl.log")" == "reload" ]]
 printf '%s\n' "public installer transaction test passed"

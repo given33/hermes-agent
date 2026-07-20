@@ -51,6 +51,8 @@ required=(
   "hermes_cli/dashboard_auth/mobile_notifications.py"
   "hermes_cli/web_server.py"
   "tui_gateway/server.py"
+  "deploy/public/nginx-00-hermes-security.conf"
+  "deploy/public/nginx-daxueshenmai.top.conf"
 )
 # The iOS intelligence release is staged alongside the collaboration release.
 # Keep this list optional for one-release rollback compatibility: an older
@@ -185,8 +187,23 @@ mobile_device_store_target="${target_root}/hermes_cli/dashboard_auth/mobile_devi
 mobile_notifications_target="${target_root}/hermes_cli/dashboard_auth/mobile_notifications.py"
 web_server_target="${target_root}/hermes_cli/web_server.py"
 tui_gateway_target="${target_root}/tui_gateway/server.py"
+nginx_security_target="${HERMES_NGINX_SECURITY_TARGET:-/etc/nginx/conf.d/00-hermes-security.conf}"
+nginx_site_target="${HERMES_NGINX_SITE_TARGET:-/etc/nginx/conf.d/daxueshenmai.top.conf}"
+nginx_service="${HERMES_NGINX_SERVICE:-nginx.service}"
+nginx_binary="${HERMES_NGINX_BINARY:-nginx}"
 [[ -d "${target_root}" ]] || die "target root does not exist: ${target_root}"
 id "${service_user}" >/dev/null 2>&1 || die "service user does not exist: ${service_user}"
+command -v "${nginx_binary}" >/dev/null 2>&1 || die "nginx binary is missing: ${nginx_binary}"
+for nginx_target in "${nginx_security_target}" "${nginx_site_target}"; do
+  nginx_target_dir="$(dirname "${nginx_target}")"
+  [[ -d "${nginx_target_dir}" && ! -L "${nginx_target_dir}" ]] \
+    || die "unsafe nginx target directory: ${nginx_target_dir}"
+  [[ "$(stat -c '%u' "${nginx_target_dir}")" == 0 ]] \
+    || die "nginx target directory must be root-owned: ${nginx_target_dir}"
+  nginx_target_mode="$(stat -c '%a' "${nginx_target_dir}")"
+  (( (8#${nginx_target_mode} & 0022) == 0 )) \
+    || die "nginx target directory must not be group/world-writable: ${nginx_target_dir}"
+done
 
 # Existing connector installations must pass the deployment gate before any
 # file changes. A legacy installation without the route is permitted exactly
@@ -223,14 +240,25 @@ if [[ -z "${token_file}" && -r "${env_file}" ]]; then
   token_file="${token_file#\'}"; token_file="${token_file%\'}"
 fi
 [[ -n "${token_file}" && -r "${token_file}" ]] || die "connector token file is not readable; health preflight refused"
-runtime_home=""
+env_runtime_home=""
 if [[ -r "${env_file}" ]]; then
-  runtime_home="$(sed -n 's/^HERMES_HOME=//p' "${env_file}" | tail -n 1)"
-  runtime_home="${runtime_home#\"}"; runtime_home="${runtime_home%\"}"
-  runtime_home="${runtime_home#\'}"; runtime_home="${runtime_home%\'}"
+  env_runtime_home="$(sed -n 's/^HERMES_HOME=//p' "${env_file}" | tail -n 1)"
+  env_runtime_home="${env_runtime_home#\"}"; env_runtime_home="${env_runtime_home%\"}"
+  env_runtime_home="${env_runtime_home#\'}"; env_runtime_home="${env_runtime_home%\'}"
 fi
 service_home="$(getent passwd "${service_user}" | cut -d: -f6)"
-runtime_home="${HERMES_HOME_DIR:-${runtime_home:-${service_home}/.hermes}}"
+systemd_environment="$(systemctl show "${service}" --property=Environment --value 2>/dev/null || true)"
+systemd_runtime_home="$(
+  printf '%s\n' "${systemd_environment}" \
+    | tr ' ' '\n' \
+    | sed -n 's/^HERMES_HOME=//p' \
+    | tail -n 1
+)"
+systemd_runtime_home="${systemd_runtime_home#\"}"; systemd_runtime_home="${systemd_runtime_home%\"}"
+systemd_runtime_home="${systemd_runtime_home#\'}"; systemd_runtime_home="${systemd_runtime_home%\'}"
+runtime_home="${HERMES_HOME_DIR:-${systemd_runtime_home:-${env_runtime_home:-${service_home}/.hermes}}}"
+[[ -n "${runtime_home}" && "${runtime_home}" == /* ]] \
+  || die "Hermes runtime home must be an absolute path"
 state_target="${HERMES_COLLABORATION_STATE_FILE:-${runtime_home}/collaboration/single.json}"
 config_target="${HERMES_CONFIG_FILE:-${runtime_home}/config.yaml}"
 ios_supervisor_target="${runtime_home}/ios-mcp-supervisor.db"
@@ -296,6 +324,24 @@ assert "artifact-upload" in (data.get("capabilities") or [])
 assert "attachment-download" in (data.get("capabilities") or [])
 PY
 }
+validate_ios_health() {
+  local output="$1"
+  "${runtime_python}" - "${output}" <<'PY'
+import json, sys
+data = json.load(open(sys.argv[1], encoding="utf-8"))
+runtime = data.get("mcp_runtime") or {}
+assert data.get("scheduler_running") is True
+assert runtime.get("ok") is True
+assert runtime.get("running") is True
+assert runtime.get("starting") is not True
+assert runtime.get("healthy_count") == 21
+assert runtime.get("required_count") == 21
+services = runtime.get("services") or []
+assert len(services) == 21
+assert sum(len(item.get("tools") or []) for item in services) == 44
+assert all(item.get("ok") is True for item in services)
+PY
+}
 preflight_health="$(mktemp /run/hermes-agent-connector-preflight.XXXXXX)"
 if [[ -f "${plugin_target}/plugin_api.py" ]] \
   && grep -Fq '@router.get("/connector/health")' "${plugin_target}/plugin_api.py"; then
@@ -318,6 +364,7 @@ mkdir -p \
   "${backup}/plugins/collaboration/dashboard/dist" \
   "${backup}/hermes_cli/dashboard_auth" \
   "${backup}/tui_gateway" \
+  "${backup}/nginx" \
   "${backup}/state"
 
 backup_one() {
@@ -369,6 +416,8 @@ backup_one "${mobile_device_store_target}" "${backup}/hermes_cli/dashboard_auth/
 backup_one "${mobile_notifications_target}" "${backup}/hermes_cli/dashboard_auth/mobile_notifications.py"
 backup_one "${web_server_target}" "${backup}/hermes_cli/web_server.py"
 backup_one "${tui_gateway_target}" "${backup}/tui_gateway/server.py"
+backup_one "${nginx_security_target}" "${backup}/nginx/00-hermes-security.conf"
+backup_one "${nginx_site_target}" "${backup}/nginx/daxueshenmai.top.conf"
 if [[ "${ios_enabled}" == 1 ]]; then
   install -d -o "${service_user}" -g "${service_group}" -m 0755 \
     "${target_root}/plugins/ios-intelligence/dashboard"
@@ -393,10 +442,14 @@ fi
 
 transaction="$(mktemp -d "${target_root}/.collaboration-install.XXXXXX")"
 installed=0
+nginx_reload_attempted=0
 rollback() {
   local exit_code=$?
   trap - EXIT INT TERM HUP
   set +e
+  rm -f -- \
+    "$(dirname "${nginx_security_target}")/.$(basename "${nginx_security_target}").install.$$" \
+    "$(dirname "${nginx_site_target}")/.$(basename "${nginx_site_target}").install.$$"
   if [[ "${installed}" != 1 ]]; then
     systemctl stop "${service}" >/dev/null 2>&1 || true
     restore_one "${backup}/plugins/collaboration/dashboard/plugin_api.py" "${plugin_target}/plugin_api.py"
@@ -409,6 +462,8 @@ rollback() {
     restore_one "${backup}/hermes_cli/dashboard_auth/mobile_notifications.py" "${mobile_notifications_target}"
     restore_one "${backup}/hermes_cli/web_server.py" "${web_server_target}"
     restore_one "${backup}/tui_gateway/server.py" "${tui_gateway_target}"
+    restore_root_file "${backup}/nginx/00-hermes-security.conf" "${nginx_security_target}"
+    restore_root_file "${backup}/nginx/daxueshenmai.top.conf" "${nginx_site_target}"
     restore_sqlite "${backup}/state/mobile-auth.db" "${mobile_auth_target}"
     if [[ "${ios_enabled}" == 1 ]]; then
       for relative in "${ios_optional[@]}"; do
@@ -419,6 +474,11 @@ rollback() {
       restore_sqlite "${backup}/state/ios-mcp-supervisor.db" "${ios_supervisor_target}"
     fi
     restore_state "${backup}/state/single.json" "${state_target}"
+    if [[ "${nginx_reload_attempted}" == 1 ]]; then
+      "${nginx_binary}" -t >/dev/null 2>&1 \
+        && systemctl reload "${nginx_service}" >/dev/null 2>&1 \
+        || true
+    fi
     systemctl start "${service}" >/dev/null 2>&1 || true
   fi
   rm -rf -- "${transaction}"
@@ -436,6 +496,17 @@ restore_one() {
   local temporary="${destination}.rollback.$$"
   if [[ -f "${source}" ]]; then
     install -o "${service_user}" -g "${service_group}" -m 0644 "${source}" "${temporary}"
+    mv -f -- "${temporary}" "${destination}"
+  elif [[ -f "${source}.missing" ]]; then
+    rm -f -- "${destination}"
+  fi
+}
+restore_root_file() {
+  local source="$1"
+  local destination="$2"
+  local temporary="${destination}.rollback.$$"
+  if [[ -f "${source}" ]]; then
+    install -o root -g root -m 0644 "${source}" "${temporary}"
     mv -f -- "${temporary}" "${destination}"
   elif [[ -f "${source}.missing" ]]; then
     rm -f -- "${destination}"
@@ -493,6 +564,15 @@ install_atomic() {
   install -o "${service_user}" -g "${service_group}" -m 0644 "${source}" "${temporary}"
   mv -f -- "${temporary}" "${destination}"
 }
+install_root_atomic() {
+  local source="$1"
+  local destination="$2"
+  local temporary
+  temporary="$(dirname "${destination}")/.$(basename "${destination}").install.$$"
+  rm -f -- "${temporary}"
+  install -o root -g root -m 0644 "${source}" "${temporary}"
+  mv -f -- "${temporary}" "${destination}"
+}
 install_atomic "${snapshot}/plugins/collaboration/dashboard/plugin_api.py" "${plugin_target}/plugin_api.py"
 install_atomic "${snapshot}/plugins/collaboration/dashboard/manifest.json" "${plugin_target}/manifest.json"
 install_atomic "${snapshot}/plugins/collaboration/dashboard/dist/index.js" "${plugin_target}/dist/index.js"
@@ -503,6 +583,10 @@ install_atomic "${snapshot}/hermes_cli/dashboard_auth/mobile_device_store.py" "$
 install_atomic "${snapshot}/hermes_cli/dashboard_auth/mobile_notifications.py" "${mobile_notifications_target}"
 install_atomic "${snapshot}/hermes_cli/web_server.py" "${web_server_target}"
 install_atomic "${snapshot}/tui_gateway/server.py" "${tui_gateway_target}"
+install_root_atomic "${snapshot}/deploy/public/nginx-00-hermes-security.conf" "${nginx_security_target}"
+install_root_atomic "${snapshot}/deploy/public/nginx-daxueshenmai.top.conf" "${nginx_site_target}"
+"${nginx_binary}" -t \
+  || { printf '%s\n' "nginx configuration validation failed" >&2; false; }
 if [[ "${ios_enabled}" == 1 ]]; then
   for relative in "${ios_optional[@]}"; do
     install_atomic "${snapshot}/${relative}" "${target_root}/${relative}"
@@ -557,31 +641,35 @@ PY
 ios_health_file=""
 if [[ "${ios_enabled}" == 1 ]]; then
   ios_health_file="$(mktemp /run/hermes-agent-ios-status.XXXXXX)"
-  if ! curl --fail --silent --show-error --max-time 10 \
-    --config "${curl_cfg}" \
-    http://127.0.0.2:9119/api/plugins/ios-intelligence/health >"${ios_health_file}"; then
-    printf '%s\n' "iOS intelligence health endpoint did not respond" >&2
+  ios_health_attempts="${HERMES_IOS_HEALTH_ATTEMPTS:-180}"
+  [[ "${ios_health_attempts}" =~ ^[1-9][0-9]*$ ]] \
+    || die "HERMES_IOS_HEALTH_ATTEMPTS must be a positive integer"
+  ios_healthy=0
+  for _ in $(seq 1 "${ios_health_attempts}"); do
+    if systemctl is-active --quiet "${service}" \
+      && curl --fail --silent --show-error --max-time 3 \
+        --config "${curl_cfg}" \
+        http://127.0.0.2:9119/api/plugins/ios-intelligence/health >"${ios_health_file}" \
+      && validate_ios_health "${ios_health_file}" 2>/dev/null; then
+      ios_healthy=1
+      break
+    fi
+    sleep 1
+  done
+  [[ "${ios_healthy}" == 1 ]] || {
+    printf '%s\n' "iOS intelligence runtime did not reach 21 healthy MCPs and 44 tools" >&2
+    validate_ios_health "${ios_health_file}" || true
     false
-  fi
-  "${runtime_python}" - "${ios_health_file}" <<'PY'
-import json, sys
-data = json.load(open(sys.argv[1], encoding="utf-8"))
-runtime = data.get("mcp_runtime") or {}
-assert data.get("scheduler_running") is True
-assert runtime.get("ok") is True
-assert runtime.get("healthy_count") == 21
-assert runtime.get("required_count") == 21
-services = runtime.get("services") or []
-assert len(services) == 21
-assert sum(len(item.get("tools") or []) for item in services) == 44
-assert all(item.get("ok") is True for item in services)
-PY
+  }
 fi
 connector_health_file="$(mktemp /run/hermes-agent-connector-status.XXXXXX)"
 validate_connector_health "${connector_health_file}" || {
   printf '%s\n' "connector contract did not pass after restart" >&2
   false
 }
+nginx_reload_attempted=1
+systemctl reload "${nginx_service}" \
+  || { printf '%s\n' "nginx reload failed" >&2; false; }
 installed=1
 rm -rf -- "${transaction}" "${health_file}" "${handshake_file}" \
   "${ios_health_file}" "${connector_health_file}" "${curl_cfg}"

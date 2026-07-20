@@ -11,8 +11,13 @@ repo="${HERMES_REPO:-$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)}"
 remote="${HERMES_PUBLIC_REMOTE:-admin@10.66.0.1}"
 version="${HERMES_COLLABORATION_VERSION:-}"
 installer="${repo}/deploy/public/install-collaboration-backend.sh"
+local_python="${HERMES_LOCAL_PYTHON:-}"
+if [[ -z "${local_python}" ]]; then
+  local_python="$(command -v python3 || command -v python || true)"
+fi
 
 [[ -f "${installer}" ]] || die "installer is missing"
+[[ -n "${local_python}" && -x "${local_python}" ]] || die "local Python runtime is missing"
 [[ -f "${repo}/plugins/collaboration/dashboard/plugin_api.py" ]] || die "plugin_api.py is missing"
 [[ -f "${repo}/plugins/collaboration/dashboard/manifest.json" ]] || die "manifest.json is missing"
 [[ -f "${repo}/plugins/collaboration/dashboard/dist/index.js" ]] || die "dist/index.js is missing"
@@ -23,6 +28,8 @@ installer="${repo}/deploy/public/install-collaboration-backend.sh"
 [[ -f "${repo}/hermes_cli/dashboard_auth/mobile_notifications.py" ]] || die "mobile_notifications.py is missing"
 [[ -f "${repo}/hermes_cli/web_server.py" ]] || die "web_server.py is missing"
 [[ -f "${repo}/tui_gateway/server.py" ]] || die "tui_gateway/server.py is missing"
+[[ -f "${repo}/deploy/public/nginx-00-hermes-security.conf" ]] || die "nginx security config is missing"
+[[ -f "${repo}/deploy/public/nginx-daxueshenmai.top.conf" ]] || die "nginx site config is missing"
 
 ios_hermes_assets=(
   "hermes_cli/account_cleanup.py"
@@ -55,7 +62,7 @@ for relative in "${ios_hermes_assets[@]}" "${ios_plugin_assets[@]}" \
 done
 
 if [[ -z "${version}" ]]; then
-  version="$(python3 - "${repo}/plugins/collaboration/dashboard/manifest.json" <<'PY'
+  version="$("${local_python}" - "${repo}/plugins/collaboration/dashboard/manifest.json" <<'PY'
 import json, sys
 with open(sys.argv[1], encoding="utf-8") as handle:
     print(json.load(handle).get("version", ""))
@@ -71,7 +78,7 @@ if [[ -n "${HERMES_SSH_IDENTITY:-}" ]]; then
   ssh_args+=(-i "${HERMES_SSH_IDENTITY}" -o IdentitiesOnly=yes)
 fi
 
-ssh "${ssh_args[@]}" "${remote}" "install -d -m 0700 '${stage}' '${stage}/plugins/collaboration/dashboard/dist' '${stage}/hermes_cli' '${stage}/hermes_cli/dashboard_auth' '${stage}/tui_gateway' '${stage}/plugins/ios-intelligence/dashboard' '${stage}/plugins/dashboard_auth/basic' '${stage}/tools'"
+ssh "${ssh_args[@]}" "${remote}" "install -d -m 0700 '${stage}' '${stage}/plugins/collaboration/dashboard/dist' '${stage}/hermes_cli' '${stage}/hermes_cli/dashboard_auth' '${stage}/tui_gateway' '${stage}/plugins/ios-intelligence/dashboard' '${stage}/plugins/dashboard_auth/basic' '${stage}/tools' '${stage}/deploy/public'"
 scp "${ssh_args[@]}" \
   "${repo}/plugins/collaboration/dashboard/plugin_api.py" \
   "${repo}/plugins/collaboration/dashboard/manifest.json" \
@@ -121,6 +128,10 @@ scp "${ssh_args[@]}" \
 scp "${ssh_args[@]}" \
   "${repo}/plugins/dashboard_auth/basic/__init__.py" \
   "${remote}:${stage}/plugins/dashboard_auth/basic/"
+scp "${ssh_args[@]}" \
+  "${repo}/deploy/public/nginx-00-hermes-security.conf" \
+  "${repo}/deploy/public/nginx-daxueshenmai.top.conf" \
+  "${remote}:${stage}/deploy/public/"
 scp "${ssh_args[@]}" "${installer}" "${remote}:${stage}/install-collaboration-backend.sh"
 ssh "${ssh_args[@]}" "${remote}" "chmod 0700 '${stage}/install-collaboration-backend.sh'; sudo -n /bin/bash '${stage}/install-collaboration-backend.sh' '${version}' '${stage}'"
 ssh "${ssh_args[@]}" "${remote}" "rm -rf -- '${stage}'"

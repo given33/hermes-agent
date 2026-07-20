@@ -528,7 +528,9 @@ class IOSMCPRuntimeSupervisor:
         self._active_ports: dict[str, int] = {}
         self._lock = threading.RLock()
         self._stop_event = threading.Event()
+        self._startup_thread: threading.Thread | None = None
         self._thread: threading.Thread | None = None
+        self.starting = False
         self.running = False
         self._active_ports.update(self._configured_active_ports())
 
@@ -638,14 +640,22 @@ class IOSMCPRuntimeSupervisor:
             ):
                 self.supervisor.disable(name, "disabled in mcp_servers config")
 
-    def start(self) -> "IOSMCPRuntimeSupervisor":
-        with self._lock:
-            if self.running:
-                return self
+    def _start_registered_services(self) -> None:
+        """Start the required fleet without holding the runtime-wide lock.
+
+        A full fleet can take tens of seconds to become healthy. Holding
+        ``_lock`` across that work blocks truthful health checks and, when this
+        method runs from a FastAPI lifespan, prevents the public API from ever
+        binding before all child interpreters have reached steady state.
+        """
+
+        required_ok = True
+        try:
             self._register_callbacks()
-            self._stop_event.clear()
-            required_ok = True
             for name in self.capabilities:
+                if self._stop_event.is_set():
+                    required_ok = False
+                    break
                 state = self.supervisor.status(name)["state"]
                 if state in {
                     MCPState.DISABLED.value,
@@ -655,14 +665,69 @@ class IOSMCPRuntimeSupervisor:
                     continue
                 if not self.start_service(name, verify=True):
                     required_ok = False
-            self.running = required_ok
-            self._thread = threading.Thread(
-                target=self._run,
-                name="ios-mcp-runtime-supervisor",
+        except Exception:
+            required_ok = False
+            raise
+        finally:
+            with self._lock:
+                self.starting = False
+                self.running = required_ok and not self._stop_event.is_set()
+                if threading.current_thread() is self._startup_thread:
+                    self._startup_thread = None
+                if (
+                    not self._stop_event.is_set()
+                    and (self._thread is None or not self._thread.is_alive())
+                ):
+                    self._thread = threading.Thread(
+                        target=self._run,
+                        name="ios-mcp-runtime-supervisor",
+                        daemon=True,
+                    )
+                    self._thread.start()
+
+    def start(self) -> "IOSMCPRuntimeSupervisor":
+        with self._lock:
+            if self.running:
+                return self
+            if self.starting:
+                startup_thread = self._startup_thread
+            else:
+                startup_thread = None
+                self.starting = True
+                self._stop_event.clear()
+                self._startup_thread = threading.current_thread()
+        if startup_thread is not None:
+            if startup_thread is not threading.current_thread():
+                startup_thread.join()
+            return self
+        self._start_registered_services()
+        return self
+
+    def start_async(self) -> threading.Thread:
+        """Start the fleet in the background and return its one startup worker."""
+
+        with self._lock:
+            existing = self._startup_thread
+            if existing is not None and existing.is_alive():
+                return existing
+            if self.running:
+                completed = threading.Thread(
+                    target=lambda: None,
+                    name="ios-mcp-runtime-already-running",
+                    daemon=True,
+                )
+                completed.start()
+                return completed
+            self.starting = True
+            self._stop_event.clear()
+            startup = threading.Thread(
+                target=self._start_registered_services,
+                name="ios-mcp-runtime-startup",
                 daemon=True,
             )
-            self._thread.start()
-        return self
+            self._startup_thread = startup
+            startup.start()
+            return startup
 
     def health(self) -> dict[str, Any]:
         """Return truthful fleet health, including per-service probes."""
@@ -679,6 +744,7 @@ class IOSMCPRuntimeSupervisor:
         return {
             "ok": required > 0 and healthy == required,
             "running": bool(self.running),
+            "starting": bool(self.starting),
             "healthy_count": healthy,
             "required_count": required,
             "services": services,
@@ -686,12 +752,21 @@ class IOSMCPRuntimeSupervisor:
 
     def stop(self, timeout: float = 10.0) -> None:
         self._stop_event.set()
+        startup_thread = self._startup_thread
+        if (
+            startup_thread
+            and startup_thread.is_alive()
+            and startup_thread is not threading.current_thread()
+        ):
+            startup_thread.join(max(0.1, float(timeout)))
         thread = self._thread
         if thread and thread.is_alive() and thread is not threading.current_thread():
             thread.join(max(0.1, float(timeout)))
         for name in self.capabilities:
             self.stop_service(name)
+        self._startup_thread = None
         self._thread = None
+        self.starting = False
         self.running = False
 
     close = stop
@@ -712,6 +787,14 @@ class IOSMCPRuntimeSupervisor:
         log_handle = log_path.open("ab", buffering=0)
         env = os.environ.copy()
         env["PYTHONUNBUFFERED"] = "1"
+        # Keep 21 isolated Python services within a predictable memory and
+        # thread footprint. These are internal runtime controls, not user-facing
+        # behavioral configuration.
+        env.setdefault("MALLOC_ARENA_MAX", "2")
+        env.setdefault("OMP_NUM_THREADS", "1")
+        env.setdefault("OPENBLAS_NUM_THREADS", "1")
+        env.setdefault("MKL_NUM_THREADS", "1")
+        env.setdefault("NUMEXPR_NUM_THREADS", "1")
         if self.db_dir is not None:
             env["HERMES_IOS_INTELLIGENCE_DIR"] = str(self.db_dir)
         if self.owner_id:
@@ -728,10 +811,25 @@ class IOSMCPRuntimeSupervisor:
                 stderr=subprocess.STDOUT,
                 env=env,
             )
+            self._prefer_child_for_oom_recovery(process.pid)
         except Exception:
             log_handle.close()
             raise
         return process, log_handle
+
+    @staticmethod
+    def _prefer_child_for_oom_recovery(pid: int) -> None:
+        """Prefer degrading one MCP over losing the public API under pressure."""
+
+        if os.name != "posix" or int(pid) <= 0:
+            return
+        try:
+            Path(f"/proc/{int(pid)}/oom_score_adj").write_text("500", encoding="ascii")
+        except OSError:
+            # Kernels and containers may prohibit this procfs adjustment. The
+            # supervisor remains functional; production resource probes catch
+            # an undersized host independently.
+            pass
 
     @staticmethod
     def _terminate_process(process: subprocess.Popen[Any] | None, log_handle: Any = None) -> None:
@@ -747,6 +845,8 @@ class IOSMCPRuntimeSupervisor:
 
     def start_service(self, name: str, *, verify: bool = True) -> bool:
         service = self.supervisor._name(name)
+        if self._stop_event.is_set():
+            return False
         with self._lock:
             current = self._processes.get(service)
             if current is not None and current.poll() is None:

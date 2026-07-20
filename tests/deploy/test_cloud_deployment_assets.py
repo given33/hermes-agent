@@ -81,6 +81,46 @@ def test_deployment_shell_scripts_have_valid_syntax():
         assert result.returncode == 0, (path, result.stderr)
 
 
+def test_public_nginx_contract_separates_refresh_and_returns_json_errors():
+    security = (PUBLIC / "nginx-00-hermes-security.conf").read_text(
+        encoding="utf-8"
+    )
+    site = (PUBLIC / "nginx-daxueshenmai.top.conf").read_text(encoding="utf-8")
+
+    assert "$hermes_login_limit_key" in security
+    assert "$hermes_refresh_limit_key" in security
+    assert "password-login|mobile/(token|registration-code|register)" in security
+    assert "~^POST:/auth/mobile/refresh$" in security
+    assert "zone=hermes_login:10m rate=10r/m" in security
+    assert "zone=hermes_refresh:10m rate=60r/m" in security
+    assert "limit_req zone=hermes_login burst=10 nodelay" in site
+    assert "limit_req zone=hermes_refresh burst=60 nodelay" in site
+    assert "error_page 429 = @hermes_json_rate_limited" in site
+    assert "error_page 502 503 504 = @hermes_json_unavailable" in site
+    assert '"code":"rate_limited"' in site
+    assert '"code":"service_unavailable"' in site
+    assert "proxy_intercept_errors on" in site
+    assert "<html>" not in site.lower()
+
+    installer = (PUBLIC / "install-collaboration-backend.sh").read_text(
+        encoding="utf-8"
+    )
+    deployer = (PUBLIC / "deploy-collaboration-backend.sh").read_text(
+        encoding="utf-8"
+    )
+    for name in ("nginx-00-hermes-security.conf", "nginx-daxueshenmai.top.conf"):
+        assert f'"${{repo}}/deploy/public/{name}"' in deployer
+        assert f'"deploy/public/{name}"' in installer
+    assert 'backup_one "${nginx_security_target}"' in installer
+    assert 'backup_one "${nginx_site_target}"' in installer
+    assert 'restore_root_file "${backup}/nginx/00-hermes-security.conf"' in installer
+    assert 'restore_root_file "${backup}/nginx/daxueshenmai.top.conf"' in installer
+    assert 'install_root_atomic "${snapshot}/deploy/public/nginx-00-hermes-security.conf"' in installer
+    assert 'install_root_atomic "${snapshot}/deploy/public/nginx-daxueshenmai.top.conf"' in installer
+    assert '"${nginx_binary}" -t' in installer
+    assert 'systemctl reload "${nginx_service}"' in installer
+
+
 def test_transactional_installers_serialize_deployments_and_use_unique_backups():
     public = (PUBLIC / "install-collaboration-backend.sh").read_text(encoding="utf-8")
     connector = (DBB3 / "install-dbb3-cloud-connector-user.sh").read_text(encoding="utf-8")
@@ -316,6 +356,15 @@ def test_public_installer_quiesces_state_during_snapshot_and_rollback():
     assert 'required_scope="collaboration:connector"' in ios_plugin
     assert 'healthy_count") == 21' in installer
     assert 'sum(len(item.get("tools") or []) for item in services) == 44' in installer
+    assert 'HERMES_IOS_HEALTH_ATTEMPTS:-180' in installer
+    assert 'runtime.get("running") is True' in installer
+    assert 'runtime.get("starting") is not True' in installer
+    assert 'for _ in $(seq 1 "${ios_health_attempts}")' in installer
+    assert 'validate_ios_health "${ios_health_file}"' in installer
+    assert (
+        "iOS intelligence runtime did not reach 21 healthy MCPs and 44 tools"
+        in installer
+    )
 
 
 def test_public_installer_uses_only_a_root_controlled_install_lock():
@@ -362,6 +411,25 @@ def test_public_installer_registers_ios_mcps_in_the_service_hermes_home():
     ) in installer
     assert "AESGCM" in installer
     assert "from agent.plugin_llm import PluginLlm" in installer
+
+
+def test_public_installer_uses_effective_systemd_hermes_home_before_env_fallback():
+    installer = (PUBLIC / "install-collaboration-backend.sh").read_text(
+        encoding="utf-8"
+    )
+
+    systemd_read = installer.index(
+        'systemctl show "${service}" --property=Environment --value'
+    )
+    runtime_choice = installer.index(
+        'runtime_home="${HERMES_HOME_DIR:-${systemd_runtime_home:-${env_runtime_home:-${service_home}/.hermes}}}"'
+    )
+    registration = installer.index(
+        'env HERMES_HOME="${runtime_home}"', runtime_choice
+    )
+    assert systemd_read < runtime_choice < registration
+    assert 'sed -n \'s/^HERMES_HOME=//p\'' in installer[systemd_read:runtime_choice]
+    assert 'Hermes runtime home must be an absolute path' in installer
 
 
 def test_public_installer_transactions_mcp_discovery_with_ios_release():
