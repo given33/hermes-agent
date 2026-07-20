@@ -1530,12 +1530,16 @@ def init_agent(
         _platform_hints_cfg = {}
     agent._platform_hint_overrides = _platform_hints_cfg
 
-    # App-level API retry count (wraps each model API call).  Default 3,
-    # overridable via agent.api_max_retries in config.yaml.  See #11616.
+    # App-level API retry count (wraps each model API call).  Hosted surfaces
+    # may impose a tighter, user-visible retry contract through the process
+    # environment without mutating the account's persisted config.
     try:
-        _raw_api_retries = _agent_section.get("api_max_retries", 3)
+        _raw_api_retries = os.environ.get(
+            "HERMES_API_MAX_RETRIES",
+            _agent_section.get("api_max_retries", 3),
+        )
         _api_retries = int(_raw_api_retries)
-        _api_retries = max(_api_retries, 1)  # 1 = no retry (single attempt)
+        _api_retries = min(max(_api_retries, 1), 10)
     except (TypeError, ValueError):
         _api_retries = 3
     agent._api_max_retries = _api_retries

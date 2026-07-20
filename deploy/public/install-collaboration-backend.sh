@@ -50,6 +50,7 @@ required=(
   "hermes_cli/dashboard_auth/mobile_device_store.py"
   "hermes_cli/dashboard_auth/mobile_notifications.py"
   "hermes_cli/web_server.py"
+  "agent/agent_init.py"
   "tui_gateway/server.py"
   "deploy/public/nginx-00-hermes-security.conf"
   "deploy/public/nginx-daxueshenmai.top.conf"
@@ -142,6 +143,7 @@ PY
   "${snapshot}/hermes_cli/dashboard_auth/mobile_device_store.py" \
   "${snapshot}/hermes_cli/dashboard_auth/mobile_notifications.py" \
   "${snapshot}/hermes_cli/web_server.py" \
+  "${snapshot}/agent/agent_init.py" \
   "${snapshot}/tui_gateway/server.py" <<'PY'
 import pathlib, sys
 for name in sys.argv[1:]:
@@ -186,6 +188,7 @@ token_auth_target="${target_root}/hermes_cli/dashboard_auth/token_auth.py"
 mobile_device_store_target="${target_root}/hermes_cli/dashboard_auth/mobile_device_store.py"
 mobile_notifications_target="${target_root}/hermes_cli/dashboard_auth/mobile_notifications.py"
 web_server_target="${target_root}/hermes_cli/web_server.py"
+agent_init_target="${target_root}/agent/agent_init.py"
 tui_gateway_target="${target_root}/tui_gateway/server.py"
 nginx_security_target="${HERMES_NGINX_SECURITY_TARGET:-/etc/nginx/conf.d/00-hermes-security.conf}"
 nginx_site_target="${HERMES_NGINX_SITE_TARGET:-/etc/nginx/conf.d/daxueshenmai.top.conf}"
@@ -358,10 +361,12 @@ chown root:root "${backup}"
 chmod 0700 "${backup}"
 install -d -o "${service_user}" -g "${service_group}" -m 0755 "${plugin_target}"
 install -d -o "${service_user}" -g "${service_group}" -m 0755 "${plugin_target}/dist"
+install -d -o "${service_user}" -g "${service_group}" -m 0755 "${target_root}/agent"
 install -d -o "${service_user}" -g "${service_group}" -m 0755 "${target_root}/hermes_cli/dashboard_auth"
 install -d -o "${service_user}" -g "${service_group}" -m 0755 "${target_root}/tui_gateway"
 mkdir -p \
   "${backup}/plugins/collaboration/dashboard/dist" \
+  "${backup}/agent" \
   "${backup}/hermes_cli/dashboard_auth" \
   "${backup}/tui_gateway" \
   "${backup}/nginx" \
@@ -415,6 +420,7 @@ backup_one "${token_auth_target}" "${backup}/hermes_cli/dashboard_auth/token_aut
 backup_one "${mobile_device_store_target}" "${backup}/hermes_cli/dashboard_auth/mobile_device_store.py"
 backup_one "${mobile_notifications_target}" "${backup}/hermes_cli/dashboard_auth/mobile_notifications.py"
 backup_one "${web_server_target}" "${backup}/hermes_cli/web_server.py"
+backup_one "${agent_init_target}" "${backup}/agent/agent_init.py"
 backup_one "${tui_gateway_target}" "${backup}/tui_gateway/server.py"
 backup_one "${nginx_security_target}" "${backup}/nginx/00-hermes-security.conf"
 backup_one "${nginx_site_target}" "${backup}/nginx/daxueshenmai.top.conf"
@@ -461,6 +467,7 @@ rollback() {
     restore_one "${backup}/hermes_cli/dashboard_auth/mobile_device_store.py" "${mobile_device_store_target}"
     restore_one "${backup}/hermes_cli/dashboard_auth/mobile_notifications.py" "${mobile_notifications_target}"
     restore_one "${backup}/hermes_cli/web_server.py" "${web_server_target}"
+    restore_one "${backup}/agent/agent_init.py" "${agent_init_target}"
     restore_one "${backup}/tui_gateway/server.py" "${tui_gateway_target}"
     restore_root_file "${backup}/nginx/00-hermes-security.conf" "${nginx_security_target}"
     restore_root_file "${backup}/nginx/daxueshenmai.top.conf" "${nginx_site_target}"
@@ -582,6 +589,7 @@ install_atomic "${snapshot}/hermes_cli/dashboard_auth/token_auth.py" "${token_au
 install_atomic "${snapshot}/hermes_cli/dashboard_auth/mobile_device_store.py" "${mobile_device_store_target}"
 install_atomic "${snapshot}/hermes_cli/dashboard_auth/mobile_notifications.py" "${mobile_notifications_target}"
 install_atomic "${snapshot}/hermes_cli/web_server.py" "${web_server_target}"
+install_atomic "${snapshot}/agent/agent_init.py" "${agent_init_target}"
 install_atomic "${snapshot}/tui_gateway/server.py" "${tui_gateway_target}"
 install_root_atomic "${snapshot}/deploy/public/nginx-00-hermes-security.conf" "${nginx_security_target}"
 install_root_atomic "${snapshot}/deploy/public/nginx-daxueshenmai.top.conf" "${nginx_site_target}"

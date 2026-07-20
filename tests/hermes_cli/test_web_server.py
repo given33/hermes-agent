@@ -20,6 +20,23 @@ from hermes_cli.config import (
 )
 
 
+class _StreamingModelResponse:
+    def __init__(self, body=b"", *, status=200, chunks=None):
+        self.status_code = status
+        self.is_success = 200 <= status < 300
+        self._chunks = list(chunks if chunks is not None else [body])
+        self.chunks_read = 0
+        self.closed = False
+
+    async def aiter_bytes(self):
+        for chunk in self._chunks:
+            self.chunks_read += 1
+            yield chunk
+
+    async def aclose(self):
+        self.closed = True
+
+
 # ---------------------------------------------------------------------------
 # Shared fixtures
 # ---------------------------------------------------------------------------
@@ -940,6 +957,151 @@ class TestWebServerEndpoints:
             "max_output_tokens": 16,
         }
         assert post.await_args.kwargs["headers"]["Authorization"] == "Bearer private-model-key"
+
+    def test_custom_model_discovery_runs_server_side_and_reuses_saved_key(self):
+        from unittest.mock import AsyncMock
+
+        saved = self.client.put(
+            "/api/model/custom",
+            json={
+                "base_url": "https://model.example/v1",
+                "api_key": "private-model-key",
+                "model": "model-a",
+                "api_mode": "chat_completions",
+            },
+        )
+        assert saved.status_code == 200
+        response = _StreamingModelResponse(
+            json.dumps({
+                "data": [
+                    {"id": "model-b"},
+                    {"id": "model-a"},
+                    {"id": "model-a"},
+                ]
+            }).encode(),
+        )
+        with patch("tools.url_safety.is_safe_url", return_value=True), \
+             patch("httpx.AsyncClient.send", new=AsyncMock(return_value=response)) as send:
+            result = self.client.post(
+                "/api/model/custom/discover",
+                json={"base_url": "https://model.example/v1"},
+            )
+
+        assert result.status_code == 200
+        assert result.json()["ok"] is True
+        assert result.json()["models"] == ["model-b", "model-a"]
+        request = send.await_args.args[0]
+        assert str(request.url) == "https://model.example/v1/models"
+        assert request.headers["Authorization"] == "Bearer private-model-key"
+        assert send.await_args.kwargs["stream"] is True
+        assert response.closed is True
+
+    def test_custom_model_discovery_prefers_v1_for_root_base_url(self):
+        from unittest.mock import AsyncMock
+
+        response = _StreamingModelResponse(
+            b'{"data":[{"id":"model-a"}]}',
+        )
+        with patch("tools.url_safety.is_safe_url", return_value=True), \
+             patch("httpx.AsyncClient.send", new=AsyncMock(return_value=response)) as send:
+            result = self.client.post(
+                "/api/model/custom/discover",
+                json={"base_url": "https://model.example"},
+            )
+
+        assert result.status_code == 200
+        assert result.json()["ok"] is True
+        assert str(send.await_args_list[0].args[0].url) == "https://model.example/v1/models"
+        assert send.await_count == 1
+
+    def test_custom_model_discovery_falls_back_after_html_200(self):
+        from unittest.mock import AsyncMock
+
+        html = _StreamingModelResponse(b"<html><title>Gateway</title></html>")
+        catalog = _StreamingModelResponse(b'{"models":["model-b"]}')
+        with patch("tools.url_safety.is_safe_url", return_value=True), \
+             patch(
+                 "httpx.AsyncClient.send",
+                 new=AsyncMock(side_effect=[html, catalog]),
+             ) as send:
+            result = self.client.post(
+                "/api/model/custom/discover",
+                json={"base_url": "https://model.example"},
+            )
+
+        assert result.status_code == 200
+        assert result.json()["ok"] is True
+        assert result.json()["models"] == ["model-b"]
+        assert [str(call.args[0].url) for call in send.await_args_list] == [
+            "https://model.example/v1/models",
+            "https://model.example/models",
+        ]
+
+    def test_custom_model_discovery_v1_base_falls_back_to_root_models(self):
+        from unittest.mock import AsyncMock
+
+        missing = _StreamingModelResponse(b'{"error":"not found"}', status=404)
+        catalog = _StreamingModelResponse(b'{"data":[{"id":"model-c"}]}')
+        with patch("tools.url_safety.is_safe_url", return_value=True), \
+             patch(
+                 "httpx.AsyncClient.send",
+                 new=AsyncMock(side_effect=[missing, catalog]),
+             ) as send:
+            result = self.client.post(
+                "/api/model/custom/discover",
+                json={"base_url": "https://model.example/v1"},
+            )
+
+        assert result.status_code == 200
+        assert result.json()["models"] == ["model-c"]
+        assert [str(call.args[0].url) for call in send.await_args_list] == [
+            "https://model.example/v1/models",
+            "https://model.example/models",
+        ]
+
+    def test_custom_model_discovery_returns_specific_upstream_status(self):
+        from unittest.mock import AsyncMock
+
+        response = _StreamingModelResponse(b'{"error":"unauthorized"}', status=401)
+        with patch("tools.url_safety.is_safe_url", return_value=True), \
+             patch("httpx.AsyncClient.send", new=AsyncMock(return_value=response)):
+            result = self.client.post(
+                "/api/model/custom/discover",
+                json={
+                    "base_url": "https://model.example/v1",
+                    "api_key": "wrong-key",
+                },
+            )
+
+        assert result.status_code == 200
+        assert result.json() == {
+            "ok": False,
+            "reachable": True,
+            "status": 401,
+            "latency_ms": result.json()["latency_ms"],
+            "message": "The endpoint rejected the API key.",
+            "models": [],
+        }
+
+    def test_custom_model_discovery_rejects_oversized_catalog(self):
+        from unittest.mock import AsyncMock
+
+        response = _StreamingModelResponse(
+            chunks=[b"x" * (512 * 1024), b"y" * (512 * 1024 + 1), b"must-not-read"],
+        )
+        with patch("tools.url_safety.is_safe_url", return_value=True), \
+             patch("httpx.AsyncClient.send", new=AsyncMock(return_value=response)):
+            result = self.client.post(
+                "/api/model/custom/discover",
+                json={"base_url": "https://model.example/v1"},
+            )
+
+        assert result.status_code == 200
+        assert result.json()["ok"] is False
+        assert result.json()["status"] == 200
+        assert "1 MiB" in result.json()["message"]
+        assert response.chunks_read == 2
+        assert response.closed is True
 
     def test_custom_model_connection_blocks_private_and_metadata_targets(self):
         with patch("tools.url_safety.is_safe_url", return_value=False):

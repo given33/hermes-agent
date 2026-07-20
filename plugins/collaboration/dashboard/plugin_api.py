@@ -108,6 +108,8 @@ _MOBILE_NOTIFICATION_TERMINAL_STATUSES = {
     "permanent_failure",
 }
 _HOSTED_TRANSIENT_RETRIES = 1
+_HOSTED_CHAT_API_ATTEMPTS = 5
+_HOSTED_CHAT_TIMEOUT_SECONDS = 120
 _HOSTED_REWORK_LIMIT = 2
 _HOSTED_EVENT_FLUSH_SECONDS = 0.45
 _MODEL_NOT_CONFIGURED_CODE = "model_not_configured"
@@ -124,6 +126,11 @@ _MAX_CONVERSATION_TITLE_CHARS = 18
 _ATTACHMENT_BUCKETS = {"uploads", "outputs"}
 _ACCOUNT_FILE_MIGRATION_LOCK = threading.Lock()
 _ACCOUNT_FILE_MIGRATION_VERSION = "conversation-files-v1"
+
+
+class _HostedTurnCancelled(RuntimeError):
+    """Interrupt a running profile child after its durable turn is cancelled."""
+
 _WORK_MARKERS = (
     "完成",
     "执行",
@@ -1433,6 +1440,12 @@ def sanitize_runtime_error(error: Any) -> str:
     lowered = text.lower()
     status_match = re.search(r"(?:http\s*)?(4\d\d|5\d\d)", lowered)
     status = status_match.group(1) if status_match else ""
+    if status == "401":
+        return "模型服务拒绝了 API 密钥（HTTP 401）。"
+    if status == "403":
+        return "模型服务拒绝访问（HTTP 403），请检查密钥权限。"
+    if status == "404":
+        return "模型或接口路径不存在（HTTP 404）。"
     if status == "429" or "rate limit" in lowered:
         return "模型服务请求过多（HTTP 429），已保留当前进度。"
     if status in {"500", "502", "503", "504", "520", "522", "524"} or any(
@@ -1449,6 +1462,18 @@ def sanitize_runtime_error(error: Any) -> str:
     without_html = re.sub(r"<[^>]+>", " ", text)
     without_html = re.sub(r"\s+", " ", without_html).strip()
     return (without_html or "Hermes 执行失败")[:400]
+
+
+def runtime_error_code(error: Any) -> str:
+    text = _structured_text(error).lower()
+    status_match = re.search(r"(?:http\s*)?(4\d\d|5\d\d)", text)
+    if status_match:
+        return f"http_{status_match.group(1)}"
+    if "timed out" in text or "timeout" in text:
+        return "model_timeout"
+    if "empty stream" in text or "empty response" in text:
+        return "model_empty_response"
+    return "model_request_failed"
 
 
 def _is_transient_runtime_error(error: Any) -> bool:
@@ -2564,12 +2589,76 @@ def _fail_hosted_turn_preflight(
     conversation["updated_at"] = now
 
 
+def _requires_local_ios_mcp(content: str) -> bool:
+    lowered = str(content or "").strip().lower()
+    explicit_mcp = "mcp" in lowered
+    device_context = any(
+        marker in lowered
+        for marker in (
+            "iphone",
+            "apple watch",
+            "ios",
+            "\u6211\u7684",
+            "\u6211\u73b0\u5728",
+            "\u624b\u673a",
+            "\u624b\u8868",
+        )
+    )
+    managed_domain = any(
+        marker in lowered
+        for marker in (
+            "location",
+            "trajectory",
+            "places",
+            "motion",
+            "qweather",
+            "weather",
+            "health",
+            "sleep",
+            "heart",
+            "oxygen",
+            "calendar",
+            "reminder",
+            "screen time",
+            "\u4f4d\u7f6e",
+            "\u5730\u5740",
+            "\u8f68\u8ff9",
+            "\u5730\u70b9",
+            "\u8fd0\u52a8",
+            "\u5929\u6c14",
+            "\u5065\u5eb7",
+            "\u7761\u7720",
+            "\u5fc3\u7387",
+            "\u8840\u6c27",
+            "\u65e5\u5386",
+            "\u63d0\u9192",
+            "\u5c4f\u5e55\u4f7f\u7528",
+            "\u7535\u91cf",
+        )
+    )
+    return managed_domain and (explicit_mcp or device_context)
+
+
 def classify_user_intent(
     content: str,
     *,
     model_classifier: Optional[Callable[[str], Optional[dict[str, Any]]]] = None,
 ) -> dict[str, Any]:
     routed = _rule_based_user_intent(content)
+    if _requires_local_ios_mcp(content):
+        routed.update(
+            {
+                "mode": "chat",
+                "label": "Local iOS MCP",
+                "reason": "Account-scoped iOS MCP data must be read by the default Hermes profile.",
+                "confidence": 1.0,
+                "source": "managed-ios-mcp",
+                "profiles": ["default"],
+                "needs_execution": True,
+                "needs_tools": True,
+            }
+        )
+        return routed
     if model_classifier is None:
         return routed
     try:
@@ -2821,9 +2910,10 @@ def run_profile_turn(
     hermes_bin: str = "/usr/local/bin/hermes",
     event_callback: Optional[Callable[[dict[str, Any]], None]] = None,
     process_factory: Callable[..., Any] = subprocess.Popen,
-    timeout: float = 600,
+    timeout: float = _HOSTED_CHAT_TIMEOUT_SECONDS,
     kanban_task_id: Optional[str] = None,
     session_id: str = "",
+    cancel_check: Optional[Callable[[], bool]] = None,
 ) -> str:
     """Run a profile through a structured JSONL child event channel."""
     if runner is not None:
@@ -2842,12 +2932,14 @@ def run_profile_turn(
         "HOME": os.environ.get("HOME", "/home/hermes"),
         "HERMES_HOME": resolve_profile_env(profile),
         "HERMES_SESSION_SOURCE": "dashboard-group",
+        "HERMES_API_MAX_RETRIES": str(_HOSTED_CHAT_API_ATTEMPTS),
     }
     if kanban_task_id:
         env["HERMES_KANBAN_TASK"] = kanban_task_id
     else:
         env.pop("HERMES_KANBAN_TASK", None)
     command = [sys.executable, str(Path(__file__).resolve()), "--profile-event-runner"]
+    deadline = time.monotonic() + timeout
     process = process_factory(
         command,
         shell=False,
@@ -2862,15 +2954,20 @@ def run_profile_turn(
     if process.stdin is None or process.stdout is None:
         process.kill()
         raise RuntimeError("Hermes 结构化执行通道启动失败")
-    process.stdin.write(
-        json.dumps(
-            {"prompt": prompt, "session_id": str(session_id or "").strip()},
-            ensure_ascii=False,
-        )
-    )
-    process.stdin.close()
-
     line_queue: queue.Queue[Optional[str]] = queue.Queue()
+    writer_errors: queue.Queue[BaseException] = queue.Queue(maxsize=1)
+
+    def _write_stdin() -> None:
+        try:
+            process.stdin.write(
+                json.dumps(
+                    {"prompt": prompt, "session_id": str(session_id or "").strip()},
+                    ensure_ascii=False,
+                )
+            )
+            process.stdin.close()
+        except BaseException as exc:
+            writer_errors.put(exc)
 
     def _read_stdout() -> None:
         try:
@@ -2879,12 +2976,17 @@ def run_profile_turn(
         finally:
             line_queue.put(None)
 
+    writer = threading.Thread(target=_write_stdin, daemon=True)
     reader = threading.Thread(target=_read_stdout, daemon=True)
+    writer.start()
     reader.start()
-    deadline = time.monotonic() + timeout
 
     def _iter_lines():
         while True:
+            if cancel_check is not None and cancel_check():
+                raise _HostedTurnCancelled("Hosted turn cancelled")
+            if not writer_errors.empty():
+                raise RuntimeError("Hermes 结构化执行输入失败") from writer_errors.get()
             remaining = deadline - time.monotonic()
             if remaining <= 0:
                 raise TimeoutError("Hermes profile execution timed out")
@@ -3032,7 +3134,7 @@ def apply_profile_event(
                 activities.append(activity)
             activity["output"] = _append_event_delta(
                 str(activity.get("output") or ""), text
-            )[-20_000:]
+            )
             if event_type == "reasoning.available":
                 activity["status"] = "completed"
                 activity["ended_at"] = payload.get("ended_at") or now
@@ -3264,6 +3366,7 @@ def _invoke_profile_runner(
     event_callback: Callable[[dict[str, Any]], None],
     kanban_task_id: str,
     session_id: str = "",
+    cancel_check: Optional[Callable[[], bool]] = None,
 ) -> str:
     kwargs: dict[str, Any] = {}
     if _runner_supports_events(runner):
@@ -3272,6 +3375,8 @@ def _invoke_profile_runner(
         kwargs["kanban_task_id"] = kanban_task_id
     if session_id and _runner_supports_keyword(runner, "session_id"):
         kwargs["session_id"] = session_id
+    if cancel_check is not None and _runner_supports_keyword(runner, "cancel_check"):
+        kwargs["cancel_check"] = cancel_check
     return str(runner(profile, prompt, **kwargs))
 
 
@@ -3498,6 +3603,8 @@ def _run_hosted_role(
         last_persisted_at = time.monotonic()
 
     def on_event(event: dict[str, Any]) -> None:
+        if _hosted_turn_cancellation_requested(conversation_id, turn_id):
+            raise _HostedTurnCancelled("Hosted turn cancelled")
         event_type = str(event.get("type") or "")
         if event_type == "thinking.delta":
             return
@@ -3569,7 +3676,10 @@ def _run_hosted_role(
         ):
             persist()
 
-    attempts = _HOSTED_TRANSIENT_RETRIES + 1
+    # The real Hermes child already performs the five bounded provider
+    # attempts. Re-running the entire child would duplicate those attempts and
+    # could keep a failed iOS turn alive beyond its two-minute contract.
+    attempts = 1 if runner is run_profile_turn else _HOSTED_TRANSIENT_RETRIES + 1
     for attempt in range(1, attempts + 1):
         try:
             result = _invoke_profile_runner(
@@ -3579,6 +3689,7 @@ def _run_hosted_role(
                 on_event,
                 kanban_task_id,
                 str(state.get("runtime_session_id") or ""),
+                lambda: _hosted_turn_cancellation_requested(conversation_id, turn_id),
             ).strip()
             if not result:
                 raise RuntimeError("Hermes profile returned an empty response")
@@ -3591,6 +3702,13 @@ def _run_hosted_role(
             persist()
             return result, "completed", state
         except Exception as exc:
+            if isinstance(exc, _HostedTurnCancelled) or _hosted_turn_cancellation_requested(
+                conversation_id,
+                turn_id,
+            ):
+                _finish_hosted_turn_if_cancelled(conversation_id, turn_id)
+                state["status"] = "cancelled"
+                return str(state.get("content") or "").strip(), "cancelled", state
             transient = _is_transient_runtime_error(exc)
             has_tool_activity = any(
                 activity.get("kind") in {"tool", "subagent"}
@@ -4245,6 +4363,13 @@ def _persist_hosted_turn(
         run = (conversation.get("hosted_turns") or {}).get(turn_id)
         if not isinstance(run, dict):
             raise RuntimeError("托管任务记录不存在")
+        incoming_status = str((patch or {}).get("status") or "").lower()
+        current_status = str(run.get("status") or "").lower()
+        if (
+            (run.get("cancel_requested") or current_status == "cancelled")
+            and incoming_status != "cancelled"
+        ):
+            return dict(run)
         now = int(time.time() * 1000)
         if patch:
             for key, value in patch.items():
@@ -4258,6 +4383,56 @@ def _persist_hosted_turn(
                     run[key] = value
         run["updated_at"] = now
         conversation["updated_at"] = now
+        terminal_status = str(run.get("status") or "").lower()
+        if terminal_status in _HOSTED_TERMINAL_STATUSES:
+            active_statuses = {"pending", "queued", "running", "starting", "streaming"}
+            for state_key in ("role_events", "remote_runs"):
+                child_states = run.get(state_key)
+                if not isinstance(child_states, dict):
+                    continue
+                for child_state in child_states.values():
+                    if not isinstance(child_state, dict):
+                        continue
+                    if terminal_status == "cancelled" and state_key == "remote_runs":
+                        child_state["cancel_requested"] = True
+                        child_state["cancel_requested_at"] = now
+                        child_state["updated_at"] = now
+                        continue
+                    if str(child_state.get("status") or "").lower() in active_statuses:
+                        child_state["status"] = terminal_status
+                        child_state["completed_at"] = now
+                        child_state["updated_at"] = now
+            for existing_message in conversation.get("messages") or []:
+                if not isinstance(existing_message, dict):
+                    continue
+                existing_meta = existing_message.get("meta")
+                if not isinstance(existing_meta, dict):
+                    continue
+                if str(existing_meta.get("runtime_turn_id") or "") != turn_id:
+                    continue
+                if str(existing_message.get("status") or "").lower() not in active_statuses:
+                    continue
+                existing_message["status"] = terminal_status
+                existing_message["updated_at"] = now
+                existing_meta["completed_at"] = now
+                for activity in existing_meta.get("activities") or []:
+                    if not isinstance(activity, dict):
+                        continue
+                    if str(activity.get("status") or "").lower() in active_statuses:
+                        activity["status"] = terminal_status
+                        activity["completed_at"] = now
+                        activity["updated_at"] = now
+                _project_native_message(existing_message)
+            for runtime_run in (conversation.get("runtime_runs") or {}).values():
+                if not isinstance(runtime_run, dict):
+                    continue
+                if str(runtime_run.get("turn_id") or "") != turn_id:
+                    continue
+                if str(runtime_run.get("status") or "").lower() not in active_statuses:
+                    continue
+                runtime_run["status"] = terminal_status
+                runtime_run["completed_at"] = now
+                runtime_run["updated_at"] = now
         if runtime_session:
             runtime_profile, runtime_session_id = runtime_session
             if str(runtime_session_id or "").strip():
@@ -4557,8 +4732,27 @@ def request_hosted_turn_cancellation(
         conversation["updated_at"] = now
         save_single_state(state)
         persisted = dict(run)
-    _notify_hosted_update()
+    _finish_hosted_turn_if_cancelled(conversation_id, turn_id)
+    with _STATE_LOCK:
+        state = load_single_state()
+        conversation = _conversation_by_id(state, conversation_id)
+        current = (conversation.get("hosted_turns") or {}).get(turn_id)
+        persisted = dict(current) if isinstance(current, dict) else persisted
     return persisted
+
+
+def _hosted_turn_cancellation_requested(
+    conversation_id: str,
+    turn_id: str,
+) -> bool:
+    with _STATE_LOCK:
+        state = load_single_state()
+        conversation = _conversation_by_id(state, conversation_id)
+        run = (conversation.get("hosted_turns") or {}).get(turn_id)
+        return bool(
+            isinstance(run, dict)
+            and (run.get("cancel_requested") or run.get("status") == "cancelled")
+        )
 
 
 def _finish_hosted_turn_if_cancelled(
@@ -4693,7 +4887,13 @@ def execute_hosted_chat(
                 save_single_state(state)
                 return
         now = int(time.time() * 1000)
-        run.update({"status": "running", "stage": "chat", "updated_at": now})
+        run.update({
+            "status": "running",
+            "stage": "chat",
+            "updated_at": now,
+            "deadline_at": now + (_HOSTED_CHAT_TIMEOUT_SECONDS * 1000),
+            "lease_expires_at": now + (_HOSTED_CHAT_TIMEOUT_SECONDS * 1000),
+        })
         run.setdefault("started_at", now)
         _ensure_hosted_output_baseline(conversation_id, run)
         save_single_state(state)
@@ -4745,7 +4945,7 @@ def execute_hosted_chat(
         runner=runner,
         kanban_task_id="",
         runtime_session_id=runtime_session_id,
-        start_text="收到消息，正在处理。",
+        start_text="",
         previous_state=(run.get("role_events") or {}).get("chat"),
     )
     if _finish_hosted_turn_if_cancelled(conversation_id, turn_id):
@@ -4774,6 +4974,10 @@ def execute_hosted_chat(
             "status": final_status,
             "stage": final_status,
             "completed_at": now,
+            "lease_expires_at": now,
+            "error": str(_role_state.get("error") or "") if final_status == "failed" else "",
+            "error_code": runtime_error_code(_role_state.get("error")) if final_status == "failed" else "",
+            "retryable": False,
             "notification": _completion_notification_record(
                 conversation_id,
                 turn_id,
@@ -4794,7 +4998,7 @@ def execute_hosted_chat(
             "meta": {
                 "role_stage": "chat",
                 "base_role_stage": "chat",
-                "phase": "completed",
+                "phase": final_status,
                 "message_key": f"{turn_id}:chat:completed",
                 "role_label": "Hermes",
                 "profile": profile,
@@ -8365,6 +8569,22 @@ def _profile_event_runner_main() -> int:
         # enabled_toolsets are only registry aliases; discovery must connect
         # and register their schemas before AIAgent snapshots its tool list.
         enabled_toolsets = _discover_profile_toolsets(cfg)
+        managed_mcp_servers = sorted(
+            name
+            for name, server in (cfg.get("mcp_servers") or {}).items()
+            if isinstance(server, dict)
+            and server.get("enabled", True) is not False
+            and name in enabled_toolsets
+        )
+        if managed_mcp_servers:
+            prompt = (
+                f"{prompt}\n\nRuntime MCP capabilities currently connected: "
+                f"{', '.join(managed_mcp_servers)}. When the user needs current "
+                "iPhone, Apple Watch, location, health, weather, calendar, reminder, "
+                "or device data, call the matching mcp__ tool before answering. "
+                "Do not claim these MCPs are absent unless the matching tool call "
+                "itself returns an availability error."
+            )
         model_cfg = cfg.get("model") or {}
         if isinstance(model_cfg, str):
             model = model_cfg

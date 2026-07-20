@@ -238,6 +238,7 @@ printf '%s|%s\n' "$(basename "$0")" "$*" >>"$DEPLOY_CAPTURE"
         "hermes_cli/dashboard_auth/mobile_device_store.py",
         "hermes_cli/dashboard_auth/mobile_notifications.py",
         "hermes_cli/web_server.py",
+        "agent/agent_init.py",
         "tui_gateway/server.py",
         "hermes_cli/account_cleanup.py",
         "hermes_cli/ios_intelligence.py",

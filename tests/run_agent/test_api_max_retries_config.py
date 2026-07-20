@@ -43,6 +43,16 @@ def test_api_max_retries_honors_config_override():
     assert agent2._api_max_retries == 5
 
 
+def test_api_max_retries_honors_bounded_hosted_environment_override():
+    with patch.dict("os.environ", {"HERMES_API_MAX_RETRIES": "5"}):
+        agent = _make_agent(api_max_retries=2)
+    assert agent._api_max_retries == 5
+
+    with patch.dict("os.environ", {"HERMES_API_MAX_RETRIES": "99"}):
+        capped = _make_agent()
+    assert capped._api_max_retries == 10
+
+
 def test_api_max_retries_clamps_below_one_to_one():
     """0 or negative values would disable the retry loop entirely
     (the ``while retry_count < max_retries`` guard would never execute),

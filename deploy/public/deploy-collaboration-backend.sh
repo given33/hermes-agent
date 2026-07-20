@@ -27,6 +27,7 @@ fi
 [[ -f "${repo}/hermes_cli/dashboard_auth/mobile_device_store.py" ]] || die "mobile_device_store.py is missing"
 [[ -f "${repo}/hermes_cli/dashboard_auth/mobile_notifications.py" ]] || die "mobile_notifications.py is missing"
 [[ -f "${repo}/hermes_cli/web_server.py" ]] || die "web_server.py is missing"
+[[ -f "${repo}/agent/agent_init.py" ]] || die "agent_init.py is missing"
 [[ -f "${repo}/tui_gateway/server.py" ]] || die "tui_gateway/server.py is missing"
 [[ -f "${repo}/deploy/public/nginx-00-hermes-security.conf" ]] || die "nginx security config is missing"
 [[ -f "${repo}/deploy/public/nginx-daxueshenmai.top.conf" ]] || die "nginx site config is missing"
@@ -78,7 +79,7 @@ if [[ -n "${HERMES_SSH_IDENTITY:-}" ]]; then
   ssh_args+=(-i "${HERMES_SSH_IDENTITY}" -o IdentitiesOnly=yes)
 fi
 
-ssh "${ssh_args[@]}" "${remote}" "install -d -m 0700 '${stage}' '${stage}/plugins/collaboration/dashboard/dist' '${stage}/hermes_cli' '${stage}/hermes_cli/dashboard_auth' '${stage}/tui_gateway' '${stage}/plugins/ios-intelligence/dashboard' '${stage}/plugins/dashboard_auth/basic' '${stage}/tools' '${stage}/deploy/public'"
+ssh "${ssh_args[@]}" "${remote}" "install -d -m 0700 '${stage}' '${stage}/agent' '${stage}/plugins/collaboration/dashboard/dist' '${stage}/hermes_cli' '${stage}/hermes_cli/dashboard_auth' '${stage}/tui_gateway' '${stage}/plugins/ios-intelligence/dashboard' '${stage}/plugins/dashboard_auth/basic' '${stage}/tools' '${stage}/deploy/public'"
 scp "${ssh_args[@]}" \
   "${repo}/plugins/collaboration/dashboard/plugin_api.py" \
   "${repo}/plugins/collaboration/dashboard/manifest.json" \
@@ -90,6 +91,9 @@ scp "${ssh_args[@]}" \
   "${repo}/hermes_cli/cloud_file_library.py" \
   "${repo}/hermes_cli/web_server.py" \
   "${remote}:${stage}/hermes_cli/"
+scp "${ssh_args[@]}" \
+  "${repo}/agent/agent_init.py" \
+  "${remote}:${stage}/agent/"
 scp "${ssh_args[@]}" \
   "${repo}/hermes_cli/dashboard_auth/public_paths.py" \
   "${repo}/hermes_cli/dashboard_auth/token_auth.py" \

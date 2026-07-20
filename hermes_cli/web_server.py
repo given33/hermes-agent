@@ -1047,6 +1047,12 @@ class CustomModelConnectionTest(BaseModel):
     profile: Optional[str] = None
 
 
+class CustomModelDiscoveryRequest(BaseModel):
+    base_url: str
+    api_key: str = ""
+    profile: Optional[str] = None
+
+
 class CustomModelConfiguration(CustomModelConnectionTest):
     context_length: int = 0
     reasoning_effort: str = "medium"
@@ -5733,6 +5739,182 @@ async def set_custom_model(
     return {"ok": True, **get_custom_model(body.profile or profile)}
 
 
+def _configured_custom_model_api_key(profile: Optional[str]) -> str:
+    with _profile_scope(profile):
+        cfg = load_config()
+    configured = cfg.get("model") if isinstance(cfg, dict) else {}
+    if not isinstance(configured, dict):
+        return ""
+    return str(configured.get("api_key") or configured.get("api") or "").strip()
+
+
+def _custom_model_catalog_endpoints(base_url: str) -> list[str]:
+    """Return bounded OpenAI-compatible catalog candidates in preferred order."""
+    if base_url.endswith("/models"):
+        return [base_url]
+    if base_url.endswith("/v1"):
+        root_url = base_url[:-3].rstrip("/")
+        fallback = f"{root_url}/models" if root_url else "/models"
+        return list(dict.fromkeys((f"{base_url}/models", fallback)))
+    return [f"{base_url}/v1/models", f"{base_url}/models"]
+
+
+@app.post("/api/model/custom/discover")
+async def discover_custom_models(
+    body: CustomModelDiscoveryRequest,
+    profile: Optional[str] = None,
+):
+    """Discover a bounded model catalog from the server network edge."""
+    import httpx
+
+    try:
+        base_url, loopback = _validated_custom_model_base_url(body.base_url)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    endpoints = _custom_model_catalog_endpoints(base_url)
+    from tools.url_safety import is_safe_url
+    if not loopback:
+        for endpoint in endpoints:
+            if not is_safe_url(endpoint):
+                raise HTTPException(
+                    status_code=400,
+                    detail="base_url resolves to a blocked private or metadata address",
+                )
+
+    api_key = body.api_key.strip() or _configured_custom_model_api_key(
+        body.profile or profile
+    )
+    headers = {"Accept": "application/json"}
+    if api_key:
+        headers["Authorization"] = f"Bearer {api_key}"
+        headers["x-api-key"] = api_key
+
+    started = time.perf_counter()
+    last_result: dict[str, Any] | None = None
+    catalog_limit = 1024 * 1024
+    try:
+        async with httpx.AsyncClient(
+            timeout=httpx.Timeout(8.0, connect=2.5),
+            follow_redirects=False,
+        ) as client:
+            async with asyncio.timeout(8.0):
+                for index, endpoint in enumerate(endpoints):
+                    request = client.build_request("GET", endpoint, headers=headers)
+                    response = await client.send(request, stream=True)
+                    try:
+                        body_bytes = bytearray()
+                        oversized = False
+                        async for chunk in response.aiter_bytes():
+                            if len(body_bytes) + len(chunk) > catalog_limit:
+                                oversized = True
+                                break
+                            body_bytes.extend(chunk)
+                    finally:
+                        await response.aclose()
+
+                    latency_ms = round((time.perf_counter() - started) * 1000)
+                    has_fallback = index + 1 < len(endpoints)
+                    if not response.is_success:
+                        if response.status_code in {401, 403}:
+                            message = "The endpoint rejected the API key."
+                        elif 300 <= response.status_code < 400:
+                            message = "The model catalog redirected to another address."
+                        elif response.status_code == 429:
+                            message = "The endpoint is reachable but currently rate limited."
+                        else:
+                            message = f"The model catalog returned HTTP {response.status_code}."
+                        result = {
+                            "ok": False,
+                            "reachable": True,
+                            "status": response.status_code,
+                            "latency_ms": latency_ms,
+                            "message": message,
+                            "models": [],
+                        }
+                        if has_fallback and response.status_code in {404, 405}:
+                            last_result = result
+                            continue
+                        return result
+
+                    if oversized:
+                        return {
+                            "ok": False,
+                            "reachable": True,
+                            "status": response.status_code,
+                            "latency_ms": latency_ms,
+                            "message": "The model catalog exceeds 1 MiB.",
+                            "models": [],
+                        }
+                    try:
+                        payload = json.loads(body_bytes)
+                    except (TypeError, ValueError, UnicodeDecodeError):
+                        payload = {}
+                    rows = []
+                    if isinstance(payload, dict):
+                        candidate = payload.get("data", payload.get("models", []))
+                        if isinstance(candidate, list):
+                            rows = candidate
+                    models: list[str] = []
+                    seen: set[str] = set()
+                    for entry in rows:
+                        if isinstance(entry, str):
+                            model = entry.strip()
+                        elif isinstance(entry, dict):
+                            model = str(entry.get("id") or entry.get("name") or "").strip()
+                        else:
+                            model = ""
+                        if not model or len(model) > 256 or model in seen:
+                            continue
+                        seen.add(model)
+                        models.append(model)
+                        if len(models) >= 500:
+                            break
+                    if models:
+                        return {
+                            "ok": True,
+                            "reachable": True,
+                            "status": response.status_code,
+                            "latency_ms": latency_ms,
+                            "message": "Model catalog loaded.",
+                            "models": models,
+                        }
+                    result = {
+                        "ok": False,
+                        "reachable": True,
+                        "status": response.status_code,
+                        "latency_ms": latency_ms,
+                        "message": "The endpoint returned no usable models.",
+                        "models": [],
+                    }
+                    if has_fallback:
+                        last_result = result
+                        continue
+                    return result
+    except (TimeoutError, httpx.TimeoutException, httpx.NetworkError):
+        if last_result is not None:
+            return {
+                **last_result,
+                "latency_ms": round((time.perf_counter() - started) * 1000),
+                "message": "The model catalog fallback timed out.",
+            }
+        return {
+            "ok": False,
+            "reachable": False,
+            "status": 0,
+            "latency_ms": round((time.perf_counter() - started) * 1000),
+            "message": "Endpoint is unreachable.",
+            "models": [],
+        }
+    return last_result or {
+        "ok": False,
+        "reachable": False,
+        "status": 0,
+        "latency_ms": round((time.perf_counter() - started) * 1000),
+        "message": "Endpoint is unreachable.",
+        "models": [],
+    }
+
+
 @app.post("/api/model/custom/test")
 async def test_custom_model_connection(
     body: CustomModelConnectionTest,
@@ -5751,13 +5933,9 @@ async def test_custom_model_connection(
     if api_mode not in {"chat_completions", "codex_responses", "anthropic_messages"}:
         raise HTTPException(status_code=400, detail="unsupported api_mode")
 
-    api_key = body.api_key.strip()
-    if not api_key:
-        with _profile_scope(body.profile or profile):
-            cfg = load_config()
-        configured = cfg.get("model") if isinstance(cfg, dict) else {}
-        if isinstance(configured, dict):
-            api_key = str(configured.get("api_key") or configured.get("api") or "").strip()
+    api_key = body.api_key.strip() or _configured_custom_model_api_key(
+        body.profile or profile
+    )
 
     headers = {"Accept": "application/json", "Content-Type": "application/json"}
     if api_mode == "anthropic_messages":

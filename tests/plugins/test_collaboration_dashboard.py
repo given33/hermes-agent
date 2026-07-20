@@ -1,10 +1,11 @@
 import asyncio
 import importlib.util
+import io
 import json
 import os
-import subprocess
 import threading
 import time
+import subprocess
 import unittest
 from tempfile import TemporaryDirectory
 from pathlib import Path
@@ -57,6 +58,101 @@ class CollaborationDashboardTests(unittest.TestCase):
         self.assertEqual(resolved, ["ios-location"])
         self.assertEqual(calls[0], "discover")
         self.assertEqual(calls[1], ("resolve", config, "cli"))
+
+    def test_personal_ios_mcp_request_stays_on_the_default_profile(self):
+        module = load_module()
+
+        routed = module.classify_user_intent(
+            "Use MCP to query my current iPhone location",
+            model_classifier=lambda _content: {
+                "mode": "work",
+                "confidence": 0.99,
+                "profiles": ["dbb3-worker"],
+            },
+        )
+
+        self.assertEqual(routed["mode"], "chat")
+        self.assertEqual(routed["profiles"], ["default"])
+        self.assertEqual(routed["source"], "managed-ios-mcp")
+        self.assertTrue(routed["needs_tools"])
+
+    def test_cancellation_is_terminal_before_a_late_chat_completion(self):
+        module = load_module()
+        conversation = module.create_single_conversation("default")
+        state = {"conversations": [conversation]}
+        module.load_single_state = lambda: state
+        module.save_single_state = lambda _state: None
+        run = module.create_hosted_turn_record(
+            conversation,
+            turn_id="turn-cancel-race",
+            content="cancel this",
+            title="cancel this",
+            profiles=["default"],
+            artifact_required=False,
+            mode="chat",
+            route_metadata={"mode": "chat"},
+        )
+        run["status"] = "running"
+        run["remote_runs"] = {
+            "worker": {"id": "remote-cancel-race", "status": "running"},
+        }
+        module._persist_hosted_turn(
+            conversation["id"],
+            "turn-cancel-race",
+            message={
+                "role": "assistant",
+                "name": "default",
+                "content": "partial",
+                "status": "running",
+                "meta": {
+                    "base_role_stage": "chat",
+                    "role_stage": "chat.progress",
+                    "phase": "progress",
+                    "message_key": "turn-cancel-race:chat:progress",
+                },
+            },
+        )
+
+        cancelled = module.request_hosted_turn_cancellation(
+            conversation["id"],
+            "turn-cancel-race",
+            reason="user cancelled",
+        )
+        module._persist_hosted_turn(
+            conversation["id"],
+            "turn-cancel-race",
+            patch={"status": "completed", "stage": "completed"},
+            message={
+                "role": "assistant",
+                "name": "default",
+                "content": "late final",
+                "status": "completed",
+                "meta": {
+                    "base_role_stage": "chat",
+                    "role_stage": "chat",
+                    "phase": "completed",
+                    "message_key": "turn-cancel-race:chat:completed",
+                },
+            },
+        )
+
+        self.assertEqual(cancelled["status"], "cancelled")
+        self.assertEqual(run["status"], "cancelled")
+        self.assertEqual(run["remote_runs"]["worker"]["status"], "running")
+        self.assertTrue(run["remote_runs"]["worker"]["cancel_requested"])
+        self.assertFalse(any(
+            message.get("meta", {}).get("message_key")
+            == "turn-cancel-race:chat:completed"
+            for message in conversation["messages"]
+        ))
+        self.assertEqual(
+            sum(
+                1
+                for message in conversation["messages"]
+                if message.get("meta", {}).get("final_report") is True
+            ),
+            1,
+        )
 
     def test_profile_model_readiness_rejects_virtual_moa_without_real_credentials(self):
         module = load_module()
@@ -365,6 +461,148 @@ class CollaborationDashboardTests(unittest.TestCase):
             captured["kwargs"]["env"]["HERMES_KANBAN_TASK"],
             "t_worker_child",
         )
+
+    def test_structured_profile_turn_uses_five_attempts_and_two_minute_deadline(self):
+        module = load_module()
+        captured = {}
+
+        class FakeProcess:
+            def __init__(self):
+                self.stdin = io.StringIO()
+                self.stdout = io.StringIO(
+                    json.dumps({
+                        "type": "message.complete",
+                        "payload": {"text": "连接成功", "status": "completed"},
+                    }, ensure_ascii=False) + "\n"
+                )
+                self.stderr = io.StringIO()
+
+            def poll(self):
+                return 0
+
+            def wait(self, timeout=None):
+                captured["wait_timeout"] = timeout
+                return 0
+
+            def kill(self):
+                captured["killed"] = True
+
+            def terminate(self):
+                captured["terminated"] = True
+
+        def process_factory(_command, **kwargs):
+            captured["env"] = kwargs["env"]
+            return FakeProcess()
+
+        response = module.run_profile_turn(
+            "default",
+            "你好",
+            process_factory=process_factory,
+        )
+
+        self.assertEqual(response, "连接成功")
+        self.assertEqual(captured["env"]["HERMES_API_MAX_RETRIES"], "5")
+        self.assertGreater(captured["wait_timeout"], 119)
+        self.assertLessEqual(captured["wait_timeout"], 120)
+
+    def test_structured_profile_turn_deadline_includes_blocked_stdin_write(self):
+        module = load_module()
+        released = threading.Event()
+        state = {"stopped": False}
+
+        class BlockingStdin:
+            def write(self, _value):
+                released.wait(5)
+
+            def close(self):
+                return None
+
+        class BlockingStdout:
+            def __iter__(self):
+                return self
+
+            def __next__(self):
+                released.wait(5)
+                raise StopIteration
+
+        class FakeProcess:
+            stdin = BlockingStdin()
+            stdout = BlockingStdout()
+            stderr = io.StringIO()
+
+            def poll(self):
+                return -15 if state["stopped"] else None
+
+            def wait(self, timeout=None):
+                if state["stopped"]:
+                    return -15
+                raise subprocess.TimeoutExpired("fake", timeout)
+
+            def terminate(self):
+                state["stopped"] = True
+                released.set()
+
+            def kill(self):
+                state["stopped"] = True
+                released.set()
+
+        started = time.monotonic()
+        with self.assertRaisesRegex(TimeoutError, "timed out"):
+            module.run_profile_turn(
+                "default",
+                "x" * (1024 * 1024),
+                process_factory=lambda *_args, **_kwargs: FakeProcess(),
+                timeout=0.05,
+            )
+
+        self.assertTrue(state["stopped"])
+        self.assertLess(time.monotonic() - started, 1.0)
+
+    def test_structured_profile_turn_terminates_immediately_when_cancelled(self):
+        module = load_module()
+        released = threading.Event()
+        state = {"stopped": False}
+
+        class BlockingStdout:
+            def __iter__(self):
+                return self
+
+            def __next__(self):
+                released.wait(5)
+                raise StopIteration
+
+        class FakeProcess:
+            stdin = io.StringIO()
+            stdout = BlockingStdout()
+            stderr = io.StringIO()
+
+            def poll(self):
+                return -15 if state["stopped"] else None
+
+            def wait(self, timeout=None):
+                if state["stopped"]:
+                    return -15
+                raise subprocess.TimeoutExpired("fake", timeout)
+
+            def terminate(self):
+                state["stopped"] = True
+                released.set()
+
+            def kill(self):
+                state["stopped"] = True
+                released.set()
+
+        started = time.monotonic()
+        with self.assertRaises(module._HostedTurnCancelled):
+            module.run_profile_turn(
+                "default",
+                "cancel now",
+                cancel_check=lambda: True,
+                process_factory=lambda *_args, **_kwargs: FakeProcess(),
+            )
+
+        self.assertTrue(state["stopped"])
+        self.assertLess(time.monotonic() - started, 1.0)
 
     def test_single_chat_store_and_prompt_keep_conversation_context(self):
         module = load_module()
@@ -819,6 +1057,20 @@ class CollaborationDashboardTests(unittest.TestCase):
         )
         self.assertNotIn("<html>", cleaned.lower())
         self.assertNotIn("nginx", cleaned.lower())
+
+    def test_provider_auth_and_service_errors_keep_specific_http_status(self):
+        module = load_module()
+
+        self.assertEqual(
+            module.sanitize_runtime_error("HTTP 401: invalid_api_key"),
+            "模型服务拒绝了 API 密钥（HTTP 401）。",
+        )
+        self.assertEqual(
+            module.sanitize_runtime_error("HTTP 503: upstream unavailable"),
+            "模型服务暂时繁忙（HTTP 503），已保留当前进度。",
+        )
+        self.assertEqual(module.runtime_error_code("HTTP 401"), "http_401")
+        self.assertEqual(module.runtime_error_code("request timed out"), "model_timeout")
 
     def test_profile_event_stream_uses_structured_json_and_keeps_tool_details(self):
         module = load_module()
@@ -2950,10 +3202,16 @@ class CollaborationDashboardTests(unittest.TestCase):
                     },
                 }
             )
+            event_callback(
+                {
+                    "type": "status.update",
+                    "payload": {"status": "running", "text": "model running"},
+                }
+            )
             visible_before_output.extend(
                 message
                 for message in conversation["messages"]
-                if message.get("meta", {}).get("role_stage") == "chat"
+                if message.get("meta", {}).get("base_role_stage") == "chat"
             )
             return "真实模型回复"
 
@@ -2963,7 +3221,8 @@ class CollaborationDashboardTests(unittest.TestCase):
             runner=runner,
         )
 
-        self.assertEqual(visible_before_output, [])
+        self.assertTrue(visible_before_output)
+        self.assertTrue(all(not message["content"] for message in visible_before_output))
         chat_messages = [
             message
             for message in conversation["messages"]
@@ -2973,6 +3232,113 @@ class CollaborationDashboardTests(unittest.TestCase):
         self.assertFalse(
             any("收到消息" in message.get("content", "") for message in chat_messages)
         )
+
+    def test_failed_hosted_chat_closes_the_turn_and_timer_with_specific_status(self):
+        module = load_module()
+        conversation = module.create_single_conversation("default")
+        state = {"conversations": [conversation]}
+        module.load_single_state = lambda: state
+        module.save_single_state = lambda _state: None
+        module._schedule_mobile_completion_notification = lambda *_args: None
+        run = module.create_hosted_turn_record(
+            conversation,
+            turn_id="turn-auth-failure",
+            content="你好",
+            title="你好",
+            profiles=["default"],
+            artifact_required=False,
+            mode="chat",
+            route_metadata={"mode": "chat"},
+        )
+
+        module.execute_hosted_chat(
+            conversation["id"],
+            "turn-auth-failure",
+            runner=lambda *_args, **_kwargs: (_ for _ in ()).throw(
+                RuntimeError("HTTP 401: invalid_api_key")
+            ),
+        )
+
+        self.assertEqual(run["status"], "failed")
+        self.assertEqual(run["stage"], "failed")
+        self.assertEqual(run["error_code"], "http_401")
+        self.assertFalse(run["retryable"])
+        self.assertEqual(run["lease_expires_at"], run["completed_at"])
+        self.assertGreater(run["deadline_at"] - run["updated_at"], 0)
+        self.assertLessEqual(
+            run["deadline_at"] - run["updated_at"],
+            module._HOSTED_CHAT_TIMEOUT_SECONDS * 1000,
+        )
+        final = next(
+            message
+            for message in conversation["messages"]
+            if message.get("meta", {}).get("message_key")
+            == "turn-auth-failure:chat:completed"
+        )
+        self.assertEqual(final["status"], "failed")
+        self.assertEqual(final["meta"]["phase"], "failed")
+        self.assertIn("HTTP 401", final["content"])
+
+    def test_empty_stream_failure_atomically_closes_progress_and_runtime_timers(self):
+        module = load_module()
+        conversation = module.create_single_conversation("default")
+        state = {"conversations": [conversation]}
+        module.load_single_state = lambda: state
+        module.save_single_state = lambda _state: None
+        module._schedule_mobile_completion_notification = lambda *_args: None
+        run = module.create_hosted_turn_record(
+            conversation,
+            turn_id="turn-empty-stream",
+            content="你好",
+            title="你好",
+            profiles=["default"],
+            artifact_required=False,
+            mode="chat",
+            route_metadata={"mode": "chat"},
+        )
+        conversation["runtime_runs"] = {
+            "default": {
+                "status": "running",
+                "turn_id": "turn-empty-stream",
+                "updated_at": int(time.time() * 1000),
+            },
+        }
+
+        def empty_stream_runner(_profile, _prompt, *, event_callback):
+            event_callback({"type": "request.accepted", "payload": {}})
+            event_callback({
+                "type": "message.delta",
+                "payload": {"text": "收到消息，正在处理。"},
+            })
+            raise RuntimeError(
+                "HTTP 502: Provider returned an empty stream with no finish_reason"
+            )
+
+        module.execute_hosted_chat(
+            conversation["id"],
+            "turn-empty-stream",
+            runner=empty_stream_runner,
+        )
+
+        self.assertEqual(run["status"], "failed")
+        self.assertEqual(run["error_code"], "http_502")
+        self.assertEqual(run["role_events"]["chat"]["status"], "failed")
+        self.assertEqual(conversation["runtime_runs"]["default"]["status"], "failed")
+        turn_messages = [
+            message
+            for message in conversation["messages"]
+            if message.get("meta", {}).get("runtime_turn_id") == "turn-empty-stream"
+        ]
+        self.assertTrue(turn_messages)
+        self.assertFalse(any(
+            message.get("status") in {"pending", "queued", "running", "starting", "streaming"}
+            for message in turn_messages
+        ))
+        self.assertTrue(any(
+            message.get("status") == "failed"
+            and "HTTP 502" in message.get("content", "")
+            for message in turn_messages
+        ))
 
     def test_completed_hosted_chat_role_is_not_executed_again_after_restart(self):
         module = load_module()
