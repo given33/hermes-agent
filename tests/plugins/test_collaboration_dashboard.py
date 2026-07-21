@@ -462,7 +462,7 @@ class CollaborationDashboardTests(unittest.TestCase):
             "t_worker_child",
         )
 
-    def test_structured_profile_turn_uses_five_attempts_and_two_minute_deadline(self):
+    def test_structured_profile_turn_uses_five_attempts_with_minute_retry_cadence(self):
         module = load_module()
         captured = {}
 
@@ -502,8 +502,11 @@ class CollaborationDashboardTests(unittest.TestCase):
 
         self.assertEqual(response, "连接成功")
         self.assertEqual(captured["env"]["HERMES_API_MAX_RETRIES"], "5")
-        self.assertGreater(captured["wait_timeout"], 119)
-        self.assertLessEqual(captured["wait_timeout"], 120)
+        self.assertEqual(captured["env"]["HERMES_API_RETRY_DELAY_SECONDS"], "60")
+        self.assertEqual(captured["env"]["HERMES_API_RETRY_STATUS_LIVE"], "1")
+        self.assertEqual(captured["env"]["HERMES_API_RETRY_CLIENT_ERRORS"], "1")
+        self.assertGreater(captured["wait_timeout"], 599)
+        self.assertLessEqual(captured["wait_timeout"], 600)
 
     def test_structured_profile_turn_deadline_includes_blocked_stdin_write(self):
         module = load_module()
@@ -1893,6 +1896,57 @@ class CollaborationDashboardTests(unittest.TestCase):
         ]
         self.assertEqual([item["output"] for item in reasoning], ["正在检查服务。"])
 
+    def test_hosted_event_reducer_freezes_first_token_and_exposes_retry_state_only(self):
+        module = load_module()
+        state = {
+            "content": "",
+            "status": "streaming",
+            "activities": [],
+            "first_token_at": 0,
+        }
+
+        with patch.object(module.time, "time", side_effect=[1.0, 1.0, 2.0, 3.0]):
+            module.apply_profile_event(
+                state,
+                {"type": "status.update", "payload": {"text": "正在重连 (1/5)"}},
+            )
+            module.apply_profile_event(
+                state,
+                {"type": "message.delta", "payload": {"text": "你"}},
+            )
+            module.apply_profile_event(
+                state,
+                {"type": "message.delta", "payload": {"text": "好"}},
+            )
+
+        self.assertEqual(state["content"], "你好")
+        self.assertEqual(state["first_token_at"], 2000)
+        statuses = [
+            item for item in state["activities"] if item["kind"] == "status"
+        ]
+        self.assertEqual([item["output"] for item in statuses], ["正在重连 (1/5)"])
+
+    def test_connection_retry_event_hides_intermediate_error_and_exposes_attempt(self):
+        module = load_module()
+        state = {"content": "", "status": "streaming", "activities": []}
+
+        module.apply_profile_event(
+            state,
+            {
+                "type": "connection.retry",
+                "payload": {
+                    "attempt": 2,
+                    "max_attempts": 5,
+                    "message": "HTTP 401 secret intermediate provider detail",
+                },
+            },
+        )
+
+        self.assertEqual(len(state["activities"]), 1)
+        self.assertEqual(state["activities"][0]["name"], "运行状态")
+        self.assertEqual(state["activities"][0]["output"], "正在重连 (2/5)")
+        self.assertNotIn("401", state["activities"][0]["output"])
+
     def test_tool_generating_does_not_create_a_duplicate_running_activity(self):
         module = load_module()
         state = {"content": "", "status": "streaming", "activities": []}
@@ -3278,6 +3332,47 @@ class CollaborationDashboardTests(unittest.TestCase):
         self.assertEqual(final["status"], "failed")
         self.assertEqual(final["meta"]["phase"], "failed")
         self.assertIn("HTTP 401", final["content"])
+
+    def test_terminal_child_error_is_not_duplicated_by_the_hosted_wrapper(self):
+        module = load_module()
+        conversation = module.create_single_conversation("default")
+        state = {"conversations": [conversation]}
+        module.load_single_state = lambda: state
+        module.save_single_state = lambda _state: None
+        module._schedule_mobile_completion_notification = lambda *_args: None
+        run = module.create_hosted_turn_record(
+            conversation,
+            turn_id="turn-final-auth-error",
+            content="你好",
+            title="你好",
+            profiles=["default"],
+            artifact_required=False,
+            mode="chat",
+            route_metadata={"mode": "chat"},
+        )
+
+        def terminal_error_runner(_profile, _prompt, *, event_callback):
+            event_callback({
+                "type": "message.complete",
+                "payload": {"text": "HTTP 401: invalid key", "status": "error"},
+            })
+            raise RuntimeError("模型服务拒绝了 API 密钥（HTTP 401）。")
+
+        module.execute_hosted_chat(
+            conversation["id"],
+            "turn-final-auth-error",
+            runner=terminal_error_runner,
+        )
+
+        self.assertEqual(run["status"], "failed")
+        final = next(
+            message
+            for message in conversation["messages"]
+            if message.get("meta", {}).get("message_key")
+            == "turn-final-auth-error:chat:completed"
+        )
+        self.assertEqual(final["content"], "HTTP 401: invalid key")
+        self.assertNotIn("本阶段未完成", final["content"])
 
     def test_empty_stream_failure_atomically_closes_progress_and_runtime_timers(self):
         module = load_module()

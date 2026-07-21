@@ -1543,6 +1543,18 @@ def init_agent(
     except (TypeError, ValueError):
         _api_retries = 3
     agent._api_max_retries = _api_retries
+    try:
+        _retry_delay = float(os.environ.get("HERMES_API_RETRY_DELAY_SECONDS", "0") or 0)
+        _retry_delay = min(max(_retry_delay, 0.0), 600.0)
+    except (TypeError, ValueError):
+        _retry_delay = 0.0
+    agent._api_retry_delay_seconds = _retry_delay
+    agent._api_retry_status_live = str(
+        os.environ.get("HERMES_API_RETRY_STATUS_LIVE", "")
+    ).strip().lower() in {"1", "true", "yes", "on"}
+    agent._api_retry_client_errors = str(
+        os.environ.get("HERMES_API_RETRY_CLIENT_ERRORS", "")
+    ).strip().lower() in {"1", "true", "yes", "on"}
 
     # Initialize context compressor for automatic context management
     # Compresses conversation when approaching model's context limit

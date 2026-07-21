@@ -1135,6 +1135,8 @@ def run_conversation(
         agent._current_api_request_id = api_request_id
 
         while retry_count < max_retries:
+            if retry_count > 0 and getattr(agent, "_api_retry_status_live", False):
+                agent._emit_status("正在思考")
             # ── Nous Portal rate limit guard ──────────────────────
             # If another session already recorded that Nous is rate-
             # limited, skip the API call entirely.  Each attempt
@@ -1607,9 +1609,20 @@ def run_conversation(
                             "failed": True  # Mark as failure for filtering
                         }
                     
-                    # Backoff before retry — jittered exponential: 5s base, 120s cap
-                    wait_time = jittered_backoff(retry_count, base_delay=5.0, max_delay=120.0)
+                    # Hosted mobile turns use a stable one-minute cadence so
+                    # the UI state machine and the real provider attempts share
+                    # one clock. Other surfaces keep the adaptive backoff.
+                    configured_retry_delay = float(
+                        getattr(agent, "_api_retry_delay_seconds", 0.0) or 0.0
+                    )
+                    wait_time = configured_retry_delay or jittered_backoff(
+                        retry_count, base_delay=5.0, max_delay=120.0
+                    )
                     agent._buffer_vprint(f"⏳ Retrying in {wait_time:.1f}s ({_failure_hint})...")
+                    if getattr(agent, "_api_retry_status_live", False):
+                        agent._emit_status(
+                            f"正在重连 ({retry_count}/{max_retries})"
+                        )
                     logger.warning(f"Invalid API response (retry {retry_count}/{max_retries}): {', '.join(error_details)} | Provider: {provider_name}")
                     
                     # Sleep in small increments to stay responsive to interrupts
@@ -3822,6 +3835,20 @@ def run_conversation(
                     )
                 ) and not is_context_length_error
 
+                if (
+                    getattr(agent, "_api_retry_client_errors", False)
+                    and status_code in {400, 401, 403, 404}
+                    and not is_local_validation_error
+                    and classified.reason not in {
+                        FailoverReason.billing,
+                        FailoverReason.content_policy_blocked,
+                        FailoverReason.context_overflow,
+                        FailoverReason.payload_too_large,
+                        FailoverReason.ssl_cert_verification,
+                    }
+                ):
+                    is_client_error = False
+
                 if is_client_error:
                     # Try fallback before aborting — a different provider may
                     # not have the same issue (rate limit, auth, etc.). Only
@@ -4228,7 +4255,14 @@ def run_conversation(
                                 _retry_after = min(float(_ra_raw), 600)
                             except (TypeError, ValueError):
                                 pass
-                wait_time = _retry_after if _retry_after else jittered_backoff(retry_count, base_delay=2.0, max_delay=60.0)
+                configured_retry_delay = float(
+                    getattr(agent, "_api_retry_delay_seconds", 0.0) or 0.0
+                )
+                wait_time = configured_retry_delay or (
+                    _retry_after
+                    if _retry_after
+                    else jittered_backoff(retry_count, base_delay=2.0, max_delay=60.0)
+                )
                 _backoff_policy = None
                 if (is_rate_limited or _is_zai_coding_overload) and not _retry_after:
                     wait_time, _backoff_policy = adaptive_rate_limit_backoff(
@@ -4262,6 +4296,10 @@ def run_conversation(
                         agent._buffer_status(_rate_limit_status)
                 else:
                     agent._buffer_status(f"⏳ Retrying in {wait_time:.1f}s (attempt {retry_count}/{max_retries})...")
+                if getattr(agent, "_api_retry_status_live", False):
+                    agent._emit_status(
+                        f"正在重连 ({retry_count}/{max_retries})"
+                    )
                 logger.warning(
                     "Retrying API call in %ss (attempt %s/%s) %s policy=%s error=%s",
                     wait_time,

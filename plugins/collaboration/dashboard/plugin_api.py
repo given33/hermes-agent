@@ -109,7 +109,7 @@ _MOBILE_NOTIFICATION_TERMINAL_STATUSES = {
 }
 _HOSTED_TRANSIENT_RETRIES = 1
 _HOSTED_CHAT_API_ATTEMPTS = 5
-_HOSTED_CHAT_TIMEOUT_SECONDS = 120
+_HOSTED_CHAT_TIMEOUT_SECONDS = 10 * 60
 _HOSTED_REWORK_LIMIT = 2
 _HOSTED_EVENT_FLUSH_SECONDS = 0.45
 _MODEL_NOT_CONFIGURED_CODE = "model_not_configured"
@@ -2933,6 +2933,9 @@ def run_profile_turn(
         "HERMES_HOME": resolve_profile_env(profile),
         "HERMES_SESSION_SOURCE": "dashboard-group",
         "HERMES_API_MAX_RETRIES": str(_HOSTED_CHAT_API_ATTEMPTS),
+        "HERMES_API_RETRY_CLIENT_ERRORS": "1",
+        "HERMES_API_RETRY_DELAY_SECONDS": "60",
+        "HERMES_API_RETRY_STATUS_LIVE": "1",
     }
     if kanban_task_id:
         env["HERMES_KANBAN_TASK"] = kanban_task_id
@@ -3143,6 +3146,8 @@ def apply_profile_event(
                     int(activity["ended_at"]) - int(activity["started_at"]),
                 )
     elif event_type == "message.delta":
+        if not int(state.get("first_token_at") or 0):
+            state["first_token_at"] = now
         for activity in reversed(activities):
             if activity.get("kind") == "reasoning" and activity.get("status") == "running":
                 activity["status"] = "completed"
@@ -3296,13 +3301,15 @@ def apply_profile_event(
                 }
             )
     elif event_type == "connection.retry":
+        attempt = max(1, int(payload.get("attempt") or 1))
+        max_attempts = max(attempt, int(payload.get("max_attempts") or _HOSTED_CHAT_API_ATTEMPTS))
         activities.append(
             {
                 "id": _new_activity_id("retry", activities),
                 "kind": "status",
                 "category": "other",
-                "name": "模型服务重试",
-                "output": sanitize_runtime_error(payload.get("message")),
+                "name": "运行状态",
+                "output": f"正在重连 ({attempt}/{max_attempts})",
                 "status": "completed",
                 "started_at": now,
                 "ended_at": now,
@@ -3443,6 +3450,7 @@ def _persist_hosted_role_state(
             state.get("runtime_session_id") or ""
         ).strip(),
         "started_at": int(state.get("started_at") or now),
+        "first_token_at": int(state.get("first_token_at") or 0),
         "completed_at": now if str(state.get("status") or "") in _HOSTED_TERMINAL_STATUSES else None,
         "milestone_count": int(state.get("milestone_count") or 0),
         "milestone_content": str(state.get("milestone_content") or ""),
@@ -3476,6 +3484,7 @@ def _persist_hosted_role_state(
                 "profile": profile,
                 "handoff_to": handoff_to,
                 "started_at": snapshot["started_at"],
+                "first_token_at": snapshot["first_token_at"] or None,
                 "completed_at": snapshot["completed_at"],
                 "collapse_activities": True,
                 "final_report": final_report and state_status in _HOSTED_TERMINAL_STATUSES,
@@ -3514,6 +3523,7 @@ def _run_hosted_role(
         "actual_provider": "",
         "runtime_session_id": str(runtime_session_id or "").strip(),
         "started_at": int(time.time() * 1000),
+        "first_token_at": 0,
         "milestone_count": 0,
         "milestone_content": "",
         "request_accepted": False,
@@ -3535,6 +3545,7 @@ def _run_hosted_role(
                     previous_state.get("started_at")
                     or state["started_at"]
                 ),
+                "first_token_at": int(previous_state.get("first_token_at") or 0),
                 "milestone_count": int(previous_state.get("milestone_count") or 0),
                 "milestone_content": str(previous_state.get("milestone_content") or ""),
                 "request_accepted": bool(previous_state.get("request_accepted")),
@@ -3709,6 +3720,16 @@ def _run_hosted_role(
                 _finish_hosted_turn_if_cancelled(conversation_id, turn_id)
                 state["status"] = "cancelled"
                 return str(state.get("content") or "").strip(), "cancelled", state
+            terminal_content = str(state.get("content") or "").strip()
+            if str(state.get("status") or "") == "failed" and terminal_content:
+                clean_error = sanitize_runtime_error(exc)
+                state["error"] = clean_error
+                state["activities"] = _remove_duplicate_reasoning_activities(
+                    state.get("activities") or [],
+                    terminal_content,
+                )
+                persist()
+                return terminal_content, "failed", state
             transient = _is_transient_runtime_error(exc)
             has_tool_activity = any(
                 activity.get("kind") in {"tool", "subagent"}
@@ -4965,6 +4986,7 @@ def execute_hosted_chat(
                 f"{result}\n\n文件交付失败：Hermes 未在指定输出目录生成可下载文件。"
             ).strip()
     now = int(time.time() * 1000)
+    first_token_at = int(_role_state.get("first_token_at") or 0)
     _persist_hosted_turn(
         conversation_id,
         turn_id,
@@ -5003,6 +5025,10 @@ def execute_hosted_chat(
                 "role_label": "Hermes",
                 "profile": profile,
                 "attachments": published_attachments,
+                "started_at": first_token_at or None,
+                "first_token_at": first_token_at or None,
+                "completed_at": now,
+                "duration_ms": max(0, now - first_token_at) if first_token_at else 0,
                 "runtime_session_id": str(
                     _role_state.get("runtime_session_id") or ""
                 ).strip(),

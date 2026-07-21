@@ -53,6 +53,24 @@ def test_api_max_retries_honors_bounded_hosted_environment_override():
     assert capped._api_max_retries == 10
 
 
+def test_hosted_retry_clock_and_live_status_are_environment_scoped():
+    with patch.dict("os.environ", {
+        "HERMES_API_RETRY_CLIENT_ERRORS": "1",
+        "HERMES_API_RETRY_DELAY_SECONDS": "60",
+        "HERMES_API_RETRY_STATUS_LIVE": "true",
+    }):
+        agent = _make_agent()
+
+    assert agent._api_retry_client_errors is True
+    assert agent._api_retry_delay_seconds == 60
+    assert agent._api_retry_status_live is True
+
+    default_agent = _make_agent()
+    assert default_agent._api_retry_client_errors is False
+    assert default_agent._api_retry_delay_seconds == 0
+    assert default_agent._api_retry_status_live is False
+
+
 def test_api_max_retries_clamps_below_one_to_one():
     """0 or negative values would disable the retry loop entirely
     (the ``while retry_count < max_retries`` guard would never execute),
