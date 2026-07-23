@@ -103,6 +103,35 @@ _API_CALL_MODULES = frozenset({
 })
 
 
+def _hosted_should_retry_client_error(agent: Any, status_code: Any) -> bool:
+    """Limit the iOS key-replacement grace period to hosted 401/403 turns."""
+    return bool(
+        (
+            getattr(agent, "_api_retry_client_errors", False)
+            or getattr(agent, "_hosted_retry_client_errors", False)
+        )
+        and status_code in {401, 403}
+    )
+
+
+def _model_retry_wait_seconds(
+    agent: Any,
+    *,
+    retry_after: Optional[float],
+    retry_count: int,
+) -> float:
+    """Resolve one retry delay while preserving provider Retry-After hints."""
+    configured_delay = getattr(agent, "_api_retry_delay_seconds", None)
+    if configured_delay is None:
+        configured_delay = getattr(agent, "_hosted_retry_delay_seconds", None)
+    if configured_delay is not None:
+        delay = max(0.0, float(configured_delay))
+        return max(delay, float(retry_after or 0.0))
+    if retry_after is not None:
+        return float(retry_after)
+    return jittered_backoff(retry_count, base_delay=2.0, max_delay=60.0)
+
+
 def _image_error_max_dimension(error: Exception) -> Optional[int]:
     """Extract a provider-reported image dimension ceiling, if present."""
     parts = []
@@ -3925,6 +3954,14 @@ def run_conversation(
                         }
                     )
                 ) and not is_context_length_error
+                if is_client_error and _hosted_should_retry_client_error(
+                    agent, status_code
+                ):
+                    # The iOS hosted-turn contract intentionally gives the
+                    # user time to replace an expired key while the same child
+                    # keeps its session. Other Hermes surfaces retain the
+                    # normal fail-fast behavior for deterministic 4xx errors.
+                    is_client_error = False
 
                 if (
                     getattr(agent, "_api_retry_client_errors", False)
@@ -4346,13 +4383,10 @@ def run_conversation(
                                 _retry_after = min(float(_ra_raw), 600)
                             except (TypeError, ValueError):
                                 pass
-                configured_retry_delay = float(
-                    getattr(agent, "_api_retry_delay_seconds", 0.0) or 0.0
-                )
-                wait_time = configured_retry_delay or (
-                    _retry_after
-                    if _retry_after
-                    else jittered_backoff(retry_count, base_delay=2.0, max_delay=60.0)
+                wait_time = _model_retry_wait_seconds(
+                    agent,
+                    retry_after=_retry_after,
+                    retry_count=retry_count,
                 )
                 _backoff_policy = None
                 if (is_rate_limited or _is_zai_coding_overload) and not _retry_after:

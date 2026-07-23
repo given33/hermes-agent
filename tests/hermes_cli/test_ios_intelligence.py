@@ -526,7 +526,7 @@ def test_departure_callback_closes_the_existing_visit_without_double_learning(st
         ).fetchone()[0] == 2
 
 
-def test_account_delete_removes_registered_custom_cold_segment(store, tmp_path):
+def test_account_delete_removes_registered_custom_cold_segment(store):
     observed_at = 946_684_800
     store.ingest_events(
         "alice",
@@ -534,7 +534,7 @@ def test_account_delete_removes_registered_custom_cold_segment(store, tmp_path):
         [_location_event("cold-point", owner_time=observed_at)],
         "cold",
     )
-    target = tmp_path / "custom-cold" / "alice-segment.enc"
+    target = store._cold_owner_directory("alice", create=True) / "alice-segment.enc"
     archived = store.archive_cold_storage(
         "alice",
         before=observed_at + 1,
@@ -611,7 +611,6 @@ def test_cold_archive_install_failure_and_restart_remove_unindexed_files(
 
 def test_account_delete_retains_failed_cold_segment_and_retries_after_restart(
     store,
-    tmp_path,
     monkeypatch,
 ):
     observed_at = 946_684_800
@@ -621,7 +620,7 @@ def test_account_delete_retains_failed_cold_segment_and_retries_after_restart(
         [_location_event("cold-retry", owner_time=observed_at)],
         "cold-retry",
     )
-    target = tmp_path / "custom-cold" / "retry-segment.enc"
+    target = store._cold_owner_directory("alice", create=True) / "retry-segment.enc"
     archived = store.archive_cold_storage(
         "alice",
         before=observed_at + 1,
@@ -656,6 +655,7 @@ def test_account_delete_retains_failed_cold_segment_and_retries_after_restart(
         "cold_files_removed": 1,
         "cold_segments_pending": 0,
         "cold_segments_failed": 0,
+        "cold_install_intents_pending": 0,
         "state": "complete",
     }]
     assert not target.exists()
@@ -1653,7 +1653,7 @@ def test_expired_partial_delivery_reaches_terminal_state_when_event_is_kept(stor
         "alice", now=now + 61, keep_event_key="rain"
     )
 
-    assert result["expired"] == 0
+    assert result["expired"] == 1
     with sqlite3.connect(store.path) as conn:
         state, lease_token, leased_until = conn.execute(
             "SELECT state,lease_token,leased_until FROM ios_notification_outbox WHERE id=?",

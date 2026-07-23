@@ -1,0 +1,174 @@
+name: Upstream Hermes sync
+
+on:
+  schedule:
+    # 02:17 Asia/Shanghai. A non-round minute avoids the busiest scheduler edge.
+    - cron: '17 18 * * *'
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Optional exact NousResearch/hermes-agent tag
+        required: false
+        type: string
+
+permissions:
+  contents: write
+  issues: write
+  pull-requests: write
+
+concurrency:
+  group: upstream-hermes-sync
+  cancel-in-progress: false
+
+jobs:
+  prepare-sync:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    env:
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - name: Check out the complete product history
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          fetch-depth: 0
+
+      - name: Fetch and select the upstream release
+        id: release
+        shell: bash
+        env:
+          REQUESTED_TAG: ${{ inputs.tag }}
+        run: |
+          set -euo pipefail
+          git remote remove upstream 2>/dev/null || true
+          git remote add upstream https://github.com/NousResearch/hermes-agent.git
+          git fetch --force --tags upstream '+refs/tags/*:refs/tags/*'
+          tag="${REQUESTED_TAG:-}"
+          if [[ -z "$tag" ]]; then
+            tag="$(git tag --list 'v[0-9]*' --sort=-version:refname | head -n 1)"
+          fi
+          [[ "$tag" =~ ^v[0-9]+([.][0-9]+)+$ ]] || {
+            echo "Invalid upstream tag: $tag" >&2
+            exit 2
+          }
+          git rev-parse --verify "refs/tags/$tag^{commit}" >/dev/null
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+          if git merge-base --is-ancestor "$tag" origin/main; then
+            echo "needed=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "needed=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Stop when main already contains the release
+        if: steps.release.outputs.needed != 'true'
+        run: echo "${{ steps.release.outputs.tag }} is already contained in main."
+
+      - name: Generate the pre-merge risk report
+        if: steps.release.outputs.needed == 'true'
+        run: |
+          python3 scripts/upstream_change_report.py \
+            --base origin/main \
+            --tag '${{ steps.release.outputs.tag }}' \
+            --output "$RUNNER_TEMP/upstream-report.md"
+
+      - name: Merge into the managed sync branch
+        if: steps.release.outputs.needed == 'true'
+        id: merge
+        shell: bash
+        run: |
+          set -euo pipefail
+          tag='${{ steps.release.outputs.tag }}'
+          branch="upstream-sync/$tag"
+          git config user.name github-actions[bot]
+          git config user.email 41898282+github-actions[bot]@users.noreply.github.com
+          git switch --force-create "$branch" origin/main
+          set +e
+          git merge --no-ff --no-edit "$tag" >"$RUNNER_TEMP/merge.log" 2>&1
+          status=$?
+          set -e
+          if [[ $status -ne 0 ]]; then
+            git diff --name-only --diff-filter=U >"$RUNNER_TEMP/conflicts.txt"
+            git merge --abort
+            echo "conflict=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          echo "conflict=false" >> "$GITHUB_OUTPUT"
+          echo "branch=$branch" >> "$GITHUB_OUTPUT"
+
+      - name: Record merge conflicts without changing main
+        if: steps.release.outputs.needed == 'true' && steps.merge.outputs.conflict == 'true'
+        shell: bash
+        run: |
+          set -euo pipefail
+          title="Upstream sync conflict: ${{ steps.release.outputs.tag }}"
+          {
+            cat "$RUNNER_TEMP/upstream-report.md"
+            printf '\n## Merge conflicts\n\n```text\n'
+            cat "$RUNNER_TEMP/conflicts.txt"
+            printf '```\n'
+          } >"$RUNNER_TEMP/conflict-issue.md"
+          existing="$(gh issue list --state open --search "$title in:title" --json number --jq '.[0].number // empty')"
+          if [[ -n "$existing" ]]; then
+            gh issue edit "$existing" --body-file "$RUNNER_TEMP/conflict-issue.md"
+          else
+            gh issue create --title "$title" --body-file "$RUNNER_TEMP/conflict-issue.md"
+          fi
+
+      - name: Install the locked test environment
+        if: steps.release.outputs.needed == 'true' && steps.merge.outputs.conflict == 'false'
+        uses: astral-sh/setup-uv@fac544c07dec837d0ccb6301d7b5580bf5edae39 # 8.2.0
+        with:
+          enable-cache: true
+          cache-dependency-glob: |
+            pyproject.toml
+            uv.lock
+
+      - name: Run product integration preflight
+        if: steps.release.outputs.needed == 'true' && steps.merge.outputs.conflict == 'false'
+        id: product
+        continue-on-error: true
+        shell: bash
+        run: |
+          set -euo pipefail
+          uv python install 3.11
+          uv sync --locked --python 3.11 --extra all --extra dev
+          source .venv/bin/activate
+          python -m pytest -q \
+            tests/plugins/test_collaboration_dashboard.py \
+            tests/deploy/test_cloud_deployment_assets.py
+
+      - name: Push the managed branch and create or update its pull request
+        if: steps.release.outputs.needed == 'true' && steps.merge.outputs.conflict == 'false'
+        shell: bash
+        run: |
+          set -euo pipefail
+          branch='${{ steps.merge.outputs.branch }}'
+          tag='${{ steps.release.outputs.tag }}'
+          {
+            cat "$RUNNER_TEMP/upstream-report.md"
+            printf '\n## Sync preflight\n\n- Product integration preflight: `%s`\n' '${{ steps.product.outcome }}'
+            printf '%s\n' '- The pull request automatically runs the complete official CI matrix.'
+            printf '%s\n' '- Merge and production deployment remain blocked until Codex review.'
+          } >"$RUNNER_TEMP/pr-body.md"
+          git push --force-with-lease origin "HEAD:refs/heads/$branch"
+          gh label create upstream-sync --color 1D76DB --description 'Automated official Hermes release sync' --force
+          gh label create codex-review-required --color D93F0B --description 'Requires Codex product-overlap review' --force
+          pr="$(gh pr list --state open --head "$branch" --json number --jq '.[0].number // empty')"
+          if [[ -z "$pr" ]]; then
+            gh pr create \
+              --base main \
+              --head "$branch" \
+              --title "chore: sync official Hermes $tag" \
+              --body-file "$RUNNER_TEMP/pr-body.md" \
+              --label upstream-sync \
+              --label codex-review-required
+            pr="$(gh pr list --state open --head "$branch" --json number --jq '.[0].number')"
+            gh pr comment "$pr" --body '@codex review the product overlap, iOS/API compatibility, and deployment risk in this upstream sync. Do not merge when any required adaptation or test is unresolved.'
+          else
+            gh pr edit "$pr" --body-file "$RUNNER_TEMP/pr-body.md" --add-label upstream-sync --add-label codex-review-required
+          fi
+
+      - name: Fail the run when the product preflight failed
+        if: steps.release.outputs.needed == 'true' && steps.merge.outputs.conflict == 'false' && steps.product.outcome != 'success'
+        run: |
+          echo 'Product integration preflight failed; the sync PR remains blocked.' >&2
+          exit 1

@@ -95,9 +95,15 @@ def resolve_global_config_path() -> Path:
     """Return the shared Honcho config path for the current HOME."""
     # ``Path.home()`` ignores HOME on Windows when USERPROFILE is present.
     # Respect an explicit HOME so profile isolation, service accounts, and
-    # test sandboxes never read or mutate the interactive user's config.
+    # test sandboxes never read or mutate the interactive user's config. On
+    # POSIX, ``Path.home()`` is the platform authority and must be resolved at
+    # call time (services and test sandboxes can change their user context).
     configured_home = os.environ.get("HOME", "").strip()
-    home = Path(configured_home).expanduser() if configured_home else Path.home()
+    home = (
+        Path(configured_home).expanduser()
+        if os.name == "nt" and configured_home
+        else Path.home()
+    )
     return home / ".honcho" / "config.json"
 
 

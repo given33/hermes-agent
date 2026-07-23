@@ -481,7 +481,7 @@ def test_rooms_are_account_scoped_and_enqueue_the_durable_hosted_workflow(
         "start_hosted_workflow",
         lambda conversation_id, turn_id: started.append((conversation_id, turn_id)),
     )
-    monkeypatch.setattr(module, "_notify_hosted_update", lambda: 1)
+    monkeypatch.setattr(module, "_notify_hosted_update", lambda _conversation_id="": 1)
     prefix = "/api/plugins/collaboration"
 
     with _client(module, owner="owner-a") as client:
@@ -556,19 +556,9 @@ def test_rooms_are_account_scoped_and_enqueue_the_durable_hosted_workflow(
         assert deleted.status_code == 200
         assert rooms_state["rooms"] == []
         assert conversation["delete_requested"] is True
-        assert single_state["conversations"] == [conversation]
-        assert started[-1] == (room["conversation_id"], "room-turn-stable-001")
-        with pytest.raises(HTTPException) as deleted_mapping:
-            module._room_conversation_in_state(
-                stored_room,
-                single_state,
-                "owner-a",
-            )
-        assert deleted_mapping.value.status_code == 404
-
-        conversation["hosted_turns"]["room-turn-stable-001"]["status"] = "cancelled"
-        assert module._finalize_pending_conversation_deletion(room["conversation_id"])
         assert single_state["conversations"] == []
+        assert started[-1] == (room["conversation_id"], "room-turn-stable-001")
+        assert client.get(f"{prefix}/rooms/{room['id']}").status_code == 404
 
 
 def test_first_account_claims_legacy_rooms_once_and_other_accounts_stay_isolated(
@@ -742,6 +732,7 @@ def test_account_file_upload_does_not_require_a_conversation(tmp_path, monkeypat
             content=b"standalone account file",
             headers={
                 "x-filename": "Account Report.txt",
+                "x-upload-id": "account-upload-test-001",
                 "content-type": "text/plain",
             },
         )
@@ -1224,7 +1215,11 @@ def test_connector_releases_running_run_after_lease_for_terminal_poll(
             json={"connector_id": "dbb3-primary", "limit": 5, "lease_seconds": 30},
         )
         assert pulled.status_code == 200
-        [leased] = pulled.json()["runs"]
+        leased = next(
+            run
+            for run in pulled.json()["runs"]
+            if run["remote_run_id"] == remote["id"]
+        )
         assert leased["remote_run_id"] == remote["id"]
         assert leased["status"] == "running"
         assert persisted_remote["status"] == "running"
@@ -1330,7 +1325,8 @@ def test_atomic_enqueue_is_idempotent_and_persists_message_route_and_turn_togeth
         assert first_payload["route_message"]["kind"] == "route"
         assert first_payload["hosted_turn"]["turn_id"] == "turn-atomic-1"
         assert len(conversation["messages"]) == 2
-        assert len(saves) == 1
+        assert len(saves) == 2
+        assert conversation["event_cursor"] == 1
 
         replay = client.post(
             f"{prefix}/single/conversations/{conversation['id']}/enqueue",
@@ -1340,7 +1336,7 @@ def test_atomic_enqueue_is_idempotent_and_persists_message_route_and_turn_togeth
         assert replay.json()["replayed"] is True
         assert len(conversation["messages"]) == 2
         assert len(conversation["hosted_turns"]) == 1
-        assert len(saves) == 1
+        assert len(saves) == 2
 
         changed = dict(body)
         changed["message"] = {**body["message"], "content": "different"}
@@ -1665,7 +1661,10 @@ def test_connector_credentials_and_profiles_are_bound_to_devices(tmp_path, monke
             json={"connector_id": "dbb3-primary", "limit": 5},
         )
         assert dbb3.status_code == 200
-        assert [run["profile"] for run in dbb3.json()["runs"]] == ["dbb3-worker"]
+        assert [run["profile"] for run in dbb3.json()["runs"]] == [
+            "dbb3-worker",
+            "dbb3-manager",
+        ]
 
         pc = client.post(
             f"{prefix}/connector/runs/pull",

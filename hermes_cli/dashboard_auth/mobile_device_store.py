@@ -154,74 +154,6 @@ def _bounded(value: str, limit: int) -> str:
     return str(value or "").strip()[:limit]
 
 
-def _refresh_replay_key(refresh_token: str) -> bytes:
-    return hashlib.sha256(
-        b"hermes-mobile-refresh-idempotency-v1\0" + refresh_token.encode("utf-8")
-    ).digest()
-
-
-def _seal_refresh_response(
-    consumed_refresh_token: str,
-    pair: "MobileTokenPair",
-) -> tuple[bytes, bytes]:
-    from cryptography.hazmat.primitives.ciphers.aead import AESGCM
-
-    nonce = secrets.token_bytes(12)
-    payload = json.dumps(
-        {
-            "access_token": pair.access_token,
-            "refresh_token": pair.refresh_token,
-            "session_id": pair.session.session_id,
-            "device_id": pair.session.device_id,
-            "user_id": pair.session.user_id,
-            "access_expires_at": pair.session.access_expires_at,
-            "refresh_expires_at": pair.session.refresh_expires_at,
-        },
-        separators=(",", ":"),
-        sort_keys=True,
-    ).encode("utf-8")
-    token_hash = _token_hash(consumed_refresh_token).encode("ascii")
-    ciphertext = AESGCM(_refresh_replay_key(consumed_refresh_token)).encrypt(
-        nonce,
-        payload,
-        token_hash,
-    )
-    return nonce, ciphertext
-
-
-def _open_refresh_response(
-    consumed_refresh_token: str,
-    nonce: bytes,
-    ciphertext: bytes,
-) -> Optional["MobileTokenPair"]:
-    from cryptography.hazmat.primitives.ciphers.aead import AESGCM
-
-    try:
-        token_hash = _token_hash(consumed_refresh_token).encode("ascii")
-        raw = AESGCM(_refresh_replay_key(consumed_refresh_token)).decrypt(
-            bytes(nonce),
-            bytes(ciphertext),
-            token_hash,
-        )
-        payload = json.loads(raw.decode("utf-8"))
-        record = MobileSessionRecord(
-            session_id=str(payload["session_id"]),
-            device_id=str(payload["device_id"]),
-            user_id=str(payload["user_id"]),
-            access_expires_at=int(payload["access_expires_at"]),
-            refresh_expires_at=int(payload["refresh_expires_at"]),
-        )
-        access_token = str(payload["access_token"])
-        refresh_token = str(payload["refresh_token"])
-        if not access_token.startswith("hma_") or not refresh_token.startswith("hmr_"):
-            return None
-        return MobileTokenPair(access_token, refresh_token, record)
-    except (KeyError, TypeError, ValueError, UnicodeError):
-        return None
-    except Exception:
-        return None
-
-
 @dataclass(frozen=True)
 class MobileDeviceInfo:
     id: str = ""
@@ -469,42 +401,6 @@ class MobileDeviceStore:
                 (old_hash, now),
             ).fetchone()
             if row is None:
-                replay = conn.execute(
-                    """
-                    SELECT i.response_nonce,i.response_ciphertext,s.*
-                    FROM mobile_refresh_idempotency AS i
-                    JOIN mobile_sessions AS s ON s.id=i.session_id
-                    JOIN mobile_devices AS d ON d.id=s.device_id
-                    WHERE i.token_hash=?
-                      AND s.revoked_at IS NULL
-                      AND d.revoked_at IS NULL
-                      AND s.refresh_expires_at>?
-                    """,
-                    (old_hash, now),
-                ).fetchone()
-                if replay is not None:
-                    replay_pair = _open_refresh_response(
-                        refresh_token,
-                        bytes(replay["response_nonce"]),
-                        bytes(replay["response_ciphertext"]),
-                    )
-                    if (
-                        replay_pair is not None
-                        and replay_pair.session.session_id == str(replay["id"])
-                        and replay_pair.session.device_id == str(replay["device_id"])
-                        and replay_pair.session.user_id == str(replay["user_id"])
-                        and _token_hash(replay_pair.refresh_token)
-                        == str(replay["refresh_token_hash"])
-                    ):
-                        conn.execute(
-                            "UPDATE mobile_sessions SET last_seen_at=?,updated_at=? WHERE id=?",
-                            (now, now, replay["id"]),
-                        )
-                        conn.execute(
-                            "UPDATE mobile_devices SET last_seen_at=?,updated_at=? WHERE id=?",
-                            (now, now, replay["device_id"]),
-                        )
-                        return replay_pair
                 replayed = conn.execute(
                     "SELECT session_id FROM mobile_refresh_history WHERE token_hash=?",
                     (old_hash,),
@@ -551,6 +447,10 @@ class MobileDeviceStore:
                 "UPDATE mobile_devices SET last_seen_at=?, updated_at=? WHERE id=?",
                 (now, now, row["device_id"]),
             )
+            conn.execute(
+                "DELETE FROM mobile_refresh_idempotency WHERE session_id=?",
+                (row["id"],),
+            )
             record = MobileSessionRecord(
                 session_id=str(row["id"]),
                 device_id=str(row["device_id"]),
@@ -559,15 +459,6 @@ class MobileDeviceStore:
                 refresh_expires_at=refresh_expires_at,
             )
             pair = MobileTokenPair(next_access, next_refresh, record)
-            nonce, ciphertext = _seal_refresh_response(refresh_token, pair)
-            conn.execute(
-                """
-                INSERT OR REPLACE INTO mobile_refresh_idempotency (
-                    token_hash,session_id,response_nonce,response_ciphertext,created_at
-                ) VALUES (?,?,?,?,?)
-                """,
-                (old_hash, row["id"], nonce, ciphertext, now),
-            )
         return pair
 
     @staticmethod
@@ -594,6 +485,10 @@ class MobileDeviceStore:
             WHERE id=?
             """,
             (now, now, session_id),
+        )
+        conn.execute(
+            "DELETE FROM mobile_refresh_idempotency WHERE session_id=?",
+            (session_id,),
         )
         conn.execute(
             """

@@ -639,6 +639,11 @@ async def _token_auth_seam(request: Request, call_next):
     )
 
     path = request.url.path
+    # Chronos authenticates this callback with its own short-lived NAS JWT.
+    # The mobile optional ``/api`` bearer seam must not consume that token
+    # before the route-specific verifier sees it.
+    if path == "/api/cron/fire":
+        return await call_next(request)
     if (
         not getattr(request.app.state, "auth_required", False)
         and is_optional_token_path(path)

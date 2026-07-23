@@ -62,10 +62,16 @@ def test_global_cleanup_combines_collaboration_and_model_domains(monkeypatch):
         "purge_owner_model_configuration",
         lambda owner_id: {"owner_id": owner_id, "profiles_changed": 1},
     )
+    monkeypatch.setattr(
+        account_cleanup,
+        "purge_owner_operational_state",
+        lambda owner_id: {"owner_id": owner_id, "workflow_runs": 3},
+    )
 
     result = account_cleanup.purge_account_owned_cloud_data("owner")
 
     assert result == {
         "collaboration": {"owner_id": "owner", "conversations": 2},
         "models": {"owner_id": "owner", "profiles_changed": 1},
+        "operational": {"owner_id": "owner", "workflow_runs": 3},
     }
