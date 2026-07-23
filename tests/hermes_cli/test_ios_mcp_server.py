@@ -30,6 +30,14 @@ def _call(server, name, args):
     return asyncio.run(server._tool_manager.call_tool(name, args))
 
 
+def _grant_device_permissions(store, owner_id="alice", **permissions):
+    store.record_snapshot(
+        owner_id,
+        "device",
+        {"permissions": permissions},
+    )
+
+
 def test_every_declared_capability_builds_an_isolated_server(tmp_path):
     store = IOSIntelligenceStore(tmp_path)
     expected = set(CAPABILITIES)
@@ -134,6 +142,11 @@ def test_external_mcp_clients_honor_plugin_base_urls(monkeypatch, tmp_path):
 
 def test_location_tool_reads_snapshot_and_queues_refresh_when_missing(tmp_path):
     store = IOSIntelligenceStore(tmp_path)
+    _grant_device_permissions(
+        store,
+        location="authorized",
+        locationAlways=True,
+    )
     server = create_mcp_server("ios-location", store=store)
     missing = _call(server, "current_location", {"owner_id": "alice"})
     assert missing["location"] is None
@@ -290,6 +303,7 @@ def test_each_mcp_has_scoped_manifest_and_supervisor_registration(tmp_path):
 
 def test_mcp_runtime_enforces_read_and_write_scope_before_store_access(tmp_path):
     store = IOSIntelligenceStore(tmp_path)
+    _grant_device_permissions(store, calendar="authorized")
     read_only = create_mcp_server(
         "ios-calendar",
         store=store,
@@ -394,6 +408,10 @@ def test_supervised_http_process_enforces_restricted_scope_end_to_end(tmp_path):
         log_directory=tmp_path / "restricted-logs",
         capabilities=("ios-calendar",),
         granted_scopes={"ios-calendar": ("calendar:read",)},
+    )
+    _grant_device_permissions(
+        IOSIntelligenceStore(data_dir),
+        calendar="authorized",
     )
 
     async def invoke_remote_tools():

@@ -7,6 +7,8 @@ absent and had no way to trigger recovery until the next timed self-probe
 cached entry whose session is None via _signal_reconnect.
 """
 
+import json
+
 import pytest
 
 
@@ -47,11 +49,18 @@ def test_register_wakes_stale_cached_server(monkeypatch, tmp_path):
     monkeypatch.setitem(mcp_tool._servers, "parked-srv", stale)
     monkeypatch.setitem(mcp_tool._servers, "healthy-srv", alive)
 
-    try:
-        result = mcp_tool.register_mcp_servers({
+    configs = {
             "parked-srv": {"url": "http://127.0.0.1:9/mcp"},
             "healthy-srv": {"url": "http://127.0.0.1:9/mcp"},
-        })
+    }
+    old_fingerprints = dict(mcp_tool._server_config_fingerprints)
+    mcp_tool._server_config_fingerprints.update({
+        name: json.dumps(config, sort_keys=True, separators=(",", ":"))
+        for name, config in configs.items()
+    })
+
+    try:
+        result = mcp_tool.register_mcp_servers(configs)
         # Both cached → no new connections attempted; existing names returned.
         assert "healthy-srv__tool" in result
         # The parked (session=None) entry got a reconnect nudge; the healthy
@@ -60,3 +69,5 @@ def test_register_wakes_stale_cached_server(monkeypatch, tmp_path):
     finally:
         mcp_tool._servers.pop("parked-srv", None)
         mcp_tool._servers.pop("healthy-srv", None)
+        mcp_tool._server_config_fingerprints.clear()
+        mcp_tool._server_config_fingerprints.update(old_fingerprints)

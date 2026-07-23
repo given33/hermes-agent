@@ -130,8 +130,9 @@ class TestSourceStillHasBillingExclusionRemoved:
             "the bug-fix anchor for #31273 has moved or been renamed."
         )
         idx = src.index(marker)
-        # Window large enough to span the full predicate (~30 lines).
-        window = src[idx:idx + 2000]
+        end_marker = ") and not is_context_length_error"
+        end = src.index(end_marker, idx) + len(end_marker)
+        window = src[idx:end]
 
         assert "FailoverReason.rate_limit" in window, (
             "is_client_error exclusion set has changed shape — re-verify "
