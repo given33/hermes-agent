@@ -52,7 +52,10 @@ except ModuleNotFoundError as exc:
         / "cloud_file_library.py"
     )
     runtime_stat = runtime_module.stat()
-    if runtime_stat.st_uid != os.getuid() or runtime_stat.st_mode & 0o022:
+    current_uid = getattr(os, "getuid", None)
+    if current_uid is None:
+        raise RuntimeError("Cloud file runtime fallback requires POSIX ownership checks")
+    if runtime_stat.st_uid != current_uid() or runtime_stat.st_mode & 0o022:
         raise RuntimeError("Cloud file runtime module has unsafe ownership or mode")
     runtime_spec = importlib.util.spec_from_file_location(
         "hermes_collaboration_cloud_file_library",
