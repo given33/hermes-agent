@@ -20,6 +20,7 @@ POSIX-only: Windows has its own grandchild lifecycle (no shared session,
 
 from __future__ import annotations
 
+import importlib.util
 import json
 import os
 import subprocess
@@ -36,6 +37,42 @@ import pytest
 # so concurrent invocations of the suite don't clobber each other.
 _HANDOFF_DIR = Path(os.environ.get("TMPDIR", "/tmp")) / "hermes-isolation-probe"
 _HANDOFF_DIR.mkdir(exist_ok=True)
+
+
+def _load_runner_module():
+    runner = Path(__file__).resolve().parent.parent / "scripts" / "run_tests_parallel.py"
+    spec = importlib.util.spec_from_file_location("run_tests_parallel_test", runner)
+    assert spec and spec.loader
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+def test_output_stream_is_forced_to_utf8_without_requiring_a_console() -> None:
+    module = _load_runner_module()
+
+    class Stream:
+        options = None
+
+        def reconfigure(self, **options):
+            self.options = options
+
+    stream = Stream()
+    module._configure_output_stream(stream)
+    assert stream.options == {"encoding": "utf-8", "errors": "backslashreplace"}
+
+
+def test_windows_absolute_path_is_not_split_at_the_drive_colon() -> None:
+    module = _load_runner_module()
+    with pytest.MonkeyPatch.context() as monkeypatch:
+        monkeypatch.setattr(module.os, "name", "nt")
+        monkeypatch.setattr(module.os, "pathsep", ";")
+        assert module._split_path_list(r"C:\work\tests\test_one.py") == [
+            r"C:\work\tests\test_one.py"
+        ]
+        assert module._split_path_list(
+            r"C:\work\test_one.py;D:\work\test_two.py"
+        ) == [r"C:\work\test_one.py", r"D:\work\test_two.py"]
 
 
 def _handoff_path_for(nonce: str) -> Path:
@@ -147,6 +184,8 @@ def test_grandchild_leak_is_killed_by_runner(tmp_path: Path) -> None:
         stdout=subprocess.PIPE,
         stderr=subprocess.STDOUT,
         text=True,
+        encoding="utf-8",
+        errors="replace",
         timeout=60,
     )
 
@@ -221,6 +260,8 @@ def _run_runner(probe_dir: Path, *extra: str) -> subprocess.CompletedProcess:
         stdout=subprocess.PIPE,
         stderr=subprocess.STDOUT,
         text=True,
+        encoding="utf-8",
+        errors="replace",
         timeout=60,
     )
 
@@ -271,7 +312,7 @@ def test_positional_path_not_treated_as_flag(tmp_path: Path) -> None:
         [sys.executable, str(runner), str(probe_dir), "-j", "1",
          "--file-timeout", "30", "-q"],
         cwd=repo_root, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-        text=True, timeout=60,
+        text=True, encoding="utf-8", errors="replace", timeout=60,
     )
     assert proc.returncode == 0, proc.stdout
     # Discovery found the probe file (2 tests), proving the positional path
@@ -317,6 +358,8 @@ def test_file_retry_self_heals_and_prints_both_attempts(tmp_path: Path) -> None:
         stdout=subprocess.PIPE,
         stderr=subprocess.STDOUT,
         text=True,
+        encoding="utf-8",
+        errors="replace",
         timeout=60,
     )
 
@@ -353,6 +396,8 @@ def test_file_retry_does_not_launder_deterministic_failure(tmp_path: Path) -> No
         stdout=subprocess.PIPE,
         stderr=subprocess.STDOUT,
         text=True,
+        encoding="utf-8",
+        errors="replace",
         timeout=60,
     )
 

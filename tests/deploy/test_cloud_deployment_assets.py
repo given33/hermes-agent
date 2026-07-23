@@ -15,6 +15,8 @@ ROOT = Path(__file__).resolve().parents[2]
 DBB3 = ROOT / "deploy" / "dbb3"
 PC = ROOT / "deploy" / "pc"
 PUBLIC = ROOT / "deploy" / "public"
+UPSTREAM_REPORT = ROOT / "scripts" / "upstream_change_report.py"
+UPSTREAM_WORKFLOW = ROOT / ".github" / "workflows" / "upstream-sync.yml"
 
 
 def _posix_path(path: Path) -> str:
@@ -43,6 +45,59 @@ def _load_connector():
     sys.modules[spec.name] = module
     spec.loader.exec_module(module)
     return module
+
+
+def _load_upstream_report():
+    spec = importlib.util.spec_from_file_location(
+        "upstream_change_report_test", UPSTREAM_REPORT
+    )
+    assert spec and spec.loader
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[spec.name] = module
+    spec.loader.exec_module(module)
+    return module
+
+
+def test_upstream_report_flags_product_ios_and_deployment_overlap():
+    module = _load_upstream_report()
+
+    def fake_git(*args: str) -> str:
+        if args[:1] == ("merge-base",):
+            return "base-sha"
+        if args[:2] == ("diff", "--name-only"):
+            if args[2] == "base-sha..origin/main":
+                return "plugins/collaboration/dashboard/plugin_api.py\nlocal-only.py"
+            return (
+                "plugins/collaboration/dashboard/plugin_api.py\n"
+                "gateway/run.py\n.github/workflows/tests.yml\nupstream-only.py"
+            )
+        if args[:1] == ("log",):
+            return "abc123 upstream change"
+        raise AssertionError(args)
+
+    with mock.patch.object(module, "git", side_effect=fake_git):
+        report = module.build_report("origin/main", "v2026.8.1")
+
+    assert "Direct file overlap: `1`" in report
+    assert "`plugins/collaboration/dashboard/plugin_api.py`" in report
+    assert "`gateway/run.py`" in report
+    assert "`.github/workflows/tests.yml`" in report
+    assert "Manual Codex review required before merge" in report
+
+
+def test_upstream_sync_creates_a_reviewed_pr_without_direct_merge_or_deploy():
+    workflow = UPSTREAM_WORKFLOW.read_text(encoding="utf-8")
+    assert "cron: '17 18 * * *'" in workflow
+    assert "https://github.com/NousResearch/hermes-agent.git" in workflow
+    assert 'branch="upstream-sync/$tag"' in workflow
+    assert "scripts/upstream_change_report.py" in workflow
+    assert "tests/plugins/test_collaboration_dashboard.py" in workflow
+    assert "tests/deploy/test_cloud_deployment_assets.py" in workflow
+    assert "codex-review-required" in workflow
+    assert "@codex review" in workflow
+    assert "gh pr create" in workflow
+    assert "gh pr merge" not in workflow
+    assert "ssh " not in workflow
 
 
 def test_deployment_shell_scripts_have_valid_syntax():

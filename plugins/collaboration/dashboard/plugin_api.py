@@ -984,6 +984,13 @@ def load_single_state(path: Optional[Path] = None) -> dict[str, Any]:
             )
         if not isinstance(conversation.get("hosted_turns"), dict):
             conversation["hosted_turns"] = {}
+        try:
+            conversation["event_cursor"] = max(
+                0,
+                int(conversation.get("event_cursor") or 0),
+            )
+        except (TypeError, ValueError):
+            conversation["event_cursor"] = 0
     return {"conversations": normalized_conversations}
 
 
@@ -1230,6 +1237,7 @@ def create_single_conversation(
         "runtime_sessions": {},
         "runtime_runs": {},
         "hosted_turns": {},
+        "event_cursor": 0,
         "pending_turn_cancellations": {},
         "messages": [],
         "created_at": now,
@@ -1607,7 +1615,7 @@ def _structured_text(value: Any) -> str:
 
 
 def sanitize_runtime_error(error: Any) -> str:
-    """Return a short user-facing error without upstream HTML or proxy internals."""
+    """Return one short user-facing error without HTML, secrets, or retry noise."""
     text = _structured_text(error)
     lowered = text.lower()
     status_match = re.search(r"(?:http\s*)?(4\d\d|5\d\d)", lowered)
@@ -1626,9 +1634,39 @@ def sanitize_runtime_error(error: Any) -> str:
     ):
         visible_status = status or "502"
         return f"模型服务暂时繁忙（HTTP {visible_status}），已保留当前进度。"
+    if status in {"401", "403"} or any(
+        marker in lowered
+        for marker in ("unauthorized", "invalid api key", "authentication failed")
+    ):
+        visible_status = status or "401"
+        return f"模型认证失败（HTTP {visible_status}），请检查 API 密钥。"
     if any(
         marker in lowered
-        for marker in ("timed out", "timeout", "connection reset", "connection aborted")
+        for marker in (
+            "no model configured",
+            "model is not configured",
+            "missing model configuration",
+            "api key is not configured",
+            "missing api key",
+            "no api key",
+        )
+    ):
+        return "尚未配置可用模型或模型凭据。"
+    if any(
+        marker in lowered
+        for marker in (
+            "timed out",
+            "timeout",
+            "connection reset",
+            "connection aborted",
+            "connection refused",
+            "network is unreachable",
+            "name or service not known",
+            "temporary failure in name resolution",
+            "nodename nor servname provided",
+            "no route to host",
+            "offline",
+        )
     ):
         return "模型服务连接超时，已保留当前进度。"
     without_html = re.sub(r"<[^>]+>", " ", text)
@@ -1649,9 +1687,10 @@ def runtime_error_code(error: Any) -> str:
 
 
 def _is_transient_runtime_error(error: Any) -> bool:
+    """Classify failures that can recover after model/network reconfiguration."""
     text = _structured_text(error).lower()
     return bool(
-        re.search(r"(?:http\s*)?(429|500|502|503|504|520|522|524)", text)
+        re.search(r"(?:http\s*)?(401|403|429|500|502|503|504|520|522|524)", text)
         or any(
             marker in text
             for marker in (
@@ -1661,7 +1700,23 @@ def _is_transient_runtime_error(error: Any) -> bool:
                 "timeout",
                 "connection reset",
                 "connection aborted",
+                "connection refused",
+                "network is unreachable",
+                "name or service not known",
+                "temporary failure in name resolution",
+                "nodename nor servname provided",
+                "no route to host",
+                "offline",
                 "temporarily unavailable",
+                "unauthorized",
+                "invalid api key",
+                "authentication failed",
+                "no model configured",
+                "model is not configured",
+                "missing model configuration",
+                "api key is not configured",
+                "missing api key",
+                "no api key",
             )
         )
     )
@@ -2204,6 +2259,21 @@ _WORKER_TARGET_PROFILES = {
     "dbb3": "dbb3-worker",
     "pc": "pc-worker",
 }
+_DBB3_MANAGER_PROFILE = "dbb3-manager"
+_REMOTE_RUN_PROFILES = frozenset(
+    {_DBB3_MANAGER_PROFILE, "dbb3-worker", "pc-worker", "reviewer", "default"}
+)
+_MANAGER_DIFFICULTIES = {"low", "medium", "high", "critical"}
+_MANAGER_HANDOFF_FIELDS = (
+    "task_goal",
+    "plan",
+    "worker_results",
+    "review_verdict",
+    "rework_history",
+    "artifacts",
+    "failures",
+    "suggested_conclusion",
+)
 
 
 def _target_marker_pattern(markers: tuple[str, ...]) -> str:
@@ -2373,6 +2443,158 @@ def collaboration_execution_order(profiles: list[str]) -> list[str]:
         if item != reporter and collaboration_role(item) == "reviewer"
     ]
     return [*workers, *reviewers, reporter]
+
+
+def _json_object_from_model_text(value: Any) -> dict[str, Any]:
+    """Extract one JSON object without accepting trailing prose as data."""
+
+    text = str(value or "").strip()
+    if text.startswith("```"):
+        text = re.sub(r"^```(?:json)?\s*", "", text, flags=re.IGNORECASE)
+        text = re.sub(r"\s*```$", "", text)
+    decoder = json.JSONDecoder()
+    for index, character in enumerate(text):
+        if character != "{":
+            continue
+        try:
+            parsed, _end = decoder.raw_decode(text[index:])
+        except (TypeError, ValueError):
+            continue
+        if isinstance(parsed, dict):
+            return parsed
+    return {}
+
+
+def _normalize_manager_plan(
+    result: Any,
+    *,
+    content: str,
+    fallback_workers: list[str],
+) -> dict[str, Any]:
+    """Validate DBB3 Manager output before it can control remote placement."""
+
+    parsed = _json_object_from_model_text(result)
+    difficulty = str(parsed.get("difficulty") or "medium").strip().lower()
+    if difficulty not in _MANAGER_DIFFICULTIES:
+        difficulty = "medium"
+    requested = [
+        str(item).strip().lower()
+        for item in parsed.get("workers") or []
+        if str(item).strip().lower() in set(_WORKER_TARGET_PROFILES.values())
+    ]
+    requested_targets = [profile.removesuffix("-worker") for profile in requested]
+    worker_profiles, constraints = _constrained_worker_profiles(
+        content,
+        profiles=requested or fallback_workers,
+        targets=requested_targets,
+    )
+    if not worker_profiles:
+        raise RuntimeError("DBB3 Manager did not leave an eligible execution worker")
+
+    raw_steps = parsed.get("plan") if isinstance(parsed.get("plan"), list) else []
+    steps: list[dict[str, Any]] = []
+    for index, item in enumerate(raw_steps[:24], start=1):
+        if not isinstance(item, dict):
+            continue
+        assignee = str(item.get("assignee") or "").strip().lower()
+        if assignee not in worker_profiles:
+            assignee = worker_profiles[min(index - 1, len(worker_profiles) - 1)]
+        objective = str(item.get("objective") or item.get("title") or "").strip()
+        if not objective:
+            continue
+        steps.append(
+            {
+                "id": str(item.get("id") or f"step-{index}").strip()[:80],
+                "title": str(item.get("title") or objective).strip()[:180],
+                "objective": objective[:8000],
+                "assignee": assignee,
+                "depends_on": [
+                    str(value).strip()[:80]
+                    for value in item.get("depends_on") or []
+                    if str(value).strip()
+                ][:24],
+            }
+        )
+    if not steps:
+        steps = [
+            {
+                "id": f"step-{index}",
+                "title": f"{profile} execution",
+                "objective": content[:8000],
+                "assignee": profile,
+                "depends_on": [],
+            }
+            for index, profile in enumerate(worker_profiles, start=1)
+        ]
+
+    reviewer_target = str(parsed.get("reviewer_target") or "dbb3").strip().lower()
+    if reviewer_target not in {"dbb3", "pc"}:
+        reviewer_target = "dbb3"
+    if reviewer_target == "pc" and "pc" in set(constraints.get("excluded") or []):
+        reviewer_target = "dbb3"
+    return {
+        "version": 1,
+        "difficulty": difficulty,
+        "reason": str(parsed.get("reason") or "DBB3 Manager selected a bounded execution plan.").strip()[:1000],
+        "workers": worker_profiles,
+        "reviewer_target": reviewer_target,
+        "plan": steps,
+        "constraints": constraints,
+    }
+
+
+def _manager_plan_prompt(
+    *,
+    content: str,
+    fallback_workers: list[str],
+    attachment_context: str,
+    artifact_required: bool,
+) -> str:
+    return "\n".join(
+        item
+        for item in (
+            "你是 DBB3 Manager，负责复杂任务的难度判断、拆分和执行节点选择。",
+            "只规划和调度，不执行用户任务，也不向用户生成最终答案。",
+            "可用执行节点只有 dbb3-worker 与 pc-worker；默认审阅节点是 DBB3，必要时可选择 PC。",
+            f"服务器路由建议：{', '.join(fallback_workers)}",
+            f"是否要求交付文件：{'yes' if artifact_required else 'no'}",
+            "输出一个 JSON 对象且不要附加解释。结构必须为：",
+            '{"difficulty":"low|medium|high|critical","reason":"...","workers":["dbb3-worker"],"reviewer_target":"dbb3|pc","plan":[{"id":"step-1","title":"...","objective":"...","assignee":"dbb3-worker|pc-worker","depends_on":[]}]}',
+            "按任务真实需要选择一个或两个 Worker，不得使用其他节点，不得省略验收。",
+            f"用户任务：\n{content}",
+            attachment_context,
+        )
+        if item
+    )
+
+
+def _normalize_manager_handoff(
+    result: Any,
+    *,
+    task_goal: str,
+    plan: dict[str, Any],
+    worker_results: dict[str, str],
+    review_verdict: str,
+    rework_history: list[dict[str, Any]],
+    artifacts: list[dict[str, Any]],
+    failures: list[str],
+) -> dict[str, Any]:
+    parsed = _json_object_from_model_text(result)
+    handoff = {
+        "version": 1,
+        "task_goal": str(parsed.get("task_goal") or task_goal).strip(),
+        "plan": parsed.get("plan") if isinstance(parsed.get("plan"), list) else list(plan.get("plan") or []),
+        "worker_results": parsed.get("worker_results") if isinstance(parsed.get("worker_results"), dict) else dict(worker_results),
+        "review_verdict": str(parsed.get("review_verdict") or review_verdict).strip(),
+        "rework_history": parsed.get("rework_history") if isinstance(parsed.get("rework_history"), list) else list(rework_history),
+        "artifacts": parsed.get("artifacts") if isinstance(parsed.get("artifacts"), list) else list(artifacts),
+        "failures": parsed.get("failures") if isinstance(parsed.get("failures"), list) else list(failures),
+        "suggested_conclusion": str(parsed.get("suggested_conclusion") or "").strip(),
+    }
+    for field in _MANAGER_HANDOFF_FIELDS:
+        if field not in handoff:
+            raise RuntimeError(f"DBB3 Manager handoff is missing {field}")
+    return handoff
 
 
 def _rule_based_user_intent(content: str) -> dict[str, Any]:
@@ -2907,7 +3129,7 @@ def _wait_for_hosted_chat_model(
                     return False
                 _fail_hosted_turn_preflight(conversation, run, readiness)
                 save_single_state(state)
-            _notify_hosted_update()
+            _notify_hosted_update(conversation_id)
             return False
 
 
@@ -3609,6 +3831,19 @@ def apply_profile_event(
     activities = state.setdefault("activities", [])
     now = int(time.time() * 1000)
 
+    def finish_retry_activity(status: str = "completed") -> None:
+        for item in activities:
+            if item.get("id") != "model-connection-retry":
+                continue
+            if item.get("status") == "running":
+                item["status"] = status
+                item["ended_at"] = now
+                item["duration_ms"] = max(
+                    0,
+                    now - int(item.get("started_at") or now),
+                )
+            return
+
     text_started_execution = (
         event_type in {"message.delta", "reasoning.delta", "reasoning.available"}
         and bool(_structured_text(payload.get("text")))
@@ -3637,6 +3872,7 @@ def apply_profile_event(
             payload.get("provider") or state.get("actual_provider") or ""
         )
     elif event_type in {"reasoning.delta", "reasoning.available"}:
+        finish_retry_activity()
         text = _structured_text(payload.get("text"))
         if text:
             activity = next(
@@ -3671,6 +3907,7 @@ def apply_profile_event(
                     int(activity["ended_at"]) - int(activity["started_at"]),
                 )
     elif event_type == "message.delta":
+        finish_retry_activity()
         for activity in reversed(activities):
             if activity.get("kind") == "reasoning" and activity.get("status") == "running":
                 activity["status"] = "completed"
@@ -3710,6 +3947,7 @@ def apply_profile_event(
             payload.get("preview") or payload.get("message")
         )[:1000]
     elif event_type == "tool.start":
+        finish_retry_activity()
         name = str(payload.get("name") or "工具调用")
         activity_id = str(payload.get("tool_id") or "")
         activity = _activity_by_id_or_name(activities, activity_id, name)
@@ -3873,13 +4111,23 @@ def apply_profile_event(
             activities.append(activity)
         activity.update(
             {
-                "output": f"正在重连 ({attempt}/{max_attempts})",
-                "status": "completed",
-                "ended_at": now,
-                "duration_ms": max(0, now - int(activity.get("started_at") or now)),
+                "name": f"正在重连 ({attempt}/{max_attempts})",
+                # Intermediate causes stay server-side. The fifth failure is
+                # persisted once as the terminal assistant error.
+                "output": "",
+                "status": "running",
+                "ended_at": None,
+                "duration_ms": 0,
+                "attempt": attempt,
+                "max_attempts": max_attempts,
             }
         )
     elif event_type == "message.complete":
+        finish_retry_activity(
+            "failed"
+            if str(payload.get("status") or "").lower() == "error"
+            else "completed"
+        )
         final_text = _structured_text(payload.get("text"))
         if final_text:
             state["content"] = final_text
@@ -3890,6 +4138,7 @@ def apply_profile_event(
             "failed" if str(payload.get("status") or "").lower() == "error" else "completed"
         )
     elif event_type == "error":
+        finish_retry_activity("failed")
         state["error"] = sanitize_runtime_error(payload.get("message"))
         state["status"] = "failed"
 
@@ -4378,6 +4627,7 @@ def _run_hosted_remote_role(
     delivery_context: str = "",
     attachment_context: str = "",
     rework_round: int = 0,
+    connector_id: str = "",
 ) -> tuple[str, str, dict[str, Any]]:
     """Wait for a DBB3/PC connector run and project its checkpoints.
 
@@ -4407,6 +4657,7 @@ def _run_hosted_remote_role(
         attachment_context=attachment_context,
         attachment_ids=list(run_snapshot.get("attachment_ids") or []),
         attempt=rework_round + 1,
+        connector_id=connector_id,
     )
     if str(remote.get("status") or "queued") not in _REMOTE_TERMINAL_STATUSES:
         _remote_run_state_message(
@@ -4529,7 +4780,7 @@ def create_hosted_turn_record(
     record = {
         "turn_id": normalized_turn_id,
         "status": "queued",
-        "stage": "queued",
+        "stage": "accepted",
         "content": str(content or "").strip(),
         "title": str(title or "").strip() or summarize_task_title(content),
         "profiles": list(
@@ -4684,8 +4935,23 @@ def create_hosted_kanban_task(
         }
 
 
-def _notify_hosted_update() -> int:
+def _notify_hosted_update(conversation_id: str = "") -> int:
     global _HOSTED_UPDATE_REVISION
+    normalized_conversation_id = str(conversation_id or "").strip()
+    if normalized_conversation_id:
+        with _STATE_LOCK:
+            state = load_single_state()
+            try:
+                conversation = _conversation_by_id(state, normalized_conversation_id)
+            except HTTPException:
+                conversation = None
+            if conversation is not None:
+                conversation["event_cursor"] = max(
+                    0,
+                    int(conversation.get("event_cursor") or 0),
+                ) + 1
+                conversation["event_updated_at"] = int(time.time() * 1000)
+                save_single_state(state)
     with _HOSTED_UPDATE_CONDITION:
         _HOSTED_UPDATE_REVISION += 1
         _HOSTED_UPDATE_CONDITION.notify_all()
@@ -4949,7 +5215,7 @@ def _persist_notification_outcome(
             ),
         }
         save_single_state(state)
-    _notify_hosted_update()
+    _notify_hosted_update(conversation_id)
     if outcome_state != "retry":
         return None
     return retry_delay_ms
@@ -5151,7 +5417,7 @@ def _persist_hosted_turn(
                 _project_native_message(existing)
         save_single_state(state)
         persisted = dict(run)
-    _notify_hosted_update()
+    _notify_hosted_update(conversation_id)
     return persisted
 
 
@@ -5249,6 +5515,7 @@ def _ensure_remote_run(
     attachment_context: str,
     attachment_ids: Optional[list[str]] = None,
     attempt: int = 1,
+    connector_id: str = "",
 ) -> dict[str, Any]:
     """Create or reuse the durable DBB3/PC queue item for one role phase."""
 
@@ -5274,7 +5541,7 @@ def _ensure_remote_run(
             "turn_id": turn_id,
             "role_stage": role_stage,
             "profile": profile,
-            "connector_id": _connector_for_profile(profile),
+            "connector_id": connector_id.strip()[:128] or _connector_for_profile(profile),
             "title": title,
             "objective": objective,
             "local_task_id": local_task_id,
@@ -5303,7 +5570,7 @@ def _ensure_remote_run(
         }
         remote_runs[role_stage] = record
         save_single_state(state)
-    _notify_hosted_update()
+    _notify_hosted_update(conversation_id)
     return dict(record)
 
 
@@ -5731,7 +5998,8 @@ def execute_hosted_workflow(
         if run.get("status") in _HOSTED_TERMINAL_STATUSES:
             return
         run["status"] = "running"
-        run["stage"] = str(run.get("stage") or "preparing")
+        if str(run.get("stage") or "") in {"", "accepted", "queued", "preparing"}:
+            run["stage"] = "routing"
         run.setdefault("started_at", int(time.time() * 1000))
         run["updated_at"] = int(time.time() * 1000)
         _ensure_hosted_output_baseline(conversation_id, run)
@@ -5755,18 +6023,80 @@ def execute_hosted_workflow(
     title = str(run.get("title") or summarize_task_title(content))
     profiles = list(run.get("profiles") or ["default", "dbb3-worker", "reviewer"])
     ordered = collaboration_execution_order(profiles)
-    worker_profiles = [
+    fallback_worker_profiles = [
         item for item in ordered if collaboration_role(item) == "worker"
     ] or ["dbb3-worker"]
-    reviewer_profile = next(
-        (item for item in ordered if collaboration_role(item) == "reviewer"),
-        "reviewer",
-    )
-    reporter_profile = next(
-        (item for item in ordered if collaboration_role(item) == "reporter"),
-        "default",
-    )
+    reviewer_profile = "reviewer"
+    reviewer_connector_id = "dbb3-primary"
+    reporter_profile = "default"
     artifact_required = bool(run.get("artifact_required"))
+    attachment_context = _hosted_chat_attachment_context(conversation_snapshot, run)
+
+    manager_plan = (
+        dict(run.get("manager_plan") or {})
+        if isinstance(run.get("manager_plan"), dict)
+        else {}
+    )
+    manager_result = str(run.get("manager_result") or "")
+    if remote_workers and not manager_plan:
+        _persist_hosted_turn(
+            conversation_id,
+            turn_id,
+            patch={"stage": "manager_planning"},
+            message={
+                "role": "assistant",
+                "name": _DBB3_MANAGER_PROFILE,
+                "content": "正在评估任务难度、拆分步骤并选择执行节点。",
+                "status": "streaming",
+                "kind": "message",
+                "meta": {
+                    "role_stage": "manager_planning",
+                    "role_label": "DBB3 Manager · 规划",
+                    "profile": _DBB3_MANAGER_PROFILE,
+                    "final_report": False,
+                },
+            },
+        )
+        manager_result, manager_status, _manager_state = _run_hosted_remote_role(
+            conversation_id,
+            turn_id,
+            profile=_DBB3_MANAGER_PROFILE,
+            role_stage="manager_planning",
+            role_label="DBB3 Manager · 规划",
+            prompt=_manager_plan_prompt(
+                content=content,
+                fallback_workers=fallback_worker_profiles,
+                attachment_context=attachment_context,
+                artifact_required=artifact_required,
+            ),
+            kanban_task_id="",
+            start_text="正在评估难度并形成结构化执行计划。",
+            artifact_required=False,
+            delivery_context="Return only the requested JSON plan.",
+            attachment_context=attachment_context,
+            connector_id="dbb3-primary",
+        )
+        if manager_status != "completed":
+            raise RuntimeError(manager_result or "DBB3 Manager planning failed")
+        manager_plan = _normalize_manager_plan(
+            manager_result,
+            content=content,
+            fallback_workers=fallback_worker_profiles,
+        )
+        _persist_hosted_turn(
+            conversation_id,
+            turn_id,
+            patch={
+                "manager_result": manager_result,
+                "manager_plan": manager_plan,
+                "profiles": ["default", *manager_plan["workers"], "reviewer"],
+                "stage": "dispatching",
+            },
+        )
+
+    worker_profiles = list(manager_plan.get("workers") or fallback_worker_profiles)
+    if manager_plan.get("reviewer_target") == "pc":
+        reviewer_connector_id = "pc-primary"
     artifact_producer_profiles = set(
         str(profile)
         for profile in (
@@ -5783,7 +6113,6 @@ def execute_hosted_workflow(
         run,
         remote_workers=remote_workers,
     )
-    attachment_context = _hosted_chat_attachment_context(conversation_snapshot, run)
     worker_kanban_instruction = (
         "官方 Kanban 是 DBB3 的唯一控制面。你可以读取根任务和已分配工作项，"
         "也可以向已分配工作项写入进度、证据和交接评论；"
@@ -5810,7 +6139,7 @@ def execute_hosted_workflow(
         _persist_hosted_turn(
             conversation_id,
             turn_id,
-            patch={"stage": "decomposing"},
+            patch={"stage": "dispatching"},
             message={
                 "role": "assistant",
                 "name": "dispatcher",
@@ -5877,7 +6206,7 @@ def execute_hosted_workflow(
     _persist_hosted_turn(
         conversation_id,
         turn_id,
-        patch={"stage": "worker"},
+        patch={"stage": "worker_running"},
         message={
             "role": "assistant",
             "name": reporter_profile,
@@ -6037,7 +6366,7 @@ def execute_hosted_workflow(
                     patch={
                         "worker_results": dict(worker_results),
                         "worker_statuses": dict(worker_statuses),
-                        "stage": "worker",
+                        "stage": "worker_running",
                     },
                 )
     worker_result = "\n\n".join(
@@ -6057,7 +6386,7 @@ def execute_hosted_workflow(
             "worker_status": worker_status,
             "worker_results": dict(worker_results),
             "worker_statuses": dict(worker_statuses),
-            "stage": "reviewer",
+            "stage": "reviewing",
         },
     )
     if _finish_hosted_turn_if_cancelled(conversation_id, turn_id):
@@ -6099,6 +6428,7 @@ def execute_hosted_workflow(
                 artifact_required=False,
                 delivery_context=artifact_instruction,
                 attachment_context=attachment_context,
+                connector_id=reviewer_connector_id,
             )
         else:
             reviewer_result, reviewer_status, _reviewer_state = _run_hosted_role(
@@ -6119,24 +6449,38 @@ def execute_hosted_workflow(
             patch={
                 "reviewer_result": reviewer_result,
                 "reviewer_status": reviewer_status,
-                "stage": "reporter",
+                "stage": "reviewing",
             },
         )
         if _finish_hosted_turn_if_cancelled(conversation_id, turn_id):
             return
 
     rework_round = int(run.get("rework_round") or 0)
+    rework_history = [
+        dict(item)
+        for item in run.get("rework_history") or []
+        if isinstance(item, dict)
+    ]
     while (
         reviewer_status == "completed"
         and _review_requests_rework(reviewer_result)
         and rework_round < _HOSTED_REWORK_LIMIT
     ):
         active_rework_round = rework_round + 1
+        rework_history.append(
+            {
+                "round": active_rework_round,
+                "reviewer_feedback": reviewer_result,
+                "worker_results_before": dict(worker_results),
+                "requested_at": int(time.time() * 1000),
+            }
+        )
         _persist_hosted_turn(
             conversation_id,
             turn_id,
             patch={
                 "active_rework_round": active_rework_round,
+                "rework_history": list(rework_history),
                 "stage": "rework",
             },
             message={
@@ -6200,7 +6544,7 @@ def execute_hosted_workflow(
                 "worker_status": worker_status,
                 "worker_results": dict(worker_results),
                 "worker_statuses": dict(worker_statuses),
-                "stage": "reviewer",
+                "stage": "reviewing",
             },
         )
         reviewer_prompt = "\n".join(
@@ -6238,6 +6582,7 @@ def execute_hosted_workflow(
                 delivery_context=artifact_instruction,
                 attachment_context=attachment_context,
                 rework_round=active_rework_round,
+                connector_id=reviewer_connector_id,
             )
         else:
             reviewer_result, reviewer_status, _reviewer_state = _run_hosted_role(
@@ -6260,7 +6605,7 @@ def execute_hosted_workflow(
                 "reviewer_status": reviewer_status,
                 "active_rework_round": 0,
                 "rework_round": rework_round,
-                "stage": "reporter",
+                "stage": "reviewing",
             },
         )
         if _finish_hosted_turn_if_cancelled(conversation_id, turn_id):
@@ -6281,6 +6626,97 @@ def execute_hosted_workflow(
             },
         )
 
+    handoff_artifacts = (
+        _hosted_turn_output_attachments(
+            conversation_id,
+            turn_id,
+            int(run.get("started_at") or 0),
+        )
+        if artifact_required
+        else []
+    )
+    handoff_failures = [
+        f"{profile}: {worker_results.get(profile, '')}".strip()
+        for profile in worker_profiles
+        if worker_statuses.get(profile) != "completed"
+    ]
+    if reviewer_status != "completed":
+        handoff_failures.append(f"reviewer: {reviewer_result}".strip())
+    source_handoff = {
+        "task_goal": content,
+        "plan": list(manager_plan.get("plan") or []),
+        "worker_results": dict(worker_results),
+        "review_verdict": reviewer_result,
+        "rework_history": list(rework_history),
+        "artifacts": handoff_artifacts,
+        "failures": handoff_failures,
+    }
+    manager_handoff = (
+        dict(run.get("manager_handoff") or {})
+        if isinstance(run.get("manager_handoff"), dict)
+        else {}
+    )
+    if remote_workers and not manager_handoff:
+        _persist_hosted_turn(
+            conversation_id,
+            turn_id,
+            patch={"stage": "manager_handoff"},
+        )
+        manager_handoff_result, manager_handoff_status, _handoff_state = (
+            _run_hosted_remote_role(
+                conversation_id,
+                turn_id,
+                profile=_DBB3_MANAGER_PROFILE,
+                role_stage="manager_handoff",
+                role_label="DBB3 Manager · 交接",
+                prompt="\n".join(
+                    (
+                        "你是 DBB3 Manager。根据下方已经完成的执行与审阅记录生成结构化交接，不能重新执行任务，不能补写不存在的证据。",
+                        "只输出 JSON 对象，必须包含 task_goal、plan、worker_results、review_verdict、rework_history、artifacts、failures、suggested_conclusion。",
+                        json.dumps(source_handoff, ensure_ascii=False, default=str),
+                    )
+                ),
+                kanban_task_id=task_id,
+                start_text="正在整理执行、审阅、返工和产物证据。",
+                artifact_required=False,
+                delivery_context="Return only the requested JSON handoff.",
+                attachment_context="",
+                connector_id="dbb3-primary",
+            )
+        )
+        if manager_handoff_status != "completed":
+            raise RuntimeError(manager_handoff_result or "DBB3 Manager handoff failed")
+        manager_handoff = _normalize_manager_handoff(
+            manager_handoff_result,
+            task_goal=content,
+            plan=manager_plan,
+            worker_results=worker_results,
+            review_verdict=reviewer_result,
+            rework_history=rework_history,
+            artifacts=handoff_artifacts,
+            failures=handoff_failures,
+        )
+        _persist_hosted_turn(
+            conversation_id,
+            turn_id,
+            patch={
+                "manager_handoff": manager_handoff,
+                "manager_handoff_result": manager_handoff_result,
+                "stage": "reporting",
+            },
+        )
+    elif not manager_handoff:
+        manager_handoff = _normalize_manager_handoff(
+            {},
+            task_goal=content,
+            plan=manager_plan,
+            worker_results=worker_results,
+            review_verdict=reviewer_result,
+            rework_history=rework_history,
+            artifacts=handoff_artifacts,
+            failures=handoff_failures,
+        )
+
     reporter_result = str(run.get("reporter_result") or "")
     reporter_status = str(run.get("reporter_status") or "")
     if not reporter_result:
@@ -6293,56 +6729,38 @@ def execute_hosted_workflow(
                 if task_id and not remote_workers
                 else "",
                 reporter_kanban_instruction,
-                "综合执行者和审阅者的信息，只汇报一次完成状态、关键结果、证据、问题与下一步。",
-                "不要重复执行工作，也不要重新生成执行者已经创建的文件。",
-                f"用户任务：{content}",
-                "执行者提交：",
-                worker_result,
-                "审阅者结论：",
-                reviewer_result,
+                "你只能根据 DBB3 Manager 已验证的结构化交接生成一次用户答案。",
+                "不得重新执行任务，不得调用工具补做工作，不得编造交接中缺失的结果或证据。",
+                "清楚区分已完成、失败、未完成和需要用户决定的事项。",
+                "DBB3 Manager 结构化交接：",
+                json.dumps(manager_handoff, ensure_ascii=False, default=str),
                 artifact_instruction,
             )
             if item
         )
-        if remote_workers:
-            reporter_result, reporter_status, _reporter_state = _run_hosted_remote_role(
-                conversation_id,
-                turn_id,
-                profile=reporter_profile,
-                role_stage="reporter",
-                role_label="Hermes · 最终汇报",
-                prompt=reporter_prompt,
-                kanban_task_id=reporter_task_scope,
-                start_text="执行与审阅信息已齐，正在整理唯一的最终汇报。",
-                artifact_required=False,
-                delivery_context=artifact_instruction,
-                attachment_context=attachment_context,
-            )
-        else:
-            reporter_result, reporter_status, _reporter_state = _run_hosted_role(
-                conversation_id,
-                turn_id,
-                profile=reporter_profile,
-                role_stage="reporter",
-                role_label="Hermes · 最终汇报",
-                prompt=reporter_prompt,
-                runner=runner,
-                kanban_task_id=reporter_task_scope,
-                start_text="执行与审阅信息已齐，正在整理唯一的最终汇报。",
-                final_report=True,
-                previous_state=(run.get("role_events") or {}).get("reporter"),
-            )
+        _persist_hosted_turn(
+            conversation_id,
+            turn_id,
+            patch={"stage": "reporting"},
+        )
+        reporter_result, reporter_status, _reporter_state = _run_hosted_role(
+            conversation_id,
+            turn_id,
+            profile=reporter_profile,
+            role_stage="reporter",
+            role_label="Hermes · 最终汇报",
+            prompt=reporter_prompt,
+            runner=runner,
+            kanban_task_id=reporter_task_scope,
+            start_text="执行与审阅信息已齐，正在整理唯一的最终汇报。",
+            final_report=True,
+            previous_state=(run.get("role_events") or {}).get("reporter"),
+        )
 
     if _finish_hosted_turn_if_cancelled(conversation_id, turn_id):
         return
 
-    attachments = []
-    if artifact_required:
-        attachments = _hosted_turn_output_attachments(
-            conversation_id,
-            turn_id,
-            int(run.get("started_at") or 0),
-        )
+    attachments = handoff_artifacts
     missing_required_artifact = artifact_required and not attachments
     reporter_state_snapshot = (
         _reporter_state
@@ -7228,7 +7646,7 @@ def _apply_remote_checkpoint(
         conversation_id = str(conversation.get("id") or "")
         turn_id = str(hosted.get("turn_id") or "")
         role_label = f"{remote_run.get('profile') or role_key} · 执行"
-    _notify_hosted_update()
+    _notify_hosted_update(conversation_id)
     _remote_run_state_message(
         conversation_id,
         turn_id,
@@ -7355,6 +7773,7 @@ def connector_pull_runs(payload: ConnectorPullBody, request: Request):
     now = int(time.time() * 1000)
     lease_until = now + lease_seconds * 1000
     selected: list[dict[str, Any]] = []
+    changed_conversation_ids: set[str] = set()
     changed = False
     with _STATE_LOCK:
         state = load_single_state()
@@ -7368,7 +7787,7 @@ def connector_pull_runs(payload: ConnectorPullBody, request: Request):
                     if not isinstance(remote_run, dict):
                         continue
                     profile = str(remote_run.get("profile") or "")
-                    if profile not in {"dbb3-worker", "pc-worker", "reviewer", "default"}:
+                    if profile not in _REMOTE_RUN_PROFILES:
                         continue
                     if _remote_run_connector_id(remote_run) != connector_id:
                         continue
@@ -7392,6 +7811,7 @@ def connector_pull_runs(payload: ConnectorPullBody, request: Request):
                         }
                     )
                     selected.append(_remote_run_connector_payload(remote_run))
+                    changed_conversation_ids.add(str(conversation.get("id") or ""))
                     changed = True
                     if len(selected) >= limit:
                         break
@@ -7402,7 +7822,8 @@ def connector_pull_runs(payload: ConnectorPullBody, request: Request):
         if changed:
             save_single_state(state)
     if changed:
-        _notify_hosted_update()
+        for changed_conversation_id in changed_conversation_ids:
+            _notify_hosted_update(changed_conversation_id)
     return {"runs": selected, "server_time": now}
 
 
@@ -7443,7 +7864,7 @@ def connector_ack_run(remote_run_id: str, payload: ConnectorAckBody, request: Re
                 record[key] = value[:512]
         save_single_state(state)
         persisted = dict(record)
-    _notify_hosted_update()
+    _notify_hosted_update(str(conversation.get("id") or ""))
     _remote_run_state_message(
         str(conversation.get("id") or ""),
         str(hosted.get("turn_id") or ""),
@@ -8102,6 +8523,14 @@ async def stream_hosted_conversation_events(
     request: Request,
 ):
     owner_id = owner_id_from_request(request)
+    cursor_value = request.query_params.get("cursor") or request.headers.get(
+        "last-event-id",
+        "0",
+    )
+    try:
+        requested_cursor = max(0, int(cursor_value or 0))
+    except (TypeError, ValueError) as exc:
+        raise HTTPException(status_code=422, detail="cursor must be a non-negative integer") from exc
     with _STATE_LOCK:
         state = load_single_state()
         _conversation, claimed = _owned_conversation_in_state(
@@ -8114,6 +8543,8 @@ async def stream_hosted_conversation_events(
 
     async def event_stream():
         revision = -1
+        delivered_cursor = requested_cursor
+        initial_snapshot = True
         while not await request.is_disconnected():
             with _STATE_LOCK:
                 state = load_single_state()
@@ -8123,13 +8554,23 @@ async def stream_hosted_conversation_events(
                     owner_id,
                 )
                 current_revision = _HOSTED_UPDATE_REVISION
+                current_cursor = max(0, int(conversation.get("event_cursor") or 0))
                 payload = json.dumps(
-                    {"conversation": _public_conversation(conversation)},
+                    {
+                        "cursor": current_cursor,
+                        "conversation": _public_conversation(conversation),
+                    },
                     ensure_ascii=False,
                     separators=(",", ":"),
                 )
-            if current_revision != revision:
-                yield f"event: conversation\ndata: {payload}\n\n"
+            if initial_snapshot or current_revision != revision or current_cursor > delivered_cursor:
+                yield (
+                    f"id: {current_cursor}\n"
+                    "event: conversation\n"
+                    f"data: {payload}\n\n"
+                )
+                initial_snapshot = False
+                delivered_cursor = current_cursor
                 revision = current_revision
             next_revision = await asyncio.to_thread(
                 _wait_for_hosted_update,
@@ -8569,7 +9010,7 @@ def enqueue_hosted_turn(
     if str(hosted_response.get("status") or "") not in _HOSTED_TERMINAL_STATUSES:
         start_hosted_workflow(conversation_id, turn_id)
     if accepted:
-        _notify_hosted_update()
+        _notify_hosted_update(conversation_id)
     return response
 
 
@@ -8842,7 +9283,7 @@ def delete_single_conversation(
                 )
                 pending_turn_ids.append(str(turn_id))
         save_single_state(state)
-    _notify_hosted_update()
+    _notify_hosted_update(conversation_id)
     if not _finalize_pending_conversation_deletion(conversation_id):
         for turn_id in pending_turn_ids:
             start_hosted_workflow(conversation_id, turn_id)
@@ -9171,7 +9612,7 @@ def send_message(room_id: str, payload: SendMessageBody, request: Request):
                 "hosted_turn": _public_hosted_turn(run),
             }
     start_hosted_workflow(str(response["conversation_id"]), str(response["turn_id"]))
-    _notify_hosted_update()
+    _notify_hosted_update(str(response["conversation_id"]))
     return response
 
 
@@ -9441,6 +9882,13 @@ def _profile_event_runner_main() -> int:
             ),
             status_callback=status_update,
         )
+        # The hosted child owns the model retry loop. Keeping this inside the
+        # child preserves one session and prevents the outer workflow from
+        # replaying a prompt or repeating a tool side effect.
+        agent._api_max_retries = _HOSTED_CHAT_API_ATTEMPTS
+        agent._api_retry_delay_seconds = _HOSTED_CHAT_API_RETRY_DELAY_SECONDS
+        agent._api_retry_client_errors = True
+        agent._api_retry_status_live = True
         if resolved_session_id:
             agent._session_db_created = True
         agent.suppress_status_output = True

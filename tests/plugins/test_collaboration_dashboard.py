@@ -76,6 +76,23 @@ class CollaborationDashboardTests(unittest.TestCase):
         self.assertEqual(routed["source"], "managed-ios-mcp")
         self.assertTrue(routed["needs_tools"])
 
+    def test_hosted_event_cursor_survives_process_revision_changes(self):
+        module = load_module()
+        conversation = module.create_single_conversation("default")
+        state = {"conversations": [conversation]}
+        persisted = []
+        module.load_single_state = lambda: state
+        module.save_single_state = lambda current: persisted.append(
+            int(current["conversations"][0].get("event_cursor") or 0)
+        )
+
+        module._notify_hosted_update(conversation["id"])
+        module._HOSTED_UPDATE_REVISION = 0
+        module._notify_hosted_update(conversation["id"])
+
+        self.assertEqual(conversation["event_cursor"], 2)
+        self.assertEqual(persisted, [1, 2])
+
     def test_cancellation_is_terminal_before_a_late_chat_completion(self):
         module = load_module()
         conversation = module.create_single_conversation("default")
@@ -221,7 +238,7 @@ class CollaborationDashboardTests(unittest.TestCase):
         self.assertEqual(readiness["model"], "model-test")
         self.assertEqual(readiness["provider"], "custom")
 
-    def test_enqueue_without_real_model_credentials_is_terminal_and_never_starts(self):
+    def test_enqueue_without_model_credentials_is_durable_before_background_retries(self):
         module = load_module()
         module.RouteMessageBody.model_rebuild(_types_namespace={"Any": Any})
         conversation = module.create_single_conversation("default")
@@ -280,20 +297,18 @@ class CollaborationDashboardTests(unittest.TestCase):
             first = module.enqueue_hosted_turn(conversation["id"], payload, SimpleNamespace())
             replay = module.enqueue_hosted_turn(conversation["id"], payload, SimpleNamespace())
 
-        self.assertFalse(first["accepted"])
-        self.assertFalse(replay["accepted"])
+        self.assertTrue(first["accepted"])
+        self.assertTrue(replay["accepted"])
         self.assertTrue(replay["replayed"])
-        self.assertEqual(first["error"]["code"], "model_credentials_missing")
-        self.assertFalse(first["error"]["retryable"])
-        self.assertEqual(starts, [])
+        self.assertIsNone(first["error"])
+        self.assertEqual(len(starts), 2)
         hosted = conversation["hosted_turns"]["turn-no-model"]
-        self.assertEqual(hosted["status"], "failed")
+        self.assertEqual(hosted["status"], "queued")
+        self.assertEqual(hosted["stage"], "accepted")
         assistant_messages = [
             item for item in conversation["messages"] if item.get("role") == "assistant"
         ]
-        self.assertEqual(len(assistant_messages), 1)
-        self.assertEqual(assistant_messages[0]["content"], module._MODEL_NOT_CONFIGURED_MESSAGE)
-        self.assertNotIn("正在处理", assistant_messages[0]["content"])
+        self.assertEqual(assistant_messages, [])
 
     def test_room_store_round_trip(self):
         module = load_module()
@@ -1126,6 +1141,149 @@ class CollaborationDashboardTests(unittest.TestCase):
         ])
         self.assertEqual(events[1]["payload"]["duration_s"], 1.25)
 
+    def test_hosted_retry_classifier_covers_auth_service_and_offline_failures(self):
+        module = load_module()
+
+        self.assertTrue(module._is_transient_runtime_error("HTTP 401 unauthorized"))
+        self.assertTrue(module._is_transient_runtime_error("HTTP 503 unavailable"))
+        self.assertTrue(module._is_transient_runtime_error("network is unreachable"))
+        self.assertEqual(
+            module.sanitize_runtime_error("HTTP 401 unauthorized"),
+            "模型服务拒绝了 API 密钥（HTTP 401）。",
+        )
+        self.assertEqual(
+            module.sanitize_runtime_error("network is unreachable"),
+            "模型服务连接超时，已保留当前进度。",
+        )
+
+    def test_hosted_retry_status_is_deduplicated_and_terminalized(self):
+        module = load_module()
+        events = []
+        for message in (
+            "Retrying in 60.0s (1/5)...",
+            "Retrying in 60.0s (1/5)...",
+            "Retrying in 60.0s (2/5)...",
+        ):
+            event = module._profile_status_event("lifecycle", message)
+            if event is not None:
+                events.append(event)
+        self.assertEqual(
+            [event["payload"]["attempt"] for event in events],
+            [1, 1, 2],
+        )
+
+        state = {"content": "", "status": "streaming", "activities": []}
+        for event in events:
+            module.apply_profile_event(state, event)
+        self.assertEqual(len(state["activities"]), 1)
+        self.assertEqual(state["activities"][0]["name"], "正在重连 (2/5)")
+        self.assertEqual(state["activities"][0]["output"], "")
+        self.assertEqual(state["activities"][0]["status"], "running")
+
+        module.apply_profile_event(
+            state,
+            {"type": "error", "payload": {"message": "HTTP 503 unavailable"}},
+        )
+        self.assertEqual(state["activities"][0]["status"], "failed")
+        self.assertEqual(state["error"], "模型服务暂时繁忙（HTTP 503），已保留当前进度。")
+
+    def test_profile_child_receives_single_owner_retry_contract(self):
+        module = load_module()
+        captured = {}
+
+        class Input:
+            def write(self, value):
+                captured["input"] = value
+
+            def close(self):
+                pass
+
+        class Output:
+            def __iter__(self):
+                yield json.dumps({
+                    "type": "message.complete",
+                    "payload": {"text": "ok", "status": "completed"},
+                }) + "\n"
+
+        class Error:
+            def read(self):
+                return ""
+
+        class Process:
+            stdin = Input()
+            stdout = Output()
+            stderr = Error()
+
+            def poll(self):
+                return 0
+
+            def wait(self, timeout=None):
+                return 0
+
+            def terminate(self):
+                pass
+
+            def kill(self):
+                pass
+
+        def process_factory(command, **kwargs):
+            captured["command"] = command
+            captured["kwargs"] = kwargs
+            return Process()
+
+        response = module.run_profile_turn(
+            "default",
+            "hello",
+            process_factory=process_factory,
+            timeout=5,
+        )
+
+        self.assertEqual(response, "ok")
+        env = captured["kwargs"]["env"]
+        self.assertEqual(env["HERMES_API_MAX_RETRIES"], "5")
+        self.assertEqual(env["HERMES_API_RETRY_DELAY_SECONDS"], "60")
+        self.assertEqual(env["HERMES_API_RETRY_CLIENT_ERRORS"], "1")
+        self.assertEqual(env["HERMES_API_RETRY_STATUS_LIVE"], "1")
+
+    def test_production_child_is_not_replayed_by_outer_role_retry(self):
+        module = load_module()
+        conversation = module.create_single_conversation("default")
+        state = {"conversations": [conversation]}
+        module.load_single_state = lambda: state
+        module.save_single_state = lambda _state: None
+        module.create_hosted_turn_record(
+            conversation,
+            turn_id="turn-single-owner",
+            content="hello",
+            title="hello",
+            profiles=["default"],
+            artifact_required=False,
+            mode="chat",
+        )
+        calls = 0
+
+        def production_runner(_profile, _prompt, **_kwargs):
+            nonlocal calls
+            calls += 1
+            raise RuntimeError("HTTP 503 unavailable")
+
+        module.run_profile_turn = production_runner
+        result, status, _snapshot = module._run_hosted_role(
+            conversation["id"],
+            "turn-single-owner",
+            profile="default",
+            role_stage="chat",
+            role_label="Hermes",
+            prompt="hello",
+            runner=production_runner,
+            kanban_task_id="",
+            start_text="",
+        )
+
+        self.assertEqual(calls, 1)
+        self.assertEqual(status, "failed")
+        self.assertEqual(result.count("HTTP 503"), 1)
+
     def test_reasoning_duration_uses_previous_message_as_model_start_boundary(self):
         module = load_module()
         activities = module.build_runtime_activity_timeline(
@@ -1905,7 +2063,7 @@ class CollaborationDashboardTests(unittest.TestCase):
             "first_token_at": 0,
         }
 
-        with patch.object(module.time, "time", side_effect=[1.0, 1.0, 2.0, 3.0]):
+        with patch.object(module.time, "time", side_effect=[1.0, 2.0, 3.0]):
             module.apply_profile_event(
                 state,
                 {"type": "status.update", "payload": {"text": "正在重连 (1/5)"}},
@@ -1943,8 +2101,9 @@ class CollaborationDashboardTests(unittest.TestCase):
         )
 
         self.assertEqual(len(state["activities"]), 1)
-        self.assertEqual(state["activities"][0]["name"], "运行状态")
-        self.assertEqual(state["activities"][0]["output"], "正在重连 (2/5)")
+        self.assertEqual(state["activities"][0]["name"], "正在重连 (2/5)")
+        self.assertEqual(state["activities"][0]["output"], "")
+        self.assertEqual(state["activities"][0]["status"], "running")
         self.assertNotIn("401", state["activities"][0]["output"])
 
     def test_tool_generating_does_not_create_a_duplicate_running_activity(self):
@@ -3918,6 +4077,137 @@ class CollaborationDashboardTests(unittest.TestCase):
         self.assertEqual(
             milestone["content"],
             "我已完成环境检查，发现两处配置问题。",
+        )
+
+
+    def test_manager_plan_is_bounded_by_user_placement_constraints(self):
+        module = load_module()
+        self.assertIn("dbb3-manager", module._REMOTE_RUN_PROFILES)
+        result = module._normalize_manager_plan(
+            json.dumps(
+                {
+                    "difficulty": "high",
+                    "workers": ["dbb3-worker", "pc-worker"],
+                    "reviewer_target": "pc",
+                    "plan": [
+                        {
+                            "id": "inspect",
+                            "title": "Inspect",
+                            "objective": "Inspect the deployment",
+                            "assignee": "pc-worker",
+                            "depends_on": [],
+                        }
+                    ],
+                }
+            ),
+            content="只允许 DBB3 执行，不要使用 WSL 或 PC worker。",
+            fallback_workers=["dbb3-worker"],
+        )
+
+        self.assertEqual(result["workers"], ["dbb3-worker"])
+        self.assertEqual(result["reviewer_target"], "dbb3")
+        self.assertEqual(result["plan"][0]["assignee"], "dbb3-worker")
+
+    def test_complex_production_workflow_uses_dbb3_manager_and_server_reporter(self):
+        module = load_module()
+        conversation = module.create_single_conversation("default")
+        state = {"conversations": [conversation]}
+        module.load_single_state = lambda: state
+        module.save_single_state = lambda _state: None
+        module.create_hosted_turn_record(
+            conversation,
+            turn_id="turn-manager-owned",
+            content="检查两个节点并汇总结果",
+            title="节点检查",
+            profiles=["default", "dbb3-worker", "reviewer"],
+            artifact_required=False,
+            mode="work",
+        )
+        remote_stages = []
+        local_stages = []
+
+        def remote_role(_conversation_id, _turn_id, **kwargs):
+            stage = kwargs["role_stage"]
+            remote_stages.append((stage, kwargs["profile"], kwargs.get("connector_id")))
+            if stage == "manager_planning":
+                return (
+                    json.dumps(
+                        {
+                            "difficulty": "medium",
+                            "reason": "one bounded execution lane is sufficient",
+                            "workers": ["dbb3-worker"],
+                            "reviewer_target": "dbb3",
+                            "plan": [
+                                {
+                                    "id": "step-1",
+                                    "title": "check",
+                                    "objective": "inspect both nodes",
+                                    "assignee": "dbb3-worker",
+                                    "depends_on": [],
+                                }
+                            ],
+                        }
+                    ),
+                    "completed",
+                    {},
+                )
+            if stage == "worker":
+                return "worker evidence", "completed", {}
+            if stage == "reviewer":
+                return "verified\nHERMES_REVIEW: PASS", "completed", {}
+            if stage == "manager_handoff":
+                return (
+                    json.dumps(
+                        {
+                            "task_goal": "检查两个节点并汇总结果",
+                            "plan": [{"id": "step-1"}],
+                            "worker_results": {"dbb3-worker": "worker evidence"},
+                            "review_verdict": "verified",
+                            "rework_history": [],
+                            "artifacts": [],
+                            "failures": [],
+                            "suggested_conclusion": "checks passed",
+                        }
+                    ),
+                    "completed",
+                    {},
+                )
+            raise AssertionError(stage)
+
+        def local_role(_conversation_id, _turn_id, **kwargs):
+            local_stages.append((kwargs["role_stage"], kwargs["profile"], kwargs["prompt"]))
+            return "server final answer", "completed", {"activities": []}
+
+        module._run_hosted_remote_role = remote_role
+        module._run_hosted_role = local_role
+        module.execute_hosted_workflow(
+            conversation["id"],
+            "turn-manager-owned",
+            runner=module.run_profile_turn,
+            task_creator=lambda **_kwargs: {
+                "task_id": "root-manager-owned",
+                "child_ids": ["child-worker", "child-reviewer"],
+                "profile_task_ids": {
+                    "dbb3-worker": "child-worker",
+                    "reviewer": "child-reviewer",
+                },
+                "fanout": True,
+            },
+        )
+
+        self.assertEqual(
+            [stage for stage, _profile, _connector in remote_stages],
+            ["manager_planning", "worker", "reviewer", "manager_handoff"],
+        )
+        self.assertEqual(local_stages[0][:2], ("reporter", "default"))
+        self.assertIn("结构化交接", local_stages[0][2])
+        self.assertEqual(
+            conversation["hosted_turns"]["turn-manager-owned"]["stage"],
+            "completed",
+        )
+        self.assertEqual(
+            conversation["hosted_turns"]["turn-manager-owned"]["manager_plan"]["workers"],
+            ["dbb3-worker"],
         )
 
 

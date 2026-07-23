@@ -1226,7 +1226,13 @@ class DBB3CloudConnector:
         task_id = _text(local.get("root_task_id") or task.get("id"), 256)
         workspace = _text(task.get("workspace_path"), 2048)
         if (
-            profile not in {"default", "dbb3-worker", "pc-worker", "reviewer"}
+            profile not in {
+                "default",
+                "dbb3-manager",
+                "dbb3-worker",
+                "pc-worker",
+                "reviewer",
+            }
             or not task_id
             or not workspace
         ):
@@ -1272,6 +1278,7 @@ class DBB3CloudConnector:
         remote_id = _text(local.get("remote_run_id"), 256)
         if not session_id or profile not in {
             "default",
+            "dbb3-manager",
             "dbb3-worker",
             "pc-worker",
             "reviewer",
