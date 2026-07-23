@@ -18,7 +18,7 @@ import os
 from pathlib import Path
 import sys
 import time
-from typing import TYPE_CHECKING, Any, Callable, Iterable, Mapping
+from typing import TYPE_CHECKING, Any, Callable, Iterable, Mapping, Sequence
 
 from hermes_cli.ios_intelligence import (
     AMapClient,
@@ -378,10 +378,55 @@ _LATEST_DESCRIPTIONS = {
     "ios-device": "Use automatically when the user asks about this device, iOS version, capabilities, permissions, connectivity, or native feature availability.",
 }
 
+_DEVICE_PERMISSION_BY_CAPABILITY = {
+    "ios-location": "location",
+    "ios-trajectory": "location",
+    "ios-places": "location",
+    "ios-map": "location",
+    "ios-motion": "motion",
+    "ios-health-sleep": "health",
+    "ios-health-heart": "health",
+    "ios-health-oxygen": "health",
+    "ios-health-activity": "health",
+    "ios-calendar": "calendar",
+    "ios-reminders": "reminders",
+    "ios-screen-time": "screenTime",
+}
+
+
+def _require_device_permission(
+    store: IOSIntelligenceStore,
+    owner_id: str,
+    capability: str,
+) -> None:
+    """Fail closed when the latest iPhone snapshot does not prove OS access."""
+
+    permission = _DEVICE_PERMISSION_BY_CAPABILITY.get(capability)
+    if permission is None:
+        return
+    device = store.latest_snapshot(owner_id, "device")
+    data = (device or {}).get("data")
+    permissions = data.get("permissions") if isinstance(data, Mapping) else None
+    if not isinstance(permissions, Mapping):
+        raise PermissionError(
+            f"No synchronized iOS permission state is available for {capability}"
+        )
+    state = str(permissions.get(permission) or "").strip()
+    allowed = state == "authorized" or (
+        permission in {"health", "location"} and state == "limited"
+    )
+    if permission == "location":
+        allowed = allowed and permissions.get("locationAlways") is True
+    if not allowed:
+        raise PermissionError(
+            f"The current iOS {permission} permission does not allow {capability}"
+        )
+
 
 def _resolve_location(store: IOSIntelligenceStore, owner_id: str, latitude: float | None, longitude: float | None) -> tuple[float, float]:
     if latitude is not None and longitude is not None:
         return float(latitude), float(longitude)
+    _require_device_permission(store, owner_id, "ios-location")
     snapshot = store.latest_snapshot(owner_id, "location")
     data = (snapshot or {}).get("data", {})
     lat = data.get("latitude", data.get("lat"))
@@ -430,7 +475,9 @@ def _register_latest(
     tool_name = capability.replace("-", "_") + "_get_latest"
 
     def get_latest(owner_id: str = "") -> dict[str, Any]:
-        return {"snapshot": store.latest_snapshot(_resolve_owner(store, owner_id), kind)}
+        resolved_owner = _resolve_owner(store, owner_id)
+        _require_device_permission(store, resolved_owner, capability)
+        return {"snapshot": store.latest_snapshot(resolved_owner, kind)}
 
     _register_scoped_tool(
         mcp,
@@ -453,7 +500,9 @@ def _register_history(
     store: IOSIntelligenceStore,
 ) -> None:
     def get_history(owner_id: str = "", limit: int = 100) -> dict[str, Any]:
-        return {"items": store.list_snapshots(_resolve_owner(store, owner_id), kind, limit)}
+        resolved_owner = _resolve_owner(store, owner_id)
+        _require_device_permission(store, resolved_owner, capability)
+        return {"items": store.list_snapshots(resolved_owner, kind, limit)}
 
     _register_scoped_tool(
         mcp,
@@ -584,6 +633,7 @@ def create_mcp_server(
         def current_location(owner_id: str = "", refresh_if_older_than_seconds: int = 300) -> dict[str, Any]:
             """Use automatically whenever a normal chat request depends on where the user is now, nearby conditions, or location-aware help."""
             owner_id = _resolve_owner(store, owner_id)
+            _require_device_permission(store, owner_id, capability)
             snapshot = store.latest_snapshot(owner_id, "location")
             stale = snapshot is None or int(snapshot["observed_at"]) < time.time() - max(0, refresh_if_older_than_seconds)
             command = None
@@ -601,6 +651,7 @@ def create_mcp_server(
         def trajectory_today(owner_id: str = "", timezone: str = "") -> dict[str, Any]:
             """Use automatically when the user asks where they traveled today, what path they took, or when route history is relevant."""
             owner_id = _resolve_owner(store, owner_id)
+            _require_device_permission(store, owner_id, capability)
             tz = timezone or load_ios_intelligence_config().timezone
             today = store.today_snapshot(owner_id, tz)
             return {"date": today["date"], "timezone": today["timezone"], "trajectory": today["trajectory"]}
@@ -612,6 +663,7 @@ def create_mcp_server(
         def places_today(owner_id: str = "", timezone: str = "") -> dict[str, Any]:
             """Use automatically when a chat request depends on places the user visited today or their arrival, departure, and dwell times."""
             owner_id = _resolve_owner(store, owner_id)
+            _require_device_permission(store, owner_id, capability)
             tz = timezone or load_ios_intelligence_config().timezone
             today = store.today_snapshot(owner_id, tz)
             return {"date": today["date"], "timezone": today["timezone"], "places": today["places"]}
@@ -623,6 +675,7 @@ def create_mcp_server(
         def behavior_predict(owner_id: str = "") -> dict[str, Any]:
             """Use automatically for proactive weather decisions and normal chat that needs the user's learned routine, likely departure, or behavior context."""
             owner_id = _resolve_owner(store, owner_id)
+            _require_device_permission(store, owner_id, capability)
             config = load_ios_intelligence_config()
             # Align with the scheduler path: apply MCP health weights and fail
             # closed when the supervisor is unavailable so stale sensors are
@@ -705,6 +758,7 @@ def create_mcp_server(
         def ios_map_get_today(owner_id: str = "", timezone: str = "") -> dict[str, Any]:
             """Use when the user asks to show or reason over today's standard-map location, visited-place markers, and movement polyline."""
             owner_id = _resolve_owner(store, owner_id)
+            _require_device_permission(store, owner_id, capability)
             tz = timezone or load_ios_intelligence_config().timezone
             return store.today_snapshot(owner_id, tz)
 
@@ -781,6 +835,32 @@ def create_mcp_server(
         return mcp
 
     raise AssertionError(f"Capability registration missing: {capability}")
+
+
+def _run_supervised_mcp_child(
+    argv: Sequence[str],
+    environment: Mapping[str, str],
+    log_path: str | os.PathLike[str],
+) -> int:
+    """Enter one forkserver child with the same boundary as a fresh exec."""
+
+    os.environ.clear()
+    os.environ.update({str(key): str(value) for key, value in environment.items()})
+    if hasattr(time, "tzset"):
+        time.tzset()
+
+    descriptor = os.open(
+        os.fspath(log_path),
+        os.O_WRONLY | os.O_CREAT | os.O_APPEND,
+        0o600,
+    )
+    try:
+        os.dup2(descriptor, 1)
+        os.dup2(descriptor, 2)
+    finally:
+        if descriptor not in {1, 2}:
+            os.close(descriptor)
+    return main(list(argv))
 
 
 def build_parser() -> argparse.ArgumentParser:

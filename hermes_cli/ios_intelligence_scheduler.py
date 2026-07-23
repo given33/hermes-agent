@@ -804,7 +804,7 @@ class IOSIntelligenceScheduler:
                     else "failed" if state == "permanent_failure"
                     else "retry"
                 )
-                self.store.update_notification_delivery(
+                committed = self.store.update_notification_delivery(
                     notification_id,
                     stored_state,
                     int(item.get("deliveries") or 0) + 1,
@@ -813,6 +813,8 @@ class IOSIntelligenceScheduler:
                     lease_token=lease_token,
                     now=self.clock(),
                 )
+                if not committed:
+                    raise RuntimeError("notification delivery lease lost")
                 outcomes.append({"id": item["id"], **outcome})
             except Exception as exc:
                 self.store.update_notification_delivery(

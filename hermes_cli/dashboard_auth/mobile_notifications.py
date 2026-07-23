@@ -149,6 +149,7 @@ def build_account_deletion_payload(
     *,
     owner_scope: str,
     valid_until: int | None = None,
+    requested_at: int | None = None,
 ) -> dict[str, Any]:
     """Build a silent tombstone bound to one exact device account scope."""
 
@@ -157,15 +158,18 @@ def build_account_deletion_payload(
         raise ValueError("owner_scope is required")
 
     expires_at = int(valid_until or (time.time() + 7 * 24 * 60 * 60))
+    data: dict[str, Any] = {
+        "action": "delete-account-data",
+        "owner_scope": normalized_scope,
+        "valid_until": expires_at,
+    }
+    if requested_at is not None:
+        data["requested_at"] = max(0, int(requested_at))
     return {
         "aps": {"content-available": 1},
         "hermes": {
             "category": "account-deletion",
-            "data": {
-                "action": "delete-account-data",
-                "owner_scope": normalized_scope,
-                "valid_until": expires_at,
-            },
+            "data": data,
         },
     }
 
@@ -411,6 +415,7 @@ def deliver_account_deletion_push(
     owner_id: str,
     owner_scope: str,
     valid_until: int | None = None,
+    requested_at: int | None = None,
     previous_deliveries: Optional[dict[str, dict[str, Any]]] = None,
     progress_callback: Optional[Callable[[dict[str, dict[str, Any]]], None]] = None,
     device_store: Optional[MobileDeviceStore] = None,
@@ -423,6 +428,7 @@ def deliver_account_deletion_push(
         payload=build_account_deletion_payload(
             owner_scope=owner_scope,
             valid_until=valid_until,
+            requested_at=requested_at,
         ),
         collapse_id=account_deletion_collapse_id(owner_id),
         previous_deliveries=previous_deliveries,
@@ -446,12 +452,24 @@ def process_account_deletion_outbox(
 
     store = device_store or MobileDeviceStore()
     outcomes: list[dict[str, Any]] = []
-    for item in store.claim_account_deletions(
-        limit=limit,
-        lease_seconds=ACCOUNT_DELETION_LEASE_SECONDS,
-        user_id=str(owner_id or "").strip(),
-    ):
+    remaining = max(1, min(int(limit), 1000))
+    processed_ids: set[str] = set()
+    while remaining > 0:
+        # Claim only the record about to be delivered. Pre-claiming a large
+        # batch lets later records burn their lease while an earlier account
+        # is still sending to several devices.
+        claimed = store.claim_account_deletions(
+            limit=1,
+            lease_seconds=ACCOUNT_DELETION_LEASE_SECONDS,
+            user_id=str(owner_id or "").strip(),
+            exclude_ids=list(processed_ids),
+        )
+        if not claimed:
+            break
+        item = claimed[0]
+        remaining -= 1
         deletion_id = str(item["id"])
+        processed_ids.add(deletion_id)
         lease_token = str(item.get("lease_token") or "")
         previous = dict(item.get("device_deliveries") or {})
         requested_at = int(item.get("requested_at") or time.time())
@@ -472,6 +490,7 @@ def process_account_deletion_outbox(
                 owner_id=str(item["user_id"]),
                 owner_scope=str(item["owner_scope"]),
                 valid_until=valid_until,
+                requested_at=requested_at,
                 previous_deliveries=previous,
                 progress_callback=persist_progress,
                 device_store=store,

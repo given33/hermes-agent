@@ -20,8 +20,8 @@ import os
 from pathlib import Path
 import secrets
 import sqlite3
+import stat
 import statistics
-import tempfile
 import threading
 import time
 from typing import Any, Mapping, Sequence
@@ -325,6 +325,18 @@ CREATE TABLE IF NOT EXISTS ios_cold_segments (
 CREATE INDEX IF NOT EXISTS idx_ios_cold_segments_owner_time
     ON ios_cold_segments(owner_id, start_at, end_at);
 
+CREATE TABLE IF NOT EXISTS ios_cold_install_intents (
+    owner_id TEXT NOT NULL,
+    segment_id TEXT NOT NULL,
+    intent_token TEXT NOT NULL,
+    target_path TEXT NOT NULL,
+    temp_path TEXT NOT NULL,
+    created_at INTEGER NOT NULL,
+    PRIMARY KEY(owner_id, segment_id)
+);
+CREATE INDEX IF NOT EXISTS idx_ios_cold_install_intents_owner
+    ON ios_cold_install_intents(owner_id, created_at);
+
 CREATE TABLE IF NOT EXISTS ios_account_deletion_tombstones (
     owner_id TEXT PRIMARY KEY,
     owner_scope TEXT NOT NULL DEFAULT '',
@@ -339,7 +351,7 @@ CREATE INDEX IF NOT EXISTS idx_ios_account_deletions_pending
     ON ios_account_deletion_tombstones(status, updated_at);
 """
 
-_ACCOUNT_OWNED_TABLES = (
+_ACCOUNT_HOT_TABLES = (
     "ios_events",
     "ios_snapshots",
     "ios_trajectory",
@@ -355,9 +367,12 @@ _ACCOUNT_OWNED_TABLES = (
     "ios_behavior_models",
     "ios_behavior_feedback",
     "ios_weather_quiet_summary",
-    "ios_cold_segments",
 )
-_ACCOUNT_HOT_TABLES = _ACCOUNT_OWNED_TABLES[:-1]
+_ACCOUNT_OWNED_TABLES = (
+    *_ACCOUNT_HOT_TABLES,
+    "ios_cold_segments",
+    "ios_cold_install_intents",
+)
 
 
 def _owner(value: Any) -> str:
@@ -568,7 +583,7 @@ def load_ios_feature_weights(supervisor: Any | None = None) -> dict[str, float]:
 class IOSIntelligenceStore:
     """SQLite source of truth shared by the independent iOS MCP processes."""
 
-    schema_version = 9
+    schema_version = 10
     _schema_lock = threading.RLock()
 
     def __init__(self, base_dir: str | os.PathLike[str] | None = None):
@@ -667,38 +682,194 @@ class IOSIntelligenceStore:
                         conn.execute(f"PRAGMA user_version={self.schema_version}")
             self._cleanup_orphan_cold_files()
 
-    def _cleanup_orphan_cold_files(self) -> None:
-        """Remove cold files left between atomic install and index commit."""
+    @staticmethod
+    def _cold_path_key(value: str | os.PathLike[str]) -> str:
+        return os.path.normcase(os.path.abspath(os.fspath(value)))
 
+    @staticmethod
+    def _cold_owner_directory_name(owner_id: str) -> str:
+        return hashlib.sha256(_owner(owner_id).encode()).hexdigest()[:24]
+
+    def _cold_root(self, *, create: bool = False) -> Path:
         root = self.path.parent / "ios-cold"
-        if not root.is_dir():
-            return
+        if create:
+            root.mkdir(parents=True, exist_ok=True)
         try:
-            with self._connect() as conn:
+            root_stat = root.lstat()
+        except FileNotFoundError:
+            return root.resolve(strict=False)
+        if stat.S_ISLNK(root_stat.st_mode) or not stat.S_ISDIR(root_stat.st_mode):
+            raise RuntimeError("cold storage root must be a real directory")
+        return root.resolve(strict=True)
+
+    def _cold_owner_directory(self, owner_id: str, *, create: bool = False) -> Path:
+        root = self._cold_root(create=create)
+        owner_dir = root / self._cold_owner_directory_name(owner_id)
+        if create:
+            owner_dir.mkdir(mode=0o700, parents=False, exist_ok=True)
+            try:
+                owner_dir.chmod(0o700)
+            except OSError:
+                pass
+        try:
+            owner_stat = owner_dir.lstat()
+        except FileNotFoundError:
+            return owner_dir
+        if stat.S_ISLNK(owner_stat.st_mode) or not stat.S_ISDIR(owner_stat.st_mode):
+            raise RuntimeError("cold storage account directory must be a real directory")
+        resolved = owner_dir.resolve(strict=True)
+        if resolved.parent != root:
+            raise RuntimeError("cold storage account directory escaped its managed root")
+        return resolved
+
+    def _managed_cold_path(
+        self,
+        owner_id: str,
+        value: str | os.PathLike[str],
+    ) -> Path | None:
+        """Return a direct child of the account cold directory, without following links."""
+
+        try:
+            candidate = Path(value)
+            if not candidate.is_absolute():
+                return None
+            owner_dir = self._cold_owner_directory(owner_id)
+            if candidate.parent.resolve(strict=False) != owner_dir.resolve(strict=False):
+                return None
+            try:
+                candidate_stat = candidate.lstat()
+            except FileNotFoundError:
+                candidate_stat = None
+            if candidate_stat is not None and stat.S_ISLNK(candidate_stat.st_mode):
+                return None
+            resolved = candidate.resolve(strict=False)
+            if resolved.parent != owner_dir.resolve(strict=False):
+                return None
+            return resolved
+        except (OSError, RuntimeError, ValueError):
+            return None
+
+    def _cleanup_orphan_cold_files(
+        self,
+        owner_id: str = "",
+        *,
+        intent_token: str = "",
+    ) -> dict[str, int]:
+        """Recover interrupted installs while excluding indexed segments.
+
+        The installation intent is committed before any target is written.
+        Recovery holds the same SQLite writer lock used by archive finalization,
+        so it either cancels a reservation before file I/O starts or observes a
+        fully indexed segment after the archiver commits.
+        """
+
+        normalized_owner = _owner(owner_id) if str(owner_id or "").strip() else ""
+        root = self.path.parent / "ios-cold"
+        removed_files = 0
+        removed_intents = 0
+        pending_intents = 0
+        try:
+            with self._connect() as conn, write_txn(conn):
                 indexed = {
-                    str(row[0])
+                    self._cold_path_key(str(row[0]))
                     for row in conn.execute("SELECT file_path FROM ios_cold_segments")
                     if str(row[0] or "").strip()
                 }
-            for owner_dir in root.iterdir():
-                if not owner_dir.is_dir():
-                    continue
-                for candidate in owner_dir.iterdir():
-                    if not candidate.is_file():
-                        continue
-                    if candidate.name.startswith(".ios-cold-") or str(candidate) not in indexed:
-                        try:
-                            candidate.unlink()
-                        except OSError:
+                clauses: list[str] = []
+                values: list[Any] = []
+                if normalized_owner:
+                    clauses.append("owner_id=?")
+                    values.append(normalized_owner)
+                if str(intent_token or "").strip():
+                    clauses.append("intent_token=?")
+                    values.append(str(intent_token))
+                where = f" WHERE {' AND '.join(clauses)}" if clauses else ""
+                intents = conn.execute(
+                    "SELECT owner_id,segment_id,intent_token,target_path,temp_path "
+                    f"FROM ios_cold_install_intents{where}",
+                    tuple(values),
+                ).fetchall()
+                for intent in intents:
+                    complete = True
+                    intent_owner = str(intent["owner_id"])
+                    paths = (
+                        (str(intent["temp_path"] or ""), False),
+                        (str(intent["target_path"] or ""), True),
+                    )
+                    for path_text, is_target in paths:
+                        if not path_text:
                             continue
+                        managed_path = self._managed_cold_path(intent_owner, path_text)
+                        if managed_path is None:
+                            complete = False
+                            continue
+                        if is_target and self._cold_path_key(managed_path) in indexed:
+                            continue
+                        try:
+                            managed_path.unlink()
+                            removed_files += 1
+                        except FileNotFoundError:
+                            continue
+                        except OSError:
+                            complete = False
+                    if complete:
+                        removed_intents += int(conn.execute(
+                            "DELETE FROM ios_cold_install_intents "
+                            "WHERE owner_id=? AND segment_id=? AND intent_token=?",
+                            (
+                                intent["owner_id"],
+                                intent["segment_id"],
+                                intent["intent_token"],
+                            ),
+                        ).rowcount)
+                    else:
+                        pending_intents += 1
+
+                root_is_managed = False
                 try:
-                    owner_dir.rmdir()
-                except OSError:
+                    root_stat = root.lstat()
+                    root_is_managed = stat.S_ISDIR(root_stat.st_mode) and not stat.S_ISLNK(root_stat.st_mode)
+                except FileNotFoundError:
                     pass
+                if not str(intent_token or "").strip() and root_is_managed:
+                    if normalized_owner:
+                        owner_directories = [
+                            root / hashlib.sha256(normalized_owner.encode()).hexdigest()[:24]
+                        ]
+                    else:
+                        owner_directories = list(root.iterdir())
+                    for owner_dir in owner_directories:
+                        try:
+                            owner_stat = owner_dir.lstat()
+                        except FileNotFoundError:
+                            continue
+                        if stat.S_ISLNK(owner_stat.st_mode) or not stat.S_ISDIR(owner_stat.st_mode):
+                            continue
+                        for candidate in owner_dir.iterdir():
+                            if not candidate.is_file():
+                                continue
+                            if (
+                                candidate.name.startswith(".ios-cold-")
+                                or self._cold_path_key(candidate) not in indexed
+                            ):
+                                try:
+                                    candidate.unlink()
+                                    removed_files += 1
+                                except OSError:
+                                    continue
+                        try:
+                            owner_dir.rmdir()
+                        except OSError:
+                            pass
         except (OSError, sqlite3.Error):
-            # Cleanup is best effort; registered paths remain recoverable via the
-            # account deletion tombstone when the next scheduler pass runs.
-            return
+            # Registered paths and unresolved intents remain durable for the
+            # next cleanup-only scheduler cycle.
+            pass
+        return {
+            "files_removed": removed_files,
+            "intents_removed": removed_intents,
+            "intents_pending": pending_intents,
+        }
 
     def _load_master_secret(self) -> bytes:
         """Load the deployment key or create a private local-development key."""
@@ -2075,7 +2246,8 @@ class IOSIntelligenceStore:
             # Never steal an in-flight 'delivering' lease: a worker mid-APNs
             # must finish under CAS. Only reclaim after leased_until has passed.
             outbox_rows = conn.execute(
-                "SELECT id,payload_json,state,leased_until FROM ios_notification_outbox "
+                "SELECT id,payload_json,state,leased_until,expires_at "
+                "FROM ios_notification_outbox "
                 "WHERE owner_id=? AND state IN ('pending','retry','delivering')",
                 (owner_id,),
             ).fetchall()
@@ -2083,9 +2255,18 @@ class IOSIntelligenceStore:
                 payload = self._open_json(owner_id, row["payload_json"], "ios_notification_outbox.payload_json")
                 if payload.get("category") != "smart-weather":
                     continue
-                if keep and str(payload.get("event_key") or "") == keep:
+                deadline_elapsed = int(row["expires_at"] or 0) <= instant
+                if (
+                    not deadline_elapsed
+                    and keep
+                    and str(payload.get("event_key") or "") == keep
+                ):
                     continue
-                if str(row["state"]) == "delivering" and int(row["leased_until"] or 0) > instant:
+                if (
+                    not deadline_elapsed
+                    and str(row["state"]) == "delivering"
+                    and int(row["leased_until"] or 0) > instant
+                ):
                     continue
                 expired_ids.append(str(row["id"]))
             if expired_ids:
@@ -2095,8 +2276,8 @@ class IOSIntelligenceStore:
                     f"leased_until=0,updated_at=? WHERE owner_id=? "
                     f"AND state IN ('pending','retry','delivering') "
                     f"AND id IN ({placeholders}) "
-                    f"AND (state!='delivering' OR leased_until<=?)",
-                    (instant, owner_id, *expired_ids, instant),
+                    f"AND (state!='delivering' OR leased_until<=? OR expires_at<=?)",
+                    (instant, owner_id, *expired_ids, instant, instant),
                 )
 
             delivered_rows = conn.execute(
@@ -2964,70 +3145,172 @@ class IOSIntelligenceStore:
         if encrypt:
             compressed = self._encrypt_blob(compressed, owner_id)
             encrypted = True
-        requested_destination = Path(destination) if destination else None
-        if requested_destination and requested_destination.suffix in {".gz", ".enc"}:
-            root = requested_destination.parent
-        else:
-            root = requested_destination or self.path.parent / "ios-cold"
-        root.mkdir(parents=True, exist_ok=True)
-        owner_dir = root / hashlib.sha256(owner_id.encode()).hexdigest()[:24]
-        owner_dir.mkdir(parents=True, exist_ok=True)
+        requested_destination = Path(destination).resolve(strict=False) if destination else None
+        owner_dir = self._cold_owner_directory(owner_id, create=True)
         digest = hashlib.sha256(compressed).hexdigest()
         segment_id = f"{rows[0]['observed_at']}-{rows[-1]['observed_at']}-{digest[:12]}"
-        target = requested_destination if requested_destination and requested_destination.suffix in {".gz", ".enc"} else owner_dir / f"{segment_id}.jsonl.gz{'.enc' if encrypted else ''}"
-        target = Path(target)
+        if requested_destination and requested_destination.suffix in {".gz", ".enc"}:
+            target = self._managed_cold_path(owner_id, requested_destination)
+            if target is None:
+                raise ValueError("cold storage destination must be inside the account directory")
+        elif requested_destination:
+            requested_root = requested_destination.resolve(strict=False)
+            if requested_root not in {self._cold_root(), owner_dir}:
+                raise ValueError("cold storage destination must use the managed cold root")
+            target = owner_dir / f"{segment_id}.jsonl.gz{'.enc' if encrypted else ''}"
+        else:
+            target = owner_dir / f"{segment_id}.jsonl.gz{'.enc' if encrypted else ''}"
+        target = Path(target).resolve(strict=False)
+        intent_token = uuid.uuid4().hex
+        temp_name = owner_dir / f".ios-cold-{intent_token}.tmp"
         removed_hot = 0
-        tombstoned = False
         with self._connect() as conn, write_txn(conn):
             tombstoned = conn.execute(
                 "SELECT 1 FROM ios_account_deletion_tombstones WHERE owner_id=?",
                 (owner_id,),
             ).fetchone() is not None
+            already_indexed = None
+            reserved = False
             if not tombstoned:
-                # Hold the same SQLite writer lock across file installation and
-                # index insertion. Account deletion therefore runs either before
-                # this block (and no file is created) or after it (and sees the
-                # registered path); an unindexed archive cannot appear between.
-                fd, temp_name = tempfile.mkstemp(prefix=".ios-cold-", dir=owner_dir)
-                installed = False
-                indexed = False
-                target_existed = target.exists()
-                try:
-                    with os.fdopen(fd, "wb") as handle:
-                        handle.write(compressed)
-                        handle.flush()
-                        os.fsync(handle.fileno())
-                    os.replace(temp_name, target)
-                    installed = True
-                    conn.execute(
-                        "INSERT OR IGNORE INTO ios_cold_segments VALUES(?,?,?,?,?,?,?,?,?)",
-                        (owner_id, segment_id, rows[0]["observed_at"], rows[-1]["observed_at"], str(target), len(rows), digest, int(encrypted), int(time.time())),
-                    )
-                    indexed = True
-                finally:
-                    if os.path.exists(temp_name):
-                        os.unlink(temp_name)
-                    if (installed or not target_existed) and not indexed:
-                        try:
-                            target.unlink()
-                        except FileNotFoundError:
-                            pass
-                if remove_hot:
-                    keys = [(owner_id, row["device_id"], row["event_id"]) for row in rows]
-                    removed_hot = max(0, conn.executemany(
-                        "DELETE FROM ios_trajectory WHERE owner_id=? AND device_id=? AND event_id=?",
-                        keys,
+                already_indexed = conn.execute(
+                    "SELECT file_path FROM ios_cold_segments "
+                    "WHERE owner_id=? AND segment_id=?",
+                    (owner_id, segment_id),
+                ).fetchone()
+                if already_indexed is None:
+                    path_conflict = conn.execute(
+                        "SELECT owner_id,segment_id FROM ios_cold_segments WHERE file_path=? "
+                        "UNION ALL SELECT owner_id,segment_id FROM ios_cold_install_intents "
+                        "WHERE target_path=? AND NOT (owner_id=? AND segment_id=?) LIMIT 1",
+                        (str(target), str(target), owner_id, segment_id),
+                    ).fetchone()
+                    if path_conflict is not None:
+                        raise ValueError("cold storage destination is already owned by another segment")
+                    reserved = bool(conn.execute(
+                        "INSERT OR IGNORE INTO ios_cold_install_intents "
+                        "(owner_id,segment_id,intent_token,target_path,temp_path,created_at) "
+                        "VALUES(?,?,?,?,?,?)",
+                        (
+                            owner_id,
+                            segment_id,
+                            intent_token,
+                            str(target),
+                            str(temp_name),
+                            int(time.time()),
+                        ),
                     ).rowcount)
-                    conn.executemany(
-                        "DELETE FROM ios_events WHERE owner_id=? AND device_id=? AND event_id=?",
-                        keys,
-                    )
         if tombstoned:
             return {
                 "owner_id": owner_id,
                 "archived": False,
                 "point_count": 0,
                 "account_deleted": True,
+            }
+        if already_indexed is not None:
+            return {
+                "owner_id": owner_id,
+                "archived": True,
+                "segment_id": segment_id,
+                "path": str(already_indexed["file_path"]),
+                "point_count": len(rows),
+                "hot_points_removed": 0,
+                "checksum": digest,
+                "encrypted": encrypted,
+                "already_indexed": True,
+            }
+        if not reserved:
+            return {
+                "owner_id": owner_id,
+                "archived": False,
+                "point_count": 0,
+                "retryable": True,
+            }
+
+        indexed = False
+        canceled = False
+        try:
+            # The durable reservation was committed above. Holding the writer
+            # lock from the reservation check through file installation and
+            # index commit makes deletion and startup recovery serialize with
+            # this finalization step.
+            with self._connect() as conn, write_txn(conn):
+                intent = conn.execute(
+                    "SELECT 1 FROM ios_cold_install_intents "
+                    "WHERE owner_id=? AND segment_id=? AND intent_token=?",
+                    (owner_id, segment_id, intent_token),
+                ).fetchone()
+                tombstoned = conn.execute(
+                    "SELECT 1 FROM ios_account_deletion_tombstones WHERE owner_id=?",
+                    (owner_id,),
+                ).fetchone() is not None
+                if intent is None or tombstoned:
+                    canceled = True
+                else:
+                    managed_target = self._managed_cold_path(owner_id, target)
+                    managed_temp = self._managed_cold_path(owner_id, temp_name)
+                    if managed_target is None or managed_temp is None:
+                        raise RuntimeError("cold storage path boundary changed during installation")
+                    fd = os.open(
+                        str(managed_temp),
+                        os.O_CREAT | os.O_EXCL | os.O_WRONLY,
+                        0o600,
+                    )
+                    with os.fdopen(fd, "wb") as handle:
+                        handle.write(compressed)
+                        handle.flush()
+                        os.fsync(handle.fileno())
+                    os.replace(managed_temp, managed_target)
+                    inserted = conn.execute(
+                        "INSERT OR IGNORE INTO ios_cold_segments VALUES(?,?,?,?,?,?,?,?,?)",
+                        (owner_id, segment_id, rows[0]["observed_at"], rows[-1]["observed_at"], str(managed_target), len(rows), digest, int(encrypted), int(time.time())),
+                    ).rowcount
+                    if not inserted:
+                        current = conn.execute(
+                            "SELECT file_path,checksum FROM ios_cold_segments "
+                            "WHERE owner_id=? AND segment_id=?",
+                            (owner_id, segment_id),
+                        ).fetchone()
+                        if (
+                            current is None
+                            or str(current["file_path"]) != str(managed_target)
+                            or str(current["checksum"]) != digest
+                        ):
+                            raise RuntimeError("cold segment index conflict")
+                    if remove_hot:
+                        keys = [(owner_id, row["device_id"], row["event_id"]) for row in rows]
+                        removed_hot = max(0, conn.executemany(
+                            "DELETE FROM ios_trajectory WHERE owner_id=? AND device_id=? AND event_id=?",
+                            keys,
+                        ).rowcount)
+                        conn.executemany(
+                            "DELETE FROM ios_events WHERE owner_id=? AND device_id=? AND event_id=?",
+                            keys,
+                        )
+                    conn.execute(
+                        "DELETE FROM ios_cold_install_intents "
+                        "WHERE owner_id=? AND segment_id=? AND intent_token=?",
+                        (owner_id, segment_id, intent_token),
+                    )
+                    indexed = True
+        finally:
+            if not indexed:
+                self._cleanup_orphan_cold_files(
+                    owner_id,
+                    intent_token=intent_token,
+                )
+            elif temp_name.exists():
+                try:
+                    temp_name.unlink()
+                except OSError:
+                    pass
+
+        if canceled:
+            return {
+                "owner_id": owner_id,
+                "archived": False,
+                "point_count": 0,
+                "account_deleted": bool(tombstoned),
+                "retryable": not bool(tombstoned),
             }
         return {
             "owner_id": owner_id,
@@ -3062,7 +3345,9 @@ class IOSIntelligenceStore:
             ).fetchone()
         if row is None:
             raise KeyError("cold segment not found")
-        path = Path(str(row["file_path"]))
+        path = self._managed_cold_path(owner_id, str(row["file_path"]))
+        if path is None:
+            raise RuntimeError("cold segment path is outside the account storage boundary")
         if not path.is_file():
             raise FileNotFoundError(path)
         payload = path.read_bytes()
@@ -3284,6 +3569,7 @@ class IOSIntelligenceStore:
         """Delete registered cold files without losing paths that need retry."""
 
         owner_id = _owner(owner_id)
+        orphan_cleanup = self._cleanup_orphan_cold_files(owner_id)
         with self._connect() as conn:
             rows = conn.execute(
                 "SELECT segment_id,file_path FROM ios_cold_segments "
@@ -3292,7 +3578,7 @@ class IOSIntelligenceStore:
             ).fetchall()
 
         removable: list[str] = []
-        removed_files = 0
+        removed_files = int(orphan_cleanup["files_removed"])
         failed = 0
         last_error = ""
         path_outcomes: dict[str, bool] = {}
@@ -3308,7 +3594,12 @@ class IOSIntelligenceStore:
                 else:
                     failed += 1
                 continue
-            path = Path(path_text)
+            path = self._managed_cold_path(owner_id, path_text)
+            if path is None:
+                path_outcomes[path_text] = False
+                failed += 1
+                last_error = "cold_segment_path_boundary_invalid"
+                continue
             try:
                 os.lstat(path)
             except FileNotFoundError:
@@ -3344,30 +3635,42 @@ class IOSIntelligenceStore:
                 "SELECT COUNT(*) FROM ios_cold_segments WHERE owner_id=?",
                 (owner_id,),
             ).fetchone()[0])
-            state = "complete" if remaining == 0 else "pending"
+            remaining_intents = int(conn.execute(
+                "SELECT COUNT(*) FROM ios_cold_install_intents WHERE owner_id=?",
+                (owner_id,),
+            ).fetchone()[0])
+            state = "complete" if remaining == 0 and remaining_intents == 0 else "pending"
             conn.execute(
                 "UPDATE ios_account_deletion_tombstones SET "
                 "status=?,attempts=attempts+1,last_error=?,updated_at=?,completed_at=? "
                 "WHERE owner_id=?",
                 (
                     state,
-                    "" if state == "complete" else (last_error or "cold_segment_delete_failed"),
+                    "" if state == "complete" else (
+                        last_error
+                        or (
+                            "cold_install_intent_delete_failed"
+                            if remaining_intents
+                            else "cold_segment_delete_failed"
+                        )
+                    ),
                     now,
                     now if state == "complete" else None,
                     owner_id,
                 ),
             )
 
-        if remaining == 0:
-            root = self.path.parent / "ios-cold" / hashlib.sha256(owner_id.encode()).hexdigest()[:24]
+        if remaining == 0 and remaining_intents == 0:
             try:
-                root.rmdir()
-            except OSError:
+                owner_dir = self._cold_owner_directory(owner_id)
+                owner_dir.rmdir()
+            except (OSError, RuntimeError):
                 pass
         return {
             "cold_files_removed": removed_files,
             "cold_segments_pending": remaining,
             "cold_segments_failed": failed,
+            "cold_install_intents_pending": remaining_intents,
             "state": state,
         }
 
@@ -3401,7 +3704,8 @@ class IOSIntelligenceStore:
     def account_deletion_status(self, owner_id: str) -> dict[str, Any] | None:
         with self._connect() as conn:
             row = conn.execute(
-                "SELECT * FROM ios_account_deletion_tombstones WHERE owner_id=?",
+                "SELECT * FROM ios_account_deletion_tombstones "
+                "WHERE owner_id=? COLLATE NOCASE",
                 (_owner(owner_id),),
             ).fetchone()
         return dict(row) if row is not None else None
@@ -3468,7 +3772,11 @@ class QWeatherClient:
             response.raise_for_status()
             result = {"code": "204"} if getattr(response, "status_code", None) == 204 else response.json()
         except Exception as exc:
-            raise RuntimeError(_redact_secret_text(exc, self.api_key)) from exc
+            # httpx includes the full request URL (including the query-string
+            # credential) in HTTPStatusError. Suppress the original exception
+            # chain as well as redacting the replacement message, otherwise a
+            # normal logger.exception traceback still exposes the server key.
+            raise RuntimeError(_redact_secret_text(exc, self.api_key)) from None
         if not isinstance(result, dict):
             raise RuntimeError("QWeather returned an invalid response")
         response_code = str(result.get("code") or "")
@@ -3539,7 +3847,9 @@ class AMapClient:
             response.raise_for_status()
             result = response.json()
         except Exception as exc:
-            raise RuntimeError(_redact_secret_text(exc, self.api_key)) from exc
+            # AMap also authenticates in the query string. Do not retain the
+            # provider exception as a traceback cause after sanitizing it.
+            raise RuntimeError(_redact_secret_text(exc, self.api_key)) from None
         if not isinstance(result, dict):
             raise RuntimeError("AMap request failed: invalid response")
         status = result.get("status")

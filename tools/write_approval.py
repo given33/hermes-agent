@@ -47,6 +47,7 @@ import logging
 import os
 import time
 import uuid
+from contextvars import ContextVar, Token
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
@@ -65,6 +66,51 @@ _SUBSYSTEMS = (MEMORY, SKILLS)
 # "block all writes" state — to disable a subsystem entirely use its own
 # enable flag (e.g. ``memory.memory_enabled: false``).
 CONFIG_KEY = "write_approval"
+
+# Scope follows the active turn. Local CLI callers deliberately use a
+# non-mobile owner; authenticated APIs never enumerate that scope.
+_OWNER_SCOPE: ContextVar[str] = ContextVar(
+    "hermes_write_approval_owner", default=""
+)
+_PROFILE_SCOPE: ContextVar[str] = ContextVar(
+    "hermes_write_approval_profile", default=""
+)
+
+
+def set_write_approval_scope(owner_id: str, profile: str) -> tuple[Token, Token]:
+    owner = str(owner_id or "").strip()
+    profile_name = str(profile or "").strip().lower()
+    if not owner or not profile_name:
+        raise ValueError("owner_id and profile are required")
+    return _OWNER_SCOPE.set(owner), _PROFILE_SCOPE.set(profile_name)
+
+
+def reset_write_approval_scope(tokens: tuple[Token, Token]) -> None:
+    _OWNER_SCOPE.reset(tokens[0])
+    _PROFILE_SCOPE.reset(tokens[1])
+
+
+def current_write_approval_scope() -> tuple[str, str]:
+    owner = (
+        _OWNER_SCOPE.get()
+        or os.environ.get("HERMES_OWNER_ID")
+        or os.environ.get("HERMES_IOS_OWNER_ID")
+        or os.environ.get("HERMES_OWNER_EMAIL")
+        or "local-owner"
+    )
+    profile = (
+        _PROFILE_SCOPE.get()
+        or os.environ.get("HERMES_PROFILE")
+        or os.environ.get("HERMES_PROFILE_NAME")
+        or "default"
+    )
+    return str(owner).strip()[:512], str(profile).strip().lower()[:64]
+
+
+def _approval_store():
+    from hermes_cli.account_write_approvals import AccountWriteApprovalStore
+
+    return AccountWriteApprovalStore()
 
 
 # ---------------------------------------------------------------------------
@@ -129,23 +175,31 @@ def stage_write(subsystem: str, payload: Dict[str, Any],
     logs and still returns a record (the write is simply lost, which is the
     safe failure for an approval gate — nothing is silently committed).
     """
-    pid = uuid.uuid4().hex[:8]
+    owner_id, profile = current_write_approval_scope()
+    pid = uuid.uuid4().hex
     record = {
         "id": pid,
+        "owner_id": owner_id,
+        "profile": profile,
         "subsystem": subsystem,
         "action": payload.get("action", ""),
         "summary": (summary or "").strip(),
         "origin": origin or "foreground",
         "created_at": time.time(),
         "payload": payload,
+        "state": "pending",
+        "revision": 1,
     }
     try:
-        d = _pending_dir(subsystem)
-        d.mkdir(parents=True, exist_ok=True)
-        path = d / f"{pid}.json"
-        tmp = path.with_suffix(".json.tmp")
-        tmp.write_text(json.dumps(record, ensure_ascii=False, indent=2), encoding="utf-8")
-        os.replace(tmp, path)
+        record = _approval_store().stage(
+            owner_id=owner_id,
+            profile=profile,
+            subsystem=subsystem,
+            payload=payload,
+            summary=summary,
+            origin=origin,
+            approval_id=pid,
+        )
     except Exception as e:  # pragma: no cover - disk failure path
         logger.error("Failed to stage pending %s write: %s", subsystem, e, exc_info=True)
     return record
@@ -153,37 +207,45 @@ def stage_write(subsystem: str, payload: Dict[str, Any],
 
 def list_pending(subsystem: str) -> List[Dict[str, Any]]:
     """Return all pending records for ``subsystem``, oldest first."""
-    d = _pending_dir(subsystem)
-    if not d.exists():
-        return []
-    records: List[Dict[str, Any]] = []
-    for p in d.glob("*.json"):
-        try:
-            records.append(json.loads(p.read_text(encoding="utf-8")))
-        except Exception:
-            logger.warning("Skipping unreadable pending record: %s", p)
-    records.sort(key=lambda r: r.get("created_at", 0))
-    return records
+    owner_id, profile = current_write_approval_scope()
+    store = _approval_store()
+    store.migrate_legacy_json(
+        owner_id=owner_id,
+        profile=profile,
+        subsystem=subsystem,
+        pending_dir=_pending_dir(subsystem),
+    )
+    return store.list(
+        owner_id=owner_id,
+        profile=profile,
+        subsystem=subsystem,
+        states=("pending",),
+    )
 
 
 def get_pending(subsystem: str, pending_id: str) -> Optional[Dict[str, Any]]:
     """Return a single pending record by id, or None."""
-    path = _pending_dir(subsystem) / f"{pending_id}.json"
-    if not path.exists():
+    owner_id, profile = current_write_approval_scope()
+    record = _approval_store().get(
+        owner_id=owner_id, profile=profile, approval_id=pending_id
+    )
+    if record is None or record.get("subsystem") != subsystem:
         return None
-    try:
-        return json.loads(path.read_text(encoding="utf-8"))
-    except Exception:
-        return None
+    return record if record.get("state") == "pending" else None
 
 
 def discard_pending(subsystem: str, pending_id: str) -> bool:
-    """Delete a pending record. Returns True if it existed."""
-    path = _pending_dir(subsystem) / f"{pending_id}.json"
+    """Reject a pending record. Returns True if this caller won the CAS."""
+    owner_id, profile = current_write_approval_scope()
     try:
-        if path.exists():
-            path.unlink()
-            return True
+        record = _approval_store().get(
+            owner_id=owner_id, profile=profile, approval_id=pending_id
+        )
+        if record is None or record.get("subsystem") != subsystem:
+            return False
+        return _approval_store().discard_pending(
+            owner_id=owner_id, profile=profile, approval_id=pending_id
+        )
     except Exception as e:  # pragma: no cover
         logger.error("Failed to discard pending %s/%s: %s", subsystem, pending_id, e)
     return False
@@ -191,11 +253,8 @@ def discard_pending(subsystem: str, pending_id: str) -> bool:
 
 def pending_count(subsystem: str) -> int:
     """Cheap count of pending records (for notification badges)."""
-    d = _pending_dir(subsystem)
-    if not d.exists():
-        return 0
     try:
-        return sum(1 for _ in d.glob("*.json"))
+        return len(list_pending(subsystem))
     except Exception:
         return 0
 

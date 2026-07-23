@@ -216,7 +216,27 @@ def reconcile_deleted_owner_credentials() -> dict[str, Any]:
     if section.get("disabled") is True:
         return {"disabled": True, "config_cleared": True}
     username = _resolve("HERMES_DASHBOARD_BASIC_AUTH_USERNAME", section, "username")
-    if not username or _store().account_deletion_status(username) is None:
+    if not username:
+        return {"disabled": False, "config_cleared": False}
+    deleted = False
+    mobile_error: Exception | None = None
+    try:
+        deleted = _store().account_deletion_status(username) is not None
+    except Exception as exc:
+        # The intelligence tombstone is the first durable deletion intent. It
+        # must independently disable login even while mobile-auth.db is being
+        # restored or migrated.
+        mobile_error = exc
+    if not deleted:
+        try:
+            from hermes_cli.ios_intelligence import IOSIntelligenceStore
+
+            deleted = IOSIntelligenceStore().account_deletion_status(username) is not None
+        except Exception:
+            if mobile_error is not None:
+                raise mobile_error
+            raise
+    if not deleted:
         return {"disabled": False, "config_cleared": False}
     return delete_owner_account_credentials(username)
 

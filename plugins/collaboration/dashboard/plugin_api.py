@@ -32,7 +32,7 @@ from pathlib import Path
 from typing import Any, Callable, Optional
 from urllib.parse import quote, unquote
 
-from fastapi import APIRouter, HTTPException, Request
+from fastapi import APIRouter, Header, HTTPException, Request
 from fastapi.responses import FileResponse, StreamingResponse
 from pydantic import BaseModel, Field
 
@@ -71,6 +71,29 @@ from hermes_cli.config import get_hermes_home
 from hermes_cli.profiles import list_profiles
 
 
+_WRITE_APPROVAL_RECOVERY_INTERVAL_SECONDS = 5.0
+
+
+async def _run_mobile_write_approval_recovery_loop(stop: asyncio.Event) -> None:
+    while not stop.is_set():
+        try:
+            await asyncio.wait_for(
+                stop.wait(),
+                timeout=max(
+                    0.01, float(_WRITE_APPROVAL_RECOVERY_INTERVAL_SECONDS)
+                ),
+            )
+            return
+        except asyncio.TimeoutError:
+            pass
+        try:
+            await asyncio.to_thread(_recover_all_mobile_write_approvals)
+        except Exception:
+            logging.getLogger(__name__).exception(
+                "Failed to recover mobile write approvals"
+            )
+
+
 @asynccontextmanager
 async def collaboration_dashboard_lifespan(_app):
     """Resume persisted work as soon as the dashboard process starts."""
@@ -87,7 +110,21 @@ async def collaboration_dashboard_lifespan(_app):
         logging.getLogger(__name__).exception(
             "Failed to resume collaboration hosted workflows during startup"
         )
-    yield
+    try:
+        await asyncio.to_thread(_recover_all_mobile_write_approvals)
+    except Exception:
+        logging.getLogger(__name__).exception(
+            "Failed to recover mobile write approvals during startup"
+        )
+    recovery_stop = asyncio.Event()
+    recovery_task = asyncio.create_task(
+        _run_mobile_write_approval_recovery_loop(recovery_stop)
+    )
+    try:
+        yield
+    finally:
+        recovery_stop.set()
+        await asyncio.gather(recovery_task, return_exceptions=True)
 
 
 router = APIRouter(lifespan=collaboration_dashboard_lifespan)
@@ -109,6 +146,7 @@ _MOBILE_NOTIFICATION_TERMINAL_STATUSES = {
 }
 _HOSTED_TRANSIENT_RETRIES = 1
 _HOSTED_CHAT_API_ATTEMPTS = 5
+_HOSTED_CHAT_API_RETRY_DELAY_SECONDS = 60
 _HOSTED_CHAT_TIMEOUT_SECONDS = 10 * 60
 _HOSTED_REWORK_LIMIT = 2
 _HOSTED_EVENT_FLUSH_SECONDS = 0.45
@@ -181,6 +219,29 @@ _COMPLEX_WORK_MARKERS = (
     "服务器",
     "本地电脑",
     "dbb3",
+    "modify code",
+    "code change",
+    "fix failures",
+    "fix every failure",
+    "run tests",
+    "test suite",
+    "integration test",
+    "end-to-end",
+    "multi-step",
+    "multiple steps",
+    "database",
+    "server",
+    "migration",
+    "rollback",
+    "deployment",
+    "release",
+    "offline",
+    "background hosting",
+    "background task",
+    "concurrency",
+    "attachment upload",
+    "deliverable",
+    "complete implementation",
 )
 _SIMPLE_CHAT_MARKERS = (
     "你好",
@@ -194,7 +255,53 @@ _SIMPLE_CHAT_MARKERS = (
     "总结一下",
     "聊聊",
 )
-_MULTI_STEP_MARKERS = ("然后", "接着", "并且", "同时", "最后", "之后", "以及")
+_MULTI_STEP_MARKERS = (
+    "然后",
+    "接着",
+    "并且",
+    "同时",
+    "最后",
+    "之后",
+    "以及",
+    "and then",
+    "followed by",
+    "after that",
+    "finally",
+    "as well as",
+)
+_EXPLICIT_WORKFLOW_ROLE_MARKERS = ("worker", "reviewer", "reporter")
+_EXPLICIT_WORKFLOW_PHRASES = (
+    "group workflow",
+    "multi participant workflow",
+    "multi-participant workflow",
+    "real worker",
+    "群聊工作流",
+)
+_WORKFLOW_EXECUTION_MARKERS = (
+    "execute",
+    "run",
+    "start",
+    "create",
+    "implement",
+    "deploy",
+    "build",
+    "fix",
+    "test",
+    "produce",
+    "deliver",
+    "执行",
+    "运行",
+    "启动",
+    "创建",
+    "实现",
+    "部署",
+    "构建",
+    "修复",
+    "测试",
+    "完成",
+    "生成",
+    "交付",
+)
 _DIRECT_ARTIFACT_MARKERS = (
     "ppt",
     "pptx",
@@ -1123,6 +1230,7 @@ def create_single_conversation(
         "runtime_sessions": {},
         "runtime_runs": {},
         "hosted_turns": {},
+        "pending_turn_cancellations": {},
         "messages": [],
         "created_at": now,
         "updated_at": now,
@@ -1163,6 +1271,14 @@ def create_adopted_single_conversation(
         )
         source_meta = source.get("meta")
         meta = dict(source_meta) if isinstance(source_meta, dict) else {}
+        runtime_message_ids = [
+            int(item["id"])
+            for item in pending_assistant
+            if isinstance(item.get("id"), int) or str(item.get("id") or "").isdigit()
+        ]
+        meta["runtime_session_id"] = session_id
+        if runtime_message_ids:
+            meta["runtime_message_id"] = max(runtime_message_ids)
         if activities:
             meta["activities"] = activities
         if content or activities:
@@ -1194,11 +1310,20 @@ def create_adopted_single_conversation(
                 content=content,
                 status=str(source.get("status") or "completed"),
                 kind="message",
-                meta=(
-                    source.get("meta")
-                    if isinstance(source.get("meta"), dict)
-                    else None
-                ),
+                meta={
+                    **(
+                        source.get("meta")
+                        if isinstance(source.get("meta"), dict)
+                        else {}
+                    ),
+                    "runtime_session_id": session_id,
+                    **(
+                        {"runtime_message_id": int(source["id"])}
+                        if isinstance(source.get("id"), int)
+                        or str(source.get("id") or "").isdigit()
+                        else {}
+                    ),
+                },
             )
             timestamp = source.get("timestamp")
             if isinstance(timestamp, (int, float)) and timestamp > 0:
@@ -1285,6 +1410,53 @@ def _load_runtime_messages(profile: str, session_id: str) -> list[dict[str, Any]
             return []
         resolved = db.resolve_resume_session_id(resolved)
         return db.get_messages(resolved)
+    finally:
+        db.close()
+
+
+def _runtime_session_boundary(
+    profile: str,
+    session_id: str,
+    *,
+    after_message_id: int = 0,
+) -> dict[str, Any]:
+    """Return exact active-message boundaries from the authoritative SessionDB."""
+
+    from hermes_cli.profiles import get_profile_dir
+    from hermes_state import SessionDB
+
+    normalized = str(session_id or "").strip()
+    if not normalized:
+        return {"session_id": "", "user_message_id": None, "tip_message_id": None}
+    db_path = get_profile_dir(profile.strip() or "default") / "state.db"
+    if not db_path.exists():
+        return {"session_id": "", "user_message_id": None, "tip_message_id": None}
+    db = SessionDB(db_path=db_path, read_only=True)
+    try:
+        resolved = db.resolve_resume_session_id(normalized) or db.resolve_session_id(normalized)
+        if not resolved:
+            return {"session_id": "", "user_message_id": None, "tip_message_id": None}
+        messages = [
+            item
+            for item in db.get_messages(str(resolved))
+            if int(item.get("id") or 0) > max(0, int(after_message_id or 0))
+            and bool(item.get("active", 1))
+        ]
+        user_message = next(
+            (
+                item
+                for item in messages
+                if str(item.get("role") or "").strip().lower() == "user"
+            ),
+            None,
+        )
+        return {
+            "session_id": str(resolved),
+            "user_message_id": (
+                int(user_message["id"]) if user_message is not None else None
+            ),
+            "tip_message_id": int(messages[-1]["id"]) if messages else None,
+        }
     finally:
         db.close()
 
@@ -2219,11 +2391,23 @@ def _rule_based_user_intent(content: str) -> dict[str, Any]:
     multi_step_count = sum(
         lowered.count(marker) for marker in _MULTI_STEP_MARKERS
     )
+    explicit_role_count = sum(
+        1 for marker in _EXPLICIT_WORKFLOW_ROLE_MARKERS if marker in lowered
+    )
+    explicit_workflow = (
+        (
+            explicit_role_count >= 2
+            or any(marker in lowered for marker in _EXPLICIT_WORKFLOW_PHRASES)
+        )
+        and any(marker in lowered for marker in _WORKFLOW_EXECUTION_MARKERS)
+    )
     score = min(6, len(complex_matches) * 2)
     score += min(3, len(device_matches) * 2)
     score += min(3, multi_step_count)
     score += 1 if matched else 0
     score += 2 if len(text) >= 80 else 0
+    if explicit_workflow:
+        score = max(score, 4)
     if any(marker in lowered for marker in _SIMPLE_CHAT_MARKERS) and len(text) < 30:
         score -= 3
 
@@ -2589,6 +2773,144 @@ def _fail_hosted_turn_preflight(
     conversation["updated_at"] = now
 
 
+def _hosted_model_wait_state(
+    previous: Any,
+    *,
+    attempt: int,
+    now: int,
+    thinking: bool = False,
+) -> dict[str, Any]:
+    state = dict(previous) if isinstance(previous, dict) else {}
+    state.update(
+        {
+            "content": "",
+            "status": "streaming",
+            "actual_model": "",
+            "actual_provider": "",
+            "runtime_session_id": str(state.get("runtime_session_id") or ""),
+            "started_at": int(state.get("started_at") or now),
+            "first_token_at": 0,
+            "milestone_count": 0,
+            "milestone_content": "",
+            "request_accepted": False,
+        }
+    )
+    status_text = (
+        "正在思考"
+        if thinking
+        else f"正在重连 ({attempt}/{_HOSTED_CHAT_API_ATTEMPTS})"
+    )
+    state["activities"] = [
+        {
+            "id": f"model-readiness-{attempt if not thinking else 'ready'}",
+            "kind": "status",
+            "category": "other",
+            "name": "运行状态",
+            "output": status_text,
+            "status": "completed",
+            "started_at": now,
+            "ended_at": now,
+            "duration_ms": 0,
+        }
+    ]
+    return state
+
+
+def _wait_for_hosted_chat_model(
+    conversation_id: str,
+    turn_id: str,
+    profile: str,
+    *,
+    retry_delay_seconds: float = _HOSTED_CHAT_API_RETRY_DELAY_SECONDS,
+    sleeper: Callable[[float], None] = time.sleep,
+) -> bool:
+    """Persist and resume the five-attempt model-readiness state machine."""
+
+    while True:
+        if _finish_hosted_turn_if_cancelled(conversation_id, turn_id):
+            return False
+        with _STATE_LOCK:
+            state = load_single_state()
+            conversation = _conversation_by_id(state, conversation_id)
+            run = (conversation.get("hosted_turns") or {}).get(turn_id)
+            if not isinstance(run, dict) or run.get("status") in _HOSTED_TERMINAL_STATUSES:
+                return False
+            attempt = max(0, int(run.get("model_readiness_attempt") or 0))
+            next_attempt_at = max(0, int(run.get("model_readiness_next_attempt_at") or 0))
+            previous = (run.get("role_events") or {}).get("chat")
+        now_ms = int(time.time() * 1000)
+        if next_attempt_at > now_ms:
+            sleeper(min(1.0, max(0.0, (next_attempt_at - now_ms) / 1000)))
+            continue
+
+        readiness = profile_model_readiness(profile)
+        if readiness.get("ready"):
+            ready_state = _hosted_model_wait_state(
+                previous,
+                attempt=attempt,
+                now=now_ms,
+                thinking=True,
+            )
+            _persist_hosted_turn(
+                conversation_id,
+                turn_id,
+                patch={
+                    "model_readiness_next_attempt_at": 0,
+                    "model_readiness_recovered_at": now_ms,
+                },
+            )
+            _persist_hosted_role_state(
+                conversation_id,
+                turn_id,
+                profile=profile,
+                role_stage="chat",
+                role_label="Hermes",
+                state=ready_state,
+                content_fallback="",
+            )
+            return True
+
+        attempt += 1
+        retry_state = _hosted_model_wait_state(
+            previous,
+            attempt=attempt,
+            now=now_ms,
+        )
+        next_attempt_at = (
+            0
+            if attempt >= _HOSTED_CHAT_API_ATTEMPTS
+            else now_ms + int(max(0.0, retry_delay_seconds) * 1000)
+        )
+        _persist_hosted_turn(
+            conversation_id,
+            turn_id,
+            patch={
+                "model_readiness_attempt": attempt,
+                "model_readiness_next_attempt_at": next_attempt_at,
+            },
+        )
+        _persist_hosted_role_state(
+            conversation_id,
+            turn_id,
+            profile=profile,
+            role_stage="chat",
+            role_label="Hermes",
+            state=retry_state,
+            content_fallback="",
+        )
+        if attempt >= _HOSTED_CHAT_API_ATTEMPTS:
+            with _STATE_LOCK:
+                state = load_single_state()
+                conversation = _conversation_by_id(state, conversation_id)
+                run = (conversation.get("hosted_turns") or {}).get(turn_id)
+                if not isinstance(run, dict) or run.get("status") in _HOSTED_TERMINAL_STATUSES:
+                    return False
+                _fail_hosted_turn_preflight(conversation, run, readiness)
+                save_single_state(state)
+            _notify_hosted_update()
+            return False
+
+
 def _requires_local_ios_mcp(content: str) -> bool:
     lowered = str(content or "").strip().lower()
     explicit_mcp = "mcp" in lowered
@@ -2664,11 +2986,23 @@ def classify_user_intent(
     try:
         model_result = model_classifier(content.strip())
     except Exception:
+        logging.getLogger(__name__).warning(
+            "Intent routing model failed; using deterministic fallback",
+            exc_info=True,
+        )
         return routed
     if not isinstance(model_result, dict):
+        logging.getLogger(__name__).warning(
+            "Intent routing model returned %s instead of an object; using deterministic fallback",
+            type(model_result).__name__,
+        )
         return routed
     mode = str(model_result.get("mode") or "").strip().lower()
     if mode not in {"chat", "work"}:
+        logging.getLogger(__name__).warning(
+            "Intent routing model returned invalid mode %r; using deterministic fallback",
+            mode,
+        )
         return routed
     try:
         model_confidence = max(
@@ -2859,6 +3193,48 @@ def consume_profile_event_stream(
     return final_response
 
 
+_PROFILE_RETRY_STATUS_RE = re.compile(r"\((\d+)\s*/\s*(\d+)\)")
+_PROFILE_TERMINAL_STATUS_MARKERS = (
+    "api failed after",
+    "rate limited after",
+    "non-retryable error",
+    "max retries",
+)
+
+
+def _profile_status_event(kind: Any, text: Any) -> Optional[dict[str, Any]]:
+    """Normalize agent lifecycle callbacks for the hosted event protocol."""
+
+    status_text = str(text or kind or "").strip()
+    if not status_text:
+        return None
+    retry_match = _PROFILE_RETRY_STATUS_RE.search(status_text)
+    if retry_match and (
+        "重连" in status_text
+        or "retry" in status_text.lower()
+        or "reconnect" in status_text.lower()
+    ):
+        return {
+            "type": "connection.retry",
+            "payload": {
+                "attempt": int(retry_match.group(1)),
+                "max_attempts": int(retry_match.group(2)),
+            },
+        }
+    lowered = status_text.lower()
+    if status_text.startswith("❌") or any(
+        marker in lowered for marker in _PROFILE_TERMINAL_STATUS_MARKERS
+    ):
+        # message.complete is the single persisted terminal error. Emitting the
+        # lifecycle summary too creates a duplicate error row in the activity
+        # fold and briefly races the final assistant message in the client.
+        return None
+    return {
+        "type": "status.update",
+        "payload": {"status": str(kind or ""), "text": status_text},
+    }
+
+
 def _legacy_profile_turn(
     profile: str,
     prompt: str,
@@ -2914,9 +3290,13 @@ def run_profile_turn(
     kanban_task_id: Optional[str] = None,
     session_id: str = "",
     cancel_check: Optional[Callable[[], bool]] = None,
+    action: str = "chat",
+    focus_topic: str = "",
 ) -> str:
     """Run a profile through a structured JSONL child event channel."""
     if runner is not None:
+        if action != "chat":
+            raise ValueError("legacy profile runner only supports chat")
         return _legacy_profile_turn(
             profile,
             prompt,
@@ -2964,7 +3344,12 @@ def run_profile_turn(
         try:
             process.stdin.write(
                 json.dumps(
-                    {"prompt": prompt, "session_id": str(session_id or "").strip()},
+                    {
+                        "prompt": prompt,
+                        "session_id": str(session_id or "").strip(),
+                        "action": str(action or "chat").strip().lower(),
+                        "focus_topic": str(focus_topic or "").strip(),
+                    },
                     ensure_ascii=False,
                 )
             )
@@ -3005,7 +3390,9 @@ def run_profile_turn(
 
     try:
         response = consume_profile_event_stream(_iter_lines(), event_callback)
-        remaining = max(0.1, deadline - time.monotonic())
+        remaining = min(float(timeout), deadline - time.monotonic())
+        if remaining <= 0:
+            raise TimeoutError("Hermes profile execution timed out")
         return_code = process.wait(timeout=remaining)
     except Exception:
         if process.poll() is None:
@@ -3092,6 +3479,125 @@ def _new_activity_id(prefix: str, activities: list[dict[str, Any]]) -> str:
     return f"{prefix}-{int(time.time() * 1000)}-{len(activities) + 1}"
 
 
+_SUBAGENT_ID_FIELDS = ("child_session_id", "subagent_id", "task_id", "id")
+_SUBAGENT_STREAM_EVENTS = {"subagent.text", "subagent.thinking"}
+
+
+def _subagent_identity_values(payload: dict[str, Any]) -> list[str]:
+    values: list[str] = []
+    for field in _SUBAGENT_ID_FIELDS:
+        value = str(payload.get(field) or "").strip()
+        if value and value not in values:
+            values.append(value)
+    return values
+
+
+def _subagent_activity(
+    activities: list[dict[str, Any]],
+    payload: dict[str, Any],
+    name: str,
+) -> tuple[Optional[dict[str, Any]], list[str]]:
+    identities = _subagent_identity_values(payload)
+    if identities:
+        identity_set = set(identities)
+        for activity in reversed(activities):
+            if activity.get("kind") != "subagent":
+                continue
+            known = {
+                str(activity.get("id") or "").strip(),
+                *(
+                    str(value or "").strip()
+                    for value in activity.get("identity_ids") or []
+                ),
+            }
+            if identity_set.intersection(known):
+                return activity, identities
+        return None, identities
+
+    # Legacy progress events may not carry any identity. Reuse one existing
+    # activity instead of manufacturing a new row for every progress update.
+    same_name = [
+        activity
+        for activity in activities
+        if activity.get("kind") == "subagent" and activity.get("name") == name
+    ]
+    for activity in reversed(same_name):
+        if activity.get("status") == "running":
+            return activity, identities
+    return (same_name[-1] if same_name else None), identities
+
+
+def _append_subagent_event(
+    activity: dict[str, Any],
+    event_type: str,
+    payload: dict[str, Any],
+    text: str,
+    now: int,
+) -> None:
+    events = activity.setdefault("events", [])
+    if not isinstance(events, list):
+        events = []
+        activity["events"] = events
+
+    if (
+        event_type in _SUBAGENT_STREAM_EVENTS
+        and events
+        and isinstance(events[-1], dict)
+        and events[-1].get("type") == event_type
+    ):
+        event = events[-1]
+        event["text"] = _append_event_delta(str(event.get("text") or ""), text)
+        event["updated_at"] = now
+    else:
+        event: dict[str, Any] = {
+            "type": event_type,
+            "timestamp": int(payload.get("timestamp") or now),
+        }
+        if text:
+            event["text"] = text
+        tool_name = str(payload.get("tool_name") or "").strip()
+        if event_type == "subagent.tool":
+            tool_name = tool_name or str(payload.get("name") or "").strip()
+        if tool_name:
+            event["tool_name"] = tool_name
+        if payload.get("args") is not None:
+            event["args"] = payload.get("args")
+        status = str(payload.get("status") or "").strip()
+        if status:
+            event["status"] = status
+        events.append(event)
+
+    transcript: list[str] = []
+    for item in events:
+        if not isinstance(item, dict):
+            continue
+        item_text = _structured_text(item.get("text"))
+        item_type = str(item.get("type") or "")
+        if item_type == "subagent.tool":
+            tool_name = str(item.get("tool_name") or "tool")
+            args = _structured_text(item.get("args"))
+            detail = item_text or args
+            transcript.append(f"{tool_name}: {detail}" if detail else tool_name)
+        elif item_type == "subagent.complete":
+            if item_text:
+                transcript.append(f"Final: {item_text}")
+        elif item_text:
+            transcript.append(item_text)
+    activity["output"] = "\n".join(transcript)
+
+
+def _subagent_event_text(payload: dict[str, Any], *fields: str) -> str:
+    for field in fields:
+        value = payload.get(field)
+        if value is None or value == "":
+            continue
+        # Stream callbacks carry meaningful leading/trailing whitespace in
+        # string deltas. _structured_text intentionally strips it, so preserve
+        # raw strings here and only structure non-string payloads.
+        return value if isinstance(value, str) else _structured_text(value)
+    return ""
+
+
 def apply_profile_event(
     state: dict[str, Any],
     event: dict[str, Any],
@@ -3102,6 +3608,25 @@ def apply_profile_event(
     payload = payload if isinstance(payload, dict) else {}
     activities = state.setdefault("activities", [])
     now = int(time.time() * 1000)
+
+    text_started_execution = (
+        event_type in {"message.delta", "reasoning.delta", "reasoning.available"}
+        and bool(_structured_text(payload.get("text")))
+    )
+    tool_started_execution = event_type in {
+        "tool.generating",
+        "tool.progress",
+        "tool.start",
+        "tool.complete",
+    }
+    if (
+        (text_started_execution or tool_started_execution)
+        and not int(state.get("first_token_at") or 0)
+    ):
+        # Reasoning and tool-call tokens are model output too. Some models do
+        # not emit assistant text until after a long reasoning/tool phase, so
+        # waiting for message.delta leaves the client stuck in "thinking".
+        state["first_token_at"] = now
 
     if event_type in {"session.info", "request.accepted"}:
         state["runtime_session_id"] = str(
@@ -3146,8 +3671,6 @@ def apply_profile_event(
                     int(activity["ended_at"]) - int(activity["started_at"]),
                 )
     elif event_type == "message.delta":
-        if not int(state.get("first_token_at") or 0):
-            state["first_token_at"] = now
         for activity in reversed(activities):
             if activity.get("kind") == "reasoning" and activity.get("status") == "running":
                 activity["status"] = "completed"
@@ -3253,28 +3776,46 @@ def apply_profile_event(
             )
     elif event_type.startswith("subagent."):
         name = str(payload.get("name") or payload.get("model") or "子 Agent")
-        activity_id = str(payload.get("subagent_id") or "")
-        activity = _activity_by_id_or_name(activities, activity_id, name)
+        activity, identities = _subagent_activity(activities, payload, name)
         if activity is None:
             activity = {
-                "id": activity_id or _new_activity_id("subagent", activities),
+                "id": identities[0] if identities else _new_activity_id("subagent", activities),
                 "kind": "subagent",
                 "category": "subagent",
                 "name": name,
                 "input": _structured_text(payload.get("goal") or payload.get("args"))[:8000],
                 "output": "",
+                "events": [],
                 "status": "running",
                 "started_at": now,
                 "ended_at": None,
             }
             activities.append(activity)
-        text = _structured_text(
-            payload.get("text") or payload.get("preview") or payload.get("summary")
-        )
+        if identities:
+            known_identities = [
+                str(value or "").strip()
+                for value in activity.get("identity_ids") or []
+                if str(value or "").strip()
+            ]
+            for identity in identities:
+                if identity not in known_identities:
+                    known_identities.append(identity)
+            activity["identity_ids"] = known_identities
+            # child_session_id is the durable inspection target and therefore
+            # becomes the public activity id when it is available.
+            activity["id"] = identities[0]
+            if payload.get("child_session_id"):
+                activity["child_session_id"] = str(payload["child_session_id"])
+        if event_type == "subagent.complete":
+            text = _subagent_event_text(payload, "summary", "text", "preview")
+        else:
+            text = _subagent_event_text(payload, "text", "preview", "summary")
+        _append_subagent_event(activity, event_type, payload, text, now)
+        if text:
+            activity["preview"] = text[:1000]
         if event_type == "subagent.complete":
             activity.update(
                 {
-                    "output": text[-20_000:],
                     "status": "failed"
                     if str(payload.get("status") or "").lower() in {"failed", "error"}
                     else "completed",
@@ -3282,38 +3823,60 @@ def apply_profile_event(
                     "duration_ms": round(float(payload.get("duration_seconds") or 0) * 1000),
                 }
             )
-        else:
-            activity["preview"] = text[:1000]
     elif event_type == "status.update":
         text = _structured_text(payload.get("text") or payload.get("status"))
         if text:
-            activities.append(
-                {
-                    "id": _new_activity_id("status", activities),
+            activity = next(
+                (
+                    item
+                    for item in reversed(activities)
+                    if item.get("id") == "model-runtime-status"
+                ),
+                None,
+            )
+            if activity is None:
+                activity = {
+                    "id": "model-runtime-status",
                     "kind": "status",
                     "category": "other",
                     "name": "运行状态",
+                    "started_at": now,
+                }
+                activities.append(activity)
+            activity.update(
+                {
                     "output": text[:4000],
                     "status": "completed",
-                    "started_at": now,
                     "ended_at": now,
-                    "duration_ms": 0,
+                    "duration_ms": max(0, now - int(activity.get("started_at") or now)),
                 }
             )
     elif event_type == "connection.retry":
         attempt = max(1, int(payload.get("attempt") or 1))
         max_attempts = max(attempt, int(payload.get("max_attempts") or _HOSTED_CHAT_API_ATTEMPTS))
-        activities.append(
-            {
-                "id": _new_activity_id("retry", activities),
+        activity = next(
+            (
+                item
+                for item in reversed(activities)
+                if item.get("id") == "model-connection-retry"
+            ),
+            None,
+        )
+        if activity is None:
+            activity = {
+                "id": "model-connection-retry",
                 "kind": "status",
                 "category": "other",
                 "name": "运行状态",
+                "started_at": now,
+            }
+            activities.append(activity)
+        activity.update(
+            {
                 "output": f"正在重连 ({attempt}/{max_attempts})",
                 "status": "completed",
-                "started_at": now,
                 "ended_at": now,
-                "duration_ms": 0,
+                "duration_ms": max(0, now - int(activity.get("started_at") or now)),
             }
         )
     elif event_type == "message.complete":
@@ -3455,6 +4018,9 @@ def _persist_hosted_role_state(
         "milestone_count": int(state.get("milestone_count") or 0),
         "milestone_content": str(state.get("milestone_content") or ""),
         "request_accepted": bool(state.get("request_accepted")),
+        "runtime_message_before": int(state.get("runtime_message_before") or 0),
+        "runtime_user_message_id": state.get("runtime_user_message_id"),
+        "runtime_tip_message_id": state.get("runtime_tip_message_id"),
         "updated_at": now,
     }
     patch = {"role_events": {role_stage: snapshot}}
@@ -3494,6 +4060,7 @@ def _persist_hosted_role_state(
                 "runtime_session_id": str(
                     state.get("runtime_session_id") or ""
                 ).strip(),
+                "runtime_message_id": state.get("runtime_tip_message_id"),
             },
         },
     )
@@ -3527,6 +4094,9 @@ def _run_hosted_role(
         "milestone_count": 0,
         "milestone_content": "",
         "request_accepted": False,
+        "runtime_message_before": 0,
+        "runtime_user_message_id": None,
+        "runtime_tip_message_id": None,
     }
     if isinstance(previous_state, dict):
         state.update(
@@ -3549,6 +4119,15 @@ def _run_hosted_role(
                 "milestone_count": int(previous_state.get("milestone_count") or 0),
                 "milestone_content": str(previous_state.get("milestone_content") or ""),
                 "request_accepted": bool(previous_state.get("request_accepted")),
+                "runtime_message_before": int(
+                    previous_state.get("runtime_message_before") or 0
+                ),
+                "runtime_user_message_id": previous_state.get(
+                    "runtime_user_message_id"
+                ),
+                "runtime_tip_message_id": previous_state.get(
+                    "runtime_tip_message_id"
+                ),
             }
         )
     if (
@@ -3693,6 +4272,15 @@ def _run_hosted_role(
     attempts = 1 if runner is run_profile_turn else _HOSTED_TRANSIENT_RETRIES + 1
     for attempt in range(1, attempts + 1):
         try:
+            boundary_profile = runtime_profile or profile
+            if not int(state.get("runtime_message_before") or 0):
+                before = _runtime_session_boundary(
+                    boundary_profile,
+                    str(state.get("runtime_session_id") or ""),
+                )
+                state["runtime_message_before"] = int(
+                    before.get("tip_message_id") or 0
+                )
             result = _invoke_profile_runner(
                 runner,
                 runtime_profile or profile,
@@ -3704,6 +4292,15 @@ def _run_hosted_role(
             ).strip()
             if not result:
                 raise RuntimeError("Hermes profile returned an empty response")
+            boundary = _runtime_session_boundary(
+                boundary_profile,
+                str(state.get("runtime_session_id") or ""),
+                after_message_id=int(state.get("runtime_message_before") or 0),
+            )
+            if boundary.get("session_id"):
+                state["runtime_session_id"] = str(boundary["session_id"])
+            state["runtime_user_message_id"] = boundary.get("user_message_id")
+            state["runtime_tip_message_id"] = boundary.get("tip_message_id")
             state["content"] = result
             state["status"] = "completed"
             state["activities"] = _remove_duplicate_reasoning_activities(
@@ -4377,6 +4974,7 @@ def _persist_hosted_turn(
     patch: Optional[dict[str, Any]] = None,
     message: Optional[dict[str, Any]] = None,
     runtime_session: Optional[tuple[str, str]] = None,
+    source_message_meta: Optional[dict[str, Any]] = None,
 ) -> dict[str, Any]:
     with _STATE_LOCK:
         state = load_single_state()
@@ -4462,6 +5060,36 @@ def _persist_hosted_turn(
                     str(runtime_profile or "default"),
                     str(runtime_session_id),
                 )
+        if source_message_meta:
+            source_id = next(
+                (
+                    str(record.get("message_id") or "")
+                    for record in (conversation.get("enqueue_requests") or {}).values()
+                    if isinstance(record, dict)
+                    and str(record.get("turn_id") or "") == turn_id
+                ),
+                "",
+            )
+            source_message = next(
+                (
+                    item
+                    for item in conversation.get("messages") or []
+                    if isinstance(item, dict)
+                    and str(item.get("id") or "") == source_id
+                ),
+                None,
+            )
+            if source_message is not None:
+                source_message["meta"] = {
+                    **(
+                        source_message.get("meta")
+                        if isinstance(source_message.get("meta"), dict)
+                        else {}
+                    ),
+                    **source_message_meta,
+                }
+                source_message["updated_at"] = now
+                _project_native_message(source_message)
         if message:
             message_meta = dict(message.get("meta") or {})
             message_meta.setdefault("runtime_turn_id", turn_id)
@@ -4738,7 +5366,28 @@ def request_hosted_turn_cancellation(
         conversation = _conversation_by_id(state, conversation_id)
         run = (conversation.get("hosted_turns") or {}).get(turn_id)
         if not isinstance(run, dict):
-            raise RuntimeError("托管任务记录不存在")
+            now = int(time.time() * 1000)
+            pending = conversation.get("pending_turn_cancellations")
+            if not isinstance(pending, dict):
+                pending = {}
+                conversation["pending_turn_cancellations"] = pending
+            pending[turn_id] = {
+                "turn_id": turn_id,
+                "cancel_requested": True,
+                "cancel_reason": str(reason or "用户取消").strip() or "用户取消",
+                "cancel_requested_at": now,
+                "updated_at": now,
+            }
+            if len(pending) > 2000:
+                oldest = sorted(
+                    pending,
+                    key=lambda key: int((pending.get(key) or {}).get("updated_at") or 0),
+                )[: len(pending) - 2000]
+                for key in oldest:
+                    pending.pop(key, None)
+            conversation["updated_at"] = now
+            save_single_state(state)
+            return dict(pending[turn_id])
         if run.get("status") in _HOSTED_TERMINAL_STATUSES:
             return dict(run)
         now = int(time.time() * 1000)
@@ -4883,6 +5532,8 @@ def execute_hosted_chat(
     turn_id: str,
     *,
     runner: Callable[[str, str], str] = run_profile_turn,
+    model_retry_delay_seconds: float = _HOSTED_CHAT_API_RETRY_DELAY_SECONDS,
+    model_retry_sleeper: Callable[[float], None] = time.sleep,
 ) -> None:
     """Run a durable simple turn through exactly one default Hermes."""
     with _STATE_LOCK:
@@ -4901,12 +5552,6 @@ def execute_hosted_chat(
         profile = selected_profiles[0] if selected_profiles else str(
             conversation.get("profile") or "default"
         )
-        if runner is run_profile_turn:
-            readiness = profile_model_readiness(profile)
-            if not readiness["ready"]:
-                _fail_hosted_turn_preflight(conversation, run, readiness)
-                save_single_state(state)
-                return
         now = int(time.time() * 1000)
         run.update({
             "status": "running",
@@ -4922,6 +5567,25 @@ def execute_hosted_chat(
         run = dict(run)
     if _finish_hosted_turn_if_cancelled(conversation_id, turn_id):
         return
+    if runner is run_profile_turn:
+        if not _wait_for_hosted_chat_model(
+            conversation_id,
+            turn_id,
+            profile,
+            retry_delay_seconds=model_retry_delay_seconds,
+            sleeper=model_retry_sleeper,
+        ):
+            return
+        with _STATE_LOCK:
+            state = load_single_state()
+            conversation = _conversation_by_id(state, conversation_id)
+            refreshed_run = (conversation.get("hosted_turns") or {}).get(turn_id)
+            if not isinstance(refreshed_run, dict):
+                return
+            if refreshed_run.get("status") in _HOSTED_TERMINAL_STATUSES:
+                return
+            conversation_snapshot = dict(conversation)
+            run = dict(refreshed_run)
     content = str(run.get("content") or "").strip()
     selected_profiles = [
         str(item).strip() for item in run.get("profiles") or [] if str(item).strip()
@@ -5011,6 +5675,13 @@ def execute_hosted_chat(
             profile,
             str(_role_state.get("runtime_session_id") or "").strip(),
         ),
+        source_message_meta={
+            "profile": profile,
+            "runtime_session_id": str(
+                _role_state.get("runtime_session_id") or ""
+            ).strip(),
+            "runtime_message_id": _role_state.get("runtime_user_message_id"),
+        },
         message={
             "role": "assistant",
             "name": profile,
@@ -5032,6 +5703,7 @@ def execute_hosted_chat(
                 "runtime_session_id": str(
                     _role_state.get("runtime_session_id") or ""
                 ).strip(),
+                "runtime_message_id": _role_state.get("runtime_tip_message_id"),
             },
         },
     )
@@ -7260,6 +7932,8 @@ async def upload_conversation_attachment(
             mime_type=request.headers.get("content-type", ""),
             allowed_roots=[uploads_dir],
         )
+    except PermissionError as exc:
+        raise HTTPException(status_code=410, detail="Account was deleted") from exc
     finally:
         temp.unlink(missing_ok=True)
     return {"attachment": _library_attachment(record)}
@@ -7715,11 +8389,6 @@ def enqueue_hosted_turn(
         ),
         requested_artifact=bool(route.get("artifact_required")),
     )
-    model_readiness = (
-        profile_model_readiness(selected_profiles[0])
-        if mode == "chat"
-        else {"ready": True}
-    )
     output_dir = _hosted_turn_output_dir(conversation_id, turn_id).resolve()
     delivery_context = payload.delivery_context.strip()
     if artifact_required:
@@ -7834,11 +8503,30 @@ def enqueue_hosted_turn(
                 output_dir=str(output_dir),
                 attachment_ids=attachment_ids,
             )
-            if not model_readiness["ready"]:
-                _fail_hosted_turn_preflight(
-                    conversation,
-                    hosted,
-                    model_readiness,
+            pending_cancellations = conversation.get("pending_turn_cancellations")
+            pending_cancellations = (
+                pending_cancellations
+                if isinstance(pending_cancellations, dict)
+                else {}
+            )
+            pending_cancellation = pending_cancellations.pop(turn_id, None)
+            if isinstance(pending_cancellation, dict):
+                now = int(time.time() * 1000)
+                hosted.update(
+                    {
+                        "status": "cancelled",
+                        "stage": "cancelled",
+                        "cancel_requested": True,
+                        "cancel_reason": str(
+                            pending_cancellation.get("cancel_reason") or "用户取消"
+                        ),
+                        "cancel_requested_at": int(
+                            pending_cancellation.get("cancel_requested_at") or now
+                        ),
+                        "cancelled_at": now,
+                        "completed_at": now,
+                        "updated_at": now,
+                    }
                 )
             if conversation.get("title") in {"", "新对话", None}:
                 conversation["title"] = summarize_task_title(message_content)
@@ -7850,7 +8538,7 @@ def enqueue_hosted_turn(
                 "message_id": message_id,
                 "route_message_id": route_message_id,
                 "route": route,
-                "accepted": bool(model_readiness["ready"]),
+                "accepted": not isinstance(pending_cancellation, dict),
                 "created_at": now,
             }
             requests[request_id] = request_record
@@ -7929,11 +8617,6 @@ def create_hosted_turn(
         ),
         requested_artifact=payload.artifact_required,
     )
-    model_readiness = (
-        profile_model_readiness(selected_profiles[0])
-        if mode == "chat"
-        else {"ready": True}
-    )
     attachment_ids = list(
         dict.fromkeys(str(item).strip() for item in payload.attachment_ids)
     )
@@ -7979,8 +8662,6 @@ def create_hosted_turn(
             output_dir=str(output_dir),
             attachment_ids=attachment_ids,
         )
-        if not model_readiness["ready"]:
-            _fail_hosted_turn_preflight(conversation, run, model_readiness)
         save_single_state(state)
     if attachment_ids:
         _file_library().update_links(
@@ -8574,11 +9255,19 @@ def _profile_event_runner_main() -> int:
     try:
         request_payload = json.loads(sys.stdin.read() or "{}")
         prompt = _structured_text(request_payload.get("prompt"))
+        runner_action = _structured_text(
+            request_payload.get("action") or "chat"
+        ).strip().lower()
+        focus_topic = _structured_text(request_payload.get("focus_topic")).strip()
         requested_session_id = _structured_text(
             request_payload.get("session_id")
         ).strip()
-        if not prompt:
+        if runner_action not in {"chat", "compress"}:
+            raise ValueError("unsupported profile runner action")
+        if runner_action == "chat" and not prompt:
             raise ValueError("任务内容为空")
+        if runner_action == "compress" and not requested_session_id:
+            raise ValueError("session_id is required for compression")
 
         os.environ["HERMES_YOLO_MODE"] = "1"
         os.environ["HERMES_ACCEPT_HOOKS"] = "1"
@@ -8586,8 +9275,15 @@ def _profile_event_runner_main() -> int:
         from hermes_cli.env_loader import load_hermes_dotenv
         from hermes_cli.fallback_config import get_fallback_chain
         from hermes_cli.runtime_provider import resolve_runtime_provider
+        from gateway.session_context import declare_stateless_channel
         from hermes_state import SessionDB
         from run_agent import AIAgent
+
+        # This process exits as soon as the hosted turn finishes and therefore
+        # has no channel capable of delivering a detached subagent completion.
+        # Force delegate_task onto its synchronous path before AIAgent snapshots
+        # runtime capabilities, otherwise background child results are lost.
+        declare_stateless_channel()
 
         load_hermes_dotenv(hermes_home=os.environ.get("HERMES_HOME"))
         cfg = load_config()
@@ -8602,7 +9298,7 @@ def _profile_event_runner_main() -> int:
             and server.get("enabled", True) is not False
             and name in enabled_toolsets
         )
-        if managed_mcp_servers:
+        if managed_mcp_servers and runner_action == "chat":
             prompt = (
                 f"{prompt}\n\nRuntime MCP capabilities currently connected: "
                 f"{', '.join(managed_mcp_servers)}. When the user needs current "
@@ -8692,6 +9388,11 @@ def _profile_event_runner_main() -> int:
                 },
             )
 
+        def status_update(kind: Any, text: Any = None) -> None:
+            event = _profile_status_event(kind, text)
+            if event is not None:
+                emit(event["type"], event["payload"])
+
         session_db = SessionDB()
         resolved_session_id = ""
         conversation_history: list[dict[str, Any]] = []
@@ -8738,10 +9439,7 @@ def _profile_event_runner_main() -> int:
             tool_gen_callback=lambda name: emit(
                 "tool.generating", {"name": str(name or "工具调用")}
             ),
-            status_callback=lambda kind, text=None: emit(
-                "status.update",
-                {"status": str(kind), "text": str(text or kind)},
-            ),
+            status_callback=status_update,
         )
         if resolved_session_id:
             agent._session_db_created = True
@@ -8770,6 +9468,49 @@ def _profile_event_runner_main() -> int:
                 ),
             },
         )
+        if runner_action == "compress":
+            if not resolved_session_id:
+                raise ValueError("session was not found")
+            if len(conversation_history) < 4:
+                raise ValueError("not enough conversation to compress")
+            if not bool(getattr(agent, "compression_enabled", False)):
+                raise ValueError("compression is disabled for this profile")
+            from agent.model_metadata import estimate_request_tokens_rough
+
+            approx_tokens = estimate_request_tokens_rough(
+                conversation_history,
+                system_prompt=getattr(agent, "_cached_system_prompt", "") or "",
+                tools=getattr(agent, "tools", None) or None,
+            )
+            with open(os.devnull, "w", encoding="utf-8") as devnull:
+                with redirect_stdout(devnull), redirect_stderr(devnull):
+                    compressed, _ = agent._compress_context(
+                        conversation_history,
+                        None,
+                        approx_tokens=approx_tokens,
+                        focus_topic=focus_topic or None,
+                        force=True,
+                    )
+                    if (
+                        getattr(agent, "session_id", None)
+                        and agent.session_id != resolved_session_id
+                    ):
+                        agent._flush_messages_to_session_db(compressed, None)
+            new_session_id = str(getattr(agent, "session_id", "") or "").strip()
+            if not new_session_id or new_session_id == resolved_session_id:
+                raise RuntimeError("compression did not create a continuation session")
+            emit(
+                "message.complete",
+                {
+                    "text": "Context compression completed",
+                    "status": "completed",
+                    "session_id": new_session_id,
+                    "previous_session_id": resolved_session_id,
+                    "message_count": len(compressed),
+                    "previous_message_count": len(conversation_history),
+                },
+            )
+            return 0
         with open(os.devnull, "w", encoding="utf-8") as devnull:
             with redirect_stdout(devnull), redirect_stderr(devnull):
                 result = agent.run_conversation(
@@ -9090,6 +9831,9 @@ async def upload_account_file(request: Request):
         )
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
+    upload_id = str(request.headers.get("x-upload-id") or "").strip()
+    if not re.fullmatch(r"[A-Za-z0-9._:-]{8,256}", upload_id):
+        raise HTTPException(status_code=422, detail="Invalid X-Upload-ID")
     incoming = _file_library().root / "incoming"
     incoming.mkdir(parents=True, exist_ok=True)
     temp = incoming / f".{uuid.uuid4().hex}.upload"
@@ -9103,14 +9847,29 @@ async def upload_account_file(request: Request):
                 if total > _MAX_ATTACHMENT_BYTES:
                     raise HTTPException(status_code=413, detail="文件不能超过 64 MB")
                 handle.write(chunk)
+        actual_sha = hashlib.sha256(temp.read_bytes()).hexdigest()
+        origin_key = f"account-upload:{upload_id}"
+        existing = _file_library().get_file_by_origin(owner_id, origin_key)
+        if (
+            existing is not None
+            and existing.get("status") == "available"
+            and str(existing.get("sha256") or "") != actual_sha
+        ):
+            raise HTTPException(
+                status_code=409,
+                detail="X-Upload-ID was already used with different content",
+            )
         record = _file_library().ingest_file(
             owner_id,
             temp,
             name=filename,
             source="user_upload",
+            origin_key=origin_key,
             mime_type=request.headers.get("content-type", ""),
             allowed_roots=[incoming],
         )
+    except PermissionError as exc:
+        raise HTTPException(status_code=410, detail="Account was deleted") from exc
     finally:
         temp.unlink(missing_ok=True)
     if record is None:
@@ -9199,6 +9958,868 @@ def delete_account_file(file_id: str, request: Request):
     if not deleted:
         raise HTTPException(status_code=404, detail="File not found")
     return {"ok": True, "id": file_id}
+
+
+# ---------------------------------------------------------------------------
+# Mobile P0 operations facade
+# ---------------------------------------------------------------------------
+
+
+class MobileSessionForkBody(BaseModel):
+    profile: str = "default"
+    at_message_id: int = Field(gt=0)
+    expected_tip_id: int = Field(gt=0)
+    idempotency_key: str = Field(min_length=8, max_length=256)
+    title: str = Field(default="", max_length=100)
+
+
+class MobileConversationForkBody(BaseModel):
+    profile: str = ""
+    idempotency_key: str = Field(min_length=8, max_length=256)
+    title: str = Field(default="", max_length=100)
+
+
+class MobileConversationCompressBody(BaseModel):
+    profile: str = ""
+    idempotency_key: str = Field(min_length=8, max_length=256)
+    focus_topic: str = Field(default="", max_length=500)
+
+
+class MobileWriteApprovalDecisionBody(BaseModel):
+    profile: str = "default"
+    expected_revision: int = Field(gt=0)
+    decision: str
+
+
+class MobileHostedRetryBody(BaseModel):
+    request_id: str = Field(min_length=8, max_length=256)
+
+
+def _mobile_profile_home(profile: str) -> tuple[str, Path]:
+    from hermes_cli.profiles import normalize_profile_name, resolve_profile_env
+
+    try:
+        normalized = normalize_profile_name(profile or "default")
+        return normalized, Path(resolve_profile_env(normalized))
+    except (FileNotFoundError, ValueError) as exc:
+        raise HTTPException(status_code=404, detail="Profile not found") from exc
+
+
+def _mobile_owned_conversations(owner_id: str) -> list[dict[str, Any]]:
+    with _STATE_LOCK:
+        state = load_single_state()
+        return [
+            conversation
+            for conversation in (state.get("conversations") or [])
+            if isinstance(conversation, dict)
+            and not conversation.get("delete_requested")
+            and str(conversation.get("owner_id") or "").strip() == owner_id
+        ]
+
+
+def _mobile_owned_session_ids(owner_id: str, profile: str) -> set[str]:
+    result: set[str] = set()
+    for conversation in _mobile_owned_conversations(owner_id):
+        conversation_profile = str(conversation.get("profile") or "default").lower()
+        sessions = conversation.get("runtime_sessions") or {}
+        if isinstance(sessions, dict):
+            value = sessions.get(profile)
+            if str(value or "").strip():
+                result.add(str(value).strip())
+        runs = conversation.get("runtime_runs") or {}
+        if isinstance(runs, dict):
+            run = runs.get(profile)
+            if isinstance(run, dict) and str(run.get("session_id") or "").strip():
+                result.add(str(run["session_id"]).strip())
+        if conversation_profile != profile:
+            continue
+        for hosted in (conversation.get("hosted_turns") or {}).values():
+            if not isinstance(hosted, dict):
+                continue
+            for key in ("runtime_session_id", "session_id"):
+                if str(hosted.get(key) or "").strip():
+                    result.add(str(hosted[key]).strip())
+    return result
+
+
+def _mobile_session_facade(
+    request: Request, profile: str, session_id: str,
+):
+    from hermes_cli.account_session_facade import AccountSessionFacade
+
+    owner_id = owner_id_from_request(request)
+    normalized, home = _mobile_profile_home(profile)
+    facade = AccountSessionFacade(home, normalized)
+    if not facade.is_bound(owner_id=owner_id, session_id=session_id):
+        if session_id not in _mobile_owned_session_ids(owner_id, normalized):
+            raise HTTPException(status_code=404, detail="Session not found")
+        if not facade.bind_existing(owner_id=owner_id, session_id=session_id):
+            raise HTTPException(status_code=404, detail="Session not found")
+    return owner_id, normalized, facade
+
+
+def _mobile_session_error(exc: Exception) -> HTTPException:
+    from hermes_cli.account_session_facade import (
+        SessionForkConflict,
+        SessionNotFound,
+        SessionScopeDenied,
+    )
+
+    if isinstance(exc, SessionForkConflict):
+        return HTTPException(status_code=409, detail=str(exc))
+    if isinstance(exc, (SessionNotFound, SessionScopeDenied)):
+        return HTTPException(status_code=404, detail="Session not found")
+    if isinstance(exc, ValueError):
+        return HTTPException(status_code=422, detail=str(exc))
+    return HTTPException(status_code=500, detail="Session operation failed")
+
+
+def _mobile_conversation_session(
+    request: Request,
+    conversation_id: str,
+    requested_profile: str = "",
+) -> tuple[str, str, str, Any, dict[str, Any]]:
+    """Resolve an account conversation to its current authoritative session."""
+
+    owner_id = owner_id_from_request(request)
+    with _STATE_LOCK:
+        state = load_single_state()
+        conversation, claimed = _owned_conversation_in_state(
+            state, conversation_id, owner_id
+        )
+        profile = (
+            str(requested_profile or "").strip()
+            or str(conversation.get("profile") or "default").strip()
+            or "default"
+        )
+        session_id = str(
+            (conversation.get("runtime_sessions") or {}).get(profile)
+            or (
+                conversation.get("official_session_id")
+                if str(conversation.get("official_profile") or profile) == profile
+                else ""
+            )
+            or ""
+        ).strip()
+        if claimed:
+            save_single_state(state)
+        snapshot = json.loads(json.dumps(conversation, ensure_ascii=False))
+    if not session_id:
+        raise HTTPException(status_code=409, detail="Conversation has no runtime session")
+    try:
+        _owner, normalized, facade = _mobile_session_facade(
+            request, profile, session_id
+        )
+        resolved = str(
+            facade.db.resolve_resume_session_id(session_id) or session_id
+        ).strip()
+        if resolved != session_id:
+            if not facade.bind_existing(owner_id=owner_id, session_id=resolved):
+                raise HTTPException(status_code=404, detail="Session not found")
+            with _STATE_LOCK:
+                state = load_single_state()
+                current, _claimed = _owned_conversation_in_state(
+                    state, conversation_id, owner_id
+                )
+                set_conversation_runtime_session(current, normalized, resolved)
+                save_single_state(state)
+                snapshot = json.loads(json.dumps(current, ensure_ascii=False))
+            session_id = resolved
+        return owner_id, normalized, session_id, facade, snapshot
+    except HTTPException:
+        raise
+    except Exception as exc:
+        raise _mobile_session_error(exc) from exc
+
+
+def _public_mobile_lineage(lineage: dict[str, Any]) -> dict[str, Any]:
+    fields = (
+        "id",
+        "title",
+        "parent_session_id",
+        "source",
+        "model",
+        "profile_name",
+        "started_at",
+        "ended_at",
+        "end_reason",
+        "message_count",
+        "tool_call_count",
+    )
+    return {
+        "current_session_id": lineage.get("current_session_id"),
+        "roots": list(lineage.get("roots") or []),
+        "edges": list(lineage.get("edges") or []),
+        "sessions": [
+            {key: item.get(key) for key in fields}
+            for item in lineage.get("sessions") or []
+            if isinstance(item, dict)
+        ],
+    }
+
+
+@router.get("/mobile/conversations/{conversation_id}/session-state")
+def mobile_conversation_session_state(
+    conversation_id: str,
+    request: Request,
+    profile: str = "",
+):
+    owner_id, normalized, session_id, facade, conversation = (
+        _mobile_conversation_session(request, conversation_id, profile)
+    )
+    try:
+        context = facade.context(owner_id=owner_id, session_id=session_id)
+        lineage = _public_mobile_lineage(
+            facade.lineage(owner_id=owner_id, session_id=session_id)
+        )
+    except Exception as exc:
+        raise _mobile_session_error(exc) from exc
+    branchable = []
+    for message in conversation.get("messages") or []:
+        if not isinstance(message, dict):
+            continue
+        meta = message.get("meta")
+        meta = meta if isinstance(meta, dict) else {}
+        runtime_message_id = meta.get("runtime_message_id")
+        runtime_session_id = str(meta.get("runtime_session_id") or "").strip()
+        if not runtime_session_id or not str(runtime_message_id or "").isdigit():
+            continue
+        branchable.append(
+            {
+                "message_id": str(message.get("id") or ""),
+                "role": str(message.get("role") or ""),
+                "runtime_session_id": runtime_session_id,
+                "runtime_message_id": int(runtime_message_id),
+            }
+        )
+    return {
+        "conversation_id": conversation_id,
+        "profile": normalized,
+        "session_id": session_id,
+        "context": context,
+        "lineage": lineage,
+        "branchable_messages": branchable,
+    }
+
+
+@router.post("/mobile/conversations/{conversation_id}/messages/{message_id}/fork")
+def mobile_fork_conversation_message(
+    conversation_id: str,
+    message_id: str,
+    body: MobileConversationForkBody,
+    request: Request,
+):
+    owner_id, normalized, _current_session_id, _facade, conversation = (
+        _mobile_conversation_session(request, conversation_id, body.profile)
+    )
+    messages = [
+        item
+        for item in conversation.get("messages") or []
+        if isinstance(item, dict)
+    ]
+    source_index = next(
+        (index for index, item in enumerate(messages) if str(item.get("id") or "") == message_id),
+        -1,
+    )
+    if source_index < 0:
+        raise HTTPException(status_code=404, detail="Message not found")
+    source = messages[source_index]
+    meta = source.get("meta")
+    meta = meta if isinstance(meta, dict) else {}
+    source_session_id = str(meta.get("runtime_session_id") or "").strip()
+    runtime_message_id = meta.get("runtime_message_id")
+    if not source_session_id or not str(runtime_message_id or "").isdigit():
+        raise HTTPException(status_code=409, detail="Message has no runtime branch boundary")
+    try:
+        _owner, _profile, facade = _mobile_session_facade(
+            request, normalized, source_session_id
+        )
+        source_context = facade.context(
+            owner_id=owner_id, session_id=source_session_id
+        )
+        forked = facade.fork(
+            owner_id=owner_id,
+            source_session_id=source_session_id,
+            at_message_id=int(runtime_message_id),
+            expected_tip_id=int(source_context.get("tip_message_id") or 0),
+            idempotency_key=body.idempotency_key,
+            title=body.title,
+        )
+    except Exception as exc:
+        raise _mobile_session_error(exc) from exc
+
+    child_session = dict(forked["session"])
+    digest = hashlib.sha256(
+        f"{owner_id}\0{conversation_id}\0{body.idempotency_key}".encode("utf-8")
+    ).hexdigest()[:24]
+    child_conversation_id = f"chat_branch_{digest}"
+    created = False
+    with _STATE_LOCK:
+        state = load_single_state()
+        existing = next(
+            (
+                item
+                for item in state.get("conversations") or []
+                if isinstance(item, dict) and item.get("id") == child_conversation_id
+            ),
+            None,
+        )
+        if existing is not None:
+            existing_owner = str(existing.get("owner_id") or "").strip()
+            if existing_owner != owner_id:
+                raise HTTPException(status_code=404, detail="Conversation not found")
+            child_conversation = existing
+        else:
+            child_conversation = create_single_conversation(
+                normalized,
+                str(child_session.get("title") or body.title or "Branch"),
+            )
+            child_conversation.update(
+                {
+                    "id": child_conversation_id,
+                    "owner_id": owner_id,
+                    "parent_conversation_id": conversation_id,
+                    "branch_point_message_id": message_id,
+                    "branch_source_session_id": source_session_id,
+                    "branch_at_runtime_message_id": int(runtime_message_id),
+                    "messages": json.loads(
+                        json.dumps(messages[: source_index + 1], ensure_ascii=False)
+                    ),
+                }
+            )
+            set_conversation_runtime_session(
+                child_conversation, normalized, str(child_session["id"])
+            )
+            state["conversations"].insert(0, child_conversation)
+            save_single_state(state)
+            created = True
+    return {
+        "conversation": _public_conversation(child_conversation),
+        "created": created,
+        "session": child_session,
+        "replayed": bool(forked.get("replayed")),
+    }
+
+
+@router.post("/mobile/conversations/{conversation_id}/compress")
+def mobile_compress_conversation(
+    conversation_id: str,
+    body: MobileConversationCompressBody,
+    request: Request,
+):
+    owner_id, normalized, session_id, facade, _conversation = (
+        _mobile_conversation_session(request, conversation_id, body.profile)
+    )
+    fingerprint = hashlib.sha256(
+        json.dumps(
+            {
+                "conversation_id": conversation_id,
+                "profile": normalized,
+                "focus_topic": body.focus_topic.strip(),
+            },
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode("utf-8")
+    ).hexdigest()
+    with _STATE_LOCK:
+        state = load_single_state()
+        conversation, _claimed = _owned_conversation_in_state(
+            state, conversation_id, owner_id
+        )
+        if any(
+            isinstance(run, dict)
+            and str(run.get("status") or "") not in _HOSTED_TERMINAL_STATUSES
+            for run in (conversation.get("hosted_turns") or {}).values()
+        ):
+            raise HTTPException(status_code=409, detail="Conversation is currently running")
+        requests = conversation.setdefault("compression_requests", {})
+        existing = requests.get(body.idempotency_key)
+        if isinstance(existing, dict):
+            if str(existing.get("fingerprint") or "") != fingerprint:
+                raise HTTPException(
+                    status_code=409,
+                    detail="idempotency key was reused with a different request",
+                )
+            if existing.get("state") == "complete" and isinstance(existing.get("response"), dict):
+                return {**existing["response"], "replayed": True}
+            if existing.get("state") == "running":
+                raise HTTPException(status_code=409, detail="Compression is already running")
+        requests[body.idempotency_key] = {
+            "fingerprint": fingerprint,
+            "state": "running",
+            "started_at": int(time.time() * 1000),
+        }
+        save_single_state(state)
+
+    completion: dict[str, Any] = {}
+
+    def capture(event: dict[str, Any]) -> None:
+        if event.get("type") == "message.complete":
+            completion.update(event.get("payload") or {})
+
+    try:
+        result = run_profile_turn(
+            normalized,
+            "",
+            session_id=session_id,
+            event_callback=capture,
+            action="compress",
+            focus_topic=body.focus_topic,
+        )
+        new_session_id = str(completion.get("session_id") or "").strip()
+        if not new_session_id or not facade.bind_existing(
+            owner_id=owner_id, session_id=new_session_id
+        ):
+            raise RuntimeError("compressed continuation session was not persisted")
+        context = facade.context(owner_id=owner_id, session_id=new_session_id)
+        response = {
+            "conversation_id": conversation_id,
+            "profile": normalized,
+            "previous_session_id": session_id,
+            "session_id": new_session_id,
+            "context": context,
+            "result": result,
+            "replayed": False,
+        }
+    except Exception as exc:
+        with _STATE_LOCK:
+            state = load_single_state()
+            conversation, _claimed = _owned_conversation_in_state(
+                state, conversation_id, owner_id
+            )
+            record = (conversation.get("compression_requests") or {}).get(
+                body.idempotency_key
+            )
+            if isinstance(record, dict):
+                record.update(
+                    {
+                        "state": "failed",
+                        "error": sanitize_runtime_error(exc),
+                        "updated_at": int(time.time() * 1000),
+                    }
+                )
+                save_single_state(state)
+        raise _mobile_session_error(exc) from exc
+
+    with _STATE_LOCK:
+        state = load_single_state()
+        conversation, _claimed = _owned_conversation_in_state(
+            state, conversation_id, owner_id
+        )
+        set_conversation_runtime_session(conversation, normalized, new_session_id)
+        record = (conversation.get("compression_requests") or {}).get(
+            body.idempotency_key
+        )
+        if isinstance(record, dict):
+            record.update(
+                {
+                    "state": "complete",
+                    "response": response,
+                    "updated_at": int(time.time() * 1000),
+                }
+            )
+        save_single_state(state)
+    return response
+
+
+@router.post("/mobile/sessions/{session_id}/fork")
+def mobile_fork_session(
+    session_id: str,
+    body: MobileSessionForkBody,
+    request: Request,
+):
+    owner_id, _profile, facade = _mobile_session_facade(
+        request, body.profile, session_id
+    )
+    try:
+        return facade.fork(
+            owner_id=owner_id,
+            source_session_id=session_id,
+            at_message_id=body.at_message_id,
+            expected_tip_id=body.expected_tip_id,
+            idempotency_key=body.idempotency_key,
+            title=body.title,
+        )
+    except Exception as exc:
+        raise _mobile_session_error(exc) from exc
+
+
+@router.get("/mobile/sessions/{session_id}/lineage")
+def mobile_session_lineage(
+    session_id: str,
+    request: Request,
+    profile: str = "default",
+):
+    owner_id, _profile, facade = _mobile_session_facade(
+        request, profile, session_id
+    )
+    try:
+        return facade.lineage(owner_id=owner_id, session_id=session_id)
+    except Exception as exc:
+        raise _mobile_session_error(exc) from exc
+
+
+@router.get("/mobile/sessions/{session_id}/context")
+def mobile_session_context(
+    session_id: str,
+    request: Request,
+    profile: str = "default",
+):
+    owner_id, _profile, facade = _mobile_session_facade(
+        request, profile, session_id
+    )
+    try:
+        return facade.context(owner_id=owner_id, session_id=session_id)
+    except Exception as exc:
+        raise _mobile_session_error(exc) from exc
+
+
+def _mobile_approval_store(profile: str):
+    from hermes_cli.account_write_approvals import AccountWriteApprovalStore
+
+    normalized, home = _mobile_profile_home(profile)
+    return normalized, home, AccountWriteApprovalStore(
+        home / "write-approvals.db"
+    )
+
+
+@router.get("/mobile/write-approvals")
+def mobile_list_write_approvals(
+    request: Request,
+    profile: str = "default",
+    subsystem: str = "",
+    include_terminal: bool = False,
+    limit: int = 200,
+):
+    owner_id = owner_id_from_request(request)
+    normalized, home, store = _mobile_approval_store(profile)
+    for kind in ("memory", "skills"):
+        store.migrate_legacy_json(
+            owner_id=owner_id,
+            profile=normalized,
+            subsystem=kind,
+            pending_dir=home / "pending" / kind,
+        )
+    _recover_mobile_write_approvals(
+        normalized,
+        store=store,
+        owner_id=owner_id,
+    )
+    states = (
+        ("pending", "applying", "applied", "rejected", "expired", "failed")
+        if include_terminal
+        else ("pending", "applying")
+    )
+    try:
+        records = store.list(
+            owner_id=owner_id,
+            profile=normalized,
+            subsystem=subsystem or None,
+            states=states,
+            limit=limit,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+    return {"profile": normalized, "approvals": records}
+
+
+@router.get("/mobile/write-approvals/{approval_id}")
+def mobile_get_write_approval(
+    approval_id: str,
+    request: Request,
+    profile: str = "default",
+):
+    from tools.write_approval import skill_pending_diff
+
+    owner_id = owner_id_from_request(request)
+    normalized, _home, store = _mobile_approval_store(profile)
+    record = store.get(
+        owner_id=owner_id, profile=normalized, approval_id=approval_id
+    )
+    if record is None:
+        raise HTTPException(status_code=404, detail="Approval not found")
+    if record.get("subsystem") == "skills":
+        record["diff"] = skill_pending_diff(record)
+    else:
+        record["diff"] = json.dumps(
+            record.get("payload") or {}, ensure_ascii=False, indent=2
+        )
+    return {"approval": record}
+
+
+def _mobile_write_approval_context(
+    *,
+    profile: str,
+    record: dict[str, Any],
+    prepare: bool,
+    plan: Optional[dict[str, Any]] = None,
+) -> Any:
+    from hermes_constants import reset_hermes_home_override, set_hermes_home_override
+    from tools import write_approval as wa
+
+    normalized, home = _mobile_profile_home(profile)
+    owner_id = str(record["owner_id"])
+    scope_tokens = wa.set_write_approval_scope(owner_id, normalized)
+    home_token = set_hermes_home_override(str(home))
+    try:
+        from hermes_cli.account_write_approval_apply import (
+            apply_write_approval,
+            prepare_write_approval,
+        )
+
+        if prepare:
+            return prepare_write_approval(record)
+        return apply_write_approval(record, dict(plan or {}))
+    except Exception as exc:
+        if prepare:
+            raise
+        return False, str(exc)
+    finally:
+        reset_hermes_home_override(home_token)
+        wa.reset_write_approval_scope(scope_tokens)
+
+
+def _finish_mobile_write_approval_claim(
+    *,
+    profile: str,
+    store: Any,
+    record: dict[str, Any],
+) -> dict[str, Any]:
+    owner_id = str(record["owner_id"])
+    token = str(record.get("decision_token") or "")
+    effect_key = str(record.get("effect_key") or "")
+    payload = record.get("payload")
+    if not isinstance(payload, dict):
+        raise ValueError("approval payload is invalid")
+    success, error = store.execute_effect(
+        owner_id=owner_id,
+        profile=profile,
+        approval_id=str(record["id"]),
+        decision_token=token,
+        effect_key=effect_key,
+        payload=payload,
+        prepare=lambda: _mobile_write_approval_context(
+            profile=profile,
+            record=record,
+            prepare=True,
+        ),
+        apply=lambda plan: _mobile_write_approval_context(
+            profile=profile,
+            record=record,
+            prepare=False,
+            plan=plan,
+        ),
+    )
+    return store.finish_apply(
+        owner_id=owner_id,
+        profile=profile,
+        approval_id=str(record["id"]),
+        decision_token=token,
+        success=success,
+        error=error,
+    )
+
+
+def _recover_mobile_write_approvals(
+    profile: str,
+    *,
+    store: Any = None,
+    owner_id: str = "",
+    limit: int = 20,
+) -> int:
+    from hermes_cli.account_write_approvals import ApprovalAccountDeleted
+
+    normalized, _home, selected_store = (
+        (profile, None, store) if store is not None else _mobile_approval_store(profile)
+    )
+    recovered = 0
+    scopes = (
+        [(str(owner_id), normalized)]
+        if str(owner_id or "").strip()
+        else selected_store.recoverable_apply_scopes()
+    )
+    remaining = max(1, int(limit))
+    for scope_owner, scope_profile in scopes:
+        while remaining > 0:
+            try:
+                records = selected_store.claim_recoverable_applies(
+                    owner_id=scope_owner,
+                    profile=scope_profile,
+                    limit=1,
+                )
+            except ApprovalAccountDeleted:
+                break
+            if not records:
+                break
+            record = records[0]
+            remaining -= 1
+            try:
+                _finish_mobile_write_approval_claim(
+                    profile=scope_profile,
+                    store=selected_store,
+                    record=record,
+                )
+                recovered += 1
+            except Exception:
+                logging.getLogger(__name__).exception(
+                    "Failed to recover write approval %s", record.get("id")
+                )
+    return recovered
+
+
+def _recover_all_mobile_write_approvals() -> int:
+    recovered = 0
+    for profile in list_profiles():
+        try:
+            recovered += _recover_mobile_write_approvals(profile.name)
+        except Exception:
+            logging.getLogger(__name__).exception(
+                "Failed to scan write approvals for profile %s", profile.name
+            )
+    return recovered
+
+
+@router.post("/mobile/write-approvals/{approval_id}/decision")
+def mobile_decide_write_approval(
+    approval_id: str,
+    body: MobileWriteApprovalDecisionBody,
+    request: Request,
+    idempotency_key: str | None = Header(default=None, alias="Idempotency-Key"),
+):
+    from hermes_cli.account_write_approvals import ApprovalConflict
+
+    owner_id = owner_id_from_request(request)
+    normalized, _home, store = _mobile_approval_store(body.profile)
+    try:
+        record = store.claim_decision(
+            owner_id=owner_id,
+            profile=normalized,
+            approval_id=approval_id,
+            expected_revision=body.expected_revision,
+            decision=body.decision,
+            decision_by=owner_id,
+            idempotency_key=(
+                str(idempotency_key or "").strip()
+                or f"mobile:{approval_id}:{body.decision}:{body.expected_revision}"
+            ),
+        )
+    except ApprovalConflict as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+    if body.decision.strip().lower() == "reject":
+        return {"approval": record}
+    if not record.get("_claim_acquired"):
+        return {"approval": record}
+    try:
+        record = _finish_mobile_write_approval_claim(
+            profile=normalized,
+            store=store,
+            record=record,
+        )
+    except ApprovalConflict as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    return {"approval": record}
+
+
+@router.post(
+    "/single/conversations/{conversation_id}/hosted-turns/{turn_id}/retry"
+)
+def retry_hosted_turn(
+    conversation_id: str,
+    turn_id: str,
+    body: MobileHostedRetryBody,
+    request: Request,
+):
+    """Create one durable retry attempt without rewriting the terminal run."""
+
+    owner_id = owner_id_from_request(request)
+    request_id = body.request_id.strip()
+    with _STATE_LOCK:
+        state = load_single_state()
+        conversation, _claimed = _owned_conversation_in_state(
+            state, conversation_id, owner_id
+        )
+        retries = conversation.get("hosted_retry_requests")
+        if not isinstance(retries, dict):
+            retries = {}
+            conversation["hosted_retry_requests"] = retries
+        replay_turn_id = str(retries.get(request_id) or "")
+        if replay_turn_id:
+            replay = (conversation.get("hosted_turns") or {}).get(replay_turn_id)
+            if not isinstance(replay, dict):
+                raise HTTPException(status_code=409, detail="Retry result is missing")
+            result = dict(replay)
+            should_start = False
+        else:
+            source = (conversation.get("hosted_turns") or {}).get(turn_id)
+            if not isinstance(source, dict):
+                raise HTTPException(status_code=404, detail="Hosted run not found")
+            if str(source.get("status") or "") not in {"failed", "cancelled"}:
+                raise HTTPException(status_code=409, detail="Hosted run is not retryable")
+            retry_turn_id = f"{turn_id}.retry.{uuid.uuid4().hex[:12]}"
+            result = create_hosted_turn_record(
+                conversation,
+                turn_id=retry_turn_id,
+                content=str(source.get("content") or ""),
+                title=str(source.get("title") or ""),
+                profiles=list(source.get("profiles") or []),
+                artifact_required=bool(source.get("artifact_required")),
+                attachment_context=str(source.get("attachment_context") or ""),
+                delivery_context=str(source.get("delivery_context") or ""),
+                user_delivery_context=str(source.get("user_delivery_context") or ""),
+                mode=str(source.get("mode") or "work"),
+                route_metadata=dict(source.get("route_metadata") or {}),
+                output_dir=str(_hosted_turn_output_dir(conversation_id, retry_turn_id)),
+                attachment_ids=list(source.get("attachment_ids") or []),
+            )
+            result["retry_of"] = turn_id
+            result["retry_attempt"] = int(source.get("retry_attempt") or 0) + 1
+            retries[request_id] = retry_turn_id
+            save_single_state(state)
+            result = dict(result)
+            should_start = True
+    if should_start:
+        start_hosted_workflow(conversation_id, str(result["turn_id"]))
+    return {"hosted_turn": _public_hosted_turn(result)}
+
+
+@router.get("/mobile/runtime-runs")
+def mobile_runtime_runs(
+    request: Request,
+    profile: str = "default",
+    limit: int = 200,
+):
+    from hermes_cli.account_runtime_aggregate import aggregate_account_runtime
+
+    owner_id = owner_id_from_request(request)
+    normalized, home = _mobile_profile_home(profile)
+    conversations = _mobile_owned_conversations(owner_id)
+    for conversation in conversations:
+        reconcile_stale_hosted_turns(conversation)
+    return aggregate_account_runtime(
+        owner_id=owner_id,
+        profile=normalized,
+        profile_home=home,
+        conversations=conversations,
+        limit=limit,
+    )
+
+
+@router.get("/mobile/runtime-runs/{run_id}")
+def mobile_runtime_run_detail(
+    run_id: str,
+    request: Request,
+    profile: str = "default",
+):
+    payload = mobile_runtime_runs(request=request, profile=profile, limit=500)
+    run = next(
+        (item for item in payload.get("runs", []) if str(item.get("id") or "") == run_id),
+        None,
+    )
+    if run is None:
+        raise HTTPException(status_code=404, detail="Runtime run not found")
+    return {"run": run, "sources": payload.get("sources", {})}
 
 
 if __name__ == "__main__" and "--profile-event-runner" in sys.argv:

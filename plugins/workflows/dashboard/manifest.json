@@ -1,0 +1,14 @@
+{
+  "name": "workflows",
+  "label": "工作流",
+  "description": "Versioned Hermes workflows compiled to durable Kanban execution.",
+  "icon": "Zap",
+  "version": "1.0.0",
+  "tab": {
+    "path": "/workflows",
+    "position": "after:kanban"
+  },
+  "entry": "",
+  "css": null,
+  "api": "plugin_api.py"
+}

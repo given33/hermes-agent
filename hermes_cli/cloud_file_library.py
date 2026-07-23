@@ -26,10 +26,11 @@ from hermes_cli.config import get_hermes_home
 from hermes_cli.sqlite_util import write_txn
 
 
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 3
 LOCAL_OWNER_ID = "local-owner"
 FILE_SOURCES = frozenset({"user_upload", "model_output"})
 FILE_STATUSES = frozenset({"uploading", "available", "failed"})
+INSTALL_INTENT_RECOVERY_AGE_MS = 15 * 60 * 1000
 _SOURCE_ALIASES = {
     "user": "user_upload",
     "upload": "user_upload",
@@ -141,6 +142,22 @@ CREATE TABLE IF NOT EXISTS deleted_file_origins (
     deleted_at      INTEGER NOT NULL,
     PRIMARY KEY(owner_id, origin_key)
 );
+
+CREATE TABLE IF NOT EXISTS deleted_file_owners (
+    owner_id        TEXT PRIMARY KEY,
+    deleted_at      INTEGER NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS file_install_intents (
+    id                  TEXT PRIMARY KEY,
+    owner_id            TEXT NOT NULL,
+    file_id             TEXT NOT NULL,
+    target_relpath      TEXT NOT NULL,
+    expected_sha256     TEXT NOT NULL,
+    created_at          INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_file_install_intents_owner
+    ON file_install_intents(owner_id, created_at);
 """
 
 
@@ -282,6 +299,7 @@ class CloudFileLibrary:
         self._clock_ms = clock_ms or (lambda: int(time.time() * 1000))
         self._lock = threading.RLock()
         self._schema_ready = False
+        self._last_temp_recovery_ms = 0
 
     @contextmanager
     def connection(self) -> Iterator[sqlite3.Connection]:
@@ -290,20 +308,22 @@ class CloudFileLibrary:
         conn = sqlite3.connect(str(self.db_path), timeout=30.0, isolation_level=None)
         conn.row_factory = sqlite3.Row
         conn.execute("PRAGMA busy_timeout=30000")
-        conn.execute("PRAGMA journal_mode=WAL")
         conn.execute("PRAGMA foreign_keys=ON")
         with self._lock:
+            current = int(conn.execute("PRAGMA user_version").fetchone()[0])
+            if current > SCHEMA_VERSION:
+                conn.close()
+                raise RuntimeError(
+                    "Cloud file library was created by a newer Hermes version "
+                    f"(schema {current} > {SCHEMA_VERSION})"
+                )
+            conn.execute("PRAGMA journal_mode=WAL")
             if not self._schema_ready:
                 conn.executescript(_SCHEMA_SQL)
-                current = int(conn.execute("PRAGMA user_version").fetchone()[0])
-                if current > SCHEMA_VERSION:
-                    conn.close()
-                    raise RuntimeError(
-                        "Cloud file library was created by a newer Hermes version "
-                        f"(schema {current} > {SCHEMA_VERSION})"
-                    )
                 conn.execute(f"PRAGMA user_version={SCHEMA_VERSION}")
                 self._schema_ready = True
+            self._recover_install_intents(conn)
+            self._recover_stale_temps()
         try:
             yield conn
         finally:
@@ -320,13 +340,121 @@ class CloudFileLibrary:
     def _owner_bucket(self, owner_id: str) -> str:
         return hashlib.sha256(owner_id.encode("utf-8")).hexdigest()[:32]
 
-    def _destination(self, owner_id: str, file_id: str, filename: str) -> tuple[Path, str]:
-        relative = Path("objects") / self._owner_bucket(owner_id) / file_id / filename
+    def _destination(
+        self,
+        owner_id: str,
+        file_id: str,
+        filename: str,
+        digest: str,
+    ) -> tuple[Path, str]:
+        # Immutable content revisions keep the prior indexed object valid if
+        # the process exits after installing new bytes but before committing
+        # the SQLite metadata switch.
+        relative = (
+            Path("objects")
+            / self._owner_bucket(owner_id)
+            / file_id
+            / f"{digest[:20]}-{filename}"
+        )
         target = (self.root / relative).resolve()
         root = self.root.resolve()
         if not target.is_relative_to(root):
             raise ValueError("File storage path escapes the account library")
         return target, relative.as_posix()
+
+    def _recover_install_intents(self, conn: sqlite3.Connection) -> None:
+        """Remove unindexed installed objects left by a process exit."""
+
+        intents = conn.execute(
+            "SELECT * FROM file_install_intents WHERE created_at<=?",
+            (self._clock_ms() - INSTALL_INTENT_RECOVERY_AGE_MS,),
+        ).fetchall()
+        objects_root = self.objects_root.resolve()
+        for intent in intents:
+            relative = str(intent["target_relpath"] or "")
+            target = (self.root / relative).resolve()
+            if target.is_relative_to(objects_root):
+                indexed = conn.execute(
+                    "SELECT stored_relpath,sha256 FROM account_files "
+                    "WHERE id=? AND owner_id=?",
+                    (str(intent["file_id"]), str(intent["owner_id"])),
+                ).fetchone()
+                installed_is_current = (
+                    indexed is not None
+                    and str(indexed["stored_relpath"] or "") == relative
+                    and str(indexed["sha256"] or "")
+                    == str(intent["expected_sha256"] or "")
+                )
+                if not installed_is_current:
+                    target.unlink(missing_ok=True)
+                    self._remove_empty_object_parents(target)
+            conn.execute(
+                "DELETE FROM file_install_intents WHERE id=?",
+                (str(intent["id"]),),
+            )
+
+    def _recover_stale_temps(self) -> None:
+        now = self._clock_ms()
+        if now - self._last_temp_recovery_ms < INSTALL_INTENT_RECOVERY_AGE_MS:
+            return
+        self._last_temp_recovery_ms = now
+        root = self.objects_root.resolve()
+        if not root.exists():
+            return
+        cutoff_seconds = (now - INSTALL_INTENT_RECOVERY_AGE_MS) / 1000
+        for candidate in root.rglob(".upload-*"):
+            try:
+                resolved = candidate.resolve(strict=True)
+                if (
+                    resolved.is_relative_to(root)
+                    and resolved.is_file()
+                    and resolved.stat().st_mtime <= cutoff_seconds
+                ):
+                    resolved.unlink(missing_ok=True)
+                    self._remove_empty_object_parents(resolved)
+            except (FileNotFoundError, OSError):
+                continue
+
+    def _remove_empty_object_parents(self, target: Path) -> None:
+        root = self.objects_root.resolve()
+        parent = target.parent
+        while parent != root and parent.is_relative_to(root):
+            try:
+                parent.rmdir()
+            except OSError:
+                break
+            parent = parent.parent
+
+    def _abandon_install_intent(
+        self,
+        intent_id: str,
+        relative: str,
+        target: Path,
+    ) -> None:
+        """Drop one failed install without deleting another writer's object."""
+
+        with self.connection() as conn, write_txn(conn):
+            conn.execute("DELETE FROM file_install_intents WHERE id=?", (intent_id,))
+            indexed = conn.execute(
+                "SELECT 1 FROM account_files WHERE stored_relpath=? LIMIT 1",
+                (relative,),
+            ).fetchone()
+            pending = conn.execute(
+                "SELECT 1 FROM file_install_intents WHERE target_relpath=? LIMIT 1",
+                (relative,),
+            ).fetchone()
+            if indexed is None and pending is None:
+                target.unlink(missing_ok=True)
+                self._remove_empty_object_parents(target)
+
+    @staticmethod
+    def _ensure_owner_active(conn: sqlite3.Connection, owner_id: str) -> None:
+        deleted = conn.execute(
+            "SELECT 1 FROM deleted_file_owners WHERE owner_id=?",
+            (owner_id,),
+        ).fetchone()
+        if deleted is not None:
+            raise PermissionError("account file boundary was deleted")
 
     @staticmethod
     def _validate_source_path(
@@ -392,6 +520,7 @@ class CloudFileLibrary:
             "origin_key": self._clean_metadata(origin_key, 1024),
         }
         with self._lock, self.connection() as conn, write_txn(conn):
+            self._ensure_owner_active(conn, owner_id)
             existing = None
             if file_id:
                 existing = self._select_owned(conn, owner_id, file_id)
@@ -498,6 +627,7 @@ class CloudFileLibrary:
 
         with self._lock:
             with self.connection() as conn:
+                self._ensure_owner_active(conn, owner_id)
                 if metadata["origin_key"]:
                     tombstone = conn.execute(
                         """
@@ -544,20 +674,42 @@ class CloudFileLibrary:
                 else:
                     file_id = file_id or f"file_{uuid.uuid4().hex}"
 
-            target, relative = self._destination(owner_id, file_id, name)
+            target, relative = self._destination(
+                owner_id,
+                file_id,
+                name,
+                digest,
+            )
             target.parent.mkdir(parents=True, exist_ok=True)
             # Keep the atomic sibling temp short enough for Windows MAX_PATH
             # when pytest or a user chooses a deeply nested HERMES_HOME.
             temp = target.with_name(f".upload-{uuid.uuid4().hex[:12]}")
             old_relative = str(existing["stored_relpath"] or "") if existing else ""
+            intent_id = f"install_{uuid.uuid4().hex}"
             try:
                 with source_path.open("rb") as source_handle, temp.open("xb") as target_handle:
                     shutil.copyfileobj(source_handle, target_handle, length=1024 * 1024)
                     target_handle.flush()
                     os.fsync(target_handle.fileno())
+                with self.connection() as conn, write_txn(conn):
+                    self._ensure_owner_active(conn, owner_id)
+                    conn.execute(
+                        "INSERT INTO file_install_intents("
+                        "id,owner_id,file_id,target_relpath,expected_sha256,created_at"
+                        ") VALUES(?,?,?,?,?,?)",
+                        (
+                            intent_id,
+                            owner_id,
+                            file_id,
+                            relative,
+                            digest,
+                            self._clock_ms(),
+                        ),
+                    )
                 os.replace(temp, target)
                 now = self._clock_ms()
                 with self.connection() as conn, write_txn(conn):
+                    self._ensure_owner_active(conn, owner_id)
                     if existing is None:
                         conn.execute(
                             """
@@ -627,7 +779,21 @@ class CloudFileLibrary:
                             "DELETE FROM deleted_file_origins WHERE owner_id=? AND origin_key=?",
                             (owner_id, metadata["origin_key"]),
                         )
+                    conn.execute(
+                        "DELETE FROM file_install_intents WHERE id=?",
+                        (intent_id,),
+                    )
                     row = self._select_owned(conn, owner_id, file_id)
+            except BaseException:
+                # Handles ordinary failures immediately. A hard process exit is
+                # recovered from the durable intent on the next open.
+                try:
+                    self._abandon_install_intent(intent_id, relative, target)
+                except Exception:
+                    # The durable intent remains recoverable if cleanup itself
+                    # loses the database or filesystem during error unwinding.
+                    pass
+                raise
             finally:
                 temp.unlink(missing_ok=True)
 
@@ -833,12 +999,7 @@ class CloudFileLibrary:
         except ValueError:
             return
         target.unlink(missing_ok=True)
-        parent = target.parent
-        if parent != self.objects_root.resolve():
-            try:
-                parent.rmdir()
-            except OSError:
-                pass
+        self._remove_empty_object_parents(target)
 
     def delete_file(self, owner_id: str, file_id: str) -> bool:
         owner_id = normalize_owner_id(owner_id)
@@ -922,6 +1083,11 @@ class CloudFileLibrary:
             raise ValueError("Account object bucket escapes the library")
         with self._lock:
             with self.connection() as conn, write_txn(conn):
+                conn.execute(
+                    "INSERT INTO deleted_file_owners(owner_id,deleted_at) VALUES(?,?) "
+                    "ON CONFLICT(owner_id) DO UPDATE SET deleted_at=excluded.deleted_at",
+                    (owner_id, self._clock_ms()),
+                )
                 file_count = int(conn.execute(
                     "SELECT COUNT(*) FROM account_files WHERE owner_id=?",
                     (owner_id,),
@@ -932,6 +1098,7 @@ class CloudFileLibrary:
                 ).fetchone()[0])
                 conn.execute("DELETE FROM account_files WHERE owner_id=?", (owner_id,))
                 conn.execute("DELETE FROM deleted_file_origins WHERE owner_id=?", (owner_id,))
+                conn.execute("DELETE FROM file_install_intents WHERE owner_id=?", (owner_id,))
             objects_removed = int(bucket.exists())
             if bucket.exists():
                 shutil.rmtree(bucket)

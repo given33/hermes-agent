@@ -14,6 +14,10 @@ from utils import fast_safe_load
 _MODEL_CONFIG_SECTIONS = ("model", "fallback_model", "auxiliary")
 
 
+class AccountOperationalCleanupPending(RuntimeError):
+    """Account-owned runtime work is still draining durable cancellation."""
+
+
 def purge_account_owned_cloud_data(owner_id: str) -> dict[str, Any]:
     """Purge collaboration content and model configuration for one owner.
 
@@ -33,6 +37,60 @@ def purge_account_owned_cloud_data(owner_id: str) -> dict[str, Any]:
     return {
         "collaboration": delete_owner_account_data(normalized),
         "models": purge_owner_model_configuration(normalized),
+        "operational": purge_owner_operational_state(normalized),
+    }
+
+
+def purge_owner_operational_state(owner_id: str) -> dict[str, Any]:
+    """Remove account-scoped approvals, session branches, and workflows."""
+
+    normalized = str(owner_id or "").strip()
+    if not normalized:
+        raise ValueError("owner_id is required")
+
+    from hermes_cli.account_session_facade import AccountSessionFacade
+    from hermes_cli.account_write_approvals import AccountWriteApprovalStore
+    from plugins.workflows.store import WorkflowStore
+
+    profile_roots: list[tuple[Path, str]] = []
+    visited: set[Path] = set()
+    for profile in list_profiles():
+        root = Path(profile.path).resolve()
+        if root in visited:
+            continue
+        visited.add(root)
+        profile_roots.append((root, str(profile.name or "default")))
+
+    active_root = Path(get_hermes_home()).resolve()
+    if active_root not in visited:
+        profile_roots.append((active_root, "default"))
+
+    approvals = {"rows": 0, "migrations": 0}
+    session_branches = {"branch_sessions": 0, "fork_records": 0, "bindings": 0}
+    workflows = {"definitions": 0, "runs": 0}
+    for root, profile_name in profile_roots:
+        approval_result = AccountWriteApprovalStore(
+            root / "write-approvals.db"
+        ).delete_owner(normalized)
+        for key, value in approval_result.items():
+            approvals[key] = approvals.get(key, 0) + int(value)
+
+        branch_result = AccountSessionFacade(root, profile_name).delete_owner(normalized)
+        for key, value in branch_result.items():
+            session_branches[key] = session_branches.get(key, 0) + int(value)
+
+        workflow_result = WorkflowStore(root / "workflows.db").delete_account(normalized)
+        for key, value in workflow_result.items():
+            workflows[key] = workflows.get(key, 0) + int(value)
+    pending_cancellations = int(workflows.get("pending_cancellations", 0))
+    if pending_cancellations:
+        raise AccountOperationalCleanupPending(
+            f"{pending_cancellations} workflow cancellation(s) are still pending"
+        )
+    return {
+        "write_approvals": approvals,
+        "session_facade": session_branches,
+        "workflows": workflows,
     }
 
 

@@ -212,6 +212,12 @@ done
 # file changes. A legacy installation without the route is permitted exactly
 # one bootstrap; the same authenticated contract is mandatory after restart.
 health_url="${HERMES_CONNECTOR_HEALTH_URL:-http://127.0.0.2:9119/api/plugins/collaboration/connector/health}"
+health_curl_proxy_args=()
+case "${health_url}" in
+  http://127.*|https://127.*|http://localhost/*|https://localhost/*|http://\[::1\]/*|https://\[::1\]/*)
+    health_curl_proxy_args=(--noproxy '*')
+    ;;
+esac
 connector_id="${HERMES_CONNECTOR_ID:-dbb3-primary}"
 token_file="${HERMES_COLLABORATION_CONNECTOR_TOKEN_FILE:-}"
 env_file="${HERMES_AGENT_ENV_FILE:-/etc/hermes-agent/hermes-agent.env}"
@@ -267,6 +273,7 @@ config_target="${HERMES_CONFIG_FILE:-${runtime_home}/config.yaml}"
 ios_supervisor_target="${runtime_home}/ios-mcp-supervisor.db"
 ios_database_target="${runtime_home}/ios-intelligence.db"
 mobile_auth_target="${runtime_home}/dashboard/mobile-auth.db"
+cloud_files_database_target="${runtime_home}/collaboration/account-files/library.sqlite3"
 if [[ "${ios_enabled}" == 1 ]]; then
   ios_database_target="$("${runtime_python}" - "${config_target}" "${runtime_home}" "${service_home}" <<'PY'
 import pathlib
@@ -313,6 +320,7 @@ validate_connector_health() {
   local output="$1"
   local require_identity="${2:-1}"
   curl --fail --silent --show-error --max-time 8 \
+    "${health_curl_proxy_args[@]}" \
     --config "${curl_cfg}" -o "${output}" "${health_url}" \
     && "${runtime_python}" - "${output}" "${connector_id}" "${require_identity}" <<'PY'
 import json, sys
@@ -343,6 +351,15 @@ services = runtime.get("services") or []
 assert len(services) == 21
 assert sum(len(item.get("tools") or []) for item in services) == 44
 assert all(item.get("ok") is True for item in services)
+assert all(item.get("contract_ok") is True for item in services)
+assert all(
+    sorted(item.get("tools") or []) == sorted(item.get("expected_tools") or [])
+    for item in services
+)
+assert all(
+    set(item.get("granted_scopes") or []).issubset(item.get("declared_scopes") or [])
+    for item in services
+)
 PY
 }
 preflight_health="$(mktemp /run/hermes-agent-connector-preflight.XXXXXX)"
@@ -451,42 +468,67 @@ installed=0
 nginx_reload_attempted=0
 rollback() {
   local exit_code=$?
+  local rollback_failed=0
+  local service_stopped=0
   trap - EXIT INT TERM HUP
   set +e
   rm -f -- \
     "$(dirname "${nginx_security_target}")/.$(basename "${nginx_security_target}").install.$$" \
     "$(dirname "${nginx_site_target}")/.$(basename "${nginx_site_target}").install.$$"
   if [[ "${installed}" != 1 ]]; then
-    systemctl stop "${service}" >/dev/null 2>&1 || true
-    restore_one "${backup}/plugins/collaboration/dashboard/plugin_api.py" "${plugin_target}/plugin_api.py"
-    restore_one "${backup}/plugins/collaboration/dashboard/manifest.json" "${plugin_target}/manifest.json"
-    restore_one "${backup}/plugins/collaboration/dashboard/dist/index.js" "${plugin_target}/dist/index.js"
-    restore_one "${backup}/hermes_cli/cloud_file_library.py" "${core_target}"
-    restore_one "${backup}/hermes_cli/dashboard_auth/public_paths.py" "${public_paths_target}"
-    restore_one "${backup}/hermes_cli/dashboard_auth/token_auth.py" "${token_auth_target}"
-    restore_one "${backup}/hermes_cli/dashboard_auth/mobile_device_store.py" "${mobile_device_store_target}"
-    restore_one "${backup}/hermes_cli/dashboard_auth/mobile_notifications.py" "${mobile_notifications_target}"
-    restore_one "${backup}/hermes_cli/web_server.py" "${web_server_target}"
-    restore_one "${backup}/agent/agent_init.py" "${agent_init_target}"
-    restore_one "${backup}/tui_gateway/server.py" "${tui_gateway_target}"
-    restore_root_file "${backup}/nginx/00-hermes-security.conf" "${nginx_security_target}"
-    restore_root_file "${backup}/nginx/daxueshenmai.top.conf" "${nginx_site_target}"
-    restore_sqlite "${backup}/state/mobile-auth.db" "${mobile_auth_target}"
-    if [[ "${ios_enabled}" == 1 ]]; then
-      for relative in "${ios_optional[@]}"; do
-        restore_one "${backup}/${relative}" "${target_root}/${relative}"
-      done
-      restore_one "${backup}/config/config.yaml" "${config_target}"
-      restore_sqlite "${backup}/state/ios-intelligence.db" "${ios_database_target}"
-      restore_sqlite "${backup}/state/ios-mcp-supervisor.db" "${ios_supervisor_target}"
+    if systemctl stop "${service}" >/dev/null 2>&1; then
+      service_stopped=1
+    else
+      printf '%s\n' "rollback failed: could not stop ${service}" >&2
+      rollback_failed=1
     fi
-    restore_state "${backup}/state/single.json" "${state_target}"
-    if [[ "${nginx_reload_attempted}" == 1 ]]; then
-      "${nginx_binary}" -t >/dev/null 2>&1 \
-        && systemctl reload "${nginx_service}" >/dev/null 2>&1 \
-        || true
+    if [[ "${service_stopped}" == 1 ]]; then
+      rollback_step() {
+        local label="$1"
+        shift
+        if ! "$@"; then
+          printf 'rollback failed while restoring %s\n' "${label}" >&2
+          rollback_failed=1
+        fi
+      }
+      rollback_step plugin-api restore_one "${backup}/plugins/collaboration/dashboard/plugin_api.py" "${plugin_target}/plugin_api.py"
+      rollback_step plugin-manifest restore_one "${backup}/plugins/collaboration/dashboard/manifest.json" "${plugin_target}/manifest.json"
+      rollback_step plugin-bundle restore_one "${backup}/plugins/collaboration/dashboard/dist/index.js" "${plugin_target}/dist/index.js"
+      rollback_step cloud-files-code restore_one "${backup}/hermes_cli/cloud_file_library.py" "${core_target}"
+      rollback_step public-paths restore_one "${backup}/hermes_cli/dashboard_auth/public_paths.py" "${public_paths_target}"
+      rollback_step token-auth restore_one "${backup}/hermes_cli/dashboard_auth/token_auth.py" "${token_auth_target}"
+      rollback_step mobile-device-store restore_one "${backup}/hermes_cli/dashboard_auth/mobile_device_store.py" "${mobile_device_store_target}"
+      rollback_step mobile-notifications restore_one "${backup}/hermes_cli/dashboard_auth/mobile_notifications.py" "${mobile_notifications_target}"
+      rollback_step web-server restore_one "${backup}/hermes_cli/web_server.py" "${web_server_target}"
+      rollback_step agent-init restore_one "${backup}/agent/agent_init.py" "${agent_init_target}"
+      rollback_step tui-gateway restore_one "${backup}/tui_gateway/server.py" "${tui_gateway_target}"
+      rollback_step nginx-security restore_root_file "${backup}/nginx/00-hermes-security.conf" "${nginx_security_target}"
+      rollback_step nginx-site restore_root_file "${backup}/nginx/daxueshenmai.top.conf" "${nginx_site_target}"
+      rollback_step cloud-files-db restore_sqlite "${backup}/state/cloud-files-library.sqlite3" "${cloud_files_database_target}"
+      rollback_step mobile-auth-db restore_sqlite "${backup}/state/mobile-auth.db" "${mobile_auth_target}"
+      if [[ "${ios_enabled}" == 1 ]]; then
+        for relative in "${ios_optional[@]}"; do
+          rollback_step "${relative}" restore_one "${backup}/${relative}" "${target_root}/${relative}"
+        done
+        rollback_step profile-config restore_one "${backup}/config/config.yaml" "${config_target}"
+        rollback_step ios-intelligence-db restore_sqlite "${backup}/state/ios-intelligence.db" "${ios_database_target}"
+        rollback_step ios-supervisor-db restore_sqlite "${backup}/state/ios-mcp-supervisor.db" "${ios_supervisor_target}"
+      fi
+      rollback_step conversation-state restore_state "${backup}/state/single.json" "${state_target}"
+      if [[ "${nginx_reload_attempted}" == 1 && "${rollback_failed}" == 0 ]]; then
+        if ! "${nginx_binary}" -t >/dev/null 2>&1 \
+          || ! systemctl reload "${nginx_service}" >/dev/null 2>&1; then
+          printf '%s\n' "rollback failed while restoring nginx runtime" >&2
+          rollback_failed=1
+        fi
+      fi
+      if [[ "${rollback_failed}" == 0 ]]; then
+        if ! systemctl start "${service}" >/dev/null 2>&1; then
+          printf '%s\n' "rollback restored files but failed to restart ${service}" >&2
+          rollback_failed=1
+        fi
+      fi
     fi
-    systemctl start "${service}" >/dev/null 2>&1 || true
   fi
   rm -rf -- "${transaction}"
   [[ -z "${health_file:-}" ]] || rm -f -- "${health_file}"
@@ -495,6 +537,10 @@ rollback() {
   [[ -z "${connector_health_file:-}" ]] || rm -f -- "${connector_health_file}"
   rm -f -- "${curl_cfg}"
   cleanup_snapshot
+  if [[ "${rollback_failed}" != 0 ]]; then
+    printf '%s\n' "rollback incomplete; ${service} remains stopped" >&2
+    exit_code=70
+  fi
   exit "${exit_code}"
 }
 restore_one() {
@@ -502,10 +548,14 @@ restore_one() {
   local destination="$2"
   local temporary="${destination}.rollback.$$"
   if [[ -f "${source}" ]]; then
-    install -o "${service_user}" -g "${service_group}" -m 0644 "${source}" "${temporary}"
-    mv -f -- "${temporary}" "${destination}"
+    install -o "${service_user}" -g "${service_group}" -m 0644 "${source}" "${temporary}" \
+      || { rm -f -- "${temporary}"; return 1; }
+    mv -f -- "${temporary}" "${destination}" \
+      || { rm -f -- "${temporary}"; return 1; }
   elif [[ -f "${source}.missing" ]]; then
-    rm -f -- "${destination}"
+    rm -f -- "${destination}" || return 1
+  else
+    return 1
   fi
 }
 restore_root_file() {
@@ -513,22 +563,31 @@ restore_root_file() {
   local destination="$2"
   local temporary="${destination}.rollback.$$"
   if [[ -f "${source}" ]]; then
-    install -o root -g root -m 0644 "${source}" "${temporary}"
-    mv -f -- "${temporary}" "${destination}"
+    install -o root -g root -m 0644 "${source}" "${temporary}" \
+      || { rm -f -- "${temporary}"; return 1; }
+    mv -f -- "${temporary}" "${destination}" \
+      || { rm -f -- "${temporary}"; return 1; }
   elif [[ -f "${source}.missing" ]]; then
-    rm -f -- "${destination}"
+    rm -f -- "${destination}" || return 1
+  else
+    return 1
   fi
 }
 restore_state() {
   local source="$1"
   local destination="$2"
   local temporary="${destination}.rollback.$$"
-  install -d -o "${service_user}" -g "${service_group}" -m 0700 "$(dirname "${destination}")"
+  install -d -o "${service_user}" -g "${service_group}" -m 0700 "$(dirname "${destination}")" \
+    || return 1
   if [[ -f "${source}" ]]; then
-    install -o "${service_user}" -g "${service_group}" -m 0600 "${source}" "${temporary}"
-    mv -f -- "${temporary}" "${destination}"
+    install -o "${service_user}" -g "${service_group}" -m 0600 "${source}" "${temporary}" \
+      || { rm -f -- "${temporary}"; return 1; }
+    mv -f -- "${temporary}" "${destination}" \
+      || { rm -f -- "${temporary}"; return 1; }
   elif [[ -f "${source}.missing" ]]; then
-    rm -f -- "${destination}"
+    rm -f -- "${destination}" || return 1
+  else
+    return 1
   fi
 }
 restore_sqlite() {
@@ -538,14 +597,20 @@ restore_sqlite() {
   local destination_dir
   destination_dir="$(dirname "${destination}")"
   if [[ ! -d "${destination_dir}" ]]; then
-    install -d -o "${service_user}" -g "${service_group}" -m 0700 "${destination_dir}"
+    install -d -o "${service_user}" -g "${service_group}" -m 0700 "${destination_dir}" \
+      || return 1
   fi
-  rm -f -- "${temporary}" "${destination}-wal" "${destination}-shm" "${destination}-journal"
+  rm -f -- "${temporary}" "${destination}-wal" "${destination}-shm" "${destination}-journal" \
+    || return 1
   if [[ -f "${source}" ]]; then
-    install -o "${service_user}" -g "${service_group}" -m 0600 "${source}" "${temporary}"
-    mv -f -- "${temporary}" "${destination}"
+    install -o "${service_user}" -g "${service_group}" -m 0600 "${source}" "${temporary}" \
+      || { rm -f -- "${temporary}"; return 1; }
+    mv -f -- "${temporary}" "${destination}" \
+      || { rm -f -- "${temporary}"; return 1; }
   elif [[ -f "${source}.missing" ]]; then
-    rm -f -- "${destination}"
+    rm -f -- "${destination}" || return 1
+  else
+    return 1
   fi
 }
 trap rollback EXIT
@@ -558,6 +623,7 @@ trap 'exit 129' HUP
 # rollback also stops it before restoring this snapshot.
 systemctl stop "${service}"
 backup_one "${state_target}" "${backup}/state/single.json"
+backup_sqlite "${cloud_files_database_target}" "${backup}/state/cloud-files-library.sqlite3"
 backup_sqlite "${mobile_auth_target}" "${backup}/state/mobile-auth.db"
 if [[ "${ios_enabled}" == 1 ]]; then
   backup_sqlite "${ios_database_target}" "${backup}/state/ios-intelligence.db"
@@ -616,7 +682,8 @@ health_file="$(mktemp /run/hermes-agent-status.XXXXXX)"
 healthy=0
 for _ in $(seq 1 30); do
   if systemctl is-active --quiet "${service}" \
-    && curl --fail --silent --show-error --max-time 3 http://127.0.0.2:9119/api/status >"${health_file}"; then
+    && curl --fail --silent --show-error --max-time 3 --noproxy '*' \
+      http://127.0.0.2:9119/api/status >"${health_file}"; then
     healthy=1
     break
   fi
@@ -632,7 +699,7 @@ data = json.load(open(sys.argv[1], encoding="utf-8"))
 assert isinstance(data, dict)
 PY
 handshake_file="$(mktemp /run/hermes-agent-mobile-handshake.XXXXXX)"
-if ! curl --fail --silent --show-error --max-time 3 \
+if ! curl --fail --silent --show-error --max-time 3 --noproxy '*' \
   http://127.0.0.2:9119/api/mobile/v1/handshake >"${handshake_file}"; then
   printf '%s\n' "anonymous mobile handshake did not respond" >&2
   false
@@ -655,7 +722,7 @@ if [[ "${ios_enabled}" == 1 ]]; then
   ios_healthy=0
   for _ in $(seq 1 "${ios_health_attempts}"); do
     if systemctl is-active --quiet "${service}" \
-      && curl --fail --silent --show-error --max-time 3 \
+      && curl --fail --silent --show-error --max-time 3 --noproxy '*' \
         --config "${curl_cfg}" \
         http://127.0.0.2:9119/api/plugins/ios-intelligence/health >"${ios_health_file}" \
       && validate_ios_health "${ios_health_file}" 2>/dev/null; then

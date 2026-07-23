@@ -13,6 +13,7 @@ from dataclasses import dataclass
 from enum import Enum
 import json
 import logging
+import multiprocessing
 import os
 from pathlib import Path
 import sqlite3
@@ -29,6 +30,72 @@ from hermes_cli.sqlite_util import write_txn
 
 
 logger = logging.getLogger(__name__)
+
+_RUNTIME_STOPPING_ERROR = "runtime is stopping"
+_IOS_MCP_FORKSERVER_PRELOAD = (
+    "mcp.server.fastmcp",
+    "hermes_cli.ios_intelligence",
+)
+_IOS_MCP_FORKSERVER_CONTEXT: Any | None = None
+_IOS_MCP_FORKSERVER_LOCK = threading.Lock()
+_IOS_MCP_PROCESS_ENV = {
+    "PYTHONUNBUFFERED": "1",
+    "MALLOC_ARENA_MAX": "2",
+    "OMP_NUM_THREADS": "1",
+    "OPENBLAS_NUM_THREADS": "1",
+    "MKL_NUM_THREADS": "1",
+    "NUMEXPR_NUM_THREADS": "1",
+}
+
+
+def _get_ios_mcp_forkserver_context() -> Any:
+    """Return the one release-scoped preload broker for this dashboard."""
+
+    global _IOS_MCP_FORKSERVER_CONTEXT
+    with _IOS_MCP_FORKSERVER_LOCK:
+        if _IOS_MCP_FORKSERVER_CONTEXT is None:
+            multiprocessing.set_forkserver_preload(list(_IOS_MCP_FORKSERVER_PRELOAD))
+            _IOS_MCP_FORKSERVER_CONTEXT = multiprocessing.get_context("forkserver")
+        return _IOS_MCP_FORKSERVER_CONTEXT
+
+
+class _ForkProcessAdapter:
+    """Expose the Popen subset used by the runtime around an mp.Process."""
+
+    def __init__(self, process: Any, command: Iterable[str]) -> None:
+        self._process = process
+        self.args = list(command)
+
+    @property
+    def pid(self) -> int:
+        return int(self._process.pid or 0)
+
+    def poll(self) -> int | None:
+        exit_code = self._process.exitcode
+        if exit_code is not None:
+            return int(exit_code)
+        if self._process.is_alive():
+            return None
+        exit_code = self._process.exitcode
+        return None if exit_code is None else int(exit_code)
+
+    def wait(self, timeout: float | None = None) -> int:
+        self._process.join(timeout)
+        if self._process.is_alive():
+            raise subprocess.TimeoutExpired(self.args, timeout)
+        exit_code = self._process.exitcode
+        if exit_code is None:
+            raise RuntimeError("forkserver child exited without a return code")
+        return int(exit_code)
+
+    def terminate(self) -> None:
+        self._process.terminate()
+
+    def kill(self) -> None:
+        self._process.kill()
+
+    def close(self) -> None:
+        self._process.close()
 
 
 class MCPState(str, Enum):
@@ -241,22 +308,7 @@ class IOSMCPSupervisor:
                 healthy = False
                 error = str(exc)[:2000]
         if healthy:
-            if current["state"] in {
-                MCPState.DEGRADED.value,
-                MCPState.RECOVERING.value,
-            }:
-                self._transition(service, MCPState.RUNNING, "health restored")
-            if current["state"] not in {
-                MCPState.QUARANTINED.value,
-                MCPState.DISABLED.value,
-                MCPState.UPGRADING.value,
-            }:
-                with self._lock, self._connect() as conn, write_txn(conn):
-                    conn.execute(
-                        "UPDATE mcp_services SET failures=0,last_error='',updated_at=? WHERE name=?",
-                        (int(time.time()), service),
-                    )
-            return {**self.status(service), "healthy": True, "detail": detail}
+            return {**self.record_success(service), "healthy": True, "detail": detail}
         self.record_failure(service, error or "health check failed")
         return {**self.status(service), "healthy": False, "detail": detail, "error": error or "health check failed"}
 
@@ -268,17 +320,50 @@ class IOSMCPSupervisor:
 
     run_health_checks = check_all
 
-    def record_failure(self, name: str, error: str = "") -> dict[str, Any]:
+    def record_success(self, name: str) -> dict[str, Any]:
+        """Persist a successful probe without invoking the health callback again."""
+
+        service = self._name(name)
+        current = self.status(service)
+        if current["state"] in {
+            MCPState.DEGRADED.value,
+            MCPState.RECOVERING.value,
+        }:
+            self._transition(service, MCPState.RUNNING, "health restored")
+        if current["state"] not in {
+            MCPState.QUARANTINED.value,
+            MCPState.DISABLED.value,
+            MCPState.UPGRADING.value,
+        }:
+            with self._lock, self._connect() as conn, write_txn(conn):
+                conn.execute(
+                    "UPDATE mcp_services SET failures=0,last_error='',updated_at=? WHERE name=?",
+                    (int(time.time()), service),
+                )
+        return self.status(service)
+
+    def record_failure(
+        self,
+        name: str,
+        error: str = "",
+        *,
+        schedule_restart: bool = True,
+        quarantine_at_threshold: bool = True,
+    ) -> dict[str, Any]:
         service = self._name(name)
         with self._lock, self._connect() as conn, write_txn(conn):
             row = conn.execute("SELECT failures,state FROM mcp_services WHERE name=?", (service,)).fetchone()
             if row is None:
                 raise KeyError(f"Unknown MCP: {name}")
             failures = int(row["failures"]) + 1
-            state = MCPState.DEGRADED.value if failures < self.failure_threshold else MCPState.QUARANTINED.value
+            state = (
+                MCPState.QUARANTINED.value
+                if quarantine_at_threshold and failures >= self.failure_threshold
+                else MCPState.DEGRADED.value
+            )
             conn.execute("UPDATE mcp_services SET failures=?,state=?,last_error=?,updated_at=? WHERE name=?", (failures, state, str(error)[:2000], int(time.time()), service))
             conn.execute("INSERT INTO mcp_supervisor_events(service,from_state,to_state,reason,created_at) VALUES(?,?,?,?,?)", (service, row["state"], state, str(error)[:512], int(time.time())))
-        if failures < self.failure_threshold:
+        if schedule_restart and state != MCPState.QUARANTINED.value:
             # Each recovered crash starts a new failure generation. Reusing a
             # key based only on the failure count would collide with a
             # completed restart from an earlier crash and strand the process.
@@ -439,9 +524,15 @@ class IOSMCPSupervisor:
                 "WHERE state='delivered' AND (delivered_at IS NULL OR delivered_at<=?)",
                 (cutoff,),
             )
-            rows = conn.execute("SELECT * FROM mcp_supervisor_queue WHERE state='pending' AND available_at<=? ORDER BY created_at LIMIT ?", (now, max(1, min(int(limit), 1000)))).fetchall()
+            rows = conn.execute(
+                "SELECT * FROM mcp_supervisor_queue "
+                "WHERE state IN ('pending','retry') AND available_at<=? "
+                "ORDER BY created_at LIMIT ?",
+                (now, max(1, min(int(limit), 1000))),
+            ).fetchall()
             conn.executemany(
-                "UPDATE mcp_supervisor_queue SET state='delivered',delivered_at=?,attempts=attempts+1 WHERE id=?",
+                "UPDATE mcp_supervisor_queue SET state='delivered',delivered_at=?,attempts=attempts+1 "
+                "WHERE id=? AND state IN ('pending','retry')",
                 [(now, row["id"]) for row in rows],
             )
         return [{"id": row["id"], "service": row["service"], "action": row["action"], "payload": json.loads(row["payload_json"] or "{}"), "attempts": int(row["attempts"]) + 1} for row in rows]
@@ -470,6 +561,7 @@ class IOSMCPRuntimeSupervisor:
         host: str = "127.0.0.1",
         base_port: int = 8760,
         health_interval_seconds: float = 15.0,
+        initial_health_delay_seconds: float = 60.0,
         failure_threshold: int = 3,
         restart_backoff_seconds: float = 1.0,
         log_directory: str | os.PathLike[str] | None = None,
@@ -477,6 +569,9 @@ class IOSMCPRuntimeSupervisor:
         capabilities: tuple[str, ...] | None = None,
         blue_green_port_offset: int = 100,
         drain_timeout_seconds: float = 30.0,
+        startup_timeout_seconds: float = 90.0,
+        health_probe_timeout_seconds: float = 5.0,
+        recovery_probe_timeout_seconds: float = 30.0,
         owner_id: str = "",
         granted_scopes: Mapping[str, Iterable[str] | str] | None = None,
     ) -> None:
@@ -493,7 +588,26 @@ class IOSMCPRuntimeSupervisor:
         self.base_port = int(base_port)
         self.blue_green_port_offset = max(len(self._all_capabilities) + 1, int(blue_green_port_offset))
         self.drain_timeout_seconds = max(0.0, float(drain_timeout_seconds))
+        self.startup_timeout_seconds = min(
+            600.0,
+            max(1.0, float(startup_timeout_seconds)),
+        )
+        self.health_probe_timeout_seconds = min(
+            60.0,
+            max(1.0, float(health_probe_timeout_seconds)),
+        )
+        self.recovery_probe_timeout_seconds = min(
+            180.0,
+            max(
+                self.health_probe_timeout_seconds,
+                float(recovery_probe_timeout_seconds),
+            ),
+        )
         self.health_interval_seconds = max(2.0, float(health_interval_seconds))
+        self.initial_health_delay_seconds = min(
+            600.0,
+            max(self.health_interval_seconds, float(initial_health_delay_seconds)),
+        )
         self.python_executable = str(python_executable or sys.executable)
         self.owner_id = str(owner_id or "").strip()[:512]
         try:
@@ -527,6 +641,8 @@ class IOSMCPRuntimeSupervisor:
         self._log_handles: dict[str, Any] = {}
         self._active_ports: dict[str, int] = {}
         self._lock = threading.RLock()
+        self._health_cycle_lock = threading.Lock()
+        self._health_generations = {name: 0 for name in self.capabilities}
         self._stop_event = threading.Event()
         self._startup_thread: threading.Thread | None = None
         self._thread: threading.Thread | None = None
@@ -604,6 +720,22 @@ class IOSMCPRuntimeSupervisor:
         command.append(service)
         return command
 
+    def _should_use_forkserver(
+        self,
+        *,
+        python_executable: str | None = None,
+        force_subprocess: bool = False,
+    ) -> bool:
+        if force_subprocess or not sys.platform.startswith("linux"):
+            return False
+        if "forkserver" not in multiprocessing.get_all_start_methods():
+            return False
+        requested = os.path.normcase(os.path.realpath(
+            str(python_executable or self.python_executable)
+        ))
+        current = os.path.normcase(os.path.realpath(sys.executable))
+        return requested == current
+
     def _register_callbacks(self) -> None:
         from hermes_cli.ios_mcp_server import MCP_VERSION, ios_mcp_manifests
 
@@ -632,6 +764,16 @@ class IOSMCPRuntimeSupervisor:
                 start=lambda _version=None, service=name: self.start_service(service, verify=True),
                 stop=lambda service=name: self.stop_service(service),
             )
+            if (
+                status["state"] == MCPState.QUARANTINED.value
+                and status["last_error"] == _RUNTIME_STOPPING_ERROR
+            ):
+                status = self.supervisor._transition(
+                    name,
+                    MCPState.RECOVERING,
+                    "recover shutdown-interrupted restart",
+                    error=_RUNTIME_STOPPING_ERROR,
+                )
             configured = configured_servers.get(name)
             if (
                 isinstance(configured, Mapping)
@@ -665,6 +807,8 @@ class IOSMCPRuntimeSupervisor:
                     continue
                 if not self.start_service(name, verify=True):
                     required_ok = False
+                else:
+                    self._record_runtime_success(name)
         except Exception:
             required_ok = False
             raise
@@ -732,14 +876,43 @@ class IOSMCPRuntimeSupervisor:
     def health(self) -> dict[str, Any]:
         """Return truthful fleet health, including per-service probes."""
 
+        from hermes_cli.ios_mcp_server import ios_mcp_manifests
+
+        manifests = ios_mcp_manifests(
+            transport="streamable-http",
+            host=self.host,
+            base_port=self.base_port,
+        )
         services: list[dict[str, Any]] = []
         for name in self.capabilities:
             state = self.supervisor.status(name)["state"]
             if state == MCPState.DISABLED.value:
                 continue
             probe = self.health_service(name)
-            services.append({"name": name, "state": state, **probe})
-        healthy = sum(1 for item in services if item.get("ok") is True)
+            manifest = manifests[name]
+            expected_tools = sorted((manifest.get("tool_scopes") or {}).keys())
+            actual_tools = sorted(str(tool) for tool in (probe.get("tools") or ()))
+            declared_scopes = list(manifest.get("scope") or ())
+            granted_scopes = list(self.granted_scopes.get(name, ()))
+            contract_ok = (
+                bool(probe.get("ok"))
+                and actual_tools == expected_tools
+                and set(granted_scopes).issubset(declared_scopes)
+            )
+            services.append({
+                "name": name,
+                "state": state,
+                **probe,
+                "expected_tools": expected_tools,
+                "declared_scopes": declared_scopes,
+                "granted_scopes": granted_scopes,
+                "contract_ok": contract_ok,
+            })
+        healthy = sum(
+            1
+            for item in services
+            if item.get("ok") is True and item.get("contract_ok") is True
+        )
         required = len(services)
         return {
             "ok": required > 0 and healthy == required,
@@ -778,7 +951,8 @@ class IOSMCPRuntimeSupervisor:
         port: int,
         python_executable: str | None = None,
         log_suffix: str = "",
-    ) -> tuple[subprocess.Popen[Any], Any]:
+        force_subprocess: bool = False,
+    ) -> tuple[Any, Any]:
         safe_suffix = "".join(
             character for character in str(log_suffix) if character.isalnum() or character in {".", "_", "-"}
         )[:80]
@@ -786,26 +960,67 @@ class IOSMCPRuntimeSupervisor:
         log_path = self.log_directory / f"{service}{suffix}.log"
         log_handle = log_path.open("ab", buffering=0)
         env = os.environ.copy()
-        env["PYTHONUNBUFFERED"] = "1"
         # Keep 21 isolated Python services within a predictable memory and
         # thread footprint. These are internal runtime controls, not user-facing
         # behavioral configuration.
-        env.setdefault("MALLOC_ARENA_MAX", "2")
-        env.setdefault("OMP_NUM_THREADS", "1")
-        env.setdefault("OPENBLAS_NUM_THREADS", "1")
-        env.setdefault("MKL_NUM_THREADS", "1")
-        env.setdefault("NUMEXPR_NUM_THREADS", "1")
+        env["PYTHONUNBUFFERED"] = _IOS_MCP_PROCESS_ENV["PYTHONUNBUFFERED"]
+        for key, value in _IOS_MCP_PROCESS_ENV.items():
+            env.setdefault(key, value)
         if self.db_dir is not None:
             env["HERMES_IOS_INTELLIGENCE_DIR"] = str(self.db_dir)
         if self.owner_id:
             env["HERMES_IOS_OWNER_ID"] = self.owner_id
+        command = self.command_for(
+            service,
+            port=port,
+            python_executable=python_executable,
+        )
+
+        if self._should_use_forkserver(
+            python_executable=python_executable,
+            force_subprocess=force_subprocess,
+        ):
+            raw_process = None
+            try:
+                # These controls must be present when the broker interpreter
+                # starts; setting them only inside a forked child is too late.
+                for key, value in _IOS_MCP_PROCESS_ENV.items():
+                    if key == "PYTHONUNBUFFERED":
+                        os.environ[key] = value
+                    else:
+                        os.environ.setdefault(key, value)
+                from hermes_cli.ios_mcp_server import _run_supervised_mcp_child
+
+                raw_process = _get_ios_mcp_forkserver_context().Process(
+                    target=_run_supervised_mcp_child,
+                    args=(command[3:], env, str(log_path)),
+                    name=f"ios-mcp-{service}",
+                )
+                raw_process.start()
+                process = _ForkProcessAdapter(raw_process, command)
+                self._prefer_child_for_oom_recovery(process.pid)
+            except Exception:
+                logger.warning(
+                    "iOS MCP forkserver start failed for %s; using subprocess",
+                    service,
+                    exc_info=True,
+                )
+                if raw_process is not None and getattr(raw_process, "pid", None):
+                    try:
+                        candidate = _ForkProcessAdapter(raw_process, command)
+                        self._terminate_process(candidate)
+                    except Exception:
+                        logger.warning(
+                            "failed to clean partial forkserver child for %s",
+                            service,
+                            exc_info=True,
+                        )
+            else:
+                log_handle.close()
+                return process, None
         try:
             process = subprocess.Popen(
-                self.command_for(
-                    service,
-                    port=port,
-                    python_executable=python_executable,
-                ),
+                command,
                 stdin=subprocess.DEVNULL,
                 stdout=log_handle,
                 stderr=subprocess.STDOUT,
@@ -832,16 +1047,22 @@ class IOSMCPRuntimeSupervisor:
             pass
 
     @staticmethod
-    def _terminate_process(process: subprocess.Popen[Any] | None, log_handle: Any = None) -> None:
-        if process is not None and process.poll() is None:
-            process.terminate()
-            try:
-                process.wait(timeout=5)
-            except subprocess.TimeoutExpired:
-                process.kill()
-                process.wait(timeout=5)
-        if log_handle is not None:
-            log_handle.close()
+    def _terminate_process(process: Any | None, log_handle: Any = None) -> None:
+        try:
+            if process is not None and process.poll() is None:
+                process.terminate()
+                try:
+                    process.wait(timeout=5)
+                except subprocess.TimeoutExpired:
+                    process.kill()
+                    process.wait(timeout=5)
+        finally:
+            if process is not None:
+                close_process = getattr(process, "close", None)
+                if callable(close_process):
+                    close_process()
+            if log_handle is not None:
+                log_handle.close()
 
     def start_service(self, name: str, *, verify: bool = True) -> bool:
         service = self.supervisor._name(name)
@@ -863,7 +1084,7 @@ class IOSMCPRuntimeSupervisor:
             self._log_handles[service] = log_handle
         if not verify:
             return True
-        deadline = time.monotonic() + 10.0
+        deadline = time.monotonic() + self.startup_timeout_seconds
         while time.monotonic() < deadline and not self._stop_event.is_set():
             if self.health_service(service).get("ok"):
                 return True
@@ -884,7 +1105,12 @@ class IOSMCPRuntimeSupervisor:
         log_handle = self._log_handles.pop(service, None)
         self._terminate_process(process, log_handle)
 
-    def health_service(self, name: str) -> dict[str, Any]:
+    def health_service(
+        self,
+        name: str,
+        *,
+        probe_timeout_seconds: float | None = None,
+    ) -> dict[str, Any]:
         service = self.supervisor._name(name)
         with self._lock:
             process = self._processes.get(service)
@@ -892,11 +1118,21 @@ class IOSMCPRuntimeSupervisor:
             return {"ok": False, "error": "process_missing"}
         exit_code = process.poll()
         if exit_code is not None:
-            return {"ok": False, "error": "process_exited", "exit_code": exit_code}
+            return {
+                "ok": False,
+                "error": "process_exited",
+                "exit_code": exit_code,
+                "pid": process.pid,
+            }
         try:
-            tools = self._probe_tools(self.endpoint_for(service))
+            timeout = (
+                self.health_probe_timeout_seconds
+                if probe_timeout_seconds is None
+                else max(1.0, float(probe_timeout_seconds))
+            )
+            tools = self._probe_tools_with_timeout(self.endpoint_for(service), timeout)
         except Exception as exc:
-            return {"ok": False, "error": type(exc).__name__}
+            return {"ok": False, "error": type(exc).__name__, "pid": process.pid}
         return {"ok": bool(tools), "pid": process.pid, "tools": tools}
 
     def _persist_discovery_endpoint(
@@ -960,6 +1196,8 @@ class IOSMCPRuntimeSupervisor:
             servers[service] = entry
             updated = dict(config)
             updated["mcp_servers"] = servers
+            if updated == config:
+                continue
             updates.append((home, config, updated))
 
         written: list[tuple[Path, dict[str, Any]]] = []
@@ -1086,9 +1324,13 @@ class IOSMCPRuntimeSupervisor:
                 port=green_port,
                 python_executable=green_python_executable,
                 log_suffix=f"green-{new_version}",
+                # The forkserver is an immutable snapshot of the running
+                # release. Green must import from its requested executable so
+                # stale preloaded code can never be labelled as the upgrade.
+                force_subprocess=True,
             )
             green.update({"process": process, "handle": handle})
-            deadline = time.monotonic() + 10.0
+            deadline = time.monotonic() + self.startup_timeout_seconds
             while time.monotonic() < deadline:
                 if process.poll() is not None:
                     return False
@@ -1163,13 +1405,16 @@ class IOSMCPRuntimeSupervisor:
         }
 
     @staticmethod
-    def _probe_tools(url: str) -> list[str]:
+    def _probe_tools_with_timeout(url: str, timeout_seconds: float) -> list[str]:
+        timeout_seconds = min(180.0, max(1.0, float(timeout_seconds)))
+
         async def probe() -> list[str]:
             import httpx
             from mcp import ClientSession
             from mcp.client.streamable_http import streamable_http_client
 
-            timeout = httpx.Timeout(3.0, connect=3.0)
+            request_timeout = max(1.0, timeout_seconds - 1.0)
+            timeout = httpx.Timeout(request_timeout, connect=min(5.0, request_timeout))
             async with httpx.AsyncClient(timeout=timeout) as http_client:
                 async with streamable_http_client(
                     url,
@@ -1182,7 +1427,7 @@ class IOSMCPRuntimeSupervisor:
                         return [tool.name for tool in result.tools]
 
         async def bounded_probe() -> list[str]:
-            return await asyncio.wait_for(probe(), timeout=5.0)
+            return await asyncio.wait_for(probe(), timeout=timeout_seconds)
 
         # Dashboard health checks run on the web server's asyncio loop. Running
         # asyncio.run() directly there raises and leaks the probe coroutine;
@@ -1202,37 +1447,176 @@ class IOSMCPRuntimeSupervisor:
 
         worker = threading.Thread(target=run_probe, name="ios-mcp-health-probe", daemon=True)
         worker.start()
-        worker.join(6.0)
+        worker.join(timeout_seconds + 1.0)
         if worker.is_alive():
             raise TimeoutError("MCP tools/list probe timed out")
         if failure:
             raise failure[0]
         return result[0] if result else []
 
+    @staticmethod
+    def _probe_tools(url: str) -> list[str]:
+        return IOSMCPRuntimeSupervisor._probe_tools_with_timeout(url, 5.0)
+
     def run_once(self) -> list[dict[str, Any]]:
-        results: list[dict[str, Any]] = []
-        for item in self.supervisor.statuses():
-            if item["name"] not in self.capabilities or item["state"] in {
-                MCPState.DISABLED.value,
-                MCPState.QUARANTINED.value,
-                MCPState.UPGRADING.value,
-            }:
-                continue
-            checked = self.supervisor.health_check(item["name"])
-            results.append(checked)
-            if checked["state"] == MCPState.QUARANTINED.value:
-                self.stop_service(item["name"])
-        self._process_queue()
-        return results
+        if not self._health_cycle_lock.acquire(blocking=False):
+            return []
+        try:
+            if self._stop_event.is_set():
+                self.running = False
+                return []
+            results: list[dict[str, Any]] = []
+            for item in self.supervisor.statuses():
+                if self._stop_event.is_set():
+                    break
+                if item["name"] not in self.capabilities or item["state"] in {
+                    MCPState.DISABLED.value,
+                    MCPState.QUARANTINED.value,
+                    MCPState.UPGRADING.value,
+                }:
+                    continue
+                service = item["name"]
+                observed = self.health_service(service)
+                if observed.get("ok"):
+                    state = self._record_runtime_success(service)
+                    results.append({**state, "healthy": True, "detail": observed})
+                    continue
+
+                error = str(observed.get("error") or "health check failed")
+                definitive = error in {"process_missing", "process_exited"}
+                state = self.supervisor.record_failure(
+                    service,
+                    error,
+                    schedule_restart=False,
+                    quarantine_at_threshold=False,
+                )
+                checked = {
+                    **state,
+                    "healthy": False,
+                    "detail": observed,
+                    "error": error,
+                }
+                results.append(checked)
+                if definitive:
+                    self._enqueue_health_restart(service, observed, error)
+                    continue
+                if state["failures"] < self.supervisor.failure_threshold:
+                    continue
+
+                # A live child can miss a short tools/list deadline while ARM
+                # is saturated. Confirm with one longer probe before allowing
+                # a destructive restart. This keeps transient latency in
+                # DEGRADED and reserves restart/quarantine for a confirmed
+                # hang or a process that actually exited.
+                confirmed = self.health_service(
+                    service,
+                    probe_timeout_seconds=self.recovery_probe_timeout_seconds,
+                )
+                if confirmed.get("ok"):
+                    restored = self._record_runtime_success(service)
+                    results[-1] = {
+                        **restored,
+                        "healthy": True,
+                        "detail": confirmed,
+                        "recovered_by_extended_probe": True,
+                    }
+                    continue
+                self._enqueue_health_restart(
+                    service,
+                    confirmed,
+                    str(confirmed.get("error") or error),
+                )
+            if not self._stop_event.is_set():
+                self._process_queue()
+            if not self._stop_event.is_set():
+                self._refresh_runtime_running()
+            return results
+        finally:
+            self._health_cycle_lock.release()
+
+    def _refresh_runtime_running(self) -> bool:
+        """Recompute fleet readiness after queued recovery changes a process."""
+
+        if self._stop_event.is_set() or self.starting:
+            return False
+        required: list[str] = []
+        ready = True
+        states = {
+            service: self.supervisor.status(service)["state"]
+            for service in self.capabilities
+        }
+        with self._lock:
+            for service in self.capabilities:
+                state = states[service]
+                if state == MCPState.DISABLED.value:
+                    continue
+                required.append(service)
+                process = self._processes.get(service)
+                if (
+                    state in {
+                        MCPState.QUARANTINED.value,
+                        MCPState.UPGRADING.value,
+                    }
+                    or process is None
+                    or process.poll() is not None
+                ):
+                    ready = False
+            self.running = bool(required) and ready
+            return self.running
+
+    def _record_runtime_success(self, service: str) -> dict[str, Any]:
+        self._health_generations[service] = self._health_generations.get(service, 0) + 1
+        return self.supervisor.record_success(service)
+
+    def _enqueue_health_restart(
+        self,
+        service: str,
+        observation: Mapping[str, Any],
+        reason: str,
+    ) -> None:
+        expected_pid = int(observation.get("pid") or 0)
+        generation = self._health_generations.get(service, 0)
+        self.supervisor.enqueue(
+            service,
+            "restart",
+            {
+                "reason": str(reason),
+                "trigger": "runtime_health",
+                "expected_pid": expected_pid,
+                "health_generation": generation,
+            },
+            idempotency_key=(
+                f"restart:{service}:health:{generation}:pid:{expected_pid}"
+            ),
+        )
 
     def _process_queue(self) -> None:
-        for command in self.supervisor.pull(limit=100):
+        if self._stop_event.is_set():
+            return
+        commands = self.supervisor.pull(limit=100)
+        for command in commands:
+            if self._stop_event.is_set():
+                self.supervisor.ack(
+                    command["id"],
+                    success=False,
+                    error=_RUNTIME_STOPPING_ERROR,
+                    retry_at=int(time.time()) + 5,
+                )
+                continue
             success = False
             error = ""
             try:
                 if command["action"] == "restart":
-                    result = self.supervisor.restart(command["service"], reason="queued restart")
-                    success = result["state"] == MCPState.RUNNING.value
+                    if self._health_restart_is_stale(command):
+                        success = True
+                    else:
+                        result = self._restart_runtime_service(
+                            command["service"],
+                            reason="queued restart",
+                        )
+                        success = result["state"] == MCPState.RUNNING.value
+                        if result.get("last_error") == _RUNTIME_STOPPING_ERROR:
+                            error = _RUNTIME_STOPPING_ERROR
                 elif command["action"] == "start":
                     success = self.start_service(command["service"], verify=True)
                 elif command["action"] == "stop":
@@ -1248,14 +1632,85 @@ class IOSMCPRuntimeSupervisor:
                 retry_at=int(time.time()) + 5,
             )
 
+    def _health_restart_is_stale(self, command: Mapping[str, Any]) -> bool:
+        payload = command.get("payload")
+        if not isinstance(payload, Mapping) or payload.get("trigger") != "runtime_health":
+            return False
+        service = self.supervisor._name(command.get("service"))
+        status = self.supervisor.status(service)
+        if status["state"] == MCPState.RUNNING.value and status["failures"] == 0:
+            return True
+        if int(payload.get("health_generation") or 0) != self._health_generations.get(
+            service, 0
+        ):
+            return True
+        expected_pid = int(payload.get("expected_pid") or 0)
+        if expected_pid <= 0:
+            return False
+        with self._lock:
+            process = self._processes.get(service)
+        return bool(
+            process is not None
+            and process.poll() is None
+            and int(process.pid) != expected_pid
+        )
+
+    def _restart_runtime_service(
+        self,
+        name: str,
+        *,
+        reason: str,
+    ) -> dict[str, Any]:
+        """Restart one child with exactly one verified startup probe sequence."""
+
+        service = self.supervisor._name(name)
+        current = self.supervisor.status(service)
+        if current["state"] == MCPState.DISABLED.value:
+            return current
+        if self._stop_event.is_set():
+            return self.supervisor._transition(
+                service,
+                MCPState.RECOVERING,
+                "restart deferred during shutdown",
+                error=_RUNTIME_STOPPING_ERROR,
+            )
+        self.supervisor._transition(service, MCPState.RECOVERING, reason)
+        try:
+            self.stop_service(service)
+            if self.supervisor.restart_backoff_seconds and self._stop_event.wait(
+                self.supervisor.restart_backoff_seconds
+            ):
+                raise RuntimeError(_RUNTIME_STOPPING_ERROR)
+            if self._stop_event.is_set():
+                raise RuntimeError(_RUNTIME_STOPPING_ERROR)
+            if not self.start_service(service, verify=True):
+                if self._stop_event.is_set():
+                    raise RuntimeError(_RUNTIME_STOPPING_ERROR)
+                raise RuntimeError("MCP process failed its verified restart")
+            return self._record_runtime_success(service)
+        except Exception as exc:
+            if self._stop_event.is_set() or str(exc) == _RUNTIME_STOPPING_ERROR:
+                return self.supervisor._transition(
+                    service,
+                    MCPState.RECOVERING,
+                    "restart deferred during shutdown",
+                    error=_RUNTIME_STOPPING_ERROR,
+                )
+            return self.supervisor._transition(
+                service,
+                MCPState.QUARANTINED,
+                "restart failed",
+                error=str(exc),
+            )
+
     def _run(self) -> None:
-        if self._stop_event.wait(5.0):
+        if self._stop_event.wait(self.initial_health_delay_seconds):
             return
         while not self._stop_event.is_set():
             try:
                 self.run_once()
             except Exception:
-                pass
+                logger.exception("iOS MCP runtime health cycle failed")
             self._stop_event.wait(self.health_interval_seconds)
 
     def run_forever(self) -> None:

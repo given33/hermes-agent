@@ -6289,22 +6289,30 @@ async def set_custom_model(
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
 
+    target_profile = body.profile or profile
+
     def _apply():
-        with _profile_scope(body.profile or profile):
+        # The editor never reads the stored secret back into the client. An
+        # empty api_key therefore means "keep the current key", not "delete
+        # it". Credential deletion has its own authenticated endpoint.
+        api_key = body.api_key.strip() or _configured_custom_model_api_key(
+            target_profile
+        )
+        with _profile_scope(target_profile):
             return _apply_model_assignment_sync(
                 "main",
                 "custom",
                 body.model.strip(),
                 "",
                 base_url,
-                body.api_key.strip(),
+                api_key,
                 body.api_mode.strip().lower(),
                 body.context_length,
                 body.reasoning_effort.strip().lower(),
             )
 
     await asyncio.to_thread(_apply)
-    return {"ok": True, **get_custom_model(body.profile or profile)}
+    return {"ok": True, **get_custom_model(target_profile)}
 
 
 def _configured_custom_model_api_key(profile: Optional[str]) -> str:
@@ -6325,6 +6333,10 @@ def _custom_model_catalog_endpoints(base_url: str) -> list[str]:
         fallback = f"{root_url}/models" if root_url else "/models"
         return list(dict.fromkeys((f"{base_url}/models", fallback)))
     return [f"{base_url}/v1/models", f"{base_url}/models"]
+
+
+_CUSTOM_MODEL_CATALOG_REQUEST_TIMEOUT_SECONDS = 3.25
+_CUSTOM_MODEL_CATALOG_TOTAL_TIMEOUT_SECONDS = 7.0
 
 
 @app.post("/api/model/custom/discover")
@@ -6362,26 +6374,46 @@ async def discover_custom_models(
     catalog_limit = 1024 * 1024
     try:
         async with httpx.AsyncClient(
-            timeout=httpx.Timeout(8.0, connect=2.5),
+            timeout=httpx.Timeout(
+                _CUSTOM_MODEL_CATALOG_REQUEST_TIMEOUT_SECONDS,
+                connect=1.5,
+            ),
             follow_redirects=False,
         ) as client:
-            async with asyncio.timeout(8.0):
+            # Bound each candidate separately so one black-holed /v1 path
+            # cannot consume the entire discovery budget before the root
+            # /models fallback is attempted.
+            async with asyncio.timeout(_CUSTOM_MODEL_CATALOG_TOTAL_TIMEOUT_SECONDS):
                 for index, endpoint in enumerate(endpoints):
+                    has_fallback = index + 1 < len(endpoints)
                     request = client.build_request("GET", endpoint, headers=headers)
-                    response = await client.send(request, stream=True)
                     try:
-                        body_bytes = bytearray()
-                        oversized = False
-                        async for chunk in response.aiter_bytes():
-                            if len(body_bytes) + len(chunk) > catalog_limit:
-                                oversized = True
-                                break
-                            body_bytes.extend(chunk)
-                    finally:
-                        await response.aclose()
+                        response = await client.send(request, stream=True)
+                        try:
+                            body_bytes = bytearray()
+                            oversized = False
+                            async for chunk in response.aiter_bytes():
+                                if len(body_bytes) + len(chunk) > catalog_limit:
+                                    oversized = True
+                                    break
+                                body_bytes.extend(chunk)
+                        finally:
+                            await response.aclose()
+                    except (httpx.TimeoutException, httpx.NetworkError):
+                        result = {
+                            "ok": False,
+                            "reachable": False,
+                            "status": 0,
+                            "latency_ms": round((time.perf_counter() - started) * 1000),
+                            "message": "Endpoint is unreachable.",
+                            "models": [],
+                        }
+                        if has_fallback:
+                            last_result = result
+                            continue
+                        return result
 
                     latency_ms = round((time.perf_counter() - started) * 1000)
-                    has_fallback = index + 1 < len(endpoints)
                     if not response.is_success:
                         if response.status_code in {401, 403}:
                             message = "The endpoint rejected the API key."

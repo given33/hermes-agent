@@ -974,11 +974,15 @@ def _build_child_progress_callback(
                     spinner.print_above(f" {prefix}├─ 🔀 {summary_text}")
                 except Exception as e:
                     logger.debug("Spinner print_above failed: %s", e)
-            if parent_cb:
-                try:
-                    parent_cb("subagent_progress", f"{prefix}{summary_text}")
-                except Exception as e:
-                    logger.debug("Parent callback relay failed: %s", e)
+            # Keep this on the same identity-aware relay path as every other
+            # child event. Calling parent_cb directly used to drop the current
+            # subagent/session identity, so two nested orchestrators could
+            # collapse into one activity in hosted clients.
+            _relay(
+                "subagent.progress",
+                preview=f"{prefix}{summary_text}",
+                **kwargs,
+            )
             return
 
         # TASK_TOOL_STARTED — display and batch for parent relay

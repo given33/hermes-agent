@@ -16,7 +16,7 @@ import time
 import uuid
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Callable, Optional
+from typing import Any, Callable, Optional, Sequence
 
 from hermes_cli.dashboard_auth.base import (
     DashboardAuthProvider,
@@ -31,7 +31,7 @@ from hermes_constants import get_hermes_home
 ACCESS_TTL_SECONDS = 15 * 60
 REFRESH_TTL_SECONDS = 30 * 24 * 60 * 60
 ACCOUNT_DELETION_LEASE_SECONDS = 300
-SCHEMA_VERSION = 3
+SCHEMA_VERSION = 4
 
 _SCHEMA_SQL = """
 CREATE TABLE IF NOT EXISTS mobile_devices (
@@ -78,6 +78,17 @@ CREATE TABLE IF NOT EXISTS mobile_refresh_history (
 
 CREATE INDEX IF NOT EXISTS idx_mobile_refresh_history_session
     ON mobile_refresh_history(session_id);
+
+CREATE TABLE IF NOT EXISTS mobile_refresh_idempotency (
+    token_hash           TEXT PRIMARY KEY,
+    session_id           TEXT NOT NULL REFERENCES mobile_sessions(id) ON DELETE CASCADE,
+    response_nonce       BLOB NOT NULL,
+    response_ciphertext  BLOB NOT NULL,
+    created_at           INTEGER NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_mobile_refresh_idempotency_session
+    ON mobile_refresh_idempotency(session_id);
 
 CREATE TABLE IF NOT EXISTS mobile_apns_tokens (
     id              TEXT PRIMARY KEY,
@@ -141,6 +152,74 @@ def _new_refresh_token() -> str:
 
 def _bounded(value: str, limit: int) -> str:
     return str(value or "").strip()[:limit]
+
+
+def _refresh_replay_key(refresh_token: str) -> bytes:
+    return hashlib.sha256(
+        b"hermes-mobile-refresh-idempotency-v1\0" + refresh_token.encode("utf-8")
+    ).digest()
+
+
+def _seal_refresh_response(
+    consumed_refresh_token: str,
+    pair: "MobileTokenPair",
+) -> tuple[bytes, bytes]:
+    from cryptography.hazmat.primitives.ciphers.aead import AESGCM
+
+    nonce = secrets.token_bytes(12)
+    payload = json.dumps(
+        {
+            "access_token": pair.access_token,
+            "refresh_token": pair.refresh_token,
+            "session_id": pair.session.session_id,
+            "device_id": pair.session.device_id,
+            "user_id": pair.session.user_id,
+            "access_expires_at": pair.session.access_expires_at,
+            "refresh_expires_at": pair.session.refresh_expires_at,
+        },
+        separators=(",", ":"),
+        sort_keys=True,
+    ).encode("utf-8")
+    token_hash = _token_hash(consumed_refresh_token).encode("ascii")
+    ciphertext = AESGCM(_refresh_replay_key(consumed_refresh_token)).encrypt(
+        nonce,
+        payload,
+        token_hash,
+    )
+    return nonce, ciphertext
+
+
+def _open_refresh_response(
+    consumed_refresh_token: str,
+    nonce: bytes,
+    ciphertext: bytes,
+) -> Optional["MobileTokenPair"]:
+    from cryptography.hazmat.primitives.ciphers.aead import AESGCM
+
+    try:
+        token_hash = _token_hash(consumed_refresh_token).encode("ascii")
+        raw = AESGCM(_refresh_replay_key(consumed_refresh_token)).decrypt(
+            bytes(nonce),
+            bytes(ciphertext),
+            token_hash,
+        )
+        payload = json.loads(raw.decode("utf-8"))
+        record = MobileSessionRecord(
+            session_id=str(payload["session_id"]),
+            device_id=str(payload["device_id"]),
+            user_id=str(payload["user_id"]),
+            access_expires_at=int(payload["access_expires_at"]),
+            refresh_expires_at=int(payload["refresh_expires_at"]),
+        )
+        access_token = str(payload["access_token"])
+        refresh_token = str(payload["refresh_token"])
+        if not access_token.startswith("hma_") or not refresh_token.startswith("hmr_"):
+            return None
+        return MobileTokenPair(access_token, refresh_token, record)
+    except (KeyError, TypeError, ValueError, UnicodeError):
+        return None
+    except Exception:
+        return None
 
 
 @dataclass(frozen=True)
@@ -246,7 +325,8 @@ class MobileDeviceStore:
         )
         with self.connection() as conn, write_txn(conn):
             deletion = conn.execute(
-                "SELECT state FROM mobile_account_deletion_outbox WHERE user_id=?",
+                "SELECT state FROM mobile_account_deletion_outbox "
+                "WHERE user_id=? COLLATE NOCASE",
                 (normalized_user_id,),
             ).fetchone()
             if deletion is not None:
@@ -389,6 +469,42 @@ class MobileDeviceStore:
                 (old_hash, now),
             ).fetchone()
             if row is None:
+                replay = conn.execute(
+                    """
+                    SELECT i.response_nonce,i.response_ciphertext,s.*
+                    FROM mobile_refresh_idempotency AS i
+                    JOIN mobile_sessions AS s ON s.id=i.session_id
+                    JOIN mobile_devices AS d ON d.id=s.device_id
+                    WHERE i.token_hash=?
+                      AND s.revoked_at IS NULL
+                      AND d.revoked_at IS NULL
+                      AND s.refresh_expires_at>?
+                    """,
+                    (old_hash, now),
+                ).fetchone()
+                if replay is not None:
+                    replay_pair = _open_refresh_response(
+                        refresh_token,
+                        bytes(replay["response_nonce"]),
+                        bytes(replay["response_ciphertext"]),
+                    )
+                    if (
+                        replay_pair is not None
+                        and replay_pair.session.session_id == str(replay["id"])
+                        and replay_pair.session.device_id == str(replay["device_id"])
+                        and replay_pair.session.user_id == str(replay["user_id"])
+                        and _token_hash(replay_pair.refresh_token)
+                        == str(replay["refresh_token_hash"])
+                    ):
+                        conn.execute(
+                            "UPDATE mobile_sessions SET last_seen_at=?,updated_at=? WHERE id=?",
+                            (now, now, replay["id"]),
+                        )
+                        conn.execute(
+                            "UPDATE mobile_devices SET last_seen_at=?,updated_at=? WHERE id=?",
+                            (now, now, replay["device_id"]),
+                        )
+                        return replay_pair
                 replayed = conn.execute(
                     "SELECT session_id FROM mobile_refresh_history WHERE token_hash=?",
                     (old_hash,),
@@ -442,7 +558,17 @@ class MobileDeviceStore:
                 access_expires_at=access_expires_at,
                 refresh_expires_at=refresh_expires_at,
             )
-        return MobileTokenPair(next_access, next_refresh, record)
+            pair = MobileTokenPair(next_access, next_refresh, record)
+            nonce, ciphertext = _seal_refresh_response(refresh_token, pair)
+            conn.execute(
+                """
+                INSERT OR REPLACE INTO mobile_refresh_idempotency (
+                    token_hash,session_id,response_nonce,response_ciphertext,created_at
+                ) VALUES (?,?,?,?,?)
+                """,
+                (old_hash, row["id"], nonce, ciphertext, now),
+            )
+        return pair
 
     @staticmethod
     def _revoke_replayed_session(
@@ -933,6 +1059,7 @@ class MobileDeviceStore:
         limit: int = 100,
         lease_seconds: int = ACCOUNT_DELETION_LEASE_SECONDS,
         user_id: str = "",
+        exclude_ids: Sequence[str] | None = None,
     ) -> list[dict[str, Any]]:
         now = self._clock()
         lease_until = now + max(15, min(int(lease_seconds), 3600))
@@ -944,6 +1071,10 @@ class MobileDeviceStore:
         if str(user_id or "").strip():
             clauses.append("user_id=?")
             values.append(str(user_id).strip())
+        excluded = [str(item) for item in (exclude_ids or ()) if str(item)]
+        if excluded:
+            clauses.append(f"id NOT IN ({','.join('?' for _ in excluded)})")
+            values.extend(excluded)
         values.append(max(1, min(int(limit), 1000)))
         with self.connection() as conn, write_txn(conn):
             rows = conn.execute(
@@ -1070,7 +1201,8 @@ class MobileDeviceStore:
             return None
         with self.connection() as conn:
             row = conn.execute(
-                "SELECT * FROM mobile_account_deletion_outbox WHERE user_id=?",
+                "SELECT * FROM mobile_account_deletion_outbox "
+                "WHERE user_id=? COLLATE NOCASE",
                 (normalized_user_id,),
             ).fetchone()
         if row is None:
@@ -1087,7 +1219,8 @@ class MobileDeviceStore:
             return False
         with self.connection() as conn, write_txn(conn):
             changed = conn.execute(
-                "DELETE FROM mobile_account_deletion_outbox WHERE user_id=? "
+                "DELETE FROM mobile_account_deletion_outbox "
+                "WHERE user_id=? COLLATE NOCASE "
                 "AND state IN ('delivered','no_recipients','permanent_failure')",
                 (normalized_user_id,),
             ).rowcount

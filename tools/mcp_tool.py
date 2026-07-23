@@ -682,9 +682,13 @@ def _wrap_command_with_watchdog(command: str, args: list) -> tuple[str, list]:
     See ``tools/mcp_stdio_watchdog.py`` module docstring for the full
     rationale. Returns the (command, args) unchanged on any platform/failure
     where the wrap can't safely apply, so this can never be the reason a
-    previously-working MCP server stops starting. The watchdog uses process
-    groups on POSIX and falls back to terminating the direct child on Windows.
+    previously-working MCP server stops starting. The watchdog depends on
+    POSIX process groups. On Windows, inserting an intermediate Python process
+    can close the inherited MCP stdio handles before the real server starts,
+    so the direct command remains the reliable lifecycle path there.
     """
+    if os.name != "posix":
+        return command, args
     try:
         my_pid = os.getpid()
     except Exception:
