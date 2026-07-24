@@ -819,6 +819,62 @@ class CollaborationDashboardTests(unittest.TestCase):
         self.assertEqual(message["activities"][0]["status"], "completed")
         self.assertEqual(message["activities"][0]["completed_at"], now)
 
+    def test_native_message_exposes_stable_mobile_copy_context(self):
+        module = load_module()
+        message = {
+            "role": "assistant",
+            "name": "dbb3-manager",
+            "content": "结构化计划已经完成。",
+            "status": "completed",
+            "created_at": 1_000,
+            "updated_at": 4_500,
+            "meta": {
+                "profile": "dbb3-manager",
+                "role_stage": "manager_planning",
+                "role_label": "Hermes 调度员 · 规划",
+                "actual_provider": "openai",
+                "actual_model": "gpt-test",
+                "handoff_to": ["dbb3-worker"],
+            },
+        }
+
+        module._project_native_message(message)
+
+        self.assertEqual(message["sender_name"], "Hermes 调度员 · 规划")
+        self.assertEqual(message["role_stage"], "manager_planning")
+        self.assertEqual(message["role_label"], "Hermes 调度员 · 规划")
+        self.assertEqual(message["duration_ms"], 3_500)
+        self.assertEqual(message["model_display"], "openai · gpt-test")
+        self.assertEqual(
+            message["copy_context"],
+            {
+                "version": 1,
+                "sender": {
+                    "id": "dbb3-manager",
+                    "name": "Hermes 调度员 · 规划",
+                    "role": "dispatcher",
+                    "profile": "dbb3-manager",
+                },
+                "model": {
+                    "provider": "openai",
+                    "name": "gpt-test",
+                    "display_name": "openai · gpt-test",
+                },
+                "workflow": {
+                    "stage": "manager_planning",
+                    "label": "Hermes 调度员 · 规划",
+                    "status": "completed",
+                    "handoff_to": ["dbb3-worker"],
+                },
+                "timing": {
+                    "created_at": 1_000,
+                    "started_at": 1_000,
+                    "completed_at": 4_500,
+                    "duration_ms": 3_500,
+                },
+            },
+        )
+
     def test_same_runtime_session_keeps_each_completed_turn(self):
         module = load_module()
         conversation = module.create_single_conversation("default")
@@ -4128,7 +4184,14 @@ class CollaborationDashboardTests(unittest.TestCase):
 
         def remote_role(_conversation_id, _turn_id, **kwargs):
             stage = kwargs["role_stage"]
-            remote_stages.append((stage, kwargs["profile"], kwargs.get("connector_id")))
+            remote_stages.append(
+                (
+                    stage,
+                    kwargs["profile"],
+                    kwargs.get("connector_id"),
+                    kwargs.get("role_label"),
+                )
+            )
             if stage == "manager_planning":
                 return (
                     json.dumps(
@@ -4196,7 +4259,7 @@ class CollaborationDashboardTests(unittest.TestCase):
         )
 
         self.assertEqual(
-            [stage for stage, _profile, _connector in remote_stages],
+            [stage for stage, _profile, _connector, _label in remote_stages],
             ["manager_planning", "worker", "reviewer", "manager_handoff"],
         )
         self.assertEqual(local_stages[0][:2], ("reporter", "default"))
@@ -4208,6 +4271,18 @@ class CollaborationDashboardTests(unittest.TestCase):
         self.assertEqual(
             conversation["hosted_turns"]["turn-manager-owned"]["manager_plan"]["workers"],
             ["dbb3-worker"],
+        )
+        manager_labels = {
+            label
+            for _stage, profile, _connector, label in remote_stages
+            if profile == "dbb3-manager"
+        }
+        self.assertEqual(
+            manager_labels,
+            {"Hermes 调度员 · 规划", "Hermes 调度员 · 交接"},
+        )
+        self.assertFalse(
+            any("DBB3 Manager" in str(label) for label in manager_labels)
         )
 
 

@@ -2263,6 +2263,8 @@ _WORKER_TARGET_PROFILES = {
     "pc": "pc-worker",
 }
 _DBB3_MANAGER_PROFILE = "dbb3-manager"
+_HERMES_MANAGER_NAME = "Hermes Manager"
+_HERMES_MANAGER_LABEL = "Hermes 调度员"
 _REMOTE_RUN_PROFILES = frozenset(
     {_DBB3_MANAGER_PROFILE, "dbb3-worker", "pc-worker", "reviewer", "default"}
 )
@@ -2492,7 +2494,7 @@ def _normalize_manager_plan(
         targets=requested_targets,
     )
     if not worker_profiles:
-        raise RuntimeError("DBB3 Manager did not leave an eligible execution worker")
+        raise RuntimeError(f"{_HERMES_MANAGER_NAME} did not leave an eligible execution worker")
 
     raw_steps = parsed.get("plan") if isinstance(parsed.get("plan"), list) else []
     steps: list[dict[str, Any]] = []
@@ -2538,7 +2540,7 @@ def _normalize_manager_plan(
     return {
         "version": 1,
         "difficulty": difficulty,
-        "reason": str(parsed.get("reason") or "DBB3 Manager selected a bounded execution plan.").strip()[:1000],
+        "reason": str(parsed.get("reason") or f"{_HERMES_MANAGER_NAME} selected a bounded execution plan.").strip()[:1000],
         "workers": worker_profiles,
         "reviewer_target": reviewer_target,
         "plan": steps,
@@ -2556,7 +2558,7 @@ def _manager_plan_prompt(
     return "\n".join(
         item
         for item in (
-            "你是 DBB3 Manager，负责复杂任务的难度判断、拆分和执行节点选择。",
+            "你是 Hermes Manager，负责复杂任务的难度判断、拆分和执行节点选择。",
             "只规划和调度，不执行用户任务，也不向用户生成最终答案。",
             "可用执行节点只有 dbb3-worker 与 pc-worker；默认审阅节点是 DBB3，必要时可选择 PC。",
             f"服务器路由建议：{', '.join(fallback_workers)}",
@@ -2596,7 +2598,7 @@ def _normalize_manager_handoff(
     }
     for field in _MANAGER_HANDOFF_FIELDS:
         if field not in handoff:
-            raise RuntimeError(f"DBB3 Manager handoff is missing {field}")
+            raise RuntimeError(f"{_HERMES_MANAGER_NAME} handoff is missing {field}")
     return handoff
 
 
@@ -6054,7 +6056,7 @@ def execute_hosted_workflow(
                 "kind": "message",
                 "meta": {
                     "role_stage": "manager_planning",
-                    "role_label": "DBB3 Manager · 规划",
+                    "role_label": f"{_HERMES_MANAGER_LABEL} · 规划",
                     "profile": _DBB3_MANAGER_PROFILE,
                     "final_report": False,
                 },
@@ -6065,7 +6067,7 @@ def execute_hosted_workflow(
             turn_id,
             profile=_DBB3_MANAGER_PROFILE,
             role_stage="manager_planning",
-            role_label="DBB3 Manager · 规划",
+            role_label=f"{_HERMES_MANAGER_LABEL} · 规划",
             prompt=_manager_plan_prompt(
                 content=content,
                 fallback_workers=fallback_worker_profiles,
@@ -6080,7 +6082,7 @@ def execute_hosted_workflow(
             connector_id="dbb3-primary",
         )
         if manager_status != "completed":
-            raise RuntimeError(manager_result or "DBB3 Manager planning failed")
+            raise RuntimeError(manager_result or f"{_HERMES_MANAGER_NAME} planning failed")
         manager_plan = _normalize_manager_plan(
             manager_result,
             content=content,
@@ -6671,10 +6673,10 @@ def execute_hosted_workflow(
                 turn_id,
                 profile=_DBB3_MANAGER_PROFILE,
                 role_stage="manager_handoff",
-                role_label="DBB3 Manager · 交接",
+                role_label=f"{_HERMES_MANAGER_LABEL} · 交接",
                 prompt="\n".join(
                     (
-                        "你是 DBB3 Manager。根据下方已经完成的执行与审阅记录生成结构化交接，不能重新执行任务，不能补写不存在的证据。",
+                        "你是 Hermes Manager。根据下方已经完成的执行与审阅记录生成结构化交接，不能重新执行任务，不能补写不存在的证据。",
                         "只输出 JSON 对象，必须包含 task_goal、plan、worker_results、review_verdict、rework_history、artifacts、failures、suggested_conclusion。",
                         json.dumps(source_handoff, ensure_ascii=False, default=str),
                     )
@@ -6688,7 +6690,7 @@ def execute_hosted_workflow(
             )
         )
         if manager_handoff_status != "completed":
-            raise RuntimeError(manager_handoff_result or "DBB3 Manager handoff failed")
+            raise RuntimeError(manager_handoff_result or f"{_HERMES_MANAGER_NAME} handoff failed")
         manager_handoff = _normalize_manager_handoff(
             manager_handoff_result,
             task_goal=content,
@@ -6732,10 +6734,10 @@ def execute_hosted_workflow(
                 if task_id and not remote_workers
                 else "",
                 reporter_kanban_instruction,
-                "你只能根据 DBB3 Manager 已验证的结构化交接生成一次用户答案。",
+                "你只能根据 Hermes Manager 已验证的结构化交接生成一次用户答案。",
                 "不得重新执行任务，不得调用工具补做工作，不得编造交接中缺失的结果或证据。",
                 "清楚区分已完成、失败、未完成和需要用户决定的事项。",
-                "DBB3 Manager 结构化交接：",
+                "Hermes Manager 结构化交接：",
                 json.dumps(manager_handoff, ensure_ascii=False, default=str),
                 artifact_instruction,
             )
@@ -7311,6 +7313,8 @@ def _project_native_message(message: dict[str, Any]) -> dict[str, Any]:
         "user": "user",
         "system": "system",
     }.get(base_stage, base_stage or "hermes")
+    if base_stage.startswith("manager"):
+        logical_role = "dispatcher"
     profile = str(meta.get("profile") or message.get("name") or "default")
     model = str(meta.get("actual_model") or message.get("model") or "")
     provider = str(meta.get("actual_provider") or message.get("provider") or "")
@@ -7338,27 +7342,77 @@ def _project_native_message(message: dict[str, Any]) -> dict[str, Any]:
     completed_at = message.get("completed_at") or meta.get("completed_at")
     if terminal and completed_at is None:
         completed_at = updated_at
+    started_at = message.get("started_at") or meta.get("started_at") or created_at
+    duration_ms = message.get("duration_ms")
+    if not isinstance(duration_ms, (int, float)):
+        duration_ms = meta.get("duration_ms")
+    if (
+        not isinstance(duration_ms, (int, float))
+        and isinstance(started_at, (int, float))
+        and isinstance(completed_at, (int, float))
+    ):
+        duration_ms = max(0, int(completed_at) - int(started_at))
+    role_label = str(meta.get("role_label") or "")
+    sender_id = str(meta.get("sender_id") or profile or logical_role)
+    sender_name = str(
+        meta.get("sender_name")
+        or role_label
+        or message.get("name")
+        or profile
+    )
+    model_display = " · ".join(item for item in (provider, model) if item)
+    copy_context = {
+        "version": 1,
+        "sender": {
+            "id": sender_id,
+            "name": sender_name,
+            "role": logical_role,
+            "profile": profile,
+        },
+        "model": {
+            "provider": provider,
+            "name": model,
+            "display_name": model_display,
+        },
+        "workflow": {
+            "stage": stage,
+            "label": role_label,
+            "status": message_status,
+            "handoff_to": list(handoff_to),
+        },
+        "timing": {
+            "created_at": created_at,
+            "started_at": started_at,
+            "completed_at": completed_at,
+            "duration_ms": duration_ms,
+        },
+    }
     message.update(
         {
-            "sender_id": str(meta.get("sender_id") or profile or logical_role),
-            "sender_name": str(meta.get("sender_name") or meta.get("role_label") or message.get("name") or profile),
+            "sender_id": sender_id,
+            "sender_name": sender_name,
             # Keep the canonical chat role (assistant/user/system) intact;
             # native clients read the participant role from sender_role.
             "role": canonical_role,
             "collaboration_role": logical_role,
             "sender_role": logical_role,
+            "role_stage": stage,
+            "role_label": role_label,
             "profile": profile,
             "avatar": str(meta.get("avatar") or f"role:{logical_role}"),
             "status": message_status,
             "model": model,
             "provider": provider,
+            "model_display": model_display,
             "handoff_to": list(handoff_to),
             "created_at": created_at,
             "updated_at": updated_at,
-            "started_at": message.get("started_at") or meta.get("started_at") or created_at,
+            "started_at": started_at,
             "completed_at": completed_at,
+            "duration_ms": duration_ms,
             "activity_count": len(activities),
             "activities": activities,
+            "copy_context": copy_context,
             "meta": meta,
         }
     )

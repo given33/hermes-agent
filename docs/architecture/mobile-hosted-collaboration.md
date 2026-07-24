@@ -20,20 +20,20 @@ flowchart TD
     A["Hermes iOS submits a message"] --> B["Main server persists task"]
     B --> C{"Server intent routing"}
     C -->|simple| D["Main server default Hermes"]
-    C -->|complex| E["DBB3 Manager plans and splits"]
+    C -->|complex| E["Hermes Manager plans and splits on DBB3"]
     E --> F["DBB3 Worker"]
     E --> G["WSL PC Worker"]
     F --> H["Reviewer, DBB3 by default"]
     G --> H
     H -->|rework| E
-    H -->|approved| I["DBB3 Manager structured handoff"]
+    H -->|approved| I["Hermes Manager structured handoff"]
     I --> J["Main server Reporter"]
     D --> K["Persist result, files, events, APNs"]
     J --> K
     K --> L["Hermes iOS resumes at any time"]
 ```
 
-The DBB3 handoff contains the task objective, plan, worker results, reviewer
+The Hermes Manager handoff contains the task objective, plan, worker results, reviewer
 decision, rework history, file hashes, unresolved items, and a recommended
 conclusion. The main server Reporter only summarizes verified handoff data. It
 does not rerun the task or invent missing evidence.
