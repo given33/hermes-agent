@@ -104,6 +104,40 @@ class TestCodingContextBlock:
         assert "coding agent" not in _stable_prompt(agent)
 
 
+class TestEvidenceFirstExecutionGuidance:
+    def test_injected_with_task_completion_guidance_for_tool_sessions(self):
+        stable = _stable_prompt(
+            _make_agent(
+                valid_tool_names=["read_file"],
+                _task_completion_guidance=True,
+            )
+        )
+
+        assert "# Finishing the job" in stable
+        assert "# Evidence-first execution" in stable
+        assert "reconcile every user requirement" in stable
+
+    def test_absent_when_task_completion_guidance_is_disabled(self):
+        stable = _stable_prompt(
+            _make_agent(
+                valid_tool_names=["read_file"],
+                _task_completion_guidance=False,
+            )
+        )
+
+        assert "# Evidence-first execution" not in stable
+
+    def test_absent_without_tools(self):
+        stable = _stable_prompt(
+            _make_agent(
+                valid_tool_names=[],
+                _task_completion_guidance=True,
+            )
+        )
+
+        assert "# Evidence-first execution" not in stable
+
+
 class TestTelegramRichMessagesHint:
     """Verify that TELEGRAM_RICH_MESSAGES_HINT is conditionally included."""
 

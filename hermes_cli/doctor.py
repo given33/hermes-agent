@@ -201,6 +201,50 @@ def _fail_and_issue(text: str, detail: str, fix: str, issues: list[str]) -> None
     issues.append(fix)
 
 
+def _check_context_engineering(hermes_home: Path, cwd: Path | None = None) -> None:
+    """Report prompt-context bloat and precedence surprises without rewriting files."""
+    _section("Context Engineering")
+    try:
+        from agent.context_diagnostics import analyze_context_sources
+        from agent.skill_utils import get_all_skills_dirs
+
+        report = analyze_context_sources(
+            cwd=(cwd or Path.cwd()),
+            hermes_home=hermes_home,
+            skill_dirs=get_all_skills_dirs(),
+        )
+    except Exception as exc:
+        check_warn("Context diagnostics could not complete", f"({exc})")
+        return
+
+    always_on = [
+        source
+        for source in report.sources
+        if source.active and source.kind != "skill"
+    ]
+    if always_on:
+        check_ok(
+            f"Always-on file context: about {report.always_on_estimated_tokens:,} "
+            f"tokens across {len(always_on)} source(s)"
+        )
+    else:
+        check_info("No non-empty persona, memory, or project context files found")
+
+    skill_count = sum(source.kind == "skill" for source in report.sources)
+    if skill_count:
+        check_ok(f"{skill_count} skill guide(s) indexed for progressive loading")
+
+    if not report.findings:
+        check_ok("Context sources are right-sized with no precedence or duplication warnings")
+        return
+
+    for finding in report.findings:
+        detail_paths = ", ".join(str(path) for path in finding.paths[:3])
+        if len(finding.paths) > 3:
+            detail_paths += f", +{len(finding.paths) - 3} more"
+        check_warn(finding.message, f"({detail_paths})" if detail_paths else "")
+
+
 # Deprecated / legacy config keys still read for back-compat. Doctor surfaces
 # them as non-failing warnings with the modern replacement — it does not
 # auto-migrate or delete (migrations live in config.py version steps).
@@ -1484,6 +1528,8 @@ def run_doctor(args):
                 check_info(f"WAL file is {wal_size // (1024*1024)} MB (normal for active sessions)")
         except Exception:
             pass
+
+    _check_context_engineering(hermes_home)
 
     _check_gateway_service_linger(issues)
     _check_s6_supervision(issues)

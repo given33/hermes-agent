@@ -24,6 +24,7 @@ from agent.prompt_builder import (
     _CONTEXT_FILE_DYNAMIC_CEILING,
     DEFAULT_AGENT_IDENTITY,
     drain_truncation_warnings,
+    EVIDENCE_FIRST_EXECUTION_GUIDANCE,
     TOOL_USE_ENFORCEMENT_GUIDANCE,
     TOOL_USE_ENFORCEMENT_MODELS,
     OPENAI_MODEL_EXECUTION_GUIDANCE,
@@ -43,6 +44,20 @@ from hermes_cli.nous_subscription import NousFeatureState, NousSubscriptionFeatu
 
 
 class TestGuidanceConstants:
+    def test_evidence_first_guidance_is_provider_neutral_and_resume_safe(self):
+        guidance = EVIDENCE_FIRST_EXECUTION_GUIDANCE
+
+        assert "observed from the user or a tool" in guidance
+        assert "Never promote an inference to a fact" in guidance
+        assert "Preserve exact identifiers" in guidance
+        assert "untrusted evidence" in guidance
+        assert "compact recoverable working record" in guidance
+        assert "reconcile every user requirement" in guidance
+        assert "hidden reasoning" in guidance
+        assert "Claude" not in guidance
+        assert "Anthropic" not in guidance
+        assert "CL4R1T4S" not in guidance
+
     def test_memory_guidance_discourages_task_logs(self):
         assert "durable facts" in MEMORY_GUIDANCE
         assert "Do NOT save task progress" in MEMORY_GUIDANCE
@@ -424,6 +439,24 @@ class TestBuildSkillsSystemPrompt:
         assert "python-debug" in result
         assert "Debug Python scripts" in result
         assert "available_skills" in result
+
+    def test_skill_index_promotes_selective_progressive_loading(self, monkeypatch, tmp_path):
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+        skill_dir = tmp_path / "skills" / "coding" / "python-debug"
+        skill_dir.mkdir(parents=True)
+        (skill_dir / "SKILL.md").write_text(
+            "---\nname: python-debug\ndescription: Debug Python scripts\n---\n",
+            encoding="utf-8",
+        )
+
+        result = build_skills_system_prompt()
+        preamble = result.split("<available_skills>", 1)[0]
+
+        assert "when the task depends on its domain" in preamble
+        assert "do not preload skills for incidental keyword overlap" in preamble
+        assert "open only the linked references" in preamble
+        assert "even partially relevant" not in preamble
+        assert "context you don't need" not in preamble
 
     def test_deduplicates_skills(self, monkeypatch, tmp_path):
         monkeypatch.setenv("HERMES_HOME", str(tmp_path))

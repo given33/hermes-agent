@@ -48,6 +48,22 @@ def _make_tool_defs(*names: str) -> list:
     ]
 
 
+@pytest.fixture(autouse=True)
+def _stable_model_context_length():
+    """Keep unit-only agent construction independent of models.dev network I/O."""
+    with (
+        patch(
+            "agent.context_compressor.get_model_context_length",
+            return_value=131_072,
+        ) as mock_context_length,
+        patch(
+            "agent.model_metadata.get_model_context_length",
+            return_value=131_072,
+        ),
+    ):
+        yield mock_context_length
+
+
 def test_is_destructive_command_treats_cp_as_mutating():
     assert run_agent._is_destructive_command("cp .env.local .env") is True
 
@@ -97,7 +113,7 @@ def test_run_conversation_dict_returns_include_final_response():
 
 
 @pytest.fixture()
-def agent():
+def agent(_stable_model_context_length):
     """Minimal AIAgent with mocked OpenAI client and tool loading."""
     with (
         patch(
@@ -113,6 +129,7 @@ def agent():
             skip_context_files=True,
             skip_memory=True,
         )
+        _stable_model_context_length.assert_called()
         a.client = MagicMock()
         return a
 
@@ -1676,10 +1693,14 @@ class TestTaskCompletionGuidance:
     def test_default_injects_for_claude(self):
         """The block must reach Claude by default — that's the
         primary motivating model family."""
-        from agent.prompt_builder import TASK_COMPLETION_GUIDANCE
+        from agent.prompt_builder import (
+            EVIDENCE_FIRST_EXECUTION_GUIDANCE,
+            TASK_COMPLETION_GUIDANCE,
+        )
         agent = self._make_agent(model="anthropic/claude-opus-4.8")
         prompt = agent._build_system_prompt()
         assert TASK_COMPLETION_GUIDANCE in prompt
+        assert EVIDENCE_FIRST_EXECUTION_GUIDANCE in prompt
 
     def test_default_injects_for_deepseek(self):
         """And for DeepSeek — the other model that failed the Sarasota
@@ -1698,12 +1719,16 @@ class TestTaskCompletionGuidance:
         assert TASK_COMPLETION_GUIDANCE in prompt
 
     def test_false_disables(self):
-        from agent.prompt_builder import TASK_COMPLETION_GUIDANCE
+        from agent.prompt_builder import (
+            EVIDENCE_FIRST_EXECUTION_GUIDANCE,
+            TASK_COMPLETION_GUIDANCE,
+        )
         agent = self._make_agent(
             model="anthropic/claude-opus-4.8", task_completion_guidance=False
         )
         prompt = agent._build_system_prompt()
         assert TASK_COMPLETION_GUIDANCE not in prompt
+        assert EVIDENCE_FIRST_EXECUTION_GUIDANCE not in prompt
 
     def test_no_tools_no_injection(self):
         """Same gate as tool_use_enforcement — no tools means no guidance.
@@ -7325,6 +7350,7 @@ class TestAnthropicCredentialRefresh:
 
         with (
             patch.object(agent, "_try_refresh_anthropic_client_credentials", return_value=False),
+            patch("tools.lazy_deps.ensure", return_value=True),
             pytest.raises(RuntimeError, match="input malformed"),
         ):
             agent._anthropic_messages_create({"model": "claude-sonnet-4-20250514"})
@@ -7353,7 +7379,14 @@ class TestAnthropicCredentialRefresh:
         )
         agent._anthropic_client.messages.create.return_value = response
 
-        with patch.object(agent, "_try_refresh_anthropic_client_credentials", return_value=False):
+        with (
+            patch.object(
+                agent,
+                "_try_refresh_anthropic_client_credentials",
+                return_value=False,
+            ),
+            patch("tools.lazy_deps.ensure", return_value=True),
+        ):
             result = agent._anthropic_messages_create({"model": "claude-sonnet-4-20250514"})
 
         agent._anthropic_client.messages.create.assert_called_once_with(model="claude-sonnet-4-20250514")
@@ -7663,15 +7696,20 @@ class TestAnthropicInterruptHandler:
         from run_agent import AIAgent
         from agent.chat_completion_helpers import interruptible_api_call
 
-        agent = AIAgent(
-            api_key="test-key",
-            base_url="https://api.anthropic.com",
-            provider="anthropic",
-            model="claude-test",
-            quiet_mode=True,
-            skip_context_files=True,
-            skip_memory=True,
-        )
+        with (
+            patch("run_agent.get_tool_definitions", return_value=[]),
+            patch("run_agent.check_toolset_requirements", return_value={}),
+            patch("agent.anthropic_adapter._anthropic_sdk"),
+        ):
+            agent = AIAgent(
+                api_key="test-key",
+                base_url="https://api.anthropic.com",
+                provider="anthropic",
+                model="claude-test",
+                quiet_mode=True,
+                skip_context_files=True,
+                skip_memory=True,
+            )
         agent.api_mode = "anthropic_messages"
         agent._interrupt_requested = False
         agent._anthropic_client = MagicMock()
