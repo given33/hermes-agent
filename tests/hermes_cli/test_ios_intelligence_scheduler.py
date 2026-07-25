@@ -770,7 +770,7 @@ def test_scheduler_moves_old_trajectory_to_encrypted_cold_storage(tmp_path):
         ).fetchone()[0] == 0
 
 
-def test_nighttime_weather_uses_live_behavior_and_retires_legacy_summary(tmp_path):
+def test_nighttime_weather_evaluates_but_defers_delivery_until_live_morning_recheck(tmp_path):
     store = IOSIntelligenceStore(tmp_path)
     tz = ZoneInfo("Asia/Shanghai")
     quiet_now = int(datetime(2026, 7, 18, 23, 30, tzinfo=tz).timestamp())
@@ -795,16 +795,22 @@ def test_nighttime_weather_uses_live_behavior_and_retires_legacy_summary(tmp_pat
         {"window": {"arrival_at": quiet_now + 12 * 3600}},
     )
     quiet_result = scheduler.evaluate_account("alice", force=True, now=quiet_now)
-    assert quiet_result["suppressed_reason"] is None
+    assert quiet_result["suppressed_reason"] == "quiet_hours"
     assert quiet_result["weather_queried"] is True
     assert weather.calls
-    assert quiet_result["notification"]["state"] == "pending"
+    assert quiet_result["notification"] is None
+    assert quiet_result["quiet_summary"]["delivered_at"] is None
     assert quiet_result["quiet_summary_notification"] is None
-    assert store.get_quiet_summary("alice", "2026-07-18") is None
+    assert store.pending_notifications(now=quiet_now) == []
+    assert store.get_quiet_summary("alice", "2026-07-19") is not None
 
     morning = int(datetime(2026, 7, 19, 8, 0, tzinfo=tz).timestamp())
-    morning_result = scheduler.evaluate_account("alice", force=False, now=morning)
+    morning_result = scheduler.evaluate_account("alice", force=True, now=morning)
     assert morning_result["quiet_summary_notification"] is None
+    # The old summary is not pushed blindly: the 08:00 evaluation makes a
+    # fresh decision and suppresses this fixture's now-stale rain window.
+    assert morning_result["suppressed_reason"] == "below_threshold"
+    assert morning_result["notification"] is None
     assert store.get_quiet_summary("alice", "2026-07-18") is None
     assert store.get_quiet_summary("alice", "2026-07-19") is None
 
@@ -842,7 +848,10 @@ def test_nighttime_weather_distinguishes_indoor_stationary_from_leaving(tmp_path
 
     assert leaving["behavior"]["leave_probability"] >= 0.9
     assert leaving["weather_queried"] is True
-    assert leaving["notification"]["state"] == "pending"
+    assert leaving["notification"] is None
+    assert leaving["suppressed_reason"] == "quiet_hours"
+    assert leaving["quiet_summary"]["delivered_at"] is None
+    assert store.pending_notifications(now=now + 1) == []
     assert weather.calls
 
 
@@ -868,14 +877,57 @@ def test_nighttime_weather_retracts_alert_when_risk_disappears(tmp_path):
         wet["weather_window"]["departure_at"],
         tz,
     ).date().isoformat()
-    assert wet["notification"]["state"] == "pending"
-    assert store.get_quiet_summary("alice", summary_date) is None
+    assert wet["notification"] is None
+    assert wet["suppressed_reason"] == "quiet_hours"
+    assert store.get_quiet_summary("alice", summary_date) is not None
 
     weather.fx_time = "2026-07-20T09:30:00+08:00"
     dry = scheduler.evaluate_account("alice", force=True, now=now + 60)
 
     assert dry["alert"]["should_notify"] is False
     assert store.get_quiet_summary("alice", summary_date) is None
+
+
+def test_quiet_hour_boundaries_are_2300_through_0759(tmp_path):
+    scheduler = IOSIntelligenceScheduler(
+        store=IOSIntelligenceStore(tmp_path),
+        config={"ios_intelligence": {"timezone": "Asia/Shanghai"}},
+    )
+    tz = ZoneInfo("Asia/Shanghai")
+
+    before = datetime(2026, 7, 18, 22, 59, 59, tzinfo=tz)
+    starts = datetime(2026, 7, 18, 23, 0, 0, tzinfo=tz)
+    before_end = datetime(2026, 7, 19, 7, 59, 59, tzinfo=tz)
+    ends = datetime(2026, 7, 19, 8, 0, 0, tzinfo=tz)
+
+    assert scheduler._is_quiet(before) is False
+    assert scheduler._is_quiet(starts) is True
+    assert scheduler._is_quiet(before_end) is True
+    assert scheduler._is_quiet(ends) is False
+    assert scheduler._next_non_quiet_at(int(starts.timestamp())) == int(ends.timestamp())
+    assert scheduler._next_non_quiet_at(int(before_end.timestamp())) == int(ends.timestamp())
+    assert scheduler._next_non_quiet_at(int(ends.timestamp())) == int(ends.timestamp())
+
+
+def test_quiet_hour_policy_uses_configured_window(tmp_path):
+    scheduler = IOSIntelligenceScheduler(
+        store=IOSIntelligenceStore(tmp_path),
+        config={
+            "ios_intelligence": {
+                "timezone": "Asia/Shanghai",
+                "weather": {"quiet_start_hour": 1, "quiet_end_hour": 6},
+            }
+        },
+    )
+    tz = ZoneInfo("Asia/Shanghai")
+    starts = datetime(2026, 7, 19, 1, 0, tzinfo=tz)
+    before_end = datetime(2026, 7, 19, 5, 59, tzinfo=tz)
+    ends = datetime(2026, 7, 19, 6, 0, tzinfo=tz)
+
+    assert scheduler._is_quiet(starts) is True
+    assert scheduler._is_quiet(before_end) is True
+    assert scheduler._is_quiet(ends) is False
+    assert scheduler._next_non_quiet_at(int(starts.timestamp())) == int(ends.timestamp())
 
 
 def test_weather_outbox_retry_skips_devices_already_delivered(monkeypatch, tmp_path):
@@ -1036,6 +1088,70 @@ def test_concurrent_schedulers_deliver_each_notification_once(monkeypatch, tmp_p
     assert sum(len(batch) for batch in outcomes) == 1
     assert len(calls) == 1
     assert store.pending_notifications(now=now) == []
+
+
+def test_weather_delivery_renews_lease_per_device_during_slow_batch(monkeypatch, tmp_path):
+    """A second worker cannot reclaim while the first walks a large device set."""
+
+    from hermes_cli.dashboard_auth import mobile_notifications
+
+    store = IOSIntelligenceStore(tmp_path)
+    now = 1_800_000_000
+    queued = store.enqueue_notification(
+        "alice",
+        {"title": "Rain", "body": "Bring an umbrella", "category": "smart-weather"},
+        idempotency_key="weather:slow-device-batch",
+        expires_at=now + 3600,
+        now=now,
+    )
+    clock = {"now": now}
+    registrations = [
+        {"id": f"registration-{index}", "bundle_id": "app.sunstone1029.fig1171"}
+        for index in range(40)
+    ]
+    reclaim_attempts: list[list[dict[str, Any]]] = []
+
+    class DeviceStore:
+        def list_active_apns_registrations(self, *, user_id, environment):
+            assert (user_id, environment) == ("alice", "production")
+            return registrations
+
+        def disable_apns_registration(self, **_kwargs):
+            return True
+
+    def sender(_registration, _payload, _collapse_id):
+        clock["now"] += 11
+        if clock["now"] >= now + 308 and not reclaim_attempts:
+            reclaim_attempts.append(
+                store.claim_pending_notifications(now=clock["now"], lease_seconds=300)
+            )
+        return 200, ""
+
+    original_delivery = mobile_notifications.deliver_account_notification_push
+
+    def deliver(**kwargs):
+        return original_delivery(
+            **kwargs,
+            device_store=DeviceStore(),
+            sender=sender,
+        )
+
+    monkeypatch.setenv("HERMES_APNS_BUNDLE_ID", "app.sunstone1029.fig1171")
+    monkeypatch.setattr(mobile_notifications, "deliver_account_notification_push", deliver)
+    scheduler = IOSIntelligenceScheduler(store=store, clock=lambda: clock["now"])
+
+    outcome = scheduler.deliver_pending_notifications(now=now)
+
+    assert reclaim_attempts == [[]]
+    assert outcome[0]["state"] == "delivered"
+    assert len(outcome[0]["deliveries"]) == len(registrations)
+    assert store.pending_notifications(now=clock["now"]) == []
+    with sqlite3.connect(store.path) as conn:
+        state, deliveries = conn.execute(
+            "SELECT state,deliveries FROM ios_notification_outbox WHERE id=?",
+            (queued["id"],),
+        ).fetchone()
+    assert (state, deliveries) == ("delivered", 1)
 
 
 def test_legacy_quiet_summary_retirement_is_idempotent(tmp_path):

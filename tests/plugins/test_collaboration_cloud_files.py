@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import asyncio
+import hashlib
 import importlib.util
 import json
 from pathlib import Path
@@ -1060,6 +1062,7 @@ def test_connector_cancellation_includes_current_cursor_and_reaches_terminal_sta
             headers=auth,
             json={
                 "connector_id": "dbb3-primary",
+                "claim_token": cancellation["claim_token"],
                 "checkpoint_cursor": 8,
                 "summary": "Cancellation applied",
             },
@@ -1139,13 +1142,15 @@ def test_deleting_active_remote_conversation_retains_cancellation_until_ack(
             json={"connector_id": "dbb3-primary", "limit": 5, "lease_seconds": 30},
         )
         assert pulled.status_code == 200
-        assert pulled.json()["cancellations"][0]["remote_run_id"] == remote["id"]
+        cancellation = pulled.json()["cancellations"][0]
+        assert cancellation["remote_run_id"] == remote["id"]
 
         acknowledged = client.post(
             f"{prefix}/connector/runs/{remote['id']}/cancel-ack",
             headers=auth,
             json={
                 "connector_id": "dbb3-primary",
+                "claim_token": cancellation["claim_token"],
                 "checkpoint_cursor": 1,
                 "summary": "cancelled before deletion",
             },
@@ -1694,7 +1699,7 @@ def test_connector_credentials_and_profiles_are_bound_to_devices(tmp_path, monke
         assert hidden.status_code == 404
 
 
-def test_terminal_checkpoint_conflict_is_idempotent_and_keeps_original_result(
+def test_terminal_checkpoint_seals_claim_and_rejects_conflicting_old_token(
     tmp_path,
     monkeypatch,
 ):
@@ -1726,13 +1731,6 @@ def test_terminal_checkpoint_conflict_is_idempotent_and_keeps_original_result(
         delivery_context="",
         attachment_context="",
     )
-    hosted["remote_runs"]["worker"].update(
-        {
-            "status": "completed",
-            "checkpoint_cursor": 8,
-            "result": "original result",
-        }
-    )
     auth = {
         "authorization": "Bearer connector-secret",
         "x-connector-id": "dbb3-primary",
@@ -1740,19 +1738,39 @@ def test_terminal_checkpoint_conflict_is_idempotent_and_keeps_original_result(
     prefix = "/api/plugins/collaboration"
 
     with _client(module) as client:
+        claimed = client.post(
+            f"{prefix}/connector/runs/pull",
+            headers=auth,
+            json={"connector_id": "dbb3-primary", "limit": 1, "lease_seconds": 30},
+        ).json()["runs"][0]
+        first = client.post(
+            f"{prefix}/connector/runs/{remote['id']}/status",
+            headers=auth,
+            json={
+                "connector_id": "dbb3-primary",
+                "claim_token": claimed["claim_token"],
+                "checkpoint_cursor": 8,
+                "status": "completed",
+                "terminal": True,
+                "result": "original result",
+            },
+        )
+        assert first.status_code == 200
         response = client.post(
             f"{prefix}/connector/runs/{remote['id']}/cancel-ack",
             headers=auth,
             json={
                 "connector_id": "dbb3-primary",
+                "claim_token": claimed["claim_token"],
                 "checkpoint_cursor": 9,
                 "summary": "cancel applied locally",
             },
         )
-    assert response.status_code == 200
-    assert response.json()["applied"] is False
-    assert response.json()["run"]["status"] == "completed"
+    assert response.status_code == 409
     assert hosted["remote_runs"]["worker"]["result"] == "original result"
+    assert "claim_token" not in hosted["remote_runs"]["worker"]
+    assert "lease_owner" not in hosted["remote_runs"]["worker"]
+    assert hosted["remote_runs"]["worker"]["lease_until"] == 0
 
 
 def test_required_remote_artifact_must_arrive_before_completed_checkpoint(
@@ -1801,6 +1819,12 @@ def test_required_remote_artifact_must_arrive_before_completed_checkpoint(
     }
 
     with _client(module) as client:
+        claimed = client.post(
+            f"{prefix}/connector/runs/pull",
+            headers=auth,
+            json={"connector_id": "dbb3-primary", "limit": 1, "lease_seconds": 30},
+        ).json()["runs"][0]
+        body["claim_token"] = claimed["claim_token"]
         rejected = client.post(
             f"{prefix}/connector/runs/{remote['id']}/status",
             headers=auth,
@@ -1815,6 +1839,795 @@ def test_required_remote_artifact_must_arrive_before_completed_checkpoint(
         )
         assert accepted.status_code == 200
         assert accepted.json()["run"]["status"] == "completed"
+
+
+@pytest.mark.parametrize("terminal_status", ["completed", "failed", "cancelled"])
+def test_remote_artifact_rejects_late_upload_for_every_terminal_status(
+    tmp_path,
+    monkeypatch,
+    terminal_status,
+):
+    module = _load_module()
+    monkeypatch.setattr(module, "get_hermes_home", lambda: tmp_path)
+    monkeypatch.setattr(module, "_require_connector", lambda _request: "dbb3-primary")
+    conversation = module.create_single_conversation("default", "Late artifact")
+    conversation["owner_id"] = "owner-a"
+    state = {"conversations": [conversation]}
+    monkeypatch.setattr(module, "load_single_state", lambda: state)
+    monkeypatch.setattr(module, "save_single_state", lambda _state: None)
+    hosted = module.create_hosted_turn_record(
+        conversation,
+        turn_id=f"turn-late-artifact-{terminal_status}",
+        content="deliver file",
+        title="deliver file",
+        profiles=["dbb3-worker"],
+        artifact_required=False,
+    )
+    remote = module._ensure_remote_run(
+        conversation["id"],
+        hosted["turn_id"],
+        role_stage="worker",
+        profile="dbb3-worker",
+        title="deliver file",
+        objective="deliver file",
+        local_task_id="task-late-artifact",
+        artifact_required=False,
+        delivery_context="",
+        attachment_context="",
+    )
+    claim = module.connector_pull_runs(
+        module.ConnectorPullBody(
+            connector_id="dbb3-primary", limit=1, lease_seconds=30
+        ),
+        SimpleNamespace(),
+    )["runs"][0]
+    current = hosted["remote_runs"]["worker"]
+    # Reproduce the original bug exactly: a terminal row still retains a
+    # matching, live execution claim and lease.
+    current["status"] = terminal_status
+    current["claim_token"] = claim["claim_token"]
+    current["lease_owner"] = "dbb3-primary"
+    current["lease_until"] = int(module.time.time() * 1000) + 30_000
+    body = f"late {terminal_status}".encode()
+    streamed = False
+
+    class LateRequest:
+        headers = {
+            "x-claim-token": claim["claim_token"],
+            "x-remote-run-id": remote["id"],
+            "x-relative-path": f"report/{terminal_status}.txt",
+            "x-filename": f"{terminal_status}.txt",
+            "x-content-sha256": hashlib.sha256(body).hexdigest(),
+            "content-length": str(len(body)),
+            "content-type": "text/plain",
+        }
+
+        async def stream(self):
+            nonlocal streamed
+            streamed = True
+            yield body
+
+    with pytest.raises(module.HTTPException) as raised:
+        asyncio.run(module.connector_upload_artifact(remote["id"], LateRequest()))
+    assert raised.value.status_code == 409
+    assert streamed is False
+    library = module._file_library()
+    origin_key = (
+        f"remote:{remote['id']}:report/{terminal_status}.txt:"
+        f"{hashlib.sha256(body).hexdigest()}"
+    )
+    assert library.get_file_by_origin("owner-a", origin_key) is None
+    assert library.list_files("owner-a") == ([], 0)
+    assert current.get("artifacts") in (None, [])
+    assert not hosted.get("artifact_upload_intents")
+    assert not any(
+        str((message.get("meta") or {}).get("message_key") or "").startswith(
+            f"{remote['id']}:artifact:"
+        )
+        for message in conversation["messages"]
+        if isinstance(message, dict)
+    )
+
+
+@pytest.mark.parametrize("terminal_status", ["completed", "failed", "cancelled"])
+def test_remote_terminal_checkpoint_seals_execution_claim(
+    tmp_path,
+    monkeypatch,
+    terminal_status,
+):
+    module = _load_module()
+    monkeypatch.setattr(module, "get_hermes_home", lambda: tmp_path)
+    monkeypatch.setattr(module, "_require_connector", lambda _request: "dbb3-primary")
+    conversation = module.create_single_conversation("default", "Seal claim")
+    state = {"conversations": [conversation]}
+    monkeypatch.setattr(module, "load_single_state", lambda: state)
+    monkeypatch.setattr(module, "save_single_state", lambda _state: None)
+    hosted = module.create_hosted_turn_record(
+        conversation,
+        turn_id=f"turn-seal-{terminal_status}",
+        content="finish",
+        title="finish",
+        profiles=["dbb3-worker"],
+        artifact_required=False,
+    )
+    remote = module._ensure_remote_run(
+        conversation["id"],
+        hosted["turn_id"],
+        role_stage="worker",
+        profile="dbb3-worker",
+        title="finish",
+        objective="finish",
+        local_task_id="task-seal",
+        artifact_required=False,
+        delivery_context="",
+        attachment_context="",
+    )
+    claim = module.connector_pull_runs(
+        module.ConnectorPullBody(
+            connector_id="dbb3-primary", limit=1, lease_seconds=30
+        ),
+        SimpleNamespace(),
+    )["runs"][0]
+    persisted, applied = module._apply_remote_checkpoint(
+        remote["id"],
+        {
+            "connector_id": "dbb3-primary",
+            "claim_token": claim["claim_token"],
+            "checkpoint_cursor": 1,
+            "status": terminal_status,
+            "terminal": True,
+            "result": "done" if terminal_status == "completed" else "",
+            "error": "failed" if terminal_status == "failed" else "",
+        },
+    )
+    assert applied is True
+    assert persisted["status"] == terminal_status
+    assert "claim_token" not in persisted
+    assert "lease_owner" not in persisted
+    assert persisted["lease_until"] == 0
+    assert persisted["cancel_lease_until"] == 0
+    assert persisted["sealed_claim_sha256"] == hashlib.sha256(
+        claim["claim_token"].encode()
+    ).hexdigest()
+    assert persisted["claim_sealed_at"] > 0
+
+
+def test_remote_artifact_stream_turns_terminal_before_second_claim_cas(
+    tmp_path,
+    monkeypatch,
+):
+    module = _load_module()
+    monkeypatch.setattr(module, "get_hermes_home", lambda: tmp_path)
+    monkeypatch.setattr(module, "_require_connector", lambda _request: "dbb3-primary")
+    conversation = module.create_single_conversation("default", "Artifact terminal race")
+    conversation["owner_id"] = "owner-a"
+    state = {"conversations": [conversation]}
+    monkeypatch.setattr(module, "load_single_state", lambda: state)
+    monkeypatch.setattr(module, "save_single_state", lambda _state: None)
+    hosted = module.create_hosted_turn_record(
+        conversation,
+        turn_id="turn-artifact-terminal-race",
+        content="deliver file",
+        title="deliver file",
+        profiles=["dbb3-worker"],
+        artifact_required=False,
+    )
+    remote = module._ensure_remote_run(
+        conversation["id"],
+        hosted["turn_id"],
+        role_stage="worker",
+        profile="dbb3-worker",
+        title="deliver file",
+        objective="deliver file",
+        local_task_id="task-terminal-race",
+        artifact_required=False,
+        delivery_context="",
+        attachment_context="",
+    )
+    claim = module.connector_pull_runs(
+        module.ConnectorPullBody(
+            connector_id="dbb3-primary", limit=1, lease_seconds=30
+        ),
+        SimpleNamespace(),
+    )["runs"][0]
+    first = b"first half;"
+    second = b"second half"
+    body = first + second
+    streamed = asyncio.Event()
+    resume = asyncio.Event()
+
+    class PausedRequest:
+        headers = {
+            "x-claim-token": claim["claim_token"],
+            "x-remote-run-id": remote["id"],
+            "x-relative-path": "report/terminal-race.txt",
+            "x-filename": "terminal-race.txt",
+            "x-content-sha256": hashlib.sha256(body).hexdigest(),
+            "content-length": str(len(body)),
+            "content-type": "text/plain",
+        }
+
+        async def stream(self):
+            yield first
+            streamed.set()
+            await resume.wait()
+            yield second
+
+    async def race_upload():
+        upload = asyncio.create_task(
+            module.connector_upload_artifact(remote["id"], PausedRequest())
+        )
+        await streamed.wait()
+        current = hosted["remote_runs"]["worker"]
+        current["status"] = "completed"
+        current["completed_at"] = int(module.time.time() * 1000)
+        # Keep the old claim live to prove status, not only token rotation,
+        # closes the second publication CAS.
+        assert current["claim_token"] == claim["claim_token"]
+        resume.set()
+        with pytest.raises(module.HTTPException) as raised:
+            await upload
+        assert raised.value.status_code == 409
+
+    asyncio.run(race_upload())
+    library = module._file_library()
+    origin_key = (
+        f"remote:{remote['id']}:report/terminal-race.txt:"
+        f"{hashlib.sha256(body).hexdigest()}"
+    )
+    assert library.get_file_by_origin("owner-a", origin_key) is None
+    assert library.list_files("owner-a") == ([], 0)
+    assert hosted["remote_runs"]["worker"].get("artifacts") in (None, [])
+    assert not hosted.get("artifact_upload_intents")
+    assert not any(
+        str((message.get("meta") or {}).get("message_key") or "").startswith(
+            f"{remote['id']}:artifact:"
+        )
+        for message in conversation["messages"]
+        if isinstance(message, dict)
+    )
+
+
+def test_remote_artifact_final_publish_cas_rolls_back_staged_links_on_terminal(
+    tmp_path,
+    monkeypatch,
+):
+    module = _load_module()
+    monkeypatch.setattr(module, "get_hermes_home", lambda: tmp_path)
+    monkeypatch.setattr(module, "_require_connector", lambda _request: "dbb3-primary")
+    conversation = module.create_single_conversation("default", "Final publish CAS")
+    conversation["owner_id"] = "owner-a"
+    state = {"conversations": [conversation]}
+    monkeypatch.setattr(module, "load_single_state", lambda: state)
+    monkeypatch.setattr(module, "save_single_state", lambda _state: None)
+    hosted = module.create_hosted_turn_record(
+        conversation,
+        turn_id="turn-final-publish-cas",
+        content="deliver file",
+        title="deliver file",
+        profiles=["dbb3-worker"],
+        artifact_required=False,
+    )
+    remote = module._ensure_remote_run(
+        conversation["id"],
+        hosted["turn_id"],
+        role_stage="worker",
+        profile="dbb3-worker",
+        title="deliver file",
+        objective="deliver file",
+        local_task_id="task-final-publish-cas",
+        artifact_required=False,
+        delivery_context="",
+        attachment_context="",
+    )
+    claim = module.connector_pull_runs(
+        module.ConnectorPullBody(
+            connector_id="dbb3-primary", limit=1, lease_seconds=30
+        ),
+        SimpleNamespace(),
+    )["runs"][0]
+    body = b"staged then terminal"
+    origin_key = (
+        f"remote:{remote['id']}:report/final-cas.txt:"
+        f"{hashlib.sha256(body).hexdigest()}"
+    )
+
+    class CompleteRequest:
+        headers = {
+            "x-claim-token": claim["claim_token"],
+            "x-remote-run-id": remote["id"],
+            "x-relative-path": "report/final-cas.txt",
+            "x-filename": "final-cas.txt",
+            "x-content-sha256": hashlib.sha256(body).hexdigest(),
+            "content-length": str(len(body)),
+            "content-type": "text/plain",
+        }
+
+        async def stream(self):
+            yield body
+
+    real_gate = module._require_active_remote_artifact_claim
+    gate_calls = 0
+
+    def terminal_at_publish(hosted_record, remote_record, **kwargs):
+        nonlocal gate_calls
+        gate_calls += 1
+        if gate_calls == 4:
+            # The fourth gate runs after durable artifact/message linkage and
+            # immediately before staged -> available publication.
+            remote_record["status"] = "failed"
+            remote_record["completed_at"] = int(module.time.time() * 1000)
+        return real_gate(hosted_record, remote_record, **kwargs)
+
+    monkeypatch.setattr(
+        module,
+        "_require_active_remote_artifact_claim",
+        terminal_at_publish,
+    )
+    with pytest.raises(module.HTTPException) as raised:
+        asyncio.run(module.connector_upload_artifact(remote["id"], CompleteRequest()))
+    assert raised.value.status_code == 409
+    assert gate_calls == 4
+    library = module._file_library()
+    assert library.get_file_by_origin("owner-a", origin_key) is None
+    assert library.list_files("owner-a") == ([], 0)
+    assert hosted["remote_runs"]["worker"].get("artifacts") in (None, [])
+    assert not hosted.get("artifact_upload_intents")
+    assert not any(
+        str((message.get("meta") or {}).get("message_key") or "").startswith(
+            f"{remote['id']}:artifact:"
+        )
+        for message in conversation["messages"]
+        if isinstance(message, dict)
+    )
+
+
+@pytest.mark.parametrize("terminal_status", ["completed", "failed", "cancelled"])
+@pytest.mark.parametrize("terminal_phase", ["stream", "final_publish_cas"])
+def test_remote_artifact_rejected_replay_preserves_existing_origin_and_message(
+    tmp_path,
+    monkeypatch,
+    terminal_status,
+    terminal_phase,
+):
+    module = _load_module()
+    monkeypatch.setattr(module, "get_hermes_home", lambda: tmp_path)
+    monkeypatch.setattr(module, "_require_connector", lambda _request: "dbb3-primary")
+    conversation = module.create_single_conversation("default", "Existing artifact replay")
+    conversation["owner_id"] = "owner-a"
+    state = {"conversations": [conversation]}
+    monkeypatch.setattr(module, "load_single_state", lambda: state)
+    monkeypatch.setattr(module, "save_single_state", lambda _state: None)
+    hosted = module.create_hosted_turn_record(
+        conversation,
+        turn_id=f"turn-existing-{terminal_status}-{terminal_phase}",
+        content="deliver file",
+        title="deliver file",
+        profiles=["dbb3-worker"],
+        artifact_required=False,
+    )
+    remote = module._ensure_remote_run(
+        conversation["id"],
+        hosted["turn_id"],
+        role_stage="worker",
+        profile="dbb3-worker",
+        title="deliver file",
+        objective="deliver file",
+        local_task_id=f"task-existing-{terminal_status}-{terminal_phase}",
+        artifact_required=False,
+        delivery_context="",
+        attachment_context="",
+    )
+    claim = module.connector_pull_runs(
+        module.ConnectorPullBody(connector_id="dbb3-primary", limit=1, lease_seconds=30),
+        SimpleNamespace(),
+    )["runs"][0]
+    body = b"already-published-content"
+    digest = hashlib.sha256(body).hexdigest()
+    relative_path = "report/stable.bin"
+    origin_key = f"remote:{remote['id']}:{relative_path}:{digest}"
+    source = tmp_path / "old-source.bin"
+    source.write_bytes(body)
+    library = module._file_library()
+    original_record = library.ingest_file(
+        "owner-a",
+        source,
+        name="old.bin",
+        source="model_output",
+        conversation_id=conversation["id"],
+        turn_id=hosted["turn_id"],
+        profile="dbb3-worker",
+        origin_key=origin_key,
+    )
+    original_attachment = module._library_attachment(original_record)
+    current = hosted["remote_runs"]["worker"]
+    current["artifacts"] = [json.loads(json.dumps(original_attachment))]
+    message_key = f"{remote['id']}:artifact:{original_record['id']}"
+    module._append_message(
+        conversation,
+        role="assistant",
+        name="dbb3-worker",
+        content="original artifact message",
+        status="completed",
+        kind="message",
+        meta={
+            "message_key": message_key,
+            "attachments": [json.loads(json.dumps(original_attachment))],
+            "custom": {"preserve": True},
+        },
+    )
+    original_messages = json.loads(json.dumps(conversation["messages"]))
+    original_artifacts = json.loads(json.dumps(current["artifacts"]))
+    original_path = library.resolve_download("owner-a", original_record["id"])[1]
+
+    class ReplayRequest:
+        headers = {
+            "x-claim-token": claim["claim_token"],
+            "x-remote-run-id": remote["id"],
+            "x-relative-path": relative_path,
+            "x-filename": "new.bin",
+            "x-content-sha256": digest,
+            "content-length": str(len(body)),
+            "content-type": "application/octet-stream",
+        }
+
+        async def stream(self):
+            if terminal_phase == "stream":
+                split = len(body) // 2
+                yield body[:split]
+                current["status"] = terminal_status
+                current["completed_at"] = int(module.time.time() * 1000)
+                yield body[split:]
+            else:
+                yield body
+
+    if terminal_phase == "final_publish_cas":
+        real_gate = module._require_active_remote_artifact_claim
+        gate_calls = 0
+
+        def terminal_at_publish(hosted_record, remote_record, **kwargs):
+            nonlocal gate_calls
+            gate_calls += 1
+            if gate_calls == 4:
+                remote_record["status"] = terminal_status
+                remote_record["completed_at"] = int(module.time.time() * 1000)
+            return real_gate(hosted_record, remote_record, **kwargs)
+
+        monkeypatch.setattr(module, "_require_active_remote_artifact_claim", terminal_at_publish)
+
+    with pytest.raises(module.HTTPException) as raised:
+        asyncio.run(module.connector_upload_artifact(remote["id"], ReplayRequest()))
+    assert raised.value.status_code == 409
+
+    persisted = library.get_file_by_origin("owner-a", origin_key)
+    assert persisted == original_record
+    downloaded, persisted_path = library.resolve_download("owner-a", original_record["id"])
+    assert downloaded == original_record
+    assert persisted_path == original_path
+    assert persisted_path.read_bytes() == body
+    assert conversation["messages"] == original_messages
+    assert current["artifacts"] == original_artifacts
+    assert not hosted.get("artifact_upload_intents")
+    assert library.list_files("owner-a") == ([original_record], 1)
+    assert not list(library.root.rglob("new.bin"))
+    upload_temp = tmp_path / "collaboration" / "connector-upload-tmp"
+    assert not list(upload_temp.glob("*.upload")) if upload_temp.exists() else True
+
+
+def test_remote_artifact_stream_loses_claim_before_publish_without_any_visible_file(
+    tmp_path,
+    monkeypatch,
+):
+    module = _load_module()
+    monkeypatch.setattr(module, "get_hermes_home", lambda: tmp_path)
+    monkeypatch.setattr(module, "_require_connector", lambda _request: "dbb3-primary")
+    conversation = module.create_single_conversation("default", "Artifact claim race")
+    conversation["owner_id"] = "owner-a"
+    state = {"conversations": [conversation]}
+    monkeypatch.setattr(module, "load_single_state", lambda: state)
+    monkeypatch.setattr(module, "save_single_state", lambda _state: None)
+    hosted = module.create_hosted_turn_record(
+        conversation,
+        turn_id="turn-artifact-claim-race",
+        content="deliver file",
+        title="deliver file",
+        profiles=["dbb3-worker"],
+        artifact_required=True,
+    )
+    remote = module._ensure_remote_run(
+        conversation["id"],
+        "turn-artifact-claim-race",
+        role_stage="worker",
+        profile="dbb3-worker",
+        title="deliver file",
+        objective="deliver file",
+        local_task_id="task-artifact-race",
+        artifact_required=True,
+        delivery_context="",
+        attachment_context="",
+    )
+    first_claim = module.connector_pull_runs(
+        module.ConnectorPullBody(
+            connector_id="dbb3-primary", limit=1, lease_seconds=30
+        ),
+        SimpleNamespace(),
+    )["runs"][0]
+    first = b"first half;"
+    second = b"second half"
+    body = first + second
+    streamed = asyncio.Event()
+    resume = asyncio.Event()
+
+    class PausedRequest:
+        headers = {
+            "x-claim-token": first_claim["claim_token"],
+            "x-remote-run-id": remote["id"],
+            "x-relative-path": "report/output.txt",
+            "x-filename": "output.txt",
+            "x-content-sha256": hashlib.sha256(body).hexdigest(),
+            "content-length": str(len(body)),
+            "content-type": "text/plain",
+        }
+
+        async def stream(self):
+            yield first
+            streamed.set()
+            await resume.wait()
+            yield second
+
+    async def race_upload():
+        upload = asyncio.create_task(
+            module.connector_upload_artifact(remote["id"], PausedRequest())
+        )
+        await streamed.wait()
+        current = hosted["remote_runs"]["worker"]
+        current["lease_until"] = 0
+        replacement = module.connector_pull_runs(
+            module.ConnectorPullBody(
+                connector_id="dbb3-primary", limit=1, lease_seconds=30
+            ),
+            SimpleNamespace(),
+        )["runs"][0]
+        assert replacement["claim_token"] != first_claim["claim_token"]
+        resume.set()
+        with pytest.raises(module.HTTPException) as raised:
+            await upload
+        assert raised.value.status_code == 409
+
+    asyncio.run(race_upload())
+    files, total = module._file_library().list_files("owner-a")
+    assert total == 0
+    assert files == []
+    assert hosted["remote_runs"]["worker"].get("artifacts") in (None, [])
+    assert not any(
+        str((message.get("meta") or {}).get("message_key") or "").startswith(
+            f"{remote['id']}:artifact:"
+        )
+        for message in conversation["messages"]
+        if isinstance(message, dict)
+    )
+
+
+def test_remote_artifact_process_exit_after_ingest_recovers_staged_orphan(
+    tmp_path,
+    monkeypatch,
+):
+    module = _load_module()
+    monkeypatch.setattr(module, "get_hermes_home", lambda: tmp_path)
+    monkeypatch.setattr(module, "_require_connector", lambda _request: "dbb3-primary")
+    conversation = module.create_single_conversation("default", "Artifact crash")
+    conversation["owner_id"] = "owner-a"
+    state = {"conversations": [conversation]}
+    monkeypatch.setattr(module, "load_single_state", lambda: state)
+    monkeypatch.setattr(module, "save_single_state", lambda _state: None)
+    hosted = module.create_hosted_turn_record(
+        conversation,
+        turn_id="turn-artifact-crash",
+        content="deliver file",
+        title="deliver file",
+        profiles=["dbb3-worker"],
+        artifact_required=True,
+    )
+    remote = module._ensure_remote_run(
+        conversation["id"],
+        "turn-artifact-crash",
+        role_stage="worker",
+        profile="dbb3-worker",
+        title="deliver file",
+        objective="deliver file",
+        local_task_id="task-artifact-crash",
+        artifact_required=True,
+        delivery_context="",
+        attachment_context="",
+    )
+    claim = module.connector_pull_runs(
+        module.ConnectorPullBody(
+            connector_id="dbb3-primary", limit=1, lease_seconds=30
+        ),
+        SimpleNamespace(),
+    )["runs"][0]
+    body = b"durable staged artifact"
+    origin_key = (
+        f"remote:{remote['id']}:report/crash.txt:{hashlib.sha256(body).hexdigest()}"
+    )
+
+    class CompleteRequest:
+        headers = {
+            "x-claim-token": claim["claim_token"],
+            "x-remote-run-id": remote["id"],
+            "x-relative-path": "report/crash.txt",
+            "x-filename": "crash.txt",
+            "x-content-sha256": hashlib.sha256(body).hexdigest(),
+            "content-length": str(len(body)),
+            "content-type": "text/plain",
+        }
+
+        async def stream(self):
+            yield body
+
+    class SimulatedProcessExit(BaseException):
+        pass
+
+    library = module._file_library()
+    real_ingest = library.ingest_file
+
+    def install_then_exit(*args, **kwargs):
+        real_ingest(*args, **kwargs)
+        raise SimulatedProcessExit()
+
+    monkeypatch.setattr(library, "ingest_file", install_then_exit)
+    with pytest.raises(SimulatedProcessExit):
+        asyncio.run(
+            module.connector_upload_artifact(remote["id"], CompleteRequest())
+        )
+
+    staged = library.get_file_by_origin("owner-a", origin_key)
+    assert staged is not None
+    assert staged["status"] == "staged"
+    staged_path = library._record_path(staged)
+    assert staged_path.is_file()
+    assert library.list_files("owner-a") == ([], 0)
+    assert hosted.get("artifact_upload_intents")
+    assert hosted["remote_runs"]["worker"].get("artifacts") in (None, [])
+
+    # A new process constructs a new library instance. Its first access
+    # resolves the durable intent before returning any account-file data.
+    module._FILE_LIBRARY = None
+    recovered_library = module._file_library()
+    assert recovered_library.get_file_by_origin("owner-a", origin_key) is None
+    assert recovered_library.list_files("owner-a") == ([], 0)
+    assert not staged_path.exists()
+    assert not hosted.get("artifact_upload_intents")
+    assert not any(
+        str((message.get("meta") or {}).get("message_key") or "").startswith(
+            f"{remote['id']}:artifact:"
+        )
+        for message in conversation["messages"]
+        if isinstance(message, dict)
+    )
+
+
+@pytest.mark.parametrize("terminal_status", ["completed", "failed", "cancelled"])
+def test_artifact_intent_recovery_never_deletes_preexisting_origin(
+    tmp_path,
+    monkeypatch,
+    terminal_status,
+):
+    module = _load_module()
+    monkeypatch.setattr(module, "get_hermes_home", lambda: tmp_path)
+    monkeypatch.setattr(module, "_require_connector", lambda _request: "dbb3-primary")
+    conversation = module.create_single_conversation("default", "Recover existing artifact")
+    conversation["owner_id"] = "owner-a"
+    state = {"conversations": [conversation]}
+    monkeypatch.setattr(module, "load_single_state", lambda: state)
+    monkeypatch.setattr(module, "save_single_state", lambda _state: None)
+    hosted = module.create_hosted_turn_record(
+        conversation,
+        turn_id=f"turn-recover-existing-{terminal_status}",
+        content="deliver file",
+        title="deliver file",
+        profiles=["dbb3-worker"],
+        artifact_required=False,
+    )
+    remote = module._ensure_remote_run(
+        conversation["id"],
+        hosted["turn_id"],
+        role_stage="worker",
+        profile="dbb3-worker",
+        title="deliver file",
+        objective="deliver file",
+        local_task_id=f"task-recover-existing-{terminal_status}",
+        artifact_required=False,
+        delivery_context="",
+        attachment_context="",
+    )
+    claim = module.connector_pull_runs(
+        module.ConnectorPullBody(connector_id="dbb3-primary", limit=1, lease_seconds=30),
+        SimpleNamespace(),
+    )["runs"][0]
+    body = b"preexisting-recovery-content"
+    digest = hashlib.sha256(body).hexdigest()
+    relative_path = "report/recovery.bin"
+    origin_key = f"remote:{remote['id']}:{relative_path}:{digest}"
+    source = tmp_path / "recovery-old.bin"
+    source.write_bytes(body)
+    library = module._file_library()
+    original_record = library.ingest_file(
+        "owner-a",
+        source,
+        name="old.bin",
+        source="model_output",
+        conversation_id=conversation["id"],
+        turn_id=hosted["turn_id"],
+        profile="dbb3-worker",
+        origin_key=origin_key,
+    )
+    original_path = library.resolve_download("owner-a", original_record["id"])[1]
+    original_attachment = module._library_attachment(original_record)
+    current = hosted["remote_runs"]["worker"]
+    current["artifacts"] = [json.loads(json.dumps(original_attachment))]
+    module._append_message(
+        conversation,
+        role="assistant",
+        name="dbb3-worker",
+        content="existing message remains exact",
+        status="completed",
+        kind="message",
+        meta={
+            "message_key": f"{remote['id']}:artifact:{original_record['id']}",
+            "attachments": [json.loads(json.dumps(original_attachment))],
+            "custom": "unchanged",
+        },
+    )
+    original_messages = json.loads(json.dumps(conversation["messages"]))
+    original_artifacts = json.loads(json.dumps(current["artifacts"]))
+
+    class SimulatedProcessExit(BaseException):
+        pass
+
+    real_ingest = library.ingest_file
+
+    def replay_then_exit(*args, **kwargs):
+        replayed = real_ingest(*args, **kwargs)
+        assert replayed == original_record
+        raise SimulatedProcessExit()
+
+    monkeypatch.setattr(library, "ingest_file", replay_then_exit)
+
+    class ReplayRequest:
+        headers = {
+            "x-claim-token": claim["claim_token"],
+            "x-remote-run-id": remote["id"],
+            "x-relative-path": relative_path,
+            "x-filename": "new.bin",
+            "x-content-sha256": digest,
+            "content-length": str(len(body)),
+            "content-type": "application/octet-stream",
+        }
+
+        async def stream(self):
+            yield body
+
+    with pytest.raises(SimulatedProcessExit):
+        asyncio.run(module.connector_upload_artifact(remote["id"], ReplayRequest()))
+    assert hosted.get("artifact_upload_intents")
+    current["status"] = terminal_status
+    current["completed_at"] = int(module.time.time() * 1000)
+
+    module._FILE_LIBRARY = None
+    recovered_library = module._file_library()
+    assert recovered_library.get_file_by_origin("owner-a", origin_key) == original_record
+    downloaded, recovered_path = recovered_library.resolve_download(
+        "owner-a", original_record["id"]
+    )
+    assert downloaded == original_record
+    assert recovered_path == original_path
+    assert recovered_path.read_bytes() == body
+    assert conversation["messages"] == original_messages
+    assert current["artifacts"] == original_artifacts
+    assert recovered_library.list_files("owner-a") == ([original_record], 1)
+    assert not hosted.get("artifact_upload_intents")
+    assert not list(recovered_library.root.rglob("new.bin"))
 
 
 def test_remote_progress_creates_semantic_milestones_and_redacts_activity_secrets(
@@ -1857,11 +2670,22 @@ def test_remote_progress_creates_semantic_milestones_and_redacts_activity_secret
         "output": "Cookie: session=private-cookie",
         "status": "completed",
     }
+    hosted_remote = state["conversations"][0]["hosted_turns"][
+        "turn-milestones"
+    ]["remote_runs"]["worker"]
+    hosted_remote.update(
+        {
+            "lease_owner": "dbb3-primary",
+            "lease_until": int(module.time.time() * 1000) + 60_000,
+            "claim_token": "claim-milestones",
+        }
+    )
     for cursor, summary in ((1, "完成环境检查"), (2, "完成代码修改"), (3, "完成代码修改")):
         persisted, applied = module._apply_remote_checkpoint(
             remote["id"],
             {
                 "connector_id": "dbb3-primary",
+                "claim_token": "claim-milestones",
                 "checkpoint_cursor": cursor,
                 "status": "running",
                 "terminal": False,

@@ -403,14 +403,43 @@ class IOSIntelligenceScheduler:
             decision["suppressed"] = True
         result["alert"] = decision
         if decision["should_notify"]:
-            notification = self._enqueue_weather_notification(owner_id, destination, route, window, decision, instant)
-            result["notification"] = notification
+            if self._is_quiet(local):
+                # Keep learning and querying during quiet hours, but never put
+                # an alert on APNs before 08:00.  Persist only the evidence
+                # needed to trigger a fresh evaluation after quiet hours; the
+                # morning cycle must re-check behavior, route and weather
+                # instead of blindly delivering a stale nighttime decision.
+                result["quiet_summary"] = self._save_quiet_summary(
+                    owner_id,
+                    destination,
+                    route,
+                    window,
+                    instant,
+                    decision,
+                )
+                result["suppressed_reason"] = "quiet_hours"
+                result["weather_reconciliation"] = self._expire_stale_weather(
+                    owner_id,
+                    instant,
+                )
+            else:
+                notification = self._enqueue_weather_notification(
+                    owner_id,
+                    destination,
+                    route,
+                    window,
+                    decision,
+                    instant,
+                )
+                result["notification"] = notification
         else:
             # Retract prior forecasts whenever this evaluate cycle decided not to
             # page — including partial multi-location coverage so stale outbox
             # rows and map cards cannot outlive an incomplete weather picture.
             if forecast.get("queried") or decision.get("reason") == "partial_weather_query":
                 result["weather_reconciliation"] = self._expire_stale_weather(owner_id, instant)
+            if self._is_quiet(local):
+                self._retire_quiet_summaries(owner_id, local)
             result["suppressed_reason"] = decision.get("reason") or "low_weather_impact"
         return result
 
@@ -1257,12 +1286,29 @@ class IOSIntelligenceScheduler:
         return result
 
     def _next_non_quiet_at(self, timestamp: int) -> int:
-        # Retained for mixed-version callers. Notification timing is governed
-        # by predicted exposure and behavior, never a fixed wall-clock window.
-        return timestamp
+        local = datetime.fromtimestamp(timestamp, ZoneInfo(self.config.timezone))
+        if not self._is_quiet(local):
+            return int(timestamp)
+        quiet_start = int(self.config.weather.quiet_start_hour)
+        quiet_end = int(self.config.weather.quiet_end_hour)
+        target_date = local.date()
+        if quiet_start > quiet_end and local.hour >= quiet_start:
+            target_date += timedelta(days=1)
+        target = datetime.combine(
+            target_date,
+            datetime.min.time(),
+            tzinfo=local.tzinfo,
+        ).replace(hour=quiet_end)
+        return int(target.timestamp())
 
     def _is_quiet(self, local: datetime) -> bool:
-        return False
+        quiet_start = int(self.config.weather.quiet_start_hour)
+        quiet_end = int(self.config.weather.quiet_end_hour)
+        if quiet_start == quiet_end:
+            return False
+        if quiet_start < quiet_end:
+            return quiet_start <= local.hour < quiet_end
+        return local.hour >= quiet_start or local.hour < quiet_end
 
     def _save_quiet_summary(
         self,
@@ -1290,9 +1336,15 @@ class IOSIntelligenceScheduler:
         return self.store.save_quiet_summary(owner_id, local_date, payload)
 
     def _flush_quiet_summary(self, owner_id: str, local: datetime, now: int, result: dict[str, Any]) -> None:
-        # Retire summaries created by older versions. New evaluations use live
-        # context at every hour and never defer an actionable risk to 08:00.
+        # A summary is only a durable prompt for a fresh post-08:00
+        # evaluation.  Never mark it consumed while quiet hours are still in
+        # effect, and never deliver its stale payload directly.
         result.setdefault("quiet_summary_notification", None)
+        if self._is_quiet(local):
+            return
+        self._retire_quiet_summaries(owner_id, local)
+
+    def _retire_quiet_summaries(self, owner_id: str, local: datetime) -> None:
         candidates = [
             (local.date() - timedelta(days=1)).isoformat(),
             local.date().isoformat(),

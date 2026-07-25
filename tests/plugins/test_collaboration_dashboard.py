@@ -31,6 +31,64 @@ def load_module():
     return module
 
 
+def review_control(
+    verdict: str = "PASS",
+    *,
+    blockers: list[str] | None = None,
+    findings: list[str] | None = None,
+    required_actions: list[str] | None = None,
+) -> str:
+    passing = verdict == "PASS"
+    return json.dumps(
+        {
+            "protocol": "hermes.review.v1",
+            "verdict": verdict,
+            "checks": {
+                "requirements_met": passing,
+                "evidence_verified": passing,
+                "tests_passed": passing,
+                "risks_resolved": passing,
+            },
+            "blockers": [] if passing else (blockers or ["验收证据不足"]),
+            "findings": [] if passing else (findings or ["缺少必要覆盖"]),
+            "required_actions": (
+                [] if passing else (required_actions or ["补齐证据并重新验收"])
+            ),
+        },
+        ensure_ascii=False,
+        separators=(",", ":"),
+    )
+
+
+def supervision_control(
+    verdict: str = "PASS",
+    *,
+    blockers: list[str] | None = None,
+    findings: list[str] | None = None,
+    required_actions: list[str] | None = None,
+) -> str:
+    passing = verdict == "PASS"
+    return json.dumps(
+        {
+            "protocol": "hermes.supervision.v1",
+            "verdict": verdict,
+            "checks": {
+                "role_boundaries_respected": passing,
+                "task_coverage_complete": passing,
+                "evidence_sufficient": passing,
+                "process_compliant": passing,
+            },
+            "blockers": [] if passing else (blockers or ["职责或证据存在阻断"]),
+            "findings": [] if passing else (findings or ["监督检查未通过"]),
+            "required_actions": (
+                [] if passing else (required_actions or ["按职责整改并提交复核证据"])
+            ),
+        },
+        ensure_ascii=False,
+        separators=(",", ":"),
+    )
+
+
 class CollaborationDashboardTests(unittest.TestCase):
     def test_short_chinese_greeting_keeps_its_first_character_in_title(self):
         module = load_module()
@@ -155,7 +213,7 @@ class CollaborationDashboardTests(unittest.TestCase):
 
         self.assertEqual(cancelled["status"], "cancelled")
         self.assertEqual(run["status"], "cancelled")
-        self.assertEqual(run["remote_runs"]["worker"]["status"], "running")
+        self.assertEqual(run["remote_runs"]["worker"]["status"], "cancelling")
         self.assertTrue(run["remote_runs"]["worker"]["cancel_requested"])
         self.assertFalse(any(
             message.get("meta", {}).get("message_key")
@@ -1794,6 +1852,1786 @@ class CollaborationDashboardTests(unittest.TestCase):
         self.assertIn("你是唯一最终汇报者", reporter)
         self.assertIn("综合执行者和审阅者", reporter)
 
+    def test_progress_protocol_uses_adaptive_event_and_time_cadence(self):
+        module = load_module()
+
+        protocol = module.hosted_progress_protocol("Hermes Worker")
+        supervisor = module.supervisor_role_prompt()
+
+        self.assertIn("不超过两句", protocol)
+        self.assertIn("信息增量事件 + 静默时长", protocol)
+        self.assertIn("不算信息增量", protocol)
+        self.assertIn("五到十五分钟内至少更新一次", protocol)
+        self.assertIn("优先控制在两句", protocol)
+        self.assertIn("不要逐条广播每次思考、每个工具调用", protocol)
+        self.assertIn("最后一次有代表性的错误", protocol)
+        self.assertIn("进入角色交接前", protocol)
+        self.assertIn("Hermes 原有的工具选择", protocol)
+        self.assertIn("@Hermes Worker", module.mention_priority_protocol("Hermes Worker"))
+        self.assertIn("第一个安全边界", module.mention_priority_protocol("Hermes Worker"))
+        self.assertIn("暂停新工具调用", module.mention_priority_protocol("Hermes Worker"))
+        self.assertIn("写入持久计划", module.mention_priority_protocol("Hermes Worker"))
+        self.assertIn("检查调度员", supervisor)
+        self.assertIn("检查 Worker", supervisor)
+        self.assertIn("检查审阅员", supervisor)
+        self.assertIn("检查汇报员", supervisor)
+        self.assertIn("@准确成员名", supervisor)
+        self.assertIn("长时间沉默", supervisor)
+        self.assertIn("后续安全边界复核", supervisor)
+
+    def test_role_delivery_contracts_require_evidence_and_bounded_handoffs(self):
+        module = load_module()
+
+        manager = module.hosted_role_delivery_contract("Hermes 调度员")
+        worker = module.hosted_role_delivery_contract("dbb3-worker")
+        reviewer = module.hosted_role_delivery_contract("Hermes 审阅员")
+        reporter = module.hosted_role_delivery_contract("Hermes 汇报员")
+        supervisor = module.hosted_role_delivery_contract("Hermes 监督者")
+
+        self.assertIn("负责人、依赖和可验证验收标准", manager)
+        self.assertIn("返工记录、产物路径与哈希", manager)
+        self.assertIn("实际动作与证据绑定", worker)
+        self.assertIn("尚未运行的测试必须标为未验证", worker)
+        self.assertIn("独立证据", reviewer)
+        self.assertIn("异常、并发、离线、恢复或权限场景", reviewer)
+        self.assertIn("不调用工具补洞", reporter)
+        self.assertIn("不得选择更乐观的版本", reporter)
+        self.assertIn("不等待任务结束才监督", supervisor)
+        self.assertIn("可验证的纠偏指令", supervisor)
+
+    def test_group_supervisor_has_bounded_role_and_precedes_execution(self):
+        module = load_module()
+        room = module.create_room_record(
+            "监督协作",
+            ["default", "dbb3-worker", "reviewer", "supervisor"],
+        )
+
+        prompt = module.build_group_prompt(room, "supervisor", "检查执行边界")
+
+        self.assertEqual(module.collaboration_role("supervisor"), "supervisor")
+        self.assertEqual(
+            module.collaboration_execution_order(room["profiles"]),
+            ["supervisor", "dbb3-worker", "reviewer", "default"],
+        )
+        self.assertIn("监督者不替任何成员执行其主体工作", prompt)
+
+    def test_hosted_intervention_is_targeted_idempotent_and_owner_scoped(self):
+        module = load_module()
+        conversation = module.create_single_conversation("default")
+        conversation["owner_id"] = "owner-a"
+        state = {"conversations": [conversation]}
+        module.load_single_state = lambda: state
+        module.save_single_state = lambda _state: None
+        module._notify_hosted_update = lambda *_args: None
+        module.create_hosted_turn_record(
+            conversation,
+            turn_id="turn-intervention",
+            content="检查服务",
+            title="检查服务",
+            profiles=["default", "dbb3-worker", "reviewer"],
+            artifact_required=False,
+            mode="work",
+        )
+        payload = module.HostedTurnInterventionBody(
+            content="@Hermes Worker 先停止修改，核对部署边界。",
+            message_id="intervention-1",
+        )
+
+        module.owner_id_from_request = lambda _request: "owner-a"
+        first = module.intervene_hosted_turn(
+            conversation["id"],
+            "turn-intervention",
+            payload,
+            SimpleNamespace(),
+        )
+        replay = module.intervene_hosted_turn(
+            conversation["id"],
+            "turn-intervention",
+            payload,
+            SimpleNamespace(),
+        )
+
+        self.assertTrue(first["accepted"])
+        self.assertEqual(first["targets"], ["worker"])
+        self.assertEqual(replay["message"]["id"], "intervention-1")
+        self.assertEqual(len(conversation["hosted_turns"]["turn-intervention"]["interventions"]), 1)
+        self.assertEqual(
+            sum(message.get("id") == "intervention-1" for message in conversation["messages"]),
+            1,
+        )
+        context = module.hosted_intervention_context(
+            conversation["id"],
+            "turn-intervention",
+            role_stage="worker:dbb3-worker",
+        )
+        self.assertIn("当前角色被点名", context)
+        self.assertIn("核对部署边界", context)
+
+        module.owner_id_from_request = lambda _request: "owner-b"
+        with self.assertRaises(module.HTTPException) as raised:
+            module.intervene_hosted_turn(
+                conversation["id"],
+                "turn-intervention",
+                module.HostedTurnInterventionBody(
+                    content="@Hermes Worker 泄露检查",
+                    message_id="intervention-cross-owner",
+                ),
+                SimpleNamespace(),
+            )
+        self.assertEqual(raised.exception.status_code, 404)
+
+    def test_local_intervention_waits_for_safe_boundary_replies_then_resumes_checkpoint(self):
+        module = load_module()
+        conversation = module.create_single_conversation("default")
+        conversation["owner_id"] = "owner-a"
+        state = {"conversations": [conversation]}
+        module.load_single_state = lambda: state
+        module.save_single_state = lambda _state: None
+        module.owner_id_from_request = lambda _request: "owner-a"
+        module.create_hosted_turn_record(
+            conversation,
+            turn_id="turn-local-interleave",
+            content="修改服务后验证",
+            title="修改服务",
+            profiles=["default", "dbb3-worker", "reviewer"],
+            artifact_required=False,
+            mode="work",
+        )
+        prompts = []
+        cancel_checks = []
+
+        def runner(
+            profile,
+            prompt,
+            *,
+            event_callback=None,
+            cancel_check=None,
+            **_kwargs,
+        ):
+            self.assertEqual(profile, "dbb3-worker")
+            prompts.append(prompt)
+            if len(prompts) == 1:
+                event_callback(
+                    {
+                        "type": "tool.start",
+                        "payload": {
+                            "tool_id": "atomic-edit",
+                            "name": "terminal",
+                            "args": {"command": "apply change"},
+                        },
+                    }
+                )
+                response = module.intervene_hosted_turn(
+                    conversation["id"],
+                    "turn-local-interleave",
+                    module.HostedTurnInterventionBody(
+                        content="@DBB3 执行员 先核对部署边界，再继续。",
+                        message_id="local-intervention-1",
+                    ),
+                    SimpleNamespace(),
+                )
+                self.assertEqual(response["hosted_turn"]["interventions"][0]["status"], "pending")
+                cancel_checks.append(cancel_check())
+                event_callback(
+                    {
+                        "type": "tool.complete",
+                        "payload": {
+                            "tool_id": "atomic-edit",
+                            "name": "terminal",
+                            "result_text": "checkpoint-ok",
+                        },
+                    }
+                )
+                self.fail("safe-boundary event must interrupt the original role")
+            if "此回复优先于原任务" in prompt:
+                return "接受干预；先核对部署边界，再从检查点继续。"
+            self.assertIn("从 @ 干预检查点恢复", prompt)
+            self.assertIn("checkpoint-ok", prompt)
+            self.assertIn("先核对部署边界", prompt)
+            return "修改与验证完成"
+
+        result, status, _role_state = module._run_hosted_role(
+            conversation["id"],
+            "turn-local-interleave",
+            profile="dbb3-worker",
+            role_stage="worker",
+            role_label="dbb3-worker · 执行",
+            prompt="执行原始修改任务",
+            runner=runner,
+            kanban_task_id="child-local",
+            start_text="正在执行。",
+        )
+
+        intervention = conversation["hosted_turns"]["turn-local-interleave"][
+            "interventions"
+        ][0]
+        self.assertEqual(cancel_checks, [False])
+        self.assertEqual(len(prompts), 3)
+        self.assertEqual((result, status), ("修改与验证完成", "completed"))
+        self.assertEqual(intervention["status"], "completed")
+        self.assertEqual(intervention["checkpoint"]["activities"][0]["status"], "completed")
+        self.assertIn("接受干预", intervention["reply"])
+        self.assertEqual(
+            conversation["hosted_turns"]["turn-local-interleave"]["active_roles"],
+            {},
+        )
+        self.assertTrue(
+            any(
+                message.get("meta", {}).get("intervention_reply") is True
+                for message in conversation["messages"]
+            )
+        )
+
+    def test_local_processing_intervention_recovers_without_losing_checkpoint(self):
+        module = load_module()
+        conversation = module.create_single_conversation("default")
+        state = {"conversations": [conversation]}
+        module.load_single_state = lambda: state
+        module.save_single_state = lambda _state: None
+        run = module.create_hosted_turn_record(
+            conversation,
+            turn_id="turn-local-recover-intervention",
+            content="恢复本地任务",
+            title="恢复本地任务",
+            profiles=["default", "dbb3-worker", "reviewer"],
+            artifact_required=False,
+            mode="work",
+        )
+        run["interventions"].append(
+            {
+                "id": "processing-intervention-1",
+                "content": "@DBB3 执行员 恢复前先核对边界。",
+                "targets": ["worker"],
+                "target_profiles": ["dbb3-worker"],
+                "status": "processing",
+                "claim_token": "persisted-processing-token",
+                "active_role_stage": "worker",
+                "active_profile": "dbb3-worker",
+                "checkpoint": {
+                    "role_stage": "worker",
+                    "profile": "dbb3-worker",
+                    "execution": "local",
+                    "content": "durable-before-crash",
+                    "checkpoint_cursor": 0,
+                    "activities": [],
+                },
+            }
+        )
+        prompts = []
+
+        def runner(_profile, prompt, **_kwargs):
+            prompts.append(prompt)
+            if len(prompts) == 1:
+                self.assertIn("durable-before-crash", prompt)
+                return "已回复恢复中的干预"
+            self.assertIn("从 @ 干预检查点恢复", prompt)
+            self.assertIn("durable-before-crash", prompt)
+            return "恢复执行完成"
+
+        result, status, _role_state = module._run_hosted_role(
+            conversation["id"],
+            "turn-local-recover-intervention",
+            profile="dbb3-worker",
+            role_stage="worker",
+            role_label="dbb3-worker · 执行",
+            prompt="继续原任务",
+            runner=runner,
+            kanban_task_id="child-recover",
+            start_text="正在恢复。",
+        )
+
+        intervention = run["interventions"][0]
+        self.assertEqual((result, status), ("恢复执行完成", "completed"))
+        self.assertEqual(len(prompts), 2)
+        self.assertEqual(intervention["status"], "completed")
+        self.assertEqual(intervention["checkpoint"]["content"], "durable-before-crash")
+
+    def test_intervention_claim_is_single_owner_token_cas(self):
+        module = load_module()
+        conversation = module.create_single_conversation("default")
+        state = {"conversations": [conversation]}
+        module.load_single_state = lambda: state
+        module.save_single_state = lambda _state: None
+        run = module.create_hosted_turn_record(
+            conversation,
+            turn_id="turn-claim-cas",
+            content="执行任务",
+            title="执行任务",
+            profiles=["default", "dbb3-worker", "reviewer"],
+            artifact_required=False,
+        )
+        run["interventions"].append(
+            {
+                "id": "claim-cas-1",
+                "content": "@DBB3 执行员 暂停检查",
+                "targets": ["worker"],
+                "target_profiles": ["dbb3-worker"],
+                "status": "pending",
+            }
+        )
+
+        claimed = module._claim_hosted_role_intervention(
+            conversation["id"],
+            "turn-claim-cas",
+            role_stage="worker",
+            profile="dbb3-worker",
+            checkpoint={"content": "first"},
+            intervention_id="claim-cas-1",
+            execution_owner="execution-a",
+        )
+        duplicate = module._claim_hosted_role_intervention(
+            conversation["id"],
+            "turn-claim-cas",
+            role_stage="worker",
+            profile="dbb3-worker",
+            checkpoint={"content": "overwritten"},
+            intervention_id="claim-cas-1",
+            execution_owner="execution-b",
+        )
+
+        self.assertIsNotNone(claimed)
+        self.assertTrue(claimed["claim_token"])
+        self.assertIsNone(duplicate)
+        self.assertEqual(run["interventions"][0]["checkpoint"]["content"], "first")
+
+    def test_processing_intervention_has_one_execution_owner_under_concurrency(self):
+        module = load_module()
+        conversation = module.create_single_conversation("default")
+        state = {"conversations": [conversation]}
+        module.load_single_state = lambda: state
+        module.save_single_state = lambda _state: None
+        run = module.create_hosted_turn_record(
+            conversation,
+            turn_id="turn-processing-owner-race",
+            content="执行任务",
+            title="执行任务",
+            profiles=["default", "dbb3-worker", "reviewer"],
+            artifact_required=False,
+        )
+        run["interventions"].append(
+            {
+                "id": "processing-owner-race",
+                "content": "@DBB3 执行员 先核对范围",
+                "targets": ["worker"],
+                "target_profiles": ["dbb3-worker"],
+                "status": "processing",
+                "claim_token": "stale-token",
+                "execution_owner": "dead-owner",
+                "lease_expires_at": 1,
+                "active_role_stage": "worker",
+                "active_profile": "dbb3-worker",
+                "checkpoint": {"content": "durable-checkpoint"},
+            }
+        )
+        first_call_started = threading.Event()
+        release_first_call = threading.Event()
+        prompts = []
+        prompt_lock = threading.Lock()
+
+        def runner(_profile, prompt, **_kwargs):
+            with prompt_lock:
+                prompts.append(prompt)
+                call_index = len(prompts)
+            if call_index == 1:
+                first_call_started.set()
+                self.assertTrue(release_first_call.wait(timeout=3))
+                return "已接受干预"
+            return "原任务完成"
+
+        outcomes = []
+
+        def execute():
+            try:
+                outcomes.append(
+                    module._run_hosted_role(
+                        conversation["id"],
+                        "turn-processing-owner-race",
+                        profile="dbb3-worker",
+                        role_stage="worker",
+                        role_label="Worker",
+                        prompt="执行原任务",
+                        runner=runner,
+                        kanban_task_id="child",
+                        start_text="开始",
+                    )
+                )
+            except RuntimeError as exc:
+                outcomes.append(exc)
+
+        first = threading.Thread(target=execute)
+        second = threading.Thread(target=execute)
+        first.start()
+        self.assertTrue(first_call_started.wait(timeout=3))
+        second.start()
+        second.join(timeout=3)
+        release_first_call.set()
+        first.join(timeout=3)
+
+        self.assertFalse(first.is_alive())
+        self.assertFalse(second.is_alive())
+        self.assertEqual(len(prompts), 2)
+        self.assertEqual(
+            sum(isinstance(item, RuntimeError) for item in outcomes),
+            1,
+        )
+        intervention = run["interventions"][0]
+        self.assertEqual(intervention["status"], "completed")
+        self.assertNotEqual(intervention["claim_token"], "stale-token")
+        self.assertTrue(intervention.get("reclaimed_at"))
+
+    def test_startup_releases_dead_local_owner_and_resumes_processing_intervention(self):
+        module = load_module()
+        conversation = module.create_single_conversation("default")
+        state = {"conversations": [conversation]}
+        module.load_single_state = lambda: state
+        module.save_single_state = lambda _state: None
+        run = module.create_hosted_turn_record(
+            conversation,
+            turn_id="turn-local-owner-restart",
+            content="恢复任务",
+            title="恢复任务",
+            profiles=["default", "dbb3-worker", "reviewer"],
+            artifact_required=False,
+        )
+        future_lease = int(time.time() * 1000) + 300_000
+        run["status"] = "running"
+        run["active_roles"] = {
+            "worker": {
+                "role_stage": "worker",
+                "profile": "dbb3-worker",
+                "execution": "local",
+                "status": "running",
+                "execution_owner": "dead-local-owner",
+                "lease_expires_at": future_lease,
+            },
+            "reviewer": {
+                "role_stage": "reviewer",
+                "profile": "reviewer",
+                "execution": "remote",
+                "status": "running",
+                "execution_owner": "remote:stable-review-run",
+                "lease_expires_at": future_lease,
+            },
+        }
+        run["interventions"] = [
+            {
+                "id": "local-restart-intervention",
+                "content": "@DBB3 执行员 先核对恢复边界",
+                "targets": ["worker"],
+                "target_profiles": ["dbb3-worker"],
+                "status": "processing",
+                "claim_token": "dead-token",
+                "execution_owner": "dead-local-owner",
+                "lease_expires_at": future_lease,
+                "active_role_stage": "worker",
+                "active_profile": "dbb3-worker",
+                "checkpoint": {"content": "crash-safe-checkpoint"},
+            },
+            {
+                "id": "remote-owner-remains",
+                "content": "@审阅员 保留远程执行",
+                "targets": ["reviewer"],
+                "target_profiles": ["reviewer"],
+                "status": "processing",
+                "claim_token": "remote-token",
+                "execution_owner": "remote:stable-review-run",
+                "lease_expires_at": future_lease,
+                "active_role_stage": "reviewer",
+                "active_profile": "reviewer",
+            },
+        ]
+
+        changed = module.reconcile_orphaned_local_role_owners(
+            conversation,
+            now_ms=future_lease - 100_000,
+        )
+
+        self.assertTrue(changed)
+        self.assertNotIn("worker", run["active_roles"])
+        self.assertIn("reviewer", run["active_roles"])
+        self.assertEqual(run["interventions"][0]["lease_expires_at"], 0)
+        self.assertEqual(run["interventions"][1]["lease_expires_at"], future_lease)
+        prompts = []
+
+        def runner(_profile, prompt, **_kwargs):
+            prompts.append(prompt)
+            return "干预已确认" if len(prompts) == 1 else "恢复完成"
+
+        result, status, _role_state = module._run_hosted_role(
+            conversation["id"],
+            "turn-local-owner-restart",
+            profile="dbb3-worker",
+            role_stage="worker",
+            role_label="Worker",
+            prompt="恢复原任务",
+            runner=runner,
+            kanban_task_id="child",
+            start_text="恢复中",
+            previous_state={"status": "streaming", "content": ""},
+        )
+
+        self.assertEqual((result, status), ("恢复完成", "completed"))
+        self.assertEqual(len(prompts), 2)
+        self.assertIn("crash-safe-checkpoint", prompts[0])
+        self.assertEqual(run["interventions"][0]["status"], "completed")
+
+    def test_intervention_completion_rejects_wrong_owner_token_and_late_reply(self):
+        module = load_module()
+        conversation = module.create_single_conversation("default")
+        state = {"conversations": [conversation]}
+        module.load_single_state = lambda: state
+        module.save_single_state = lambda _state: None
+        run = module.create_hosted_turn_record(
+            conversation,
+            turn_id="turn-complete-cas",
+            content="执行任务",
+            title="执行任务",
+            profiles=["default", "dbb3-worker", "reviewer"],
+            artifact_required=False,
+        )
+        run["interventions"].append(
+            {
+                "id": "complete-cas-1",
+                "content": "@DBB3 执行员 暂停检查",
+                "targets": ["worker"],
+                "target_profiles": ["dbb3-worker"],
+                "status": "processing",
+                "claim_token": "right-token",
+                "execution_owner": "execution-a",
+                "active_role_stage": "worker",
+                "active_profile": "dbb3-worker",
+            }
+        )
+        kwargs = {
+            "intervention_id": "complete-cas-1",
+            "role_stage": "worker",
+            "role_label": "Worker",
+            "profile": "dbb3-worker",
+            "reply": "收到",
+            "checkpoint": {},
+        }
+        with self.assertRaises(RuntimeError):
+            module._complete_hosted_role_intervention(
+                conversation["id"],
+                "turn-complete-cas",
+                claim_token="wrong",
+                execution_owner="execution-a",
+                **kwargs,
+            )
+        run["cancel_requested"] = True
+        with self.assertRaises(RuntimeError):
+            module._complete_hosted_role_intervention(
+                conversation["id"],
+                "turn-complete-cas",
+                claim_token="right-token",
+                execution_owner="execution-a",
+                **kwargs,
+            )
+        self.assertEqual(run["interventions"][0]["status"], "processing")
+
+    def test_generic_worker_intervention_rejects_ambiguous_active_runs(self):
+        module = load_module()
+        conversation = module.create_single_conversation("default")
+        conversation["owner_id"] = "owner-a"
+        state = {"conversations": [conversation]}
+        module.load_single_state = lambda: state
+        module.save_single_state = lambda _state: None
+        module.owner_id_from_request = lambda _request: "owner-a"
+        run = module.create_hosted_turn_record(
+            conversation,
+            turn_id="turn-ambiguous-worker",
+            content="并行执行",
+            title="并行执行",
+            profiles=["default", "dbb3-worker", "pc-worker", "reviewer"],
+            artifact_required=False,
+        )
+        run["active_roles"] = {
+            "worker:dbb3": {
+                "role_stage": "worker:dbb3",
+                "profile": "dbb3-worker",
+                "execution": "remote",
+                "remote_run_id": "remote-a",
+            },
+            "worker:pc": {
+                "role_stage": "worker:pc",
+                "profile": "pc-worker",
+                "execution": "remote",
+                "remote_run_id": "remote-b",
+            },
+        }
+        run["remote_runs"] = {
+            "a": {"id": "remote-a", "status": "running"},
+            "b": {"id": "remote-b", "status": "running"},
+        }
+        with self.assertRaises(module.HTTPException) as raised:
+            module.intervene_hosted_turn(
+                conversation["id"],
+                "turn-ambiguous-worker",
+                module.HostedTurnInterventionBody(
+                    content="@Hermes Worker 先暂停",
+                    message_id="ambiguous-worker-1",
+                ),
+                SimpleNamespace(),
+            )
+        self.assertEqual(raised.exception.status_code, 409)
+        self.assertFalse(any(item.get("cancel_requested") for item in run["remote_runs"].values()))
+
+    def test_whole_turn_cancel_carries_reason_and_kind_to_every_remote(self):
+        module = load_module()
+        conversation = module.create_single_conversation("default")
+        state = {"conversations": [conversation]}
+        module.load_single_state = lambda: state
+        module.save_single_state = lambda _state: None
+        run = module.create_hosted_turn_record(
+            conversation,
+            turn_id="turn-cancel-contract",
+            content="并行执行",
+            title="并行执行",
+            profiles=["default", "dbb3-worker", "pc-worker", "reviewer"],
+            artifact_required=False,
+        )
+        run["remote_runs"] = {
+            "a": {"id": "remote-a", "status": "running"},
+            "b": {"id": "remote-b", "status": "queued"},
+        }
+        module.request_hosted_turn_cancellation(
+            conversation["id"], "turn-cancel-contract", reason="用户停止任务"
+        )
+        for remote in run["remote_runs"].values():
+            self.assertTrue(remote["cancel_requested"])
+            self.assertEqual(remote["cancel_kind"], "turn")
+            self.assertEqual(remote["cancel_reason"], "用户停止任务")
+            self.assertEqual(remote["cancel_intervention_id"], "")
+
+    def test_terminal_turn_cancels_all_unfinished_interventions(self):
+        module = load_module()
+        conversation = module.create_single_conversation("default")
+        state = {"conversations": [conversation]}
+        module.load_single_state = lambda: state
+        module.save_single_state = lambda _state: None
+        run = module.create_hosted_turn_record(
+            conversation,
+            turn_id="turn-terminal-interventions",
+            content="执行",
+            title="执行",
+            profiles=["default", "dbb3-worker", "reviewer"],
+            artifact_required=False,
+        )
+        run["interventions"] = [
+            {"id": "pending", "status": "pending"},
+            {"id": "processing", "status": "processing"},
+        ]
+        module._persist_hosted_turn(
+            conversation["id"],
+            "turn-terminal-interventions",
+            patch={"status": "failed", "stage": "failed"},
+        )
+        self.assertEqual(
+            [item["status"] for item in run["interventions"]],
+            ["cancelled", "cancelled"],
+        )
+
+    def test_supervisor_cache_is_bound_to_evidence_digest(self):
+        module = load_module()
+        conversation = module.create_single_conversation("default")
+        state = {"conversations": [conversation]}
+        module.load_single_state = lambda: state
+        module.save_single_state = lambda _state: None
+        module.create_hosted_turn_record(
+            conversation,
+            turn_id="turn-supervisor-cache",
+            content="执行",
+            title="执行",
+            profiles=["default", "dbb3-worker", "reviewer"],
+            artifact_required=False,
+        )
+        calls = []
+
+        def runner(_profile, prompt, **_kwargs):
+            calls.append(prompt)
+            return supervision_control()
+
+        for evidence in ({"result": "v1"}, {"result": "v1"}, {"result": "v2"}):
+            module._run_hosted_supervisor_check(
+                conversation["id"],
+                "turn-supervisor-cache",
+                check_id="worker_handoff",
+                checkpoint_label="Worker 交接",
+                evidence=evidence,
+                runner=runner,
+                remote=False,
+            )
+        self.assertEqual(len(calls), 2)
+
+    def test_supervisor_cache_revalidates_a_preupgrade_contradictory_verdict(self):
+        module = load_module()
+        conversation = module.create_single_conversation("default")
+        state = {"conversations": [conversation]}
+        module.load_single_state = lambda: state
+        module.save_single_state = lambda _state: None
+        run = module.create_hosted_turn_record(
+            conversation,
+            turn_id="turn-supervisor-cache-upgrade",
+            content="执行",
+            title="执行",
+            profiles=["default", "dbb3-worker", "reviewer"],
+            artifact_required=False,
+        )
+        calls = []
+
+        def runner(_profile, _prompt, **_kwargs):
+            calls.append(1)
+            return supervision_control()
+
+        evidence = {"result": "same-evidence"}
+        module._run_hosted_supervisor_check(
+            conversation["id"],
+            "turn-supervisor-cache-upgrade",
+            check_id="worker_handoff",
+            checkpoint_label="Worker 交接",
+            evidence=evidence,
+            runner=runner,
+            remote=False,
+        )
+        cached = run["supervisor_checks"]["worker_handoff"]
+        cached["result"] = (
+            "这些检查没有通过。\nHERMES_SUPERVISION: PASS"
+        )
+        cached["verdict"] = "pass"
+
+        _result, status, persisted = module._run_hosted_supervisor_check(
+            conversation["id"],
+            "turn-supervisor-cache-upgrade",
+            check_id="worker_handoff",
+            checkpoint_label="Worker 交接",
+            evidence=evidence,
+            runner=runner,
+            remote=False,
+        )
+
+        self.assertEqual(len(calls), 2)
+        self.assertEqual(status, "completed")
+        self.assertEqual(persisted["verdict"], "pass")
+        self.assertNotIn("没有通过", persisted["result"])
+
+    def test_supervisor_unknown_and_truncated_evidence_fail_closed(self):
+        module = load_module()
+        conversation = module.create_single_conversation("default")
+        state = {"conversations": [conversation]}
+        module.load_single_state = lambda: state
+        module.save_single_state = lambda _state: None
+        run = module.create_hosted_turn_record(
+            conversation,
+            turn_id="turn-supervisor-closed",
+            content="执行",
+            title="执行",
+            profiles=["default", "dbb3-worker", "reviewer"],
+            artifact_required=False,
+        )
+        _result, status, unknown = module._run_hosted_supervisor_check(
+            conversation["id"],
+            "turn-supervisor-closed",
+            check_id="unknown",
+            checkpoint_label="未知结论",
+            evidence={"result": "ok"},
+            runner=lambda *_args, **_kwargs: "看起来没有问题",
+            remote=False,
+        )
+        self.assertEqual(status, "failed")
+        self.assertEqual(unknown["verdict"], "unknown")
+        with self.assertRaises(RuntimeError):
+            module._require_supervisor_pass("未知结论", unknown)
+
+        _result, status, truncated = module._run_hosted_supervisor_check(
+            conversation["id"],
+            "turn-supervisor-closed",
+            check_id="truncated",
+            checkpoint_label="截断证据",
+            evidence={"raw": "x" * 5000},
+            runner=lambda *_args, **_kwargs: supervision_control(),
+            remote=False,
+        )
+        self.assertEqual(status, "failed")
+        self.assertTrue(truncated["evidence_truncated"])
+        self.assertEqual(truncated["verdict"], "unknown")
+        self.assertIsInstance(run["supervisor_checks"]["truncated"]["evidence"], dict)
+
+    def test_closed_verdict_protocol_rejects_text_and_json_envelope_bypasses(self):
+        module = load_module()
+        valid_review = review_control()
+        valid_supervision = supervision_control()
+        narrative_bypasses = (
+            "Not all checks passed",
+            "All checks passed? No",
+            "All checks passed except one",
+            "No defects found because no tests ran",
+            "It is not true that the review did not fail",
+        )
+        for valid, parser in (
+            (valid_review, module._hosted_reviewer_verdict),
+            (valid_supervision, module._hosted_supervisor_verdict),
+        ):
+            invalid = (
+                *narrative_bypasses,
+                f"> {valid}",
+                f"```json\n{valid}\n```",
+                f"prefix\n{valid}",
+                f"{valid}\ntail",
+                f"{valid}\n{valid}",
+                json.dumps(valid),
+            )
+            for result in invalid:
+                with self.subTest(result=result[:80]):
+                    self.assertEqual(parser(result), "unknown")
+
+    def test_closed_verdict_protocol_enforces_exact_schema_and_pass_invariants(self):
+        module = load_module()
+        self.assertEqual(module._hosted_reviewer_verdict(review_control()), "pass")
+        self.assertEqual(
+            module._hosted_reviewer_verdict(review_control("REWORK")),
+            "rework",
+        )
+        self.assertEqual(
+            module._hosted_supervisor_verdict(supervision_control()),
+            "pass",
+        )
+        self.assertEqual(
+            module._hosted_supervisor_verdict(
+                supervision_control("CORRECTIVE_ACTION")
+            ),
+            "corrective_action",
+        )
+
+        invalid_review_objects = []
+        for mutation in (
+            lambda value: value.update({"extra": True}),
+            lambda value: value.pop("findings"),
+            lambda value: value["checks"].update({"extra": True}),
+            lambda value: value["checks"].update({"tests_passed": "true"}),
+            lambda value: value.update({"blockers": ["one blocker"]}),
+            lambda value: value["checks"].update({"tests_passed": False}),
+        ):
+            candidate = json.loads(review_control())
+            mutation(candidate)
+            invalid_review_objects.append(json.dumps(candidate, ensure_ascii=False))
+        invalid_review_objects.extend(
+            (
+                review_control("REWORK", required_actions=[]).replace(
+                    '"required_actions":["补齐证据并重新验收"]',
+                    '"required_actions":[]',
+                ),
+                review_control("REWORK", blockers=[]).replace(
+                    '"blockers":["验收证据不足"]',
+                    '"blockers":[]',
+                ),
+                '{"protocol":"hermes.review.v1","protocol":"hermes.review.v1",'
+                '"verdict":"PASS","checks":{"requirements_met":true,'
+                '"evidence_verified":true,"tests_passed":true,"risks_resolved":true},'
+                '"blockers":[],"findings":[],"required_actions":[]}',
+            )
+        )
+        for result in invalid_review_objects:
+            with self.subTest(result=result[:100]):
+                self.assertEqual(module._hosted_reviewer_verdict(result), "unknown")
+                self.assertTrue(module._review_requests_rework(result))
+
+        invalid_supervision_objects = []
+        for mutation in (
+            lambda value: value.update({"extra": True}),
+            lambda value: value.pop("findings"),
+            lambda value: value["checks"].update({"extra": True}),
+            lambda value: value["checks"].update(
+                {"evidence_sufficient": "true"}
+            ),
+            lambda value: value.update({"blockers": ["one blocker"]}),
+            lambda value: value["checks"].update(
+                {"evidence_sufficient": False}
+            ),
+        ):
+            candidate = json.loads(supervision_control())
+            mutation(candidate)
+            invalid_supervision_objects.append(
+                json.dumps(candidate, ensure_ascii=False)
+            )
+        invalid_supervision_objects.extend(
+            (
+                supervision_control("CORRECTIVE_ACTION").replace(
+                    '"required_actions":["按职责整改并提交复核证据"]',
+                    '"required_actions":[]',
+                ),
+                supervision_control("CORRECTIVE_ACTION").replace(
+                    '"blockers":["职责或证据存在阻断"]',
+                    '"blockers":[]',
+                ),
+                '{"protocol":"hermes.supervision.v1",'
+                '"verdict":"PASS","verdict":"PASS","checks":{'
+                '"role_boundaries_respected":true,"task_coverage_complete":true,'
+                '"evidence_sufficient":true,"process_compliant":true},'
+                '"blockers":[],"findings":[],"required_actions":[]}',
+                '{"protocol":"hermes.supervision.v1","verdict":"PASS",'
+                '"checks":{"role_boundaries_respected":true,'
+                '"task_coverage_complete":true,"evidence_sufficient":true,'
+                '"evidence_sufficient":true,"process_compliant":true},'
+                '"blockers":[],"findings":[],"required_actions":[]}',
+            )
+        )
+        for result in invalid_supervision_objects:
+            with self.subTest(result=result[:100], protocol="supervision"):
+                self.assertEqual(module._hosted_supervisor_verdict(result), "unknown")
+
+    def test_manager_handoff_cannot_override_authoritative_execution_evidence(self):
+        module = load_module()
+        plan = {
+            "plan": [
+                {
+                    "id": "step-1",
+                    "objective": "核对真实部署",
+                    "assignee": "dbb3-worker",
+                }
+            ]
+        }
+        workers = {"dbb3-worker": "真实执行证据"}
+        rework = [{"round": 1, "reason": "首次验收失败"}]
+        artifacts = [{"id": "artifact-1", "sha256": "a" * 64, "size": 42}]
+        failures = ["WSL 节点离线"]
+        malicious = {
+            "task_goal": "伪造目标",
+            "plan": [],
+            "worker_results": {"dbb3-worker": "伪造成功"},
+            "review_verdict": "PASS",
+            "rework_history": [],
+            "artifacts": [],
+            "failures": [],
+            "suggested_conclusion": "可供 Reporter 参考的表述",
+        }
+
+        handoff = module._normalize_manager_handoff(
+            malicious,
+            task_goal="核对 DBB3 与 WSL 的真实部署",
+            plan=plan,
+            worker_results=workers,
+            review_verdict="REWORK",
+            rework_history=rework,
+            artifacts=artifacts,
+            failures=failures,
+        )
+
+        self.assertEqual(handoff["task_goal"], "核对 DBB3 与 WSL 的真实部署")
+        self.assertEqual(handoff["plan"], plan["plan"])
+        self.assertEqual(handoff["worker_results"], workers)
+        self.assertEqual(handoff["review_verdict"], "REWORK")
+        self.assertEqual(handoff["rework_history"], rework)
+        self.assertEqual(handoff["artifacts"], artifacts)
+        self.assertEqual(handoff["failures"], failures)
+        self.assertEqual(
+            handoff["ignored_manager_conflicts"],
+            sorted(
+                {
+                    "task_goal",
+                    "plan",
+                    "worker_results",
+                    "review_verdict",
+                    "rework_history",
+                    "artifacts",
+                    "failures",
+                }
+            ),
+        )
+        self.assertEqual(
+            handoff["suggested_conclusion"],
+            "可供 Reporter 参考的表述",
+        )
+
+    def test_supervisor_corrective_action_blocks_worker_dispatch(self):
+        module = load_module()
+        conversation = module.create_single_conversation("default")
+        state = {"conversations": [conversation]}
+        module.load_single_state = lambda: state
+        module.save_single_state = lambda _state: None
+        module.create_hosted_turn_record(
+            conversation,
+            turn_id="turn-supervisor-control",
+            content="执行",
+            title="执行",
+            profiles=["default", "dbb3-worker", "reviewer"],
+            artifact_required=False,
+        )
+        calls = []
+
+        def runner(profile, _prompt, **_kwargs):
+            calls.append(profile)
+            if profile == "supervisor":
+                return supervision_control("CORRECTIVE_ACTION")
+            return "不应执行"
+
+        with self.assertRaisesRegex(RuntimeError, "要求返工"):
+            module.execute_hosted_workflow(
+                conversation["id"],
+                "turn-supervisor-control",
+                runner=runner,
+                task_creator=lambda **_kwargs: {
+                    "task_id": "root-control",
+                    "child_ids": [],
+                    "fanout": False,
+                },
+            )
+        self.assertEqual(calls, ["supervisor"])
+        run = conversation["hosted_turns"]["turn-supervisor-control"]
+        self.assertEqual(run["status"], "failed")
+        self.assertEqual(run["stage"], "failed")
+        self.assertEqual(
+            run["supervisor_corrective_action"]["verdict"],
+            "corrective_action",
+        )
+        self.assertTrue(
+            any(
+                message.get("meta", {}).get("role_stage")
+                == "supervisor.corrective"
+                for message in conversation["messages"]
+            )
+        )
+
+    def test_terminal_cas_notification_uses_cancel_winner(self):
+        module = load_module()
+        conversation = module.create_single_conversation("default")
+        state = {"conversations": [conversation]}
+        module.load_single_state = lambda: state
+        module.save_single_state = lambda _state: None
+        run = module.create_hosted_turn_record(
+            conversation,
+            turn_id="turn-terminal-cas",
+            content="执行",
+            title="执行",
+            profiles=["default"],
+            artifact_required=False,
+        )
+        run.update(
+            {
+                "status": "cancelled",
+                "stage": "cancelled",
+                "notification": module._completion_notification_record(
+                    conversation["id"], "turn-terminal-cas", "cancelled", "已取消"
+                ),
+            }
+        )
+        persisted = module._persist_hosted_turn(
+            conversation["id"],
+            "turn-terminal-cas",
+            patch={"status": "completed", "stage": "completed"},
+        )
+        delivered = []
+        module._schedule_mobile_completion_notification = (
+            lambda *_args: delivered.append(_args)
+        )
+        module._schedule_persisted_terminal_notification(
+            conversation["id"],
+            "turn-terminal-cas",
+            persisted,
+            fallback_result="错误完成",
+        )
+        self.assertEqual(persisted["status"], "cancelled")
+        self.assertEqual(delivered[0][2:], ("cancelled", "已取消"))
+
+    def test_cancelled_remote_rejects_late_completed_checkpoint(self):
+        module = load_module()
+        conversation = module.create_single_conversation("default")
+        state = {"conversations": [conversation]}
+        module.load_single_state = lambda: state
+        module.save_single_state = lambda _state: None
+        run = module.create_hosted_turn_record(
+            conversation,
+            turn_id="turn-remote-late-complete",
+            content="执行",
+            title="执行",
+            profiles=["default", "dbb3-worker", "reviewer"],
+            artifact_required=False,
+        )
+        remote = module._ensure_remote_run(
+            conversation["id"],
+            "turn-remote-late-complete",
+            role_stage="worker",
+            profile="dbb3-worker",
+            title="执行",
+            objective="执行",
+            local_task_id="child",
+            artifact_required=False,
+            delivery_context="",
+            attachment_context="",
+        )
+        run["cancel_requested"] = True
+        remote["cancel_requested"] = True
+        remote["cancel_kind"] = "turn"
+        with self.assertRaises(module.HTTPException) as raised:
+            module._apply_remote_checkpoint(
+                remote["id"],
+                {
+                    "status": "completed",
+                    "terminal": True,
+                    "checkpoint_cursor": 1,
+                    "result": "迟到完成",
+                },
+            )
+        self.assertEqual(raised.exception.status_code, 409)
+        self.assertEqual(remote["status"], "queued")
+
+    def test_remote_claim_token_rotation_rejects_the_old_same_connector_worker(self):
+        module = load_module()
+        conversation = module.create_single_conversation("default")
+        state = {"conversations": [conversation]}
+        module.load_single_state = lambda: state
+        module.save_single_state = lambda _state: None
+        module._require_connector = lambda _request: "dbb3-primary"
+        module.create_hosted_turn_record(
+            conversation,
+            turn_id="turn-remote-token-race",
+            content="执行",
+            title="执行",
+            profiles=["default", "dbb3-worker", "reviewer"],
+            artifact_required=False,
+        )
+        remote = module._ensure_remote_run(
+            conversation["id"],
+            "turn-remote-token-race",
+            role_stage="worker",
+            profile="dbb3-worker",
+            title="执行",
+            objective="执行",
+            local_task_id="child",
+            artifact_required=False,
+            delivery_context="",
+            attachment_context="",
+        )
+        clock = [1000.0]
+        with patch.object(module.time, "time", side_effect=lambda: clock[0]):
+            first = module.connector_pull_runs(
+                module.ConnectorPullBody(
+                    connector_id="dbb3-primary", limit=1, lease_seconds=5
+                ),
+                SimpleNamespace(),
+            )["runs"][0]
+            clock[0] += 6
+            second = module.connector_pull_runs(
+                module.ConnectorPullBody(
+                    connector_id="dbb3-primary", limit=1, lease_seconds=5
+                ),
+                SimpleNamespace(),
+            )["runs"][0]
+            self.assertNotEqual(first["claim_token"], second["claim_token"])
+
+            stale_calls = (
+                lambda: module.connector_ack_run(
+                    remote["id"],
+                    module.ConnectorAckBody(
+                        connector_id="dbb3-primary",
+                        claim_token=first["claim_token"],
+                    ),
+                    SimpleNamespace(),
+                ),
+                lambda: module.connector_status_run(
+                    remote["id"],
+                    module.ConnectorStatusBody(
+                        connector_id="dbb3-primary",
+                        claim_token=first["claim_token"],
+                        checkpoint_cursor=1,
+                        status="completed",
+                        terminal=True,
+                        result="stale result",
+                    ),
+                    SimpleNamespace(),
+                ),
+            )
+            for stale_call in stale_calls:
+                with self.assertRaises(module.HTTPException) as raised:
+                    stale_call()
+                self.assertEqual(raised.exception.status_code, 409)
+
+            acknowledged = module.connector_ack_run(
+                remote["id"],
+                module.ConnectorAckBody(
+                    connector_id="dbb3-primary",
+                    claim_token=second["claim_token"],
+                    lease_seconds=30,
+                ),
+                SimpleNamespace(),
+            )
+            self.assertTrue(acknowledged["applied"])
+            completed = module.connector_status_run(
+                remote["id"],
+                module.ConnectorStatusBody(
+                    connector_id="dbb3-primary",
+                    claim_token=second["claim_token"],
+                    checkpoint_cursor=1,
+                    status="completed",
+                    terminal=True,
+                    result="authoritative result",
+                ),
+                SimpleNamespace(),
+            )
+            self.assertTrue(completed["applied"])
+            persisted = state["conversations"][0]["hosted_turns"][
+                "turn-remote-token-race"
+            ]["remote_runs"]["worker"]
+            self.assertEqual(persisted["result"], "authoritative result")
+
+    def test_two_remote_coordinators_share_only_the_authoritative_role_result(self):
+        module = load_module()
+        conversation = module.create_single_conversation("default")
+        state = {"conversations": [conversation]}
+        module.load_single_state = lambda: state
+        module.save_single_state = lambda _state: None
+        module._notify_hosted_update = lambda *_args: None
+        module._wait_for_hosted_update = (
+            lambda revision, _timeout: (time.sleep(0.005), revision + 1)[1]
+        )
+        run = module.create_hosted_turn_record(
+            conversation,
+            turn_id="turn-two-coordinators",
+            content="执行",
+            title="执行",
+            profiles=["dbb3-worker"],
+            artifact_required=False,
+        )
+        run["status"] = "running"
+        original_activate = module._activate_hosted_role
+        activations = []
+
+        def capture_activate(*args, **kwargs):
+            applied = original_activate(*args, **kwargs)
+            activations.append(
+                (
+                    threading.current_thread().name,
+                    str(kwargs.get("execution_owner") or ""),
+                    applied,
+                )
+            )
+            return applied
+
+        module._activate_hosted_role = capture_activate
+        results = {}
+        failures = []
+
+        def coordinate(label):
+            try:
+                results[label] = module._run_hosted_remote_role(
+                    conversation["id"],
+                    "turn-two-coordinators",
+                    profile="dbb3-worker",
+                    role_stage="worker:parallel",
+                    role_label="Hermes Worker",
+                    prompt="execute once",
+                    kanban_task_id="task-two-coordinators",
+                    start_text="starting",
+                )
+            except BaseException as exc:
+                failures.append(exc)
+
+        first = threading.Thread(target=coordinate, args=("first",), name="coordinator-one")
+        first.start()
+        deadline = time.time() + 2
+        while time.time() < deadline and not run.get("active_roles"):
+            time.sleep(0.005)
+        self.assertTrue(run.get("active_roles"))
+        second = threading.Thread(target=coordinate, args=("second",), name="coordinator-two")
+        second.start()
+        deadline = time.time() + 2
+        while time.time() < deadline and not any(
+            name == "coordinator-two" and not applied
+            for name, _owner, applied in activations
+        ):
+            time.sleep(0.005)
+        self.assertTrue(
+            any(
+                name == "coordinator-two" and not applied
+                for name, _owner, applied in activations
+            )
+        )
+        remote = run["remote_runs"]["worker:parallel"]
+        remote.update(
+            {
+                "status": "completed",
+                "result": "one authoritative result",
+                "checkpoint_cursor": 1,
+                "completed_at": int(time.time() * 1000),
+            }
+        )
+        first.join(3)
+        second.join(3)
+        self.assertFalse(first.is_alive())
+        self.assertFalse(second.is_alive())
+        self.assertEqual(failures, [])
+        self.assertEqual(results["first"][0], "one authoritative result")
+        self.assertEqual(results["second"][0], "one authoritative result")
+        self.assertNotEqual(activations[0][1], activations[-1][1])
+        completed = [
+            message
+            for message in conversation["messages"]
+            if str((message.get("meta") or {}).get("role_stage") or "")
+            == "worker:parallel"
+            and message.get("status") == "completed"
+        ]
+        self.assertEqual(len(completed), 1)
+
+    def test_completed_or_failed_parent_rejects_statusless_late_mutation(self):
+        module = load_module()
+        for terminal_status in ("completed", "failed"):
+            with self.subTest(status=terminal_status):
+                conversation = module.create_single_conversation("default")
+                state = {"conversations": [conversation]}
+                module.load_single_state = lambda: state
+                module.save_single_state = lambda _state: None
+                turn_id = f"turn-frozen-{terminal_status}"
+                run = module.create_hosted_turn_record(
+                    conversation,
+                    turn_id=turn_id,
+                    content="执行",
+                    title="执行",
+                    profiles=["default"],
+                    artifact_required=False,
+                )
+                run.update({"status": terminal_status, "stage": terminal_status})
+                before_messages = len(conversation["messages"])
+                persisted = module._persist_hosted_turn(
+                    conversation["id"],
+                    turn_id,
+                    patch={"stage": "late-mutated", "late_field": True},
+                    message={
+                        "role": "assistant",
+                        "name": "late",
+                        "content": "迟到消息",
+                    },
+                )
+                self.assertEqual(persisted["stage"], terminal_status)
+                self.assertNotIn("late_field", run)
+                self.assertEqual(len(conversation["messages"]), before_messages)
+
+    def test_first_terminal_commit_freezes_all_statuses_and_clears_active_leases(self):
+        module = load_module()
+        for terminal_status in ("completed", "failed", "cancelled"):
+            with self.subTest(status=terminal_status):
+                conversation = module.create_single_conversation("default")
+                state = {"conversations": [conversation]}
+                module.load_single_state = lambda: state
+                module.save_single_state = lambda _state: None
+                turn_id = f"turn-terminal-freeze-{terminal_status}"
+                run = module.create_hosted_turn_record(
+                    conversation,
+                    turn_id=turn_id,
+                    content="执行",
+                    title="执行",
+                    profiles=["default", "dbb3-worker"],
+                    artifact_required=False,
+                )
+                run["active_roles"] = {
+                    "worker": {
+                        "status": "running",
+                        "execution_owner": "old-owner",
+                        "lease_expires_at": 9999999999999,
+                    }
+                }
+                run["interventions"] = [
+                    {
+                        "id": "intervention-active",
+                        "status": "processing",
+                        "claim_token": "old-intervention-token",
+                        "execution_owner": "old-owner",
+                        "lease_expires_at": 9999999999999,
+                    }
+                ]
+                run["remote_runs"] = {
+                    "worker": {
+                        "id": "remote-terminal-freeze",
+                        "status": "running",
+                        "claim_token": "old-remote-token",
+                        "lease_owner": "dbb3-primary",
+                        "lease_until": 9999999999999,
+                    }
+                }
+                first = module._persist_hosted_turn(
+                    conversation["id"],
+                    turn_id,
+                    patch={
+                        "status": terminal_status,
+                        "stage": terminal_status,
+                        "error": "authoritative",
+                    },
+                    message={
+                        "role": "assistant",
+                        "name": "winner",
+                        "content": "authoritative terminal",
+                        "status": terminal_status,
+                    },
+                )
+                message_count = len(conversation["messages"])
+                commit_id = first["terminal_commit_id"]
+                late = module._persist_hosted_turn(
+                    conversation["id"],
+                    turn_id,
+                    patch={
+                        "status": terminal_status,
+                        "stage": "late-stage",
+                        "error": "late overwrite",
+                        "late_field": True,
+                    },
+                    message={
+                        "role": "assistant",
+                        "name": "loser",
+                        "content": "late duplicate",
+                        "status": terminal_status,
+                    },
+                )
+                self.assertEqual(late["terminal_commit_id"], commit_id)
+                self.assertEqual(run["error"], "authoritative")
+                self.assertNotIn("late_field", run)
+                self.assertEqual(len(conversation["messages"]), message_count)
+                self.assertEqual(run["active_roles"], {})
+                self.assertEqual(run["interventions"][0]["status"], "cancelled")
+                self.assertNotIn("claim_token", run["interventions"][0])
+                remote = run["remote_runs"]["worker"]
+                self.assertEqual(
+                    remote["status"],
+                    "cancelling" if terminal_status == "cancelled" else terminal_status,
+                )
+                self.assertNotIn("claim_token", remote)
+                self.assertEqual(remote["lease_until"], 0)
+
+    def test_intervention_message_id_is_conversation_global_and_payload_bound(self):
+        module = load_module()
+        conversation = module.create_single_conversation("default")
+        conversation["owner_id"] = "owner-a"
+        state = {"conversations": [conversation]}
+        module.load_single_state = lambda: state
+        module.save_single_state = lambda _state: None
+        module.owner_id_from_request = lambda _request: "owner-a"
+        module.create_hosted_turn_record(
+            conversation,
+            turn_id="turn-message-id",
+            content="执行",
+            title="执行",
+            profiles=["default", "dbb3-worker", "reviewer"],
+            artifact_required=False,
+        )
+        existing = module._append_message(
+            conversation,
+            role="user",
+            name="用户",
+            content="普通消息",
+        )
+        existing["id"] = "global-message-id"
+        with self.assertRaises(module.HTTPException) as raised:
+            module.intervene_hosted_turn(
+                conversation["id"],
+                "turn-message-id",
+                module.HostedTurnInterventionBody(
+                    content="@DBB3 执行员 暂停",
+                    message_id="global-message-id",
+                ),
+                SimpleNamespace(),
+            )
+        self.assertEqual(raised.exception.status_code, 409)
+
+    def test_intervention_queues_for_a_later_activation_of_a_completed_role(self):
+        module = load_module()
+        conversation = module.create_single_conversation("default")
+        conversation["owner_id"] = "owner-a"
+        state = {"conversations": [conversation]}
+        module.load_single_state = lambda: state
+        module.save_single_state = lambda _state: None
+        module.owner_id_from_request = lambda _request: "owner-a"
+        run = module.create_hosted_turn_record(
+            conversation,
+            turn_id="turn-ended-role",
+            content="执行",
+            title="执行",
+            profiles=["default", "dbb3-worker", "reviewer"],
+            artifact_required=False,
+        )
+        run["status"] = "running"
+        run["stage"] = "reviewing"
+        run["role_events"] = {
+            "worker": {"profile": "dbb3-worker", "status": "completed"}
+        }
+        response = module.intervene_hosted_turn(
+            conversation["id"],
+            "turn-ended-role",
+            module.HostedTurnInterventionBody(
+                content="@DBB3 执行员 再处理一项",
+                message_id="ended-role-1",
+            ),
+            SimpleNamespace(),
+        )
+        self.assertTrue(response["accepted"])
+        self.assertEqual(run["interventions"][0]["status"], "pending")
+        self.assertTrue(run["interventions"][0]["queued_for_future_stage"])
+        pending = module._pending_hosted_role_intervention(
+            conversation["id"],
+            "turn-ended-role",
+            role_stage="worker:rework:1",
+            profile="dbb3-worker",
+        )
+        self.assertEqual(pending["id"], "ended-role-1")
+
+    def test_manager_reviewer_and_supervisor_mentions_wait_for_future_phases(self):
+        module = load_module()
+        module.owner_id_from_request = lambda _request: "owner-a"
+        scenarios = (
+            ("@Manager 调整后续交接", "manager:plan", "manager:handoff", "dbb3-manager"),
+            ("@Reviewer 复核返工结果", "reviewer:initial", "reviewer:rework:1", "reviewer"),
+            ("@Supervisor 检查最终汇报", "supervisor:dispatch", "supervisor:post_report", "supervisor"),
+        )
+        for index, (content, historical_stage, future_stage, profile) in enumerate(scenarios):
+            with self.subTest(future_stage=future_stage):
+                conversation = module.create_single_conversation("default")
+                conversation["owner_id"] = "owner-a"
+                state = {"conversations": [conversation]}
+                module.load_single_state = lambda state=state: state
+                module.save_single_state = lambda _state: None
+                run = module.create_hosted_turn_record(
+                    conversation,
+                    turn_id=f"turn-future-{index}",
+                    content="执行",
+                    title="执行",
+                    profiles=["default", "dbb3-worker", "reviewer"],
+                    artifact_required=False,
+                )
+                run["status"] = "running"
+                run["role_events"] = {
+                    historical_stage: {"profile": profile, "status": "completed"}
+                }
+                response = module.intervene_hosted_turn(
+                    conversation["id"],
+                    f"turn-future-{index}",
+                    module.HostedTurnInterventionBody(
+                        content=content,
+                        message_id=f"future-{index}",
+                    ),
+                    SimpleNamespace(),
+                )
+                self.assertTrue(response["accepted"])
+                pending = module._pending_hosted_role_intervention(
+                    conversation["id"],
+                    f"turn-future-{index}",
+                    role_stage=future_stage,
+                    profile=profile,
+                )
+                self.assertEqual(pending["id"], f"future-{index}")
+
+    def test_accepted_intervention_replays_after_role_and_turn_finish(self):
+        module = load_module()
+        conversation = module.create_single_conversation("default")
+        conversation["owner_id"] = "owner-a"
+        state = {"conversations": [conversation]}
+        module.load_single_state = lambda: state
+        module.save_single_state = lambda _state: None
+        module.owner_id_from_request = lambda _request: "owner-a"
+        run = module.create_hosted_turn_record(
+            conversation,
+            turn_id="turn-replay-terminal",
+            content="执行",
+            title="执行",
+            profiles=["default", "dbb3-worker", "reviewer"],
+            artifact_required=False,
+        )
+        payload = module.HostedTurnInterventionBody(
+            content="@DBB3 执行员 核对范围",
+            message_id="stable-replay-id",
+        )
+        first = module.intervene_hosted_turn(
+            conversation["id"], "turn-replay-terminal", payload, SimpleNamespace()
+        )
+        run["role_events"] = {
+            "worker": {"profile": "dbb3-worker", "status": "completed"}
+        }
+        run["status"] = "completed"
+        run["stage"] = "completed"
+        replay = module.intervene_hosted_turn(
+            conversation["id"], "turn-replay-terminal", payload, SimpleNamespace()
+        )
+        self.assertEqual(first["message"]["id"], "stable-replay-id")
+        self.assertTrue(replay["replayed"])
+        self.assertEqual(replay["message"]["id"], "stable-replay-id")
+        self.assertEqual(len(run["interventions"]), 1)
+
+    def test_remote_intervention_cancels_one_run_replies_and_resumes_from_checkpoint(self):
+        module = load_module()
+        conversation = module.create_single_conversation("default")
+        conversation["owner_id"] = "owner-a"
+        state = {"conversations": [conversation]}
+        module.load_single_state = lambda: state
+        module.save_single_state = lambda _state: None
+        module.owner_id_from_request = lambda _request: "owner-a"
+        module._require_connector = lambda _request: "dbb3-primary"
+        module.create_hosted_turn_record(
+            conversation,
+            turn_id="turn-remote-interleave",
+            content="远程检查并修复",
+            title="远程修复",
+            profiles=["default", "dbb3-worker", "reviewer"],
+            artifact_required=False,
+            mode="work",
+        )
+        outcome = {}
+        activation_entered = threading.Event()
+        allow_activation = threading.Event()
+        cancellation_committed = threading.Event()
+        original_activate_hosted_role = module._activate_hosted_role
+        original_request_remote_cancel = module._request_remote_role_intervention_cancel
+
+        def activate_hosted_role(*args, **kwargs):
+            if kwargs.get("role_stage") == "worker":
+                activation_entered.set()
+                if not allow_activation.wait(timeout=4):
+                    raise AssertionError("worker activation was not released")
+            return original_activate_hosted_role(*args, **kwargs)
+
+        def request_remote_cancel(*args, **kwargs):
+            claimed = original_request_remote_cancel(*args, **kwargs)
+            if kwargs.get("role_stage") == "worker" and isinstance(claimed, dict):
+                cancellation_committed.set()
+            return claimed
+
+        module._activate_hosted_role = activate_hosted_role
+        module._request_remote_role_intervention_cancel = request_remote_cancel
+        self.addCleanup(allow_activation.set)
+
+        def execute_remote():
+            try:
+                outcome["value"] = module._run_hosted_remote_role(
+                    conversation["id"],
+                    "turn-remote-interleave",
+                    profile="dbb3-worker",
+                    role_stage="worker",
+                    role_label="dbb3-worker · 执行",
+                    prompt="执行远程原始任务",
+                    kanban_task_id="child-remote",
+                    start_text="正在远程执行。",
+                    connector_id="dbb3-primary",
+                )
+            except BaseException as exc:
+                outcome["error"] = exc
+
+        def wait_for_remote_stage(fragment, timeout=4):
+            deadline = time.monotonic() + timeout
+            while time.monotonic() < deadline:
+                for remote in conversation["hosted_turns"]["turn-remote-interleave"].get(
+                    "remote_runs", {}
+                ).values():
+                    if fragment in str(remote.get("role_stage") or ""):
+                        return remote
+                time.sleep(0.01)
+            self.fail(f"remote stage was not created: {fragment}")
+
+        with patch.dict(os.environ, {"HERMES_REMOTE_RUN_WAIT_SECONDS": "10"}):
+            thread = threading.Thread(target=execute_remote, daemon=True)
+            thread.start()
+            self.assertTrue(activation_entered.wait(timeout=4))
+            original = wait_for_remote_stage("worker")
+            intervention_response = module.intervene_hosted_turn(
+                conversation["id"],
+                "turn-remote-interleave",
+                module.HostedTurnInterventionBody(
+                    content="@DBB3 执行员 暂停并核对远端边界。",
+                    message_id="remote-intervention-1",
+                ),
+                SimpleNamespace(),
+            )
+            intervention = intervention_response["hosted_turn"]["interventions"][0]
+            self.assertEqual(intervention["status"], "pending")
+            self.assertTrue(intervention["queued_for_future_stage"])
+            before_activation = module.connector_pull_cancellations(
+                module.ConnectorPullBody(connector_id="dbb3-primary", limit=5),
+                SimpleNamespace(),
+            )
+            self.assertEqual(before_activation["cancellations"], [])
+            allow_activation.set()
+            self.assertTrue(cancellation_committed.wait(timeout=4))
+            pulled = module.connector_pull_cancellations(
+                module.ConnectorPullBody(connector_id="dbb3-primary", limit=5),
+                SimpleNamespace(),
+            )
+            self.assertEqual(len(pulled["cancellations"]), 1)
+            cancellation = pulled["cancellations"][0]
+            self.assertEqual(cancellation["remote_run_id"], original["id"])
+            self.assertEqual(cancellation["kind"], "intervention")
+            self.assertEqual(cancellation["intervention_id"], "remote-intervention-1")
+            self.assertFalse(
+                conversation["hosted_turns"]["turn-remote-interleave"]["cancel_requested"]
+            )
+            module._apply_remote_checkpoint(
+                original["id"],
+                {
+                    "connector_id": "dbb3-primary",
+                    "claim_token": cancellation["claim_token"],
+                    "status": "cancelled",
+                    "terminal": True,
+                    "checkpoint_cursor": 7,
+                    "summary": "paused-at-remote-checkpoint",
+                    "activities": [{"id": "remote-step", "status": "completed"}],
+                },
+            )
+            reply_run = wait_for_remote_stage(":intervention:")
+            reply_claim = next(
+                item
+                for item in module.connector_pull_runs(
+                    module.ConnectorPullBody(connector_id="dbb3-primary", limit=5),
+                    SimpleNamespace(),
+                )["runs"]
+                if item["remote_run_id"] == reply_run["id"]
+            )
+            module._apply_remote_checkpoint(
+                reply_run["id"],
+                {
+                    "connector_id": "dbb3-primary",
+                    "claim_token": reply_claim["claim_token"],
+                    "status": "completed",
+                    "terminal": True,
+                    "checkpoint_cursor": 1,
+                    "result": "已核对远端边界，将从检查点继续。",
+                },
+            )
+            resume_run = wait_for_remote_stage(":resume:")
+            self.assertIn("paused-at-remote-checkpoint", resume_run["objective"])
+            self.assertIn("checkpoint_cursor", resume_run["objective"])
+            resume_claim = next(
+                item
+                for item in module.connector_pull_runs(
+                    module.ConnectorPullBody(connector_id="dbb3-primary", limit=5),
+                    SimpleNamespace(),
+                )["runs"]
+                if item["remote_run_id"] == resume_run["id"]
+            )
+            module._apply_remote_checkpoint(
+                resume_run["id"],
+                {
+                    "connector_id": "dbb3-primary",
+                    "claim_token": resume_claim["claim_token"],
+                    "status": "completed",
+                    "terminal": True,
+                    "checkpoint_cursor": 8,
+                    "result": "远端恢复后完成",
+                },
+            )
+            thread.join(timeout=4)
+
+        self.assertFalse(thread.is_alive())
+        self.assertNotIn("error", outcome)
+        self.assertEqual(outcome["value"][:2], ("远端恢复后完成", "completed"))
+        intervention = conversation["hosted_turns"]["turn-remote-interleave"][
+            "interventions"
+        ][0]
+        self.assertEqual(intervention["status"], "completed")
+        self.assertEqual(intervention["checkpoint"]["checkpoint_cursor"], 7)
+        self.assertIn("已核对远端边界", intervention["reply"])
+        self.assertEqual(
+            conversation["hosted_turns"]["turn-remote-interleave"]["role_events"][
+                "worker"
+            ]["status"],
+            "completed",
+        )
+        self.assertEqual(
+            conversation["hosted_turns"]["turn-remote-interleave"]["active_roles"],
+            {},
+        )
+
     def test_manifest_registers_one_official_collaboration_tab(self):
         manifest_path = MODULE_PATH.parent / "manifest.json"
         manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
@@ -2235,7 +4073,8 @@ class CollaborationDashboardTests(unittest.TestCase):
             calls.append((profile, prompt))
             return {
                 "dbb3-worker": "执行完成，服务已恢复",
-                "reviewer": "审阅通过，证据完整",
+                "reviewer": review_control(),
+                "supervisor": supervision_control(),
                 "default": "最终汇报：任务完成",
             }[profile]
 
@@ -2250,11 +4089,14 @@ class CollaborationDashboardTests(unittest.TestCase):
             },
         )
 
-        self.assertEqual([profile for profile, _prompt in calls], [
-            "dbb3-worker",
-            "reviewer",
-            "default",
-        ])
+        self.assertEqual(
+            [profile for profile, _prompt in calls if profile != "supervisor"],
+            ["dbb3-worker", "reviewer", "default"],
+        )
+        self.assertEqual(
+            [profile for profile, _prompt in calls].count("supervisor"),
+            5,
+        )
         assistant_messages = [
             message
             for message in conversation["messages"]
@@ -2269,6 +4111,16 @@ class CollaborationDashboardTests(unittest.TestCase):
             conversation["hosted_turns"]["turn-hosted-1"]["status"],
             "completed",
         )
+        self.assertEqual(
+            set(conversation["hosted_turns"]["turn-hosted-1"]["supervisor_checks"]),
+            {
+                "plan_dispatch",
+                "worker_handoff",
+                "review_handoff",
+                "final_report",
+                "post_report",
+            },
+        )
         notification = conversation["hosted_turns"]["turn-hosted-1"]["notification"]
         self.assertEqual(notification["state"], "queued")
         self.assertEqual(notification["task_status"], "completed")
@@ -2282,19 +4134,25 @@ class CollaborationDashboardTests(unittest.TestCase):
                 "最终汇报：任务完成",
             )],
         )
-        worker_prompt = calls[0][1]
-        reviewer_prompt = calls[1][1]
-        reporter_prompt = calls[2][1]
+        business_calls = [item for item in calls if item[0] != "supervisor"]
+        worker_prompt = business_calls[0][1]
+        reviewer_prompt = business_calls[1][1]
+        reporter_prompt = business_calls[2][1]
 
         self.assertIn("可以使用所有已配置的 Skill、MCP 和工具", worker_prompt)
+        self.assertIn("信息增量事件 + 静默时长", worker_prompt)
+        self.assertIn("实际动作与证据绑定", worker_prompt)
         self.assertIn("可以读取根任务和已分配工作项", worker_prompt)
         self.assertIn("可以向已分配工作项写入进度、证据和交接评论", worker_prompt)
         self.assertNotIn("不要主动查询或修改 Kanban 内部状态", worker_prompt)
 
         self.assertIn("独立抽样复核", reviewer_prompt)
+        self.assertIn("采用的独立证据", reviewer_prompt)
         self.assertIn("正常的 Skill、MCP、命令和取证调用不属于过度执行", reviewer_prompt)
         self.assertNotIn("不要主动查询或修改 Kanban 内部状态", reviewer_prompt)
         self.assertIn("不得创建、改派、关闭或删除根任务", reporter_prompt)
+        self.assertIn("不调用工具补洞", reporter_prompt)
+        self.assertIn("不得选择更乐观的版本", reporter_prompt)
 
     def test_notification_delivery_progress_and_terminal_state_are_persisted(self):
         module = load_module()
@@ -2579,6 +4437,10 @@ class CollaborationDashboardTests(unittest.TestCase):
 
         def runner(profile, _prompt, **kwargs):
             calls.append((profile, kwargs.get("kanban_task_id")))
+            if profile == "supervisor":
+                return supervision_control()
+            if profile == "reviewer":
+                return review_control()
             return f"{profile} 完成"
 
         module.execute_hosted_workflow(
@@ -2592,10 +4454,11 @@ class CollaborationDashboardTests(unittest.TestCase):
             },
         )
 
-        self.assertEqual(calls[0], ("pc-worker", "child-worker"))
-        self.assertEqual(calls[1], ("reviewer", "child-reviewer"))
-        self.assertTrue(calls[2][1].startswith("hosted-reporter-"))
-        self.assertNotIn("root-scoped", [scope for _profile, scope in calls])
+        business_calls = [item for item in calls if item[0] != "supervisor"]
+        self.assertEqual(business_calls[0], ("pc-worker", "child-worker"))
+        self.assertEqual(business_calls[1], ("reviewer", "child-reviewer"))
+        self.assertTrue(business_calls[2][1].startswith("hosted-reporter-"))
+        self.assertNotIn("root-scoped", [scope for _profile, scope in business_calls])
 
     def test_hosted_roles_persist_separate_live_messages_with_nested_activities(self):
         module = load_module()
@@ -2643,14 +4506,15 @@ class CollaborationDashboardTests(unittest.TestCase):
                     "payload": {"text": f"{profile} 已取得第一条结果。"},
                 }
             )
-            role_message = next(
-                message
-                for message in conversation["messages"]
-                if message.get("meta", {}).get("runtime_turn_id") == "turn-live-roles"
-                and message.get("name") == profile
-                and message.get("status") == "streaming"
-            )
-            observed_running_messages.append(role_message["content"])
+            if profile not in {"supervisor", "default"}:
+                role_message = next(
+                    message
+                    for message in conversation["messages"]
+                    if message.get("meta", {}).get("runtime_turn_id") == "turn-live-roles"
+                    and message.get("name") == profile
+                    and message.get("status") == "streaming"
+                )
+                observed_running_messages.append(role_message["content"])
             event_callback(
                 {
                     "type": "tool.complete",
@@ -2662,6 +4526,10 @@ class CollaborationDashboardTests(unittest.TestCase):
                     },
                 }
             )
+            if profile == "supervisor":
+                return supervision_control()
+            if profile == "reviewer":
+                return review_control()
             return f"{profile} 阶段完成"
 
         module.execute_hosted_workflow(
@@ -2686,7 +4554,9 @@ class CollaborationDashboardTests(unittest.TestCase):
             [message["meta"]["role_stage"] for message in role_messages],
             ["dispatch", "worker", "reviewer", "reporter"],
         )
-        self.assertEqual(len(observed_running_messages), 3)
+        # Reporter is intentionally invisible until the independent
+        # post-report supervisor gate accepts the candidate.
+        self.assertEqual(len(observed_running_messages), 2)
         for message in role_messages[1:]:
             self.assertTrue(message["meta"]["collapse_activities"])
             self.assertEqual(message["meta"]["actual_model"], "gpt-5.6-sol")
@@ -2711,6 +4581,8 @@ class CollaborationDashboardTests(unittest.TestCase):
 
         def runner(profile, _prompt, *, event_callback=None):
             nonlocal worker_attempts
+            if profile == "supervisor":
+                return supervision_control()
             if profile == "dbb3-worker":
                 worker_attempts += 1
                 if worker_attempts == 1:
@@ -2730,7 +4602,11 @@ class CollaborationDashboardTests(unittest.TestCase):
                     }
                 )
                 return "执行恢复完成"
-            return "审阅通过" if profile == "reviewer" else "最终汇报完成"
+            return (
+                review_control()
+                if profile == "reviewer"
+                else "最终汇报完成"
+            )
 
         module.execute_hosted_workflow(
             conversation["id"],
@@ -2834,6 +4710,8 @@ class CollaborationDashboardTests(unittest.TestCase):
 
         def runner(profile, prompt):
             prompts.append((profile, prompt))
+            if profile == "supervisor":
+                return supervision_control()
             return f"{profile} 完成"
 
         module.create_hosted_turn_record(
@@ -2908,12 +4786,14 @@ class CollaborationDashboardTests(unittest.TestCase):
 
         def runner(profile, _prompt):
             calls.append(profile)
-            module.request_hosted_turn_cancellation(
-                conversation["id"],
-                "turn-cancel-1",
-                reason="用户取消",
-            )
-            return "执行者已停止"
+            if profile == "dbb3-worker":
+                module.request_hosted_turn_cancellation(
+                    conversation["id"],
+                    "turn-cancel-1",
+                    reason="用户取消",
+                )
+                return "执行者已停止"
+            return supervision_control()
 
         module.execute_hosted_workflow(
             conversation["id"],
@@ -2927,7 +4807,10 @@ class CollaborationDashboardTests(unittest.TestCase):
         )
 
         run = conversation["hosted_turns"]["turn-cancel-1"]
-        self.assertEqual(calls, ["dbb3-worker"])
+        self.assertEqual(
+            [profile for profile in calls if profile != "supervisor"],
+            ["dbb3-worker"],
+        )
         self.assertEqual(run["status"], "cancelled")
         self.assertEqual(run["stage"], "cancelled")
         self.assertEqual(
@@ -3774,6 +5657,8 @@ class CollaborationDashboardTests(unittest.TestCase):
         def runner(profile, _prompt, *, event_callback=None, kanban_task_id=None):
             with call_lock:
                 calls.append((profile, "start", time.monotonic(), kanban_task_id))
+            if profile == "supervisor":
+                return supervision_control()
             if profile in {"dbb3-worker", "pc-worker"}:
                 barrier.wait()
                 event_callback(
@@ -3810,7 +5695,7 @@ class CollaborationDashboardTests(unittest.TestCase):
                 return f"{profile} 完成"
             if profile == "reviewer":
                 self.assertEqual(worker_finished, {"dbb3-worker", "pc-worker"})
-                return "全部执行结果审阅通过"
+                return review_control()
             self.assertEqual(worker_finished, {"dbb3-worker", "pc-worker"})
             return "最终汇报完成"
 
@@ -3829,7 +5714,11 @@ class CollaborationDashboardTests(unittest.TestCase):
         self.assertEqual(run["status"], "completed")
         self.assertEqual(set(run["worker_results"]), {"dbb3-worker", "pc-worker"})
         self.assertTrue(all(value == "completed" for value in run["worker_statuses"].values()))
-        start_profiles = [profile for profile, phase, _at, _scope in calls if phase == "start"]
+        start_profiles = [
+            profile
+            for profile, phase, _at, _scope in calls
+            if phase == "start" and profile != "supervisor"
+        ]
         self.assertEqual(set(start_profiles[:2]), {"dbb3-worker", "pc-worker"})
         self.assertEqual(start_profiles[2:], ["reviewer", "default"])
 
@@ -3890,6 +5779,8 @@ class CollaborationDashboardTests(unittest.TestCase):
         def runner(profile, prompt, **_kwargs):
             nonlocal worker_attempt, reviewer_attempt
             calls.append(profile)
+            if profile == "supervisor":
+                return supervision_control()
             if profile == "dbb3-worker":
                 worker_attempt += 1
                 if worker_attempt == 2:
@@ -3898,9 +5789,9 @@ class CollaborationDashboardTests(unittest.TestCase):
             if profile == "reviewer":
                 reviewer_attempt += 1
                 if reviewer_attempt == 1:
-                    return "证据不足，需要返工。\nHERMES_REVIEW: REWORK"
+                    return review_control("REWORK")
                 self.assertIn("返工后的执行者提交", prompt)
-                return "证据已补齐，审阅通过。\nHERMES_REVIEW: PASS"
+                return review_control()
             self.assertEqual(reviewer_attempt, 2)
             return "最终汇报"
 
@@ -3917,12 +5808,15 @@ class CollaborationDashboardTests(unittest.TestCase):
 
         run = conversation["hosted_turns"]["turn-review-rework"]
         self.assertEqual(
-            calls,
+            [profile for profile in calls if profile != "supervisor"],
             ["dbb3-worker", "reviewer", "dbb3-worker", "reviewer", "default"],
         )
         self.assertEqual(run["rework_round"], 1)
         self.assertEqual(run["status"], "completed")
-        self.assertIn("HERMES_REVIEW: PASS", run["reviewer_result"])
+        self.assertEqual(
+            json.loads(run["reviewer_result"])["verdict"],
+            "PASS",
+        )
         rework_request = next(
             message
             for message in conversation["messages"]
@@ -4083,6 +5977,8 @@ class CollaborationDashboardTests(unittest.TestCase):
         )
 
         def runner(profile, _prompt, *, event_callback=None, **_kwargs):
+            if profile == "supervisor":
+                return supervision_control()
             if profile == "dbb3-worker":
                 event_callback(
                     {
@@ -4217,7 +6113,7 @@ class CollaborationDashboardTests(unittest.TestCase):
             if stage == "worker":
                 return "worker evidence", "completed", {}
             if stage == "reviewer":
-                return "verified\nHERMES_REVIEW: PASS", "completed", {}
+                return review_control(), "completed", {}
             if stage == "manager_handoff":
                 return (
                     json.dumps(
@@ -4235,6 +6131,8 @@ class CollaborationDashboardTests(unittest.TestCase):
                     "completed",
                     {},
                 )
+            if stage.startswith("supervisor:"):
+                return supervision_control(), "completed", {}
             raise AssertionError(stage)
 
         def local_role(_conversation_id, _turn_id, **kwargs):
@@ -4260,7 +6158,17 @@ class CollaborationDashboardTests(unittest.TestCase):
 
         self.assertEqual(
             [stage for stage, _profile, _connector, _label in remote_stages],
-            ["manager_planning", "worker", "reviewer", "manager_handoff"],
+            [
+                "manager_planning",
+                "supervisor:plan_dispatch",
+                "worker",
+                "supervisor:worker_handoff",
+                "reviewer",
+                "supervisor:review_handoff",
+                "manager_handoff",
+                "supervisor:final_report",
+                "supervisor:post_report",
+            ],
         )
         self.assertEqual(local_stages[0][:2], ("reporter", "default"))
         self.assertIn("结构化交接", local_stages[0][2])
@@ -4274,8 +6182,8 @@ class CollaborationDashboardTests(unittest.TestCase):
         )
         manager_labels = {
             label
-            for _stage, profile, _connector, label in remote_stages
-            if profile == "dbb3-manager"
+            for stage, profile, _connector, label in remote_stages
+            if profile == "dbb3-manager" and stage.startswith("manager_")
         }
         self.assertEqual(
             manager_labels,
@@ -4284,6 +6192,111 @@ class CollaborationDashboardTests(unittest.TestCase):
         self.assertFalse(
             any("DBB3 Manager" in str(label) for label in manager_labels)
         )
+        self.assertEqual(
+            set(conversation["hosted_turns"]["turn-manager-owned"]["supervisor_checks"]),
+            {
+                "plan_dispatch",
+                "worker_handoff",
+                "review_handoff",
+                "final_report",
+                "post_report",
+            },
+        )
+
+    def test_post_report_corrective_gate_rejects_candidate_before_publication(self):
+        module = load_module()
+        conversation = module.create_single_conversation("default")
+        state = {"conversations": [conversation]}
+        module.load_single_state = lambda: state
+        module.save_single_state = lambda _state: None
+        module.create_hosted_turn_record(
+            conversation,
+            turn_id="turn-post-report-reject",
+            content="检查节点并发布结果",
+            title="检查节点",
+            profiles=["default", "dbb3-worker", "reviewer"],
+            artifact_required=False,
+            mode="work",
+        )
+        visibility = {}
+        notifications = []
+
+        def remote_role(_conversation_id, _turn_id, **kwargs):
+            stage = kwargs["role_stage"]
+            visibility[stage] = kwargs.get("visible", True)
+            if stage == "manager_planning":
+                return (
+                    json.dumps(
+                        {
+                            "difficulty": "medium",
+                            "reason": "single lane",
+                            "workers": ["dbb3-worker"],
+                            "reviewer_target": "dbb3",
+                            "plan": [
+                                {
+                                    "id": "step-1",
+                                    "title": "check",
+                                    "objective": "inspect node",
+                                    "assignee": "dbb3-worker",
+                                    "depends_on": [],
+                                }
+                            ],
+                        }
+                    ),
+                    "completed",
+                    {},
+                )
+            if stage == "worker":
+                return "verified worker evidence", "completed", {}
+            if stage == "reviewer":
+                return review_control(), "completed", {}
+            if stage == "manager_handoff":
+                return '{"suggested_conclusion":"candidate conclusion"}', "completed", {}
+            if stage == "supervisor:post_report":
+                return supervision_control("CORRECTIVE_ACTION"), "completed", {}
+            if stage.startswith("supervisor:"):
+                return supervision_control(), "completed", {}
+            raise AssertionError(stage)
+
+        def local_role(_conversation_id, _turn_id, **kwargs):
+            visibility[kwargs["role_stage"]] = kwargs.get("visible", True)
+            return "未经监督批准的 Reporter 草稿", "completed", {"activities": []}
+
+        module._run_hosted_remote_role = remote_role
+        module._run_hosted_role = local_role
+        module._schedule_mobile_completion_notification = (
+            lambda *args: notifications.append(args)
+        )
+
+        with self.assertRaisesRegex(RuntimeError, "要求返工"):
+            module.execute_hosted_workflow(
+                conversation["id"],
+                "turn-post-report-reject",
+                runner=module.run_profile_turn,
+                task_creator=lambda **_kwargs: {
+                    "task_id": "root-post-report-reject",
+                    "child_ids": ["child-worker", "child-reviewer"],
+                    "profile_task_ids": {
+                        "dbb3-worker": "child-worker",
+                        "reviewer": "child-reviewer",
+                    },
+                    "fanout": True,
+                },
+            )
+
+        run = conversation["hosted_turns"]["turn-post-report-reject"]
+        self.assertEqual(run["status"], "failed")
+        self.assertEqual(run["supervisor_checks"]["post_report"]["verdict"], "corrective_action")
+        self.assertFalse(visibility["reporter"])
+        self.assertFalse(visibility["supervisor:post_report"])
+        self.assertFalse(
+            any(
+                message.get("meta", {}).get("final_report")
+                or message.get("content") == "未经监督批准的 Reporter 草稿"
+                for message in conversation["messages"]
+            )
+        )
+        self.assertEqual(notifications, [])
 
 
 if __name__ == "__main__":

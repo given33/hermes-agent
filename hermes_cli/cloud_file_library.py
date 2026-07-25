@@ -26,10 +26,21 @@ from hermes_cli.config import get_hermes_home
 from hermes_cli.sqlite_util import write_txn
 
 
+def _native_atomic_path(path: Path) -> str:
+    """Return an extended Windows path for the final atomic filesystem call."""
+
+    value = os.path.abspath(os.fspath(path))
+    if os.name != "nt" or value.startswith("\\\\?\\"):
+        return value
+    if value.startswith("\\\\"):
+        return "\\\\?\\UNC\\" + value.lstrip("\\")
+    return "\\\\?\\" + value
+
+
 SCHEMA_VERSION = 3
 LOCAL_OWNER_ID = "local-owner"
 FILE_SOURCES = frozenset({"user_upload", "model_output"})
-FILE_STATUSES = frozenset({"uploading", "available", "failed"})
+FILE_STATUSES = frozenset({"uploading", "staged", "available", "failed"})
 INSTALL_INTENT_RECOVERY_AGE_MS = 15 * 60 * 1000
 _SOURCE_ALIASES = {
     "user": "user_upload",
@@ -224,7 +235,7 @@ def normalize_source(source: str) -> str:
 def normalize_status(status: str) -> str:
     normalized = str(status or "").strip().lower()
     if normalized not in FILE_STATUSES:
-        raise ValueError("File status must be uploading, available, or failed")
+        raise ValueError("File status must be uploading, staged, available, or failed")
     return normalized
 
 
@@ -386,7 +397,7 @@ class CloudFileLibrary:
                     == str(intent["expected_sha256"] or "")
                 )
                 if not installed_is_current:
-                    target.unlink(missing_ok=True)
+                    Path(_native_atomic_path(target)).unlink(missing_ok=True)
                     self._remove_empty_object_parents(target)
             conn.execute(
                 "DELETE FROM file_install_intents WHERE id=?",
@@ -608,6 +619,7 @@ class CloudFileLibrary:
         file_id: str = "",
         allowed_roots: Sequence[Path | str] | None = None,
         restore_deleted: bool = True,
+        make_available: bool = True,
     ) -> dict[str, Any] | None:
         owner_id = normalize_owner_id(owner_id)
         normalized_source = normalize_source(source)
@@ -660,19 +672,40 @@ class CloudFileLibrary:
                             existing_path_ok = self._record_path(dict(existing)).is_file()
                         except ValueError:
                             existing_path_ok = False
+                    desired_status = "available" if make_available else "staged"
+                    status_compatible = (
+                        existing["status"] == "available"
+                        if make_available
+                        else existing["status"] in {"staged", "available"}
+                    )
                     unchanged = (
                         existing_path_ok
-                        and existing["status"] == "available"
+                        and status_compatible
                         and existing["sha256"] == digest
                         and existing["name"] == name
                     )
                     metadata_unchanged = all(
                         str(existing[key]) == value for key, value in metadata.items()
                     ) and existing["source"] == normalized_source
+                    # An origin key is the caller's idempotency boundary. A
+                    # replay carrying the same bytes must not rename, relink,
+                    # or temporarily hide an already-published object merely
+                    # because presentation metadata changed between attempts.
+                    origin_replay = bool(
+                        metadata["origin_key"]
+                        and existing_path_ok
+                        and status_compatible
+                        and existing["sha256"] == digest
+                    )
+                    if origin_replay:
+                        return dict(existing)
                     if unchanged and metadata_unchanged:
                         return dict(existing)
                 else:
                     file_id = file_id or f"file_{uuid.uuid4().hex}"
+
+            desired_status = "available" if make_available else "staged"
+            available_at = self._clock_ms() if make_available else None
 
             target, relative = self._destination(
                 owner_id,
@@ -706,7 +739,7 @@ class CloudFileLibrary:
                             self._clock_ms(),
                         ),
                     )
-                os.replace(temp, target)
+                os.replace(_native_atomic_path(temp), _native_atomic_path(target))
                 now = self._clock_ms()
                 with self.connection() as conn, write_txn(conn):
                     self._ensure_owner_active(conn, owner_id)
@@ -719,7 +752,7 @@ class CloudFileLibrary:
                                 status, conversation_id, message_id, turn_id,
                                 profile, origin_key, error, created_at,
                                 updated_at, available_at
-                            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'available',
+                            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
                                       ?, ?, ?, ?, ?, '', ?, ?, ?)
                             """,
                             (
@@ -733,6 +766,7 @@ class CloudFileLibrary:
                                 file_type,
                                 size,
                                 normalized_source,
+                                desired_status,
                                 metadata["conversation_id"],
                                 metadata["message_id"],
                                 metadata["turn_id"],
@@ -740,7 +774,7 @@ class CloudFileLibrary:
                                 metadata["origin_key"],
                                 now,
                                 now,
-                                now,
+                                available_at,
                             ),
                         )
                     else:
@@ -749,7 +783,7 @@ class CloudFileLibrary:
                             UPDATE account_files
                             SET name=?, stored_relpath=?, sha256=?, mime_type=?,
                                 extension=?, file_type=?, size=?, source=?,
-                                status='available', conversation_id=?, message_id=?,
+                                status=?, conversation_id=?, message_id=?,
                                 turn_id=?, profile=?, origin_key=?, error='',
                                 updated_at=?, available_at=?
                             WHERE id=? AND owner_id=?
@@ -763,13 +797,14 @@ class CloudFileLibrary:
                                 file_type,
                                 size,
                                 normalized_source,
+                                desired_status,
                                 metadata["conversation_id"],
                                 metadata["message_id"],
                                 metadata["turn_id"],
                                 metadata["profile"],
                                 metadata["origin_key"],
                                 now,
-                                now,
+                                available_at,
                                 file_id,
                                 owner_id,
                             ),
@@ -800,6 +835,95 @@ class CloudFileLibrary:
             if old_relative and old_relative != relative:
                 self._remove_object_path(old_relative)
             return dict(row)
+
+    def restore_file_record(self, previous: dict[str, Any]) -> dict[str, Any]:
+        """Restore every field and object path from a pre-publication snapshot."""
+
+        columns = (
+            "id", "owner_id", "name", "stored_relpath", "sha256",
+            "mime_type", "extension", "file_type", "size", "source",
+            "status", "conversation_id", "message_id", "turn_id", "profile",
+            "origin_key", "error", "created_at", "updated_at", "available_at",
+        )
+        if not isinstance(previous, dict) or any(key not in previous for key in columns):
+            raise ValueError("Previous file record is incomplete")
+        owner_id = normalize_owner_id(previous["owner_id"])
+        file_id = str(previous["id"] or "").strip()
+        if not file_id or owner_id != str(previous["owner_id"]):
+            raise ValueError("Previous file record identity is invalid")
+        previous_path = self._record_path(previous)
+
+        with self._lock:
+            with self.connection() as conn:
+                current = self._select_owned(conn, owner_id, file_id)
+            current_record = dict(current) if current is not None else None
+            current_path = self._record_path(current_record) if current_record else None
+
+            if not previous_path.is_file():
+                if current_path is None or not current_path.is_file():
+                    raise FileNotFoundError(file_id)
+                digest, size = self._hash_file(current_path)
+                if digest != str(previous["sha256"] or "") or size != int(previous["size"]):
+                    raise ValueError("Current object cannot restore previous record")
+                previous_path.parent.mkdir(parents=True, exist_ok=True)
+                temp = previous_path.with_name(f".restore-{uuid.uuid4().hex[:12]}")
+                try:
+                    with current_path.open("rb") as source_handle, temp.open("xb") as target_handle:
+                        shutil.copyfileobj(source_handle, target_handle, length=1024 * 1024)
+                        target_handle.flush()
+                        os.fsync(target_handle.fileno())
+                    os.replace(_native_atomic_path(temp), _native_atomic_path(previous_path))
+                finally:
+                    temp.unlink(missing_ok=True)
+            else:
+                digest, size = self._hash_file(previous_path)
+                if digest != str(previous["sha256"] or "") or size != int(previous["size"]):
+                    raise ValueError("Previous object no longer matches its record")
+
+            placeholders = ",".join("?" for _ in columns)
+            updates = ",".join(f"{column}=excluded.{column}" for column in columns[2:])
+            with self.connection() as conn, write_txn(conn):
+                self._ensure_owner_active(conn, owner_id)
+                conn.execute(
+                    f"INSERT INTO account_files ({','.join(columns)}) VALUES ({placeholders}) "
+                    f"ON CONFLICT(id) DO UPDATE SET {updates}",
+                    tuple(previous[column] for column in columns),
+                )
+                if previous["origin_key"]:
+                    conn.execute(
+                        "DELETE FROM deleted_file_origins WHERE owner_id=? AND origin_key=?",
+                        (owner_id, previous["origin_key"]),
+                    )
+                row = self._select_owned(conn, owner_id, file_id)
+
+            if current_path is not None and current_path != previous_path:
+                self._remove_object_path(str(current_record.get("stored_relpath") or ""))
+        return dict(row)
+
+    def publish_file(self, owner_id: str, file_id: str) -> dict[str, Any]:
+        """Make staged bytes visible after their owning transaction commits."""
+
+        owner_id = normalize_owner_id(owner_id)
+        now = self._clock_ms()
+        with self._lock, self.connection() as conn, write_txn(conn):
+            self._ensure_owner_active(conn, owner_id)
+            row = self._select_owned(conn, owner_id, file_id)
+            if row is None:
+                raise KeyError(file_id)
+            if str(row["status"] or "") == "available":
+                return dict(row)
+            if str(row["status"] or "") != "staged":
+                raise ValueError("Only staged files can be published")
+            path = self._record_path(dict(row))
+            if not path.is_file():
+                raise FileNotFoundError(file_id)
+            conn.execute(
+                "UPDATE account_files SET status='available', available_at=?, "
+                "updated_at=? WHERE id=? AND owner_id=? AND status='staged'",
+                (now, now, file_id, owner_id),
+            )
+            row = self._select_owned(conn, owner_id, file_id)
+        return dict(row)
 
     def set_status(
         self,
@@ -899,7 +1023,9 @@ class CloudFileLibrary:
         offset: int = 0,
     ) -> tuple[list[dict[str, Any]], int]:
         owner_id = normalize_owner_id(owner_id)
-        clauses = ["owner_id=?"]
+        # Staged connector objects are an internal two-phase publication
+        # detail and are never visible through account-library listings.
+        clauses = ["owner_id=?", "status<>'staged'"]
         values: list[Any] = [owner_id]
         keyword = str(keyword or "").strip()[:300]
         if keyword:
@@ -978,7 +1104,7 @@ class CloudFileLibrary:
         objects_root = self.objects_root.resolve()
         if not target.is_relative_to(objects_root):
             raise ValueError("Stored file path escapes the object directory")
-        return target
+        return Path(_native_atomic_path(target))
 
     def resolve_download(self, owner_id: str, file_id: str) -> tuple[dict[str, Any], Path]:
         record = self.get_file(owner_id, file_id)

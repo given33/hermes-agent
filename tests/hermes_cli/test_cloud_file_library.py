@@ -58,6 +58,24 @@ def test_ingest_is_durable_and_records_delivery_metadata(tmp_path):
     assert path.read_bytes() == source.read_bytes()
 
 
+def test_ingest_supports_a_long_final_object_path(tmp_path):
+    source = _write(tmp_path / "source.bin", b"long-path-content")
+    library = CloudFileLibrary(tmp_path / "cloud")
+    display_name = f"{'report-' * 30}final.txt"
+
+    record = library.ingest_file(
+        "account-long-path",
+        source,
+        name=display_name,
+        source="user_upload",
+    )
+
+    assert record is not None
+    persisted, path = library.resolve_download("account-long-path", record["id"])
+    assert persisted["name"] == display_name
+    assert path.read_bytes() == b"long-path-content"
+
+
 def test_owner_scope_applies_to_read_list_download_and_delete(tmp_path):
     source = _write(tmp_path / "source.txt", b"owner-a-only")
     library = CloudFileLibrary(tmp_path / "cloud")
@@ -72,6 +90,44 @@ def test_owner_scope_applies_to_read_list_download_and_delete(tmp_path):
     assert library.delete_file("account-a", record["id"]) is True
     assert library.get_file("account-a", record["id"]) is None
     assert library.delete_file("account-a", record["id"]) is False
+
+
+def test_same_origin_same_bytes_is_strictly_idempotent_across_filename_changes(tmp_path):
+    library = CloudFileLibrary(tmp_path / "cloud")
+    old_source = _write(tmp_path / "old.bin", b"stable-artifact")
+    original = library.ingest_file(
+        "account-a",
+        old_source,
+        name="old.bin",
+        source="model_output",
+        conversation_id="conversation-old",
+        message_id="message-old",
+        turn_id="turn-old",
+        profile="worker-old",
+        origin_key="remote:run:path:sha",
+    )
+    original_path = library.resolve_download("account-a", original["id"])[1]
+
+    replay = library.ingest_file(
+        "account-a",
+        _write(tmp_path / "new.bin", b"stable-artifact"),
+        name="new.bin",
+        source="model_output",
+        conversation_id="conversation-new",
+        message_id="message-new",
+        turn_id="turn-new",
+        profile="worker-new",
+        origin_key="remote:run:path:sha",
+        make_available=False,
+    )
+
+    assert replay == original
+    assert library.get_file("account-a", original["id"]) == original
+    persisted, persisted_path = library.resolve_download("account-a", original["id"])
+    assert persisted == original
+    assert persisted_path == original_path
+    assert persisted_path.read_bytes() == b"stable-artifact"
+    assert not list(library.root.rglob("new.bin"))
 
 
 def test_delete_owner_removes_index_tombstones_and_objects_without_touching_peers(tmp_path):

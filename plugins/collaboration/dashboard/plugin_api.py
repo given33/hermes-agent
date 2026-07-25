@@ -9,6 +9,7 @@ Kanban dashboard API rather than introducing a second scheduler.
 from __future__ import annotations
 
 import asyncio
+from copy import deepcopy
 from collections import Counter
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from contextlib import asynccontextmanager, redirect_stderr, redirect_stdout
@@ -22,6 +23,7 @@ import mimetypes
 import os
 import queue
 import re
+import secrets
 import shutil
 import subprocess
 import sys
@@ -106,6 +108,7 @@ async def collaboration_dashboard_lifespan(_app):
         changed = False
         for conversation in conversations:
             changed = reconcile_stale_hosted_turns(conversation) or changed
+            changed = reconcile_orphaned_local_role_owners(conversation) or changed
         if changed:
             save_single_state(state)
         resume_unfinished_hosted_workflows(conversations)
@@ -157,8 +160,9 @@ _MODEL_NOT_CONFIGURED_CODE = "model_not_configured"
 _MODEL_NOT_CONFIGURED_MESSAGE = "尚未配置可用模型。请先在“模型”中添加并选择模型后重试。"
 _RUNTIME_RUN_STALE_AFTER_MS = 30 * 60 * 1000
 _HOSTED_TURN_STALE_AFTER_MS = 36 * 60 * 60 * 1000
-_REMOTE_CONTRACT_VERSION = 1
+_REMOTE_CONTRACT_VERSION = 2
 _REMOTE_TERMINAL_STATUSES = {"completed", "failed", "cancelled"}
+_REMOTE_ARTIFACT_ACTIVE_STATUSES = {"leased", "running"}
 _REMOTE_RUN_LEASE_SECONDS = 60
 _MAX_REMOTE_RUNS_PER_PULL = 20
 _PROMPT_HISTORY = 24
@@ -171,6 +175,14 @@ _ACCOUNT_FILE_MIGRATION_VERSION = "conversation-files-v1"
 
 class _HostedTurnCancelled(RuntimeError):
     """Interrupt a running profile child after its durable turn is cancelled."""
+
+
+class _HostedRoleIntervention(RuntimeError):
+    """Pause one role at an event boundary so a targeted control can run first."""
+
+    def __init__(self, intervention: dict[str, Any]):
+        super().__init__("Hosted role intervention requested")
+        self.intervention = dict(intervention)
 
 _WORK_MARKERS = (
     "完成",
@@ -2244,6 +2256,66 @@ def reconcile_stale_hosted_turns(
     return changed
 
 
+def reconcile_orphaned_local_role_owners(
+    conversation: dict[str, Any],
+    *,
+    now_ms: Optional[int] = None,
+) -> bool:
+    """Release process-local role claims after this dashboard process starts.
+
+    Local role owners represent threads and child processes from the previous
+    dashboard process. They cannot survive a restart, even when their durable
+    lease has time remaining. Remote owners are stable connector run IDs and
+    must remain claimed so the new process can reattach to the same queue item.
+    """
+
+    hosted_turns = conversation.get("hosted_turns")
+    if not isinstance(hosted_turns, dict):
+        return False
+    now = int(time.time() * 1000) if now_ms is None else int(now_ms)
+    changed = False
+    for run in hosted_turns.values():
+        if not isinstance(run, dict):
+            continue
+        if str(run.get("status") or "queued") not in {"queued", "running"}:
+            continue
+        run_changed = False
+        active_roles = run.get("active_roles")
+        if isinstance(active_roles, dict):
+            orphaned_stages = [
+                str(stage)
+                for stage, active in active_roles.items()
+                if isinstance(active, dict)
+                and str(
+                    active.get("execution")
+                    or ("remote" if active.get("remote_run_id") else "local")
+                )
+                == "local"
+            ]
+            for stage in orphaned_stages:
+                active_roles.pop(stage, None)
+                changed = True
+                run_changed = True
+        for intervention in run.get("interventions") or []:
+            if not isinstance(intervention, dict):
+                continue
+            owner = str(intervention.get("execution_owner") or "")
+            if (
+                str(intervention.get("status") or "") != "processing"
+                or owner.startswith("remote:")
+            ):
+                continue
+            intervention["lease_expires_at"] = 0
+            intervention["recovery_released_at"] = now
+            intervention["updated_at"] = now
+            changed = True
+            run_changed = True
+        if run_changed:
+            run["updated_at"] = now
+            conversation["updated_at"] = now
+    return changed
+
+
 def available_profiles() -> list[dict[str, Any]]:
     return [
         {
@@ -2265,6 +2337,8 @@ _WORKER_TARGET_PROFILES = {
 _DBB3_MANAGER_PROFILE = "dbb3-manager"
 _HERMES_MANAGER_NAME = "Hermes Manager"
 _HERMES_MANAGER_LABEL = "Hermes 调度员"
+_HERMES_SUPERVISOR_NAME = "Hermes Supervisor"
+_HERMES_SUPERVISOR_LABEL = "Hermes 监督者"
 _REMOTE_RUN_PROFILES = frozenset(
     {_DBB3_MANAGER_PROFILE, "dbb3-worker", "pc-worker", "reviewer", "default"}
 )
@@ -2421,6 +2495,8 @@ def requires_artifact_delivery(content: str) -> bool:
 
 def collaboration_role(profile: str) -> str:
     normalized = str(profile or "").strip().lower()
+    if normalized == "supervisor" or "supervis" in normalized or "监督" in normalized:
+        return "supervisor"
     if normalized == "reviewer" or "review" in normalized:
         return "reviewer"
     if normalized.endswith("worker") or "worker" in normalized:
@@ -2429,7 +2505,7 @@ def collaboration_role(profile: str) -> str:
 
 
 def collaboration_execution_order(profiles: list[str]) -> list[str]:
-    """Order one worker, reviewer, then exactly one final reporter."""
+    """Order supervisors, workers, reviewers, then exactly one final reporter."""
     selected = list(dict.fromkeys(str(item).strip() for item in profiles if str(item).strip()))
     if not selected:
         return []
@@ -2447,7 +2523,751 @@ def collaboration_execution_order(profiles: list[str]) -> list[str]:
         for item in selected
         if item != reporter and collaboration_role(item) == "reviewer"
     ]
-    return [*workers, *reviewers, reporter]
+    supervisors = [
+        item
+        for item in selected
+        if item != reporter and collaboration_role(item) == "supervisor"
+    ]
+    return [*supervisors, *workers, *reviewers, reporter]
+
+
+def hosted_progress_protocol(role_name: str) -> str:
+    """Static user-visible progress contract shared by every hosted role."""
+
+    return "\n".join(
+        (
+            f"【{role_name} 过程回报协议】",
+            "收到任务、上游交接、用户干预、附件或工具返回后，先在内部核对目标、边界、完成标准、已知事实、证据缺口和下一项可验证动作；不得只回复“收到”“正在处理”或复述任务。",
+            "首次实质执行前，先发一条不超过两句的定向更新：第一句概括你对本角色任务和当前证据的理解，第二句说明马上要验证或完成什么；不得把计划、假设或预计结果写成已经完成。",
+            "后续回报采用“信息增量事件 + 静默时长”双触发，不限于大里程碑。以下任一变化都应在下一个安全边界更新：得到会改变结论或计划的新证据；作出有取舍的决定；进入新阶段或发生交接；风险、权限或依赖发生变化；出现新的错误类别、重试策略、阻断或返工；完成一项验收；生成、修改或验证用户交付物。",
+            "若一组连续操作服务于同一个小目标，先连续完成这组操作，再用一次更新合并说明证据和结论；只有工具名称、命令次数、百分比或“仍在运行”发生变化，不算信息增量。",
+            "若同一阶段持续较久且没有上述事件，提供低频心跳：说明已经验证到哪里、当前在处理什么、还缺什么。预计少于五分钟的短步骤不单独心跳；长任务从上次可见更新起五到十五分钟内至少更新一次，阻断或需要用户决定时立即更新。",
+            "每次更新优先控制在两句，复杂阻断最多三句；至少包含一项已验证事实和一项当前动作、下一步或影响。失败时给出最后一次有代表性的错误、已尝试的策略及剩余影响，不逐次堆叠相同错误。",
+            "不要逐条广播每次思考、每个工具调用、重复读取、普通重试或微小步骤；连续重试只在错误类别、处置策略、是否需要外部输入或最终结果改变时更新。不得为了满足频率虚构进度，也不得用过程回报代替实际执行。",
+            "内部推理、工具参数、命令和原始输出进入可折叠活动明细；正文只给用户可验证的工程结论、决策理由和必要风险，不披露隐藏思维链。",
+            "进入角色交接前再发一条两句左右的收束更新：已完成/未完成、关键证据或产物、风险，以及接收角色下一步必须核验的事项；交接数据与用户可见更新必须一致。",
+            "Hermes 原有的工具选择、Skill/MCP 使用、超时和失败恢复策略保持不变；本协议只约束可见过程回报的时机、密度、真实性和交接质量。",
+        )
+    )
+
+
+def hosted_role_delivery_contract(role_name: str) -> str:
+    """Evidence and handoff contract specialized for one hosted role."""
+
+    normalized = str(role_name or "").strip().lower()
+    if "manager" in normalized or "调度" in normalized or "dispatcher" in normalized:
+        rules = (
+            "调度员的更新必须说明任务边界、拆分或路由发生了什么变化，以及每个子任务的负责人、依赖和可验证验收标准；不能只说“已经派发”。",
+            "派发前检查目标是否完整覆盖、步骤是否可并行、产物归属是否唯一；返工时明确退回哪一项、依据什么证据、由谁修正。",
+            "结构化交接必须保留原始目标、计划版本、Worker 证据、审阅结论、返工记录、产物路径与哈希、失败和未完成项，不得把推测补成事实。",
+        )
+    elif "review" in normalized or "审阅" in normalized:
+        rules = (
+            "审阅员的更新必须指明正在核对的验收标准、采用的独立证据以及当前 PASS/REWORK 倾向；不能只复述 Worker 的结论。",
+            "发现缺陷时说明复现条件、影响、严重度和最小整改要求；退回必须可执行，复审必须逐项对应上轮意见。",
+            "没有证据覆盖的场景标为未验证，不得因主路径通过而推断异常、并发、离线、恢复或权限场景也通过。",
+        )
+    elif "report" in normalized or "汇报" in normalized:
+        rules = (
+            "汇报员只消费已经持久化并经审阅的结构化交接，不重新执行任务、不调用工具补洞，也不依据常识补写缺失结果。",
+            "最终答案按已完成、失败、未完成/待决定、关键证据与产物组织；只有具备来源、执行结果和审阅结论的事项才能写成完成。",
+            "交接相互矛盾或证据不足时保留冲突并明确标注，不得选择更乐观的版本；面向用户的结论必须可追溯到交接字段。",
+        )
+    elif "supervis" in normalized or "监督" in normalized:
+        rules = (
+            "监督者在计划形成、首次派发、每次角色交接、返工、阻断和最终汇报前进行检查；连续执行期间按新进展抽查，不等待任务结束才监督。",
+            "监督更新只报告发现、证据、整改对象和复核结果；没有新增问题时不重复发“监督正常”，但不得因此停止检查。",
+            "监督者不得替代调度、执行、审阅或汇报；其产物是可验证的纠偏指令和对整改是否落实的复核记录。",
+        )
+    else:
+        rules = (
+            "Worker 的更新必须把实际动作与证据绑定：说明验证了什么、观察到什么、这对任务结论有何影响，以及下一组操作是什么。",
+            "修改、部署或生成产物后必须给出可复核位置、版本/哈希或测试结果；失败不得包装为完成，尚未运行的测试必须标为未验证。",
+            "交接审阅员时提交完成项、命令/测试证据摘要、产物、异常路径、残余风险和明确未完成项，不替审阅员宣布通过。",
+        )
+    return "\n".join((f"【{role_name} 角色交付契约】", *rules))
+
+
+def mention_priority_protocol(role_name: str) -> str:
+    """Return the mandatory targeted-intervention semantics for one role."""
+
+    return "\n".join(
+        (
+            f"【{role_name} @ 干预协议】",
+            f"当用户、监督者或其他成员使用 @{role_name}（含等价角色名）定向发言时，该内容是高优先级控制消息。",
+            "除不可中断的原子操作外，立即暂停新工具调用；在当前不可中断操作结束后的第一个安全边界，先直接回复该 @ 消息，并说明接受、拒绝或需要澄清的原因及其对计划的影响。",
+            "回应后把有效要求、优先级和受影响步骤写入持久计划，再恢复执行；不得忽略、延迟到最终汇报、继续排队旧工具，或由未被 @ 的成员代答。",
+            "若 @ 指令与用户原始目标、权限或已验证事实冲突，明确指出冲突并等待可执行决策，不得静默改变任务边界。",
+        )
+    )
+
+
+def supervisor_role_prompt() -> str:
+    """Define the independent supervisor's duties and bounded authority."""
+
+    return "\n".join(
+        (
+            "【Hermes 监督者职责与权限】",
+            "群聊拉起即开始监督，持续检查调度员、Worker、审阅员和汇报员；在计划形成、派发、角色交接、返工、阻断和最终汇报前必须检查，连续执行期间根据新增证据抽查。监督者不替任何成员执行其主体工作，也不直接生成最终答案。",
+            "检查调度员是否完整理解目标和边界、合理拆分、明确依赖与验收标准、选择合适节点并处理遗漏。",
+            "检查 Worker 是否真实执行、保留证据、遵守范围、没有偏离目标或用进度话术替代工作。",
+            "检查审阅员是否独立复核、覆盖异常/并发/离线等必要场景、给出可复现证据，并对不合格结果明确退回。",
+            "检查汇报员是否只基于已验证交接，准确区分完成、失败、未完成和风险，不遗漏返工记录、产物及哈希。",
+            "发现偏离、偷懒、遗漏或证据不足时，立即用“@准确成员名：已观察到的事实；违反的职责边界；必须整改的动作；完成时需提交的验收证据”发出定向整改，并在后续安全边界复核是否落实。",
+            "同时监督过程回报是否存在长时间沉默、无信息增量刷屏、只报计划不报证据或失败后不说明影响；违反时必须 @对应成员要求按过程回报协议整改。",
+            "监督结论必须可验证；没有问题时简短写明检查范围和通过依据，不制造无意义返工。",
+            hosted_role_delivery_contract(_HERMES_SUPERVISOR_LABEL),
+        )
+    )
+
+
+_MENTION_TARGET_ALIASES = {
+    "dispatcher": (
+        "Hermes 调度员",
+        "调度员",
+        "Hermes Manager",
+        "Manager",
+    ),
+    "worker": (
+        "Hermes Worker",
+        "Worker",
+        "DBB3 执行员",
+        "PC/WSL 执行员",
+        "dbb3-worker",
+        "pc-worker",
+    ),
+    "reviewer": (
+        "Hermes 审阅员",
+        "审阅员",
+        "Hermes Reviewer",
+        "Reviewer",
+    ),
+    "reporter": (
+        "Hermes 汇报员",
+        "汇报员",
+        "Hermes Reporter",
+        "Reporter",
+    ),
+    "supervisor": (
+        "Hermes 监督者",
+        "监督者",
+        "Hermes Supervisor",
+        "Supervisor",
+    ),
+}
+
+
+def mentioned_collaboration_roles(content: str) -> list[str]:
+    """Resolve explicit @ role mentions without treating ordinary prose as control."""
+
+    normalized = re.sub(r"\s+", " ", str(content or "")).strip().lower()
+    found: list[str] = []
+    for role, aliases in _MENTION_TARGET_ALIASES.items():
+        if any(f"@{alias.lower()}" in normalized for alias in aliases):
+            found.append(role)
+    return found
+
+
+def hosted_intervention_context(
+    conversation_id: str,
+    turn_id: str,
+    *,
+    role_stage: str,
+) -> str:
+    """Return durable control messages relevant to the next role boundary."""
+
+    with _STATE_LOCK:
+        state = load_single_state()
+        conversation = _conversation_by_id(state, conversation_id)
+        run = (conversation.get("hosted_turns") or {}).get(turn_id)
+        interventions = (
+            run.get("interventions")
+            if isinstance(run, dict) and isinstance(run.get("interventions"), list)
+            else []
+        )
+        snapshot = [dict(item) for item in interventions if isinstance(item, dict)]
+    if not snapshot:
+        return ""
+    base_role = str(role_stage or "").split(":", 1)[0]
+    lines = [
+        "【任务进行中的持久化 @ 干预】",
+        "以下控制消息属于当前托管任务。pending/processing 且被点名的成员必须按 @ 干预协议优先回应；completed 只用于核对落实情况，不得重复回复。",
+    ]
+    for item in snapshot[-50:]:
+        targets = [str(value) for value in item.get("targets") or [] if str(value)]
+        target_note = "、".join(targets) or "未识别"
+        intervention_status = str(item.get("status") or "pending")
+        relevance = (
+            "当前角色被点名"
+            if base_role in targets and intervention_status in _INTERVENTION_ACTIVE_STATUSES
+            else "已处理，供复核"
+            if intervention_status == "completed"
+            else "供流程监督核对"
+        )
+        lines.append(
+            f"- [{relevance}; status={intervention_status}; targets={target_note}] "
+            f"{str(item.get('content') or '').strip()}"
+        )
+    return "\n".join(lines)
+
+
+_INTERVENTION_ACTIVE_STATUSES = {"pending", "processing"}
+
+
+def _hosted_stage_target_role(role_stage: str, profile: str = "") -> str:
+    """Map a concrete hosted phase to the member name used by @ controls."""
+
+    normalized = str(role_stage or "").strip().lower()
+    base = normalized.split(":", 1)[0]
+    if base == "worker":
+        return "worker"
+    if base == "reviewer":
+        return "reviewer"
+    if base == "reporter" or normalized.startswith("report"):
+        return "reporter"
+    if base == "supervisor" or normalized.startswith("supervis"):
+        return "supervisor"
+    if base == "dispatcher" or normalized.startswith(("dispatch", "manager")):
+        return "dispatcher"
+    return collaboration_role(profile)
+
+
+def _mentioned_collaboration_profiles(content: str) -> list[str]:
+    """Preserve exact worker targeting when the user names a concrete lane."""
+
+    normalized = re.sub(r"\s+", " ", str(content or "")).strip().lower()
+    aliases = {
+        "dbb3-worker": ("dbb3-worker", "dbb3 执行员"),
+        "pc-worker": ("pc-worker", "pc/wsl 执行员", "pc 执行员", "wsl 执行员"),
+    }
+    return [
+        profile
+        for profile, names in aliases.items()
+        if any(f"@{name}" in normalized for name in names)
+    ]
+
+
+def _intervention_matches_role(
+    intervention: dict[str, Any],
+    *,
+    role_stage: str,
+    profile: str,
+) -> bool:
+    target_role = _hosted_stage_target_role(role_stage, profile)
+    targets = {str(item) for item in intervention.get("targets") or [] if str(item)}
+    if target_role not in targets:
+        return False
+    target_profiles = {
+        str(item) for item in intervention.get("target_profiles") or [] if str(item)
+    }
+    return not target_profiles or str(profile or "") in target_profiles
+
+
+def _hosted_role_checkpoint(
+    *,
+    role_stage: str,
+    profile: str,
+    execution: str,
+    role_state: Optional[dict[str, Any]] = None,
+    remote_run: Optional[dict[str, Any]] = None,
+) -> dict[str, Any]:
+    """Create the bounded durable checkpoint carried into a resumed role."""
+
+    source = remote_run if isinstance(remote_run, dict) else role_state or {}
+    checkpoint = {
+        "role_stage": str(role_stage or ""),
+        "profile": str(profile or ""),
+        "execution": str(execution or "local"),
+        "status": str(source.get("status") or "running"),
+        "content": str(
+            source.get("result") or source.get("summary") or source.get("content") or ""
+        )[-12000:],
+        "activities": [
+            _redact_sensitive(dict(item))
+            for item in (source.get("activities") or [])[-50:]
+            if isinstance(item, dict)
+        ],
+        "runtime_session_id": str(
+            source.get("runtime_session_id") or source.get("session_id") or ""
+        )[:512],
+        "checkpoint_cursor": int(source.get("checkpoint_cursor") or 0),
+        "captured_at": int(time.time() * 1000),
+    }
+    remote_run_id = str(source.get("id") or source.get("remote_run_id") or "")
+    if remote_run_id:
+        checkpoint["remote_run_id"] = remote_run_id[:512]
+    return checkpoint
+
+
+def _activate_hosted_role(
+    conversation_id: str,
+    turn_id: str,
+    *,
+    role_stage: str,
+    profile: str,
+    execution: str,
+    remote_run_id: str = "",
+    execution_owner: str = "",
+    lease_ms: int = 120_000,
+) -> bool:
+    """Publish the currently interruptible local/remote role lane."""
+
+    now = int(time.time() * 1000)
+    with _STATE_LOCK:
+        state = load_single_state()
+        conversation = _conversation_by_id(state, conversation_id)
+        run = (conversation.get("hosted_turns") or {}).get(turn_id)
+        if not isinstance(run, dict) or run.get("status") in _HOSTED_TERMINAL_STATUSES:
+            return False
+        active_roles = run.get("active_roles")
+        if not isinstance(active_roles, dict):
+            active_roles = {}
+            run["active_roles"] = active_roles
+        previous = active_roles.get(role_stage)
+        owner = str(execution_owner or remote_run_id or uuid.uuid4().hex)
+        if (
+            isinstance(previous, dict)
+            and str(previous.get("status") or "running") == "running"
+            and int(previous.get("lease_expires_at") or 0) > now
+            and str(previous.get("execution_owner") or "") != owner
+        ):
+            return False
+        active_roles[role_stage] = {
+            "role_stage": role_stage,
+            "target_role": _hosted_stage_target_role(role_stage, profile),
+            "profile": profile,
+            "execution": execution,
+            "remote_run_id": str(remote_run_id or ""),
+            "status": "running",
+            "execution_owner": owner,
+            "lease_expires_at": now + max(1_000, int(lease_ms)),
+            "started_at": int(previous.get("started_at") or now)
+            if isinstance(previous, dict)
+            else now,
+            "updated_at": now,
+        }
+        run["updated_at"] = now
+        conversation["updated_at"] = now
+        save_single_state(state)
+    _notify_hosted_update(conversation_id)
+    return True
+
+
+def _clear_hosted_active_role(
+    conversation_id: str,
+    turn_id: str,
+    *,
+    role_stage: str,
+    remote_run_id: str = "",
+    execution_owner: str = "",
+) -> None:
+    with _STATE_LOCK:
+        state = load_single_state()
+        conversation = _conversation_by_id(state, conversation_id)
+        run = (conversation.get("hosted_turns") or {}).get(turn_id)
+        active_roles = run.get("active_roles") if isinstance(run, dict) else None
+        current = active_roles.get(role_stage) if isinstance(active_roles, dict) else None
+        if not isinstance(current, dict):
+            return
+        expected_remote_id = str(remote_run_id or "")
+        if expected_remote_id and str(current.get("remote_run_id") or "") != expected_remote_id:
+            return
+        expected_owner = str(execution_owner or "")
+        if expected_owner and str(current.get("execution_owner") or "") != expected_owner:
+            return
+        active_roles.pop(role_stage, None)
+        now = int(time.time() * 1000)
+        run["updated_at"] = now
+        conversation["updated_at"] = now
+        save_single_state(state)
+    _notify_hosted_update(conversation_id)
+
+
+def _renew_hosted_active_role(
+    conversation_id: str,
+    turn_id: str,
+    *,
+    role_stage: str,
+    execution_owner: str,
+    lease_ms: int = 120_000,
+) -> bool:
+    """CAS-renew one role lane only while this coordinator still owns it."""
+
+    now = int(time.time() * 1000)
+    with _STATE_LOCK:
+        state = load_single_state()
+        conversation = _conversation_by_id(state, conversation_id)
+        run = (conversation.get("hosted_turns") or {}).get(turn_id)
+        if not isinstance(run, dict) or run.get("status") in _HOSTED_TERMINAL_STATUSES:
+            return False
+        active_roles = run.get("active_roles")
+        current = active_roles.get(role_stage) if isinstance(active_roles, dict) else None
+        if (
+            not isinstance(current, dict)
+            or str(current.get("status") or "running") != "running"
+            or str(current.get("execution_owner") or "") != execution_owner
+        ):
+            return False
+        current["lease_expires_at"] = now + max(1_000, int(lease_ms))
+        current["updated_at"] = now
+        run["updated_at"] = now
+        conversation["updated_at"] = now
+        save_single_state(state)
+    return True
+
+
+def _pending_hosted_role_intervention(
+    conversation_id: str,
+    turn_id: str,
+    *,
+    role_stage: str,
+    profile: str,
+    include_processing: bool = False,
+) -> Optional[dict[str, Any]]:
+    with _STATE_LOCK:
+        state = load_single_state()
+        conversation = _conversation_by_id(state, conversation_id)
+        run = (conversation.get("hosted_turns") or {}).get(turn_id)
+        if not isinstance(run, dict):
+            return None
+        return next(
+            (
+                dict(item)
+                for item in run.get("interventions") or []
+                if isinstance(item, dict)
+                and (
+                    str(item.get("status") or "pending") == "pending"
+                    or (
+                        include_processing
+                        and str(item.get("status") or "") == "processing"
+                        and str(item.get("active_role_stage") or "") == role_stage
+                        and str(item.get("active_profile") or "") == profile
+                    )
+                )
+                and _intervention_matches_role(
+                    item,
+                    role_stage=role_stage,
+                    profile=profile,
+                )
+            ),
+            None,
+        )
+
+
+def _hosted_intervention_by_id(
+    conversation_id: str,
+    turn_id: str,
+    intervention_id: str,
+) -> Optional[dict[str, Any]]:
+    wanted = str(intervention_id or "")
+    with _STATE_LOCK:
+        state = load_single_state()
+        conversation = _conversation_by_id(state, conversation_id)
+        run = (conversation.get("hosted_turns") or {}).get(turn_id)
+        if not isinstance(run, dict):
+            return None
+        return next(
+            (
+                dict(item)
+                for item in run.get("interventions") or []
+                if isinstance(item, dict) and str(item.get("id") or "") == wanted
+            ),
+            None,
+        )
+
+
+def _claim_hosted_role_intervention(
+    conversation_id: str,
+    turn_id: str,
+    *,
+    role_stage: str,
+    profile: str,
+    checkpoint: dict[str, Any],
+    intervention_id: str = "",
+    execution_owner: str = "",
+    lease_ms: int = 120_000,
+) -> Optional[dict[str, Any]]:
+    """Atomically move one matching @ control from pending to processing."""
+
+    wanted = str(intervention_id or "")
+    with _STATE_LOCK:
+        state = load_single_state()
+        conversation = _conversation_by_id(state, conversation_id)
+        run = (conversation.get("hosted_turns") or {}).get(turn_id)
+        if not isinstance(run, dict):
+            return None
+        intervention = next(
+            (
+                item
+                for item in run.get("interventions") or []
+                if isinstance(item, dict)
+                and (not wanted or str(item.get("id") or "") == wanted)
+                and str(item.get("status") or "pending") in {
+                    "pending",
+                    "processing",
+                }
+                and _intervention_matches_role(
+                    item,
+                    role_stage=role_stage,
+                    profile=profile,
+                )
+            ),
+            None,
+        )
+        if not isinstance(intervention, dict):
+            return None
+        now = int(time.time() * 1000)
+        owner = str(execution_owner or "")
+        if not owner:
+            return None
+        current_status = str(intervention.get("status") or "pending")
+        current_owner = str(intervention.get("execution_owner") or "")
+        lease_expires_at = int(intervention.get("lease_expires_at") or 0)
+        if current_status == "processing":
+            if current_owner == owner and lease_expires_at > now:
+                intervention["lease_expires_at"] = now + max(1_000, int(lease_ms))
+                intervention["updated_at"] = now
+                save_single_state(state)
+                return dict(intervention)
+            if lease_expires_at > now:
+                return None
+        claim_token = uuid.uuid4().hex
+        persisted_checkpoint = intervention.get("checkpoint")
+        intervention.update(
+            {
+                "status": "processing",
+                "claim_token": claim_token,
+                "execution_owner": owner,
+                "lease_expires_at": now + max(1_000, int(lease_ms)),
+                "claimed_at": now,
+                "active_role_stage": role_stage,
+                "active_profile": profile,
+                "checkpoint": (
+                    dict(persisted_checkpoint)
+                    if current_status == "processing"
+                    and isinstance(persisted_checkpoint, dict)
+                    else _redact_sensitive(dict(checkpoint))
+                ),
+                "updated_at": now,
+            }
+        )
+        if current_status == "processing":
+            intervention["reclaimed_at"] = now
+        run["updated_at"] = now
+        conversation["updated_at"] = now
+        save_single_state(state)
+        claimed = dict(intervention)
+    _notify_hosted_update(conversation_id)
+    return claimed
+
+
+def _complete_hosted_role_intervention(
+    conversation_id: str,
+    turn_id: str,
+    *,
+    intervention_id: str,
+    claim_token: str,
+    execution_owner: str,
+    role_stage: str,
+    role_label: str,
+    profile: str,
+    reply: str,
+    checkpoint: dict[str, Any],
+    resume_role_stage: str = "",
+) -> dict[str, Any]:
+    """Persist the targeted member's reply before the original role resumes."""
+
+    clean_reply = str(reply or "").strip() or "已收到定向干预，已在检查点暂停并更新执行计划。"
+    now = int(time.time() * 1000)
+    with _STATE_LOCK:
+        state = load_single_state()
+        conversation = _conversation_by_id(state, conversation_id)
+        run = (conversation.get("hosted_turns") or {}).get(turn_id)
+        if not isinstance(run, dict):
+            raise RuntimeError("托管任务记录不存在")
+        intervention = next(
+            (
+                item
+                for item in run.get("interventions") or []
+                if isinstance(item, dict)
+                and str(item.get("id") or "") == str(intervention_id or "")
+            ),
+            None,
+        )
+        if not isinstance(intervention, dict):
+            raise RuntimeError("托管干预记录不存在")
+        if str(run.get("status") or "") in _HOSTED_TERMINAL_STATUSES or run.get(
+            "cancel_requested"
+        ):
+            raise RuntimeError("托管任务已结束，拒绝迟到的干预回复")
+        if str(intervention.get("status") or "") != "processing":
+            raise RuntimeError("托管干预不在可完成状态")
+        if not hmac.compare_digest(
+            str(intervention.get("claim_token") or ""),
+            str(claim_token or ""),
+        ):
+            raise RuntimeError("托管干预 claim_token 不匹配")
+        if (
+            str(intervention.get("active_role_stage") or "") != role_stage
+            or str(intervention.get("active_profile") or "") != profile
+            or str(intervention.get("execution_owner") or "")
+            != str(execution_owner or "")
+        ):
+            raise RuntimeError("托管干预角色所有者不匹配")
+        intervention.update(
+            {
+                "status": "completed",
+                "reply": clean_reply,
+                "checkpoint": _redact_sensitive(dict(checkpoint)),
+                "replied_at": int(intervention.get("replied_at") or now),
+                "completed_at": int(intervention.get("completed_at") or now),
+                "resume_role_stage": str(resume_role_stage or ""),
+                "updated_at": now,
+            }
+        )
+        message_key = f"{turn_id}:intervention:{intervention_id}:reply"
+        existing = next(
+            (
+                item
+                for item in conversation.get("messages") or []
+                if isinstance(item, dict)
+                and str((item.get("meta") or {}).get("message_key") or "") == message_key
+            ),
+            None,
+        )
+        message_meta = {
+            "runtime_turn_id": turn_id,
+            "role_stage": f"{role_stage}:intervention",
+            "base_role_stage": _hosted_stage_target_role(role_stage, profile),
+            "phase": "completed",
+            "message_key": message_key,
+            "role_label": role_label,
+            "profile": profile,
+            "intervention_reply": True,
+            "intervention_id": intervention_id,
+            "checkpoint": _redact_sensitive(dict(checkpoint)),
+            "final_report": False,
+        }
+        if existing is None:
+            existing = _append_message(
+                conversation,
+                role="assistant",
+                name=profile,
+                content=clean_reply,
+                status="completed",
+                kind="message",
+                meta=message_meta,
+            )
+        else:
+            existing.update(
+                {
+                    "content": clean_reply,
+                    "status": "completed",
+                    "meta": {**(existing.get("meta") or {}), **message_meta},
+                    "updated_at": now,
+                }
+            )
+            _project_native_message(existing)
+        run["updated_at"] = now
+        conversation["updated_at"] = now
+        save_single_state(state)
+        completed = dict(intervention)
+    _notify_hosted_update(conversation_id)
+    return completed
+
+
+def _refresh_claimed_intervention_checkpoint(
+    conversation_id: str,
+    turn_id: str,
+    *,
+    intervention_id: str,
+    claim_token: str,
+    execution_owner: str,
+    role_stage: str,
+    profile: str,
+    checkpoint: dict[str, Any],
+) -> Optional[dict[str, Any]]:
+    """Advance a claimed checkpoint without changing its owner or token."""
+
+    with _STATE_LOCK:
+        state = load_single_state()
+        conversation = _conversation_by_id(state, conversation_id)
+        run = (conversation.get("hosted_turns") or {}).get(turn_id)
+        if not isinstance(run, dict) or str(run.get("status") or "") in _HOSTED_TERMINAL_STATUSES:
+            return None
+        intervention = next(
+            (
+                item
+                for item in run.get("interventions") or []
+                if isinstance(item, dict)
+                and str(item.get("id") or "") == str(intervention_id or "")
+            ),
+            None,
+        )
+        if not isinstance(intervention, dict):
+            return None
+        if (
+            str(intervention.get("status") or "") != "processing"
+            or str(intervention.get("active_role_stage") or "") != role_stage
+            or str(intervention.get("active_profile") or "") != profile
+            or str(intervention.get("execution_owner") or "")
+            != str(execution_owner or "")
+            or not hmac.compare_digest(
+                str(intervention.get("claim_token") or ""),
+                str(claim_token or ""),
+            )
+        ):
+            return None
+        now = int(time.time() * 1000)
+        intervention["checkpoint"] = _redact_sensitive(dict(checkpoint))
+        intervention["updated_at"] = now
+        run["updated_at"] = now
+        conversation["updated_at"] = now
+        save_single_state(state)
+        refreshed = dict(intervention)
+    _notify_hosted_update(conversation_id)
+    return refreshed
+
+
+def _hosted_intervention_reply_prompt(
+    *,
+    role_label: str,
+    intervention: dict[str, Any],
+    checkpoint: dict[str, Any],
+) -> str:
+    return "\n".join(
+        (
+            f"你是 {role_label}。当前执行已在安全边界暂停。",
+            "先处理下面的 @ 定向干预；此回复优先于原任务，不调用新工具，不继续原步骤。",
+            "用一到两句直接说明接受、拒绝或需要澄清的原因，以及它对后续计划的影响。",
+            f"干预消息：{str(intervention.get('content') or '').strip()}",
+            "暂停检查点：",
+            json.dumps(checkpoint, ensure_ascii=False, default=str),
+        )
+    )
+
+
+def _hosted_intervention_resume_prompt(
+    original_prompt: str,
+    *,
+    intervention: dict[str, Any],
+    checkpoint: dict[str, Any],
+    reply: str,
+) -> str:
+    return "\n\n".join(
+        (
+            str(original_prompt or "").strip(),
+            "\n".join(
+                (
+                    "【从 @ 干预检查点恢复】",
+                    f"已优先回复：{str(reply or '').strip()}",
+                    f"有效干预：{str(intervention.get('content') or '').strip()}",
+                    "从下方持久化检查点继续；不得重复已经完成的动作。先把有效要求写入计划，再执行下一项安全动作。",
+                    json.dumps(checkpoint, ensure_ascii=False, default=str),
+                )
+            ),
+        )
+    )
 
 
 def _json_object_from_model_text(value: Any) -> dict[str, Any]:
@@ -2478,7 +3298,11 @@ def _normalize_manager_plan(
 ) -> dict[str, Any]:
     """Validate DBB3 Manager output before it can control remote placement."""
 
-    parsed = _json_object_from_model_text(result)
+    parsed = (
+        dict(result)
+        if isinstance(result, dict)
+        else _json_object_from_model_text(result)
+    )
     difficulty = str(parsed.get("difficulty") or "medium").strip().lower()
     if difficulty not in _MANAGER_DIFFICULTIES:
         difficulty = "medium"
@@ -2560,10 +3384,13 @@ def _manager_plan_prompt(
         for item in (
             "你是 Hermes Manager，负责复杂任务的难度判断、拆分和执行节点选择。",
             "只规划和调度，不执行用户任务，也不向用户生成最终答案。",
+            hosted_progress_protocol(_HERMES_MANAGER_LABEL),
+            hosted_role_delivery_contract(_HERMES_MANAGER_LABEL),
+            mention_priority_protocol(_HERMES_MANAGER_LABEL),
             "可用执行节点只有 dbb3-worker 与 pc-worker；默认审阅节点是 DBB3，必要时可选择 PC。",
             f"服务器路由建议：{', '.join(fallback_workers)}",
             f"是否要求交付文件：{'yes' if artifact_required else 'no'}",
-            "输出一个 JSON 对象且不要附加解释。结构必须为：",
+            "最终交接输出一个 JSON 对象且不要附加解释；过程回报通过运行事件发送，不得混入最终 JSON。结构必须为：",
             '{"difficulty":"low|medium|high|critical","reason":"...","workers":["dbb3-worker"],"reviewer_target":"dbb3|pc","plan":[{"id":"step-1","title":"...","objective":"...","assignee":"dbb3-worker|pc-worker","depends_on":[]}]}',
             "按任务真实需要选择一个或两个 Worker，不得使用其他节点，不得省略验收。",
             f"用户任务：\n{content}",
@@ -2584,17 +3411,32 @@ def _normalize_manager_handoff(
     artifacts: list[dict[str, Any]],
     failures: list[str],
 ) -> dict[str, Any]:
-    parsed = _json_object_from_model_text(result)
+    parsed = (
+        dict(result)
+        if isinstance(result, dict)
+        else _json_object_from_model_text(result)
+    )
+    authoritative = {
+        "task_goal": str(task_goal).strip(),
+        "plan": list(plan.get("plan") or []),
+        "worker_results": dict(worker_results),
+        "review_verdict": str(review_verdict).strip(),
+        "rework_history": list(rework_history),
+        "artifacts": list(artifacts),
+        "failures": list(failures),
+    }
+    ignored_conflicts = sorted(
+        key
+        for key, value in authoritative.items()
+        if key in parsed and parsed.get(key) != value
+    )
     handoff = {
         "version": 1,
-        "task_goal": str(parsed.get("task_goal") or task_goal).strip(),
-        "plan": parsed.get("plan") if isinstance(parsed.get("plan"), list) else list(plan.get("plan") or []),
-        "worker_results": parsed.get("worker_results") if isinstance(parsed.get("worker_results"), dict) else dict(worker_results),
-        "review_verdict": str(parsed.get("review_verdict") or review_verdict).strip(),
-        "rework_history": parsed.get("rework_history") if isinstance(parsed.get("rework_history"), list) else list(rework_history),
-        "artifacts": parsed.get("artifacts") if isinstance(parsed.get("artifacts"), list) else list(artifacts),
-        "failures": parsed.get("failures") if isinstance(parsed.get("failures"), list) else list(failures),
-        "suggested_conclusion": str(parsed.get("suggested_conclusion") or "").strip(),
+        **authoritative,
+        "suggested_conclusion": str(
+            parsed.get("suggested_conclusion") or ""
+        ).strip()[:4000],
+        "ignored_manager_conflicts": ignored_conflicts,
     }
     for field in _MANAGER_HANDOFF_FIELDS:
         if field not in handoff:
@@ -3333,6 +4175,7 @@ def build_group_prompt(
             "你是审阅者。基于执行者已经提交的结果做验收、风险检查和通过/退回判断；"
             "不要重复执行者的工作，不要向用户做最终总结。"
         ),
+        "supervisor": supervisor_role_prompt(),
         "reporter": (
             "你是唯一最终汇报者。综合执行者和审阅者的信息，向用户给出一次清晰的最终结论、"
             "完成状态、关键证据、问题和下一步；不要重新执行已经完成的工作。"
@@ -3354,6 +4197,9 @@ def build_group_prompt(
         f"参与 Profiles：{members}\n"
         f"{role_instruction}\n"
         f"{artifact_instruction}\n"
+        f"{hosted_progress_protocol(profile)}\n"
+        f"{hosted_role_delivery_contract(role)}\n"
+        f"{mention_priority_protocol(profile)}\n"
         "请使用简体中文，避免机械重复其他成员。\n\n"
         f"最近讨论：\n{recent or '暂无'}\n\n"
         f"用户的新消息：\n{user_message.strip()}"
@@ -4204,6 +5050,65 @@ def _invoke_profile_runner(
     return str(runner(profile, prompt, **kwargs))
 
 
+def _run_local_intervention_reply(
+    conversation_id: str,
+    turn_id: str,
+    *,
+    profile: str,
+    runtime_profile: str,
+    runner: Callable[..., str],
+    kanban_task_id: str,
+    runtime_session_id: str,
+    prompt: str,
+) -> tuple[str, dict[str, Any]]:
+    """Run the targeted reply in the same durable child session."""
+
+    reply_state: dict[str, Any] = {
+        "content": "",
+        "status": "streaming",
+        "activities": [],
+        "actual_model": "",
+        "actual_provider": "",
+        "runtime_session_id": str(runtime_session_id or "").strip(),
+        "started_at": int(time.time() * 1000),
+    }
+
+    def on_event(event: dict[str, Any]) -> None:
+        if _hosted_turn_cancellation_requested(conversation_id, turn_id):
+            raise _HostedTurnCancelled("Hosted turn cancelled")
+        if str(event.get("type") or "") != "thinking.delta":
+            apply_profile_event(reply_state, event)
+
+    boundary_profile = runtime_profile or profile
+    before = _runtime_session_boundary(
+        boundary_profile,
+        str(reply_state.get("runtime_session_id") or ""),
+    )
+    result = _invoke_profile_runner(
+        runner,
+        runtime_profile or profile,
+        prompt,
+        on_event,
+        kanban_task_id,
+        str(reply_state.get("runtime_session_id") or ""),
+        lambda: _hosted_turn_cancellation_requested(conversation_id, turn_id),
+    ).strip()
+    if not result:
+        raise RuntimeError("Hermes profile returned an empty intervention response")
+    boundary = _runtime_session_boundary(
+        boundary_profile,
+        str(reply_state.get("runtime_session_id") or ""),
+        after_message_id=int(before.get("tip_message_id") or 0),
+    )
+    if boundary.get("session_id"):
+        reply_state["runtime_session_id"] = str(boundary["session_id"])
+    reply_state["runtime_user_message_id"] = boundary.get("user_message_id")
+    reply_state["runtime_tip_message_id"] = boundary.get("tip_message_id")
+    reply_state["content"] = result
+    reply_state["status"] = "completed"
+    return result, reply_state
+
+
 def _persist_hosted_role_state(
     conversation_id: str,
     turn_id: str,
@@ -4215,6 +5120,7 @@ def _persist_hosted_role_state(
     content_fallback: str,
     final_report: bool = False,
     semantic_milestone: str = "",
+    visible: bool = True,
 ) -> None:
     state_content = str(state.get("content") or "").strip()
     state_status = str(state.get("status") or "streaming")
@@ -4281,6 +5187,34 @@ def _persist_hosted_role_state(
     if snapshot["request_accepted"]:
         patch["request_accepted"] = True
         patch["request_accepted_at"] = now
+    projected_message = {
+        "role": "assistant",
+        "name": profile,
+        "content": content,
+        "status": snapshot["status"],
+        "kind": "message",
+        "meta": {
+            "role_stage": phase_role_stage,
+            "base_role_stage": base_stage,
+            "phase": phase,
+            "message_key": message_key,
+            "role_label": role_label,
+            "profile": profile,
+            "handoff_to": handoff_to,
+            "started_at": snapshot["started_at"],
+            "first_token_at": snapshot["first_token_at"] or None,
+            "completed_at": snapshot["completed_at"],
+            "collapse_activities": True,
+            "final_report": final_report and state_status in _HOSTED_TERMINAL_STATUSES,
+            "activities": activities,
+            "actual_model": snapshot["actual_model"],
+            "actual_provider": snapshot["actual_provider"],
+            "runtime_session_id": str(
+                state.get("runtime_session_id") or ""
+            ).strip(),
+            "runtime_message_id": state.get("runtime_tip_message_id"),
+        },
+    }
     _persist_hosted_turn(
         conversation_id,
         turn_id,
@@ -4289,34 +5223,7 @@ def _persist_hosted_role_state(
             profile,
             str(state.get("runtime_session_id") or "").strip(),
         ),
-        message={
-            "role": "assistant",
-            "name": profile,
-            "content": content,
-            "status": snapshot["status"],
-            "kind": "message",
-            "meta": {
-                "role_stage": phase_role_stage,
-                "base_role_stage": base_stage,
-                "phase": phase,
-                "message_key": message_key,
-                "role_label": role_label,
-                "profile": profile,
-                "handoff_to": handoff_to,
-                "started_at": snapshot["started_at"],
-                "first_token_at": snapshot["first_token_at"] or None,
-                "completed_at": snapshot["completed_at"],
-                "collapse_activities": True,
-                "final_report": final_report and state_status in _HOSTED_TERMINAL_STATUSES,
-                "activities": activities,
-                "actual_model": snapshot["actual_model"],
-                "actual_provider": snapshot["actual_provider"],
-                "runtime_session_id": str(
-                    state.get("runtime_session_id") or ""
-                ).strip(),
-                "runtime_message_id": state.get("runtime_tip_message_id"),
-            },
-        },
+        message=projected_message if visible else None,
     )
 
 
@@ -4335,7 +5242,10 @@ def _run_hosted_role(
     runtime_session_id: str = "",
     final_report: bool = False,
     previous_state: Optional[dict[str, Any]] = None,
+    execution_owner: str = "",
+    visible: bool = True,
 ) -> tuple[str, str, dict[str, Any]]:
+    execution_owner = str(execution_owner or f"local-{uuid.uuid4().hex}")
     state = {
         "content": "",
         "status": "streaming",
@@ -4393,6 +5303,16 @@ def _run_hosted_role(
             str(state["status"]),
             state,
         )
+    if not _activate_hosted_role(
+        conversation_id,
+        turn_id,
+        role_stage=role_stage,
+        profile=profile,
+        execution="local",
+        execution_owner=execution_owner,
+        lease_ms=(_HOSTED_CHAT_TIMEOUT_SECONDS + 60) * 1000,
+    ):
+        raise RuntimeError("同一角色阶段已有活动执行 owner")
     if role_stage.split(":", 1)[0] != "chat":
         _persist_hosted_role_state(
             conversation_id,
@@ -4403,8 +5323,65 @@ def _run_hosted_role(
             state=state,
             content_fallback=start_text,
             final_report=final_report,
+            visible=visible,
         )
     last_persisted_at = 0.0
+    atomic_depth = 0
+
+    def claim_pending_intervention() -> Optional[dict[str, Any]]:
+        pending = _pending_hosted_role_intervention(
+            conversation_id,
+            turn_id,
+            role_stage=role_stage,
+            profile=profile,
+            include_processing=True,
+        )
+        if not isinstance(pending, dict):
+            return None
+        checkpoint = _hosted_role_checkpoint(
+            role_stage=role_stage,
+            profile=profile,
+            execution="local",
+            role_state=state,
+        )
+        claimed = _claim_hosted_role_intervention(
+            conversation_id,
+            turn_id,
+            role_stage=role_stage,
+            profile=profile,
+            checkpoint=checkpoint,
+            intervention_id=str(pending.get("id") or ""),
+            execution_owner=execution_owner,
+            lease_ms=(_HOSTED_CHAT_TIMEOUT_SECONDS + 60) * 1000,
+        )
+        if (
+            claimed is None
+            and str(pending.get("status") or "") == "processing"
+        ):
+            raise RuntimeError("定向干预正在由另一 execution owner 处理")
+        return claimed
+
+    def cancellation_requested() -> bool:
+        if _hosted_turn_cancellation_requested(conversation_id, turn_id):
+            return True
+        if atomic_depth != 0:
+            return False
+        pending = _pending_hosted_role_intervention(
+            conversation_id,
+            turn_id,
+            role_stage=role_stage,
+            profile=profile,
+            include_processing=True,
+        )
+        if not isinstance(pending, dict):
+            return False
+        if str(pending.get("status") or "pending") == "pending":
+            return True
+        now = int(time.time() * 1000)
+        return bool(
+            str(pending.get("execution_owner") or "") == execution_owner
+            or int(pending.get("lease_expires_at") or 0) <= now
+        )
 
     def persist() -> None:
         nonlocal last_persisted_at
@@ -4443,19 +5420,28 @@ def _run_hosted_role(
             state=state,
             content_fallback=start_text,
             final_report=final_report,
+            visible=visible,
         )
         last_persisted_at = time.monotonic()
 
     def on_event(event: dict[str, Any]) -> None:
+        nonlocal atomic_depth
         if _hosted_turn_cancellation_requested(conversation_id, turn_id):
             raise _HostedTurnCancelled("Hosted turn cancelled")
         event_type = str(event.get("type") or "")
         if event_type == "thinking.delta":
             return
+        if event_type in {"tool.start", "subagent.start"} and atomic_depth == 0:
+            intervention = claim_pending_intervention()
+            if isinstance(intervention, dict):
+                raise _HostedRoleIntervention(intervention)
+        if event_type in {"tool.start", "subagent.start"}:
+            atomic_depth += 1
         current_content = str(state.get("content") or "").strip()
         previous_milestone = str(state.get("milestone_content") or "")
         if (
-            event_type in {"tool.start", "subagent.start"}
+            visible
+            and event_type in {"tool.start", "subagent.start"}
             and current_content
             and current_content != previous_milestone
         ):
@@ -4498,6 +5484,8 @@ def _run_hosted_role(
             for activity in state.get("activities") or []
         )
         apply_profile_event(state, event)
+        if event_type in {"tool.complete", "subagent.complete"}:
+            atomic_depth = max(0, atomic_depth - 1)
         if event_type == "request.accepted":
             state["request_accepted"] = True
         first_visible_delta = (
@@ -4519,6 +5507,11 @@ def _run_hosted_role(
             )
         ):
             persist()
+        if atomic_depth == 0:
+            intervention = claim_pending_intervention()
+            if isinstance(intervention, dict):
+                persist()
+                raise _HostedRoleIntervention(intervention)
 
     # The real Hermes child already performs the five bounded provider
     # attempts. Re-running the entire child would duplicate those attempts and
@@ -4535,6 +5528,9 @@ def _run_hosted_role(
                 state["runtime_message_before"] = int(
                     before.get("tip_message_id") or 0
                 )
+            intervention = claim_pending_intervention()
+            if isinstance(intervention, dict):
+                raise _HostedRoleIntervention(intervention)
             result = _invoke_profile_runner(
                 runner,
                 runtime_profile or profile,
@@ -4542,8 +5538,11 @@ def _run_hosted_role(
                 on_event,
                 kanban_task_id,
                 str(state.get("runtime_session_id") or ""),
-                lambda: _hosted_turn_cancellation_requested(conversation_id, turn_id),
+                cancellation_requested,
             ).strip()
+            intervention = claim_pending_intervention()
+            if isinstance(intervention, dict):
+                raise _HostedRoleIntervention(intervention)
             if not result:
                 raise RuntimeError("Hermes profile returned an empty response")
             boundary = _runtime_session_boundary(
@@ -4562,14 +5561,125 @@ def _run_hosted_role(
                 result,
             )
             persist()
+            _clear_hosted_active_role(
+                conversation_id,
+                turn_id,
+                role_stage=role_stage,
+                execution_owner=execution_owner,
+            )
             return result, "completed", state
         except Exception as exc:
+            intervention = (
+                dict(exc.intervention)
+                if isinstance(exc, _HostedRoleIntervention)
+                else None
+            )
+            if (
+                intervention is None
+                and isinstance(exc, _HostedTurnCancelled)
+                and not _hosted_turn_cancellation_requested(conversation_id, turn_id)
+            ):
+                intervention = claim_pending_intervention()
+            if isinstance(intervention, dict):
+                checkpoint = dict(intervention.get("checkpoint") or {})
+                if not checkpoint:
+                    checkpoint = _hosted_role_checkpoint(
+                        role_stage=role_stage,
+                        profile=profile,
+                        execution="local",
+                        role_state=state,
+                    )
+                state["status"] = "streaming"
+                persist()
+                try:
+                    intervention_reply, reply_state = _run_local_intervention_reply(
+                        conversation_id,
+                        turn_id,
+                        profile=profile,
+                        runtime_profile=runtime_profile,
+                        runner=runner,
+                        kanban_task_id=kanban_task_id,
+                        runtime_session_id=str(state.get("runtime_session_id") or ""),
+                        prompt=_hosted_intervention_reply_prompt(
+                            role_label=role_label,
+                            intervention=intervention,
+                            checkpoint=checkpoint,
+                        ),
+                    )
+                except _HostedTurnCancelled:
+                    _finish_hosted_turn_if_cancelled(conversation_id, turn_id)
+                    state["status"] = "cancelled"
+                    _clear_hosted_active_role(
+                        conversation_id,
+                        turn_id,
+                        role_stage=role_stage,
+                        execution_owner=execution_owner,
+                    )
+                    return str(state.get("content") or "").strip(), "cancelled", state
+                except Exception as reply_exc:
+                    intervention_reply = (
+                        "已在安全边界暂停；定向回复执行失败："
+                        f"{sanitize_runtime_error(reply_exc)}。后续将携带检查点继续。"
+                    )
+                    reply_state = {}
+                _complete_hosted_role_intervention(
+                    conversation_id,
+                    turn_id,
+                    intervention_id=str(intervention.get("id") or ""),
+                    claim_token=str(intervention.get("claim_token") or ""),
+                    execution_owner=execution_owner,
+                    role_stage=role_stage,
+                    role_label=role_label,
+                    profile=profile,
+                    reply=intervention_reply,
+                    checkpoint=checkpoint,
+                    resume_role_stage=role_stage,
+                )
+                if reply_state.get("runtime_session_id"):
+                    state["runtime_session_id"] = str(reply_state["runtime_session_id"])
+                if reply_state.get("runtime_tip_message_id"):
+                    state["runtime_message_before"] = int(
+                        reply_state["runtime_tip_message_id"]
+                    )
+                    state["runtime_tip_message_id"] = reply_state[
+                        "runtime_tip_message_id"
+                    ]
+                state["content"] = ""
+                state["status"] = "streaming"
+                return _run_hosted_role(
+                    conversation_id,
+                    turn_id,
+                    profile=profile,
+                    role_stage=role_stage,
+                    role_label=role_label,
+                    prompt=_hosted_intervention_resume_prompt(
+                        prompt,
+                        intervention=intervention,
+                        checkpoint=checkpoint,
+                        reply=intervention_reply,
+                    ),
+                    runner=runner,
+                    kanban_task_id=kanban_task_id,
+                    start_text="已优先处理定向干预，正在从检查点恢复。",
+                    runtime_profile=runtime_profile,
+                    runtime_session_id=str(state.get("runtime_session_id") or ""),
+                    final_report=final_report,
+                    previous_state=state,
+                    execution_owner=execution_owner,
+                    visible=visible,
+                )
             if isinstance(exc, _HostedTurnCancelled) or _hosted_turn_cancellation_requested(
                 conversation_id,
                 turn_id,
             ):
                 _finish_hosted_turn_if_cancelled(conversation_id, turn_id)
                 state["status"] = "cancelled"
+                _clear_hosted_active_role(
+                    conversation_id,
+                    turn_id,
+                    role_stage=role_stage,
+                    execution_owner=execution_owner,
+                )
                 return str(state.get("content") or "").strip(), "cancelled", state
             terminal_content = str(state.get("content") or "").strip()
             if str(state.get("status") or "") == "failed" and terminal_content:
@@ -4580,6 +5690,12 @@ def _run_hosted_role(
                     terminal_content,
                 )
                 persist()
+                _clear_hosted_active_role(
+                    conversation_id,
+                    turn_id,
+                    role_stage=role_stage,
+                    execution_owner=execution_owner,
+                )
                 return terminal_content, "failed", state
             transient = _is_transient_runtime_error(exc)
             has_tool_activity = any(
@@ -4613,9 +5729,121 @@ def _run_hosted_role(
                 result,
             )
             persist()
+            _clear_hosted_active_role(
+                conversation_id,
+                turn_id,
+                role_stage=role_stage,
+                execution_owner=execution_owner,
+            )
             return result, "failed", state
 
+    _clear_hosted_active_role(
+        conversation_id,
+        turn_id,
+        role_stage=role_stage,
+        execution_owner=execution_owner,
+    )
     raise RuntimeError("Hermes 托管角色执行状态异常")
+
+
+def _request_remote_role_intervention_cancel(
+    conversation_id: str,
+    turn_id: str,
+    *,
+    remote_run_id: str,
+    role_stage: str,
+    profile: str,
+    intervention_id: str = "",
+    execution_owner: str = "",
+) -> Optional[dict[str, Any]]:
+    """Claim one @ control and cancel only its active remote run."""
+
+    wanted = str(intervention_id or "")
+    with _STATE_LOCK:
+        state = load_single_state()
+        conversation = _conversation_by_id(state, conversation_id)
+        run = (conversation.get("hosted_turns") or {}).get(turn_id)
+        if not isinstance(run, dict):
+            return None
+        remote_run = next(
+            (
+                item
+                for item in (run.get("remote_runs") or {}).values()
+                if isinstance(item, dict)
+                and str(item.get("id") or "") == str(remote_run_id or "")
+            ),
+            None,
+        )
+        if not isinstance(remote_run, dict):
+            return None
+        intervention = next(
+            (
+                item
+                for item in run.get("interventions") or []
+                if isinstance(item, dict)
+                and (not wanted or str(item.get("id") or "") == wanted)
+                and str(item.get("status") or "pending") in {
+                    "pending",
+                    "processing",
+                }
+                and _intervention_matches_role(
+                    item,
+                    role_stage=role_stage,
+                    profile=profile,
+                )
+            ),
+            None,
+        )
+        if not isinstance(intervention, dict):
+            return None
+        now = int(time.time() * 1000)
+        execution_owner = str(execution_owner or f"remote:{remote_run_id}")
+        current_status = str(intervention.get("status") or "pending")
+        current_owner = str(intervention.get("execution_owner") or "")
+        lease_expires_at = int(intervention.get("lease_expires_at") or 0)
+        if current_status == "processing":
+            if current_owner == execution_owner and lease_expires_at > now:
+                return dict(intervention)
+            if lease_expires_at > now:
+                return None
+        checkpoint = _hosted_role_checkpoint(
+            role_stage=role_stage,
+            profile=profile,
+            execution="remote",
+            remote_run=remote_run,
+        )
+        intervention.update(
+            {
+                "status": "processing",
+                "claim_token": uuid.uuid4().hex,
+                "execution_owner": execution_owner,
+                "lease_expires_at": now + 120_000,
+                "claimed_at": now,
+                "active_role_stage": role_stage,
+                "active_profile": profile,
+                "checkpoint": _redact_sensitive(dict(checkpoint)),
+                "updated_at": now,
+            }
+        )
+        if current_status == "processing":
+            intervention["reclaimed_at"] = now
+        if str(remote_run.get("status") or "") not in _REMOTE_TERMINAL_STATUSES:
+            remote_run.update(
+                {
+                    "cancel_requested": True,
+                    "cancel_kind": "intervention",
+                    "cancel_intervention_id": str(intervention.get("id") or ""),
+                    "cancel_reason": str(intervention.get("content") or "")[:1000],
+                    "cancel_requested_at": now,
+                    "updated_at": now,
+                }
+            )
+        run["updated_at"] = now
+        conversation["updated_at"] = now
+        save_single_state(state)
+        claimed = dict(intervention)
+    _notify_hosted_update(conversation_id)
+    return claimed
 
 
 def _run_hosted_remote_role(
@@ -4633,6 +5861,7 @@ def _run_hosted_remote_role(
     attachment_context: str = "",
     rework_round: int = 0,
     connector_id: str = "",
+    visible: bool = True,
 ) -> tuple[str, str, dict[str, Any]]:
     """Wait for a DBB3/PC connector run and project its checkpoints.
 
@@ -4664,7 +5893,52 @@ def _run_hosted_remote_role(
         attempt=rework_round + 1,
         connector_id=connector_id,
     )
-    if str(remote.get("status") or "queued") not in _REMOTE_TERMINAL_STATUSES:
+    active_remote_id = str(remote.get("id") or "")
+    coordinator_owner = f"remote-coordinator:{active_remote_id}:{uuid.uuid4().hex}"
+    revision = -1
+    deadline = time.monotonic() + float(
+        os.environ.get("HERMES_REMOTE_RUN_WAIT_SECONDS", "86400")
+    )
+    while True:
+        # Observe a committed result before attempting takeover. This order is
+        # essential when the original owner clears its lane immediately after
+        # publishing the terminal role_event.
+        with _STATE_LOCK:
+            waiting_state = load_single_state()
+            waiting_conversation = _conversation_by_id(waiting_state, conversation_id)
+            waiting_hosted = (waiting_conversation.get("hosted_turns") or {}).get(turn_id)
+            if not isinstance(waiting_hosted, dict):
+                raise RuntimeError("Hosted turn no longer exists")
+            authoritative = (waiting_hosted.get("role_events") or {}).get(role_stage)
+            hosted_terminal = str(waiting_hosted.get("status") or "") in _HOSTED_TERMINAL_STATUSES
+        if (
+            isinstance(authoritative, dict)
+            and str(authoritative.get("status") or "") in _HOSTED_TERMINAL_STATUSES
+        ):
+            authoritative_state = dict(authoritative)
+            result = str(authoritative_state.get("content") or "").strip()
+            status = (
+                "completed"
+                if str(authoritative_state.get("status") or "") == "completed"
+                else "failed"
+            )
+            return result, status, authoritative_state
+        if hosted_terminal:
+            return "", "failed", {"content": "", "status": "failed", "activities": []}
+        if _activate_hosted_role(
+            conversation_id,
+            turn_id,
+            role_stage=role_stage,
+            profile=profile,
+            execution="remote",
+            remote_run_id=active_remote_id,
+            execution_owner=coordinator_owner,
+        ):
+            break
+        if time.monotonic() >= deadline:
+            raise RuntimeError("Timed out waiting for the authoritative role coordinator")
+        revision = _wait_for_hosted_update(revision, 15.0)
+    if visible and str(remote.get("status") or "queued") not in _REMOTE_TERMINAL_STATUSES:
         _remote_run_state_message(
             conversation_id,
             turn_id,
@@ -4672,11 +5946,29 @@ def _run_hosted_remote_role(
             role_label=role_label,
         )
 
-    revision = -1
-    deadline = time.monotonic() + float(
-        os.environ.get("HERMES_REMOTE_RUN_WAIT_SECONDS", "86400")
-    )
     while True:
+        if not _renew_hosted_active_role(
+            conversation_id,
+            turn_id,
+            role_stage=role_stage,
+            execution_owner=coordinator_owner,
+        ):
+            return _run_hosted_remote_role(
+                conversation_id,
+                turn_id,
+                profile=profile,
+                role_stage=role_stage,
+                role_label=role_label,
+                prompt=prompt,
+                kanban_task_id=kanban_task_id,
+                start_text=start_text,
+                artifact_required=artifact_required,
+                delivery_context=delivery_context,
+                attachment_context=attachment_context,
+                rework_round=rework_round,
+                connector_id=connector_id,
+                visible=visible,
+            )
         with _STATE_LOCK:
             state = load_single_state()
             location = _remote_run_location(state, str(remote.get("id") or ""))
@@ -4684,8 +5976,42 @@ def _run_hosted_remote_role(
                 raise RuntimeError("远程执行记录不存在")
             _conversation, _hosted, _role_key, current = location
             remote = dict(current)
-            cancel_requested = bool(_hosted.get("cancel_requested"))
-        if cancel_requested and str(remote.get("status") or "") not in _REMOTE_TERMINAL_STATUSES:
+            turn_cancel_requested = bool(_hosted.get("cancel_requested"))
+        status = str(remote.get("status") or "queued")
+        pending_intervention = _pending_hosted_role_intervention(
+            conversation_id,
+            turn_id,
+            role_stage=role_stage,
+            profile=profile,
+        )
+        remote_intervention_id = str(remote.get("cancel_intervention_id") or "")
+        if (
+            not turn_cancel_requested
+            and status not in _REMOTE_TERMINAL_STATUSES
+            and (isinstance(pending_intervention, dict) or remote_intervention_id)
+        ):
+            claimed = _request_remote_role_intervention_cancel(
+                conversation_id,
+                turn_id,
+                remote_run_id=active_remote_id,
+                role_stage=role_stage,
+                profile=profile,
+                intervention_id=(
+                    remote_intervention_id
+                    or str((pending_intervention or {}).get("id") or "")
+                ),
+                execution_owner=coordinator_owner,
+            )
+            if isinstance(claimed, dict):
+                remote.update(
+                    {
+                        "cancel_requested": True,
+                        "cancel_kind": "intervention",
+                        "cancel_intervention_id": str(claimed.get("id") or ""),
+                    }
+                )
+                remote_intervention_id = str(claimed.get("id") or "")
+        if turn_cancel_requested and status not in _REMOTE_TERMINAL_STATUSES:
             _persist_hosted_turn(
                 conversation_id,
                 turn_id,
@@ -4694,13 +6020,144 @@ def _run_hosted_remote_role(
                     "stage": "cancel_requested",
                 },
             )
+            _clear_hosted_active_role(
+                conversation_id,
+                turn_id,
+                role_stage=role_stage,
+                remote_run_id=active_remote_id,
+                execution_owner=coordinator_owner,
+            )
             return "远程执行已请求取消。", "failed", {
                 "content": "远程执行已请求取消。",
                 "status": "failed",
                 "activities": list(remote.get("activities") or []),
             }
-        status = str(remote.get("status") or "queued")
         if status in _REMOTE_TERMINAL_STATUSES:
+            terminal_intervention_id = (
+                remote_intervention_id
+                or str((pending_intervention or {}).get("id") or "")
+            )
+            if terminal_intervention_id:
+                checkpoint = _hosted_role_checkpoint(
+                    role_stage=role_stage,
+                    profile=profile,
+                    execution="remote",
+                    remote_run=remote,
+                )
+                intervention = _request_remote_role_intervention_cancel(
+                    conversation_id,
+                    turn_id,
+                    remote_run_id=active_remote_id,
+                    role_stage=role_stage,
+                    profile=profile,
+                    intervention_id=terminal_intervention_id,
+                    execution_owner=coordinator_owner,
+                ) or _hosted_intervention_by_id(
+                    conversation_id,
+                    turn_id,
+                    terminal_intervention_id,
+                )
+                if isinstance(intervention, dict):
+                    refreshed = _refresh_claimed_intervention_checkpoint(
+                        conversation_id,
+                        turn_id,
+                        intervention_id=terminal_intervention_id,
+                        claim_token=str(intervention.get("claim_token") or ""),
+                        execution_owner=coordinator_owner,
+                        role_stage=role_stage,
+                        profile=profile,
+                        checkpoint=checkpoint,
+                    )
+                    if isinstance(refreshed, dict):
+                        intervention = refreshed
+                    checkpoint = dict(intervention.get("checkpoint") or checkpoint)
+                    digest = hashlib.sha256(
+                        terminal_intervention_id.encode("utf-8")
+                    ).hexdigest()[:12]
+                    reply_stage = f"{role_stage}:intervention:{digest}"
+                    resume_stage = f"{role_stage}:resume:{digest}"
+                    intervention_reply = str(intervention.get("reply") or "").strip()
+                    if str(intervention.get("status") or "") != "completed":
+                        _clear_hosted_active_role(
+                            conversation_id,
+                            turn_id,
+                            role_stage=role_stage,
+                            remote_run_id=active_remote_id,
+                            execution_owner=coordinator_owner,
+                        )
+                        reply_result, reply_status, _reply_state = _run_hosted_remote_role(
+                            conversation_id,
+                            turn_id,
+                            profile=profile,
+                            role_stage=reply_stage,
+                            role_label=f"{role_label} · 干预回复",
+                            prompt=_hosted_intervention_reply_prompt(
+                                role_label=role_label,
+                                intervention=intervention,
+                                checkpoint=checkpoint,
+                            ),
+                            kanban_task_id=kanban_task_id,
+                            start_text="已在安全边界暂停，正在优先回复定向干预。",
+                            artifact_required=False,
+                            delivery_context="Reply to the intervention only; do not create artifacts.",
+                            attachment_context="",
+                            rework_round=rework_round,
+                            connector_id=connector_id,
+                            visible=visible,
+                        )
+                        intervention_reply = (
+                            reply_result
+                            if reply_status == "completed" and reply_result.strip()
+                            else "已在安全边界暂停；定向回复未完整执行，将携带检查点继续。"
+                        )
+                        _complete_hosted_role_intervention(
+                            conversation_id,
+                            turn_id,
+                            intervention_id=terminal_intervention_id,
+                            claim_token=str(intervention.get("claim_token") or ""),
+                            execution_owner=coordinator_owner,
+                            role_stage=role_stage,
+                            role_label=role_label,
+                            profile=profile,
+                            reply=intervention_reply,
+                            checkpoint=checkpoint,
+                            resume_role_stage=resume_stage if status == "cancelled" else "",
+                        )
+                    if status == "cancelled":
+                        resumed_result, resumed_status, resumed_state = (
+                            _run_hosted_remote_role(
+                                conversation_id,
+                                turn_id,
+                                profile=profile,
+                                role_stage=resume_stage,
+                                role_label=f"{role_label} · 恢复",
+                                prompt=_hosted_intervention_resume_prompt(
+                                    prompt,
+                                    intervention=intervention,
+                                    checkpoint=checkpoint,
+                                    reply=intervention_reply,
+                                ),
+                                kanban_task_id=kanban_task_id,
+                                start_text="已优先处理定向干预，正在从远程检查点恢复。",
+                                artifact_required=artifact_required,
+                                delivery_context=delivery_context,
+                                attachment_context=attachment_context,
+                                rework_round=rework_round,
+                                connector_id=connector_id,
+                                visible=visible,
+                            )
+                        )
+                        _persist_hosted_role_state(
+                            conversation_id,
+                            turn_id,
+                            profile=profile,
+                            role_stage=role_stage,
+                            role_label=role_label,
+                            state=resumed_state,
+                            content_fallback=resumed_result,
+                            visible=visible,
+                        )
+                        return resumed_result, resumed_status, resumed_state
             result = str(remote.get("result") or remote.get("summary") or "").strip()
             if status != "completed" and remote.get("error"):
                 result = result or f"远程执行失败：{remote['error']}"
@@ -4723,20 +6180,36 @@ def _run_hosted_remote_role(
                 role_label=role_label,
                 state=role_state,
                 content_fallback=result,
+                visible=visible,
+            )
+            _clear_hosted_active_role(
+                conversation_id,
+                turn_id,
+                role_stage=role_stage,
+                remote_run_id=active_remote_id,
+                execution_owner=coordinator_owner,
             )
             return result, role_state["status"], role_state
-        _remote_run_state_message(
-            conversation_id,
-            turn_id,
-            remote,
-            role_label=role_label,
-        )
+        if visible:
+            _remote_run_state_message(
+                conversation_id,
+                turn_id,
+                remote,
+                role_label=role_label,
+            )
         if time.monotonic() >= deadline:
             error = "远程执行器在规定时间内没有完成"
             _persist_hosted_turn(
                 conversation_id,
                 turn_id,
                 patch={"stage": "failed", "error": error},
+            )
+            _clear_hosted_active_role(
+                conversation_id,
+                turn_id,
+                role_stage=role_stage,
+                remote_run_id=active_remote_id,
+                execution_owner=coordinator_owner,
             )
             return f"本阶段未完成：{error}", "failed", {
                 "content": error,
@@ -4808,6 +6281,9 @@ def create_hosted_turn_record(
         "user_delivery_context": str(user_delivery_context or "").strip(),
         "output_dir": str(output_dir or "").strip(),
         "cancel_requested": False,
+        "interventions": [],
+        "active_roles": {},
+        "supervisor_checks": {},
         "created_at": now,
         "updated_at": now,
     }
@@ -5061,6 +6537,37 @@ def _schedule_mobile_completion_notification(
         return
 
 
+def _schedule_persisted_terminal_notification(
+    conversation_id: str,
+    turn_id: str,
+    persisted_run: dict[str, Any],
+    *,
+    fallback_result: str = "",
+) -> None:
+    """Notify only the terminal state that won the durable state transition."""
+
+    actual_status = str(persisted_run.get("status") or "")
+    if actual_status not in _HOSTED_TERMINAL_STATUSES:
+        return
+    notification = persisted_run.get("notification")
+    notification = dict(notification) if isinstance(notification, dict) else {}
+    task_status = str(notification.get("task_status") or actual_status)
+    if task_status != actual_status:
+        task_status = actual_status
+    result = str(
+        notification.get("result")
+        or persisted_run.get("reporter_result")
+        or persisted_run.get("chat_result")
+        or fallback_result
+    )
+    _schedule_mobile_completion_notification(
+        conversation_id,
+        turn_id,
+        task_status,
+        result,
+    )
+
+
 def _mobile_notification_dispatch_loop() -> None:
     """Deliver all persistent APNs jobs without allocating one thread per job."""
 
@@ -5255,6 +6762,11 @@ def _persist_hosted_turn(
             raise RuntimeError("托管任务记录不存在")
         incoming_status = str((patch or {}).get("status") or "").lower()
         current_status = str(run.get("status") or "").lower()
+        if current_status in _HOSTED_TERMINAL_STATUSES:
+            # The first terminal transaction is authoritative. Even a late
+            # writer repeating the same status may carry stale fields or a
+            # duplicate message, so terminal retries are read-only.
+            return dict(run)
         if (
             (run.get("cancel_requested") or current_status == "cancelled")
             and incoming_status != "cancelled"
@@ -5275,7 +6787,30 @@ def _persist_hosted_turn(
         conversation["updated_at"] = now
         terminal_status = str(run.get("status") or "").lower()
         if terminal_status in _HOSTED_TERMINAL_STATUSES:
+            run.setdefault("terminal_commit_id", f"terminal_{uuid.uuid4().hex}")
+            run.setdefault("terminal_committed_at", now)
             active_statuses = {"pending", "queued", "running", "starting", "streaming"}
+            for intervention in run.get("interventions") or []:
+                if not isinstance(intervention, dict):
+                    continue
+                if str(intervention.get("status") or "pending") not in {
+                    "pending",
+                    "processing",
+                }:
+                    continue
+                intervention.update(
+                    {
+                        "status": "cancelled",
+                        "cancel_reason": f"hosted_turn_{terminal_status}",
+                        "cancelled_at": now,
+                        "completed_at": now,
+                        "updated_at": now,
+                    }
+                )
+                intervention.pop("claim_token", None)
+                intervention.pop("execution_owner", None)
+                intervention["lease_expires_at"] = 0
+            run["active_roles"] = {}
             for state_key in ("role_events", "remote_runs"):
                 child_states = run.get(state_key)
                 if not isinstance(child_states, dict):
@@ -5285,13 +6820,27 @@ def _persist_hosted_turn(
                         continue
                     if terminal_status == "cancelled" and state_key == "remote_runs":
                         child_state["cancel_requested"] = True
+                        child_state["cancel_kind"] = "turn"
+                        child_state["cancel_intervention_id"] = ""
+                        child_state["cancel_reason"] = str(
+                            run.get("cancel_reason") or "用户取消"
+                        )[:1000]
                         child_state["cancel_requested_at"] = now
+                        # The hosted turn is terminal immediately, but a live
+                        # device worker still needs a durable cancellation to
+                        # pull and acknowledge.  `cancelling` is deliberately
+                        # non-terminal; the cancel claim owns the only allowed
+                        # transition from here to `cancelled`.
+                        if str(child_state.get("status") or "").lower() not in _REMOTE_TERMINAL_STATUSES:
+                            child_state["status"] = "cancelling"
+                            child_state.pop("completed_at", None)
                         child_state["updated_at"] = now
-                        continue
                     if str(child_state.get("status") or "").lower() in active_statuses:
                         child_state["status"] = terminal_status
                         child_state["completed_at"] = now
                         child_state["updated_at"] = now
+                    if state_key == "remote_runs":
+                        _seal_remote_run_claim(child_state, now=now)
             for existing_message in conversation.get("messages") or []:
                 if not isinstance(existing_message, dict):
                     continue
@@ -5472,6 +7021,11 @@ def _remote_run_public(remote_run: dict[str, Any]) -> dict[str, Any]:
             "session_id",
             "cancel_requested",
             "cancel_reason",
+            "cancel_kind",
+            "cancel_intervention_id",
+            "cancel_requested_at",
+            "claim_token",
+            "lease_until",
             "delivery_context",
             "attachment_context",
             "attachment_ids",
@@ -5595,7 +7149,13 @@ def _remote_run_state_message(
         remote_run.get("summary") or remote_run.get("result") or ""
     ).strip()
     result = str(remote_run.get("result") or remote_run.get("summary") or "").strip()
-    if status in _REMOTE_TERMINAL_STATUSES:
+    intervention_pause = (
+        status == "cancelled"
+        and str(remote_run.get("cancel_kind") or "") == "intervention"
+    )
+    if intervention_pause:
+        content = result or "远程角色已在安全边界暂停，正在优先处理定向干预。"
+    elif status in _REMOTE_TERMINAL_STATUSES:
         content = result or (
             f"远程执行已结束：{remote_run.get('error')}"
             if remote_run.get("error")
@@ -5607,7 +7167,15 @@ def _remote_run_state_message(
         content = "已排队等待远程执行器领取。"
     state = {
         "content": content,
-        "status": "completed" if status == "completed" else "failed" if status in {"failed", "cancelled"} else "streaming",
+        "status": (
+            "streaming"
+            if intervention_pause
+            else "completed"
+            if status == "completed"
+            else "failed"
+            if status in {"failed", "cancelled"}
+            else "streaming"
+        ),
         "activities": [dict(item) for item in remote_run.get("activities") or [] if isinstance(item, dict)],
         "actual_model": str(remote_run.get("actual_model") or ""),
         "actual_provider": str(remote_run.get("actual_provider") or ""),
@@ -5623,7 +7191,9 @@ def _remote_run_state_message(
         role_label=role_label,
         state=state,
         content_fallback=content,
-        semantic_milestone=semantic_progress if status == "running" else "",
+        semantic_milestone=(
+            semantic_progress if status == "running" or intervention_pause else ""
+        ),
     )
 
 
@@ -5663,14 +7233,30 @@ def request_hosted_turn_cancellation(
         if run.get("status") in _HOSTED_TERMINAL_STATUSES:
             return dict(run)
         now = int(time.time() * 1000)
+        clean_reason = str(reason or "用户取消").strip() or "用户取消"
         run.update(
             {
                 "cancel_requested": True,
-                "cancel_reason": str(reason or "用户取消").strip() or "用户取消",
+                "cancel_reason": clean_reason,
                 "cancel_requested_at": now,
                 "updated_at": now,
             }
         )
+        for remote_run in (run.get("remote_runs") or {}).values():
+            if not isinstance(remote_run, dict):
+                continue
+            if str(remote_run.get("status") or "queued") in _REMOTE_TERMINAL_STATUSES:
+                continue
+            remote_run.update(
+                {
+                    "cancel_requested": True,
+                    "cancel_kind": "turn",
+                    "cancel_intervention_id": "",
+                    "cancel_reason": clean_reason[:1000],
+                    "cancel_requested_at": now,
+                    "updated_at": now,
+                }
+            )
         conversation["updated_at"] = now
         save_single_state(state)
         persisted = dict(run)
@@ -5680,6 +7266,12 @@ def request_hosted_turn_cancellation(
         conversation = _conversation_by_id(state, conversation_id)
         current = (conversation.get("hosted_turns") or {}).get(turn_id)
         persisted = dict(current) if isinstance(current, dict) else persisted
+    _schedule_persisted_terminal_notification(
+        conversation_id,
+        turn_id,
+        persisted,
+        fallback_result=str(persisted.get("cancel_reason") or "用户取消"),
+    )
     return persisted
 
 
@@ -5719,6 +7311,12 @@ def _finish_hosted_turn_if_cancelled(
             "stage": "cancelled",
             "cancelled_at": now,
             "completed_at": now,
+            "notification": _completion_notification_record(
+                conversation_id,
+                turn_id,
+                "cancelled",
+                f"任务已取消：{reason}",
+            ),
         },
         message={
             "role": "assistant",
@@ -5736,31 +7334,194 @@ def _finish_hosted_turn_if_cancelled(
     return True
 
 
-def _review_requests_rework(result: str) -> bool:
-    """Resolve the review gate from its explicit marker with a text fallback."""
+_HOSTED_CONTROL_ROOT_KEYS = frozenset(
+    {"protocol", "verdict", "checks", "blockers", "findings", "required_actions"}
+)
+_HOSTED_REVIEW_CHECKS = (
+    "requirements_met",
+    "evidence_verified",
+    "tests_passed",
+    "risks_resolved",
+)
+_HOSTED_SUPERVISION_CHECKS = (
+    "role_boundaries_respected",
+    "task_coverage_complete",
+    "evidence_sufficient",
+    "process_compliant",
+)
 
-    text = str(result or "").strip()
-    marker = re.search(
-        r"HERMES_REVIEW\s*:\s*(PASS|REWORK)",
-        text,
-        flags=re.IGNORECASE,
+
+def _strict_json_object(text: str) -> Optional[dict[str, Any]]:
+    """Decode exactly one JSON object and reject duplicate keys at every depth."""
+
+    class DuplicateKeyError(ValueError):
+        pass
+
+    def unique_object(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
+        result: dict[str, Any] = {}
+        for key, value in pairs:
+            if key in result:
+                raise DuplicateKeyError(key)
+            result[key] = value
+        return result
+
+    raw = str(text or "").strip()
+    if not raw or not raw.startswith("{") or not raw.endswith("}"):
+        return None
+    try:
+        parsed = json.loads(raw, object_pairs_hook=unique_object)
+    except (DuplicateKeyError, json.JSONDecodeError, TypeError, ValueError):
+        return None
+    return parsed if isinstance(parsed, dict) else None
+
+
+def _strict_hosted_control_result(
+    result: str,
+    *,
+    protocol: str,
+    outcomes: tuple[str, ...],
+    required_checks: tuple[str, ...],
+) -> Optional[dict[str, Any]]:
+    """Validate the closed verdict schema without interpreting narrative text."""
+
+    parsed = _strict_json_object(result)
+    if parsed is None or set(parsed) != _HOSTED_CONTROL_ROOT_KEYS:
+        return None
+    if parsed.get("protocol") != protocol or parsed.get("verdict") not in outcomes:
+        return None
+    checks = parsed.get("checks")
+    if not isinstance(checks, dict) or set(checks) != set(required_checks):
+        return None
+    if any(type(checks.get(key)) is not bool for key in required_checks):
+        return None
+    for key in ("blockers", "findings", "required_actions"):
+        values = parsed.get(key)
+        if (
+            not isinstance(values, list)
+            or len(values) > 50
+            or any(
+                not isinstance(value, str)
+                or not value.strip()
+                or len(value) > 2000
+                for value in values
+            )
+        ):
+            return None
+    verdict = str(parsed["verdict"])
+    issue_count = sum(
+        len(parsed[key]) for key in ("blockers", "findings", "required_actions")
     )
-    if marker:
-        return marker.group(1).upper() == "REWORK"
-    normalized = text.lower()
-    return any(
-        phrase in normalized
-        for phrase in (
-            "需要返工",
-            "退回执行",
-            "退回修改",
-            "审阅未通过",
-            "验收未通过",
-            "changes requested",
-            "request rework",
-            "review failed",
-        )
+    if verdict == "PASS":
+        if issue_count or not all(checks[key] for key in required_checks):
+            return None
+    elif (
+        not parsed["blockers"]
+        or not parsed["required_actions"]
+        or issue_count == 0
+        or all(checks[key] for key in required_checks)
+    ):
+        # A negative control decision must identify both a failed check and an
+        # actionable structured reason. Empty pessimistic verdicts are invalid.
+        return None
+    return parsed
+
+
+def _hosted_reviewer_control(result: str) -> Optional[dict[str, Any]]:
+    return _strict_hosted_control_result(
+        result,
+        protocol="hermes.review.v1",
+        outcomes=("PASS", "REWORK"),
+        required_checks=_HOSTED_REVIEW_CHECKS,
     )
+
+
+def _hosted_reviewer_verdict(result: str) -> str:
+    control = _hosted_reviewer_control(result)
+    return str(control["verdict"]).lower() if control is not None else "unknown"
+
+
+def _hosted_control_display(
+    result: str,
+    *,
+    kind: str,
+    checkpoint_label: str = "",
+) -> str:
+    """Render user-visible Chinese text from a validated machine verdict."""
+
+    if kind == "reviewer":
+        control = _hosted_reviewer_control(result)
+        if control is None:
+            return "审阅控制结果格式无效，已按未通过处理。"
+        if control["verdict"] == "PASS":
+            return "审阅通过：全部验收、证据、测试和风险检查均已确认。"
+        prefix = "审阅要求返工"
+    else:
+        control = _hosted_supervisor_control(result)
+        label = f"“{checkpoint_label}”" if checkpoint_label else "当前检查点"
+        if control is None:
+            return f"监督控制结果格式无效，{label} 已按未通过处理。"
+        if control["verdict"] == "PASS":
+            return f"监督检查通过：{label} 的职责、覆盖、证据和流程均已确认。"
+        prefix = f"监督要求整改：{label}"
+    details = [
+        *control["blockers"],
+        *control["findings"],
+        *control["required_actions"],
+    ]
+    return f"{prefix}：" + "；".join(details)
+
+
+def _hosted_reviewer_protocol_prompt() -> str:
+    return (
+        "最终控制结果只允许输出一个 JSON 对象，不得使用 Markdown 代码块、引用、"
+        "解释正文、前后缀或第二个对象。严格 schema："
+        '{"protocol":"hermes.review.v1","verdict":"PASS|REWORK",'
+        '"checks":{"requirements_met":true|false,"evidence_verified":true|false,'
+        '"tests_passed":true|false,"risks_resolved":true|false},'
+        '"blockers":["..."],"findings":["..."],"required_actions":["..."]}。'
+        "键集、类型和枚举必须完全一致。PASS 时四项 checks 必须全为 true，且三个数组"
+        "必须全空；REWORK 时至少一项 check 为 false，并在数组中给出具体问题和整改动作。"
+    )
+
+
+def _persist_hosted_reviewer_display(
+    conversation_id: str,
+    turn_id: str,
+    *,
+    profile: str,
+    role_stage: str,
+    role_label: str,
+    raw_result: str,
+    status: str,
+    role_state: dict[str, Any],
+) -> tuple[str, Optional[dict[str, Any]]]:
+    """Keep the machine verdict private and expose a backend-rendered message."""
+
+    control = _hosted_reviewer_control(raw_result)
+    display_result = _hosted_control_display(raw_result, kind="reviewer")
+    display_state = dict(role_state)
+    display_state.update(
+        {
+            "content": display_result,
+            "status": "failed" if status == "completed" and control is None else status,
+        }
+    )
+    _persist_hosted_role_state(
+        conversation_id,
+        turn_id,
+        profile=profile,
+        role_stage=role_stage,
+        role_label=role_label,
+        state=display_state,
+        content_fallback=display_result,
+    )
+    return display_result, control
+
+
+def _review_requests_rework(result: str) -> bool:
+    """Fail closed unless the reviewer emits one strict, consistent PASS."""
+
+    return _hosted_reviewer_verdict(result) != "pass"
 
 
 def _hosted_chat_attachment_context(
@@ -5923,7 +7684,7 @@ def execute_hosted_chat(
             ).strip()
     now = int(time.time() * 1000)
     first_token_at = int(_role_state.get("first_token_at") or 0)
-    _persist_hosted_turn(
+    persisted_run = _persist_hosted_turn(
         conversation_id,
         turn_id,
         patch={
@@ -5979,12 +7740,418 @@ def execute_hosted_chat(
             },
         },
     )
-    _schedule_mobile_completion_notification(
+    _schedule_persisted_terminal_notification(
         conversation_id,
         turn_id,
-        final_status,
-        result,
+        persisted_run,
+        fallback_result=result,
     )
+
+
+def _persist_hosted_supervisor_check(
+    conversation_id: str,
+    turn_id: str,
+    check_id: str,
+    patch: dict[str, Any],
+) -> dict[str, Any]:
+    """Merge one durable supervisor checkpoint without replacing its siblings."""
+
+    with _STATE_LOCK:
+        state = load_single_state()
+        conversation = _conversation_by_id(state, conversation_id)
+        run = (conversation.get("hosted_turns") or {}).get(turn_id)
+        if not isinstance(run, dict):
+            raise RuntimeError("托管任务记录不存在")
+        checks = run.get("supervisor_checks")
+        if not isinstance(checks, dict):
+            checks = {}
+            run["supervisor_checks"] = checks
+        current = checks.get(check_id)
+        record = dict(current) if isinstance(current, dict) else {"id": check_id}
+        record.update(_redact_sensitive(dict(patch)))
+        record["updated_at"] = int(time.time() * 1000)
+        checks[check_id] = record
+        run["updated_at"] = record["updated_at"]
+        conversation["updated_at"] = record["updated_at"]
+        save_single_state(state)
+        persisted = dict(record)
+    _notify_hosted_update(conversation_id)
+    return persisted
+
+
+def _hosted_supervisor_control(result: str) -> Optional[dict[str, Any]]:
+    return _strict_hosted_control_result(
+        result,
+        protocol="hermes.supervision.v1",
+        outcomes=("PASS", "CORRECTIVE_ACTION"),
+        required_checks=_HOSTED_SUPERVISION_CHECKS,
+    )
+
+
+def _hosted_supervisor_verdict(result: str) -> str:
+    control = _hosted_supervisor_control(result)
+    return str(control["verdict"]).lower() if control is not None else "unknown"
+
+
+def _hosted_supervisor_protocol_prompt() -> str:
+    return (
+        "最终控制结果只允许输出一个 JSON 对象，不得使用 Markdown 代码块、引用、"
+        "解释正文、前后缀或第二个对象。严格 schema："
+        '{"protocol":"hermes.supervision.v1",'
+        '"verdict":"PASS|CORRECTIVE_ACTION",'
+        '"checks":{"role_boundaries_respected":true|false,'
+        '"task_coverage_complete":true|false,"evidence_sufficient":true|false,'
+        '"process_compliant":true|false},"blockers":["..."],'
+        '"findings":["..."],"required_actions":["..."]}。'
+        "键集、类型和枚举必须完全一致。PASS 时四项 checks 必须全为 true，且三个数组"
+        "必须全空；CORRECTIVE_ACTION 时至少一项 check 为 false，并在数组中给出责任"
+        "对象、事实、整改动作和复核证据。"
+    )
+
+
+def _bounded_supervisor_evidence(
+    value: Any,
+    *,
+    depth: int = 0,
+) -> tuple[Any, bool]:
+    """Return field-preserving bounded evidence and whether anything was omitted."""
+
+    if depth >= 8:
+        return "[maximum depth exceeded]", True
+    if isinstance(value, dict):
+        bounded: dict[str, Any] = {}
+        truncated = len(value) > 100
+        for key in sorted(value, key=lambda item: str(item))[:100]:
+            child, child_truncated = _bounded_supervisor_evidence(
+                value[key],
+                depth=depth + 1,
+            )
+            bounded[str(key)[:256]] = child
+            truncated = truncated or child_truncated
+        return bounded, truncated
+    if isinstance(value, (list, tuple, set)):
+        values = list(value)
+        bounded_items: list[Any] = []
+        truncated = len(values) > 100
+        for item in values[:100]:
+            child, child_truncated = _bounded_supervisor_evidence(
+                item,
+                depth=depth + 1,
+            )
+            bounded_items.append(child)
+            truncated = truncated or child_truncated
+        return bounded_items, truncated
+    if isinstance(value, str) and len(value) > 4000:
+        return value[:4000], True
+    if value is None or isinstance(value, (str, int, float, bool)):
+        return value, False
+    rendered = str(value)
+    return (rendered[:4000], len(rendered) > 4000)
+
+
+def _require_supervisor_pass(
+    checkpoint_label: str,
+    check: dict[str, Any],
+    *,
+    conversation_id: str = "",
+    turn_id: str = "",
+) -> None:
+    """Make supervision a control gate instead of advisory prompt text."""
+
+    verdict = str(check.get("verdict") or "unknown")
+    status = str(check.get("status") or "failed")
+    if status == "completed" and verdict == "pass":
+        return
+    finding = str(
+        check.get("display_result") or check.get("result") or ""
+    ).strip()
+    reason = (
+        f"监督检查要求返工：{checkpoint_label}"
+        if verdict == "corrective_action"
+        else f"监督检查未形成可验证结论：{checkpoint_label}"
+    )
+    if conversation_id and turn_id:
+        now = int(time.time() * 1000)
+        _persist_hosted_turn(
+            conversation_id,
+            turn_id,
+            patch={
+                "status": "failed",
+                "stage": "failed",
+                "error": reason,
+                "supervisor_corrective_action": {
+                    "checkpoint": checkpoint_label,
+                    "verdict": verdict,
+                    "finding": finding,
+                    "required_action": reason,
+                    "created_at": now,
+                },
+                "completed_at": now,
+                "notification": _completion_notification_record(
+                    conversation_id,
+                    turn_id,
+                    "failed",
+                    reason,
+                ),
+            },
+            message={
+                "role": "assistant",
+                "name": "supervisor",
+                "content": "\n\n".join(item for item in (reason, finding) if item),
+                "status": "failed",
+                "kind": "message",
+                "meta": {
+                    "role_stage": "supervisor.corrective",
+                    "base_role_stage": "supervisor",
+                    "phase": "failed",
+                    "message_key": f"{turn_id}:supervisor:corrective:{checkpoint_label}",
+                    "role_label": _HERMES_SUPERVISOR_LABEL,
+                    "profile": "supervisor",
+                    "final_report": False,
+                },
+            },
+        )
+    if verdict == "corrective_action":
+        raise RuntimeError(reason)
+    raise RuntimeError(reason)
+
+
+def _run_hosted_supervisor_check(
+    conversation_id: str,
+    turn_id: str,
+    *,
+    check_id: str,
+    checkpoint_label: str,
+    evidence: dict[str, Any],
+    runner: Callable[..., str],
+    remote: bool,
+    kanban_task_id: str = "",
+    visible: bool = True,
+) -> tuple[str, str, dict[str, Any]]:
+    """Execute, expose, and persist one independent supervisor check."""
+
+    redacted_evidence = _redact_sensitive(dict(evidence))
+    evidence_json = json.dumps(
+        redacted_evidence,
+        ensure_ascii=False,
+        default=str,
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+    evidence_digest = hashlib.sha256(evidence_json.encode("utf-8")).hexdigest()
+    bounded_evidence, evidence_truncated = _bounded_supervisor_evidence(
+        redacted_evidence
+    )
+    bounded_evidence_json = json.dumps(
+        bounded_evidence,
+        ensure_ascii=False,
+        default=str,
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+    if len(bounded_evidence_json.encode("utf-8")) > 20000:
+        evidence_truncated = True
+        bounded_evidence = {
+            "error": "bounded evidence exceeded the supervisor payload limit",
+            "evidence_sha256": evidence_digest,
+        }
+        bounded_evidence_json = json.dumps(
+            bounded_evidence,
+            ensure_ascii=False,
+            sort_keys=True,
+        )
+
+    cached_result_invalid = False
+    with _STATE_LOCK:
+        state = load_single_state()
+        conversation = _conversation_by_id(state, conversation_id)
+        run = (conversation.get("hosted_turns") or {}).get(turn_id)
+        existing = (
+            (run.get("supervisor_checks") or {}).get(check_id)
+            if isinstance(run, dict)
+            else None
+        )
+        if (
+            isinstance(existing, dict)
+            and str(existing.get("status") or "") == "completed"
+            and str(existing.get("result") or "").strip()
+            and hmac.compare_digest(
+                str(existing.get("evidence_sha256") or ""),
+                evidence_digest,
+            )
+            and not existing.get("evidence_truncated")
+        ):
+            result = str(existing["result"])
+            cached_verdict = _hosted_supervisor_verdict(result)
+            if cached_verdict in {"pass", "corrective_action"} and hmac.compare_digest(
+                str(existing.get("verdict") or ""),
+                cached_verdict,
+            ):
+                display_result = str(existing.get("display_result") or "").strip()
+                if not display_result:
+                    display_result = _hosted_control_display(
+                        result,
+                        kind="supervisor",
+                        checkpoint_label=checkpoint_label,
+                    )
+                return result, "completed", dict(existing)
+            cached_result_invalid = True
+
+    now = int(time.time() * 1000)
+    _persist_hosted_supervisor_check(
+        conversation_id,
+        turn_id,
+        check_id,
+        {
+            "checkpoint": checkpoint_label,
+            "status": "running",
+            "evidence_sha256": evidence_digest,
+            "evidence": bounded_evidence,
+            "evidence_truncated": evidence_truncated,
+            "started_at": now,
+        },
+    )
+    role_stage = f"supervisor:{check_id}"
+    if cached_result_invalid:
+        invalid_digest = hashlib.sha256(
+            str((existing or {}).get("result") or "").encode("utf-8")
+        ).hexdigest()[:12]
+        role_stage = f"{role_stage}:revalidate:{invalid_digest}"
+    elif isinstance(existing, dict) and not hmac.compare_digest(
+        str(existing.get("evidence_sha256") or ""),
+        evidence_digest,
+    ):
+        role_stage = f"{role_stage}:evidence:{evidence_digest[:12]}"
+    prompt = "\n".join(
+        item
+        for item in (
+            supervisor_role_prompt(),
+            hosted_progress_protocol(_HERMES_SUPERVISOR_LABEL),
+            mention_priority_protocol(_HERMES_SUPERVISOR_LABEL),
+            hosted_intervention_context(
+                conversation_id,
+                turn_id,
+                role_stage=role_stage,
+            ),
+            f"当前强制检查点：{checkpoint_label}",
+            "独立核对下方持久化证据。发现问题时必须点名责任角色、说明事实、整改动作和复核证据；没有问题时说明检查范围和通过依据。",
+            _hosted_supervisor_protocol_prompt(),
+            bounded_evidence_json,
+        )
+        if item
+    )
+    if remote:
+        result, status, role_state = _run_hosted_remote_role(
+            conversation_id,
+            turn_id,
+            profile=_DBB3_MANAGER_PROFILE,
+            role_stage=role_stage,
+            role_label=f"{_HERMES_SUPERVISOR_LABEL} · {checkpoint_label}",
+            prompt=prompt,
+            kanban_task_id=kanban_task_id,
+            start_text=f"正在监督检查：{checkpoint_label}。",
+            artifact_required=False,
+            delivery_context="Return only the supervisor finding; do not create artifacts.",
+            attachment_context="",
+            connector_id="dbb3-primary",
+            visible=visible,
+        )
+        supervisor_profile = _DBB3_MANAGER_PROFILE
+    else:
+        supervisor_profile = "supervisor"
+        result, status, role_state = _run_hosted_role(
+            conversation_id,
+            turn_id,
+            profile=supervisor_profile,
+            role_stage=role_stage,
+            role_label=f"{_HERMES_SUPERVISOR_LABEL} · {checkpoint_label}",
+            prompt=prompt,
+            runner=runner,
+            kanban_task_id=kanban_task_id,
+            start_text=f"正在监督检查：{checkpoint_label}。",
+            previous_state=(
+                ((run or {}).get("role_events") or {}).get(role_stage)
+                if isinstance(run, dict)
+                else None
+            ),
+            visible=visible,
+        )
+    completed_at = int(time.time() * 1000)
+    verdict = (
+        "unknown"
+        if evidence_truncated or status != "completed"
+        else _hosted_supervisor_verdict(result)
+    )
+    persisted_status = (
+        "completed"
+        if status == "completed" and verdict in {"pass", "corrective_action"}
+        else "failed"
+    )
+    display_result = _hosted_control_display(
+        result,
+        kind="supervisor",
+        checkpoint_label=checkpoint_label,
+    )
+    display_state = dict(role_state)
+    display_state.update({"content": display_result, "status": persisted_status})
+    if visible:
+        _persist_hosted_role_state(
+            conversation_id,
+            turn_id,
+            profile=supervisor_profile,
+            role_stage=role_stage,
+            role_label=f"{_HERMES_SUPERVISOR_LABEL} · {checkpoint_label}",
+            state=display_state,
+            content_fallback=display_result,
+        )
+    else:
+        # Post-report supervision is a server-side publication gate. Its
+        # execution still remains in role_events/supervisor_checks for audit,
+        # but it must not appear after the Reporter answer in the chat stream.
+        with _STATE_LOCK:
+            state = load_single_state()
+            conversation = _conversation_by_id(state, conversation_id)
+            messages = conversation.get("messages") or []
+            retained = [
+                item
+                for item in messages
+                if not (
+                    isinstance(item, dict)
+                    and isinstance(item.get("meta"), dict)
+                    and str(item["meta"].get("runtime_turn_id") or "") == turn_id
+                    and (
+                        str(item["meta"].get("role_stage") or "") == role_stage
+                        or str(item["meta"].get("role_stage") or "").startswith(
+                            f"{role_stage}."
+                        )
+                    )
+                )
+            ]
+            if len(retained) != len(messages):
+                conversation["messages"] = retained
+                conversation["updated_at"] = int(time.time() * 1000)
+                save_single_state(state)
+                _notify_hosted_update(conversation_id)
+    persisted = _persist_hosted_supervisor_check(
+        conversation_id,
+        turn_id,
+        check_id,
+        {
+            "checkpoint": checkpoint_label,
+            "status": persisted_status,
+            "result": result,
+            "display_result": display_result,
+            "verdict": verdict,
+            "profile": supervisor_profile,
+            "role_stage": role_stage,
+            "evidence_sha256": evidence_digest,
+            "evidence": bounded_evidence,
+            "evidence_truncated": evidence_truncated,
+            "activities": list(role_state.get("activities") or []),
+            "completed_at": completed_at,
+        },
+    )
+    return result, persisted_status, persisted
 
 
 def execute_hosted_workflow(
@@ -6068,11 +8235,22 @@ def execute_hosted_workflow(
             profile=_DBB3_MANAGER_PROFILE,
             role_stage="manager_planning",
             role_label=f"{_HERMES_MANAGER_LABEL} · 规划",
-            prompt=_manager_plan_prompt(
-                content=content,
-                fallback_workers=fallback_worker_profiles,
-                attachment_context=attachment_context,
-                artifact_required=artifact_required,
+            prompt="\n".join(
+                item
+                for item in (
+                    _manager_plan_prompt(
+                        content=content,
+                        fallback_workers=fallback_worker_profiles,
+                        attachment_context=attachment_context,
+                        artifact_required=artifact_required,
+                    ),
+                    hosted_intervention_context(
+                        conversation_id,
+                        turn_id,
+                        role_stage="dispatcher",
+                    ),
+                )
+                if item
             ),
             kanban_task_id="",
             start_text="正在评估难度并形成结构化执行计划。",
@@ -6208,6 +8386,42 @@ def execute_hosted_workflow(
         if _finish_hosted_turn_if_cancelled(conversation_id, turn_id):
             return
 
+    supervisor_statuses: dict[str, str] = {}
+    supervisor_findings: dict[str, str] = {}
+    plan_supervision, plan_supervision_status, _plan_supervision = (
+        _run_hosted_supervisor_check(
+            conversation_id,
+            turn_id,
+            check_id="plan_dispatch",
+            checkpoint_label="计划形成与首次派发",
+            evidence={
+                "task_goal": content,
+                "manager_plan": manager_plan,
+                "worker_profiles": worker_profiles,
+                "reviewer_profile": reviewer_profile,
+                "task_id": task_id,
+                "child_ids": child_ids,
+                "profile_task_ids": profile_task_ids,
+                "artifact_required": artifact_required,
+            },
+            runner=runner,
+            remote=remote_workers,
+            kanban_task_id=task_id,
+        )
+    )
+    supervisor_statuses["plan_dispatch"] = plan_supervision_status
+    supervisor_findings["plan_dispatch"] = str(
+        _plan_supervision.get("display_result") or plan_supervision
+    )
+    _require_supervisor_pass(
+        "计划形成与首次派发",
+        _plan_supervision,
+        conversation_id=conversation_id,
+        turn_id=turn_id,
+    )
+    if _finish_hosted_turn_if_cancelled(conversation_id, turn_id):
+        return
+
     _persist_hosted_turn(
         conversation_id,
         turn_id,
@@ -6304,7 +8518,16 @@ def execute_hosted_workflow(
                 "你是任务执行者。只完成调度分配给当前 Profile 和目标设备的子任务。",
                 "负责实际执行、工具调用、证据收集和必要产物创建。",
                 "可以使用所有已配置的 Skill、MCP 和工具；正常的搜索、命令、取证和验证属于执行过程。",
-                "工作过程中按真实进展自然汇报，不套固定中间模板。",
+                hosted_progress_protocol(profile),
+                hosted_role_delivery_contract(profile),
+                mention_priority_protocol(profile),
+                hosted_intervention_context(
+                    conversation_id,
+                    turn_id,
+                    role_stage=role_stage,
+                ),
+                "监督者对计划与派发的检查：",
+                plan_supervision,
                 "不要做最终总结；把结果、证据、耗时和遗留问题提交给审阅者。",
                 f"用户任务：{content}",
                 (
@@ -6397,8 +8620,55 @@ def execute_hosted_workflow(
     if _finish_hosted_turn_if_cancelled(conversation_id, turn_id):
         return
 
+    worker_supervision, worker_supervision_status, _worker_supervision = (
+        _run_hosted_supervisor_check(
+            conversation_id,
+            turn_id,
+            check_id="worker_handoff",
+            checkpoint_label="Worker 交接",
+            evidence={
+                "task_goal": content,
+                "manager_plan": manager_plan,
+                "worker_results": worker_results,
+                "worker_statuses": worker_statuses,
+                "artifact_required": artifact_required,
+            },
+            runner=runner,
+            remote=remote_workers,
+            kanban_task_id=task_id,
+        )
+    )
+    supervisor_statuses["worker_handoff"] = worker_supervision_status
+    supervisor_findings["worker_handoff"] = str(
+        _worker_supervision.get("display_result") or worker_supervision
+    )
+    _require_supervisor_pass(
+        "Worker 交接",
+        _worker_supervision,
+        conversation_id=conversation_id,
+        turn_id=turn_id,
+    )
+    if _finish_hosted_turn_if_cancelled(conversation_id, turn_id):
+        return
+
     reviewer_result = str(run.get("reviewer_result") or "")
     reviewer_status = str(run.get("reviewer_status") or "")
+    reviewer_display_result = str(run.get("reviewer_display_result") or "")
+    reviewer_control = _hosted_reviewer_control(reviewer_result)
+    reviewer_revalidation = bool(reviewer_result and reviewer_control is None)
+    reviewer_role_stage = "reviewer"
+    if reviewer_revalidation:
+        legacy_digest = hashlib.sha256(reviewer_result.encode("utf-8")).hexdigest()[:12]
+        reviewer_role_stage = f"reviewer:protocol-revalidation:{legacy_digest}"
+        reviewer_result = ""
+        reviewer_status = ""
+        reviewer_display_result = ""
+        reviewer_control = None
+    if reviewer_result and not reviewer_display_result:
+        reviewer_display_result = _hosted_control_display(
+            reviewer_result,
+            kind="reviewer",
+        )
     if not reviewer_result:
         reviewer_prompt = "\n".join(
             item
@@ -6412,11 +8682,21 @@ def execute_hosted_workflow(
                 "你是结果审阅者。基于执行者结果做验收、风险检查和通过或退回判断。",
                 "允许使用 Skill、MCP 和工具做必要的独立抽样复核，但不要完整重做整个任务。",
                 "正常的 Skill、MCP、命令和取证调用不属于过度执行；只有明显超出用户目标、增加风险或无效成本时才指出越界。",
+                hosted_progress_protocol("Hermes 审阅员"),
+                hosted_role_delivery_contract("Hermes 审阅员"),
+                mention_priority_protocol("Hermes 审阅员"),
+                hosted_intervention_context(
+                    conversation_id,
+                    turn_id,
+                    role_stage="reviewer",
+                ),
                 "不要创建新的交付文件，也不要向用户做最终总结。",
-                "结论最后单独一行写 HERMES_REVIEW: PASS 或 HERMES_REVIEW: REWORK。",
+                _hosted_reviewer_protocol_prompt(),
                 f"用户任务：{content}",
                 "执行者提交：",
                 worker_result,
+                "监督者对 Worker 交接的检查：",
+                worker_supervision,
             )
             if item
         )
@@ -6425,7 +8705,7 @@ def execute_hosted_workflow(
                 conversation_id,
                 turn_id,
                 profile=reviewer_profile,
-                role_stage="reviewer",
+                role_stage=reviewer_role_stage,
                 role_label=f"{reviewer_profile} · 审阅",
                 prompt=reviewer_prompt,
                 kanban_task_id=reviewer_task_scope,
@@ -6440,14 +8720,28 @@ def execute_hosted_workflow(
                 conversation_id,
                 turn_id,
                 profile=reviewer_profile,
-                role_stage="reviewer",
+                role_stage=reviewer_role_stage,
                 role_label=f"{reviewer_profile} · 审阅",
                 prompt=reviewer_prompt,
                 runner=runner,
                 kanban_task_id=reviewer_task_scope,
                 start_text="我已收到执行结果，正在独立验收证据与风险。",
-                previous_state=(run.get("role_events") or {}).get("reviewer"),
+                previous_state=(
+                    None
+                    if reviewer_revalidation
+                    else (run.get("role_events") or {}).get("reviewer")
+                ),
             )
+        reviewer_display_result, reviewer_control = _persist_hosted_reviewer_display(
+            conversation_id,
+            turn_id,
+            profile=reviewer_profile,
+            role_stage=reviewer_role_stage,
+            role_label=f"{reviewer_profile} · 审阅",
+            raw_result=reviewer_result,
+            status=reviewer_status,
+            role_state=_reviewer_state,
+        )
         _persist_hosted_turn(
             conversation_id,
             turn_id,
@@ -6475,7 +8769,8 @@ def execute_hosted_workflow(
         rework_history.append(
             {
                 "round": active_rework_round,
-                "reviewer_feedback": reviewer_result,
+                "reviewer_feedback": reviewer_display_result,
+                "reviewer_control": reviewer_control or {},
                 "worker_results_before": dict(worker_results),
                 "requested_at": int(time.time() * 1000),
             }
@@ -6491,7 +8786,7 @@ def execute_hosted_workflow(
             message={
                 "role": "assistant",
                 "name": reviewer_profile,
-                "content": reviewer_result,
+                "content": reviewer_display_result,
                 "status": "completed",
                 "kind": "message",
                 "meta": {
@@ -6508,6 +8803,43 @@ def execute_hosted_workflow(
         if _finish_hosted_turn_if_cancelled(conversation_id, turn_id):
             return
 
+        rework_check_id = f"rework_{active_rework_round}"
+        rework_supervision, rework_supervision_status, _rework_supervision = (
+            _run_hosted_supervisor_check(
+                conversation_id,
+                turn_id,
+                check_id=rework_check_id,
+                checkpoint_label=f"第 {active_rework_round} 轮返工",
+                evidence={
+                    "task_goal": content,
+                    "reviewer_feedback": reviewer_result,
+                    "worker_results_before": worker_results,
+                    "rework_round": active_rework_round,
+                },
+                runner=runner,
+                remote=remote_workers,
+                kanban_task_id=task_id,
+            )
+        )
+        supervisor_statuses[rework_check_id] = rework_supervision_status
+        supervisor_findings[rework_check_id] = str(
+            _rework_supervision.get("display_result") or rework_supervision
+        )
+        _require_supervisor_pass(
+            f"第 {active_rework_round} 轮返工",
+            _rework_supervision,
+            conversation_id=conversation_id,
+            turn_id=turn_id,
+        )
+        if _finish_hosted_turn_if_cancelled(conversation_id, turn_id):
+            return
+        supervised_rework_feedback = "\n\n".join(
+            (
+                reviewer_result,
+                f"监督者返工检查：\n{rework_supervision}",
+            )
+        )
+
         round_results: dict[str, str] = {}
         round_statuses: dict[str, str] = {}
         with ThreadPoolExecutor(
@@ -6518,7 +8850,7 @@ def execute_hosted_workflow(
                 executor.submit(
                     execute_worker,
                     profile,
-                    rework_feedback=reviewer_result,
+                    rework_feedback=supervised_rework_feedback,
                     rework_round=active_rework_round,
                 ): profile
                 for profile in worker_profiles
@@ -6563,8 +8895,16 @@ def execute_hosted_workflow(
                 reviewer_kanban_instruction,
                 f"这是第 {active_rework_round} 轮返工后的重新验收。",
                 "逐项核对上轮退回意见和新的执行证据。",
+                hosted_progress_protocol("Hermes 审阅员"),
+                hosted_role_delivery_contract("Hermes 审阅员"),
+                mention_priority_protocol("Hermes 审阅员"),
+                hosted_intervention_context(
+                    conversation_id,
+                    turn_id,
+                    role_stage="reviewer",
+                ),
                 "不要创建新的交付文件，也不要向用户做最终总结。",
-                "结论最后单独一行写 HERMES_REVIEW: PASS 或 HERMES_REVIEW: REWORK。",
+                _hosted_reviewer_protocol_prompt(),
                 f"用户任务：{content}",
                 "上轮退回意见：",
                 reviewer_result,
@@ -6601,12 +8941,24 @@ def execute_hosted_workflow(
                 kanban_task_id=reviewer_task_scope,
                 start_text=f"第 {active_rework_round} 轮返工已提交，正在重新验收。",
             )
+        reviewer_display_result, reviewer_control = _persist_hosted_reviewer_display(
+            conversation_id,
+            turn_id,
+            profile=reviewer_profile,
+            role_stage=f"reviewer:rework:{active_rework_round}",
+            role_label=f"{reviewer_profile} · 返工复审",
+            raw_result=reviewer_result,
+            status=reviewer_status,
+            role_state=_reviewer_state,
+        )
         rework_round = active_rework_round
         _persist_hosted_turn(
             conversation_id,
             turn_id,
             patch={
                 "reviewer_result": reviewer_result,
+                "reviewer_control": reviewer_control or {},
+                "reviewer_display_result": reviewer_display_result,
                 "reviewer_status": reviewer_status,
                 "active_rework_round": 0,
                 "rework_round": rework_round,
@@ -6618,8 +8970,8 @@ def execute_hosted_workflow(
 
     if reviewer_status == "completed" and _review_requests_rework(reviewer_result):
         reviewer_status = "failed"
-        reviewer_result = (
-            f"{reviewer_result}\n\n"
+        reviewer_display_result = (
+            f"{reviewer_display_result}\n"
             f"已达到 {_HOSTED_REWORK_LIMIT} 轮自动返工上限，任务保留为未通过。"
         )
         _persist_hosted_turn(
@@ -6627,9 +8979,45 @@ def execute_hosted_workflow(
             turn_id,
             patch={
                 "reviewer_result": reviewer_result,
+                "reviewer_control": reviewer_control or {},
+                "reviewer_display_result": reviewer_display_result,
                 "reviewer_status": reviewer_status,
             },
         )
+
+    review_supervision, review_supervision_status, _review_supervision = (
+        _run_hosted_supervisor_check(
+            conversation_id,
+            turn_id,
+            check_id="review_handoff",
+            checkpoint_label="审阅与返工交接",
+            evidence={
+                "task_goal": content,
+                "worker_results": worker_results,
+                "worker_statuses": worker_statuses,
+                "reviewer_result": reviewer_result,
+                "reviewer_control": reviewer_control or {},
+                "reviewer_display_result": reviewer_display_result,
+                "reviewer_status": reviewer_status,
+                "rework_history": rework_history,
+            },
+            runner=runner,
+            remote=remote_workers,
+            kanban_task_id=task_id,
+        )
+    )
+    supervisor_statuses["review_handoff"] = review_supervision_status
+    supervisor_findings["review_handoff"] = str(
+        _review_supervision.get("display_result") or review_supervision
+    )
+    _require_supervisor_pass(
+        "审阅与返工交接",
+        _review_supervision,
+        conversation_id=conversation_id,
+        turn_id=turn_id,
+    )
+    if _finish_hosted_turn_if_cancelled(conversation_id, turn_id):
+        return
 
     handoff_artifacts = (
         _hosted_turn_output_attachments(
@@ -6652,6 +9040,7 @@ def execute_hosted_workflow(
         "plan": list(manager_plan.get("plan") or []),
         "worker_results": dict(worker_results),
         "review_verdict": reviewer_result,
+        "supervisor_review": review_supervision,
         "rework_history": list(rework_history),
         "artifacts": handoff_artifacts,
         "failures": handoff_failures,
@@ -6677,7 +9066,16 @@ def execute_hosted_workflow(
                 prompt="\n".join(
                     (
                         "你是 Hermes Manager。根据下方已经完成的执行与审阅记录生成结构化交接，不能重新执行任务，不能补写不存在的证据。",
-                        "只输出 JSON 对象，必须包含 task_goal、plan、worker_results、review_verdict、rework_history、artifacts、failures、suggested_conclusion。",
+                        hosted_progress_protocol(_HERMES_MANAGER_LABEL),
+                        hosted_role_delivery_contract(_HERMES_MANAGER_LABEL),
+                        mention_priority_protocol(_HERMES_MANAGER_LABEL),
+                        hosted_intervention_context(
+                            conversation_id,
+                            turn_id,
+                            role_stage="dispatcher",
+                        ),
+                        "服务端会固定 task_goal、plan、worker_results、review_verdict、rework_history、artifacts 和 failures；你无权覆盖这些字段。",
+                        '只输出一个 JSON 对象：{"suggested_conclusion":"..."}，不得附加正文或伪造权威字段。',
                         json.dumps(source_handoff, ensure_ascii=False, default=str),
                     )
                 ),
@@ -6722,6 +9120,57 @@ def execute_hosted_workflow(
             failures=handoff_failures,
         )
 
+    # Rebind cached or model-proposed handoffs to the current authoritative
+    # server state. This also protects resumed pre-upgrade runs.
+    manager_handoff = _normalize_manager_handoff(
+        manager_handoff,
+        task_goal=content,
+        plan=manager_plan,
+        worker_results=worker_results,
+        review_verdict=reviewer_result,
+        rework_history=rework_history,
+        artifacts=handoff_artifacts,
+        failures=handoff_failures,
+    )
+    _persist_hosted_turn(
+        conversation_id,
+        turn_id,
+        patch={"manager_handoff": manager_handoff},
+    )
+
+    final_supervision, final_supervision_status, _final_supervision = (
+        _run_hosted_supervisor_check(
+            conversation_id,
+            turn_id,
+            check_id="final_report",
+            checkpoint_label="最终汇报前",
+            evidence={
+                "manager_handoff": manager_handoff,
+                "worker_status": worker_status,
+                "reviewer_status": reviewer_status,
+                "supervisor_statuses": supervisor_statuses,
+                "supervisor_findings": supervisor_findings,
+                "artifact_required": artifact_required,
+                "artifacts": handoff_artifacts,
+            },
+            runner=runner,
+            remote=remote_workers,
+            kanban_task_id=task_id,
+        )
+    )
+    supervisor_statuses["final_report"] = final_supervision_status
+    supervisor_findings["final_report"] = str(
+        _final_supervision.get("display_result") or final_supervision
+    )
+    _require_supervisor_pass(
+        "最终汇报前",
+        _final_supervision,
+        conversation_id=conversation_id,
+        turn_id=turn_id,
+    )
+    if _finish_hosted_turn_if_cancelled(conversation_id, turn_id):
+        return
+
     reporter_result = str(run.get("reporter_result") or "")
     reporter_status = str(run.get("reporter_status") or "")
     if not reporter_result:
@@ -6736,9 +9185,19 @@ def execute_hosted_workflow(
                 reporter_kanban_instruction,
                 "你只能根据 Hermes Manager 已验证的结构化交接生成一次用户答案。",
                 "不得重新执行任务，不得调用工具补做工作，不得编造交接中缺失的结果或证据。",
+                hosted_progress_protocol("Hermes 汇报员"),
+                hosted_role_delivery_contract("Hermes 汇报员"),
+                mention_priority_protocol("Hermes 汇报员"),
+                hosted_intervention_context(
+                    conversation_id,
+                    turn_id,
+                    role_stage="reporter",
+                ),
                 "清楚区分已完成、失败、未完成和需要用户决定的事项。",
                 "Hermes Manager 结构化交接：",
                 json.dumps(manager_handoff, ensure_ascii=False, default=str),
+                "监督者在最终汇报前的检查：",
+                final_supervision,
                 artifact_instruction,
             )
             if item
@@ -6760,12 +9219,92 @@ def execute_hosted_workflow(
             start_text="执行与审阅信息已齐，正在整理唯一的最终汇报。",
             final_report=True,
             previous_state=(run.get("role_events") or {}).get("reporter"),
+            visible=False,
         )
+
+        # Reporter output is a candidate until the independent post-report
+        # gate accepts it. Keep its role_event for audit, but do not expose a
+        # draft message that may subsequently be rejected.
+        with _STATE_LOCK:
+            draft_state = load_single_state()
+            draft_conversation = _conversation_by_id(draft_state, conversation_id)
+            draft_messages = draft_conversation.get("messages") or []
+            retained_messages = [
+                item
+                for item in draft_messages
+                if not (
+                    isinstance(item, dict)
+                    and isinstance(item.get("meta"), dict)
+                    and str(item["meta"].get("runtime_turn_id") or "") == turn_id
+                    and (
+                        str(item["meta"].get("role_stage") or "") == "reporter"
+                        or str(item["meta"].get("role_stage") or "").startswith(
+                            "reporter."
+                        )
+                    )
+                )
+            ]
+            if len(retained_messages) != len(draft_messages):
+                draft_conversation["messages"] = retained_messages
+                draft_conversation["updated_at"] = int(time.time() * 1000)
+                save_single_state(draft_state)
 
     if _finish_hosted_turn_if_cancelled(conversation_id, turn_id):
         return
 
-    attachments = handoff_artifacts
+    # The attachment snapshot was captured once before the authoritative
+    # manager handoff. Reporter is presentation-only and cannot publish files,
+    # so reusing that immutable snapshot avoids a second TOCTOU lookup.
+    attachments = list(handoff_artifacts)
+    def artifact_identity(item: dict[str, Any]) -> tuple[str, str, int]:
+        return (
+            str(item.get("id") or ""),
+            str(item.get("sha256") or ""),
+            int(item.get("size") or 0),
+        )
+    artifacts_match = {
+        artifact_identity(item)
+        for item in handoff_artifacts
+        if isinstance(item, dict)
+    } == {
+        artifact_identity(item)
+        for item in attachments
+        if isinstance(item, dict)
+    }
+    post_report_supervision, post_report_status, _post_report_supervision = (
+        _run_hosted_supervisor_check(
+            conversation_id,
+            turn_id,
+            check_id="post_report",
+            checkpoint_label="最终汇报成稿",
+            evidence={
+                "authoritative_handoff": manager_handoff,
+                "reporter_result": reporter_result,
+                "reporter_status": reporter_status,
+                "expected_artifacts": handoff_artifacts,
+                "verified_attachments": attachments,
+                "attachments_match_handoff": artifacts_match,
+                "artifact_required": artifact_required,
+            },
+            runner=runner,
+            remote=remote_workers,
+            kanban_task_id=task_id,
+            visible=False,
+        )
+    )
+    supervisor_statuses["post_report"] = post_report_status
+    supervisor_findings["post_report"] = str(
+        _post_report_supervision.get("display_result") or post_report_supervision
+    )
+    _require_supervisor_pass(
+        "最终汇报成稿",
+        _post_report_supervision,
+        conversation_id=conversation_id,
+        turn_id=turn_id,
+    )
+    if _finish_hosted_turn_if_cancelled(conversation_id, turn_id):
+        return
+
     missing_required_artifact = artifact_required and not attachments
     reporter_state_snapshot = (
         _reporter_state
@@ -6776,6 +9315,10 @@ def execute_hosted_workflow(
         "completed"
         if (
             worker_status == reviewer_status == reporter_status == "completed"
+            and all(status == "completed" for status in supervisor_statuses.values())
+            and _hosted_supervisor_verdict(final_supervision) == "pass"
+            and _hosted_supervisor_verdict(post_report_supervision) == "pass"
+            and artifacts_match
             and not missing_required_artifact
         )
         else "failed"
@@ -6789,13 +9332,30 @@ def execute_hosted_workflow(
             )
             if item
         )
+    with _STATE_LOCK:
+        current_state = load_single_state()
+        current_conversation = _conversation_by_id(current_state, conversation_id)
+        current_run = (current_conversation.get("hosted_turns") or {}).get(turn_id)
+        current_checks = (
+            current_run.get("supervisor_checks")
+            if isinstance(current_run, dict)
+            and isinstance(current_run.get("supervisor_checks"), dict)
+            else {}
+        )
+        supervisor_verdicts = {
+            str(check_id): str(check.get("verdict") or "unknown")
+            for check_id, check in current_checks.items()
+            if isinstance(check, dict)
+        }
     now = int(time.time() * 1000)
-    _persist_hosted_turn(
+    persisted_run = _persist_hosted_turn(
         conversation_id,
         turn_id,
         patch={
             "reporter_result": reporter_result,
             "reporter_status": reporter_status,
+            "supervisor_statuses": dict(supervisor_statuses),
+            "supervisor_verdicts": supervisor_verdicts,
             "status": final_status,
             "stage": "completed" if final_status == "completed" else "failed",
             "completed_at": now,
@@ -6827,11 +9387,11 @@ def execute_hosted_workflow(
             },
         },
     )
-    _schedule_mobile_completion_notification(
+    _schedule_persisted_terminal_notification(
         conversation_id,
         turn_id,
-        final_status,
-        reporter_result,
+        persisted_run,
+        fallback_result=reporter_result,
     )
 
 
@@ -6903,7 +9463,7 @@ def start_hosted_workflow(conversation_id: str, turn_id: str) -> threading.Threa
                     except Exception as exc:
                         clean_error = sanitize_runtime_error(exc)
                         try:
-                            _persist_hosted_turn(
+                            persisted_run = _persist_hosted_turn(
                                 conversation_id,
                                 current_turn_id,
                                 patch={
@@ -6932,13 +9492,14 @@ def start_hosted_workflow(conversation_id: str, turn_id: str) -> threading.Threa
                                 },
                             )
                         except Exception:
-                            pass
-                        _schedule_mobile_completion_notification(
-                            conversation_id,
-                            current_turn_id,
-                            "failed",
-                            clean_error,
-                        )
+                            persisted_run = {}
+                        if persisted_run:
+                            _schedule_persisted_terminal_notification(
+                                conversation_id,
+                                current_turn_id,
+                                persisted_run,
+                                fallback_result=clean_error,
+                            )
             finally:
                 with _HOSTED_THREADS_LOCK:
                     _HOSTED_THREADS.pop(key, None)
@@ -7198,7 +9759,15 @@ def _public_hosted_turn(run: dict[str, Any]) -> dict[str, Any]:
             str(role): {
                 key: value
                 for key, value in remote.items()
-                if key not in {"delivery_context", "attachment_context"}
+                if key
+                not in {
+                    "delivery_context",
+                    "attachment_context",
+                    "claim_token",
+                    "lease_owner",
+                    "cancel_claim_token",
+                    "cancel_lease_owner",
+                }
             }
             for role, remote in remote_runs.items()
             if isinstance(remote, dict)
@@ -7531,6 +10100,11 @@ class HostedTurnCancellationBody(BaseModel):
     reason: str = "用户取消"
 
 
+class HostedTurnInterventionBody(BaseModel):
+    content: str
+    message_id: str = ""
+
+
 class ConnectorPullBody(BaseModel):
     connector_id: str = "dbb3-primary"
     limit: int = 5
@@ -7539,6 +10113,7 @@ class ConnectorPullBody(BaseModel):
 
 class ConnectorAckBody(BaseModel):
     connector_id: str = "dbb3-primary"
+    claim_token: str = ""
     idempotency_key: str = ""
     remote_task_id: str = ""
     root_task_id: str = ""
@@ -7549,13 +10124,15 @@ class ConnectorAckBody(BaseModel):
 
 class ConnectorStatusBody(BaseModel):
     connector_id: str = "dbb3-primary"
+    claim_token: str = ""
+    lease_seconds: int = _REMOTE_RUN_LEASE_SECONDS
     checkpoint_cursor: int = 0
     status: str = "running"
     terminal: bool = False
     summary: str = ""
     result: str = ""
     error: str = ""
-    activities: list[dict[str, Any]] = Field(default_factory=list)
+    activities: list[dict[str, object]] = Field(default_factory=list)
     remote_task_id: str = ""
     root_task_id: str = ""
     session_id: str = ""
@@ -7566,6 +10143,7 @@ class ConnectorStatusBody(BaseModel):
 
 class ConnectorCancelAckBody(BaseModel):
     connector_id: str = "dbb3-primary"
+    claim_token: str = ""
     checkpoint_cursor: int = 0
     summary: str = ""
     observed_at: str = ""
@@ -7575,6 +10153,86 @@ def _validate_connector_claim(claimed: Any, authenticated: str) -> None:
     normalized = str(claimed or "").strip()[:128]
     if normalized and normalized != authenticated:
         raise HTTPException(status_code=403, detail="Connector identity mismatch")
+
+
+def _require_remote_run_claim(
+    remote_run: dict[str, Any],
+    *,
+    connector_id: str,
+    claim_token: Any,
+    now: Optional[int] = None,
+) -> None:
+    """Require the current per-claim secret and a live lease for mutation."""
+
+    supplied = str(claim_token or "").strip()
+    expected = str(remote_run.get("claim_token") or "").strip()
+    owner = str(remote_run.get("lease_owner") or "").strip()
+    if (
+        not supplied
+        or not expected
+        or owner != connector_id
+        or not hmac.compare_digest(supplied, expected)
+    ):
+        raise HTTPException(status_code=409, detail="Remote run claim was lost")
+    if str(remote_run.get("status") or "") in _REMOTE_TERMINAL_STATUSES:
+        raise HTTPException(status_code=409, detail="Remote run claim is sealed")
+    instant = int(time.time() * 1000) if now is None else int(now)
+    if int(remote_run.get("lease_until") or 0) <= instant:
+        raise HTTPException(status_code=409, detail="Remote run lease expired")
+
+
+def _seal_remote_run_claim(
+    remote_run: dict[str, Any],
+    *,
+    now: Optional[int] = None,
+) -> None:
+    """Permanently retire execution and cancellation claims after termination."""
+
+    instant = int(time.time() * 1000) if now is None else int(now)
+    token = str(remote_run.pop("claim_token", "") or "")
+    if token:
+        remote_run["sealed_claim_sha256"] = hashlib.sha256(
+            token.encode("utf-8")
+        ).hexdigest()
+    remote_run.pop("lease_owner", None)
+    remote_run.pop("cancel_claim_token", None)
+    remote_run.pop("cancel_lease_owner", None)
+    remote_run["lease_until"] = 0
+    remote_run["cancel_lease_until"] = 0
+    remote_run["claim_sealed_at"] = instant
+
+
+def _require_active_remote_artifact_claim(
+    hosted: dict[str, Any],
+    remote_run: dict[str, Any],
+    *,
+    connector_id: str,
+    claim_token: Any,
+    now: Optional[int] = None,
+) -> None:
+    """Require an active non-cancelling run before accepting an artifact."""
+
+    hosted_status = str(hosted.get("status") or "queued").strip().lower()
+    hosted_stage = str(hosted.get("stage") or "").strip().lower()
+    remote_status = str(remote_run.get("status") or "queued").strip().lower()
+    if (
+        hosted_status in _HOSTED_TERMINAL_STATUSES
+        or hosted_status in {"cancelling", "cancel_requested"}
+        or hosted_stage in {"cancelling", "cancel_requested", "cancelled"}
+        or hosted.get("cancel_requested")
+        or remote_run.get("cancel_requested")
+        or remote_status not in _REMOTE_ARTIFACT_ACTIVE_STATUSES
+    ):
+        raise HTTPException(
+            status_code=409,
+            detail="Remote run is not active for artifact upload",
+        )
+    _require_remote_run_claim(
+        remote_run,
+        connector_id=connector_id,
+        claim_token=claim_token,
+        now=now,
+    )
 
 
 def _validate_connector_batch(
@@ -7649,13 +10307,25 @@ def _apply_remote_checkpoint(
         if location is None:
             raise HTTPException(status_code=404, detail="Remote run not found")
         conversation, hosted, role_key, remote_run = location
+        connector_id = str(payload.get("connector_id") or "").strip()[:128]
+        _require_remote_run_claim(
+            remote_run,
+            connector_id=connector_id,
+            claim_token=payload.get("claim_token"),
+        )
+        hosted_status = str(hosted.get("status") or "queued")
         current_status = str(remote_run.get("status") or "queued")
         current_cursor = int(remote_run.get("checkpoint_cursor") or 0)
+        if (
+            hosted_status in _HOSTED_TERMINAL_STATUSES
+            or hosted.get("cancel_requested")
+            or remote_run.get("cancel_requested")
+        ) and status != "cancelled":
+            raise HTTPException(
+                status_code=409,
+                detail="Remote run cancellation already won; late checkpoint rejected",
+            )
         if current_status in _REMOTE_TERMINAL_STATUSES:
-            # Completion and cancellation can cross in flight. Once terminal,
-            # every later checkpoint is an idempotent observation of the
-            # stored result rather than a contract error that kills a systemd
-            # connector configured not to restart on protocol failures.
             return dict(remote_run), False
         if (
             status == "completed"
@@ -7692,10 +10362,17 @@ def _apply_remote_checkpoint(
             remote_run["observed_at"] = observed_at[:128]
         if status == "running":
             remote_run.setdefault("started_at", now)
+            lease_seconds = max(
+                5,
+                min(
+                    int(payload.get("lease_seconds") or _REMOTE_RUN_LEASE_SECONDS),
+                    900,
+                ),
+            )
+            remote_run["lease_until"] = now + lease_seconds * 1000
         if expected_terminal:
             remote_run["completed_at"] = now
-            remote_run.pop("lease_until", None)
-            remote_run.pop("lease_owner", None)
+            _seal_remote_run_claim(remote_run, now=now)
         if status == "cancelled":
             remote_run["cancel_requested"] = True
         save_single_state(state)
@@ -7852,6 +10529,8 @@ def connector_pull_runs(payload: ConnectorPullBody, request: Request):
                     old_lease = int(remote_run.get("lease_until") or 0)
                     if status not in {"queued", "leased", "running"}:
                         continue
+                    if remote_run.get("cancel_requested"):
+                        continue
                     if status in {"leased", "running"} and old_lease > now:
                         continue
                     remote_run.update(
@@ -7863,6 +10542,7 @@ def connector_pull_runs(payload: ConnectorPullBody, request: Request):
                                 "running" if status == "running" else "leased"
                             ),
                             "lease_owner": connector_id,
+                            "claim_token": secrets.token_urlsafe(32),
                             "lease_until": lease_until,
                             "updated_at": now,
                         }
@@ -7886,17 +10566,9 @@ def connector_pull_runs(payload: ConnectorPullBody, request: Request):
 
 @router.post("/connector/runs/{remote_run_id}/ack")
 def connector_ack_run(remote_run_id: str, payload: ConnectorAckBody, request: Request):
-    conversation, hosted, remote_run = _remote_run_for_connector(request, remote_run_id)
+    conversation, hosted, _remote_run = _remote_run_for_connector(request, remote_run_id)
     connector_id = _require_connector(request)
     _validate_connector_claim(payload.connector_id, connector_id)
-    expected_key = str(remote_run.get("idempotency_key") or "")
-    supplied_key = str(payload.idempotency_key or "")
-    if supplied_key and supplied_key != expected_key:
-        raise HTTPException(status_code=409, detail="idempotency key mismatch")
-    supplied_task = str(payload.remote_task_id or "").strip()
-    existing_task = str(remote_run.get("remote_task_id") or "").strip()
-    if supplied_task and existing_task and supplied_task != existing_task:
-        raise HTTPException(status_code=409, detail="remote task mismatch")
     now = int(time.time() * 1000)
     with _STATE_LOCK:
         state = load_single_state()
@@ -7904,6 +10576,20 @@ def connector_ack_run(remote_run_id: str, payload: ConnectorAckBody, request: Re
         if location is None:
             raise HTTPException(status_code=404, detail="Remote run not found")
         _conversation, _hosted, _role_key, record = location
+        _require_remote_run_claim(
+            record,
+            connector_id=connector_id,
+            claim_token=payload.claim_token,
+            now=now,
+        )
+        expected_key = str(record.get("idempotency_key") or "")
+        supplied_key = str(payload.idempotency_key or "")
+        if supplied_key and supplied_key != expected_key:
+            raise HTTPException(status_code=409, detail="idempotency key mismatch")
+        supplied_task = str(payload.remote_task_id or "").strip()
+        existing_task = str(record.get("remote_task_id") or "").strip()
+        if supplied_task and existing_task and supplied_task != existing_task:
+            raise HTTPException(status_code=409, detail="remote task mismatch")
         if str(record.get("status") or "") in _REMOTE_TERMINAL_STATUSES:
             return {"run": _remote_run_connector_payload(record), "applied": False}
         record.update(
@@ -7964,18 +10650,29 @@ def connector_pull_cancellations(payload: ConnectorPullBody, request: Request):
             if not isinstance(conversation, dict):
                 continue
             for hosted in (conversation.get("hosted_turns") or {}).values():
-                if not isinstance(hosted, dict) or not hosted.get("cancel_requested"):
+                if not isinstance(hosted, dict):
                     continue
                 for remote_run in (hosted.get("remote_runs") or {}).values():
                     if not isinstance(remote_run, dict) or str(remote_run.get("status") or "") in _REMOTE_TERMINAL_STATUSES:
+                        continue
+                    if not (
+                        hosted.get("cancel_requested")
+                        or remote_run.get("cancel_requested")
+                    ):
                         continue
                     if _remote_run_connector_id(remote_run) != connector_id:
                         continue
                     old_lease = int(remote_run.get("cancel_lease_until") or 0)
                     if old_lease > now:
                         continue
+                    claim_token = secrets.token_urlsafe(32)
                     remote_run["cancel_lease_owner"] = connector_id
                     remote_run["cancel_lease_until"] = now + lease_seconds * 1000
+                    # Cancellation becomes the sole mutation owner and
+                    # invalidates the execution worker's previous claim.
+                    remote_run["lease_owner"] = connector_id
+                    remote_run["lease_until"] = now + lease_seconds * 1000
+                    remote_run["claim_token"] = claim_token
                     remote_run["updated_at"] = now
                     selected.append(
                         {
@@ -7985,8 +10682,21 @@ def connector_pull_cancellations(payload: ConnectorPullBody, request: Request):
                             "checkpoint_cursor": int(
                                 remote_run.get("checkpoint_cursor") or 0
                             ),
-                            "reason": hosted.get("cancel_reason") or "用户取消",
-                            "requested_at": hosted.get("cancel_requested_at") or now,
+                            "claim_token": claim_token,
+                            "reason": (
+                                remote_run.get("cancel_reason")
+                                or hosted.get("cancel_reason")
+                                or "用户取消"
+                            ),
+                            "requested_at": (
+                                remote_run.get("cancel_requested_at")
+                                or hosted.get("cancel_requested_at")
+                                or now
+                            ),
+                            "kind": str(remote_run.get("cancel_kind") or "turn"),
+                            "intervention_id": str(
+                                remote_run.get("cancel_intervention_id") or ""
+                            ),
                         }
                     )
                     changed = True
@@ -8014,11 +10724,23 @@ def connector_cancel_ack(remote_run_id: str, payload: ConnectorCancelAckBody, re
 
 @router.post("/connector/runs/{remote_run_id}/artifacts")
 async def connector_upload_artifact(remote_run_id: str, request: Request):
-    _require_connector(request)
+    connector_id = _require_connector(request)
+    claim_token = str(request.headers.get("x-claim-token") or "").strip()
     header_id = str(request.headers.get("x-remote-run-id") or "").strip()
     if header_id != remote_run_id:
         raise HTTPException(status_code=422, detail="X-Remote-Run-ID mismatch")
-    conversation, hosted, remote_run = _remote_run_for_connector(request, remote_run_id)
+    conversation, _hosted, _remote_run = _remote_run_for_connector(request, remote_run_id)
+    with _STATE_LOCK:
+        state = load_single_state()
+        location = _remote_run_location(state, remote_run_id)
+        if location is None:
+            raise HTTPException(status_code=404, detail="Remote run not found")
+        _require_active_remote_artifact_claim(
+            location[1],
+            location[3],
+            connector_id=connector_id,
+            claim_token=claim_token,
+        )
     relative_path = _connector_relative_path(request.headers.get("x-relative-path", ""))
     try:
         filename = safe_attachment_name(unquote(request.headers.get("x-filename", "")) or Path(relative_path).name)
@@ -8052,57 +10774,265 @@ async def connector_upload_artifact(remote_run_id: str, request: Request):
         actual_sha = digest.hexdigest()
         if actual_sha != expected_sha:
             raise HTTPException(status_code=422, detail="Artifact SHA-256 mismatch")
-        owner_id = str(conversation.get("owner_id") or LOCAL_OWNER_ID)
-        origin_key = f"remote:{remote_run_id}:{relative_path}:{actual_sha}"
-        record = _file_library().ingest_file(
-            owner_id,
-            temp,
-            name=filename,
-            source="model_output",
-            conversation_id=str(conversation.get("id") or ""),
-            turn_id=str(hosted.get("turn_id") or ""),
-            profile=str(remote_run.get("profile") or ""),
-            origin_key=origin_key,
-            mime_type=request.headers.get("content-type", ""),
-            allowed_roots=[temp_root],
-        )
+        library = _file_library()
+        owner_id = ""
+        record: dict[str, Any] | None = None
+        previous_record: dict[str, Any] | None = None
+        attachment: dict[str, Any] = {}
+        intent_id = f"artifact_upload_{uuid.uuid4().hex}"
+        intent: dict[str, Any] = {}
+        artifact_link_added = False
+        message_added = False
+        try:
+            # Publication is one claim-owned critical section. A pull,
+            # cancellation, or terminal checkpoint cannot rotate the claim
+            # between the file-library commit and the hosted-run linkage.
+            with _STATE_LOCK:
+                state = load_single_state()
+                location = _remote_run_location(state, remote_run_id)
+                if location is None:
+                    raise HTTPException(status_code=404, detail="Remote run not found")
+                current_conversation, current_hosted, role_key, current = location
+                _require_active_remote_artifact_claim(
+                    current_hosted,
+                    current,
+                    connector_id=connector_id,
+                    claim_token=claim_token,
+                )
+                owner_id = str(current_conversation.get("owner_id") or LOCAL_OWNER_ID)
+                origin_key = f"remote:{remote_run_id}:{relative_path}:{actual_sha}"
+                previous_record = library.get_file_by_origin(owner_id, origin_key)
+                intents = current_hosted.get("artifact_upload_intents")
+                if not isinstance(intents, dict):
+                    intents = {}
+                    current_hosted["artifact_upload_intents"] = intents
+                intent = {
+                    "id": intent_id,
+                    "status": "staging",
+                    "owner_id": owner_id,
+                    "remote_run_id": remote_run_id,
+                    "role_key": role_key,
+                    "role_stage": str(current.get("role_stage") or "worker"),
+                    "profile": str(current.get("profile") or "worker"),
+                    "origin_key": origin_key,
+                    "relative_path": relative_path,
+                    "filename": filename,
+                    "expected_sha256": actual_sha,
+                    "connector_id": connector_id,
+                    "claim_sha256": hashlib.sha256(claim_token.encode("utf-8")).hexdigest(),
+                    "previous_file_record": deepcopy(previous_record),
+                    "created_at": int(time.time() * 1000),
+                }
+                intents[intent_id] = intent
+                save_single_state(state)
+                record = library.ingest_file(
+                    owner_id,
+                    temp,
+                    name=filename,
+                    source="model_output",
+                    conversation_id=str(current_conversation.get("id") or ""),
+                    turn_id=str(current_hosted.get("turn_id") or ""),
+                    profile=str(current.get("profile") or ""),
+                    origin_key=origin_key,
+                    mime_type=request.headers.get("content-type", ""),
+                    allowed_roots=[temp_root],
+                    make_available=False,
+                )
+                if not isinstance(record, dict):
+                    raise RuntimeError("Artifact publication did not return a file record")
+                intent.update(
+                    {
+                        "status": "installed",
+                        "file_id": str(record.get("id") or ""),
+                        "installed_at": int(time.time() * 1000),
+                    }
+                )
+                save_single_state(state)
+                # A long filesystem commit may cross the lease boundary. The
+                # second check is the actual publish CAS and rolls back a new
+                # library row if the lease is no longer live.
+                _require_active_remote_artifact_claim(
+                    current_hosted,
+                    current,
+                    connector_id=connector_id,
+                    claim_token=claim_token,
+                )
+                attachment = _library_attachment(
+                    {
+                        **record,
+                        "status": "available",
+                        "available_at": int(time.time() * 1000),
+                    }
+                )
+                artifacts = current.get("artifacts")
+                if not isinstance(artifacts, list):
+                    artifacts = []
+                    current["artifacts"] = artifacts
+                if not any(
+                    isinstance(item, dict)
+                    and str(item.get("id") or "") == str(record.get("id") or "")
+                    for item in artifacts
+                ):
+                    artifacts.append(attachment)
+                    artifact_link_added = True
+                now = int(time.time() * 1000)
+                current["updated_at"] = now
+                current_conversation["updated_at"] = now
+                message_key = f"{remote_run_id}:artifact:{record.get('id')}"
+                message_meta = {
+                    "role_stage": f"{current.get('role_stage') or 'worker'}.artifact",
+                    "phase": "milestone",
+                    "message_key": message_key,
+                    "runtime_turn_id": str(current_hosted.get("turn_id") or ""),
+                    "profile": str(current.get("profile") or "worker"),
+                    "attachments": [attachment],
+                    "collapse_activities": True,
+                    "final_report": False,
+                }
+                existing_message = next(
+                    (
+                        item
+                        for item in current_conversation.get("messages") or []
+                        if isinstance(item, dict)
+                        and isinstance(item.get("meta"), dict)
+                        and str(item["meta"].get("message_key") or "") == message_key
+                    ),
+                    None,
+                )
+                if existing_message is not None:
+                    intent["previous_message"] = deepcopy(existing_message)
+                    intent["previous_message_index"] = next(
+                        (
+                            index
+                            for index, item in enumerate(current_conversation.get("messages") or [])
+                            if item is existing_message
+                        ),
+                        -1,
+                    )
+                if existing_message is None:
+                    existing_message = _append_message(
+                        current_conversation,
+                        role="assistant",
+                        name=str(current.get("profile") or "worker"),
+                        content=f"已收到交付文件：{filename}",
+                        status="completed",
+                        kind="message",
+                        meta=message_meta,
+                    )
+                    message_added = True
+                    intent["message_added"] = True
+                else:
+                    # A same-origin replay is already represented by this
+                    # exact message. Do not rewrite its display name or time.
+                    if previous_record is None:
+                        existing_message.update(
+                            {
+                                "content": f"已收到交付文件：{filename}",
+                                "status": "completed",
+                                "meta": {**existing_message.get("meta", {}), **message_meta},
+                                "updated_at": now,
+                            }
+                        )
+                        _project_native_message(existing_message)
+                        intent["message_updated"] = True
+                intent["artifact_link_added"] = artifact_link_added
+                intent["status"] = "linked"
+                intent["linked_at"] = now
+                save_single_state(state)
+                # The final publication gate is evaluated after durable links
+                # exist but before the staged file becomes account-visible.
+                # The state lock makes this check and publish one CAS section.
+                _require_active_remote_artifact_claim(
+                    current_hosted,
+                    current,
+                    connector_id=connector_id,
+                    claim_token=claim_token,
+                )
+                record = library.publish_file(owner_id, str(record.get("id") or ""))
+                intent["status"] = "committed"
+                intent["committed_at"] = int(time.time() * 1000)
+                intents.pop(intent_id, None)
+                if not intents:
+                    current_hosted.pop("artifact_upload_intents", None)
+                save_single_state(state)
+        except Exception:
+            file_rollback_complete = True
+            if record is not None and previous_record is None and owner_id:
+                try:
+                    library.delete_file(owner_id, str(record.get("id") or ""))
+                except Exception:
+                    file_rollback_complete = False
+            elif previous_record is not None:
+                try:
+                    library.restore_file_record(previous_record)
+                except Exception:
+                    file_rollback_complete = False
+            try:
+                with _STATE_LOCK:
+                    failure_state = load_single_state()
+                    failure_location = _remote_run_location(failure_state, remote_run_id)
+                    if failure_location is not None:
+                        failure_conversation, failure_hosted, _failure_role, failure_remote = (
+                            failure_location
+                        )
+                        file_id = str((record or {}).get("id") or "")
+                        if artifact_link_added and file_id:
+                            failure_remote["artifacts"] = [
+                                item
+                                for item in failure_remote.get("artifacts") or []
+                                if not (
+                                    isinstance(item, dict)
+                                    and str(item.get("id") or "") == file_id
+                                )
+                            ]
+                        if message_added and file_id:
+                            message_key = f"{remote_run_id}:artifact:{file_id}"
+                            failure_conversation["messages"] = [
+                                item
+                                for item in failure_conversation.get("messages") or []
+                                if not (
+                                    isinstance(item, dict)
+                                    and isinstance(item.get("meta"), dict)
+                                    and str(item["meta"].get("message_key") or "")
+                                    == message_key
+                                )
+                            ]
+                        elif file_id and isinstance(intent.get("previous_message"), dict):
+                            message_key = f"{remote_run_id}:artifact:{file_id}"
+                            messages = failure_conversation.get("messages") or []
+                            previous_message = deepcopy(intent["previous_message"])
+                            current_index = next(
+                                (
+                                    index
+                                    for index, item in enumerate(messages)
+                                    if isinstance(item, dict)
+                                    and isinstance(item.get("meta"), dict)
+                                    and str(item["meta"].get("message_key") or "")
+                                    == message_key
+                                ),
+                                -1,
+                            )
+                            if current_index >= 0:
+                                messages[current_index] = previous_message
+                            else:
+                                restore_index = int(intent.get("previous_message_index") or -1)
+                                messages.insert(
+                                    max(0, min(restore_index, len(messages))),
+                                    previous_message,
+                                )
+                        failure_intents = failure_hosted.get("artifact_upload_intents")
+                        if isinstance(failure_intents, dict):
+                            if file_rollback_complete:
+                                failure_intents.pop(intent_id, None)
+                            if not failure_intents:
+                                failure_hosted.pop("artifact_upload_intents", None)
+                            save_single_state(failure_state)
+            except Exception:
+                pass
+            raise
     finally:
         temp.unlink(missing_ok=True)
-    attachment = _library_attachment(record)
-    now = int(time.time() * 1000)
-    with _STATE_LOCK:
-        state = load_single_state()
-        location = _remote_run_location(state, remote_run_id)
-        if location is not None:
-            _conversation, _hosted, _role_key, current = location
-            artifacts = current.get("artifacts")
-            if not isinstance(artifacts, list):
-                artifacts = []
-                current["artifacts"] = artifacts
-            if not any(str(item.get("id") or "") == str(record.get("id") or "") for item in artifacts if isinstance(item, dict)):
-                artifacts.append(attachment)
-            current["updated_at"] = now
-            save_single_state(state)
-    _persist_hosted_turn(
-        str(conversation.get("id") or ""),
-        str(hosted.get("turn_id") or ""),
-        message={
-            "role": "assistant",
-            "name": str(remote_run.get("profile") or "worker"),
-            "content": f"已收到交付文件：{filename}",
-            "status": "completed",
-            "kind": "message",
-            "meta": {
-                "role_stage": f"{remote_run.get('role_stage') or 'worker'}.artifact",
-                "phase": "milestone",
-                "message_key": f"{remote_run_id}:artifact:{record.get('id')}",
-                "profile": str(remote_run.get("profile") or "worker"),
-                "attachments": [attachment],
-                "collapse_activities": True,
-                "final_report": False,
-            },
-        },
-    )
+    _notify_hosted_update(str(conversation.get("id") or ""))
     return {"artifact": attachment, "applied": True}
 
 
@@ -8968,6 +11898,15 @@ def enqueue_hosted_turn(
                 )
             _project_native_message(user_message)
             route_message_id = f"route_{hashlib.sha256(request_id.encode('utf-8')).hexdigest()[:20]}"
+            if any(
+                isinstance(item, dict)
+                and str(item.get("id") or "") == route_message_id
+                for item in messages
+            ):
+                raise HTTPException(
+                    status_code=409,
+                    detail="route message id already exists outside this request",
+                )
             route_record = _append_message(
                 conversation,
                 role="system",
@@ -9193,6 +12132,271 @@ def cancel_hosted_turn(
     except RuntimeError as exc:
         raise HTTPException(status_code=404, detail=str(exc)) from exc
     return {"hosted_turn": _public_hosted_turn(run)}
+
+
+@router.post(
+    "/single/conversations/{conversation_id}/hosted-turns/{turn_id}/interventions"
+)
+def intervene_hosted_turn(
+    conversation_id: str,
+    turn_id: str,
+    payload: HostedTurnInterventionBody,
+    request: Request,
+):
+    content = payload.content.strip()
+    targets = mentioned_collaboration_roles(content)
+    target_profiles = _mentioned_collaboration_profiles(content)
+    if not content:
+        raise HTTPException(status_code=400, detail="干预内容不能为空")
+    if not targets:
+        raise HTTPException(status_code=422, detail="干预消息必须 @ 一个群聊成员")
+    message_id = payload.message_id.strip()[:256] or f"intervention_{uuid.uuid4().hex[:20]}"
+    idempotency_fingerprint = hashlib.sha256(
+        json.dumps(
+            {
+                "content": content,
+                "turn_id": turn_id,
+                "targets": sorted(targets),
+                "target_profiles": sorted(target_profiles),
+                "kind": "intervention",
+            },
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode("utf-8")
+    ).hexdigest()
+    owner_id = owner_id_from_request(request)
+    with _STATE_LOCK:
+        state = load_single_state()
+        conversation, _claimed = _owned_conversation_in_state(
+            state,
+            conversation_id,
+            owner_id,
+        )
+        run = (conversation.get("hosted_turns") or {}).get(turn_id)
+        if not isinstance(run, dict):
+            raise HTTPException(status_code=404, detail="托管任务不存在")
+        interventions = run.get("interventions")
+        if not isinstance(interventions, list):
+            interventions = []
+            run["interventions"] = interventions
+        replay_intervention = next(
+            (
+                item
+                for item in interventions
+                if isinstance(item, dict) and str(item.get("id") or "") == message_id
+            ),
+            None,
+        )
+        replay_message = next(
+            (
+                item
+                for item in conversation.get("messages") or []
+                if isinstance(item, dict) and str(item.get("id") or "") == message_id
+            ),
+            None,
+        )
+        if isinstance(replay_intervention, dict):
+            replay_meta = (
+                replay_message.get("meta")
+                if isinstance(replay_message, dict)
+                and isinstance(replay_message.get("meta"), dict)
+                else {}
+            )
+            stored_fingerprint = str(
+                replay_intervention.get("idempotency_fingerprint") or ""
+            )
+            replay_matches = bool(
+                isinstance(replay_message, dict)
+                and str(replay_message.get("content") or "") == content
+                and replay_meta.get("intervention") is True
+                and str(replay_meta.get("runtime_turn_id") or "") == turn_id
+                and (
+                    hmac.compare_digest(stored_fingerprint, idempotency_fingerprint)
+                    if stored_fingerprint
+                    else (
+                        str(replay_intervention.get("content") or "") == content
+                        and sorted(
+                            str(item)
+                            for item in replay_intervention.get("targets") or []
+                        )
+                        == sorted(targets)
+                        and sorted(
+                            str(item)
+                            for item in replay_intervention.get("target_profiles") or []
+                        )
+                        == sorted(target_profiles)
+                    )
+                )
+            )
+            if not replay_matches:
+                raise HTTPException(
+                    status_code=409,
+                    detail="message_id 已用于另一条干预消息",
+                )
+            return {
+                "accepted": True,
+                "replayed": True,
+                "message": replay_message,
+                "targets": targets,
+                "hosted_turn": _public_hosted_turn(run),
+            }
+        if isinstance(replay_message, dict):
+            raise HTTPException(
+                status_code=409,
+                detail="message_id 已用于会话中的另一条消息",
+            )
+        if str(run.get("status") or "queued") in _HOSTED_TERMINAL_STATUSES:
+            raise HTTPException(status_code=409, detail="托管任务已经结束")
+        active_matches = [
+            dict(item)
+            for item in (run.get("active_roles") or {}).values()
+            if isinstance(item, dict)
+            and _intervention_matches_role(
+                {
+                    "targets": targets,
+                    "target_profiles": target_profiles,
+                },
+                role_stage=str(item.get("role_stage") or ""),
+                profile=str(item.get("profile") or ""),
+            )
+        ]
+        if len(active_matches) > 1 and not target_profiles:
+            raise HTTPException(
+                status_code=409,
+                detail="该角色当前有多个执行实例，请 @ 具体成员",
+            )
+        existing = next(
+            (
+                item
+                for item in interventions
+                if isinstance(item, dict) and str(item.get("id") or "") == message_id
+            ),
+            None,
+        )
+        message_with_id = next(
+            (
+                item
+                for item in conversation.get("messages") or []
+                if isinstance(item, dict) and str(item.get("id") or "") == message_id
+            ),
+            None,
+        )
+        if isinstance(existing, dict):
+            existing_fingerprint = str(existing.get("idempotency_fingerprint") or "")
+            if existing_fingerprint:
+                matches_existing = hmac.compare_digest(
+                    existing_fingerprint,
+                    idempotency_fingerprint,
+                )
+            else:
+                matches_existing = (
+                    str(existing.get("content") or "") == content
+                    and sorted(str(item) for item in existing.get("targets") or [])
+                    == sorted(targets)
+                    and sorted(
+                        str(item) for item in existing.get("target_profiles") or []
+                    )
+                    == sorted(target_profiles)
+                )
+            message_meta = (
+                message_with_id.get("meta")
+                if isinstance(message_with_id, dict)
+                and isinstance(message_with_id.get("meta"), dict)
+                else {}
+            )
+            matches_message = bool(
+                isinstance(message_with_id, dict)
+                and str(message_with_id.get("content") or "") == content
+                and message_meta.get("intervention") is True
+                and str(message_meta.get("runtime_turn_id") or "") == turn_id
+            )
+            if not matches_existing or not matches_message:
+                raise HTTPException(
+                    status_code=409,
+                    detail="message_id 已用于另一条干预消息",
+                )
+            message = message_with_id
+        else:
+            if isinstance(message_with_id, dict):
+                raise HTTPException(
+                    status_code=409,
+                    detail="message_id 已用于会话中的另一条消息",
+                )
+            now = int(time.time() * 1000)
+            intervention = {
+                "id": message_id,
+                "content": content,
+                "targets": targets,
+                "target_profiles": target_profiles,
+                "status": "pending",
+                "queued_for_future_stage": not bool(active_matches),
+                "idempotency_fingerprint": idempotency_fingerprint,
+                "created_at": now,
+                "updated_at": now,
+            }
+            interventions.append(intervention)
+            message = _append_message(
+                conversation,
+                role="user",
+                name="用户",
+                content=content,
+                status="completed",
+                meta={
+                    "intervention": True,
+                    "intervention_for": targets,
+                    "intervention_profiles": target_profiles,
+                    "runtime_turn_id": turn_id,
+                    "idempotency_fingerprint": idempotency_fingerprint,
+                },
+            )
+            message["id"] = message_id
+            _project_native_message(message)
+            active_remote_ids = {
+                str(item.get("remote_run_id") or "")
+                for item in active_matches
+                if isinstance(item, dict)
+                and str(item.get("execution") or "") == "remote"
+            }
+            dispatched_to: list[str] = []
+            for remote_run in (run.get("remote_runs") or {}).values():
+                if not isinstance(remote_run, dict):
+                    continue
+                remote_id = str(remote_run.get("id") or "")
+                remote_status = str(remote_run.get("status") or "queued")
+                if remote_status in _REMOTE_TERMINAL_STATUSES:
+                    continue
+                if remote_id not in active_remote_ids:
+                    continue
+                if not _intervention_matches_role(
+                    intervention,
+                    role_stage=str(remote_run.get("role_stage") or ""),
+                    profile=str(remote_run.get("profile") or ""),
+                ):
+                    continue
+                remote_run.update(
+                    {
+                        "cancel_requested": True,
+                        "cancel_kind": "intervention",
+                        "cancel_intervention_id": message_id,
+                        "cancel_reason": content[:1000],
+                        "cancel_requested_at": now,
+                        "updated_at": now,
+                    }
+                )
+                dispatched_to.append(remote_id)
+            if dispatched_to:
+                intervention["cancel_dispatched_to"] = dispatched_to
+            run["updated_at"] = now
+            conversation["updated_at"] = now
+            save_single_state(state)
+    _notify_hosted_update(conversation_id)
+    return {
+        "accepted": True,
+        "message": message,
+        "targets": targets,
+        "hosted_turn": _public_hosted_turn(run),
+    }
 
 
 def _conversation_deletion_ready(conversation: dict[str, Any]) -> bool:
@@ -9620,6 +12824,15 @@ def send_message(room_id: str, payload: SendMessageBody, request: Request):
                     requested_artifact=artifact_required,
                 )
             )
+            if any(
+                isinstance(item, dict)
+                and str(item.get("id") or "") == request_id
+                for item in conversation.get("messages") or []
+            ):
+                raise HTTPException(
+                    status_code=409,
+                    detail="message_id 已用于会话中的另一条消息",
+                )
             user_message = _append_message(
                 conversation,
                 role="user",
@@ -10045,6 +13258,217 @@ def _profile_event_runner_main() -> int:
 
 
 _FILE_LIBRARY: CloudFileLibrary | None = None
+_ARTIFACT_INTENT_RECOVERY_RUNNING = False
+
+
+def _artifact_intent_has_active_claim(
+    hosted: dict[str, Any],
+    remote: Any,
+    intent: dict[str, Any],
+    *,
+    now: int,
+) -> bool:
+    if not isinstance(remote, dict):
+        return False
+    claim_token = str(remote.get("claim_token") or "")
+    expected_digest = str(intent.get("claim_sha256") or "")
+    connector_id = str(
+        intent.get("connector_id") or remote.get("lease_owner") or ""
+    )
+    if not claim_token or not expected_digest or not connector_id:
+        return False
+    actual_digest = hashlib.sha256(claim_token.encode("utf-8")).hexdigest()
+    if not hmac.compare_digest(actual_digest, expected_digest):
+        return False
+    try:
+        _require_active_remote_artifact_claim(
+            hosted,
+            remote,
+            connector_id=connector_id,
+            claim_token=claim_token,
+            now=now,
+        )
+    except HTTPException:
+        return False
+    return True
+
+
+def _recover_connector_artifact_upload_intents(
+    library: CloudFileLibrary,
+) -> None:
+    """Finish or roll back connector artifact publication after a crash."""
+
+    global _ARTIFACT_INTENT_RECOVERY_RUNNING
+    if _ARTIFACT_INTENT_RECOVERY_RUNNING:
+        return
+    _ARTIFACT_INTENT_RECOVERY_RUNNING = True
+    changed_conversations: set[str] = set()
+    try:
+        with _STATE_LOCK:
+            state = load_single_state()
+            now = int(time.time() * 1000)
+            changed = False
+            for conversation in state.get("conversations") or []:
+                if not isinstance(conversation, dict):
+                    continue
+                owner_id = str(conversation.get("owner_id") or LOCAL_OWNER_ID)
+                for hosted in (conversation.get("hosted_turns") or {}).values():
+                    if not isinstance(hosted, dict):
+                        continue
+                    intents = hosted.get("artifact_upload_intents")
+                    if not isinstance(intents, dict) or not intents:
+                        continue
+                    for intent_id, intent in list(intents.items()):
+                        if not isinstance(intent, dict):
+                            intents.pop(intent_id, None)
+                            changed = True
+                            continue
+                        origin_key = str(intent.get("origin_key") or "")
+                        record = (
+                            library.get_file_by_origin(owner_id, origin_key)
+                            if origin_key
+                            else None
+                        )
+                        file_id = str((record or {}).get("id") or intent.get("file_id") or "")
+                        remote_id = str(intent.get("remote_run_id") or "")
+                        role_key = str(intent.get("role_key") or "")
+                        remote = (
+                            (hosted.get("remote_runs") or {}).get(role_key)
+                            if role_key
+                            else None
+                        )
+                        if not isinstance(remote, dict) or str(remote.get("id") or "") != remote_id:
+                            remote = next(
+                                (
+                                    item
+                                    for item in (hosted.get("remote_runs") or {}).values()
+                                    if isinstance(item, dict)
+                                    and str(item.get("id") or "") == remote_id
+                                ),
+                                None,
+                            )
+                        artifact_linked = bool(
+                            record
+                            and isinstance(remote, dict)
+                            and any(
+                                isinstance(item, dict)
+                                and str(item.get("id") or "") == file_id
+                                for item in remote.get("artifacts") or []
+                            )
+                        )
+                        message_linked = any(
+                            isinstance(message, dict)
+                            and isinstance(message.get("meta"), dict)
+                            and str(message["meta"].get("message_key") or "")
+                            == f"{remote_id}:artifact:{file_id}"
+                            for message in conversation.get("messages") or []
+                        )
+                        claim_active = _artifact_intent_has_active_claim(
+                            hosted,
+                            remote,
+                            intent,
+                            now=now,
+                        )
+                        publication_finished = bool(
+                            record is not None
+                            and str(record.get("status") or "") == "available"
+                            and isinstance(remote, dict)
+                            and (artifact_linked or message_linked)
+                        )
+                        if record is not None and (
+                            publication_finished
+                            or (claim_active and (artifact_linked or message_linked))
+                        ):
+                            published = library.publish_file(owner_id, file_id)
+                            attachment = _library_attachment(published)
+                            if isinstance(remote, dict) and not artifact_linked:
+                                remote.setdefault("artifacts", []).append(attachment)
+                            if not message_linked:
+                                _append_message(
+                                    conversation,
+                                    role="assistant",
+                                    name=str(intent.get("profile") or "worker"),
+                                    content=f"已收到交付文件：{intent.get('filename') or published.get('name')}",
+                                    status="completed",
+                                    kind="message",
+                                    meta={
+                                        "role_stage": f"{intent.get('role_stage') or 'worker'}.artifact",
+                                        "phase": "milestone",
+                                        "message_key": f"{remote_id}:artifact:{file_id}",
+                                        "runtime_turn_id": str(hosted.get("turn_id") or ""),
+                                        "profile": str(intent.get("profile") or "worker"),
+                                        "attachments": [attachment],
+                                        "collapse_activities": True,
+                                        "final_report": False,
+                                    },
+                                )
+                        else:
+                            if (
+                                isinstance(remote, dict)
+                                and file_id
+                                and bool(intent.get("artifact_link_added"))
+                            ):
+                                remote["artifacts"] = [
+                                    item
+                                    for item in remote.get("artifacts") or []
+                                    if not (
+                                        isinstance(item, dict)
+                                        and str(item.get("id") or "") == file_id
+                                    )
+                                ]
+                            if file_id and bool(intent.get("message_added")):
+                                message_key = f"{remote_id}:artifact:{file_id}"
+                                conversation["messages"] = [
+                                    message
+                                    for message in conversation.get("messages") or []
+                                    if not (
+                                        isinstance(message, dict)
+                                        and isinstance(message.get("meta"), dict)
+                                        and str(message["meta"].get("message_key") or "")
+                                        == message_key
+                                    )
+                                ]
+                            elif file_id and isinstance(intent.get("previous_message"), dict):
+                                message_key = f"{remote_id}:artifact:{file_id}"
+                                messages = conversation.get("messages") or []
+                                previous_message = deepcopy(intent["previous_message"])
+                                current_index = next(
+                                    (
+                                        index
+                                        for index, message in enumerate(messages)
+                                        if isinstance(message, dict)
+                                        and isinstance(message.get("meta"), dict)
+                                        and str(message["meta"].get("message_key") or "")
+                                        == message_key
+                                    ),
+                                    -1,
+                                )
+                                if current_index >= 0:
+                                    messages[current_index] = previous_message
+                                else:
+                                    restore_index = int(
+                                        intent.get("previous_message_index") or -1
+                                    )
+                                    messages.insert(
+                                        max(0, min(restore_index, len(messages))),
+                                        previous_message,
+                                    )
+                            previous_file_record = intent.get("previous_file_record")
+                            if isinstance(previous_file_record, dict):
+                                library.restore_file_record(previous_file_record)
+                            elif record is not None:
+                                library.delete_file(owner_id, file_id)
+                        intents.pop(intent_id, None)
+                        changed = True
+                        changed_conversations.add(str(conversation.get("id") or ""))
+                    if not intents:
+                        hosted.pop("artifact_upload_intents", None)
+            if changed:
+                save_single_state(state)
+    finally:
+        _ARTIFACT_INTENT_RECOVERY_RUNNING = False
+    for conversation_id in changed_conversations:
+        _notify_hosted_update(conversation_id)
 
 
 def _file_library() -> CloudFileLibrary:
@@ -10056,6 +13480,7 @@ def _file_library() -> CloudFileLibrary:
     )
     if _FILE_LIBRARY is None or _FILE_LIBRARY.root != expected_root:
         _FILE_LIBRARY = CloudFileLibrary(expected_root)
+    _recover_connector_artifact_upload_intents(_FILE_LIBRARY)
     return _FILE_LIBRARY
 
 
@@ -10424,7 +13849,7 @@ def list_account_files(
 @router.get("/files/{file_id}")
 def get_account_file(file_id: str, request: Request):
     record = _file_library().get_file(owner_id_from_request(request), file_id)
-    if record is None:
+    if record is None or str(record.get("status") or "") == "staged":
         raise HTTPException(status_code=404, detail="File not found")
     return {"file": _library_attachment(record)}
 
