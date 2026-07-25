@@ -387,7 +387,7 @@ validate_connector_health() {
 import json, sys
 data = json.load(open(sys.argv[1], encoding="utf-8"))
 assert data.get("ok") is True
-assert int(data.get("contract_version", 0)) == 1
+assert int(data.get("contract_version", 0)) == 2
 if sys.argv[3] == "1":
     assert data.get("connector_id") == sys.argv[2]
 else:

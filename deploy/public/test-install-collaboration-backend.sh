@@ -197,7 +197,7 @@ elif [[ "${url}" =~ /_hermes/installations/(dbb3|wsl)/(mi-[0-9a-f]+)$ ]]; then
   probe_id="${BASH_REMATCH[2]}"
   payload="{\"id\":\"${probe_id}\",\"node_id\":\"${node}\",\"state\":\"completed\",\"detail\":{\"probe\":true,\"persisted\":true}}"
 else
-  payload='{"ok":true,"contract_version":1,"connector_id":"dbb3-primary","capabilities":["artifact-upload","attachment-download"]}'
+  payload='{"ok":true,"contract_version":2,"connector_id":"dbb3-primary","capabilities":["artifact-upload","attachment-download"]}'
 fi
 if [[ -n "${output}" ]]; then
   printf '%s\n' "${payload}" >"${output}"
