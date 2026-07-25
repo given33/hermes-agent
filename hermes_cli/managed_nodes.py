@@ -57,14 +57,19 @@ def read_private_token(path: str | Path, *, label: str = "credential") -> str:
         raise ValueError(f"{label} file must be a regular non-symlink file")
     if _is_posix_token_runtime():
         mode = stat.S_IMODE(metadata.st_mode)
-        current_uid = os.geteuid()
+        get_effective_uid = getattr(os, "geteuid", None)
+        get_effective_gid = getattr(os, "getegid", None)
+        get_groups = getattr(os, "getgroups", None)
+        if not callable(get_effective_uid) or not callable(get_effective_gid) or not callable(get_groups):
+            raise ValueError(f"{label} ownership checks are unavailable on this platform")
+        current_uid = get_effective_uid()
         allowed_uids = {0, current_uid}
         if metadata.st_uid not in allowed_uids:
             raise ValueError(f"{label} file owner is not trusted")
         if mode not in {0o600, 0o640}:
             raise ValueError(f"{label} file mode must be 0600 or controlled 0640")
         if mode == 0o640:
-            controlled_groups = {os.getegid(), *os.getgroups()}
+            controlled_groups = {get_effective_gid(), *get_groups()}
             if metadata.st_gid not in controlled_groups:
                 raise ValueError(f"{label} file group is not available to this service")
     try:

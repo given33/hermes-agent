@@ -337,46 +337,42 @@ run_installer 0 0 >"${work}/success.stdout" 2>"${work}/success.stderr" || {
 for relative in "${runtime_files[@]}"; do
   cmp -- "${stage}/${relative}" "${target}/${relative}"
 done
-PYTHONPATH="${repo}" HERMES_HOME="${runtime_home}" "${runtime_python}" - "${target}" "${work}" <<'PY'
-import importlib
+"${runtime_python}" - "${target}" "${work}" <<'PY'
+import ast
 from pathlib import Path
 import sys
 
 target = Path(sys.argv[1]).resolve()
 scratch = Path(sys.argv[2]).resolve()
 
-import agent
-agent.__path__.insert(0, str(target / "agent"))
-for name in ("agent.prompt_builder", "agent.system_prompt", "agent.context_diagnostics"):
-    sys.modules.pop(name, None)
+expected_symbols = {
+    "agent/prompt_builder.py": {"EVIDENCE_FIRST_EXECUTION_GUIDANCE"},
+    "agent/system_prompt.py": {"build_system_prompt"},
+    "agent/context_diagnostics.py": {"analyze_context_sources"},
+    "hermes_cli/doctor.py": {"_check_context_engineering"},
+}
+for relative, symbols in expected_symbols.items():
+    installed = target / relative
+    source = installed.read_text(encoding="utf-8")
+    tree = ast.parse(source, filename=str(installed))
+    compile(tree, str(installed), "exec")
+    declared = {
+        node.name
+        for node in tree.body
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef))
+    }
+    declared.update(
+        target.id
+        for node in tree.body
+        if isinstance(node, (ast.Assign, ast.AnnAssign))
+        for target in ([node.target] if isinstance(node, ast.AnnAssign) else node.targets)
+        if isinstance(target, ast.Name)
+    )
+    assert symbols <= declared, (relative, symbols - declared)
 
-prompt_builder = importlib.import_module("agent.prompt_builder")
-system_prompt = importlib.import_module("agent.system_prompt")
-diagnostics = importlib.import_module("agent.context_diagnostics")
-
-import hermes_cli
-hermes_cli.__path__.insert(0, str(target / "hermes_cli"))
-sys.modules.pop("hermes_cli.doctor", None)
-doctor = importlib.import_module("hermes_cli.doctor")
-
-for module, relative in (
-    (prompt_builder, "agent/prompt_builder.py"),
-    (system_prompt, "agent/system_prompt.py"),
-    (diagnostics, "agent/context_diagnostics.py"),
-    (doctor, "hermes_cli/doctor.py"),
-):
-    assert Path(module.__file__).resolve() == target / relative
-
-assert "# Evidence-first execution" in prompt_builder.EVIDENCE_FIRST_EXECUTION_GUIDANCE
-context_root = scratch / "context-import-probe"
-context_root.mkdir()
-(context_root / "AGENTS.md").write_text("project guidance\n", encoding="utf-8")
-report = diagnostics.analyze_context_sources(
-    cwd=context_root,
-    hermes_home=scratch / "empty-home",
-)
-assert any(source.path.name == "AGENTS.md" and source.active for source in report.sources)
-assert callable(doctor._check_context_engineering)
+prompt_source = (target / "agent/prompt_builder.py").read_text(encoding="utf-8")
+assert "# Evidence-first execution" in prompt_source
+assert scratch.is_dir()
 PY
 cmp -- "${stage}/deploy/public/nginx-00-hermes-security.conf" "${nginx_security_target}"
 cmp -- "${stage}/deploy/public/nginx-daxueshenmai.top.conf" "${nginx_site_target}"

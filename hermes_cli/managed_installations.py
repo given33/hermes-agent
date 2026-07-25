@@ -1441,14 +1441,20 @@ def _terminate_process_group(process: subprocess.Popen[Any]) -> None:
                 creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
             )
         else:
-            os.killpg(process.pid, signal.SIGTERM)
+            kill_process_group = getattr(os, "killpg", None)
+            if not callable(kill_process_group):
+                raise OSError("process-group termination is unavailable")
+            kill_process_group(process.pid, signal.SIGTERM)
         process.wait(timeout=1)
     except (OSError, subprocess.TimeoutExpired):
         try:
             if os.name == "nt":
                 process.kill()
             else:
-                os.killpg(process.pid, signal.SIGKILL)
+                kill_process_group = getattr(os, "killpg", None)
+                if not callable(kill_process_group):
+                    raise OSError("process-group termination is unavailable")
+                kill_process_group(process.pid, getattr(signal, "SIGKILL", signal.SIGTERM))
             process.wait(timeout=2)
         except (OSError, subprocess.TimeoutExpired):
             pass
