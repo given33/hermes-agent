@@ -12,6 +12,7 @@ import ipaddress
 import json
 import math
 import os
+import stat
 import subprocess
 import threading
 import time
@@ -32,10 +33,56 @@ DEFAULT_RECOVERY_COOLDOWN_SECONDS = 90.0
 _RECOVERY_LOCK = threading.Lock()
 _RECOVERY_LAST_ATTEMPT: dict[str, float] = {}
 _RECOVERY_RECEIVER_LOCK = threading.Lock()
+MIN_MANAGED_TOKEN_LENGTH = 32
+MAX_MANAGED_TOKEN_LENGTH = 4096
+
+
+def _is_posix_token_runtime() -> bool:
+    return os.name == "posix"
 
 
 def managed_nodes_config_path() -> Path:
     return Path(get_hermes_home()) / "managed-nodes.json"
+
+
+def read_private_token(path: str | Path, *, label: str = "credential") -> str:
+    """Read a single-line credential from a non-symlink private file."""
+
+    token_path = Path(path).expanduser()
+    try:
+        metadata = token_path.lstat()
+    except OSError as exc:
+        raise ValueError(f"{label} file is missing or unreadable") from exc
+    if stat.S_ISLNK(metadata.st_mode) or not stat.S_ISREG(metadata.st_mode):
+        raise ValueError(f"{label} file must be a regular non-symlink file")
+    if _is_posix_token_runtime():
+        mode = stat.S_IMODE(metadata.st_mode)
+        current_uid = os.geteuid()
+        allowed_uids = {0, current_uid}
+        if metadata.st_uid not in allowed_uids:
+            raise ValueError(f"{label} file owner is not trusted")
+        if mode not in {0o600, 0o640}:
+            raise ValueError(f"{label} file mode must be 0600 or controlled 0640")
+        if mode == 0o640:
+            controlled_groups = {os.getegid(), *os.getgroups()}
+            if metadata.st_gid not in controlled_groups:
+                raise ValueError(f"{label} file group is not available to this service")
+    try:
+        raw = token_path.read_text(encoding="utf-8")
+    except (OSError, UnicodeError) as exc:
+        raise ValueError(f"{label} file is missing or unreadable") from exc
+    lines = raw.splitlines()
+    if len(lines) != 1 or raw.rstrip("\r\n") != lines[0]:
+        raise ValueError(f"{label} must contain exactly one line")
+    token = lines[0]
+    if token != token.strip():
+        raise ValueError(f"{label} must not contain surrounding whitespace")
+    if not (MIN_MANAGED_TOKEN_LENGTH <= len(token) <= MAX_MANAGED_TOKEN_LENGTH):
+        raise ValueError(
+            f"{label} length must be between {MIN_MANAGED_TOKEN_LENGTH} and "
+            f"{MAX_MANAGED_TOKEN_LENGTH} characters"
+        )
+    return token
 
 
 def load_managed_nodes_config(path: Path | None = None) -> list[dict[str, Any]]:
@@ -57,18 +104,31 @@ def load_managed_nodes_config(path: Path | None = None) -> list[dict[str, Any]]:
         node_id = str(raw.get("id") or "").strip().lower()
         url = str(raw.get("status_url") or "").strip()
         token_file = str(raw.get("token_file") or "").strip()
+        raw_installation_token_file = raw.get("installation_token_file")
+        installation_token_file = (
+            str(raw_installation_token_file).strip()
+            if raw_installation_token_file is not None
+            else ""
+        )
         recovery_url = str(raw.get("recovery_url") or "").strip()
         raw_recovery_urls = raw.get("recovery_urls") or {}
+        raw_installation_urls = raw.get("installation_urls") or {}
         if not node_id or node_id in seen:
             raise ValueError("managed node ids must be non-empty and unique")
         if not (url.startswith("http://") or url.startswith("https://")):
             raise ValueError(f"managed node {node_id!r} requires an HTTP(S) status_url")
         if not token_file:
             raise ValueError(f"managed node {node_id!r} requires token_file")
+        if raw_installation_token_file is not None and not installation_token_file:
+            raise ValueError(
+                f"managed node {node_id!r} installation_token_file must be non-empty"
+            )
         if recovery_url and not _is_secure_recovery_url(recovery_url):
             raise ValueError(f"managed node {node_id!r} has an invalid recovery_url")
         if not isinstance(raw_recovery_urls, dict):
             raise ValueError(f"managed node {node_id!r} recovery_urls must be an object")
+        if not isinstance(raw_installation_urls, dict):
+            raise ValueError(f"managed node {node_id!r} installation_urls must be an object")
         recovery_urls: dict[str, str] = {}
         for target, target_url in raw_recovery_urls.items():
             normalized_target = str(target).strip().lower()
@@ -79,6 +139,40 @@ def load_managed_nodes_config(path: Path | None = None) -> list[dict[str, Any]]:
             ):
                 raise ValueError(f"managed node {node_id!r} has an invalid recovery_urls entry")
             recovery_urls[normalized_target] = normalized_url
+        installation_urls: dict[str, str] = {}
+        for target, target_url in raw_installation_urls.items():
+            normalized_target = str(target).strip().lower()
+            normalized_url = str(target_url or "").strip()
+            if (
+                normalized_target not in {"dbb3", "wsl"}
+                or not _is_secure_recovery_url(normalized_url)
+            ):
+                raise ValueError(f"managed node {node_id!r} has an invalid installation_urls entry")
+            installation_urls[normalized_target] = normalized_url
+        if installation_urls:
+            if not installation_token_file:
+                raise ValueError(
+                    f"managed node {node_id!r} requires installation_token_file "
+                    "when installation_urls are configured"
+                )
+            if (
+                Path(installation_token_file).expanduser().resolve(strict=False)
+                == Path(token_file).expanduser().resolve(strict=False)
+            ):
+                raise ValueError(
+                    f"managed node {node_id!r} must not reuse token_file as "
+                    "installation_token_file"
+                )
+            status_token = read_private_token(token_file, label="managed-node status credential")
+            installation_token = read_private_token(
+                installation_token_file,
+                label="managed installation credential",
+            )
+            if hmac.compare_digest(status_token, installation_token):
+                raise ValueError(
+                    f"managed node {node_id!r} must use different status and "
+                    "installation credential contents"
+                )
         timeout = float(raw.get("timeout_seconds") or DEFAULT_TIMEOUT_SECONDS)
         if not math.isfinite(timeout) or timeout <= 0 or timeout > 15:
             raise ValueError(f"managed node {node_id!r} has an invalid timeout")
@@ -93,9 +187,11 @@ def load_managed_nodes_config(path: Path | None = None) -> list[dict[str, Any]]:
             "label": str(raw.get("label") or node_id).strip() or node_id,
             "status_url": url,
             "token_file": token_file,
+            "installation_token_file": installation_token_file,
             "timeout_seconds": timeout,
             "recovery_url": recovery_url,
             "recovery_urls": recovery_urls,
+            "installation_urls": installation_urls,
             "auto_recover": raw.get("auto_recover") is not False,
             "recovery_cooldown_seconds": recovery_cooldown,
         })

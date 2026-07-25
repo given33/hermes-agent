@@ -12,6 +12,12 @@ from hermes_cli.managed_nodes import (
     accept_managed_node_recovery,
     load_managed_node_recovery_config,
 )
+from hermes_cli.managed_installations import (
+    accept_managed_installation,
+    get_received_managed_installation,
+    load_managed_installation_receiver_config,
+    resume_received_managed_installations,
+)
 
 
 MAX_REQUEST_BYTES = 64 * 1024
@@ -21,28 +27,85 @@ class RecoveryHTTPServer(ThreadingHTTPServer):
     daemon_threads = True
 
     def __init__(self, address: tuple[str, int], config_path: Path | None):
+        recovery_config = load_managed_node_recovery_config(config_path)
+        installation_config = load_managed_installation_receiver_config(config_path)
         super().__init__(address, RecoveryRequestHandler)
         self.config_path = config_path
+        self.recovery_config = recovery_config
+        self.installation_config = installation_config
+        if installation_config is not None:
+            resume_received_managed_installations(config_path)
 
 
 class RecoveryRequestHandler(BaseHTTPRequestHandler):
     server: RecoveryHTTPServer
 
     def do_GET(self) -> None:
+        if self.path.startswith("/installations/"):
+            if self.server.installation_config is None:
+                self._json(404, {"error": "not_found"})
+                return
+            operation_id = self.path.removeprefix("/installations/").split("?", 1)[0]
+            if not operation_id:
+                self._json(404, {"error": "not_found"})
+                return
+            try:
+                result = get_received_managed_installation(
+                    operation_id,
+                    self.headers.get("X-DBB3-Token", ""),
+                    self.server.config_path,
+                )
+            except PermissionError:
+                self._json(401, {"error": "invalid_credential"})
+                return
+            except KeyError:
+                self._json(404, {"error": "not_found"})
+                return
+            except (ValueError, RuntimeError) as exc:
+                self._json(503, {"error": str(exc)[:256]})
+                return
+            self._json(200, result)
+            return
         if self.path != "/health":
             self._json(404, {"error": "not_found"})
             return
-        try:
-            config = load_managed_node_recovery_config(self.server.config_path)
-        except ValueError:
-            config = None
+        recovery = self.server.recovery_config
+        installation = self.server.installation_config
+        if installation is not None:
+            try:
+                # This is a read-only authenticated capability probe. It verifies
+                # the dedicated installation credential without creating work.
+                from hermes_cli.managed_installations import _authenticate_receiver
+
+                _authenticate_receiver(
+                    installation,
+                    self.headers.get("X-DBB3-Token", ""),
+                )
+            except PermissionError:
+                self._json(401, {"error": "invalid_credential"})
+                return
+            except (ValueError, RuntimeError) as exc:
+                self._json(503, {"error": str(exc)[:256]})
+                return
+        config = recovery or installation
         self._json(200 if config else 503, {
             "ok": config is not None,
             "node_id": str((config or {}).get("node_id") or ""),
+            "recovery": recovery is not None,
+            "installations": installation is not None,
         })
 
     def do_POST(self) -> None:
-        if self.path != "/recover":
+        if self.path not in {"/recover", "/installations"}:
+            self._json(404, {"error": "not_found"})
+            return
+        if (
+            (self.path == "/recover" and self.server.recovery_config is None)
+            or (
+                self.path == "/installations"
+                and self.server.installation_config is None
+            )
+        ):
             self._json(404, {"error": "not_found"})
             return
         try:
@@ -56,11 +119,18 @@ class RecoveryRequestHandler(BaseHTTPRequestHandler):
             payload = json.loads(self.rfile.read(length).decode("utf-8"))
             if not isinstance(payload, dict):
                 raise ValueError("request body must be an object")
-            result = accept_managed_node_recovery(
-                payload,
-                self.headers.get("X-DBB3-Token", ""),
-                self.server.config_path,
-            )
+            if self.path == "/installations":
+                result = accept_managed_installation(
+                    payload,
+                    self.headers.get("X-DBB3-Token", ""),
+                    self.server.config_path,
+                )
+            else:
+                result = accept_managed_node_recovery(
+                    payload,
+                    self.headers.get("X-DBB3-Token", ""),
+                    self.server.config_path,
+                )
         except PermissionError:
             self._json(401, {"error": "invalid_credential"})
             return

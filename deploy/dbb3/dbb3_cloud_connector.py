@@ -29,7 +29,7 @@ from datetime import datetime, timezone
 from typing import Any, Callable, Iterable
 
 
-CONTRACT_VERSION = 1
+CONTRACT_VERSION = 2
 MAX_ARTIFACT_BYTES = 64 * 1024 * 1024
 TERMINAL_STATUSES = {"completed", "failed", "cancelled"}
 _SAFE_NAME_RE = re.compile(r"[^A-Za-z0-9._-]+")
@@ -300,6 +300,7 @@ class CloudRelayClient:
             method="POST",
             payload={
                 "connector_id": self.connector_id,
+                "claim_token": _text(run.get("claim_token"), 256),
                 "idempotency_key": _text(run.get("idempotency_key"), 512),
                 "remote_task_id": _text(local.get("remote_task_id"), 256),
                 "root_task_id": _text(local.get("root_task_id"), 256),
@@ -346,6 +347,7 @@ class CloudRelayClient:
         self,
         remote_run_id: str,
         *,
+        claim_token: str,
         relative_path: str,
         filename: str,
         sha256: str,
@@ -362,6 +364,7 @@ class CloudRelayClient:
             headers={
                 "Content-Type": media_type or "application/octet-stream",
                 "X-Remote-Run-ID": _text(remote_run_id, 256),
+                "X-Claim-Token": _text(claim_token, 256),
                 "X-Relative-Path": relative_header,
                 "X-Filename": filename_header,
                 "X-Content-SHA256": sha256,
@@ -1386,15 +1389,25 @@ class DBB3CloudConnector:
         if not remote_id:
             return {}
         current = state.setdefault("runs", {}).setdefault(remote_id, {})
+        previous_claim = _text(current.get("claim_token"), 256)
+        claim_token = _text(run_payload.get("claim_token"), 256)
+        if not claim_token:
+            raise RuntimeError("Cloud run is missing the contract-v2 claim token")
         current.update(
             {
                 "remote_run_id": remote_id,
                 "idempotency_key": _text(run_payload.get("idempotency_key"), 512),
                 "profile": _text(run_payload.get("profile"), 128),
                 "artifact_required": bool(run_payload.get("artifact_required")),
+                "claim_token": claim_token,
                 "status": current.get("status") or "running",
             }
         )
+        if previous_claim and previous_claim != claim_token:
+            current["acked"] = False
+            pending = current.get("pending_status")
+            if isinstance(pending, dict):
+                pending["claim_token"] = claim_token
         if not current.get("root_task_id"):
             attachment_paths = self._materialize_attachments(run_payload, current, state)
             objective_path = self._write_objective_file(run_payload, current, state)
@@ -1489,6 +1502,8 @@ class DBB3CloudConnector:
                 break
         payload = {
             "connector_id": self.cloud_client.connector_id,
+            "claim_token": _text(local.get("claim_token"), 256),
+            "lease_seconds": 90,
             "checkpoint_cursor": int(local.get("checkpoint_cursor") or 0) + 1,
             "status": status,
             "terminal": status in TERMINAL_STATUSES,
@@ -1559,6 +1574,7 @@ class DBB3CloudConnector:
                 media_type = mimetypes.guess_type(filename)[0] or media_type
                 self.cloud_client.upload_artifact(
                     remote_id,
+                    claim_token=_text(local.get("claim_token"), 256),
                     relative_path=relative,
                     filename=filename,
                     sha256=digest,
@@ -1751,6 +1767,7 @@ class DBB3CloudConnector:
                 item,
                 {
                     "connector_id": self.cloud_client.connector_id,
+                    "claim_token": _text(item.get("claim_token"), 256),
                     "checkpoint_cursor": cursor,
                     "summary": _text(output, 1000) or "Cancellation applied",
                     "observed_at": self.clock(),
@@ -1815,6 +1832,7 @@ class DBB3CloudConnector:
                         remote_id,
                         {
                             "connector_id": self.cloud_client.connector_id,
+                            "claim_token": _text(local.get("claim_token"), 256),
                             "checkpoint_cursor": cursor,
                             "error": _text(exc, 1000),
                             "summary": "DBB3 could not create the Kanban root",

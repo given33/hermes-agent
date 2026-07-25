@@ -43,6 +43,9 @@ _HERMES_CORE_TOOLS = [
     "vision_analyze", "image_generate",
     # Skills
     "skills_list", "skill_view", "skill_manage",
+    # Main-server durable fleet installation. Its availability probe hides it
+    # on DBB3/WSL runtimes that do not own managed-node routes.
+    "managed_installation",
     # Browser automation
     "browser_navigate", "browser_snapshot", "browser_click",
     "browser_type", "browser_scroll", "browser_back",

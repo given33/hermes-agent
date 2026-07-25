@@ -49,11 +49,20 @@ required=(
   "hermes_cli/dashboard_auth/token_auth.py"
   "hermes_cli/dashboard_auth/mobile_device_store.py"
   "hermes_cli/dashboard_auth/mobile_notifications.py"
+  "hermes_cli/managed_installations.py"
+  "hermes_cli/managed_nodes.py"
   "hermes_cli/web_server.py"
+  "tools/managed_installation_tool.py"
+  "toolsets.py"
   "agent/agent_init.py"
+  "agent/prompt_builder.py"
+  "agent/system_prompt.py"
+  "agent/context_diagnostics.py"
+  "hermes_cli/doctor.py"
   "tui_gateway/server.py"
   "deploy/public/nginx-00-hermes-security.conf"
   "deploy/public/nginx-daxueshenmai.top.conf"
+  "deploy/public/managed-nodes.server.json"
 )
 # The iOS intelligence release is staged alongside the collaboration release.
 # Keep this list optional for one-release rollback compatibility: an older
@@ -73,7 +82,6 @@ ios_optional=(
   "hermes_cli/dashboard_auth/owner_mobile.py"
   "hermes_cli/dashboard_auth/registry.py"
   "hermes_cli/profiles.py"
-  "hermes_cli/managed_nodes.py"
   "hermes_cli/managed_node_recovery_service.py"
   "plugins/dashboard_auth/basic/__init__.py"
   "tools/mcp_tool.py"
@@ -142,8 +150,16 @@ PY
   "${snapshot}/hermes_cli/dashboard_auth/token_auth.py" \
   "${snapshot}/hermes_cli/dashboard_auth/mobile_device_store.py" \
   "${snapshot}/hermes_cli/dashboard_auth/mobile_notifications.py" \
+  "${snapshot}/hermes_cli/managed_installations.py" \
+  "${snapshot}/hermes_cli/managed_nodes.py" \
   "${snapshot}/hermes_cli/web_server.py" \
+  "${snapshot}/tools/managed_installation_tool.py" \
+  "${snapshot}/toolsets.py" \
   "${snapshot}/agent/agent_init.py" \
+  "${snapshot}/agent/prompt_builder.py" \
+  "${snapshot}/agent/system_prompt.py" \
+  "${snapshot}/agent/context_diagnostics.py" \
+  "${snapshot}/hermes_cli/doctor.py" \
   "${snapshot}/tui_gateway/server.py" <<'PY'
 import pathlib, sys
 for name in sys.argv[1:]:
@@ -187,8 +203,16 @@ public_paths_target="${target_root}/hermes_cli/dashboard_auth/public_paths.py"
 token_auth_target="${target_root}/hermes_cli/dashboard_auth/token_auth.py"
 mobile_device_store_target="${target_root}/hermes_cli/dashboard_auth/mobile_device_store.py"
 mobile_notifications_target="${target_root}/hermes_cli/dashboard_auth/mobile_notifications.py"
+managed_installations_target="${target_root}/hermes_cli/managed_installations.py"
+managed_nodes_code_target="${target_root}/hermes_cli/managed_nodes.py"
 web_server_target="${target_root}/hermes_cli/web_server.py"
+managed_installation_tool_target="${target_root}/tools/managed_installation_tool.py"
+toolsets_target="${target_root}/toolsets.py"
 agent_init_target="${target_root}/agent/agent_init.py"
+prompt_builder_target="${target_root}/agent/prompt_builder.py"
+system_prompt_target="${target_root}/agent/system_prompt.py"
+context_diagnostics_target="${target_root}/agent/context_diagnostics.py"
+doctor_target="${target_root}/hermes_cli/doctor.py"
 tui_gateway_target="${target_root}/tui_gateway/server.py"
 nginx_security_target="${HERMES_NGINX_SECURITY_TARGET:-/etc/nginx/conf.d/00-hermes-security.conf}"
 nginx_site_target="${HERMES_NGINX_SITE_TARGET:-/etc/nginx/conf.d/daxueshenmai.top.conf}"
@@ -274,6 +298,43 @@ ios_supervisor_target="${runtime_home}/ios-mcp-supervisor.db"
 ios_database_target="${runtime_home}/ios-intelligence.db"
 mobile_auth_target="${runtime_home}/dashboard/mobile-auth.db"
 cloud_files_database_target="${runtime_home}/collaboration/account-files/library.sqlite3"
+managed_installations_database_target="${runtime_home}/managed-installations.db"
+managed_nodes_target="${runtime_home}/managed-nodes.json"
+managed_node_token_file="${HERMES_MANAGED_NODE_TOKEN_FILE:-/etc/hermes-agent/dbb3-status-token}"
+managed_installation_token_file="${HERMES_MANAGED_INSTALLATION_TOKEN_FILE:-/etc/hermes-agent/managed-installation-token}"
+[[ "${managed_node_token_file}" != "${managed_installation_token_file}" ]] \
+  || die "status and installation credentials must use different files"
+validate_managed_token_file() {
+  local credential_file="$1" label="$2"
+  [[ "${credential_file}" == /* && -f "${credential_file}" && ! -L "${credential_file}" ]] \
+    || die "${label} credential path is missing or unsafe"
+  [[ "$(stat -c '%U' "${credential_file}")" == root ]] \
+    || die "${label} credential must be root-owned"
+  [[ "$(stat -c '%G' "${credential_file}")" == "${service_group}" ]] \
+    || die "${label} credential group must be ${service_group}"
+  [[ "$(stat -c '%a' "${credential_file}")" == 640 ]] \
+    || die "${label} credential mode must be 0640"
+  local credential_value
+  credential_value="$(cat -- "${credential_file}")"
+  (( ${#credential_value} >= 32 && ${#credential_value} <= 4096 )) \
+    || die "${label} credential length must be 32..4096 characters"
+  [[ "${credential_value}" != *$'\n'* && "${credential_value}" != *$'\r'* ]] \
+    || die "${label} credential must contain exactly one line"
+  printf '%s\n' "${credential_value}" | cmp -s -- - "${credential_file}" \
+    || die "${label} credential must have one newline-terminated line"
+  unset credential_value
+}
+for credential_file in "${managed_node_token_file}" "${managed_installation_token_file}"; do
+  runuser -u "${service_user}" -- test -r "${credential_file}" \
+    || die "managed-node credential is not readable by ${service_user}"
+done
+validate_managed_token_file "${managed_node_token_file}" status
+validate_managed_token_file "${managed_installation_token_file}" installation
+for existing_credential in "${managed_node_token_file}" "${token_file}"; do
+  if cmp -s -- "${existing_credential}" "${managed_installation_token_file}"; then
+    die "managed installation credentials must be dedicated"
+  fi
+done
 if [[ "${ios_enabled}" == 1 ]]; then
   ios_database_target="$("${runtime_python}" - "${config_target}" "${runtime_home}" "${service_home}" <<'PY'
 import pathlib
@@ -381,10 +442,13 @@ install -d -o "${service_user}" -g "${service_group}" -m 0755 "${plugin_target}/
 install -d -o "${service_user}" -g "${service_group}" -m 0755 "${target_root}/agent"
 install -d -o "${service_user}" -g "${service_group}" -m 0755 "${target_root}/hermes_cli/dashboard_auth"
 install -d -o "${service_user}" -g "${service_group}" -m 0755 "${target_root}/tui_gateway"
+install -d -o "${service_user}" -g "${service_group}" -m 0755 "${target_root}/tools"
+install -d -o "${service_user}" -g "${service_group}" -m 0700 "${runtime_home}"
 mkdir -p \
   "${backup}/plugins/collaboration/dashboard/dist" \
   "${backup}/agent" \
   "${backup}/hermes_cli/dashboard_auth" \
+  "${backup}/tools" \
   "${backup}/tui_gateway" \
   "${backup}/nginx" \
   "${backup}/state"
@@ -436,8 +500,16 @@ backup_one "${public_paths_target}" "${backup}/hermes_cli/dashboard_auth/public_
 backup_one "${token_auth_target}" "${backup}/hermes_cli/dashboard_auth/token_auth.py"
 backup_one "${mobile_device_store_target}" "${backup}/hermes_cli/dashboard_auth/mobile_device_store.py"
 backup_one "${mobile_notifications_target}" "${backup}/hermes_cli/dashboard_auth/mobile_notifications.py"
+backup_one "${managed_installations_target}" "${backup}/hermes_cli/managed_installations.py"
+backup_one "${managed_nodes_code_target}" "${backup}/hermes_cli/managed_nodes.py"
 backup_one "${web_server_target}" "${backup}/hermes_cli/web_server.py"
+backup_one "${managed_installation_tool_target}" "${backup}/tools/managed_installation_tool.py"
+backup_one "${toolsets_target}" "${backup}/toolsets.py"
 backup_one "${agent_init_target}" "${backup}/agent/agent_init.py"
+backup_one "${prompt_builder_target}" "${backup}/agent/prompt_builder.py"
+backup_one "${system_prompt_target}" "${backup}/agent/system_prompt.py"
+backup_one "${context_diagnostics_target}" "${backup}/agent/context_diagnostics.py"
+backup_one "${doctor_target}" "${backup}/hermes_cli/doctor.py"
 backup_one "${tui_gateway_target}" "${backup}/tui_gateway/server.py"
 backup_one "${nginx_security_target}" "${backup}/nginx/00-hermes-security.conf"
 backup_one "${nginx_site_target}" "${backup}/nginx/daxueshenmai.top.conf"
@@ -499,13 +571,23 @@ rollback() {
       rollback_step token-auth restore_one "${backup}/hermes_cli/dashboard_auth/token_auth.py" "${token_auth_target}"
       rollback_step mobile-device-store restore_one "${backup}/hermes_cli/dashboard_auth/mobile_device_store.py" "${mobile_device_store_target}"
       rollback_step mobile-notifications restore_one "${backup}/hermes_cli/dashboard_auth/mobile_notifications.py" "${mobile_notifications_target}"
+      rollback_step managed-installations-code restore_one "${backup}/hermes_cli/managed_installations.py" "${managed_installations_target}"
+      rollback_step managed-nodes-code restore_one "${backup}/hermes_cli/managed_nodes.py" "${managed_nodes_code_target}"
       rollback_step web-server restore_one "${backup}/hermes_cli/web_server.py" "${web_server_target}"
+      rollback_step managed-installation-tool restore_one "${backup}/tools/managed_installation_tool.py" "${managed_installation_tool_target}"
+      rollback_step toolsets restore_one "${backup}/toolsets.py" "${toolsets_target}"
       rollback_step agent-init restore_one "${backup}/agent/agent_init.py" "${agent_init_target}"
+      rollback_step prompt-builder restore_one "${backup}/agent/prompt_builder.py" "${prompt_builder_target}"
+      rollback_step system-prompt restore_one "${backup}/agent/system_prompt.py" "${system_prompt_target}"
+      rollback_step context-diagnostics restore_one "${backup}/agent/context_diagnostics.py" "${context_diagnostics_target}"
+      rollback_step doctor restore_one "${backup}/hermes_cli/doctor.py" "${doctor_target}"
       rollback_step tui-gateway restore_one "${backup}/tui_gateway/server.py" "${tui_gateway_target}"
       rollback_step nginx-security restore_root_file "${backup}/nginx/00-hermes-security.conf" "${nginx_security_target}"
       rollback_step nginx-site restore_root_file "${backup}/nginx/daxueshenmai.top.conf" "${nginx_site_target}"
       rollback_step cloud-files-db restore_sqlite "${backup}/state/cloud-files-library.sqlite3" "${cloud_files_database_target}"
       rollback_step mobile-auth-db restore_sqlite "${backup}/state/mobile-auth.db" "${mobile_auth_target}"
+      rollback_step managed-installations-db restore_sqlite "${backup}/state/managed-installations.db" "${managed_installations_database_target}"
+      rollback_step managed-nodes-config restore_state "${backup}/state/managed-nodes.json" "${managed_nodes_target}"
       if [[ "${ios_enabled}" == 1 ]]; then
         for relative in "${ios_optional[@]}"; do
           rollback_step "${relative}" restore_one "${backup}/${relative}" "${target_root}/${relative}"
@@ -535,6 +617,11 @@ rollback() {
   [[ -z "${handshake_file:-}" ]] || rm -f -- "${handshake_file}"
   [[ -z "${ios_health_file:-}" ]] || rm -f -- "${ios_health_file}"
   [[ -z "${connector_health_file:-}" ]] || rm -f -- "${connector_health_file}"
+  [[ -z "${installation_health_cfg:-}" ]] || rm -f -- "${installation_health_cfg}"
+  [[ -z "${node_health:-}" ]] || rm -f -- "${node_health}"
+  [[ -z "${installation_probe_body:-}" ]] || rm -f -- "${installation_probe_body}"
+  [[ -z "${installation_probe_post:-}" ]] || rm -f -- "${installation_probe_post}"
+  [[ -z "${installation_probe_get:-}" ]] || rm -f -- "${installation_probe_get}"
   rm -f -- "${curl_cfg}"
   cleanup_snapshot
   if [[ "${rollback_failed}" != 0 ]]; then
@@ -625,6 +712,8 @@ systemctl stop "${service}"
 backup_one "${state_target}" "${backup}/state/single.json"
 backup_sqlite "${cloud_files_database_target}" "${backup}/state/cloud-files-library.sqlite3"
 backup_sqlite "${mobile_auth_target}" "${backup}/state/mobile-auth.db"
+backup_sqlite "${managed_installations_database_target}" "${backup}/state/managed-installations.db"
+backup_one "${managed_nodes_target}" "${backup}/state/managed-nodes.json"
 if [[ "${ios_enabled}" == 1 ]]; then
   backup_sqlite "${ios_database_target}" "${backup}/state/ios-intelligence.db"
   backup_sqlite "${ios_supervisor_target}" "${backup}/state/ios-mcp-supervisor.db"
@@ -633,8 +722,9 @@ fi
 install_atomic() {
   local source="$1"
   local destination="$2"
-  local temporary="${transaction}/$(basename "${destination}")"
-  install -o "${service_user}" -g "${service_group}" -m 0644 "${source}" "${temporary}"
+  local mode="${3:-0644}"
+  local temporary="${transaction}/.install.$(basename "${destination}").$$"
+  install -o "${service_user}" -g "${service_group}" -m "${mode}" "${source}" "${temporary}"
   mv -f -- "${temporary}" "${destination}"
 }
 install_root_atomic() {
@@ -654,9 +744,44 @@ install_atomic "${snapshot}/hermes_cli/dashboard_auth/public_paths.py" "${public
 install_atomic "${snapshot}/hermes_cli/dashboard_auth/token_auth.py" "${token_auth_target}"
 install_atomic "${snapshot}/hermes_cli/dashboard_auth/mobile_device_store.py" "${mobile_device_store_target}"
 install_atomic "${snapshot}/hermes_cli/dashboard_auth/mobile_notifications.py" "${mobile_notifications_target}"
+install_atomic "${snapshot}/hermes_cli/managed_installations.py" "${managed_installations_target}"
+install_atomic "${snapshot}/hermes_cli/managed_nodes.py" "${managed_nodes_code_target}"
 install_atomic "${snapshot}/hermes_cli/web_server.py" "${web_server_target}"
+install_atomic "${snapshot}/tools/managed_installation_tool.py" "${managed_installation_tool_target}"
+install_atomic "${snapshot}/toolsets.py" "${toolsets_target}"
 install_atomic "${snapshot}/agent/agent_init.py" "${agent_init_target}"
+install_atomic "${snapshot}/agent/prompt_builder.py" "${prompt_builder_target}"
+install_atomic "${snapshot}/agent/system_prompt.py" "${system_prompt_target}"
+install_atomic "${snapshot}/agent/context_diagnostics.py" "${context_diagnostics_target}"
+install_atomic "${snapshot}/hermes_cli/doctor.py" "${doctor_target}"
 install_atomic "${snapshot}/tui_gateway/server.py" "${tui_gateway_target}"
+managed_nodes_rendered="${transaction}/managed-nodes.json"
+"${runtime_python}" - \
+  "${snapshot}/deploy/public/managed-nodes.server.json" \
+  "${managed_nodes_rendered}" \
+  "${managed_node_token_file}" \
+  "${managed_installation_token_file}" <<'PY'
+import json
+import pathlib
+import sys
+
+source, destination, status_token_file, installation_token_file = map(
+    pathlib.Path, sys.argv[1:]
+)
+payload = json.loads(source.read_text(encoding="utf-8"))
+for node in payload.get("nodes", []):
+    if node.get("token_file") != "/etc/hermes-agent/dbb3-status-token":
+        raise SystemExit("managed-nodes template has an unexpected status token path")
+    if node.get("installation_token_file") != "/etc/hermes-agent/managed-installation-token":
+        raise SystemExit("managed-nodes template has an unexpected installation token path")
+    node["token_file"] = str(status_token_file)
+    node["installation_token_file"] = str(installation_token_file)
+destination.write_text(
+    json.dumps(payload, indent=2, ensure_ascii=True) + "\n",
+    encoding="utf-8",
+)
+PY
+install_atomic "${managed_nodes_rendered}" "${managed_nodes_target}" 0600
 install_root_atomic "${snapshot}/deploy/public/nginx-00-hermes-security.conf" "${nginx_security_target}"
 install_root_atomic "${snapshot}/deploy/public/nginx-daxueshenmai.top.conf" "${nginx_site_target}"
 "${nginx_binary}" -t \
@@ -745,6 +870,69 @@ validate_connector_health "${connector_health_file}" || {
 nginx_reload_attempted=1
 systemctl reload "${nginx_service}" \
   || { printf '%s\n' "nginx reload failed" >&2; false; }
+installation_health_cfg="$(mktemp /run/hermes-installation-route-health.XXXXXX)"
+chmod 0600 "${installation_health_cfg}"
+printf 'header = "X-DBB3-Token: %s"\nheader = "Accept: application/json"\n' \
+  "$(cat -- "${managed_installation_token_file}")" >"${installation_health_cfg}"
+for node in dbb3 wsl; do
+  node_health="$(mktemp "/run/hermes-installation-${node}.XXXXXX")"
+  route_healthy=0
+  for _ in $(seq 1 30); do
+    if curl --fail --silent --show-error --max-time 5 \
+        --resolve 'daxueshenmai.top:443:127.0.0.1' \
+        --config "${installation_health_cfg}" \
+        "https://daxueshenmai.top/_hermes/installations/${node}/health" \
+        >"${node_health}" \
+      && "${runtime_python}" - "${node_health}" "${node}" <<'PY'
+import json
+import sys
+data = json.load(open(sys.argv[1], encoding="utf-8"))
+assert data.get("ok") is True
+assert data.get("node_id") == sys.argv[2]
+assert data.get("installations") is True
+assert data.get("recovery") is False
+PY
+    then
+      route_healthy=1
+      break
+    fi
+    sleep 1
+  done
+  rm -f -- "${node_health}"
+  [[ "${route_healthy}" == 1 ]] \
+    || { printf 'managed installation route failed: %s\n' "${node}" >&2; false; }
+  installation_probe_id="mi-$(${runtime_python} -c 'import uuid; print(uuid.uuid4().hex)')"
+  installation_probe_body="$(mktemp "/run/hermes-installation-${node}-body.XXXXXX")"
+  installation_probe_post="$(mktemp "/run/hermes-installation-${node}-post.XXXXXX")"
+  installation_probe_get="$(mktemp "/run/hermes-installation-${node}-get.XXXXXX")"
+  printf '{"id":"%s","request_id":"%s","node_id":"%s","kind":"probe","identifier":"managed-installation-route-probe","probe":true}\n' \
+    "${installation_probe_id}" "${installation_probe_id}" "${node}" \
+    >"${installation_probe_body}"
+  curl --fail --silent --show-error --max-time 8 \
+    --resolve 'daxueshenmai.top:443:127.0.0.1' \
+    --config "${installation_health_cfg}" -H 'Content-Type: application/json' \
+    --data-binary "@${installation_probe_body}" -o "${installation_probe_post}" \
+    "https://daxueshenmai.top/_hermes/installations/${node}"
+  curl --fail --silent --show-error --max-time 8 \
+    --resolve 'daxueshenmai.top:443:127.0.0.1' \
+    --config "${installation_health_cfg}" -o "${installation_probe_get}" \
+    "https://daxueshenmai.top/_hermes/installations/${node}/${installation_probe_id}"
+  "${runtime_python}" - \
+    "${installation_probe_post}" "${installation_probe_get}" \
+    "${installation_probe_id}" "${node}" <<'PY'
+import json, sys
+post = json.load(open(sys.argv[1], encoding="utf-8"))
+get = json.load(open(sys.argv[2], encoding="utf-8"))
+assert post.get("accepted") is True and post.get("id") == sys.argv[3]
+assert get.get("id") == sys.argv[3] and get.get("node_id") == sys.argv[4]
+assert get.get("state") == "completed"
+assert (get.get("detail") or {}).get("probe") is True
+assert (get.get("detail") or {}).get("persisted") is True
+PY
+  rm -f -- \
+    "${installation_probe_body}" "${installation_probe_post}" "${installation_probe_get}"
+done
+rm -f -- "${installation_health_cfg}"
 installed=1
 rm -rf -- "${transaction}" "${health_file}" "${handshake_file}" \
   "${ios_health_file}" "${connector_health_file}" "${curl_cfg}"

@@ -1,0 +1,8 @@
+{
+  "installation_receiver": {
+    "node_id": "wsl",
+    "token_file": "/etc/pc-team/managed-installation-token",
+    "state_file": "/mnt/d/Hermes/home/managed-installations.db",
+    "project_root": "/mnt/d/Hermes/home/managed-projects"
+  }
+}

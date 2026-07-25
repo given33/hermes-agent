@@ -215,11 +215,28 @@ async def _lifespan(app: "FastAPI"):
     # Reap idle/dead keep-alive PTY sessions in the background (30-min TTL).
     pty_reaper_task = asyncio.create_task(run_reaper(PTY_REGISTRY))
 
+    # Resume durable Skill/MCP/project operations even when the initiating
+    # iPhone is offline. The dispatcher is idle when no operations exist.
+    from hermes_cli.managed_installations import run_managed_installation_dispatcher
+
+    managed_install_stop = threading.Event()
+    managed_install_thread = threading.Thread(
+        target=run_managed_installation_dispatcher,
+        args=(managed_install_stop,),
+        daemon=True,
+        name="managed-installation-dispatcher",
+    )
+    managed_install_thread.start()
+
     try:
         yield
     finally:
         pty_reaper_task.cancel()
         await PTY_REGISTRY.close_all()
+        managed_install_stop.set()
+        managed_install_thread.join(timeout=2)
+        if managed_install_thread.is_alive():
+            _log.warning("managed installation dispatcher did not stop within 2 seconds")
         if cron_stop is not None:
             cron_stop.set()
 
@@ -3278,6 +3295,72 @@ async def managed_node_recovery_hook(
         raise HTTPException(status_code=400, detail=str(exc)) from exc
     except RuntimeError as exc:
         raise HTTPException(status_code=503, detail=str(exc)) from exc
+
+
+class ManagedInstallationRequest(BaseModel):
+    kind: str
+    identifier: str
+    profile: str = "default"
+    request_id: str = ""
+    scope: str = "auto"
+    locality: str = "portable"
+    targets: list[str] = []
+    project_name: str = ""
+
+
+@app.post("/api/managed-installations", status_code=202)
+async def create_managed_installation_api(body: ManagedInstallationRequest):
+    """Persist a fleet installation before acknowledging the mobile client."""
+
+    from hermes_cli.managed_installations import create_managed_installation
+
+    try:
+        operation = await asyncio.to_thread(
+            create_managed_installation,
+            kind=body.kind,
+            identifier=body.identifier,
+            profile=body.profile,
+            request_id=body.request_id,
+            scope=body.scope,
+            locality=body.locality,
+            targets=body.targets,
+            project_name=body.project_name,
+            require_topology=True,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except RuntimeError as exc:
+        raise HTTPException(status_code=503, detail=str(exc)) from exc
+    return {"accepted": True, "operation": operation}
+
+
+@app.get("/api/managed-installations")
+async def list_managed_installations_api(
+    kind: str = "",
+    profile: str = "",
+    limit: int = 50,
+):
+    from hermes_cli.managed_installations import list_managed_installations
+
+    try:
+        return await asyncio.to_thread(
+            list_managed_installations,
+            kind=kind,
+            profile=profile,
+            limit=limit,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@app.get("/api/managed-installations/{operation_id}")
+async def get_managed_installation_api(operation_id: str):
+    from hermes_cli.managed_installations import get_managed_installation
+
+    try:
+        return await asyncio.to_thread(get_managed_installation, operation_id)
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail="Installation operation not found") from exc
 
 
 # ---------------------------------------------------------------------------

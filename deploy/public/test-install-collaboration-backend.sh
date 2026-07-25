@@ -10,6 +10,8 @@ umask 077
 here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 repo="$(cd "${here}/../.." && pwd)"
 installer="${here}/install-collaboration-backend.sh"
+runtime_python="${repo}/venv/bin/python"
+[[ -x "${runtime_python}" ]] || runtime_python="$(command -v python3)"
 version="$(python3 - "${repo}/plugins/collaboration/dashboard/manifest.json" <<'PY'
 import json, sys
 print(json.load(open(sys.argv[1], encoding="utf-8"))["version"])
@@ -31,27 +33,62 @@ runtime_files=(
   "hermes_cli/dashboard_auth/token_auth.py"
   "hermes_cli/dashboard_auth/mobile_device_store.py"
   "hermes_cli/dashboard_auth/mobile_notifications.py"
+  "hermes_cli/managed_installations.py"
+  "hermes_cli/managed_nodes.py"
   "hermes_cli/web_server.py"
+  "tools/managed_installation_tool.py"
+  "toolsets.py"
   "agent/agent_init.py"
+  "agent/prompt_builder.py"
+  "agent/system_prompt.py"
+  "agent/context_diagnostics.py"
+  "hermes_cli/doctor.py"
   "tui_gateway/server.py"
 )
 nginx_files=(
   "deploy/public/nginx-00-hermes-security.conf"
   "deploy/public/nginx-daxueshenmai.top.conf"
 )
+managed_nodes_template="deploy/public/managed-nodes.server.json"
 
 target="${work}/target"
 backup="${work}/backups"
 fake_bin="${work}/bin"
 token_file="${work}/connector.token"
+status_token_file="${work}/dbb3-status.token"
+installation_token_file="${work}/managed-installation.token"
 state_file="${work}/state/single.json"
+runtime_home="${work}/hermes-home"
+managed_installations_db="${runtime_home}/managed-installations.db"
+managed_nodes_file="${runtime_home}/managed-nodes.json"
 nginx_dir="${work}/nginx"
 nginx_security_target="${nginx_dir}/00-hermes-security.conf"
 nginx_site_target="${nginx_dir}/daxueshenmai.top.conf"
-install -d -m 0700 "${stage}" "${target}" "${backup}" "${fake_bin}" "${nginx_dir}"
+install -d -m 0700 \
+  "${stage}" "${target}" "${backup}" "${fake_bin}" "${nginx_dir}" "${runtime_home}"
 install -d -m 0700 "$(dirname "${state_file}")"
 printf '%s' "connector-test-token" >"${token_file}"
+printf '%s\n' "status-test-token-00000000000000000001" >"${status_token_file}"
+printf '%s\n' "installation-test-token-000000000000001" >"${installation_token_file}"
+chmod 0640 "${status_token_file}" "${installation_token_file}"
 printf '%s\n' '{"conversations":[{"id":"old-state"}]}' >"${state_file}"
+printf '%s\n' '{"nodes":[]}' >"${managed_nodes_file}"
+assert_old_state() {
+  python3 - "$1" <<'PY'
+import json
+import sys
+data = json.load(open(sys.argv[1], encoding="utf-8"))
+assert data["conversations"][0]["id"] == "old-state"
+PY
+}
+python3 - "${managed_installations_db}" <<'PY'
+import sqlite3
+import sys
+
+with sqlite3.connect(sys.argv[1]) as database:
+    database.execute("CREATE TABLE marker (value TEXT NOT NULL)")
+    database.execute("INSERT INTO marker VALUES ('old-managed-installation-state')")
+PY
 for relative in "${runtime_files[@]}"; do
   install -D -m 0644 "${repo}/${relative}" "${stage}/${relative}"
   install -D -m 0644 /dev/null "${target}/${relative}"
@@ -60,6 +97,8 @@ done
 for relative in "${nginx_files[@]}"; do
   install -D -m 0644 "${repo}/${relative}" "${stage}/${relative}"
 done
+install -D -m 0644 \
+  "${repo}/${managed_nodes_template}" "${stage}/${managed_nodes_template}"
 printf '%s\n' "old:nginx-security" >"${nginx_security_target}"
 printf '%s\n' "old:nginx-site" >"${nginx_site_target}"
 
@@ -71,6 +110,7 @@ fi
 if [[ "${1:-}" == "start" && "${FAKE_STATUS_FAIL:-0}" == 1 \
   && ! -e "${HERMES_COLLABORATION_STATE_FILE}.mutated" ]]; then
   printf '%s\n' '{"conversations":[{"id":"new-state"}]}' >"${HERMES_COLLABORATION_STATE_FILE}"
+  printf '%s\n' 'not a sqlite database' >"${HERMES_HOME_DIR}/managed-installations.db"
   : >"${HERMES_COLLABORATION_STATE_FILE}.mutated"
 fi
 if [[ "${1:-}" == "start" && "${FAKE_SIGNAL_ON_START:-0}" == 1 \
@@ -102,12 +142,19 @@ cat >"${fake_bin}/curl" <<'SH'
 set -euo pipefail
 output=""
 next_is_output=0
+data_file=""
+next_is_data=0
 for arg in "$@"; do
   if [[ "${next_is_output}" == 1 ]]; then
     output="${arg}"
     next_is_output=0
   elif [[ "${arg}" == "-o" ]]; then
     next_is_output=1
+  elif [[ "${next_is_data}" == 1 ]]; then
+    data_file="${arg#@}"
+    next_is_data=0
+  elif [[ "${arg}" == "--data-binary" ]]; then
+    next_is_data=1
   fi
 done
 url="${!#}"
@@ -137,6 +184,18 @@ print(json.dumps({
 }))
 PY
 )"
+elif [[ "${url}" == */_hermes/installations/dbb3/health ]]; then
+  payload='{"ok":true,"node_id":"dbb3","installations":true,"recovery":false}'
+elif [[ "${url}" == */_hermes/installations/wsl/health ]]; then
+  payload='{"ok":true,"node_id":"wsl","installations":true,"recovery":false}'
+elif [[ "${url}" =~ /_hermes/installations/(dbb3|wsl)$ ]]; then
+  node="${BASH_REMATCH[1]}"
+  probe_id="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["id"])' "${data_file}")"
+  payload="{\"accepted\":true,\"id\":\"${probe_id}\",\"state\":\"completed\",\"node_id\":\"${node}\"}"
+elif [[ "${url}" =~ /_hermes/installations/(dbb3|wsl)/(mi-[0-9a-f]+)$ ]]; then
+  node="${BASH_REMATCH[1]}"
+  probe_id="${BASH_REMATCH[2]}"
+  payload="{\"id\":\"${probe_id}\",\"node_id\":\"${node}\",\"state\":\"completed\",\"detail\":{\"probe\":true,\"persisted\":true}}"
 else
   payload='{"ok":true,"contract_version":1,"connector_id":"dbb3-primary","capabilities":["artifact-upload","attachment-download"]}'
 fi
@@ -156,7 +215,7 @@ run_installer() {
     FAKE_HANDSHAKE_FAIL="${3:-0}" \
     FAKE_NGINX_FAIL="${4:-0}" \
     HERMES_AGENT_ROOT="${target}" \
-    HERMES_RUNTIME_PYTHON="$(command -v python3)" \
+    HERMES_RUNTIME_PYTHON="${runtime_python}" \
     HERMES_AGENT_SERVICE="hermes-agent-test.service" \
     HERMES_AGENT_USER="root" \
     HERMES_AGENT_GROUP="root" \
@@ -164,7 +223,10 @@ run_installer() {
     HERMES_BACKUP_ROOT="${backup}" \
     HERMES_INSTALL_LOCK_FILE="${work}/collaboration-install.lock" \
     HERMES_COLLABORATION_STATE_FILE="${state_file}" \
+    HERMES_HOME_DIR="${runtime_home}" \
     HERMES_COLLABORATION_CONNECTOR_TOKEN_FILE="${token_file}" \
+    HERMES_MANAGED_NODE_TOKEN_FILE="${status_token_file}" \
+    HERMES_MANAGED_INSTALLATION_TOKEN_FILE="${installation_token_file}" \
     HERMES_NGINX_SECURITY_TARGET="${nginx_security_target}" \
     HERMES_NGINX_SITE_TARGET="${nginx_site_target}" \
     HERMES_NGINX_SERVICE="nginx-test.service" \
@@ -190,7 +252,15 @@ for relative in "${runtime_files[@]}"; do
 done
 [[ "$(<"${nginx_security_target}")" == "old:nginx-security" ]]
 [[ "$(<"${nginx_site_target}")" == "old:nginx-site" ]]
-grep -Fq '"id":"old-state"' "${state_file}"
+assert_old_state "${state_file}"
+grep -Fq '"nodes":[]' "${managed_nodes_file}"
+[[ "$(python3 - "${managed_installations_db}" <<'PY'
+import sqlite3
+import sys
+with sqlite3.connect(sys.argv[1]) as database:
+    print(database.execute("SELECT value FROM marker").fetchone()[0])
+PY
+)" == "old-managed-installation-state" ]]
 [[ "$(sed -n '1p' "${work}/systemctl.log")" == "stop" ]]
 [[ "$(sed -n '2p' "${work}/systemctl.log")" == "start" ]]
 [[ "$(sed -n '3p' "${work}/systemctl.log")" == "is-active" ]]
@@ -233,7 +303,8 @@ for relative in "${runtime_files[@]}"; do
     exit 1
   }
 done
-grep -Fq '"id":"old-state"' "${state_file}"
+assert_old_state "${state_file}"
+grep -Fq '"nodes":[]' "${managed_nodes_file}"
 
 : >"${work}/systemctl.log"
 set +e
@@ -250,7 +321,8 @@ for relative in "${runtime_files[@]}"; do
     exit 1
   }
 done
-grep -Fq '"id":"old-state"' "${state_file}"
+assert_old_state "${state_file}"
+grep -Fq '"nodes":[]' "${managed_nodes_file}"
 [[ "$(sed -n '1p' "${work}/systemctl.log")" == "stop" ]]
 [[ "$(sed -n '2p' "${work}/systemctl.log")" == "start" ]]
 [[ "$(sed -n '3p' "${work}/systemctl.log")" == "stop" ]]
@@ -265,8 +337,67 @@ run_installer 0 0 >"${work}/success.stdout" 2>"${work}/success.stderr" || {
 for relative in "${runtime_files[@]}"; do
   cmp -- "${stage}/${relative}" "${target}/${relative}"
 done
+PYTHONPATH="${repo}" HERMES_HOME="${runtime_home}" "${runtime_python}" - "${target}" "${work}" <<'PY'
+import importlib
+from pathlib import Path
+import sys
+
+target = Path(sys.argv[1]).resolve()
+scratch = Path(sys.argv[2]).resolve()
+
+import agent
+agent.__path__.insert(0, str(target / "agent"))
+for name in ("agent.prompt_builder", "agent.system_prompt", "agent.context_diagnostics"):
+    sys.modules.pop(name, None)
+
+prompt_builder = importlib.import_module("agent.prompt_builder")
+system_prompt = importlib.import_module("agent.system_prompt")
+diagnostics = importlib.import_module("agent.context_diagnostics")
+
+import hermes_cli
+hermes_cli.__path__.insert(0, str(target / "hermes_cli"))
+sys.modules.pop("hermes_cli.doctor", None)
+doctor = importlib.import_module("hermes_cli.doctor")
+
+for module, relative in (
+    (prompt_builder, "agent/prompt_builder.py"),
+    (system_prompt, "agent/system_prompt.py"),
+    (diagnostics, "agent/context_diagnostics.py"),
+    (doctor, "hermes_cli/doctor.py"),
+):
+    assert Path(module.__file__).resolve() == target / relative
+
+assert "# Evidence-first execution" in prompt_builder.EVIDENCE_FIRST_EXECUTION_GUIDANCE
+context_root = scratch / "context-import-probe"
+context_root.mkdir()
+(context_root / "AGENTS.md").write_text("project guidance\n", encoding="utf-8")
+report = diagnostics.analyze_context_sources(
+    cwd=context_root,
+    hermes_home=scratch / "empty-home",
+)
+assert any(source.path.name == "AGENTS.md" and source.active for source in report.sources)
+assert callable(doctor._check_context_engineering)
+PY
 cmp -- "${stage}/deploy/public/nginx-00-hermes-security.conf" "${nginx_security_target}"
 cmp -- "${stage}/deploy/public/nginx-daxueshenmai.top.conf" "${nginx_site_target}"
+python3 - \
+  "${managed_nodes_file}" "${status_token_file}" "${installation_token_file}" <<'PY'
+import json
+import sys
+
+payload = json.load(open(sys.argv[1], encoding="utf-8"))
+node = payload["nodes"][0]
+assert node["token_file"] == sys.argv[2]
+assert node["installation_token_file"] == sys.argv[3]
+assert sorted(node["installation_urls"]) == ["dbb3", "wsl"]
+PY
+[[ "$(python3 - "${managed_installations_db}" <<'PY'
+import sqlite3
+import sys
+with sqlite3.connect(sys.argv[1]) as database:
+    print(database.execute("SELECT value FROM marker").fetchone()[0])
+PY
+)" == "old-managed-installation-state" ]]
 grep -Fq "service=active" "${work}/success.stdout"
 [[ "$(sed -n '1p' "${work}/systemctl.log")" == "stop" ]]
 [[ "$(sed -n '2p' "${work}/systemctl.log")" == "start" ]]

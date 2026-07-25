@@ -15,6 +15,7 @@ ROOT = Path(__file__).resolve().parents[2]
 DBB3 = ROOT / "deploy" / "dbb3"
 PC = ROOT / "deploy" / "pc"
 PUBLIC = ROOT / "deploy" / "public"
+RECOVERY = ROOT / "deploy" / "recovery"
 UPSTREAM_REPORT = ROOT / "scripts" / "upstream_change_report.py"
 UPSTREAM_WORKFLOW = ROOT / ".github" / "workflows" / "upstream-sync.yml"
 
@@ -112,6 +113,8 @@ def test_deployment_shell_scripts_have_valid_syntax():
         PUBLIC / "test-install-collaboration-backend.sh",
         PUBLIC / "deploy-collaboration-backend.sh",
         PUBLIC / "configure-connector-credential.sh",
+        RECOVERY / "install-dbb3-managed-installation-receiver.sh",
+        RECOVERY / "install-wsl-managed-installation.sh",
     ):
         if os.name == "nt":
             wsl = shutil.which("wsl.exe")
@@ -497,13 +500,17 @@ def test_public_installer_transactions_mcp_discovery_with_ios_release():
             'for relative in "${required[@]}"'
         )
     ]
+    required_assets = installer[
+        installer.index("required=("):installer.index("ios_optional=(")
+    ]
 
     assert '"tools/mcp_tool.py"' in ios_assets
     assert '"hermes_cli/dashboard_auth/owner_mobile.py"' in ios_assets
     assert '"hermes_cli/dashboard_auth/registry.py"' in ios_assets
     assert '"hermes_cli/profiles.py"' in ios_assets
     assert '"hermes_cli/account_cleanup.py"' in ios_assets
-    assert '"hermes_cli/managed_nodes.py"' in ios_assets
+    assert '"hermes_cli/managed_nodes.py"' not in ios_assets
+    assert '"hermes_cli/managed_nodes.py"' in required_assets
     assert '"hermes_cli/managed_node_recovery_service.py"' in ios_assets
     assert '"plugins/dashboard_auth/basic/__init__.py"' in ios_assets
     assert '"${snapshot}/tools/mcp_tool.py"' in installer
@@ -569,6 +576,7 @@ class _FakeCloud:
     connector_id = "dbb3-primary"
 
     def __init__(self, run):
+        run.setdefault("claim_token", "claim-v2-test-token")
         self.run = run
         self.acks = []
         self.statuses = []
@@ -583,13 +591,16 @@ class _FakeCloud:
         return [self.run]
 
     def acknowledge_run(self, run, local, lease_seconds=90):
+        assert run["claim_token"]
         self.acks.append((run, dict(local)))
 
     def report_status(self, remote_id, payload):
+        assert payload["claim_token"]
         self.statuses.append((remote_id, dict(payload)))
         return {"applied": True}
 
     def fail_run(self, remote_id, payload):
+        assert payload["claim_token"]
         self.failures.append((remote_id, dict(payload)))
         return {"applied": True}
 
@@ -600,6 +611,7 @@ class _FakeCloud:
         raise AssertionError("unexpected cancellation")
 
     def upload_artifact(self, remote_id, **kwargs):
+        assert kwargs["claim_token"]
         self.uploads.append((remote_id, kwargs))
         return {"applied": True, "artifact": {"id": "artifact-1"}}
 
@@ -979,7 +991,7 @@ def test_connector_client_uses_the_connector_route_prefix():
     def request(path, **kwargs):
         calls.append(path)
         if path == "/connector/health":
-            return {"ok": True, "contract_version": 1}
+            return {"ok": True, "contract_version": 2}
         if path.endswith("/pull"):
             return {"runs": [], "cancellations": []}
         return {}
@@ -1021,7 +1033,7 @@ def test_connector_client_sends_bound_connector_identity_header():
             return False
 
         def read(self):
-            return b'{"ok":true,"contract_version":1}'
+            return b'{"ok":true,"contract_version":2}'
 
     with mock.patch.object(connector.urllib.request, "urlopen", return_value=Response()) as urlopen:
         client.probe()

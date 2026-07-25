@@ -1,0 +1,22 @@
+{
+  "nodes": [
+    {
+      "id": "hermes-fabric",
+      "label": "DBB3 + Windows PC + WSL",
+      "status_url": "http://10.66.0.2:8766/status",
+      "token_file": "/etc/hermes-agent/dbb3-status-token",
+      "installation_token_file": "/etc/hermes-agent/managed-installation-token",
+      "recovery_urls": {
+        "dbb3": "https://daxueshenmai.top/_hermes/recovery/dbb3",
+        "wsl": "https://daxueshenmai.top/_hermes/recovery/wsl"
+      },
+      "installation_urls": {
+        "dbb3": "https://daxueshenmai.top/_hermes/installations/dbb3",
+        "wsl": "https://daxueshenmai.top/_hermes/installations/wsl"
+      },
+      "auto_recover": true,
+      "timeout_seconds": 8,
+      "recovery_cooldown_seconds": 90
+    }
+  ]
+}

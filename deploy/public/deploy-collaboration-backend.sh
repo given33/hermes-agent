@@ -27,10 +27,18 @@ fi
 [[ -f "${repo}/hermes_cli/dashboard_auth/mobile_device_store.py" ]] || die "mobile_device_store.py is missing"
 [[ -f "${repo}/hermes_cli/dashboard_auth/mobile_notifications.py" ]] || die "mobile_notifications.py is missing"
 [[ -f "${repo}/hermes_cli/web_server.py" ]] || die "web_server.py is missing"
+[[ -f "${repo}/hermes_cli/managed_installations.py" ]] || die "managed_installations.py is missing"
+[[ -f "${repo}/tools/managed_installation_tool.py" ]] || die "managed_installation_tool.py is missing"
+[[ -f "${repo}/toolsets.py" ]] || die "toolsets.py is missing"
 [[ -f "${repo}/agent/agent_init.py" ]] || die "agent_init.py is missing"
+[[ -f "${repo}/agent/prompt_builder.py" ]] || die "prompt_builder.py is missing"
+[[ -f "${repo}/agent/system_prompt.py" ]] || die "system_prompt.py is missing"
+[[ -f "${repo}/agent/context_diagnostics.py" ]] || die "context_diagnostics.py is missing"
+[[ -f "${repo}/hermes_cli/doctor.py" ]] || die "doctor.py is missing"
 [[ -f "${repo}/tui_gateway/server.py" ]] || die "tui_gateway/server.py is missing"
 [[ -f "${repo}/deploy/public/nginx-00-hermes-security.conf" ]] || die "nginx security config is missing"
 [[ -f "${repo}/deploy/public/nginx-daxueshenmai.top.conf" ]] || die "nginx site config is missing"
+[[ -f "${repo}/deploy/public/managed-nodes.server.json" ]] || die "managed-nodes server config is missing"
 
 ios_hermes_assets=(
   "hermes_cli/account_cleanup.py"
@@ -89,11 +97,24 @@ scp "${ssh_args[@]}" \
   "${remote}:${stage}/plugins/collaboration/dashboard/dist/"
 scp "${ssh_args[@]}" \
   "${repo}/hermes_cli/cloud_file_library.py" \
+  "${repo}/hermes_cli/managed_installations.py" \
   "${repo}/hermes_cli/web_server.py" \
   "${remote}:${stage}/hermes_cli/"
 scp "${ssh_args[@]}" \
+  "${repo}/tools/managed_installation_tool.py" \
+  "${remote}:${stage}/tools/"
+scp "${ssh_args[@]}" \
+  "${repo}/toolsets.py" \
+  "${remote}:${stage}/"
+scp "${ssh_args[@]}" \
   "${repo}/agent/agent_init.py" \
+  "${repo}/agent/prompt_builder.py" \
+  "${repo}/agent/system_prompt.py" \
+  "${repo}/agent/context_diagnostics.py" \
   "${remote}:${stage}/agent/"
+scp "${ssh_args[@]}" \
+  "${repo}/hermes_cli/doctor.py" \
+  "${remote}:${stage}/hermes_cli/"
 scp "${ssh_args[@]}" \
   "${repo}/hermes_cli/dashboard_auth/public_paths.py" \
   "${repo}/hermes_cli/dashboard_auth/token_auth.py" \
@@ -135,6 +156,7 @@ scp "${ssh_args[@]}" \
 scp "${ssh_args[@]}" \
   "${repo}/deploy/public/nginx-00-hermes-security.conf" \
   "${repo}/deploy/public/nginx-daxueshenmai.top.conf" \
+  "${repo}/deploy/public/managed-nodes.server.json" \
   "${remote}:${stage}/deploy/public/"
 scp "${ssh_args[@]}" "${installer}" "${remote}:${stage}/install-collaboration-backend.sh"
 ssh "${ssh_args[@]}" "${remote}" "chmod 0700 '${stage}/install-collaboration-backend.sh'; sudo -n /bin/bash '${stage}/install-collaboration-backend.sh' '${version}' '${stage}'"

@@ -1,15 +1,20 @@
 import json
+from pathlib import Path
 import sys
 import threading
 import time
+from types import SimpleNamespace
 from datetime import datetime, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.request import Request, urlopen
+
+import pytest
 
 from hermes_cli.managed_nodes import (
     accept_managed_node_recovery,
     fetch_managed_nodes,
     load_managed_nodes_config,
+    read_private_token,
 )
 from hermes_cli import managed_nodes
 from hermes_cli.managed_node_recovery_service import RecoveryHTTPServer
@@ -277,6 +282,99 @@ def test_managed_nodes_rejects_plain_http_remote_recovery_url(tmp_path):
         assert "recovery_url" in str(exc)
     else:
         raise AssertionError("remote recovery token could be sent over plain HTTP")
+
+
+def test_managed_nodes_validates_optional_installation_token_file(tmp_path):
+    config_path = tmp_path / "managed-nodes.json"
+    config_path.write_text(json.dumps({
+        "nodes": [{
+            "id": "home",
+            "status_url": "https://status.example/live",
+            "token_file": "/etc/hermes-agent/dbb3-status-token",
+            "installation_token_file": "   ",
+        }],
+    }), encoding="utf-8")
+
+    try:
+        load_managed_nodes_config(config_path)
+    except ValueError as exc:
+        assert "installation_token_file" in str(exc)
+    else:
+        raise AssertionError("blank installation token paths must be rejected")
+
+
+def test_managed_nodes_requires_a_distinct_installation_credential(tmp_path):
+    status_token = tmp_path / "status-token"
+    status_token.write_text("status-private-token-00000000000000000001", encoding="utf-8")
+
+    for installation_token in (None, str(status_token)):
+        config_path = tmp_path / f"managed-nodes-{installation_token is None}.json"
+        node = {
+            "id": "private-fleet",
+            "status_url": "https://status.example/live",
+            "token_file": str(status_token),
+            "installation_urls": {"dbb3": "https://install.example/dbb3"},
+        }
+        if installation_token is not None:
+            node["installation_token_file"] = installation_token
+        config_path.write_text(json.dumps({"nodes": [node]}), encoding="utf-8")
+
+        with pytest.raises(ValueError, match="installation_token_file"):
+            load_managed_nodes_config(config_path)
+
+
+def test_managed_nodes_rejects_distinct_paths_with_same_credential_content(tmp_path):
+    status_token = tmp_path / "status-token"
+    installation_token = tmp_path / "installation-token"
+    shared = "shared-private-token-00000000000000000001"
+    status_token.write_text(shared, encoding="utf-8")
+    installation_token.write_text(shared, encoding="utf-8")
+    status_token.chmod(0o600)
+    installation_token.chmod(0o600)
+    config_path = tmp_path / "managed-nodes.json"
+    config_path.write_text(json.dumps({
+        "nodes": [{
+            "id": "private-fleet",
+            "status_url": "https://status.example/live",
+            "token_file": str(status_token),
+            "installation_token_file": str(installation_token),
+            "installation_urls": {"dbb3": "https://install.example/dbb3"},
+        }],
+    }), encoding="utf-8")
+
+    with pytest.raises(ValueError, match="different status and installation"):
+        load_managed_nodes_config(config_path)
+
+
+@pytest.mark.parametrize("contents", ["short", "a" * 32 + "\nsecond\n", " " + "a" * 32])
+def test_private_token_rejects_short_multiline_or_padded_values(tmp_path, contents):
+    token = tmp_path / "token"
+    token.write_text(contents, encoding="utf-8")
+    with pytest.raises(ValueError):
+        read_private_token(token, label="test credential")
+
+
+def test_private_token_rejects_nobody_owner_even_with_controlled_group(tmp_path, monkeypatch):
+    token = tmp_path / "token"
+    token.write_text("owner-private-token-00000000000000000001", encoding="utf-8")
+    real_lstat = Path.lstat
+
+    def nobody_lstat(path):
+        metadata = real_lstat(path)
+        return SimpleNamespace(
+            st_mode=(metadata.st_mode & ~0o777) | 0o640,
+            st_uid=65534,
+            st_gid=1000,
+        )
+
+    monkeypatch.setattr(Path, "lstat", nobody_lstat)
+    monkeypatch.setattr(managed_nodes, "_is_posix_token_runtime", lambda: True)
+    monkeypatch.setattr(managed_nodes.os, "geteuid", lambda: 1000, raising=False)
+    monkeypatch.setattr(managed_nodes.os, "getegid", lambda: 1000, raising=False)
+    monkeypatch.setattr(managed_nodes.os, "getgroups", lambda: [1000], raising=False)
+
+    with pytest.raises(ValueError, match="owner is not trusted"):
+        read_private_token(token, label="test credential")
 
 
 def test_recovery_receiver_authenticates_and_executes_each_idempotency_key_once(tmp_path):
