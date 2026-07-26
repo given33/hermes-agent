@@ -39,6 +39,8 @@ fi
 [[ -f "${repo}/deploy/public/nginx-00-hermes-security.conf" ]] || die "nginx security config is missing"
 [[ -f "${repo}/deploy/public/nginx-daxueshenmai.top.conf" ]] || die "nginx site config is missing"
 [[ -f "${repo}/deploy/public/managed-nodes.server.json" ]] || die "managed-nodes server config is missing"
+[[ -f "${repo}/deploy/recovery/configure-main-managed-installation-ssh.sh" ]] \
+  || die "managed installation SSH configurator is missing"
 
 ios_hermes_assets=(
   "hermes_cli/account_cleanup.py"
@@ -87,7 +89,7 @@ if [[ -n "${HERMES_SSH_IDENTITY:-}" ]]; then
   ssh_args+=(-i "${HERMES_SSH_IDENTITY}" -o IdentitiesOnly=yes)
 fi
 
-ssh "${ssh_args[@]}" "${remote}" "install -d -m 0700 '${stage}' '${stage}/agent' '${stage}/plugins/collaboration/dashboard/dist' '${stage}/hermes_cli' '${stage}/hermes_cli/dashboard_auth' '${stage}/tui_gateway' '${stage}/plugins/ios-intelligence/dashboard' '${stage}/plugins/dashboard_auth/basic' '${stage}/tools' '${stage}/deploy/public'"
+ssh "${ssh_args[@]}" "${remote}" "install -d -m 0700 '${stage}' '${stage}/agent' '${stage}/plugins/collaboration/dashboard/dist' '${stage}/hermes_cli' '${stage}/hermes_cli/dashboard_auth' '${stage}/tui_gateway' '${stage}/plugins/ios-intelligence/dashboard' '${stage}/plugins/dashboard_auth/basic' '${stage}/tools' '${stage}/deploy/public' '${stage}/deploy/recovery'"
 scp "${ssh_args[@]}" \
   "${repo}/plugins/collaboration/dashboard/plugin_api.py" \
   "${repo}/plugins/collaboration/dashboard/manifest.json" \
@@ -158,6 +160,10 @@ scp "${ssh_args[@]}" \
   "${repo}/deploy/public/nginx-daxueshenmai.top.conf" \
   "${repo}/deploy/public/managed-nodes.server.json" \
   "${remote}:${stage}/deploy/public/"
+scp "${ssh_args[@]}" \
+  "${repo}/deploy/recovery/configure-main-managed-installation-ssh.sh" \
+  "${remote}:${stage}/deploy/recovery/"
 scp "${ssh_args[@]}" "${installer}" "${remote}:${stage}/install-collaboration-backend.sh"
+ssh "${ssh_args[@]}" "${remote}" "chmod 0700 '${stage}/deploy/recovery/configure-main-managed-installation-ssh.sh'; sudo -n /bin/bash '${stage}/deploy/recovery/configure-main-managed-installation-ssh.sh'"
 ssh "${ssh_args[@]}" "${remote}" "chmod 0700 '${stage}/install-collaboration-backend.sh'; sudo -n /bin/bash '${stage}/install-collaboration-backend.sh' '${version}' '${stage}'"
 ssh "${ssh_args[@]}" "${remote}" "rm -rf -- '${stage}'"

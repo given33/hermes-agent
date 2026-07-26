@@ -115,6 +115,7 @@ def test_deployment_shell_scripts_have_valid_syntax():
         PUBLIC / "configure-connector-credential.sh",
         RECOVERY / "install-dbb3-managed-installation-receiver.sh",
         RECOVERY / "install-wsl-managed-installation.sh",
+        RECOVERY / "configure-main-managed-installation-ssh.sh",
     ):
         if os.name == "nt":
             wsl = shutil.which("wsl.exe")
@@ -162,6 +163,17 @@ def test_managed_installation_receivers_probe_their_real_bind_and_rollback_safel
     assert dbb3.count("http://10.66.0.2:9122/") == 3
     assert "http://127.0.0.1:9122/" not in dbb3
     assert wsl.count("http://127.0.0.1:9122/") == 3
+
+
+def test_main_managed_installation_ssh_configurator_is_deployed():
+    deployer = (PUBLIC / "deploy-collaboration-backend.sh").read_text(
+        encoding="utf-8"
+    )
+
+    relative = "deploy/recovery/configure-main-managed-installation-ssh.sh"
+    assert f'"${{repo}}/{relative}"' in deployer
+    assert "sudo -n /bin/bash" in deployer
+    assert "configure-main-managed-installation-ssh.sh'" in deployer
 
 
 def test_public_nginx_contract_separates_refresh_and_returns_json_errors():
@@ -340,6 +352,7 @@ printf '%s|%s\n' "$(basename "$0")" "$*" >>"$DEPLOY_CAPTURE"
         "hermes_cli/managed_node_recovery_service.py",
         "plugins/dashboard_auth/basic/__init__.py",
         "tools/mcp_tool.py",
+        "deploy/recovery/configure-main-managed-installation-ssh.sh",
     ):
         assert f"{_posix_path(ROOT)}/{relative}" in deployed
 

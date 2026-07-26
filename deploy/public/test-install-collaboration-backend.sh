@@ -54,6 +54,8 @@ managed_nodes_template="deploy/public/managed-nodes.server.json"
 target="${work}/target"
 backup="${work}/backups"
 fake_bin="${work}/bin"
+sshd_config="${work}/sshd_config"
+sshd_original="${work}/sshd_config.original"
 token_file="${work}/connector.token"
 status_token_file="${work}/dbb3-status.token"
 installation_token_file="${work}/managed-installation.token"
@@ -101,6 +103,15 @@ install -D -m 0644 \
   "${repo}/${managed_nodes_template}" "${stage}/${managed_nodes_template}"
 printf '%s\n' "old:nginx-security" >"${nginx_security_target}"
 printf '%s\n' "old:nginx-site" >"${nginx_site_target}"
+cat >"${sshd_original}" <<'EOF'
+Match User admin
+    AllowTcpForwarding yes
+    GatewayPorts clientspecified
+    PermitListen 127.0.0.1:19122 10.66.0.1:8081
+Match all
+    AllowTcpForwarding local
+EOF
+cp "${sshd_original}" "${sshd_config}"
 
 cat >"${fake_bin}/systemctl" <<'SH'
 #!/usr/bin/env bash
@@ -124,9 +135,35 @@ case "${1:-}" in
     printf '%s\n' "${FAKE_SYSTEMD_ENVIRONMENT:-}"
     exit 0
     ;;
-  stop|start|is-active|reload) exit 0 ;;
+  reload)
+    if [[ "${FAKE_SSH_RELOAD_FAIL_ONCE:-0}" == 1 \
+      && ! -e "${FAKE_SSH_RELOAD_MARKER:-/nonexistent}" ]]; then
+      : >"${FAKE_SSH_RELOAD_MARKER}"
+      exit 1
+    fi
+    exit 0
+    ;;
+  stop|start|is-active) exit 0 ;;
   *) exit 0 ;;
 esac
+SH
+cat >"${fake_bin}/sshd" <<'SH'
+#!/usr/bin/env bash
+set -euo pipefail
+config=""
+mode=""
+while (($#)); do
+  case "$1" in
+    -t|-T) mode="$1" ;;
+    -f) shift; config="$1" ;;
+  esac
+  shift
+done
+[[ -n "${config}" && -f "${config}" ]]
+if [[ "${mode}" == "-T" ]]; then
+  printf '%s\n' 'allowtcpforwarding yes'
+  awk 'tolower($1) == "permitlisten" { $1="permitlisten"; print }' "${config}"
+fi
 SH
 cat >"${fake_bin}/nginx" <<'SH'
 #!/usr/bin/env bash
@@ -205,7 +242,36 @@ else
   printf '%s\n' "${payload}"
 fi
 SH
-chmod 0755 "${fake_bin}/systemctl" "${fake_bin}/nginx" "${fake_bin}/sleep" "${fake_bin}/curl"
+chmod 0755 "${fake_bin}/systemctl" "${fake_bin}/sshd" "${fake_bin}/nginx" "${fake_bin}/sleep" "${fake_bin}/curl"
+
+ssh_configurator="${repo}/deploy/recovery/configure-main-managed-installation-ssh.sh"
+ssh_reload_marker="${work}/ssh-reload-failed"
+run_ssh_configurator() {
+  env \
+    PATH="${fake_bin}:${PATH}" \
+    FAKE_SSH_RELOAD_FAIL_ONCE="${1:-0}" \
+    FAKE_SSH_RELOAD_MARKER="${ssh_reload_marker}" \
+    HERMES_SSHD_CONFIG="${sshd_config}" \
+    HERMES_SSHD_BINARY="${fake_bin}/sshd" \
+    HERMES_SSHD_SERVICE="ssh-test.service" \
+    HERMES_SSHD_LOCK_FILE="${work}/sshd-install.lock" \
+    HERMES_BACKUP_ROOT="${backup}" \
+    /bin/bash "${ssh_configurator}"
+}
+
+run_ssh_configurator 0 >"${work}/sshd-success.stdout"
+grep -Eq 'PermitListen .*127\.0\.0\.1:19123' "${sshd_config}"
+sshd_hash="$(sha256sum "${sshd_config}" | cut -d' ' -f1)"
+run_ssh_configurator 0 >"${work}/sshd-idempotent.stdout"
+[[ "$(sha256sum "${sshd_config}" | cut -d' ' -f1)" == "${sshd_hash}" ]]
+cp "${sshd_original}" "${sshd_config}"
+rm -f -- "${ssh_reload_marker}"
+set +e
+run_ssh_configurator 1 >"${work}/sshd-failure.stdout" 2>"${work}/sshd-failure.stderr"
+sshd_failure_status=$?
+set -e
+[[ "${sshd_failure_status}" -ne 0 ]]
+cmp -- "${sshd_original}" "${sshd_config}"
 
 run_installer() {
   env \
