@@ -165,17 +165,6 @@ def test_managed_installation_receivers_probe_their_real_bind_and_rollback_safel
     assert wsl.count("http://127.0.0.1:9122/") == 3
 
 
-def test_main_managed_installation_ssh_configurator_is_deployed():
-    deployer = (PUBLIC / "deploy-collaboration-backend.sh").read_text(
-        encoding="utf-8"
-    )
-
-    relative = "deploy/recovery/configure-main-managed-installation-ssh.sh"
-    assert f'"${{repo}}/{relative}"' in deployer
-    assert "sudo -n /bin/bash" in deployer
-    assert "configure-main-managed-installation-ssh.sh'" in deployer
-
-
 def test_public_nginx_contract_separates_refresh_and_returns_json_errors():
     security = (PUBLIC / "nginx-00-hermes-security.conf").read_text(
         encoding="utf-8"

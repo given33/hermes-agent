@@ -73,14 +73,29 @@ cp --preserve=mode,ownership,timestamps -- "${sshd_config}" "${backup}"
 chmod 0600 "${backup}"
 
 changed=0
+restore_original() {
+  local rollback_candidate
+  rollback_candidate="$(mktemp "${config_dir}/.sshd_config.rollback.XXXXXX")"
+  if ! install -o "${config_uid}" -g "${config_gid}" -m "${config_mode}" \
+      "${backup}" "${rollback_candidate}" \
+    || ! "${sshd_binary}" -t -f "${rollback_candidate}" \
+    || ! sync -f "${rollback_candidate}"; then
+    rm -f -- "${rollback_candidate}"
+    return 1
+  fi
+  if ! mv -f -- "${rollback_candidate}" "${sshd_config}" \
+    || ! sync -f "${config_dir}" \
+    || ! reload_sshd; then
+    rm -f -- "${rollback_candidate}"
+    return 1
+  fi
+}
 on_exit() {
   local status=$?
   trap - EXIT INT TERM HUP
   rm -f -- "${candidate}"
   if [[ "${status}" != 0 && "${changed}" == 1 ]]; then
-    install -o "${config_uid}" -g "${config_gid}" -m "${config_mode}" \
-      "${backup}" "${sshd_config}"
-    if ! "${sshd_binary}" -t -f "${sshd_config}" || ! reload_sshd; then
+    if ! restore_original; then
       printf '%s\n' "configure-main-managed-installation-ssh: rollback failed" >&2
       exit 70
     fi
@@ -128,9 +143,10 @@ PY
 chown "${config_uid}:${config_gid}" "${candidate}"
 chmod "${config_mode}" "${candidate}"
 "${sshd_binary}" -t -f "${candidate}" || die "candidate sshd configuration is invalid"
-install -o "${config_uid}" -g "${config_gid}" -m "${config_mode}" \
-  "${candidate}" "${sshd_config}"
 changed=1
+sync -f "${candidate}" || die "candidate sshd configuration could not be synced"
+mv -f -- "${candidate}" "${sshd_config}" || die "atomic sshd configuration replacement failed"
+sync -f "${config_dir}" || die "sshd configuration directory could not be synced"
 validate_effective
 reload_sshd || die "sshd reload failed"
 validate_effective

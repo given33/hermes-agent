@@ -165,6 +165,35 @@ if [[ "${mode}" == "-T" ]]; then
   awk 'tolower($1) == "permitlisten" { $1="permitlisten"; print }' "${config}"
 fi
 SH
+cat >"${fake_bin}/mv" <<'SH'
+#!/usr/bin/env bash
+set -euo pipefail
+target="${!#}"
+if [[ "${FAKE_SSH_MV_FAIL_ONCE:-0}" == 1 \
+  && "${target}" == "${HERMES_SSHD_CONFIG}" \
+  && ! -e "${FAKE_SSH_MV_MARKER}" ]]; then
+  /usr/bin/mv "$@"
+  : >"${FAKE_SSH_MV_MARKER}"
+  exit 1
+fi
+exec /usr/bin/mv "$@"
+SH
+cat >"${fake_bin}/ssh" <<'SH'
+#!/usr/bin/env bash
+set -euo pipefail
+command="${!#}"
+printf '%s\n' "${command}" >>"${FAKE_DEPLOY_SSH_LOG}"
+if [[ "${FAKE_DEPLOY_CONFIGURE_FAIL:-0}" == 1 \
+  && "${command}" == *"sudo -n /bin/bash"* \
+  && "${command}" == *"configure-main-managed-installation-ssh.sh"* ]]; then
+  exit 1
+fi
+SH
+cat >"${fake_bin}/scp" <<'SH'
+#!/usr/bin/env bash
+set -euo pipefail
+printf '%s\n' "$*" >>"${FAKE_DEPLOY_SCP_LOG}"
+SH
 cat >"${fake_bin}/nginx" <<'SH'
 #!/usr/bin/env bash
 printf '%s\n' "$*" >>"${FAKE_NGINX_LOG}"
@@ -242,15 +271,20 @@ else
   printf '%s\n' "${payload}"
 fi
 SH
-chmod 0755 "${fake_bin}/systemctl" "${fake_bin}/sshd" "${fake_bin}/nginx" "${fake_bin}/sleep" "${fake_bin}/curl"
+chmod 0755 "${fake_bin}/systemctl" "${fake_bin}/sshd" "${fake_bin}/mv" \
+  "${fake_bin}/ssh" "${fake_bin}/scp" "${fake_bin}/nginx" \
+  "${fake_bin}/sleep" "${fake_bin}/curl"
 
 ssh_configurator="${repo}/deploy/recovery/configure-main-managed-installation-ssh.sh"
 ssh_reload_marker="${work}/ssh-reload-failed"
+ssh_mv_marker="${work}/ssh-mv-failed"
 run_ssh_configurator() {
   env \
     PATH="${fake_bin}:${PATH}" \
     FAKE_SSH_RELOAD_FAIL_ONCE="${1:-0}" \
     FAKE_SSH_RELOAD_MARKER="${ssh_reload_marker}" \
+    FAKE_SSH_MV_FAIL_ONCE="${2:-0}" \
+    FAKE_SSH_MV_MARKER="${ssh_mv_marker}" \
     HERMES_SSHD_CONFIG="${sshd_config}" \
     HERMES_SSHD_BINARY="${fake_bin}/sshd" \
     HERMES_SSHD_SERVICE="ssh-test.service" \
@@ -272,6 +306,42 @@ sshd_failure_status=$?
 set -e
 [[ "${sshd_failure_status}" -ne 0 ]]
 cmp -- "${sshd_original}" "${sshd_config}"
+cp "${sshd_original}" "${sshd_config}"
+rm -f -- "${ssh_mv_marker}"
+set +e
+run_ssh_configurator 0 1 >"${work}/sshd-mv-failure.stdout" \
+  2>"${work}/sshd-mv-failure.stderr"
+sshd_mv_failure_status=$?
+set -e
+[[ "${sshd_mv_failure_status}" -ne 0 ]]
+cmp -- "${sshd_original}" "${sshd_config}"
+
+deployer="${repo}/deploy/public/deploy-collaboration-backend.sh"
+deploy_ssh_log="${work}/deploy-ssh.log"
+deploy_scp_log="${work}/deploy-scp.log"
+: >"${deploy_ssh_log}"
+: >"${deploy_scp_log}"
+set +e
+env \
+  PATH="${fake_bin}:${PATH}" \
+  FAKE_DEPLOY_CONFIGURE_FAIL=1 \
+  FAKE_DEPLOY_SSH_LOG="${deploy_ssh_log}" \
+  FAKE_DEPLOY_SCP_LOG="${deploy_scp_log}" \
+  HERMES_REPO="${repo}" \
+  HERMES_LOCAL_PYTHON="${runtime_python}" \
+  HERMES_COLLABORATION_VERSION="${version}" \
+  HERMES_PUBLIC_REMOTE="admin@test.invalid" \
+  /bin/bash "${deployer}" >"${work}/deployer-failure.stdout" \
+    2>"${work}/deployer-failure.stderr"
+deployer_failure_status=$?
+set -e
+[[ "${deployer_failure_status}" -ne 0 ]]
+grep -Fq "configure-main-managed-installation-ssh.sh" "${deploy_ssh_log}"
+if grep -Eq "sudo -n /bin/bash .*install-collaboration-backend\.sh" "${deploy_ssh_log}"; then
+  printf '%s\n' "installer ran after SSH configuration failure" >&2
+  exit 1
+fi
+[[ "$(tail -n 1 "${deploy_ssh_log}")" == "rm -rf -- "* ]]
 
 run_installer() {
   env \

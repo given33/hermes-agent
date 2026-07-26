@@ -89,6 +89,24 @@ if [[ -n "${HERMES_SSH_IDENTITY:-}" ]]; then
   ssh_args+=(-i "${HERMES_SSH_IDENTITY}" -o IdentitiesOnly=yes)
 fi
 
+stage_created=0
+cleanup_remote_stage() {
+  local status=$?
+  trap - EXIT
+  if [[ "${stage_created}" == 1 ]]; then
+    if ! ssh "${ssh_args[@]}" "${remote}" "rm -rf -- '${stage}'"; then
+      printf '%s\n' "deploy-collaboration-backend: remote stage cleanup failed" >&2
+      [[ "${status}" != 0 ]] || status=1
+    fi
+  fi
+  exit "${status}"
+}
+trap cleanup_remote_stage EXIT
+trap 'exit 130' INT
+trap 'exit 143' TERM
+trap 'exit 129' HUP
+
+stage_created=1
 ssh "${ssh_args[@]}" "${remote}" "install -d -m 0700 '${stage}' '${stage}/agent' '${stage}/plugins/collaboration/dashboard/dist' '${stage}/hermes_cli' '${stage}/hermes_cli/dashboard_auth' '${stage}/tui_gateway' '${stage}/plugins/ios-intelligence/dashboard' '${stage}/plugins/dashboard_auth/basic' '${stage}/tools' '${stage}/deploy/public' '${stage}/deploy/recovery'"
 scp "${ssh_args[@]}" \
   "${repo}/plugins/collaboration/dashboard/plugin_api.py" \
@@ -166,4 +184,3 @@ scp "${ssh_args[@]}" \
 scp "${ssh_args[@]}" "${installer}" "${remote}:${stage}/install-collaboration-backend.sh"
 ssh "${ssh_args[@]}" "${remote}" "chmod 0700 '${stage}/deploy/recovery/configure-main-managed-installation-ssh.sh'; sudo -n /bin/bash '${stage}/deploy/recovery/configure-main-managed-installation-ssh.sh'"
 ssh "${ssh_args[@]}" "${remote}" "chmod 0700 '${stage}/install-collaboration-backend.sh'; sudo -n /bin/bash '${stage}/install-collaboration-backend.sh' '${version}' '${stage}'"
-ssh "${ssh_args[@]}" "${remote}" "rm -rf -- '${stage}'"
