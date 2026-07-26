@@ -7,6 +7,7 @@ die() { printf 'configure-main-managed-installation-ssh: %s\n' "$*" >&2; exit 1;
 
 sshd_config="${HERMES_SSHD_CONFIG:-/etc/ssh/sshd_config}"
 sshd_binary="${HERMES_SSHD_BINARY:-/usr/sbin/sshd}"
+python_binary="${HERMES_SSHD_PYTHON:-python3}"
 sshd_service="${HERMES_SSHD_SERVICE:-}"
 lock_file="${HERMES_SSHD_LOCK_FILE:-/run/lock/hermes-agent/managed-installation-ssh.lock}"
 backup_root="${HERMES_BACKUP_ROOT:-/var/backups/hermes-agent}"
@@ -16,6 +17,7 @@ match_user="${HERMES_SSHD_MATCH_USER:-admin}"
 match_address="${HERMES_SSHD_MATCH_ADDRESS:-10.66.0.3}"
 
 [[ -x "${sshd_binary}" ]] || die "sshd binary is missing"
+command -v "${python_binary}" >/dev/null 2>&1 || die "Python runtime is missing"
 [[ -f "${sshd_config}" && ! -L "${sshd_config}" ]] || die "unsafe sshd config"
 [[ "$(stat -c '%u' "${sshd_config}")" == 0 ]] || die "sshd config must be root-owned"
 config_dir="$(dirname "${sshd_config}")"
@@ -90,7 +92,7 @@ trap 'exit 130' INT
 trap 'exit 143' TERM
 trap 'exit 129' HUP
 
-python3 - "${sshd_config}" "${candidate}" "${anchor}" "${required}" <<'PY'
+"${python_binary}" - "${sshd_config}" "${candidate}" "${anchor}" "${required}" <<'PY'
 from pathlib import Path
 import re
 import sys
@@ -100,7 +102,7 @@ target = Path(sys.argv[2])
 anchor = sys.argv[3]
 required = sys.argv[4]
 lines = source.read_text(encoding="utf-8").splitlines(keepends=True)
-matches: list[int] = []
+matches = []
 for index, line in enumerate(lines):
     match = re.match(r"^(\s*PermitListen\s+)(.*?)(\r?\n)?$", line, re.IGNORECASE)
     if not match:
@@ -119,7 +121,8 @@ configuration = configuration.rstrip() + " " + required
 if marker:
     configuration += " #" + comment
 lines[index] = configuration + newline
-target.write_text("".join(lines), encoding="utf-8", newline="")
+with open(target, "w", encoding="utf-8", newline="") as handle:
+    handle.write("".join(lines))
 PY
 
 chown "${config_uid}:${config_gid}" "${candidate}"
