@@ -259,10 +259,10 @@ install -d -o root -g "${receiver_user}" -m 0750 "$(dirname "${token_target}")"
 install -d -o "${receiver_user}" -g "${receiver_user}" -m 0700 \
   "${receiver_home}" "${receiver_home}/managed-projects" "${unit_dir}" "${ssh_dir}"
 transaction_started=1
-install -o root -g "${receiver_user}" -m 0640 \
+install -o "${receiver_user}" -g "${receiver_user}" -m 0600 \
   "${token_source}" "${token_target}.new.$$"
 mv -f -- "${token_target}.new.$$" "${token_target}"
-[[ "$(stat -c '%U:%G:%a' "${token_target}")" == "root:${receiver_user}:640" ]] \
+[[ "$(stat -c '%U:%G:%a' "${token_target}")" == "${receiver_user}:${receiver_user}:600" ]] \
   || die "installed managed installation token metadata is invalid"
 unset token_source_value
 install -o "${receiver_user}" -g "${receiver_user}" -m 0600 \

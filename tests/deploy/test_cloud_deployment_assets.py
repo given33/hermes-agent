@@ -154,6 +154,9 @@ def test_managed_installation_receivers_probe_their_real_bind_and_rollback_safel
     )
     assert safe_restore in dbb3
     assert safe_restore in wsl
+    assert 'install -o "${receiver_user}" -g "${receiver_user}" -m 0600' in wsl
+    assert '"${receiver_user}:${receiver_user}:600"' in wsl
+    assert 'install -o root -g "${receiver_user}" -m 0640' not in wsl
     assert 'local current="$1" name="$2" temporary="${current}.rollback.$$"' not in dbb3
     assert 'local current="$1" name="$2" temporary="${current}.rollback.$$"' not in wsl
     assert dbb3.count("http://10.66.0.2:9122/") == 3
