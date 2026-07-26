@@ -81,7 +81,9 @@ backup_one() {
   fi
 }
 restore_one() {
-  local current="$1" name="$2" temporary="${current}.rollback.$$"
+  local current="$1"
+  local name="$2"
+  local temporary="${current}.rollback.$$"
   rm -f -- "${temporary}"
   if [[ -f "${backup}/${name}.present" ]]; then
     cp -a -- "${backup}/${name}" "${temporary}" && mv -f -- "${temporary}" "${current}"
@@ -157,7 +159,7 @@ printf 'header = "X-DBB3-Token: %s"\nheader = "Accept: application/json"\n' \
 healthy=0
 for _ in $(seq 1 30); do
   if curl --fail --silent --show-error --max-time 2 --noproxy '*' \
-      --config "${health_cfg}" http://127.0.0.1:9122/health \
+      --config "${health_cfg}" http://10.66.0.2:9122/health \
       | "${runtime_python}" -c \
         'import json,sys; d=json.load(sys.stdin); assert d.get("ok") is True; assert d.get("node_id")=="dbb3"; assert d.get("installations") is True; assert d.get("recovery") is False'; then
     healthy=1
@@ -175,10 +177,10 @@ printf '{"id":"%s","request_id":"%s","node_id":"dbb3","kind":"probe","identifier
 curl --fail --silent --show-error --max-time 5 --noproxy '*' \
   --config "${health_cfg}" -H 'Content-Type: application/json' \
   --data-binary "@${probe_body}" -o "${probe_post}" \
-  http://127.0.0.1:9122/installations
+  http://10.66.0.2:9122/installations
 curl --fail --silent --show-error --max-time 5 --noproxy '*' \
   --config "${health_cfg}" -o "${probe_get}" \
-  "http://127.0.0.1:9122/installations/${probe_id}"
+  "http://10.66.0.2:9122/installations/${probe_id}"
 "${runtime_python}" - "${probe_post}" "${probe_get}" "${probe_id}" dbb3 <<'PY'
 import json, sys
 post = json.load(open(sys.argv[1], encoding="utf-8"))

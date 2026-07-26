@@ -133,7 +133,9 @@ backup_one() {
   fi
 }
 restore_one() {
-  local current="$1" name="$2" temporary="${current}.rollback.$$"
+  local current="$1"
+  local name="$2"
+  local temporary="${current}.rollback.$$"
   rm -f -- "${temporary}"
   if [[ -f "${backup}/${name}.present" ]]; then
     cp -a -- "${backup}/${name}" "${temporary}" && mv -f -- "${temporary}" "${current}"

@@ -139,6 +139,28 @@ def test_deployment_shell_scripts_have_valid_syntax():
         assert result.returncode == 0, (path, result.stderr)
 
 
+def test_managed_installation_receivers_probe_their_real_bind_and_rollback_safely():
+    dbb3 = (RECOVERY / "install-dbb3-managed-installation-receiver.sh").read_text(
+        encoding="utf-8"
+    )
+    wsl = (RECOVERY / "install-wsl-managed-installation.sh").read_text(
+        encoding="utf-8"
+    )
+
+    safe_restore = (
+        'local current="$1"\n'
+        '  local name="$2"\n'
+        '  local temporary="${current}.rollback.$$"'
+    )
+    assert safe_restore in dbb3
+    assert safe_restore in wsl
+    assert 'local current="$1" name="$2" temporary="${current}.rollback.$$"' not in dbb3
+    assert 'local current="$1" name="$2" temporary="${current}.rollback.$$"' not in wsl
+    assert dbb3.count("http://10.66.0.2:9122/") == 3
+    assert "http://127.0.0.1:9122/" not in dbb3
+    assert wsl.count("http://127.0.0.1:9122/") == 3
+
+
 def test_public_nginx_contract_separates_refresh_and_returns_json_errors():
     security = (PUBLIC / "nginx-00-hermes-security.conf").read_text(
         encoding="utf-8"
