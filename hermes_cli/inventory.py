@@ -83,7 +83,7 @@ def load_picker_context() -> ConfigContext:
     Replaces the inline 17-LOC config-slice that ``web_server.py`` and
     ``tui_gateway/server.py`` (×2 sites) used to do.
     """
-    from hermes_cli.config import get_compatible_custom_providers, load_config
+    from hermes_runtime.config import get_compatible_custom_providers, load_config
 
     cfg = load_config()
     model_cfg = cfg.get("model", {})
@@ -418,7 +418,7 @@ def _raw_config_has_enabled_moa_preset() -> bool:
     one enabled preset (or an older flat MoA config) in their own config.yaml.
     """
     try:
-        from hermes_cli.config import read_raw_config
+        from hermes_runtime.config import read_raw_config
 
         raw = read_raw_config()
     except Exception:
@@ -608,7 +608,7 @@ def _moa_provider_row(current_provider: str = "") -> dict | None:
     row shape stays in one place. Returns ``None`` when no MoA presets exist.
     """
     try:
-        from hermes_cli.config import load_config
+        from hermes_runtime.config import load_config
         from hermes_cli.moa_config import normalize_moa_config
 
         cfg = normalize_moa_config(load_config().get("moa") or {})

@@ -1124,8 +1124,8 @@ def interactive_setup() -> None:
     ``hermes_cli/setup.py::_setup_mattermost`` function this migration
     removes.
     """
-    from hermes_cli.config import get_env_value, save_env_value
-    from hermes_cli.cli_output import (
+    from hermes_runtime.config import get_env_value, save_env_value
+    from hermes_runtime.console_output import (
         prompt,
         prompt_yes_no,
         print_header,

@@ -32,7 +32,9 @@ from dataclasses import dataclass
 from pathlib import Path, PurePosixPath, PureWindowsPath
 from typing import List, Optional, Tuple
 
-from agent.skill_utils import is_excluded_skill_path
+from hermes_runtime.skill_utils import is_excluded_skill_path
+from hermes_runtime.config import read_raw_config
+from hermes_runtime import process_probe
 
 _PROFILE_ID_RE = re.compile(r"^[a-z0-9][a-z0-9_-]{0,63}$")
 
@@ -520,7 +522,7 @@ def _migrate_profile_config_if_outdated(profile_dir: Path) -> None:
 
     try:
         from hermes_constants import reset_hermes_home_override, set_hermes_home_override
-        from hermes_cli.config import check_config_version, migrate_config
+        from hermes_runtime.config import check_config_version, migrate_config
 
         token = set_hermes_home_override(str(profile_dir))
         try:
@@ -778,9 +780,7 @@ def _read_config_model(profile_dir: Path) -> tuple:
     if not config_path.exists():
         return None, None
     try:
-        import yaml
-        with open(config_path, "r", encoding="utf-8") as f:
-            cfg = yaml.safe_load(f) or {}
+        cfg = read_raw_config(config_path=config_path)
         model_cfg = cfg.get("model", {})
         if isinstance(model_cfg, str):
             return model_cfg, None
@@ -1225,7 +1225,7 @@ def create_profile(
     soul_path = profile_dir / "SOUL.md"
     if not soul_path.exists():
         try:
-            from hermes_cli.default_soul import DEFAULT_SOUL_MD
+            from hermes_runtime.default_soul import DEFAULT_SOUL_MD
             soul_path.write_text(DEFAULT_SOUL_MD, encoding="utf-8")
         except Exception:
             pass  # best-effort — don't fail profile creation over this
@@ -1505,7 +1505,7 @@ def _stop_profile_backends(canon: str, profile_dir: Path) -> None:
         return
 
     try:
-        from gateway.status import _pid_exists, terminate_pid as _terminate_pid
+        from gateway.status import terminate_pid as _terminate_pid
     except Exception:
         return
 
@@ -1518,12 +1518,12 @@ def _stop_profile_backends(canon: str, profile_dir: Path) -> None:
     # Wait up to 10s for graceful exit, then force-kill stragglers.
     deadline = time.time() + 10.0
     while time.time() < deadline:
-        if not any(_pid_exists(pid) for pid in pids):
+        if not any(process_probe.pid_exists(pid) for pid in pids):
             break
         time.sleep(0.5)
 
     for pid in pids:
-        if _pid_exists(pid):
+        if process_probe.pid_exists(pid):
             try:
                 _terminate_pid(pid, force=True)
             except (ProcessLookupError, PermissionError, OSError):
@@ -1866,13 +1866,12 @@ def _stop_gateway_process(profile_dir: Path) -> None:
         # and raw os.kill with SIGTERM doesn't cascade to child processes
         # the same way taskkill /T does.
         from gateway.status import terminate_pid as _terminate_pid
-        from gateway.status import _pid_exists
         _terminate_pid(pid)  # graceful first
         # Wait up to 10s for graceful shutdown. On Windows, os.kill(pid, 0)
         # is NOT a no-op — use the handle-based existence check.
         for _ in range(20):
             _time.sleep(0.5)
-            if not _pid_exists(pid):
+            if not process_probe.pid_exists(pid):
                 print(f"✓ Gateway stopped (PID {pid})")
                 return
         # Force kill
@@ -1937,30 +1936,10 @@ def set_active_profile(name: str) -> None:
 
 
 def get_active_profile_name() -> str:
-    """Infer the current profile name from HERMES_HOME.
+    """Compatibility export for the runtime-owned profile identity helper."""
+    from hermes_runtime.profile_identity import get_active_profile_name as resolve
 
-    Returns ``"default"`` if HERMES_HOME is not set or points to ``~/.hermes``.
-    Returns the profile name if HERMES_HOME points into ``~/.hermes/profiles/<name>``.
-    Returns ``"custom"`` if HERMES_HOME is set to an unrecognized path.
-    """
-    from hermes_constants import get_hermes_home
-    hermes_home = get_hermes_home()
-    resolved = hermes_home.resolve()
-
-    default_resolved = _get_default_hermes_home().resolve()
-    if resolved == default_resolved:
-        return "default"
-
-    profiles_root = _get_profiles_root().resolve()
-    try:
-        rel = resolved.relative_to(profiles_root)
-        parts = rel.parts
-        if len(parts) == 1 and _PROFILE_ID_RE.match(parts[0]):
-            return parts[0]
-    except ValueError:
-        pass
-
-    return "custom"
+    return resolve()
 
 
 # ---------------------------------------------------------------------------

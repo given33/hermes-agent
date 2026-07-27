@@ -37,14 +37,14 @@ from typing import Any, Dict, List, Optional
 import yaml
 
 from hermes_constants import get_hermes_home, get_optional_mcps_dir
-from hermes_cli.colors import Colors, color
-from hermes_cli.config import (
+from hermes_runtime.colors import Colors, color
+from hermes_runtime.config import (
     load_config,
     save_config,
     get_env_value,
     save_env_value,
 )
-from hermes_cli.cli_output import prompt as _prompt_input
+from hermes_runtime.console_output import prompt as _prompt_input
 
 _MANIFEST_VERSION = 1
 

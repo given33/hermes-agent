@@ -19,6 +19,8 @@ import logging
 import re
 from typing import Any
 
+from hermes_runtime.text_safety import sanitize_surrogates
+
 logger = logging.getLogger(__name__)
 
 # Lone surrogate code points are invalid in UTF-8 and crash json.dumps
@@ -34,9 +36,7 @@ def _sanitize_surrogates(text: str) -> str:
     Surrogates are invalid in UTF-8 and will crash ``json.dumps()`` inside the
     OpenAI SDK.  This is a fast no-op when the text contains no surrogates.
     """
-    if _SURROGATE_RE.search(text):
-        return _SURROGATE_RE.sub('\ufffd', text)
-    return text
+    return sanitize_surrogates(text)
 
 
 def _sanitize_structure_surrogates(payload: Any) -> bool:

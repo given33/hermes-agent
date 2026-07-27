@@ -1189,7 +1189,12 @@ class TestDeleteSkillRmtreeGuard:
         skills = tmp_path / "skills"
         skills.mkdir()
         evil = skills / "evil-skill"
-        evil.symlink_to(victim, target_is_directory=True)
+        try:
+            evil.symlink_to(victim, target_is_directory=True)
+        except OSError as exc:
+            if getattr(exc, "winerror", None) == 1314:
+                pytest.skip("Windows symlink privilege is not enabled")
+            raise
         try:
             with patch("tools.skill_manager_tool.SKILLS_DIR", skills), \
                  patch("agent.skill_utils.get_all_skills_dirs", return_value=[skills]), \

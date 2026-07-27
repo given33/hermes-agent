@@ -15,30 +15,9 @@ _VALID_MODAL_MODES = {"auto", "direct", "managed"}
 
 
 def managed_nous_tools_enabled(*, force_fresh: bool = False) -> bool:
-    """Return True when the user is entitled to the Nous Tool Gateway.
-
-    Entitlement is paid Nous Portal service access OR a live free tool pool
-    (``tool_gateway_entitled``). Per-category coverage (the pool funds image but
-    not video, etc.) is narrowed by callers via ``tool_gateway_entitled_for``;
-    this coarse gate only answers "is any managed tool usable at all".
-
-    Tool Gateway availability fails closed on unknown/error entitlement.  We
-    intentionally catch all exceptions and return False — never block startup.
-    ``force_fresh=True`` is for interactive configuration flows that should
-    reflect a just-purchased subscription, credits, or pool grant immediately.
-    """
-    try:
-        from hermes_cli.nous_account import get_nous_portal_account_info
-
-        if force_fresh:
-            account_info = get_nous_portal_account_info(force_fresh=True)
-        else:
-            account_info = get_nous_portal_account_info()
-        if not account_info.logged_in:
-            return False
-        return account_info.tool_gateway_entitled
-    except Exception:
-        return False
+    """Nous account-managed tools are not part of this fork's product surface."""
+    del force_fresh
+    return False
 
 
 def nous_tool_gateway_unavailable_message(
@@ -46,26 +25,9 @@ def nous_tool_gateway_unavailable_message(
     *,
     force_fresh: bool = False,
 ) -> str:
-    """Return account-aware guidance for an unavailable Nous Tool Gateway path."""
-    try:
-        from hermes_cli.nous_account import (
-            format_nous_portal_entitlement_message,
-            get_nous_portal_account_info,
-        )
-
-        account_info = get_nous_portal_account_info(force_fresh=force_fresh)
-        message = format_nous_portal_entitlement_message(
-            account_info,
-            capability=capability,
-        )
-        if message:
-            return message
-    except Exception:
-        pass
-    return (
-        f"{capability} is unavailable. Run `hermes model` to refresh your "
-        "Nous Portal login and billing status."
-    )
+    """Explain that account-managed backends are unavailable in this fork."""
+    del force_fresh
+    return f"{capability} is unavailable. Configure a direct provider and API key."
 
 
 def normalize_browser_cloud_provider(value: object | None) -> str:
@@ -152,7 +114,7 @@ def prefers_gateway(config_section: str) -> bool:
     Reads ``<section>.use_gateway`` from config.yaml.  Never raises.
     """
     try:
-        from hermes_cli.config import load_config
+        from hermes_runtime.config import load_config
         section = (load_config() or {}).get(config_section)
         if isinstance(section, dict):
             return is_truthy_value(section.get("use_gateway"), default=False)
@@ -174,7 +136,7 @@ def fal_key_is_configured() -> bool:
         # Fall back to the .env file for CLI paths that may run before
         # dotenv is loaded into os.environ.
         try:
-            from hermes_cli.config import get_env_value
+            from hermes_runtime.config import get_env_value
 
             value = get_env_value("FAL_KEY")
         except Exception:

@@ -303,6 +303,7 @@ def test_resolve_runtime_provider_codex(monkeypatch):
 
 def test_resolve_runtime_provider_qwen_oauth(monkeypatch):
     monkeypatch.setattr(rp, "resolve_provider", lambda *a, **k: "qwen-oauth")
+    monkeypatch.setattr(rp, "load_pool", lambda _provider: SimpleNamespace(has_credentials=lambda: False))
     monkeypatch.setattr(
         rp,
         "resolve_qwen_runtime_credentials",
@@ -363,6 +364,7 @@ def test_qwen_oauth_auto_fallthrough_on_auth_failure(monkeypatch):
     from hermes_cli.auth import AuthError
 
     monkeypatch.setattr(rp, "resolve_provider", lambda *a, **k: "qwen-oauth")
+    monkeypatch.setattr(rp, "load_pool", lambda _provider: SimpleNamespace(has_credentials=lambda: False))
     monkeypatch.setattr(
         rp,
         "resolve_qwen_runtime_credentials",
@@ -1137,12 +1139,11 @@ def test_named_custom_provider_does_not_shadow_builtin_provider(monkeypatch):
     )
     monkeypatch.setattr(
         rp,
-        "resolve_nous_runtime_credentials",
-        lambda **kwargs: {
+        "resolve_api_key_provider_credentials",
+        lambda provider: {
             "base_url": "https://inference-api.nousresearch.com/v1",
             "api_key": "nous-runtime-key",
-            "source": "portal",
-            "expires_at": None,
+            "source": "test",
         },
     )
 
@@ -1152,49 +1153,6 @@ def test_named_custom_provider_does_not_shadow_builtin_provider(monkeypatch):
     assert resolved["base_url"] == "https://inference-api.nousresearch.com/v1"
     assert resolved["api_key"] == "nous-runtime-key"
     assert resolved["requested_provider"] == "nous"
-
-
-def test_nous_pool_entry_refreshes_expired_agent_key(monkeypatch):
-    stale_token = _fake_invoke_jwt(ttl_seconds=-60)
-    fresh_token = _fake_invoke_jwt(ttl_seconds=3600)
-
-    class _Entry:
-        def __init__(self, token):
-            self.access_token = "pool-access-token"
-            self.agent_key = token
-            self.agent_key_expires_at = "2099-01-01T00:00:00+00:00"
-            self.scope = "inference:invoke"
-            self.base_url = "https://inference.pool.example/v1"
-            self.source = "manual:nous"
-
-        @property
-        def runtime_api_key(self):
-            return self.agent_key
-
-    class _Pool:
-        refreshed = False
-
-        def has_credentials(self):
-            return True
-
-        def select(self):
-            return _Entry(stale_token)
-
-        def try_refresh_current(self):
-            self.refreshed = True
-            return _Entry(fresh_token)
-
-    pool = _Pool()
-    monkeypatch.setattr(rp, "resolve_provider", lambda *a, **k: "nous")
-    monkeypatch.setattr(rp, "load_pool", lambda provider: pool)
-    monkeypatch.setattr(rp, "_get_model_config", lambda: {"provider": "nous"})
-
-    resolved = rp.resolve_runtime_provider(requested="nous")
-
-    assert pool.refreshed is True
-    assert resolved["provider"] == "nous"
-    assert resolved["api_key"] == fresh_token
-    assert resolved["base_url"] == "https://inference.pool.example/v1"
 
 
 def test_named_custom_provider_wins_over_builtin_alias(monkeypatch):
@@ -1880,8 +1838,7 @@ def test_custom_provider_no_key_gets_placeholder(monkeypatch):
 
 
 def test_auto_detected_nous_auth_failure_falls_through_to_openrouter(monkeypatch):
-    """When auto-detect picks Nous but credentials are revoked, fall through to OpenRouter."""
-    from hermes_cli.auth import AuthError
+    """A stale auto-selected Nous provider without an API key falls through."""
 
     monkeypatch.setenv("OPENROUTER_API_KEY", "test-or-key")
     monkeypatch.delenv("OPENAI_API_KEY", raising=False)
@@ -1895,13 +1852,10 @@ def test_auto_detected_nous_auth_failure_falls_through_to_openrouter(monkeypatch
     monkeypatch.setattr(rp, "load_pool", lambda p: type("P", (), {
         "has_credentials": lambda self: False,
     })())
-    # Nous credential resolution fails with revoked token
     monkeypatch.setattr(
-        rp, "resolve_nous_runtime_credentials",
-        lambda **kw: (_ for _ in ()).throw(
-            AuthError("Refresh session has been revoked",
-                      provider="nous", code="invalid_grant", relogin_required=True)
-        ),
+        rp,
+        "resolve_api_key_provider_credentials",
+        lambda provider: {"api_key": "", "base_url": "", "source": "default"},
     )
 
     # With requested="auto", should fall through to OpenRouter
@@ -1938,7 +1892,7 @@ def test_auto_detected_codex_auth_failure_falls_through_to_openrouter(monkeypatc
 
 
 def test_explicit_nous_auth_failure_still_raises(monkeypatch):
-    """When user explicitly requests Nous and auth fails, the error should propagate."""
+    """Explicit Nous selection reports a missing direct API key."""
     from hermes_cli.auth import AuthError
     import pytest
 
@@ -1950,15 +1904,13 @@ def test_explicit_nous_auth_failure_still_raises(monkeypatch):
         "has_credentials": lambda self: False,
     })())
     monkeypatch.setattr(
-        rp, "resolve_nous_runtime_credentials",
-        lambda **kw: (_ for _ in ()).throw(
-            AuthError("Refresh session has been revoked",
-                      provider="nous", code="invalid_grant", relogin_required=True)
-        ),
+        rp,
+        "resolve_api_key_provider_credentials",
+        lambda provider: {"api_key": "", "base_url": "", "source": "default"},
     )
 
     # With explicit "nous", should raise — don't silently switch providers
-    with pytest.raises(AuthError, match="Refresh session has been revoked"):
+    with pytest.raises(AuthError, match="NOUS_API_KEY"):
         rp.resolve_runtime_provider(requested="nous")
 
 

@@ -29,7 +29,7 @@ import shutil
 from datetime import datetime, timezone
 from pathlib import Path, PurePosixPath
 from hermes_constants import get_bundled_skills_dir, get_hermes_home, get_optional_skills_dir
-from agent.skill_utils import is_excluded_skill_path
+from hermes_runtime.skill_utils import is_excluded_skill_path
 from typing import Dict, List, Optional, Set, Tuple
 from utils import atomic_replace
 
@@ -72,12 +72,15 @@ def _build_external_skill_index() -> Set[str]:
     Used to prevent sync_skills from shadowing externally-delegated skills.
     """
     try:
-        from agent.skill_utils import get_external_skills_dirs, _external_dirs_cache_clear
+        from hermes_runtime.skill_utils import (
+            clear_external_skills_cache,
+            get_external_skills_dirs,
+        )
     except ImportError:
         return set()
 
     # Clear the external dirs cache so a config edit (or a test patch) is seen.
-    _external_dirs_cache_clear()
+    clear_external_skills_cache()
 
     external_names: Set[str] = set()
     for ext_dir in get_external_skills_dirs():

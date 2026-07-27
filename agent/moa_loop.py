@@ -157,7 +157,7 @@ def _aggregator_reasoning_config(aggregator: dict[str, Any]) -> dict[str, Any] |
     if cfg is not None:
         return cfg
     try:
-        from hermes_cli.config import load_config
+        from hermes_runtime.config import load_config
         from hermes_constants import resolve_reasoning_config
 
         return resolve_reasoning_config(
@@ -188,7 +188,7 @@ def _slot_runtime(slot: dict[str, Any]) -> dict[str, Any]:
     model = str(slot.get("model") or "").strip()
     out: dict[str, Any] = {"provider": provider, "model": model}
     try:
-        from hermes_cli.runtime_provider import resolve_runtime_provider
+        from agent.runtime_provider import resolve_runtime_provider
 
         rt = resolve_runtime_provider(requested=provider, target_model=model)
         # Forward the resolved endpoint through to call_llm unconditionally.
@@ -906,8 +906,8 @@ class MoAChatCompletions:
             logger.debug("MoA reference_callback failed for %s: %s", event, exc)
 
     def create(self, **api_kwargs: Any) -> Any:
-        from hermes_cli.config import load_config
-        from hermes_cli.moa_config import resolve_moa_preset
+        from hermes_runtime.config import load_config
+        from agent.moa_config import resolve_moa_preset
 
         preset = resolve_moa_preset(load_config().get("moa") or {}, self.preset_name)
         messages = list(api_kwargs.get("messages") or [])

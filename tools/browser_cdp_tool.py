@@ -44,7 +44,7 @@ _CDP_PRIVATE_PAGE_ALLOWED_METHODS = {
 
 def _redact_cdp_output(value: Any) -> Any:
     """Redact browser-originated CDP result data before returning it."""
-    from agent.redact import redact_sensitive_text
+    from hermes_runtime.redaction import redact_sensitive_text
 
     if isinstance(value, str):
         return redact_sensitive_text(value, force=True)

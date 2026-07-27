@@ -68,7 +68,7 @@ from gateway.platforms.base import (
 )
 from hermes_constants import get_hermes_home
 from utils import atomic_json_write
-from agent.secret_scope import get_secret
+from hermes_runtime.secret_scope import get_secret
 
 ILINK_BASE_URL = "https://ilinkai.weixin.qq.com"
 WEIXIN_CDN_BASE_URL = "https://novac2c.cdn.weixin.qq.com/c2c"

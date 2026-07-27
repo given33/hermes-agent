@@ -60,7 +60,7 @@ def test_prepare_agent_startup_backgrounds_blocking_mcp_for_chat(monkeypatch):
     )
     monkeypatch.setitem(
         sys.modules,
-        "hermes_cli.config",
+        "hermes_runtime.config",
         types.SimpleNamespace(
             read_raw_config=lambda: {"mcp_servers": {"demo": {"transport": "stdio"}}},
             load_config=lambda: {},
@@ -117,7 +117,7 @@ def test_background_mcp_discovery_suppresses_interactive_oauth(monkeypatch):
 
     monkeypatch.setitem(
         sys.modules,
-        "hermes_cli.config",
+        "hermes_runtime.config",
         types.SimpleNamespace(
             read_raw_config=lambda: {"mcp_servers": {"demo": {"url": "https://mcp.example.test/mcp"}}},
         ),
@@ -156,7 +156,7 @@ def test_prepare_agent_startup_skips_mcp_bootstrap_for_tui_chat(monkeypatch):
     )
     monkeypatch.setitem(
         sys.modules,
-        "hermes_cli.config",
+        "hermes_runtime.config",
         types.SimpleNamespace(load_config=lambda: {}),
     )
     monkeypatch.setitem(

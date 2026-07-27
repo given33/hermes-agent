@@ -127,7 +127,7 @@ def write_approval_enabled(subsystem: str) -> bool:
     if subsystem not in _SUBSYSTEMS:
         return False
     try:
-        from hermes_cli.config import load_config, cfg_get
+        from hermes_runtime.config import load_config, cfg_get
         cfg = load_config()
         raw = cfg_get(cfg, subsystem, CONFIG_KEY, default=False)
     except Exception:

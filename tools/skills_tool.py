@@ -78,11 +78,12 @@ from pathlib import Path, PurePosixPath, PureWindowsPath
 from typing import Dict, Any, List, Optional, Set, Tuple
 
 from tools.registry import registry, tool_error
-from hermes_cli.config import cfg_get
+from hermes_runtime.config import cfg_get
 from utils import env_var_enabled
-from agent.skill_utils import (
+from hermes_runtime.skill_utils import (
     EXCLUDED_SKILL_DIRS as _EXCLUDED_SKILL_DIRS,
     is_skill_support_path as _is_skill_support_path,
+    register_primary_skills_dir_resolver,
 )
 
 logger = logging.getLogger(__name__)
@@ -104,35 +105,51 @@ _SKILLS_CACHE_KEY_FILTERED = "filtered"
 
 
 def _skills_scan_signature(dirs_to_scan, disabled) -> tuple:
-    """Cheap change-signature for the skill scan inputs.
+    """Return a stable topology signature for every configured skill root.
 
-    O(#dirs + #categories) stat calls, not a recursive walk. Includes the
-    platform the scan's ``skill_matches_platform`` filter will use (read
-    from ``agent.skill_utils``'s ``sys`` so test patches of that module
-    are honored) — the scan result is platform-dependent.
+    Skill categories can be nested arbitrarily, and some filesystems expose
+    directory mtimes with insufficient resolution for an install followed by
+    an immediate refresh. Record directory names plus the lightweight metadata
+    of each ``SKILL.md`` so add/remove/update operations invalidate the cache
+    without reading full skill contents.
     """
     from agent import skill_utils as _skill_utils
 
     platform = getattr(getattr(_skill_utils, "sys", None), "platform", "")
     sig = []
     for d in dirs_to_scan:
+        root = Path(d)
         try:
-            m = d.stat().st_mtime
+            root.resolve(strict=True)
         except OSError:
             continue
-        try:
-            with os.scandir(d) as it:
-                for entry in it:
-                    try:
-                        if entry.is_dir(follow_symlinks=False):
-                            em = entry.stat(follow_symlinks=False).st_mtime
-                            if em > m:
-                                m = em
-                    except OSError:
-                        continue
-        except OSError:
-            pass
-        sig.append((str(d), m))
+        for current, dirnames, filenames in os.walk(root, followlinks=False):
+            dirnames[:] = sorted(
+                name for name in dirnames if name not in _EXCLUDED_SKILL_DIRS
+            )
+            current_path = Path(current)
+            try:
+                relative = current_path.relative_to(root).as_posix()
+                directory_mtime = current_path.stat().st_mtime_ns
+            except OSError:
+                continue
+
+            skill_meta = None
+            if "SKILL.md" in filenames:
+                try:
+                    stat = (current_path / "SKILL.md").stat()
+                    skill_meta = (stat.st_mtime_ns, stat.st_size)
+                except OSError:
+                    skill_meta = (None, None)
+            sig.append(
+                (
+                    str(root),
+                    relative,
+                    directory_mtime,
+                    tuple(dirnames),
+                    skill_meta,
+                )
+            )
     return (tuple(sig), frozenset(disabled), platform)
 
 
@@ -141,6 +158,7 @@ def _skills_scan_signature(dirs_to_scan, disabled) -> tuple:
 # skills all coexist here without polluting the git repo.
 HERMES_HOME = get_hermes_home()
 SKILLS_DIR = HERMES_HOME / "skills"
+register_primary_skills_dir_resolver(lambda: SKILLS_DIR)
 _SKILLS_DIR_AT_IMPORT = SKILLS_DIR
 
 
@@ -249,22 +267,22 @@ def set_secret_capture_callback(callback) -> None:
 def skill_matches_platform(frontmatter: Dict[str, Any]) -> bool:
     """Check if a skill is compatible with the current OS platform.
 
-    Delegates to ``agent.skill_utils.skill_matches_platform`` — kept here
+    Delegates to ``hermes_runtime.skill_utils.skill_matches_platform`` — kept here
     as a public re-export so existing callers don't need updating.
     """
-    from agent.skill_utils import skill_matches_platform as _impl
+    from hermes_runtime.skill_utils import skill_matches_platform as _impl
     return _impl(frontmatter)
 
 
 def skill_matches_environment(frontmatter: Dict[str, Any]) -> bool:
     """Check if a skill is relevant to the current runtime environment.
 
-    Delegates to ``agent.skill_utils.skill_matches_environment`` — kept here
+    Delegates to ``hermes_runtime.skill_utils.skill_matches_environment`` — kept here
     as a public re-export so existing callers don't need updating. This is an
     offer-time relevance gate (kanban/docker/s6), NOT a hard-compatibility gate;
     explicit skill loads bypass it.
     """
-    from agent.skill_utils import skill_matches_environment as _impl
+    from hermes_runtime.skill_utils import skill_matches_environment as _impl
     return _impl(frontmatter)
 
 
@@ -483,7 +501,7 @@ def _capture_required_environment_variables(
 def _is_gateway_surface() -> bool:
     if env_var_enabled("HERMES_GATEWAY_SESSION"):
         return True
-    from gateway.session_context import get_session_env
+    from hermes_runtime.session_context import get_session_env
     return bool(get_session_env("HERMES_SESSION_PLATFORM"))
 
 
@@ -552,10 +570,10 @@ def check_skills_requirements() -> bool:
 def _parse_frontmatter(content: str) -> Tuple[Dict[str, Any], str]:
     """Parse YAML frontmatter from markdown content.
 
-    Delegates to ``agent.skill_utils.parse_frontmatter`` — kept here
+    Delegates to ``hermes_runtime.skill_utils.parse_frontmatter`` — kept here
     as a public re-export so existing callers don't need updating.
     """
-    from agent.skill_utils import parse_frontmatter
+    from hermes_runtime.skill_utils import parse_frontmatter
     return parse_frontmatter(content)
 
 
@@ -570,7 +588,7 @@ def _get_category_from_path(skill_path: Path) -> Optional[str]:
     # then fall back to external dirs from config.
     dirs_to_check = [_skills_dir()]
     try:
-        from agent.skill_utils import get_external_skills_dirs
+        from hermes_runtime.skill_utils import get_external_skills_dirs
         dirs_to_check.extend(get_external_skills_dirs())
     except Exception:
         pass
@@ -619,10 +637,10 @@ def _parse_tags(tags_value) -> List[str]:
 def _get_disabled_skill_names() -> Set[str]:
     """Load disabled skill names from config.
 
-    Delegates to ``agent.skill_utils.get_disabled_skill_names`` — kept here
+    Delegates to ``hermes_runtime.skill_utils.get_disabled_skill_names`` — kept here
     as a public re-export so existing callers don't need updating.
     """
-    from agent.skill_utils import get_disabled_skill_names
+    from hermes_runtime.skill_utils import get_disabled_skill_names
     return get_disabled_skill_names()
 
 
@@ -630,11 +648,11 @@ def _get_session_platform() -> str:
     """Resolve the current platform from gateway session context.
 
     Mirrors the platform-resolution logic in
-    ``agent.skill_utils.get_disabled_skill_names`` so that
+    ``hermes_runtime.skill_utils.get_disabled_skill_names`` so that
     ``_is_skill_disabled`` respects ``HERMES_SESSION_PLATFORM``.
     """
     try:
-        from gateway.session_context import get_session_env
+        from hermes_runtime.session_context import get_session_env
         return get_session_env("HERMES_SESSION_PLATFORM") or ""
     except Exception:
         return ""
@@ -649,7 +667,7 @@ def _is_skill_disabled(name: str, platform: str = None) -> bool:
     3. ``HERMES_SESSION_PLATFORM`` from gateway session context
     """
     try:
-        from hermes_cli.config import load_config
+        from hermes_runtime.config import load_config
         config = load_config()
         skills_cfg = config.get("skills", {})
         resolved_platform = platform or os.getenv("HERMES_PLATFORM") or _get_session_platform()
@@ -659,7 +677,7 @@ def _is_skill_disabled(name: str, platform: str = None) -> bool:
             if platform_disabled is not None:
                 # A globally-disabled skill stays disabled on every platform;
                 # the platform list adds to it rather than replacing it. Keep
-                # in sync with agent.skill_utils.get_disabled_skill_names.
+                # in sync with hermes_runtime.skill_utils.get_disabled_skill_names.
                 return name in platform_disabled or name in global_disabled
         return name in global_disabled
     except Exception:
@@ -681,7 +699,7 @@ def _find_all_skills(*, skip_disabled: bool = False) -> List[Dict[str, Any]]:
     signature changes (dir/category mtimes or the disabled-set) and expires
     after a short TTL to bound staleness from in-place SKILL.md edits.
     """
-    from agent.skill_utils import get_external_skills_dirs, iter_skill_index_files
+    from hermes_runtime.skill_utils import get_external_skills_dirs, iter_skill_index_files
 
     cache_key = _SKILLS_CACHE_KEY_DISABLED if skip_disabled else _SKILLS_CACHE_KEY_FILTERED
 
@@ -1000,7 +1018,7 @@ def skill_view(
         # Names containing ':' are routed to the plugin skill registry.
         # Bare names fall through to the existing flat-tree scan below.
         if ":" in name:
-            from agent.skill_utils import is_valid_namespace, parse_qualified_name
+            from hermes_runtime.skill_utils import is_valid_namespace, parse_qualified_name
             from hermes_cli.plugins import discover_plugins, get_plugin_manager
 
             namespace, bare = parse_qualified_name(name)
@@ -1063,7 +1081,7 @@ def skill_view(
             if bare:
                 local_category_name = f"{namespace}/{bare}"
 
-        from agent.skill_utils import get_external_skills_dirs
+        from hermes_runtime.skill_utils import get_external_skills_dirs
 
         # The categorized fall-through form (namespace/bare) joins onto each
         # search dir too; re-validate it since `bare` is not namespace-checked.
@@ -1104,7 +1122,7 @@ def skill_view(
         # the caller — silent shadowing of a local skill by a same-named
         # external skill is a real bug class (`/skills` shows one, agent
         # loaded the other) so we surface it loudly instead of guessing.
-        from agent.skill_utils import iter_skill_index_files
+        from hermes_runtime.skill_utils import iter_skill_index_files
 
         candidates: List[Tuple[Optional[Path], Path]] = []  # (skill_dir, skill_md)
         seen_md: set = set()
@@ -1180,7 +1198,7 @@ def skill_view(
                     _record(None, found_md)
 
         if len(candidates) > 1:
-            paths = [str(smd) for _, smd in candidates]
+            paths = [smd.as_posix() for _, smd in candidates]
             logging.getLogger(__name__).warning(
                 "Skill name collision for '%s': %d candidates — %s",
                 name, len(candidates), "; ".join(paths),
@@ -1473,10 +1491,14 @@ def skill_view(
             linked_files["scripts"] = script_files
 
         try:
-            rel_path = str(skill_md.relative_to(active_skills_dir))
+            rel_path = skill_md.relative_to(active_skills_dir).as_posix()
         except ValueError:
             # External skill — use path relative to the skill's own parent dir
-            rel_path = str(skill_md.relative_to(skill_md.parent.parent)) if skill_md.parent.parent else skill_md.name
+            rel_path = (
+                skill_md.relative_to(skill_md.parent.parent).as_posix()
+                if skill_md.parent.parent
+                else skill_md.name
+            )
         skill_name = frontmatter.get(
             "name", skill_md.stem if not skill_dir else skill_dir.name
         )

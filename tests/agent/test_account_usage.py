@@ -172,7 +172,7 @@ def test_codex_usage_account_id_read_failure_keeps_singleton_token(monkeypatch, 
     )
     monkeypatch.setattr(
         account_usage,
-        "_read_codex_tokens",
+        "read_codex_tokens",
         lambda *a, **k: (_ for _ in ()).throw(
             account_usage.AuthError("partial store", provider="openai-codex", code="codex_auth_invalid_shape")
         ),

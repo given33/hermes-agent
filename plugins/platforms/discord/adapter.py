@@ -716,7 +716,7 @@ class VoiceReceiver:
             f.write(pcm_data)
             pcm_path = f.name
         try:
-            from hermes_cli._subprocess_compat import windows_hide_flags
+            from hermes_runtime.subprocess_compat import windows_hide_flags
 
             subprocess.run(
                 [
@@ -754,7 +754,7 @@ def _read_dm_role_auth_guild() -> Optional[int]:
     default (DM role-auth disabled).
     """
     try:
-        from hermes_cli.config import read_raw_config
+        from hermes_runtime.config import read_raw_config
         cfg = read_raw_config() or {}
         discord_cfg = cfg.get("discord", {}) or {}
         raw = discord_cfg.get("dm_role_auth_guild")
@@ -799,7 +799,7 @@ def _read_discord_prompt_timeout() -> int:
     """
     raw: Any = None
     try:
-        from hermes_cli.config import read_raw_config
+        from hermes_runtime.config import read_raw_config
         cfg = read_raw_config() or {}
         approvals_cfg = cfg.get("approvals", {}) or {}
         raw = approvals_cfg.get("discord_prompt_timeout")
@@ -3584,7 +3584,7 @@ class DiscordAdapter(BasePlatformAdapter):
             ],
         }
         try:
-            from hermes_cli.config import read_raw_config
+            from hermes_runtime.config import read_raw_config
             cfg = read_raw_config() or {}
             fx = ((cfg.get("discord") or {}).get("voice_fx") or {})
             if isinstance(fx, dict):
@@ -9211,8 +9211,8 @@ def interactive_setup() -> None:
     the plugin's import surface stays small, prompts for the bot token,
     captures an allowlist, and offers to set a home channel.
     """
-    from hermes_cli.config import get_env_value, save_env_value
-    from hermes_cli.cli_output import (
+    from hermes_runtime.config import get_env_value, save_env_value
+    from hermes_runtime.console_output import (
         prompt,
         prompt_yes_no,
         print_header,

@@ -27,7 +27,7 @@ from openai.types.chat.chat_completion_message_tool_call import (
 )
 
 from agent.file_safety import get_read_block_error, get_write_denied_error
-from agent.redact import redact_sensitive_text
+from hermes_runtime.redaction import redact_sensitive_text
 from tools.environments.local import hermes_subprocess_env
 
 ACP_MARKER_BASE_URL = "acp://copilot"

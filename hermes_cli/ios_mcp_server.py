@@ -341,7 +341,7 @@ def install_ios_mcp_servers(
 ) -> dict[str, Any]:
     """Persist all independent MCPs so ordinary Hermes chats discover them."""
 
-    from hermes_cli.config import read_raw_config, save_config
+    from hermes_runtime.config import read_raw_config, save_config
 
     config, changed = merge_ios_mcp_servers(
         read_raw_config(),

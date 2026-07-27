@@ -321,7 +321,7 @@ def check_for_updates() -> Optional[int]:
     # both the Rich banner (build_welcome_banner) and the Ink badge
     # (branding.tsx, guarded on `typeof === 'number' && > 0`) show nothing.
     try:
-        from hermes_cli.config import detect_install_method, get_project_root
+        from hermes_runtime.config import detect_install_method, get_project_root
         if detect_install_method(get_project_root()) == "docker":
             return None
     except Exception:
@@ -660,7 +660,7 @@ def build_welcome_banner(console: "Console", model: str, cwd: str,
         preset_name = model
         agg_label = ""
         try:
-            from hermes_cli.config import load_config
+            from hermes_runtime.config import load_config
             from hermes_cli.moa_config import normalize_moa_config
 
             _moa = normalize_moa_config(load_config().get("moa") or {})
@@ -846,7 +846,7 @@ def build_welcome_banner(console: "Console", model: str, cwd: str,
     # (codex builds its own tool list inside the spawned subprocess).
     try:
         from hermes_cli.codex_runtime_switch import get_current_runtime
-        from hermes_cli.config import load_config as _load_cfg
+        from hermes_runtime.config import load_config as _load_cfg
         if get_current_runtime(_load_cfg()) == "codex_app_server":
             right_lines.append(
                 f"[bold {accent}]Runtime:[/] [{text}]codex app-server[/] "
@@ -869,7 +869,7 @@ def build_welcome_banner(console: "Console", model: str, cwd: str,
     try:
         behind = get_update_result(timeout=0.5)
         if behind is not None and behind != 0:
-            from hermes_cli.config import get_managed_update_command, recommended_update_command
+            from hermes_runtime.config import get_managed_update_command, recommended_update_command
             if behind > 0:
                 commits_word = "commit" if behind == 1 else "commits"
                 right_lines.append(
@@ -895,7 +895,7 @@ def build_welcome_banner(console: "Console", model: str, cwd: str,
     # issue triage don't behave correctly. Warn, don't block. NixOS is fully
     # supported and never hits this.
     try:
-        from hermes_cli.config import (
+        from hermes_runtime.config import (
             detect_install_method,
             format_unsupported_install_warning,
             is_unsupported_install_method,

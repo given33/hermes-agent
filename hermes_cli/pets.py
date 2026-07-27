@@ -291,7 +291,7 @@ def _cmd_doctor(args) -> int:
 # ─────────────────────────────────────────────────────────────────────────
 
 def _pet_config() -> dict:
-    from hermes_cli.config import load_config
+    from hermes_runtime.config import load_config
 
     cfg = load_config()
     display = cfg.get("display", {}) if isinstance(cfg.get("display"), dict) else {}
@@ -304,7 +304,7 @@ def _has_active_pet() -> bool:
 
 
 def _set_active(slug: str) -> None:
-    from hermes_cli.config import load_config, save_config
+    from hermes_runtime.config import load_config, save_config
 
     cfg = load_config()
     display = cfg.setdefault("display", {})
@@ -315,7 +315,7 @@ def _set_active(slug: str) -> None:
 
 
 def _set_enabled(enabled: bool) -> None:
-    from hermes_cli.config import load_config, save_config
+    from hermes_runtime.config import load_config, save_config
 
     cfg = load_config()
     display = cfg.setdefault("display", {})
@@ -325,7 +325,7 @@ def _set_enabled(enabled: bool) -> None:
 
 
 def _set_scale(scale: float) -> None:
-    from hermes_cli.config import load_config, save_config
+    from hermes_runtime.config import load_config, save_config
 
     cfg = load_config()
     display = cfg.setdefault("display", {})
@@ -404,7 +404,7 @@ def _clear_active_if(slug: str) -> bool:
 
     Returns whether anything changed, so callers don't write config needlessly.
     """
-    from hermes_cli.config import load_config, save_config
+    from hermes_runtime.config import load_config, save_config
 
     cfg = load_config()
     pet = cfg.setdefault("display", {}).setdefault("pet", {})
@@ -425,7 +425,7 @@ def _rename_active_if(old_slug: str, new_slug: str) -> bool:
     """
     if not new_slug or old_slug == new_slug:
         return False
-    from hermes_cli.config import load_config, save_config
+    from hermes_runtime.config import load_config, save_config
 
     cfg = load_config()
     pet = cfg.setdefault("display", {}).setdefault("pet", {})

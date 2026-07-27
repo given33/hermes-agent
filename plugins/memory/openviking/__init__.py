@@ -854,7 +854,7 @@ def _is_local_openviking_url(value: str) -> bool:
 
 def _load_hermes_openviking_config() -> dict:
     try:
-        from hermes_cli.config import load_config
+        from hermes_runtime.config import load_config
 
         config = load_config()
         memory_config = config.get("memory", {}) if isinstance(config, dict) else {}
@@ -1962,7 +1962,7 @@ class OpenVikingMemoryProvider(MemoryProvider):
 
     def post_setup(self, hermes_home: str, config: dict) -> None:
         """Custom setup that can reuse OpenViking's shared CLI config."""
-        from hermes_cli.config import save_config
+        from hermes_runtime.config import save_config
         from hermes_cli.memory_setup import _CANCELLED, _curses_select, _print_cancelled_setup, _prompt
 
         hermes_home_path = Path(hermes_home)

@@ -228,6 +228,16 @@ _FEISHU_WEBHOOK_BODY_TIMEOUT_SECONDS = 30          # max seconds to read request
 _FEISHU_WEBHOOK_ANOMALY_THRESHOLD = 25             # consecutive error responses before WARNING log
 _FEISHU_WEBHOOK_ANOMALY_TTL_SECONDS = 6 * 60 * 60  # anomaly tracker TTL (6 hours) — matches openclaw
 _FEISHU_CARD_ACTION_DEDUP_TTL_SECONDS = 15 * 60    # card action token dedup window (15 min)
+# Replay protection for the webhook signature. The timestamp is folded into
+# the signed digest but proves nothing unless also compared against the
+# clock — without that, a captured (timestamp, nonce, signature, body) tuple
+# replays forever. 1 hour matches Feishu's own freshness guidance and
+# comfortably covers its delayed retry pushes plus clock skew; a tighter
+# window would risk dropping legitimate retries. Within the window, the
+# (timestamp, nonce) single-use check below rejects exact replays, so the
+# effective replay budget is still zero.
+_FEISHU_WEBHOOK_SIGNATURE_MAX_SKEW_SECONDS = 60 * 60
+_FEISHU_WEBHOOK_NONCE_MAX_KEYS = 4096              # bounded (timestamp, nonce) dedup retention
 
 _APPROVAL_CHOICE_MAP: Dict[str, str] = {
     "approve_once": "once",
@@ -1482,6 +1492,7 @@ class FeishuAdapter(BasePlatformAdapter):
         self._webhook_rate_counts: Dict[str, tuple[int, float]] = {}  # rate_key → (count, window_start)
         self._webhook_anomaly_counts: Dict[str, tuple[int, str, float]] = {}  # ip → (count, last_status, first_seen)
         self._card_action_tokens: Dict[str, float] = {}  # token → first_seen_time
+        self._webhook_seen_nonces: Dict[str, float] = {}  # "ts:nonce" → header timestamp
         # Inbound events that arrived before the adapter loop was ready
         # (e.g. during startup/restart or network-flap reconnect). A single
         # drainer thread replays them as soon as the loop becomes available.
@@ -3544,18 +3555,23 @@ class FeishuAdapter(BasePlatformAdapter):
                 self._record_webhook_anomaly(remote_ip, "401-token")
                 return web.Response(status=401, text="Invalid verification token")
 
-        # URL verification challenge — Feishu includes the verification token in
-        # challenge requests. Validate the token (above) before reflecting the
-        # challenge so an unauthenticated remote request cannot prove endpoint
-        # control by getting attacker-supplied challenge data echoed back.
-        if payload.get("type") == "url_verification":
-            return web.json_response({"challenge": payload.get("challenge", "")})
-
-        # Timing-safe signature verification (only enforced when encrypt_key is set).
-        if self._encrypt_key and not self._is_webhook_signature_valid(request.headers, body_bytes):
+        # Timing-safe signature verification (only enforced when encrypt_key
+        # is set). Checked BEFORE the url_verification echo below: when the
+        # signature is the only configured authenticator, reflecting the
+        # challenge first would let an unauthenticated POST get
+        # attacker-supplied data echoed back.
+        if self._encrypt_key and not self._is_webhook_signature_valid(headers, body_bytes):
             logger.warning("[Feishu] Webhook rejected: invalid signature from %s", remote_ip)
             self._record_webhook_anomaly(remote_ip, "401-sig")
             return web.Response(status=401, text="Invalid signature")
+
+        # URL verification challenge — reflected only after every configured
+        # authenticator has passed (verification token and/or signature,
+        # above), so an unauthenticated remote request cannot prove endpoint
+        # control by getting attacker-supplied challenge data echoed back.
+        if payload.get("type") == "url_verification":
+            self._commit_webhook_nonce(headers)
+            return web.json_response({"challenge": payload.get("challenge", "")})
 
         if payload.get("encrypt"):
             logger.error("[Feishu] Encrypted webhook payloads are not supported by Hermes webhook mode")
@@ -3584,6 +3600,11 @@ class FeishuAdapter(BasePlatformAdapter):
             self._on_meeting_invited_event(data)
         else:
             logger.debug("[Feishu] Ignoring webhook event type: %s", event_type or "unknown")
+        # Processing succeeded — NOW consume the (timestamp, nonce) pair.
+        # Every earlier exit is non-2xx (or an exception aiohttp turns into a
+        # 500); Feishu retries those with the same headers, and the retry
+        # must not be mistaken for a replay.
+        self._commit_webhook_nonce(headers)
         return web.json_response({"code": 0, "msg": "ok"})
 
     def _is_webhook_signature_valid(self, headers: Any, body_bytes: bytes) -> bool:
@@ -3592,11 +3613,26 @@ class FeishuAdapter(BasePlatformAdapter):
         Feishu signature algorithm:
             SHA256(timestamp + nonce + encrypt_key + body_string)
         Headers checked: x-lark-request-timestamp, x-lark-request-nonce, x-lark-signature.
+
+        Beyond the digest itself this enforces timestamp freshness
+        (± _FEISHU_WEBHOOK_SIGNATURE_MAX_SKEW_SECONDS) and (timestamp, nonce)
+        single-use — the signed timestamp is meaningless unless compared
+        against the clock, so without both checks a captured request could be
+        replayed forever to re-trigger agent runs.
         """
         timestamp = str(headers.get("x-lark-request-timestamp", "") or "")
         nonce = str(headers.get("x-lark-request-nonce", "") or "")
         signature = str(headers.get("x-lark-signature", "") or "")
         if not timestamp or not nonce or not signature:
+            return False
+        # Freshness — fail closed on a malformed timestamp: a header we can't
+        # parse can't be bounded, so it must not authenticate.
+        try:
+            ts = float(timestamp)
+        except (TypeError, ValueError):
+            return False
+        if abs(time.time() - ts) > _FEISHU_WEBHOOK_SIGNATURE_MAX_SKEW_SECONDS:
+            logger.warning("[Feishu] Webhook signature rejected: timestamp outside replay window")
             return False
         try:
             body_str = body_bytes.decode("utf-8", errors="replace")
@@ -3604,10 +3640,65 @@ class FeishuAdapter(BasePlatformAdapter):
             computed = hashlib.sha256(content.encode("utf-8")).hexdigest()
             # Compare as bytes: compare_digest raises TypeError on a str with
             # non-ASCII characters, and the signature is a raw request header.
-            return hmac.compare_digest(computed.encode(), signature.encode())
+            if not hmac.compare_digest(computed.encode(), signature.encode()):
+                return False
         except Exception:
             logger.debug("[Feishu] Signature verification raised an exception", exc_info=True)
             return False
+        # Single-use within the freshness window: a valid (timestamp, nonce)
+        # pair authenticates exactly one *successfully processed* request.
+        # Only CHECK for a replay here — the pair is committed by
+        # _commit_webhook_nonce right before the handler answers 2xx. Feishu
+        # retries an event on any non-2xx with the SAME headers, so recording
+        # the pair at signature time would burn the nonce before processing
+        # and turn the retry of a transiently failed event into a rejected
+        # "replay", losing the event for good.
+        if f"{timestamp}:{nonce}" in self._webhook_seen_nonces:
+            logger.warning("[Feishu] Webhook rejected: replayed (timestamp, nonce) pair")
+            return False
+        return True
+
+    def _commit_webhook_nonce(self, headers: Any) -> None:
+        """Record the request's signature-checked (timestamp, nonce) pair as consumed.
+
+        Called by the webhook handler immediately before a 2xx response —
+        never at signature-check time (see _is_webhook_signature_valid for
+        why). The handler is purely synchronous between that replay check and
+        this commit (no awaits), so two in-flight copies of the same request
+        cannot interleave on the event loop: a successfully answered event
+        stays replay-proof, while a failed attempt leaves the pair unconsumed
+        for Feishu's retry.
+
+        Retention is bounded two ways so the map cannot grow without limit:
+        entries whose header timestamp has aged past the freshness window are
+        pruned lazily (the timestamp check alone rejects them from then on),
+        and the map is capped at _FEISHU_WEBHOOK_NONCE_MAX_KEYS by evicting
+        the oldest-stamped entries — those are the first to age out of the
+        freshness window anyway, so dedup stays exact for current traffic
+        instead of failing open for all of it.
+        """
+        if not self._encrypt_key:
+            return  # no signature scheme configured — nothing was checked
+        timestamp = str(headers.get("x-lark-request-timestamp", "") or "")
+        nonce = str(headers.get("x-lark-request-nonce", "") or "")
+        if not timestamp or not nonce:
+            return
+        try:
+            ts = float(timestamp)
+        except (TypeError, ValueError):
+            return
+        if len(self._webhook_seen_nonces) >= _FEISHU_WEBHOOK_NONCE_MAX_KEYS:
+            now = time.time()
+            expired = [
+                k for k, seen_ts in self._webhook_seen_nonces.items()
+                if now - seen_ts > _FEISHU_WEBHOOK_SIGNATURE_MAX_SKEW_SECONDS
+            ]
+            for k in expired:
+                del self._webhook_seen_nonces[k]
+            while len(self._webhook_seen_nonces) >= _FEISHU_WEBHOOK_NONCE_MAX_KEYS:
+                oldest = min(self._webhook_seen_nonces, key=self._webhook_seen_nonces.get)
+                del self._webhook_seen_nonces[oldest]
+        self._webhook_seen_nonces[f"{timestamp}:{nonce}"] = ts
 
     def _check_webhook_rate_limit(self, rate_key: str) -> bool:
         """Return False when the composite rate_key has exceeded _FEISHU_WEBHOOK_RATE_LIMIT_MAX.
@@ -5499,9 +5590,9 @@ def interactive_setup() -> None:
     Replaces the central _setup_feishu in hermes_cli/gateway.py and the static
     _PLATFORMS["feishu"] dict. CLI helpers are lazy-imported.
     """
-    from hermes_cli.config import get_env_value, save_env_value
+    from hermes_runtime.config import get_env_value, save_env_value
     from hermes_cli.setup import prompt_choice
-    from hermes_cli.cli_output import (
+    from hermes_runtime.console_output import (
         prompt,
         prompt_yes_no,
         print_header,

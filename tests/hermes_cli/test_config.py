@@ -36,7 +36,12 @@ class TestGetHermesHome:
         with patch.dict(os.environ, {}, clear=False):
             os.environ.pop("HERMES_HOME", None)
             home = get_hermes_home()
-            assert home == Path.home() / ".hermes"
+            expected = (
+                Path(os.environ["LOCALAPPDATA"]) / "hermes"
+                if os.name == "nt"
+                else Path.home() / ".hermes"
+            )
+            assert home == expected
 
     def test_env_override(self):
         with patch.dict(os.environ, {"HERMES_HOME": "/custom/path"}):
@@ -223,9 +228,9 @@ class TestLoadConfigParseFailure:
             baks = list(tmp_path.glob("config.yaml.corrupt.*.bak"))
             assert len(baks) == 1, f"expected one backup, got {baks}"
             # Backup preserves the original broken content verbatim
-            assert baks[0].read_text() == broken
+            assert baks[0].read_text(encoding="utf-8") == broken
             # Original config.yaml is left untouched (not reset to clean state)
-            assert (tmp_path / "config.yaml").read_text() == broken
+            assert (tmp_path / "config.yaml").read_text(encoding="utf-8") == broken
             # User is told where the backup landed
             assert str(baks[0]) in err
 
@@ -412,7 +417,7 @@ class TestSaveAndLoadRoundtrip:
             assert reloaded["model"] == "test/custom-model"
             assert reloaded["agent"]["max_turns"] == 42
 
-            saved = yaml.safe_load((tmp_path / "config.yaml").read_text())
+            saved = yaml.safe_load((tmp_path / "config.yaml").read_text(encoding="utf-8"))
             assert saved["agent"]["max_turns"] == 42
             assert "max_turns" not in saved
 
@@ -472,7 +477,7 @@ class TestSaveAndLoadRoundtrip:
         with patch.dict(os.environ, {"HERMES_HOME": str(tmp_path)}):
             save_config({"model": "test/custom-model", "max_turns": 37})
 
-            saved = yaml.safe_load((tmp_path / "config.yaml").read_text())
+            saved = yaml.safe_load((tmp_path / "config.yaml").read_text(encoding="utf-8"))
             assert saved["agent"]["max_turns"] == 37
             assert "max_turns" not in saved
 
@@ -615,6 +620,7 @@ class TestSaveEnvValueSecure:
         TERMINAL_SSH_KEY=/Users/.../Application Support/... unquoted.
         python-dotenv still parsed it; ``set -a; . file`` failed.
         """
+        import shutil
         import subprocess
         from dotenv import dotenv_values
 
@@ -632,6 +638,8 @@ class TestSaveEnvValueSecure:
             assert load_env()["TERMINAL_SSH_KEY"] == path
 
             # Shell source must round-trip (this is what the bug broke).
+            if not shutil.which("env") or not shutil.which("sh"):
+                pytest.skip("POSIX env/sh are not available on this platform")
             r = subprocess.run(
                 [
                     "env",
@@ -650,6 +658,7 @@ class TestSaveEnvValueSecure:
 
     def test_save_env_value_quotes_values_with_tabs(self, tmp_path):
         """Tabs trigger quoting; round-trip via dotenv and shell source."""
+        import shutil
         import subprocess
         from dotenv import dotenv_values
 
@@ -666,6 +675,8 @@ class TestSaveEnvValueSecure:
             assert parsed["TABBY_KEY"] == value
             assert load_env()["TABBY_KEY"] == value
 
+            if not shutil.which("env") or not shutil.which("sh"):
+                pytest.skip("POSIX env/sh are not available on this platform")
             r = subprocess.run(
                 [
                     "env",
@@ -820,7 +831,7 @@ class TestRemoveEnvValue:
         with patch.dict(os.environ, {"HERMES_HOME": str(tmp_path), "KEY_B": "value_b"}):
             result = remove_env_value("KEY_B")
             assert result is True
-            content = env_path.read_text()
+            content = env_path.read_text(encoding="utf-8")
             assert "KEY_B" not in content
             assert "KEY_A=value_a" in content
             assert "KEY_C=value_c" in content
@@ -839,7 +850,7 @@ class TestRemoveEnvValue:
             result = remove_env_value("MISSING_KEY")
             assert result is False
             # File should be untouched
-            assert env_path.read_text() == "OTHER_KEY=value\n"
+            assert env_path.read_text(encoding="utf-8") == "OTHER_KEY=value\n"
 
     def test_handles_missing_env_file(self, tmp_path):
         with patch.dict(os.environ, {"HERMES_HOME": str(tmp_path), "GHOST_KEY": "ghost"}):
@@ -873,7 +884,7 @@ class TestRemoveEnvValue:
             removed = remove_env_value("DROP")
 
         assert removed is True
-        assert "DROP" not in env_path.read_text()
+        assert "DROP" not in env_path.read_text(encoding="utf-8")
         env_mode = env_path.stat().st_mode & 0o777
         assert env_mode == 0o640, f"expected 0o640, got {oct(env_mode)}"
 
@@ -1046,7 +1057,7 @@ class TestSanitizeEnvLines:
         with patch.dict(os.environ, {"HERMES_HOME": str(tmp_path)}):
             save_env_value("MESSAGING_CWD", "/tmp")
 
-            content = env_file.read_text()
+            content = env_file.read_text(encoding="utf-8")
             lines = content.strip().split("\n")
 
             # Corrupted line should be split, new key added
@@ -1066,7 +1077,7 @@ class TestSanitizeEnvLines:
             assert fixes > 0
 
             # Verify file is now clean
-            content = env_file.read_text()
+            content = env_file.read_text(encoding="utf-8")
             assert "OPENROUTER_API_KEY=val\n" in content
             assert "FIRECRAWL_API_KEY=val2\n" in content
 
@@ -1736,7 +1747,7 @@ class TestWriteApprovalMigration:
                         "_config_version: 28\nmemory:\n  write_mode: approve\n"
                         "skills:\n  write_mode: approve\n")
             migrate_config(interactive=False, quiet=True)
-            raw = yaml.safe_load((tmp_path / "config.yaml").read_text())
+            raw = yaml.safe_load((tmp_path / "config.yaml").read_text(encoding="utf-8"))
             assert raw["memory"]["write_approval"] is True
             assert raw["skills"]["write_approval"] is True
             assert "write_mode" not in raw["memory"]
@@ -1750,7 +1761,7 @@ class TestWriteApprovalMigration:
                         "_config_version: 28\nmemory:\n  write_mode: 'on'\n"
                         "skills:\n  write_mode: 'off'\n")
             migrate_config(interactive=False, quiet=True)
-            raw = yaml.safe_load((tmp_path / "config.yaml").read_text())
+            raw = yaml.safe_load((tmp_path / "config.yaml").read_text(encoding="utf-8"))
             loaded = load_config()
             # write_approval=False equals the schema default, so it is NOT
             # materialised to disk (lean-config invariant) — the legacy
@@ -1765,7 +1776,7 @@ class TestWriteApprovalMigration:
         with patch.dict(os.environ, {"HERMES_HOME": str(tmp_path)}):
             self._write(tmp_path, "_config_version: 28\nmemory:\n  memory_enabled: true\n")
             migrate_config(interactive=False, quiet=True)
-            raw = yaml.safe_load((tmp_path / "config.yaml").read_text())
+            raw = yaml.safe_load((tmp_path / "config.yaml").read_text(encoding="utf-8"))
             loaded = load_config()
             # No write_mode was persisted, so the rename is a no-op; the gate
             # ends up off (default) via deep-merge and there's no leftover
@@ -1932,6 +1943,89 @@ platforms:
         assert raw["agent"]["max_turns"] == 60
         assert raw["_config_version"] == 32
 
+    # ── Fail-closed on a corrupt on-disk document ───────────────────────────
+    # read_raw_config() degrades a YAML parse error to {}, and _persist_migration
+    # writes via save_config(merge_existing=False). Without a guard, an
+    # unattended version bump against a config with one bad indent replaces the
+    # user's whole file with just the migrated section.
+    # require_readable_config_before_write() does NOT cover this: it proves the
+    # bytes are readable, not that they parse.
+
+    CORRUPT_CONFIG = (
+        "_config_version: 4\n"
+        "model:\n"
+        "  default: [unterminated\n"
+        "platforms:\n"
+        "  feishu:\n"
+        "    enabled: true\n"
+        "    extra:\n"
+        "      app_id: cli_xxx\n"
+    )
+
+    def test_persist_migration_refuses_to_write_over_a_corrupt_config(self, tmp_path):
+        """An existing-but-unparseable config.yaml aborts the write."""
+        from hermes_cli.config import _persist_migration
+
+        cfg_file = tmp_path / "config.yaml"
+        cfg_file.write_text(self.CORRUPT_CONFIG, encoding="utf-8")
+
+        with patch.dict(os.environ, {"HERMES_HOME": str(tmp_path)}):
+            with pytest.raises(yaml.YAMLError):
+                _persist_migration(
+                    {"_config_version": 99, "display": {"tool_progress": "all"}}
+                )
+
+        # Byte-identical: the user can still hand-fix the indent and keep
+        # everything. A wipe would have left only _config_version + display.
+        assert cfg_file.read_text(encoding="utf-8") == self.CORRUPT_CONFIG
+
+    def test_persist_migration_refuses_a_non_mapping_config(self, tmp_path):
+        """A valid-YAML-but-not-a-mapping document is refused, not coerced."""
+        from hermes_cli.config import _persist_migration
+
+        body = "- just\n- a\n- list\n"
+        cfg_file = tmp_path / "config.yaml"
+        cfg_file.write_text(body, encoding="utf-8")
+
+        with patch.dict(os.environ, {"HERMES_HOME": str(tmp_path)}):
+            with pytest.raises(ValueError):
+                _persist_migration({"_config_version": 99})
+
+        assert cfg_file.read_text(encoding="utf-8") == body
+
+    def test_migrate_config_leaves_a_corrupt_config_untouched(self, tmp_path):
+        """End-to-end: the unattended path (`hermes update`, first launch after a
+        version bump, `doctor --fix`, profile creation) must not destroy a
+        corrupt-but-recoverable config.yaml."""
+        import contextlib
+
+        from hermes_cli.config import migrate_config
+
+        cfg_file = tmp_path / "config.yaml"
+        cfg_file.write_text(self.CORRUPT_CONFIG, encoding="utf-8")
+
+        with patch.dict(os.environ, {"HERMES_HOME": str(tmp_path)}):
+            # Every production caller wraps this in try/except and reports the
+            # failure, so raising here is the designed outcome — what must never
+            # happen is a silent successful overwrite.
+            with contextlib.suppress(Exception):
+                migrate_config(interactive=False, quiet=True)
+
+        assert cfg_file.read_text(encoding="utf-8") == self.CORRUPT_CONFIG
+
+    def test_persist_migration_still_creates_an_absent_config(self, tmp_path):
+        """The guard must not break first-run: no file yet is not corruption."""
+        from hermes_cli.config import _persist_migration
+
+        cfg_file = tmp_path / "config.yaml"
+        assert not cfg_file.exists()
+
+        with patch.dict(os.environ, {"HERMES_HOME": str(tmp_path)}):
+            _persist_migration({"_config_version": 99, "timezone": "Asia/Shanghai"})
+            raw = yaml.safe_load(cfg_file.read_text(encoding="utf-8"))
+
+        assert raw["timezone"] == "Asia/Shanghai"
+
     def test_v30_to_latest_migration_keeps_platforms(self, tmp_path):
         """End-to-end: reporter's v30 feishu profile survives version bump."""
         body = """_config_version: 30
@@ -1968,14 +2062,14 @@ class TestVerifyOnStopMigration:
         with patch.dict(os.environ, {"HERMES_HOME": str(tmp_path)}):
             self._write(tmp_path, "_config_version: 30\nagent:\n  verify_on_stop: auto\n")
             migrate_config(interactive=False, quiet=True)
-            raw = yaml.safe_load((tmp_path / "config.yaml").read_text())
+            raw = yaml.safe_load((tmp_path / "config.yaml").read_text(encoding="utf-8"))
             assert raw["agent"]["verify_on_stop"] is False
 
     def test_missing_key_seeded_false(self, tmp_path):
         with patch.dict(os.environ, {"HERMES_HOME": str(tmp_path)}):
             self._write(tmp_path, "_config_version: 30\nagent:\n  max_turns: 5\n")
             migrate_config(interactive=False, quiet=True)
-            raw = yaml.safe_load((tmp_path / "config.yaml").read_text())
+            raw = yaml.safe_load((tmp_path / "config.yaml").read_text(encoding="utf-8"))
             assert raw["agent"]["verify_on_stop"] is False
             assert raw["agent"]["max_turns"] == 5
 
@@ -1983,7 +2077,7 @@ class TestVerifyOnStopMigration:
         with patch.dict(os.environ, {"HERMES_HOME": str(tmp_path)}):
             self._write(tmp_path, "_config_version: 30\nmodel:\n  provider: openrouter\n")
             migrate_config(interactive=False, quiet=True)
-            raw = yaml.safe_load((tmp_path / "config.yaml").read_text())
+            raw = yaml.safe_load((tmp_path / "config.yaml").read_text(encoding="utf-8"))
             assert raw["agent"]["verify_on_stop"] is False
 
     def test_pre_v32_literal_true_flipped_to_false(self, tmp_path):
@@ -1994,7 +2088,7 @@ class TestVerifyOnStopMigration:
         with patch.dict(os.environ, {"HERMES_HOME": str(tmp_path)}):
             self._write(tmp_path, "_config_version: 30\nagent:\n  verify_on_stop: true\n")
             migrate_config(interactive=False, quiet=True)
-            raw = yaml.safe_load((tmp_path / "config.yaml").read_text())
+            raw = yaml.safe_load((tmp_path / "config.yaml").read_text(encoding="utf-8"))
             assert raw["agent"]["verify_on_stop"] is False
 
     def test_v31_literal_true_flipped_to_false(self, tmp_path):
@@ -2004,7 +2098,7 @@ class TestVerifyOnStopMigration:
         with patch.dict(os.environ, {"HERMES_HOME": str(tmp_path)}):
             self._write(tmp_path, "_config_version: 31\nagent:\n  verify_on_stop: true\n")
             migrate_config(interactive=False, quiet=True)
-            raw = yaml.safe_load((tmp_path / "config.yaml").read_text())
+            raw = yaml.safe_load((tmp_path / "config.yaml").read_text(encoding="utf-8"))
             assert raw["agent"]["verify_on_stop"] is False
 
     def test_post_v32_explicit_true_preserved(self, tmp_path):
@@ -2019,14 +2113,14 @@ class TestVerifyOnStopMigration:
                 "agent:\n  verify_on_stop: true\n",
             )
             migrate_config(interactive=False, quiet=True)
-            raw = yaml.safe_load((tmp_path / "config.yaml").read_text())
+            raw = yaml.safe_load((tmp_path / "config.yaml").read_text(encoding="utf-8"))
             assert raw["agent"]["verify_on_stop"] is True
 
     def test_explicit_false_preserved(self, tmp_path):
         with patch.dict(os.environ, {"HERMES_HOME": str(tmp_path)}):
             self._write(tmp_path, "_config_version: 30\nagent:\n  verify_on_stop: false\n")
             migrate_config(interactive=False, quiet=True)
-            raw = yaml.safe_load((tmp_path / "config.yaml").read_text())
+            raw = yaml.safe_load((tmp_path / "config.yaml").read_text(encoding="utf-8"))
             assert raw["agent"]["verify_on_stop"] is False
 
     def test_already_current_version_is_noop(self, tmp_path):
@@ -2039,7 +2133,7 @@ class TestVerifyOnStopMigration:
                 "agent:\n  verify_on_stop: true\n",
             )
             migrate_config(interactive=False, quiet=True)
-            raw = yaml.safe_load((tmp_path / "config.yaml").read_text())
+            raw = yaml.safe_load((tmp_path / "config.yaml").read_text(encoding="utf-8"))
             assert raw["agent"]["verify_on_stop"] is True
 
 class TestDelegationCapUnificationMigration:
@@ -2056,7 +2150,7 @@ class TestDelegationCapUnificationMigration:
                 "  max_concurrent_children: 15\n",
             )
             migrate_config(interactive=False, quiet=True)
-            raw = yaml.safe_load((tmp_path / "config.yaml").read_text())
+            raw = yaml.safe_load((tmp_path / "config.yaml").read_text(encoding="utf-8"))
         assert "max_async_children" not in raw["delegation"]
         # Default-valued (3) async cap must not shrink a raised children cap.
         assert raw["delegation"]["max_concurrent_children"] == 15
@@ -2069,7 +2163,7 @@ class TestDelegationCapUnificationMigration:
                 "  max_concurrent_children: 5\n",
             )
             migrate_config(interactive=False, quiet=True)
-            raw = yaml.safe_load((tmp_path / "config.yaml").read_text())
+            raw = yaml.safe_load((tmp_path / "config.yaml").read_text(encoding="utf-8"))
         assert "max_async_children" not in raw["delegation"]
         assert raw["delegation"]["max_concurrent_children"] == 20
 
@@ -2081,7 +2175,7 @@ class TestDelegationCapUnificationMigration:
                 "  max_concurrent_children: 15\n",
             )
             migrate_config(interactive=False, quiet=True)
-            raw = yaml.safe_load((tmp_path / "config.yaml").read_text())
+            raw = yaml.safe_load((tmp_path / "config.yaml").read_text(encoding="utf-8"))
         assert "max_async_children" not in raw["delegation"]
         assert raw["delegation"]["max_concurrent_children"] == 15
 
@@ -2089,7 +2183,7 @@ class TestDelegationCapUnificationMigration:
         with patch.dict(os.environ, {"HERMES_HOME": str(tmp_path)}):
             self._write(tmp_path, "_config_version: 32\nmodel:\n  provider: openrouter\n")
             migrate_config(interactive=False, quiet=True)
-            raw = yaml.safe_load((tmp_path / "config.yaml").read_text())
+            raw = yaml.safe_load((tmp_path / "config.yaml").read_text(encoding="utf-8"))
         # Migration must not materialize a delegation section it never had.
         assert "delegation" not in raw
 
@@ -2237,7 +2331,7 @@ class TestCodexAppServerAutoConfig:
 
             migrate_config(interactive=False, quiet=True)
 
-            raw = yaml.safe_load((tmp_path / "config.yaml").read_text())
+            raw = yaml.safe_load((tmp_path / "config.yaml").read_text(encoding="utf-8"))
             assert raw["compression"]["codex_app_server_auto"] == "hermes"
 
 

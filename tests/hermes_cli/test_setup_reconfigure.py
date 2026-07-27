@@ -7,7 +7,7 @@ On an existing install:
 - `hermes setup --reconfigure` is a backwards-compat alias for the
   bare-setup default.
 
-On a fresh install, all three are no-ops — fall through to first-time setup.
+On a fresh install, all three fall through to the guided direct-provider setup.
 """
 
 from argparse import Namespace
@@ -84,6 +84,7 @@ def _enter_fresh_install_patches(stack, **extra):
         ("hermes_cli.auth.get_active_provider", {"return_value": None}),
         ("hermes_cli.setup.get_env_value", {"return_value": None}),
         ("hermes_cli.setup._offer_openclaw_migration", {"return_value": False}),
+        ("hermes_cli.setup._print_setup_summary", {}),
     ]:
         stack.enter_context(patch(target, **kwargs))
 
@@ -184,7 +185,7 @@ class TestQuickFlag:
 
 
 class TestFreshInstall:
-    """On a fresh install (no active provider), flags are no-ops."""
+    """Fresh installs use the guided direct-provider path, never account OAuth."""
 
     def test_bare_setup_runs_first_time_flow(self, fresh_install):
         args = _make_setup_args()
@@ -194,12 +195,21 @@ class TestFreshInstall:
                 stack,
                 prompt=("hermes_cli.setup.prompt_choice", {"return_value": 0}),
                 first="hermes_cli.setup._run_first_time_quick_setup",
+                model="hermes_cli.setup.setup_model_provider",
+                terminal="hermes_cli.setup.setup_terminal_backend",
+                gateway="hermes_cli.setup.setup_gateway",
+                tools="hermes_cli.setup.setup_tools",
             )
             from hermes_cli.setup import run_setup_wizard
             run_setup_wizard(args)
 
-        m["prompt"].assert_called_once()  # quick-vs-full prompt
-        m["first"].assert_called_once()
+        m["prompt"].assert_called_once()
+        m["first"].assert_not_called()
+        m["model"].assert_called_once()
+        m["terminal"].assert_called_once()
+        m["gateway"].assert_called_once()
+        m["tools"].assert_called_once()
+        assert m["tools"].call_args.kwargs == {"first_install": True}
 
     def test_reconfigure_on_fresh_install_falls_through(self, fresh_install):
         args = _make_setup_args(reconfigure=True)
@@ -209,12 +219,21 @@ class TestFreshInstall:
                 stack,
                 prompt=("hermes_cli.setup.prompt_choice", {"return_value": 0}),
                 first="hermes_cli.setup._run_first_time_quick_setup",
+                model="hermes_cli.setup.setup_model_provider",
+                terminal="hermes_cli.setup.setup_terminal_backend",
+                gateway="hermes_cli.setup.setup_gateway",
+                tools="hermes_cli.setup.setup_tools",
             )
             from hermes_cli.setup import run_setup_wizard
             run_setup_wizard(args)
 
         m["prompt"].assert_called_once()
-        m["first"].assert_called_once()
+        m["first"].assert_not_called()
+        m["model"].assert_called_once()
+        m["terminal"].assert_called_once()
+        m["gateway"].assert_called_once()
+        m["tools"].assert_called_once()
+        assert m["tools"].call_args.kwargs == {"first_install": True}
 
     def test_quick_on_fresh_install_falls_through(self, fresh_install):
         args = _make_setup_args(quick=True)
@@ -224,12 +243,21 @@ class TestFreshInstall:
                 stack,
                 prompt=("hermes_cli.setup.prompt_choice", {"return_value": 0}),
                 first="hermes_cli.setup._run_first_time_quick_setup",
+                model="hermes_cli.setup.setup_model_provider",
+                terminal="hermes_cli.setup.setup_terminal_backend",
+                gateway="hermes_cli.setup.setup_gateway",
+                tools="hermes_cli.setup.setup_tools",
             )
             from hermes_cli.setup import run_setup_wizard
             run_setup_wizard(args)
 
         m["prompt"].assert_called_once()
-        m["first"].assert_called_once()
+        m["first"].assert_not_called()
+        m["model"].assert_called_once()
+        m["terminal"].assert_called_once()
+        m["gateway"].assert_called_once()
+        m["tools"].assert_called_once()
+        assert m["tools"].call_args.kwargs == {"first_install": True}
 
 
 class TestArgparse:

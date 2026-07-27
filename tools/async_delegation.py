@@ -46,6 +46,7 @@ from concurrent.futures import ThreadPoolExecutor
 from typing import Any, Callable, Dict, List, Optional
 
 from hermes_constants import get_hermes_home
+from hermes_runtime.process_probe import pid_exists as _pid_exists
 from tools.daemon_pool import DaemonThreadPoolExecutor
 from tools.thread_context import propagate_context_to_thread
 
@@ -219,7 +220,7 @@ def _note_delivery_attempt(delegation_id: str) -> None:
 def recover_abandoned_delegations() -> int:
     """Classify records whose owning process disappeared as outcome unknown."""
     try:
-        from gateway.status import _pid_exists, get_process_start_time
+        from gateway.status import get_process_start_time
     except Exception:
         return 0
     now = time.time()

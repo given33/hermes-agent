@@ -32,7 +32,7 @@ from agent.model_metadata import (
     get_model_context_length,
     estimate_messages_tokens_rough,
 )
-from agent.redact import redact_sensitive_text
+from hermes_runtime.redaction import redact_sensitive_text
 from agent.turn_context import drop_stale_api_content
 
 logger = logging.getLogger(__name__)

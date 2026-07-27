@@ -6,7 +6,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Dict, Iterable, Optional, Set
 
-from hermes_cli.config import get_env_value, load_config
+from hermes_runtime.config import get_env_value, load_config
 from hermes_cli.nous_account import (
     NousPortalAccountInfo,
     format_nous_portal_entitlement_message,
@@ -337,13 +337,10 @@ def get_nous_subscription_features(
     model_cfg = _model_config_dict(config)
     provider_is_nous = str(model_cfg.get("provider") or "").strip().lower() == "nous"
 
-    try:
-        if force_fresh:
-            account_info = get_nous_portal_account_info(force_fresh=True)
-        else:
-            account_info = get_nous_portal_account_info()
-    except Exception:
-        account_info = None
+    # This fork supports the Nous inference API as a normal API-key provider,
+    # but does not expose or query the Nous account/subscription product.
+    del force_fresh
+    account_info = None
 
     # Coarse "entitled to any managed tool" gate: paid access OR a live free
     # tool pool. Per-backend availability is then narrowed by coverage below
@@ -357,7 +354,9 @@ def get_nous_subscription_features(
 
     def _entitled_for(category: str) -> bool:
         return bool(account_info and account_info.tool_gateway_entitled_for(category))
-    subscribed = provider_is_nous or nous_auth_present
+    # Selecting the direct Nous inference provider is not a subscription and
+    # must not surface account-managed entitlements.
+    subscribed = False
 
     web_tool_enabled = _toolset_enabled(config, "web")
     image_tool_enabled = _toolset_enabled(config, "image_gen")
@@ -1121,7 +1120,7 @@ def prompt_enable_tool_gateway(
 
     changed = apply_gateway_defaults(config, chosen_keys)
     if changed:
-        from hermes_cli.config import save_config
+        from hermes_runtime.config import save_config
 
         save_config(config)
         for key in sorted(changed):
@@ -1163,6 +1162,12 @@ def ensure_nous_portal_access(
     Returns ``True`` when the account is entitled after the flow, ``False``
     otherwise (declined login, login failed, or no entitlement).
     """
+
+    # The consumer Portal account product is retired from this distribution.
+    # Managed backends remain unavailable until the caller selects a direct
+    # provider and supplies its API key.
+    del capability, coverage_category
+    return False
 
     def _entitled(account) -> bool:
         if account is None:
@@ -1210,6 +1215,9 @@ def _run_nous_portal_login_only(*, capability: str) -> bool:
     Returns ``True`` on a successful login, ``False`` if the user declined or
     the flow failed.
     """
+    del capability
+    return False
+
     try:
         from hermes_cli.auth import (
             _auth_store_lock,

@@ -135,10 +135,9 @@ class TestProviderRegistry:
         assert PROVIDER_REGISTRY["huggingface"].inference_base_url == "https://router.huggingface.co/v1"
         assert PROVIDER_REGISTRY["deepinfra"].inference_base_url == "https://api.deepinfra.com/v1/openai"
 
-    def test_oauth_providers_unchanged(self):
-        """Ensure we didn't break the existing OAuth providers."""
+    def test_nous_is_a_direct_api_key_provider(self):
         assert "nous" in PROVIDER_REGISTRY
-        assert PROVIDER_REGISTRY["nous"].auth_type == "oauth_device_code"
+        assert PROVIDER_REGISTRY["nous"].auth_type == "api_key"
         assert "openai-codex" in PROVIDER_REGISTRY
         assert PROVIDER_REGISTRY["openai-codex"].auth_type == "oauth_external"
 
@@ -412,9 +411,16 @@ class TestApiKeyProviderStatus:
         assert status["configured"] is True
         assert status["provider"] == "copilot-acp"
 
-    def test_non_api_key_provider(self):
+    def test_nous_without_direct_key_is_unconfigured(self):
         status = get_api_key_provider_status("nous")
         assert status["configured"] is False
+
+    def test_nous_auth_status_uses_direct_api_key(self, monkeypatch):
+        monkeypatch.setenv("NOUS_API_KEY", "nous-direct-key")
+        status = get_auth_status("nous")
+        assert status["configured"] is True
+        assert status["logged_in"] is True
+        assert status["key_source"] == "NOUS_API_KEY"
 
 
 # =============================================================================
@@ -592,7 +598,7 @@ class TestResolveApiKeyProviderCredentials:
 
     def test_resolve_invalid_provider_raises(self):
         with pytest.raises(AuthError):
-            resolve_api_key_provider_credentials("nous")
+            resolve_api_key_provider_credentials("unsupported-provider")
 
     def test_glm_key_priority(self, monkeypatch):
         """GLM_API_KEY takes priority over ZAI_API_KEY."""

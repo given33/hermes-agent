@@ -36,7 +36,11 @@ from hermes_cli.dashboard_auth.mobile_device_store import (
     MobileTokenPair,
     OwnerMobileTokenProvider,
 )
-from hermes_cli.dashboard_auth.routes import _client_ip, _password_rate_limited
+from hermes_cli.dashboard_auth.routes import (
+    _account_rate_key,
+    _client_ip,
+    _password_rate_limited,
+)
 from hermes_cli.dashboard_auth.token_auth import (
     extract_bearer_token,
     register_optional_token_prefix,
@@ -193,7 +197,7 @@ def delete_owner_account_credentials(user_id: str) -> dict[str, Any]:
     unregister_provider(BasicAuthProvider.name, expected=provider)
     config_cleared = False
     try:
-        from hermes_cli.config import load_config, save_config
+        from hermes_runtime.config import load_config, save_config
 
         config = load_config()
         dashboard = config.setdefault("dashboard", {})
@@ -502,7 +506,7 @@ def mobile_register(request: Request, body: MobileRegisterBody):
             raise HTTPException(status_code=403, detail="Owner registration is closed")
         _validate_registration_code(email, body.verification_code)
 
-        from hermes_cli.config import load_config, save_config
+        from hermes_runtime.config import load_config, save_config
 
         config = load_config()
         deletion = _store().account_deletion_status(username)
@@ -572,7 +576,10 @@ def mobile_register(request: Request, body: MobileRegisterBody):
 @router.post("/auth/mobile/token")
 def mobile_login(request: Request, body: MobileLoginBody):
     ip = _client_ip(request)
-    if _password_rate_limited(ip):
+    # Password-guessing surface, so it also consumes the per-account
+    # budget: the IP bucket alone gives an attacker with many source
+    # addresses a fresh allowance per address against the same account.
+    if _password_rate_limited(ip, _account_rate_key("owner-mobile", body.username)):
         raise HTTPException(status_code=429, detail="Too many attempts")
     provider = ensure_owner_provider()
     if provider is None:

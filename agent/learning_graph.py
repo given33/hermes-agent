@@ -40,7 +40,7 @@ class SkillNode:
 
 def _frontmatter(text: str) -> dict[str, Any]:
     try:
-        from agent.skill_utils import parse_frontmatter
+        from hermes_runtime.skill_utils import parse_frontmatter
 
         fm, _ = parse_frontmatter(text)
         return fm or {}

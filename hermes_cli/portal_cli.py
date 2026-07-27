@@ -23,8 +23,8 @@ from __future__ import annotations
 import sys
 import webbrowser
 
-from hermes_cli.colors import Colors, color
-from hermes_cli.config import load_config
+from hermes_runtime.colors import Colors, color
+from hermes_runtime.config import load_config
 
 DEFAULT_PORTAL_URL = "https://portal.nousresearch.com"
 SUBSCRIPTION_URL = "https://portal.nousresearch.com/manage-subscription"

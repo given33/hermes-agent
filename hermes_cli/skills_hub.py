@@ -23,7 +23,7 @@ from rich.table import Table
 # Lazy imports to avoid circular dependencies and slow startup.
 # tools.skills_hub and tools.skills_guard are imported inside functions.
 from hermes_constants import display_hermes_home
-from agent.skill_utils import is_excluded_skill_path
+from hermes_runtime.skill_utils import is_excluded_skill_path
 
 _console = Console()
 
@@ -938,7 +938,7 @@ def do_list(source_filter: str = "all",
     from tools.skills_hub import HubLockFile, ensure_hub_dirs
     from tools.skills_sync import _read_manifest
     from tools.skills_tool import _find_all_skills
-    from agent.skill_utils import get_disabled_skill_names
+    from hermes_runtime.skill_utils import get_disabled_skill_names
 
     c = console or _console
     ensure_hub_dirs()

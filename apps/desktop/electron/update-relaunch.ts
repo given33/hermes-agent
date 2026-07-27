@@ -64,11 +64,12 @@ function resolveUnpackedRelease(execPath, updateRoot, platform) {
     return null
   }
 
-  const releaseDir = path.join(updateRoot, 'apps', 'desktop', 'release')
-  const unpacked = path.join(releaseDir, unpackedDirName(platform))
-  const normalizedExec = path.resolve(String(execPath))
+  const targetPath = platform === 'win32' ? path.win32 : path.posix
+  const releaseDir = targetPath.join(updateRoot, 'apps', 'desktop', 'release')
+  const unpacked = targetPath.resolve(targetPath.join(releaseDir, unpackedDirName(platform)))
+  const normalizedExec = targetPath.resolve(String(execPath))
   // execPath must be the unpacked dir itself or a descendant of it.
-  const withSep = unpacked.endsWith(path.sep) ? unpacked : unpacked + path.sep
+  const withSep = unpacked.endsWith(targetPath.sep) ? unpacked : unpacked + targetPath.sep
 
   if (normalizedExec === unpacked || normalizedExec.startsWith(withSep)) {
     return unpacked

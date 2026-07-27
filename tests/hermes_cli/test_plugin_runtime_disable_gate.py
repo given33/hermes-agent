@@ -1,4 +1,4 @@
-"""Regression tests for runtime plugin disable gating.
+﻿"""Regression tests for runtime plugin disable gating.
 
 Covers two residual bypasses addressed in the PR:
 
@@ -25,9 +25,9 @@ from hermes_cli import web_server
 @pytest.fixture(autouse=True)
 def _reset_plugin_cache():
     """Bust the plugin cache before and after each test."""
-    web_server._dashboard_plugins_cache = None
+    web_server.get_runtime_state().dashboard_plugins_cache = None
     yield
-    web_server._dashboard_plugins_cache = None
+    web_server.get_runtime_state().dashboard_plugins_cache = None
 
 
 @pytest.fixture

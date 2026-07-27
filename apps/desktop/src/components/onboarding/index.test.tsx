@@ -56,11 +56,11 @@ afterEach(() => {
 })
 
 describe('onboarding Picker', () => {
-  it('features Nous Portal and hides other providers behind a disclosure', () => {
-    setProviders([provider('anthropic', 'Anthropic Claude'), provider('nous', 'Nous Portal')])
+  it('features the Nous direct API and hides other providers behind a disclosure', () => {
+    setProviders([provider('anthropic', 'Anthropic Claude'), provider('nous', 'Nous Research API')])
     render(<Picker ctx={ctx} />)
 
-    expect(screen.getByText('Nous Portal')).toBeTruthy()
+    expect(screen.getByText('Nous Research API')).toBeTruthy()
     expect(screen.getByText('Recommended')).toBeTruthy()
     // Fireworks is the always-visible #2 slot (after Nous), even while OAuth
     // alternatives stay collapsed behind the disclosure.
@@ -77,7 +77,7 @@ describe('onboarding Picker', () => {
     setProviders([
       provider('openai-codex', 'OpenAI Codex / ChatGPT'),
       provider('minimax-oauth', 'MiniMax'),
-      provider('nous', 'Nous Portal')
+      provider('nous', 'Nous Research API')
     ])
     render(<Picker ctx={ctx} />)
     fireEvent.click(screen.getByRole('button', { name: 'Other providers' }))
@@ -85,16 +85,16 @@ describe('onboarding Picker', () => {
     const labels = screen
       .getAllByRole('button')
       .map(el => el.textContent ?? '')
-      .filter(text => /Nous Portal|Fireworks AI|OpenAI OAuth|MiniMax|OpenRouter/.test(text))
+      .filter(text => /Nous Research API|Fireworks AI|OpenAI OAuth|MiniMax|OpenRouter/.test(text))
 
     const indexOf = (needle: string) => labels.findIndex(text => text.includes(needle))
-    expect(indexOf('Nous Portal')).toBeGreaterThanOrEqual(0)
-    expect(indexOf('Fireworks AI')).toBeGreaterThan(indexOf('Nous Portal'))
+    expect(indexOf('Nous Research API')).toBeGreaterThanOrEqual(0)
+    expect(indexOf('Fireworks AI')).toBeGreaterThan(indexOf('Nous Research API'))
     expect(indexOf('OpenAI OAuth')).toBeGreaterThan(indexOf('Fireworks AI'))
     expect(indexOf('MiniMax')).toBeGreaterThan(indexOf('OpenAI OAuth'))
   })
 
-  it('shows every provider directly when Nous Portal is absent', () => {
+  it('shows every provider directly when the Nous direct API is absent', () => {
     setProviders([provider('anthropic', 'Anthropic Claude'), provider('openai-codex', 'OpenAI Codex / ChatGPT')])
     render(<Picker ctx={ctx} />)
 
@@ -106,7 +106,7 @@ describe('onboarding Picker', () => {
   })
 
   it('offers "choose later" on first run and persists the skip', () => {
-    setProviders([provider('nous', 'Nous Portal')])
+    setProviders([provider('nous', 'Nous Research API')])
     render(<Picker ctx={ctx} />)
 
     const skip = screen.getByRole('button', { name: "I'll choose a provider later" })
@@ -118,7 +118,7 @@ describe('onboarding Picker', () => {
   })
 
   it('hides "choose later" in manual (add-provider) mode', () => {
-    setProviders([provider('nous', 'Nous Portal')])
+    setProviders([provider('nous', 'Nous Research API')])
     $desktopOnboarding.set({ ...$desktopOnboarding.get(), manual: true })
     render(<Picker ctx={ctx} />)
 

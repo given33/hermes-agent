@@ -283,7 +283,7 @@ def _scan_cron_skill_assembled(assembled: str) -> tuple[str, str]:
 
 
 def _origin_from_env() -> Optional[Dict[str, str]]:
-    from gateway.session_context import get_session_env
+    from hermes_runtime.session_context import get_session_env
     origin_platform = get_session_env("HERMES_SESSION_PLATFORM")
     origin_chat_id = get_session_env("HERMES_SESSION_CHAT_ID")
     if origin_platform and origin_chat_id:
@@ -397,7 +397,7 @@ def _resolve_model_override(model_obj: Optional[Dict[str, Any]]) -> tuple:
     # silently hijacks a job that meant to use the configured custom endpoint.
     if provider_name == "custom":
         try:
-            from hermes_cli.runtime_provider import has_named_custom_provider
+            from agent.runtime_provider import has_named_custom_provider
             if not has_named_custom_provider("custom"):
                 provider_name = None
         except Exception:
@@ -405,7 +405,7 @@ def _resolve_model_override(model_obj: Optional[Dict[str, Any]]) -> tuple:
     if model_name and not provider_name:
         # Pin to the current main provider so the job is stable
         try:
-            from hermes_cli.config import load_config
+            from hermes_runtime.config import load_config
             cfg = load_config()
             model_cfg = cfg.get("model", {})
             if isinstance(model_cfg, dict):
@@ -473,12 +473,12 @@ def _validate_cron_base_url(
             "configured custom provider to use a custom endpoint."
         )
     try:
-        from hermes_cli.runtime_provider import (
+        from agent.runtime_provider import (
+            get_named_custom_provider,
             has_named_custom_provider,
             resolve_requested_provider,
-            _get_named_custom_provider,
         )
-        from hermes_cli.auth import PROVIDER_REGISTRY
+        from agent.provider_auth import PROVIDER_REGISTRY
         from utils import base_url_host_matches, base_url_hostname
     except Exception:
         # Can't resolve provider metadata -> fail closed.
@@ -495,7 +495,7 @@ def _validate_cron_base_url(
         # sending that stored key — so an off-host override exfiltrates it.
         # Require the override host to match the provider's CONFIGURED endpoint.
         try:
-            cp = _get_named_custom_provider(prov)
+            cp = get_named_custom_provider(prov)
         except Exception:
             cp = None
         cfg_host = base_url_hostname((cp or {}).get("base_url", "")) if cp else ""

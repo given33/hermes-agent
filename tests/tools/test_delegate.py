@@ -2565,12 +2565,12 @@ class TestConcurrencyDefaults(unittest.TestCase):
 
         with patch.dict("sys.modules", {"cli": stale_cli}):
             with patch(
-                "hermes_cli.config.load_config_readonly", return_value=active_config
+                "hermes_runtime.config.load_config_readonly", return_value=active_config
             ):
                 self.assertEqual(_load_config()["max_concurrent_children"], 50)
                 self.assertEqual(_get_max_concurrent_children(), 50)
 
-    def test_load_config_falls_back_to_cli_config_when_persistent_load_fails(self):
+    def test_load_config_fails_closed_when_persistent_load_fails(self):
         fallback_cli = types.ModuleType("cli")
         fallback_cli.CLI_CONFIG = {
             "delegation": {
@@ -2581,33 +2581,44 @@ class TestConcurrencyDefaults(unittest.TestCase):
 
         with patch.dict("sys.modules", {"cli": fallback_cli}):
             with patch(
-                "hermes_cli.config.load_config_readonly",
+                "hermes_runtime.config.load_config_readonly",
                 side_effect=RuntimeError("boom"),
             ):
-                self.assertEqual(_load_config()["max_concurrent_children"], 8)
+                self.assertEqual(_load_config(), {})
 
-    def test_load_config_prefers_cli_config_when_user_config_ignored(self):
-        # `hermes chat --ignore-user-config` sets HERMES_IGNORE_USER_CONFIG=1,
-        # which only load_cli_config() honors. The delegation loader must keep
-        # CLI_CONFIG authoritative under the flag so user config.yaml
-        # delegation keys stay suppressed.
-        ignoring_cli = types.ModuleType("cli")
-        ignoring_cli.CLI_CONFIG = {
+    def test_load_config_uses_shared_loader_when_user_config_ignored(self):
+        # `hermes chat --ignore-user-config` sets HERMES_IGNORE_USER_CONFIG=1.
+        # This flag used to be honored ONLY by the legacy load_cli_config(),
+        # which forced this loader to prefer CLI_CONFIG under the flag just to
+        # keep user delegation keys suppressed — a compensation for the two
+        # config tracks disagreeing.
+        #
+        # hermes_cli.config._load_config_impl now honors the flag itself
+        # (it treats the user file as absent), so the compensation is gone and
+        # the shared loader is authoritative unconditionally. That is what this
+        # test pins: the shared loader IS consulted under the flag, and its
+        # result — not CLI_CONFIG's stale import-time snapshot — wins.
+        # End-to-end proof that both entry points now agree lives in
+        # tests/architecture/test_ignore_user_config_convergence.py.
+        stale_cli = types.ModuleType("cli")
+        stale_cli.CLI_CONFIG = {
             "delegation": {
                 "max_iterations": 45,
                 "max_concurrent_children": 4,
             }
         }
-        user_config = {"delegation": {"max_concurrent_children": 50}}
+        # What the shared loader returns under the flag: defaults only, with
+        # the user's config.yaml value already suppressed by the loader.
+        defaults_only = {"delegation": {"max_concurrent_children": 9}}
 
-        with patch.dict("sys.modules", {"cli": ignoring_cli}):
+        with patch.dict("sys.modules", {"cli": stale_cli}):
             with patch.dict(os.environ, {"HERMES_IGNORE_USER_CONFIG": "1"}):
                 with patch(
-                    "hermes_cli.config.load_config_readonly",
-                    return_value=user_config,
+                    "hermes_runtime.config.load_config_readonly",
+                    return_value=defaults_only,
                 ) as mock_loader:
-                    self.assertEqual(_load_config()["max_concurrent_children"], 4)
-                    mock_loader.assert_not_called()
+                    self.assertEqual(_load_config()["max_concurrent_children"], 9)
+                    mock_loader.assert_called_once()
 
     @patch("tools.delegate_tool._load_config", return_value={})
     def test_default_is_three(self, mock_cfg):

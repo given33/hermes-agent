@@ -65,11 +65,12 @@ import requests
 from typing import Dict, Any, Optional, List, Tuple, Union
 from pathlib import Path
 from agent.auxiliary_client import call_llm
-from agent.redact import redact_cdp_url
+from hermes_runtime.redaction import redact_cdp_url
 from hermes_constants import agent_browser_runnable, get_hermes_home
 from utils import env_int, is_truthy_value
-from hermes_cli.config import DEFAULT_CONFIG, cfg_get
-from hermes_cli._subprocess_compat import windows_hide_flags
+from hermes_runtime.config import DEFAULT_CONFIG, cfg_get
+from hermes_runtime.subprocess_compat import windows_hide_flags
+from hermes_runtime.process_probe import pid_exists as _pid_exists
 
 # Browser-specific tool keys passed through to the agent-browser subprocess
 # AFTER credential stripping.  agent-browser is a Node process loading npm
@@ -251,7 +252,7 @@ _command_timeout_resolved = False
 def _sanitize_url_for_logs(value: object) -> str:
     """Mask secrets in logged browser endpoint URLs and URL-like errors.
 
-    Thin wrapper over :func:`agent.redact.redact_cdp_url`, which is the single
+    Thin wrapper over :func:`hermes_runtime.redaction.redact_cdp_url`, which is the single
     source of truth for CDP-URL log redaction. Kept as a local name because
     several browser-tool log sites reference it; the redaction policy itself
     lives once in ``redact.py`` so the browser tool and the CDP supervisor
@@ -273,7 +274,7 @@ def _get_command_timeout() -> int:
 
     result = DEFAULT_COMMAND_TIMEOUT
     try:
-        from hermes_cli.config import read_raw_config
+        from hermes_runtime.config import read_raw_config
         cfg = read_raw_config()
         val = cfg_get(cfg, "browser", "command_timeout")
         if val is not None:
@@ -473,7 +474,7 @@ def _get_cdp_override() -> str:
         return _resolve_cdp_override(env_override)
 
     try:
-        from hermes_cli.config import read_raw_config
+        from hermes_runtime.config import read_raw_config
 
         cfg = read_raw_config()
         browser_cfg = cfg.get("browser", {})
@@ -499,7 +500,7 @@ def _get_dialog_policy_config() -> Tuple[str, float]:
     )
 
     try:
-        from hermes_cli.config import read_raw_config
+        from hermes_runtime.config import read_raw_config
 
         cfg = read_raw_config()
         browser_cfg = cfg.get("browser", {}) if isinstance(cfg, dict) else {}
@@ -685,7 +686,7 @@ def _get_cloud_provider() -> Optional[CloudBrowserProvider]:
 
     resolved: Optional[CloudBrowserProvider] = None
     try:
-        from hermes_cli.config import read_raw_config
+        from hermes_runtime.config import read_raw_config
         cfg = read_raw_config()
         browser_cfg = cfg.get("browser", {})
         provider_key = None
@@ -859,7 +860,7 @@ def _get_browser_engine() -> str:
 
     # Config file takes priority
     try:
-        from hermes_cli.config import read_raw_config
+        from hermes_runtime.config import read_raw_config
         cfg = read_raw_config()
         val = cfg.get("browser", {}).get("engine")
         if val and str(val).strip():
@@ -903,7 +904,7 @@ def _is_headed_mode() -> bool:
     _cached_headed_mode = False
 
     try:
-        from hermes_cli.config import read_raw_config
+        from hermes_runtime.config import read_raw_config
         cfg = read_raw_config()
         val = cfg.get("browser", {}).get("headed")
         if val is not None:
@@ -1221,7 +1222,7 @@ def _auto_local_for_private_urls() -> bool:
 
     _auto_local_for_private_urls_resolved = True
     try:
-        from hermes_cli.config import read_raw_config
+        from hermes_runtime.config import read_raw_config
         cfg = read_raw_config()
         browser_cfg = cfg.get("browser", {})
         if isinstance(browser_cfg, dict) and "auto_local_for_private_urls" in browser_cfg:
@@ -1396,7 +1397,7 @@ def _allow_private_urls() -> bool:
     _allow_private_urls_resolved = True
     _cached_allow_private_urls = False  # safe default
     try:
-        from hermes_cli.config import read_raw_config
+        from hermes_runtime.config import read_raw_config
         cfg = read_raw_config()
         browser_cfg = cfg.get("browser", {})
         if isinstance(browser_cfg, dict):
@@ -1463,7 +1464,7 @@ DEFAULT_SESSION_INACTIVITY_TIMEOUT = int(
 def _get_session_inactivity_timeout() -> int:
     result = env_int("BROWSER_INACTIVITY_TIMEOUT", DEFAULT_SESSION_INACTIVITY_TIMEOUT)
     try:
-        from hermes_cli.config import read_raw_config
+        from hermes_runtime.config import read_raw_config
         cfg = read_raw_config()
         val = cfg_get(cfg, "browser", "inactivity_timeout")
         if val is not None:
@@ -1729,7 +1730,6 @@ def _reap_orphaned_browser_sessions():
                 owner_pid = int(Path(owner_pid_file).read_text(encoding="utf-8").strip())
                 # ``os.kill(pid, 0)`` is NOT a no-op on Windows (bpo-14484).
                 # Use the cross-platform existence check.
-                from gateway.status import _pid_exists
                 owner_alive = _pid_exists(owner_pid)
             except (ValueError, OSError):
                 owner_alive = None  # corrupt file — fall through
@@ -1759,7 +1759,6 @@ def _reap_orphaned_browser_sessions():
 
         # Check if the daemon is still alive. ``os.kill(pid, 0)`` on Windows
         # is NOT a no-op — use the handle-based existence check.
-        from gateway.status import _pid_exists
         if not _pid_exists(daemon_pid):
             shutil.rmtree(socket_dir, ignore_errors=True)
             continue
@@ -2645,7 +2644,7 @@ def _store_full_snapshot(snapshot_text: str) -> Optional[str]:
     try:
         import hashlib
         from hermes_constants import get_hermes_dir
-        from agent.redact import redact_sensitive_text
+        from hermes_runtime.redaction import redact_sensitive_text
 
         content = redact_sensitive_text(snapshot_text, force=True)
         if len(content) > MAX_STORED_SNAPSHOT_CHARS:
@@ -2707,7 +2706,7 @@ def _extract_relevant_content(
     # Without this, a page displaying env vars or API keys would leak
     # secrets to the extraction model before run_agent.py's general
     # redaction layer ever sees the tool result.
-    from agent.redact import redact_sensitive_text
+    from hermes_runtime.redaction import redact_sensitive_text
     extraction_prompt = redact_sensitive_text(extraction_prompt)
 
     try:
@@ -2785,7 +2784,7 @@ def _redact_browser_output(value: Any) -> Any:
     Tool output is a model boundary, so force redaction here even if global log
     redaction is disabled for debugging.
     """
-    from agent.redact import redact_sensitive_text
+    from hermes_runtime.redaction import redact_sensitive_text
 
     if isinstance(value, str):
         return redact_sensitive_text(value, force=True)
@@ -2818,9 +2817,9 @@ def browser_navigate(url: str, task_id: Optional[str] = None) -> str:
     # into navigating to https://evil.com/steal?key=sk-ant-... to exfil secrets.
     # Also check URL-decoded form to catch %2D encoding tricks (e.g. sk%2Dant%2D...).
     import urllib.parse
-    from agent.redact import _PREFIX_RE
+    from hermes_runtime.redaction import SECRET_PREFIX_PATTERN
     url_decoded = urllib.parse.unquote(url)
-    if _PREFIX_RE.search(url) or _PREFIX_RE.search(url_decoded):
+    if SECRET_PREFIX_PATTERN.search(url) or SECRET_PREFIX_PATTERN.search(url_decoded):
         return json.dumps({
             "success": False,
             "error": "Blocked: URL contains what appears to be an API key or token. "
@@ -2828,7 +2827,7 @@ def browser_navigate(url: str, task_id: Optional[str] = None) -> str:
         })
     url = _normalize_url_for_request(url)
     normalized_decoded = urllib.parse.unquote(url)
-    if _PREFIX_RE.search(url) or _PREFIX_RE.search(normalized_decoded):
+    if SECRET_PREFIX_PATTERN.search(url) or SECRET_PREFIX_PATTERN.search(normalized_decoded):
         return json.dumps({
             "success": False,
             "error": "Blocked: URL contains what appears to be an API key or token. "
@@ -3562,7 +3561,7 @@ def _allow_unsafe_browser_evaluate() -> bool:
     sensitive-primitive denylist even if ``browser.restrict_evaluate`` is set.
     """
     try:
-        from hermes_cli.config import read_raw_config
+        from hermes_runtime.config import read_raw_config
 
         cfg = read_raw_config()
         return is_truthy_value(cfg_get(cfg, "browser", "allow_unsafe_evaluate"), default=False)
@@ -3586,7 +3585,7 @@ def _restrict_browser_evaluate() -> bool:
     ``browser.allow_unsafe_evaluate: true`` overrides it back off.
     """
     try:
-        from hermes_cli.config import read_raw_config
+        from hermes_runtime.config import read_raw_config
 
         cfg = read_raw_config()
         return is_truthy_value(cfg_get(cfg, "browser", "restrict_evaluate"), default=False)
@@ -3910,7 +3909,7 @@ def _maybe_start_recording(task_id: str):
         if task_id in _recording_sessions:
             return
     try:
-        from hermes_cli.config import read_raw_config
+        from hermes_runtime.config import read_raw_config
         hermes_home = get_hermes_home()
         cfg = read_raw_config()
         record_enabled = cfg_get(cfg, "browser", "record_sessions", default=False)
@@ -4252,7 +4251,7 @@ def browser_vision(question: str, annotate: bool = False, task_id: Optional[str]
         vision_timeout = 120.0
         vision_temperature = 0.1
         try:
-            from hermes_cli.config import load_config
+            from hermes_runtime.config import load_config
             _cfg = load_config()
             _vision_cfg = cfg_get(_cfg, "auxiliary", "vision", default={})
             _vt = _vision_cfg.get("timeout")
@@ -4305,7 +4304,7 @@ def browser_vision(question: str, annotate: bool = False, task_id: Optional[str]
 
         analysis = (response.choices[0].message.content or "").strip()
         # Redact secrets the vision LLM may have read from the screenshot.
-        from agent.redact import redact_sensitive_text
+        from hermes_runtime.redaction import redact_sensitive_text
         analysis = redact_sensitive_text(analysis)
         response_data = {
             "success": True,

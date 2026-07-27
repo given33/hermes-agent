@@ -313,7 +313,7 @@ def setup_logging(
     backups = backup_count or cfg_backup or 3
 
     # Lazy import to avoid circular dependency at module load time.
-    from agent.redact import RedactingFormatter
+    from hermes_runtime.redaction import RedactingFormatter
 
     root = logging.getLogger()
 
@@ -381,7 +381,7 @@ def setup_verbose_logging() -> None:
 
     Called by ``AIAgent.__init__()`` when ``verbose_logging=True``.
     """
-    from agent.redact import RedactingFormatter
+    from hermes_runtime.redaction import RedactingFormatter
 
     root = logging.getLogger()
 
@@ -438,7 +438,7 @@ class _ManagedRotatingFileHandler(RotatingFileHandler):
     """
 
     def __init__(self, *args, **kwargs):
-        from hermes_cli.config import is_managed
+        from hermes_runtime.config import is_managed
         self._managed = is_managed()
         super().__init__(*args, **kwargs)
         # Snapshot the inode of the currently open stream so emit() can
@@ -773,7 +773,7 @@ def _read_logging_config():
             # Managed scope: an administrator can pin logging.* too. Overlay via
             # the shared helper (fail-open) since this reads config.yaml directly.
             try:
-                from hermes_cli import managed_scope
+                from hermes_runtime import managed_scope
                 cfg = managed_scope.apply_managed_overlay(cfg)
             except Exception:
                 pass

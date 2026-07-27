@@ -22,7 +22,7 @@ import threading
 import time
 import unicodedata
 from typing import Optional
-from hermes_cli.config import cfg_get
+from hermes_runtime.config import cfg_get
 
 from tools.interrupt import is_interrupted
 from utils import env_var_enabled, is_truthy_value
@@ -135,7 +135,7 @@ def _prepare_smart_approval_observer(
     the auxiliary LLM from making its decision.
     """
     try:
-        from agent.redact import redact_sensitive_text
+        from hermes_runtime.redaction import redact_sensitive_text
 
         hook_command = redact_sensitive_text(command, force=True)
         hook_description = redact_sensitive_text(description, force=True)
@@ -210,14 +210,14 @@ def get_current_session_key(default: str = "default") -> str:
     session_key = _approval_session_key.get()
     if session_key:
         return session_key
-    from gateway.session_context import get_session_env
+    from hermes_runtime.session_context import get_session_env
     return get_session_env("HERMES_SESSION_KEY", default)
 
 
 def _get_session_platform() -> str:
     """Return the current gateway platform from contextvars/env fallback."""
     try:
-        from gateway.session_context import get_session_env
+        from hermes_runtime.session_context import get_session_env
 
         return get_session_env("HERMES_SESSION_PLATFORM", "") or ""
     except Exception:
@@ -2244,7 +2244,7 @@ def load_permanent_allowlist() -> set:
     patterns added via 'always' in a previous session.
     """
     try:
-        from hermes_cli.config import load_config
+        from hermes_runtime.config import load_config
         config = load_config()
         patterns = set(config.get("command_allowlist", []) or [])
         if patterns:
@@ -2258,7 +2258,7 @@ def load_permanent_allowlist() -> set:
 def save_permanent_allowlist(patterns: set):
     """Save permanently allowed command patterns to config."""
     try:
-        from hermes_cli.config import load_config, save_config
+        from hermes_runtime.config import load_config, save_config
         config = load_config()
         config["command_allowlist"] = list(patterns)
         save_config(config)
@@ -2298,7 +2298,7 @@ def prompt_dangerous_approval(command: str, description: str,
     # `command` is still what executes after approval; only the displayed
     # copy is scrubbed. Reuses the same redaction module used for memory
     # and log sanitization so tokens mask consistently across surfaces.
-    from agent.redact import redact_sensitive_text
+    from hermes_runtime.redaction import redact_sensitive_text
     display_command = redact_sensitive_text(command)
     display_description = redact_sensitive_text(description)
 
@@ -2455,7 +2455,7 @@ def _normalize_approval_mode(mode) -> str:
 def _get_approval_config() -> dict:
     """Read the approvals config block. Returns a dict with 'mode', 'timeout', etc."""
     try:
-        from hermes_cli.config import load_config
+        from hermes_runtime.config import load_config
         config = load_config()
         return config.get("approvals", {}) or {}
     except Exception as e:
@@ -2501,7 +2501,7 @@ def _get_approval_timeout() -> int:
 def _get_cron_approval_mode() -> str:
     """Read the cron approval mode from config. Returns 'deny' or 'approve'."""
     try:
-        from hermes_cli.config import load_config
+        from hermes_runtime.config import load_config
         config = load_config()
         mode = str(cfg_get(config, "approvals", "cron_mode", default="deny")).lower().strip()
         if mode in {"approve", "off", "allow", "yes"}:
@@ -2756,7 +2756,7 @@ def _run_approval_gate(
             notify_cb = _gateway_notify_cbs.get(session_key)
 
         if notify_cb is not None:
-            from agent.redact import redact_sensitive_text
+            from hermes_runtime.redaction import redact_sensitive_text
             approval_data = {
                 "command": redact_sensitive_text(display_target),
                 "pattern_key": pattern_key,
@@ -3278,7 +3278,7 @@ def check_all_command_guards(command: str, env_type: str,
                     # fail-closed synthesis in the main flow below; see #20733).
                     _cron_fail_open = True  # safe default if config is unreadable
                     try:
-                        from hermes_cli.config import load_config as _load_cfg
+                        from hermes_runtime.config import load_config as _load_cfg
                         _sec = (_load_cfg() or {}).get("security", {}) or {}
                         if _sec.get("tirith_enabled", True):
                             _cron_fail_open = _sec.get("tirith_fail_open", True)
@@ -3316,7 +3316,7 @@ def check_all_command_guards(command: str, env_type: str,
         # normal approval flow.  Fixes #20733.
         _tirith_fail_open = True  # safe default if config is unreadable
         try:
-            from hermes_cli.config import load_config as _load_cfg
+            from hermes_runtime.config import load_config as _load_cfg
             _sec = (_load_cfg() or {}).get("security", {}) or {}
             _tirith_enabled = _sec.get("tirith_enabled", True)
             if _tirith_enabled:
@@ -3439,7 +3439,7 @@ def check_all_command_guards(command: str, env_type: str,
             # via the closure below, so redaction is display-only. Approval
             # persistence keys off pattern_key (not the command text), so the
             # allowlist is unaffected.
-            from agent.redact import redact_sensitive_text
+            from hermes_runtime.redaction import redact_sensitive_text
             approval_data = {
                 "command": redact_sensitive_text(command),
                 "pattern_key": primary_key,
@@ -3522,7 +3522,7 @@ def check_all_command_guards(command: str, env_type: str,
         # Return approval_required for backward compat. Redact secrets in the
         # user-facing copy — the raw `command` is preserved for execution and
         # the allowlist keys off pattern_key, so redaction is display-only.
-        from agent.redact import redact_sensitive_text
+        from hermes_runtime.redaction import redact_sensitive_text
         _disp_command = redact_sensitive_text(command)
         _disp_combined_desc = redact_sensitive_text(combined_desc)
         pending_data = {
@@ -3736,7 +3736,7 @@ def check_execute_code_guard(code: str, env_type: str,
     # screenshottable. The raw `command`/`code` are still what get assessed by
     # smart approval and executed; redaction is display-only. Approval
     # persistence keys off pattern_key, so the allowlist is unaffected.
-    from agent.redact import redact_sensitive_text
+    from hermes_runtime.redaction import redact_sensitive_text
     display_command = redact_sensitive_text(command)
     display_code = redact_sensitive_text(code)
     display_description = redact_sensitive_text(description)

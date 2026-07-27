@@ -437,7 +437,7 @@ def _allow_lazy_installs() -> bool:
     """
     # (1) Config kill switch wins in every mode.
     try:
-        from hermes_cli.config import load_config
+        from hermes_runtime.config import load_config
         cfg = load_config()
     except Exception:
         cfg = None

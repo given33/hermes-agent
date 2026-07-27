@@ -22,7 +22,7 @@ import time
 from typing import Any, Callable, Iterator, Sequence
 import uuid
 
-from hermes_cli.config import get_hermes_home
+from hermes_runtime.config import get_hermes_home
 from hermes_cli.sqlite_util import write_txn
 
 

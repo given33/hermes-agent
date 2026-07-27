@@ -37,7 +37,7 @@ from pathlib import Path
 from typing import Optional, Dict, Any
 from urllib.parse import urljoin
 
-from hermes_cli._subprocess_compat import windows_hide_flags
+from hermes_runtime.subprocess_compat import windows_hide_flags
 from utils import is_truthy_value
 from tools.managed_tool_gateway import resolve_managed_tool_gateway
 from tools.tool_backend_helpers import (
@@ -56,7 +56,7 @@ def get_env_value(name, default=None):
     not keep a stale imported function for the rest of the test process.
     """
     try:
-        from hermes_cli.config import get_env_value as _get_env_value
+        from hermes_runtime.config import get_env_value as _get_env_value
     except ImportError:
         return os.getenv(name, default)
     value = _get_env_value(name)
@@ -122,7 +122,7 @@ _local_model_name: Optional[str] = None
 def _load_stt_config() -> dict:
     """Load the ``stt`` section from user config, falling back to defaults."""
     try:
-        from hermes_cli.config import load_config
+        from hermes_runtime.config import load_config
         return load_config().get("stt") or {}
     except Exception:
         return {}
@@ -1669,7 +1669,7 @@ def _transcribe_deepinfra(file_path: str, model_name: str) -> Dict[str, Any]:
     if not api_key:
         return {"success": False, "transcript": "", "error": "DEEPINFRA_API_KEY not set"}
 
-    from hermes_cli.models import deepinfra_base_url, deepinfra_model_ids
+    from agent.model_catalog import deepinfra_base_url, deepinfra_model_ids
 
     stt_config = _load_stt_config()
     # ``stt.deepinfra: null`` in YAML yields None, not {} — coalesce so the

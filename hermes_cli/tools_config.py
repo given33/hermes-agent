@@ -19,11 +19,13 @@ from pathlib import Path
 from typing import Dict, List, Optional, Set
 
 
-from hermes_cli.config import (
+from hermes_runtime.config import (
     cfg_get,
     load_config, save_config, get_env_value, save_env_value,
 )
-from hermes_cli.colors import Colors, color
+from hermes_runtime.colors import Colors, color
+from hermes_runtime.package_install import install_python_packages
+from hermes_config_values import parse_enabled_flag
 from hermes_cli.nous_subscription import (
     MANAGED_FEATURE_COVERAGE_CATEGORY,
     apply_nous_managed_defaults,
@@ -44,7 +46,7 @@ def _post_setup_no_window_flags(*, streams_to_console: bool = False) -> int:
     (npm.cmd, npx, pip, powershell, curl) spawned from that console-less
     parent materializes a brand-new console window — the "terminal flash"
     users see when clicking "Run setup". ``CREATE_NO_WINDOW`` (via
-    :func:`hermes_cli._subprocess_compat.windows_hide_flags`) suppresses it
+    :func:`hermes_runtime.subprocess_compat.windows_hide_flags`) suppresses it
     without breaking ``capture_output`` — unlike ``DETACHED_PROCESS``, stdio
     handles stay inheritable. Returns 0 on POSIX, so passing the result
     unconditionally is safe.
@@ -56,7 +58,7 @@ def _post_setup_no_window_flags(*, streams_to_console: bool = False) -> int:
     the current process has no usable console of its own (stdout is a
     pipe/log file — exactly the GUI-spawn case that flashes).
     """
-    from hermes_cli._subprocess_compat import windows_hide_flags
+    from hermes_runtime.subprocess_compat import windows_hide_flags
 
     flags = windows_hide_flags()
     if not flags:
@@ -79,7 +81,7 @@ PROJECT_ROOT = Path(__file__).parent.parent.resolve()
 
 # ─── UI Helpers (shared with setup.py) ────────────────────────────────────────
 
-from hermes_cli.cli_output import (  # noqa: E402 — late import block
+from hermes_runtime.console_output import (  # noqa: E402 — late import block
     print_error as _print_error,
     print_info as _print_info,
     print_success as _print_success,
@@ -675,75 +677,15 @@ def _pip_install(
     timeout: int = 300,
     capture_output: bool = True,
 ):
-    """Install Python packages from a post-setup hook.
-
-    Strategy (in order):
-    1. ``uv pip install`` if uv is on PATH — fast, doesn't need pip in the venv.
-    2. ``python -m pip install`` — works on stdlib venvs.
-    3. ``python -m ensurepip --upgrade`` then retry pip — covers ``uv venv``
-       which creates a venv WITHOUT pip.
-
-    Why this exists: the Windows installer creates the venv via ``uv venv``,
-    which doesn't seed pip. Post-setup hooks that shelled out to
-    ``[sys.executable, '-m', 'pip', 'install', ...]`` failed with
-    ``No module named pip`` on every fresh install. uv-first sidesteps that.
-
-    Returns the ``subprocess.CompletedProcess`` from whichever tier succeeded
-    (or the last failure for the caller to inspect).
-    """
-    venv_root = Path(sys.executable).parent.parent
-    uv_env = {**os.environ, "VIRTUAL_ENV": str(venv_root)}
-
-    uv_bin = shutil.which("uv")
-    if uv_bin:
-        try:
-            result = subprocess.run(
-                [uv_bin, "pip", "install", *args],
-                capture_output=capture_output, text=True, timeout=timeout,
-                env=uv_env,
-                creationflags=_post_setup_no_window_flags(
-                    streams_to_console=not capture_output
-                ),
-            )
-            if result.returncode == 0:
-                return result
-            # Fall through to pip — uv may have failed for an unrelated reason
-            # (resolution conflict, network), and pip might handle it.
-        except (subprocess.TimeoutExpired, FileNotFoundError):
-            pass
-
-    pip_cmd = [sys.executable, "-m", "pip"]
-    try:
-        # Probe for pip; bootstrap via ensurepip if missing (uv venv lacks it).
-        probe = subprocess.run(
-            pip_cmd + ["--version"],
-            capture_output=True, text=True, timeout=15,
-            creationflags=_post_setup_no_window_flags(),
-        )
-        if probe.returncode != 0:
-            raise FileNotFoundError("pip not in venv")
-    except (subprocess.TimeoutExpired, FileNotFoundError):
-        try:
-            subprocess.run(
-                [sys.executable, "-m", "ensurepip", "--upgrade", "--default-pip"],
-                capture_output=True, text=True, timeout=120, check=True,
-                creationflags=_post_setup_no_window_flags(),
-            )
-        except (subprocess.CalledProcessError, subprocess.TimeoutExpired) as e:
-            # Synthesize a result so callers see a clean failure path.
-            return subprocess.CompletedProcess(
-                pip_cmd, returncode=1, stdout="",
-                stderr=f"pip not available and ensurepip failed: {e}",
-            )
-
-    return subprocess.run(
-        pip_cmd + ["install", *args],
-        capture_output=capture_output, text=True, timeout=timeout,
+    """Compatibility wrapper for the runtime-owned installer policy."""
+    return install_python_packages(
+        args,
+        timeout=timeout,
+        capture_output=capture_output,
         creationflags=_post_setup_no_window_flags(
             streams_to_console=not capture_output
         ),
     )
-
 
 
 # The asset-probe that lived here used to hit `/releases/latest` on
@@ -1527,7 +1469,7 @@ def _run_post_setup(post_setup_key: str):
                 prompt_choice,
                 prompt as _setup_prompt,
             )
-            from hermes_cli.config import save_env_value
+            from hermes_runtime.config import save_env_value
         except Exception as exc:
             _print_warning(f"    Could not load setup helpers: {exc}")
             _print_info("    Run later: hermes auth add xai-oauth   (or set XAI_API_KEY)")
@@ -1662,20 +1604,8 @@ def _platform_toolset_summary(config: dict, platforms: Optional[List[str]] = Non
 
 
 def _parse_enabled_flag(value, default: bool = True) -> bool:
-    """Parse bool-like config values used by tool/platform settings."""
-    if value is None:
-        return default
-    if isinstance(value, bool):
-        return value
-    if isinstance(value, int):
-        return value != 0
-    if isinstance(value, str):
-        lowered = value.strip().lower()
-        if lowered in {"true", "1", "yes", "on"}:
-            return True
-        if lowered in {"false", "0", "no", "off"}:
-            return False
-    return default
+    """Compatibility alias for the public runtime parser."""
+    return parse_enabled_flag(value, default=default)
 
 
 def enabled_mcp_server_names(config: dict) -> Set[str]:
@@ -1692,7 +1622,7 @@ def enabled_mcp_server_names(config: dict) -> Set[str]:
         str(name)
         for name, server_cfg in mcp_servers.items()
         if isinstance(server_cfg, dict)
-        and _parse_enabled_flag(server_cfg.get("enabled", True), default=True)
+        and parse_enabled_flag(server_cfg.get("enabled", True), default=True)
     }
 
 
@@ -2561,14 +2491,7 @@ def _visible_providers(
     *,
     force_fresh: bool = False,
 ) -> list[dict]:
-    """Return provider entries visible for the current auth/config state.
-
-    Nous-managed Tool Gateway rows (``managed_nous_feature``) are always
-    shown — even to logged-out / unentitled users — so the picker advertises
-    that the capability exists.  Selecting one drives an inline Nous Portal
-    login + entitlement check (see ``_configure_provider``); the row only
-    *activates* the gateway once paid access is confirmed.
-    """
+    """Return direct provider entries visible for the current config state."""
     features = get_nous_subscription_features(config, force_fresh=force_fresh)
     acct = features.account_info
     # Pool-only users (entitled to managed tools via the free tool pool but with
@@ -2584,6 +2507,8 @@ def _visible_providers(
     )
     visible = []
     for provider in cat.get("providers", []):
+        if provider.get("managed_nous_feature") or provider.get("requires_nous_auth"):
+            continue
         # Nous-managed Tool Gateway rows stay visible regardless of auth —
         # selecting one drives an inline Portal login. A `requires_nous_auth`
         # row that is NOT a managed gateway feature (pure pre-auth UX) is

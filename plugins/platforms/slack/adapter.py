@@ -17,6 +17,7 @@ import re
 import time
 from dataclasses import dataclass, field
 from typing import Dict, Optional, Any, Tuple, List
+from urllib.parse import urlparse
 
 try:
     from slack_bolt.async_app import AsyncApp
@@ -36,7 +37,7 @@ from pathlib import Path as _Path
 
 sys.path.insert(0, str(_Path(__file__).resolve().parents[3]))
 
-from agent.secret_scope import UnscopedSecretError, get_secret
+from hermes_runtime.secret_scope import UnscopedSecretError, get_secret
 from gateway.config import Platform, PlatformConfig
 from gateway.platforms.helpers import MessageDeduplicator
 from gateway.platforms.base import (
@@ -403,6 +404,82 @@ def _is_slack_voice_clip(file_obj: Dict[str, Any]) -> bool:
     return name.startswith("audio_message")
 
 
+# Slack-owned domains from which inbound file content may be fetched with the
+# bot token attached. ``url_private`` / ``url_private_download`` normally live
+# on files.slack.com (enterprise installs use workspace subdomains of
+# slack.com; legacy share links use slack-files.com). Slack "remote files"
+# (``files.remote.add``) instead carry an arbitrary EXTERNAL url_private that
+# any workspace member or shared-channel guest can point anywhere — that URL
+# must never receive our xoxb credential or a server-side fetch.
+_SLACK_FILE_HOSTS = frozenset({"slack.com", "slack-files.com"})
+_SLACK_FILE_HOST_SUFFIXES = (".slack.com", ".slack-files.com")
+
+
+def _is_slack_file_url(url: str) -> bool:
+    """Return True only for an https URL on a Slack-owned file domain.
+
+    Fails closed: unparseable URLs, non-https schemes, userinfo tricks
+    (``https://files.slack.com@evil.test/``) and lookalike hosts
+    (``notslack.com``, ``evilslack.com``) all return False —
+    ``urlparse().hostname`` already strips userinfo/port, and matching is on
+    the exact host or a dot-anchored suffix.
+    """
+    try:
+        parsed = urlparse(url or "")
+    except ValueError:
+        return False
+    if (parsed.scheme or "").lower() != "https":
+        return False
+    host = (parsed.hostname or "").strip().lower().rstrip(".")
+    if not host:
+        return False
+    return host in _SLACK_FILE_HOSTS or host.endswith(_SLACK_FILE_HOST_SUFFIXES)
+
+
+async def _slack_file_redirect_guard(response) -> None:
+    """Re-check every redirect target of an inbound Slack file download.
+
+    Mirrors ``send_image``'s ``_ssrf_redirect_guard``, plus host pinning:
+    the initial URL was pinned to a Slack file domain, and a redirect must
+    not be able to bounce the request (or, same-origin, the bot token) to an
+    attacker-chosen host or a private/internal address.
+    """
+    from tools.url_safety import is_safe_url, redirect_target_from_response
+
+    redirect_url = redirect_target_from_response(response)
+    if redirect_url is None:
+        return
+    if not _is_slack_file_url(redirect_url):
+        raise ValueError("Blocked Slack file redirect off Slack-owned hosts")
+    if not is_safe_url(redirect_url):
+        raise ValueError("Blocked redirect to private/internal address")
+
+
+def _check_slack_download_url(url: str) -> None:
+    """Validate an inbound file URL before it is fetched with the bot token.
+
+    The URL comes straight from event JSON (``url_private_download`` /
+    ``url_private``), so treat it as attacker-controllable: pin the host to
+    Slack's own file domains BEFORE attaching the xoxb bot token (a token
+    sent to a non-Slack host is a full workspace compromise), and reject
+    private/internal resolution (credentialed SSRF probes at metadata
+    endpoints or localhost). This is the inbound twin of the ``is_safe_url``
+    + redirect-guard defence ``send_image`` applies on the outbound path.
+    """
+    from tools.url_safety import is_safe_url
+
+    if not _is_slack_file_url(url):
+        raise ValueError(
+            "Blocked Slack file download from non-Slack host "
+            f"(SSRF/token protection): {safe_url_for_log(url)}"
+        )
+    if not is_safe_url(url):
+        raise ValueError(
+            "Blocked Slack file download resolving to a private/internal "
+            f"address: {safe_url_for_log(url)}"
+        )
+
+
 class SlackAdapter(BasePlatformAdapter):
     """
     Slack bot adapter using Socket Mode.
@@ -748,6 +825,25 @@ class SlackAdapter(BasePlatformAdapter):
                 return f"Slack attachment {file_label} returned HTTP 404 and is no longer reachable."
 
         message = str(exc)
+        # ValueErrors raised by _check_slack_download_url / the redirect guard
+        # before any bytes move, so there is no HTTP status to translate. The
+        # common non-attack trigger is a Slack external/remote file
+        # (files.remote.add — Google Drive, OneDrive, ...) whose url_private
+        # points outside Slack's own file hosts: blocking the fetch is
+        # working as designed, but without this branch the attachment
+        # vanished with no user-visible explanation.
+        if isinstance(exc, ValueError):
+            if "non-Slack host" in message or "off Slack-owned hosts" in message:
+                return (
+                    f"Slack attachment {file_label} is hosted outside Slack (an external/shared "
+                    "file such as a Google Drive or OneDrive link), so the bot cannot fetch it. "
+                    "Upload the file to Slack directly, or paste a link instead."
+                )
+            if "private/internal address" in message:
+                return (
+                    f"Slack attachment {file_label} was blocked: its download URL resolves to a "
+                    "private/internal address, which the bot refuses to fetch (SSRF protection)."
+                )
         if (
             "Slack returned HTML instead of media" in message
             or "non-image data" in message
@@ -4009,7 +4105,7 @@ class SlackAdapter(BasePlatformAdapter):
         def _env(name: str) -> str:
             # Multiplex: profile .env is in secret_scope, not process environ.
             try:
-                from agent.secret_scope import get_secret
+                from hermes_runtime.secret_scope import get_secret
 
                 val = get_secret(name)
                 if val is not None and str(val).strip():
@@ -4655,8 +4751,15 @@ class SlackAdapter(BasePlatformAdapter):
     async def _download_slack_file(
         self, url: str, ext: str, audio: bool = False, team_id: str = ""
     ) -> str:
-        """Download a Slack file using the bot token for auth, with retry."""
+        """Download a Slack file using the bot token for auth, with retry.
+
+        The URL originates from inbound event JSON, so it is pinned to Slack
+        file hosts and SSRF-checked (including on redirects) before the bot
+        token goes on the wire — see ``_check_slack_download_url``.
+        """
         import httpx
+
+        _check_slack_download_url(url)
 
         bot_token = (
             self._team_clients[team_id].token
@@ -4664,7 +4767,11 @@ class SlackAdapter(BasePlatformAdapter):
             else self.config.token
         )
 
-        async with httpx.AsyncClient(timeout=30.0, follow_redirects=True) as client:
+        async with httpx.AsyncClient(
+            timeout=30.0,
+            follow_redirects=True,
+            event_hooks={"response": [_slack_file_redirect_guard]},
+        ) as client:
             for attempt in range(3):
                 try:
                     response = await client.get(
@@ -4711,8 +4818,15 @@ class SlackAdapter(BasePlatformAdapter):
                     raise
 
     async def _download_slack_file_bytes(self, url: str, team_id: str = "") -> bytes:
-        """Download a Slack file and return raw bytes, with retry."""
+        """Download a Slack file and return raw bytes, with retry.
+
+        Same host pinning + SSRF guard as ``_download_slack_file`` — the URL
+        is attacker-controllable event data and the request carries the bot
+        token.
+        """
         import httpx
+
+        _check_slack_download_url(url)
 
         bot_token = (
             self._team_clients[team_id].token
@@ -4720,7 +4834,11 @@ class SlackAdapter(BasePlatformAdapter):
             else self.config.token
         )
 
-        async with httpx.AsyncClient(timeout=30.0, follow_redirects=True) as client:
+        async with httpx.AsyncClient(
+            timeout=30.0,
+            follow_redirects=True,
+            event_hooks={"response": [_slack_file_redirect_guard]},
+        ) as client:
             for attempt in range(3):
                 try:
                     response = await client.get(
@@ -4983,8 +5101,8 @@ def interactive_setup() -> None:
     offers to set a home channel. Replaces ``hermes_cli/setup.py::_setup_slack``.
     """
     from pathlib import Path
-    from hermes_cli.config import get_env_value, save_env_value
-    from hermes_cli.cli_output import (
+    from hermes_runtime.config import get_env_value, save_env_value
+    from hermes_runtime.console_output import (
         prompt,
         prompt_yes_no,
         print_header,

@@ -38,7 +38,7 @@ def _raise_import():
 # managed_nous_tools_enabled
 # ---------------------------------------------------------------------------
 class TestManagedNousToolsEnabled:
-    """Subscription-based gate: True for paid Nous subscribers."""
+    """The fork never enables account-managed tool backends."""
 
     def test_disabled_when_not_logged_in(self, monkeypatch):
         monkeypatch.setattr(
@@ -59,19 +59,16 @@ class TestManagedNousToolsEnabled:
         )
         assert managed_nous_tools_enabled() is False
 
-    def test_enabled_for_paid_subscriber(self, monkeypatch):
+    def test_disabled_for_paid_subscriber_without_querying_account(self, monkeypatch):
         monkeypatch.setattr(
             "hermes_cli.nous_account.get_nous_portal_account_info",
-            lambda: NousPortalAccountInfo(
-                logged_in=True,
-                source="jwt",
-                fresh=False,
-                paid_service_access=True,
+            lambda *args, **kwargs: (_ for _ in ()).throw(
+                AssertionError("Nous account state must not be queried")
             ),
         )
-        assert managed_nous_tools_enabled() is True
+        assert managed_nous_tools_enabled() is False
 
-    def test_force_fresh_is_forwarded(self, monkeypatch):
+    def test_force_fresh_does_not_restore_account_product(self, monkeypatch):
         calls = []
 
         def fake_account_info(*, force_fresh=False):
@@ -88,8 +85,8 @@ class TestManagedNousToolsEnabled:
             fake_account_info,
         )
 
-        assert managed_nous_tools_enabled(force_fresh=True) is True
-        assert calls == [True]
+        assert managed_nous_tools_enabled(force_fresh=True) is False
+        assert calls == []
 
     def test_returns_false_on_exception(self, monkeypatch):
         """Should never crash — returns False on any exception."""
@@ -101,32 +98,18 @@ class TestManagedNousToolsEnabled:
 
 
 class TestNousToolGatewayUnavailableMessage:
-    def test_uses_entitlement_reason_for_logged_in_user(self, monkeypatch):
+    def test_points_to_direct_provider_without_querying_account(self, monkeypatch):
         monkeypatch.setattr(
             "hermes_cli.nous_account.get_nous_portal_account_info",
-            lambda force_fresh=False: NousPortalAccountInfo(
-                logged_in=True,
-                source="account_api",
-                fresh=True,
-                paid_service_access=False,
-                portal_base_url="https://portal.example.test",
-                paid_service_access_info=NousPaidServiceAccessInfo(
-                    allowed=False,
-                    reason="no_usable_credits",
-                    has_active_subscription=True,
-                    active_subscription_is_paid=True,
-                    subscription_credits_remaining=0,
-                    purchased_credits_remaining=0,
-                    total_usable_credits=0,
-                ),
+            lambda *args, **kwargs: (_ for _ in ()).throw(
+                AssertionError("Nous account state must not be queried")
             ),
         )
 
         message = nous_tool_gateway_unavailable_message("managed image generation")
 
-        assert "credits are exhausted" in message
         assert "managed image generation" in message
-        assert "https://portal.example.test/billing" in message
+        assert "direct provider and API key" in message
 
 
 # ---------------------------------------------------------------------------

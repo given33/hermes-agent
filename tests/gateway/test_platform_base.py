@@ -1494,7 +1494,10 @@ class TestMediaDeliveryDefaultMode:
         workdir = fake_home / "work"
         workdir.mkdir()
         link = workdir / "innocent.pdf"
-        link.symlink_to(key)
+        try:
+            link.symlink_to(key)
+        except OSError as exc:
+            pytest.skip(f"symlink creation is unavailable: {exc}")
         monkeypatch.setenv("HOME", str(fake_home))
         monkeypatch.setattr(
             "gateway.platforms.base._MEDIA_DELIVERY_DENIED_PREFIXES",
@@ -1502,6 +1505,231 @@ class TestMediaDeliveryDefaultMode:
         )
 
         assert BasePlatformAdapter.validate_media_delivery_path(str(link)) is None
+
+
+class TestMediaDeliverySecretBasenames:
+    """Global, case-insensitive secret-basename denial (any location).
+
+    The location-based denylists only covered ``~/.hermes/.env``,
+    ``~/.ssh/...`` and system prefixes — a prompt-injected
+    ``MEDIA:/home/hermes/code/clientA/.env`` sat under none of them and
+    delivered in default (non-strict) mode. A ``.env`` or ``id_rsa`` is
+    credential material wherever it sits, so the basename itself is now
+    denied everywhere. None of these tests touch $HOME: the whole point is
+    that the path is outside every location-based list.
+    """
+
+    def _patch_roots(self, monkeypatch, *roots):
+        monkeypatch.setattr(
+            "gateway.platforms.base.MEDIA_DELIVERY_SAFE_ROOTS",
+            tuple(roots),
+        )
+        monkeypatch.delenv("HERMES_MEDIA_DELIVERY_STRICT", raising=False)
+        monkeypatch.delenv("HERMES_MEDIA_ALLOW_DIRS", raising=False)
+
+    def test_project_env_file_rejected_outside_hermes_root(self, tmp_path, monkeypatch):
+        """The motivating exfil case: a client checkout's .env, far from
+        $HOME/.hermes and any denied prefix, must not deliver.
+        """
+        self._patch_roots(monkeypatch)
+
+        project = tmp_path / "code" / "clientA"
+        project.mkdir(parents=True)
+        secret = project / ".env"
+        secret.write_text("STRIPE_SECRET_KEY=sk_live_...\n")
+
+        assert BasePlatformAdapter.validate_media_delivery_path(str(secret)) is None
+
+    @pytest.mark.parametrize(
+        "name",
+        [
+            ".env.local",
+            ".env.production",
+            # Deliberately NOT carved out (unlike the read guard in
+            # agent/file_safety.py): no chat reply needs the template as a
+            # native attachment — the agent can quote it as text.
+            ".env.example",
+            ".envrc",
+            # docker-compose ``env_file:`` convention.
+            "prod.env",
+            # Case-insensitive: case-preserving filesystems must not let a
+            # renamed-case copy through.
+            ".ENV",
+            "ID_RSA",
+        ],
+    )
+    def test_env_family_and_case_variants_rejected(self, tmp_path, monkeypatch, name):
+        self._patch_roots(monkeypatch)
+
+        secret = tmp_path / name
+        secret.write_text("SECRET=1\n")
+
+        assert BasePlatformAdapter.validate_media_delivery_path(str(secret)) is None
+
+    @pytest.mark.parametrize(
+        "name",
+        ["id_rsa", "id_dsa", "id_ecdsa", "id_ed25519", "id_ecdsa_sk", "id_ed25519_sk"],
+    )
+    def test_default_ssh_private_key_names_rejected_anywhere(
+        self, tmp_path, monkeypatch, name
+    ):
+        """A key copied/generated into a scratch dir is as secret as ~/.ssh's."""
+        self._patch_roots(monkeypatch)
+
+        secret = tmp_path / "backup" / name
+        secret.parent.mkdir()
+        secret.write_bytes(b"-----BEGIN OPENSSH PRIVATE KEY-----")
+
+        assert BasePlatformAdapter.validate_media_delivery_path(str(secret)) is None
+
+    @pytest.mark.parametrize(
+        "name",
+        [
+            "server.pem",
+            "bundle.p12",
+            "client.pfx",
+            "putty.ppk",
+            "release.jks",
+            "debug.keystore",
+        ],
+    )
+    def test_key_material_extensions_rejected(self, tmp_path, monkeypatch, name):
+        self._patch_roots(monkeypatch)
+
+        secret = tmp_path / name
+        secret.write_bytes(b"key material")
+
+        assert BasePlatformAdapter.validate_media_delivery_path(str(secret)) is None
+
+    @pytest.mark.parametrize(
+        "name",
+        [
+            "private.key",
+            "server.key",
+            # Case-insensitive like every other basename rule.
+            "tls.KEY",
+            "apns.key",
+            "ca.key",
+            "client.key",
+        ],
+    )
+    def test_wellknown_private_key_basenames_rejected(
+        self, tmp_path, monkeypatch, name
+    ):
+        """``*.key`` is no longer denied wholesale (Keynote collision — see
+        test_keynote_presentation_still_delivers), so each conventional
+        private-key name is denied exactly instead.
+        """
+        self._patch_roots(monkeypatch)
+
+        secret = tmp_path / name
+        secret.write_bytes(b"-----BEGIN PRIVATE KEY-----")
+
+        assert BasePlatformAdapter.validate_media_delivery_path(str(secret)) is None
+
+    def test_keynote_presentation_still_delivers(self, tmp_path, monkeypatch):
+        """Apple Keynote also uses ``*.key``, and MEDIA_DELIVERY_EXTS lists it
+        as a presentation type. A blanket ``.key`` suffix denial made every
+        legitimate Keynote deck silently fail to deliver, so only the
+        enumerated private-key basenames are denied.
+        """
+        self._patch_roots(monkeypatch)
+
+        deck = tmp_path / "presentation.key"
+        deck.write_bytes(b"keynote deck")
+
+        assert BasePlatformAdapter.validate_media_delivery_path(str(deck)) == str(
+            deck.resolve()
+        )
+
+    def test_denied_suffixes_disjoint_from_media_delivery_exts(self):
+        """Ratchet for the Keynote regression class: a suffix present in both
+        the denial tuple and MEDIA_DELIVERY_EXTS silently kills that whole
+        media type, so the two sets must stay disjoint (exact basenames are
+        the escape hatch for double-duty extensions like ``.key``).
+        """
+        from gateway.platforms.base import (
+            MEDIA_DELIVERY_EXTS,
+            _MEDIA_DELIVERY_DENIED_BASENAME_SUFFIXES,
+        )
+
+        overlap = set(_MEDIA_DELIVERY_DENIED_BASENAME_SUFFIXES) & set(
+            MEDIA_DELIVERY_EXTS
+        )
+        assert overlap == set()
+
+    @pytest.mark.parametrize(
+        "name",
+        ["credentials", "credentials.json", ".netrc", "_netrc", ".pgpass", ".htpasswd"],
+    )
+    def test_classic_credential_stores_rejected(self, tmp_path, monkeypatch, name):
+        self._patch_roots(monkeypatch)
+
+        secret = tmp_path / name
+        secret.write_text("hunter2\n")
+
+        assert BasePlatformAdapter.validate_media_delivery_path(str(secret)) is None
+
+    @pytest.mark.parametrize(
+        "name",
+        [
+            # Public halves of SSH keys are legitimately shareable.
+            "id_rsa.pub",
+            "id_ed25519.pub",
+            # Near-misses that must NOT be swept up by the substring-ish rules.
+            "environment.json",
+            "envelope.pdf",
+            "dotenv.md",
+            "renv.lock",
+            "passkey-notes.txt",
+            "monkey.png",
+        ],
+    )
+    def test_innocent_near_miss_names_still_deliver(self, tmp_path, monkeypatch, name):
+        self._patch_roots(monkeypatch)
+
+        f = tmp_path / name
+        f.write_bytes(b"harmless")
+
+        assert BasePlatformAdapter.validate_media_delivery_path(str(f)) == str(f.resolve())
+
+    def test_strict_mode_recency_trust_never_vouches_for_secret_basename(
+        self, tmp_path, monkeypatch
+    ):
+        """Strict mode: an id_ed25519 minted by ssh-keygen seconds ago is
+        exactly the file the recency window must not trust, while a fresh
+        ordinary artifact still delivers through the same window.
+        """
+        self._patch_roots(monkeypatch)
+        monkeypatch.setenv("HERMES_MEDIA_DELIVERY_STRICT", "1")
+        monkeypatch.setenv("HERMES_MEDIA_TRUST_RECENT_FILES", "1")
+        monkeypatch.setenv("HERMES_MEDIA_TRUST_RECENT_SECONDS", "600")
+
+        fresh_key = tmp_path / "id_ed25519"
+        fresh_key.write_bytes(b"-----BEGIN OPENSSH PRIVATE KEY-----")  # mtime = now
+        control = tmp_path / "report.pdf"
+        control.write_bytes(b"%PDF-1.4")  # mtime = now
+
+        assert BasePlatformAdapter.validate_media_delivery_path(str(fresh_key)) is None
+        assert BasePlatformAdapter.validate_media_delivery_path(str(control)) == str(
+            control.resolve()
+        )
+
+    def test_allowlisted_root_still_beats_basename_denial(self, tmp_path, monkeypatch):
+        """Documented precedence: Hermes-managed caches / operator allowlist
+        roots are matched before every denylist (same contract as the prefix
+        denylist — see _MEDIA_DELIVERY_DENIED_PREFIXES' comment), so an
+        operator who intentionally stages a cert for delivery can.
+        """
+        cache_dir = tmp_path / "cache" / "documents"
+        cache_dir.mkdir(parents=True)
+        staged = cache_dir / "cert.pem"
+        staged.write_bytes(b"-----BEGIN CERTIFICATE-----")
+        self._patch_roots(monkeypatch, cache_dir)
+
+        assert BasePlatformAdapter.validate_media_delivery_path(str(staged)) == str(
+            staged.resolve()
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -1985,7 +2213,7 @@ class TestMediaDeliveryDiagnosability:
 
     def test_canonical_cache_roots_present(self):
         from gateway.platforms.base import MEDIA_DELIVERY_SAFE_ROOTS
-        roots = {str(r) for r in MEDIA_DELIVERY_SAFE_ROOTS}
+        roots = {str(r).replace("\\", "/") for r in MEDIA_DELIVERY_SAFE_ROOTS}
         assert any(r.endswith("cache/images") for r in roots)
         assert any(r.endswith("cache/documents") for r in roots)
         # Legacy layout still present.

@@ -104,7 +104,7 @@ def load_ios_intelligence_config(
     """Load settings from an explicit mapping or the active profile config."""
 
     if config is None:
-        from hermes_cli.config import load_config
+        from hermes_runtime.config import load_config
 
         config = load_config()
     root = _section(config)

@@ -25,7 +25,7 @@ from typing import Any, Callable, Iterable, Mapping
 from urllib.parse import urlsplit
 import uuid
 
-from hermes_cli.config import get_hermes_home
+from hermes_runtime.config import get_hermes_home
 from hermes_cli.sqlite_util import write_txn
 
 
@@ -611,7 +611,7 @@ class IOSMCPRuntimeSupervisor:
         self.python_executable = str(python_executable or sys.executable)
         self.owner_id = str(owner_id or "").strip()[:512]
         try:
-            from hermes_cli.config import load_config
+            from hermes_runtime.config import load_config
 
             configured_servers = load_config().get("mcp_servers") or {}
         except Exception:
@@ -652,7 +652,7 @@ class IOSMCPRuntimeSupervisor:
 
     def _configured_active_ports(self) -> dict[str, int]:
         try:
-            from hermes_cli.config import load_config
+            from hermes_runtime.config import load_config
 
             servers = (load_config().get("mcp_servers") or {})
         except Exception:
@@ -740,7 +740,7 @@ class IOSMCPRuntimeSupervisor:
         from hermes_cli.ios_mcp_server import MCP_VERSION, ios_mcp_manifests
 
         try:
-            from hermes_cli.config import load_config
+            from hermes_runtime.config import load_config
 
             configured_servers = load_config().get("mcp_servers") or {}
         except Exception:
@@ -1250,7 +1250,7 @@ class IOSMCPRuntimeSupervisor:
         """
 
         try:
-            from hermes_cli.config import read_raw_config
+            from hermes_runtime.config import read_raw_config
             from tools import mcp_tool
 
             config = read_raw_config() or {}

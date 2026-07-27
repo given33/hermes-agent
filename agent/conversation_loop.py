@@ -215,20 +215,10 @@ def _ra():
 
 
 def _nous_entitlement_message(capability: str) -> str:
-    try:
-        from hermes_cli.nous_account import (
-            format_nous_portal_entitlement_message,
-            get_nous_portal_account_info,
-        )
-
-        account_info = get_nous_portal_account_info(force_fresh=True)
-        message = format_nous_portal_entitlement_message(
-            account_info,
-            capability=capability,
-        )
-        return message or ""
-    except Exception:
-        return ""
+    return (
+        f"{capability} requires a valid NOUS_API_KEY with access to the selected "
+        "model. Update the key or switch to another configured provider."
+    )
 
 
 def _print_nous_entitlement_guidance(agent, capability: str) -> bool:
@@ -317,18 +307,9 @@ def _print_billing_or_entitlement_guidance(
 
 
 def _try_refresh_nous_paid_entitlement_credentials(agent) -> bool:
-    """Refresh Nous runtime credentials after a fresh paid-entitlement check."""
-    try:
-        from hermes_cli.nous_account import get_nous_portal_account_info
-
-        account_info = get_nous_portal_account_info(force_fresh=True)
-        if account_info.paid_service_access is not True:
-            return False
-        return agent._try_refresh_nous_client_credentials(
-            force=True,
-        )
-    except Exception:
-        return False
+    """Account-managed credential refresh is disabled in this fork."""
+    del agent
+    return False
 
 
 def _restore_or_build_system_prompt(agent, system_message, conversation_history):
@@ -649,7 +630,7 @@ def run_conversation(
     """
     if moa_config is None:
         try:
-            from hermes_cli.moa_config import decode_moa_turn
+            from agent.moa_config import decode_moa_turn
 
             _decoded_message, _decoded_moa_config = decode_moa_turn(user_message)
             if _decoded_moa_config is not None:
@@ -657,8 +638,16 @@ def run_conversation(
                 moa_config = _decoded_moa_config
                 if persist_user_message is None:
                     persist_user_message = _decoded_message
-        except Exception:
-            pass
+        except Exception as _moa_decode_err:
+            # decode_moa_turn already hands back the message unchanged for
+            # non-MoA payloads, so getting here means the hermes_cli import
+            # or preset normalization itself blew up.  Non-fatal — the turn
+            # proceeds with the raw message — but it must not be silent:
+            # a swallowed failure here looks like "MoA mysteriously off".
+            logger.warning(
+                "MoA turn decode failed; sending message as-is: %s",
+                _moa_decode_err,
+            )
 
     # ── Per-turn setup (the prologue) ──
     # All once-per-turn setup — stdio guarding, retry-counter resets, user
@@ -832,19 +821,30 @@ def run_conversation(
                     existing = _sm.get("content", "")
                     if isinstance(existing, str):
                         _sm["content"] = existing + marker
+                        _injected = True
                     else:
                         # Multimodal content blocks — append text block
                         try:
                             blocks = list(existing) if existing else []
                             blocks.append({"type": "text", "text": marker})
                             _sm["content"] = blocks
-                        except Exception:
-                            pass
-                    _injected = True
-                    logger.debug(
-                        "Pre-API-call steer drain: injected into tool msg at index %d",
-                        _si,
-                    )
+                            _injected = True
+                        except Exception as _steer_err:
+                            # Leave _injected False: the requeue branch
+                            # below then preserves the steer for the
+                            # post-tool drain.  Marking it injected here
+                            # would silently drop the user's steer.
+                            logger.warning(
+                                "Pre-API-call steer drain: could not append to "
+                                "multimodal tool msg at index %d; requeueing steer: %s",
+                                _si,
+                                _steer_err,
+                            )
+                    if _injected:
+                        logger.debug(
+                            "Pre-API-call steer drain: injected into tool msg at index %d",
+                            _si,
+                        )
                     break
             if not _injected:
                 # No tool message to inject into — put it back so
@@ -1335,7 +1335,7 @@ def run_conversation(
                     api_kwargs["extra_headers"] = _xh
                     agent._is_user_initiated_turn = False
                 try:
-                    from hermes_cli.middleware import apply_llm_request_middleware
+                    from hermes_services.middleware import apply_llm_request_middleware
 
                     _llm_request_mw = apply_llm_request_middleware(
                         api_kwargs,
@@ -1411,8 +1411,15 @@ def run_conversation(
                             middleware_trace=list(_llm_middleware_trace),
                             request=_request_payload,
                         )
-                except Exception:
-                    pass
+                except Exception as _pre_hook_err:
+                    # Plugin hooks are observability-only: a broken plugin
+                    # must never break the API call.  But swallowing the
+                    # error silently hid real hook bugs — log and continue.
+                    logger.warning(
+                        "pre_api_request plugin hook failed (api call #%s): %s",
+                        api_call_count,
+                        _pre_hook_err,
+                    )
 
                 if env_var_enabled("HERMES_DUMP_REQUESTS"):
                     agent._dump_api_request_debug(api_kwargs, reason="preflight")
@@ -1484,7 +1491,7 @@ def run_conversation(
                         )
                     return agent._interruptible_api_call(next_api_kwargs)
 
-                from hermes_cli.middleware import run_llm_execution_middleware
+                from hermes_services.middleware import run_llm_execution_middleware
 
                 response = run_llm_execution_middleware(
                     api_kwargs,
@@ -2820,23 +2827,6 @@ def run_conversation(
                     reason=classified.reason.value,
                 )
 
-                if (
-                    classified.reason == FailoverReason.billing
-                    and _is_nous_inference_route(
-                        getattr(agent, "provider", "") or "",
-                        getattr(agent, "base_url", "") or "",
-                    )
-                    and not _retry.nous_paid_entitlement_refresh_attempted
-                ):
-                    _retry.nous_paid_entitlement_refresh_attempted = True
-                    if _try_refresh_nous_paid_entitlement_credentials(agent):
-                        agent._vprint(
-                            f"{agent.log_prefix}🔐 Nous paid access verified — "
-                            "refreshed runtime credentials and retrying request...",
-                            force=True,
-                        )
-                        continue
-
                 recovered_with_pool, _retry.has_retried_429 = agent._recover_with_credential_pool(
                     status_code=status_code,
                     has_retried_429=_retry.has_retried_429,
@@ -2950,38 +2940,6 @@ def run_conversation(
                     if agent._try_refresh_vertex_client_credentials():
                         agent._buffer_vprint("🔐 Vertex AI token refreshed after 401. Retrying request...")
                         continue
-                if (
-                    agent.api_mode == "chat_completions"
-                    and agent.provider == "nous"
-                    and status_code == 401
-                    and not _retry.nous_auth_retry_attempted
-                ):
-                    _retry.nous_auth_retry_attempted = True
-                    if agent._try_refresh_nous_client_credentials(force=True):
-                        print(f"{agent.log_prefix}🔐 Nous agent key refreshed after 401. Retrying request...")
-                        continue
-                    # Credential refresh didn't help — show diagnostic info.
-                    # Most common causes: Portal OAuth expired/revoked,
-                    # account out of credits, or agent key blocked.
-                    from hermes_constants import display_hermes_home as _dhh_fn
-                    _dhh = _dhh_fn()
-                    _body_text = ""
-                    try:
-                        _body = getattr(api_error, "body", None) or getattr(api_error, "response", None)
-                        if _body is not None:
-                            _body_text = str(_body)[:200]
-                    except Exception:
-                        pass
-                    print(f"{agent.log_prefix}🔐 Nous 401 — Portal authentication failed.")
-                    if _body_text:
-                        print(f"{agent.log_prefix}   Response: {_body_text}")
-                    if not _print_nous_entitlement_guidance(agent, "Nous model access"):
-                        print(f"{agent.log_prefix}   Most likely: Portal OAuth expired, account out of credits, or agent key revoked.")
-                    print(f"{agent.log_prefix}   Troubleshooting:")
-                    print(f"{agent.log_prefix}     • Re-authenticate: hermes auth add nous")
-                    print(f"{agent.log_prefix}     • Check credits / billing: https://portal.nousresearch.com")
-                    print(f"{agent.log_prefix}     • Verify stored credentials: {_dhh}/auth.json")
-                    print(f"{agent.log_prefix}     • Switch providers temporarily: /model <model> --provider openrouter")
                 if (
                     agent.provider == "copilot"
                     and status_code == 401
@@ -4045,7 +4003,7 @@ def run_conversation(
                             "Nous model access",
                         ):
                             pass
-                        elif _provider in {"openai-codex", "xai-oauth", "nous"} and status_code == 401:
+                        elif _provider in {"openai-codex", "xai-oauth"} and status_code == 401:
                             if _provider == "openai-codex":
                                 agent._vprint(f"{agent.log_prefix}   💡 Codex OAuth token was rejected (HTTP 401). Your token may have been", force=True)
                                 agent._vprint(f"{agent.log_prefix}      refreshed by another client (Codex CLI, VS Code). To fix:", force=True)
@@ -4054,17 +4012,6 @@ def run_conversation(
                             elif _provider == "xai-oauth":
                                 agent._vprint(f"{agent.log_prefix}   💡 xAI OAuth token was rejected (HTTP 401). To fix:", force=True)
                                 agent._vprint(f"{agent.log_prefix}      re-authenticate with xAI Grok OAuth (SuperGrok / Premium+) from `hermes model`.", force=True)
-                            else:  # nous
-                                agent._vprint(f"{agent.log_prefix}   💡 Nous Portal OAuth token was rejected (HTTP 401). Your token may be", force=True)
-                                agent._vprint(f"{agent.log_prefix}      expired, revoked, or your account may be out of credits. To fix:", force=True)
-                                agent._vprint(f"{agent.log_prefix}      1. Re-authenticate: hermes portal", force=True)
-                                agent._vprint(f"{agent.log_prefix}      2. Check your portal account: https://portal.nousresearch.com", force=True)
-                                # ``:free`` is OpenRouter slug syntax; Nous Portal will reject
-                                # the model name even after a successful re-auth.
-                                if isinstance(_model, str) and _model.endswith(":free"):
-                                    agent._vprint(f"{agent.log_prefix}      ⚠️  Note: `{_model}` looks like an OpenRouter slug (`:free` suffix).", force=True)
-                                    agent._vprint(f"{agent.log_prefix}         Nous Portal won't recognize that model name. Either switch to a", force=True)
-                                    agent._vprint(f"{agent.log_prefix}         Nous catalog model, or run `/model openrouter:{_model}` to use OpenRouter.", force=True)
                         else:
                             agent._vprint(f"{agent.log_prefix}   💡 Your API key was rejected by the provider. Check:", force=True)
                             agent._vprint(f"{agent.log_prefix}      • Is the key valid? Run: hermes setup", force=True)
@@ -4593,8 +4540,14 @@ def run_conversation(
                         assistant_content_chars=len(_assistant_text),
                         assistant_tool_call_count=len(_assistant_tool_calls),
                     )
-            except Exception:
-                pass
+            except Exception as _post_hook_err:
+                # Same contract as pre_api_request above: hook failures are
+                # non-fatal, but must be visible in the logs.
+                logger.warning(
+                    "post_api_request plugin hook failed (api call #%s): %s",
+                    api_call_count,
+                    _post_hook_err,
+                )
 
             # Handle assistant response
             if assistant_message.content and not agent.quiet_mode:

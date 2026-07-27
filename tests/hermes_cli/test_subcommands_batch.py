@@ -105,15 +105,16 @@ def test_config_get_unset_subcommands_parse():
     assert ns.key == "terminal.backend"
 
 
-def test_dashboard_builder_two_handlers():
+def test_dashboard_builder_exposes_no_account_registration_subcommand():
     parser = argparse.ArgumentParser(prog="hermes")
     sub = parser.add_subparsers(dest="command")
     dash, reg = _h("dashboard"), _h("dashboard_register")
     build_dashboard_parser(sub, cmd_dashboard=dash, cmd_dashboard_register=reg)
     # bare dashboard -> launch handler
     assert parser.parse_args(["dashboard"]).func is dash
-    # dashboard register -> register handler
-    assert parser.parse_args(["dashboard", "register"]).func is reg
+    # The old Nous account registration command is no longer a product entry.
+    with pytest.raises(SystemExit):
+        parser.parse_args(["dashboard", "register"])
 
 
 # ── deprecated `hermes login` fails gracefully, not with argparse error ────

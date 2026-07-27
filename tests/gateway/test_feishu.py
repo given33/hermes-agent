@@ -10,9 +10,40 @@ from collections import OrderedDict
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Dict
-from unittest.mock import AsyncMock, Mock, patch
+from unittest.mock import AsyncMock, Mock, patch as _unittest_patch
 
 from gateway.platforms.base import ProcessingOutcome
+
+
+_FEISHU_TEST_HOME = tempfile.TemporaryDirectory(prefix="hermes-feishu-tests-")
+
+
+class _EnvironmentSafePatch:
+    """Keep a private Hermes home when tests intentionally clear the env.
+
+    Many Feishu tests use ``patch.dict(os.environ, ..., clear=True)`` to prove
+    configuration isolation. On Windows that also removes every variable used
+    by ``Path.home()``, so adapter construction fails before the behavior under
+    test runs. Injecting only ``HERMES_HOME`` preserves the isolation contract
+    while keeping all filesystem writes inside a process-private temp tree.
+    """
+
+    def __call__(self, *args, **kwargs):
+        return _unittest_patch(*args, **kwargs)
+
+    def object(self, *args, **kwargs):
+        return _unittest_patch.object(*args, **kwargs)
+
+    def dict(self, target, values=(), clear=False, **kwargs):
+        if target is os.environ:
+            merged = dict(values)
+            merged.update(kwargs)
+            merged.setdefault("HERMES_HOME", _FEISHU_TEST_HOME.name)
+            return _unittest_patch.dict(target, merged, clear=clear)
+        return _unittest_patch.dict(target, values, clear=clear, **kwargs)
+
+
+patch = _EnvironmentSafePatch()
 
 try:
     import lark_oapi
@@ -3392,25 +3423,164 @@ class TestPendingInboundQueue(unittest.TestCase):
 class TestWebhookSecurity(unittest.TestCase):
     """Tests for webhook signature verification, rate limiting, and body size limits."""
 
+    def setUp(self):
+        from hermes_constants import reset_hermes_home_override, set_hermes_home_override
+
+        self._test_hermes_home = tempfile.TemporaryDirectory()
+        self.addCleanup(self._test_hermes_home.cleanup)
+        token = set_hermes_home_override(self._test_hermes_home.name)
+        self.addCleanup(reset_hermes_home_override, token)
+
     def _make_adapter(self, encrypt_key: str = "") -> "FeishuAdapter":
+        return self._make_webhook_adapter(encrypt_key)
+
+    def _make_webhook_adapter(self, encrypt_key: str) -> "FeishuAdapter":
+        """Like _make_adapter, but Windows-survivable and filesystem-isolated.
+
+        ``patch.dict(clear=True)`` drops USERPROFILE/LOCALAPPDATA, so on
+        Windows ``Path.home()`` raises inside ``FeishuAdapter.__init__``.
+        Overlay only the FEISHU_* keys instead (still deterministic against
+        ambient env) and point the dedup-state path at a temp HERMES home.
+        """
         from gateway.config import PlatformConfig
+        from hermes_constants import reset_hermes_home_override, set_hermes_home_override
         from plugins.platforms.feishu.adapter import FeishuAdapter
 
-        with patch.dict(os.environ, {"FEISHU_APP_ID": "cli", "FEISHU_APP_SECRET": "sec", "FEISHU_ENCRYPT_KEY": encrypt_key}, clear=True):
-            return FeishuAdapter(PlatformConfig())
+        tmpdir = tempfile.TemporaryDirectory()
+        self.addCleanup(tmpdir.cleanup)
+        env = {
+            "FEISHU_APP_ID": "cli",
+            "FEISHU_APP_SECRET": "sec",
+            "FEISHU_ENCRYPT_KEY": encrypt_key,
+            "FEISHU_VERIFICATION_TOKEN": "",
+        }
+        token = set_hermes_home_override(tmpdir.name)
+        try:
+            with patch.dict(os.environ, env):
+                return FeishuAdapter(PlatformConfig())
+        finally:
+            reset_hermes_home_override(token)
+
+    @staticmethod
+    def _signed_headers(encrypt_key: str, body: bytes, timestamp: str, nonce: str = "abc123") -> dict:
+        import hashlib
+
+        content = f"{timestamp}{nonce}{encrypt_key}" + body.decode("utf-8")
+        sig = hashlib.sha256(content.encode("utf-8")).hexdigest()
+        return {
+            "x-lark-request-timestamp": timestamp,
+            "x-lark-request-nonce": nonce,
+            "x-lark-signature": sig,
+        }
 
     def test_signature_valid_passes(self):
-        import hashlib
+        encrypt_key = "test_secret"
+        adapter = self._make_adapter(encrypt_key)
+        body = b'{"type":"event"}'
+        # Timestamp freshness is enforced, so sign with "now".
+        headers = self._signed_headers(encrypt_key, body, str(int(time.time())))
+        self.assertTrue(adapter._is_webhook_signature_valid(headers, body))
+
+    def test_signature_stale_timestamp_rejected(self):
+        """A correctly signed request dated outside the freshness window is a
+        replayable capture and must not authenticate."""
+        from plugins.platforms.feishu.adapter import _FEISHU_WEBHOOK_SIGNATURE_MAX_SKEW_SECONDS
 
         encrypt_key = "test_secret"
         adapter = self._make_adapter(encrypt_key)
         body = b'{"type":"event"}'
-        timestamp = "1700000000"
-        nonce = "abc123"
-        content = f"{timestamp}{nonce}{encrypt_key}" + body.decode("utf-8")
-        sig = hashlib.sha256(content.encode("utf-8")).hexdigest()
-        headers = {"x-lark-request-timestamp": timestamp, "x-lark-request-nonce": nonce, "x-lark-signature": sig}
+        stale = str(int(time.time() - _FEISHU_WEBHOOK_SIGNATURE_MAX_SKEW_SECONDS - 60))
+        headers = self._signed_headers(encrypt_key, body, stale)
+        self.assertFalse(adapter._is_webhook_signature_valid(headers, body))
+
+    def test_signature_replayed_nonce_rejected(self):
+        """A byte-for-byte replay of a request the handler ANSWERED 2xx (i.e.
+        whose nonce was committed) must fail even while the timestamp is
+        still inside the freshness window."""
+        encrypt_key = "test_secret"
+        adapter = self._make_webhook_adapter(encrypt_key)
+        body = b'{"type":"event"}'
+        headers = self._signed_headers(encrypt_key, body, str(int(time.time())))
         self.assertTrue(adapter._is_webhook_signature_valid(headers, body))
+        # The handler commits the pair only when it answers 2xx.
+        adapter._commit_webhook_nonce(headers)
+        self.assertFalse(adapter._is_webhook_signature_valid(headers, body))
+
+    def test_signature_check_alone_does_not_consume_nonce(self):
+        """Feishu retries an event on any non-2xx with the SAME headers, so
+        signature validation must not burn the (timestamp, nonce) pair —
+        only the post-processing commit may. Burning it at check time turned
+        every retry of a transiently failed event into a rejected "replay"
+        and lost the event permanently."""
+        encrypt_key = "test_secret"
+        adapter = self._make_webhook_adapter(encrypt_key)
+        body = b'{"type":"event"}'
+        headers = self._signed_headers(encrypt_key, body, str(int(time.time())))
+        self.assertTrue(adapter._is_webhook_signature_valid(headers, body))
+        # No commit happened (processing failed) — the retry must
+        # authenticate again instead of being rejected as a replay.
+        self.assertTrue(adapter._is_webhook_signature_valid(headers, body))
+
+    def test_webhook_retry_after_failed_processing_not_lost_and_replay_proof(self):
+        """End-to-end nonce lifecycle across the webhook handler.
+
+        1. Event processing blows up after auth -> non-2xx -> Feishu will
+           retry: the (timestamp, nonce) pair must NOT be consumed, so the
+           byte-identical retry authenticates and the event is not lost.
+        2. The retry processes fine -> 200 -> pair committed.
+        3. A further byte-identical delivery after the 2xx IS a replay -> 401
+           and the event handler is not invoked again.
+        """
+        encrypt_key = "test_secret"
+        adapter = self._make_webhook_adapter(encrypt_key)
+        body = json.dumps(
+            {"header": {"event_type": "im.message.receive_v1"}, "event": {}}
+        ).encode()
+        headers = self._signed_headers(encrypt_key, body, str(int(time.time())))
+
+        def make_request():
+            return SimpleNamespace(
+                remote="127.0.0.1",
+                content_length=None,
+                headers=dict(headers),
+                content=_FakeRequestContent(body),
+            )
+
+        # 1) First delivery: processing fails after the signature passed.
+        with patch.object(adapter, "_on_message_event", side_effect=RuntimeError("boom")):
+            with self.assertRaises(RuntimeError):
+                asyncio.run(adapter._handle_webhook_request(make_request()))
+
+        # 2) Feishu's retry (same timestamp/nonce/signature) must be accepted.
+        with patch.object(adapter, "_on_message_event") as on_event:
+            response = asyncio.run(adapter._handle_webhook_request(make_request()))
+        self.assertEqual(response.status, 200)
+        self.assertEqual(on_event.call_count, 1)
+
+        # 3) ...and exactly once: after the 2xx the pair is consumed for good.
+        with patch.object(adapter, "_on_message_event") as on_event:
+            response = asyncio.run(adapter._handle_webhook_request(make_request()))
+        self.assertEqual(response.status, 401)
+        self.assertEqual(on_event.call_count, 0)
+
+    def test_signature_fresh_nonce_after_accepted_request_passes(self):
+        """Dedup keys on (timestamp, nonce) — new nonces keep flowing."""
+        encrypt_key = "test_secret"
+        adapter = self._make_adapter(encrypt_key)
+        body = b'{"type":"event"}'
+        now = str(int(time.time()))
+        self.assertTrue(adapter._is_webhook_signature_valid(
+            self._signed_headers(encrypt_key, body, now, nonce="nonce-one"), body))
+        self.assertTrue(adapter._is_webhook_signature_valid(
+            self._signed_headers(encrypt_key, body, now, nonce="nonce-two"), body))
+
+    def test_signature_malformed_timestamp_rejected(self):
+        """An unparseable timestamp cannot be freshness-bounded — fail closed."""
+        encrypt_key = "test_secret"
+        adapter = self._make_adapter(encrypt_key)
+        body = b'{"type":"event"}'
+        headers = self._signed_headers(encrypt_key, body, "not-a-number")
+        self.assertFalse(adapter._is_webhook_signature_valid(headers, body))
 
     def test_signature_invalid_rejected(self):
         adapter = self._make_adapter("test_secret")

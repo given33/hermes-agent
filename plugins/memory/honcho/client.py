@@ -879,7 +879,7 @@ _honcho_json_timeout_memo: tuple[int | None, float | None] = (None, None)
 def _config_yaml_timeout() -> float | None:
     """Read honcho.timeout / honcho.request_timeout via the cached config loader."""
     try:
-        from hermes_cli.config import load_config_readonly
+        from hermes_runtime.config import load_config_readonly
 
         honcho_cfg = load_config_readonly().get("honcho", {})
         if isinstance(honcho_cfg, dict):
@@ -1044,7 +1044,7 @@ def get_honcho_client(config: HonchoClientConfig | None = None) -> Honcho:
         resolved_timeout = config.timeout
         if not resolved_base_url or resolved_timeout is None:
             try:
-                from hermes_cli.config import load_config
+                from hermes_runtime.config import load_config
                 hermes_cfg = load_config()
                 honcho_cfg = hermes_cfg.get("honcho", {})
                 if isinstance(honcho_cfg, dict):

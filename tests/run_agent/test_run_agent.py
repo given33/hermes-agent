@@ -1440,10 +1440,10 @@ class TestBuildSystemPrompt:
         else:
             assert False, "Expected a 'Conversation started:' line in the system prompt"
 
-    def test_includes_nous_subscription_prompt(self, agent, monkeypatch):
+    def test_excludes_nous_subscription_prompt(self, agent, monkeypatch):
         monkeypatch.setattr(run_agent, "build_nous_subscription_prompt", lambda tool_names: "NOUS SUBSCRIPTION BLOCK")
         prompt = agent._build_system_prompt()
-        assert "NOUS SUBSCRIPTION BLOCK" in prompt
+        assert "NOUS SUBSCRIPTION BLOCK" not in prompt
 
     def test_skills_prompt_derives_available_toolsets_from_loaded_tools(self):
         tools = _make_tool_defs("web_search", "skills_list", "skill_view", "skill_manage")
@@ -4895,12 +4895,12 @@ class TestRunConversation:
         assert result["final_response"].startswith(INTERRUPT_WAITING_FOR_MODEL_PREFIX)
         assert result["messages"][-1]["role"] == "user"
 
-    def test_nous_401_refreshes_after_remint_and_retries(self, agent):
+    def test_nous_401_does_not_remint_removed_account_credentials(self, agent):
         self._setup_agent(agent)
         agent.provider = "nous"
         agent.api_mode = "chat_completions"
 
-        calls = {"api": 0, "refresh": 0}
+        calls = {"api": 0}
 
         class _UnauthorizedError(RuntimeError):
             def __init__(self):
@@ -4909,32 +4909,22 @@ class TestRunConversation:
 
         def _fake_api_call(api_kwargs):
             calls["api"] += 1
-            if calls["api"] == 1:
-                raise _UnauthorizedError()
-            return _mock_response(
-                content="Recovered after remint", finish_reason="stop"
-            )
-
-        def _fake_refresh(*, force=True):
-            calls["refresh"] += 1
-            assert force is True
-            return True
+            raise _UnauthorizedError()
 
         with (
             patch.object(agent, "_persist_session"),
             patch.object(agent, "_save_trajectory"),
             patch.object(agent, "_cleanup_task_resources"),
             patch.object(agent, "_interruptible_api_call", side_effect=_fake_api_call),
-            patch.object(
-                agent, "_try_refresh_nous_client_credentials", side_effect=_fake_refresh
-            ),
+            patch.object(agent, "_try_refresh_nous_client_credentials") as refresh,
         ):
             result = agent.run_conversation("hello")
 
-        assert calls["api"] == 2
-        assert calls["refresh"] == 1
-        assert result["completed"] is True
-        assert result["final_response"] == "Recovered after remint"
+        assert calls["api"] == 1
+        refresh.assert_not_called()
+        assert result["completed"] is False
+        assert result["failed"] is True
+        assert "401" in result["error"]
 
     def test_context_compression_triggered(self, agent):
         """When compressor says should_compress, compression runs."""

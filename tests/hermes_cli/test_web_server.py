@@ -52,6 +52,42 @@ _EXAMPLE_PLUGIN_FIXTURE = (
 )
 
 
+def test_dashboard_runtime_state_owns_mutable_process_state():
+    from hermes_cli import web_server
+
+    first = web_server.DashboardRuntimeState("first-token")
+    second = web_server.DashboardRuntimeState("second-token")
+
+    first.action_results["deploy"] = {"ok": True}
+    first.oauth_sessions["oauth-1"] = {"status": "pending"}
+    first.voice_list_last_error = "voice-error"
+    first.dashboard_plugins_cache = [{"name": "plugin-a"}]
+
+    assert first.session_token == "first-token"
+    assert second.session_token == "second-token"
+    assert second.action_results == {}
+    assert second.oauth_sessions == {}
+    assert second.voice_list_last_error is None
+    assert second.dashboard_plugins_cache is None
+    assert first.oauth_sessions_lock is not second.oauth_sessions_lock
+    assert first.console_executor_lock is not second.console_executor_lock
+
+
+def test_voice_error_log_latch_uses_dashboard_runtime_state():
+    from hermes_cli import web_server
+
+    state = web_server.get_runtime_state()
+    state.voice_list_last_error = None
+    try:
+        assert web_server._voice_list_error_logged_once("provider-down") is True
+        assert state.voice_list_last_error == "provider-down"
+        assert web_server._voice_list_error_logged_once("provider-down") is False
+        assert web_server._voice_list_error_logged_once(None) is False
+        assert state.voice_list_last_error is None
+    finally:
+        state.voice_list_last_error = None
+
+
 @pytest.fixture
 def _install_example_plugin(_isolate_hermes_home):
     """Drop the example-dashboard fixture into the per-test HERMES_HOME
@@ -117,7 +153,7 @@ def _install_example_plugin(_isolate_hermes_home):
     # list dynamically per request, so the rescan alone is enough for
     # the static-asset tests; the API auth tests additionally need the
     # route reorder below.
-    web_server._dashboard_plugins_cache = None
+    web_server.get_runtime_state().dashboard_plugins_cache = None
     web_server._get_dashboard_plugins(force_rescan=True)
     web_server._mount_plugin_api_routes()
 
@@ -143,7 +179,7 @@ def _install_example_plugin(_isolate_hermes_home):
         # routes so the next test sees a clean app — and clear the
         # cache for the same reason.
         app.router.routes[:] = original_routes
-        web_server._dashboard_plugins_cache = None
+        web_server.get_runtime_state().dashboard_plugins_cache = None
 
 
 # ---------------------------------------------------------------------------
@@ -274,6 +310,8 @@ class TestWebServerEndpoints:
 
         self.client = TestClient(app)
         self.client.headers[_SESSION_HEADER_NAME] = _SESSION_TOKEN
+        yield
+        self.client.close()
 
     def test_get_status(self):
         resp = self.client.get("/api/status")
@@ -283,6 +321,16 @@ class TestWebServerEndpoints:
         assert "hermes_home" in data
         assert "active_sessions" in data
         assert data["can_update_hermes"] is True
+
+    def test_dashboard_responses_apply_shared_security_policy(self):
+        resp = self.client.get("/api/status")
+        assert resp.status_code == 200
+        assert resp.headers["X-Content-Type-Options"] == "nosniff"
+        assert resp.headers["X-Frame-Options"] == "DENY"
+        assert resp.headers["Referrer-Policy"] == "no-referrer"
+        # The dashboard serves its own JS/CSS and may use microphone input;
+        # the sterile machine-API CSP must not be copied onto this surface.
+        assert "Content-Security-Policy" not in resp.headers
 
     def test_status_active_session_count_uses_read_only_db(self, monkeypatch, tmp_path):
         import hermes_cli.web_server as web_server
@@ -6156,8 +6204,8 @@ class TestNewEndpoints:
         assert all(p["status"] in valid for p in data["providers"])
         # Genuinely-free keyless row stays Ready.
         assert by_name["Microsoft Edge TTS"]["status"] == "ready"
-        # Keyless ≠ ready for gated rows:
-        assert by_name["Nous Subscription"]["status"] == "needs_auth"
+        # Removed account-managed rows are not exposed as selectable tools.
+        assert "Nous Subscription" not in by_name
         assert by_name["xAI TTS"]["status"] == "needs_auth"
         assert by_name["KittenTTS"]["status"] == "needs_setup"
         assert by_name["Piper"]["status"] == "needs_setup"
@@ -6253,57 +6301,12 @@ class TestNewEndpoints:
         )
         assert resp.status_code == 400
 
-    def test_select_managed_nous_provider_reports_needs_nous_auth(self, monkeypatch):
-        """Selecting a managed Nous row while logged out flags needs_nous_auth.
-
-        Regression: the GUI PUT wrote browser.cloud_provider + use_gateway
-        but skipped the Portal entitlement handshake the CLI runs inline
-        (ensure_nous_portal_access) — so the row never activated and nothing
-        told the user to sign in. The endpoint now reports the entitlement
-        gap so the client can drive the existing Nous OAuth flow.
-        """
-        from hermes_cli.nous_account import NousPortalAccountInfo
-
-        monkeypatch.setattr(
-            "hermes_cli.nous_subscription.get_nous_portal_account_info",
-            lambda *a, **k: NousPortalAccountInfo(
-                logged_in=False, source="none", fresh=False, paid_service_access=None
-            ),
-        )
-
+    def test_select_managed_nous_provider_is_rejected(self):
         resp = self.client.put(
             "/api/tools/toolsets/browser/provider",
             json={"provider": "Nous Subscription (Browser Use cloud)"},
         )
-        assert resp.status_code == 200
-        data = resp.json()
-        assert data["ok"] is True
-        assert data["needs_nous_auth"] is True
-        assert data["feature"] == "browser"
-        # The selection is still persisted — activation is what's gated.
-        from hermes_cli.config import load_config
-        cfg = load_config()
-        assert cfg["browser"]["cloud_provider"] == "browser-use"
-
-    def test_select_managed_nous_provider_entitled_no_auth_flag(self, monkeypatch):
-        """A signed-in, entitled subscriber gets no needs_nous_auth field."""
-        from hermes_cli.nous_account import NousPortalAccountInfo
-
-        monkeypatch.setattr(
-            "hermes_cli.nous_subscription.get_nous_portal_account_info",
-            lambda *a, **k: NousPortalAccountInfo(
-                logged_in=True, source="jwt", fresh=True, paid_service_access=True
-            ),
-        )
-
-        resp = self.client.put(
-            "/api/tools/toolsets/browser/provider",
-            json={"provider": "Nous Subscription (Browser Use cloud)"},
-        )
-        assert resp.status_code == 200
-        data = resp.json()
-        assert data["ok"] is True
-        assert "needs_nous_auth" not in data
+        assert resp.status_code == 400
 
     def test_select_unmanaged_provider_has_no_nous_auth_field(self):
         """Non-managed rows never carry the entitlement fields."""
@@ -8532,7 +8535,7 @@ class TestDashboardPluginManifestExtensions:
         })
         from hermes_cli import web_server
         # Bust the process-level cache so the test plugin is picked up.
-        web_server._dashboard_plugins_cache = None
+        web_server.get_runtime_state().dashboard_plugins_cache = None
         plugins = web_server._get_dashboard_plugins(force_rescan=True)
         entry = next(p for p in plugins if p["name"] == "skin-home")
         assert entry["tab"]["override"] == "/"
@@ -8576,7 +8579,7 @@ class TestDashboardPluginManifestExtensions:
             "entry": "dist/index.js",
         })
         from hermes_cli import web_server
-        web_server._dashboard_plugins_cache = None
+        web_server.get_runtime_state().dashboard_plugins_cache = None
         plugins = web_server._get_dashboard_plugins(force_rescan=True)
         entry = next(p for p in plugins if p["name"] == "bad-override")
         assert "override" not in entry["tab"]
@@ -8590,7 +8593,7 @@ class TestDashboardPluginManifestExtensions:
             "entry": "dist/index.js",
         })
         from hermes_cli import web_server
-        web_server._dashboard_plugins_cache = None
+        web_server.get_runtime_state().dashboard_plugins_cache = None
         plugins = web_server._get_dashboard_plugins(force_rescan=True)
         entry = next(p for p in plugins if p["name"] == "no-slots")
         assert entry["slots"] == []
@@ -8607,7 +8610,7 @@ class TestDashboardPluginManifestExtensions:
             "entry": "dist/index.js",
         })
         from hermes_cli import web_server
-        web_server._dashboard_plugins_cache = None
+        web_server.get_runtime_state().dashboard_plugins_cache = None
         plugins = web_server._get_dashboard_plugins(force_rescan=True)
         entry = next(p for p in plugins if p["name"] == "mixed-slots")
         assert entry["slots"] == ["sidebar", "header-right"]
@@ -8636,7 +8639,7 @@ class TestDashboardPluginManifestExtensions:
             "entry": "dist/index.js",
         })
         from hermes_cli import web_server
-        web_server._dashboard_plugins_cache = None
+        web_server.get_runtime_state().dashboard_plugins_cache = None
         plugins = web_server._get_dashboard_plugins(force_rescan=True)
         entry = next(p for p in plugins if p["name"] == "page-slots")
         assert entry["slots"] == [

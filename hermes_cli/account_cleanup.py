@@ -6,7 +6,7 @@ from pathlib import Path
 from typing import Any
 
 from hermes_constants import get_hermes_home
-from hermes_cli.config import atomic_config_write
+from hermes_runtime.config import atomic_config_write
 from hermes_cli.profiles import list_profiles
 from utils import fast_safe_load
 

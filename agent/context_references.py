@@ -12,7 +12,7 @@ from pathlib import Path
 from typing import Awaitable, Callable
 
 from agent.model_metadata import estimate_tokens_rough
-from hermes_cli._subprocess_compat import IS_WINDOWS, windows_hide_flags
+from hermes_runtime.subprocess_compat import IS_WINDOWS, windows_hide_flags
 
 _QUOTED_REFERENCE_VALUE = r'(?:`[^`\n]+`|"[^"\n]+"|\'[^\'\n]+\')'
 REFERENCE_PATTERN = re.compile(

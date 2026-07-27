@@ -11,7 +11,9 @@ another account's pending writes.
 from __future__ import annotations
 
 import hashlib
+import hmac
 import json
+import os
 import sqlite3
 import threading
 import time
@@ -105,8 +107,69 @@ _EFFECT_MIGRATION_COLUMNS = {
 }
 
 
+# ``claim_decision`` refuses any APPROVAL that does not carry a digest of
+# the payload the approver was shown.
+#
+# On by default, because a security control that ships dark is not a
+# control: the whole purpose of the write-approval gate is to stop a
+# manipulated agent writing hostile content into memory/skills, and
+# without the digest the server cannot tell an honest approval from one
+# harvested by pairing a harmless ``summary`` with a hostile ``payload``.
+# There is exactly one production decision route
+# (``plugins/collaboration/dashboard/plugin_api.py`` →
+# ``POST /mobile/write-approvals/{id}/decision``) and its client sends the
+# digest, so defaulting on does not strand a shipped caller.
+#
+# Set to "0" only to interoperate with a pre-digest client; that restores
+# the confused-deputy exposure and the refusal message says so. Rejections
+# never require a digest — discarding a payload is the safe action and must
+# not be blocked.
+_REQUIRE_DIGEST_ENV = "HERMES_WRITE_APPROVAL_REQUIRE_DIGEST"
+_REQUIRE_DIGEST_DEFAULT = "1"
+
+_SUMMARY_PREVIEW_CHARS = 240
+
+
+def _derive_payload_summary(subsystem: str, payload: dict[str, Any]) -> str:
+    """Describe ``payload`` from the payload itself, not from agent prose.
+
+    The write-approval gate exists to stop a manipulated agent writing
+    hostile content into memory/skills. But the agent supplies BOTH the
+    ``payload`` and the free-text ``summary`` at stage() time, and they
+    are stored in separate columns with nothing tying them together — so
+    an approval list that renders only ``summary`` shows the human
+    something the attacker wrote, about content the attacker also wrote.
+    That is a textbook confused deputy: the approver authorises "remember
+    to buy milk" and what executes is a malicious skill file.
+
+    This function derives a description from the bytes that will actually
+    be applied, so a UI has something trustworthy to display next to (or
+    instead of) the agent's summary.
+    """
+    action = str(payload.get("action") or "").strip() or "write"
+    name = str(payload.get("name") or payload.get("path") or "").strip()
+    content = payload.get("content")
+    parts = [f"{subsystem or 'write'}:{action}"]
+    if name:
+        parts.append(name)
+    if isinstance(content, str):
+        preview = " ".join(content.split())
+        if len(preview) > _SUMMARY_PREVIEW_CHARS:
+            preview = preview[:_SUMMARY_PREVIEW_CHARS] + "…"
+        parts.append(f"{len(content)} chars: {preview}")
+    return " | ".join(parts)
+
+
 class ApprovalConflict(RuntimeError):
     """The requested revision/state no longer owns the approval row."""
+
+
+class ApprovalPayloadMismatch(ApprovalConflict):
+    """The approver's payload digest does not match the stored payload.
+
+    Subclasses :class:`ApprovalConflict` so existing callers that already
+    handle a conflict keep failing closed on this new check.
+    """
 
 
 class ApprovalAccountDeleted(ApprovalConflict):
@@ -152,13 +215,62 @@ class AccountWriteApprovalStore:
             )
         return owner, profile_name
 
+    @staticmethod
+    def _restrict_permissions(path: Path, mode: int) -> None:
+        """Best-effort tighten ``path`` to ``mode``.
+
+        Mirrors ``dashboard_auth.mobile_device_store._restrict_permissions``.
+        Swallows ``OSError`` because a filesystem without POSIX modes
+        (Windows, some network mounts) must not break approvals.
+        """
+        try:
+            path.chmod(mode)
+        except OSError:
+            pass
+
     def _connect(self) -> sqlite3.Connection:
+        # ``write-approvals.db`` is the durable record of authorisation
+        # decisions, and its ``payload_json`` column holds the full
+        # memory entries and skill file contents awaiting approval —
+        # i.e. arbitrary user-private text. The module docstring promises
+        # that "a mobile/dashboard caller can never enumerate another
+        # account's pending writes", but that guarantee was enforced only
+        # in SQL: the file itself landed at the default umask (0644 under
+        # the usual 022) inside a 0755 directory, so any other local user
+        # could just read it — and get the -wal/-shm sidecars too.
+        # ``mobile_device_store`` already hardens its equally sensitive
+        # DB to 0600/0700; this asymmetry was the defect.
         self.db_path.parent.mkdir(parents=True, exist_ok=True)
+        # Tighten the parent directory only when it is a dedicated home for
+        # this store (custom ``db_path`` in its own subdir). The default
+        # layout places the DB directly in the hermes home root, shared by
+        # every other subsystem (config.yaml, sessions/, workspace/...) —
+        # silently flipping the whole home to 0700 is beyond this store's
+        # remit and can break setups that deliberately grant group access
+        # to unrelated files there. ``mobile_device_store`` chmods 0700
+        # because its DB lives in a subdir it owns; we only mirror that
+        # when the same is true here. File-level 0600 below is the real
+        # protection either way: SQLite derives -wal/-shm modes from the
+        # main DB file's mode, so payload bytes stay owner-only.
+        try:
+            _shared_home = Path(get_hermes_home()).resolve()
+        except Exception:
+            _shared_home = None
+        if _shared_home is None or self.db_path.parent.resolve() != _shared_home:
+            self._restrict_permissions(self.db_path.parent, 0o700)
         conn = sqlite3.connect(self.db_path, timeout=10)
         conn.row_factory = sqlite3.Row
         conn.execute("PRAGMA busy_timeout=10000")
         conn.execute("PRAGMA journal_mode=WAL")
         conn.execute("PRAGMA synchronous=FULL")
+        # WAL mode creates -wal/-shm beside the DB; they contain the same
+        # payload bytes, so they need the same mode. They only exist once
+        # WAL is enabled, hence the ordering here.
+        self._restrict_permissions(self.db_path, 0o600)
+        for suffix in ("-wal", "-shm"):
+            sidecar = Path(str(self.db_path) + suffix)
+            if sidecar.exists():
+                self._restrict_permissions(sidecar, 0o600)
         return conn
 
     @staticmethod
@@ -212,6 +324,20 @@ class AccountWriteApprovalStore:
         except (TypeError, ValueError, json.JSONDecodeError):
             result["payload"] = {}
             result.pop("payload_json", None)
+        # Digest of the exact bytes that will be applied. Surfaced on
+        # every read so an approving client can echo back the digest of
+        # what it actually rendered — see ``claim_decision``.
+        result["payload_digest"] = AccountWriteApprovalStore._payload_hash(
+            result["payload"]
+        )
+        # ``summary`` is agent-supplied free text chosen at stage() time,
+        # independently of ``payload``. A manipulated agent can therefore
+        # pair an innocuous summary with a hostile payload. Expose a
+        # server-derived description of the payload alongside it so an
+        # approval UI can show something the agent does not control.
+        result["derived_summary"] = _derive_payload_summary(
+            str(result.get("subsystem") or ""), result["payload"]
+        )
         return result
 
     def stage(
@@ -338,6 +464,7 @@ class AccountWriteApprovalStore:
         decision: str,
         decision_by: str,
         idempotency_key: str | None = None,
+        payload_digest: str | None = None,
         lease_seconds: float = _APPLY_LEASE_SECONDS,
         now: float | None = None,
     ) -> dict[str, Any]:
@@ -347,12 +474,51 @@ class AccountWriteApprovalStore:
         stable across every recovery attempt.  A caller that loses its process
         after claiming can therefore reacquire the same operation after the
         lease expires without inventing a second side effect identity.
+
+        ``payload_digest`` binds the decision to the bytes the approver was
+        actually shown. Without it the chain proves only that *apply*
+        equals *stage* — the payload column is written once and never
+        updated, ``execute_effect`` cross-checks ``payload_hash``, and the
+        apply helpers re-verify before/after digests. What it could not
+        prove is that the human approved *that* payload: the decision was
+        bound to ``(approval_id, expected_revision)`` alone, while the
+        ``summary`` the approver read is agent-controlled free text stored
+        in a separate column. A manipulated agent could therefore stage an
+        innocuous summary over a hostile payload and harvest a genuine
+        approval — a confused deputy.
+
+        Callers should pass the ``payload_digest`` from the record they
+        rendered. It is compared in constant time against the stored
+        payload; a mismatch means the caller approved something other than
+        what is on file and raises :class:`ApprovalPayloadMismatch`.
+        REQUIRED for approvals by default — an approval without a digest is
+        exactly the unbound approval this parameter exists to prevent, and
+        the shipped mobile client echoes it. Set
+        ``HERMES_WRITE_APPROVAL_REQUIRE_DIGEST=0`` only to interoperate
+        with a pre-digest client build; rejections never require it
+        (discarding a payload is the safe action).
         """
 
         owner, profile_name = self._scope(owner_id, profile)
         normalized = str(decision).strip().lower()
         if normalized not in {"approve", "reject"}:
             raise ValueError("decision must be approve or reject")
+        supplied_digest = str(payload_digest or "").strip()
+        # Only an *approval* executes the payload; a rejection discards it,
+        # so requiring the digest there would block the safe action.
+        if (
+            not supplied_digest
+            and normalized == "approve"
+            and os.environ.get(_REQUIRE_DIGEST_ENV, _REQUIRE_DIGEST_DEFAULT) != "0"
+        ):
+            raise ApprovalPayloadMismatch(
+                "payload_digest is required to approve this write: the client "
+                "must echo the payload_digest of the approval record it "
+                "displayed, so the server can prove the approval covers the "
+                "bytes it will execute. Set "
+                f"{_REQUIRE_DIGEST_ENV}=0 to accept unbound approvals from a "
+                "pre-digest client (this reinstates the confused-deputy risk)."
+            )
         timestamp = float(time.time() if now is None else now)
         lease_duration = max(1.0, float(lease_seconds))
         supplied_key = idempotency_key is not None
@@ -375,6 +541,21 @@ class AccountWriteApprovalStore:
             if row is None:
                 conn.rollback()
                 raise ApprovalConflict("approval revision or state changed")
+
+            if supplied_digest:
+                # Constant-time: the digest is attacker-influenced input
+                # compared against a server-held value, so a byte-wise
+                # early exit would leak it — same discipline as every
+                # other secret comparison in this repo.
+                stored_record = self._record(row) or {}
+                if not hmac.compare_digest(
+                    supplied_digest,
+                    str(stored_record.get("payload_digest") or ""),
+                ):
+                    conn.rollback()
+                    raise ApprovalPayloadMismatch(
+                        "approval payload changed since it was displayed"
+                    )
 
             stored_key = str(row["idempotency_key"] or "")
             if stored_key:

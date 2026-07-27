@@ -19,6 +19,8 @@ SCRIPT_DIR = Path(__file__).resolve().parent
 PROJECT_ROOT = SCRIPT_DIR.parent
 sys.path.insert(0, str(PROJECT_ROOT))
 
+from hermes_runtime.config import read_raw_config
+
 HERMES_HOME = Path(os.getenv("HERMES_HOME", Path.home() / ".hermes"))
 ENV_FILE = HERMES_HOME / ".env"
 
@@ -241,9 +243,7 @@ def check_config(groq_key, eleven_key):
     config_path = HERMES_HOME / "config.yaml"
     if config_path.exists():
         try:
-            import yaml
-            with open(config_path, encoding="utf-8") as f:
-                cfg = yaml.safe_load(f) or {}
+            cfg = read_raw_config(config_path=config_path)
 
             stt_provider = cfg.get("stt", {}).get("provider", "local")
             tts_provider = cfg.get("tts", {}).get("provider", "edge")

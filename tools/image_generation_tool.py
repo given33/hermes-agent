@@ -535,7 +535,7 @@ def _resolve_fal_model() -> tuple:
     """
     model_id = ""
     try:
-        from hermes_cli.config import load_config
+        from hermes_runtime.config import load_config
         cfg = load_config()
         img_cfg = cfg.get("image_gen") if isinstance(cfg, dict) else None
         if isinstance(img_cfg, dict):
@@ -1223,7 +1223,7 @@ IMAGE_GENERATE_SCHEMA = {
 def _read_configured_image_model():
     """Return the value of ``image_gen.model`` from config.yaml, or None."""
     try:
-        from hermes_cli.config import load_config
+        from hermes_runtime.config import load_config
         cfg = load_config()
         section = cfg.get("image_gen") if isinstance(cfg, dict) else None
         if isinstance(section, dict):
@@ -1247,7 +1247,7 @@ def _read_configured_image_provider():
     issue #26241).
     """
     try:
-        from hermes_cli.config import load_config
+        from hermes_runtime.config import load_config
         cfg = load_config()
         section = cfg.get("image_gen") if isinstance(cfg, dict) else None
         if isinstance(section, dict):

@@ -178,3 +178,8 @@ def test_builtin_set_has_no_phantom_entries():
         f"_BUILTIN_SUBCOMMANDS has entries that are not registered as "
         f"top-level subparsers: {sorted(phantom)}"
     )
+
+
+def test_nous_account_portal_is_not_a_public_subcommand():
+    assert "portal" not in _live_subcommand_names()
+    assert "portal" not in _BUILTIN_SUBCOMMANDS

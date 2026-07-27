@@ -48,8 +48,12 @@ from typing import Any, Callable, Dict, List, Optional, Set, Union
 
 from hermes_constants import get_hermes_home
 from utils import env_var_enabled, fast_safe_load
-from hermes_cli.config import cfg_get
-from hermes_cli.middleware import OBSERVER_SCHEMA_VERSION, VALID_MIDDLEWARE
+from hermes_runtime.config import cfg_get
+from hermes_services.middleware import (
+    OBSERVER_SCHEMA_VERSION,
+    VALID_MIDDLEWARE,
+    install_middleware_backend,
+)
 
 
 def get_bundled_plugins_dir() -> Path:
@@ -232,7 +236,7 @@ def _get_disabled_plugins() -> set:
     ``plugins.enabled``.
     """
     try:
-        from hermes_cli.config import load_config
+        from hermes_runtime.config import load_config
         config = load_config()
         disabled = cfg_get(config, "plugins", "disabled", default=[])
         return set(disabled) if isinstance(disabled, list) else set()
@@ -255,7 +259,7 @@ def _get_enabled_plugins() -> Optional[set]:
     * ``set(...)`` — the concrete allow-list.
     """
     try:
-        from hermes_cli.config import load_config
+        from hermes_runtime.config import load_config
         config = load_config()
         plugins_cfg = config.get("plugins")
         if not isinstance(plugins_cfg, dict):
@@ -460,7 +464,7 @@ class PluginContext:
         if source == "bundled":
             return True
         try:
-            from hermes_cli.config import load_config
+            from hermes_runtime.config import load_config
             cfg = load_config() or {}
         except Exception:
             # If we can't load config, fail closed — better to break the
@@ -1213,7 +1217,7 @@ class PluginContext:
             ValueError: if *name* contains ``':'`` or invalid characters.
             FileNotFoundError: if *path* does not exist.
         """
-        from agent.skill_utils import _NAMESPACE_RE
+        from hermes_runtime.skill_utils import NAMESPACE_PATTERN
 
         if ":" in name:
             raise ValueError(
@@ -1221,7 +1225,7 @@ class PluginContext:
                 f"(the namespace is derived from the plugin name "
                 f"'{self.manifest.name}' automatically)."
             )
-        if not name or not _NAMESPACE_RE.match(name):
+        if not name or not NAMESPACE_PATTERN.match(name):
             raise ValueError(
                 f"Invalid skill name '{name}'. Must match [a-zA-Z0-9_-]+."
             )
@@ -2069,6 +2073,20 @@ def has_middleware(kind: str) -> bool:
     if callable(method):
         return bool(method(kind))
     return bool(getattr(manager, "_middleware", {}).get(kind))
+
+
+def get_middleware_callbacks(kind: str) -> List[Callable]:
+    """Return a snapshot of callbacks registered for one middleware kind."""
+    return list(get_plugin_manager()._middleware.get(kind, []))
+
+
+# The plugin manager is an adapter. Register it with the framework-neutral
+# middleware service instead of making agent/runtime code import this module.
+install_middleware_backend(
+    invoke=invoke_middleware,
+    has=has_middleware,
+    callbacks=get_middleware_callbacks,
+)
 
 
 def has_hook(hook_name: str) -> bool:

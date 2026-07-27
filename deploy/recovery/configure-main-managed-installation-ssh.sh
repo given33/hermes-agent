@@ -64,18 +64,23 @@ fi
 
 install -d -o root -g root -m 0700 "${backup_root}"
 stamp="$(date +%Y%m%d-%H%M%S)-$$"
-backup="$(mktemp "${backup_root}/sshd-managed-installation-${stamp}.XXXXXX")"
-candidate="$(mktemp "${config_dir}/.sshd_config.managed-installation.XXXXXX")"
-config_uid="$(stat -c '%u' "${sshd_config}")"
-config_gid="$(stat -c '%g' "${sshd_config}")"
-config_mode="$(stat -c '%a' "${sshd_config}")"
-cp --preserve=mode,ownership,timestamps -- "${sshd_config}" "${backup}"
-chmod 0600 "${backup}"
 
+# Rollback state.  changed=1 only while the live config may differ from the
+# backup (it is set immediately before the atomic rename below).  backup and
+# candidate start empty so on_exit can run safely even when a failure happens
+# before the temp files exist.
 changed=0
+backup=""
+candidate=""
+
 restore_original() {
+  # Returns 0 when the original config is back on disk and sshd reloaded,
+  # 1 when the restore itself failed (the live config may still be the new
+  # one), and 2 when the original is back on disk but the reload failed.
+  # Callers must not conflate 1 and 2: with 2 the on-disk state is already
+  # correct and only a manual reload is outstanding.
   local rollback_candidate
-  rollback_candidate="$(mktemp "${config_dir}/.sshd_config.rollback.XXXXXX")"
+  rollback_candidate="$(mktemp "${config_dir}/.sshd_config.rollback.XXXXXX")" || return 1
   if ! install -o "${config_uid}" -g "${config_gid}" -m "${config_mode}" \
       "${backup}" "${rollback_candidate}" \
     || ! "${sshd_binary}" -t -f "${rollback_candidate}" \
@@ -83,29 +88,63 @@ restore_original() {
     rm -f -- "${rollback_candidate}"
     return 1
   fi
-  if ! mv -f -- "${rollback_candidate}" "${sshd_config}" \
-    || ! sync -f "${config_dir}" \
-    || ! reload_sshd; then
+  if ! mv -f -- "${rollback_candidate}" "${sshd_config}"; then
     rm -f -- "${rollback_candidate}"
     return 1
   fi
+  # The rename is already visible at this point; the directory sync is
+  # durability-only and must not turn a successful restore into a failure.
+  sync -f "${config_dir}" || true
+  reload_sshd || return 2
 }
 on_exit() {
   local status=$?
   trap - EXIT INT TERM HUP
-  rm -f -- "${candidate}"
+  if [[ -n "${candidate}" ]]; then
+    rm -f -- "${candidate}"
+  fi
   if [[ "${status}" != 0 && "${changed}" == 1 ]]; then
-    if ! restore_original; then
-      printf '%s\n' "configure-main-managed-installation-ssh: rollback failed" >&2
+    local restore_status=0
+    restore_original || restore_status=$?
+    if [[ "${restore_status}" == 2 ]]; then
+      printf '%s\n' "configure-main-managed-installation-ssh: original sshd configuration restored, but sshd reload failed; reload sshd manually" >&2
+      exit 71
+    elif [[ "${restore_status}" != 0 ]]; then
+      printf '%s\n' "configure-main-managed-installation-ssh: rollback failed; original configuration saved at ${backup}" >&2
       exit 70
     fi
   fi
   exit "${status}"
 }
+prune_backups() {
+  # One backup accumulates per modifying run and nothing ever deleted them,
+  # so ${backup_root} grew without bound.  Keep the newest N (including the
+  # one just created); pruning is best-effort — a hiccup here must not abort
+  # the deployment.
+  local keep stale old
+  keep="${HERMES_SSHD_BACKUP_KEEP:-5}"
+  [[ "${keep}" =~ ^[0-9]+$ ]] || keep=5
+  (( keep >= 1 )) || keep=1
+  stale="$(ls -1t -- "${backup_root}"/sshd-managed-installation-* 2>/dev/null | tail -n "+$((keep + 1))" || true)"
+  [[ -z "${stale}" ]] || while IFS= read -r old; do
+    rm -f -- "${old}" || true
+  done <<<"${stale}"
+}
+# Install the cleanup trap before creating any temp file so a failure in the
+# snapshot block below cannot leak the backup or candidate temp files.
 trap on_exit EXIT
 trap 'exit 130' INT
 trap 'exit 143' TERM
 trap 'exit 129' HUP
+
+backup="$(mktemp "${backup_root}/sshd-managed-installation-${stamp}.XXXXXX")"
+candidate="$(mktemp "${config_dir}/.sshd_config.managed-installation.XXXXXX")"
+config_uid="$(stat -c '%u' "${sshd_config}")"
+config_gid="$(stat -c '%g' "${sshd_config}")"
+config_mode="$(stat -c '%a' "${sshd_config}")"
+cp --preserve=mode,ownership,timestamps -- "${sshd_config}" "${backup}"
+chmod 0600 "${backup}"
+prune_backups
 
 "${python_binary}" - "${sshd_config}" "${candidate}" "${anchor}" "${required}" <<'PY'
 from pathlib import Path
@@ -143,8 +182,14 @@ PY
 chown "${config_uid}:${config_gid}" "${candidate}"
 chmod "${config_mode}" "${candidate}"
 "${sshd_binary}" -t -f "${candidate}" || die "candidate sshd configuration is invalid"
-changed=1
 sync -f "${candidate}" || die "candidate sshd configuration could not be synced"
+# Only the rename below mutates the live config, so flip changed=1 right
+# before it: a candidate-stage failure above must exit without a rollback
+# (the config was never touched, and a spurious rollback whose reload failed
+# would be misreported as "rollback failed").  It cannot be set after the mv
+# either — a reported mv failure is ambiguous (the rename may have landed),
+# so rollback must treat the config as modified in that case.
+changed=1
 mv -f -- "${candidate}" "${sshd_config}" || die "atomic sshd configuration replacement failed"
 sync -f "${config_dir}" || die "sshd configuration directory could not be synced"
 validate_effective

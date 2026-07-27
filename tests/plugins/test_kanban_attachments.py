@@ -408,9 +408,11 @@ def test_cli_attach_honors_name_override(kanban_home, tmp_path):
         task_id = _make_task(conn)
     finally:
         conn.close()
-    src = tmp_path / "raw.bin"
+    upload_dir = tmp_path / "folder with spaces"
+    upload_dir.mkdir()
+    src = upload_dir / "raw.bin"
     src.write_bytes(b"xyz")
-    run_slash(f"attach {task_id} {src} --name renamed.dat")
+    run_slash(f'attach {task_id} "{src}" --name renamed.dat')
     conn = kb.connect()
     try:
         assert kb.list_attachments(conn, task_id)[0].filename == "renamed.dat"

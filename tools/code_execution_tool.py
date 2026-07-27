@@ -1124,7 +1124,7 @@ def _execute_remote(
     # Redact secrets. code_file=True: execute_code output is code-execution
     # output that often echoes source/config — skip false-positive ENV/JSON/
     # f-string-template redaction while still masking real credentials.
-    from agent.redact import redact_sensitive_text
+    from hermes_runtime.redaction import redact_sensitive_text
     stdout_text = redact_sensitive_text(stdout_text, code_file=True)
 
     # Build response
@@ -1547,7 +1547,7 @@ def execute_code(
         # This ensures leaked secrets never enter the model context.
         # code_file=True: this is code-execution output — skip false-positive
         # ENV/JSON/f-string-template redaction; real credentials still masked.
-        from agent.redact import redact_sensitive_text
+        from hermes_runtime.redaction import redact_sensitive_text
         stdout_text = redact_sensitive_text(stdout_text, code_file=True)
         stderr_text = redact_sensitive_text(stderr_text, code_file=True)
 
@@ -1683,7 +1683,7 @@ def _load_config() -> dict:
     key cleanly falls back to DEFAULT_EXECUTION_MODE.
     """
     try:
-        from hermes_cli.config import read_raw_config
+        from hermes_runtime.config import read_raw_config
 
         cfg = read_raw_config().get("code_execution", {})
         return cfg if isinstance(cfg, dict) else {}

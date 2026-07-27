@@ -9,6 +9,7 @@ covered in ``test_shell_hooks_consent.py``.
 from __future__ import annotations
 
 import json
+import os
 from pathlib import Path
 
 import pytest
@@ -24,6 +25,11 @@ def _write_script(tmp_path: Path, name: str, body: str) -> Path:
     path.write_text(body)
     path.chmod(0o755)
     return path
+
+
+def _shell_path(path: Path) -> str:
+    """Render a temporary path for the shell used by hook fixtures."""
+    return path.as_posix()
 
 
 def _allowlist_pair(monkeypatch, tmp_path, event: str, command: str) -> None:
@@ -359,7 +365,7 @@ class TestCallbackSubprocess:
         script = _write_script(
             tmp_path, "log.sh",
             f"#!/usr/bin/env bash\n"
-            f"echo \"$(cat -)\" >> {calls}\n"
+            f"echo \"$(cat -)\" >> {_shell_path(calls)}\n"
             f"printf '{{}}\\n'\n",
         )
         spec = shell_hooks.ShellHookSpec(
@@ -379,7 +385,7 @@ class TestCallbackSubprocess:
         capture = tmp_path / "payload.json"
         script = _write_script(
             tmp_path, "capture.sh",
-            f"#!/usr/bin/env bash\ncat - > {capture}\nprintf '{{}}\\n'\n",
+            f"#!/usr/bin/env bash\ncat - > {_shell_path(capture)}\nprintf '{{}}\\n'\n",
         )
         spec = shell_hooks.ShellHookSpec(
             event="pre_tool_call", command=str(script),
@@ -695,7 +701,12 @@ class TestAllowlistConcurrency:
 
         # Flip +x; bare invocation is now runnable too.
         script.chmod(0o755)
-        assert shell_hooks.script_is_executable(str(script))
+        if os.name == "nt":
+            # NTFS does not expose a Unix execute bit through chmod and
+            # CreateProcess does not launch .py files through associations.
+            assert not shell_hooks.script_is_executable(str(script))
+        else:
+            assert shell_hooks.script_is_executable(str(script))
 
     def test_command_script_path_resolution(self):
         """Regression: ``_command_script_path`` used to return the first

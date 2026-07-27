@@ -23,6 +23,16 @@ except ModuleNotFoundError:
     # means UTF-8 stdio setup is skipped on Windows; POSIX is unaffected.
     pass
 
+# Cross-platform UTF-8 stdio repair: hermes_bootstrap above is Windows-only,
+# this one also fixes legacy POSIX locales (latin-1/C on minimal Debian/Pi).
+# Explicit entry-point call — importing hermes_cli no longer does this as a
+# side effect (see hermes_cli.ensure_utf8_stdio's docstring for the callers
+# that must be wired). cli.py module init runs before any banner print for
+# both `python cli.py` and `hermes chat` (which imports this module).
+from hermes_cli import ensure_utf8_stdio as _hermes_ensure_utf8_stdio
+
+_hermes_ensure_utf8_stdio()
+
 import logging
 import copy
 import os
@@ -51,11 +61,12 @@ logger = logging.getLogger(__name__)
 os.environ["HERMES_QUIET"] = "1"  # Our own modules
 
 import yaml
+from hermes_runtime.config import read_raw_config_strict
+from hermes_runtime.process_probe import pid_exists as _pid_exists
 
 from hermes_cli.fallback_config import get_fallback_chain
 from hermes_cli.cli_agent_setup_mixin import CLIAgentSetupMixin
 from hermes_cli.cli_commands_mixin import CLICommandsMixin
-from hermes_cli.cli_billing_mixin import CLIBillingMixin
 
 # prompt_toolkit for fixed input area TUI
 from prompt_toolkit.history import FileHistory
@@ -140,7 +151,7 @@ def _reverse_alias_for_display(model_name: str) -> str:
     if _REVERSE_ALIAS_CACHE is None:
         rmap: dict[str, str] = {}
         try:
-            from hermes_cli.config import load_config
+            from hermes_runtime.config import load_config
             cfg = load_config() or {}
             ma = cfg.get("model_aliases")
             if isinstance(ma, dict):
@@ -562,9 +573,9 @@ def load_cli_config() -> Dict[str, Any]:
     if config_path.exists():
         try:
             with open(config_path, "r", encoding="utf-8") as f:
-                from hermes_cli.config import _normalize_root_model_keys
+                from hermes_runtime.config import normalize_root_model_keys
 
-                file_config = _normalize_root_model_keys(fast_safe_load(f) or {})
+                file_config = normalize_root_model_keys(fast_safe_load(f) or {})
             
             _file_has_terminal_config = "terminal" in file_config
 
@@ -616,8 +627,8 @@ def load_cli_config() -> Dict[str, Any]:
             logger.warning("Failed to load cli-config.yaml: %s", e)
 
     # Expand ${ENV_VAR} references in config values before bridging to env vars.
-    from hermes_cli.config import _expand_env_vars
-    defaults = _expand_env_vars(defaults)
+    from hermes_runtime.config import expand_env_vars
+    defaults = expand_env_vars(defaults)
 
     # Managed scope: overlay administrator-pinned values LAST so they win over
     # the user's config here too. cli.py builds its config independently of
@@ -627,7 +638,7 @@ def load_cli_config() -> Dict[str, Any]:
     # `hermes config`/`doctor`/guards (which use load_config) honor it. The
     # shared helper mirrors _load_config_impl (env-only expansion, root-model
     # normalization, leaf-merge) and is fail-open.
-    from hermes_cli import managed_scope
+    from hermes_runtime import managed_scope
 
     defaults = managed_scope.apply_managed_overlay(defaults)
 
@@ -774,7 +785,18 @@ def load_cli_config() -> Dict[str, Any]:
 
     return defaults
 
-# Load configuration at module startup
+# Load configuration at module startup.
+#
+# DEPRECATED (in place): CLI_CONFIG is the legacy import-time snapshot used by
+# cli.py's own REPL paths and a tail of external importers. New code must use
+# hermes_cli.config.load_config() / load_config_readonly() instead — the
+# shared loader adds DEFAULT_CONFIG deep-merge, managed-scope overrides,
+# last-known-good fallback on parse errors, mtime-keyed caching, and (as of
+# the HERMES_IGNORE_USER_CONFIG convergence) the same --ignore-user-config
+# semantics as this loader, so there is no behavioral reason left to import
+# CLI_CONFIG from outside cli.py. Remaining migration: external importers of
+# cli.CLI_CONFIG (outside this module) should switch to the shared loader;
+# tools/delegate_tool.py already treats it as a fallback only.
 CLI_CONFIG = load_cli_config()
 
 
@@ -788,7 +810,7 @@ except Exception:
 
 # Validate config structure early — print warnings before user hits cryptic errors
 try:
-    from hermes_cli.config import print_config_warnings
+    from hermes_runtime.config import print_config_warnings
     print_config_warnings()
 except Exception:
     pass
@@ -928,7 +950,7 @@ def validate_toolset(*args, **kwargs):
 
 def _sync_process_session_id(session_id: str) -> None:
     """Keep process-local session-id consumers aligned after CLI switches."""
-    from gateway.session_context import set_current_session_id
+    from hermes_runtime.session_context import set_current_session_id
 
     set_current_session_id(session_id)
 
@@ -1030,7 +1052,7 @@ def _prepare_deferred_agent_startup() -> None:
         )
     try:
         from agent.shell_hooks import register_from_config
-        from hermes_cli.config import load_config
+        from hermes_runtime.config import load_config
 
         register_from_config(load_config(), accept_hooks=_accept_hooks)
     except Exception:
@@ -1788,7 +1810,6 @@ def _worktree_lock_is_live(repo_root: str, worktree_path: str, timeout: int = 10
             if pid == os.getpid():
                 return "live"
             try:
-                from gateway.status import _pid_exists
                 return "live" if _pid_exists(pid) else "dead"
             except Exception:
                 # Can't determine liveness — fail safe toward keeping it.
@@ -1872,7 +1893,7 @@ def _run_state_db_auto_maintenance(session_db) -> None:
     if session_db is None:
         return
     try:
-        from hermes_cli.config import load_config as _load_full_config
+        from hermes_runtime.config import load_config as _load_full_config
         from hermes_constants import get_hermes_home as _get_hermes_home
         _hermes_home_maint = _get_hermes_home()
 
@@ -1922,7 +1943,7 @@ def _run_checkpoint_auto_maintenance() -> None:
     Never raises — maintenance must never block interactive startup.
     """
     try:
-        from hermes_cli.config import load_config as _load_full_config
+        from hermes_runtime.config import load_config as _load_full_config
         cfg = (_load_full_config().get("checkpoints") or {})
         if not cfg.get("auto_prune", False):
             return
@@ -3746,7 +3767,7 @@ def save_config_value(key_path: str, value: any) -> bool:
 # HermesCLI Class
 # ============================================================================
 
-class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
+class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin):
     """
     Interactive CLI for the Hermes Agent.
     
@@ -4892,7 +4913,7 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
         try:
             from agent.pet import constants, store
             from agent.pet.render import PetRenderer
-            from hermes_cli.config import load_config
+            from hermes_runtime.config import load_config
 
             cfg = load_config()
             display = cfg.get("display", {}) if isinstance(cfg.get("display"), dict) else {}
@@ -5359,7 +5380,7 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
 
         if resolved_provider == "copilot":
             try:
-                from hermes_cli.models import copilot_model_api_mode, normalize_copilot_model_id
+                from agent.model_catalog import copilot_model_api_mode, normalize_copilot_model_id
 
                 canonical = normalize_copilot_model_id(current_model, api_key=self.api_key)
                 if canonical and canonical != current_model:
@@ -5381,7 +5402,7 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
 
         if resolved_provider in {"opencode-zen", "opencode-go"}:
             try:
-                from hermes_cli.models import normalize_opencode_model_id, opencode_model_api_mode
+                from agent.model_catalog import normalize_opencode_model_id, opencode_model_api_mode
 
                 canonical = normalize_opencode_model_id(resolved_provider, current_model)
                 if canonical and canonical != current_model:
@@ -6677,7 +6698,7 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
     
     def _fast_command_available(self) -> bool:
         try:
-            from hermes_cli.models import model_supports_fast_mode
+            from agent.model_catalog import model_supports_fast_mode
         except Exception:
             return False
         agent = getattr(self, "agent", None)
@@ -8199,7 +8220,7 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
             model_list = provider_data.get("models", [])
             if not model_list:
                 try:
-                    from hermes_cli.models import provider_model_ids
+                    from agent.model_catalog import provider_model_ids
                     live = provider_model_ids(provider_data["slug"])
                     if live:
                         model_list = live
@@ -8305,7 +8326,7 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
         # /v1/models endpoint on this open.
         if force_refresh:
             try:
-                from hermes_cli.models import clear_provider_models_cache
+                from agent.model_catalog import clear_provider_models_cache
                 clear_provider_models_cache()
                 _cprint("  Cleared model picker cache. Refreshing...")
             except Exception:
@@ -8545,7 +8566,7 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
 
         # Load + persist via the existing config helpers
         try:
-            from hermes_cli.config import load_config, save_config
+            from hermes_runtime.config import load_config, save_config
         except Exception as exc:
             _cprint(f"❌ could not load config: {exc}")
             return
@@ -8977,10 +8998,6 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
             self._manual_compress(cmd_original)
         elif canonical == "usage":
             self._handle_usage_command(cmd_original)
-        elif canonical == "subscription":
-            self._show_subscription()
-        elif canonical == "topup":
-            self._show_billing(cmd_original)
         elif canonical == "insights":
             self._show_insights(cmd_original)
         elif canonical == "copy":
@@ -8999,7 +9016,7 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
         elif canonical == "image":
             self._handle_image_command(cmd_original)
         elif canonical == "reload":
-            from hermes_cli.config import reload_env
+            from hermes_runtime.config import reload_env
             count = reload_env()
             print(f"  Reloaded .env ({count} var(s) updated)")
         elif canonical == "reload-mcp":
@@ -9198,7 +9215,7 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
                             )
                             output = result.stdout.strip() or result.stderr.strip()
                             if output:
-                                from agent.redact import redact_sensitive_text
+                                from hermes_runtime.redaction import redact_sensitive_text
                                 output = redact_sensitive_text(output)
                                 self._console_print(_rich_text_from_ansi(output))
                             else:
@@ -9375,7 +9392,7 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
         """
         try:
             from hermes_cli.goals import GoalManager
-            from hermes_cli.config import load_config
+            from hermes_runtime.config import load_config
         except Exception as exc:
             logging.debug("goal manager unavailable: %s", exc)
             return None
@@ -9631,7 +9648,7 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
         # prompt_toolkit's renderer.  self.console.print() with Rich markup
         # writes directly to stdout which patch_stdout's StdoutProxy mangles
         # into garbled sequences like '?[33mTool progress: NEW?[0m' (#2262).
-        from hermes_cli.colors import Colors as _Colors
+        from hermes_runtime.colors import Colors as _Colors
         labels = {
             "off": f"{_Colors.DIM}Tool progress: OFF{_Colors.RESET} — silent mode, just the final response.",
             "new": f"{_Colors.YELLOW}Tool progress: NEW{_Colors.RESET} — show each new tool (skip repeats).",
@@ -9710,7 +9727,7 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
         ``set_current_session_key`` so the bypass takes effect on the very
         next dangerous command in this run.
         """
-        from hermes_cli.colors import Colors as _Colors
+        from hermes_runtime.colors import Colors as _Colors
         from tools.approval import (
             disable_session_yolo,
             enable_session_yolo,
@@ -9980,28 +9997,16 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
         print(f"  {result.message}")
 
     def _show_usage(self):
-        """Rate limits + session token usage (when a live agent exists) + Nous credits.
-
-        The Nous credits block is agent-independent (a portal fetch), so it runs even
-        with no live agent — important for the TUI, where /usage runs in a slash-worker
-        subprocess that resumes the session WITHOUT building an agent (self.agent is None),
-        which would otherwise early-return before any credits showed.
-        """
+        """Show rate limits and token usage for the active session."""
         if not self.agent:
-            if self._print_nous_credits_block():
-                self._print_usage_cta()
-            else:
-                print("(._.) No active agent -- send a message first.")
+            print("(._.) No active agent -- send a message first.")
             return
 
         agent = self.agent
         calls = agent.session_api_calls
 
         if calls == 0:
-            if self._print_nous_credits_block():
-                self._print_usage_cta()
-            else:
-                print("(._.) No API calls made yet in this session.")
+            print("(._.) No API calls made yet in this session.")
             return
 
         # ── Rate limits (shown first when available) ────────────────
@@ -10068,11 +10073,6 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
             print()
             for line in account_lines:
                 print(line)
-
-        # Nous credits magnitudes + monthly-grant gauge (agent-independent — also
-        # runs at the no-agent / no-calls early-returns above). See the helper.
-        if self._print_nous_credits_block():
-            self._print_usage_cta()
 
         if self.verbose:
             logging.getLogger().setLevel(logging.DEBUG)
@@ -10145,8 +10145,6 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
           other Hermes instances.
         """
 
-        import yaml as _yaml
-
         CONFIG_WATCH_INTERVAL = 5.0  # seconds between config.yaml stat() calls
 
         now = time.monotonic()
@@ -10154,7 +10152,7 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
             return
         self._last_config_check = now
 
-        from hermes_cli.config import get_config_path as _get_config_path
+        from hermes_runtime.config import get_config_path as _get_config_path
         cfg_path = _get_config_path()
         if not cfg_path.exists():
             return
@@ -10170,8 +10168,7 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
         # File changed — check whether mcp_servers section changed
         self._config_mtime = mtime
         try:
-            with open(cfg_path, encoding="utf-8") as f:
-                new_cfg = _yaml.safe_load(f) or {}
+            new_cfg = read_raw_config_strict(config_path=cfg_path)
         except Exception:
             return
 
@@ -10183,8 +10180,8 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
         # keys) triggers a false-positive MCP reload because the raw yaml
         # still has "${POWERMEM_API_KEY}" while the snapshot has the
         # expanded value.
-        from hermes_cli.config import _expand_env_vars
-        new_mcp = _expand_env_vars(new_mcp)
+        from hermes_runtime.config import expand_env_vars
+        new_mcp = expand_env_vars(new_mcp)
         if new_mcp == self._config_mcp_servers:
             return  # mcp_servers unchanged (some other section was edited)
 
@@ -10855,7 +10852,7 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
         # instead of crashing on ``.get()``.
         voice_cfg: dict = {}
         try:
-            from hermes_cli.config import load_config
+            from hermes_runtime.config import load_config
             _cfg = load_config().get("voice")
             voice_cfg = _cfg if isinstance(_cfg, dict) else {}
         except Exception:
@@ -10974,7 +10971,7 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
             # Get STT model from config
             stt_model = None
             try:
-                from hermes_cli.config import load_config
+                from hermes_runtime.config import load_config
                 stt_config = load_config().get("stt", {})
                 stt_model = stt_config.get("model")
             except Exception:
@@ -11108,7 +11105,7 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
     def _voice_beeps_enabled(self) -> bool:
         """Return whether CLI voice mode should play record start/stop beeps."""
         try:
-            from hermes_cli.config import load_config
+            from hermes_runtime.config import load_config
             voice_cfg = load_config().get("voice", {})
             if isinstance(voice_cfg, dict):
                 return bool(voice_cfg.get("beep_enabled", True))
@@ -11152,7 +11149,7 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
         # Check config for auto_tts (shape-safe — malformed ``voice:`` YAML
         # leaves ``voice_config`` as a non-dict, so guard before .get()).
         try:
-            from hermes_cli.config import load_config
+            from hermes_runtime.config import load_config
             _raw_voice = load_config().get("voice")
             voice_config = _raw_voice if isinstance(_raw_voice, dict) else {}
             if voice_config.get("auto_tts", False):
@@ -11835,7 +11832,7 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
                     build_native_content_parts,
                     decide_image_input_mode,
                 )
-                from hermes_cli.config import load_config
+                from hermes_runtime.config import load_config
 
                 _img_mode = decide_image_input_mode(
                     (self.provider or "").strip(),
@@ -13043,7 +13040,7 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
                     _resid_color = "#B8860B"
                 self._console_print(f"[{_resid_color}]{openclaw_residue_hint_cli()}[/]")
                 try:
-                    from hermes_cli.config import get_config_path as _get_cfg_path_resid
+                    from hermes_runtime.config import get_config_path as _get_cfg_path_resid
                     mark_seen(_get_cfg_path_resid(), OPENCLAW_RESIDUE_FLAG)
                 except Exception:
                     pass  # best-effort — banner will fire again next session
@@ -13098,7 +13095,7 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
         get_plugin_manager()._cli_ref = self
 
         # Config file watcher — detect mcp_servers changes and auto-reload
-        from hermes_cli.config import get_config_path as _get_config_path
+        from hermes_runtime.config import get_config_path as _get_config_path
         _cfg_path = _get_config_path()
         self._config_mtime: float = _cfg_path.stat().st_mtime if _cfg_path.exists() else 0.0
         self._config_mcp_servers: dict = self.config.get("mcp_servers") or {}
@@ -13833,7 +13830,7 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
         # TUI/CLI split instead of a silent mismatch (round-11).
         _raw_key: object = "ctrl+b"
         try:
-            from hermes_cli.config import load_config
+            from hermes_runtime.config import load_config
             from hermes_cli.voice import (
                 normalize_voice_record_key_for_prompt_toolkit,
                 voice_record_key_from_config,
@@ -15920,7 +15917,7 @@ def main(
                                 build_native_content_parts as _build_parts,  # noqa: F811
                             )
                             from agent.image_routing import decide_image_input_mode
-                            from hermes_cli.config import load_config
+                            from hermes_runtime.config import load_config
 
                             _img_mode = decide_image_input_mode(
                                 (cli.provider or "").strip(),

@@ -56,7 +56,8 @@ from agent.account_usage import fetch_account_usage, render_account_usage_lines
 from agent.async_utils import consume_detached_task_result, safe_schedule_threadsafe
 from agent.conversation_loop import INTERRUPT_WAITING_FOR_MODEL_PREFIX
 from agent.i18n import t
-from hermes_cli.config import cfg_get
+from hermes_runtime.config import cfg_get, read_raw_config, read_raw_config_strict
+from hermes_runtime.process_probe import pid_exists as _pid_exists
 from hermes_cli.fallback_config import get_fallback_chain
 
 # --- Agent cache tuning ---------------------------------------------------
@@ -311,7 +312,7 @@ def _gateway_loop_exception_handler(
 def _redact_gateway_user_facing_secrets(text: str) -> str:
     """Secret redaction before text can leave the gateway.
 
-    Delegates to the authoritative ``agent.redact.redact_sensitive_text`` — the
+    Delegates to the authoritative ``hermes_runtime.redaction.redact_sensitive_text`` — the
     same Tirith-grade redactor already applied to logs, tool output, and
     approval-command prompts — so the outbound chat path masks the full
     credential set the startup banner promises ("chat responses are scrubbed
@@ -325,7 +326,7 @@ def _redact_gateway_user_facing_secrets(text: str) -> str:
     """
     redacted = str(text or "")
     try:
-        from agent.redact import redact_sensitive_text
+        from hermes_runtime.redaction import redact_sensitive_text
 
         redacted = redact_sensitive_text(redacted, force=True)
     except Exception:
@@ -348,7 +349,7 @@ def _redact_approval_command(cmd: "str | None") -> str:
     off. Module-level so the wiring is unit-testable (the call site is a deeply
     nested gateway closure that cannot be driven directly).
     """
-    from agent.redact import redact_sensitive_text
+    from hermes_runtime.redaction import redact_sensitive_text
 
     return redact_sensitive_text(str(cmd or ""), force=True)
 
@@ -1439,7 +1440,7 @@ def _reload_runtime_env_preserving_config_authority() -> None:
     the process-global ``os.environ`` here would defeat that isolation and leak
     the default profile's keys to every profile's turns and subprocesses.
     """
-    from agent.secret_scope import is_multiplex_active
+    from hermes_runtime.secret_scope import is_multiplex_active
     if is_multiplex_active():
         # Credentials are resolved from the active profile's secret scope, not
         # os.environ. Still honor config.yaml's agent.max_turns bridge below
@@ -1460,17 +1461,15 @@ def _bridge_max_turns_from_config(home: "Path") -> None:
     if not config_path.exists():
         return
     try:
-        import yaml as _yaml
-        with open(config_path, encoding="utf-8") as f:
-            cfg = _yaml.safe_load(f) or {}
-        from hermes_cli.config import _expand_env_vars
-        cfg = _expand_env_vars(cfg)
+        from hermes_runtime.config import expand_env_vars
+        cfg = read_raw_config(config_path=config_path)
+        cfg = expand_env_vars(cfg)
         # Managed scope: keep administrator-pinned values authoritative on every
         # turn too. This per-turn reload re-bridges config→env, so without the
         # overlay a managed agent.max_turns / timezone / redact_secrets would be
         # replaced by the user's value after the first turn. Fail-open.
         try:
-            from hermes_cli import managed_scope
+            from hermes_runtime import managed_scope
             cfg = managed_scope.apply_managed_overlay(cfg)
         except Exception:
             pass
@@ -1540,7 +1539,7 @@ def _profile_runtime_scope(profile_home: "Path"):
     from inheriting cross-profile secrets.
     """
     from hermes_constants import set_hermes_home_override, reset_hermes_home_override
-    from agent.secret_scope import (
+    from hermes_runtime.secret_scope import (
         build_profile_secret_scope,
         set_secret_scope,
         reset_secret_scope,
@@ -1618,12 +1617,10 @@ _DOCKER_MEDIA_OUTPUT_CONTAINER_PATHS = {"/output", "/outputs"}
 _config_path = _hermes_home / 'config.yaml'
 if _config_path.exists():
     try:
-        import yaml as _yaml
-        with open(_config_path, encoding="utf-8") as _f:
-            _cfg = _yaml.safe_load(_f) or {}
+        _cfg = read_raw_config(config_path=_config_path)
         # Expand ${ENV_VAR} references before bridging to env vars.
-        from hermes_cli.config import _expand_env_vars
-        _cfg = _expand_env_vars(_cfg)
+        from hermes_runtime.config import expand_env_vars
+        _cfg = expand_env_vars(_cfg)
         # Managed scope: overlay administrator-pinned values BEFORE bridging to
         # env vars, so a managed timezone / redact_secrets / max_turns / terminal
         # setting wins over the user's value at the env layer too. This bridge
@@ -1631,7 +1628,7 @@ if _config_path.exists():
         # overlay every HERMES_*/TERMINAL_* env var below would carry the user's
         # value even when an administrator pinned it. Fail-open via the helper.
         try:
-            from hermes_cli import managed_scope
+            from hermes_runtime import managed_scope
             _cfg = managed_scope.apply_managed_overlay(_cfg)
         except Exception:
             pass
@@ -1858,14 +1855,14 @@ except Exception as _bootstrap_exc:
 
 # Validate config structure early — log warnings so gateway operators see problems
 try:
-    from hermes_cli.config import print_config_warnings
+    from hermes_runtime.config import print_config_warnings
     print_config_warnings()
 except Exception as _bootstrap_exc:
     print(f"  Warning: config validation failed: {_bootstrap_exc}", file=sys.stderr)
 
 # Warn if user has deprecated MESSAGING_CWD / TERMINAL_CWD in .env
 try:
-    from hermes_cli.config import warn_deprecated_cwd_env_vars
+    from hermes_runtime.config import warn_deprecated_cwd_env_vars
     warn_deprecated_cwd_env_vars()
 except Exception as _bootstrap_exc:
     print(f"  Warning: deprecation check failed: {_bootstrap_exc}", file=sys.stderr)
@@ -2058,12 +2055,12 @@ def _resolve_runtime_agent_kwargs() -> dict:
     resolve credentials using the fallback provider chain from config.yaml
     before giving up.
     """
-    from hermes_cli.runtime_provider import (
+    from agent.runtime_provider import (
         resolve_runtime_provider,
         format_runtime_provider_error,
-        _get_model_config,
+        get_model_config,
     )
-    from hermes_cli.auth import AuthError, is_rate_limited_auth_error
+    from hermes_services.auth import AuthError, is_rate_limited_auth_error
 
     try:
         runtime = resolve_runtime_provider()
@@ -2083,7 +2080,7 @@ def _resolve_runtime_agent_kwargs() -> dict:
     except Exception as exc:
         raise RuntimeError(format_runtime_provider_error(exc)) from exc
 
-    model_cfg = _get_model_config()
+    model_cfg = get_model_config()
     max_tokens = None
     _env_mt = os.environ.get("HERMES_MAX_TOKENS")
     if _env_mt:
@@ -2117,7 +2114,7 @@ def _resolve_runtime_agent_kwargs() -> dict:
 
 def _resolve_runtime_agent_kwargs_for_provider(provider: str) -> dict:
     """Resolve runtime credentials for a specific provider (e.g. from channel override)."""
-    from hermes_cli.runtime_provider import (
+    from agent.runtime_provider import (
         resolve_runtime_provider,
         format_runtime_provider_error,
     )
@@ -2155,14 +2152,9 @@ def _credential_pool_for_provider(provider: Optional[str]):
 
 def _try_resolve_fallback_provider() -> dict | None:
     """Attempt to resolve credentials from the fallback_model/fallback_providers config."""
-    from hermes_cli.runtime_provider import resolve_runtime_provider
+    from agent.runtime_provider import resolve_runtime_provider
     try:
-        import yaml as _y
-        cfg_path = _hermes_home / "config.yaml"
-        if not cfg_path.exists():
-            return None
-        with open(cfg_path, encoding="utf-8") as _f:
-            cfg = _y.safe_load(_f) or {}
+        cfg = _load_gateway_config()
         fb_list = get_fallback_chain(cfg)
         if not fb_list:
             return None
@@ -2462,7 +2454,7 @@ def _check_unavailable_skill(command_name: str) -> str | None:
     normalized = command_name.lower().replace("_", "-")
     try:
         from tools.skills_tool import _get_disabled_skill_names
-        from agent.skill_utils import get_all_skills_dirs, is_excluded_skill_path
+        from hermes_runtime.skill_utils import get_all_skills_dirs, is_excluded_skill_path
         disabled = _get_disabled_skill_names()
 
         # Check disabled skills across all dirs (local + external)
@@ -2533,9 +2525,8 @@ def _gateway_config_home() -> Path:
 def _load_gateway_config() -> dict:
     """Load and parse ~/.hermes/config.yaml, returning {} on any error.
 
-    Uses the module-level ``_hermes_home`` (so tests that monkeypatch it
-    still see their fixture) and shares the mtime-keyed raw-yaml cache
-    from ``hermes_cli.config.read_raw_config`` when the paths match.
+    Uses the active profile home and the configuration authority's mtime-keyed
+    raw cache, including tests that pin ``_hermes_home`` to a fixture.
 
     Managed scope is overlaid on the result (via the shared helper) so the
     gateway honors administrator-pinned values — neither read_raw_config nor a
@@ -2544,35 +2535,18 @@ def _load_gateway_config() -> dict:
     config_home = _gateway_config_home()
     config_path = config_home / 'config.yaml'
     raw: dict = {}
-    used_canonical = False
     try:
-        from hermes_cli.config import get_config_path, read_raw_config
-        # Fast path: if _hermes_home agrees with the canonical config
-        # location, reuse the shared cache. Otherwise fall through to a
-        # direct read (keeps test fixtures with a monkeypatched
-        # _hermes_home working).
-        if config_path == get_config_path():
-            raw = read_raw_config()
-            used_canonical = True
+        raw = read_raw_config(config_path=config_path)
     except Exception:
-        pass
-
-    if not used_canonical:
-        try:
-            if config_path.exists():
-                import yaml
-                with open(config_path, 'r', encoding='utf-8') as f:
-                    raw = yaml.safe_load(f) or {}
-        except Exception:
-            logger.debug("Could not load gateway config from %s", config_path)
-            raw = {}
+        logger.debug("Could not load gateway config from %s", config_path)
+        raw = {}
 
     # Overlay managed scope. read_raw_config() returns the user's raw YAML
     # WITHOUT the managed merge (that lives in load_config/_load_config_impl),
     # so the overlay is required on both paths for the gateway to honor pinned
     # values. Helper is fail-open and a no-op when no managed scope exists.
     try:
-        from hermes_cli import managed_scope
+        from hermes_runtime import managed_scope
         raw = managed_scope.apply_managed_overlay(raw if isinstance(raw, dict) else {})
     except Exception:
         pass
@@ -2585,8 +2559,8 @@ def _load_gateway_config() -> dict:
     # gateway would resolve an empty model for ``model: {name: <id>}`` configs
     # while the CLI resolves it correctly. See issue #34500. Fail-open.
     try:
-        from hermes_cli.config import _normalize_root_model_keys
-        raw = _normalize_root_model_keys(raw)
+        from hermes_runtime.config import normalize_root_model_keys
+        raw = normalize_root_model_keys(raw)
     except Exception:
         pass
     return raw
@@ -2606,9 +2580,9 @@ def _load_gateway_runtime_config() -> dict:
     cfg = _load_gateway_config()
     if not isinstance(cfg, dict) or not cfg:
         return {}
-    from hermes_cli.config import _expand_env_vars
+    from hermes_runtime.config import expand_env_vars
 
-    expanded = _expand_env_vars(cfg)
+    expanded = expand_env_vars(cfg)
     return expanded if isinstance(expanded, dict) else {}
 
 
@@ -3076,11 +3050,11 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         # is left untouched.
         self.config = config if config is not None else load_gateway_config_for_runner()
         # Mark the process as a profile multiplexer when configured. This flips
-        # agent.secret_scope.get_secret() to fail-closed on any unscoped
+        # hermes_runtime.secret_scope.get_secret() to fail-closed on any unscoped
         # credential read, so a missed migration crashes loudly instead of
         # leaking a cross-profile value (Workstream A). Inert when off.
         try:
-            from agent.secret_scope import set_multiplex_active
+            from hermes_runtime.secret_scope import set_multiplex_active
             set_multiplex_active(bool(getattr(self.config, "multiplex_profiles", False)))
         except Exception:
             logger.debug("could not set multiplex-active flag", exc_info=True)
@@ -3326,7 +3300,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         # so operators knowingly enable tirith or configure auxiliary.approval
         # for unattended gateways.
         try:
-            from hermes_cli.config import load_config as _load_full_config
+            from hermes_runtime.config import load_config as _load_full_config
             _appr_cfg = _load_full_config()
             _appr_mode = str(
                 cfg_get(_appr_cfg, "approvals", "mode", default="manual") or "manual"
@@ -3367,7 +3341,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         # but never raised.
         if self._session_db is not None:
             try:
-                from hermes_cli.config import load_config as _load_full_config
+                from hermes_runtime.config import load_config as _load_full_config
                 _sess_cfg = (_load_full_config().get("sessions") or {})
                 if _sess_cfg.get("auto_prune", False):
                     # Construction-time, before the loop serves traffic; sync DB is fine.
@@ -3384,7 +3358,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         # checkpoint repos under ~/.hermes/checkpoints/.  Opt-in via
         # checkpoints.auto_prune, idempotent via .last_prune marker.
         try:
-            from hermes_cli.config import load_config as _load_full_config
+            from hermes_runtime.config import load_config as _load_full_config
             _ckpt_cfg = (_load_full_config().get("checkpoints") or {})
             if _ckpt_cfg.get("auto_prune", False):
                 from tools.checkpoint_manager import maybe_auto_prune_checkpoints
@@ -3624,7 +3598,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         # Push the global voice.auto_tts default (config.yaml) onto the adapter.
         # Lazy import to avoid adding a module-level dep from gateway → hermes_cli.
         try:
-            from hermes_cli.config import load_config as _load_full_config
+            from hermes_runtime.config import load_config as _load_full_config
             _full_cfg = _load_full_config()
             _auto_tts_default = bool(
                 (_full_cfg.get("voice") or {}).get("auto_tts", False)
@@ -4191,7 +4165,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         # doesn't fail with "model must be a non-empty string".
         if not model and runtime_kwargs.get("provider"):
             try:
-                from hermes_cli.models import get_default_model_for_provider
+                from agent.model_catalog import get_default_model_for_provider
                 model = get_default_model_for_provider(runtime_kwargs["provider"])
                 if model:
                     logger.info(
@@ -4237,7 +4211,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         mode, attach `request_overrides` so the API call is marked
         accordingly.
         """
-        from hermes_cli.models import resolve_fast_mode_overrides
+        from agent.model_catalog import resolve_fast_mode_overrides
 
         runtime = {
             "api_key": runtime_kwargs.get("api_key"),
@@ -5405,12 +5379,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
     def _load_provider_routing() -> dict:
         """Load OpenRouter provider routing preferences from config.yaml."""
         try:
-            import yaml as _y
-            cfg_path = _hermes_home / "config.yaml"
-            if cfg_path.exists():
-                with open(cfg_path, encoding="utf-8") as _f:
-                    cfg = _y.safe_load(_f) or {}
-                return cfg.get("provider_routing", {}) or {}
+            cfg = _load_gateway_config()
+            return cfg.get("provider_routing", {}) or {}
         except Exception:
             pass
         return {}
@@ -5424,14 +5394,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         when both keys are present.
         """
         try:
-            import yaml as _y
-            cfg_path = _hermes_home / "config.yaml"
-            if cfg_path.exists():
-                with open(cfg_path, encoding="utf-8") as _f:
-                    cfg = _y.safe_load(_f) or {}
-                fb = get_fallback_chain(cfg)
-                if fb:
-                    return fb
+            fb = get_fallback_chain(_load_gateway_config())
+            if fb:
+                return fb
         except Exception:
             pass
         return None
@@ -5451,13 +5416,11 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         that genuinely lacks the key clears the chain.
         """
         try:
-            import yaml as _y
             cfg_path = _hermes_home / "config.yaml"
             if not cfg_path.exists():
                 self._fallback_model = None
                 return self._fallback_model
-            with open(cfg_path, encoding="utf-8") as _f:
-                cfg = _y.safe_load(_f) or {}
+            cfg = read_raw_config_strict(config_path=cfg_path)
         except Exception:
             # Transient failure — keep last known-good chain.
             logger.debug(
@@ -6663,13 +6626,13 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         # that triggered the /restart command closing its console.
         if sys.platform == "win32":
             import textwrap
-            from hermes_cli._subprocess_compat import windows_detach_popen_kwargs
+            from hermes_runtime.subprocess_compat import windows_detach_popen_kwargs
 
             cmd_argv = [*hermes_cmd, "gateway", "restart"]
             watcher = textwrap.dedent(
                 """
                 import os, subprocess, sys, time
-                from hermes_cli._subprocess_compat import windows_detach_flags_without_breakaway
+                from hermes_runtime.subprocess_compat import windows_detach_flags_without_breakaway
                 pid = int(sys.argv[1])
                 restart_after_s = float(sys.argv[2])
                 cmd = sys.argv[3:]
@@ -7537,7 +7500,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         # hooks_auto_accept here would just duplicate that lookup.
         # Failures are logged but must never block gateway startup.
         try:
-            from hermes_cli.config import load_config
+            from hermes_runtime.config import load_config
             from agent.shell_hooks import register_from_config
             register_from_config(load_config(), accept_hooks=False)
         except Exception:
@@ -9971,7 +9934,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         # safe (no session) instead of leaking the sibling's. See
         # gateway/session_context.reset_session_vars + the inheritance test.
         try:
-            from gateway.session_context import reset_session_vars
+            from hermes_runtime.session_context import reset_session_vars
             reset_session_vars()
         except Exception:
             logger.debug("reset_session_vars failed at handler entry", exc_info=True)
@@ -11003,9 +10966,6 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         if canonical == "usage":
             return await self._handle_usage_command(event)
 
-        if canonical == "topup":
-            return await self._handle_topup_command(event)
-
         if canonical == "insights":
             return await self._handle_insights_command(event)
 
@@ -11087,7 +11047,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 moa_usage,
                 normalize_moa_config,
             )
-            from hermes_cli.config import load_config
+            from hermes_runtime.config import load_config
 
             moa_payload = event.get_command_args().strip()
             if not moa_payload:
@@ -11161,7 +11121,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                             output = (stdout or stderr).decode().strip()
                             # Redact any remaining sensitive patterns in output
                             if output:
-                                from agent.redact import redact_sensitive_text
+                                from hermes_runtime.redaction import redact_sensitive_text
                                 output = redact_sensitive_text(output)
                             return output if output else "Command returned no output."
                         except asyncio.TimeoutError:
@@ -11257,7 +11217,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     _skill_name = skill_cmds[cmd_key].get("name", "")
                     _plat = source.platform.value if source.platform else None
                     if _plat and _skill_name:
-                        from agent.skill_utils import get_disabled_skill_names as _get_plat_disabled
+                        from hermes_runtime.skill_utils import get_disabled_skill_names as _get_plat_disabled
                         if _skill_name in _get_plat_disabled(platform=_plat):
                             return (
                                 f"The **{_skill_name}** skill is disabled for {_plat}.\n"
@@ -11286,7 +11246,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                         # leading one above) against the same disabled list,
                         # or a skill an operator disabled for this platform
                         # still gets its full content loaded via the stack.
-                        from agent.skill_utils import get_disabled_skill_names as _get_plat_disabled
+                        from hermes_runtime.skill_utils import get_disabled_skill_names as _get_plat_disabled
                         _plat_disabled = _get_plat_disabled(platform=_plat)
                         _disabled_extra = [
                             skill_cmds.get(k, {}).get("name", "")
@@ -11806,7 +11766,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                         if _msg_raw_ctx is not None:
                             _msg_config_ctx = int(_msg_raw_ctx)
                     try:
-                        from hermes_cli.config import get_compatible_custom_providers
+                        from hermes_runtime.config import get_compatible_custom_providers
 
                         _msg_custom_providers = get_compatible_custom_providers(_msg_cfg)
                     except Exception:
@@ -11838,7 +11798,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     _msg_config_ctx = None
                 if _msg_custom_providers and _msg_base_url:
                     try:
-                        from hermes_cli.config import get_custom_provider_context_length
+                        from hermes_runtime.config import get_custom_provider_context_length
 
                         _msg_custom_ctx = get_custom_provider_context_length(
                             model=_msg_model,
@@ -12387,7 +12347,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 if _hyg_config_context_length is None and _hyg_base_url:
                     try:
                         try:
-                            from hermes_cli.config import get_compatible_custom_providers as _gw_gcp
+                            from hermes_runtime.config import get_compatible_custom_providers as _gw_gcp
                             _hyg_custom_providers = _gw_gcp(_hyg_data)
                         except Exception:
                             _hyg_custom_providers = _hyg_data.get("custom_providers")
@@ -12653,7 +12613,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                                         # Force-redact: provider exception text
                                         # may contain credentials; this message
                                         # reaches gateway users directly.
-                                        from agent.redact import redact_sensitive_text
+                                        from hermes_runtime.redaction import redact_sensitive_text
                                         _err = redact_sensitive_text(_err, force=True)
                                         _warn_msg = (
                                             "⚠️ Context compression aborted "
@@ -12760,7 +12720,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             # scope / PlatformConfig, not process os.environ.
             home_env = ""
             try:
-                from agent.secret_scope import get_secret
+                from hermes_runtime.secret_scope import get_secret
 
                 home_env = (get_secret(env_key) or "").strip() if env_key else ""
             except Exception:
@@ -13680,7 +13640,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     provider = model_cfg.get("provider") or None
                     base_url = model_cfg.get("base_url") or None
                 try:
-                    from hermes_cli.config import get_compatible_custom_providers
+                    from hermes_runtime.config import get_compatible_custom_providers
                     custom_provs = get_compatible_custom_providers(data)
                 except Exception:
                     custom_provs = data.get("custom_providers")
@@ -14032,7 +13992,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 else getattr(self.config, "goals", {}) or {}
             )
             if not goals_cfg:
-                from hermes_cli.config import load_config
+                from hermes_runtime.config import load_config
 
                 goals_cfg = (load_config() or {}).get("goals") or {}
             return int(goals_cfg.get("max_turns", 20) or 20)
@@ -15717,7 +15677,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         (e.g. a prior "Always Approve" click) without a gateway restart.
         """
         try:
-            from hermes_cli.config import load_config
+            from hermes_runtime.config import load_config
             cfg = load_config()
             return cfg if isinstance(cfg, dict) else {}
         except Exception:
@@ -16361,7 +16321,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         Returns a list of reset tokens; pass them to ``_clear_session_env``
         in a ``finally`` block.
         """
-        from gateway.session_context import set_session_vars
+        from hermes_runtime.session_context import set_session_vars
         # Propagate the adapter's async-delivery capability so async tools
         # (terminal notify_on_complete / watch_patterns, delegate_task
         # background=True) know whether this channel can wake a later turn.
@@ -16387,7 +16347,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
 
     def _clear_session_env(self, tokens: list) -> None:
         """Restore session context variables to their pre-handler values."""
-        from gateway.session_context import clear_session_vars
+        from hermes_runtime.session_context import clear_session_vars
         clear_session_vars(tokens)
 
     async def _run_in_executor_with_context(self, func, *args):
@@ -16463,7 +16423,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         try:
             from agent.image_routing import decide_image_input_mode
             from agent.auxiliary_client import _read_main_model, _read_main_provider
-            from hermes_cli.config import load_config
+            from hermes_runtime.config import load_config
 
             cfg = user_config if isinstance(user_config, dict) else load_config()
             resolved_provider = (provider or "").strip()
@@ -17139,7 +17099,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 # (#10156) — a status check must not suppress this delivery turn.
                 from tools.process_registry import format_process_notification, process_registry as _pr_check
                 if agent_notify and not _pr_check.is_completion_consumed(session_id):
-                    from agent.redact import redact_terminal_output
+                    from hermes_runtime.redaction import redact_terminal_output
                     from tools.ansi_strip import strip_ansi
                     _command = getattr(session, "command", "") or ""
                     _raw = strip_ansi(session.output_buffer) if session.output_buffer else ""
@@ -17196,7 +17156,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 if should_notify:
                     new_output = session.output_buffer[-1000:] if session.output_buffer else ""
                     if new_output:
-                        from agent.redact import redact_terminal_output
+                        from hermes_runtime.redaction import redact_terminal_output
                         new_output = redact_terminal_output(
                             new_output, getattr(session, "command", "") or ""
                         )
@@ -17226,7 +17186,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 # Skip periodic updates for agent_notify watchers (they only care about completion)
                 new_output = session.output_buffer[-500:] if session.output_buffer else ""
                 if new_output:
-                    from agent.redact import redact_terminal_output
+                    from hermes_runtime.redaction import redact_terminal_output
                     new_output = redact_terminal_output(
                         new_output, getattr(session, "command", "") or ""
                     )
@@ -19426,7 +19386,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 return
             from logging.handlers import RotatingFileHandler
 
-            from agent.redact import RedactingFormatter
+            from hermes_runtime.redaction import RedactingFormatter
 
             log_dir = _hermes_home / "logs"
             log_dir.mkdir(parents=True, exist_ok=True)
@@ -22461,7 +22421,6 @@ async def start_gateway(config: Optional[GatewayConfig] = None, replace: bool = 
             # Wait up to 10 seconds for the old process to exit.
             # ``os.kill(pid, 0)`` on Windows is NOT a no-op — use the
             # handle-based existence check instead.
-            from gateway.status import _pid_exists
             old_gateway_exited = False
             for _ in range(20):
                 if not _pid_exists(existing_pid):
@@ -22568,7 +22527,7 @@ async def start_gateway(config: Optional[GatewayConfig] = None, replace: bool = 
 
         _audit_cfg = None
         try:
-            from hermes_cli.config import read_raw_config
+            from hermes_runtime.config import read_raw_config
 
             _audit_cfg = read_raw_config()
         except Exception:
@@ -22583,7 +22542,7 @@ async def start_gateway(config: Optional[GatewayConfig] = None, replace: bool = 
     # verbosity=1    (-v):         INFO and above
     # verbosity=2+   (-vv/-vvv):   DEBUG
     if verbosity is not None:
-        from agent.redact import RedactingFormatter
+        from hermes_runtime.redaction import RedactingFormatter
 
         _stderr_level = {0: logging.WARNING, 1: logging.INFO}.get(verbosity, logging.DEBUG)
         _stderr_handler = logging.StreamHandler(_safe_stderr())
@@ -22783,13 +22742,6 @@ async def start_gateway(config: Optional[GatewayConfig] = None, replace: bool = 
     atexit.register(remove_pid_file)
     atexit.register(release_gateway_runtime_lock)
 
-    try:
-        from hermes_cli.nous_auth_keepalive import start_nous_auth_keepalive
-
-        start_nous_auth_keepalive()
-    except Exception as exc:
-        logger.debug("Nous auth keepalive did not start: %s", exc)
-
     _ensure_windows_gateway_venv_imports()
 
     # MCP tool discovery — run in an executor so the asyncio event loop
@@ -22886,13 +22838,6 @@ async def start_gateway(config: Optional[GatewayConfig] = None, replace: bool = 
     # Wait for shutdown
     await runner.wait_for_shutdown()
 
-    try:
-        from hermes_cli.nous_auth_keepalive import stop_nous_auth_keepalive
-
-        stop_nous_auth_keepalive()
-    except Exception:
-        pass
-
     if runner.should_exit_with_failure:
         if runner.exit_reason:
             logger.error("Gateway exiting with failure: %s", runner.exit_reason)
@@ -22964,10 +22909,27 @@ async def start_gateway(config: Optional[GatewayConfig] = None, replace: bool = 
 
 def main():
     """CLI entry point for the gateway."""
-    # Force UTF-8 stdio on Windows — gateway logs and startup banner would
-    # otherwise UnicodeEncodeError on cp1252 consoles.  No-op on POSIX.
+    # Force UTF-8 stdio before anything prints.
+    #
+    # ``ensure_utf8_stdio`` is the repair that used to run as an import-time
+    # side effect of ``hermes_cli`` — which meant any ``from hermes_cli...``
+    # import anywhere in agent/, tools/, gateway/ or plugins/ could replace
+    # this process's ``sys.stdout``/``sys.stderr`` and write
+    # PYTHONUTF8/PYTHONIOENCODING into the environment every subprocess
+    # inherits.  It now belongs to process entry points such as this one.
+    # It is idempotent, no-ops when the streams are already UTF-8, and
+    # covers the legacy POSIX locales ``configure_windows_stdio`` does not
+    # (that one is Windows-only: gateway logs and the startup banner would
+    # otherwise UnicodeEncodeError on cp1252 consoles).
+    #
+    # Both come from ``hermes_cli.stdio`` in a single import statement on
+    # purpose: ``tests/architecture/test_dependency_direction.py`` ratchets
+    # the number of deferred cross-package imports, and adding a second
+    # statement here would (correctly) register as new coupling for what is
+    # really one concern.
     try:
-        from hermes_cli.stdio import configure_windows_stdio
+        from hermes_cli.stdio import configure_windows_stdio, ensure_utf8_stdio
+        ensure_utf8_stdio()
         configure_windows_stdio()
     except Exception:
         pass

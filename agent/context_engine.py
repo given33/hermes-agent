@@ -28,7 +28,7 @@ Lifecycle:
 from abc import ABC, abstractmethod
 from typing import Any, Dict, List, Optional
 
-from agent.redact import redact_sensitive_text
+from hermes_runtime.redaction import redact_sensitive_text
 
 
 MEMORY_CONTEXT_MAX_CHARS = 6_000

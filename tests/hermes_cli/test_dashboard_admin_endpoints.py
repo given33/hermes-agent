@@ -86,8 +86,8 @@ class TestMcpEndpoints:
         assert "bearer_token" not in response.json()
 
         hermes_home = get_hermes_home()
-        config_text = (hermes_home / "config.yaml").read_text()
-        env_text = (hermes_home / ".env").read_text()
+        config_text = (hermes_home / "config.yaml").read_text(encoding="utf-8")
+        env_text = (hermes_home / ".env").read_text(encoding="utf-8")
         assert secret not in config_text
         assert "Bearer ${MCP_BEARER_SERVER_API_KEY}" in config_text
         assert f"MCP_BEARER_SERVER_API_KEY={secret}" in env_text
@@ -677,12 +677,9 @@ class TestPortalEndpoint:
     def _setup(self, _isolate_hermes_home):
         self.client, _ = _client()
 
-    def test_status_shape(self):
+    def test_nous_account_surface_is_not_registered(self):
         r = self.client.get("/api/portal")
-        assert r.status_code == 200
-        body = r.json()
-        assert {"logged_in", "features", "subscription_url", "provider"} <= set(body)
-        assert isinstance(body["features"], list)
+        assert r.status_code == 404
 
 
 class TestSessionManagementEndpoints:

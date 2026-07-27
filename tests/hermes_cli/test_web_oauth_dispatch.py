@@ -107,31 +107,13 @@ def test_minimax_login_does_not_launch_anthropic_flow():
     assert body["expires_in"] == 600
 
 
-def test_nous_dashboard_device_flow_ignores_legacy_scope_override(monkeypatch):
-    from hermes_cli import auth as auth_mod
-    from hermes_cli import web_server as ws
+def test_nous_account_is_absent_from_dashboard_oauth():
+    listed = client.get("/api/providers/oauth", headers=HEADERS)
+    assert listed.status_code == 200
+    assert "nous" not in {row["id"] for row in listed.json()["providers"]}
 
-    requested_scopes = []
-
-    def fake_request_device_code(**kwargs):
-        requested_scopes.append(kwargs["scope"])
-        return _fake_nous_device_data()
-
-    monkeypatch.setenv("HERMES_AGENT_USE_LEGACY_SESSION_KEYS", "true")
-    monkeypatch.setattr(auth_mod, "_request_device_code", fake_request_device_code)
-    monkeypatch.setattr(ws, "_nous_poller", lambda sid: None)
-
-    result = asyncio.run(ws._start_device_code_flow("nous"))
-    try:
-        assert requested_scopes == [auth_mod.DEFAULT_NOUS_SCOPE]
-        assert result["flow"] == "device_code"
-        assert result["user_code"] == "NOUS-1234"
-        assert (
-            ws._oauth_sessions[result["session_id"]]["scope"]
-            == auth_mod.DEFAULT_NOUS_SCOPE
-        )
-    finally:
-        ws._oauth_sessions.pop(result["session_id"], None)
+    started = client.post("/api/providers/oauth/nous/start", headers=HEADERS)
+    assert started.status_code == 400
 
 
 def test_oauth_provider_status_uses_profile_query(tmp_path, monkeypatch):
@@ -195,23 +177,13 @@ def test_oauth_start_stores_profile_for_background_completion(tmp_path, monkeypa
         ws._oauth_sessions.pop(session_id, None)
 
 
-def test_nous_dashboard_device_flow_does_not_retry_legacy_scope_on_invoke_refusal(monkeypatch):
-    from hermes_cli import auth as auth_mod
+def test_nous_device_flow_helper_rejects_removed_account_login():
     from hermes_cli import web_server as ws
 
-    requested_scopes = []
-
-    def fake_request_device_code(**kwargs):
-        requested_scopes.append(kwargs["scope"])
-        raise _invoke_scope_refusal()
-
-    monkeypatch.delenv("HERMES_AGENT_USE_LEGACY_SESSION_KEYS", raising=False)
-    monkeypatch.setattr(auth_mod, "_request_device_code", fake_request_device_code)
-    monkeypatch.setattr(ws, "_nous_poller", lambda sid: None)
-
-    with pytest.raises(httpx.HTTPStatusError):
+    with pytest.raises(ws.HTTPException) as exc_info:
         asyncio.run(ws._start_device_code_flow("nous"))
-    assert requested_scopes == [auth_mod.DEFAULT_NOUS_SCOPE]
+    assert exc_info.value.status_code == 400
+    assert "NOUS_API_KEY" in str(exc_info.value.detail)
 
 
 def test_codex_dashboard_worker_persists_runtime_provider(tmp_path, monkeypatch):
@@ -789,17 +761,24 @@ def test_status_falls_through_to_generic_dispatcher_for_catalog_only_provider():
     assert out["has_refresh_token"] is True
 
 
-def test_status_hardcoded_branch_wins_over_generic_fallback():
-    """An existing hardcoded branch (nous) is unaffected by the fallthrough."""
+def test_nous_status_uses_generic_direct_api_key_fallback():
+    """Nous has no account-specific status branch after Portal removal."""
     import hermes_cli.web_server as ws
 
     with patch(
-        "hermes_cli.auth.get_nous_auth_status",
-        return_value={"logged_in": True, "portal_base_url": "https://portal.test"},
+        "hermes_cli.auth.get_auth_status",
+        return_value={
+            "logged_in": True,
+            "provider": "nous",
+            "name": "Nous API",
+            "source": "env",
+            "access_token": "sk-direct-secret",
+        },
     ):
         out = ws._resolve_provider_status("nous", None)
-    assert out["source"] == "nous_portal"
-    assert out["source_label"] == "https://portal.test"
+    assert out["source"] == "env"
+    assert out["source_label"] == "Nous API"
+    assert "sk-direct-secret" not in str(out["token_preview"])
 
 
 def test_status_unknown_provider_degrades_to_logged_out():

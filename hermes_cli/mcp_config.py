@@ -15,7 +15,7 @@ import re
 import time
 from typing import Any, Dict, List, Optional, Tuple
 
-from hermes_cli.config import (
+from hermes_runtime.config import (
     cfg_get,
     load_config,
     save_config,
@@ -23,9 +23,9 @@ from hermes_cli.config import (
     save_env_value,
     get_hermes_home,  # noqa: F401 — used by test mocks
 )
-from hermes_cli.colors import Colors, color
+from hermes_runtime.colors import Colors, color
 from hermes_constants import display_hermes_home
-from hermes_cli.mcp_security import validate_mcp_server_entry
+from hermes_runtime.mcp_security import validate_mcp_server_entry
 from tools.mcp_tool import _ENV_VAR_PATTERN, _env_ref_name
 
 logger = logging.getLogger(__name__)
@@ -69,7 +69,7 @@ def _confirm(question: str, default: bool = True) -> bool:
 
 
 def _prompt(question: str, *, password: bool = False, default: str = "") -> str:
-    from hermes_cli.cli_output import prompt as _shared_prompt
+    from hermes_runtime.console_output import prompt as _shared_prompt
     return _shared_prompt(question, default=default, password=password)
 
 
@@ -264,7 +264,7 @@ def _resolve_mcp_server_config(config: dict) -> dict:
     """
     from tools.mcp_tool import _interpolate_env_vars
 
-    from agent.secret_scope import current_secret_scope
+    from hermes_runtime.secret_scope import current_secret_scope
 
     if current_secret_scope() is None:
         try:

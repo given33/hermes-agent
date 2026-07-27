@@ -7,6 +7,7 @@ import os
 import shutil
 import stat
 import tempfile
+import time
 from pathlib import Path
 from typing import Any, Union
 from urllib.parse import urlparse
@@ -111,9 +112,27 @@ def atomic_replace(tmp_path: Union[str, Path], target: Union[str, Path]) -> str:
     target_str = str(target)
     real_path = os.path.realpath(target_str) if os.path.islink(target_str) else target_str
     tmp_str = str(tmp_path)
-    try:
-        os.replace(tmp_str, real_path)
-    except OSError as exc:
+    replace_error: OSError | None = None
+    for attempt in range(6):
+        try:
+            os.replace(tmp_str, real_path)
+            replace_error = None
+            break
+        except OSError as exc:
+            replace_error = exc
+            transient_windows_conflict = (
+                os.name == "nt"
+                and (
+                    exc.errno in {errno.EACCES, errno.EPERM}
+                    or getattr(exc, "winerror", None) in {5, 32, 33}
+                )
+            )
+            if not transient_windows_conflict or attempt == 5:
+                break
+            time.sleep(0.005 * (2**attempt))
+
+    if replace_error is not None:
+        exc = replace_error
         if exc.errno not in (errno.EXDEV, errno.EBUSY):
             raise
         logger.debug(
@@ -208,6 +227,66 @@ def atomic_json_write(
         raise
 
 
+def write_secret_file(
+    path: Union[str, Path],
+    text: str,
+    *,
+    mode: int = 0o600,
+    encoding: str = "utf-8",
+) -> None:
+    """Atomically write *text* to *path* with owner-only permissions.
+
+    The TOCTOU-safe primitive for secret-bearing plain-text files (.env
+    files, API-key profiles, generated passwords).  ``path.write_text(...)``
+    creates the file with the process umask (usually world-readable) and a
+    later ``chmod`` leaves a window where the secret is already on disk with
+    loose permissions — and a crash between the two calls makes that state
+    permanent.  Here the temp file is born 0o600 (``mkstemp``), pinned to
+    *mode* via ``fchmod`` **before** any secret byte is written, fsynced,
+    and atomically swapped into place, so the secret is never observable
+    with looser permissions than *mode*.
+
+    Mirrors :func:`atomic_json_write` (symlink-preserving replace, owner
+    preservation, crash-safe temp cleanup); only the payload differs.
+    """
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+
+    original_owner = _preserve_file_owner(path)
+
+    fd, tmp_path = tempfile.mkstemp(
+        dir=str(path.parent),
+        prefix=f".{path.stem}_",
+        suffix=".tmp",
+    )
+    try:
+        if hasattr(os, "fchmod"):
+            # fchmod is Unix-only; Windows' os module has no fchmod. Skipping it
+            # here is safe — mkstemp already created the temp file as 0o600, and
+            # the post-replace os.chmod below applies the final mode durably.
+            os.fchmod(fd, mode)
+        with os.fdopen(fd, "w", encoding=encoding) as f:
+            f.write(text)
+            f.flush()
+            os.fsync(f.fileno())
+        # Preserve symlinks — swap in-place on the real file (GitHub #16743).
+        real_path = atomic_replace(tmp_path, path)
+        real_path_obj = Path(real_path)
+        _restore_file_owner(real_path_obj, original_owner)
+        try:
+            os.chmod(real_path_obj, mode)
+        except OSError:
+            pass
+    except BaseException:
+        # Intentionally catch BaseException so temp-file cleanup still runs for
+        # KeyboardInterrupt/SystemExit before re-raising the original signal.
+        try:
+            os.unlink(tmp_path)
+        except OSError:
+            pass
+        raise
+
+
 class IndentDumper(yaml.SafeDumper):
     """PyYAML dumper that indents list items under mapping keys (2-space).
 
@@ -230,6 +309,7 @@ def atomic_yaml_write(
     *,
     default_flow_style: bool = False,
     sort_keys: bool = False,
+    mode: int | None = None,
     extra_content: str | None = None,
 ) -> None:
     """Write YAML data to a file atomically.
@@ -243,13 +323,18 @@ def atomic_yaml_write(
         data: YAML-serializable data to write.
         default_flow_style: YAML flow style (default False).
         sort_keys: Whether to sort dict keys (default False).
+        mode: Optional final permission mode. When set, the temp file is
+            created and replaced with this mode, avoiding chmod-after-write
+            TOCTOU exposure for secret-bearing files (matches
+            atomic_json_write). When None the target's existing mode is
+            preserved, as before.
         extra_content: Optional string to append after the YAML dump
             (e.g. commented-out sections for user reference).
     """
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
 
-    original_mode = _preserve_file_mode(path)
+    original_mode = None if mode is not None else _preserve_file_mode(path)
     original_owner = _preserve_file_owner(path)
 
     fd, tmp_path = tempfile.mkstemp(
@@ -258,6 +343,11 @@ def atomic_yaml_write(
         suffix=".tmp",
     )
     try:
+        if mode is not None and hasattr(os, "fchmod"):
+            # fchmod is Unix-only; Windows' os module has no fchmod. Skipping it
+            # here is safe — mkstemp already created the temp file as 0o600, and
+            # the post-replace os.chmod below applies the final mode durably.
+            os.fchmod(fd, mode)
         with os.fdopen(fd, "w", encoding="utf-8") as f:
             # allow_unicode=True writes emoji/kaomoji (e.g. personalities, skin
             # cursors) as real UTF-8 instead of fragile escape sequences. Without
@@ -282,7 +372,13 @@ def atomic_yaml_write(
         real_path = atomic_replace(tmp_path, path)
         real_path_obj = Path(real_path)
         _restore_file_owner(real_path_obj, original_owner)
-        _restore_file_mode(real_path_obj, original_mode)
+        if mode is not None:
+            try:
+                os.chmod(real_path_obj, mode)
+            except OSError:
+                pass
+        else:
+            _restore_file_mode(real_path_obj, original_mode)
     except BaseException:
         # Match atomic_json_write: cleanup must also happen for process-level
         # interruptions before we re-raise them.

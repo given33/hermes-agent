@@ -31,7 +31,7 @@ def _redact_telegram_error_text(error: object) -> str:
     if not text:
         return text
     try:
-        from agent.redact import redact_sensitive_text
+        from hermes_runtime.redaction import redact_sensitive_text
 
         return redact_sensitive_text(text, force=True)
     except Exception:
@@ -3136,7 +3136,13 @@ class TelegramAdapter(BasePlatformAdapter):
         thread_id: int,
         replace_existing: bool = False,
     ) -> None:
-        """Save a newly created thread_id back into config.yaml so it persists across restarts."""
+        """Save a newly created thread_id back into config.yaml so it persists across restarts.
+
+        Uses ``mutate_config`` so the whole read→mutate→write runs under the
+        cross-process config lock: the gateway (/reasoning, /fast), dashboard
+        and CLI write the same file, and the old bare safe_load + write here
+        silently dropped whichever keys the concurrent writer had just saved.
+        """
         try:
             from hermes_constants import get_hermes_home
             config_path = get_hermes_home() / "config.yaml"
@@ -3144,58 +3150,60 @@ class TelegramAdapter(BasePlatformAdapter):
                 logger.warning("[%s] Config file not found at %s, cannot persist thread_id", self.name, config_path)
                 return
 
-            import yaml as _yaml
-            with open(config_path, "r", encoding="utf-8") as f:
-                config = _yaml.safe_load(f) or {}
+            def _write_thread_id(config: dict):
+                # Navigate to platforms.telegram.extra.dm_topics, creating the
+                # path when a named delivery target asks us to create a topic
+                # that was not predeclared in config.yaml. Runs on the CURRENT
+                # on-disk document (re-read under the lock), so decisions here
+                # must not rely on any earlier read.
+                platforms = config.setdefault("platforms", {})
+                telegram_config = platforms.setdefault("telegram", {})
+                extra = telegram_config.setdefault("extra", {})
+                dm_topics = extra.setdefault("dm_topics", [])
 
-            # Navigate to platforms.telegram.extra.dm_topics, creating the path
-            # when a named delivery target asks us to create a topic that was
-            # not predeclared in config.yaml.
-            platforms = config.setdefault("platforms", {})
-            telegram_config = platforms.setdefault("telegram", {})
-            extra = telegram_config.setdefault("extra", {})
-            dm_topics = extra.setdefault("dm_topics", [])
+                changed = False
+                matching_chat_entry = None
+                for chat_entry in dm_topics:
+                    try:
+                        chat_matches = int(chat_entry.get("chat_id", 0)) == int(chat_id)
+                    except (TypeError, ValueError):
+                        chat_matches = False
+                    if not chat_matches:
+                        continue
+                    matching_chat_entry = chat_entry
+                    for t in chat_entry.setdefault("topics", []):
+                        if t.get("name") == topic_name:
+                            if replace_existing or not t.get("thread_id"):
+                                if t.get("thread_id") != thread_id:
+                                    t["thread_id"] = thread_id
+                                    changed = True
+                            break
+                    else:
+                        chat_entry.setdefault("topics", []).append(
+                            {"name": topic_name, "thread_id": thread_id}
+                        )
+                        changed = True
+                    break
 
-            changed = False
-            matching_chat_entry = None
-            for chat_entry in dm_topics:
-                try:
-                    chat_matches = int(chat_entry.get("chat_id", 0)) == int(chat_id)
-                except (TypeError, ValueError):
-                    chat_matches = False
-                if not chat_matches:
-                    continue
-                matching_chat_entry = chat_entry
-                for t in chat_entry.setdefault("topics", []):
-                    if t.get("name") == topic_name:
-                        if replace_existing or not t.get("thread_id"):
-                            if t.get("thread_id") != thread_id:
-                                t["thread_id"] = thread_id
-                                changed = True
-                        break
-                else:
-                    chat_entry.setdefault("topics", []).append(
-                        {"name": topic_name, "thread_id": thread_id}
-                    )
+                if matching_chat_entry is None:
+                    dm_topics.append({
+                        "chat_id": chat_id,
+                        "topics": [{"name": topic_name, "thread_id": thread_id}],
+                    })
                     changed = True
-                break
 
-            if matching_chat_entry is None:
-                dm_topics.append({
-                    "chat_id": chat_id,
-                    "topics": [{"name": topic_name, "thread_id": thread_id}],
-                })
-                changed = True
+                # None → mutate_config skips the write ("nothing changed").
+                return config if changed else None
 
-            if changed:
-                from hermes_cli.config import atomic_config_write
+            from hermes_runtime.config import mutate_config
 
-                atomic_config_write(
-                    config_path,
-                    config,
-                    default_flow_style=False,
-                    sort_keys=False,
-                )
+            written = mutate_config(
+                _write_thread_id,
+                config_path=config_path,
+                default_flow_style=False,
+                sort_keys=False,
+            )
+            if written is not None:
                 logger.info(
                     "[%s] Persisted thread_id=%s for topic '%s' in config.yaml",
                     self.name, thread_id, topic_name,
@@ -5416,7 +5424,7 @@ class TelegramAdapter(BasePlatformAdapter):
         so all surfaces stay consistent.
         """
         try:
-            from hermes_cli.models import group_providers
+            from agent.model_catalog import group_providers
         except Exception:
             group_providers = None
 
@@ -5773,7 +5781,7 @@ class TelegramAdapter(BasePlatformAdapter):
             # --- Provider group selected: show member providers ---
             group_id = data[4:]
             try:
-                from hermes_cli.models import PROVIDER_GROUPS
+                from agent.model_catalog import PROVIDER_GROUPS
                 _label, _desc, member_slugs = PROVIDER_GROUPS.get(group_id, ("", "", []))
             except Exception:
                 _label, member_slugs = "", []
@@ -8772,9 +8780,11 @@ class TelegramAdapter(BasePlatformAdapter):
             if not config_path.exists():
                 return
 
-            import yaml as _yaml
-            with open(config_path, "r", encoding="utf-8") as f:
-                config = _yaml.safe_load(f) or {}
+            # Shared raw reader (mtime-cached, lock-guarded) instead of a bare
+            # yaml.safe_load — raw semantics are correct here because this
+            # mirrors what _persist_dm_topic_thread_id writes to disk.
+            from hermes_runtime.config import read_raw_config
+            config = read_raw_config(config_path)
 
             dm_topics = (
                 config.get("platforms", {})

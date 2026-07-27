@@ -72,7 +72,7 @@ except ModuleNotFoundError as exc:
     LOCAL_OWNER_ID = runtime_library.LOCAL_OWNER_ID
     owner_id_from_request = runtime_library.owner_id_from_request
     parse_date_filter = runtime_library.parse_date_filter
-from hermes_cli.config import get_hermes_home
+from hermes_runtime.config import get_hermes_home
 from hermes_cli.profiles import list_profiles
 
 
@@ -2531,6 +2531,118 @@ def collaboration_execution_order(profiles: list[str]) -> list[str]:
     return [*supervisors, *workers, *reviewers, reporter]
 
 
+# Execution node per hosted member Profile; the parity contract exposes it so
+# native clients can label where each team member actually runs.
+_HOSTED_MEMBER_NODES = {
+    _DBB3_MANAGER_PROFILE: "dbb3",
+    "dbb3-worker": "dbb3",
+    "pc-worker": "wsl",
+    "reviewer": "dbb3",
+    "supervisor": "dbb3",
+    "default": "main",
+}
+_HOSTED_MEMBER_DISPLAY_NAMES = {
+    _DBB3_MANAGER_PROFILE: _HERMES_MANAGER_LABEL,
+    "dbb3-worker": "DBB3 执行员",
+    "pc-worker": "PC/WSL 执行员",
+    "reviewer": "Hermes 审阅员",
+    "supervisor": _HERMES_SUPERVISOR_LABEL,
+    "default": "Hermes 汇报员",
+}
+
+
+def hosted_member_role(profile: str, role_stage: str = "") -> str:
+    """Roster role of one hosted member: manager/worker/reviewer/reporter/supervisor."""
+
+    normalized = str(profile or "").strip().lower()
+    if normalized in {_DBB3_MANAGER_PROFILE, "dispatcher", "manager"}:
+        return "manager"
+    base_stage = str(role_stage or "").strip().lower().split(":", 1)[0].split(".", 1)[0]
+    if base_stage.startswith("manager") or base_stage in {"dispatch", "workflow"}:
+        return "manager"
+    if base_stage in {"worker", "reviewer", "supervisor", "reporter"}:
+        return base_stage
+    return collaboration_role(normalized)
+
+
+def hosted_member_id(profile: str, role_stage: str = "") -> str:
+    """Canonical member id; every manager/dispatcher alias collapses to dbb3-manager."""
+
+    if hosted_member_role(profile, role_stage) == "manager":
+        return _DBB3_MANAGER_PROFILE
+    return str(profile or "").strip() or "default"
+
+
+def hosted_participant_descriptor(
+    profile: str,
+    *,
+    role_stage: str = "",
+    node: str = "",
+) -> dict[str, Any]:
+    """Stable identity card one team member contributes to the group-chat roster."""
+
+    member_id = hosted_member_id(profile, role_stage)
+    return {
+        "id": member_id,
+        "role": hosted_member_role(member_id, role_stage),
+        "display_name": _HOSTED_MEMBER_DISPLAY_NAMES.get(member_id, member_id),
+        "node": str(node or "").strip() or _HOSTED_MEMBER_NODES.get(member_id, "main"),
+        "avatar_seed": f"hermes-member-{member_id}",
+    }
+
+
+def _merge_hosted_participants(run: dict[str, Any], members: Any) -> bool:
+    """Append newly dispatched members; identity fields stay write-once."""
+
+    participants = run.get("participants")
+    if not isinstance(participants, list):
+        participants = []
+        run["participants"] = participants
+    by_id = {
+        str(item.get("id") or ""): item
+        for item in participants
+        if isinstance(item, dict)
+    }
+    changed = False
+    now = int(time.time() * 1000)
+    for member in members if isinstance(members, list) else []:
+        if not isinstance(member, dict):
+            continue
+        member_id = str(member.get("id") or "").strip()
+        if not member_id:
+            continue
+        existing = by_id.get(member_id)
+        if existing is None:
+            entry = {**member, "joined_at": int(member.get("joined_at") or now)}
+            participants.append(entry)
+            by_id[member_id] = entry
+            changed = True
+            continue
+        for key, value in member.items():
+            if key == "joined_at" or value in (None, ""):
+                continue
+            if not existing.get(key):
+                existing[key] = value
+                changed = True
+    return changed
+
+
+def _conversation_participants(conversation: dict[str, Any]) -> list[dict[str, Any]]:
+    """Union of hosted team members across turns; the first identity wins."""
+
+    merged: dict[str, dict[str, Any]] = {}
+    for run in (conversation.get("hosted_turns") or {}).values():
+        if not isinstance(run, dict):
+            continue
+        for member in run.get("participants") or []:
+            if not isinstance(member, dict):
+                continue
+            member_id = str(member.get("id") or "")
+            if member_id and member_id not in merged:
+                merged[member_id] = dict(member)
+    return list(merged.values())
+
+
 def hosted_progress_protocol(role_name: str) -> str:
     """Static user-visible progress contract shared by every hosted role."""
 
@@ -3693,10 +3805,10 @@ def _profile_runtime_readiness(
 ) -> dict[str, Any]:
     """Resolve the same credential path used by the hosted child process."""
 
-    from hermes_cli.config import load_config
+    from hermes_runtime.config import load_config
     from hermes_cli.moa_config import resolve_moa_preset
     from hermes_cli.profiles import resolve_profile_env
-    from hermes_cli.runtime_provider import resolve_runtime_provider
+    from agent.runtime_provider import resolve_runtime_provider
     from hermes_constants import reset_hermes_home_override, set_hermes_home_override
 
     token = set_hermes_home_override(resolve_profile_env(profile))
@@ -5162,8 +5274,10 @@ def _persist_hosted_role_state(
             else f"{role_stage}.{phase}"
         )
         message_key = f"{turn_id}:{role_stage}:{phase}"
+    member_id = hosted_member_id(profile, role_stage)
     snapshot = {
         "profile": profile,
+        "member_id": member_id,
         "content": content,
         "status": state_status,
         "activities": activities,
@@ -5184,6 +5298,12 @@ def _persist_hosted_role_state(
         "updated_at": now,
     }
     patch = {"role_events": {role_stage: snapshot}}
+    if base_stage != "chat":
+        # Every hosted role joins the durable roster with its first persisted
+        # stage event, so clients never hardcode the team composition.
+        patch["participants"] = [
+            hosted_participant_descriptor(profile, role_stage=role_stage)
+        ]
     if snapshot["request_accepted"]:
         patch["request_accepted"] = True
         patch["request_accepted_at"] = now
@@ -5200,6 +5320,7 @@ def _persist_hosted_role_state(
             "message_key": message_key,
             "role_label": role_label,
             "profile": profile,
+            "member_id": member_id,
             "handoff_to": handoff_to,
             "started_at": snapshot["started_at"],
             "first_token_at": snapshot["first_token_at"] or None,
@@ -6284,6 +6405,7 @@ def create_hosted_turn_record(
         "interventions": [],
         "active_roles": {},
         "supervisor_checks": {},
+        "participants": [],
         "created_at": now,
         "updated_at": now,
     }
@@ -6781,6 +6903,8 @@ def _persist_hosted_turn(
                         role_events = {}
                         run["role_events"] = role_events
                     role_events.update(value)
+                elif key == "participants" and isinstance(value, list):
+                    _merge_hosted_participants(run, value)
                 else:
                     run[key] = value
         run["updated_at"] = now
@@ -8214,7 +8338,12 @@ def execute_hosted_workflow(
         _persist_hosted_turn(
             conversation_id,
             turn_id,
-            patch={"stage": "manager_planning"},
+            patch={
+                "stage": "manager_planning",
+                "participants": [
+                    hosted_participant_descriptor(_DBB3_MANAGER_PROFILE)
+                ],
+            },
             message={
                 "role": "assistant",
                 "name": _DBB3_MANAGER_PROFILE,
@@ -8425,7 +8554,18 @@ def execute_hosted_workflow(
     _persist_hosted_turn(
         conversation_id,
         turn_id,
-        patch={"stage": "worker_running"},
+        patch={
+            "stage": "worker_running",
+            # Dispatch is the authoritative join point: the manager and every
+            # dispatched worker become first-class roster members here.
+            "participants": [
+                hosted_participant_descriptor(_DBB3_MANAGER_PROFILE),
+                *(
+                    hosted_participant_descriptor(profile, role_stage="worker")
+                    for profile in worker_profiles
+                ),
+            ],
+        },
         message={
             "role": "assistant",
             "name": reporter_profile,
@@ -8615,6 +8755,13 @@ def execute_hosted_workflow(
             "worker_results": dict(worker_results),
             "worker_statuses": dict(worker_statuses),
             "stage": "reviewing",
+            "participants": [
+                hosted_participant_descriptor(
+                    reviewer_profile,
+                    role_stage="reviewer",
+                    node="wsl" if reviewer_connector_id == "pc-primary" else "dbb3",
+                ),
+            ],
         },
     )
     if _finish_hosted_turn_if_cancelled(conversation_id, turn_id):
@@ -9205,7 +9352,15 @@ def execute_hosted_workflow(
         _persist_hosted_turn(
             conversation_id,
             turn_id,
-            patch={"stage": "reporting"},
+            patch={
+                "stage": "reporting",
+                "participants": [
+                    hosted_participant_descriptor(
+                        reporter_profile,
+                        role_stage="reporter",
+                    ),
+                ],
+            },
         )
         reporter_result, reporter_status, _reporter_state = _run_hosted_role(
             conversation_id,
@@ -9790,6 +9945,9 @@ def _public_conversation(conversation: dict[str, Any]) -> dict[str, Any]:
     projected["hosted_turns"] = _public_hosted_turns(
         conversation.get("hosted_turns")
     )
+    # Conversation-level roster so clients render the team without scanning
+    # every hosted turn. Additive; per-turn participants stay authoritative.
+    projected["participants"] = _conversation_participants(conversation)
     return projected
 
 
@@ -9929,6 +10087,16 @@ def _project_native_message(message: dict[str, Any]) -> dict[str, Any]:
         or message.get("name")
         or profile
     )
+    member_id = str(meta.get("member_id") or "")
+    if not member_id:
+        # Hosted stage events attribute to a canonical roster member; plain
+        # chat/user/system messages keep their sender identity unchanged.
+        member_id = (
+            hosted_member_id(profile, stage)
+            if canonical_role != "user"
+            and logical_role in {"dispatcher", "worker", "reviewer", "reporter", "supervisor"}
+            else sender_id
+        )
     model_display = " · ".join(item for item in (provider, model) if item)
     copy_context = {
         "version": 1,
@@ -9937,6 +10105,7 @@ def _project_native_message(message: dict[str, Any]) -> dict[str, Any]:
             "name": sender_name,
             "role": logical_role,
             "profile": profile,
+            "member_id": member_id,
         },
         "model": {
             "provider": provider,
@@ -9960,6 +10129,7 @@ def _project_native_message(message: dict[str, Any]) -> dict[str, Any]:
         {
             "sender_id": sender_id,
             "sender_name": sender_name,
+            "member_id": member_id,
             # Keep the canonical chat role (assistant/user/system) intact;
             # native clients read the participant role from sender_role.
             "role": canonical_role,
@@ -12982,11 +13152,11 @@ def _profile_event_runner_main() -> int:
 
         os.environ["HERMES_YOLO_MODE"] = "1"
         os.environ["HERMES_ACCEPT_HOOKS"] = "1"
-        from hermes_cli.config import load_config
+        from hermes_runtime.config import load_config
         from hermes_cli.env_loader import load_hermes_dotenv
         from hermes_cli.fallback_config import get_fallback_chain
-        from hermes_cli.runtime_provider import resolve_runtime_provider
-        from gateway.session_context import declare_stateless_channel
+        from agent.runtime_provider import resolve_runtime_provider
+        from hermes_runtime.session_context import declare_stateless_channel
         from hermes_state import SessionDB
         from run_agent import AIAgent
 
@@ -13919,6 +14089,14 @@ class MobileWriteApprovalDecisionBody(BaseModel):
     profile: str = "default"
     expected_revision: int = Field(gt=0)
     decision: str
+    # Digest of the payload the client actually rendered to the approver.
+    # Binds "what the human saw" to "what will execute": the stored
+    # ``summary`` is agent-controlled free text held in a different column
+    # from ``payload``, so without this the server cannot tell an honest
+    # approval from one harvested by pairing a harmless summary with a
+    # hostile payload. Optional for older clients; enforce with
+    # HERMES_WRITE_APPROVAL_REQUIRE_DIGEST=1.
+    payload_digest: str | None = Field(default=None, max_length=128)
 
 
 class MobileHostedRetryBody(BaseModel):
@@ -14616,7 +14794,10 @@ def mobile_decide_write_approval(
     request: Request,
     idempotency_key: str | None = Header(default=None, alias="Idempotency-Key"),
 ):
-    from hermes_cli.account_write_approvals import ApprovalConflict
+    from hermes_cli.account_write_approvals import (
+        ApprovalConflict,
+        ApprovalPayloadMismatch,
+    )
 
     owner_id = owner_id_from_request(request)
     normalized, _home, store = _mobile_approval_store(body.profile)
@@ -14632,7 +14813,13 @@ def mobile_decide_write_approval(
                 str(idempotency_key or "").strip()
                 or f"mobile:{approval_id}:{body.decision}:{body.expected_revision}"
             ),
+            payload_digest=body.payload_digest,
         )
+    except ApprovalPayloadMismatch as exc:
+        # Distinct from a plain revision conflict: the caller approved
+        # different bytes than the ones on file, so the client should
+        # re-fetch and re-display rather than blindly retry.
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
     except ApprovalConflict as exc:
         raise HTTPException(status_code=409, detail=str(exc)) from exc
     except ValueError as exc:
@@ -14734,6 +14921,50 @@ def mobile_runtime_runs(
         conversations=conversations,
         limit=limit,
     )
+
+
+class MobileConsoleCommandBody(BaseModel):
+    line: str
+    profile: str = "default"
+    confirmed: bool = False
+
+
+@router.get("/mobile/console/commands")
+def mobile_console_commands(request: Request, profile: str = "default"):
+    """Return the server-owned command catalog available to Hermes iOS."""
+
+    from hermes_cli.mobile_console import mobile_console_catalog
+
+    owner_id_from_request(request)
+    normalized, _home = _mobile_profile_home(profile)
+    return {"profile": normalized, "commands": mobile_console_catalog()}
+
+
+@router.post("/mobile/console/execute")
+def mobile_console_execute(
+    body: MobileConsoleCommandBody,
+    request: Request,
+):
+    """Execute one bounded command inside the authenticated Profile scope."""
+
+    from hermes_cli.mobile_console import execute_mobile_console_command
+
+    owner_id_from_request(request)
+    normalized, _home = _mobile_profile_home(body.profile)
+    if len(body.line.encode("utf-8")) > 4096:
+        raise HTTPException(status_code=413, detail="Console command is too large")
+    result = execute_mobile_console_command(
+        body.line,
+        confirmed=body.confirmed,
+        profile=normalized,
+    )
+    return {
+        "profile": normalized,
+        "status": result.status,
+        "output": result.output,
+        "command": result.command,
+        "confirmation_message": result.confirmation_message,
+    }
 
 
 @router.get("/mobile/runtime-runs/{run_id}")

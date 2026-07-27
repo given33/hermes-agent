@@ -171,7 +171,7 @@ def _profile_author() -> str:
 
 def _load_config() -> dict:
     try:
-        from hermes_cli.config import load_config
+        from hermes_runtime.config import load_config
         return load_config() or {}
     except Exception:
         return {}

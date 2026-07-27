@@ -109,6 +109,8 @@ from datetime import datetime
 from typing import Any, Coroutine, Dict, List, Optional
 from urllib.parse import urlparse
 
+from hermes_runtime import process_probe
+
 logger = logging.getLogger(__name__)
 
 # Upper bound for the OSV malware preflight during stdio MCP startup. The
@@ -2444,7 +2446,6 @@ class MCPServerTask:
             # on Linux, where setsid() children escape the parent cgroup).
             # Mark them as orphans so the next cleanup sweep can reap them.
             if new_pids:
-                from gateway.status import _pid_exists
                 _killpg = getattr(os, "killpg", None)
                 with _lock:
                     for _pid in new_pids:
@@ -2452,7 +2453,7 @@ class MCPServerTask:
                     for pid in new_pids:
                         # ``os.kill(pid, 0)`` is NOT a no-op on Windows
                         # (bpo-14484). Use the cross-platform check.
-                        pid_alive = _pid_exists(pid)
+                        pid_alive = process_probe.pid_exists(pid)
                         pgroup_alive = False
                         pgid = _stdio_pgids.get(pid)
                         if not pid_alive and pgid is not None and _killpg is not None:
@@ -4053,7 +4054,7 @@ def _interpolate_env_vars(value):
     which may hold another profile's), falling back to ``os.environ``
     otherwise. Unset vars keep the literal placeholder, as before.
     """
-    from agent.secret_scope import get_secret as _get_secret
+    from hermes_runtime.secret_scope import get_secret as _get_secret
 
     if isinstance(value, str):
         def _replace(m):
@@ -4070,7 +4071,7 @@ def _interpolate_env_vars(value):
 def _filter_suspicious_mcp_servers(servers: Dict[str, dict]) -> Dict[str, dict]:
     """Drop exfiltration-shaped MCP configs before any stdio spawn path."""
     try:
-        from hermes_cli.mcp_security import validate_mcp_server_entry as _validate_mcp_server_entry
+        from hermes_runtime.mcp_security import validate_mcp_server_entry as _validate_mcp_server_entry
     except Exception:
         _validate_mcp_server_entry: Callable[[str, dict[str, Any]], list[str]] | None = None
 
@@ -4106,7 +4107,7 @@ def _load_mcp_config() -> Dict[str, dict]:
     ``os.environ`` (which includes ``~/.hermes/.env`` loaded at startup).
     """
     try:
-        from hermes_cli.config import load_config
+        from hermes_runtime.config import load_config
         from utils import env_var_enabled as _env_enabled
 
         if _env_enabled("HERMES_SAFE_MODE"):
@@ -6144,9 +6145,8 @@ def _kill_orphaned_mcp_children(
     _sigkill = getattr(_signal, "SIGKILL", _signal.SIGTERM)
     # ``os.kill(pid, 0)`` is NOT a no-op on Windows. Use the cross-platform
     # existence check before escalating to SIGKILL.
-    from gateway.status import _pid_exists
     for pid, server_name in pids.items():
-        if not _pid_exists(pid):
+        if not process_probe.pid_exists(pid):
             continue  # Good — exited after SIGTERM
         _send_signal(pid, _sigkill, server_name)
         logger.warning(

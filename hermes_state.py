@@ -25,9 +25,8 @@ import threading
 import time
 from pathlib import Path
 
-from agent.memory_manager import sanitize_context
-from agent.message_sanitization import _sanitize_surrogates
 from hermes_constants import get_hermes_home
+from hermes_runtime.text_safety import sanitize_surrogates, strip_internal_memory_context
 from typing import Any, Callable, Dict, List, Optional, Tuple, TypeVar
 
 logger = logging.getLogger(__name__)
@@ -41,7 +40,7 @@ def _scrub_surrogates(value: Any) -> Any:
     such code point anywhere in a message aborts the whole write. No-op for
     well-formed text.
     """
-    return _sanitize_surrogates(value) if isinstance(value, str) else value
+    return sanitize_surrogates(value) if isinstance(value, str) else value
 
 
 def workspace_key(row: Dict[str, Any]) -> Optional[str]:
@@ -3306,7 +3305,7 @@ class SessionDB:
 
         # Lone surrogates cannot be bound by sqlite3 (UnicodeEncodeError at
         # UTF-8 encode time) — scrub them like every other write path here.
-        title = _sanitize_surrogates(title)
+        title = sanitize_surrogates(title)
 
         # Remove ASCII control characters (0x00-0x1F, 0x7F) but keep
         # whitespace chars (\t=0x09, \n=0x0A, \r=0x0D) so they can be
@@ -3928,7 +3927,7 @@ class SessionDB:
                     ) AS last_active
                 FROM sessions s
                 {where_sql}
-                ORDER BY s.started_at DESC
+                ORDER BY s.started_at DESC, s.id DESC
                 LIMIT ? OFFSET ?
             """
             params.extend([limit, offset])
@@ -4124,7 +4123,7 @@ class SessionDB:
             # land. Left raw, sqlite3 raises UnicodeEncodeError, the flush is
             # abandoned, and the session silently stops persisting for the
             # rest of its life. Scrub so persistence never fails.
-            return _sanitize_surrogates(content)
+            return sanitize_surrogates(content)
         if content is None or isinstance(content, (bytes, int, float)):
             return content
         try:
@@ -4133,7 +4132,7 @@ class SessionDB:
             return cls._CONTENT_JSON_PREFIX + json.dumps(content)
         except (TypeError, ValueError):
             # Last-resort fallback: stringify so persistence never fails.
-            return _sanitize_surrogates(str(content))
+            return sanitize_surrogates(str(content))
 
     @classmethod
     def _decode_content(cls, content: Any) -> Any:
@@ -4925,7 +4924,7 @@ class SessionDB:
         for row in rows:
             content = self._decode_content(row["content"])
             if row["role"] in {"user", "assistant"} and isinstance(content, str):
-                content = sanitize_context(content).strip()
+                content = strip_internal_memory_context(content).strip()
             msg = {"role": row["role"], "content": content}
             # api_content is the byte-fidelity sidecar: the exact string sent
             # to the API when it differed from the clean content. Returned

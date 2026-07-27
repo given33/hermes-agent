@@ -902,7 +902,7 @@ def test_load_pool_persists_bitwarden_origin_metadata_without_secret(tmp_path, m
     monkeypatch.setenv("HERMES_HOME", str(tmp_path / "hermes"))
     monkeypatch.setenv("OPENROUTER_API_KEY", sentinel)
     monkeypatch.setattr(
-        "hermes_cli.env_loader.get_secret_source",
+        "hermes_runtime.secret_provenance.get_secret_source",
         lambda env_var: "bitwarden" if env_var == "OPENROUTER_API_KEY" else None,
     )
     _write_auth_store(tmp_path, {"version": 1, "providers": {}})
@@ -1323,7 +1323,7 @@ def test_load_pool_missing_env_does_not_overwrite_other_process_seed(tmp_path, m
     assert persisted[0]["source"] == "env:MINIMAX_API_KEY"
 
 
-def test_load_pool_migrates_nous_provider_state(tmp_path, monkeypatch):
+def test_load_pool_does_not_migrate_legacy_nous_provider_state(tmp_path, monkeypatch):
     monkeypatch.setenv("HERMES_HOME", str(tmp_path / "hermes"))
     _write_auth_store(
         tmp_path,
@@ -1350,16 +1350,13 @@ def test_load_pool_migrates_nous_provider_state(tmp_path, monkeypatch):
     from agent.credential_pool import load_pool
 
     pool = load_pool("nous")
-    entry = pool.select()
-
-    assert entry is not None
-    assert entry.source == "device_code"
-    assert entry.portal_base_url == "https://portal.example.com"
-    assert entry.agent_key == "agent-key"
+    assert pool.select() is None
+    assert pool.has_credentials() is False
 
 
-def test_load_pool_mirrors_nous_invoke_jwt_agent_key_runtime_api_key(tmp_path, monkeypatch):
+def test_load_pool_prefers_direct_nous_api_key_over_legacy_portal_state(tmp_path, monkeypatch):
     monkeypatch.setenv("HERMES_HOME", str(tmp_path / "hermes"))
+    monkeypatch.setenv("NOUS_API_KEY", "direct-nous-key")
     expires_at = datetime.fromtimestamp(time.time() + 3600, tz=timezone.utc).isoformat()
     token = _jwt_with_claims({
         "sub": "test-user",
@@ -1394,14 +1391,14 @@ def test_load_pool_mirrors_nous_invoke_jwt_agent_key_runtime_api_key(tmp_path, m
     entry = pool.select()
 
     assert entry is not None
-    assert entry.source == "device_code"
-    assert entry.agent_key == token
-    assert entry.runtime_api_key == token
+    assert entry.source == "env:NOUS_API_KEY"
+    assert entry.auth_type == "api_key"
+    assert entry.runtime_api_key == "direct-nous-key"
 
     auth_payload = json.loads((tmp_path / "hermes" / "auth.json").read_text())
     pool_entry = auth_payload["credential_pool"]["nous"][0]
-    assert pool_entry["agent_key"] == token
-    assert pool_entry["agent_key_expires_at"] == expires_at
+    assert pool_entry["source"] == "env:NOUS_API_KEY"
+    assert pool_entry.get("access_token") != "direct-nous-key"
 
 
 def test_nous_runtime_api_key_rejects_opaque_agent_key():
@@ -1427,6 +1424,7 @@ def test_nous_runtime_api_key_rejects_opaque_agent_key():
     assert entry.runtime_api_key == ""
 
 
+@pytest.mark.skip(reason="Nous Portal OAuth was removed; direct API-key isolation is covered above")
 def test_nous_pool_terminal_refresh_removes_device_code_entry(tmp_path, monkeypatch):
     monkeypatch.setenv("HERMES_HOME", str(tmp_path / "hermes"))
     monkeypatch.setenv("HERMES_SHARED_AUTH_DIR", str(tmp_path / "shared"))
@@ -1600,6 +1598,7 @@ def test_load_pool_removes_stale_file_backed_singleton_entry(tmp_path, monkeypat
     assert auth_payload["credential_pool"]["anthropic"] == []
 
 
+@pytest.mark.skip(reason="Nous Portal OAuth was removed; legacy singleton state must not migrate")
 def test_load_pool_migrates_nous_provider_state_preserves_tls(tmp_path, monkeypatch):
     monkeypatch.setenv("HERMES_HOME", str(tmp_path / "hermes"))
     _write_auth_store(
@@ -2424,6 +2423,7 @@ def test_load_pool_does_not_seed_qwen_oauth_when_no_token(tmp_path, monkeypatch)
     assert pool.entries() == []
 
 
+@pytest.mark.skip(reason="Nous Portal OAuth singleton seeding was removed")
 def test_nous_seed_from_singletons_preserves_obtained_at_timestamps(tmp_path, monkeypatch):
     """Regression test for #15099 secondary issue.
 
@@ -2525,6 +2525,7 @@ class TestLeastUsedStrategy:
 
 # ── PR #10160 salvage: Nous OAuth cross-process sync tests ─────────────────
 
+@pytest.mark.skip(reason="Nous Portal OAuth auth-store synchronization was removed")
 def test_sync_nous_entry_from_auth_store_adopts_newer_tokens(tmp_path, monkeypatch):
     """When auth.json has a newer refresh token, the pool entry should adopt it."""
     monkeypatch.setenv("HERMES_HOME", str(tmp_path / "hermes"))
@@ -2587,6 +2588,7 @@ def test_sync_nous_entry_from_auth_store_adopts_newer_tokens(tmp_path, monkeypat
     assert synced.agent_key == "agent-key-NEW"
     assert synced.agent_key_expires_at == "2026-03-24T14:00:00+00:00"
 
+@pytest.mark.skip(reason="Nous Portal OAuth auth-store synchronization was removed")
 def test_sync_nous_entry_noop_when_tokens_match(tmp_path, monkeypatch):
     """When auth.json has the same refresh token, sync should be a no-op."""
     monkeypatch.setenv("HERMES_HOME", str(tmp_path / "hermes"))
@@ -2621,6 +2623,7 @@ def test_sync_nous_entry_noop_when_tokens_match(tmp_path, monkeypatch):
     synced = pool._sync_nous_entry_from_auth_store(entry)
     assert synced is entry
 
+@pytest.mark.skip(reason="Nous Portal OAuth recovery was removed")
 def test_nous_exhausted_entry_recovers_via_auth_store_sync(tmp_path, monkeypatch):
     """An exhausted Nous entry should recover when auth.json has newer tokens."""
     monkeypatch.setenv("HERMES_HOME", str(tmp_path / "hermes"))

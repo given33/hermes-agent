@@ -13,7 +13,7 @@ from pydantic import BaseModel, Field
 
 from hermes_cli.account_cleanup import purge_account_owned_cloud_data
 from hermes_cli.cloud_file_library import owner_id_from_request
-from hermes_cli.config import get_hermes_home
+from hermes_runtime.config import get_hermes_home
 from hermes_cli.dashboard_auth.mobile_device_store import MobileDeviceStore
 from hermes_cli.dashboard_auth.owner_mobile import delete_owner_account_credentials
 from hermes_cli.dashboard_auth.mobile_notifications import process_account_deletion_outbox

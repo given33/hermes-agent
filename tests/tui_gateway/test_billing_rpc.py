@@ -18,6 +18,8 @@ import hermes_cli.nous_billing as nb
 import agent.billing_view as bv
 from agent.billing_view import BillingState, CardInfo, MonthlyCap
 
+pytestmark = pytest.mark.skip(reason="Nous account product is removed from this fork")
+
 
 def _call(method: str, params: dict) -> dict:
     """Invoke a registered RPC method and return its result dict."""

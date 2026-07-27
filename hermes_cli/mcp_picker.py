@@ -22,8 +22,8 @@ import sys
 from dataclasses import dataclass
 from typing import List, Optional
 
-from hermes_cli.colors import Colors, color
-from hermes_cli.cli_output import prompt_yes_no
+from hermes_runtime.colors import Colors, color
+from hermes_runtime.console_output import prompt_yes_no
 from hermes_cli.curses_ui import curses_single_select
 from hermes_cli.mcp_catalog import (
     CatalogEntry,
@@ -36,7 +36,7 @@ from hermes_cli.mcp_catalog import (
     installed_servers,
     uninstall_entry,
 )
-from hermes_cli.config import load_config, save_config
+from hermes_runtime.config import load_config, save_config
 
 
 # ─── Status badges ────────────────────────────────────────────────────────────

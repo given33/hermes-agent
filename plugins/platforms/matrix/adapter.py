@@ -4596,8 +4596,8 @@ def interactive_setup() -> None:
     and the static _PLATFORMS["matrix"] dict. CLI helpers are lazy-imported."""
     import shutil
     import sys as _sys
-    from hermes_cli.config import get_env_value, save_env_value
-    from hermes_cli.cli_output import (
+    from hermes_runtime.config import get_env_value, save_env_value
+    from hermes_runtime.console_output import (
         prompt,
         prompt_yes_no,
         print_header,

@@ -648,15 +648,16 @@ _apply_profile_override()
 
 # Load .env from ~/.hermes/.env first, then project root as dev fallback.
 # User-managed env files should override stale shell exports on restart.
-from hermes_cli.config import get_hermes_home
+from hermes_runtime.config import get_hermes_home
+from hermes_runtime.process_probe import pid_exists as _pid_exists
 from hermes_cli.env_loader import load_hermes_dotenv
 
 load_hermes_dotenv(project_env=PROJECT_ROOT / ".env")
 
 # Bridge security.redact_secrets from config.yaml → HERMES_REDACT_SECRETS env
-# var BEFORE hermes_logging imports agent.redact (which snapshots the flag at
+# var BEFORE hermes_logging imports hermes_runtime.redaction (which snapshots the flag at
 # module-import time). Without this, config.yaml's toggle is ignored because
-# the setup_logging() call below imports agent.redact, which reads the env var
+# the setup_logging() call below imports hermes_runtime.redaction, which reads the env var
 # exactly once. Env var in .env still wins — this is config.yaml fallback only.
 #
 # We also read network.force_ipv4 from the same yaml load to avoid two
@@ -678,7 +679,7 @@ try:
         # without the overlay a managed redact_secrets toggle would be ignored.
         # Fail-open via the shared helper.
         try:
-            from hermes_cli import managed_scope
+            from hermes_runtime import managed_scope
             _early_cfg_raw = managed_scope.apply_managed_overlay(_early_cfg_raw)
         except Exception:
             pass
@@ -918,14 +919,14 @@ def _relative_time(ts) -> str:
 
 def _has_any_provider_configured() -> bool:
     """Check if at least one inference provider is usable."""
-    from hermes_cli.config import get_env_path, get_hermes_home, load_config
+    from hermes_runtime.config import get_env_path, get_hermes_home, load_config
     from hermes_cli.auth import get_auth_status
 
     # Determine whether Hermes itself has been explicitly configured (model
     # in config that isn't the hardcoded default). Used below to gate external
     # tool credentials (Claude Code, Codex CLI) that shouldn't silently skip
     # the setup wizard on a fresh install.
-    from hermes_cli.config import DEFAULT_CONFIG
+    from hermes_runtime.config import DEFAULT_CONFIG
 
     _DEFAULT_MODEL = DEFAULT_CONFIG.get("model", "")
     cfg = load_config()
@@ -2188,7 +2189,7 @@ def _launch_tui(
 
     env = os.environ.copy()
     try:
-        from hermes_cli.config import apply_terminal_config_to_env
+        from hermes_runtime.config import apply_terminal_config_to_env
         apply_terminal_config_to_env(env=env)
     except Exception:
         logger.debug("Failed to apply terminal config bridge for TUI launch", exc_info=True)
@@ -2402,7 +2403,7 @@ def _resolve_use_tui(args) -> bool:
     if os.environ.get("HERMES_TUI") == "1":
         return True
     try:
-        from hermes_cli.config import load_config
+        from hermes_runtime.config import load_config
 
         iface = (load_config().get("display", {}) or {}).get("interface", "cli")
         return isinstance(iface, str) and iface.strip().lower() == "tui"
@@ -2479,7 +2480,7 @@ def cmd_chat(args):
             find_retired_xai_refs,
             format_issue,
         )
-        from hermes_cli.config import load_config as _load_config_for_xai_check
+        from hermes_runtime.config import load_config as _load_config_for_xai_check
 
         _retired_xai_refs = find_retired_xai_refs(_load_config_for_xai_check())
         if _retired_xai_refs:
@@ -2645,7 +2646,7 @@ def cmd_proxy(args):
 def cmd_whatsapp(args):
     """Set up WhatsApp: choose mode, configure, install bridge, pair via QR."""
     _require_tty("whatsapp")
-    from hermes_cli.config import get_env_value, save_env_value
+    from hermes_runtime.config import get_env_value, save_env_value
     from hermes_constants import find_node_executable, with_hermes_node_path
 
     print()
@@ -2903,7 +2904,7 @@ def cmd_setup(args):
 
 def cmd_postinstall(args):
     """One-shot bootstrap for pip users: install non-Python deps + run setup."""
-    from hermes_cli.config import stamp_install_method
+    from hermes_runtime.config import stamp_install_method
     from hermes_cli.dep_ensure import ensure_dependency
 
     stamp_install_method("pip")
@@ -2963,7 +2964,7 @@ def select_provider_and_model(args=None):
         AuthError,
         format_auth_error,
     )
-    from hermes_cli.config import (
+    from hermes_runtime.config import (
         get_compatible_custom_providers,
         load_config,
         get_env_value,
@@ -2988,7 +2989,7 @@ def select_provider_and_model(args=None):
     )
     compatible_custom_providers = get_compatible_custom_providers(config)
     def _named_custom_provider_map(cfg) -> dict[str, dict[str, str]]:
-        from hermes_cli.config import read_raw_config
+        from hermes_runtime.config import read_raw_config
 
         # Build lookups of raw (un-expanded) templates keyed by a
         # stable identity. We intentionally bypass
@@ -3311,7 +3312,7 @@ def select_provider_and_model(args=None):
     elif selected_provider == "moa":
         _model_flow_moa(config, current_model)
     elif selected_provider == "nous":
-        _model_flow_nous(config, current_model, args=args)
+        _model_flow_api_key_provider(config, "nous", current_model)
     elif selected_provider == "openai-codex":
         _model_flow_openai_codex(config, current_model)
     elif selected_provider == "xai-oauth":
@@ -3396,7 +3397,7 @@ def _clear_stale_openai_base_url():
     requests to the old custom endpoint instead of the newly selected
     provider.  See issue #5161.
     """
-    from hermes_cli.config import get_env_value, save_env_value, load_config
+    from hermes_runtime.config import get_env_value, save_env_value, load_config
 
     cfg = load_config()
     model_cfg = cfg.get("model", {})
@@ -3501,7 +3502,7 @@ def _save_aux_choice(
     other task-specific settings are preserved untouched. The main model
     config (``model.default``/``model.provider``) is never modified.
     """
-    from hermes_cli.config import load_config, save_config
+    from hermes_runtime.config import load_config, save_config
 
     cfg = load_config()
     aux = cfg.setdefault("auxiliary", {})
@@ -3525,7 +3526,7 @@ def _reset_aux_to_auto() -> int:
     Includes plugin-registered tasks (via ``_all_aux_tasks``) so a plugin
     that contributed an auxiliary task gets reset alongside built-ins.
     """
-    from hermes_cli.config import load_config, save_config
+    from hermes_runtime.config import load_config, save_config
 
     cfg = load_config()
     aux = cfg.setdefault("auxiliary", {})
@@ -3559,7 +3560,7 @@ def _aux_config_menu() -> None:
     Loops until the user picks "Back" so multiple tasks can be configured
     without returning to the main provider menu.
     """
-    from hermes_cli.config import load_config
+    from hermes_runtime.config import load_config
 
     while True:
         cfg = load_config()
@@ -3621,7 +3622,7 @@ def _aux_select_for_task(task: str) -> None:
     inside the aux picker — users set up new providers through the normal
     ``hermes model`` flow, then route aux tasks to them here.
     """
-    from hermes_cli.config import load_config
+    from hermes_runtime.config import load_config
     from hermes_cli.model_switch import list_authenticated_providers
 
     cfg = load_config()
@@ -3747,7 +3748,7 @@ def _aux_flow_provider_model(
 
 def _aux_flow_custom_endpoint(task: str, task_cfg: dict) -> None:
     """Prompt for a direct OpenAI-compatible base_url + optional api_key/model."""
-    from hermes_cli.secret_prompt import masked_secret_prompt
+    from hermes_runtime.secret_prompt import masked_secret_prompt
 
     display_name = next((name for key, name, _ in _all_aux_tasks() if key == task), task)
     current_base_url = str(task_cfg.get("base_url") or "").strip()
@@ -3973,7 +3974,7 @@ def _save_custom_provider(
     model name, context_length, and api_mode but doesn't add a duplicate entry.
     Uses *name* when provided, otherwise auto-generates from the URL.
     """
-    from hermes_cli.config import load_config, save_config
+    from hermes_runtime.config import load_config, save_config
 
     cfg = load_config()
     providers = cfg.get("custom_providers") or []
@@ -4032,7 +4033,7 @@ def _save_custom_provider(
 
 def _remove_custom_provider(config):
     """Let the user remove a saved custom provider from config.yaml."""
-    from hermes_cli.config import load_config, save_config
+    from hermes_runtime.config import load_config, save_config
 
     cfg = load_config()
     providers = cfg.get("custom_providers") or []
@@ -4224,8 +4225,8 @@ def _prompt_api_key(pconfig, existing_key: str, provider_id: str = "") -> tuple:
     cleared the key and is now unconfigured.
     """
     from hermes_cli.auth import LMSTUDIO_NOAUTH_PLACEHOLDER
-    from hermes_cli.config import save_env_value
-    from hermes_cli.secret_prompt import masked_secret_prompt
+    from hermes_runtime.config import save_env_value
+    from hermes_runtime.secret_prompt import masked_secret_prompt
 
     key_env = pconfig.api_key_env_vars[0] if pconfig.api_key_env_vars else ""
 
@@ -4333,7 +4334,7 @@ def _run_anthropic_oauth_flow(save_env_value):
         read_claude_code_credentials,
         is_claude_code_token_valid,
     )
-    from hermes_cli.config import (
+    from hermes_runtime.config import (
         save_anthropic_oauth_token,
         use_anthropic_claude_code_credentials,
     )
@@ -4373,7 +4374,7 @@ def _run_anthropic_oauth_flow(save_env_value):
         print()
         print("  If the setup-token was displayed above, paste it here:")
         print()
-        from hermes_cli.secret_prompt import masked_secret_prompt
+        from hermes_runtime.secret_prompt import masked_secret_prompt
 
         try:
             manual_token = masked_secret_prompt(
@@ -4404,7 +4405,7 @@ def _run_anthropic_oauth_flow(save_env_value):
         print()
         print("  Or paste an existing setup-token now (sk-ant-oat-...):")
         print()
-        from hermes_cli.secret_prompt import masked_secret_prompt
+        from hermes_runtime.secret_prompt import masked_secret_prompt
 
         try:
             token = masked_secret_prompt("  Setup-token (or Enter to cancel): ").strip()
@@ -4551,7 +4552,7 @@ def cmd_debug(args):
 
 def cmd_config(args):
     """Configuration management."""
-    from hermes_cli.config import config_command
+    from hermes_cli.config_commands import config_command
 
     config_command(args)
 
@@ -4576,7 +4577,7 @@ def cmd_import(args):
 
 
 def _print_version_info(*, check_updates: bool = True) -> None:
-    from hermes_cli.config import detect_install_method
+    from hermes_runtime.config import detect_install_method
     from hermes_cli.banner import format_banner_version_label
 
     print(format_banner_version_label())
@@ -4605,7 +4606,7 @@ def _print_version_info(*, check_updates: bool = True) -> None:
     # Show update status (synchronous — acceptable since user asked for version info)
     try:
         from hermes_cli.banner import check_for_updates
-        from hermes_cli.config import recommended_update_command
+        from hermes_runtime.config import recommended_update_command
 
         behind = check_for_updates()
         if behind and behind > 0:
@@ -5805,7 +5806,7 @@ def _desktop_launch_options() -> tuple[list[str], str]:
     flags: list[str] = []
     disable_gpu = "auto"
     try:
-        from hermes_cli.config import load_config
+        from hermes_runtime.config import load_config
 
         desktop_cfg = (load_config() or {}).get("desktop") or {}
     except Exception:
@@ -6115,7 +6116,7 @@ def _find_stale_dashboard_pids(
             # CREATE_NO_WINDOW hides the conhost flash: this scan can run from
             # the windowless pythonw.exe desktop/gateway backend during an
             # update, where a bare wmic spawn would pop a console window.
-            from hermes_cli._subprocess_compat import windows_hide_flags
+            from hermes_runtime.subprocess_compat import windows_hide_flags
 
             result = subprocess.run(
                 ["wmic", "process", "get", "ProcessId,CommandLine", "/FORMAT:LIST"],
@@ -6397,7 +6398,6 @@ def _kill_stale_dashboard_processes(
             still_pending = []
             # On Windows, os.kill(pid, 0) is NOT a no-op. Route through
             # the cross-platform existence check.
-            from gateway.status import _pid_exists
             for pid in pending:
                 if _pid_exists(pid):
                     still_pending.append(pid)
@@ -8732,7 +8732,7 @@ def _install_hangup_protection(gateway_mode: bool = False):
     try:
         # Late-bound import so tests can monkeypatch
         # hermes_cli.config.get_hermes_home to simulate setup failure.
-        from hermes_cli.config import get_hermes_home as _get_hermes_home
+        from hermes_runtime.config import get_hermes_home as _get_hermes_home
 
         logs_dir = _get_hermes_home() / "logs"
         logs_dir.mkdir(parents=True, exist_ok=True)
@@ -8847,7 +8847,7 @@ def _cmd_update_check(branch: str = "main", *, branch_explicit: bool = False):
     on a PyPI install we surface a one-line notice instead of silently
     dropping the flag.
     """
-    from hermes_cli.config import (
+    from hermes_runtime.config import (
         detect_install_method,
         format_unsupported_install_warning,
         is_unsupported_install_method,
@@ -8860,11 +8860,11 @@ def _cmd_update_check(branch: str = "main", *, branch_explicit: bool = False):
         # same long-form ``docker pull`` guidance ``hermes update`` (apply
         # path) uses — telling the user to "reinstall via curl" or that
         # ".git is missing" would point them at the wrong remediation.
-        from hermes_cli.config import format_docker_update_message
+        from hermes_runtime.config import format_docker_update_message
         print(format_docker_update_message())
         sys.exit(1)
     if method == "pip":
-        from hermes_cli.config import recommended_update_command
+        from hermes_runtime.config import recommended_update_command
         from hermes_cli.banner import check_via_pypi
         if branch_explicit and branch != "main":
             print(f"⚠ --branch is ignored for PyPI installs (would have checked '{branch}').")
@@ -8985,7 +8985,7 @@ def _cmd_update_check(branch: str = "main", *, branch_explicit: bool = False):
             print("✓ Already up to date.")
         else:
             print(f"⚕ Update available (behind {compare_branch}).")
-            from hermes_cli.config import recommended_update_command
+            from hermes_runtime.config import recommended_update_command
 
             print(f"  Run '{recommended_update_command()}' to install.")
         return
@@ -9004,7 +9004,7 @@ def _cmd_update_check(branch: str = "main", *, branch_explicit: bool = False):
     else:
         commits_word = "commit" if behind == 1 else "commits"
         print(f"⚕ Update available: {behind} {commits_word} behind {compare_branch}.")
-        from hermes_cli.config import recommended_update_command
+        from hermes_runtime.config import recommended_update_command
 
         print(f"  Run '{recommended_update_command()}' to install.")
 
@@ -9124,7 +9124,7 @@ def _resolve_pre_update_backup_mode(args) -> str:
         return "full"
 
     try:
-        from hermes_cli.config import load_config
+        from hermes_runtime.config import load_config
 
         cfg = load_config()
     except Exception as exc:
@@ -9215,7 +9215,7 @@ def _run_pre_update_backup(args) -> Optional[str]:
         return snapshot_id
 
     try:
-        from hermes_cli.config import load_config
+        from hermes_runtime.config import load_config
 
         _keep = (load_config() or {}).get("updates", {}).get("backup_keep", 5)
     except Exception:
@@ -9301,8 +9301,6 @@ def _wait_for_windows_update_gateway_exit(
     """Wait for the given gateway PIDs to exit, returning survivors."""
     if not pids:
         return set()
-
-    from gateway.status import _pid_exists
 
     remaining = set(pids)
     deadline = _time.monotonic() + max(timeout, 0.0)
@@ -9805,7 +9803,7 @@ def cmd_update(args):
     runs the update, then restores stdio on the way out (even on
     ``sys.exit`` or unhandled exceptions).
     """
-    from hermes_cli.config import (
+    from hermes_runtime.config import (
         detect_install_method,
         format_docker_update_message,
         format_unsupported_install_warning,
@@ -9862,7 +9860,7 @@ def cmd_update(args):
 def _cmd_update_pip(args):
     """Update Hermes via pip (for PyPI installs)."""
     from hermes_cli import __version__
-    from hermes_cli.config import is_uv_tool_install
+    from hermes_runtime.config import is_uv_tool_install
 
     print(f"→ Current version: {__version__}")
     print("→ Checking PyPI for updates...")
@@ -9944,7 +9942,7 @@ def _cmd_update_impl(args, gateway_mode: bool):
     discard_local_changes = False
     if _non_interactive_update:
         try:
-            from hermes_cli.config import load_config
+            from hermes_runtime.config import load_config
 
             _update_cfg = (load_config() or {}).get("updates", {})
             if isinstance(_update_cfg, dict):
@@ -10011,7 +10009,7 @@ def _cmd_update_impl(args, gateway_mode: bool):
         if sys.platform == "win32":
             use_zip_update = True
         else:
-            from hermes_cli.config import detect_install_method
+            from hermes_runtime.config import detect_install_method
             method = detect_install_method(PROJECT_ROOT)
             if method == "pip":
                 _cmd_update_pip(args)
@@ -10621,7 +10619,7 @@ def _cmd_update_impl(args, gateway_mode: bool):
         print()
         print("→ Checking configuration for new options...")
 
-        from hermes_cli.config import (
+        from hermes_runtime.config import (
             get_missing_env_vars,
             get_missing_config_fields,
             check_config_version,
@@ -10805,7 +10803,7 @@ def _cmd_update_impl(args, gateway_mode: bool):
         try:
             refresh_cua_driver = True
             try:
-                from hermes_cli.config import load_config
+                from hermes_runtime.config import load_config
 
                 _update_cfg = (load_config() or {}).get("updates", {})
                 if isinstance(_update_cfg, dict):
@@ -11022,7 +11020,7 @@ def _cmd_update_impl(args, gateway_mode: bool):
                 _DEFAULT_DRAIN = 60.0
             _cfg_drain = None
             try:
-                from hermes_cli.config import load_config
+                from hermes_runtime.config import load_config
 
                 _cfg_agent = load_config().get("agent") or {}
                 _cfg_drain = _cfg_agent.get("restart_drain_timeout")
@@ -12356,8 +12354,7 @@ def _maybe_setup_dashboard_auth_interactively(args) -> None:
     the June 2026 hardening), and ``start_server`` fails closed when no
     ``DashboardAuthProvider`` is registered. Rather than greet an interactive
     operator with that hard error, prompt them to set up the bundled
-    username/password provider on the spot — or point them at
-    ``hermes dashboard register`` for OAuth.
+    username/password provider on the spot.
 
     No-ops (so the existing fail-closed ``SystemExit`` remains the backstop)
     when:
@@ -12398,8 +12395,7 @@ def _maybe_setup_dashboard_auth_interactively(args) -> None:
     print()
     print("  How do you want to authenticate the dashboard?")
     print("    [1] Username & password (quickest; for a trusted LAN / VPN)")
-    print("    [2] OAuth via Nous Portal (run `hermes dashboard register`)")
-    print("    [3] Cancel")
+    print("    [2] Cancel")
     print()
 
     try:
@@ -12407,19 +12403,6 @@ def _maybe_setup_dashboard_auth_interactively(args) -> None:
     except (EOFError, KeyboardInterrupt):
         print("\n  Cancelled.")
         sys.exit(1)
-
-    if choice == "2":
-        print()
-        print(
-            "  Run this on the host where the dashboard lives, then start "
-            "the dashboard again:\n"
-            "    hermes dashboard register\n"
-            "  It provisions a Nous Portal OAuth client and writes "
-            "HERMES_DASHBOARD_OAUTH_CLIENT_ID into ~/.hermes/.env for you.\n"
-            "  Docs: https://hermes-agent.nousresearch.com/docs/"
-            "user-guide/features/web-dashboard#authentication-gated-mode"
-        )
-        sys.exit(0)
 
     if choice not in ("1",):
         print("  Cancelled.")
@@ -12456,7 +12439,7 @@ def _maybe_setup_dashboard_auth_interactively(args) -> None:
     secret = secrets.token_urlsafe(32)
 
     try:
-        from hermes_cli.config import load_config, save_config
+        from hermes_runtime.config import load_config, save_config
         from hermes_cli.plugins_cmd import ensure_basic_auth_plugin_enabled_in_config
 
         cfg = load_config()
@@ -12651,7 +12634,7 @@ def cmd_dashboard(args):
     # (#63141, #54449, #61115, #65696). PTY chat spawns already bridge their
     # child env copy; this covers the in-process consumers.
     try:
-        from hermes_cli.config import apply_terminal_config_to_env
+        from hermes_runtime.config import apply_terminal_config_to_env
 
         apply_terminal_config_to_env()
     except Exception:
@@ -12851,7 +12834,7 @@ _BUILTIN_SUBCOMMANDS = frozenset(
         "dump", "fallback", "gateway", "hooks", "import", "insights",
         "gui", "desktop", "kanban", "login", "logout", "logs", "lsp", "mcp", "memory", "migrate", "moa",
         "journey", "memory-graph", "learning",
-        "model", "pairing", "pets", "plugins", "portal", "postinstall", "profile",
+        "model", "pairing", "pets", "plugins", "postinstall", "profile",
         "project", "proxy",
         "prompt-size",
         "send", "sessions", "setup",
@@ -13042,7 +13025,7 @@ def _prepare_agent_startup(args) -> None:
                 exc_info=True,
             )
     try:
-        from hermes_cli.config import load_config
+        from hermes_runtime.config import load_config
         from agent.shell_hooks import register_from_config
 
         register_from_config(load_config(), accept_hooks=_accept_hooks)
@@ -13190,7 +13173,7 @@ def _try_termux_fast_tui_launch() -> bool:
 def cmd_memory(args):
     sub = getattr(args, "memory_command", None)
     if sub == "off":
-        from hermes_cli.config import load_config, save_config
+        from hermes_runtime.config import load_config, save_config
 
         config = load_config()
         if not isinstance(config.get("memory"), dict):
@@ -13346,6 +13329,21 @@ def main():
     # Cosmetic: make the process show up as 'hermes' instead of 'python3.11'
     # in ps/top/htop.  Non-fatal — just a nicer UX.
     _set_process_title()
+
+    # Repair non-UTF-8 stdio before anything prints.  This used to run as a
+    # side effect of importing ``hermes_cli`` — which meant every
+    # ``from hermes_runtime.config import ...`` anywhere in agent/, tools/,
+    # gateway/ or plugins/ could replace the process's ``sys.stdout`` and
+    # write PYTHONUTF8/PYTHONIOENCODING into the environment inherited by
+    # every subprocess, and fought pytest's capture.  It belongs to the
+    # process entry point, which is here.  Idempotent, and a no-op when the
+    # streams are already UTF-8.  Catches the legacy POSIX locales that
+    # ``configure_windows_stdio`` (Windows-only) does not.
+    try:
+        from hermes_cli import ensure_utf8_stdio
+        ensure_utf8_stdio()
+    except Exception:
+        pass
 
     # Force UTF-8 stdio on Windows before anything prints.  No-op elsewhere.
     try:
@@ -13617,12 +13615,6 @@ def main():
     # webhook command  (parser built in hermes_cli/subcommands/webhook.py)
     # =========================================================================
     build_webhook_parser(subparsers, cmd_webhook=cmd_webhook)
-
-    # =========================================================================
-    # portal command — Nous Portal status + Tool Gateway routing
-    # =========================================================================
-    from hermes_cli.portal_cli import add_parser as _add_portal_parser
-    _add_portal_parser(subparsers)
 
     # =========================================================================
     # kanban command — multi-profile collaboration board
@@ -15193,7 +15185,7 @@ def main():
     # the managed container.  This MUST run before parse_args() so that
     # --help, unrecognised flags, and every subcommand are forwarded
     # transparently instead of being intercepted by argparse on the host.
-    from hermes_cli.config import get_container_exec_info
+    from hermes_runtime.config import get_container_exec_info
 
     container_info = get_container_exec_info()
     if container_info:

@@ -90,6 +90,38 @@ def supervision_control(
 
 
 class CollaborationDashboardTests(unittest.TestCase):
+    def test_mobile_console_routes_require_owner_and_keep_profile_scope(self):
+        module = load_module()
+        request = SimpleNamespace()
+        seen = []
+        module.owner_id_from_request = lambda current: seen.append(current) or "owner-a"
+        module._mobile_profile_home = lambda profile: (profile.strip() or "default", Path("/tmp/profile"))
+
+        with patch(
+            "hermes_cli.mobile_console.mobile_console_catalog",
+            return_value=[{"command": "/status", "mutating": False}],
+        ), patch(
+            "hermes_cli.mobile_console.execute_mobile_console_command",
+        ) as execute:
+            from hermes_cli.console_engine import ConsoleResult
+
+            execute.return_value = ConsoleResult("ok", output="healthy", command="status")
+            catalog = module.mobile_console_commands(request, profile="ios-native")
+            result = module.mobile_console_execute(
+                module.MobileConsoleCommandBody(line="/status", profile="ios-native"),
+                request,
+            )
+
+        self.assertEqual(seen, [request, request])
+        self.assertEqual(catalog["commands"][0]["command"], "/status")
+        self.assertEqual(result["status"], "ok")
+        self.assertEqual(result["output"], "healthy")
+        execute.assert_called_once_with(
+            "/status",
+            confirmed=False,
+            profile="ios-native",
+        )
+
     def test_short_chinese_greeting_keeps_its_first_character_in_title(self):
         module = load_module()
 
@@ -912,6 +944,7 @@ class CollaborationDashboardTests(unittest.TestCase):
                     "name": "Hermes 调度员 · 规划",
                     "role": "dispatcher",
                     "profile": "dbb3-manager",
+                    "member_id": "dbb3-manager",
                 },
                 "model": {
                     "provider": "openai",
@@ -5753,6 +5786,98 @@ class CollaborationDashboardTests(unittest.TestCase):
         self.assertEqual(
             sum(bool(message.get("meta", {}).get("final_report")) for message in conversation["messages"]),
             1,
+        )
+
+    def test_dispatch_to_two_workers_registers_participants_with_member_ids(self):
+        module = load_module()
+        conversation = module.create_single_conversation("default")
+        state = {"conversations": [conversation]}
+        module.load_single_state = lambda: state
+        module.save_single_state = lambda _state: None
+        module._schedule_mobile_completion_notification = lambda *_args: None
+        module.create_hosted_turn_record(
+            conversation,
+            turn_id="turn-participants",
+            content="在 DBB3 部署，并在本地电脑验证",
+            title="部署与验证",
+            profiles=["default", "dbb3-worker", "pc-worker", "reviewer"],
+            artifact_required=False,
+            mode="work",
+            route_metadata={
+                "mode": "work",
+                "profiles": ["dbb3-worker", "pc-worker"],
+                "targets": ["dbb3", "pc"],
+            },
+        )
+
+        def runner(profile, _prompt, **_kwargs):
+            if profile == "supervisor":
+                return supervision_control()
+            if profile == "reviewer":
+                return review_control()
+            if profile == "default":
+                return "最终汇报完成"
+            return f"{profile} 完成"
+
+        module.execute_hosted_workflow(
+            conversation["id"],
+            "turn-participants",
+            runner=runner,
+            task_creator=lambda **_kwargs: {
+                "task_id": "root-participants",
+                "child_ids": ["child-dbb3", "child-pc", "child-review"],
+                "fanout": True,
+            },
+        )
+
+        run = conversation["hosted_turns"]["turn-participants"]
+        self.assertEqual(run["status"], "completed")
+        participants = {member["id"]: member for member in run["participants"]}
+        self.assertEqual(participants["dbb3-manager"]["role"], "manager")
+        self.assertEqual(participants["dbb3-manager"]["display_name"], "Hermes 调度员")
+        self.assertEqual(participants["dbb3-manager"]["node"], "dbb3")
+        self.assertEqual(participants["dbb3-worker"]["role"], "worker")
+        self.assertEqual(participants["dbb3-worker"]["node"], "dbb3")
+        self.assertEqual(participants["pc-worker"]["role"], "worker")
+        self.assertEqual(participants["pc-worker"]["node"], "wsl")
+        self.assertEqual(participants["reviewer"]["role"], "reviewer")
+        self.assertEqual(participants["default"]["role"], "reporter")
+        for member in run["participants"]:
+            self.assertTrue(member["avatar_seed"])
+            self.assertTrue(member["joined_at"])
+
+        # Every worker_running stage event names the member that produced it.
+        worker_events = {
+            stage: event
+            for stage, event in run["role_events"].items()
+            if stage.startswith("worker:")
+        }
+        self.assertEqual(
+            {event["member_id"] for event in worker_events.values()},
+            {"dbb3-worker", "pc-worker"},
+        )
+        worker_messages = [
+            message
+            for message in conversation["messages"]
+            if message.get("sender_role") == "worker"
+        ]
+        self.assertGreaterEqual(len(worker_messages), 2)
+        for message in worker_messages:
+            self.assertEqual(message["member_id"], message["profile"])
+
+        # Snapshot payloads expose the roster per turn and per conversation
+        # without renaming or removing any pre-existing field.
+        public = module._public_conversation(conversation)
+        self.assertEqual(
+            {
+                member["id"]
+                for member in public["hosted_turns"]["turn-participants"]["participants"]
+            },
+            set(participants),
+        )
+        self.assertEqual(
+            {member["id"] for member in public["participants"]},
+            set(participants),
         )
 
     def test_reviewer_rework_runs_workers_again_before_final_report(self):

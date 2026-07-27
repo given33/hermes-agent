@@ -10,6 +10,16 @@ from pathlib import Path
 
 from dotenv import load_dotenv
 from utils import atomic_replace, fast_safe_load
+from hermes_runtime import managed_scope
+from hermes_runtime.secret_provenance import (
+    SECRET_SOURCES,
+    get_secret_source,
+    record_secret_source,
+)
+
+# Compatibility alias retained for callers and tests that inspect the old
+# process-local registry directly. New lower layers use the public runtime API.
+_SECRET_SOURCES = SECRET_SOURCES
 
 
 # Env var name suffixes that indicate credential values.  These are the
@@ -35,8 +45,6 @@ _WARNED_UTF32_PATHS: set[str] = set()
 # users understand WHERE a key came from when their .env doesn't contain it
 # directly (otherwise the "credentials detected ✓" line looks identical to
 # the .env case and they don't know Bitwarden is wired up).
-_SECRET_SOURCES: dict[str, str] = {}
-
 # HERMES_HOME paths we've already pulled external secrets for during this
 # process.  ``load_hermes_dotenv()`` is called at module-import time from
 # several hot modules (cli.py, hermes_cli/main.py, run_agent.py,
@@ -45,19 +53,6 @@ _SECRET_SOURCES: dict[str, str] = {}
 # in-process cache prevents redundant network calls, but the print, the
 # config re-parse, and the ASCII sanitization sweep still ran every time.
 _APPLIED_HOMES: set[str] = set()
-
-
-def get_secret_source(env_var: str) -> str | None:
-    """Return the label of the secret source that supplied ``env_var``, if any.
-
-    Returns ``"bitwarden"`` for keys pulled from Bitwarden Secrets Manager
-    during the current process's ``load_hermes_dotenv()`` call.  Returns
-    ``None`` for keys that came from ``.env``, the shell environment, or
-    aren't tracked.  The returned label is metadata only: credential-pool
-    persistence may store it to explain the origin of a borrowed secret, but
-    must never treat it as authorization to persist the raw value.
-    """
-    return _SECRET_SOURCES.get(env_var)
 
 
 def reset_secret_source_cache() -> None:
@@ -190,14 +185,14 @@ def _sanitize_env_file_if_needed(path: Path) -> None:
     to the errors=replace corruption path. Order of BOM checks matters:
     UTF-32-LE's BOM starts with UTF-16-LE's FF FE.
 
-    We delegate to ``hermes_cli.config._sanitize_env_lines`` which
+    We delegate to ``hermes_cli.config.sanitize_env_lines`` which
     already knows all valid Hermes env-var names and can split
     concatenated lines correctly.
     """
     if not path.exists():
         return
     try:
-        from hermes_cli.config import _sanitize_env_lines
+        from hermes_runtime.config import sanitize_env_lines
     except ImportError:
         return  # early bootstrap — config module not available yet
 
@@ -258,12 +253,12 @@ def _sanitize_env_file_if_needed(path: Path) -> None:
             return
 
     try:
-        # Strip null bytes before _sanitize_env_lines so they never
+        # Strip null bytes before sanitize_env_lines so they never
         # reach python-dotenv (which passes them to os.environ and
         # crashes with ValueError). Also intentionally repairs
         # BOM-less UTF-16 (NUL-padded ASCII) into clean UTF-8.
         stripped = [line.replace("\x00", "") for line in original]
-        sanitized = _sanitize_env_lines(stripped)
+        sanitized = sanitize_env_lines(stripped)
         if sanitized != original or force_utf8_rewrite:
             import tempfile
             fd, tmp = tempfile.mkstemp(
@@ -356,8 +351,6 @@ def _apply_managed_env() -> None:
     error here is swallowed so managed scope can never block startup.
     """
     try:
-        from hermes_cli import managed_scope
-
         managed_dir = managed_scope.get_managed_dir()
     except Exception:  # noqa: BLE001 — managed scope must never block startup
         return
@@ -425,7 +418,7 @@ def _apply_external_secret_sources(home_path: Path) -> None:
         # "(from 1Password)" — otherwise users see "credentials ✓" with
         # no hint the value came from a vault rather than .env.
         for name, applied in report.provenance.items():
-            _SECRET_SOURCES[name] = applied.source
+            record_secret_source(name, applied.source)
 
     for src in report.sources:
         if src.applied:

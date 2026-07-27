@@ -33,10 +33,10 @@ sys.path.insert(0, REPO_ROOT)
 # Ensure HERMES_HOME is set for imports that touch it at module level.
 os.environ.setdefault("HERMES_HOME", os.path.join(os.path.expanduser("~"), ".hermes"))
 
-from hermes_cli.models import (  # noqa: E402
+from agent.model_catalog import (  # noqa: E402
     OPENROUTER_MODELS,
     PREFERRED_SILENT_DEFAULT_MODEL,
-    _PROVIDER_MODELS,
+    static_provider_model_catalog,
 )
 
 OUTPUT_PATH = os.path.join(REPO_ROOT, "website", "static", "api", "model-catalog.json")
@@ -59,6 +59,7 @@ def _nous_entry(mid: str) -> dict:
 
 
 def build_catalog() -> dict:
+    provider_models = static_provider_model_catalog()
     return {
         "version": CATALOG_VERSION,
         "updated_at": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
@@ -94,7 +95,7 @@ def build_catalog() -> dict:
                 },
                 "models": [
                     _nous_entry(mid)
-                    for mid in _PROVIDER_MODELS.get("nous", [])
+                    for mid in provider_models.get("nous", [])
                 ],
             },
         },

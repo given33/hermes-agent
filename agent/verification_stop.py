@@ -113,7 +113,7 @@ def _session_is_messaging_surface() -> bool:
     non-messaging surface.
     """
     try:
-        from gateway.session_context import get_session_env
+        from hermes_runtime.session_context import get_session_env
 
         platform = (
             os.getenv("HERMES_PLATFORM")
@@ -149,7 +149,7 @@ def verify_on_stop_enabled(config: dict[str, Any] | None = None) -> bool:
         return env.strip().lower() not in {"0", "false", "no", "off"}
     if config is None:
         try:
-            from hermes_cli.config import load_config
+            from hermes_runtime.config import load_config
 
             config = load_config()
         except Exception:

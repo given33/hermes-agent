@@ -30,7 +30,7 @@ from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 import httpx
 
-from hermes_cli.config import get_hermes_home
+from hermes_runtime.config import get_hermes_home
 from hermes_cli.sqlite_util import write_txn
 
 

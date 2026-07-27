@@ -16,8 +16,8 @@ from pathlib import Path
 from hermes_constants import get_hermes_home, get_skills_dir, is_wsl
 from typing import Optional
 
-from agent.runtime_cwd import resolve_agent_cwd
-from agent.skill_utils import (
+from hermes_runtime.runtime_cwd import resolve_agent_cwd
+from hermes_runtime.skill_utils import (
     EXCLUDED_SKILL_DIRS,
     SKILL_SUPPORT_DIRS,
     extract_skill_conditions,
@@ -1245,7 +1245,7 @@ def build_environment_hints() -> str:
     extra = (os.getenv("HERMES_ENVIRONMENT_HINT") or "").strip()
     if not extra:
         try:
-            from hermes_cli.config import load_config
+            from hermes_runtime.config import load_config
 
             extra = str(
                 (load_config().get("agent", {}) or {}).get("environment_hint", "")
@@ -1299,7 +1299,7 @@ def _get_context_file_max_chars(context_length: Optional[int] = None) -> int:
       3. ``CONTEXT_FILE_MAX_CHARS`` (20K) as the upstream-compatible fallback.
     """
     try:
-        from hermes_cli.config import load_config
+        from hermes_runtime.config import load_config
 
         val = load_config().get("context_file_max_chars")
         if isinstance(val, (int, float)) and val > 0:
@@ -1522,7 +1522,7 @@ def _current_session_platform_hint() -> str:
     if platform:
         return platform
 
-    session_context = sys.modules.get("gateway.session_context")
+    session_context = sys.modules.get("hermes_runtime.session_context")
     get_session_env = getattr(session_context, "get_session_env", None) if session_context else None
     if get_session_env is None:
         return ""
@@ -1787,69 +1787,9 @@ def build_skills_system_prompt(
 
 
 def build_nous_subscription_prompt(valid_tool_names: "set[str] | None" = None) -> str:
-    """Build a compact Nous subscription capability block for the system prompt."""
-    try:
-        from hermes_cli.nous_subscription import get_nous_subscription_features
-        from tools.tool_backend_helpers import managed_nous_tools_enabled
-    except Exception as exc:
-        logger.debug("Failed to import Nous subscription helper: %s", exc)
-        return ""
-
-    if not managed_nous_tools_enabled():
-        return ""
-
-    valid_names = set(valid_tool_names or set())
-    relevant_tool_names = {
-        "web_search",
-        "web_extract",
-        "browser_navigate",
-        "browser_snapshot",
-        "browser_click",
-        "browser_type",
-        "browser_scroll",
-        "browser_console",
-        "browser_press",
-        "browser_get_images",
-        "browser_vision",
-        "image_generate",
-        "text_to_speech",
-        "terminal",
-        "process",
-        "execute_code",
-    }
-
-    if valid_names and not (valid_names & relevant_tool_names):
-        return ""
-
-    features = get_nous_subscription_features()
-
-    def _status_line(feature) -> str:
-        if feature.managed_by_nous:
-            return f"- {feature.label}: active via Nous subscription"
-        if feature.active:
-            current = feature.current_provider or "configured provider"
-            return f"- {feature.label}: currently using {current}"
-        if feature.included_by_default and features.nous_auth_present:
-            return f"- {feature.label}: included with Nous subscription, not currently selected"
-        if feature.key == "modal" and features.nous_auth_present:
-            return f"- {feature.label}: optional via Nous subscription"
-        return f"- {feature.label}: not currently available"
-
-    lines = [
-        "# Nous Subscription",
-        "Nous subscription includes managed web tools (Firecrawl), image generation (FAL), OpenAI TTS, OpenAI Whisper STT, and browser automation (Browser Use) by default. Modal execution is optional.",
-        "Current capability status:",
-    ]
-    lines.extend(_status_line(feature) for feature in features.items())
-    lines.extend(
-        [
-            "When a Nous-managed feature is active, do not ask the user for Firecrawl, FAL, OpenAI TTS, OpenAI Whisper, or Browser-Use API keys.",
-            "If the user is not subscribed and asks for a capability that Nous subscription would unlock or simplify, suggest Nous subscription as one option alongside direct setup or local alternatives.",
-            "Do not mention subscription unless the user asks about it or it directly solves the current missing capability.",
-            "Useful commands: hermes setup, hermes setup tools, hermes setup terminal, hermes status.",
-        ]
-    )
-    return "\n".join(lines)
+    """Compatibility shim: this fork has no Nous account product surface."""
+    del valid_tool_names
+    return ""
 
 
 # =========================================================================
@@ -1904,7 +1844,7 @@ def load_soul_md(context_length: Optional[int] = None) -> Optional[str]:
     ``skip_soul=True`` so SOUL.md isn't injected twice.
     """
     try:
-        from hermes_cli.config import ensure_hermes_home
+        from hermes_runtime.config import ensure_hermes_home
         ensure_hermes_home()
     except Exception as e:
         logger.debug("Could not ensure HERMES_HOME before loading SOUL.md: %s", e)
@@ -2065,12 +2005,12 @@ def build_context_files_prompt(
     # legitimate workspace when the user deliberately points a session at it —
     # and CLI-style surfaces pass allow_install_tree_fallback=True because
     # their launch dir IS the user's shell cwd (developing Hermes in-tree).
-    from agent.runtime_cwd import _is_install_tree
+    from hermes_runtime.runtime_cwd import is_install_tree
 
     if (
         cwd_is_fallback
         and not allow_install_tree_fallback
-        and _is_install_tree(cwd_path)
+        and is_install_tree(cwd_path)
     ):
         logger.warning(
             "skipping project-context discovery: working-directory resolution "

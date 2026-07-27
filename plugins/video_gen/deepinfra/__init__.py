@@ -17,6 +17,7 @@ from __future__ import annotations
 import logging
 from typing import Any, Dict, List
 
+from agent import model_catalog
 from agent.video_gen_provider import OpenAICompatibleVideoGenProvider
 
 logger = logging.getLogger(__name__)
@@ -40,11 +41,11 @@ class DeepInfraVideoGenProvider(OpenAICompatibleVideoGenProvider):
         options rather than routing to a possibly-retired model.
         """
         try:
-            from hermes_cli.models import _fetch_deepinfra_models_by_tag
+            items = model_catalog.fetch_deepinfra_models_by_tag("video-gen")
         except Exception as exc:  # noqa: BLE001 — never break the picker
             logger.debug("Cannot import _fetch_deepinfra_models_by_tag: %s", exc)
             return []
-        items = _fetch_deepinfra_models_by_tag("video-gen") or []
+        items = items or []
         out: List[Dict[str, Any]] = []
         for item in items:
             mid = item.get("id")

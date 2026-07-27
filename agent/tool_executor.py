@@ -274,7 +274,7 @@ def _apply_tool_request_middleware_for_agent(
     tool_call_id: str,
 ) -> tuple[dict, list[dict[str, Any]]]:
     try:
-        from hermes_cli.middleware import apply_tool_request_middleware
+        from hermes_services.middleware import apply_tool_request_middleware
 
         result = apply_tool_request_middleware(
             function_name,
@@ -308,7 +308,7 @@ def _run_agent_tool_execution_middleware(
         observed_args = next_args if isinstance(next_args, dict) else function_args
         return execute(observed_args)
 
-    from hermes_cli.middleware import run_tool_execution_middleware
+    from hermes_services.middleware import run_tool_execution_middleware
 
     result = run_tool_execution_middleware(
         function_name,

@@ -32,7 +32,7 @@ from dataclasses import dataclass, field
 from typing import Any, Callable, Optional
 
 from agent.codex_responses_adapter import _format_responses_error
-from agent.redact import redact_sensitive_text
+from hermes_runtime.redaction import redact_sensitive_text
 from agent.transports.codex_app_server import (
     CodexAppServerClient,
     CodexAppServerError,
@@ -334,7 +334,7 @@ class CodexAppServerSession:
         """Build a user-facing error string for codex failures.
 
         Appends the last few lines of codex's stderr buffer when available,
-        passed through agent.redact with force=True so secrets in provider
+        passed through hermes_runtime.redaction with force=True so secrets in provider
         error responses (auth headers, query-string tokens, sk-* keys) never
         leak into chat output or trajectories. The codex CLI's own error
         text ('Internal error', 'turn/start failed: ...') is otherwise

@@ -169,31 +169,12 @@ def _seed(agent, fixture):
         os.environ.pop("HERMES_DEV_CREDITS", None)
 
 
-def test_seed_fires_usage_band_at_session_open():
+def test_nous_account_credit_seed_is_disabled_for_every_fixture():
     a = _FakeAgent()
-    assert _seed(a, "sub_90pct") is True
-    assert a._credits_state is not None
-    assert a.emitted == [(["credits.usage"], [])]
-
-
-def test_seed_fires_depleted_at_session_open():
-    a = _FakeAgent()
-    assert _seed(a, "depleted") is True
-    assert a.emitted == [(["credits.depleted"], [])]
-
-
-def test_seed_depleted_suppressed_on_free_model():
-    """A session that opens depleted but on a Nous ``:free`` model must NOT show
-    the depleted banner — inference works fine on the free tier."""
-    a = _FakeAgent(model="nvidia/nemotron-3-ultra:free")
-    assert _seed(a, "depleted") is True
-    assert a.emitted == [([], [])]
-
-
-def test_seed_healthy_no_notice():
-    a = _FakeAgent()
-    assert _seed(a, "healthy") is True
-    assert a.emitted == [([], [])]
+    for fixture in ("sub_90pct", "depleted", "healthy"):
+        assert _seed(a, fixture) is False
+    assert a._credits_state is None
+    assert a.emitted == []
 
 
 def test_seed_is_idempotent():

@@ -33,9 +33,7 @@ from agent.gemini_schema import sanitize_gemini_tool_parameters
 logger = logging.getLogger(__name__)
 
 try:
-    import hermes_cli as _hermes_cli
-
-    _HERMES_VERSION = str(_hermes_cli.__version__)
+    from hermes_runtime.version import HERMES_VERSION as _HERMES_VERSION
 except Exception:
     _HERMES_VERSION = "0.0.0"
 

@@ -93,6 +93,12 @@ def _add_forward_compat_models(model_ids: List[str]) -> List[str]:
     return ordered
 
 
+def add_forward_compat_models(model_ids: List[str]) -> List[str]:
+    """Public cross-package wrapper for Codex forward compatibility."""
+
+    return _add_forward_compat_models(model_ids)
+
+
 def _fetch_models_from_api(access_token: str) -> List[str]:
     """Fetch available models from the Codex API. Returns visible models sorted by priority."""
     try:

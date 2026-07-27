@@ -52,7 +52,7 @@ from pathlib import Path
 from typing import Callable, Dict, Any, Optional
 from urllib.parse import urljoin, urlparse
 
-from hermes_cli._subprocess_compat import windows_hide_flags
+from hermes_runtime.subprocess_compat import windows_hide_flags
 from hermes_constants import display_hermes_home
 
 logger = logging.getLogger(__name__)
@@ -64,7 +64,7 @@ def get_env_value(name, default=None):
     not keep a stale imported function for the rest of the test process.
     """
     try:
-        from hermes_cli.config import get_env_value as _get_env_value
+        from hermes_runtime.config import get_env_value as _get_env_value
     except ImportError:
         return os.getenv(name, default)
     value = _get_env_value(name)
@@ -341,7 +341,7 @@ def _load_tts_config() -> Dict[str, Any]:
     for any missing fields.
     """
     try:
-        from hermes_cli.config import load_config
+        from hermes_runtime.config import load_config
         config = load_config()
         return config.get("tts") or {}
     except ImportError:
@@ -1169,7 +1169,7 @@ def _generate_deepinfra_tts(text: str, output_path: str, tts_config: Dict[str, A
     if not isinstance(di_config, dict):
         di_config = {}
 
-    from hermes_cli.models import deepinfra_base_url, deepinfra_model_ids
+    from agent.model_catalog import deepinfra_base_url, deepinfra_model_ids
 
     model = di_config.get("model")
     if not isinstance(model, str) or not model.strip():
@@ -2328,7 +2328,7 @@ def text_to_speech_tool(
     # Telegram voice bubbles require Opus (.ogg); OpenAI and ElevenLabs can
     # produce Opus natively (no ffmpeg needed).  Edge TTS always outputs MP3
     # and needs ffmpeg for conversion.
-    from gateway.session_context import get_session_env
+    from hermes_runtime.session_context import get_session_env
     platform = get_session_env("HERMES_SESSION_PLATFORM", "").lower()
     want_opus = (platform == "telegram")
 

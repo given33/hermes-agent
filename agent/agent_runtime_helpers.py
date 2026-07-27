@@ -32,7 +32,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
-from hermes_cli.timeouts import get_provider_request_timeout
+from hermes_runtime.timeouts import get_provider_request_timeout
 from agent.prompt_builder import format_steer_marker
 from agent.tool_dispatch_helpers import _trajectory_normalize_msg, make_tool_result_message
 from agent.trajectory import convert_scratchpad_to_think
@@ -1670,7 +1670,7 @@ def dump_api_request_debug(
         # Run the serialized dump through the same scrubber used for logs/tool
         # output, then hand the resulting payload back to the shared atomic
         # JSON writer so request dumps keep the same write semantics as before.
-        from agent.redact import redact_sensitive_text
+        from hermes_runtime.redaction import redact_sensitive_text
         _serialized = json.dumps(dump_payload, ensure_ascii=False, indent=2, default=str)
         _redacted_payload = json.loads(redact_sensitive_text(_serialized, force=True))
         atomic_json_write(dump_file, _redacted_payload, default=str)
@@ -1734,9 +1734,9 @@ def anthropic_prompt_cache_policy(
     # the policy from the preset's real aggregator slot instead.
     if eff_provider.strip().lower() == "moa":
         try:
-            from hermes_cli.config import load_config as _load_moa_cfg
-            from hermes_cli.moa_config import resolve_moa_preset
-            from hermes_cli.runtime_provider import resolve_runtime_provider
+            from hermes_runtime.config import load_config as _load_moa_cfg
+            from agent.moa_config import resolve_moa_preset
+            from agent.runtime_provider import resolve_runtime_provider
 
             _preset = resolve_moa_preset(
                 _load_moa_cfg().get("moa") or {}, eff_model or None
@@ -1954,7 +1954,7 @@ def switch_model(agent, new_model, new_provider, api_key='', base_url='', api_mo
     change persists across turns (unlike fallback which is
     turn-scoped).
     """
-    from hermes_cli.providers import determine_api_mode
+    from agent.provider_registry import determine_api_mode
 
     # ── Determine api_mode if not provided ──
     if not api_mode:
@@ -2113,7 +2113,7 @@ def switch_model(agent, new_model, new_provider, api_key='', base_url='', api_mo
             # the matching block in agent_init.py for the full rationale.
             if new_provider == "minimax-oauth" and isinstance(effective_key, str) and effective_key:
                 try:
-                    from hermes_cli.auth import build_minimax_oauth_token_provider
+                    from agent.provider_auth import build_minimax_oauth_token_provider
                     effective_key = build_minimax_oauth_token_provider()
                 except Exception as _mm_exc:  # noqa: BLE001
                     import logging as _logging
@@ -2141,7 +2141,7 @@ def switch_model(agent, new_model, new_provider, api_key='', base_url='', api_mo
                 "base_url": effective_base,
             }
             try:
-                from hermes_cli.config import (
+                from hermes_runtime.config import (
                     apply_custom_provider_tls_to_client_kwargs,
                     get_compatible_custom_providers,
                     load_config_readonly,
@@ -2208,7 +2208,7 @@ def switch_model(agent, new_model, new_provider, api_key='', base_url='', api_mo
         # custom provider mid-session (closes #15779).
         _sm_custom_providers = None
         try:
-            from hermes_cli.config import load_config, get_compatible_custom_providers
+            from hermes_runtime.config import load_config, get_compatible_custom_providers
             _sm_cfg = load_config()
             _sm_custom_providers = get_compatible_custom_providers(_sm_cfg)
         except Exception:
@@ -2243,7 +2243,7 @@ def switch_model(agent, new_model, new_provider, api_key='', base_url='', api_mo
     # boolean False = disabled).
     try:
         from hermes_constants import resolve_reasoning_config
-        from hermes_cli.config import load_config as _sm_load_config
+        from hermes_runtime.config import load_config as _sm_load_config
 
         _reasoning_cfg = _sm_load_config() or {}
         agent.reasoning_config = resolve_reasoning_config(_reasoning_cfg, agent.model)
@@ -2358,7 +2358,7 @@ def invoke_tool(agent, function_name: str, function_args: dict, effective_task_i
 
     _tool_middleware_trace = list(tool_request_middleware_trace or [])
     try:
-        from hermes_cli.middleware import apply_tool_request_middleware
+        from hermes_services.middleware import apply_tool_request_middleware
 
         if not skip_tool_request_middleware:
             _tool_request_mw = apply_tool_request_middleware(
@@ -2538,7 +2538,7 @@ def invoke_tool(agent, function_name: str, function_args: dict, effective_task_i
                 tool_request_middleware_trace=list(_tool_middleware_trace),
             )
 
-    from hermes_cli.middleware import run_tool_execution_middleware
+    from hermes_services.middleware import run_tool_execution_middleware
 
     return run_tool_execution_middleware(
         function_name,

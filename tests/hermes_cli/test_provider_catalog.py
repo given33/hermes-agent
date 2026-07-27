@@ -62,6 +62,9 @@ def test_api_key_providers_route_to_keys_oauth_to_accounts():
     # api_key → keys
     assert by["kilocode"].tab == "keys"
     assert by["openai-api"].tab == "keys"
+    assert by["nous"].tab == "keys"
+    assert by["nous"].auth_type == "api_key"
+    assert by["nous"].api_key_env_vars == ("NOUS_API_KEY",)
     assert by["copilot-acp"].tab == "accounts"
 
 

@@ -40,8 +40,12 @@ from typing import Any, List, Optional
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
 from hermes_constants import get_hermes_home
-from hermes_cli._subprocess_compat import windows_hide_flags
-from hermes_cli.config import load_config, _expand_env_vars
+from hermes_runtime.subprocess_compat import windows_hide_flags
+from hermes_runtime.config import (
+    expand_env_vars,
+    load_config,
+    read_raw_config_strict,
+)
 from hermes_cli.fallback_config import get_fallback_chain
 from hermes_time import now as _hermes_now
 
@@ -1969,7 +1973,23 @@ def _deliver_result(job: dict, content: str, adapters=None, loop=None) -> Option
                 try:
                     pool = concurrent.futures.ThreadPoolExecutor(max_workers=1)
                     try:
-                        future = pool.submit(asyncio.run, _send_to_platform(platform, pconfig, chat_id, cleaned_delivery_content, thread_id=thread_id, media_files=media_files))
+                        # Create the retry coroutine inside the worker.  Calling
+                        # _send_to_platform before submit() leaves an orphaned
+                        # coroutine when executor startup/submit fails during
+                        # process shutdown.
+                        def run_standalone_retry():
+                            return asyncio.run(
+                                _send_to_platform(
+                                    platform,
+                                    pconfig,
+                                    chat_id,
+                                    cleaned_delivery_content,
+                                    thread_id=thread_id,
+                                    media_files=media_files,
+                                )
+                            )
+
+                        future = pool.submit(run_standalone_retry)
                         result = future.result(timeout=30)
                     finally:
                         pool.shutdown(wait=False)
@@ -2220,7 +2240,7 @@ def _run_job_script(script_path: str) -> tuple[bool, str]:
 
         # Redact secrets from both stdout and stderr before any return path.
         try:
-            from agent.redact import redact_sensitive_text
+            from hermes_runtime.redaction import redact_sensitive_text
             stdout = redact_sensitive_text(stdout)
             stderr = redact_sensitive_text(stderr)
         except Exception as e:
@@ -2467,7 +2487,7 @@ def _build_job_prompt(job: dict, prerun_script: Optional[tuple] = None) -> str:
     from tools.skills_tool import skill_view
     from tools.skill_usage import bump_use
     from agent.skill_bundles import build_bundle_invocation_message, resolve_bundle_command_key
-    from agent.skill_utils import normalize_skill_lookup_name
+    from hermes_runtime.skill_utils import normalize_skill_lookup_name
 
     parts = []
     skipped: list[str] = []
@@ -2820,7 +2840,7 @@ def run_job(
                 )
         if _session_db_timeout is None:
             try:
-                from hermes_cli.config import load_config
+                from hermes_runtime.config import load_config
                 _cfg = load_config() or {}
                 _cron_cfg = _cfg.get("cron", {}) if isinstance(_cfg, dict) else {}
                 _configured = _cron_cfg.get("session_db_timeout_seconds")
@@ -2921,7 +2941,11 @@ def run_job(
 
     # Use ContextVars for per-job session/delivery state so parallel jobs
     # don't clobber each other's targets (os.environ is process-global).
-    from gateway.session_context import set_session_vars, clear_session_vars, _VAR_MAP
+    from hermes_runtime.session_context import (
+        SESSION_CONTEXT_VARS,
+        clear_session_vars,
+        set_session_vars,
+    )
 
     # Cron execution is an internal scheduler context, not a live inbound
     # gateway message. Do not seed HERMES_SESSION_* contextvars from the
@@ -2969,7 +2993,7 @@ def run_job(
         "HERMES_CRON_AUTO_DELIVER_THREAD_ID",
     )
     for _var_name in _cron_delivery_vars:
-        _VAR_MAP[_var_name].set("")
+        SESSION_CONTEXT_VARS[_var_name].set("")
 
     # Per-job working directory.  When set (and validated at create/update
     # time), we point TERMINAL_CWD at it so:
@@ -3040,9 +3064,9 @@ def run_job(
 
         delivery_target = _resolve_delivery_target(job)
         if delivery_target:
-            _VAR_MAP["HERMES_CRON_AUTO_DELIVER_PLATFORM"].set(delivery_target["platform"])
-            _VAR_MAP["HERMES_CRON_AUTO_DELIVER_CHAT_ID"].set(str(delivery_target["chat_id"]))
-            _VAR_MAP["HERMES_CRON_AUTO_DELIVER_THREAD_ID"].set(
+            SESSION_CONTEXT_VARS["HERMES_CRON_AUTO_DELIVER_PLATFORM"].set(delivery_target["platform"])
+            SESSION_CONTEXT_VARS["HERMES_CRON_AUTO_DELIVER_CHAT_ID"].set(str(delivery_target["chat_id"]))
+            SESSION_CONTEXT_VARS["HERMES_CRON_AUTO_DELIVER_THREAD_ID"].set(
                 ""
                 if delivery_target.get("thread_id") is None
                 else str(delivery_target["thread_id"])
@@ -3059,21 +3083,19 @@ def run_job(
         _cfg = {}
         _model_cfg = {}
         try:
-            import yaml
-            _cfg_path = str(_get_hermes_home() / "config.yaml")
-            if os.path.exists(_cfg_path):
-                with open(_cfg_path, encoding="utf-8") as _f:
-                    _cfg = yaml.safe_load(_f) or {}
+            _cfg_path = _get_hermes_home() / "config.yaml"
+            if _cfg_path.exists():
+                _cfg = read_raw_config_strict(config_path=_cfg_path)
                 # Managed scope: a scheduled job must honor administrator-pinned
                 # model / reasoning / toolsets / provider_routing too. This loader
                 # builds its own dict, so overlay managed values via the shared
                 # helper (fail-open, no-op when no managed scope).
                 try:
-                    from hermes_cli import managed_scope
+                    from hermes_runtime import managed_scope
                     _cfg = managed_scope.apply_managed_overlay(_cfg)
                 except Exception:
                     pass
-                _cfg = _expand_env_vars(_cfg)
+                _cfg = expand_env_vars(_cfg)
                 # Coerce null/missing to {} so a falsy default never
                 # clobbers an already-resolved env value with ``None``.
                 _model_cfg = _cfg.get("model") or {}
@@ -3149,7 +3171,7 @@ def run_job(
             resolve_runtime_provider,
             format_runtime_provider_error,
         )
-        from hermes_cli.auth import AuthError
+        from agent.provider_auth import AuthError
 
         # F8 runtime backstop: never resolve a stored provider/base_url pair that
         # would ship a named provider's stored credential to an off-host endpoint
@@ -3625,7 +3647,7 @@ def run_job(
         # Clean up ContextVar session/delivery state for this job.
         clear_session_vars(_ctx_tokens)
         for _var_name in _cron_delivery_vars:
-            _VAR_MAP[_var_name].set("")
+            SESSION_CONTEXT_VARS[_var_name].set("")
         if _session_db:
             # Title the cron session from the job (name -> id) and PERSIST it
             # BEFORE end_session()/close() tear the connection down, so the
@@ -3757,7 +3779,7 @@ def run_one_job(job: dict, *, adapters=None, loop=None, verbose: bool = False) -
         # resolve_runtime_provider() raised UnscopedSecretError before model
         # selection, breaking every cron job. Mirrors the per-turn pattern in
         # gateway/run.py (_profile_runtime_scope).
-        from agent.secret_scope import (
+        from hermes_runtime.secret_scope import (
             build_profile_secret_scope,
             reset_secret_scope,
             set_secret_scope,

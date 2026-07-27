@@ -42,10 +42,22 @@ from __future__ import annotations
 from typing import Any, Dict, List
 
 __all__ = [
+    "save_env_value_secure",
     "save_provider_env_credential",
     "remove_provider_env_credential",
     "purge_env_credential_references",
 ]
+
+
+def save_env_value_secure(key: str, value: str) -> Dict[str, Any]:
+    """UI-facing credential capture with the historical response contract."""
+    lifecycle = save_provider_env_credential(key, value)
+    return {
+        "success": True,
+        "stored_as": key,
+        "validated": False,
+        "config_updates": lifecycle.get("config_updates", []),
+    }
 
 
 def _providers_for_env_var(env_var: str) -> List[str]:
@@ -123,7 +135,7 @@ def _scrub_config_yaml_mirrors(old_value: str, new_value: str | None) -> List[st
         return []
     from utils import atomic_yaml_write, fast_safe_load
 
-    from hermes_cli.config import (
+    from hermes_runtime.config import (
         get_config_path,
         require_readable_config_before_write,
     )
@@ -219,7 +231,7 @@ def save_provider_env_credential(env_var: str, value: str) -> Dict[str, Any]:
     Suppressed ``env:<VAR>`` pool sources are re-enabled so a deliberate
     re-add through the UI behaves like ``hermes auth add``.
     """
-    from hermes_cli.config import load_env, save_env_value
+    from hermes_runtime.config import load_env, save_env_value
 
     old_value = load_env().get(env_var)
     save_env_value(env_var, value)
@@ -254,7 +266,7 @@ def remove_provider_env_credential(env_var: str) -> Dict[str, Any]:
     previously 404'd on ".env miss" should key off this instead so a stale
     pool-only entry can still be cleaned up through the same button.
     """
-    from hermes_cli.config import load_env, remove_env_value
+    from hermes_runtime.config import load_env, remove_env_value
 
     old_value = load_env().get(env_var)
     removed_from_env = remove_env_value(env_var)

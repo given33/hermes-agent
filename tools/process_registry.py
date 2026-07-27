@@ -42,11 +42,12 @@ import uuid
 
 _IS_WINDOWS = platform.system() == "Windows"
 from tools.environments.local import _find_shell, _resolve_safe_cwd, _sanitize_subprocess_env
-from hermes_cli._subprocess_compat import windows_hide_flags
+from hermes_runtime.subprocess_compat import windows_hide_flags
+from hermes_runtime.process_probe import pid_exists as _pid_exists
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional
 
-from hermes_cli.config import get_hermes_home
+from hermes_runtime.config import get_hermes_home
 
 logger = logging.getLogger(__name__)
 
@@ -454,7 +455,6 @@ class ProcessRegistry:
             return False
         # ``os.kill(pid, 0)`` is NOT a no-op on Windows (bpo-14484) — use
         # the cross-platform existence check.
-        from gateway.status import _pid_exists
         return _pid_exists(pid)
 
     @staticmethod
@@ -534,7 +534,7 @@ class ProcessRegistry:
         config is unreadable, so callers always get a sane number.
         """
         try:
-            from hermes_cli.config import read_raw_config, cfg_get, DEFAULT_CONFIG
+            from hermes_runtime.config import read_raw_config, cfg_get, DEFAULT_CONFIG
             cfg = read_raw_config()
             val = cfg_get(cfg, "terminal", "daemon_term_grace_seconds")
             if val is None:
@@ -2289,7 +2289,7 @@ def _redact_process_result(result: dict) -> dict:
     """
     if not isinstance(result, dict):
         return result
-    from agent.redact import redact_sensitive_text, redact_terminal_output
+    from hermes_runtime.redaction import redact_sensitive_text, redact_terminal_output
 
     command = result.get("command") or ""
     for field in ("output", "output_preview"):

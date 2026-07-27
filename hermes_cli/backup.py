@@ -40,7 +40,7 @@ logger = logging.getLogger(__name__)
 # HERMES_HOME gets walked file-by-file, ballooning a backup to hundreds of
 # thousands of entries that crawl for hours — the exact "backup stuck for
 # days / 426543 files" symptom users hit. The dependency/test-env names mostly
-# mirror ``agent.skill_utils.EXCLUDED_SKILL_DIRS`` (the project's canonical
+# mirror ``hermes_runtime.skill_utils.EXCLUDED_SKILL_DIRS`` (the project's canonical
 # "regeneratable dir" set); ``.cache`` is an additional backup-only entry, as
 # it names a broad regeneratable cache convention (pip/uv/etc.) that the skill
 # scanner doesn't need to prune but a backup walk does. We deliberately do NOT

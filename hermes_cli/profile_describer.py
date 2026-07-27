@@ -34,7 +34,7 @@ from pathlib import Path
 from typing import Optional
 
 from hermes_cli import profiles as profiles_mod
-from agent.skill_utils import is_excluded_skill_path
+from hermes_runtime.skill_utils import is_excluded_skill_path
 
 logger = logging.getLogger(__name__)
 

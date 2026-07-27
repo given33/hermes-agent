@@ -13,7 +13,7 @@ from pathlib import Path
 import re
 from typing import Iterable, Sequence
 
-from agent.skill_utils import iter_skill_index_files
+from hermes_runtime.skill_utils import iter_skill_index_files
 
 
 _KIND_CHAR_LIMITS = {

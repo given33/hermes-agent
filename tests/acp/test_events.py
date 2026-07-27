@@ -4,7 +4,7 @@ import asyncio
 import gc
 import warnings
 from concurrent.futures import Future
-from unittest.mock import AsyncMock, MagicMock, patch
+from unittest.mock import MagicMock, patch
 
 import pytest
 
@@ -25,7 +25,10 @@ from acp_adapter.events import (
 def mock_conn():
     """Mock ACP Client connection."""
     conn = MagicMock(spec=acp.Client)
-    conn.session_update = AsyncMock()
+    # Callback tests replace run_coroutine_threadsafe, so an AsyncMock would
+    # manufacture a real coroutine that the scheduler double never consumes.
+    # The dedicated scheduler-failure test below uses a real coroutine.
+    conn.session_update = MagicMock()
     return conn
 
 

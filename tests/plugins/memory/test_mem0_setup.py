@@ -328,3 +328,63 @@ class TestConnectivityChecks:
     def test_pgvector_unreachable(self):
         ok, msg = _check_pgvector("localhost", 1)
         assert ok is False
+
+
+class TestPgvectorPassword:
+    """The managed pgvector container must not use a hardcoded password
+    and must publish its port on loopback only (Docker's iptables rules
+    bypass most host firewalls, so 0.0.0.0 publishing exposes the DB)."""
+
+    def test_password_generated_persisted_and_reused(self, tmp_path, monkeypatch):
+        from plugins.memory.mem0 import _setup as setup_mod
+
+        monkeypatch.setattr(setup_mod, "get_hermes_home", lambda: str(tmp_path))
+        monkeypatch.delenv("HERMES_PGVECTOR_PASSWORD", raising=False)
+
+        first = setup_mod._ensure_pgvector_password()
+        assert first and first != "hermes"
+        password_file = tmp_path / "pgvector-password"
+        assert password_file.read_text(encoding="utf-8").strip() == first
+        # Re-runs of the wizard must reuse the persisted password — the
+        # existing container's initdb only ever learned the first one.
+        assert setup_mod._ensure_pgvector_password() == first
+
+    def test_env_var_overrides_persisted_password(self, tmp_path, monkeypatch):
+        from plugins.memory.mem0 import _setup as setup_mod
+
+        monkeypatch.setattr(setup_mod, "get_hermes_home", lambda: str(tmp_path))
+        (tmp_path / "pgvector-password").write_text("persisted\n", encoding="utf-8")
+        monkeypatch.setenv("HERMES_PGVECTOR_PASSWORD", "from-env")
+        assert setup_mod._load_pgvector_password() == "from-env"
+        assert setup_mod._ensure_pgvector_password() == "from-env"
+
+    def test_docker_run_binds_loopback_with_generated_password(self, tmp_path, monkeypatch):
+        from plugins.memory.mem0 import _setup as setup_mod
+
+        monkeypatch.setattr(setup_mod, "get_hermes_home", lambda: str(tmp_path))
+        monkeypatch.delenv("HERMES_PGVECTOR_PASSWORD", raising=False)
+
+        commands = []
+
+        def fake_run(cmd, **kwargs):
+            commands.append(list(cmd))
+            return MagicMock(returncode=0, stdout="", stderr="")
+
+        monkeypatch.setattr(setup_mod.subprocess, "run", fake_run)
+        monkeypatch.setattr(setup_mod, "_wait_for_port", lambda *a, **kw: True)
+        monkeypatch.setattr(setup_mod, "_check_pgvector", lambda *a, **kw: (True, "ok"))
+
+        result = setup_mod._start_pgvector_docker("localhost", 5432)
+
+        run_cmd = next(c for c in commands if c[:3] == ["docker", "run", "-d"])
+        assert "-p" in run_cmd
+        port_publish = run_cmd[run_cmd.index("-p") + 1]
+        assert port_publish == "127.0.0.1:5432:5432"
+        env_arg = run_cmd[run_cmd.index("-e") + 1]
+        assert env_arg.startswith("POSTGRES_PASSWORD=")
+        password = env_arg.split("=", 1)[1]
+        assert password != "hermes"
+        assert result is not None and result["password"] == password
+        # The generated password is persisted for later wizard runs.
+        stored = (tmp_path / "pgvector-password").read_text(encoding="utf-8").strip()
+        assert stored == password

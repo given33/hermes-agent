@@ -78,7 +78,7 @@ def get_env_value(name: str, default=None):
     xAI credential resolver.
     """
     try:
-        from hermes_cli.config import get_env_value as _hermes_get_env_value
+        from hermes_runtime.config import get_env_value as _hermes_get_env_value
 
         value = _hermes_get_env_value(name)
         if value is not None:
@@ -100,7 +100,7 @@ def hermes_xai_user_agent() -> str:
 def _load_config_section(section_name: str) -> Dict[str, Any]:
     """Return a top-level Hermes config section as a dict, or empty."""
     try:
-        from hermes_cli.config import load_config
+        from hermes_runtime.config import load_config
 
         cfg = load_config()
         section = cfg.get(section_name) if isinstance(cfg, dict) else None
@@ -261,7 +261,7 @@ def resolve_xai_http_credentials(
     """
     try:
         from agent.credential_pool import load_pool
-        import hermes_cli.auth as auth_mod
+        import agent.provider_auth as auth_mod
 
         pool = load_pool("xai-oauth")
         entry = (

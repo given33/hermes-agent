@@ -31,6 +31,7 @@ import json
 import logging
 import os
 import re
+import threading
 from types import SimpleNamespace
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -56,6 +57,15 @@ except Exception:
 
 _bedrock_runtime_client_cache: Dict[str, Any] = {}
 _bedrock_control_client_cache: Dict[str, Any] = {}
+# Guards both caches. ``boto3.client(...)`` without an explicit Session goes
+# through the module-level default botocore Session, which is NOT thread-safe
+# during client construction (concurrent first calls can crash with
+# KeyError: 'credential_provider' or UnknownServiceError while the loader
+# mutates shared state). MoA fan-out hits this: several worker threads ask
+# for the same region's client at once. Double-checked locking below makes
+# exactly one thread build the client; losers reuse the winner's instance
+# (the built client itself is thread-safe per boto3 docs).
+_bedrock_client_cache_lock = threading.Lock()
 
 
 _MIN_BOTO3_VERSION = (1, 34, 59)
@@ -93,28 +103,45 @@ def _get_bedrock_runtime_client(region: str):
 
     Uses the default AWS credential chain (env vars → profile → instance role).
     """
-    if region not in _bedrock_runtime_client_cache:
-        boto3 = _require_boto3()
-        _bedrock_runtime_client_cache[region] = boto3.client(
-            "bedrock-runtime", region_name=region,
-        )
-    return _bedrock_runtime_client_cache[region]
+    # Lock-free fast path: dict reads are atomic under the GIL, and once a
+    # region is cached the entry is only ever replaced wholesale.
+    client = _bedrock_runtime_client_cache.get(region)
+    if client is not None:
+        return client
+    boto3 = _require_boto3()  # import outside the lock — may pip-install
+    with _bedrock_client_cache_lock:
+        # Re-check under the lock: another thread may have won the race and
+        # built the client while we imported boto3.
+        client = _bedrock_runtime_client_cache.get(region)
+        if client is None:
+            client = boto3.client(
+                "bedrock-runtime", region_name=region,
+            )
+            _bedrock_runtime_client_cache[region] = client
+    return client
 
 
 def _get_bedrock_control_client(region: str):
     """Get or create a cached ``bedrock`` control-plane client for model discovery."""
-    if region not in _bedrock_control_client_cache:
-        boto3 = _require_boto3()
-        _bedrock_control_client_cache[region] = boto3.client(
-            "bedrock", region_name=region,
-        )
-    return _bedrock_control_client_cache[region]
+    client = _bedrock_control_client_cache.get(region)
+    if client is not None:
+        return client
+    boto3 = _require_boto3()
+    with _bedrock_client_cache_lock:
+        client = _bedrock_control_client_cache.get(region)
+        if client is None:
+            client = boto3.client(
+                "bedrock", region_name=region,
+            )
+            _bedrock_control_client_cache[region] = client
+    return client
 
 
 def reset_client_cache():
     """Clear cached boto3 clients. Used in tests and profile switches."""
-    _bedrock_runtime_client_cache.clear()
-    _bedrock_control_client_cache.clear()
+    with _bedrock_client_cache_lock:
+        _bedrock_runtime_client_cache.clear()
+        _bedrock_control_client_cache.clear()
 
 
 def invalidate_runtime_client(region: str) -> bool:
@@ -128,8 +155,9 @@ def invalidate_runtime_client(region: str) -> bool:
     Returns True if a cached entry was evicted, False if the region was not
     cached.
     """
-    existed = region in _bedrock_runtime_client_cache
-    _bedrock_runtime_client_cache.pop(region, None)
+    with _bedrock_client_cache_lock:
+        existed = region in _bedrock_runtime_client_cache
+        _bedrock_runtime_client_cache.pop(region, None)
     return existed
 
 

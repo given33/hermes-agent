@@ -541,7 +541,7 @@ class CLIAgentSetupMixin:
         last ``MAX_DISPLAY_EXCHANGES`` user/assistant exchanges and shows
         an indicator for earlier hidden messages.
         """
-        from cli import CLI_CONFIG, _record_output_history_entry, _strip_reasoning_tags, _suspend_output_history
+        from cli import _record_output_history_entry, _strip_reasoning_tags, _suspend_output_history
         from tools.ansi_strip import sanitize_display_text as _sanitize_display_text
         if not self.conversation_history:
             return
@@ -551,7 +551,8 @@ class CLIAgentSetupMixin:
             return
 
         # Read limits from config (with hardcoded defaults)
-        _disp = CLI_CONFIG.get("display", {})
+        _config = getattr(self, "config", {})
+        _disp = _config.get("display", {}) if isinstance(_config, dict) else {}
         MAX_DISPLAY_EXCHANGES = int(_disp.get("resume_exchanges", 10))
         MAX_USER_LEN = int(_disp.get("resume_max_user_chars", 300))
         MAX_ASST_LEN = int(_disp.get("resume_max_assistant_chars", 200))

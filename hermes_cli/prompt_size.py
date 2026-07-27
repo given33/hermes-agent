@@ -33,7 +33,7 @@ def _build_inspection_agent(platform: str) -> Any:
     platform come from the caller so the breakdown matches a real session.
     """
     from run_agent import AIAgent
-    from hermes_cli.config import load_config
+    from hermes_runtime.config import load_config
     from hermes_cli.tools_config import _get_platform_tools
 
     cfg = load_config()

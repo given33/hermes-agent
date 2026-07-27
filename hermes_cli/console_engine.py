@@ -914,20 +914,6 @@ class HermesConsoleEngine:
             confirmation="Send this message?",
         )
 
-        portal_paths = [("info",), ("tools",)]
-        _register_command_family(
-            self,
-            root="portal",
-            paths=portal_paths,
-            summaries=_adder_summaries("hermes_cli.portal_cli", "add_parser"),
-            handler_factory=lambda fixed: _adder_handler(
-                "portal",
-                fixed,
-                "hermes_cli.portal_cli",
-                "add_parser",
-            ),
-        )
-
         _register_command_family(
             self,
             root="project",
@@ -1197,8 +1183,6 @@ class HermesConsoleEngine:
             ("profile", "alias"): "`profile alias` creates shell wrappers and is not available in Hermes Console.",
             ("skills", "config"): "`skills config` is interactive and is not available in Hermes Console.",
             ("skills", "publish"): "`skills publish` is not available in Hermes Console.",
-            ("portal", "login"): "`portal login` is interactive and is not available in Hermes Console.",
-            ("portal", "open"): "`portal open` opens a browser and is not available in Hermes Console.",
             ("kanban", "tail"): "`kanban tail` streams output and is not available in Hermes Console.",
             ("kanban", "watch"): "`kanban watch` streams output and is not available in Hermes Console.",
             ("kanban", "daemon"): "`kanban daemon` starts a service and is not available in Hermes Console.",
@@ -1358,14 +1342,14 @@ def _sessions_stats(_engine: HermesConsoleEngine, args: list[str]) -> str:
 
 def _config_show(_engine: HermesConsoleEngine, args: list[str]) -> str:
     _expect_no_args(args, "config show")
-    from hermes_cli.config import show_config
+    from hermes_cli.config_commands import show_config
 
     return _capture_output(show_config)
 
 
 def _config_path(_engine: HermesConsoleEngine, args: list[str]) -> str:
     _expect_no_args(args, "config path")
-    from hermes_cli.config import get_config_path
+    from hermes_runtime.config import get_config_path
 
     return str(get_config_path())
 
@@ -1375,7 +1359,7 @@ def _config_set(_engine: HermesConsoleEngine, args: list[str]) -> str:
         raise ConsoleCommandError("Usage: config set <key> <value>")
     key = args[0]
     value = " ".join(args[1:])
-    from hermes_cli.config import set_config_value
+    from hermes_cli.config_commands import set_config_value
 
     return _capture_output(lambda: set_config_value(key, value))
 
@@ -1384,7 +1368,7 @@ def _config_migrate(_engine: HermesConsoleEngine, args: list[str]) -> str:
     _expect_no_args(args, "config migrate")
 
     def _run() -> None:
-        from hermes_cli.config import migrate_config
+        from hermes_runtime.config import migrate_config
 
         results = migrate_config(interactive=False, quiet=False)
         if results.get("env_added") or results.get("config_added"):

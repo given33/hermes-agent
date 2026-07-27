@@ -615,6 +615,22 @@ def test_real_dashboard_routes_register_login_refresh_and_authorize_api():
             "/api/sessions",
             headers={"Authorization": f"Bearer {token}"},
         )
+        memory_before = client.get(
+            "/api/hermes/memory",
+            params={"profile": "default"},
+            headers={"Authorization": f"Bearer {token}"},
+        )
+        memory_written = client.put(
+            "/api/hermes/memory",
+            params={"profile": "default"},
+            headers={"Authorization": f"Bearer {token}"},
+            json={"section": "user", "content": "owner mobile profile"},
+        )
+        memory_after = client.get(
+            "/api/hermes/memory",
+            params={"profile": "default"},
+            headers={"Authorization": f"Bearer {token}"},
+        )
         rejected = client.get(
             "/api/sessions",
             headers={"Authorization": "Bearer invalid"},
@@ -665,6 +681,12 @@ def test_real_dashboard_routes_register_login_refresh_and_authorize_api():
     assert handshake_authed.status_code == 200
     assert handshake_authed.json()["api_version"] == 1
     assert protected.status_code == 200
+    assert memory_before.status_code == 200
+    assert memory_before.json()["user"] == ""
+    assert memory_written.status_code == 200
+    assert memory_written.json()["user"] == "owner mobile profile"
+    assert memory_after.status_code == 200
+    assert memory_after.json()["user"] == "owner mobile profile"
     assert rejected.status_code == 401
     assert login.status_code == 200
     assert refresh.status_code == 200

@@ -136,7 +136,7 @@ class GatewayKanbanWatchersMixin:
         # in the dispatch owner's per-board DBs. This prevents N-gateway -shm contention.
         # TODO: gate per-board when per-board dispatcher_owner tracking lands.
         try:
-            from hermes_cli.config import load_config as _load_config
+            from hermes_runtime.config import load_config as _load_config
         except Exception:
             logger.warning("kanban notifier: config loader unavailable; disabled")
             return
@@ -764,7 +764,7 @@ class GatewayKanbanWatchersMixin:
         # watcher here. Honours HERMES_KANBAN_DISPATCH_IN_GATEWAY env var
         # as an escape hatch (false-y value disables without editing YAML).
         try:
-            from hermes_cli.config import load_config as _load_config
+            from hermes_runtime.config import load_config as _load_config
         except Exception:
             logger.warning("kanban dispatcher: config loader unavailable; disabled")
             return

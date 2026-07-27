@@ -4,7 +4,7 @@ import { Check, ChevronRight, Terminal } from '@/lib/icons'
 import type { OAuthProvider } from '@/types/hermes'
 
 const PROVIDER_DISPLAY: Record<string, { order: number; title: string }> = {
-  nous: { order: 0, title: 'Nous Portal' },
+  nous: { order: 0, title: 'Nous Research API' },
   'openai-codex': { order: 1, title: 'OpenAI OAuth (ChatGPT)' },
   'minimax-oauth': { order: 2, title: 'MiniMax' },
   'qwen-oauth': { order: 3, title: 'Qwen Code' },

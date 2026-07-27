@@ -49,7 +49,7 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional, Set, Tuple
 
 from hermes_constants import get_hermes_home
-from agent.skill_utils import is_excluded_skill_path
+from hermes_runtime.skill_utils import is_excluded_skill_path
 
 logger = logging.getLogger(__name__)
 
@@ -147,7 +147,7 @@ def _utc_id(now: Optional[datetime] = None) -> str:
 
 def _load_config() -> Dict[str, Any]:
     try:
-        from hermes_cli.config import load_config
+        from hermes_runtime.config import load_config
         cfg = load_config()
     except Exception as e:
         logger.debug("Failed to load config for curator backup: %s", e)

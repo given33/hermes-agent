@@ -1336,10 +1336,10 @@ class TestAuxiliaryPoolAwareness:
 
         assert client is not None
         assert model == "google/gemini-3-flash-preview"
-        assert mock_openai.call_args.kwargs["api_key"] == pooled_token
+        assert mock_openai.call_args.kwargs["api_key"] == "pooled-access-token"
         assert mock_openai.call_args.kwargs["base_url"] == "https://inference.pool.example/v1"
 
-    def test_try_nous_refreshes_stale_pool_entry(self):
+    def test_try_nous_uses_direct_pool_key_without_portal_refresh(self):
         stale_token = _jwt_with_claims({
             "scope": "inference:invoke",
             "exp": int(time.time() - 60),
@@ -1380,13 +1380,13 @@ class TestAuxiliaryPoolAwareness:
 
             client, model = _try_nous()
 
-        assert pool.refreshed is True
+        assert pool.refreshed is False
         assert client is not None
         assert model == "google/gemini-3-flash-preview"
-        assert mock_openai.call_args.kwargs["api_key"] == fresh_token
+        assert mock_openai.call_args.kwargs["api_key"] == "pooled-access-token"
         assert mock_openai.call_args.kwargs["base_url"] == "https://inference.pool.example/v1"
 
-    def test_resolve_nous_runtime_api_rejects_stale_pool_entry_when_refresh_fails(self):
+    def test_resolve_nous_runtime_api_treats_pool_access_token_as_direct_key(self):
         stale_token = _jwt_with_claims({
             "scope": "inference:invoke",
             "exp": int(time.time() - 60),
@@ -1420,10 +1420,12 @@ class TestAuxiliaryPoolAwareness:
 
             runtime = _resolve_nous_runtime_api()
 
-        assert runtime is None
+        assert runtime == (
+            "pooled-access-token",
+            "https://inference.pool.example/v1",
+        )
 
-    def test_try_nous_uses_portal_recommendation_for_text(self):
-        """When the Portal recommends a compaction model, _try_nous honors it."""
+    def test_try_nous_uses_stable_default_for_text(self):
         fresh_base = "https://inference-api.nousresearch.com/v1"
         with (
             patch("agent.auxiliary_client._read_nous_auth", return_value={"access_token": "***"}),
@@ -1437,11 +1439,10 @@ class TestAuxiliaryPoolAwareness:
             client, model = _try_nous(vision=False)
 
         assert client is not None
-        assert model == "minimax/minimax-m2.7"
-        assert mock_rec.call_args.kwargs["vision"] is False
+        assert model == "google/gemini-3-flash-preview"
+        mock_rec.assert_not_called()
 
-    def test_try_nous_uses_portal_recommendation_for_vision(self):
-        """Vision tasks should ask for the vision-specific recommendation."""
+    def test_try_nous_uses_stable_default_for_vision(self):
         fresh_base = "https://inference-api.nousresearch.com/v1"
         with (
             patch("agent.auxiliary_client._read_nous_auth", return_value={"access_token": "***"}),
@@ -1454,7 +1455,7 @@ class TestAuxiliaryPoolAwareness:
 
         assert client is not None
         assert model == "google/gemini-3-flash-preview"
-        assert mock_rec.call_args.kwargs["vision"] is True
+        mock_rec.assert_not_called()
 
     def test_try_nous_falls_back_when_recommendation_lookup_raises(self):
         """If the Portal lookup throws, we must still return a usable model."""
@@ -1499,9 +1500,7 @@ class TestAuxiliaryPoolAwareness:
         assert stale_client.chat.completions.create.call_count == 1
         assert fresh_client.chat.completions.create.call_count == 1
 
-    def test_call_llm_refreshes_nous_after_free_tier_block_when_account_paid(self):
-        from hermes_cli.nous_account import NousPortalAccountInfo
-
+    def test_call_llm_does_not_query_account_after_payment_block(self):
         class _Payment404(Exception):
             status_code = 404
 
@@ -1523,22 +1522,17 @@ class TestAuxiliaryPoolAwareness:
             patch("agent.auxiliary_client._resolve_nous_runtime_api", return_value=("fresh-agent-key", "https://inference-api.nousresearch.com/v1")),
             patch(
                 "hermes_cli.nous_account.get_nous_portal_account_info",
-                return_value=NousPortalAccountInfo(
-                    logged_in=True,
-                    source="account_api",
-                    fresh=True,
-                    paid_service_access=True,
-                ),
-            ),
+            ) as mock_account,
         ):
-            result = call_llm(
-                task="compression",
-                messages=[{"role": "user", "content": "hi"}],
-            )
+            with pytest.raises(_Payment404, match="free tier"):
+                call_llm(
+                    task="compression",
+                    messages=[{"role": "user", "content": "hi"}],
+                )
 
-        assert result == {"ok": True}
+        mock_account.assert_not_called()
         assert stale_client.chat.completions.create.call_count == 1
-        assert fresh_client.chat.completions.create.call_count == 1
+        assert fresh_client.chat.completions.create.call_count == 0
 
     @pytest.mark.asyncio
     async def test_async_call_llm_retries_nous_after_401(self):
@@ -1570,9 +1564,7 @@ class TestAuxiliaryPoolAwareness:
         assert fresh_async_client.chat.completions.create.await_count == 1
 
     @pytest.mark.asyncio
-    async def test_async_call_llm_refreshes_nous_after_free_tier_block_when_account_paid(self):
-        from hermes_cli.nous_account import NousPortalAccountInfo
-
+    async def test_async_call_llm_does_not_query_account_after_payment_block(self):
         class _Payment404(Exception):
             status_code = 404
 
@@ -1594,22 +1586,17 @@ class TestAuxiliaryPoolAwareness:
             patch("agent.auxiliary_client._resolve_nous_runtime_api", return_value=("fresh-agent-key", "https://inference-api.nousresearch.com/v1")),
             patch(
                 "hermes_cli.nous_account.get_nous_portal_account_info",
-                return_value=NousPortalAccountInfo(
-                    logged_in=True,
-                    source="account_api",
-                    fresh=True,
-                    paid_service_access=True,
-                ),
-            ),
+            ) as mock_account,
         ):
-            result = await async_call_llm(
-                task="session_search",
-                messages=[{"role": "user", "content": "hi"}],
-            )
+            with pytest.raises(_Payment404, match="free tier"):
+                await async_call_llm(
+                    task="session_search",
+                    messages=[{"role": "user", "content": "hi"}],
+                )
 
-        assert result == {"ok": True}
+        mock_account.assert_not_called()
         assert stale_client.chat.completions.create.await_count == 1
-        assert fresh_async_client.chat.completions.create.await_count == 1
+        assert fresh_async_client.chat.completions.create.await_count == 0
 
     def test_cached_gmi_client_keeps_explicit_slash_model_override(self):
         import agent.auxiliary_client as aux
@@ -3851,13 +3838,14 @@ class TestAuxiliaryAuthRefreshRetry:
     def test_refresh_provider_credentials_force_refreshes_anthropic_oauth_and_evicts_cache(self, monkeypatch):
         stale_client = MagicMock()
         cache_key = ("anthropic", False, None, None, None)
+        patched_cache = {cache_key: (stale_client, "claude-haiku-4-5-20251001", None)}
 
         monkeypatch.setenv("ANTHROPIC_TOKEN", "")
         monkeypatch.setenv("CLAUDE_CODE_OAUTH_TOKEN", "")
         monkeypatch.setenv("ANTHROPIC_API_KEY", "")
 
         with (
-            patch("agent.auxiliary_client._client_cache", {cache_key: (stale_client, "claude-haiku-4-5-20251001", None)}),
+            patch("agent.auxiliary_client._client_cache", patched_cache),
             patch("agent.anthropic_adapter.read_claude_code_credentials", return_value={
                 "accessToken": "expired-token",
                 "refreshToken": "refresh-token",
@@ -3876,7 +3864,13 @@ class TestAuxiliaryAuthRefreshRetry:
 
         mock_refresh_oauth.assert_called_once_with("refresh-token", use_json=False)
         mock_write.assert_called_once_with("fresh-token", "refresh-token-2", 9999999999999)
-        stale_client.close.assert_called_once()
+        # Eviction drops the cache reference so the next call rebuilds with
+        # fresh creds — but it must NOT force-close the stale client: sibling
+        # threads (MoA fan-out) may still be mid-request on it, and a close
+        # here surfaces as a spurious APIConnectionError in those threads.
+        # GC closes it once the in-flight users release their references.
+        assert patched_cache == {}
+        stale_client.close.assert_not_called()
 
     @pytest.mark.asyncio
     async def test_async_call_llm_refreshes_anthropic_on_401_for_non_vision(self):

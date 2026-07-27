@@ -10,7 +10,7 @@ import subprocess
 import shutil
 from pathlib import Path
 
-from hermes_cli.config import get_project_root, get_hermes_home, get_env_path
+from hermes_runtime.config import get_project_root, get_hermes_home, get_env_path
 from hermes_cli.env_loader import load_hermes_dotenv
 from hermes_constants import display_hermes_home
 from hermes_constants import agent_browser_runnable
@@ -23,7 +23,7 @@ _DHH = display_hermes_home()  # user-facing display path (e.g. ~/.hermes or ~/.h
 _env_path = get_env_path()
 load_hermes_dotenv(hermes_home=_env_path.parent, project_env=PROJECT_ROOT / ".env")
 
-from hermes_cli.colors import Colors, color
+from hermes_runtime.colors import Colors, color
 from hermes_cli.models import _HERMES_USER_AGENT
 from hermes_constants import OPENROUTER_MODELS_URL
 from utils import base_url_host_matches
@@ -206,7 +206,7 @@ def _check_context_engineering(hermes_home: Path, cwd: Path | None = None) -> No
     _section("Context Engineering")
     try:
         from agent.context_diagnostics import analyze_context_sources
-        from agent.skill_utils import get_all_skills_dirs
+        from hermes_runtime.skill_utils import get_all_skills_dirs
 
         report = analyze_context_sources(
             cwd=(cwd or Path.cwd()),
@@ -342,7 +342,7 @@ def report_deprecated_config_and_env(
 def _enabled_cli_toolsets_for_doctor() -> set[str] | None:
     """Return toolsets enabled for the CLI, or None if config resolution fails."""
     try:
-        from hermes_cli.config import load_config
+        from hermes_runtime.config import load_config
         from hermes_cli.tools_config import _get_platform_tools
 
         return {str(toolset) for toolset in _get_platform_tools(load_config() or {}, "cli")}
@@ -632,7 +632,7 @@ def managed_scope_check() -> None:
     foot-gun (see docs/design/managed-scope.md §7) and an operator should see it.
     """
     try:
-        from hermes_cli import managed_scope
+        from hermes_runtime import managed_scope
         managed_dir = managed_scope.get_managed_dir()
     except Exception:  # noqa: BLE001 — diagnostics must never crash
         return
@@ -650,6 +650,12 @@ def managed_scope_check() -> None:
 
 def run_doctor(args):
     """Run diagnostic checks."""
+    # Doctor is the most banner-heavy subcommand (box-drawing + ⚕/🩺 glyphs
+    # below crash cp1252/latin-1 stdio). The repair is an explicit entry-point
+    # call now, not an import side effect — see hermes_cli.ensure_utf8_stdio.
+    from hermes_cli import ensure_utf8_stdio
+    ensure_utf8_stdio()
+
     should_fix = getattr(args, 'fix', False)
     ack_target = getattr(args, 'ack', None)
 
@@ -745,8 +751,8 @@ def run_doctor(args):
 
     _section("MCP Server Security")
     try:
-        from hermes_cli.config import load_config
-        from hermes_cli.mcp_security import validate_mcp_server_entry
+        from hermes_runtime.config import load_config
+        from hermes_runtime.mcp_security import validate_mcp_server_entry
 
         servers = load_config().get("mcp_servers") or {}
         suspicious = 0
@@ -876,8 +882,13 @@ def run_doctor(args):
 
         # Validate model.provider and model.default values
         try:
-            import yaml as _yaml
-            cfg = _yaml.safe_load(config_path.read_text(encoding="utf-8")) or {}
+            # Shared raw reader (mtime-cached, lock-guarded, parse-failure
+            # warning) instead of a bare yaml.safe_load. Raw semantics are
+            # intended: doctor inspects what the USER wrote, not the
+            # defaults-merged view. Pass config_path explicitly — doctor's
+            # HERMES_HOME module attribute may be monkeypatched in tests.
+            from hermes_runtime.config import read_raw_config
+            cfg = read_raw_config(config_path)
             model_section = cfg.get("model") or {}
             provider_raw = (model_section.get("provider") or "").strip()
             provider = provider_raw.lower()
@@ -894,7 +905,7 @@ def run_doctor(args):
                 _resolve_auth_provider = None
                 pass
             try:
-                from hermes_cli.config import get_compatible_custom_providers as _compatible_custom_providers
+                from hermes_runtime.config import get_compatible_custom_providers as _compatible_custom_providers
                 from hermes_cli.providers import (
                     normalize_provider as _normalize_catalog_provider,
                     resolve_provider_full as _resolve_provider_full,
@@ -913,7 +924,7 @@ def run_doctor(args):
 
             user_providers = cfg.get("providers")
             if isinstance(user_providers, dict):
-                from hermes_cli.config import is_provider_enabled
+                from hermes_runtime.config import is_provider_enabled
                 known_providers.update(
                     str(name).strip().lower()
                     for name, prov_cfg in user_providers.items()
@@ -1028,7 +1039,7 @@ def run_doctor(args):
             if runtime_provider and runtime_provider not in ("auto", "custom"):
                 try:
                     if runtime_provider == "openrouter":
-                        from hermes_cli.config import get_env_value
+                        from hermes_runtime.config import get_env_value
 
                         configured = bool(
                             str(get_env_value("OPENROUTER_API_KEY") or "").strip()
@@ -1074,7 +1085,7 @@ def run_doctor(args):
                     shutil.copy2(str(example_config), str(config_path))
                     check_ok(f"Created {_DHH}/config.yaml from cli-config.yaml.example")
                 else:
-                    from hermes_cli.config import DEFAULT_CONFIG, save_config
+                    from hermes_runtime.config import DEFAULT_CONFIG, save_config
                     save_config(DEFAULT_CONFIG)
                     check_ok(f"Created {_DHH}/config.yaml from defaults")
                 fixed_count += 1
@@ -1085,7 +1096,7 @@ def run_doctor(args):
     config_path = HERMES_HOME / 'config.yaml'
     if config_path.exists():
         try:
-            from hermes_cli.config import check_config_version, migrate_config
+            from hermes_runtime.config import check_config_version, migrate_config
             current_ver, latest_ver = check_config_version()
             if current_ver < latest_ver:
                 check_warn(
@@ -1109,9 +1120,8 @@ def run_doctor(args):
 
         # Detect stale root-level model keys (known bug source — PR #4329)
         try:
-            import yaml
-            with open(config_path, encoding="utf-8") as f:
-                raw_config = yaml.safe_load(f) or {}
+            from hermes_runtime.config import mutate_config, read_raw_config
+            raw_config = read_raw_config(config_path)
             stale_root_keys = [k for k in ("provider", "base_url") if k in raw_config and isinstance(raw_config[k], str)]
             if stale_root_keys:
                 check_warn(
@@ -1119,25 +1129,38 @@ def run_doctor(args):
                     "(should be under 'model:' section)"
                 )
                 if should_fix:
-                    # Coerce scalar/None ``model:`` into a dict before mutation —
-                    # ``setdefault("model", {})`` would return an existing scalar
-                    # and then ``model_section[k] = ...`` would raise TypeError.
-                    raw_model = raw_config.get("model")
-                    if isinstance(raw_model, dict):
-                        model_section = raw_model
-                    elif isinstance(raw_model, str) and raw_model.strip():
-                        model_section = {"default": raw_model.strip()}
-                        raw_config["model"] = model_section
-                    else:
-                        model_section = {}
-                        raw_config["model"] = model_section
-                    for k in stale_root_keys:
-                        if not model_section.get(k):
-                            model_section[k] = raw_config.pop(k)
+                    # mutate_config re-reads the CURRENT on-disk document under
+                    # the cross-process lock, so re-detect the stale keys inside
+                    # the mutate_fn (a concurrent writer may have fixed or
+                    # changed them since the detection read above).
+                    def _migrate_stale_root_keys(cfg: dict):
+                        stale = [
+                            k for k in ("provider", "base_url")
+                            if k in cfg and isinstance(cfg[k], str)
+                        ]
+                        if not stale:
+                            return None  # nothing left to migrate — skip write
+                        # Coerce scalar/None ``model:`` into a dict before
+                        # mutation — ``setdefault("model", {})`` would return an
+                        # existing scalar and then ``model_section[k] = ...``
+                        # would raise TypeError.
+                        raw_model = cfg.get("model")
+                        if isinstance(raw_model, dict):
+                            model_section = raw_model
+                        elif isinstance(raw_model, str) and raw_model.strip():
+                            model_section = {"default": raw_model.strip()}
+                            cfg["model"] = model_section
                         else:
-                            raw_config.pop(k)
-                    from hermes_cli.config import atomic_config_write
-                    atomic_config_write(config_path, raw_config)
+                            model_section = {}
+                            cfg["model"] = model_section
+                        for k in stale:
+                            if not model_section.get(k):
+                                model_section[k] = cfg.pop(k)
+                            else:
+                                cfg.pop(k)
+                        return cfg
+
+                    mutate_config(_migrate_stale_root_keys, config_path=config_path)
                     check_ok("Migrated stale root-level keys into model section")
                     fixed_count += 1
                 else:
@@ -1156,10 +1179,8 @@ def run_doctor(args):
         # Read the .env FILE directly (load_env), not get_env_value/os.environ,
         # which the startup bridge may already have overridden.
         try:
-            import yaml
-            from hermes_cli.config import load_env, remove_env_value
-            with open(config_path, encoding="utf-8") as f:
-                raw_config = yaml.safe_load(f) or {}
+            from hermes_runtime.config import load_env, read_raw_config, remove_env_value
+            raw_config = read_raw_config(config_path)
             agent_cfg = raw_config.get("agent")
             cfg_max_turns = (
                 agent_cfg.get("max_turns")
@@ -1206,11 +1227,10 @@ def run_doctor(args):
         # Migrations may still live in config.py version steps; doctor does
         # not auto-delete here — only tells the user the modern replacement.
         try:
-            import yaml as _yaml_depr
-            from hermes_cli.config import load_env as _load_env_depr
+            from hermes_runtime.config import load_env as _load_env_depr
+            from hermes_runtime.config import read_raw_config as _read_raw_depr
 
-            with open(config_path, encoding="utf-8") as _f_depr:
-                _raw_for_depr = _yaml_depr.safe_load(_f_depr) or {}
+            _raw_for_depr = _read_raw_depr(config_path)
             # Prefer the on-disk .env so bridged process env (e.g. TERMINAL_CWD
             # from terminal.cwd) does not false-positive.
             try:
@@ -1223,7 +1243,7 @@ def run_doctor(args):
 
         # Validate config structure (catches malformed custom_providers, etc.)
         try:
-            from hermes_cli.config import validate_config_structure
+            from hermes_runtime.config import validate_config_structure
             config_issues = validate_config_structure()
             if config_issues:
                 _section("Config Structure")
@@ -1242,7 +1262,7 @@ def run_doctor(args):
     if not config_path.exists():
         # No config.yaml — still surface deprecated env vars from .env.
         try:
-            from hermes_cli.config import load_env as _load_env_depr
+            from hermes_runtime.config import load_env as _load_env_depr
 
             try:
                 _env_for_depr = _load_env_depr()
@@ -1255,7 +1275,7 @@ def run_doctor(args):
     _section("xAI Model Retirement (May 15, 2026)")
 
     try:
-        from hermes_cli.config import load_config
+        from hermes_runtime.config import load_config
         from hermes_cli.xai_retirement import (
             MIGRATION_GUIDE_URL,
             find_retired_xai_refs,
@@ -1281,16 +1301,9 @@ def run_doctor(args):
 
     try:
         from hermes_cli.auth import (
-            get_nous_auth_status,
             get_codex_auth_status,
             get_minimax_oauth_auth_status,
         )
-
-        nous_status = get_nous_auth_status()
-        if nous_status.get("logged_in"):
-            check_ok("Nous Portal auth", "(logged in)")
-        else:
-            check_warn("Nous Portal auth", "(not logged in)")
 
         codex_status = get_codex_auth_status()
         if codex_status.get("logged_in"):
@@ -2222,7 +2235,7 @@ def run_doctor(args):
         """
         label = "Azure Foundry (Entra ID)".ljust(28)
         try:
-            from hermes_cli.config import load_config
+            from hermes_runtime.config import load_config
             cfg = load_config()
             model_cfg = cfg.get("model") if isinstance(cfg, dict) else {}
             if not isinstance(model_cfg, dict):
@@ -2403,7 +2416,7 @@ def run_doctor(args):
     else:
         check_warn("Skills Hub directory not initialized", "(run: hermes skills list)")
 
-    from hermes_cli.config import get_env_value
+    from hermes_runtime.config import get_env_value
 
     def _gh_authenticated() -> bool:
         """Check if gh CLI is authenticated via token file or device flow."""
@@ -2427,13 +2440,12 @@ def run_doctor(args):
     _section("Memory Provider")
     _active_memory_provider = ""
     try:
-        import yaml as _yaml
+        from hermes_runtime.config import read_raw_config as _read_raw_mem
         _mem_cfg_path = HERMES_HOME / "config.yaml"
         if _mem_cfg_path.exists():
-            with open(_mem_cfg_path, encoding="utf-8") as _f:
-                _raw_cfg = _yaml.safe_load(_f) or {}
+            _raw_cfg = _read_raw_mem(_mem_cfg_path)
             try:
-                from hermes_cli import managed_scope
+                from hermes_runtime import managed_scope
                 _raw_cfg = managed_scope.apply_managed_overlay(_raw_cfg)
             except Exception:
                 pass

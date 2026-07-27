@@ -26,7 +26,7 @@ import posixpath
 from contextvars import ContextVar
 from pathlib import Path
 from typing import Dict, List, Optional
-from hermes_cli.config import cfg_get
+from hermes_runtime.config import cfg_get
 
 try:  # pragma: no cover - exercised via the fail-closed test below
     from agent.file_safety import get_read_block_error
@@ -181,7 +181,7 @@ def _load_config_files() -> List[Dict[str, str]]:
 
     result: List[Dict[str, str]] = []
     try:
-        from hermes_cli.config import read_raw_config
+        from hermes_runtime.config import read_raw_config
         hermes_home = _resolve_hermes_home()
         cfg = read_raw_config()
         cred_files = cfg_get(cfg, "terminal", "credential_files")
@@ -275,7 +275,7 @@ def get_skills_directory_mount(
 
     # Mount external skill dirs
     try:
-        from agent.skill_utils import get_external_skills_dirs
+        from hermes_runtime.skill_utils import get_external_skills_dirs
         for idx, ext_dir in enumerate(get_external_skills_dirs()):
             if ext_dir.is_dir():
                 host_path = _safe_skills_path(ext_dir)
@@ -362,7 +362,7 @@ def iter_skills_files(
 
     # Include external skill dirs
     try:
-        from agent.skill_utils import get_external_skills_dirs
+        from hermes_runtime.skill_utils import get_external_skills_dirs
         for idx, ext_dir in enumerate(get_external_skills_dirs()):
             if not ext_dir.is_dir():
                 continue

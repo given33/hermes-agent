@@ -55,7 +55,7 @@ def test_get_nous_subscription_features_recognizes_direct_exa_backend(monkeypatc
     assert features.web.current_provider == "exa"
 
 
-def test_get_nous_subscription_features_force_fresh_forwards_account_request(monkeypatch):
+def test_get_nous_subscription_features_never_queries_account(monkeypatch):
     calls = []
 
     def fake_account_info(*, force_fresh=False):
@@ -72,12 +72,12 @@ def test_get_nous_subscription_features_force_fresh_forwards_account_request(mon
 
     features = ns.get_nous_subscription_features({}, force_fresh=True)
 
-    assert features.account_info is not None
-    assert features.account_info.paid_service_access is True
-    assert calls == [True]
+    assert features.account_info is None
+    assert features.nous_auth_present is False
+    assert calls == []
 
 
-def test_get_nous_subscription_features_prefers_managed_modal_in_auto_mode(monkeypatch):
+def test_get_nous_subscription_features_prefers_direct_modal_in_auto_mode(monkeypatch):
     monkeypatch.setattr("tools.tool_backend_helpers.managed_nous_tools_enabled", lambda: True)
     monkeypatch.setattr(ns, "get_env_value", lambda name: "")
     monkeypatch.setattr(
@@ -95,11 +95,11 @@ def test_get_nous_subscription_features_prefers_managed_modal_in_auto_mode(monke
 
     assert features.modal.available is True
     assert features.modal.active is True
-    assert features.modal.managed_by_nous is True
-    assert features.modal.direct_override is False
+    assert features.modal.managed_by_nous is False
+    assert features.modal.direct_override is True
 
 
-def test_get_nous_subscription_features_marks_browser_use_as_managed_when_gateway_ready(monkeypatch):
+def test_get_nous_subscription_features_does_not_enable_account_managed_browser(monkeypatch):
     monkeypatch.setattr(ns, "get_env_value", lambda name: "")
     monkeypatch.setattr(
         ns, "get_nous_portal_account_info", lambda: _account(logged_in=True, paid=True)
@@ -118,9 +118,9 @@ def test_get_nous_subscription_features_marks_browser_use_as_managed_when_gatewa
         {"browser": {"cloud_provider": "browser-use"}}
     )
 
-    assert features.browser.available is True
-    assert features.browser.active is True
-    assert features.browser.managed_by_nous is True
+    assert features.browser.available is False
+    assert features.browser.active is False
+    assert features.browser.managed_by_nous is False
     assert features.browser.direct_override is False
     assert features.browser.current_provider == "Browser Use"
 
@@ -483,7 +483,7 @@ def test_prompt_enable_tool_gateway_paid_user_offers_video(monkeypatch):
     assert "video" in blob
 
 
-def test_apply_nous_managed_defaults_writes_video_gen_config(monkeypatch):
+def test_apply_nous_managed_defaults_does_not_write_video_gen_config(monkeypatch):
     """apply_nous_managed_defaults must write video_gen.provider and
     video_gen.use_gateway when a Nous subscriber selects video_gen
     without a direct FAL_KEY."""
@@ -500,12 +500,11 @@ def test_apply_nous_managed_defaults_writes_video_gen_config(monkeypatch):
         config, enabled_toolsets=["video_gen"],
     )
 
-    assert "video_gen" in changed
-    assert config["video_gen"]["provider"] == "fal"
-    assert config["video_gen"]["use_gateway"] is True
+    assert changed == set()
+    assert "video_gen" not in config
 
 
-def test_apply_nous_managed_defaults_writes_image_gen_config(monkeypatch):
+def test_apply_nous_managed_defaults_does_not_write_image_gen_config(monkeypatch):
     """apply_nous_managed_defaults must write image_gen.use_gateway
     when a Nous subscriber selects image_gen without a direct FAL_KEY."""
     monkeypatch.setattr(ns, "managed_nous_tools_enabled", lambda **kw: True)
@@ -521,8 +520,8 @@ def test_apply_nous_managed_defaults_writes_image_gen_config(monkeypatch):
         config, enabled_toolsets=["image_gen"],
     )
 
-    assert "image_gen" in changed
-    assert config["image_gen"]["use_gateway"] is True
+    assert changed == set()
+    assert "image_gen" not in config
 
 
 def test_apply_nous_managed_defaults_skips_fal_tools_when_key_present(monkeypatch):
@@ -547,7 +546,7 @@ def test_apply_nous_managed_defaults_skips_fal_tools_when_key_present(monkeypatc
     assert "video_gen" not in config
 
 
-def test_apply_nous_managed_defaults_preserves_existing_video_gen_section(monkeypatch):
+def test_apply_nous_managed_defaults_leaves_existing_video_gen_section_unchanged(monkeypatch):
     """When video_gen config already exists as a dict, the function should
     update it in-place rather than replacing it."""
     monkeypatch.setattr(ns, "managed_nous_tools_enabled", lambda **kw: True)
@@ -566,85 +565,37 @@ def test_apply_nous_managed_defaults_preserves_existing_video_gen_section(monkey
         config, enabled_toolsets=["video_gen"],
     )
 
-    assert "video_gen" in changed
-    assert config["video_gen"]["provider"] == "fal"
-    assert config["video_gen"]["use_gateway"] is True
-    # Pre-existing keys should be preserved
-    assert config["video_gen"]["model"] == "pixverse-v6"
+    assert changed == set()
+    assert config["video_gen"] == {"model": "pixverse-v6"}
 
 
 # ---------------------------------------------------------------------------
-# ensure_nous_portal_access — inline login gate for `hermes tools`
+# Retired account-managed tool access
 # ---------------------------------------------------------------------------
 
 
-def test_ensure_nous_portal_access_fast_path_when_already_paid(monkeypatch):
-    """Already-entitled users return True without any login prompt."""
-    login_called = {"v": False}
-
+def test_ensure_nous_portal_access_is_fail_closed_without_account_lookup(monkeypatch):
+    calls = []
     monkeypatch.setattr(
-        ns, "get_nous_portal_account_info",
-        lambda **kw: _account(logged_in=True, paid=True),
+        ns,
+        "get_nous_portal_account_info",
+        lambda **kw: calls.append(("account", kw)),
+    )
+    monkeypatch.setattr(
+        ns,
+        "_run_nous_portal_login_only",
+        lambda **kw: calls.append(("login", kw)),
     )
 
-    def _login(**kw):
-        login_called["v"] = True
-        return True
-
-    monkeypatch.setattr(ns, "_run_nous_portal_login_only", _login)
-
-    assert ns.ensure_nous_portal_access() is True
-    assert login_called["v"] is False
-
-
-def test_ensure_nous_portal_access_logs_in_then_grants(monkeypatch):
-    """Logged-out user logs in, then entitlement re-check shows paid access."""
-    states = iter([
-        _account(logged_in=False, paid=None),  # initial check
-        _account(logged_in=True, paid=True),   # after login
-    ])
-    monkeypatch.setattr(
-        ns, "get_nous_portal_account_info", lambda **kw: next(states),
-    )
-    monkeypatch.setattr(ns, "_run_nous_portal_login_only", lambda **kw: True)
-
-    assert ns.ensure_nous_portal_access() is True
-
-
-def test_ensure_nous_portal_access_returns_false_when_login_declined(monkeypatch):
-    monkeypatch.setattr(
-        ns, "get_nous_portal_account_info",
-        lambda **kw: _account(logged_in=False, paid=None),
-    )
-    monkeypatch.setattr(ns, "_run_nous_portal_login_only", lambda **kw: False)
-
-    assert ns.ensure_nous_portal_access() is False
-
-
-def test_ensure_nous_portal_access_false_when_logged_in_but_unpaid(monkeypatch):
-    """Logged in already but no paid access — no login attempt, returns False."""
-    login_called = {"v": False}
-    monkeypatch.setattr(
-        ns, "get_nous_portal_account_info",
-        lambda **kw: _account(logged_in=True, paid=False),
-    )
-
-    def _login(**kw):
-        login_called["v"] = True
-        return True
-
-    monkeypatch.setattr(ns, "_run_nous_portal_login_only", _login)
-
-    assert ns.ensure_nous_portal_access() is False
-    # Already logged in, so no device-code login should be attempted.
-    assert login_called["v"] is False
+    assert ns.ensure_nous_portal_access(capability="managed browser") is False
+    assert calls == []
 
 
 # ---------------------------------------------------------------------------
 # STT — managed-by-Nous detection (Phase 4 follow-up)
 # ---------------------------------------------------------------------------
 
-def test_stt_managed_by_nous_when_provider_openai_and_no_direct_key(monkeypatch):
+def test_stt_requires_direct_key_when_provider_openai(monkeypatch):
     """Default `stt.provider: openai` with a Nous sub + no direct OpenAI key
     should route through the managed audio gateway."""
     monkeypatch.setattr(ns, "get_env_value", lambda name: "")
@@ -664,9 +615,9 @@ def test_stt_managed_by_nous_when_provider_openai_and_no_direct_key(monkeypatch)
 
     features = ns.get_nous_subscription_features({"stt": {"provider": "openai"}})
 
-    assert features.stt.available is True
-    assert features.stt.active is True
-    assert features.stt.managed_by_nous is True
+    assert features.stt.available is False
+    assert features.stt.active is False
+    assert features.stt.managed_by_nous is False
     assert features.stt.direct_override is False
     assert features.stt.current_provider == "OpenAI Whisper"
 

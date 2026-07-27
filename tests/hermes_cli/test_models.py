@@ -684,7 +684,7 @@ class TestUnionWithPortalPaidRecommendations:
 
 
 class TestCheckNousFreeTierCache:
-    """Tests for the TTL cache on check_nous_free_tier()."""
+    """Nous model selection never consults a removed account entitlement."""
 
     def setup_method(self):
         _models_mod._free_tier_cache = None
@@ -693,59 +693,12 @@ class TestCheckNousFreeTierCache:
         _models_mod._free_tier_cache = None
 
     @patch("hermes_cli.nous_account.get_nous_portal_account_info")
-    def test_result_is_cached(self, mock_account):
-        """Second call within TTL returns cached result without account lookup."""
-        mock_account.return_value = NousPortalAccountInfo(
-            logged_in=True,
-            source="jwt",
-            fresh=False,
-            paid_service_access=False,
-        )
-        result1 = check_nous_free_tier()
-        result2 = check_nous_free_tier()
-
-        assert result1 is True
-        assert result2 is True
-        assert mock_account.call_count == 1
-
-    @patch("hermes_cli.nous_account.get_nous_portal_account_info")
-    def test_cache_expires_after_ttl(self, mock_account):
-        """After TTL expires, account info is resolved again."""
-        mock_account.return_value = NousPortalAccountInfo(
-            logged_in=True,
-            source="jwt",
-            fresh=False,
-            paid_service_access=True,
-        )
-        result1 = check_nous_free_tier()
-        assert mock_account.call_count == 1
-
-        cached_result, cached_at = _models_mod._free_tier_cache
-        _models_mod._free_tier_cache = (cached_result, cached_at - _FREE_TIER_CACHE_TTL - 1)
-
-        result2 = check_nous_free_tier()
-        assert mock_account.call_count == 2
-
-        assert result1 is False
-        assert result2 is False
-
-    @patch("hermes_cli.nous_account.get_nous_portal_account_info")
-    def test_force_fresh_bypasses_cache(self, mock_account):
-        mock_account.return_value = NousPortalAccountInfo(
-            logged_in=True,
-            source="account_api",
-            fresh=True,
-            paid_service_access=True,
-        )
-
+    def test_calls_are_account_independent(self, mock_account):
         assert check_nous_free_tier() is False
         assert check_nous_free_tier(force_fresh=True) is False
+        mock_account.assert_not_called()
 
-        assert mock_account.call_count == 2
-        mock_account.assert_called_with(force_fresh=True)
-
-    def test_cache_ttl_is_short(self):
-        """TTL should be short enough to catch upgrades quickly (<=5 min)."""
+    def test_legacy_cache_ttl_remains_bounded_for_compatibility(self):
         assert _FREE_TIER_CACHE_TTL <= 300
 
 

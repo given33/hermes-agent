@@ -433,7 +433,7 @@ class TestNousProfile:
 
     def test_auth_type(self):
         p = get_provider_profile("nous")
-        assert p.auth_type == "oauth_device_code"
+        assert p.auth_type == "api_key"
 
     def test_reasoning_enabled(self):
         p = get_provider_profile("nous")

@@ -252,7 +252,7 @@ def _persist_runtime_env(spectrum_project_id: str, project_secret: str) -> None:
     caller — same CodeQL-clean-flow rationale as the rest of this module.
     """
     try:
-        from hermes_cli.config import save_env_value
+        from hermes_runtime.config import save_env_value
     except ImportError:
         logger.warning("photon: hermes_cli.config unavailable — skipping .env write")
         return
@@ -916,7 +916,7 @@ def _configured_operator_phone() -> Optional[str]:
 
 def _get_config_env_value(key: str) -> Optional[str]:
     try:
-        from hermes_cli.config import get_env_value
+        from hermes_runtime.config import get_env_value
     except Exception:
         return os.getenv(key)
     return get_env_value(key)

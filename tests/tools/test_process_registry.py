@@ -1123,7 +1123,7 @@ class TestKillProcess:
         assert result["status"] == "killed"
         assert terminate_calls == [(12345, 67890)]
 
-    def test_kill_detached_session_uses_host_pid(self, registry):
+    def test_kill_detached_session_uses_host_pid(self, registry, monkeypatch):
         s = _make_session(sid="proc_detached", command="sleep 999")
         s.pid = 424242
         s.detached = True
@@ -1131,32 +1131,32 @@ class TestKillProcess:
 
         terminate_calls = []
 
-        class FakeProcess:
-            def __init__(self, pid):
-                self.pid = pid
-            def children(self, recursive=False):
-                return []
-            def terminate(self):
-                terminate_calls.append(("terminate", self.pid))
-
-        import psutil as _psutil
+        monkeypatch.setattr(
+            registry,
+            "_host_pid_is_ours",
+            lambda pid, expected_start: pid == 424242 and expected_start is None,
+        )
+        monkeypatch.setattr(
+            registry,
+            "_terminate_host_pid",
+            lambda pid, expected_start=None: terminate_calls.append(
+                (pid, expected_start)
+            ),
+        )
+        monkeypatch.setattr(registry, "_write_checkpoint", lambda: None)
 
         try:
             # Post-#21561: liveness probe routes through
             # ``ProcessRegistry._is_host_pid_alive`` (→
-            # ``gateway.status._pid_exists``), and the actual kill on POSIX
+            # ``hermes_runtime.process_probe.pid_exists``), and the actual kill on POSIX
             # routes through ``psutil.Process(pid).terminate()``. Neither
             # touches ``os.kill`` directly. Mock both seams.  Disable the
             # SIGKILL-escalation step (grace=0) so it doesn't call
             # ``psutil.wait_procs`` on the FakeProcess.
-            with patch("gateway.status._pid_exists", return_value=True), \
-                 patch.object(ProcessRegistry, "_daemon_term_grace_seconds",
-                              staticmethod(lambda: 0.0)), \
-                 patch.object(_psutil, "Process", side_effect=lambda pid: FakeProcess(pid)):
-                result = registry.kill_process(s.id)
+            result = registry.kill_process(s.id)
 
             assert result["status"] == "killed"
-            assert ("terminate", 424242) in terminate_calls
+            assert terminate_calls == [(424242, None)]
         finally:
             registry._running.pop(s.id, None)
 

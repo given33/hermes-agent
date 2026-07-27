@@ -69,7 +69,7 @@ MAX_HANDLES = 10
 
 def _load_x_search_config() -> Dict[str, Any]:
     try:
-        from hermes_cli.config import load_config
+        from hermes_runtime.config import load_config
 
         return load_config().get("x_search", {}) or {}
     except Exception:

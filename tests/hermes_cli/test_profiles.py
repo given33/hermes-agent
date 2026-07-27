@@ -695,7 +695,7 @@ class TestDeleteProfile:
         with patch("hermes_cli.profiles._cleanup_gateway_service"), \
              patch("hermes_cli.profiles._profile_bound_backend_pids", return_value=[4242]) as pids, \
              patch("gateway.status.terminate_pid") as terminate, \
-             patch("gateway.status._pid_exists", return_value=False):
+             patch("hermes_runtime.process_probe.pid_exists", return_value=False):
             delete_profile("coder", yes=True)
 
         pids.assert_called_once()
@@ -1889,7 +1889,7 @@ class TestEdgeCases:
         # coder's. start_time is absent so the PID-reuse guard cannot catch it;
         # the profile scope must.
         with patch("gateway.status.get_running_pid", return_value=None), patch(
-            "gateway.status._pid_exists", return_value=True
+            "hermes_runtime.process_probe.pid_exists", return_value=True
         ), patch("gateway.status._get_process_start_time", return_value=None), patch(
             "gateway.status._read_process_cmdline",
             return_value="hermes gateway run --replace",
@@ -1919,7 +1919,7 @@ class TestEdgeCases:
         )
 
         with patch("gateway.status.get_running_pid", return_value=None), patch(
-            "gateway.status._pid_exists", return_value=True
+            "hermes_runtime.process_probe.pid_exists", return_value=True
         ), patch("gateway.status._get_process_start_time", return_value=1000), patch(
             "gateway.status._read_process_cmdline",
             return_value="hermes -p coder gateway run --replace",

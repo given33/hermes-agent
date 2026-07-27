@@ -14,7 +14,7 @@ from pathlib import Path
 
 from hermes_constants import get_hermes_home
 
-from hermes_cli.colors import Colors, color
+from hermes_runtime.colors import Colors, color
 
 def log_info(msg: str):
     print(f"{color('→', Colors.CYAN)} {msg}")
@@ -935,7 +935,7 @@ def main(argv=None) -> int:
     The desktop launches this with the system Python + ``PYTHONPATH=<agentRoot>``
     so ``import hermes_cli`` resolves from source while the venv is torn down.
 
-    This module imports only stdlib + ``hermes_constants`` + ``hermes_cli.colors``
+    This module imports only stdlib + ``hermes_constants`` + ``hermes_runtime.colors``
     (and lazily ``hermes_cli.gui_uninstall``), so it runs fine under a bare
     system Python with no site-packages from the venv.
     """

@@ -21,7 +21,7 @@ import os
 import time
 from typing import Optional, Tuple
 
-from agent.secret_scope import get_secret as _get_secret, is_multiplex_active
+from hermes_runtime.secret_scope import get_secret as _get_secret, is_multiplex_active
 
 # Ensure google-auth is installed before importing. The [vertex] extra is no
 # longer in [all] per the lazy-install policy added 2026-05-12 — lazy_deps
@@ -55,7 +55,7 @@ def _vertex_config() -> dict:
     directly at the call sites below, with config.yaml as the fallback.
     """
     try:
-        from hermes_cli.config import load_config
+        from hermes_runtime.config import load_config
 
         section = load_config().get("vertex")
         return section if isinstance(section, dict) else {}

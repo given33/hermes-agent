@@ -48,6 +48,7 @@ from fastapi.responses import JSONResponse, Response
 from hermes_cli.dashboard_auth import list_token_providers
 from hermes_cli.dashboard_auth.audit import AuditEvent, audit_log
 from hermes_cli.dashboard_auth.base import ProviderError, TokenPrincipal
+from hermes_cli.dashboard_auth.client_ip import client_ip as _resolve_client_ip
 
 _log = logging.getLogger(__name__)
 
@@ -136,10 +137,13 @@ def clear_optional_token_prefixes() -> None:
 
 
 def _client_ip(request: Request) -> str:
-    fwd = request.headers.get("x-forwarded-for", "")
-    if fwd:
-        return fwd.split(",")[0].strip()
-    return request.client.host if request.client else ""
+    """Resolve the client IP for audit records.
+
+    Shared trusted-proxy-aware resolver — a caller must not be able to
+    name itself in the audit trail by sending ``X-Forwarded-For``. See
+    :mod:`hermes_cli.dashboard_auth.client_ip`.
+    """
+    return _resolve_client_ip(request)
 
 
 def extract_bearer_token(request: Request) -> str:

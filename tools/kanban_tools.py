@@ -33,10 +33,10 @@ import logging
 import os
 from typing import Any, Optional
 
-from agent.redact import redact_sensitive_text
+from hermes_runtime.redaction import redact_sensitive_text
 from hermes_cli.goals import judge_goal
 from tools.registry import registry, tool_error
-from hermes_cli.config import cfg_get, load_config
+from hermes_runtime.config import cfg_get, load_config
 
 logger = logging.getLogger(__name__)
 
@@ -54,7 +54,7 @@ def _profile_has_kanban_toolset() -> bool:
     # negligible overhead. The check_fn results are further TTL-cached
     # (~30s) by the tool registry.
     try:
-        from hermes_cli.config import load_config
+        from hermes_runtime.config import load_config
         cfg = load_config()
         toolsets = cfg.get("toolsets", [])
         return "kanban" in toolsets
@@ -1231,7 +1231,7 @@ def _maybe_auto_subscribe(conn: Any, task_id: str) -> bool:
     platform = ""
     chat_id = ""
     try:
-        from gateway.session_context import get_session_env
+        from hermes_runtime.session_context import get_session_env
         platform = get_session_env("HERMES_SESSION_PLATFORM", "")
         chat_id = get_session_env("HERMES_SESSION_CHAT_ID", "")
         if not platform or not chat_id:

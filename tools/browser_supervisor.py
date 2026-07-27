@@ -46,7 +46,7 @@ def _redact_cdp_error_text(exc: object) -> str:
     fixed sentinel if redaction itself raises, erring toward masking.
     """
     try:
-        from agent.redact import redact_cdp_url
+        from hermes_runtime.redaction import redact_cdp_url
 
         return redact_cdp_url(str(exc))
     except Exception:
@@ -55,7 +55,7 @@ def _redact_cdp_error_text(exc: object) -> str:
 
 def _redact_supervisor_text(value: str) -> str:
     """Redact page-originated text before exposing supervisor snapshots."""
-    from agent.redact import redact_sensitive_text
+    from hermes_runtime.redaction import redact_sensitive_text
 
     return redact_sensitive_text(value, force=True)
 
@@ -368,7 +368,7 @@ class CDPSupervisor:
         if not self._ready_event.wait(timeout=timeout):
             self.stop()
             try:
-                from agent.redact import redact_cdp_url
+                from hermes_runtime.redaction import redact_cdp_url
                 _safe_url = redact_cdp_url(self.cdp_url)
             except Exception:
                 _safe_url = "<cdp_url redacted>"

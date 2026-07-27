@@ -1591,7 +1591,7 @@ def interactive_setup() -> None:
     print()
 
     try:
-        from hermes_cli.config import get_env_var, set_env_var
+        from hermes_runtime.config import get_env_var, set_env_var
     except ImportError:
         print("hermes_cli.config not available; set LINE_* vars manually in ~/.hermes/.env")
         return
@@ -1601,7 +1601,7 @@ def interactive_setup() -> None:
         suffix = " [keep current]" if existing else ""
         try:
             if secret:
-                from hermes_cli.secret_prompt import masked_secret_prompt
+                from hermes_runtime.secret_prompt import masked_secret_prompt
                 value = masked_secret_prompt(f"{prompt}{suffix}: ")
             else:
                 value = input(f"{prompt}{suffix}: ").strip()

@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from typing import Any
 
-from hermes_cli.config import load_config, save_config
+from hermes_runtime.config import load_config, save_config
 from hermes_cli.inventory import build_models_payload, load_picker_context
 from hermes_cli.moa_config import DEFAULT_MOA_PRESET_NAME, normalize_moa_config
 

@@ -36,7 +36,7 @@ from urllib.parse import SplitResult, urlsplit, urlunsplit
 
 import requests
 
-from hermes_cli.config import cfg_get, load_config, read_raw_config
+from hermes_runtime.config import cfg_get, load_config, read_raw_config
 from tools.browser_camofox_state import get_camofox_identity
 from tools.registry import tool_error
 
@@ -101,7 +101,7 @@ def _config_cdp_url() -> str:
     same way it already yields to the ``BROWSER_CDP_URL`` env override.
     """
     try:
-        from hermes_cli.config import read_raw_config
+        from hermes_runtime.config import read_raw_config
 
         browser_cfg = read_raw_config().get("browser", {})
         if isinstance(browser_cfg, dict):
@@ -877,7 +877,7 @@ def camofox_vision(question: str, annotate: bool = False,
         # Redact secrets from annotation context before sending to vision LLM.
         # The screenshot image itself cannot be redacted, but at least the
         # text-based accessibility tree snippet won't leak secret values.
-        from agent.redact import redact_sensitive_text
+        from hermes_runtime.redaction import redact_sensitive_text
         annotation_context = redact_sensitive_text(annotation_context)
 
         # Send to vision LLM
@@ -917,7 +917,7 @@ def camofox_vision(question: str, annotate: bool = False,
         analysis = (response.choices[0].message.content or "").strip() if response.choices else ""
 
         # Redact secrets the vision LLM may have read from the screenshot.
-        from agent.redact import redact_sensitive_text
+        from hermes_runtime.redaction import redact_sensitive_text
         analysis = redact_sensitive_text(analysis)
 
         return json.dumps({

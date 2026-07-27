@@ -42,7 +42,6 @@ Requires:
 import asyncio
 import errno
 import hashlib
-import hmac
 import json
 from contextlib import contextmanager, nullcontext
 from contextvars import ContextVar
@@ -89,7 +88,14 @@ from gateway.platforms.base import (
     is_network_accessible,
     validate_media_delivery_path,
 )
-from agent.redact import redact_sensitive_text
+from hermes_runtime.redaction import redact_sensitive_text
+from hermes_services import (
+    DEFAULT_MAX_REQUEST_BYTES,
+    HermesApplicationKernel,
+    accept_cron_fire_request,
+    has_usable_secret,
+    openai_error_body,
+)
 from gateway.readiness import collect_runtime_readiness
 
 logger = logging.getLogger(__name__)
@@ -121,7 +127,9 @@ def _hermes_version() -> str:
 DEFAULT_HOST = "127.0.0.1"
 DEFAULT_PORT = 8642
 MAX_STORED_RESPONSES = 100
-MAX_REQUEST_BYTES = 10_000_000  # 10 MB — accommodates long agent conversations with tool calls
+MAX_REQUEST_BYTES = DEFAULT_MAX_REQUEST_BYTES
+_DEFAULT_API_APPLICATION = HermesApplicationKernel.for_http(surface="api")
+_DEFAULT_API_HTTP_BOUNDARY = _DEFAULT_API_APPLICATION.require_http_boundary()
 CHAT_COMPLETIONS_SSE_KEEPALIVE_SECONDS = 30.0
 MAX_NORMALIZED_TEXT_LENGTH = 65_536  # 64 KB cap for normalized content parts
 MAX_CONTENT_LIST_SIZE = 1_000  # Max items when content is an array
@@ -417,7 +425,7 @@ class ResponseStore:
         self._max_size = max_size
         if db_path is None:
             try:
-                from hermes_cli.config import get_hermes_home
+                from hermes_runtime.config import get_hermes_home
                 db_path = str(get_hermes_home() / "response_store.db")
             except Exception:
                 db_path = ":memory:"
@@ -573,12 +581,6 @@ class ResponseStore:
 # CORS middleware
 # ---------------------------------------------------------------------------
 
-_CORS_HEADERS = {
-    "Access-Control-Allow-Methods": "GET, POST, DELETE, OPTIONS",
-    "Access-Control-Allow-Headers": "Authorization, Content-Type, Idempotency-Key",
-}
-
-
 if AIOHTTP_AVAILABLE:
     @web.middleware
     async def cors_middleware(request, handler):
@@ -677,14 +679,12 @@ def _redact_api_error_text(value: Any, *, limit: int | None = None) -> str:
 
 def _openai_error(message: str, err_type: str = "invalid_request_error", param: str = None, code: str = None) -> Dict[str, Any]:
     """OpenAI-style error envelope."""
-    return {
-        "error": {
-            "message": _redact_api_error_text(message),
-            "type": err_type,
-            "param": param,
-            "code": code,
-        }
-    }
+    return openai_error_body(
+        _redact_api_error_text(message),
+        error_type=err_type,
+        param=param,
+        code=code,
+    )
 
 
 _api_agent_request_reservation: ContextVar[Optional[dict[str, bool]]] = ContextVar(
@@ -751,14 +751,21 @@ if AIOHTTP_AVAILABLE:
     @web.middleware
     async def body_limit_middleware(request, handler):
         """Reject overly large request bodies early based on Content-Length."""
-        if request.method in {"POST", "PUT", "PATCH"}:
-            cl = request.headers.get("Content-Length")
-            if cl is not None:
-                try:
-                    if int(cl) > MAX_REQUEST_BYTES:
-                        return web.json_response(_openai_error("Request body too large.", code="body_too_large"), status=413)
-                except ValueError:
-                    return web.json_response(_openai_error("Invalid Content-Length header.", code="invalid_content_length"), status=400)
+        adapter = request.app.get("api_server_adapter")
+        boundary = (
+            adapter._http_boundary
+            if adapter is not None
+            else _DEFAULT_API_HTTP_BOUNDARY
+        )
+        failure = boundary.validate_content_length(
+            request.method,
+            request.headers.get("Content-Length"),
+        )
+        if failure is not None:
+            return web.json_response(
+                _openai_error(failure.message, code=failure.code),
+                status=failure.status_code,
+            )
         try:
             return await handler(request)
         except web.HTTPRequestEntityTooLarge:
@@ -772,23 +779,12 @@ if AIOHTTP_AVAILABLE:
 else:
     body_limit_middleware = None  # type: ignore[assignment]
 
-_SECURITY_HEADERS = {
-    "Content-Security-Policy": "default-src 'none'; frame-ancestors 'none'",
-    "Permissions-Policy": "camera=(), microphone=(), geolocation=()",
-    "Strict-Transport-Security": "max-age=31536000; includeSubDomains",
-    "X-Content-Type-Options": "nosniff",
-    "X-Frame-Options": "DENY",
-    "X-XSS-Protection": "0",
-    "Referrer-Policy": "no-referrer",
-}
-
-
 if AIOHTTP_AVAILABLE:
     @web.middleware
     async def security_headers_middleware(request, handler):
         """Add security headers to all responses (including errors)."""
         response = await handler(request)
-        for k, v in _SECURITY_HEADERS.items():
+        for k, v in _DEFAULT_API_HTTP_BOUNDARY.response_headers.items():
             response.headers.setdefault(k, v)
         return response
 else:
@@ -949,6 +945,14 @@ class APIServerAdapter(BasePlatformAdapter):
         self._cors_origins: tuple[str, ...] = self._parse_cors_origins(
             extra.get("cors_origins", os.getenv("API_SERVER_CORS_ORIGINS", "")),
         )
+        self._application = HermesApplicationKernel.for_http(
+            surface="api",
+            bearer_secret=self._api_key,
+            allow_unconfigured_bearer=True,
+            allowed_origins=self._cors_origins,
+            max_request_bytes=MAX_REQUEST_BYTES,
+        )
+        self._http_boundary = self._application.require_http_boundary()
         self._model_name: str = self._resolve_model_name(
             extra.get("model_name", os.getenv("API_SERVER_MODEL_NAME", "")),
         )
@@ -1112,7 +1116,7 @@ class APIServerAdapter(BasePlatformAdapter):
         """
         default = 10
         try:
-            from hermes_cli.config import cfg_get, load_config
+            from hermes_runtime.config import cfg_get, load_config
 
             raw = cfg_get(
                 load_config(),
@@ -1148,33 +1152,11 @@ class APIServerAdapter(BasePlatformAdapter):
 
     def _cors_headers_for_origin(self, origin: str) -> Optional[Dict[str, str]]:
         """Return CORS headers for an allowed browser origin."""
-        if not origin or not self._cors_origins:
-            return None
-
-        if "*" in self._cors_origins:
-            headers = dict(_CORS_HEADERS)
-            headers["Access-Control-Allow-Origin"] = "*"
-            headers["Access-Control-Max-Age"] = "600"
-            return headers
-
-        if origin not in self._cors_origins:
-            return None
-
-        headers = dict(_CORS_HEADERS)
-        headers["Access-Control-Allow-Origin"] = origin
-        headers["Vary"] = "Origin"
-        headers["Access-Control-Max-Age"] = "600"
-        return headers
+        return self._http_boundary.cors_headers(origin)
 
     def _origin_allowed(self, origin: str) -> bool:
         """Allow non-browser clients and explicitly configured browser origins."""
-        if not origin:
-            return True
-
-        if not self._cors_origins:
-            return False
-
-        return "*" in self._cors_origins or origin in self._cors_origins
+        return self._http_boundary.origin_allowed(origin)
 
     @staticmethod
     def _clean_log_value(value: Any, *, max_len: int = 200) -> str:
@@ -1240,20 +1222,11 @@ class APIServerAdapter(BasePlatformAdapter):
         connect() refuses to start the API server without API_SERVER_KEY, so
         the no-key branch only exists for tests or unsupported manual wiring.
         """
-        if not self._api_key:
+        decision = self._http_boundary.authorize(
+            request.headers.get("Authorization", "")
+        )
+        if decision.authenticated:
             return None
-
-        auth_header = request.headers.get("Authorization", "")
-        if auth_header.startswith("Bearer "):
-            token = auth_header[7:].strip()
-            # Compare as bytes: ``hmac.compare_digest`` raises TypeError on a
-            # str containing non-ASCII characters, and ``token`` is the raw
-            # client-supplied header. A stray non-ASCII byte in the key would
-            # otherwise crash this handler (500) instead of returning a clean
-            # 401. Encoding both sides keeps the timing-safe comparison and
-            # matches web_server.py's dashboard-token check.
-            if hmac.compare_digest(token.encode(), self._api_key.encode()):
-                return None  # Auth OK
 
         logger.warning(
             "API server rejected invalid API key: %s",
@@ -1437,7 +1410,7 @@ class APIServerAdapter(BasePlatformAdapter):
         """
         if not profile:
             try:
-                from agent.secret_scope import is_multiplex_active
+                from hermes_runtime.secret_scope import is_multiplex_active
 
                 if is_multiplex_active():
                     from gateway.run import _profile_runtime_scope
@@ -2115,7 +2088,7 @@ class APIServerAdapter(BasePlatformAdapter):
             return auth_err
 
         try:
-            from hermes_cli.config import load_config
+            from hermes_runtime.config import load_config
             from hermes_cli.tools_config import (
                 _get_effective_configurable_toolsets,
                 _get_platform_tools,
@@ -4354,25 +4327,6 @@ class APIServerAdapter(BasePlatformAdapter):
         trips NAS's HTTP timeout. The store CAS claim inside fire_due guards
         against double-fire on a NAS/scheduler retry.
         """
-        from hermes_cli.config import cfg_get, load_config
-        from plugins.cron_providers.chronos.verify import get_fire_verifier
-
-        auth = request.headers.get("Authorization", "")
-        token = auth[7:].strip() if auth.startswith("Bearer ") else ""
-
-        cfg = load_config()
-        claims = get_fire_verifier()(
-            token=token,
-            expected_audience=cfg_get(cfg, "cron", "chronos", "expected_audience", default=""),
-            jwks_or_key=cfg_get(cfg, "cron", "chronos", "nas_jwks_url", default="") or None,
-            issuer=cfg_get(cfg, "cron", "chronos", "portal_url", default="") or None,
-        )
-        if claims is None:
-            logger.warning(
-                "cron fire: rejected invalid token: %s",
-                self._request_audit_log_suffix(request),
-            )
-            return web.json_response({"error": "invalid fire token"}, status=401)
         draining = self._draining_response()
         if draining is not None:
             return draining
@@ -4382,19 +4336,37 @@ class APIServerAdapter(BasePlatformAdapter):
                 body = await request.json()
             except Exception:
                 body = {}
-            job_id = (body or {}).get("job_id")
-            if not job_id:
-                return web.json_response({"error": "missing job_id"}, status=400)
 
             from cron.scheduler_provider import resolve_cron_scheduler
             provider = resolve_cron_scheduler()
 
             loop = asyncio.get_running_loop()
-            # Fire in the background (202 immediately). fire_due claims via the
-            # store CAS, so a retry while this is in flight is de-duped.
-            task = asyncio.create_task(
-                asyncio.to_thread(provider.fire_due, job_id, adapters=None, loop=loop)
+
+            async def execute(command, _target):
+                return await asyncio.to_thread(
+                    provider.fire_due,
+                    command.job_id,
+                    adapters=None,
+                    loop=loop,
+                )
+
+            accepted = await accept_cron_fire_request(
+                request.headers.get("Authorization", ""),
+                body,
+                execute=execute,
             )
+            if accepted.failure is not None:
+                logger.warning(
+                    "cron fire: rejected request (%s): %s",
+                    accepted.failure.code,
+                    self._request_audit_log_suffix(request),
+                )
+
+            task = accepted.background_task
+            if task is None:
+                return web.json_response(
+                    dict(accepted.body), status=accepted.status_code
+                )
             reservation["detached"] = True
             task.add_done_callback(
                 lambda _task: _release_pending_api_work(self, reservation)
@@ -4405,7 +4377,9 @@ class APIServerAdapter(BasePlatformAdapter):
             except (TypeError, AttributeError):
                 pass
 
-            return web.json_response({"status": "accepted", "job_id": job_id}, status=202)
+            return web.json_response(
+                dict(accepted.body), status=accepted.status_code
+            )
 
 
     # ------------------------------------------------------------------
@@ -4609,7 +4583,7 @@ class APIServerAdapter(BasePlatformAdapter):
         the turn — a session resumed later on a delivering interface, e.g. the
         CLI or a gateway platform, re-binds fresh and is NOT blocked).
         """
-        from gateway.session_context import set_session_vars
+        from hermes_runtime.session_context import set_session_vars
 
         return set_session_vars(
             platform="api_server",
@@ -4655,7 +4629,7 @@ class APIServerAdapter(BasePlatformAdapter):
         request_profile = _api_request_profile.get()
 
         def _run():
-            from gateway.session_context import clear_session_vars
+            from hermes_runtime.session_context import clear_session_vars
 
             with self._profile_scope(request_profile):
                 tokens = self._bind_api_server_session(
@@ -4955,7 +4929,7 @@ class APIServerAdapter(BasePlatformAdapter):
                         pass
 
                 def _run_sync():
-                    from gateway.session_context import clear_session_vars
+                    from hermes_runtime.session_context import clear_session_vars
                     from tools.approval import (
                         register_gateway_notify,
                         reset_current_session_key,
@@ -5362,7 +5336,6 @@ class APIServerAdapter(BasePlatformAdapter):
             return False
 
         try:
-            from hermes_cli.auth import has_usable_secret
             if not has_usable_secret(self._api_key, min_length=16):
                 logger.error(
                     "[%s] Refusing to start: API_SERVER_KEY is a "
@@ -5432,7 +5405,7 @@ class APIServerAdapter(BasePlatformAdapter):
             # the operator may have an external firewall / strong key.
             if is_network_accessible(self._host):
                 try:
-                    from hermes_cli.config import load_config as _load_cfg
+                    from hermes_runtime.config import load_config as _load_cfg
                     _backend = (
                         ((_load_cfg() or {}).get("terminal") or {}).get(
                             "backend", "local"

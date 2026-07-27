@@ -184,7 +184,7 @@ def terminate_pid(pid: int, *, force: bool = False) -> None:
         # CREATE_NO_WINDOW: terminate_pid runs from the windowless pythonw.exe
         # gateway/desktop backend, so a bare taskkill spawn would flash a
         # conhost window on every force-kill.
-        from hermes_cli._subprocess_compat import windows_hide_flags
+        from hermes_runtime.subprocess_compat import windows_hide_flags
 
         try:
             result = subprocess.run(
@@ -657,122 +657,13 @@ def _try_acquire_file_lock(handle) -> bool:
         return False
 
 
+from hermes_runtime import process_probe
+
+# Compatibility for gateway-local callers while imports migrate to the
+# runtime foundation. Resolve through the module at call time so platform
+# implementations and test probes share one authoritative entry point.
 def _pid_exists(pid: int) -> bool:
-    """Cross-platform "is this PID alive" check that does NOT kill the target.
-
-    CRITICAL on Windows: Python's ``os.kill(pid, 0)`` is NOT a no-op like it
-    is on POSIX. CPython's Windows implementation
-    (``Modules/posixmodule.c::os_kill_impl``) treats ``sig=0`` as
-    ``CTRL_C_EVENT`` because the two values collide at the C level, and
-    routes it through ``GenerateConsoleCtrlEvent(0, pid)`` — which sends
-    a Ctrl+C to the entire console process group containing the target
-    PID, not just the PID itself. Any caller that wanted to "check if
-    this PID is alive" via ``os.kill(pid, 0)`` on Windows was silently
-    killing that process (and often unrelated processes in the same
-    console group). Long-standing Python quirk; see bpo-14484.
-
-    Implementation: prefer :mod:`psutil` (hard dependency — the canonical
-    cross-platform answer, maintained by Giampaolo Rodolà, uses
-    ``OpenProcess + GetExitCodeProcess`` on Windows internally). Fall back
-    to a hand-rolled ctypes ``OpenProcess`` / ``WaitForSingleObject`` pair
-    on Windows + ``os.kill(pid, 0)`` on POSIX if psutil is somehow
-    unavailable — e.g. stripped-down install or import error during the
-    scaffold phase before ``psutil`` is pip-installed.
-    """
-    try:
-        import psutil  # type: ignore
-
-        # A zombie (defunct) process is still in the process table, so
-        # ``psutil.pid_exists()`` returns True for it — but it is already
-        # dead: SIGKILL has no effect and it cannot be a running gateway.
-        # Treating a zombie as alive makes ``--replace`` wait for the old
-        # PID to die (it never does, until its parent reaps it), then abort
-        # with exit 1 — a silent crash loop under systemd ``Restart=always``,
-        # which respawns the gateway before reaping the previous process
-        # (issue #42126). Report zombies as dead so the takeover proceeds.
-        # Best-effort: any failure to read status (partial/stub psutil,
-        # access denied, transient race) falls through to the authoritative
-        # ``pid_exists()`` below rather than raising.
-        try:
-            if psutil.Process(int(pid)).status() == psutil.STATUS_ZOMBIE:
-                return False
-        except getattr(psutil, "NoSuchProcess", ()):
-            return False
-        except Exception:
-            pass
-        return bool(psutil.pid_exists(int(pid)))
-
-    except ImportError:
-        pass  # Fall through to stdlib fallback.
-    if _IS_WINDOWS:
-        try:
-            import ctypes
-            kernel32 = ctypes.windll.kernel32  # type: ignore[attr-defined]
-            # Pin return types — default ctypes restype is c_int (signed),
-            # which mangles WAIT_* DWORD return codes into negative numbers.
-            kernel32.OpenProcess.restype = ctypes.c_void_p
-            kernel32.WaitForSingleObject.restype = ctypes.c_uint
-            kernel32.GetLastError.restype = ctypes.c_uint
-            PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
-            SYNCHRONIZE = 0x100000  # required for WaitForSingleObject
-            WAIT_TIMEOUT = 0x00000102
-            ERROR_INVALID_PARAMETER = 87
-            ERROR_ACCESS_DENIED = 5
-            handle = kernel32.OpenProcess(
-                PROCESS_QUERY_LIMITED_INFORMATION | SYNCHRONIZE, False, int(pid)
-            )
-            if not handle:
-                err = kernel32.GetLastError()
-                if err == ERROR_INVALID_PARAMETER:
-                    return False  # PID definitely gone
-                if err == ERROR_ACCESS_DENIED:
-                    return True   # Exists but owned by another user/session
-                return False      # Conservative default for unknown errors
-            try:
-                wait_result = kernel32.WaitForSingleObject(handle, 0)
-                # WAIT_TIMEOUT = still running; anything else (WAIT_OBJECT_0
-                # via exit, WAIT_FAILED via handle issue) = treat as gone.
-                return wait_result == WAIT_TIMEOUT
-            finally:
-                kernel32.CloseHandle(handle)
-        except (OSError, AttributeError):
-            return False
-    else:
-        # psutil missing (stripped install / scaffold phase). Catch the same
-        # zombie case as the psutil path above (issue #42126): a zombie
-        # answers os.kill(pid, 0) successfully, so without this check
-        # ``--replace`` would wait on a dead PID and abort with exit 1.
-        try:
-            stat_fields = (
-                Path(f"/proc/{int(pid)}/stat").read_text(encoding="utf-8").split()
-            )
-            if len(stat_fields) > 2 and stat_fields[2] == "Z":
-                return False
-        except FileNotFoundError:
-            # No /proc (macOS/BSD) — fall back to ps state.
-            try:
-                r = subprocess.run(
-                    ["ps", "-o", "state=", "-p", str(int(pid))],
-                    capture_output=True,
-                    text=True,
-                    timeout=5,
-                )
-                if r.returncode == 0 and r.stdout.strip().startswith("Z"):
-                    return False
-            except Exception:
-                pass
-        except (IndexError, PermissionError, OSError):
-            pass
-        try:
-            os.kill(int(pid), 0)  # windows-footgun: ok — POSIX-only branch (the whole point of _pid_exists)
-            return True
-        except ProcessLookupError:
-            return False
-        except PermissionError:
-            # Process exists but we can't signal it — still alive.
-            return True
-        except OSError:
-            return False
+    return process_probe.pid_exists(pid)
 
 
 

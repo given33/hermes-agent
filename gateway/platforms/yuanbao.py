@@ -1660,17 +1660,19 @@ class AutoSetHomeMiddleware(InboundMiddleware):
             if _should_set:
                 try:
                     from hermes_constants import get_hermes_home
-                    from hermes_cli.config import atomic_config_write
-                    import yaml
+                    from hermes_runtime.config import mutate_config
 
                     _home = get_hermes_home()
                     config_path = _home / "config.yaml"
-                    user_config: dict = {}
-                    if config_path.exists():
-                        with open(config_path, encoding="utf-8") as f:
-                            user_config = yaml.safe_load(f) or {}
-                    user_config["YUANBAO_HOME_CHANNEL"] = ctx.chat_id
-                    atomic_config_write(config_path, user_config)
+
+                    # Locked read→mutate→write: the old bare safe_load + write
+                    # raced the gateway's other config writers (slash commands,
+                    # Telegram thread-id write-back) and could drop their keys.
+                    def _set_home_channel(user_config: dict) -> dict:
+                        user_config["YUANBAO_HOME_CHANNEL"] = ctx.chat_id
+                        return user_config
+
+                    mutate_config(_set_home_channel, config_path=config_path)
                     os.environ["YUANBAO_HOME_CHANNEL"] = str(ctx.chat_id)
                     logger.info(
                         "[%s] Auto-sethome: designated %s (%s) as Yuanbao home channel",

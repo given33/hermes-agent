@@ -537,6 +537,12 @@ fi
 
 transaction="$(mktemp -d "${target_root}/.collaboration-install.XXXXXX")"
 installed=0
+# Flipped to 1 immediately before the first in-place install below.  Until
+# then a failure (the service stop or a state snapshot) has modified nothing,
+# so rollback must not run the restore_* helpers: the state snapshots may not
+# have been taken yet (no backup file and no `.missing` marker), which would
+# be misreported as a failed restore and leave ${service} stopped.
+mutated=0
 nginx_reload_attempted=0
 rollback() {
   local exit_code=$?
@@ -548,7 +554,18 @@ rollback() {
     "$(dirname "${nginx_security_target}")/.$(basename "${nginx_security_target}").install.$$" \
     "$(dirname "${nginx_site_target}")/.$(basename "${nginx_site_target}").install.$$"
   if [[ "${installed}" != 1 ]]; then
-    if systemctl stop "${service}" >/dev/null 2>&1; then
+    if [[ "${mutated}" != 1 ]]; then
+      # Failed between `trap rollback EXIT` and the first in-place install
+      # (the `systemctl stop` itself, or one of the state snapshots).  No
+      # target file has been touched, so there is nothing to restore;
+      # leaving service_stopped=0 skips the restore block below.  Just make
+      # sure the service is running again — `systemctl start` is a no-op if
+      # the stop never went through.
+      if ! systemctl start "${service}" >/dev/null 2>&1; then
+        printf '%s\n' "rollback failed: no files were changed but ${service} could not be started" >&2
+        rollback_failed=1
+      fi
+    elif systemctl stop "${service}" >/dev/null 2>&1; then
       service_stopped=1
     else
       printf '%s\n' "rollback failed: could not stop ${service}" >&2
@@ -625,7 +642,13 @@ rollback() {
   rm -f -- "${curl_cfg}"
   cleanup_snapshot
   if [[ "${rollback_failed}" != 0 ]]; then
-    printf '%s\n' "rollback incomplete; ${service} remains stopped" >&2
+    if [[ "${mutated}" != 1 ]]; then
+      # Nothing was modified, so no restore was attempted — but the service
+      # could not be (re)started and needs operator attention.
+      printf '%s\n' "no rollback was required but ${service} is not running" >&2
+    else
+      printf '%s\n' "rollback incomplete; ${service} remains stopped" >&2
+    fi
     exit_code=70
   fi
   exit "${exit_code}"
@@ -736,6 +759,10 @@ install_root_atomic() {
   install -o root -g root -m 0644 "${source}" "${temporary}"
   mv -f -- "${temporary}" "${destination}"
 }
+# Point of no return: everything below replaces live files, so from here on
+# rollback must restore the snapshots taken above instead of merely
+# restarting the service.
+mutated=1
 install_atomic "${snapshot}/plugins/collaboration/dashboard/plugin_api.py" "${plugin_target}/plugin_api.py"
 install_atomic "${snapshot}/plugins/collaboration/dashboard/manifest.json" "${plugin_target}/manifest.json"
 install_atomic "${snapshot}/plugins/collaboration/dashboard/dist/index.js" "${plugin_target}/dist/index.js"

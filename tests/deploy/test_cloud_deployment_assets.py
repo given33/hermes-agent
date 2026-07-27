@@ -432,7 +432,10 @@ def test_public_installer_quiesces_state_during_snapshot_and_rollback():
     assert 'restore_sqlite "${backup}/state/ios-mcp-supervisor.db"' in rollback
     assert 'restore_sqlite "${backup}/state/mobile-auth.db"' in rollback
     assert 'backup_sqlite "${mobile_auth_target}" "${backup}/state/mobile-auth.db"' in installer
-    assert rollback.index("restore_state") < rollback.index('systemctl start "${service}"')
+    mutated_start = rollback.index(
+        'systemctl start "${service}"', rollback.index("restore_state")
+    )
+    assert rollback.index("restore_state") < mutated_start
     assert '/api/plugins/ios-intelligence/health' in installer
     assert '--config "${curl_cfg}"' in installer[installer.index('/api/plugins/ios-intelligence/health') - 160:]
     ios_plugin = (

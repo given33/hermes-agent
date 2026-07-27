@@ -30,7 +30,7 @@ function provider(id: string, loggedIn: boolean, patch: Partial<OAuthProvider> =
     docs_url: '',
     flow: 'device_code',
     id,
-    name: id === 'nous' ? 'Nous Portal' : 'MiniMax',
+    name: id === 'minimax-oauth' ? 'MiniMax' : id,
     status: {
       logged_in: loggedIn
     },
@@ -60,9 +60,9 @@ function keyVar(patch: Partial<EnvVarInfo> = {}): EnvVarInfo {
 beforeEach(() => {
   onboarding.set({ manual: false })
   getEnvVars.mockResolvedValue({})
-  disconnectOAuthProvider.mockResolvedValue({ ok: true, provider: 'nous' })
+  disconnectOAuthProvider.mockResolvedValue({ ok: true, provider: 'minimax-oauth' })
   listOAuthProviders.mockResolvedValue({
-    providers: [provider('nous', true), provider('minimax-oauth', false)]
+    providers: [provider('minimax-oauth', true), provider('qwen-oauth', false)]
   })
   vi.spyOn(window, 'confirm').mockReturnValue(true)
 })
@@ -75,35 +75,27 @@ afterEach(() => {
 
 async function renderProvidersSettings() {
   const { ProvidersSettings } = await import('./providers-settings')
-  let result: ReturnType<typeof render>
-  await act(async () => {
-    result = render(<ProvidersSettings onClose={vi.fn()} onViewChange={vi.fn()} view="accounts" />)
-  })
 
-  return result!
+  return render(<ProvidersSettings onClose={vi.fn()} onViewChange={vi.fn()} view="accounts" />)
 }
 
 describe('ProvidersSettings', () => {
   it('disconnects a connected provider account and refreshes the accounts list', async () => {
     await renderProvidersSettings()
 
-    const remove = await screen.findByRole('button', { name: 'Remove Nous Portal' })
-    await act(async () => {
-      fireEvent.click(remove)
-    })
+    const remove = await screen.findByRole('button', { name: 'Remove MiniMax' })
+    fireEvent.click(remove)
 
-    await waitFor(() => expect(disconnectOAuthProvider).toHaveBeenCalledWith('nous'))
+    await waitFor(() => expect(disconnectOAuthProvider).toHaveBeenCalledWith('minimax-oauth'))
     expect(listOAuthProviders).toHaveBeenCalledTimes(2)
   })
 
   it('keeps provider selection separate from account removal', async () => {
     await renderProvidersSettings()
 
-    await act(async () => {
-      fireEvent.click(await screen.findByText('Nous Portal'))
-    })
+    fireEvent.click(await screen.findByText('MiniMax'))
 
-    expect(startManualProviderOAuth).toHaveBeenCalledWith('nous')
+    expect(startManualProviderOAuth).toHaveBeenCalledWith('minimax-oauth')
     expect(disconnectOAuthProvider).not.toHaveBeenCalled()
   })
 

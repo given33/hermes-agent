@@ -203,7 +203,7 @@ def set_approval_callback(cb):
 def _get_sudo_password_cache_scope() -> str:
     """Return the cache scope for interactive sudo passwords."""
     try:
-        from gateway.session_context import get_session_env
+        from hermes_runtime.session_context import get_session_env
 
         session_key = get_session_env("HERMES_SESSION_KEY", "")
     except Exception:
@@ -955,7 +955,17 @@ import sys
 
 
 # Tool description for LLM
-TERMINAL_TOOL_DESCRIPTION = """Execute shell commands on a Linux environment. Filesystem, current working directory, and exported environment variables persist between calls.
+#
+# Backend-neutral on purpose: every backend runs commands through POSIX bash —
+# _find_bash() resolves git-bash on Windows-local hosts and system bash on
+# macOS/Linux, and the remote backends (docker/modal/ssh/...) are Linux — but
+# the HOST OS varies, and the system prompt's environment-hints block already
+# names it precisely ("Host: Windows (...)", "Terminal backend: docker...",
+# plus _WINDOWS_BASH_SHELL_HINT). Claiming "a Linux environment" here
+# contradicted those hints on Windows/macOS local backends and steered models
+# toward Linux-only commands (apt-get, /proc) the host can't run. Say "POSIX
+# bash" — true everywhere — and let the environment hints carry the OS facts.
+TERMINAL_TOOL_DESCRIPTION = """Execute shell commands in a persistent POSIX bash shell. Filesystem, current working directory, and exported environment variables persist between calls.
 
 Do NOT use cat/head/tail to read files — use read_file instead.
 Do NOT use grep/rg/find to search — use search_files instead.
@@ -1335,7 +1345,7 @@ def _ensure_terminal_env_bridged() -> None:
         return
     _terminal_config_bridge_attempted = True
     try:
-        from hermes_cli.config import apply_terminal_config_to_env
+        from hermes_runtime.config import apply_terminal_config_to_env
 
         # env=None targets os.environ inside the helper; override=False keeps
         # any already-set TERMINAL_* values (e.g. from .env) authoritative.
@@ -2607,7 +2617,7 @@ def terminal_tool(
                 # watch-pattern and completion notifications can be
                 # routed back to the correct chat/thread.
                 if background and (notify_on_complete or watch_patterns):
-                    from gateway.session_context import (
+                    from hermes_runtime.session_context import (
                         async_delivery_supported as _async_ok,
                         get_session_env as _gse,
                     )
@@ -2842,7 +2852,7 @@ def terminal_tool(
             # (code_file=False) to mask opaque tokens with no vendor prefix.
             # Real prefixes, auth headers, JWTs, private keys are masked in
             # both modes. See issue #43025.
-            from agent.redact import redact_terminal_output
+            from hermes_runtime.redaction import redact_terminal_output
             output = redact_terminal_output(output.strip(), command) if output else ""
 
             # Interpret non-zero exit codes that aren't real errors
@@ -3079,7 +3089,10 @@ TERMINAL_SCHEMA = {
         "properties": {
             "command": {
                 "type": "string",
-                "description": "The command to execute on the VM"
+                # "on the VM" predated the multi-backend split — local
+                # backends run on the host, not a VM. Keep it neutral; the
+                # tool description + environment hints name the real target.
+                "description": "The shell command to execute"
             },
             "background": {
                 "type": "boolean",

@@ -223,7 +223,7 @@ def is_free_tier_model(model: str, base_url: str = "") -> bool:
     if not base_url:
         return False
     try:
-        from hermes_cli.models import _is_model_free, _pricing_cache
+        from agent.model_catalog import _is_model_free, _pricing_cache
 
         # Mirror get_pricing_for_provider's key normalization: the agent's
         # Nous base_url is /v1-suffixed (https://inference-api.nousresearch.com/v1)
@@ -739,56 +739,10 @@ def _hydrate_seed_state(agent, state) -> None:
 
 
 def seed_credits_at_session_start(agent) -> bool:
-    """Hydrate agent._credits_state from /api/oauth/account (or a dev fixture) and
-    fire the notice policy, so depletion / usage-band warnings show at session OPEN.
+    """Compatibility no-op after removal of the Nous account product surface.
 
-    Shared by (a) the TUI/desktop agent build (fires at "ready", before any message)
-    and (b) the first-turn conversation setup (fallback for plain CLI / when the
-    build path didn't seed). Idempotent: a second call is a no-op once a seed or a
-    real header has already populated _credits_state.
-
-    Returns True if it seeded this call, False otherwise (not nous / already seeded /
-    fail-open error). Never raises — credits must never block session startup.
+    Direct Nous inference keys do not imply a Portal account. Session startup
+    must therefore never query account or balance endpoints.
     """
-    try:
-        if getattr(agent, "provider", "") != "nous":
-            return False
-        # Idempotent: don't re-seed if state already exists (seed or live header).
-        if getattr(agent, "_credits_state", None) is not None:
-            return False
-        fixture = None
-        try:
-            fixture = dev_fixture_credits_state()
-        except Exception:
-            fixture = None
-        if fixture is not None:
-            # Synchronous: a fixture is instant (no network), and tests rely on the
-            # state + notice landing before this returns.
-            _hydrate_seed_state(agent, fixture)
-            return True
-
-        # Real portal fetch is FIRE-AND-FORGET: a slow/unreachable portal must never
-        # delay session "ready". A daemon thread hydrates + emits when it resolves,
-        # re-checking idempotency first (a live inference header may land before it).
-        import threading
-
-        def _bg_seed() -> None:
-            try:
-                from hermes_cli.nous_account import get_nous_portal_account_info
-                info = get_nous_portal_account_info(force_fresh=True)
-                if getattr(agent, "_credits_state", None) is not None:
-                    return  # a live inference header beat us — don't clobber it
-                state = _credits_state_from_account(info)
-                if state is not None:
-                    _hydrate_seed_state(agent, state)
-            except Exception:
-                logger.debug("credits ▸ session-start seed (background) failed", exc_info=True)
-
-        threading.Thread(target=_bg_seed, name="credits-seed", daemon=True).start()
-        return True
-    except Exception:
-        # Fail-open: any auth/portal hiccup leaves _credits_state as-is, never blocks.
-        # Innermost log across all four call sites (TUI build / CLI build / first
-        # turn / desktop), so a dead session-open seed is diagnosable in agent.log.
-        logger.debug("credits ▸ session-start seed failed (fail-open)", exc_info=True)
-        return False
+    del agent
+    return False

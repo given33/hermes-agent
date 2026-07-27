@@ -33,6 +33,8 @@ from gateway.platforms.base import (
 )
 from gateway.platforms.helpers import strip_markdown
 
+from hermes_secret_compare import constant_time_equals
+
 logger = logging.getLogger(__name__)
 
 # ---------------------------------------------------------------------------
@@ -880,7 +882,19 @@ class BlueBubblesAdapter(BasePlatformAdapter):
             or request.headers.get("x-guid")
             or request.headers.get("x-bluebubbles-guid")
         )
-        if token != self.password:
+        # ``constant_time_equals`` owns all three rules this check needs, and
+        # is the same implementation the dashboard and API server use:
+        #   * constant time — a plain ``!=`` leaks the match prefix, and this
+        #     password doubles as the credential Hermes presents TO the
+        #     BlueBubbles server (see ``_api_url``), so recovering it hands
+        #     over that server too;
+        #   * encode both sides — ``token`` is raw attacker input and
+        #     ``compare_digest`` raises TypeError on non-ASCII str;
+        #   * fail closed on empty — with no configured password the old
+        #     ``token != self.password`` compared "" against "" and
+        #     *authorized* a request carrying no credential at all, turning
+        #     this webhook into an unauthenticated way to trigger agent runs.
+        if not constant_time_equals(token, self.password):
             return web.json_response({"error": "unauthorized"}, status=401)
         try:
             raw = await request.read()

@@ -1,8 +1,4 @@
-"""Tests for the display.credits_notices config gate on _emit_credits_notices.
-
-The toggle suppresses notice EMISSION only — credits state capture and /usage
-stay live. Uses the bare-AIAgent pattern (object.__new__) from test_notice_spine.py.
-"""
+"""Regression tests for the removed Nous account-notice product surface."""
 from __future__ import annotations
 
 from unittest.mock import patch
@@ -27,6 +23,19 @@ def _cfg(enabled):
 
 
 class TestCreditsNoticesToggle:
+    def test_response_headers_are_not_captured(self):
+        agent = _agent_with_state()
+        agent._credits_state = None
+        response = type(
+            "Response",
+            (),
+            {"headers": {"x-nous-credits-remaining": "1000000"}},
+        )()
+
+        agent._capture_credits(response)
+
+        assert agent._credits_state is None
+
     def test_disabled_emits_nothing(self):
         agent = _agent_with_state()
         received = []
@@ -35,39 +44,37 @@ class TestCreditsNoticesToggle:
             agent._emit_credits_notices()
         assert received == []
 
-    def test_enabled_emits_depleted(self):
+    def test_enabled_still_emits_nothing(self):
         agent = _agent_with_state()
         received = []
         agent.notice_callback = received.append
         with patch("hermes_cli.config.load_config", return_value=_cfg(True)):
             agent._emit_credits_notices()
-        assert any(getattr(n, "key", None) == "credits.depleted" for n in received)
+        assert received == []
 
-    def test_default_missing_key_emits(self):
-        """Key absent from config → fail-open True (current behaviour preserved)."""
+    def test_default_missing_key_emits_nothing(self):
         agent = _agent_with_state()
         received = []
         agent.notice_callback = received.append
         with patch("hermes_cli.config.load_config", return_value={"display": {}}):
             agent._emit_credits_notices()
-        assert any(getattr(n, "key", None) == "credits.depleted" for n in received)
+        assert received == []
 
-    def test_config_error_fails_open(self):
+    def test_config_error_emits_nothing(self):
         agent = _agent_with_state()
         received = []
         agent.notice_callback = received.append
         with patch("hermes_cli.config.load_config", side_effect=RuntimeError("boom")):
             agent._emit_credits_notices()
-        assert any(getattr(n, "key", None) == "credits.depleted" for n in received)
+        assert received == []
 
-    def test_toggle_cached_per_agent(self):
-        """load_config is consulted once per agent, not once per emission."""
+    def test_removed_surface_does_not_load_toggle_config(self):
         agent = _agent_with_state()
         agent.notice_callback = lambda n: None
         with patch("hermes_cli.config.load_config", return_value=_cfg(True)) as mock_load:
             agent._emit_credits_notices()
             agent._emit_credits_notices()
-        assert mock_load.call_count == 1
+        assert mock_load.call_count == 0
 
     def test_disabled_state_still_cached_for_usage(self):
         """The gate stops emission only — get_credits_state still returns data."""

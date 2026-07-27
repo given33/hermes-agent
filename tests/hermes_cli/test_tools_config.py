@@ -724,7 +724,7 @@ def test_save_platform_tools_still_preserves_mcp_with_platform_default_present()
     assert "terminal" not in saved
 
 
-def test_visible_providers_include_nous_subscription_when_logged_in(monkeypatch):
+def test_visible_providers_exclude_nous_account_when_logged_in(monkeypatch):
     config = {"model": {"provider": "nous"}}
 
     monkeypatch.setattr(
@@ -739,20 +739,13 @@ def test_visible_providers_include_nous_subscription_when_logged_in(monkeypatch)
 
     providers = _visible_providers(TOOL_CATEGORIES["browser"], config)
 
-    # The managed Nous row is listed (not necessarily first — "Local Browser"
-    # sorts first so a fresh-install Enter lands on the free local backend).
-    assert any(p["name"].startswith("Nous Subscription") for p in providers)
+    assert not any(p["name"].startswith("Nous Subscription") for p in providers)
     # "Local Browser" must be the index-0 default so pressing Enter never
     # walks a user into a paid Nous Portal login.
     assert providers[0]["name"] == "Local Browser"
 
 
-def test_visible_providers_show_nous_subscription_when_logged_out(monkeypatch):
-    """Nous-managed Tool Gateway rows are always listed, even logged out.
-
-    Selecting one triggers an inline Portal login (entitlement is checked at
-    selection time, not visibility time).
-    """
+def test_visible_providers_exclude_nous_account_when_logged_out(monkeypatch):
     config = {"model": {"provider": "openrouter"}}
 
     monkeypatch.setattr(
@@ -767,15 +760,10 @@ def test_visible_providers_show_nous_subscription_when_logged_out(monkeypatch):
 
     providers = _visible_providers(TOOL_CATEGORIES["browser"], config)
 
-    assert any(p["name"].startswith("Nous Subscription") for p in providers)
+    assert not any(p["name"].startswith("Nous Subscription") for p in providers)
 
 
-def test_visible_providers_show_nous_subscription_when_paid_access_is_false(monkeypatch):
-    """Logged-in-but-unpaid users still see the managed rows.
-
-    The paid-access gate moved from visibility to selection time — the row is
-    shown; ``ensure_nous_portal_access`` blocks activation if still unpaid.
-    """
+def test_visible_providers_exclude_nous_account_when_paid_access_is_false(monkeypatch):
     config = {"model": {"provider": "nous"}}
 
     monkeypatch.setattr(
@@ -790,10 +778,10 @@ def test_visible_providers_show_nous_subscription_when_paid_access_is_false(monk
 
     providers = _visible_providers(TOOL_CATEGORIES["browser"], config)
 
-    assert any(p["name"].startswith("Nous Subscription") for p in providers)
+    assert not any(p["name"].startswith("Nous Subscription") for p in providers)
 
 
-def test_visible_providers_force_fresh_shows_nous_subscription_after_upgrade(monkeypatch):
+def test_visible_providers_force_fresh_does_not_restore_nous_account(monkeypatch):
     calls = []
 
     def fake_subscription_features(config, *, force_fresh=False):
@@ -820,9 +808,7 @@ def test_visible_providers_force_fresh_shows_nous_subscription_after_upgrade(mon
         force_fresh=True,
     )
 
-    # The managed Nous row reappears after the entitlement upgrade. It is no
-    # longer asserted to be first — "Local Browser" sorts first by design.
-    assert any(p["name"].startswith("Nous Subscription") for p in providers)
+    assert not any(p["name"].startswith("Nous Subscription") for p in providers)
     assert ("features", True) in calls
 
 
@@ -985,7 +971,7 @@ def test_configure_single_platform_configures_selected_tool_missing_provider(mon
     assert config["platform_toolsets"]["cli"] == ["web"]
 
 
-def test_first_install_nous_auto_configures_managed_defaults(monkeypatch):
+def test_first_install_nous_does_not_auto_configure_account_managed_defaults(monkeypatch):
     monkeypatch.setattr("hermes_cli.nous_subscription.managed_nous_tools_enabled", lambda: True)
     config = {
         "model": {"provider": "nous"},
@@ -1037,14 +1023,14 @@ def test_first_install_nous_auto_configures_managed_defaults(monkeypatch):
 
     tools_command(first_install=True, config=config)
 
-    assert config["web"]["backend"] == "firecrawl"
-    assert config["tts"]["provider"] == "openai"
-    assert config["browser"]["cloud_provider"] == "browser-use"
-    assert config["image_gen"]["use_gateway"] is True
-    assert configured == []
+    assert "web" not in config
+    assert "tts" not in config
+    assert "browser" not in config
+    assert "image_gen" not in config
+    assert set(configured) == {"web", "image_gen", "tts", "browser"}
 
 
-def test_first_install_nous_auto_configures_video_gen(monkeypatch):
+def test_first_install_nous_does_not_auto_configure_account_managed_video(monkeypatch):
     """When a Nous subscriber checks video_gen in the toolset checklist,
     apply_nous_managed_defaults must write video_gen.provider and
     video_gen.use_gateway so the FAL plugin can route through the gateway
@@ -1097,10 +1083,8 @@ def test_first_install_nous_auto_configures_video_gen(monkeypatch):
 
     tools_command(first_install=True, config=config)
 
-    assert config["video_gen"]["provider"] == "fal"
-    assert config["video_gen"]["use_gateway"] is True
-    # video_gen should NOT appear in the manual configure list — it's auto-configured
-    assert "video_gen" not in configured
+    assert "video_gen" not in config
+    assert configured == ["video_gen"]
 
 # ── Platform / toolset consistency ────────────────────────────────────────────
 

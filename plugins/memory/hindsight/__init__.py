@@ -46,7 +46,7 @@ from typing import Any, Dict, List
 from agent.memory_provider import MemoryProvider
 from hermes_constants import get_hermes_home
 from tools.registry import tool_error
-from hermes_cli.config import cfg_get
+from hermes_runtime.config import cfg_get
 
 logger = logging.getLogger(__name__)
 
@@ -550,12 +550,18 @@ def _embedded_profile_env_path(config: dict[str, Any]):
 
 def _materialize_embedded_profile_env(config: dict[str, Any], *, llm_api_key: str | None = None):
     """Write the profile-scoped env file that standalone hindsight-embed uses."""
+    from utils import write_secret_file
+
     profile_env = _embedded_profile_env_path(config)
     profile_env.parent.mkdir(parents=True, exist_ok=True)
     env_values = _build_embedded_profile_env(config, llm_api_key=llm_api_key)
-    profile_env.write_text(
+    # The profile env carries HINDSIGHT_API_LLM_API_KEY — write it through
+    # the TOCTOU-safe secret primitive (temp file born 0o600 before any
+    # secret byte lands) instead of write_text, which creates the file with
+    # umask-default (typically world-readable) permissions.
+    write_secret_file(
+        profile_env,
         "".join(f"{key}={value}\n" for key, value in env_values.items()),
-        encoding="utf-8",
     )
     return profile_env
 
@@ -760,8 +766,8 @@ class HindsightMemoryProvider(MemoryProvider):
         import sys
         from pathlib import Path
 
-        from hermes_cli.config import save_config
-        from hermes_cli.secret_prompt import masked_secret_prompt
+        from hermes_runtime.config import save_config
+        from hermes_runtime.secret_prompt import masked_secret_prompt
 
         from hermes_cli.memory_setup import _CANCELLED, _curses_select, _print_cancelled_setup
 
@@ -938,7 +944,12 @@ class HindsightMemoryProvider(MemoryProvider):
             for k, v in env_writes.items():
                 if k not in updated_keys:
                     new_lines.append(f"{k}={v}")
-            env_path.write_text("\n".join(new_lines) + "\n")
+            # ~/.hermes/.env carries HINDSIGHT_API_KEY / HINDSIGHT_LLM_API_KEY;
+            # use the TOCTOU-safe secret writer (0o600 before content) rather
+            # than a bare write_text that inherits the process umask.
+            from utils import write_secret_file
+
+            write_secret_file(env_path, "\n".join(new_lines) + "\n")
 
         if mode == "local_embedded":
             materialized_config = dict(provider_config)

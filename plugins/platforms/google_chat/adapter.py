@@ -1405,7 +1405,7 @@ class GoogleChatAdapter(BasePlatformAdapter):
             # default log configurations never surface it. Operators must
             # enable DEBUG logging AND set this env var to see the dump.
             try:
-                from agent.redact import redact_sensitive_text
+                from hermes_runtime.redaction import redact_sensitive_text
 
                 dump = redact_sensitive_text(json.dumps(envelope))
             except Exception:
@@ -3429,14 +3429,14 @@ def interactive_setup() -> None:
     prompt for env vars, persist them to ``~/.hermes/.env`` so the next
     gateway restart picks them up.
     """
-    from hermes_cli.cli_output import (
+    from hermes_runtime.console_output import (
         print_info,
         print_success,
         print_warning,
         prompt,
         prompt_yes_no,
     )
-    from hermes_cli.config import get_env_value, save_env_value
+    from hermes_runtime.config import get_env_value, save_env_value
 
     existing_sub = get_env_value("GOOGLE_CHAT_SUBSCRIPTION_NAME")
     if existing_sub:

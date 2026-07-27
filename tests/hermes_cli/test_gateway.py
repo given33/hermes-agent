@@ -2,7 +2,6 @@
 
 import argparse
 import os
-import pty
 import signal
 import subprocess
 import sys
@@ -10,6 +9,11 @@ import textwrap
 from types import ModuleType, SimpleNamespace
 
 import pytest
+
+try:
+    import pty
+except ModuleNotFoundError:  # pragma: no cover - Windows has no pty module
+    pty = None
 
 import hermes_cli.gateway as gateway
 
@@ -92,6 +96,7 @@ def test_run_gateway_exits_nonzero_when_start_gateway_reports_failure(monkeypatc
         (False, "failure", 1),
     ],
 )
+@pytest.mark.skipif(pty is None, reason="POSIX pseudo-terminals are not available")
 def test_gateway_run_subprocess_preserves_daemon_exit_codes(
     tmp_path, stdin_is_tty, outcome, expected_exit
 ):
@@ -1084,7 +1089,7 @@ def test_reap_unsupervised_orphans_sigterms_then_sigkills_survivor(monkeypatch):
     monkeypatch.setattr("gateway.status.write_planned_stop_marker", lambda pid: True)
     # Orphan ignores SIGTERM (matches the field report) and stays alive, so the
     # follow-up SIGKILL must fire.
-    monkeypatch.setattr("gateway.status._pid_exists", lambda pid: True)
+    monkeypatch.setattr("hermes_runtime.process_probe.pid_exists", lambda pid: True)
 
     sent = []
     monkeypatch.setattr(gateway.os, "kill", lambda pid, sig: sent.append((pid, sig)))
@@ -1227,7 +1232,7 @@ class TestStopProfileGateway:
 
         monkeypatch.setattr("gateway.status.get_running_pid", lambda: 12345)
         # Post-#21561: the stop loop sends one SIGTERM via ``os.kill`` then
-        # polls liveness via ``gateway.status._pid_exists`` (safe on
+        # polls liveness via ``hermes_runtime.process_probe.pid_exists`` (safe on
         # Windows — bpo-14484). Instrument both seams separately.
         monkeypatch.setattr(
             gateway.os,
@@ -1235,7 +1240,7 @@ class TestStopProfileGateway:
             lambda pid, sig: calls.__setitem__("kill", calls["kill"] + 1),
         )
         monkeypatch.setattr(
-            "gateway.status._pid_exists",
+            "hermes_runtime.process_probe.pid_exists",
             lambda pid: calls.__setitem__("alive_probes", calls["alive_probes"] + 1) or True,
         )
         monkeypatch.setattr("time.sleep", lambda _: None)

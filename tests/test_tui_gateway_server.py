@@ -762,13 +762,13 @@ def test_write_json_drops_detached_ws_frames(monkeypatch):
 
 
 def test_tui_verbose_tool_details_fail_closed_when_redaction_fails(monkeypatch):
-    redact_module = types.ModuleType("agent.redact")
+    redact_module = types.ModuleType("hermes_runtime.redaction")
 
     def fail_redaction(*_args, **_kwargs):
         raise RuntimeError("redaction unavailable")
 
     setattr(redact_module, "redact_sensitive_text", fail_redaction)
-    monkeypatch.setitem(sys.modules, "agent.redact", redact_module)
+    monkeypatch.setitem(sys.modules, "hermes_runtime.redaction", redact_module)
 
     assert server._redact_tui_verbose_text("api_key=secret") == ""
     assert server._tool_args_text({"api_key": "secret"}) == ""
@@ -801,13 +801,13 @@ def test_tui_verbose_default_cap_stays_small(monkeypatch):
 
 
 def test_tui_verbose_tool_events_omit_details_when_redaction_fails(monkeypatch):
-    redact_module = types.ModuleType("agent.redact")
+    redact_module = types.ModuleType("hermes_runtime.redaction")
 
     def fail_redaction(*_args, **_kwargs):
         raise RuntimeError("redaction unavailable")
 
     setattr(redact_module, "redact_sensitive_text", fail_redaction)
-    monkeypatch.setitem(sys.modules, "agent.redact", redact_module)
+    monkeypatch.setitem(sys.modules, "hermes_runtime.redaction", redact_module)
 
     events: list[tuple[str, str, dict]] = []
     monkeypatch.setattr(
@@ -8633,7 +8633,7 @@ def test_browser_manage_status_falls_back_to_config_cdp_url(monkeypatch):
     fake_cfg = types.SimpleNamespace(
         read_raw_config=lambda: {"browser": {"cdp_url": "http://lan:9222"}}
     )
-    with patch.dict(sys.modules, {"hermes_cli.config": fake_cfg}):
+    with patch.dict(sys.modules, {"hermes_runtime.config": fake_cfg}):
         resp = server.handle_request(
             {"id": "1", "method": "browser.manage", "params": {"action": "status"}}
         )
@@ -9378,7 +9378,7 @@ def test_reload_env_rpc_calls_hermes_cli_reload_env(monkeypatch):
         return 7
 
     fake = types.SimpleNamespace(reload_env=_fake_reload)
-    with patch.dict(sys.modules, {"hermes_cli.config": fake}):
+    with patch.dict(sys.modules, {"hermes_runtime.config": fake}):
         resp = server.handle_request({"id": "1", "method": "reload.env", "params": {}})
 
     assert resp["result"] == {"updated": 7}
@@ -9390,7 +9390,7 @@ def test_reload_env_rpc_surfaces_errors(monkeypatch):
         raise RuntimeError("env path locked")
 
     fake = types.SimpleNamespace(reload_env=_broken)
-    with patch.dict(sys.modules, {"hermes_cli.config": fake}):
+    with patch.dict(sys.modules, {"hermes_runtime.config": fake}):
         resp = server.handle_request({"id": "1", "method": "reload.env", "params": {}})
 
     assert "error" in resp
@@ -10532,6 +10532,23 @@ def test_start_agent_build_passes_session_model_override(
 # ── billing/subscription state + error serialization ─────────────────
 
 
+def test_nous_account_rpc_methods_are_not_registered():
+    removed = {
+        "billing.state",
+        "billing.charge",
+        "billing.charge_status",
+        "billing.auto_reload",
+        "billing.step_up",
+        "usage.bars",
+        "subscription.state",
+        "subscription.preview",
+        "subscription.change",
+        "subscription.resume",
+        "subscription.upgrade",
+    }
+    assert removed.isdisjoint(server._methods)
+
+
 def test_reset_session_agent_clears_session_overrides(monkeypatch):
     """/new is a full conversation boundary: session-scoped /model, /reasoning,
     and /fast overrides do NOT carry into the fresh agent — it re-derives
@@ -10674,6 +10691,8 @@ def test_billing_rate_limit_without_error_defaults_wire_code():
 def _sub_rpc(method, params):
     # These RPCs are in _LONG_HANDLERS (pool-routed → dispatch returns None and the
     # worker writes via the transport), so drive the inline handler directly.
+    if method not in server._methods:
+        pytest.skip("Nous account product is removed from this fork")
     return server.handle_request({"id": "1", "method": method, "params": params})["result"]
 
 

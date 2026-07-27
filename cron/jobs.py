@@ -34,6 +34,7 @@ except ImportError:  # pragma: no cover - non-Windows
 from datetime import datetime, timedelta
 from pathlib import Path
 from hermes_constants import get_hermes_home
+from hermes_runtime.config import expand_env_vars, read_raw_config
 from typing import Optional, Dict, List, Any, Set, Tuple, Union
 
 logger = logging.getLogger(__name__)
@@ -979,20 +980,16 @@ def _resolve_default_model_snapshot() -> Optional[str]:
     or resolution fails (fail-open — caller treats ``None`` as "no snapshot").
     """
     try:
-        import yaml
-        from hermes_cli.config import _expand_env_vars
-
         cfg_path = get_hermes_home() / "config.yaml"
         if not cfg_path.exists():
             return None
-        with cfg_path.open(encoding="utf-8") as f:
-            cfg = yaml.safe_load(f) or {}
+        cfg = read_raw_config(config_path=cfg_path)
         try:
-            from hermes_cli import managed_scope
+            from hermes_runtime import managed_scope
             cfg = managed_scope.apply_managed_overlay(cfg)
         except Exception:
             pass
-        cfg = _expand_env_vars(cfg)
+        cfg = expand_env_vars(cfg)
         model_cfg = cfg.get("model") or {}
         if isinstance(model_cfg, str):
             return model_cfg.strip() or None
@@ -2168,7 +2165,7 @@ _CRON_OUTPUT_DEFAULT_KEEP = 50
 def _cron_output_keep() -> int:
     """Resolve the per-job output-file retention cap from config (``cron.output_retention``)."""
     try:
-        from hermes_cli.config import load_config
+        from hermes_runtime.config import load_config
         cfg = load_config() or {}
         cron_cfg = cfg.get("cron", {}) if isinstance(cfg, dict) else {}
         return int(cron_cfg.get("output_retention", _CRON_OUTPUT_DEFAULT_KEEP))

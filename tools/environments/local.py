@@ -14,7 +14,7 @@ import time
 from pathlib import Path
 
 from tools.environments.base import BaseEnvironment, _pipe_stdin
-from hermes_cli._subprocess_compat import windows_hide_flags
+from hermes_runtime.subprocess_compat import windows_hide_flags
 
 _IS_WINDOWS = platform.system() == "Windows"
 
@@ -226,7 +226,7 @@ def _build_provider_env_blocklist() -> frozenset:
     blocked: set[str] = set()
 
     try:
-        from hermes_cli.auth import PROVIDER_REGISTRY
+        from agent.provider_auth import PROVIDER_REGISTRY
         for pconfig in PROVIDER_REGISTRY.values():
             blocked.update(pconfig.api_key_env_vars)
             if pconfig.auth_type == "aws_sdk":
@@ -237,7 +237,7 @@ def _build_provider_env_blocklist() -> frozenset:
         pass
 
     try:
-        from hermes_cli.config import OPTIONAL_ENV_VARS
+        from hermes_runtime.config import OPTIONAL_ENV_VARS
         for name, metadata in OPTIONAL_ENV_VARS.items():
             category = metadata.get("category")
             if category in {"tool", "messaging"}:
@@ -428,18 +428,18 @@ def _inject_session_context_env(env: dict) -> None:
     tests/tools/test_local_env_session_leak.py.
     """
     try:
-        from gateway.session_context import (
-            _UNSET,
-            _VAR_MAP,
+        from hermes_runtime.session_context import (
+            SESSION_CONTEXT_UNSET,
+            SESSION_CONTEXT_VARS,
             session_context_engaged,
         )
     except Exception:
         return
 
     _engaged = session_context_engaged()
-    for var_name, var in _VAR_MAP.items():
+    for var_name, var in SESSION_CONTEXT_VARS.items():
         value = var.get()
-        if value is not _UNSET:
+        if value is not SESSION_CONTEXT_UNSET:
             # Explicitly bound (including "") — authoritative for this task.
             env[var_name] = "" if value is None else str(value)
         elif _engaged:
@@ -1184,7 +1184,7 @@ def _read_terminal_shell_init_config() -> tuple[list[str], bool]:
     execution never breaks because the config file is unreadable.
     """
     try:
-        from hermes_cli.config import load_config
+        from hermes_runtime.config import load_config
 
         cfg = load_config() or {}
         terminal_cfg = cfg.get("terminal") or {}

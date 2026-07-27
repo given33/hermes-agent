@@ -20,7 +20,6 @@ import functools
 from dataclasses import dataclass
 from datetime import datetime, timezone
 import hashlib
-import hmac
 import inspect
 import importlib.util
 import ipaddress
@@ -42,7 +41,7 @@ import urllib.error
 import urllib.parse
 import zipfile
 
-from hermes_cli._subprocess_compat import windows_detach_flags, windows_hide_flags
+from hermes_runtime.subprocess_compat import windows_detach_flags, windows_hide_flags
 import urllib.request
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
@@ -54,7 +53,7 @@ if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
 from hermes_cli import __version__, __release_date__
-from hermes_cli.config import (
+from hermes_runtime.config import (
     cfg_get,
     DEFAULT_CONFIG,
     OPTIONAL_ENV_VARS,
@@ -75,7 +74,12 @@ from hermes_cli.config import (
     recommended_update_command_for_method,
     redact_key,
     write_platform_config_field,
-    _deep_merge,
+    deep_merge,
+)
+from hermes_services import (
+    HermesApplicationKernel,
+    LOCAL_DASHBOARD_CORS_ORIGIN_REGEX,
+    accept_cron_fire_request,
 )
 from plugins.memory.config_schema import (
     ProviderConfigSchema,
@@ -310,6 +314,10 @@ app.include_router(_memory_oauth_router)
 # injected into the SPA HTML so only the legitimate web UI can use it.
 # ---------------------------------------------------------------------------
 _SESSION_TOKEN = os.environ.get("HERMES_DASHBOARD_SESSION_TOKEN") or secrets.token_urlsafe(32)
+_DASHBOARD_APPLICATION = HermesApplicationKernel.for_http(
+    surface="dashboard", bearer_secret=_SESSION_TOKEN
+)
+_DASHBOARD_HTTP_BOUNDARY = _DASHBOARD_APPLICATION.require_http_boundary()
 _SESSION_HEADER_NAME = "X-Hermes-Session-Token"
 
 # In-browser Chat tab (/chat, /api/pty, /api/ws, …).  Always enabled: the
@@ -321,9 +329,222 @@ _SESSION_HEADER_NAME = "X-Hermes-Session-Token"
 _DASHBOARD_EMBEDDED_CHAT_ENABLED = True
 
 # Simple rate limiter for the reveal endpoint
-_reveal_timestamps: List[float] = []
+_reveal_timestamps: List[float]
 _REVEAL_MAX_PER_WINDOW = 5
 _REVEAL_WINDOW_SECONDS = 30
+
+
+# ---------------------------------------------------------------------------
+# Dashboard runtime state — single named owner for this module's mutable
+# globals (audit finding H5: containment, not a rewrite).
+# ---------------------------------------------------------------------------
+class DashboardRuntimeState:
+    """Registry and documented owner of every module-level MUTABLE global.
+
+    SINGLE-PROCESS CONSTRAINT (the audit's point): everything below lives in
+    this module's globals, so the design only works with exactly ONE
+    dashboard process and ONE web_server import per interpreter. Running N
+    uvicorn/gunicorn workers (or two dashboards on one config) silently
+    breaks auth and state:
+
+      * ``session_token`` — sole anchor of dashboard auth. Minted per
+        process (unless HERMES_DASHBOARD_SESSION_TOKEN pins it), so worker A
+        injects its token into the SPA and worker B rejects those calls
+        with 401. Multi-worker needs a shared secret source (env injected
+        into every worker, or a secrets file) instead of module state.
+      * ``oauth_sessions`` / ``mcp_oauth_flows`` / ``mcp_oauth_transactions``
+        — in-flight PKCE/OAuth state. A callback routed to a different
+        worker finds no flow and the login dies. Needs an external store
+        (DB/redis) or sticky routing.
+      * ``action_procs`` / ``action_commands`` / ``action_results`` —
+        Popen handles are inherently process-local; "is the update still
+        running?" is only answerable by the worker that spawned it. Needs a
+        job table keyed off the log/pid files rather than live handles.
+      * ``reveal_timestamps`` — secret-reveal rate limit; per-worker copies
+        multiply the intended budget by N. Needs a shared counter.
+      * the ``threading.Lock``/``RLock`` members — exclude only threads in
+        THIS process; cross-worker exclusion needs OS/file locks (see
+        hermes_cli.config.config_write_lock) or a single-writer service.
+      * ``dashboard_plugins_cache`` / ``voice_list_last_error`` /
+        ``console_executor`` — legitimately per-process, but cache
+        invalidation ("re-scan plugins") would need cross-worker broadcast.
+
+    OWNERSHIP MODEL: this object is the storage of record. Historical names
+    for mutable dictionaries are compatibility aliases to containers owned by
+    this object, so existing in-place mutations keep working. Scalar state and
+    cache invalidation must go through :func:`get_runtime_state`; rebinding a
+    private module alias is deliberately unsupported because it creates two
+    divergent sources of truth.
+    """
+
+    __slots__ = (
+        "_action_commands",
+        "_action_procs",
+        "_action_results",
+        "_console_executor",
+        "_console_executor_lock",
+        "_dashboard_plugins_cache",
+        "_mcp_oauth_flows",
+        "_mcp_oauth_flows_lock",
+        "_mcp_oauth_transactions",
+        "_mcp_oauth_transactions_lock",
+        "_oauth_sessions",
+        "_oauth_sessions_lock",
+        "_reveal_timestamps",
+        "_session_token",
+        "_skills_profile_lock",
+        "_telegram_onboarding_lock",
+        "_voice_list_last_error",
+    )
+
+    def __init__(self, session_token: str) -> None:
+        self._session_token = session_token
+        self._reveal_timestamps: List[float] = []
+        self._action_procs: Dict[str, subprocess.Popen] = {}
+        self._action_commands: Dict[str, Tuple[str, ...]] = {}
+        self._action_results: Dict[str, Dict[str, Any]] = {}
+        self._oauth_sessions: Dict[str, Dict[str, Any]] = {}
+        self._oauth_sessions_lock = threading.Lock()
+        self._mcp_oauth_flows: dict[str, Any] = {}
+        self._mcp_oauth_flows_lock = threading.Lock()
+        self._mcp_oauth_transactions: dict[tuple[str, str], threading.Lock] = {}
+        self._mcp_oauth_transactions_lock = threading.Lock()
+        self._telegram_onboarding_lock = threading.RLock()
+        self._skills_profile_lock = threading.RLock()
+        self._voice_list_last_error: Optional[str] = None
+        self._console_executor: Optional[concurrent.futures.ThreadPoolExecutor] = None
+        self._console_executor_lock = threading.Lock()
+        self._dashboard_plugins_cache: Optional[list] = None
+
+    # -- auth / secret-reveal -------------------------------------------
+    @property
+    def session_token(self) -> str:
+        """Per-process bearer token every /api call must present."""
+        return self._session_token
+
+    @property
+    def reveal_timestamps(self) -> List[float]:
+        """Sliding-window timestamps for the secret-reveal rate limit."""
+        return self._reveal_timestamps
+
+    # -- dashboard-triggered actions (update/restart subprocesses) -------
+    @property
+    def action_procs(self) -> Dict[str, subprocess.Popen]:
+        """Live Popen handle per action name (liveness/exit-code probe)."""
+        return self._action_procs
+
+    @property
+    def action_commands(self) -> Dict[str, Tuple[str, ...]]:
+        """argv actually spawned per action, for status reporting."""
+        return self._action_commands
+
+    @property
+    def action_results(self) -> Dict[str, Dict[str, Any]]:
+        """Synthetic results for actions handled without a subprocess."""
+        return self._action_results
+
+    # -- provider OAuth onboarding (dashboard-driven) ---------------------
+    @property
+    def oauth_sessions(self) -> Dict[str, Dict[str, Any]]:
+        """In-flight provider OAuth sessions keyed by session id."""
+        return self._oauth_sessions
+
+    @property
+    def oauth_sessions_lock(self) -> threading.Lock:
+        return self._oauth_sessions_lock
+
+    # -- MCP server OAuth flows ------------------------------------------
+    @property
+    def mcp_oauth_flows(self) -> "dict[str, DashboardOAuthFlow]":
+        """Pending MCP OAuth flows keyed by flow id."""
+        return self._mcp_oauth_flows
+
+    @property
+    def mcp_oauth_flows_lock(self) -> threading.Lock:
+        return self._mcp_oauth_flows_lock
+
+    @property
+    def mcp_oauth_transactions(self) -> "dict[tuple[str, str], threading.Lock]":
+        """Per-(server, account) locks serialising MCP token exchanges."""
+        return self._mcp_oauth_transactions
+
+    @property
+    def mcp_oauth_transactions_lock(self) -> threading.Lock:
+        return self._mcp_oauth_transactions_lock
+
+    # -- misc single-process coordination ---------------------------------
+    @property
+    def telegram_onboarding_lock(self) -> threading.RLock:
+        return self._telegram_onboarding_lock
+
+    @property
+    def skills_profile_lock(self) -> threading.RLock:
+        return self._skills_profile_lock
+
+    @property
+    def voice_list_last_error(self) -> Optional[str]:
+        """Last logged ElevenLabs voice-list failure signature (log dedupe)."""
+        return self._voice_list_last_error
+
+    @voice_list_last_error.setter
+    def voice_list_last_error(self, value: Optional[str]) -> None:
+        self._voice_list_last_error = value
+
+    @property
+    def console_executor(self) -> Optional[concurrent.futures.ThreadPoolExecutor]:
+        """Lazily created bounded worker pool for console commands."""
+        return self._console_executor
+
+    @console_executor.setter
+    def console_executor(
+        self, value: Optional[concurrent.futures.ThreadPoolExecutor]
+    ) -> None:
+        self._console_executor = value
+
+    @property
+    def console_executor_lock(self) -> threading.Lock:
+        return self._console_executor_lock
+
+    @property
+    def dashboard_plugins_cache(self) -> Optional[list]:
+        """Per-process cache of discovered dashboard plugins."""
+        return self._dashboard_plugins_cache
+
+    @dashboard_plugins_cache.setter
+    def dashboard_plugins_cache(self, value: Optional[list]) -> None:
+        self._dashboard_plugins_cache = value
+
+
+# The one instance. There must never be a second runtime-state owner in this
+# process; doing so would split authentication, OAuth and process handles.
+_RUNTIME_STATE = DashboardRuntimeState(_SESSION_TOKEN)
+_reveal_timestamps = _RUNTIME_STATE.reveal_timestamps
+
+
+def get_runtime_state() -> DashboardRuntimeState:
+    """Sanctioned handle on the dashboard's mutable runtime state.
+
+    New code (and external callers that today import private names) should
+    go through this instead of reaching into module globals, so the future
+    multi-worker refactor has one seam to change.
+    """
+    return _RUNTIME_STATE
+
+
+def get_session_token() -> str:
+    """Current dashboard session token (see DashboardRuntimeState docs)."""
+    return _RUNTIME_STATE.session_token
+
+
+def get_action_procs() -> Dict[str, subprocess.Popen]:
+    """Live action-subprocess handles (see DashboardRuntimeState docs)."""
+    return _RUNTIME_STATE.action_procs
+
+
+def get_oauth_sessions() -> Dict[str, Dict[str, Any]]:
+    """In-flight provider OAuth sessions (see DashboardRuntimeState docs)."""
+    return _RUNTIME_STATE.oauth_sessions
+
 
 # CORS: restrict to localhost origins only.  The web UI is intended to run
 # locally; binding to 0.0.0.0 with allow_origins=["*"] would let any website
@@ -331,10 +552,19 @@ _REVEAL_WINDOW_SECONDS = 30
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origin_regex=r"^https?://(localhost|127\.0\.0\.1)(:\d+)?$",
+    allow_origin_regex=LOCAL_DASHBOARD_CORS_ORIGIN_REGEX,
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+
+@app.middleware("http")
+async def security_headers_middleware(request: Request, call_next):
+    """Apply the shared dashboard-safe HTTP response policy."""
+    response = await call_next(request)
+    for name, value in _DASHBOARD_HTTP_BOUNDARY.response_headers.items():
+        response.headers.setdefault(name, value)
+    return response
 
 # ---------------------------------------------------------------------------
 # Endpoints that do NOT require the session token.  Everything else under
@@ -352,13 +582,14 @@ app.add_middleware(
 from hermes_cli.dashboard_auth.public_paths import (
     PUBLIC_API_PATHS as _PUBLIC_API_PATHS,
 )
+from hermes_secret_compare import constant_time_equals as _secret_matches
 
 
 def _has_valid_legacy_bearer_token(request: Request) -> bool:
     """True only for the exact legacy ``Authorization`` Bearer credential."""
-    auth = request.headers.get("authorization", "")
-    expected = f"Bearer {_SESSION_TOKEN}"
-    return hmac.compare_digest(auth.encode(), expected.encode())
+    return _DASHBOARD_HTTP_BOUNDARY.authorize(
+        request.headers.get("authorization", "")
+    ).authenticated
 
 
 def _has_valid_session_token(request: Request) -> bool:
@@ -368,11 +599,14 @@ def _has_valid_session_token(request: Request) -> bool:
     already use ``Authorization`` (for example Caddy ``basic_auth``). We still
     accept the legacy Bearer path for backward compatibility with older
     dashboard bundles.
+
+    Both comparisons go through :mod:`hermes_secret_compare` — the single
+    implementation shared with the aiohttp API server, so a change to the
+    comparison rules (constant time, byte encoding, empty-secret handling)
+    cannot land on one HTTP surface and miss another.
     """
-    session_header = request.headers.get(_SESSION_HEADER_NAME, "")
-    if session_header and hmac.compare_digest(
-        session_header.encode(),
-        _SESSION_TOKEN.encode(),
+    if _secret_matches(
+        request.headers.get(_SESSION_HEADER_NAME, ""), _SESSION_TOKEN
     ):
         return True
 
@@ -388,8 +622,7 @@ _QUERY_TOKEN_API_PATHS: frozenset[str] = frozenset({"/api/files/download"})
 def _has_valid_query_token(request: Request, path: str) -> bool:
     if path not in _QUERY_TOKEN_API_PATHS:
         return False
-    token = request.query_params.get("token", "")
-    return bool(token) and hmac.compare_digest(token.encode(), _SESSION_TOKEN.encode())
+    return _secret_matches(request.query_params.get("token", ""), _SESSION_TOKEN)
 
 
 def _require_token(request: Request) -> None:
@@ -1322,7 +1555,7 @@ def _normalize_main_model_assignment(provider: str, model: str) -> tuple[str, st
        ``normalize_model_for_provider`` (e.g. ``anthropic/claude-opus-4.6``
        on native anthropic → ``claude-opus-4-6``).
     """
-    from hermes_cli.config import get_compatible_custom_providers
+    from hermes_runtime.config import get_compatible_custom_providers
     from hermes_cli.models import _KNOWN_PROVIDER_NAMES, normalize_provider
     from hermes_cli.model_normalize import normalize_model_for_provider
     from hermes_cli.providers import resolve_custom_provider, resolve_user_provider
@@ -1943,6 +2176,11 @@ def _default_hermes_root_is_opt_data() -> bool:
     raw = os.environ.get("HERMES_HOME", "").strip()
     if not raw:
         return False
+    # Preserve the hosted layout's POSIX identity when validation runs on a
+    # Windows control host. ``Path('/opt/data')`` otherwise acquires the current
+    # drive and no longer compares equal to the deployment sentinel.
+    if raw.replace("\\", "/").rstrip("/") == "/opt/data":
+        return True
     try:
         from hermes_constants import get_default_hermes_root
 
@@ -2005,7 +2243,8 @@ def _managed_files_policy(request: Request, *, create_root: bool = True) -> Mana
         root = _ensure_managed_root(_HOSTED_MANAGED_FILES_ROOT) if create_root else _HOSTED_MANAGED_FILES_ROOT
         return ManagedFilesPolicy(default_path=root, locked_root=root, can_change_path=False)
 
-    home = _canonical_path(Path.home())
+    configured_home = os.environ.get("HOME", "").strip()
+    home = _canonical_path(Path(configured_home) if configured_home else Path.home())
     return ManagedFilesPolicy(default_path=home, locked_root=None, can_change_path=True)
 
 
@@ -2774,8 +3013,7 @@ def _profile_platform_ports(profile_home: Path, runtime: Optional[dict]) -> Dict
 
     blocks: Dict[str, dict] = {}
     try:
-        with open(profile_home / "config.yaml", encoding="utf-8") as f:
-            cfg = yaml.safe_load(f) or {}
+        cfg = read_raw_config(config_path=profile_home / "config.yaml")
         gateway_cfg = cfg.get("gateway") if isinstance(cfg.get("gateway"), dict) else {}
         # gateway.platforms first, top-level platforms second — later wins,
         # matching the precedence in gateway.config.load_gateway_config().
@@ -3492,7 +3730,6 @@ def _safe_call(mod, fn_name: str, default):
 # ---------------------------------------------------------------------------
 
 
-@app.get("/api/portal")
 async def get_portal_status():
     cfg = load_config() or {}
     auth: Dict[str, Any] = {}
@@ -3650,12 +3887,12 @@ _ACTION_LOG_FILES: Dict[str, str] = {
 
 # ``name`` → most recently spawned Popen handle.  Used so ``status`` can
 # report liveness and exit code without shelling out to ``ps``.
-_ACTION_PROCS: Dict[str, subprocess.Popen] = {}
-_ACTION_COMMANDS: Dict[str, Tuple[str, ...]] = {}
+_ACTION_PROCS = _RUNTIME_STATE.action_procs
+_ACTION_COMMANDS = _RUNTIME_STATE.action_commands
 
 # ``name`` → completed synthetic action result for actions the server handled
 # without spawning a subprocess (for example, unsupported Docker updates).
-_ACTION_RESULTS: Dict[str, Dict[str, Any]] = {}
+_ACTION_RESULTS = _RUNTIME_STATE.action_results
 
 
 def _record_completed_action(name: str, message: str, exit_code: int = 1) -> None:
@@ -4245,25 +4482,19 @@ def _elevenlabs_voice_label(voice: Dict[str, Any]) -> str:
     return f"{name} ({category})" if category else name
 
 
-# Collapses repeated identical ElevenLabs voice-list failures (the desktop
-# re-polls on every settings open/focus) to a single log line. Re-arms on
-# success or when the error signature changes, so a real new failure is seen.
-_voice_list_last_error: Optional[str] = None
-
-
 def _voice_list_error_logged_once(signature: Optional[str]) -> bool:
     """Return True if ``signature`` is new and should be logged now.
 
     Passing ``None`` clears the latch (call on success). Idempotent per
     signature: the same error logs once until it changes.
     """
-    global _voice_list_last_error
+    state = get_runtime_state()
     if signature is None:
-        _voice_list_last_error = None
+        state.voice_list_last_error = None
         return False
-    if signature == _voice_list_last_error:
+    if signature == state.voice_list_last_error:
         return False
-    _voice_list_last_error = signature
+    state.voice_list_last_error = signature
     return True
 
 
@@ -6952,7 +7183,7 @@ def set_moa_models(body: MoaConfigPayload, profile: Optional[str] = None):
 
         def _slot_dict(slot: MoaModelSlot) -> dict:
             # Drop unset optionals so saved slots stay minimal ({provider, model}).
-            return {k: v for k, v in slot.dict().items() if v is not None}
+            return {k: v for k, v in slot.model_dump().items() if v is not None}
 
         def _preset_dict(preset: MoaPresetPayload) -> dict:
             return {
@@ -7430,7 +7661,7 @@ async def update_config(body: ConfigUpdate, profile: Optional[str] = None):
             # frontend can only overwrite what it explicitly sends.
             existing = read_raw_config()
             incoming = _denormalize_config_from_web(body.config)
-            save_config(_deep_merge(existing, incoming))
+            save_config(deep_merge(existing, incoming))
         return {"ok": True}
     except HTTPException:
         raise
@@ -7463,7 +7694,7 @@ def _catalog_provider_env_metadata() -> dict:
     # promoted into a provider card. Copilot lists GITHUB_TOKEN among its auth
     # aliases, but its provider card uses the provider-owned COPILOT_GITHUB_TOKEN.
     try:
-        from hermes_cli.config import OPTIONAL_ENV_VARS as _OPT
+        from hermes_runtime.config import OPTIONAL_ENV_VARS as _OPT
     except Exception:
         _OPT = {}
     _non_provider_keys = {
@@ -9289,7 +9520,7 @@ class _TelegramOnboardingPairing:
 
 
 _telegram_onboarding_pairings: dict[str, _TelegramOnboardingPairing] = {}
-_telegram_onboarding_lock = threading.RLock()
+_telegram_onboarding_lock = _RUNTIME_STATE.telegram_onboarding_lock
 
 
 def _telegram_onboarding_base_url() -> str:
@@ -9921,7 +10152,7 @@ def _anthropic_oauth_status() -> Dict[str, Any]:
     except (ImportError, KeyError):
         pass
     try:
-        from hermes_cli.config import get_env_value
+        from hermes_runtime.config import get_env_value
     except ImportError:
         get_env_value = None  # type: ignore
     try:
@@ -10001,14 +10232,6 @@ def _copilot_acp_status() -> Dict[str, Any]:
 # CLI like Claude Code or Qwen).
 _OAUTH_PROVIDER_CATALOG: tuple[Dict[str, Any], ...] = (
     {
-        "id": "nous",
-        "name": "Nous Portal",
-        "flow": "device_code",
-        "cli_command": "hermes auth add nous",
-        "docs_url": "https://portal.nousresearch.com",
-        "status_fn": None,  # dispatched via auth.get_nous_auth_status
-    },
-    {
         "id": "openai-codex",
         "name": "OpenAI OAuth (ChatGPT)",
         "flow": "device_code",
@@ -10087,16 +10310,6 @@ def _resolve_provider_status(provider_id: str, status_fn) -> Dict[str, Any]:
             return {"logged_in": False, "error": str(e)}
     try:
         from hermes_cli import auth as hauth
-        if provider_id == "nous":
-            raw = hauth.get_nous_auth_status()
-            return {
-                "logged_in": bool(raw.get("logged_in")),
-                "source": "nous_portal",
-                "source_label": raw.get("portal_base_url") or "Nous Portal",
-                "token_preview": _truncate_token(raw.get("access_token")),
-                "expires_at": raw.get("access_expires_at"),
-                "has_refresh_token": bool(raw.get("has_refresh_token")),
-            }
         if provider_id == "openai-codex":
             raw = hauth.get_codex_auth_status()
             return {
@@ -10408,8 +10621,8 @@ async def disconnect_oauth_provider(
 # expired sessions so the dict doesn't grow without bound.
 
 _OAUTH_SESSION_TTL_SECONDS = 15 * 60
-_oauth_sessions: Dict[str, Dict[str, Any]] = {}
-_oauth_sessions_lock = threading.Lock()
+_oauth_sessions = _RUNTIME_STATE.oauth_sessions
+_oauth_sessions_lock = _RUNTIME_STATE.oauth_sessions_lock
 
 # Import OAuth constants from canonical source instead of duplicating.
 # Guarded so hermes web still starts if anthropic_adapter is unavailable;
@@ -10659,56 +10872,13 @@ async def _start_device_code_flow(
     so the UI can render the verification page link + user code.
     """
     if provider_id == "nous":
-        from hermes_cli.auth import (
-            _request_device_code,
-            PROVIDER_REGISTRY,
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                "Nous account login is not available. Configure the direct "
+                "Nous inference provider with NOUS_API_KEY."
+            ),
         )
-        import httpx
-        pconfig = PROVIDER_REGISTRY["nous"]
-        portal_base_url = (
-            os.getenv("HERMES_PORTAL_BASE_URL")
-            or os.getenv("NOUS_PORTAL_BASE_URL")
-            or pconfig.portal_base_url
-        ).rstrip("/")
-        client_id = pconfig.client_id
-        scope = pconfig.scope
-
-        def _do_nous_device_request():
-            with httpx.Client(
-                timeout=httpx.Timeout(15.0),
-                headers={"Accept": "application/json"},
-            ) as client:
-                return (
-                    _request_device_code(
-                        client=client,
-                        portal_base_url=portal_base_url,
-                        client_id=client_id,
-                        scope=scope,
-                    ),
-                    scope,
-                )
-
-        device_data, effective_scope = await asyncio.get_running_loop().run_in_executor(
-            None, _do_nous_device_request
-        )
-        sid, sess = _new_oauth_session("nous", "device_code", profile=profile)
-        sess["device_code"] = str(device_data["device_code"])
-        sess["interval"] = int(device_data["interval"])
-        sess["expires_at"] = time.time() + int(device_data["expires_in"])
-        sess["portal_base_url"] = portal_base_url
-        sess["client_id"] = client_id
-        sess["scope"] = effective_scope
-        threading.Thread(
-            target=_nous_poller, args=(sid,), daemon=True, name=f"oauth-poll-{sid[:6]}"
-        ).start()
-        return {
-            "session_id": sid,
-            "flow": "device_code",
-            "user_code": str(device_data["user_code"]),
-            "verification_url": str(device_data["verification_uri_complete"]),
-            "expires_in": int(device_data["expires_in"]),
-            "poll_interval": int(device_data["interval"]),
-        }
 
     if provider_id == "openai-codex":
         # Codex uses fixed OpenAI device-auth endpoints; reuse the helper.
@@ -12526,44 +12696,28 @@ async def cron_fire_webhook(request: Request):
     Returns 202 immediately and runs the job in the background so a long agent
     turn never trips NAS's HTTP timeout.
     """
-    from plugins.cron_providers.chronos.verify import get_fire_verifier
-
-    auth = request.headers.get("Authorization", "")
-    token = auth[7:].strip() if auth.startswith("Bearer ") else ""
-
-    cfg = load_config()
-    claims = get_fire_verifier()(
-        token=token,
-        expected_audience=cfg_get(cfg, "cron", "chronos", "expected_audience", default=""),
-        jwks_or_key=cfg_get(cfg, "cron", "chronos", "nas_jwks_url", default="") or None,
-        issuer=cfg_get(cfg, "cron", "chronos", "portal_url", default="") or None,
-    )
-    if claims is None:
-        return JSONResponse({"error": "invalid fire token"}, status_code=401)
-
     try:
         body = await request.json()
     except Exception:
         body = {}
-    job_id = (body or {}).get("job_id") if isinstance(body, dict) else None
-    if not job_id:
-        return JSONResponse({"error": "missing job_id"}, status_code=400)
+    async def resolve_target(command):
+        return await _run_cron_dashboard_io(
+            _find_cron_job_profile, command.job_id
+        )
 
-    # _find_cron_job_profile walks every profile and lists its jobs (file
-    # I/O per profile) — run it off the event loop like the other cron
-    # dashboard endpoints.
-    profile = await _run_cron_dashboard_io(_find_cron_job_profile, job_id)
-    if not profile:
-        # Job is gone (cancelled / completed) — nothing to fire. 200 so NAS
-        # does not retry a fire that is intentionally absent.
-        return JSONResponse({"status": "gone", "job_id": job_id}, status_code=200)
+    async def execute(command, profile):
+        assert profile is not None
+        return await asyncio.to_thread(
+            _fire_cron_job_for_profile, profile, command.job_id
+        )
 
-    # Run in the background; the store CAS claim inside fire_due de-dupes a
-    # NAS/scheduler retry that arrives while this is in flight.
-    asyncio.create_task(
-        asyncio.to_thread(_fire_cron_job_for_profile, profile, job_id)
+    accepted = await accept_cron_fire_request(
+        request.headers.get("Authorization", ""),
+        body,
+        resolve_target=resolve_target,
+        execute=execute,
     )
-    return JSONResponse({"status": "accepted", "job_id": job_id}, status_code=202)
+    return JSONResponse(dict(accepted.body), status_code=accepted.status_code)
 
 
 # ---------------------------------------------------------------------------
@@ -12684,7 +12838,7 @@ def _normalize_mcp_server_create(
         _bearer_auth_headers,
         _strip_bearer_prefix,
     )
-    from hermes_cli.mcp_security import validate_mcp_server_entry
+    from hermes_runtime.mcp_security import validate_mcp_server_entry
 
     name = (body.name or "").strip()
     if not name:
@@ -12914,10 +13068,10 @@ async def test_mcp_server(name: str, profile: Optional[str] = None):
 
 _MCP_DASHBOARD_OAUTH_TTL = 15 * 60
 _MAX_PENDING_MCP_OAUTH_FLOWS = 8
-_mcp_oauth_flows: dict[str, "DashboardOAuthFlow"] = {}
-_mcp_oauth_flows_lock = threading.Lock()
-_mcp_oauth_transactions: dict[tuple[str, str], threading.Lock] = {}
-_mcp_oauth_transactions_lock = threading.Lock()
+_mcp_oauth_flows = _RUNTIME_STATE.mcp_oauth_flows
+_mcp_oauth_flows_lock = _RUNTIME_STATE.mcp_oauth_flows_lock
+_mcp_oauth_transactions = _RUNTIME_STATE.mcp_oauth_transactions
+_mcp_oauth_transactions_lock = _RUNTIME_STATE.mcp_oauth_transactions_lock
 
 
 def _gc_mcp_oauth_flows() -> None:
@@ -12969,7 +13123,7 @@ def _run_dashboard_mcp_oauth(flow, cfg: dict) -> None:
         _save_mcp_server,
     )
     try:
-        from agent.secret_scope import (
+        from hermes_runtime.secret_scope import (
             build_profile_secret_scope,
             reset_secret_scope,
             set_secret_scope,
@@ -14109,7 +14263,7 @@ async def list_hooks():
     currently executable, plus the set of valid hook events so the create
     form can offer them.
     """
-    from hermes_cli.config import load_config as _load_config
+    from hermes_runtime.config import load_config as _load_config
     from agent import shell_hooks
 
     try:
@@ -14797,6 +14951,11 @@ class ProfileSoulUpdate(BaseModel):
     content: str
 
 
+class StudioMemoryUpdate(BaseModel):
+    section: str
+    content: str
+
+
 class ProfileActiveUpdate(BaseModel):
     name: str
 
@@ -14904,6 +15063,71 @@ def _resolve_profile_dir(name: str) -> Path:
     if not profiles_mod.profile_exists(name):
         raise HTTPException(status_code=404, detail=f"Profile '{name}' does not exist.")
     return profiles_mod.get_profile_dir(name)
+
+
+_STUDIO_MEMORY_FILES = {
+    "memory": Path("memories") / "MEMORY.md",
+    "soul": Path("SOUL.md"),
+    "user": Path("memories") / "USER.md",
+}
+
+
+def _read_studio_memory(profile_dir: Path) -> Dict[str, Any]:
+    """Return the three editable profile context files and their mtimes."""
+    result: Dict[str, Any] = {}
+    for section, relative_path in _STUDIO_MEMORY_FILES.items():
+        path = profile_dir / relative_path
+        try:
+            if path.is_file():
+                result[section] = path.read_text(encoding="utf-8")
+                result[f"{section}_mtime"] = path.stat().st_mtime
+            else:
+                result[section] = ""
+                result[f"{section}_mtime"] = None
+        except (OSError, UnicodeError) as exc:
+            raise HTTPException(
+                status_code=500,
+                detail=f"Could not read {relative_path.as_posix()}: {exc}",
+            ) from exc
+    return result
+
+
+@app.get("/api/hermes/memory")
+async def get_studio_memory(profile: str = "default"):
+    """Read editable long-term context for one Hermes profile."""
+    return _read_studio_memory(_resolve_profile_dir(profile))
+
+
+@app.put("/api/hermes/memory")
+async def update_studio_memory(
+    body: StudioMemoryUpdate,
+    profile: str = "default",
+):
+    """Atomically replace one editable context file for a Hermes profile."""
+    relative_path = _STUDIO_MEMORY_FILES.get(body.section)
+    if relative_path is None:
+        raise HTTPException(
+            status_code=400,
+            detail="section must be memory, soul, or user",
+        )
+
+    profile_dir = _resolve_profile_dir(profile)
+    target = profile_dir / relative_path
+    try:
+        from utils import write_secret_file
+
+        write_secret_file(target, body.content, mode=0o600)
+    except OSError as exc:
+        _log.exception(
+            "PUT /api/hermes/memory failed for profile=%s section=%s",
+            profile,
+            body.section,
+        )
+        raise HTTPException(
+            status_code=500,
+            detail=f"Could not write {relative_path.as_posix()}: {exc}",
+        ) from exc
+    return _read_studio_memory(profile_dir)
 
 
 def _profile_setup_command(name: str) -> str:
@@ -15280,7 +15504,7 @@ async def get_profile_soul(name: str):
     if soul_path.exists():
         try:
             return {"content": soul_path.read_text(encoding="utf-8"), "exists": True}
-        except OSError as e:
+        except (OSError, UnicodeError) as e:
             raise HTTPException(status_code=500, detail=f"Could not read SOUL.md: {e}")
     return {"content": "", "exists": False}
 
@@ -15289,7 +15513,9 @@ async def get_profile_soul(name: str):
 async def update_profile_soul(name: str, body: ProfileSoulUpdate):
     soul_path = _resolve_profile_dir(name) / "SOUL.md"
     try:
-        soul_path.write_text(body.content, encoding="utf-8")
+        from utils import write_secret_file
+
+        write_secret_file(soul_path, body.content, mode=0o600)
     except OSError as e:
         _log.exception("PUT /api/profiles/%s/soul failed", name)
         raise HTTPException(status_code=500, detail=f"Could not write SOUL.md: {e}")
@@ -15380,7 +15606,7 @@ async def describe_profile_auto_endpoint(name: str, body: ProfileDescribeAuto):
 # ---------------------------------------------------------------------------
 
 
-_SKILLS_PROFILE_LOCK = threading.RLock()
+_SKILLS_PROFILE_LOCK = _RUNTIME_STATE.skills_profile_lock
 
 
 @contextmanager
@@ -15724,7 +15950,7 @@ async def get_toolset_config(name: str, profile: Optional[str] = None):
         provider_readiness_status,
         web_provider_capabilities,
     )
-    from hermes_cli.config import get_env_value
+    from hermes_runtime.config import get_env_value
     from hermes_cli.nous_subscription import get_nous_subscription_features
 
     valid = {ts_key for ts_key, _, _ in _get_effective_configurable_toolsets()}
@@ -16032,10 +16258,6 @@ async def select_toolset_provider(
         _get_effective_configurable_toolsets,
         _visible_providers,
     )
-    from hermes_cli.nous_subscription import (
-        MANAGED_FEATURE_COVERAGE_CATEGORY,
-        get_nous_subscription_features,
-    )
 
     valid = {ts_key for ts_key, _, _ in _get_effective_configurable_toolsets()}
     if name not in valid:
@@ -16094,36 +16316,6 @@ async def select_toolset_provider(
         if body.capability is not None:
             response["capability"] = body.capability
 
-        # Entitlement check for managed Nous rows — mirrors the gate the CLI
-        # applies via ensure_nous_portal_access at selection time.
-        cat = TOOL_CATEGORIES.get(name)
-        row = None
-        if cat:
-            row = next(
-                (
-                    p
-                    for p in _visible_providers(cat, config, force_fresh=True)
-                    if p.get("name") == body.provider
-                ),
-                None,
-            )
-        managed_feature = (row or {}).get("managed_nous_feature")
-        if managed_feature:
-            features = get_nous_subscription_features(config, force_fresh=True)
-            acct = features.account_info
-            category = MANAGED_FEATURE_COVERAGE_CATEGORY.get(managed_feature)
-            entitled = bool(
-                acct
-                and acct.logged_in
-                and (
-                    acct.tool_gateway_entitled_for(category)
-                    if category
-                    else acct.tool_gateway_entitled
-                )
-            )
-            if not entitled:
-                response["needs_nous_auth"] = True
-                response["feature"] = managed_feature
     return response
 
 
@@ -16149,7 +16341,7 @@ async def save_toolset_env(name: str, body: ToolsetEnvUpdate, profile: Optional[
         _get_effective_configurable_toolsets,
         _visible_providers,
     )
-    from hermes_cli.config import get_env_value, save_env_value
+    from hermes_runtime.config import get_env_value, save_env_value
 
     valid_ts = {ts_key for ts_key, _, _ in _get_effective_configurable_toolsets()}
     if name not in valid_ts:
@@ -16296,7 +16488,7 @@ def _terminal_cfg_value(terminal_cfg: dict, key: str, env_var: str) -> str:
     if value is not None and str(value).strip():
         return str(value).strip()
     try:
-        from hermes_cli.config import get_env_value
+        from hermes_runtime.config import get_env_value
 
         return (get_env_value(env_var) or "").strip()
     except Exception:
@@ -16362,7 +16554,7 @@ def _probe_modal_backend() -> tuple:
     except Exception:
         pass
     try:
-        from hermes_cli.config import get_env_value
+        from hermes_runtime.config import get_env_value
 
         if get_env_value("MODAL_TOKEN_ID") and get_env_value("MODAL_TOKEN_SECRET"):
             return ("ready", "")
@@ -16376,7 +16568,7 @@ def _probe_modal_backend() -> tuple:
 
 def _probe_daytona_backend() -> tuple:
     try:
-        from hermes_cli.config import get_env_value
+        from hermes_runtime.config import get_env_value
 
         if get_env_value("DAYTONA_API_KEY"):
             return ("ready", "")
@@ -17315,7 +17507,7 @@ def _ws_auth_reason(ws: "WebSocket") -> tuple[Optional[str], str]:
     token = ws.query_params.get("token", "")
     if not token:
         return "no_credential", "none"
-    if hmac.compare_digest(token.encode(), _SESSION_TOKEN.encode()):
+    if _secret_matches(token, _SESSION_TOKEN):
         return None, "token"
     return "token_mismatch", "token"
 
@@ -17383,7 +17575,7 @@ def _resolve_chat_argv(
     argv, cwd = _make_tui_argv(PROJECT_ROOT / "ui-tui", tui_dev=False)
     env = os.environ.copy()
     try:
-        from hermes_cli.config import apply_terminal_config_to_env
+        from hermes_runtime.config import apply_terminal_config_to_env
         apply_terminal_config_to_env(env=env)
     except Exception:
         _log.debug("Failed to apply terminal config bridge for dashboard chat", exc_info=True)
@@ -17665,17 +17857,13 @@ _CONSOLE_OUTPUT_LIMIT = 50000
 # dedicated, bounded pool: a leaked worker is capped, and concurrent console
 # execution is bounded to a fixed number of threads regardless of reconnects.
 _CONSOLE_EXECUTOR_MAX_WORKERS = 4
-_console_executor: Optional[concurrent.futures.ThreadPoolExecutor] = None
-_console_executor_lock = threading.Lock()
-
-
 def _get_console_executor() -> concurrent.futures.ThreadPoolExecutor:
     """Lazily create the bounded console worker pool (once per process)."""
-    global _console_executor
-    if _console_executor is None:
-        with _console_executor_lock:
-            if _console_executor is None:
-                _console_executor = concurrent.futures.ThreadPoolExecutor(
+    state = get_runtime_state()
+    if state.console_executor is None:
+        with state.console_executor_lock:
+            if state.console_executor is None:
+                state.console_executor = concurrent.futures.ThreadPoolExecutor(
                     max_workers=_CONSOLE_EXECUTOR_MAX_WORKERS,
                     thread_name_prefix="hermes-console",
                 )
@@ -17683,10 +17871,13 @@ def _get_console_executor() -> concurrent.futures.ThreadPoolExecutor:
                 # in-flight workers: a stuck 60s console command must not block
                 # shutdown (cancel_futures drops anything not yet started).
                 atexit.register(
-                    lambda: _console_executor
-                    and _console_executor.shutdown(wait=False, cancel_futures=True)
+                    lambda: state.console_executor
+                    and state.console_executor.shutdown(wait=False, cancel_futures=True)
                 )
-    return _console_executor
+    executor = state.console_executor
+    if executor is None:  # pragma: no cover - guarded by the lock above
+        raise RuntimeError("console executor initialization failed")
+    return executor
 
 
 def _console_profile_from_ws(ws: WebSocket) -> Optional[str]:
@@ -19232,18 +19423,16 @@ def _discover_dashboard_plugins() -> list:
     return plugins
 
 
-# Cache discovered plugins per-process (refresh on explicit re-scan).
-_dashboard_plugins_cache: Optional[list] = None
-
-
 def _get_dashboard_plugins(force_rescan: bool = False) -> list:
-    global _dashboard_plugins_cache
-    if _dashboard_plugins_cache is None or force_rescan:
-        _dashboard_plugins_cache = _discover_dashboard_plugins()
-    elif _dashboard_plugins_cache:
-        if any(not Path(p["_dir"]).is_dir() for p in _dashboard_plugins_cache):
-            _dashboard_plugins_cache = _discover_dashboard_plugins()
-    return _dashboard_plugins_cache
+    state = get_runtime_state()
+    cache = state.dashboard_plugins_cache
+    if cache is None or force_rescan:
+        cache = _discover_dashboard_plugins()
+        state.dashboard_plugins_cache = cache
+    elif cache and any(not Path(p["_dir"]).is_dir() for p in cache):
+        cache = _discover_dashboard_plugins()
+        state.dashboard_plugins_cache = cache
+    return cache
 
 
 @app.get("/api/dashboard/plugins")
@@ -19961,7 +20150,7 @@ def start_server(
             # Hint when credentials exist but the bundled provider is blocked
             # (#54489).
             try:
-                from hermes_cli.config import load_config as _load_cfg
+                from hermes_runtime.config import load_config as _load_cfg
                 from hermes_cli.plugins_cmd import _BASIC_AUTH_PLUGIN_KEYS
 
                 _cfg = _load_cfg()

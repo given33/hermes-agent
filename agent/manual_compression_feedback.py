@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from typing import Any, Sequence
 
-from agent.redact import redact_sensitive_text
+from hermes_runtime.redaction import redact_sensitive_text
 
 
 def summarize_manual_compression(

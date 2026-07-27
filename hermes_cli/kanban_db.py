@@ -91,6 +91,7 @@ from typing import Any, Iterable, Optional
 
 from hermes_cli.sqlite_util import add_column_if_missing as _add_column_if_missing
 from toolsets import get_toolset_names
+from hermes_runtime.process_probe import pid_exists as _pid_exists
 
 _log = logging.getLogger(__name__)
 
@@ -6232,7 +6233,7 @@ def _pid_alive(pid: Optional[int]) -> bool:
     """Return True if ``pid`` is still running on this host.
 
     Cross-platform: uses ``OpenProcess`` + ``WaitForSingleObject`` on
-    Windows (via ``gateway.status._pid_exists``) and ``os.kill(pid, 0)``
+    Windows (via ``hermes_runtime.process_probe.pid_exists``) and ``os.kill(pid, 0)``
     on POSIX. Returns False for falsy PIDs or on any OS error.
 
     **DO NOT** use ``os.kill(pid, 0)`` directly on Windows — Python's
@@ -6253,7 +6254,6 @@ def _pid_alive(pid: Optional[int]) -> bool:
     """
     if not pid or pid <= 0:
         return False
-    from gateway.status import _pid_exists
     if not _pid_exists(int(pid)):
         return False
     # Still here → process exists. Check for zombie on platforms
@@ -7971,7 +7971,7 @@ def worker_log_rotation_config(kanban_cfg: Optional[dict] = None) -> tuple[int, 
     """
     if kanban_cfg is None:
         try:
-            from hermes_cli.config import load_config
+            from hermes_runtime.config import load_config
 
             kanban_cfg = (load_config().get("kanban") or {})
         except Exception:
@@ -8197,7 +8197,7 @@ def _resolve_worker_cli_toolsets(hermes_home: Optional[str]) -> Optional[list[st
         return None
     try:
         from hermes_constants import reset_hermes_home_override, set_hermes_home_override
-        from hermes_cli.config import load_config
+        from hermes_runtime.config import load_config
         from hermes_cli.tools_config import _get_platform_tools
 
         token = set_hermes_home_override(hermes_home)

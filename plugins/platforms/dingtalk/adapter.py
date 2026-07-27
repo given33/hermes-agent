@@ -1579,9 +1579,9 @@ def interactive_setup() -> None:
     _PLATFORMS["dingtalk"] dict in hermes_cli/gateway.py. CLI helpers are
     lazy-imported so the plugin's module-load surface stays minimal.
     """
-    from hermes_cli.config import get_env_value, save_env_value
+    from hermes_runtime.config import get_env_value, save_env_value
     from hermes_cli.setup import prompt_choice
-    from hermes_cli.cli_output import (
+    from hermes_runtime.console_output import (
         prompt,
         prompt_yes_no,
         print_header,

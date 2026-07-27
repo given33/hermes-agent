@@ -24,7 +24,7 @@ import argparse
 import os
 import subprocess
 
-from hermes_cli.config import clear_model_endpoint_credentials
+from hermes_runtime.config import clear_model_endpoint_credentials
 
 
 # AWS cross-region inference profile prefixes. Any geo-prefixed profile only
@@ -176,7 +176,7 @@ def _model_flow_openrouter(config, current_model=""):
         _save_model_choice,
         deactivate_provider,
     )
-    from hermes_cli.config import get_env_value
+    from hermes_runtime.config import get_env_value
 
     # Route through _prompt_api_key so users can replace a stale/broken key
     # in-flow (K/R/C) instead of having to edit ~/.hermes/.env by hand. The
@@ -216,7 +216,7 @@ def _model_flow_openrouter(config, current_model=""):
         _save_model_choice(selected)
 
         # Update config provider and deactivate any OAuth provider
-        from hermes_cli.config import load_config, save_config
+        from hermes_runtime.config import load_config, save_config
 
         cfg = load_config()
         model = cfg.get("model")
@@ -253,7 +253,7 @@ def _model_flow_moa(config, current_model=""):
     what they are selecting, then print the full preset breakdown on selection.
     """
     from hermes_cli.auth import _save_model_choice, deactivate_provider
-    from hermes_cli.config import load_config, save_config
+    from hermes_runtime.config import load_config, save_config
     from hermes_cli.moa_config import normalize_moa_config
 
     moa = normalize_moa_config(config.get("moa") if isinstance(config, dict) else {})
@@ -330,7 +330,17 @@ def _model_flow_moa(config, current_model=""):
 
 
 def _model_flow_nous(config, current_model="", args=None):
-    """Nous Portal provider: ensure logged in, then pick model."""
+    """Configure Nous as a direct inference API-key provider.
+
+    This compatibility entry point intentionally delegates to the generic
+    API-key flow.  Consumer Portal login/subscription state is not a runtime
+    credential source in this distribution.
+    """
+    del args
+    return _model_flow_api_key_provider(config, "nous", current_model)
+
+    # Legacy Portal flow retained below as unreachable compatibility source for
+    # downstream patch sets.  Do not re-enable it as a product entry point.
     from hermes_cli.auth import (
         get_provider_auth_state,
         _prompt_model_selection,
@@ -342,7 +352,7 @@ def _model_flow_nous(config, current_model="", args=None):
         _login_nous,
         PROVIDER_REGISTRY,
     )
-    from hermes_cli.config import (
+    from hermes_runtime.config import (
         get_env_value,
         load_config,
         save_config,
@@ -833,8 +843,8 @@ def _model_flow_custom(config):
     """
     from hermes_cli.main import _auto_provider_name, _prompt_custom_api_mode_selection, _save_custom_provider
     from hermes_cli.auth import _save_model_choice, deactivate_provider
-    from hermes_cli.config import get_env_value, load_config, save_config
-    from hermes_cli.secret_prompt import masked_secret_prompt
+    from hermes_runtime.config import get_env_value, load_config, save_config
+    from hermes_runtime.secret_prompt import masked_secret_prompt
 
     current_url = get_env_value("OPENAI_BASE_URL") or ""
     current_key = get_env_value("OPENAI_API_KEY") or ""
@@ -1083,7 +1093,7 @@ def _model_flow_azure_foundry(config, current_model=""):
     (models.dev, provider metadata, hardcoded family fallbacks).
     """
     from hermes_cli.auth import _save_model_choice, deactivate_provider  # noqa: F401
-    from hermes_cli.config import (
+    from hermes_runtime.config import (
         get_env_value,
         save_env_value,
         load_config,
@@ -1252,7 +1262,7 @@ def _model_flow_azure_foundry(config, current_model=""):
             token_provider = None
     else:
         print()
-        from hermes_cli.secret_prompt import masked_secret_prompt
+        from hermes_runtime.secret_prompt import masked_secret_prompt
 
         try:
             api_key = masked_secret_prompt(
@@ -1426,7 +1436,7 @@ def _model_flow_named_custom(config, provider_info):
     """
     from hermes_cli.main import _custom_provider_api_key_config_value, _custom_provider_base_url_config_value, _save_custom_provider
     from hermes_cli.auth import _save_model_choice, deactivate_provider
-    from hermes_cli.config import load_config, save_config
+    from hermes_runtime.config import load_config, save_config
     from hermes_cli.models import fetch_api_models
 
     name = provider_info["name"]
@@ -1619,7 +1629,7 @@ def _model_flow_copilot(config, current_model=""):
         deactivate_provider,
         resolve_api_key_provider_credentials,
     )
-    from hermes_cli.config import save_env_value, load_config, save_config
+    from hermes_runtime.config import save_env_value, load_config, save_config
     from hermes_cli.models import (
         _PROVIDER_MODELS,
         fetch_api_models,
@@ -1674,7 +1684,7 @@ def _model_flow_copilot(config, current_model=""):
                 print(f"  Login failed: {exc}")
                 return
         elif choice == "2":
-            from hermes_cli.secret_prompt import masked_secret_prompt
+            from hermes_runtime.secret_prompt import masked_secret_prompt
 
             try:
                 new_key = masked_secret_prompt("  Token (COPILOT_GITHUB_TOKEN): ").strip()
@@ -1824,7 +1834,7 @@ def _model_flow_copilot_acp(config, current_model=""):
         fetch_github_model_catalog,
         normalize_copilot_model_id,
     )
-    from hermes_cli.config import load_config, save_config
+    from hermes_runtime.config import load_config, save_config
 
     del config
 
@@ -1941,7 +1951,7 @@ def _model_flow_kimi(config, current_model=""):
         _save_model_choice,
         deactivate_provider,
     )
-    from hermes_cli.config import (
+    from hermes_runtime.config import (
         get_env_value,
         save_env_value,
         load_config,
@@ -2027,7 +2037,7 @@ def _model_flow_stepfun(config, current_model=""):
         _save_model_choice,
         deactivate_provider,
     )
-    from hermes_cli.config import (
+    from hermes_runtime.config import (
         get_env_value,
         save_env_value,
         load_config,
@@ -2143,7 +2153,7 @@ def _model_flow_bedrock_api_key(config, region, current_model=""):
         _save_model_choice,
         deactivate_provider,
     )
-    from hermes_cli.config import (
+    from hermes_runtime.config import (
         load_config,
         save_config,
         get_env_value,
@@ -2162,7 +2172,7 @@ def _model_flow_bedrock_api_key(config, region, current_model=""):
     else:
         print(f"  Endpoint: {mantle_base_url}")
         print()
-        from hermes_cli.secret_prompt import masked_secret_prompt
+        from hermes_runtime.secret_prompt import masked_secret_prompt
 
         try:
             api_key = masked_secret_prompt("  Bedrock API Key: ").strip()
@@ -2240,7 +2250,7 @@ def _model_flow_bedrock(config, current_model=""):
         _save_model_choice,
         deactivate_provider,
     )
-    from hermes_cli.config import load_config, save_config
+    from hermes_runtime.config import load_config, save_config
     from hermes_cli.models import _PROVIDER_MODELS
 
     # 1. Check for AWS credentials
@@ -2447,7 +2457,7 @@ def _model_flow_vertex(config, current_model=""):
         _save_model_choice,
         deactivate_provider,
     )
-    from hermes_cli.config import load_config, save_config, get_env_value
+    from hermes_runtime.config import load_config, save_config, get_env_value
     from hermes_cli.models import _PROVIDER_MODELS
 
     # 1. Credential source detection (fast, no network / no google-auth import).
@@ -2604,7 +2614,7 @@ def _model_flow_api_key_provider(config, provider_id, current_model=""):
         _save_model_choice,
         deactivate_provider,
     )
-    from hermes_cli.config import (
+    from hermes_runtime.config import (
         get_env_value,
         save_env_value,
         load_config,
@@ -2917,7 +2927,7 @@ def _model_flow_anthropic(config, current_model=""):
         _save_model_choice,
         deactivate_provider,
     )
-    from hermes_cli.config import (
+    from hermes_runtime.config import (
         save_env_value,
         load_config,
         save_config,
@@ -3006,7 +3016,7 @@ def _model_flow_anthropic(config, current_model=""):
             print()
             print("  Get an API key at: https://platform.claude.com/settings/keys")
             print()
-            from hermes_cli.secret_prompt import masked_secret_prompt
+            from hermes_runtime.secret_prompt import masked_secret_prompt
 
             try:
                 api_key = masked_secret_prompt("  API key (sk-ant-...): ").strip()

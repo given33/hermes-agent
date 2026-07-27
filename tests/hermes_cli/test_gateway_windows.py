@@ -809,7 +809,7 @@ def test_stop_escalates_to_force_kill_when_drain_times_out(monkeypatch):
 
     from gateway import status as status_mod
     monkeypatch.setattr(status_mod, "write_planned_stop_marker", lambda p: True)
-    monkeypatch.setattr(status_mod, "_pid_exists", lambda check_pid: True)
+    monkeypatch.setattr("hermes_runtime.process_probe.pid_exists", lambda check_pid: True)
     monkeypatch.setattr(status_mod, "get_running_pid", lambda: pid)
     monkeypatch.setattr(gateway_windows, "_drain_gateway_pid", lambda *_args: False)
 
@@ -841,7 +841,10 @@ def test_stop_no_running_gateway_skips_drain(monkeypatch):
         events.append(("write_marker", target_pid))
         return True
     monkeypatch.setattr(status_mod, "write_planned_stop_marker", fake_write_marker)
-    monkeypatch.setattr(status_mod, "_pid_exists", lambda check_pid: check_pid == stray_pid)
+    monkeypatch.setattr(
+        "hermes_runtime.process_probe.pid_exists",
+        lambda check_pid: check_pid == stray_pid,
+    )
 
     def fake_terminate_pid(target_pid, force=False):
         events.append(("terminate", target_pid, force))
@@ -878,7 +881,7 @@ def test_drain_helper_returns_true_when_pid_exits_quickly(monkeypatch):
 
     from gateway import status as status_mod
     monkeypatch.setattr(status_mod, "write_planned_stop_marker", lambda p: True)
-    monkeypatch.setattr(status_mod, "_pid_exists", fake_pid_exists)
+    monkeypatch.setattr("hermes_runtime.process_probe.pid_exists", fake_pid_exists)
 
     assert gateway_windows._drain_gateway_pid(pid, drain_timeout=5.0) is True
 
@@ -887,7 +890,7 @@ def test_drain_helper_returns_false_on_timeout(monkeypatch):
     """_drain_gateway_pid returns False when the PID never exits."""
     from gateway import status as status_mod
     monkeypatch.setattr(status_mod, "write_planned_stop_marker", lambda p: True)
-    monkeypatch.setattr(status_mod, "_pid_exists", lambda check_pid: True)
+    monkeypatch.setattr("hermes_runtime.process_probe.pid_exists", lambda check_pid: True)
 
     assert gateway_windows._drain_gateway_pid(55555, drain_timeout=1.0) is False
 

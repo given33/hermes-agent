@@ -300,11 +300,6 @@ export function ToolsetConfigDrawer({ toolset, profile, onClose, onChanged }: Pr
                           {provider.badge}
                         </Badge>
                       )}
-                      {provider.requires_nous_auth && (
-                        <Badge tone="outline" className="text-xs">
-                          Nous Portal
-                        </Badge>
-                      )}
                     </div>
                     {isActive ? (
                       <Badge tone="success" className="text-xs shrink-0">

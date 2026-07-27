@@ -91,9 +91,8 @@ def test_disabled_set_change_invalidates(tmp_path, monkeypatch):
     assert names == ["skill-one"], "disabled-set change must invalidate the cache"
 
 
-def test_ttl_expiry_forces_rescan(tmp_path, monkeypatch):
-    """In-place SKILL.md edits are invisible to any directory signature;
-    the TTL bounds that staleness."""
+def test_skill_file_edit_forces_immediate_rescan(tmp_path):
+    """In-place SKILL.md edits invalidate the cache without waiting for TTL."""
     skill_dir = _write_skill(tmp_path, "cat-a", "skill-one", "old description")
     first = st._find_all_skills()
     assert first[0]["description"] == "old description"
@@ -110,11 +109,8 @@ def test_ttl_expiry_forces_rescan(tmp_path, monkeypatch):
     for p, s in stats.items():
         os.utime(p, (s.st_atime, s.st_mtime))
 
-    # Within TTL: stale (documented trade-off).
-    assert st._find_all_skills()[0]["description"] == "old description"
-
-    # Past TTL: fresh.
-    monkeypatch.setattr(st, "_SKILLS_CACHE_TTL_SECONDS", 0.0)
+    # The file metadata is part of the topology signature, so long-lived
+    # servers and connected iOS clients see the update on their next refresh.
     assert st._find_all_skills()[0]["description"] == "new description"
 
 

@@ -1,15 +1,6 @@
-"""Tests for the /credits command — shared view core + gateway handler.
-
-`/credits` is the focused money surface (balance in, top-up out). These tests
-exercise the surface-agnostic `build_credits_view()` core and assert the gateway
-handler renders the block + tappable top-up URL + no-wait copy. The CLI panel is
-a thin wrapper over the same view (interactive prompt_toolkit modal — covered by
-the view-core tests plus manual verification).
-"""
+"""Legacy account-view compatibility and removed product-surface contracts."""
 
 from __future__ import annotations
-
-import asyncio
 
 import pytest
 
@@ -131,84 +122,18 @@ def test_view_fetch_failure_is_logged_out(monkeypatch):
     assert view.logged_in is False
 
 
-# ── gateway _handle_topup_command (the messaging billing surface) ────────────
-
-
-class _FakeEvent:
-    pass
-
-
-def _make_gateway_stub():
-    """Minimal object exposing the mixin's _handle_topup_command."""
-    from gateway.slash_commands import GatewaySlashCommandsMixin
-
-    class _Stub(GatewaySlashCommandsMixin):
-        def __init__(self):
-            pass
-
-    return _Stub()
-
-
-def test_gateway_topup_renders_block_and_url(monkeypatch):
-    view = CreditsView(
-        logged_in=True,
-        balance_lines=("📈 Nous credits", "Total usable: $52.50"),
-        identity_line="Topping up as alice@example.test / org Acme",
-        topup_url="https://portal.example.test/orgs/acme/billing?topup=open",
-        depleted=False,
-    )
-    monkeypatch.setattr(account_usage, "build_credits_view", lambda *a, **kw: view)
-
-    stub = _make_gateway_stub()
-    out = asyncio.run(stub._handle_topup_command(_FakeEvent()))
-
-    assert "💳" in out
-    assert "Total usable: $52.50" in out
-    assert "Topping up as alice@example.test / org Acme" in out
-    assert "https://portal.example.test/orgs/acme/billing?topup=open" in out
-    assert "Manage billing on the portal" in out
-    # The helper's own 📈 header line is dropped (we render our own 💳 header).
-    assert "📈 Nous credits" not in out
-
-
-def test_gateway_topup_not_logged_in(monkeypatch):
-    monkeypatch.setattr(
-        account_usage, "build_credits_view", lambda *a, **kw: CreditsView(logged_in=False)
-    )
-    stub = _make_gateway_stub()
-    out = asyncio.run(stub._handle_topup_command(_FakeEvent()))
-    assert "Not logged into Nous Portal" in out
-
-
-def test_gateway_topup_fetch_exception_is_not_logged_in(monkeypatch):
-    def _boom(*a, **kw):
-        raise RuntimeError("boom")
-
-    monkeypatch.setattr(account_usage, "build_credits_view", _boom)
-    stub = _make_gateway_stub()
-    out = asyncio.run(stub._handle_topup_command(_FakeEvent()))
-    assert "Not logged into Nous Portal" in out
-
-
 # ── command registry ────────────────────────────────────────────────────────
 
 
 def test_credits_command_fully_removed():
-    """`/credits` and the old `/billing` are gone entirely — not commands, not
-    aliases. Billing lives only on /topup, with NO aliases, on every platform."""
+    """Consumer account balance and billing commands are absent everywhere."""
     from hermes_cli.commands import resolve_command, COMMAND_REGISTRY
+    from gateway.slash_commands import GatewaySlashCommandsMixin
 
-    # Both old names resolve to nothing.
-    assert resolve_command("credits") is None
-    assert resolve_command("billing") is None
-    # No standalone command for either remains in the registry.
-    assert not any(c.name in ("credits", "billing") for c in COMMAND_REGISTRY)
-    # And no command carries either as an alias.
+    removed = {"credits", "billing", "topup", "subscription", "upgrade"}
+    for name in removed:
+        assert resolve_command(name) is None
+    assert not any(c.name in removed for c in COMMAND_REGISTRY)
     for c in COMMAND_REGISTRY:
-        assert "credits" not in (c.aliases or ())
-        assert "billing" not in (c.aliases or ())
-    # /topup is the billing surface, on every surface, and carries no aliases.
-    entry = next(c for c in COMMAND_REGISTRY if c.name == "topup")
-    assert entry.cli_only is False
-    assert entry.gateway_only is False
-    assert not entry.aliases
+        assert removed.isdisjoint(c.aliases or ())
+    assert not hasattr(GatewaySlashCommandsMixin, "_handle_topup_command")

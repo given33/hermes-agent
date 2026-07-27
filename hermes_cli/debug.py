@@ -4,7 +4,7 @@ Currently supports:
     hermes debug share    Upload debug report (system info + logs) to a
                           paste service and print a shareable URL.
                           By default, log content is run through
-                          ``agent.redact.redact_sensitive_text`` with
+                          ``hermes_runtime.redaction.redact_sensitive_text`` with
                           ``force=True`` before upload so credentials in
                           ``~/.hermes/logs/*.log`` are not leaked into
                           the public paste service. Pass ``--no-redact``
@@ -404,7 +404,7 @@ def _redact_log_text(text: str) -> str:
     """
     if not text:
         return text
-    from agent.redact import redact_sensitive_text
+    from hermes_runtime.redaction import redact_sensitive_text
 
     text = redact_sensitive_text(text, force=True)
     return _EMAIL_ADDRESS_RE.sub("[REDACTED_EMAIL]", text)

@@ -69,7 +69,7 @@ def _load_plugin_config() -> Dict[str, Any]:
     early docs/issues, so accept it as a compatibility fallback.
     """
     try:
-        from hermes_cli.config import load_config
+        from hermes_runtime.config import load_config
 
         config = load_config()
         memory_config = config.get("memory", {})

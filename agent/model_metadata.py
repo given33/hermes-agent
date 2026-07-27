@@ -2126,9 +2126,9 @@ def get_model_context_length(
     # acting context, so they're ignored here.
     if (provider or "").strip().lower() == "moa":
         try:
-            from hermes_cli.config import load_config
-            from hermes_cli.moa_config import resolve_moa_preset
-            from hermes_cli.runtime_provider import resolve_runtime_provider
+            from hermes_runtime.config import load_config
+            from agent.moa_config import resolve_moa_preset
+            from agent.runtime_provider import resolve_runtime_provider
 
             preset = resolve_moa_preset(load_config().get("moa") or {}, model)
             agg = preset.get("aggregator") or {}
@@ -2152,7 +2152,7 @@ def get_model_context_length(
     # See #15779.
     if custom_providers and base_url and model:
         try:
-            from hermes_cli.config import get_custom_provider_context_length
+            from hermes_runtime.config import get_custom_provider_context_length
             cp_ctx = get_custom_provider_context_length(
                 model=model,
                 base_url=base_url,
@@ -2427,7 +2427,7 @@ def get_model_context_length(
     # returns the provider-enforced limit which is what users can actually use.
     if effective_provider in {"copilot", "copilot-acp", "github-copilot"}:
         try:
-            from hermes_cli.models import get_copilot_model_context
+            from agent.model_catalog import get_copilot_model_context
             ctx = get_copilot_model_context(model, api_key=api_key)
             if ctx:
                 return ctx

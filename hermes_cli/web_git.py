@@ -492,7 +492,7 @@ def worktree_list(cwd: str) -> list[dict]:
         return []
     return [
         {
-            "path": tree["path"],
+            "path": str(Path(tree["path"]).resolve(strict=False)),
             "branch": tree["branch"],
             "isMain": index == 0,
             "detached": tree["detached"],

@@ -8,7 +8,7 @@ import sys
 from dataclasses import dataclass
 from typing import Callable, List, Optional, Set
 
-from hermes_cli.colors import Colors, color
+from hermes_runtime.colors import Colors, color
 
 
 def _query_matches(label: str, query: str) -> bool:

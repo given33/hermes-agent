@@ -26,7 +26,7 @@ from agent.memory_provider import MemoryProvider
 from tools.registry import tool_error
 from .store import MemoryStore
 from .retrieval import FactRetriever
-from hermes_cli.config import cfg_get
+from hermes_runtime.config import cfg_get, mutate_config, read_raw_config
 
 logger = logging.getLogger(__name__)
 
@@ -100,9 +100,7 @@ def _load_plugin_config() -> dict:
     if not config_path.exists():
         return {}
     try:
-        import yaml
-        with open(config_path, encoding="utf-8-sig") as f:
-            all_config = yaml.safe_load(f) or {}
+        all_config = read_raw_config(config_path=config_path)
         return cfg_get(all_config, "plugins", "hermes-memory-store", default={}) or {}
     except Exception:
         return {}
@@ -133,15 +131,15 @@ class HolographicMemoryProvider(MemoryProvider):
         from pathlib import Path
         config_path = Path(hermes_home) / "config.yaml"
         try:
-            import yaml
-            existing = {}
-            if config_path.exists():
-                with open(config_path, encoding="utf-8-sig") as f:
-                    existing = yaml.safe_load(f) or {}
-            existing.setdefault("plugins", {})
-            existing["plugins"]["hermes-memory-store"] = values
-            with open(config_path, "w", encoding="utf-8") as f:
-                yaml.dump(existing, f, default_flow_style=False)
+            def update(existing: dict) -> dict:
+                plugins = existing.setdefault("plugins", {})
+                if not isinstance(plugins, dict):
+                    plugins = {}
+                    existing["plugins"] = plugins
+                plugins["hermes-memory-store"] = values
+                return existing
+
+            mutate_config(update, config_path=config_path)
         except Exception:
             pass
 
