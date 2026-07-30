@@ -18,7 +18,7 @@ PDF_BYTES = b"%PDF-1.4 fake pdf payload for tests"
 def _blob_resource(data: bytes, uri="slack://files/F123/report.pdf", mime="application/pdf"):
     return SimpleNamespace(
         uri=uri,
-        mimeType=mime,
+        mime_type=mime,
         blob=base64.b64encode(data).decode("ascii"),
         text=None,
     )
@@ -56,7 +56,7 @@ class TestRenderResourceBlock:
     def test_embedded_text_resource_is_inlined(self):
         from tools.mcp_tool import _render_mcp_resource_block
 
-        res = SimpleNamespace(uri="mem://notes", mimeType="text/plain", text="hello world", blob=None)
+        res = SimpleNamespace(uri="mem://notes", mime_type="text/plain", text="hello world", blob=None)
         assert _render_mcp_resource_block(_embedded(res), "srv") == "hello world"
 
     def test_resource_link_preserves_uri_and_points_at_reader(self):
@@ -66,7 +66,7 @@ class TestRenderResourceBlock:
             type="resource_link",
             uri="slack://files/F123",
             name="report.pdf",
-            mimeType="application/pdf",
+            mime_type="application/pdf",
         )
         out = _render_mcp_resource_block(link, "slack")
         assert "slack://files/F123" in out
@@ -86,7 +86,7 @@ class TestRenderResourceBlock:
     def test_malformed_base64_fails_explicitly(self):
         from tools.mcp_tool import _render_mcp_resource_block
 
-        res = SimpleNamespace(uri="x://y", mimeType="application/pdf", blob="!!!not-base64!!!", text=None)
+        res = SimpleNamespace(uri="x://y", mime_type="application/pdf", blob="!!!not-base64!!!", text=None)
         out = _render_mcp_resource_block(_embedded(res), "srv")
         assert "could not be decoded" in out
 
@@ -143,7 +143,7 @@ class TestPreDecodeSizeCap:
 
         monkeypatch.setattr(m, "_MCP_RESOURCE_MAX_B64_CHARS", 16)
         res = SimpleNamespace(
-            uri="x://y/big.pdf", mimeType="application/pdf",
+            uri="x://y/big.pdf", mime_type="application/pdf",
             blob="A" * 100, text=None,
         )
         called = []
@@ -157,7 +157,7 @@ class TestAudioBlock:
     def test_non_audio_returns_empty(self):
         from tools.mcp_tool import _cache_mcp_audio_block
 
-        block = SimpleNamespace(data=base64.b64encode(b"x").decode(), mimeType="application/pdf")
+        block = SimpleNamespace(data=base64.b64encode(b"x").decode(), mime_type="application/pdf")
         assert _cache_mcp_audio_block(block) == ""
 
     def test_audio_block_cached_as_media(self, tmp_path, monkeypatch):
@@ -167,7 +167,7 @@ class TestAudioBlock:
         monkeypatch.setattr(base, "AUDIO_CACHE_DIR", tmp_path)
         block = SimpleNamespace(
             data=base64.b64encode(b"RIFFfakewav").decode(),
-            mimeType="audio/wav",
+            mime_type="audio/wav",
         )
         out = _cache_mcp_audio_block(block)
         assert out.startswith("MEDIA:")
@@ -207,7 +207,7 @@ class TestToolResultLoopOrdering:
 
         block = SimpleNamespace(
             data=base64.b64encode(b"some bytes").decode("ascii"),
-            mimeType="application/pdf",
+            mime_type="application/pdf",
         )
         assert _cache_mcp_image_block(block) == ""
 
@@ -248,10 +248,10 @@ class TestErrorPathResourceText:
         from unittest.mock import AsyncMock
 
         session, handler = _handler
-        res = SimpleNamespace(uri="mem://err", mimeType="text/plain",
+        res = SimpleNamespace(uri="mem://err", mime_type="text/plain",
                               text="quota exceeded for workspace W1", blob=None)
         session.call_tool = AsyncMock(return_value=SimpleNamespace(
-            content=[_embedded(res)], isError=True, structuredContent=None,
+            content=[_embedded(res)], is_error=True, structured_content=None,
         ))
         data = json.loads(handler({}))
         assert "quota exceeded for workspace W1" in data["error"]
@@ -260,11 +260,11 @@ class TestErrorPathResourceText:
         from unittest.mock import AsyncMock
 
         session, handler = _handler
-        res = SimpleNamespace(uri="mem://err", mimeType="text/plain",
+        res = SimpleNamespace(uri="mem://err", mime_type="text/plain",
                               text=" — details in resource", blob=None)
         session.call_tool = AsyncMock(return_value=SimpleNamespace(
             content=[SimpleNamespace(type="text", text="tool failed"), _embedded(res)],
-            isError=True, structuredContent=None,
+            is_error=True, structured_content=None,
         ))
         data = json.loads(handler({}))
         assert "tool failed" in data["error"]
@@ -275,7 +275,7 @@ class TestErrorPathResourceText:
 
         session, handler = _handler
         session.call_tool = AsyncMock(return_value=SimpleNamespace(
-            content=[], isError=True, structuredContent=None,
+            content=[], is_error=True, structured_content=None,
         ))
         data = json.loads(handler({}))
         assert data["error"] == "MCP tool returned an error"

@@ -1,0 +1,19 @@
+[Unit]
+Description=Update the Hermes fabric node to the committed public release
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+EnvironmentFile=/etc/hermes-agent/fabric-update.env
+ExecStart=/usr/local/lib/hermes-agent/update-fabric-node.sh
+User=root
+Group=root
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectHome=read-only
+ProtectSystem=strict
+ReadWritePaths=-/opt/dbb3-team -/opt/pc-team -/var/lib/hermes-agent-fabric-update -/var/lib/systemd/linger -/etc/systemd/system -/home/hermes/.config -/home/hermes/.local/state /run
+
+[Install]
+WantedBy=multi-user.target

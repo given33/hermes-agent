@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import threading
+import time
 
 import pytest
 
@@ -18,7 +19,10 @@ from hermes_services.auth import (
     has_usable_secret,
     is_rate_limited_auth_error,
 )
-from hermes_services.http_boundary import HttpBoundaryPolicy
+from hermes_services.http_boundary import (
+    HttpBoundaryCompatibilityAdapter,
+    HttpBoundaryPolicy,
+)
 from hermes_services.jsonrpc import JsonRpcMethodRegistry
 from hermes_services.http_policy import (
     API_SECURITY_HEADERS,
@@ -174,6 +178,104 @@ def test_application_kernel_composes_http_rpc_and_session_services() -> None:
     assert kernel.rpc.handle(
         {"id": "request-a", "method": "status", "params": {"state": "ok"}}
     )["result"] == {"state": "ok"}
+
+
+def test_application_kernel_owns_the_five_bounded_contexts() -> None:
+    contexts = HermesApplicationKernel.for_local_rpc().contexts.snapshot()
+
+    assert set(contexts) == {
+        "account",
+        "hosted_task",
+        "resource_catalog",
+        "notification",
+        "intelligence",
+    }
+    assert contexts["resource_catalog"].status == "canonical"
+    assert contexts["resource_catalog"].migration_flag == (
+        "HERMES_RESOURCE_CATALOG_MODE"
+    )
+    assert all(context.port_name.endswith("Port") for context in contexts.values())
+    assert all(context.adapters for context in contexts.values())
+
+
+def test_http_compatibility_adapter_dual_runs_and_fails_closed() -> None:
+    canonical = HttpBoundaryPolicy(
+        surface="api",
+        bearer_secret="canonical-secret",
+        allowed_origins=("https://app.example.test",),
+    )
+    matching = HttpBoundaryPolicy(
+        surface="api",
+        bearer_secret="canonical-secret",
+        allowed_origins=("https://app.example.test",),
+    )
+    dual = HttpBoundaryCompatibilityAdapter(
+        canonical=canonical,
+        legacy=matching,
+        mode="dual",
+    )
+
+    assert dual.authorize("Bearer canonical-secret").authenticated
+    assert dual.origin_allowed("https://app.example.test")
+    assert dual.response_headers is canonical.response_headers
+
+    divergent = HttpBoundaryCompatibilityAdapter(
+        canonical=canonical,
+        legacy=HttpBoundaryPolicy(
+            surface="api",
+            bearer_secret="legacy-secret",
+            allowed_origins=("https://legacy.example.test",),
+        ),
+        mode="dual",
+    )
+    auth = divergent.authorize("Bearer canonical-secret")
+    assert not auth.authenticated
+    assert auth.error_code == "http_contract_mismatch"
+    with pytest.raises(RuntimeError, match="contracts diverged"):
+        divergent.origin_allowed("https://app.example.test")
+
+
+def test_http_contract_mode_supports_staged_rollback() -> None:
+    canonical = HttpBoundaryPolicy(surface="api", bearer_secret="new-secret")
+    legacy = HttpBoundaryPolicy(surface="api", bearer_secret="old-secret")
+
+    canonical_mode = HttpBoundaryCompatibilityAdapter(
+        canonical=canonical,
+        legacy=legacy,
+        mode="canonical",
+    )
+    assert canonical_mode.authorize("Bearer new-secret").authenticated
+
+    rolled_back = HttpBoundaryCompatibilityAdapter(
+        canonical=canonical,
+        legacy=legacy,
+        mode="legacy",
+    )
+    assert rolled_back.authorize("Bearer old-secret").authenticated
+    assert not rolled_back.authorize("Bearer new-secret").authenticated
+    with pytest.raises(ValueError, match="invalid HTTP contract"):
+        HttpBoundaryCompatibilityAdapter(
+            canonical=canonical,
+            legacy=legacy,
+            mode="invalid",  # type: ignore[arg-type]
+        )
+
+
+def test_http_compatibility_adapter_has_a_bounded_policy_cost() -> None:
+    policy = HttpBoundaryPolicy(
+        surface="api",
+        bearer_secret="performance-secret",
+    )
+    adapter = HttpBoundaryCompatibilityAdapter(
+        canonical=policy,
+        legacy=policy,
+        mode="dual",
+    )
+
+    started = time.perf_counter()
+    for _ in range(10_000):
+        assert adapter.authorize("Bearer performance-secret").authenticated
+    assert time.perf_counter() - started < 2.0
 
 
 def test_local_rpc_kernel_rejects_http_boundary_access() -> None:

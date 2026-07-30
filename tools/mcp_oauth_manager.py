@@ -107,7 +107,7 @@ def _make_hermes_provider_class() -> Optional[type]:
     """Lazy-import the SDK base class and return our subclass.
 
     Wrapped in a function so this module imports cleanly even when the
-    MCP SDK's OAuth module is unavailable (e.g. older mcp versions).
+    the MCP SDK's OAuth module is unavailable.
     """
     try:
         from mcp.client.auth.oauth2 import OAuthClientProvider
@@ -233,7 +233,7 @@ def _make_hermes_provider_class() -> Optional[type]:
             builders and response handlers so we track whatever the SDK
             version we're pinned to expects.
             """
-            import httpx  # local import: httpx is an MCP SDK dependency
+            import httpx2 as httpx  # MCP SDK v2 transport dependency
             from mcp.client.auth.utils import (
                 build_oauth_authorization_server_metadata_discovery_urls,
                 build_protected_resource_metadata_discovery_urls,
@@ -579,7 +579,6 @@ class MCPOAuthManager:
             storage=storage,
             redirect_handler=redirect_handler,
             callback_handler=callback_handler,
-            timeout=float(cfg.get("timeout", 300)),
         )
 
     def remove(

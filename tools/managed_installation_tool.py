@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import os
 from uuid import uuid4
 
 from tools.registry import registry
@@ -22,14 +23,27 @@ def managed_installation(args: dict, **_kwargs) -> str:
         create_managed_installation,
         get_managed_installation,
         list_managed_installations,
+        rollback_managed_installation,
     )
 
     action = str(args.get("action") or "install").strip().lower()
+    owner_id = str(os.environ.get("HERMES_TOOL_ARTIFACT_OWNER") or "").strip()
+    account_generation = str(os.environ.get("HERMES_ACCOUNT_GENERATION") or "").strip()
+    if bool(owner_id) != bool(account_generation):
+        return json.dumps({"error": "managed installation account boundary is incomplete"})
+    owner_kwargs = (
+        {"owner_id": owner_id, "account_generation": account_generation}
+        if owner_id and account_generation
+        else {}
+    )
     if action == "status":
         operation_id = str(args.get("operation_id") or "").strip()
         if operation_id:
             try:
-                return json.dumps(get_managed_installation(operation_id), ensure_ascii=False)
+                return json.dumps(
+                    get_managed_installation(operation_id, **owner_kwargs),
+                    ensure_ascii=False,
+                )
             except KeyError:
                 return json.dumps({"error": "installation_not_found"})
         return json.dumps(
@@ -37,11 +51,25 @@ def managed_installation(args: dict, **_kwargs) -> str:
                 kind=str(args.get("kind") or ""),
                 profile=str(args.get("profile") or ""),
                 limit=50,
+                **owner_kwargs,
             ),
             ensure_ascii=False,
         )
+    if action == "rollback":
+        operation_id = str(args.get("operation_id") or "").strip()
+        if not operation_id:
+            return json.dumps({"error": "operation_id is required for rollback"})
+        try:
+            operation = rollback_managed_installation(
+                operation_id,
+                request_id=str(args.get("request_id") or ""),
+                **owner_kwargs,
+            )
+        except (KeyError, RuntimeError, ValueError) as exc:
+            return json.dumps({"error": str(exc)}, ensure_ascii=False)
+        return json.dumps({"accepted": True, "operation": operation}, ensure_ascii=False)
     if action != "install":
-        return json.dumps({"error": "action must be install or status"})
+        return json.dumps({"error": "action must be install, rollback, or status"})
     try:
         operation = create_managed_installation(
             kind=str(args.get("kind") or ""),
@@ -52,7 +80,9 @@ def managed_installation(args: dict, **_kwargs) -> str:
             locality=str(args.get("locality") or "portable"),
             targets=args.get("targets") or [],
             project_name=str(args.get("project_name") or ""),
+            source_ref=str(args.get("source_ref") or ""),
             require_topology=True,
+            **owner_kwargs,
         )
     except (RuntimeError, ValueError) as exc:
         return json.dumps({"error": str(exc)}, ensure_ascii=False)
@@ -80,7 +110,7 @@ registry.register(
         "parameters": {
             "type": "object",
             "properties": {
-                "action": {"type": "string", "enum": ["install", "status"]},
+                "action": {"type": "string", "enum": ["install", "rollback", "status"]},
                 "kind": {"type": "string", "enum": ["skill", "mcp", "project"]},
                 "identifier": {
                     "type": "string",
@@ -100,6 +130,10 @@ registry.register(
                 },
                 "profile": {"type": "string"},
                 "project_name": {"type": "string"},
+                "source_ref": {
+                    "type": "string",
+                    "description": "Project branch, tag, ref, or commit to resolve once and pin.",
+                },
                 "request_id": {"type": "string"},
                 "operation_id": {"type": "string"},
             },

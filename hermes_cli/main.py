@@ -9873,7 +9873,10 @@ def _cmd_update_pip(args):
     uv = ensure_uv()
     in_venv = sys.prefix != sys.base_prefix
     # pipx-managed installs live under .../pipx/venvs/<name>/...
-    pipx_managed = "pipx" in sys.prefix.split(os.sep)
+    prefix_parts = {
+        part.casefold() for part in sys.prefix.replace("\\", "/").split("/") if part
+    }
+    pipx_managed = "pipx" in prefix_parts
     pipx = shutil.which("pipx") if pipx_managed else None
 
     # Only the ``uv pip install`` path inside a venv needs VIRTUAL_ENV

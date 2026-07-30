@@ -2,7 +2,7 @@
 """
 MCP (Model Context Protocol) Client Support
 
-Connects to external MCP servers via stdio, HTTP/StreamableHTTP, or SSE
+Connects to external MCP servers via stdio or Streamable HTTP
 transport, discovers their tools, and registers them into the hermes-agent
 tool registry so the agent can call them like any built-in tool.
 
@@ -19,10 +19,8 @@ Example config::
         env: {}
         timeout: 120         # per-tool-call timeout in seconds (default: 300)
         connect_timeout: 60  # initial connection timeout (default: 60)
-        keepalive_interval: 10  # liveness ping cadence in seconds (default:
-                                # 180). Set below the server's session TTL for
-                                # servers that GC idle sessions quickly (e.g.
-                                # Unreal Engine editor MCP, ~15s). Floored at 5s.
+        keepalive_interval: 10  # transport liveness probe cadence in seconds
+                                # (default: 180; floored at 5s)
         idle_timeout_seconds: 3600      # optional stdio recycle after idle
         max_lifetime_seconds: 86400     # optional stdio recycle after age
         # The recycle settings may also live under lifecycle: {...}.
@@ -42,13 +40,6 @@ Example config::
                               # Streamable HTTP endpoint that answers HEAD/GET
                               # with a non-MCP content type but serves real
                               # MCP over POST. Default: false.
-      searxng:
-        url: "http://localhost:8000/sse"
-        transport: sse       # use SSE transport instead of Streamable HTTP
-        timeout: 180
-        connect_timeout: 10
-        command: "npx"
-        args: ["-y", "analysis-server"]
         sampling:                    # server-initiated LLM requests
           enabled: true              # default: true
           model: "gemini-3-flash"    # override model (optional)
@@ -61,7 +52,6 @@ Example config::
 
 Features:
     - Stdio transport (command + args) and HTTP/StreamableHTTP transport (url)
-    - SSE transport (transport: sse) for MCP servers using the SSE protocol
     - Automatic reconnection with exponential backoff (up to 5 retries)
     - Environment variable filtering for stdio subprocesses (security)
     - Credential stripping in error messages returned to the LLM
@@ -92,6 +82,7 @@ Thread safety:
 import asyncio
 import contextvars
 import concurrent.futures
+from dataclasses import dataclass
 import functools
 import inspect
 import json
@@ -106,7 +97,7 @@ import time
 from types import SimpleNamespace
 from typing import Callable
 from datetime import datetime
-from typing import Any, Coroutine, Dict, List, Optional
+from typing import Any, Coroutine, Dict, Iterable, List, Optional
 from urllib.parse import urlparse
 
 from hermes_runtime import process_probe
@@ -130,7 +121,7 @@ _OSV_MALWARE_CHECK_TIMEOUT_S = 12.0
 #
 # The MCP SDK's ``stdio_client(server, errlog=sys.stderr)`` defaults the
 # subprocess stderr stream to the parent process's real stderr, i.e. the
-# user's TTY.  That means any MCP server we spawn at startup (FastMCP
+# user's TTY. That means any MCP server we spawn at startup (MCPServer
 # banners, slack-mcp-server JSON startup logs, etc.) writes directly onto
 # the terminal while prompt_toolkit / Rich is rendering the TUI — which
 # corrupts the display and can hang the session.
@@ -205,37 +196,27 @@ _MCP_SAMPLING_TYPES = False
 _MCP_NOTIFICATION_TYPES = False
 _MCP_ELICITATION_TYPES = False
 _MCP_MESSAGE_HANDLER_SUPPORTED = False
-# Conservative fallback for SDK builds that don't export LATEST_PROTOCOL_VERSION.
-# Streamable HTTP was introduced by 2025-03-26, so this remains valid for the
-# HTTP transport path even on older-but-supported SDK versions.
-LATEST_PROTOCOL_VERSION = "2025-03-26"
+# The project pins MCP SDK v2, whose current protocol revision is 2026-07-28.
+# Keep the fallback aligned with that revision so manual HTTP probes remain
+# coherent even if a downstream SDK build stops re-exporting the constant.
+LATEST_PROTOCOL_VERSION = "2026-07-28"
 try:
     from mcp import ClientSession, StdioServerParameters
     from mcp.client.stdio import stdio_client
     _MCP_AVAILABLE = True
     try:
-        from mcp.client.streamable_http import streamablehttp_client
+        from mcp.client.streamable_http import streamable_http_client
         _MCP_HTTP_AVAILABLE = True
     except ImportError:
         _MCP_HTTP_AVAILABLE = False
-    # Prefer the non-deprecated API (mcp >= 1.24.0); fall back to the
-    # deprecated wrapper for older SDK versions.
     try:
-        from mcp.client.streamable_http import streamable_http_client
-        _MCP_NEW_HTTP = True
+        from mcp.types.version import LATEST_PROTOCOL_VERSION
     except ImportError:
-        _MCP_NEW_HTTP = False
-    try:
-        from mcp.types import LATEST_PROTOCOL_VERSION
-    except ImportError:
-        logger.debug("mcp.types.LATEST_PROTOCOL_VERSION not available -- using fallback protocol version")
-    # SSE transport client (for MCP servers using SSE transport instead of Streamable HTTP)
-    try:
-        from mcp.client.sse import sse_client
-    except ImportError:
-        sse_client = None
-        logger.debug("mcp.client.sse.sse_client not available -- SSE transport disabled")
-    # Sampling types -- separated so older SDK versions don't break MCP support
+        try:
+            from mcp.types import LATEST_PROTOCOL_VERSION
+        except ImportError:
+            logger.debug("MCP protocol version constant unavailable -- using v2 fallback")
+    # Sampling types remain optional at runtime even on SDK v2.
     try:
         from mcp.types import (
             CreateMessageResult,
@@ -259,7 +240,7 @@ try:
         _MCP_ELICITATION_TYPES = True
     except ImportError:
         logger.debug("MCP elicitation types not available -- elicitation disabled")
-    # Notification types for dynamic tool discovery (tools/list_changed)
+    # Notification types delivered by the current ClientSession callback.
     try:
         from mcp.types import (
             ServerNotification,
@@ -271,45 +252,17 @@ try:
     except ImportError:
         logger.debug("MCP notification types not available -- dynamic tool discovery disabled")
 except ImportError:
+    streamable_http_client = None
     logger.debug("mcp package not installed -- MCP tool support disabled")
 
 
-def _check_message_handler_support() -> bool:
-    """Check if ClientSession accepts ``message_handler`` kwarg.
-
-    Inspects the constructor signature for backward compatibility with older
-    MCP SDK versions that don't support notification handlers.
-    """
-    if not _MCP_AVAILABLE:
-        return False
-    try:
-        return "message_handler" in inspect.signature(ClientSession).parameters
-    except (TypeError, ValueError):
-        return False
+async def _discover_mcp_session(session: Any) -> Any:
+    """Negotiate a current, stateless MCP protocol revision."""
+    return await session.discover()
 
 
-_MCP_MESSAGE_HANDLER_SUPPORTED = _check_message_handler_support()
-if _MCP_AVAILABLE and not _MCP_MESSAGE_HANDLER_SUPPORTED:
-    logger.debug("MCP SDK does not support message_handler -- dynamic tool discovery disabled")
-
-
-def _check_logging_callback_support() -> bool:
-    """Check if ClientSession accepts the ``logging_callback`` kwarg.
-
-    Mirrors ``_check_message_handler_support`` for backward compatibility
-    with older MCP SDK versions.  Without a logging_callback, the SDK's
-    default handler silently discards every ``notifications/message`` a
-    server emits, so server-side diagnostics never reach Hermes' logs.
-    """
-    if not _MCP_AVAILABLE:
-        return False
-    try:
-        return "logging_callback" in inspect.signature(ClientSession).parameters
-    except (TypeError, ValueError):
-        return False
-
-
-_MCP_LOGGING_CALLBACK_SUPPORTED = _check_logging_callback_support()
+_MCP_MESSAGE_HANDLER_SUPPORTED = _MCP_AVAILABLE
+_MCP_LOGGING_CALLBACK_SUPPORTED = _MCP_AVAILABLE
 
 # MCP logging levels (RFC 5424 syslog severities) -> Python logging levels.
 # Port of anomalyco/opencode#34529's serverLog mapping.
@@ -346,14 +299,9 @@ _MAX_BACKOFF_SECONDS = 60
 _PARKED_RETRY_INTERVAL = 300     # seconds between parked self-probes
 _RECYCLED_RECONNECT_TIMEOUT = 15.0
 
-# Keepalive cadence for HTTP/SSE sessions. The MCP spec lets a server expire
-# idle sessions on any TTL it chooses (Streamable HTTP "Session Management"),
-# so a client that wants a session to survive idle periods MUST refresh faster
-# than that TTL. The default suits long LB/NAT idle windows (commonly
-# 300-600s); servers with short session TTLs (e.g. Unreal Engine's editor MCP,
-# ~15s) need a smaller ``keepalive_interval`` in their config or every idle
-# tool call lands on a dead session and pays the full reconnect path. The floor
-# stops a misconfigured tiny interval from busy-looping the keepalive.
+# Keepalive cadence for long-lived transports. Protocol 2026-07-28 is stateless;
+# this detects dead child processes, network paths, and idle LB/NAT connections.
+# The floor stops a misconfigured tiny interval from busy-looping the probe.
 _DEFAULT_KEEPALIVE_INTERVAL = 180  # seconds between liveness pings
 _MIN_KEEPALIVE_INTERVAL = 5        # clamp floor for configured intervals
 
@@ -476,48 +424,6 @@ def _exc_str(exc: BaseException) -> str:
     return text if text else repr(exc)
 
 
-# JSON-RPC "method not found" — the error a server returns when it does not
-# implement a requested method (e.g. a tool-capable server that never wired up
-# the optional ``ping`` utility). Defined locally with a fallback so detection
-# works even on SDK builds that don't export the constant.
-try:
-    from mcp.types import METHOD_NOT_FOUND as _JSONRPC_METHOD_NOT_FOUND
-except Exception:  # pragma: no cover — older/newer SDK without the constant
-    _JSONRPC_METHOD_NOT_FOUND = -32601
-
-
-def _is_method_not_found_error(exc: BaseException) -> bool:
-    """Return True if *exc* is a JSON-RPC ``method not found`` (-32601).
-
-    ``ping`` is an *optional* MCP utility (spec: "optional ping mechanism").
-    A server that doesn't implement it answers a ping with -32601 rather than
-    an empty result. Structurally inspect ``McpError.error.code`` first, then
-    fall back to a substring match so detection survives SDK version drift and
-    servers that surface the condition as a plain message.
-
-    The substring fallback matters when a server reports method-not-found
-    without a structural ``-32601`` code (e.g. surfaced as a plain exception
-    string). Besides the canonical "method not found", many JSON-RPC
-    implementations phrase it as "Unknown method: <name>" — agentmemory's MCP
-    server is one such case (#50028). Without matching that phrasing the
-    ping→list_tools fallback never latches and the keepalive reconnect-loops.
-    """
-    # Structural: mcp.shared.exceptions.McpError carries ErrorData.code.
-    err = getattr(exc, "error", None)
-    code = getattr(err, "code", None)
-    if code == _JSONRPC_METHOD_NOT_FOUND:
-        return True
-    msg = str(exc).lower()
-    if not msg:
-        return False
-    return (
-        str(_JSONRPC_METHOD_NOT_FOUND) in msg
-        or "method not found" in msg
-        or "unknown method" in msg
-        or "not found: ping" in msg
-    )
-
-
 # ---------------------------------------------------------------------------
 # MCP tool description content scanning
 # ---------------------------------------------------------------------------
@@ -617,7 +523,7 @@ async def _paginate_full_list(list_method, items_attr: str, server_name: str):
     for _ in range(_MCP_LIST_MAX_PAGES):
         result = await (list_method(cursor=cursor) if cursor else list_method())
         items.extend(getattr(result, items_attr, None) or [])
-        cursor = getattr(result, "nextCursor", None)
+        cursor = getattr(result, "next_cursor", None)
         # Per the MCP spec the cursor is an opaque string; anything else
         # (including mock objects in tests) means "no more pages".
         if not isinstance(cursor, str) or not cursor:
@@ -733,7 +639,7 @@ def _cache_mcp_image_block(block) -> str:
     import base64
 
     data = getattr(block, "data", None)
-    mime_type = getattr(block, "mimeType", None)
+    mime_type = getattr(block, "mime_type", None)
     normalized_mime = str(mime_type or "").split(";", 1)[0].strip().lower()
     if data is None or not normalized_mime.startswith("image/"):
         return ""
@@ -821,7 +727,7 @@ def _cache_mcp_audio_block(block) -> str:
     import base64
 
     data = getattr(block, "data", None)
-    mime_type = str(getattr(block, "mimeType", None) or "").split(";", 1)[0].strip().lower()
+    mime_type = str(getattr(block, "mime_type", None) or "").split(";", 1)[0].strip().lower()
     if data is None or not mime_type.startswith("audio/"):
         return ""
     if len(data) > _MCP_RESOURCE_MAX_B64_CHARS:
@@ -875,7 +781,7 @@ def _render_mcp_resource_block(block, server_name: str = "") -> str:
         if not uri:
             return ""
         name = getattr(block, "name", "") or ""
-        mime = getattr(block, "mimeType", "") or ""
+        mime = getattr(block, "mime_type", "") or ""
         details = f"uri={uri}"
         if name:
             details += f", name={name}"
@@ -903,7 +809,7 @@ def _render_mcp_resource_block(block, server_name: str = "") -> str:
     import base64
 
     uri = str(getattr(resource, "uri", "") or "")
-    mime = str(getattr(resource, "mimeType", "") or "")
+    mime = str(getattr(resource, "mime_type", "") or "")
     if len(blob) > _MCP_RESOURCE_MAX_B64_CHARS:
         return f"[MCP embedded resource too large to cache: ~{len(blob) * 3 // 4} bytes, uri={uri}]"
     try:
@@ -1290,10 +1196,10 @@ class SamplingHandler:
                     for block in content_blocks:
                         if hasattr(block, "text"):
                             parts.append({"type": "text", "text": block.text})
-                        elif hasattr(block, "data") and hasattr(block, "mimeType"):
+                        elif hasattr(block, "data") and hasattr(block, "mime_type"):
                             parts.append({
                                 "type": "image_url",
-                                "image_url": {"url": f"data:{block.mimeType};base64,{block.data}"},
+                                "image_url": {"url": f"data:{block.mime_type};base64,{block.data}"},
                             })
                         else:
                             logger.warning(
@@ -1370,7 +1276,7 @@ class SamplingHandler:
             role="assistant",
             content=content_blocks,
             model=response.model,
-            stopReason="toolUse",
+            stop_reason="toolUse",
         )
 
     def _build_text_result(self, choice, response):
@@ -1389,7 +1295,7 @@ class SamplingHandler:
             role="assistant",
             content=TextContent(type="text", text=_sanitize_error(response_text)),
             model=response.model,
-            stopReason=self._STOP_REASON_MAP.get(choice.finish_reason, "endTurn"),
+            stop_reason=self._STOP_REASON_MAP.get(choice.finish_reason, "endTurn"),
         )
 
     # -- Session kwargs helper -----------------------------------------------
@@ -1466,7 +1372,7 @@ class SamplingHandler:
                         "name": getattr(t, "name", ""),
                         "description": getattr(t, "description", "") or "",
                         "parameters": _normalize_mcp_input_schema(
-                            getattr(t, "inputSchema", None)
+                            getattr(t, "input_schema", None)
                         ),
                     },
                 }
@@ -1737,6 +1643,7 @@ class MCPServerTask:
     __slots__ = (
         "name", "session", "tool_timeout",
         "_task", "_ready", "_shutdown_event", "_reconnect_event",
+        "_subscription_task",
         "_tools", "_error", "_config",
         "_sampling", "_elicitation",
         "_registered_tool_names", "_auth_type", "_refresh_lock",
@@ -1744,7 +1651,7 @@ class MCPServerTask:
         "_pending_call_context",
         "_lifecycle_started_at", "_last_tool_call_at",
         "_idle_timeout_seconds", "_max_lifetime_seconds", "_recycled_reason",
-        "initialize_result", "_ping_unsupported",
+        "discover_result",
         "_reconnect_retries", "_accepting_calls",
         "_call_state_lock", "_inflight_calls", "_inflight_zero",
     )
@@ -1762,6 +1669,7 @@ class MCPServerTask:
         # outer run() loop re-enters the transport so the MCP session is
         # rebuilt with fresh credentials.
         self._reconnect_event = asyncio.Event()
+        self._subscription_task: Optional[asyncio.Task] = None
         self._tools: list = []
         self._error: Optional[Exception] = None
         self._config: dict = {}
@@ -1809,18 +1717,12 @@ class MCPServerTask:
         self._idle_timeout_seconds: Optional[float] = None
         self._max_lifetime_seconds: Optional[float] = None
         self._recycled_reason: Optional[str] = None
-        # Captures the ``InitializeResult`` returned by
-        # ``await session.initialize()`` so downstream code can inspect the
+        # Captures the negotiated 2026+ ``DiscoverResult`` so downstream code
+        # can inspect the
         # server's real advertised capabilities (``.capabilities.resources``,
         # ``.capabilities.prompts``) instead of assuming every ``ClientSession``
         # method attribute corresponds to a supported server method. See #18051.
-        self.initialize_result: Optional[Any] = None
-        # Set True the first time a keepalive ``ping`` returns JSON-RPC
-        # -32601 (method not found): the server is tool-capable but doesn't
-        # implement the optional ``ping`` utility. Subsequent keepalives fall
-        # back to ``list_tools`` (the pre-ping probe) so we neither spam pings
-        # nor reconnect-loop. Reset on each fresh transport connection.
-        self._ping_unsupported: bool = False
+        self.discover_result: Optional[Any] = None
 
     def _is_http(self) -> bool:
         """Check if this server uses HTTP transport."""
@@ -1829,21 +1731,24 @@ class MCPServerTask:
     def _advertises_tools(self) -> bool:
         """Whether the server advertises the ``tools`` capability.
 
-        Per the MCP spec, ``InitializeResult.capabilities.tools`` is non-None
+        Per the MCP spec, ``DiscoverResult.capabilities.tools`` is non-None
         iff the server implements the ``tools/*`` request family. Prompt-only
         or resource-only servers omit it, and calling ``tools/list`` against
         them raises ``McpError(-32601 Method not found)`` — which previously
         killed the connection during discovery and made every keepalive fail.
         (Ported from anomalyco/opencode#31271.)
 
-        Returns True when no capability info was captured (legacy fallback:
-        preserve the old always-call-list_tools behavior rather than regress
-        any server that was working before this gate).
+        Missing discovery data fails closed so this client never probes an
+        unsupported request family.
         """
-        init_result = self.initialize_result
-        caps = getattr(init_result, "capabilities", None) if init_result is not None else None
+        discover_result = self.discover_result
+        caps = (
+            getattr(discover_result, "capabilities", None)
+            if discover_result is not None
+            else None
+        )
         if caps is None:
-            return True
+            return False
         return getattr(caps, "tools", None) is not None
 
     def _is_recycled_stdio(self) -> bool:
@@ -1929,7 +1834,7 @@ class MCPServerTask:
         self._recycled_reason = reason
         self.session = None
 
-    # ----- Dynamic tool discovery (notifications/tools/list_changed) -----
+    # ----- Dynamic tool discovery -----
 
     async def _refresh_tools_task(self):
         """Run a dynamic tool refresh and log failures from background tasks."""
@@ -1994,14 +1899,14 @@ class MCPServerTask:
                     logger.debug("MCP message handler (%s): exception: %s", self.name, message)
                     return
                 if _MCP_NOTIFICATION_TYPES and isinstance(message, ServerNotification):
-                    match message.root:
+                    match message:
                         case ToolListChangedNotification():
                             logger.info(
                                 "MCP server '%s': received tools/list_changed notification",
                                 self.name,
                             )
                             # Some servers (notably mongodb-mcp-server) emit
-                            # tools/list_changed immediately after initialize,
+                            # tools/list_changed immediately after discovery,
                             # while the client may already be executing another
                             # request. Refreshing synchronously inside the SDK
                             # notification handler can race with that request
@@ -2027,7 +1932,7 @@ class MCPServerTask:
     async def _refresh_tools(self):
         """Re-fetch tools from the server and update the registry.
 
-        Called when the server sends ``notifications/tools/list_changed``.
+        Called when the subscription stream reports a tool-list change.
         The lock prevents overlapping refreshes from rapid-fire notifications.
         After the initial ``await`` (list_tools), all mutations are synchronous
         — atomic from the event loop's perspective.
@@ -2092,45 +1997,76 @@ class MCPServerTask:
                     self.name, len(self._registered_tool_names),
                 )
 
+    def _supports_tool_subscriptions(self) -> bool:
+        """Whether the discovered server advertises tool-list changes."""
+        if self.session is None or getattr(self.session, "discover_result", None) is None:
+            return False
+        caps = getattr(self.discover_result, "capabilities", None)
+        tools_cap = getattr(caps, "tools", None) if caps is not None else None
+        return bool(getattr(tools_cap, "list_changed", False))
+
+    async def _listen_for_tool_changes(self) -> None:
+        """Consume the 2026 ``subscriptions/listen`` tool-change stream."""
+        from mcp.client.subscriptions import listen
+        from mcp.shared.subscriptions import ToolsListChanged
+
+        try:
+            async with listen(self.session, tools_list_changed=True) as subscription:
+                async for event in subscription:
+                    if isinstance(event, ToolsListChanged):
+                        await self._refresh_tools()
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            # Losing change notifications must not discard an otherwise usable
+            # tool connection. A reconnect or explicit refresh re-lists tools.
+            logger.warning(
+                "MCP server '%s': subscriptions/listen ended: %s",
+                self.name,
+                exc,
+            )
+
+    def _start_subscription_listener(self) -> None:
+        if not self._supports_tool_subscriptions():
+            return
+        if self._subscription_task is None or self._subscription_task.done():
+            self._subscription_task = asyncio.create_task(
+                self._listen_for_tool_changes(),
+                name=f"mcp-subscriptions-{self.name}",
+            )
+
+    async def _stop_subscription_listener(self) -> None:
+        task = self._subscription_task
+        self._subscription_task = None
+        if task is None or task.done():
+            return
+        task.cancel()
+        try:
+            await task
+        except (asyncio.CancelledError, Exception):
+            pass
+
     async def _keepalive_probe(self) -> None:
         """Exercise the session to detect a stale/expired connection.
 
-        Uses ``ping`` (cheap, transport-agnostic liveness) by default. ``ping``
-        is an OPTIONAL MCP utility: a server that doesn't implement it answers
-        JSON-RPC -32601. The first time that happens we latch
-        ``_ping_unsupported`` and fall back to the pre-ping probe — capability
-        permitting, ``list_tools``; otherwise ``ping`` is the only option and
-        the -32601 propagates (a server advertising neither a working ping nor
-        tools has no liveness primitive left). The latch resets on each fresh
-        transport connection so a server that gains ping support after a
-        reconnect is re-probed with the cheap path.
+        The 2026-07-28 protocol removed ``ping``. Use the first list operation
+        advertised by ``server/discover``. When the server has no listable
+        family, request and stream failures remain its liveness signal.
 
         Raises on a genuine connection failure so the caller triggers a
         reconnect; returns normally when the session is alive.
         """
-        if not self._ping_unsupported:
-            try:
-                await asyncio.wait_for(self.session.send_ping(), timeout=30.0)
-                return
-            except Exception as exc:
-                # Only a "method not found" means ping is unsupported. Any
-                # other error (timeout, closed transport, session expired) is
-                # a real liveness failure — propagate so we reconnect.
-                if not _is_method_not_found_error(exc):
-                    raise
-                if not self._advertises_tools():
-                    # No ping, no tools → no cheaper probe to fall back to.
-                    raise
-                self._ping_unsupported = True
-                logger.info(
-                    "MCP server '%s': does not implement the optional 'ping' "
-                    "utility (-32601); using 'list_tools' for keepalive on "
-                    "this connection.",
-                    self.name,
+        caps = getattr(self.discover_result, "capabilities", None)
+        for cap_name, method_name in (
+            ("tools", "list_tools"),
+            ("resources", "list_resources"),
+            ("prompts", "list_prompts"),
+        ):
+            if getattr(caps, cap_name, None) is not None:
+                await asyncio.wait_for(
+                    getattr(self.session, method_name)(), timeout=30.0
                 )
-
-        # Fallback probe for servers without ping support.
-        await asyncio.wait_for(self.session.list_tools(), timeout=30.0)
+                return
 
     async def _wait_for_lifecycle_event(self) -> str:
         """Block until either _shutdown_event or _reconnect_event fires.
@@ -2138,8 +2074,8 @@ class MCPServerTask:
         Returns:
             "shutdown"  if the server should exit the run loop entirely.
             "reconnect" if the server should tear down the current MCP
-                        session and re-enter the transport (fresh OAuth
-                        tokens, new session ID, etc.). The reconnect event
+                        client and re-enter the transport (for example with
+                        refreshed OAuth tokens). The reconnect event
                         is cleared before return so the next cycle starts
                         with a fresh signal.
             "recycle"   if a stdio idle/max-lifetime limit elapsed. The
@@ -2148,25 +2084,15 @@ class MCPServerTask:
 
         Shutdown takes precedence if both events are set simultaneously.
 
-        Periodically sends a lightweight keepalive (``ping``, with a
-        ``list_tools`` fallback for servers that don't implement the optional
-        ping utility — see :meth:`_keepalive_probe`) to prevent TCP/session
-        state from going stale during idle periods (#17003). If the keepalive
-        fails, triggers a reconnect.
+        Periodically sends a capability-gated list request to detect stale
+        transport state. If the request fails, the transport is reconnected.
 
         The cadence is ``keepalive_interval`` from server config (default
         :data:`_DEFAULT_KEEPALIVE_INTERVAL`, floored at
-        :data:`_MIN_KEEPALIVE_INTERVAL`). Servers that GC idle sessions on a
-        short TTL (e.g. Unreal Engine's editor MCP, ~15s) need an interval
-        below that TTL, otherwise every idle tool call lands on an
-        already-expired session and pays the full reconnect path.
+        :data:`_MIN_KEEPALIVE_INTERVAL`). Deployments with short load-balancer
+        or NAT idle timeouts may configure a shorter interval.
         """
-        # Refresh faster than the server's session TTL. ``ping`` (MCP base
-        # protocol liveness) is used rather than ``list_tools`` so the probe
-        # stays a few bytes regardless of how many tools the server exposes —
-        # a ``list_tools`` keepalive against an 830-tool server would pull
-        # ~1 MB every cycle. Tool-list changes still arrive out-of-band via
-        # ``notifications/tools/list_changed`` → ``_refresh_tools``.
+        # Tool changes arrive through the independent subscriptions stream.
         keepalive_interval = max(
             _MIN_KEEPALIVE_INTERVAL,
             float(self._config.get("keepalive_interval", _DEFAULT_KEEPALIVE_INTERVAL)),
@@ -2199,14 +2125,8 @@ class MCPServerTask:
                     self._mark_stdio_recycled(recycle_reason)
                     return "recycle"
 
-                # Timeout — no lifecycle event fired.  Probe the connection
-                # to detect stale/expired sessions. Prefer ``ping`` (MCP base
-                # protocol liveness): it works uniformly and stays a few bytes
-                # regardless of tool count, unlike ``list_tools`` (~1 MB on an
-                # 830-tool server). ``ping`` is an OPTIONAL utility, so a
-                # tool-capable server that doesn't implement it answers -32601;
-                # in that case fall back to the pre-ping ``list_tools`` probe
-                # for the rest of this connection rather than reconnect-looping.
+                # Timeout — no lifecycle event fired. Probe the first listable
+                # request family advertised by ``server/discover``.
                 if self.session:
                     try:
                         await self._keepalive_probe()
@@ -2219,6 +2139,7 @@ class MCPServerTask:
                         self._reconnect_event.set()
                         break
         finally:
+            await self._stop_subscription_listener()
             for t in (shutdown_task, reconnect_task):
                 if not t.done():
                     t.cancel()
@@ -2366,7 +2287,7 @@ class MCPServerTask:
         pids_before = _snapshot_child_pids()
         new_pids: set = set()
         # Redirect subprocess stderr into a shared log file so MCP servers
-        # (FastMCP banners, slack-mcp startup JSON, etc.) don't dump onto
+        # (MCPServer banners, slack-mcp startup JSON, etc.) don't dump onto
         # the user's TTY and corrupt the TUI.  Preserves debuggability via
         # ~/.hermes/logs/mcp-stderr.log.
         _write_stderr_log_header(self.name)
@@ -2407,7 +2328,7 @@ class MCPServerTask:
                     read_stream, write_stream, **sampling_kwargs
                 ) as session:
                     # Bound the MCP handshake. A stdio server that never
-                    # completes ``initialize`` (e.g. emits a non-JSON-RPC frame
+                    # completes ``server/discover`` (e.g. emits a non-JSON-RPC frame
                     # and then blocks on stdin) otherwise hangs this coroutine
                     # forever on the background loop: ``connect_timeout`` only
                     # bounds the caller's ``.result()`` wait, not the coroutine
@@ -2420,8 +2341,8 @@ class MCPServerTask:
                     connect_timeout = float(
                         config.get("connect_timeout", _DEFAULT_CONNECT_TIMEOUT)
                     )
-                    self.initialize_result = await asyncio.wait_for(
-                        session.initialize(), timeout=connect_timeout
+                    self.discover_result = await asyncio.wait_for(
+                        _discover_mcp_session(session), timeout=connect_timeout
                     )
                     self.session = session
                     self._mark_lifecycle_started()
@@ -2499,9 +2420,9 @@ class MCPServerTask:
 
         Detection is allow-list based: a 2xx response is rejected only when it
         carries a definite content type that is NOT one an MCP endpoint uses
-        (``application/json`` / ``text/event-stream``).  When HEAD/GET returns
+        (``application/json`` / ``text/event-stream``). When HEAD/GET returns
         a non-MCP content type (e.g. ``text/html``), a lightweight JSON-RPC
-        ``initialize`` POST is attempted before giving up — some servers
+        ``server/discover`` POST is attempted before giving up — some servers
         (e.g. DocuSeal) serve a web UI on GET but speak Streamable HTTP only
         via POST.
 
@@ -2553,31 +2474,43 @@ class MCPServerTask:
                     and ct not in self._MCP_CONTENT_TYPES
                     and 200 <= resp.status_code < 300
                 ):
+                    probe_meta = {
+                        "io.modelcontextprotocol/protocolVersion": LATEST_PROTOCOL_VERSION,
+                        "io.modelcontextprotocol/clientCapabilities": {},
+                        "io.modelcontextprotocol/clientInfo": {
+                            "name": "hermes-probe",
+                            "version": "0.1",
+                        },
+                    }
                     post_resp = await client.post(
                         url,
                         headers={
                             **probe_headers,
                             "Content-Type": "application/json",
                             "Accept": "application/json, text/event-stream",
+                            "MCP-Protocol-Version": LATEST_PROTOCOL_VERSION,
+                            "Mcp-Method": "server/discover",
                         },
-                        content=(
-                            '{"jsonrpc":"2.0","id":"_probe",'
-                            '"method":"initialize",'
-                            '"params":{"protocolVersion":"2025-03-26",'
-                            '"capabilities":{},'
-                            '"clientInfo":{"name":"hermes-probe",'
-                            '"version":"0.1"}}}'
+                        content=json.dumps(
+                            {
+                                "jsonrpc": "2.0",
+                                "id": "_probe",
+                                "method": "server/discover",
+                                "params": {"_meta": probe_meta},
+                            },
+                            separators=(",", ":"),
                         ),
                     )
-                    if 200 <= post_resp.status_code < 300:
-                        post_ct = (
-                            post_resp.headers.get("content-type", "")
-                            .split(";")[0]
-                            .strip()
-                            .lower()
-                        )
-                        if post_ct in self._MCP_CONTENT_TYPES:
-                            resp = post_resp
+                    post_ct = (
+                        post_resp.headers.get("content-type", "")
+                        .split(";")[0]
+                        .strip()
+                        .lower()
+                    )
+                    # A JSON-RPC error on HTTP 400 is still positive evidence
+                    # that this is an MCP endpoint.
+                    if post_ct in self._MCP_CONTENT_TYPES:
+                        resp = post_resp
         except _httpx.HTTPError:
             return  # DNS/connect/timeout/transport error — let the SDK try.
 
@@ -2597,7 +2530,7 @@ class MCPServerTask:
             f"'{ct_base}', not an MCP response (expected one of: "
             f"{', '.join(self._MCP_CONTENT_TYPES)}). The URL most likely "
             "points at a web page rather than an MCP endpoint — check it "
-            "resolves to a Streamable HTTP / SSE endpoint "
+            "resolves to a Streamable HTTP endpoint "
             "(e.g. https://host/mcp, not https://host/)."
         )
 
@@ -2612,12 +2545,8 @@ class MCPServerTask:
 
         url = config["url"]
         headers = dict(config.get("headers") or {})
-        # Some MCP servers require MCP-Protocol-Version on the initial
-        # initialize request and reject session-less POSTs otherwise.
-        # Seed it as a client-level default, but treat user overrides as
-        # case-insensitive so conventional casing is preserved.
-        if not any(key.lower() == "mcp-protocol-version" for key in headers):
-            headers["mcp-protocol-version"] = LATEST_PROTOCOL_VERSION
+        # SDK v2 stamps the protocol version and required method/name headers
+        # on every request.
         connect_timeout = config.get("connect_timeout", _DEFAULT_CONNECT_TIMEOUT)
         ssl_verify = config.get("ssl_verify", True)
         client_cert = _resolve_client_cert(self.name, config)
@@ -2647,165 +2576,47 @@ class MCPServerTask:
         if _MCP_LOGGING_CALLBACK_SUPPORTED:
             sampling_kwargs["logging_callback"] = self._make_logging_callback()
 
-        # SSE transport (for MCP servers that implement the SSE transport protocol
-        # rather than Streamable HTTP). Configure with ``transport: sse`` in the
-        # mcp_servers entry in config.yaml.
-        if config.get("transport") == "sse":
-            if sse_client is None:
-                raise ImportError(
-                    f"MCP server '{self.name}' requires SSE transport but "
-                    "mcp.client.sse.sse_client is not available. "
-                    "Upgrade the mcp package to get SSE support."
-                )
-            # sse_read_timeout governs how long sse_client will wait between
-            # events on the SSE stream. Using the tool_timeout (default 60s)
-            # here is wrong: SSE servers commonly hold the stream idle for
-            # minutes between events, so a 60s read timeout drops the
-            # connection after the first slow stretch. 300s matches the
-            # Streamable HTTP code path's httpx read timeout below. Original
-            # observation from @amiller in PR #5981 (Router Teamwork,
-            # Supermemory on Cloudflare Workers idle-disconnect at ~60s).
-            _sse_kwargs: dict = {
-                "url": url,
-                "headers": headers or None,
-                "timeout": float(connect_timeout),
-                "sse_read_timeout": 300.0,
-            }
-            if _oauth_auth is not None:
-                # Pass OAuth auth through to sse_client so SSE MCP servers
-                # behind OAuth 2.1 PKCE work. Previously built but never
-                # forwarded — SSE OAuth would silently fail with 401s.
-                _sse_kwargs["auth"] = _oauth_auth
-            if client_cert is not None or ssl_verify is not True:
-                # SSE transport doesn't expose verify/cert as kwargs, so route
-                # them through an httpx_client_factory that wraps the SDK's
-                # defaults (follow_redirects=True) and adds our TLS settings.
-                # The SDK calls the factory with (headers, auth, timeout); we
-                # forward all of those and layer verify/cert on top.
-                import httpx as _httpx_mod
+        # MCP SDK v2 uses httpx2 and yields a two-stream transport result.
+        # Supplying the client explicitly preserves Hermes' TLS, OAuth and
+        # cross-origin redirect policy.
+        import httpx2
 
-                _cert_for_factory = client_cert
-                _verify_for_factory = ssl_verify
+        _original_url = httpx2.URL(url)
 
-                def _mcp_http_client_factory(
-                    headers=None, timeout=None, auth=None,
+        async def _strip_auth_on_cross_origin_redirect(response):
+            """Strip Authorization when a redirect crosses an origin boundary."""
+            if response.is_redirect and response.next_request:
+                target = response.next_request.url
+                if (target.scheme, target.host, target.port) != (
+                    _original_url.scheme,
+                    _original_url.host,
+                    _original_url.port,
                 ):
-                    kwargs: dict = {
-                        "follow_redirects": True,
-                        "verify": _verify_for_factory,
-                    }
-                    if timeout is not None:
-                        kwargs["timeout"] = timeout
-                    else:
-                        kwargs["timeout"] = _httpx_mod.Timeout(30.0, read=300.0)
-                    if headers is not None:
-                        kwargs["headers"] = headers
-                    if auth is not None:
-                        kwargs["auth"] = auth
-                    if _cert_for_factory is not None:
-                        kwargs["cert"] = _cert_for_factory
-                    return _httpx_mod.AsyncClient(**kwargs)
+                    response.next_request.headers.pop("authorization", None)
 
-                _sse_kwargs["httpx_client_factory"] = _mcp_http_client_factory
-            async with sse_client(**_sse_kwargs) as (read_stream, write_stream):
-                async with ClientSession(
-                    read_stream, write_stream, **sampling_kwargs
-                ) as session:
-                    # Bound the handshake — same orphaned-task hang as the
-                    # stdio path (#59349): an endpoint that accepts the
-                    # connection but never answers ``initialize`` parks this
-                    # coroutine forever on the background loop.
-                    self.initialize_result = await asyncio.wait_for(
-                        session.initialize(), timeout=float(connect_timeout)
-                    )
-                    self.session = session
-                    await self._discover_tools()
-                    self._ready.set()
-                    # Session is live again: clear any breaker state from a
-                    # prior outage so the first call after recovery isn't
-                    # gated on a stale consecutive-failure count (#16788).
-                    _reset_server_error(self.name)
-                    self._reconnect_retries = 0
-                    reason = await self._wait_for_lifecycle_event()
-                    if reason == "reconnect":
-                        logger.info(
-                            "MCP server '%s': reconnect requested — "
-                            "tearing down SSE session", self.name,
-                        )
-            return reason
+        client_kwargs: dict = {
+            "follow_redirects": True,
+            "timeout": httpx2.Timeout(float(connect_timeout), read=300.0),
+            "verify": ssl_verify,
+            "event_hooks": {"response": [_strip_auth_on_cross_origin_redirect]},
+        }
+        if headers:
+            client_kwargs["headers"] = headers
+        if _oauth_auth is not None:
+            client_kwargs["auth"] = _oauth_auth
+        if client_cert is not None:
+            client_kwargs["cert"] = client_cert
 
-        if _MCP_NEW_HTTP:
-            # New API (mcp >= 1.24.0): build an explicit httpx.AsyncClient
-            # matching the SDK's own create_mcp_http_client defaults.
-            import httpx
-
-            _original_url = httpx.URL(url)
-
-            async def _strip_auth_on_cross_origin_redirect(response):
-                """Strip Authorization headers when redirected to a different origin."""
-                if response.is_redirect and response.next_request:
-                    target = response.next_request.url
-                    if (target.scheme, target.host, target.port) != (
-                        _original_url.scheme, _original_url.host, _original_url.port,
-                    ):
-                        response.next_request.headers.pop("authorization", None)
-                        response.next_request.headers.pop("Authorization", None)
-
-            client_kwargs: dict = {
-                "follow_redirects": True,
-                "timeout": httpx.Timeout(float(connect_timeout), read=300.0),
-                "verify": ssl_verify,
-                "event_hooks": {"response": [_strip_auth_on_cross_origin_redirect]},
-            }
-            if headers:
-                client_kwargs["headers"] = headers
-            if _oauth_auth is not None:
-                client_kwargs["auth"] = _oauth_auth
-            if client_cert is not None:
-                client_kwargs["cert"] = client_cert
-
-            # Caller owns the client lifecycle — the SDK skips cleanup when
-            # http_client is provided, so we wrap in async-with.
-            async with httpx.AsyncClient(**client_kwargs) as http_client:
-                async with streamable_http_client(url, http_client=http_client) as (
-                    read_stream, write_stream, _get_session_id,
-                ):
-                    async with ClientSession(read_stream, write_stream, **sampling_kwargs) as session:
-                        # Bound the handshake (#59349) — see stdio path.
-                        self.initialize_result = await asyncio.wait_for(
-                            session.initialize(), timeout=float(connect_timeout)
-                        )
-                        self.session = session
-                        await self._discover_tools()
-                        self._ready.set()
-                        # Session is live again: clear any breaker state from
-                        # a prior outage so the first call after recovery
-                        # isn't gated on a stale failure count (#16788).
-                        _reset_server_error(self.name)
-                        self._reconnect_retries = 0
-                        reason = await self._wait_for_lifecycle_event()
-                        if reason == "reconnect":
-                            logger.info(
-                                "MCP server '%s': reconnect requested — "
-                                "tearing down HTTP session", self.name,
-                            )
-            return reason
-        else:
-            # Deprecated API (mcp < 1.24.0): manages httpx client internally.
-            _http_kwargs: dict = {
-                "headers": headers,
-                "timeout": float(connect_timeout),
-                "verify": ssl_verify,
-            }
-            if _oauth_auth is not None:
-                _http_kwargs["auth"] = _oauth_auth
-            async with streamablehttp_client(url, **_http_kwargs) as (
-                read_stream, write_stream, _get_session_id,
+        # The SDK leaves a caller-supplied client open, so Hermes owns it.
+        async with httpx2.AsyncClient(**client_kwargs) as http_client:
+            async with streamable_http_client(url, http_client=http_client) as (
+                read_stream,
+                write_stream,
             ):
                 async with ClientSession(read_stream, write_stream, **sampling_kwargs) as session:
-                    # Bound the handshake (#59349) — see stdio path.
-                    self.initialize_result = await asyncio.wait_for(
-                        session.initialize(), timeout=float(connect_timeout)
+                    # Bound protocol discovery (#59349).
+                    self.discover_result = await asyncio.wait_for(
+                        _discover_mcp_session(session), timeout=float(connect_timeout)
                     )
                     self.session = session
                     await self._discover_tools()
@@ -2819,9 +2630,9 @@ class MCPServerTask:
                     if reason == "reconnect":
                         logger.info(
                             "MCP server '%s': reconnect requested — "
-                            "tearing down legacy HTTP session", self.name,
+                            "tearing down HTTP session", self.name,
                         )
-            return reason
+        return reason
 
     async def _discover_tools(self):
         """Discover tools from the connected session.
@@ -2833,10 +2644,6 @@ class MCPServerTask:
         server doesn't advertise the ``tools`` capability.
         (Ported from anomalyco/opencode#31271.)
         """
-        # Fresh transport connection → re-probe with the cheap ``ping`` path.
-        # Clears any latch from a prior connection in case the server gained
-        # ping support across the reconnect.
-        self._ping_unsupported = False
         if self.session is None:
             return
         if not self._advertises_tools():
@@ -2853,6 +2660,7 @@ class MCPServerTask:
                 self.session.list_tools, "tools", self.name
             )
         self._register_discovered_tools_if_needed()
+        self._start_subscription_listener()
 
     def _register_discovered_tools_if_needed(self) -> None:
         """Re-register tools after a post-ready reconnect if needed.
@@ -2922,9 +2730,8 @@ class MCPServerTask:
                 self._ready.set()
                 return
 
-            # Pre-flight content-type probe (Streamable HTTP only; SSE is
-            # exercised by its own client and legitimately serves
-            # text/event-stream). A URL pointed at a web-app root returns
+            # Pre-flight content-type probe for Streamable HTTP. A URL pointed
+            # at a web-app root returns
             # HTML, which makes the SDK hang for the full connect_timeout
             # before surfacing an opaque CancelledError. Probing here — once,
             # outside the SDK task group — fails fast and non-retryably with
@@ -2934,7 +2741,11 @@ class MCPServerTask:
             # re-probing is a redundant round-trip. Also skip for OAuth servers:
             # without a cached token the endpoint returns HTML or 401, which
             # would incorrectly block the OAuth flow before it can run.
-            if config.get("transport") != "sse" and not config.get("skip_preflight") and not self._ready.is_set() and self._auth_type != "oauth":
+            if (
+                not config.get("skip_preflight")
+                and not self._ready.is_set()
+                and self._auth_type != "oauth"
+            ):
                 try:
                     _probe_headers = dict(config.get("headers") or {})
                     await self._preflight_content_type(
@@ -3145,6 +2956,13 @@ class MCPServerTask:
 
     async def start(self, config: dict):
         """Create the background Task and wait until ready (or failed)."""
+        # HTTP+SSE was removed by protocol 2026-07-28. Reject stale manifests
+        # before creating any background task or transport client.
+        if config.get("transport") == "sse":
+            raise ValueError(
+                f"MCP server '{self.name}' uses deprecated HTTP+SSE transport; "
+                "update it to Streamable HTTP for protocol 2026-07-28"
+            )
         self._task = asyncio.ensure_future(self.run(config))
         try:
             await self._ready.wait()
@@ -3283,6 +3101,34 @@ _server_config_fingerprints: Dict[str, str] = {}
 _server_connecting: set[str] = set()
 _server_connect_errors: Dict[str, str] = {}
 
+
+@dataclass(frozen=True)
+class MCPAvailability:
+    """One coherent, model-safe snapshot of an MCP server's availability."""
+
+    name: str
+    configured: bool
+    state: str
+    registered_tools: tuple[str, ...] = ()
+    last_error: str = ""
+    transport: str = "stdio"
+    disabled: bool = False
+
+    @property
+    def live(self) -> bool:
+        return self.state == "live"
+
+    def as_dict(self) -> dict[str, Any]:
+        return {
+            "name": self.name,
+            "configured": self.configured,
+            "state": self.state,
+            "registered_tools": list(self.registered_tools),
+            "last_error": self.last_error,
+            "transport": self.transport,
+            "disabled": self.disabled,
+        }
+
 # Circuit breaker: consecutive error counts per server.  After
 # _CIRCUIT_BREAKER_THRESHOLD consecutive failures, the handler returns
 # a "server unreachable" message that tells the model to stop retrying,
@@ -3411,15 +3257,14 @@ def _signal_reconnect_and_wait(
     op_description: str,
     timeout: float = 15.0,
 ) -> bool:
-    """Ask a live MCP server task to rebuild its transport session.
+    """Ask a live MCP server task to rebuild its transport client.
 
     The important detail is clearing ``_ready`` on the MCP event loop before
     setting ``_reconnect_event``. Older code left ``_ready`` set across
     reconnects, so the caller's readiness poll could return immediately and
-    retry against the same dead HTTP/stream session. That was observed as
-    repeated ``Session terminated`` / ``not connected`` / circuit-breaker
-    failures in long-lived gateway sessions even though a fresh CLI process
-    could connect successfully.
+    retry against the same closed transport. That was observed as repeated
+    ``not connected`` / circuit-breaker failures in long-lived gateways even
+    though a fresh client could connect successfully.
     """
     loop = _mcp_loop
     if loop is None or not loop.is_running():
@@ -3622,17 +3467,10 @@ def _handle_auth_error_and_retry(
     }, ensure_ascii=False)
 
 
-# Substrings (lower-cased match) that indicate the MCP server rejected
-# the request because its server-side transport session expired /
-# was garbage-collected.  The caller's OAuth token is still valid —
-# only the transport-layer session state needs rebuilding.  See #13383.
-_SESSION_EXPIRED_MARKERS: tuple = (
-    "invalid or expired session",
-    "expired session",
-    "session expired",
-    "session not found",
-    "unknown session",
-    "session terminated",
+# Stable lower-cased markers for a closed underlying transport. Protocol
+# 2026-07-28 has no server session, so application-level "session expired"
+# messages must not trigger an MCP reconnect.
+_TRANSPORT_CLOSED_MARKERS: tuple = (
     "closedresourceerror",
     "closed resource",
     "transport is closed",
@@ -3642,20 +3480,8 @@ _SESSION_EXPIRED_MARKERS: tuple = (
 )
 
 
-def _is_session_expired_error(exc: BaseException) -> bool:
-    """Return True if ``exc`` looks like an MCP transport session expiry.
-
-    Streamable HTTP MCP servers may garbage-collect server-side session
-    state while the OAuth token remains valid — idle TTL, server
-    restart, horizontal-scaling pod rotation, etc.  The SDK surfaces
-    this as a JSON-RPC error whose message contains phrases like
-    ``"Invalid or expired session"``.  This class of failure is
-    distinct from :func:`_is_auth_error`: re-running the OAuth refresh
-    flow would be pointless because the access token is fine.  What's
-    needed is a transport reconnect — tear down and rebuild the
-    ``streamablehttp_client`` + ``ClientSession`` pair, which is
-    exactly what ``MCPServerTask._reconnect_event`` triggers.
-    """
+def _is_transport_closed_error(exc: BaseException) -> bool:
+    """Return True if ``exc`` indicates a closed MCP transport."""
     if isinstance(exc, InterruptedError):
         return False
     # Exception messages vary across SDK versions + server
@@ -3665,24 +3491,19 @@ def _is_session_expired_error(exc: BaseException) -> bool:
     msg = str(exc).lower()
     if not msg:
         return False
-    return any(marker in msg for marker in _SESSION_EXPIRED_MARKERS)
+    return any(marker in msg for marker in _TRANSPORT_CLOSED_MARKERS)
 
 
-def _handle_session_expired_and_retry(
+def _handle_transport_closed_and_retry(
     server_name: str,
     exc: BaseException,
     retry_call,
     op_description: str,
 ):
-    """Trigger a transport reconnect and retry once on session expiry.
+    """Trigger a transport reconnect and retry once after transport closure.
 
-    Unlike :func:`_handle_auth_error_and_retry`, this does **not** call
-    the OAuth manager's ``handle_401`` — the access token is still
-    valid, only the server-side session state is stale.  Setting
-    ``_reconnect_event`` causes the server task's lifecycle loop to
-    tear down the current ``streamablehttp_client`` + ``ClientSession``
-    and rebuild them, reusing the existing OAuth provider instance.
-    See #13383.
+    Unlike :func:`_handle_auth_error_and_retry`, this does not call the OAuth
+    manager. It rebuilds the transport and reuses the existing credentials.
 
     Args:
         server_name: Name of the MCP server that raised.
@@ -3694,10 +3515,10 @@ def _handle_session_expired_and_retry(
     Returns:
         A JSON string if reconnect + retry was attempted and produced
         a response, or ``None`` to fall through to the caller's
-        generic error path (not a session-expired error, no server
+        generic error path (not a transport-closed error, no server
         record, reconnect didn't ready in time, or retry also failed).
     """
-    if not _is_session_expired_error(exc):
+    if not _is_transport_closed_error(exc):
         return None
 
     with _lock:
@@ -3710,7 +3531,7 @@ def _handle_session_expired_and_retry(
         return None
 
     logger.info(
-        "MCP server '%s': %s failed with session-expired error (%s); "
+        "MCP server '%s': %s failed because the transport closed (%s); "
         "signalling transport reconnect and retrying once.",
         server_name, op_description, exc,
     )
@@ -3725,7 +3546,7 @@ def _handle_session_expired_and_retry(
     ):
         logger.warning(
             "MCP server '%s': reconnect did not ready within 15s after "
-            "session-expired error; falling through to error response.",
+            "transport closure; falling through to error response.",
             server_name,
         )
         return None
@@ -3742,7 +3563,7 @@ def _handle_session_expired_and_retry(
             return result
     except Exception as retry_exc:
         logger.warning(
-            "MCP %s/%s retry after session reconnect failed: %s",
+            "MCP %s/%s retry after transport reconnect failed: %s",
             server_name, op_description, retry_exc,
         )
     return None
@@ -4146,7 +3967,7 @@ async def _connect_server(name: str, config: dict) -> MCPServerTask:
     Raises:
         ValueError: if required config keys are missing.
         ImportError: if HTTP transport is needed but not available.
-        Exception: on connection or initialization failure.
+        Exception: on connection or discovery failure.
     """
     server = MCPServerTask(name)
     await server.start(config)
@@ -4300,7 +4121,7 @@ def _make_tool_handler(server_name: str, tool_name: str, tool_timeout: float):
                 # transport — which respawns a dead stdio subprocess — and
                 # return a clean "reconnecting" error so the model backs off
                 # without burning iterations. The breaker resets once the
-                # fresh session initializes (_run_stdio/_run_http call
+                # fresh session completes discovery (_run_stdio/_run_http call
                 # _reset_server_error).
                 _bump_server_error(server_name)
                 if _signal_reconnect(server):
@@ -4327,8 +4148,8 @@ def _make_tool_handler(server_name: str, tool_name: str, tool_timeout: float):
                     result = await server.session.call_tool(tool_name, arguments=args)
                 finally:
                     server._pending_call_context = None
-            # MCP CallToolResult has .content (list of content blocks) and .isError
-            if result.isError:
+            # MCP CallToolResult has content blocks and a snake_case error flag.
+            if result.is_error:
                 error_text = ""
                 for block in (result.content or []):
                     if getattr(block, "text", None):
@@ -4399,7 +4220,7 @@ def _make_tool_handler(server_name: str, tool_name: str, tool_timeout: float):
             # MCP spec: content is model-oriented (text), structuredContent
             # is machine-oriented (JSON metadata).  For an AI agent, content
             # is the primary payload; structuredContent supplements it.
-            structured = getattr(result, "structuredContent", None)
+            structured = getattr(result, "structured_content", None)
             if structured is not None:
                 if text_result:
                     return json.dumps({
@@ -4437,10 +4258,9 @@ def _make_tool_handler(server_name: str, tool_name: str, tool_timeout: float):
             if recovered is not None:
                 return recovered
 
-            # Transport session expiry (#13383): same reconnect flow
-            # but skips OAuth recovery because the access token is
-            # still valid — only the server-side session is stale.
-            recovered = _handle_session_expired_and_retry(
+            # A closed transport uses the same reconnect signal but does not
+            # invoke OAuth recovery.
+            recovered = _handle_transport_closed_and_retry(
                 server_name, exc, _call_once,
                 f"tools/call {tool_name}",
             )
@@ -4485,8 +4305,8 @@ def _make_list_resources_handler(server_name: str, tool_timeout: float):
                     entry["name"] = r.name
                 if hasattr(r, "description") and r.description:
                     entry["description"] = r.description
-                if hasattr(r, "mimeType") and r.mimeType:
-                    entry["mimeType"] = r.mimeType
+                if hasattr(r, "mime_type") and r.mime_type:
+                    entry["mimeType"] = r.mime_type
                 resources.append(entry)
             return json.dumps({"resources": resources}, ensure_ascii=False)
 
@@ -4503,7 +4323,7 @@ def _make_list_resources_handler(server_name: str, tool_timeout: float):
             )
             if recovered is not None:
                 return recovered
-            recovered = _handle_session_expired_and_retry(
+            recovered = _handle_transport_closed_and_retry(
                 server_name, exc, _call_once, "resources/list",
             )
             if recovered is not None:
@@ -4569,7 +4389,7 @@ def _make_read_resource_handler(server_name: str, tool_timeout: float):
             )
             if recovered is not None:
                 return recovered
-            recovered = _handle_session_expired_and_retry(
+            recovered = _handle_transport_closed_and_retry(
                 server_name, exc, _call_once, "resources/read",
             )
             if recovered is not None:
@@ -4633,7 +4453,7 @@ def _make_list_prompts_handler(server_name: str, tool_timeout: float):
             )
             if recovered is not None:
                 return recovered
-            recovered = _handle_session_expired_and_retry(
+            recovered = _handle_transport_closed_and_retry(
                 server_name, exc, _call_once, "prompts/list",
             )
             if recovered is not None:
@@ -4703,7 +4523,7 @@ def _make_get_prompt_handler(server_name: str, tool_timeout: float):
             )
             if recovered is not None:
                 return recovered
-            recovered = _handle_session_expired_and_retry(
+            recovered = _handle_transport_closed_and_retry(
                 server_name, exc, _call_once, "prompts/get",
             )
             if recovered is not None:
@@ -4917,7 +4737,7 @@ def _convert_mcp_schema(server_name: str, mcp_tool) -> dict:
     Args:
         server_name: The logical server name for prefixing.
         mcp_tool:    An MCP ``Tool`` object with ``.name``, ``.description``,
-                     and ``.inputSchema``.
+                     and ``.input_schema``.
 
     Returns:
         A dict suitable for ``registry.register(schema=...)``.
@@ -4926,7 +4746,7 @@ def _convert_mcp_schema(server_name: str, mcp_tool) -> dict:
     return {
         "name": prefixed_name,
         "description": mcp_tool.description or f"MCP tool {mcp_tool.name} from {server_name}",
-        "parameters": _normalize_mcp_input_schema(getattr(mcp_tool, "inputSchema", None)),
+        "parameters": _normalize_mcp_input_schema(getattr(mcp_tool, "input_schema", None)),
     }
 
 
@@ -5051,15 +4871,8 @@ def _get_lifecycle_seconds(config: dict, key: str) -> Optional[float]:
     return seconds
 
 
-_UTILITY_CAPABILITY_METHODS = {
-    "list_resources": "list_resources",
-    "read_resource": "read_resource",
-    "list_prompts": "list_prompts",
-    "get_prompt": "get_prompt",
-}
-
 # Maps each utility handler to the MCP capability key that must be non-None
-# on the server's ``initialize`` response for the handler to be registered.
+# in the server's discovery result for the handler to be registered.
 # Source of truth: MCP spec — capabilities.resources / capabilities.prompts
 # are present on the response only when the server actually implements
 # those request families. Without this gate, tools-only servers (e.g.
@@ -5095,15 +4908,15 @@ def _select_utility_schemas(server_name: str, server: MCPServerTask, config: dic
     resources_enabled = _parse_boolish(tools_filter.get("resources"), default=True)
     prompts_enabled = _parse_boolish(tools_filter.get("prompts"), default=True)
 
-    # ``initialize_result.capabilities`` is the source of truth: its sub-objects
+    # ``discover_result.capabilities`` is the source of truth: its sub-objects
     # (``resources``, ``prompts``) are non-None iff the server advertises that
     # request family. ``hasattr(server.session, ...)`` was the old gate but
     # ClientSession always has the four method attributes defined on the class,
     # so it never filtered anything.
     advertised_caps = None
-    init_result = getattr(server, "initialize_result", None)
-    if init_result is not None:
-        advertised_caps = getattr(init_result, "capabilities", None)
+    discover_result = getattr(server, "discover_result", None)
+    if discover_result is not None:
+        advertised_caps = getattr(discover_result, "capabilities", None)
 
     selected: List[dict] = []
     for entry in _build_utility_schemas(server_name):
@@ -5129,19 +4942,12 @@ def _select_utility_schemas(server_name: str, server: MCPServerTask, config: dic
                 )
                 continue
         else:
-            # Legacy fallback for test fixtures or older code paths where
-            # initialize_result wasn't captured. Preserves the old behavior
-            # of registering every stub in that case rather than regressing
-            # any server that was working before this fix.
-            required_method = _UTILITY_CAPABILITY_METHODS[handler_key]
-            if not hasattr(server.session, required_method):
-                logger.debug(
-                    "MCP server '%s': skipping utility '%s' (session lacks %s)",
-                    server_name,
-                    handler_key,
-                    required_method,
-                )
-                continue
+            logger.debug(
+                "MCP server '%s': skipping utility '%s' (discovery unavailable)",
+                server_name,
+                handler_key,
+            )
+            continue
         selected.append(entry)
     return selected
 
@@ -5318,15 +5124,122 @@ def _discovery_outer_timeout(servers: Dict[str, dict]) -> float:
     return batches * max(connect_timeouts) + _DISCOVERY_TIMEOUT_MARGIN
 
 
+_CAPABILITY_HINT_SERVERS: dict[str, frozenset[str]] = {
+    "ios.location": frozenset({
+        "ios-location", "ios-trajectory", "ios-places", "ios-map", "amap-route",
+    }),
+    # Weather answers commonly need the current location and route provider
+    # (reverse geocoding), but do not need the other 18 device MCPs.
+    "ios.weather": frozenset({"ios-location", "qweather", "amap-route"}),
+    "ios.health": frozenset({
+        "ios-health-sleep", "ios-health-heart", "ios-health-oxygen",
+        "ios-health-activity",
+    }),
+    "ios.calendar": frozenset({"ios-calendar", "ios-reminders"}),
+    "ios.screen_time": frozenset({"ios-screen-time"}),
+    "ios.motion": frozenset({"ios-motion", "ios-behavior"}),
+    "ios.power": frozenset({"ios-power"}),
+}
+
+
+def select_mcp_servers_for_capabilities(
+    servers: Dict[str, dict],
+    capability_hints: Iterable[str],
+) -> Dict[str, dict]:
+    """Return only enabled servers explicitly selected by route capabilities.
+
+    Managed iOS capabilities use the stable mapping above. Third-party MCPs
+    can declare ``capability_hints`` or ``capabilities`` in their config; an
+    exact server name or ``mcp.<server-name>`` hint is also accepted. An empty
+    hint set deliberately selects no MCP server.
+    """
+
+    normalized_hints = {
+        str(value or "").strip().lower()
+        for value in capability_hints
+        if str(value or "").strip()
+    }
+    selected_names: set[str] = set()
+    for hint in normalized_hints:
+        selected_names.update(_CAPABILITY_HINT_SERVERS.get(hint, ()))
+        if hint.startswith("mcp."):
+            selected_names.add(hint[4:])
+
+    selected: Dict[str, dict] = {}
+    for name, config in servers.items():
+        if not isinstance(config, dict):
+            continue
+        if not _parse_boolish(config.get("enabled", True), default=True):
+            continue
+        declared = config.get("capability_hints", config.get("capabilities", ()))
+        if isinstance(declared, str):
+            declared = [declared]
+        declared_hints = {
+            str(value or "").strip().lower()
+            for value in (declared or ())
+            if str(value or "").strip()
+        }
+        normalized_name = str(name).strip().lower()
+        if (
+            normalized_name in selected_names
+            or normalized_name in normalized_hints
+            or bool(declared_hints & normalized_hints)
+        ):
+            selected[name] = config
+    return selected
+
+
+def _retire_mcp_servers(names: set[str]) -> None:
+    """Stop routing, drain calls, deregister tools, and close selected servers."""
+
+    if not names:
+        return
+    with _lock:
+        retiring = {
+            name: _servers[name]
+            for name in names
+            if name in _servers
+        }
+        for server in retiring.values():
+            server.begin_drain()
+    if retiring:
+        _ensure_mcp_loop()
+
+        async def _drain_and_close() -> None:
+            outcomes = await asyncio.gather(
+                *(server.shutdown() for server in retiring.values()),
+                return_exceptions=True,
+            )
+            for name, outcome in zip(retiring, outcomes):
+                if isinstance(outcome, BaseException):
+                    logger.warning("Retired MCP server '%s' cleanup failed: %s", name, outcome)
+
+        _run_on_mcp_loop(_drain_and_close, timeout=None)
+
+    with _lock:
+        for name, server in retiring.items():
+            if _servers.get(name) is server:
+                _servers.pop(name, None)
+            _server_config_fingerprints.pop(name, None)
+            _server_connecting.discard(name)
+            _server_connect_errors.pop(name, None)
+            _parallel_safe_servers.discard(sanitize_mcp_name_component(name))
+
+
 # ---------------------------------------------------------------------------
 # Public API
 # ---------------------------------------------------------------------------
 
-def register_mcp_servers(servers: Dict[str, dict]) -> List[str]:
+def register_mcp_servers(
+    servers: Dict[str, dict],
+    *,
+    authoritative: bool = False,
+) -> List[str]:
     """Connect to explicit MCP servers and register their tools.
 
-    Idempotent for already-connected server names. Servers with
-    ``enabled: false`` are skipped without disconnecting existing sessions.
+    Idempotent for already-connected server names. When ``authoritative`` is
+    true, this mapping is the full desired configuration: removed or disabled
+    servers are drained and retired, including when the mapping is empty.
 
     Args:
         servers: Mapping of ``{server_name: server_config}``.
@@ -5339,9 +5252,20 @@ def register_mcp_servers(servers: Dict[str, dict]) -> List[str]:
         return []
 
     servers = _filter_suspicious_mcp_servers(servers)
+
+    enabled_names = {
+        name
+        for name, config in servers.items()
+        if isinstance(config, dict)
+        and _parse_boolish(config.get("enabled", True), default=True)
+    }
+    if authoritative:
+        with _lock:
+            retire_names = set(_servers) - enabled_names
+        _retire_mcp_servers(retire_names)
     if not servers:
         logger.debug("No explicit MCP servers provided")
-        return []
+        return _existing_tool_names()
 
     def _fingerprint(config: dict) -> str:
         return json.dumps(config, sort_keys=True, separators=(",", ":"), default=str)
@@ -5353,7 +5277,8 @@ def register_mcp_servers(servers: Dict[str, dict]) -> List[str]:
     with _lock:
         changed_names = [
             name for name, config in servers.items()
-            if name in _servers
+            if name in enabled_names
+            and name in _servers
             and (
                 _server_config_fingerprints.get(name) != _fingerprint(config)
                 or not getattr(_servers[name], "accepting_calls", True)
@@ -5451,7 +5376,9 @@ def register_mcp_servers(servers: Dict[str, dict]) -> List[str]:
         new_servers = {
             k: v
             for k, v in servers.items()
-            if k not in _servers and _parse_boolish(v.get("enabled", True), default=True)
+            if k not in _servers
+            and k not in _server_connecting
+            and _parse_boolish(v.get("enabled", True), default=True)
         }
         # Cached entries with no live session are parked or mid-reconnect.
         # Their tools are deregistered, so nothing else can reach
@@ -5560,7 +5487,9 @@ def register_mcp_servers(servers: Dict[str, dict]) -> List[str]:
     return _existing_tool_names()
 
 
-def discover_mcp_tools() -> List[str]:
+def discover_mcp_tools(
+    capability_hints: Optional[Iterable[str]] = None,
+) -> List[str]:
     """Entry point: load config, connect to MCP servers, register tools.
 
     Called from ``model_tools`` after ``discover_builtin_tools()``. Safe to call even when
@@ -5576,10 +5505,15 @@ def discover_mcp_tools() -> List[str]:
         logger.debug("MCP SDK not available -- skipping MCP tool discovery")
         return []
 
-    servers = _load_mcp_config()
-    if not servers:
-        logger.debug("No MCP servers configured")
-        return []
+    configured_servers = _load_mcp_config()
+    servers = (
+        configured_servers
+        if capability_hints is None
+        else select_mcp_servers_for_capabilities(
+            configured_servers,
+            capability_hints,
+        )
+    )
 
     with _lock:
         new_server_names = [
@@ -5588,7 +5522,10 @@ def discover_mcp_tools() -> List[str]:
             if name not in _servers and _parse_boolish(cfg.get("enabled", True), default=True)
         ]
 
-    tool_names = register_mcp_servers(servers)
+    tool_names = register_mcp_servers(
+        servers,
+        authoritative=capability_hints is None,
+    )
     if not new_server_names:
         return tool_names
 
@@ -5627,6 +5564,57 @@ def is_mcp_tool_parallel_safe(tool_name: str) -> bool:
         return bool(server_name and server_name in _parallel_safe_servers)
 
 
+def get_mcp_availability() -> List[MCPAvailability]:
+    """Return a coherent availability snapshot without probing the network."""
+
+    configured = _load_mcp_config()
+    with _lock:
+        active_servers = dict(_servers)
+        connecting = set(_server_connecting)
+        connect_errors = dict(_server_connect_errors)
+
+    snapshots: List[MCPAvailability] = []
+    for name, cfg in configured.items():
+        if not isinstance(cfg, dict):
+            continue
+        transport = str(
+            cfg.get("transport", "http") if "url" in cfg else "stdio"
+        )
+        enabled = _parse_boolish(cfg.get("enabled", True), default=True)
+        server = active_servers.get(name)
+        tools = tuple(sorted(getattr(server, "_registered_tool_names", ()) or ()))
+        if not enabled:
+            state = "unavailable"
+            error = "disabled"
+        elif name in connecting:
+            state = "connecting"
+            error = ""
+        elif server is not None and server.session is not None:
+            state = "live"
+            error = ""
+        elif server is not None:
+            state = "degraded"
+            error = connect_errors.get(name, "transport reconnecting")
+        elif name in connect_errors:
+            state = "unavailable"
+            error = connect_errors[name]
+        else:
+            state = "configured"
+            error = ""
+        snapshots.append(
+            MCPAvailability(
+                name=name,
+                configured=True,
+                state=state,
+                registered_tools=tools if state == "live" else (),
+                last_error=error,
+                transport=transport,
+                disabled=not enabled,
+            )
+        )
+    return snapshots
+
+
 def get_mcp_status() -> List[dict]:
     """Return status of all configured MCP servers for banner display.
 
@@ -5636,74 +5624,38 @@ def get_mcp_status() -> List[dict]:
     configured but have not been started in this process yet.
     """
     result: List[dict] = []
-
-    # Get configured servers from config
-    configured = _load_mcp_config()
-    if not configured:
-        return result
-
     with _lock:
         active_servers = dict(_servers)
-        connecting = set(_server_connecting)
-        connect_errors = dict(_server_connect_errors)
-
-    for name, cfg in configured.items():
-        transport = cfg.get("transport", "http") if "url" in cfg else "stdio"
-        enabled = _parse_boolish(cfg.get("enabled", True), default=True)
-        server = active_servers.get(name)
-        if server and server.session is not None:
-            entry = {
-                "name": name,
-                "transport": transport,
-                "tools": len(server._registered_tool_names) if hasattr(server, "_registered_tool_names") else len(server._tools),
-                "connected": True,
-                "disabled": False,
-                "status": "connected",
-            }
-            if server._sampling:
-                entry["sampling"] = dict(server._sampling.metrics)
-            result.append(entry)
-        elif not enabled:
-            # A server with enabled: false is intentionally not connected — it is
-            # disabled, not failed. Surface that distinction so consumers (banner,
-            # TUI) can render "disabled" rather than an alarming "failed".
-            result.append({
-                "name": name,
-                "transport": transport,
-                "tools": 0,
-                "connected": False,
-                "disabled": True,
-                "status": "disabled",
-            })
-        elif name in connecting:
-            result.append({
-                "name": name,
-                "transport": transport,
-                "tools": 0,
-                "connected": False,
-                "disabled": False,
-                "status": "connecting",
-            })
-        elif name in connect_errors:
-            result.append({
-                "name": name,
-                "transport": transport,
-                "tools": 0,
-                "connected": False,
-                "disabled": False,
-                "status": "failed",
-                "error": connect_errors[name],
-            })
-        else:
-            result.append({
-                "name": name,
-                "transport": transport,
-                "tools": 0,
-                "connected": False,
-                "disabled": False,
-                "status": "configured",
-            })
-
+    legacy_status = {
+        "live": "connected",
+        "connecting": "connecting",
+        "degraded": "failed",
+        "unavailable": "disabled",
+        "configured": "configured",
+    }
+    for snapshot in get_mcp_availability():
+        status = (
+            "disabled"
+            if snapshot.disabled
+            else "failed"
+            if snapshot.state in {"degraded", "unavailable"}
+            else legacy_status[snapshot.state]
+        )
+        entry = {
+            "name": snapshot.name,
+            "transport": snapshot.transport,
+            "tools": len(snapshot.registered_tools),
+            "connected": snapshot.live,
+            "disabled": snapshot.disabled,
+            "status": status,
+            "availability": snapshot.state,
+        }
+        if snapshot.last_error and not snapshot.disabled:
+            entry["error"] = snapshot.last_error
+        server = active_servers.get(snapshot.name)
+        if snapshot.live and server is not None and server._sampling:
+            entry["sampling"] = dict(server._sampling.metrics)
+        result.append(entry)
     return result
 
 

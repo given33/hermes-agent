@@ -100,9 +100,11 @@ clients die:
 
 ### HTTP wire behavior (for raw clients / debugging)
 
-- `initialize` → plain JSON response + `Mcp-Session-Id` header you must
-  echo on every subsequent request; `notifications/initialized` → 202
-  empty; `tools/call` → **`text/event-stream`**: the result arrives as an
+- `server/discover` → plain JSON response with supported versions and
+  capabilities. MCP 2026-07-28 is stateless: every request carries
+  `MCP-Protocol-Version`, `Mcp-Method`, request `_meta`, and `Mcp-Name` when
+  the method has a name argument. `tools/call` may return
+  **`text/event-stream`**: the result arrives as an
   `event: message` + `data: <jsonrpc>` frame only when the game thread
   finishes. A client that treats the response as plain JSON reads an empty
   body. Send `Accept: application/json, text/event-stream` always.

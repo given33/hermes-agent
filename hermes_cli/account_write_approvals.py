@@ -22,6 +22,11 @@ from pathlib import Path
 from typing import Any, Callable, Iterable
 
 from hermes_constants import get_hermes_home
+from hermes_cli.account_identity import (
+    generation_scoped_owner_id,
+    public_owner_id,
+    storage_account_generation,
+)
 
 
 _SCHEMA = """
@@ -189,7 +194,10 @@ class AccountWriteApprovalStore:
         self._initialize()
 
     @staticmethod
-    def _owner(owner_id: str) -> str:
+    def _owner(
+        owner_id: str,
+        account_generation: str | None = None,
+    ) -> str:
         if not isinstance(owner_id, str):
             raise ValueError("owner_id must be a string")
         owner = owner_id.strip()
@@ -199,7 +207,7 @@ class AccountWriteApprovalStore:
             raise ValueError(
                 f"owner_id must be at most {_MAX_OWNER_ID_LENGTH} characters"
             )
-        return owner
+        return generation_scoped_owner_id(owner, account_generation)
 
     @classmethod
     def _scope(cls, owner_id: str, profile: str) -> tuple[str, str]:
@@ -318,6 +326,10 @@ class AccountWriteApprovalStore:
         if row is None:
             return None
         result = dict(row)
+        if "owner_id" in result:
+            storage_owner = str(result["owner_id"])
+            result["owner_id"] = public_owner_id(storage_owner)
+            result["account_generation"] = storage_account_generation(storage_owner)
         try:
             payload = json.loads(result.pop("payload_json"))
             result["payload"] = payload if isinstance(payload, dict) else {}
@@ -1188,11 +1200,15 @@ class AccountWriteApprovalStore:
             return False
 
     def delete_owner(
-        self, owner_id: str, *, now: float | None = None
+        self,
+        owner_id: str,
+        *,
+        account_generation: str = "",
+        now: float | None = None,
     ) -> dict[str, int]:
         """Delete one owner's approvals and migration markers idempotently."""
 
-        owner = self._owner(owner_id)
+        owner = self._owner(owner_id, account_generation or None)
         timestamp = float(time.time() if now is None else now)
         active_effects = 0
         with self._lock, self._connect() as conn:

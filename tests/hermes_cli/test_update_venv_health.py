@@ -69,7 +69,7 @@ def _fake_venv_python(tmp_path, *, windows: bool = False):
 
 def test_venv_health_reports_missing_imports(tmp_path):
     """Probe output lines are surfaced as the unhealthy detail."""
-    _fake_venv_python(tmp_path)
+    _fake_venv_python(tmp_path, windows=cli_main._is_windows())
 
     fake = SimpleNamespace(
         returncode=0,
@@ -86,7 +86,7 @@ def test_venv_health_reports_missing_imports(tmp_path):
 
 
 def test_venv_health_healthy_when_probe_clean(tmp_path):
-    _fake_venv_python(tmp_path)
+    _fake_venv_python(tmp_path, windows=cli_main._is_windows())
     fake = SimpleNamespace(returncode=0, stdout="", stderr="")
     with patch.object(cli_main, "PROJECT_ROOT", tmp_path), patch.object(
         cli_main.subprocess, "run", return_value=fake
@@ -97,7 +97,7 @@ def test_venv_health_healthy_when_probe_clean(tmp_path):
 
 def test_venv_health_broken_interpreter_is_unhealthy(tmp_path):
     """Nonzero exit with no module list = interpreter itself is broken."""
-    _fake_venv_python(tmp_path)
+    _fake_venv_python(tmp_path, windows=cli_main._is_windows())
     fake = SimpleNamespace(returncode=1, stdout="", stderr="Fatal Python error: init failed\n")
     with patch.object(cli_main, "PROJECT_ROOT", tmp_path), patch.object(
         cli_main.subprocess, "run", return_value=fake
@@ -109,7 +109,7 @@ def test_venv_health_broken_interpreter_is_unhealthy(tmp_path):
 
 def test_venv_health_probe_failure_reports_healthy(tmp_path):
     """A probe that can't run must NOT force needless reinstalls."""
-    _fake_venv_python(tmp_path)
+    _fake_venv_python(tmp_path, windows=cli_main._is_windows())
     with patch.object(cli_main, "PROJECT_ROOT", tmp_path), patch.object(
         cli_main.subprocess,
         "run",

@@ -956,6 +956,71 @@ class TestWebServerEndpoints:
         assert cfg["model"]["context_length"] == 200000
         assert cfg["agent"]["reasoning_effort"] == "high"
 
+    def test_custom_model_api_key_actions_preserve_replace_and_delete(self):
+        from hermes_cli.config import load_config
+
+        base = {
+            "base_url": "https://model.example/v1",
+            "model": "model-a",
+            "api_mode": "chat_completions",
+            "context_length": 131072,
+        }
+        created = self.client.put(
+            "/api/model/custom",
+            json={**base, "api_key": "private-model-key"},
+        )
+        assert created.status_code == 200
+
+        preserved = self.client.put(
+            "/api/model/custom",
+            json={
+                **base,
+                "model": "model-b",
+                "api_key": "********",
+                "api_key_action": "preserve",
+            },
+        )
+        assert preserved.status_code == 200
+        assert load_config()["model"]["api_key"] == "private-model-key"
+
+        replaced = self.client.put(
+            "/api/model/custom",
+            json={
+                **base,
+                "api_key": "rotated-model-key",
+                "api_key_action": "replace",
+            },
+        )
+        assert replaced.status_code == 200
+        cfg = load_config()
+        assert cfg["model"]["api_key"] == "rotated-model-key"
+        matching = [
+            entry for entry in cfg.get("custom_providers", [])
+            if entry.get("base_url") == base["base_url"]
+        ]
+        assert matching and matching[0]["api_key"] == "rotated-model-key"
+
+        deleted = self.client.put(
+            "/api/model/custom",
+            json={**base, "api_key_action": "delete"},
+        )
+        assert deleted.status_code == 200
+        assert deleted.json()["api_key_configured"] is False
+        cfg = load_config()
+        assert "api_key" not in cfg["model"]
+        assert all(
+            "api_key" not in entry
+            for entry in cfg.get("custom_providers", [])
+            if entry.get("base_url") == base["base_url"]
+        )
+
+        missing = self.client.put(
+            "/api/model/custom",
+            json={**base, "api_key_action": "replace"},
+        )
+        assert missing.status_code == 400
+        assert missing.json()["detail"] == "api_key is required for replace"
+
     def test_model_credentials_expose_only_masked_model_editor_keys_and_delete_them(self):
         from hermes_cli.config import load_config
 

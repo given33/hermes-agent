@@ -172,6 +172,10 @@ class IOSIntelligenceScheduler:
         self._thread: threading.Thread | None = None
         self._lock = threading.RLock()
         self.running = False
+        self._cycle_count = 0
+        self._last_cycle_started_at = 0
+        self._last_cycle_completed_at = 0
+        self._last_cycle_error = ""
 
     # ------------------------------------------------------------------
     # Lifecycle
@@ -203,13 +207,40 @@ class IOSIntelligenceScheduler:
 
     close = stop
 
+    def health(self) -> dict[str, Any]:
+        """Report whether the recovery loop is alive and completing work."""
+
+        with self._lock:
+            thread_alive = bool(self._thread and self._thread.is_alive())
+            cycle_count = int(self._cycle_count)
+            last_error = str(self._last_cycle_error)
+            return {
+                "ok": bool(self.running and thread_alive and cycle_count > 0 and not last_error),
+                "running": bool(self.running),
+                "thread_alive": thread_alive,
+                "cleanup_only": bool(self.cleanup_only),
+                "cycle_count": cycle_count,
+                "last_cycle_started_at": int(self._last_cycle_started_at),
+                "last_cycle_completed_at": int(self._last_cycle_completed_at),
+                "last_error": last_error,
+            }
+
     def _run(self) -> None:
         interval = max(5, int(self.config.weather.evaluation_interval_seconds))
         while not self._stop_event.is_set():
+            with self._lock:
+                self._last_cycle_started_at = int(time.time())
             try:
                 self._run_cycle()
-            except Exception:
+            except Exception as exc:
+                with self._lock:
+                    self._last_cycle_error = str(exc)[:2000]
                 logger.exception("iOS intelligence scheduler evaluation failed")
+            else:
+                with self._lock:
+                    self._cycle_count += 1
+                    self._last_cycle_completed_at = int(time.time())
+                    self._last_cycle_error = ""
             self._stop_event.wait(interval)
 
     def _run_cycle(self) -> dict[str, Any]:
@@ -221,6 +252,10 @@ class IOSIntelligenceScheduler:
         }
         if self.cleanup_only:
             return result
+        result["derived_jobs"] = self.store.run_derived_jobs(
+            limit=200,
+            backfill_limit=50,
+        )
         result["evaluations"] = self.evaluate_all()
         result["notification_deliveries"] = self.deliver_pending_notifications()
         return result
@@ -237,6 +272,9 @@ class IOSIntelligenceScheduler:
             owner_id = str(saga.get("owner_id") or "")
             if not owner_id:
                 continue
+            account_generation = str(
+                saga.get("account_generation") or ""
+            ).strip()
             try:
                 from hermes_cli.account_cleanup import (  # noqa: PLC0415
                     purge_account_owned_cloud_data,
@@ -245,7 +283,10 @@ class IOSIntelligenceScheduler:
                 cloud.append({
                     "owner_id": owner_id,
                     "state": "complete",
-                    **purge_account_owned_cloud_data(owner_id),
+                    **purge_account_owned_cloud_data(
+                        owner_id,
+                        account_generation=account_generation,
+                    ),
                 })
             except Exception as exc:
                 logger.exception(
@@ -270,9 +311,17 @@ class IOSIntelligenceScheduler:
                 if (
                     owner_id
                     and owner_scope
-                    and mobile_store.account_deletion_status(owner_id) is None
+                    and mobile_store.account_deletion_status(
+                        owner_id,
+                        str(saga.get("account_generation") or ""),
+                    )
+                    is None
                 ):
-                    mobile_store.begin_account_deletion(owner_id, owner_scope)
+                    mobile_store.begin_account_deletion(
+                        owner_id,
+                        owner_scope,
+                        str(saga.get("account_generation") or ""),
+                    )
                     reconciled += 1
             mobile = process_account_deletion_outbox(limit=100)
         except Exception:
@@ -1278,7 +1327,9 @@ class IOSIntelligenceScheduler:
             self.store.record_active_forecast(owner_id, {
                 **payload,
                 "id": result.get("id") or f"weather:{event_hash}",
-                "valid_from": window.starts_at,
+                # The card is actionable as soon as the decision is made even
+                # when APNs delivery is deferred until the exposure window.
+                "valid_from": now,
                 "valid_until": expires,
             })
             # Delivery is intentionally left to the durable outbox worker.

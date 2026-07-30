@@ -1,12 +1,14 @@
 import asyncio
 import json
+import os
 from pathlib import Path
 import sqlite3
 import subprocess
 import sys
 import threading
 import time
-from urllib.error import HTTPError
+from types import SimpleNamespace
+from urllib.error import HTTPError, URLError
 from urllib.request import Request, urlopen
 
 import pytest
@@ -102,6 +104,90 @@ def test_server_install_uses_allowlisted_argv_and_reaches_terminal_state(tmp_pat
     assert current["state"] == "completed"
     assert current["targets"][0]["state"] == "completed"
     assert calls[0][0][-4:] == ["skills", "install", "official/example", "--yes"]
+
+
+def test_skill_install_proof_is_computed_from_the_installed_profile_tree(tmp_path):
+    profile_home = tmp_path / "profile"
+
+    def executor(command, *, timeout):
+        assert timeout == managed_installations.DEFAULT_COMMAND_TIMEOUT_SECONDS
+        destination = profile_home / "skills" / "development" / "example"
+        destination.mkdir(parents=True)
+        (destination / "SKILL.md").write_text("# Example\n", encoding="utf-8")
+        (destination / "helper.txt").write_text("real content\n", encoding="utf-8")
+        lock = profile_home / "skills" / ".hub" / "lock.json"
+        lock.parent.mkdir(parents=True)
+        lock.write_text(json.dumps({
+            "version": 1,
+            "installed": {
+                "example": {
+                    "identifier": "official/example",
+                    "install_path": "development/example",
+                    "content_hash": "untrusted-lock-value",
+                }
+            },
+        }), encoding="utf-8")
+        return subprocess.CompletedProcess(command, 0, stdout="installed\n", stderr="")
+
+    detail = managed_installations._execute_allowlisted_installation(
+        {
+            "kind": "skill",
+            "identifier": "official/example",
+            "profile": "default",
+            "_profile_home": str(profile_home),
+        },
+        executor=executor,
+    )
+
+    assert detail["proof_schema"] == 1
+    assert detail["proof_source"] == "local_filesystem"
+    assert detail["content_hash"] == managed_installations._hash_resource_tree(
+        profile_home / "skills" / "development" / "example"
+    )
+    assert detail["content_hash"] != "untrusted-lock-value"
+
+
+def test_mcp_install_proof_verifies_local_config_against_catalog_manifest(
+    tmp_path, monkeypatch
+):
+    profile_home = tmp_path / "profile"
+    profile_home.mkdir()
+    manifest = tmp_path / "manifest.yaml"
+    manifest.write_text("manifest_version: 1\nname: demo\n", encoding="utf-8")
+    entry = SimpleNamespace(
+        name="demo",
+        manifest_path=manifest,
+        install=None,
+        transport=SimpleNamespace(version="1.2.3"),
+    )
+    monkeypatch.setattr("hermes_cli.mcp_catalog.get_entry", lambda _name: entry)
+    monkeypatch.setattr(
+        "hermes_cli.mcp_catalog._build_server_config",
+        lambda _entry, _install_dir: {"url": "https://mcp.example.test"},
+    )
+
+    def executor(command, *, timeout):
+        (profile_home / "config.yaml").write_text(
+            "mcp_servers:\n  demo:\n    url: https://mcp.example.test\n    enabled: true\n",
+            encoding="utf-8",
+        )
+        return subprocess.CompletedProcess(command, 0, stdout="installed\n", stderr="")
+
+    detail = managed_installations._execute_allowlisted_installation(
+        {
+            "kind": "mcp",
+            "identifier": "demo",
+            "profile": "default",
+            "_profile_home": str(profile_home),
+        },
+        executor=executor,
+    )
+
+    assert detail["proof_source"] == "local_filesystem"
+    assert detail["resolved_version"] == "1.2.3"
+    assert detail["content_hash"] == managed_installations.hashlib.sha256(
+        manifest.read_bytes()
+    ).hexdigest()
 
 
 def _receiver_config(tmp_path: Path, token_path: Path, installation_url: str = "") -> Path:
@@ -565,6 +651,122 @@ def test_project_source_rejects_local_paths_and_shell_fragments(tmp_path):
         )
 
 
+@pytest.mark.parametrize(
+    "identifier",
+    [
+        "https://127.0.0.1/private.git",
+        "https://[::1]/private.git",
+        "https://169.254.169.254/latest/meta-data.git",
+        "https://10.0.0.1/private.git",
+        "https://github.com:8443/example/demo.git",
+        "https://github.com%2f@127.0.0.1/private.git",
+        "https://github.com.evil.example/example/demo.git",
+    ],
+)
+def test_managed_source_rejects_private_encoded_or_unapproved_targets(identifier):
+    with pytest.raises(ValueError):
+        managed_installations._normalize_identifier("project", identifier)
+
+
+def test_runtime_source_host_extension_cannot_expand_trust_root(monkeypatch):
+    monkeypatch.setenv("HERMES_MANAGED_SOURCE_HOSTS", "git.example.test")
+    source = "https://git.example.test/example/demo.git"
+    with pytest.raises(ValueError, match="not approved"):
+        managed_installations._normalize_identifier("project", source)
+
+
+def test_receiver_rejects_persisted_non_builtin_source(tmp_path, monkeypatch):
+    monkeypatch.setenv("HERMES_MANAGED_SOURCE_HOSTS", "git.example.test")
+    source = "https://git.example.test/example/demo.git"
+    operation = {
+        "id": "persisted-untrusted-source",
+        "kind": "project",
+        "identifier": source,
+        "profile": "default",
+        "owner_id": "server-admin",
+        "account_generation": "",
+    }
+    commands = []
+
+    with pytest.raises(ValueError, match="not approved"):
+        managed_installations._execute_allowlisted_installation(
+            operation,
+            executor=lambda command, *, timeout: commands.append(command),
+            project_root=tmp_path / "projects",
+        )
+    assert commands == []
+
+
+def test_nested_git_processes_drop_inherited_config_and_enforce_https(monkeypatch):
+    monkeypatch.setenv("GIT_CONFIG_GLOBAL", "attacker-global")
+    monkeypatch.setenv("GIT_CONFIG_SYSTEM", "attacker-system")
+    monkeypatch.setenv("GIT_CONFIG_COUNT", "2")
+    monkeypatch.setenv("GIT_CONFIG_KEY_0", "url.https://attacker.invalid/.insteadOf")
+    monkeypatch.setenv("GIT_CONFIG_VALUE_0", "https://github.com/")
+    monkeypatch.setenv("GIT_CONFIG_KEY_1", "http.sslVerify")
+    monkeypatch.setenv("GIT_CONFIG_VALUE_1", "false")
+    monkeypatch.setenv("GIT_SSL_NO_VERIFY", "1")
+
+    environment = managed_installations._hardened_command_environment()
+    command = managed_installations._managed_git_command(
+        "clone", "https://github.com/example/demo.git", "destination",
+    )
+
+    assert not any(key.startswith("GIT_CONFIG_KEY_") for key in environment)
+    assert not any(key.startswith("GIT_CONFIG_VALUE_") for key in environment)
+    assert "GIT_CONFIG_COUNT" not in environment
+    assert "GIT_SSL_NO_VERIFY" not in environment
+    assert environment["GIT_CONFIG_GLOBAL"] == os.devnull
+    assert environment["GIT_CONFIG_SYSTEM"] == os.devnull
+    assert environment["GIT_CONFIG_NOSYSTEM"] == "1"
+    assert environment["GIT_TERMINAL_PROMPT"] == "0"
+    assert environment["GIT_ALLOW_PROTOCOL"] == "https"
+    assert command[:1] == ["git"]
+    assert command[1:-3] == [
+        "-c", "http.followRedirects=false",
+        "-c", "http.sslVerify=true",
+        "-c", "credential.helper=",
+        "-c", f"core.hooksPath={os.devnull}",
+        "-c", "protocol.file.allow=never",
+        "-c", "protocol.ext.allow=never",
+        "-c", "protocol.git.allow=never",
+        "-c", "protocol.ssh.allow=never",
+        "-c", "protocol.http.allow=never",
+        "-c", "protocol.https.allow=always",
+    ]
+
+
+def test_fenced_runner_drops_inherited_git_configuration(monkeypatch, tmp_path):
+    monkeypatch.setenv("GIT_CONFIG_COUNT", "1")
+    monkeypatch.setenv("GIT_CONFIG_KEY_0", "url.https://attacker.invalid/.insteadOf")
+    monkeypatch.setenv("GIT_CONFIG_VALUE_0", "https://github.com/")
+    monkeypatch.setenv("GIT_SSL_NO_VERIFY", "1")
+    monkeypatch.setenv("git_config_key_9", "http.sslVerify")
+    captured = tmp_path / "child-environment.json"
+    program = (
+        "import json, os, pathlib; "
+        "pathlib.Path(os.sys.argv[1]).write_text("
+        "json.dumps({key: value for key, value in os.environ.items() "
+        "if key.startswith('GIT_')}), encoding='utf-8')"
+    )
+
+    managed_installations._run_command_fenced(
+        [sys.executable, "-c", program, str(captured)],
+        timeout=5,
+        ownership_guard=lambda: None,
+        fence=None,
+    )
+
+    child_environment = json.loads(captured.read_text(encoding="utf-8"))
+    assert child_environment == {
+        "GIT_CONFIG_GLOBAL": os.devnull,
+        "GIT_CONFIG_SYSTEM": os.devnull,
+        "GIT_CONFIG_NOSYSTEM": "1",
+        "GIT_TERMINAL_PROMPT": "0",
+        "GIT_ALLOW_PROTOCOL": "https",
+    }
+
+
 def test_failure_budget_counts_failures_not_successful_remote_polls(tmp_path, monkeypatch):
     db = tmp_path / "polls.db"
     operation = create_managed_installation(
@@ -713,8 +915,14 @@ def test_existing_project_requires_normalized_matching_origin(tmp_path):
     )
     assert detail["existing"] is True
     assert commands == [
-        ["git", "-C", str(destination), "remote", "get-url", "origin"],
-        ["git", "-C", str(destination), "rev-parse", "--verify", "HEAD"],
+        managed_installations._managed_git_command(
+            "-C", str(destination),
+            "config", "--local", "--no-includes", "--get-all",
+            "remote.origin.url",
+        ),
+        managed_installations._managed_git_command(
+            "-C", str(destination), "rev-parse", "--verify", "HEAD",
+        ),
     ]
 
     def mismatched(command, *, timeout):
@@ -733,6 +941,87 @@ def test_existing_project_requires_normalized_matching_origin(tmp_path):
             executor=mismatched,
             project_root=project_root,
         )
+
+
+@pytest.mark.skipif(
+    managed_installations.shutil.which("git") is None,
+    reason="git is required for raw-origin validation",
+)
+def test_existing_project_rejects_local_instead_of_origin_spoof(tmp_path):
+    project_root = tmp_path / "projects"
+    destination = project_root / "demo"
+    destination.mkdir(parents=True)
+
+    def git(*arguments):
+        return subprocess.run(
+            ["git", *arguments],
+            cwd=destination,
+            stdin=subprocess.DEVNULL,
+            capture_output=True,
+            text=True,
+            check=True,
+            env=managed_installations._hardened_command_environment(),
+        )
+
+    git("init")
+    git("config", "user.email", "managed-install-test@example.invalid")
+    git("config", "user.name", "Managed Install Test")
+    (destination / "README.md").write_text("untrusted content\n", encoding="utf-8")
+    git("add", "README.md")
+    git("commit", "-m", "test fixture")
+    head = git("rev-parse", "HEAD").stdout.strip().lower()
+    git("remote", "add", "origin", "https://attacker.invalid/example/demo.git")
+    git(
+        "config",
+        "url.https://github.com/.insteadOf",
+        "https://attacker.invalid/",
+    )
+    (destination / ".git" / "hermes-managed-install.json").write_text(
+        json.dumps({
+            "version": 1,
+            "origin": "https://github.com/example/demo",
+            "head": head,
+        }),
+        encoding="utf-8",
+    )
+
+    rewritten = managed_installations._run_command(
+        managed_installations._managed_git_command(
+            "-C", str(destination), "remote", "get-url", "origin",
+        ),
+        timeout=30,
+    )
+    assert rewritten.stdout.strip() == "https://github.com/example/demo.git"
+
+    with pytest.raises(RuntimeError, match="origin does not match"):
+        managed_installations._execute_allowlisted_installation(
+            {
+                "id": "local-origin-spoof",
+                "kind": "project",
+                "identifier": "https://github.com/example/demo.git",
+                "profile": "default",
+                "project_name": "demo",
+                "owner_id": "server-admin",
+            },
+            project_root=project_root,
+        )
+
+    git("config", "--unset-all", "url.https://github.com/.insteadOf")
+    git("config", "--unset-all", "remote.origin.url")
+    git("config", "--add", "remote.origin.url", "https://GITHUB.com/example/demo.git/")
+    detail = managed_installations._execute_allowlisted_installation(
+        {
+            "id": "valid-raw-origin",
+            "kind": "project",
+            "identifier": "https://github.com/example/demo",
+            "profile": "default",
+            "project_name": "demo",
+            "owner_id": "server-admin",
+        },
+        project_root=project_root,
+    )
+    assert detail["existing"] is True
+    assert detail["head"] == head
 
 
 def test_interrupted_project_clone_is_not_accepted_as_existing(tmp_path):
@@ -761,8 +1050,10 @@ def test_interrupted_project_clone_is_not_accepted_as_existing(tmp_path):
 def test_project_clone_uses_staging_validation_marker_and_atomic_publish(tmp_path):
     project_root = tmp_path / "projects"
     head = "c" * 40
+    commands = []
 
     def runner(command, *, timeout):
+        commands.append(command)
         if "clone" in command:
             staging = Path(command[-1])
             (staging / ".git").mkdir(parents=True)
@@ -788,6 +1079,12 @@ def test_project_clone_uses_staging_validation_marker_and_atomic_publish(tmp_pat
     assert detail["head"] == head
     assert (destination / ".git" / "hermes-managed-install.json").is_file()
     assert not list(project_root.glob(".demo.managed-install-*"))
+    clone = next(command for command in commands if "clone" in command)
+    assert clone[:-1] == managed_installations._managed_git_command(
+        "clone", "--filter=blob:none", "--", "https://github.com/example/demo.git",
+    )
+    assert Path(clone[-1]).parent == project_root
+    assert Path(clone[-1]).name.startswith(".demo.managed-install-")
 
 
 def test_expired_worker_fence_prevents_second_installation_overlap(tmp_path, monkeypatch):
@@ -951,6 +1248,17 @@ def test_dashboard_api_persists_before_returning_accepted(tmp_path, monkeypatch)
 
     db = tmp_path / "api-installations.db"
     monkeypatch.setattr(managed_installations, "managed_installations_db_path", lambda: db)
+    monkeypatch.setattr(
+        managed_installations,
+        "_resolve_managed_project_source",
+        lambda identifier, source_ref: {
+            "canonical_source": managed_installations._normalize_project_origin(identifier),
+            "source_ref": source_ref,
+            "resolved_commit": "a" * 40,
+            "resolved_tree": "b" * 40,
+            "policy_version": managed_installations.MANAGED_SOURCE_POLICY_VERSION,
+        },
+    )
     _main_managed_nodes_config(tmp_path, monkeypatch)
     response = asyncio.run(
         web_server.create_managed_installation_api(
@@ -993,6 +1301,17 @@ def test_required_topology_is_checked_before_installation_persistence(tmp_path, 
     assert not db.exists()
 
     _main_managed_nodes_config(tmp_path, monkeypatch)
+    monkeypatch.setattr(
+        managed_installations,
+        "_resolve_managed_project_source",
+        lambda identifier, source_ref: {
+            "canonical_source": managed_installations._normalize_project_origin(identifier),
+            "source_ref": source_ref,
+            "resolved_commit": "a" * 40,
+            "resolved_tree": "b" * 40,
+            "policy_version": managed_installations.MANAGED_SOURCE_POLICY_VERSION,
+        },
+    )
     operation = create_managed_installation(
         kind="project",
         identifier="https://github.com/example/project.git",
@@ -1039,3 +1358,949 @@ def test_managed_installation_tool_schema_requires_https_project_sources():
     description = schema["parameters"]["properties"]["identifier"]["description"]
     assert "HTTPS git URL" in description
     assert "SSH" not in description
+
+
+def _project_clone_runner(head: str):
+    def runner(command, *, timeout):
+        if "clone" in command:
+            staging = Path(command[-1])
+            (staging / ".git").mkdir(parents=True)
+            (staging / "README.md").write_text("ready\n", encoding="utf-8")
+            return subprocess.CompletedProcess(command, 0, stdout="cloned\n", stderr="")
+        output = head if "rev-parse" in command else "https://github.com/example/demo.git"
+        return subprocess.CompletedProcess(command, 0, stdout=output + "\n", stderr="")
+
+    return runner
+
+
+def test_account_projects_with_same_name_are_physically_isolated(tmp_path):
+    project_root = tmp_path / "managed-projects"
+    alice = managed_installations._execute_allowlisted_installation(
+        {
+            "id": "alice-project",
+            "kind": "project",
+            "identifier": "https://github.com/example/demo.git",
+            "profile": "default",
+            "project_name": "demo",
+            "owner_id": "alice",
+            "account_generation": "alice-gen-1",
+        },
+        executor=_project_clone_runner("a" * 40),
+        project_root=project_root,
+    )
+    bob = managed_installations._execute_allowlisted_installation(
+        {
+            "id": "bob-project",
+            "kind": "project",
+            "identifier": "https://github.com/example/demo.git",
+            "profile": "default",
+            "project_name": "demo",
+            "owner_id": "bob",
+            "account_generation": "bob-gen-1",
+        },
+        executor=_project_clone_runner("b" * 40),
+        project_root=project_root,
+    )
+
+    alice_path = Path(alice["path"])
+    bob_path = Path(bob["path"])
+    assert alice_path != bob_path
+    assert alice_path.name == bob_path.name == "demo"
+    assert alice_path.is_dir() and bob_path.is_dir()
+    assert alice_path.parent.parent == bob_path.parent.parent
+
+
+def test_truncated_account_directory_collision_is_rejected_by_full_marker(
+    tmp_path, monkeypatch,
+):
+    real_digest = managed_installations._owner_boundary_digest
+
+    def colliding_digest(owner_id, generation):
+        suffix = "1" * 40 if owner_id == "alice" else "2" * 40
+        return "a" * 24 + suffix
+
+    monkeypatch.setattr(
+        managed_installations, "_owner_boundary_digest", colliding_digest
+    )
+    first = managed_installations._account_project_root(
+        tmp_path / "projects", "alice", "gen-1", create=True,
+    )
+    with pytest.raises(RuntimeError, match="boundary collision"):
+        managed_installations._account_project_root(
+            tmp_path / "projects", "bob", "gen-1", create=True,
+        )
+    assert json.loads((first / ".managed-owner-boundary.json").read_text(
+        encoding="utf-8"
+    ))["boundary"] == colliding_digest("alice", "gen-1")
+    assert real_digest("alice", "gen-1") != real_digest("bob", "gen-1")
+
+
+def test_account_skill_profiles_use_distinct_physical_homes(tmp_path, monkeypatch):
+    profiles_root = tmp_path / "profiles"
+    monkeypatch.setattr(
+        "hermes_cli.profiles.get_profile_dir",
+        lambda name: profiles_root / name,
+    )
+    commands = []
+
+    def install_skill(command, *, timeout):
+        commands.append(command)
+        profile_home = profiles_root / command[4]
+        destination = profile_home / "skills" / "development" / "example"
+        destination.mkdir(parents=True)
+        (destination / "SKILL.md").write_text("# Example\n", encoding="utf-8")
+        lock = profile_home / "skills" / ".hub" / "lock.json"
+        lock.parent.mkdir(parents=True, exist_ok=True)
+        lock.write_text(json.dumps({"installed": {"example": {
+            "identifier": "official/example",
+            "install_path": "development/example",
+        }}}), encoding="utf-8")
+        return subprocess.CompletedProcess(command, 0, stdout="installed\n", stderr="")
+
+    for owner, generation in (("alice", "gen-1"), ("bob", "gen-1")):
+        managed_installations._execute_allowlisted_installation(
+            {
+                "kind": "skill",
+                "identifier": "official/example",
+                "profile": "default",
+                "owner_id": owner,
+                "account_generation": generation,
+            },
+            executor=install_skill,
+        )
+
+    profile_names = [command[4] for command in commands]
+    assert len(set(profile_names)) == 2
+    assert all(name.startswith("acct-") for name in profile_names)
+    assert all((profiles_root / name / ".managed-owner-boundary.json").is_file()
+               for name in profile_names)
+
+
+def test_account_runtime_inherits_base_and_exposes_only_its_generation_resources(
+    tmp_path, monkeypatch,
+):
+    import yaml
+
+    profiles_root = tmp_path / "profiles"
+    base_home = tmp_path / "default"
+    base_home.mkdir()
+    (base_home / "skills" / "base-skill").mkdir(parents=True)
+    (base_home / "skills" / "base-skill" / "SKILL.md").write_text(
+        "# Base\n", encoding="utf-8"
+    )
+    (base_home / "config.yaml").write_text(
+        yaml.safe_dump({
+            "model": "base-model",
+            "mcp_servers": {"base-mcp": {"url": "https://base.invalid/mcp"}},
+            "skills": {"external_dirs": ["shared-skills"]},
+        }, sort_keys=False),
+        encoding="utf-8",
+    )
+    (base_home / ".env").write_text("MODEL_API_KEY=base-secret\n", encoding="utf-8")
+    (base_home / "SOUL.md").write_text("Base identity\n", encoding="utf-8")
+    (base_home / "shared-skills").mkdir()
+
+    def profile_dir(name):
+        return base_home if name == "default" else profiles_root / name
+
+    monkeypatch.setattr("hermes_cli.profiles.get_profile_dir", profile_dir)
+    monkeypatch.setattr(managed_installations, "get_hermes_home", lambda: str(tmp_path))
+    db = tmp_path / "managed-installations.db"
+
+    alice_home = managed_installations._account_resource_home(
+        "alice", "alice-gen-1", create=True,
+    )
+    (alice_home / "skills" / "alice-skill").mkdir(parents=True)
+    (alice_home / "skills" / "alice-skill" / "SKILL.md").write_text(
+        "# Alice\n", encoding="utf-8"
+    )
+    (alice_home / "config.yaml").write_text(
+        yaml.safe_dump({
+            "mcp_servers": {"alice-mcp": {"url": "https://alice.invalid/mcp"}},
+        }),
+        encoding="utf-8",
+    )
+    managed_installations._record_account_mcp_server(alice_home, "alice-mcp")
+
+    runtime = managed_installations.managed_account_runtime_home(
+        "alice",
+        "alice-gen-1",
+        "default",
+        db_path=db,
+        base_profile_home=base_home,
+    )
+    config = yaml.safe_load((runtime / "config.yaml").read_text(encoding="utf-8"))
+    assert config["model"] == "base-model"
+    assert set(config["mcp_servers"]) == {"base-mcp", "alice-mcp"}
+    assert str((base_home / "skills").resolve()) in config["skills"]["external_dirs"]
+    assert str((base_home / "shared-skills").resolve()) in config["skills"]["external_dirs"]
+    assert str((alice_home / "skills").resolve()) in config["skills"]["external_dirs"]
+    assert (alice_home / "skills" / "alice-skill" / "SKILL.md").is_file()
+    assert (runtime / ".env").read_text(encoding="utf-8") == "MODEL_API_KEY=base-secret\n"
+    assert (runtime / "SOUL.md").read_text(encoding="utf-8") == "Base identity\n"
+
+    bob_home = managed_installations.managed_account_runtime_home(
+        "bob",
+        "bob-gen-1",
+        "default",
+        db_path=db,
+        base_profile_home=base_home,
+    )
+    bob_config = yaml.safe_load((bob_home / "config.yaml").read_text(encoding="utf-8"))
+    assert set(bob_config["mcp_servers"]) == {"base-mcp"}
+    assert str((alice_home / "skills").resolve()) not in bob_config["skills"]["external_dirs"]
+
+    managed_installations.delete_owner_managed_resources(
+        "alice",
+        account_generation="alice-gen-1",
+        db_path=db,
+        _project_root=tmp_path / "managed-projects",
+    )
+    with pytest.raises(PermissionError, match="generation is deleted"):
+        managed_installations.managed_account_runtime_home(
+            "alice",
+            "alice-gen-1",
+            "default",
+            db_path=db,
+            base_profile_home=base_home,
+        )
+    assert not alice_home.exists()
+    assert bob_home.is_dir()
+
+
+def test_account_resources_are_shared_across_role_runtime_profiles(
+    tmp_path, monkeypatch,
+):
+    import yaml
+
+    profiles_root = tmp_path / "profiles"
+    base_homes = {}
+    for name in ("default", "dbb3-manager", "dbb3-worker", "pc-worker"):
+        home = tmp_path / f"base-{name}"
+        home.mkdir()
+        (home / "config.yaml").write_text(
+            yaml.safe_dump({"model": f"model-{name}"}, sort_keys=False),
+            encoding="utf-8",
+        )
+        base_homes[name] = home
+
+    def profile_dir(name):
+        return base_homes.get(name, profiles_root / name)
+
+    monkeypatch.setattr("hermes_cli.profiles.get_profile_dir", profile_dir)
+    monkeypatch.setattr(managed_installations, "get_hermes_home", lambda: str(tmp_path))
+    db = tmp_path / "managed-installations.db"
+    resource_home = managed_installations._account_resource_home(
+        "alice", "alice-gen-1", create=True,
+    )
+    (resource_home / "skills" / "shared-account-skill").mkdir(parents=True)
+    (resource_home / "skills" / "shared-account-skill" / "SKILL.md").write_text(
+        "# Shared account skill\n", encoding="utf-8",
+    )
+    (resource_home / "config.yaml").write_text(
+        yaml.safe_dump({
+            "mcp_servers": {"account-mcp": {"url": "https://account.invalid/mcp"}},
+        }),
+        encoding="utf-8",
+    )
+    managed_installations._record_account_mcp_server(resource_home, "account-mcp")
+
+    runtimes = {}
+    for role, base_home in base_homes.items():
+        runtimes[role] = managed_installations.managed_account_runtime_home(
+            "alice",
+            "alice-gen-1",
+            role,
+            db_path=db,
+            base_profile_home=base_home,
+        )
+
+    assert len(set(runtimes.values())) == len(base_homes)
+    for role, runtime in runtimes.items():
+        config = yaml.safe_load((runtime / "config.yaml").read_text(encoding="utf-8"))
+        assert config["model"] == f"model-{role}"
+        assert set(config["mcp_servers"]) == {"account-mcp"}
+        assert str((resource_home / "skills").resolve()) in config["skills"]["external_dirs"]
+        assert managed_installations.managed_account_runtime_profile(
+            "alice",
+            "alice-gen-1",
+            role,
+            db_path=db,
+            base_profile_home=base_homes[role],
+        ) == managed_installations._account_profile_name(
+            "alice", "alice-gen-1", role,
+        )
+
+
+def test_remote_install_request_preserves_account_boundary(monkeypatch):
+    captured = {}
+    monkeypatch.setattr(
+        managed_installations,
+        "_installation_route",
+        lambda *_args, **_kwargs: {
+            "url": "https://node.example/install",
+            "token": INSTALL_TOKEN,
+            "timeout": 8,
+        },
+    )
+
+    def read(request, timeout):
+        captured.update(json.loads(request.data.decode("utf-8")))
+        return {"state": "accepted"}
+
+    monkeypatch.setattr(managed_installations, "_read_json_response", read)
+    managed_installations._dispatch_or_poll_remote({
+        "id": "mi-account-boundary",
+        "request_id": "request-1",
+        "node_id": "dbb3",
+        "target_state": "pending",
+        "kind": "skill",
+        "identifier": "official/example",
+        "profile": "default",
+        "project_name": "",
+        "owner_id": "alice",
+        "account_generation": "alice-gen-7",
+    }, config_path=None)
+
+    assert captured["owner_id"] == "alice"
+    assert captured["account_generation"] == "alice-gen-7"
+
+
+def test_receiver_can_poll_account_scoped_operation_by_main_operation_id(
+    tmp_path, monkeypatch,
+):
+    token = tmp_path / "receiver-token"
+    token.write_text(INSTALL_TOKEN, encoding="utf-8")
+    config = _receiver_config(tmp_path, token)
+    monkeypatch.setattr(managed_installations, "_start_receiver_thread", lambda *_args: None)
+    payload = {
+        "id": "mi-account-remote-poll",
+        "request_id": "main-request",
+        "node_id": "dbb3",
+        "kind": "skill",
+        "identifier": "official/example",
+        "profile": "default",
+        "project_name": "",
+        "owner_id": "alice",
+        "account_generation": "alice-gen-7",
+    }
+
+    accepted = accept_managed_installation(payload, INSTALL_TOKEN, config)
+    polled = get_received_managed_installation(
+        "mi-account-remote-poll", INSTALL_TOKEN, config
+    )
+
+    assert accepted["accepted"] is True
+    assert polled["id"] == "mi-account-remote-poll"
+    assert polled["node_id"] == "dbb3"
+
+
+def test_managed_installation_tool_cannot_read_another_account_operation(
+    tmp_path, monkeypatch,
+):
+    from tools.managed_installation_tool import managed_installation
+
+    db = tmp_path / "managed-installations.db"
+    alice = create_managed_installation(
+        kind="skill", identifier="official/example", request_id="alice-tool-op",
+        targets=["server"], owner_id="alice", account_generation="alice-gen-1",
+        db_path=db,
+    )
+    monkeypatch.setattr(managed_installations, "managed_installations_db_path", lambda: db)
+    monkeypatch.setenv("HERMES_TOOL_ARTIFACT_OWNER", "bob")
+    monkeypatch.setenv("HERMES_ACCOUNT_GENERATION", "bob-gen-1")
+
+    response = json.loads(managed_installation({
+        "action": "status", "operation_id": alice["id"],
+    }))
+
+    assert response == {"error": "installation_not_found"}
+
+
+def test_account_delete_removes_physical_boundary_and_blocks_old_generation(
+    tmp_path, monkeypatch,
+):
+    db = tmp_path / "managed-installations.db"
+    profiles_root = tmp_path / "profiles"
+    projects_root = tmp_path / "managed-projects"
+    monkeypatch.setattr(
+        "hermes_cli.profiles.get_profile_dir",
+        lambda name: profiles_root / name,
+    )
+    monkeypatch.setattr(managed_installations, "get_hermes_home", lambda: str(tmp_path))
+    alice_profile = managed_installations._account_profile_home(
+        "alice", "alice-gen-1", "default", create=True,
+    )
+    bob_profile = managed_installations._account_profile_home(
+        "bob", "bob-gen-1", "default", create=True,
+    )
+    alice_projects = managed_installations._account_project_root(
+        projects_root, "alice", "alice-gen-1", create=True,
+    )
+    bob_projects = managed_installations._account_project_root(
+        projects_root, "bob", "bob-gen-1", create=True,
+    )
+    (alice_projects / "demo").mkdir()
+    (bob_projects / "demo").mkdir()
+    create_managed_installation(
+        kind="skill", identifier="official/example", request_id="alice-install",
+        targets=["server"], owner_id="alice", account_generation="alice-gen-1",
+        db_path=db,
+    )
+    bob = create_managed_installation(
+        kind="skill", identifier="official/example", request_id="bob-install",
+        targets=["server"], owner_id="bob", account_generation="bob-gen-1",
+        db_path=db,
+    )
+
+    deleted = managed_installations.delete_owner_managed_resources(
+        "alice", account_generation="alice-gen-1", db_path=db,
+    )
+
+    assert deleted["operations"] == 1
+    assert not alice_profile.exists() and not alice_projects.exists()
+    assert bob_profile.is_dir() and bob_projects.is_dir()
+    assert get_managed_installation(bob["id"], db_path=db)["owner_id"] == "bob"
+    with pytest.raises(ValueError, match="generation is deleted"):
+        create_managed_installation(
+            kind="skill", identifier="official/example", request_id="late-old-request",
+            targets=["server"], owner_id="alice", account_generation="alice-gen-1",
+            db_path=db,
+        )
+
+
+def test_empty_account_delete_fences_paused_old_install_and_allows_new_generation(
+    tmp_path, monkeypatch,
+):
+    db = tmp_path / "managed-installations.db"
+    profiles_root = tmp_path / "profiles"
+    monkeypatch.setattr(
+        "hermes_cli.profiles.get_profile_dir",
+        lambda name: profiles_root / name,
+    )
+    monkeypatch.setattr(managed_installations, "get_hermes_home", lambda: str(tmp_path))
+    entered = threading.Event()
+    release = threading.Event()
+    real_resolve = managed_installations.resolve_installation_targets
+    outcome = {}
+
+    def paused_resolve(*args, **kwargs):
+        targets = real_resolve(*args, **kwargs)
+        if threading.current_thread().name == "late-managed-install":
+            entered.set()
+            assert release.wait(timeout=5)
+        return targets
+
+    def late_creator():
+        try:
+            create_managed_installation(
+                kind="skill",
+                identifier="official/example",
+                request_id="late-empty-store-request",
+                targets=["server"],
+                owner_id="alice",
+                account_generation="alice-gen-1",
+                db_path=db,
+            )
+        except BaseException as exc:
+            outcome["error"] = exc
+
+    monkeypatch.setattr(
+        managed_installations,
+        "resolve_installation_targets",
+        paused_resolve,
+    )
+    worker = threading.Thread(target=late_creator, name="late-managed-install")
+    worker.start()
+    assert entered.wait(timeout=5)
+
+    assert managed_installations.delete_owner_managed_resources(
+        "alice",
+        account_generation="alice-gen-1",
+        include_known_generations=True,
+        db_path=db,
+    ) == {"resources": 0, "events": 0, "operations": 0}
+    release.set()
+    worker.join(timeout=5)
+
+    assert not worker.is_alive()
+    assert isinstance(outcome.get("error"), ValueError)
+    assert "generation is deleted" in str(outcome["error"])
+
+    current = create_managed_installation(
+        kind="skill",
+        identifier="official/example",
+        request_id="new-generation-request",
+        targets=["server"],
+        owner_id="alice",
+        account_generation="alice-gen-2",
+        db_path=db,
+    )
+    assert current["account_generation"] == "alice-gen-2"
+
+
+def test_delete_interleaved_with_running_install_cleans_after_fence_release(
+    tmp_path, monkeypatch,
+):
+    db = tmp_path / "managed-installations.db"
+    profiles_root = tmp_path / "profiles"
+    monkeypatch.setattr(
+        "hermes_cli.profiles.get_profile_dir",
+        lambda name: profiles_root / name,
+    )
+    monkeypatch.setattr(managed_installations, "get_hermes_home", lambda: str(tmp_path))
+    create_managed_installation(
+        kind="skill", identifier="official/example", request_id="interleaved-install",
+        targets=["server"], owner_id="alice", account_generation="alice-gen-1",
+        db_path=db,
+    )
+    entered = threading.Event()
+    release = threading.Event()
+
+    def blocking_install(command, *, timeout):
+        profile_home = profiles_root / command[4]
+        destination = profile_home / "skills" / "development" / "example"
+        destination.mkdir(parents=True)
+        (destination / "SKILL.md").write_text("# Example\n", encoding="utf-8")
+        lock = profile_home / "skills" / ".hub" / "lock.json"
+        lock.parent.mkdir(parents=True, exist_ok=True)
+        lock.write_text(json.dumps({"installed": {"example": {
+            "identifier": "official/example",
+            "install_path": "development/example",
+        }}}), encoding="utf-8")
+        entered.set()
+        assert release.wait(5)
+        return subprocess.CompletedProcess(command, 0, stdout="installed\n", stderr="")
+
+    worker = threading.Thread(
+        target=dispatch_managed_installations_once,
+        kwargs={"db_path": db, "executor": blocking_install},
+    )
+    worker.start()
+    assert entered.wait(3)
+    profile_home = next(profiles_root.glob("acct-*"))
+
+    managed_installations.delete_owner_managed_resources(
+        "alice", account_generation="alice-gen-1", db_path=db,
+    )
+    assert profile_home.exists()
+    release.set()
+    worker.join(5)
+    assert not worker.is_alive()
+    with managed_installations.closing(managed_installations._connect(db)) as conn:
+        conn.execute("UPDATE managed_owner_deletion_targets SET next_attempt_at=0")
+    assert dispatch_managed_installations_once(db_path=db) is True
+
+    assert not profile_home.exists()
+    assert managed_installations._owner_deletion_state(
+        db, "alice", "alice-gen-1"
+    ) == "complete"
+
+
+def test_receiver_delete_action_cleans_node_files_and_tombstones_generation(
+    tmp_path, monkeypatch,
+):
+    token = tmp_path / "receiver-token"
+    token.write_text(INSTALL_TOKEN, encoding="utf-8")
+    config = _receiver_config(tmp_path, token)
+    profiles_root = tmp_path / "profiles"
+    monkeypatch.setattr(
+        "hermes_cli.profiles.get_profile_dir",
+        lambda name: profiles_root / name,
+    )
+    profile_home = managed_installations._account_profile_home(
+        "alice", "alice-gen-9", "default", create=True,
+    )
+    project_home = managed_installations._account_project_root(
+        tmp_path / "projects", "alice", "alice-gen-9", create=True,
+    )
+    receiver_db = tmp_path / "node-installations.db"
+    create_managed_installation(
+        kind="project", identifier="https://github.com/example/demo.git",
+        request_id="receiver-project", targets=["dbb3"], project_name="demo",
+        owner_id="alice", account_generation="alice-gen-9", db_path=receiver_db,
+    )
+
+    response = accept_managed_installation({
+        "action": "delete_owner",
+        "node_id": "dbb3",
+        "owner_id": "alice",
+        "account_generation": "alice-gen-9",
+    }, INSTALL_TOKEN, config)
+
+    assert response["state"] == "complete"
+    assert not profile_home.exists() and not project_home.exists()
+    with pytest.raises(ValueError, match="generation is deleted"):
+        create_managed_installation(
+            kind="skill", identifier="official/example", request_id="late-receiver",
+            targets=["dbb3"], owner_id="alice", account_generation="alice-gen-9",
+            db_path=receiver_db,
+        )
+
+
+def test_remote_account_cleanup_retries_durably_then_completes(
+    tmp_path, monkeypatch,
+):
+    db = tmp_path / "managed-installations.db"
+    monkeypatch.setattr(managed_installations, "get_hermes_home", lambda: str(tmp_path))
+    create_managed_installation(
+        kind="project", identifier="https://github.com/example/demo.git",
+        request_id="remote-delete", targets=["dbb3"], project_name="demo",
+        owner_id="alice", account_generation="alice-gen-3", db_path=db,
+    )
+    managed_installations.delete_owner_managed_resources(
+        "alice", account_generation="alice-gen-3", db_path=db,
+    )
+    monkeypatch.setattr(
+        managed_installations,
+        "_installation_route",
+        lambda *_args, **_kwargs: {
+            "url": "https://node.example/install",
+            "token": INSTALL_TOKEN,
+            "timeout": 8,
+        },
+    )
+    responses = iter([URLError("offline"), {"state": "complete"}])
+
+    def read(*_args, **_kwargs):
+        result = next(responses)
+        if isinstance(result, Exception):
+            raise result
+        return result
+
+    monkeypatch.setattr(managed_installations, "_read_json_response", read)
+    assert dispatch_managed_installations_once(db_path=db) is True
+    assert managed_installations._owner_deletion_state(
+        db, "alice", "alice-gen-3"
+    ) == "pending"
+    with managed_installations.closing(managed_installations._connect(db)) as conn:
+        conn.execute("UPDATE managed_owner_deletion_targets SET next_attempt_at=0")
+    assert dispatch_managed_installations_once(db_path=db) is True
+    assert managed_installations._owner_deletion_state(
+        db, "alice", "alice-gen-3"
+    ) == "complete"
+
+
+def test_project_ref_is_resolved_once_and_idempotent_replay_keeps_original_lock(
+    tmp_path, monkeypatch,
+):
+    db = tmp_path / "source-lock.db"
+    locks = iter((("a" * 40, "b" * 40), ("c" * 40, "d" * 40)))
+    calls = []
+
+    monkeypatch.setattr(
+        managed_installations,
+        "require_managed_installation_topology",
+        lambda *_args, **_kwargs: None,
+    )
+
+    def resolve(identifier, source_ref):
+        calls.append((identifier, source_ref))
+        commit, tree = next(locks)
+        return {
+            "canonical_source": managed_installations._normalize_project_origin(identifier),
+            "source_ref": source_ref,
+            "resolved_commit": commit,
+            "resolved_tree": tree,
+            "policy_version": managed_installations.MANAGED_SOURCE_POLICY_VERSION,
+        }
+
+    monkeypatch.setattr(managed_installations, "_resolve_managed_project_source", resolve)
+    first = create_managed_installation(
+        kind="project",
+        identifier="https://github.com/example/demo.git",
+        source_ref="refs/heads/main",
+        request_id="moving-ref",
+        targets=["dbb3"],
+        require_topology=True,
+        db_path=db,
+    )
+    replay = create_managed_installation(
+        kind="project",
+        identifier="https://github.com/example/demo.git",
+        source_ref="refs/heads/main",
+        request_id="moving-ref",
+        targets=["dbb3"],
+        require_topology=True,
+        db_path=db,
+    )
+    moved = create_managed_installation(
+        kind="project",
+        identifier="https://github.com/example/demo.git",
+        source_ref="refs/heads/main",
+        request_id="moving-ref-new-operation",
+        targets=["dbb3"],
+        require_topology=True,
+        db_path=db,
+    )
+
+    assert first["source_lock"]["resolved_commit"] == "a" * 40
+    assert replay["source_lock"] == first["source_lock"]
+    assert moved["source_lock"]["resolved_commit"] == "c" * 40
+    assert len(calls) == 2
+
+
+def test_source_resolution_pins_git_connection_and_rejects_private_dns(
+    monkeypatch,
+):
+    commands = []
+
+    monkeypatch.setattr(
+        managed_installations.socket,
+        "getaddrinfo",
+        lambda *_args, **_kwargs: [
+            (managed_installations.socket.AF_INET, 1, 6, "", ("93.184.216.34", 443)),
+        ],
+    )
+
+    def runner(command, *, timeout):
+        commands.append(command)
+        if "FETCH_HEAD^{commit}" in command:
+            output = "a" * 40
+        elif "FETCH_HEAD^{tree}" in command:
+            output = "b" * 40
+        else:
+            output = "ok"
+        return subprocess.CompletedProcess(command, 0, stdout=output + "\n", stderr="")
+
+    locked = managed_installations._resolve_managed_project_source(
+        "https://github.com/example/demo.git",
+        "refs/tags/v1.0.0",
+        runner=runner,
+    )
+    fetch = next(command for command in commands if "fetch" in command)
+    assert "http.curloptResolve=+github.com:443:93.184.216.34" in fetch
+    assert "http.followRedirects=false" in fetch
+    assert "http.sslVerify=true" in fetch
+    assert "credential.helper=" in fetch
+    assert f"core.hooksPath={os.devnull}" in fetch
+    assert locked["resolved_commit"] == "a" * 40
+    assert locked["resolved_tree"] == "b" * 40
+
+    monkeypatch.setattr(
+        managed_installations.socket,
+        "getaddrinfo",
+        lambda *_args, **_kwargs: [
+            (managed_installations.socket.AF_INET, 1, 6, "", ("127.0.0.1", 443)),
+        ],
+    )
+    with pytest.raises(RuntimeError, match="non-public"):
+        managed_installations._managed_source_curl_resolve(
+            "https://github.com/example/demo.git"
+        )
+
+
+def test_pinned_project_uses_detached_commit_and_emits_verified_receipt(tmp_path):
+    project_root = tmp_path / "projects"
+    commit = "a" * 40
+    tree = "b" * 40
+    canonical = "https://github.com/example/demo"
+    commands = []
+
+    def runner(command, *, timeout):
+        commands.append(command)
+        if "init" in command:
+            staging = Path(command[-1])
+            (staging / ".git").mkdir(parents=True)
+            (staging / "README.md").write_text("locked\n", encoding="utf-8")
+        if "remote.origin.url" in command:
+            output = canonical
+        elif "--abbrev-ref" in command:
+            output = "HEAD"
+        elif "HEAD^{tree}" in command:
+            output = tree
+        elif "--verify" in command and "HEAD" in command:
+            output = commit
+        else:
+            output = "ok"
+        return subprocess.CompletedProcess(command, 0, stdout=output + "\n", stderr="")
+
+    detail = managed_installations._execute_allowlisted_installation(
+        {
+            "id": "pinned-project",
+            "node_id": "dbb3",
+            "kind": "project",
+            "identifier": "https://github.com/example/demo.git",
+            "canonical_source": canonical,
+            "source_ref": "refs/heads/main",
+            "resolved_commit": commit,
+            "resolved_tree": tree,
+            "policy_version": managed_installations.MANAGED_SOURCE_POLICY_VERSION,
+            "project_name": "demo",
+            "owner_id": "server-admin",
+            "_source_pins": ("+github.com:443:93.184.216.34",),
+        },
+        executor=runner,
+        project_root=project_root,
+    )
+
+    assert not any("clone" in command for command in commands)
+    assert any("fetch" in command and commit in command for command in commands)
+    assert any("checkout" in command and "--detach" in command for command in commands)
+    assert detail["resolved_commit"] == commit
+    assert detail["tree_sha"] == tree
+    assert detail["artifact_hash"] == detail["content_hash"]
+    assert detail["receipt_schema"] == 1
+    assert detail["node_id"] == "dbb3"
+    assert detail["health"]["status"] == "healthy"
+    marker = json.loads(
+        (project_root / "demo" / ".git" / "hermes-managed-install.json").read_text(
+            encoding="utf-8"
+        )
+    )
+    assert marker["version"] == 2
+    assert marker["head"] == commit
+    assert marker["tree"] == tree
+
+
+def test_source_lock_columns_are_immutable_and_partial_state_is_explicit(tmp_path):
+    db = tmp_path / "aggregate.db"
+    operation = create_managed_installation(
+        kind="skill",
+        identifier="official/example",
+        request_id="partial-install",
+        targets=["server", "dbb3"],
+        db_path=db,
+    )
+    first = managed_installations._claim_target(db, now=time.time(), lease_seconds=30)
+    assert first and first["node_id"] == "server"
+    detail = managed_installations._finalize_installation_detail(first, {
+        "installed": True,
+        "kind": "skill",
+        "proof_schema": 1,
+        "proof_source": "local_filesystem",
+        "resolved_version": "1.0.0",
+        "content_hash": "f" * 64,
+    })
+    assert managed_installations._finish_target(
+        db, first, state="completed", detail=detail
+    )
+    managed_installations._release_execution_fence(first)
+
+    current = get_managed_installation(operation["id"], db_path=db)
+    assert current["aggregate_state"] == "partial"
+    with managed_installations.closing(managed_installations._connect(db)) as conn:
+        with pytest.raises(sqlite3.IntegrityError, match="source lock is immutable"):
+            conn.execute(
+                "UPDATE managed_installations SET policy_version='attacker-policy' WHERE id=?",
+                (operation["id"],),
+            )
+
+
+def test_verified_skill_rollback_uninstalls_each_node_and_updates_catalog(
+    tmp_path, monkeypatch,
+):
+    db = tmp_path / "rollback.db"
+    installation = create_managed_installation(
+        kind="skill",
+        identifier="official/example",
+        request_id="install-before-rollback",
+        targets=["server"],
+        db_path=db,
+    )
+    claimed = managed_installations._claim_target(db, now=time.time(), lease_seconds=30)
+    assert claimed
+    receipt = managed_installations._finalize_installation_detail(claimed, {
+        "installed": True,
+        "kind": "skill",
+        "installed_name": "example",
+        "proof_schema": 1,
+        "proof_source": "local_filesystem",
+        "resolved_version": "1.0.0",
+        "content_hash": "f" * 64,
+    })
+    assert managed_installations._finish_target(
+        db, claimed, state="completed", detail=receipt
+    )
+    managed_installations._release_execution_fence(claimed)
+    assert get_managed_installation(
+        installation["id"], db_path=db
+    )["aggregate_state"] == "verified"
+
+    monkeypatch.setattr(
+        managed_installations,
+        "require_managed_installation_topology",
+        lambda *_args, **_kwargs: None,
+    )
+    rollback = managed_installations.rollback_managed_installation(
+        installation["id"],
+        request_id="rollback-example",
+        db_path=db,
+    )
+    calls = []
+
+    def executor(command, *, timeout):
+        calls.append(command)
+        return subprocess.CompletedProcess(command, 0, stdout="removed\n", stderr="")
+
+    assert dispatch_managed_installations_once(db_path=db, executor=executor)
+    current = get_managed_installation(rollback["id"], db_path=db)
+    assert current["state"] == "rolled_back"
+    assert current["aggregate_state"] == "rolled_back"
+    assert calls[0][-4:] == ["skills", "uninstall", "example", "--yes"]
+    resource = managed_installations.list_managed_resources(db_path=db)["resources"][0]
+    assert resource["aggregate_state"] == "rolled_back"
+    assert resource["enabled"] is False
+    assert resource["loaded_nodes"] == []
+    assert resource["rollback_available"] is False
+
+
+def test_partial_rollback_fails_closed_without_claiming_every_node_was_removed(
+    tmp_path, monkeypatch,
+):
+    db = tmp_path / "partial-rollback.db"
+    installation = create_managed_installation(
+        kind="skill",
+        identifier="official/example",
+        request_id="install-two-nodes",
+        targets=["server", "dbb3"],
+        db_path=db,
+    )
+    for node_id in ("server", "dbb3"):
+        claimed = managed_installations._claim_target(
+            db, now=time.time() + 10_000, lease_seconds=30
+        )
+        assert claimed and claimed["node_id"] == node_id
+        receipt = managed_installations._finalize_installation_detail(claimed, {
+            "installed": True,
+            "kind": "skill",
+            "installed_name": "example",
+            "proof_schema": 1,
+            "proof_source": "local_filesystem",
+            "resolved_version": "1.0.0",
+            "content_hash": "f" * 64,
+        })
+        assert managed_installations._finish_target(
+            db, claimed, state="completed", detail=receipt
+        )
+        managed_installations._release_execution_fence(claimed)
+    monkeypatch.setattr(
+        managed_installations,
+        "require_managed_installation_topology",
+        lambda *_args, **_kwargs: None,
+    )
+    rollback = managed_installations.rollback_managed_installation(
+        installation["id"], db_path=db
+    )
+    first = managed_installations._claim_target(db, now=time.time() + 20_000)
+    assert first and first["node_id"] == "server"
+    assert managed_installations._finish_target(
+        db,
+        first,
+        state="completed",
+        detail={"rollback_receipt_schema": 1, "removed": True},
+    )
+    managed_installations._release_execution_fence(first)
+    second = managed_installations._claim_target(db, now=time.time() + 20_000)
+    assert second and second["node_id"] == "dbb3"
+    assert managed_installations._finish_target(
+        db, second, state="failed", error="node offline"
+    )
+    managed_installations._release_execution_fence(second)
+
+    current = get_managed_installation(rollback["id"], db_path=db)
+    assert current["aggregate_state"] == "partial"
+    resource = managed_installations.list_managed_resources(db_path=db)["resources"][0]
+    assert resource["aggregate_state"] == "partial"
+    assert resource["loaded_nodes"] == ["dbb3"]
+    assert resource["enabled"] is False

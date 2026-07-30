@@ -86,6 +86,54 @@ def staged(store):
     )
 
 
+def test_old_generation_cleanup_preserves_replacement_approvals(
+    tmp_path,
+    monkeypatch,
+):
+    from hermes_cli.dashboard_auth import mobile_device_store
+
+    monkeypatch.setattr(
+        mobile_device_store,
+        "mobile_auth_db_path",
+        lambda: tmp_path / "mobile-auth.db",
+    )
+    mobile = mobile_device_store.MobileDeviceStore()
+    old_generation = mobile.account_generation("owner-1", create=True)
+    approvals = AccountWriteApprovalStore(tmp_path / "write-approvals.db")
+    approvals.stage(
+        owner_id="owner-1",
+        profile="default",
+        subsystem="memory",
+        payload={"action": "add", "content": "old"},
+        summary="old",
+        origin="foreground",
+        approval_id="old-approval",
+    )
+    mobile.begin_account_deletion("owner-1", "owner-scope", old_generation)
+    new_generation = mobile.activate_account_generation(
+        "owner-1",
+        replace_deleting=True,
+    )
+    approvals.stage(
+        owner_id="owner-1",
+        profile="default",
+        subsystem="memory",
+        payload={"action": "add", "content": "new"},
+        summary="new",
+        origin="foreground",
+        approval_id="new-approval",
+    )
+
+    approvals.delete_owner(
+        "owner-1",
+        account_generation=old_generation,
+    )
+
+    current = approvals.list(owner_id="owner-1", profile="default")
+    assert [item["id"] for item in current] == ["new-approval"]
+    assert current[0]["account_generation"] == new_generation
+
+
 class TestPayloadDigestBinding:
     def test_records_expose_a_payload_digest(self, staged):
         assert staged["payload_digest"]

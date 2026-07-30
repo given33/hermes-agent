@@ -1,7 +1,11 @@
 from __future__ import annotations
 
 import hashlib
+import multiprocessing
+import os
 from pathlib import Path
+import sqlite3
+import threading
 from types import SimpleNamespace
 
 import pytest
@@ -19,6 +23,42 @@ def _write(path: Path, content: bytes) -> Path:
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_bytes(content)
     return path
+
+
+def _multiprocess_ingest_worker(root, source, barrier, results):
+    try:
+        barrier.wait(timeout=20)
+        record = CloudFileLibrary(root).ingest_file(
+            "account-a",
+            source,
+            account_generation="generation-a",
+            source="user_upload",
+            origin_key="account-upload:shared-upload-id",
+        )
+        results.put(("ok", record["id"], record["sha256"]))
+    except (FileExistsError, BlockingIOError) as exc:
+        results.put(("conflict", type(exc).__name__, str(exc)))
+    except BaseException as exc:
+        results.put(("error", type(exc).__name__, str(exc)))
+
+
+def _crash_after_replace_worker(root, source):
+    import hermes_cli.cloud_file_library as cloud_files
+
+    original_replace = cloud_files.os.replace
+
+    def replace_then_exit(source_path, target_path):
+        original_replace(source_path, target_path)
+        os._exit(77)
+
+    cloud_files.os.replace = replace_then_exit
+    CloudFileLibrary(root).ingest_file(
+        "account-a",
+        source,
+        account_generation="generation-a",
+        source="user_upload",
+        origin_key="account-upload:crash-upload-id",
+    )
 
 
 def test_ingest_is_durable_and_records_delivery_metadata(tmp_path):
@@ -92,6 +132,119 @@ def test_owner_scope_applies_to_read_list_download_and_delete(tmp_path):
     assert library.delete_file("account-a", record["id"]) is False
 
 
+def test_generation_scope_fences_reused_owner_and_late_writers(tmp_path):
+    library = CloudFileLibrary(tmp_path / "cloud")
+    old = library.ingest_file(
+        "account-a",
+        _write(tmp_path / "old.txt", b"old-generation"),
+        account_generation="generation-old",
+        source="user_upload",
+        origin_key="upload-1",
+    )
+    new = library.ingest_file(
+        "account-a",
+        _write(tmp_path / "new.txt", b"new-generation"),
+        account_generation="generation-new",
+        source="user_upload",
+        origin_key="upload-1",
+    )
+
+    assert old["id"] != new["id"]
+    assert old["stored_relpath"].split("/")[1] != new["stored_relpath"].split("/")[1]
+    assert library.get_file(
+        "account-a", old["id"], account_generation="generation-new"
+    ) is None
+    assert library.list_files(
+        "account-a", account_generation="generation-new"
+    )[0] == [new]
+
+    assert library.delete_owner(
+        "account-a", account_generation="generation-old"
+    )["files"] == 1
+    assert library.resolve_download(
+        "account-a", new["id"], account_generation="generation-new"
+    )[1].read_bytes() == b"new-generation"
+    with pytest.raises(PermissionError, match="deleted"):
+        library.ingest_file(
+            "account-a",
+            _write(tmp_path / "late.txt", b"late-old-writer"),
+            account_generation="generation-old",
+            source="model_output",
+        )
+
+
+def test_v3_schema_migration_fences_existing_rows_into_legacy_generation(tmp_path):
+    root = tmp_path / "cloud"
+    root.mkdir()
+    with sqlite3.connect(root / "library.sqlite3") as conn:
+        conn.executescript(
+            """
+            CREATE TABLE account_files (
+                id TEXT PRIMARY KEY,
+                owner_id TEXT NOT NULL,
+                name TEXT NOT NULL,
+                stored_relpath TEXT NOT NULL DEFAULT '',
+                sha256 TEXT NOT NULL DEFAULT '',
+                mime_type TEXT NOT NULL DEFAULT 'application/octet-stream',
+                extension TEXT NOT NULL DEFAULT '',
+                file_type TEXT NOT NULL DEFAULT 'other',
+                size INTEGER NOT NULL DEFAULT 0,
+                source TEXT NOT NULL,
+                status TEXT NOT NULL,
+                conversation_id TEXT NOT NULL DEFAULT '',
+                message_id TEXT NOT NULL DEFAULT '',
+                turn_id TEXT NOT NULL DEFAULT '',
+                profile TEXT NOT NULL DEFAULT '',
+                origin_key TEXT NOT NULL DEFAULT '',
+                error TEXT NOT NULL DEFAULT '',
+                created_at INTEGER NOT NULL,
+                updated_at INTEGER NOT NULL,
+                available_at INTEGER
+            );
+            CREATE UNIQUE INDEX idx_account_files_owner_origin
+                ON account_files(owner_id, origin_key) WHERE origin_key <> '';
+            CREATE TABLE deleted_file_origins (
+                owner_id TEXT NOT NULL,
+                origin_key TEXT NOT NULL,
+                sha256 TEXT NOT NULL DEFAULT '',
+                deleted_at INTEGER NOT NULL,
+                PRIMARY KEY(owner_id, origin_key)
+            );
+            CREATE TABLE deleted_file_owners (
+                owner_id TEXT PRIMARY KEY,
+                deleted_at INTEGER NOT NULL
+            );
+            CREATE TABLE file_install_intents (
+                id TEXT PRIMARY KEY,
+                owner_id TEXT NOT NULL,
+                file_id TEXT NOT NULL,
+                target_relpath TEXT NOT NULL,
+                expected_sha256 TEXT NOT NULL,
+                created_at INTEGER NOT NULL
+            );
+            INSERT INTO account_files (
+                id, owner_id, name, source, status, origin_key,
+                created_at, updated_at, available_at
+            ) VALUES (
+                'legacy-file', 'recycled-owner', 'old.txt', 'user_upload',
+                'available', 'upload-1', 1, 1, 1
+            );
+            PRAGMA user_version=3;
+            """
+        )
+
+    library = CloudFileLibrary(root)
+    legacy_files, legacy_total = library.list_files("recycled-owner")
+
+    assert legacy_total == 1
+    assert legacy_files[0]["account_generation"] == "legacy"
+    assert library.list_files(
+        "recycled-owner", account_generation="generation-new"
+    ) == ([], 0)
+    with sqlite3.connect(root / "library.sqlite3") as conn:
+        assert conn.execute("PRAGMA user_version").fetchone()[0] == 5
+
+
 def test_same_origin_same_bytes_is_strictly_idempotent_across_filename_changes(tmp_path):
     library = CloudFileLibrary(tmp_path / "cloud")
     old_source = _write(tmp_path / "old.bin", b"stable-artifact")
@@ -128,6 +281,170 @@ def test_same_origin_same_bytes_is_strictly_idempotent_across_filename_changes(t
     assert persisted_path == original_path
     assert persisted_path.read_bytes() == b"stable-artifact"
     assert not list(library.root.rglob("new.bin"))
+
+
+@pytest.mark.parametrize(
+    ("second_bytes", "expected_statuses"),
+    [
+        (b"same bytes", ["ok", "ok"]),
+        (b"different bytes", ["conflict", "ok"]),
+    ],
+)
+def test_upload_reservation_is_idempotent_across_processes(
+    tmp_path,
+    second_bytes,
+    expected_statuses,
+):
+    ctx = multiprocessing.get_context("spawn")
+    root = tmp_path / "cloud"
+    first = _write(tmp_path / "first.bin", b"same bytes")
+    second = _write(tmp_path / "second.bin", second_bytes)
+    barrier = ctx.Barrier(2)
+    results = ctx.Queue()
+    workers = [
+        ctx.Process(
+            target=_multiprocess_ingest_worker,
+            args=(root, source, barrier, results),
+        )
+        for source in (first, second)
+    ]
+
+    for worker in workers:
+        worker.start()
+    for worker in workers:
+        worker.join(timeout=30)
+        assert worker.exitcode == 0
+
+    outcomes = [results.get(timeout=5) for _ in workers]
+    assert sorted(item[0] for item in outcomes) == expected_statuses
+    assert not [item for item in outcomes if item[0] == "error"]
+    successful_ids = {item[1] for item in outcomes if item[0] == "ok"}
+    assert len(successful_ids) == 1
+    files, total = CloudFileLibrary(root).list_files(
+        "account-a",
+        account_generation="generation-a",
+    )
+    assert total == 1
+    assert files[0]["id"] in successful_ids
+
+
+def test_expired_crash_reservation_reclaims_without_stale_intent_deleting_publish(
+    tmp_path,
+):
+    ctx = multiprocessing.get_context("spawn")
+    root = tmp_path / "cloud"
+    source = _write(tmp_path / "crash.bin", b"crash-safe bytes")
+    worker = ctx.Process(target=_crash_after_replace_worker, args=(root, source))
+    worker.start()
+    worker.join(timeout=30)
+    assert worker.exitcode == 77
+
+    with sqlite3.connect(root / "library.sqlite3") as conn:
+        old_token = conn.execute(
+            "SELECT reservation_token FROM file_upload_reservations"
+        ).fetchone()[0]
+        conn.execute("UPDATE file_upload_reservations SET lease_expires_at=0")
+
+    recovered = CloudFileLibrary(root).ingest_file(
+        "account-a",
+        source,
+        account_generation="generation-a",
+        source="user_upload",
+        origin_key="account-upload:crash-upload-id",
+    )
+    downloaded = CloudFileLibrary(root).resolve_download(
+        "account-a",
+        recovered["id"],
+        account_generation="generation-a",
+    )[1]
+    assert downloaded.read_bytes() == b"crash-safe bytes"
+
+    with sqlite3.connect(root / "library.sqlite3") as conn:
+        current_token = conn.execute(
+            "SELECT reservation_token FROM file_upload_reservations"
+        ).fetchone()[0]
+        assert current_token != old_token
+        conn.execute("UPDATE file_install_intents SET created_at=0")
+
+    reopened = CloudFileLibrary(root, clock_ms=lambda: 10**12)
+    record, path = reopened.resolve_download(
+        "account-a",
+        recovered["id"],
+        account_generation="generation-a",
+    )
+    assert record["sha256"] == hashlib.sha256(b"crash-safe bytes").hexdigest()
+    assert path.read_bytes() == b"crash-safe bytes"
+    with sqlite3.connect(root / "library.sqlite3") as conn:
+        assert conn.execute("SELECT COUNT(*) FROM file_install_intents").fetchone()[0] == 0
+        assert conn.execute("SELECT state FROM file_upload_reservations").fetchone()[0] == "completed"
+    assert not list(root.rglob(".upload-*"))
+
+
+def test_delete_and_upload_interleave_without_orphan_or_cross_generation_file(
+    tmp_path,
+    monkeypatch,
+):
+    root = tmp_path / "cloud"
+    source = _write(tmp_path / "interleave.bin", b"interleave")
+    deleting = CloudFileLibrary(root)
+    original = deleting.ingest_file(
+        "account-a",
+        source,
+        account_generation="generation-a",
+        source="user_upload",
+        origin_key="account-upload:delete-race-id",
+    )
+    removal_started = threading.Event()
+    allow_removal = threading.Event()
+    original_remove = deleting._remove_object_path
+
+    def paused_remove(relative):
+        removal_started.set()
+        assert allow_removal.wait(timeout=10)
+        original_remove(relative)
+
+    monkeypatch.setattr(deleting, "_remove_object_path", paused_remove)
+    delete_result = []
+    upload_result = []
+    delete_thread = threading.Thread(
+        target=lambda: delete_result.append(
+            deleting.delete_file(
+                "account-a",
+                original["id"],
+                account_generation="generation-a",
+            )
+        )
+    )
+    upload_thread = threading.Thread(
+        target=lambda: upload_result.append(
+            CloudFileLibrary(root).ingest_file(
+                "account-a",
+                source,
+                account_generation="generation-a",
+                source="user_upload",
+                origin_key="account-upload:delete-race-id",
+            )
+        )
+    )
+
+    delete_thread.start()
+    assert removal_started.wait(timeout=10)
+    upload_thread.start()
+    assert upload_thread.is_alive()
+    allow_removal.set()
+    delete_thread.join(timeout=10)
+    upload_thread.join(timeout=10)
+
+    assert delete_result == [True]
+    assert len(upload_result) == 1
+    assert upload_result[0]["id"] != original["id"]
+    files, total = CloudFileLibrary(root).list_files(
+        "account-a",
+        account_generation="generation-a",
+    )
+    assert total == 1
+    assert files[0]["id"] == upload_result[0]["id"]
+    assert not list(root.rglob(f"*/{original['id']}/*"))
 
 
 def test_delete_owner_removes_index_tombstones_and_objects_without_touching_peers(tmp_path):

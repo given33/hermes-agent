@@ -30,7 +30,7 @@ import sys
 import time
 from dataclasses import dataclass
 from pathlib import Path, PurePosixPath, PureWindowsPath
-from typing import List, Optional, Tuple
+from typing import Any, List, Optional, Tuple
 
 from hermes_runtime.skill_utils import is_excluded_skill_path
 from hermes_runtime.config import read_raw_config
@@ -134,12 +134,27 @@ _CLONE_ALL_HISTORY_EXCLUDE_ROOT: frozenset[str] = frozenset({
 # `hermes skills install` or drop SKILL.md files into the profile's skills/.
 # Delete the marker file to opt back in.
 NO_BUNDLED_SKILLS_MARKER = ".no-bundled-skills"
+MANAGED_INTERNAL_PROFILE_MARKER = ".managed-owner-boundary.json"
 
 
 def has_bundled_skills_opt_out(profile_dir: Path) -> bool:
     """Return True if the profile opted out of bundled-skill seeding."""
     try:
         return (profile_dir / NO_BUNDLED_SKILLS_MARKER).exists()
+    except OSError:
+        return False
+
+
+def _is_managed_internal_profile(profile_dir: Path) -> bool:
+    """Return True for account overlays that must stay out of public profile UI."""
+
+    try:
+        marker = profile_dir / MANAGED_INTERNAL_PROFILE_MARKER
+        return (
+            profile_dir.name.startswith("acct-")
+            and marker.is_file()
+            and not marker.is_symlink()
+        )
     except OSError:
         return False
 
@@ -1006,6 +1021,8 @@ def list_profiles() -> List[ProfileInfo]:
         for entry in sorted(profiles_root.iterdir()):
             if not entry.is_dir():
                 continue
+            if _is_managed_internal_profile(entry):
+                continue
             name = entry.name
             if name == "default":
                 continue  # already added as the built-in default above
@@ -1071,6 +1088,8 @@ def profiles_to_serve(multiplex: bool) -> List[Tuple[str, Path]]:
     if profiles_root.is_dir():
         for entry in sorted(profiles_root.iterdir()):
             if not entry.is_dir():
+                continue
+            if _is_managed_internal_profile(entry):
                 continue
             name = entry.name
             if name == "default":
@@ -1983,6 +2002,206 @@ def _default_export_ignore(root_dir: Path):
     return _ignore
 
 
+_PROFILE_SECRET_KEYS = frozenset({
+    "api_key",
+    "apikey",
+    "access_token",
+    "refresh_token",
+    "auth_token",
+    "session_token",
+    "token",
+    "password",
+    "passwd",
+    "secret",
+    "private_key",
+    "client_secret",
+})
+_PROFILE_CREDENTIAL_KEYS = frozenset({
+    "credential",
+    "credentials",
+    "credential_ref",
+    "credential_reference",
+})
+_PROFILE_INLINE_SECRET_RE = re.compile(
+    r"(?im)(\b(?:api[_ -]?key|access[_ -]?token|refresh[_ -]?token|"
+    r"auth[_ -]?token|session[_ -]?token|password|passwd|secret|"
+    r"client[_ -]?secret)\b\s*[:=]\s*)([^\s,;]+)"
+)
+_PROFILE_BEARER_RE = re.compile(r"(?i)(\bBearer\s+)[A-Za-z0-9._~+/=-]{8,}")
+_PROFILE_STRUCTURED_SUFFIXES = frozenset({".json", ".yaml", ".yml"})
+_PROFILE_TEXT_SUFFIXES = frozenset({
+    "", ".conf", ".ini", ".json", ".md", ".toml", ".txt", ".yaml", ".yml",
+})
+
+
+def _profile_secret_key(key: Any, *, credential_context: bool = False) -> bool:
+    normalized = re.sub(r"[^a-z0-9]+", "_", str(key).strip().lower()).strip("_")
+    if normalized == "credentials_configured":
+        return False
+    if normalized in _PROFILE_SECRET_KEYS or normalized.endswith("_api_key"):
+        return True
+    return credential_context and normalized in {"value", "ref", "reference"}
+
+
+def _credential_summary(value: Any) -> dict[str, Any]:
+    provider = ""
+    configured = False
+    if isinstance(value, dict):
+        provider = str(
+            value.get("provider") or value.get("name") or value.get("type") or ""
+        ).strip()
+        configured = bool(value.get("configured")) or any(
+            _profile_secret_key(key, credential_context=True) and bool(item)
+            for key, item in value.items()
+        )
+    else:
+        configured = bool(value)
+    summary: dict[str, Any] = {"configured": configured}
+    if provider:
+        summary["provider"] = provider
+    return summary
+
+
+def _redact_profile_export_value(value: Any) -> tuple[Any, int]:
+    if isinstance(value, dict):
+        result: dict[str, Any] = {}
+        removed = 0
+        credentials_configured = False
+        for key, item in value.items():
+            normalized = re.sub(
+                r"[^a-z0-9]+", "_", str(key).strip().lower()
+            ).strip("_")
+            if normalized in _PROFILE_CREDENTIAL_KEYS:
+                if isinstance(item, list):
+                    result[str(key)] = [_credential_summary(entry) for entry in item]
+                else:
+                    result[str(key)] = _credential_summary(item)
+                removed += 1
+                continue
+            if _profile_secret_key(key):
+                credentials_configured = credentials_configured or bool(item)
+                removed += 1
+                continue
+            clean, count = _redact_profile_export_value(item)
+            result[str(key)] = clean
+            removed += count
+        if credentials_configured:
+            result["credentials_configured"] = True
+        return result, removed
+    if isinstance(value, list):
+        clean_list = []
+        removed = 0
+        for item in value:
+            clean, count = _redact_profile_export_value(item)
+            clean_list.append(clean)
+            removed += count
+        return clean_list, removed
+    return value, 0
+
+
+def _scan_profile_export_value(value: Any, path: str = "$") -> list[str]:
+    findings: list[str] = []
+    if isinstance(value, dict):
+        for key, item in value.items():
+            child = f"{path}.{key}"
+            if _profile_secret_key(key):
+                findings.append(child)
+            findings.extend(_scan_profile_export_value(item, child))
+    elif isinstance(value, list):
+        for index, item in enumerate(value):
+            findings.extend(_scan_profile_export_value(item, f"{path}[{index}]"))
+    elif isinstance(value, str):
+        if _PROFILE_INLINE_SECRET_RE.search(value) or _PROFILE_BEARER_RE.search(value):
+            findings.append(path)
+    return findings
+
+
+def _sanitize_profile_export_tree(staged: Path) -> dict[str, int]:
+    scanned = 0
+    redactions = 0
+    residual: list[str] = []
+    for path in staged.rglob("*"):
+        if path.is_symlink() or not path.is_file() or path.suffix.lower() not in _PROFILE_TEXT_SUFFIXES:
+            continue
+        if path.stat().st_size > 16 * 1024 * 1024:
+            continue
+        scanned += 1
+        try:
+            text = path.read_text(encoding="utf-8")
+        except UnicodeDecodeError:
+            continue
+        parsed: Any = None
+        structured = path.suffix.lower() in _PROFILE_STRUCTURED_SUFFIXES
+        if structured:
+            try:
+                if path.suffix.lower() == ".json":
+                    parsed = json.loads(text)
+                else:
+                    import yaml
+
+                    parsed = yaml.safe_load(text)
+            except Exception:
+                structured = False
+        if structured:
+            clean, count = _redact_profile_export_value(parsed)
+            redactions += count
+            if count:
+                if path.suffix.lower() == ".json":
+                    rendered = json.dumps(clean, ensure_ascii=False, indent=2) + "\n"
+                else:
+                    import yaml
+
+                    rendered = yaml.safe_dump(clean, sort_keys=False, allow_unicode=True)
+                path.write_text(rendered, encoding="utf-8")
+            residual.extend(
+                f"{path.relative_to(staged).as_posix()}:{item}"
+                for item in _scan_profile_export_value(clean)
+            )
+        else:
+            clean, labelled = _PROFILE_INLINE_SECRET_RE.subn(r"\1[REDACTED]", text)
+            clean, bearer = _PROFILE_BEARER_RE.subn(r"\1[REDACTED]", clean)
+            redactions += labelled + bearer
+            if clean != text:
+                path.write_text(clean, encoding="utf-8")
+            if _PROFILE_INLINE_SECRET_RE.search(clean) or _PROFILE_BEARER_RE.search(clean):
+                residual.append(path.relative_to(staged).as_posix())
+    if residual:
+        raise RuntimeError(
+            "Profile export secret scanner blocked residual credential fields: "
+            + ", ".join(residual[:10])
+        )
+    return {"files_scanned": scanned, "redactions": redactions, "findings": 0}
+
+
+def _record_profile_export_audit(
+    profile: str,
+    output: Path,
+    scan: dict[str, int],
+    *,
+    status: str,
+) -> None:
+    audit = _get_profiles_root().parent / "audit" / "profile-exports.jsonl"
+    audit.parent.mkdir(parents=True, exist_ok=True)
+    record = {
+        "event": "profile.export",
+        "profile": profile,
+        "archive_name": output.name,
+        "status": status,
+        "files_scanned": int(scan.get("files_scanned") or 0),
+        "redactions": int(scan.get("redactions") or 0),
+        "findings": int(scan.get("findings") or 0),
+        "created_at": int(time.time()),
+    }
+    with audit.open("a", encoding="utf-8") as handle:
+        handle.write(json.dumps(record, ensure_ascii=False, separators=(",", ":")) + "\n")
+        handle.flush()
+        os.fsync(handle.fileno())
+    try:
+        audit.chmod(stat.S_IRUSR | stat.S_IWUSR)
+    except OSError:
+        pass
+
+
 def export_profile(name: str, output_path: str) -> Path:
     """Export a profile to a tar.gz archive.
 
@@ -2012,7 +2231,20 @@ def export_profile(name: str, output_path: str) -> Path:
                 symlinks=True,
                 ignore=_default_export_ignore(profile_dir),
             )
+            try:
+                scan = _sanitize_profile_export_tree(staged)
+            except Exception:
+                _record_profile_export_audit(
+                    canon,
+                    output,
+                    {"files_scanned": 0, "redactions": 0, "findings": 1},
+                    status="blocked",
+                )
+                raise
             result = shutil.make_archive(base, "gztar", tmpdir, "default")
+            _record_profile_export_audit(
+                canon, Path(result), scan, status="completed"
+            )
             return Path(result)
 
     # Named profiles — stage a filtered copy to exclude credentials
@@ -2025,7 +2257,18 @@ def export_profile(name: str, output_path: str) -> Path:
             symlinks=True,
             ignore=lambda d, contents: _CREDENTIAL_FILES & set(contents),
         )
+        try:
+            scan = _sanitize_profile_export_tree(staged)
+        except Exception:
+            _record_profile_export_audit(
+                canon,
+                output,
+                {"files_scanned": 0, "redactions": 0, "findings": 1},
+                status="blocked",
+            )
+            raise
         result = shutil.make_archive(base, "gztar", tmpdir, canon)
+        _record_profile_export_audit(canon, Path(result), scan, status="completed")
         return Path(result)
 
 

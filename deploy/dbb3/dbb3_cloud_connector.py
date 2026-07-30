@@ -31,8 +31,9 @@ from typing import Any, Callable, Iterable
 
 CONTRACT_VERSION = 2
 MAX_ARTIFACT_BYTES = 64 * 1024 * 1024
-TERMINAL_STATUSES = {"completed", "failed", "cancelled"}
+TERMINAL_STATUSES = {"completed", "failed", "cancelled", "timed_out"}
 _SAFE_NAME_RE = re.compile(r"[^A-Za-z0-9._-]+")
+_PROFILE_NAME_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,127}")
 _SESSION_ID_RE = re.compile(r"\b\d{8}_\d{6}_[a-z0-9]+\b", re.IGNORECASE)
 _SESSION_REFRESH_SECONDS = 5.0
 _DEFAULT_CANCEL_COMMAND = "hermes kanban block {root_id} {reason}"
@@ -317,6 +318,16 @@ class CloudRelayClient:
     def fail_run(self, remote_run_id: str, payload: dict[str, Any]) -> dict[str, Any]:
         encoded = urllib.parse.quote(_text(remote_run_id, 256), safe="")
         return self._request(f"/connector/runs/{encoded}/fail", method="POST", payload=payload)
+
+    def get_run(self, remote_run_id: str) -> dict[str, Any]:
+        """Read the authoritative run after a conflicting terminal update."""
+
+        encoded = urllib.parse.quote(_text(remote_run_id, 256), safe="")
+        result = self._request(f"/connector/runs/{encoded}")
+        run = result.get("run") if isinstance(result, dict) else None
+        if not isinstance(run, dict):
+            raise ConnectorContractError(502, "connector run snapshot is invalid")
+        return run
 
     def pull_cancellations(self, limit: int = 5, lease_seconds: int = 90) -> list[dict[str, Any]]:
         result = self._request(
@@ -1035,6 +1046,42 @@ def _session_record_activities(
     return activities[-200:]
 
 
+def _execution_profile_for_run(run_payload: dict[str, Any]) -> str:
+    """Resolve a private account overlay without changing the public profile."""
+
+    logical_profile = _text(run_payload.get("profile"), 128) or "default"
+    owner_id = _text(run_payload.get("owner_id"), 256)
+    account_generation = _text(run_payload.get("account_generation"), 256)
+    if not owner_id or owner_id in {"server-admin", "local-owner"}:
+        return logical_profile
+    if not account_generation:
+        raise RuntimeError("Cloud run is missing its account generation boundary")
+    try:
+        from hermes_cli.managed_installations import managed_account_runtime_home
+
+        profile_home = managed_account_runtime_home(
+            owner_id,
+            account_generation,
+            logical_profile,
+        )
+    except PermissionError as exc:
+        raise RuntimeError("Cloud run account generation is deleted") from exc
+    except (OSError, RuntimeError, ValueError) as exc:
+        raise RuntimeError("Cloud run account overlay is unavailable") from exc
+    internal_profile = profile_home.name
+    if not _PROFILE_NAME_RE.fullmatch(internal_profile):
+        raise RuntimeError("Cloud run account overlay profile is invalid")
+    return internal_profile
+
+
+def _profiled_hermes_command(profile: str, *arguments: str) -> list[str]:
+    command = ["hermes"]
+    if profile:
+        command.extend(["-p", profile])
+    command.extend(arguments)
+    return command
+
+
 def build_root_task_command(run_payload: dict[str, Any]) -> list[str]:
     objective = _text(run_payload.get("objective"), 12000)
     title = _text(run_payload.get("title"), 120) or next(
@@ -1042,19 +1089,20 @@ def build_root_task_command(run_payload: dict[str, Any]) -> list[str]:
         "云端任务",
     )
     profile = _text(run_payload.get("profile"), 128) or "default"
+    execution_profile = _text(run_payload.get("execution_profile"), 128) or profile
     idempotency = _text(run_payload.get("idempotency_key"), 512)
     body = objective + "\n\nCloud hosted run: " + _text(run_payload.get("remote_run_id"), 256)
     workspace_path = _text(run_payload.get("workspace_path"), 2048)
     workspace = f"dir:{workspace_path}" if workspace_path else "scratch"
-    command = [
-        "hermes",
+    command = _profiled_hermes_command(
+        execution_profile if execution_profile != profile else "",
         "kanban",
         "create",
         title,
         "--body",
         body,
         "--assignee",
-        profile,
+        execution_profile,
         "--triage",
         "--workspace",
         workspace,
@@ -1063,7 +1111,7 @@ def build_root_task_command(run_payload: dict[str, Any]) -> list[str]:
         "--idempotency-key",
         idempotency,
         "--json",
-    ]
+    )
     max_runtime = run_payload.get("max_runtime_seconds")
     try:
         if max_runtime:
@@ -1106,13 +1154,19 @@ class DBB3CloudConnector:
         if private_artifact_root not in self.artifact_roots:
             self.artifact_roots.append(private_artifact_root)
         self._session_cache: dict[str, dict[str, Any]] = {}
+        self._boundary_validated_runs: set[str] = set()
         self.cancel_command = (
             str(cancel_command or "").strip()
             or os.environ.get("HERMES_CONNECTOR_CANCEL_COMMAND", "").strip()
             or _DEFAULT_CANCEL_COMMAND
         )
 
-    def _build_cancel_command(self, root_id: str, reason: str) -> list[str]:
+    def _build_cancel_command(
+        self,
+        root_id: str,
+        reason: str,
+        execution_profile: str = "",
+    ) -> list[str]:
         try:
             template = shlex.split(self.cancel_command)
         except ValueError as exc:
@@ -1125,6 +1179,13 @@ class DBB3CloudConnector:
             item.replace("{root_id}", root_id).replace("{reason}", reason)
             for item in template
         ]
+        if (
+            execution_profile
+            and command[:1] == ["hermes"]
+            and "-p" not in command
+            and "--profile" not in command
+        ):
+            command[1:1] = ["-p", execution_profile]
         if not has_root_placeholder:
             command.append(root_id)
         if not has_reason_placeholder:
@@ -1191,9 +1252,16 @@ class DBB3CloudConnector:
         self.checkpoints.save(state)
         return paths
 
-    def _show_task(self, task_id: str) -> dict[str, Any]:
+    def _show_task(self, task_id: str, local: dict[str, Any]) -> dict[str, Any]:
+        execution_profile = _text(local.get("execution_profile"), 128)
         code, output = self.command_runner(
-            ["hermes", "kanban", "show", task_id, "--json"],
+            _profiled_hermes_command(
+                execution_profile,
+                "kanban",
+                "show",
+                task_id,
+                "--json",
+            ),
             timeout=10,
         )
         if code != 0:
@@ -1224,18 +1292,15 @@ class DBB3CloudConnector:
                 local["worker_session_id"] = session_id
                 return session_id
 
-        profile = _text(local.get("profile"), 128)
+        profile = _text(
+            local.get("execution_profile") or local.get("profile"),
+            128,
+        )
         task = detail.get("task") if isinstance(detail.get("task"), dict) else {}
         task_id = _text(local.get("root_task_id") or task.get("id"), 256)
         workspace = _text(task.get("workspace_path"), 2048)
         if (
-            profile not in {
-                "default",
-                "dbb3-manager",
-                "dbb3-worker",
-                "pc-worker",
-                "reviewer",
-            }
+            not _PROFILE_NAME_RE.fullmatch(profile)
             or not task_id
             or not workspace
         ):
@@ -1277,15 +1342,12 @@ class DBB3CloudConnector:
         terminal: bool,
     ) -> dict[str, Any]:
         session_id = self._discover_session_id(detail, local)
-        profile = _text(local.get("profile"), 128)
+        profile = _text(
+            local.get("execution_profile") or local.get("profile"),
+            128,
+        )
         remote_id = _text(local.get("remote_run_id"), 256)
-        if not session_id or profile not in {
-            "default",
-            "dbb3-manager",
-            "dbb3-worker",
-            "pc-worker",
-            "reviewer",
-        }:
+        if not session_id or not _PROFILE_NAME_RE.fullmatch(profile):
             return {}
         cached = self._session_cache.get(remote_id) or {}
         refreshed_at = float(cached.get("refreshed_at") or 0.0)
@@ -1360,6 +1422,135 @@ class DBB3CloudConnector:
             return _text(value.get("id") or (value.get("task") or {}).get("id"), 256)
         return ""
 
+    def _queue_terminal_failure(
+        self,
+        local: dict[str, Any],
+        state: dict[str, Any],
+        *,
+        error: str,
+        summary: str,
+    ) -> dict[str, Any]:
+        """Persist a cloud terminal report before sealing the local run."""
+
+        pending = local.get("pending_terminal_failure")
+        if not isinstance(pending, dict):
+            pending = {
+                "connector_id": self.cloud_client.connector_id,
+                "claim_token": _text(local.get("claim_token"), 256),
+                "checkpoint_cursor": int(local.get("checkpoint_cursor") or 0) + 1,
+                "error": _text(error, 1000),
+                "summary": _text(summary, 1000),
+                "observed_at": self.clock(),
+            }
+            local["pending_terminal_failure"] = pending
+        else:
+            pending["claim_token"] = _text(local.get("claim_token"), 256)
+            pending["error"] = _text(error, 1000)
+            pending["summary"] = _text(summary, 1000)
+        local["status"] = "terminal_pending"
+        local["terminal_target_status"] = "failed"
+        self.checkpoints.save(state)
+        return pending
+
+    def _flush_terminal_failure(
+        self,
+        remote_id: str,
+        local: dict[str, Any],
+        state: dict[str, Any],
+    ) -> bool:
+        """Retry one durable terminal report until the cloud acknowledges it."""
+
+        pending = local.get("pending_terminal_failure")
+        if not isinstance(pending, dict):
+            return False
+        pending["claim_token"] = _text(local.get("claim_token"), 256)
+        try:
+            response = self.cloud_client.fail_run(remote_id, pending)
+        except ConnectorContractError as exc:
+            if exc.status != 409:
+                raise
+            try:
+                response = {
+                    "applied": False,
+                    "run": self.cloud_client.get_run(remote_id),
+                }
+            except (CloudHTTPError, ConnectorContractError, OSError, urllib.error.URLError):
+                return False
+        except CloudHTTPError as exc:
+            if exc.status in {401, 409, 422}:
+                raise
+            return False
+        except (OSError, urllib.error.URLError):
+            return False
+
+        remote = response.get("run") if isinstance(response, dict) else None
+        remote_status = _text((remote or {}).get("status"), 64).lower()
+        if remote_status not in TERMINAL_STATUSES:
+            remote_claim = _text((remote or {}).get("claim_token"), 256)
+            if remote_claim and remote_claim != _text(local.get("claim_token"), 256):
+                local["claim_stale"] = True
+                local["status"] = "awaiting_claim"
+                self.checkpoints.save(state)
+            return False
+        local.update(
+            {
+                "status": remote_status or "failed",
+                "checkpoint_cursor": max(
+                    int(local.get("checkpoint_cursor") or 0),
+                    int(pending.get("checkpoint_cursor") or 0),
+                    int((remote or {}).get("checkpoint_cursor") or 0),
+                ),
+                "terminal_acked": True,
+            }
+        )
+        local.pop("claim_stale", None)
+        local.pop("pending_terminal_failure", None)
+        local.pop("terminal_target_status", None)
+        self.checkpoints.save(state)
+        return True
+
+    def _assert_local_account_boundary(
+        self,
+        local: dict[str, Any],
+        state: dict[str, Any],
+    ) -> None:
+        owner_id = _text(local.get("owner_id"), 256)
+        if not owner_id or owner_id in {"server-admin", "local-owner"}:
+            return
+        try:
+            resolved_profile = _execution_profile_for_run(local)
+        except RuntimeError:
+            reason = "Account generation is no longer active"
+            pending = self._queue_terminal_failure(
+                local,
+                state,
+                error=reason,
+                summary="Account deletion stopped the accepted Hermes run",
+            )
+            root_id = _text(local.get("root_task_id"), 256)
+            if root_id and not local.get("terminal_local_stopped"):
+                code, output = self.command_runner(
+                    self._build_cancel_command(
+                        root_id,
+                        reason,
+                        _text(local.get("execution_profile"), 128),
+                    ),
+                    timeout=30,
+                )
+                if code == 0:
+                    local["terminal_local_stopped"] = True
+                else:
+                    pending["error"] = _text(
+                        f"{reason}; local cancellation failed: {output}",
+                        1000,
+                    )
+                    local["terminal_stop_error"] = pending["error"]
+            local["error"] = reason
+            self.checkpoints.save(state)
+            raise
+        if resolved_profile != _text(local.get("execution_profile"), 128):
+            raise RuntimeError("Cloud run account overlay profile changed")
+
     def _write_objective_file(
         self,
         run_payload: dict[str, Any],
@@ -1393,11 +1584,36 @@ class DBB3CloudConnector:
         claim_token = _text(run_payload.get("claim_token"), 256)
         if not claim_token:
             raise RuntimeError("Cloud run is missing the contract-v2 claim token")
+        owner_id = _text(run_payload.get("owner_id"), 256)
+        account_generation = _text(run_payload.get("account_generation"), 256)
+        for key, incoming in (
+            ("owner_id", owner_id),
+            ("account_generation", account_generation),
+        ):
+            existing = _text(current.get(key), 256)
+            if existing and incoming != existing:
+                raise RuntimeError("Cloud run account boundary changed after acceptance")
+        if current.get("terminal_acked") and str(current.get("status") or "") in TERMINAL_STATUSES:
+            return current
+        if current.get("root_task_id"):
+            self._assert_local_account_boundary(current, state)
+            resolved_profile = _text(current.get("execution_profile"), 128)
+        else:
+            resolved_profile = _execution_profile_for_run(run_payload)
+        self._boundary_validated_runs.add(remote_id)
+        execution_profile = (
+            resolved_profile
+            if owner_id and owner_id not in {"server-admin", "local-owner"}
+            else ""
+        )
         current.update(
             {
                 "remote_run_id": remote_id,
                 "idempotency_key": _text(run_payload.get("idempotency_key"), 512),
                 "profile": _text(run_payload.get("profile"), 128),
+                "execution_profile": execution_profile,
+                "owner_id": owner_id,
+                "account_generation": account_generation,
                 "artifact_required": bool(run_payload.get("artifact_required")),
                 "claim_token": claim_token,
                 "status": current.get("status") or "running",
@@ -1408,10 +1624,14 @@ class DBB3CloudConnector:
             pending = current.get("pending_status")
             if isinstance(pending, dict):
                 pending["claim_token"] = claim_token
+            terminal_pending = current.get("pending_terminal_failure")
+            if isinstance(terminal_pending, dict):
+                terminal_pending["claim_token"] = claim_token
         if not current.get("root_task_id"):
             attachment_paths = self._materialize_attachments(run_payload, current, state)
             objective_path = self._write_objective_file(run_payload, current, state)
             prepared = dict(run_payload)
+            prepared["execution_profile"] = execution_profile
             prepared["title"] = "Hermes hosted run " + (
                 _text(run_payload.get("remote_run_id"), 64) or "task"
             )
@@ -1623,7 +1843,11 @@ class DBB3CloudConnector:
         local: dict[str, Any],
         state: dict[str, Any],
     ) -> tuple[int, int]:
-        detail = self._show_task(_text(local.get("root_task_id"), 256))
+        if remote_id in self._boundary_validated_runs:
+            self._boundary_validated_runs.discard(remote_id)
+        else:
+            self._assert_local_account_boundary(local, state)
+        detail = self._show_task(_text(local.get("root_task_id"), 256), local)
         payload, artifact_paths = self._compact_status(detail, local)
         if artifact_paths:
             local["artifact_paths"] = list(artifact_paths)
@@ -1741,6 +1965,8 @@ class DBB3CloudConnector:
         remote_id = _text(run_payload.get("remote_run_id"), 256)
         if not local or not remote_id:
             return 0, 0
+        if local.get("terminal_acked") and str(local.get("status") or "") in TERMINAL_STATUSES:
+            return 0, 0
         return self._sync_local_run(remote_id, local, state)
 
     def _process_cancellation(self, item: dict[str, Any], state: dict[str, Any]) -> int:
@@ -1753,7 +1979,11 @@ class DBB3CloudConnector:
         root_id = _text(item.get("root_task_id") or local.get("root_task_id"), 256)
         reason = _text(item.get("reason"), 500) or "Cancelled by cloud user"
         code, output = self.command_runner(
-            self._build_cancel_command(root_id, reason),
+            self._build_cancel_command(
+                root_id,
+                reason,
+                _text(local.get("execution_profile"), 128),
+            ),
             timeout=30,
         )
         if code != 0:
@@ -1826,27 +2056,38 @@ class DBB3CloudConnector:
                 # cycle so a temporary local `show` failure is retryable.
                 remote_id = _text(run_payload.get("remote_run_id"), 256)
                 local = state.setdefault("runs", {}).setdefault(remote_id, {})
-                if remote_id and not local.get("root_task_id"):
-                    cursor = int(local.get("checkpoint_cursor") or 0) + 1
-                    self.cloud_client.fail_run(
-                        remote_id,
-                        {
-                            "connector_id": self.cloud_client.connector_id,
-                            "claim_token": _text(local.get("claim_token"), 256),
-                            "checkpoint_cursor": cursor,
-                            "error": _text(exc, 1000),
-                            "summary": "DBB3 could not create the Kanban root",
-                            "observed_at": self.clock(),
-                        },
+                if remote_id:
+                    local.setdefault("remote_run_id", remote_id)
+                    local.setdefault(
+                        "claim_token",
+                        _text(run_payload.get("claim_token"), 256),
                     )
-                    local.update({"status": "failed", "checkpoint_cursor": cursor})
-                    self.checkpoints.save(state)
+                    local.setdefault("owner_id", _text(run_payload.get("owner_id"), 256))
+                    local.setdefault(
+                        "account_generation",
+                        _text(run_payload.get("account_generation"), 256),
+                    )
+                    if not isinstance(local.get("pending_terminal_failure"), dict):
+                        self._queue_terminal_failure(
+                            local,
+                            state,
+                            error=_text(exc, 1000),
+                            summary=(
+                                "DBB3 accepted the run but its account generation expired"
+                                if local.get("root_task_id")
+                                else "DBB3 could not create the Kanban root"
+                            ),
+                        )
+                    statuses += int(self._flush_terminal_failure(remote_id, local, state))
                 continue
             created += made
             artifacts += uploaded
             statuses += int(made > 0)
         for remote_id, local in list((state.get("runs") or {}).items()):
             if remote_id in processed or not isinstance(local, dict):
+                continue
+            if isinstance(local.get("pending_terminal_failure"), dict):
+                statuses += int(self._flush_terminal_failure(remote_id, local, state))
                 continue
             if not local.get("acked") or not local.get("root_task_id"):
                 continue

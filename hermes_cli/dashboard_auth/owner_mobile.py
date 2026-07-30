@@ -45,6 +45,7 @@ from hermes_cli.dashboard_auth.token_auth import (
     extract_bearer_token,
     register_optional_token_prefix,
 )
+from hermes_cli.account_lifecycle import account_lifecycle_commit_guard
 from plugins.dashboard_auth.basic import (
     BasicAuthProvider,
     _DEFAULT_TTL_SECONDS,
@@ -223,9 +224,18 @@ def reconcile_deleted_owner_credentials() -> dict[str, Any]:
     if not username:
         return {"disabled": False, "config_cleared": False}
     deleted = False
+    active_generation = ""
     mobile_error: Exception | None = None
     try:
-        deleted = _store().account_deletion_status(username) is not None
+        mobile_store = _store()
+        active_generation = mobile_store.account_generation(username, create=False)
+        deleted = (
+            mobile_store.account_deletion_status(
+                username,
+                active_generation,
+            )
+            is not None
+        )
     except Exception as exc:
         # The intelligence tombstone is the first durable deletion intent. It
         # must independently disable login even while mobile-auth.db is being
@@ -235,7 +245,14 @@ def reconcile_deleted_owner_credentials() -> dict[str, Any]:
         try:
             from hermes_cli.ios_intelligence import IOSIntelligenceStore
 
-            deleted = IOSIntelligenceStore().account_deletion_status(username) is not None
+            intelligence_deletion = IOSIntelligenceStore().account_deletion_status(
+                username
+            )
+            deleted = bool(
+                intelligence_deletion
+                and str(intelligence_deletion.get("account_generation") or "")
+                == active_generation
+            )
         except Exception:
             if mobile_error is not None:
                 raise mobile_error
@@ -430,6 +447,7 @@ def _token_response(tokens: MobileTokenPair) -> dict[str, Any]:
         "account": {
             "username": tokens.session.user_id,
             "display_name": tokens.session.user_id,
+            "account_generation": tokens.session.account_generation,
         },
     }
 
@@ -509,7 +527,12 @@ def mobile_register(request: Request, body: MobileRegisterBody):
         from hermes_runtime.config import load_config, save_config
 
         config = load_config()
-        deletion = _store().account_deletion_status(username)
+        mobile_store = _store()
+        active_generation = mobile_store.account_generation(username, create=False)
+        deletion = mobile_store.account_deletion_status(
+            username,
+            active_generation,
+        )
         try:
             from hermes_cli.ios_intelligence import IOSIntelligenceStore
 
@@ -519,38 +542,71 @@ def mobile_register(request: Request, body: MobileRegisterBody):
                 status_code=503,
                 detail="Account deletion boundary is temporarily unavailable",
             ) from exc
-        if deletion is not None or intelligence_deletion is not None:
-            deletion_state = str(
-                (deletion or intelligence_deletion or {}).get("state")
-                or (deletion or intelligence_deletion or {}).get("status")
-                or "pending"
+        if intelligence_deletion is not None:
+            intelligence_generation = str(
+                intelligence_deletion.get("account_generation") or ""
+            ).strip()
+            if not active_generation or intelligence_generation != active_generation:
+                raise HTTPException(
+                    status_code=409,
+                    detail="Account deletion generation cannot be verified",
+                )
+            if deletion is None:
+                try:
+                    deletion = mobile_store.begin_account_deletion(
+                        username,
+                        str(intelligence_deletion.get("owner_scope") or "").strip(),
+                        active_generation,
+                    )
+                except (PermissionError, ValueError) as exc:
+                    raise HTTPException(status_code=409, detail=str(exc)) from exc
+        with account_lifecycle_commit_guard():
+            if deletion is not None:
+                try:
+                    from hermes_cli.account_cleanup import (
+                        purge_owner_model_configuration,
+                    )
+
+                    model_cleanup = purge_owner_model_configuration(
+                        username,
+                        account_generation=active_generation,
+                    )
+                except Exception as exc:
+                    raise HTTPException(
+                        status_code=503,
+                        detail="Previous account model cleanup is incomplete",
+                    ) from exc
+                if model_cleanup.get("skipped_stale_generation"):
+                    raise HTTPException(
+                        status_code=409,
+                        detail="Account generation changed during registration",
+                    )
+            try:
+                mobile_store.activate_account_generation(
+                    username,
+                    replace_deleting=deletion is not None,
+                )
+            except PermissionError as exc:
+                raise HTTPException(status_code=409, detail=str(exc)) from exc
+
+            # The new password secret and account generation are committed
+            # under the same cross-process lifecycle boundary. Old cookies,
+            # mobile tokens and workers remain bound to the retained tombstone.
+            dashboard = config.setdefault("dashboard", {})
+            basic = dashboard.setdefault("basic_auth", {})
+            basic.update(
+                {
+                    "username": username,
+                    "password_hash": hash_password(password),
+                    "password": "",
+                    "secret": base64.b64encode(secrets.token_bytes(32)).decode("ascii"),
+                    "session_ttl_seconds": _DEFAULT_TTL_SECONDS,
+                    "disabled": False,
+                }
             )
-            if deletion_state not in {
-                "delivered", "no_recipients", "permanent_failure"
-            }:
-                raise HTTPException(status_code=409, detail="Account deletion is still pending")
-            # A terminal deletion is a permanent account-generation boundary.
-            # Reusing the same owner id would make late encrypted uploads from
-            # the old generation indistinguishable from the new account.
-            raise HTTPException(status_code=409, detail="The deleted account name is permanently retired")
-        # Do not mutate the configured account until all deletion-boundary
-        # checks have passed. A rejected re-registration must leave disabled
-        # owner credentials untouched.
-        dashboard = config.setdefault("dashboard", {})
-        basic = dashboard.setdefault("basic_auth", {})
-        basic.update(
-            {
-                "username": username,
-                "password_hash": hash_password(password),
-                "password": "",
-                "secret": base64.b64encode(secrets.token_bytes(32)).decode("ascii"),
-                "session_ttl_seconds": _DEFAULT_TTL_SECONDS,
-                "disabled": False,
-            }
-        )
-        existing = get_provider(BasicAuthProvider.name)
-        unregister_provider(BasicAuthProvider.name, expected=existing)
-        save_config(config)
+            existing = get_provider(BasicAuthProvider.name)
+            unregister_provider(BasicAuthProvider.name, expected=existing)
+            save_config(config)
         _discard_registration_code(email)
         provider = ensure_owner_provider()
         if provider is None:

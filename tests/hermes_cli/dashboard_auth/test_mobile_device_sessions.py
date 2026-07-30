@@ -44,12 +44,171 @@ def test_tokens_are_hashed_and_survive_store_reopen(tmp_path):
     session = reopened.verify_access(tokens.access_token, touch=False)
     assert session is not None
     assert session.device_id == "device-primary"
+    assert session.account_generation == tokens.session.account_generation
 
     provider = OwnerMobileTokenProvider(lambda: MobileDeviceStore(db_path))
     principal = provider.verify_token(token=tokens.access_token)
     assert principal is not None
     assert principal.principal == "owner"
     assert principal.provider == "owner-mobile"
+    assert principal.account_generation == reopened.account_generation(
+        "owner", create=False
+    )
+
+
+def test_old_mobile_tokens_cannot_cross_a_same_name_account_generation(tmp_path):
+    store = MobileDeviceStore(tmp_path / "mobile-auth.db")
+    old = store.create_session(
+        user_id="owner",
+        device=_device("device-old", "Old iPhone"),
+    )
+    old_generation = old.session.account_generation
+
+    store.begin_account_deletion("owner", "owner-scope")
+    with store.connection() as conn:
+        conn.execute(
+            "UPDATE mobile_account_deletion_outbox SET state='delivered' "
+            "WHERE user_id='owner'"
+        )
+        conn.commit()
+    assert store.clear_completed_account_deletion("owner") is True
+    replacement = store.create_session(
+        user_id="owner",
+        device=_device("device-new", "New iPhone"),
+    )
+    assert replacement.session.account_generation != old_generation
+
+    # Simulate incomplete cleanup resurrecting the old credential rows. The
+    # issuance generation still fences both access and refresh credentials.
+    with store.connection() as conn:
+        conn.execute(
+            "UPDATE mobile_devices SET revoked_at=NULL WHERE id='device-old'"
+        )
+        conn.execute(
+            "UPDATE mobile_sessions SET revoked_at=NULL WHERE id=?",
+            (old.session.session_id,),
+        )
+        conn.commit()
+
+    assert store.verify_access(old.access_token, touch=False) is None
+    assert store.rotate_refresh(old.refresh_token) is None
+    assert OwnerMobileTokenProvider(lambda: store).verify_token(
+        token=old.access_token
+    ) is None
+    assert store.verify_access(replacement.access_token, touch=False) is not None
+
+
+def test_late_old_generation_cleanup_preserves_replacement_devices_and_tokens(tmp_path):
+    store = MobileDeviceStore(tmp_path / "mobile-auth.db")
+    old = store.create_session(
+        user_id="owner",
+        device=_device("device-old", "Old iPhone"),
+    )
+    store.register_apns(
+        device_id=old.session.device_id,
+        token="aa" * 32,
+        environment="production",
+        bundle_id="com.example.hermes",
+    )
+    deletion = store.begin_account_deletion("owner", "owner-scope")
+
+    replacement_generation = store.activate_account_generation(
+        "owner",
+        replace_deleting=True,
+    )
+    replacement = store.create_session(
+        user_id="owner",
+        device=_device("device-new", "Replacement iPhone"),
+    )
+    store.register_apns(
+        device_id=replacement.session.device_id,
+        token="bb" * 32,
+        environment="production",
+        bundle_id="com.example.hermes",
+    )
+
+    claimed = store.claim_account_deletions(limit=1)[0]
+    cleanup = store.finish_account_deletion(
+        claimed["id"],
+        "delivered",
+        deliveries={},
+        lease_token=claimed["lease_token"],
+    )
+
+    assert cleanup == {
+        "updated": True,
+        "state": "delivered",
+        "devices": 1,
+        "sessions": 1,
+        "apns": 1,
+    }
+    assert replacement.session.account_generation == replacement_generation
+    assert store.verify_access(replacement.access_token, touch=False) is not None
+    assert [item["id"] for item in store.list_devices(user_id="owner")] == [
+        "device-new"
+    ]
+    assert store.account_deletion_status(
+        "owner",
+        deletion["account_generation"],
+    )["state"] == "delivered"
+
+
+def test_account_generation_is_stable_and_rotates_after_completed_deletion(tmp_path):
+    store = MobileDeviceStore(tmp_path / "mobile-auth.db")
+    store.create_session(
+        user_id="owner",
+        device=_device("device-primary", "Owner iPhone"),
+    )
+    first_generation = store.account_generation("owner")
+    assert first_generation.startswith("acctgen_")
+    assert MobileDeviceStore(store.db_path).account_generation("OWNER") == first_generation
+
+    store.begin_account_deletion("owner", "owner-scope")
+    with store.connection() as conn:
+        conn.execute(
+            "UPDATE mobile_account_deletion_outbox SET state='delivered' "
+            "WHERE user_id='owner'"
+        )
+        conn.commit()
+    assert store.clear_completed_account_deletion("owner") is True
+    replacement_generation = store.account_generation("owner")
+    assert replacement_generation != first_generation
+    assert store.account_deletion_status(
+        "owner",
+        first_generation,
+    )["state"] == "delivered"
+    assert store.account_deletion_status("owner") is None
+
+    store.create_session(
+        user_id="owner",
+        device=_device("device-new", "Replacement iPhone"),
+    )
+    assert store.account_generation("owner") == replacement_generation
+
+
+def test_active_account_generation_fails_closed_after_deletion_begins(tmp_path):
+    store = MobileDeviceStore(tmp_path / "mobile-auth.db")
+    generation = store.account_generation("owner", create=True)
+
+    deletion = store.begin_account_deletion("owner", "owner-scope")
+
+    assert deletion["account_generation"] == generation
+    assert store.account_generation("owner", create=False) == generation
+    with pytest.raises(PermissionError, match="deletion tombstone"):
+        store.account_generation("owner", create=True)
+
+
+def test_account_deletion_persists_generation_before_any_cleanup_store_is_touched(
+    tmp_path,
+):
+    store = MobileDeviceStore(tmp_path / "mobile-auth.db")
+    assert store.account_generation("owner") == ""
+
+    deletion = store.begin_account_deletion("owner", "owner-scope")
+
+    generation = store.account_generation("owner")
+    assert generation.startswith("acctgen_")
+    assert deletion["account_generation"] == generation
 
 
 def test_refresh_replay_revokes_the_rotated_token_family(tmp_path):
@@ -601,6 +760,77 @@ def test_account_deletion_worker_stops_after_lease_is_reclaimed(
     status = store.account_deletion_status("owner")
     assert status["state"] == "delivering"
     assert status["attempts"] == 2
+
+
+def test_v6_migration_binds_devices_and_deletion_outbox_to_generation(tmp_path):
+    db_path = tmp_path / "mobile-auth.db"
+    generation = "acctgen_existing"
+    with sqlite3.connect(db_path) as conn:
+        conn.executescript(
+            """
+            CREATE TABLE mobile_devices (
+                id TEXT PRIMARY KEY, user_id TEXT NOT NULL, name TEXT NOT NULL,
+                model TEXT NOT NULL DEFAULT '', os_version TEXT NOT NULL DEFAULT '',
+                app_version TEXT NOT NULL DEFAULT '', created_at INTEGER NOT NULL,
+                updated_at INTEGER NOT NULL, last_seen_at INTEGER NOT NULL,
+                revoked_at INTEGER, revoke_reason TEXT NOT NULL DEFAULT ''
+            );
+            CREATE TABLE mobile_sessions (
+                id TEXT PRIMARY KEY, device_id TEXT NOT NULL REFERENCES mobile_devices(id),
+                user_id TEXT NOT NULL, account_generation TEXT NOT NULL DEFAULT '',
+                access_token_hash TEXT NOT NULL UNIQUE,
+                refresh_token_hash TEXT NOT NULL UNIQUE,
+                access_expires_at INTEGER NOT NULL, refresh_expires_at INTEGER NOT NULL,
+                created_at INTEGER NOT NULL, updated_at INTEGER NOT NULL,
+                last_seen_at INTEGER NOT NULL, revoked_at INTEGER,
+                revoke_reason TEXT NOT NULL DEFAULT ''
+            );
+            CREATE TABLE mobile_account_deletion_outbox (
+                id TEXT PRIMARY KEY, user_id TEXT NOT NULL UNIQUE,
+                owner_scope TEXT NOT NULL, state TEXT NOT NULL DEFAULT 'pending',
+                device_deliveries_json TEXT NOT NULL DEFAULT '{}',
+                attempts INTEGER NOT NULL DEFAULT 0, available_at INTEGER NOT NULL,
+                lease_token TEXT NOT NULL DEFAULT '', leased_until INTEGER NOT NULL DEFAULT 0,
+                requested_at INTEGER NOT NULL, updated_at INTEGER NOT NULL,
+                completed_at INTEGER, last_error TEXT NOT NULL DEFAULT ''
+            );
+            CREATE INDEX idx_mobile_account_deletion_due
+                ON mobile_account_deletion_outbox(state, available_at, leased_until);
+            CREATE TABLE mobile_account_generations (
+                user_id TEXT PRIMARY KEY COLLATE NOCASE,
+                generation TEXT NOT NULL UNIQUE,
+                created_at INTEGER NOT NULL
+            );
+            INSERT INTO mobile_account_generations VALUES('owner','acctgen_existing',1);
+            INSERT INTO mobile_devices VALUES(
+                'device-old','owner','Old iPhone','','','',1,1,1,NULL,''
+            );
+            INSERT INTO mobile_sessions VALUES(
+                'session-old','device-old','owner','acctgen_existing',
+                'access-hash','refresh-hash',999,999,1,1,1,NULL,''
+            );
+            INSERT INTO mobile_account_deletion_outbox VALUES(
+                'deletion-old','owner','owner-scope','pending','{}',0,1,'',0,1,1,NULL,''
+            );
+            PRAGMA user_version=6;
+            """
+        )
+
+    store = MobileDeviceStore(db_path)
+    with store.connection() as conn:
+        assert conn.execute("PRAGMA user_version").fetchone()[0] == 7
+        assert conn.execute(
+            "SELECT account_generation FROM mobile_devices WHERE id='device-old'"
+        ).fetchone()[0] == generation
+        assert conn.execute(
+            "SELECT account_generation FROM mobile_account_deletion_outbox "
+            "WHERE id='deletion-old'"
+        ).fetchone()[0] == generation
+        conn.execute(
+            "INSERT INTO mobile_account_deletion_outbox ("
+            "id,user_id,account_generation,owner_scope,available_at,requested_at,updated_at"
+            ") VALUES('deletion-new','owner','acctgen_new','owner-scope',1,1,1)"
+        )
 
 
 def test_schema_initialization_is_idempotent_and_preserves_rows(tmp_path):

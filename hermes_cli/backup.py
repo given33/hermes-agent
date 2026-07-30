@@ -131,6 +131,20 @@ _SECRET_FILE_NAMES = {".env", "auth.json", "state.db"}
 # home-relative location on import. Anything not under home is skipped.
 _EXTERNAL_PREFIX = "_external/"
 
+# Keep import memory use independent of archive member size. Backups can
+# contain multi-gigabyte databases and provider state files.
+_IMPORT_COPY_CHUNK_BYTES = 1024 * 1024
+
+
+def _copy_zip_member(
+    zf: zipfile.ZipFile,
+    member: str,
+    target: Path,
+) -> None:
+    """Copy one archive member to disk without loading it all into memory."""
+    with zf.open(member) as src, open(target, "wb") as dst:
+        shutil.copyfileobj(src, dst, length=_IMPORT_COPY_CHUNK_BYTES)
+
 
 def _collect_memory_provider_external_paths() -> List[Path]:
     """Return existing absolute paths the active memory provider stores
@@ -607,8 +621,7 @@ def run_import(args) -> None:
                     continue
                 try:
                     target.parent.mkdir(parents=True, exist_ok=True)
-                    with zf.open(member) as src, open(target, "wb") as dst:
-                        dst.write(src.read())
+                    _copy_zip_member(zf, member, target)
                     # External provider configs commonly hold credentials.
                     if target.suffix in {".json", ".env", ".conf"} or target.name in _SECRET_FILE_NAMES:
                         try:
@@ -653,8 +666,7 @@ def run_import(args) -> None:
 
             try:
                 target.parent.mkdir(parents=True, exist_ok=True)
-                with zf.open(member) as src, open(target, "wb") as dst:
-                    dst.write(src.read())
+                _copy_zip_member(zf, member, target)
                 if target.name in _SECRET_FILE_NAMES:
                     os.chmod(target, 0o600)
                 restored += 1

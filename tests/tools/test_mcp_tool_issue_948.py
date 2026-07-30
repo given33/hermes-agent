@@ -100,7 +100,11 @@ def test_run_stdio_uses_resolved_command_and_prepended_path(tmp_path):
     npx_path.chmod(0o755)
 
     mock_session = MagicMock()
-    mock_session.initialize = AsyncMock()
+    mock_session.discover = AsyncMock(
+        return_value=SimpleNamespace(
+            capabilities=SimpleNamespace(tools=SimpleNamespace())
+        )
+    )
     mock_session.list_tools = AsyncMock(return_value=SimpleNamespace(tools=[]))
 
     mock_stdio_cm = MagicMock()
@@ -127,11 +131,15 @@ def test_run_stdio_uses_resolved_command_and_prepended_path(tmp_path):
             # its args still flow through correctly as the watchdog's target
             # command, preserving this test's original path-resolution intent.
             call_kwargs = mock_params.call_args.kwargs
-            assert call_kwargs["command"] == sys.executable
-            assert call_kwargs["args"][0].endswith("mcp_stdio_watchdog.py")
-            assert "--" in call_kwargs["args"]
-            sep = call_kwargs["args"].index("--")
-            assert call_kwargs["args"][sep + 1:] == [str(npx_path), "-y", "pkg"]
+            if os.name == "posix":
+                assert call_kwargs["command"] == sys.executable
+                assert call_kwargs["args"][0].endswith("mcp_stdio_watchdog.py")
+                assert "--" in call_kwargs["args"]
+                sep = call_kwargs["args"].index("--")
+                assert call_kwargs["args"][sep + 1:] == [str(npx_path), "-y", "pkg"]
+            else:
+                assert call_kwargs["command"] == str(npx_path)
+                assert call_kwargs["args"] == ["-y", "pkg"]
             assert call_kwargs["env"]["PATH"].split(os.pathsep)[0] == str(node_bin)
 
             await server.shutdown()
@@ -147,7 +155,11 @@ def test_run_stdio_uses_resolved_command_and_prepended_path(tmp_path):
 
 def _stdio_mocks():
     mock_session = MagicMock()
-    mock_session.initialize = AsyncMock()
+    mock_session.discover = AsyncMock(
+        return_value=SimpleNamespace(
+            capabilities=SimpleNamespace(tools=SimpleNamespace())
+        )
+    )
     mock_session.list_tools = AsyncMock(return_value=SimpleNamespace(tools=[]))
     mock_stdio_cm = MagicMock()
     mock_stdio_cm.__aenter__ = AsyncMock(return_value=(object(), object()))

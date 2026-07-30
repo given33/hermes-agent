@@ -49,11 +49,16 @@ from typing import Any, Callable, Dict, List, Optional, Set, Union
 from hermes_constants import get_hermes_home
 from utils import env_var_enabled, fast_safe_load
 from hermes_runtime.config import cfg_get
+from hermes_services.startup import bootstrap_trusted_runtime
 from hermes_services.middleware import (
     OBSERVER_SCHEMA_VERSION,
     VALID_MIDDLEWARE,
     install_middleware_backend,
 )
+
+# Explicit production boundary: manifest scanning, entry-point loading, and
+# plugin ``register`` callbacks run only after trusted hooks are sealed.
+bootstrap_trusted_runtime()
 
 
 def get_bundled_plugins_dir() -> Path:

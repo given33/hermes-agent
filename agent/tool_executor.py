@@ -37,7 +37,7 @@ from agent.tool_dispatch_helpers import (
     _is_multimodal_tool_result,
     _multimodal_text_summary,
     _append_subdir_hint_to_multimodal,
-    _plan_tool_batch_segments,
+    _plan_tool_batch_execution,
     make_tool_result_message,
 )
 from tools.terminal_tool import (
@@ -71,6 +71,7 @@ def _budget_for_agent(agent) -> BudgetConfig:
 # Maximum number of concurrent worker threads for parallel tool execution.
 # Mirrors the constant in ``run_agent`` for tests/imports that look here.
 _MAX_TOOL_WORKERS = 8
+_TOOL_EXECUTION_SLOTS = threading.BoundedSemaphore(_MAX_TOOL_WORKERS)
 # Keep this above the stock auxiliary.web_extract timeout (360s) so the batch
 # guard does not preempt a slow-but-valid summarization attempt.
 _DEFAULT_CONCURRENT_TOOL_TIMEOUT_S = 420.0
@@ -95,10 +96,14 @@ def _parse_tool_arguments(raw_arguments: Any) -> tuple[dict, Optional[str]]:
     )
 
 
-def _resolve_concurrent_tool_timeout() -> float | None:
+def _resolve_concurrent_tool_timeout(tool_names: list[str] | None = None) -> float | None:
+    from hermes_services.tool_contract import contract_timeout_seconds
+
+    contract_timeout = contract_timeout_seconds(list(tool_names or []))
     raw = os.getenv("HERMES_CONCURRENT_TOOL_TIMEOUT_S", "").strip()
     if not raw:
-        return _DEFAULT_CONCURRENT_TOOL_TIMEOUT_S
+        configured = _DEFAULT_CONCURRENT_TOOL_TIMEOUT_S
+        return min(configured, contract_timeout) if contract_timeout is not None else configured
     try:
         value = float(raw)
     except ValueError:
@@ -109,8 +114,73 @@ def _resolve_concurrent_tool_timeout() -> float | None:
         )
         return _DEFAULT_CONCURRENT_TOOL_TIMEOUT_S
     if value <= 0:
+        return contract_timeout
+    return min(value, contract_timeout) if contract_timeout is not None else value
+
+
+def _tool_contract_approval_block(function_name: str) -> str | None:
+    from hermes_services.tool_contract import resolve_tool_contract
+
+    contract = resolve_tool_contract(function_name)
+    if not contract.requires_approval:
         return None
-    return value
+    from tools.approval import request_tool_approval
+    from tools.terminal_tool import get_approval_callback
+
+    decision = request_tool_approval(
+        function_name,
+        f"The {function_name} tool is marked as requiring approval by its execution contract.",
+        rule_key=f"tool_contract:{function_name}",
+        approval_callback=get_approval_callback(),
+    )
+    if decision.get("approved") is True:
+        return None
+    return str(
+        decision.get("message")
+        or f"Tool '{function_name}' was not approved."
+    )
+
+
+def _tool_contract_event_metadata(function_name: str) -> dict[str, Any]:
+    from hermes_services.tool_contract import tool_contract_event_metadata
+
+    return tool_contract_event_metadata(function_name)
+
+
+def _tool_contract_consistency_block(agent, function_name: str) -> str | None:
+    """Validate the live handler/policy against this agent's advertised tools."""
+
+    snapshot_generation = getattr(agent, "_tool_snapshot_generation", None)
+    if not isinstance(snapshot_generation, int):
+        # Lightweight legacy/test agents do not own a production tool snapshot.
+        return None
+    from hermes_services.tool_contract import validate_tool_contract_binding
+
+    return validate_tool_contract_binding(
+        function_name,
+        advertised_registry_generation=snapshot_generation,
+    )
+
+
+def _run_with_tool_contract_timeout(agent, function_name: str, execute) -> Any:
+    from hermes_services.tool_contract import resolve_tool_contract
+
+    consistency_error = _tool_contract_consistency_block(agent, function_name)
+    if consistency_error is not None:
+        raise RuntimeError(consistency_error)
+    contract = resolve_tool_contract(function_name)
+    if contract.timeout_seconds is not None:
+        from tools.registry import registry
+
+        if registry.get_entry(function_name) is None:
+            raise RuntimeError(
+                f"Tool '{function_name}' declares a hard deadline but is not "
+                "registry-dispatched and cannot be process-isolated"
+            )
+    # Registry-dispatched bounded handlers enforce their deadline in a
+    # disposable process. The outer agent wrapper must not add a second thread
+    # timeout around hooks, approvals, persistence, or result normalization.
+    return execute()
 
 
 def _flush_session_db_after_tool_progress(
@@ -285,11 +355,32 @@ def _apply_tool_request_middleware_for_agent(
             turn_id=getattr(agent, "_current_turn_id", "") or "",
             api_request_id=getattr(agent, "_current_api_request_id", "") or "",
         )
-        payload = result.payload if isinstance(result.payload, dict) else function_args
-        return payload, list(result.trace)
     except Exception as exc:
         logger.debug("tool_request middleware error: %s", exc)
-        return function_args, []
+        payload = function_args
+        middleware_trace: list[dict[str, Any]] = []
+    else:
+        payload = result.payload if isinstance(result.payload, dict) else function_args
+        middleware_trace = list(result.trace)
+
+    # Trusted fail-closed hooks are intentionally outside the middleware's
+    # fail-open boundary. A guard that rejects a call must stop execution.
+    from hermes_services.internal_hooks import run_internal_hooks
+
+    hook_result = run_internal_hooks(
+        "before_tool_call",
+        payload,
+        tool_name=function_name,
+        task_id=effective_task_id or "",
+        session_id=getattr(agent, "session_id", "") or "",
+        tool_call_id=tool_call_id or "",
+        turn_id=getattr(agent, "_current_turn_id", "") or "",
+    )
+    hooked_payload = hook_result.payload
+    hook_trace = hook_result.trace
+    if not isinstance(hooked_payload, dict):
+        raise TypeError("before_tool_call hooks must return a dict or None")
+    return hooked_payload, [*middleware_trace, *hook_trace]
 
 
 def _run_agent_tool_execution_middleware(
@@ -310,17 +401,24 @@ def _run_agent_tool_execution_middleware(
 
     from hermes_services.middleware import run_tool_execution_middleware
 
-    result = run_tool_execution_middleware(
-        function_name,
-        function_args,
-        _execute,
-        original_args=function_args,
-        task_id=effective_task_id or "",
-        session_id=getattr(agent, "session_id", "") or "",
-        tool_call_id=tool_call_id or "",
-        turn_id=getattr(agent, "_current_turn_id", "") or "",
-        api_request_id=getattr(agent, "_current_api_request_id", "") or "",
-    )
+    try:
+        result = _run_with_tool_contract_timeout(
+            agent,
+            function_name,
+            lambda: run_tool_execution_middleware(
+                function_name,
+                function_args,
+                _execute,
+                original_args=function_args,
+                task_id=effective_task_id or "",
+                session_id=getattr(agent, "session_id", "") or "",
+                tool_call_id=tool_call_id or "",
+                turn_id=getattr(agent, "_current_turn_id", "") or "",
+                api_request_id=getattr(agent, "_current_api_request_id", "") or "",
+            ),
+        )
+    except TimeoutError as exc:
+        result = f"Error executing tool '{function_name}': {exc}"
     return result, observed_args
 
 
@@ -450,20 +548,26 @@ def execute_tool_calls_concurrent(agent, assistant_message, messages: list, effe
                 middleware_trace=list(middleware_trace),
             )
         else:
+            contract_consistency_error = _tool_contract_consistency_block(
+                agent, function_name
+            )
+            block_message = contract_consistency_error
             try:
-                from hermes_cli.plugins import resolve_pre_tool_block
-                block_message = resolve_pre_tool_block(
-                    function_name,
-                    function_args,
-                    task_id=effective_task_id or "",
-                    session_id=getattr(agent, "session_id", "") or "",
-                    tool_call_id=getattr(tool_call, "id", "") or "",
-                    turn_id=getattr(agent, "_current_turn_id", "") or "",
-                    api_request_id=getattr(agent, "_current_api_request_id", "") or "",
-                    middleware_trace=list(middleware_trace),
-                )
+                if block_message is None:
+                    from hermes_cli.plugins import resolve_pre_tool_block
+                    block_message = resolve_pre_tool_block(
+                        function_name,
+                        function_args,
+                        task_id=effective_task_id or "",
+                        session_id=getattr(agent, "session_id", "") or "",
+                        tool_call_id=getattr(tool_call, "id", "") or "",
+                        turn_id=getattr(agent, "_current_turn_id", "") or "",
+                        api_request_id=getattr(agent, "_current_api_request_id", "") or "",
+                        middleware_trace=list(middleware_trace),
+                    )
             except Exception:
-                block_message = None
+                if contract_consistency_error is None:
+                    block_message = None
 
             if block_message is not None:
                 block_result = json.dumps({"error": block_message}, ensure_ascii=False)
@@ -475,11 +579,32 @@ def execute_tool_calls_concurrent(agent, assistant_message, messages: list, effe
                     effective_task_id=effective_task_id,
                     tool_call_id=getattr(tool_call, "id", "") or "",
                     status="blocked",
-                    error_type="plugin_block",
+                    error_type=(
+                        "tool_contract_drift"
+                        if contract_consistency_error is not None
+                        else "plugin_block"
+                    ),
                     error_message=block_message,
                     middleware_trace=list(middleware_trace),
                 )
             else:
+                block_message = _tool_contract_approval_block(function_name)
+
+            if block_result is None and block_message is not None:
+                block_result = json.dumps({"error": block_message}, ensure_ascii=False)
+                _emit_terminal_post_tool_call(
+                    agent,
+                    function_name=function_name,
+                    function_args=function_args,
+                    result=block_result,
+                    effective_task_id=effective_task_id,
+                    tool_call_id=getattr(tool_call, "id", "") or "",
+                    status="blocked",
+                    error_type="contract_approval_block",
+                    error_message=block_message,
+                    middleware_trace=list(middleware_trace),
+                )
+            elif block_result is None:
                 guardrail_decision = agent._tool_guardrails.before_call(function_name, function_args)
                 if not guardrail_decision.allows_execution:
                     block_result = agent._guardrail_block_result(guardrail_decision)
@@ -544,7 +669,13 @@ def execute_tool_calls_concurrent(agent, assistant_message, messages: list, effe
             try:
                 display_args = _redact_tool_args_for_display(name, args) or args
                 preview = _build_tool_preview(name, display_args)
-                agent.tool_progress_callback("tool.started", name, preview, display_args)
+                agent.tool_progress_callback(
+                    "tool.started",
+                    name,
+                    preview,
+                    display_args,
+                    **_tool_contract_event_metadata(name),
+                )
             except Exception as cb_err:
                 logging.debug(f"Tool progress callback error: {cb_err}")
 
@@ -572,6 +703,17 @@ def execute_tool_calls_concurrent(agent, assistant_message, messages: list, effe
 
     def _run_tool(index, tool_call, function_name, function_args, middleware_trace):
         """Worker function executed in a thread."""
+        if not _TOOL_EXECUTION_SLOTS.acquire(blocking=False):
+            results[index] = (
+                function_name,
+                function_args,
+                f"Error executing tool '{function_name}': global tool worker limit reached",
+                0.0,
+                True,
+                False,
+                middleware_trace,
+            )
+            return
         # Register this worker tid so the agent can fan out an interrupt
         # to it — see AIAgent.interrupt().  Must happen first thing, and
         # must be paired with discard + clear in the finally block.
@@ -653,6 +795,7 @@ def execute_tool_calls_concurrent(agent, assistant_message, messages: list, effe
                 _ra()._set_interrupt(False, _worker_tid)
             except Exception:
                 pass
+            _TOOL_EXECUTION_SLOTS.release()
 
     # Start spinner for CLI mode (skip when TUI handles tool progress)
     spinner = None
@@ -670,7 +813,9 @@ def execute_tool_calls_concurrent(agent, assistant_message, messages: list, effe
         futures = []
         future_to_index = {}
         timed_out_indices: set[int] = set()
-        timeout_s = _resolve_concurrent_tool_timeout()
+        timeout_s = _resolve_concurrent_tool_timeout(
+            [name for _tc, name, _args, _trace, block, _guardrail in parsed_calls if block is None]
+        )
         deadline = time.monotonic() + timeout_s if timeout_s is not None else None
         if runnable_calls:
             max_workers = min(len(runnable_calls), _MAX_TOOL_WORKERS)
@@ -748,23 +893,22 @@ def execute_tool_calls_concurrent(agent, assistant_message, messages: list, effe
                         break
 
                     if deadline is not None and time.monotonic() >= deadline:
-                        abandon_executor = True
-                        timed_out_indices = {
-                            future_to_index[f]
-                            for f in not_done
-                            if f in future_to_index
+                        deadline_indices = {
+                            future_to_index[f] for f in not_done if f in future_to_index
                         }
                         _still_running = [
                             parsed_calls[i][1]
-                            for i in timed_out_indices
+                            for i in deadline_indices
                         ]
                         logger.warning(
-                            "concurrent tool batch timed out after %.1fs; "
+                            "concurrent tool batch reached its %.1fs hard deadline; "
                             "%d tool(s) still running: %s",
                             timeout_s,
-                            len(timed_out_indices),
+                            len(deadline_indices),
                             ", ".join(_still_running[:5]),
                         )
+                        timed_out_indices.update(deadline_indices)
+                        abandon_executor = True
                         for f in not_done:
                             f.cancel()
                         with agent._tool_worker_threads_lock:
@@ -774,6 +918,11 @@ def execute_tool_calls_concurrent(agent, assistant_message, messages: list, effe
                                 _ra()._set_interrupt(True, tid)
                             except Exception:
                                 pass
+                        # Parallel batches contain only none/read contracts.
+                        # Give interrupted workers a short grace period, then
+                        # detach daemon workers. Their late values are ignored;
+                        # the global slot cap bounds permanently wedged threads.
+                        concurrent.futures.wait(not_done, timeout=0.25)
                         break
 
                     # Check for interrupt — the per-thread interrupt signal
@@ -810,11 +959,6 @@ def execute_tool_calls_concurrent(agent, assistant_message, messages: list, effe
                             f"{len(not_done)} remaining: {', '.join(_still_running[:3])})"
                         )
             finally:
-                # On abandon (interrupt or deadline) we intentionally do NOT
-                # join hung workers: wait=False returns immediately and
-                # cancel_futures drops queued-but-unstarted work. A wedged tool
-                # thread is left running detached — the deliberate tradeoff vs.
-                # deadlocking the whole batch. Normal completion joins (wait=True).
                 executor.shutdown(
                     wait=not abandon_executor,
                     cancel_futures=abandon_executor,
@@ -830,15 +974,11 @@ def execute_tool_calls_concurrent(agent, assistant_message, messages: list, effe
     for i, (tc, name, args, middleware_trace, block_result, blocked_by_guardrail) in enumerate(parsed_calls):
         r = results[i]
         blocked = False
-        # A worker can finish and write results[i] in the window between the
-        # deadline snapshot (timed_out_indices, taken from not_done) and this
-        # loop. Prefer that real result over a fabricated timeout message — the
-        # tool genuinely succeeded, just slightly late.
         effect_disposition = None
-        if i in timed_out_indices and r is None:
+        if i in timed_out_indices:
             suffix = f"{timeout_s:.1f}s" if timeout_s is not None else "the configured timeout"
             function_result = f"Error executing tool '{name}': timed out after {suffix}"
-            effect_disposition = "unknown"
+            effect_disposition = "none"
             _emit_terminal_post_tool_call(
                 agent,
                 function_name=name,
@@ -918,6 +1058,7 @@ def execute_tool_calls_concurrent(agent, assistant_message, messages: list, effe
                         "tool.completed", function_name, None, None,
                         duration=tool_duration, is_error=is_error,
                         result=function_result,
+                        **_tool_contract_event_metadata(function_name),
                     )
                 except Exception as cb_err:
                     logging.debug(f"Tool progress callback error: {cb_err}")
@@ -1113,20 +1254,29 @@ def execute_tool_calls_sequential(agent, assistant_message, messages: list, effe
             _block_msg = _ts_scope_block
             _block_error_type = "tool_scope_block"
         else:
+            _block_msg = _tool_contract_consistency_block(agent, function_name)
+            if _block_msg is not None:
+                _block_error_type = "tool_contract_drift"
             try:
-                from hermes_cli.plugins import resolve_pre_tool_block
-                _block_msg = resolve_pre_tool_block(
-                    function_name,
-                    function_args,
-                    task_id=effective_task_id or "",
-                    session_id=getattr(agent, "session_id", "") or "",
-                    tool_call_id=getattr(tool_call, "id", "") or "",
-                    turn_id=getattr(agent, "_current_turn_id", "") or "",
-                    api_request_id=getattr(agent, "_current_api_request_id", "") or "",
-                    middleware_trace=list(middleware_trace),
-                )
+                if _block_msg is None:
+                    from hermes_cli.plugins import resolve_pre_tool_block
+                    _block_msg = resolve_pre_tool_block(
+                        function_name,
+                        function_args,
+                        task_id=effective_task_id or "",
+                        session_id=getattr(agent, "session_id", "") or "",
+                        tool_call_id=getattr(tool_call, "id", "") or "",
+                        turn_id=getattr(agent, "_current_turn_id", "") or "",
+                        api_request_id=getattr(agent, "_current_api_request_id", "") or "",
+                        middleware_trace=list(middleware_trace),
+                    )
             except Exception:
                 pass
+
+        if _block_msg is None:
+            _block_msg = _tool_contract_approval_block(function_name)
+            if _block_msg is not None:
+                _block_error_type = "contract_approval_block"
 
         _guardrail_block_decision: ToolGuardrailDecision | None = None
         if _block_msg is None:
@@ -1174,7 +1324,13 @@ def execute_tool_calls_sequential(agent, assistant_message, messages: list, effe
             try:
                 display_args = _redact_tool_args_for_display(function_name, function_args) or function_args
                 preview = _build_tool_preview(function_name, display_args)
-                agent.tool_progress_callback("tool.started", function_name, preview, display_args)
+                agent.tool_progress_callback(
+                    "tool.started",
+                    function_name,
+                    preview,
+                    display_args,
+                    **_tool_contract_event_metadata(function_name),
+                )
             except Exception as cb_err:
                 logging.debug(f"Tool progress callback error: {cb_err}")
 
@@ -1483,18 +1639,23 @@ def execute_tool_calls_sequential(agent, assistant_message, messages: list, effe
                 spinner.start()
             _spinner_result = None
             try:
-                function_result = _ra().handle_function_call(
-                    function_name, function_args, effective_task_id,
-                    tool_call_id=tool_call.id,
-                    session_id=agent.session_id or "",
-                    turn_id=getattr(agent, "_current_turn_id", "") or "",
-                    api_request_id=getattr(agent, "_current_api_request_id", "") or "",
-                    enabled_tools=list(agent.valid_tool_names) if agent.valid_tool_names else None,
-                    skip_pre_tool_call_hook=True,
-                    skip_tool_request_middleware=True,
-                    enabled_toolsets=getattr(agent, "enabled_toolsets", None),
-                    disabled_toolsets=getattr(agent, "disabled_toolsets", None),
-                    tool_request_middleware_trace=list(middleware_trace),
+                function_result = _run_with_tool_contract_timeout(
+                    agent,
+                    function_name,
+                    lambda: _ra().handle_function_call(
+                        function_name, function_args, effective_task_id,
+                        tool_call_id=tool_call.id,
+                        session_id=agent.session_id or "",
+                        turn_id=getattr(agent, "_current_turn_id", "") or "",
+                        api_request_id=getattr(agent, "_current_api_request_id", "") or "",
+                        enabled_tools=list(agent.valid_tool_names) if agent.valid_tool_names else None,
+                        skip_pre_tool_call_hook=True,
+                        skip_tool_request_middleware=True,
+                        enabled_toolsets=getattr(agent, "enabled_toolsets", None),
+                        disabled_toolsets=getattr(agent, "disabled_toolsets", None),
+                        tool_request_middleware_trace=list(middleware_trace),
+                        enforce_tool_isolation=True,
+                    ),
                 )
                 _spinner_result = function_result
             except KeyboardInterrupt:
@@ -1525,18 +1686,23 @@ def execute_tool_calls_sequential(agent, assistant_message, messages: list, effe
                     agent._vprint(f"  {cute_msg}")
         else:
             try:
-                function_result = _ra().handle_function_call(
-                    function_name, function_args, effective_task_id,
-                    tool_call_id=tool_call.id,
-                    session_id=agent.session_id or "",
-                    turn_id=getattr(agent, "_current_turn_id", "") or "",
-                    api_request_id=getattr(agent, "_current_api_request_id", "") or "",
-                    enabled_tools=list(agent.valid_tool_names) if agent.valid_tool_names else None,
-                    skip_pre_tool_call_hook=True,
-                    skip_tool_request_middleware=True,
-                    enabled_toolsets=getattr(agent, "enabled_toolsets", None),
-                    disabled_toolsets=getattr(agent, "disabled_toolsets", None),
-                    tool_request_middleware_trace=list(middleware_trace),
+                function_result = _run_with_tool_contract_timeout(
+                    agent,
+                    function_name,
+                    lambda: _ra().handle_function_call(
+                        function_name, function_args, effective_task_id,
+                        tool_call_id=tool_call.id,
+                        session_id=agent.session_id or "",
+                        turn_id=getattr(agent, "_current_turn_id", "") or "",
+                        api_request_id=getattr(agent, "_current_api_request_id", "") or "",
+                        enabled_tools=list(agent.valid_tool_names) if agent.valid_tool_names else None,
+                        skip_pre_tool_call_hook=True,
+                        skip_tool_request_middleware=True,
+                        enabled_toolsets=getattr(agent, "enabled_toolsets", None),
+                        disabled_toolsets=getattr(agent, "disabled_toolsets", None),
+                        tool_request_middleware_trace=list(middleware_trace),
+                        enforce_tool_isolation=True,
+                    ),
                 )
             except KeyboardInterrupt:
                 _emit_cancelled_terminal_post_tool_call(
@@ -1626,6 +1792,7 @@ def execute_tool_calls_sequential(agent, assistant_message, messages: list, effe
                     "tool.completed", function_name, None, None,
                     duration=tool_duration, is_error=_is_error_result,
                     result=function_result,
+                    **_tool_contract_event_metadata(function_name),
                 )
             except Exception as cb_err:
                 logging.debug(f"Tool progress callback error: {cb_err}")
@@ -1743,7 +1910,7 @@ def execute_tool_calls_segmented(agent, assistant_message, messages: list, effec
     """Execute a mixed tool-call batch as ordered parallel/sequential segments.
 
     ``segments`` is the ``(kind, calls)`` plan from
-    ``_plan_tool_batch_segments``: maximal contiguous runs of parallel-safe
+    ``_plan_tool_batch_execution``: conservative provider-batch execution
     calls execute on the concurrent path, barrier calls on the sequential
     path, strictly in the model's original call order. Because segments are
     contiguous, every tool result is still appended one-per-call in emission
@@ -1767,7 +1934,10 @@ def execute_tool_calls_segmented(agent, assistant_message, messages: list, effec
     if segments is None:
         _active_env = get_active_env(effective_task_id)
         _exec_cwd = Path(_active_env.cwd) if _active_env is not None and _active_env.cwd else None
-        segments = _plan_tool_batch_segments(assistant_message.tool_calls, execution_cwd=_exec_cwd)
+        segments = _plan_tool_batch_execution(
+            assistant_message.tool_calls,
+            execution_cwd=_exec_cwd,
+        )
 
     for kind, calls in segments:
         segment_message = SimpleNamespace(tool_calls=list(calls))

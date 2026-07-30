@@ -1031,6 +1031,27 @@ def compress_context(
             except Exception:
                 pass
 
+        from hermes_services.internal_hooks import has_internal_hooks, run_internal_hooks
+
+        _compression_hook_trace = []
+        if has_internal_hooks("before_context_compaction"):
+            _compression_hook_result = run_internal_hooks(
+                "before_context_compaction",
+                copy.deepcopy(messages),
+                session_id=getattr(agent, "session_id", "") or "",
+                model=getattr(agent, "model", "") or "",
+                approx_tokens=approx_tokens,
+                focus_topic=focus_topic or "",
+                forced=bool(force),
+            )
+            hooked_messages = _compression_hook_result.payload
+            _compression_hook_trace = _compression_hook_result.trace
+            if not isinstance(hooked_messages, list) or not all(
+                isinstance(item, dict) for item in hooked_messages
+            ):
+                raise TypeError("before_context_compaction hooks must return a message list or None")
+            messages[:] = hooked_messages
+
         compress_fn = agent.context_compressor.compress
         compress_kwargs = _supported_compression_kwargs(
             compress_fn,
@@ -1134,6 +1155,25 @@ def compress_context(
                 _existing_sp = agent._build_system_prompt(system_message)
             _release_lock()
             return messages, _existing_sp
+
+        if _compression_hook_trace:
+            try:
+                from agent.context_compressor import (
+                    COMPRESSED_SUMMARY_METADATA_KEY as summary_marker,
+                )
+            except ImportError:
+                summary_marker = "_compressed_summary"
+            trace_target = next(
+                (
+                    item
+                    for item in compressed
+                    if isinstance(item, dict)
+                    and item.get(summary_marker)
+                ),
+                compressed[0] if isinstance(compressed[0], dict) else None,
+            )
+            if isinstance(trace_target, dict):
+                trace_target["hook_trace"] = list(_compression_hook_trace)
 
         summary_error = getattr(agent.context_compressor, "_last_summary_error", None)
         if summary_error:

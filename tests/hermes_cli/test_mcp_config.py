@@ -652,7 +652,7 @@ class TestProbeCapabilityGating:
             self.prompts = prompts
             self.resources = resources
 
-    class _InitResult:
+    class _DiscoverResult:
         def __init__(self, caps):
             self.capabilities = caps
 
@@ -680,7 +680,7 @@ class TestProbeCapabilityGating:
         class _FakeServer:
             _tools = [outer._FakeTool()]
             session = _Session()
-            initialize_result = outer._InitResult(caps)
+            discover_result = outer._DiscoverResult(caps)
 
             async def shutdown(self_inner):
                 return None
@@ -720,10 +720,10 @@ class TestProbeCapabilityGating:
         called, details = self._run_probe(monkeypatch, {"url": "http://x/mcp"}, caps)
         assert set(called) == {"prompts", "resources"}
 
-    def test_missing_capability_info_falls_back_to_probe(self, monkeypatch):
-        # No initialize_result captured → preserve legacy always-try behaviour.
+    def test_missing_capability_info_does_not_probe(self, monkeypatch):
+        # Current discovery is authoritative; missing capability data fails closed.
         called, _ = self._run_probe(monkeypatch, {"url": "http://x/mcp"}, None)
-        assert set(called) == {"prompts", "resources"}
+        assert called == []
 
 
 class TestStripBearerPrefix:

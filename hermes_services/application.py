@@ -12,17 +12,20 @@ from dataclasses import dataclass, field
 from typing import Any
 
 from .http_boundary import HttpBoundaryPolicy
+from .http_boundary import HttpBoundaryCompatibilityAdapter, HttpContractMode
 from .jsonrpc import JsonRpcMethodRegistry
 from .session_registry import LiveSessionRegistry
+from .contexts import BoundedContextRegistry
 
 
 @dataclass(slots=True)
 class HermesApplicationKernel:
     """Transport-neutral application services owned by one adapter process."""
 
-    http_boundary: HttpBoundaryPolicy | None = None
+    http_boundary: HttpBoundaryPolicy | HttpBoundaryCompatibilityAdapter | None = None
     sessions: LiveSessionRegistry[Any] = field(default_factory=LiveSessionRegistry)
     rpc: JsonRpcMethodRegistry = field(default_factory=JsonRpcMethodRegistry)
+    contexts: BoundedContextRegistry = field(default_factory=BoundedContextRegistry)
 
     @classmethod
     def for_http(
@@ -33,6 +36,7 @@ class HermesApplicationKernel:
         allow_unconfigured_bearer: bool = False,
         allowed_origins: tuple[str, ...] = (),
         max_request_bytes: int | None = None,
+        compatibility_mode: HttpContractMode = "dual",
     ) -> "HermesApplicationKernel":
         options: dict[str, Any] = {
             "surface": surface,
@@ -42,13 +46,23 @@ class HermesApplicationKernel:
         }
         if max_request_bytes is not None:
             options["max_request_bytes"] = max_request_bytes
-        return cls(http_boundary=HttpBoundaryPolicy(**options))
+        canonical = HttpBoundaryPolicy(**options)
+        legacy = HttpBoundaryPolicy(**options)
+        return cls(
+            http_boundary=HttpBoundaryCompatibilityAdapter(
+                canonical=canonical,
+                legacy=legacy,
+                mode=compatibility_mode,
+            )
+        )
 
     @classmethod
     def for_local_rpc(cls) -> "HermesApplicationKernel":
         return cls()
 
-    def require_http_boundary(self) -> HttpBoundaryPolicy:
+    def require_http_boundary(
+        self,
+    ) -> HttpBoundaryPolicy | HttpBoundaryCompatibilityAdapter:
         boundary = self.http_boundary
         if boundary is None:
             raise RuntimeError("application kernel has no HTTP boundary")

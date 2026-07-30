@@ -1,0 +1,58 @@
+name: Deploy three Hermes endpoints
+
+on:
+  workflow_run:
+    workflows: [CI]
+    branches: [main]
+    types: [completed]
+  schedule:
+    - cron: '17 */2 * * *'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: hermes-three-endpoint-production
+  cancel-in-progress: false
+
+jobs:
+  deploy-public:
+    if: github.event_name != 'workflow_run' || github.event.workflow_run.conclusion == 'success'
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    environment: production
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.workflow_run.head_sha || 'main' }}
+      - name: Configure pinned deployment SSH identity
+        env:
+          DEPLOY_KEY: ${{ secrets.HERMES_PUBLIC_SSH_KEY }}
+          KNOWN_HOSTS: ${{ secrets.HERMES_PUBLIC_KNOWN_HOSTS }}
+        run: |
+          test -n "$DEPLOY_KEY"
+          test -n "$KNOWN_HOSTS"
+          install -d -m 0700 "$RUNNER_TEMP/ssh"
+          printf '%s\n' "$DEPLOY_KEY" >"$RUNNER_TEMP/ssh/id_ed25519"
+          printf '%s\n' "$KNOWN_HOSTS" >"$RUNNER_TEMP/ssh/known_hosts"
+          chmod 0600 "$RUNNER_TEMP/ssh/id_ed25519" "$RUNNER_TEMP/ssh/known_hosts"
+      - name: Deploy the public authority transactionally
+        env:
+          HERMES_PUBLIC_REMOTE: ${{ secrets.HERMES_PUBLIC_USER }}@${{ secrets.HERMES_PUBLIC_HOST }}
+          HERMES_SSH_IDENTITY: ${{ runner.temp }}/ssh/id_ed25519
+          HERMES_SSH_KNOWN_HOSTS: ${{ runner.temp }}/ssh/known_hosts
+          HERMES_REQUIRE_PINNED_SSH_HOST_KEY: '1'
+          HERMES_RELEASE_COMMIT: ${{ github.event.workflow_run.head_sha || github.sha }}
+        run: |
+          bash deploy/public/deploy-collaboration-backend.sh
+      - name: Verify the public release evidence
+        env:
+          REMOTE: ${{ secrets.HERMES_PUBLIC_USER }}@${{ secrets.HERMES_PUBLIC_HOST }}
+          EXPECTED_COMMIT: ${{ github.event.workflow_run.head_sha || github.sha }}
+        run: |
+          evidence="$(ssh -i "$RUNNER_TEMP/ssh/id_ed25519" \
+            -o UserKnownHostsFile="$RUNNER_TEMP/ssh/known_hosts" \
+            -o StrictHostKeyChecking=yes "$REMOTE" \
+            'sudo -n cat /var/lib/hermes-agent/release-evidence.json')"
+          python3 -c 'import json,os,sys; d=json.load(sys.stdin); assert d["phase"]=="committed"; assert d["commit"]==os.environ["EXPECTED_COMMIT"]' <<<"$evidence"

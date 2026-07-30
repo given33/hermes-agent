@@ -52,6 +52,11 @@ PROJECT_ROOT = Path(__file__).parent.parent.resolve()
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
+from hermes_services.startup import bootstrap_trusted_runtime
+
+# Dashboard manifests and backend API modules are dynamically loaded below.
+bootstrap_trusted_runtime()
+
 from hermes_cli import __version__, __release_date__
 from hermes_runtime.config import (
     cfg_get,
@@ -315,7 +320,9 @@ app.include_router(_memory_oauth_router)
 # ---------------------------------------------------------------------------
 _SESSION_TOKEN = os.environ.get("HERMES_DASHBOARD_SESSION_TOKEN") or secrets.token_urlsafe(32)
 _DASHBOARD_APPLICATION = HermesApplicationKernel.for_http(
-    surface="dashboard", bearer_secret=_SESSION_TOKEN
+    surface="dashboard",
+    bearer_secret=_SESSION_TOKEN,
+    compatibility_mode=os.environ.get("HERMES_HTTP_CONTRACT_MODE", "dual"),
 )
 _DASHBOARD_HTTP_BOUNDARY = _DASHBOARD_APPLICATION.require_http_boundary()
 _SESSION_HEADER_NAME = "X-Hermes-Session-Token"
@@ -1485,6 +1492,9 @@ class CustomModelDiscoveryRequest(BaseModel):
 class CustomModelConfiguration(CustomModelConnectionTest):
     context_length: int = 0
     reasoning_effort: str = "medium"
+    # Empty keeps compatibility with older clients. New clients must choose
+    # preserve/replace/delete so a masked or blank field cannot erase a key.
+    api_key_action: str = ""
 
 
 class MoaModelSlot(BaseModel):
@@ -3544,6 +3554,11 @@ class ManagedInstallationRequest(BaseModel):
     locality: str = "portable"
     targets: list[str] = []
     project_name: str = ""
+    source_ref: str = ""
+
+
+class ManagedInstallationRollbackRequest(BaseModel):
+    request_id: str = ""
 
 
 @app.post("/api/managed-installations", status_code=202)
@@ -3563,6 +3578,7 @@ async def create_managed_installation_api(body: ManagedInstallationRequest):
             locality=body.locality,
             targets=body.targets,
             project_name=body.project_name,
+            source_ref=body.source_ref,
             require_topology=True,
         )
     except ValueError as exc:
@@ -3599,6 +3615,28 @@ async def get_managed_installation_api(operation_id: str):
         return await asyncio.to_thread(get_managed_installation, operation_id)
     except KeyError as exc:
         raise HTTPException(status_code=404, detail="Installation operation not found") from exc
+
+
+@app.post("/api/managed-installations/{operation_id}/rollback", status_code=202)
+async def rollback_managed_installation_api(
+    operation_id: str,
+    body: ManagedInstallationRollbackRequest,
+):
+    from hermes_cli.managed_installations import rollback_managed_installation
+
+    try:
+        operation = await asyncio.to_thread(
+            rollback_managed_installation,
+            operation_id,
+            request_id=body.request_id,
+        )
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail="Installation operation not found") from exc
+    except ValueError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    except RuntimeError as exc:
+        raise HTTPException(status_code=503, detail=str(exc)) from exc
+    return {"accepted": True, "operation": operation}
 
 
 # ---------------------------------------------------------------------------
@@ -6582,16 +6620,14 @@ def get_model_credentials(profile: Optional[str] = None):
 def delete_model_credential(credential_id: str, profile: Optional[str] = None):
     if credential_id != "custom-main":
         raise HTTPException(status_code=404, detail="Model credential not found")
-    with _profile_scope(profile):
-        cfg = load_config()
-        model_cfg = cfg.get("model") if isinstance(cfg, dict) else None
-        if not isinstance(model_cfg, dict):
-            raise HTTPException(status_code=404, detail="Model credential not found")
-        removed = bool(model_cfg.get("api_key") or model_cfg.get("api"))
-        model_cfg.pop("api_key", None)
-        model_cfg.pop("api", None)
-        cfg["model"] = model_cfg
-        save_config(cfg)
+    current = get_custom_model(profile)
+    if not current.get("api_key_configured"):
+        raise HTTPException(status_code=404, detail="Model credential not found")
+    removed = _synchronize_custom_model_api_key(
+        profile,
+        str(current.get("base_url") or ""),
+        action="delete",
+    )
     return {"ok": True, "removed": removed}
 
 
@@ -6609,16 +6645,26 @@ async def set_custom_model(
         raise HTTPException(status_code=400, detail=str(exc)) from exc
 
     target_profile = body.profile or profile
+    key_action = body.api_key_action.strip().lower()
+    if key_action not in {"", "preserve", "replace", "delete"}:
+        raise HTTPException(status_code=400, detail="unsupported api_key_action")
+    supplied_key = body.api_key.strip()
+    if key_action == "replace" and not supplied_key:
+        raise HTTPException(status_code=400, detail="api_key is required for replace")
 
     def _apply():
-        # The editor never reads the stored secret back into the client. An
-        # empty api_key therefore means "keep the current key", not "delete
-        # it". Credential deletion has its own authenticated endpoint.
-        api_key = body.api_key.strip() or _configured_custom_model_api_key(
-            target_profile
-        )
+        configured_key = _configured_custom_model_api_key(target_profile)
+        if key_action == "replace":
+            api_key = supplied_key
+        elif key_action == "delete":
+            api_key = ""
+        elif key_action == "preserve":
+            api_key = configured_key
+        else:
+            # Legacy empty action has the same safe semantics as before.
+            api_key = supplied_key or configured_key
         with _profile_scope(target_profile):
-            return _apply_model_assignment_sync(
+            result = _apply_model_assignment_sync(
                 "main",
                 "custom",
                 body.model.strip(),
@@ -6629,6 +6675,14 @@ async def set_custom_model(
                 body.context_length,
                 body.reasoning_effort.strip().lower(),
             )
+        if key_action in {"replace", "delete"}:
+            _synchronize_custom_model_api_key(
+                target_profile,
+                base_url,
+                action=key_action,
+                value=api_key,
+            )
+        return result
 
     await asyncio.to_thread(_apply)
     return {"ok": True, **get_custom_model(target_profile)}
@@ -6641,6 +6695,52 @@ def _configured_custom_model_api_key(profile: Optional[str]) -> str:
     if not isinstance(configured, dict):
         return ""
     return str(configured.get("api_key") or configured.get("api") or "").strip()
+
+
+def _synchronize_custom_model_api_key(
+    profile: Optional[str],
+    base_url: str,
+    *,
+    action: str,
+    value: str = "",
+) -> bool:
+    """Replace or delete every config copy of one custom endpoint key."""
+
+    normalized_url = str(base_url or "").strip().rstrip("/")
+    replacement = str(value or "").strip()
+    changed = False
+    with _profile_scope(profile):
+        cfg = load_config()
+        model_cfg = cfg.get("model") if isinstance(cfg, dict) else None
+        if isinstance(model_cfg, dict):
+            if action == "replace":
+                if model_cfg.get("api_key") != replacement or "api" in model_cfg:
+                    model_cfg["api_key"] = replacement
+                    model_cfg.pop("api", None)
+                    changed = True
+            elif action == "delete":
+                changed = bool(model_cfg.pop("api_key", None)) or changed
+                changed = bool(model_cfg.pop("api", None)) or changed
+            cfg["model"] = model_cfg
+        providers = cfg.get("custom_providers") if isinstance(cfg, dict) else None
+        if isinstance(providers, list):
+            for entry in providers:
+                if not isinstance(entry, dict):
+                    continue
+                entry_url = str(entry.get("base_url") or "").strip().rstrip("/")
+                if not normalized_url or entry_url != normalized_url:
+                    continue
+                if action == "replace":
+                    if entry.get("api_key") != replacement or "api" in entry:
+                        entry["api_key"] = replacement
+                        entry.pop("api", None)
+                        changed = True
+                elif action == "delete":
+                    changed = bool(entry.pop("api_key", None)) or changed
+                    changed = bool(entry.pop("api", None)) or changed
+        if changed:
+            save_config(cfg)
+    return changed
 
 
 def _custom_model_catalog_endpoints(base_url: str) -> list[str]:

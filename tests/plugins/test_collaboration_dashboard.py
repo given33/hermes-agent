@@ -6,6 +6,7 @@ import os
 import threading
 import time
 import subprocess
+import sys
 import unittest
 from tempfile import TemporaryDirectory
 from pathlib import Path
@@ -129,41 +130,55 @@ class CollaborationDashboardTests(unittest.TestCase):
         self.assertEqual(module.summarize_task_title("你好吗"), "你好吗")
         self.assertEqual(module.summarize_task_title("你帮我检查服务"), "检查服务")
 
-    def test_profile_toolsets_connect_mcp_before_resolving_agent_snapshot(self):
+    def test_profile_toolsets_connect_only_hinted_live_mcp_before_snapshot(self):
         module = load_module()
         calls = []
-        config = {"mcp_servers": {"ios-location": {"enabled": True}}}
+        config = {
+            "mcp_servers": {
+                "ios-location": {"enabled": True},
+                "ios-motion": {"enabled": True},
+            }
+        }
+        live = SimpleNamespace(
+            name="ios-location",
+            live=True,
+            registered_tools=("mcp__ios_location__current_location",),
+        )
 
         with patch(
             "tools.mcp_tool.discover_mcp_tools",
-            side_effect=lambda: calls.append("discover") or ["current_location"],
+            side_effect=lambda **kwargs: calls.append(
+                ("discover", kwargs["capability_hints"])
+            ) or ["current_location"],
+        ), patch(
+            "tools.mcp_tool.get_mcp_availability",
+            return_value=[live],
         ), patch(
             "hermes_cli.tools_config._get_platform_tools",
-            side_effect=lambda current, platform: (
-                calls.append(("resolve", current, platform)) or {"ios-location"}
+            side_effect=lambda current, platform, **kwargs: (
+                calls.append(("resolve", current, platform, kwargs))
+                or {"file", "ios-location", "ios-motion"}
             ),
         ):
-            resolved = module._discover_profile_toolsets(config)
+            resolved = module._discover_profile_toolsets(config, ["ios.location"])
 
-        self.assertEqual(resolved, ["ios-location"])
-        self.assertEqual(calls[0], "discover")
-        self.assertEqual(calls[1], ("resolve", config, "cli"))
+        self.assertEqual(resolved, ["file", "ios-location"])
+        self.assertEqual(calls[0], ("discover", ["ios.location"]))
+        self.assertEqual(
+            calls[1],
+            ("resolve", config, "cli", {"include_default_mcp_servers": False}),
+        )
 
-    def test_personal_ios_mcp_request_stays_on_the_default_profile(self):
+    def test_personal_ios_mcp_request_adds_capability_hints_without_forcing_mode(self):
         module = load_module()
 
         routed = module.classify_user_intent(
             "Use MCP to query my current iPhone location",
-            model_classifier=lambda _content: {
-                "mode": "work",
-                "confidence": 0.99,
-                "profiles": ["dbb3-worker"],
-            },
         )
 
         self.assertEqual(routed["mode"], "chat")
         self.assertEqual(routed["profiles"], ["default"])
-        self.assertEqual(routed["source"], "managed-ios-mcp")
+        self.assertIn("ios.location", routed["capability_hints"])
         self.assertTrue(routed["needs_tools"])
 
     def test_hosted_event_cursor_survives_process_revision_changes(self):
@@ -183,7 +198,7 @@ class CollaborationDashboardTests(unittest.TestCase):
         self.assertEqual(conversation["event_cursor"], 2)
         self.assertEqual(persisted, [1, 2])
 
-    def test_cancellation_is_terminal_before_a_late_chat_completion(self):
+    def test_cancellation_stays_requested_until_execution_acknowledges_it(self):
         module = load_module()
         conversation = module.create_single_conversation("default")
         state = {"conversations": [conversation]}
@@ -243,15 +258,27 @@ class CollaborationDashboardTests(unittest.TestCase):
             },
         )
 
-        self.assertEqual(cancelled["status"], "cancelled")
-        self.assertEqual(run["status"], "cancelled")
-        self.assertEqual(run["remote_runs"]["worker"]["status"], "cancelling")
+        self.assertEqual(cancelled["status"], "running")
+        self.assertEqual(cancelled["stage"], "cancel_requested")
+        self.assertEqual(run["status"], "running")
+        self.assertEqual(run["remote_runs"]["worker"]["status"], "running")
         self.assertTrue(run["remote_runs"]["worker"]["cancel_requested"])
         self.assertFalse(any(
             message.get("meta", {}).get("message_key")
             == "turn-cancel-race:chat:completed"
             for message in conversation["messages"]
         ))
+        self.assertFalse(any(
+            message.get("meta", {}).get("final_report") is True
+            for message in conversation["messages"]
+        ))
+
+        run["remote_runs"]["worker"]["status"] = "cancelled"
+        self.assertTrue(module._finish_hosted_turn_if_cancelled(
+            conversation["id"],
+            "turn-cancel-race",
+        ))
+        self.assertEqual(run["status"], "cancelled")
         self.assertEqual(
             sum(
                 1
@@ -376,12 +403,10 @@ class CollaborationDashboardTests(unittest.TestCase):
         ), patch.object(
             module, "owner_id_from_request", return_value="owner-a"
         ), patch.object(
-            module, "route_message", return_value=route
-        ), patch.object(
-            module, "profile_model_readiness", return_value=readiness
+            module, "route_message", side_effect=AssertionError("routing ran before durable save")
         ), patch.object(
             module,
-            "start_hosted_workflow",
+            "start_hosted_routing",
             side_effect=lambda *args: starts.append(args),
         ):
             first = module.enqueue_hosted_turn(conversation["id"], payload, SimpleNamespace())
@@ -394,11 +419,107 @@ class CollaborationDashboardTests(unittest.TestCase):
         self.assertEqual(len(starts), 2)
         hosted = conversation["hosted_turns"]["turn-no-model"]
         self.assertEqual(hosted["status"], "queued")
-        self.assertEqual(hosted["stage"], "accepted")
+        self.assertEqual(hosted["stage"], "routing_pending")
+        self.assertEqual(first["route"]["mode"], "pending")
+        self.assertEqual(conversation["route_outbox"]["turn-no-model"]["state"], "pending")
         assistant_messages = [
             item for item in conversation["messages"] if item.get("role") == "assistant"
         ]
         self.assertEqual(assistant_messages, [])
+
+    def test_route_outbox_recovers_after_classifier_failure_without_duplicating_message(self):
+        module = load_module()
+        module.RouteMessageBody.model_rebuild(_types_namespace={"Any": Any})
+        conversation = module.create_single_conversation("default")
+        conversation["owner_id"] = "owner-route"
+        conversation["account_generation"] = "generation-route"
+        state = {"conversations": [conversation]}
+        payload = SimpleNamespace(
+            request_id="request-route-recovery",
+            turn_id="turn-route-recovery",
+            message={"id": "message-route-recovery", "role": "user", "content": "请修复天气功能"},
+            recent_messages=[],
+            profiles=[],
+            attachment_ids=[],
+            attachment_context="",
+            delivery_context="",
+            required_provider="",
+            required_model="",
+        )
+
+        with patch.object(module, "load_single_state", return_value=state), patch.object(
+            module, "save_single_state", side_effect=lambda _state: None
+        ), patch.object(module, "owner_id_from_request", return_value="owner-route"), patch.object(
+            module, "_account_generation_for_request", return_value="generation-route"
+        ), patch.object(
+            module, "_account_generation_for_owner", return_value="generation-route"
+        ), patch.object(module, "start_hosted_routing"):
+            accepted = module.enqueue_hosted_turn(
+                conversation["id"], payload, SimpleNamespace()
+            )
+
+        with patch.object(module, "load_single_state", return_value=state), patch.object(
+            module, "save_single_state", side_effect=lambda _state: None
+        ), patch.object(
+            module, "_account_generation_for_owner", return_value="generation-route"
+        ), patch.object(
+            module, "route_message", side_effect=TimeoutError("classifier offline")
+        ):
+            self.assertFalse(
+                module._complete_pending_hosted_route(
+                    conversation["id"], "turn-route-recovery"
+                )
+            )
+
+        self.assertTrue(accepted["accepted"])
+        self.assertEqual(
+            conversation["hosted_turns"]["turn-route-recovery"]["stage"],
+            "routing_failed",
+        )
+        self.assertEqual(
+            conversation["route_outbox"]["turn-route-recovery"]["state"],
+            "retryable",
+        )
+
+        route = {
+            "mode": "work",
+            "label": "群聊 + 工作流",
+            "reason": "确定性执行请求",
+            "title": "修复天气功能",
+            "profiles": ["default", "dbb3-worker", "reviewer"],
+            "artifact_required": False,
+            "artifact": {"decision": "none"},
+            "source": "rules",
+            "confidence": 0.99,
+            "lock_level": "hard_work",
+        }
+        starts = []
+        with patch.object(module, "load_single_state", return_value=state), patch.object(
+            module, "save_single_state", side_effect=lambda _state: None
+        ), patch.object(
+            module, "_account_generation_for_owner", return_value="generation-route"
+        ), patch.object(module, "route_message", return_value=route), patch.object(
+            module, "start_hosted_workflow", side_effect=lambda *args: starts.append(args)
+        ):
+            self.assertTrue(
+                module._complete_pending_hosted_route(
+                    conversation["id"], "turn-route-recovery"
+                )
+            )
+
+        run = conversation["hosted_turns"]["turn-route-recovery"]
+        self.assertEqual(run["stage"], "accepted")
+        self.assertEqual(run["mode"], "work")
+        self.assertNotIn("route_outbox", conversation)
+        self.assertEqual(starts, [(conversation["id"], "turn-route-recovery")])
+        self.assertEqual(
+            sum(message.get("role") == "user" for message in conversation["messages"]),
+            1,
+        )
+        self.assertEqual(
+            sum(message.get("kind") == "route" for message in conversation["messages"]),
+            1,
+        )
 
     def test_room_store_round_trip(self):
         module = load_module()
@@ -567,7 +688,7 @@ class CollaborationDashboardTests(unittest.TestCase):
             "t_worker_child",
         )
 
-    def test_structured_profile_turn_uses_five_attempts_with_minute_retry_cadence(self):
+    def test_structured_profile_turn_uses_five_attempts_with_bounded_retry_cadence(self):
         module = load_module()
         captured = {}
 
@@ -607,11 +728,125 @@ class CollaborationDashboardTests(unittest.TestCase):
 
         self.assertEqual(response, "连接成功")
         self.assertEqual(captured["env"]["HERMES_API_MAX_RETRIES"], "5")
-        self.assertEqual(captured["env"]["HERMES_API_RETRY_DELAY_SECONDS"], "60")
+        self.assertEqual(captured["env"]["HERMES_API_RETRY_DELAY_SECONDS"], "15")
         self.assertEqual(captured["env"]["HERMES_API_RETRY_STATUS_LIVE"], "1")
         self.assertEqual(captured["env"]["HERMES_API_RETRY_CLIENT_ERRORS"], "1")
         self.assertGreater(captured["wait_timeout"], 599)
         self.assertLessEqual(captured["wait_timeout"], 600)
+
+    def test_structured_profile_turn_drains_large_stderr_concurrently(self):
+        module = load_module()
+        script = (
+            "import json,sys;"
+            "sys.stderr.write('x' * 262144);sys.stderr.flush();"
+            "print(json.dumps({'type':'message.complete','payload':"
+            "{'text':'stderr-drained','status':'completed'}}),flush=True)"
+        )
+
+        def process_factory(_command, **kwargs):
+            return subprocess.Popen([sys.executable, "-c", script], **kwargs)
+
+        result = module.run_profile_turn(
+            "default",
+            "hello",
+            process_factory=process_factory,
+            timeout=5,
+        )
+
+        self.assertEqual(result, "stderr-drained")
+
+    def test_model_readiness_deadline_fails_before_a_late_sixth_attempt(self):
+        module = load_module()
+        conversation = module.create_single_conversation("default")
+        state = {"conversations": [conversation]}
+        run = module.create_hosted_turn_record(
+            conversation,
+            turn_id="turn-model-deadline",
+            content="你好",
+            title="你好",
+            profiles=["default"],
+            artifact_required=False,
+            mode="chat",
+            route_metadata={"mode": "chat"},
+        )
+        run.update(
+            {
+                "status": "running",
+                "model_retry_deadline_at": int(time.time() * 1000) - 1,
+                "model_readiness_attempt": 4,
+            }
+        )
+        readiness_calls = []
+
+        with patch.object(module, "load_single_state", return_value=state), patch.object(
+            module, "save_single_state", side_effect=lambda _state: None
+        ), patch.object(
+            module,
+            "profile_model_readiness",
+            side_effect=lambda _profile: readiness_calls.append(True) or {"ready": True},
+        ):
+            recovered = module._wait_for_hosted_chat_model(
+                conversation["id"], "turn-model-deadline", "default"
+            )
+
+        self.assertFalse(recovered)
+        self.assertEqual(readiness_calls, [])
+        self.assertEqual(run["status"], "failed")
+        self.assertEqual(run["error_code"], "model_connection_deadline_exceeded")
+
+    def test_structured_account_turn_uses_managed_resource_runtime_overlay(self):
+        module = load_module()
+        captured = {}
+
+        class FakeProcess:
+            def __init__(self):
+                self.stdin = io.StringIO()
+                self.stdout = io.StringIO(
+                    json.dumps({
+                        "type": "message.complete",
+                        "payload": {"text": "ready", "status": "completed"},
+                    }) + "\n"
+                )
+                self.stderr = io.StringIO()
+
+            def poll(self):
+                return 0
+
+            def wait(self, timeout=None):
+                return 0
+
+            def kill(self):
+                return None
+
+            def terminate(self):
+                return None
+
+        def process_factory(_command, **kwargs):
+            captured["env"] = kwargs["env"]
+            return FakeProcess()
+
+        overlay = Path(os.environ["HERMES_HOME"]) / "profiles" / "acct-runtime"
+        with patch(
+            "hermes_cli.managed_installations.managed_account_runtime_home",
+            return_value=overlay,
+        ) as runtime_home:
+            response = module.run_profile_turn(
+                "default",
+                "hello",
+                process_factory=process_factory,
+                artifact_context={
+                    "root": os.environ["HERMES_HOME"],
+                    "owner_id": "alice",
+                    "account_generation": "alice-gen-7",
+                    "conversation_id": "conversation-1",
+                    "turn_id": "turn-1",
+                },
+            )
+
+        self.assertEqual(response, "ready")
+        self.assertEqual(captured["env"]["HERMES_HOME"], str(overlay))
+        runtime_home.assert_called_once()
+        self.assertEqual(runtime_home.call_args.args[:3], ("alice", "alice-gen-7", "default"))
 
     def test_structured_profile_turn_deadline_includes_blocked_stdin_write(self):
         module = load_module()
@@ -1388,7 +1623,7 @@ class CollaborationDashboardTests(unittest.TestCase):
         self.assertEqual(response, "ok")
         env = captured["kwargs"]["env"]
         self.assertEqual(env["HERMES_API_MAX_RETRIES"], "5")
-        self.assertEqual(env["HERMES_API_RETRY_DELAY_SECONDS"], "60")
+        self.assertEqual(env["HERMES_API_RETRY_DELAY_SECONDS"], "15")
         self.assertEqual(env["HERMES_API_RETRY_CLIENT_ERRORS"], "1")
         self.assertEqual(env["HERMES_API_RETRY_STATUS_LIVE"], "1")
 
@@ -1652,6 +1887,24 @@ class CollaborationDashboardTests(unittest.TestCase):
         self.assertIn("pc-worker", work["profiles"])
         self.assertIn("reviewer", work["profiles"])
 
+    def test_explicit_work_lock_wins_and_ios_mcp_only_adds_capability_hints(self):
+        module = load_module()
+        calls = []
+
+        routed = module.classify_user_intent(
+            "请安装天气 MCP，然后修复我 iPhone 上的智能天气并运行测试",
+            model_classifier=lambda text: calls.append(text) or {
+                "mode": "chat",
+                "confidence": 0.99,
+            },
+        )
+
+        self.assertEqual(calls, [])
+        self.assertEqual(routed["mode"], "work")
+        self.assertEqual(routed["lock_level"], "hard_work")
+        self.assertIn("ios.weather", routed["capability_hints"])
+        self.assertIn("capability.ios_mcp", routed["rationale_codes"])
+
     def test_worker_target_constraints_honor_only_and_negative_wording(self):
         module = load_module()
 
@@ -1791,6 +2044,8 @@ class CollaborationDashboardTests(unittest.TestCase):
             "检查项目里的文件并运行测试",
             "分析日志，直接告诉我结论",
             "修改代码后汇报结果",
+            "分析仓库并生成发布报告",
+            "Review the repository and generate a release report",
             "搜索网页并总结重点",
             "分析我上传的 PDF，只在会话里告诉我结论",
             "Inspect the uploaded file and summarize it in chat",
@@ -3007,6 +3262,112 @@ class CollaborationDashboardTests(unittest.TestCase):
         self.assertEqual(raised.exception.status_code, 409)
         self.assertEqual(remote["status"], "queued")
 
+    def test_remote_run_payload_carries_immutable_account_boundary(self):
+        module = load_module()
+        conversation = module.create_single_conversation("default")
+        conversation.update(
+            {
+                "owner_id": "alice@example.test",
+                "account_generation": "generation-4",
+            }
+        )
+        state = {"conversations": [conversation]}
+        module.load_single_state = lambda: state
+        module.save_single_state = lambda _state: None
+        module._account_generation_for_owner = lambda _owner: "generation-4"
+        module.create_hosted_turn_record(
+            conversation,
+            turn_id="turn-account-boundary",
+            content="execute",
+            title="execute",
+            profiles=["dbb3-worker"],
+            artifact_required=False,
+        )
+
+        remote = module._ensure_remote_run(
+            conversation["id"],
+            "turn-account-boundary",
+            role_stage="worker",
+            profile="dbb3-worker",
+            title="execute",
+            objective="execute",
+            local_task_id="child",
+            artifact_required=False,
+            delivery_context="",
+            attachment_context="",
+        )
+        public = module._remote_run_connector_payload(remote)
+
+        self.assertEqual(public["profile"], "dbb3-worker")
+        self.assertEqual(public["owner_id"], "alice@example.test")
+        self.assertEqual(public["account_generation"], "generation-4")
+        conversation["account_generation"] = "generation-5"
+        module._account_generation_for_owner = lambda _owner: "generation-5"
+        with self.assertRaises(module.CollaborationAccountDeletionInProgress):
+            module._ensure_remote_run(
+                conversation["id"],
+                "turn-account-boundary",
+                role_stage="worker",
+                profile="dbb3-worker",
+                title="execute",
+                objective="execute",
+                local_task_id="child",
+                artifact_required=False,
+                delivery_context="",
+                attachment_context="",
+            )
+
+    def test_remote_pull_fails_closed_for_old_account_generation(self):
+        module = load_module()
+        conversation = module.create_single_conversation("default")
+        conversation.update(
+            {
+                "owner_id": "alice@example.test",
+                "account_generation": "generation-old",
+            }
+        )
+        state = {"conversations": [conversation]}
+        module.load_single_state = lambda: state
+        module.save_single_state = lambda _state: None
+        module._notify_hosted_update = lambda *_args: None
+        module._require_connector = lambda _request: "dbb3-primary"
+        module._account_generation_for_owner = lambda _owner: "generation-old"
+        run = module.create_hosted_turn_record(
+            conversation,
+            turn_id="turn-old-generation",
+            content="execute",
+            title="execute",
+            profiles=["dbb3-worker"],
+            artifact_required=False,
+        )
+        remote = module._ensure_remote_run(
+            conversation["id"],
+            "turn-old-generation",
+            role_stage="worker",
+            profile="dbb3-worker",
+            title="execute",
+            objective="execute",
+            local_task_id="child",
+            artifact_required=False,
+            delivery_context="",
+            attachment_context="",
+        )
+        module._account_generation_for_owner = lambda _owner: "generation-new"
+
+        response = module.connector_pull_runs(
+            module.ConnectorPullBody(
+                connector_id="dbb3-primary",
+                limit=1,
+                lease_seconds=30,
+            ),
+            SimpleNamespace(),
+        )
+
+        self.assertEqual(response["runs"], [])
+        persisted = run["remote_runs"]["worker"]
+        self.assertEqual(persisted["status"], "queued")
+        self.assertNotIn("claim_token", persisted)
+
     def test_remote_claim_token_rotation_rejects_the_old_same_connector_worker(self):
         module = load_module()
         conversation = module.create_single_conversation("default")
@@ -3077,6 +3438,7 @@ class CollaborationDashboardTests(unittest.TestCase):
                 with self.assertRaises(module.HTTPException) as raised:
                     stale_call()
                 self.assertEqual(raised.exception.status_code, 409)
+                self.assertEqual(raised.exception.detail["reason"], "claim_lost")
 
             acknowledged = module.connector_ack_run(
                 remote["id"],
@@ -3105,6 +3467,312 @@ class CollaborationDashboardTests(unittest.TestCase):
                 "turn-remote-token-race"
             ]["remote_runs"]["worker"]
             self.assertEqual(persisted["result"], "authoritative result")
+
+    def test_remote_deadline_is_minimum_of_policy_server_cap_and_hosted_deadline(self):
+        module = load_module()
+        conversation = module.create_single_conversation("default")
+        state = {"conversations": [conversation]}
+        module.load_single_state = lambda: state
+        module.save_single_state = lambda _state: None
+        module._notify_hosted_update = lambda *_args: None
+
+        with patch.object(module.time, "time", return_value=1000.0):
+            dbb3 = module.create_hosted_turn_record(
+                conversation,
+                turn_id="turn-dbb3-deadline",
+                content="run",
+                title="run",
+                profiles=["dbb3-worker"],
+                artifact_required=False,
+                route_metadata={"remote_max_runtime_seconds": 1200},
+            )
+            dbb3_remote = module._ensure_remote_run(
+                conversation["id"],
+                dbb3["turn_id"],
+                role_stage="worker",
+                profile="dbb3-worker",
+                title="run",
+                objective="run",
+                local_task_id="dbb3-child",
+                artifact_required=False,
+                delivery_context="",
+                attachment_context="",
+            )
+            self.assertEqual(dbb3_remote["max_runtime_seconds"], 900)
+            self.assertEqual(dbb3_remote["deadline_at"], 1_900_000)
+
+            pc_default = module.create_hosted_turn_record(
+                conversation,
+                turn_id="turn-pc-default-deadline",
+                content="run",
+                title="run",
+                profiles=["pc-worker"],
+                artifact_required=False,
+            )
+            pc_default_remote = module._ensure_remote_run(
+                conversation["id"],
+                pc_default["turn_id"],
+                role_stage="worker",
+                profile="pc-worker",
+                title="run",
+                objective="run",
+                local_task_id="pc-default-child",
+                artifact_required=False,
+                delivery_context="",
+                attachment_context="",
+            )
+            self.assertEqual(pc_default_remote["max_runtime_seconds"], 1800)
+            self.assertEqual(pc_default_remote["deadline_at"], 2_800_000)
+
+            pc = module.create_hosted_turn_record(
+                conversation,
+                turn_id="turn-pc-deadline",
+                content="run",
+                title="run",
+                profiles=["pc-worker"],
+                artifact_required=False,
+                route_metadata={"remote_max_runtime_seconds": 1200},
+            )
+            pc_remote = module._ensure_remote_run(
+                conversation["id"],
+                pc["turn_id"],
+                role_stage="worker",
+                profile="pc-worker",
+                title="run",
+                objective="run",
+                local_task_id="pc-child",
+                artifact_required=False,
+                delivery_context="",
+                attachment_context="",
+            )
+            self.assertEqual(pc_remote["max_runtime_seconds"], 1200)
+
+            hosted_cap = module.create_hosted_turn_record(
+                conversation,
+                turn_id="turn-hosted-deadline",
+                content="run",
+                title="run",
+                profiles=["pc-worker"],
+                artifact_required=False,
+                route_metadata={"remote_max_runtime_seconds": 1600},
+            )
+            hosted_cap["deadline_at"] = 1_600_000
+            capped_remote = module._ensure_remote_run(
+                conversation["id"],
+                hosted_cap["turn_id"],
+                role_stage="worker",
+                profile="pc-worker",
+                title="run",
+                objective="run",
+                local_task_id="hosted-child",
+                artifact_required=False,
+                delivery_context="",
+                attachment_context="",
+            )
+            self.assertEqual(capped_remote["max_runtime_seconds"], 600)
+            self.assertEqual(capped_remote["deadline_at"], 1_600_000)
+
+    def test_remote_timeout_cancel_ack_seals_single_timed_out_terminal(self):
+        module = load_module()
+        conversation = module.create_single_conversation("default")
+        state = {"conversations": [conversation]}
+        module.load_single_state = lambda: state
+        module.save_single_state = lambda _state: None
+        module._notify_hosted_update = lambda *_args: None
+        module._remote_run_state_message = lambda *_args, **_kwargs: None
+        module._finalize_pending_conversation_deletion = lambda *_args: None
+        module._require_connector = lambda _request: "dbb3-primary"
+
+        clock = [1000.0]
+        with patch.object(module.time, "time", side_effect=lambda: clock[0]):
+            hosted = module.create_hosted_turn_record(
+                conversation,
+                turn_id="turn-timeout",
+                content="run",
+                title="run",
+                profiles=["dbb3-worker"],
+                artifact_required=False,
+            )
+            remote = module._ensure_remote_run(
+                conversation["id"],
+                hosted["turn_id"],
+                role_stage="worker",
+                profile="dbb3-worker",
+                title="run",
+                objective="run",
+                local_task_id="child",
+                artifact_required=False,
+                delivery_context="",
+                attachment_context="",
+            )
+            persisted_remote = hosted["remote_runs"]["worker"]
+            first_claim = module.connector_pull_runs(
+                module.ConnectorPullBody(
+                    connector_id="dbb3-primary", limit=1, lease_seconds=30
+                ),
+                SimpleNamespace(),
+            )["runs"][0]["claim_token"]
+            module.connector_ack_run(
+                remote["id"],
+                module.ConnectorAckBody(
+                    connector_id="dbb3-primary",
+                    claim_token=first_claim,
+                    lease_seconds=30,
+                ),
+                SimpleNamespace(),
+            )
+
+            clock[0] = 1900.0
+            cancellation = module.connector_pull_cancellations(
+                module.ConnectorPullBody(
+                    connector_id="dbb3-primary", limit=1, lease_seconds=30
+                ),
+                SimpleNamespace(),
+            )["cancellations"][0]
+            self.assertNotEqual(cancellation["claim_token"], first_claim)
+            self.assertEqual(persisted_remote["status"], "cancelling")
+            self.assertEqual(hosted["stage"], "awaiting_cancellation")
+
+            terminal = module.connector_cancel_ack(
+                remote["id"],
+                module.ConnectorCancelAckBody(
+                    connector_id="dbb3-primary",
+                    claim_token=cancellation["claim_token"],
+                    checkpoint_cursor=1,
+                    summary="cancelled locally",
+                ),
+                SimpleNamespace(),
+            )["run"]
+            self.assertEqual(terminal["status"], "timed_out")
+
+            with self.assertRaises(module.HTTPException) as raised:
+                module.connector_status_run(
+                    remote["id"],
+                    module.ConnectorStatusBody(
+                        connector_id="dbb3-primary",
+                        claim_token=first_claim,
+                        checkpoint_cursor=2,
+                        status="completed",
+                        terminal=True,
+                        result="late result",
+                    ),
+                    SimpleNamespace(),
+                )
+            self.assertEqual(raised.exception.status_code, 409)
+            self.assertEqual(raised.exception.detail["reason"], "terminal_sealed")
+            self.assertEqual(persisted_remote["status"], "timed_out")
+
+    def test_remote_conflicts_report_lease_and_generation_reasons(self):
+        module = load_module()
+        conversation = module.create_single_conversation("default")
+        conversation.update(
+            {"owner_id": "owner@example.test", "account_generation": "gen-1"}
+        )
+        state = {"conversations": [conversation]}
+        module.load_single_state = lambda: state
+        module.save_single_state = lambda _state: None
+        module._notify_hosted_update = lambda *_args: None
+        module._require_connector = lambda _request: "dbb3-primary"
+        live_generation = ["gen-1"]
+        module._account_generation_for_owner = lambda _owner: live_generation[0]
+
+        clock = [1000.0]
+        with patch.object(module.time, "time", side_effect=lambda: clock[0]):
+            hosted = module.create_hosted_turn_record(
+                conversation,
+                turn_id="turn-conflict-reasons",
+                content="run",
+                title="run",
+                profiles=["dbb3-worker"],
+                artifact_required=False,
+            )
+            remote = module._ensure_remote_run(
+                conversation["id"],
+                hosted["turn_id"],
+                role_stage="worker",
+                profile="dbb3-worker",
+                title="run",
+                objective="run",
+                local_task_id="child",
+                artifact_required=False,
+                delivery_context="",
+                attachment_context="",
+            )
+            claim = module.connector_pull_runs(
+                module.ConnectorPullBody(
+                    connector_id="dbb3-primary", limit=1, lease_seconds=5
+                ),
+                SimpleNamespace(),
+            )["runs"][0]["claim_token"]
+            clock[0] = 1006.0
+            with self.assertRaises(module.HTTPException) as lease_error:
+                module.connector_status_run(
+                    remote["id"],
+                    module.ConnectorStatusBody(
+                        connector_id="dbb3-primary",
+                        claim_token=claim,
+                        checkpoint_cursor=1,
+                    ),
+                    SimpleNamespace(),
+                )
+            self.assertEqual(lease_error.exception.detail["reason"], "lease_expired")
+
+            live_generation[0] = "gen-2"
+            with self.assertRaises(module.HTTPException) as generation_error:
+                module.connector_status_run(
+                    remote["id"],
+                    module.ConnectorStatusBody(
+                        connector_id="dbb3-primary",
+                        claim_token=claim,
+                        checkpoint_cursor=1,
+                    ),
+                    SimpleNamespace(),
+                )
+            self.assertEqual(
+                generation_error.exception.detail["reason"], "generation_deleted"
+            )
+
+    def test_remote_timeout_seals_after_cancel_delivery_grace_without_ack(self):
+        module = load_module()
+        conversation = module.create_single_conversation("default")
+        state = {"conversations": [conversation]}
+        module.load_single_state = lambda: state
+        module.save_single_state = lambda _state: None
+        module._notify_hosted_update = lambda *_args: None
+
+        with patch.object(module.time, "time", return_value=1000.0):
+            hosted = module.create_hosted_turn_record(
+                conversation,
+                turn_id="turn-timeout-no-ack",
+                content="run",
+                title="run",
+                profiles=["dbb3-worker"],
+                artifact_required=False,
+            )
+            module._ensure_remote_run(
+                conversation["id"],
+                hosted["turn_id"],
+                role_stage="worker",
+                profile="dbb3-worker",
+                title="run",
+                objective="run",
+                local_task_id="child",
+                artifact_required=False,
+                delivery_context="",
+                attachment_context="",
+            )
+        remote = hosted["remote_runs"]["worker"]
+
+        changed = module._advance_remote_run_deadlines(state, now=1_900_000)
+        self.assertEqual(changed, {conversation["id"]})
+        self.assertEqual(remote["status"], "cancel_requested")
+        self.assertEqual(hosted["stage"], "awaiting_cancellation")
+
+        changed = module._advance_remote_run_deadlines(state, now=1_960_000)
+        self.assertEqual(changed, {conversation["id"]})
+        self.assertEqual(remote["status"], "timed_out")
+        self.assertEqual(remote["lease_until"], 0)
+        self.assertNotIn("claim_token", remote)
 
     def test_two_remote_coordinators_share_only_the_authoritative_role_result(self):
         module = load_module()
@@ -5253,7 +5921,7 @@ class CollaborationDashboardTests(unittest.TestCase):
             Path.cwd() / "account-files" / "report.pdf"
         ).resolve()
         module._file_library = lambda: SimpleNamespace(
-            resolve_download=lambda owner_id, file_id: (
+            resolve_download=lambda owner_id, file_id, **_kwargs: (
                 {
                     "id": file_id,
                     "mime_type": "application/pdf",
@@ -5957,30 +6625,21 @@ class CollaborationDashboardTests(unittest.TestCase):
             )
         )
 
-    def test_intent_classifier_is_model_first_and_adjudicates_low_confidence(self):
+    def test_intent_classifier_hard_chat_lock_rejects_conflicting_model(self):
         module = load_module()
         calls = []
-        answers = [
-            {"mode": "chat", "confidence": 0.4, "reason": "uncertain"},
-            {
-                "mode": "work",
-                "confidence": 0.92,
-                "reason": "requires execution",
-                "profiles": ["pc-worker"],
-                "targets": ["pc"],
-                "artifact": {"decision": "none", "types": [], "reason": "repo edit"},
-            },
-        ]
-
         routed = module.classify_user_intent(
             "你好",
-            model_classifier=lambda text: calls.append(text) or answers.pop(0),
+            model_classifier=lambda text: calls.append(text) or {
+                "mode": "work",
+                "confidence": 0.99,
+                "profiles": ["pc-worker"],
+            },
         )
 
-        self.assertEqual(calls, ["你好", "你好"])
-        self.assertEqual(routed["mode"], "work")
-        self.assertEqual(routed["source"], "model")
-        self.assertEqual(routed["profiles"], ["default", "pc-worker", "reviewer"])
+        self.assertEqual(calls, [])
+        self.assertEqual(routed["mode"], "chat")
+        self.assertEqual(routed["lock_level"], "hard_chat")
         self.assertFalse(routed["artifact_required"])
 
     def test_hosted_turn_record_persists_route_contract(self):

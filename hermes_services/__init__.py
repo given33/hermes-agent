@@ -21,8 +21,13 @@ from .auth import (
     is_rate_limited_auth_error,
 )
 from .application import HermesApplicationKernel
+from .contexts import BoundedContext, BoundedContextRegistry
 from .cron_fire import CronFireAcceptance, accept_cron_fire_request
-from .http_boundary import HttpBoundaryPolicy
+from .http_boundary import (
+    HttpBoundaryCompatibilityAdapter,
+    HttpBoundaryPolicy,
+    HttpContractMode,
+)
 from .jsonrpc import JsonRpcMethodRegistry
 from .session_registry import LiveSessionRegistry
 from .middleware import (
@@ -49,11 +54,15 @@ __all__ = [
     "CODEX_RATE_LIMITED_CODE",
     "CronFireAcceptance",
     "HermesApplicationKernel",
+    "BoundedContext",
+    "BoundedContextRegistry",
     "JsonRpcMethodRegistry",
     "LiveSessionRegistry",
     "MiddlewareBackend",
     "RequestMiddlewareResult",
     "HttpBoundaryPolicy",
+    "HttpBoundaryCompatibilityAdapter",
+    "HttpContractMode",
     "API_SECURITY_HEADERS",
     "DASHBOARD_SECURITY_HEADERS",
     "DEFAULT_MAX_REQUEST_BYTES",

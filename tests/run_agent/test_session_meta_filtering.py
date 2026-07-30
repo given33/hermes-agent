@@ -62,6 +62,15 @@ class TestSanitizeApiMessagesRoleFilter:
         assert len(out) == 2
         assert [m["role"] for m in out] == ["user", "assistant"]
 
+    def test_hook_trace_is_not_sent_to_provider(self):
+        trace = [{"point": "after_provider_response", "status": "ok"}]
+        stored = {"role": "assistant", "content": "done", "hook_trace": trace}
+
+        out = AIAgent._sanitize_api_messages([stored])
+
+        assert out == [{"role": "assistant", "content": "done"}]
+        assert stored["hook_trace"] == trace
+
 
 # ---------------------------------------------------------------------------
 # Layer 2 — CLI session-restore filters session_meta before loading

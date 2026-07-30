@@ -150,11 +150,11 @@ EXPOSED_TOOLS: tuple[str, ...] = (
 
 
 def _build_server() -> Any:
-    """Create the FastMCP server with Hermes tools attached. Lazy imports
+    """Create the MCP server with Hermes tools attached. Lazy imports
     so the module can be imported without the mcp package installed
     (we degrade to a clear error only when actually run)."""
     try:
-        from mcp.server.fastmcp import FastMCP
+        from mcp.server import MCPServer
     except ImportError as exc:  # pragma: no cover - install hint
         raise ImportError(
             f"hermes-tools MCP server requires the 'mcp' package: {exc}"
@@ -166,7 +166,7 @@ def _build_server() -> Any:
         handle_function_call,
     )
 
-    mcp = FastMCP(
+    mcp = MCPServer(
         "hermes-tools",
         instructions=(
             "Hermes Agent's tool surface, exposed for use inside a Codex "
@@ -198,10 +198,10 @@ def _build_server() -> Any:
         description = spec.get("description") or f"Hermes {name} tool"
         params_schema = spec.get("parameters") or {"type": "object", "properties": {}}
 
-        # FastMCP wants a Python callable. Build a closure that takes the
+        # MCPServer wants a Python callable. Build a closure that takes the
         # arguments dict, dispatches via handle_function_call, and returns
         # the result string. We use add_tool() for full control over the
-        # input schema (FastMCP's @tool() decorator inspects type hints,
+        # input schema (MCPServer's @tool() decorator inspects type hints,
         # which we can't get from a JSON schema at runtime).
         def _make_handler(tool_name: str, schema: dict | None):
             sig, annots = _signature_from_schema(schema)
@@ -222,18 +222,11 @@ def _build_server() -> Any:
             _dispatch.__annotations__ = {**annots, "return": str}
             return _dispatch
 
-        try:
-            mcp.add_tool(
-                _make_handler(name, params_schema),
-                name=name,
-                description=description,
-            )
-        except TypeError:
-            # Older mcp SDK signature — fall back to decorator-style. The
-            # synthesized __signature__ on the handler still drives schema
-            # generation there.
-            handler = _make_handler(name, params_schema)
-            handler = mcp.tool(name=name, description=description)(handler)
+        mcp.add_tool(
+            _make_handler(name, params_schema),
+            name=name,
+            description=description,
+        )
 
         exposed_count += 1
 
@@ -267,7 +260,7 @@ def main(argv: Optional[list[str]] = None) -> int:
         sys.stderr.write(f"hermes-tools MCP server cannot start: {exc}\n")
         return 2
 
-    # FastMCP runs with stdio transport by default when launched as a
+    # MCPServer runs with stdio transport by default when launched as a
     # subprocess.
     try:
         server.run()

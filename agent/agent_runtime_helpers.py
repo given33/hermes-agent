@@ -2536,6 +2536,7 @@ def invoke_tool(agent, function_name: str, function_args: dict, effective_task_i
                 enabled_toolsets=getattr(agent, "enabled_toolsets", None),
                 disabled_toolsets=getattr(agent, "disabled_toolsets", None),
                 tool_request_middleware_trace=list(_tool_middleware_trace),
+                enforce_tool_isolation=True,
             )
 
     from hermes_services.middleware import run_tool_execution_middleware
@@ -2666,6 +2667,10 @@ def sanitize_api_messages(messages: List[Dict[str, Any]]) -> List[Dict[str, Any]
                 role,
             )
             continue
+        # Internal audit metadata must never cross the provider protocol
+        # boundary, including callers that bypass the normal builders.
+        if "hook_trace" in msg:
+            msg = {key: value for key, value in msg.items() if key != "hook_trace"}
         filtered.append(msg)
     messages = filtered
 

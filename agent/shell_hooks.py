@@ -542,7 +542,7 @@ def _terminate_hook_process_tree(proc: subprocess.Popen) -> None:
             pass
     else:
         try:
-            os.killpg(proc.pid, signal.SIGKILL)
+            os.killpg(proc.pid, signal.SIGKILL)  # windows-footgun: ok - POSIX-only branch
             return
         except (OSError, ProcessLookupError):
             pass

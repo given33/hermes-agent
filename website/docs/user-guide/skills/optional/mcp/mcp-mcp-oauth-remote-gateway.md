@@ -304,29 +304,32 @@ mcp_servers:
 
 ### 10. Smoke-test the token BEFORE asking the user to reload
 
-Manually POST an MCP `initialize` request to confirm the token works end-to-end —
+Manually POST an MCP `server/discover` request to confirm the token works end-to-end —
 this catches scope misconfigurations, wrong `resource` values, and CF blocks
 before the user is confused by another "No MCP tools available" reload:
 
 ```python
 body = json.dumps({
-    "jsonrpc": "2.0", "id": 1, "method": "initialize",
-    "params": {
-        "protocolVersion": "2025-06-18",
-        "capabilities": {},
-        "clientInfo": {"name": "hermes-debug", "version": "1.0"},
-    },
+    "jsonrpc": "2.0", "id": 1, "method": "server/discover",
+    "params": {"_meta": {
+        "io.modelcontextprotocol/protocolVersion": "2026-07-28",
+        "io.modelcontextprotocol/clientCapabilities": {},
+        "io.modelcontextprotocol/clientInfo": {
+            "name": "hermes-debug", "version": "2.0"
+        },
+    }},
 }).encode()
 # POST to the MCP URL with:
 #   Authorization: Bearer <access_token>
 #   Accept: application/json, text/event-stream
 #   Content-Type: application/json
-#   MCP-Protocol-Version: 2025-06-18
+#   MCP-Protocol-Version: 2026-07-28
+#   Mcp-Method: server/discover
 #   User-Agent: python-httpx/0.27
 ```
 
 Expect HTTP 200 with `Content-Type: text/event-stream` and a JSON-RPC result
-containing `serverInfo` and `capabilities`. **Do not use `urllib` with its default
+containing `supportedVersions` and `capabilities`. **Do not use `urllib` with its default
 UA** — Cloudflare will 403 you even though Hermes (which uses httpx) will succeed.
 `scripts/diagnose-oauth-mcp.py` automates this smoke test.
 
@@ -348,7 +351,7 @@ tools. Refresh happens automatically before `expires_in` elapses.
 
 5. **Trailing slash matters.** Some servers advertise the resource as `https://mcp.example.com/` with a trailing slash and reject tokens issued against the no-slash variant. Copy the `resource` value verbatim from the `.well-known/oauth-protected-resource` response.
 
-6. **`/reload-mcp` is silent on failure.** If the reload shows "No MCP tools available" with no `change_detail` line, a server is in config but failed to connect and no error bubbled up. Tail the error log, smoke-test the token directly with a manual `initialize` POST, and — if everything looks good — ask for a full process restart.
+6. **`/reload-mcp` is silent on failure.** If the reload shows "No MCP tools available" with no `change_detail` line, a server is in config but failed to connect and no error bubbled up. Tail the error log, smoke-test the token directly with a manual `server/discover` POST, and — if everything looks good — ask for a full process restart.
 
 7. **Circuit breaker can survive `/reload-mcp`.** `tools/mcp_tool.py` keeps a module-level error-count dict with a small threshold. Once tripped (e.g. after token expiry produces several consecutive failures), the tool handler can short-circuit before calling the server, so no successful call resets the counter. Symptom: reload says "Reconnected: X" but subsequent calls still fail with "server unreachable" in the same conversation. Recovery order: try `/reload-mcp` FIRST (cheap, no chat-process blip) — on current builds it can clear the counter; only escalate to a full gateway process restart if a live call STILL short-circuits after reload. Do not lead with "you must restart."
 
@@ -356,7 +359,7 @@ tools. Refresh happens automatically before `expires_in` elapses.
 
 9. **`invalid_grant` on a manual refresh means the refresh token is DEAD — re-auth is the only fix, do not loop.** When the access_token has been expired long enough, the refresh_token can also be revoked/expired server-side. A `grant_type=refresh_token` POST then returns HTTP 400 `{"error":"invalid_grant",...}` (wording varies: "Grant not found", "Token expired", "refresh token is invalid"). There is NO recovery from the gateway side. Hand back to the user with two options: (a) re-run the full manual OAuth dance (steps 3–10), or (b) if the provider offers a static personal API key, switch to that — no refresh/expiry cycle, more durable for an unattended remote gateway. Detect early: before any create/update operation against an OAuth MCP, check `expires_at` vs `time.time()`; if already expired, attempt the refresh first and surface `invalid_grant` immediately rather than failing mid-task.
 
-10. **A successful refresh that STILL yields a rejected token = server-side SESSION revocation; only a fresh authorization_code flow fixes it.** Distinct from pitfall 9. The stored token file can look healthy (`expires_at` well out, refresh_token present), yet a live `initialize` POST returns `401 invalid_token` with a JSON-RPC body like `{"error":{"code":-32002,"message":"Session expired. Please re-authenticate."}}`. The `grant_type=refresh_token` POST may **succeed** (HTTP 200, new access_token) — yet the brand-new token gets the SAME `-32002`. The provider revoked the underlying MCP *session* server-side; the OAuth refresh chain re-mints credentials but cannot re-establish a revoked session. Decision rule when an OAuth MCP reports "not connected": (1) smoke-test the stored access_token with a manual `initialize` POST; (2) if `401 invalid_token`, attempt a refresh and smoke-test the NEW token; (3a) new token works → write it + restart to clear the breaker; (3b) new token STILL gets `-32002`/"Session expired" → stop, this is session revocation, hand the user the authorize URL for a full re-auth. `scripts/diagnose-oauth-mcp.py` automates steps 1–2 and prints which branch you're in. For an unattended gateway whose session keeps getting revoked, prefer a static Personal API key. See `references/stripe-mcp-oauth-revocation.md` for a worked example of a provider that revokes weekly.
+10. **A refreshed token that still gets `401 invalid_token` requires a fresh authorization-code flow.** MCP 2026-07-28 has no protocol session, so do not diagnose this as an MCP session expiry. Smoke-test the stored token with `server/discover`, refresh once, and test the new token. If the new token is also rejected, re-authorize the OAuth grant. For unattended gateways, prefer a provider-supported static restricted key. See `references/stripe-mcp-oauth-revocation.md` for a grant-revocation example.
 
 11. **Client info file is NOT optional.** Hermes needs `<server>.client.json` to know the `client_id` for refresh grants. Skipping it means the first refresh fails and the user has to re-auth — writing both files is the whole point of this skill.
 

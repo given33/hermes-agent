@@ -242,7 +242,12 @@ class TestUtilities:
         monkeypatch.delenv("WAYLAND_DISPLAY", raising=False)
         # Mock os.name and uname for non-macOS, non-Windows
         monkeypatch.setattr(os, "name", "posix")
-        monkeypatch.setattr(os, "uname", lambda: type("", (), {"sysname": "Linux"})())
+        monkeypatch.setattr(
+            os,
+            "uname",
+            lambda: type("", (), {"sysname": "Linux"})(),
+            raising=False,
+        )
         assert _can_open_browser() is False
 
     def test_can_open_browser_true_with_display(self, monkeypatch):
@@ -555,9 +560,10 @@ class TestCallbackPortReservation:
             t.start()
             return await asyncio.wait_for(task, timeout=10)
 
-        code, state = asyncio.run(drive())
-        assert code == "abc123"
-        assert state == "xyz"
+        callback = asyncio.run(drive())
+        assert callback.code == "abc123"
+        assert callback.state == "xyz"
+        assert callback.iss is None
         # Reservation was consumed by adoption.
         assert port not in mod._reserved_sockets
 
@@ -601,13 +607,13 @@ class TestCallbackPortReservation:
             return await asyncio.wait_for(task, timeout=10)
 
         try:
-            code, state = asyncio.run(drive())
+            callback = asyncio.run(drive())
         finally:
             leftover = mod._reserved_sockets.pop(port_b, None)
             if leftover is not None:
                 leftover.close()
-        assert code == "flowA"
-        assert state == "sA"
+        assert callback.code == "flowA"
+        assert callback.state == "sA"
 
 
 # ---------------------------------------------------------------------------

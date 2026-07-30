@@ -142,7 +142,9 @@ def register_credential_file(
         )
         return False
 
-    container_path = f"{container_base.rstrip('/')}/{relative_path}"
+    container_path = (
+        f"{container_base.rstrip('/')}/{Path(relative_path).as_posix()}"
+    )
     _get_registered()[container_path] = str(resolved)
     logger.debug("credential_files: registered %s -> %s", resolved, container_path)
     return True
@@ -206,7 +208,7 @@ def _load_config_files() -> List[Dict[str, str]]:
                         continue
                     resolved_path = host_path.resolve()
                     if resolved_path.is_file():
-                        container_path = f"/root/.hermes/{rel}"
+                        container_path = f"/root/.hermes/{Path(rel).as_posix()}"
                         result.append({
                             "host_path": str(resolved_path),
                             "container_path": container_path,
@@ -357,7 +359,7 @@ def iter_skills_files(
             rel = item.relative_to(skills_dir)
             result.append({
                 "host_path": str(item),
-                "container_path": f"{container_root}/{rel}",
+                "container_path": f"{container_root}/{rel.as_posix()}",
             })
 
     # Include external skill dirs
@@ -373,7 +375,7 @@ def iter_skills_files(
                 rel = item.relative_to(ext_dir)
                 result.append({
                     "host_path": str(item),
-                    "container_path": f"{container_root}/{rel}",
+                    "container_path": f"{container_root}/{rel.as_posix()}",
                 })
     except ImportError:
         pass
@@ -513,7 +515,7 @@ def iter_cache_files(
             rel = item.relative_to(host_dir)
             result.append({
                 "host_path": str(item),
-                "container_path": f"{container_root}/{rel}",
+                "container_path": f"{container_root}/{rel.as_posix()}",
             })
     return result
 

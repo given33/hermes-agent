@@ -1317,6 +1317,11 @@ def build_assistant_message(agent, assistant_message, finish_reason: str) -> dic
         "reasoning": reasoning_text,
         "finish_reason": finish_reason,
     }
+    hook_trace = getattr(assistant_message, "hermes_hook_trace", None)
+    if isinstance(hook_trace, list) and all(
+        isinstance(item, dict) for item in hook_trace
+    ):
+        msg["hook_trace"] = [dict(item) for item in hook_trace]
 
     raw_reasoning_content = getattr(assistant_message, "reasoning_content", None)
     if raw_reasoning_content is None and hasattr(assistant_message, "model_extra"):
@@ -1931,7 +1936,13 @@ def handle_max_iterations(agent, messages: list, api_call_count: int) -> str:
             # timestamp (preserved on gateway user replay entries for the
             # stale-confirmation expiry check — #47868 rejection class),
             # and every Hermes-internal underscore-prefixed scaffolding key.
-            for schema_foreign in ("tool_name", "codex_reasoning_items", "codex_message_items", "timestamp"):
+            for schema_foreign in (
+                "tool_name",
+                "codex_reasoning_items",
+                "codex_message_items",
+                "timestamp",
+                "hook_trace",
+            ):
                 api_msg.pop(schema_foreign, None)
             # api_content (the persist-what-you-send sidecar) carries the
             # exact bytes every main-loop call sent for this message —

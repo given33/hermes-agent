@@ -61,7 +61,7 @@ class TestCacheMcpImageBlock:
 
         block = SimpleNamespace(
             data=base64.b64encode(_png_bytes()).decode("ascii"),
-            mimeType="image/png",
+            mime_type="image/png",
         )
         tag = _cache_mcp_image_block(block)
         assert tag.startswith("MEDIA:"), f"expected MEDIA: tag, got {tag!r}"
@@ -84,7 +84,7 @@ class TestCacheMcpImageBlock:
 
         block = SimpleNamespace(
             data=base64.b64encode(b"some bytes").decode("ascii"),
-            mimeType="application/pdf",
+            mime_type="application/pdf",
         )
         assert _cache_mcp_image_block(block) == ""
 
@@ -92,7 +92,7 @@ class TestCacheMcpImageBlock:
         monkeypatch.setenv("HERMES_HOME", str(tmp_path))
         from tools.mcp_tool import _cache_mcp_image_block
 
-        block = SimpleNamespace(data=None, mimeType="image/png")
+        block = SimpleNamespace(data=None, mime_type="image/png")
         assert _cache_mcp_image_block(block) == ""
 
     def test_returns_empty_on_malformed_base64(self, tmp_path, monkeypatch):
@@ -103,7 +103,7 @@ class TestCacheMcpImageBlock:
 
         block = SimpleNamespace(
             data="!!!not-base64!!!",
-            mimeType="image/png",
+            mime_type="image/png",
         )
         assert _cache_mcp_image_block(block) == ""
 
@@ -116,7 +116,7 @@ class TestCacheMcpImageBlock:
 
         block = SimpleNamespace(
             data=base64.b64encode(b"<html>error</html>").decode("ascii"),
-            mimeType="image/png",
+            mime_type="image/png",
         )
         assert _cache_mcp_image_block(block) == ""
 
@@ -129,7 +129,7 @@ class TestCacheMcpImageBlock:
         jpeg = b"\xff\xd8\xff\xe0" + b"\x00" * 100 + b"\xff\xd9"
         block = SimpleNamespace(
             data=base64.b64encode(jpeg).decode("ascii"),
-            mimeType="image/jpeg",
+            mime_type="image/jpeg",
         )
         tag = _cache_mcp_image_block(block)
         assert tag.startswith("MEDIA:")

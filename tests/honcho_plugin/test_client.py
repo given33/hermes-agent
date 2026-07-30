@@ -377,7 +377,7 @@ class TestResolveConfigPath:
         fake_home = tmp_path / "fakehome"
         fake_home.mkdir()
 
-        with patch.dict(os.environ, {}, clear=False), \
+        with patch.dict(os.environ, {"HOME": str(fake_home)}, clear=False), \
              patch.object(Path, "home", return_value=fake_home):
             os.environ.pop("HERMES_HOME", None)
             result = resolve_config_path()
@@ -389,7 +389,10 @@ class TestResolveConfigPath:
         hermes_home = tmp_path / "hermes"
         hermes_home.mkdir()
 
-        with patch.dict(os.environ, {"HERMES_HOME": str(hermes_home)}), \
+        with patch.dict(os.environ, {
+            "HERMES_HOME": str(hermes_home),
+            "HOME": str(fake_home),
+        }), \
              patch.object(Path, "home", return_value=fake_home):
             assert resolve_global_config_path() == fake_home / ".honcho" / "config.json"
             assert resolve_config_path() == fake_home / ".honcho" / "config.json"

@@ -23,9 +23,24 @@ from unittest.mock import MagicMock, patch
 import pytest
 
 from run_agent import AIAgent
+
+
+def _symlink_or_skip(link: Path, target: Path) -> None:
+    try:
+        link.symlink_to(target)
+    except (NotImplementedError, OSError) as exc:
+        if isinstance(exc, NotImplementedError) or getattr(exc, "winerror", None) == 1314:
+            pytest.skip("host does not grant symlink creation capability")
+        raise
 from agent.tool_dispatch_helpers import (
+    _plan_tool_batch_execution,
     _plan_tool_batch_segments,
     _should_parallelize_tool_batch,
+)
+from hermes_services.tool_contract import (
+    ToolExecutionContract,
+    register_tool_contract,
+    reset_tool_contracts_for_tests,
 )
 
 
@@ -235,9 +250,24 @@ def agent():
 
 
 class TestSegmentedDispatchIntegration:
-    def test_mixed_batch_runs_safe_prefix_concurrently_and_barrier_after(self, agent):
-        """Two web_search calls must overlap in time; terminal must start only
-        after both finish; results land in the model's emission order."""
+    def test_explicit_sequential_contract_overrides_legacy_parallel_allowlist(self):
+        register_tool_contract(
+            "web_search",
+            ToolExecutionContract(execution_mode="sequential"),
+        )
+        try:
+            calls = [
+                _tc("web_search", '{"query":"a"}', call_id="s1"),
+                _tc("web_search", '{"query":"b"}', call_id="s2"),
+            ]
+            plan = _plan_tool_batch_execution(calls)
+        finally:
+            reset_tool_contracts_for_tests()
+
+        assert plan == [("sequential", calls)]
+
+    def test_mixed_batch_with_sequential_contract_runs_wholly_in_order(self, agent):
+        """One sequential contract serializes the provider batch in source order."""
         calls = [
             _tc("web_search", '{"query":"a"}', call_id="s1"),
             _tc("web_search", '{"query":"b"}', call_id="s2"),
@@ -246,17 +276,12 @@ class TestSegmentedDispatchIntegration:
         msg = SimpleNamespace(content="", tool_calls=calls)
         messages = []
 
-        rendezvous = threading.Barrier(2, timeout=10)
         events = []
         events_lock = threading.Lock()
 
         def fake_handle(name, args, task_id, **kwargs):
             with events_lock:
                 events.append(("start", name, kwargs["tool_call_id"]))
-            if name == "web_search":
-                # Both searches must be in flight at once to pass this
-                # barrier — proves genuine concurrency for the safe prefix.
-                rendezvous.wait()
             with events_lock:
                 events.append(("end", name, kwargs["tool_call_id"]))
             return json.dumps({"ok": name})
@@ -268,13 +293,14 @@ class TestSegmentedDispatchIntegration:
         assert [m["tool_call_id"] for m in messages] == ["s1", "s2", "t1"]
         assert all(m["role"] == "tool" for m in messages)
 
-        # The barrier (terminal) started only after BOTH searches ended.
-        terminal_start = events.index(("start", "terminal", "t1"))
-        search_ends = [
-            i for i, e in enumerate(events) if e[0] == "end" and e[1] == "web_search"
+        assert events == [
+            ("start", "web_search", "s1"),
+            ("end", "web_search", "s1"),
+            ("start", "web_search", "s2"),
+            ("end", "web_search", "s2"),
+            ("start", "terminal", "t1"),
+            ("end", "terminal", "t1"),
         ]
-        assert len(search_ends) == 2
-        assert all(i < terminal_start for i in search_ends)
 
     def test_mixed_batch_preserves_order_with_barrier_in_middle(self, agent):
         calls = [
@@ -442,7 +468,7 @@ class TestPathCanonicalization:
         target.touch()
 
         alias_dir = tmp_path / "alias"
-        alias_dir.symlink_to(real_dir)
+        _symlink_or_skip(alias_dir, real_dir)
 
         real_path = _canonical_path(str(target))
         alias_path = _canonical_path(str(alias_dir / "config.json"))
@@ -492,7 +518,7 @@ class TestPathCanonicalization:
         real_dir = tmp_path / "real"
         real_dir.mkdir()
         alias_dir = tmp_path / "alias"
-        alias_dir.symlink_to(real_dir)
+        _symlink_or_skip(alias_dir, real_dir)
 
         # Leaf file does NOT exist yet (write_file scenario).
         real_target = _canonical_path(str(real_dir / "new.txt"))

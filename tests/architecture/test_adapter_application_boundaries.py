@@ -39,6 +39,7 @@ def test_fastapi_and_aiohttp_use_shared_http_and_cron_boundaries() -> None:
         imports = _imported_from(source, "hermes_services")
         assert {"HermesApplicationKernel", "accept_cron_fire_request"} <= imports, name
         assert "HermesApplicationKernel.for_http(" in source, name
+        assert 'os.environ.get("HERMES_HTTP_CONTRACT_MODE", "dual")' in source, name
         assert "accept_cron_fire_request(" in source, name
         assert "get_fire_verifier" not in source, (
             f"{name} reintroduced transport-local Chronos JWT verification"
@@ -48,6 +49,24 @@ def test_fastapi_and_aiohttp_use_shared_http_and_cron_boundaries() -> None:
     assert "self._http_boundary.authorize(" in api_server
     assert "_DASHBOARD_APPLICATION.require_http_boundary()" in dashboard
     assert "self._application.require_http_boundary()" in api_server
+
+
+def test_kernel_declares_bounded_contexts_and_compatibility_migration() -> None:
+    application = _source("hermes_services/application.py")
+    contexts = _source("hermes_services/contexts.py")
+    boundary = _source("hermes_services/http_boundary.py")
+
+    assert "contexts: BoundedContextRegistry" in application
+    for name in (
+        "account",
+        "hosted_task",
+        "resource_catalog",
+        "notification",
+        "intelligence",
+    ):
+        assert f'"{name}": BoundedContext(' in contexts
+    assert 'mode: HttpContractMode = "dual"' in boundary
+    assert 'error_code="http_contract_mismatch"' in boundary
 
 
 def test_jsonrpc_adapter_uses_shared_registry_without_a_second_method_table() -> None:

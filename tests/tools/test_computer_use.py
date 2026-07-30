@@ -1259,7 +1259,7 @@ class TestLazyMcpInstall:
     def test_feature_registered_in_allowlist(self):
         from tools import lazy_deps
         assert lazy_deps.feature_specs("tool.computer_use") == (
-            "mcp==1.26.0",
+            "mcp==2.0.0",
             "starlette==1.0.1",
         )
 
@@ -1279,7 +1279,7 @@ class TestLazyMcpInstall:
         from tools.computer_use import cua_backend
         from tools.lazy_deps import FeatureUnavailable
         unavailable = FeatureUnavailable(
-            "tool.computer_use", ("mcp==1.26.0",), "lazy installs disabled"
+            "tool.computer_use", ("mcp==2.0.0",), "lazy installs disabled"
         )
         with patch.object(cua_backend, "_maybe_nudge_update"), \
              patch("tools.lazy_deps.ensure", side_effect=unavailable), \
@@ -1638,8 +1638,11 @@ class TestCuaDriverSessionReconnect:
             returncode = 0
             stderr = ""
             # Daemon returns a path, not inline base64.
-            stdout = ('{"element_count": 7, "tree_markdown": "- [0] AXButton",'
-                      ' "screenshot_file_path": "%s"}' % str(shot))
+            stdout = json.dumps({
+                "element_count": 7,
+                "tree_markdown": "- [0] AXButton",
+                "screenshot_file_path": str(shot),
+            })
 
         import subprocess as _sp
         orig_run = _sp.run
@@ -1683,7 +1686,7 @@ class TestCuaDriverSessionReconnect:
 
         result = MagicMock()
         result.content = []
-        result.structuredContent = None
+        result.structured_content = None
 
         assert _extract_tool_result(result)["isError"] is False
 
@@ -2346,7 +2349,7 @@ class TestCuaEnvironmentScrubbing:
 
                 # ClientSession(read, write) is used as `async with`.
                 fake_session = MagicMock()
-                fake_session.initialize = AsyncMock()
+                fake_session.discover = AsyncMock()
                 # tools/list yields nothing — keeps _populate_capabilities
                 # quiet without us needing to fully mock the response shape.
                 fake_session.list_tools = AsyncMock(return_value=MagicMock(tools=[]))
@@ -2694,11 +2697,11 @@ class TestImageMimeTypePropagation:
         image_part = MagicMock()
         image_part.type = "image"
         image_part.data = "iVBORw0K..."
-        image_part.mimeType = "image/png"
+        image_part.mime_type = "image/png"
 
         result = MagicMock()
-        result.isError = False
-        result.structuredContent = None
+        result.is_error = False
+        result.structured_content = None
         result.content = [image_part]
 
         out = _extract_tool_result(result)
@@ -2715,11 +2718,11 @@ class TestImageMimeTypePropagation:
         image_part.type = "image"
         image_part.data = "/9j/4AAQ..."
         # Simulate the field being absent on the SDK object.
-        del image_part.mimeType
+        del image_part.mime_type
 
         result = MagicMock()
-        result.isError = False
-        result.structuredContent = None
+        result.is_error = False
+        result.structured_content = None
         result.content = [image_part]
 
         out = _extract_tool_result(result)
@@ -3794,7 +3797,7 @@ class TestStartupTimeoutPhaseDetail:
         session._ready_event = threading.Event()  # never set → timeout path
         session._setup_error = None
         session._shutdown_event = None
-        session._startup_phase = "mcp-initialize"
+        session._startup_phase = "mcp-discover"
         session._signal_shutdown_locked = lambda: None
 
         fake_bridge = MagicMock()
@@ -3811,7 +3814,7 @@ class TestStartupTimeoutPhaseDetail:
                 assert False, "expected RuntimeError"
             except RuntimeError as e:
                 msg = str(e)
-                assert "stuck in phase: mcp-initialize" in msg
+                assert "stuck in phase: mcp-discover" in msg
                 assert "computer-use doctor" in msg
 
     def test_timeout_error_defaults_to_unknown_phase(self):

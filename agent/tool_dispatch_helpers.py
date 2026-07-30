@@ -34,6 +34,10 @@ from typing import Any, Dict, List, Optional
 from agent.tool_result_classification import (
     FILE_MUTATING_TOOL_NAMES as _FILE_MUTATING_TOOLS,
 )
+from hermes_services.tool_contract import (
+    has_registered_tool_contract,
+    resolve_tool_contract,
+)
 from tools.threat_patterns import scan_for_threats
 
 logger = logging.getLogger(__name__)
@@ -185,7 +189,11 @@ def _plan_tool_batch_segments(tool_calls, *, execution_cwd: Optional[Path] = Non
             current.append(tool_call)
             continue
 
-        if tool_name in _PARALLEL_SAFE_TOOLS or _is_mcp_tool_parallel_safe(tool_name):
+        if (
+            tool_name in _PARALLEL_SAFE_TOOLS
+            or _is_mcp_tool_parallel_safe(tool_name)
+            or resolve_tool_contract(tool_name).execution_mode == "parallel"
+        ):
             current.append(tool_call)
             continue
 
@@ -213,8 +221,50 @@ def _should_parallelize_tool_batch(tool_calls) -> bool:
     """
     if len(tool_calls) <= 1:
         return False
-    segments = _plan_tool_batch_segments(tool_calls)
+    segments = _plan_tool_batch_execution(tool_calls)
     return len(segments) == 1 and segments[0][0] == "parallel"
+
+
+def _plan_tool_batch_execution(
+    tool_calls,
+    *,
+    execution_cwd: Optional[Path] = None,
+) -> List[tuple]:
+    """Return the authoritative execution plan for one provider batch.
+
+    The legacy segment planner remains useful for diagnostics, but execution
+    is conservative: one sequential contract or one unsafe segment serializes
+    the whole source-ordered batch.
+    """
+
+    if not tool_calls:
+        return []
+    for tool_call in tool_calls:
+        name = str(tool_call.function.name or "")
+        contract = resolve_tool_contract(name)
+        known_parallel = contract.execution_mode == "parallel" if (
+            has_registered_tool_contract(name)
+        ) else (
+            name in _PARALLEL_SAFE_TOOLS
+            or _is_mcp_tool_parallel_safe(name)
+            or contract.execution_mode == "parallel"
+        )
+        if not known_parallel:
+            return [("sequential", list(tool_calls))]
+    planned = _plan_tool_batch_segments(tool_calls, execution_cwd=execution_cwd)
+    if any(kind == "sequential" for kind, _calls in planned):
+        return [("sequential", list(tool_calls))]
+    return planned
+
+
+def plan_tool_batch_execution(
+    tool_calls,
+    *,
+    execution_cwd: Optional[Path] = None,
+) -> List[tuple]:
+    """Public application entry point for authoritative batch planning."""
+
+    return _plan_tool_batch_execution(tool_calls, execution_cwd=execution_cwd)
 
 
 def _canonical_path(raw_path: str, execution_cwd: Optional[Path] = None) -> Path:
@@ -639,6 +689,8 @@ __all__ = [
     "_is_destructive_command",
     "_plan_tool_batch_segments",
     "_should_parallelize_tool_batch",
+    "_plan_tool_batch_execution",
+    "plan_tool_batch_execution",
     "_canonical_path",
     "_extract_parallel_scope_path",
     "_paths_overlap",

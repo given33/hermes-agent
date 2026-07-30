@@ -7444,6 +7444,12 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             self._request_clean_exit(reason)
             return True
         
+        # Seal trusted internal hooks at the gateway's production startup
+        # boundary before any dynamic plugin or user-hook code is imported.
+        from hermes_services.startup import bootstrap_trusted_runtime
+
+        bootstrap_trusted_runtime()
+
         # Discover Python plugins before shell hooks so plugin block
         # decisions take precedence in tie cases.  The CLI startup path
         # does this via an explicit call in hermes_cli/main.py; the

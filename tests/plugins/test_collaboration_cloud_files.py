@@ -58,8 +58,16 @@ def test_delete_owner_account_data_removes_only_owned_collaboration_state(
     owner_conversation = {
         "id": "conversation-owner-a",
         "owner_id": "owner-a",
+        "account_generation": "owner-a-generation",
         "runtime_sessions": {"default": "session-owner-a"},
         "hosted_turns": {"turn-a": {"state": "running"}},
+    }
+    replacement_conversation = {
+        "id": "conversation-owner-a-replacement",
+        "owner_id": "owner-a",
+        "account_generation": "owner-a-new-generation",
+        "runtime_sessions": {"default": "session-owner-a-new"},
+        "hosted_turns": {},
     }
     peer_conversation = {
         "id": "conversation-owner-b",
@@ -67,9 +75,24 @@ def test_delete_owner_account_data_removes_only_owned_collaboration_state(
         "runtime_sessions": {},
         "hosted_turns": {},
     }
-    single_state = {"conversations": [owner_conversation, peer_conversation]}
+    single_state = {
+        "conversations": [
+            owner_conversation,
+            replacement_conversation,
+            peer_conversation,
+        ]
+    }
     room_state = {"rooms": [
-        {"id": "room-owner-a", "owner_id": "owner-a"},
+        {
+            "id": "room-owner-a",
+            "owner_id": "owner-a",
+            "account_generation": "owner-a-generation",
+        },
+        {
+            "id": "room-owner-a-replacement",
+            "owner_id": "owner-a",
+            "account_generation": "owner-a-new-generation",
+        },
         {"id": "room-owner-b", "owner_id": "owner-b"},
     ]}
     conversation_root = tmp_path / "conversation-owner-a"
@@ -78,7 +101,7 @@ def test_delete_owner_account_data_removes_only_owned_collaboration_state(
     sessions = []
     file_owners = []
 
-    monkeypatch.setattr(module, "load_single_state", lambda: single_state)
+    monkeypatch.setattr(module, "load_single_state", lambda **_kwargs: single_state)
     monkeypatch.setattr(module, "save_single_state", lambda _state: None)
     monkeypatch.setattr(module, "load_state", lambda: room_state)
     monkeypatch.setattr(module, "save_state", lambda _state: None)
@@ -96,22 +119,40 @@ def test_delete_owner_account_data_removes_only_owned_collaboration_state(
         module,
         "_file_library",
         lambda: SimpleNamespace(
-            delete_owner=lambda owner_id: file_owners.append(owner_id) or {"files": 1}
+            delete_owner=lambda owner_id, *, account_generation: file_owners.append(
+                (owner_id, account_generation)
+            )
+            or {"files": 1}
         ),
     )
 
-    result = module.delete_owner_account_data("owner-a")
+    result = module.delete_owner_account_data(
+        "owner-a",
+        account_generation="owner-a-generation",
+    )
 
     assert result == {
         "conversations": 1,
         "rooms": 1,
         "runtime_sessions": 1,
         "files": {"files": 1},
+        "tool_output_artifacts": {"artifacts": 0},
+        "managed_resources": {"resources": 0, "events": 0, "operations": 0},
     }
-    assert single_state["conversations"] == [peer_conversation]
-    assert room_state["rooms"] == [{"id": "room-owner-b", "owner_id": "owner-b"}]
+    assert single_state["conversations"] == [
+        replacement_conversation,
+        peer_conversation,
+    ]
+    assert room_state["rooms"] == [
+        {
+            "id": "room-owner-a-replacement",
+            "owner_id": "owner-a",
+            "account_generation": "owner-a-new-generation",
+        },
+        {"id": "room-owner-b", "owner_id": "owner-b"},
+    ]
     assert sessions == [("default", "session-owner-a")]
-    assert file_owners == ["owner-a"]
+    assert file_owners == [("owner-a", "owner-a-generation")]
     assert conversation_root.exists() is False
 
 
@@ -128,6 +169,19 @@ def test_account_file_routes_cover_upload_artifact_link_download_and_delete(
     prefix = "/api/plugins/collaboration"
 
     with _client(module) as client:
+        rejected_hash = client.post(
+            f"{prefix}/single/conversations/{conversation['id']}/attachments",
+            content=b"tampered upload",
+            headers={
+                "x-filename": "tampered.txt",
+                "content-type": "text/plain",
+                "x-upload-id": "upload-tampered-001",
+                "x-content-sha256": "0" * 64,
+            },
+        )
+        assert rejected_hash.status_code == 422
+        assert "does not match" in rejected_hash.json()["detail"]
+
         upload = client.post(
             f"{prefix}/single/conversations/{conversation['id']}/attachments",
             content=b"user upload",
@@ -146,7 +200,9 @@ def test_account_file_routes_cover_upload_artifact_link_download_and_delete(
         assert uploaded["status"] == "available"
         assert uploaded["sha256"]
         assert "path" not in uploaded
-        assert client.get(f"{prefix}/files/{uploaded['id']}/download").content == b"user upload"
+        download = client.get(f"{prefix}/files/{uploaded['id']}/download")
+        assert download.content == b"user upload"
+        assert download.headers["x-content-sha256"] == uploaded["sha256"]
 
         replayed_upload = client.post(
             f"{prefix}/single/conversations/{conversation['id']}/attachments",
@@ -298,9 +354,11 @@ def test_account_file_listing_uses_only_the_index_and_hides_server_paths(
     incoming.mkdir()
     source = incoming / "indexed.txt"
     source.write_text("indexed", encoding="utf-8")
+    generation = module._account_generation_for_owner("owner-index")
     record = library.ingest_file(
         "owner-index",
         source,
+        account_generation=generation,
         name="indexed.txt",
         source="user_upload",
         allowed_roots=[incoming],
@@ -318,7 +376,7 @@ def test_account_file_listing_uses_only_the_index_and_hides_server_paths(
     assert "path" not in response.json()["files"][0]
 
 
-def test_legacy_conversation_files_are_indexed_once_before_file_listing(
+def test_legacy_conversation_files_require_explicit_one_time_migration(
     tmp_path,
     monkeypatch,
 ):
@@ -337,20 +395,38 @@ def test_legacy_conversation_files_are_indexed_once_before_file_listing(
     with _client(module, owner="owner-migration") as client:
         first = client.get(f"{prefix}/files")
         assert first.status_code == 200
-        assert [item["name"] for item in first.json()["files"]] == ["legacy.txt"]
-        assert "path" not in first.json()["files"][0]
+        assert first.json()["files"] == []
+
+        generation = module._account_generation_for_owner("owner-migration")
+        module._migrate_account_conversation_files_once(
+            "owner-migration",
+            generation,
+        )
+        migrated = client.get(f"{prefix}/files")
+        assert [item["name"] for item in migrated.json()["files"]] == ["legacy.txt"]
+        assert "path" not in migrated.json()["files"][0]
         assert conversation["owner_id"] == "owner-migration"
-        assert module._account_file_migration_marker("owner-migration").is_file()
+        assert conversation["account_generation"] == generation
+        assert module._account_file_migration_marker(
+            "owner-migration",
+            generation,
+        ).is_file()
 
         monkeypatch.setattr(
             module,
             "_sync_account_conversations",
-            lambda _owner_id: (_ for _ in ()).throw(AssertionError("migration repeated")),
+            lambda *_args, **_kwargs: (_ for _ in ()).throw(
+                AssertionError("migration repeated")
+            ),
+        )
+        module._migrate_account_conversation_files_once(
+            "owner-migration",
+            generation,
         )
         second = client.get(f"{prefix}/files")
 
     assert second.status_code == 200
-    assert second.json()["files"][0]["id"] == first.json()["files"][0]["id"]
+    assert second.json()["files"][0]["id"] == migrated.json()["files"][0]["id"]
 
 
 def test_unconfigured_account_cannot_claim_legacy_conversations_or_rooms(
@@ -433,8 +509,8 @@ def test_incomplete_legacy_file_migration_does_not_write_completion_marker(
     monkeypatch.setattr(module, "get_hermes_home", lambda: tmp_path)
     attempts = []
 
-    def fail_once(owner_id, *, strict=False):
-        attempts.append((owner_id, strict))
+    def fail_once(owner_id, account_generation, *, strict=False):
+        attempts.append((owner_id, account_generation, strict))
         raise OSError("file changed during indexing")
 
     monkeypatch.setattr(module, "_sync_account_conversations", fail_once)
@@ -443,16 +519,19 @@ def test_incomplete_legacy_file_migration_does_not_write_completion_marker(
     with pytest.raises(OSError, match="changed during indexing"):
         module._migrate_account_conversation_files_once("owner-retry")
 
-    assert attempts == [("owner-retry", True)]
+    generation = module._account_generation_for_owner("owner-retry")
+    assert attempts == [("owner-retry", generation, True)]
     assert not marker.exists()
 
     monkeypatch.setattr(
         module,
         "_sync_account_conversations",
-        lambda owner_id, *, strict=False: attempts.append((owner_id, strict)),
+        lambda owner_id, account_generation, *, strict=False: attempts.append(
+            (owner_id, account_generation, strict)
+        ),
     )
     module._migrate_account_conversation_files_once("owner-retry")
-    assert attempts[-1] == ("owner-retry", True)
+    assert attempts[-1] == ("owner-retry", generation, True)
     assert marker.is_file()
 
 
@@ -558,7 +637,7 @@ def test_rooms_are_account_scoped_and_enqueue_the_durable_hosted_workflow(
         assert deleted.status_code == 200
         assert rooms_state["rooms"] == []
         assert conversation["delete_requested"] is True
-        assert single_state["conversations"] == []
+        assert single_state["conversations"] == [conversation]
         assert started[-1] == (room["conversation_id"], "room-turn-stable-001")
         assert client.get(f"{prefix}/rooms/{room['id']}").status_code == 404
 
@@ -571,10 +650,12 @@ def test_first_account_claims_legacy_rooms_once_and_other_accounts_stay_isolated
     monkeypatch.setattr(module, "get_hermes_home", lambda: tmp_path)
     legacy = module.create_room_record("Legacy room", ["default"])
     legacy.pop("owner_id")
+    legacy.pop("account_generation")
     legacy["messages"] = [
         {"role": "assistant", "name": "default", "content": "legacy message"}
     ]
     local_room = module.create_room_record("Local room", ["default"])
+    local_room.pop("account_generation")
     rooms_state = {"rooms": [legacy, local_room]}
     single_state = {"conversations": []}
     saves = []
@@ -1053,7 +1134,11 @@ def test_connector_cancellation_includes_current_cursor_and_reaches_terminal_sta
             json={"connector_id": "dbb3-primary", "limit": 5, "lease_seconds": 30},
         )
         assert pulled.status_code == 200
-        [cancellation] = pulled.json()["cancellations"]
+        cancellation = next(
+            item
+            for item in pulled.json()["cancellations"]
+            if item["remote_run_id"] == remote["id"]
+        )
         assert cancellation["remote_run_id"] == remote["id"]
         assert cancellation["checkpoint_cursor"] == 7
 
@@ -1274,12 +1359,20 @@ def test_atomic_enqueue_is_idempotent_and_persists_message_route_and_turn_togeth
     state = {"conversations": [conversation]}
     saves = []
     starts = []
+    routing_starts = []
     monkeypatch.setattr(module, "load_single_state", lambda: state)
     monkeypatch.setattr(module, "save_single_state", lambda value: saves.append(value))
     monkeypatch.setattr(
         module,
         "start_hosted_workflow",
         lambda conversation_id, turn_id: starts.append((conversation_id, turn_id)),
+    )
+    monkeypatch.setattr(
+        module,
+        "start_hosted_routing",
+        lambda conversation_id, turn_id: routing_starts.append(
+            (conversation_id, turn_id)
+        ),
     )
     monkeypatch.setattr(
         module,
@@ -1322,26 +1415,35 @@ def test_atomic_enqueue_is_idempotent_and_persists_message_route_and_turn_togeth
             f"{prefix}/single/conversations/{conversation['id']}/enqueue",
             json=body,
         )
-        assert first.status_code == 200
+        assert first.status_code == 202
         first_payload = first.json()
         assert first_payload["accepted"] is True
         assert first_payload["replayed"] is False
         assert first_payload["message"]["id"] == "message-atomic-1"
-        assert first_payload["route_message"]["kind"] == "route"
+        assert first_payload["route"]["mode"] == "pending"
         assert first_payload["hosted_turn"]["turn_id"] == "turn-atomic-1"
+        assert len(conversation["messages"]) == 1
+        accepted_save_count = len(saves)
+        assert accepted_save_count >= 1
+
+        assert module._complete_pending_hosted_route(
+            conversation["id"], "turn-atomic-1"
+        ) is True
+        assert conversation["messages"][-1]["kind"] == "route"
         assert len(conversation["messages"]) == 2
-        assert len(saves) == 2
-        assert conversation["event_cursor"] == 1
+        routed_save_count = len(saves)
+        assert routed_save_count > accepted_save_count
+        assert conversation["event_cursor"] >= 1
 
         replay = client.post(
             f"{prefix}/single/conversations/{conversation['id']}/enqueue",
             json=body,
         )
-        assert replay.status_code == 200
+        assert replay.status_code == 202
         assert replay.json()["replayed"] is True
         assert len(conversation["messages"]) == 2
         assert len(conversation["hosted_turns"]) == 1
-        assert len(saves) == 2
+        assert len(saves) == routed_save_count
 
         changed = dict(body)
         changed["message"] = {**body["message"], "content": "different"}
@@ -1351,8 +1453,9 @@ def test_atomic_enqueue_is_idempotent_and_persists_message_route_and_turn_togeth
         )
         assert conflict.status_code == 409
 
-    assert starts == [
-        (conversation["id"], "turn-atomic-1"),
+    assert starts
+    assert set(starts) == {(conversation["id"], "turn-atomic-1")}
+    assert routing_starts == [
         (conversation["id"], "turn-atomic-1"),
     ]
 
@@ -1369,6 +1472,7 @@ def test_atomic_chat_enqueue_falls_back_to_the_authenticated_conversation_profil
     monkeypatch.setattr(module, "load_single_state", lambda: state)
     monkeypatch.setattr(module, "save_single_state", lambda _state: None)
     monkeypatch.setattr(module, "start_hosted_workflow", lambda *_args: None)
+    monkeypatch.setattr(module, "start_hosted_routing", lambda *_args: None)
     monkeypatch.setattr(
         module,
         "available_profiles",
@@ -1408,15 +1512,20 @@ def test_atomic_chat_enqueue_falls_back_to_the_authenticated_conversation_profil
             json=body,
         )
 
-    assert response.status_code == 200
-    assert response.json()["hosted_turn"]["profiles"] == ["reviewer"]
+    assert response.status_code == 202
+    assert module._complete_pending_hosted_route(
+        conversation["id"], "turn-reviewer-chat"
+    ) is True
+    assert conversation["hosted_turns"]["turn-reviewer-chat"]["profiles"] == [
+        "reviewer"
+    ]
     replay_body = {**body, "profiles": ["reviewer"]}
     with _client(module, owner="owner-a") as client:
         replay = client.post(
             f"{prefix}/single/conversations/{conversation['id']}/enqueue",
             json=replay_body,
         )
-    assert replay.status_code == 200
+    assert replay.status_code == 202
     assert replay.json()["replayed"] is True
     calls = []
 
@@ -1446,6 +1555,9 @@ def test_hosted_chat_rejects_a_recent_unbound_output_when_this_turn_creates_noth
     )
     conversation = module.create_single_conversation("default", "Artifact isolation")
     conversation["owner_id"] = "owner-a"
+    conversation["account_generation"] = module._account_generation_for_owner(
+        "owner-a"
+    )
     state = {"conversations": [conversation]}
     monkeypatch.setattr(module, "load_single_state", lambda: state)
     monkeypatch.setattr(module, "save_single_state", lambda _state: None)
@@ -1454,6 +1566,7 @@ def test_hosted_chat_rejects_a_recent_unbound_output_when_this_turn_creates_noth
     module._sync_conversation_files("owner-a", conversation)
     unbound, total = module._file_library().list_files(
         "owner-a",
+        account_generation=conversation["account_generation"],
         conversation_id=conversation["id"],
     )
     assert total == 1
@@ -1478,6 +1591,7 @@ def test_hosted_chat_rejects_a_recent_unbound_output_when_this_turn_creates_noth
     assert hosted["status"] == "failed"
     assert module._file_library().list_files(
         "owner-a",
+        account_generation=conversation["account_generation"],
         conversation_id=conversation["id"],
         turn_id="turn-no-current-file",
     )[1] == 0
@@ -1520,6 +1634,9 @@ def test_hosted_chat_delivers_only_the_file_created_after_its_output_baseline(
     )
     conversation = module.create_single_conversation("default", "Artifact isolation")
     conversation["owner_id"] = "owner-a"
+    conversation["account_generation"] = module._account_generation_for_owner(
+        "owner-a"
+    )
     state = {"conversations": [conversation]}
     monkeypatch.setattr(module, "load_single_state", lambda: state)
     monkeypatch.setattr(module, "save_single_state", lambda _state: None)
@@ -1550,6 +1667,7 @@ def test_hosted_chat_delivers_only_the_file_created_after_its_output_baseline(
     assert hosted["status"] == "completed"
     current_files, total = module._file_library().list_files(
         "owner-a",
+        account_generation=conversation["account_generation"],
         conversation_id=conversation["id"],
         turn_id="turn-current-file",
     )
@@ -1567,6 +1685,7 @@ def test_hosted_chat_delivers_only_the_file_created_after_its_output_baseline(
     module._sync_conversation_files("owner-a", conversation)
     preserved, preserved_total = module._file_library().list_files(
         "owner-a",
+        account_generation=conversation["account_generation"],
         conversation_id=conversation["id"],
         turn_id="turn-current-file",
     )
@@ -2481,12 +2600,20 @@ def test_remote_artifact_process_exit_after_ingest_recovers_staged_orphan(
             module.connector_upload_artifact(remote["id"], CompleteRequest())
         )
 
-    staged = library.get_file_by_origin("owner-a", origin_key)
+    generation = conversation["account_generation"]
+    staged = library.get_file_by_origin(
+        "owner-a",
+        origin_key,
+        account_generation=generation,
+    )
     assert staged is not None
     assert staged["status"] == "staged"
     staged_path = library._record_path(staged)
     assert staged_path.is_file()
-    assert library.list_files("owner-a") == ([], 0)
+    assert library.list_files(
+        "owner-a",
+        account_generation=generation,
+    ) == ([], 0)
     assert hosted.get("artifact_upload_intents")
     assert hosted["remote_runs"]["worker"].get("artifacts") in (None, [])
 
@@ -2494,8 +2621,15 @@ def test_remote_artifact_process_exit_after_ingest_recovers_staged_orphan(
     # resolves the durable intent before returning any account-file data.
     module._FILE_LIBRARY = None
     recovered_library = module._file_library()
-    assert recovered_library.get_file_by_origin("owner-a", origin_key) is None
-    assert recovered_library.list_files("owner-a") == ([], 0)
+    assert recovered_library.get_file_by_origin(
+        "owner-a",
+        origin_key,
+        account_generation=generation,
+    ) is None
+    assert recovered_library.list_files(
+        "owner-a",
+        account_generation=generation,
+    ) == ([], 0)
     assert not staged_path.exists()
     assert not hosted.get("artifact_upload_intents")
     assert not any(
@@ -2555,6 +2689,7 @@ def test_artifact_intent_recovery_never_deletes_preexisting_origin(
     original_record = library.ingest_file(
         "owner-a",
         source,
+        account_generation=conversation["account_generation"],
         name="old.bin",
         source="model_output",
         conversation_id=conversation["id"],
@@ -2562,7 +2697,11 @@ def test_artifact_intent_recovery_never_deletes_preexisting_origin(
         profile="dbb3-worker",
         origin_key=origin_key,
     )
-    original_path = library.resolve_download("owner-a", original_record["id"])[1]
+    original_path = library.resolve_download(
+        "owner-a",
+        original_record["id"],
+        account_generation=conversation["account_generation"],
+    )[1]
     original_attachment = module._library_attachment(original_record)
     current = hosted["remote_runs"]["worker"]
     current["artifacts"] = [json.loads(json.dumps(original_attachment))]
@@ -2616,16 +2755,25 @@ def test_artifact_intent_recovery_never_deletes_preexisting_origin(
 
     module._FILE_LIBRARY = None
     recovered_library = module._file_library()
-    assert recovered_library.get_file_by_origin("owner-a", origin_key) == original_record
+    assert recovered_library.get_file_by_origin(
+        "owner-a",
+        origin_key,
+        account_generation=conversation["account_generation"],
+    ) == original_record
     downloaded, recovered_path = recovered_library.resolve_download(
-        "owner-a", original_record["id"]
+        "owner-a",
+        original_record["id"],
+        account_generation=conversation["account_generation"],
     )
     assert downloaded == original_record
     assert recovered_path == original_path
     assert recovered_path.read_bytes() == body
     assert conversation["messages"] == original_messages
     assert current["artifacts"] == original_artifacts
-    assert recovered_library.list_files("owner-a") == ([original_record], 1)
+    assert recovered_library.list_files(
+        "owner-a",
+        account_generation=conversation["account_generation"],
+    ) == ([original_record], 1)
     assert not hosted.get("artifact_upload_intents")
     assert not list(recovered_library.root.rglob("new.bin"))
 

@@ -975,6 +975,20 @@ class ShellFileOperations(FileOperations):
         # Use single quotes and escape any single quotes in the string
         return "'" + arg.replace("'", "'\"'\"'") + "'"
 
+    def _escape_native_path_arg(self, path: str) -> str:
+        """Quote a path passed from Git Bash to a native host executable.
+
+        LocalEnvironment disables MSYS argv conversion so native Windows
+        tools keep option-like arguments intact. Consequently a native
+        ``rg.exe`` cannot resolve Git Bash's ``/c/...`` spelling and must
+        receive a drive-qualified path itself.
+        """
+        if os.name == "nt":
+            from tools.environments.local import _msys_to_windows_path
+
+            path = _msys_to_windows_path(path).replace("\\", "/")
+        return "'" + path.replace("'", "'\"'\"'") + "'"
+
     def _atomic_write(self, path: str, content: str) -> "ExecuteResult":
         """Write ``content`` to ``path`` atomically via temp-file + rename.
 
@@ -2285,7 +2299,7 @@ class ShellFileOperations(FileOperations):
         
         # Add pattern and path
         cmd_parts.append(self._escape_shell_arg(pattern))
-        cmd_parts.append(self._escape_shell_arg(path))
+        cmd_parts.append(self._escape_native_path_arg(path))
         
         # Fetch extra rows so we can report the true total before slicing.
         # For context mode, rg emits separator lines ("--") between groups,

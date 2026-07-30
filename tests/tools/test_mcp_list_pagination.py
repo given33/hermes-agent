@@ -32,9 +32,9 @@ class TestPaginateFullList:
     def test_follows_next_cursor_across_pages(self):
         """Pages are concatenated in order; cursor passed back verbatim."""
         pages = {
-            None: SimpleNamespace(tools=[_tool("p1a"), _tool("p1b")], nextCursor="c2"),
-            "c2": SimpleNamespace(tools=[_tool("p2a")], nextCursor="c3"),
-            "c3": SimpleNamespace(tools=[_tool("p3a")], nextCursor=None),
+            None: SimpleNamespace(tools=[_tool("p1a"), _tool("p1b")], next_cursor="c2"),
+            "c2": SimpleNamespace(tools=[_tool("p2a")], next_cursor="c3"),
+            "c3": SimpleNamespace(tools=[_tool("p3a")], next_cursor=None),
         }
 
         async def fake_list(cursor=None):
@@ -46,8 +46,8 @@ class TestPaginateFullList:
     def test_empty_page_with_cursor_continues(self):
         """An empty middle page doesn't abort the walk."""
         pages = {
-            None: SimpleNamespace(resources=[_tool("r1")], nextCursor="c2"),
-            "c2": SimpleNamespace(resources=[], nextCursor="c3"),
+            None: SimpleNamespace(resources=[_tool("r1")], next_cursor="c2"),
+            "c2": SimpleNamespace(resources=[], next_cursor="c3"),
             "c3": SimpleNamespace(resources=[_tool("r2")]),
         }
 
@@ -70,7 +70,7 @@ class TestPaginateFullList:
         async def evil_list(cursor=None):
             calls["n"] += 1
             return SimpleNamespace(
-                tools=[_tool(f"t{calls['n']}")], nextCursor=f"c{calls['n']}"
+                tools=[_tool(f"t{calls['n']}")], next_cursor=f"c{calls['n']}"
             )
 
         items = asyncio.run(_paginate_full_list(evil_list, "tools", "srv"))
@@ -86,7 +86,7 @@ class TestDiscoveryUsesPagination:
         server = MCPServerTask("pag_srv")
         server._config = {"command": "test"}
         pages = {
-            None: SimpleNamespace(tools=[_tool("first")], nextCursor="page-2"),
+            None: SimpleNamespace(tools=[_tool("first")], next_cursor="page-2"),
             "page-2": SimpleNamespace(tools=[_tool("second")]),
         }
 
@@ -95,9 +95,9 @@ class TestDiscoveryUsesPagination:
 
         server.session = MagicMock()
         server.session.list_tools = fake_list
-        # capability gate: _advertises_tools() returns True when no
-        # capability info was captured (legacy fallback), so no override
-        # is needed here.
+        server.discover_result = SimpleNamespace(
+            capabilities=SimpleNamespace(tools=SimpleNamespace())
+        )
 
         asyncio.run(server._discover_tools())
         assert [t.name for t in server._tools] == ["first", "second"]

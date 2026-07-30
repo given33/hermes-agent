@@ -226,6 +226,54 @@ def test_rollback_is_itself_undoable(backup_env):
     )
 
 
+def _prepare_changed_tree_for_failed_rollback(backup_env):
+    cb = backup_env["cb"]
+    skills = backup_env["skills"]
+    original = _write_skill(skills, "snapshot-only", body="snapshot state")
+    target = cb.snapshot_skills(reason="rollback-target")
+    assert target is not None
+
+    import shutil as _sh
+    _sh.rmtree(original)
+    current = _write_skill(skills, "current-only", body="current state")
+    return cb, skills, target, current
+
+
+def _assert_failed_rollback_preserved_state(cb, skills, target, current):
+    archive_bytes = (target / "skills.tar.gz").read_bytes()
+
+    ok, msg, restored = cb.rollback(backup_id=target.name)
+
+    assert not ok
+    assert restored is None
+    assert "safety snapshot" in msg.lower()
+    assert current.exists()
+    assert "current state" in (current / "SKILL.md").read_text(encoding="utf-8")
+    assert not (skills / "snapshot-only").exists()
+    assert target.exists()
+    assert (target / "skills.tar.gz").read_bytes() == archive_bytes
+    assert not any(
+        entry.name.startswith(".rollback-staging-")
+        for entry in (skills / ".curator_backups").iterdir()
+    )
+
+
+def test_rollback_fails_closed_when_safety_snapshot_returns_none(
+    backup_env, monkeypatch
+):
+    cb, skills, target, current = _prepare_changed_tree_for_failed_rollback(backup_env)
+    monkeypatch.setattr(cb, "snapshot_skills", lambda *args, **kwargs: None)
+
+    _assert_failed_rollback_preserved_state(cb, skills, target, current)
+
+
+def test_rollback_fails_closed_when_backups_are_disabled(backup_env, monkeypatch):
+    cb, skills, target, current = _prepare_changed_tree_for_failed_rollback(backup_env)
+    monkeypatch.setattr(cb, "is_enabled", lambda: False)
+
+    _assert_failed_rollback_preserved_state(cb, skills, target, current)
+
+
 def test_rollback_no_snapshots_returns_error(backup_env):
     cb = backup_env["cb"]
     ok, msg, _ = cb.rollback()

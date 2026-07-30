@@ -801,6 +801,16 @@ class TestListProfiles:
         assert profiles[0].name == "default"
         assert profiles[0].is_default is True
 
+    def test_managed_account_overlays_are_not_public_profiles(self, profile_env):
+        internal = _get_profiles_root() / "acct-1234567890abcdef-profile"
+        internal.mkdir(parents=True)
+        (internal / ".managed-owner-boundary.json").write_text(
+            json.dumps({"version": 1, "boundary": "a" * 64, "profile": "default"}),
+            encoding="utf-8",
+        )
+
+        assert internal.name not in {item.name for item in list_profiles()}
+
 
 # ===================================================================
 # TestActiveProfile
@@ -1284,6 +1294,90 @@ class TestExportImport:
 
         assert Path(result).exists()
         assert tarfile.is_tarfile(str(result))
+
+    def test_export_recursively_redacts_credentials_and_audits_scan(
+        self, profile_env, tmp_path
+    ):
+        create_profile("secure", no_alias=True)
+        profile_dir = get_profile_dir("secure")
+        marker_values = [
+            "sk-model-plaintext-marker",
+            "aux-token-plaintext-marker",
+            "custom-password-plaintext-marker",
+            "credential-reference-plaintext-marker",
+            "bearer-plaintext-marker",
+        ]
+        (profile_dir / "config.yaml").write_text(
+            yaml.safe_dump(
+                {
+                    "model": {
+                        "provider": "openrouter",
+                        "api_key": marker_values[0],
+                    },
+                    "auxiliary": {"token": marker_values[1]},
+                    "custom_providers": {
+                        "private": {
+                            "provider": "custom",
+                            "password": marker_values[2],
+                            "credential_reference": {
+                                "provider": "vault",
+                                "value": marker_values[3],
+                            },
+                        }
+                    },
+                },
+                sort_keys=False,
+            ),
+            encoding="utf-8",
+        )
+        nested = profile_dir / "skills" / "nested"
+        nested.mkdir(parents=True)
+        (nested / "settings.json").write_text(
+            json.dumps({"outer": {"client_secret": "json-secret-marker"}}),
+            encoding="utf-8",
+        )
+        (profile_dir / "SOUL.md").write_text(
+            f"Authorization: Bearer {marker_values[4]}",
+            encoding="utf-8",
+        )
+        output = tmp_path / "secure.tar.gz"
+
+        export_profile("secure", str(output))
+
+        with tarfile.open(output, "r:gz") as archive:
+            config = yaml.safe_load(
+                archive.extractfile("secure/config.yaml").read().decode("utf-8")
+            )
+            settings = json.loads(
+                archive.extractfile("secure/skills/nested/settings.json")
+                .read()
+                .decode("utf-8")
+            )
+            soul = archive.extractfile("secure/SOUL.md").read().decode("utf-8")
+            archive_bytes = b"".join(
+                archive.extractfile(member).read()
+                for member in archive.getmembers()
+                if member.isfile()
+            )
+        assert config["model"] == {
+            "provider": "openrouter",
+            "credentials_configured": True,
+        }
+        assert config["custom_providers"]["private"]["credential_reference"] == {
+            "configured": True,
+            "provider": "vault",
+        }
+        assert settings["outer"] == {"credentials_configured": True}
+        assert "Bearer [REDACTED]" in soul
+        for marker in [*marker_values, "json-secret-marker"]:
+            assert marker.encode() not in archive_bytes
+
+        audit = _get_profiles_root().parent / "audit" / "profile-exports.jsonl"
+        record = json.loads(audit.read_text(encoding="utf-8").splitlines()[-1])
+        assert record["status"] == "completed"
+        assert record["findings"] == 0
+        assert record["redactions"] >= 6
+        assert not any(marker in audit.read_text(encoding="utf-8") for marker in marker_values)
 
     def test_import_restores_from_archive(self, profile_env, tmp_path):
         # Create and export a profile
@@ -2015,3 +2109,13 @@ class TestProfilesToServe:
     def test_on_no_named_profiles_returns_just_default(self, profile_env):
         serve = profiles_to_serve(multiplex=True)
         assert [n for n, _ in serve] == ["default"]
+
+    def test_on_excludes_managed_account_overlays(self, profile_env):
+        internal = _get_profiles_root() / "acct-1234567890abcdef-profile"
+        internal.mkdir(parents=True)
+        (internal / ".managed-owner-boundary.json").write_text(
+            json.dumps({"version": 1, "boundary": "a" * 64, "profile": "default"}),
+            encoding="utf-8",
+        )
+
+        assert internal.name not in dict(profiles_to_serve(multiplex=True))

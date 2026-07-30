@@ -1,0 +1,12 @@
+[Unit]
+Description=Poll for a committed Hermes fabric release
+
+[Timer]
+OnBootSec=2min
+OnUnitActiveSec=2min
+RandomizedDelaySec=20s
+Persistent=true
+Unit=hermes-fabric-update.service
+
+[Install]
+WantedBy=timers.target

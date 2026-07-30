@@ -13,8 +13,21 @@ this from a real user-initiated /new.
 
 import os
 import tempfile
+from contextlib import contextmanager
 from pathlib import Path
 from unittest.mock import MagicMock, patch
+
+
+@contextmanager
+def _temporary_session_db():
+    from hermes_state import SessionDB
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        db = SessionDB(db_path=Path(tmpdir) / "test.db")
+        try:
+            yield db
+        finally:
+            db.close()
 
 
 
@@ -37,10 +50,7 @@ class TestCompressionBoundaryHook:
             return agent
 
     def test_on_session_start_called_with_compression_boundary(self):
-        from hermes_state import SessionDB
-
-        with tempfile.TemporaryDirectory() as tmpdir:
-            db = SessionDB(db_path=Path(tmpdir) / "test.db")
+        with _temporary_session_db() as db:
             agent = self._make_agent(db)
 
             # Stub the context compressor: we only need to observe the hook.
@@ -132,10 +142,7 @@ class TestCompressionBoundaryHook:
 
     def test_hook_failure_does_not_break_compression(self):
         """If the context engine raises from on_session_start, compression still completes."""
-        from hermes_state import SessionDB
-
-        with tempfile.TemporaryDirectory() as tmpdir:
-            db = SessionDB(db_path=Path(tmpdir) / "test.db")
+        with _temporary_session_db() as db:
             agent = self._make_agent(db)
 
             compressor = MagicMock()
@@ -162,6 +169,50 @@ class TestCompressionBoundaryHook:
             )
             assert compressed
             assert agent.session_id != original_sid
+
+    def test_internal_hook_trace_is_persisted_on_compression_summary(self):
+        from hermes_services.internal_hooks import InternalHook
+        from tests.hermes_services.internal_hook_test_support import (
+            register_test_hook,
+            reset_test_registry,
+            restore_production_registry,
+        )
+        with _temporary_session_db() as db:
+            try:
+                agent = self._make_agent(db)
+                compressor = MagicMock()
+                compressor.compress.return_value = [
+                    {"role": "user", "content": "[CONTEXT COMPACTION] summary"},
+                    {"role": "user", "content": "tail question"},
+                ]
+                compressor.compression_count = 1
+                compressor.last_prompt_tokens = 0
+                compressor.last_completion_tokens = 0
+                compressor._last_summary_error = None
+                compressor._last_compress_aborted = False
+                agent.context_compressor = compressor
+                reset_test_registry()
+                register_test_hook(
+                    "before_context_compaction",
+                    InternalHook(
+                        name="compression-observer",
+                        source="hermes.tests",
+                        version="1",
+                        callback=lambda value, **_context: value,
+                    ),
+                )
+                compressed, _ = agent._compress_context(
+                    [{"role": "user", "content": "original"}],
+                    "sys",
+                    approx_tokens=100,
+                )
+                assert compressed[0]["hook_trace"][0]["point"] == (
+                    "before_context_compaction"
+                )
+                persisted = db.get_messages_as_conversation(agent.session_id)
+                assert persisted[0]["hook_trace"] == compressed[0]["hook_trace"]
+            finally:
+                restore_production_registry()
 
 
 class TestSessionCompressEvent:
@@ -199,11 +250,8 @@ class TestSessionCompressEvent:
         return compressor
 
     def test_event_emitted_on_compression(self):
-        from hermes_state import SessionDB
-
         events = []
-        with tempfile.TemporaryDirectory() as tmpdir:
-            db = SessionDB(db_path=Path(tmpdir) / "test.db")
+        with _temporary_session_db() as db:
             agent = self._make_agent(
                 db, event_callback=lambda et, ctx: events.append((et, ctx))
             )
@@ -225,10 +273,7 @@ class TestSessionCompressEvent:
 
     def test_no_callback_is_safe(self):
         """Compression must work when no event_callback is wired."""
-        from hermes_state import SessionDB
-
-        with tempfile.TemporaryDirectory() as tmpdir:
-            db = SessionDB(db_path=Path(tmpdir) / "test.db")
+        with _temporary_session_db() as db:
             agent = self._make_agent(db, event_callback=None)
             agent.context_compressor = self._stub_compressor()
             compressed, _ = agent._compress_context(
@@ -237,13 +282,10 @@ class TestSessionCompressEvent:
             assert compressed
 
     def test_callback_exception_does_not_break_compression(self):
-        from hermes_state import SessionDB
-
         def _boom(event_type, ctx):
             raise RuntimeError("hook exploded")
 
-        with tempfile.TemporaryDirectory() as tmpdir:
-            db = SessionDB(db_path=Path(tmpdir) / "test.db")
+        with _temporary_session_db() as db:
             agent = self._make_agent(db, event_callback=_boom)
             original_sid = agent.session_id
             agent.context_compressor = self._stub_compressor()

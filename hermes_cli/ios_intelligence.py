@@ -18,6 +18,7 @@ import hmac
 import math
 import os
 from pathlib import Path
+import re
 import secrets
 import sqlite3
 import stat
@@ -32,6 +33,11 @@ import httpx
 
 from hermes_runtime.config import get_hermes_home
 from hermes_cli.sqlite_util import write_txn
+from hermes_cli.account_identity import (
+    generation_scoped_owner_id,
+    public_owner_id as _public_owner,
+    storage_account_generation as _storage_generation,
+)
 
 
 WEATHER_MONTHLY_LIMIT = 30_000
@@ -42,6 +48,8 @@ _CURRENT_COLLECTION_INDEX_KINDS = {
     "reminder": "reminder-index",
 }
 _BLOCKED_EVENT_KINDS = frozenset({"apns-token"})
+_DERIVED_JOB_LEASE_SECONDS = 60
+_DERIVED_JOB_MAX_ATTEMPTS = 20
 _HOT_ENVELOPE_PREFIX = "HERMES-HOT-AESGCM-1:"
 _SHARED_CACHE_OWNER = "__hermes-shared-cache__"
 _PLAINTEXT_DEFAULTS = {
@@ -64,6 +72,7 @@ _HOT_JSON_FIELDS = (
     ("ios_behavior_models", "payload_json", "ios_behavior_models.payload_json"),
     ("ios_behavior_feedback", "payload_json", "ios_behavior_feedback.payload_json"),
     ("ios_weather_quiet_summary", "payload_json", "ios_weather_quiet_summary.payload_json"),
+    ("ios_derived_jobs", "payload_json", "ios_derived_jobs.payload_json"),
 )
 _HOT_TEXT_FIELDS = (
     ("ios_trajectory", "motion", "ios_trajectory.motion"),
@@ -301,6 +310,42 @@ CREATE TABLE IF NOT EXISTS ios_behavior_feedback (
 CREATE INDEX IF NOT EXISTS idx_ios_feedback_owner_time
     ON ios_behavior_feedback(owner_id, observed_at DESC);
 
+CREATE TABLE IF NOT EXISTS ios_place_samples (
+    owner_id TEXT NOT NULL,
+    sample_id TEXT NOT NULL,
+    created_at INTEGER NOT NULL,
+    PRIMARY KEY(owner_id, sample_id)
+);
+
+CREATE TABLE IF NOT EXISTS ios_derived_jobs (
+    owner_id TEXT NOT NULL,
+    device_id TEXT NOT NULL,
+    event_id TEXT NOT NULL,
+    job_kind TEXT NOT NULL,
+    payload_json TEXT NOT NULL,
+    state TEXT NOT NULL DEFAULT 'pending',
+    priority INTEGER NOT NULL DEFAULT 100,
+    attempts INTEGER NOT NULL DEFAULT 0,
+    not_before INTEGER NOT NULL DEFAULT 0,
+    lease_token TEXT NOT NULL DEFAULT '',
+    lease_until INTEGER NOT NULL DEFAULT 0,
+    last_error TEXT NOT NULL DEFAULT '',
+    created_at INTEGER NOT NULL,
+    updated_at INTEGER NOT NULL,
+    completed_at INTEGER,
+    PRIMARY KEY(owner_id, device_id, event_id, job_kind)
+);
+CREATE INDEX IF NOT EXISTS idx_ios_derived_jobs_claim
+    ON ios_derived_jobs(state, priority DESC, not_before, created_at);
+
+CREATE TABLE IF NOT EXISTS ios_derived_backfill_watermarks (
+    owner_id TEXT PRIMARY KEY,
+    received_at INTEGER NOT NULL DEFAULT 0,
+    device_id TEXT NOT NULL DEFAULT '',
+    event_id TEXT NOT NULL DEFAULT '',
+    updated_at INTEGER NOT NULL
+);
+
 CREATE TABLE IF NOT EXISTS ios_weather_quiet_summary (
     owner_id TEXT NOT NULL,
     local_date TEXT NOT NULL,
@@ -340,6 +385,7 @@ CREATE INDEX IF NOT EXISTS idx_ios_cold_install_intents_owner
 CREATE TABLE IF NOT EXISTS ios_account_deletion_tombstones (
     owner_id TEXT PRIMARY KEY,
     owner_scope TEXT NOT NULL DEFAULT '',
+    account_generation TEXT NOT NULL DEFAULT '',
     status TEXT NOT NULL DEFAULT 'pending',
     attempts INTEGER NOT NULL DEFAULT 0,
     last_error TEXT NOT NULL DEFAULT '',
@@ -349,6 +395,23 @@ CREATE TABLE IF NOT EXISTS ios_account_deletion_tombstones (
 );
 CREATE INDEX IF NOT EXISTS idx_ios_account_deletions_pending
     ON ios_account_deletion_tombstones(status, updated_at);
+
+CREATE TABLE IF NOT EXISTS ios_export_audit (
+    id TEXT PRIMARY KEY,
+    owner_id TEXT NOT NULL,
+    account_generation TEXT NOT NULL,
+    encrypted INTEGER NOT NULL,
+    kdf TEXT NOT NULL,
+    destination_kind TEXT NOT NULL,
+    plaintext_bytes INTEGER NOT NULL,
+    ciphertext_bytes INTEGER NOT NULL,
+    scanner_redactions INTEGER NOT NULL,
+    scanner_findings INTEGER NOT NULL,
+    status TEXT NOT NULL,
+    created_at INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_ios_export_audit_owner_time
+    ON ios_export_audit(owner_id, created_at DESC);
 """
 
 _ACCOUNT_HOT_TABLES = (
@@ -366,7 +429,11 @@ _ACCOUNT_HOT_TABLES = (
     "ios_route_samples",
     "ios_behavior_models",
     "ios_behavior_feedback",
+    "ios_place_samples",
+    "ios_derived_jobs",
+    "ios_derived_backfill_watermarks",
     "ios_weather_quiet_summary",
+    "ios_export_audit",
 )
 _ACCOUNT_OWNED_TABLES = (
     *_ACCOUNT_HOT_TABLES,
@@ -374,12 +441,9 @@ _ACCOUNT_OWNED_TABLES = (
     "ios_cold_install_intents",
 )
 
-
-def _owner(value: Any) -> str:
-    result = str(value or "").strip().replace("\x00", "")[:512]
-    if not result:
-        raise ValueError("owner_id is required")
-    return result
+def _owner(value: Any, account_generation: str | None = None) -> str:
+    """Return the immutable storage scope for the active account generation."""
+    return generation_scoped_owner_id(value, account_generation)
 
 
 def _device(value: Any) -> str:
@@ -411,6 +475,88 @@ def _epoch(value: Any = None) -> int:
 
 def _json(value: Any) -> str:
     return json.dumps(value, ensure_ascii=False, separators=(",", ":"), default=str)
+
+
+_ACCOUNT_EXPORT_SECRET_KEYS = frozenset({
+    "api_key",
+    "apikey",
+    "access_token",
+    "refresh_token",
+    "auth_token",
+    "session_token",
+    "token",
+    "lease_token",
+    "password",
+    "passwd",
+    "secret",
+    "private_key",
+    "client_secret",
+    "credential",
+    "credentials",
+    "credential_reference",
+    "credential_ref",
+})
+
+
+def _account_export_secret_key(value: Any) -> bool:
+    normalized = re.sub(r"[^a-z0-9]+", "_", str(value).lower()).strip("_")
+    return (
+        normalized in _ACCOUNT_EXPORT_SECRET_KEYS
+        or normalized.endswith("_api_key")
+        or normalized.endswith("_token")
+        or normalized.endswith("_password")
+        or normalized.endswith("_secret")
+    )
+
+
+def _redact_account_export_credentials(value: Any) -> tuple[Any, int]:
+    if isinstance(value, Mapping):
+        clean: dict[str, Any] = {}
+        removed = 0
+        for key, item in value.items():
+            if _account_export_secret_key(key):
+                removed += 1
+                continue
+            child, count = _redact_account_export_credentials(item)
+            clean[str(key)] = child
+            removed += count
+        return clean, removed
+    if isinstance(value, list):
+        clean_list = []
+        removed = 0
+        for item in value:
+            child, count = _redact_account_export_credentials(item)
+            clean_list.append(child)
+            removed += count
+        return clean_list, removed
+    if isinstance(value, str) and value.lstrip().startswith(("{", "[")):
+        try:
+            decoded = json.loads(value)
+        except json.JSONDecodeError:
+            return value, 0
+        clean, removed = _redact_account_export_credentials(decoded)
+        return _json(clean), removed
+    return value, 0
+
+
+def _scan_account_export_credentials(value: Any, path: str = "$") -> list[str]:
+    findings: list[str] = []
+    if isinstance(value, Mapping):
+        for key, item in value.items():
+            child = f"{path}.{key}"
+            if _account_export_secret_key(key):
+                findings.append(child)
+            findings.extend(_scan_account_export_credentials(item, child))
+    elif isinstance(value, list):
+        for index, item in enumerate(value):
+            findings.extend(_scan_account_export_credentials(item, f"{path}[{index}]"))
+    elif isinstance(value, str) and value.lstrip().startswith(("{", "[")):
+        try:
+            decoded = json.loads(value)
+        except json.JSONDecodeError:
+            return findings
+        findings.extend(_scan_account_export_credentials(decoded, path))
+    return findings
 
 
 def _loads(value: str) -> dict[str, Any]:
@@ -583,7 +729,7 @@ def load_ios_feature_weights(supervisor: Any | None = None) -> dict[str, float]:
 class IOSIntelligenceStore:
     """SQLite source of truth shared by the independent iOS MCP processes."""
 
-    schema_version = 10
+    schema_version = 13
     _schema_lock = threading.RLock()
 
     def __init__(self, base_dir: str | os.PathLike[str] | None = None):
@@ -654,6 +800,11 @@ class IOSIntelligenceStore:
                         conn.execute(
                             "ALTER TABLE ios_account_deletion_tombstones "
                             "ADD COLUMN owner_scope TEXT NOT NULL DEFAULT ''"
+                        )
+                    if "account_generation" not in deletion_columns:
+                        conn.execute(
+                            "ALTER TABLE ios_account_deletion_tombstones "
+                            "ADD COLUMN account_generation TEXT NOT NULL DEFAULT ''"
                         )
                     if locked_version < 4:
                         placeholders = ",".join("?" for _kind_name in _BLOCKED_EVENT_KINDS)
@@ -1091,6 +1242,9 @@ class IOSIntelligenceStore:
         for field_table, column, purpose in _HOT_NUMBER_FIELDS:
             if field_table == table and column in item:
                 item[column] = self._open_number(owner_id, item[column], purpose)
+        if "owner_id" in item:
+            item["owner_id"] = _public_owner(item["owner_id"])
+            item["account_generation"] = _storage_generation(owner_id)
         return item
 
     def _connect(self) -> sqlite3.Connection:
@@ -1206,6 +1360,133 @@ class IOSIntelligenceStore:
         # radius while keeping raw coordinates out of persistent identifiers.
         return self._pseudonymous_place_id(owner_id, latitude, longitude)
 
+    def _enqueue_derived_job(
+        self,
+        conn: sqlite3.Connection,
+        owner_id: str,
+        device_id: str,
+        event_id: str,
+        job_kind: str,
+        payload: Mapping[str, Any],
+        *,
+        priority: int = 100,
+        created_at: int | None = None,
+    ) -> int:
+        now = int(time.time()) if created_at is None else int(created_at)
+        return int(conn.execute(
+            "INSERT OR IGNORE INTO ios_derived_jobs("
+            "owner_id,device_id,event_id,job_kind,payload_json,state,priority,"
+            "attempts,not_before,lease_token,lease_until,last_error,created_at,"
+            "updated_at,completed_at) VALUES(?,?,?,?,?,'pending',?,0,0,'',0,'',?,?,NULL)",
+            (
+                owner_id,
+                device_id,
+                event_id,
+                job_kind,
+                self._seal_json(owner_id, dict(payload), "ios_derived_jobs.payload_json"),
+                max(0, min(100, int(priority))),
+                now,
+                now,
+            ),
+        ).rowcount)
+
+    def _enqueue_event_derived_jobs(
+        self,
+        conn: sqlite3.Connection,
+        *,
+        owner_id: str,
+        device_id: str,
+        event_id: str,
+        kind: str,
+        payload: Mapping[str, Any],
+        observed_at: int,
+        place: Mapping[str, Any] | None = None,
+        priority: int = 100,
+        created_at: int | None = None,
+    ) -> int:
+        queued = 0
+        if place is not None:
+            queued += self._enqueue_derived_job(
+                conn,
+                owner_id,
+                device_id,
+                event_id,
+                "learn-place",
+                place,
+                priority=priority,
+                created_at=created_at,
+            )
+
+        feedback_label = {
+            "place": "actual-destination",
+            "place-visit": "actual-destination",
+            "visit": "actual-destination",
+            "motion": "actual-motion",
+            "notification-feedback": "notification-value",
+            "weather-feedback": "notification-value",
+        }.get(kind)
+        if feedback_label:
+            queued += self._enqueue_derived_job(
+                conn,
+                owner_id,
+                device_id,
+                event_id,
+                "behavior-feedback",
+                {
+                    "label": feedback_label,
+                    "payload": dict(payload),
+                    "observed_at": observed_at,
+                },
+                priority=priority,
+                created_at=created_at,
+            )
+
+        if kind in {"route", "route-sample", "trip"}:
+            route = payload.get("route")
+            route_payload = dict(route) if isinstance(route, Mapping) else dict(payload)
+            origin = str(
+                route_payload.get("origin_place_id")
+                or route_payload.get("origin")
+                or ""
+            ).strip()
+            destination = str(
+                route_payload.get("destination_place_id")
+                or route_payload.get("destination")
+                or ""
+            ).strip()
+            if origin and destination:
+                route_payload["origin_place_id"] = origin
+                route_payload["destination_place_id"] = destination
+                route_payload.setdefault("observed_at", observed_at)
+                queued += self._enqueue_derived_job(
+                    conn,
+                    owner_id,
+                    device_id,
+                    event_id,
+                    "learn-route",
+                    route_payload,
+                    priority=priority,
+                    created_at=created_at,
+                )
+
+        if kind in {"behavior-model", "model-update"}:
+            model_payload = payload.get("payload")
+            if isinstance(model_payload, Mapping):
+                queued += self._enqueue_derived_job(
+                    conn,
+                    owner_id,
+                    device_id,
+                    event_id,
+                    "update-model",
+                    {
+                        "model_name": str(payload.get("model_name") or "behavior")[:128],
+                        "payload": dict(model_payload),
+                    },
+                    priority=priority,
+                    created_at=created_at,
+                )
+        return queued
+
     def ingest_events(
         self,
         owner_id: str,
@@ -1226,8 +1507,6 @@ class IOSIntelligenceStore:
         now = int(time.time())
         accepted = duplicates = discarded = 0
         max_cursor = str(cursor or "")
-        learned_places: list[dict[str, Any]] = []
-        feedback_events: list[tuple[str, dict[str, Any], int, str, str]] = []
         with self._connect() as conn, write_txn(conn):
             if conn.execute(
                 "SELECT 1 FROM ios_account_deletion_tombstones WHERE owner_id=?",
@@ -1286,18 +1565,7 @@ class IOSIntelligenceStore:
                     duplicates += 1
                     continue
                 accepted += 1
-                feedback_label = {
-                    "place": "actual-destination",
-                    "place-visit": "actual-destination",
-                    "visit": "actual-destination",
-                    "motion": "actual-motion",
-                    "notification-feedback": "notification-value",
-                    "weather-feedback": "notification-value",
-                }.get(kind)
-                if feedback_label:
-                    feedback_events.append(
-                        (feedback_label, dict(payload), observed_at, event_id, event_device_id)
-                    )
+                learned_place: dict[str, Any] | None = None
                 conn.execute(
                     "INSERT INTO ios_snapshots VALUES(?,?,?,?,?,?) "
                     "ON CONFLICT(owner_id,kind,device_id) DO UPDATE SET "
@@ -1381,7 +1649,7 @@ class IOSIntelligenceStore:
                                 self._seal_json(owner_id, payload, "ios_places.payload_json"),
                             ),
                         )
-                        learned_places.append({
+                        learned_place = {
                             "place_id": place_id,
                             "name": str(payload.get("name") or ""),
                             "latitude": payload.get("latitude"),
@@ -1390,7 +1658,19 @@ class IOSIntelligenceStore:
                             "departed_at": departed,
                             "indoor": payload.get("indoor"),
                             "metadata": payload,
-                        })
+                        }
+                self._enqueue_event_derived_jobs(
+                    conn,
+                    owner_id=owner_id,
+                    device_id=event_device_id,
+                    event_id=event_id,
+                    kind=kind,
+                    payload=payload,
+                    observed_at=observed_at,
+                    place=learned_place,
+                    priority=100,
+                    created_at=now,
+                )
             if accepted or discarded or prior_cursor_row is None:
                 stored_cursor = _advance_upload_cursor(
                     "" if prior_cursor_row is None else str(prior_cursor_row["cursor"]),
@@ -1405,22 +1685,330 @@ class IOSIntelligenceStore:
             else:
                 max_cursor = str(prior_cursor_row["cursor"])
             self._touch(conn, owner_id, now)
-        # Derived aggregates use their own short transaction so a malformed
-        # aggregate cannot invalidate an already accepted immutable event.
-        for place in learned_places:
-            try:
-                self.learn_place(owner_id, **place)
-            except (TypeError, ValueError):
-                continue
-        for label, payload, observed_at, event_id, event_device_id in feedback_events:
+        # Preserve low-latency projections without coupling cursor durability
+        # to derived training. A crash or failure leaves the durable job for
+        # the scheduler; successful jobs are CAS-sealed by their lease token.
+        try:
+            self.run_derived_jobs(limit=max(1, min(200, accepted * 3)), owner_id=owner_id)
+        except Exception:
+            pass
+        return {"accepted": accepted, "duplicates": duplicates, "next_cursor": max_cursor}
+
+    def _claim_derived_jobs(
+        self,
+        *,
+        limit: int,
+        owner_id: str = "",
+        now: int | None = None,
+        lease_seconds: int = _DERIVED_JOB_LEASE_SECONDS,
+    ) -> list[dict[str, Any]]:
+        instant = int(time.time()) if now is None else int(now)
+        requested_owner = _owner(owner_id) if owner_id else ""
+        claimed: list[dict[str, Any]] = []
+        with self._connect() as conn, write_txn(conn):
+            conn.execute(
+                "UPDATE ios_derived_jobs SET state='cancelled',lease_token='',"
+                "lease_until=0,last_error='generation_deleted',updated_at=? "
+                "WHERE state IN ('pending','inflight') AND owner_id IN ("
+                "SELECT owner_id FROM ios_account_deletion_tombstones)",
+                (instant,),
+            )
+            conn.execute(
+                "UPDATE ios_derived_jobs SET state=CASE WHEN attempts>=? THEN 'failed' ELSE 'pending' END,"
+                "lease_token='',lease_until=0,not_before=?,last_error='lease_expired',updated_at=? "
+                "WHERE state='inflight' AND lease_until<=?",
+                (_DERIVED_JOB_MAX_ATTEMPTS, instant, instant, instant),
+            )
+            where_owner = " AND owner_id=?" if requested_owner else ""
+            params: tuple[Any, ...] = (
+                (instant, requested_owner, max(1, min(int(limit), 1000)))
+                if requested_owner
+                else (instant, max(1, min(int(limit), 1000)))
+            )
+            rows = conn.execute(
+                "SELECT * FROM ios_derived_jobs WHERE state='pending' AND not_before<=?"
+                + where_owner
+                + " ORDER BY priority DESC,created_at,owner_id,device_id,event_id,job_kind LIMIT ?",
+                params,
+            ).fetchall()
+            for row in rows:
+                token = secrets.token_hex(24)
+                changed = conn.execute(
+                    "UPDATE ios_derived_jobs SET state='inflight',attempts=attempts+1,"
+                    "lease_token=?,lease_until=?,updated_at=? WHERE owner_id=? AND "
+                    "device_id=? AND event_id=? AND job_kind=? AND state='pending'",
+                    (
+                        token,
+                        instant + max(1, int(lease_seconds)),
+                        instant,
+                        row["owner_id"],
+                        row["device_id"],
+                        row["event_id"],
+                        row["job_kind"],
+                    ),
+                ).rowcount
+                if changed:
+                    item = dict(row)
+                    item["lease_token"] = token
+                    item["attempts"] = int(item.get("attempts") or 0) + 1
+                    item["payload"] = self._open_json(
+                        str(row["owner_id"]),
+                        str(row["payload_json"]),
+                        "ios_derived_jobs.payload_json",
+                    )
+                    claimed.append(item)
+        return claimed
+
+    def _process_derived_job(self, job: Mapping[str, Any]) -> None:
+        owner_id = str(job["owner_id"])
+        device_id = str(job["device_id"])
+        event_id = str(job["event_id"])
+        payload = dict(job.get("payload") or {})
+        sample_id = "derived:" + hashlib.sha256(
+            f"{owner_id}\0{device_id}\0{event_id}".encode("utf-8")
+        ).hexdigest()
+        job_kind = str(job["job_kind"])
+        if job_kind == "learn-place":
+            self.learn_place(owner_id, sample_id=sample_id, **payload)
+            return
+        if job_kind == "behavior-feedback":
+            feedback_payload = payload.get("payload")
             self.record_behavior_feedback(
                 owner_id,
-                label,
-                payload,
-                observed_at=observed_at,
-                feedback_id=f"event:{event_device_id}:{event_id}",
+                str(payload.get("label") or "event"),
+                dict(feedback_payload) if isinstance(feedback_payload, Mapping) else {},
+                observed_at=payload.get("observed_at"),
+                feedback_id=sample_id,
             )
-        return {"accepted": accepted, "duplicates": duplicates, "next_cursor": max_cursor}
+            return
+        if job_kind == "learn-route":
+            metadata = payload.get("metadata")
+            self.learn_route(
+                owner_id,
+                str(payload.get("origin_place_id") or ""),
+                str(payload.get("destination_place_id") or ""),
+                mode=str(payload.get("mode") or ""),
+                duration_seconds=payload.get("duration_seconds"),
+                distance_meters=payload.get("distance_meters"),
+                outdoor_minutes=payload.get("outdoor_minutes"),
+                observed_at=payload.get("observed_at"),
+                metadata=dict(metadata) if isinstance(metadata, Mapping) else payload,
+                sample_id=sample_id,
+            )
+            return
+        if job_kind == "update-model":
+            model_payload = payload.get("payload")
+            if not isinstance(model_payload, Mapping):
+                raise ValueError("derived model payload must be an object")
+            self.save_model(
+                owner_id,
+                str(payload.get("model_name") or "behavior"),
+                model_payload,
+            )
+            return
+        raise ValueError(f"unsupported derived job kind: {job_kind}")
+
+    def _finish_derived_job(
+        self,
+        job: Mapping[str, Any],
+        *,
+        error: Exception | None = None,
+        now: int | None = None,
+    ) -> bool:
+        instant = int(time.time()) if now is None else int(now)
+        attempts = int(job.get("attempts") or 1)
+        with self._connect() as conn, write_txn(conn):
+            tombstoned = conn.execute(
+                "SELECT 1 FROM ios_account_deletion_tombstones WHERE owner_id=?",
+                (job["owner_id"],),
+            ).fetchone() is not None
+            if tombstoned:
+                state = "cancelled"
+                last_error = "generation_deleted"
+                not_before = 0
+                completed_at = instant
+            elif error is None:
+                state = "completed"
+                last_error = ""
+                not_before = 0
+                completed_at = instant
+            else:
+                state = "failed" if attempts >= _DERIVED_JOB_MAX_ATTEMPTS else "pending"
+                last_error = type(error).__name__[:128]
+                not_before = instant + min(300, 2 ** min(8, attempts))
+                completed_at = instant if state == "failed" else None
+            changed = conn.execute(
+                "UPDATE ios_derived_jobs SET state=?,not_before=?,lease_token='',"
+                "lease_until=0,last_error=?,updated_at=?,completed_at=? WHERE "
+                "owner_id=? AND device_id=? AND event_id=? AND job_kind=? AND "
+                "state='inflight' AND lease_token=?",
+                (
+                    state,
+                    not_before,
+                    last_error,
+                    instant,
+                    completed_at,
+                    job["owner_id"],
+                    job["device_id"],
+                    job["event_id"],
+                    job["job_kind"],
+                    job["lease_token"],
+                ),
+            ).rowcount
+        return bool(changed)
+
+    def run_derived_jobs(
+        self,
+        *,
+        limit: int = 200,
+        owner_id: str = "",
+        backfill_limit: int = 0,
+        now: int | None = None,
+        lease_seconds: int = _DERIVED_JOB_LEASE_SECONDS,
+    ) -> dict[str, int]:
+        jobs = self._claim_derived_jobs(
+            limit=limit,
+            owner_id=owner_id,
+            now=now,
+            lease_seconds=lease_seconds,
+        )
+        completed = retry = failed = lost = 0
+        for job in jobs:
+            error: Exception | None = None
+            try:
+                self._process_derived_job(job)
+            except Exception as exc:
+                error = exc
+            if not self._finish_derived_job(job, error=error, now=now):
+                lost += 1
+            elif error is None:
+                completed += 1
+            elif int(job.get("attempts") or 1) >= _DERIVED_JOB_MAX_ATTEMPTS:
+                failed += 1
+            else:
+                retry += 1
+        backfilled = self.backfill_derived_jobs(limit=backfill_limit) if backfill_limit else 0
+        return {
+            "claimed": len(jobs),
+            "completed": completed,
+            "retry": retry,
+            "failed": failed,
+            "claim_lost": lost,
+            "backfilled": backfilled,
+        }
+
+    def backfill_derived_jobs(self, *, limit: int = 100) -> int:
+        remaining = max(0, min(int(limit), 10_000))
+        if not remaining:
+            return 0
+        queued = 0
+        with self._connect() as conn, write_txn(conn):
+            owners = conn.execute(
+                "SELECT DISTINCT e.owner_id FROM ios_events e WHERE NOT EXISTS ("
+                "SELECT 1 FROM ios_account_deletion_tombstones d WHERE d.owner_id=e.owner_id) "
+                "ORDER BY e.owner_id"
+            ).fetchall()
+            for owner_row in owners:
+                if remaining <= 0:
+                    break
+                owner = str(owner_row["owner_id"])
+                watermark = conn.execute(
+                    "SELECT received_at,device_id,event_id FROM ios_derived_backfill_watermarks "
+                    "WHERE owner_id=?",
+                    (owner,),
+                ).fetchone()
+                received_at = int(watermark["received_at"] or 0) if watermark else 0
+                device_id = str(watermark["device_id"] or "") if watermark else ""
+                event_id = str(watermark["event_id"] or "") if watermark else ""
+                rows = conn.execute(
+                    "SELECT * FROM ios_events WHERE owner_id=? AND (received_at>? OR "
+                    "(received_at=? AND device_id>?) OR "
+                    "(received_at=? AND device_id=? AND event_id>?)) "
+                    "ORDER BY received_at,device_id,event_id LIMIT ?",
+                    (
+                        owner,
+                        received_at,
+                        received_at,
+                        device_id,
+                        received_at,
+                        device_id,
+                        event_id,
+                        remaining,
+                    ),
+                ).fetchall()
+                for row in rows:
+                    raw_payload = self._open_json(
+                        owner,
+                        str(row["payload_json"]),
+                        "ios_events.payload_json",
+                    )
+                    place = None
+                    if str(row["kind"]) in {"place", "place-visit", "visit"}:
+                        place_row = conn.execute(
+                            "SELECT * FROM ios_places WHERE owner_id=? AND device_id=? AND event_id=?",
+                            (owner, row["device_id"], row["event_id"]),
+                        ).fetchone()
+                        if place_row is not None:
+                            place = {
+                                "place_id": str(place_row["place_id"]),
+                                "name": self._open_text(owner, place_row["name"], "ios_places.name"),
+                                "latitude": self._open_number(owner, place_row["latitude"], "ios_places.latitude"),
+                                "longitude": self._open_number(owner, place_row["longitude"], "ios_places.longitude"),
+                                "arrived_at": int(place_row["arrived_at"]),
+                                "departed_at": place_row["departed_at"],
+                                "indoor": None if place_row["indoor"] is None else bool(place_row["indoor"]),
+                                "metadata": self._open_json(owner, place_row["payload_json"], "ios_places.payload_json"),
+                            }
+                    queued += self._enqueue_event_derived_jobs(
+                        conn,
+                        owner_id=owner,
+                        device_id=str(row["device_id"]),
+                        event_id=str(row["event_id"]),
+                        kind=str(row["kind"]),
+                        payload=raw_payload,
+                        observed_at=int(row["observed_at"]),
+                        place=place,
+                        priority=10,
+                        created_at=int(row["received_at"]),
+                    )
+                    received_at = int(row["received_at"])
+                    device_id = str(row["device_id"])
+                    event_id = str(row["event_id"])
+                    remaining -= 1
+                if rows:
+                    conn.execute(
+                        "INSERT INTO ios_derived_backfill_watermarks VALUES(?,?,?,?,?) "
+                        "ON CONFLICT(owner_id) DO UPDATE SET received_at=excluded.received_at,"
+                        "device_id=excluded.device_id,event_id=excluded.event_id,updated_at=excluded.updated_at",
+                        (owner, received_at, device_id, event_id, int(time.time())),
+                    )
+        return queued
+
+    def list_derived_jobs(
+        self,
+        owner_id: str,
+        *,
+        state: str = "",
+    ) -> list[dict[str, Any]]:
+        owner_id = _owner(owner_id)
+        with self._connect() as conn:
+            rows = conn.execute(
+                "SELECT * FROM ios_derived_jobs WHERE owner_id=?"
+                + (" AND state=?" if state else "")
+                + " ORDER BY created_at,device_id,event_id,job_kind",
+                (owner_id, state) if state else (owner_id,),
+            ).fetchall()
+        return [
+            {
+                **dict(row),
+                "payload": self._open_json(
+                    owner_id,
+                    str(row["payload_json"]),
+                    "ios_derived_jobs.payload_json",
+                ),
+            }
+            for row in rows
+        ]
 
     def record_snapshot(
         self,
@@ -1683,6 +2271,7 @@ class IOSIntelligenceStore:
             place_result.append(item)
         forecasts = self.active_forecast(owner_id)
         return {
+            "schema_version": "hermes.ios-intelligence.snapshot.v1",
             "date": local_date.isoformat(), "timezone": str(tz),
             "trajectory": track_result, "places": place_result,
             "current_location": self.latest_snapshot(owner_id, "location"),
@@ -1712,6 +2301,7 @@ class IOSIntelligenceStore:
         expires_at: Any = None,
     ) -> dict[str, Any]:
         owner_id = _owner(owner_id)
+        public_owner_id = _public_owner(owner_id)
         now = int(time.time())
         available = _epoch(not_before)
         expiry = _epoch(expires_at) if expires_at is not None else None
@@ -1746,7 +2336,7 @@ class IOSIntelligenceStore:
             )
 
             result["wake"] = deliver_account_background_wake(
-                owner_id=owner_id,
+                owner_id=public_owner_id,
                 command_id=command_id,
                 expires_at=expiry,
             )
@@ -1888,7 +2478,13 @@ class IOSIntelligenceStore:
             rows = conn.execute(
                 f"SELECT owner_id FROM ios_account_activity{where} ORDER BY last_seen_at DESC", args
             ).fetchall()
-        return [str(row["owner_id"]) for row in rows]
+        active: list[str] = []
+        for row in rows:
+            storage_owner = str(row["owner_id"])
+            public_owner = _public_owner(storage_owner)
+            if _owner(public_owner) == storage_owner and public_owner not in active:
+                active.append(public_owner)
+        return active
 
     def evaluate_behavior(
         self,
@@ -2142,14 +2738,18 @@ class IOSIntelligenceStore:
         with self._connect() as conn:
             rows = conn.execute(
                 "SELECT id,valid_from,valid_until,payload_json FROM ios_active_forecasts "
-                "WHERE owner_id=? AND valid_until>? ORDER BY valid_from",
-                (owner_id, current),
+                "WHERE owner_id=? AND valid_from<=? AND valid_until>? ORDER BY valid_from",
+                (owner_id, current, current),
             ).fetchall()
         return [
             {
                 "id": row["id"],
                 "valid_from": row["valid_from"],
                 "valid_until": row["valid_until"],
+                "starts_at": row["valid_from"],
+                "expires_at": row["valid_until"],
+                "is_active": row["valid_from"] <= current < row["valid_until"],
+                "schema_version": "hermes.ios-intelligence.forecast.v1",
                 "data": self._open_json(owner_id, row["payload_json"], "ios_active_forecasts.payload_json"),
             }
             for row in rows
@@ -2709,6 +3309,7 @@ class IOSIntelligenceStore:
         departed_at: Any = None,
         indoor: bool | None = None,
         metadata: Mapping[str, Any] | None = None,
+        sample_id: str = "",
     ) -> dict[str, Any]:
         """Upsert a place in the account's weighted place graph.
 
@@ -2725,6 +3326,17 @@ class IOSIntelligenceStore:
         stored_name = self._seal_text(owner_id, clean_name, "ios_place_graph.name") if clean_name else ""
         meta = dict(metadata or {})
         with self._connect() as conn, write_txn(conn):
+            normalized_sample = str(sample_id or "").strip()[:512]
+            if normalized_sample and not conn.execute(
+                "INSERT OR IGNORE INTO ios_place_samples(owner_id,sample_id,created_at) "
+                "VALUES(?,?,?)",
+                (owner_id, normalized_sample, int(time.time())),
+            ).rowcount:
+                return {
+                    "owner_id": owner_id,
+                    "place_id": place_id,
+                    "duplicate_sample": True,
+                }
             existing = conn.execute(
                 "SELECT visits,weight,first_seen,is_home FROM ios_place_graph "
                 "WHERE owner_id=? AND place_id=?", (owner_id, place_id)
@@ -3453,17 +4065,25 @@ class IOSIntelligenceStore:
         owner_id: str,
         destination: str | os.PathLike[str] | None = None,
         *,
-        encrypt: bool = False,
+        encrypt: bool = True,
         export_passphrase: str | None = None,
         include_cold: bool = True,
     ) -> dict[str, Any]:
         owner_id = _owner(owner_id)
+        public_owner_id = _public_owner(owner_id)
         tables = (
             "ios_events", "ios_snapshots", "ios_trajectory", "ios_places", "ios_upload_cursors",
             "ios_device_commands", "ios_active_forecasts", "ios_notification_outbox", "ios_place_graph",
             "ios_route_graph", "ios_route_samples", "ios_behavior_models", "ios_behavior_feedback", "ios_weather_quiet_summary",
+            "ios_place_samples", "ios_derived_jobs", "ios_derived_backfill_watermarks",
         )
-        export: dict[str, Any] = {"format": "hermes-ios-account-v1", "owner_id": owner_id, "exported_at": int(time.time()), "tables": {}}
+        export: dict[str, Any] = {
+            "format": "hermes-ios-account-v1",
+            "owner_id": public_owner_id,
+            "account_generation": _storage_generation(owner_id),
+            "exported_at": int(time.time()),
+            "tables": {},
+        }
         with self._connect() as conn:
             for table in tables:
                 if table in {"ios_events", "ios_snapshots"}:
@@ -3479,66 +4099,138 @@ class IOSIntelligenceStore:
                 ]
             if include_cold:
                 rows = conn.execute("SELECT * FROM ios_cold_segments WHERE owner_id=?", (owner_id,)).fetchall()
-                export["cold_segments"] = [dict(row) for row in rows]
+                export["cold_segments"] = [
+                    {
+                        **dict(row),
+                        "owner_id": public_owner_id,
+                        "account_generation": _storage_generation(owner_id),
+                    }
+                    for row in rows
+                ]
         if include_cold:
             export["cold_trajectory"] = []
             for segment in export.get("cold_segments", []):
                 export["cold_trajectory"].extend(
                     self.read_cold_trajectory(owner_id, str(segment["segment_id"]))
                 )
+        export, scanner_redactions = _redact_account_export_credentials(export)
+        scanner_findings = _scan_account_export_credentials(export)
+        generated_recovery_key = export_passphrase is None
+        passphrase = export_passphrase or secrets.token_urlsafe(32)
+        if len(passphrase) < 12:
+            raise ValueError("account export passphrase must contain at least 12 characters")
         raw = _json(export).encode("utf-8")
-        payload: bytes
-        if encrypt and export_passphrase is not None:
-            payload = self._encrypt_export_blob(raw, owner_id, export_passphrase)
-        elif encrypt:
-            payload = self._encrypt_blob(raw, owner_id)
-        else:
-            payload = raw
+        if scanner_findings:
+            with self._connect() as conn, write_txn(conn):
+                conn.execute(
+                    "INSERT INTO ios_export_audit VALUES(?,?,?,?,?,?,?,?,?,?,?,?)",
+                    (
+                        f"export_{uuid.uuid4().hex}", owner_id,
+                        _storage_generation(owner_id), 1, "scrypt-N16384-r8-p1",
+                        "file" if destination is not None else "response",
+                        len(raw), 0, scanner_redactions, len(scanner_findings),
+                        "blocked", int(time.time()),
+                    ),
+                )
+            raise RuntimeError("account export secret scanner found credential fields")
+        # Encryption is unconditional even when an older caller explicitly
+        # passes encrypt=False. The compatibility argument cannot downgrade
+        # the server-side account export policy.
+        _ = encrypt
+        payload = self._encrypt_export_blob(raw, owner_id, passphrase)
+        response = {
+            "owner_id": public_owner_id,
+            "account_generation": _storage_generation(owner_id),
+            "encrypted": True,
+            "format": "hermes-account-export-v1",
+            "algorithm": "AES-256-GCM",
+            "kdf": "scrypt-N16384-r8-p1",
+            "bytes": len(payload),
+        }
+        if generated_recovery_key:
+            response["recovery_key"] = passphrase
         if destination is not None:
             target = Path(destination)
             target.parent.mkdir(parents=True, exist_ok=True)
-            target.write_bytes(payload)
-            return {"owner_id": owner_id, "path": str(target), "bytes": len(payload), "encrypted": encrypt}
-        if encrypt:
-            return {
-                "owner_id": owner_id,
-                "encrypted": True,
-                "format": "hermes-account-export-v1",
-                "algorithm": "AES-256-GCM",
-                "kdf": "scrypt-N16384-r8-p1" if export_passphrase is not None else "account-key",
-                "blob_base64": base64.b64encode(payload).decode("ascii"),
-                "bytes": len(payload),
-            }
-        return export
+            temporary = target.with_name(f".{target.name}.{uuid.uuid4().hex}.tmp")
+            try:
+                with temporary.open("xb") as handle:
+                    try:
+                        os.chmod(temporary, stat.S_IRUSR | stat.S_IWUSR)
+                    except OSError:
+                        pass
+                    for offset in range(0, len(payload), 1024 * 1024):
+                        handle.write(payload[offset:offset + 1024 * 1024])
+                    handle.flush()
+                    os.fsync(handle.fileno())
+                os.replace(temporary, target)
+                try:
+                    os.chmod(target, stat.S_IRUSR | stat.S_IWUSR)
+                except OSError:
+                    pass
+            finally:
+                temporary.unlink(missing_ok=True)
+            response["path"] = str(target)
+        else:
+            response["blob_base64"] = base64.b64encode(payload).decode("ascii")
+        with self._connect() as conn, write_txn(conn):
+            conn.execute(
+                "INSERT INTO ios_export_audit VALUES(?,?,?,?,?,?,?,?,?,?,?,?)",
+                (
+                    f"export_{uuid.uuid4().hex}", owner_id,
+                    _storage_generation(owner_id), 1, "scrypt-N16384-r8-p1",
+                    "file" if destination is not None else "response",
+                    len(raw), len(payload), scanner_redactions, 0,
+                    "completed", int(time.time()),
+                ),
+            )
+        return response
 
     export_account_data = export_account
 
-    def begin_account_deletion(self, owner_id: str, owner_scope: str = "") -> dict[str, Any]:
+    def begin_account_deletion(
+        self,
+        owner_id: str,
+        owner_scope: str = "",
+        account_generation: str = "",
+    ) -> dict[str, Any]:
         """Commit the fail-closed deletion intent before any destructive work."""
 
-        owner_id = _owner(owner_id)
         normalized_scope = str(owner_scope or "").strip()[:2048]
+        normalized_generation = str(account_generation or "").strip()[:256]
+        owner_id = _owner(owner_id, normalized_generation or None)
+        if not normalized_generation:
+            normalized_generation = _storage_generation(owner_id)
         now = int(time.time())
         with self._connect() as conn, write_txn(conn):
             conn.execute(
                 "INSERT INTO ios_account_deletion_tombstones("
-                "owner_id,owner_scope,status,attempts,last_error,requested_at,updated_at,completed_at"
-                ") VALUES(?,?,'pending',0,'',?,?,NULL) "
+                "owner_id,owner_scope,account_generation,status,attempts,last_error,"
+                "requested_at,updated_at,completed_at"
+                ") VALUES(?,?,?,'pending',0,'',?,?,NULL) "
                 "ON CONFLICT(owner_id) DO UPDATE SET "
                 "owner_scope=CASE WHEN excluded.owner_scope<>'' THEN excluded.owner_scope "
                 "ELSE ios_account_deletion_tombstones.owner_scope END,"
+                "account_generation=CASE WHEN excluded.account_generation<>'' "
+                "THEN excluded.account_generation "
+                "ELSE ios_account_deletion_tombstones.account_generation END,"
                 "status='pending',last_error='',updated_at=excluded.updated_at,completed_at=NULL",
-                (owner_id, normalized_scope, now, now),
+                (owner_id, normalized_scope, normalized_generation, now, now),
             )
         return {
-            "owner_id": owner_id,
+            "owner_id": _public_owner(owner_id),
             "owner_scope": normalized_scope,
+            "account_generation": normalized_generation,
             "state": "pending",
             "requested_at": now,
         }
 
-    def _purge_account_hot_data(self, owner_id: str) -> dict[str, int]:
-        owner_id = _owner(owner_id)
+    def _purge_account_hot_data(
+        self,
+        owner_id: str,
+        account_generation: str | None = None,
+    ) -> dict[str, int]:
+        owner_id = _owner(owner_id, account_generation)
         deleted: dict[str, int] = {}
         with self._connect() as conn, write_txn(conn):
             for table in _ACCOUNT_HOT_TABLES:
@@ -3550,20 +4242,31 @@ class IOSIntelligenceStore:
                 )
         return deleted
 
-    def delete_account(self, owner_id: str, *, delete_cold: bool = True) -> dict[str, Any]:
-        owner_id = _owner(owner_id)
+    def delete_account(
+        self,
+        owner_id: str,
+        *,
+        delete_cold: bool = True,
+        account_generation: str = "",
+    ) -> dict[str, Any]:
+        owner_id = _owner(owner_id, account_generation or None)
         if delete_cold:
-            self.begin_account_deletion(owner_id)
+            self.begin_account_deletion(
+                owner_id,
+                account_generation=(
+                    account_generation or _storage_generation(owner_id)
+                ),
+            )
         deleted = self._purge_account_hot_data(owner_id)
         if not delete_cold:
             return {
-                "owner_id": owner_id,
+                "owner_id": _public_owner(owner_id),
                 "deleted": deleted,
                 "cold_files_removed": 0,
                 "state": "complete",
             }
         cleanup = self._retry_account_deletion(owner_id)
-        return {"owner_id": owner_id, "deleted": deleted, **cleanup}
+        return {"owner_id": _public_owner(owner_id), "deleted": deleted, **cleanup}
 
     def _retry_account_deletion(self, owner_id: str) -> dict[str, Any]:
         """Delete registered cold files without losing paths that need retry."""
@@ -3678,6 +4381,7 @@ class IOSIntelligenceStore:
         self,
         *,
         owner_id: str = "",
+        account_generation: str = "",
         limit: int = 100,
     ) -> list[dict[str, Any]]:
         """Resume pending hot-row and cold-file deletion after restart."""
@@ -3686,7 +4390,7 @@ class IOSIntelligenceStore:
         values: list[Any] = []
         if str(owner_id or "").strip():
             clauses.append("owner_id=?")
-            values.append(_owner(owner_id))
+            values.append(_owner(owner_id, account_generation or None))
         values.append(max(1, min(int(limit), 1000)))
         with self._connect() as conn:
             rows = conn.execute(
@@ -3701,14 +4405,22 @@ class IOSIntelligenceStore:
             outcomes.append(self._retry_account_deletion(pending_owner))
         return outcomes
 
-    def account_deletion_status(self, owner_id: str) -> dict[str, Any] | None:
+    def account_deletion_status(
+        self,
+        owner_id: str,
+        account_generation: str = "",
+    ) -> dict[str, Any] | None:
         with self._connect() as conn:
             row = conn.execute(
                 "SELECT * FROM ios_account_deletion_tombstones "
                 "WHERE owner_id=? COLLATE NOCASE",
-                (_owner(owner_id),),
+                (_owner(owner_id, account_generation or None),),
             ).fetchone()
-        return dict(row) if row is not None else None
+        if row is None:
+            return None
+        result = dict(row)
+        result["owner_id"] = _public_owner(result["owner_id"])
+        return result
 
     def account_deletion_sagas(self, limit: int = 1000) -> list[dict[str, Any]]:
         with self._connect() as conn:
@@ -3717,7 +4429,10 @@ class IOSIntelligenceStore:
                 "ORDER BY requested_at LIMIT ?",
                 (max(1, min(int(limit), 10_000)),),
             ).fetchall()
-        return [dict(row) for row in rows]
+        return [
+            {**dict(row), "owner_id": _public_owner(row["owner_id"])}
+            for row in rows
+        ]
 
     delete_account_data = delete_account
 

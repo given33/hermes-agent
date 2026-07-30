@@ -181,6 +181,12 @@ def _get_approval_callback():
     return getattr(_callback_tls, "approval", None)
 
 
+def get_approval_callback():
+    """Return the current thread's approval callback for tool adapters."""
+
+    return _get_approval_callback()
+
+
 def set_sudo_password_callback(cb):
     """Register a callback for sudo password prompts (used by CLI).
 

@@ -18,7 +18,32 @@ class AccountOperationalCleanupPending(RuntimeError):
     """Account-owned runtime work is still draining durable cancellation."""
 
 
-def purge_account_owned_cloud_data(owner_id: str) -> dict[str, Any]:
+def begin_account_owned_cloud_deletion(
+    owner_id: str,
+    *,
+    account_generation: str,
+) -> dict[str, Any]:
+    """Fence collaboration writes before mobile sessions are revoked."""
+
+    normalized = str(owner_id or "").strip()
+    generation = str(account_generation or "").strip()
+    if not normalized or not generation:
+        raise ValueError("owner_id and account_generation are required")
+    from plugins.collaboration.dashboard.plugin_api import (  # noqa: PLC0415
+        begin_owner_account_deletion,
+    )
+
+    return begin_owner_account_deletion(
+        normalized,
+        account_generation=generation,
+    )
+
+
+def purge_account_owned_cloud_data(
+    owner_id: str,
+    *,
+    account_generation: str = "",
+) -> dict[str, Any]:
     """Purge collaboration content and model configuration for one owner.
 
     The iOS intelligence tombstone drives retries, so every operation here is
@@ -29,24 +54,60 @@ def purge_account_owned_cloud_data(owner_id: str) -> dict[str, Any]:
     normalized = str(owner_id or "").strip()
     if not normalized:
         raise ValueError("owner_id is required")
+    generation = str(account_generation or "").strip()
+    if not generation:
+        from hermes_cli.dashboard_auth.mobile_device_store import MobileDeviceStore
+
+        generation = MobileDeviceStore().account_generation(normalized, create=False)
+    if not generation:
+        raise RuntimeError("active account generation is unavailable for deletion")
 
     from plugins.collaboration.dashboard.plugin_api import (  # noqa: PLC0415
         delete_owner_account_data,
     )
 
     return {
-        "collaboration": delete_owner_account_data(normalized),
-        "models": purge_owner_model_configuration(normalized),
-        "operational": purge_owner_operational_state(normalized),
+        "collaboration": delete_owner_account_data(
+            normalized,
+            account_generation=generation,
+        ),
+        "models": purge_owner_model_configuration(
+            normalized,
+            account_generation=generation,
+        ),
+        "operational": purge_owner_operational_state(
+            normalized,
+            account_generation=generation,
+        ),
     }
 
 
-def purge_owner_operational_state(owner_id: str) -> dict[str, Any]:
+def _cleanup_generation_is_current(owner_id: str, account_generation: str) -> bool:
+    generation = str(account_generation or "").strip()
+    if not generation:
+        return True
+    from hermes_cli.dashboard_auth.mobile_device_store import MobileDeviceStore
+
+    active = MobileDeviceStore().account_generation(owner_id, create=False)
+    return not active or active == generation
+
+
+def purge_owner_operational_state(
+    owner_id: str,
+    *,
+    account_generation: str = "",
+) -> dict[str, Any]:
     """Remove account-scoped approvals, session branches, and workflows."""
 
     normalized = str(owner_id or "").strip()
     if not normalized:
         raise ValueError("owner_id is required")
+    generation = str(account_generation or "").strip()
+    if not _cleanup_generation_is_current(normalized, generation):
+        return {
+            "skipped_stale_generation": True,
+            "account_generation": generation,
+        }
 
     from hermes_cli.account_session_facade import AccountSessionFacade
     from hermes_cli.account_write_approvals import AccountWriteApprovalStore
@@ -71,11 +132,17 @@ def purge_owner_operational_state(owner_id: str) -> dict[str, Any]:
     for root, profile_name in profile_roots:
         approval_result = AccountWriteApprovalStore(
             root / "write-approvals.db"
-        ).delete_owner(normalized)
+        ).delete_owner(
+            normalized,
+            account_generation=generation,
+        )
         for key, value in approval_result.items():
             approvals[key] = approvals.get(key, 0) + int(value)
 
-        branch_result = AccountSessionFacade(root, profile_name).delete_owner(normalized)
+        branch_result = AccountSessionFacade(root, profile_name).delete_owner(
+            normalized,
+            account_generation=generation,
+        )
         for key, value in branch_result.items():
             session_branches[key] = session_branches.get(key, 0) + int(value)
 
@@ -94,7 +161,11 @@ def purge_owner_operational_state(owner_id: str) -> dict[str, Any]:
     }
 
 
-def purge_owner_model_configuration(owner_id: str) -> dict[str, int]:
+def purge_owner_model_configuration(
+    owner_id: str,
+    *,
+    account_generation: str = "",
+) -> dict[str, int | bool | str]:
     """Remove account-owned model assignments and inline credentials.
 
     Hermes Profiles are agent configurations under the same single owner, so
@@ -104,6 +175,16 @@ def purge_owner_model_configuration(owner_id: str) -> dict[str, int]:
 
     if not str(owner_id or "").strip():
         raise ValueError("owner_id is required")
+    normalized_owner = str(owner_id).strip()
+    generation = str(account_generation or "").strip()
+    if not _cleanup_generation_is_current(normalized_owner, generation):
+        return {
+            "profiles_changed": 0,
+            "sections_removed": 0,
+            "credentials_removed": 0,
+            "skipped_stale_generation": True,
+            "account_generation": generation,
+        }
 
     roots = {Path(get_hermes_home()).resolve()}
     roots.update(profile.path.resolve() for profile in list_profiles())

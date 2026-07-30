@@ -31,7 +31,7 @@ from __future__ import annotations
 import pytest
 
 
-pytest.importorskip("mcp.client.auth.oauth2", reason="MCP SDK 1.26.0+ required")
+pytest.importorskip("mcp.client.auth.oauth2", reason="MCP SDK v2 required")
 
 
 @pytest.mark.asyncio
@@ -43,7 +43,7 @@ async def test_hermes_provider_forwards_asend_values(tmp_path, monkeypatch):
     ``oauth2.py:505``. With the correct bridge, a 200 response finishes the
     flow cleanly (``StopAsyncIteration``).
     """
-    import httpx
+    import httpx2 as httpx
     from mcp.shared.auth import OAuthClientMetadata, OAuthToken
     from pydantic import AnyUrl
 
@@ -125,7 +125,7 @@ async def test_hermes_provider_forwards_401_triggers_refresh(tmp_path, monkeypat
     bridge, the 401 is routed into the SDK's ``response.status_code == 401``
     branch which begins discovery (yielding a metadata-discovery request).
     """
-    import httpx
+    import httpx2 as httpx
     from mcp.shared.auth import OAuthClientInformationFull, OAuthClientMetadata, OAuthToken
     from pydantic import AnyUrl
 

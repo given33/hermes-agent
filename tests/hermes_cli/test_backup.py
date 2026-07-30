@@ -16,6 +16,50 @@ import pytest
 # Helpers
 # ---------------------------------------------------------------------------
 
+class _RejectUnboundedRead:
+    """Proxy that fails when an archive member is read without a size cap."""
+
+    def __init__(self, source, read_sizes: list[int]):
+        self._source = source
+        self._read_sizes = read_sizes
+
+    def read(self, size: int = -1):
+        if size is None or size < 0:
+            raise AssertionError("archive member was read without a size limit")
+        self._read_sizes.append(size)
+        return self._source.read(size)
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, exc_type, exc_value, traceback):
+        return self._source.__exit__(exc_type, exc_value, traceback)
+
+
+def _guard_member_against_unbounded_reads(
+    monkeypatch,
+    member_name: str,
+) -> list[int]:
+    """Wrap reads for one ZIP member and return the requested read sizes."""
+    original_open = zipfile.ZipFile.open
+    read_sizes: list[int] = []
+
+    def guarded_open(self, name, mode="r", pwd=None, *, force_zip64=False):
+        source = original_open(
+            self,
+            name,
+            mode=mode,
+            pwd=pwd,
+            force_zip64=force_zip64,
+        )
+        opened_name = name.filename if isinstance(name, zipfile.ZipInfo) else name
+        if mode == "r" and opened_name == member_name:
+            return _RejectUnboundedRead(source, read_sizes)
+        return source
+
+    monkeypatch.setattr(zipfile.ZipFile, "open", guarded_open)
+    return read_sizes
+
 def _make_hermes_tree(root: Path) -> None:
     """Create a realistic ~/.hermes directory structure for testing."""
     (root / "config.yaml").write_text("model:\n  provider: openrouter\n")
@@ -587,6 +631,25 @@ class TestImport:
         assert (hermes_home / ".env").read_text() == "OPENROUTER_API_KEY=sk-test\n"
         assert (hermes_home / "skills" / "my-skill" / "SKILL.md").read_text() == "# My Skill\n"
         assert (hermes_home / "profiles" / "coder" / "config.yaml").exists()
+
+    def test_streams_large_root_member_with_bounded_reads(self, tmp_path, monkeypatch):
+        """Importing a large in-home member never reads the whole member at once."""
+        hermes_home = tmp_path / ".hermes"
+        hermes_home.mkdir()
+        monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+        monkeypatch.setattr(Path, "home", lambda: tmp_path)
+
+        payload = b"0123456789abcdef" * (80 * 1024)
+        zip_path = tmp_path / "backup.zip"
+        self._make_backup_zip(zip_path, {"state.db": payload})
+
+        read_sizes = _guard_member_against_unbounded_reads(monkeypatch, "state.db")
+
+        from hermes_cli.backup import run_import
+        run_import(Namespace(zipfile=str(zip_path), force=True))
+
+        assert read_sizes
+        assert (hermes_home / "state.db").read_bytes() == payload
 
     def test_strips_hermes_prefix(self, tmp_path, monkeypatch):
         """Import strips .hermes/ prefix if all entries share it."""
@@ -2705,6 +2768,30 @@ class TestMemoryProviderExternalPaths:
         # External state did NOT leak into HERMES_HOME.
         assert not (hermes_home / "_external").exists()
 
+    def test_import_streams_external_member_with_bounded_reads(self, tmp_path, monkeypatch):
+        """External provider state is restored without an unbounded ZIP read."""
+        dst_home = tmp_path / "dst"
+        dst_home.mkdir()
+        hermes_home = dst_home / ".hermes"
+        hermes_home.mkdir()
+
+        payload = b"provider-state" * (100 * 1024)
+        member_name = "_external/.honcho/state.bin"
+        zip_path = tmp_path / "backup.zip"
+        with zipfile.ZipFile(zip_path, "w") as zf:
+            zf.writestr("config.yaml", "model: {}\n")
+            zf.writestr(member_name, payload)
+
+        monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+        monkeypatch.setattr(Path, "home", lambda: dst_home)
+        read_sizes = _guard_member_against_unbounded_reads(monkeypatch, member_name)
+
+        from hermes_cli.backup import run_import
+        run_import(Namespace(zipfile=str(zip_path), force=True))
+
+        assert read_sizes
+        assert (dst_home / ".honcho" / "state.bin").read_bytes() == payload
+
     def test_import_blocks_external_path_traversal(self, tmp_path, monkeypatch):
         """A malicious _external/ member that escapes the home dir is blocked."""
         dst_home = tmp_path / "dst"
@@ -2750,6 +2837,9 @@ class TestMemoryProviderExternalPaths:
 
     def test_honcho_provider_declares_global_config_dir(self, tmp_path, monkeypatch):
         """The honcho provider's backup_paths() resolves to ~/.honcho."""
+        # Honcho deliberately honors explicit HOME on Windows because
+        # Path.home() prefers USERPROFILE there; POSIX uses Path.home().
+        monkeypatch.setenv("HOME", str(tmp_path))
         monkeypatch.setattr(Path, "home", lambda: tmp_path)
         from plugins.memory.honcho import HonchoMemoryProvider
 

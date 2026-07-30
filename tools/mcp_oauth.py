@@ -604,17 +604,24 @@ def _make_callback_handler() -> tuple[type, dict]:
     OAuth redirect arrives.  Each call returns a fresh pair so concurrent
     flows don't stomp on each other.
     """
-    result: dict[str, Any] = {"auth_code": None, "state": None, "error": None}
+    result: dict[str, Any] = {
+        "auth_code": None,
+        "state": None,
+        "iss": None,
+        "error": None,
+    }
 
     class _Handler(BaseHTTPRequestHandler):
         def do_GET(self) -> None:  # noqa: N802
             params = parse_qs(urlparse(self.path).query)
             code = params.get("code", [None])[0]
             state = params.get("state", [None])[0]
+            issuer = params.get("iss", [None])[0]
             error = params.get("error", [None])[0]
 
             result["auth_code"] = code
             result["state"] = state
+            result["iss"] = issuer
             result["error"] = error
 
             body = (
@@ -737,7 +744,7 @@ def _make_redirect_handler(port: int, redirect_uri: str | None = None):
     return _redirect_handler
 
 
-async def _wait_for_callback() -> tuple[str, str | None]:
+async def _wait_for_callback() -> Any:
     """Wait for the OAuth callback on the legacy module-level port.
 
     Kept for backwards compatibility with callers that never went through
@@ -777,12 +784,17 @@ def _make_callback_waiter(port: int):
             to complete the browser auth), or in non-interactive contexts.
     """
 
-    async def _wait() -> tuple[str, str | None]:
+    async def _wait() -> Any:
+        from mcp.client.auth import AuthorizationCodeResult
         from tools.mcp_dashboard_oauth import get_dashboard_oauth_flow
 
         dashboard_flow = get_dashboard_oauth_flow()
         if dashboard_flow is not None:
-            return await dashboard_flow.wait_for_callback()
+            callback = await dashboard_flow.wait_for_callback()
+            if isinstance(callback, AuthorizationCodeResult):
+                return callback
+            code, state = callback
+            return AuthorizationCodeResult(code=code, state=state, iss=None)
 
         # Reject before binding the callback listener in non-interactive
         # contexts. Reaching here means the SDK entered the authorization-code
@@ -881,7 +893,11 @@ def _make_callback_waiter(port: int):
                 "Ensure you completed the browser authorization flow."
             )
 
-        return result["auth_code"], result["state"]
+        return AuthorizationCodeResult(
+            code=result["auth_code"],
+            state=result["state"],
+            iss=result["iss"],
+        )
 
     return _wait
 
@@ -950,6 +966,7 @@ def _paste_callback_reader(result: dict) -> None:
 
     code = params.get("code", [None])[0]
     state = params.get("state", [None])[0]
+    issuer = params.get("iss", [None])[0]
     error = params.get("error", [None])[0]
 
     if not code and not error:
@@ -965,6 +982,7 @@ def _paste_callback_reader(result: dict) -> None:
 
     result["auth_code"] = code
     result["state"] = state
+    result["iss"] = issuer
     result["error"] = error
     if code:
         print("  Got authorization code from paste — completing flow.", file=sys.stderr)
@@ -1152,7 +1170,7 @@ def build_oauth_auth(
     if not _OAUTH_AVAILABLE:
         logger.warning(
             "MCP OAuth requested for '%s' but SDK auth types are not available. "
-            "Install with: pip install 'mcp>=1.26.0'",
+            "Install with: pip install 'mcp==2.0.0'",
             server_name,
         )
         return None
@@ -1186,5 +1204,4 @@ def build_oauth_auth(
         storage=storage,
         redirect_handler=redirect_handler,
         callback_handler=callback_handler,
-        timeout=float(cfg.get("timeout", 300)),
     )

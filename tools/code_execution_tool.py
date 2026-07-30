@@ -1402,7 +1402,10 @@ def execute_code(
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
             stdin=subprocess.DEVNULL,
-            start_new_session=True,
+            # A registry-isolated worker already owns a dedicated process
+            # group. Do not let this script escape it, or the outer hard
+            # deadline could terminate the handler while leaving the script.
+            start_new_session=not bool(os.environ.get("HERMES_TOOL_ISOLATION")),
             creationflags=subprocess.CREATE_NO_WINDOW if _IS_WINDOWS else 0,
         )
 

@@ -16,8 +16,10 @@ DBB3 = ROOT / "deploy" / "dbb3"
 PC = ROOT / "deploy" / "pc"
 PUBLIC = ROOT / "deploy" / "public"
 RECOVERY = ROOT / "deploy" / "recovery"
+AUTOMATION = ROOT / "deploy" / "automation"
 UPSTREAM_REPORT = ROOT / "scripts" / "upstream_change_report.py"
 UPSTREAM_WORKFLOW = ROOT / ".github" / "workflows" / "upstream-sync.yml"
+DEPLOY_WORKFLOW = ROOT / ".github" / "workflows" / "deploy-three-endpoints.yml"
 
 
 def _posix_path(path: Path) -> str:
@@ -116,6 +118,8 @@ def test_deployment_shell_scripts_have_valid_syntax():
         RECOVERY / "install-dbb3-managed-installation-receiver.sh",
         RECOVERY / "install-wsl-managed-installation.sh",
         RECOVERY / "configure-main-managed-installation-ssh.sh",
+        AUTOMATION / "install-fabric-auto-update.sh",
+        AUTOMATION / "update-fabric-node.sh",
     ):
         if os.name == "nt":
             wsl = shutil.which("wsl.exe")
@@ -138,6 +142,113 @@ def test_deployment_shell_scripts_have_valid_syntax():
             check=False,
         )
         assert result.returncode == 0, (path, result.stderr)
+
+
+def test_three_endpoint_updates_follow_only_a_committed_main_release():
+    updater = (AUTOMATION / "update-fabric-node.sh").read_text(encoding="utf-8")
+    bootstrap = (AUTOMATION / "install-fabric-auto-update.sh").read_text(
+        encoding="utf-8"
+    )
+    service = (AUTOMATION / "hermes-fabric-update.service").read_text(
+        encoding="utf-8"
+    )
+    timer = (AUTOMATION / "hermes-fabric-update.timer").read_text(encoding="utf-8")
+    workflow = DEPLOY_WORKFLOW.read_text(encoding="utf-8")
+    deployer = (PUBLIC / "deploy-collaboration-backend.sh").read_text(
+        encoding="utf-8"
+    )
+
+    assert "connector/deployment-health" in updater
+    assert 'payload.get("ok") is True' in updater
+    assert 're.fullmatch(r"[0-9a-f]{40}", commit)' in updater
+    assert "merge-base --is-ancestor" in updater
+    assert "refs/remotes/origin/main" in updater
+    assert '--config "${curl_config}"' in updater
+    assert 'Authorization: Bearer $(cat' not in updater
+    assert "^[A-Za-z0-9._~+/-]+={0,3}$" in updater
+    assert updater.index("install-dbb3-cloud-connector-user.sh") < updater.index(
+        'mv -f -- "${deployed_file}.new.$$"'
+    )
+    assert "systemctl enable --now hermes-fabric-update.timer" in bootstrap
+    assert "initial_state=pending" in bootstrap
+    assert (
+        "install -d -o root -g root -m 0700 /var/lib/hermes-agent-fabric-update"
+        in bootstrap
+    )
+    assert "Persistent=true" in timer
+    assert "ProtectSystem=strict" in service
+    assert "/var/lib/systemd/linger" in service
+    assert "/etc/systemd/system" in service
+    assert "workflow_run:" in workflow
+    assert "schedule:" in workflow
+    assert "environment: production" in workflow
+    assert "HERMES_REQUIRE_PINNED_SSH_HOST_KEY: '1'" in workflow
+    assert "HERMES_SSH_KNOWN_HOSTS" in workflow
+    assert "HERMES_SSH_KNOWN_HOSTS" in deployer
+    assert "StrictHostKeyChecking=yes" in deployer
+
+
+def test_public_release_contains_the_complete_application_service_layer():
+    deployer = (PUBLIC / "deploy-collaboration-backend.sh").read_text(
+        encoding="utf-8"
+    )
+    installer = (PUBLIC / "install-collaboration-backend.sh").read_text(
+        encoding="utf-8"
+    )
+    harness = (PUBLIC / "test-install-collaboration-backend.sh").read_text(
+        encoding="utf-8"
+    )
+
+    service_files = sorted((ROOT / "hermes_services").glob("*.py"))
+    assert service_files
+    for path in service_files:
+        relative = path.relative_to(ROOT).as_posix()
+        assert relative in deployer
+        assert relative in installer
+        assert relative in harness
+    for relative in (
+        "hermes_cli/account_identity.py",
+        "hermes_cli/account_lifecycle.py",
+        "hermes_cli/account_session_facade.py",
+        "hermes_cli/account_write_approvals.py",
+        "hermes_cli/mobile_console.py",
+    ):
+        assert relative in deployer
+        assert relative in installer
+        assert relative in harness
+
+    for relative in (
+        "agent/conversation_loop.py",
+        "agent/tool_executor.py",
+        "agent/transports/hermes_tools_mcp_server.py",
+        "gateway/platforms/api_server.py",
+        "hermes_cli/mcp_config.py",
+        "plugins/memory/config_schema.py",
+        "run_agent.py",
+        "tools/file_operations.py",
+        "tools/mcp_oauth_manager.py",
+        "tools/registry.py",
+        "tools/skills_guard.py",
+        "tools/terminal_tool.py",
+    ):
+        assert relative in deployer
+        assert relative in installer
+        assert relative in harness
+
+    assert 'required+=("${runtime_service_assets[@]}")' in installer
+    assert 'tar -C "${repo}" -cf - -- "${runtime_service_assets[@]}"' in deployer
+    assert 'runtime_compile_assets+=("${snapshot}/${relative}")' in installer
+    assert 'destination_parent="$(dirname "${target_root}/${relative}")"' in installer
+    assert 'backup_one "${target_root}/${relative}"' in installer
+    assert 'install_atomic "${snapshot}/${relative}"' in installer
+    assert 'restore_one "${backup}/${relative}"' in installer
+    assert "runtime-requirements.lock" in deployer
+    assert "runtime-requirements.lock" in installer
+    assert "runtime-requirements.lock" in harness
+    assert 'version("mcp") == "2.0.0"' in installer
+    assert 'version("starlette") == "1.0.1"' in installer
+    assert 'mv -f -- "${runtime_venv}" "${previous_venv}"' in installer
+    assert 'mv -f -- "${previous_venv}" "${runtime_venv}"' in installer
 
 
 def test_managed_installation_receivers_probe_their_real_bind_and_rollback_safely():
@@ -291,6 +402,7 @@ def test_public_deployer_uploads_the_complete_runtime_snapshot(tmp_path):
     capture = tmp_path / "deploy.log"
     fake_command = """#!/usr/bin/env bash
 printf '%s|%s\n' "$(basename "$0")" "$*" >>"$DEPLOY_CAPTURE"
+cat >/dev/null
 """
     _write_executable(fake_bin / "ssh", fake_command)
     _write_executable(fake_bin / "scp", fake_command)
@@ -632,7 +744,18 @@ class _FakeCloud:
     def fail_run(self, remote_id, payload):
         assert payload["claim_token"]
         self.failures.append((remote_id, dict(payload)))
-        return {"applied": True}
+        return {
+            "applied": True,
+            "run": {
+                "status": "failed",
+                "checkpoint_cursor": payload.get("checkpoint_cursor", 0),
+                "claim_token": payload["claim_token"],
+            },
+        }
+
+    def get_run(self, remote_id):
+        assert remote_id == self.run["remote_run_id"]
+        return dict(self.run)
 
     def pull_cancellations(self, limit=5, lease_seconds=90):
         return []
@@ -734,6 +857,420 @@ def test_connector_checkpoint_status_and_raw_artifact_are_idempotent(tmp_path):
     assert len(fake.statuses) == 1
     assert len(fake.uploads) == 1
     assert show_count["value"] == 2
+
+
+def test_account_remote_run_executes_in_private_overlay_profile(tmp_path, monkeypatch):
+    connector = _load_connector()
+    run = {
+        "remote_run_id": "run-account-overlay",
+        "idempotency_key": "idem-account-overlay",
+        "profile": "dbb3-worker",
+        "owner_id": "alice@example.test",
+        "account_generation": "generation-7",
+        "title": "Private task",
+        "objective": "Use my installed resources",
+    }
+    overlay = tmp_path / "profiles" / "acct-private-worker"
+    overlay.mkdir(parents=True)
+    resolved = []
+
+    from hermes_cli import managed_installations
+
+    def resolve(owner_id, account_generation, profile):
+        resolved.append((owner_id, account_generation, profile))
+        return overlay
+
+    monkeypatch.setattr(
+        managed_installations,
+        "managed_account_runtime_home",
+        resolve,
+    )
+    commands = []
+
+    def command_runner(command, timeout=30):
+        commands.append(command)
+        assert command[:4] == ["hermes", "-p", overlay.name, "kanban"]
+        if command[4] == "create":
+            assert command[command.index("--assignee") + 1] == overlay.name
+            return 0, json.dumps({"id": "task-private"})
+        if command[4] == "show":
+            return 0, json.dumps(
+                {
+                    "task": {
+                        "id": "task-private",
+                        "status": "done",
+                        "result": "complete",
+                    },
+                    "events": [],
+                    "runs": [],
+                }
+            )
+        raise AssertionError(command)
+
+    cloud = _FakeCloud(run)
+    instance = connector.DBB3CloudConnector(
+        cloud,
+        command_runner=command_runner,
+        state_file=tmp_path / "state" / "checkpoint.json",
+        artifact_roots=[tmp_path],
+    )
+
+    result = instance.sync_once()
+
+    assert result["created"] == 1
+    assert result["statuses"] == 1
+    assert resolved == [
+        ("alice@example.test", "generation-7", "dbb3-worker"),
+    ]
+    assert run["profile"] == "dbb3-worker"
+    assert cloud.acks[0][1]["profile"] == "dbb3-worker"
+    assert cloud.acks[0][1]["execution_profile"] == overlay.name
+    assert len(commands) == 2
+
+
+def test_deleted_account_remote_run_fails_without_local_execution(tmp_path, monkeypatch):
+    connector = _load_connector()
+    run = {
+        "remote_run_id": "run-deleted-account",
+        "idempotency_key": "idem-deleted-account",
+        "profile": "pc-worker",
+        "owner_id": "deleted@example.test",
+        "account_generation": "old-generation",
+        "title": "Stale task",
+        "objective": "Must not execute",
+    }
+    from hermes_cli import managed_installations
+
+    def deleted(*_args, **_kwargs):
+        raise PermissionError("account generation is deleted")
+
+    monkeypatch.setattr(
+        managed_installations,
+        "managed_account_runtime_home",
+        deleted,
+    )
+    commands = []
+    cloud = _FakeCloud(run)
+    instance = connector.DBB3CloudConnector(
+        cloud,
+        command_runner=lambda command, timeout=30: (
+            commands.append(command) or (0, "")
+        ),
+        state_file=tmp_path / "state" / "checkpoint.json",
+        artifact_roots=[tmp_path],
+    )
+
+    result = instance.sync_once()
+
+    assert result == {
+        "created": 0,
+        "statuses": 1,
+        "artifacts": 0,
+        "cancelled": 0,
+    }
+    assert commands == []
+    assert len(cloud.failures) == 1
+    assert cloud.failures[0][1]["claim_token"] == run["claim_token"]
+    assert "deleted" in cloud.failures[0][1]["error"].lower()
+
+
+def test_account_deletion_stops_an_already_accepted_remote_root(tmp_path, monkeypatch):
+    connector = _load_connector()
+    run = {
+        "remote_run_id": "run-deleted-after-ack",
+        "idempotency_key": "idem-deleted-after-ack",
+        "profile": "dbb3-worker",
+        "owner_id": "alice@example.test",
+        "account_generation": "generation-live",
+        "title": "Long task",
+        "objective": "Keep working",
+    }
+    overlay = tmp_path / "profiles" / "acct-live-worker"
+    overlay.mkdir(parents=True)
+    deleted = {"value": False}
+    from hermes_cli import managed_installations
+
+    def resolve(*_args, **_kwargs):
+        if deleted["value"]:
+            raise PermissionError("account generation is deleted")
+        return overlay
+
+    monkeypatch.setattr(
+        managed_installations,
+        "managed_account_runtime_home",
+        resolve,
+    )
+    commands = []
+
+    def command_runner(command, timeout=30):
+        commands.append(command)
+        if command[3:5] == ["kanban", "create"]:
+            return 0, json.dumps({"id": "task-long"})
+        if command[3:5] == ["kanban", "show"]:
+            return 0, json.dumps(
+                {
+                    "task": {"id": "task-long", "status": "running"},
+                    "events": [],
+                    "runs": [],
+                }
+            )
+        if command[3:5] == ["kanban", "block"]:
+            return 0, "blocked"
+        raise AssertionError(command)
+
+    cloud = _FakeCloud(run)
+    state_file = tmp_path / "state" / "checkpoint.json"
+    instance = connector.DBB3CloudConnector(
+        cloud,
+        command_runner=command_runner,
+        state_file=state_file,
+        artifact_roots=[tmp_path],
+    )
+    first = instance.sync_once()
+    assert first["created"] == 1
+
+    deleted["value"] = True
+    second = instance.sync_once()
+
+    assert second["created"] == 0
+    assert commands[-1] == [
+        "hermes",
+        "-p",
+        overlay.name,
+        "kanban",
+        "block",
+        "task-long",
+        "Account generation is no longer active",
+    ]
+    checkpoint = json.loads(state_file.read_text(encoding="utf-8"))
+    local = checkpoint["runs"][run["remote_run_id"]]
+    assert local["status"] == "failed"
+    assert local["terminal_acked"] is True
+    assert "pending_terminal_failure" not in local
+    assert len(cloud.failures) == 1
+    assert cloud.failures[0][1]["claim_token"] == run["claim_token"]
+
+
+def test_account_deletion_terminal_report_survives_network_failure_and_restart(
+    tmp_path,
+    monkeypatch,
+):
+    connector = _load_connector()
+    run = {
+        "remote_run_id": "run-deleted-terminal-retry",
+        "idempotency_key": "idem-deleted-terminal-retry",
+        "profile": "dbb3-worker",
+        "owner_id": "alice@example.test",
+        "account_generation": "generation-live",
+        "title": "Long task",
+        "objective": "Keep working",
+    }
+    overlay = tmp_path / "profiles" / "acct-live-worker"
+    overlay.mkdir(parents=True)
+    deleted = {"value": False}
+    from hermes_cli import managed_installations
+
+    def resolve(*_args, **_kwargs):
+        if deleted["value"]:
+            raise PermissionError("account generation is deleted")
+        return overlay
+
+    monkeypatch.setattr(managed_installations, "managed_account_runtime_home", resolve)
+
+    commands = []
+
+    def command_runner(command, timeout=30):
+        commands.append(command)
+        if command[3:5] == ["kanban", "create"]:
+            return 0, json.dumps({"id": "task-terminal-retry"})
+        if command[3:5] == ["kanban", "show"]:
+            return 0, json.dumps(
+                {
+                    "task": {"id": "task-terminal-retry", "status": "running"},
+                    "events": [],
+                    "runs": [],
+                }
+            )
+        if command[3:5] == ["kanban", "block"]:
+            return 0, "blocked"
+        raise AssertionError(command)
+
+    class FlakyCloud(_FakeCloud):
+        def __init__(self, payload):
+            super().__init__(payload)
+            self.emit_run = True
+            self.failure_attempts = 0
+
+        def pull_runs(self, limit=5, lease_seconds=90):
+            self.pull_count += 1
+            return [self.run] if self.emit_run else []
+
+        def fail_run(self, remote_id, payload):
+            self.failure_attempts += 1
+            if self.failure_attempts == 1:
+                raise OSError("cloud unavailable")
+            return super().fail_run(remote_id, payload)
+
+    cloud = FlakyCloud(run)
+    state_file = tmp_path / "state" / "checkpoint.json"
+    first = connector.DBB3CloudConnector(
+        cloud,
+        command_runner=command_runner,
+        state_file=state_file,
+        artifact_roots=[tmp_path],
+    )
+    assert first.sync_once()["created"] == 1
+
+    deleted["value"] = True
+    assert first.sync_once()["statuses"] == 0
+    pending_state = json.loads(state_file.read_text(encoding="utf-8"))["runs"][
+        run["remote_run_id"]
+    ]
+    assert pending_state["status"] == "terminal_pending"
+    assert pending_state["pending_terminal_failure"]["claim_token"] == run["claim_token"]
+    assert pending_state["terminal_local_stopped"] is True
+    assert pending_state.get("terminal_acked") is not True
+
+    cloud.emit_run = False
+    restarted = connector.DBB3CloudConnector(
+        cloud,
+        command_runner=command_runner,
+        state_file=state_file,
+        artifact_roots=[tmp_path],
+    )
+    assert restarted.sync_once()["statuses"] == 1
+
+    final_state = json.loads(state_file.read_text(encoding="utf-8"))["runs"][
+        run["remote_run_id"]
+    ]
+    assert final_state["status"] == "failed"
+    assert final_state["terminal_acked"] is True
+    assert "pending_terminal_failure" not in final_state
+    assert cloud.failure_attempts == 2
+    assert len(cloud.failures) == 1
+    assert sum(command[3:5] == ["kanban", "block"] for command in commands) == 1
+
+
+def test_terminal_conflict_with_rotated_claim_waits_for_new_claim(tmp_path):
+    connector = _load_connector()
+    run = {
+        "remote_run_id": "run-claim-rotated",
+        "idempotency_key": "idem-claim-rotated",
+        "profile": "dbb3-worker",
+        "owner_id": "server-admin",
+        "account_generation": "",
+        "claim_token": "claim-old",
+    }
+
+    class RotatingCloud(_FakeCloud):
+        def __init__(self, payload):
+            super().__init__(payload)
+            self.conflict = True
+
+        def fail_run(self, remote_id, payload):
+            if self.conflict:
+                raise connector.ConnectorContractError(409, "claim lost")
+            return super().fail_run(remote_id, payload)
+
+        def get_run(self, remote_id):
+            assert remote_id == self.run["remote_run_id"]
+            return {
+                **self.run,
+                "claim_token": "claim-new",
+                "status": "running",
+                "checkpoint_cursor": 4,
+            }
+
+    cloud = RotatingCloud(run)
+    state_file = tmp_path / "state" / "checkpoint.json"
+    instance = connector.DBB3CloudConnector(
+        cloud,
+        state_file=state_file,
+        artifact_roots=[tmp_path],
+    )
+    state = {
+        "version": 1,
+        "runs": {
+            run["remote_run_id"]: {
+                **run,
+                "root_task_id": "root-claim-rotated",
+                "status": "terminal_pending",
+                "pending_terminal_failure": {
+                    "claim_token": "claim-old",
+                    "checkpoint_cursor": 5,
+                    "error": "account deleted",
+                    "summary": "stopped",
+                },
+            }
+        },
+        "cancellations": {},
+    }
+    local = state["runs"][run["remote_run_id"]]
+
+    assert instance._flush_terminal_failure(run["remote_run_id"], local, state) is False
+    assert local["status"] == "awaiting_claim"
+    assert local["claim_stale"] is True
+    assert local.get("terminal_acked") is not True
+    assert "pending_terminal_failure" in local
+
+    instance._accept_run({**run, "claim_token": "claim-new"}, state)
+    assert local["claim_token"] == "claim-new"
+    assert local["pending_terminal_failure"]["claim_token"] == "claim-new"
+    cloud.conflict = False
+    assert instance._flush_terminal_failure(run["remote_run_id"], local, state) is True
+    assert local["status"] == "failed"
+    assert local["terminal_acked"] is True
+    assert "pending_terminal_failure" not in local
+
+
+def test_terminal_conflict_seals_only_authoritative_terminal_snapshot(tmp_path):
+    connector = _load_connector()
+    run = {
+        "remote_run_id": "run-already-completed",
+        "idempotency_key": "idem-already-completed",
+        "profile": "dbb3-worker",
+        "claim_token": "claim-old",
+    }
+
+    class CompletedCloud(_FakeCloud):
+        def fail_run(self, remote_id, payload):
+            raise connector.ConnectorContractError(409, "already terminal")
+
+        def get_run(self, remote_id):
+            return {
+                **self.run,
+                "status": "completed",
+                "checkpoint_cursor": 9,
+            }
+
+    cloud = CompletedCloud(run)
+    instance = connector.DBB3CloudConnector(
+        cloud,
+        state_file=tmp_path / "state" / "checkpoint.json",
+        artifact_roots=[tmp_path],
+    )
+    state = {
+        "version": 1,
+        "runs": {
+            run["remote_run_id"]: {
+                **run,
+                "status": "terminal_pending",
+                "pending_terminal_failure": {
+                    "claim_token": "claim-old",
+                    "checkpoint_cursor": 5,
+                    "error": "account deleted",
+                    "summary": "stopped",
+                },
+            }
+        },
+        "cancellations": {},
+    }
+    local = state["runs"][run["remote_run_id"]]
+
+    assert instance._flush_terminal_failure(run["remote_run_id"], local, state) is True
+    assert local["status"] == "completed"
+    assert local["checkpoint_cursor"] == 9
+    assert local["terminal_acked"] is True
 
 
 def test_connector_rejects_artifacts_outside_allowlisted_roots(tmp_path):

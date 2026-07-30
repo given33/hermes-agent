@@ -128,7 +128,10 @@ DEFAULT_HOST = "127.0.0.1"
 DEFAULT_PORT = 8642
 MAX_STORED_RESPONSES = 100
 MAX_REQUEST_BYTES = DEFAULT_MAX_REQUEST_BYTES
-_DEFAULT_API_APPLICATION = HermesApplicationKernel.for_http(surface="api")
+_DEFAULT_API_APPLICATION = HermesApplicationKernel.for_http(
+    surface="api",
+    compatibility_mode=os.environ.get("HERMES_HTTP_CONTRACT_MODE", "dual"),
+)
 _DEFAULT_API_HTTP_BOUNDARY = _DEFAULT_API_APPLICATION.require_http_boundary()
 CHAT_COMPLETIONS_SSE_KEEPALIVE_SECONDS = 30.0
 MAX_NORMALIZED_TEXT_LENGTH = 65_536  # 64 KB cap for normalized content parts
@@ -951,6 +954,7 @@ class APIServerAdapter(BasePlatformAdapter):
             allow_unconfigured_bearer=True,
             allowed_origins=self._cors_origins,
             max_request_bytes=MAX_REQUEST_BYTES,
+            compatibility_mode=os.environ.get("HERMES_HTTP_CONTRACT_MODE", "dual"),
         )
         self._http_boundary = self._application.require_http_boundary()
         self._model_name: str = self._resolve_model_name(

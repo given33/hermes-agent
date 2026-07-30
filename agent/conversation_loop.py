@@ -907,6 +907,9 @@ def run_conversation(
             # It is bookkeeping, never a provider field — pop it from EVERY
             # outgoing copy.
             _api_content = api_msg.pop("api_content", None)
+            # Hook traces are durable audit metadata, not provider message
+            # fields. Keep them on the canonical/session copy only.
+            api_msg.pop("hook_trace", None)
 
             # Inject ephemeral context into the current turn's user message.
             # Sources: memory manager prefetch + plugin pre_llm_call hooks
@@ -1356,6 +1359,29 @@ def run_conversation(
                 except Exception:
                     _original_api_kwargs = dict(api_kwargs)
                     _llm_middleware_trace = []
+
+                from hermes_services.internal_hooks import run_internal_hooks
+
+                _request_hook_result = run_internal_hooks(
+                    "before_model_request",
+                    api_kwargs,
+                    task_id=effective_task_id or "",
+                    turn_id=turn_id,
+                    api_request_id=api_request_id,
+                    session_id=agent.session_id or "",
+                    model=agent.model,
+                    provider=agent.provider,
+                    api_call_count=api_call_count,
+                )
+                _hooked_api_kwargs = _request_hook_result.payload
+                _internal_request_trace = _request_hook_result.trace
+                if not isinstance(_hooked_api_kwargs, dict):
+                    raise TypeError("before_model_request hooks must return a dict or None")
+                api_kwargs = _hooked_api_kwargs
+                _llm_middleware_trace = [
+                    *_llm_middleware_trace,
+                    *_internal_request_trace,
+                ]
 
                 try:
                     from hermes_cli.plugins import (
@@ -4500,6 +4526,41 @@ def run_conversation(
                     assistant_message.content = "\n".join(parts)
                 else:
                     assistant_message.content = str(raw)
+
+            from hermes_services.internal_hooks import run_internal_hooks
+
+            _response_hook_result = run_internal_hooks(
+                "after_provider_response",
+                {
+                    "content": assistant_message.content or "",
+                    "finish_reason": finish_reason or "",
+                    "tool_call_count": len(
+                        getattr(assistant_message, "tool_calls", None) or []
+                    ),
+                    "response_model": getattr(response, "model", None),
+                },
+                task_id=effective_task_id or "",
+                turn_id=turn_id,
+                api_request_id=api_request_id,
+                session_id=agent.session_id or "",
+                model=agent.model,
+                provider=agent.provider,
+                api_call_count=api_call_count,
+            )
+            _provider_payload = _response_hook_result.payload
+            _internal_response_trace = _response_hook_result.trace
+            if not isinstance(_provider_payload, dict):
+                raise TypeError("after_provider_response hooks must return a dict or None")
+            if isinstance(_provider_payload.get("content"), str):
+                assistant_message.content = _provider_payload["content"]
+            if isinstance(_provider_payload.get("finish_reason"), str):
+                finish_reason = _provider_payload["finish_reason"] or finish_reason
+            if _internal_response_trace:
+                setattr(
+                    assistant_message,
+                    "hermes_hook_trace",
+                    list(_internal_response_trace),
+                )
 
             try:
                 from hermes_cli.plugins import (

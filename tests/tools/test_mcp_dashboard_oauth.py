@@ -181,7 +181,10 @@ def test_mcp_oauth_helpers_use_dashboard_flow_without_loopback_port():
             )
         )
         flow.deliver_callback(code="code-4", state="state-4", error=None)
-        assert asyncio.run(_make_callback_waiter(0)()) == ("code-4", "state-4")
+        callback = asyncio.run(_make_callback_waiter(0)())
+        assert callback.code == "code-4"
+        assert callback.state == "state-4"
+        assert callback.iss is None
 
     assert flow.authorization_url == "https://idp.example/authorize?state=state-4"
 

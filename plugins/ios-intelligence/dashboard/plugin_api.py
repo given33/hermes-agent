@@ -11,7 +11,11 @@ from typing import Any, Literal, Optional
 from fastapi import APIRouter, HTTPException, Query, Request
 from pydantic import BaseModel, Field
 
-from hermes_cli.account_cleanup import purge_account_owned_cloud_data
+from hermes_cli.account_cleanup import (
+    begin_account_owned_cloud_deletion,
+    purge_account_owned_cloud_data,
+)
+from hermes_cli.account_lifecycle import account_lifecycle_commit_guard
 from hermes_cli.cloud_file_library import owner_id_from_request
 from hermes_runtime.config import get_hermes_home
 from hermes_cli.dashboard_auth.mobile_device_store import MobileDeviceStore
@@ -149,8 +153,10 @@ except Exception:
 
 
 class ContextEvent(BaseModel):
+    account_generation: str = Field(min_length=1, max_length=256)
     id: str = Field(min_length=1, max_length=256)
     kind: str = Field(min_length=1, max_length=64)
+    lifecycle_epoch: int = Field(ge=1)
     timestamp: int = Field(ge=0)
     payload: dict[str, Any] = Field(default_factory=dict)
 
@@ -206,13 +212,17 @@ def _bound_relay_identity(
     requested_device_id: str,
     *,
     relay_policy: Any | None = None,
-) -> tuple[str, str]:
+) -> tuple[str, str, str]:
     """Bind a device-directed relay operation to its mobile bearer session."""
 
     owner_id = owner_id_from_request(request)
     policy = relay_policy or load_ios_intelligence_config().relay
     if not policy.require_device_token:
-        return owner_id, requested_device_id
+        return (
+            owner_id,
+            requested_device_id,
+            MobileDeviceStore().account_generation(owner_id, create=False),
+        )
 
     token = extract_bearer_token(request)
     session = MobileDeviceStore().verify_access(token, touch=False) if token else None
@@ -222,7 +232,7 @@ def _bound_relay_identity(
         raise HTTPException(status_code=403, detail="Mobile token account does not match this request")
     if str(session.device_id) != requested_device_id:
         raise HTTPException(status_code=403, detail="Relay device does not match the mobile token")
-    return owner_id, str(session.device_id)
+    return owner_id, str(session.device_id), str(session.account_generation)
 
 
 @router.get("/health")
@@ -242,15 +252,35 @@ def health() -> dict[str, Any]:
         "migrated": True,
         "compatible": True,
     }
+    scheduler_health = (
+        _SCHEDULER.health()
+        if _SCHEDULER is not None and callable(getattr(_SCHEDULER, "health", None))
+        else {
+            "ok": bool(_SCHEDULER and _SCHEDULER.running),
+            "running": bool(_SCHEDULER and _SCHEDULER.running),
+            "thread_alive": bool(_SCHEDULER and _SCHEDULER.running),
+            "cleanup_only": bool(getattr(_SCHEDULER, "cleanup_only", False)),
+            "cycle_count": 0,
+            "last_cycle_started_at": 0,
+            "last_cycle_completed_at": 0,
+            "last_error": "",
+        }
+    )
     return {
-        "ok": bool(runtime_health["ok"]) and bool(schema.get("compatible", True)),
+        "ok": (
+            bool(runtime_health["ok"])
+            and bool(schema.get("compatible", True))
+            and bool(scheduler_health.get("ok"))
+        ),
         # Keep schema_version as the code contract; also expose live DB PRAGMA.
         "schema_version": int(schema.get("code_schema_version") or schema.get("schema_version") or 1),
         "code_schema_version": int(schema.get("code_schema_version") or 1),
         "db_user_version": int(schema.get("db_user_version") or 0),
         "schema_migrated": bool(schema.get("migrated")),
         "schema_compatible": bool(schema.get("compatible")),
-        "scheduler_running": bool(_SCHEDULER and _SCHEDULER.running),
+        "scheduler_running": bool(scheduler_health.get("running")),
+        "cleanup_worker_running": bool(scheduler_health.get("ok")),
+        "scheduler": scheduler_health,
         "mcp_supervisor_running": bool(runtime_health["running"]),
         "mcp_supervisor_starting": bool(runtime_health.get("starting")),
         "mcp_runtime": runtime_health,
@@ -260,15 +290,22 @@ def health() -> dict[str, Any]:
 @router.post("/events/batch")
 def ingest_event_batch(request: Request, body: ContextEventBatch) -> dict[str, Any]:
     relay_policy = load_ios_intelligence_config().relay
-    owner_id, device_id = _bound_relay_identity(
-        request,
-        body.device_id,
-        relay_policy=relay_policy,
-    )
     if len(body.events) > relay_policy.maximum_event_batch:
         raise HTTPException(
             status_code=422,
             detail=f"event batch exceeds configured limit ({relay_policy.maximum_event_batch})",
+        )
+    owner_id, device_id, account_generation = _bound_relay_identity(
+        request,
+        body.device_id,
+        relay_policy=relay_policy,
+    )
+    if not account_generation or any(
+        event.account_generation != account_generation for event in body.events
+    ):
+        raise HTTPException(
+            status_code=409,
+            detail="event batch account generation is stale",
         )
     events = [event.model_dump() for event in body.events]
     try:
@@ -314,7 +351,9 @@ def active_forecast(
 
 @router.post("/capabilities")
 def record_capabilities(request: Request, body: CapabilityBody) -> dict[str, Any]:
-    owner_id, device_id = _bound_relay_identity(request, body.device_id)
+    owner_id, device_id, _account_generation = _bound_relay_identity(
+        request, body.device_id
+    )
     event = {
         "id": f"capabilities:{device_id}:{body.observed_at}",
         "kind": "device",
@@ -332,7 +371,7 @@ def record_capabilities(request: Request, body: CapabilityBody) -> dict[str, Any
 @router.post("/commands/pull")
 def pull_commands(request: Request, body: DeviceCommandPull) -> dict[str, Any]:
     relay_policy = load_ios_intelligence_config().relay
-    owner_id, device_id = _bound_relay_identity(
+    owner_id, device_id, _account_generation = _bound_relay_identity(
         request,
         body.device_id,
         relay_policy=relay_policy,
@@ -353,7 +392,9 @@ def acknowledge_command(
     request: Request,
     body: DeviceCommandAck,
 ) -> dict[str, Any]:
-    owner_id, device_id = _bound_relay_identity(request, body.device_id)
+    owner_id, device_id, _account_generation = _bound_relay_identity(
+        request, body.device_id
+    )
     applied = intelligence_store().ack_device_command(
         owner_id,
         device_id,
@@ -445,20 +486,41 @@ def delete_account(request: Request, body: AccountDeleteBody) -> dict[str, Any]:
     _scope_origin, separator, scope_owner = owner_scope.rpartition("|")
     if not separator or scope_owner.strip().casefold() != owner_id.casefold():
         raise HTTPException(status_code=400, detail="owner_scope does not match account")
-    store = intelligence_store()
-    store.begin_account_deletion(owner_id, owner_scope)
     mobile_store = MobileDeviceStore()
-    try:
-        mobile_deletion = mobile_store.begin_account_deletion(owner_id, owner_scope)
-    except Exception as exc:
-        logger.exception("mobile account deletion intent deferred")
-        mobile_deletion = {
-            "state": "pending",
-            "devices": 0,
-            "sessions": 0,
-            "apns": 0,
-            "error": type(exc).__name__,
-        }
+    account_generation = mobile_store.account_generation(owner_id, create=False)
+    if not account_generation:
+        raise HTTPException(status_code=409, detail="active account generation is unavailable")
+    store = intelligence_store()
+    with account_lifecycle_commit_guard():
+        store.begin_account_deletion(owner_id, owner_scope, account_generation)
+        try:
+            begin_account_owned_cloud_deletion(
+                owner_id,
+                account_generation=account_generation,
+            )
+        except Exception as exc:
+            # The intelligence intent remains the authoritative fail-closed
+            # fence. Authentication remains usable so the caller can retry.
+            logger.exception("collaboration account deletion intent could not be persisted")
+            raise HTTPException(
+                status_code=503,
+                detail="account deletion intent could not be persisted",
+            ) from exc
+        try:
+            mobile_deletion = mobile_store.begin_account_deletion(
+                owner_id,
+                owner_scope,
+                account_generation,
+            )
+        except Exception as exc:
+            logger.exception("mobile account deletion intent deferred")
+            mobile_deletion = {
+                "state": "pending",
+                "devices": 0,
+                "sessions": 0,
+                "apns": 0,
+                "error": type(exc).__name__,
+            }
     try:
         cleanup_outcomes = process_account_deletion_outbox(
             device_store=mobile_store,
@@ -478,7 +540,11 @@ def delete_account(request: Request, body: AccountDeleteBody) -> dict[str, Any]:
         "error": "",
     }
     try:
-        result = store.delete_account(owner_id, delete_cold=True)
+        result = store.delete_account(
+            owner_id,
+            delete_cold=True,
+            account_generation=account_generation,
+        )
     except Exception as exc:
         logger.exception("iOS account data cleanup deferred")
         result = {
@@ -491,7 +557,10 @@ def delete_account(request: Request, body: AccountDeleteBody) -> dict[str, Any]:
     try:
         cloud_cleanup = {
             "state": "complete",
-            **purge_account_owned_cloud_data(owner_id),
+            **purge_account_owned_cloud_data(
+                owner_id,
+                account_generation=account_generation,
+            ),
         }
     except Exception as exc:
         logger.exception("account-owned cloud data cleanup deferred")

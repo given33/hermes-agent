@@ -31,12 +31,13 @@ from hermes_constants import get_hermes_home
 ACCESS_TTL_SECONDS = 15 * 60
 REFRESH_TTL_SECONDS = 30 * 24 * 60 * 60
 ACCOUNT_DELETION_LEASE_SECONDS = 300
-SCHEMA_VERSION = 4
+SCHEMA_VERSION = 7
 
 _SCHEMA_SQL = """
 CREATE TABLE IF NOT EXISTS mobile_devices (
     id              TEXT PRIMARY KEY,
     user_id         TEXT NOT NULL,
+    account_generation TEXT NOT NULL DEFAULT 'legacy',
     name            TEXT NOT NULL,
     model           TEXT NOT NULL DEFAULT '',
     os_version      TEXT NOT NULL DEFAULT '',
@@ -52,6 +53,7 @@ CREATE TABLE IF NOT EXISTS mobile_sessions (
     id                  TEXT PRIMARY KEY,
     device_id           TEXT NOT NULL REFERENCES mobile_devices(id) ON DELETE CASCADE,
     user_id             TEXT NOT NULL,
+    account_generation  TEXT NOT NULL DEFAULT '',
     access_token_hash   TEXT NOT NULL UNIQUE,
     refresh_token_hash  TEXT NOT NULL UNIQUE,
     access_expires_at   INTEGER NOT NULL,
@@ -111,7 +113,8 @@ CREATE INDEX IF NOT EXISTS idx_mobile_apns_token_hash
 
 CREATE TABLE IF NOT EXISTS mobile_account_deletion_outbox (
     id                      TEXT PRIMARY KEY,
-    user_id                 TEXT NOT NULL UNIQUE,
+    user_id                 TEXT NOT NULL,
+    account_generation      TEXT NOT NULL,
     owner_scope             TEXT NOT NULL,
     state                   TEXT NOT NULL DEFAULT 'pending',
     device_deliveries_json  TEXT NOT NULL DEFAULT '{}',
@@ -122,11 +125,18 @@ CREATE TABLE IF NOT EXISTS mobile_account_deletion_outbox (
     requested_at            INTEGER NOT NULL,
     updated_at              INTEGER NOT NULL,
     completed_at            INTEGER,
-    last_error              TEXT NOT NULL DEFAULT ''
+    last_error              TEXT NOT NULL DEFAULT '',
+    UNIQUE(user_id, account_generation)
 );
 
 CREATE INDEX IF NOT EXISTS idx_mobile_account_deletion_due
     ON mobile_account_deletion_outbox(state, available_at, leased_until);
+
+CREATE TABLE IF NOT EXISTS mobile_account_generations (
+    user_id         TEXT PRIMARY KEY COLLATE NOCASE,
+    generation      TEXT NOT NULL UNIQUE,
+    created_at      INTEGER NOT NULL
+);
 """
 
 
@@ -168,6 +178,7 @@ class MobileSessionRecord:
     session_id: str
     device_id: str
     user_id: str
+    account_generation: str
     access_expires_at: int
     refresh_expires_at: int
 
@@ -209,6 +220,20 @@ class MobileDeviceStore:
                     "mobile-auth.db was created by a newer Hermes version "
                     f"(schema {current_version} > {SCHEMA_VERSION})"
                 )
+            session_columns = {
+                str(row[1])
+                for row in conn.execute("PRAGMA table_info(mobile_sessions)").fetchall()
+            }
+            if session_columns and "account_generation" not in session_columns:
+                # Pre-v6 credentials did not capture their issuance boundary.
+                # Leave them unbound so they fail closed instead of guessing
+                # that a same-name account is the original account.
+                conn.execute(
+                    "ALTER TABLE mobile_sessions ADD COLUMN account_generation "
+                    "TEXT NOT NULL DEFAULT ''"
+                )
+            if current_version < 7:
+                self._migrate_generation_boundaries_v7(conn)
             conn.executescript(_SCHEMA_SQL)
             if current_version < SCHEMA_VERSION:
                 conn.execute(f"PRAGMA user_version={SCHEMA_VERSION}")
@@ -218,6 +243,79 @@ class MobileDeviceStore:
         except Exception:
             conn.close()
             raise
+
+    @staticmethod
+    def _migrate_generation_boundaries_v7(conn: sqlite3.Connection) -> None:
+        device_columns = {
+            str(row[1])
+            for row in conn.execute("PRAGMA table_info(mobile_devices)").fetchall()
+        }
+        if device_columns and "account_generation" not in device_columns:
+            conn.execute(
+                "ALTER TABLE mobile_devices ADD COLUMN account_generation "
+                "TEXT NOT NULL DEFAULT 'legacy'"
+            )
+            conn.execute(
+                "UPDATE mobile_devices SET account_generation=COALESCE(("
+                "SELECT NULLIF(s.account_generation,'') FROM mobile_sessions AS s "
+                "WHERE s.device_id=mobile_devices.id ORDER BY s.created_at DESC LIMIT 1"
+                "),'legacy')"
+            )
+
+        deletion_columns = {
+            str(row[1])
+            for row in conn.execute(
+                "PRAGMA table_info(mobile_account_deletion_outbox)"
+            ).fetchall()
+        }
+        if deletion_columns and "account_generation" not in deletion_columns:
+            conn.execute("DROP INDEX IF EXISTS idx_mobile_account_deletion_due")
+            conn.execute(
+                "ALTER TABLE mobile_account_deletion_outbox "
+                "RENAME TO mobile_account_deletion_outbox_v6"
+            )
+            conn.execute(
+                """
+                CREATE TABLE mobile_account_deletion_outbox (
+                    id TEXT PRIMARY KEY,
+                    user_id TEXT NOT NULL,
+                    account_generation TEXT NOT NULL,
+                    owner_scope TEXT NOT NULL,
+                    state TEXT NOT NULL DEFAULT 'pending',
+                    device_deliveries_json TEXT NOT NULL DEFAULT '{}',
+                    attempts INTEGER NOT NULL DEFAULT 0,
+                    available_at INTEGER NOT NULL,
+                    lease_token TEXT NOT NULL DEFAULT '',
+                    leased_until INTEGER NOT NULL DEFAULT 0,
+                    requested_at INTEGER NOT NULL,
+                    updated_at INTEGER NOT NULL,
+                    completed_at INTEGER,
+                    last_error TEXT NOT NULL DEFAULT '',
+                    UNIQUE(user_id, account_generation)
+                )
+                """
+            )
+            conn.execute(
+                """
+                INSERT INTO mobile_account_deletion_outbox (
+                    id, user_id, account_generation, owner_scope, state,
+                    device_deliveries_json, attempts, available_at, lease_token,
+                    leased_until, requested_at, updated_at, completed_at, last_error
+                )
+                SELECT old.id, old.user_id,
+                       COALESCE((
+                           SELECT NULLIF(g.generation, '')
+                           FROM mobile_account_generations AS g
+                           WHERE g.user_id=old.user_id COLLATE NOCASE
+                       ), 'legacy'),
+                       old.owner_scope, old.state, old.device_deliveries_json,
+                       old.attempts, old.available_at, old.lease_token,
+                       old.leased_until, old.requested_at, old.updated_at,
+                       old.completed_at, old.last_error
+                FROM mobile_account_deletion_outbox_v6 AS old
+                """
+            )
+            conn.execute("DROP TABLE mobile_account_deletion_outbox_v6")
 
     @contextlib.contextmanager
     def connection(self):
@@ -248,23 +346,32 @@ class MobileDeviceStore:
         access_token = _new_access_token()
         refresh_token = _new_refresh_token()
         session_id = "ms_" + uuid.uuid4().hex
-        record = MobileSessionRecord(
-            session_id=session_id,
-            device_id=normalized.id,
-            user_id=normalized_user_id,
-            access_expires_at=now + ACCESS_TTL_SECONDS,
-            refresh_expires_at=now + REFRESH_TTL_SECONDS,
-        )
+        access_expires_at = now + ACCESS_TTL_SECONDS
+        refresh_expires_at = now + REFRESH_TTL_SECONDS
+        account_generation = ""
         with self.connection() as conn, write_txn(conn):
-            deletion = conn.execute(
-                "SELECT state FROM mobile_account_deletion_outbox "
+            conn.execute(
+                "INSERT OR IGNORE INTO mobile_account_generations(user_id,generation,created_at) "
+                "VALUES (?,?,?)",
+                (normalized_user_id, "acctgen_" + uuid.uuid4().hex, now),
+            )
+            generation_row = conn.execute(
+                "SELECT generation FROM mobile_account_generations "
                 "WHERE user_id=? COLLATE NOCASE",
                 (normalized_user_id,),
+            ).fetchone()
+            if generation_row is None:
+                raise RuntimeError("account generation could not be persisted")
+            account_generation = str(generation_row["generation"])
+            deletion = conn.execute(
+                "SELECT state FROM mobile_account_deletion_outbox "
+                "WHERE user_id=? COLLATE NOCASE AND account_generation=?",
+                (normalized_user_id, account_generation),
             ).fetchone()
             if deletion is not None:
                 raise PermissionError("account deletion tombstone is active")
             existing = conn.execute(
-                "SELECT id, user_id FROM mobile_devices WHERE id=?",
+                "SELECT id, user_id, account_generation FROM mobile_devices WHERE id=?",
                 (normalized.id,),
             ).fetchone()
             if existing is not None:
@@ -275,12 +382,23 @@ class MobileDeviceStore:
                     raise PermissionError(
                         "device_id is already bound to another account"
                     )
+                if str(existing["account_generation"] or "") != account_generation:
+                    # A stable native device identifier may be reused after an
+                    # explicitly activated replacement account. Removing the
+                    # old binding also prevents an old deletion push from
+                    # targeting the newly registered account on that device.
+                    conn.execute(
+                        "DELETE FROM mobile_devices WHERE id=? AND user_id=?",
+                        (normalized.id, normalized_user_id),
+                    )
+                    existing = None
+            if existing is not None:
                 conn.execute(
                     """
                     UPDATE mobile_devices
                     SET name=?, model=?, os_version=?, app_version=?,
                         updated_at=?, last_seen_at=?, revoked_at=NULL, revoke_reason=''
-                    WHERE id=? AND user_id=?
+                    WHERE id=? AND user_id=? AND account_generation=?
                     """,
                     (
                         normalized.name,
@@ -291,19 +409,21 @@ class MobileDeviceStore:
                         now,
                         normalized.id,
                         normalized_user_id,
+                        account_generation,
                     ),
                 )
             else:
                 conn.execute(
                     """
                     INSERT INTO mobile_devices (
-                        id, user_id, name, model, os_version, app_version,
+                        id, user_id, account_generation, name, model, os_version, app_version,
                         created_at, updated_at, last_seen_at, revoked_at, revoke_reason
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, '')
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, '')
                     """,
                     (
                         normalized.id,
                         normalized_user_id,
+                        account_generation,
                         normalized.name,
                         normalized.model,
                         normalized.os_version,
@@ -317,32 +437,98 @@ class MobileDeviceStore:
                 """
                 UPDATE mobile_sessions
                 SET revoked_at=?, revoke_reason='replaced_by_login', updated_at=?
-                WHERE device_id=? AND user_id=? AND revoked_at IS NULL
+                WHERE device_id=? AND user_id=? AND account_generation=?
+                  AND revoked_at IS NULL
                 """,
-                (now, now, normalized.id, normalized_user_id),
+                (now, now, normalized.id, normalized_user_id, account_generation),
             )
             conn.execute(
                 """
                 INSERT INTO mobile_sessions (
-                    id, device_id, user_id, access_token_hash,
+                    id, device_id, user_id, account_generation, access_token_hash,
                     refresh_token_hash, access_expires_at, refresh_expires_at,
                     created_at, updated_at, last_seen_at, revoked_at, revoke_reason
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, '')
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, '')
                 """,
                 (
                     session_id,
                     normalized.id,
                     normalized_user_id,
+                    account_generation,
                     _token_hash(access_token),
                     _token_hash(refresh_token),
-                    record.access_expires_at,
-                    record.refresh_expires_at,
+                    access_expires_at,
+                    refresh_expires_at,
                     now,
                     now,
                     now,
                 ),
             )
+        record = MobileSessionRecord(
+            session_id=session_id,
+            device_id=normalized.id,
+            user_id=normalized_user_id,
+            account_generation=account_generation,
+            access_expires_at=access_expires_at,
+            refresh_expires_at=refresh_expires_at,
+        )
         return MobileTokenPair(access_token, refresh_token, record)
+
+    def account_generation(self, user_id: str, *, create: bool = False) -> str:
+        """Return the immutable random boundary for one active account."""
+
+        normalized = str(user_id or "").strip()
+        if not normalized:
+            raise ValueError("user_id is required")
+        if create:
+            return self.activate_account_generation(normalized)
+        with self.connection() as conn:
+            row = conn.execute(
+                "SELECT generation FROM mobile_account_generations "
+                "WHERE user_id=? COLLATE NOCASE",
+                (normalized,),
+            ).fetchone()
+        return str(row["generation"]) if row is not None else ""
+
+    def activate_account_generation(
+        self,
+        user_id: str,
+        *,
+        replace_deleting: bool = False,
+    ) -> str:
+        """Return the active generation or explicitly create its replacement."""
+
+        normalized = str(user_id or "").strip()
+        if not normalized:
+            raise ValueError("user_id is required")
+        now = self._clock()
+        with self.connection() as conn, write_txn(conn):
+            row = conn.execute(
+                "SELECT generation FROM mobile_account_generations "
+                "WHERE user_id=? COLLATE NOCASE",
+                (normalized,),
+            ).fetchone()
+            current = str(row["generation"]) if row is not None else ""
+            deletion = None
+            if current:
+                deletion = conn.execute(
+                    "SELECT state FROM mobile_account_deletion_outbox "
+                    "WHERE user_id=? COLLATE NOCASE AND account_generation=?",
+                    (normalized, current),
+                ).fetchone()
+            if current and deletion is None:
+                return current
+            if deletion is not None and not replace_deleting:
+                raise PermissionError("account deletion tombstone is active")
+
+            generation = "acctgen_" + uuid.uuid4().hex
+            conn.execute(
+                "INSERT INTO mobile_account_generations(user_id,generation,created_at) "
+                "VALUES (?,?,?) ON CONFLICT(user_id) DO UPDATE SET "
+                "generation=excluded.generation,created_at=excluded.created_at",
+                (normalized, generation, now),
+            )
+        return generation
 
     def verify_access(
         self,
@@ -358,11 +544,21 @@ class MobileDeviceStore:
                 """
                 SELECT s.*
                 FROM mobile_sessions AS s
-                JOIN mobile_devices AS d ON d.id=s.device_id
+                JOIN mobile_devices AS d
+                  ON d.id=s.device_id
+                 AND d.account_generation=s.account_generation
+                JOIN mobile_account_generations AS g
+                  ON g.user_id=s.user_id COLLATE NOCASE
+                 AND g.generation=s.account_generation
                 WHERE s.access_token_hash=?
                   AND s.revoked_at IS NULL
                   AND d.revoked_at IS NULL
                   AND s.access_expires_at>?
+                  AND NOT EXISTS (
+                      SELECT 1 FROM mobile_account_deletion_outbox AS deletion
+                      WHERE deletion.user_id=s.user_id COLLATE NOCASE
+                        AND deletion.account_generation=s.account_generation
+                  )
                 """,
                 (_token_hash(token), now),
             ).fetchone()
@@ -392,11 +588,21 @@ class MobileDeviceStore:
                 """
                 SELECT s.*
                 FROM mobile_sessions AS s
-                JOIN mobile_devices AS d ON d.id=s.device_id
+                JOIN mobile_devices AS d
+                  ON d.id=s.device_id
+                 AND d.account_generation=s.account_generation
+                JOIN mobile_account_generations AS g
+                  ON g.user_id=s.user_id COLLATE NOCASE
+                 AND g.generation=s.account_generation
                 WHERE s.refresh_token_hash=?
                   AND s.revoked_at IS NULL
                   AND d.revoked_at IS NULL
                   AND s.refresh_expires_at>?
+                  AND NOT EXISTS (
+                      SELECT 1 FROM mobile_account_deletion_outbox AS deletion
+                      WHERE deletion.user_id=s.user_id COLLATE NOCASE
+                        AND deletion.account_generation=s.account_generation
+                  )
                 """,
                 (old_hash, now),
             ).fetchone()
@@ -455,6 +661,7 @@ class MobileDeviceStore:
                 session_id=str(row["id"]),
                 device_id=str(row["device_id"]),
                 user_id=str(row["user_id"]),
+                account_generation=str(row["account_generation"]),
                 access_expires_at=access_expires_at,
                 refresh_expires_at=refresh_expires_at,
             )
@@ -568,7 +775,12 @@ class MobileDeviceStore:
                            COUNT(CASE WHEN s.revoked_at IS NULL
                                           AND s.refresh_expires_at>? THEN 1 END) AS active_sessions
                     FROM mobile_devices AS d
-                    LEFT JOIN mobile_sessions AS s ON s.device_id=d.id
+                    LEFT JOIN mobile_sessions AS s
+                      ON s.device_id=d.id
+                     AND s.account_generation=d.account_generation
+                    JOIN mobile_account_generations AS g
+                      ON g.user_id=d.user_id COLLATE NOCASE
+                     AND g.generation=d.account_generation
                     WHERE d.user_id=?
                     GROUP BY d.id
                     ORDER BY d.last_seen_at DESC, d.created_at DESC
@@ -580,6 +792,9 @@ class MobileDeviceStore:
                     SELECT t.id, t.device_id, t.environment, t.bundle_id, t.token, t.updated_at
                     FROM mobile_apns_tokens AS t
                     INNER JOIN mobile_devices AS d ON d.id=t.device_id
+                    JOIN mobile_account_generations AS g
+                      ON g.user_id=d.user_id COLLATE NOCASE
+                     AND g.generation=d.account_generation
                     WHERE t.disabled_at IS NULL AND d.user_id=?
                     ORDER BY t.updated_at DESC
                     """,
@@ -594,7 +809,9 @@ class MobileDeviceStore:
                            COUNT(CASE WHEN s.revoked_at IS NULL
                                           AND s.refresh_expires_at>? THEN 1 END) AS active_sessions
                     FROM mobile_devices AS d
-                    LEFT JOIN mobile_sessions AS s ON s.device_id=d.id
+                    LEFT JOIN mobile_sessions AS s
+                      ON s.device_id=d.id
+                     AND s.account_generation=d.account_generation
                     GROUP BY d.id
                     ORDER BY d.last_seen_at DESC, d.created_at DESC
                     """,
@@ -833,8 +1050,13 @@ class MobileDeviceStore:
             "p.disabled_at IS NULL",
             "d.revoked_at IS NULL",
             "d.user_id=?",
+            "EXISTS (SELECT 1 FROM mobile_account_generations AS g "
+            "WHERE g.user_id=d.user_id COLLATE NOCASE "
+            "AND g.generation=d.account_generation)",
             "EXISTS (SELECT 1 FROM mobile_sessions AS s "
-            "WHERE s.device_id=d.id AND s.revoked_at IS NULL "
+            "WHERE s.device_id=d.id "
+            "AND s.account_generation=d.account_generation "
+            "AND s.revoked_at IS NULL "
             "AND s.refresh_expires_at>?)",
         ]
         values: list[Any] = [normalized_user_id, now]
@@ -845,6 +1067,7 @@ class MobileDeviceStore:
             rows = conn.execute(
                 f"""
                 SELECT p.id, p.device_id, p.token, p.environment, p.bundle_id,
+                       d.user_id, d.account_generation,
                        p.created_at, p.updated_at
                 FROM mobile_apns_tokens AS p
                 JOIN mobile_devices AS d ON d.id=p.device_id
@@ -859,6 +1082,7 @@ class MobileDeviceStore:
         self,
         *,
         user_id: str,
+        account_generation: str = "",
         environment: str = "",
     ) -> list[dict[str, Any]]:
         """Return retained APNs rows after account sessions are revoked."""
@@ -866,8 +1090,12 @@ class MobileDeviceStore:
         normalized_user_id = str(user_id or "").strip()
         if not normalized_user_id:
             return []
+        generation = str(account_generation or "").strip()
         clauses = ["p.disabled_at IS NULL", "d.user_id=?"]
         values: list[Any] = [normalized_user_id]
+        if generation:
+            clauses.append("d.account_generation=?")
+            values.append(generation)
         if environment:
             clauses.append("p.environment=?")
             values.append(environment.strip().lower())
@@ -875,6 +1103,7 @@ class MobileDeviceStore:
             rows = conn.execute(
                 f"""
                 SELECT p.id, p.device_id, p.token, p.environment, p.bundle_id,
+                       d.user_id, d.account_generation,
                        p.created_at, p.updated_at
                 FROM mobile_apns_tokens AS p
                 JOIN mobile_devices AS d ON d.id=p.device_id
@@ -885,7 +1114,12 @@ class MobileDeviceStore:
             ).fetchall()
         return [dict(row) for row in rows]
 
-    def begin_account_deletion(self, user_id: str, owner_scope: str) -> dict[str, Any]:
+    def begin_account_deletion(
+        self,
+        user_id: str,
+        owner_scope: str,
+        account_generation: str = "",
+    ) -> dict[str, Any]:
         """Revoke access immediately and persist APNs cleanup until terminal."""
 
         normalized_user_id = str(user_id or "").strip()
@@ -897,9 +1131,27 @@ class MobileDeviceStore:
         now = self._clock()
         identifier = "account_delete_" + uuid.uuid4().hex
         with self.connection() as conn, write_txn(conn):
-            device_rows = conn.execute(
-                "SELECT id FROM mobile_devices WHERE user_id=?",
+            conn.execute(
+                "INSERT OR IGNORE INTO mobile_account_generations(user_id,generation,created_at) "
+                "VALUES (?,?,?)",
+                (normalized_user_id, "acctgen_" + uuid.uuid4().hex, now),
+            )
+            generation_row = conn.execute(
+                "SELECT generation FROM mobile_account_generations "
+                "WHERE user_id=? COLLATE NOCASE",
                 (normalized_user_id,),
+            ).fetchone()
+            if generation_row is None:
+                raise RuntimeError("account generation could not be persisted")
+            active_generation = str(generation_row["generation"])
+            requested_generation = str(account_generation or "").strip()
+            if requested_generation and requested_generation != active_generation:
+                raise PermissionError("account generation is no longer active")
+            account_generation = active_generation
+            device_rows = conn.execute(
+                "SELECT id FROM mobile_devices "
+                "WHERE user_id=? AND account_generation=?",
+                (normalized_user_id, account_generation),
             ).fetchall()
             device_ids = [str(row["id"]) for row in device_rows]
             sessions = 0
@@ -928,17 +1180,26 @@ class MobileDeviceStore:
                 )
             conn.execute(
                 "INSERT INTO mobile_account_deletion_outbox("
-                "id,user_id,owner_scope,state,device_deliveries_json,attempts,"
+                "id,user_id,account_generation,owner_scope,state,device_deliveries_json,attempts,"
                 "available_at,lease_token,leased_until,requested_at,updated_at,completed_at,last_error"
-                ") VALUES(?,?,?,'pending','{}',0,?,'',0,?,?,NULL,'') "
-                "ON CONFLICT(user_id) DO UPDATE SET "
+                ") VALUES(?,?,?,?,'pending','{}',0,?,'',0,?,?,NULL,'') "
+                "ON CONFLICT(user_id,account_generation) DO UPDATE SET "
                 "owner_scope=excluded.owner_scope,state='pending',available_at=excluded.available_at,"
                 "lease_token='',leased_until=0,updated_at=excluded.updated_at,completed_at=NULL,last_error=''",
-                (identifier, normalized_user_id, normalized_scope, now, now, now),
+                (
+                    identifier,
+                    normalized_user_id,
+                    account_generation,
+                    normalized_scope,
+                    now,
+                    now,
+                    now,
+                ),
             )
             row = conn.execute(
-                "SELECT id,state FROM mobile_account_deletion_outbox WHERE user_id=?",
-                (normalized_user_id,),
+                "SELECT id,state FROM mobile_account_deletion_outbox "
+                "WHERE user_id=? AND account_generation=?",
+                (normalized_user_id, account_generation),
             ).fetchone()
         return {
             "id": str(row["id"]),
@@ -946,6 +1207,7 @@ class MobileDeviceStore:
             "devices": len(device_ids),
             "sessions": sessions,
             "apns": apns,
+            "account_generation": account_generation,
         }
 
     def claim_account_deletions(
@@ -1044,17 +1306,19 @@ class MobileDeviceStore:
         with self.connection() as conn, write_txn(conn):
             now = self._clock()
             row = conn.execute(
-                "SELECT user_id FROM mobile_account_deletion_outbox "
+                "SELECT user_id,account_generation FROM mobile_account_deletion_outbox "
                 "WHERE id=? AND state='delivering' AND lease_token=? AND leased_until>?",
                 (str(deletion_id), str(lease_token), now),
             ).fetchone()
             if row is None:
                 return {"updated": False, "state": normalized_state, **removed}
             user_id = str(row["user_id"])
+            account_generation = str(row["account_generation"])
             if terminal:
                 device_rows = conn.execute(
-                    "SELECT id FROM mobile_devices WHERE user_id=?",
-                    (user_id,),
+                    "SELECT id FROM mobile_devices "
+                    "WHERE user_id=? AND account_generation=?",
+                    (user_id, account_generation),
                 ).fetchall()
                 device_ids = [str(item["id"]) for item in device_rows]
                 if device_ids:
@@ -1090,16 +1354,40 @@ class MobileDeviceStore:
             )
         return {"updated": True, "state": normalized_state, **removed}
 
-    def account_deletion_status(self, user_id: str) -> dict[str, Any] | None:
+    def account_deletion_status(
+        self,
+        user_id: str,
+        account_generation: str = "",
+        *,
+        include_historical: bool = False,
+    ) -> dict[str, Any] | None:
         normalized_user_id = str(user_id or "").strip()
         if not normalized_user_id:
             return None
+        generation = str(account_generation or "").strip()
         with self.connection() as conn:
-            row = conn.execute(
-                "SELECT * FROM mobile_account_deletion_outbox "
-                "WHERE user_id=? COLLATE NOCASE",
-                (normalized_user_id,),
-            ).fetchone()
+            if not generation and not include_historical:
+                active = conn.execute(
+                    "SELECT generation FROM mobile_account_generations "
+                    "WHERE user_id=? COLLATE NOCASE",
+                    (normalized_user_id,),
+                ).fetchone()
+                generation = str(active["generation"]) if active is not None else ""
+            if generation:
+                row = conn.execute(
+                    "SELECT * FROM mobile_account_deletion_outbox "
+                    "WHERE user_id=? COLLATE NOCASE AND account_generation=?",
+                    (normalized_user_id, generation),
+                ).fetchone()
+            elif include_historical:
+                row = conn.execute(
+                    "SELECT * FROM mobile_account_deletion_outbox "
+                    "WHERE user_id=? COLLATE NOCASE "
+                    "ORDER BY requested_at DESC LIMIT 1",
+                    (normalized_user_id,),
+                ).fetchone()
+            else:
+                row = None
         if row is None:
             return None
         result = dict(row)
@@ -1107,19 +1395,23 @@ class MobileDeviceStore:
         return result
 
     def clear_completed_account_deletion(self, user_id: str) -> bool:
-        """Release a terminal tombstone before an explicitly verified re-registration."""
+        """Activate a replacement generation while retaining the old tombstone."""
 
         normalized_user_id = str(user_id or "").strip()
         if not normalized_user_id:
             return False
-        with self.connection() as conn, write_txn(conn):
-            changed = conn.execute(
-                "DELETE FROM mobile_account_deletion_outbox "
-                "WHERE user_id=? COLLATE NOCASE "
-                "AND state IN ('delivered','no_recipients','permanent_failure')",
-                (normalized_user_id,),
-            ).rowcount
-        return bool(changed)
+        status = self.account_deletion_status(normalized_user_id)
+        if status is None or str(status.get("state")) not in {
+            "delivered",
+            "no_recipients",
+            "permanent_failure",
+        }:
+            return False
+        self.activate_account_generation(
+            normalized_user_id,
+            replace_deleting=True,
+        )
+        return True
 
     def delete_user(self, user_id: str) -> dict[str, int]:
         """Remove a user's device, session, refresh-history and APNs rows."""
@@ -1188,6 +1480,7 @@ class MobileDeviceStore:
             session_id=str(row["id"]),
             device_id=str(row["device_id"]),
             user_id=str(row["user_id"]),
+            account_generation=str(row["account_generation"]),
             access_expires_at=int(row["access_expires_at"]),
             refresh_expires_at=int(row["refresh_expires_at"]),
         )
@@ -1208,13 +1501,17 @@ class OwnerMobileTokenProvider(DashboardAuthProvider):
         self._store_factory = store_factory
 
     def verify_token(self, *, token: str) -> Optional[TokenPrincipal]:
-        record = self._store_factory().verify_access(token)
+        store = self._store_factory()
+        record = store.verify_access(token)
         if record is None:
+            return None
+        if not record.account_generation:
             return None
         return TokenPrincipal(
             principal=record.user_id,
             provider=self.name,
             scopes=("dashboard:admin",),
+            account_generation=record.account_generation,
         )
 
     def start_login(self, *, redirect_uri: str) -> LoginStart:

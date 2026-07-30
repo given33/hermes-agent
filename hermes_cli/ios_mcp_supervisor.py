@@ -33,7 +33,7 @@ logger = logging.getLogger(__name__)
 
 _RUNTIME_STOPPING_ERROR = "runtime is stopping"
 _IOS_MCP_FORKSERVER_PRELOAD = (
-    "mcp.server.fastmcp",
+    "mcp.server.mcpserver",
     "hermes_cli.ios_intelligence",
 )
 _IOS_MCP_FORKSERVER_CONTEXT: Any | None = None
@@ -885,7 +885,8 @@ class IOSMCPRuntimeSupervisor:
         )
         services: list[dict[str, Any]] = []
         for name in self.capabilities:
-            state = self.supervisor.status(name)["state"]
+            supervisor_status = self.supervisor.status(name)
+            state = supervisor_status["state"]
             if state == MCPState.DISABLED.value:
                 continue
             probe = self.health_service(name)
@@ -902,6 +903,8 @@ class IOSMCPRuntimeSupervisor:
             services.append({
                 "name": name,
                 "state": state,
+                "version": str(supervisor_status.get("version") or ""),
+                "active_version": str(supervisor_status.get("active_version") or ""),
                 **probe,
                 "expected_tools": expected_tools,
                 "declared_scopes": declared_scopes,
@@ -1409,22 +1412,22 @@ class IOSMCPRuntimeSupervisor:
         timeout_seconds = min(180.0, max(1.0, float(timeout_seconds)))
 
         async def probe() -> list[str]:
-            import httpx
-            from mcp import ClientSession
+            import httpx2
+            from mcp import Client
             from mcp.client.streamable_http import streamable_http_client
+            from mcp.types.version import LATEST_PROTOCOL_VERSION
 
             request_timeout = max(1.0, timeout_seconds - 1.0)
-            timeout = httpx.Timeout(request_timeout, connect=min(5.0, request_timeout))
-            async with httpx.AsyncClient(timeout=timeout) as http_client:
-                async with streamable_http_client(
+            timeout = httpx2.Timeout(request_timeout, connect=min(5.0, request_timeout))
+            async with httpx2.AsyncClient(timeout=timeout) as http_client:
+                transport = streamable_http_client(
                     url,
                     http_client=http_client,
                     terminate_on_close=True,
-                ) as (read_stream, write_stream, _):
-                    async with ClientSession(read_stream, write_stream) as session:
-                        await session.initialize()
-                        result = await session.list_tools()
-                        return [tool.name for tool in result.tools]
+                )
+                async with Client(transport, mode=LATEST_PROTOCOL_VERSION) as client:
+                    result = await client.list_tools()
+                    return [tool.name for tool in result.tools]
 
         async def bounded_probe() -> list[str]:
             return await asyncio.wait_for(probe(), timeout=timeout_seconds)

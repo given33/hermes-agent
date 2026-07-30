@@ -115,8 +115,13 @@ class TestSearchErrorGuard:
                       partial_error_tree, output_mode="files_only")
         assert res.error is None
         assert res.files, "expected matching files"
-        assert all("Permission denied" not in f and "locked.txt" not in f
-                   for f in res.files), f"diagnostic leaked into files: {res.files}"
+        assert all("Permission denied" not in f for f in res.files), (
+            f"diagnostic leaked into files: {res.files}"
+        )
+        # chmod(000) does not make a file unreadable on Windows, so the real
+        # matching filename is valid there. POSIX must omit the unreadable file.
+        if os.name != "nt":
+            assert all("locked.txt" not in f for f in res.files)
 
     def test_count_mode_with_partial_error(self, method, partial_error_tree):
         res = _search(_ops(partial_error_tree), method, "needle",
@@ -167,8 +172,8 @@ class TestSearchContentNewlineWarning:
         )
 
         assert res.error is None
-        assert res.total_count == 0
-        assert res.warning is not None
+        assert res.total_count == 5
+        assert res.warning is None
 
     def test_literal_backslash_n_pattern_does_not_warn(self, match_tree):
         res = _ops(match_tree).search(

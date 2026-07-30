@@ -17,6 +17,7 @@ from pathlib import Path
 from typing import Any
 
 from hermes_state import SessionDB
+from hermes_cli.account_identity import generation_scoped_owner_id
 
 
 _FACADE_SCHEMA = """
@@ -83,11 +84,14 @@ class AccountSessionFacade:
         self.db._execute_write(lambda conn: conn.executescript(_FACADE_SCHEMA))
 
     @staticmethod
-    def _owner(owner_id: str) -> str:
+    def _owner(
+        owner_id: str,
+        account_generation: str | None = None,
+    ) -> str:
         owner = str(owner_id or "").strip()[:512]
         if not owner:
             raise ValueError("owner_id is required")
-        return owner
+        return generation_scoped_owner_id(owner, account_generation)
 
     @staticmethod
     def _session_id(session_id: str) -> str:
@@ -446,10 +450,15 @@ class AccountSessionFacade:
             "compression_in_progress": self.db.get_compression_lock_holder(sid) is not None,
         }
 
-    def delete_owner(self, owner_id: str) -> dict[str, int]:
+    def delete_owner(
+        self,
+        owner_id: str,
+        *,
+        account_generation: str = "",
+    ) -> dict[str, int]:
         """Delete every branch created inside this account/profile boundary."""
 
-        owner = self._owner(owner_id)
+        owner = self._owner(owner_id, account_generation or None)
 
         # The permanent fence is committed before any sidecar cleanup. Every
         # bind/fork transaction checks it after acquiring the same SQLite write

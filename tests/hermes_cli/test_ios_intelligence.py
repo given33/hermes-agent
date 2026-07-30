@@ -3,6 +3,7 @@ from __future__ import annotations
 from concurrent.futures import ThreadPoolExecutor
 import base64
 import hashlib
+import json
 import os
 from datetime import datetime
 from pathlib import Path
@@ -61,6 +62,265 @@ def test_ingest_is_idempotent_and_account_scoped(store):
     assert store.get_upload_cursor("alice", "iphone") == "cursor-2"
 
 
+def test_ingest_rolls_back_event_projection_cursor_and_job_together(store, monkeypatch):
+    def fail_enqueue(*_args, **_kwargs):
+        raise RuntimeError("derived queue unavailable")
+
+    monkeypatch.setattr(store, "_enqueue_event_derived_jobs", fail_enqueue)
+
+    with pytest.raises(RuntimeError, match="derived queue unavailable"):
+        store.ingest_events(
+            "alice",
+            "iphone",
+            [_location_event("atomic-point", owner_time=1_700_000_000)],
+            "cursor-atomic",
+        )
+
+    assert store.get_upload_cursor("alice", "iphone") is None
+    assert store.latest_snapshot("alice", "location") is None
+    with sqlite3.connect(store.path) as conn:
+        assert conn.execute(
+            "SELECT COUNT(*) FROM ios_events WHERE event_id='atomic-point'"
+        ).fetchone()[0] == 0
+        assert conn.execute("SELECT COUNT(*) FROM ios_derived_jobs").fetchone()[0] == 0
+
+
+def test_derived_jobs_recover_after_cursor_commit_without_duplicate_training(
+    store,
+    monkeypatch,
+):
+    original_process = store._process_derived_job
+
+    def fail_processing(_job):
+        raise RuntimeError("fixture training failure")
+
+    monkeypatch.setattr(store, "_process_derived_job", fail_processing)
+    result = store.ingest_events(
+        "alice",
+        "iphone",
+        [{
+            "event_id": "place-recovery",
+            "kind": "place",
+            "observed_at": 1_700_000_000,
+            "payload": {
+                "place_id": "home",
+                "name": "Home",
+                "latitude": 24.9,
+                "longitude": 118.6,
+                "arrived_at": 1_700_000_000,
+            },
+        }],
+        "cursor-recovery",
+    )
+
+    assert result["next_cursor"] == "cursor-recovery"
+    assert store.get_place("alice", "home") is None
+    pending = store.list_derived_jobs("alice", state="pending")
+    assert {job["job_kind"] for job in pending} == {
+        "behavior-feedback",
+        "learn-place",
+    }
+
+
+def _clear_account_export(store, exported, owner_id="alice", passphrase=None):
+    encrypted = base64.b64decode(exported["blob_base64"])
+    clear = store.decrypt_account_export(
+        encrypted,
+        owner_id,
+        passphrase or exported["recovery_key"],
+    )
+    return json.loads(clear)
+
+    monkeypatch.setattr(store, "_process_derived_job", original_process)
+    retry_at = max(int(job["not_before"]) for job in pending) + 1
+    recovered = store.run_derived_jobs(owner_id="alice", now=retry_at)
+
+    assert recovered["completed"] == 2
+    assert store.get_place("alice", "home")["visits"] == 1
+    assert all(
+        job["state"] == "completed"
+        for job in store.list_derived_jobs("alice")
+    )
+
+
+def test_derived_job_lease_replay_is_idempotent_after_process_exit(store, monkeypatch):
+    original_process = store._process_derived_job
+    monkeypatch.setattr(
+        store,
+        "_process_derived_job",
+        lambda _job: (_ for _ in ()).throw(RuntimeError("defer fixture")),
+    )
+    store.ingest_events(
+        "alice",
+        "iphone",
+        [{
+            "event_id": "place-crash-window",
+            "kind": "place",
+            "observed_at": 1_700_000_100,
+            "payload": {
+                "place_id": "office",
+                "name": "Office",
+                "latitude": 24.91,
+                "longitude": 118.61,
+                "arrived_at": 1_700_000_100,
+            },
+        }],
+        "cursor-crash-window",
+    )
+    monkeypatch.setattr(store, "_process_derived_job", original_process)
+    pending = store.list_derived_jobs("alice", state="pending")
+    claim_at = max(int(job["not_before"]) for job in pending) + 1
+    claimed = store._claim_derived_jobs(
+        limit=10,
+        owner_id="alice",
+        now=claim_at,
+        lease_seconds=5,
+    )
+    place_job = next(job for job in claimed if job["job_kind"] == "learn-place")
+
+    # Simulate process exit after the side effect but before lease completion.
+    store._process_derived_job(place_job)
+    assert store.get_place("alice", "office")["visits"] == 1
+
+    replayed = store.run_derived_jobs(owner_id="alice", now=claim_at + 6)
+
+    assert replayed["completed"] == 2
+    assert store.get_place("alice", "office")["visits"] == 1
+
+
+def test_derived_backfill_uses_low_priority_watermark_without_cursor_rollback(store):
+    store.ingest_events(
+        "alice",
+        "iphone",
+        [{
+            "event_id": "legacy-place",
+            "kind": "place",
+            "observed_at": 1_600_000_000,
+            "payload": {
+                "place_id": "legacy-home",
+                "latitude": 24.9,
+                "longitude": 118.6,
+                "arrived_at": 1_600_000_000,
+            },
+        }],
+        "cursor-current",
+    )
+    with sqlite3.connect(store.path) as conn:
+        for table in (
+            "ios_derived_jobs",
+            "ios_derived_backfill_watermarks",
+            "ios_place_samples",
+            "ios_place_graph",
+            "ios_behavior_feedback",
+        ):
+            conn.execute(f"DELETE FROM {table}")
+
+    assert store.backfill_derived_jobs(limit=10) == 2
+    queued = store.list_derived_jobs("alice", state="pending")
+    assert len(queued) == 2
+    assert {job["priority"] for job in queued} == {10}
+    assert store.get_upload_cursor("alice", "iphone") == "cursor-current"
+
+    assert store.run_derived_jobs(owner_id="alice")["completed"] == 2
+    assert store.get_place("alice", "legacy-home")["visits"] == 1
+    assert store.backfill_derived_jobs(limit=10) == 0
+    assert store.get_upload_cursor("alice", "iphone") == "cursor-current"
+
+
+def test_generation_tombstone_cancels_inflight_derived_job(store, monkeypatch):
+    original_process = store._process_derived_job
+    monkeypatch.setattr(
+        store,
+        "_process_derived_job",
+        lambda _job: (_ for _ in ()).throw(RuntimeError("defer fixture")),
+    )
+    store.ingest_events(
+        "alice",
+        "iphone",
+        [{
+            "event_id": "old-generation-motion",
+            "kind": "motion",
+            "observed_at": 1_700_000_000,
+            "payload": {"state": "walking"},
+        }],
+        "old-generation-cursor",
+    )
+    monkeypatch.setattr(store, "_process_derived_job", original_process)
+    pending = store.list_derived_jobs("alice", state="pending")
+    claim_at = int(pending[0]["not_before"]) + 1
+    job = store._claim_derived_jobs(
+        limit=1,
+        owner_id="alice",
+        now=claim_at,
+    )[0]
+
+    store.begin_account_deletion("alice", account_generation="legacy")
+    with pytest.raises(sqlite3.IntegrityError, match="deletion tombstone") as error:
+        store._process_derived_job(job)
+    assert store._finish_derived_job(job, error=error.value, now=claim_at + 1)
+    assert store.list_derived_jobs("alice")[0]["state"] == "cancelled"
+    with pytest.raises(PermissionError, match="deletion tombstone"):
+        store.ingest_events(
+            "alice",
+            "iphone",
+            [_location_event("new-after-delete")],
+            "forbidden-cursor",
+        )
+
+
+def test_route_and_model_derived_jobs_are_applied(store):
+    result = store.ingest_events(
+        "alice",
+        "iphone",
+        [
+            {
+                "event_id": "route-derived",
+                "kind": "route",
+                "observed_at": 1_700_000_000,
+                "payload": {
+                    "origin_place_id": "home",
+                    "destination_place_id": "office",
+                    "mode": "walking",
+                    "duration_seconds": 900,
+                    "distance_meters": 1200,
+                },
+            },
+            {
+                "event_id": "model-derived",
+                "kind": "behavior-model",
+                "observed_at": 1_700_000_001,
+                "payload": {
+                    "model_name": "departure",
+                    "payload": {"bias": 0.25},
+                },
+            },
+        ],
+        "cursor-route-model",
+    )
+
+    assert result["accepted"] == 2
+    assert store.get_route("alice", "home", "office", "walking")["trips"] == 1
+    assert store.load_model("alice", "departure")["payload"] == {"bias": 0.25}
+
+
+def test_same_client_event_id_is_isolated_by_account_and_device(store):
+    event = {
+        "event_id": "shared-client-id",
+        "kind": "motion",
+        "observed_at": 1_700_000_000,
+        "payload": {"state": "walking"},
+    }
+
+    assert store.ingest_events("alice", "iphone", [event], "alice-1")["accepted"] == 1
+    assert store.ingest_events("bob", "iphone", [event], "bob-1")["accepted"] == 1
+    with sqlite3.connect(store.path) as conn:
+        rows = conn.execute(
+            "SELECT owner_id,COUNT(*) FROM ios_behavior_feedback "
+            "WHERE label='actual-motion' GROUP BY owner_id ORDER BY owner_id"
+        ).fetchall()
+    assert rows == [("alice", 1), ("bob", 1)]
+
+
 def test_apns_tokens_are_consumed_without_entering_history_or_exports(store):
     event = {
         "event_id": "legacy-apns-token",
@@ -91,7 +351,7 @@ def test_apns_tokens_are_consumed_without_entering_history_or_exports(store):
             ),
         )
 
-    exported = store.export_account("alice")
+    exported = _clear_account_export(store, store.export_account("alice"))
     assert exported["tables"]["ios_events"] == []
     assert exported["tables"]["ios_snapshots"] == []
 
@@ -185,6 +445,65 @@ def test_account_export_passphrase_envelope_is_recoverable_without_plaintext(sto
     assert b"export-secret" in clear
     with pytest.raises(Exception):
         store.decrypt_account_export(encrypted, "alice", "wrong password")
+
+
+def test_account_export_cannot_be_downgraded_and_recovery_key_stays_outside_blob(store):
+    store.ingest_events(
+        "alice",
+        "iphone",
+        [_location_event("forced-encryption", latitude=24.976543)],
+        "forced-encryption",
+    )
+
+    exported = store.export_account("alice", encrypt=False)
+    encrypted = base64.b64decode(exported["blob_base64"])
+
+    assert exported["encrypted"] is True
+    assert exported["recovery_key"]
+    assert exported["recovery_key"].encode() not in encrypted
+    assert b"24.976543" not in encrypted
+    clear = _clear_account_export(store, exported)
+    assert clear["tables"]["ios_events"][0]["event_id"] == "forced-encryption"
+
+
+def test_account_export_redacts_nested_credentials_and_records_scanner_audit(store):
+    credential = "api-key-plaintext-export-marker"
+    store.ingest_events(
+        "alice",
+        "iphone",
+        [{
+            "event_id": "credential-redaction",
+            "kind": "location",
+            "observed_at": 1_700_000_000,
+            "payload": {
+                "latitude": 24.9,
+                "longitude": 118.6,
+                "nested": {"api_key": credential},
+            },
+        }],
+        "credential-redaction",
+    )
+
+    exported = store.export_account(
+        "alice",
+        export_passphrase="correct horse battery staple",
+    )
+    clear = _clear_account_export(
+        store,
+        exported,
+        passphrase="correct horse battery staple",
+    )
+
+    assert credential not in json.dumps(clear)
+    assert "api_key" not in clear["tables"]["ios_events"][0]["payload_json"]
+    with sqlite3.connect(store.path) as conn:
+        audit = conn.execute(
+            "SELECT encrypted,kdf,scanner_redactions,scanner_findings,status "
+            "FROM ios_export_audit ORDER BY created_at DESC,id DESC LIMIT 1"
+        ).fetchone()
+    assert audit[:2] == (1, "scrypt-N16384-r8-p1")
+    assert audit[2] >= 1
+    assert audit[3:] == (0, "completed")
 
 
 def test_connect_closes_and_reraises_setup_errors(monkeypatch, tmp_path):
@@ -548,7 +867,7 @@ def test_account_delete_removes_registered_custom_cold_segment(store):
     assert target.read_bytes().startswith(b"HERMES-AESGCM-1")
     restored = store.read_cold_trajectory("alice", archived["segment_id"])
     assert restored[0]["event_id"] == "cold-point"
-    exported = store.export_account("alice")
+    exported = _clear_account_export(store, store.export_account("alice"))
     assert exported["cold_trajectory"][0]["event_id"] == "cold-point"
     with sqlite3.connect(store.path) as conn:
         assert conn.execute(
@@ -704,6 +1023,77 @@ def test_account_deletion_tombstone_blocks_late_uploads_and_derived_writes(store
         "point_count": 0,
         "account_deleted": True,
     }
+
+
+def test_old_cleanup_and_late_writes_cannot_cross_reused_owner_generation(
+    tmp_path,
+    monkeypatch,
+):
+    from hermes_cli.dashboard_auth import mobile_device_store
+
+    monkeypatch.setattr(
+        mobile_device_store,
+        "mobile_auth_db_path",
+        lambda: tmp_path / "mobile-auth.db",
+    )
+    mobile = mobile_device_store.MobileDeviceStore()
+    old_generation = mobile.account_generation("alice", create=True)
+    intelligence = IOSIntelligenceStore(tmp_path / "intelligence")
+    first = intelligence.ingest_events(
+        "alice",
+        "iphone-old",
+        [_location_event("same-event", owner_time=946_684_800)],
+        "1",
+    )
+    assert first["accepted"] == 1
+    with intelligence._connect() as conn:
+        old_storage_owner = str(
+            conn.execute(
+                "SELECT owner_id FROM ios_events WHERE event_id='same-event'"
+            ).fetchone()[0]
+        )
+
+    intelligence.begin_account_deletion(
+        "alice",
+        "owner-scope",
+        old_generation,
+    )
+    mobile.begin_account_deletion("alice", "owner-scope", old_generation)
+    new_generation = mobile.activate_account_generation(
+        "alice",
+        replace_deleting=True,
+    )
+    assert new_generation != old_generation
+
+    replacement = intelligence.ingest_events(
+        "alice",
+        "iphone-new",
+        [_location_event("same-event", owner_time=946_684_900)],
+        "1",
+    )
+    assert replacement["accepted"] == 1
+    with pytest.raises(PermissionError, match="deletion tombstone"):
+        intelligence.ingest_events(
+            old_storage_owner,
+            "iphone-old",
+            [_location_event("late-old", owner_time=946_684_901)],
+            "2",
+        )
+
+    deleted = intelligence.delete_account(
+        "alice",
+        account_generation=old_generation,
+    )
+
+    assert deleted["state"] == "complete"
+    assert intelligence.latest_snapshot("alice", "location")["observed_at"] == 946_684_900
+    assert intelligence.account_deletion_status("alice") is None
+    assert intelligence.account_deletion_status(
+        "alice",
+        old_generation,
+    )["status"] == "complete"
+    exported = intelligence.export_account("alice")
+    assert exported["account_generation"] == new_generation
 
 
 def test_device_command_queue_survives_delivery_and_ack(store, monkeypatch):
@@ -1323,11 +1713,18 @@ def test_active_forecast_expires_from_native_today_view(store):
         "alice", {"id": "old", "valid_from": now - 3600, "valid_until": now - 1, "summary": "已结束"}
     )
     store.record_active_forecast(
+        "alice", {"id": "future", "valid_from": now + 60, "valid_until": now + 1800, "summary": "未开始"}
+    )
+    store.record_active_forecast(
         "bob", {"id": "rain-1", "valid_from": now, "valid_until": now + 1800, "summary": "晴"}
     )
     assert active["id"] == "rain-1"
     assert [item["id"] for item in store.active_forecast("alice", now)] == ["rain-1"]
+    assert store.active_forecast("alice", now)[0]["is_active"] is True
+    assert store.active_forecast("alice", now)[0]["starts_at"] == now
+    assert store.active_forecast("alice", now)[0]["expires_at"] == now + 1800
     assert store.today_snapshot("alice")["active_forecasts"][0]["data"]["summary"] == "有雨"
+    assert store.today_snapshot("alice")["schema_version"] == "hermes.ios-intelligence.snapshot.v1"
     assert store.active_forecast("bob", now)[0]["data"]["summary"] == "晴"
 
 

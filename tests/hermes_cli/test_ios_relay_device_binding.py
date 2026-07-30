@@ -65,13 +65,19 @@ def _request(token: str, owner_id: str = "owner"):
     )
 
 
-def _invoke_device_routes(module, request, device_id: str) -> None:
+def _invoke_device_routes(module, request, device_id: str, account_generation: str) -> None:
     module.ingest_event_batch(
         request,
         module.ContextEventBatch(
             device_id=device_id,
             cursor="event-1",
-            events=[module.ContextEvent(id="event-1", kind="power", timestamp=1)],
+            events=[module.ContextEvent(
+                account_generation=account_generation,
+                id="event-1",
+                kind="power",
+                lifecycle_epoch=1,
+                timestamp=1,
+            )],
         ),
     )
     module.record_capabilities(
@@ -124,7 +130,27 @@ def test_relay_routes_bind_body_device_to_verified_mobile_session(monkeypatch, t
         assert exc_info.value.status_code == 403
     assert relay_store.calls == []
 
-    _invoke_device_routes(module, _request(tablet.access_token), "device-tablet")
+    _invoke_device_routes(
+        module,
+        _request(tablet.access_token),
+        "device-tablet",
+        tablet.session.account_generation,
+    )
+    with pytest.raises(module.HTTPException) as stale_generation:
+        module.ingest_event_batch(
+            _request(tablet.access_token),
+            module.ContextEventBatch(
+                device_id="device-tablet",
+                events=[module.ContextEvent(
+                    account_generation="acctgen_stale",
+                    id="event-stale",
+                    kind="power",
+                    lifecycle_epoch=1,
+                    timestamp=2,
+                )],
+            ),
+        )
+    assert stale_generation.value.status_code == 409
     assert relay_store.calls == [
         ("events", "owner", "device-tablet"),
         ("events", "owner", "device-tablet"),

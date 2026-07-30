@@ -36,6 +36,12 @@ import logging
 import sys
 from pathlib import Path
 
+from hermes_services.startup import bootstrap_trusted_runtime
+
+# Provider profiles are dynamically imported on first lookup, including when
+# this package is imported directly outside the CLI plugin manager.
+bootstrap_trusted_runtime()
+
 from providers.base import OMIT_TEMPERATURE, ProviderProfile  # noqa: F401
 
 logger = logging.getLogger(__name__)

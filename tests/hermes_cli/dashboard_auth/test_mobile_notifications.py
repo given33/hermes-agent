@@ -125,6 +125,9 @@ def test_generic_account_notification_uses_stable_collapse_and_delivery(monkeypa
     assert result["state"] == "delivered"
     assert calls[0][0] == "registration-weather"
     assert calls[0][1]["hermes"]["category"] == "smart-weather"
+    assert calls[0][1]["hermes"]["owner_id"] == "owner-a"
+    assert calls[0][1]["hermes"]["account_generation"] == "acctgen_test"
+    assert calls[0][1]["hermes"]["event_key"] == "forecast-1"
     assert calls[0][2] == account_notification_collapse_id(
         "smart-weather",
         "forecast-1",
@@ -192,11 +195,16 @@ def test_account_deletion_push_is_silent_and_targets_every_active_device(monkeyp
 
     assert result["state"] == "delivered"
     assert [item[0] for item in calls] == ["registration-a", "registration-b"]
+    expected = build_account_deletion_payload(
+        owner_scope="https://hermes.example|owner-a",
+        valid_until=1_900_000_000,
+    )
+    assert all(item[1]["aps"] == expected["aps"] for item in calls)
+    assert all(item[1]["hermes"]["data"] == expected["hermes"]["data"] for item in calls)
+    assert all(item[1]["hermes"]["owner_id"] == "owner-a" for item in calls)
+    assert all(item[1]["hermes"]["account_generation"] == "acctgen_test" for item in calls)
     assert all(
-        item[1] == build_account_deletion_payload(
-            owner_scope="https://hermes.example|owner-a",
-            valid_until=1_900_000_000,
-        )
+        item[1]["hermes"]["event_key"] == "account-deletion:"
         for item in calls
     )
     assert all(
@@ -209,7 +217,14 @@ def test_account_deletion_push_is_silent_and_targets_every_active_device(monkeyp
 
 class _DeviceStore:
     def __init__(self, registrations):
-        self.registrations = registrations
+        self.registrations = [
+            {
+                "user_id": "owner-a",
+                "account_generation": "acctgen_test",
+                **registration,
+            }
+            for registration in registrations
+        ]
         self.disabled = []
 
     def list_active_apns_registrations(self, *, user_id, environment):

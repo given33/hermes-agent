@@ -23,7 +23,7 @@ def _make_mcp_tool(name="read_file", description="Read a file", input_schema=Non
     tool = SimpleNamespace()
     tool.name = name
     tool.description = description
-    tool.inputSchema = input_schema or {
+    tool.input_schema = input_schema or {
         "type": "object",
         "properties": {
             "path": {"type": "string", "description": "File path"},
@@ -36,7 +36,7 @@ def _make_mcp_tool(name="read_file", description="Read a file", input_schema=Non
 def _make_call_result(text="file contents here", is_error=False):
     """Create a fake MCP CallToolResult."""
     block = SimpleNamespace(text=text)
-    return SimpleNamespace(content=[block], isError=is_error)
+    return SimpleNamespace(content=[block], is_error=is_error, structured_content=None)
 
 
 def _make_mock_server(name, session=None, tools=None):
@@ -242,7 +242,7 @@ class TestSchemaConversion:
         from tools.mcp_tool import _convert_mcp_schema
 
         mcp_tool = _make_mcp_tool(name="ping", description="Ping", input_schema=None)
-        mcp_tool.inputSchema = None
+        mcp_tool.input_schema = None
         schema = _convert_mcp_schema("test", mcp_tool)
 
         assert schema["parameters"]["type"] == "object"
@@ -542,7 +542,7 @@ class TestSchemaConversion:
         }
 
     def test_convert_mcp_schema_survives_missing_inputschema_attribute(self):
-        """A Tool object without .inputSchema must not crash registration."""
+        """A Tool object without .input_schema must not crash registration."""
         import types
 
         from tools.mcp_tool import _convert_mcp_schema
@@ -554,14 +554,14 @@ class TestSchemaConversion:
         assert schema["parameters"] == {"type": "object", "properties": {}}
 
     def test_convert_mcp_schema_with_none_inputschema(self):
-        """Tool with inputSchema=None produces a valid empty object schema."""
+        """Tool with input_schema=None produces a valid empty object schema."""
         import types
 
         from tools.mcp_tool import _convert_mcp_schema
 
         # Note: _make_mcp_tool(input_schema=None) falls back to a default —
-        # build the namespace directly so .inputSchema really is None.
-        mcp_tool = types.SimpleNamespace(name="probe", description="Probe", inputSchema=None)
+        # build the namespace directly so .input_schema really is None.
+        mcp_tool = types.SimpleNamespace(name="probe", description="Probe", input_schema=None)
         schema = _convert_mcp_schema("srv", mcp_tool)
 
         assert schema["parameters"] == {"type": "object", "properties": {}}
@@ -994,6 +994,109 @@ class TestRunOnMCPLoopInterrupts:
 # ---------------------------------------------------------------------------
 
 class TestDiscoverAndRegister:
+    def test_authoritative_disabled_server_is_drained_without_replacement(
+        self, monkeypatch,
+    ):
+        from tools import mcp_tool
+
+        name = "disabled-authoritative"
+        old = mcp_tool.MCPServerTask(name)
+        old.session = object()
+        old._registered_tool_names = []
+        mcp_tool._servers[name] = old
+        mcp_tool._server_config_fingerprints[name] = "old"
+        connect_calls = []
+        monkeypatch.setattr(mcp_tool, "_MCP_AVAILABLE", True)
+        monkeypatch.setattr(mcp_tool, "_filter_suspicious_mcp_servers", lambda value: value)
+        monkeypatch.setattr(mcp_tool, "_ensure_mcp_loop", lambda: None)
+        monkeypatch.setattr(
+            mcp_tool,
+            "_run_on_mcp_loop",
+            lambda factory, timeout=30: asyncio.run(factory()),
+        )
+        monkeypatch.setattr(
+            mcp_tool,
+            "_connect_server",
+            lambda *args, **kwargs: connect_calls.append((args, kwargs)),
+        )
+        try:
+            assert mcp_tool.register_mcp_servers(
+                {name: {"url": "http://disabled.test/mcp", "enabled": False}},
+                authoritative=True,
+            ) == []
+            assert name not in mcp_tool._servers
+            assert old.accepting_calls is False
+            assert old._shutdown_event.is_set()
+            assert connect_calls == []
+        finally:
+            mcp_tool._servers.pop(name, None)
+            mcp_tool._server_config_fingerprints.pop(name, None)
+
+    def test_authoritative_empty_config_retires_old_server(self, monkeypatch):
+        from tools import mcp_tool
+
+        name = "removed-authoritative"
+        old = mcp_tool.MCPServerTask(name)
+        old.session = object()
+        old._registered_tool_names = []
+        mcp_tool._servers[name] = old
+        monkeypatch.setattr(mcp_tool, "_MCP_AVAILABLE", True)
+        monkeypatch.setattr(mcp_tool, "_filter_suspicious_mcp_servers", lambda value: value)
+        monkeypatch.setattr(mcp_tool, "_ensure_mcp_loop", lambda: None)
+        monkeypatch.setattr(
+            mcp_tool,
+            "_run_on_mcp_loop",
+            lambda factory, timeout=30: asyncio.run(factory()),
+        )
+        try:
+            assert mcp_tool.register_mcp_servers({}, authoritative=True) == []
+            assert name not in mcp_tool._servers
+            assert old._shutdown_event.is_set()
+        finally:
+            mcp_tool._servers.pop(name, None)
+
+    def test_connecting_server_is_singleflight(self, monkeypatch):
+        from tools import mcp_tool
+
+        name = "singleflight"
+        monkeypatch.setattr(mcp_tool, "_MCP_AVAILABLE", True)
+        monkeypatch.setattr(mcp_tool, "_filter_suspicious_mcp_servers", lambda value: value)
+        monkeypatch.setattr(mcp_tool, "_existing_tool_names", lambda: [])
+        with mcp_tool._lock:
+            mcp_tool._server_connecting.add(name)
+        try:
+            with patch.object(mcp_tool, "_run_on_mcp_loop") as run_on_loop:
+                assert mcp_tool.register_mcp_servers(
+                    {name: {"url": "http://singleflight.test/mcp"}}
+                ) == []
+            run_on_loop.assert_not_called()
+        finally:
+            with mcp_tool._lock:
+                mcp_tool._server_connecting.discard(name)
+
+    def test_weather_capability_selects_only_location_weather_and_route(self):
+        from tools.mcp_tool import select_mcp_servers_for_capabilities
+
+        configs = {
+            name: {"url": f"http://{name}.test/mcp"}
+            for name in (
+                "ios-location", "qweather", "amap-route", "ios-motion",
+                "ios-calendar", "ios-health-heart",
+            )
+        }
+        configs["disabled-weather"] = {
+            "url": "http://disabled.test/mcp",
+            "enabled": False,
+            "capability_hints": ["ios.weather"],
+        }
+
+        selected = select_mcp_servers_for_capabilities(
+            configs,
+            ["ios.weather"],
+        )
+
+        assert set(selected) == {"ios-location", "qweather", "amap-route"}
+
     def test_changed_endpoint_reloads_existing_server_task(self, monkeypatch):
         from tools import mcp_tool
 
@@ -1127,6 +1230,9 @@ class TestDiscoverAndRegister:
             server = MCPServerTask(name)
             server.session = mock_session
             server._tools = mock_tools
+            server.discover_result = SimpleNamespace(
+                capabilities=SimpleNamespace(resources=object(), prompts=object())
+            )
             return server
 
         with patch("tools.mcp_tool._connect_server", side_effect=fake_connect), \
@@ -1233,7 +1339,10 @@ class TestMCPServerTask:
 
         mock_tools = [_make_mcp_tool("echo")]
         mock_session = MagicMock()
-        mock_session.initialize = AsyncMock()
+        mock_session.discover = AsyncMock(
+            return_value=SimpleNamespace(capabilities=SimpleNamespace(tools=object()))
+        )
+        mock_session.discover_result = None
         mock_session.list_tools = AsyncMock(
             return_value=SimpleNamespace(tools=mock_tools)
         )
@@ -1248,7 +1357,7 @@ class TestMCPServerTask:
                 assert server.session is mock_session
                 assert len(server._tools) == 1
                 assert server._tools[0].name == "echo"
-                mock_session.initialize.assert_called_once()
+                mock_session.discover.assert_called_once()
 
                 await server.shutdown()
                 assert server.session is None
@@ -1276,6 +1385,11 @@ class TestMCPServerTask:
         server._config = {"command": "test"}
         server._tools = [_make_mcp_tool("old"), _make_mcp_tool("keep")]
         server._registered_tool_names = ["mcp__srv__old", "mcp__srv__keep"]
+        server.discover_result = SimpleNamespace(
+            capabilities=SimpleNamespace(
+                tools=object(), resources=object(), prompts=object()
+            )
+        )
         server.session = MagicMock()
         server.session.list_tools = AsyncMock(
             return_value=SimpleNamespace(tools=[_make_mcp_tool("keep"), _make_mcp_tool("new")])
@@ -1371,7 +1485,10 @@ class TestMCPServerTask:
         from tools.mcp_tool import MCPServerTask
 
         mock_session = MagicMock()
-        mock_session.initialize = AsyncMock()
+        mock_session.discover = AsyncMock(
+            return_value=SimpleNamespace(capabilities=SimpleNamespace(tools=object()))
+        )
+        mock_session.discover_result = None
         mock_session.list_tools = AsyncMock(
             return_value=SimpleNamespace(tools=[])
         )
@@ -1402,7 +1519,10 @@ class TestMCPServerTask:
         from tools.mcp_tool import MCPServerTask
 
         mock_session = MagicMock()
-        mock_session.initialize = AsyncMock()
+        mock_session.discover = AsyncMock(
+            return_value=SimpleNamespace(capabilities=SimpleNamespace(tools=object()))
+        )
+        mock_session.discover_result = None
         mock_session.list_tools = AsyncMock(
             return_value=SimpleNamespace(tools=[])
         )
@@ -1530,6 +1650,9 @@ class TestToolsetInjection:
             server = MCPServerTask(name)
             server.session = mock_session
             server._tools = mock_tools
+            server.discover_result = SimpleNamespace(
+                capabilities=SimpleNamespace(resources=object(), prompts=object())
+            )
             return server
 
         fake_config = {"fs": {"command": "npx", "args": []}}
@@ -2043,8 +2166,8 @@ class TestHTTPConfig:
 
         asyncio.run(_test())
 
-    def test_http_seeds_initial_protocol_header(self):
-        from tools.mcp_tool import LATEST_PROTOCOL_VERSION, MCPServerTask
+    def test_http_uses_v2_transport_without_static_protocol_header(self):
+        from tools.mcp_tool import MCPServerTask
 
         server = MCPServerTask("remote")
         captured = {}
@@ -2061,7 +2184,7 @@ class TestHTTPConfig:
 
         class DummyTransportCtx:
             async def __aenter__(self):
-                return MagicMock(), MagicMock(), (lambda: None)
+                return MagicMock(), MagicMock()
 
             async def __aexit__(self, exc_type, exc, tb):
                 return False
@@ -2076,58 +2199,36 @@ class TestHTTPConfig:
             async def __aexit__(self, exc_type, exc, tb):
                 return False
 
-            async def initialize(self):
-                return None
-
-        class DummyLegacyTransportCtx:
-            def __init__(self, **kwargs):
-                captured["legacy_headers"] = kwargs.get("headers")
-
-            async def __aenter__(self):
-                return MagicMock(), MagicMock(), (lambda: None)
-
-            async def __aexit__(self, exc_type, exc, tb):
-                return False
+            async def discover(self):
+                return SimpleNamespace(capabilities=SimpleNamespace(tools=object()))
 
         async def _discover_tools(self):
             self._shutdown_event.set()
 
-        async def _run(config, *, new_http):
+        async def _run(config):
             captured.clear()
             with patch("tools.mcp_tool._MCP_HTTP_AVAILABLE", True), \
-                 patch("tools.mcp_tool._MCP_NEW_HTTP", new_http), \
-                 patch("httpx.AsyncClient", DummyAsyncClient), \
+                 patch("httpx2.AsyncClient", DummyAsyncClient), \
                  patch("tools.mcp_tool.streamable_http_client", return_value=DummyTransportCtx()), \
-                 patch("tools.mcp_tool.streamablehttp_client", side_effect=lambda url, **kwargs: DummyLegacyTransportCtx(**kwargs)), \
                  patch("tools.mcp_tool.ClientSession", DummySession), \
                  patch.object(MCPServerTask, "_discover_tools", _discover_tools):
                 await server._run_http(config)
 
-        asyncio.run(_run({"url": "https://example.com/mcp"}, new_http=True))
-        assert captured["headers"]["mcp-protocol-version"] == LATEST_PROTOCOL_VERSION
+        asyncio.run(_run({"url": "https://example.com/mcp"}))
+        assert "headers" not in captured
 
         asyncio.run(_run({
             "url": "https://example.com/mcp",
             "headers": {"mcp-protocol-version": "custom-version"},
-        }, new_http=True))
+        }))
         assert captured["headers"]["mcp-protocol-version"] == "custom-version"
 
         asyncio.run(_run({
             "url": "https://example.com/mcp",
             "headers": {"MCP-Protocol-Version": "custom-version"},
-        }, new_http=True))
+        }))
         assert captured["headers"]["MCP-Protocol-Version"] == "custom-version"
         assert "mcp-protocol-version" not in captured["headers"]
-
-        asyncio.run(_run({"url": "https://example.com/mcp"}, new_http=False))
-        assert captured["legacy_headers"]["mcp-protocol-version"] == LATEST_PROTOCOL_VERSION
-
-        asyncio.run(_run({
-            "url": "https://example.com/mcp",
-            "headers": {"MCP-Protocol-Version": "custom-version"},
-        }, new_http=False))
-        assert captured["legacy_headers"]["MCP-Protocol-Version"] == "custom-version"
-        assert "mcp-protocol-version" not in captured["legacy_headers"]
 
 
 # ---------------------------------------------------------------------------
@@ -2588,7 +2689,7 @@ class TestUtilityHandlers:
 
         mock_resource = SimpleNamespace(
             uri="file:///tmp/test.txt", name="test.txt",
-            description="A test file", mimeType="text/plain",
+            description="A test file", mime_type="text/plain",
         )
         mock_session = MagicMock()
         mock_session.list_resources = AsyncMock(
@@ -2827,6 +2928,9 @@ class TestUtilityToolRegistration:
             server = MCPServerTask(name)
             server.session = mock_session
             server._tools = mock_tools
+            server.discover_result = SimpleNamespace(
+                capabilities=SimpleNamespace(resources=object(), prompts=object())
+            )
             return server
 
         with patch("tools.mcp_tool._connect_server", side_effect=fake_connect), \
@@ -2862,6 +2966,9 @@ class TestUtilityToolRegistration:
             server = MCPServerTask(name)
             server.session = mock_session
             server._tools = []
+            server.discover_result = SimpleNamespace(
+                capabilities=SimpleNamespace(resources=object(), prompts=object())
+            )
             return server
 
         with patch("tools.mcp_tool._connect_server", side_effect=fake_connect), \
@@ -2891,6 +2998,9 @@ class TestUtilityToolRegistration:
             server = MCPServerTask(name)
             server.session = mock_session
             server._tools = []
+            server.discover_result = SimpleNamespace(
+                capabilities=SimpleNamespace(resources=object(), prompts=object())
+            )
             return server
 
         with patch("tools.mcp_tool._connect_server", side_effect=fake_connect), \
@@ -3185,7 +3295,7 @@ class TestConvertMessages:
 
     def test_image_message(self):
         text_block = SimpleNamespace(text="Look at this")
-        img_block = SimpleNamespace(data="abc123", mimeType="image/png")
+        img_block = SimpleNamespace(data="abc123", mime_type="image/png")
         msg = SimpleNamespace(
             role="user",
             content=[text_block, img_block],
@@ -3286,7 +3396,7 @@ class TestSamplingCallbackText:
         assert result.content.text == "Hello from LLM"
         assert result.model == "test-model"
         assert result.role == "assistant"
-        assert result.stopReason == "endTurn"
+        assert result.stop_reason == "endTurn"
 
     def test_system_prompt_prepended(self):
         """System prompt is inserted as the first message."""
@@ -3311,7 +3421,7 @@ class TestSamplingCallbackText:
         server_tool = SimpleNamespace(
             name="ask",
             description="Ask Crawl4AI",
-            inputSchema={"type": "object"},
+            input_schema={"type": "object"},
         )
 
         with patch(
@@ -3346,7 +3456,7 @@ class TestSamplingCallbackText:
             result = asyncio.run(self.handler(None, params))
 
         assert isinstance(result, CreateMessageResult)
-        assert result.stopReason == "maxTokens"
+        assert result.stop_reason == "maxTokens"
 
 
 # ---------------------------------------------------------------------------
@@ -3370,7 +3480,7 @@ class TestSamplingCallbackToolUse:
             result = asyncio.run(self.handler(None, params))
 
         assert isinstance(result, CreateMessageResultWithTools)
-        assert result.stopReason == "toolUse"
+        assert result.stop_reason == "toolUse"
         assert result.model == "test-model"
         assert len(result.content) == 1
         tc = result.content[0]
@@ -3926,20 +4036,25 @@ class TestDiscoveryFailedCount:
 class TestMCPSelectiveToolLoading:
     """Tests for per-server MCP filtering and utility tool policies."""
 
-    def _make_server(self, name, tool_names, session=None):
+    def _make_server(self, name, tool_names, session=None, capabilities=None):
         server = _make_mock_server(
             name,
             session=session or SimpleNamespace(),
             tools=[_make_mcp_tool(n, n) for n in tool_names],
         )
+        server.discover_result = SimpleNamespace(
+            capabilities=capabilities or SimpleNamespace()
+        )
         return server
 
-    def _run_discover(self, name, tool_names, config, session=None):
+    def _run_discover(self, name, tool_names, config, session=None, capabilities=None):
         from tools.registry import ToolRegistry
         from tools.mcp_tool import _discover_and_register_server, _servers
 
         mock_registry = ToolRegistry()
-        server = self._make_server(name, tool_names, session=session)
+        server = self._make_server(
+            name, tool_names, session=session, capabilities=capabilities
+        )
 
         async def fake_connect(_name, _config):
             return server
@@ -4047,6 +4162,7 @@ class TestMCPSelectiveToolLoading:
             ["create_service"],
             {"url": "https://mcp.example.com"},
             session=session,
+            capabilities=SimpleNamespace(resources=object()),
         )
         assert "mcp__ink_resources_only__create_service" in registered
         assert "mcp__ink_resources_only__list_resources" in registered

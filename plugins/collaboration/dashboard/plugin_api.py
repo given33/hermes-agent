@@ -12,7 +12,7 @@ import asyncio
 from copy import deepcopy
 from collections import Counter
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from contextlib import asynccontextmanager, redirect_stderr, redirect_stdout
+from contextlib import asynccontextmanager, contextmanager, redirect_stderr, redirect_stdout
 import hashlib
 import hmac
 import inspect
@@ -34,12 +34,19 @@ from pathlib import Path
 from typing import Any, Callable, Optional
 from urllib.parse import quote, unquote
 
+from hermes_services.startup import bootstrap_trusted_runtime
+
+# This module can be loaded directly from a dashboard manifest. Seal trusted
+# state before importing runtime fallbacks or executing plugin-owned code.
+bootstrap_trusted_runtime()
+
 from fastapi import APIRouter, Header, HTTPException, Request
-from fastapi.responses import FileResponse, StreamingResponse
+from fastapi.responses import FileResponse, Response, StreamingResponse
 from pydantic import BaseModel, Field
 
 try:
     from hermes_cli.cloud_file_library import (
+        account_generation_from_request,
         CloudFileLibrary,
         LOCAL_OWNER_ID,
         owner_id_from_request,
@@ -69,14 +76,75 @@ except ModuleNotFoundError as exc:
     sys.modules[runtime_spec.name] = runtime_library
     runtime_spec.loader.exec_module(runtime_library)
     CloudFileLibrary = runtime_library.CloudFileLibrary
+    account_generation_from_request = runtime_library.account_generation_from_request
     LOCAL_OWNER_ID = runtime_library.LOCAL_OWNER_ID
     owner_id_from_request = runtime_library.owner_id_from_request
     parse_date_filter = runtime_library.parse_date_filter
 from hermes_runtime.config import get_hermes_home
+from hermes_cli.account_lifecycle import account_lifecycle_commit_guard
 from hermes_cli.profiles import list_profiles
+from hermes_services.hosted_event_protocol import (
+    append_hosted_event as _append_hosted_event_protocol,
+    dispatch_persisted_hosted_event_hooks,
+    drop_account_persistence_hook_work,
+    hosted_event_page,
+    normalize_legacy_profile_event,
+    preserve_persistence_hook_outbox,
+    state_with_persistence_hook_outbox,
+)
+from hermes_services.session_entries import (
+    append_message_stream_entries,
+    append_session_entry,
+    entries_after,
+    normalize_session_entries,
+)
+from hermes_services.tool_output_artifacts import EncryptedToolArtifactStore
 
 
 _WRITE_APPROVAL_RECOVERY_INTERVAL_SECONDS = 5.0
+_TOOL_ARTIFACT_CLEANUP_INTERVAL_SECONDS = 60 * 60
+_ACCOUNT_DELETION_STORE_LOCK = threading.Lock()
+_ACCOUNT_DELETION_STORES: dict[str, Any] = {}
+
+
+def _account_generation_for_owner(owner_id: str) -> str:
+    normalized = str(owner_id or "").strip()
+    if normalized == LOCAL_OWNER_ID:
+        return "local-owner-generation"
+    if not normalized:
+        raise RuntimeError("authenticated owner generation is required")
+    from hermes_cli.dashboard_auth.mobile_device_store import MobileDeviceStore
+
+    try:
+        return MobileDeviceStore().account_generation(normalized, create=True)
+    except PermissionError as exc:
+        raise HTTPException(
+            status_code=410,
+            detail="Account deletion is in progress",
+        ) from exc
+
+
+def _account_generation_for_request(request: Request, owner_id: str) -> str:
+    """Validate the authenticated generation against the current account."""
+
+    live_generation = _account_generation_for_owner(owner_id)
+    authenticated_generation = account_generation_from_request(request)
+    principal = getattr(getattr(request, "state", None), "token_principal", None)
+    if (
+        getattr(principal, "provider", "") == "owner-mobile"
+        and authenticated_generation != live_generation
+    ):
+        raise HTTPException(status_code=410, detail="Account generation is no longer active")
+    if authenticated_generation not in {"legacy", live_generation}:
+        raise HTTPException(status_code=410, detail="Account generation is no longer active")
+    return live_generation
+
+
+def _account_generation_for_conversation(conversation: dict[str, Any]) -> str:
+    """Return the boundary captured when the conversation was created."""
+
+    generation = str(conversation.get("account_generation") or "").strip()
+    return generation or "legacy"
 
 
 async def _run_mobile_write_approval_recovery_loop(stop: asyncio.Event) -> None:
@@ -96,6 +164,27 @@ async def _run_mobile_write_approval_recovery_loop(stop: asyncio.Event) -> None:
         except Exception:
             logging.getLogger(__name__).exception(
                 "Failed to recover mobile write approvals"
+            )
+
+
+def _purge_expired_tool_output_artifacts() -> dict[str, int]:
+    return EncryptedToolArtifactStore(Path(get_hermes_home())).purge_expired()
+
+
+async def _run_tool_artifact_cleanup_loop(stop: asyncio.Event) -> None:
+    while not stop.is_set():
+        try:
+            await asyncio.wait_for(
+                stop.wait(), timeout=_TOOL_ARTIFACT_CLEANUP_INTERVAL_SECONDS
+            )
+            return
+        except asyncio.TimeoutError:
+            pass
+        try:
+            await asyncio.to_thread(_purge_expired_tool_output_artifacts)
+        except Exception:
+            logging.getLogger(__name__).exception(
+                "Failed to purge expired encrypted tool output artifacts"
             )
 
 
@@ -122,21 +211,37 @@ async def collaboration_dashboard_lifespan(_app):
         logging.getLogger(__name__).exception(
             "Failed to recover mobile write approvals during startup"
         )
+    try:
+        await asyncio.to_thread(_purge_expired_tool_output_artifacts)
+    except Exception:
+        logging.getLogger(__name__).exception(
+            "Failed to purge expired encrypted tool output artifacts during startup"
+        )
     recovery_stop = asyncio.Event()
     recovery_task = asyncio.create_task(
         _run_mobile_write_approval_recovery_loop(recovery_stop)
+    )
+    artifact_cleanup_task = asyncio.create_task(
+        _run_tool_artifact_cleanup_loop(recovery_stop)
     )
     try:
         yield
     finally:
         recovery_stop.set()
-        await asyncio.gather(recovery_task, return_exceptions=True)
+        await asyncio.gather(
+            recovery_task, artifact_cleanup_task, return_exceptions=True
+        )
 
 
 router = APIRouter(lifespan=collaboration_dashboard_lifespan)
 _STATE_LOCK = threading.RLock()
 _HOSTED_THREADS_LOCK = threading.Lock()
 _HOSTED_THREADS: dict[str, threading.Thread] = {}
+_HOSTED_ROUTING_THREADS_LOCK = threading.Lock()
+_HOSTED_ROUTING_THREADS: dict[str, threading.Thread] = {}
+_HOSTED_EXECUTION_GENERATION = threading.local()
+_COLLABORATION_DELETION_WRITE = threading.local()
+_ACCOUNT_DELETION_TOMBSTONES_KEY = "account_deletion_tombstones"
 _HOSTED_CONVERSATION_LOCKS_LOCK = threading.Lock()
 _HOSTED_CONVERSATION_LOCKS: dict[str, threading.Lock] = {}
 _MOBILE_NOTIFICATION_DISPATCH_CONDITION = threading.Condition()
@@ -152,8 +257,10 @@ _MOBILE_NOTIFICATION_TERMINAL_STATUSES = {
 }
 _HOSTED_TRANSIENT_RETRIES = 1
 _HOSTED_CHAT_API_ATTEMPTS = 5
-_HOSTED_CHAT_API_RETRY_DELAY_SECONDS = 60
+_HOSTED_CHAT_API_RETRY_DELAY_SECONDS = 15
+_HOSTED_CHAT_MODEL_BUDGET_SECONDS = 120
 _HOSTED_CHAT_TIMEOUT_SECONDS = 10 * 60
+_HOSTED_STDERR_TAIL_CHARS = 64 * 1024
 _HOSTED_REWORK_LIMIT = 2
 _HOSTED_EVENT_FLUSH_SECONDS = 0.45
 _MODEL_NOT_CONFIGURED_CODE = "model_not_configured"
@@ -161,9 +268,10 @@ _MODEL_NOT_CONFIGURED_MESSAGE = "尚未配置可用模型。请先在“模型�
 _RUNTIME_RUN_STALE_AFTER_MS = 30 * 60 * 1000
 _HOSTED_TURN_STALE_AFTER_MS = 36 * 60 * 60 * 1000
 _REMOTE_CONTRACT_VERSION = 2
-_REMOTE_TERMINAL_STATUSES = {"completed", "failed", "cancelled"}
+_REMOTE_TERMINAL_STATUSES = {"completed", "failed", "cancelled", "timed_out"}
 _REMOTE_ARTIFACT_ACTIVE_STATUSES = {"leased", "running"}
 _REMOTE_RUN_LEASE_SECONDS = 60
+_REMOTE_CANCELLATION_GRACE_SECONDS = 60
 _MAX_REMOTE_RUNS_PER_PULL = 20
 _PROMPT_HISTORY = 24
 _MAX_ATTACHMENT_BYTES = 64 * 1024 * 1024
@@ -171,6 +279,186 @@ _MAX_CONVERSATION_TITLE_CHARS = 18
 _ATTACHMENT_BUCKETS = {"uploads", "outputs"}
 _ACCOUNT_FILE_MIGRATION_LOCK = threading.Lock()
 _ACCOUNT_FILE_MIGRATION_VERSION = "conversation-files-v1"
+
+
+def append_hosted_event(
+    conversation: dict[str, Any],
+    **kwargs: Any,
+):
+    """Append a canonical event and its durable session-history projection."""
+
+    result = _append_hosted_event_protocol(conversation, **kwargs)
+    if not result.appended:
+        return result
+    event_type = str(kwargs.get("event_type") or "").strip().lower()
+    if not (
+        event_type.startswith("intervention.")
+        or event_type in {
+            "role.handoff",
+            "role.rework_requested",
+            "turn.completed",
+            "turn.failed",
+            "turn.cancelled",
+        }
+    ):
+        return result
+    payload = (
+        dict(kwargs.get("payload"))
+        if isinstance(kwargs.get("payload"), dict)
+        else {}
+    )
+    entity_id = str(
+        kwargs.get("entity_id")
+        or payload.get("entity_id")
+        or kwargs.get("turn_id")
+        or ""
+    ).strip()
+    event_key = str(
+        (result.event if isinstance(result.event, dict) else {}).get(
+            "idempotency_key"
+        )
+        or kwargs.get("idempotency_key")
+        or f"{event_type}:{entity_id}"
+    )
+    occurred_at = int(
+        (result.event if isinstance(result.event, dict) else {}).get("occurred_at")
+        or kwargs.get("occurred_at")
+        or time.time() * 1000
+    )
+    if event_type.startswith("intervention."):
+        entry_type = "intervention"
+    elif event_type in {"role.handoff", "role.rework_requested"}:
+        entry_type = (
+            "collaboration_lift"
+            if str(payload.get("action") or "") == "collaboration_lift"
+            else "role_handoff"
+        )
+    else:
+        entry_type = "terminal_state"
+        payload.setdefault("status", event_type.removeprefix("turn."))
+    append_session_entry(
+        conversation,
+        entry_type=entry_type,
+        idempotency_key=f"hosted-event:{event_key}",
+        payload={
+            **payload,
+            "event_type": event_type,
+            "entity_id": entity_id,
+            "turn_id": str(kwargs.get("turn_id") or ""),
+            "role_stage": str(kwargs.get("role_stage") or "chat"),
+        },
+        occurred_at=occurred_at,
+    )
+    return result
+
+
+def _append_attachment_session_entries(
+    conversation: dict[str, Any],
+    *,
+    turn_id: str,
+    role_stage: str,
+    attachments: Any,
+    direction: str,
+    occurred_at: int,
+) -> None:
+    for raw in attachments if isinstance(attachments, list) else []:
+        item = dict(raw) if isinstance(raw, dict) else {"id": str(raw or "")}
+        attachment_id = str(item.get("id") or item.get("file_id") or "").strip()
+        if not attachment_id:
+            continue
+        try:
+            attachment_size = max(0, int(item.get("size") or 0))
+        except (TypeError, ValueError, OverflowError):
+            attachment_size = 0
+        append_session_entry(
+            conversation,
+            entry_type="attachment",
+            idempotency_key=(
+                f"attachment:{turn_id}:{direction}:{attachment_id}"
+            ),
+            payload={
+                "attachment_id": attachment_id,
+                "turn_id": str(turn_id or ""),
+                "role_stage": str(role_stage or "chat"),
+                "direction": str(direction or "input"),
+                "name": str(item.get("name") or item.get("filename") or "")[:240],
+                "mime_type": str(item.get("mime_type") or "")[:120],
+                "sha256": str(item.get("sha256") or "")[:64],
+                "size": attachment_size,
+            },
+            occurred_at=occurred_at,
+        )
+
+
+def _append_canonical_turn_terminal(
+    conversation: dict[str, Any],
+    *,
+    conversation_id: str,
+    turn_id: str,
+    run: dict[str, Any],
+    occurred_at: int,
+) -> None:
+    status = str(run.get("status") or "").strip().lower()
+    if status not in _HOSTED_TERMINAL_STATUSES:
+        return
+    for message in conversation.get("messages") or []:
+        if not isinstance(message, dict):
+            continue
+        meta = message.get("meta") if isinstance(message.get("meta"), dict) else {}
+        message_key = str(meta.get("message_key") or "")
+        if (
+            str(meta.get("runtime_turn_id") or "").strip() != turn_id
+            and not message_key.startswith(f"{turn_id}:")
+        ):
+            continue
+        message_id = str(message.get("id") or "").strip()
+        if not message_id:
+            continue
+        message_status = str(message.get("status") or status).strip().lower()
+        if message_status not in _HOSTED_TERMINAL_STATUSES:
+            message_status = status
+        append_message_stream_entries(
+            conversation,
+            message_id=message_id,
+            previous_content=str(message.get("content") or ""),
+            current_content=str(message.get("content") or ""),
+            status=message_status,
+            role=str(message.get("role") or "assistant"),
+            name=str(message.get("name") or ""),
+            kind=str(message.get("kind") or "message"),
+            turn_id=turn_id,
+            role_stage=str(meta.get("role_stage") or "chat"),
+            occurred_at=occurred_at,
+        )
+        _append_attachment_session_entries(
+            conversation,
+            turn_id=turn_id,
+            role_stage=str(meta.get("role_stage") or "chat"),
+            attachments=meta.get("attachments"),
+            direction="output",
+            occurred_at=occurred_at,
+        )
+    event_type = f"turn.{status}"
+    append_hosted_event(
+        conversation,
+        conversation_id=conversation_id,
+        turn_id=turn_id,
+        role_stage="turn",
+        event_type=event_type,
+        entity_id=turn_id,
+        idempotency_key=f"turn:{turn_id}:{event_type}",
+        account_generation=_account_generation_for_owner(
+            str(conversation.get("owner_id") or LOCAL_OWNER_ID)
+        ),
+        payload={
+            "entity_id": turn_id,
+            "status": status,
+            "stage": str(run.get("stage") or status),
+            "error": str(run.get("error") or "")[:4000],
+            "terminal_commit_id": str(run.get("terminal_commit_id") or ""),
+        },
+        occurred_at=occurred_at,
+    )
 
 
 class _HostedTurnCancelled(RuntimeError):
@@ -270,6 +558,42 @@ _SIMPLE_CHAT_MARKERS = (
     "总结一下",
     "聊聊",
 )
+_HARD_WORK_MARKERS = (
+    "帮我修改",
+    "请修改",
+    "修复",
+    "部署",
+    "安装",
+    "运行测试",
+    "执行测试",
+    "实现",
+    "构建",
+    "迁移",
+    "回滚",
+    "生成文件",
+    "modify",
+    "fix",
+    "deploy",
+    "install",
+    "run tests",
+    "implement",
+    "build",
+    "migrate",
+    "rollback",
+)
+_EXPLANATION_MARKERS = (
+    "如何",
+    "怎么",
+    "为什么",
+    "解释",
+    "介绍",
+    "是什么",
+    "how to",
+    "how does",
+    "why ",
+    "what is",
+    "explain",
+)
 _MULTI_STEP_MARKERS = (
     "然后",
     "接着",
@@ -361,19 +685,35 @@ _ARTIFACT_ACTION_MARKERS = (
 )
 _ARTIFACT_NOUN_MARKERS = (
     "文档",
-    "报告",
     "表格",
     "图片",
     "文件",
     "附件",
     "file",
     "document",
-    "report",
     "spreadsheet",
     "image",
     "attachment",
     "deliverable",
     "archive",
+)
+_AMBIGUOUS_ARTIFACT_NOUN_MARKERS = ("报告", "report")
+_ARTIFACT_TRANSFER_ACTION_MARKERS = (
+    "导出",
+    "保存为",
+    "保存成",
+    "打包",
+    "下载",
+    "发给我",
+    "上传给我",
+    "交付",
+    "export",
+    "save as",
+    "send me",
+    "upload",
+    "deliver",
+    "attach",
+    "package",
 )
 
 
@@ -630,6 +970,30 @@ def _ensure_hosted_output_baseline(
     run["output_baseline_captured_at"] = int(time.time() * 1000)
 
 
+def _sha256_path(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        while chunk := handle.read(256 * 1024):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def _attachment_upload_contract(request: Request) -> tuple[int | None, str]:
+    declared_length = request.headers.get("content-length")
+    expected_bytes: int | None = None
+    if declared_length is not None:
+        normalized_length = declared_length.strip()
+        if not normalized_length.isdigit():
+            raise HTTPException(status_code=422, detail="Invalid Content-Length")
+        expected_bytes = int(normalized_length)
+        if expected_bytes > _MAX_ATTACHMENT_BYTES:
+            raise HTTPException(status_code=413, detail="Attachment exceeds 64 MB")
+    expected_sha = str(request.headers.get("x-content-sha256") or "").strip().lower()
+    if expected_sha and not re.fullmatch(r"[a-f0-9]{64}", expected_sha):
+        raise HTTPException(status_code=422, detail="X-Content-SHA256 must be a SHA-256 hex digest")
+    return expected_bytes, expected_sha
+
+
 def _attachment_record(
     conversation_id: str,
     bucket: str,
@@ -649,6 +1013,7 @@ def _attachment_record(
         "relative_path": relative_path.as_posix(),
         "size": stat.st_size,
         "mime_type": mime_type,
+        "sha256": _sha256_path(path),
         "updated_at": int(stat.st_mtime * 1000),
         "download_url": (
             "/api/plugins/collaboration/single/conversations/"
@@ -679,13 +1044,22 @@ def _list_conversation_attachments(conversation_id: str) -> list[dict[str, Any]]
                 else ""
             )
         if owner_id and isinstance(conversation, dict):
+            account_generation = _account_generation_for_conversation(conversation)
             try:
-                _sync_conversation_files(owner_id, conversation)
+                _sync_conversation_files(
+                    owner_id,
+                    conversation,
+                    account_generation=account_generation,
+                )
             except Exception:
                 logging.getLogger(__name__).exception(
                     "Failed to publish conversation files into account library"
                 )
-            return _conversation_library_attachments(owner_id, conversation_id)
+            return _conversation_library_attachments(
+                owner_id,
+                conversation_id,
+                account_generation=account_generation,
+            )
     except Exception:
         logging.getLogger(__name__).exception(
             "Failed to resolve conversation file ownership"
@@ -721,6 +1095,13 @@ def _hosted_turn_output_attachments(
             return []
         run_snapshot = dict(run)
         owner_id = str(conversation.get("owner_id") or LOCAL_OWNER_ID).strip()
+        account_generation = str(
+            run.get("account_generation")
+            or conversation.get("account_generation")
+            or ""
+        ).strip()
+        if not account_generation:
+            return []
         profile = next(
             (
                 str(item).strip()
@@ -752,6 +1133,7 @@ def _hosted_turn_output_attachments(
                 library.sync_directory(
                     owner_id,
                     output_dir,
+                    account_generation=account_generation,
                     source="model_output",
                     conversation_id=conversation_id,
                     turn_id=normalized_turn_id,
@@ -769,6 +1151,7 @@ def _hosted_turn_output_attachments(
                     record = library.ingest_file(
                         owner_id,
                         candidate,
+                        account_generation=account_generation,
                         name=candidate.name,
                         source="model_output",
                         conversation_id=conversation_id,
@@ -786,6 +1169,7 @@ def _hosted_turn_output_attachments(
     while True:
         page, total = library.list_files(
             owner_id,
+            account_generation=account_generation,
             source="model_output",
             status="available",
             conversation_id=conversation_id,
@@ -802,6 +1186,166 @@ def _hosted_turn_output_attachments(
 
 class StateStoreError(RuntimeError):
     """Raised when a collaboration state store needs operator recovery."""
+
+
+class CollaborationAccountDeletionInProgress(HTTPException):
+    def __init__(self) -> None:
+        super().__init__(status_code=410, detail="Account deletion is in progress")
+
+
+def _account_deletion_tombstones(data: Any) -> dict[str, dict[str, dict[str, int]]]:
+    if not isinstance(data, dict):
+        return {}
+    source = data.get(_ACCOUNT_DELETION_TOMBSTONES_KEY)
+    if not isinstance(source, dict):
+        return {}
+    normalized: dict[str, dict[str, dict[str, int]]] = {}
+    for owner_id, generations in source.items():
+        owner = str(owner_id or "").strip().lower()
+        if not owner or not isinstance(generations, dict):
+            continue
+        retained: dict[str, dict[str, int]] = {}
+        for account_generation, metadata in generations.items():
+            generation = str(account_generation or "").strip()
+            if not generation:
+                continue
+            deleted_at = 0
+            if isinstance(metadata, dict):
+                try:
+                    deleted_at = max(0, int(metadata.get("deleted_at") or 0))
+                except (TypeError, ValueError):
+                    deleted_at = 0
+            retained[generation] = {"deleted_at": deleted_at}
+        if retained:
+            normalized[owner] = retained
+    return normalized
+
+
+def _record_account_deletion_intent(
+    state: dict[str, Any],
+    owner_id: str,
+    account_generation: str,
+    *,
+    deleted_at: int,
+) -> None:
+    tombstones = _account_deletion_tombstones(state)
+    owner = str(owner_id or "").strip().lower()
+    generation = str(account_generation or "").strip()
+    if not owner or not generation:
+        raise ValueError("owner_id and account_generation are required")
+    tombstones.setdefault(owner, {})[generation] = {
+        "deleted_at": max(0, int(deleted_at)),
+    }
+    state[_ACCOUNT_DELETION_TOMBSTONES_KEY] = tombstones
+    drop_account_persistence_hook_work(
+        state,
+        owner_id=owner,
+        account_generation=generation,
+    )
+
+
+def _merge_account_deletion_tombstones(
+    destination: dict[str, Any],
+    source: dict[str, Any],
+) -> dict[str, dict[str, dict[str, int]]]:
+    merged = _account_deletion_tombstones(destination)
+    for owner, generations in _account_deletion_tombstones(source).items():
+        merged.setdefault(owner, {}).update(generations)
+    if merged:
+        destination[_ACCOUNT_DELETION_TOMBSTONES_KEY] = merged
+    return merged
+
+
+def _merge_authoritative_account_deletion_intents(
+    state: dict[str, Any],
+    collection_key: str,
+) -> None:
+    """Merge intelligence deletion intents before an account-owned commit."""
+
+    account_scopes = {
+        (
+            str(record.get("owner_id") or "").strip().lower(),
+            str(record.get("account_generation") or "").strip(),
+        )
+        for record in state.get(collection_key) or []
+        if isinstance(record, dict)
+        and str(record.get("owner_id") or "").strip()
+        and str(record.get("owner_id") or "").strip().lower()
+        != str(LOCAL_OWNER_ID).strip().lower()
+    }
+    if not account_scopes:
+        return
+    from hermes_cli.ios_intelligence import IOSIntelligenceStore
+    from hermes_cli.ios_intelligence_config import load_ios_intelligence_config
+
+    configured = str(load_ios_intelligence_config().database_path or "").strip()
+    root = Path(get_hermes_home())
+    database_path = Path(configured).expanduser() if configured else root
+    if not database_path.is_absolute():
+        database_path = root / database_path
+    resolved_key = str(database_path.resolve())
+    with _ACCOUNT_DELETION_STORE_LOCK:
+        deletion_store = _ACCOUNT_DELETION_STORES.get(resolved_key)
+        if deletion_store is None:
+            deletion_store = IOSIntelligenceStore(database_path)
+            _ACCOUNT_DELETION_STORES[resolved_key] = deletion_store
+    for owner, record_generation in account_scopes:
+        intent = deletion_store.account_deletion_status(
+            owner,
+            record_generation,
+        )
+        if not intent:
+            continue
+        generation = str(intent.get("account_generation") or "").strip()
+        if not generation:
+            # A legacy/malformed deletion intent blocks every generation.
+            generation = "*"
+        deleted_at = int(intent.get("requested_at") or intent.get("updated_at") or 0)
+        tombstones = _account_deletion_tombstones(state)
+        tombstones.setdefault(owner, {})[generation] = {"deleted_at": deleted_at}
+        state[_ACCOUNT_DELETION_TOMBSTONES_KEY] = tombstones
+
+
+def _assert_no_tombstoned_state_mutation(
+    current: dict[str, Any],
+    incoming: dict[str, Any],
+    collection_key: str,
+) -> None:
+    tombstones = _merge_account_deletion_tombstones(incoming, current)
+    if not tombstones:
+        return
+    current_by_id = {
+        str(record.get("id") or ""): record
+        for record in current.get(collection_key) or []
+        if isinstance(record, dict) and str(record.get("id") or "")
+    }
+    for record in incoming.get(collection_key) or []:
+        if not isinstance(record, dict):
+            continue
+        owner = str(record.get("owner_id") or "").strip().lower()
+        if not owner or owner == str(LOCAL_OWNER_ID).strip().lower():
+            continue
+        generations = tombstones.get(owner) or {}
+        generation = str(record.get("account_generation") or "").strip()
+        is_deleted = (
+            "*" in generations
+            or (generation in generations if generation else bool(generations))
+        )
+        if not is_deleted:
+            continue
+        existing = current_by_id.get(str(record.get("id") or ""))
+        if existing != record:
+            raise CollaborationAccountDeletionInProgress()
+
+
+@contextmanager
+def _collaboration_deletion_write():
+    previous = bool(getattr(_COLLABORATION_DELETION_WRITE, "active", False))
+    _COLLABORATION_DELETION_WRITE.active = True
+    try:
+        yield
+    finally:
+        _COLLABORATION_DELETION_WRITE.active = previous
 
 
 def _state_backup_path(target: Path) -> Path:
@@ -875,6 +1419,37 @@ def _atomic_write_state_document(target: Path, data: dict[str, Any]) -> None:
             pass
 
 
+def _deliver_and_persist_hosted_event_hook_outbox(
+    target: Path,
+    state: dict[str, Any],
+    collection_key: str,
+) -> dict[str, Any]:
+    """Deliver committed callbacks and persist their ACK without rollback."""
+
+    outcome = dispatch_persisted_hosted_event_hooks(
+        state,
+        store_path=str(target),
+    )
+    # Dispatch also performs deletion-boundary garbage collection.  Persist
+    # that change even when no callback was attempted (for example, an empty
+    # registry recovering a tombstoned account).
+    if not outcome.attempted_event_ids and outcome.state == state:
+        return state
+    _validate_state_document(outcome.state, collection_key, target)
+    try:
+        # The backup intentionally retains the pre-ACK outbox. If the ACK target
+        # is lost or damaged, recovery redelivers with the same idempotency key.
+        _atomic_write_state_document(_state_backup_path(target), state)
+        _atomic_write_state_document(target, outcome.state)
+    except Exception:
+        logging.getLogger(__name__).exception(
+            "Could not persist hosted-event hook ACK for %s; delivery will retry",
+            target,
+        )
+        return state
+    return outcome.state
+
+
 def _quarantine_state_file(target: Path) -> Path:
     quarantine = target.with_name(
         f"{target.name}.corrupt.{time.time_ns()}.{uuid.uuid4().hex[:8]}"
@@ -930,22 +1505,66 @@ def _restore_state_backup(
     return data
 
 
-def _load_state_store(target: Path, collection_key: str) -> dict[str, Any]:
+def _load_state_store(
+    target: Path,
+    collection_key: str,
+    *,
+    dispatch_persistence_hooks: bool = True,
+) -> dict[str, Any]:
+    # Recovery can persist an outbox ACK, so readers share the same critical
+    # section as writers rather than allowing a stale read to overwrite a newer
+    # conversation document.
+    with account_lifecycle_commit_guard():
+        with _STATE_LOCK:
+            return _load_state_store_locked(
+                target,
+                collection_key,
+                dispatch_persistence_hooks=dispatch_persistence_hooks,
+            )
+
+
+def _load_state_store_locked(
+    target: Path,
+    collection_key: str,
+    *,
+    dispatch_persistence_hooks: bool = True,
+) -> dict[str, Any]:
     try:
-        return _read_state_document(target, collection_key)
+        data = _read_state_document(target, collection_key)
+        if dispatch_persistence_hooks:
+            return _deliver_and_persist_hosted_event_hook_outbox(
+                target,
+                data,
+                collection_key,
+            )
+        return data
     except FileNotFoundError:
         pass
     except (OSError, UnicodeError, ValueError, TypeError) as primary_error:
         quarantine = _quarantine_state_file(target)
-        return _restore_state_backup(
+        restored = _restore_state_backup(
             target,
             collection_key,
             primary_error=primary_error,
             quarantine=quarantine,
         )
+        if dispatch_persistence_hooks:
+            return _deliver_and_persist_hosted_event_hook_outbox(
+                target,
+                restored,
+                collection_key,
+            )
+        return restored
 
     if _state_path_present(_state_backup_path(target)):
-        return _restore_state_backup(target, collection_key)
+        restored = _restore_state_backup(target, collection_key)
+        if dispatch_persistence_hooks:
+            return _deliver_and_persist_hosted_event_hook_outbox(
+                target,
+                restored,
+                collection_key,
+            )
+        return restored
     quarantines = _state_quarantine_paths(target)
     if quarantines:
         raise StateStoreError(
@@ -960,34 +1579,89 @@ def _save_state_store(
     state: dict[str, Any],
     collection_key: str,
 ) -> None:
-    _validate_state_document(state, collection_key, target)
     previous: dict[str, Any] | None = None
     if (
         _state_path_present(target)
         or _state_path_present(_state_backup_path(target))
         or _state_quarantine_paths(target)
     ):
-        previous = _load_state_store(target, collection_key)
+        previous = _load_state_store(
+            target,
+            collection_key,
+            dispatch_persistence_hooks=not bool(
+                getattr(_COLLABORATION_DELETION_WRITE, "active", False)
+            ),
+        )
+        # A stale in-memory writer may still carry a staged callback that a
+        # recovery reader already delivered. Merge durable receipts before
+        # promoting pending work so an ACK cannot be resurrected.
+        preserve_persistence_hook_outbox(previous, state)
+    persisted_state = state_with_persistence_hook_outbox(state)
+    _validate_state_document(persisted_state, collection_key, target)
 
     # Keep the last known-good document in a separately atomic file. On first
     # creation the backup is written first, so a crash cannot leave an empty
     # store with no recovery source.
-    _atomic_write_state_document(
-        _state_backup_path(target),
-        previous if previous is not None else state,
-    )
-    _atomic_write_state_document(target, state)
+    if previous is None:
+        backup_state = persisted_state
+    else:
+        # A deletion intent may have been added to the incoming state after
+        # the previous document was read.  Carry that tombstone into the
+        # backup before filtering its hook outbox, otherwise recovery from the
+        # backup could resurrect a delivery for the deleted generation.
+        backup_state = deepcopy(previous)
+        _merge_account_deletion_tombstones(backup_state, persisted_state)
+        backup_state = state_with_persistence_hook_outbox(backup_state)
+    _atomic_write_state_document(_state_backup_path(target), backup_state)
+    _atomic_write_state_document(target, persisted_state)
+    try:
+        committed_state = _deliver_and_persist_hosted_event_hook_outbox(
+            target,
+            persisted_state,
+            collection_key,
+        )
+        state.clear()
+        state.update(deepcopy(committed_state))
+    except Exception:
+        # The target write is already authoritative. Persistence observers are
+        # fail-open and must never turn a committed state transition into a
+        # caller-visible save failure.
+        logging.getLogger(__name__).exception(
+            "Post-persistence hosted-event observer failed for %s",
+            target,
+        )
 
 
-def load_state(path: Optional[Path] = None) -> dict[str, Any]:
+def load_state(
+    path: Optional[Path] = None,
+    *,
+    dispatch_persistence_hooks: bool = True,
+) -> dict[str, Any]:
     target = path or state_path()
-    data = _load_state_store(target, "rooms")
-    return {"rooms": data["rooms"]}
+    data = _load_state_store(
+        target,
+        "rooms",
+        dispatch_persistence_hooks=dispatch_persistence_hooks,
+    )
+    result = {"rooms": data["rooms"]}
+    tombstones = _account_deletion_tombstones(data)
+    if tombstones:
+        result[_ACCOUNT_DELETION_TOMBSTONES_KEY] = tombstones
+    preserve_persistence_hook_outbox(data, result)
+    return result
 
 
-def load_single_state(path: Optional[Path] = None) -> dict[str, Any]:
+def load_single_state(
+    path: Optional[Path] = None,
+    *,
+    dispatch_persistence_hooks: bool = True,
+) -> dict[str, Any]:
     target = path or single_state_path()
-    data = _load_state_store(target, "conversations")
+    data = _load_state_store(
+        target,
+        "conversations",
+        dispatch_persistence_hooks=dispatch_persistence_hooks,
+    )
     normalized_conversations = data["conversations"]
     for conversation in normalized_conversations:
         if not isinstance(conversation, dict):
@@ -999,6 +1673,13 @@ def load_single_state(path: Optional[Path] = None) -> dict[str, Any]:
             )
         if not isinstance(conversation.get("hosted_turns"), dict):
             conversation["hosted_turns"] = {}
+        if not isinstance(conversation.get("hosted_events"), list):
+            conversation["hosted_events"] = []
+        if not isinstance(conversation.get("hosted_event_sequences"), dict):
+            conversation["hosted_event_sequences"] = {}
+        if not isinstance(conversation.get("hosted_event_terminals"), dict):
+            conversation["hosted_event_terminals"] = {}
+        normalize_session_entries(conversation)
         try:
             conversation["event_cursor"] = max(
                 0,
@@ -1006,7 +1687,30 @@ def load_single_state(path: Optional[Path] = None) -> dict[str, Any]:
             )
         except (TypeError, ValueError):
             conversation["event_cursor"] = 0
-    return {"conversations": normalized_conversations}
+        retained_hosted_events = [
+            item
+            for item in conversation.get("hosted_events") or []
+            if isinstance(item, dict)
+        ]
+        try:
+            conversation["hosted_event_cursor"] = max(
+                max(
+                    (
+                        int(item.get("cursor") or 0)
+                        for item in retained_hosted_events
+                    ),
+                    default=0,
+                ),
+                int(conversation.get("hosted_event_cursor") or 0),
+            )
+        except (TypeError, ValueError):
+            conversation["hosted_event_cursor"] = 0
+    result = {"conversations": normalized_conversations}
+    tombstones = _account_deletion_tombstones(data)
+    if tombstones:
+        result[_ACCOUNT_DELETION_TOMBSTONES_KEY] = tombstones
+    preserve_persistence_hook_outbox(data, result)
+    return result
 
 
 def summarize_task_title(content: str) -> str:
@@ -1123,24 +1827,99 @@ def compact_conversation_title(conversation: dict[str, Any]) -> bool:
 
 def save_state(state: dict[str, Any], path: Optional[Path] = None) -> None:
     target = path or state_path()
-    _save_state_store(target, state, "rooms")
+    with account_lifecycle_commit_guard():
+        with _STATE_LOCK:
+            if not bool(getattr(_COLLABORATION_DELETION_WRITE, "active", False)):
+                current = (
+                    _load_state_store(target, "rooms")
+                    if _state_path_present(target)
+                    else {"rooms": []}
+                )
+                if path is None:
+                    # The single-conversation store is the deletion-intent
+                    # authority. Group-room writes must observe the same fence
+                    # before mobile authentication is revoked.
+                    _merge_account_deletion_tombstones(current, load_single_state())
+                _merge_authoritative_account_deletion_intents(state, "rooms")
+                _assert_no_tombstoned_state_mutation(current, state, "rooms")
+            _save_state_store(target, state, "rooms")
 
 
 def save_single_state(state: dict[str, Any], path: Optional[Path] = None) -> None:
     target = path or single_state_path()
-    _save_state_store(target, state, "conversations")
+    with account_lifecycle_commit_guard():
+        with _STATE_LOCK:
+            if not bool(getattr(_COLLABORATION_DELETION_WRITE, "active", False)):
+                current = (
+                    _load_state_store(target, "conversations")
+                    if _state_path_present(target)
+                    else {"conversations": []}
+                )
+                _merge_authoritative_account_deletion_intents(
+                    state,
+                    "conversations",
+                )
+                _assert_no_tombstoned_state_mutation(current, state, "conversations")
+            _save_state_store(target, state, "conversations")
 
 
-def delete_owner_account_data(owner_id: str) -> dict[str, Any]:
+def begin_owner_account_deletion(
+    owner_id: str,
+    *,
+    account_generation: str,
+) -> dict[str, Any]:
+    """Persist the collaboration write fence without starting heavy cleanup."""
+
+    normalized_owner = str(owner_id or "").strip()
+    normalized_generation = str(account_generation or "").strip()
+    if not normalized_owner:
+        raise ValueError("owner_id is required")
+    if not normalized_generation or "\x00" in normalized_generation:
+        raise ValueError("account_generation is required")
+    now = int(time.time() * 1000)
+    with _STATE_LOCK:
+        # Do not dispatch the pre-deletion outbox while the deletion intent is
+        # still being assembled.  The tombstone and outbox purge must become
+        # visible in one guarded state commit before any recovery reader can
+        # attempt a callback.
+        state = load_single_state(dispatch_persistence_hooks=False)
+        _record_account_deletion_intent(
+            state,
+            normalized_owner,
+            normalized_generation,
+            deleted_at=now,
+        )
+        with _collaboration_deletion_write():
+            save_single_state(state)
+    return {
+        "owner_id": normalized_owner,
+        "account_generation": normalized_generation,
+        "state": "pending",
+        "requested_at": now,
+    }
+
+
+def delete_owner_account_data(
+    owner_id: str,
+    *,
+    account_generation: str,
+) -> dict[str, Any]:
     """Idempotently remove all collaboration data for an account."""
 
     normalized_owner = str(owner_id or "").strip()
+    normalized_generation = str(account_generation or "").strip()
     if not normalized_owner:
         raise ValueError("owner_id is required")
+    if not normalized_generation or "\x00" in normalized_generation:
+        raise ValueError("account_generation is required")
     runtime_sessions: list[tuple[str, str]] = []
     conversation_ids: list[str] = []
     now = int(time.time() * 1000)
 
+    begin_owner_account_deletion(
+        normalized_owner,
+        account_generation=normalized_generation,
+    )
     with _STATE_LOCK:
         state = load_single_state()
         owned: list[dict[str, Any]] = []
@@ -1152,6 +1931,11 @@ def delete_owner_account_data(owner_id: str) -> dict[str, Any]:
                 existing_owner,
                 normalized_owner,
             ):
+                continue
+            stored_generation = str(
+                conversation.get("account_generation") or ""
+            ).strip()
+            if stored_generation and stored_generation != normalized_generation:
                 continue
             owned.append(conversation)
             conversation_ids.append(str(conversation.get("id") or ""))
@@ -1166,7 +1950,7 @@ def delete_owner_account_data(owner_id: str) -> dict[str, Any]:
                 if isinstance(run, dict):
                     run["cancel_requested"] = True
                     run["cancel_requested_at"] = now
-        if owned:
+        with _collaboration_deletion_write():
             save_single_state(state)
 
     # Delete external/runtime state before dropping the only persisted list of
@@ -1194,32 +1978,63 @@ def delete_owner_account_data(owner_id: str) -> dict[str, Any]:
                         normalized_owner,
                     )
                 )
+                and (
+                    not str(conversation.get("account_generation") or "").strip()
+                    or str(conversation.get("account_generation") or "").strip()
+                    == normalized_generation
+                )
             )
         ]
-        save_single_state(state)
+        with _collaboration_deletion_write():
+            save_single_state(state)
 
         room_state = load_state()
+        _record_account_deletion_intent(
+            room_state,
+            normalized_owner,
+            normalized_generation,
+            deleted_at=now,
+        )
         removed_rooms = 0
         kept_rooms: list[dict[str, Any]] = []
         for room in room_state.get("rooms") or []:
             if not isinstance(room, dict):
                 continue
             room_owner = str(room.get("owner_id") or "").strip()
-            if room_owner == normalized_owner or _legacy_owner_claim_allowed(
-                room_owner,
-                normalized_owner,
+            room_generation = str(room.get("account_generation") or "").strip()
+            if (
+                room_owner == normalized_owner
+                or _legacy_owner_claim_allowed(room_owner, normalized_owner)
+            ) and (
+                not room_generation or room_generation == normalized_generation
             ):
                 removed_rooms += 1
                 continue
             kept_rooms.append(room)
         room_state["rooms"] = kept_rooms
-        save_state(room_state)
+        with _collaboration_deletion_write():
+            save_state(room_state)
+
+    from hermes_cli.managed_installations import delete_owner_managed_resources
 
     return {
         "conversations": len(conversation_ids),
         "rooms": removed_rooms,
         "runtime_sessions": len(runtime_sessions),
-        "files": _file_library().delete_owner(normalized_owner),
+        "files": _file_library().delete_owner(
+            normalized_owner,
+            account_generation=normalized_generation,
+        ),
+        "tool_output_artifacts": EncryptedToolArtifactStore(
+            Path(get_hermes_home())
+        ).delete_owner(
+            normalized_owner,
+            account_generation=normalized_generation,
+        ),
+        "managed_resources": delete_owner_managed_resources(
+            normalized_owner,
+            account_generation=normalized_generation,
+        ),
     }
 
 
@@ -1227,6 +2042,7 @@ def create_room_record(
     name: str,
     profiles: list[str],
     owner_id: str = LOCAL_OWNER_ID,
+    account_generation: str = "local-owner-generation",
 ) -> dict[str, Any]:
     now = int(time.time() * 1000)
     return {
@@ -1234,6 +2050,8 @@ def create_room_record(
         "name": name.strip() or "新群聊",
         "profiles": list(dict.fromkeys(p.strip() for p in profiles if p.strip())),
         "owner_id": str(owner_id or LOCAL_OWNER_ID).strip() or LOCAL_OWNER_ID,
+        "account_generation": str(account_generation or "").strip()
+        or "local-owner-generation",
         "messages": [],
         "created_at": now,
         "updated_at": now,
@@ -1252,7 +2070,15 @@ def create_single_conversation(
         "runtime_sessions": {},
         "runtime_runs": {},
         "hosted_turns": {},
+        "hosted_events": [],
+        "hosted_event_sequences": {},
+        "hosted_event_terminals": {},
         "event_cursor": 0,
+        "hosted_event_cursor": 0,
+        "hosted_event_min_cursor": 1,
+        "session_entries": [],
+        "session_entry_cursor": 0,
+        "session_entry_leaf_id": "",
         "pending_turn_cancellations": {},
         "messages": [],
         "created_at": now,
@@ -2198,6 +3024,8 @@ def reconcile_stale_hosted_turns(
             "completed_at": now,
             "updated_at": now,
         })
+        run.setdefault("terminal_commit_id", f"terminal_{uuid.uuid4().hex}")
+        run.setdefault("terminal_committed_at", now)
         turn_id = str(run.get("turn_id") or stored_turn_id).strip()
         for key in ("role_events", "remote_runs"):
             states = run.get(key)
@@ -2251,6 +3079,13 @@ def reconcile_stale_hosted_turns(
                         activity["status"] = "failed"
                         activity["completed_at"] = now
                         activity["updated_at"] = now
+        _append_canonical_turn_terminal(
+            conversation,
+            conversation_id=str(conversation.get("id") or "conversation"),
+            turn_id=turn_id,
+            run=run,
+            occurred_at=now,
+        )
         conversation["updated_at"] = now
         changed = True
     return changed
@@ -2470,12 +3305,23 @@ def requires_artifact_delivery(content: str) -> bool:
     """Return true only when the user explicitly asks for a file deliverable."""
     lowered = re.sub(r"\s+", " ", str(content or "").strip().lower())
     for clause in re.split(r"[\n.!?;。！？；]+", lowered):
-        if not any(
+        has_concrete_artifact = any(
             _contains_intent_marker(clause, marker)
             for marker in (*_DIRECT_ARTIFACT_MARKERS, *_ARTIFACT_NOUN_MARKERS)
-        ):
+        )
+        has_ambiguous_report = any(
+            _contains_intent_marker(clause, marker)
+            for marker in _AMBIGUOUS_ARTIFACT_NOUN_MARKERS
+        )
+        if not has_concrete_artifact and not has_ambiguous_report:
             continue
         for marker in _ARTIFACT_ACTION_MARKERS:
+            if (
+                has_ambiguous_report
+                and not has_concrete_artifact
+                and marker not in _ARTIFACT_TRANSFER_ACTION_MARKERS
+            ):
+                continue
             pattern = _target_marker_pattern((marker,))
             for match in re.finditer(pattern, clause):
                 prefix = clause[max(0, match.start() - 64):match.start()]
@@ -2872,7 +3718,59 @@ def _intervention_matches_role(
     target_profiles = {
         str(item) for item in intervention.get("target_profiles") or [] if str(item)
     }
-    return not target_profiles or str(profile or "") in target_profiles
+    role_profiles = {
+        item for item in target_profiles if collaboration_role(item) == target_role
+    }
+    return not role_profiles or str(profile or "") in role_profiles
+
+
+def _intervention_delivery_key(
+    intervention: dict[str, Any],
+    *,
+    role_stage: str,
+    profile: str,
+) -> str:
+    target_profiles = {
+        str(item) for item in intervention.get("target_profiles") or [] if str(item)
+    }
+    if str(profile or "") in target_profiles:
+        return f"profile:{profile}"
+    return f"role:{_hosted_stage_target_role(role_stage, profile)}"
+
+
+def _intervention_expected_delivery_keys(
+    intervention: dict[str, Any],
+) -> set[str]:
+    targets = {str(item) for item in intervention.get("targets") or [] if str(item)}
+    target_profiles = {
+        str(item) for item in intervention.get("target_profiles") or [] if str(item)
+    }
+    keys = {f"profile:{profile}" for profile in target_profiles}
+    covered_roles = {collaboration_role(profile) for profile in target_profiles}
+    keys.update(f"role:{role}" for role in targets if role not in covered_roles)
+    return keys
+
+
+def _intervention_delivery_claim(
+    intervention: dict[str, Any],
+    *,
+    role_stage: str,
+    profile: str,
+) -> tuple[str, dict[str, Any]]:
+    key = _intervention_delivery_key(
+        intervention,
+        role_stage=role_stage,
+        profile=profile,
+    )
+    claims = intervention.get("delivery_claims")
+    if not isinstance(claims, dict):
+        claims = {}
+        intervention["delivery_claims"] = claims
+    claim = claims.get(key)
+    if not isinstance(claim, dict):
+        claim = {"status": "pending"}
+        claims[key] = claim
+    return key, claim
 
 
 def _hosted_role_checkpoint(
@@ -3035,6 +3933,7 @@ def _pending_hosted_role_intervention(
     role_stage: str,
     profile: str,
     include_processing: bool = False,
+    deliveries: Optional[set[str]] = None,
 ) -> Optional[dict[str, Any]]:
     with _STATE_LOCK:
         state = load_single_state()
@@ -3042,28 +3941,36 @@ def _pending_hosted_role_intervention(
         run = (conversation.get("hosted_turns") or {}).get(turn_id)
         if not isinstance(run, dict):
             return None
-        return next(
-            (
-                dict(item)
-                for item in run.get("interventions") or []
-                if isinstance(item, dict)
-                and (
-                    str(item.get("status") or "pending") == "pending"
-                    or (
-                        include_processing
-                        and str(item.get("status") or "") == "processing"
-                        and str(item.get("active_role_stage") or "") == role_stage
-                        and str(item.get("active_profile") or "") == profile
-                    )
-                )
-                and _intervention_matches_role(
+        for item in run.get("interventions") or []:
+            if not isinstance(item, dict) or not _intervention_matches_role(
+                item,
+                role_stage=role_stage,
+                profile=profile,
+            ):
+                continue
+            if deliveries is not None and str(
+                item.get("delivery") or "steer"
+            ) not in deliveries:
+                continue
+            if str(item.get("queue_mode") or "one_at_a_time") == "all_at_once":
+                delivery_key, claim = _intervention_delivery_claim(
                     item,
                     role_stage=role_stage,
                     profile=profile,
                 )
-            ),
-            None,
-        )
+                status = str(claim.get("status") or "pending")
+                if status == "pending" or (include_processing and status == "processing"):
+                    return {**dict(item), **dict(claim), "delivery_key": delivery_key}
+                continue
+            status = str(item.get("status") or "pending")
+            if status == "pending" or (
+                include_processing
+                and status == "processing"
+                and str(item.get("active_role_stage") or "") == role_stage
+                and str(item.get("active_profile") or "") == profile
+            ):
+                return dict(item)
+        return None
 
 
 def _hosted_intervention_by_id(
@@ -3098,6 +4005,7 @@ def _claim_hosted_role_intervention(
     intervention_id: str = "",
     execution_owner: str = "",
     lease_ms: int = 120_000,
+    deliveries: Optional[set[str]] = None,
 ) -> Optional[dict[str, Any]]:
     """Atomically move one matching @ control from pending to processing."""
 
@@ -3123,6 +4031,10 @@ def _claim_hosted_role_intervention(
                     role_stage=role_stage,
                     profile=profile,
                 )
+                and (
+                    deliveries is None
+                    or str(item.get("delivery") or "steer") in deliveries
+                )
             ),
             None,
         )
@@ -3132,20 +4044,37 @@ def _claim_hosted_role_intervention(
         owner = str(execution_owner or "")
         if not owner:
             return None
-        current_status = str(intervention.get("status") or "pending")
-        current_owner = str(intervention.get("execution_owner") or "")
-        lease_expires_at = int(intervention.get("lease_expires_at") or 0)
+        all_at_once = str(
+            intervention.get("queue_mode") or "one_at_a_time"
+        ) == "all_at_once"
+        delivery_key = ""
+        claim_state = intervention
+        if all_at_once:
+            delivery_key, claim_state = _intervention_delivery_claim(
+                intervention,
+                role_stage=role_stage,
+                profile=profile,
+            )
+        current_status = str(claim_state.get("status") or "pending")
+        if current_status == "completed":
+            return None
+        current_owner = str(claim_state.get("execution_owner") or "")
+        lease_expires_at = int(claim_state.get("lease_expires_at") or 0)
         if current_status == "processing":
             if current_owner == owner and lease_expires_at > now:
-                intervention["lease_expires_at"] = now + max(1_000, int(lease_ms))
+                claim_state["lease_expires_at"] = now + max(1_000, int(lease_ms))
                 intervention["updated_at"] = now
                 save_single_state(state)
-                return dict(intervention)
+                return {
+                    **dict(intervention),
+                    **dict(claim_state),
+                    **({"delivery_key": delivery_key} if delivery_key else {}),
+                }
             if lease_expires_at > now:
                 return None
         claim_token = uuid.uuid4().hex
-        persisted_checkpoint = intervention.get("checkpoint")
-        intervention.update(
+        persisted_checkpoint = claim_state.get("checkpoint")
+        claim_state.update(
             {
                 "status": "processing",
                 "claim_token": claim_token,
@@ -3164,11 +4093,43 @@ def _claim_hosted_role_intervention(
             }
         )
         if current_status == "processing":
-            intervention["reclaimed_at"] = now
+            claim_state["reclaimed_at"] = now
+        if all_at_once:
+            intervention["status"] = "processing"
+            intervention["updated_at"] = now
         run["updated_at"] = now
         conversation["updated_at"] = now
+        append_hosted_event(
+            conversation,
+            conversation_id=conversation_id,
+            turn_id=turn_id,
+            role_stage=role_stage,
+            event_type="intervention.claimed",
+            entity_id=str(intervention.get("id") or ""),
+            idempotency_key=(
+                f"intervention:{intervention.get('id')}:claimed:{claim_token}"
+            ),
+            account_generation=_account_generation_for_owner(
+                str(conversation.get("owner_id") or LOCAL_OWNER_ID)
+            ),
+            payload={
+                "entity_id": str(intervention.get("id") or ""),
+                "delivery": str(intervention.get("delivery") or "steer"),
+                "queue_mode": str(
+                    intervention.get("queue_mode") or "one_at_a_time"
+                ),
+                "profile": profile,
+                "role_stage": role_stage,
+                "delivery_key": delivery_key,
+            },
+            occurred_at=now,
+        )
         save_single_state(state)
-        claimed = dict(intervention)
+        claimed = {
+            **dict(intervention),
+            **dict(claim_state),
+            **({"delivery_key": delivery_key} if delivery_key else {}),
+        }
     _notify_hosted_update(conversation_id)
     return claimed
 
@@ -3212,32 +4173,58 @@ def _complete_hosted_role_intervention(
             "cancel_requested"
         ):
             raise RuntimeError("托管任务已结束，拒绝迟到的干预回复")
-        if str(intervention.get("status") or "") != "processing":
+        all_at_once = str(
+            intervention.get("queue_mode") or "one_at_a_time"
+        ) == "all_at_once"
+        delivery_key = ""
+        claim_state = intervention
+        if all_at_once:
+            delivery_key, claim_state = _intervention_delivery_claim(
+                intervention,
+                role_stage=role_stage,
+                profile=profile,
+            )
+        if str(claim_state.get("status") or "") != "processing":
             raise RuntimeError("托管干预不在可完成状态")
         if not hmac.compare_digest(
-            str(intervention.get("claim_token") or ""),
+            str(claim_state.get("claim_token") or ""),
             str(claim_token or ""),
         ):
             raise RuntimeError("托管干预 claim_token 不匹配")
         if (
-            str(intervention.get("active_role_stage") or "") != role_stage
-            or str(intervention.get("active_profile") or "") != profile
-            or str(intervention.get("execution_owner") or "")
+            str(claim_state.get("active_role_stage") or "") != role_stage
+            or str(claim_state.get("active_profile") or "") != profile
+            or str(claim_state.get("execution_owner") or "")
             != str(execution_owner or "")
         ):
             raise RuntimeError("托管干预角色所有者不匹配")
-        intervention.update(
+        claim_state.update(
             {
                 "status": "completed",
                 "reply": clean_reply,
                 "checkpoint": _redact_sensitive(dict(checkpoint)),
-                "replied_at": int(intervention.get("replied_at") or now),
-                "completed_at": int(intervention.get("completed_at") or now),
+                "replied_at": int(claim_state.get("replied_at") or now),
+                "completed_at": int(claim_state.get("completed_at") or now),
                 "resume_role_stage": str(resume_role_stage or ""),
                 "updated_at": now,
             }
         )
-        message_key = f"{turn_id}:intervention:{intervention_id}:reply"
+        if all_at_once:
+            expected = _intervention_expected_delivery_keys(intervention)
+            claims = intervention.get("delivery_claims")
+            completed_keys = {
+                str(key)
+                for key, value in (claims.items() if isinstance(claims, dict) else [])
+                if isinstance(value, dict) and str(value.get("status") or "") == "completed"
+            }
+            intervention["status"] = (
+                "completed" if expected and expected.issubset(completed_keys) else "processing"
+            )
+            intervention["updated_at"] = now
+            if intervention["status"] == "completed":
+                intervention["completed_at"] = now
+        message_suffix = f":{delivery_key}" if delivery_key else ""
+        message_key = f"{turn_id}:intervention:{intervention_id}{message_suffix}:reply"
         existing = next(
             (
                 item
@@ -3282,8 +4269,52 @@ def _complete_hosted_role_intervention(
             _project_native_message(existing)
         run["updated_at"] = now
         conversation["updated_at"] = now
+        append_hosted_event(
+            conversation,
+            conversation_id=conversation_id,
+            turn_id=turn_id,
+            role_stage=role_stage,
+            event_type="intervention.replied",
+            entity_id=f"{intervention_id}{message_suffix}",
+            idempotency_key=f"intervention:{intervention_id}{message_suffix}:replied",
+            account_generation=_account_generation_for_owner(
+                str(conversation.get("owner_id") or LOCAL_OWNER_ID)
+            ),
+            payload={
+                "entity_id": intervention_id,
+                "profile": profile,
+                "role_stage": role_stage,
+                "reply": clean_reply,
+                "delivery_key": delivery_key,
+            },
+            occurred_at=now,
+        )
+        append_hosted_event(
+            conversation,
+            conversation_id=conversation_id,
+            turn_id=turn_id,
+            role_stage=role_stage,
+            event_type="intervention.completed",
+            entity_id=f"{intervention_id}{message_suffix}",
+            idempotency_key=f"intervention:{intervention_id}{message_suffix}:completed",
+            account_generation=_account_generation_for_owner(
+                str(conversation.get("owner_id") or LOCAL_OWNER_ID)
+            ),
+            payload={
+                "entity_id": intervention_id,
+                "profile": profile,
+                "role_stage": role_stage,
+                "status": "completed",
+                "delivery_key": delivery_key,
+            },
+            occurred_at=now,
+        )
         save_single_state(state)
-        completed = dict(intervention)
+        completed = {
+            **dict(intervention),
+            **dict(claim_state),
+            **({"delivery_key": delivery_key} if delivery_key else {}),
+        }
     _notify_hosted_update(conversation_id)
     return completed
 
@@ -3318,25 +4349,38 @@ def _refresh_claimed_intervention_checkpoint(
         )
         if not isinstance(intervention, dict):
             return None
+        delivery_key = ""
+        claim_state = intervention
+        if str(intervention.get("queue_mode") or "one_at_a_time") == "all_at_once":
+            delivery_key, claim_state = _intervention_delivery_claim(
+                intervention,
+                role_stage=role_stage,
+                profile=profile,
+            )
         if (
-            str(intervention.get("status") or "") != "processing"
-            or str(intervention.get("active_role_stage") or "") != role_stage
-            or str(intervention.get("active_profile") or "") != profile
-            or str(intervention.get("execution_owner") or "")
+            str(claim_state.get("status") or "") != "processing"
+            or str(claim_state.get("active_role_stage") or "") != role_stage
+            or str(claim_state.get("active_profile") or "") != profile
+            or str(claim_state.get("execution_owner") or "")
             != str(execution_owner or "")
             or not hmac.compare_digest(
-                str(intervention.get("claim_token") or ""),
+                str(claim_state.get("claim_token") or ""),
                 str(claim_token or ""),
             )
         ):
             return None
         now = int(time.time() * 1000)
-        intervention["checkpoint"] = _redact_sensitive(dict(checkpoint))
+        claim_state["checkpoint"] = _redact_sensitive(dict(checkpoint))
+        claim_state["updated_at"] = now
         intervention["updated_at"] = now
         run["updated_at"] = now
         conversation["updated_at"] = now
         save_single_state(state)
-        refreshed = dict(intervention)
+        refreshed = {
+            **dict(intervention),
+            **dict(claim_state),
+            **({"delivery_key": delivery_key} if delivery_key else {}),
+        }
     _notify_hosted_update(conversation_id)
     return refreshed
 
@@ -3582,12 +4626,28 @@ def _rule_based_user_intent(content: str) -> dict[str, Any]:
         )
         and any(marker in lowered for marker in _WORKFLOW_EXECUTION_MARKERS)
     )
+    explanatory = any(marker in lowered for marker in _EXPLANATION_MARKERS)
+    imperative = any(
+        marker in lowered
+        for marker in ("帮我", "请你", "直接", "现在", "完成", "执行", "go ahead")
+    )
+    hard_work = explicit_workflow or (
+        any(marker in lowered for marker in _HARD_WORK_MARKERS)
+        and (imperative or not explanatory)
+    )
+    hard_chat = (
+        not hard_work
+        and len(text) <= 80
+        and any(marker in lowered for marker in _SIMPLE_CHAT_MARKERS)
+    )
     score = min(6, len(complex_matches) * 2)
     score += min(3, len(device_matches) * 2)
     score += min(3, multi_step_count)
     score += 1 if matched else 0
     score += 2 if len(text) >= 80 else 0
     if explicit_workflow:
+        score = max(score, 4)
+    if hard_work:
         score = max(score, 4)
     if any(marker in lowered for marker in _SIMPLE_CHAT_MARKERS) and len(text) < 30:
         score -= 3
@@ -3610,6 +4670,11 @@ def _rule_based_user_intent(content: str) -> dict[str, Any]:
             "source": "rules",
             "profiles": ["default"],
             "artifact_required": requires_artifact_delivery(text),
+            "lock_level": "hard_chat" if hard_chat else "ambiguous",
+            "capability_hints": [],
+            "rationale_codes": [
+                "rule.explicit_chat" if hard_chat else "rule.ambiguous_chat_fallback"
+            ],
         }
 
     profiles = _work_profiles(lowered)
@@ -3628,6 +4693,11 @@ def _rule_based_user_intent(content: str) -> dict[str, Any]:
         ],
         "target_constraints": _target_constraints(lowered),
         "artifact_required": requires_artifact_delivery(text),
+        "lock_level": "hard_work" if hard_work else "ambiguous",
+        "capability_hints": [],
+        "rationale_codes": [
+            "rule.explicit_work" if hard_work else "rule.ambiguous_work_fallback"
+        ],
     }
 
 
@@ -3915,6 +4985,8 @@ def _fail_hosted_turn_preflight(
             "updated_at": now,
         }
     )
+    run.setdefault("terminal_commit_id", f"terminal_{uuid.uuid4().hex}")
+    run.setdefault("terminal_committed_at", now)
     message_key = f"{turn_id}:chat:preflight-failed"
     messages = conversation.setdefault("messages", [])
     existing = next(
@@ -3951,6 +5023,13 @@ def _fail_hosted_turn_preflight(
         existing["updated_at"] = now
         message = existing
     _project_native_message(message)
+    _append_canonical_turn_terminal(
+        conversation,
+        conversation_id=str(conversation.get("id") or "conversation"),
+        turn_id=turn_id,
+        run=run,
+        occurred_at=now,
+    )
     conversation["updated_at"] = now
 
 
@@ -4018,14 +5097,40 @@ def _wait_for_hosted_chat_model(
                 return False
             attempt = max(0, int(run.get("model_readiness_attempt") or 0))
             next_attempt_at = max(0, int(run.get("model_readiness_next_attempt_at") or 0))
+            deadline_at = int(run.get("model_retry_deadline_at") or 0)
             previous = (run.get("role_events") or {}).get("chat")
         now_ms = int(time.time() * 1000)
+        if deadline_at and now_ms >= deadline_at:
+            with _STATE_LOCK:
+                state = load_single_state()
+                conversation = _conversation_by_id(state, conversation_id)
+                run = (conversation.get("hosted_turns") or {}).get(turn_id)
+                if isinstance(run, dict) and run.get("status") not in _HOSTED_TERMINAL_STATUSES:
+                    _fail_hosted_turn_preflight(
+                        conversation,
+                        run,
+                        {
+                            "profile": profile,
+                            "code": "model_connection_deadline_exceeded",
+                            "message": "模型连接在 120 秒预算内未恢复，请重试。",
+                        },
+                    )
+                    save_single_state(state)
+            _notify_hosted_update(conversation_id)
+            return False
         if next_attempt_at > now_ms:
-            sleeper(min(1.0, max(0.0, (next_attempt_at - now_ms) / 1000)))
+            wait_seconds = max(0.0, (next_attempt_at - now_ms) / 1000)
+            if deadline_at:
+                wait_seconds = min(
+                    wait_seconds,
+                    max(0.0, (deadline_at - now_ms) / 1000),
+                )
+            sleeper(min(1.0, wait_seconds))
             continue
 
         readiness = profile_model_readiness(profile)
-        if readiness.get("ready"):
+        checked_at = int(time.time() * 1000)
+        if readiness.get("ready") and (not deadline_at or checked_at < deadline_at):
             ready_state = _hosted_model_wait_state(
                 previous,
                 attempt=attempt,
@@ -4037,7 +5142,8 @@ def _wait_for_hosted_chat_model(
                 turn_id,
                 patch={
                     "model_readiness_next_attempt_at": 0,
-                    "model_readiness_recovered_at": now_ms,
+                    "model_readiness_recovered_at": checked_at,
+                    "model_retry_attempt": attempt,
                 },
             )
             _persist_hosted_role_state(
@@ -4057,17 +5163,21 @@ def _wait_for_hosted_chat_model(
             attempt=attempt,
             now=now_ms,
         )
+        remaining_ms = max(0, deadline_at - checked_at) if deadline_at else 0
+        retry_delay_ms = int(max(0.0, retry_delay_seconds) * 1000)
         next_attempt_at = (
             0
-            if attempt >= _HOSTED_CHAT_API_ATTEMPTS
-            else now_ms + int(max(0.0, retry_delay_seconds) * 1000)
+            if attempt >= _HOSTED_CHAT_API_ATTEMPTS or (deadline_at and remaining_ms <= 0)
+            else checked_at + min(retry_delay_ms, remaining_ms or retry_delay_ms)
         )
         _persist_hosted_turn(
             conversation_id,
             turn_id,
             patch={
                 "model_readiness_attempt": attempt,
+                "model_retry_attempt": attempt,
                 "model_readiness_next_attempt_at": next_attempt_at,
+                "model_retry_last_error": str(readiness.get("code") or "model_unavailable"),
             },
         )
         _persist_hosted_role_state(
@@ -4079,7 +5189,7 @@ def _wait_for_hosted_chat_model(
             state=retry_state,
             content_fallback="",
         )
-        if attempt >= _HOSTED_CHAT_API_ATTEMPTS:
+        if attempt >= _HOSTED_CHAT_API_ATTEMPTS or (deadline_at and checked_at >= deadline_at):
             with _STATE_LOCK:
                 state = load_single_state()
                 conversation = _conversation_by_id(state, conversation_id)
@@ -4142,25 +5252,54 @@ def _requires_local_ios_mcp(content: str) -> bool:
     return managed_domain and (explicit_mcp or device_context)
 
 
+def _ios_capability_hints(content: str) -> list[str]:
+    """Return advisory device capabilities without changing chat/work mode."""
+
+    lowered = str(content or "").strip().lower()
+    domains = {
+        "ios.location": ("location", "trajectory", "places", "位置", "地址", "轨迹", "地点"),
+        "ios.weather": ("qweather", "weather", "天气"),
+        "ios.health": ("health", "sleep", "heart", "oxygen", "健康", "睡眠", "心率", "血氧"),
+        "ios.calendar": ("calendar", "reminder", "日历", "提醒"),
+        "ios.screen_time": ("screen time", "屏幕使用"),
+        "ios.motion": ("motion", "运动"),
+        "ios.power": ("battery", "电量"),
+    }
+    return [
+        capability
+        for capability, markers in domains.items()
+        if any(marker in lowered for marker in markers)
+    ] if _requires_local_ios_mcp(content) else []
+
+
 def classify_user_intent(
     content: str,
     *,
     model_classifier: Optional[Callable[[str], Optional[dict[str, Any]]]] = None,
 ) -> dict[str, Any]:
     routed = _rule_based_user_intent(content)
-    if _requires_local_ios_mcp(content):
-        routed.update(
-            {
-                "mode": "chat",
-                "label": "Local iOS MCP",
-                "reason": "Account-scoped iOS MCP data must be read by the default Hermes profile.",
-                "confidence": 1.0,
-                "source": "managed-ios-mcp",
-                "profiles": ["default"],
-                "needs_execution": True,
-                "needs_tools": True,
-            }
+    capability_hints = _ios_capability_hints(content)
+    if capability_hints:
+        routed["capability_hints"] = capability_hints
+        routed["rationale_codes"] = [
+            *list(routed.get("rationale_codes") or []),
+            "capability.ios_mcp",
+        ]
+        routed["needs_tools"] = True
+    rule_decision = {
+        key: deepcopy(routed.get(key))
+        for key in (
+            "mode",
+            "confidence",
+            "lock_level",
+            "profiles",
+            "targets",
+            "rationale_codes",
         )
+        if key in routed
+    }
+    routed["rule_decision"] = rule_decision
+    if str(routed.get("lock_level") or "") in {"hard_chat", "hard_work"}:
         return routed
     if model_classifier is None:
         return routed
@@ -4256,6 +5395,20 @@ def classify_user_intent(
             "mutates_state": bool(model_result.get("mutates_state", mode == "work")),
             "artifact": {**artifact, "decision": artifact_decision},
             "artifact_required": artifact_decision == "required",
+            "lock_level": "ambiguous",
+            "capability_hints": capability_hints,
+            "rationale_codes": [
+                *list(routed.get("rationale_codes") or []),
+                "model.ambiguous_resolution",
+            ],
+            "rule_decision": rule_decision,
+            "model_decision": {
+                "mode": mode,
+                "confidence": model_confidence,
+                "profiles": list(model_profiles),
+                "targets": list(model_result.get("targets") or []),
+            },
+            "routing_conflict": bool(rule_decision.get("mode") != mode),
         }
     )
     return routed
@@ -4399,11 +5552,20 @@ def _profile_status_event(kind: Any, text: Any) -> Optional[dict[str, Any]]:
         or "retry" in status_text.lower()
         or "reconnect" in status_text.lower()
     ):
+        try:
+            attempt_offset = max(
+                0, int(os.environ.get("HERMES_API_RETRY_ATTEMPT_OFFSET", "0") or 0)
+            )
+        except (TypeError, ValueError):
+            attempt_offset = 0
         return {
             "type": "connection.retry",
             "payload": {
-                "attempt": int(retry_match.group(1)),
-                "max_attempts": int(retry_match.group(2)),
+                "attempt": min(
+                    _HOSTED_CHAT_API_ATTEMPTS,
+                    attempt_offset + int(retry_match.group(1)),
+                ),
+                "max_attempts": _HOSTED_CHAT_API_ATTEMPTS,
             },
         }
     lowered = status_text.lower()
@@ -4477,6 +5639,7 @@ def run_profile_turn(
     cancel_check: Optional[Callable[[], bool]] = None,
     action: str = "chat",
     focus_topic: str = "",
+    artifact_context: Optional[dict[str, str]] = None,
 ) -> str:
     """Run a profile through a structured JSONL child event channel."""
     if runner is not None:
@@ -4492,20 +5655,69 @@ def run_profile_turn(
 
     from hermes_cli.profiles import resolve_profile_env
 
+    runtime_home = resolve_profile_env(profile)
+    if artifact_context:
+        runtime_owner = str(artifact_context.get("owner_id") or "").strip()
+        runtime_generation = str(
+            artifact_context.get("account_generation") or ""
+        ).strip()
+        if runtime_owner and runtime_owner != LOCAL_OWNER_ID:
+            from hermes_cli.managed_installations import managed_account_runtime_home
+
+            try:
+                runtime_home = str(
+                    managed_account_runtime_home(
+                        runtime_owner,
+                        runtime_generation,
+                        profile,
+                        base_profile_home=Path(runtime_home),
+                    )
+                )
+            except PermissionError as exc:
+                raise RuntimeError("stale hosted turn account generation") from exc
+
     env = {
         **os.environ,
         "HOME": os.environ.get("HOME", "/home/hermes"),
-        "HERMES_HOME": resolve_profile_env(profile),
+        "HERMES_HOME": runtime_home,
         "HERMES_SESSION_SOURCE": "dashboard-group",
         "HERMES_API_MAX_RETRIES": str(_HOSTED_CHAT_API_ATTEMPTS),
         "HERMES_API_RETRY_CLIENT_ERRORS": "1",
-        "HERMES_API_RETRY_DELAY_SECONDS": "60",
+        "HERMES_API_RETRY_DELAY_SECONDS": str(_HOSTED_CHAT_API_RETRY_DELAY_SECONDS),
         "HERMES_API_RETRY_STATUS_LIVE": "1",
     }
     if kanban_task_id:
         env["HERMES_KANBAN_TASK"] = kanban_task_id
     else:
         env.pop("HERMES_KANBAN_TASK", None)
+    if artifact_context:
+        retry_deadline_at = int(artifact_context.get("model_retry_deadline_at") or 0)
+        retry_attempt_offset = max(
+            0, int(artifact_context.get("model_retry_attempt") or 0)
+        )
+        remaining_attempts = max(1, _HOSTED_CHAT_API_ATTEMPTS - retry_attempt_offset)
+        env.update(
+            {
+                "HERMES_TOOL_ARTIFACT_ROOT": str(
+                    artifact_context.get("root") or get_hermes_home()
+                ),
+                "HERMES_TOOL_ARTIFACT_OWNER": str(
+                    artifact_context.get("owner_id") or ""
+                ),
+                "HERMES_TOOL_ARTIFACT_CONVERSATION": str(
+                    artifact_context.get("conversation_id") or ""
+                ),
+                "HERMES_TOOL_ARTIFACT_TURN": str(
+                    artifact_context.get("turn_id") or ""
+                ),
+                "HERMES_ACCOUNT_GENERATION": str(
+                    artifact_context.get("account_generation") or ""
+                ),
+                "HERMES_API_MAX_RETRIES": str(remaining_attempts),
+                "HERMES_API_RETRY_ATTEMPT_OFFSET": str(retry_attempt_offset),
+                "HERMES_API_RETRY_DEADLINE_EPOCH_MS": str(retry_deadline_at),
+            }
+        )
     command = [sys.executable, str(Path(__file__).resolve()), "--profile-event-runner"]
     deadline = time.monotonic() + timeout
     process = process_factory(
@@ -4524,6 +5736,8 @@ def run_profile_turn(
         raise RuntimeError("Hermes 结构化执行通道启动失败")
     line_queue: queue.Queue[Optional[str]] = queue.Queue()
     writer_errors: queue.Queue[BaseException] = queue.Queue(maxsize=1)
+    stderr_tail: list[str] = []
+    stderr_tail_chars = 0
 
     def _write_stdin() -> None:
         try:
@@ -4534,6 +5748,13 @@ def run_profile_turn(
                         "session_id": str(session_id or "").strip(),
                         "action": str(action or "chat").strip().lower(),
                         "focus_topic": str(focus_topic or "").strip(),
+                        "capability_hints": [
+                            str(item)
+                            for item in (artifact_context or {}).get(
+                                "capability_hints", []
+                            )
+                            if str(item).strip()
+                        ],
                     },
                     ensure_ascii=False,
                 )
@@ -4549,10 +5770,51 @@ def run_profile_turn(
         finally:
             line_queue.put(None)
 
+    def _read_stderr() -> None:
+        nonlocal stderr_tail_chars
+        if process.stderr is None:
+            return
+        while True:
+            try:
+                chunk = process.stderr.read(4096)
+            except TypeError:
+                chunk = process.stderr.read()
+            except BaseException:
+                return
+            if not chunk:
+                return
+            stderr_tail.append(chunk)
+            stderr_tail_chars += len(chunk)
+            while stderr_tail and stderr_tail_chars > _HOSTED_STDERR_TAIL_CHARS:
+                overflow = stderr_tail_chars - _HOSTED_STDERR_TAIL_CHARS
+                if overflow >= len(stderr_tail[0]):
+                    stderr_tail_chars -= len(stderr_tail.pop(0))
+                else:
+                    stderr_tail[0] = stderr_tail[0][overflow:]
+                    stderr_tail_chars -= overflow
+
     writer = threading.Thread(target=_write_stdin, daemon=True)
     reader = threading.Thread(target=_read_stdout, daemon=True)
+    stderr_reader = threading.Thread(target=_read_stderr, daemon=True)
     writer.start()
     reader.start()
+    stderr_reader.start()
+
+    first_model_event = False
+    retry_deadline_at = int((artifact_context or {}).get("model_retry_deadline_at") or 0)
+
+    def _forward_event(event: dict[str, Any]) -> None:
+        nonlocal first_model_event
+        if str(event.get("type") or "") in {
+            "message.delta",
+            "message.complete",
+            "reasoning.delta",
+            "tool.start",
+            "subagent.start",
+        }:
+            first_model_event = True
+        if event_callback is not None:
+            event_callback(event)
 
     def _iter_lines():
         while True:
@@ -4561,7 +5823,14 @@ def run_profile_turn(
             if not writer_errors.empty():
                 raise RuntimeError("Hermes 结构化执行输入失败") from writer_errors.get()
             remaining = deadline - time.monotonic()
+            if retry_deadline_at > 0 and not first_model_event:
+                remaining = min(
+                    remaining,
+                    (retry_deadline_at - int(time.time() * 1000)) / 1000,
+                )
             if remaining <= 0:
+                if retry_deadline_at > 0 and not first_model_event:
+                    raise TimeoutError("Model connection exceeded the 120 second retry budget")
                 raise TimeoutError("Hermes profile execution timed out")
             try:
                 line = line_queue.get(timeout=min(1.0, remaining))
@@ -4574,7 +5843,7 @@ def run_profile_turn(
             yield line
 
     try:
-        response = consume_profile_event_stream(_iter_lines(), event_callback)
+        response = consume_profile_event_stream(_iter_lines(), _forward_event)
         remaining = min(float(timeout), deadline - time.monotonic())
         if remaining <= 0:
             raise TimeoutError("Hermes profile execution timed out")
@@ -4586,8 +5855,10 @@ def run_profile_turn(
                 process.wait(timeout=5)
             except subprocess.TimeoutExpired:
                 process.kill()
+        stderr_reader.join(timeout=1)
         raise
-    stderr = process.stderr.read().strip() if process.stderr is not None else ""
+    stderr_reader.join(timeout=1)
+    stderr = "".join(stderr_tail).strip()
     if return_code != 0:
         raise RuntimeError(sanitize_runtime_error(stderr or "Hermes profile execution failed"))
     if not response:
@@ -5085,6 +6356,8 @@ def apply_profile_event(
                 "max_attempts": max_attempts,
             }
         )
+        state["model_retry_attempt"] = attempt
+        state["model_retry_max_attempts"] = max_attempts
     elif event_type == "message.complete":
         finish_retry_activity(
             "failed"
@@ -5107,6 +6380,114 @@ def apply_profile_event(
 
     state["updated_at"] = now
     return state
+
+
+def _queue_hosted_protocol_event(
+    state: dict[str, Any],
+    event: dict[str, Any],
+) -> None:
+    """Stage one canonical event for the next atomic hosted-state write."""
+
+    raw_event_type = str(event.get("type") or "").strip().lower()
+    if raw_event_type == "session:compress":
+        raw_payload = (
+            dict(event.get("payload"))
+            if isinstance(event.get("payload"), dict)
+            else {}
+        )
+        compression_count = max(0, int(raw_payload.get("compression_count") or 0))
+        session_id = str(raw_payload.get("session_id") or "").strip()
+        old_session_id = str(raw_payload.get("old_session_id") or "").strip()
+        pending_entries = state.setdefault("_session_entry_events", [])
+        if not isinstance(pending_entries, list):
+            pending_entries = []
+            state["_session_entry_events"] = pending_entries
+        pending_entries.append(
+            {
+                "entry_type": "compaction",
+                "idempotency_key": (
+                    f"compaction:{session_id}:{old_session_id}:{compression_count}"
+                ),
+                "payload": {
+                    "session_id": session_id,
+                    "old_session_id": old_session_id,
+                    "in_place": bool(raw_payload.get("in_place")),
+                    "compression_count": compression_count,
+                    "runtime": str(raw_payload.get("runtime") or "hermes"),
+                    "thread_id": str(raw_payload.get("thread_id") or ""),
+                    "runtime_turn_id": str(raw_payload.get("turn_id") or ""),
+                },
+                "occurred_at": int(time.time() * 1000),
+            }
+        )
+        if session_id:
+            state["runtime_session_id"] = session_id
+        return
+
+    event_type, payload, entity_id = normalize_legacy_profile_event(event)
+    invocation = int(state.get("_protocol_invocation_index") or 0)
+    if event_type == "agent.started":
+        invocation += 1
+        state["_protocol_invocation_index"] = invocation
+        state["_saw_message_complete"] = False
+        state["_protocol_started_entities"] = []
+    elif invocation <= 0:
+        invocation = 1
+        state["_protocol_invocation_index"] = invocation
+    payload = dict(payload)
+    if not entity_id:
+        if event_type.startswith("message."):
+            entity_id = f"message-invocation-{invocation}"
+        elif event_type.startswith("thinking."):
+            entity_id = f"thinking-invocation-{invocation}"
+        elif event_type.startswith("agent."):
+            entity_id = f"agent-invocation-{invocation}"
+    if entity_id:
+        payload.setdefault("entity_id", entity_id)
+    pending = state.setdefault("_protocol_events", [])
+    if not isinstance(pending, list):
+        pending = []
+        state["_protocol_events"] = pending
+
+    started_entities = {
+        str(item)
+        for item in state.get("_protocol_started_entities") or []
+        if str(item)
+    }
+    start_type = {
+        "message.delta": "message.started",
+        "message.completed": "message.started",
+        "thinking.delta": "thinking.started",
+        "thinking.completed": "thinking.started",
+    }.get(event_type)
+    started_key = f"{start_type}:{entity_id}" if start_type and entity_id else ""
+
+    def stage(kind: str, body: dict[str, Any], staged_entity_id: str) -> None:
+        next_index = int(state.get("_protocol_event_index") or 0) + 1
+        state["_protocol_event_index"] = next_index
+        pending.append(
+            {
+                "event_type": kind,
+                "payload": body,
+                "entity_id": staged_entity_id,
+                "idempotency_key": (
+                    f"profile-event:{next_index}:{kind}:{staged_entity_id}"
+                ),
+                "occurred_at": int(body.get("timestamp") or time.time() * 1000),
+            }
+        )
+
+    if started_key and started_key not in started_entities:
+        stage(
+            start_type,
+            {"entity_id": entity_id, "synthetic": True},
+            entity_id,
+        )
+        started_entities.add(started_key)
+        state["_protocol_started_entities"] = sorted(started_entities)
+    stage(event_type, payload, entity_id)
+    if event_type == "message.completed":
+        state["_saw_message_complete"] = True
 
 
 def _remove_duplicate_reasoning_activities(
@@ -5149,6 +6530,7 @@ def _invoke_profile_runner(
     kanban_task_id: str,
     session_id: str = "",
     cancel_check: Optional[Callable[[], bool]] = None,
+    artifact_context: Optional[dict[str, str]] = None,
 ) -> str:
     kwargs: dict[str, Any] = {}
     if _runner_supports_events(runner):
@@ -5159,6 +6541,8 @@ def _invoke_profile_runner(
         kwargs["session_id"] = session_id
     if cancel_check is not None and _runner_supports_keyword(runner, "cancel_check"):
         kwargs["cancel_check"] = cancel_check
+    if artifact_context and _runner_supports_keyword(runner, "artifact_context"):
+        kwargs["artifact_context"] = dict(artifact_context)
     return str(runner(profile, prompt, **kwargs))
 
 
@@ -5172,6 +6556,7 @@ def _run_local_intervention_reply(
     kanban_task_id: str,
     runtime_session_id: str,
     prompt: str,
+    artifact_context: dict[str, str],
 ) -> tuple[str, dict[str, Any]]:
     """Run the targeted reply in the same durable child session."""
 
@@ -5204,6 +6589,7 @@ def _run_local_intervention_reply(
         kanban_task_id,
         str(reply_state.get("runtime_session_id") or ""),
         lambda: _hosted_turn_cancellation_requested(conversation_id, turn_id),
+        artifact_context,
     ).strip()
     if not result:
         raise RuntimeError("Hermes profile returned an empty intervention response")
@@ -5292,12 +6678,29 @@ def _persist_hosted_role_state(
         "milestone_count": int(state.get("milestone_count") or 0),
         "milestone_content": str(state.get("milestone_content") or ""),
         "request_accepted": bool(state.get("request_accepted")),
+        "model_retry_attempt": int(state.get("model_retry_attempt") or 0),
+        "model_retry_max_attempts": int(
+            state.get("model_retry_max_attempts") or _HOSTED_CHAT_API_ATTEMPTS
+        ),
         "runtime_message_before": int(state.get("runtime_message_before") or 0),
         "runtime_user_message_id": state.get("runtime_user_message_id"),
         "runtime_tip_message_id": state.get("runtime_tip_message_id"),
+        "_protocol_event_index": int(state.get("_protocol_event_index") or 0),
+        "_protocol_invocation_index": int(
+            state.get("_protocol_invocation_index") or 0
+        ),
+        "_protocol_started_entities": [
+            str(item)
+            for item in state.get("_protocol_started_entities") or []
+            if str(item)
+        ],
         "updated_at": now,
     }
     patch = {"role_events": {role_stage: snapshot}}
+    if base_stage == "chat" and snapshot["model_retry_attempt"]:
+        patch["model_retry_attempt"] = snapshot["model_retry_attempt"]
+    if base_stage == "chat" and snapshot["first_token_at"]:
+        patch["model_first_token_at"] = snapshot["first_token_at"]
     if base_stage != "chat":
         # Every hosted role joins the durable roster with its first persisted
         # stage event, so clients never hardcode the team composition.
@@ -5336,6 +6739,28 @@ def _persist_hosted_role_state(
             "runtime_message_id": state.get("runtime_tip_message_id"),
         },
     }
+    pending_protocol_events = [
+        {**dict(item), "role_stage": role_stage}
+        for item in state.get("_protocol_events") or []
+        if isinstance(item, dict)
+    ]
+    pending_session_entries = [
+        {
+            **dict(item),
+            "payload": {
+                **(
+                    dict(item.get("payload"))
+                    if isinstance(item.get("payload"), dict)
+                    else {}
+                ),
+                "turn_id": turn_id,
+                "role_stage": role_stage,
+                "profile": profile,
+            },
+        }
+        for item in state.get("_session_entry_events") or []
+        if isinstance(item, dict)
+    ]
     _persist_hosted_turn(
         conversation_id,
         turn_id,
@@ -5345,7 +6770,13 @@ def _persist_hosted_role_state(
             str(state.get("runtime_session_id") or "").strip(),
         ),
         message=projected_message if visible else None,
+        protocol_events=pending_protocol_events,
+        session_entries=pending_session_entries,
     )
+    if pending_protocol_events:
+        state["_protocol_events"] = []
+    if pending_session_entries:
+        state["_session_entry_events"] = []
 
 
 def _run_hosted_role(
@@ -5365,8 +6796,44 @@ def _run_hosted_role(
     previous_state: Optional[dict[str, Any]] = None,
     execution_owner: str = "",
     visible: bool = True,
+    provider_max_attempts: Optional[int] = None,
+    retry_sleeper: Callable[[float], None] = time.sleep,
 ) -> tuple[str, str, dict[str, Any]]:
     execution_owner = str(execution_owner or f"local-{uuid.uuid4().hex}")
+    with _STATE_LOCK:
+        artifact_state = load_single_state()
+        artifact_conversation = _conversation_by_id(artifact_state, conversation_id)
+        artifact_run = (artifact_conversation.get("hosted_turns") or {}).get(turn_id)
+        artifact_run = artifact_run if isinstance(artifact_run, dict) else {}
+        artifact_owner_id = str(
+            artifact_conversation.get("owner_id") or LOCAL_OWNER_ID
+        )
+    captured_generation = str(
+        getattr(_HOSTED_EXECUTION_GENERATION, "value", "")
+    ).strip()
+    live_generation = _account_generation_for_owner(artifact_owner_id)
+    if captured_generation and captured_generation != live_generation:
+        raise RuntimeError("stale hosted turn account generation")
+    artifact_context = {
+        "root": str(get_hermes_home()),
+        "owner_id": artifact_owner_id,
+        "conversation_id": conversation_id,
+        "turn_id": turn_id,
+        "account_generation": captured_generation or live_generation,
+        "model_retry_deadline_at": int(
+            artifact_run.get("model_retry_deadline_at") or 0
+        ),
+        "model_retry_attempt": int(artifact_run.get("model_retry_attempt") or 0),
+        "capability_hints": [
+            str(item)
+            for item in (
+                (artifact_run.get("route_metadata") or {}).get("capability_hints")
+                if isinstance(artifact_run.get("route_metadata"), dict)
+                else []
+            ) or []
+            if str(item).strip()
+        ],
+    }
     state = {
         "content": "",
         "status": "streaming",
@@ -5379,9 +6846,16 @@ def _run_hosted_role(
         "milestone_count": 0,
         "milestone_content": "",
         "request_accepted": False,
+        "model_retry_attempt": 0,
+        "model_retry_max_attempts": _HOSTED_CHAT_API_ATTEMPTS,
         "runtime_message_before": 0,
         "runtime_user_message_id": None,
         "runtime_tip_message_id": None,
+        "_protocol_event_index": 0,
+        "_protocol_invocation_index": 0,
+        "_protocol_started_entities": [],
+        "_protocol_events": [],
+        "_saw_message_complete": False,
     }
     if isinstance(previous_state, dict):
         state.update(
@@ -5404,6 +6878,13 @@ def _run_hosted_role(
                 "milestone_count": int(previous_state.get("milestone_count") or 0),
                 "milestone_content": str(previous_state.get("milestone_content") or ""),
                 "request_accepted": bool(previous_state.get("request_accepted")),
+                "model_retry_attempt": int(
+                    previous_state.get("model_retry_attempt") or 0
+                ),
+                "model_retry_max_attempts": int(
+                    previous_state.get("model_retry_max_attempts")
+                    or _HOSTED_CHAT_API_ATTEMPTS
+                ),
                 "runtime_message_before": int(
                     previous_state.get("runtime_message_before") or 0
                 ),
@@ -5412,6 +6893,20 @@ def _run_hosted_role(
                 ),
                 "runtime_tip_message_id": previous_state.get(
                     "runtime_tip_message_id"
+                ),
+                "_protocol_event_index": int(
+                    previous_state.get("_protocol_event_index") or 0
+                ),
+                "_protocol_invocation_index": int(
+                    previous_state.get("_protocol_invocation_index") or 0
+                ),
+                "_protocol_started_entities": [
+                    str(item)
+                    for item in previous_state.get("_protocol_started_entities") or []
+                    if str(item)
+                ],
+                "_saw_message_complete": bool(
+                    previous_state.get("_saw_message_complete")
                 ),
             }
         )
@@ -5435,6 +6930,10 @@ def _run_hosted_role(
     ):
         raise RuntimeError("同一角色阶段已有活动执行 owner")
     if role_stage.split(":", 1)[0] != "chat":
+        _queue_hosted_protocol_event(
+            state,
+            {"type": "request.accepted", "payload": {"status": "started"}},
+        )
         _persist_hosted_role_state(
             conversation_id,
             turn_id,
@@ -5449,13 +6948,16 @@ def _run_hosted_role(
     last_persisted_at = 0.0
     atomic_depth = 0
 
-    def claim_pending_intervention() -> Optional[dict[str, Any]]:
+    def claim_pending_intervention(
+        deliveries: Optional[set[str]] = None,
+    ) -> Optional[dict[str, Any]]:
         pending = _pending_hosted_role_intervention(
             conversation_id,
             turn_id,
             role_stage=role_stage,
             profile=profile,
             include_processing=True,
+            deliveries=deliveries,
         )
         if not isinstance(pending, dict):
             return None
@@ -5474,6 +6976,7 @@ def _run_hosted_role(
             intervention_id=str(pending.get("id") or ""),
             execution_owner=execution_owner,
             lease_ms=(_HOSTED_CHAT_TIMEOUT_SECONDS + 60) * 1000,
+            deliveries=deliveries,
         )
         if (
             claimed is None
@@ -5493,6 +6996,7 @@ def _run_hosted_role(
             role_stage=role_stage,
             profile=profile,
             include_processing=True,
+            deliveries={"steer"},
         )
         if not isinstance(pending, dict):
             return False
@@ -5511,6 +7015,7 @@ def _run_hosted_role(
             base_stage == "chat"
             and not str(state.get("content") or "").strip()
             and not state.get("activities")
+            and not state.get("_session_entry_events")
             and str(state.get("status") or "") not in _HOSTED_TERMINAL_STATUSES
         ):
             patch: dict[str, Any] = {}
@@ -5553,7 +7058,7 @@ def _run_hosted_role(
         if event_type == "thinking.delta":
             return
         if event_type in {"tool.start", "subagent.start"} and atomic_depth == 0:
-            intervention = claim_pending_intervention()
+            intervention = claim_pending_intervention({"steer"})
             if isinstance(intervention, dict):
                 raise _HostedRoleIntervention(intervention)
         if event_type in {"tool.start", "subagent.start"}:
@@ -5605,6 +7110,7 @@ def _run_hosted_role(
             for activity in state.get("activities") or []
         )
         apply_profile_event(state, event)
+        _queue_hosted_protocol_event(state, event)
         if event_type in {"tool.complete", "subagent.complete"}:
             atomic_depth = max(0, atomic_depth - 1)
         if event_type == "request.accepted":
@@ -5629,7 +7135,7 @@ def _run_hosted_role(
         ):
             persist()
         if atomic_depth == 0:
-            intervention = claim_pending_intervention()
+            intervention = claim_pending_intervention({"steer"})
             if isinstance(intervention, dict):
                 persist()
                 raise _HostedRoleIntervention(intervention)
@@ -5637,7 +7143,18 @@ def _run_hosted_role(
     # The real Hermes child already performs the five bounded provider
     # attempts. Re-running the entire child would duplicate those attempts and
     # could keep a failed iOS turn alive beyond its two-minute contract.
-    attempts = 1 if runner is run_profile_turn else _HOSTED_TRANSIENT_RETRIES + 1
+    attempts = (
+        1
+        if runner is run_profile_turn
+        else max(
+            1,
+            int(
+                provider_max_attempts
+                if provider_max_attempts is not None
+                else _HOSTED_TRANSIENT_RETRIES + 1
+            ),
+        )
+    )
     for attempt in range(1, attempts + 1):
         try:
             boundary_profile = runtime_profile or profile
@@ -5649,7 +7166,7 @@ def _run_hosted_role(
                 state["runtime_message_before"] = int(
                     before.get("tip_message_id") or 0
                 )
-            intervention = claim_pending_intervention()
+            intervention = claim_pending_intervention({"steer"})
             if isinstance(intervention, dict):
                 raise _HostedRoleIntervention(intervention)
             result = _invoke_profile_runner(
@@ -5660,8 +7177,9 @@ def _run_hosted_role(
                 kanban_task_id,
                 str(state.get("runtime_session_id") or ""),
                 cancellation_requested,
+                artifact_context,
             ).strip()
-            intervention = claim_pending_intervention()
+            intervention = claim_pending_intervention({"steer", "follow_up"})
             if isinstance(intervention, dict):
                 raise _HostedRoleIntervention(intervention)
             if not result:
@@ -5677,6 +7195,18 @@ def _run_hosted_role(
             state["runtime_tip_message_id"] = boundary.get("tip_message_id")
             state["content"] = result
             state["status"] = "completed"
+            if not state.get("_saw_message_complete"):
+                _queue_hosted_protocol_event(
+                    state,
+                    {
+                        "type": "message.complete",
+                        "payload": {
+                            "text": result,
+                            "status": "completed",
+                            "entity_id": f"{turn_id}:{role_stage}:final",
+                        },
+                    },
+                )
             state["activities"] = _remove_duplicate_reasoning_activities(
                 state.get("activities") or [],
                 result,
@@ -5700,7 +7230,7 @@ def _run_hosted_role(
                 and isinstance(exc, _HostedTurnCancelled)
                 and not _hosted_turn_cancellation_requested(conversation_id, turn_id)
             ):
-                intervention = claim_pending_intervention()
+                intervention = claim_pending_intervention({"steer"})
             if isinstance(intervention, dict):
                 checkpoint = dict(intervention.get("checkpoint") or {})
                 if not checkpoint:
@@ -5726,6 +7256,7 @@ def _run_hosted_role(
                             intervention=intervention,
                             checkpoint=checkpoint,
                         ),
+                        artifact_context=artifact_context,
                     )
                 except _HostedTurnCancelled:
                     _finish_hosted_turn_if_cancelled(conversation_id, turn_id)
@@ -5788,6 +7319,8 @@ def _run_hosted_role(
                     previous_state=state,
                     execution_owner=execution_owner,
                     visible=visible,
+                    provider_max_attempts=provider_max_attempts,
+                    retry_sleeper=retry_sleeper,
                 )
             if isinstance(exc, _HostedTurnCancelled) or _hosted_turn_cancellation_requested(
                 conversation_id,
@@ -5824,16 +7357,18 @@ def _run_hosted_role(
                 for activity in state.get("activities") or []
             )
             if transient and not has_tool_activity and attempt < attempts:
-                apply_profile_event(
-                    state,
-                    {
-                        "type": "connection.retry",
-                        "payload": {"message": str(exc), "attempt": attempt + 1},
+                retry_event = {
+                    "type": "connection.retry",
+                    "payload": {
+                        "attempt": attempt + 1,
+                        "max_attempts": attempts,
                     },
-                )
+                }
+                apply_profile_event(state, retry_event)
+                _queue_hosted_protocol_event(state, retry_event)
                 state["status"] = "streaming"
                 persist()
-                time.sleep(0.5 * attempt)
+                retry_sleeper(0.5 * attempt)
                 continue
             clean_error = sanitize_runtime_error(exc)
             partial = str(state.get("content") or "").strip()
@@ -6017,9 +7552,14 @@ def _run_hosted_remote_role(
     active_remote_id = str(remote.get("id") or "")
     coordinator_owner = f"remote-coordinator:{active_remote_id}:{uuid.uuid4().hex}"
     revision = -1
-    deadline = time.monotonic() + float(
-        os.environ.get("HERMES_REMOTE_RUN_WAIT_SECONDS", "86400")
+    remaining_seconds = max(
+        0.0,
+        (int(remote.get("deadline_at") or 0) - int(time.time() * 1000)) / 1000,
     )
+    configured_wait = _positive_int(os.environ.get("HERMES_REMOTE_RUN_WAIT_SECONDS"))
+    if configured_wait is not None:
+        remaining_seconds = min(remaining_seconds, float(configured_wait))
+    deadline = time.monotonic() + remaining_seconds
     while True:
         # Observe a committed result before attempting takeover. This order is
         # essential when the original owner clears its lane immediately after
@@ -6057,7 +7597,8 @@ def _run_hosted_remote_role(
         ):
             break
         if time.monotonic() >= deadline:
-            raise RuntimeError("Timed out waiting for the authoritative role coordinator")
+            _advance_remote_run_deadline(active_remote_id)
+            deadline = time.monotonic() + _REMOTE_CANCELLATION_GRACE_SECONDS
         revision = _wait_for_hosted_update(revision, 15.0)
     if visible and str(remote.get("status") or "queued") not in _REMOTE_TERMINAL_STATUSES:
         _remote_run_state_message(
@@ -6104,6 +7645,7 @@ def _run_hosted_remote_role(
             turn_id,
             role_stage=role_stage,
             profile=profile,
+            deliveries={"steer"},
         )
         remote_intervention_id = str(remote.get("cancel_intervention_id") or "")
         if (
@@ -6154,6 +7696,13 @@ def _run_hosted_remote_role(
                 "activities": list(remote.get("activities") or []),
             }
         if status in _REMOTE_TERMINAL_STATUSES:
+            pending_intervention = _pending_hosted_role_intervention(
+                conversation_id,
+                turn_id,
+                role_stage=role_stage,
+                profile=profile,
+                deliveries={"steer", "follow_up"},
+            )
             terminal_intervention_id = (
                 remote_intervention_id
                 or str((pending_intervention or {}).get("id") or "")
@@ -6319,24 +7868,8 @@ def _run_hosted_remote_role(
                 role_label=role_label,
             )
         if time.monotonic() >= deadline:
-            error = "远程执行器在规定时间内没有完成"
-            _persist_hosted_turn(
-                conversation_id,
-                turn_id,
-                patch={"stage": "failed", "error": error},
-            )
-            _clear_hosted_active_role(
-                conversation_id,
-                turn_id,
-                role_stage=role_stage,
-                remote_run_id=active_remote_id,
-                execution_owner=coordinator_owner,
-            )
-            return f"本阶段未完成：{error}", "failed", {
-                "content": error,
-                "status": "failed",
-                "activities": list(remote.get("activities") or []),
-            }
+            _advance_remote_run_deadline(active_remote_id)
+            deadline = time.monotonic() + _REMOTE_CANCELLATION_GRACE_SECONDS
         revision = _wait_for_hosted_update(revision, 15.0)
 
 
@@ -6371,6 +7904,11 @@ def create_hosted_turn_record(
     if normalized_mode not in {"chat", "work"}:
         normalized_mode = "work"
     route_metadata = dict(route_metadata or {})
+    owner_id = str(conversation.get("owner_id") or LOCAL_OWNER_ID)
+    account_generation = str(conversation.get("account_generation") or "").strip()
+    if not account_generation:
+        account_generation = _account_generation_for_owner(owner_id)
+        conversation["account_generation"] = account_generation
     artifact_producers = _artifact_producer_profiles(
         route_metadata,
         profiles,
@@ -6378,6 +7916,7 @@ def create_hosted_turn_record(
     )
     record = {
         "turn_id": normalized_turn_id,
+        "account_generation": account_generation,
         "status": "queued",
         "stage": "accepted",
         "content": str(content or "").strip(),
@@ -6410,6 +7949,32 @@ def create_hosted_turn_record(
         "updated_at": now,
     }
     hosted_turns[normalized_turn_id] = record
+    if normalized_mode == "work":
+        append_hosted_event(
+            conversation,
+            conversation_id=str(conversation.get("id") or "conversation"),
+            turn_id=normalized_turn_id,
+            role_stage="manager",
+            event_type="role.handoff",
+            entity_id=f"{normalized_turn_id}:collaboration-lift",
+            idempotency_key=f"turn:{normalized_turn_id}:collaboration-lift",
+            account_generation=account_generation,
+            payload={
+                "entity_id": f"{normalized_turn_id}:collaboration-lift",
+                "action": "collaboration_lift",
+                "from_role": "chat",
+                "to_role": "manager",
+            },
+            occurred_at=now,
+        )
+    _append_attachment_session_entries(
+        conversation,
+        turn_id=normalized_turn_id,
+        role_stage="user",
+        attachments=record["attachment_ids"],
+        direction="input",
+        occurred_at=now,
+    )
     conversation["updated_at"] = now
     return record
 
@@ -6875,6 +8440,9 @@ def _persist_hosted_turn(
     message: Optional[dict[str, Any]] = None,
     runtime_session: Optional[tuple[str, str]] = None,
     source_message_meta: Optional[dict[str, Any]] = None,
+    protocol_events: Optional[list[dict[str, Any]]] = None,
+    session_entries: Optional[list[dict[str, Any]]] = None,
+    expected_account_generation: str = "",
 ) -> dict[str, Any]:
     with _STATE_LOCK:
         state = load_single_state()
@@ -6882,12 +8450,50 @@ def _persist_hosted_turn(
         run = (conversation.get("hosted_turns") or {}).get(turn_id)
         if not isinstance(run, dict):
             raise RuntimeError("托管任务记录不存在")
+        owner_id = str(conversation.get("owner_id") or LOCAL_OWNER_ID)
+        live_generation = _account_generation_for_owner(owner_id)
+        conversation_generation = str(
+            conversation.get("account_generation") or ""
+        ).strip()
+        run_generation = str(run.get("account_generation") or "").strip()
+        expected_generation = str(
+            expected_account_generation
+            or getattr(_HOSTED_EXECUTION_GENERATION, "value", "")
+            or run_generation
+            or conversation_generation
+            or live_generation
+        ).strip()
+        if (
+            live_generation != expected_generation
+            or (conversation_generation and conversation_generation != expected_generation)
+            or (run_generation and run_generation != expected_generation)
+        ):
+            raise RuntimeError("stale hosted turn account generation")
+        conversation["account_generation"] = expected_generation
+        run["account_generation"] = expected_generation
         incoming_status = str((patch or {}).get("status") or "").lower()
         current_status = str(run.get("status") or "").lower()
         if current_status in _HOSTED_TERMINAL_STATUSES:
             # The first terminal transaction is authoritative. Even a late
             # writer repeating the same status may carry stale fields or a
-            # duplicate message, so terminal retries are read-only.
+            # duplicate message. Repair legacy terminal records, but never
+            # apply the retry's stale patch or message.
+            before_cursor = int(conversation.get("hosted_event_cursor") or 0)
+            before_entry_cursor = int(conversation.get("session_entry_cursor") or 0)
+            _append_canonical_turn_terminal(
+                conversation,
+                conversation_id=conversation_id,
+                turn_id=turn_id,
+                run=run,
+                occurred_at=int(run.get("completed_at") or time.time() * 1000),
+            )
+            if (
+                int(conversation.get("hosted_event_cursor") or 0) != before_cursor
+                or int(conversation.get("session_entry_cursor") or 0)
+                != before_entry_cursor
+            ):
+                save_single_state(state)
+                _notify_hosted_update(conversation_id)
             return dict(run)
         if (
             (run.get("cancel_requested") or current_status == "cancelled")
@@ -6895,6 +8501,7 @@ def _persist_hosted_turn(
         ):
             return dict(run)
         now = int(time.time() * 1000)
+        previous_stage = str(run.get("stage") or "accepted")
         if patch:
             for key, value in patch.items():
                 if key == "role_events" and isinstance(value, dict):
@@ -6907,6 +8514,30 @@ def _persist_hosted_turn(
                     _merge_hosted_participants(run, value)
                 else:
                     run[key] = value
+        current_stage = str(run.get("stage") or previous_stage)
+        if current_stage != previous_stage:
+            transition_sequence = int(run.get("stage_transition_sequence") or 0) + 1
+            run["stage_transition_sequence"] = transition_sequence
+            append_hosted_event(
+                conversation,
+                conversation_id=conversation_id,
+                turn_id=turn_id,
+                role_stage="turn",
+                event_type="role.handoff",
+                entity_id=f"{turn_id}:stage:{transition_sequence}",
+                idempotency_key=(
+                    f"turn:{turn_id}:stage:{transition_sequence}:"
+                    f"{previous_stage}:{current_stage}"
+                ),
+                account_generation=expected_generation,
+                payload={
+                    "entity_id": f"{turn_id}:stage:{transition_sequence}",
+                    "action": "stage_transition",
+                    "from_role": previous_stage,
+                    "to_role": current_stage,
+                },
+                occurred_at=now,
+            )
         run["updated_at"] = now
         conversation["updated_at"] = now
         terminal_status = str(run.get("status") or "").lower()
@@ -6934,6 +8565,23 @@ def _persist_hosted_turn(
                 intervention.pop("claim_token", None)
                 intervention.pop("execution_owner", None)
                 intervention["lease_expires_at"] = 0
+                intervention_id = str(intervention.get("id") or "").strip()
+                if intervention_id:
+                    append_session_entry(
+                        conversation,
+                        entry_type="intervention",
+                        idempotency_key=(
+                            f"intervention:{intervention_id}:cancelled:"
+                            f"{terminal_status}"
+                        ),
+                        payload={
+                            "intervention_id": intervention_id,
+                            "turn_id": turn_id,
+                            "status": "cancelled",
+                            "reason": f"hosted_turn_{terminal_status}",
+                        },
+                        occurred_at=now,
+                    )
             run["active_roles"] = {}
             for state_key in ("role_events", "remote_runs"):
                 child_states = run.get(state_key)
@@ -7034,6 +8682,61 @@ def _persist_hosted_turn(
                 }
                 source_message["updated_at"] = now
                 _project_native_message(source_message)
+        def append_protocol_event(protocol_event: dict[str, Any]) -> None:
+            append_hosted_event(
+                conversation,
+                conversation_id=conversation_id,
+                turn_id=turn_id,
+                role_stage=str(
+                    protocol_event.get("role_stage")
+                    or next(
+                        (
+                            str(item.get("role_stage") or "")
+                            for item in (patch or {}).get("role_events", {}).values()
+                            if isinstance(item, dict)
+                        ),
+                        "chat",
+                    )
+                ),
+                event_type=str(protocol_event.get("event_type") or "message.delta"),
+                payload=(
+                    protocol_event.get("payload")
+                    if isinstance(protocol_event.get("payload"), dict)
+                    else {}
+                ),
+                entity_id=str(protocol_event.get("entity_id") or ""),
+                idempotency_key=str(protocol_event.get("idempotency_key") or ""),
+                occurred_at=int(protocol_event.get("occurred_at") or now),
+                account_generation=expected_generation,
+            )
+
+        for session_entry in session_entries or []:
+            if not isinstance(session_entry, dict):
+                continue
+            append_session_entry(
+                conversation,
+                entry_type=str(session_entry.get("entry_type") or "label"),
+                idempotency_key=str(session_entry.get("idempotency_key") or ""),
+                payload=(
+                    dict(session_entry.get("payload"))
+                    if isinstance(session_entry.get("payload"), dict)
+                    else {}
+                ),
+                occurred_at=int(session_entry.get("occurred_at") or now),
+            )
+
+        for protocol_event in protocol_events or []:
+            if not isinstance(protocol_event, dict):
+                continue
+            if str(protocol_event.get("event_type") or "") in {
+                "turn.completed",
+                "turn.cancelled",
+                "turn.failed",
+            }:
+                # Role-level errors are provisional. Only the authoritative run
+                # transition below may commit the turn terminal.
+                continue
+            append_protocol_event(protocol_event)
         if message:
             message_meta = dict(message.get("meta") or {})
             message_meta.setdefault("runtime_turn_id", turn_id)
@@ -7084,6 +8787,7 @@ def _persist_hosted_turn(
                     meta=message_meta,
                 )
             else:
+                previous_content = str(existing.get("content") or "")
                 existing.update(
                     {
                         "content": str(message.get("content") or "").strip(),
@@ -7093,6 +8797,90 @@ def _persist_hosted_turn(
                     }
                 )
                 _project_native_message(existing)
+                message_status = str(existing.get("status") or "completed").lower()
+                message_content = str(existing.get("content") or "")
+                stream_entries = append_message_stream_entries(
+                    conversation,
+                    message_id=str(existing.get("id") or ""),
+                    previous_content=previous_content,
+                    current_content=message_content,
+                    status=message_status,
+                    role=str(existing.get("role") or "assistant"),
+                    name=str(existing.get("name") or ""),
+                    kind=str(existing.get("kind") or "message"),
+                    turn_id=turn_id,
+                    role_stage=role_stage or "chat",
+                    occurred_at=now,
+                )
+                _append_attachment_session_entries(
+                    conversation,
+                    turn_id=turn_id,
+                    role_stage=role_stage or "chat",
+                    attachments=message_meta.get("attachments"),
+                    direction="output",
+                    occurred_at=now,
+                )
+                for stream_entry in stream_entries:
+                    stream_payload = dict(stream_entry.get("payload") or {})
+                    operation = str(stream_payload.get("operation") or "reference")
+                    event_payload = {
+                        "entity_id": str(existing.get("id") or ""),
+                        "status": message_status,
+                        "role": str(existing.get("role") or "assistant"),
+                        "name": str(existing.get("name") or ""),
+                        "operation": operation,
+                        "content_sha256": str(
+                            stream_payload.get("content_sha256") or ""
+                        ),
+                        "content_length": int(
+                            stream_payload.get("content_length") or 0
+                        ),
+                    }
+                    if operation == "append":
+                        event_payload["delta"] = str(
+                            stream_payload.get("content_delta") or ""
+                        )
+                        # Keep compatibility with clients that still read the
+                        # legacy field; it now contains only the bounded delta.
+                        event_payload["content"] = event_payload["delta"]
+                        event_payload["offset"] = int(
+                            stream_payload.get("offset") or 0
+                        )
+                    elif operation == "replace":
+                        event_payload["content"] = message_content
+                    else:
+                        event_payload["content_ref"] = str(
+                            stream_payload.get("content_ref") or ""
+                        )
+                    append_hosted_event(
+                        conversation,
+                        conversation_id=conversation_id,
+                        turn_id=turn_id,
+                        role_stage=role_stage or "chat",
+                        event_type=(
+                            "message.completed"
+                            if message_status in _HOSTED_TERMINAL_STATUSES
+                            else "message.delta"
+                        ),
+                        entity_id=str(existing.get("id") or ""),
+                        idempotency_key=(
+                            "message-update-event:"
+                            + str(stream_entry.get("idempotency_key") or "")
+                        ),
+                        account_generation=expected_generation,
+                        payload=event_payload,
+                        occurred_at=now,
+                    )
+        # The final visible message and all session projections must precede the
+        # turn terminal. The authoritative run state is the only terminal
+        # producer, so normal, error, cancellation and recovery paths converge.
+        _append_canonical_turn_terminal(
+            conversation,
+            conversation_id=conversation_id,
+            turn_id=turn_id,
+            run=run,
+            occurred_at=int(run.get("completed_at") or now),
+        )
         save_single_state(state)
         persisted = dict(run)
     _notify_hosted_update(conversation_id)
@@ -7130,11 +8918,14 @@ def _remote_run_public(remote_run: dict[str, Any]) -> dict[str, Any]:
             "idempotency_key",
             "connector_id",
             "profile",
+            "owner_id",
+            "account_generation",
             "title",
             "objective",
             "local_task_id",
             "attempt",
             "max_runtime_seconds",
+            "deadline_at",
             "artifact_required",
             "created_at",
             "updated_at",
@@ -7170,6 +8961,196 @@ def _remote_run_connector_id(remote_run: dict[str, Any]) -> str:
         remote_run.get("connector_id")
         or _connector_for_profile(str(remote_run.get("profile") or ""))
     ).strip()[:128]
+
+
+def _assert_remote_run_account_boundary(
+    conversation: dict[str, Any],
+    remote_run: dict[str, Any],
+) -> None:
+    owner_id = str(conversation.get("owner_id") or LOCAL_OWNER_ID).strip()
+    run_owner = str(remote_run.get("owner_id") or "").strip()
+    run_generation = str(remote_run.get("account_generation") or "").strip()
+    if run_owner != owner_id or not run_generation:
+        raise CollaborationAccountDeletionInProgress()
+    live_generation = _account_generation_for_owner(owner_id)
+    conversation_generation = str(
+        conversation.get("account_generation") or ""
+    ).strip()
+    if (
+        run_generation != live_generation
+        or (conversation_generation and run_generation != conversation_generation)
+    ):
+        raise CollaborationAccountDeletionInProgress()
+
+
+def _remote_profile_server_cap_seconds(profile: str) -> int:
+    return 1800 if str(profile or "").strip() == "pc-worker" else 900
+
+
+def _positive_int(value: Any) -> Optional[int]:
+    try:
+        parsed = int(value)
+    except (TypeError, ValueError, OverflowError):
+        return None
+    return parsed if parsed > 0 else None
+
+
+def _remote_run_deadline_fields(
+    hosted: dict[str, Any],
+    profile: str,
+    now: int,
+) -> tuple[int, int]:
+    """Return effective max runtime and deadline for one remote run."""
+
+    server_cap = _remote_profile_server_cap_seconds(profile)
+    route_metadata = hosted.get("route_metadata")
+    if not isinstance(route_metadata, dict):
+        route_metadata = {}
+    policy_candidates = [
+        hosted.get("max_runtime_seconds"),
+        route_metadata.get("remote_max_runtime_seconds"),
+        route_metadata.get("max_runtime_seconds"),
+    ]
+    policy_seconds = next(
+        (item for item in (_positive_int(value) for value in policy_candidates) if item),
+        None,
+    )
+    max_runtime = min(
+        value for value in (server_cap, policy_seconds) if value is not None
+    )
+    deadline = now + max_runtime * 1000
+    hosted_deadline = _positive_int(hosted.get("deadline_at"))
+    if hosted_deadline is not None:
+        deadline = min(deadline, hosted_deadline)
+        max_runtime = max(1, int((deadline - now + 999) // 1000))
+    return max_runtime, deadline
+
+
+def _request_remote_timeout_locked(
+    hosted: dict[str, Any],
+    remote_run: dict[str, Any],
+    *,
+    now: int,
+) -> bool:
+    """Advance one overdue remote run toward a timeout terminal state."""
+
+    status = str(remote_run.get("status") or "queued").strip().lower()
+    if status in _REMOTE_TERMINAL_STATUSES:
+        return False
+    deadline_at = _positive_int(remote_run.get("deadline_at"))
+    timeout_requested = (
+        bool(remote_run.get("cancel_requested"))
+        and str(remote_run.get("cancel_kind") or "") == "timeout"
+    )
+    if not timeout_requested and (deadline_at is None or now < deadline_at):
+        return False
+    if timeout_requested:
+        force_terminal_at = _positive_int(remote_run.get("cancel_force_terminal_at"))
+        if force_terminal_at is None or now < force_terminal_at:
+            return False
+        remote_run.update(
+            {
+                "status": "timed_out",
+                "terminal": True,
+                "error": remote_run.get("error") or "Remote run timed out",
+                "summary": remote_run.get("summary") or "Remote run timed out",
+                "completed_at": now,
+                "updated_at": now,
+            }
+        )
+        _seal_remote_run_claim(remote_run, now=now)
+        return True
+
+    old_token = str(remote_run.pop("claim_token", "") or "")
+    if old_token:
+        remote_run["superseded_claim_sha256"] = hashlib.sha256(
+            old_token.encode("utf-8")
+        ).hexdigest()
+    remote_run.pop("lease_owner", None)
+    remote_run["lease_until"] = 0
+    remote_run.update(
+        {
+            "status": "cancel_requested",
+            "cancel_requested": True,
+            "cancel_kind": "timeout",
+            "cancel_reason": "Remote run timed out",
+            "cancel_requested_at": now,
+            "cancel_force_terminal_at": now + _REMOTE_CANCELLATION_GRACE_SECONDS * 1000,
+            "updated_at": now,
+        }
+    )
+    hosted.update(
+        {
+            "stage": "awaiting_cancellation",
+            "remote_cancel_pending": True,
+            "updated_at": now,
+        }
+    )
+    return True
+
+
+def _advance_remote_run_deadlines(
+    state: dict[str, Any],
+    *,
+    now: Optional[int] = None,
+) -> set[str]:
+    """Apply remote timeout transactions and return changed conversation ids."""
+
+    instant = int(time.time() * 1000) if now is None else int(now)
+    changed_conversation_ids: set[str] = set()
+    for conversation in state.get("conversations") or []:
+        if not isinstance(conversation, dict):
+            continue
+        for hosted in (conversation.get("hosted_turns") or {}).values():
+            if not isinstance(hosted, dict):
+                continue
+            for remote_run in (hosted.get("remote_runs") or {}).values():
+                if not isinstance(remote_run, dict):
+                    continue
+                if _request_remote_timeout_locked(hosted, remote_run, now=instant):
+                    changed_conversation_ids.add(str(conversation.get("id") or ""))
+    return {item for item in changed_conversation_ids if item}
+
+
+def _advance_remote_run_deadline(remote_run_id: str) -> dict[str, Any] | None:
+    changed_conversation_ids: set[str] = set()
+    persisted: dict[str, Any] | None = None
+    now = int(time.time() * 1000)
+    with _STATE_LOCK:
+        state = load_single_state()
+        location = _remote_run_location(state, remote_run_id)
+        if location is None:
+            return None
+        conversation, hosted, _role_key, remote_run = location
+        if _request_remote_timeout_locked(hosted, remote_run, now=now):
+            save_single_state(state)
+            changed_conversation_ids.add(str(conversation.get("id") or ""))
+        persisted = dict(remote_run)
+    for conversation_id in changed_conversation_ids:
+        _notify_hosted_update(conversation_id)
+    return persisted
+
+
+def _connector_conflict(reason: str, message: str) -> HTTPException:
+    """Build the stable connector-v2 conflict envelope."""
+
+    return HTTPException(
+        status_code=409,
+        detail={"reason": str(reason), "message": str(message)},
+    )
+
+
+def _require_connector_account_boundary(
+    conversation: dict[str, Any],
+    remote_run: dict[str, Any],
+) -> None:
+    try:
+        _assert_remote_run_account_boundary(conversation, remote_run)
+    except CollaborationAccountDeletionInProgress as exc:
+        raise _connector_conflict(
+            "generation_deleted",
+            "Remote run account generation was deleted",
+        ) from exc
 
 
 def _remote_run_id(
@@ -7209,14 +9190,41 @@ def _ensure_remote_run(
         hosted = (conversation.get("hosted_turns") or {}).get(turn_id)
         if not isinstance(hosted, dict):
             raise RuntimeError("托管任务记录不存在")
+        owner_id = str(conversation.get("owner_id") or LOCAL_OWNER_ID).strip()
+        live_generation = _account_generation_for_owner(owner_id)
+        account_generation = str(
+            conversation.get("account_generation")
+            or hosted.get("account_generation")
+            or ""
+        ).strip()
+        if account_generation and account_generation != live_generation:
+            raise CollaborationAccountDeletionInProgress()
+        account_generation = live_generation
+        conversation["account_generation"] = account_generation
+        hosted["account_generation"] = account_generation
         remote_runs = hosted.get("remote_runs")
         if not isinstance(remote_runs, dict):
             remote_runs = {}
             hosted["remote_runs"] = remote_runs
         existing = remote_runs.get(role_stage)
         if isinstance(existing, dict) and str(existing.get("id") or "") == remote_id:
+            existing_owner = str(existing.get("owner_id") or "").strip()
+            existing_generation = str(
+                existing.get("account_generation") or ""
+            ).strip()
+            if existing_owner and existing_owner != owner_id:
+                raise CollaborationAccountDeletionInProgress()
+            if existing_generation and existing_generation != account_generation:
+                raise CollaborationAccountDeletionInProgress()
+            if not existing_owner or not existing_generation:
+                existing["owner_id"] = owner_id
+                existing["account_generation"] = account_generation
+                save_single_state(state)
             return dict(existing)
         now = int(time.time() * 1000)
+        max_runtime_seconds, deadline_at = _remote_run_deadline_fields(
+            hosted, profile, now
+        )
         record = {
             "id": remote_id,
             "idempotency_key": f"collaboration:{conversation_id}:{turn_id}:{role_stage}",
@@ -7224,12 +9232,14 @@ def _ensure_remote_run(
             "turn_id": turn_id,
             "role_stage": role_stage,
             "profile": profile,
+            "owner_id": owner_id,
+            "account_generation": account_generation,
             "connector_id": connector_id.strip()[:128] or _connector_for_profile(profile),
             "title": title,
             "objective": objective,
             "local_task_id": local_task_id,
             "attempt": max(1, int(attempt)),
-            "max_runtime_seconds": 1800 if profile == "pc-worker" else 900,
+            "max_runtime_seconds": max_runtime_seconds,
             "artifact_required": bool(artifact_required),
             "delivery_context": delivery_context,
             "attachment_context": attachment_context,
@@ -7251,6 +9261,7 @@ def _ensure_remote_run(
             "created_at": now,
             "updated_at": now,
         }
+        record["deadline_at"] = deadline_at
         remote_runs[role_stage] = record
         save_single_state(state)
     _notify_hosted_update(conversation_id)
@@ -7326,6 +9337,7 @@ def request_hosted_turn_cancellation(
     turn_id: str,
     *,
     reason: str = "用户取消",
+    request_id: str = "",
 ) -> dict[str, Any]:
     with _STATE_LOCK:
         state = load_single_state()
@@ -7340,10 +9352,28 @@ def request_hosted_turn_cancellation(
             pending[turn_id] = {
                 "turn_id": turn_id,
                 "cancel_requested": True,
+                "cancel_request_id": str(request_id or f"cancel-{turn_id}")[:256],
                 "cancel_reason": str(reason or "用户取消").strip() or "用户取消",
                 "cancel_requested_at": now,
                 "updated_at": now,
             }
+            append_hosted_event(
+                conversation,
+                conversation_id=conversation_id,
+                turn_id=turn_id,
+                role_stage="turn",
+                event_type="turn.cancel_requested",
+                entity_id=turn_id,
+                idempotency_key=f"turn:{turn_id}:cancel-requested",
+                account_generation=_account_generation_for_owner(
+                    str(conversation.get("owner_id") or LOCAL_OWNER_ID)
+                ),
+                payload={
+                    "entity_id": turn_id,
+                    "reason": str(reason or "用户取消").strip() or "用户取消",
+                },
+                occurred_at=now,
+            )
             if len(pending) > 2000:
                 oldest = sorted(
                     pending,
@@ -7361,8 +9391,14 @@ def request_hosted_turn_cancellation(
         run.update(
             {
                 "cancel_requested": True,
+                "cancel_request_id": str(
+                    run.get("cancel_request_id")
+                    or request_id
+                    or f"cancel-{turn_id}"
+                )[:256],
                 "cancel_reason": clean_reason,
                 "cancel_requested_at": now,
+                "stage": "cancel_requested",
                 "updated_at": now,
             }
         )
@@ -7382,20 +9418,34 @@ def request_hosted_turn_cancellation(
                 }
             )
         conversation["updated_at"] = now
+        append_hosted_event(
+            conversation,
+            conversation_id=conversation_id,
+            turn_id=turn_id,
+            role_stage="turn",
+            event_type="turn.cancel_requested",
+            entity_id=turn_id,
+            idempotency_key=f"turn:{turn_id}:cancel-requested",
+            account_generation=_account_generation_for_owner(
+                str(conversation.get("owner_id") or LOCAL_OWNER_ID)
+            ),
+            payload={"entity_id": turn_id, "reason": clean_reason},
+            occurred_at=now,
+        )
         save_single_state(state)
         persisted = dict(run)
-    _finish_hosted_turn_if_cancelled(conversation_id, turn_id)
     with _STATE_LOCK:
         state = load_single_state()
         conversation = _conversation_by_id(state, conversation_id)
         current = (conversation.get("hosted_turns") or {}).get(turn_id)
         persisted = dict(current) if isinstance(current, dict) else persisted
-    _schedule_persisted_terminal_notification(
-        conversation_id,
-        turn_id,
-        persisted,
-        fallback_result=str(persisted.get("cancel_reason") or "用户取消"),
-    )
+    if str(persisted.get("status") or "") in _HOSTED_TERMINAL_STATUSES:
+        _schedule_persisted_terminal_notification(
+            conversation_id,
+            turn_id,
+            persisted,
+            fallback_result=str(persisted.get("cancel_reason") or "用户取消"),
+        )
     return persisted
 
 
@@ -7425,6 +9475,12 @@ def _finish_hosted_turn_if_cancelled(
             return False
         if run.get("status") in {"completed", "cancelled"}:
             return run.get("status") == "cancelled"
+        if any(
+            isinstance(remote, dict)
+            and str(remote.get("status") or "queued") not in _REMOTE_TERMINAL_STATUSES
+            for remote in (run.get("remote_runs") or {}).values()
+        ):
+            return False
         reason = str(run.get("cancel_reason") or "用户取消")
     now = int(time.time() * 1000)
     _persist_hosted_turn(
@@ -7454,6 +9510,20 @@ def _finish_hosted_turn_if_cancelled(
                 "final_report": True,
             },
         },
+        protocol_events=[
+            {
+                "role_stage": "turn",
+                "event_type": "turn.cancelled",
+                "entity_id": turn_id,
+                "idempotency_key": f"turn:{turn_id}:cancelled",
+                "occurred_at": now,
+                "payload": {
+                    "entity_id": turn_id,
+                    "status": "cancelled",
+                    "reason": reason,
+                },
+            }
+        ],
     )
     return True
 
@@ -7662,11 +9732,22 @@ def _hosted_chat_attachment_context(
     if not attachment_ids:
         return str(run.get("attachment_context") or "").strip()
     owner_id = str(conversation.get("owner_id") or LOCAL_OWNER_ID).strip()
+    account_generation = str(
+        run.get("account_generation")
+        or conversation.get("account_generation")
+        or ""
+    ).strip()
+    if not account_generation:
+        return "This turn's attachment boundary is unavailable."
     lines: list[str] = []
     library = _file_library()
     for file_id in attachment_ids:
         try:
-            record, stored_path = library.resolve_download(owner_id, file_id)
+            record, stored_path = library.resolve_download(
+                owner_id,
+                file_id,
+                account_generation=account_generation,
+            )
         except (KeyError, FileNotFoundError, ValueError, OSError):
             continue
         path = str(stored_path)
@@ -7691,6 +9772,8 @@ def execute_hosted_chat(
     runner: Callable[[str, str], str] = run_profile_turn,
     model_retry_delay_seconds: float = _HOSTED_CHAT_API_RETRY_DELAY_SECONDS,
     model_retry_sleeper: Callable[[float], None] = time.sleep,
+    provider_max_attempts: Optional[int] = None,
+    provider_retry_sleeper: Callable[[float], None] = time.sleep,
 ) -> None:
     """Run a durable simple turn through exactly one default Hermes."""
     with _STATE_LOCK:
@@ -7710,12 +9793,20 @@ def execute_hosted_chat(
             conversation.get("profile") or "default"
         )
         now = int(time.time() * 1000)
+        model_retry_started_at = int(run.get("model_retry_started_at") or now)
+        model_retry_deadline_at = int(
+            run.get("model_retry_deadline_at")
+            or model_retry_started_at + (_HOSTED_CHAT_MODEL_BUDGET_SECONDS * 1000)
+        )
         run.update({
             "status": "running",
             "stage": "chat",
             "updated_at": now,
             "deadline_at": now + (_HOSTED_CHAT_TIMEOUT_SECONDS * 1000),
             "lease_expires_at": now + (_HOSTED_CHAT_TIMEOUT_SECONDS * 1000),
+            "model_retry_started_at": model_retry_started_at,
+            "model_retry_deadline_at": model_retry_deadline_at,
+            "model_retry_max_attempts": _HOSTED_CHAT_API_ATTEMPTS,
         })
         run.setdefault("started_at", now)
         _ensure_hosted_output_baseline(conversation_id, run)
@@ -7789,6 +9880,8 @@ def execute_hosted_chat(
         runtime_session_id=runtime_session_id,
         start_text="",
         previous_state=(run.get("role_events") or {}).get("chat"),
+        provider_max_attempts=provider_max_attempts,
+        retry_sleeper=provider_retry_sleeper,
     )
     if _finish_hosted_turn_if_cancelled(conversation_id, turn_id):
         return
@@ -8284,7 +10377,17 @@ def execute_hosted_workflow(
     *,
     runner: Callable[[str, str], str] = run_profile_turn,
     task_creator: Callable[..., dict[str, Any]] = create_hosted_kanban_task,
+    manager_runner: Optional[Callable[[str, str], str]] = None,
+    provider_max_attempts: Optional[int] = None,
+    provider_retry_sleeper: Callable[[float], None] = time.sleep,
 ) -> None:
+    captured_generation = str(
+        getattr(_HOSTED_EXECUTION_GENERATION, "value", "")
+    ).strip()
+    live_generation = _hosted_turn_account_generation(conversation_id, turn_id)
+    if captured_generation and captured_generation != live_generation:
+        raise RuntimeError("stale hosted turn account generation")
+    execution_generation = captured_generation or live_generation
     with _STATE_LOCK:
         state = load_single_state()
         conversation = _conversation_by_id(state, conversation_id)
@@ -8304,7 +10407,13 @@ def execute_hosted_workflow(
         run = dict(run)
 
     if str(run.get("mode") or "work").lower() == "chat":
-        execute_hosted_chat(conversation_id, turn_id, runner=runner)
+        execute_hosted_chat(
+            conversation_id,
+            turn_id,
+            runner=runner,
+            provider_max_attempts=provider_max_attempts,
+            provider_retry_sleeper=provider_retry_sleeper,
+        )
         return
 
     # The public instance intentionally ships only the default Profile. Real
@@ -8334,7 +10443,7 @@ def execute_hosted_workflow(
         else {}
     )
     manager_result = str(run.get("manager_result") or "")
-    if remote_workers and not manager_plan:
+    if (remote_workers or manager_runner is not None) and not manager_plan:
         _persist_hosted_turn(
             conversation_id,
             turn_id,
@@ -8358,36 +10467,50 @@ def execute_hosted_workflow(
                 },
             },
         )
-        manager_result, manager_status, _manager_state = _run_hosted_remote_role(
-            conversation_id,
-            turn_id,
-            profile=_DBB3_MANAGER_PROFILE,
-            role_stage="manager_planning",
-            role_label=f"{_HERMES_MANAGER_LABEL} · 规划",
-            prompt="\n".join(
-                item
-                for item in (
-                    _manager_plan_prompt(
-                        content=content,
-                        fallback_workers=fallback_worker_profiles,
-                        attachment_context=attachment_context,
-                        artifact_required=artifact_required,
-                    ),
-                    hosted_intervention_context(
-                        conversation_id,
-                        turn_id,
-                        role_stage="dispatcher",
-                    ),
-                )
-                if item
-            ),
-            kanban_task_id="",
-            start_text="正在评估难度并形成结构化执行计划。",
-            artifact_required=False,
-            delivery_context="Return only the requested JSON plan.",
-            attachment_context=attachment_context,
-            connector_id="dbb3-primary",
+        manager_prompt = "\n".join(
+            item
+            for item in (
+                _manager_plan_prompt(
+                    content=content,
+                    fallback_workers=fallback_worker_profiles,
+                    attachment_context=attachment_context,
+                    artifact_required=artifact_required,
+                ),
+                hosted_intervention_context(
+                    conversation_id,
+                    turn_id,
+                    role_stage="dispatcher",
+                ),
+            )
+            if item
         )
+        if remote_workers:
+            manager_result, manager_status, _manager_state = _run_hosted_remote_role(
+                conversation_id,
+                turn_id,
+                profile=_DBB3_MANAGER_PROFILE,
+                role_stage="manager_planning",
+                role_label=f"{_HERMES_MANAGER_LABEL} · 规划",
+                prompt=manager_prompt,
+                kanban_task_id="",
+                start_text="正在评估难度并形成结构化执行计划。",
+                artifact_required=False,
+                delivery_context="Return only the requested JSON plan.",
+                attachment_context=attachment_context,
+                connector_id="dbb3-primary",
+            )
+        else:
+            manager_result, manager_status, _manager_state = _run_hosted_role(
+                conversation_id,
+                turn_id,
+                profile=_DBB3_MANAGER_PROFILE,
+                role_stage="manager_planning",
+                role_label=f"{_HERMES_MANAGER_LABEL} · 规划",
+                prompt=manager_prompt,
+                runner=manager_runner or runner,
+                kanban_task_id="",
+                start_text="正在评估难度并形成结构化执行计划。",
+            )
         if manager_status != "completed":
             raise RuntimeError(manager_result or f"{_HERMES_MANAGER_NAME} planning failed")
         manager_plan = _normalize_manager_plan(
@@ -8719,6 +10842,8 @@ def execute_hosted_workflow(
         with ThreadPoolExecutor(
             max_workers=len(pending_workers),
             thread_name_prefix=f"hosted-workers-{turn_id[-8:]}",
+            initializer=_set_hosted_execution_generation,
+            initargs=(execution_generation,),
         ) as executor:
             futures = {
                 executor.submit(execute_worker, profile): profile
@@ -8992,6 +11117,8 @@ def execute_hosted_workflow(
         with ThreadPoolExecutor(
             max_workers=len(worker_profiles),
             thread_name_prefix=f"hosted-rework-{turn_id[-8:]}-{active_rework_round}",
+            initializer=_set_hosted_execution_generation,
+            initargs=(execution_generation,),
         ) as executor:
             futures = {
                 executor.submit(
@@ -9197,35 +11324,36 @@ def execute_hosted_workflow(
         if isinstance(run.get("manager_handoff"), dict)
         else {}
     )
-    if remote_workers and not manager_handoff:
+    if (remote_workers or manager_runner is not None) and not manager_handoff:
         _persist_hosted_turn(
             conversation_id,
             turn_id,
             patch={"stage": "manager_handoff"},
         )
-        manager_handoff_result, manager_handoff_status, _handoff_state = (
-            _run_hosted_remote_role(
+        manager_handoff_prompt = "\n".join(
+            (
+                "你是 Hermes Manager。根据下方已经完成的执行与审阅记录生成结构化交接，不能重新执行任务，不能补写不存在的证据。",
+                hosted_progress_protocol(_HERMES_MANAGER_LABEL),
+                hosted_role_delivery_contract(_HERMES_MANAGER_LABEL),
+                mention_priority_protocol(_HERMES_MANAGER_LABEL),
+                hosted_intervention_context(
+                    conversation_id,
+                    turn_id,
+                    role_stage="dispatcher",
+                ),
+                "服务端会固定 task_goal、plan、worker_results、review_verdict、rework_history、artifacts 和 failures；你无权覆盖这些字段。",
+                '只输出一个 JSON 对象：{"suggested_conclusion":"..."}，不得附加正文或伪造权威字段。',
+                json.dumps(source_handoff, ensure_ascii=False, default=str),
+            )
+        )
+        if remote_workers:
+            manager_handoff_result, manager_handoff_status, _handoff_state = _run_hosted_remote_role(
                 conversation_id,
                 turn_id,
                 profile=_DBB3_MANAGER_PROFILE,
                 role_stage="manager_handoff",
                 role_label=f"{_HERMES_MANAGER_LABEL} · 交接",
-                prompt="\n".join(
-                    (
-                        "你是 Hermes Manager。根据下方已经完成的执行与审阅记录生成结构化交接，不能重新执行任务，不能补写不存在的证据。",
-                        hosted_progress_protocol(_HERMES_MANAGER_LABEL),
-                        hosted_role_delivery_contract(_HERMES_MANAGER_LABEL),
-                        mention_priority_protocol(_HERMES_MANAGER_LABEL),
-                        hosted_intervention_context(
-                            conversation_id,
-                            turn_id,
-                            role_stage="dispatcher",
-                        ),
-                        "服务端会固定 task_goal、plan、worker_results、review_verdict、rework_history、artifacts 和 failures；你无权覆盖这些字段。",
-                        '只输出一个 JSON 对象：{"suggested_conclusion":"..."}，不得附加正文或伪造权威字段。',
-                        json.dumps(source_handoff, ensure_ascii=False, default=str),
-                    )
-                ),
+                prompt=manager_handoff_prompt,
                 kanban_task_id=task_id,
                 start_text="正在整理执行、审阅、返工和产物证据。",
                 artifact_required=False,
@@ -9233,7 +11361,18 @@ def execute_hosted_workflow(
                 attachment_context="",
                 connector_id="dbb3-primary",
             )
-        )
+        else:
+            manager_handoff_result, manager_handoff_status, _handoff_state = _run_hosted_role(
+                conversation_id,
+                turn_id,
+                profile=_DBB3_MANAGER_PROFILE,
+                role_stage="manager_handoff",
+                role_label=f"{_HERMES_MANAGER_LABEL} · 交接",
+                prompt=manager_handoff_prompt,
+                runner=manager_runner or runner,
+                kanban_task_id=task_id,
+                start_text="正在整理执行、审阅、返工和产物证据。",
+            )
         if manager_handoff_status != "completed":
             raise RuntimeError(manager_handoff_result or f"{_HERMES_MANAGER_NAME} handoff failed")
         manager_handoff = _normalize_manager_handoff(
@@ -9583,11 +11722,46 @@ def _next_hosted_turn_id(
             )
             if isinstance(run, dict)
             and str(run.get("status") or "queued") in {"queued", "running"}
+            and str(run.get("stage") or "") not in {"routing_pending", "routing_failed"}
             and str(candidate_turn_id) not in (excluded or set())
         ]
     if not candidates:
         return ""
     return min(candidates)[2]
+
+
+def _hosted_turn_account_generation(conversation_id: str, turn_id: str) -> str:
+    with _STATE_LOCK:
+        state = load_single_state()
+        conversation = _conversation_by_id(state, conversation_id)
+        run = (conversation.get("hosted_turns") or {}).get(turn_id)
+        if not isinstance(run, dict):
+            raise RuntimeError("Hosted turn record does not exist")
+        owner_id = str(conversation.get("owner_id") or LOCAL_OWNER_ID)
+        live_generation = _account_generation_for_owner(owner_id)
+        conversation_generation = str(
+            conversation.get("account_generation") or ""
+        ).strip()
+        run_generation = str(run.get("account_generation") or "").strip()
+        if (
+            (conversation_generation and conversation_generation != live_generation)
+            or (run_generation and run_generation != live_generation)
+        ):
+            raise RuntimeError("stale hosted turn account generation")
+        changed = False
+        if not conversation_generation:
+            conversation["account_generation"] = live_generation
+            changed = True
+        if not run_generation:
+            run["account_generation"] = live_generation
+            changed = True
+        if changed:
+            save_single_state(state)
+        return live_generation
+
+
+def _set_hosted_execution_generation(account_generation: str) -> None:
+    _HOSTED_EXECUTION_GENERATION.value = str(account_generation or "").strip()
 
 
 def start_hosted_workflow(conversation_id: str, turn_id: str) -> threading.Thread:
@@ -9609,6 +11783,12 @@ def start_hosted_workflow(conversation_id: str, turn_id: str) -> threading.Threa
                     if not current_turn_id:
                         break
                     attempted_turn_ids.add(current_turn_id)
+                    _set_hosted_execution_generation(
+                        _hosted_turn_account_generation(
+                            conversation_id,
+                            current_turn_id,
+                        )
+                    )
                     try:
                         with _hosted_conversation_execution_lock(conversation_id):
                             execute_hosted_workflow(
@@ -9656,6 +11836,7 @@ def start_hosted_workflow(conversation_id: str, turn_id: str) -> threading.Threa
                                 fallback_result=clean_error,
                             )
             finally:
+                _set_hosted_execution_generation("")
                 with _HOSTED_THREADS_LOCK:
                     _HOSTED_THREADS.pop(key, None)
                 try:
@@ -9704,7 +11885,10 @@ def resume_unfinished_hosted_workflows(
             if not isinstance(run, dict):
                 continue
             if run.get("status") in {"queued", "running"}:
-                start_hosted_workflow(conversation_id, str(turn_id))
+                if str(run.get("stage") or "") in {"routing_pending", "routing_failed"}:
+                    start_hosted_routing(conversation_id, str(turn_id))
+                else:
+                    start_hosted_workflow(conversation_id, str(turn_id))
                 continue
             notification = run.get("notification")
             if (
@@ -9753,6 +11937,7 @@ def _claim_legacy_rooms_in_state(
     state: dict[str, Any],
     owner_id: str,
     *,
+    account_generation: str = "",
     requested_room_id: str = "",
 ) -> bool:
     """Assign pre-account rooms once, without reopening claimed records."""
@@ -9760,23 +11945,52 @@ def _claim_legacy_rooms_in_state(
     normalized_owner = str(owner_id or "").strip()
     if not normalized_owner:
         return False
+    generation = str(
+        account_generation or _account_generation_for_owner(normalized_owner)
+    ).strip()
     if requested_room_id:
         requested_room = _room_by_id(state, requested_room_id)
         requested_owner = str(requested_room.get("owner_id") or "").strip()
-        if requested_owner == normalized_owner:
+        requested_generation = str(
+            requested_room.get("account_generation") or ""
+        ).strip()
+        if (
+            requested_owner == normalized_owner
+            and requested_generation == generation
+        ):
             return False
-        if not _legacy_owner_claim_allowed(requested_owner, normalized_owner):
+        if requested_generation or not (
+            _legacy_owner_claim_allowed(requested_owner, normalized_owner)
+            or (
+                requested_owner == normalized_owner
+                and (
+                    normalized_owner == LOCAL_OWNER_ID
+                    or _configured_legacy_owner_id() == normalized_owner
+                )
+            )
+        ):
             return False
     claimed = False
     for room in state.get("rooms") or []:
         if not isinstance(room, dict):
             continue
         existing_owner = str(room.get("owner_id") or "").strip()
-        if existing_owner == normalized_owner:
+        existing_generation = str(room.get("account_generation") or "").strip()
+        if existing_owner == normalized_owner and existing_generation == generation:
             continue
-        if not _legacy_owner_claim_allowed(existing_owner, normalized_owner):
+        if existing_generation or not (
+            _legacy_owner_claim_allowed(existing_owner, normalized_owner)
+            or (
+                existing_owner == normalized_owner
+                and (
+                    normalized_owner == LOCAL_OWNER_ID
+                    or _configured_legacy_owner_id() == normalized_owner
+                )
+            )
+        ):
             continue
         room["owner_id"] = normalized_owner
+        room["account_generation"] = generation
         claimed = True
     return claimed
 
@@ -9785,10 +11999,16 @@ def _owned_room_in_state(
     state: dict[str, Any],
     room_id: str,
     owner_id: str,
+    account_generation: str = "",
 ) -> dict[str, Any]:
     room = _room_by_id(state, room_id)
     existing_owner = str(room.get("owner_id") or "").strip()
     if existing_owner != owner_id:
+        raise HTTPException(status_code=404, detail="Room not found")
+    generation = str(
+        account_generation or _account_generation_for_owner(owner_id)
+    ).strip()
+    if str(room.get("account_generation") or "").strip() != generation:
         raise HTTPException(status_code=404, detail="Room not found")
     return room
 
@@ -9797,7 +12017,15 @@ def _room_conversation_in_state(
     room: dict[str, Any],
     single_state: dict[str, Any],
     owner_id: str,
+    account_generation: str = "",
 ) -> tuple[dict[str, Any], bool]:
+    generation = str(
+        account_generation
+        or room.get("account_generation")
+        or _account_generation_for_owner(owner_id)
+    ).strip()
+    if str(room.get("account_generation") or "").strip() != generation:
+        raise HTTPException(status_code=404, detail="Room not found")
     conversation_id = str(room.get("conversation_id") or "").strip()
     if conversation_id:
         mapped = next(
@@ -9821,6 +12049,7 @@ def _room_conversation_in_state(
     )
     conversation["id"] = f"chat_room_{room_id.removeprefix('room_')}"
     conversation["owner_id"] = owner_id
+    conversation["account_generation"] = generation
     conversation["room_id"] = room_id
     conversation["source"] = "collaboration_room"
     conversation["messages"] = normalize_stored_conversation_messages(
@@ -9942,6 +12171,17 @@ def _public_hosted_turns(hosted_turns: Any) -> dict[str, dict[str, Any]]:
 
 def _public_conversation(conversation: dict[str, Any]) -> dict[str, Any]:
     projected = dict(conversation)
+    # Append-only protocol/history collections have dedicated cursor endpoints.
+    # Keeping them out of every snapshot prevents quadratic mobile payloads.
+    for internal_key in (
+        "hosted_events",
+        "hosted_event_sequences",
+        "hosted_event_terminals",
+        "session_entries",
+        "session_entry_quarantine",
+        "session_entry_diagnostics",
+    ):
+        projected.pop(internal_key, None)
     projected["hosted_turns"] = _public_hosted_turns(
         conversation.get("hosted_turns")
     )
@@ -9970,14 +12210,25 @@ def _owned_conversation_in_state(
 
     conversation = _conversation_by_id(state, conversation_id)
     existing_owner = str(conversation.get("owner_id") or "").strip()
+    changed = False
     if conversation.get("delete_requested"):
         raise HTTPException(status_code=404, detail="Conversation not found")
-    if existing_owner == owner_id:
-        return conversation, False
-    if not _legacy_owner_claim_allowed(existing_owner, owner_id):
+    if existing_owner != owner_id:
+        if not _legacy_owner_claim_allowed(existing_owner, owner_id):
+            raise HTTPException(status_code=404, detail="Conversation not found")
+        conversation["owner_id"] = owner_id
+        changed = True
+    current_generation = _account_generation_for_owner(owner_id)
+    stored_generation = str(conversation.get("account_generation") or "").strip()
+    if stored_generation and stored_generation != current_generation:
         raise HTTPException(status_code=404, detail="Conversation not found")
-    conversation["owner_id"] = owner_id
-    return conversation, True
+    if not stored_generation:
+        conversation["account_generation"] = current_generation
+        for run in (conversation.get("hosted_turns") or {}).values():
+            if isinstance(run, dict) and not run.get("account_generation"):
+                run["account_generation"] = current_generation
+        changed = True
+    return conversation, changed
 
 
 def _native_activity_projection(
@@ -10183,6 +12434,59 @@ def _append_message(
     messages = room.setdefault("messages", [])
     messages.append(message)
     room["updated_at"] = message["created_at"]
+    if "hosted_turns" in room:
+        message_meta = message.get("meta") if isinstance(message.get("meta"), dict) else {}
+        turn_id = str(
+            message_meta.get("runtime_turn_id")
+            or message_meta.get("turn_id")
+            or message["id"]
+        )
+        role_stage = str(message_meta.get("role_stage") or role or "chat")
+        append_session_entry(
+            room,
+            entry_type="message",
+            idempotency_key=f"message:{message['id']}",
+            payload={
+                "message_id": message["id"],
+                "role": role,
+                "name": name,
+                "content": content,
+                "status": status,
+                "kind": kind,
+                "turn_id": turn_id,
+                "role_stage": role_stage,
+            },
+            occurred_at=message["created_at"],
+        )
+        _append_attachment_session_entries(
+            room,
+            turn_id=turn_id,
+            role_stage=role_stage,
+            attachments=message_meta.get("attachments"),
+            direction=("input" if role == "user" else "output"),
+            occurred_at=message["created_at"],
+        )
+        append_hosted_event(
+            room,
+            conversation_id=str(room.get("id") or "conversation"),
+            turn_id=turn_id,
+            role_stage=role_stage,
+            event_type="message.completed" if status in _HOSTED_TERMINAL_STATUSES else "message.started",
+            entity_id=message["id"],
+            idempotency_key=f"message-event:{message['id']}:{status}",
+            account_generation=_account_generation_for_owner(
+                str(room.get("owner_id") or LOCAL_OWNER_ID)
+            ),
+            payload={
+                "entity_id": message["id"],
+                "role": role,
+                "name": name,
+                "content": content,
+                "status": status,
+                "kind": kind,
+            },
+            occurred_at=message["created_at"],
+        )
     return message
 
 
@@ -10264,15 +12568,20 @@ class EnqueueHostedTurnBody(BaseModel):
     attachment_ids: list[str] = Field(default_factory=list)
     attachment_context: str = ""
     delivery_context: str = ""
+    required_provider: str = ""
+    required_model: str = ""
 
 
 class HostedTurnCancellationBody(BaseModel):
     reason: str = "用户取消"
+    request_id: str = ""
 
 
 class HostedTurnInterventionBody(BaseModel):
     content: str
     message_id: str = ""
+    delivery: str = "steer"
+    queue_mode: str = "one_at_a_time"
 
 
 class ConnectorPullBody(BaseModel):
@@ -10337,18 +12646,21 @@ def _require_remote_run_claim(
     supplied = str(claim_token or "").strip()
     expected = str(remote_run.get("claim_token") or "").strip()
     owner = str(remote_run.get("lease_owner") or "").strip()
+    if str(remote_run.get("status") or "") in _REMOTE_TERMINAL_STATUSES:
+        raise _connector_conflict(
+            "terminal_sealed",
+            "Remote run terminal state is sealed",
+        )
     if (
         not supplied
         or not expected
         or owner != connector_id
         or not hmac.compare_digest(supplied, expected)
     ):
-        raise HTTPException(status_code=409, detail="Remote run claim was lost")
-    if str(remote_run.get("status") or "") in _REMOTE_TERMINAL_STATUSES:
-        raise HTTPException(status_code=409, detail="Remote run claim is sealed")
+        raise _connector_conflict("claim_lost", "Remote run claim was lost")
     instant = int(time.time() * 1000) if now is None else int(now)
     if int(remote_run.get("lease_until") or 0) <= instant:
-        raise HTTPException(status_code=409, detail="Remote run lease expired")
+        raise _connector_conflict("lease_expired", "Remote run lease expired")
 
 
 def _seal_remote_run_claim(
@@ -10393,9 +12705,14 @@ def _require_active_remote_artifact_claim(
         or remote_run.get("cancel_requested")
         or remote_status not in _REMOTE_ARTIFACT_ACTIVE_STATUSES
     ):
-        raise HTTPException(
-            status_code=409,
-            detail="Remote run is not active for artifact upload",
+        reason = (
+            "terminal_sealed"
+            if remote_status in _REMOTE_TERMINAL_STATUSES
+            else "claim_lost"
+        )
+        raise _connector_conflict(
+            reason,
+            "Remote run is not active for artifact upload",
         )
     _require_remote_run_claim(
         remote_run,
@@ -10418,8 +12735,11 @@ def _validate_connector_batch(
 def _remote_run_for_connector(
     request: Request,
     remote_run_id: str,
+    *,
+    enforce_account_boundary: bool = True,
 ) -> tuple[dict[str, Any], dict[str, Any], dict[str, Any]]:
     connector_id = _require_connector(request)
+    _advance_remote_run_deadline(remote_run_id)
     with _STATE_LOCK:
         state = load_single_state()
         location = _remote_run_location(state, remote_run_id)
@@ -10428,6 +12748,8 @@ def _remote_run_for_connector(
         conversation, hosted, _role_key, remote_run = location
         if _remote_run_connector_id(remote_run) != connector_id:
             raise HTTPException(status_code=404, detail="Remote run not found")
+        if enforce_account_boundary:
+            _require_connector_account_boundary(conversation, remote_run)
         return conversation, hosted, remote_run
 
 
@@ -10435,6 +12757,18 @@ def _remote_run_connector_payload(remote_run: dict[str, Any]) -> dict[str, Any]:
     payload = _remote_run_public(remote_run)
     payload["remote_run_id"] = payload.pop("id", "")
     return payload
+
+
+@router.get("/connector/runs/{remote_run_id}")
+def connector_get_run(remote_run_id: str, request: Request):
+    """Return authoritative claim/terminal state for conflict reconciliation."""
+
+    _conversation, _hosted, remote_run = _remote_run_for_connector(
+        request,
+        remote_run_id,
+        enforce_account_boundary=False,
+    )
+    return {"run": _remote_run_connector_payload(remote_run)}
 
 
 def _sanitize_remote_activities(value: Any) -> list[dict[str, Any]]:
@@ -10459,7 +12793,7 @@ def _apply_remote_checkpoint(
     payload = _redact_sensitive(payload)
     status = str(payload.get("status") or "").strip().lower()
     terminal = bool(payload.get("terminal"))
-    if status not in {"running", "completed", "failed", "cancelled"}:
+    if status not in {"running", "completed", "failed", "cancelled", "timed_out"}:
         raise HTTPException(status_code=422, detail="Invalid remote run status")
     expected_terminal = status in _REMOTE_TERMINAL_STATUSES
     if terminal != expected_terminal:
@@ -10471,17 +12805,23 @@ def _apply_remote_checkpoint(
     if cursor < 0:
         raise HTTPException(status_code=422, detail="checkpoint_cursor must be non-negative")
 
+    now = int(time.time() * 1000)
     with _STATE_LOCK:
         state = load_single_state()
+        deadline_changes = _advance_remote_run_deadlines(state, now=now)
+        if deadline_changes:
+            save_single_state(state)
         location = _remote_run_location(state, remote_run_id)
         if location is None:
             raise HTTPException(status_code=404, detail="Remote run not found")
         conversation, hosted, role_key, remote_run = location
+        _require_connector_account_boundary(conversation, remote_run)
         connector_id = str(payload.get("connector_id") or "").strip()[:128]
         _require_remote_run_claim(
             remote_run,
             connector_id=connector_id,
             claim_token=payload.get("claim_token"),
+            now=now,
         )
         hosted_status = str(hosted.get("status") or "queued")
         current_status = str(remote_run.get("status") or "queued")
@@ -10490,10 +12830,10 @@ def _apply_remote_checkpoint(
             hosted_status in _HOSTED_TERMINAL_STATUSES
             or hosted.get("cancel_requested")
             or remote_run.get("cancel_requested")
-        ) and status != "cancelled":
-            raise HTTPException(
-                status_code=409,
-                detail="Remote run cancellation already won; late checkpoint rejected",
+        ) and status not in {"cancelled", "timed_out"}:
+            raise _connector_conflict(
+                "claim_lost",
+                "Remote run cancellation already won; late checkpoint rejected",
             )
         if current_status in _REMOTE_TERMINAL_STATUSES:
             return dict(remote_run), False
@@ -10505,13 +12845,12 @@ def _apply_remote_checkpoint(
                 for item in remote_run.get("artifacts") or []
             )
         ):
-            raise HTTPException(
-                status_code=409,
-                detail="Required artifact must be uploaded before completion",
+            raise _connector_conflict(
+                "artifact_required",
+                "Required artifact must be uploaded before completion",
             )
         if cursor < current_cursor:
             return dict(remote_run), False
-        now = int(time.time() * 1000)
         remote_run.update(
             {
                 "status": status,
@@ -10559,6 +12898,8 @@ def _apply_remote_checkpoint(
     )
     if expected_terminal:
         _finalize_pending_conversation_deletion(conversation_id)
+    if status == "cancelled":
+        _finish_hosted_turn_if_cancelled(conversation_id, turn_id)
     return persisted, True
 
 
@@ -10592,14 +12933,175 @@ def connector_health(request: Request):
     }
 
 
+def _deployment_sqlite_health(
+    conn: Any,
+    *,
+    code_schema_version: int,
+    required_tables: tuple[str, ...] = (),
+    required_triggers: tuple[str, ...] = (),
+) -> dict[str, Any]:
+    db_user_version = int(conn.execute("PRAGMA user_version").fetchone()[0])
+    integrity = str(conn.execute("PRAGMA integrity_check").fetchone()[0])
+    schema_rows = conn.execute(
+        "SELECT type,name,tbl_name,COALESCE(sql,'') AS sql "
+        "FROM sqlite_master WHERE name NOT LIKE 'sqlite_%' "
+        "ORDER BY type,name"
+    ).fetchall()
+    schema_records = [
+        [str(row[0]), str(row[1]), str(row[2]), str(row[3])]
+        for row in schema_rows
+    ]
+    tables = {record[1] for record in schema_records if record[0] == "table"}
+    triggers = {record[1] for record in schema_records if record[0] == "trigger"}
+    compatible = (
+        db_user_version == int(code_schema_version)
+        and integrity == "ok"
+        and set(required_tables).issubset(tables)
+        and set(required_triggers).issubset(triggers)
+    )
+    return {
+        "ok": compatible,
+        "code_schema_version": int(code_schema_version),
+        "db_user_version": db_user_version,
+        "integrity_check": integrity,
+        "schema_sha256": hashlib.sha256(
+            json.dumps(
+                schema_records,
+                ensure_ascii=True,
+                separators=(",", ":"),
+            ).encode("utf-8")
+        ).hexdigest(),
+        "required_tables": list(required_tables),
+        "required_triggers": list(required_triggers),
+    }
+
+
+@router.get("/connector/deployment-health")
+def connector_deployment_health(request: Request) -> dict[str, Any]:
+    """Prove release identity and every deployment-owned SQLite schema."""
+
+    connector = connector_health(request)
+    from hermes_cli.cloud_file_library import SCHEMA_VERSION as cloud_schema_version
+    from hermes_cli.dashboard_auth.mobile_device_store import (
+        MobileDeviceStore,
+        SCHEMA_VERSION as mobile_schema_version,
+    )
+    from hermes_cli.managed_installations import (
+        MANAGED_INSTALLATIONS_SCHEMA_VERSION,
+        connect_managed_installations_database,
+        managed_installations_db_path,
+    )
+
+    library = _file_library()
+    with library.connection() as cloud_conn:
+        cloud = _deployment_sqlite_health(
+            cloud_conn,
+            code_schema_version=cloud_schema_version,
+            required_tables=("account_files", "file_install_intents"),
+        )
+    mobile_conn = MobileDeviceStore().connect()
+    try:
+        mobile = _deployment_sqlite_health(
+            mobile_conn,
+            code_schema_version=mobile_schema_version,
+            required_tables=(
+                "mobile_devices",
+                "mobile_sessions",
+                "mobile_account_deletion_outbox",
+            ),
+        )
+    finally:
+        mobile_conn.close()
+    managed_conn = connect_managed_installations_database(
+        managed_installations_db_path()
+    )
+    try:
+        managed = _deployment_sqlite_health(
+            managed_conn,
+            code_schema_version=MANAGED_INSTALLATIONS_SCHEMA_VERSION,
+            required_tables=(
+                "managed_installations",
+                "managed_installation_targets",
+                "managed_resource_catalog",
+                "managed_resource_events",
+            ),
+            required_triggers=("managed_installation_source_lock_immutable",),
+        )
+        managed["catalog_rows"] = int(
+            managed_conn.execute(
+                "SELECT COUNT(*) FROM managed_resource_catalog"
+            ).fetchone()[0]
+        )
+    finally:
+        managed_conn.close()
+
+    manifest_path = Path(__file__).with_name("manifest.json")
+    manifest_bytes = manifest_path.read_bytes()
+    manifest = json.loads(manifest_bytes.decode("utf-8"))
+    databases = {
+        "cloud_files": cloud,
+        "mobile_auth": mobile,
+        "managed_resources": managed,
+    }
+    release: dict[str, str] = {}
+    evidence_path = Path(
+        os.environ.get(
+            "HERMES_RELEASE_EVIDENCE_FILE",
+            "/var/lib/hermes-agent/release-evidence.json",
+        )
+    )
+    if evidence_path.is_file() and not evidence_path.is_symlink():
+        try:
+            evidence = json.loads(evidence_path.read_text(encoding="utf-8"))
+        except (OSError, UnicodeError, json.JSONDecodeError):
+            evidence = {}
+        if (
+            isinstance(evidence, dict)
+            and evidence.get("schema") == "hermes.release-evidence.v1"
+            and evidence.get("phase") == "committed"
+        ):
+            commit = str(evidence.get("commit") or "")
+            if re.fullmatch(r"[0-9a-f]{40}", commit):
+                release = {
+                    "commit": commit,
+                    "version": str(evidence.get("version") or ""),
+                    "manifest_sha256": str(
+                        evidence.get("manifest_sha256") or ""
+                    ),
+                    "deployed_at": str(evidence.get("deployed_at") or ""),
+                }
+    return {
+        **connector,
+        "ok": bool(connector.get("ok")) and all(
+            item.get("ok") is True for item in databases.values()
+        ),
+        "manifest_version": str(manifest.get("version") or ""),
+        "manifest_sha256": hashlib.sha256(manifest_bytes).hexdigest(),
+        "managed_catalog_readable": managed.get("catalog_rows") is not None,
+        "release": release,
+        "databases": databases,
+    }
+
+
 def _connector_run_attachments(
     conversation: dict[str, Any],
     hosted: dict[str, Any],
 ) -> list[dict[str, Any]]:
     owner_id = str(conversation.get("owner_id") or LOCAL_OWNER_ID)
+    account_generation = str(
+        hosted.get("account_generation")
+        or conversation.get("account_generation")
+        or ""
+    ).strip()
+    if not account_generation:
+        return []
     records: list[dict[str, Any]] = []
     for file_id in list(dict.fromkeys(hosted.get("attachment_ids") or []))[:32]:
-        record = _file_library().get_file(owner_id, str(file_id))
+        record = _file_library().get_file(
+            owner_id,
+            str(file_id),
+            account_generation=account_generation,
+        )
         if record is None or record.get("status") != "available":
             continue
         records.append(
@@ -10654,8 +13156,19 @@ def connector_download_run_attachment(
     if file_id not in allowed:
         raise HTTPException(status_code=404, detail="Attachment not found")
     owner_id = str(conversation.get("owner_id") or LOCAL_OWNER_ID)
+    account_generation = str(
+        hosted.get("account_generation")
+        or conversation.get("account_generation")
+        or ""
+    ).strip()
+    if not account_generation:
+        raise HTTPException(status_code=404, detail="Attachment not found")
     try:
-        record, path = _file_library().resolve_download(owner_id, file_id)
+        record, path = _file_library().resolve_download(
+            owner_id,
+            file_id,
+            account_generation=account_generation,
+        )
     except (KeyError, FileNotFoundError, ValueError) as exc:
         raise HTTPException(status_code=404, detail="Attachment not found") from exc
     return FileResponse(
@@ -10665,6 +13178,7 @@ def connector_download_run_attachment(
         headers={
             "Cache-Control": "private, no-store",
             "ETag": f'"{record["sha256"]}"',
+            "X-Content-SHA256": str(record["sha256"]),
             "X-Content-Type-Options": "nosniff",
         },
     )
@@ -10681,6 +13195,10 @@ def connector_pull_runs(payload: ConnectorPullBody, request: Request):
     changed = False
     with _STATE_LOCK:
         state = load_single_state()
+        deadline_changes = _advance_remote_run_deadlines(state, now=now)
+        if deadline_changes:
+            changed_conversation_ids.update(deadline_changes)
+            changed = True
         for conversation in state.get("conversations") or []:
             if not isinstance(conversation, dict):
                 continue
@@ -10694,6 +13212,17 @@ def connector_pull_runs(payload: ConnectorPullBody, request: Request):
                     if profile not in _REMOTE_RUN_PROFILES:
                         continue
                     if _remote_run_connector_id(remote_run) != connector_id:
+                        continue
+                    try:
+                        _require_connector_account_boundary(conversation, remote_run)
+                    except HTTPException as exc:
+                        # Deleted generations are immutable. Exclude the work
+                        # without trying to mutate its tombstoned conversation.
+                        if not (
+                            isinstance(exc.detail, dict)
+                            and exc.detail.get("reason") == "generation_deleted"
+                        ):
+                            raise
                         continue
                     status = str(remote_run.get("status") or "queued")
                     old_lease = int(remote_run.get("lease_until") or 0)
@@ -10745,7 +13274,8 @@ def connector_ack_run(remote_run_id: str, payload: ConnectorAckBody, request: Re
         location = _remote_run_location(state, remote_run_id)
         if location is None:
             raise HTTPException(status_code=404, detail="Remote run not found")
-        _conversation, _hosted, _role_key, record = location
+        current_conversation, _hosted, _role_key, record = location
+        _require_connector_account_boundary(current_conversation, record)
         _require_remote_run_claim(
             record,
             connector_id=connector_id,
@@ -10755,11 +13285,17 @@ def connector_ack_run(remote_run_id: str, payload: ConnectorAckBody, request: Re
         expected_key = str(record.get("idempotency_key") or "")
         supplied_key = str(payload.idempotency_key or "")
         if supplied_key and supplied_key != expected_key:
-            raise HTTPException(status_code=409, detail="idempotency key mismatch")
+            raise _connector_conflict(
+                "claim_lost",
+                "Remote run idempotency key does not match the active claim",
+            )
         supplied_task = str(payload.remote_task_id or "").strip()
         existing_task = str(record.get("remote_task_id") or "").strip()
         if supplied_task and existing_task and supplied_task != existing_task:
-            raise HTTPException(status_code=409, detail="remote task mismatch")
+            raise _connector_conflict(
+                "claim_lost",
+                "Remote task does not match the active claim",
+            )
         if str(record.get("status") or "") in _REMOTE_TERMINAL_STATUSES:
             return {"run": _remote_run_connector_payload(record), "applied": False}
         record.update(
@@ -10813,9 +13349,14 @@ def connector_pull_cancellations(payload: ConnectorPullBody, request: Request):
     connector_id, limit, lease_seconds = _validate_connector_batch(payload, authenticated)
     now = int(time.time() * 1000)
     selected: list[dict[str, Any]] = []
+    changed_conversation_ids: set[str] = set()
     changed = False
     with _STATE_LOCK:
         state = load_single_state()
+        deadline_changes = _advance_remote_run_deadlines(state, now=now)
+        if deadline_changes:
+            changed_conversation_ids.update(deadline_changes)
+            changed = True
         for conversation in state.get("conversations") or []:
             if not isinstance(conversation, dict):
                 continue
@@ -10832,6 +13373,15 @@ def connector_pull_cancellations(payload: ConnectorPullBody, request: Request):
                         continue
                     if _remote_run_connector_id(remote_run) != connector_id:
                         continue
+                    try:
+                        _require_connector_account_boundary(conversation, remote_run)
+                    except HTTPException as exc:
+                        if not (
+                            isinstance(exc.detail, dict)
+                            and exc.detail.get("reason") == "generation_deleted"
+                        ):
+                            raise
+                        continue
                     old_lease = int(remote_run.get("cancel_lease_until") or 0)
                     if old_lease > now:
                         continue
@@ -10843,7 +13393,9 @@ def connector_pull_cancellations(payload: ConnectorPullBody, request: Request):
                     remote_run["lease_owner"] = connector_id
                     remote_run["lease_until"] = now + lease_seconds * 1000
                     remote_run["claim_token"] = claim_token
+                    remote_run["status"] = "cancelling"
                     remote_run["updated_at"] = now
+                    changed_conversation_ids.add(str(conversation.get("id") or ""))
                     selected.append(
                         {
                             "remote_run_id": remote_run.get("id"),
@@ -10878,16 +13430,26 @@ def connector_pull_cancellations(payload: ConnectorPullBody, request: Request):
                 break
         if changed:
             save_single_state(state)
+    if changed:
+        for changed_conversation_id in changed_conversation_ids:
+            _notify_hosted_update(changed_conversation_id)
     return {"cancellations": selected, "server_time": now}
 
 
 @router.post("/connector/runs/{remote_run_id}/cancel-ack")
 def connector_cancel_ack(remote_run_id: str, payload: ConnectorCancelAckBody, request: Request):
     connector_id = _require_connector(request)
-    _remote_run_for_connector(request, remote_run_id)
+    _conversation, _hosted, remote_run = _remote_run_for_connector(
+        request, remote_run_id
+    )
     _validate_connector_claim(payload.connector_id, connector_id)
     body = payload.model_dump()
-    body.update({"status": "cancelled", "terminal": True})
+    terminal_status = (
+        "timed_out"
+        if str(remote_run.get("cancel_kind") or "") == "timeout"
+        else "cancelled"
+    )
+    body.update({"status": terminal_status, "terminal": True})
     persisted, applied = _apply_remote_checkpoint(remote_run_id, body)
     return {"run": _remote_run_connector_payload(persisted), "applied": applied}
 
@@ -10946,6 +13508,7 @@ async def connector_upload_artifact(remote_run_id: str, request: Request):
             raise HTTPException(status_code=422, detail="Artifact SHA-256 mismatch")
         library = _file_library()
         owner_id = ""
+        account_generation = ""
         record: dict[str, Any] | None = None
         previous_record: dict[str, Any] | None = None
         attachment: dict[str, Any] = {}
@@ -10970,8 +13533,23 @@ async def connector_upload_artifact(remote_run_id: str, request: Request):
                     claim_token=claim_token,
                 )
                 owner_id = str(current_conversation.get("owner_id") or LOCAL_OWNER_ID)
+                account_generation = str(
+                    current.get("account_generation")
+                    or current_hosted.get("account_generation")
+                    or current_conversation.get("account_generation")
+                    or ""
+                ).strip()
+                if not account_generation:
+                    raise HTTPException(
+                        status_code=409,
+                        detail="Remote run account generation is missing",
+                    )
                 origin_key = f"remote:{remote_run_id}:{relative_path}:{actual_sha}"
-                previous_record = library.get_file_by_origin(owner_id, origin_key)
+                previous_record = library.get_file_by_origin(
+                    owner_id,
+                    origin_key,
+                    account_generation=account_generation,
+                )
                 intents = current_hosted.get("artifact_upload_intents")
                 if not isinstance(intents, dict):
                     intents = {}
@@ -10980,6 +13558,7 @@ async def connector_upload_artifact(remote_run_id: str, request: Request):
                     "id": intent_id,
                     "status": "staging",
                     "owner_id": owner_id,
+                    "account_generation": account_generation,
                     "remote_run_id": remote_run_id,
                     "role_key": role_key,
                     "role_stage": str(current.get("role_stage") or "worker"),
@@ -10998,6 +13577,7 @@ async def connector_upload_artifact(remote_run_id: str, request: Request):
                 record = library.ingest_file(
                     owner_id,
                     temp,
+                    account_generation=account_generation,
                     name=filename,
                     source="model_output",
                     conversation_id=str(current_conversation.get("id") or ""),
@@ -11118,7 +13698,11 @@ async def connector_upload_artifact(remote_run_id: str, request: Request):
                     connector_id=connector_id,
                     claim_token=claim_token,
                 )
-                record = library.publish_file(owner_id, str(record.get("id") or ""))
+                record = library.publish_file(
+                    owner_id,
+                    str(record.get("id") or ""),
+                    account_generation=account_generation,
+                )
                 intent["status"] = "committed"
                 intent["committed_at"] = int(time.time() * 1000)
                 intents.pop(intent_id, None)
@@ -11129,7 +13713,11 @@ async def connector_upload_artifact(remote_run_id: str, request: Request):
             file_rollback_complete = True
             if record is not None and previous_record is None and owner_id:
                 try:
-                    library.delete_file(owner_id, str(record.get("id") or ""))
+                    library.delete_file(
+                        owner_id,
+                        str(record.get("id") or ""),
+                        account_generation=account_generation,
+                    )
                 except Exception:
                     file_rollback_complete = False
             elif previous_record is not None:
@@ -11220,6 +13808,8 @@ def route_message(payload: RouteMessageBody):
         routed["label"] = "简单任务" if mode == "chat" else "群聊 + 工作流"
         routed["confidence"] = 1.0
         routed["source"] = "manual"
+        routed["lock_level"] = "hard_chat" if mode == "chat" else "hard_work"
+        routed["rationale_codes"] = [f"manual.{mode}"]
         routed["reason"] = (
             "用户手动选择普通对话。"
             if mode == "chat"
@@ -11277,6 +13867,7 @@ def compact_hosted_turns_for_index(
 @router.get("/single/conversations")
 def get_single_conversations(request: Request = None):
     owner_id = owner_id_from_request(request)
+    account_generation = _account_generation_for_owner(owner_id)
     with _STATE_LOCK:
         state = load_single_state()
         conversations = state.get("conversations") or []
@@ -11295,6 +13886,17 @@ def get_single_conversations(request: Request = None):
                 changed = True
             if existing_owner != owner_id:
                 continue
+            stored_generation = str(
+                conversation.get("account_generation") or ""
+            ).strip()
+            if stored_generation and stored_generation != account_generation:
+                continue
+            if not stored_generation:
+                conversation["account_generation"] = account_generation
+                for run in (conversation.get("hosted_turns") or {}).values():
+                    if isinstance(run, dict) and not run.get("account_generation"):
+                        run["account_generation"] = account_generation
+                changed = True
             changed = reconcile_conversation_runtime_results(conversation) or changed
             changed = reconcile_stale_hosted_turns(conversation) or changed
             changed = compact_conversation_title(conversation) or changed
@@ -11322,6 +13924,7 @@ def create_single_chat(payload: CreateSingleConversationBody, request: Request =
     if payload.profile not in known:
         raise HTTPException(status_code=400, detail="Hermes Profile 不存在")
     owner_id = owner_id_from_request(request)
+    account_generation = _account_generation_for_owner(owner_id)
     client_id = payload.client_id.strip()
     if client_id and not re.fullmatch(r"chat_[A-Za-z0-9._:-]{8,251}", client_id):
         raise HTTPException(status_code=422, detail="Invalid client_id")
@@ -11338,8 +13941,20 @@ def create_single_chat(payload: CreateSingleConversationBody, request: Request =
             )
             if isinstance(existing, dict):
                 existing_owner = str(existing.get("owner_id") or LOCAL_OWNER_ID)
-                if existing_owner != owner_id:
+                existing_generation = str(
+                    existing.get("account_generation") or ""
+                ).strip()
+                if (
+                    existing_owner != owner_id
+                    or (
+                        existing_generation
+                        and existing_generation != account_generation
+                    )
+                ):
                     raise HTTPException(status_code=404, detail="Conversation not found")
+                if not existing_generation:
+                    existing["account_generation"] = account_generation
+                    save_single_state(state)
                 return {
                     "conversation": _public_conversation(existing),
                     "created": False,
@@ -11348,6 +13963,7 @@ def create_single_chat(payload: CreateSingleConversationBody, request: Request =
         if client_id:
             conversation["id"] = client_id
         conversation["owner_id"] = owner_id
+        conversation["account_generation"] = account_generation
         state["conversations"].insert(0, conversation)
         save_single_state(state)
     return {"conversation": _public_conversation(conversation), "created": True}
@@ -11365,6 +13981,7 @@ def adopt_single_chat(
     if payload.profile not in known:
         raise HTTPException(status_code=400, detail="Hermes Profile does not exist")
     owner_id = owner_id_from_request(request)
+    account_generation = _account_generation_for_owner(owner_id)
     with _STATE_LOCK:
         state = load_single_state()
         for conversation in state.get("conversations") or []:
@@ -11380,7 +13997,14 @@ def adopt_single_chat(
                     raise HTTPException(status_code=404, detail="Conversation not found")
                 if existing_owner != owner_id:
                     conversation["owner_id"] = owner_id
-                    save_single_state(state)
+                existing_generation = str(
+                    conversation.get("account_generation") or ""
+                ).strip()
+                if existing_generation and existing_generation != account_generation:
+                    raise HTTPException(status_code=404, detail="Conversation not found")
+                if not existing_generation:
+                    conversation["account_generation"] = account_generation
+                save_single_state(state)
                 return {
                     "conversation": _public_conversation(conversation),
                     "created": False,
@@ -11392,6 +14016,7 @@ def adopt_single_chat(
             payload.messages,
         )
         conversation["owner_id"] = owner_id
+        conversation["account_generation"] = account_generation
         state["conversations"].insert(0, conversation)
         save_single_state(state)
     return {"conversation": _public_conversation(conversation), "created": True}
@@ -11446,13 +14071,21 @@ def rename_single_conversation(
 @router.get("/single/conversations/{conversation_id}/attachments")
 def get_conversation_attachments(conversation_id: str, request: Request):
     owner_id, conversation = _owned_conversation(request, conversation_id)
+    account_generation = _account_generation_for_request(request, owner_id)
     uploads_dir = _conversation_file_dir(conversation_id, "uploads")
     outputs_dir = _conversation_file_dir(conversation_id, "outputs")
-    _sync_conversation_files(owner_id, conversation, uploads_dir, outputs_dir)
+    _sync_conversation_files(
+        owner_id,
+        conversation,
+        uploads_dir,
+        outputs_dir,
+        account_generation=account_generation,
+    )
     return {
         "attachments": _conversation_library_attachments(
             owner_id,
             conversation_id,
+            account_generation=account_generation,
         ),
     }
 
@@ -11463,6 +14096,7 @@ async def upload_conversation_attachment(
     request: Request,
 ):
     owner_id, conversation = _owned_conversation(request, conversation_id)
+    account_generation = _account_generation_for_request(request, owner_id)
     try:
         filename = safe_attachment_name(
             unquote(request.headers.get("x-filename", ""))
@@ -11472,6 +14106,7 @@ async def upload_conversation_attachment(
     upload_id = str(request.headers.get("x-upload-id") or "").strip()
     if not re.fullmatch(r"[A-Za-z0-9._:-]{8,256}", upload_id):
         raise HTTPException(status_code=422, detail="Invalid X-Upload-ID")
+    expected_bytes, expected_sha = _attachment_upload_contract(request)
     uploads_dir = _conversation_file_dir(conversation_id, "uploads")
     total = 0
     origin_key = f"conversation-upload:{conversation_id}:{upload_id}"
@@ -11485,8 +14120,16 @@ async def upload_conversation_attachment(
                 if total > _MAX_ATTACHMENT_BYTES:
                     raise HTTPException(status_code=413, detail="附件不能超过 64 MB")
                 handle.write(chunk)
-        actual_sha = hashlib.sha256(temp.read_bytes()).hexdigest()
-        existing = _file_library().get_file_by_origin(owner_id, origin_key)
+        if expected_bytes is not None and total != expected_bytes:
+            raise HTTPException(status_code=400, detail="Content-Length does not match request body")
+        actual_sha = _sha256_path(temp)
+        if expected_sha and actual_sha != expected_sha:
+            raise HTTPException(status_code=422, detail="X-Content-SHA256 does not match request body")
+        existing = _file_library().get_file_by_origin(
+            owner_id,
+            origin_key,
+            account_generation=account_generation,
+        )
         if (
             existing is not None
             and existing.get("status") == "available"
@@ -11499,6 +14142,7 @@ async def upload_conversation_attachment(
         record = _file_library().ingest_file(
             owner_id,
             temp,
+            account_generation=account_generation,
             name=filename,
             source="user_upload",
             conversation_id=conversation_id,
@@ -11510,6 +14154,8 @@ async def upload_conversation_attachment(
             mime_type=request.headers.get("content-type", ""),
             allowed_roots=[uploads_dir],
         )
+    except (FileExistsError, BlockingIOError) as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
     except PermissionError as exc:
         raise HTTPException(status_code=410, detail="Account was deleted") from exc
     finally:
@@ -11535,12 +14181,19 @@ def download_conversation_attachment(
         raise HTTPException(status_code=403, detail="附件路径越界")
     if not target.is_file():
         raise HTTPException(status_code=404, detail="附件不存在")
+    digest = _sha256_path(target)
     return FileResponse(
         path=str(target),
         filename=target.name,
         media_type=mimetypes.guess_type(target.name)[0]
         or "application/octet-stream",
         content_disposition_type="inline" if preview else "attachment",
+        headers={
+            "Cache-Control": "private, no-store",
+            "ETag": f'"{digest}"',
+            "X-Content-SHA256": digest,
+            "X-Content-Type-Options": "nosniff",
+        },
     )
 
 
@@ -11622,12 +14275,14 @@ def record_single_message(
             conversation["title"] = summarize_task_title(payload.content)
         save_single_state(state)
         owner_id = str(conversation.get("owner_id") or "").strip()
+        account_generation = _account_generation_for_conversation(conversation)
         profile = str(conversation.get("profile") or payload.name or "").strip()
         attachment_ids = _attachment_file_ids(message.get("meta"))
     if owner_id and attachment_ids:
         _file_library().update_links(
             owner_id,
             attachment_ids,
+            account_generation=account_generation,
             conversation_id=conversation_id,
             message_id=str(message.get("id") or ""),
             turn_id=runtime_turn_id,
@@ -11674,12 +14329,54 @@ def save_runtime_session(
     return {"runtime_sessions": runtime_sessions}
 
 
+def _hosted_event_stream_frame(
+    conversation: dict[str, Any],
+    *,
+    delivered_cursor: int,
+    include_snapshot: bool,
+    limit: int = 500,
+) -> tuple[dict[str, Any], bool]:
+    page = hosted_event_page(conversation, delivered_cursor, limit=limit)
+    current_cursor = page.next_cursor
+    envelope: dict[str, Any] = {
+        "cursor": current_cursor,
+        "min_cursor": page.min_cursor,
+        "has_gap": page.has_gap,
+        "reset_cursor": page.reset_cursor,
+        "reset_reason": page.reset_reason,
+        "events": page.events,
+        "snapshot_cursor": max(0, int(conversation.get("event_cursor") or 0)),
+        "account_generation": _account_generation_for_owner(
+            str(conversation.get("owner_id") or LOCAL_OWNER_ID)
+        ),
+    }
+    if include_snapshot or page.has_gap:
+        envelope["conversation"] = _public_conversation(conversation)
+    has_more = current_cursor < max(
+        0,
+        int(conversation.get("hosted_event_cursor") or 0),
+    )
+    return envelope, has_more
+
+
 @router.get("/single/conversations/{conversation_id}/hosted-events")
 async def stream_hosted_conversation_events(
     conversation_id: str,
     request: Request,
 ):
     owner_id = owner_id_from_request(request)
+    account_generation = _account_generation_for_request(request, owner_id)
+    expected_account_generation = str(
+        request.query_params.get("expected_account_generation") or ""
+    ).strip()
+    if (
+        expected_account_generation
+        and expected_account_generation != account_generation
+    ):
+        raise HTTPException(
+            status_code=409,
+            detail="hosted event account generation changed",
+        )
     cursor_value = request.query_params.get("cursor") or request.headers.get(
         "last-event-id",
         "0",
@@ -11711,16 +14408,19 @@ async def stream_hosted_conversation_events(
                     owner_id,
                 )
                 current_revision = _HOSTED_UPDATE_REVISION
-                current_cursor = max(0, int(conversation.get("event_cursor") or 0))
+                envelope, has_more_events = _hosted_event_stream_frame(
+                    conversation,
+                    delivered_cursor=delivered_cursor,
+                    include_snapshot=initial_snapshot,
+                    limit=500,
+                )
+                current_cursor = int(envelope["cursor"])
                 payload = json.dumps(
-                    {
-                        "cursor": current_cursor,
-                        "conversation": _public_conversation(conversation),
-                    },
+                    envelope,
                     ensure_ascii=False,
                     separators=(",", ":"),
                 )
-            if initial_snapshot or current_revision != revision or current_cursor > delivered_cursor:
+            if initial_snapshot or envelope["has_gap"] or envelope["events"]:
                 yield (
                     f"id: {current_cursor}\n"
                     "event: conversation\n"
@@ -11728,6 +14428,14 @@ async def stream_hosted_conversation_events(
                 )
                 initial_snapshot = False
                 delivered_cursor = current_cursor
+                revision = current_revision
+                if has_more_events:
+                    continue
+            else:
+                # Another conversation can advance the global revision without
+                # producing a frame for this stream. Mark that revision as
+                # observed before waiting; otherwise the condition returns
+                # immediately forever and this connection spins at 100% CPU.
                 revision = current_revision
             next_revision = await asyncio.to_thread(
                 _wait_for_hosted_update,
@@ -11746,6 +14454,54 @@ async def stream_hosted_conversation_events(
             "X-Accel-Buffering": "no",
         },
     )
+
+
+@router.get("/single/conversations/{conversation_id}/session-entries")
+def list_conversation_session_entries(
+    conversation_id: str,
+    request: Request,
+    cursor: int = 0,
+    limit: int = 500,
+):
+    owner_id = owner_id_from_request(request)
+    if cursor < 0:
+        raise HTTPException(status_code=422, detail="cursor must be non-negative")
+    if limit < 1 or limit > 2_000:
+        raise HTTPException(status_code=422, detail="limit must be between 1 and 2000")
+    with _STATE_LOCK:
+        state = load_single_state()
+        conversation, claimed = _owned_conversation_in_state(
+            state,
+            conversation_id,
+            owner_id,
+        )
+        if claimed:
+            save_single_state(state)
+        authoritative_cursor = max(
+            0, int(conversation.get("session_entry_cursor") or 0)
+        )
+        reset_cursor = cursor > authoritative_cursor
+        entries = (
+            []
+            if reset_cursor
+            else entries_after(conversation, cursor, limit=limit)
+        )
+        next_cursor = (
+            authoritative_cursor
+            if reset_cursor
+            else int(entries[-1].get("cursor") or cursor)
+            if entries
+            else authoritative_cursor
+        )
+        return {
+            "schema_version": "hermes.session-entry.v1",
+            "account_generation": _account_generation_for_owner(owner_id),
+            "cursor": next_cursor,
+            "reset_cursor": reset_cursor,
+            "reset_reason": "future_cursor" if reset_cursor else "",
+            "leaf_entry_id": str(conversation.get("session_entry_leaf_id") or ""),
+            "entries": entries,
+        }
 
 
 def _hosted_route_parameters(
@@ -11818,6 +14574,12 @@ def _enqueue_payload_fingerprint(
         "attachment_ids": list(dict.fromkeys(payload.attachment_ids)),
         "attachment_context": payload.attachment_context,
         "delivery_context": payload.delivery_context,
+        "required_provider": str(
+            getattr(payload, "required_provider", "") or ""
+        ).strip(),
+        "required_model": str(
+            getattr(payload, "required_model", "") or ""
+        ).strip(),
     }
     return hashlib.sha256(
         json.dumps(
@@ -11827,6 +14589,52 @@ def _enqueue_payload_fingerprint(
             separators=(",", ":"),
         ).encode("utf-8")
     ).hexdigest()
+
+
+def _required_runtime_binding(
+    profile: str,
+    *,
+    required_provider: str,
+    required_model: str,
+) -> dict[str, Any]:
+    required_provider = str(required_provider or "").strip()
+    required_model = str(required_model or "").strip()
+    if bool(required_provider) != bool(required_model):
+        raise HTTPException(
+            status_code=422,
+            detail="required_provider and required_model must be supplied together",
+        )
+    record = next(
+        (
+            item
+            for item in available_profiles()
+            if str(item.get("name") or "").strip() == profile
+        ),
+        None,
+    )
+    if record is None:
+        raise HTTPException(status_code=400, detail="Hermes Profile does not exist")
+    actual_provider = str(record.get("provider") or "").strip()
+    actual_model = str(record.get("model") or "").strip()
+    verified = bool(required_provider and required_model)
+    if verified and (
+        actual_provider.casefold() != required_provider.casefold()
+        or actual_model.casefold() != required_model.casefold()
+    ):
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                "Behavior evaluation runtime mismatch: "
+                f"profile {profile!r} resolves to {actual_provider}/{actual_model}, "
+                f"not {required_provider}/{required_model}"
+            ),
+        )
+    return {
+        "profile": profile,
+        "provider": actual_provider,
+        "model": actual_model,
+        "verified": verified,
+    }
 
 
 def _enqueued_turn_response(
@@ -11878,7 +14686,273 @@ def _enqueued_turn_response(
     }
 
 
-@router.post("/single/conversations/{conversation_id}/enqueue")
+def _complete_pending_hosted_route(conversation_id: str, turn_id: str) -> bool:
+    """Claim and resolve one durable route-outbox item."""
+
+    claim_token = uuid.uuid4().hex
+    now = int(time.time() * 1000)
+    with _STATE_LOCK:
+        state = load_single_state()
+        conversation = _conversation_by_id(state, conversation_id)
+        run = (conversation.get("hosted_turns") or {}).get(turn_id)
+        outbox = conversation.get("route_outbox")
+        item = outbox.get(turn_id) if isinstance(outbox, dict) else None
+        if not isinstance(run, dict) or not isinstance(item, dict):
+            return False
+        if run.get("status") in _HOSTED_TERMINAL_STATUSES:
+            outbox.pop(turn_id, None)
+            save_single_state(state)
+            return False
+        live_generation = _account_generation_for_owner(
+            str(conversation.get("owner_id") or LOCAL_OWNER_ID)
+        )
+        if str(item.get("account_generation") or "") != live_generation:
+            return False
+        if (
+            str(item.get("state") or "pending") == "inflight"
+            and int(item.get("lease_expires_at") or 0) > now
+        ):
+            return False
+        item.update(
+            {
+                "state": "inflight",
+                "claim_token": claim_token,
+                "lease_expires_at": now + 60_000,
+                "attempt": int(item.get("attempt") or 0) + 1,
+                "updated_at": now,
+            }
+        )
+        save_single_state(state)
+        item_snapshot = deepcopy(item)
+
+    try:
+        route = route_message(
+            RouteMessageBody(
+                content=str(item_snapshot.get("content") or ""),
+                mode="auto",
+                recent_messages=[
+                    dict(value)
+                    for value in item_snapshot.get("recent_messages") or []
+                    if isinstance(value, dict)
+                ],
+                attachments=[
+                    dict(value)
+                    for value in item_snapshot.get("attachments") or []
+                    if isinstance(value, dict)
+                ],
+            )
+        )
+        route, mode, selected_profiles, artifact_required = _hosted_route_parameters(
+            route_metadata=route,
+            content=str(item_snapshot.get("content") or ""),
+            requested_mode=str(route.get("mode") or ""),
+            requested_profiles=(
+                [str(item_snapshot.get("conversation_profile") or "default")]
+                if str(route.get("mode") or "").strip().lower() == "chat"
+                else list(route.get("profiles") or [])
+            ),
+            requested_artifact=bool(route.get("artifact_required")),
+        )
+    except Exception as exc:
+        clean_error = sanitize_runtime_error(exc)
+        with _STATE_LOCK:
+            state = load_single_state()
+            conversation = _conversation_by_id(state, conversation_id)
+            run = (conversation.get("hosted_turns") or {}).get(turn_id)
+            outbox = conversation.get("route_outbox")
+            item = outbox.get(turn_id) if isinstance(outbox, dict) else None
+            if (
+                isinstance(run, dict)
+                and isinstance(item, dict)
+                and hmac.compare_digest(
+                    str(item.get("claim_token") or ""), claim_token
+                )
+            ):
+                failed_at = int(time.time() * 1000)
+                item.update(
+                    {
+                        "state": "retryable",
+                        "last_error": clean_error,
+                        "next_attempt_at": failed_at + min(
+                            30_000, 1_000 * (2 ** min(5, int(item.get("attempt") or 1)))
+                        ),
+                        "lease_expires_at": 0,
+                        "updated_at": failed_at,
+                    }
+                )
+                run.update(
+                    {
+                        "stage": "routing_failed",
+                        "routing_error": clean_error,
+                        "retryable": True,
+                        "updated_at": failed_at,
+                    }
+                )
+                save_single_state(state)
+        _notify_hosted_update(conversation_id)
+        return False
+
+    output_dir = _hosted_turn_output_dir(conversation_id, turn_id).resolve()
+    user_delivery_context = str(item_snapshot.get("delivery_context") or "").strip()
+    delivery_context = user_delivery_context
+    if artifact_required:
+        delivery_context = "\n".join(
+            value
+            for value in (
+                delivery_context,
+                f"Absolute output directory: `{output_dir}`.",
+                "Write every generated deliverable to this exact directory, but mention only file names in user-facing text.",
+            )
+            if value
+        )
+
+    with _STATE_LOCK:
+        state = load_single_state()
+        conversation = _conversation_by_id(state, conversation_id)
+        run = (conversation.get("hosted_turns") or {}).get(turn_id)
+        outbox = conversation.get("route_outbox")
+        item = outbox.get(turn_id) if isinstance(outbox, dict) else None
+        if (
+            not isinstance(run, dict)
+            or not isinstance(item, dict)
+            or not hmac.compare_digest(str(item.get("claim_token") or ""), claim_token)
+            or run.get("status") in _HOSTED_TERMINAL_STATUSES
+        ):
+            return False
+        completed_at = int(time.time() * 1000)
+        route_message_id = str(item.get("route_message_id") or "")
+        messages = conversation.setdefault("messages", [])
+        if not any(
+            isinstance(message, dict)
+            and str(message.get("id") or "") == route_message_id
+            for message in messages
+        ):
+            route_record = _append_message(
+                conversation,
+                role="system",
+                name=str(route.get("label") or "任务路由"),
+                content=str(route.get("reason") or "已完成任务路由。"),
+                status="completed",
+                kind="route",
+                meta={
+                    "artifact_required": artifact_required,
+                    "confidence": route.get("confidence"),
+                    "lock_level": route.get("lock_level"),
+                    "mode": mode,
+                    "profiles": selected_profiles,
+                    "source": route.get("source"),
+                    "runtime_turn_id": turn_id,
+                },
+            )
+            route_record["id"] = route_message_id
+            _project_native_message(route_record)
+        run.update(
+            {
+                "status": "queued",
+                "stage": "accepted",
+                "title": str(route.get("title") or "").strip()
+                or summarize_task_title(str(run.get("content") or "")),
+                "profiles": selected_profiles,
+                "artifact_required": artifact_required,
+                "artifact_producer_profiles": _artifact_producer_profiles(
+                    route, selected_profiles, required=artifact_required
+                ),
+                "artifact": dict(route.get("artifact") or {}),
+                "mode": mode,
+                "route_metadata": route,
+                "delivery_context": delivery_context,
+                "user_delivery_context": user_delivery_context,
+                "output_dir": str(output_dir),
+                "routing_completed_at": completed_at,
+                "retryable": False,
+                "routing_error": "",
+                "updated_at": completed_at,
+            }
+        )
+        if mode == "work":
+            append_hosted_event(
+                conversation,
+                conversation_id=conversation_id,
+                turn_id=turn_id,
+                role_stage="manager",
+                event_type="role.handoff",
+                entity_id=f"{turn_id}:collaboration-lift",
+                idempotency_key=f"turn:{turn_id}:collaboration-lift",
+                account_generation=str(run.get("account_generation") or ""),
+                payload={
+                    "entity_id": f"{turn_id}:collaboration-lift",
+                    "action": "collaboration_lift",
+                    "from_role": "chat",
+                    "to_role": "manager",
+                },
+                occurred_at=completed_at,
+            )
+        request_id = str(item.get("request_id") or "")
+        request_record = (conversation.get("enqueue_requests") or {}).get(request_id)
+        if isinstance(request_record, dict):
+            request_record.update(
+                {
+                    "route": route,
+                    "route_message_id": route_message_id,
+                    "routing_state": "completed",
+                    "routing_completed_at": completed_at,
+                }
+            )
+        outbox.pop(turn_id, None)
+        if not outbox:
+            conversation.pop("route_outbox", None)
+        conversation["updated_at"] = completed_at
+        save_single_state(state)
+    _notify_hosted_update(conversation_id)
+    start_hosted_workflow(conversation_id, turn_id)
+    return True
+
+
+def start_hosted_routing(conversation_id: str, turn_id: str) -> threading.Thread:
+    key = f"{conversation_id}:{turn_id}"
+    with _HOSTED_ROUTING_THREADS_LOCK:
+        existing = _HOSTED_ROUTING_THREADS.get(key)
+        if existing is not None and existing.is_alive():
+            return existing
+
+        def run_and_release() -> None:
+            try:
+                for _ in range(5):
+                    if _complete_pending_hosted_route(conversation_id, turn_id):
+                        return
+                    with _STATE_LOCK:
+                        state = load_single_state()
+                        conversation = _conversation_by_id(state, conversation_id)
+                        item = (conversation.get("route_outbox") or {}).get(turn_id)
+                        run = (conversation.get("hosted_turns") or {}).get(turn_id)
+                        if (
+                            not isinstance(item, dict)
+                            or not isinstance(run, dict)
+                            or run.get("status") in _HOSTED_TERMINAL_STATUSES
+                            or str(item.get("state") or "") != "retryable"
+                        ):
+                            return
+                        delay = max(
+                            0.0,
+                            (int(item.get("next_attempt_at") or 0) - int(time.time() * 1000))
+                            / 1000,
+                        )
+                    time.sleep(min(30.0, delay))
+            finally:
+                with _HOSTED_ROUTING_THREADS_LOCK:
+                    _HOSTED_ROUTING_THREADS.pop(key, None)
+
+        thread = threading.Thread(
+            target=run_and_release,
+            name=f"hermes-route-{turn_id[-12:]}",
+            daemon=True,
+        )
+        _HOSTED_ROUTING_THREADS[key] = thread
+        thread.start()
+        return thread
+
+
+@router.post("/single/conversations/{conversation_id}/enqueue", status_code=202)
 def enqueue_hosted_turn(
     conversation_id: str,
     payload: EnqueueHostedTurnBody,
@@ -11904,6 +14978,7 @@ def enqueue_hosted_turn(
     ):
         raise HTTPException(status_code=422, detail="Invalid attachment_ids")
     owner_id = owner_id_from_request(request)
+    account_generation = _account_generation_for_request(request, owner_id)
     fingerprint = _enqueue_payload_fingerprint(
         payload,
         message_content=message_content,
@@ -11919,6 +14994,15 @@ def enqueue_hosted_turn(
             owner_id,
         )
         conversation_profile = str(conversation.get("profile") or "default").strip() or "default"
+        runtime_binding = _required_runtime_binding(
+            conversation_profile,
+            required_provider=str(
+                getattr(payload, "required_provider", "") or ""
+            ),
+            required_model=str(
+                getattr(payload, "required_model", "") or ""
+            ),
+        )
         requests = conversation.get("enqueue_requests")
         requests = requests if isinstance(requests, dict) else {}
         existing_request = requests.get(request_id)
@@ -11935,7 +15019,11 @@ def enqueue_hosted_turn(
             )
         else:
             for file_id in attachment_ids:
-                file_record = _file_library().get_file(owner_id, file_id)
+                file_record = _file_library().get_file(
+                    owner_id,
+                    file_id,
+                    account_generation=account_generation,
+                )
                 if file_record is None or file_record.get("status") != "available":
                     raise HTTPException(status_code=404, detail="Attachment not found")
                 route_attachments.append(
@@ -11950,13 +15038,18 @@ def enqueue_hosted_turn(
                     }
                 )
     if replay_response is not None:
+        replay_response["runtime_binding"] = runtime_binding
         hosted = replay_response.get("hosted_turn")
         if isinstance(hosted, dict) and str(hosted.get("status") or "") not in _HOSTED_TERMINAL_STATUSES:
-            start_hosted_workflow(conversation_id, turn_id)
+            if str(hosted.get("stage") or "") in {"routing_pending", "routing_failed"}:
+                start_hosted_routing(conversation_id, turn_id)
+            else:
+                start_hosted_workflow(conversation_id, turn_id)
         if attachment_ids:
             _file_library().update_links(
                 owner_id,
                 attachment_ids,
+                account_generation=account_generation,
                 conversation_id=conversation_id,
                 message_id=str((replay_response.get("message") or {}).get("id") or ""),
                 turn_id=turn_id,
@@ -11964,41 +15057,7 @@ def enqueue_hosted_turn(
             )
         return replay_response
 
-    route = route_message(
-        RouteMessageBody(
-            content=message_content,
-            mode="auto",
-            recent_messages=[
-                dict(item)
-                for item in payload.recent_messages[-20:]
-                if isinstance(item, dict)
-            ],
-            attachments=route_attachments,
-        )
-    )
-    route, mode, selected_profiles, artifact_required = _hosted_route_parameters(
-        route_metadata=route,
-        content=message_content,
-        requested_mode=str(route.get("mode") or ""),
-        requested_profiles=(
-            [conversation_profile]
-            if str(route.get("mode") or "").strip().lower() == "chat"
-            else list(route.get("profiles") or [])
-        ),
-        requested_artifact=bool(route.get("artifact_required")),
-    )
     output_dir = _hosted_turn_output_dir(conversation_id, turn_id).resolve()
-    delivery_context = payload.delivery_context.strip()
-    if artifact_required:
-        delivery_context = "\n".join(
-            item
-            for item in (
-                delivery_context,
-                f"Absolute output directory: `{output_dir}`.",
-                "Write every generated deliverable to this exact directory, but mention only file names in user-facing text.",
-            )
-            if item
-        )
 
     with _STATE_LOCK:
         state = load_single_state()
@@ -12026,7 +15085,11 @@ def enqueue_hosted_turn(
             accepted = False
         else:
             for file_id in attachment_ids:
-                file_record = _file_library().get_file(owner_id, file_id)
+                file_record = _file_library().get_file(
+                    owner_id,
+                    file_id,
+                    account_generation=account_generation,
+                )
                 if file_record is None or file_record.get("status") != "available":
                     raise HTTPException(status_code=404, detail="Attachment not found")
             if isinstance((conversation.get("hosted_turns") or {}).get(turn_id), dict):
@@ -12077,38 +15140,32 @@ def enqueue_hosted_turn(
                     status_code=409,
                     detail="route message id already exists outside this request",
                 )
-            route_record = _append_message(
-                conversation,
-                role="system",
-                name=str(route.get("label") or "任务路由"),
-                content=str(route.get("reason") or "已完成任务路由。"),
-                status="completed",
-                kind="route",
-                meta={
-                    "artifact_required": artifact_required,
-                    "confidence": route.get("confidence"),
-                    "mode": mode,
-                    "profiles": selected_profiles,
-                    "source": route.get("source"),
-                    "runtime_turn_id": turn_id,
-                },
-            )
-            route_record["id"] = route_message_id
-            _project_native_message(route_record)
             hosted = create_hosted_turn_record(
                 conversation,
                 turn_id=turn_id,
                 content=message_content,
-                title=str(route.get("title") or ""),
-                profiles=selected_profiles,
-                artifact_required=artifact_required,
+                title=summarize_task_title(message_content),
+                profiles=[],
+                artifact_required=False,
                 attachment_context=payload.attachment_context,
-                delivery_context=delivery_context,
+                delivery_context=payload.delivery_context,
                 user_delivery_context=payload.delivery_context,
-                mode=mode,
-                route_metadata=route,
+                mode="chat",
+                route_metadata={
+                    "mode": "pending",
+                    "lock_level": "pending",
+                    "source": "route-outbox",
+                },
                 output_dir=str(output_dir),
                 attachment_ids=attachment_ids,
+            )
+            hosted.update(
+                {
+                    "mode": "pending",
+                    "stage": "routing_pending",
+                    "profiles": [],
+                    "routing_requested_at": int(time.time() * 1000),
+                }
             )
             pending_cancellations = conversation.get("pending_turn_cancellations")
             pending_cancellations = (
@@ -12135,20 +15192,64 @@ def enqueue_hosted_turn(
                         "updated_at": now,
                     }
                 )
+                hosted.setdefault("terminal_commit_id", f"terminal_{uuid.uuid4().hex}")
+                hosted.setdefault("terminal_committed_at", now)
+                _append_canonical_turn_terminal(
+                    conversation,
+                    conversation_id=conversation_id,
+                    turn_id=turn_id,
+                    run=hosted,
+                    occurred_at=now,
+                )
             if conversation.get("title") in {"", "新对话", None}:
                 conversation["title"] = summarize_task_title(message_content)
             now = int(time.time() * 1000)
+            pending_route = {
+                "mode": "pending",
+                "confidence": 0.0,
+                "lock_level": "pending",
+                "capability_hints": [],
+                "rationale_codes": ["route.accepted_pending"],
+                "source": "route-outbox",
+                "profiles": [],
+            }
             request_record = {
                 "request_id": request_id,
                 "fingerprint": fingerprint,
                 "turn_id": turn_id,
                 "message_id": message_id,
-                "route_message_id": route_message_id,
-                "route": route,
+                "route_message_id": "",
+                "route": pending_route,
+                "routing_state": "pending",
                 "accepted": not isinstance(pending_cancellation, dict),
                 "created_at": now,
             }
             requests[request_id] = request_record
+            if not isinstance(pending_cancellation, dict):
+                route_outbox = conversation.get("route_outbox")
+                if not isinstance(route_outbox, dict):
+                    route_outbox = {}
+                    conversation["route_outbox"] = route_outbox
+                route_outbox[turn_id] = {
+                    "turn_id": turn_id,
+                    "request_id": request_id,
+                    "route_message_id": route_message_id,
+                    "account_generation": account_generation,
+                    "state": "pending",
+                    "attempt": 0,
+                    "next_attempt_at": 0,
+                    "content": message_content,
+                    "conversation_profile": conversation_profile,
+                    "recent_messages": [
+                        dict(item)
+                        for item in payload.recent_messages[-20:]
+                        if isinstance(item, dict)
+                    ],
+                    "attachments": route_attachments,
+                    "delivery_context": payload.delivery_context.strip(),
+                    "created_at": now,
+                    "updated_at": now,
+                }
             if len(requests) > 2000:
                 oldest = sorted(
                     requests,
@@ -12167,6 +15268,7 @@ def enqueue_hosted_turn(
         _file_library().update_links(
             owner_id,
             attachment_ids,
+            account_generation=account_generation,
             conversation_id=conversation_id,
             message_id=str((response.get("message") or {}).get("id") or ""),
             turn_id=turn_id,
@@ -12174,9 +15276,10 @@ def enqueue_hosted_turn(
         )
     hosted_response = response.get("hosted_turn") or {}
     if str(hosted_response.get("status") or "") not in _HOSTED_TERMINAL_STATUSES:
-        start_hosted_workflow(conversation_id, turn_id)
+        start_hosted_routing(conversation_id, turn_id)
     if accepted:
         _notify_hosted_update(conversation_id)
+    response["runtime_binding"] = runtime_binding
     return response
 
 
@@ -12192,6 +15295,7 @@ def create_hosted_turn(
     if not payload.content.strip():
         raise HTTPException(status_code=400, detail="任务内容不能为空")
     owner_id = owner_id_from_request(request)
+    account_generation = _account_generation_for_request(request, owner_id)
     with _STATE_LOCK:
         state = load_single_state()
         conversation, claimed = _owned_conversation_in_state(
@@ -12251,7 +15355,11 @@ def create_hosted_turn(
             owner_id,
         )
         for file_id in attachment_ids:
-            file_record = _file_library().get_file(owner_id, file_id)
+            file_record = _file_library().get_file(
+                owner_id,
+                file_id,
+                account_generation=account_generation,
+            )
             if file_record is None or file_record.get("status") != "available":
                 raise HTTPException(status_code=404, detail="Attachment not found")
         run = create_hosted_turn_record(
@@ -12274,6 +15382,7 @@ def create_hosted_turn(
         _file_library().update_links(
             owner_id,
             attachment_ids,
+            account_generation=account_generation,
             conversation_id=conversation_id,
             turn_id=turn_id,
             profile=str(conversation.get("profile") or "default"),
@@ -12298,6 +15407,7 @@ def cancel_hosted_turn(
             conversation_id,
             turn_id,
             reason=payload.reason,
+            request_id=payload.request_id,
         )
     except RuntimeError as exc:
         raise HTTPException(status_code=404, detail=str(exc)) from exc
@@ -12320,6 +15430,18 @@ def intervene_hosted_turn(
         raise HTTPException(status_code=400, detail="干预内容不能为空")
     if not targets:
         raise HTTPException(status_code=422, detail="干预消息必须 @ 一个群聊成员")
+    delivery = str(payload.delivery or "steer").strip().lower()
+    queue_mode = str(payload.queue_mode or "one_at_a_time").strip().lower()
+    if delivery not in {"steer", "follow_up"}:
+        raise HTTPException(
+            status_code=422,
+            detail="delivery must be steer or follow_up",
+        )
+    if queue_mode not in {"one_at_a_time", "all_at_once"}:
+        raise HTTPException(
+            status_code=422,
+            detail="queue_mode must be one_at_a_time or all_at_once",
+        )
     message_id = payload.message_id.strip()[:256] or f"intervention_{uuid.uuid4().hex[:20]}"
     idempotency_fingerprint = hashlib.sha256(
         json.dumps(
@@ -12329,6 +15451,8 @@ def intervene_hosted_turn(
                 "targets": sorted(targets),
                 "target_profiles": sorted(target_profiles),
                 "kind": "intervention",
+                "delivery": delivery,
+                "queue_mode": queue_mode,
             },
             ensure_ascii=False,
             sort_keys=True,
@@ -12500,6 +15624,8 @@ def intervene_hosted_turn(
                 "targets": targets,
                 "target_profiles": target_profiles,
                 "status": "pending",
+                "delivery": delivery,
+                "queue_mode": queue_mode,
                 "queued_for_future_stage": not bool(active_matches),
                 "idempotency_fingerprint": idempotency_fingerprint,
                 "created_at": now,
@@ -12544,6 +15670,8 @@ def intervene_hosted_turn(
                     profile=str(remote_run.get("profile") or ""),
                 ):
                     continue
+                if delivery != "steer":
+                    continue
                 remote_run.update(
                     {
                         "cancel_requested": True,
@@ -12557,6 +15685,25 @@ def intervene_hosted_turn(
                 dispatched_to.append(remote_id)
             if dispatched_to:
                 intervention["cancel_dispatched_to"] = dispatched_to
+            append_hosted_event(
+                conversation,
+                conversation_id=conversation_id,
+                turn_id=turn_id,
+                role_stage="intervention",
+                event_type="intervention.queued",
+                entity_id=message_id,
+                idempotency_key=f"intervention:{message_id}:queued",
+                account_generation=_account_generation_for_owner(owner_id),
+                payload={
+                    "entity_id": message_id,
+                    "targets": targets,
+                    "target_profiles": target_profiles,
+                    "delivery": delivery,
+                    "queue_mode": queue_mode,
+                    "queued_for_future_stage": not bool(active_matches),
+                },
+                occurred_at=now,
+            )
             run["updated_at"] = now
             conversation["updated_at"] = now
             save_single_state(state)
@@ -12644,11 +15791,16 @@ def _finalize_pending_conversation_deletion(conversation_id: str) -> bool:
             if str(session_id or "").strip()
         ]
         owner_id = str(conversation.get("owner_id") or LOCAL_OWNER_ID)
+        account_generation = _account_generation_for_conversation(conversation)
         # Account-file rows are a separate durable store.  Remove them before
         # dropping the conversation tombstone so a crash leaves a retryable
         # deletion intent rather than an orphaned file index/object.
         try:
-            _file_library().delete_conversation(owner_id, conversation_id)
+            _file_library().delete_conversation(
+                owner_id,
+                conversation_id,
+                account_generation=account_generation,
+            )
         except Exception:
             return False
         state["conversations"] = [
@@ -12778,15 +15930,21 @@ async def send_single_message(
 @router.get("/rooms")
 def get_rooms(request: Request):
     owner_id = owner_id_from_request(request)
+    account_generation = _account_generation_for_request(request, owner_id)
     with _STATE_LOCK:
         state = load_state()
-        if _claim_legacy_rooms_in_state(state, owner_id):
+        if _claim_legacy_rooms_in_state(
+            state,
+            owner_id,
+            account_generation=account_generation,
+        ):
             save_state(state)
         single_state = load_single_state()
         rooms = [
             room
             for room in state.get("rooms") or []
             if str(room.get("owner_id") or "") == owner_id
+            and str(room.get("account_generation") or "") == account_generation
             and not _room_maps_to_deleting_conversation(room, single_state)
         ]
         summaries = [
@@ -12803,11 +15961,22 @@ def create_room(payload: CreateRoomBody, request: Request):
     if not selected:
         raise HTTPException(status_code=400, detail="至少选择一个 Hermes Profile")
     owner_id = owner_id_from_request(request)
+    account_generation = _account_generation_for_request(request, owner_id)
     with _STATE_LOCK:
         state = load_state()
         single_state = load_single_state()
-        room = create_room_record(payload.name, selected, owner_id)
-        _room_conversation_in_state(room, single_state, owner_id)
+        room = create_room_record(
+            payload.name,
+            selected,
+            owner_id,
+            account_generation,
+        )
+        _room_conversation_in_state(
+            room,
+            single_state,
+            owner_id,
+            account_generation,
+        )
         state["rooms"].insert(0, room)
         save_single_state(single_state)
         save_state(state)
@@ -12817,15 +15986,22 @@ def create_room(payload: CreateRoomBody, request: Request):
 @router.get("/rooms/{room_id}")
 def get_room(room_id: str, request: Request):
     owner_id = owner_id_from_request(request)
+    account_generation = _account_generation_for_request(request, owner_id)
     with _STATE_LOCK:
         state = load_state()
         if _claim_legacy_rooms_in_state(
             state,
             owner_id,
+            account_generation=account_generation,
             requested_room_id=room_id,
         ):
             save_state(state)
-        room = _owned_room_in_state(state, room_id, owner_id)
+        room = _owned_room_in_state(
+            state,
+            room_id,
+            owner_id,
+            account_generation,
+        )
         single_state = load_single_state()
         if _room_maps_to_deleting_conversation(room, single_state):
             raise HTTPException(status_code=404, detail="Room not found")
@@ -12841,14 +16017,21 @@ def get_room(room_id: str, request: Request):
 @router.delete("/rooms/{room_id}")
 def delete_room(room_id: str, request: Request):
     owner_id = owner_id_from_request(request)
+    account_generation = _account_generation_for_request(request, owner_id)
     with _STATE_LOCK:
         state = load_state()
         _claim_legacy_rooms_in_state(
             state,
             owner_id,
+            account_generation=account_generation,
             requested_room_id=room_id,
         )
-        room = _owned_room_in_state(state, room_id, owner_id)
+        room = _owned_room_in_state(
+            state,
+            room_id,
+            owner_id,
+            account_generation,
+        )
         conversation_id = str(room.get("conversation_id") or "")
         if conversation_id:
             try:
@@ -12873,6 +16056,7 @@ def send_message(room_id: str, payload: SendMessageBody, request: Request):
     if not content:
         raise HTTPException(status_code=400, detail="Message cannot be empty")
     owner_id = owner_id_from_request(request)
+    account_generation = _account_generation_for_request(request, owner_id)
     request_id = payload.request_id.strip()[:256] or f"room-request-{uuid.uuid4().hex}"
     turn_id = payload.turn_id.strip()[:256] or (
         "room-turn-"
@@ -12884,9 +16068,15 @@ def send_message(room_id: str, payload: SendMessageBody, request: Request):
         _claim_legacy_rooms_in_state(
             state,
             owner_id,
+            account_generation=account_generation,
             requested_room_id=room_id,
         )
-        room = _owned_room_in_state(state, room_id, owner_id)
+        room = _owned_room_in_state(
+            state,
+            room_id,
+            owner_id,
+            account_generation,
+        )
         known_profiles = set(room.get("profiles") or [])
         requested = payload.profiles or list(room.get("profiles") or [])
         targets = collaboration_execution_order(
@@ -12907,6 +16097,7 @@ def send_message(room_id: str, payload: SendMessageBody, request: Request):
             room,
             single_state,
             owner_id,
+            account_generation,
         )
         room_requests = room.get("hosted_requests")
         if not isinstance(room_requests, dict):
@@ -13064,15 +16255,22 @@ def cancel_room_hosted_turn(
     request: Request,
 ):
     owner_id = owner_id_from_request(request)
+    account_generation = _account_generation_for_request(request, owner_id)
     with _STATE_LOCK:
         state = load_state()
         if _claim_legacy_rooms_in_state(
             state,
             owner_id,
+            account_generation=account_generation,
             requested_room_id=room_id,
         ):
             save_state(state)
-        room = _owned_room_in_state(state, room_id, owner_id)
+        room = _owned_room_in_state(
+            state,
+            room_id,
+            owner_id,
+            account_generation,
+        )
         conversation_id = str(room.get("conversation_id") or "")
         single_state = load_single_state()
         _conversation, claimed = _owned_conversation_in_state(
@@ -13111,14 +16309,39 @@ def _profile_runner_result_error(result: Any) -> str:
     return ""
 
 
-def _discover_profile_toolsets(config: dict[str, Any]) -> list[str]:
-    """Connect configured MCPs before resolving the hosted agent tool snapshot."""
+def _discover_profile_toolsets(
+    config: dict[str, Any],
+    capability_hints: Optional[list[str]] = None,
+) -> list[str]:
+    """Connect only route-selected MCPs before taking the hosted tool snapshot."""
 
-    from hermes_cli.tools_config import _get_platform_tools
-    from tools.mcp_tool import discover_mcp_tools
+    from hermes_cli.tools_config import _get_platform_tools, enabled_mcp_server_names
+    from tools.mcp_tool import (
+        discover_mcp_tools,
+        get_mcp_availability,
+        select_mcp_servers_for_capabilities,
+    )
 
-    discover_mcp_tools()
-    return sorted(_get_platform_tools(config, "cli"))
+    hints = [str(item) for item in (capability_hints or []) if str(item).strip()]
+    configured = config.get("mcp_servers") if isinstance(config, dict) else {}
+    configured = configured if isinstance(configured, dict) else {}
+    selected = select_mcp_servers_for_capabilities(configured, hints)
+    discover_mcp_tools(capability_hints=hints)
+    live_selected = {
+        snapshot.name
+        for snapshot in get_mcp_availability()
+        if snapshot.live
+        and snapshot.registered_tools
+        and snapshot.name in selected
+    }
+    base_toolsets = set(
+        _get_platform_tools(
+            config,
+            "cli",
+            include_default_mcp_servers=False,
+        )
+    ) - enabled_mcp_server_names(config)
+    return sorted(base_toolsets | live_selected)
 
 
 def _profile_event_runner_main() -> int:
@@ -13140,6 +16363,11 @@ def _profile_event_runner_main() -> int:
             request_payload.get("action") or "chat"
         ).strip().lower()
         focus_topic = _structured_text(request_payload.get("focus_topic")).strip()
+        capability_hints = [
+            str(item)
+            for item in request_payload.get("capability_hints") or []
+            if str(item).strip()
+        ]
         requested_session_id = _structured_text(
             request_payload.get("session_id")
         ).strip()
@@ -13171,7 +16399,23 @@ def _profile_event_runner_main() -> int:
         # This runner is a fresh process for a hosted chat turn. MCP names in
         # enabled_toolsets are only registry aliases; discovery must connect
         # and register their schemas before AIAgent snapshots its tool list.
-        enabled_toolsets = _discover_profile_toolsets(cfg)
+        enabled_toolsets = _discover_profile_toolsets(cfg, capability_hints)
+        from tools.mcp_tool import (
+            get_mcp_availability,
+            select_mcp_servers_for_capabilities,
+        )
+
+        selected_mcp_names = set(
+            select_mcp_servers_for_capabilities(
+                cfg.get("mcp_servers") or {},
+                capability_hints,
+            )
+        )
+        mcp_availability = [
+            snapshot.as_dict()
+            for snapshot in get_mcp_availability()
+            if snapshot.name in selected_mcp_names
+        ]
         managed_mcp_servers = sorted(
             name
             for name, server in (cfg.get("mcp_servers") or {}).items()
@@ -13321,11 +16565,29 @@ def _profile_event_runner_main() -> int:
                 "tool.generating", {"name": str(name or "工具调用")}
             ),
             status_callback=status_update,
+            event_callback=lambda event_type, payload: emit(
+                str(event_type or ""),
+                dict(payload) if isinstance(payload, dict) else {},
+            ),
         )
         # The hosted child owns the model retry loop. Keeping this inside the
         # child preserves one session and prevents the outer workflow from
         # replaying a prompt or repeating a tool side effect.
-        agent._api_max_retries = _HOSTED_CHAT_API_ATTEMPTS
+        try:
+            agent._api_max_retries = max(
+                1,
+                min(
+                    _HOSTED_CHAT_API_ATTEMPTS,
+                    int(
+                        os.environ.get(
+                            "HERMES_API_MAX_RETRIES",
+                            str(_HOSTED_CHAT_API_ATTEMPTS),
+                        )
+                    ),
+                ),
+            )
+        except (TypeError, ValueError):
+            agent._api_max_retries = _HOSTED_CHAT_API_ATTEMPTS
         agent._api_retry_delay_seconds = _HOSTED_CHAT_API_RETRY_DELAY_SECONDS
         agent._api_retry_client_errors = True
         agent._api_retry_status_live = True
@@ -13342,6 +16604,7 @@ def _profile_event_runner_main() -> int:
                     or runtime.get("provider")
                     or ""
                 ),
+                "mcp_availability": mcp_availability,
             },
         )
         emit(
@@ -13493,9 +16756,23 @@ def _recover_connector_artifact_upload_intents(
                             intents.pop(intent_id, None)
                             changed = True
                             continue
+                        account_generation = str(
+                            intent.get("account_generation")
+                            or hosted.get("account_generation")
+                            or conversation.get("account_generation")
+                            or ""
+                        ).strip()
+                        if not account_generation:
+                            intents.pop(intent_id, None)
+                            changed = True
+                            continue
                         origin_key = str(intent.get("origin_key") or "")
                         record = (
-                            library.get_file_by_origin(owner_id, origin_key)
+                            library.get_file_by_origin(
+                                owner_id,
+                                origin_key,
+                                account_generation=account_generation,
+                            )
                             if origin_key
                             else None
                         )
@@ -13517,6 +16794,18 @@ def _recover_connector_artifact_upload_intents(
                                 ),
                                 None,
                             )
+                        boundary_matches = all(
+                            not candidate or candidate == account_generation
+                            for candidate in (
+                                str(conversation.get("account_generation") or "").strip(),
+                                str(hosted.get("account_generation") or "").strip(),
+                                (
+                                    str(remote.get("account_generation") or "").strip()
+                                    if isinstance(remote, dict)
+                                    else ""
+                                ),
+                            )
+                        )
                         artifact_linked = bool(
                             record
                             and isinstance(remote, dict)
@@ -13533,7 +16822,7 @@ def _recover_connector_artifact_upload_intents(
                             == f"{remote_id}:artifact:{file_id}"
                             for message in conversation.get("messages") or []
                         )
-                        claim_active = _artifact_intent_has_active_claim(
+                        claim_active = boundary_matches and _artifact_intent_has_active_claim(
                             hosted,
                             remote,
                             intent,
@@ -13544,12 +16833,17 @@ def _recover_connector_artifact_upload_intents(
                             and str(record.get("status") or "") == "available"
                             and isinstance(remote, dict)
                             and (artifact_linked or message_linked)
+                            and boundary_matches
                         )
                         if record is not None and (
                             publication_finished
                             or (claim_active and (artifact_linked or message_linked))
                         ):
-                            published = library.publish_file(owner_id, file_id)
+                            published = library.publish_file(
+                                owner_id,
+                                file_id,
+                                account_generation=account_generation,
+                            )
                             attachment = _library_attachment(published)
                             if isinstance(remote, dict) and not artifact_linked:
                                 remote.setdefault("artifacts", []).append(attachment)
@@ -13627,7 +16921,11 @@ def _recover_connector_artifact_upload_intents(
                             if isinstance(previous_file_record, dict):
                                 library.restore_file_record(previous_file_record)
                             elif record is not None:
-                                library.delete_file(owner_id, file_id)
+                                library.delete_file(
+                                    owner_id,
+                                    file_id,
+                                    account_generation=account_generation,
+                                )
                         intents.pop(intent_id, None)
                         changed = True
                         changed_conversations.add(str(conversation.get("id") or ""))
@@ -13661,6 +16959,7 @@ def _owned_conversation(
     """Bind legacy conversations on first file access and enforce ownership."""
 
     owner_id = owner_id_from_request(request)
+    _account_generation_for_request(request, owner_id)
     with _STATE_LOCK:
         state = load_single_state()
         conversation, claimed = _owned_conversation_in_state(
@@ -13679,12 +16978,20 @@ def _sync_conversation_files(
     uploads_dir: Path | None = None,
     outputs_dir: Path | None = None,
     *,
+    account_generation: str = "",
     strict: bool = False,
 ) -> None:
     conversation_id = str(conversation.get("id") or "").strip()
     if not conversation_id:
         return
     profile = str(conversation.get("profile") or "").strip()
+    generation = str(
+        account_generation
+        or conversation.get("account_generation")
+        or ""
+    ).strip()
+    if not generation:
+        raise ValueError("conversation account_generation is required")
     uploads = uploads_dir or _conversation_file_dir(conversation_id, "uploads")
     outputs = outputs_dir or _conversation_file_dir(conversation_id, "outputs")
     library = _file_library()
@@ -13692,6 +16999,7 @@ def _sync_conversation_files(
     library.sync_directory(
         owner_id,
         uploads,
+        account_generation=generation,
         source="user_upload",
         conversation_id=conversation_id,
         profile=profile,
@@ -13701,6 +17009,7 @@ def _sync_conversation_files(
     library.sync_directory(
         owner_id,
         outputs,
+        account_generation=generation,
         source="model_output",
         conversation_id=conversation_id,
         profile=profile,
@@ -13709,9 +17018,17 @@ def _sync_conversation_files(
     )
 
 
-def _sync_account_conversations(owner_id: str, *, strict: bool = False) -> None:
+def _sync_account_conversations(
+    owner_id: str,
+    account_generation: str = "",
+    *,
+    strict: bool = False,
+) -> None:
     """Migrate explicitly bound legacy conversations and discover outputs."""
 
+    generation = str(
+        account_generation or _account_generation_for_owner(owner_id)
+    ).strip()
     with _STATE_LOCK:
         state = load_single_state()
         conversations: list[dict[str, Any]] = []
@@ -13728,15 +17045,36 @@ def _sync_account_conversations(owner_id: str, *, strict: bool = False) -> None:
             if existing_owner != owner_id:
                 conversation["owner_id"] = owner_id
                 changed = True
+            stored_generation = str(
+                conversation.get("account_generation") or ""
+            ).strip()
+            if stored_generation and stored_generation != generation:
+                continue
+            if not stored_generation:
+                conversation["account_generation"] = generation
+                changed = True
             conversations.append(conversation)
         if changed:
             save_single_state(state)
     for conversation in conversations:
-        _sync_conversation_files(owner_id, conversation, strict=strict)
+        _sync_conversation_files(
+            owner_id,
+            conversation,
+            account_generation=generation,
+            strict=strict,
+        )
 
 
-def _account_file_migration_marker(owner_id: str) -> Path:
-    owner_hash = hashlib.sha256(owner_id.encode("utf-8")).hexdigest()[:32]
+def _account_file_migration_marker(
+    owner_id: str,
+    account_generation: str = "",
+) -> Path:
+    generation = str(
+        account_generation or _account_generation_for_owner(owner_id)
+    ).strip()
+    owner_hash = hashlib.sha256(
+        f"{owner_id}\x00{generation}".encode("utf-8")
+    ).hexdigest()[:32]
     return (
         _file_library().root
         / "migrations"
@@ -13744,16 +17082,22 @@ def _account_file_migration_marker(owner_id: str) -> Path:
     )
 
 
-def _migrate_account_conversation_files_once(owner_id: str) -> None:
+def _migrate_account_conversation_files_once(
+    owner_id: str,
+    account_generation: str = "",
+) -> None:
     """Index pre-library conversation files once for the account that claims them."""
 
-    marker = _account_file_migration_marker(owner_id)
+    generation = str(
+        account_generation or _account_generation_for_owner(owner_id)
+    ).strip()
+    marker = _account_file_migration_marker(owner_id, generation)
     if marker.is_file():
         return
     with _ACCOUNT_FILE_MIGRATION_LOCK:
         if marker.is_file():
             return
-        _sync_account_conversations(owner_id, strict=True)
+        _sync_account_conversations(owner_id, generation, strict=True)
         marker.parent.mkdir(parents=True, exist_ok=True)
         temporary = marker.with_name(f".{marker.name}.{uuid.uuid4().hex}.tmp")
         try:
@@ -13800,6 +17144,8 @@ def _library_attachment(record: dict[str, Any]) -> dict[str, Any]:
 def _conversation_library_attachments(
     owner_id: str,
     conversation_id: str,
+    *,
+    account_generation: str,
 ) -> list[dict[str, Any]]:
     library = _file_library()
     records: list[dict[str, Any]] = []
@@ -13807,6 +17153,7 @@ def _conversation_library_attachments(
     while True:
         page, total = library.list_files(
             owner_id,
+            account_generation=account_generation,
             conversation_id=conversation_id,
             limit=200,
             offset=offset,
@@ -13844,6 +17191,22 @@ class RegisterArtifactBody(BaseModel):
     error: str = ""
 
 
+class MobileManagedInstallationBody(BaseModel):
+    kind: str
+    identifier: str
+    profile: str = "default"
+    request_id: str = ""
+    scope: str = "auto"
+    locality: str = "portable"
+    targets: list[str] = []
+    project_name: str = ""
+    source_ref: str = ""
+
+
+class MobileManagedInstallationRollbackBody(BaseModel):
+    request_id: str = ""
+
+
 @router.post("/single/conversations/{conversation_id}/artifacts")
 def register_conversation_artifact(
     conversation_id: str,
@@ -13853,6 +17216,7 @@ def register_conversation_artifact(
     """Reserve, publish, or fail a model-created file in ``outputs``."""
 
     owner_id, conversation = _owned_conversation(request, conversation_id)
+    account_generation = _account_generation_for_request(request, owner_id)
     output_root = _conversation_file_dir(conversation_id, "outputs").resolve()
     relative_path = payload.relative_path.strip().replace("\\", "/")
     target = (output_root / relative_path).resolve() if relative_path else None
@@ -13879,6 +17243,7 @@ def register_conversation_artifact(
             record = library.ingest_file(
                 owner_id,
                 target,
+                account_generation=account_generation,
                 name=name,
                 source="model_output",
                 conversation_id=conversation_id,
@@ -13892,12 +17257,17 @@ def register_conversation_artifact(
             )
         else:
             if payload.artifact_id:
-                record = library.get_file(owner_id, payload.artifact_id)
+                record = library.get_file(
+                    owner_id,
+                    payload.artifact_id,
+                    account_generation=account_generation,
+                )
                 if record is None:
                     raise KeyError(payload.artifact_id)
             else:
                 record = library.reserve_file(
                     owner_id,
+                    account_generation=account_generation,
                     name=name,
                     source="model_output",
                     conversation_id=conversation_id,
@@ -13911,6 +17281,7 @@ def register_conversation_artifact(
                 owner_id,
                 str(record["id"]),
                 artifact_status,
+                account_generation=account_generation,
                 error=payload.error,
             )
     except KeyError as exc:
@@ -13925,6 +17296,7 @@ async def upload_account_file(request: Request):
     """Upload a durable user-owned file without requiring a chat first."""
 
     owner_id = owner_id_from_request(request)
+    account_generation = _account_generation_for_request(request, owner_id)
     try:
         filename = safe_attachment_name(
             unquote(request.headers.get("x-filename", ""))
@@ -13934,6 +17306,7 @@ async def upload_account_file(request: Request):
     upload_id = str(request.headers.get("x-upload-id") or "").strip()
     if not re.fullmatch(r"[A-Za-z0-9._:-]{8,256}", upload_id):
         raise HTTPException(status_code=422, detail="Invalid X-Upload-ID")
+    expected_bytes, expected_sha = _attachment_upload_contract(request)
     incoming = _file_library().root / "incoming"
     incoming.mkdir(parents=True, exist_ok=True)
     temp = incoming / f".{uuid.uuid4().hex}.upload"
@@ -13947,9 +17320,17 @@ async def upload_account_file(request: Request):
                 if total > _MAX_ATTACHMENT_BYTES:
                     raise HTTPException(status_code=413, detail="文件不能超过 64 MB")
                 handle.write(chunk)
-        actual_sha = hashlib.sha256(temp.read_bytes()).hexdigest()
+        if expected_bytes is not None and total != expected_bytes:
+            raise HTTPException(status_code=400, detail="Content-Length does not match request body")
+        actual_sha = _sha256_path(temp)
+        if expected_sha and actual_sha != expected_sha:
+            raise HTTPException(status_code=422, detail="X-Content-SHA256 does not match request body")
         origin_key = f"account-upload:{upload_id}"
-        existing = _file_library().get_file_by_origin(owner_id, origin_key)
+        existing = _file_library().get_file_by_origin(
+            owner_id,
+            origin_key,
+            account_generation=account_generation,
+        )
         if (
             existing is not None
             and existing.get("status") == "available"
@@ -13962,12 +17343,15 @@ async def upload_account_file(request: Request):
         record = _file_library().ingest_file(
             owner_id,
             temp,
+            account_generation=account_generation,
             name=filename,
             source="user_upload",
             origin_key=origin_key,
             mime_type=request.headers.get("content-type", ""),
             allowed_roots=[incoming],
         )
+    except (FileExistsError, BlockingIOError) as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
     except PermissionError as exc:
         raise HTTPException(status_code=410, detail="Account was deleted") from exc
     finally:
@@ -13990,13 +17374,14 @@ def list_account_files(
     offset: int = 0,
 ):
     owner_id = owner_id_from_request(request)
-    _migrate_account_conversation_files_once(owner_id)
+    account_generation = _account_generation_for_request(request, owner_id)
     try:
         start_ms = parse_date_filter(date_from)
         end_ms = parse_date_filter(date_to, end_of_day=True)
         requested_type = file_type or request.query_params.get("type", "")
         records, total = _file_library().list_files(
             owner_id,
+            account_generation=account_generation,
             keyword=q,
             date_from=start_ms,
             date_to=end_ms,
@@ -14016,9 +17401,267 @@ def list_account_files(
     }
 
 
+@router.get("/tool-output-artifacts")
+def list_tool_output_artifacts(request: Request, limit: int = 100, offset: int = 0):
+    if limit < 1 or limit > 1000:
+        raise HTTPException(status_code=422, detail="limit must be between 1 and 1000")
+    if offset < 0:
+        raise HTTPException(status_code=422, detail="offset must be non-negative")
+    store = EncryptedToolArtifactStore(Path(get_hermes_home()))
+    owner_id = owner_id_from_request(request)
+    account_generation = _account_generation_for_request(request, owner_id)
+    return {
+        "artifacts": store.list_owner(
+            owner_id,
+            account_generation=account_generation,
+            limit=limit,
+            offset=offset,
+        ),
+        "total": store.count_owner(
+            owner_id,
+            account_generation=account_generation,
+        ),
+        "limit": limit,
+        "offset": offset,
+    }
+
+
+@router.post("/managed-installations", status_code=202)
+def create_mobile_managed_installation(
+    body: MobileManagedInstallationBody,
+    request: Request,
+):
+    """Create one fleet operation inside the authenticated account boundary."""
+
+    from hermes_cli.managed_installations import create_managed_installation
+
+    owner_id = owner_id_from_request(request)
+    account_generation = _account_generation_for_request(request, owner_id)
+    try:
+        operation = create_managed_installation(
+            kind=body.kind,
+            identifier=body.identifier,
+            profile=body.profile,
+            request_id=body.request_id,
+            scope=body.scope,
+            locality=body.locality,
+            targets=body.targets,
+            project_name=body.project_name,
+            source_ref=body.source_ref,
+            require_topology=True,
+            owner_id=owner_id,
+            account_generation=account_generation,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except RuntimeError as exc:
+        raise HTTPException(status_code=503, detail=str(exc)) from exc
+    return {"accepted": True, "operation": operation}
+
+
+@router.get("/managed-installations")
+def list_mobile_managed_installations(
+    request: Request,
+    kind: str = "",
+    profile: str = "",
+    limit: int = 50,
+):
+    from hermes_cli.managed_installations import list_managed_installations
+
+    owner_id = owner_id_from_request(request)
+    account_generation = _account_generation_for_request(request, owner_id)
+    try:
+        return list_managed_installations(
+            kind=kind,
+            profile=profile,
+            limit=limit,
+            owner_id=owner_id,
+            account_generation=account_generation,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@router.get("/managed-installations/{operation_id}")
+def get_mobile_managed_installation(operation_id: str, request: Request):
+    from hermes_cli.managed_installations import get_managed_installation
+
+    owner_id = owner_id_from_request(request)
+    account_generation = _account_generation_for_request(request, owner_id)
+    try:
+        return get_managed_installation(
+            operation_id,
+            owner_id=owner_id,
+            account_generation=account_generation,
+        )
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail="Installation operation not found") from exc
+
+
+@router.post("/managed-installations/{operation_id}/rollback", status_code=202)
+def rollback_mobile_managed_installation(
+    operation_id: str,
+    body: MobileManagedInstallationRollbackBody,
+    request: Request,
+):
+    from hermes_cli.managed_installations import rollback_managed_installation
+
+    owner_id = owner_id_from_request(request)
+    account_generation = _account_generation_for_request(request, owner_id)
+    try:
+        operation = rollback_managed_installation(
+            operation_id,
+            request_id=body.request_id,
+            owner_id=owner_id,
+            account_generation=account_generation,
+        )
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail="Installation operation not found") from exc
+    except ValueError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    except RuntimeError as exc:
+        raise HTTPException(status_code=503, detail=str(exc)) from exc
+    return {"accepted": True, "operation": operation}
+
+
+@router.get("/managed-resources")
+def list_mobile_managed_resources(
+    request: Request,
+    cursor: int = 0,
+    limit: int = 500,
+):
+    owner_id = owner_id_from_request(request)
+    account_generation = _account_generation_for_request(request, owner_id)
+    try:
+        from hermes_cli.managed_installations import list_managed_resources
+
+        return list_managed_resources(
+            since_cursor=cursor,
+            limit=limit,
+            owner_id=owner_id,
+            account_generation=account_generation,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+
+
+@router.get("/managed-resources/events")
+async def stream_mobile_managed_resources(request: Request):
+    """Stream account-scoped catalog commits without exposing another generation."""
+
+    owner_id = owner_id_from_request(request)
+    account_generation = _account_generation_for_request(request, owner_id)
+    cursor_value = request.query_params.get("cursor") or request.headers.get(
+        "last-event-id",
+        "0",
+    )
+    try:
+        requested_cursor = max(0, int(cursor_value or 0))
+    except (TypeError, ValueError) as exc:
+        raise HTTPException(status_code=422, detail="cursor must be a non-negative integer") from exc
+
+    async def event_stream():
+        from hermes_cli.managed_installations import list_managed_resources
+
+        delivered_cursor = requested_cursor
+        initial = True
+        last_frame_at = time.monotonic()
+        while not await request.is_disconnected():
+            if _account_generation_for_owner(owner_id) != account_generation:
+                return
+            page = await asyncio.to_thread(
+                list_managed_resources,
+                since_cursor=delivered_cursor,
+                limit=500,
+                owner_id=owner_id,
+                account_generation=account_generation,
+            )
+            events = page.get("events") if isinstance(page, dict) else None
+            if initial or page.get("reset_cursor") or events:
+                current_cursor = max(0, int(page.get("cursor") or 0))
+                payload = json.dumps(
+                    page,
+                    ensure_ascii=False,
+                    separators=(",", ":"),
+                )
+                yield (
+                    f"id: {current_cursor}\n"
+                    "event: managed-resources\n"
+                    f"data: {payload}\n\n"
+                )
+                delivered_cursor = current_cursor
+                initial = False
+                last_frame_at = time.monotonic()
+                if page.get("has_more"):
+                    continue
+            elif time.monotonic() - last_frame_at >= 15:
+                yield ": keepalive\n\n"
+                last_frame_at = time.monotonic()
+            await asyncio.sleep(1.0)
+
+    return StreamingResponse(
+        event_stream(),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache, no-transform",
+            "Connection": "keep-alive",
+            "X-Accel-Buffering": "no",
+        },
+    )
+
+
+@router.get("/tool-output-artifacts/{artifact_id}/download")
+def download_tool_output_artifact(artifact_id: str, request: Request):
+    owner_id = owner_id_from_request(request)
+    account_generation = _account_generation_for_request(request, owner_id)
+    store = EncryptedToolArtifactStore(Path(get_hermes_home()))
+    metadata = store.metadata(
+        owner_id, artifact_id, account_generation=account_generation
+    )
+    if metadata is None:
+        raise HTTPException(status_code=404, detail="Tool output artifact not found")
+    try:
+        content = store.read(
+            owner_id, artifact_id, account_generation=account_generation
+        )
+    except (FileNotFoundError, RuntimeError) as exc:
+        raise HTTPException(status_code=404, detail="Tool output artifact not found") from exc
+    return Response(
+        content=content,
+        media_type="text/plain; charset=utf-8",
+        headers={
+            "Cache-Control": "private, no-store",
+            "ETag": f'"{metadata["sha256"]}"',
+            "Content-Disposition": (
+                f'attachment; filename="{artifact_id}.txt"'
+            ),
+        },
+    )
+
+
+@router.delete("/tool-output-artifacts/{artifact_id}")
+def delete_tool_output_artifact(artifact_id: str, request: Request):
+    owner_id = owner_id_from_request(request)
+    account_generation = _account_generation_for_request(request, owner_id)
+    deleted = EncryptedToolArtifactStore(Path(get_hermes_home())).delete(
+        owner_id,
+        artifact_id,
+        account_generation=account_generation,
+    )
+    if not deleted:
+        raise HTTPException(status_code=404, detail="Tool output artifact not found")
+    return {"id": artifact_id, "ok": True}
+
+
 @router.get("/files/{file_id}")
 def get_account_file(file_id: str, request: Request):
-    record = _file_library().get_file(owner_id_from_request(request), file_id)
+    owner_id = owner_id_from_request(request)
+    account_generation = _account_generation_for_request(request, owner_id)
+    record = _file_library().get_file(
+        owner_id,
+        file_id,
+        account_generation=account_generation,
+    )
     if record is None or str(record.get("status") or "") == "staged":
         raise HTTPException(status_code=404, detail="File not found")
     return {"file": _library_attachment(record)}
@@ -14031,9 +17674,12 @@ def download_account_file(
     preview: bool = False,
 ):
     try:
+        owner_id = owner_id_from_request(request)
+        account_generation = _account_generation_for_request(request, owner_id)
         record, path = _file_library().resolve_download(
-            owner_id_from_request(request),
+            owner_id,
             file_id,
+            account_generation=account_generation,
         )
     except (KeyError, FileNotFoundError, ValueError) as exc:
         raise HTTPException(status_code=404, detail="File not found") from exc
@@ -14045,15 +17691,19 @@ def download_account_file(
         headers={
             "Cache-Control": "private, no-cache",
             "ETag": f'"{record["sha256"]}"',
+            "X-Content-SHA256": str(record["sha256"]),
         },
     )
 
 
 @router.delete("/files/{file_id}")
 def delete_account_file(file_id: str, request: Request):
+    owner_id = owner_id_from_request(request)
+    account_generation = _account_generation_for_request(request, owner_id)
     deleted = _file_library().delete_file(
-        owner_id_from_request(request),
+        owner_id,
         file_id,
+        account_generation=account_generation,
     )
     if not deleted:
         raise HTTPException(status_code=404, detail="File not found")
@@ -14929,6 +18579,12 @@ class MobileConsoleCommandBody(BaseModel):
     confirmed: bool = False
 
 
+class MobileConsoleCompletionBody(BaseModel):
+    line: str
+    profile: str = "default"
+    limit: int = Field(default=30, ge=1, le=50)
+
+
 @router.get("/mobile/console/commands")
 def mobile_console_commands(request: Request, profile: str = "default"):
     """Return the server-owned command catalog available to Hermes iOS."""
@@ -14936,7 +18592,12 @@ def mobile_console_commands(request: Request, profile: str = "default"):
     from hermes_cli.mobile_console import mobile_console_catalog
 
     owner_id_from_request(request)
-    normalized, _home = _mobile_profile_home(profile)
+    from hermes_cli.profiles import normalize_profile_name
+
+    try:
+        normalized = normalize_profile_name(profile or "default")
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail="Invalid Profile name") from exc
     return {"profile": normalized, "commands": mobile_console_catalog()}
 
 
@@ -14950,7 +18611,12 @@ def mobile_console_execute(
     from hermes_cli.mobile_console import execute_mobile_console_command
 
     owner_id_from_request(request)
-    normalized, _home = _mobile_profile_home(body.profile)
+    from hermes_cli.profiles import normalize_profile_name
+
+    try:
+        normalized = normalize_profile_name(body.profile or "default")
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail="Invalid Profile name") from exc
     if len(body.line.encode("utf-8")) > 4096:
         raise HTTPException(status_code=413, detail="Console command is too large")
     result = execute_mobile_console_command(
@@ -14964,6 +18630,34 @@ def mobile_console_execute(
         "output": result.output,
         "command": result.command,
         "confirmation_message": result.confirmation_message,
+    }
+
+
+@router.post("/mobile/console/completions")
+def mobile_console_completion_candidates(
+    body: MobileConsoleCompletionBody,
+    request: Request,
+):
+    """Complete mobile command arguments without local path or shell lookup."""
+
+    from hermes_cli.mobile_console import mobile_console_completions
+
+    owner_id_from_request(request)
+    from hermes_cli.profiles import normalize_profile_name
+
+    try:
+        normalized = normalize_profile_name(body.profile or "default")
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail="Invalid Profile name") from exc
+    if len(body.line.encode("utf-8")) > 4096:
+        raise HTTPException(status_code=413, detail="Console completion input is too large")
+    return {
+        "profile": normalized,
+        **mobile_console_completions(
+            body.line,
+            profile=normalized,
+            limit=body.limit,
+        ),
     }
 
 

@@ -1,5 +1,6 @@
 import json
 import os
+import sys
 from pathlib import Path
 from unittest.mock import MagicMock
 
@@ -175,8 +176,9 @@ def test_large_process_output_is_bounded_before_sudo_and_plugin_hooks(
     monkeypatch.setitem(terminal_tool_module._active_environments, "default", env)
     monkeypatch.setitem(terminal_tool_module._last_activity, "default", 0.0)
     try:
+        python_path = sys.executable.replace("\\", "/")
         command = (
-            "python3 -c \"import sys; "
+            f"'{python_path}' -c \"import sys; "
             "sys.stdout.write('HEAD-SENTINEL\\n' + 'x' * 2000000 + "
             "'\\nTAIL-SENTINEL')\""
         )

@@ -290,7 +290,7 @@ class TestScanFile:
 
     def test_detect_invisible_unicode(self, tmp_path):
         f = tmp_path / "hidden.md"
-        f.write_text("normal text\u200b with zero-width space\n")
+        f.write_text("normal text\u200b with zero-width space\n", encoding="utf-8")
         findings = scan_file(f, "hidden.md")
         assert any(fi.pattern_id == "invisible_unicode" for fi in findings)
 
@@ -395,7 +395,10 @@ class TestCheckStructure:
         target.mkdir()
         link = tmp_path / "skill" / "escape"
         (tmp_path / "skill").mkdir()
-        link.symlink_to(target)
+        try:
+            link.symlink_to(target, target_is_directory=True)
+        except OSError as exc:
+            pytest.skip(f"directory symlinks unavailable: {exc}")
         findings = _check_structure(tmp_path / "skill")
         assert any(fi.pattern_id == "symlink_escape" for fi in findings)
 

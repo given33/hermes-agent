@@ -44,6 +44,9 @@ from typing import Any, Callable, Dict, List, Optional
 import yaml
 
 from hermes_runtime.config import get_hermes_home
+from hermes_services.startup import bootstrap_trusted_runtime
+
+bootstrap_trusted_runtime()
 
 
 HOOKS_DIR = get_hermes_home() / "hooks"

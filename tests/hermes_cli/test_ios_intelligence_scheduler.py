@@ -43,6 +43,57 @@ class FakeWeather:
         return {"warning": []}
 
 
+def test_scheduler_health_requires_a_completed_recovery_cycle(monkeypatch, tmp_path):
+    scheduler = IOSIntelligenceScheduler(store=IOSIntelligenceStore(tmp_path))
+    completed = threading.Event()
+
+    def successful_cycle():
+        completed.set()
+        return {"account_deletions": {}, "cleanup_only": False}
+
+    monkeypatch.setattr(scheduler, "_run_cycle", successful_cycle)
+    assert scheduler.health()["ok"] is False
+
+    scheduler.start()
+    assert completed.wait(2)
+    for _ in range(100):
+        if scheduler.health()["cycle_count"]:
+            break
+        time.sleep(0.01)
+    healthy = scheduler.health()
+    assert healthy["ok"] is True
+    assert healthy["thread_alive"] is True
+    assert healthy["cycle_count"] == 1
+    assert healthy["last_cycle_completed_at"] >= healthy["last_cycle_started_at"]
+    assert healthy["last_error"] == ""
+
+    scheduler.stop()
+    assert scheduler.health()["ok"] is False
+
+
+def test_scheduler_health_exposes_a_failing_cleanup_loop(monkeypatch, tmp_path):
+    scheduler = IOSIntelligenceScheduler(store=IOSIntelligenceStore(tmp_path))
+    attempted = threading.Event()
+
+    def failed_cycle():
+        attempted.set()
+        raise RuntimeError("cleanup database unavailable")
+
+    monkeypatch.setattr(scheduler, "_run_cycle", failed_cycle)
+    scheduler.start()
+    assert attempted.wait(2)
+    for _ in range(100):
+        if scheduler.health()["last_error"]:
+            break
+        time.sleep(0.01)
+    unhealthy = scheduler.health()
+    assert unhealthy["ok"] is False
+    assert unhealthy["thread_alive"] is True
+    assert unhealthy["cycle_count"] == 0
+    assert unhealthy["last_error"] == "cleanup database unavailable"
+    scheduler.stop()
+
+
 def test_cloud_semantic_analyzer_uses_structured_host_model_call():
     captured = {}
 
@@ -295,11 +346,13 @@ def test_cleanup_only_cycle_retries_deletions_without_prediction_or_weather(monk
             return [{
                 "owner_id": "alice",
                 "owner_scope": "https://hermes.example|alice",
+                "account_generation": "alice-generation-1",
             }]
 
     class CleanupMobileStore:
-        def account_deletion_status(self, owner_id):
+        def account_deletion_status(self, owner_id, account_generation):
             assert owner_id == "alice"
+            assert account_generation == "alice-generation-1"
             return {"state": "pending"}
 
     monkeypatch.setattr(
@@ -317,7 +370,9 @@ def test_cleanup_only_cycle_retries_deletions_without_prediction_or_weather(monk
     )
     monkeypatch.setattr(
         "hermes_cli.account_cleanup.purge_account_owned_cloud_data",
-        lambda owner_id: calls.append(f"cloud:{owner_id}") or {"profiles": []},
+        lambda owner_id, *, account_generation: calls.append(
+            f"cloud:{owner_id}:{account_generation}"
+        ) or {"profiles": []},
     )
     scheduler = IOSIntelligenceScheduler(
         store=CleanupStore(),
@@ -346,19 +401,26 @@ def test_cleanup_only_cycle_retries_deletions_without_prediction_or_weather(monk
         "state": "complete",
         "profiles": [],
     }]
-    assert calls == ["cold:100", "cloud:alice", "mobile:100", "credentials"]
+    assert calls == [
+        "cold:100",
+        "cloud:alice:alice-generation-1",
+        "mobile:100",
+        "credentials",
+    ]
 
 
 def test_cleanup_reconciles_mobile_intent_after_cross_database_process_exit(
     tmp_path,
     monkeypatch,
 ):
+    mobile = MobileDeviceStore(tmp_path / "mobile-auth.db")
+    generation = mobile.account_generation("alice", create=True)
     intelligence = IOSIntelligenceStore(tmp_path / "ios-intelligence.db")
     intelligence.begin_account_deletion(
         "alice",
         "https://hermes.example|alice",
+        generation,
     )
-    mobile = MobileDeviceStore(tmp_path / "mobile-auth.db")
     monkeypatch.setattr(
         "hermes_cli.dashboard_auth.mobile_device_store.MobileDeviceStore",
         lambda: mobile,
@@ -373,7 +435,11 @@ def test_cleanup_reconciles_mobile_intent_after_cross_database_process_exit(
     )
     monkeypatch.setattr(
         "hermes_cli.account_cleanup.purge_account_owned_cloud_data",
-        lambda owner_id: {"owner_id": owner_id, "profiles": []},
+        lambda owner_id, *, account_generation: {
+            "owner_id": owner_id,
+            "account_generation": account_generation,
+            "profiles": [],
+        },
     )
     scheduler = IOSIntelligenceScheduler(
         store=intelligence,
@@ -399,7 +465,11 @@ def test_cloud_account_cleanup_retries_even_when_mobile_store_is_unavailable(mon
 
         def account_deletion_sagas(self, *, limit):
             assert limit == 1000
-            return [{"owner_id": "alice", "owner_scope": "scope|alice"}]
+            return [{
+                "owner_id": "alice",
+                "owner_scope": "scope|alice",
+                "account_generation": "alice-generation-1",
+            }]
 
     def unavailable_mobile_store():
         raise sqlite3.OperationalError("mobile database unavailable")
@@ -410,7 +480,11 @@ def test_cloud_account_cleanup_retries_even_when_mobile_store_is_unavailable(mon
     )
     monkeypatch.setattr(
         "hermes_cli.account_cleanup.purge_account_owned_cloud_data",
-        lambda owner_id: {"owner_id": owner_id, "profiles": ["default"]},
+        lambda owner_id, *, account_generation: {
+            "owner_id": owner_id,
+            "account_generation": account_generation,
+            "profiles": ["default"],
+        },
     )
     monkeypatch.setattr(
         "hermes_cli.dashboard_auth.owner_mobile.reconcile_deleted_owner_credentials",
@@ -428,6 +502,7 @@ def test_cloud_account_cleanup_retries_even_when_mobile_store_is_unavailable(mon
     assert result["cloud"] == [{
         "owner_id": "alice",
         "state": "complete",
+        "account_generation": "alice-generation-1",
         "profiles": ["default"],
     }]
     assert result["credentials"]["config_cleared"] is True
@@ -943,8 +1018,18 @@ def test_weather_outbox_retry_skips_devices_already_delivered(monkeypatch, tmp_p
         now=now,
     )
     registrations = [
-        {"id": "registration-a", "bundle_id": "app.sunstone1029.fig1171"},
-        {"id": "registration-b", "bundle_id": "app.sunstone1029.fig1171"},
+        {
+            "id": "registration-a",
+            "user_id": "alice",
+            "account_generation": "generation-1",
+            "bundle_id": "app.sunstone1029.fig1171",
+        },
+        {
+            "id": "registration-b",
+            "user_id": "alice",
+            "account_generation": "generation-1",
+            "bundle_id": "app.sunstone1029.fig1171",
+        },
     ]
     calls: list[str] = []
     retrying = {"value": True}
@@ -1106,7 +1191,12 @@ def test_weather_delivery_renews_lease_per_device_during_slow_batch(monkeypatch,
     )
     clock = {"now": now}
     registrations = [
-        {"id": f"registration-{index}", "bundle_id": "app.sunstone1029.fig1171"}
+        {
+            "id": f"registration-{index}",
+            "user_id": "alice",
+            "account_generation": "generation-1",
+            "bundle_id": "app.sunstone1029.fig1171",
+        }
         for index in range(40)
     ]
     reclaim_attempts: list[list[dict[str, Any]]] = []
@@ -1584,7 +1674,14 @@ def test_plugin_relay_policy_limits_event_batches_and_command_retries(monkeypatc
     monkeypatch.setattr(module, "owner_id_from_request", lambda _request: "alice")
 
     events = [
-        module.ContextEvent(id=f"event-{index}", kind="power", timestamp=1, payload={})
+        module.ContextEvent(
+            account_generation="acctgen_test",
+            id=f"event-{index}",
+            kind="power",
+            lifecycle_epoch=1,
+            timestamp=1,
+            payload={},
+        )
         for index in range(2)
     ]
     with pytest.raises(module.HTTPException) as exc_info:
@@ -1626,17 +1723,26 @@ def test_account_delete_route_always_purges_cold_and_mobile_data(monkeypatch):
     calls = {}
 
     class FakeStore:
-        def begin_account_deletion(self, owner_id, owner_scope):
-            calls["intent"] = (owner_id, owner_scope)
+        def begin_account_deletion(self, owner_id, owner_scope, account_generation):
+            calls["intent"] = (owner_id, owner_scope, account_generation)
             return {"owner_id": owner_id, "state": "pending"}
 
-        def delete_account(self, owner_id, *, delete_cold):
-            calls["store"] = (owner_id, delete_cold)
+        def delete_account(self, owner_id, *, delete_cold, account_generation):
+            calls["store"] = (owner_id, delete_cold, account_generation)
             return {"owner_id": owner_id, "state": "complete"}
 
     class FakeMobileStore:
-        def begin_account_deletion(self, owner_id, owner_scope):
-            calls["mobile"] = (owner_id, owner_scope)
+        def account_generation(self, owner_id, *, create):
+            calls["generation"] = (owner_id, create)
+            return "alice-gen-1"
+
+        def begin_account_deletion(
+            self,
+            owner_id,
+            owner_scope,
+            account_generation,
+        ):
+            calls["mobile"] = (owner_id, owner_scope, account_generation)
             return {
                 "id": "delete-1",
                 "state": "pending",
@@ -1652,8 +1758,14 @@ def test_account_delete_route_always_purges_cold_and_mobile_data(monkeypatch):
     monkeypatch.setattr(module, "intelligence_store", lambda: FakeStore())
     monkeypatch.setattr(module, "MobileDeviceStore", FakeMobileStore)
     monkeypatch.setattr(module, "process_account_deletion_outbox", deliver_cleanup)
-    def purge_cloud(owner_id):
-        calls["cloud"] = owner_id
+    def begin_cloud(owner_id, *, account_generation):
+        calls["cloud_intent"] = (owner_id, account_generation)
+        return {"state": "pending"}
+
+    monkeypatch.setattr(module, "begin_account_owned_cloud_deletion", begin_cloud)
+
+    def purge_cloud(owner_id, *, account_generation):
+        calls["cloud"] = (owner_id, account_generation)
         return {"profiles": ["default"], "conversations": 2, "cloud_files": 1}
 
     monkeypatch.setattr(module, "purge_account_owned_cloud_data", purge_cloud)
@@ -1675,11 +1787,13 @@ def test_account_delete_route_always_purges_cold_and_mobile_data(monkeypatch):
     assert "delete_cold" not in module.AccountDeleteBody.model_fields
     assert calls == {
         "cleanup": ("alice", 1, "FakeMobileStore"),
-        "cloud": "alice",
+        "cloud": ("alice", "alice-gen-1"),
+        "cloud_intent": ("alice", "alice-gen-1"),
         "credentials": "alice",
-        "intent": ("alice", "https://hermes.example|alice"),
-        "store": ("alice", True),
-        "mobile": ("alice", "https://hermes.example|alice"),
+        "generation": ("alice", False),
+        "intent": ("alice", "https://hermes.example|alice", "alice-gen-1"),
+        "store": ("alice", True, "alice-gen-1"),
+        "mobile": ("alice", "https://hermes.example|alice", "alice-gen-1"),
     }
     assert result["mobile_auth"] == {"devices": 1, "sessions": 1, "apns": 1}
     assert result["device_cleanup"] == {
@@ -1716,6 +1830,15 @@ def test_account_delete_route_keeps_intent_and_returns_pending_when_cleanup_fail
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
 
+    monkeypatch.setattr(
+        "hermes_cli.dashboard_auth.mobile_device_store.mobile_auth_db_path",
+        lambda: tmp_path / "mobile-auth.db",
+    )
+    mobile = MobileDeviceStore()
+    tokens = mobile.create_session(
+        user_id="alice",
+        device=MobileDeviceInfo(id="device-primary", name="Alice iPhone"),
+    )
     intelligence = IOSIntelligenceStore(tmp_path / "ios-intelligence.db")
     intelligence.ingest_events(
         "alice",
@@ -1728,27 +1851,38 @@ def test_account_delete_route_keeps_intent_and_returns_pending_when_cleanup_fail
         }],
         "event-before-delete",
     )
-    mobile = MobileDeviceStore(tmp_path / "mobile-auth.db")
-    tokens = mobile.create_session(
-        user_id="alice",
-        device=MobileDeviceInfo(id="device-primary", name="Alice iPhone"),
-    )
     original_delete = intelligence.delete_account
     cleanup_calls = [0]
 
-    def fail_first_cleanup(owner_id, *, delete_cold):
+    def fail_first_cleanup(owner_id, *, delete_cold, account_generation):
         cleanup_calls[0] += 1
         if cleanup_calls[0] == 1:
             raise sqlite3.OperationalError("fixture write failure")
-        return original_delete(owner_id, delete_cold=delete_cold)
+        return original_delete(
+            owner_id,
+            delete_cold=delete_cold,
+            account_generation=account_generation,
+        )
 
     monkeypatch.setattr(intelligence, "delete_account", fail_first_cleanup)
     monkeypatch.setattr(module, "intelligence_store", lambda: intelligence)
     monkeypatch.setattr(module, "MobileDeviceStore", lambda: mobile)
     monkeypatch.setattr(
         module,
+        "begin_account_owned_cloud_deletion",
+        lambda owner_id, *, account_generation: {
+            "owner_id": owner_id,
+            "account_generation": account_generation,
+        },
+    )
+    monkeypatch.setattr(
+        module,
         "purge_account_owned_cloud_data",
-        lambda owner_id: {"owner_id": owner_id, "profiles": []},
+        lambda owner_id, *, account_generation: {
+            "owner_id": owner_id,
+            "account_generation": account_generation,
+            "profiles": [],
+        },
     )
     monkeypatch.setattr(
         module,
@@ -1768,18 +1902,86 @@ def test_account_delete_route_keeps_intent_and_returns_pending_when_cleanup_fail
     assert result["accepted"] is True
     assert result["state"] == "pending"
     assert result["error"] == "OperationalError"
-    assert intelligence.account_deletion_status("alice")["status"] == "pending"
+    generation = tokens.session.account_generation
+    assert intelligence.account_deletion_status(
+        "alice",
+        generation,
+    )["status"] == "pending"
     assert mobile.verify_access(tokens.access_token, touch=False) is None
     assert mobile.account_deletion_status("alice") is not None
 
-    recovered = intelligence.retry_account_deletions(owner_id="alice")
+    recovered = intelligence.retry_account_deletions(
+        owner_id="alice",
+        account_generation=generation,
+    )
 
     assert recovered[0]["state"] == "complete"
-    assert intelligence.account_deletion_status("alice")["status"] == "complete"
+    assert intelligence.account_deletion_status(
+        "alice",
+        generation,
+    )["status"] == "complete"
     with sqlite3.connect(intelligence.path) as conn:
         assert conn.execute(
-            "SELECT COUNT(*) FROM ios_events WHERE owner_id='alice'"
+            "SELECT COUNT(*) FROM ios_events"
         ).fetchone()[0] == 0
+
+
+def test_account_delete_does_not_revoke_mobile_auth_before_collaboration_fence(
+    monkeypatch,
+):
+    plugin_path = (
+        Path(__file__).resolve().parents[2]
+        / "plugins"
+        / "ios-intelligence"
+        / "dashboard"
+        / "plugin_api.py"
+    )
+    spec = importlib.util.spec_from_file_location(
+        "test_ios_intelligence_delete_fence_plugin", plugin_path
+    )
+    assert spec and spec.loader
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    calls: list[str] = []
+
+    class FakeStore:
+        def begin_account_deletion(self, owner_id, owner_scope, account_generation):
+            calls.append("intelligence")
+            return {"state": "pending"}
+
+    class FakeMobileStore:
+        def account_generation(self, owner_id, *, create):
+            calls.append("generation")
+            return "alice-gen-1"
+
+        def begin_account_deletion(self, owner_id, owner_scope, account_generation):
+            calls.append("mobile-revoked")
+            raise AssertionError("mobile auth must remain valid")
+
+    def fail_collaboration_fence(owner_id, *, account_generation):
+        calls.append("collaboration-fence")
+        raise OSError("fixture state write failure")
+
+    monkeypatch.setattr(module, "intelligence_store", lambda: FakeStore())
+    monkeypatch.setattr(module, "MobileDeviceStore", FakeMobileStore)
+    monkeypatch.setattr(
+        module,
+        "begin_account_owned_cloud_deletion",
+        fail_collaboration_fence,
+    )
+    monkeypatch.setattr(module, "owner_id_from_request", lambda _request: "alice")
+
+    with pytest.raises(module.HTTPException) as exc_info:
+        module.delete_account(
+            object(),
+            module.AccountDeleteBody(
+                confirm=True,
+                owner_scope="https://hermes.example|alice",
+            ),
+        )
+
+    assert exc_info.value.status_code == 503
+    assert calls == ["generation", "intelligence", "collaboration-fence"]
 
 
 def test_account_delete_route_rejects_a_tombstone_for_another_owner(monkeypatch):

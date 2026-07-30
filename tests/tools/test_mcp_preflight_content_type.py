@@ -414,12 +414,8 @@ def test_post_probe_still_rejects_when_post_also_returns_html():
             asyncio.run(task._preflight_content_type(f"{base}/", timeout=5.0))
 
 
-def test_post_probe_still_rejects_when_post_returns_non_2xx():
-    """HEAD returns HTML, POST returns 401 with JSON → reject.
-
-    A non-2xx POST does not prove MCP capability; the original HEAD/GET
-    response is used and should still trigger rejection.
-    """
+def test_post_probe_accepts_jsonrpc_media_type_on_401():
+    """A JSON response on 401 is positive MCP endpoint evidence."""
     task = _make_task("post_401")
     with _serve(_handler(
         status=200, content_type="text/html",
@@ -427,8 +423,7 @@ def test_post_probe_still_rejects_when_post_returns_non_2xx():
         post_body=b'{"error":"unauthorized"}',
         post_status=401,
     )) as base:
-        with pytest.raises(NonMcpEndpointError):
-            asyncio.run(task._preflight_content_type(f"{base}/", timeout=5.0))
+        asyncio.run(task._preflight_content_type(f"{base}/", timeout=5.0))
 
 
 def test_post_probe_not_attempted_for_valid_head():

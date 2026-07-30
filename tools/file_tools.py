@@ -441,7 +441,15 @@ def _path_resolution_warning(filepath: str, resolved: Path, task_id: str = "defa
 
 def _is_blocked_device_path(path: str) -> bool:
     """Return True for concrete device/fd paths that can hang reads."""
-    normalized = os.path.normpath(_expand_tilde(path))
+    expanded = _expand_tilde(path)
+    # Device paths are POSIX namespaces even when Hermes itself runs on
+    # Windows. ntpath.normpath rewrites /dev/zero to \\dev\\zero, which used
+    # to bypass this guard before a Git Bash-backed read.
+    posix_candidate = expanded.replace("\\", "/")
+    if posix_candidate.startswith(("/dev/", "/proc/")):
+        normalized = posixpath.normpath(posix_candidate)
+    else:
+        normalized = os.path.normpath(expanded)
     if normalized in _BLOCKED_DEVICE_PATHS:
         return True
     # /proc/self/fd/0-2 and /proc/<pid>/fd/0-2 are Linux aliases for stdio

@@ -689,9 +689,9 @@ class _CuaDriverSession:
             )
 
             async with stdio_client(params) as (read, write):
-                self._startup_phase = "mcp-initialize"
+                self._startup_phase = "mcp-discover"
                 async with ClientSession(read, write) as session:
-                    await session.initialize()
+                    await session.discover()
                     _t_init = _time.monotonic()
                     # Populate capabilities + capability_version BEFORE
                     # exposing the session to callers, so the first
@@ -761,7 +761,7 @@ class _CuaDriverSession:
             # capability_version is a top-level sibling of `tools` on the
             # tools/list response. cua-driver-core/src/tool.rs:354 emits
             # it; cua-driver-core/src/protocol.rs:150 leaves it OUT of
-            # initialize — so we discover here, not there.
+            # server/discover — so we query tools/list here, not there.
             cv = getattr(tools_list, "capability_version", None)
             if cv is None:
                 extra = getattr(tools_list, "model_extra", None) or {}
@@ -1129,8 +1129,8 @@ def _extract_tool_result(mcp_result: Any) -> Dict[str, Any]:
         "structuredContent": <dict|None>,
         "isError": bool,
       }
-    structuredContent is populated from the MCP result's structuredContent field
-    (MCP spec §2024-11-05+) and takes precedence for structured data like
+    structuredContent is populated from the MCP result's structured content and
+    takes precedence for structured data like
     list_windows window arrays.
 
     `image_mime_types` is the explicit `mimeType` cua-driver emits on every
@@ -1145,8 +1145,8 @@ def _extract_tool_result(mcp_result: Any) -> Dict[str, Any]:
     image_mime_types: List[str] = []
     # Use identity, not truthiness: unittest mocks and proxy objects commonly
     # synthesize truthy attributes that were never present in the real result.
-    is_error = getattr(mcp_result, "isError", False) is True
-    structured: Optional[Dict] = getattr(mcp_result, "structuredContent", None) or None
+    is_error = getattr(mcp_result, "is_error", False) is True
+    structured: Optional[Dict] = getattr(mcp_result, "structured_content", None) or None
     text_chunks: List[str] = []
     for part in getattr(mcp_result, "content", []) or []:
         ptype = getattr(part, "type", None)
@@ -1156,7 +1156,7 @@ def _extract_tool_result(mcp_result: Any) -> Dict[str, Any]:
             b64 = getattr(part, "data", None)
             if b64:
                 images.append(b64)
-                mime = getattr(part, "mimeType", None) or ""
+                mime = getattr(part, "mime_type", None) or ""
                 image_mime_types.append(mime)
     if text_chunks:
         joined = "\n".join(t for t in text_chunks if t)

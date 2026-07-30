@@ -31,6 +31,10 @@ from typing import List, Optional, Tuple
 from hermes_runtime.config import cfg_get
 from utils import fast_safe_load
 
+from hermes_services.startup import bootstrap_trusted_runtime
+
+bootstrap_trusted_runtime()
+
 logger = logging.getLogger(__name__)
 
 _MEMORY_PLUGINS_DIR = Path(__file__).parent

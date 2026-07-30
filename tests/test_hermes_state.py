@@ -864,6 +864,28 @@ class TestSessionLifecycle:
 # =========================================================================
 
 class TestMessageStorage:
+    def test_hook_trace_round_trips_through_session_message(self, db):
+        db.create_session(
+            session_id="hook-session",
+            source="test",
+            model="test-model",
+        )
+        trace = [{
+            "point": "after_provider_response",
+            "name": "observer",
+            "status": "completed",
+        }]
+
+        db.append_message(
+            "hook-session",
+            role="assistant",
+            content="done",
+            hook_trace=trace,
+        )
+
+        messages = db.get_messages_as_conversation("hook-session")
+        assert messages[0]["hook_trace"] == trace
+
     def test_append_and_get_messages(self, db):
         db.create_session(session_id="s1", source="cli")
         db.append_message("s1", role="user", content="Hello")

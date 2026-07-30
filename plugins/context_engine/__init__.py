@@ -25,6 +25,10 @@ import sys
 from pathlib import Path
 from typing import List, Optional, Tuple
 
+from hermes_services.startup import bootstrap_trusted_runtime
+
+bootstrap_trusted_runtime()
+
 logger = logging.getLogger(__name__)
 
 _CONTEXT_ENGINE_PLUGINS_DIR = Path(__file__).parent

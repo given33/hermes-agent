@@ -211,36 +211,42 @@ def test_account_deletion_revokes_password_provider_and_persisted_credentials():
     assert login_error.value.status_code == 409
 
 
-def test_terminally_deleted_username_is_permanently_retired():
-    _register()
+def test_same_username_can_register_a_new_generation_while_old_cleanup_is_pending():
+    old_tokens = _register()
     store = owner_mobile._store()
-    store.begin_account_deletion("owner", "https://hermes.example|owner")
-    with sqlite3.connect(store.db_path) as conn:
-        conn.execute(
-            "UPDATE mobile_account_deletion_outbox SET state='delivered',completed_at=1 "
-            "WHERE user_id='owner'"
-        )
+    assert old_tokens["account"]["account_generation"] == store.account_generation(
+        "owner"
+    )
+    deletion = store.begin_account_deletion(
+        "owner",
+        "https://hermes.example|owner",
+    )
+    old_generation = deletion["account_generation"]
     owner_mobile.delete_owner_account_credentials("owner")
-    from hermes_cli.config import load_config
-
-    before_rejected_registration = load_config()
     _seed_registration_code()
 
-    with pytest.raises(HTTPException) as error:
-        mobile_register(
-            _Request(),
-            MobileRegisterBody(
-                email="2821961676@qq.com",
-                verification_code="123456",
-                username="owner",
-                password="new-correct-horse-42",
-                device=MobileDeviceBody(id="new-device", name="New iPhone"),
-            ),
-        )
+    replacement = mobile_register(
+        _Request(),
+        MobileRegisterBody(
+            email="2821961676@qq.com",
+            verification_code="123456",
+            username="owner",
+            password="new-correct-horse-42",
+            device=MobileDeviceBody(id="new-device", name="New iPhone"),
+        ),
+    )
 
-    assert error.value.status_code == 409
-    assert "permanently retired" in str(error.value.detail)
-    assert load_config() == before_rejected_registration
+    new_generation = store.account_generation("owner")
+    assert new_generation != old_generation
+    assert replacement["account"]["account_generation"] == new_generation
+    assert store.account_deletion_status("owner") is None
+    assert store.account_deletion_status(
+        "owner",
+        old_generation,
+    )["state"] == "pending"
+    assert store.verify_access(old_tokens["access_token"], touch=False) is None
+    assert store.verify_access(replacement["access_token"], touch=False) is not None
+    assert owner_mobile.owner_account_configured() is True
 
 
 def test_registration_fails_closed_when_intelligence_tombstone_lookup_errors(monkeypatch):

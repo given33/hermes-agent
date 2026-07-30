@@ -564,6 +564,13 @@ def _compute_tool_definitions(
     except Exception as e:  # pragma: no cover — never break tool loading
         logger.warning("Tool search assembly skipped: %s", e)
 
+    # Bind and publish contracts for the definitions the model will actually
+    # receive. Tool-search assembly can replace deferred tools with bridge
+    # tools, so annotating earlier would leave those final capabilities without
+    # an execution contract and would bind definitions that were not exposed.
+    from hermes_services.tool_contract import annotate_tool_definitions
+    filtered_tools = annotate_tool_definitions(filtered_tools)
+
     return filtered_tools
 
 
@@ -1037,6 +1044,7 @@ def handle_function_call(
     tool_request_middleware_trace: Optional[List[Dict[str, Any]]] = None,
     enabled_toolsets: Optional[List[str]] = None,
     disabled_toolsets: Optional[List[str]] = None,
+    enforce_tool_isolation: bool = False,
 ) -> str:
     """
     Main function call dispatcher that routes calls to the tool registry.
@@ -1058,6 +1066,9 @@ def handle_function_call(
                        matching ``get_tool_definitions`` semantics.
         disabled_toolsets: The session's disabled toolsets, applied as a
                        subtraction when scoping the bridge catalog.
+        enforce_tool_isolation: Run registry handlers in a disposable process
+                       with the runtime hard deadline. Agent executors set
+                       this; direct callers retain legacy dispatch.
 
     Returns:
         Function result as a JSON string.
@@ -1141,6 +1152,7 @@ def handle_function_call(
                 tool_request_middleware_trace=list(_tool_middleware_trace),
                 enabled_toolsets=enabled_toolsets,
                 disabled_toolsets=disabled_toolsets,
+                enforce_tool_isolation=enforce_tool_isolation,
             )
 
     _tool_original_args = dict(function_args)
@@ -1267,6 +1279,7 @@ def handle_function_call(
                         task_id=task_id,
                         session_id=session_id,
                         enabled_tools=sandbox_enabled,
+                        isolate=enforce_tool_isolation,
                     )
             else:
                 def _dispatch(next_args: Dict[str, Any]) -> Any:
@@ -1275,6 +1288,7 @@ def handle_function_call(
                         task_id=task_id,
                         session_id=session_id,
                         user_task=user_task,
+                        isolate=enforce_tool_isolation,
                     )
             from hermes_cli.middleware import run_tool_execution_middleware
 

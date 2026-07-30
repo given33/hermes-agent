@@ -25,6 +25,47 @@ cleanup() {
 trap cleanup EXIT
 
 runtime_files=(
+  "agent/agent_runtime_helpers.py"
+  "agent/chat_completion_helpers.py"
+  "agent/conversation_compression.py"
+  "agent/conversation_loop.py"
+  "agent/curator_backup.py"
+  "agent/lsp/workspace.py"
+  "agent/shell_hooks.py"
+  "agent/tool_dispatch_helpers.py"
+  "agent/tool_executor.py"
+  "agent/transports/hermes_tools_mcp_server.py"
+  "gateway/hooks.py"
+  "gateway/platforms/api_server.py"
+  "gateway/run.py"
+  "hermes_cli/backup.py"
+  "hermes_cli/dashboard_auth/base.py"
+  "hermes_cli/main.py"
+  "hermes_cli/mcp_config.py"
+  "hermes_cli/plugins.py"
+  "hermes_cli/profile_distribution.py"
+  "hermes_state.py"
+  "mcp_serve.py"
+  "model_tools.py"
+  "plugins/context_engine/__init__.py"
+  "plugins/cron_providers/__init__.py"
+  "plugins/memory/__init__.py"
+  "plugins/memory/config_schema.py"
+  "providers/__init__.py"
+  "run_agent.py"
+  "tools/code_execution_tool.py"
+  "tools/computer_use/cua_backend.py"
+  "tools/credential_files.py"
+  "tools/file_operations.py"
+  "tools/file_tools.py"
+  "tools/lazy_deps.py"
+  "tools/mcp_oauth.py"
+  "tools/mcp_oauth_manager.py"
+  "tools/registry.py"
+  "tools/skills_guard.py"
+  "tools/skills_hub.py"
+  "tools/terminal_tool.py"
+  "tools/tool_result_storage.py"
   "plugins/collaboration/dashboard/plugin_api.py"
   "plugins/collaboration/dashboard/manifest.json"
   "plugins/collaboration/dashboard/dist/index.js"
@@ -44,6 +85,31 @@ runtime_files=(
   "agent/context_diagnostics.py"
   "hermes_cli/doctor.py"
   "tui_gateway/server.py"
+  "hermes_services/__init__.py"
+  "hermes_services/application.py"
+  "hermes_services/auth.py"
+  "hermes_services/behavior_eval.py"
+  "hermes_services/contexts.py"
+  "hermes_services/contracts.py"
+  "hermes_services/cron_fire.py"
+  "hermes_services/hosted_event_protocol.py"
+  "hermes_services/http_boundary.py"
+  "hermes_services/http_policy.py"
+  "hermes_services/internal_hooks.py"
+  "hermes_services/jsonrpc.py"
+  "hermes_services/middleware.py"
+  "hermes_services/resource_catalog.py"
+  "hermes_services/session_entries.py"
+  "hermes_services/session_registry.py"
+  "hermes_services/startup.py"
+  "hermes_services/tool_contract.py"
+  "hermes_services/tool_isolation.py"
+  "hermes_services/tool_output_artifacts.py"
+  "hermes_cli/account_identity.py"
+  "hermes_cli/account_lifecycle.py"
+  "hermes_cli/account_session_facade.py"
+  "hermes_cli/account_write_approvals.py"
+  "hermes_cli/mobile_console.py"
 )
 nginx_files=(
   "deploy/public/nginx-00-hermes-security.conf"
@@ -63,6 +129,7 @@ state_file="${work}/state/single.json"
 runtime_home="${work}/hermes-home"
 managed_installations_db="${runtime_home}/managed-installations.db"
 managed_nodes_file="${runtime_home}/managed-nodes.json"
+release_evidence_file="${work}/release/release-evidence.json"
 nginx_dir="${work}/nginx"
 nginx_security_target="${nginx_dir}/00-hermes-security.conf"
 nginx_site_target="${nginx_dir}/daxueshenmai.top.conf"
@@ -101,6 +168,9 @@ for relative in "${nginx_files[@]}"; do
 done
 install -D -m 0644 \
   "${repo}/${managed_nodes_template}" "${stage}/${managed_nodes_template}"
+install -D -m 0644 \
+  "${repo}/deploy/public/runtime-requirements.lock" \
+  "${stage}/deploy/public/runtime-requirements.lock"
 printf '%s\n' "old:nginx-security" >"${nginx_security_target}"
 printf '%s\n' "old:nginx-site" >"${nginx_site_target}"
 cat >"${sshd_original}" <<'EOF'
@@ -183,6 +253,7 @@ cat >"${fake_bin}/ssh" <<'SH'
 set -euo pipefail
 command="${!#}"
 printf '%s\n' "${command}" >>"${FAKE_DEPLOY_SSH_LOG}"
+cat >/dev/null
 if [[ "${FAKE_DEPLOY_CONFIGURE_FAIL:-0}" == 1 \
   && "${command}" == *"sudo -n /bin/bash"* \
   && "${command}" == *"configure-main-managed-installation-ssh.sh"* ]]; then
@@ -193,6 +264,7 @@ cat >"${fake_bin}/scp" <<'SH'
 #!/usr/bin/env bash
 set -euo pipefail
 printf '%s\n' "$*" >>"${FAKE_DEPLOY_SCP_LOG}"
+[[ "${FAKE_DEPLOY_SCP_FAIL:-0}" != 1 ]]
 SH
 cat >"${fake_bin}/nginx" <<'SH'
 #!/usr/bin/env bash
@@ -250,6 +322,44 @@ print(json.dumps({
 }))
 PY
 )"
+elif [[ "${url}" == */api/plugins/collaboration/connector/deployment-health ]]; then
+  payload="$(python3 - "${HERMES_AGENT_ROOT}/plugins/collaboration/dashboard/manifest.json" <<'PY'
+import hashlib
+import json
+import sys
+
+manifest_bytes = open(sys.argv[1], "rb").read()
+manifest = json.loads(manifest_bytes)
+database = {
+    "ok": True,
+    "code_schema_version": 1,
+    "db_user_version": 1,
+    "integrity_check": "ok",
+    "schema_sha256": "0" * 64,
+    "required_tables": [],
+    "required_triggers": [],
+}
+managed = {
+    **database,
+    "catalog_rows": 0,
+    "required_tables": ["managed_resource_catalog"],
+    "required_triggers": ["managed_installation_source_lock_immutable"],
+}
+print(json.dumps({
+    "ok": True,
+    "connector_id": "dbb3-primary",
+    "contract_version": 2,
+    "manifest_version": manifest["version"],
+    "manifest_sha256": hashlib.sha256(manifest_bytes).hexdigest(),
+    "managed_catalog_readable": True,
+    "databases": {
+        "cloud_files": database,
+        "mobile_auth": database,
+        "managed_resources": managed,
+    },
+}))
+PY
+)"
 elif [[ "${url}" == */_hermes/installations/dbb3/health ]]; then
   payload='{"ok":true,"node_id":"dbb3","installations":true,"recovery":false}'
 elif [[ "${url}" == */_hermes/installations/wsl/health ]]; then
@@ -285,6 +395,7 @@ run_ssh_configurator() {
     FAKE_SSH_RELOAD_MARKER="${ssh_reload_marker}" \
     FAKE_SSH_MV_FAIL_ONCE="${2:-0}" \
     FAKE_SSH_MV_MARKER="${ssh_mv_marker}" \
+    FAKE_SYSTEMCTL_LOG="${work}/sshd-systemctl.log" \
     HERMES_SSHD_CONFIG="${sshd_config}" \
     HERMES_SSHD_BINARY="${fake_bin}/sshd" \
     HERMES_SSHD_SERVICE="ssh-test.service" \
@@ -343,6 +454,30 @@ if grep -Eq "sudo -n /bin/bash .*install-collaboration-backend\.sh" "${deploy_ss
 fi
 [[ "$(tail -n 1 "${deploy_ssh_log}")" == "rm -rf -- "* ]]
 
+: >"${deploy_ssh_log}"
+: >"${deploy_scp_log}"
+set +e
+env \
+  PATH="${fake_bin}:${PATH}" \
+  FAKE_DEPLOY_SCP_FAIL=1 \
+  FAKE_DEPLOY_SSH_LOG="${deploy_ssh_log}" \
+  FAKE_DEPLOY_SCP_LOG="${deploy_scp_log}" \
+  HERMES_REPO="${repo}" \
+  HERMES_LOCAL_PYTHON="${runtime_python}" \
+  HERMES_COLLABORATION_VERSION="${version}" \
+  HERMES_PUBLIC_REMOTE="admin@test.invalid" \
+  /bin/bash "${deployer}" >"${work}/deployer-upload.stdout" \
+    2>"${work}/deployer-upload.stderr"
+deployer_upload_status=$?
+set -e
+[[ "${deployer_upload_status}" -ne 0 ]]
+[[ -s "${deploy_scp_log}" ]]
+if grep -Eq "sudo -n /bin/bash .*install-collaboration-backend\.sh" "${deploy_ssh_log}"; then
+  printf '%s\n' "installer ran after upload failure" >&2
+  exit 1
+fi
+[[ "$(tail -n 1 "${deploy_ssh_log}")" == "rm -rf -- "* ]]
+
 run_installer() {
   env \
     PATH="${fake_bin}:${PATH}" \
@@ -350,6 +485,7 @@ run_installer() {
     FAKE_SIGNAL_ON_START="${2:-0}" \
     FAKE_HANDSHAKE_FAIL="${3:-0}" \
     FAKE_NGINX_FAIL="${4:-0}" \
+    HERMES_DEPLOY_FAIL_PHASE="${5:-}" \
     HERMES_AGENT_ROOT="${target}" \
     HERMES_RUNTIME_PYTHON="${runtime_python}" \
     HERMES_AGENT_SERVICE="hermes-agent-test.service" \
@@ -367,9 +503,11 @@ run_installer() {
     HERMES_NGINX_SITE_TARGET="${nginx_site_target}" \
     HERMES_NGINX_SERVICE="nginx-test.service" \
     HERMES_NGINX_BINARY="${fake_bin}/nginx" \
+    HERMES_RELEASE_EVIDENCE_FILE="${release_evidence_file}" \
     FAKE_SYSTEMCTL_LOG="${work}/systemctl.log" \
     FAKE_NGINX_LOG="${work}/nginx.log" \
-    /bin/bash "${installer}" "${version}" "${stage}"
+    /bin/bash "${installer}" "${version}" "${stage}" \
+      0000000000000000000000000000000000000001
 }
 
 set +e
@@ -464,6 +602,34 @@ grep -Fq '"nodes":[]' "${managed_nodes_file}"
 [[ "$(sed -n '3p' "${work}/systemctl.log")" == "stop" ]]
 [[ "$(sed -n '4p' "${work}/systemctl.log")" == "start" ]]
 
+for injected_phase in migrate candidate-health traffic-switch drain commit; do
+  : >"${work}/systemctl.log"
+  set +e
+  run_installer 0 0 0 0 "${injected_phase}" \
+    >"${work}/phase-${injected_phase}.stdout" \
+    2>"${work}/phase-${injected_phase}.stderr"
+  phase_status=$?
+  set -e
+  [[ "${phase_status}" -ne 0 ]] || {
+    printf 'forced %s failure unexpectedly succeeded\n' "${injected_phase}" >&2
+    exit 1
+  }
+  grep -Fq "injected deployment failure at ${injected_phase}" \
+    "${work}/phase-${injected_phase}.stderr"
+  for relative in "${runtime_files[@]}"; do
+    [[ "$(<"${target}/${relative}")" == "old:${relative}" ]]
+  done
+  assert_old_state "${state_file}"
+  [[ "$(python3 - "${managed_installations_db}" <<'PY'
+import sqlite3
+import sys
+with sqlite3.connect(sys.argv[1]) as database:
+    print(database.execute("SELECT value FROM marker").fetchone()[0])
+PY
+)" == "old-managed-installation-state" ]]
+  [[ ! -e "${release_evidence_file}" ]]
+done
+
 : >"${work}/systemctl.log"
 run_installer 0 0 >"${work}/success.stdout" 2>"${work}/success.stderr" || {
   cat "${work}/success.stdout" >&2
@@ -531,6 +697,24 @@ with sqlite3.connect(sys.argv[1]) as database:
 PY
 )" == "old-managed-installation-state" ]]
 grep -Fq "service=active" "${work}/success.stdout"
+python3 - "${release_evidence_file}" <<'PY'
+import json
+import sys
+
+evidence = json.load(open(sys.argv[1], encoding="utf-8"))
+assert evidence["schema"] == "hermes.release-evidence.v1"
+assert evidence["phase"] == "committed"
+assert evidence["commit"] == "0000000000000000000000000000000000000001"
+assert len(evidence["manifest_sha256"]) == 64
+assert evidence["database_snapshot"]["database_count"] >= 1
+assert len(evidence["database_snapshot"]["manifest_sha256"]) == 64
+assert evidence["probes"]["deployment_health"]["ok"] is True
+assert evidence["probes"]["managed_installation_routes"] == {
+    "dbb3": True,
+    "wsl": True,
+}
+assert evidence["probes"]["traffic_switch"]["nginx_reloaded"] is True
+PY
 [[ "$(sed -n '1p' "${work}/systemctl.log")" == "stop" ]]
 [[ "$(sed -n '2p' "${work}/systemctl.log")" == "start" ]]
 [[ "$(sed -n '3p' "${work}/systemctl.log")" == "is-active" ]]

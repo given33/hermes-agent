@@ -40,7 +40,7 @@ import time
 import pytest
 
 
-pytest.importorskip("mcp.client.auth.oauth2", reason="MCP SDK 1.26.0+ required")
+pytest.importorskip("mcp.client.auth.oauth2", reason="MCP SDK v2 required")
 
 
 # ---------------------------------------------------------------------------
@@ -382,7 +382,7 @@ async def test_initialize_prefetches_oauth_metadata_when_missing(
     """
     monkeypatch.setenv("HERMES_HOME", str(tmp_path))
 
-    import httpx
+    import httpx2 as httpx
     from mcp.shared.auth import (
         OAuthClientInformationFull,
         OAuthClientMetadata,
@@ -452,7 +452,7 @@ async def test_initialize_prefetches_oauth_metadata_when_missing(
 
     # Patch the AsyncClient constructor used by _prefetch_oauth_metadata so
     # it uses our mock transport instead of the real network.
-    import httpx as real_httpx
+    import httpx2 as real_httpx
 
     original_async_client = real_httpx.AsyncClient
 
@@ -498,7 +498,7 @@ async def test_initialize_skips_prefetch_when_no_tokens(tmp_path, monkeypatch):
     discovery will run on the first real request anyway).
     """
     monkeypatch.setenv("HERMES_HOME", str(tmp_path))
-    import httpx
+    import httpx2 as httpx
     from mcp.shared.auth import OAuthClientMetadata
     from pydantic import AnyUrl
 
@@ -515,7 +515,7 @@ async def test_initialize_skips_prefetch_when_no_tokens(tmp_path, monkeypatch):
         return httpx.Response(404)
 
     transport = httpx.MockTransport(mock_handler)
-    import httpx as real_httpx
+    import httpx2 as real_httpx
 
     original = real_httpx.AsyncClient
 

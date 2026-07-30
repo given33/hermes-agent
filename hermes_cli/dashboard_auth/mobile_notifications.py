@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import copy
 import os
 import threading
 import time
@@ -148,6 +149,7 @@ def build_device_relay_wake_payload(
 def build_account_deletion_payload(
     *,
     owner_scope: str,
+    account_generation: str = "",
     valid_until: int | None = None,
     requested_at: int | None = None,
 ) -> dict[str, Any]:
@@ -163,6 +165,9 @@ def build_account_deletion_payload(
         "owner_scope": normalized_scope,
         "valid_until": expires_at,
     }
+    generation = str(account_generation or "").strip()
+    if generation:
+        data["account_generation"] = generation
     if requested_at is not None:
         data["requested_at"] = max(0, int(requested_at))
     return {
@@ -261,8 +266,13 @@ def device_relay_collapse_id(owner_id: str) -> str:
     return f"hermes-relay-{digest}"[:64]
 
 
-def account_deletion_collapse_id(owner_id: str) -> str:
-    digest = hashlib.sha256(str(owner_id or "").encode("utf-8")).hexdigest()[:40]
+def account_deletion_collapse_id(
+    owner_id: str,
+    account_generation: str = "",
+) -> str:
+    digest = hashlib.sha256(
+        f"{owner_id}\0{account_generation}".encode("utf-8")
+    ).hexdigest()[:40]
     return f"hermes-delete-{digest}"[:64]
 
 
@@ -341,6 +351,7 @@ def deliver_task_completion_push(
         owner_id=owner_id,
         payload=payload,
         collapse_id=collapse_id,
+        event_key=f"turn:{conversation_id}:{turn_id}",
         previous_deliveries=previous_deliveries,
         progress_callback=progress_callback,
         device_store=device_store,
@@ -375,6 +386,7 @@ def deliver_account_notification_push(
         owner_id=owner_id,
         payload=payload,
         collapse_id=account_notification_collapse_id(category, notification_id),
+        event_key=str(notification_id),
         previous_deliveries=previous_deliveries,
         progress_callback=progress_callback,
         device_store=device_store,
@@ -401,6 +413,7 @@ def deliver_account_background_wake(
             expires_at=expires_at,
         ),
         collapse_id=device_relay_collapse_id(owner_id),
+        event_key=f"relay:{command_id}",
         previous_deliveries=previous_deliveries,
         progress_callback=progress_callback,
         device_store=device_store,
@@ -414,6 +427,7 @@ def deliver_account_deletion_push(
     *,
     owner_id: str,
     owner_scope: str,
+    account_generation: str = "",
     valid_until: int | None = None,
     requested_at: int | None = None,
     previous_deliveries: Optional[dict[str, dict[str, Any]]] = None,
@@ -427,10 +441,12 @@ def deliver_account_deletion_push(
         owner_id=owner_id,
         payload=build_account_deletion_payload(
             owner_scope=owner_scope,
+            account_generation=account_generation,
             valid_until=valid_until,
             requested_at=requested_at,
         ),
-        collapse_id=account_deletion_collapse_id(owner_id),
+        collapse_id=account_deletion_collapse_id(owner_id, account_generation),
+        event_key=f"account-deletion:{account_generation}",
         previous_deliveries=previous_deliveries,
         progress_callback=progress_callback,
         device_store=device_store,
@@ -438,6 +454,7 @@ def deliver_account_deletion_push(
         push_type="background",
         priority="5",
         include_revoked_devices=True,
+        account_generation=account_generation,
     )
 
 
@@ -489,6 +506,7 @@ def process_account_deletion_outbox(
             outcome = deliver_account_deletion_push(
                 owner_id=str(item["user_id"]),
                 owner_scope=str(item["owner_scope"]),
+                account_generation=str(item.get("account_generation") or ""),
                 valid_until=valid_until,
                 requested_at=requested_at,
                 previous_deliveries=previous,
@@ -533,6 +551,7 @@ def _deliver_account_payload(
     owner_id: str,
     payload: dict[str, Any],
     collapse_id: str,
+    event_key: str,
     previous_deliveries: Optional[dict[str, dict[str, Any]]] = None,
     progress_callback: Optional[Callable[[dict[str, dict[str, Any]]], None]] = None,
     device_store: Optional[MobileDeviceStore] = None,
@@ -540,6 +559,7 @@ def _deliver_account_payload(
     push_type: str = "alert",
     priority: str = "10",
     include_revoked_devices: bool = False,
+    account_generation: str = "",
 ) -> dict[str, Any]:
     """Attempt one bounded APNs payload delivery for every active device."""
 
@@ -566,11 +586,16 @@ def _deliver_account_payload(
             "list_account_deletion_apns_registrations",
             registration_loader,
         )
+    registration_kwargs = {
+        "user_id": normalized_owner_id,
+        "environment": environment,
+    }
+    if include_revoked_devices and str(account_generation or "").strip():
+        registration_kwargs["account_generation"] = str(account_generation).strip()
     registrations = [
         registration
         for registration in registration_loader(
-            user_id=normalized_owner_id,
-            environment=environment,
+            **registration_kwargs,
         )
         if str(registration.get("bundle_id") or "") == bundle_id
     ]
@@ -630,7 +655,13 @@ def _deliver_account_payload(
             continue
         attempts = int(previous.get("attempts") or 0) + 1
         try:
-            response_status, reason = send(registration, payload, collapse_id)
+            fenced_payload = _account_fenced_payload(
+                payload,
+                registration=registration,
+                owner_id=normalized_owner_id,
+                event_key=event_key,
+            )
+            response_status, reason = send(registration, fenced_payload, collapse_id)
             next_state, error = _classify_apns_response(response_status, reason)
             if next_state == "permanent_failure" and reason in _INVALID_DEVICE_REASONS:
                 store.disable_apns_registration(
@@ -666,6 +697,80 @@ def _deliver_account_payload(
         "deliveries": deliveries,
         "error": "all_apns_deliveries_failed_permanently",
     }
+
+
+def _account_fenced_payload(
+    payload: dict[str, Any],
+    *,
+    registration: dict[str, Any],
+    owner_id: str,
+    event_key: str,
+) -> dict[str, Any]:
+    """Bind one APNs attempt to the exact account generation receiving it."""
+
+    generation = _bounded_identifier(
+        registration.get("account_generation"),
+        "",
+    )
+    normalized_owner = _bounded_identifier(
+        registration.get("user_id") or owner_id,
+        "",
+    )
+    normalized_event = _bounded_identifier(event_key, "")
+    if not generation or not normalized_owner or not normalized_event:
+        raise ValueError("APNs account fence is incomplete")
+
+    current = copy.deepcopy(payload)
+    hermes = current.get("hermes")
+    if not isinstance(hermes, dict):
+        raise ValueError("APNs Hermes payload is missing")
+    hermes["owner_id"] = normalized_owner
+    hermes["account_generation"] = generation
+    hermes["event_key"] = normalized_event
+    return _fit_fenced_payload(current)
+
+
+def _fit_fenced_payload(payload: dict[str, Any]) -> dict[str, Any]:
+    """Keep the account fence while reducing optional display content to 4 KB."""
+
+    def encoded_size() -> int:
+        return len(json.dumps(
+            payload,
+            ensure_ascii=False,
+            separators=(",", ":"),
+        ).encode())
+
+    if encoded_size() <= _MAX_PAYLOAD_BYTES:
+        return payload
+    hermes = payload.get("hermes")
+    if isinstance(hermes, dict):
+        hermes.pop("result", None)
+        data = hermes.get("data")
+        if isinstance(data, dict):
+            required = {
+                key: value
+                for key, value in data.items()
+                if key in {"command_id", "notification_id", "valid_until"}
+            }
+            hermes["data"] = required
+    aps = payload.get("aps")
+    alert = aps.get("alert") if isinstance(aps, dict) else None
+    if encoded_size() > _MAX_PAYLOAD_BYTES and isinstance(alert, dict):
+        body = str(alert.get("body") or "")
+        low, high, best = 0, len(body), ""
+        while low <= high:
+            midpoint = (low + high) // 2
+            candidate = body[:midpoint]
+            alert["body"] = candidate
+            if encoded_size() <= _MAX_PAYLOAD_BYTES:
+                best = candidate
+                low = midpoint + 1
+            else:
+                high = midpoint - 1
+        alert["body"] = best
+    if encoded_size() > _MAX_PAYLOAD_BYTES:
+        raise ValueError("APNs fenced payload exceeds 4 KB")
+    return payload
 
 
 def _registration_key(registration: dict[str, Any]) -> str:

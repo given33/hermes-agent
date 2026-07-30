@@ -339,16 +339,16 @@ def _probe_single_server(
                     tools_filter.get("resources"), default=True
                 )
                 advertised_caps = getattr(
-                    getattr(server, "initialize_result", None),
+                    getattr(server, "discover_result", None),
                     "capabilities",
                     None,
                 )
 
                 def _advertises(cap_attr: str) -> bool:
-                    # When no capability info was captured (legacy fixtures /
-                    # older servers) preserve the old always-try behaviour.
+                    # Current protocol discovery is authoritative. Missing
+                    # capability information fails closed.
                     if advertised_caps is None:
-                        return True
+                        return False
                     return getattr(advertised_caps, cap_attr, None) is not None
 
                 # Capability probes are best-effort: servers without the

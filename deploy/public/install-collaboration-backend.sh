@@ -31,6 +31,20 @@ version="${1:-}"
 stage="${2:-}"
 [[ "${version}" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] || die "invalid release version"
 [[ -n "${stage}" && -d "${stage}" ]] || die "release stage is missing"
+release_commit="${3:-${HERMES_RELEASE_COMMIT:-}}"
+[[ "${release_commit}" =~ ^[0-9a-f]{40}$ ]] \
+  || die "HERMES_RELEASE_COMMIT must be a full lowercase Git commit"
+deploy_fail_phase="${HERMES_DEPLOY_FAIL_PHASE:-}"
+case "${deploy_fail_phase}" in
+  ""|prepare|migrate|candidate-health|traffic-switch|drain|commit) ;;
+  *) die "unknown HERMES_DEPLOY_FAIL_PHASE: ${deploy_fail_phase}" ;;
+esac
+release_phase() {
+  local phase="$1"
+  printf 'release_phase=%s\n' "${phase}"
+  [[ "${deploy_fail_phase}" != "${phase}" ]] \
+    || die "injected deployment failure at ${phase}"
+}
 
 stage_owner="${HERMES_STAGE_OWNER:-admin}"
 stage_root="$(realpath -e -- "${stage}")"
@@ -63,7 +77,77 @@ required=(
   "deploy/public/nginx-00-hermes-security.conf"
   "deploy/public/nginx-daxueshenmai.top.conf"
   "deploy/public/managed-nodes.server.json"
+  "deploy/public/runtime-requirements.lock"
 )
+runtime_service_assets=(
+  "agent/agent_runtime_helpers.py"
+  "agent/chat_completion_helpers.py"
+  "agent/conversation_compression.py"
+  "agent/conversation_loop.py"
+  "agent/curator_backup.py"
+  "agent/lsp/workspace.py"
+  "agent/shell_hooks.py"
+  "agent/tool_dispatch_helpers.py"
+  "agent/tool_executor.py"
+  "agent/transports/hermes_tools_mcp_server.py"
+  "gateway/hooks.py"
+  "gateway/platforms/api_server.py"
+  "gateway/run.py"
+  "hermes_cli/backup.py"
+  "hermes_cli/dashboard_auth/base.py"
+  "hermes_cli/main.py"
+  "hermes_cli/mcp_config.py"
+  "hermes_cli/plugins.py"
+  "hermes_cli/profile_distribution.py"
+  "hermes_services/__init__.py"
+  "hermes_services/application.py"
+  "hermes_services/auth.py"
+  "hermes_services/behavior_eval.py"
+  "hermes_services/contexts.py"
+  "hermes_services/contracts.py"
+  "hermes_services/cron_fire.py"
+  "hermes_services/hosted_event_protocol.py"
+  "hermes_services/http_boundary.py"
+  "hermes_services/http_policy.py"
+  "hermes_services/internal_hooks.py"
+  "hermes_services/jsonrpc.py"
+  "hermes_services/middleware.py"
+  "hermes_services/resource_catalog.py"
+  "hermes_services/session_entries.py"
+  "hermes_services/session_registry.py"
+  "hermes_services/startup.py"
+  "hermes_services/tool_contract.py"
+  "hermes_services/tool_isolation.py"
+  "hermes_services/tool_output_artifacts.py"
+  "hermes_cli/account_identity.py"
+  "hermes_cli/account_lifecycle.py"
+  "hermes_cli/account_session_facade.py"
+  "hermes_cli/account_write_approvals.py"
+  "hermes_cli/mobile_console.py"
+  "hermes_state.py"
+  "mcp_serve.py"
+  "model_tools.py"
+  "plugins/context_engine/__init__.py"
+  "plugins/cron_providers/__init__.py"
+  "plugins/memory/__init__.py"
+  "plugins/memory/config_schema.py"
+  "providers/__init__.py"
+  "run_agent.py"
+  "tools/code_execution_tool.py"
+  "tools/computer_use/cua_backend.py"
+  "tools/credential_files.py"
+  "tools/file_operations.py"
+  "tools/file_tools.py"
+  "tools/lazy_deps.py"
+  "tools/mcp_oauth.py"
+  "tools/mcp_oauth_manager.py"
+  "tools/registry.py"
+  "tools/skills_guard.py"
+  "tools/skills_hub.py"
+  "tools/terminal_tool.py"
+  "tools/tool_result_storage.py"
+)
+required+=("${runtime_service_assets[@]}")
 # The iOS intelligence release is staged alongside the collaboration release.
 # Keep this list optional for one-release rollback compatibility: an older
 # stage can still be installed, while a stage containing the plugin is copied
@@ -143,6 +227,8 @@ with open(sys.argv[1], encoding="utf-8") as handle:
 PY
 )"
 [[ "${manifest_version}" == "${version}" ]] || die "manifest version ${manifest_version@Q} does not match ${version}"
+manifest_sha256="$(sha256sum "${snapshot}/plugins/collaboration/dashboard/manifest.json" | cut -d' ' -f1)"
+[[ "${manifest_sha256}" =~ ^[0-9a-f]{64}$ ]] || die "manifest SHA-256 is invalid"
 "${runtime_python}" - \
   "${snapshot}/plugins/collaboration/dashboard/plugin_api.py" \
   "${snapshot}/hermes_cli/cloud_file_library.py" \
@@ -161,6 +247,15 @@ PY
   "${snapshot}/agent/context_diagnostics.py" \
   "${snapshot}/hermes_cli/doctor.py" \
   "${snapshot}/tui_gateway/server.py" <<'PY'
+import pathlib, sys
+for name in sys.argv[1:]:
+    compile(pathlib.Path(name).read_text(encoding="utf-8"), name, "exec")
+PY
+runtime_compile_assets=()
+for relative in "${runtime_service_assets[@]}"; do
+  runtime_compile_assets+=("${snapshot}/${relative}")
+done
+"${runtime_python}" - "${runtime_compile_assets[@]}" <<'PY'
 import pathlib, sys
 for name in sys.argv[1:]:
     compile(pathlib.Path(name).read_text(encoding="utf-8"), name, "exec")
@@ -186,8 +281,8 @@ import pathlib, sys
 for name in sys.argv[1:]:
     compile(pathlib.Path(name).read_text(encoding="utf-8"), name, "exec")
 PY
-  "${runtime_python}" -c 'from mcp.server.fastmcp import FastMCP; assert FastMCP' \
-    || die "Hermes runtime is missing the FastMCP SDK required by iOS MCP services"
+  "${runtime_python}" -c 'from mcp.server import MCPServer; assert MCPServer' \
+    || die "Hermes runtime is missing MCP SDK v2 required by iOS MCP services"
   "${runtime_python}" -c 'from cryptography.hazmat.primitives.ciphers.aead import AESGCM; assert AESGCM' \
     || die "Hermes runtime is missing AES-GCM support required by encrypted iOS hot and cold storage"
   "${runtime_python}" -c 'from agent.plugin_llm import PluginLlm; assert PluginLlm' \
@@ -236,6 +331,7 @@ done
 # file changes. A legacy installation without the route is permitted exactly
 # one bootstrap; the same authenticated contract is mandatory after restart.
 health_url="${HERMES_CONNECTOR_HEALTH_URL:-http://127.0.0.2:9119/api/plugins/collaboration/connector/health}"
+deployment_health_url="${HERMES_DEPLOYMENT_HEALTH_URL:-http://127.0.0.2:9119/api/plugins/collaboration/connector/deployment-health}"
 health_curl_proxy_args=()
 case "${health_url}" in
   http://127.*|https://127.*|http://localhost/*|https://localhost/*|http://\[::1\]/*|https://\[::1\]/*)
@@ -300,6 +396,19 @@ mobile_auth_target="${runtime_home}/dashboard/mobile-auth.db"
 cloud_files_database_target="${runtime_home}/collaboration/account-files/library.sqlite3"
 managed_installations_database_target="${runtime_home}/managed-installations.db"
 managed_nodes_target="${runtime_home}/managed-nodes.json"
+release_evidence_target="${HERMES_RELEASE_EVIDENCE_FILE:-/var/lib/hermes-agent/release-evidence.json}"
+[[ "${release_evidence_target}" == /* ]] || die "release evidence path must be absolute"
+release_evidence_dir="$(dirname "${release_evidence_target}")"
+if [[ ! -d "${release_evidence_dir}" ]]; then
+  install -d -o root -g root -m 0755 "${release_evidence_dir}"
+fi
+[[ -d "${release_evidence_dir}" && ! -L "${release_evidence_dir}" ]] \
+  || die "release evidence directory is unsafe"
+[[ "$(stat -c '%u' "${release_evidence_dir}")" == 0 ]] \
+  || die "release evidence directory must be root-owned"
+release_evidence_mode="$(stat -c '%a' "${release_evidence_dir}")"
+(( (8#${release_evidence_mode} & 0022) == 0 )) \
+  || die "release evidence directory must not be group/world-writable"
 managed_node_token_file="${HERMES_MANAGED_NODE_TOKEN_FILE:-/etc/hermes-agent/dbb3-status-token}"
 managed_installation_token_file="${HERMES_MANAGED_INSTALLATION_TOKEN_FILE:-/etc/hermes-agent/managed-installation-token}"
 [[ "${managed_node_token_file}" != "${managed_installation_token_file}" ]] \
@@ -402,7 +511,21 @@ validate_ios_health() {
 import json, sys
 data = json.load(open(sys.argv[1], encoding="utf-8"))
 runtime = data.get("mcp_runtime") or {}
+schema_version = int(data.get("code_schema_version") or 0)
+assert data.get("ok") is True
+assert schema_version > 0
+assert data.get("db_user_version") == schema_version
+assert data.get("schema_migrated") is True
+assert data.get("schema_compatible") is True
 assert data.get("scheduler_running") is True
+assert data.get("cleanup_worker_running") is True
+scheduler = data.get("scheduler") or {}
+assert scheduler.get("ok") is True
+assert scheduler.get("running") is True
+assert scheduler.get("thread_alive") is True
+assert int(scheduler.get("cycle_count") or 0) > 0
+assert int(scheduler.get("last_cycle_completed_at") or 0) > 0
+assert not scheduler.get("last_error")
 assert runtime.get("ok") is True
 assert runtime.get("running") is True
 assert runtime.get("starting") is not True
@@ -413,6 +536,9 @@ assert len(services) == 21
 assert sum(len(item.get("tools") or []) for item in services) == 44
 assert all(item.get("ok") is True for item in services)
 assert all(item.get("contract_ok") is True for item in services)
+assert len({item.get("name") for item in services}) == 21
+assert all(item.get("version") for item in services)
+assert all(item.get("active_version") == item.get("version") for item in services)
 assert all(
     sorted(item.get("tools") or []) == sorted(item.get("expected_tools") or [])
     for item in services
@@ -420,6 +546,38 @@ assert all(
 assert all(
     set(item.get("granted_scopes") or []).issubset(item.get("declared_scopes") or [])
     for item in services
+)
+PY
+}
+validate_deployment_health() {
+  local output="$1"
+  curl --fail --silent --show-error --max-time 12 \
+    "${health_curl_proxy_args[@]}" \
+    --config "${curl_cfg}" -o "${output}" "${deployment_health_url}" \
+    && "${runtime_python}" - "${output}" "${version}" "${manifest_sha256}" "${connector_id}" <<'PY'
+import json
+import sys
+
+data = json.load(open(sys.argv[1], encoding="utf-8"))
+assert data.get("ok") is True
+assert data.get("connector_id") == sys.argv[4]
+assert int(data.get("contract_version") or 0) == 2
+assert data.get("manifest_version") == sys.argv[2]
+assert data.get("manifest_sha256") == sys.argv[3]
+assert data.get("managed_catalog_readable") is True
+databases = data.get("databases") or {}
+assert set(databases) == {"cloud_files", "mobile_auth", "managed_resources"}
+for status in databases.values():
+    assert status.get("ok") is True
+    assert int(status.get("code_schema_version") or 0) > 0
+    assert status.get("db_user_version") == status.get("code_schema_version")
+    assert status.get("integrity_check") == "ok"
+    assert len(str(status.get("schema_sha256") or "")) == 64
+managed = databases["managed_resources"]
+assert managed.get("catalog_rows") is not None
+assert "managed_resource_catalog" in (managed.get("required_tables") or [])
+assert "managed_installation_source_lock_immutable" in (
+    managed.get("required_triggers") or []
 )
 PY
 }
@@ -441,6 +599,7 @@ install -d -o "${service_user}" -g "${service_group}" -m 0755 "${plugin_target}"
 install -d -o "${service_user}" -g "${service_group}" -m 0755 "${plugin_target}/dist"
 install -d -o "${service_user}" -g "${service_group}" -m 0755 "${target_root}/agent"
 install -d -o "${service_user}" -g "${service_group}" -m 0755 "${target_root}/hermes_cli/dashboard_auth"
+install -d -o "${service_user}" -g "${service_group}" -m 0755 "${target_root}/hermes_services"
 install -d -o "${service_user}" -g "${service_group}" -m 0755 "${target_root}/tui_gateway"
 install -d -o "${service_user}" -g "${service_group}" -m 0755 "${target_root}/tools"
 install -d -o "${service_user}" -g "${service_group}" -m 0700 "${runtime_home}"
@@ -448,10 +607,20 @@ mkdir -p \
   "${backup}/plugins/collaboration/dashboard/dist" \
   "${backup}/agent" \
   "${backup}/hermes_cli/dashboard_auth" \
+  "${backup}/hermes_services" \
   "${backup}/tools" \
   "${backup}/tui_gateway" \
   "${backup}/nginx" \
+  "${backup}/release" \
   "${backup}/state"
+for relative in "${runtime_service_assets[@]}"; do
+  destination_parent="$(dirname "${target_root}/${relative}")"
+  backup_parent="$(dirname "${backup}/${relative}")"
+  [[ ! -L "${destination_parent}" ]] || die "unsafe runtime destination ${destination_parent}"
+  install -d -o "${service_user}" -g "${service_group}" -m 0755 \
+    "${destination_parent}"
+  mkdir -p "${backup_parent}"
+done
 
 backup_one() {
   local source="$1" destination="$2"
@@ -472,6 +641,8 @@ backup_sqlite() {
   if [[ -e "${source}" || -L "${source}" ]]; then
     [[ -f "${source}" && ! -L "${source}" ]] || die "refusing to back up unsafe SQLite database ${source}"
     "${runtime_python}" - "${source}" "${temporary}" <<'PY'
+import hashlib
+import json
 import os
 import pathlib
 import sqlite3
@@ -486,11 +657,197 @@ with sqlite3.connect(source_uri, uri=True, timeout=30) as source_db:
     with sqlite3.connect(destination, timeout=30) as destination_db:
         source_db.backup(destination_db)
 os.chmod(destination, 0o600)
+with sqlite3.connect(destination, timeout=30) as snapshot_db:
+    schema = snapshot_db.execute(
+        "SELECT type,name,tbl_name,COALESCE(sql,'') FROM sqlite_master "
+        "WHERE name NOT LIKE 'sqlite_%' ORDER BY type,name"
+    ).fetchall()
+    metadata = {
+        "schema": "hermes.sqlite-snapshot.v1",
+        "source": str(source),
+        "user_version": int(snapshot_db.execute("PRAGMA user_version").fetchone()[0]),
+        "application_id": int(snapshot_db.execute("PRAGMA application_id").fetchone()[0]),
+        "integrity_check": str(snapshot_db.execute("PRAGMA integrity_check").fetchone()[0]),
+        "schema_sha256": hashlib.sha256(
+            json.dumps(schema, ensure_ascii=True, separators=(",", ":")).encode("utf-8")
+        ).hexdigest(),
+        "snapshot_sha256": hashlib.sha256(destination.read_bytes()).hexdigest(),
+    }
+metadata_path = pathlib.Path(str(destination) + ".metadata.json")
+metadata_path.write_text(
+    json.dumps(metadata, sort_keys=True, ensure_ascii=True) + "\n",
+    encoding="utf-8",
+)
+os.chmod(metadata_path, 0o600)
 PY
     mv -f -- "${temporary}" "${destination}"
+    mv -f -- "${temporary}.metadata.json" "${destination}.metadata.json"
   else
     : >"${destination}.missing"
   fi
+}
+backup_runtime_sqlite_tree() {
+  local source_root="$1" destination_root="$2"
+  "${runtime_python}" - "${source_root}" "${destination_root}" <<'PY'
+import hashlib
+import json
+import os
+import pathlib
+import sqlite3
+import stat
+import sys
+from urllib.parse import quote
+
+root = pathlib.Path(sys.argv[1]).resolve(strict=True)
+destination = pathlib.Path(sys.argv[2])
+database_root = destination / "databases"
+database_root.mkdir(parents=True, exist_ok=True)
+
+def metadata(database):
+    rows = database.execute(
+        "SELECT type,name,tbl_name,COALESCE(sql,'') FROM sqlite_master "
+        "WHERE name NOT LIKE 'sqlite_%' ORDER BY type,name"
+    ).fetchall()
+    return {
+        "user_version": int(database.execute("PRAGMA user_version").fetchone()[0]),
+        "application_id": int(database.execute("PRAGMA application_id").fetchone()[0]),
+        "integrity_check": str(database.execute("PRAGMA integrity_check").fetchone()[0]),
+        "schema_sha256": hashlib.sha256(
+            json.dumps(rows, ensure_ascii=True, separators=(",", ":")).encode("utf-8")
+        ).hexdigest(),
+    }
+
+records = []
+for directory, child_directories, files in os.walk(root, followlinks=False):
+    base = pathlib.Path(directory)
+    child_directories[:] = [
+        name for name in child_directories if not (base / name).is_symlink()
+    ]
+    for name in files:
+        source = base / name
+        if source.suffix.lower() not in {".db", ".sqlite", ".sqlite3"}:
+            continue
+        if source.is_symlink() or not source.is_file():
+            raise RuntimeError(f"unsafe SQLite path in runtime home: {source}")
+        relative = source.relative_to(root)
+        snapshot = database_root / relative
+        snapshot.parent.mkdir(parents=True, exist_ok=True)
+        source_uri = f"file:{quote(source.as_posix(), safe='/')}?mode=ro"
+        with sqlite3.connect(source_uri, uri=True, timeout=30) as source_db:
+            with sqlite3.connect(snapshot, timeout=30) as snapshot_db:
+                source_db.backup(snapshot_db)
+        with sqlite3.connect(snapshot, timeout=30) as snapshot_db:
+            record = metadata(snapshot_db)
+        if record["integrity_check"] != "ok":
+            raise RuntimeError(
+                f"SQLite integrity check failed for {relative}: {record['integrity_check']}"
+            )
+        source_stat = source.stat()
+        os.chmod(snapshot, 0o600)
+        records.append({
+            **record,
+            "relative_path": relative.as_posix(),
+            "snapshot_path": (pathlib.Path("databases") / relative).as_posix(),
+            "snapshot_sha256": hashlib.sha256(snapshot.read_bytes()).hexdigest(),
+            "mode": stat.S_IMODE(source_stat.st_mode),
+            "uid": source_stat.st_uid,
+            "gid": source_stat.st_gid,
+        })
+
+records.sort(key=lambda item: item["relative_path"])
+manifest = {
+    "schema": "hermes.sqlite-tree-snapshot.v1",
+    "root": str(root),
+    "database_count": len(records),
+    "databases": records,
+}
+manifest_path = destination / "manifest.json"
+manifest_path.write_text(
+    json.dumps(manifest, sort_keys=True, ensure_ascii=True, indent=2) + "\n",
+    encoding="utf-8",
+)
+os.chmod(manifest_path, 0o600)
+PY
+}
+restore_runtime_sqlite_tree() {
+  local snapshot_root="$1" destination_root="$2"
+  "${runtime_python}" - "${snapshot_root}" "${destination_root}" <<'PY'
+import hashlib
+import json
+import os
+import pathlib
+import shutil
+import sqlite3
+import sys
+
+snapshot_root = pathlib.Path(sys.argv[1]).resolve(strict=True)
+root = pathlib.Path(sys.argv[2]).resolve(strict=True)
+manifest = json.loads((snapshot_root / "manifest.json").read_text(encoding="utf-8"))
+if manifest.get("schema") != "hermes.sqlite-tree-snapshot.v1":
+    raise RuntimeError("runtime SQLite snapshot manifest is invalid")
+records = manifest.get("databases")
+if not isinstance(records, list) or manifest.get("database_count") != len(records):
+    raise RuntimeError("runtime SQLite snapshot manifest count is invalid")
+
+def bounded(relative):
+    candidate = root / pathlib.PurePosixPath(relative)
+    resolved = candidate.resolve(strict=False)
+    if resolved != root and root not in resolved.parents:
+        raise RuntimeError(f"SQLite restore path escapes runtime home: {relative}")
+    if candidate.is_symlink():
+        raise RuntimeError(f"SQLite restore target is a symlink: {relative}")
+    return candidate
+
+expected = {str(item["relative_path"]) for item in records}
+for directory, child_directories, files in os.walk(root, followlinks=False):
+    base = pathlib.Path(directory)
+    child_directories[:] = [
+        name for name in child_directories if not (base / name).is_symlink()
+    ]
+    for name in files:
+        current = base / name
+        if current.suffix.lower() not in {".db", ".sqlite", ".sqlite3"}:
+            continue
+        relative = current.relative_to(root).as_posix()
+        if relative not in expected:
+            if current.is_symlink():
+                raise RuntimeError(f"new SQLite target is a symlink: {relative}")
+            for suffix in ("", "-wal", "-shm", "-journal"):
+                pathlib.Path(str(current) + suffix).unlink(missing_ok=True)
+
+for record in records:
+    relative = str(record["relative_path"])
+    destination = bounded(relative)
+    snapshot = snapshot_root / pathlib.PurePosixPath(str(record["snapshot_path"]))
+    resolved_snapshot = snapshot.resolve(strict=True)
+    if snapshot_root not in resolved_snapshot.parents:
+        raise RuntimeError(f"SQLite snapshot path escapes backup: {relative}")
+    if hashlib.sha256(resolved_snapshot.read_bytes()).hexdigest() != record["snapshot_sha256"]:
+        raise RuntimeError(f"SQLite snapshot hash mismatch: {relative}")
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    for suffix in ("", "-wal", "-shm", "-journal"):
+        pathlib.Path(str(destination) + suffix).unlink(missing_ok=True)
+    temporary = pathlib.Path(str(destination) + f".rollback.{os.getpid()}")
+    shutil.copyfile(resolved_snapshot, temporary)
+    os.chmod(temporary, int(record["mode"]))
+    os.chown(temporary, int(record["uid"]), int(record["gid"]))
+    os.replace(temporary, destination)
+    with sqlite3.connect(destination, timeout=30) as database:
+        schema = database.execute(
+            "SELECT type,name,tbl_name,COALESCE(sql,'') FROM sqlite_master "
+            "WHERE name NOT LIKE 'sqlite_%' ORDER BY type,name"
+        ).fetchall()
+        restored = {
+            "user_version": int(database.execute("PRAGMA user_version").fetchone()[0]),
+            "application_id": int(database.execute("PRAGMA application_id").fetchone()[0]),
+            "integrity_check": str(database.execute("PRAGMA integrity_check").fetchone()[0]),
+            "schema_sha256": hashlib.sha256(
+                json.dumps(schema, ensure_ascii=True, separators=(",", ":")).encode("utf-8")
+            ).hexdigest(),
+        }
+    if any(restored[key] != record[key] for key in restored):
+        raise RuntimeError(f"SQLite restore verification failed: {relative}")
+PY
 }
 backup_one "${plugin_target}/plugin_api.py" "${backup}/plugins/collaboration/dashboard/plugin_api.py"
 backup_one "${plugin_target}/manifest.json" "${backup}/plugins/collaboration/dashboard/manifest.json"
@@ -513,6 +870,10 @@ backup_one "${doctor_target}" "${backup}/hermes_cli/doctor.py"
 backup_one "${tui_gateway_target}" "${backup}/tui_gateway/server.py"
 backup_one "${nginx_security_target}" "${backup}/nginx/00-hermes-security.conf"
 backup_one "${nginx_site_target}" "${backup}/nginx/daxueshenmai.top.conf"
+backup_one "${release_evidence_target}" "${backup}/release/release-evidence.json"
+for relative in "${runtime_service_assets[@]}"; do
+  backup_one "${target_root}/${relative}" "${backup}/${relative}"
+done
 if [[ "${ios_enabled}" == 1 ]]; then
   install -d -o "${service_user}" -g "${service_group}" -m 0755 \
     "${target_root}/plugins/ios-intelligence/dashboard"
@@ -537,6 +898,17 @@ fi
 
 transaction="$(mktemp -d "${target_root}/.collaboration-install.XXXXXX")"
 installed=0
+runtime_venv="${target_root}/.venv"
+candidate_venv=""
+previous_venv=""
+venv_old_moved=0
+venv_swapped=0
+dependency_update_enabled=0
+if [[ "${runtime_python}" == "${runtime_venv}/bin/python" ]]; then
+  [[ -d "${runtime_venv}" && ! -L "${runtime_venv}" ]] \
+    || die "runtime virtual environment is missing or unsafe"
+  dependency_update_enabled=1
+fi
 # Flipped to 1 immediately before the first in-place install below.  Until
 # then a failure (the service stop or a state snapshot) has modified nothing,
 # so rollback must not run the restore_* helpers: the state snapshots may not
@@ -552,7 +924,21 @@ rollback() {
   set +e
   rm -f -- \
     "$(dirname "${nginx_security_target}")/.$(basename "${nginx_security_target}").install.$$" \
-    "$(dirname "${nginx_site_target}")/.$(basename "${nginx_site_target}").install.$$"
+    "$(dirname "${nginx_site_target}")/.$(basename "${nginx_site_target}").install.$$" \
+    "${release_evidence_target}.new.$$"
+  if [[ "${installed}" != 1 && "${venv_old_moved}" == 1 ]]; then
+    failed_venv="${target_root}/.venv.failed.$$"
+    rm -rf -- "${failed_venv}"
+    if [[ -e "${runtime_venv}" || -L "${runtime_venv}" ]]; then
+      mv -f -- "${runtime_venv}" "${failed_venv}" || rollback_failed=1
+    fi
+    if [[ -d "${previous_venv}" && ! -L "${previous_venv}" ]]; then
+      mv -f -- "${previous_venv}" "${runtime_venv}" || rollback_failed=1
+    else
+      rollback_failed=1
+    fi
+    rm -rf -- "${failed_venv}"
+  fi
   if [[ "${installed}" != 1 ]]; then
     if [[ "${mutated}" != 1 ]]; then
       # Failed between `trap rollback EXIT` and the first in-place install
@@ -601,6 +987,10 @@ rollback() {
       rollback_step tui-gateway restore_one "${backup}/tui_gateway/server.py" "${tui_gateway_target}"
       rollback_step nginx-security restore_root_file "${backup}/nginx/00-hermes-security.conf" "${nginx_security_target}"
       rollback_step nginx-site restore_root_file "${backup}/nginx/daxueshenmai.top.conf" "${nginx_site_target}"
+      rollback_step release-evidence restore_root_file "${backup}/release/release-evidence.json" "${release_evidence_target}"
+      for relative in "${runtime_service_assets[@]}"; do
+        rollback_step "${relative}" restore_one "${backup}/${relative}" "${target_root}/${relative}"
+      done
       rollback_step cloud-files-db restore_sqlite "${backup}/state/cloud-files-library.sqlite3" "${cloud_files_database_target}"
       rollback_step mobile-auth-db restore_sqlite "${backup}/state/mobile-auth.db" "${mobile_auth_target}"
       rollback_step managed-installations-db restore_sqlite "${backup}/state/managed-installations.db" "${managed_installations_database_target}"
@@ -614,6 +1004,8 @@ rollback() {
         rollback_step ios-supervisor-db restore_sqlite "${backup}/state/ios-mcp-supervisor.db" "${ios_supervisor_target}"
       fi
       rollback_step conversation-state restore_state "${backup}/state/single.json" "${state_target}"
+      rollback_step runtime-sqlite-tree restore_runtime_sqlite_tree \
+        "${backup}/state/sqlite-tree" "${runtime_home}"
       if [[ "${nginx_reload_attempted}" == 1 && "${rollback_failed}" == 0 ]]; then
         if ! "${nginx_binary}" -t >/dev/null 2>&1 \
           || ! systemctl reload "${nginx_service}" >/dev/null 2>&1; then
@@ -630,15 +1022,18 @@ rollback() {
     fi
   fi
   rm -rf -- "${transaction}"
+  [[ -z "${candidate_venv}" ]] || rm -rf -- "${candidate_venv}"
   [[ -z "${health_file:-}" ]] || rm -f -- "${health_file}"
   [[ -z "${handshake_file:-}" ]] || rm -f -- "${handshake_file}"
   [[ -z "${ios_health_file:-}" ]] || rm -f -- "${ios_health_file}"
   [[ -z "${connector_health_file:-}" ]] || rm -f -- "${connector_health_file}"
+  [[ -z "${deployment_health_file:-}" ]] || rm -f -- "${deployment_health_file}"
   [[ -z "${installation_health_cfg:-}" ]] || rm -f -- "${installation_health_cfg}"
   [[ -z "${node_health:-}" ]] || rm -f -- "${node_health}"
   [[ -z "${installation_probe_body:-}" ]] || rm -f -- "${installation_probe_body}"
   [[ -z "${installation_probe_post:-}" ]] || rm -f -- "${installation_probe_post}"
   [[ -z "${installation_probe_get:-}" ]] || rm -f -- "${installation_probe_get}"
+  [[ -z "${release_evidence_temp:-}" ]] || rm -f -- "${release_evidence_temp}"
   rm -f -- "${curl_cfg}"
   cleanup_snapshot
   if [[ "${rollback_failed}" != 0 ]]; then
@@ -694,6 +1089,33 @@ restore_state() {
       || { rm -f -- "${temporary}"; return 1; }
     mv -f -- "${temporary}" "${destination}" \
       || { rm -f -- "${temporary}"; return 1; }
+    if [[ -f "${source}.metadata.json" ]]; then
+      "${runtime_python}" - "${destination}" "${source}.metadata.json" <<'PY' \
+        || return 1
+import hashlib
+import json
+import sqlite3
+import sys
+
+destination, metadata_path = sys.argv[1:]
+metadata = json.load(open(metadata_path, encoding="utf-8"))
+with sqlite3.connect(destination, timeout=30) as database:
+    schema = database.execute(
+        "SELECT type,name,tbl_name,COALESCE(sql,'') FROM sqlite_master "
+        "WHERE name NOT LIKE 'sqlite_%' ORDER BY type,name"
+    ).fetchall()
+    restored = {
+        "user_version": int(database.execute("PRAGMA user_version").fetchone()[0]),
+        "application_id": int(database.execute("PRAGMA application_id").fetchone()[0]),
+        "integrity_check": str(database.execute("PRAGMA integrity_check").fetchone()[0]),
+        "schema_sha256": hashlib.sha256(
+            json.dumps(schema, ensure_ascii=True, separators=(",", ":")).encode("utf-8")
+        ).hexdigest(),
+    }
+assert metadata.get("schema") == "hermes.sqlite-snapshot.v1"
+assert all(restored[key] == metadata[key] for key in restored)
+PY
+    fi
   elif [[ -f "${source}.missing" ]]; then
     rm -f -- "${destination}" || return 1
   else
@@ -723,10 +1145,35 @@ restore_sqlite() {
     return 1
   fi
 }
+release_phase prepare
 trap rollback EXIT
 trap 'exit 130' INT
 trap 'exit 143' TERM
 trap 'exit 129' HUP
+
+# Build and verify the dependency candidate while the current service and
+# interpreter remain untouched. An explicit external HERMES_RUNTIME_PYTHON is
+# used by the deployment harness and deliberately skips this production-only
+# virtual-environment swap.
+if [[ "${dependency_update_enabled}" == 1 ]]; then
+  candidate_venv="${target_root}/.venv.candidate.$$"
+  previous_venv="${target_root}/.venv.rollback-${version}-${release_commit:0:12}-$$"
+  [[ ! -e "${candidate_venv}" && ! -L "${candidate_venv}" ]] \
+    || die "runtime dependency candidate already exists"
+  [[ ! -e "${previous_venv}" && ! -L "${previous_venv}" ]] \
+    || die "runtime dependency rollback path already exists"
+  cp -a -- "${runtime_venv}" "${candidate_venv}"
+  "${candidate_venv}/bin/python" -m pip install \
+    --disable-pip-version-check --require-hashes \
+    -r "${snapshot}/deploy/public/runtime-requirements.lock"
+  "${candidate_venv}/bin/python" - <<'PY'
+from importlib.metadata import version
+
+assert version("mcp") == "2.0.0"
+assert version("starlette") == "1.0.1"
+import mcp  # noqa: F401
+PY
+fi
 
 # Quiesce the state writer before taking the transactional state snapshot.
 # Keep the service stopped until every runtime file has been atomically placed;
@@ -741,6 +1188,7 @@ if [[ "${ios_enabled}" == 1 ]]; then
   backup_sqlite "${ios_database_target}" "${backup}/state/ios-intelligence.db"
   backup_sqlite "${ios_supervisor_target}" "${backup}/state/ios-mcp-supervisor.db"
 fi
+backup_runtime_sqlite_tree "${runtime_home}" "${backup}/state/sqlite-tree"
 
 install_atomic() {
   local source="$1"
@@ -763,6 +1211,13 @@ install_root_atomic() {
 # rollback must restore the snapshots taken above instead of merely
 # restarting the service.
 mutated=1
+if [[ "${dependency_update_enabled}" == 1 ]]; then
+  mv -f -- "${runtime_venv}" "${previous_venv}"
+  venv_old_moved=1
+  mv -f -- "${candidate_venv}" "${runtime_venv}"
+  candidate_venv=""
+  venv_swapped=1
+fi
 install_atomic "${snapshot}/plugins/collaboration/dashboard/plugin_api.py" "${plugin_target}/plugin_api.py"
 install_atomic "${snapshot}/plugins/collaboration/dashboard/manifest.json" "${plugin_target}/manifest.json"
 install_atomic "${snapshot}/plugins/collaboration/dashboard/dist/index.js" "${plugin_target}/dist/index.js"
@@ -782,6 +1237,9 @@ install_atomic "${snapshot}/agent/system_prompt.py" "${system_prompt_target}"
 install_atomic "${snapshot}/agent/context_diagnostics.py" "${context_diagnostics_target}"
 install_atomic "${snapshot}/hermes_cli/doctor.py" "${doctor_target}"
 install_atomic "${snapshot}/tui_gateway/server.py" "${tui_gateway_target}"
+for relative in "${runtime_service_assets[@]}"; do
+  install_atomic "${snapshot}/${relative}" "${target_root}/${relative}"
+done
 managed_nodes_rendered="${transaction}/managed-nodes.json"
 "${runtime_python}" - \
   "${snapshot}/deploy/public/managed-nodes.server.json" \
@@ -865,6 +1323,22 @@ assert isinstance(data.get("profiles"), list)
 assert isinstance(data.get("capabilities"), list)
 assert isinstance(data.get("server_time"), str) and data["server_time"]
 PY
+deployment_health_file="$(mktemp /run/hermes-agent-deployment-status.XXXXXX)"
+deployment_healthy=0
+for _ in $(seq 1 30); do
+  if systemctl is-active --quiet "${service}" \
+    && validate_deployment_health "${deployment_health_file}" 2>/dev/null; then
+    deployment_healthy=1
+    break
+  fi
+  sleep 1
+done
+[[ "${deployment_healthy}" == 1 ]] || {
+  printf '%s\n' "deployment database, schema, catalog, version, or manifest gate failed" >&2
+  validate_deployment_health "${deployment_health_file}" || true
+  false
+}
+release_phase migrate
 ios_health_file=""
 if [[ "${ios_enabled}" == 1 ]]; then
   ios_health_file="$(mktemp /run/hermes-agent-ios-status.XXXXXX)"
@@ -894,6 +1368,8 @@ validate_connector_health "${connector_health_file}" || {
   printf '%s\n' "connector contract did not pass after restart" >&2
   false
 }
+release_phase candidate-health
+release_phase traffic-switch
 nginx_reload_attempted=1
 systemctl reload "${nginx_service}" \
   || { printf '%s\n' "nginx reload failed" >&2; false; }
@@ -960,7 +1436,78 @@ PY
     "${installation_probe_body}" "${installation_probe_post}" "${installation_probe_get}"
 done
 rm -f -- "${installation_health_cfg}"
+release_phase drain
+release_phase commit
+release_evidence_temp="$(mktemp "${release_evidence_dir}/.release-evidence.XXXXXX")"
+"${runtime_python}" - \
+  "${release_evidence_temp}" "${version}" "${release_commit}" \
+  "${manifest_sha256}" "${backup}" "${backup}/state/sqlite-tree/manifest.json" \
+  "${health_file}" "${handshake_file}" "${deployment_health_file}" \
+  "${connector_health_file}" "${ios_health_file}" <<'PY'
+from datetime import datetime, timezone
+import hashlib
+import json
+import pathlib
+import sys
+
+(
+    output,
+    version,
+    commit,
+    manifest_sha256,
+    backup,
+    sqlite_manifest_path,
+    main_health_path,
+    handshake_path,
+    deployment_health_path,
+    connector_health_path,
+    ios_health_path,
+) = sys.argv[1:]
+
+def load(path):
+    return json.loads(pathlib.Path(path).read_text(encoding="utf-8")) if path else None
+
+sqlite_manifest_file = pathlib.Path(sqlite_manifest_path)
+sqlite_manifest_bytes = sqlite_manifest_file.read_bytes()
+sqlite_manifest = json.loads(sqlite_manifest_bytes.decode("utf-8"))
+evidence = {
+    "schema": "hermes.release-evidence.v1",
+    "phase": "committed",
+    "version": version,
+    "commit": commit,
+    "manifest_sha256": manifest_sha256,
+    "deployed_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+    "backup": backup,
+    "database_snapshot": {
+        "schema": sqlite_manifest.get("schema"),
+        "database_count": sqlite_manifest.get("database_count"),
+        "manifest_sha256": hashlib.sha256(sqlite_manifest_bytes).hexdigest(),
+    },
+    "probes": {
+        "main_api": load(main_health_path),
+        "mobile_handshake": load(handshake_path),
+        "deployment_health": load(deployment_health_path),
+        "connector": load(connector_health_path),
+        "ios_runtime": load(ios_health_path),
+        "managed_installation_routes": {"dbb3": True, "wsl": True},
+        "traffic_switch": {"nginx_reloaded": True},
+        "drain": {"previous_service_quiesced": True},
+    },
+}
+pathlib.Path(output).write_text(
+    json.dumps(evidence, sort_keys=True, ensure_ascii=True, indent=2) + "\n",
+    encoding="utf-8",
+)
+PY
+install -o root -g root -m 0644 \
+  "${release_evidence_temp}" "${release_evidence_target}.new.$$"
+mv -f -- "${release_evidence_target}.new.$$" "${release_evidence_target}"
+rm -f -- "${release_evidence_temp}"
+release_evidence_temp=""
 installed=1
 rm -rf -- "${transaction}" "${health_file}" "${handshake_file}" \
-  "${ios_health_file}" "${connector_health_file}" "${curl_cfg}"
-printf 'service=active\nversion=%s\nbackup=%s\n' "${version}" "${backup}"
+  "${ios_health_file}" "${connector_health_file}" "${deployment_health_file}" \
+  "${curl_cfg}"
+printf 'service=active\nversion=%s\ncommit=%s\nmanifest_sha256=%s\nbackup=%s\nevidence=%s\n' \
+  "${version}" "${release_commit}" "${manifest_sha256}" "${backup}" \
+  "${release_evidence_target}"
