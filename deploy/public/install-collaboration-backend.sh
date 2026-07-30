@@ -393,7 +393,7 @@ mobile_auth_target="${runtime_home}/dashboard/mobile-auth.db"
 cloud_files_database_target="${runtime_home}/collaboration/account-files/library.sqlite3"
 managed_installations_database_target="${runtime_home}/managed-installations.db"
 managed_nodes_target="${runtime_home}/managed-nodes.json"
-release_evidence_target="${HERMES_RELEASE_EVIDENCE_FILE:-/var/lib/hermes-agent/release-evidence.json}"
+release_evidence_target="${HERMES_RELEASE_EVIDENCE_FILE:-/var/lib/hermes-agent-release/release-evidence.json}"
 [[ "${release_evidence_target}" == /* ]] || die "release evidence path must be absolute"
 release_evidence_dir="$(dirname "${release_evidence_target}")"
 if [[ ! -d "${release_evidence_dir}" ]]; then

@@ -13065,7 +13065,7 @@ def connector_deployment_health(request: Request) -> dict[str, Any]:
     evidence_path = Path(
         os.environ.get(
             "HERMES_RELEASE_EVIDENCE_FILE",
-            "/var/lib/hermes-agent/release-evidence.json",
+            "/var/lib/hermes-agent-release/release-evidence.json",
         )
     )
     if evidence_path.is_file() and not evidence_path.is_symlink():

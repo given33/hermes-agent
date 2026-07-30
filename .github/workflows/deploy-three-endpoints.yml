@@ -84,5 +84,5 @@ jobs:
           evidence="$(ssh -i "$RUNNER_TEMP/ssh/id_ed25519" \
             -o UserKnownHostsFile="$RUNNER_TEMP/ssh/known_hosts" \
             -o StrictHostKeyChecking=yes "$REMOTE" \
-            'sudo -n cat /var/lib/hermes-agent/release-evidence.json')"
+            'sudo -n cat /var/lib/hermes-agent-release/release-evidence.json')"
           python3 -c 'import json,os,sys; d=json.load(sys.stdin); assert d["phase"]=="committed"; assert d["commit"]==os.environ["EXPECTED_COMMIT"]' <<<"$evidence"
