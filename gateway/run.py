@@ -58,7 +58,7 @@ from agent.async_utils import consume_detached_task_result, safe_schedule_thread
 from agent.conversation_loop import INTERRUPT_WAITING_FOR_MODEL_PREFIX
 from agent.i18n import t
 from hermes_runtime.config import cfg_get, read_raw_config, read_raw_config_strict
-from hermes_runtime.process_probe import pid_exists as _pid_exists
+from hermes_runtime import process_probe
 from hermes_cli.fallback_config import get_fallback_chain
 
 # --- Agent cache tuning ---------------------------------------------------
@@ -22428,7 +22428,7 @@ async def start_gateway(config: Optional[GatewayConfig] = None, replace: bool = 
             # handle-based existence check instead.
             old_gateway_exited = False
             for _ in range(20):
-                if not _pid_exists(existing_pid):
+                if not process_probe.pid_exists(existing_pid):
                     old_gateway_exited = True
                     break  # Process is gone
                 time.sleep(0.5)
@@ -22452,7 +22452,7 @@ async def start_gateway(config: Optional[GatewayConfig] = None, replace: bool = 
                 # token — the duplicate-gateway failure in #19471.
                 if not old_gateway_exited:
                     for _ in range(20):
-                        if not _pid_exists(existing_pid):
+                        if not process_probe.pid_exists(existing_pid):
                             old_gateway_exited = True
                             break
                         time.sleep(0.25)

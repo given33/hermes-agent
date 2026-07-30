@@ -15,6 +15,33 @@ from fastapi.testclient import TestClient
 from hermes_cli import web_server
 
 
+_MISSING_APP_STATE = object()
+
+
+@pytest.fixture(autouse=True)
+def restore_dashboard_app_state():
+    """Keep bind/auth mutations from leaking into later test modules."""
+    names = ("auth_required", "bound_host", "bound_port")
+    previous = {
+        name: getattr(web_server.app.state, name, _MISSING_APP_STATE)
+        for name in names
+    }
+    for name in names:
+        try:
+            delattr(web_server.app.state, name)
+        except (AttributeError, KeyError):
+            pass
+    yield
+    for name, value in previous.items():
+        if value is _MISSING_APP_STATE:
+            try:
+                delattr(web_server.app.state, name)
+            except (AttributeError, KeyError):
+                pass
+        else:
+            setattr(web_server.app.state, name, value)
+
+
 @pytest.fixture
 def client_loopback():
     # Pin the bound-host state for host_header_middleware so requests with
@@ -259,22 +286,18 @@ def test_start_server_gate_without_provider_fails_closed(monkeypatch):
         )
 
 
-def test_start_server_surfaces_nous_skip_reason_when_unconfigured(monkeypatch):
-    """When the bundled Nous plugin loaded but skipped registration (no
-    env vars set), the gate's fail-closed message should surface the
-    plugin's LAST_SKIP_REASON so the operator knows the config fix is
-    'set HERMES_DASHBOARD_OAUTH_CLIENT_ID', not 'install a plugin'."""
+def test_start_server_surfaces_retired_nous_provider_reason(monkeypatch):
+    """The public-bind gate explains that Nous dashboard auth is retired."""
     from hermes_cli.dashboard_auth import clear_providers
     from plugins.dashboard_auth import nous as nous_plugin
 
-    # Simulate the plugin running and skipping for "no client_id".
     clear_providers()
     _stub_uvicorn_run(monkeypatch)
     monkeypatch.delenv("HERMES_DASHBOARD_OAUTH_CLIENT_ID", raising=False)
     monkeypatch.delenv("HERMES_DASHBOARD_PORTAL_URL", raising=False)
     from unittest.mock import MagicMock
     nous_plugin.register(MagicMock())  # populates LAST_SKIP_REASON
-    assert "HERMES_DASHBOARD_OAUTH_CLIENT_ID" in nous_plugin.LAST_SKIP_REASON
+    assert "retired" in nous_plugin.LAST_SKIP_REASON
 
     web_server.app.state.auth_required = None
     with pytest.raises(SystemExit) as exc_info:
@@ -282,10 +305,8 @@ def test_start_server_surfaces_nous_skip_reason_when_unconfigured(monkeypatch):
             host="0.0.0.0", port=9119,
             open_browser=False, allow_public=False,
         )
-    # The error message embeds the plugin's specific skip reason rather
-    # than the generic "Install the default Nous provider" boilerplate.
     msg = str(exc_info.value)
-    assert "HERMES_DASHBOARD_OAUTH_CLIENT_ID" in msg
+    assert "retired" in msg
     assert "nous:" in msg
 
 

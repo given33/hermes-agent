@@ -1322,7 +1322,7 @@ def get_preferred_silent_default_model(provider: str = "openrouter") -> str:
     the provider block carries no label.
     """
     try:
-        from agent.model_catalog import get_default_model_from_cache
+        from hermes_cli.model_catalog import get_default_model_from_cache
         labeled = get_default_model_from_cache(provider)
         if labeled:
             return labeled

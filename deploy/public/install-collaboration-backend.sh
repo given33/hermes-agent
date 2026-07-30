@@ -1316,10 +1316,12 @@ if [[ "${ios_enabled}" == 1 ]]; then
   # Persist discovery and supervisor state while the old process is quiesced;
   # the restarted service then boots with the complete MCP tool surface.
   sudo -u "${service_user}" -- env HERMES_HOME="${runtime_home}" \
+    PYTHONPATH="${target_root}${PYTHONPATH:+:${PYTHONPATH}}" \
     "${runtime_python}" -m hermes_cli.ios_mcp_server --install \
     --transport streamable-http --host 127.0.0.1 --base-port 8760 \
     || { printf '%s\n' "iOS MCP registration failed" >&2; false; }
   sudo -u "${service_user}" -- env HERMES_HOME="${runtime_home}" \
+    PYTHONPATH="${target_root}${PYTHONPATH:+:${PYTHONPATH}}" \
     "${runtime_python}" -m hermes_cli.ios_mcp_supervisor --register \
     --host 127.0.0.1 --base-port 8760 \
     || { printf '%s\n' "iOS MCP supervisor registration failed" >&2; false; }

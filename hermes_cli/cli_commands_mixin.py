@@ -2522,7 +2522,7 @@ class CLICommandsMixin:
             /reasoning full         Show complete thinking (no 10-line clamp)
             /reasoning clamp        Collapse long thinking to the first 10 lines
         """
-        from cli import _ACCENT, _DIM, _RST, _cprint, _parse_reasoning_config, save_config_value
+        from cli import CLI_CONFIG, _ACCENT, _DIM, _RST, _cprint, _parse_reasoning_config, save_config_value
         parts = cmd.strip().split(maxsplit=1)
 
         if len(parts) < 2:
@@ -2607,6 +2607,11 @@ class CLICommandsMixin:
                 agent_cfg = {}
                 config["agent"] = agent_cfg
             agent_cfg["reasoning_effort"] = arg
+            legacy_agent_cfg = CLI_CONFIG.get("agent")
+            if not isinstance(legacy_agent_cfg, dict):
+                legacy_agent_cfg = {}
+                CLI_CONFIG["agent"] = legacy_agent_cfg
+            legacy_agent_cfg["reasoning_effort"] = arg
             _cprint(f"  {_ACCENT}✓ Reasoning effort set to '{arg}' (saved to config){_RST}")
         elif explicit_global:
             _cprint(f"  {_ACCENT}✓ Reasoning effort set to '{arg}' (session only; config save failed){_RST}")

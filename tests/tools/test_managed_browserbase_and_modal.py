@@ -234,6 +234,7 @@ def test_browserbase_does_not_use_gateway_only_configuration():
     assert provider.is_available() is False
 
 
+@pytest.mark.skip(reason="Nous-managed Browser Use gateway is retired")
 def test_browser_use_availability_skips_refresh_for_expired_cached_gateway_token(tmp_path, monkeypatch):
     _install_fake_tools_package()
     monkeypatch.delenv("TOOL_GATEWAY_USER_TOKEN", raising=False)
@@ -272,6 +273,7 @@ def test_browser_use_availability_skips_refresh_for_expired_cached_gateway_token
     assert refresh_calls == []
 
 
+@pytest.mark.skip(reason="Nous-managed Browser Use gateway is retired")
 def test_browser_use_managed_gateway_adds_idempotency_key_and_persists_external_call_id():
     _install_fake_tools_package()
     env = os.environ.copy()
@@ -312,6 +314,7 @@ def test_browser_use_managed_gateway_adds_idempotency_key_and_persists_external_
     assert session["external_call_id"] == "call-browser-use-1"
 
 
+@pytest.mark.skip(reason="Nous-managed Browser Use gateway is retired")
 def test_browser_use_managed_gateway_reuses_pending_idempotency_key_after_timeout():
     _install_fake_tools_package()
     env = os.environ.copy()
@@ -360,6 +363,7 @@ def test_browser_use_managed_gateway_reuses_pending_idempotency_key_after_timeou
     assert first_headers["X-Idempotency-Key"] == second_headers["X-Idempotency-Key"]
 
 
+@pytest.mark.skip(reason="Nous-managed Browser Use gateway is retired")
 def test_browser_use_managed_gateway_preserves_pending_idempotency_key_for_in_progress_conflicts():
     _install_fake_tools_package()
     env = os.environ.copy()
@@ -421,6 +425,7 @@ def test_browser_use_managed_gateway_preserves_pending_idempotency_key_for_in_pr
     assert first_headers["X-Idempotency-Key"] == second_headers["X-Idempotency-Key"]
 
 
+@pytest.mark.skip(reason="Nous-managed Browser Use gateway is retired")
 def test_browser_use_managed_gateway_uses_new_idempotency_key_for_a_new_session_after_success():
     _install_fake_tools_package()
     env = os.environ.copy()
@@ -458,6 +463,7 @@ def test_browser_use_managed_gateway_uses_new_idempotency_key_for_a_new_session_
     assert first_headers["X-Idempotency-Key"] != second_headers["X-Idempotency-Key"]
 
 
+@pytest.mark.skip(reason="Nous-managed Modal gateway is retired")
 def test_terminal_tool_prefers_managed_modal_when_gateway_ready_and_no_direct_creds():
     _install_fake_tools_package()
     env = os.environ.copy()
@@ -493,6 +499,7 @@ def test_terminal_tool_prefers_managed_modal_when_gateway_ready_and_no_direct_cr
     assert not direct_ctor.called
 
 
+@pytest.mark.skip(reason="Nous-managed Modal gateway is retired")
 def test_terminal_tool_auto_mode_prefers_managed_modal_when_available():
     _install_fake_tools_package()
     env = os.environ.copy()

@@ -623,10 +623,12 @@ def test_public_installer_registers_ios_mcps_in_the_service_hermes_home():
 
     assert (
         'sudo -u "${service_user}" -- env HERMES_HOME="${runtime_home}" \\\n'
+        '    PYTHONPATH="${target_root}${PYTHONPATH:+:${PYTHONPATH}}" \\\n'
         '    "${runtime_python}" -m hermes_cli.ios_mcp_server --install'
     ) in installer
     assert (
         'sudo -u "${service_user}" -- env HERMES_HOME="${runtime_home}" \\\n'
+        '    PYTHONPATH="${target_root}${PYTHONPATH:+:${PYTHONPATH}}" \\\n'
         '    "${runtime_python}" -m hermes_cli.ios_mcp_supervisor --register'
     ) in installer
     assert "AESGCM" in installer

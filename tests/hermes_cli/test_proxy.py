@@ -22,8 +22,8 @@ from hermes_cli.proxy.adapters.xai import XAIGrokAdapter
 # ---------------------------------------------------------------------------
 
 
-def test_registry_lists_nous():
-    assert "nous" in ADAPTERS
+def test_registry_does_not_list_retired_nous_proxy():
+    assert "nous" not in ADAPTERS
 
 
 def test_registry_lists_xai():
@@ -31,8 +31,8 @@ def test_registry_lists_xai():
 
 
 def test_get_adapter_returns_instance():
-    adapter = get_adapter("nous")
-    assert isinstance(adapter, NousPortalAdapter)
+    adapter = get_adapter("xai")
+    assert isinstance(adapter, XAIGrokAdapter)
     assert isinstance(adapter, UpstreamAdapter)
 
 
@@ -43,9 +43,8 @@ def test_get_adapter_returns_xai_instance():
 
 
 def test_get_adapter_case_insensitive():
-    assert isinstance(get_adapter("NOUS"), NousPortalAdapter)
-    assert isinstance(get_adapter("  Nous  "), NousPortalAdapter)
     assert isinstance(get_adapter("XAI"), XAIGrokAdapter)
+    assert isinstance(get_adapter("  xAi  "), XAIGrokAdapter)
 
 
 def test_get_adapter_unknown_provider_raises():
@@ -225,6 +224,7 @@ def test_nous_adapter_get_credential_raises_on_refresh_failure(tmp_path, monkeyp
             adapter.get_credential()
 
 
+@pytest.mark.skip(reason="Nous proxy authentication is retired")
 def test_nous_adapter_quarantines_terminal_refresh_failure(tmp_path, monkeypatch):
     from hermes_cli.auth import AuthError
     from agent.credential_pool import load_pool
@@ -858,8 +858,8 @@ def test_cmd_proxy_status_runs(capsys, tmp_path, monkeypatch):
     rc = cmd_proxy_status(args)
     assert rc == 0
     out = capsys.readouterr().out
-    assert "nous" in out
-    assert "Nous Portal" in out
+    assert "xai" in out
+    assert "xAI Grok OAuth" in out
     assert "not logged in" in out
 
 
@@ -870,8 +870,8 @@ def test_cmd_proxy_providers_runs(capsys):
     rc = cmd_proxy_list_providers(args)
     assert rc == 0
     out = capsys.readouterr().out
-    assert "nous" in out
-    assert "Nous Portal" in out
+    assert "xai" in out
+    assert "xAI Grok OAuth" in out
 
 
 def test_cmd_proxy_start_refuses_unknown_provider(capsys):
@@ -892,10 +892,10 @@ def test_cmd_proxy_start_refuses_when_unauthenticated(capsys, tmp_path, monkeypa
     from hermes_cli.proxy.cli import cmd_proxy_start
 
     args = MagicMock()
-    args.provider = "nous"
+    args.provider = "xai"
     args.host = None
     args.port = None
     rc = cmd_proxy_start(args)
     assert rc == 2
     err = capsys.readouterr().err
-    assert "hermes auth add nous" in err
+    assert "hermes auth add xai-oauth --type oauth" in err

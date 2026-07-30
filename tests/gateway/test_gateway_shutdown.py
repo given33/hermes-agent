@@ -490,6 +490,7 @@ def test_pid_exists_zombie_via_psutil_returns_false(monkeypatch):
     import types
 
     from gateway import status
+    from hermes_runtime import process_probe
 
     fake_psutil = types.SimpleNamespace()
     fake_psutil.STATUS_ZOMBIE = "zombie"
@@ -554,6 +555,7 @@ def test_pid_exists_zombie_via_proc_fallback_returns_false(monkeypatch):
     import sys
 
     from gateway import status
+    from hermes_runtime import process_probe
 
     monkeypatch.setitem(sys.modules, "psutil", None)  # force ImportError
     real_import = builtins.__import__
@@ -564,15 +566,15 @@ def test_pid_exists_zombie_via_proc_fallback_returns_false(monkeypatch):
         return real_import(name, *a, **k)
 
     monkeypatch.setattr(builtins, "__import__", _no_psutil)
-    monkeypatch.setattr(status, "_IS_WINDOWS", False)
+    monkeypatch.setattr(process_probe, "_IS_WINDOWS", False)
 
     fake_stat = "4242 (defunct) Z 1 0 0 0 -1 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0"
     fake_path = MagicMock()
     fake_path.read_text.return_value = fake_stat
-    monkeypatch.setattr(status, "Path", lambda *_a, **_k: fake_path)
+    monkeypatch.setattr(process_probe, "Path", lambda *_a, **_k: fake_path)
 
     kill = MagicMock()
-    monkeypatch.setattr(status.os, "kill", kill)
+    monkeypatch.setattr(process_probe.os, "kill", kill)
 
     assert status._pid_exists(4242) is False
     kill.assert_not_called()

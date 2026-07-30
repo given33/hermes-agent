@@ -43,7 +43,7 @@ import uuid
 _IS_WINDOWS = platform.system() == "Windows"
 from tools.environments.local import _find_shell, _resolve_safe_cwd, _sanitize_subprocess_env
 from hermes_runtime.subprocess_compat import windows_hide_flags
-from hermes_runtime.process_probe import pid_exists as _pid_exists
+from hermes_runtime import process_probe
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional
 
@@ -455,7 +455,7 @@ class ProcessRegistry:
             return False
         # ``os.kill(pid, 0)`` is NOT a no-op on Windows (bpo-14484) — use
         # the cross-platform existence check.
-        return _pid_exists(pid)
+        return process_probe.pid_exists(pid)
 
     @staticmethod
     def _safe_host_start_time(pid: Optional[int]) -> Optional[int]:

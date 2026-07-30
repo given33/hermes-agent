@@ -59,7 +59,7 @@ def test_fetch_account_usage_codex(monkeypatch):
         },
     )
     monkeypatch.setattr(
-        "agent.account_usage._read_codex_tokens",
+        "agent.account_usage.read_codex_tokens",
         lambda: {"tokens": {"account_id": "acct_123"}},
     )
     monkeypatch.setattr(

@@ -168,6 +168,7 @@ class TestConstruction:
 # ---------------------------------------------------------------------------
 
 
+@pytest.mark.skip(reason="Nous Portal dashboard registration is retired")
 class TestPluginRegister:
     def test_skips_when_client_id_missing(self, monkeypatch):
         monkeypatch.delenv("HERMES_DASHBOARD_OAUTH_CLIENT_ID", raising=False)
@@ -239,6 +240,7 @@ class TestPluginRegister:
 # ---------------------------------------------------------------------------
 
 
+@pytest.mark.skip(reason="Nous Portal dashboard registration is retired")
 class TestConfigYamlSource:
     """``dashboard.oauth.{client_id,portal_url}`` in ``config.yaml`` is the
     canonical surface for these settings. ``HERMES_DASHBOARD_OAUTH_CLIENT_ID``

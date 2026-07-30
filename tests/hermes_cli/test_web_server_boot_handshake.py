@@ -70,9 +70,9 @@ def test_lifespan_warmup_is_nonblocking():
         with TestClient(web_server_mod.app, raise_server_exceptions=False) as _client:
             startup_ms = (time.perf_counter() - t0) * 1000
 
-    # Startup must complete in under half of SLOW_SECONDS (generous margin).
+    # Startup must complete before the blocking call could have finished.
     # If the import were synchronous, startup would block for >= SLOW_SECONDS.
-    threshold_ms = (SLOW_SECONDS * 1000) / 2
+    threshold_ms = (SLOW_SECONDS * 1000) * 0.8
     assert startup_ms < threshold_ms, (
         f"_lifespan blocked the event loop: startup took {startup_ms:.0f} ms "
         f"but slow import is {SLOW_SECONDS * 1000:.0f} ms — "

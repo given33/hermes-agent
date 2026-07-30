@@ -68,6 +68,25 @@ _SENSITIVE_BODY_KEYS = frozenset({
 # downgrade — see `_log_redaction_status()` in gateway/run.py and cli.py.
 _REDACT_ENABLED = os.getenv("HERMES_REDACT_SECRETS", "true").lower() in {"1", "true", "yes", "on"}
 
+
+def finalize_redaction_config() -> bool:
+    """Finalize the startup redaction flag after config and dotenv bridging.
+
+    Some startup paths import provider hooks while sanitizing ``.env`` files,
+    which can load this module before ``security.redact_secrets`` has been
+    bridged into the process environment. Entry points call this exactly once
+    after their startup configuration layers are complete; ordinary runtime
+    environment mutations still do not change the snapshotted flag.
+    """
+    global _REDACT_ENABLED
+    _REDACT_ENABLED = os.getenv("HERMES_REDACT_SECRETS", "true").lower() in {
+        "1",
+        "true",
+        "yes",
+        "on",
+    }
+    return _REDACT_ENABLED
+
 # Known API key prefixes -- match the prefix + contiguous token chars
 _PREFIX_PATTERNS = [
     r"sk-[A-Za-z0-9_-]{10,}",           # OpenAI / OpenRouter / Anthropic (sk-ant-*)

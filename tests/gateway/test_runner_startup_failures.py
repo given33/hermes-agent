@@ -218,7 +218,7 @@ async def test_start_gateway_replace_force_uses_terminate_pid(monkeypatch, tmp_p
             _pid_state["alive"] = False
     monkeypatch.setattr("gateway.status.terminate_pid", _mock_terminate_pid)
     monkeypatch.setattr(
-        "gateway.status._pid_exists", lambda pid: _pid_state["alive"]
+        "gateway.run.process_probe.pid_exists", lambda pid: _pid_state["alive"]
     )
     monkeypatch.setattr("gateway.run.os.getpid", lambda: 100)
     monkeypatch.setattr("gateway.run.os.kill", lambda pid, sig: None)
@@ -276,7 +276,7 @@ async def test_start_gateway_replace_aborts_when_force_killed_pid_still_alive(
         lambda pid, force=False: calls.append((pid, force)),
     )
     # _pid_exists never goes False — the force-kill did not take.
-    monkeypatch.setattr("gateway.status._pid_exists", lambda pid: True)
+    monkeypatch.setattr("gateway.run.process_probe.pid_exists", lambda pid: True)
     monkeypatch.setattr("gateway.run.os.getpid", lambda: 100)
     monkeypatch.setattr("gateway.run.os.kill", lambda pid, sig: None)
     monkeypatch.setattr("time.sleep", lambda _: None)

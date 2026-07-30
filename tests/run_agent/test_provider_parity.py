@@ -1030,13 +1030,9 @@ class TestAuxiliaryClientProviderPriority:
 
     def test_nous_when_no_openrouter(self, monkeypatch):
         monkeypatch.delenv("OPENROUTER_API_KEY", raising=False)
+        monkeypatch.setenv("NOUS_API_KEY", "nous-key")
         from agent.auxiliary_client import get_text_auxiliary_client
-        nous_auth = {
-            "access_token": _fake_invoke_jwt(),
-            "scope": "inference:invoke",
-        }
-        with patch("agent.auxiliary_client._read_nous_auth", return_value=nous_auth), \
-             patch("agent.auxiliary_client.OpenAI") as mock, \
+        with patch("agent.auxiliary_client.OpenAI") as mock, \
              patch("hermes_cli.models.get_nous_recommended_aux_model", return_value=None):
             client, model = get_text_auxiliary_client()
         assert model == "google/gemini-3-flash-preview"

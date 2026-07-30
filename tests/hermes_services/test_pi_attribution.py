@@ -47,9 +47,11 @@ def test_adopted_service_modules_have_concrete_product_consumers():
     }
     for relative_path, expected_imports in expected_edges.items():
         tree = ast.parse((ROOT / relative_path).read_text(encoding="utf-8"))
-        actual = {
-            node.module
-            for node in ast.walk(tree)
-            if isinstance(node, ast.ImportFrom) and node.module
-        }
+        actual = set()
+        for node in ast.walk(tree):
+            if not isinstance(node, ast.ImportFrom) or not node.module:
+                continue
+            actual.add(node.module)
+            if node.module == "hermes_services":
+                actual.update(f"hermes_services.{name.name}" for name in node.names)
         assert expected_imports <= actual
