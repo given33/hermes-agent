@@ -215,6 +215,13 @@ def test_public_release_contains_the_complete_application_service_layer():
         assert relative in deployer
         assert relative in installer
         assert relative in harness
+    runtime_files = sorted((ROOT / "hermes_runtime").glob("*.py"))
+    assert runtime_files
+    for path in runtime_files:
+        relative = path.relative_to(ROOT).as_posix()
+        assert relative in deployer
+        assert relative in installer
+        assert relative in harness
     for relative in (
         "hermes_cli/account_identity.py",
         "hermes_cli/account_lifecycle.py",
