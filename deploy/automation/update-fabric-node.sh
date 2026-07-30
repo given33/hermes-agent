@@ -90,7 +90,22 @@ git --git-dir="${mirror}" cat-file -e "${release_commit}^{commit}"
 git --git-dir="${mirror}" merge-base --is-ancestor \
   "${release_commit}" refs/remotes/origin/main \
   || die "committed release is not part of the approved main branch"
-git --git-dir="${mirror}" archive --format=tar "${release_commit}" | tar -xf - -C "${stage}"
+archive_paths=(
+  "deploy/automation/update-fabric-node.sh"
+  "deploy/automation/hermes-fabric-update.service"
+  "deploy/automation/hermes-fabric-update.timer"
+  "deploy/dbb3/install-dbb3-cloud-connector-user.sh"
+  "deploy/dbb3/dbb3_cloud_connector.py"
+  "deploy/dbb3/dbb3-cloud-connector.service"
+)
+if [[ "${role}" == wsl ]]; then
+  archive_paths+=(
+    "deploy/pc/install-pc-cloud-connector-user.sh"
+    "deploy/pc/pc-cloud-connector.service"
+  )
+fi
+git --git-dir="${mirror}" archive --format=tar "${release_commit}" \
+  -- "${archive_paths[@]}" | tar -xf - -C "${stage}"
 # The connector installer deliberately drops to the service account for its
 # preflight. The verified public Git archive contains no node credentials, so
 # expose the ephemeral snapshot read-only after ancestry validation while

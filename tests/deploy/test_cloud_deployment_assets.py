@@ -165,8 +165,22 @@ def test_three_endpoint_updates_follow_only_a_committed_main_release():
     assert "refs/remotes/origin/main" in updater
     archive = updater.index('archive --format=tar "${release_commit}"')
     readable_stage = updater.index('chmod -R a+rX "${stage}"')
-    node_install = updater.index("install-dbb3-cloud-connector-user.sh")
+    node_install = updater.index(
+        'bash "${stage}/deploy/dbb3/install-dbb3-cloud-connector-user.sh"'
+    )
     assert archive < readable_stage < node_install
+    assert '-- "${archive_paths[@]}"' in updater
+    for relative in (
+        "deploy/automation/update-fabric-node.sh",
+        "deploy/automation/hermes-fabric-update.service",
+        "deploy/automation/hermes-fabric-update.timer",
+        "deploy/dbb3/install-dbb3-cloud-connector-user.sh",
+        "deploy/dbb3/dbb3_cloud_connector.py",
+        "deploy/dbb3/dbb3-cloud-connector.service",
+        "deploy/pc/install-pc-cloud-connector-user.sh",
+        "deploy/pc/pc-cloud-connector.service",
+    ):
+        assert f'"{relative}"' in updater
     assert "systemctl enable --now hermes-managed-installation-receiver.service" in updater
     assert "hermes-wsl-managed-installation-receiver.service" in updater
     assert "hermes-wsl-managed-installation-tunnel.service" in updater
