@@ -18,6 +18,7 @@ from difflib import get_close_matches
 from pathlib import Path
 from typing import Any, NamedTuple, Optional
 
+from hermes_runtime import model_catalog_cache
 from hermes_runtime.version import HERMES_VERSION as _HERMES_VERSION
 from hermes_runtime.urllib_security import open_credentialed_url
 
@@ -1322,8 +1323,7 @@ def get_preferred_silent_default_model(provider: str = "openrouter") -> str:
     the provider block carries no label.
     """
     try:
-        from hermes_cli.model_catalog import get_default_model_from_cache
-        labeled = get_default_model_from_cache(provider)
+        labeled = model_catalog_cache.get_default_model_from_disk_cache(provider)
         if labeled:
             return labeled
     except Exception:

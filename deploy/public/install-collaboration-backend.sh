@@ -101,6 +101,7 @@ runtime_service_assets=(
   "hermes_runtime/default_soul.py"
   "hermes_runtime/managed_scope.py"
   "hermes_runtime/mcp_security.py"
+  "hermes_runtime/model_catalog_cache.py"
   "hermes_runtime/package_install.py"
   "hermes_runtime/process_probe.py"
   "hermes_runtime/profile_identity.py"

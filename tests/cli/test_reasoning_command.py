@@ -175,6 +175,7 @@ class TestHandleReasoningCommand(unittest.TestCase):
         with patch.dict(CLI_CONFIG.setdefault("agent", {}), {"reasoning_effort": "medium"}), \
              patch("cli.save_config_value", return_value=True) as save_config, \
              patch("cli._cprint"):
+            stub.config = CLI_CONFIG
             CLICommandsMixin._handle_reasoning_command(stub, "/reasoning high --global")
             self.assertEqual(CLI_CONFIG["agent"]["reasoning_effort"], "high")
 

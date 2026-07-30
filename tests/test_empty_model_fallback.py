@@ -1,6 +1,36 @@
 """Tests for empty model fallback — when provider is configured but model is missing."""
 
+import json
 from unittest.mock import patch
+
+
+def test_cached_default_reader_rejects_unsupported_schema(tmp_path):
+    from hermes_runtime.model_catalog_cache import (
+        default_model_from_catalog,
+        read_disk_cache,
+    )
+
+    cache = tmp_path / "model-catalog.json"
+    payload = {
+        "version": 1,
+        "providers": {
+            "openrouter": {
+                "models": [
+                    {"id": "expensive/model"},
+                    {"id": "safe/default", "default": True},
+                ]
+            }
+        },
+    }
+    cache.write_text(json.dumps(payload), encoding="utf-8")
+
+    catalog, mtime = read_disk_cache(cache)
+    assert mtime > 0
+    assert default_model_from_catalog(catalog, "openrouter") == "safe/default"
+
+    payload["version"] = 2
+    cache.write_text(json.dumps(payload), encoding="utf-8")
+    assert read_disk_cache(cache) == (None, 0.0)
 
 
 class TestGetDefaultModelForProvider:
@@ -73,7 +103,7 @@ class TestGetDefaultModelForProvider:
         from hermes_cli import models as models_mod
 
         with patch(
-            "hermes_cli.model_catalog.get_default_model_from_cache",
+            "hermes_runtime.model_catalog_cache.get_default_model_from_disk_cache",
             return_value="qwen/qwen3.7-plus",
         ):
             assert (
@@ -94,7 +124,7 @@ class TestGetDefaultModelForProvider:
         from hermes_cli import models as models_mod
 
         with patch(
-            "hermes_cli.model_catalog.get_default_model_from_cache",
+            "hermes_runtime.model_catalog_cache.get_default_model_from_disk_cache",
             return_value=None,
         ):
             assert (
@@ -110,7 +140,7 @@ class TestGetDefaultModelForProvider:
         from hermes_cli import models as models_mod
 
         with patch(
-            "hermes_cli.model_catalog.get_default_model_from_cache",
+            "hermes_runtime.model_catalog_cache.get_default_model_from_disk_cache",
             return_value="does-not-exist-model",
         ):
             result = models_mod.get_default_model_for_provider("nous")
