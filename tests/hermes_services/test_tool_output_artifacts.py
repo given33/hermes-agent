@@ -172,6 +172,80 @@ def test_encrypted_artifact_round_trip_and_owner_isolation(tmp_path):
     assert store.list_owner("alice")[0]["sha256"] == record["sha256"]
 
 
+def test_owner_listing_filters_metadata_dates_and_filtered_total(tmp_path, monkeypatch):
+    store = EncryptedToolArtifactStore(tmp_path)
+    now = [1_800_000_000]
+    monkeypatch.setattr(
+        "hermes_services.tool_output_artifacts.time.time", lambda: now[0]
+    )
+
+    records = []
+    for index, (created_at, tool_name) in enumerate(
+        (
+            (1_800_000_000, "DeployX100Y"),
+            (1_800_000_060, "Deploy_100%"),
+            (1_800_000_120, "Deploy_100%"),
+            (1_800_000_180, "Deploy_100%"),
+        )
+    ):
+        now[0] = created_at
+        records.append(
+            store.put(
+                owner_id="alice",
+                account_generation="generation-1",
+                conversation_id=f"conversation-{index}",
+                turn_id=f"turn-{index}",
+                tool_call_id=f"tool-{index}",
+                tool_name=tool_name,
+                content=f"output-{index}",
+            )
+        )
+    now[0] = 1_800_000_200
+
+    filters = {
+        "account_generation": "generation-1",
+        "q": "deploy_100",
+        "date_from": 1_800_000_060_000,
+        "date_to": 1_800_000_120_999,
+    }
+    page = store.list_owner("alice", limit=1, **filters)
+
+    assert [item["id"] for item in page] == [records[2]["id"]]
+    assert store.count_owner("alice", **filters) == 2
+    assert [
+        item["id"] for item in store.list_owner("alice", limit=100, **filters)
+    ] == [records[2]["id"], records[1]["id"]]
+    assert store.count_owner(
+        "alice", account_generation="generation-1", q="tool_output"
+    ) == 4
+    assert store.count_owner(
+        "alice", account_generation="generation-1", q="deploy-100"
+    ) == 0
+
+
+def test_owner_listing_uses_id_ascending_tie_break(tmp_path, monkeypatch):
+    store = EncryptedToolArtifactStore(tmp_path)
+    monkeypatch.setattr(
+        "hermes_services.tool_output_artifacts.time.time", lambda: 1_800_000_000
+    )
+    records = [
+        store.put(
+            owner_id="alice",
+            account_generation="generation-1",
+            conversation_id="conversation-1",
+            turn_id="turn-1",
+            tool_call_id=tool_call_id,
+            tool_name="terminal",
+            content=tool_call_id,
+        )
+        for tool_call_id in ("tool-b", "tool-a")
+    ]
+
+    listed = store.list_owner("alice", account_generation="generation-1")
+
+    assert [item["id"] for item in listed] == sorted(item["id"] for item in records)
+
+
 def test_same_tool_call_replaces_one_stable_encrypted_artifact(tmp_path):
     store = EncryptedToolArtifactStore(tmp_path)
     first = store.put(

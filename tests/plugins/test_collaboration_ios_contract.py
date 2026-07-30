@@ -66,6 +66,25 @@ def test_explicit_file_type_takes_precedence_over_legacy_alias():
     assert captured[-1]["file_type"] == "image"
 
 
+def test_account_files_v1_contract_is_echoed_and_selects_exact_semantics():
+    module = load_module()
+    captured = []
+    module.owner_id_from_request = lambda _request: "owner-a"
+    module._file_library = lambda: SimpleNamespace(
+        list_files=lambda _owner_id, **kwargs: (
+            captured.append(kwargs) or ([], 0)
+        ),
+    )
+
+    response = module.list_account_files(
+        SimpleNamespace(query_params={}),
+        filter_contract="account-files-v1",
+    )
+
+    assert response["filter_contract"] == "account-files-v1"
+    assert captured[-1]["account_files_contract"] is True
+
+
 @pytest.mark.asyncio
 async def test_conversation_upload_persists_ios_context_headers(tmp_path: Path):
     module = load_module()

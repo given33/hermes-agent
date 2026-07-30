@@ -1240,7 +1240,8 @@ class TestStopProfileGateway:
             lambda pid, sig: calls.__setitem__("kill", calls["kill"] + 1),
         )
         monkeypatch.setattr(
-            "hermes_runtime.process_probe.pid_exists",
+            gateway,
+            "_pid_exists",
             lambda pid: calls.__setitem__("alive_probes", calls["alive_probes"] + 1) or True,
         )
         monkeypatch.setattr("time.sleep", lambda _: None)

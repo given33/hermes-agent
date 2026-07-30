@@ -24,6 +24,7 @@ import os
 import json
 import re
 import asyncio
+import concurrent.futures
 import logging
 import threading
 import time
@@ -47,6 +48,61 @@ _WARNED_DISABLED_BUNDLES: set = set()
 _tool_loop = None          # persistent loop for the main (CLI) thread
 _tool_loop_lock = threading.Lock()
 _worker_thread_local = threading.local()  # per-worker-thread persistent loops
+_ASYNC_BRIDGE_TIMEOUT_SECONDS = 300
+_ASYNC_BRIDGE_MAX_WORKERS = 128
+_ASYNC_BRIDGE_MAX_WORKERS_PER_SESSION = 32
+_async_bridge_slots = threading.BoundedSemaphore(_ASYNC_BRIDGE_MAX_WORKERS)
+_async_bridge_session_lock = threading.Lock()
+_async_bridge_session_slots: dict[str, tuple[threading.BoundedSemaphore, int]] = {}
+
+
+def _async_bridge_session_key() -> str:
+    try:
+        from tools.approval import get_current_session_key
+
+        key = get_current_session_key("").strip()
+    except Exception:
+        key = ""
+    return key or f"thread:{threading.get_ident()}"
+
+
+def _acquire_async_bridge_slot() -> tuple[str, threading.BoundedSemaphore]:
+    if not _async_bridge_slots.acquire(blocking=False):
+        raise RuntimeError("async bridge process worker limit reached")
+    key = _async_bridge_session_key()
+    with _async_bridge_session_lock:
+        state = _async_bridge_session_slots.get(key)
+        slots, active = state or (
+            threading.BoundedSemaphore(_ASYNC_BRIDGE_MAX_WORKERS_PER_SESSION),
+            0,
+        )
+        if not slots.acquire(blocking=False):
+            _async_bridge_slots.release()
+            raise RuntimeError("async bridge session worker limit reached")
+        _async_bridge_session_slots[key] = (slots, active + 1)
+    return key, slots
+
+
+def _release_async_bridge_slot(
+    key: str,
+    slots: threading.BoundedSemaphore,
+) -> None:
+    slots.release()
+    with _async_bridge_session_lock:
+        current = _async_bridge_session_slots.get(key)
+        if current is not None and current[0] is slots:
+            active = current[1] - 1
+            if active:
+                _async_bridge_session_slots[key] = (slots, active)
+            else:
+                _async_bridge_session_slots.pop(key, None)
+    _async_bridge_slots.release()
+
+
+def _close_awaitable(awaitable: Any) -> None:
+    close = getattr(awaitable, "close", None)
+    if callable(close):
+        close()
 
 
 def _get_tool_loop():
@@ -86,6 +142,89 @@ def _get_worker_loop():
     return loop
 
 
+def _run_async_in_daemon_thread(coro):
+    """Run one awaitable on a bounded daemon worker with its own loop."""
+    try:
+        session_key, session_slots = _acquire_async_bridge_slot()
+    except BaseException:
+        _close_awaitable(coro)
+        raise
+
+    worker_loop: Optional[asyncio.AbstractEventLoop] = None
+    loop_ready = threading.Event()
+    cancel_requested = threading.Event()
+    future: concurrent.futures.Future = concurrent.futures.Future()
+
+    def _run_in_worker():
+        nonlocal worker_loop
+        worker_loop = asyncio.new_event_loop()
+        loop_ready.set()
+        try:
+            asyncio.set_event_loop(worker_loop)
+            if cancel_requested.is_set():
+                _close_awaitable(coro)
+                raise concurrent.futures.CancelledError()
+            return worker_loop.run_until_complete(coro)
+        finally:
+            try:
+                pending = asyncio.all_tasks(worker_loop)
+                for task in pending:
+                    task.cancel()
+                if pending:
+                    worker_loop.run_until_complete(
+                        asyncio.gather(*pending, return_exceptions=True)
+                    )
+            except Exception:
+                pass
+            worker_loop.close()
+
+    from tools.thread_context import propagate_context_to_thread
+
+    propagated_worker = propagate_context_to_thread(_run_in_worker)
+
+    def _complete_future() -> None:
+        try:
+            if not future.set_running_or_notify_cancel():
+                _close_awaitable(coro)
+                return
+            try:
+                result = propagated_worker()
+            except BaseException as exc:
+                future.set_exception(exc)
+            else:
+                future.set_result(result)
+        finally:
+            _release_async_bridge_slot(session_key, session_slots)
+
+    worker = threading.Thread(
+        target=_complete_future,
+        name="hermes-async-bridge",
+        daemon=True,
+    )
+    try:
+        worker.start()
+    except BaseException:
+        _release_async_bridge_slot(session_key, session_slots)
+        _close_awaitable(coro)
+        raise
+
+    try:
+        return future.result(timeout=_ASYNC_BRIDGE_TIMEOUT_SECONDS)
+    except concurrent.futures.TimeoutError:
+        cancel_requested.set()
+        future.cancel()
+        if loop_ready.wait(timeout=1.0) and worker_loop is not None:
+            try:
+                def _cancel_pending() -> None:
+                    for task in asyncio.all_tasks(worker_loop):
+                        task.cancel()
+
+                worker_loop.call_soon_threadsafe(_cancel_pending)
+            except RuntimeError:
+                pass
+        raise
+
+
 def _run_async(coro):
     """Run an async coroutine from a sync context.
 
@@ -112,62 +251,7 @@ def _run_async(coro):
         loop = None
 
     if loop and loop.is_running():
-        # Inside an async context (gateway, RL env) — run in a fresh thread
-        # with its own event loop we own a reference to, so on timeout we
-        # can cancel the task inside that loop (ThreadPoolExecutor.cancel()
-        # only works on not-yet-started futures — it's a no-op on a running
-        # worker, which previously leaked the thread on every 300 s timeout).
-        import concurrent.futures
-
-        worker_loop: Optional[asyncio.AbstractEventLoop] = None
-        loop_ready = threading.Event()
-
-        def _run_in_worker():
-            nonlocal worker_loop
-            worker_loop = asyncio.new_event_loop()
-            loop_ready.set()
-            try:
-                asyncio.set_event_loop(worker_loop)
-                return worker_loop.run_until_complete(coro)
-            finally:
-                try:
-                    # Cancel anything still pending (e.g. task cancelled
-                    # externally via call_soon_threadsafe on timeout).
-                    pending = asyncio.all_tasks(worker_loop)
-                    for t in pending:
-                        t.cancel()
-                    if pending:
-                        worker_loop.run_until_complete(
-                            asyncio.gather(*pending, return_exceptions=True)
-                        )
-                except Exception:
-                    pass
-                worker_loop.close()
-
-        pool = concurrent.futures.ThreadPoolExecutor(max_workers=1)
-        # Carry the active profile + approval/sudo callbacks into the worker so
-        # async tools resolve get_hermes_home() under the active profile.
-        from tools.thread_context import propagate_context_to_thread
-
-        future = pool.submit(propagate_context_to_thread(_run_in_worker))
-        try:
-            return future.result(timeout=300)
-        except concurrent.futures.TimeoutError:
-            # Cancel the coroutine inside its own loop so the worker thread
-            # can wind down instead of running forever.
-            if loop_ready.wait(timeout=1.0) and worker_loop is not None:
-                try:
-                    for t in asyncio.all_tasks(worker_loop):
-                        worker_loop.call_soon_threadsafe(t.cancel)
-                except RuntimeError:
-                    # Loop already closed — nothing to cancel.
-                    pass
-            raise
-        finally:
-            # wait=False: don't block the caller on a stuck coroutine. We've
-            # already requested cancellation above; the worker will exit
-            # once the coroutine observes it (usually at the next await).
-            pool.shutdown(wait=False)
+        return _run_async_in_daemon_thread(coro)
 
     # If we're on a worker thread (e.g., parallel tool execution in
     # delegate_task), use a per-thread persistent loop.  This avoids

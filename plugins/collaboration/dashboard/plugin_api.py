@@ -17378,9 +17378,12 @@ def list_account_files(
     source: str = "",
     file_type: str = "",
     status: str = "",
+    filter_contract: str = "",
     limit: int = 100,
     offset: int = 0,
 ):
+    if filter_contract and filter_contract != _TOOL_OUTPUT_FILTER_CONTRACT:
+        raise HTTPException(status_code=422, detail="unsupported account-files filter contract")
     owner_id = owner_id_from_request(request)
     account_generation = _account_generation_for_request(request, owner_id)
     try:
@@ -17396,41 +17399,72 @@ def list_account_files(
             source=source,
             file_type=requested_type,
             status=status,
+            account_files_contract=filter_contract == _TOOL_OUTPUT_FILTER_CONTRACT,
             limit=limit,
             offset=offset,
         )
     except ValueError as exc:
         raise HTTPException(status_code=422, detail=str(exc)) from exc
-    return {
+    response = {
         "files": [_library_attachment(record) for record in records],
         "total": total,
         "limit": max(1, min(limit, 200)),
         "offset": max(0, offset),
     }
+    if filter_contract:
+        response["filter_contract"] = _TOOL_OUTPUT_FILTER_CONTRACT
+    return response
+
+
+_TOOL_OUTPUT_FILTER_CONTRACT = "account-files-v1"
 
 
 @router.get("/tool-output-artifacts")
-def list_tool_output_artifacts(request: Request, limit: int = 100, offset: int = 0):
+def list_tool_output_artifacts(
+    request: Request,
+    q: str = "",
+    date_from: str = "",
+    date_to: str = "",
+    filter_contract: str = "",
+    limit: int = 100,
+    offset: int = 0,
+):
     if limit < 1 or limit > 1000:
         raise HTTPException(status_code=422, detail="limit must be between 1 and 1000")
     if offset < 0:
         raise HTTPException(status_code=422, detail="offset must be non-negative")
+    if filter_contract and filter_contract != _TOOL_OUTPUT_FILTER_CONTRACT:
+        raise HTTPException(status_code=422, detail="unsupported tool-output filter contract")
     store = EncryptedToolArtifactStore(Path(get_hermes_home()))
     owner_id = owner_id_from_request(request)
     account_generation = _account_generation_for_request(request, owner_id)
-    return {
-        "artifacts": store.list_owner(
+    try:
+        start_ms = parse_date_filter(date_from)
+        end_ms = parse_date_filter(date_to, end_of_day=True)
+        artifacts = store.list_owner(
             owner_id,
             account_generation=account_generation,
+            q=q,
+            date_from=start_ms,
+            date_to=end_ms,
             limit=limit,
             offset=offset,
-        ),
-        "total": store.count_owner(
+        )
+        total = store.count_owner(
             owner_id,
             account_generation=account_generation,
-        ),
+            q=q,
+            date_from=start_ms,
+            date_to=end_ms,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+    return {
+        "artifacts": artifacts,
+        "total": total,
         "limit": limit,
         "offset": offset,
+        "filter_contract": _TOOL_OUTPUT_FILTER_CONTRACT,
     }
 
 

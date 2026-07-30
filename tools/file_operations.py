@@ -790,6 +790,44 @@ def _maybe_warn_line_oriented_newline_pattern(result: SearchResult, pattern: str
     return result
 
 
+def _line_safe_top_level_alternatives(pattern: str) -> Optional[str]:
+    """Drop top-level regex branches that require multiline matching.
+
+    This intentionally declines to rewrite nested alternations. Replaying the
+    original expression through grep changes ``\\n`` into ``n`` on GNU grep
+    and can create false positives.
+    """
+    branches: list[str] = []
+    start = 0
+    depth = 0
+    in_class = False
+    escaped = False
+    for index, character in enumerate(pattern):
+        if escaped:
+            escaped = False
+            continue
+        if character == "\\":
+            escaped = True
+            continue
+        if character == "[" and not in_class:
+            in_class = True
+        elif character == "]" and in_class:
+            in_class = False
+        elif not in_class:
+            if character == "(":
+                depth += 1
+            elif character == ")" and depth:
+                depth -= 1
+            elif character == "|" and depth == 0:
+                branches.append(pattern[start:index])
+                start = index + 1
+    branches.append(pattern[start:])
+    if len(branches) == 1:
+        return None
+    safe = [branch for branch in branches if not _pattern_has_regex_newline(branch)]
+    return "|".join(safe) if safe else None
+
+
 class ShellFileOperations(FileOperations):
     """
     File operations implemented via shell commands.
@@ -2266,6 +2304,19 @@ class ShellFileOperations(FileOperations):
         if self._has_command('rg'):
             result = self._search_with_rg(pattern, path, file_glob, limit, offset,
                                           output_mode, context)
+            # ripgrep rejects an expression when any branch contains a
+            # newline escape. Retry only top-level branches proven not to
+            # contain one; grep changes ``\\n`` to ``n`` and creates false
+            # positives if it receives the original expression.
+            if (
+                _is_line_oriented_newline_error(result.error)
+                and "\n" not in pattern
+            ):
+                safe_pattern = _line_safe_top_level_alternatives(pattern)
+                if safe_pattern:
+                    result = self._search_with_rg(
+                        safe_pattern, path, file_glob, limit, offset, output_mode, context
+                    )
         elif self._has_command('grep'):
             result = self._search_with_grep(pattern, path, file_glob, limit, offset,
                                             output_mode, context)
@@ -2407,7 +2458,9 @@ class ShellFileOperations(FileOperations):
     def _search_with_grep(self, pattern: str, path: str, file_glob: Optional[str],
                           limit: int, offset: int, output_mode: str, context: int) -> SearchResult:
         """Fallback search using grep."""
-        cmd_parts = ["grep", "-rnH"]  # -H forces filename even for single-file searches
+        # Extended regex keeps fallback semantics aligned with ripgrep,
+        # including alternation with ``|``.
+        cmd_parts = ["grep", "-rnHE"]  # -H forces filename even for single-file searches
         
         # Exclude hidden directories (matching ripgrep's default behavior).
         # This prevents searching inside .hub/index-cache/, .git/, etc.

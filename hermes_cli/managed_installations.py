@@ -16,6 +16,7 @@ import ipaddress
 import json
 import os
 from pathlib import Path
+import random
 import re
 import shutil
 import signal
@@ -68,6 +69,10 @@ _SECRET_RE = re.compile(
 _THREADS_LOCK = threading.Lock()
 _RECEIVER_THREADS: dict[str, threading.Thread] = {}
 _ACCOUNT_RUNTIME_LOCK_TIMEOUT_SECONDS = 30.0
+_ACCOUNT_RUNTIME_LOCK_INITIAL_DELAY_SECONDS = 0.01
+_ACCOUNT_RUNTIME_LOCK_MAX_DELAY_SECONDS = 0.25
+_ACCOUNT_RUNTIME_LOCK_BACKOFF_MULTIPLIER = 2.0
+_ACCOUNT_RUNTIME_LOCK_JITTER_FRACTION = 0.2
 _ACCOUNT_RUNTIME_METADATA = ".managed-runtime-overlay.json"
 _BUILTIN_MANAGED_SOURCE_HOSTS = frozenset({"github.com"})
 MANAGED_SOURCE_POLICY_VERSION = "managed-source-v2"
@@ -496,6 +501,7 @@ def _account_runtime_lock(
     anchor = profiles_root / ".managed-account-runtime"
     deadline = time.monotonic() + max(0.0, float(timeout))
     boundary = _owner_boundary_digest(owner_id, account_generation)
+    retry_delay = _ACCOUNT_RUNTIME_LOCK_INITIAL_DELAY_SECONDS
     while True:
         # The resource store is shared by every logical role profile. A single
         # boundary lock prevents one role from materializing a partially
@@ -503,9 +509,18 @@ def _account_runtime_lock(
         fence = _try_execution_fence(anchor, f"runtime:{boundary}", "account")
         if fence is not None:
             break
-        if time.monotonic() >= deadline:
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
             raise TimeoutError("managed account runtime is busy")
-        time.sleep(0.05)
+        jitter = random.uniform(
+            1.0 - _ACCOUNT_RUNTIME_LOCK_JITTER_FRACTION,
+            1.0 + _ACCOUNT_RUNTIME_LOCK_JITTER_FRACTION,
+        )
+        time.sleep(min(remaining, retry_delay * jitter))
+        retry_delay = min(
+            _ACCOUNT_RUNTIME_LOCK_MAX_DELAY_SECONDS,
+            retry_delay * _ACCOUNT_RUNTIME_LOCK_BACKOFF_MULTIPLIER,
+        )
     try:
         yield
     finally:

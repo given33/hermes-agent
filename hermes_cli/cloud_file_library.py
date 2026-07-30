@@ -1503,6 +1503,7 @@ class CloudFileLibrary:
         status: str = "",
         conversation_id: str = "",
         turn_id: str = "",
+        account_files_contract: bool = False,
         limit: int = 100,
         offset: int = 0,
     ) -> tuple[list[dict[str, Any]], int]:
@@ -1516,19 +1517,23 @@ class CloudFileLibrary:
         if keyword:
             escaped = keyword.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
             pattern = f"%{escaped}%"
-            clauses.append(
-                "(" + " OR ".join(
-                    f"{column} LIKE ? ESCAPE '\\'"
-                    for column in (
-                        "name",
-                        "conversation_id",
-                        "message_id",
-                        "turn_id",
-                        "profile",
-                    )
-                ) + ")"
-            )
-            values.extend([pattern] * 5)
+            if account_files_contract:
+                clauses.append("(name || ' ' || file_type) LIKE ? ESCAPE '\\'")
+                values.append(pattern)
+            else:
+                clauses.append(
+                    "(" + " OR ".join(
+                        f"{column} LIKE ? ESCAPE '\\'"
+                        for column in (
+                            "name",
+                            "conversation_id",
+                            "message_id",
+                            "turn_id",
+                            "profile",
+                        )
+                    ) + ")"
+                )
+                values.extend([pattern] * 5)
         if date_from is not None:
             clauses.append("created_at>=?")
             values.append(int(date_from))
@@ -1543,7 +1548,10 @@ class CloudFileLibrary:
             values.append(normalize_status(status))
         type_filter = str(file_type or "").strip().lower()
         if type_filter:
-            if type_filter.endswith("/*"):
+            if account_files_contract:
+                clauses.append("file_type=?")
+                values.append(type_filter)
+            elif type_filter.endswith("/*"):
                 clauses.append("mime_type LIKE ?")
                 values.append(type_filter[:-1] + "%")
             elif "/" in type_filter:
@@ -1574,7 +1582,7 @@ class CloudFileLibrary:
                 f"""
                 SELECT * FROM account_files
                 WHERE {where}
-                ORDER BY created_at DESC, id DESC
+                ORDER BY created_at DESC, id {"ASC" if account_files_contract else "DESC"}
                 LIMIT ? OFFSET ?
                 """,
                 (*values, limit, offset),

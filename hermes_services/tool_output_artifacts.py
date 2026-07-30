@@ -8,6 +8,7 @@ import hmac
 import json
 import os
 from pathlib import Path
+import re
 import secrets
 import shutil
 import sqlite3
@@ -22,6 +23,18 @@ SCHEMA_VERSION = 3
 DEFAULT_RETENTION_SECONDS = 365 * 24 * 60 * 60
 
 
+def _artifact_search_text(tool_name: str, tool_call_id: str, artifact_id: str) -> str:
+    """Mirror the account-file name exposed by the iOS client."""
+
+    def safe_name(value: str, fallback: str) -> str:
+        normalized = re.sub(r"[^A-Za-z0-9._-]+", "-", str(value or "").strip())
+        return normalized.strip("-") or fallback
+
+    name = safe_name(tool_name, "tool")
+    call_id = safe_name(tool_call_id or artifact_id, "tool")[-48:]
+    return f"{name}-{call_id}.txt tool_output".lower()
+
+
 class EncryptedToolArtifactStore:
     def __init__(self, root: Path) -> None:
         self.root = Path(root)
@@ -34,6 +47,12 @@ class EncryptedToolArtifactStore:
         conn = sqlite3.connect(self.db_path, timeout=30)
         try:
             conn.row_factory = sqlite3.Row
+            conn.create_function(
+                "artifact_search_text",
+                3,
+                _artifact_search_text,
+                deterministic=True,
+            )
             conn.execute("PRAGMA busy_timeout=30000")
             wal_deadline = time.monotonic() + 30.0
             while True:
@@ -467,6 +486,9 @@ class EncryptedToolArtifactStore:
         owner_id: str,
         *,
         account_generation: str = "legacy",
+        q: str = "",
+        date_from: int | None = None,
+        date_to: int | None = None,
         limit: int = 100,
         offset: int = 0,
     ) -> list[dict[str, Any]]:
@@ -474,17 +496,22 @@ class EncryptedToolArtifactStore:
         generation = str(account_generation or "").strip() or "legacy"
         now = int(time.time())
         self.purge_expired(now=now)
+        where, params = self._owner_filter_where(
+            owner,
+            generation,
+            now=now,
+            q=q,
+            date_from=date_from,
+            date_to=date_to,
+        )
         with closing(self._connect()) as conn:
             rows = conn.execute(
                 "SELECT id,account_generation,conversation_id,turn_id,tool_call_id,tool_name,sha256,"
                 "size_bytes,state,created_at,retained_until "
-                "FROM tool_output_artifacts WHERE owner_id=? AND account_generation=? "
-                "AND state='available' AND retained_until>? "
-                "ORDER BY created_at DESC, id DESC LIMIT ? OFFSET ?",
-                (
-                    owner,
-                    generation,
-                    now,
+                f"FROM tool_output_artifacts WHERE {where} "
+                "ORDER BY created_at DESC, id ASC LIMIT ? OFFSET ?",
+                params
+                + (
                     min(1000, max(1, int(limit))),
                     max(0, int(offset)),
                 ),
@@ -496,18 +523,68 @@ class EncryptedToolArtifactStore:
         owner_id: str,
         *,
         account_generation: str = "legacy",
+        q: str = "",
+        date_from: int | None = None,
+        date_to: int | None = None,
     ) -> int:
         owner = str(owner_id or "").strip()
         generation = str(account_generation or "").strip() or "legacy"
         now = int(time.time())
+        where, params = self._owner_filter_where(
+            owner,
+            generation,
+            now=now,
+            q=q,
+            date_from=date_from,
+            date_to=date_to,
+        )
         with closing(self._connect()) as conn:
             row = conn.execute(
                 "SELECT COUNT(*) AS total FROM tool_output_artifacts "
-                "WHERE owner_id=? AND account_generation=? AND state='available' "
-                "AND retained_until>?",
-                (owner, generation, now),
+                f"WHERE {where}",
+                params,
             ).fetchone()
         return int(row["total"] if row is not None else 0)
+
+    @staticmethod
+    def _owner_filter_where(
+        owner_id: str,
+        account_generation: str,
+        *,
+        now: int,
+        q: str = "",
+        date_from: int | None = None,
+        date_to: int | None = None,
+    ) -> tuple[str, tuple[Any, ...]]:
+        if date_from is not None and date_to is not None and date_from > date_to:
+            raise ValueError("date_from must be before or equal to date_to")
+
+        clauses = [
+            "owner_id=?",
+            "account_generation=?",
+            "state='available'",
+            "retained_until>?",
+        ]
+        params: list[Any] = [owner_id, account_generation, now]
+        keyword = str(q or "").strip()
+        if keyword:
+            escaped = (
+                keyword.lower()
+                .replace("\\", "\\\\")
+                .replace("%", "\\%")
+                .replace("_", "\\_")
+            )
+            clauses.append(
+                "artifact_search_text(tool_name,tool_call_id,id) LIKE ? ESCAPE '\\'"
+            )
+            params.append(f"%{escaped}%")
+        if date_from is not None:
+            clauses.append("created_at>=?")
+            params.append((int(date_from) + 999) // 1000)
+        if date_to is not None:
+            clauses.append("created_at<=?")
+            params.append(int(date_to) // 1000)
+        return " AND ".join(clauses), tuple(params)
 
     def metadata(
         self,

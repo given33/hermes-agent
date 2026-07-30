@@ -215,7 +215,12 @@ def test_config_enabled_hard_stop_concurrent_path_does_not_submit_blocked_calls_
     assert starts == [("c-allow", "web_search", allowed_args)]
     started_events = [event for event in progress_events if event[0] == "tool.started"]
     completed_events = [event for event in progress_events if event[0] == "tool.completed"]
-    assert started_events == [("tool.started", "web_search", allowed_args, {})]
+    assert len(started_events) == 1
+    assert started_events[0][:3] == ("tool.started", "web_search", allowed_args)
+    execution_contract = started_events[0][3]["execution_contract"]
+    assert execution_contract["execution_mode"] == "parallel"
+    assert execution_contract["side_effect_class"] == "read"
+    assert execution_contract["timeout_policy"] == "hard"
     assert len(completed_events) == 1
     assert completed_events[0][1] == "web_search"
 

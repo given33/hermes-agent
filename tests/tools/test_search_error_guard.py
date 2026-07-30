@@ -175,6 +175,18 @@ class TestSearchContentNewlineWarning:
         assert res.total_count == 5
         assert res.warning is None
 
+    def test_newline_branch_does_not_turn_into_grep_false_positive(self, tmp_path):
+        (tmp_path / "rows.txt").write_text("foonbar\nVALID\n", encoding="utf-8")
+
+        res = _ops(tmp_path).search(
+            r"foo\nbar|VALID",
+            path=str(tmp_path),
+            target="content",
+        )
+
+        assert res.error is None
+        assert [match.content for match in res.matches] == ["VALID"]
+
     def test_literal_backslash_n_pattern_does_not_warn(self, match_tree):
         res = _ops(match_tree).search(
             r"absent\\npattern",

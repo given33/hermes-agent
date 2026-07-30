@@ -509,6 +509,24 @@ def test_keyword_date_source_and_type_filters(tmp_path):
     assert [item["id"] for item in library.list_files("account", date_from=parse_date_filter("2026-07-16"))[0]] == [second["id"]]
     assert [item["id"] for item in library.list_files("account", date_to=parse_date_filter("2026-07-15", end_of_day=True))[0]] == [first["id"]]
 
+    contract_kwargs = {"account_files_contract": True}
+    assert library.list_files("account", keyword="design-chat", **contract_kwargs)[0] == []
+    assert [item["id"] for item in library.list_files(
+        "account", keyword="document", **contract_kwargs
+    )[0]] == [first["id"]]
+    assert library.list_files("account", file_type="pdf", **contract_kwargs)[0] == []
+    assert [item["id"] for item in library.list_files(
+        "account", file_type="document", **contract_kwargs
+    )[0]] == [first["id"]]
+
+    with library.connection() as conn:
+        conn.execute(
+            "UPDATE account_files SET created_at=? WHERE id IN (?,?)",
+            (int(now[0]), first["id"], second["id"]),
+        )
+    tied = library.list_files("account", account_files_contract=True)[0]
+    assert [item["id"] for item in tied] == sorted([first["id"], second["id"]])
+
 
 def test_artifact_lifecycle_reserves_completes_fails_and_links(tmp_path):
     output_root = tmp_path / "outputs"

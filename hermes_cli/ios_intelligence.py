@@ -13,6 +13,7 @@ from datetime import datetime, timedelta
 import json
 import gzip
 import hashlib
+import logging
 import base64
 import hmac
 import math
@@ -38,6 +39,9 @@ from hermes_cli.account_identity import (
     public_owner_id as _public_owner,
     storage_account_generation as _storage_generation,
 )
+
+
+logger = logging.getLogger(__name__)
 
 
 WEATHER_MONTHLY_LIMIT = 30_000
@@ -1036,31 +1040,66 @@ class IOSIntelligenceStore:
         # fallback part of the account boundary.
         key_path = self.path.with_name(self.path.name + ".key")
         key_path.parent.mkdir(parents=True, exist_ok=True)
-        for _attempt in range(2):
+        value = secrets.token_urlsafe(48).encode("ascii")
+        candidate = key_path.with_name(
+            f".{key_path.name}.{os.getpid()}.{threading.get_ident()}."
+            f"{secrets.token_hex(8)}.tmp"
+        )
+        descriptor = os.open(
+            str(candidate), os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600
+        )
+        try:
+            with os.fdopen(descriptor, "wb") as handle:
+                descriptor = -1
+                handle.write(value)
+                handle.flush()
+                os.fsync(handle.fileno())
+            os.link(candidate, key_path)
+            self._fsync_directory(key_path.parent)
             try:
-                value = secrets.token_urlsafe(48).encode("ascii")
-                flags = os.O_CREAT | os.O_EXCL | os.O_WRONLY
-                fd = os.open(str(key_path), flags, 0o600)
-                try:
-                    os.write(fd, value)
-                finally:
-                    os.close(fd)
-                try:
-                    os.chmod(key_path, 0o600)
-                except OSError:
-                    pass
-                return value
-            except FileExistsError:
-                try:
-                    value = key_path.read_bytes().strip()
-                except OSError:
-                    continue
-                if value:
-                    return value
-                # An existing empty key cannot become usable by retrying the
-                # same read forever. Do not spin the startup thread.
-                raise RuntimeError(f"Master secret file is empty: {key_path}")
-        raise RuntimeError(f"Could not create master secret file: {key_path}")
+                os.chmod(key_path, 0o600)
+            except OSError:
+                pass
+            return value
+        except FileExistsError:
+            if key_path.is_symlink() or not key_path.is_file():
+                raise RuntimeError(f"Master secret path is unsafe: {key_path}")
+            try:
+                existing = key_path.read_bytes().strip()
+            except OSError as exc:
+                raise RuntimeError(f"Could not read master secret file: {key_path}") from exc
+            if existing:
+                self._fsync_directory(key_path.parent)
+                return existing
+            raise RuntimeError(f"Master secret file is empty: {key_path}")
+        finally:
+            if descriptor >= 0:
+                os.close(descriptor)
+            try:
+                candidate.unlink(missing_ok=True)
+            except OSError:
+                logger.warning(
+                    "Could not remove iOS sidecar key candidate %s",
+                    candidate,
+                    exc_info=True,
+                )
+
+    @staticmethod
+    def _fsync_directory(path: Path) -> None:
+        """Persist a published sidecar key directory entry where supported."""
+
+        try:
+            descriptor = os.open(path, os.O_RDONLY)
+        except OSError:
+            return
+        try:
+            os.fsync(descriptor)
+        except OSError:
+            # Windows does not expose directory handles through os.open.
+            if os.name != "nt":
+                raise
+        finally:
+            os.close(descriptor)
 
     @staticmethod
     def _is_hot_envelope(value: Any) -> bool:

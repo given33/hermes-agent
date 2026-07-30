@@ -46,6 +46,82 @@ def test_authenticated_artifact_endpoints_are_generation_scoped(tmp_path, monkey
     assert exc.value.status_code == 404
 
 
+def test_artifact_listing_combines_search_dates_and_filtered_total(tmp_path, monkeypatch):
+    store = EncryptedToolArtifactStore(tmp_path)
+    now = [1_800_000_000]
+    monkeypatch.setattr(
+        "hermes_services.tool_output_artifacts.time.time", lambda: now[0]
+    )
+    artifacts = []
+    for index, (created_at, tool_name) in enumerate(
+        (
+            (1_800_000_000, "terminal"),
+            (1_800_000_060, "Deploy Runner"),
+            (1_800_000_120, "deploy verifier"),
+            (1_800_000_180, "Deploy cleanup"),
+        )
+    ):
+        now[0] = created_at
+        artifacts.append(
+            store.put(
+                owner_id="alice",
+                account_generation="generation-2",
+                conversation_id=f"conversation-{index}",
+                turn_id=f"turn-{index}",
+                tool_call_id=f"tool-{index}",
+                tool_name=tool_name,
+                content=f"output-{index}",
+            )
+        )
+    now[0] = 1_800_000_200
+    monkeypatch.setattr(plugin_api, "get_hermes_home", lambda: str(tmp_path))
+    monkeypatch.setattr(plugin_api, "owner_id_from_request", lambda _request: "alice")
+    monkeypatch.setattr(
+        plugin_api, "_account_generation_for_owner", lambda _owner: "generation-2"
+    )
+
+    listing = plugin_api.list_tool_output_artifacts(
+        object(),
+        q="DEPLOY",
+        date_from="1800000060",
+        date_to="1800000120",
+        filter_contract="account-files-v1",
+        limit=1,
+    )
+
+    assert [item["id"] for item in listing["artifacts"]] == [artifacts[2]["id"]]
+    assert listing["total"] == 2
+    assert listing["limit"] == 1
+    assert listing["filter_contract"] == "account-files-v1"
+
+
+def test_artifact_listing_rejects_unknown_filter_contract(tmp_path, monkeypatch):
+    monkeypatch.setattr(plugin_api, "get_hermes_home", lambda: str(tmp_path))
+    monkeypatch.setattr(plugin_api, "owner_id_from_request", lambda _request: "alice")
+
+    with pytest.raises(HTTPException) as exc:
+        plugin_api.list_tool_output_artifacts(
+            object(), filter_contract="account-files-v2"
+        )
+
+    assert exc.value.status_code == 422
+
+
+def test_artifact_listing_rejects_reversed_dates(tmp_path, monkeypatch):
+    monkeypatch.setattr(plugin_api, "get_hermes_home", lambda: str(tmp_path))
+    monkeypatch.setattr(plugin_api, "owner_id_from_request", lambda _request: "alice")
+    monkeypatch.setattr(
+        plugin_api, "_account_generation_for_owner", lambda _owner: "generation-2"
+    )
+
+    with pytest.raises(HTTPException) as exc:
+        plugin_api.list_tool_output_artifacts(
+            object(), date_from="1800000120", date_to="1800000060"
+        )
+
+    assert exc.value.status_code == 422
+
+
 def test_authenticated_delete_only_removes_current_generation(tmp_path, monkeypatch):
     store = EncryptedToolArtifactStore(tmp_path)
     old = store.put(

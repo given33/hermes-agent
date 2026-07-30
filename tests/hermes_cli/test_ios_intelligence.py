@@ -40,6 +40,32 @@ def test_store_rejects_an_empty_sidecar_master_secret(tmp_path, monkeypatch):
         IOSIntelligenceStore(path)
 
 
+def test_sidecar_master_secret_syncs_directory_and_cleanup_is_best_effort(
+    tmp_path, monkeypatch
+):
+    path = tmp_path / "durable-master-secret.db"
+    synced = []
+    real_unlink = Path.unlink
+
+    monkeypatch.setattr(
+        IOSIntelligenceStore,
+        "_fsync_directory",
+        staticmethod(lambda directory: synced.append(Path(directory))),
+    )
+
+    def flaky_unlink(candidate, *args, **kwargs):
+        if candidate.name.startswith(f".{path.name}.key."):
+            raise PermissionError("busy test candidate")
+        return real_unlink(candidate, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "unlink", flaky_unlink)
+
+    instance = IOSIntelligenceStore(path)
+
+    assert instance._master_secret == path.with_name(path.name + ".key").read_bytes()
+    assert synced == [path.parent]
+
+
 def _location_event(event_id: str, *, latitude: float = 24.9, owner_time: int | None = None):
     return {
         "event_id": event_id,
@@ -634,6 +660,9 @@ def test_concurrent_store_initialization_serializes_schema_migrations(tmp_path):
         stores = list(pool.map(lambda _index: IOSIntelligenceStore(path), range(16)))
 
     assert all(item.path == path for item in stores)
+    secrets = {item._master_secret for item in stores}
+    assert len(secrets) == 1
+    assert path.with_name(path.name + ".key").read_bytes() in secrets
     with sqlite3.connect(path) as conn:
         assert conn.execute("PRAGMA user_version").fetchone()[0] == IOSIntelligenceStore.schema_version
 
