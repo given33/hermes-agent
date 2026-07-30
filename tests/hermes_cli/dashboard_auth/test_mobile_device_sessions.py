@@ -28,6 +28,37 @@ def _device(device_id: str, name: str) -> MobileDeviceInfo:
     )
 
 
+def test_custom_database_path_does_not_change_parent_permissions(tmp_path, monkeypatch):
+    db_path = tmp_path / "shared" / "mobile-auth.db"
+    calls = []
+    monkeypatch.setattr(
+        MobileDeviceStore,
+        "_restrict_permissions",
+        staticmethod(lambda path, mode: calls.append((path, mode))),
+    )
+
+    MobileDeviceStore(db_path).connect().close()
+
+    assert (db_path.parent, 0o700) not in calls
+    assert (db_path, 0o600) in calls
+
+
+def test_default_database_path_keeps_private_parent_permissions(tmp_path, monkeypatch):
+    db_path = tmp_path / "dashboard" / "mobile-auth.db"
+    calls = []
+    monkeypatch.setattr(mobile_device_store, "mobile_auth_db_path", lambda: db_path)
+    monkeypatch.setattr(
+        MobileDeviceStore,
+        "_restrict_permissions",
+        staticmethod(lambda path, mode: calls.append((path, mode))),
+    )
+
+    MobileDeviceStore().connect().close()
+
+    assert (db_path.parent, 0o700) in calls
+    assert (db_path, 0o600) in calls
+
+
 def test_tokens_are_hashed_and_survive_store_reopen(tmp_path):
     db_path = tmp_path / "mobile-auth.db"
     store = MobileDeviceStore(db_path)
@@ -831,6 +862,69 @@ def test_v6_migration_binds_devices_and_deletion_outbox_to_generation(tmp_path):
             "id,user_id,account_generation,owner_scope,available_at,requested_at,updated_at"
             ") VALUES('deletion-new','owner','acctgen_new','owner-scope',1,1,1)"
         )
+
+
+def test_v4_migration_creates_missing_account_generation_table(tmp_path):
+    db_path = tmp_path / "mobile-auth.db"
+    with sqlite3.connect(db_path) as conn:
+        conn.executescript(
+            """
+            CREATE TABLE mobile_devices (
+                id TEXT PRIMARY KEY, user_id TEXT NOT NULL, name TEXT NOT NULL,
+                model TEXT NOT NULL DEFAULT '', os_version TEXT NOT NULL DEFAULT '',
+                app_version TEXT NOT NULL DEFAULT '', created_at INTEGER NOT NULL,
+                updated_at INTEGER NOT NULL, last_seen_at INTEGER NOT NULL,
+                revoked_at INTEGER, revoke_reason TEXT NOT NULL DEFAULT ''
+            );
+            CREATE TABLE mobile_sessions (
+                id TEXT PRIMARY KEY, device_id TEXT NOT NULL REFERENCES mobile_devices(id),
+                user_id TEXT NOT NULL, access_token_hash TEXT NOT NULL UNIQUE,
+                refresh_token_hash TEXT NOT NULL UNIQUE,
+                access_expires_at INTEGER NOT NULL, refresh_expires_at INTEGER NOT NULL,
+                created_at INTEGER NOT NULL, updated_at INTEGER NOT NULL,
+                last_seen_at INTEGER NOT NULL, revoked_at INTEGER,
+                revoke_reason TEXT NOT NULL DEFAULT ''
+            );
+            CREATE TABLE mobile_account_deletion_outbox (
+                id TEXT PRIMARY KEY, user_id TEXT NOT NULL UNIQUE,
+                owner_scope TEXT NOT NULL, state TEXT NOT NULL DEFAULT 'pending',
+                device_deliveries_json TEXT NOT NULL DEFAULT '{}',
+                attempts INTEGER NOT NULL DEFAULT 0, available_at INTEGER NOT NULL,
+                lease_token TEXT NOT NULL DEFAULT '', leased_until INTEGER NOT NULL DEFAULT 0,
+                requested_at INTEGER NOT NULL, updated_at INTEGER NOT NULL,
+                completed_at INTEGER, last_error TEXT NOT NULL DEFAULT ''
+            );
+            CREATE INDEX idx_mobile_account_deletion_due
+                ON mobile_account_deletion_outbox(state, available_at, leased_until);
+            INSERT INTO mobile_devices VALUES(
+                'device-old','owner','Old iPhone','','','',1,1,1,NULL,''
+            );
+            INSERT INTO mobile_sessions VALUES(
+                'session-old','device-old','owner','access-hash','refresh-hash',
+                999,999,1,1,1,NULL,''
+            );
+            INSERT INTO mobile_account_deletion_outbox VALUES(
+                'deletion-old','owner','owner-scope','pending','{}',0,1,'',0,1,1,NULL,''
+            );
+            PRAGMA user_version=4;
+            """
+        )
+
+    with MobileDeviceStore(db_path).connection() as conn:
+        assert conn.execute("PRAGMA user_version").fetchone()[0] == 7
+        assert conn.execute(
+            "SELECT generation FROM mobile_account_generations"
+        ).fetchall() == []
+        assert conn.execute(
+            "SELECT account_generation FROM mobile_sessions WHERE id='session-old'"
+        ).fetchone()[0] == ""
+        assert conn.execute(
+            "SELECT account_generation FROM mobile_devices WHERE id='device-old'"
+        ).fetchone()[0] == "legacy"
+        assert conn.execute(
+            "SELECT account_generation FROM mobile_account_deletion_outbox "
+            "WHERE id='deletion-old'"
+        ).fetchone()[0] == "legacy"
 
 
 def test_schema_initialization_is_idempotent_and_preserves_rows(tmp_path):

@@ -199,13 +199,15 @@ class MobileDeviceStore:
         *,
         clock: Callable[[], int] = _now,
     ) -> None:
+        self._manage_parent_permissions = db_path is None
         self.db_path = db_path if db_path is not None else mobile_auth_db_path()
         self._clock = clock
 
     def connect(self) -> sqlite3.Connection:
         path = self.db_path
         path.parent.mkdir(parents=True, exist_ok=True)
-        self._restrict_permissions(path.parent, 0o700)
+        if self._manage_parent_permissions:
+            self._restrict_permissions(path.parent, 0o700)
         conn = sqlite3.connect(str(path), timeout=30.0)
         try:
             conn.row_factory = sqlite3.Row
@@ -233,6 +235,17 @@ class MobileDeviceStore:
                     "TEXT NOT NULL DEFAULT ''"
                 )
             if current_version < 7:
+                # Some pre-v7 databases contain the deletion outbox but not
+                # the generation lookup table. The v7 outbox rebuild queries
+                # that table, so create this additive dependency before the
+                # data migration; the complete schema and indexes are applied
+                # immediately afterwards.
+                conn.execute(
+                    "CREATE TABLE IF NOT EXISTS mobile_account_generations ("
+                    "user_id TEXT PRIMARY KEY COLLATE NOCASE,"
+                    "generation TEXT NOT NULL UNIQUE,"
+                    "created_at INTEGER NOT NULL)"
+                )
                 self._migrate_generation_boundaries_v7(conn)
             conn.executescript(_SCHEMA_SQL)
             if current_version < SCHEMA_VERSION:
