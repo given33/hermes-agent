@@ -251,25 +251,12 @@ class _WindowsJob:
             self._handle = None
 
 
-def _resolve_isolated_handler(identity: dict) -> tuple[Callable[..., Any], bool]:
-    """Resolve a registry handler by name inside the fresh worker process."""
-
-    try:
-        from tools.registry import registry
-        from tools.registry import ToolRegistryResolutionError
-
-        return registry.resolve_handler_for_isolation(identity)
-    except ToolRegistryResolutionError as exc:
-        raise ToolIsolationResolutionError(str(exc)) from exc
-    except ToolIsolationResolutionError:
-        raise
-    except Exception as exc:
-        raise ToolIsolationResolutionError(
-            f"isolated registry resolver failed: {type(exc).__name__}: {exc}"
-        ) from exc
-
-
-def _isolated_handler_main(send_connection, start_connection, payload: bytes) -> None:
+def _isolated_handler_main(
+    send_connection,
+    start_connection,
+    payload: bytes,
+    handler_resolver: Callable[[dict], tuple[Callable[..., Any], bool]],
+) -> None:
     """Deserialize identity/arguments and execute inside a disposable child."""
 
     try:
@@ -283,7 +270,7 @@ def _isolated_handler_main(send_connection, start_connection, payload: bytes) ->
         # this worker's group so an outer isolation deadline owns that tree.
         os.environ["HERMES_TOOL_ISOLATION"] = "1"
         identity, args, kwargs = pickle.loads(payload)
-        handler, is_async = _resolve_isolated_handler(identity)
+        handler, is_async = handler_resolver(identity)
         send_connection.send(("ready",))
         result = handler(args, **kwargs)
         if is_async:
@@ -350,15 +337,14 @@ def _poll_interruptibly(
     timeout_seconds: float,
     tool_name: str,
     phase: str,
+    interrupt_check: Callable[[], bool],
     windows_job: _WindowsJob | None = None,
 ) -> bool:
     """Wait for one pipe envelope while honoring the caller thread's cancel bit."""
 
-    from tools.interrupt import is_interrupted
-
     deadline = time.monotonic() + max(0.0, float(timeout_seconds))
     while True:
-        if is_interrupted():
+        if interrupt_check():
             _stop_process(process, windows_job=windows_job)
             raise ToolIsolationCancelled(
                 f"Tool '{tool_name}' was cancelled during isolated {phase}"
@@ -381,6 +367,8 @@ def run_tool_handler_isolated(
     *,
     timeout_seconds: float,
     tool_name: str,
+    handler_resolver: Callable[[dict], tuple[Callable[..., Any], bool]],
+    interrupt_check: Callable[[], bool],
 ) -> Any:
     """Run a registry handler by stable identity in a killable child process.
 
@@ -426,7 +414,7 @@ def run_tool_handler_isolated(
     windows_job = _WindowsJob() if os.name == "nt" else None
     process = context.Process(
         target=_isolated_handler_main,
-        args=(send_connection, start_receive, payload),
+        args=(send_connection, start_receive, payload, handler_resolver),
         name=f"hermes-tool-{tool_name[:32]}",
         daemon=True,
     )
@@ -456,6 +444,7 @@ def run_tool_handler_isolated(
             timeout_seconds=min(_PROCESS_START_TIMEOUT_SECONDS, _remaining()),
             tool_name=tool_name,
             phase="startup",
+            interrupt_check=interrupt_check,
             windows_job=windows_job,
         ):
             _stop_process(process, windows_job=windows_job)
@@ -491,6 +480,7 @@ def run_tool_handler_isolated(
             timeout_seconds=min(_PROCESS_START_TIMEOUT_SECONDS, _remaining()),
             tool_name=tool_name,
             phase="startup",
+            interrupt_check=interrupt_check,
             windows_job=windows_job,
         ):
             _stop_process(process, windows_job=windows_job)
@@ -529,6 +519,7 @@ def run_tool_handler_isolated(
             timeout_seconds=_remaining(),
             tool_name=tool_name,
             phase="execution",
+            interrupt_check=interrupt_check,
             windows_job=windows_job,
         ):
             _stop_process(process, windows_job=windows_job)

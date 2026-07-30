@@ -81,7 +81,6 @@ except ModuleNotFoundError as exc:
     owner_id_from_request = runtime_library.owner_id_from_request
     parse_date_filter = runtime_library.parse_date_filter
 from hermes_runtime.config import get_hermes_home
-from hermes_cli.account_lifecycle import account_lifecycle_commit_guard
 from hermes_cli.profiles import list_profiles
 from hermes_services.hosted_event_protocol import (
     append_hosted_event as _append_hosted_event_protocol,
@@ -107,16 +106,23 @@ _ACCOUNT_DELETION_STORE_LOCK = threading.Lock()
 _ACCOUNT_DELETION_STORES: dict[str, Any] = {}
 
 
+def _backend_api():
+    from hermes_cli import collaboration_plugin_backend
+
+    return collaboration_plugin_backend
+
+
 def _account_generation_for_owner(owner_id: str) -> str:
     normalized = str(owner_id or "").strip()
     if normalized == LOCAL_OWNER_ID:
         return "local-owner-generation"
     if not normalized:
         raise RuntimeError("authenticated owner generation is required")
-    from hermes_cli.dashboard_auth.mobile_device_store import MobileDeviceStore
-
     try:
-        return MobileDeviceStore().account_generation(normalized, create=True)
+        return _backend_api().MobileDeviceStore().account_generation(
+            normalized,
+            create=True,
+        )
     except PermissionError as exc:
         raise HTTPException(
             status_code=410,
@@ -1275,10 +1281,8 @@ def _merge_authoritative_account_deletion_intents(
     }
     if not account_scopes:
         return
-    from hermes_cli.ios_intelligence import IOSIntelligenceStore
-    from hermes_cli.ios_intelligence_config import load_ios_intelligence_config
-
-    configured = str(load_ios_intelligence_config().database_path or "").strip()
+    backend = _backend_api()
+    configured = str(backend.load_ios_intelligence_config().database_path or "").strip()
     root = Path(get_hermes_home())
     database_path = Path(configured).expanduser() if configured else root
     if not database_path.is_absolute():
@@ -1287,7 +1291,7 @@ def _merge_authoritative_account_deletion_intents(
     with _ACCOUNT_DELETION_STORE_LOCK:
         deletion_store = _ACCOUNT_DELETION_STORES.get(resolved_key)
         if deletion_store is None:
-            deletion_store = IOSIntelligenceStore(database_path)
+            deletion_store = backend.IOSIntelligenceStore(database_path)
             _ACCOUNT_DELETION_STORES[resolved_key] = deletion_store
     for owner, record_generation in account_scopes:
         intent = deletion_store.account_deletion_status(
@@ -1514,7 +1518,7 @@ def _load_state_store(
     # Recovery can persist an outbox ACK, so readers share the same critical
     # section as writers rather than allowing a stale read to overwrite a newer
     # conversation document.
-    with account_lifecycle_commit_guard():
+    with _backend_api().account_lifecycle_commit_guard():
         with _STATE_LOCK:
             return _load_state_store_locked(
                 target,
@@ -1827,7 +1831,7 @@ def compact_conversation_title(conversation: dict[str, Any]) -> bool:
 
 def save_state(state: dict[str, Any], path: Optional[Path] = None) -> None:
     target = path or state_path()
-    with account_lifecycle_commit_guard():
+    with _backend_api().account_lifecycle_commit_guard():
         with _STATE_LOCK:
             if not bool(getattr(_COLLABORATION_DELETION_WRITE, "active", False)):
                 current = (
@@ -1847,7 +1851,7 @@ def save_state(state: dict[str, Any], path: Optional[Path] = None) -> None:
 
 def save_single_state(state: dict[str, Any], path: Optional[Path] = None) -> None:
     target = path or single_state_path()
-    with account_lifecycle_commit_guard():
+    with _backend_api().account_lifecycle_commit_guard():
         with _STATE_LOCK:
             if not bool(getattr(_COLLABORATION_DELETION_WRITE, "active", False)):
                 current = (
@@ -2015,8 +2019,6 @@ def delete_owner_account_data(
         with _collaboration_deletion_write():
             save_state(room_state)
 
-    from hermes_cli.managed_installations import delete_owner_managed_resources
-
     return {
         "conversations": len(conversation_ids),
         "rooms": removed_rooms,
@@ -2031,7 +2033,7 @@ def delete_owner_account_data(
             normalized_owner,
             account_generation=normalized_generation,
         ),
-        "managed_resources": delete_owner_managed_resources(
+        "managed_resources": _backend_api().delete_owner_managed_resources(
             normalized_owner,
             account_generation=normalized_generation,
         ),
@@ -2246,10 +2248,9 @@ def mark_conversation_runtime_run(
 
 
 def _load_runtime_messages(profile: str, session_id: str) -> list[dict[str, Any]]:
-    from hermes_cli.profiles import get_profile_dir
     from hermes_state import SessionDB
 
-    db_path = get_profile_dir(profile) / "state.db"
+    db_path = _backend_api().get_profile_dir(profile) / "state.db"
     if not db_path.exists():
         return []
     db = SessionDB(db_path=db_path, read_only=True)
@@ -2271,13 +2272,12 @@ def _runtime_session_boundary(
 ) -> dict[str, Any]:
     """Return exact active-message boundaries from the authoritative SessionDB."""
 
-    from hermes_cli.profiles import get_profile_dir
     from hermes_state import SessionDB
 
     normalized = str(session_id or "").strip()
     if not normalized:
         return {"session_id": "", "user_message_id": None, "tip_message_id": None}
-    db_path = get_profile_dir(profile.strip() or "default") / "state.db"
+    db_path = _backend_api().get_profile_dir(profile.strip() or "default") / "state.db"
     if not db_path.exists():
         return {"session_id": "", "user_message_id": None, "tip_message_id": None}
     db = SessionDB(db_path=db_path, read_only=True)
@@ -2311,13 +2311,12 @@ def _runtime_session_boundary(
 
 
 def _delete_runtime_session(profile: str, session_id: str) -> bool:
-    from hermes_cli.profiles import get_profile_dir
     from hermes_state import SessionDB
 
     normalized_session_id = session_id.strip()
     if not normalized_session_id:
         return False
-    db_path = get_profile_dir(profile.strip() or "default") / "state.db"
+    db_path = _backend_api().get_profile_dir(profile.strip() or "default") / "state.db"
     if not db_path.exists():
         return False
     db = SessionDB(db_path=db_path)
@@ -5662,11 +5661,9 @@ def run_profile_turn(
             artifact_context.get("account_generation") or ""
         ).strip()
         if runtime_owner and runtime_owner != LOCAL_OWNER_ID:
-            from hermes_cli.managed_installations import managed_account_runtime_home
-
             try:
                 runtime_home = str(
-                    managed_account_runtime_home(
+                    _backend_api().managed_account_runtime_home(
                         runtime_owner,
                         runtime_generation,
                         profile,
@@ -12981,29 +12978,20 @@ def connector_deployment_health(request: Request) -> dict[str, Any]:
     """Prove release identity and every deployment-owned SQLite schema."""
 
     connector = connector_health(request)
-    from hermes_cli.cloud_file_library import SCHEMA_VERSION as cloud_schema_version
-    from hermes_cli.dashboard_auth.mobile_device_store import (
-        MobileDeviceStore,
-        SCHEMA_VERSION as mobile_schema_version,
-    )
-    from hermes_cli.managed_installations import (
-        MANAGED_INSTALLATIONS_SCHEMA_VERSION,
-        connect_managed_installations_database,
-        managed_installations_db_path,
-    )
+    backend = _backend_api()
 
     library = _file_library()
     with library.connection() as cloud_conn:
         cloud = _deployment_sqlite_health(
             cloud_conn,
-            code_schema_version=cloud_schema_version,
+            code_schema_version=backend.CLOUD_FILE_SCHEMA_VERSION,
             required_tables=("account_files", "file_install_intents"),
         )
-    mobile_conn = MobileDeviceStore().connect()
+    mobile_conn = backend.MobileDeviceStore().connect()
     try:
         mobile = _deployment_sqlite_health(
             mobile_conn,
-            code_schema_version=mobile_schema_version,
+            code_schema_version=backend.MOBILE_DEVICE_SCHEMA_VERSION,
             required_tables=(
                 "mobile_devices",
                 "mobile_sessions",
@@ -13012,13 +13000,13 @@ def connector_deployment_health(request: Request) -> dict[str, Any]:
         )
     finally:
         mobile_conn.close()
-    managed_conn = connect_managed_installations_database(
-        managed_installations_db_path()
+    managed_conn = backend.connect_managed_installations_database(
+        backend.managed_installations_db_path()
     )
     try:
         managed = _deployment_sqlite_health(
             managed_conn,
-            code_schema_version=MANAGED_INSTALLATIONS_SCHEMA_VERSION,
+            code_schema_version=backend.MANAGED_INSTALLATIONS_SCHEMA_VERSION,
             required_tables=(
                 "managed_installations",
                 "managed_installation_targets",
@@ -16315,32 +16303,26 @@ def _discover_profile_toolsets(
 ) -> list[str]:
     """Connect only route-selected MCPs before taking the hosted tool snapshot."""
 
-    from hermes_cli.tools_config import _get_platform_tools, enabled_mcp_server_names
-    from tools.mcp_tool import (
-        discover_mcp_tools,
-        get_mcp_availability,
-        select_mcp_servers_for_capabilities,
-    )
-
+    backend = _backend_api()
     hints = [str(item) for item in (capability_hints or []) if str(item).strip()]
     configured = config.get("mcp_servers") if isinstance(config, dict) else {}
     configured = configured if isinstance(configured, dict) else {}
-    selected = select_mcp_servers_for_capabilities(configured, hints)
-    discover_mcp_tools(capability_hints=hints)
+    selected = backend.select_mcp_servers_for_capabilities(configured, hints)
+    backend.discover_mcp_tools(capability_hints=hints)
     live_selected = {
         snapshot.name
-        for snapshot in get_mcp_availability()
+        for snapshot in backend.get_mcp_availability()
         if snapshot.live
         and snapshot.registered_tools
         and snapshot.name in selected
     }
     base_toolsets = set(
-        _get_platform_tools(
+        backend._get_platform_tools(
             config,
             "cli",
             include_default_mcp_servers=False,
         )
-    ) - enabled_mcp_server_names(config)
+    ) - backend.enabled_mcp_server_names(config)
     return sorted(base_toolsets | live_selected)
 
 
@@ -16400,20 +16382,16 @@ def _profile_event_runner_main() -> int:
         # enabled_toolsets are only registry aliases; discovery must connect
         # and register their schemas before AIAgent snapshots its tool list.
         enabled_toolsets = _discover_profile_toolsets(cfg, capability_hints)
-        from tools.mcp_tool import (
-            get_mcp_availability,
-            select_mcp_servers_for_capabilities,
-        )
-
+        backend = _backend_api()
         selected_mcp_names = set(
-            select_mcp_servers_for_capabilities(
+            backend.select_mcp_servers_for_capabilities(
                 cfg.get("mcp_servers") or {},
                 capability_hints,
             )
         )
         mcp_availability = [
             snapshot.as_dict()
-            for snapshot in get_mcp_availability()
+            for snapshot in backend.get_mcp_availability()
             if snapshot.name in selected_mcp_names
         ]
         managed_mcp_servers = sorted(
@@ -17433,12 +17411,10 @@ def create_mobile_managed_installation(
 ):
     """Create one fleet operation inside the authenticated account boundary."""
 
-    from hermes_cli.managed_installations import create_managed_installation
-
     owner_id = owner_id_from_request(request)
     account_generation = _account_generation_for_request(request, owner_id)
     try:
-        operation = create_managed_installation(
+        operation = _backend_api().create_managed_installation(
             kind=body.kind,
             identifier=body.identifier,
             profile=body.profile,
@@ -17466,12 +17442,10 @@ def list_mobile_managed_installations(
     profile: str = "",
     limit: int = 50,
 ):
-    from hermes_cli.managed_installations import list_managed_installations
-
     owner_id = owner_id_from_request(request)
     account_generation = _account_generation_for_request(request, owner_id)
     try:
-        return list_managed_installations(
+        return _backend_api().list_managed_installations(
             kind=kind,
             profile=profile,
             limit=limit,
@@ -17484,12 +17458,10 @@ def list_mobile_managed_installations(
 
 @router.get("/managed-installations/{operation_id}")
 def get_mobile_managed_installation(operation_id: str, request: Request):
-    from hermes_cli.managed_installations import get_managed_installation
-
     owner_id = owner_id_from_request(request)
     account_generation = _account_generation_for_request(request, owner_id)
     try:
-        return get_managed_installation(
+        return _backend_api().get_managed_installation(
             operation_id,
             owner_id=owner_id,
             account_generation=account_generation,
@@ -17504,12 +17476,10 @@ def rollback_mobile_managed_installation(
     body: MobileManagedInstallationRollbackBody,
     request: Request,
 ):
-    from hermes_cli.managed_installations import rollback_managed_installation
-
     owner_id = owner_id_from_request(request)
     account_generation = _account_generation_for_request(request, owner_id)
     try:
-        operation = rollback_managed_installation(
+        operation = _backend_api().rollback_managed_installation(
             operation_id,
             request_id=body.request_id,
             owner_id=owner_id,
@@ -17533,9 +17503,7 @@ def list_mobile_managed_resources(
     owner_id = owner_id_from_request(request)
     account_generation = _account_generation_for_request(request, owner_id)
     try:
-        from hermes_cli.managed_installations import list_managed_resources
-
-        return list_managed_resources(
+        return _backend_api().list_managed_resources(
             since_cursor=cursor,
             limit=limit,
             owner_id=owner_id,
@@ -17561,8 +17529,6 @@ async def stream_mobile_managed_resources(request: Request):
         raise HTTPException(status_code=422, detail="cursor must be a non-negative integer") from exc
 
     async def event_stream():
-        from hermes_cli.managed_installations import list_managed_resources
-
         delivered_cursor = requested_cursor
         initial = True
         last_frame_at = time.monotonic()
@@ -17570,7 +17536,7 @@ async def stream_mobile_managed_resources(request: Request):
             if _account_generation_for_owner(owner_id) != account_generation:
                 return
             page = await asyncio.to_thread(
-                list_managed_resources,
+                _backend_api().list_managed_resources,
                 since_cursor=delivered_cursor,
                 limit=500,
                 owner_id=owner_id,
@@ -17754,11 +17720,10 @@ class MobileHostedRetryBody(BaseModel):
 
 
 def _mobile_profile_home(profile: str) -> tuple[str, Path]:
-    from hermes_cli.profiles import normalize_profile_name, resolve_profile_env
-
+    backend = _backend_api()
     try:
-        normalized = normalize_profile_name(profile or "default")
-        return normalized, Path(resolve_profile_env(normalized))
+        normalized = backend.normalize_profile_name(profile or "default")
+        return normalized, Path(backend.resolve_profile_env(normalized))
     except (FileNotFoundError, ValueError) as exc:
         raise HTTPException(status_code=404, detail="Profile not found") from exc
 
@@ -18589,16 +18554,13 @@ class MobileConsoleCompletionBody(BaseModel):
 def mobile_console_commands(request: Request, profile: str = "default"):
     """Return the server-owned command catalog available to Hermes iOS."""
 
-    from hermes_cli.mobile_console import mobile_console_catalog
-
     owner_id_from_request(request)
-    from hermes_cli.profiles import normalize_profile_name
-
+    backend = _backend_api()
     try:
-        normalized = normalize_profile_name(profile or "default")
+        normalized = backend.normalize_profile_name(profile or "default")
     except ValueError as exc:
         raise HTTPException(status_code=422, detail="Invalid Profile name") from exc
-    return {"profile": normalized, "commands": mobile_console_catalog()}
+    return {"profile": normalized, "commands": backend.mobile_console_catalog()}
 
 
 @router.post("/mobile/console/execute")
@@ -18608,18 +18570,15 @@ def mobile_console_execute(
 ):
     """Execute one bounded command inside the authenticated Profile scope."""
 
-    from hermes_cli.mobile_console import execute_mobile_console_command
-
     owner_id_from_request(request)
-    from hermes_cli.profiles import normalize_profile_name
-
+    backend = _backend_api()
     try:
-        normalized = normalize_profile_name(body.profile or "default")
+        normalized = backend.normalize_profile_name(body.profile or "default")
     except ValueError as exc:
         raise HTTPException(status_code=422, detail="Invalid Profile name") from exc
     if len(body.line.encode("utf-8")) > 4096:
         raise HTTPException(status_code=413, detail="Console command is too large")
-    result = execute_mobile_console_command(
+    result = backend.execute_mobile_console_command(
         body.line,
         confirmed=body.confirmed,
         profile=normalized,
@@ -18640,20 +18599,17 @@ def mobile_console_completion_candidates(
 ):
     """Complete mobile command arguments without local path or shell lookup."""
 
-    from hermes_cli.mobile_console import mobile_console_completions
-
     owner_id_from_request(request)
-    from hermes_cli.profiles import normalize_profile_name
-
+    backend = _backend_api()
     try:
-        normalized = normalize_profile_name(body.profile or "default")
+        normalized = backend.normalize_profile_name(body.profile or "default")
     except ValueError as exc:
         raise HTTPException(status_code=422, detail="Invalid Profile name") from exc
     if len(body.line.encode("utf-8")) > 4096:
         raise HTTPException(status_code=413, detail="Console completion input is too large")
     return {
         "profile": normalized,
-        **mobile_console_completions(
+        **backend.mobile_console_completions(
             body.line,
             profile=normalized,
             limit=body.limit,

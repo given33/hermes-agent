@@ -43,6 +43,7 @@ import sqlite3
 from collections import OrderedDict
 from contextvars import copy_context
 from pathlib import Path
+from hermes_services.startup import bootstrap_trusted_runtime
 from datetime import datetime
 from typing import Awaitable, Callable, Dict, Optional, Any, List, Union
 
@@ -7446,8 +7447,6 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         
         # Seal trusted internal hooks at the gateway's production startup
         # boundary before any dynamic plugin or user-hook code is imported.
-        from hermes_services.startup import bootstrap_trusted_runtime
-
         bootstrap_trusted_runtime()
 
         # Discover Python plugins before shell hooks so plugin block

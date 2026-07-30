@@ -41,6 +41,7 @@ from typing import Any, Optional, Tuple
 
 from agent.context_engine import sanitize_memory_context
 from agent.model_metadata import estimate_request_tokens_rough
+from hermes_services.internal_hooks import has_internal_hooks, run_internal_hooks
 
 logger = logging.getLogger(__name__)
 
@@ -1031,8 +1032,6 @@ def compress_context(
             except Exception:
                 pass
 
-        from hermes_services.internal_hooks import has_internal_hooks, run_internal_hooks
-
         _compression_hook_trace = []
         if has_internal_hooks("before_context_compaction"):
             _compression_hook_result = run_internal_hooks(
@@ -1170,7 +1169,7 @@ def compress_context(
                     if isinstance(item, dict)
                     and item.get(summary_marker)
                 ),
-                compressed[0] if isinstance(compressed[0], dict) else None,
+                compressed[0] if compressed and isinstance(compressed[0], dict) else None,
             )
             if isinstance(trace_target, dict):
                 trace_target["hook_trace"] = list(_compression_hook_trace)

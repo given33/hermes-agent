@@ -30,6 +30,7 @@ from typing import Any, Dict, List, Optional
 from agent.codex_responses_adapter import _summarize_user_message_for_log
 from agent.conversation_compression import conversation_history_after_compression
 from agent.display import KawaiiSpinner
+from hermes_services.internal_hooks import run_internal_hooks
 from agent.error_classifier import FailoverReason, classify_api_error
 from agent.iteration_budget import IterationBudget
 from agent.turn_context import (
@@ -1359,8 +1360,6 @@ def run_conversation(
                 except Exception:
                     _original_api_kwargs = dict(api_kwargs)
                     _llm_middleware_trace = []
-
-                from hermes_services.internal_hooks import run_internal_hooks
 
                 _request_hook_result = run_internal_hooks(
                     "before_model_request",
@@ -4526,8 +4525,6 @@ def run_conversation(
                     assistant_message.content = "\n".join(parts)
                 else:
                     assistant_message.content = str(raw)
-
-            from hermes_services.internal_hooks import run_internal_hooks
 
             _response_hook_result = run_internal_hooks(
                 "after_provider_response",

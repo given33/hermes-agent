@@ -165,6 +165,33 @@ class TestMemoryPluginCliDiscovery:
 
         assert len(cmds) == 0
 
+    def test_non_honcho_provider_never_inherits_honcho_handler(
+        self, tmp_path, monkeypatch
+    ):
+        plugin_dir = tmp_path / "custommemory"
+        plugin_dir.mkdir()
+        (plugin_dir / "__init__.py").write_text("pass\n")
+        (plugin_dir / "cli.py").write_text(
+            "def register_cli(subparser):\n    pass\n"
+            "def honcho_command(args):\n    raise AssertionError('wrong provider')\n"
+        )
+
+        import plugins.memory as pm
+
+        original_dir = pm._MEMORY_PLUGINS_DIR
+        module_name = "plugins.memory.custommemory.cli"
+        sys.modules.pop(module_name, None)
+        monkeypatch.setattr(pm, "_MEMORY_PLUGINS_DIR", tmp_path)
+        monkeypatch.setattr(pm, "_get_active_memory_provider", lambda: "custommemory")
+        try:
+            commands = pm.discover_plugin_cli_commands()
+        finally:
+            monkeypatch.setattr(pm, "_MEMORY_PLUGINS_DIR", original_dir)
+            sys.modules.pop(module_name, None)
+
+        assert len(commands) == 1
+        assert commands[0]["handler_fn"] is None
+
 
 # ── Honcho register_cli ──────────────────────────────────────────────────
 

@@ -107,9 +107,12 @@ runtime_files=(
   "hermes_services/tool_output_artifacts.py"
   "hermes_cli/account_identity.py"
   "hermes_cli/account_lifecycle.py"
+  "hermes_cli/collaboration_plugin_backend.py"
+  "hermes_cli/ios_plugin_backend.py"
   "hermes_cli/account_session_facade.py"
   "hermes_cli/account_write_approvals.py"
   "hermes_cli/mobile_console.py"
+  "plugins/account_cleanup_backend.py"
 )
 nginx_files=(
   "deploy/public/nginx-00-hermes-security.conf"

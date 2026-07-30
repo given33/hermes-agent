@@ -33,6 +33,7 @@ from urllib.request import Request, urlopen
 from uuid import uuid4
 
 from hermes_constants import get_hermes_home
+from hermes_runtime.config import read_raw_config_strict
 from hermes_services.resource_catalog import (
     ResourceRecord,
     resolve_resource_collisions,
@@ -512,15 +513,13 @@ def _account_runtime_lock(
 
 
 def _read_yaml_mapping(path: Path, *, label: str) -> dict[str, Any]:
-    import yaml
-
     if not path.exists():
         return {}
     if path.is_symlink() or not path.is_file():
         raise RuntimeError(f"{label} path is unsafe")
     try:
-        value = yaml.safe_load(path.read_text(encoding="utf-8")) or {}
-    except (OSError, UnicodeDecodeError, yaml.YAMLError) as exc:
+        value = read_raw_config_strict(config_path=path)
+    except Exception as exc:
         raise RuntimeError(f"{label} cannot be read") from exc
     if not isinstance(value, dict):
         raise RuntimeError(f"{label} must contain a mapping")
@@ -2056,17 +2055,16 @@ def _installed_mcp_proof(
     *,
     probe_health: bool = False,
 ) -> dict[str, Any]:
-    import yaml
     from hermes_cli.mcp_catalog import _build_server_config, get_entry
 
     entry = get_entry(identifier)
     if entry is None:
         raise RuntimeError("installed MCP is not present in the managed catalog")
     config_path = profile_home / "config.yaml"
-    try:
-        config = yaml.safe_load(config_path.read_text(encoding="utf-8")) or {}
-    except (OSError, UnicodeDecodeError, yaml.YAMLError) as exc:
-        raise RuntimeError("installed MCP configuration cannot be read") from exc
+    config = _read_yaml_mapping(
+        config_path,
+        label="installed MCP configuration",
+    )
     servers = config.get("mcp_servers") if isinstance(config, dict) else None
     actual = servers.get(entry.name) if isinstance(servers, dict) else None
     if not isinstance(actual, dict):

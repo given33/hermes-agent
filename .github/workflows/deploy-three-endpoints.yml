@@ -1,10 +1,8 @@
 name: Deploy three Hermes endpoints
 
 on:
-  workflow_run:
-    workflows: [CI]
+  push:
     branches: [main]
-    types: [completed]
   schedule:
     - cron: '17 */2 * * *'
   workflow_dispatch:
@@ -17,15 +15,46 @@ concurrency:
   cancel-in-progress: false
 
 jobs:
+  verify:
+    name: Verify production backend release
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+      - uses: astral-sh/setup-uv@fac544c07dec837d0ccb6301d7b5580bf5edae39 # 8.2.0
+        with:
+          enable-cache: true
+          cache-dependency-glob: uv.lock
+      - name: Install the locked backend environment
+        run: uv sync --locked --python 3.11 --extra all --extra dev
+      - name: Verify deployable backend boundaries
+        run: |
+          uv run ruff check \
+            agent gateway hermes_cli hermes_services plugins tools utils.py
+          uv run pytest -q \
+            tests/deploy/test_cloud_deployment_assets.py \
+            tests/architecture/test_bare_config_reads.py \
+            tests/architecture/test_layering_policy.py \
+            tests/architecture/test_dependency_direction.py \
+            tests/hermes_services/test_tool_contract.py \
+            tests/hermes_services/test_internal_hooks.py \
+            tests/run_agent/test_tool_batch_segmentation.py \
+            tests/hermes_cli/test_account_cleanup.py \
+            tests/hermes_cli/test_ios_intelligence.py \
+            tests/hermes_cli/test_plugin_cli_registration.py \
+            tests/gateway/test_hooks.py \
+            tests/gateway/test_weixin.py::TestWeixinStatePersistence \
+            tests/plugins/memory/test_hindsight_provider.py \
+            tests/plugins/test_collaboration_ios_contract.py \
+            tests/tools/test_windows_compat.py
+
   deploy-public:
-    if: github.event_name != 'workflow_run' || github.event.workflow_run.conclusion == 'success'
+    needs: verify
     runs-on: ubuntu-latest
     timeout-minutes: 30
     environment: production
     steps:
-      - uses: actions/checkout@v4
-        with:
-          ref: ${{ github.event.workflow_run.head_sha || 'main' }}
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
       - name: Configure pinned deployment SSH identity
         env:
           DEPLOY_KEY: ${{ secrets.HERMES_PUBLIC_SSH_KEY }}
@@ -43,13 +72,13 @@ jobs:
           HERMES_SSH_IDENTITY: ${{ runner.temp }}/ssh/id_ed25519
           HERMES_SSH_KNOWN_HOSTS: ${{ runner.temp }}/ssh/known_hosts
           HERMES_REQUIRE_PINNED_SSH_HOST_KEY: '1'
-          HERMES_RELEASE_COMMIT: ${{ github.event.workflow_run.head_sha || github.sha }}
+          HERMES_RELEASE_COMMIT: ${{ github.sha }}
         run: |
           bash deploy/public/deploy-collaboration-backend.sh
       - name: Verify the public release evidence
         env:
           REMOTE: ${{ secrets.HERMES_PUBLIC_USER }}@${{ secrets.HERMES_PUBLIC_HOST }}
-          EXPECTED_COMMIT: ${{ github.event.workflow_run.head_sha || github.sha }}
+          EXPECTED_COMMIT: ${{ github.sha }}
         run: |
           evidence="$(ssh -i "$RUNNER_TEMP/ssh/id_ed25519" \
             -o UserKnownHostsFile="$RUNNER_TEMP/ssh/known_hosts" \

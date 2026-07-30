@@ -1036,7 +1036,7 @@ class IOSIntelligenceStore:
         # fallback part of the account boundary.
         key_path = self.path.with_name(self.path.name + ".key")
         key_path.parent.mkdir(parents=True, exist_ok=True)
-        while True:
+        for _attempt in range(2):
             try:
                 value = secrets.token_urlsafe(48).encode("ascii")
                 flags = os.O_CREAT | os.O_EXCL | os.O_WRONLY
@@ -1057,6 +1057,10 @@ class IOSIntelligenceStore:
                     continue
                 if value:
                     return value
+                # An existing empty key cannot become usable by retrying the
+                # same read forever. Do not spin the startup thread.
+                raise RuntimeError(f"Master secret file is empty: {key_path}")
+        raise RuntimeError(f"Could not create master secret file: {key_path}")
 
     @staticmethod
     def _is_hot_envelope(value: Any) -> bool:

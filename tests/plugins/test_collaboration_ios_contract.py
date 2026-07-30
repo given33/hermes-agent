@@ -74,7 +74,7 @@ async def test_conversation_upload_persists_ios_context_headers(tmp_path: Path):
     captured = {}
 
     class FakeLibrary:
-        def get_file_by_origin(self, _owner_id, _origin_key):
+        def get_file_by_origin(self, _owner_id, _origin_key, **_kwargs):
             return None
 
         def ingest_file(self, owner_id, source_path, **kwargs):

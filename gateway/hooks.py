@@ -49,7 +49,13 @@ from hermes_services.startup import bootstrap_trusted_runtime
 bootstrap_trusted_runtime()
 
 
-HOOKS_DIR = get_hermes_home() / "hooks"
+# ``None`` keeps the production path dynamic while preserving the test hook
+# used by integrations that patch this module attribute.
+HOOKS_DIR: Optional[object] = None
+
+
+def _hooks_dir():
+    return HOOKS_DIR if HOOKS_DIR is not None else get_hermes_home() / "hooks"
 
 
 class HookRegistry:
@@ -93,10 +99,11 @@ class HookRegistry:
         """
         self._register_builtin_hooks()
 
-        if not HOOKS_DIR.exists():
+        hooks_dir = _hooks_dir()
+        if not hooks_dir.exists():
             return
 
-        for hook_dir in sorted(HOOKS_DIR.iterdir()):
+        for hook_dir in sorted(hooks_dir.iterdir()):
             if not hook_dir.is_dir():
                 continue
 

@@ -19,6 +19,8 @@ from types import MappingProxyType
 from typing import Any, Callable, Literal, Mapping, TypedDict
 import uuid
 
+from hermes_runtime.redaction import redact_sensitive_text
+
 
 logger = logging.getLogger(__name__)
 
@@ -678,8 +680,6 @@ def _audit_hook_trace(item: HookTrace, context: Mapping[str, Any]) -> None:
     """Write bounded, redacted hook telemetry without persisting payload data."""
 
     try:
-        from hermes_runtime.redaction import redact_sensitive_text
-
         trace = dict(item)
         trace["error"] = redact_sensitive_text(str(trace.get("error") or ""))[:1000]
         allowed_context = {
@@ -761,8 +761,6 @@ def _make_trace(
     started: float,
 ) -> HookTrace:
     try:
-        from hermes_runtime.redaction import redact_sensitive_text
-
         safe_error = redact_sensitive_text(str(error or ""))[:1000]
     except Exception:
         safe_error = type(error).__name__ if error else ""

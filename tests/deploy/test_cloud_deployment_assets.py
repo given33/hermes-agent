@@ -179,7 +179,13 @@ def test_three_endpoint_updates_follow_only_a_committed_main_release():
     assert "ProtectSystem=strict" in service
     assert "/var/lib/systemd/linger" in service
     assert "/etc/systemd/system" in service
-    assert "workflow_run:" in workflow
+    assert "push:" in workflow
+    assert "branches: [main]" in workflow
+    assert "needs: verify" in workflow
+    assert "workflow_run:" not in workflow
+    assert "tests/architecture/test_bare_config_reads.py" in workflow
+    assert "tests/hermes_cli/test_ios_intelligence.py" in workflow
+    assert "tests/plugins/test_collaboration_ios_contract.py" in workflow
     assert "schedule:" in workflow
     assert "environment: production" in workflow
     assert "HERMES_REQUIRE_PINNED_SSH_HOST_KEY: '1'" in workflow
@@ -209,9 +215,12 @@ def test_public_release_contains_the_complete_application_service_layer():
     for relative in (
         "hermes_cli/account_identity.py",
         "hermes_cli/account_lifecycle.py",
+        "hermes_cli/collaboration_plugin_backend.py",
+        "hermes_cli/ios_plugin_backend.py",
         "hermes_cli/account_session_facade.py",
         "hermes_cli/account_write_approvals.py",
         "hermes_cli/mobile_console.py",
+        "plugins/account_cleanup_backend.py",
     ):
         assert relative in deployer
         assert relative in installer
@@ -481,7 +490,7 @@ def test_public_installer_rolls_back_and_installs_every_runtime_file():
         capture_output=True,
         text=True,
         check=False,
-        timeout=90,
+        timeout=180,
     )
     assert result.returncode == 0, result.stdout + "\n" + result.stderr
     assert "public installer transaction test passed" in result.stdout

@@ -16,6 +16,7 @@ Import chain (circular-import safe):
 
 import ast
 from dataclasses import dataclass
+import hashlib
 import importlib
 import json
 import logging
@@ -24,6 +25,8 @@ import threading
 import time
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Set
+
+from hermes_services import tool_contract, tool_isolation
 
 logger = logging.getLogger(__name__)
 
@@ -364,6 +367,36 @@ class ToolRegistry:
         """Return a registered tool entry by name, or None."""
         with self._lock:
             return self._tools.get(name)
+
+    def registration_fingerprint(self, name: str) -> str | None:
+        """Return the stable execution identity advertised for one entry."""
+
+        entry = self.get_entry(name)
+        if entry is None:
+            return None
+        handler = entry.handler
+        dynamic = entry.dynamic_schema_overrides
+        payload = {
+            "name": entry.name,
+            "toolset": entry.toolset,
+            "schema": entry.schema,
+            "handler_module": getattr(handler, "__module__", ""),
+            "handler_qualname": getattr(handler, "__qualname__", ""),
+            "handler_identity": id(handler),
+            "is_async": bool(entry.is_async),
+            "requires_env": list(entry.requires_env),
+            "dynamic_schema_module": getattr(dynamic, "__module__", "") if dynamic else "",
+            "dynamic_schema_qualname": getattr(dynamic, "__qualname__", "") if dynamic else "",
+            "dynamic_schema_identity": id(dynamic) if dynamic else 0,
+        }
+        encoded = json.dumps(
+            payload,
+            sort_keys=True,
+            separators=(",", ":"),
+            ensure_ascii=False,
+            default=str,
+        ).encode("utf-8")
+        return hashlib.sha256(encoded).hexdigest()
 
     def get_handler_descriptor(self, name: str) -> HandlerDescriptor:
         """Return the immutable process-isolation descriptor for a tool."""
@@ -840,14 +873,7 @@ class ToolRegistry:
         if not entry:
             return json.dumps({"error": f"Unknown tool: {name}"})
         try:
-            from hermes_services.tool_contract import resolve_tool_contract
-
-            contract = resolve_tool_contract(name)
-            from hermes_services.tool_isolation import (
-                default_tool_timeout_seconds,
-                run_tool_handler_isolated,
-                ToolIsolationResolutionError,
-            )
+            contract = tool_contract.resolve_tool_contract(name)
 
             identity = self.get_isolation_identity(name)
             use_child = (
@@ -859,16 +885,18 @@ class ToolRegistry:
                 # registry handlers. Stateful browser/terminal/MCP handlers
                 # stay in the owning runtime so their sessions remain
                 # coherent; those handlers enforce their own deadlines.
-                result = run_tool_handler_isolated(
+                result = tool_isolation.run_tool_handler_isolated(
                     self.get_isolation_identity(name),
                     args,
                     kwargs,
                     timeout_seconds=(
                         float(contract.timeout_seconds)
                         if contract.timeout_seconds is not None
-                        else default_tool_timeout_seconds()
+                        else tool_isolation.default_tool_timeout_seconds()
                     ),
                     tool_name=name,
+                    handler_resolver=_resolve_isolated_handler,
+                    interrupt_check=_tool_interrupt_requested,
                 )
             elif entry.is_async:
                 from model_tools import _run_async
@@ -876,7 +904,7 @@ class ToolRegistry:
             else:
                 result = entry.handler(args, **kwargs)
             return self._normalize_handler_result(name, result)
-        except ToolIsolationResolutionError as e:
+        except tool_isolation.ToolIsolationResolutionError as e:
             # A dynamic closure/live MCP handler cannot be reconstructed in a
             # spawned worker. Return a typed, non-retryable error rather than
             # silently falling back to a thread (which could outlive a turn).
@@ -1020,6 +1048,52 @@ class ToolRegistry:
 
 # Module-level singleton
 registry = ToolRegistry()
+
+
+def _resolve_isolated_handler(identity: dict) -> tuple[Callable[..., Any], bool]:
+    """Resolve registry metadata inside a spawned tool worker."""
+
+    try:
+        return registry.resolve_handler_for_isolation(identity)
+    except ToolRegistryResolutionError as exc:
+        raise tool_isolation.ToolIsolationResolutionError(str(exc)) from exc
+    except tool_isolation.ToolIsolationResolutionError:
+        raise
+    except Exception as exc:
+        raise tool_isolation.ToolIsolationResolutionError(
+            f"isolated registry resolver failed: {type(exc).__name__}: {exc}"
+        ) from exc
+
+
+def _tool_interrupt_requested() -> bool:
+    from tools.interrupt import is_interrupted
+
+    return bool(is_interrupted())
+
+
+def _tool_contract_registry_generation() -> int:
+    with registry._lock:
+        return int(registry._generation)
+
+
+def _bump_tool_contract_registry_generation() -> None:
+    with registry._lock:
+        registry._generation += 1
+
+
+def _invalidate_model_tool_definitions() -> None:
+    module = sys.modules.get("model_tools")
+    clear = getattr(module, "_clear_tool_defs_cache", None)
+    if callable(clear):
+        clear()
+
+
+tool_contract.configure_tool_contract_runtime(
+    registry_generation=_tool_contract_registry_generation,
+    bump_registry_generation=_bump_tool_contract_registry_generation,
+    registration_fingerprint=registry.registration_fingerprint,
+    invalidate_definition_cache=_invalidate_model_tool_definitions,
+)
 
 
 # ---------------------------------------------------------------------------

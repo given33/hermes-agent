@@ -6,7 +6,7 @@ from dataclasses import asdict, dataclass, replace
 import hashlib
 import json
 from threading import RLock
-from typing import Any
+from typing import Any, Callable
 
 
 EXECUTION_MODES = frozenset({"parallel", "sequential"})
@@ -51,6 +51,30 @@ class ToolExecutionContract:
 _LOCK = RLock()
 _CONTRACTS: dict[str, ToolExecutionContract] = {}
 _PUBLISHED_BINDINGS: dict[tuple[str, int], dict[str, Any]] = {}
+_REGISTRY_GENERATION: Callable[[], int] | None = None
+_BUMP_REGISTRY_GENERATION: Callable[[], None] | None = None
+_REGISTRATION_FINGERPRINT: Callable[[str], str | None] | None = None
+_INVALIDATE_DEFINITION_CACHE: Callable[[], None] | None = None
+
+
+def configure_tool_contract_runtime(
+    *,
+    registry_generation: Callable[[], int],
+    bump_registry_generation: Callable[[], None],
+    registration_fingerprint: Callable[[str], str | None],
+    invalidate_definition_cache: Callable[[], None],
+) -> None:
+    """Install upper-layer registry callbacks at the application boundary."""
+
+    global _REGISTRY_GENERATION
+    global _BUMP_REGISTRY_GENERATION
+    global _REGISTRATION_FINGERPRINT
+    global _INVALIDATE_DEFINITION_CACHE
+    with _LOCK:
+        _REGISTRY_GENERATION = registry_generation
+        _BUMP_REGISTRY_GENERATION = bump_registry_generation
+        _REGISTRATION_FINGERPRINT = registration_fingerprint
+        _INVALIDATE_DEFINITION_CACHE = invalidate_definition_cache
 
 
 def register_tool_contract(
@@ -247,68 +271,27 @@ def annotate_tool_definitions(
 
 
 def _invalidate_tool_definition_cache() -> None:
-    try:
-        import model_tools
-
-        model_tools._clear_tool_defs_cache()
-    except Exception:
-        pass
+    callback = _INVALIDATE_DEFINITION_CACHE
+    if callback is not None:
+        callback()
 
 
 def _runtime_registry_generation() -> int:
-    try:
-        from tools.registry import registry
-
-        with registry._lock:
-            return int(registry._generation)
-    except Exception:
-        return 0
+    callback = _REGISTRY_GENERATION
+    return int(callback()) if callback is not None else 0
 
 
 def _bump_runtime_registry_generation() -> None:
     """Make contract mutations invalidate every production tool snapshot."""
 
-    try:
-        from tools.registry import registry
-
-        with registry._lock:
-            registry._generation += 1
-    except Exception:
-        pass
+    callback = _BUMP_REGISTRY_GENERATION
+    if callback is not None:
+        callback()
 
 
 def _runtime_registration_fingerprint(tool_name: str) -> str | None:
-    try:
-        from tools.registry import registry
-
-        entry = registry.get_entry(tool_name)
-    except Exception:
-        return None
-    if entry is None:
-        return None
-    handler = entry.handler
-    dynamic = entry.dynamic_schema_overrides
-    payload = {
-        "name": entry.name,
-        "toolset": entry.toolset,
-        "schema": entry.schema,
-        "handler_module": getattr(handler, "__module__", ""),
-        "handler_qualname": getattr(handler, "__qualname__", ""),
-        "handler_identity": id(handler),
-        "is_async": bool(entry.is_async),
-        "requires_env": list(entry.requires_env),
-        "dynamic_schema_module": getattr(dynamic, "__module__", "") if dynamic else "",
-        "dynamic_schema_qualname": getattr(dynamic, "__qualname__", "") if dynamic else "",
-        "dynamic_schema_identity": id(dynamic) if dynamic else 0,
-    }
-    encoded = json.dumps(
-        payload,
-        sort_keys=True,
-        separators=(",", ":"),
-        ensure_ascii=False,
-        default=str,
-    ).encode("utf-8")
-    return hashlib.sha256(encoded).hexdigest()
+    callback = _REGISTRATION_FINGERPRINT
+    return callback(tool_name) if callback is not None else None
 
 
 def _contract_fingerprint(contract: ToolExecutionContract) -> str:

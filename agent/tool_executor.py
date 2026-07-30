@@ -40,15 +40,30 @@ from agent.tool_dispatch_helpers import (
     _plan_tool_batch_execution,
     make_tool_result_message,
 )
-from tools.terminal_tool import (
-    get_active_env,
+from hermes_services.internal_hooks import run_internal_hooks
+from hermes_services.tool_contract import (
+    contract_timeout_seconds,
+    resolve_tool_contract,
+    tool_contract_event_metadata,
+    validate_tool_contract_binding,
 )
-from tools.thread_context import propagate_context_to_thread
-from tools.tool_result_storage import (
-    maybe_persist_tool_result,
-    enforce_turn_budget,
+from tools import (
+    approval as _tool_approval,
+    budget_config as _budget_config,
+    registry as _tool_registry,
+    terminal_tool as _terminal_tool,
+    thread_context as _thread_context,
+    tool_result_storage as _tool_result_storage,
 )
-from tools.budget_config import BudgetConfig, DEFAULT_BUDGET, budget_for_context_window
+
+BudgetConfig = _budget_config.BudgetConfig
+DEFAULT_BUDGET = _budget_config.DEFAULT_BUDGET
+budget_for_context_window = _budget_config.budget_for_context_window
+enforce_turn_budget = _tool_result_storage.enforce_turn_budget
+get_active_env = _terminal_tool.get_active_env
+get_approval_callback = _terminal_tool.get_approval_callback
+maybe_persist_tool_result = _tool_result_storage.maybe_persist_tool_result
+propagate_context_to_thread = _thread_context.propagate_context_to_thread
 
 logger = logging.getLogger(__name__)
 
@@ -71,10 +86,26 @@ def _budget_for_agent(agent) -> BudgetConfig:
 # Maximum number of concurrent worker threads for parallel tool execution.
 # Mirrors the constant in ``run_agent`` for tests/imports that look here.
 _MAX_TOOL_WORKERS = 8
+_TOOL_EXECUTION_SLOT_SETUP_LOCK = threading.Lock()
+# Compatibility export for integrations that inspect the historical global
+# budget. Execution uses the per-agent budget returned below.
 _TOOL_EXECUTION_SLOTS = threading.BoundedSemaphore(_MAX_TOOL_WORKERS)
 # Keep this above the stock auxiliary.web_extract timeout (360s) so the batch
 # guard does not preempt a slow-but-valid summarization attempt.
 _DEFAULT_CONCURRENT_TOOL_TIMEOUT_S = 420.0
+
+
+def _agent_tool_execution_slots(agent):
+    """Return a per-agent worker budget without cross-agent starvation."""
+    slots = getattr(agent, "_tool_execution_slots", None)
+    if slots is not None:
+        return slots
+    with _TOOL_EXECUTION_SLOT_SETUP_LOCK:
+        slots = getattr(agent, "_tool_execution_slots", None)
+        if slots is None:
+            slots = threading.BoundedSemaphore(_MAX_TOOL_WORKERS)
+            agent._tool_execution_slots = slots
+        return slots
 
 
 def _parse_tool_arguments(raw_arguments: Any) -> tuple[dict, Optional[str]]:
@@ -97,8 +128,6 @@ def _parse_tool_arguments(raw_arguments: Any) -> tuple[dict, Optional[str]]:
 
 
 def _resolve_concurrent_tool_timeout(tool_names: list[str] | None = None) -> float | None:
-    from hermes_services.tool_contract import contract_timeout_seconds
-
     contract_timeout = contract_timeout_seconds(list(tool_names or []))
     raw = os.getenv("HERMES_CONCURRENT_TOOL_TIMEOUT_S", "").strip()
     if not raw:
@@ -119,15 +148,11 @@ def _resolve_concurrent_tool_timeout(tool_names: list[str] | None = None) -> flo
 
 
 def _tool_contract_approval_block(function_name: str) -> str | None:
-    from hermes_services.tool_contract import resolve_tool_contract
-
     contract = resolve_tool_contract(function_name)
     if not contract.requires_approval:
         return None
-    from tools.approval import request_tool_approval
-    from tools.terminal_tool import get_approval_callback
 
-    decision = request_tool_approval(
+    decision = _tool_approval.request_tool_approval(
         function_name,
         f"The {function_name} tool is marked as requiring approval by its execution contract.",
         rule_key=f"tool_contract:{function_name}",
@@ -142,8 +167,6 @@ def _tool_contract_approval_block(function_name: str) -> str | None:
 
 
 def _tool_contract_event_metadata(function_name: str) -> dict[str, Any]:
-    from hermes_services.tool_contract import tool_contract_event_metadata
-
     return tool_contract_event_metadata(function_name)
 
 
@@ -154,8 +177,6 @@ def _tool_contract_consistency_block(agent, function_name: str) -> str | None:
     if not isinstance(snapshot_generation, int):
         # Lightweight legacy/test agents do not own a production tool snapshot.
         return None
-    from hermes_services.tool_contract import validate_tool_contract_binding
-
     return validate_tool_contract_binding(
         function_name,
         advertised_registry_generation=snapshot_generation,
@@ -163,16 +184,12 @@ def _tool_contract_consistency_block(agent, function_name: str) -> str | None:
 
 
 def _run_with_tool_contract_timeout(agent, function_name: str, execute) -> Any:
-    from hermes_services.tool_contract import resolve_tool_contract
-
     consistency_error = _tool_contract_consistency_block(agent, function_name)
     if consistency_error is not None:
         raise RuntimeError(consistency_error)
     contract = resolve_tool_contract(function_name)
     if contract.timeout_seconds is not None:
-        from tools.registry import registry
-
-        if registry.get_entry(function_name) is None:
+        if _tool_registry.registry.get_entry(function_name) is None:
             raise RuntimeError(
                 f"Tool '{function_name}' declares a hard deadline but is not "
                 "registry-dispatched and cannot be process-isolated"
@@ -365,8 +382,6 @@ def _apply_tool_request_middleware_for_agent(
 
     # Trusted fail-closed hooks are intentionally outside the middleware's
     # fail-open boundary. A guard that rejects a call must stop execution.
-    from hermes_services.internal_hooks import run_internal_hooks
-
     hook_result = run_internal_hooks(
         "before_tool_call",
         payload,
@@ -703,7 +718,8 @@ def execute_tool_calls_concurrent(agent, assistant_message, messages: list, effe
 
     def _run_tool(index, tool_call, function_name, function_args, middleware_trace):
         """Worker function executed in a thread."""
-        if not _TOOL_EXECUTION_SLOTS.acquire(blocking=False):
+        tool_execution_slots = _agent_tool_execution_slots(agent)
+        if not tool_execution_slots.acquire(blocking=False):
             results[index] = (
                 function_name,
                 function_args,
@@ -795,7 +811,7 @@ def execute_tool_calls_concurrent(agent, assistant_message, messages: list, effe
                 _ra()._set_interrupt(False, _worker_tid)
             except Exception:
                 pass
-            _TOOL_EXECUTION_SLOTS.release()
+            tool_execution_slots.release()
 
     # Start spinner for CLI mode (skip when TUI handles tool progress)
     spinner = None
@@ -975,10 +991,13 @@ def execute_tool_calls_concurrent(agent, assistant_message, messages: list, effe
         r = results[i]
         blocked = False
         effect_disposition = None
-        if i in timed_out_indices:
+        # A worker can finish after the deadline snapshot but before result
+        # aggregation. Preserve that completed result instead of replacing it
+        # with a synthetic timeout.
+        if i in timed_out_indices and r is None:
             suffix = f"{timeout_s:.1f}s" if timeout_s is not None else "the configured timeout"
             function_result = f"Error executing tool '{name}': timed out after {suffix}"
-            effect_disposition = "none"
+            effect_disposition = "unknown"
             _emit_terminal_post_tool_call(
                 agent,
                 function_name=name,

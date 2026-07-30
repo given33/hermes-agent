@@ -14,6 +14,12 @@ from utils import fast_safe_load
 _MODEL_CONFIG_SECTIONS = ("model", "fallback_model", "auxiliary")
 
 
+def _account_cleanup_plugins():
+    from plugins import account_cleanup_backend
+
+    return account_cleanup_backend
+
+
 class AccountOperationalCleanupPending(RuntimeError):
     """Account-owned runtime work is still draining durable cancellation."""
 
@@ -29,11 +35,7 @@ def begin_account_owned_cloud_deletion(
     generation = str(account_generation or "").strip()
     if not normalized or not generation:
         raise ValueError("owner_id and account_generation are required")
-    from plugins.collaboration.dashboard.plugin_api import (  # noqa: PLC0415
-        begin_owner_account_deletion,
-    )
-
-    return begin_owner_account_deletion(
+    return _account_cleanup_plugins().plugin_api.begin_owner_account_deletion(
         normalized,
         account_generation=generation,
     )
@@ -62,12 +64,8 @@ def purge_account_owned_cloud_data(
     if not generation:
         raise RuntimeError("active account generation is unavailable for deletion")
 
-    from plugins.collaboration.dashboard.plugin_api import (  # noqa: PLC0415
-        delete_owner_account_data,
-    )
-
     return {
-        "collaboration": delete_owner_account_data(
+        "collaboration": _account_cleanup_plugins().plugin_api.delete_owner_account_data(
             normalized,
             account_generation=generation,
         ),
@@ -111,8 +109,6 @@ def purge_owner_operational_state(
 
     from hermes_cli.account_session_facade import AccountSessionFacade
     from hermes_cli.account_write_approvals import AccountWriteApprovalStore
-    from plugins.workflows.store import WorkflowStore
-
     profile_roots: list[tuple[Path, str]] = []
     visited: set[Path] = set()
     for profile in list_profiles():
@@ -146,7 +142,9 @@ def purge_owner_operational_state(
         for key, value in branch_result.items():
             session_branches[key] = session_branches.get(key, 0) + int(value)
 
-        workflow_result = WorkflowStore(root / "workflows.db").delete_account(normalized)
+        workflow_result = _account_cleanup_plugins().WorkflowStore(
+            root / "workflows.db"
+        ).delete_account(normalized)
         for key, value in workflow_result.items():
             workflows[key] = workflows.get(key, 0) + int(value)
     pending_cancellations = int(workflows.get("pending_cancellations", 0))

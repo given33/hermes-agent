@@ -31,7 +31,7 @@ from agent.memory_manager import MemoryManager
 from agent.prompt_builder import DEFAULT_AGENT_IDENTITY
 
 
-_DEFAULT_ISOLATION_TEST_TIMEOUT = "3" if os.name == "nt" else "1"
+_DEFAULT_ISOLATION_TEST_TIMEOUT = "3"
 
 
 # ---------------------------------------------------------------------------

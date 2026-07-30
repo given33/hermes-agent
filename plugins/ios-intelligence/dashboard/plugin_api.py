@@ -11,11 +11,11 @@ from typing import Any, Literal, Optional
 from fastapi import APIRouter, HTTPException, Query, Request
 from pydantic import BaseModel, Field
 
-from hermes_cli.account_cleanup import (
+from hermes_cli.ios_plugin_backend import (
+    account_lifecycle_commit_guard,
     begin_account_owned_cloud_deletion,
     purge_account_owned_cloud_data,
 )
-from hermes_cli.account_lifecycle import account_lifecycle_commit_guard
 from hermes_cli.cloud_file_library import owner_id_from_request
 from hermes_runtime.config import get_hermes_home
 from hermes_cli.dashboard_auth.mobile_device_store import MobileDeviceStore

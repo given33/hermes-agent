@@ -27,12 +27,12 @@ import re
 import shlex
 import uuid
 
+from hermes_services import internal_hooks, tool_contract, tool_output_artifacts
 from tools.budget_config import (
     DEFAULT_PREVIEW_SIZE_CHARS,
     BudgetConfig,
     DEFAULT_BUDGET,
 )
-from hermes_services.tool_contract import resolve_tool_contract
 
 logger = logging.getLogger(__name__)
 PERSISTED_OUTPUT_TAG = "<persisted-output>"
@@ -177,9 +177,7 @@ def maybe_persist_tool_result(
         Original content if small, or <persisted-output> replacement.
     """
     if apply_hooks:
-        from hermes_services.internal_hooks import run_internal_hooks
-
-        hook_result = run_internal_hooks(
+        hook_result = internal_hooks.run_internal_hooks(
             "after_tool_result",
             content,
             tool_name=tool_name,
@@ -190,7 +188,7 @@ def maybe_persist_tool_result(
         if hook_trace:
             logger.debug("after_tool_result hooks for %s: %s", tool_use_id, hook_trace)
     effective_threshold = threshold if threshold is not None else config.resolve_threshold(tool_name)
-    output_policy = resolve_tool_contract(tool_name).output_policy
+    output_policy = tool_contract.resolve_tool_contract(tool_name).output_policy
 
     if output_policy == "inline" or effective_threshold == float("inf"):
         return content
@@ -211,9 +209,10 @@ def maybe_persist_tool_result(
     if owner_id and artifact_root:
         try:
             from pathlib import Path
-            from hermes_services.tool_output_artifacts import EncryptedToolArtifactStore
 
-            artifact = EncryptedToolArtifactStore(Path(artifact_root)).put(
+            artifact = tool_output_artifacts.EncryptedToolArtifactStore(
+                Path(artifact_root)
+            ).put(
                 owner_id=owner_id,
                 account_generation=account_generation,
                 conversation_id=str(os.environ.get("HERMES_TOOL_ARTIFACT_CONVERSATION") or ""),

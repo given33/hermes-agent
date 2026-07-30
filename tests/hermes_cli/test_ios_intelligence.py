@@ -30,6 +30,16 @@ def store(tmp_path):
     return IOSIntelligenceStore(tmp_path)
 
 
+def test_store_rejects_an_empty_sidecar_master_secret(tmp_path, monkeypatch):
+    monkeypatch.delenv("HERMES_IOS_DATA_KEY", raising=False)
+    monkeypatch.delenv("HERMES_DATA_ENCRYPTION_KEY", raising=False)
+    path = tmp_path / "empty-master-secret.db"
+    path.with_name(path.name + ".key").write_bytes(b"")
+
+    with pytest.raises(RuntimeError, match="Master secret file is empty"):
+        IOSIntelligenceStore(path)
+
+
 def _location_event(event_id: str, *, latitude: float = 24.9, owner_time: int | None = None):
     return {
         "event_id": event_id,

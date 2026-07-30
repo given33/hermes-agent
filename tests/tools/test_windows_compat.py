@@ -47,21 +47,22 @@ class TestNoUnconditionalSetsid:
 
 
 class TestStartNewSession:
-    """All guarded files must use start_new_session=True instead of preexec_fn."""
+    """All guarded files must use start_new_session instead of preexec_fn."""
 
     @pytest.mark.parametrize("relpath", GUARDED_FILES)
     def test_uses_start_new_session(self, relpath):
-        """Each guarded file must use start_new_session=True for process isolation."""
+        """Each guarded file must explicitly manage subprocess sessions."""
         filepath = PROJECT_ROOT / relpath
         if not filepath.exists():
             pytest.skip(f"{relpath} not found")
         source = filepath.read_text(encoding="utf-8")
-        # Files should use start_new_session=True, not preexec_fn
+        # The code-execution child stays inside an already-isolated registry
+        # worker, while direct invocations still create their own session.
         assert "preexec_fn" not in source, (
             f"{relpath} still uses preexec_fn; use start_new_session=True instead"
         )
-        assert "start_new_session=True" in source, (
-            f"{relpath} missing start_new_session=True in Popen call"
+        assert "start_new_session=" in source, (
+            f"{relpath} missing explicit start_new_session in Popen call"
         )
 
 
