@@ -372,6 +372,8 @@ def sanitize_tool_call_arguments(
 # per-agent marker it extends.
 _INFLIGHT_TURNS_BY_SESSION: Dict[str, Tuple[str, float]] = {}
 _INFLIGHT_TURNS_LOCK = threading.Lock()
+_INFLIGHT_TURN_TTL_SECONDS = 6 * 60 * 60
+_INFLIGHT_TURNS_MAX = 4096
 
 
 def note_turn_start(agent, turn_id: str):
@@ -419,8 +421,18 @@ def note_turn_start(agent, turn_id: str):
     if session_id and not getattr(agent, "_persist_disabled", False):
         now = time.time()
         with _INFLIGHT_TURNS_LOCK:
+            stale_before = now - _INFLIGHT_TURN_TTL_SECONDS
+            for stale_session, (_, started_at) in list(
+                _INFLIGHT_TURNS_BY_SESSION.items()
+            ):
+                if started_at < stale_before:
+                    _INFLIGHT_TURNS_BY_SESSION.pop(stale_session, None)
             entry = _INFLIGHT_TURNS_BY_SESSION.get(session_id)
+            _INFLIGHT_TURNS_BY_SESSION.pop(session_id, None)
             _INFLIGHT_TURNS_BY_SESSION[session_id] = (turn_id, now)
+            while len(_INFLIGHT_TURNS_BY_SESSION) > _INFLIGHT_TURNS_MAX:
+                oldest_session = next(iter(_INFLIGHT_TURNS_BY_SESSION))
+                _INFLIGHT_TURNS_BY_SESSION.pop(oldest_session, None)
         # Stamp the session id this turn registered under: compression can
         # rotate agent.session_id mid-turn, and the persist-time clear must
         # pop the slot the turn actually holds, not the rotated id.

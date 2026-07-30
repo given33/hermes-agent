@@ -27,7 +27,9 @@ import shutil
 import stat
 import subprocess
 import sys
+import threading
 import time
+from collections import OrderedDict
 from dataclasses import dataclass
 from pathlib import Path, PurePosixPath, PureWindowsPath
 from typing import Any, List, Optional, Tuple
@@ -847,8 +849,10 @@ def _check_gateway_running(profile_dir: Path) -> bool:
 # renders "全部智能体 0". We cache the count keyed by the skills dir, invalidated
 # when the dir tree's signature (skills_dir + immediate category dirs mtimes)
 # changes (catches skill add/remove) or after a short TTL (catches deep edits).
-_SKILL_COUNT_CACHE: dict[str, tuple[float, float, int]] = {}
+_SKILL_COUNT_CACHE: OrderedDict[str, tuple[float, float, int]] = OrderedDict()
 _SKILL_COUNT_TTL_SECONDS = 30.0
+_SKILL_COUNT_CACHE_MAX = 128
+_SKILL_COUNT_CACHE_LOCK = threading.Lock()
 
 
 def _skills_dir_signature(skills_dir: Path) -> float:
@@ -887,7 +891,10 @@ def _count_skills(profile_dir: Path) -> int:
     key = str(skills_dir)
     signature = _skills_dir_signature(skills_dir)
     now = time.time()
-    cached = _SKILL_COUNT_CACHE.get(key)
+    with _SKILL_COUNT_CACHE_LOCK:
+        cached = _SKILL_COUNT_CACHE.get(key)
+        if cached is not None:
+            _SKILL_COUNT_CACHE.move_to_end(key)
     if (
         cached is not None
         and cached[0] == signature
@@ -900,7 +907,11 @@ def _count_skills(profile_dir: Path) -> int:
         if is_excluded_skill_path(md):
             continue
         count += 1
-    _SKILL_COUNT_CACHE[key] = (signature, now, count)
+    with _SKILL_COUNT_CACHE_LOCK:
+        _SKILL_COUNT_CACHE[key] = (signature, now, count)
+        _SKILL_COUNT_CACHE.move_to_end(key)
+        while len(_SKILL_COUNT_CACHE) > _SKILL_COUNT_CACHE_MAX:
+            _SKILL_COUNT_CACHE.popitem(last=False)
     return count
 
 

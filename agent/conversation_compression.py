@@ -1008,7 +1008,9 @@ def compress_context(
                 existing_prompt = agent._build_system_prompt(system_message)
             return messages, existing_prompt
 
+    messages_before_attempt = None
     try:
+        messages_before_attempt = copy.deepcopy(messages)
         if _lock_holder is not None:
             _lock_refresher = _CompressionLockLeaseRefresher(
                 _lock_db,
@@ -1082,6 +1084,8 @@ def compress_context(
         # ANY exception after lock acquisition — memory hook, capability
         # inspection, engine lookup, or compress() — must release the lock so
         # the session isn't permanently blocked from future compression.
+        if messages_before_attempt is not None:
+            messages[:] = messages_before_attempt
         _release_lock()
         raise
 

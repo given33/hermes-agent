@@ -1,0 +1,46 @@
+from __future__ import annotations
+
+import json
+
+from deploy.dbb3 import dbb3_cloud_connector as connector_module
+
+
+def test_session_snapshot_cache_is_bounded_lru(tmp_path, monkeypatch):
+    calls = []
+
+    def command_runner(command, **_kwargs):
+        session_id = command[command.index("--session-id") + 1]
+        calls.append(session_id)
+        return 0, json.dumps({"id": session_id, "model": "test-model"})
+
+    connector = connector_module.DBB3CloudConnector(
+        object(),
+        command_runner=command_runner,
+        state_file=tmp_path / "checkpoint.json",
+        artifact_roots=[tmp_path],
+    )
+    monkeypatch.setattr(connector_module, "_SESSION_CACHE_MAX", 2)
+    monkeypatch.setattr(
+        connector,
+        "_discover_session_id",
+        lambda _detail, local: local["session_id"],
+    )
+
+    def snapshot(name):
+        return connector._session_snapshot(
+            {},
+            {
+                "session_id": name,
+                "remote_run_id": f"remote-{name}",
+                "execution_profile": "default",
+            },
+            terminal=False,
+        )
+
+    snapshot("one")
+    snapshot("two")
+    snapshot("one")
+    snapshot("three")
+
+    assert list(connector._session_cache) == ["remote-one", "remote-three"]
+    assert calls == ["one", "two", "three"]

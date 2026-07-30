@@ -11,6 +11,7 @@ and artifact keys instead of creating duplicate work or traffic.
 from __future__ import annotations
 
 import argparse
+from collections import OrderedDict
 import hashlib
 import json
 import os
@@ -21,6 +22,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 import urllib.error
 import urllib.parse
@@ -36,6 +38,7 @@ _SAFE_NAME_RE = re.compile(r"[^A-Za-z0-9._-]+")
 _PROFILE_NAME_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,127}")
 _SESSION_ID_RE = re.compile(r"\b\d{8}_\d{6}_[a-z0-9]+\b", re.IGNORECASE)
 _SESSION_REFRESH_SECONDS = 5.0
+_SESSION_CACHE_MAX = 256
 _DEFAULT_CANCEL_COMMAND = "hermes kanban block {root_id} {reason}"
 _SENSITIVE_KEYS = {
     "authorization",
@@ -1153,7 +1156,8 @@ class DBB3CloudConnector:
         private_artifact_root = self.attachment_root.resolve()
         if private_artifact_root not in self.artifact_roots:
             self.artifact_roots.append(private_artifact_root)
-        self._session_cache: dict[str, dict[str, Any]] = {}
+        self._session_cache: OrderedDict[str, dict[str, Any]] = OrderedDict()
+        self._session_cache_lock = threading.Lock()
         self._boundary_validated_runs: set[str] = set()
         self.cancel_command = (
             str(cancel_command or "").strip()
@@ -1349,7 +1353,10 @@ class DBB3CloudConnector:
         remote_id = _text(local.get("remote_run_id"), 256)
         if not session_id or not _PROFILE_NAME_RE.fullmatch(profile):
             return {}
-        cached = self._session_cache.get(remote_id) or {}
+        with self._session_cache_lock:
+            cached = self._session_cache.get(remote_id) or {}
+            if cached:
+                self._session_cache.move_to_end(remote_id)
         refreshed_at = float(cached.get("refreshed_at") or 0.0)
         terminal_loaded = bool(cached.get("terminal_loaded"))
         if (
@@ -1405,12 +1412,16 @@ class DBB3CloudConnector:
                 terminal=terminal,
             ),
         }
-        self._session_cache[remote_id] = {
-            "session_id": session_id,
-            "refreshed_at": time.monotonic(),
-            "terminal_loaded": terminal,
-            "snapshot": snapshot,
-        }
+        with self._session_cache_lock:
+            self._session_cache[remote_id] = {
+                "session_id": session_id,
+                "refreshed_at": time.monotonic(),
+                "terminal_loaded": terminal,
+                "snapshot": snapshot,
+            }
+            self._session_cache.move_to_end(remote_id)
+            while len(self._session_cache) > _SESSION_CACHE_MAX:
+                self._session_cache.popitem(last=False)
         return snapshot
 
     def _create_root(self, run_payload: dict[str, Any]) -> str:

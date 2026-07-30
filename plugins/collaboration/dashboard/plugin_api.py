@@ -240,7 +240,37 @@ async def collaboration_dashboard_lifespan(_app):
 
 
 router = APIRouter(lifespan=collaboration_dashboard_lifespan)
-_STATE_LOCK = threading.RLock()
+
+
+class _AccountStateLock:
+    """Always acquire the account fence before collaboration state."""
+
+    def __init__(self) -> None:
+        self._lock = threading.RLock()
+        self._local = threading.local()
+
+    def __enter__(self):
+        guard = _backend_api().account_lifecycle_commit_guard()
+        guard.__enter__()
+        try:
+            self._lock.acquire()
+        except BaseException:
+            guard.__exit__(*sys.exc_info())
+            raise
+        stack = getattr(self._local, "guards", None)
+        if stack is None:
+            stack = []
+            self._local.guards = stack
+        stack.append(guard)
+        return self
+
+    def __exit__(self, exc_type, exc_value, traceback):
+        guard = self._local.guards.pop()
+        self._lock.release()
+        return guard.__exit__(exc_type, exc_value, traceback)
+
+
+_STATE_LOCK = _AccountStateLock()
 _HOSTED_THREADS_LOCK = threading.Lock()
 _HOSTED_THREADS: dict[str, threading.Thread] = {}
 _HOSTED_ROUTING_THREADS_LOCK = threading.Lock()

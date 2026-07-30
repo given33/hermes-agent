@@ -19,6 +19,8 @@ from __future__ import annotations
 
 import logging
 import os
+import threading
+from collections import OrderedDict
 from pathlib import Path
 from typing import Iterable, Optional, Tuple
 
@@ -27,7 +29,17 @@ logger = logging.getLogger("agent.lsp.workspace")
 # Cache: cwd → (worktree_root, is_git) so repeated calls don't re-stat.
 # Cleared on shutdown.  Keyed by absolute resolved path so symlink
 # folds collapse to one entry.
-_workspace_cache: dict = {}
+_WORKSPACE_CACHE_MAX = 256
+_workspace_cache: OrderedDict[str, Tuple[Optional[str], bool]] = OrderedDict()
+_workspace_cache_lock = threading.Lock()
+
+
+def _cache_workspace(key: str, value: Tuple[Optional[str], bool]) -> None:
+    with _workspace_cache_lock:
+        _workspace_cache[key] = value
+        _workspace_cache.move_to_end(key)
+        while len(_workspace_cache) > _WORKSPACE_CACHE_MAX:
+            _workspace_cache.popitem(last=False)
 
 
 def normalize_path(path: str) -> str:
@@ -71,7 +83,11 @@ def find_git_worktree(start: str) -> Optional[str]:
         return None
 
     # Cache check
-    cached = _workspace_cache.get(str(start_path))
+    cache_key = str(start_path)
+    with _workspace_cache_lock:
+        cached = _workspace_cache.get(cache_key)
+        if cached is not None:
+            _workspace_cache.move_to_end(cache_key)
     if cached is not None:
         root, _is_git = cached
         return root
@@ -85,7 +101,7 @@ def find_git_worktree(start: str) -> Optional[str]:
         try:
             if git_marker.exists():
                 resolved = str(cur)
-                _workspace_cache[str(start_path)] = (resolved, True)
+                _cache_workspace(cache_key, (resolved, True))
                 return resolved
         except OSError:
             # Permission error on a parent dir — bail out cleanly.
@@ -95,7 +111,7 @@ def find_git_worktree(start: str) -> Optional[str]:
             break
         cur = parent
 
-    _workspace_cache[str(start_path)] = (None, False)
+    _cache_workspace(cache_key, (None, False))
     return None
 
 
@@ -221,7 +237,8 @@ def clear_cache() -> None:
     Called on service shutdown so a subsequent re-init doesn't pick
     up stale results from a previous session.
     """
-    _workspace_cache.clear()
+    with _workspace_cache_lock:
+        _workspace_cache.clear()
 
 
 __all__ = [

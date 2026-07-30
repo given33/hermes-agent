@@ -33,6 +33,7 @@ import os
 import threading
 import time
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -45,16 +46,26 @@ def _build_agent_with_db(db: SessionDB, session_id: str):
     with patch.dict(os.environ, {"OPENROUTER_API_KEY": "test-key"}):
         from run_agent import AIAgent
 
-        agent = AIAgent(
-            api_key="test-key",
-            base_url="https://openrouter.ai/api/v1",
-            model="test/model",
-            quiet_mode=True,
-            session_db=db,
-            session_id=session_id,
-            skip_context_files=True,
-            skip_memory=True,
-        )
+        # Compression tests do not need tool discovery. Keeping it out of this
+        # helper also prevents unrelated TLS/provider initialization from
+        # making the concurrency regression depend on the host environment.
+        with (
+            patch("run_agent.get_tool_definitions", return_value=[]),
+            patch(
+                "agent.context_compressor.get_model_context_length",
+                return_value=131_072,
+            ),
+        ):
+            agent = AIAgent(
+                api_key="test-key",
+                base_url="https://openrouter.ai/api/v1",
+                model="test/model",
+                quiet_mode=True,
+                session_db=db,
+                session_id=session_id,
+                skip_context_files=True,
+                skip_memory=True,
+            )
 
     # Stub the compressor so it returns deterministic output and DOESN'T make
     # an LLM call.  Sleep inside compress() so the two threads' rotations
@@ -557,6 +568,41 @@ def test_internal_typeerror_stops_lock_refresher_without_retry(tmp_path: Path, m
     assert len(calls) == 1
     time.sleep(1.3)
     assert db.try_acquire_compression_lock(parent_sid, "probe", ttl_seconds=1.0) is True
+
+
+def test_base_exception_restores_messages_changed_by_pre_compaction_hook(
+    tmp_path: Path, monkeypatch
+) -> None:
+    db = SessionDB(db_path=tmp_path / "state.db")
+    parent_sid = "BASE_EXCEPTION_RESTORE_TEST"
+    db.create_session(parent_sid, source="discord")
+    agent = _build_agent_with_db(db, parent_sid)
+    agent.context_compressor.compress.side_effect = KeyboardInterrupt("cancelled")
+    messages = [
+        {"role": "user", "content": {"text": "original"}},
+        {"role": "assistant", "content": "answer"},
+    ]
+    original = [
+        {"role": "user", "content": {"text": "original"}},
+        {"role": "assistant", "content": "answer"},
+    ]
+
+    monkeypatch.setattr(
+        "agent.conversation_compression.has_internal_hooks", lambda _point: True
+    )
+    monkeypatch.setattr(
+        "agent.conversation_compression.run_internal_hooks",
+        lambda *_args, **_kwargs: SimpleNamespace(
+            payload=[{"role": "user", "content": "hook replacement"}],
+            trace=[],
+        ),
+    )
+
+    with pytest.raises(KeyboardInterrupt, match="cancelled"):
+        agent._compress_context(messages, "sys", approx_tokens=120_000)
+
+    assert messages == original
+    assert db.get_compression_lock_holder(parent_sid) is None
 
 
 def test_lease_refresher_start_exception_releases_lock(tmp_path: Path, monkeypatch) -> None:

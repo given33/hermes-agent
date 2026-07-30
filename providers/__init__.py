@@ -34,6 +34,7 @@ import importlib
 import importlib.util
 import logging
 import sys
+import threading
 from pathlib import Path
 
 from hermes_services.startup import bootstrap_trusted_runtime
@@ -49,6 +50,7 @@ logger = logging.getLogger(__name__)
 _REGISTRY: dict[str, ProviderProfile] = {}
 _ALIASES: dict[str, str] = {}
 _discovered = False
+_DISCOVERY_LOCK = threading.RLock()
 
 # Repo-root ``plugins/model-providers/`` — populated at discovery time.
 _BUNDLED_PLUGINS_DIR = (
@@ -63,9 +65,10 @@ def register_provider(profile: ProviderProfile) -> None:
     plugins under ``$HERMES_HOME/plugins/model-providers/`` can override
     bundled profiles without editing repo code.
     """
-    _REGISTRY[profile.name] = profile
-    for alias in profile.aliases:
-        _ALIASES[alias] = profile.name
+    with _DISCOVERY_LOCK:
+        _REGISTRY[profile.name] = profile
+        for alias in profile.aliases:
+            _ALIASES[alias] = profile.name
 
 
 def get_provider_profile(name: str) -> ProviderProfile | None:
@@ -73,24 +76,24 @@ def get_provider_profile(name: str) -> ProviderProfile | None:
 
     Returns None if the provider has no profile (falls back to generic).
     """
-    if not _discovered:
-        _discover_providers()
-    canonical = _ALIASES.get(name, name)
-    return _REGISTRY.get(canonical)
+    _discover_providers()
+    with _DISCOVERY_LOCK:
+        canonical = _ALIASES.get(name, name)
+        return _REGISTRY.get(canonical)
 
 
 def list_providers() -> list[ProviderProfile]:
     """Return all registered provider profiles (one per canonical name)."""
-    if not _discovered:
-        _discover_providers()
+    _discover_providers()
     # Deduplicate: _REGISTRY has canonical names; _ALIASES points to same objects
     seen: set[int] = set()
     result: list[ProviderProfile] = []
-    for profile in _REGISTRY.values():
-        pid = id(profile)
-        if pid not in seen:
-            seen.add(pid)
-            result.append(profile)
+    with _DISCOVERY_LOCK:
+        for profile in _REGISTRY.values():
+            pid = id(profile)
+            if pid not in seen:
+                seen.add(pid)
+                result.append(profile)
     return result
 
 
@@ -157,7 +160,15 @@ def _discover_providers() -> None:
     global _discovered
     if _discovered:
         return
-    _discovered = True
+    with _DISCOVERY_LOCK:
+        if _discovered:
+            return
+        _discover_providers_unlocked()
+        _discovered = True
+
+
+def _discover_providers_unlocked() -> None:
+    """Perform one discovery sweep while ``_DISCOVERY_LOCK`` is held."""
 
     # 1. Bundled plugins — shipped with hermes-agent.
     if _BUNDLED_PLUGINS_DIR.is_dir():

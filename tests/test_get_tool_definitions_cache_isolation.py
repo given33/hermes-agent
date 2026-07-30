@@ -16,6 +16,8 @@ These tests pin:
 """
 from __future__ import annotations
 
+import threading
+
 import pytest
 
 import model_tools
@@ -107,6 +109,55 @@ class TestQuietModeCacheIsolation:
         assert len(model_tools._tool_defs_cache) == cap, (
             "Eviction should keep the cache at the cap, not clear it or grow"
         )
+
+    def test_cache_hit_updates_lru_order(self):
+        cap = model_tools._TOOL_DEFS_CACHE_MAX
+        for i in range(cap):
+            model_tools.get_tool_definitions(
+                enabled_toolsets=[f"lru_toolset_{i}"], quiet_mode=True,
+            )
+        oldest_key, second_key = list(model_tools._tool_defs_cache)[:2]
+
+        model_tools.get_tool_definitions(
+            enabled_toolsets=["lru_toolset_0"], quiet_mode=True,
+        )
+        model_tools.get_tool_definitions(
+            enabled_toolsets=["lru_toolset_overflow"], quiet_mode=True,
+        )
+
+        assert oldest_key in model_tools._tool_defs_cache
+        assert second_key not in model_tools._tool_defs_cache
+
+    def test_clear_waits_for_inflight_miss_before_invalidating(self, monkeypatch):
+        compute_started = threading.Event()
+        release_compute = threading.Event()
+        clear_finished = threading.Event()
+
+        def slow_compute(*_args, **_kwargs):
+            compute_started.set()
+            assert release_compute.wait(timeout=5)
+            return [{"type": "function", "function": {"name": "stale"}}]
+
+        monkeypatch.setattr(model_tools, "_compute_tool_definitions", slow_compute)
+        getter = threading.Thread(
+            target=lambda: model_tools.get_tool_definitions(quiet_mode=True)
+        )
+        clearer = threading.Thread(
+            target=lambda: (
+                model_tools._clear_tool_defs_cache(), clear_finished.set()
+            )
+        )
+
+        getter.start()
+        assert compute_started.wait(timeout=5)
+        clearer.start()
+        assert not clear_finished.wait(timeout=0.1)
+        release_compute.set()
+        getter.join(timeout=5)
+        clearer.join(timeout=5)
+
+        assert not getter.is_alive() and not clearer.is_alive()
+        assert not model_tools._tool_defs_cache
 
     def test_non_quiet_mode_does_not_use_cache(self):
         """Sanity: quiet_mode=False (TUI path) skips the cache entirely \u2014

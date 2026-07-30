@@ -177,3 +177,30 @@ def test_persist_disabled_fork_persist_does_not_steal_parent_slot(caplog):
         prev = note_turn_start(intruder, "s1:t2:bbbb")
     assert prev == "s1:t1:aaaa"
     assert len(caplog.records) == 1
+
+
+def test_stale_session_entries_are_pruned_without_false_overlap(monkeypatch, caplog):
+    monkeypatch.setattr(_helpers, "_INFLIGHT_TURN_TTL_SECONDS", 10)
+    with _helpers._INFLIGHT_TURNS_LOCK:
+        _helpers._INFLIGHT_TURNS_BY_SESSION["s1"] = ("old-turn", 1.0)
+    monkeypatch.setattr(_helpers.time, "time", lambda: 100.0)
+
+    with caplog.at_level(logging.WARNING, logger="agent.agent_runtime_helpers"):
+        assert note_turn_start(_FakeAgent(), "new-turn") is None
+
+    assert not caplog.records
+    assert _helpers._INFLIGHT_TURNS_BY_SESSION["s1"] == ("new-turn", 100.0)
+
+
+def test_session_registry_evicts_oldest_entry_at_capacity(monkeypatch):
+    monkeypatch.setattr(_helpers, "_INFLIGHT_TURNS_MAX", 2)
+    monkeypatch.setattr(_helpers, "_INFLIGHT_TURN_TTL_SECONDS", 10_000)
+    timestamps = iter((100.0, 100.0, 101.0, 101.0, 102.0, 102.0))
+    monkeypatch.setattr(_helpers.time, "time", lambda: next(timestamps))
+
+    for session_id in ("s1", "s2", "s3"):
+        agent = _FakeAgent()
+        agent.session_id = session_id
+        note_turn_start(agent, f"{session_id}-turn")
+
+    assert list(_helpers._INFLIGHT_TURNS_BY_SESSION) == ["s2", "s3"]

@@ -284,12 +284,6 @@ import pathlib, sys
 for name in sys.argv[1:]:
     compile(pathlib.Path(name).read_text(encoding="utf-8"), name, "exec")
 PY
-  "${runtime_python}" -c 'from mcp.server import MCPServer; assert MCPServer' \
-    || die "Hermes runtime is missing MCP SDK v2 required by iOS MCP services"
-  "${runtime_python}" -c 'from cryptography.hazmat.primitives.ciphers.aead import AESGCM; assert AESGCM' \
-    || die "Hermes runtime is missing AES-GCM support required by encrypted iOS hot and cold storage"
-  "${runtime_python}" -c 'from agent.plugin_llm import PluginLlm; assert PluginLlm' \
-    || die "Hermes runtime is missing the host LLM facade required by iOS semantic analysis"
 fi
 
 service="${HERMES_AGENT_SERVICE:-hermes-agent.service}"
@@ -1176,6 +1170,23 @@ assert version("mcp") == "2.0.0"
 assert version("starlette") == "1.0.1"
 import mcp  # noqa: F401
 PY
+fi
+
+# Dependency-backed release checks must use the fully resolved candidate.  A
+# live installation may still run MCP 1.x while this release upgrades it to
+# MCP 2, so checking runtime_python before building the candidate would reject
+# the exact upgrade that the transactional venv swap is designed to perform.
+dependency_validation_python="${runtime_python}"
+if [[ "${dependency_update_enabled}" == 1 ]]; then
+  dependency_validation_python="${candidate_venv}/bin/python"
+fi
+if [[ "${ios_enabled}" == 1 ]]; then
+  "${dependency_validation_python}" -c 'from mcp.server import MCPServer; assert MCPServer' \
+    || die "Hermes runtime candidate is missing MCP SDK v2 required by iOS MCP services"
+  "${dependency_validation_python}" -c 'from cryptography.hazmat.primitives.ciphers.aead import AESGCM; assert AESGCM' \
+    || die "Hermes runtime candidate is missing AES-GCM support required by encrypted iOS hot and cold storage"
+  "${dependency_validation_python}" -c 'from agent.plugin_llm import PluginLlm; assert PluginLlm' \
+    || die "Hermes runtime candidate is missing the host LLM facade required by iOS semantic analysis"
 fi
 
 # Quiesce the state writer before taking the transactional state snapshot.

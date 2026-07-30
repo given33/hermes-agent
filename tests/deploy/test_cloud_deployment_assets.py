@@ -626,6 +626,25 @@ def test_public_installer_registers_ios_mcps_in_the_service_hermes_home():
     assert "from agent.plugin_llm import PluginLlm" in installer
 
 
+def test_public_installer_validates_mcp_v2_in_the_dependency_candidate():
+    installer = (PUBLIC / "install-collaboration-backend.sh").read_text(
+        encoding="utf-8"
+    )
+
+    candidate_install = installer.index('"${candidate_venv}/bin/python" -m pip install')
+    select_candidate = installer.index(
+        'dependency_validation_python="${candidate_venv}/bin/python"'
+    )
+    mcp_validation = installer.index(
+        '"${dependency_validation_python}" -c \'from mcp.server import MCPServer; assert MCPServer\''
+    )
+    service_stop = installer.index('systemctl stop "${service}"', mcp_validation)
+
+    assert candidate_install < select_candidate < mcp_validation < service_stop
+    pre_candidate = installer[:candidate_install]
+    assert '"${runtime_python}" -c \'from mcp.server import MCPServer' not in pre_candidate
+
+
 def test_public_installer_uses_effective_systemd_hermes_home_before_env_fallback():
     installer = (PUBLIC / "install-collaboration-backend.sh").read_text(
         encoding="utf-8"
