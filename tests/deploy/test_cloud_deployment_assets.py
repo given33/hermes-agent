@@ -222,6 +222,16 @@ def test_public_release_contains_the_complete_application_service_layer():
         assert relative in deployer
         assert relative in installer
         assert relative in harness
+    root_runtime_dependencies = (
+        "hermes_constants.py",
+        "hermes_logging.py",
+        "hermes_secret_compare.py",
+        "utils.py",
+    )
+    for relative in root_runtime_dependencies:
+        assert relative in deployer
+        assert relative in installer
+        assert relative in harness
     for relative in (
         "hermes_cli/account_identity.py",
         "hermes_cli/account_lifecycle.py",

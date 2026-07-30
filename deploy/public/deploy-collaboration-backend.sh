@@ -142,6 +142,9 @@ runtime_service_assets=(
   "hermes_cli/account_session_facade.py"
   "hermes_cli/account_write_approvals.py"
   "hermes_cli/mobile_console.py"
+  "hermes_constants.py"
+  "hermes_logging.py"
+  "hermes_secret_compare.py"
   "hermes_state.py"
   "mcp_serve.py"
   "model_tools.py"
@@ -165,6 +168,7 @@ runtime_service_assets=(
   "tools/skills_hub.py"
   "tools/terminal_tool.py"
   "tools/tool_result_storage.py"
+  "utils.py"
 )
 for relative in "${ios_hermes_assets[@]}" "${ios_plugin_assets[@]}" \
   "${ios_tool_assets[@]}" "${ios_support_assets[@]}" \
