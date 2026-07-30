@@ -478,6 +478,7 @@ cat >/dev/null
         "hermes_cli/dashboard_auth/__init__.py",
         "hermes_cli/dashboard_auth/owner_mobile.py",
         "hermes_cli/dashboard_auth/registry.py",
+        "hermes_cli/dashboard_auth/routes.py",
         "hermes_cli/profiles.py",
         "hermes_cli/managed_nodes.py",
         "hermes_cli/managed_node_recovery_service.py",
@@ -701,9 +702,13 @@ def test_public_installer_imports_installed_dashboard_before_service_restart():
         '"${runtime_python}" -c \'from hermes_cli.web_server import app; assert app\'',
         install_runtime,
     )
+    ios_registration = installer.index(
+        '"${runtime_python}" -m hermes_cli.ios_mcp_supervisor --register',
+        install_runtime,
+    )
     service_start = installer.index('systemctl start "${service}"', dashboard_preflight)
 
-    assert install_runtime < dashboard_preflight < service_start
+    assert install_runtime < ios_registration < dashboard_preflight < service_start
     preflight = installer[install_runtime:service_start]
     assert 'if [[ "${dependency_update_enabled}" == 1 ]]; then' in preflight
     assert 'sudo -u "${service_user}" -- env HERMES_HOME="${runtime_home}"' in preflight
@@ -745,6 +750,7 @@ def test_public_installer_transactions_mcp_discovery_with_ios_release():
     assert '"tools/mcp_tool.py"' in ios_assets
     assert '"hermes_cli/dashboard_auth/owner_mobile.py"' in ios_assets
     assert '"hermes_cli/dashboard_auth/registry.py"' in ios_assets
+    assert '"hermes_cli/dashboard_auth/routes.py"' in ios_assets
     assert '"hermes_cli/profiles.py"' in ios_assets
     assert '"hermes_cli/account_cleanup.py"' in ios_assets
     assert '"hermes_cli/managed_nodes.py"' not in ios_assets

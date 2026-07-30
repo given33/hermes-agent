@@ -65,6 +65,7 @@ ios_support_assets=(
   "hermes_cli/dashboard_auth/__init__.py"
   "hermes_cli/dashboard_auth/owner_mobile.py"
   "hermes_cli/dashboard_auth/registry.py"
+  "hermes_cli/dashboard_auth/routes.py"
   "hermes_cli/profiles.py"
   "hermes_cli/managed_nodes.py"
   "hermes_cli/managed_node_recovery_service.py"
@@ -281,6 +282,7 @@ scp "${ssh_args[@]}" \
   "${repo}/hermes_cli/dashboard_auth/__init__.py" \
   "${repo}/hermes_cli/dashboard_auth/owner_mobile.py" \
   "${repo}/hermes_cli/dashboard_auth/registry.py" \
+  "${repo}/hermes_cli/dashboard_auth/routes.py" \
   "${remote}:${stage}/hermes_cli/dashboard_auth/"
 scp "${ssh_args[@]}" \
   "${repo}/hermes_cli/profiles.py" \

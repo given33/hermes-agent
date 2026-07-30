@@ -198,6 +198,7 @@ ios_optional=(
   "hermes_cli/dashboard_auth/__init__.py"
   "hermes_cli/dashboard_auth/owner_mobile.py"
   "hermes_cli/dashboard_auth/registry.py"
+  "hermes_cli/dashboard_auth/routes.py"
   "hermes_cli/profiles.py"
   "hermes_cli/managed_node_recovery_service.py"
   "plugins/dashboard_auth/basic/__init__.py"
@@ -304,6 +305,7 @@ if [[ "${ios_enabled}" == 1 ]]; then
     "${snapshot}/hermes_cli/dashboard_auth/__init__.py" \
     "${snapshot}/hermes_cli/dashboard_auth/owner_mobile.py" \
     "${snapshot}/hermes_cli/dashboard_auth/registry.py" \
+    "${snapshot}/hermes_cli/dashboard_auth/routes.py" \
     "${snapshot}/hermes_cli/profiles.py" \
     "${snapshot}/hermes_cli/managed_nodes.py" \
     "${snapshot}/hermes_cli/managed_node_recovery_service.py" \
@@ -1353,17 +1355,6 @@ install_root_atomic "${snapshot}/deploy/public/nginx-00-hermes-security.conf" "$
 install_root_atomic "${snapshot}/deploy/public/nginx-daxueshenmai.top.conf" "${nginx_site_target}"
 "${nginx_binary}" -t \
   || { printf '%s\n' "nginx configuration validation failed" >&2; false; }
-# Import the installed dashboard entry point with the same user, runtime home,
-# source root, and interpreter that systemd will use. This validates the local
-# module dependency closure before entering the restart/health-check loop. The
-# external-runtime path is reserved for the deployment harness and does not
-# provide the production dashboard dependencies.
-if [[ "${dependency_update_enabled}" == 1 ]]; then
-  sudo -u "${service_user}" -- env HERMES_HOME="${runtime_home}" \
-    PYTHONPATH="${target_root}${PYTHONPATH:+:${PYTHONPATH}}" \
-    "${runtime_python}" -c 'from hermes_cli.web_server import app; assert app' \
-    || { printf '%s\n' "installed dashboard import preflight failed" >&2; false; }
-fi
 if [[ "${ios_enabled}" == 1 ]]; then
   for relative in "${ios_optional[@]}"; do
     install_atomic "${snapshot}/${relative}" "${target_root}/${relative}"
@@ -1380,6 +1371,17 @@ if [[ "${ios_enabled}" == 1 ]]; then
     "${runtime_python}" -m hermes_cli.ios_mcp_supervisor --register \
     --host 127.0.0.1 --base-port 8760 \
     || { printf '%s\n' "iOS MCP supervisor registration failed" >&2; false; }
+fi
+# Import the installed dashboard entry point with the same user, runtime home,
+# source root, and interpreter that systemd will use. This must run after every
+# optional iOS asset is installed so mixed dashboard-auth versions cannot reach
+# the service restart. The external-runtime path is reserved for the deployment
+# harness and does not provide the production dashboard dependencies.
+if [[ "${dependency_update_enabled}" == 1 ]]; then
+  sudo -u "${service_user}" -- env HERMES_HOME="${runtime_home}" \
+    PYTHONPATH="${target_root}${PYTHONPATH:+:${PYTHONPATH}}" \
+    "${runtime_python}" -c 'from hermes_cli.web_server import app; assert app' \
+    || { printf '%s\n' "installed dashboard import preflight failed" >&2; false; }
 fi
 systemctl start "${service}"
 
