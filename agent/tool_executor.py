@@ -991,10 +991,10 @@ def execute_tool_calls_concurrent(agent, assistant_message, messages: list, effe
         r = results[i]
         blocked = False
         effect_disposition = None
-        # A worker can finish after the deadline snapshot but before result
-        # aggregation. Preserve that completed result instead of replacing it
-        # with a synthetic timeout.
-        if i in timed_out_indices and r is None:
+        # The deadline snapshot is the terminal CAS boundary. A worker may
+        # finish before aggregation, but its late result must not replace the
+        # timeout already chosen for this call.
+        if i in timed_out_indices:
             suffix = f"{timeout_s:.1f}s" if timeout_s is not None else "the configured timeout"
             function_result = f"Error executing tool '{name}': timed out after {suffix}"
             effect_disposition = "unknown"

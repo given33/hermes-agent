@@ -10,6 +10,8 @@ Branches printed at the end:
                          breaker (SKILL pitfall 7) -> restart the gateway.
   REFRESH_FIXED       -> refresh minted a working token; pass --write to persist
                          it (atomic, 0600), then restart to clear the breaker.
+  SESSION_REVOKED     -> refresh succeeds but the new token still receives the
+                         MCP -32002 session-expired error; full re-auth required.
   REFRESH_DEAD        -> refresh grant itself returns invalid_grant (pitfall 9)
                          -> full interactive re-auth, or switch to a static API key.
 
@@ -82,9 +84,17 @@ def _mcp_discover(mcp_url, access_token):
             "Mcp-Method": "server/discover",
         },
     )
-    txt = body[:400].decode(errors="replace")
+    decoded = body.decode(errors="replace")
+    txt = decoded[:400]
     ok = status == 200 and ("supportedVersions" in txt or '"result"' in txt)
-    return ok, status, txt
+    session_revoked = False
+    try:
+        payload = json.loads(decoded)
+        error = payload.get("error") if isinstance(payload, dict) else None
+        session_revoked = isinstance(error, dict) and error.get("code") == -32002
+    except (TypeError, ValueError):
+        pass
+    return ok, session_revoked, status, txt
 
 
 def main():
@@ -112,7 +122,7 @@ def main():
         print(f"stored expires_at in {round((exp - time.time())/60)} min")
 
     # Step 1: stored token
-    ok, status, txt = _mcp_discover(mcp_url, tok["access_token"])
+    ok, _session_revoked, status, txt = _mcp_discover(mcp_url, tok["access_token"])
     print(f"[1] stored-token server/discover -> HTTP {status} ok={ok}")
     if ok:
         print("BRANCH=TOKEN_OK  -> stored token works; 'not connected' is the breaker (7). Restart the gateway.")
@@ -149,7 +159,7 @@ def main():
           f"expires_in={j.get('expires_in')} rotated_refresh={bool(j.get('refresh_token'))}")
 
     # Step 2b: smoke-test the freshly-minted token
-    ok2, status2, txt2 = _mcp_discover(mcp_url, new_at)
+    ok2, session_revoked2, status2, txt2 = _mcp_discover(mcp_url, new_at)
     print(f"[2b] new-token server/discover -> HTTP {status2} ok={ok2}")
     if ok2:
         if args.write:
@@ -166,6 +176,11 @@ def main():
             os.replace(tmp, tpath)
             print(f"     wrote {tpath} (0600). NOW RESTART the gateway to clear the breaker.")
         print("BRANCH=REFRESH_FIXED  -> refreshed token works. Persist (--write) + restart gateway.")
+        return
+
+    if session_revoked2:
+        print("BRANCH=SESSION_REVOKED  -> refreshed token still has an expired MCP session.")
+        print("     Refreshing again will not help. Full interactive re-auth is required.")
         return
 
     print(f"BRANCH=UNKNOWN  -> new token failed discovery: {txt2[:200]}")

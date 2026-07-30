@@ -10,6 +10,7 @@ from __future__ import annotations
 import importlib.util
 import io
 import json
+import os
 import re
 import sys
 import urllib.error
@@ -180,8 +181,9 @@ def test_refresh_fixed_write_persists_atomically(tmp_path):
     assert on_disk["scope"] == "read write"
     assert on_disk["expires_at"] > 0
     assert not (tokens_dir / "stripe.json.tmp").exists()  # atomic replace, no leftover
-    mode = (tokens_dir / "stripe.json").stat().st_mode & 0o777
-    assert mode == 0o600
+    if os.name != "nt":
+        mode = (tokens_dir / "stripe.json").stat().st_mode & 0o777
+        assert mode == 0o600
 
 
 def test_session_revoked_branch(tmp_path):
@@ -222,7 +224,7 @@ def test_requests_send_httpx_user_agent(tmp_path):
 
 def test_skill_md_frontmatter_invariants():
     yaml = pytest.importorskip("yaml")
-    content = SKILL_MD.read_text()
+    content = SKILL_MD.read_text(encoding="utf-8")
     assert content.startswith("---\n")
     fm = yaml.safe_load(re.search(r"^---\n(.*?)\n---", content, re.DOTALL).group(1))
     assert len(fm["description"]) <= 60
