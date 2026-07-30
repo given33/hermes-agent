@@ -111,6 +111,7 @@ runtime_service_assets=(
   "hermes_runtime/version.py"
   "hermes_cli/backup.py"
   "hermes_cli/dashboard_auth/base.py"
+  "hermes_cli/dashboard_auth/client_ip.py"
   "hermes_cli/main.py"
   "hermes_cli/mcp_config.py"
   "hermes_cli/plugins.py"

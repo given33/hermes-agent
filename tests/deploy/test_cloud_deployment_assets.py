@@ -251,6 +251,7 @@ def test_public_release_contains_the_complete_application_service_layer():
         "agent/tool_executor.py",
         "agent/transports/hermes_tools_mcp_server.py",
         "gateway/platforms/api_server.py",
+        "hermes_cli/dashboard_auth/client_ip.py",
         "hermes_cli/mcp_config.py",
         "plugins/memory/config_schema.py",
         "run_agent.py",
@@ -686,6 +687,27 @@ def test_public_installer_makes_candidate_dependencies_readable_to_service_user(
     assert "import requests" in service_imports
     assert "from fastapi import (" in service_imports
     assert "from mcp.server import MCPServer" in service_imports
+
+
+def test_public_installer_imports_installed_dashboard_before_service_restart():
+    installer = (PUBLIC / "install-collaboration-backend.sh").read_text(
+        encoding="utf-8"
+    )
+
+    install_runtime = installer.index(
+        'install_atomic "${snapshot}/${relative}" "${target_root}/${relative}"'
+    )
+    dashboard_preflight = installer.index(
+        '"${runtime_python}" -c \'from hermes_cli.web_server import app; assert app\'',
+        install_runtime,
+    )
+    service_start = installer.index('systemctl start "${service}"', dashboard_preflight)
+
+    assert install_runtime < dashboard_preflight < service_start
+    preflight = installer[install_runtime:service_start]
+    assert 'if [[ "${dependency_update_enabled}" == 1 ]]; then' in preflight
+    assert 'sudo -u "${service_user}" -- env HERMES_HOME="${runtime_home}"' in preflight
+    assert 'PYTHONPATH="${target_root}${PYTHONPATH:+:${PYTHONPATH}}"' in preflight
 
 
 def test_public_installer_uses_effective_systemd_hermes_home_before_env_fallback():

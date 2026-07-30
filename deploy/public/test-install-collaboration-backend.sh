@@ -65,6 +65,7 @@ runtime_files=(
   "hermes_runtime/version.py"
   "hermes_cli/backup.py"
   "hermes_cli/dashboard_auth/base.py"
+  "hermes_cli/dashboard_auth/client_ip.py"
   "hermes_cli/main.py"
   "hermes_cli/mcp_config.py"
   "hermes_cli/plugins.py"
@@ -558,7 +559,10 @@ for relative in "${runtime_files[@]}"; do
 done
 [[ "$(<"${nginx_security_target}")" == "old:nginx-security" ]]
 [[ "$(<"${nginx_site_target}")" == "old:nginx-site" ]]
-assert_old_state "${state_file}"
+assert_old_state "${state_file}" || {
+  cat "${work}/failure.stderr" >&2
+  exit 1
+}
 grep -Fq '"nodes":[]' "${managed_nodes_file}"
 [[ "$(python3 - "${managed_installations_db}" <<'PY'
 import sqlite3

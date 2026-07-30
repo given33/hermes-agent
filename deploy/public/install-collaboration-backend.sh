@@ -120,6 +120,7 @@ runtime_service_assets=(
   "hermes_runtime/version.py"
   "hermes_cli/backup.py"
   "hermes_cli/dashboard_auth/base.py"
+  "hermes_cli/dashboard_auth/client_ip.py"
   "hermes_cli/main.py"
   "hermes_cli/mcp_config.py"
   "hermes_cli/plugins.py"
@@ -1352,6 +1353,17 @@ install_root_atomic "${snapshot}/deploy/public/nginx-00-hermes-security.conf" "$
 install_root_atomic "${snapshot}/deploy/public/nginx-daxueshenmai.top.conf" "${nginx_site_target}"
 "${nginx_binary}" -t \
   || { printf '%s\n' "nginx configuration validation failed" >&2; false; }
+# Import the installed dashboard entry point with the same user, runtime home,
+# source root, and interpreter that systemd will use. This validates the local
+# module dependency closure before entering the restart/health-check loop. The
+# external-runtime path is reserved for the deployment harness and does not
+# provide the production dashboard dependencies.
+if [[ "${dependency_update_enabled}" == 1 ]]; then
+  sudo -u "${service_user}" -- env HERMES_HOME="${runtime_home}" \
+    PYTHONPATH="${target_root}${PYTHONPATH:+:${PYTHONPATH}}" \
+    "${runtime_python}" -c 'from hermes_cli.web_server import app; assert app' \
+    || { printf '%s\n' "installed dashboard import preflight failed" >&2; false; }
+fi
 if [[ "${ios_enabled}" == 1 ]]; then
   for relative in "${ios_optional[@]}"; do
     install_atomic "${snapshot}/${relative}" "${target_root}/${relative}"
