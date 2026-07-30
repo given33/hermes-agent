@@ -37,9 +37,14 @@ esac
 evidence_file="$(mktemp /run/hermes-fabric-evidence.XXXXXX)"
 curl_config="$(mktemp /run/hermes-fabric-curl.XXXXXX)"
 stage="$(mktemp -d "/run/hermes-fabric-${role}.XXXXXX")"
+automation_script_temp="/usr/local/lib/hermes-agent/update-fabric-node.sh.new.$$"
+automation_service_temp="/etc/systemd/system/hermes-fabric-update.service.new.$$"
+automation_timer_temp="/etc/systemd/system/hermes-fabric-update.timer.new.$$"
 cleanup() {
   rm -rf -- "${stage}"
-  rm -f -- "${evidence_file}" "${curl_config}"
+  rm -f -- "${evidence_file}" "${curl_config}" \
+    "${automation_script_temp}" "${automation_service_temp}" \
+    "${automation_timer_temp}"
 }
 trap cleanup EXIT
 connector_token="$(cat -- "${token_file}")"
@@ -86,16 +91,78 @@ git --git-dir="${mirror}" merge-base --is-ancestor \
   "${release_commit}" refs/remotes/origin/main \
   || die "committed release is not part of the approved main branch"
 git --git-dir="${mirror}" archive --format=tar "${release_commit}" | tar -xf - -C "${stage}"
+# The connector installer deliberately drops to the service account for its
+# preflight. The verified public Git archive contains no node credentials, so
+# expose the ephemeral snapshot read-only after ancestry validation while
+# keeping every entry root-owned and non-writable by the service account.
+chmod -R a+rX "${stage}"
+
+automation_assets=(
+  "deploy/automation/update-fabric-node.sh"
+  "deploy/automation/hermes-fabric-update.service"
+  "deploy/automation/hermes-fabric-update.timer"
+)
+for relative in "${automation_assets[@]}"; do
+  [[ -f "${stage}/${relative}" && ! -L "${stage}/${relative}" ]] \
+    || die "missing or unsafe automation asset ${relative}"
+done
+
+ensure_user_units_active() {
+  local service_user="${HERMES_FABRIC_SERVICE_USER:-hermes}"
+  local uid runtime unit
+  uid="$(id -u "${service_user}")"
+  runtime="/run/user/${uid}"
+  systemctl start "user@${uid}.service"
+  runuser -u "${service_user}" -- env \
+    XDG_RUNTIME_DIR="${runtime}" \
+    DBUS_SESSION_BUS_ADDRESS="unix:path=${runtime}/bus" \
+    systemctl --user enable --now "$@"
+  for unit in "$@"; do
+    runuser -u "${service_user}" -- env \
+      XDG_RUNTIME_DIR="${runtime}" \
+      DBUS_SESSION_BUS_ADDRESS="unix:path=${runtime}/bus" \
+      systemctl --user is-active --quiet "${unit}" \
+      || die "required ${role} user service is not active: ${unit}"
+  done
+}
 
 case "${role}" in
   dbb3)
     bash "${stage}/deploy/dbb3/install-dbb3-cloud-connector-user.sh" \
       "${stage}/deploy/dbb3/dbb3_cloud_connector.py"
+    systemctl enable --now hermes-managed-installation-receiver.service
+    systemctl is-active --quiet hermes-managed-installation-receiver.service \
+      || die "DBB3 managed installation receiver is not active"
     ;;
   wsl)
     bash "${stage}/deploy/pc/install-pc-cloud-connector-user.sh"
+    ensure_user_units_active \
+      hermes-wsl-managed-installation-receiver.service \
+      hermes-wsl-managed-installation-tunnel.service
     ;;
 esac
+
+# A fabric release also advances the updater itself. Install only the three
+# root-owned automation assets from the ancestry-verified snapshot; the
+# running shell keeps its open script while the next timer invocation uses the
+# new implementation.
+install -o root -g root -m 0755 \
+  "${stage}/deploy/automation/update-fabric-node.sh" \
+  "${automation_script_temp}"
+install -o root -g root -m 0644 \
+  "${stage}/deploy/automation/hermes-fabric-update.service" \
+  "${automation_service_temp}"
+install -o root -g root -m 0644 \
+  "${stage}/deploy/automation/hermes-fabric-update.timer" \
+  "${automation_timer_temp}"
+mv -f -- "${automation_script_temp}" \
+  /usr/local/lib/hermes-agent/update-fabric-node.sh
+mv -f -- "${automation_service_temp}" \
+  /etc/systemd/system/hermes-fabric-update.service
+mv -f -- "${automation_timer_temp}" \
+  /etc/systemd/system/hermes-fabric-update.timer
+systemctl daemon-reload
+systemctl enable --now hermes-fabric-update.timer
 
 printf '%s\n' "${release_commit}" >"${deployed_file}.new.$$"
 chmod 0600 "${deployed_file}.new.$$"

@@ -163,10 +163,27 @@ def test_three_endpoint_updates_follow_only_a_committed_main_release():
     assert 're.fullmatch(r"[0-9a-f]{40}", commit)' in updater
     assert "merge-base --is-ancestor" in updater
     assert "refs/remotes/origin/main" in updater
+    archive = updater.index('archive --format=tar "${release_commit}"')
+    readable_stage = updater.index('chmod -R a+rX "${stage}"')
+    node_install = updater.index("install-dbb3-cloud-connector-user.sh")
+    assert archive < readable_stage < node_install
+    assert "systemctl enable --now hermes-managed-installation-receiver.service" in updater
+    assert "hermes-wsl-managed-installation-receiver.service" in updater
+    assert "hermes-wsl-managed-installation-tunnel.service" in updater
+    updater_refresh = updater.index(
+        '"${stage}/deploy/automation/update-fabric-node.sh"'
+    )
+    deployed_commit = updater.index('mv -f -- "${deployed_file}.new.$$"')
+    assert node_install < updater_refresh < deployed_commit
+    assert "systemctl daemon-reload" in updater[updater_refresh:deployed_commit]
+    assert (
+        "systemctl enable --now hermes-fabric-update.timer"
+        in updater[updater_refresh:deployed_commit]
+    )
     assert '--config "${curl_config}"' in updater
     assert 'Authorization: Bearer $(cat' not in updater
     assert "^[A-Za-z0-9._~+/-]+={0,3}$" in updater
-    assert updater.index("install-dbb3-cloud-connector-user.sh") < updater.index(
+    assert node_install < updater.index(
         'mv -f -- "${deployed_file}.new.$$"'
     )
     assert "systemctl enable --now hermes-fabric-update.timer" in bootstrap
@@ -179,6 +196,7 @@ def test_three_endpoint_updates_follow_only_a_committed_main_release():
     assert "ProtectSystem=strict" in service
     assert "/var/lib/systemd/linger" in service
     assert "/etc/systemd/system" in service
+    assert "/usr/local/lib/hermes-agent" in service
     assert "push:" in workflow
     assert "branches: [main]" in workflow
     assert "needs: verify" in workflow
