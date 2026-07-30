@@ -664,6 +664,30 @@ def test_public_installer_validates_mcp_v2_in_the_dependency_candidate():
     assert '"${runtime_python}" -c \'from mcp.server import MCPServer' not in pre_candidate
 
 
+def test_public_installer_makes_candidate_dependencies_readable_to_service_user():
+    installer = (PUBLIC / "install-collaboration-backend.sh").read_text(
+        encoding="utf-8"
+    )
+
+    candidate_copy = installer.index('cp -a -- "${runtime_venv}" "${candidate_venv}"')
+    readable_umask = installer.index("    umask 022", candidate_copy)
+    candidate_install = installer.index(
+        '"${candidate_venv}/bin/python" -m pip install', readable_umask
+    )
+    service_validation = installer.index(
+        'sudo -u "${service_user}" -- "${candidate_venv}/bin/python" -',
+        candidate_install,
+    )
+    service_stop = installer.index('systemctl stop "${service}"', service_validation)
+
+    assert candidate_copy < readable_umask < candidate_install
+    assert candidate_install < service_validation < service_stop
+    service_imports = installer[service_validation:service_stop]
+    assert "import requests" in service_imports
+    assert "from fastapi import (" in service_imports
+    assert "from mcp.server import MCPServer" in service_imports
+
+
 def test_public_installer_uses_effective_systemd_hermes_home_before_env_fallback():
     installer = (PUBLIC / "install-collaboration-backend.sh").read_text(
         encoding="utf-8"

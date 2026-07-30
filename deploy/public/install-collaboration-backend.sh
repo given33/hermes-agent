@@ -1189,15 +1189,53 @@ if [[ "${dependency_update_enabled}" == 1 ]]; then
   [[ ! -e "${previous_venv}" && ! -L "${previous_venv}" ]] \
     || die "runtime dependency rollback path already exists"
   cp -a -- "${runtime_venv}" "${candidate_venv}"
-  "${candidate_venv}/bin/python" -m pip install \
-    --disable-pip-version-check --require-hashes \
-    -r "${snapshot}/deploy/public/runtime-requirements.lock"
+  # The installer keeps umask 077 for release evidence, tokens, and rollback
+  # state. Python packages are executable code shared with the unprivileged
+  # service account, so install them with searchable/readable permissions.
+  # Keeping this override in a subshell restores the restrictive umask for all
+  # subsequent deployment artifacts.
+  (
+    umask 022
+    "${candidate_venv}/bin/python" -m pip install \
+      --disable-pip-version-check --require-hashes \
+      -r "${snapshot}/deploy/public/runtime-requirements.lock"
+  )
   "${candidate_venv}/bin/python" - <<'PY'
 from importlib.metadata import version
 
 assert version("mcp") == "2.0.0"
 assert version("starlette") == "1.0.1"
 import mcp  # noqa: F401
+PY
+  # Root can import packages installed with mode 0700, while the systemd
+  # service cannot. Validate the dashboard's real import surface as the
+  # service account before stopping or replacing the live environment.
+  sudo -u "${service_user}" -- "${candidate_venv}/bin/python" - <<'PY'
+import requests  # noqa: F401
+import uvicorn  # noqa: F401
+from fastapi import (
+    FastAPI,
+    File,
+    Form,
+    HTTPException,
+    Request,
+    UploadFile,
+    WebSocket,
+    WebSocketDisconnect,
+)
+from fastapi.middleware.cors import CORSMiddleware  # noqa: F401
+from fastapi.responses import (  # noqa: F401
+    FileResponse,
+    HTMLResponse,
+    JSONResponse,
+    Response,
+)
+from fastapi.staticfiles import StaticFiles  # noqa: F401
+from mcp.server import MCPServer
+from pydantic import BaseModel, SecretStr  # noqa: F401
+from starlette.concurrency import run_in_threadpool  # noqa: F401
+
+assert FastAPI and MCPServer
 PY
 fi
 
