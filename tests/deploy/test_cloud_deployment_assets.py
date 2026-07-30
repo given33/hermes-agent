@@ -188,6 +188,9 @@ def test_three_endpoint_updates_follow_only_a_committed_main_release():
     assert "tests/plugins/test_collaboration_ios_contract.py" in workflow
     assert "schedule:" in workflow
     assert "environment: production" in workflow
+    assert "HERMES_PUBLIC_SSH_KEY_B64" in workflow
+    assert "base64 --decode" in workflow
+    assert 'ssh-keygen -y -f "$RUNNER_TEMP/ssh/id_ed25519"' in workflow
     assert "HERMES_REQUIRE_PINNED_SSH_HOST_KEY: '1'" in workflow
     assert "HERMES_SSH_KNOWN_HOSTS" in workflow
     assert "HERMES_SSH_KNOWN_HOSTS" in deployer

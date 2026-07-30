@@ -57,15 +57,16 @@ jobs:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
       - name: Configure pinned deployment SSH identity
         env:
-          DEPLOY_KEY: ${{ secrets.HERMES_PUBLIC_SSH_KEY }}
+          DEPLOY_KEY_B64: ${{ secrets.HERMES_PUBLIC_SSH_KEY_B64 }}
           KNOWN_HOSTS: ${{ secrets.HERMES_PUBLIC_KNOWN_HOSTS }}
         run: |
-          test -n "$DEPLOY_KEY"
+          test -n "$DEPLOY_KEY_B64"
           test -n "$KNOWN_HOSTS"
           install -d -m 0700 "$RUNNER_TEMP/ssh"
-          printf '%s\n' "$DEPLOY_KEY" >"$RUNNER_TEMP/ssh/id_ed25519"
+          printf '%s' "$DEPLOY_KEY_B64" | base64 --decode >"$RUNNER_TEMP/ssh/id_ed25519"
           printf '%s\n' "$KNOWN_HOSTS" >"$RUNNER_TEMP/ssh/known_hosts"
           chmod 0600 "$RUNNER_TEMP/ssh/id_ed25519" "$RUNNER_TEMP/ssh/known_hosts"
+          ssh-keygen -y -f "$RUNNER_TEMP/ssh/id_ed25519" >/dev/null
       - name: Deploy the public authority transactionally
         env:
           HERMES_PUBLIC_REMOTE: ${{ secrets.HERMES_PUBLIC_USER }}@${{ secrets.HERMES_PUBLIC_HOST }}
