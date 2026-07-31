@@ -278,6 +278,8 @@ def test_production_release_synchronizes_the_ios_workflow_observably():
     assert "release_name=\"Backend release ${RELEASE_COMMIT}\"" in workflow
     assert "ios-production-eas.yml" in workflow
     assert "already has unsigned run" in workflow
+    assert 'if [ -n "${run_id}" ] || [ -n "${production_run_id}" ]; then' in workflow
+    assert "reusing existing dispatch" in workflow
     assert "production EAS run could not be observed" in workflow
     assert 'echo "Observing iOS production EAS run ${production_run_id}"' in workflow
     assert "--event repository_dispatch" in workflow

@@ -164,56 +164,43 @@ jobs:
           PY
           )"
           release_name="Backend release ${RELEASE_COMMIT}"
-          unsigned_runs="$(gh run list \
-            --repo "${IOS_REPOSITORY}" \
-            --workflow ios-unsigned.yml \
-            --limit 50 \
-            --json databaseId,name,status,conclusion)"
-          unsigned_run="$(printf '%s' "${unsigned_runs}" | jq -r --arg name "${release_name}" \
-            'map(select(.name == $name and (.status == "queued" or .status == "in_progress" or (.status == "completed" and .conclusion == "success")))) | sort_by(.databaseId) | reverse | .[0].databaseId // empty')"
-          production_runs="$(gh run list \
-            --repo "${IOS_REPOSITORY}" \
-            --workflow ios-production-eas.yml \
-            --limit 50 \
-            --json databaseId,name,status,conclusion)"
-          production_run="$(printf '%s' "${production_runs}" | jq -r --arg name "${release_name}" \
-            'map(select(.name == $name and (.status == "queued" or .status == "in_progress" or (.status == "completed" and .conclusion == "success")))) | sort_by(.databaseId) | reverse | .[0].databaseId // empty')"
+          find_release_run() {
+            local workflow="$1"
+            gh run list \
+              --repo "${IOS_REPOSITORY}" \
+              --workflow "${workflow}" \
+              --event repository_dispatch \
+              --limit 50 \
+              --json databaseId,name,status,conclusion \
+              | jq -r --arg name "${release_name}" \
+                'map(select(.name == $name and (.status == "queued" or .status == "in_progress" or (.status == "completed" and .conclusion == "success")))) | sort_by(.databaseId) | reverse | .[0].databaseId // empty'
+          }
 
-          run_id="${unsigned_run}"
-          production_run_id="${production_run}"
-          if [ -n "${unsigned_run}" ] && [ -n "${production_run}" ]; then
-            echo "iOS release ${RELEASE_COMMIT} already has unsigned run ${unsigned_run} and production run ${production_run}; reusing them"
+          # A repository_dispatch starts both child workflows. Seeing either
+          # child proves the event was already accepted, so never dispatch the
+          # same release again while the sibling is still appearing in the
+          # Actions API. Re-dispatching here can cancel an in-flight build via
+          # the child workflow's concurrency group.
+          run_id="$(find_release_run ios-unsigned.yml)"
+          production_run_id="$(find_release_run ios-production-eas.yml)"
+          if [ -n "${run_id}" ] || [ -n "${production_run_id}" ]; then
+            echo "iOS release ${RELEASE_COMMIT} already has unsigned run ${run_id:-none} and production run ${production_run_id:-none}; reusing existing dispatch"
           else
-            dispatch_started="$(date +%s)"
             gh api --method POST "repos/${IOS_REPOSITORY}/dispatches" --input - <<EOF
           {"event_type":"hermes-backend-release","client_payload":{"commit":"${RELEASE_COMMIT}","version":"${release_version}"}}
           EOF
             echo "Dispatched backend release ${RELEASE_COMMIT} (${release_version}) to ${IOS_REPOSITORY}"
-            run_id=""
-            production_run_id=""
-            for _ in $(seq 1 30); do
-              run_id="$(gh run list \
-              --repo "${IOS_REPOSITORY}" \
-              --workflow ios-unsigned.yml \
-              --event repository_dispatch \
-              --limit 20 \
-              --json databaseId,createdAt \
-              --jq "map(select((.createdAt | fromdateiso8601) >= ${dispatch_started})) | sort_by(.createdAt) | reverse | .[0].databaseId // empty")"
-              [ -n "${run_id}" ] && break
-              sleep 2
-            done
-            for _ in $(seq 1 30); do
-              production_run_id="$(gh run list \
-                --repo "${IOS_REPOSITORY}" \
-                --workflow ios-production-eas.yml \
-                --event repository_dispatch \
-                --limit 20 \
-                --json databaseId,createdAt \
-                --jq "map(select((.createdAt | fromdateiso8601) >= ${dispatch_started})) | sort_by(.createdAt) | reverse | .[0].databaseId // empty")"
-              [ -n "${production_run_id}" ] && break
-              sleep 2
-            done
           fi
+          # Poll both workflows together. This covers the normal API delay and
+          # the case where one workflow is queued before the other is visible.
+          for _ in $(seq 1 60); do
+            [ -n "${run_id}" ] || run_id="$(find_release_run ios-unsigned.yml)"
+            [ -n "${production_run_id}" ] || production_run_id="$(find_release_run ios-production-eas.yml)"
+            if [ -n "${run_id}" ] && [ -n "${production_run_id}" ]; then
+              break
+            fi
+            sleep 2
+          done
           test -n "${run_id}" || {
             echo "::error::iOS repository dispatch was accepted but its unsigned run could not be observed"
             exit 1
