@@ -2223,9 +2223,9 @@ class ShellFileOperations(FileOperations):
                 continue
             parts = line.split(' ', 1)
             if len(parts) == 2 and parts[0].replace('.', '').isdigit():
-                files.append(parts[1])
+                files.append(self._normalize_search_result_path(parts[1]))
             else:
-                files.append(line)
+                files.append(self._normalize_search_result_path(line))
 
         # For explicit hidden roots, find's path-based filtering excludes every
         # file under the hidden path. Apply descendant filtering after command
@@ -2251,6 +2251,32 @@ class ShellFileOperations(FileOperations):
             limit_reason=limit_reason,
         )
 
+    @staticmethod
+    def _normalize_search_result_path(path: str) -> str:
+        """Normalize Git Bash drive paths emitted by local Windows searches.
+
+        ``find`` runs inside Git Bash and reports a native Windows file as
+        ``/c/Users/...``.  Feeding that spelling to ``pathlib.Path`` on the
+        host produces ``C:\\c\\Users\\...``; hidden-ancestor filtering then
+        treats the real ``.hermes``/``.git`` ancestor as a descendant and
+        drops every match.  Convert only paths that resolve to an existing
+        native file so remote backends that legitimately use ``/c`` retain
+        their original POSIX spelling.
+        """
+        if os.name != "nt" or not path:
+            return path
+        if not re.match(r"^/(?:mnt/|cygdrive/)?[A-Za-z](?:/|$)", path):
+            return path
+        try:
+            from tools.environments.local import _msys_to_windows_path
+
+            native = _msys_to_windows_path(path)
+            if native != path and Path(native).exists():
+                return native
+        except (ImportError, OSError, ValueError):
+            pass
+        return path
+
     def _search_files_rg(self, pattern: str, path: str, limit: int, offset: int) -> SearchResult:
         """Search for files by name using ripgrep's --files mode.
 
@@ -2270,7 +2296,12 @@ class ShellFileOperations(FileOperations):
         # Try mtime-sorted first (rg 13+); fall back to unsorted if not supported.
         cmd_sorted = (
             f"rg --files --sortr=modified -g {self._escape_shell_arg(glob_pattern)} "
-            f"{self._escape_shell_arg(path)} 2>/dev/null "
+            # ``rg`` is a native Windows executable in Git Bash.  The local
+            # environment sets ``MSYS_NO_PATHCONV=1`` so option-like argv is
+            # preserved, which means a Git-Bash ``/c/...`` path would reach
+            # rg unchanged and silently match nothing.  Convert only the
+            # filesystem operand back to a native path for this executable.
+            f"{self._escape_native_path_arg(path)} 2>/dev/null "
             f"| head -n {fetch_limit}"
         )
         result = self._exec(cmd_sorted, timeout=60)
@@ -2281,7 +2312,7 @@ class ShellFileOperations(FileOperations):
             # --sortr may have failed on older rg; retry without it.
             cmd_plain = (
                 f"rg --files -g {self._escape_shell_arg(glob_pattern)} "
-                f"{self._escape_shell_arg(path)} 2>/dev/null "
+                f"{self._escape_native_path_arg(path)} 2>/dev/null "
                 f"| head -n {fetch_limit}"
             )
             result = self._exec(cmd_plain, timeout=60)
