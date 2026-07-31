@@ -5,9 +5,10 @@ Wants=network-online.target
 
 [Service]
 Type=simple
-WorkingDirectory=/mnt/d/Hermes/home
+WorkingDirectory=/mnt/d/Hermes/hermes-agent
 Environment=HOME=/home/hermes
 Environment=HERMES_HOME=/mnt/d/Hermes/home
+Environment=PYTHONPATH=/mnt/d/Hermes/hermes-agent
 ExecStart=/mnt/d/Hermes/hermes-agent/venv/bin/python -m hermes_cli.managed_node_recovery_service --host 127.0.0.1 --port 9122 --config /mnt/d/Hermes/home/managed-installations.json
 Restart=always
 RestartSec=5

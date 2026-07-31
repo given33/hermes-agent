@@ -264,6 +264,11 @@ git --git-dir="${mirror}" archive --format=tar "${release_commit}" \
 # expose the ephemeral snapshot read-only after ancestry validation while
 # keeping every entry root-owned and non-writable by the service account.
 chmod -R a+rX "${stage}"
+# Some WSL/DrvFs environments preserve the mktemp directory's restrictive
+# traversal bit across recursive chmod; make every extracted directory
+# explicitly traversable so the delegated service-account preflight can read
+# the snapshot before it is removed.
+find "${stage}" -type d -exec chmod a+rx {} +
 
 automation_assets=(
   "deploy/automation/update-fabric-node.sh"
