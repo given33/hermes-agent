@@ -297,6 +297,11 @@ def test_production_release_synchronizes_the_ios_workflow_observably():
     assert "rerun_release()" in workflow
     assert "rerun attempt ${attempt}/3" in workflow
     assert "sleep $((attempt * 5))" in workflow
+    assert "watch_release()" in workflow
+    assert "watch attempt ${attempt}/3" in workflow
+    assert "failure|cancelled|timed_out|action_required|startup_failure|stale" in workflow
+    assert 'watch_release "${run_id}" unsigned' in workflow
+    assert 'watch_release "${production_run_id}" production' in workflow
     assert 'elif [ -z "${run_id}" ] || [ -z "${production_run_id}" ]; then' in workflow
     assert "if [ -z \"${run_id}\" ] || [ -z \"${production_run_id}\" ]; then" in workflow
     assert "refusing a duplicate dispatch" in workflow

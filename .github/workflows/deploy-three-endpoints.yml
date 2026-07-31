@@ -229,6 +229,29 @@ jobs:
             done
             return 1
           }
+          watch_release() {
+            local run_id="$1"
+            local workflow_label="$2"
+            local state=""
+            for attempt in 1 2 3; do
+              if gh run watch "${run_id}" --repo "${IOS_REPOSITORY}" --interval 15 --exit-status; then
+                return 0
+              fi
+              state="$(gh run view "${run_id}" --repo "${IOS_REPOSITORY}" --json status,conclusion \
+                --jq 'if .status == "completed" then (.conclusion // "unknown") else .status end' 2>/dev/null || true)"
+              case "${state}" in
+                failure|cancelled|timed_out|action_required|startup_failure|stale)
+                  echo "::error::iOS ${workflow_label} run ${run_id} ended with ${state}"
+                  return 1
+                  ;;
+              esac
+              echo "::warning::iOS ${workflow_label} watch attempt ${attempt}/3 ended with ${state:-unknown}; retrying" >&2
+              [ "${attempt}" -lt 3 ] && sleep $((attempt * 10))
+            done
+            gh run view "${run_id}" --repo "${IOS_REPOSITORY}" \
+              --json databaseId,status,conclusion,headSha,url
+            return 1
+          }
 
           # A repository_dispatch starts both child workflows. Reuse active or
           # successful runs while the sibling is still appearing in the API;
@@ -290,14 +313,6 @@ jobs:
             exit 1
           }
           echo "Observing iOS unsigned run ${run_id}"
-          if ! gh run watch "${run_id}" --repo "${IOS_REPOSITORY}" --interval 15 --exit-status; then
-            gh run view "${run_id}" --repo "${IOS_REPOSITORY}" \
-              --json databaseId,status,conclusion,headSha,url
-            exit 1
-          fi
+          watch_release "${run_id}" unsigned
           echo "Observing iOS production EAS run ${production_run_id}"
-          if ! gh run watch "${production_run_id}" --repo "${IOS_REPOSITORY}" --interval 15 --exit-status; then
-            gh run view "${production_run_id}" --repo "${IOS_REPOSITORY}" \
-              --json databaseId,status,conclusion,headSha,url
-            exit 1
-          fi
+          watch_release "${production_run_id}" production
