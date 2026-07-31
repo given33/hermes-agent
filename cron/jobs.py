@@ -380,8 +380,14 @@ def _normalize_skill_list(skill: Optional[str] = None, skills: Optional[Any] = N
         raw_items = [skill] if skill else []
     elif isinstance(skills, str):
         raw_items = [skills]
-    else:
+    elif isinstance(skills, (list, tuple, set)):
         raw_items = list(skills)
+    else:
+        # jobs.json is user-editable; a scalar/dict in ``skills`` is corrupt
+        # but must not abort normalization of every sibling job. Treat the
+        # malformed field as absent and let the job run without optional skill
+        # instructions (the scheduler can still report other errors).
+        raw_items = []
 
     normalized: List[str] = []
     for item in raw_items:

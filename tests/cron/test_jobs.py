@@ -908,6 +908,25 @@ class TestGetDueJobs:
         assert resolved["id"] == "numeric-name"
         assert resolved["name"] == "42"
 
+    def test_malformed_skills_field_does_not_abort_due_scan(self, tmp_cron_dir):
+        """A scalar ``skills`` field is ignored instead of raising TypeError."""
+        healthy = create_job(prompt="Healthy", schedule="every 1h")
+        jobs_path = Path(tmp_cron_dir) / "cron" / "jobs.json"
+        payload = json.loads(jobs_path.read_text(encoding="utf-8"))
+        payload["jobs"][0]["next_run_at"] = (
+            datetime.now(timezone.utc) - timedelta(minutes=5)
+        ).isoformat()
+        malformed = dict(payload["jobs"][0])
+        malformed["id"] = "bad-skills"
+        malformed["skills"] = 42
+        malformed["skill"] = None
+        payload["jobs"].append(malformed)
+        jobs_path.write_text(json.dumps(payload), encoding="utf-8")
+
+        due = get_due_jobs()
+
+        assert {item["id"] for item in due} == {healthy["id"], "bad-skills"}
+
 
     def test_long_execution_does_not_perpetually_defer(self, tmp_cron_dir, monkeypatch):
         """#33315: a recurring job whose runtime exceeds interval+grace must still
