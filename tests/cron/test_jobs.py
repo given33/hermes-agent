@@ -313,13 +313,19 @@ class TestJobCRUD:
         save_jobs([{
             "id": "malformed-enabled",
             "name": "malformed",
+            "enabled": float("nan"),
+            "schedule": {"kind": "once", "run_at": past},
+            "next_run_at": past,
+        }, {
+            "id": "object-enabled",
+            "name": "object",
             "enabled": {},
             "schedule": {"kind": "once", "run_at": past},
             "next_run_at": past,
         }])
 
         assert get_due_jobs() == []
-        assert load_jobs()[0]["enabled"] is False
+        assert [job["enabled"] for job in load_jobs()] == [False, False]
         assert list_jobs() == []
 
     def test_string_false_no_agent_is_normalized(self, tmp_cron_dir):

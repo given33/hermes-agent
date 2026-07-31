@@ -14,6 +14,7 @@ import concurrent.futures
 import contextvars
 import json
 import logging
+import math
 import os
 import re
 import shutil
@@ -58,6 +59,8 @@ def _coerce_cron_bool(value: Any, default: bool = False) -> bool:
     if isinstance(value, bool):
         return value
     if isinstance(value, (int, float)) and not isinstance(value, bool):
+        if isinstance(value, float) and not math.isfinite(value):
+            return default
         return value != 0
     if isinstance(value, str):
         normalized = value.strip().casefold()

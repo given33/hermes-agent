@@ -467,6 +467,8 @@ def _coerce_job_enabled(value: Any, default: bool = True) -> bool:
     if isinstance(value, bool):
         return value
     if isinstance(value, (int, float)) and not isinstance(value, bool):
+        if isinstance(value, float) and not math.isfinite(value):
+            return default
         return value != 0
     if isinstance(value, str):
         normalized = value.strip().casefold()
