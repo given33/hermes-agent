@@ -631,6 +631,8 @@ def parse_duration(s: str) -> int:
         raise ValueError(f"Invalid duration: '{s}'. Use format like '30m', '2h', or '1d'")
     
     value = int(match.group(1))
+    if value <= 0:
+        raise ValueError("Invalid duration: value must be greater than zero")
     unit = match.group(2)[0]  # First char: m, h, or d
     
     multipliers = {'m': 1, 'h': 60, 'd': 1440}
@@ -1744,7 +1746,11 @@ def mark_job_run(job_id: str, success: bool, error: Optional[str] = None,
                         return
                 
                 # Compute next run
-                job["next_run_at"] = compute_next_run(job["schedule"], now)
+                # A hand-edited legacy record may omit ``schedule`` entirely.
+                # ``compute_next_run`` is deliberately total for malformed
+                # values; use ``get`` here so marking the run still persists
+                # its terminal/error state instead of raising KeyError.
+                job["next_run_at"] = compute_next_run(job.get("schedule"), now)
 
                 # If no next run, decide whether this is terminal completion
                 # (one-shot) or a transient failure (recurring schedule couldn't

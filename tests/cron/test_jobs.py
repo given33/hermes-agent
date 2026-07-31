@@ -72,6 +72,11 @@ class TestParseDuration:
         with pytest.raises(ValueError, match="expected a string"):
             parse_duration(value)
 
+    @pytest.mark.parametrize("value", ["0m", "0h", "0d"])
+    def test_zero_duration_raises(self, value):
+        with pytest.raises(ValueError, match="greater than zero"):
+            parse_duration(value)
+
 
 # =========================================================================
 # parse_schedule
@@ -104,6 +109,10 @@ class TestParseSchedule:
         result = parse_schedule("Every 30m")
         assert result["kind"] == "interval"
         assert result["minutes"] == 30
+
+    def test_zero_interval_schedule_raises(self):
+        with pytest.raises(ValueError, match="greater than zero"):
+            parse_schedule("every 0m")
 
     def test_cron_expression(self):
         pytest.importorskip("croniter")
@@ -752,6 +761,18 @@ class TestMarkJobRun:
         assert updated is not None
         assert updated["last_status"] == "error"
         assert updated["last_error"] == "bad schedule"
+
+    def test_missing_schedule_does_not_abort_marking_run(self, tmp_cron_dir):
+        save_jobs([{"id": "missing-schedule", "next_run_at": None}])
+
+        mark_job_run("missing-schedule", success=False, error="missing schedule")
+
+        updated = get_job("missing-schedule")
+        assert updated is not None
+        assert updated["last_status"] == "error"
+        assert updated["last_error"] == "missing schedule"
+        assert updated["state"] == "completed"
+        assert updated["enabled"] is False
 
     def test_delivery_error_tracked_separately(self, tmp_cron_dir):
         """Agent succeeds but delivery fails — both tracked independently."""
