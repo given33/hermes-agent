@@ -171,7 +171,7 @@ def _structured_text(value: Any, limit: int = 12000) -> str:
 
 
 def _timestamp_ms(value: Any) -> int | None:
-    if not isinstance(value, (int, float)):
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
         return None
     numeric = float(value)
     # Malformed upstream timestamps must not take down the polling bridge.
@@ -638,15 +638,21 @@ def _activity_timing(source: dict[str, Any], fallback: Any) -> tuple[int | None,
     )
     duration_ms: int | None = None
     raw_duration = source.get("duration_ms")
-    if isinstance(raw_duration, (int, float)) and math.isfinite(float(raw_duration)):
+    if (
+        not isinstance(raw_duration, bool)
+        and isinstance(raw_duration, (int, float))
+        and math.isfinite(float(raw_duration))
+    ):
         duration_ms = max(0, int(raw_duration))
     elif (
-        isinstance(source.get("duration_seconds"), (int, float))
+        not isinstance(source.get("duration_seconds"), bool)
+        and isinstance(source.get("duration_seconds"), (int, float))
         and math.isfinite(float(source["duration_seconds"]))
     ):
         duration_ms = max(0, round(float(source["duration_seconds"]) * 1000))
     elif (
-        isinstance(source.get("duration_s"), (int, float))
+        not isinstance(source.get("duration_s"), bool)
+        and isinstance(source.get("duration_s"), (int, float))
         and math.isfinite(float(source["duration_s"]))
     ):
         duration_ms = max(0, round(float(source["duration_s"]) * 1000))
