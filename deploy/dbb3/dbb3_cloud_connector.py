@@ -1175,7 +1175,7 @@ def build_root_task_command(run_payload: dict[str, Any]) -> list[str]:
     try:
         if max_runtime:
             command.extend(["--max-runtime", f"{max(60, int(max_runtime))}s"])
-    except (TypeError, ValueError):
+    except (TypeError, ValueError, OverflowError):
         pass
     return command
 
