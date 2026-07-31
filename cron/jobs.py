@@ -456,6 +456,33 @@ def _normalize_repeat_record(job: Dict[str, Any]) -> Tuple[Optional[Dict[str, An
     return normalized, changed
 
 
+def _normalize_repeat_limit(value: Any) -> Optional[int]:
+    """Normalize a create/update repeat limit without truthiness/type traps.
+
+    The cron tool schema advertises an integer, but direct callers and older
+    integrations can still send numeric strings. Treat non-positive values as
+    the documented unlimited mode and reject malformed values with a useful
+    ``ValueError`` instead of leaking a ``TypeError`` from ``repeat <= 0``.
+    """
+    if value is None:
+        return None
+    if isinstance(value, bool):
+        raise ValueError("repeat must be an integer, not a boolean")
+    if isinstance(value, int):
+        parsed = value
+    elif isinstance(value, str):
+        text = value.strip()
+        if not text:
+            raise ValueError("repeat must be a positive integer or omitted")
+        try:
+            parsed = int(text)
+        except ValueError as exc:
+            raise ValueError("repeat must be a positive integer or omitted") from exc
+    else:
+        raise ValueError("repeat must be a positive integer or omitted")
+    return parsed if parsed > 0 else None
+
+
 def _job_schedule_kind(job: Dict[str, Any]) -> Optional[str]:
     """Return a stored job's schedule kind without trusting its JSON shape."""
     schedule = job.get("schedule")
@@ -1263,9 +1290,9 @@ def create_job(
     """
     parsed_schedule = parse_schedule(schedule)
 
-    # Normalize repeat: treat 0 or negative values as None (infinite)
-    if repeat is not None and repeat <= 0:
-        repeat = None
+    # Normalize repeat: treat 0 or negative values as None (infinite), while
+    # giving direct callers a stable validation error for malformed values.
+    repeat = _normalize_repeat_limit(repeat)
 
     # Auto-set repeat=1 for one-shot schedules if not specified
     if parsed_schedule["kind"] == "once" and repeat is None:

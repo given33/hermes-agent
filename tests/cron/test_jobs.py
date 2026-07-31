@@ -678,6 +678,15 @@ class TestMarkJobRun:
         mark_job_run(job["id"], success=True)
         assert get_job(job["id"]) is not None
 
+    def test_repeat_numeric_string_is_normalized(self, tmp_cron_dir):
+        job = create_job(prompt="StringRepeat", schedule="every 1h", repeat="3")
+        assert job["repeat"]["times"] == 3
+
+    @pytest.mark.parametrize("value", [True, 1.5, {}, "bad", ""])
+    def test_malformed_repeat_input_is_rejected(self, tmp_cron_dir, value):
+        with pytest.raises(ValueError, match="repeat"):
+            create_job(prompt="BadRepeat", schedule="every 1h", repeat=value)
+
     def test_error_status(self, tmp_cron_dir):
         job = create_job(prompt="Fail", schedule="every 1h")
         mark_job_run(job["id"], success=False, error="timeout")

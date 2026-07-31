@@ -26,6 +26,7 @@ from cron.jobs import (
     get_job,
     list_jobs,
     mark_job_run,
+    _normalize_repeat_limit,
     parse_schedule,
     pause_job,
     remove_job,
@@ -949,7 +950,7 @@ def cronjob(
                 updates["no_agent"] = target_no_agent
             if repeat is not None:
                 # Normalize: treat 0 or negative as None (infinite)
-                normalized_repeat = None if repeat <= 0 else repeat
+                normalized_repeat = _normalize_repeat_limit(repeat)
                 repeat_state = dict(job.get("repeat") or {})
                 repeat_state["times"] = normalized_repeat
                 updates["repeat"] = repeat_state
