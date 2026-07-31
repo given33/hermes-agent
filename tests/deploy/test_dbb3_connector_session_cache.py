@@ -63,6 +63,13 @@ def test_checkpoint_cursor_is_fail_closed_and_non_negative():
     assert connector_module._checkpoint_cursor(float("inf")) == 0
 
 
+def test_coerce_flag_handles_textual_values():
+    assert connector_module._coerce_flag("true") is True
+    assert connector_module._coerce_flag("false") is False
+    assert connector_module._coerce_flag("unexpected") is False
+    assert connector_module._coerce_flag(True) is True
+
+
 def test_build_root_command_ignores_non_finite_runtime_limit():
     command = connector_module.build_root_task_command(
         {"objective": "test", "remote_run_id": "run-1", "max_runtime_seconds": float("inf")}

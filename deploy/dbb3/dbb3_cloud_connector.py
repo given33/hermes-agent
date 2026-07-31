@@ -569,6 +569,18 @@ def _checkpoint_cursor(value: Any) -> int:
         return 0
 
 
+def _coerce_flag(value: Any, default: bool = False) -> bool:
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, str):
+        normalized = value.strip().lower()
+        if normalized in {"1", "true", "yes", "on"}:
+            return True
+        if normalized in {"0", "false", "no", "off", ""}:
+            return False
+    return default
+
+
 def _safe_filename(path: Path) -> str:
     name = path.name.replace("\x00", "").strip() or "artifact"
     name = _SAFE_NAME_RE.sub("_", name).strip(" .") or "artifact"
@@ -1434,7 +1446,7 @@ class DBB3CloudConnector:
             if cached:
                 self._session_cache.move_to_end(remote_id)
         refreshed_at = float(cached.get("refreshed_at") or 0.0)
-        terminal_loaded = bool(cached.get("terminal_loaded"))
+        terminal_loaded = _coerce_flag(cached.get("terminal_loaded"))
         if (
             cached.get("session_id") == session_id
             and time.monotonic() - refreshed_at < _SESSION_REFRESH_SECONDS
@@ -1701,7 +1713,7 @@ class DBB3CloudConnector:
                 "execution_profile": execution_profile,
                 "owner_id": owner_id,
                 "account_generation": account_generation,
-                "artifact_required": bool(run_payload.get("artifact_required")),
+                "artifact_required": _coerce_flag(run_payload.get("artifact_required")),
                 "claim_token": claim_token,
                 "status": current.get("status") or "running",
             }
@@ -1730,7 +1742,7 @@ class DBB3CloudConnector:
                 "with the verified result, or kanban_block with a concrete blocker. "
                 "A comment alone is not a terminal outcome."
             )
-            if bool(run_payload.get("artifact_required")):
+            if _coerce_flag(run_payload.get("artifact_required")):
                 workspace = objective_path.parent / "workspace"
                 workspace.mkdir(parents=True, exist_ok=True)
                 workspace.chmod(0o700)
@@ -1851,7 +1863,10 @@ class DBB3CloudConnector:
         paths: list[str],
         state: dict[str, Any],
     ) -> tuple[int, bool, list[str], bool]:
-        uploaded = local.setdefault("artifacts", {})
+        uploaded = local.get("artifacts")
+        if not isinstance(uploaded, dict):
+            uploaded = {}
+            local["artifacts"] = uploaded
         count = 0
         permanent_errors: list[str] = []
         transient_failure = False
@@ -1965,7 +1980,7 @@ class DBB3CloudConnector:
                 local["artifact_errors"] = list(artifact_errors)
                 self.checkpoints.save(state)
 
-        if payload.get("terminal") and bool(local.get("artifact_required")):
+        if payload.get("terminal") and _coerce_flag(local.get("artifact_required")):
             if not artifact_paths:
                 artifact_errors = ["Required artifact was not declared by the worker"]
             if artifact_errors:
