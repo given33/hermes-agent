@@ -69,6 +69,18 @@ def test_build_root_command_ignores_non_finite_runtime_limit():
     assert "--max-runtime" not in command
 
 
+def test_content_length_parser_rejects_invalid_headers():
+    assert connector_module._content_length_bytes(None) is None
+    assert connector_module._content_length_bytes("12") == 12
+    for value in ("broken", "-1"):
+        try:
+            connector_module._content_length_bytes(value)
+        except connector_module.ConnectorContractError as exc:
+            assert exc.status == 502
+        else:
+            raise AssertionError(f"invalid Content-Length accepted: {value}")
+
+
 def test_session_snapshot_cache_is_bounded_lru(tmp_path, monkeypatch):
     calls = []
 

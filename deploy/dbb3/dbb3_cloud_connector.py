@@ -204,6 +204,18 @@ def _dict_list_response(result: Any, key: str) -> list[dict[str, Any]]:
     return list(items)
 
 
+def _content_length_bytes(value: Any) -> int | None:
+    if value is None or value == "":
+        return None
+    try:
+        length = int(value)
+    except (TypeError, ValueError, OverflowError):
+        raise ConnectorContractError(502, "attachment Content-Length is invalid") from None
+    if length < 0:
+        raise ConnectorContractError(502, "attachment Content-Length is invalid")
+    return length
+
+
 def run(command: list[str], timeout: int = 30) -> tuple[int, str]:
     try:
         proc = subprocess.run(
@@ -448,8 +460,10 @@ class CloudRelayClient:
                 fd = -1
                 try:
                     with urllib.request.urlopen(request, timeout=self.timeout) as response:
-                        content_length = response.headers.get("Content-Length")
-                        if content_length and int(content_length) > MAX_ARTIFACT_BYTES:
+                        content_length = _content_length_bytes(
+                            response.headers.get("Content-Length")
+                        )
+                        if content_length is not None and content_length > MAX_ARTIFACT_BYTES:
                             raise ConnectorContractError(413, "attachment exceeds 64 MiB limit")
                         for chunk in iter(lambda: response.read(1024 * 1024), b""):
                             total += len(chunk)
