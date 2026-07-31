@@ -3,12 +3,15 @@ name: Deploy three Hermes endpoints
 on:
   push:
     branches: [main]
+  release:
+    types: [published]
   schedule:
     - cron: '17 */2 * * *'
   workflow_dispatch:
 
 permissions:
   contents: read
+  actions: read
 
 concurrency:
   group: hermes-three-endpoint-production
@@ -25,6 +28,44 @@ jobs:
         with:
           enable-cache: true
           cache-dependency-glob: uv.lock
+      - name: Wait for the complete CI gate
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_COMMIT: ${{ github.sha }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          deadline=$(( $(date +%s) + 900 ))
+          while :; do
+            run_json="$(gh run list \
+              --repo "$GITHUB_REPOSITORY" \
+              --workflow ci.yml \
+              --commit "$RELEASE_COMMIT" \
+              --limit 1 \
+              --json status,conclusion,headSha)"
+            if [ "$(printf '%s' "$run_json" | jq 'length')" -gt 0 ]; then
+              status="$(printf '%s' "$run_json" | jq -r '.[0].status')"
+              conclusion="$(printf '%s' "$run_json" | jq -r '.[0].conclusion // empty')"
+              case "$status" in
+                completed)
+                  if [ "$conclusion" = success ]; then
+                    echo "Complete CI gate passed for $RELEASE_COMMIT"
+                    break
+                  fi
+                  echo "::error::Complete CI gate ended with conclusion '$conclusion' for $RELEASE_COMMIT"
+                  exit 1
+                  ;;
+              esac
+              echo "CI gate is $status for $RELEASE_COMMIT; waiting"
+            else
+              echo "CI gate for $RELEASE_COMMIT has not been created; waiting"
+            fi
+            if [ "$(date +%s)" -ge "$deadline" ]; then
+              echo "::error::Timed out waiting for the complete CI gate for $RELEASE_COMMIT"
+              exit 1
+            fi
+            sleep 10
+          done
       - name: Install the locked backend environment
         run: uv sync --locked --python 3.11 --extra all --extra dev
       - name: Verify deployable backend boundaries
@@ -92,3 +133,104 @@ jobs:
             -o StrictHostKeyChecking=yes "$REMOTE" \
             "sudo -n /bin/bash -s -- '$EXPECTED_COMMIT' '$EXPECTED_VERSION'" \
             < deploy/public/verify-fabric-release.sh
+
+  dispatch-ios:
+    name: Build iOS app after backend release
+    needs: deploy-public
+    # Scheduled runs heal backend drift but must not enqueue an iOS build every
+    # two hours. Pushes and explicit manual runs represent source changes or an
+    # intentional replay and therefore fan out to the iOS repository.
+    if: needs.deploy-public.result == 'success' && (github.event_name == 'push' || github.event_name == 'release' || github.event_name == 'workflow_dispatch')
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+      - name: Dispatch and observe the iOS build
+        env:
+          GH_TOKEN: ${{ secrets.HERMES_IOS_WORKFLOW_TOKEN }}
+          IOS_REPOSITORY: ${{ vars.HERMES_IOS_REPOSITORY || 'given33/hermes-ios' }}
+          RELEASE_COMMIT: ${{ github.sha }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -n "${GH_TOKEN}" || {
+            echo "::error::HERMES_IOS_WORKFLOW_TOKEN is required to synchronize the iOS repository"
+            exit 1
+          }
+          release_version="$(python3 - <<'PY'
+          import json
+          from pathlib import Path
+          print(json.loads(Path('plugins/collaboration/dashboard/manifest.json').read_text(encoding='utf-8'))['version'])
+          PY
+          )"
+          release_name="Backend release ${RELEASE_COMMIT}"
+          unsigned_runs="$(gh run list \
+            --repo "${IOS_REPOSITORY}" \
+            --workflow ios-unsigned.yml \
+            --limit 50 \
+            --json databaseId,name,status,conclusion)"
+          unsigned_run="$(printf '%s' "${unsigned_runs}" | jq -r --arg name "${release_name}" \
+            'map(select(.name == $name and (.status == "queued" or .status == "in_progress" or (.status == "completed" and .conclusion == "success")))) | sort_by(.databaseId) | reverse | .[0].databaseId // empty')"
+          production_runs="$(gh run list \
+            --repo "${IOS_REPOSITORY}" \
+            --workflow ios-production-eas.yml \
+            --limit 50 \
+            --json databaseId,name,status,conclusion)"
+          production_run="$(printf '%s' "${production_runs}" | jq -r --arg name "${release_name}" \
+            'map(select(.name == $name and (.status == "queued" or .status == "in_progress" or (.status == "completed" and .conclusion == "success")))) | sort_by(.databaseId) | reverse | .[0].databaseId // empty')"
+
+          run_id="${unsigned_run}"
+          production_run_id="${production_run}"
+          if [ -n "${unsigned_run}" ] && [ -n "${production_run}" ]; then
+            echo "iOS release ${RELEASE_COMMIT} already has unsigned run ${unsigned_run} and production run ${production_run}; reusing them"
+          else
+            dispatch_started="$(date +%s)"
+            gh api --method POST "repos/${IOS_REPOSITORY}/dispatches" --input - <<EOF
+          {"event_type":"hermes-backend-release","client_payload":{"commit":"${RELEASE_COMMIT}","version":"${release_version}"}}
+          EOF
+            echo "Dispatched backend release ${RELEASE_COMMIT} (${release_version}) to ${IOS_REPOSITORY}"
+            run_id=""
+            production_run_id=""
+            for _ in $(seq 1 30); do
+              run_id="$(gh run list \
+              --repo "${IOS_REPOSITORY}" \
+              --workflow ios-unsigned.yml \
+              --event repository_dispatch \
+              --limit 20 \
+              --json databaseId,createdAt \
+              --jq "map(select((.createdAt | fromdateiso8601) >= ${dispatch_started})) | sort_by(.createdAt) | reverse | .[0].databaseId // empty")"
+              [ -n "${run_id}" ] && break
+              sleep 2
+            done
+            for _ in $(seq 1 30); do
+              production_run_id="$(gh run list \
+                --repo "${IOS_REPOSITORY}" \
+                --workflow ios-production-eas.yml \
+                --event repository_dispatch \
+                --limit 20 \
+                --json databaseId,createdAt \
+                --jq "map(select((.createdAt | fromdateiso8601) >= ${dispatch_started})) | sort_by(.createdAt) | reverse | .[0].databaseId // empty")"
+              [ -n "${production_run_id}" ] && break
+              sleep 2
+            done
+          fi
+          test -n "${run_id}" || {
+            echo "::error::iOS repository dispatch was accepted but its unsigned run could not be observed"
+            exit 1
+          }
+          test -n "${production_run_id}" || {
+            echo "::error::iOS repository dispatch was accepted but its production EAS run could not be observed"
+            exit 1
+          }
+          echo "Observing iOS unsigned run ${run_id}"
+          if ! gh run watch "${run_id}" --repo "${IOS_REPOSITORY}" --interval 15 --exit-status; then
+            gh run view "${run_id}" --repo "${IOS_REPOSITORY}" \
+              --json databaseId,status,conclusion,headSha,url
+            exit 1
+          fi
+          echo "Observing iOS production EAS run ${production_run_id}"
+          if ! gh run watch "${production_run_id}" --repo "${IOS_REPOSITORY}" --interval 15 --exit-status; then
+            gh run view "${production_run_id}" --repo "${IOS_REPOSITORY}" \
+              --json databaseId,status,conclusion,headSha,url
+            exit 1
+          fi

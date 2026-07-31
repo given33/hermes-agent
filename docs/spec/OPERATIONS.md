@@ -63,6 +63,36 @@ HERMES_UID=$(id -u) HERMES_GID=$(id -g) docker compose up -d
 
 ---
 
+### 1.5 GitHub Actions production fan-out
+
+The `deploy-three-endpoints.yml` workflow is the release gate for the public
+backend and its fabric nodes. A successful push to `main`, published release,
+or explicit manual run first waits for the same commit's complete `CI`
+workflow, then dispatches the `hermes-backend-release` event to the iOS
+repository. That event starts both the unsigned IPA verification and the signed
+production EAS workflow. Scheduled drift-healing runs intentionally skip the
+iOS fan-out so they do not enqueue an app build every two hours.
+
+Configure the following repository settings before enabling this fan-out:
+
+- Secret `HERMES_IOS_WORKFLOW_TOKEN`: a short-lived or narrowly scoped token
+  with Contents write and Actions read access to the target iOS repository. It
+  must be able to call the repository dispatch API and read workflow runs.
+- Repository variable `HERMES_IOS_REPOSITORY`: optional; defaults to
+  `given33/hermes-ios` and should be set when the iOS repository moves.
+- The target workflows must keep `repository_dispatch` enabled for event type
+  `hermes-backend-release`. A missing token, an unobservable dispatch, or a
+  failed unsigned iOS run fails the fan-out job after the backend deployment
+  has already completed, leaving an explicit GitHub check to prevent silent
+  drift. The signed EAS job separately fails closed when `EXPO_TOKEN` is not
+  configured.
+
+The `deploy-site.yml` workflow deploys GitHub Pages and triggers the Vercel
+deploy hook for release events, matching `main` pushes, and manual runs. The
+Vercel hook secret is `VERCEL_DEPLOY_HOOK`.
+
+---
+
 ## 2. 进程与端口
 
 ### 2.1 端口总表(默认值,均可配)

@@ -14,6 +14,8 @@ on:
   pull_request:
   push:
     branches: [main]
+  release:
+    types: [published]
 
 permissions:
   contents: read
@@ -173,8 +175,7 @@ jobs:
       - docker-lint
       - supply-chain
       - osv-scanner
-      # we don't require docker to pass rn because it's so slow lol
-      # - docker
+      - docker
     if: always()
     runs-on: ubuntu-latest
     timeout-minutes: 10
@@ -186,13 +187,16 @@ jobs:
           echo "$NEEDS" | python3 -c "
           import json, sys
           needs = json.load(sys.stdin)
-          failed = [name for name, info in needs.items() if info['result'] == 'failure']
+          failed = [
+              name for name, info in needs.items()
+              if info['result'] not in ('success', 'skipped')
+          ]
           for name, info in sorted(needs.items()):
               result = info['result']
               icon = '✅' if result in ('success', 'skipped') else '❌'
               print(f'{icon} {name}: {result}')
           if failed:
-              print(f'::error::{len(failed)} job(s) failed: {\", \".join(failed)}')
+              print(f'::error::{len(failed)} required job(s) did not pass: {\", \".join(failed)}')
               sys.exit(1)
           print('All checks passed (or were skipped)')
           "

@@ -10,6 +10,8 @@ import subprocess
 import sys
 from unittest import mock
 
+import pytest
+
 
 ROOT = Path(__file__).resolve().parents[2]
 DBB3 = ROOT / "deploy" / "dbb3"
@@ -20,6 +22,7 @@ AUTOMATION = ROOT / "deploy" / "automation"
 UPSTREAM_REPORT = ROOT / "scripts" / "upstream_change_report.py"
 UPSTREAM_WORKFLOW = ROOT / ".github" / "workflows" / "upstream-sync.yml"
 DEPLOY_WORKFLOW = ROOT / ".github" / "workflows" / "deploy-three-endpoints.yml"
+SITE_WORKFLOW = ROOT / ".github" / "workflows" / "deploy-site.yml"
 
 
 def _posix_path(path: Path) -> str:
@@ -27,11 +30,20 @@ def _posix_path(path: Path) -> str:
         return str(path)
     wsl = shutil.which("wsl.exe")
     if not wsl:
-        raise RuntimeError("WSL is required for deployment script tests")
-    return subprocess.check_output(
-        [wsl, "wslpath", "-a", str(path).replace("\\", "/")],
-        text=True,
-    ).strip()
+        pytest.skip("WSL is required for deployment script tests")
+    try:
+        result = subprocess.run(
+            [wsl, "wslpath", "-a", str(path).replace("\\", "/")],
+            capture_output=True,
+            timeout=15,
+            check=False,
+        )
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        pytest.skip(f"WSL is unavailable: {exc}")
+    stdout = result.stdout.decode("utf-8", errors="replace").strip()
+    if result.returncode != 0 or not stdout:
+        pytest.skip("WSL service is unavailable for deployment script tests")
+    return stdout
 
 
 def _write_executable(path: Path, content: str) -> None:
@@ -129,11 +141,7 @@ def test_deployment_shell_scripts_have_valid_syntax():
                 continue
             # wsl.exe can consume backslashes while forwarding argv to Linux.
             # wslpath accepts forward-slash Windows paths without ambiguity.
-            windows_path = str(path).replace("\\", "/")
-            posix_path = subprocess.check_output(
-                [wsl, "wslpath", "-a", windows_path],
-                text=True,
-            ).strip()
+            posix_path = _posix_path(path)
             command = [wsl, "bash", "-n", posix_path]
         else:
             command = [bash, "-n", str(path)]
@@ -227,7 +235,12 @@ def test_three_endpoint_updates_follow_only_a_committed_main_release():
     assert "/usr/local/lib/hermes-agent" in service
     assert "push:" in workflow
     assert "branches: [main]" in workflow
+    assert "release:" in workflow
+    assert "types: [published]" in workflow
     assert "needs: verify" in workflow
+    assert "actions: read" in workflow
+    assert "Wait for the complete CI gate" in workflow
+    assert "--workflow ci.yml" in workflow
     assert "workflow_run:" not in workflow
     assert "tests/architecture/test_bare_config_reads.py" in workflow
     assert "tests/hermes_cli/test_ios_intelligence.py" in workflow
@@ -241,6 +254,56 @@ def test_three_endpoint_updates_follow_only_a_committed_main_release():
     assert "HERMES_SSH_KNOWN_HOSTS" in workflow
     assert "HERMES_SSH_KNOWN_HOSTS" in deployer
     assert "StrictHostKeyChecking=yes" in deployer
+
+
+def test_production_release_synchronizes_the_ios_workflow_observably():
+    workflow = DEPLOY_WORKFLOW.read_text(encoding="utf-8")
+
+    assert "dispatch-ios:" in workflow
+    assert "needs: deploy-public" in workflow
+    assert "github.event_name == 'push'" in workflow
+    assert "github.event_name == 'release'" in workflow
+    assert "github.event_name == 'workflow_dispatch'" in workflow
+    assert "github.event_name == 'schedule'" not in workflow.split(
+        "dispatch-ios:", 1
+    )[1]
+    assert "HERMES_IOS_WORKFLOW_TOKEN" in workflow
+    assert "IOS_REPOSITORY" in workflow
+    assert "given33/hermes-ios" in workflow
+    assert "ios-unsigned.yml" in workflow
+    assert 'gh api --method POST "repos/${IOS_REPOSITORY}/dispatches"' in workflow
+    assert '"event_type":"hermes-backend-release"' in workflow
+    assert '"commit":"${RELEASE_COMMIT}"' in workflow
+    assert '"version":"${release_version}"' in workflow
+    assert "release_name=\"Backend release ${RELEASE_COMMIT}\"" in workflow
+    assert "ios-production-eas.yml" in workflow
+    assert "already has unsigned run" in workflow
+    assert "production EAS run could not be observed" in workflow
+    assert 'echo "Observing iOS production EAS run ${production_run_id}"' in workflow
+    assert "--event repository_dispatch" in workflow
+    assert "gh run watch" in workflow
+    assert "--exit-status" in workflow
+    assert "repository dispatch was accepted but its unsigned run could not be observed" in workflow
+
+    operations = (ROOT / "docs" / "spec" / "OPERATIONS.md").read_text(encoding="utf-8")
+    assert "Contents write and Actions read access" in operations
+
+
+def test_site_pushes_trigger_vercel_and_pages_deployments():
+    workflow = SITE_WORKFLOW.read_text(encoding="utf-8")
+
+    assert "release:" in workflow
+    assert "types: [published]" in workflow
+    assert "branches: [main]" in workflow
+    assert "website/**" in workflow
+    vercel_job = workflow[workflow.index("deploy-vercel:") : workflow.index("deploy-docs:")]
+    assert "github.repository == 'NousResearch/hermes-agent'" in vercel_job
+    assert "github.event_name == 'push'" in vercel_job
+    assert "VERCEL_DEPLOY_HOOK" in vercel_job
+    assert 'curl -fsS --retry 3 --retry-delay 10 -X POST "$VERCEL_DEPLOY_HOOK"' in vercel_job
+    assert "secrets.VERCEL_DEPLOY_HOOK" in vercel_job
+    assert '"${{ secrets.VERCEL_DEPLOY_HOOK }}"' not in vercel_job
+    assert "github.event_name == 'release' || github.event_name == 'push' || github.event_name == 'workflow_dispatch'" in vercel_job
 
 
 def test_fabric_updater_transaction_and_rollback_behavior():
