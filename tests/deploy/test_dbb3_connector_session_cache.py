@@ -26,6 +26,16 @@ def test_cloud_client_rejects_malformed_list_responses():
         raise AssertionError("malformed runs response was accepted")
 
 
+def test_activity_timing_ignores_non_finite_duration_values():
+    started, completed, duration = connector_module._activity_timing(
+        {"duration_ms": float("nan"), "duration_seconds": float("inf")},
+        None,
+    )
+    assert started is None
+    assert completed is None
+    assert duration is None
+
+
 def test_session_snapshot_cache_is_bounded_lru(tmp_path, monkeypatch):
     calls = []
 

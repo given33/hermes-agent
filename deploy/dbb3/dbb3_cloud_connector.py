@@ -597,11 +597,17 @@ def _activity_timing(source: dict[str, Any], fallback: Any) -> tuple[int | None,
     )
     duration_ms: int | None = None
     raw_duration = source.get("duration_ms")
-    if isinstance(raw_duration, (int, float)):
+    if isinstance(raw_duration, (int, float)) and math.isfinite(float(raw_duration)):
         duration_ms = max(0, int(raw_duration))
-    elif isinstance(source.get("duration_seconds"), (int, float)):
+    elif (
+        isinstance(source.get("duration_seconds"), (int, float))
+        and math.isfinite(float(source["duration_seconds"]))
+    ):
         duration_ms = max(0, round(float(source["duration_seconds"]) * 1000))
-    elif isinstance(source.get("duration_s"), (int, float)):
+    elif (
+        isinstance(source.get("duration_s"), (int, float))
+        and math.isfinite(float(source["duration_s"]))
+    ):
         duration_ms = max(0, round(float(source["duration_s"]) * 1000))
     elif started_at is not None and completed_at is not None:
         duration_ms = max(0, completed_at - started_at)
