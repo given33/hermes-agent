@@ -71,6 +71,22 @@ def test_independent_servers_do_not_leak_other_capability_tools(tmp_path):
     }
 
 
+def test_clipboard_tools_are_scoped_and_require_confirmation_for_writes(tmp_path):
+    store = IOSIntelligenceStore(tmp_path)
+    server = create_mcp_server("ios-clipboard", store=store)
+    assert {tool.name for tool in _tools(server)} == {
+        "ios_clipboard_read", "ios_clipboard_write",
+    }
+    read = _call(server, "ios_clipboard_read", {"owner_id": "alice"})
+    assert read["action_metadata"]["confirmation"] == "none"
+    write = _call(server, "ios_clipboard_write", {
+        "owner_id": "alice", "text": "draft", "confirmed": False,
+    })
+    assert write["action_metadata"]["confirmation"] == "required"
+    queued = store.pull_device_commands("alice", "iphone")["commands"]
+    assert queued[-1]["payload"] == {"text": "draft"}
+
+
 def test_screen_time_server_exposes_native_monitor_controls(tmp_path):
     store = IOSIntelligenceStore(tmp_path)
     names = {

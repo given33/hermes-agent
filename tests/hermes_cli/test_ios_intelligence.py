@@ -21,6 +21,7 @@ from hermes_cli.ios_intelligence import (
     QWeatherClient,
     WEATHER_MONTHLY_LIMIT,
     WEATHER_SOFT_LIMIT,
+    ios_native_action_metadata,
     load_ios_feature_weights,
 )
 
@@ -1163,6 +1164,22 @@ def test_device_command_queue_survives_delivery_and_ack(store, monkeypatch):
     assert store.pull_device_commands("bob", "iphone")["commands"] == []
     assert store.ack_device_command("alice", first["id"], result={"native_id": "r1"}) is True
     assert store.ack_device_command("alice", first["id"], result={}) is False
+
+
+def test_native_action_metadata_fails_closed_for_unknown_actions():
+    assert ios_native_action_metadata("ios-calendar", "create")["confirmation"] == "required"
+    assert ios_native_action_metadata("ios-clipboard", "read")["risk"] == "read"
+    unknown = ios_native_action_metadata("ios-device", "future-write")
+    assert unknown["risk"] == "destructive"
+    assert unknown["confirmation"] == "required"
+
+
+def test_pulled_commands_include_canonical_native_action_metadata(store):
+    command = store.queue_device_command("alice", "ios-reminders", "create", {"title": "x"})
+    pulled = store.pull_device_commands("alice", "iphone")["commands"][0]
+    assert pulled["id"] == command["id"]
+    assert pulled["action_metadata"]["permission"] == "reminders"
+    assert pulled["action_metadata"]["confirmation"] == "required"
 
 
 def test_device_command_delivery_lease_recovers_unacknowledged_pull(store):

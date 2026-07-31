@@ -47,6 +47,64 @@ logger = logging.getLogger(__name__)
 WEATHER_MONTHLY_LIMIT = 30_000
 WEATHER_SOFT_LIMIT = 28_500
 DEFAULT_TIMEZONE = "Asia/Shanghai"
+
+# The mobile relay treats this envelope as a security boundary.  It is
+# derived from the server-side capability/action pair rather than trusting
+# metadata supplied by an MCP caller or a device payload.  Unknown actions
+# fail closed so a newly added native operation cannot silently become an
+# unconfirmed write.
+_IOS_NATIVE_ACTION_POLICY: dict[tuple[str, str], dict[str, Any]] = {
+    ("ios-clipboard", "read"): {"risk": "read", "confirmation": "none", "permission": None},
+    ("ios-clipboard", "get"): {"risk": "read", "confirmation": "none", "permission": None},
+    ("ios-clipboard", "write"): {"risk": "write", "confirmation": "required", "permission": None},
+    ("ios-clipboard", "set"): {"risk": "write", "confirmation": "required", "permission": None},
+    ("ios-calendar", "create"): {"risk": "write", "confirmation": "required", "permission": "calendar"},
+    ("ios-reminders", "create"): {"risk": "write", "confirmation": "required", "permission": "reminders"},
+    ("ios-notes", "share-text"): {"risk": "write", "confirmation": "required", "permission": None},
+    ("ios-notification", "send"): {"risk": "write", "confirmation": "required", "permission": "notification"},
+    ("ios-notification", "schedule"): {"risk": "write", "confirmation": "required", "permission": "notification"},
+    ("ios-notification", "cancel"): {"risk": "write", "confirmation": "required", "permission": "notification"},
+    ("ios-live-activity", "update"): {"risk": "write", "confirmation": "required", "permission": None},
+    ("ios-live-activity", "start"): {"risk": "write", "confirmation": "required", "permission": None},
+    ("ios-live-activity", "end"): {"risk": "write", "confirmation": "required", "permission": None},
+    ("ios-device", "delete-account-data"): {"risk": "destructive", "confirmation": "required", "permission": None},
+}
+
+_IOS_NATIVE_READ_ACTIONS = frozenset({
+    "get", "latest", "list", "current", "refresh", "read", "today", "snapshot",
+    "history", "capabilities", "evaluate", "server", "query", "plan",
+})
+
+
+def ios_native_action_metadata(capability: str, action: str) -> dict[str, Any]:
+    """Return the canonical policy envelope for a queued native action."""
+
+    normalized_capability = str(capability or "").strip().lower()
+    normalized_action = str(action or "").strip().lower()
+    policy = _IOS_NATIVE_ACTION_POLICY.get((normalized_capability, normalized_action))
+    if policy is None:
+        if normalized_action in _IOS_NATIVE_READ_ACTIONS:
+            risk, confirmation = "read", "none"
+        else:
+            # Device code must not guess that a future action is harmless.
+            risk, confirmation = "destructive", "required"
+        permission = None
+    else:
+        risk = str(policy["risk"])
+        confirmation = str(policy["confirmation"])
+        permission = policy.get("permission")
+    return {
+        "action_id": f"ios.{normalized_capability}.{normalized_action}",
+        "capability": normalized_capability,
+        "action": normalized_action,
+        "risk": risk,
+        "permission": permission,
+        "confirmation": confirmation,
+        "max_attempts": 3,
+        "audit_kind": "ios-action-audit",
+    }
+
+
 _CURRENT_COLLECTION_INDEX_KINDS = {
     "calendar": "calendar-index",
     "reminder": "reminder-index",
@@ -2356,7 +2414,12 @@ class IOSIntelligenceStore:
                     (owner_id, idempotency_key),
                 ).fetchone()
                 if existing:
-                    return {"id": existing["id"], "status": existing["status"], "duplicate": True}
+                    return {
+                        "id": existing["id"],
+                        "status": existing["status"],
+                        "duplicate": True,
+                        "action_metadata": ios_native_action_metadata(capability, action),
+                    }
             conn.execute(
                 "INSERT INTO ios_device_commands(id,owner_id,device_id,capability,action,payload_json,"
                 "idempotency_key,status,not_before,expires_at,created_at) VALUES(?,?,?,?,?,?,?,'pending',?,?,?)",
@@ -2372,6 +2435,7 @@ class IOSIntelligenceStore:
             "id": command_id,
             "status": "pending",
             "duplicate": False,
+            "action_metadata": ios_native_action_metadata(capability, action),
         }
         try:
             from hermes_cli.dashboard_auth.mobile_notifications import (
@@ -2465,6 +2529,7 @@ class IOSIntelligenceStore:
         commands = [
             {"id": row["id"], "capability": row["capability"], "action": row["action"],
              "payload": self._open_json(owner_id, row["payload_json"], "ios_device_commands.payload_json"),
+             "action_metadata": ios_native_action_metadata(row["capability"], row["action"]),
              "created_at": row["created_at"],
              "expires_at": row["expires_at"]}
             for row in rows
@@ -4672,5 +4737,6 @@ __all__ = [
     "QWeatherClient",
     "WEATHER_MONTHLY_LIMIT",
     "WEATHER_SOFT_LIMIT",
+    "ios_native_action_metadata",
     "load_ios_feature_weights",
 ]

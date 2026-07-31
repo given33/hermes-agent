@@ -36,7 +36,7 @@ CAPABILITIES = (
     "ios-location", "ios-trajectory", "ios-places", "ios-motion", "ios-behavior",
     "qweather", "amap-route", "ios-map", "ios-power", "ios-health-sleep",
     "ios-health-heart", "ios-health-oxygen", "ios-health-activity", "ios-calendar",
-    "ios-reminders", "ios-notes", "ios-screen-time", "ios-watch", "ios-notification",
+    "ios-reminders", "ios-clipboard", "ios-notes", "ios-screen-time", "ios-watch", "ios-notification",
     "ios-live-activity", "ios-device",
 )
 
@@ -57,6 +57,7 @@ _SCOPE_BY_CAPABILITY = {
     "ios-health-activity": ("health:activity:read",),
     "ios-calendar": ("calendar:read", "calendar:write"),
     "ios-reminders": ("reminders:read", "reminders:write"),
+    "ios-clipboard": ("clipboard:read", "clipboard:write"),
     "ios-notes": ("notes:share",),
     "ios-screen-time": ("screen-time:read", "screen-time:control"),
     "ios-watch": ("watch:read", "watch:control"),
@@ -111,6 +112,10 @@ _TOOL_SCOPE_BY_CAPABILITY = {
     "ios-reminders": {
         "ios_reminders_list": ("reminders:read",),
         "ios_reminder_create": ("reminders:write",),
+    },
+    "ios-clipboard": {
+        "ios_clipboard_read": ("clipboard:read",),
+        "ios_clipboard_write": ("clipboard:write",),
     },
     "ios-notes": {"ios_notes_share_text": ("notes:share",)},
     "ios-screen-time": {
@@ -794,6 +799,65 @@ def create_mcp_server(
         _queue_tool(
             mcp, enforcer, store, capability, "ios_reminder_create", "create",
             "Use automatically when the user asks Hermes to create an iOS reminder. Queue the native EventKit operation with title and due date in payload.",
+        )
+        return mcp
+
+    if capability == "ios-clipboard":
+        def ios_clipboard_read(owner_id: str = "", device_id: str = "", idempotency_key: str = "") -> dict[str, Any]:
+            """Queue a read of the current iPhone clipboard for the requesting account."""
+            owner_id = _resolve_owner(store, owner_id)
+            return store.queue_device_command(
+                owner_id,
+                capability,
+                "read",
+                {},
+                device_id=device_id,
+                idempotency_key=idempotency_key,
+            )
+
+        def ios_clipboard_write(
+            text: str,
+            owner_id: str = "",
+            device_id: str = "",
+            idempotency_key: str = "",
+            confirmed: bool = False,
+            confirmation_token: str = "",
+        ) -> dict[str, Any]:
+            """Queue a clipboard write; explicit user confirmation is required on the phone."""
+            owner_id = _resolve_owner(store, owner_id)
+            normalized_text = str(text or "")
+            if not normalized_text:
+                raise ValueError("text is required")
+            payload: dict[str, Any] = {"text": normalized_text[:100_000]}
+            if confirmed:
+                payload["confirmed"] = True
+            normalized_token = str(confirmation_token or "").strip()
+            if normalized_token:
+                payload["confirmation_token"] = normalized_token[:512]
+            return store.queue_device_command(
+                owner_id,
+                capability,
+                "write",
+                payload,
+                device_id=device_id,
+                idempotency_key=idempotency_key,
+            )
+
+        _register_scoped_tool(
+            mcp,
+            enforcer,
+            capability,
+            ios_clipboard_read,
+            name="ios_clipboard_read",
+            description="Use when Hermes needs to read the current iPhone clipboard into a task.",
+        )
+        _register_scoped_tool(
+            mcp,
+            enforcer,
+            capability,
+            ios_clipboard_write,
+            name="ios_clipboard_write",
+            description="Use when Hermes should write task output to the iPhone clipboard after the user explicitly approves it.",
         )
         return mcp
 
