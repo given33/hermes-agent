@@ -1627,7 +1627,7 @@ class DBB3CloudConnector:
                 summary="Account deletion stopped the accepted Hermes run",
             )
             root_id = _text(local.get("root_task_id"), 256)
-            if root_id and not local.get("terminal_local_stopped"):
+            if root_id and not _coerce_flag(local.get("terminal_local_stopped")):
                 code, output = self.command_runner(
                     self._build_cancel_command(
                         root_id,
@@ -1692,7 +1692,7 @@ class DBB3CloudConnector:
             existing = _text(current.get(key), 256)
             if existing and incoming != existing:
                 raise RuntimeError("Cloud run account boundary changed after acceptance")
-        if current.get("terminal_acked") and str(current.get("status") or "") in TERMINAL_STATUSES:
+        if _coerce_flag(current.get("terminal_acked")) and str(current.get("status") or "") in TERMINAL_STATUSES:
             return current
         if current.get("root_task_id"):
             self._assert_local_account_boundary(current, state)
@@ -1765,7 +1765,7 @@ class DBB3CloudConnector:
                 }
             )
             self.checkpoints.save(state)
-        if not current.get("acked"):
+        if not _coerce_flag(current.get("acked")):
             self.cloud_client.acknowledge_run(run_payload, current)
             current["acked"] = True
             self.checkpoints.save(state)
@@ -1994,7 +1994,7 @@ class DBB3CloudConnector:
                 )
             elif transient_upload_failure or not uploads_complete:
                 pending = local.get("pending_status")
-                if isinstance(pending, dict) and pending.get("terminal"):
+                if isinstance(pending, dict) and _coerce_flag(pending.get("terminal")):
                     local.pop("pending_status", None)
                     local.pop("pending_status_fingerprint", None)
                     self.checkpoints.save(state)
@@ -2006,7 +2006,7 @@ class DBB3CloudConnector:
             # retryable and keep the remote run active.
             if transient_upload_failure or (not uploads_complete and not artifact_errors):
                 pending = local.get("pending_status")
-                if isinstance(pending, dict) and pending.get("terminal"):
+                if isinstance(pending, dict) and _coerce_flag(pending.get("terminal")):
                     local.pop("pending_status", None)
                     local.pop("pending_status_fingerprint", None)
                     self.checkpoints.save(state)
@@ -2019,7 +2019,7 @@ class DBB3CloudConnector:
             json.dumps(fingerprint_payload, ensure_ascii=False, sort_keys=True).encode("utf-8")
         ).hexdigest()
         pending = local.get("pending_status")
-        if isinstance(pending, dict) and pending.get("terminal"):
+        if isinstance(pending, dict) and _coerce_flag(pending.get("terminal")):
             pending_fingerprint_payload = dict(pending)
             pending_fingerprint_payload.pop("checkpoint_cursor", None)
             pending_fingerprint_payload.pop("observed_at", None)
@@ -2067,7 +2067,7 @@ class DBB3CloudConnector:
         remote_id = _text(run_payload.get("remote_run_id"), 256)
         if not local or not remote_id:
             return 0, 0
-        if local.get("terminal_acked") and str(local.get("status") or "") in TERMINAL_STATUSES:
+        if _coerce_flag(local.get("terminal_acked")) and str(local.get("status") or "") in TERMINAL_STATUSES:
             return 0, 0
         return self._sync_local_run(remote_id, local, state)
 
@@ -2076,7 +2076,7 @@ class DBB3CloudConnector:
         if not remote_id:
             return 0
         local = _checkpoint_run(state, remote_id)
-        if local.get("cancel_acked"):
+        if _coerce_flag(local.get("cancel_acked")):
             return 0
         root_id = _text(item.get("root_task_id") or local.get("root_task_id"), 256)
         reason = _text(item.get("reason"), 500) or "Cancelled by cloud user"
@@ -2191,7 +2191,7 @@ class DBB3CloudConnector:
             if isinstance(local.get("pending_terminal_failure"), dict):
                 statuses += int(self._flush_terminal_failure(remote_id, local, state))
                 continue
-            if not local.get("acked") or not local.get("root_task_id"):
+            if not _coerce_flag(local.get("acked")) or not local.get("root_task_id"):
                 continue
             if str(local.get("status") or "") in TERMINAL_STATUSES:
                 artifact_paths = [
@@ -2199,7 +2199,7 @@ class DBB3CloudConnector:
                     for path in local.get("artifact_paths") or []
                     if _text(path, 2048)
                 ]
-                if artifact_paths and not local.get("artifacts_synced"):
+                if artifact_paths and not _coerce_flag(local.get("artifacts_synced")):
                     uploaded, complete, _errors, _transient = self._upload_artifacts(
                         remote_id,
                         local,
