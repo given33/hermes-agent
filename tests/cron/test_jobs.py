@@ -67,12 +67,22 @@ class TestParseDuration:
         with pytest.raises(ValueError):
             parse_duration("m30")
 
+    @pytest.mark.parametrize("value", [None, 30, {}, []])
+    def test_non_string_input_raises_value_error(self, value):
+        with pytest.raises(ValueError, match="expected a string"):
+            parse_duration(value)
+
 
 # =========================================================================
 # parse_schedule
 # =========================================================================
 
 class TestParseSchedule:
+    @pytest.mark.parametrize("value", [None, 30, {}, []])
+    def test_non_string_input_raises_value_error(self, value):
+        with pytest.raises(ValueError, match="expected a string"):
+            parse_schedule(value)
+
     def test_duration_becomes_once(self):
         result = parse_schedule("30m")
         assert result["kind"] == "once"
