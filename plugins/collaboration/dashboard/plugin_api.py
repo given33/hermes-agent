@@ -17821,6 +17821,12 @@ class MobileHostedRetryBody(BaseModel):
     request_id: str = Field(min_length=8, max_length=256)
 
 
+class MobileRuntimeControlBody(BaseModel):
+    action: str = Field(min_length=1, max_length=32)
+    request_id: str = Field(default="", max_length=256)
+    reason: str = Field(default="mobile task control", max_length=512)
+
+
 def _mobile_profile_home(profile: str) -> tuple[str, Path]:
     backend = _backend_api()
     try:
@@ -18733,6 +18739,60 @@ def mobile_runtime_run_detail(
     if run is None:
         raise HTTPException(status_code=404, detail="Runtime run not found")
     return {"run": run, "sources": payload.get("sources", {})}
+
+
+@router.post("/mobile/runtime-runs/{run_id}/control")
+def mobile_runtime_run_control(
+    run_id: str,
+    body: MobileRuntimeControlBody,
+    request: Request,
+):
+    """Apply a task control emitted by Siri, a widget, or Live Activity."""
+
+    owner_id = owner_id_from_request(request)
+    action = str(body.action or "").strip().lower()
+    if action not in {"cancel", "retry", "pause", "resume"}:
+        raise HTTPException(status_code=422, detail="Unknown runtime control")
+    token = str(run_id or "").strip()
+    conversation_id = ""
+    turn_id = ""
+    if token.startswith("hosted:"):
+        _prefix, conversation_id, turn_id = token.split(":", 2) if token.count(":") >= 2 else ("", "", "")
+    else:
+        turn_id = token
+    conversations = _mobile_owned_conversations(owner_id)
+    conversation = next(
+        (
+            item for item in conversations
+            if isinstance(item, dict)
+            and (not conversation_id or str(item.get("id") or "") == conversation_id)
+            and isinstance(item.get("hosted_turns"), dict)
+            and isinstance(item["hosted_turns"].get(turn_id), dict)
+        ),
+        None,
+    )
+    if conversation is None:
+        raise HTTPException(status_code=404, detail="Runtime run not found")
+    conversation_id = str(conversation.get("id") or "")
+    if action in {"cancel", "pause"}:
+        try:
+            run = request_hosted_turn_cancellation(
+                conversation_id,
+                turn_id,
+                reason=body.reason if action == "cancel" else "paused from iOS task control",
+                request_id=body.request_id,
+            )
+        except RuntimeError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+        return {"action": action, "hosted_turn": _public_hosted_turn(run)}
+    request_id = body.request_id.strip() or f"mobile-retry-{uuid.uuid4().hex}"
+    retry = retry_hosted_turn(
+        conversation_id,
+        turn_id,
+        MobileHostedRetryBody(request_id=request_id),
+        request,
+    )
+    return {"action": action, **retry}
 
 
 if __name__ == "__main__" and "--profile-event-runner" in sys.argv:
