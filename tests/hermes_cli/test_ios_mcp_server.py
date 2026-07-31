@@ -283,7 +283,7 @@ def test_calendar_create_queues_native_device_command(tmp_path):
     result = _call(
         server,
         "ios_calendar_create",
-        {"owner_id": "alice", "payload": {"title": "自习", "start": "2026-07-19T09:00:00+08:00"}},
+            {"owner_id": "alice", "payload": {"title": "自习", "start": "2026-07-19T09:00:00+08:00"}, "idempotency_key": "calendar-create-test"},
     )
     commands = store.pull_device_commands("alice", "iphone")["commands"]
     assert result["status"] == "pending"
