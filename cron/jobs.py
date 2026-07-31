@@ -888,8 +888,25 @@ def load_jobs() -> List[Dict[str, Any]]:
     # list (auto-repair). Anything else (str/number/null) is corruption that
     # would otherwise raise an uncaught AttributeError on ``.get()`` and take
     # down the whole cron subsystem.
+    def _valid_records(raw_jobs: Any) -> List[Dict[str, Any]]:
+        if not isinstance(raw_jobs, list):
+            raise RuntimeError(
+                "Cron database corrupted: expected 'jobs' to be a list, "
+                f"got {type(raw_jobs).__name__}"
+            )
+        valid = [record for record in raw_jobs if isinstance(record, dict)]
+        dropped = len(raw_jobs) - len(valid)
+        if dropped:
+            logger.error(
+                "Ignoring %d malformed non-object record(s) in jobs.json; "
+                "rewriting the valid records so cron can continue",
+                dropped,
+            )
+            save_jobs(valid)
+        return valid
+
     if isinstance(data, dict):
-        jobs = data.get("jobs", [])
+        jobs = _valid_records(data.get("jobs", []))
         if _strict_retry and jobs:
             # Hit control-character corruption — rewrite with proper escaping.
             save_jobs(jobs)
@@ -898,10 +915,11 @@ def load_jobs() -> List[Dict[str, Any]]:
     if isinstance(data, list):
         # Bare array — likely saved/edited outside save_jobs(). Wrap it back
         # into the expected {"jobs": [...]} structure.
+        jobs = _valid_records(data)
         if data:
-            save_jobs(data)
+            save_jobs(jobs)
             logger.warning("Auto-repaired jobs.json (bare list wrapped as dict)")
-        return data
+        return jobs
 
     raise RuntimeError(
         f"Cron database corrupted: expected {{'jobs': [...]}}, got {type(data).__name__}"
@@ -1268,7 +1286,7 @@ def get_job(job_id: str) -> Optional[Dict[str, Any]]:
     """Get a job by ID."""
     jobs = load_jobs()
     for job in jobs:
-        if job["id"] == job_id:
+        if job.get("id") == job_id:
             return _normalize_job_record(job)
     return None
 
@@ -1279,7 +1297,7 @@ class AmbiguousJobReference(LookupError):
     def __init__(self, ref: str, matches: List[Dict[str, Any]]):
         self.ref = ref
         self.matches = matches
-        ids = ", ".join(m["id"] for m in matches)
+        ids = ", ".join(str(m.get("id", "?")) for m in matches)
         super().__init__(
             f"Job name '{ref}' is ambiguous — matches {len(matches)} jobs: {ids}. "
             f"Use the job ID instead."
@@ -1296,12 +1314,18 @@ def resolve_job_ref(ref: str) -> Optional[Dict[str, Any]]:
     """
     if not ref:
         return None
+    ref_text = str(ref).strip()
+    if not ref_text:
+        return None
     jobs = load_jobs()
     for job in jobs:
-        if job["id"] == ref:
+        if job.get("id") == ref_text:
             return _normalize_job_record(job)
-    ref_lower = ref.lower()
-    name_matches = [j for j in jobs if (j.get("name") or "").lower() == ref_lower]
+    ref_lower = ref_text.casefold()
+    name_matches = [
+        j for j in jobs
+        if _coerce_job_text(j.get("name")).strip().casefold() == ref_lower
+    ]
     if not name_matches:
         return None
     if len(name_matches) > 1:
@@ -1341,7 +1365,7 @@ def update_job(job_id: str, updates: Dict[str, Any]) -> Optional[Dict[str, Any]]
     with _jobs_lock():
         jobs = load_jobs()
         for i, job in enumerate(jobs):
-            if job["id"] != job_id:
+            if job.get("id") != job_id:
                 continue
 
             # Validate / normalize workdir if present in updates.  Empty string
@@ -1495,7 +1519,7 @@ def remove_job(job_id: str) -> bool:
     with _jobs_lock():
         jobs = load_jobs()
         original_len = len(jobs)
-        jobs = [j for j in jobs if j["id"] != canonical_id]
+        jobs = [j for j in jobs if j.get("id") != canonical_id]
         if len(jobs) < original_len:
             # Resolve the output dir BEFORE saving so a legacy unsafe ID (e.g.
             # left over from before the create-time guard) fails closed without
@@ -1523,7 +1547,7 @@ def mark_job_run(job_id: str, success: bool, error: Optional[str] = None,
     with _jobs_lock():
         jobs = load_jobs()
         for i, job in enumerate(jobs):
-            if job["id"] == job_id:
+            if job.get("id") == job_id:
                 now = _hermes_now().isoformat()
                 job["last_run_at"] = now
                 job["last_status"] = "ok" if success else "error"
@@ -1624,7 +1648,7 @@ def claim_dispatch(job_id: str) -> bool:
     with _jobs_lock():
         jobs = load_jobs()
         for i, job in enumerate(jobs):
-            if job["id"] != job_id:
+            if job.get("id") != job_id:
                 continue
             if job.get("schedule", {}).get("kind") != "once":
                 return True  # recurring jobs use advance_next_run(), not dispatch claims
@@ -1714,7 +1738,7 @@ def advance_next_run(job_id: str) -> bool:
     with _jobs_lock():
         jobs = load_jobs()
         for job in jobs:
-            if job["id"] == job_id:
+            if job.get("id") == job_id:
                 kind = job.get("schedule", {}).get("kind")
                 if kind not in {"cron", "interval"}:
                     return False
@@ -1809,7 +1833,7 @@ def claim_job_for_fire(
     with _jobs_lock():
         jobs = load_jobs()
         for job in jobs:
-            if job["id"] != job_id:
+            if job.get("id") != job_id:
                 continue
             if not job.get("enabled", True) or job.get("state") == "paused":
                 return False

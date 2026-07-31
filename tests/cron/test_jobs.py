@@ -1,8 +1,10 @@
 """Tests for cron/jobs.py — schedule parsing, job CRUD, and due-job detection."""
 
+import json
 import threading
 import pytest
 from datetime import datetime, timedelta, timezone
+from pathlib import Path
 
 from cron.jobs import (
     parse_duration,
@@ -12,6 +14,7 @@ from cron.jobs import (
     load_jobs,
     save_jobs,
     get_job,
+    resolve_job_ref,
     list_jobs,
     update_job,
     pause_job,
@@ -869,6 +872,41 @@ class TestGetDueJobs:
 
         # The healthy sibling is still discovered despite the malformed neighbor.
         assert any(d.get("id") == healthy["id"] for d in due)
+
+    def test_non_object_record_does_not_crash_or_block_sibling_jobs(self, tmp_cron_dir):
+        """Scalars in the JSON jobs array are discarded before scheduling.
+
+        JSON permits ``null`` and strings in an array, but cron records must
+        be mappings.  A malformed sibling must not make ``record.get`` abort
+        the scan and starve healthy jobs.
+        """
+        healthy = create_job(prompt="Healthy", schedule="every 1h")
+        jobs_path = Path(tmp_cron_dir) / "cron" / "jobs.json"
+        payload = json.loads(jobs_path.read_text(encoding="utf-8"))
+        payload["jobs"][0]["next_run_at"] = (
+            datetime.now(timezone.utc) - timedelta(minutes=5)
+        ).isoformat()
+        payload["jobs"].insert(0, None)
+        payload["jobs"].append("not-a-job")
+        jobs_path.write_text(json.dumps(payload), encoding="utf-8")
+
+        due = get_due_jobs()
+
+        assert [item["id"] for item in due] == [healthy["id"]]
+        loaded = load_jobs()
+        assert [item["id"] for item in loaded] == [healthy["id"]]
+        repaired = json.loads(jobs_path.read_text(encoding="utf-8"))
+        assert repaired["jobs"] == loaded
+
+    def test_non_string_name_does_not_crash_job_reference_resolution(self, tmp_cron_dir):
+        """Hand-edited numeric names are coerced by the reference resolver."""
+        save_jobs([{"id": "numeric-name", "name": 42, "enabled": True}])
+
+        resolved = resolve_job_ref("42")
+
+        assert resolved is not None
+        assert resolved["id"] == "numeric-name"
+        assert resolved["name"] == "42"
 
 
     def test_long_execution_does_not_perpetually_defer(self, tmp_cron_dir, monkeypatch):
