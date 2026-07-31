@@ -701,6 +701,25 @@ class TestMarkJobRun:
         assert updated["last_status"] == "ok"
         assert updated["repeat"] == {"times": None, "completed": 1}
 
+    def test_malformed_repeat_is_safe_for_readers(self, tmp_cron_dir):
+        """Legacy scalar repeat records must not break get/list consumers."""
+        save_jobs([{
+            "id": "reader-bad-repeat",
+            "name": "reader",
+            "prompt": "check",
+            "repeat": "not-a-record",
+            "schedule": {"kind": "interval", "minutes": 5},
+            "next_run_at": (
+                datetime.now(timezone.utc) + timedelta(minutes=5)
+            ).isoformat(),
+        }])
+
+        fetched = get_job("reader-bad-repeat")
+        assert fetched is not None
+        assert fetched["repeat"] == {"times": None, "completed": 0}
+        listed = list_jobs()
+        assert listed[0]["repeat"] == {"times": None, "completed": 0}
+
     def test_malformed_schedule_does_not_abort_marking_run(self, tmp_cron_dir):
         save_jobs([{
             "id": "bad-schedule",

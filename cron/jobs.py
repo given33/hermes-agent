@@ -538,6 +538,11 @@ def _normalize_job_record(job: Dict[str, Any]) -> Dict[str, Any]:
         name = label_source[:50].strip() or "cron job"
     normalized["name"] = name
     normalized["schedule_display"] = _schedule_display_for_job(normalized)
+    # ``repeat`` is user-editable JSON too. Normalize malformed scalar
+    # records here so read-only consumers (cron list/API formatters) never
+    # crash while calling ``repeat.get(...)``. Due/lifecycle paths perform
+    # the same repair under the jobs lock and persist it when appropriate.
+    _normalize_repeat_record(normalized)
     for flag, default in (("enabled", False), ("no_agent", False)):
         if flag in normalized:
             normalized[flag] = _coerce_job_enabled(normalized.get(flag), default)
