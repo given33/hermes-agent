@@ -13,6 +13,8 @@ hosted agents don't expose). It must:
     background, returning 202.
 """
 
+import time
+
 import pytest
 from starlette.testclient import TestClient
 
@@ -150,4 +152,7 @@ def test_valid_token_accepts_and_fires(monkeypatch):
         _restore(pa, ph)
         client.close()
     # background task ran the fire for the resolved profile
+    deadline = time.monotonic() + 2.0
+    while not fired and time.monotonic() < deadline:
+        time.sleep(0.01)
     assert fired == [("default", "j1", _FIRE_AT)]
