@@ -621,6 +621,10 @@ def parse_duration(s: str) -> int:
         "2h" → 120
         "1d" → 1440
     """
+    if not isinstance(s, str):
+        raise ValueError(
+            f"Invalid duration: expected a string, got {type(s).__name__}"
+        )
     s = s.strip().lower()
     match = re.match(r'^(\d+)\s*(m|min|mins|minute|minutes|h|hr|hrs|hour|hours|d|day|days)$', s)
     if not match:
@@ -651,6 +655,10 @@ def parse_schedule(schedule: str) -> Dict[str, Any]:
         "0 9 * * *"        → cron expression
         "2026-02-03T14:00" → once at timestamp
     """
+    if not isinstance(schedule, str):
+        raise ValueError(
+            f"Invalid schedule: expected a string, got {type(schedule).__name__}"
+        )
     schedule = schedule.strip()
     original = schedule
     schedule_lower = schedule.lower()
