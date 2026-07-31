@@ -1601,9 +1601,35 @@ PY
     fi
     sleep 1
   done
+  if [[ "${route_healthy}" != 1 ]]; then
+    printf 'managed installation route failed: %s\n' "${node}" >&2
+    if [[ -s "${node_health}" ]]; then
+      # Keep rollout failures actionable without echoing arbitrary response
+      # bodies (which could contain credentials or upstream HTML).
+      "${runtime_python}" - "${node_health}" <<'PY' >&2 || true
+import json
+import sys
+
+try:
+    payload = json.load(open(sys.argv[1], encoding="utf-8"))
+except Exception as error:
+    print(f"managed installation last response is not JSON: {error}")
+else:
+    release = payload.get("release")
+    print(json.dumps({
+        "ok": payload.get("ok"),
+        "node_id": payload.get("node_id"),
+        "installations": payload.get("installations"),
+        "recovery": payload.get("recovery"),
+        "release": release if isinstance(release, dict) else None,
+    }, sort_keys=True))
+PY
+    else
+      printf '%s\n' 'managed installation last response was empty or unavailable' >&2
+    fi
+  fi
   rm -f -- "${node_health}"
-  [[ "${route_healthy}" == 1 ]] \
-    || { printf 'managed installation route failed: %s\n' "${node}" >&2; false; }
+  [[ "${route_healthy}" == 1 ]] || false
   installation_probe_id="mi-$(${runtime_python} -c 'import uuid; print(uuid.uuid4().hex)')"
   installation_probe_body="$(mktemp "/run/hermes-installation-${node}-body.XXXXXX")"
   installation_probe_post="$(mktemp "/run/hermes-installation-${node}-post.XXXXXX")"
