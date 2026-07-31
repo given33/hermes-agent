@@ -184,6 +184,11 @@ def test_three_endpoint_updates_follow_only_a_committed_main_release():
         "deploy/dbb3/dbb3-cloud-connector.service",
         "deploy/pc/install-pc-cloud-connector-user.sh",
         "deploy/pc/pc-cloud-connector.service",
+        "hermes_cli/__init__.py",
+        "hermes_runtime",
+        "hermes_services",
+        "hermes_constants.py",
+        "hermes_secret_compare.py",
     ):
         assert f'"{relative}"' in updater
     assert (

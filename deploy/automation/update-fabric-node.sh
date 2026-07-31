@@ -263,7 +263,11 @@ archive_paths=(
   "hermes_cli/managed_installations.py"
   "hermes_cli/managed_nodes.py"
   "hermes_cli/managed_node_recovery_service.py"
+  "hermes_cli/__init__.py"
   "hermes_runtime"
+  "hermes_services"
+  "hermes_constants.py"
+  "hermes_secret_compare.py"
 )
 if [[ "${role}" == wsl ]]; then
   archive_paths+=(
@@ -356,14 +360,18 @@ for target in "${automation_script_target}" "${automation_service_target}" \
 done
 
 runtime_assets=(
+  "hermes_cli/__init__.py"
   "hermes_cli/managed_installations.py"
   "hermes_cli/managed_nodes.py"
   "hermes_cli/managed_node_recovery_service.py"
 )
-while IFS= read -r -d '' runtime_path; do
-  runtime_assets+=("${runtime_path#"${stage}/"}")
-done < <(find "${stage}/hermes_runtime" -type f -name '*.py' -print0 2>/dev/null)
-(( ${#runtime_assets[@]} > 3 )) || die "managed runtime package is missing"
+for runtime_root_path in hermes_runtime hermes_services; do
+  while IFS= read -r -d '' runtime_path; do
+    runtime_assets+=("${runtime_path#"${stage}/"}")
+  done < <(find "${stage}/${runtime_root_path}" -type f -name '*.py' -print0 2>/dev/null)
+done
+runtime_assets+=("hermes_constants.py" "hermes_secret_compare.py")
+(( ${#runtime_assets[@]} > 8 )) || die "managed runtime package is incomplete"
 case "${role}" in
   dbb3) runtime_root="${HERMES_DBB3_AGENT_ROOT:-/usr/local/lib/hermes-agent}" ;;
   wsl) runtime_root="${HERMES_WSL_AGENT_ROOT:-/mnt/d/Hermes/hermes-agent}" ;;

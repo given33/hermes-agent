@@ -14,7 +14,7 @@ archive="${work}/archive"
 mkdir -p "${fake_bin}" "${archive}/deploy/automation" \
   "${archive}/deploy/dbb3" "${archive}/deploy/pc" \
   "${archive}/deploy/recovery" "${archive}/hermes_cli" \
-  "${archive}/hermes_runtime"
+  "${archive}/hermes_runtime" "${archive}/hermes_services"
 
 cat >"${fake_bin}/git" <<'SH'
 #!/usr/bin/env bash
@@ -93,12 +93,17 @@ for asset in hermes-managed-installation-receiver.service \
 done
 printf '{}\n' >"${archive}/deploy/recovery/managed-installations.dbb3.json"
 printf '{}\n' >"${archive}/deploy/recovery/managed-installations.wsl.json"
-for module in managed_installations.py managed_nodes.py managed_node_recovery_service.py; do
+for module in __init__.py managed_installations.py managed_nodes.py managed_node_recovery_service.py; do
   printf 'RELEASE = "new"\n' >"${archive}/hermes_cli/${module}"
 done
 for module in __init__.py config.py; do
   printf 'RELEASE = "new"\n' >"${archive}/hermes_runtime/${module}"
 done
+for module in __init__.py resource_catalog.py; do
+  printf 'RELEASE = "new"\n' >"${archive}/hermes_services/${module}"
+done
+printf 'RELEASE = "new"\n' >"${archive}/hermes_constants.py"
+printf 'RELEASE = "new"\n' >"${archive}/hermes_secret_compare.py"
 
 cat >"${archive}/deploy/dbb3/install-dbb3-cloud-connector-user.sh" <<'SH'
 #!/usr/bin/env bash
@@ -150,14 +155,20 @@ release_version="1.2.3"
 run_case() {
   local role="$1" failpoint="${2:-}"
   local root="${work}/${role}-${failpoint:-success}"
-  mkdir -p "${root}/runtime/hermes_cli" "${root}/runtime/hermes_runtime" "${root}/automation" \
+  mkdir -p "${root}/runtime/hermes_cli" "${root}/runtime/hermes_runtime" \
+    "${root}/runtime/hermes_services" "${root}/automation" \
     "${root}/home/.ssh" "${root}/backups" "${root}/state"
-  for module in managed_installations.py managed_nodes.py managed_node_recovery_service.py; do
+  for module in __init__.py managed_installations.py managed_nodes.py managed_node_recovery_service.py; do
     printf 'RELEASE = "old"\n' >"${root}/runtime/hermes_cli/${module}"
   done
   for module in __init__.py config.py; do
     printf 'RELEASE = "old"\n' >"${root}/runtime/hermes_runtime/${module}"
   done
+  for module in __init__.py resource_catalog.py; do
+    printf 'RELEASE = "old"\n' >"${root}/runtime/hermes_services/${module}"
+  done
+  printf 'RELEASE = "old"\n' >"${root}/runtime/hermes_constants.py"
+  printf 'RELEASE = "old"\n' >"${root}/runtime/hermes_secret_compare.py"
   for asset in update-fabric-node.sh hermes-fabric-update.service hermes-fabric-update.timer; do
     printf 'old automation\n' >"${root}/automation/${asset}"
   done
@@ -212,6 +223,7 @@ assert json.load(open(sys.argv[1], encoding="utf-8")) == {
 PY
     [[ "$(cat "${root}/state/${role}/deployed-commit")" == "${release_commit}" ]]
     grep -Fxq 'RELEASE = "new"' "${root}/runtime/hermes_runtime/config.py"
+    grep -Fxq 'RELEASE = "new"' "${root}/runtime/hermes_services/resource_catalog.py"
   else
     [[ "${status}" != 0 ]]
     [[ "$(cat "${root}/connector.state")" == old ]]
@@ -220,6 +232,7 @@ PY
     grep -Fxq 'connector rollback' "${root}/components.log"
     grep -Fq 'RELEASE = "old"' "${root}/runtime/hermes_cli/managed_installations.py"
     grep -Fq 'RELEASE = "old"' "${root}/runtime/hermes_runtime/config.py"
+    grep -Fq 'RELEASE = "old"' "${root}/runtime/hermes_services/resource_catalog.py"
     if [[ "${failpoint}" == after-automation ]]; then
       for asset in update-fabric-node.sh hermes-fabric-update.service hermes-fabric-update.timer; do
         grep -Fxq 'old automation' "${root}/automation/${asset}"
