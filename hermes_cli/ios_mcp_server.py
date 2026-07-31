@@ -157,6 +157,9 @@ _TOOL_SCOPE_BY_CAPABILITY = {
     },
     "ios-vision": {
         "ios_vision_analyze": ("photos:read",),
+        "ios_vision_classify": ("photos:read",),
+        "ios_vision_detect": ("photos:read",),
+        "ios_vision_faces": ("photos:read",),
     },
     "ios-media": {
         "ios_media_get": ("media:read",),
@@ -1033,10 +1036,13 @@ def create_mcp_server(
         return mcp
 
     if capability == "ios-vision":
-        _queue_tool(
-            mcp, enforcer, store, capability, "ios_vision_analyze", "analyze",
-            "Use when Hermes needs on-device Vision classification, rectangles, and face detection for an owner-scoped image.",
-        )
+        for tool_name, action, description in (
+            ("ios_vision_analyze", "analyze", "Use when Hermes needs complete on-device Vision analysis for an owner-scoped image."),
+            ("ios_vision_classify", "classify", "Use when Hermes needs image classifications from an owner-scoped iPhone image."),
+            ("ios_vision_detect", "detect", "Use when Hermes needs rectangle detections from an owner-scoped iPhone image."),
+            ("ios_vision_faces", "faces", "Use when Hermes needs face detections from an owner-scoped iPhone image."),
+        ):
+            _queue_tool(mcp, enforcer, store, capability, tool_name, action, description)
         return mcp
 
     if capability == "ios-health-write":

@@ -1166,6 +1166,37 @@ def test_device_command_queue_survives_delivery_and_ack(store, monkeypatch):
     assert store.ack_device_command("alice", first["id"], result={}) is False
 
 
+def test_failed_device_command_retries_then_becomes_terminal(store):
+    command = store.queue_device_command("alice", "ios-device", "open-url", {"url": "https://example.test"})
+    for expected_attempt in (1, 2):
+        pulled = store.pull_device_commands("alice", "iphone")["commands"]
+        assert [item["id"] for item in pulled] == [command["id"]]
+        assert store.ack_device_command(
+            "alice", command["id"], status="failed", error=f"transient-{expected_attempt}",
+        ) is True
+        with sqlite3.connect(store.path) as conn:
+            status, acknowledged_at = conn.execute(
+                "SELECT status,acknowledged_at FROM ios_device_commands WHERE id=?",
+                (command["id"],),
+            ).fetchone()
+        assert status == "pending"
+        assert acknowledged_at is None
+
+    pulled = store.pull_device_commands("alice", "iphone")["commands"]
+    assert [item["id"] for item in pulled] == [command["id"]]
+    assert store.ack_device_command(
+        "alice", command["id"], status="failed", error="terminal",
+    ) is True
+    with sqlite3.connect(store.path) as conn:
+        status, acknowledged_at = conn.execute(
+            "SELECT status,acknowledged_at FROM ios_device_commands WHERE id=?",
+            (command["id"],),
+        ).fetchone()
+    assert status == "failed"
+    assert acknowledged_at is not None
+    assert store.pull_device_commands("alice", "iphone")["commands"] == []
+
+
 def test_device_command_idempotency_key_cannot_cross_action_boundary(store):
     store.queue_device_command(
         "alice",

@@ -85,6 +85,9 @@ _IOS_NATIVE_ACTION_POLICY: dict[tuple[str, str], dict[str, Any]] = {
     ("ios-photos", "album-add"): {"risk": "write", "confirmation": "required", "permission": "photos"},
     ("ios-photos", "import"): {"risk": "write", "confirmation": "required", "permission": "photos"},
     ("ios-vision", "analyze"): {"risk": "read", "confirmation": "none", "permission": "photos"},
+    ("ios-vision", "classify"): {"risk": "read", "confirmation": "none", "permission": "photos"},
+    ("ios-vision", "detect"): {"risk": "read", "confirmation": "none", "permission": "photos"},
+    ("ios-vision", "faces"): {"risk": "read", "confirmation": "none", "permission": "photos"},
     ("ios-media", "get"): {"risk": "read", "confirmation": "none", "permission": "media"},
     ("ios-media", "control"): {"risk": "write", "confirmation": "required", "permission": "media"},
     ("ios-media", "play"): {"risk": "write", "confirmation": "required", "permission": "media"},
@@ -2629,12 +2632,30 @@ class IOSIntelligenceStore:
         if error:
             stored_result["error"] = str(error)[:2000]
         with self._connect() as conn, write_txn(conn):
+            row = conn.execute(
+                "SELECT attempts,capability,action FROM ios_device_commands "
+                "WHERE id=? AND owner_id=? AND status IN ('pending','delivered') "
+                "AND (?='' OR device_id='' OR device_id=?)",
+                (command_id, owner_id, device_id, device_id),
+            ).fetchone()
+            if row is None:
+                return False
+            # Keep transient native failures durable for the next relay pass.
+            # The canonical action policy caps retries; the final failure is
+            # still terminal and retains the error in result_json.
+            retryable = False
+            if not succeeded:
+                max_attempts = int(ios_native_action_metadata(
+                    str(row["capability"]), str(row["action"]),
+                )["max_attempts"])
+                retryable = int(row["attempts"] or 0) < max_attempts
+            next_status = "pending" if retryable else ("completed" if succeeded else "failed")
             changed = conn.execute(
                 "UPDATE ios_device_commands SET status=?,acknowledged_at=?,result_json=? "
                 "WHERE id=? AND owner_id=? AND status IN ('pending','delivered') "
                 "AND (?='' OR device_id='' OR device_id=?)",
                 (
-                    "completed" if succeeded else "failed", int(time.time()),
+                    next_status, None if retryable else int(time.time()),
                     self._seal_json(owner_id, stored_result, "ios_device_commands.result_json"),
                     command_id, owner_id, device_id, device_id,
                 ),

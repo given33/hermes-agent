@@ -108,7 +108,7 @@ def test_generic_native_writes_require_idempotency_key(tmp_path):
     [
         ("ios-contacts", {"ios_contacts_list", "ios_contacts_search", "ios_contacts_create"}),
         ("ios-photos", {"ios_photos_list", "ios_photos_search", "ios_photos_capture", "ios_photos_scan", "ios_photos_ocr", "ios_photos_albums", "ios_photos_near", "ios_photos_export", "ios_photos_favorite", "ios_photos_delete", "ios_photos_album_create", "ios_photos_album_add", "ios_photos_import"}),
-        ("ios-vision", {"ios_vision_analyze"}),
+        ("ios-vision", {"ios_vision_analyze", "ios_vision_classify", "ios_vision_detect", "ios_vision_faces"}),
         ("ios-media", {"ios_media_get", "ios_media_control", "ios_media_search", "ios_media_play_search", "ios_media_volume"}),
         ("ios-bluetooth", {"ios_bluetooth_state", "ios_bluetooth_scan", "ios_bluetooth_connect", "ios_bluetooth_disconnect", "ios_bluetooth_services", "ios_bluetooth_read", "ios_bluetooth_write", "ios_bluetooth_notify"}),
         ("ios-nfc", {"ios_nfc_scan", "ios_nfc_write"}),

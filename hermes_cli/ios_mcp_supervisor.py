@@ -1323,29 +1323,48 @@ class IOSMCPRuntimeSupervisor:
         green: dict[str, Any] = {}
 
         def start_new(_version: str) -> bool:
-            process, handle = self._spawn_process(
-                service,
-                port=green_port,
-                python_executable=green_python_executable,
-                log_suffix=f"green-{new_version}",
-                # The forkserver is an immutable snapshot of the running
-                # release. Green must import from its requested executable so
-                # stale preloaded code can never be labelled as the upgrade.
-                force_subprocess=True,
-            )
-            green.update({"process": process, "handle": handle})
-            deadline = time.monotonic() + self.startup_timeout_seconds
-            while time.monotonic() < deadline:
-                if process.poll() is not None:
-                    return False
+            nonlocal green_port
+            initial_port = green_port
+            # A port that was free during discovery can be claimed before the
+            # subprocess binds it (especially on Windows). Retry a bounded
+            # sequence of adjacent ports and publish the actual selected port
+            # only after its MCP health probe succeeds.
+            for offset in range(8):
+                candidate_port = initial_port + offset
                 try:
-                    tools = self._probe_tools(f"http://{self.host}:{green_port}/mcp")
-                except Exception:
-                    time.sleep(0.2)
-                    continue
-                if tools:
-                    green["tools"] = tools
-                    return True
+                    process, handle = self._spawn_process(
+                        service,
+                        port=candidate_port,
+                        python_executable=green_python_executable,
+                        log_suffix=f"green-{new_version}-{candidate_port}",
+                        # The forkserver is an immutable snapshot of the
+                        # running release. Green must import from its requested
+                        # executable so stale preloaded code can never be
+                        # labelled as the upgrade.
+                        force_subprocess=True,
+                    )
+                except (OSError, FileNotFoundError):
+                    # An invalid interpreter is not a port collision and must
+                    # fail immediately so the blue process stays authoritative.
+                    return False
+                green.update({"process": process, "handle": handle})
+                deadline = time.monotonic() + self.startup_timeout_seconds
+                while time.monotonic() < deadline:
+                    if process.poll() is not None:
+                        break
+                    try:
+                        tools = self._probe_tools(f"http://{self.host}:{candidate_port}/mcp")
+                    except Exception:
+                        time.sleep(0.2)
+                        continue
+                    if tools:
+                        green_port = candidate_port
+                        if candidate_port != initial_port:
+                            self.blue_green_port_offset = candidate_port - self.stable_port_for(service)
+                        green["tools"] = tools
+                        return True
+                self._terminate_process(process, handle)
+                green.clear()
             return False
 
         def health_new(_version: str) -> bool:
