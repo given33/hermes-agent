@@ -41,6 +41,50 @@ def test_connector_nonnegative_int_rejects_corrupt_state():
     assert module._nonnegative_int(float("inf")) == 0
 
 
+def test_connector_flags_normalize_textual_values():
+    module = load_module()
+    assert module._coerce_flag(True) is True
+    assert module._coerce_flag(False) is False
+    assert module._coerce_flag("true") is True
+    assert module._coerce_flag(" false ") is False
+    assert module._coerce_flag("unexpected") is False
+
+
+def test_artifact_claim_accepts_persisted_false_cancel_flag():
+    module = load_module()
+    now = 100_000
+    hosted = {
+        "status": "running",
+        "stage": "running",
+        "cancel_requested": "false",
+    }
+    remote_run = {
+        "status": "running",
+        "cancel_requested": "false",
+        "claim_token": "claim-token",
+        "lease_owner": "dbb3-primary",
+        "lease_until": now + 1_000,
+    }
+    module._require_active_remote_artifact_claim(
+        hosted,
+        remote_run,
+        connector_id="dbb3-primary",
+        claim_token="claim-token",
+        now=now,
+    )
+
+
+def test_hosted_route_does_not_treat_text_false_as_artifact_request():
+    module = load_module()
+    module.available_profiles = lambda: [{"name": "default"}]
+    _route, _mode, _profiles, artifact_required = module._hosted_route_parameters(
+        route_metadata={"mode": "chat", "artifact_required": "false"},
+        requested_mode="chat",
+        requested_profiles=["default"],
+    )
+    assert artifact_required is False
+
+
 def review_control(
     verdict: str = "PASS",
     *,

@@ -999,7 +999,7 @@ def _ensure_hosted_output_baseline(
     conversation_id: str,
     run: dict[str, Any],
 ) -> None:
-    if not bool(run.get("artifact_required")) or "output_baseline" in run:
+    if not _coerce_flag(run.get("artifact_required")) or "output_baseline" in run:
         return
     _output_root, output_dir = _hosted_output_paths(conversation_id, run)
     run["output_baseline"] = _output_file_signatures(output_dir)
@@ -2319,7 +2319,7 @@ def _runtime_session_boundary(
             item
             for item in db.get_messages(str(resolved))
             if int(item.get("id") or 0) > max(0, int(after_message_id or 0))
-            and bool(item.get("active", 1))
+            and _coerce_flag(item.get("active", 1), default=True)
         ]
         user_message = next(
             (
@@ -4198,8 +4198,8 @@ def _complete_hosted_role_intervention(
         )
         if not isinstance(intervention, dict):
             raise RuntimeError("托管干预记录不存在")
-        if str(run.get("status") or "") in _HOSTED_TERMINAL_STATUSES or run.get(
-            "cancel_requested"
+        if str(run.get("status") or "") in _HOSTED_TERMINAL_STATUSES or _coerce_flag(
+            run.get("cancel_requested")
         ):
             raise RuntimeError("托管任务已结束，拒绝迟到的干预回复")
         all_at_once = str(
@@ -4857,9 +4857,15 @@ def classify_intent_with_context_model(
         artifact_decision = "none"
     return {
         "mode": mode,
-        "needs_execution": bool(parsed.get("needs_execution", mode == "work")),
-        "needs_tools": bool(parsed.get("needs_tools", mode == "work")),
-        "mutates_state": bool(parsed.get("mutates_state", mode == "work")),
+        "needs_execution": _coerce_flag(
+            parsed.get("needs_execution"), default=mode == "work"
+        ),
+        "needs_tools": _coerce_flag(
+            parsed.get("needs_tools"), default=mode == "work"
+        ),
+        "mutates_state": _coerce_flag(
+            parsed.get("mutates_state"), default=mode == "work"
+        ),
         "targets": targets,
         "profiles": profiles,
         "artifact": {
@@ -5387,7 +5393,9 @@ def classify_user_intent(
         dict(model_result.get("artifact"))
         if isinstance(model_result.get("artifact"), dict)
         else {
-            "decision": "required" if routed.get("artifact_required") else "none",
+            "decision": "required"
+            if _coerce_flag(routed.get("artifact_required"))
+            else "none",
             "types": [],
             "reason": "",
         }
@@ -5419,9 +5427,15 @@ def classify_user_intent(
                 profile.removesuffix("-worker") for profile in worker_profiles
             ],
             "target_constraints": target_constraints,
-            "needs_execution": bool(model_result.get("needs_execution", mode == "work")),
-            "needs_tools": bool(model_result.get("needs_tools", mode == "work")),
-            "mutates_state": bool(model_result.get("mutates_state", mode == "work")),
+            "needs_execution": _coerce_flag(
+                model_result.get("needs_execution"), default=mode == "work"
+            ),
+            "needs_tools": _coerce_flag(
+                model_result.get("needs_tools"), default=mode == "work"
+            ),
+            "mutates_state": _coerce_flag(
+                model_result.get("mutates_state"), default=mode == "work"
+            ),
             "artifact": {**artifact, "decision": artifact_decision},
             "artifact_required": artifact_decision == "required",
             "lock_level": "ambiguous",
@@ -6438,7 +6452,7 @@ def _queue_hosted_protocol_event(
                 "payload": {
                     "session_id": session_id,
                     "old_session_id": old_session_id,
-                    "in_place": bool(raw_payload.get("in_place")),
+                    "in_place": _coerce_flag(raw_payload.get("in_place")),
                     "compression_count": compression_count,
                     "runtime": str(raw_payload.get("runtime") or "hermes"),
                     "thread_id": str(raw_payload.get("thread_id") or ""),
@@ -6704,7 +6718,7 @@ def _persist_hosted_role_state(
         "completed_at": now if str(state.get("status") or "") in _HOSTED_TERMINAL_STATUSES else None,
         "milestone_count": int(state.get("milestone_count") or 0),
         "milestone_content": str(state.get("milestone_content") or ""),
-        "request_accepted": bool(state.get("request_accepted")),
+        "request_accepted": _coerce_flag(state.get("request_accepted")),
         "model_retry_attempt": int(state.get("model_retry_attempt") or 0),
         "model_retry_max_attempts": int(
             state.get("model_retry_max_attempts") or _HOSTED_CHAT_API_ATTEMPTS
@@ -6904,7 +6918,7 @@ def _run_hosted_role(
                 "first_token_at": int(previous_state.get("first_token_at") or 0),
                 "milestone_count": int(previous_state.get("milestone_count") or 0),
                 "milestone_content": str(previous_state.get("milestone_content") or ""),
-                "request_accepted": bool(previous_state.get("request_accepted")),
+                "request_accepted": _coerce_flag(previous_state.get("request_accepted")),
                 "model_retry_attempt": int(
                     previous_state.get("model_retry_attempt") or 0
                 ),
@@ -7151,12 +7165,12 @@ def _run_hosted_role(
             event_type == "request.accepted"
             or event_type in {"error", "message.complete"}
             or (
-                bool(state.get("request_accepted"))
+                _coerce_flag(state.get("request_accepted"))
                 and event_type not in {"message.delta", "reasoning.delta"}
             )
             or first_visible_delta
             or (
-                bool(state.get("request_accepted"))
+                _coerce_flag(state.get("request_accepted"))
                 and time.monotonic() - last_persisted_at >= _HOSTED_EVENT_FLUSH_SECONDS
             )
         ):
@@ -7665,7 +7679,7 @@ def _run_hosted_remote_role(
                 raise RuntimeError("远程执行记录不存在")
             _conversation, _hosted, _role_key, current = location
             remote = dict(current)
-            turn_cancel_requested = bool(_hosted.get("cancel_requested"))
+            turn_cancel_requested = _coerce_flag(_hosted.get("cancel_requested"))
         status = str(remote.get("status") or "queued")
         pending_intervention = _pending_hosted_role_intervention(
             conversation_id,
@@ -8011,7 +8025,7 @@ def hosted_artifact_instruction(
     *,
     remote_workers: bool,
 ) -> str:
-    if not bool(run.get("artifact_required")):
+    if not _coerce_flag(run.get("artifact_required")):
         return "本任务未要求交付文件。不要创建、复制或上传文件，只提交文字结果和必要证据。"
     if not remote_workers:
         return str(run.get("delivery_context") or "").strip()
@@ -8523,7 +8537,7 @@ def _persist_hosted_turn(
                 _notify_hosted_update(conversation_id)
             return dict(run)
         if (
-            (run.get("cancel_requested") or current_status == "cancelled")
+            (_coerce_flag(run.get("cancel_requested")) or current_status == "cancelled")
             and incoming_status != "cancelled"
         ):
             return dict(run)
@@ -9032,6 +9046,20 @@ def _nonnegative_int(value: Any, default: int = 0) -> int:
     return parsed if parsed >= 0 else default
 
 
+def _coerce_flag(value: Any, default: bool = False) -> bool:
+    """Normalize persisted JSON flags without treating text ``"false"`` as true."""
+
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, str):
+        normalized = value.strip().lower()
+        if normalized in {"1", "true", "yes", "on"}:
+            return True
+        if normalized in {"0", "false", "no", "off", ""}:
+            return False
+    return default
+
+
 def _remote_run_deadline_fields(
     hosted: dict[str, Any],
     profile: str,
@@ -9076,7 +9104,7 @@ def _request_remote_timeout_locked(
         return False
     deadline_at = _positive_int(remote_run.get("deadline_at"))
     timeout_requested = (
-        bool(remote_run.get("cancel_requested"))
+        _coerce_flag(remote_run.get("cancel_requested"))
         and str(remote_run.get("cancel_kind") or "") == "timeout"
     )
     if not timeout_requested and (deadline_at is None or now < deadline_at):
@@ -9508,7 +9536,7 @@ def _finish_hosted_turn_if_cancelled(
         state = load_single_state()
         conversation = _conversation_by_id(state, conversation_id)
         run = (conversation.get("hosted_turns") or {}).get(turn_id)
-        if not isinstance(run, dict) or not run.get("cancel_requested"):
+        if not isinstance(run, dict) or not _coerce_flag(run.get("cancel_requested")):
             return False
         if run.get("status") in {"completed", "cancelled"}:
             return run.get("status") == "cancelled"
@@ -9924,7 +9952,7 @@ def execute_hosted_chat(
         return
     final_status = "completed" if status == "completed" else "failed"
     published_attachments: list[dict[str, Any]] = []
-    if bool(run.get("artifact_required")) and final_status == "completed":
+    if _coerce_flag(run.get("artifact_required")) and final_status == "completed":
         published_attachments = _hosted_turn_output_attachments(
             conversation_id,
             turn_id,
@@ -10471,7 +10499,7 @@ def execute_hosted_workflow(
     reviewer_profile = "reviewer"
     reviewer_connector_id = "dbb3-primary"
     reporter_profile = "default"
-    artifact_required = bool(run.get("artifact_required"))
+    artifact_required = _coerce_flag(run.get("artifact_required"))
     attachment_context = _hosted_chat_attachment_context(conversation_snapshot, run)
 
     manager_plan = (
@@ -12738,8 +12766,8 @@ def _require_active_remote_artifact_claim(
         hosted_status in _HOSTED_TERMINAL_STATUSES
         or hosted_status in {"cancelling", "cancel_requested"}
         or hosted_stage in {"cancelling", "cancel_requested", "cancelled"}
-        or hosted.get("cancel_requested")
-        or remote_run.get("cancel_requested")
+        or _coerce_flag(hosted.get("cancel_requested"))
+        or _coerce_flag(remote_run.get("cancel_requested"))
         or remote_status not in _REMOTE_ARTIFACT_ACTIVE_STATUSES
     ):
         reason = (
@@ -12829,7 +12857,7 @@ def _apply_remote_checkpoint(
 ) -> tuple[dict[str, Any], bool]:
     payload = _redact_sensitive(payload)
     status = str(payload.get("status") or "").strip().lower()
-    terminal = bool(payload.get("terminal"))
+    terminal = _coerce_flag(payload.get("terminal"))
     if status not in {"running", "completed", "failed", "cancelled", "timed_out"}:
         raise HTTPException(status_code=422, detail="Invalid remote run status")
     expected_terminal = status in _REMOTE_TERMINAL_STATUSES
@@ -12865,8 +12893,8 @@ def _apply_remote_checkpoint(
         current_cursor = _nonnegative_int(remote_run.get("checkpoint_cursor"))
         if (
             hosted_status in _HOSTED_TERMINAL_STATUSES
-            or hosted.get("cancel_requested")
-            or remote_run.get("cancel_requested")
+            or _coerce_flag(hosted.get("cancel_requested"))
+            or _coerce_flag(remote_run.get("cancel_requested"))
         ) and status not in {"cancelled", "timed_out"}:
             raise _connector_conflict(
                 "claim_lost",
@@ -12876,7 +12904,7 @@ def _apply_remote_checkpoint(
             return dict(remote_run), False
         if (
             status == "completed"
-            and bool(remote_run.get("artifact_required"))
+            and _coerce_flag(remote_run.get("artifact_required"))
             and not any(
                 isinstance(item, dict) and item.get("id")
                 for item in remote_run.get("artifacts") or []
@@ -13100,7 +13128,7 @@ def connector_deployment_health(request: Request) -> dict[str, Any]:
                 }
     return {
         **connector,
-        "ok": bool(connector.get("ok")) and all(
+        "ok": _coerce_flag(connector.get("ok")) and all(
             item.get("ok") is True for item in databases.values()
         ),
         "manifest_version": str(manifest.get("version") or ""),
@@ -13256,7 +13284,7 @@ def connector_pull_runs(payload: ConnectorPullBody, request: Request):
                     old_lease = _nonnegative_int(remote_run.get("lease_until"))
                     if status not in {"queued", "leased", "running"}:
                         continue
-                    if remote_run.get("cancel_requested"):
+                    if _coerce_flag(remote_run.get("cancel_requested")):
                         continue
                     if status in {"leased", "running"} and old_lease > now:
                         continue
@@ -13395,8 +13423,8 @@ def connector_pull_cancellations(payload: ConnectorPullBody, request: Request):
                     if not isinstance(remote_run, dict) or str(remote_run.get("status") or "") in _REMOTE_TERMINAL_STATUSES:
                         continue
                     if not (
-                        hosted.get("cancel_requested")
-                        or remote_run.get("cancel_requested")
+                        _coerce_flag(hosted.get("cancel_requested"))
+                        or _coerce_flag(remote_run.get("cancel_requested"))
                     ):
                         continue
                     if _remote_run_connector_id(remote_run) != connector_id:
@@ -14581,9 +14609,9 @@ def _hosted_route_parameters(
         )
     artifact = route.get("artifact")
     artifact = dict(artifact) if isinstance(artifact, dict) else {}
-    artifact_required = bool(
-        requested_artifact
-        or route.get("artifact_required")
+    artifact_required = (
+        _coerce_flag(requested_artifact)
+        or _coerce_flag(route.get("artifact_required"))
         or str(artifact.get("decision") or "").lower() == "required"
     )
     return route, mode, selected_profiles, artifact_required
@@ -14699,10 +14727,10 @@ def _enqueued_turn_response(
         error = {
             "code": str(hosted.get("error_code") or "hosted_turn_failed"),
             "message": str(hosted.get("error") or "Hermes 执行失败"),
-            "retryable": bool(hosted.get("retryable")),
+            "retryable": _coerce_flag(hosted.get("retryable")),
         }
     return {
-        "accepted": bool(request_record.get("accepted", True)),
+        "accepted": _coerce_flag(request_record.get("accepted", True), default=True),
         "replayed": replayed,
         "request_id": str(request_record.get("request_id") or ""),
         "conversation_id": str(conversation.get("id") or ""),
@@ -14779,7 +14807,7 @@ def _complete_pending_hosted_route(conversation_id: str, turn_id: str) -> bool:
                 if str(route.get("mode") or "").strip().lower() == "chat"
                 else list(route.get("profiles") or [])
             ),
-            requested_artifact=bool(route.get("artifact_required")),
+            requested_artifact=_coerce_flag(route.get("artifact_required")),
         )
     except Exception as exc:
         clean_error = sanitize_runtime_error(exc)
@@ -16888,7 +16916,7 @@ def _recover_connector_artifact_upload_intents(
                             if (
                                 isinstance(remote, dict)
                                 and file_id
-                                and bool(intent.get("artifact_link_added"))
+                                and _coerce_flag(intent.get("artifact_link_added"))
                             ):
                                 remote["artifacts"] = [
                                     item
@@ -16898,7 +16926,7 @@ def _recover_connector_artifact_upload_intents(
                                         and str(item.get("id") or "") == file_id
                                     )
                                 ]
-                            if file_id and bool(intent.get("message_added")):
+                            if file_id and _coerce_flag(intent.get("message_added")):
                                 message_key = f"{remote_id}:artifact:{file_id}"
                                 conversation["messages"] = [
                                     message
@@ -18094,7 +18122,7 @@ def mobile_fork_conversation_message(
         "conversation": _public_conversation(child_conversation),
         "created": created,
         "session": child_session,
-        "replayed": bool(forked.get("replayed")),
+        "replayed": _coerce_flag(forked.get("replayed")),
     }
 
 
@@ -18570,7 +18598,7 @@ def retry_hosted_turn(
                 content=str(source.get("content") or ""),
                 title=str(source.get("title") or ""),
                 profiles=list(source.get("profiles") or []),
-                artifact_required=bool(source.get("artifact_required")),
+                artifact_required=_coerce_flag(source.get("artifact_required")),
                 attachment_context=str(source.get("attachment_context") or ""),
                 delivery_context=str(source.get("delivery_context") or ""),
                 user_delivery_context=str(source.get("user_delivery_context") or ""),
