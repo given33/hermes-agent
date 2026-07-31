@@ -522,6 +522,18 @@ def _coerce_job_text(value: Any, fallback: str = "") -> str:
     return str(value)
 
 
+def _normalize_enabled_toolsets(value: Any) -> Optional[List[str]]:
+    """Normalize a cron toolset allowlist without iterating scalar strings."""
+    if isinstance(value, str):
+        values = [value]
+    elif isinstance(value, (list, tuple, set)):
+        values = value
+    else:
+        return None
+    normalized = [str(item).strip() for item in values if str(item).strip()]
+    return normalized or None
+
+
 def _schedule_display_for_job(job: Dict[str, Any]) -> str:
     display = _coerce_job_text(job.get("schedule_display")).strip()
     if display:
@@ -565,6 +577,10 @@ def _normalize_job_record(job: Dict[str, Any]) -> Dict[str, Any]:
         name = label_source[:50].strip() or "cron job"
     normalized["name"] = name
     normalized["schedule_display"] = _schedule_display_for_job(normalized)
+    if "enabled_toolsets" in normalized:
+        normalized["enabled_toolsets"] = _normalize_enabled_toolsets(
+            normalized.get("enabled_toolsets")
+        )
     # ``repeat`` is user-editable JSON too. Normalize malformed scalar
     # records here so read-only consumers (cron list/API formatters) never
     # crash while calling ``repeat.get(...)``. Due/lifecycle paths perform
@@ -1327,8 +1343,7 @@ def create_job(
     normalized_base_url = _normalize_job_optional_text(base_url, strip_trailing_slash=True)
     normalized_script = str(script).strip() if isinstance(script, str) else None
     normalized_script = normalized_script or None
-    normalized_toolsets = [str(t).strip() for t in enabled_toolsets if str(t).strip()] if enabled_toolsets else None
-    normalized_toolsets = normalized_toolsets or None
+    normalized_toolsets = _normalize_enabled_toolsets(enabled_toolsets)
     normalized_workdir = _normalize_workdir(workdir)
     normalized_no_agent = _coerce_job_enabled(no_agent, False)
     normalized_attach = attach_to_session if isinstance(attach_to_session, bool) else None
@@ -1533,6 +1548,10 @@ def update_job(job_id: str, updates: Dict[str, Any]) -> Optional[Dict[str, Any]]
 
             previous_inference_axes = _normalized_inference_axes(job)
             updated = _apply_skill_fields({**job, **updates})
+            if "enabled_toolsets" in updates:
+                updated["enabled_toolsets"] = _normalize_enabled_toolsets(
+                    updated.get("enabled_toolsets")
+                )
             schedule_changed = "schedule" in updates
             inference_fields_changed = bool(
                 {"provider", "model", "base_url", "no_agent"}.intersection(updates)

@@ -1737,11 +1737,20 @@ class TestEnabledToolsets:
         job = create_job(prompt="monitor", schedule="every 1h", enabled_toolsets=["web", " ", "file"])
         assert job["enabled_toolsets"] == ["web", "file"]
 
+    def test_enabled_toolsets_string_is_one_entry(self, tmp_cron_dir):
+        job = create_job(prompt="monitor", schedule="every 1h", enabled_toolsets="web")
+        assert job["enabled_toolsets"] == ["web"]
+
     def test_enabled_toolsets_updated_via_update_job(self, tmp_cron_dir):
         job = create_job(prompt="monitor", schedule="every 1h")
         update_job(job["id"], {"enabled_toolsets": ["web", "delegation"]})
         fetched = get_job(job["id"])
         assert fetched["enabled_toolsets"] == ["web", "delegation"]
+
+    def test_enabled_toolsets_scalar_update_is_normalized(self, tmp_cron_dir):
+        job = create_job(prompt="monitor", schedule="every 1h")
+        update_job(job["id"], {"enabled_toolsets": "terminal"})
+        assert get_job(job["id"])["enabled_toolsets"] == ["terminal"]
 
 
 class TestMarkJobRunConcurrency:
