@@ -5,6 +5,12 @@ import json
 from deploy.dbb3 import dbb3_cloud_connector as connector_module
 
 
+def test_timestamp_ms_rejects_non_finite_values():
+    assert connector_module._timestamp_ms(float("nan")) is None
+    assert connector_module._timestamp_ms(float("inf")) is None
+    assert connector_module._timestamp_ms(float("-inf")) is None
+
+
 def test_session_snapshot_cache_is_bounded_lru(tmp_path, monkeypatch):
     calls = []
 

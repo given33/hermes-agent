@@ -14,6 +14,7 @@ import argparse
 from collections import OrderedDict
 import hashlib
 import json
+import math
 import os
 from pathlib import Path
 import re
@@ -173,6 +174,9 @@ def _timestamp_ms(value: Any) -> int | None:
     if not isinstance(value, (int, float)):
         return None
     numeric = float(value)
+    # Malformed upstream timestamps must not take down the polling bridge.
+    if not math.isfinite(numeric):
+        return None
     if not 0 < numeric:
         return int(numeric)
     return int(numeric * 1000) if numeric < 10_000_000_000 else int(numeric)
