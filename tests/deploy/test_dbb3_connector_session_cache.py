@@ -36,6 +36,17 @@ def test_activity_timing_ignores_non_finite_duration_values():
     assert duration is None
 
 
+def test_checkpoint_store_recovers_invalid_top_level_collections(tmp_path):
+    path = tmp_path / "checkpoint.json"
+    path.write_text(
+        json.dumps({"version": 1, "runs": [], "cancellations": "broken"}),
+        encoding="utf-8",
+    )
+    state = connector_module.CheckpointStore(path).load()
+    assert state["runs"] == {}
+    assert state["cancellations"] == {}
+
+
 def test_session_snapshot_cache_is_bounded_lru(tmp_path, monkeypatch):
     calls = []
 

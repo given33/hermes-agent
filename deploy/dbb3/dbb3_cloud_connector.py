@@ -498,8 +498,10 @@ class CheckpointStore:
         if not isinstance(value, dict):
             return {"version": 1, "runs": {}, "cancellations": {}}
         value.setdefault("version", 1)
-        value.setdefault("runs", {})
-        value.setdefault("cancellations", {})
+        if not isinstance(value.get("runs"), dict):
+            value["runs"] = {}
+        if not isinstance(value.get("cancellations"), dict):
+            value["cancellations"] = {}
         return value
 
     def save(self, value: dict[str, Any]) -> None:
