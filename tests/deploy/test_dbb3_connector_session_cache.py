@@ -47,6 +47,13 @@ def test_checkpoint_store_recovers_invalid_top_level_collections(tmp_path):
     assert state["cancellations"] == {}
 
 
+def test_checkpoint_run_recovers_invalid_nested_record():
+    state = {"runs": {"run-1": ["corrupt"]}}
+    local = connector_module._checkpoint_run(state, "run-1")
+    assert local == {}
+    assert state["runs"]["run-1"] is local
+
+
 def test_session_snapshot_cache_is_bounded_lru(tmp_path, monkeypatch):
     calls = []
 

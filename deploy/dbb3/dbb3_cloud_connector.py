@@ -530,6 +530,20 @@ class CheckpointStore:
                 pass
 
 
+def _checkpoint_run(state: dict[str, Any], remote_id: str) -> dict[str, Any]:
+    """Return a writable run record even when a checkpoint was partially corrupt."""
+
+    runs = state.get("runs")
+    if not isinstance(runs, dict):
+        runs = {}
+        state["runs"] = runs
+    local = runs.get(remote_id)
+    if not isinstance(local, dict):
+        local = {}
+        runs[remote_id] = local
+    return local
+
+
 def _safe_filename(path: Path) -> str:
     name = path.name.replace("\x00", "").strip() or "artifact"
     name = _SAFE_NAME_RE.sub("_", name).strip(" .") or "artifact"
@@ -1621,7 +1635,7 @@ class DBB3CloudConnector:
         remote_id = _text(run_payload.get("remote_run_id"), 256)
         if not remote_id:
             return {}
-        current = state.setdefault("runs", {}).setdefault(remote_id, {})
+        current = _checkpoint_run(state, remote_id)
         previous_claim = _text(current.get("claim_token"), 256)
         claim_token = _text(run_payload.get("claim_token"), 256)
         if not claim_token:
@@ -2015,7 +2029,7 @@ class DBB3CloudConnector:
         remote_id = _text(item.get("remote_run_id"), 256)
         if not remote_id:
             return 0
-        local = state.setdefault("runs", {}).setdefault(remote_id, {})
+        local = _checkpoint_run(state, remote_id)
         if local.get("cancel_acked"):
             return 0
         root_id = _text(item.get("root_task_id") or local.get("root_task_id"), 256)
@@ -2097,7 +2111,7 @@ class DBB3CloudConnector:
                 # a root that already exists is left pending for the next
                 # cycle so a temporary local `show` failure is retryable.
                 remote_id = _text(run_payload.get("remote_run_id"), 256)
-                local = state.setdefault("runs", {}).setdefault(remote_id, {})
+                local = _checkpoint_run(state, remote_id)
                 if remote_id:
                     local.setdefault("remote_run_id", remote_id)
                     local.setdefault(
