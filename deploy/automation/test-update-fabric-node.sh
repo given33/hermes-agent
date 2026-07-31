@@ -13,7 +13,8 @@ fake_bin="${work}/bin"
 archive="${work}/archive"
 mkdir -p "${fake_bin}" "${archive}/deploy/automation" \
   "${archive}/deploy/dbb3" "${archive}/deploy/pc" \
-  "${archive}/deploy/recovery" "${archive}/hermes_cli"
+  "${archive}/deploy/recovery" "${archive}/hermes_cli" \
+  "${archive}/hermes_runtime"
 
 cat >"${fake_bin}/git" <<'SH'
 #!/usr/bin/env bash
@@ -95,6 +96,9 @@ printf '{}\n' >"${archive}/deploy/recovery/managed-installations.wsl.json"
 for module in managed_installations.py managed_nodes.py managed_node_recovery_service.py; do
   printf 'RELEASE = "new"\n' >"${archive}/hermes_cli/${module}"
 done
+for module in __init__.py config.py; do
+  printf 'RELEASE = "new"\n' >"${archive}/hermes_runtime/${module}"
+done
 
 cat >"${archive}/deploy/dbb3/install-dbb3-cloud-connector-user.sh" <<'SH'
 #!/usr/bin/env bash
@@ -146,10 +150,13 @@ release_version="1.2.3"
 run_case() {
   local role="$1" failpoint="${2:-}"
   local root="${work}/${role}-${failpoint:-success}"
-  mkdir -p "${root}/runtime/hermes_cli" "${root}/automation" \
+  mkdir -p "${root}/runtime/hermes_cli" "${root}/runtime/hermes_runtime" "${root}/automation" \
     "${root}/home/.ssh" "${root}/backups" "${root}/state"
   for module in managed_installations.py managed_nodes.py managed_node_recovery_service.py; do
     printf 'RELEASE = "old"\n' >"${root}/runtime/hermes_cli/${module}"
+  done
+  for module in __init__.py config.py; do
+    printf 'RELEASE = "old"\n' >"${root}/runtime/hermes_runtime/${module}"
   done
   for asset in update-fabric-node.sh hermes-fabric-update.service hermes-fabric-update.timer; do
     printf 'old automation\n' >"${root}/automation/${asset}"
@@ -204,6 +211,7 @@ assert json.load(open(sys.argv[1], encoding="utf-8")) == {
 }
 PY
     [[ "$(cat "${root}/state/${role}/deployed-commit")" == "${release_commit}" ]]
+    grep -Fxq 'RELEASE = "new"' "${root}/runtime/hermes_runtime/config.py"
   else
     [[ "${status}" != 0 ]]
     [[ "$(cat "${root}/connector.state")" == old ]]
@@ -211,6 +219,7 @@ PY
     grep -Fxq 'receiver rollback' "${root}/components.log"
     grep -Fxq 'connector rollback' "${root}/components.log"
     grep -Fq 'RELEASE = "old"' "${root}/runtime/hermes_cli/managed_installations.py"
+    grep -Fq 'RELEASE = "old"' "${root}/runtime/hermes_runtime/config.py"
     if [[ "${failpoint}" == after-automation ]]; then
       for asset in update-fabric-node.sh hermes-fabric-update.service hermes-fabric-update.timer; do
         grep -Fxq 'old automation' "${root}/automation/${asset}"

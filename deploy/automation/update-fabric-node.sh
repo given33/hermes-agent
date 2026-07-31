@@ -138,7 +138,7 @@ cleanup() {
     systemctl enable --now hermes-fabric-update.timer >/dev/null 2>&1 || rollback_failed=1
   fi
   if (( runtime_swapped && ! transaction_committed )); then
-    for relative in "${runtime_modules[@]:-}"; do
+    for relative in "${runtime_assets[@]:-}"; do
       target="${runtime_root}/${relative}"
       backup_target="${runtime_backup}/${relative}"
       if [[ -f "${backup_target}.present" ]]; then
@@ -251,6 +251,7 @@ archive_paths=(
   "hermes_cli/managed_installations.py"
   "hermes_cli/managed_nodes.py"
   "hermes_cli/managed_node_recovery_service.py"
+  "hermes_runtime"
 )
 if [[ "${role}" == wsl ]]; then
   archive_paths+=(
@@ -342,11 +343,15 @@ for target in "${automation_script_target}" "${automation_service_target}" \
   fi
 done
 
-runtime_modules=(
+runtime_assets=(
   "hermes_cli/managed_installations.py"
   "hermes_cli/managed_nodes.py"
   "hermes_cli/managed_node_recovery_service.py"
 )
+while IFS= read -r -d '' runtime_path; do
+  runtime_assets+=("${runtime_path#"${stage}/"}")
+done < <(find "${stage}/hermes_runtime" -type f -name '*.py' -print0 2>/dev/null)
+(( ${#runtime_assets[@]} > 3 )) || die "managed runtime package is missing"
 case "${role}" in
   dbb3) runtime_root="${HERMES_DBB3_AGENT_ROOT:-/usr/local/lib/hermes-agent}" ;;
   wsl) runtime_root="${HERMES_WSL_AGENT_ROOT:-/mnt/d/Hermes/hermes-agent}" ;;
@@ -367,13 +372,14 @@ fi
   || die "managed receiver package root or one of its parents is unsafe"
 runtime_backup="${stage}/runtime-backup"
 install -d -o root -g root -m 0700 "${runtime_backup}/hermes_cli"
-for relative in "${runtime_modules[@]}"; do
+for relative in "${runtime_assets[@]}"; do
   source_file="${stage}/${relative}"
   target="${runtime_root}/${relative}"
   backup_target="${runtime_backup}/${relative}"
   [[ -f "${source_file}" && ! -L "${source_file}" ]] \
     || die "missing or unsafe managed receiver runtime asset ${relative}"
   [[ ! -L "${target}" ]] || die "managed receiver runtime target is a symlink: ${target}"
+  install -d -o root -g root -m 0700 "$(dirname "${backup_target}")"
   if [[ -f "${target}" ]]; then
     cp -a -- "${target}" "${backup_target}"
     : >"${backup_target}.present"
@@ -384,7 +390,7 @@ for relative in "${runtime_modules[@]}"; do
   fi
 done
 staged_runtime_modules=()
-for relative in "${runtime_modules[@]}"; do
+for relative in "${runtime_assets[@]}"; do
   staged_runtime_modules+=("${stage}/${relative}")
 done
 python3 - "${staged_runtime_modules[@]}" <<'PY'
@@ -393,7 +399,7 @@ for name in sys.argv[1:]:
     compile(pathlib.Path(name).read_text(encoding="utf-8"), name, "exec")
 PY
 runtime_swapped=1
-for relative in "${runtime_modules[@]}"; do
+for relative in "${runtime_assets[@]}"; do
   target="${runtime_root}/${relative}"
   install -d -o root -g root -m 0755 "$(dirname "${target}")"
   install -o root -g root -m 0644 "${stage}/${relative}" "${target}.new.$$"

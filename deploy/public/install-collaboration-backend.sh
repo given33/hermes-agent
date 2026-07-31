@@ -1578,13 +1578,17 @@ fabric_health_attempts="${HERMES_FABRIC_HEALTH_ATTEMPTS:-600}"
   || die "HERMES_FABRIC_HEALTH_ATTEMPTS must be a positive integer"
 for node in dbb3 wsl; do
   node_health="$(mktemp "/run/hermes-installation-${node}.XXXXXX")"
+  node_http_status="$(mktemp "/run/hermes-installation-${node}-status.XXXXXX")"
   route_healthy=0
   for _ in $(seq 1 "${fabric_health_attempts}"); do
-    if curl --fail --silent --show-error --max-time 5 \
+    if curl --silent --show-error --max-time 5 \
         --resolve 'daxueshenmai.top:443:127.0.0.1' \
         --config "${installation_health_cfg}" \
+        --write-out '%{http_code}' \
+        -o "${node_health}" \
         "https://daxueshenmai.top/_hermes/installations/${node}/health" \
-        >"${node_health}" \
+        >"${node_http_status}" \
+      && [[ "$(cat -- "${node_http_status}")" == 200 ]] \
       && "${runtime_python}" - "${node_health}" "${node}" \
         "${release_commit}" "${version}" <<'PY'
 import json
@@ -1630,8 +1634,12 @@ PY
     else
       printf '%s\n' 'managed installation last response was empty or unavailable' >&2
     fi
+    if [[ -s "${node_http_status}" ]]; then
+      printf 'managed installation last HTTP status: %s\n' \
+        "$(cat -- "${node_http_status}")" >&2
+    fi
   fi
-  rm -f -- "${node_health}"
+  rm -f -- "${node_health}" "${node_http_status}"
   [[ "${route_healthy}" == 1 ]] || false
   installation_probe_id="mi-$(${runtime_python} -c 'import uuid; print(uuid.uuid4().hex)')"
   installation_probe_body="$(mktemp "/run/hermes-installation-${node}-body.XXXXXX")"

@@ -331,14 +331,21 @@ cat >"${fake_bin}/curl" <<'SH'
 set -euo pipefail
 output=""
 next_is_output=0
+write_out=""
+next_is_write_out=0
 data_file=""
 next_is_data=0
 for arg in "$@"; do
   if [[ "${next_is_output}" == 1 ]]; then
     output="${arg}"
     next_is_output=0
+  elif [[ "${next_is_write_out}" == 1 ]]; then
+    write_out="${arg}"
+    next_is_write_out=0
   elif [[ "${arg}" == "-o" ]]; then
     next_is_output=1
+  elif [[ "${arg}" == "--write-out" ]]; then
+    next_is_write_out=1
   elif [[ "${next_is_data}" == 1 ]]; then
     data_file="${arg#@}"
     next_is_data=0
@@ -432,6 +439,9 @@ if [[ -n "${output}" ]]; then
   printf '%s\n' "${payload}" >"${output}"
 else
   printf '%s\n' "${payload}"
+fi
+if [[ -n "${write_out}" ]]; then
+  printf '%s' '200'
 fi
 SH
 chmod 0755 "${fake_bin}/systemctl" "${fake_bin}/sshd" "${fake_bin}/mv" \
