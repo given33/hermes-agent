@@ -2289,8 +2289,12 @@ def main(argv: list[str] | None = None) -> int:
                 print(json.dumps({"timestamp": now_iso(), "error": f"cloud request failed ({exc.status})"}), flush=True)
                 return 65
             print(json.dumps({"timestamp": now_iso(), "error": f"cloud temporary failure ({exc.status})"}), flush=True)
+            if args.once:
+                return 75
         except (OSError, urllib.error.URLError, json.JSONDecodeError, ValueError, RuntimeError) as exc:
             print(json.dumps({"timestamp": now_iso(), "error": f"{type(exc).__name__}: {_text(exc, 500)}"}), flush=True)
+            if args.once:
+                return 75
         if args.once:
             return 0
         time.sleep(max(0.5, args.interval))

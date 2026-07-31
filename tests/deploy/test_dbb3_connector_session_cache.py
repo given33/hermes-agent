@@ -89,6 +89,30 @@ def test_content_length_parser_rejects_invalid_headers():
             raise AssertionError(f"invalid Content-Length accepted: {value}")
 
 
+def test_main_once_returns_failure_for_transient_sync_error(tmp_path, monkeypatch):
+    class FailingConnector:
+        def __init__(self, *_args, **_kwargs):
+            pass
+
+        def sync_once(self):
+            raise OSError("cloud unavailable")
+
+    monkeypatch.setattr(connector_module, "_load_token", lambda _path: "token")
+    monkeypatch.setattr(connector_module, "DBB3CloudConnector", FailingConnector)
+    assert (
+        connector_module.main(
+            [
+                "--cloud-url",
+                "https://example.test",
+                "--token-file",
+                str(tmp_path / "token"),
+                "--once",
+            ]
+        )
+        == 75
+    )
+
+
 def test_session_snapshot_cache_is_bounded_lru(tmp_path, monkeypatch):
     calls = []
 
