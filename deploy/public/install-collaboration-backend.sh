@@ -1581,6 +1581,8 @@ for node in dbb3 wsl; do
   node_http_status="$(mktemp "/run/hermes-installation-${node}-status.XXXXXX")"
   route_healthy=0
   for _ in $(seq 1 "${fabric_health_attempts}"); do
+    : >"${node_health}"
+    : >"${node_http_status}"
     if curl --silent --show-error --max-time 5 \
         --resolve 'daxueshenmai.top:443:127.0.0.1' \
         --config "${installation_health_cfg}" \
