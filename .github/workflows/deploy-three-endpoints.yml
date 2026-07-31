@@ -177,9 +177,9 @@ jobs:
               --workflow "${workflow}" \
               --event repository_dispatch \
               --limit 50 \
-              --json databaseId,name,status,conclusion \
+              --json databaseId,displayTitle,status,conclusion \
               | jq -r --arg name "${run_name}" \
-                'map(select(.name == $name and (.status == "queued" or .status == "in_progress" or (.status == "completed" and .conclusion == "success")))) | sort_by(.databaseId) | reverse | .[0].databaseId // empty'
+                'map(select(.displayTitle == $name and (.status == "queued" or .status == "in_progress" or (.status == "completed" and .conclusion == "success")))) | sort_by(.databaseId) | reverse | .[0].databaseId // empty'
           }
           find_failed_release_run() {
             local workflow="$1"
@@ -189,9 +189,9 @@ jobs:
               --workflow "${workflow}" \
               --event repository_dispatch \
               --limit 50 \
-              --json databaseId,name,status,conclusion \
+              --json databaseId,displayTitle,status,conclusion \
               | jq -r --arg name "${run_name}" \
-                'map(select(.name == $name and .status == "completed" and .conclusion != "success")) | sort_by(.databaseId) | reverse | .[0].databaseId // empty'
+                'map(select(.displayTitle == $name and .status == "completed" and .conclusion != "success")) | sort_by(.databaseId) | reverse | .[0].databaseId // empty'
           }
           dispatch_release() {
             jq -n \
