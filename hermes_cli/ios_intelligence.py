@@ -75,6 +75,7 @@ _IOS_NATIVE_ACTION_POLICY: dict[tuple[str, str], dict[str, Any]] = {
     ("ios-photos", "list"): {"risk": "read", "confirmation": "none", "permission": "photos"},
     ("ios-photos", "capture"): {"risk": "write", "confirmation": "required", "permission": "camera"},
     ("ios-photos", "scan"): {"risk": "write", "confirmation": "required", "permission": "camera"},
+    ("ios-photos", "ocr"): {"risk": "read", "confirmation": "none", "permission": "photos"},
     ("ios-media", "get"): {"risk": "read", "confirmation": "none", "permission": "media"},
     ("ios-media", "control"): {"risk": "write", "confirmation": "required", "permission": "media"},
     ("ios-media", "play"): {"risk": "write", "confirmation": "required", "permission": "media"},
@@ -89,6 +90,9 @@ _IOS_NATIVE_ACTION_POLICY: dict[tuple[str, str], dict[str, Any]] = {
     ("ios-homekit", "list"): {"risk": "read", "confirmation": "none", "permission": "homekit"},
     ("ios-homekit", "get"): {"risk": "read", "confirmation": "none", "permission": "homekit"},
     ("ios-homekit", "set"): {"risk": "write", "confirmation": "required", "permission": "homekit"},
+    ("ios-health-write", "authorize"): {"risk": "write", "confirmation": "required", "permission": "health"},
+    ("ios-health-write", "write"): {"risk": "write", "confirmation": "required", "permission": "health"},
+    ("ios-device", "open-url"): {"risk": "write", "confirmation": "required", "permission": "device"},
 }
 
 _IOS_NATIVE_READ_ACTIONS = frozenset({

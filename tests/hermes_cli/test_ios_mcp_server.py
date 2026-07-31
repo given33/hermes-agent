@@ -91,11 +91,13 @@ def test_clipboard_tools_are_scoped_and_require_confirmation_for_writes(tmp_path
     ("capability", "tools"),
     [
         ("ios-contacts", {"ios_contacts_search", "ios_contacts_create"}),
-        ("ios-photos", {"ios_photos_search", "ios_photos_capture", "ios_photos_scan"}),
+        ("ios-photos", {"ios_photos_search", "ios_photos_capture", "ios_photos_scan", "ios_photos_ocr"}),
         ("ios-media", {"ios_media_get", "ios_media_control"}),
         ("ios-bluetooth", {"ios_bluetooth_state", "ios_bluetooth_scan"}),
         ("ios-nfc", {"ios_nfc_scan"}),
         ("ios-homekit", {"ios_homekit_list", "ios_homekit_set"}),
+        ("ios-health-write", {"ios_health_write_authorize", "ios_health_write"}),
+        ("ios-device", {"ios_device_get_latest", "ios_device_open_url"}),
     ],
 )
 def test_native_action_capabilities_expose_queue_tools(tmp_path, capability, tools):

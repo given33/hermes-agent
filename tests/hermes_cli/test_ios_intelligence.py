@@ -1181,6 +1181,10 @@ def test_native_action_metadata_fails_closed_for_unknown_actions():
         ("ios-media", "control", "write", "required", "media"),
         ("ios-media", "pause", "write", "required", "media"),
         ("ios-nfc", "scan", "read", "required", "nfc"),
+        ("ios-health-write", "authorize", "write", "required", "health"),
+        ("ios-health-write", "write", "write", "required", "health"),
+        ("ios-photos", "ocr", "read", "none", "photos"),
+        ("ios-device", "open-url", "write", "required", "device"),
     ],
 )
 def test_native_action_metadata_matches_device_contract(

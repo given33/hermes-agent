@@ -361,11 +361,15 @@ elif [[ "${url}" == */api/mobile/v1/handshake ]]; then
   [[ "${FAKE_HANDSHAKE_FAIL:-0}" != 1 ]] || exit 22
   payload='{"api_version":1,"hermes_version":"test","profiles":[],"capabilities":[],"server_time":"2026-07-19T12:00:00Z"}'
 elif [[ "${url}" == */api/plugins/ios-intelligence/health ]]; then
-  payload="$(python3 - <<'PY'
+  payload="$(python3 - "${HERMES_AGENT_ROOT}" <<'PY'
 import json
+import sys
+from pathlib import Path
+sys.path.insert(0, str(Path(sys.argv[1])))
+from hermes_cli.ios_mcp_server import CAPABILITIES
 services = [
     {"name": f"service-{index}", "ok": True, "tools": ["read", "write"] + (["extra"] if index < 2 else [])}
-    for index in range(28)
+    for index, _capability in enumerate(CAPABILITIES)
 ]
 print(json.dumps({
     "ok": True,
@@ -373,8 +377,8 @@ print(json.dumps({
     "mcp_runtime": {
         "ok": True,
         "running": True,
-        "healthy_count": 28,
-        "required_count": 28,
+        "healthy_count": len(CAPABILITIES),
+        "required_count": len(CAPABILITIES),
         "services": services,
     },
 }))

@@ -465,7 +465,7 @@ stdio 无认证（父进程信任）;WS 认证同 §2.4。**不存在 `/api/rpc`
 | 16 | Photon sidecar | `plugins/platforms/photon/sidecar/index.mjs` | Node http（127.0.0.1） |
 | 17 | WhatsApp bridge | `scripts/whatsapp-bridge/bridge.js:1098` | Express（127.0.0.1） |
 | 18-20 | OAuth 回环单次监听：MCP（`tools/mcp_oauth.py`）、Spotify（`hermes_cli/auth.py`）、Honcho（`plugins/memory/honcho/oauth_flow.py`） | 各文件 | http.server |
-| 21 | iOS MCP server（仅显式 `--transport streamable-http` 时监听） | `hermes_cli/ios_mcp_server.py:874` | MCP Python SDK v2 |
+| 动态清单 | iOS MCP server（仅显式 `--transport streamable-http` 时监听） | `hermes_cli/ios_mcp_server.py` | MCP Python SDK v2 |
 
 stdio-only（非监听器）：`mcp_serve.py`（`hermes mcp serve`，暴露 conversations_list/messages_read/events_poll·wait/messages_send/permissions_list_open·respond/channels_list 等 MCP 工具）、`acp_adapter/server.py`（「ACP is stdio-only, local-trust」）。
 

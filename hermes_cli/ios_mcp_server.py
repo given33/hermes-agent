@@ -19,6 +19,7 @@ from pathlib import Path
 import sys
 import time
 from typing import TYPE_CHECKING, Any, Callable, Iterable, Mapping, Sequence
+from urllib.parse import urlparse
 
 from hermes_cli.ios_intelligence import (
     AMapClient,
@@ -35,7 +36,7 @@ if TYPE_CHECKING:
 CAPABILITIES = (
     "ios-location", "ios-trajectory", "ios-places", "ios-motion", "ios-behavior",
     "qweather", "amap-route", "ios-map", "ios-power", "ios-health-sleep",
-    "ios-health-heart", "ios-health-oxygen", "ios-health-activity", "ios-calendar",
+    "ios-health-heart", "ios-health-oxygen", "ios-health-activity", "ios-health-write", "ios-calendar",
     "ios-reminders", "ios-clipboard", "ios-contacts", "ios-photos", "ios-media",
     "ios-bluetooth", "ios-nfc", "ios-homekit", "ios-notes", "ios-screen-time", "ios-watch", "ios-notification",
     "ios-live-activity", "ios-device",
@@ -70,7 +71,8 @@ _SCOPE_BY_CAPABILITY = {
     "ios-watch": ("watch:read", "watch:control"),
     "ios-notification": ("notification:send",),
     "ios-live-activity": ("live-activity:write",),
-    "ios-device": ("device:read",),
+    "ios-device": ("device:read", "device:control"),
+    "ios-health-write": ("health:write",),
 }
 
 _TOOL_SCOPE_BY_CAPABILITY = {
@@ -132,6 +134,7 @@ _TOOL_SCOPE_BY_CAPABILITY = {
         "ios_photos_search": ("photos:read",),
         "ios_photos_capture": ("camera:write",),
         "ios_photos_scan": ("camera:write",),
+        "ios_photos_ocr": ("photos:read",),
     },
     "ios-media": {
         "ios_media_get": ("media:read",),
@@ -169,7 +172,14 @@ _TOOL_SCOPE_BY_CAPABILITY = {
         "ios_live_activity_start": ("live-activity:write",),
         "ios_live_activity_end": ("live-activity:write",),
     },
-    "ios-device": {"ios_device_get_latest": ("device:read",)},
+    "ios-device": {
+        "ios_device_get_latest": ("device:read",),
+        "ios_device_open_url": ("device:control",),
+    },
+    "ios-health-write": {
+        "ios_health_write_authorize": ("health:write",),
+        "ios_health_write": ("health:write",),
+    },
 }
 
 
@@ -425,6 +435,7 @@ _DEVICE_PERMISSION_BY_CAPABILITY = {
     "ios-health-heart": "health",
     "ios-health-oxygen": "health",
     "ios-health-activity": "health",
+    "ios-health-write": "health",
     "ios-calendar": "calendar",
     "ios-reminders": "reminders",
     "ios-screen-time": "screenTime",
@@ -660,6 +671,39 @@ def create_mcp_server(
             _queue_tool(
                 mcp, enforcer, store, capability, "ios_screen_time_stop", "stop",
                 "Use when the user asks Hermes to stop a named native Device Activity monitor.",
+            )
+        if capability == "ios-device":
+            def ios_device_open_url(
+                url: str,
+                owner_id: str = "",
+                device_id: str = "",
+                idempotency_key: str = "",
+                confirmed: bool = False,
+                confirmation_token: str = "",
+            ) -> dict[str, Any]:
+                normalized = str(url or "").strip()
+                parsed = urlparse(normalized)
+                allowed = {"http", "https", "mailto", "tel", "facetime", "maps", "shortcuts", "app-settings"}
+                if len(normalized) > 2048 or parsed.scheme.lower() not in allowed:
+                    raise ValueError("url must use an allowed iOS URL scheme")
+                if parsed.scheme.lower() in {"http", "https", "facetime", "maps", "shortcuts"} and not parsed.netloc:
+                    raise ValueError("url host is required")
+                payload: dict[str, Any] = {"url": normalized}
+                if confirmed:
+                    payload["confirmed"] = True
+                token = str(confirmation_token or "").strip()
+                if token:
+                    payload["confirmation_token"] = token[:512]
+                owner = _resolve_owner(store, owner_id)
+                return store.queue_device_command(
+                    owner, capability, "open-url", payload,
+                    device_id=device_id, idempotency_key=idempotency_key,
+                )
+
+            _register_scoped_tool(
+                mcp, enforcer, capability, ios_device_open_url,
+                name="ios_device_open_url",
+                description="Use when the user asks Hermes to open a safe URL, app deep link, or the iOS Settings screen on the user's iPhone.",
             )
         return mcp
 
@@ -913,6 +957,21 @@ def create_mcp_server(
         _queue_tool(
             mcp, enforcer, store, capability, "ios_photos_scan", "scan",
             "Use when the user asks Hermes to scan a visual code with the iPhone camera; the app must be foregrounded.",
+        )
+        _queue_tool(
+            mcp, enforcer, store, capability, "ios_photos_ocr", "ocr",
+            "Use when Hermes needs to extract text from a local iPhone image. Payload must include imageURL or uri.",
+        )
+        return mcp
+
+    if capability == "ios-health-write":
+        _queue_tool(
+            mcp, enforcer, store, capability, "ios_health_write_authorize", "authorize",
+            "Use to request the native HealthKit write permission for a specific quantity identifier; iOS shows the system permission prompt.",
+        )
+        _queue_tool(
+            mcp, enforcer, store, capability, "ios_health_write", "write",
+            "Use only when the user explicitly asks Hermes to write a HealthKit quantity sample. Payload must include identifier, value, unit, start, and end.",
         )
         return mcp
 
