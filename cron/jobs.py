@@ -2088,6 +2088,16 @@ def _get_due_jobs_locked() -> List[Dict[str, Any]]:
                 rj.pop("last_run_at", None)
                 needs_save = True
 
+    # Normalize repeat records before the due loop.  The one-shot dispatch
+    # limit guard below reads ``times``/``completed`` directly; a scalar or
+    # malformed counter from a hand-edited jobs.json would otherwise raise in
+    # that per-job guard and silently skip the job forever.
+    for j, rj in zip(jobs, raw_jobs):
+        _repeat, repaired = _normalize_repeat_record(j)
+        if repaired:
+            rj["repeat"] = copy.deepcopy(j["repeat"])
+            needs_save = True
+
     # Resolve the one-shot running-claim stale-recovery TTL once per scan
     # (derived from HERMES_CRON_TIMEOUT). See _oneshot_run_claim_ttl_seconds.
     _run_claim_ttl = _oneshot_run_claim_ttl_seconds()

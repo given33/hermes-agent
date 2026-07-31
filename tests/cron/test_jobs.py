@@ -2026,6 +2026,27 @@ class TestClaimDispatch:
         assert due == []
         assert load_jobs() == []  # cleaned up
 
+    def test_malformed_repeat_does_not_block_due_scan(self, tmp_cron_dir):
+        past = (datetime.now(timezone.utc) - timedelta(seconds=5)).isoformat()
+        save_jobs([{
+            "id": "bad-repeat",
+            "enabled": True,
+            "schedule": {"kind": "once", "run_at": past},
+            "repeat": "not-a-record",
+            "next_run_at": past,
+        }, {
+            "id": "healthy",
+            "enabled": True,
+            "schedule": {"kind": "once", "run_at": past},
+            "repeat": {"times": 1, "completed": 0},
+            "next_run_at": past,
+        }])
+
+        due = get_due_jobs()
+
+        assert {job["id"] for job in due} == {"bad-repeat", "healthy"}
+        assert load_jobs()[0]["repeat"] == {"times": None, "completed": 0}
+
     def test_bad_schedule_does_not_crash_or_block_sibling_jobs(self, tmp_cron_dir):
         """Regression for a job with non-dict 'schedule' (null / string / etc.
 
