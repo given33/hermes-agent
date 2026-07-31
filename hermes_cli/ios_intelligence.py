@@ -2466,15 +2466,26 @@ class IOSIntelligenceStore:
         with self._connect() as conn, write_txn(conn):
             if idempotency_key:
                 existing = conn.execute(
-                    "SELECT id,status FROM ios_device_commands WHERE owner_id=? AND idempotency_key=?",
+                    "SELECT id,status,capability,action FROM ios_device_commands "
+                    "WHERE owner_id=? AND idempotency_key=?",
                     (owner_id, idempotency_key),
                 ).fetchone()
                 if existing:
+                    existing_capability = str(existing["capability"])
+                    existing_action = str(existing["action"])
+                    if existing_capability != _kind(capability) or existing_action != str(action)[:128]:
+                        raise ValueError(
+                            "idempotency_key already belongs to "
+                            f"{existing_capability}:{existing_action}"
+                        )
                     return {
                         "id": existing["id"],
                         "status": existing["status"],
                         "duplicate": True,
-                        "action_metadata": ios_native_action_metadata(capability, action),
+                        "action_metadata": ios_native_action_metadata(
+                            existing_capability,
+                            existing_action,
+                        ),
                     }
             conn.execute(
                 "INSERT INTO ios_device_commands(id,owner_id,device_id,capability,action,payload_json,"

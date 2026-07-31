@@ -1166,6 +1166,24 @@ def test_device_command_queue_survives_delivery_and_ack(store, monkeypatch):
     assert store.ack_device_command("alice", first["id"], result={}) is False
 
 
+def test_device_command_idempotency_key_cannot_cross_action_boundary(store):
+    store.queue_device_command(
+        "alice",
+        "ios-reminders",
+        "create",
+        {"title": "draft"},
+        idempotency_key="shared-key",
+    )
+    with pytest.raises(ValueError, match="already belongs to ios-reminders:create"):
+        store.queue_device_command(
+            "alice",
+            "ios-calendar",
+            "create",
+            {"title": "wrong target"},
+            idempotency_key="shared-key",
+        )
+
+
 def test_native_action_metadata_fails_closed_for_unknown_actions():
     assert ios_native_action_metadata("ios-calendar", "create")["confirmation"] == "required"
     assert ios_native_action_metadata("ios-clipboard", "read")["risk"] == "read"
