@@ -2754,9 +2754,11 @@ def _scan_assembled_cron_prompt(
         # prompt is what actually runs.
         cleaned, scan_error = _scan_cron_skill_assembled(assembled)
         assembled = cleaned
-        if not scan_error and not has_skills and user_prompt:
-            # Data-injection path: keep the strict guarantee on the
-            # user-authored prompt itself.
+        if not scan_error and user_prompt:
+            # Runtime-loaded skill/data content uses the looser tier, but the
+            # original user-authored prompt must always retain the strict
+            # guarantee. This is a defense-in-depth backstop for legacy jobs
+            # that predate create/update-time prompt validation.
             scan_error = _scan_cron_prompt(user_prompt)
     else:
         scan_error = _scan_cron_prompt(assembled)
