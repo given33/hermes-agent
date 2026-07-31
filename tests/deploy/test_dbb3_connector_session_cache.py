@@ -54,6 +54,14 @@ def test_checkpoint_run_recovers_invalid_nested_record():
     assert state["runs"]["run-1"] is local
 
 
+def test_checkpoint_cursor_is_fail_closed_and_non_negative():
+    assert connector_module._checkpoint_cursor("12") == 12
+    assert connector_module._checkpoint_cursor(-4) == 0
+    assert connector_module._checkpoint_cursor(True) == 0
+    assert connector_module._checkpoint_cursor("broken") == 0
+    assert connector_module._checkpoint_cursor(float("inf")) == 0
+
+
 def test_session_snapshot_cache_is_bounded_lru(tmp_path, monkeypatch):
     calls = []
 

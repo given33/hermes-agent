@@ -544,6 +544,17 @@ def _checkpoint_run(state: dict[str, Any], remote_id: str) -> dict[str, Any]:
     return local
 
 
+def _checkpoint_cursor(value: Any) -> int:
+    """Parse a persisted/cloud cursor without letting corrupt state stop polling."""
+
+    if isinstance(value, bool):
+        return 0
+    try:
+        return max(0, int(value))
+    except (TypeError, ValueError, OverflowError):
+        return 0
+
+
 def _safe_filename(path: Path) -> str:
     name = path.name.replace("\x00", "").strip() or "artifact"
     name = _SAFE_NAME_RE.sub("_", name).strip(" .") or "artifact"
@@ -1493,7 +1504,7 @@ class DBB3CloudConnector:
             pending = {
                 "connector_id": self.cloud_client.connector_id,
                 "claim_token": _text(local.get("claim_token"), 256),
-                "checkpoint_cursor": int(local.get("checkpoint_cursor") or 0) + 1,
+                "checkpoint_cursor": _checkpoint_cursor(local.get("checkpoint_cursor")) + 1,
                 "error": _text(error, 1000),
                 "summary": _text(summary, 1000),
                 "observed_at": self.clock(),
@@ -1552,9 +1563,9 @@ class DBB3CloudConnector:
             {
                 "status": remote_status or "failed",
                 "checkpoint_cursor": max(
-                    int(local.get("checkpoint_cursor") or 0),
-                    int(pending.get("checkpoint_cursor") or 0),
-                    int((remote or {}).get("checkpoint_cursor") or 0),
+                    _checkpoint_cursor(local.get("checkpoint_cursor")),
+                    _checkpoint_cursor(pending.get("checkpoint_cursor")),
+                    _checkpoint_cursor((remote or {}).get("checkpoint_cursor")),
                 ),
                 "terminal_acked": True,
             }
@@ -1780,7 +1791,7 @@ class DBB3CloudConnector:
             "connector_id": self.cloud_client.connector_id,
             "claim_token": _text(local.get("claim_token"), 256),
             "lease_seconds": 90,
-            "checkpoint_cursor": int(local.get("checkpoint_cursor") or 0) + 1,
+            "checkpoint_cursor": _checkpoint_cursor(local.get("checkpoint_cursor")) + 1,
             "status": status,
             "terminal": status in TERMINAL_STATUSES,
             "summary": summary,
@@ -2005,7 +2016,7 @@ class DBB3CloudConnector:
             except (OSError, urllib.error.URLError):
                 return 0, 0
             else:
-                local["checkpoint_cursor"] = int(pending["checkpoint_cursor"])
+                local["checkpoint_cursor"] = _checkpoint_cursor(pending["checkpoint_cursor"])
                 local["last_status_fingerprint"] = str(
                     local.get("pending_status_fingerprint") or fingerprint
                 )
@@ -2045,8 +2056,8 @@ class DBB3CloudConnector:
         if code != 0:
             return 0
         cursor = max(
-            int(local.get("checkpoint_cursor") or 0),
-            int(item.get("checkpoint_cursor") or 0),
+            _checkpoint_cursor(local.get("checkpoint_cursor")),
+            _checkpoint_cursor(item.get("checkpoint_cursor")),
         ) + 1
         try:
             response = self.cloud_client.acknowledge_cancel(
@@ -2070,7 +2081,7 @@ class DBB3CloudConnector:
             return 1
         remote = response.get("run") if isinstance(response, dict) else None
         if isinstance(remote, dict):
-            remote_cursor = int(remote.get("checkpoint_cursor") or 0)
+            remote_cursor = _checkpoint_cursor(remote.get("checkpoint_cursor"))
             cursor = max(cursor, remote_cursor)
             remote_status = str(remote.get("status") or "")
             if remote_status in TERMINAL_STATUSES:
