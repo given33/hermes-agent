@@ -30,7 +30,9 @@ import pytest
 
 import hermes_cli.web_server as web_server_mod
 
-SLOW_SECONDS = 3  # represents the Defender worst-case (scaled down for CI speed)
+# Keep enough margin for shared-runner scheduling while remaining short enough
+# that a synchronous warmup is unambiguously slower than the threshold.
+SLOW_SECONDS = 5
 
 
 # ---------------------------------------------------------------------------
