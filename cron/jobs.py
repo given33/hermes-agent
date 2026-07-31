@@ -731,6 +731,8 @@ def parse_schedule(schedule: str) -> Dict[str, Any]:
             "run_at": run_at.isoformat(),
             "display": f"once in {original}"
         }
+    except OverflowError as exc:
+        raise ValueError("Invalid duration: value is too large") from exc
     except ValueError:
         pass
     
@@ -887,15 +889,19 @@ def compute_next_run(schedule: Dict[str, Any], last_run_at: Optional[str] = None
             or minutes <= 0
         ):
             return None
-        if last_run_at:
-            try:
-                last = _ensure_aware(datetime.fromisoformat(last_run_at))
-                next_run = last + timedelta(minutes=minutes)
-            except Exception:
+        try:
+            if last_run_at:
+                try:
+                    last = _ensure_aware(datetime.fromisoformat(last_run_at))
+                    next_run = last + timedelta(minutes=minutes)
+                except Exception:
+                    next_run = now + timedelta(minutes=minutes)
+            else:
+                # First run is now + interval
                 next_run = now + timedelta(minutes=minutes)
-        else:
-            # First run is now + interval
-            next_run = now + timedelta(minutes=minutes)
+        except OverflowError:
+            logger.warning("Cannot compute next run for oversized interval: %r", minutes)
+            return None
         return next_run.isoformat()
 
     elif kind == "cron":

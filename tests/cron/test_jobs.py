@@ -114,6 +114,10 @@ class TestParseSchedule:
         with pytest.raises(ValueError, match="greater than zero"):
             parse_schedule("every 0m")
 
+    def test_oversized_interval_schedule_raises(self):
+        with pytest.raises(ValueError, match="too large"):
+            parse_schedule("999999999999999999999999999m")
+
     def test_cron_expression(self):
         pytest.importorskip("croniter")
         result = parse_schedule("0 9 * * *")
@@ -234,7 +238,7 @@ class TestComputeNextRun:
         # Should be ~30 minutes from last run
         assert next_dt > datetime.now().astimezone() + timedelta(minutes=29)
 
-    @pytest.mark.parametrize("minutes", [None, "five", {}, -1, True])
+    @pytest.mark.parametrize("minutes", [None, "five", {}, -1, True, 10**100])
     def test_interval_with_invalid_minutes_is_not_schedulable(self, minutes):
         """Hand-edited schedule values must not raise from runtime helpers."""
         assert compute_next_run({"kind": "interval", "minutes": minutes}) is None
