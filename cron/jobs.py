@@ -500,7 +500,7 @@ def _job_schedule_kind(job: Dict[str, Any]) -> Optional[str]:
     return schedule.get("kind") if isinstance(schedule, dict) else None
 
 
-def _coerce_job_enabled(value: Any, default: bool = True) -> bool:
+def coerce_job_enabled(value: Any, default: bool = True) -> bool:
     """Interpret legacy/user-edited enabled values without truthiness traps."""
     if isinstance(value, bool):
         return value
@@ -599,11 +599,11 @@ def _normalize_job_record(job: Dict[str, Any]) -> Dict[str, Any]:
     _normalize_repeat_record(normalized)
     for flag, default in (("enabled", False), ("no_agent", False)):
         if flag in normalized:
-            normalized[flag] = _coerce_job_enabled(normalized.get(flag), default)
+            normalized[flag] = coerce_job_enabled(normalized.get(flag), default)
 
     state = _coerce_job_text(normalized.get("state")).strip()
     if not state:
-        state = "scheduled" if _coerce_job_enabled(normalized.get("enabled", True)) else "paused"
+        state = "scheduled" if coerce_job_enabled(normalized.get("enabled", True)) else "paused"
     normalized["state"] = state
 
     return normalized
@@ -1230,7 +1230,7 @@ def _compute_provider_model_snapshots(
         base_url,
         strip_trailing_slash=True,
     )
-    if _coerce_job_enabled(no_agent, False):
+    if coerce_job_enabled(no_agent, False):
         return None, None
 
     provider_snapshot: Optional[str] = None
@@ -1261,7 +1261,7 @@ def _normalized_inference_axes(job: Dict[str, Any]) -> Tuple[Optional[str], Opti
         _normalize_job_optional_text(job.get("provider")),
         _normalize_job_optional_text(job.get("model")),
         _normalize_job_optional_text(job.get("base_url"), strip_trailing_slash=True),
-        _coerce_job_enabled(job.get("no_agent"), False),
+        coerce_job_enabled(job.get("no_agent"), False),
     )
 
 
@@ -1356,7 +1356,7 @@ def create_job(
     normalized_script = normalized_script or None
     normalized_toolsets = _normalize_enabled_toolsets(enabled_toolsets)
     normalized_workdir = _normalize_workdir(workdir)
-    normalized_no_agent = _coerce_job_enabled(no_agent, False)
+    normalized_no_agent = coerce_job_enabled(no_agent, False)
     normalized_attach = attach_to_session if isinstance(attach_to_session, bool) else None
 
     # no_agent jobs are meaningless without a script — the script IS the job.
@@ -1519,7 +1519,7 @@ def list_jobs(include_disabled: bool = False) -> List[Dict[str, Any]]:
     """List all jobs, optionally including disabled ones."""
     jobs = [_normalize_job_record(j) for j in load_jobs()]
     if not include_disabled:
-        jobs = [j for j in jobs if _coerce_job_enabled(j.get("enabled", True))]
+        jobs = [j for j in jobs if coerce_job_enabled(j.get("enabled", True))]
     try:
         from cron.executions import latest_executions
 
@@ -1625,7 +1625,7 @@ def update_job(job_id: str, updates: Dict[str, Any]) -> Optional[Dict[str, Any]]
                 updated["model_snapshot"] = model_snapshot
 
             enabled_default = "enabled" not in updated
-            if _coerce_job_enabled(updated.get("enabled", True), enabled_default) and updated.get("state") != "paused" and not updated.get("next_run_at"):
+            if coerce_job_enabled(updated.get("enabled", True), enabled_default) and updated.get("state") != "paused" and not updated.get("next_run_at"):
                 next_run = compute_next_run(updated["schedule"])
                 if next_run is None and _job_schedule_kind(updated) == "once":
                     schedule = updated.get("schedule")
@@ -2035,7 +2035,7 @@ def claim_job_for_fire(
             if job.get("id") != job_id:
                 continue
             enabled_default = "enabled" not in job
-            if not _coerce_job_enabled(job.get("enabled", True), enabled_default) or job.get("state") == "paused":
+            if not coerce_job_enabled(job.get("enabled", True), enabled_default) or job.get("state") == "paused":
                 return False
             now = _hermes_now()
             existing = job.get("fire_claim")
@@ -2199,7 +2199,7 @@ def _get_due_jobs_locked() -> List[Dict[str, Any]]:
     for j, rj in zip(jobs, raw_jobs):
         for flag, default in (("enabled", False), ("no_agent", False)):
             if flag in j:
-                normalized_flag = _coerce_job_enabled(j.get(flag), default)
+                normalized_flag = coerce_job_enabled(j.get(flag), default)
                 if j.get(flag) != normalized_flag:
                     j[flag] = normalized_flag
                     rj[flag] = normalized_flag
