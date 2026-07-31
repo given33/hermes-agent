@@ -588,9 +588,6 @@ def test_base_exception_restores_messages_changed_by_pre_compaction_hook(
     ]
 
     monkeypatch.setattr(
-        "agent.conversation_compression.has_internal_hooks", lambda _point: True
-    )
-    monkeypatch.setattr(
         "agent.conversation_compression.run_internal_hooks",
         lambda *_args, **_kwargs: SimpleNamespace(
             payload=[{"role": "user", "content": "hook replacement"}],
@@ -602,6 +599,33 @@ def test_base_exception_restores_messages_changed_by_pre_compaction_hook(
         agent._compress_context(messages, "sys", approx_tokens=120_000)
 
     assert messages == original
+    assert db.get_compression_lock_holder(parent_sid) is None
+
+
+def test_compression_validates_hook_boundary_without_registered_hooks(
+    tmp_path: Path,
+) -> None:
+    """Hook contracts must run even when production has no observers."""
+    from hermes_services.internal_hooks import InternalHookExecutionError
+    from tests.hermes_services.internal_hook_test_support import (
+        restore_production_registry,
+    )
+
+    restore_production_registry()
+    db = SessionDB(db_path=tmp_path / "state.db")
+    parent_sid = "HOOK_CONTRACT_EMPTY_REGISTRY"
+    db.create_session(parent_sid, source="discord")
+    agent = _build_agent_with_db(db, parent_sid)
+
+    with pytest.raises(InternalHookExecutionError, match="focus_topic"):
+        agent._compress_context(
+            [{"role": "user", "content": "message"}],
+            "sys",
+            approx_tokens=120_000,
+            focus_topic=123,
+        )
+
+    assert agent.context_compressor.compress.call_count == 0
     assert db.get_compression_lock_holder(parent_sid) is None
 
 

@@ -41,7 +41,7 @@ from typing import Any, Optional, Tuple
 
 from agent.context_engine import sanitize_memory_context
 from agent.model_metadata import estimate_request_tokens_rough
-from hermes_services.internal_hooks import has_internal_hooks, run_internal_hooks
+from hermes_services.internal_hooks import run_internal_hooks
 
 logger = logging.getLogger(__name__)
 
@@ -1034,24 +1034,26 @@ def compress_context(
             except Exception:
                 pass
 
-        _compression_hook_trace = []
-        if has_internal_hooks("before_context_compaction"):
-            _compression_hook_result = run_internal_hooks(
-                "before_context_compaction",
-                copy.deepcopy(messages),
-                session_id=getattr(agent, "session_id", "") or "",
-                model=getattr(agent, "model", "") or "",
-                approx_tokens=approx_tokens,
-                focus_topic=focus_topic or "",
-                forced=bool(force),
-            )
-            hooked_messages = _compression_hook_result.payload
-            _compression_hook_trace = _compression_hook_result.trace
-            if not isinstance(hooked_messages, list) or not all(
-                isinstance(item, dict) for item in hooked_messages
-            ):
-                raise TypeError("before_context_compaction hooks must return a message list or None")
-            messages[:] = hooked_messages
+        # Always cross the hook boundary, even when the registry is empty.
+        # ``run_internal_hooks`` owns payload/context validation, so guarding
+        # it with ``has_internal_hooks`` would make the contract depend on
+        # deployment-time registration state.
+        _compression_hook_result = run_internal_hooks(
+            "before_context_compaction",
+            copy.deepcopy(messages),
+            session_id=getattr(agent, "session_id", "") or "",
+            model=getattr(agent, "model", "") or "",
+            approx_tokens=approx_tokens,
+            focus_topic=focus_topic or "",
+            forced=bool(force),
+        )
+        hooked_messages = _compression_hook_result.payload
+        _compression_hook_trace = _compression_hook_result.trace
+        if not isinstance(hooked_messages, list) or not all(
+            isinstance(item, dict) for item in hooked_messages
+        ):
+            raise TypeError("before_context_compaction hooks must return a message list or None")
+        messages[:] = hooked_messages
 
         compress_fn = agent.context_compressor.compress
         compress_kwargs = _supported_compression_kwargs(
