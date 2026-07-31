@@ -81,10 +81,26 @@ def test_clipboard_tools_are_scoped_and_require_confirmation_for_writes(tmp_path
     assert read["action_metadata"]["confirmation"] == "none"
     write = _call(server, "ios_clipboard_write", {
         "owner_id": "alice", "text": "draft", "confirmed": False,
+        "idempotency_key": "clipboard-draft-1",
     })
     assert write["action_metadata"]["confirmation"] == "required"
     queued = store.pull_device_commands("alice", "iphone")["commands"]
     assert queued[-1]["payload"] == {"text": "draft"}
+
+
+def test_generic_native_writes_require_idempotency_key(tmp_path):
+    server = create_mcp_server("ios-calendar", store=IOSIntelligenceStore(tmp_path))
+    with pytest.raises(ToolError, match="idempotency_key is required"):
+        _call(server, "ios_calendar_create", {"owner_id": "alice", "payload": {"title": "x"}})
+    queued = _call(server, "ios_calendar_create", {
+        "owner_id": "alice", "payload": {"title": "x"}, "idempotency_key": "calendar-create-1",
+    })
+    duplicate = _call(server, "ios_calendar_create", {
+        "owner_id": "alice", "payload": {"title": "x"}, "idempotency_key": "calendar-create-1",
+    })
+    assert queued["status"] == "pending"
+    assert duplicate["duplicate"] is True
+    assert duplicate["id"] == queued["id"]
 
 
 @pytest.mark.parametrize(

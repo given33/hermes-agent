@@ -24,6 +24,7 @@ from urllib.parse import urlparse
 from hermes_cli.ios_intelligence import (
     AMapClient,
     IOSIntelligenceStore,
+    ios_native_action_metadata,
     QWeatherClient,
     load_ios_feature_weights,
 )
@@ -604,8 +605,12 @@ def _queue_tool(
     action: str,
     description: str,
 ) -> None:
+    action_metadata = ios_native_action_metadata(capability, action)
+
     def queue(payload: dict[str, Any] | None = None, owner_id: str = "", device_id: str = "", idempotency_key: str = "") -> dict[str, Any]:
         owner_id = _resolve_owner(store, owner_id)
+        if action_metadata["risk"] in {"write", "destructive"} and not str(idempotency_key or "").strip():
+            raise ValueError(f"idempotency_key is required for {capability}:{action}")
         return store.queue_device_command(
             owner_id, capability, action, payload or {}, device_id=device_id,
             idempotency_key=idempotency_key,
