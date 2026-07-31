@@ -363,7 +363,12 @@ def _resolve_path(cwd: Path, target: str, *, allowed_root: Path | None = None) -
 
 def _ensure_reference_path_allowed(path: Path) -> None:
     from hermes_constants import get_hermes_home
-    home = Path(os.path.expanduser("~")).resolve()
+    # Honour an explicitly configured HOME on every platform.  On Windows
+    # Path.home()/expanduser("~") are driven by USERPROFILE and ignore HOME,
+    # which can otherwise anchor the deny-list to the wrong account when the
+    # runtime supplies an isolated HOME (and expose ~/.ssh credentials).
+    configured_home = os.environ.get("HOME") or os.environ.get("USERPROFILE")
+    home = Path(configured_home).expanduser().resolve() if configured_home else Path.home().resolve()
     hermes_home = get_hermes_home().resolve()
 
     blocked_exact = {home / rel for rel in _SENSITIVE_HOME_FILES}

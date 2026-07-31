@@ -883,6 +883,18 @@ def _split_command(command: str) -> List[str]:
     ]
 
 
+def _expand_user_path(value: str) -> str:
+    """Expand ``~`` using an explicit HOME consistently on all platforms."""
+    candidate = str(value or "")
+    if candidate.startswith(("~/", "~\\", "~")):
+        configured_home = os.environ.get("HOME") or os.environ.get("USERPROFILE")
+        if configured_home:
+            if candidate == "~":
+                return configured_home
+            return str(Path(configured_home) / candidate[2:].replace("\\", os.sep).replace("/", os.sep))
+    return os.path.expanduser(candidate)
+
+
 def _windows_bash() -> Optional[str]:
     """Locate Git Bash for native Windows shell-hook execution."""
 
@@ -905,7 +917,7 @@ def _windows_bash() -> Optional[str]:
 def _prepare_spawn_argv(command: str) -> List[str]:
     """Resolve platform-specific interpreter shims for a parsed command."""
 
-    argv = _split_command(os.path.expanduser(command))
+    argv = _split_command(_expand_user_path(command))
     if not IS_WINDOWS or not argv:
         return argv
 
@@ -1000,7 +1012,7 @@ def script_mtime_iso(command: str) -> Optional[str]:
     if not path:
         return None
     try:
-        expanded = os.path.expanduser(path)
+        expanded = _expand_user_path(path)
         return datetime.fromtimestamp(
             os.path.getmtime(expanded), tz=timezone.utc,
         ).isoformat().replace("+00:00", "Z")
@@ -1019,7 +1031,7 @@ def script_is_executable(command: str) -> bool:
     path = _command_script_path(command)
     if not path:
         return False
-    expanded = os.path.expanduser(path)
+    expanded = _expand_user_path(path)
     if not os.path.isfile(expanded):
         return False
     try:

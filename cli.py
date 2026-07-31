@@ -2929,6 +2929,8 @@ from hermes_constants import is_termux as _is_termux_environment
 
 def _termux_example_image_path(filename: str = "cat.png") -> str:
     """Return a realistic example media path for the current Termux setup."""
+    import posixpath
+
     candidates = [
         os.path.expanduser("~/storage/shared"),
         "/sdcard",
@@ -2937,8 +2939,10 @@ def _termux_example_image_path(filename: str = "cat.png") -> str:
     ]
     for root in candidates:
         if os.path.isdir(root):
-            return os.path.join(root, "Pictures", filename)
-    return os.path.join("~/storage/shared", "Pictures", filename)
+            # Termux paths are POSIX even when this helper is exercised by a
+            # Windows host (for example, in cross-platform CLI tests).
+            return posixpath.join(root, "Pictures", filename)
+    return posixpath.join("~/storage/shared", "Pictures", filename)
 
 
 def _split_path_input(raw: str) -> tuple[str, str]:
@@ -3009,9 +3013,21 @@ def _resolve_attachment_path(raw_path: str) -> Path | None:
                 expanded = unquote(parsed.path or "")
                 if parsed.netloc and os.name == "nt":
                     expanded = f"//{parsed.netloc}{expanded}"
+                elif os.name == "nt" and re.match(r"^/[A-Za-z]:[\\/]", expanded):
+                    # file:///C:/path is serialized with a leading slash;
+                    # strip it before Path() interprets the Windows drive.
+                    expanded = expanded[1:]
         except Exception:
             expanded = token
-    expanded = os.path.expandvars(os.path.expanduser(expanded))
+    expanded = os.path.expandvars(expanded)
+    if expanded.startswith(("~/", "~\\", "~")):
+        configured_home = os.environ.get("HOME") or os.environ.get("USERPROFILE")
+        if configured_home:
+            expanded = str(Path(configured_home) / expanded[2:].replace("\\", os.sep).replace("/", os.sep)) if expanded != "~" else configured_home
+        else:
+            expanded = os.path.expanduser(expanded)
+    else:
+        expanded = os.path.expanduser(expanded)
     if os.name != "nt":
         normalized = expanded.replace("\\", "/")
         if len(normalized) >= 3 and normalized[1] == ":" and normalized[2] == "/" and normalized[0].isalpha():

@@ -22,6 +22,21 @@ _INLINE_SHELL_RE = re.compile(r"!`([^`\n]+)`")
 _INLINE_SHELL_MAX_OUTPUT = 4000
 
 
+def _normalize_inline_shell_output(output: str) -> str:
+    """Present WSL-mounted paths as native Windows paths to the model."""
+    if not IS_WINDOWS or not output:
+        return output
+    # ``bash.exe`` on Windows may execute in WSL and report ``/mnt/c/...``
+    # even though the caller supplied a native ``C:\\...`` cwd. Convert only
+    # that unambiguous mount form; leave ordinary POSIX output untouched.
+    def _replace(match: re.Match) -> str:
+        drive = match.group(1).upper()
+        rest = match.group(2).replace("/", "\\")
+        return f"{drive}:{rest}"
+
+    return re.sub(r"(?<![A-Za-z0-9_])/mnt/([A-Za-z])((?:/[^\s]*)?)", _replace, output)
+
+
 def load_skills_config() -> dict:
     """Load the ``skills`` section of config.yaml (best-effort)."""
     try:
@@ -100,7 +115,7 @@ def run_inline_shell(command: str, cwd: Path | None, timeout: int) -> str:
         output = completed.stderr.rstrip("\n")
     if len(output) > _INLINE_SHELL_MAX_OUTPUT:
         output = output[:_INLINE_SHELL_MAX_OUTPUT] + "...[truncated]"
-    return output
+    return _normalize_inline_shell_output(output)
 
 
 def expand_inline_shell(

@@ -69,6 +69,14 @@ _LOCAL_IMAGE_PATH_RE = re.compile(
     r"(?<![/:\w.])(?:~/|/)(?:[\w.\-]+/)*[\w.\-]+\.(?:" + _IMAGE_EXT_PATTERN + r")\b",
     re.IGNORECASE,
 )
+# Windows drive-qualified and home-relative paths.  Keep this separate from
+# the POSIX expression so the URL guard remains easy to reason about.
+_WINDOWS_LOCAL_IMAGE_PATH_RE = re.compile(
+    r"(?<![\w/])(?:[A-Za-z]:[\\/]|~[\\/])"
+    r"(?:[^\\/\s<>\"'`]+[\\/])*[^\\/\s<>\"'`]+\."
+    r"(?:" + _IMAGE_EXT_PATTERN + r")\b",
+    re.IGNORECASE,
+)
 
 # http(s) URL ending in an image extension (optionally followed by a
 # query string). Case-insensitive on the extension. Strict ``http(s)://``
@@ -115,11 +123,15 @@ def extract_image_refs(text: str) -> Tuple[List[str], List[str]]:
 
     local_paths: list[str] = []
     seen_paths: set[str] = set()
-    for match in _LOCAL_IMAGE_PATH_RE.finditer(text):
+    local_matches = sorted(
+        [*_LOCAL_IMAGE_PATH_RE.finditer(text), *_WINDOWS_LOCAL_IMAGE_PATH_RE.finditer(text)],
+        key=lambda match: match.start(),
+    )
+    for match in local_matches:
         if _in_code(match.start()):
             continue
         raw = match.group(0)
-        expanded = os.path.expanduser(raw)
+        expanded = _expand_image_path(raw)
         try:
             if not os.path.isfile(expanded):
                 continue
@@ -146,6 +158,15 @@ def extract_image_refs(text: str) -> Tuple[List[str], List[str]]:
         urls.append(url)
 
     return local_paths, urls
+
+
+def _expand_image_path(raw: str) -> str:
+    """Expand a local image reference while honoring an explicit HOME."""
+    if raw.startswith(("~/", "~\\")):
+        configured_home = os.environ.get("HOME") or os.environ.get("USERPROFILE")
+        if configured_home:
+            return str(Path(configured_home) / raw[2:].replace("\\", os.sep).replace("/", os.sep))
+    return os.path.expanduser(raw)
 
 
 # Strict YAML/JSON boolean coercion for capability overrides.

@@ -281,13 +281,21 @@ def _build_skill_message(
         if isinstance(entries, list):
             supporting.extend(entries)
 
+    # Linked-file metadata can be produced by platform-specific scanners and
+    # may carry native separators.  These are logical skill identifiers, so
+    # normalize them before rendering the model-facing block.
+    supporting = [str(item).replace("\\", "/") for item in supporting]
+
     if not supporting and skill_dir:
         for subdir in ("references", "templates", "scripts", "assets"):
             subdir_path = skill_dir / subdir
             if subdir_path.exists():
                 for f in sorted(subdir_path.rglob("*")):
                     if f.is_file() and not f.is_symlink():
-                        rel = str(f.relative_to(skill_dir))
+                        # Logical skill paths are portable identifiers even on
+                        # Windows; keep separators stable for skill_view and
+                        # model-facing instructions.
+                        rel = f.relative_to(skill_dir).as_posix()
                         supporting.append(rel)
 
     if supporting and skill_dir:
