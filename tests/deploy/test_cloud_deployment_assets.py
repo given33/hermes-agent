@@ -1808,6 +1808,8 @@ def test_connector_client_uses_the_connector_route_prefix():
             return {"ok": True, "contract_version": 2}
         if path.endswith("/pull"):
             return {"runs": [], "cancellations": []}
+        if path.endswith("/attachments"):
+            return {"attachments": []}
         return {}
 
     client._request = request
