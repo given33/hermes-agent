@@ -38,7 +38,7 @@ CAPABILITIES = (
     "qweather", "amap-route", "ios-map", "ios-power", "ios-health-sleep",
     "ios-health-heart", "ios-health-oxygen", "ios-health-activity", "ios-health-write", "ios-calendar",
     "ios-reminders", "ios-clipboard", "ios-contacts", "ios-photos", "ios-media",
-    "ios-bluetooth", "ios-nfc", "ios-homekit", "ios-notes", "ios-screen-time", "ios-watch", "ios-notification",
+    "ios-vision", "ios-bluetooth", "ios-nfc", "ios-homekit", "ios-notes", "ios-screen-time", "ios-watch", "ios-notification",
     "ios-live-activity", "ios-device",
 )
 
@@ -61,10 +61,11 @@ _SCOPE_BY_CAPABILITY = {
     "ios-reminders": ("reminders:read", "reminders:write"),
     "ios-clipboard": ("clipboard:read", "clipboard:write"),
     "ios-contacts": ("contacts:read", "contacts:write"),
-    "ios-photos": ("photos:read", "camera:write"),
+    "ios-photos": ("photos:read", "photos:write", "camera:write"),
+    "ios-vision": ("photos:read",),
     "ios-media": ("media:read", "media:control"),
     "ios-bluetooth": ("bluetooth:read",),
-    "ios-nfc": ("nfc:read",),
+    "ios-nfc": ("nfc:read", "nfc:write"),
     "ios-homekit": ("homekit:read", "homekit:control"),
     "ios-notes": ("notes:share",),
     "ios-screen-time": ("screen-time:read", "screen-time:control"),
@@ -116,11 +117,18 @@ _TOOL_SCOPE_BY_CAPABILITY = {
     },
     "ios-calendar": {
         "ios_calendar_list": ("calendar:read",),
+        "ios_calendar_calendars": ("calendar:read",),
+        "ios_calendar_freebusy": ("calendar:read",),
         "ios_calendar_create": ("calendar:write",),
+        "ios_calendar_update": ("calendar:write",),
+        "ios_calendar_delete": ("calendar:write",),
     },
     "ios-reminders": {
         "ios_reminders_list": ("reminders:read",),
         "ios_reminder_create": ("reminders:write",),
+        "ios_reminder_update": ("reminders:write",),
+        "ios_reminder_complete": ("reminders:write",),
+        "ios_reminder_delete": ("reminders:write",),
     },
     "ios-clipboard": {
         "ios_clipboard_read": ("clipboard:read",),
@@ -135,19 +143,42 @@ _TOOL_SCOPE_BY_CAPABILITY = {
         "ios_photos_capture": ("camera:write",),
         "ios_photos_scan": ("camera:write",),
         "ios_photos_ocr": ("photos:read",),
+        "ios_photos_albums": ("photos:read",),
+        "ios_photos_near": ("photos:read",),
+        "ios_photos_export": ("photos:read",),
+        "ios_photos_favorite": ("photos:write",),
+        "ios_photos_delete": ("photos:write",),
+        "ios_photos_album_create": ("photos:write",),
+        "ios_photos_album_add": ("photos:write",),
+        "ios_photos_import": ("photos:write",),
+    },
+    "ios-vision": {
+        "ios_vision_analyze": ("photos:read",),
     },
     "ios-media": {
         "ios_media_get": ("media:read",),
         "ios_media_control": ("media:control",),
+        "ios_media_search": ("media:read",),
+        "ios_media_play_search": ("media:control",),
+        "ios_media_volume": ("media:control",),
     },
     "ios-bluetooth": {
         "ios_bluetooth_state": ("bluetooth:read",),
         "ios_bluetooth_scan": ("bluetooth:read",),
+        "ios_bluetooth_connect": ("bluetooth:read",),
+        "ios_bluetooth_disconnect": ("bluetooth:read",),
+        "ios_bluetooth_services": ("bluetooth:read",),
+        "ios_bluetooth_read": ("bluetooth:read",),
+        "ios_bluetooth_write": ("bluetooth:read",),
+        "ios_bluetooth_notify": ("bluetooth:read",),
     },
-    "ios-nfc": {"ios_nfc_scan": ("nfc:read",)},
+    "ios-nfc": {"ios_nfc_scan": ("nfc:read",), "ios_nfc_write": ("nfc:write",)},
     "ios-homekit": {
         "ios_homekit_list": ("homekit:read",),
         "ios_homekit_set": ("homekit:control",),
+        "ios_homekit_search": ("homekit:read",),
+        "ios_homekit_scenes": ("homekit:read",),
+        "ios_homekit_trigger": ("homekit:control",),
     },
     "ios-notes": {"ios_notes_share_text": ("notes:share",)},
     "ios-screen-time": {
@@ -179,6 +210,8 @@ _TOOL_SCOPE_BY_CAPABILITY = {
     "ios-health-write": {
         "ios_health_write_authorize": ("health:write",),
         "ios_health_write": ("health:write",),
+        "ios_health_write_batch": ("health:write",),
+        "ios_health_delete": ("health:write",),
     },
 }
 
@@ -688,6 +721,8 @@ def create_mcp_server(
                     raise ValueError("url must use an allowed iOS URL scheme")
                 if parsed.scheme.lower() in {"http", "https", "facetime", "maps", "shortcuts"} and not parsed.netloc:
                     raise ValueError("url host is required")
+                if not str(idempotency_key or "").strip():
+                    raise ValueError("idempotency_key is required for ios_device_open_url")
                 payload: dict[str, Any] = {"url": normalized}
                 if confirmed:
                     payload["confirmed"] = True
@@ -857,6 +892,10 @@ def create_mcp_server(
             mcp, enforcer, store, capability, "ios_calendar_create", "create",
             "Use automatically when the user asks Hermes to create a calendar event. Queue the native EventKit operation with title and dates in payload.",
         )
+        _queue_tool(mcp, enforcer, store, capability, "ios_calendar_calendars", "calendars", "Use when Hermes needs the user's available iOS calendars.")
+        _queue_tool(mcp, enforcer, store, capability, "ios_calendar_freebusy", "freebusy", "Use when Hermes needs to check iOS calendar busy windows.")
+        _queue_tool(mcp, enforcer, store, capability, "ios_calendar_update", "update", "Use when the user asks Hermes to update a calendar event after confirmation.")
+        _queue_tool(mcp, enforcer, store, capability, "ios_calendar_delete", "delete", "Use when the user asks Hermes to delete a calendar event after confirmation.")
         return mcp
 
     if capability == "ios-reminders":
@@ -873,6 +912,9 @@ def create_mcp_server(
             mcp, enforcer, store, capability, "ios_reminder_create", "create",
             "Use automatically when the user asks Hermes to create an iOS reminder. Queue the native EventKit operation with title and due date in payload.",
         )
+        _queue_tool(mcp, enforcer, store, capability, "ios_reminder_update", "update", "Use when the user asks Hermes to update a reminder after confirmation.")
+        _queue_tool(mcp, enforcer, store, capability, "ios_reminder_complete", "complete", "Use when the user asks Hermes to complete a reminder after confirmation.")
+        _queue_tool(mcp, enforcer, store, capability, "ios_reminder_delete", "delete", "Use when the user asks Hermes to delete a reminder after confirmation.")
         return mcp
 
     if capability == "ios-clipboard":
@@ -962,6 +1004,24 @@ def create_mcp_server(
             mcp, enforcer, store, capability, "ios_photos_ocr", "ocr",
             "Use when Hermes needs to extract text from a local iPhone image. Payload must include imageURL or uri.",
         )
+        for name, action, description in (
+            ("ios_photos_albums", "albums", "Use when Hermes needs to list iPhone photo albums."),
+            ("ios_photos_near", "near", "Use when Hermes needs to search iPhone photos near a GPS coordinate."),
+            ("ios_photos_export", "export", "Use when Hermes needs to export an iPhone photo into the owner-scoped workspace."),
+            ("ios_photos_favorite", "favorite", "Use when the user asks Hermes to favorite or unfavorite selected iPhone photos after confirmation."),
+            ("ios_photos_delete", "delete", "Use when the user asks Hermes to delete selected iPhone photos after confirmation."),
+            ("ios_photos_album_create", "album-create", "Use when the user asks Hermes to create an iPhone photo album after confirmation."),
+            ("ios_photos_album_add", "album-add", "Use when the user asks Hermes to add selected photos to an iPhone album after confirmation."),
+            ("ios_photos_import", "import", "Use when the user asks Hermes to import an owner-scoped image into Photos after confirmation."),
+        ):
+            _queue_tool(mcp, enforcer, store, capability, name, action, description)
+        return mcp
+
+    if capability == "ios-vision":
+        _queue_tool(
+            mcp, enforcer, store, capability, "ios_vision_analyze", "analyze",
+            "Use when Hermes needs on-device Vision classification, rectangles, and face detection for an owner-scoped image.",
+        )
         return mcp
 
     if capability == "ios-health-write":
@@ -972,6 +1032,14 @@ def create_mcp_server(
         _queue_tool(
             mcp, enforcer, store, capability, "ios_health_write", "write",
             "Use only when the user explicitly asks Hermes to write a HealthKit quantity sample. Payload must include identifier, value, unit, start, and end.",
+        )
+        _queue_tool(
+            mcp, enforcer, store, capability, "ios_health_write_batch", "batch",
+            "Use only when the user explicitly asks Hermes to write a bounded batch of HealthKit quantity samples; every sample must include identifier, value, unit, start, and end.",
+        )
+        _queue_tool(
+            mcp, enforcer, store, capability, "ios_health_delete", "delete",
+            "Use only when the user explicitly asks Hermes to delete HealthKit samples created by a prior Hermes command; the native bridge matches the command id and type.",
         )
         return mcp
 
@@ -984,6 +1052,9 @@ def create_mcp_server(
             mcp, enforcer, store, capability, "ios_media_control", "control",
             "Use when the user asks Hermes to play, pause, stop, skip, or resume media. Payload must contain action.",
         )
+        _queue_tool(mcp, enforcer, store, capability, "ios_media_search", "search", "Use when Hermes needs to search the iPhone Media Library by title.")
+        _queue_tool(mcp, enforcer, store, capability, "ios_media_play_search", "play-search", "Use when the user asks Hermes to search and play matching iPhone media after confirmation.")
+        _queue_tool(mcp, enforcer, store, capability, "ios_media_volume", "volume", "Use when the user asks Hermes to set iPhone media volume after confirmation.")
         return mcp
 
     if capability == "ios-bluetooth":
@@ -995,6 +1066,15 @@ def create_mcp_server(
             mcp, enforcer, store, capability, "ios_bluetooth_scan", "scan",
             "Use when the user asks Hermes to scan nearby Bluetooth devices. Payload may contain seconds.",
         )
+        for name, action, description in (
+            ("ios_bluetooth_connect", "connect", "Use when Hermes needs to connect to a Bluetooth peripheral for this owner."),
+            ("ios_bluetooth_disconnect", "disconnect", "Use when the user asks Hermes to disconnect the current Bluetooth session."),
+            ("ios_bluetooth_services", "services", "Use when Hermes needs to discover Bluetooth services and characteristics."),
+            ("ios_bluetooth_read", "read", "Use when Hermes needs to read a Bluetooth characteristic."),
+            ("ios_bluetooth_write", "write", "Use when the user asks Hermes to write a Bluetooth characteristic after confirmation."),
+            ("ios_bluetooth_notify", "notify", "Use when Hermes needs to collect Bluetooth notification samples for a bounded period."),
+        ):
+            _queue_tool(mcp, enforcer, store, capability, name, action, description)
         return mcp
 
     if capability == "ios-nfc":
@@ -1002,6 +1082,7 @@ def create_mcp_server(
             mcp, enforcer, store, capability, "ios_nfc_scan", "scan",
             "Use when the user asks Hermes to read an NFC tag; the iPhone presents the native reader session.",
         )
+        _queue_tool(mcp, enforcer, store, capability, "ios_nfc_write", "write", "Use when the user asks Hermes to write a text NDEF record after explicit confirmation.")
         return mcp
 
     if capability == "ios-homekit":
@@ -1013,6 +1094,9 @@ def create_mcp_server(
             mcp, enforcer, store, capability, "ios_homekit_set", "set",
             "Use when the user explicitly asks Hermes to change a HomeKit characteristic. Payload must include accessoryId, characteristicId, and value; the native bridge requires confirmation.",
         )
+        _queue_tool(mcp, enforcer, store, capability, "ios_homekit_search", "search", "Use when Hermes needs to search HomeKit accessories by name, room, or service.")
+        _queue_tool(mcp, enforcer, store, capability, "ios_homekit_scenes", "scenes", "Use when Hermes needs to list HomeKit scenes." )
+        _queue_tool(mcp, enforcer, store, capability, "ios_homekit_trigger", "trigger", "Use when the user asks Hermes to trigger a HomeKit scene after confirmation.")
         return mcp
 
     if capability == "ios-notes":

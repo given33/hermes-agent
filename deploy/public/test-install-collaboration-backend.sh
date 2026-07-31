@@ -17,6 +17,27 @@ import json, sys
 print(json.load(open(sys.argv[1], encoding="utf-8"))["version"])
 PY
 )"
+ios_capabilities_count="$(python3 - "${repo}/hermes_cli/ios_mcp_server.py" <<'PY'
+import ast
+import sys
+from pathlib import Path
+
+tree = ast.parse(Path(sys.argv[1]).read_text(encoding="utf-8"))
+for node in tree.body:
+    if isinstance(node, (ast.Assign, ast.AnnAssign)):
+        targets = node.targets if isinstance(node, ast.Assign) else [node.target]
+        if any(isinstance(target, ast.Name) and target.id == "CAPABILITIES" for target in targets):
+            value = ast.literal_eval(node.value)
+            print(len(value))
+            break
+else:
+    raise SystemExit("CAPABILITIES declaration not found")
+PY
+)"
+[[ "${ios_capabilities_count}" =~ ^[1-9][0-9]*$ ]] || {
+  printf '%s\n' "invalid iOS capability count" >&2
+  exit 1
+}
 work="$(mktemp -d /tmp/hermes-public-installer-test.XXXXXX)"
 stage="/home/root/.cache/hermes-agent-deploy/${version}-test-$$"
 cleanup() {
@@ -361,15 +382,14 @@ elif [[ "${url}" == */api/mobile/v1/handshake ]]; then
   [[ "${FAKE_HANDSHAKE_FAIL:-0}" != 1 ]] || exit 22
   payload='{"api_version":1,"hermes_version":"test","profiles":[],"capabilities":[],"server_time":"2026-07-19T12:00:00Z"}'
 elif [[ "${url}" == */api/plugins/ios-intelligence/health ]]; then
-  payload="$(python3 - "${HERMES_AGENT_ROOT}" <<'PY'
+  payload="$(IOS_CAPABILITIES_COUNT="${ios_capabilities_count}" python3 - <<'PY'
 import json
-import sys
-from pathlib import Path
-sys.path.insert(0, str(Path(sys.argv[1])))
-from hermes_cli.ios_mcp_server import CAPABILITIES
+import os
+
+capability_count = int(os.environ["IOS_CAPABILITIES_COUNT"])
 services = [
     {"name": f"service-{index}", "ok": True, "tools": ["read", "write"] + (["extra"] if index < 2 else [])}
-    for index, _capability in enumerate(CAPABILITIES)
+    for index in range(capability_count)
 ]
 print(json.dumps({
     "ok": True,
@@ -377,13 +397,13 @@ print(json.dumps({
     "mcp_runtime": {
         "ok": True,
         "running": True,
-        "healthy_count": len(CAPABILITIES),
-        "required_count": len(CAPABILITIES),
+        "healthy_count": capability_count,
+        "required_count": capability_count,
         "services": services,
     },
 }))
 PY
-)"
+  )"
 elif [[ "${url}" == */api/plugins/collaboration/connector/deployment-health ]]; then
   payload="$(python3 - "${HERMES_AGENT_ROOT}/plugins/collaboration/dashboard/manifest.json" <<'PY'
 import hashlib
@@ -553,6 +573,7 @@ run_installer() {
     FAKE_HANDSHAKE_FAIL="${3:-0}" \
     FAKE_NGINX_FAIL="${4:-0}" \
     HERMES_DEPLOY_FAIL_PHASE="${5:-}" \
+    IOS_CAPABILITIES_COUNT="${ios_capabilities_count}" \
     HERMES_AGENT_ROOT="${target}" \
     HERMES_RUNTIME_PYTHON="${runtime_python}" \
     HERMES_AGENT_SERVICE="hermes-agent-test.service" \

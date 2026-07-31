@@ -11,7 +11,7 @@ import pytest
 from mcp.server.mcpserver.exceptions import ToolError
 
 import hermes_cli.ios_mcp_server as ios_mcp_server_module
-from hermes_cli.ios_intelligence import IOSIntelligenceStore
+from hermes_cli.ios_intelligence import IOSIntelligenceStore, ios_native_action_metadata
 from hermes_cli.ios_mcp_server import (
     CAPABILITIES,
     create_mcp_server,
@@ -58,7 +58,7 @@ def test_independent_servers_do_not_leak_other_capability_tools(tmp_path):
     weather_names = {tool.name for tool in _tools(create_mcp_server("qweather", store=store))}
 
     assert location_names == {"current_location"}
-    assert reminder_names == {"ios_reminders_list", "ios_reminder_create"}
+    assert reminder_names == {"ios_reminders_list", "ios_reminder_create", "ios_reminder_update", "ios_reminder_complete", "ios_reminder_delete"}
     assert weather_names == {"weather_minutely", "weather_current", "weather_hourly", "weather_warnings"}
     assert location_names.isdisjoint(reminder_names | weather_names)
 
@@ -91,12 +91,13 @@ def test_clipboard_tools_are_scoped_and_require_confirmation_for_writes(tmp_path
     ("capability", "tools"),
     [
         ("ios-contacts", {"ios_contacts_search", "ios_contacts_create"}),
-        ("ios-photos", {"ios_photos_search", "ios_photos_capture", "ios_photos_scan", "ios_photos_ocr"}),
-        ("ios-media", {"ios_media_get", "ios_media_control"}),
-        ("ios-bluetooth", {"ios_bluetooth_state", "ios_bluetooth_scan"}),
-        ("ios-nfc", {"ios_nfc_scan"}),
-        ("ios-homekit", {"ios_homekit_list", "ios_homekit_set"}),
-        ("ios-health-write", {"ios_health_write_authorize", "ios_health_write"}),
+        ("ios-photos", {"ios_photos_search", "ios_photos_capture", "ios_photos_scan", "ios_photos_ocr", "ios_photos_albums", "ios_photos_near", "ios_photos_export", "ios_photos_favorite", "ios_photos_delete", "ios_photos_album_create", "ios_photos_album_add", "ios_photos_import"}),
+        ("ios-vision", {"ios_vision_analyze"}),
+        ("ios-media", {"ios_media_get", "ios_media_control", "ios_media_search", "ios_media_play_search", "ios_media_volume"}),
+        ("ios-bluetooth", {"ios_bluetooth_state", "ios_bluetooth_scan", "ios_bluetooth_connect", "ios_bluetooth_disconnect", "ios_bluetooth_services", "ios_bluetooth_read", "ios_bluetooth_write", "ios_bluetooth_notify"}),
+        ("ios-nfc", {"ios_nfc_scan", "ios_nfc_write"}),
+        ("ios-homekit", {"ios_homekit_list", "ios_homekit_set", "ios_homekit_search", "ios_homekit_scenes", "ios_homekit_trigger"}),
+        ("ios-health-write", {"ios_health_write_authorize", "ios_health_write", "ios_health_write_batch", "ios_health_delete"}),
         ("ios-device", {"ios_device_get_latest", "ios_device_open_url"}),
     ],
 )
@@ -105,10 +106,40 @@ def test_native_action_capabilities_expose_queue_tools(tmp_path, capability, too
     assert {tool.name for tool in _tools(server)} == tools
 
 
+def test_open_url_requires_idempotency_key(tmp_path):
+    server = create_mcp_server("ios-device", store=IOSIntelligenceStore(tmp_path))
+    with pytest.raises(ToolError, match="idempotency_key is required"):
+        _call(server, "ios_device_open_url", {
+            "owner_id": "alice",
+            "device_id": "iphone",
+            "url": "https://example.com",
+        })
+
+
 def test_photos_scope_does_not_grant_unsupported_library_writes():
     manifest = ios_mcp_manifests()["ios-photos"]
-    assert manifest["scope"] == ["photos:read", "camera:write"]
-    assert "photos:write" not in manifest["scope"]
+    assert manifest["scope"] == ["photos:read", "photos:write", "camera:write"]
+    assert manifest["tool_scopes"]["ios_photos_delete"] == ["photos:write"]
+
+
+def test_new_native_actions_have_explicit_server_risk_and_permission_policies():
+    expected = {
+        ("ios-photos", "albums"): ("read", "none", "photos"),
+        ("ios-photos", "delete"): ("destructive", "required", "photos"),
+        ("ios-vision", "analyze"): ("read", "none", "photos"),
+        ("ios-bluetooth", "services"): ("read", "none", "bluetooth"),
+        ("ios-bluetooth", "write"): ("write", "required", "bluetooth"),
+        ("ios-nfc", "write"): ("write", "required", "nfc"),
+        ("ios-homekit", "scenes"): ("read", "none", "homekit"),
+        ("ios-calendar", "delete"): ("destructive", "required", "calendar"),
+        ("ios-reminders", "complete"): ("write", "required", "reminders"),
+        ("ios-health-write", "batch"): ("write", "required", "health"),
+    }
+    for action, (risk, confirmation, permission) in expected.items():
+        metadata = ios_native_action_metadata(*action)
+        assert (metadata["risk"], metadata["confirmation"], metadata["permission"]) == (
+            risk, confirmation, permission,
+        )
 
 
 def test_screen_time_server_exposes_native_monitor_controls(tmp_path):
