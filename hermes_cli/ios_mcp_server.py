@@ -136,10 +136,12 @@ _TOOL_SCOPE_BY_CAPABILITY = {
         "ios_clipboard_write": ("clipboard:write",),
     },
     "ios-contacts": {
+        "ios_contacts_list": ("contacts:read",),
         "ios_contacts_search": ("contacts:read",),
         "ios_contacts_create": ("contacts:write",),
     },
     "ios-photos": {
+        "ios_photos_list": ("photos:read",),
         "ios_photos_search": ("photos:read",),
         "ios_photos_capture": ("camera:write",),
         "ios_photos_scan": ("camera:write",),
@@ -983,6 +985,10 @@ def create_mcp_server(
 
     if capability == "ios-contacts":
         _queue_tool(
+            mcp, enforcer, store, capability, "ios_contacts_list", "list",
+            "Use when Hermes needs a bounded list of the user's authorized iPhone contacts.",
+        )
+        _queue_tool(
             mcp, enforcer, store, capability, "ios_contacts_search", "search",
             "Use when Hermes needs to search the user's authorized iPhone contacts. Payload may include query and limit.",
         )
@@ -993,6 +999,10 @@ def create_mcp_server(
         return mcp
 
     if capability == "ios-photos":
+        _queue_tool(
+            mcp, enforcer, store, capability, "ios_photos_list", "list",
+            "Use when Hermes needs a bounded list of the user's authorized iPhone photo and video assets.",
+        )
         _queue_tool(
             mcp, enforcer, store, capability, "ios_photos_search", "search",
             "Use when Hermes needs to search the user's authorized iPhone photo library by filename or date window.",
