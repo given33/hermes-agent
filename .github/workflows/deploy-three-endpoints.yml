@@ -253,10 +253,10 @@ jobs:
           elif [ -z "${run_id}" ] || [ -z "${production_run_id}" ]; then
             # A partial/old dispatch can leave only one child workflow. Give
             # the missing sibling time to appear in the Actions API first;
-            # if it never does, emit a fresh repository_dispatch so both
-            # workflows are created instead of polling forever for a run that
-            # cannot exist.
-            for _ in $(seq 1 30); do
+            # if it never does, fail closed instead of emitting a duplicate
+            # repository_dispatch. The original event may already be accepted,
+            # and a second event would queue duplicate unsigned/EAS builds.
+            for _ in $(seq 1 60); do
               [ -n "${run_id}" ] || run_id="$(find_release_run ios-unsigned.yml "${release_name}")"
               [ -n "${production_run_id}" ] || production_run_id="$(find_release_run ios-production-eas.yml "${production_release_name}")"
               if [ -n "${run_id}" ] && [ -n "${production_run_id}" ]; then
@@ -265,7 +265,8 @@ jobs:
               sleep 2
             done
             if [ -z "${run_id}" ] || [ -z "${production_run_id}" ]; then
-              dispatch_release
+              echo "::error::Initial iOS repository dispatch produced only a partial child set; refusing a duplicate dispatch"
+              exit 1
             fi
           else
             echo "iOS release ${RELEASE_COMMIT} already has unsigned run ${run_id:-none} and production run ${production_run_id:-none}; reusing existing dispatch"
