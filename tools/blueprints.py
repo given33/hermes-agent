@@ -121,7 +121,12 @@ def parse_blueprint(skill_md_text: str) -> Optional[BlueprintSpec]:
     prompt = blueprint.get("prompt")
     if prompt is not None:
         prompt = str(prompt)
-    no_agent = bool(blueprint.get("no_agent", False))
+    # YAML/frontmatter can carry legacy string values (for example
+    # ``no_agent: "false"``). Reuse cron's bool coercion so textual false
+    # does not accidentally switch a blueprint into script-only mode.
+    from cron.jobs import _coerce_job_enabled
+
+    no_agent = _coerce_job_enabled(blueprint.get("no_agent", False), False)
     model = blueprint.get("model")
     provider = blueprint.get("provider")
     toolsets = blueprint.get("enabled_toolsets")

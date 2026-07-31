@@ -64,6 +64,20 @@ metadata:
 
 
 class TestParseBlueprint:
+    def test_string_false_no_agent_is_not_script_only(self):
+        skill = """---
+name: string-bool
+metadata:
+  hermes:
+    blueprint:
+      schedule: every 1h
+      no_agent: "false"
+---
+"""
+        spec = parse_blueprint(skill)
+        assert spec is not None
+        assert spec.no_agent is False
+
     def test_parses_full_blueprint(self):
         spec = parse_blueprint(BLUEPRINT_SKILL)
         assert spec is not None
