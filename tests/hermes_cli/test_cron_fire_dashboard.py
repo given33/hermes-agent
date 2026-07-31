@@ -148,11 +148,12 @@ def test_valid_token_accepts_and_fires(monkeypatch):
                            json={"job_id": "j1", "fire_at": _FIRE_AT})
         assert resp.status_code == 202
         assert resp.json()["job_id"] == "j1"
+        # Keep the TestClient portal alive while the 202 background task runs;
+        # closing it first cancels tasks that have not started yet.
+        deadline = time.monotonic() + 2.0
+        while not fired and time.monotonic() < deadline:
+            time.sleep(0.01)
+        assert fired == [("default", "j1", _FIRE_AT)]
     finally:
         _restore(pa, ph)
         client.close()
-    # background task ran the fire for the resolved profile
-    deadline = time.monotonic() + 2.0
-    while not fired and time.monotonic() < deadline:
-        time.sleep(0.01)
-    assert fired == [("default", "j1", _FIRE_AT)]
