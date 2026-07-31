@@ -228,8 +228,20 @@ if [[ ! -d "${mirror}" ]]; then
 fi
 [[ -d "${mirror}" && ! -L "${mirror}" ]] || die "repository mirror is unsafe"
 git --git-dir="${mirror}" remote set-url origin "${repository_url}"
-git --git-dir="${mirror}" fetch --force --prune origin \
-  "+refs/heads/main:refs/remotes/origin/main"
+if ! git --git-dir="${mirror}" fetch --force --prune origin \
+  "+refs/heads/main:refs/remotes/origin/main"; then
+  # A transient GitHub outage must not strand a node when the public release
+  # is already present in its last verified mirror. Continue only for that
+  # exact commit and ancestry; unknown releases remain fail-closed below.
+  if git --git-dir="${mirror}" cat-file -e "${release_commit}^{commit}" \
+    && git --git-dir="${mirror}" merge-base --is-ancestor \
+      "${release_commit}" refs/remotes/origin/main; then
+    printf 'update-fabric-node: repository refresh unavailable; using verified mirror commit %s\n' \
+      "${release_commit}" >&2
+  else
+    die "repository mirror refresh failed and release is not already verified"
+  fi
+fi
 git --git-dir="${mirror}" cat-file -e "${release_commit}^{commit}"
 git --git-dir="${mirror}" merge-base --is-ancestor \
   "${release_commit}" refs/remotes/origin/main \
