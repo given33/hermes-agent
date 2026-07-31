@@ -456,6 +456,12 @@ def _normalize_repeat_record(job: Dict[str, Any]) -> Tuple[Optional[Dict[str, An
     return normalized, changed
 
 
+def _job_schedule_kind(job: Dict[str, Any]) -> Optional[str]:
+    """Return a stored job's schedule kind without trusting its JSON shape."""
+    schedule = job.get("schedule")
+    return schedule.get("kind") if isinstance(schedule, dict) else None
+
+
 def _apply_skill_fields(job: Dict[str, Any]) -> Dict[str, Any]:
     """Return a job dict with canonical `skills` and legacy `skill` fields aligned."""
     normalized = dict(job)
@@ -1477,6 +1483,10 @@ def update_job(job_id: str, updates: Dict[str, Any]) -> Optional[Dict[str, Any]]
                 if isinstance(updated_schedule, str):
                     updated_schedule = parse_schedule(updated_schedule)
                     updated["schedule"] = updated_schedule
+                elif not isinstance(updated_schedule, dict):
+                    raise ValueError(
+                        "Cron schedule must be a schedule string or mapping"
+                    )
                 updated["schedule_display"] = updates.get(
                     "schedule_display",
                     updated_schedule.get("display", updated.get("schedule_display")),
@@ -1518,8 +1528,9 @@ def update_job(job_id: str, updates: Dict[str, Any]) -> Optional[Dict[str, Any]]
 
             if updated.get("enabled", True) and updated.get("state") != "paused" and not updated.get("next_run_at"):
                 next_run = compute_next_run(updated["schedule"])
-                if next_run is None and updated["schedule"].get("kind") == "once":
-                    run_at = updated["schedule"].get("run_at", "unknown")
+                if next_run is None and _job_schedule_kind(updated) == "once":
+                    schedule = updated.get("schedule")
+                    run_at = schedule.get("run_at", "unknown") if isinstance(schedule, dict) else "unknown"
                     raise ValueError(
                         f"Requested one-shot time {run_at} is in the past "
                         f"(grace window: {ONESHOT_GRACE_SECONDS}s) and cannot be scheduled."
@@ -1554,9 +1565,10 @@ def resume_job(job_id: str) -> Optional[Dict[str, Any]]:
     if not job:
         return None
 
-    next_run_at = compute_next_run(job["schedule"])
-    if next_run_at is None and job["schedule"].get("kind") == "once":
-        run_at = job["schedule"].get("run_at", "unknown")
+    schedule = job.get("schedule")
+    next_run_at = compute_next_run(schedule)
+    if next_run_at is None and _job_schedule_kind(job) == "once":
+        run_at = schedule.get("run_at", "unknown") if isinstance(schedule, dict) else "unknown"
         raise ValueError(
             f"Cannot resume: one-shot time {run_at} is in the past "
             f"(grace window: {ONESHOT_GRACE_SECONDS}s) and will never fire."
@@ -1652,7 +1664,7 @@ def mark_job_run(job_id: str, success: bool, error: Optional[str] = None,
                 if repeat:
                     times = repeat.get("times")
                     completed = repeat.get("completed", 0)
-                    kind = job.get("schedule", {}).get("kind")
+                    kind = _job_schedule_kind(job)
                     preclaimed_oneshot = (
                         kind == "once"
                         and times is not None
@@ -1680,7 +1692,7 @@ def mark_job_run(job_id: str, success: bool, error: Optional[str] = None,
                 # missing runtime dep into "job completed" and the user's
                 # schedule quietly goes off. See issue #16265.
                 if job["next_run_at"] is None:
-                    kind = job.get("schedule", {}).get("kind")
+                    kind = _job_schedule_kind(job)
                     if kind in {"cron", "interval"}:
                         job["state"] = "error"
                         if not job.get("last_error"):
@@ -1730,7 +1742,7 @@ def claim_dispatch(job_id: str) -> bool:
         for i, job in enumerate(jobs):
             if job.get("id") != job_id:
                 continue
-            if job.get("schedule", {}).get("kind") != "once":
+            if _job_schedule_kind(job) != "once":
                 return True  # recurring jobs use advance_next_run(), not dispatch claims
             repeat, repeat_repaired = _normalize_repeat_record(job)
             if repeat_repaired:
@@ -1796,7 +1808,7 @@ def heartbeat_run_claim(job_id: str, *, expected_owner: str) -> bool:
         for job in jobs:
             if job.get("id") != job_id:
                 continue
-            if job.get("schedule", {}).get("kind") != "once":
+            if _job_schedule_kind(job) != "once":
                 return False
             claim = job.get("run_claim")
             if not isinstance(claim, dict) or claim.get("by") != expected_owner:
@@ -1823,7 +1835,7 @@ def advance_next_run(job_id: str) -> bool:
         jobs = load_jobs()
         for job in jobs:
             if job.get("id") == job_id:
-                kind = job.get("schedule", {}).get("kind")
+                kind = _job_schedule_kind(job)
                 if kind not in {"cron", "interval"}:
                     return False
                 now = _hermes_now().isoformat()
@@ -1951,7 +1963,7 @@ def claim_job_for_fire(
             if normalized_fire_at:
                 claim["fire_at"] = normalized_fire_at
             job["fire_claim"] = claim
-            kind = job.get("schedule", {}).get("kind")
+            kind = _job_schedule_kind(job)
             if kind in {"cron", "interval"} and not reclaiming_same_fire:
                 nxt = compute_next_run(job["schedule"], now.isoformat())
                 if nxt:
@@ -2099,7 +2111,7 @@ def _get_due_jobs_locked() -> List[Dict[str, Any]]:
             # is treated as stale (the claiming tick died mid-run) and allowed
             # through so the job is recovered rather than wedged forever.
             existing_claim = job.get("run_claim")
-            if existing_claim and job.get("schedule", {}).get("kind") == "once":
+            if existing_claim and _job_schedule_kind(job) == "once":
                 try:
                     claimed_at = _ensure_aware(
                         datetime.fromisoformat(existing_claim["at"])

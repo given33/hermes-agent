@@ -422,6 +422,21 @@ class TestUpdateJob:
         result = update_job("nonexistent_id", {"name": "X"})
         assert result is None
 
+    def test_update_preserves_malformed_schedule_without_crashing(self, tmp_cron_dir):
+        save_jobs([{
+            "id": "bad-schedule",
+            "schedule": None,
+            "enabled": True,
+            "state": "scheduled",
+            "next_run_at": None,
+        }])
+
+        updated = update_job("bad-schedule", {"name": "repaired label"})
+
+        assert updated is not None
+        assert updated["name"] == "repaired label"
+        assert updated["schedule"] is None
+
     def test_update_rejects_id_change(self, tmp_cron_dir):
         """Job IDs are filesystem path components — must be immutable."""
         job = create_job(prompt="Original", schedule="every 1h")
@@ -624,6 +639,20 @@ class TestMarkJobRun:
         assert updated is not None
         assert updated["last_status"] == "ok"
         assert updated["repeat"] == {"times": None, "completed": 1}
+
+    def test_malformed_schedule_does_not_abort_marking_run(self, tmp_cron_dir):
+        save_jobs([{
+            "id": "bad-schedule",
+            "schedule": "not-a-mapping",
+            "next_run_at": None,
+        }])
+
+        mark_job_run("bad-schedule", success=False, error="bad schedule")
+
+        updated = get_job("bad-schedule")
+        assert updated is not None
+        assert updated["last_status"] == "error"
+        assert updated["last_error"] == "bad schedule"
 
     def test_delivery_error_tracked_separately(self, tmp_cron_dir):
         """Agent succeeds but delivery fails — both tracked independently."""
