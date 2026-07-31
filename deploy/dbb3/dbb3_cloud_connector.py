@@ -196,9 +196,11 @@ def _dict_list_response(result: Any, key: str) -> list[dict[str, Any]]:
 
     if not isinstance(result, dict):
         raise ConnectorContractError(502, f"connector response is missing {key}")
-    items = result.get(key)
+    if key not in result:
+        raise ConnectorContractError(502, f"connector response is missing {key}")
+    items = result[key]
     if items is None:
-        return []
+        raise ConnectorContractError(502, f"connector response field {key} is invalid")
     if not isinstance(items, list) or any(not isinstance(item, dict) for item in items):
         raise ConnectorContractError(502, f"connector response field {key} is invalid")
     return list(items)

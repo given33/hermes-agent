@@ -29,6 +29,14 @@ def test_cloud_client_rejects_malformed_list_responses():
         raise AssertionError("malformed runs response was accepted")
 
 
+def test_cloud_client_rejects_missing_list_response_field():
+    client = connector_module.CloudRelayClient("https://example.test", "token")
+    client._request = lambda _path, **_kwargs: {}
+    with pytest.raises(connector_module.ConnectorContractError) as error:
+        client.pull_runs()
+    assert error.value.status == 502
+
+
 def test_activity_timing_ignores_non_finite_duration_values():
     started, completed, duration = connector_module._activity_timing(
         {"duration_ms": float("nan"), "duration_seconds": float("inf")},
