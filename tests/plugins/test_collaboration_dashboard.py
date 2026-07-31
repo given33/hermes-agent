@@ -36,6 +36,7 @@ def test_connector_nonnegative_int_rejects_corrupt_state():
     module = load_module()
     assert module._nonnegative_int("12") == 12
     assert module._nonnegative_int(-1) == 0
+    assert module._nonnegative_int(True) == 0
     assert module._nonnegative_int("broken") == 0
     assert module._nonnegative_int(float("inf")) == 0
 

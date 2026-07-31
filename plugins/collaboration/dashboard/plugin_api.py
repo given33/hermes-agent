@@ -9023,6 +9023,8 @@ def _positive_int(value: Any) -> Optional[int]:
 
 
 def _nonnegative_int(value: Any, default: int = 0) -> int:
+    if isinstance(value, bool):
+        return default
     try:
         parsed = int(value)
     except (TypeError, ValueError, OverflowError):
