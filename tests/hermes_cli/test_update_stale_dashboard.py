@@ -292,6 +292,7 @@ class TestKillStaleDashboardPosix:
 
         with patch("hermes_cli.main._find_stale_dashboard_pids",
                    return_value=[99999]), \
+             patch("hermes_cli.main._pid_exists", return_value=True), \
              patch("os.kill", side_effect=fake_kill), \
              patch("time.sleep"), \
              patch("time.monotonic", side_effect=[0.0] + [10.0] * 20):

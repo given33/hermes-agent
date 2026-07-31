@@ -116,9 +116,9 @@ def _save_auth(data: Dict[str, Any], path: Optional[Path] = None) -> None:
 
 def _auth_store_transaction(path: Path):
     """Use the same auth.lock protocol as every other auth.json writer."""
-    from agent.provider_auth import _auth_store_lock
+    from agent.provider_auth import auth_store_lock
 
-    return _auth_store_lock(target_path=path)
+    return auth_store_lock(target_path=path)
 
 
 def load_photon_token() -> Optional[str]:

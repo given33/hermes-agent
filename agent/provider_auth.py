@@ -1043,6 +1043,22 @@ def _auth_store_lock(
         yield
 
 
+@contextmanager
+def auth_store_lock(
+    timeout_seconds: float = AUTH_LOCK_TIMEOUT_SECONDS,
+    *,
+    target_path: Optional[Path] = None,
+):
+    """Public auth-store transaction lock for provider integrations.
+
+    Provider modules outside ``agent.provider_auth`` must use this wrapper
+    instead of importing the private implementation, so the lock protocol
+    remains an explicit cross-package contract.
+    """
+    with _auth_store_lock(timeout_seconds, target_path=target_path):
+        yield
+
+
 def _load_auth_store(auth_file: Optional[Path] = None) -> Dict[str, Any]:
     auth_file = auth_file or _auth_file_path()
     if not auth_file.exists():

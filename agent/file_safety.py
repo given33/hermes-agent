@@ -635,8 +635,16 @@ def classify_sandbox_mirror_target(path: str) -> Optional[dict]:
     if inner_idx is None:
         return None
 
-    mirror_root = str(Path(*parts[: inner_idx + 1]))
-    inner_path = str(Path(*parts[inner_idx + 1 :])) if inner_idx + 1 < len(parts) else ""
+    # Keep the model-facing path fields platform-independent.  The absolute
+    # target path remains native for filesystem diagnostics, while these
+    # logical mirror paths are part of the warning contract and must be
+    # comparable on Windows and POSIX hosts.
+    mirror_root = Path(*parts[: inner_idx + 1]).as_posix()
+    inner_path = (
+        Path(*parts[inner_idx + 1 :]).as_posix()
+        if inner_idx + 1 < len(parts)
+        else ""
+    )
 
     return {
         "target_path": str(target),
