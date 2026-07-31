@@ -191,6 +191,19 @@ def _json_body(raw: bytes) -> Any:
         raise ConnectorContractError(502, f"invalid JSON response: {exc}") from exc
 
 
+def _dict_list_response(result: Any, key: str) -> list[dict[str, Any]]:
+    """Validate list-shaped connector responses before they reach the worker."""
+
+    if not isinstance(result, dict):
+        raise ConnectorContractError(502, f"connector response is missing {key}")
+    items = result.get(key)
+    if items is None:
+        return []
+    if not isinstance(items, list) or any(not isinstance(item, dict) for item in items):
+        raise ConnectorContractError(502, f"connector response field {key} is invalid")
+    return list(items)
+
+
 def run(command: list[str], timeout: int = 30) -> tuple[int, str]:
     try:
         proc = subprocess.run(
@@ -285,7 +298,11 @@ class CloudRelayClient:
         )
         if not isinstance(result, dict) or result.get("ok") is not True:
             raise ConnectorContractError(502, "connector health contract is invalid")
-        if int(result.get("contract_version") or 0) != CONTRACT_VERSION:
+        try:
+            contract_version = int(result.get("contract_version") or 0)
+        except (TypeError, ValueError):
+            raise ConnectorContractError(502, "connector health contract version is invalid") from None
+        if contract_version != CONTRACT_VERSION:
             raise ConnectorContractError(409, "unsupported connector contract version")
         return result
 
@@ -299,7 +316,7 @@ class CloudRelayClient:
                 "lease_seconds": max(15, min(int(lease_seconds), 900)),
             },
         )
-        return list(result.get("runs") or []) if isinstance(result, dict) else []
+        return _dict_list_response(result, "runs")
 
     def acknowledge_run(self, run: dict[str, Any], local: dict[str, Any], lease_seconds: int = 90) -> None:
         remote_id = urllib.parse.quote(_text(run.get("remote_run_id"), 256), safe="")
@@ -346,7 +363,7 @@ class CloudRelayClient:
                 "lease_seconds": max(15, min(int(lease_seconds), 900)),
             },
         )
-        return list(result.get("cancellations") or []) if isinstance(result, dict) else []
+        return _dict_list_response(result, "cancellations")
 
     def acknowledge_cancel(
         self,
@@ -359,7 +376,9 @@ class CloudRelayClient:
             method="POST",
             payload=payload,
         )
-        return result if isinstance(result, dict) else {}
+        if not isinstance(result, dict):
+            raise ConnectorContractError(502, "cancellation acknowledgement response is invalid")
+        return result
 
     def upload_artifact(
         self,
@@ -392,7 +411,7 @@ class CloudRelayClient:
     def list_run_attachments(self, remote_run_id: str) -> list[dict[str, Any]]:
         encoded = urllib.parse.quote(_text(remote_run_id, 256), safe="")
         result = self._request(f"/connector/runs/{encoded}/attachments")
-        return list(result.get("attachments") or []) if isinstance(result, dict) else []
+        return _dict_list_response(result, "attachments")
 
     def download_run_attachment(
         self,

@@ -11,6 +11,21 @@ def test_timestamp_ms_rejects_non_finite_values():
     assert connector_module._timestamp_ms(float("-inf")) is None
 
 
+def test_cloud_client_rejects_malformed_list_responses():
+    client = connector_module.CloudRelayClient("https://example.test", "token")
+
+    def malformed(_path, **_kwargs):
+        return {"runs": {"remote_run_id": "run-1"}}
+
+    client._request = malformed
+    try:
+        client.pull_runs()
+    except connector_module.ConnectorContractError as exc:
+        assert exc.status == 502
+    else:
+        raise AssertionError("malformed runs response was accepted")
+
+
 def test_session_snapshot_cache_is_bounded_lru(tmp_path, monkeypatch):
     calls = []
 
