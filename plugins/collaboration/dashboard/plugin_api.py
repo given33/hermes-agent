@@ -9022,6 +9022,14 @@ def _positive_int(value: Any) -> Optional[int]:
     return parsed if parsed > 0 else None
 
 
+def _nonnegative_int(value: Any, default: int = 0) -> int:
+    try:
+        parsed = int(value)
+    except (TypeError, ValueError, OverflowError):
+        return default
+    return parsed if parsed >= 0 else default
+
+
 def _remote_run_deadline_fields(
     hosted: dict[str, Any],
     profile: str,
@@ -12686,7 +12694,7 @@ def _require_remote_run_claim(
     ):
         raise _connector_conflict("claim_lost", "Remote run claim was lost")
     instant = int(time.time() * 1000) if now is None else int(now)
-    if int(remote_run.get("lease_until") or 0) <= instant:
+    if _nonnegative_int(remote_run.get("lease_until")) <= instant:
         raise _connector_conflict("lease_expired", "Remote run lease expired")
 
 
@@ -12852,7 +12860,7 @@ def _apply_remote_checkpoint(
         )
         hosted_status = str(hosted.get("status") or "queued")
         current_status = str(remote_run.get("status") or "queued")
-        current_cursor = int(remote_run.get("checkpoint_cursor") or 0)
+        current_cursor = _nonnegative_int(remote_run.get("checkpoint_cursor"))
         if (
             hosted_status in _HOSTED_TERMINAL_STATUSES
             or hosted.get("cancel_requested")
@@ -13243,7 +13251,7 @@ def connector_pull_runs(payload: ConnectorPullBody, request: Request):
                             raise
                         continue
                     status = str(remote_run.get("status") or "queued")
-                    old_lease = int(remote_run.get("lease_until") or 0)
+                    old_lease = _nonnegative_int(remote_run.get("lease_until"))
                     if status not in {"queued", "leased", "running"}:
                         continue
                     if remote_run.get("cancel_requested"):
@@ -13319,7 +13327,7 @@ def connector_ack_run(remote_run_id: str, payload: ConnectorAckBody, request: Re
         record.update(
             {
                 "status": "running",
-                "started_at": int(record.get("started_at") or now),
+                "started_at": _nonnegative_int(record.get("started_at"), now) or now,
                 "updated_at": now,
                 "lease_owner": connector_id,
                 "lease_until": now + max(5, min(int(payload.lease_seconds or _REMOTE_RUN_LEASE_SECONDS), 900)) * 1000,
@@ -13400,7 +13408,7 @@ def connector_pull_cancellations(payload: ConnectorPullBody, request: Request):
                         ):
                             raise
                         continue
-                    old_lease = int(remote_run.get("cancel_lease_until") or 0)
+                    old_lease = _nonnegative_int(remote_run.get("cancel_lease_until"))
                     if old_lease > now:
                         continue
                     claim_token = secrets.token_urlsafe(32)
@@ -13419,8 +13427,8 @@ def connector_pull_cancellations(payload: ConnectorPullBody, request: Request):
                             "remote_run_id": remote_run.get("id"),
                             "remote_task_id": remote_run.get("remote_task_id", ""),
                             "root_task_id": remote_run.get("root_task_id", ""),
-                            "checkpoint_cursor": int(
-                                remote_run.get("checkpoint_cursor") or 0
+                            "checkpoint_cursor": _nonnegative_int(
+                                remote_run.get("checkpoint_cursor")
                             ),
                             "claim_token": claim_token,
                             "reason": (
