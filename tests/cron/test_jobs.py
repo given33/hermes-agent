@@ -752,6 +752,19 @@ class TestMarkJobRun:
         listed = list_jobs()
         assert listed[0]["repeat"] == {"times": None, "completed": 0}
 
+    def test_integral_float_repeat_fields_are_normalized(self, tmp_cron_dir):
+        save_jobs([{
+            "id": "float-repeat",
+            "repeat": {"times": 3.0, "completed": 1.0},
+            "schedule": {"kind": "interval", "minutes": 5},
+            "next_run_at": (
+                datetime.now(timezone.utc) + timedelta(minutes=5)
+            ).isoformat(),
+        }])
+
+        fetched = get_job("float-repeat")
+        assert fetched["repeat"] == {"times": 3, "completed": 1}
+
     def test_malformed_schedule_does_not_abort_marking_run(self, tmp_cron_dir):
         save_jobs([{
             "id": "bad-schedule",

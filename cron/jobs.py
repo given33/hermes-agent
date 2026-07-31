@@ -423,6 +423,12 @@ def _normalize_repeat_record(job: Dict[str, Any]) -> Tuple[Optional[Dict[str, An
         times = None
     elif isinstance(times, int):
         times = times if times > 0 else None
+    elif isinstance(times, float):
+        if math.isfinite(times) and times.is_integer():
+            parsed_times = int(times)
+            times = parsed_times if parsed_times > 0 else None
+        else:
+            times = None
     elif isinstance(times, str):
         try:
             parsed_times = int(times.strip())
@@ -437,6 +443,11 @@ def _normalize_repeat_record(job: Dict[str, Any]) -> Tuple[Optional[Dict[str, An
         completed = 0
     elif isinstance(completed, int):
         completed = max(0, completed)
+    elif isinstance(completed, float):
+        if math.isfinite(completed) and completed.is_integer():
+            completed = max(0, int(completed))
+        else:
+            completed = 0
     elif isinstance(completed, str):
         try:
             completed = max(0, int(completed.strip()))
@@ -456,7 +467,7 @@ def _normalize_repeat_record(job: Dict[str, Any]) -> Tuple[Optional[Dict[str, An
     return normalized, changed
 
 
-def _normalize_repeat_limit(value: Any) -> Optional[int]:
+def normalize_repeat_limit(value: Any) -> Optional[int]:
     """Normalize a create/update repeat limit without truthiness/type traps.
 
     The cron tool schema advertises an integer, but direct callers and older
@@ -1324,7 +1335,7 @@ def create_job(
 
     # Normalize repeat: treat 0 or negative values as None (infinite), while
     # giving direct callers a stable validation error for malformed values.
-    repeat = _normalize_repeat_limit(repeat)
+    repeat = normalize_repeat_limit(repeat)
 
     # Auto-set repeat=1 for one-shot schedules if not specified
     if parsed_schedule["kind"] == "once" and repeat is None:
