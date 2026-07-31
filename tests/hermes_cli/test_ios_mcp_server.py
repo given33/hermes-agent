@@ -122,6 +122,14 @@ def test_photos_scope_does_not_grant_unsupported_library_writes():
     assert manifest["tool_scopes"]["ios_photos_delete"] == ["photos:write"]
 
 
+def test_bluetooth_control_tools_require_control_scope():
+    manifest = ios_mcp_manifests()["ios-bluetooth"]
+    assert manifest["scope"] == ["bluetooth:read", "bluetooth:control"]
+    assert manifest["tool_scopes"]["ios_bluetooth_connect"] == ["bluetooth:control"]
+    assert manifest["tool_scopes"]["ios_bluetooth_disconnect"] == ["bluetooth:control"]
+    assert manifest["tool_scopes"]["ios_bluetooth_write"] == ["bluetooth:control"]
+
+
 def test_new_native_actions_have_explicit_server_risk_and_permission_policies():
     expected = {
         ("ios-photos", "albums"): ("read", "none", "photos"),
