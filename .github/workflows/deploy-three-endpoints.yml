@@ -164,15 +164,17 @@ jobs:
           PY
           )"
           release_name="Backend release ${RELEASE_COMMIT}"
+          production_release_name="Backend release signed ${RELEASE_COMMIT}"
           find_release_run() {
             local workflow="$1"
+            local run_name="$2"
             gh run list \
               --repo "${IOS_REPOSITORY}" \
               --workflow "${workflow}" \
               --event repository_dispatch \
               --limit 50 \
               --json databaseId,name,status,conclusion \
-              | jq -r --arg name "${release_name}" \
+              | jq -r --arg name "${run_name}" \
                 'map(select(.name == $name and (.status == "queued" or .status == "in_progress" or (.status == "completed" and .conclusion == "success")))) | sort_by(.databaseId) | reverse | .[0].databaseId // empty'
           }
 
@@ -181,8 +183,8 @@ jobs:
           # same release again while the sibling is still appearing in the
           # Actions API. Re-dispatching here can cancel an in-flight build via
           # the child workflow's concurrency group.
-          run_id="$(find_release_run ios-unsigned.yml)"
-          production_run_id="$(find_release_run ios-production-eas.yml)"
+          run_id="$(find_release_run ios-unsigned.yml "${release_name}")"
+          production_run_id="$(find_release_run ios-production-eas.yml "${production_release_name}")"
           if [ -n "${run_id}" ] || [ -n "${production_run_id}" ]; then
             echo "iOS release ${RELEASE_COMMIT} already has unsigned run ${run_id:-none} and production run ${production_run_id:-none}; reusing existing dispatch"
           else
@@ -194,8 +196,8 @@ jobs:
           # Poll both workflows together. This covers the normal API delay and
           # the case where one workflow is queued before the other is visible.
           for _ in $(seq 1 60); do
-            [ -n "${run_id}" ] || run_id="$(find_release_run ios-unsigned.yml)"
-            [ -n "${production_run_id}" ] || production_run_id="$(find_release_run ios-production-eas.yml)"
+            [ -n "${run_id}" ] || run_id="$(find_release_run ios-unsigned.yml "${release_name}")"
+            [ -n "${production_run_id}" ] || production_run_id="$(find_release_run ios-production-eas.yml "${production_release_name}")"
             if [ -n "${run_id}" ] && [ -n "${production_run_id}" ]; then
               break
             fi

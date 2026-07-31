@@ -276,6 +276,8 @@ def test_production_release_synchronizes_the_ios_workflow_observably():
     assert '"commit":"${RELEASE_COMMIT}"' in workflow
     assert '"version":"${release_version}"' in workflow
     assert "release_name=\"Backend release ${RELEASE_COMMIT}\"" in workflow
+    assert "production_release_name=\"Backend release signed ${RELEASE_COMMIT}\"" in workflow
+    assert 'find_release_run ios-production-eas.yml "${production_release_name}"' in workflow
     assert "ios-production-eas.yml" in workflow
     assert "already has unsigned run" in workflow
     assert 'if [ -n "${run_id}" ] || [ -n "${production_run_id}" ]; then' in workflow
