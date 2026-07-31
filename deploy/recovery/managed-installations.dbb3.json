@@ -3,6 +3,7 @@
     "node_id": "dbb3",
     "token_file": "/etc/dbb3-team/managed-installation-token",
     "state_file": "/home/hermes/.hermes/managed-installations.db",
-    "project_root": "/home/hermes/.hermes/managed-projects"
+    "project_root": "/home/hermes/.hermes/managed-projects",
+    "release_evidence_file": "/var/lib/hermes-agent-fabric-update/dbb3/release.json"
   }
 }

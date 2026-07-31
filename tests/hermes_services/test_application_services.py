@@ -331,13 +331,60 @@ async def test_cron_fire_rejects_auth_and_payload_before_execution() -> None:
 
     malformed = await accept_cron_fire_request(
         "Bearer accepted",
-        {"job_id": "  "},
+        {"job_id": "  ", "fire_at": "2026-08-01T00:00:00+00:00"},
         execute=execute,
         config=_cron_config(),
-        verifier=lambda **kwargs: {"purpose": "cron_fire"},
+        verifier=lambda **kwargs: {
+            "purpose": "cron_fire",
+            "job_id": "job-a",
+            "fire_at": "2026-08-01T00:00:00+00:00",
+        },
     )
     assert malformed.status_code == 400
     assert malformed.body == {"error": "missing job_id"}
+    assert executions == []
+
+
+@pytest.mark.asyncio
+async def test_cron_fire_requires_token_bound_job_and_fire_identity() -> None:
+    executions: list[CronFireCommand] = []
+    claims = {
+        "purpose": "cron_fire",
+        "job_id": "job-a",
+        "fire_at": "2026-08-01T00:00:00+00:00",
+    }
+
+    async def execute(command, target):
+        executions.append(command)
+
+    missing_fire_at = await accept_cron_fire_request(
+        "Bearer accepted",
+        {"job_id": "job-a"},
+        execute=execute,
+        config=_cron_config(),
+        verifier=lambda **kwargs: claims,
+    )
+    wrong_job = await accept_cron_fire_request(
+        "Bearer accepted",
+        {"job_id": "job-b", "fire_at": claims["fire_at"]},
+        execute=execute,
+        config=_cron_config(),
+        verifier=lambda **kwargs: claims,
+    )
+    wrong_fire = await accept_cron_fire_request(
+        "Bearer accepted",
+        {"job_id": "job-a", "fire_at": "2026-08-01T00:01:00+00:00"},
+        execute=execute,
+        config=_cron_config(),
+        verifier=lambda **kwargs: claims,
+    )
+
+    assert missing_fire_at.status_code == 400
+    assert missing_fire_at.body == {"error": "missing fire_at"}
+    assert wrong_job.status_code == 401
+    assert wrong_job.body == {"error": "invalid fire token"}
+    assert wrong_fire.status_code == 401
+    assert wrong_fire.body == {"error": "invalid fire token"}
     assert executions == []
 
 
@@ -350,7 +397,12 @@ async def test_cron_fire_verifies_off_loop_and_returns_gone_target() -> None:
     def verifier(**kwargs):
         verifier_threads.append(threading.get_ident())
         assert kwargs["token"] == "accepted"
-        return {"purpose": "cron_fire", "subject": "scheduler"}
+        return {
+            "purpose": "cron_fire",
+            "subject": "scheduler",
+            "job_id": "job-b",
+            "fire_at": "2026-08-01T00:00:00+00:00",
+        }
 
     async def resolve(command):
         resolutions.append(command)
@@ -361,7 +413,7 @@ async def test_cron_fire_verifies_off_loop_and_returns_gone_target() -> None:
 
     result = await accept_cron_fire_request(
         "Bearer accepted",
-        {"job_id": " job-b "},
+        {"job_id": " job-b ", "fire_at": "2026-08-01T00:00:00+00:00"},
         execute=execute,
         resolve_target=resolve,
         config=_cron_config(),
@@ -389,11 +441,16 @@ async def test_cron_fire_accepts_exact_command_target_and_owns_task_failure() ->
 
     accepted = await accept_cron_fire_request(
         "Bearer accepted",
-        {"job_id": "job-c"},
+        {"job_id": "job-c", "fire_at": "2026-08-01T00:00:00+00:00"},
         execute=execute,
         resolve_target=resolve,
         config=_cron_config(),
-        verifier=lambda **kwargs: {"purpose": "cron_fire", "tenant": "test"},
+        verifier=lambda **kwargs: {
+            "purpose": "cron_fire",
+            "tenant": "test",
+            "job_id": "job-c",
+            "fire_at": "2026-08-01T00:00:00+00:00",
+        },
     )
 
     assert accepted.status_code == 202
@@ -405,5 +462,11 @@ async def test_cron_fire_accepts_exact_command_target_and_owns_task_failure() ->
     assert len(observed) == 1
     command, target = observed[0]
     assert command.job_id == "job-c"
-    assert command.claims == {"purpose": "cron_fire", "tenant": "test"}
+    assert command.fire_at == "2026-08-01T00:00:00+00:00"
+    assert command.claims == {
+        "purpose": "cron_fire",
+        "tenant": "test",
+        "job_id": "job-c",
+        "fire_at": "2026-08-01T00:00:00+00:00",
+    }
     assert target == "profile-a"

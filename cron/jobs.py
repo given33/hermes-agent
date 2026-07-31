@@ -1745,7 +1745,39 @@ def _machine_id() -> str:
     return f"{host}:{os.getpid()}"
 
 
-def claim_job_for_fire(job_id: str, *, claim_ttl_seconds: int = 300) -> bool:
+def _fire_times_match(left: Any, right: Any) -> bool:
+    """Return whether two timezone-aware ISO timestamps name one instant."""
+    if not isinstance(left, str) or not isinstance(right, str):
+        return False
+    left = left.strip()
+    right = right.strip()
+    if not left or not right:
+        return False
+    try:
+        left_dt = datetime.fromisoformat(
+            left[:-1] + "+00:00" if left.endswith("Z") else left
+        )
+        right_dt = datetime.fromisoformat(
+            right[:-1] + "+00:00" if right.endswith("Z") else right
+        )
+    except ValueError:
+        return False
+    if (
+        left_dt.tzinfo is None
+        or left_dt.utcoffset() is None
+        or right_dt.tzinfo is None
+        or right_dt.utcoffset() is None
+    ):
+        return False
+    return left_dt == right_dt
+
+
+def claim_job_for_fire(
+    job_id: str,
+    fire_at: Optional[str] = None,
+    *,
+    claim_ttl_seconds: int = 300,
+) -> bool:
     """Atomically claim a job for a single external 'fire' (multi-machine
     at-most-once). Returns True iff THIS caller won the claim.
 
@@ -1755,10 +1787,14 @@ def claim_job_for_fire(job_id: str, *, claim_ttl_seconds: int = 300) -> bool:
 
     Under the file lock: reject if the job is missing/disabled/paused. If a
     fresh claim (younger than ``claim_ttl_seconds``) already exists, lose.
-    Otherwise stamp a ``fire_claim`` and, for recurring jobs, advance
+    Identity-bound callers also prove that ``fire_at`` is the job's current
+    scheduled occurrence. Otherwise stamp a ``fire_claim`` and, for recurring
+    jobs, advance
     ``next_run_at`` (mirrors ``advance_next_run``'s at-most-once bump so a stale
-    re-delivery for the old time can't re-fire). One-shots keep ``next_run_at``
-    but the fresh ``fire_claim`` blocks a duplicate retry for the same fire.
+    re-delivery for the old time can't re-fire). A stale retry for the same
+    identity may reclaim a crashed attempt without advancing the schedule twice.
+    One-shots keep ``next_run_at`` but the fresh ``fire_claim`` blocks a
+    duplicate retry for the same fire.
     ``mark_job_run`` clears the claim on completion so a re-armed recurring job
     is claimable again next fire.
 
@@ -1766,6 +1802,10 @@ def claim_job_for_fire(job_id: str, *, claim_ttl_seconds: int = 300) -> bool:
     completing doesn't wedge the job forever — after the TTL another fire can
     reclaim it.
     """
+    if fire_at is not None and (not isinstance(fire_at, str) or not fire_at.strip()):
+        return False
+    normalized_fire_at = fire_at.strip() if isinstance(fire_at, str) else None
+
     with _jobs_lock():
         jobs = load_jobs()
         for job in jobs:
@@ -1789,9 +1829,22 @@ def claim_job_for_fire(job_id: str, *, claim_ttl_seconds: int = 300) -> bool:
                         return False  # someone holds a fresh claim
                 except Exception:
                     pass  # malformed claim → overwrite
-            job["fire_claim"] = {"at": now.isoformat(), "by": _machine_id()}
+            reclaiming_same_fire = bool(
+                normalized_fire_at
+                and isinstance(existing, dict)
+                and _fire_times_match(existing.get("fire_at"), normalized_fire_at)
+            )
+            if normalized_fire_at and not reclaiming_same_fire and not _fire_times_match(
+                job.get("next_run_at"), normalized_fire_at
+            ):
+                return False
+
+            claim = {"at": now.isoformat(), "by": _machine_id()}
+            if normalized_fire_at:
+                claim["fire_at"] = normalized_fire_at
+            job["fire_claim"] = claim
             kind = job.get("schedule", {}).get("kind")
-            if kind in {"cron", "interval"}:
+            if kind in {"cron", "interval"} and not reclaiming_same_fire:
                 nxt = compute_next_run(job["schedule"], now.isoformat())
                 if nxt:
                     job["next_run_at"] = nxt

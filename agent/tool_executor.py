@@ -86,10 +86,18 @@ def _budget_for_agent(agent) -> BudgetConfig:
 # Maximum number of concurrent worker threads for parallel tool execution.
 # Mirrors the constant in ``run_agent`` for tests/imports that look here.
 _MAX_TOOL_WORKERS = 8
+# Preserve eight fully occupied agents before process-wide backpressure.
+_MAX_PROCESS_TOOL_WORKERS = _MAX_TOOL_WORKERS * 8
 _TOOL_EXECUTION_SLOT_SETUP_LOCK = threading.Lock()
 # Compatibility export for integrations that inspect the historical global
 # budget. Execution uses the per-agent budget returned below.
 _TOOL_EXECUTION_SLOTS = threading.BoundedSemaphore(_MAX_TOOL_WORKERS)
+# A timed-out Python thread cannot be killed safely. Per-agent capacity can be
+# restored after abandonment, but the orphan keeps this process-wide lease
+# until it really exits so repeated timeouts cannot grow threads without bound.
+_PROCESS_TOOL_EXECUTION_SLOTS = threading.BoundedSemaphore(
+    _MAX_PROCESS_TOOL_WORKERS
+)
 # Keep this above the stock auxiliary.web_extract timeout (360s) so the batch
 # guard does not preempt a slow-but-valid summarization attempt.
 _DEFAULT_CONCURRENT_TOOL_TIMEOUT_S = 420.0
@@ -106,6 +114,46 @@ def _agent_tool_execution_slots(agent):
             slots = threading.BoundedSemaphore(_MAX_TOOL_WORKERS)
             agent._tool_execution_slots = slots
         return slots
+
+
+class _ToolExecutionLease:
+    """Own per-agent and process capacity for one concurrent tool worker."""
+
+    def __init__(self, agent_slots, process_slots):
+        self._agent_slots = agent_slots
+        self._process_slots = process_slots
+        self._lock = threading.Lock()
+        self._agent_released = False
+        self._process_released = False
+
+    def abandon(self) -> None:
+        """Restore the session after timeout while retaining the orphan bound."""
+        with self._lock:
+            if self._agent_released:
+                return
+            self._agent_released = True
+            self._agent_slots.release()
+
+    def finish(self) -> None:
+        """Release all capacity exactly once when the worker really exits."""
+        with self._lock:
+            if not self._agent_released:
+                self._agent_released = True
+                self._agent_slots.release()
+            if not self._process_released:
+                self._process_released = True
+                self._process_slots.release()
+
+
+def _acquire_tool_execution_lease(agent) -> tuple[Optional[_ToolExecutionLease], str]:
+    if not _PROCESS_TOOL_EXECUTION_SLOTS.acquire(blocking=False):
+        return None, "process tool worker limit reached"
+
+    agent_slots = _agent_tool_execution_slots(agent)
+    if not agent_slots.acquire(blocking=False):
+        _PROCESS_TOOL_EXECUTION_SLOTS.release()
+        return None, "agent tool worker limit reached"
+    return _ToolExecutionLease(agent_slots, _PROCESS_TOOL_EXECUTION_SLOTS), ""
 
 
 def _parse_tool_arguments(raw_arguments: Any) -> tuple[dict, Optional[str]]:
@@ -707,6 +755,10 @@ def execute_tool_calls_concurrent(agent, assistant_message, messages: list, effe
     # ── Concurrent execution ─────────────────────────────────────────
     # Each slot holds (function_name, function_args, function_result, duration, error_flag, blocked_flag, middleware_trace)
     results = [None] * num_tools
+    execution_leases: dict[int, _ToolExecutionLease] = {}
+    timed_out_indices: set[int] = set()
+    abandoned_indices: set[int] = set()
+    execution_leases_lock = threading.Lock()
     for i, (tc, name, args, middleware_trace, block_result, blocked_by_guardrail) in enumerate(parsed_calls):
         if block_result is not None:
             results[i] = (name, args, block_result, 0.0, True, True, middleware_trace)
@@ -718,18 +770,23 @@ def execute_tool_calls_concurrent(agent, assistant_message, messages: list, effe
 
     def _run_tool(index, tool_call, function_name, function_args, middleware_trace):
         """Worker function executed in a thread."""
-        tool_execution_slots = _agent_tool_execution_slots(agent)
-        if not tool_execution_slots.acquire(blocking=False):
+        execution_lease, capacity_error = _acquire_tool_execution_lease(agent)
+        if execution_lease is None:
             results[index] = (
                 function_name,
                 function_args,
-                f"Error executing tool '{function_name}': global tool worker limit reached",
+                f"Error executing tool '{function_name}': {capacity_error}",
                 0.0,
                 True,
                 False,
                 middleware_trace,
             )
             return
+        with execution_leases_lock:
+            execution_leases[index] = execution_lease
+            abandon_immediately = index in abandoned_indices
+        if abandon_immediately:
+            execution_lease.abandon()
         # Register this worker tid so the agent can fan out an interrupt
         # to it — see AIAgent.interrupt().  Must happen first thing, and
         # must be paired with discard + clear in the finally block.
@@ -811,7 +868,7 @@ def execute_tool_calls_concurrent(agent, assistant_message, messages: list, effe
                 _ra()._set_interrupt(False, _worker_tid)
             except Exception:
                 pass
-            tool_execution_slots.release()
+            execution_lease.finish()
 
     # Start spinner for CLI mode (skip when TUI handles tool progress)
     spinner = None
@@ -828,7 +885,6 @@ def execute_tool_calls_concurrent(agent, assistant_message, messages: list, effe
         ]
         futures = []
         future_to_index = {}
-        timed_out_indices: set[int] = set()
         timeout_s = _resolve_concurrent_tool_timeout(
             [name for _tc, name, _args, _trace, block, _guardrail in parsed_calls if block is None]
         )
@@ -923,7 +979,8 @@ def execute_tool_calls_concurrent(agent, assistant_message, messages: list, effe
                             len(deadline_indices),
                             ", ".join(_still_running[:5]),
                         )
-                        timed_out_indices.update(deadline_indices)
+                        with execution_leases_lock:
+                            timed_out_indices.update(deadline_indices)
                         abandon_executor = True
                         for f in not_done:
                             f.cancel()
@@ -936,9 +993,27 @@ def execute_tool_calls_concurrent(agent, assistant_message, messages: list, effe
                                 pass
                         # Parallel batches contain only none/read contracts.
                         # Give interrupted workers a short grace period, then
-                        # detach daemon workers. Their late values are ignored;
-                        # the global slot cap bounds permanently wedged threads.
-                        concurrent.futures.wait(not_done, timeout=0.25)
+                        # detach daemon workers. Their late values are ignored.
+                        # Restore per-agent capacity for each orphan, while its
+                        # process lease continues to bound permanently wedged
+                        # threads across subsequent agents and turns.
+                        _finished, still_running = concurrent.futures.wait(
+                            not_done, timeout=0.25
+                        )
+                        with execution_leases_lock:
+                            abandoned_indices.update(
+                                future_to_index[f]
+                                for f in still_running
+                                if f in future_to_index
+                            )
+                            leases_to_abandon = [
+                                execution_leases.get(future_to_index[f])
+                                for f in still_running
+                                if f in future_to_index
+                            ]
+                        for lease in leases_to_abandon:
+                            if lease is not None:
+                                lease.abandon()
                         break
 
                     # Check for interrupt — the per-thread interrupt signal
@@ -959,7 +1034,23 @@ def execute_tool_calls_concurrent(agent, assistant_message, messages: list, effe
                             f.cancel()
                         # Give already-running tools a moment to notice the
                         # per-thread interrupt signal and exit gracefully.
-                        concurrent.futures.wait(not_done, timeout=3.0)
+                        _finished, still_running = concurrent.futures.wait(
+                            not_done, timeout=3.0
+                        )
+                        with execution_leases_lock:
+                            abandoned_indices.update(
+                                future_to_index[f]
+                                for f in still_running
+                                if f in future_to_index
+                            )
+                            leases_to_abandon = [
+                                execution_leases.get(future_to_index[f])
+                                for f in still_running
+                                if f in future_to_index
+                            ]
+                        for lease in leases_to_abandon:
+                            if lease is not None:
+                                lease.abandon()
                         break
 
                     _conc_elapsed = int(time.time() - _conc_start)

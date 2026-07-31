@@ -11,6 +11,7 @@ from __future__ import annotations
 from contextlib import contextmanager
 from datetime import datetime, time as datetime_time, timezone
 import hashlib
+import math
 import mimetypes
 import os
 from pathlib import Path
@@ -41,6 +42,8 @@ def _native_atomic_path(path: Path) -> str:
 SCHEMA_VERSION = 5
 LOCAL_OWNER_ID = "local-owner"
 LEGACY_ACCOUNT_GENERATION = "legacy"
+_SQLITE_INTEGER_MIN = -(1 << 63)
+_SQLITE_INTEGER_MAX = (1 << 63) - 1
 FILE_SOURCES = frozenset({"user_upload", "model_output"})
 FILE_STATUSES = frozenset({"uploading", "staged", "available", "failed"})
 INSTALL_INTENT_RECOVERY_AGE_MS = 15 * 60 * 1000
@@ -314,11 +317,21 @@ def parse_date_filter(value: Any, *, end_of_day: bool = False) -> int | None:
         return None
     raw = str(value).strip()
     try:
-        numeric = float(raw)
+        numeric: int | float | None = int(raw, 10)
     except ValueError:
-        numeric = None
+        try:
+            numeric = float(raw)
+        except ValueError:
+            numeric = None
     if numeric is not None:
-        return int(numeric if abs(numeric) >= 100_000_000_000 else numeric * 1000)
+        if isinstance(numeric, float) and not math.isfinite(numeric):
+            raise ValueError("Date filters must be finite epoch seconds/ms")
+        epoch_ms = int(
+            numeric if abs(numeric) >= 100_000_000_000 else numeric * 1000
+        )
+        if not _SQLITE_INTEGER_MIN <= epoch_ms <= _SQLITE_INTEGER_MAX:
+            raise ValueError("Date filters must fit SQLite INTEGER range")
+        return epoch_ms
 
     date_only = bool(re.fullmatch(r"\d{4}-\d{2}-\d{2}", raw))
     normalized = raw[:-1] + "+00:00" if raw.endswith("Z") else raw
@@ -334,7 +347,13 @@ def parse_date_filter(value: Any, *, end_of_day: bool = False) -> int | None:
         )
     elif parsed.tzinfo is None:
         parsed = parsed.replace(tzinfo=timezone.utc)
-    return int(parsed.timestamp() * 1000)
+    try:
+        epoch_ms = int(parsed.timestamp() * 1000)
+    except (OSError, OverflowError, ValueError) as exc:
+        raise ValueError("Date filters must fit SQLite INTEGER range") from exc
+    if not _SQLITE_INTEGER_MIN <= epoch_ms <= _SQLITE_INTEGER_MAX:
+        raise ValueError("Date filters must fit SQLite INTEGER range")
+    return epoch_ms
 
 
 class CloudFileLibrary:

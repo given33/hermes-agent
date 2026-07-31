@@ -4,6 +4,7 @@ from __future__ import annotations
 import json
 import os
 from base64 import b64encode
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from typing import Any, Dict
 
@@ -125,6 +126,33 @@ def test_store_user_numbers_round_trip(tmp_hermes_home: Path) -> None:
     photon_auth.print_credential_summary(rendered.append)
     assert "  my number           : +15551234567" in rendered[0]
     assert "  assigned number     : +16282679185" in rendered[0]
+
+
+def test_concurrent_auth_updates_preserve_unrelated_credentials(
+    tmp_hermes_home: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(photon_auth, "_persist_runtime_env", lambda *a, **k: None)
+
+    def store_token(index: int) -> None:
+        photon_auth.store_photon_token(f"token-{index}")
+
+    def store_project(index: int) -> None:
+        photon_auth.store_project_credentials(
+            spectrum_project_id=f"project-{index}",
+            project_secret=f"secret-{index}",
+        )
+
+    with ThreadPoolExecutor(max_workers=8) as pool:
+        futures = []
+        for index in range(20):
+            futures.append(pool.submit(store_token, index))
+            futures.append(pool.submit(store_project, index))
+        for future in futures:
+            future.result()
+
+    auth_json = json.loads((tmp_hermes_home / "auth.json").read_text())
+    assert auth_json["credential_pool"]["photon"]
+    assert auth_json["credential_pool"]["photon_project"]
 
 
 def test_load_user_numbers_falls_back_to_home_channel(

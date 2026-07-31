@@ -141,7 +141,7 @@ def _stub_uvicorn_run(monkeypatch):
     import asyncio
     import contextlib
     import uvicorn
-    captured: dict = {"kwargs": {}}
+    captured: dict = {"kwargs": {}, "shutdowns": 0}
 
     class _FakeConfig:
         loaded = True
@@ -181,14 +181,30 @@ def _stub_uvicorn_run(monkeypatch):
             pass
 
         async def main_loop(self):
-            pass
+            if captured.get("raise_main_loop"):
+                raise RuntimeError("injected main-loop failure")
 
         async def shutdown(self, sockets=None):
-            pass
+            captured["shutdowns"] += 1
 
     monkeypatch.setattr(uvicorn, "Config", _FakeConfig)
     monkeypatch.setattr(uvicorn, "Server", lambda config: _FakeServer())
     return captured
+
+
+def test_start_server_shuts_down_lifespan_when_main_loop_raises(monkeypatch):
+    captured = _stub_uvicorn_run(monkeypatch)
+    captured["raise_main_loop"] = True
+
+    with pytest.raises(RuntimeError, match="injected main-loop failure"):
+        web_server.start_server(
+            host="127.0.0.1",
+            port=9119,
+            open_browser=False,
+            allow_public=False,
+        )
+
+    assert captured["shutdowns"] == 1
 
 
 def test_start_server_loopback_sets_auth_required_false(monkeypatch):

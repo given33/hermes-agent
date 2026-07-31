@@ -6,6 +6,8 @@ import argparse
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import json
 from pathlib import Path
+import re
+import stat
 from typing import Any
 
 from hermes_cli.managed_nodes import (
@@ -21,6 +23,42 @@ from hermes_cli.managed_installations import (
 
 
 MAX_REQUEST_BYTES = 64 * 1024
+MAX_RELEASE_EVIDENCE_BYTES = 16 * 1024
+
+
+def _load_release_evidence(config: dict[str, Any] | None) -> dict[str, str] | None:
+    """Return the node-local release marker without trusting arbitrary JSON."""
+    if config is None or config.get("release_evidence_file") is None:
+        return None
+    path = Path(config["release_evidence_file"])
+    try:
+        metadata = path.lstat()
+    except FileNotFoundError:
+        return None
+    except OSError as exc:
+        raise RuntimeError("release evidence is unreadable") from exc
+    if stat.S_ISLNK(metadata.st_mode) or not stat.S_ISREG(metadata.st_mode):
+        raise RuntimeError("release evidence is not a regular file")
+    if metadata.st_size < 2 or metadata.st_size > MAX_RELEASE_EVIDENCE_BYTES:
+        raise RuntimeError("release evidence size is invalid")
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise RuntimeError("release evidence is invalid") from exc
+    if not isinstance(payload, dict):
+        raise RuntimeError("release evidence is invalid")
+    commit = str(payload.get("commit") or "")
+    version = str(payload.get("version") or "")
+    node_id = str(payload.get("node_id") or "")
+    if payload.get("schema") != "hermes.fabric-release.v1":
+        raise RuntimeError("release evidence schema is invalid")
+    if node_id != str(config.get("node_id") or ""):
+        raise RuntimeError("release evidence node does not match")
+    if re.fullmatch(r"[0-9a-f]{40}", commit) is None:
+        raise RuntimeError("release evidence commit is invalid")
+    if re.fullmatch(r"[0-9]+\.[0-9]+\.[0-9]+", version) is None:
+        raise RuntimeError("release evidence version is invalid")
+    return {"commit": commit, "version": version}
 
 
 class RecoveryHTTPServer(ThreadingHTTPServer):
@@ -88,12 +126,20 @@ class RecoveryRequestHandler(BaseHTTPRequestHandler):
                 self._json(503, {"error": str(exc)[:256]})
                 return
         config = recovery or installation
-        self._json(200 if config else 503, {
+        try:
+            release = _load_release_evidence(installation)
+        except RuntimeError as exc:
+            self._json(503, {"error": str(exc)})
+            return
+        payload: dict[str, Any] = {
             "ok": config is not None,
             "node_id": str((config or {}).get("node_id") or ""),
             "recovery": recovery is not None,
             "installations": installation is not None,
-        })
+        }
+        if installation is not None and installation.get("release_evidence_file") is not None:
+            payload["release"] = release
+        self._json(200 if config else 503, payload)
 
     def do_POST(self) -> None:
         if self.path not in {"/recover", "/installations"}:

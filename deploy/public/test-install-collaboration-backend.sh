@@ -235,7 +235,17 @@ if [[ "${1:-}" == "start" && "${FAKE_SIGNAL_ON_START:-0}" == 1 \
 fi
 case "${1:-}" in
   show)
-    printf '%s\n' "${FAKE_SYSTEMD_ENVIRONMENT:-}"
+    if [[ "$*" == *"ActiveState,SubState,Result,ExecMainCode,ExecMainStatus,NRestarts"* ]]; then
+      printf '%s\n' \
+        'ActiveState=activating' \
+        'SubState=auto-restart' \
+        'Result=exit-code' \
+        'ExecMainCode=1' \
+        'ExecMainStatus=1' \
+        'NRestarts=3'
+    else
+      printf '%s\n' "${FAKE_SYSTEMD_ENVIRONMENT:-}"
+    fi
     exit 0
     ;;
   reload)
@@ -249,6 +259,14 @@ case "${1:-}" in
   stop|start|is-active) exit 0 ;;
   *) exit 0 ;;
 esac
+SH
+cat >"${fake_bin}/journalctl" <<'SH'
+#!/usr/bin/env bash
+set -euo pipefail
+printf '%s\n' "$*" >>"${FAKE_JOURNALCTL_LOG}"
+printf '%s\n' \
+  'dashboard startup failed: token=super-secret-diagnostic-token-value' \
+  'Traceback: RuntimeError: failed before bind'
 SH
 cat >"${fake_bin}/sshd" <<'SH'
 #!/usr/bin/env bash
@@ -394,9 +412,11 @@ print(json.dumps({
 PY
 )"
 elif [[ "${url}" == */_hermes/installations/dbb3/health ]]; then
-  payload='{"ok":true,"node_id":"dbb3","installations":true,"recovery":false}'
+  release_version="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["version"])' "${HERMES_AGENT_ROOT}/plugins/collaboration/dashboard/manifest.json")"
+  payload="{\"ok\":true,\"node_id\":\"dbb3\",\"installations\":true,\"recovery\":false,\"release\":{\"commit\":\"0000000000000000000000000000000000000001\",\"version\":\"${release_version}\"}}"
 elif [[ "${url}" == */_hermes/installations/wsl/health ]]; then
-  payload='{"ok":true,"node_id":"wsl","installations":true,"recovery":false}'
+  release_version="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["version"])' "${HERMES_AGENT_ROOT}/plugins/collaboration/dashboard/manifest.json")"
+  payload="{\"ok\":true,\"node_id\":\"wsl\",\"installations\":true,\"recovery\":false,\"release\":{\"commit\":\"0000000000000000000000000000000000000001\",\"version\":\"${release_version}\"}}"
 elif [[ "${url}" =~ /_hermes/installations/(dbb3|wsl)$ ]]; then
   node="${BASH_REMATCH[1]}"
   probe_id="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["id"])' "${data_file}")"
@@ -416,7 +436,7 @@ fi
 SH
 chmod 0755 "${fake_bin}/systemctl" "${fake_bin}/sshd" "${fake_bin}/mv" \
   "${fake_bin}/ssh" "${fake_bin}/scp" "${fake_bin}/nginx" \
-  "${fake_bin}/sleep" "${fake_bin}/curl"
+  "${fake_bin}/sleep" "${fake_bin}/curl" "${fake_bin}/journalctl"
 
 ssh_configurator="${repo}/deploy/recovery/configure-main-managed-installation-ssh.sh"
 ssh_reload_marker="${work}/ssh-reload-failed"
@@ -538,6 +558,7 @@ run_installer() {
     HERMES_NGINX_BINARY="${fake_bin}/nginx" \
     HERMES_RELEASE_EVIDENCE_FILE="${release_evidence_file}" \
     FAKE_SYSTEMCTL_LOG="${work}/systemctl.log" \
+    FAKE_JOURNALCTL_LOG="${work}/journalctl.log" \
     FAKE_NGINX_LOG="${work}/nginx.log" \
     /bin/bash "${installer}" "${version}" "${stage}" \
       0000000000000000000000000000000000000001
@@ -551,6 +572,14 @@ set -e
   printf '%s\n' "forced post-start failure unexpectedly succeeded" >&2
   exit 1
 }
+grep -Fq "service_diagnostics_begin" "${work}/failure.stderr"
+grep -Fq "SubState=auto-restart" "${work}/failure.stderr"
+grep -Fq "Traceback: RuntimeError: failed before bind" "${work}/failure.stderr"
+if grep -Fq "super-secret-diagnostic-token-value" "${work}/failure.stderr"; then
+  printf '%s\n' "service failure diagnostics leaked a token" >&2
+  exit 1
+fi
+grep -Fq -- "--unit hermes-agent-test.service" "${work}/journalctl.log"
 for relative in "${runtime_files[@]}"; do
   [[ "$(<"${target}/${relative}")" == "old:${relative}" ]] || {
     printf 'rollback mismatch: %s\n' "${relative}" >&2
@@ -748,6 +777,11 @@ assert evidence["probes"]["deployment_health"]["ok"] is True
 assert evidence["probes"]["managed_installation_routes"] == {
     "dbb3": True,
     "wsl": True,
+}
+assert evidence["fabric"]["status"] == "verified"
+assert evidence["fabric"]["nodes"] == {
+    "dbb3": {"commit": evidence["commit"], "version": evidence["version"]},
+    "wsl": {"commit": evidence["commit"], "version": evidence["version"]},
 }
 assert evidence["probes"]["traffic_switch"]["nginx_reloaded"] is True
 PY

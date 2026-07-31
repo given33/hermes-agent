@@ -19,6 +19,17 @@ from starlette.testclient import TestClient
 from hermes_cli import web_server
 from hermes_cli.dashboard_auth.public_paths import PUBLIC_API_PATHS
 
+_FIRE_AT = "2026-08-01T00:00:00+00:00"
+
+
+def _claims(job_id):
+    return {
+        "purpose": "cron_fire",
+        "aud": "agent:x",
+        "job_id": job_id,
+        "fire_at": _FIRE_AT,
+    }
+
 
 def _client(auth_required: bool):
     prev_auth = getattr(web_server.app.state, "auth_required", None)
@@ -83,7 +94,7 @@ def test_bad_token_401(monkeypatch):
 def test_missing_job_id_400(monkeypatch):
     monkeypatch.setattr(
         "plugins.cron_providers.chronos.verify.get_fire_verifier",
-        lambda: (lambda **kw: {"purpose": "cron_fire"}),
+        lambda: (lambda **kw: _claims("ghost")),
     )
     client, pa, ph = _client(auth_required=False)
     try:
@@ -101,14 +112,14 @@ def test_unknown_job_200_gone(monkeypatch):
     (NAS shouldn't retry a fire for a cancelled/completed job)."""
     monkeypatch.setattr(
         "plugins.cron_providers.chronos.verify.get_fire_verifier",
-        lambda: (lambda **kw: {"purpose": "cron_fire"}),
+        lambda: (lambda **kw: _claims("ghost")),
     )
     monkeypatch.setattr(web_server, "_find_cron_job_profile", lambda jid: None)
     client, pa, ph = _client(auth_required=False)
     try:
         resp = client.post("/api/cron/fire",
                            headers={"Authorization": "Bearer good"},
-                           json={"job_id": "ghost"})
+                           json={"job_id": "ghost", "fire_at": _FIRE_AT})
         assert resp.status_code == 200
         assert resp.json().get("status") == "gone"
     finally:
@@ -122,21 +133,21 @@ def test_valid_token_accepts_and_fires(monkeypatch):
     fired = []
     monkeypatch.setattr(
         "plugins.cron_providers.chronos.verify.get_fire_verifier",
-        lambda: (lambda **kw: {"purpose": "cron_fire", "aud": "agent:x"}),
+        lambda: (lambda **kw: _claims("j1")),
     )
     monkeypatch.setattr(web_server, "_find_cron_job_profile", lambda jid: "default")
     monkeypatch.setattr(web_server, "_fire_cron_job_for_profile",
-                        lambda p, j: fired.append((p, j)) or True)
+                        lambda p, j, fire_at: fired.append((p, j, fire_at)) or True)
 
     client, pa, ph = _client(auth_required=False)
     try:
         resp = client.post("/api/cron/fire",
                            headers={"Authorization": "Bearer good"},
-                           json={"job_id": "j1"})
+                           json={"job_id": "j1", "fire_at": _FIRE_AT})
         assert resp.status_code == 202
         assert resp.json()["job_id"] == "j1"
     finally:
         _restore(pa, ph)
         client.close()
     # background task ran the fire for the resolved profile
-    assert fired == [("default", "j1")]
+    assert fired == [("default", "j1", _FIRE_AT)]

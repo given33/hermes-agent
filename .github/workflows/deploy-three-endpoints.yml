@@ -76,13 +76,19 @@ jobs:
           HERMES_RELEASE_COMMIT: ${{ github.sha }}
         run: |
           bash deploy/public/deploy-collaboration-backend.sh
-      - name: Verify the public release evidence
+      - name: Verify the public and fabric release evidence
         env:
           REMOTE: ${{ secrets.HERMES_PUBLIC_USER }}@${{ secrets.HERMES_PUBLIC_HOST }}
           EXPECTED_COMMIT: ${{ github.sha }}
         run: |
+          EXPECTED_VERSION="$(python3 -c 'import json; print(json.load(open("plugins/collaboration/dashboard/manifest.json"))["version"])')"
           evidence="$(ssh -i "$RUNNER_TEMP/ssh/id_ed25519" \
             -o UserKnownHostsFile="$RUNNER_TEMP/ssh/known_hosts" \
             -o StrictHostKeyChecking=yes "$REMOTE" \
             'sudo -n cat /var/lib/hermes-agent-release/release-evidence.json')"
-          python3 -c 'import json,os,sys; d=json.load(sys.stdin); assert d["phase"]=="committed"; assert d["commit"]==os.environ["EXPECTED_COMMIT"]' <<<"$evidence"
+          EXPECTED_VERSION="$EXPECTED_VERSION" python3 -c 'import json,os,sys; d=json.load(sys.stdin); assert d["phase"]=="committed"; assert d["commit"]==os.environ["EXPECTED_COMMIT"]; assert d["version"]==os.environ["EXPECTED_VERSION"]; assert d["fabric"]["status"]=="verified"; assert all(v=={"commit":d["commit"],"version":d["version"]} for v in d["fabric"]["nodes"].values())' <<<"$evidence"
+          ssh -i "$RUNNER_TEMP/ssh/id_ed25519" \
+            -o UserKnownHostsFile="$RUNNER_TEMP/ssh/known_hosts" \
+            -o StrictHostKeyChecking=yes "$REMOTE" \
+            "sudo -n /bin/bash -s -- '$EXPECTED_COMMIT' '$EXPECTED_VERSION'" \
+            < deploy/public/verify-fabric-release.sh

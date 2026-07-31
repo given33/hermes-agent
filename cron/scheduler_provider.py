@@ -88,7 +88,14 @@ class CronScheduler(ABC):
 
         return recover_interrupted_executions()
 
-    def fire_due(self, job_id: str, *, adapters: Any = None, loop: Any = None) -> bool:
+    def fire_due(
+        self,
+        job_id: str,
+        *,
+        fire_at: str | None = None,
+        adapters: Any = None,
+        loop: Any = None,
+    ) -> bool:
         """Run a single job NOW via the shared orchestrator. Called by the
         inbound fire webhook when an external scheduler signals a job is due.
 
@@ -104,7 +111,12 @@ class CronScheduler(ABC):
         from cron.executions import create_execution
         from cron.scheduler import run_one_job
 
-        if not claim_job_for_fire(job_id):
+        claimed = (
+            claim_job_for_fire(job_id, fire_at=fire_at)
+            if fire_at is not None
+            else claim_job_for_fire(job_id)
+        )
+        if not claimed:
             return False  # another machine already claimed this fire
         job = get_job(job_id)
         if job is None:

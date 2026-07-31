@@ -18,7 +18,7 @@ done
 install -d -o root -g root -m 0755 /usr/local/lib/hermes-agent /etc/hermes-agent
 # ProtectSystem=strict makes /var read-only before ExecStart. The service may
 # create its role subdirectory, but its allowlisted parent must already exist.
-install -d -o root -g root -m 0700 /var/lib/hermes-agent-fabric-update
+install -d -o root -g root -m 0755 /var/lib/hermes-agent-fabric-update
 install -o root -g root -m 0755 \
   "${repo}/deploy/automation/update-fabric-node.sh" \
   /usr/local/lib/hermes-agent/update-fabric-node.sh

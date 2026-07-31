@@ -19,6 +19,7 @@ import re
 import shutil
 import subprocess
 import sys
+import tempfile
 import threading
 import time
 
@@ -505,6 +506,8 @@ _terminal_cwd_lock = _ReadWriteLock()
 def _get_parallel_pool(max_workers: Optional[int]) -> concurrent.futures.ThreadPoolExecutor:
     """Return (or create) the persistent parallel pool."""
     global _parallel_pool, _parallel_pool_max_workers
+    if max_workers is not None and max_workers <= 0:
+        max_workers = None
     if _parallel_pool is None or _parallel_pool_max_workers != max_workers:
         if _parallel_pool is not None:
             _parallel_pool.shutdown(wait=False, cancel_futures=False)
@@ -514,6 +517,40 @@ def _get_parallel_pool(max_workers: Optional[int]) -> concurrent.futures.ThreadP
         )
         _parallel_pool_max_workers = max_workers
     return _parallel_pool
+
+
+def _resolve_max_parallel_workers() -> Optional[int]:
+    """Resolve a positive worker cap; zero/invalid values mean unbounded."""
+    raw_env = os.getenv("HERMES_CRON_MAX_PARALLEL", "").strip()
+    if raw_env:
+        try:
+            env_workers = int(raw_env)
+            if env_workers < 0:
+                raise ValueError
+            return env_workers or None
+        except (ValueError, TypeError):
+            logger.warning(
+                "Invalid HERMES_CRON_MAX_PARALLEL value; checking config.yaml"
+            )
+
+    try:
+        config = load_config() or {}
+        raw_config = (
+            config.get("cron", {}) if isinstance(config, dict) else {}
+        ).get("max_parallel_jobs")
+        if raw_config is None:
+            return None
+        config_workers = int(raw_config)
+        if config_workers < 0:
+            raise ValueError
+        return config_workers or None
+    except (ValueError, TypeError):
+        logger.warning(
+            "Invalid cron.max_parallel_jobs value; defaulting to unbounded"
+        )
+        return None
+    except Exception:
+        return None
 
 
 def _get_sequential_pool() -> concurrent.futures.ThreadPoolExecutor:
@@ -2193,6 +2230,7 @@ def _run_job_script(script_path: str) -> tuple[bool, str]:
     # shebang: the scripts dir is trusted, but keeping the interpreter
     # choice explicit here keeps the allowed surface small and auditable.
     suffix = path.suffix.lower()
+    temporary_script_path: Optional[Path] = None
     if suffix in {".sh", ".bash"}:
         # Resolve bash dynamically so Windows (Git Bash) and Linux/macOS
         # all work.  On native Windows without Git for Windows installed
@@ -2208,7 +2246,32 @@ def _run_job_script(script_path: str) -> tuple[bool, str]:
                 "On Windows, install Git for Windows (which ships Git Bash) "
                 "or rewrite the script as Python (.py)."
         )
-        argv = [_bash, str(path)]
+        execution_path = path
+        try:
+            script_bytes = path.read_bytes()
+            normalized_bytes = script_bytes.replace(b"\r\n", b"\n")
+            if normalized_bytes != script_bytes:
+                with tempfile.NamedTemporaryFile(
+                    mode="wb",
+                    prefix=f".{path.stem}-",
+                    suffix=path.suffix,
+                    dir=path.parent,
+                    delete=False,
+                ) as normalized_script:
+                    temporary_script_path = Path(normalized_script.name)
+                    normalized_script.write(normalized_bytes)
+                execution_path = temporary_script_path
+        except OSError as exc:
+            if temporary_script_path is not None:
+                try:
+                    temporary_script_path.unlink(missing_ok=True)
+                except OSError:
+                    pass
+            return False, f"Script preparation failed: {exc}"
+        # The subprocess cwd is the validated script directory, so a basename
+        # avoids incompatible absolute-path dialects across native POSIX,
+        # Git Bash, and the Windows WSL bash launcher.
+        argv = [_bash, "--", execution_path.name]
         env_overlay: dict[str, str] = {}
     else:
         python_exe, env_overlay = _windows_cron_python_invocation(sys.executable)
@@ -2262,6 +2325,16 @@ def _run_job_script(script_path: str) -> tuple[bool, str]:
         return False, f"Script timed out after {script_timeout}s: {path}"
     except Exception as exc:
         return False, f"Script execution failed: {exc}"
+    finally:
+        if temporary_script_path is not None:
+            try:
+                temporary_script_path.unlink(missing_ok=True)
+            except OSError as exc:
+                logger.warning(
+                    "Failed to remove normalized cron script %s: %s",
+                    temporary_script_path,
+                    exc,
+                )
 
 
 def _run_job_script_with_claim_heartbeat(
@@ -3962,6 +4035,10 @@ def tick(
         if verbose:
             logger.info("%s - %s job(s) due", _hermes_now().strftime('%H:%M:%S'), len(due_jobs))
 
+        # Validate executor configuration before mutating any due job. A bad
+        # value must not advance next_run_at and then abort dispatch.
+        _max_workers = _resolve_max_parallel_workers()
+
         # Advance next_run_at for all recurring jobs FIRST, under the file lock,
         # before any execution begins.  This preserves at-most-once semantics.
         # For parallel jobs that are already running, advance_next_run keeps
@@ -3969,26 +4046,6 @@ def tick(
         # mark_job_run() overwrites next_run_at on completion.
         for job in due_jobs:
             advance_next_run(job["id"])
-
-        # Resolve max parallel workers: env var > config.yaml > unbounded.
-        # Set HERMES_CRON_MAX_PARALLEL=1 to restore old serial behaviour.
-        _max_workers: Optional[int] = None
-        try:
-            _env_par = os.getenv("HERMES_CRON_MAX_PARALLEL", "").strip()
-            if _env_par:
-                _max_workers = int(_env_par) or None
-        except (ValueError, TypeError):
-            logger.warning("Invalid HERMES_CRON_MAX_PARALLEL value; defaulting to unbounded")
-        if _max_workers is None:
-            try:
-                _ucfg = load_config() or {}
-                _cfg_par = (
-                    _ucfg.get("cron", {}) if isinstance(_ucfg, dict) else {}
-                ).get("max_parallel_jobs")
-                if _cfg_par is not None:
-                    _max_workers = int(_cfg_par) or None
-            except Exception:
-                pass
 
         if verbose:
             logger.info(

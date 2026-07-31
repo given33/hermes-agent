@@ -46,6 +46,8 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
+from utils import atomic_json_write
+
 try:
     import httpx
 except ImportError:  # pragma: no cover - httpx is a hermes dependency
@@ -94,8 +96,8 @@ def _auth_json_path() -> Path:
         return Path(os.path.expanduser("~/.hermes")) / "auth.json"
 
 
-def _load_auth() -> Dict[str, Any]:
-    path = _auth_json_path()
+def _load_auth(path: Optional[Path] = None) -> Dict[str, Any]:
+    path = path or _auth_json_path()
     if not path.exists():
         return {}
     try:
@@ -106,17 +108,17 @@ def _load_auth() -> Dict[str, Any]:
         return {}
 
 
-def _save_auth(data: Dict[str, Any]) -> None:
-    path = _auth_json_path()
-    path.parent.mkdir(parents=True, exist_ok=True)
-    tmp = path.with_suffix(".json.tmp")
-    with tmp.open("w", encoding="utf-8") as fh:
-        json.dump(data, fh, indent=2, sort_keys=True)
-    try:
-        os.chmod(tmp, 0o600)
-    except OSError:
-        pass
-    tmp.replace(path)
+def _save_auth(data: Dict[str, Any], path: Optional[Path] = None) -> None:
+    atomic_json_write(
+        path or _auth_json_path(), data, indent=2, mode=0o600, sort_keys=True
+    )
+
+
+def _auth_store_transaction(path: Path):
+    """Use the same auth.lock protocol as every other auth.json writer."""
+    from agent.provider_auth import _auth_store_lock
+
+    return _auth_store_lock(target_path=path)
 
 
 def load_photon_token() -> Optional[str]:
@@ -136,11 +138,13 @@ def load_photon_token() -> Optional[str]:
 
 def store_photon_token(token: str) -> None:
     """Persist a dashboard bearer token under ``credential_pool.photon``."""
-    auth = _load_auth()
-    auth.setdefault("credential_pool", {})["photon"] = [
-        {"access_token": token, "issued_at": int(time.time())}
-    ]
-    _save_auth(auth)
+    path = _auth_json_path()
+    with _auth_store_transaction(path):
+        auth = _load_auth(path)
+        auth.setdefault("credential_pool", {})["photon"] = [
+            {"access_token": token, "issued_at": int(time.time())}
+        ]
+        _save_auth(auth, path)
 
 
 def load_project_credentials() -> Tuple[Optional[str], Optional[str]]:
@@ -205,18 +209,20 @@ def store_project_credentials(
     ``auth.json`` so management commands work even when ``.env`` hasn't been
     loaded into the current process.
     """
-    auth = _load_auth()
-    record: Dict[str, Any] = {
-        "spectrum_project_id": spectrum_project_id,
-        "project_secret": project_secret,
-        "issued_at": int(time.time()),
-    }
-    if dashboard_project_id:
-        record["dashboard_project_id"] = dashboard_project_id
-    if name:
-        record["name"] = name
-    auth.setdefault("credential_pool", {})["photon_project"] = [record]
-    _save_auth(auth)
+    path = _auth_json_path()
+    with _auth_store_transaction(path):
+        auth = _load_auth(path)
+        record: Dict[str, Any] = {
+            "spectrum_project_id": spectrum_project_id,
+            "project_secret": project_secret,
+            "issued_at": int(time.time()),
+        }
+        if dashboard_project_id:
+            record["dashboard_project_id"] = dashboard_project_id
+        if name:
+            record["name"] = name
+        auth.setdefault("credential_pool", {})["photon_project"] = [record]
+        _save_auth(auth, path)
     _persist_runtime_env(spectrum_project_id, project_secret)
 
 
@@ -230,18 +236,20 @@ def store_user_numbers(
     """Persist non-secret Photon user numbers for offline ``status`` output."""
     if not phone_number and not assigned_phone_number:
         return
-    auth = _load_auth()
-    record: Dict[str, Any] = {"issued_at": int(time.time())}
-    if phone_number:
-        record["phone_number"] = phone_number
-    if assigned_phone_number:
-        record["assigned_phone_number"] = assigned_phone_number
-    if user_id:
-        record["user_id"] = user_id
-    if dashboard_project_id:
-        record["dashboard_project_id"] = dashboard_project_id
-    auth.setdefault("credential_pool", {})["photon_user"] = [record]
-    _save_auth(auth)
+    path = _auth_json_path()
+    with _auth_store_transaction(path):
+        auth = _load_auth(path)
+        record: Dict[str, Any] = {"issued_at": int(time.time())}
+        if phone_number:
+            record["phone_number"] = phone_number
+        if assigned_phone_number:
+            record["assigned_phone_number"] = assigned_phone_number
+        if user_id:
+            record["user_id"] = user_id
+        if dashboard_project_id:
+            record["dashboard_project_id"] = dashboard_project_id
+        auth.setdefault("credential_pool", {})["photon_user"] = [record]
+        _save_auth(auth, path)
 
 
 def _persist_runtime_env(spectrum_project_id: str, project_secret: str) -> None:

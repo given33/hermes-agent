@@ -15,7 +15,9 @@ from __future__ import annotations
 
 import importlib
 import os
+import subprocess
 import sys
+import time
 from unittest.mock import patch, MagicMock
 
 import pytest
@@ -25,6 +27,7 @@ from hermes_cli.main import (
     _kill_stale_dashboard_processes,
     _warn_stale_dashboard_processes,  # back-compat alias
 )
+from hermes_runtime.process_probe import pid_exists
 
 
 @pytest.fixture(autouse=True)
@@ -82,6 +85,10 @@ def _ps_runner(stdout: str):
 
 class TestFindStaleDashboardPids:
     """Unit tests for the ps/wmic-based detection step."""
+
+    @pytest.fixture(autouse=True)
+    def _use_posix_process_table(self, monkeypatch):
+        monkeypatch.setattr(sys, "platform", "linux")
 
     def test_no_matches_returns_empty(self):
         with patch("subprocess.run") as mock_run:
@@ -348,14 +355,18 @@ class TestKillStaleDashboardWindows:
              patch("subprocess.run", side_effect=fake_run) as mock_run:
             _kill_stale_dashboard_processes()
 
-        # Each PID triggered a taskkill /PID <n> /F invocation.
+        # Each PID triggered a recursive taskkill invocation.
         taskkill_calls = [
             c for c in mock_run.call_args_list
             if c.args and isinstance(c.args[0], list) and c.args[0][:1] == ["taskkill"]
         ]
         assert len(taskkill_calls) == 2
-        assert ["taskkill", "/PID", "12345", "/F"] in [c.args[0] for c in taskkill_calls]
-        assert ["taskkill", "/PID", "12346", "/F"] in [c.args[0] for c in taskkill_calls]
+        assert ["taskkill", "/PID", "12345", "/T", "/F"] in [
+            c.args[0] for c in taskkill_calls
+        ]
+        assert ["taskkill", "/PID", "12346", "/T", "/F"] in [
+            c.args[0] for c in taskkill_calls
+        ]
 
         out = capsys.readouterr().out
         assert "✓ stopped PID 12345" in out
@@ -384,6 +395,78 @@ class TestBackCompatAlias:
 
     def test_alias_is_the_kill_function(self):
         assert _warn_stale_dashboard_processes is _kill_stale_dashboard_processes
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="POSIX process-tree semantics")
+def test_hard_stop_reaps_a_real_uncooperative_child_process():
+    script = """
+import signal, subprocess, sys, time
+child = subprocess.Popen([
+    sys.executable, "-c",
+    "import signal,time; signal.signal(signal.SIGTERM, signal.SIG_IGN); time.sleep(60)",
+])
+print(child.pid, flush=True)
+signal.signal(signal.SIGTERM, signal.SIG_IGN)
+time.sleep(60)
+"""
+    parent = subprocess.Popen(
+        [sys.executable, "-c", script],
+        stdout=subprocess.PIPE,
+        text=True,
+    )
+    assert parent.stdout is not None
+    child_pid = int(parent.stdout.readline().strip())
+    try:
+        with patch(
+            "hermes_cli.main._find_stale_dashboard_pids",
+            return_value=[parent.pid],
+        ):
+            assert _kill_stale_dashboard_processes(grace_seconds=0.2) is True
+        parent.wait(timeout=5)
+        deadline = time.monotonic() + 5
+        while pid_exists(child_pid) and time.monotonic() < deadline:
+            time.sleep(0.05)
+        assert not pid_exists(child_pid)
+    finally:
+        for pid in (child_pid, parent.pid):
+            if pid_exists(pid):
+                os.kill(pid, 9)
+
+
+@pytest.mark.skipif(sys.platform != "win32", reason="Windows process-tree semantics")
+def test_windows_hard_stop_reaps_a_real_child_process():
+    script = """
+import subprocess, sys, time
+child = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(60)"])
+print(child.pid, flush=True)
+time.sleep(60)
+"""
+    parent = subprocess.Popen(
+        [sys.executable, "-c", script],
+        stdout=subprocess.PIPE,
+        text=True,
+        creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+    )
+    assert parent.stdout is not None
+    child_pid = int(parent.stdout.readline().strip())
+    try:
+        with patch(
+            "hermes_cli.main._find_stale_dashboard_pids",
+            return_value=[parent.pid],
+        ):
+            assert _kill_stale_dashboard_processes() is True
+        parent.wait(timeout=5)
+        deadline = time.monotonic() + 5
+        while pid_exists(child_pid) and time.monotonic() < deadline:
+            time.sleep(0.05)
+        assert not pid_exists(child_pid)
+    finally:
+        if pid_exists(parent.pid):
+            subprocess.run(
+                ["taskkill", "/PID", str(parent.pid), "/T", "/F"],
+                capture_output=True,
+                check=False,
+            )
 
 
 class TestWindowsWmicEncoding:

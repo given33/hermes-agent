@@ -4,6 +4,7 @@ import json
 import os
 import sys
 import time
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -682,7 +683,9 @@ class TestGetProcessStartTime:
     def test_live_process_is_stable_int(self):
         import subprocess
         import time
-        p = subprocess.Popen(["sleep", "20"])
+        p = subprocess.Popen(
+            [sys.executable, "-c", "import time; time.sleep(20)"]
+        )
         try:
             a = status._get_process_start_time(p.pid)
             time.sleep(0.2)
@@ -702,12 +705,14 @@ class TestGetProcessStartTime:
         orig_read_text = Path.read_text
 
         def no_proc(self, *args, **kwargs):
-            if str(self).startswith("/proc/"):
+            if str(self).replace("\\", "/").startswith("/proc/"):
                 raise FileNotFoundError
             return orig_read_text(self, *args, **kwargs)
 
         monkeypatch.setattr(Path, "read_text", no_proc)
-        p = subprocess.Popen(["sleep", "20"])
+        p = subprocess.Popen(
+            [sys.executable, "-c", "import time; time.sleep(20)"]
+        )
         try:
             a = status._get_process_start_time(p.pid)
             b = status._get_process_start_time(p.pid)
@@ -1664,6 +1669,21 @@ class TestGatewayBusyDerivation:
 
 
 class TestRespawnStormBreaker:
+    def test_concurrent_starts_are_not_lost(self, tmp_path, monkeypatch):
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+        with ThreadPoolExecutor(max_workers=8) as pool:
+            list(
+                pool.map(
+                    lambda _index: status.record_start_and_check_storm(
+                        max_starts=100, window_s=120.0
+                    ),
+                    range(40),
+                )
+            )
+
+        lines = status._get_starts_log_path().read_text(encoding="utf-8").splitlines()
+        assert len(lines) == 40
+
     def test_no_storm_under_threshold(self, tmp_path, monkeypatch):
         monkeypatch.setenv("HERMES_HOME", str(tmp_path))
         for _ in range(5):

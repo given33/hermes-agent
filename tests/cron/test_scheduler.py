@@ -3305,6 +3305,24 @@ class TestParallelTick:
         start_s2 = [t for action, jid, t in call_times if action == "start" and jid == "s2"][0]
         assert start_s2 >= end_s1, "Jobs ran concurrently despite max_parallel=1"
 
+    def test_negative_parallel_config_defaults_to_working_pool(self, monkeypatch):
+        monkeypatch.delenv("HERMES_CRON_MAX_PARALLEL", raising=False)
+        job = {"id": "negative-cap", "name": "negative-cap", "deliver": "local"}
+
+        with patch("cron.scheduler.get_due_jobs", return_value=[job]), \
+             patch("cron.scheduler.load_config", return_value={"cron": {"max_parallel_jobs": -1}}), \
+             patch("cron.scheduler.advance_next_run") as advance, \
+             patch("cron.scheduler.run_job", return_value=(True, "output", "response", None)), \
+             patch("cron.scheduler.save_job_output", return_value="/tmp/out.md"), \
+             patch("cron.scheduler._deliver_result", return_value=None), \
+             patch("cron.scheduler.mark_job_run"):
+            from cron.scheduler import tick
+
+            result = tick(verbose=False)
+
+        assert result == 1
+        advance.assert_called_once_with("negative-cap")
+
 
 class TestDeliverResultTimeoutCancelsFuture:
     """When future.result(timeout=60) raises TimeoutError in the live adapter

@@ -309,6 +309,33 @@ def test_run_job_script_bash_extension_also_runs_via_bash(hermes_env):
     assert output == "via bash"
 
 
+def test_run_job_script_normalizes_crlf_without_leaving_temporary_file(hermes_env):
+    from cron.scheduler import _run_job_script
+
+    scripts_dir = hermes_env / "scripts"
+    script_path = scripts_dir / "windows-lines.sh"
+    script_path.write_bytes(b'printf "crlf works\\n"\r\n')
+    files_before = set(scripts_dir.iterdir())
+
+    ok, output = _run_job_script("windows-lines.sh")
+
+    assert ok is True
+    assert output == "crlf works"
+    assert set(scripts_dir.iterdir()) == files_before
+
+
+def test_run_job_script_treats_dash_prefixed_name_as_a_file(hermes_env):
+    from cron.scheduler import _run_job_script
+
+    script_path = hermes_env / "scripts" / "-watch.sh"
+    script_path.write_bytes(b'printf "dash name\\n"\n')
+
+    ok, output = _run_job_script("-watch.sh")
+
+    assert ok is True
+    assert output == "dash name"
+
+
 def test_run_job_script_python_still_runs_via_python(hermes_env):
     """Regression: .py files must keep running via sys.executable."""
     from cron.scheduler import _run_job_script

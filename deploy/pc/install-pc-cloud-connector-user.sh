@@ -39,4 +39,4 @@ exec env \
   HERMES_CONNECTOR_CONFIG_DIR="${user_home}/.config/pc-team" \
   HERMES_CONNECTOR_STATE_DIR="${user_home}/.local/state/pc-cloud-connector" \
   HERMES_CONNECTOR_HERMES_HOME="${pc_home}" \
-  bash "${shared_installer}" "${shared_source}"
+  bash "${shared_installer}" "${shared_source}" "${1:-}"

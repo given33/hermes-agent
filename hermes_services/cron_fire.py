@@ -11,6 +11,7 @@ import asyncio
 import logging
 import threading
 from dataclasses import dataclass
+from datetime import datetime, timezone
 from typing import Any, Awaitable, Callable, Dict, Generic, Mapping, Optional, TypeVar
 
 from hermes_runtime.config import cfg_get, load_config
@@ -21,6 +22,8 @@ from .contracts import ServiceFailure
 logger = logging.getLogger("cron.chronos.verify")
 
 _FIRE_PURPOSE = "cron_fire"
+_MAX_JOB_ID_LENGTH = 512
+_MAX_FIRE_AT_LENGTH = 128
 _JWK_CLIENTS: Dict[str, Any] = {}
 _JWK_CLIENTS_LOCK = threading.Lock()
 
@@ -33,6 +36,7 @@ class CronFireAuthorization:
 @dataclass(frozen=True, slots=True)
 class CronFireCommand:
     job_id: str
+    fire_at: str
     claims: Mapping[str, Any]
 
 
@@ -63,6 +67,23 @@ def _get_jwk_client(jwks_url: str) -> Any:
             client = PyJWKClient(jwks_url)
             _JWK_CLIENTS[jwks_url] = client
         return client
+
+
+def _normalize_fire_at(value: Any) -> str | None:
+    if not isinstance(value, str):
+        return None
+    normalized = value.strip()
+    if not normalized or len(normalized) > _MAX_FIRE_AT_LENGTH:
+        return None
+    try:
+        parsed = datetime.fromisoformat(
+            normalized[:-1] + "+00:00" if normalized.endswith("Z") else normalized
+        )
+        if parsed.tzinfo is None or parsed.utcoffset() is None:
+            return None
+        return parsed.astimezone(timezone.utc).isoformat()
+    except (ValueError, OverflowError):
+        return None
 
 
 def verify_nas_fire_token(
@@ -108,6 +129,17 @@ def verify_nas_fire_token(
     if claims.get("purpose") != _FIRE_PURPOSE:
         logger.warning("cron fire: token missing/!=%s purpose claim", _FIRE_PURPOSE)
         return None
+    claim_job_id = claims.get("job_id")
+    if (
+        not isinstance(claim_job_id, str)
+        or not claim_job_id.strip()
+        or len(claim_job_id.strip()) > _MAX_JOB_ID_LENGTH
+    ):
+        logger.warning("cron fire: token missing/invalid job_id claim")
+        return None
+    if _normalize_fire_at(claims.get("fire_at")) is None:
+        logger.warning("cron fire: token missing/invalid fire_at claim")
+        return None
     return claims
 
 
@@ -149,9 +181,33 @@ def parse_cron_fire_payload(
     if not isinstance(job_id, str) or not job_id.strip():
         return None, ServiceFailure(400, "missing_job_id", "missing job_id")
     normalized = job_id.strip()
-    if len(normalized) > 512:
+    if len(normalized) > _MAX_JOB_ID_LENGTH:
         return None, ServiceFailure(400, "invalid_job_id", "invalid job_id")
-    return CronFireCommand(job_id=normalized, claims=authorization.claims), None
+
+    fire_at = payload.get("fire_at") if isinstance(payload, Mapping) else None
+    normalized_fire_at = _normalize_fire_at(fire_at)
+    if not isinstance(fire_at, str) or not fire_at.strip():
+        return None, ServiceFailure(400, "missing_fire_at", "missing fire_at")
+    if normalized_fire_at is None:
+        return None, ServiceFailure(400, "invalid_fire_at", "invalid fire_at")
+
+    claim_job_id = authorization.claims.get("job_id")
+    claim_fire_at = _normalize_fire_at(authorization.claims.get("fire_at"))
+    if (
+        not isinstance(claim_job_id, str)
+        or claim_job_id.strip() != normalized
+        or claim_fire_at != normalized_fire_at
+    ):
+        return None, ServiceFailure(
+            401,
+            "invalid_fire_token",
+            "invalid fire token",
+        )
+    return CronFireCommand(
+        job_id=normalized,
+        fire_at=normalized_fire_at,
+        claims=authorization.claims,
+    ), None
 
 
 async def accept_cron_fire_request(

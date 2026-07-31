@@ -1202,6 +1202,17 @@ def _kanban_attachment_roots() -> List[Path]:
 def _media_delivery_allowed_roots() -> List[Path]:
     """Return roots from which model-emitted local media may be delivered."""
     roots = [Path(root) for root in MEDIA_DELIVERY_SAFE_ROOTS]
+    active_home = get_hermes_home()
+    for legacy_dir in (
+        "image_cache",
+        "audio_cache",
+        "video_cache",
+        "document_cache",
+        "browser_screenshots",
+    ):
+        roots.append(active_home / legacy_dir)
+    for subdir in _MEDIA_DELIVERY_CACHE_SUBDIRS:
+        roots.append(active_home / "cache" / subdir)
     roots.extend(_profile_cache_roots())
     roots.extend(_kanban_attachment_roots())
     extra_roots = os.environ.get(MEDIA_DELIVERY_ALLOW_DIRS_ENV, "")
@@ -1310,7 +1321,12 @@ def _media_delivery_denied_paths() -> List[Path]:
         "pairing",
         "mcp-tokens",
     )
-    for hermes_root in (_HERMES_HOME, _HERMES_ROOT):
+    # ``get_hermes_home`` can be a context-local dashboard/desktop profile
+    # override. Include it at check time; the import-time home alone would let
+    # active-profile credential directories such as mcp-tokens/ escape this
+    # denylist in a multi-profile process.
+    hermes_roots = dict.fromkeys((_HERMES_HOME, get_hermes_home(), _HERMES_ROOT))
+    for hermes_root in hermes_roots:
         for rel in _ROOT_CREDENTIAL_FILES:
             denied.append(hermes_root / rel)
         for rel in _ROOT_CREDENTIAL_DIRS:

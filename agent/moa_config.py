@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import base64
 import json
+import math
 from copy import deepcopy
 from typing import Any
 
@@ -19,6 +20,7 @@ DEFAULT_MOA_AGGREGATOR: dict[str, str] = {
     "provider": "openrouter",
     "model": "anthropic/claude-opus-4.8",
 }
+_MAX_MOA_TOKEN_LIMIT = (1 << 31) - 1
 
 
 def _coerce_float_or_none(value: Any) -> float | None:
@@ -32,21 +34,42 @@ def _coerce_float_or_none(value: Any) -> float | None:
     if value is None or value == "":
         return None
     try:
-        return float(value)
-    except (TypeError, ValueError):
+        number = float(value)
+        return number if math.isfinite(number) else None
+    except (TypeError, ValueError, OverflowError):
         return None
 
 
-def _coerce_int(value: Any, default: int) -> int:
-    if value is None or value == "":
-        return default
+def _coerce_positive_bounded_int(value: Any) -> int | None:
+    if value is None or value == "" or isinstance(value, bool):
+        return None
+
+    number: int | None = None
     try:
-        return int(value)
-    except (TypeError, ValueError):
+        if isinstance(value, int):
+            number = value
+        elif isinstance(value, str):
+            number = int(value.strip())
+    except (ValueError, OverflowError):
+        number = None
+
+    if number is None:
         try:
-            return int(float(value))
-        except (TypeError, ValueError):
-            return default
+            numeric = float(value)
+        except (TypeError, ValueError, OverflowError):
+            return None
+        if not math.isfinite(numeric) or not numeric.is_integer():
+            return None
+        number = int(numeric)
+
+    if not 0 < number <= _MAX_MOA_TOKEN_LIMIT:
+        return None
+    return number
+
+
+def _coerce_int(value: Any, default: int) -> int:
+    number = _coerce_positive_bounded_int(value)
+    return default if number is None else number
 
 
 def _coerce_int_or_none(value: Any) -> int | None:
@@ -57,14 +80,7 @@ def _coerce_int_or_none(value: Any) -> int | None:
     """
     if value is None or value == "":
         return None
-    try:
-        n = int(value)
-    except (TypeError, ValueError):
-        try:
-            n = int(float(value))
-        except (TypeError, ValueError):
-            return None
-    return n if n > 0 else None
+    return _coerce_positive_bounded_int(value)
 
 
 def _coerce_fanout(value: Any) -> str:
@@ -153,8 +169,23 @@ def validate_moa_payload(raw: Any) -> list[str]:
         presets = {DEFAULT_MOA_PRESET_NAME: raw}
 
     problems: list[str] = []
+    clean_names: dict[str, str] = {}
     for name, preset in presets.items():
-        label = str(name or "").strip() or "(unnamed)"
+        raw_name = str(name or "")
+        clean_name = raw_name.strip()
+        label = clean_name or "(unnamed)"
+        if not clean_name:
+            problems.append("preset names cannot be blank")
+        elif clean_name != raw_name:
+            problems.append(
+                f"preset '{label}': name cannot have leading or trailing whitespace"
+            )
+        if clean_name in clean_names:
+            problems.append(
+                f"preset '{label}': name collides with preset {clean_names[clean_name]!r}"
+            )
+        elif clean_name:
+            clean_names[clean_name] = raw_name
         if not isinstance(preset, dict):
             problems.append(f"preset '{label}': must be an object")
             continue
@@ -175,6 +206,34 @@ def validate_moa_payload(raw: Any) -> list[str]:
         agg_issue = _slot_problem(preset.get("aggregator"))
         if agg_issue:
             problems.append(f"preset '{label}' aggregator: {agg_issue}")
+
+        for field in ("reference_temperature", "aggregator_temperature"):
+            value = preset.get(field)
+            if value is None or value == "":
+                continue
+            try:
+                finite = math.isfinite(float(value))
+            except (TypeError, ValueError, OverflowError):
+                finite = False
+            if not finite:
+                problems.append(f"preset '{label}' {field}: must be a finite number")
+
+        for field in ("max_tokens", "reference_max_tokens"):
+            if field not in preset or preset.get(field) in (None, ""):
+                continue
+            if _coerce_positive_bounded_int(preset[field]) is None:
+                problems.append(
+                    f"preset '{label}' {field}: must be an integer between 1 and "
+                    f"{_MAX_MOA_TOKEN_LIMIT}"
+                )
+
+    if isinstance(presets_raw, dict) and presets_raw:
+        default_name = str(raw.get("default_preset") or "").strip()
+        active_name = str(raw.get("active_preset") or "").strip()
+        if default_name and default_name not in clean_names:
+            problems.append("default_preset must name an existing preset")
+        if active_name and active_name not in clean_names:
+            problems.append("active_preset must name an existing preset")
 
     return problems
 

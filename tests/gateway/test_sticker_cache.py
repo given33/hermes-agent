@@ -1,5 +1,6 @@
 """Tests for gateway/sticker_cache.py — sticker description cache."""
 
+from concurrent.futures import ThreadPoolExecutor
 from unittest.mock import patch
 
 from gateway.sticker_cache import (
@@ -20,6 +21,12 @@ class TestLoadSaveCache:
     def test_load_corrupt_file(self, tmp_path):
         bad_file = tmp_path / "bad.json"
         bad_file.write_text("not json{{{")
+        with patch("gateway.sticker_cache.CACHE_PATH", bad_file):
+            assert _load_cache() == {}
+
+    def test_load_non_object_file(self, tmp_path):
+        bad_file = tmp_path / "list.json"
+        bad_file.write_text("[]")
         with patch("gateway.sticker_cache.CACHE_PATH", bad_file):
             assert _load_cache() == {}
 
@@ -57,6 +64,12 @@ class TestCacheSticker:
             result = get_cached_description("nonexistent")
         assert result is None
 
+    def test_non_object_entry_is_a_cache_miss(self, tmp_path):
+        cache_file = tmp_path / "cache.json"
+        cache_file.write_text('{"uid_1": "not-an-entry"}')
+        with patch("gateway.sticker_cache.CACHE_PATH", cache_file):
+            assert get_cached_description("uid_1") is None
+
     def test_overwrite_existing(self, tmp_path):
         cache_file = tmp_path / "cache.json"
         with patch("gateway.sticker_cache.CACHE_PATH", cache_file):
@@ -65,6 +78,16 @@ class TestCacheSticker:
             result = get_cached_description("uid_1")
 
         assert result["description"] == "New description"
+
+    def test_write_recovers_from_non_object_cache(self, tmp_path):
+        cache_file = tmp_path / "cache.json"
+        cache_file.write_text("[]")
+        with patch("gateway.sticker_cache.CACHE_PATH", cache_file):
+            cache_sticker_description("uid_1", "Recovered")
+            result = get_cached_description("uid_1")
+
+        assert result is not None
+        assert result["description"] == "Recovered"
 
     def test_multiple_stickers(self, tmp_path):
         cache_file = tmp_path / "cache.json"
@@ -76,6 +99,22 @@ class TestCacheSticker:
 
         assert r1["description"] == "Cat"
         assert r2["description"] == "Dog"
+
+    def test_concurrent_writers_preserve_every_sticker(self, tmp_path):
+        cache_file = tmp_path / "cache.json"
+        with patch("gateway.sticker_cache.CACHE_PATH", cache_file):
+            with ThreadPoolExecutor(max_workers=8) as pool:
+                list(
+                    pool.map(
+                        lambda index: cache_sticker_description(
+                            f"uid_{index}", f"description {index}"
+                        ),
+                        range(40),
+                    )
+                )
+            loaded = _load_cache()
+
+        assert set(loaded) == {f"uid_{index}" for index in range(40)}
 
 
 class TestBuildStickerInjection:

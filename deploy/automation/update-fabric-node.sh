@@ -14,10 +14,16 @@ cloud_url="${HERMES_CLOUD_URL:-https://daxueshenmai.top/api/plugins/collaboratio
 case "${cloud_url}" in https://daxueshenmai.top/api/plugins/collaboration) ;; *) die "cloud URL is not approved" ;; esac
 
 state_root="${HERMES_FABRIC_STATE_ROOT:-/var/lib/hermes-agent-fabric-update/${role}}"
+allow_test_paths="${HERMES_FABRIC_ALLOW_TEST_PATHS:-0}"
+if [[ "${allow_test_paths}" != 1 ]]; then
+  [[ "${state_root}" == "/var/lib/hermes-agent-fabric-update/${role}" ]] \
+    || die "fabric state root override is not allowed"
+fi
 mirror="${state_root}/repository.git"
 deployed_file="${state_root}/deployed-commit"
+release_evidence_file="${state_root}/release.json"
 lock_file="${state_root}/update.lock"
-install -d -o root -g root -m 0700 "${state_root}"
+install -d -o root -g root -m 0755 "$(dirname "${state_root}")" "${state_root}"
 exec 8>"${lock_file}"
 chmod 0600 "${lock_file}"
 flock -n 8 || exit 0
@@ -37,14 +43,129 @@ esac
 evidence_file="$(mktemp /run/hermes-fabric-evidence.XXXXXX)"
 curl_config="$(mktemp /run/hermes-fabric-curl.XXXXXX)"
 stage="$(mktemp -d "/run/hermes-fabric-${role}.XXXXXX")"
-automation_script_temp="/usr/local/lib/hermes-agent/update-fabric-node.sh.new.$$"
-automation_service_temp="/etc/systemd/system/hermes-fabric-update.service.new.$$"
-automation_timer_temp="/etc/systemd/system/hermes-fabric-update.timer.new.$$"
+automation_script_target="${HERMES_FABRIC_AUTOMATION_SCRIPT_TARGET:-/usr/local/lib/hermes-agent/update-fabric-node.sh}"
+automation_service_target="${HERMES_FABRIC_AUTOMATION_SERVICE_TARGET:-/etc/systemd/system/hermes-fabric-update.service}"
+automation_timer_target="${HERMES_FABRIC_AUTOMATION_TIMER_TARGET:-/etc/systemd/system/hermes-fabric-update.timer}"
+if [[ "${allow_test_paths}" != 1 ]]; then
+  [[ "${automation_script_target}" == /usr/local/lib/hermes-agent/update-fabric-node.sh \
+      && "${automation_service_target}" == /etc/systemd/system/hermes-fabric-update.service \
+      && "${automation_timer_target}" == /etc/systemd/system/hermes-fabric-update.timer ]] \
+    || die "automation target override is not allowed"
+fi
+automation_script_temp="${automation_script_target}.new.$$"
+automation_service_temp="${automation_service_target}.new.$$"
+automation_timer_temp="${automation_timer_target}.new.$$"
+automation_backup="${stage}/automation-backup"
+runtime_swapped=0
+automation_swapped=0
+transaction_committed=0
+connector_installed=0
+receiver_installed=0
+evidence_published=0
+connector_handle="${stage}/connector-rollback-handle"
+receiver_handle="${stage}/receiver-rollback-handle"
 cleanup() {
+  local status=$?
+  trap - EXIT
+  set +e
+  rollback_failed=0
+  if (( receiver_installed && ! transaction_committed )); then
+    receiver_backup="$(cat -- "${receiver_handle}" 2>/dev/null)"
+    case "${role}" in
+      dbb3)
+        bash "${stage}/deploy/recovery/install-dbb3-managed-installation-receiver.sh" \
+          "${stage}" "--rollback-backup=${receiver_backup}" \
+          || rollback_failed=1
+        ;;
+      wsl)
+        bash "${stage}/deploy/recovery/install-wsl-managed-installation.sh" \
+          "${stage}" "${wsl_secret_stage}/installation-token" \
+          "${wsl_secret_stage}/installation-key" \
+          "--rollback-backup=${receiver_backup}" \
+          || rollback_failed=1
+        ;;
+    esac
+  fi
+  if (( connector_installed && ! transaction_committed )); then
+    connector_backup="$(cat -- "${connector_handle}" 2>/dev/null)"
+    case "${role}" in
+      dbb3)
+        bash "${stage}/deploy/dbb3/install-dbb3-cloud-connector-user.sh" \
+          "${stage}/deploy/dbb3/dbb3_cloud_connector.py" \
+          "--rollback-backup=${connector_backup}" \
+          || rollback_failed=1
+        ;;
+      wsl)
+        bash "${stage}/deploy/pc/install-pc-cloud-connector-user.sh" \
+          "--rollback-backup=${connector_backup}" \
+          || rollback_failed=1
+        ;;
+    esac
+  fi
+  if (( evidence_published && ! transaction_committed )); then
+    if [[ -f "${stage}/previous-release-evidence.present" ]]; then
+      install -o root -g root -m 0644 \
+        "${stage}/previous-release-evidence.json" \
+        "${release_evidence_file}.rollback.$$" \
+        && mv -f -- "${release_evidence_file}.rollback.$$" \
+          "${release_evidence_file}" \
+        || rollback_failed=1
+    else
+      rm -f -- "${release_evidence_file}" || rollback_failed=1
+    fi
+  fi
+  if (( automation_swapped && ! transaction_committed )); then
+    for target in "${automation_script_target}" "${automation_service_target}" \
+      "${automation_timer_target}"; do
+      case "${target}" in
+        "${automation_script_target}") relative="update-fabric-node.sh" ;;
+        "${automation_service_target}") relative="systemd/hermes-fabric-update.service" ;;
+        "${automation_timer_target}") relative="systemd/hermes-fabric-update.timer" ;;
+      esac
+      backup_target="${automation_backup}/${relative}"
+      if [[ -f "${backup_target}.present" ]]; then
+        install -o root -g root -m 0644 "${backup_target}" "${target}.rollback.$$" \
+          && mv -f -- "${target}.rollback.$$" "${target}" \
+          || rollback_failed=1
+      elif [[ -f "${backup_target}.absent" ]]; then
+        rm -f -- "${target}" || rollback_failed=1
+      else
+        rollback_failed=1
+      fi
+    done
+    systemctl daemon-reload >/dev/null 2>&1 || rollback_failed=1
+    systemctl enable --now hermes-fabric-update.timer >/dev/null 2>&1 || rollback_failed=1
+  fi
+  if (( runtime_swapped && ! transaction_committed )); then
+    for relative in "${runtime_modules[@]:-}"; do
+      target="${runtime_root}/${relative}"
+      backup_target="${runtime_backup}/${relative}"
+      if [[ -f "${backup_target}.present" ]]; then
+        install -o root -g root -m 0644 "${backup_target}" "${target}.rollback.$$" \
+          && mv -f -- "${target}.rollback.$$" "${target}"
+      elif [[ -f "${backup_target}.absent" ]]; then
+        rm -f -- "${target}"
+      fi
+    done
+    case "${role}" in
+      dbb3) systemctl restart hermes-managed-installation-receiver.service >/dev/null 2>&1 || true ;;
+      wsl)
+        if id hermes >/dev/null 2>&1; then
+          uid="$(id -u hermes)"
+          runuser -u hermes -- env XDG_RUNTIME_DIR="/run/user/${uid}" \
+            DBUS_SESSION_BUS_ADDRESS="unix:path=/run/user/${uid}/bus" \
+            systemctl --user restart hermes-wsl-managed-installation-receiver.service \
+            >/dev/null 2>&1 || true
+        fi
+        ;;
+    esac
+  fi
   rm -rf -- "${stage}"
   rm -f -- "${evidence_file}" "${curl_config}" \
     "${automation_script_temp}" "${automation_service_temp}" \
-    "${automation_timer_temp}"
+    "${automation_timer_temp}" "${release_evidence_temp:-}"
+  (( rollback_failed == 0 )) || status=70
+  exit "${status}"
 }
 trap cleanup EXIT
 connector_token="$(cat -- "${token_file}")"
@@ -59,20 +180,42 @@ unset connector_token
 curl --fail --silent --show-error --max-time 15 --noproxy '*' \
   --config "${curl_config}" \
   -o "${evidence_file}" "${cloud_url}/connector/deployment-health"
-release_commit="$(python3 - "${evidence_file}" <<'PY'
+readarray -t release_identity < <(python3 - "${evidence_file}" <<'PY'
 import json
 import re
 import sys
 
 payload = json.load(open(sys.argv[1], encoding="utf-8"))
 assert payload.get("ok") is True
-commit = str((payload.get("release") or {}).get("commit") or "")
+release = payload.get("release") or {}
+commit = str(release.get("commit") or "")
+version = str(release.get("version") or "")
 assert re.fullmatch(r"[0-9a-f]{40}", commit)
+assert re.fullmatch(r"[0-9]+\.[0-9]+\.[0-9]+", version)
 print(commit)
+print(version)
 PY
-)"
-if [[ -f "${deployed_file}" && "$(cat -- "${deployed_file}")" == "${release_commit}" ]]; then
-  printf 'role=%s\ncommit=%s\nstate=current\n' "${role}" "${release_commit}"
+)
+release_commit="${release_identity[0]:-}"
+release_version="${release_identity[1]:-}"
+[[ "${release_commit}" =~ ^[0-9a-f]{40}$ ]] || die "release commit is invalid"
+[[ "${release_version}" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] || die "release version is invalid"
+if [[ -f "${deployed_file}" \
+    && "$(cat -- "${deployed_file}")" == "${release_commit}" \
+    && -f "${release_evidence_file}" ]] \
+  && python3 - "${release_evidence_file}" "${role}" "${release_commit}" "${release_version}" <<'PY'
+import json, sys
+data = json.load(open(sys.argv[1], encoding="utf-8"))
+assert data == {
+    "commit": sys.argv[3],
+    "node_id": sys.argv[2],
+    "schema": "hermes.fabric-release.v1",
+    "version": sys.argv[4],
+}
+PY
+then
+  printf 'role=%s\ncommit=%s\nversion=%s\nstate=current\n' \
+    "${role}" "${release_commit}" "${release_version}"
   exit 0
 fi
 
@@ -97,6 +240,16 @@ archive_paths=(
   "deploy/dbb3/install-dbb3-cloud-connector-user.sh"
   "deploy/dbb3/dbb3_cloud_connector.py"
   "deploy/dbb3/dbb3-cloud-connector.service"
+  "deploy/recovery/install-dbb3-managed-installation-receiver.sh"
+  "deploy/recovery/install-wsl-managed-installation.sh"
+  "deploy/recovery/hermes-managed-installation-receiver.service"
+  "deploy/recovery/hermes-wsl-managed-installation-receiver.service"
+  "deploy/recovery/hermes-wsl-managed-installation-tunnel.service"
+  "deploy/recovery/managed-installations.dbb3.json"
+  "deploy/recovery/managed-installations.wsl.json"
+  "hermes_cli/managed_installations.py"
+  "hermes_cli/managed_nodes.py"
+  "hermes_cli/managed_node_recovery_service.py"
 )
 if [[ "${role}" == wsl ]]; then
   archive_paths+=(
@@ -121,6 +274,83 @@ for relative in "${automation_assets[@]}"; do
   [[ -f "${stage}/${relative}" && ! -L "${stage}/${relative}" ]] \
     || die "missing or unsafe automation asset ${relative}"
 done
+install -d -o root -g root -m 0700 \
+  "${automation_backup}" "${automation_backup}/systemd"
+for target in "${automation_script_target}" "${automation_service_target}" \
+  "${automation_timer_target}"; do
+  [[ ! -L "${target}" ]] || die "automation target is a symlink: ${target}"
+  case "${target}" in
+    "${automation_script_target}") backup_relative="update-fabric-node.sh" ;;
+    "${automation_service_target}") backup_relative="systemd/hermes-fabric-update.service" ;;
+    "${automation_timer_target}") backup_relative="systemd/hermes-fabric-update.timer" ;;
+  esac
+  if [[ -f "${target}" ]]; then
+    cp -a -- "${target}" "${automation_backup}/${backup_relative}"
+    : >"${automation_backup}/${backup_relative}.present"
+  elif [[ ! -e "${target}" ]]; then
+    : >"${automation_backup}/${backup_relative}.absent"
+  else
+    die "automation target is not a regular file: ${target}"
+  fi
+done
+
+runtime_modules=(
+  "hermes_cli/managed_installations.py"
+  "hermes_cli/managed_nodes.py"
+  "hermes_cli/managed_node_recovery_service.py"
+)
+case "${role}" in
+  dbb3) runtime_root="${HERMES_DBB3_AGENT_ROOT:-/usr/local/lib/hermes-agent}" ;;
+  wsl) runtime_root="${HERMES_WSL_AGENT_ROOT:-/mnt/d/Hermes/hermes-agent}" ;;
+esac
+if [[ "${allow_test_paths}" != 1 ]]; then
+  case "${role}:${runtime_root}" in
+    dbb3:/usr/local/lib/hermes-agent|wsl:/mnt/d/Hermes/hermes-agent) ;;
+    *) die "managed receiver runtime root override is not allowed" ;;
+  esac
+fi
+[[ "${runtime_root}" == /* && -d "${runtime_root}" && ! -L "${runtime_root}" ]] \
+  || die "managed receiver runtime root is unsafe"
+[[ "$(realpath -e -- "${runtime_root}")" == "${runtime_root}" ]] \
+  || die "managed receiver runtime root or one of its parents is a symlink"
+[[ -d "${runtime_root}/hermes_cli" \
+    && ! -L "${runtime_root}/hermes_cli" \
+    && "$(realpath -e -- "${runtime_root}/hermes_cli")" == "${runtime_root}/hermes_cli" ]] \
+  || die "managed receiver package root or one of its parents is unsafe"
+runtime_backup="${stage}/runtime-backup"
+install -d -o root -g root -m 0700 "${runtime_backup}/hermes_cli"
+for relative in "${runtime_modules[@]}"; do
+  source_file="${stage}/${relative}"
+  target="${runtime_root}/${relative}"
+  backup_target="${runtime_backup}/${relative}"
+  [[ -f "${source_file}" && ! -L "${source_file}" ]] \
+    || die "missing or unsafe managed receiver runtime asset ${relative}"
+  [[ ! -L "${target}" ]] || die "managed receiver runtime target is a symlink: ${target}"
+  if [[ -f "${target}" ]]; then
+    cp -a -- "${target}" "${backup_target}"
+    : >"${backup_target}.present"
+  elif [[ ! -e "${target}" ]]; then
+    : >"${backup_target}.absent"
+  else
+    die "managed receiver runtime target is not a file: ${target}"
+  fi
+done
+staged_runtime_modules=()
+for relative in "${runtime_modules[@]}"; do
+  staged_runtime_modules+=("${stage}/${relative}")
+done
+python3 - "${staged_runtime_modules[@]}" <<'PY'
+import pathlib, sys
+for name in sys.argv[1:]:
+    compile(pathlib.Path(name).read_text(encoding="utf-8"), name, "exec")
+PY
+runtime_swapped=1
+for relative in "${runtime_modules[@]}"; do
+  target="${runtime_root}/${relative}"
+  install -d -o root -g root -m 0755 "$(dirname "${target}")"
+  install -o root -g root -m 0644 "${stage}/${relative}" "${target}.new.$$"
+  mv -f -- "${target}.new.$$" "${target}"
+done
 
 ensure_user_units_active() {
   local service_user="${HERMES_FABRIC_SERVICE_USER:-hermes}"
@@ -144,23 +374,59 @@ ensure_user_units_active() {
 case "${role}" in
   dbb3)
     bash "${stage}/deploy/dbb3/install-dbb3-cloud-connector-user.sh" \
-      "${stage}/deploy/dbb3/dbb3_cloud_connector.py"
-    systemctl enable --now hermes-managed-installation-receiver.service
-    systemctl is-active --quiet hermes-managed-installation-receiver.service \
-      || die "DBB3 managed installation receiver is not active"
+      "${stage}/deploy/dbb3/dbb3_cloud_connector.py" \
+      "--handle-file=${connector_handle}"
+    connector_installed=1
+    [[ "${HERMES_FABRIC_FAILPOINT:-}" != after-connector ]] \
+      || die "injected fabric failure after connector"
+    bash "${stage}/deploy/recovery/install-dbb3-managed-installation-receiver.sh" \
+      "${stage}" "--handle-file=${receiver_handle}"
+    receiver_installed=1
     ;;
   wsl)
-    bash "${stage}/deploy/pc/install-pc-cloud-connector-user.sh"
-    ensure_user_units_active \
-      hermes-wsl-managed-installation-receiver.service \
-      hermes-wsl-managed-installation-tunnel.service
+    bash "${stage}/deploy/pc/install-pc-cloud-connector-user.sh" \
+      "--handle-file=${connector_handle}"
+    connector_installed=1
+    [[ "${HERMES_FABRIC_FAILPOINT:-}" != after-connector ]] \
+      || die "injected fabric failure after connector"
+    wsl_secret_stage="${stage}/wsl-secrets"
+    install -d -o root -g root -m 0700 "${wsl_secret_stage}"
+    wsl_installation_token="${HERMES_WSL_INSTALLATION_TOKEN_FILE:-/etc/pc-team/managed-installation-token}"
+    wsl_installation_key="${HERMES_WSL_INSTALLATION_KEY_FILE:-${wsl_user_home:-}/.ssh/aliyun_hermes_ed25519}"
+    if [[ "${allow_test_paths}" != 1 ]]; then
+      [[ "${wsl_installation_token}" == /etc/pc-team/managed-installation-token ]] \
+        || die "WSL installation token override is not allowed"
+      [[ -z "${HERMES_WSL_INSTALLATION_KEY_FILE:-}" ]] \
+        || die "WSL installation key override is not allowed"
+    fi
+    [[ -f "${wsl_installation_token}" && ! -L "${wsl_installation_token}" ]] \
+      || die "WSL managed installation token is missing or unsafe"
+    install -o root -g root -m 0600 \
+      "${wsl_installation_token}" "${wsl_secret_stage}/installation-token"
+    wsl_receiver_user="${HERMES_FABRIC_SERVICE_USER:-hermes}"
+    wsl_user_home="$(getent passwd "${wsl_receiver_user}" | cut -d: -f6)"
+    if [[ -z "${HERMES_WSL_INSTALLATION_KEY_FILE:-}" ]]; then
+      wsl_installation_key="${wsl_user_home}/.ssh/aliyun_hermes_ed25519"
+    fi
+    [[ -f "${wsl_installation_key}" && ! -L "${wsl_installation_key}" ]] \
+      || die "WSL managed installation key is missing or unsafe"
+    install -o root -g root -m 0600 \
+      "${wsl_installation_key}" "${wsl_secret_stage}/installation-key"
+    bash "${stage}/deploy/recovery/install-wsl-managed-installation.sh" \
+      "${stage}" "${wsl_secret_stage}/installation-token" \
+      "${wsl_secret_stage}/installation-key" \
+      "--handle-file=${receiver_handle}"
+    receiver_installed=1
     ;;
 esac
+[[ "${HERMES_FABRIC_FAILPOINT:-}" != after-receiver ]] \
+  || die "injected fabric failure after receiver"
 
 # A fabric release also advances the updater itself. Install only the three
 # root-owned automation assets from the ancestry-verified snapshot; the
 # running shell keeps its open script while the next timer invocation uses the
 # new implementation.
+automation_swapped=1
 install -o root -g root -m 0755 \
   "${stage}/deploy/automation/update-fabric-node.sh" \
   "${automation_script_temp}"
@@ -171,15 +437,44 @@ install -o root -g root -m 0644 \
   "${stage}/deploy/automation/hermes-fabric-update.timer" \
   "${automation_timer_temp}"
 mv -f -- "${automation_script_temp}" \
-  /usr/local/lib/hermes-agent/update-fabric-node.sh
+  "${automation_script_target}"
 mv -f -- "${automation_service_temp}" \
-  /etc/systemd/system/hermes-fabric-update.service
+  "${automation_service_target}"
 mv -f -- "${automation_timer_temp}" \
-  /etc/systemd/system/hermes-fabric-update.timer
+  "${automation_timer_target}"
 systemctl daemon-reload
 systemctl enable --now hermes-fabric-update.timer
+[[ "${HERMES_FABRIC_FAILPOINT:-}" != after-automation ]] \
+  || die "injected fabric failure after automation"
 
+release_evidence_temp="${release_evidence_file}.new.$$"
+python3 - "${release_evidence_temp}" "${role}" "${release_commit}" "${release_version}" <<'PY'
+import json, pathlib, sys
+payload = {
+    "schema": "hermes.fabric-release.v1",
+    "node_id": sys.argv[2],
+    "commit": sys.argv[3],
+    "version": sys.argv[4],
+}
+pathlib.Path(sys.argv[1]).write_text(
+    json.dumps(payload, sort_keys=True, ensure_ascii=True) + "\n",
+    encoding="utf-8",
+)
+PY
+chmod 0644 "${release_evidence_temp}"
+if [[ -f "${release_evidence_file}" && ! -L "${release_evidence_file}" ]]; then
+  cp -a -- "${release_evidence_file}" "${stage}/previous-release-evidence.json"
+  : >"${stage}/previous-release-evidence.present"
+elif [[ -e "${release_evidence_file}" || -L "${release_evidence_file}" ]]; then
+  die "fabric release evidence target is unsafe"
+fi
+mv -f -- "${release_evidence_temp}" "${release_evidence_file}"
+evidence_published=1
+[[ "${HERMES_FABRIC_FAILPOINT:-}" != after-evidence ]] \
+  || die "injected fabric failure after evidence"
 printf '%s\n' "${release_commit}" >"${deployed_file}.new.$$"
 chmod 0600 "${deployed_file}.new.$$"
 mv -f -- "${deployed_file}.new.$$" "${deployed_file}"
-printf 'role=%s\ncommit=%s\nstate=updated\n' "${role}" "${release_commit}"
+transaction_committed=1
+printf 'role=%s\ncommit=%s\nversion=%s\nstate=updated\n' \
+  "${role}" "${release_commit}" "${release_version}"

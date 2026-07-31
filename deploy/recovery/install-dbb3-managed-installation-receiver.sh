@@ -6,6 +6,15 @@ die() { printf 'install-dbb3-managed-installation-receiver: %s\n' "$*" >&2; exit
 [[ "$(id -u)" == 0 ]] || die "must run as root"
 
 repo="${1:-$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)}"
+control_request="${2:-}"
+handle_file=""
+if [[ "${control_request}" == --handle-file=* ]]; then
+  handle_file="${control_request#--handle-file=}"
+  control_request=""
+  [[ "${handle_file}" == /* && ! -L "${handle_file}" ]] \
+    || die "rollback handle path must be an absolute non-symlink path"
+  install -d -o root -g root -m 0700 "$(dirname "${handle_file}")"
+fi
 runtime_root="${HERMES_DBB3_AGENT_ROOT:-/usr/local/lib/hermes-agent}"
 runtime_python="${HERMES_DBB3_RUNTIME_PYTHON:-${runtime_root}/venv/bin/python}"
 receiver_user="${HERMES_DBB3_RECEIVER_USER:-hermes}"
@@ -68,7 +77,13 @@ fi
 
 backup_root="${HERMES_INSTALLATION_BACKUP_ROOT:-/var/backups/hermes-agent}"
 install -d -o root -g root -m 0700 "${backup_root}"
-backup="$(mktemp -d "${backup_root}/dbb3-installation-receiver.XXXXXX")"
+if [[ "${control_request}" == --rollback-backup=* ]]; then
+  backup="${control_request#--rollback-backup=}"
+elif [[ -n "${control_request}" ]]; then
+  die "unsupported receiver control request"
+else
+  backup="$(mktemp -d "${backup_root}/dbb3-installation-receiver.XXXXXX")"
+fi
 backup_one() {
   local current="$1" name="$2"
   [[ ! -L "${current}" ]] || die "refusing to replace symlink ${current}"
@@ -93,13 +108,42 @@ restore_one() {
     return 1
   fi
 }
-backup_one "${config_target}" managed-installations.json
-backup_one "${unit_target}" hermes-managed-installation-receiver.service
-
 unit_was_active=0
 unit_was_enabled=0
 systemctl is-active --quiet "${unit_name}" && unit_was_active=1
 systemctl is-enabled --quiet "${unit_name}" && unit_was_enabled=1
+if [[ "${control_request}" == --rollback-backup=* ]]; then
+  canonical_backup="$(realpath -e -- "${backup}")" \
+    || die "receiver rollback backup does not exist"
+  canonical_root="$(realpath -e -- "${backup_root}")"
+  [[ "${canonical_backup}" == "${canonical_root}"/dbb3-installation-receiver.* ]] \
+    || die "receiver rollback backup is outside the managed backup root"
+  backup="${canonical_backup}"
+  [[ -f "${backup}/transaction-state" && ! -L "${backup}/transaction-state" ]] \
+    || die "receiver rollback transaction state is missing"
+  saved_state="$(cat -- "${backup}/transaction-state")"
+  [[ "${saved_state}" =~ ^[01]:[01]$ ]] \
+    || die "receiver rollback transaction state is invalid"
+  IFS=: read -r unit_was_active unit_was_enabled <<<"${saved_state}"
+  systemctl disable --now "${unit_name}" >/dev/null 2>&1 || true
+  restore_one "${config_target}" managed-installations.json
+  restore_one "${unit_target}" hermes-managed-installation-receiver.service
+  systemctl daemon-reload
+  (( unit_was_enabled == 0 )) || systemctl enable "${unit_name}"
+  (( unit_was_active == 0 )) || systemctl start "${unit_name}"
+  printf 'rolled_back=%s\n' "${backup}"
+  exit 0
+fi
+backup_one "${config_target}" managed-installations.json
+backup_one "${unit_target}" hermes-managed-installation-receiver.service
+printf '%s:%s\n' "${unit_was_active}" "${unit_was_enabled}" \
+  >"${backup}/transaction-state"
+chmod 0600 "${backup}/transaction-state"
+if [[ -n "${handle_file}" ]]; then
+  printf '%s\n' "${backup}" >"${handle_file}.new.$$"
+  chmod 0600 "${handle_file}.new.$$"
+  mv -f -- "${handle_file}.new.$$" "${handle_file}"
+fi
 transaction_started=0
 transaction_committed=0
 rollback_failed=0

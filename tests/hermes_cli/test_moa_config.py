@@ -461,3 +461,58 @@ def test_validate_moa_payload_rejects_non_dict():
     assert validate_moa_payload(None)
     assert validate_moa_payload([1, 2])
     assert validate_moa_payload({"presets": {"p": "not-a-dict"}})
+
+
+@pytest.mark.parametrize("name", ["", "   ", " padded", "padded "])
+def test_validate_moa_payload_rejects_lossy_preset_names(name):
+    from hermes_cli.moa_config import validate_moa_payload
+
+    assert validate_moa_payload({"presets": {name: _valid_preset_payload()}})
+
+
+def test_validate_moa_payload_rejects_trimmed_name_collisions():
+    from hermes_cli.moa_config import validate_moa_payload
+
+    problems = validate_moa_payload(
+        {
+            "presets": {
+                "same": _valid_preset_payload(),
+                " same ": _valid_preset_payload(),
+            }
+        }
+    )
+    assert any("collides" in problem for problem in problems)
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("reference_temperature", float("nan")),
+        ("aggregator_temperature", float("inf")),
+        ("max_tokens", -1),
+        ("reference_max_tokens", 0),
+    ],
+)
+def test_validate_moa_payload_rejects_unsafe_scalars(field, value):
+    from hermes_cli.moa_config import validate_moa_payload
+
+    preset = _valid_preset_payload()
+    preset[field] = value
+    assert validate_moa_payload({"presets": {"default": preset}})
+
+
+def test_normalize_moa_config_repairs_unsafe_scalars():
+    preset = _valid_preset_payload()
+    preset.update(
+        reference_temperature=float("nan"),
+        aggregator_temperature=float("inf"),
+        max_tokens=-1,
+        reference_max_tokens=float("inf"),
+    )
+
+    normalized = normalize_moa_config({"presets": {"default": preset}})
+    saved = normalized["presets"]["default"]
+    assert saved["reference_temperature"] is None
+    assert saved["aggregator_temperature"] is None
+    assert saved["max_tokens"] == 4096
+    assert saved["reference_max_tokens"] is None

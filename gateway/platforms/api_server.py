@@ -43,6 +43,7 @@ import asyncio
 import errno
 import hashlib
 import json
+import math
 from contextlib import contextmanager, nullcontext
 from contextvars import ContextVar
 from functools import wraps
@@ -51,6 +52,7 @@ import os
 import re
 import sqlite3
 import sys
+import threading
 import time
 import uuid
 from pathlib import Path
@@ -426,6 +428,7 @@ class ResponseStore:
 
     def __init__(self, max_size: int = MAX_STORED_RESPONSES, db_path: str = None):
         self._max_size = max_size
+        self._access_clock_lock = threading.Lock()
         if db_path is None:
             try:
                 from hermes_runtime.config import get_hermes_home
@@ -458,12 +461,27 @@ class ResponseStore:
             )"""
         )
         self._conn.commit()
+        row = self._conn.execute(
+            "SELECT MAX(accessed_at) FROM responses"
+        ).fetchone()
+        self._last_accessed_at = (
+            float(row[0]) if row and row[0] is not None else float("-inf")
+        )
         # response_store.db contains conversation history (tool payloads,
         # prompts, results). Tighten to owner-only after creation so other
         # local users on a shared box can't read it. Run once at __init__
         # rather than after every commit — chmod-on-every-write is wasted
         # syscalls on a hot path.
         self._tighten_file_permissions()
+
+    def _next_accessed_at(self) -> float:
+        """Return a strictly increasing LRU stamp even on coarse clocks."""
+        with self._access_clock_lock:
+            stamp = time.time()
+            if stamp <= self._last_accessed_at:
+                stamp = math.nextafter(self._last_accessed_at, math.inf)
+            self._last_accessed_at = stamp
+            return stamp
 
     def _tighten_file_permissions(self) -> None:
         """Force owner-only permissions on the DB and SQLite sidecars."""
@@ -493,7 +511,7 @@ class ResponseStore:
             return None
         self._conn.execute(
             "UPDATE responses SET accessed_at = ? WHERE response_id = ?",
-            (time.time(), response_id),
+            (self._next_accessed_at(), response_id),
         )
         self._conn.commit()
         try:
@@ -514,7 +532,7 @@ class ResponseStore:
         """Store a response, evicting the oldest if at capacity."""
         self._conn.execute(
             "INSERT OR REPLACE INTO responses (response_id, data, accessed_at) VALUES (?, ?, ?)",
-            (response_id, json.dumps(data, default=str), time.time()),
+            (response_id, json.dumps(data, default=str), self._next_accessed_at()),
         )
         # Evict oldest entries beyond max_size
         count = self._conn.execute("SELECT COUNT(*) FROM responses").fetchone()[0]
@@ -799,7 +817,7 @@ class _IdempotencyCache:
     def __init__(self, max_items: int = 1000, ttl_seconds: int = 300):
         from collections import OrderedDict
         self._store = OrderedDict()
-        self._inflight: Dict[tuple[str, str], "asyncio.Task[Any]"] = {}
+        self._inflight: Dict[tuple[Any, ...], "asyncio.Task[Any]"] = {}
         self._ttl = ttl_seconds
         self._max = max_items
 
@@ -811,19 +829,32 @@ class _IdempotencyCache:
         while len(self._store) > self._max:
             self._store.popitem(last=False)
 
-    async def get_or_set(self, key: str, fingerprint: str, compute_coro):
+    async def get_or_set(
+        self,
+        key: str,
+        fingerprint: str,
+        compute_coro,
+        *,
+        namespace: tuple[str, ...] = (),
+    ):
         self._purge()
-        item = self._store.get(key)
+        scoped_key = (namespace, key)
+        item = self._store.get(scoped_key)
         if item and item["fp"] == fingerprint:
             return item["resp"]
 
-        inflight_key = (key, fingerprint)
+        inflight_key = (namespace, key, fingerprint)
         task = self._inflight.get(inflight_key)
         if task is None:
             async def _compute_and_store():
                 resp = await compute_coro()
                 import time as _t
-                self._store[key] = {"resp": resp, "fp": fingerprint, "ts": _t.time()}
+                self._store[scoped_key] = {
+                    "resp": resp,
+                    "fp": fingerprint,
+                    "ts": _t.time(),
+                }
+                self._store.move_to_end(scoped_key)
                 self._purge()
                 return resp
 
@@ -839,13 +870,33 @@ class _IdempotencyCache:
         return await asyncio.shield(task)
 
 
-_idem_cache = _IdempotencyCache()
+def _make_request_fingerprint(body: Dict[str, Any]) -> str:
+    canonical = json.dumps(
+        body,
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+    return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
 
 
-def _make_request_fingerprint(body: Dict[str, Any], keys: List[str]) -> str:
-    from hashlib import sha256
-    subset = {k: body.get(k) for k in keys}
-    return sha256(repr(subset).encode("utf-8")).hexdigest()
+def _idempotency_namespace(
+    request: "web.Request",
+    *,
+    endpoint: str,
+    gateway_session_key: Optional[str] = None,
+    session_id: Optional[str] = None,
+) -> tuple[str, ...]:
+    """Scope a client key to the request identity that can affect execution."""
+    authorization = request.headers.get("Authorization", "")
+    auth_digest = hashlib.sha256(authorization.encode("utf-8")).hexdigest()
+    return (
+        endpoint,
+        _api_request_profile.get() or "<default>",
+        auth_digest,
+        gateway_session_key or "",
+        session_id or "",
+    )
 
 
 def _derive_chat_session_id(
@@ -979,6 +1030,9 @@ class APIServerAdapter(BasePlatformAdapter):
         self._app: Optional["web.Application"] = None
         self._runner: Optional["web.AppRunner"] = None
         self._site: Optional["web.TCPSite"] = None
+        # Idempotency is adapter-local so listeners with different bearer
+        # credentials can never replay one another's cached responses.
+        self._idempotency_cache = _IdempotencyCache()
         self._response_store = ResponseStore()
         # Active run streams: run_id -> asyncio.Queue of SSE event dicts
         self._run_streams: Dict[str, "asyncio.Queue[Optional[Dict]]"] = {}
@@ -2866,9 +2920,20 @@ class APIServerAdapter(BasePlatformAdapter):
 
         idempotency_key = request.headers.get("Idempotency-Key")
         if idempotency_key:
-            fp = _make_request_fingerprint(body, keys=["model", "messages", "tools", "tool_choice", "stream"])
+            fp = _make_request_fingerprint(body)
+            namespace = _idempotency_namespace(
+                request,
+                endpoint="chat.completions",
+                gateway_session_key=gateway_session_key,
+                session_id=session_id,
+            )
             try:
-                result, usage = await _idem_cache.get_or_set(idempotency_key, fp, _compute_completion)
+                result, usage = await self._idempotency_cache.get_or_set(
+                    idempotency_key,
+                    fp,
+                    _compute_completion,
+                    namespace=namespace,
+                )
             except Exception as e:
                 logger.error("Error running agent for chat completions: %s", e, exc_info=True)
                 return web.json_response(
@@ -3964,12 +4029,27 @@ class APIServerAdapter(BasePlatformAdapter):
 
         idempotency_key = request.headers.get("Idempotency-Key")
         if idempotency_key:
-            fp = _make_request_fingerprint(
-                body,
-                keys=["input", "instructions", "previous_response_id", "conversation", "model", "tools"],
+            fp = _make_request_fingerprint(body)
+            namespace = _idempotency_namespace(
+                request,
+                endpoint="responses",
+                gateway_session_key=gateway_session_key,
+                # A generated session id changes on every retry. Only a stored
+                # continuation id is stable enough to participate in the key.
+                session_id=stored_session_id,
             )
+
+            async def _compute_idempotent_response():
+                result, usage = await _compute_response()
+                return result, usage, session_id
+
             try:
-                result, usage = await _idem_cache.get_or_set(idempotency_key, fp, _compute_response)
+                result, usage, session_id = await self._idempotency_cache.get_or_set(
+                    idempotency_key,
+                    fp,
+                    _compute_idempotent_response,
+                    namespace=namespace,
+                )
             except Exception as e:
                 logger.error("Error running agent for responses: %s", e, exc_info=True)
                 return web.json_response(
@@ -4350,6 +4430,7 @@ class APIServerAdapter(BasePlatformAdapter):
                 return await asyncio.to_thread(
                     provider.fire_due,
                     command.job_id,
+                    fire_at=command.fire_at,
                     adapters=None,
                     loop=loop,
                 )

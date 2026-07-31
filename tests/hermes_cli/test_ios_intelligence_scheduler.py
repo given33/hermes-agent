@@ -1582,6 +1582,67 @@ def test_plugin_lifespan_wires_real_weather_route_and_mcp_runtime(monkeypatch, t
     assert runtime_captured["db_dir"] == store.path
 
 
+def test_plugin_lifespan_cleans_partially_started_runtime_on_startup_failure(
+    monkeypatch, tmp_path
+):
+    plugin_path = (
+        Path(__file__).resolve().parents[2]
+        / "plugins"
+        / "ios-intelligence"
+        / "dashboard"
+        / "plugin_api.py"
+    )
+    spec = importlib.util.spec_from_file_location(
+        "test_ios_intelligence_startup_failure_plugin", plugin_path
+    )
+    assert spec and spec.loader
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    store = type("Store", (), {"path": tmp_path / "ios-intelligence.db"})()
+    stopped: list[str] = []
+
+    class FakeScheduler:
+        def __init__(self, **_kwargs):
+            pass
+
+        def start(self):
+            pass
+
+        def stop(self):
+            stopped.append("scheduler")
+
+    class FailingRuntime:
+        supervisor = object()
+
+        def __init__(self, **_kwargs):
+            pass
+
+        def start_async(self):
+            raise RuntimeError("injected MCP startup failure")
+
+        def stop(self):
+            stopped.append("runtime")
+
+    monkeypatch.setattr(module, "intelligence_store", lambda: store)
+    monkeypatch.setattr(module, "QWeatherClient", lambda *_args, **_kwargs: object())
+    monkeypatch.setattr(module, "AMapClient", lambda **_kwargs: object())
+    monkeypatch.setattr(module, "IOSIntelligenceScheduler", FakeScheduler)
+    monkeypatch.setattr(module, "IOSMCPRuntimeSupervisor", FailingRuntime)
+
+    import asyncio
+
+    async def exercise():
+        with pytest.raises(RuntimeError, match="injected MCP startup failure"):
+            async with module.ios_intelligence_lifespan(None):
+                pytest.fail("startup failure must prevent lifespan entry")
+
+    asyncio.run(exercise())
+    assert stopped == ["scheduler", "runtime"]
+    assert module._SCHEDULER is None
+    assert module._MCP_RUNTIME is None
+    assert module._MCP_STARTUP_THREAD is None
+
+
 def test_plugin_lifespan_starts_only_deletion_recovery_when_profile_disabled(monkeypatch, tmp_path):
     plugin_path = (
         Path(__file__).resolve().parents[2]

@@ -115,11 +115,13 @@ def test_deployment_shell_scripts_have_valid_syntax():
         PUBLIC / "test-install-collaboration-backend.sh",
         PUBLIC / "deploy-collaboration-backend.sh",
         PUBLIC / "configure-connector-credential.sh",
+        PUBLIC / "verify-fabric-release.sh",
         RECOVERY / "install-dbb3-managed-installation-receiver.sh",
         RECOVERY / "install-wsl-managed-installation.sh",
         RECOVERY / "configure-main-managed-installation-ssh.sh",
         AUTOMATION / "install-fabric-auto-update.sh",
         AUTOMATION / "update-fabric-node.sh",
+        AUTOMATION / "test-update-fabric-node.sh",
     ):
         if os.name == "nt":
             wsl = shutil.which("wsl.exe")
@@ -165,8 +167,10 @@ def test_three_endpoint_updates_follow_only_a_committed_main_release():
     assert "refs/remotes/origin/main" in updater
     archive = updater.index('archive --format=tar "${release_commit}"')
     readable_stage = updater.index('chmod -R a+rX "${stage}"')
+    install_dispatch = updater.index('case "${role}" in', archive)
     node_install = updater.index(
-        'bash "${stage}/deploy/dbb3/install-dbb3-cloud-connector-user.sh"'
+        'bash "${stage}/deploy/dbb3/install-dbb3-cloud-connector-user.sh"',
+        install_dispatch,
     )
     assert archive < readable_stage < node_install
     assert '-- "${archive_paths[@]}"' in updater
@@ -181,9 +185,13 @@ def test_three_endpoint_updates_follow_only_a_committed_main_release():
         "deploy/pc/pc-cloud-connector.service",
     ):
         assert f'"{relative}"' in updater
-    assert "systemctl enable --now hermes-managed-installation-receiver.service" in updater
-    assert "hermes-wsl-managed-installation-receiver.service" in updater
-    assert "hermes-wsl-managed-installation-tunnel.service" in updater
+    assert (
+        'bash "${stage}/deploy/recovery/install-dbb3-managed-installation-receiver.sh"'
+        in updater
+    )
+    assert 'bash "${stage}/deploy/recovery/install-wsl-managed-installation.sh"' in updater
+    assert '"hermes_cli/managed_node_recovery_service.py"' in updater
+    assert "hermes.fabric-release.v1" in updater
     updater_refresh = updater.index(
         '"${stage}/deploy/automation/update-fabric-node.sh"'
     )
@@ -203,7 +211,7 @@ def test_three_endpoint_updates_follow_only_a_committed_main_release():
     assert "systemctl enable --now hermes-fabric-update.timer" in bootstrap
     assert "initial_state=pending" in bootstrap
     assert (
-        "install -d -o root -g root -m 0700 /var/lib/hermes-agent-fabric-update"
+        "install -d -o root -g root -m 0755 /var/lib/hermes-agent-fabric-update"
         in bootstrap
     )
     assert "Persistent=true" in timer
@@ -227,6 +235,28 @@ def test_three_endpoint_updates_follow_only_a_committed_main_release():
     assert "HERMES_SSH_KNOWN_HOSTS" in workflow
     assert "HERMES_SSH_KNOWN_HOSTS" in deployer
     assert "StrictHostKeyChecking=yes" in deployer
+
+
+def test_fabric_updater_transaction_and_rollback_behavior():
+    harness = AUTOMATION / "test-update-fabric-node.sh"
+    if os.name == "nt":
+        wsl = shutil.which("wsl.exe")
+        if not wsl:
+            return
+        command = [wsl, "sudo", "-n", "bash", _posix_path(harness)]
+    elif os.geteuid() == 0:
+        command = ["bash", str(harness)]
+    elif subprocess.run(
+        ["sudo", "-n", "true"], capture_output=True, check=False
+    ).returncode == 0:
+        command = ["sudo", "-n", "bash", str(harness)]
+    else:
+        return
+    result = subprocess.run(
+        command, capture_output=True, text=True, check=False, timeout=60
+    )
+    assert result.returncode == 0, result.stdout + "\n" + result.stderr
+    assert "fabric updater transaction harness passed" in result.stdout
 
 
 def test_public_release_contains_the_complete_application_service_layer():

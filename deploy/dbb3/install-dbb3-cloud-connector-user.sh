@@ -27,6 +27,15 @@ chmod 0600 "${install_lock}"
 flock -n 8 || die "another connector deployment is already running"
 
 source_file="${1:-$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/dbb3_cloud_connector.py}"
+control_request="${2:-}"
+handle_file=""
+if [[ "${control_request}" == --handle-file=* ]]; then
+  handle_file="${control_request#--handle-file=}"
+  control_request=""
+  [[ "${handle_file}" == /* && ! -L "${handle_file}" ]] \
+    || die "rollback handle path must be an absolute non-symlink path"
+  install -d -o root -g root -m 0700 "$(dirname "${handle_file}")"
+fi
 cloud_url="${HERMES_CLOUD_URL:-https://daxueshenmai.top/api/plugins/collaboration}"
 connector_user="${DBB3_CONNECTOR_USER:-hermes}"
 token_file="${HERMES_CLOUD_TOKEN_FILE:-/etc/dbb3-team/cloud_connector_token}"
@@ -35,12 +44,15 @@ target="${DBB3_CONNECTOR_SOURCE_TARGET:-/opt/dbb3-team/dbb3_cloud_connector.py}"
 unit_name="${HERMES_CONNECTOR_UNIT_NAME:-dbb3-cloud-connector.service}"
 unit_template="${DBB3_CONNECTOR_UNIT_TEMPLATE:-$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/dbb3-cloud-connector.service}"
 
-[[ -f "${source_file}" && ! -L "${source_file}" ]] || die "connector source is missing or a symlink"
-[[ -f "${unit_template}" && ! -L "${unit_template}" ]] || die "user unit template is missing"
+if [[ "${control_request}" != --rollback-backup=* ]]; then
+  [[ -f "${source_file}" && ! -L "${source_file}" ]] || die "connector source is missing or a symlink"
+  [[ -f "${unit_template}" && ! -L "${unit_template}" ]] || die "user unit template is missing"
+fi
 id "${connector_user}" >/dev/null 2>&1 || die "connector user does not exist"
 [[ -r "${token_file}" ]] || die "connector user cannot read token file ${token_file}"
 runuser -u "${connector_user}" -- test -r "${token_file}" || die "connector token is not readable by ${connector_user}"
 
+if [[ "${control_request}" != --rollback-backup=* ]]; then
 python3 - "${source_file}" <<'PY'
 import pathlib, sys
 compile(pathlib.Path(sys.argv[1]).read_text(encoding="utf-8"), sys.argv[1], "exec")
@@ -55,6 +67,7 @@ runuser -u "${connector_user}" -- env \
   DBB3_CONNECTOR_ID="${connector_id}" \
   python3 "${source_file}" --probe >/dev/null \
   || die "connector health/contract preflight failed; no service changes were made"
+fi
 
 user_home="$(getent passwd "${connector_user}" | cut -d: -f6)"
 [[ -n "${user_home}" && -d "${user_home}" ]] || die "cannot resolve ${connector_user} home"
@@ -65,12 +78,20 @@ env_file="${config_dir}/cloud_connector.env"
 unit_file="${unit_dir}/${unit_name}"
 backup_root="${DBB3_CONNECTOR_BACKUP_ROOT:-/opt/dbb3-team/backups}"
 stamp="$(date +%Y%m%d-%H%M%S)"
-backup="${backup_root}/${stamp}-$$"
+if [[ "${control_request}" == --rollback-backup=* ]]; then
+  backup="${control_request#--rollback-backup=}"
+elif [[ -n "${control_request}" ]]; then
+  die "unsupported connector control request"
+else
+  backup="${backup_root}/${stamp}-$$"
+fi
 
 install -d -o root -g root -m 0755 "$(dirname "${target}")"
 install -d -o "${connector_user}" -g "${connector_user}" -m 0700 \
   "${config_dir}" "${state_dir}" "${unit_dir}"
-install -d -o root -g root -m 0700 "${backup}"
+if [[ "${control_request}" != --rollback-backup=* ]]; then
+  install -d -o root -g root -m 0700 "${backup}"
+fi
 
 backup_one() {
   local current="$1"
@@ -93,19 +114,24 @@ restore_one() {
   if [[ -f "${backup}/${name}.present" ]]; then
     cp -a -- "${backup}/${name}" "${rollback_tmp}"
     mv -f -- "${rollback_tmp}" "${current}"
-  else
+  elif [[ -f "${backup}/${name}.absent" ]]; then
     rm -f -- "${current}"
+  else
+    return 1
   fi
 }
 
-backup_one "${target}" "dbb3_cloud_connector.py"
-backup_one "${env_file}" "cloud_connector.env"
-backup_one "${unit_file}" "dbb3-cloud-connector.service"
+if [[ "${control_request}" != --rollback-backup=* ]]; then
+  backup_one "${target}" "dbb3_cloud_connector.py"
+  backup_one "${env_file}" "cloud_connector.env"
+  backup_one "${unit_file}" "dbb3-cloud-connector.service"
+fi
 
 source_tmp="${target}.new.$$"
 env_tmp="${env_file}.new.$$"
 unit_tmp="${unit_file}.new.$$"
 rm -f -- "${source_tmp}" "${env_tmp}" "${unit_tmp}"
+if [[ "${control_request}" != --rollback-backup=* ]]; then
 install -o root -g "${connector_user}" -m 0750 "${source_file}" "${source_tmp}"
 cat >"${env_tmp}" <<EOF
 HERMES_CLOUD_URL=${cloud_url}
@@ -120,6 +146,7 @@ fi
 chown "${connector_user}:${connector_user}" "${env_tmp}"
 chmod 0600 "${env_tmp}"
 install -o "${connector_user}" -g "${connector_user}" -m 0644 "${unit_template}" "${unit_tmp}"
+fi
 
 uid="$(id -u "${connector_user}")"
 runtime="/run/user/${uid}"
@@ -195,6 +222,46 @@ restore_service_state() {
     systemctl start "${unit_name}" >/dev/null 2>&1 || rollback_failed=1
   fi
 }
+
+if [[ "${control_request}" == --rollback-backup=* ]]; then
+  canonical_backup="$(realpath -e -- "${backup}")" \
+    || die "connector rollback backup does not exist"
+  canonical_root="$(realpath -e -- "${backup_root}")"
+  [[ "${canonical_backup}" == "${canonical_root}"/* ]] \
+    || die "connector rollback backup is outside the managed backup root"
+  backup="${canonical_backup}"
+  [[ -f "${backup}/transaction-state" && ! -L "${backup}/transaction-state" ]] \
+    || die "connector rollback transaction state is missing"
+  saved_state="$(cat -- "${backup}/transaction-state")"
+  [[ "${saved_state}" =~ ^[01]:[01]:[01]:[01]:[01]:[01]$ ]] \
+    || die "connector rollback transaction state is invalid"
+  IFS=: read -r root_was_active root_was_enabled user_was_active \
+    user_was_enabled user_unit_was_present linger_was_enabled <<<"${saved_state}"
+  rollback_failed=0
+  stop_deployed_services
+  restore_one "${target}" "dbb3_cloud_connector.py" || rollback_failed=1
+  restore_one "${env_file}" "cloud_connector.env" || rollback_failed=1
+  restore_one "${unit_file}" "dbb3-cloud-connector.service" || rollback_failed=1
+  restore_service_state
+  if (( ! linger_was_enabled )); then
+    loginctl disable-linger "${connector_user}" >/dev/null 2>&1 || rollback_failed=1
+  fi
+  (( ! rollback_failed )) || die "connector committed rollback was incomplete"
+  printf 'rolled_back=%s\n' "${backup}"
+  exit 0
+fi
+
+printf '%s:%s:%s:%s:%s:%s\n' \
+  "${root_was_active}" "${root_was_enabled}" \
+  "${user_was_active}" "${user_was_enabled}" \
+  "${user_unit_was_present}" "${linger_was_enabled}" \
+  >"${backup}/transaction-state"
+chmod 0600 "${backup}/transaction-state"
+if [[ -n "${handle_file}" ]]; then
+  printf '%s\n' "${backup}" >"${handle_file}.new.$$"
+  chmod 0600 "${handle_file}.new.$$"
+  mv -f -- "${handle_file}.new.$$" "${handle_file}"
+fi
 
 rollback_transaction() {
   local exit_status="$1"

@@ -224,6 +224,29 @@ fi
 target_root="${HERMES_AGENT_ROOT:-/opt/hermes-agent}"
 runtime_python="${HERMES_RUNTIME_PYTHON:-${target_root}/.venv/bin/python}"
 [[ -x "${runtime_python}" ]] || die "Hermes runtime Python is missing: ${runtime_python}"
+journalctl_binary="${HERMES_JOURNALCTL_BINARY:-journalctl}"
+
+emit_service_failure_diagnostics() {
+  printf '%s\n' "service_diagnostics_begin"
+  systemctl show "${service}" --no-pager \
+    --property=ActiveState,SubState,Result,ExecMainCode,ExecMainStatus,NRestarts \
+    2>&1 || true
+  if command -v "${journalctl_binary}" >/dev/null 2>&1; then
+    # Startup logs are the only useful explanation for a service that exits
+    # before binding. Force the central redaction policy because CI logs are
+    # an external boundary and runtime redaction may be operator-disabled.
+    "${journalctl_binary}" --unit "${service}" --since "${service_start_since}" \
+      --no-pager --lines 160 --output=short-iso-precise 2>&1 \
+      | env PYTHONPATH="${target_root}${PYTHONPATH:+:${PYTHONPATH}}" \
+          "${runtime_python}" -c \
+          'import re, sys; from hermes_runtime.redaction import redact_sensitive_text; text = redact_sensitive_text(sys.stdin.read(), force=True, redact_url_credentials=True); text = re.sub(r"(?i)(\b(?:api[_-]?key|access[_-]?token|refresh[_-]?token|token|secret|password|passwd|credential|authorization)\s*[=:]\s*)(?:\"[^\"\n]*\"|\x27[^\x27\n]*\x27|[^\s,;]+)", r"\1[REDACTED]", text); print(text, end="")' \
+      || true
+  else
+    printf 'journal diagnostics unavailable: %s not found\n' \
+      "${journalctl_binary}" >&2
+  fi
+  printf '%s\n' "service_diagnostics_end"
+}
 
 # Copy through a root-owned snapshot. Reading the admin-owned stage through a
 # lower-privileged tar process prevents a symlink swap during privileged copy.
@@ -1383,6 +1406,7 @@ if [[ "${dependency_update_enabled}" == 1 ]]; then
     "${runtime_python}" -c 'from hermes_cli.web_server import app; assert app' \
     || { printf '%s\n' "installed dashboard import preflight failed" >&2; false; }
 fi
+service_start_since="$(date --iso-8601=seconds)"
 systemctl start "${service}"
 
 health_file="$(mktemp /run/hermes-agent-status.XXXXXX)"
@@ -1398,6 +1422,7 @@ for _ in $(seq 1 30); do
 done
 [[ "${healthy}" == 1 ]] || {
   printf '%s\n' "${service} did not pass post-restart health check" >&2
+  emit_service_failure_diagnostics >&2
   false
 }
 "${runtime_python}" - "${health_file}" <<'PY'
@@ -1470,71 +1495,10 @@ release_phase traffic-switch
 nginx_reload_attempted=1
 systemctl reload "${nginx_service}" \
   || { printf '%s\n' "nginx reload failed" >&2; false; }
-installation_health_cfg="$(mktemp /run/hermes-installation-route-health.XXXXXX)"
-chmod 0600 "${installation_health_cfg}"
-printf 'header = "X-DBB3-Token: %s"\nheader = "Accept: application/json"\n' \
-  "$(cat -- "${managed_installation_token_file}")" >"${installation_health_cfg}"
-for node in dbb3 wsl; do
-  node_health="$(mktemp "/run/hermes-installation-${node}.XXXXXX")"
-  route_healthy=0
-  for _ in $(seq 1 30); do
-    if curl --fail --silent --show-error --max-time 5 \
-        --resolve 'daxueshenmai.top:443:127.0.0.1' \
-        --config "${installation_health_cfg}" \
-        "https://daxueshenmai.top/_hermes/installations/${node}/health" \
-        >"${node_health}" \
-      && "${runtime_python}" - "${node_health}" "${node}" <<'PY'
-import json
-import sys
-data = json.load(open(sys.argv[1], encoding="utf-8"))
-assert data.get("ok") is True
-assert data.get("node_id") == sys.argv[2]
-assert data.get("installations") is True
-assert data.get("recovery") is False
-PY
-    then
-      route_healthy=1
-      break
-    fi
-    sleep 1
-  done
-  rm -f -- "${node_health}"
-  [[ "${route_healthy}" == 1 ]] \
-    || { printf 'managed installation route failed: %s\n' "${node}" >&2; false; }
-  installation_probe_id="mi-$(${runtime_python} -c 'import uuid; print(uuid.uuid4().hex)')"
-  installation_probe_body="$(mktemp "/run/hermes-installation-${node}-body.XXXXXX")"
-  installation_probe_post="$(mktemp "/run/hermes-installation-${node}-post.XXXXXX")"
-  installation_probe_get="$(mktemp "/run/hermes-installation-${node}-get.XXXXXX")"
-  printf '{"id":"%s","request_id":"%s","node_id":"%s","kind":"probe","identifier":"managed-installation-route-probe","probe":true}\n' \
-    "${installation_probe_id}" "${installation_probe_id}" "${node}" \
-    >"${installation_probe_body}"
-  curl --fail --silent --show-error --max-time 8 \
-    --resolve 'daxueshenmai.top:443:127.0.0.1' \
-    --config "${installation_health_cfg}" -H 'Content-Type: application/json' \
-    --data-binary "@${installation_probe_body}" -o "${installation_probe_post}" \
-    "https://daxueshenmai.top/_hermes/installations/${node}"
-  curl --fail --silent --show-error --max-time 8 \
-    --resolve 'daxueshenmai.top:443:127.0.0.1' \
-    --config "${installation_health_cfg}" -o "${installation_probe_get}" \
-    "https://daxueshenmai.top/_hermes/installations/${node}/${installation_probe_id}"
-  "${runtime_python}" - \
-    "${installation_probe_post}" "${installation_probe_get}" \
-    "${installation_probe_id}" "${node}" <<'PY'
-import json, sys
-post = json.load(open(sys.argv[1], encoding="utf-8"))
-get = json.load(open(sys.argv[2], encoding="utf-8"))
-assert post.get("accepted") is True and post.get("id") == sys.argv[3]
-assert get.get("id") == sys.argv[3] and get.get("node_id") == sys.argv[4]
-assert get.get("state") == "completed"
-assert (get.get("detail") or {}).get("probe") is True
-assert (get.get("detail") or {}).get("persisted") is True
-PY
-  rm -f -- \
-    "${installation_probe_body}" "${installation_probe_post}" "${installation_probe_get}"
-done
-rm -f -- "${installation_health_cfg}"
 release_phase drain
 release_phase commit
+# Fabric timers consume committed public evidence. Publish the immutable
+# identity before waiting for node routes so stale nodes can begin updating.
 release_evidence_temp="$(mktemp "${release_evidence_dir}/.release-evidence.XXXXXX")"
 "${runtime_python}" - \
   "${release_evidence_temp}" "${version}" "${release_commit}" \
@@ -1580,17 +1544,119 @@ evidence = {
         "database_count": sqlite_manifest.get("database_count"),
         "manifest_sha256": hashlib.sha256(sqlite_manifest_bytes).hexdigest(),
     },
+    "fabric": {"status": "pending", "nodes": {}},
     "probes": {
         "main_api": load(main_health_path),
         "mobile_handshake": load(handshake_path),
         "deployment_health": load(deployment_health_path),
         "connector": load(connector_health_path),
         "ios_runtime": load(ios_health_path),
-        "managed_installation_routes": {"dbb3": True, "wsl": True},
+        "managed_installation_routes": {"dbb3": False, "wsl": False},
         "traffic_switch": {"nginx_reloaded": True},
         "drain": {"previous_service_quiesced": True},
     },
 }
+pathlib.Path(output).write_text(
+    json.dumps(evidence, sort_keys=True, ensure_ascii=True, indent=2) + "\n",
+    encoding="utf-8",
+)
+PY
+install -o root -g root -m 0644 \
+  "${release_evidence_temp}" "${release_evidence_target}.new.$$"
+mv -f -- "${release_evidence_target}.new.$$" "${release_evidence_target}"
+rm -f -- "${release_evidence_temp}"
+release_evidence_temp=""
+installation_health_cfg="$(mktemp /run/hermes-installation-route-health.XXXXXX)"
+chmod 0600 "${installation_health_cfg}"
+printf 'header = "X-DBB3-Token: %s"\nheader = "Accept: application/json"\n' \
+  "$(cat -- "${managed_installation_token_file}")" >"${installation_health_cfg}"
+fabric_health_attempts="${HERMES_FABRIC_HEALTH_ATTEMPTS:-180}"
+[[ "${fabric_health_attempts}" =~ ^[1-9][0-9]*$ ]] \
+  || die "HERMES_FABRIC_HEALTH_ATTEMPTS must be a positive integer"
+for node in dbb3 wsl; do
+  node_health="$(mktemp "/run/hermes-installation-${node}.XXXXXX")"
+  route_healthy=0
+  for _ in $(seq 1 "${fabric_health_attempts}"); do
+    if curl --fail --silent --show-error --max-time 5 \
+        --resolve 'daxueshenmai.top:443:127.0.0.1' \
+        --config "${installation_health_cfg}" \
+        "https://daxueshenmai.top/_hermes/installations/${node}/health" \
+        >"${node_health}" \
+      && "${runtime_python}" - "${node_health}" "${node}" \
+        "${release_commit}" "${version}" <<'PY'
+import json
+import sys
+data = json.load(open(sys.argv[1], encoding="utf-8"))
+assert data.get("ok") is True
+assert data.get("node_id") == sys.argv[2]
+assert data.get("installations") is True
+assert data.get("recovery") is False
+release = data.get("release") or {}
+assert release.get("commit") == sys.argv[3]
+assert release.get("version") == sys.argv[4]
+PY
+    then
+      route_healthy=1
+      break
+    fi
+    sleep 1
+  done
+  rm -f -- "${node_health}"
+  [[ "${route_healthy}" == 1 ]] \
+    || { printf 'managed installation route failed: %s\n' "${node}" >&2; false; }
+  installation_probe_id="mi-$(${runtime_python} -c 'import uuid; print(uuid.uuid4().hex)')"
+  installation_probe_body="$(mktemp "/run/hermes-installation-${node}-body.XXXXXX")"
+  installation_probe_post="$(mktemp "/run/hermes-installation-${node}-post.XXXXXX")"
+  installation_probe_get="$(mktemp "/run/hermes-installation-${node}-get.XXXXXX")"
+  printf '{"id":"%s","request_id":"%s","node_id":"%s","kind":"probe","identifier":"managed-installation-route-probe","probe":true}\n' \
+    "${installation_probe_id}" "${installation_probe_id}" "${node}" \
+    >"${installation_probe_body}"
+  curl --fail --silent --show-error --max-time 8 \
+    --resolve 'daxueshenmai.top:443:127.0.0.1' \
+    --config "${installation_health_cfg}" -H 'Content-Type: application/json' \
+    --data-binary "@${installation_probe_body}" -o "${installation_probe_post}" \
+    "https://daxueshenmai.top/_hermes/installations/${node}"
+  curl --fail --silent --show-error --max-time 8 \
+    --resolve 'daxueshenmai.top:443:127.0.0.1' \
+    --config "${installation_health_cfg}" -o "${installation_probe_get}" \
+    "https://daxueshenmai.top/_hermes/installations/${node}/${installation_probe_id}"
+  "${runtime_python}" - \
+    "${installation_probe_post}" "${installation_probe_get}" \
+    "${installation_probe_id}" "${node}" <<'PY'
+import json, sys
+post = json.load(open(sys.argv[1], encoding="utf-8"))
+get = json.load(open(sys.argv[2], encoding="utf-8"))
+assert post.get("accepted") is True and post.get("id") == sys.argv[3]
+assert get.get("id") == sys.argv[3] and get.get("node_id") == sys.argv[4]
+assert get.get("state") == "completed"
+assert (get.get("detail") or {}).get("probe") is True
+assert (get.get("detail") or {}).get("persisted") is True
+PY
+  rm -f -- \
+    "${installation_probe_body}" "${installation_probe_post}" "${installation_probe_get}"
+done
+rm -f -- "${installation_health_cfg}"
+release_evidence_temp="$(mktemp "${release_evidence_dir}/.release-evidence.XXXXXX")"
+"${runtime_python}" - "${release_evidence_target}" \
+  "${release_evidence_temp}" "${version}" "${release_commit}" <<'PY'
+from datetime import datetime, timezone
+import json
+import pathlib
+import sys
+
+source, output, version, commit = sys.argv[1:]
+evidence = json.loads(pathlib.Path(source).read_text(encoding="utf-8"))
+if evidence.get("version") != version or evidence.get("commit") != commit:
+    raise RuntimeError("release evidence identity changed during fabric verification")
+evidence["fabric"] = {
+    "status": "verified",
+    "verified_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+    "nodes": {
+        "dbb3": {"commit": commit, "version": version},
+        "wsl": {"commit": commit, "version": version},
+    },
+}
+evidence["probes"]["managed_installation_routes"] = {"dbb3": True, "wsl": True}
 pathlib.Path(output).write_text(
     json.dumps(evidence, sort_keys=True, ensure_ascii=True, indent=2) + "\n",
     encoding="utf-8",

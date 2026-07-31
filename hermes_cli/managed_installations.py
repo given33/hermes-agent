@@ -2985,17 +2985,26 @@ def load_managed_installation_receiver_config(
         raise ValueError("installation_receiver requires token_file")
     state_file = str(raw.get("state_file") or "managed-installations.db").strip()
     project_root = str(raw.get("project_root") or "managed-projects").strip()
+    release_evidence_file = str(raw.get("release_evidence_file") or "").strip()
     state_path = Path(state_file)
     root_path = Path(project_root)
     if not state_path.is_absolute():
         state_path = config_path.parent / state_path
     if not root_path.is_absolute():
         root_path = config_path.parent / root_path
+    evidence_path: Path | None = None
+    if release_evidence_file:
+        evidence_path = Path(release_evidence_file)
+        if not evidence_path.is_absolute():
+            evidence_path = config_path.parent / evidence_path
     return {
         "node_id": node_id,
         "token_file": token_file,
         "state_file": state_path.resolve(),
         "project_root": root_path.resolve(),
+        "release_evidence_file": (
+            evidence_path.resolve(strict=False) if evidence_path is not None else None
+        ),
     }
 
 

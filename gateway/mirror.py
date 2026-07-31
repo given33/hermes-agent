@@ -20,6 +20,18 @@ logger = logging.getLogger(__name__)
 
 _SESSIONS_DIR = get_hermes_home() / "sessions"
 _SESSIONS_INDEX = _SESSIONS_DIR / "sessions.json"
+_IMPORT_SESSIONS_DIR = _SESSIONS_DIR
+_IMPORT_SESSIONS_INDEX = _SESSIONS_INDEX
+
+
+def _sessions_paths():
+    if (
+        _SESSIONS_DIR != _IMPORT_SESSIONS_DIR
+        or _SESSIONS_INDEX != _IMPORT_SESSIONS_INDEX
+    ):
+        return _SESSIONS_DIR, _SESSIONS_INDEX
+    sessions_dir = get_hermes_home() / "sessions"
+    return sessions_dir, sessions_dir / "sessions.json"
 
 
 def mirror_to_session(
@@ -114,7 +126,7 @@ def _find_session_id(
     # Primary: state.db
     try:
         from hermes_state import SessionDB
-        db = SessionDB()
+        db = SessionDB(db_path=get_hermes_home() / "state.db")
         try:
             finder = getattr(db, "find_session_by_origin", None)
             if callable(finder):
@@ -132,11 +144,12 @@ def _find_session_id(
         logger.debug("Mirror state.db session lookup failed: %s", e)
 
     # Fallback: sessions.json (pre-migration databases)
-    if not _SESSIONS_INDEX.exists():
+    _, sessions_index = _sessions_paths()
+    if not sessions_index.exists():
         return None
 
     try:
-        with open(_SESSIONS_INDEX, encoding="utf-8") as f:
+        with open(sessions_index, encoding="utf-8") as f:
             data = json.load(f)
     except Exception:
         return None
@@ -193,7 +206,7 @@ def _append_to_sqlite(session_id: str, message: dict) -> None:
     db = None
     try:
         from hermes_state import SessionDB
-        db = SessionDB()
+        db = SessionDB(db_path=get_hermes_home() / "state.db")
         db.append_message(
             session_id=session_id,
             role=message.get("role", "assistant"),

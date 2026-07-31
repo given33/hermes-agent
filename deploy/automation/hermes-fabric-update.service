@@ -13,7 +13,7 @@ NoNewPrivileges=true
 PrivateTmp=true
 ProtectHome=read-only
 ProtectSystem=strict
-ReadWritePaths=-/opt/dbb3-team -/opt/pc-team -/var/lib/hermes-agent-fabric-update -/var/lib/systemd/linger -/etc/systemd/system -/usr/local/lib/hermes-agent -/home/hermes/.config -/home/hermes/.local/state /run
+ReadWritePaths=-/opt/dbb3-team -/opt/pc-team -/var/backups/hermes-agent -/var/lib/hermes-agent-fabric-update -/var/lib/systemd/linger -/etc/systemd/system -/etc/pc-team -/usr/local/lib/hermes-agent -/mnt/d/Hermes/hermes-agent -/mnt/d/Hermes/home -/home/hermes/.hermes -/home/hermes/.config -/home/hermes/.local/state -/home/hermes/.ssh /run
 
 [Install]
 WantedBy=multi-user.target

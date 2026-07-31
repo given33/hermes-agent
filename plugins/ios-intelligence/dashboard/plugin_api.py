@@ -60,6 +60,27 @@ async def ios_intelligence_lifespan(_app):
     global _MCP_RUNTIME, _MCP_STARTUP_THREAD, _SCHEDULER
     scheduler = None
     runtime = None
+
+    def cleanup() -> None:
+        global _MCP_RUNTIME, _MCP_STARTUP_THREAD, _SCHEDULER
+        first_error: BaseException | None = None
+        if scheduler is not None:
+            try:
+                scheduler.stop()
+            except BaseException as exc:
+                first_error = exc
+        if runtime is not None:
+            try:
+                runtime.stop()
+            except BaseException as exc:
+                if first_error is None:
+                    first_error = exc
+        _MCP_RUNTIME = None
+        _MCP_STARTUP_THREAD = None
+        _SCHEDULER = None
+        if first_error is not None:
+            raise first_error
+
     if IOSIntelligenceScheduler is not None:
         config = load_ios_intelligence_config()
         store = (
@@ -115,24 +136,22 @@ async def ios_intelligence_lifespan(_app):
             ),
             cleanup_only=not config.enabled,
         )
-        scheduler.start()
-        _SCHEDULER = scheduler
-        if runtime is not None and config.supervisor.enabled:
-            # Fleet startup is intentionally outside the blocking lifespan
-            # path. The HTTP API and deletion-recovery scheduler become
-            # available first, while /health truthfully reports starting until
-            # all 21 isolated endpoints pass tools/list.
-            _MCP_STARTUP_THREAD = runtime.start_async()
+        try:
+            scheduler.start()
+            _SCHEDULER = scheduler
+            if runtime is not None and config.supervisor.enabled:
+                # Fleet startup is intentionally outside the blocking lifespan
+                # path. The HTTP API and deletion-recovery scheduler become
+                # available first, while /health truthfully reports starting until
+                # all 21 isolated endpoints pass tools/list.
+                _MCP_STARTUP_THREAD = runtime.start_async()
+        except BaseException:
+            cleanup()
+            raise
     try:
         yield
     finally:
-        if scheduler is not None:
-            scheduler.stop()
-        if runtime is not None:
-            runtime.stop()
-        _MCP_RUNTIME = None
-        _MCP_STARTUP_THREAD = None
-        _SCHEDULER = None
+        cleanup()
 
 
 router = APIRouter(lifespan=ios_intelligence_lifespan)

@@ -19,13 +19,14 @@ import shlex
 import signal
 import subprocess
 import sys
+import tempfile
 import threading
 import time
 from datetime import datetime, timezone
 from pathlib import Path
 from hermes_constants import get_hermes_home, _get_platform_default_hermes_home
 from typing import Any, NamedTuple, Optional
-from utils import atomic_json_write
+from utils import advisory_file_lock, atomic_json_write
 
 if sys.platform == "win32":
     import msvcrt
@@ -83,35 +84,47 @@ def record_start_and_check_storm(
     try:
         path = _get_starts_log_path()
         path.parent.mkdir(parents=True, exist_ok=True)
+        with advisory_file_lock(path.with_suffix(".lock")):
+            now = datetime.now(timezone.utc).timestamp()
 
-        now = datetime.now(timezone.utc).timestamp()
+            existing: list[float] = []
+            if path.exists():
+                for line in path.read_text(encoding="utf-8").splitlines():
+                    line = line.strip()
+                    if not line:
+                        continue
+                    try:
+                        existing.append(float(line))
+                    except ValueError:
+                        continue
 
-        existing: list[float] = []
-        if path.exists():
-            for line in path.read_text(encoding="utf-8").splitlines():
-                line = line.strip()
-                if not line:
-                    continue
+            existing.append(now)
+
+            # Keep only starts within the sliding window for the storm decision.
+            recent = [ts for ts in existing if now - ts <= window_s]
+
+            # Ring-buffer what we persist so the file stays bounded even if the
+            # window is wide or starts are frequent.
+            keep = max(max_starts * 4, 40)
+            to_write = existing[-keep:]
+
+            fd, tmp_name = tempfile.mkstemp(
+                dir=str(path.parent), prefix=f".{path.stem}_", suffix=".tmp"
+            )
+            try:
+                with os.fdopen(fd, "w", encoding="utf-8") as tmp_file:
+                    tmp_file.write(
+                        "\n".join(repr(ts) for ts in to_write) + "\n"
+                    )
+                    tmp_file.flush()
+                    os.fsync(tmp_file.fileno())
+                os.replace(tmp_name, path)
+            except BaseException:
                 try:
-                    existing.append(float(line))
-                except ValueError:
-                    continue
-
-        existing.append(now)
-
-        # Keep only starts within the sliding window for the storm decision.
-        recent = [ts for ts in existing if now - ts <= window_s]
-
-        # Ring-buffer what we persist so the file stays bounded even if the
-        # window is wide or starts are frequent.
-        keep = max(max_starts * 4, 40)
-        to_write = existing[-keep:]
-
-        tmp = path.with_suffix(".tmp")
-        tmp.write_text(
-            "\n".join(repr(ts) for ts in to_write) + "\n", encoding="utf-8"
-        )
-        os.replace(tmp, path)
+                    os.unlink(tmp_name)
+                except OSError:
+                    pass
+                raise
 
         if len(recent) > max_starts:
             backoff = min(
@@ -437,9 +450,9 @@ def _command_line_belongs_to_profile(command: str, profile_home: Path) -> bool:
     explicit ``HERMES_HOME=<path>``) on its argv; the default/root gateway runs
     bare with no profile flag.
     """
-    command_lc = command.lower()
+    command_lc = command.lower().replace("\\", "/")
     profile_name = _profile_name_for_home(profile_home)
-    home_lc = str(profile_home).lower()
+    home_lc = str(profile_home).lower().replace("\\", "/")
 
     if profile_name is not None and profile_name != "default":
         profile_lc = profile_name.lower()

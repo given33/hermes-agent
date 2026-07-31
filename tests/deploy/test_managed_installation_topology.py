@@ -199,4 +199,43 @@ def test_receiver_http_health_and_probe_require_dedicated_credential(tmp_path):
     finally:
         server.shutdown()
         server.server_close()
+
+
+def test_receiver_health_exposes_only_valid_node_release_identity(tmp_path):
+    config_path, token = _receiver_config(tmp_path, node_id="wsl")
+    evidence_path = tmp_path / "fabric-release.json"
+    payload = json.loads(config_path.read_text(encoding="utf-8"))
+    payload["installation_receiver"]["release_evidence_file"] = str(evidence_path)
+    config_path.write_text(json.dumps(payload), encoding="utf-8")
+    commit = "a" * 40
+    evidence_path.write_text(
+        json.dumps({
+            "schema": "hermes.fabric-release.v1",
+            "node_id": "wsl",
+            "commit": commit,
+            "version": "1.2.3",
+        }),
+        encoding="utf-8",
+    )
+
+    server = RecoveryHTTPServer(("127.0.0.1", 0), config_path)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    base = f"http://127.0.0.1:{server.server_address[1]}"
+    try:
+        status, body = _request_json(
+            Request(f"{base}/health", headers={"X-DBB3-Token": token})
+        )
+        assert status == 200
+        assert body["release"] == {"commit": commit, "version": "1.2.3"}
+
+        evidence_path.write_text('{"schema":"wrong"}', encoding="utf-8")
+        status, body = _request_json(
+            Request(f"{base}/health", headers={"X-DBB3-Token": token})
+        )
+        assert status == 503
+        assert body == {"error": "release evidence schema is invalid"}
+    finally:
+        server.shutdown()
+        server.server_close()
         thread.join(timeout=5)

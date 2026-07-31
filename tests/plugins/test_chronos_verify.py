@@ -45,6 +45,8 @@ def _base_claims(**over):
         "aud": AUD,
         "iss": ISS,
         "purpose": "cron_fire",
+        "job_id": "job-123",
+        "fire_at": "2026-08-01T00:00:00+00:00",
         "iat": now,
         "nbf": now - 5,
         "exp": now + 300,
@@ -92,7 +94,24 @@ def test_wrong_purpose_rejected(rsa_keys):
     priv, pub = rsa_keys
     token = _mint(priv, _base_claims(purpose="inference"))
     assert verify_nas_fire_token(token=token, expected_audience=AUD,
-                                 jwks_or_key=pub, issuer=ISS) is None
+                                  jwks_or_key=pub, issuer=ISS) is None
+
+
+@pytest.mark.parametrize("missing_claim", ["job_id", "fire_at"])
+def test_missing_fire_binding_claim_rejected(rsa_keys, missing_claim):
+    from plugins.cron_providers.chronos.verify import verify_nas_fire_token
+
+    priv, pub = rsa_keys
+    claims = _base_claims()
+    del claims[missing_claim]
+    token = _mint(priv, claims)
+
+    assert verify_nas_fire_token(
+        token=token,
+        expected_audience=AUD,
+        jwks_or_key=pub,
+        issuer=ISS,
+    ) is None
 
 
 def test_expired_token_rejected(rsa_keys):

@@ -6193,6 +6193,45 @@ def _find_stale_dashboard_pids(
     return dashboard_pids
 
 
+def _find_process_descendants(root_pids: set[int]) -> list[int]:
+    """Snapshot POSIX descendants before a dashboard begins shutting down."""
+    if not root_pids or sys.platform == "win32":
+        return []
+    try:
+        result = subprocess.run(
+            ["ps", "-A", "-o", "pid=,ppid="],
+            capture_output=True,
+            text=True,
+            timeout=10,
+        )
+    except (FileNotFoundError, subprocess.TimeoutExpired, OSError):
+        return []
+    if result.returncode != 0:
+        return []
+    children: dict[int, list[int]] = {}
+    for line in result.stdout.splitlines():
+        parts = line.split()
+        if len(parts) != 2:
+            continue
+        try:
+            pid, parent = (int(value) for value in parts)
+        except ValueError:
+            continue
+        children.setdefault(parent, []).append(pid)
+    descendants: list[int] = []
+    pending = list(root_pids)
+    seen = set(root_pids)
+    while pending:
+        parent = pending.pop()
+        for child in children.get(parent, []):
+            if child in seen or child == os.getpid():
+                continue
+            seen.add(child)
+            descendants.append(child)
+            pending.append(child)
+    return descendants
+
+
 def _print_curator_first_run_notice() -> None:
     """Print a short heads-up about the skill curator after `hermes update`.
 
@@ -6322,7 +6361,9 @@ def _format_time_ago(iso_ts: str) -> str:
 
 def _kill_stale_dashboard_processes(
     reason: str = "the running backend no longer matches the updated frontend",
-) -> None:
+    *,
+    grace_seconds: float = 15.0,
+) -> bool:
     """Kill running ``hermes dashboard`` processes.
 
     Called at the end of ``hermes update`` (default ``reason``) and also
@@ -6333,8 +6374,8 @@ def _kill_stale_dashboard_processes(
     frontend/backend mismatches (new auth headers the old backend doesn't
     recognise → every API call 401s).
 
-    POSIX: SIGTERM, wait up to ~3s for graceful exit, SIGKILL any survivors.
-    Windows: ``taskkill /PID <pid> /F`` since there's no clean SIGTERM
+    POSIX: SIGTERM, wait for lifespan cleanup, SIGKILL the captured process
+    tree if needed. Windows: ``taskkill /PID <pid> /T /F`` since there is no clean SIGTERM
     equivalent for background console apps.
 
     The dashboard isn't auto-restarted because we don't know the original
@@ -6363,7 +6404,7 @@ def _kill_stale_dashboard_processes(
 
     pids = _find_stale_dashboard_pids(exclude_pids=exclude)
     if not pids:
-        return
+        return True
 
     print()
     print(f"⟲ Stopping {len(pids)} dashboard process(es) ({reason})")
@@ -6375,7 +6416,7 @@ def _kill_stale_dashboard_processes(
         for pid in pids:
             try:
                 result = subprocess.run(
-                    ["taskkill", "/PID", str(pid), "/F"],
+                    ["taskkill", "/PID", str(pid), "/T", "/F"],
                     capture_output=True,
                     text=True,
                     timeout=10,
@@ -6390,6 +6431,8 @@ def _kill_stale_dashboard_processes(
         import signal as _signal
         import time as _time
 
+        descendants = _find_process_descendants(set(pids))
+
         # SIGTERM first — give each process a chance to shut down cleanly
         # (uvicorn closes its socket, flushes logs, etc.).
         for pid in pids:
@@ -6401,8 +6444,9 @@ def _kill_stale_dashboard_processes(
             except (PermissionError, OSError) as e:
                 failed.append((pid, str(e)))
 
-        # Poll for exit up to ~3s total.
-        deadline = _time.monotonic() + 3.0
+        # iOS MCP lifespan cleanup can coordinate many worker processes. Give
+        # it enough time to finish before using the process-tree fallback.
+        deadline = _time.monotonic() + max(0.0, grace_seconds)
         pending = [
             p for p in pids if p not in killed and p not in {f[0] for f in failed}
         ]
@@ -6418,13 +6462,17 @@ def _kill_stale_dashboard_processes(
                     killed.append(pid)
             pending = still_pending
 
-        # SIGKILL any survivors.
-        for pid in pending:
+        # If graceful shutdown did not finish, kill descendants first. They
+        # may otherwise be re-parented and disappear from a later tree scan.
+        hard_kill = [pid for pid in descendants if _pid_exists(pid)] + pending
+        for pid in dict.fromkeys(hard_kill):
             try:
                 os.kill(pid, _signal.SIGKILL)
-                killed.append(pid)
+                if pid in pids:
+                    killed.append(pid)
             except ProcessLookupError:
-                killed.append(pid)
+                if pid in pids:
+                    killed.append(pid)
             except (PermissionError, OSError) as e:
                 failed.append((pid, str(e)))
 
@@ -6436,6 +6484,7 @@ def _kill_stale_dashboard_processes(
     if killed:
         print("  Restart the dashboard when you're ready:")
         print("    hermes dashboard --port <port>")
+    return not failed
 
 
 # Back-compat alias: some tests and any external callers may import the old
@@ -12513,11 +12562,13 @@ def cmd_dashboard(args):
             print("No hermes dashboard processes running.")
             sys.exit(0)
         # Reuse the same SIGTERM-grace-SIGKILL path used after `hermes update`.
-        _kill_stale_dashboard_processes(reason="requested via --stop")
+        stopped_cleanly = _kill_stale_dashboard_processes(
+            reason="requested via --stop"
+        )
         # _kill_stale_dashboard_processes prints outcomes itself.  Exit 0 if
         # we killed at least one, 1 if they were all unkillable.
         remaining = _find_stale_dashboard_pids()
-        sys.exit(1 if remaining else 0)
+        sys.exit(1 if remaining or not stopped_cleanly else 0)
 
     # `serve` is the headless backend: no UI build, no SPA mount, neutral
     # ready sentinel. Resolved once and threaded through the re-exec, the

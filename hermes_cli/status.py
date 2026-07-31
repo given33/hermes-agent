@@ -200,19 +200,21 @@ def show_status(args):
         except Exception:
             nous_status = {}
 
-    try:
-        from hermes_cli.auth import (
-            get_codex_auth_status,
-            get_qwen_auth_status,
-            get_minimax_oauth_auth_status,
-        )
-        codex_status = get_codex_auth_status()
-        qwen_status = get_qwen_auth_status()
-        minimax_status = get_minimax_oauth_auth_status()
-    except Exception:
-        codex_status = {}
-        qwen_status = {}
-        minimax_status = {}
+    def _safe_auth_status(getter_name: str) -> dict:
+        try:
+            import hermes_cli.auth as auth_module
+
+            getter = getattr(auth_module, getter_name)
+            result = getter()
+            return result if isinstance(result, dict) else {}
+        except Exception:
+            return {}
+
+    # Probe independently: one provider's corrupt/missing auth backend must
+    # not erase healthy status rows from the other providers.
+    codex_status = _safe_auth_status("get_codex_auth_status")
+    qwen_status = _safe_auth_status("get_qwen_auth_status")
+    minimax_status = _safe_auth_status("get_minimax_oauth_auth_status")
 
     nous_account_info = None
     if (

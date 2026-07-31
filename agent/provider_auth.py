@@ -904,6 +904,8 @@ def _auth_lock_path() -> Path:
 
 _auth_target_lock_holders: Dict[str, threading.local] = {}
 _auth_target_lock_holders_guard = threading.Lock()
+_auth_file_process_locks: Dict[str, threading.Lock] = {}
+_auth_file_process_locks_guard = threading.Lock()
 
 
 def _same_path(left: Path, right: Path) -> bool:
@@ -921,6 +923,15 @@ def _auth_lock_holder_for(target_path: Path) -> threading.local:
         key = str(target_path)
     with _auth_target_lock_holders_guard:
         return _auth_target_lock_holders.setdefault(key, threading.local())
+
+
+def _auth_file_process_lock_for(lock_path: Path) -> threading.Lock:
+    try:
+        key = str(lock_path.resolve(strict=False))
+    except Exception:
+        key = str(lock_path)
+    with _auth_file_process_locks_guard:
+        return _auth_file_process_locks.setdefault(key, threading.Lock())
 
 
 @contextmanager
@@ -947,52 +958,60 @@ def _file_lock(
             holder.depth -= 1
         return
 
-    lock_path.parent.mkdir(parents=True, exist_ok=True)
+    deadline = time.monotonic() + max(1.0, timeout_seconds)
+    process_lock = _auth_file_process_lock_for(lock_path)
+    if not process_lock.acquire(timeout=max(1.0, timeout_seconds)):
+        raise TimeoutError(timeout_message)
+    try:
+        lock_path.parent.mkdir(parents=True, exist_ok=True)
 
-    if fcntl is None and msvcrt is None:
-        holder.depth = 1
-        try:
-            yield
-        finally:
-            holder.depth = 0
-        return
-
-    # On Windows, msvcrt.locking needs the file to have content and the
-    # file pointer at position 0. Ensure the lock file has at least 1 byte.
-    if msvcrt and (not lock_path.exists() or lock_path.stat().st_size == 0):
-        lock_path.write_text(" ", encoding="utf-8")
-
-    with lock_path.open("r+" if msvcrt else "a+", encoding="utf-8") as lock_file:
-        deadline = time.monotonic() + max(1.0, timeout_seconds)
-        while True:
+        if fcntl is None and msvcrt is None:
+            holder.depth = 1
             try:
-                if fcntl:
-                    fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
-                else:
-                    lock_file.seek(0)
-                    msvcrt.locking(lock_file.fileno(), msvcrt.LK_NBLCK, 1)
-                break
-            except (BlockingIOError, OSError, PermissionError):
-                if time.monotonic() >= deadline:
-                    raise TimeoutError(timeout_message)
-                time.sleep(0.05)
+                yield
+            finally:
+                holder.depth = 0
+            return
 
-        holder.depth = 1
-        try:
-            yield
-        finally:
-            holder.depth = 0
-            if fcntl:
+        # On Windows, msvcrt.locking needs the file to have content and the
+        # file pointer at position 0. The process lock also serializes this
+        # first-use initialization; two threads must never truncate/write the
+        # same mandatory-locked byte concurrently.
+        if msvcrt and (not lock_path.exists() or lock_path.stat().st_size == 0):
+            lock_path.write_text(" ", encoding="utf-8")
+
+        with lock_path.open("r+" if msvcrt else "a+", encoding="utf-8") as lock_file:
+            while True:
                 try:
-                    fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)
-                except (OSError, IOError):
-                    pass
-            elif msvcrt:
-                try:
-                    lock_file.seek(0)
-                    msvcrt.locking(lock_file.fileno(), msvcrt.LK_UNLCK, 1)
-                except (OSError, IOError):
-                    pass
+                    if fcntl:
+                        fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+                    else:
+                        lock_file.seek(0)
+                        msvcrt.locking(lock_file.fileno(), msvcrt.LK_NBLCK, 1)
+                    break
+                except (BlockingIOError, OSError, PermissionError):
+                    if time.monotonic() >= deadline:
+                        raise TimeoutError(timeout_message)
+                    time.sleep(0.05)
+
+            holder.depth = 1
+            try:
+                yield
+            finally:
+                holder.depth = 0
+                if fcntl:
+                    try:
+                        fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)
+                    except (OSError, IOError):
+                        pass
+                elif msvcrt:
+                    try:
+                        lock_file.seek(0)
+                        msvcrt.locking(lock_file.fileno(), msvcrt.LK_UNLCK, 1)
+                    except (OSError, IOError):
+                        pass
+    finally:
+        process_lock.release()
 
 
 @contextmanager

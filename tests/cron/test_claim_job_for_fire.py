@@ -80,5 +80,79 @@ def test_mark_job_run_clears_claim(temp_home):
 
     mark_job_run(jid, success=True)
     assert get_job(jid).get("fire_claim") is None
-    # …and the re-armed recurring job is claimable again.
+    # ...and the re-armed recurring job is claimable again.
     assert claim_job_for_fire(jid) is True
+
+
+def test_completed_recurring_fire_cannot_be_replayed(temp_home):
+    from cron.jobs import create_job, claim_job_for_fire, get_job, mark_job_run
+
+    job = create_job(prompt="x", schedule="every 5m", name="identity")
+    job_id = job["id"]
+    first_fire_at = get_job(job_id)["next_run_at"]
+
+    assert claim_job_for_fire(job_id, fire_at=first_fire_at) is True
+    mark_job_run(job_id, success=True)
+
+    assert claim_job_for_fire(job_id, fire_at=first_fire_at) is False
+    next_fire_at = get_job(job_id)["next_run_at"]
+    assert claim_job_for_fire(job_id, fire_at=next_fire_at) is True
+
+
+def test_completed_oneshot_fire_cannot_be_replayed(temp_home):
+    """Completion consumes a one-shot durably by removing its job record."""
+    from cron.jobs import create_job, claim_job_for_fire, get_job, mark_job_run
+
+    job = create_job(prompt="x", schedule="30m", name="one-fire")
+    job_id = job["id"]
+    fire_at = get_job(job_id)["next_run_at"]
+
+    assert claim_job_for_fire(job_id, fire_at=fire_at) is True
+    mark_job_run(job_id, success=True)
+
+    assert get_job(job_id) is None
+    assert claim_job_for_fire(job_id, fire_at=fire_at) is False
+
+
+def test_stale_retry_of_same_identity_does_not_advance_twice(temp_home):
+    from cron.jobs import create_job, claim_job_for_fire, get_job
+
+    job = create_job(prompt="x", schedule="every 5m", name="retry")
+    job_id = job["id"]
+    fire_at = get_job(job_id)["next_run_at"]
+
+    assert claim_job_for_fire(job_id, fire_at=fire_at) is True
+    advanced_next_run = get_job(job_id)["next_run_at"]
+    assert claim_job_for_fire(
+        job_id,
+        fire_at=fire_at,
+        claim_ttl_seconds=0,
+    ) is True
+    assert get_job(job_id)["next_run_at"] == advanced_next_run
+
+
+def test_identity_bound_claim_rejects_unscheduled_fire(temp_home):
+    from cron.jobs import create_job, claim_job_for_fire, get_job
+
+    job = create_job(prompt="x", schedule="every 5m", name="wrong-fire")
+    job_id = job["id"]
+    scheduled = get_job(job_id)["next_run_at"]
+
+    assert claim_job_for_fire(
+        job_id,
+        fire_at="2099-01-01T00:00:00+00:00",
+    ) is False
+    current = get_job(job_id)
+    assert current["next_run_at"] == scheduled
+    assert not current.get("fire_claim")
+
+
+def test_identity_bound_claim_rejects_naive_fire_time(temp_home):
+    from cron.jobs import create_job, claim_job_for_fire
+
+    job = create_job(prompt="x", schedule="every 5m", name="naive-fire")
+
+    assert claim_job_for_fire(
+        job["id"],
+        fire_at="2026-08-01T00:00:00",
+    ) is False

@@ -7,9 +7,11 @@ import os
 import shutil
 import stat
 import tempfile
+import threading
 import time
+from contextlib import contextmanager
 from pathlib import Path
-from typing import Any, Union
+from typing import Any, Iterator, Union
 from urllib.parse import urlparse
 
 import yaml
@@ -18,6 +20,80 @@ logger = logging.getLogger(__name__)
 
 
 TRUTHY_STRINGS = frozenset({"1", "true", "yes", "on"})
+
+_advisory_locks_guard = threading.Lock()
+_advisory_locks: dict[str, threading.Lock] = {}
+
+
+@contextmanager
+def advisory_file_lock(path: Union[str, Path], *, timeout: float = 30.0) -> Iterator[None]:
+    """Hold a cross-process advisory lock for a short file transaction.
+
+    A process-local lock is paired with ``fcntl.flock``/``msvcrt.locking`` so
+    threads and sibling processes serialize the same read-modify-write cycle.
+    The lock file is durable bookkeeping only; releasing the OS lock, rather
+    than deleting the file, is what hands ownership to the next caller.
+    """
+    lock_path = Path(path)
+    try:
+        lock_key = str(lock_path.resolve(strict=False))
+    except (OSError, RuntimeError, ValueError):
+        lock_key = str(lock_path.absolute())
+
+    with _advisory_locks_guard:
+        process_lock = _advisory_locks.setdefault(lock_key, threading.Lock())
+
+    wait_seconds = max(0.0, float(timeout))
+    if not process_lock.acquire(timeout=wait_seconds):
+        raise TimeoutError(f"Timed out waiting for file lock: {lock_path}")
+
+    handle = None
+    locked = False
+    try:
+        lock_path.parent.mkdir(parents=True, exist_ok=True)
+        handle = lock_path.open("a+b")
+        deadline = time.monotonic() + wait_seconds
+        while True:
+            try:
+                if os.name == "nt":
+                    import msvcrt
+
+                    handle.seek(0, os.SEEK_END)
+                    if handle.tell() == 0:
+                        handle.write(b" ")
+                        handle.flush()
+                    handle.seek(0)
+                    msvcrt.locking(handle.fileno(), msvcrt.LK_NBLCK, 1)
+                else:
+                    import fcntl
+
+                    fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+                locked = True
+                break
+            except (BlockingIOError, OSError, PermissionError) as exc:
+                if time.monotonic() >= deadline:
+                    raise TimeoutError(
+                        f"Timed out waiting for file lock: {lock_path}"
+                    ) from exc
+                time.sleep(0.05)
+        yield
+    finally:
+        if handle is not None:
+            if locked:
+                try:
+                    if os.name == "nt":
+                        import msvcrt
+
+                        handle.seek(0)
+                        msvcrt.locking(handle.fileno(), msvcrt.LK_UNLCK, 1)
+                    else:
+                        import fcntl
+
+                        fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+                except OSError:
+                    pass
+            handle.close()
+        process_lock.release()
 
 
 def is_truthy_value(value: Any, default: bool = False) -> bool:

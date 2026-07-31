@@ -12751,7 +12751,7 @@ async def delete_cron_job(job_id: str, profile: Optional[str] = None):
     return await _run_cron_dashboard_io(_delete_cron_job_sync, job_id, profile)
 
 
-def _fire_cron_job_for_profile(profile: str, job_id: str) -> bool:
+def _fire_cron_job_for_profile(profile: str, job_id: str, fire_at: str) -> bool:
     """Run ONE due cron job end-to-end for ``profile`` via the resolved
     scheduler provider's ``fire_due`` (store CAS claim + ``run_one_job``).
 
@@ -12772,7 +12772,14 @@ def _fire_cron_job_for_profile(profile: str, job_id: str) -> bool:
     try:
         with cron_jobs.use_cron_store(home):
             provider = resolve_cron_scheduler()
-            return bool(provider.fire_due(job_id, adapters=None, loop=None))
+            return bool(
+                provider.fire_due(
+                    job_id,
+                    fire_at=fire_at,
+                    adapters=None,
+                    loop=None,
+                )
+            )
     finally:
         reset_hermes_home_override(token)
 
@@ -12808,7 +12815,10 @@ async def cron_fire_webhook(request: Request):
     async def execute(command, profile):
         assert profile is not None
         return await asyncio.to_thread(
-            _fire_cron_job_for_profile, profile, command.job_id
+            _fire_cron_job_for_profile,
+            profile,
+            command.job_id,
+            command.fire_at,
         )
 
     accepted = await accept_cron_fire_request(
@@ -20432,9 +20442,11 @@ def start_server(
                 _hb_interval, _loop_heartbeat, _hb_loop.time() + _hb_interval
             )
 
-            await server.main_loop()
-            if server.started:
-                await server.shutdown()
+            try:
+                await server.main_loop()
+            finally:
+                if server.started:
+                    await server.shutdown()
 
     # On POSIX, keep the long-standing ``asyncio.run(_serve())`` behavior
     # unchanged — Python's default loop there is already a SelectorEventLoop

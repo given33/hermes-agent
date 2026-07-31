@@ -700,3 +700,6 @@ def test_date_parser_accepts_epoch_and_rejects_invalid_input():
     )
     with pytest.raises(ValueError, match="ISO-8601"):
         parse_date_filter("next thursday")
+    for value in ("nan", "inf", "-inf"):
+        with pytest.raises(ValueError, match="finite"):
+            parse_date_filter(value)
