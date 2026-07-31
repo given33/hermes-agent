@@ -26,6 +26,7 @@ from cron.jobs import (
     get_job,
     list_jobs,
     mark_job_run,
+    _coerce_job_enabled,
     _normalize_repeat_limit,
     parse_schedule,
     pause_job,
@@ -696,7 +697,7 @@ def cronjob(
             if not schedule:
                 return tool_error("schedule is required for create", success=False)
             canonical_skills = _canonical_skills(skill, skills)
-            _no_agent = bool(no_agent)
+            _no_agent = _coerce_job_enabled(no_agent, False)
             # Job-shape validation differs by mode:
             #   - no_agent=True → script is the job; prompt/skills are optional
             #     (and irrelevant to execution).
@@ -929,7 +930,7 @@ def cronjob(
             if enabled_toolsets is not None:
                 updates["enabled_toolsets"] = enabled_toolsets or None
             if attach_to_session is not None:
-                updates["attach_to_session"] = bool(attach_to_session)
+                updates["attach_to_session"] = _coerce_job_enabled(attach_to_session, False)
             if workdir is not None:
                 # Empty string clears the field (restores old behaviour);
                 # otherwise pass raw — update_job() validates / normalizes.
@@ -938,7 +939,7 @@ def cronjob(
                 # Toggling no_agent on/off at update time. If flipping to True,
                 # we need a script to already exist on the job (or be part of
                 # the same update) — otherwise the next tick would error out.
-                target_no_agent = bool(no_agent)
+                target_no_agent = _coerce_job_enabled(no_agent, False)
                 if target_no_agent:
                     effective_script = updates.get("script") if "script" in updates else job.get("script")
                     if not effective_script:
