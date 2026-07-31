@@ -536,7 +536,7 @@ def _normalize_job_record(job: Dict[str, Any]) -> Dict[str, Any]:
         name = label_source[:50].strip() or "cron job"
     normalized["name"] = name
     normalized["schedule_display"] = _schedule_display_for_job(normalized)
-    for flag, default in (("enabled", True), ("no_agent", False)):
+    for flag, default in (("enabled", False), ("no_agent", False)):
         if flag in normalized:
             normalized[flag] = _coerce_job_enabled(normalized.get(flag), default)
 
@@ -1544,7 +1544,8 @@ def update_job(job_id: str, updates: Dict[str, Any]) -> Optional[Dict[str, Any]]
                 updated["provider_snapshot"] = provider_snapshot
                 updated["model_snapshot"] = model_snapshot
 
-            if _coerce_job_enabled(updated.get("enabled", True)) and updated.get("state") != "paused" and not updated.get("next_run_at"):
+            enabled_default = "enabled" not in updated
+            if _coerce_job_enabled(updated.get("enabled", True), enabled_default) and updated.get("state") != "paused" and not updated.get("next_run_at"):
                 next_run = compute_next_run(updated["schedule"])
                 if next_run is None and _job_schedule_kind(updated) == "once":
                     schedule = updated.get("schedule")
@@ -1949,7 +1950,8 @@ def claim_job_for_fire(
         for job in jobs:
             if job.get("id") != job_id:
                 continue
-            if not _coerce_job_enabled(job.get("enabled", True)) or job.get("state") == "paused":
+            enabled_default = "enabled" not in job
+            if not _coerce_job_enabled(job.get("enabled", True), enabled_default) or job.get("state") == "paused":
                 return False
             now = _hermes_now()
             existing = job.get("fire_claim")
@@ -2111,7 +2113,7 @@ def _get_due_jobs_locked() -> List[Dict[str, Any]]:
     # malformed counter from a hand-edited jobs.json would otherwise raise in
     # that per-job guard and silently skip the job forever.
     for j, rj in zip(jobs, raw_jobs):
-        for flag, default in (("enabled", True), ("no_agent", False)):
+        for flag, default in (("enabled", False), ("no_agent", False)):
             if flag in j:
                 normalized_flag = _coerce_job_enabled(j.get(flag), default)
                 if j.get(flag) != normalized_flag:

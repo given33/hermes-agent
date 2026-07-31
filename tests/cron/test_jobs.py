@@ -307,6 +307,21 @@ class TestJobCRUD:
         assert load_jobs()[0]["enabled"] is False
         assert [job["id"] for job in list_jobs()] == ["enabled-bool"]
 
+    def test_malformed_enabled_value_fails_closed(self, tmp_cron_dir):
+        """Invalid persisted enabled values must not run hand-edited jobs."""
+        past = (datetime.now(timezone.utc) - timedelta(seconds=5)).isoformat()
+        save_jobs([{
+            "id": "malformed-enabled",
+            "name": "malformed",
+            "enabled": {},
+            "schedule": {"kind": "once", "run_at": past},
+            "next_run_at": past,
+        }])
+
+        assert get_due_jobs() == []
+        assert load_jobs()[0]["enabled"] is False
+        assert list_jobs() == []
+
     def test_string_false_no_agent_is_normalized(self, tmp_cron_dir):
         created = create_job(
             prompt="Use the model", schedule="every 5m", no_agent="false"
