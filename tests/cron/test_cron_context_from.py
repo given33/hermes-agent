@@ -268,6 +268,19 @@ class TestBuildJobPromptContextFrom:
         assert "Process" in prompt
         assert "etc/passwd" not in prompt
 
+    @pytest.mark.parametrize("context_from", [123, {"id": "abcdef123456"}, [123]])
+    def test_malformed_context_from_is_ignored(self, cron_env, context_from):
+        """Tampered scalar/reference values must not abort prompt assembly."""
+        from cron.scheduler import _build_job_prompt
+
+        prompt = _build_job_prompt({
+            "id": "prompt-job",
+            "prompt": "Process this",
+            "context_from": context_from,
+        })
+
+        assert "Process this" in prompt
+
     def test_invalid_job_id_log_includes_job_origin(self, cron_env, caplog):
         """Invalid stored context_from refs log job/source provenance."""
         from cron.jobs import create_job

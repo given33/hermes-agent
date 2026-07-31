@@ -215,6 +215,11 @@ class TestComputeNextRun:
         # Should be ~30 minutes from last run
         assert next_dt > datetime.now().astimezone() + timedelta(minutes=29)
 
+    @pytest.mark.parametrize("minutes", [None, "five", {}, -1, True])
+    def test_interval_with_invalid_minutes_is_not_schedulable(self, minutes):
+        """Hand-edited schedule values must not raise from runtime helpers."""
+        assert compute_next_run({"kind": "interval", "minutes": minutes}) is None
+
     def test_cron_returns_future(self):
         pytest.importorskip("croniter")
         schedule = {"kind": "cron", "expr": "* * * * *"}  # every minute
@@ -603,6 +608,22 @@ class TestMarkJobRun:
         updated = get_job(job["id"])
         assert updated["last_status"] == "error"
         assert updated["last_error"] == "timeout"
+
+    def test_malformed_repeat_is_repaired_before_marking_run(self, tmp_cron_dir):
+        """A corrupt repeat field must not abort completion under the jobs lock."""
+        save_jobs([{
+            "id": "bad-repeat",
+            "schedule": {"kind": "interval", "minutes": 5},
+            "next_run_at": (datetime.now(timezone.utc) - timedelta(minutes=1)).isoformat(),
+            "repeat": "not-a-record",
+        }])
+
+        mark_job_run("bad-repeat", success=True)
+
+        updated = get_job("bad-repeat")
+        assert updated is not None
+        assert updated["last_status"] == "ok"
+        assert updated["repeat"] == {"times": None, "completed": 1}
 
     def test_delivery_error_tracked_separately(self, tmp_cron_dir):
         """Agent succeeds but delivery fails — both tracked independently."""
@@ -1915,6 +1936,16 @@ class TestClaimDispatch:
         save_jobs([job])
         assert claim_dispatch("os1") is True
         assert load_jobs()[0]["repeat"]["completed"] == 0
+
+    def test_malformed_repeat_is_repaired_before_claim(self, tmp_cron_dir):
+        save_jobs([{
+            **self._oneshot(times=1),
+            "repeat": {"times": "not-a-number", "completed": "bad"},
+        }])
+
+        assert claim_dispatch("os1") is True
+
+        assert load_jobs()[0]["repeat"] == {"times": None, "completed": 0}
 
     def test_no_repeat_block_not_claimed(self, tmp_cron_dir):
         job = {"id": "os1", "schedule": {"kind": "once", "run_at": "2026-01-01T00:00:00+00:00"}}

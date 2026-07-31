@@ -172,8 +172,23 @@ def _resolve_cron_disabled_toolsets(cfg: dict) -> list[str]:
     past config.yaml's denylist).
     """
     disabled = ["cronjob", "messaging", "clarify"]
-    agent_cfg = (cfg or {}).get("agent") or {}
+    config = cfg if isinstance(cfg, dict) else {}
+    agent_cfg = config.get("agent") or {}
+    if not isinstance(agent_cfg, dict):
+        logger.warning(
+            "Ignoring malformed agent config value of type %s",
+            type(agent_cfg).__name__,
+        )
+        agent_cfg = {}
     user_disabled = agent_cfg.get("disabled_toolsets") or []
+    if isinstance(user_disabled, str):
+        user_disabled = [user_disabled]
+    elif not isinstance(user_disabled, (list, tuple, set)):
+        logger.warning(
+            "Ignoring malformed agent.disabled_toolsets value of type %s",
+            type(user_disabled).__name__,
+        )
+        user_disabled = []
     for name in user_disabled:
         name = str(name).strip()
         if name and name not in disabled:
@@ -231,12 +246,26 @@ def _resolve_cron_enabled_toolsets(job: dict, cfg: dict) -> list[str] | None:
     get cron WITHOUT ``moa`` by default (issue reported by Norbert —
     surprise $4.63 run).
     """
+    config = cfg if isinstance(cfg, dict) else {}
     per_job = job.get("enabled_toolsets")
+    if isinstance(per_job, str):
+        per_job = [per_job]
+    elif isinstance(per_job, (list, tuple, set)):
+        per_job = [str(name).strip() for name in per_job if str(name).strip()]
+    elif per_job:
+        # A hand-edited scalar/dict must not be passed to list() (which either
+        # raises for scalars or turns a dict into arbitrary key names). Fall
+        # through to the operator's cron platform policy instead.
+        logger.warning(
+            "Ignoring malformed cron enabled_toolsets value of type %s",
+            type(per_job).__name__,
+        )
+        per_job = None
     if per_job:
-        return _merge_mcp_into_per_job_toolsets(list(per_job), cfg or {})
+        return _merge_mcp_into_per_job_toolsets(per_job, config)
     try:
         from hermes_cli.tools_config import _get_platform_tools  # lazy: avoid heavy import at cron module load
-        return sorted(_get_platform_tools(cfg or {}, "cron"))
+        return sorted(_get_platform_tools(config, "cron"))
     except Exception as exc:
         logger.warning(
             "Cron toolset resolution failed, falling back to full default toolset: %s",
@@ -2484,10 +2513,24 @@ def _build_job_prompt(job: dict, prerun_script: Optional[tuple] = None) -> str:
         from cron.jobs import get_cron_output_dir
         output_dir = get_cron_output_dir()
         if isinstance(context_from, str):
-            context_from = [context_from]
-        for source_job_id in context_from:
+            context_refs = [context_from]
+        elif isinstance(context_from, (list, tuple, set)):
+            context_refs = context_from
+        else:
+            logger.warning(
+                "context_from: ignoring malformed value of type %s for job_id=%r%s",
+                type(context_from).__name__,
+                job.get("id"),
+                _cron_job_origin_log_suffix(job),
+            )
+            context_refs = ()
+        for source_job_id in context_refs:
             # Guard against path traversal — valid job IDs are 12-char hex strings
-            if not source_job_id or not all(c in "0123456789abcdef" for c in source_job_id):
+            if (
+                not isinstance(source_job_id, str)
+                or not source_job_id
+                or not all(c in "0123456789abcdef" for c in source_job_id)
+            ):
                 logger.warning(
                     "context_from: skipping invalid job_id %r for job_id=%r name=%r%s",
                     source_job_id,
@@ -2546,6 +2589,13 @@ def _build_job_prompt(job: dict, prerun_script: Optional[tuple] = None) -> str:
         skills = [legacy] if legacy else []
     elif isinstance(skills, str):
         skills = [skills]
+    elif not isinstance(skills, (list, tuple, set)):
+        logger.warning(
+            "Ignoring malformed cron skills value of type %s for job_id=%r",
+            type(skills).__name__,
+            job.get("id"),
+        )
+        skills = []
 
     skill_names = [str(name).strip() for name in skills if str(name).strip()]
     if not skill_names:
@@ -2799,7 +2849,14 @@ def run_job(
         # Apply workdir if configured — lets scripts use predictable relative
         # paths. For no_agent jobs this is just the subprocess cwd (not an
         # agent TERMINAL_CWD bridge).
-        _job_workdir = (job.get("workdir") or "").strip() or None
+        _raw_workdir = job.get("workdir")
+        _job_workdir = _raw_workdir.strip() if isinstance(_raw_workdir, str) else None
+        if _raw_workdir not in (None, "") and not isinstance(_raw_workdir, str):
+            logger.warning(
+                "Job '%s': ignoring malformed workdir value of type %s",
+                job_id,
+                type(_raw_workdir).__name__,
+            )
         _prior_cwd = None
         if _job_workdir and Path(_job_workdir).is_dir():
             _prior_cwd = os.getcwd()
@@ -3084,7 +3141,14 @@ def run_job(
     # file / code-exec commands in the wrong directory.  For workdir-less jobs
     # we leave TERMINAL_CWD untouched — preserves the original behaviour
     # (skip_context_files=True, tools use whatever cwd the scheduler has).
-    _job_workdir = (job.get("workdir") or "").strip() or None
+    _raw_workdir = job.get("workdir")
+    _job_workdir = _raw_workdir.strip() if isinstance(_raw_workdir, str) else None
+    if _raw_workdir not in (None, "") and not isinstance(_raw_workdir, str):
+        logger.warning(
+            "Job '%s': ignoring malformed workdir value of type %s",
+            job_id,
+            type(_raw_workdir).__name__,
+        )
     if _job_workdir and not Path(_job_workdir).is_dir():
         # Directory was removed between create-time validation and now.  Log
         # and drop back to old behaviour rather than crashing the job.

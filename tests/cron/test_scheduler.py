@@ -77,6 +77,16 @@ class TestPerJobToolsetMcpMerge:
         assert m_platform.call_args[0][1] == "cron"
         assert set(result) == set(sentinel)
 
+    @pytest.mark.parametrize("value", [123, {"web": True}])
+    def test_resolver_ignores_malformed_per_job_toolsets(self, value):
+        """Corrupt jobs.json values must not crash or become dict key lists."""
+        with patch("hermes_cli.tools_config._get_platform_tools", return_value={"web"}) as m_platform:
+            result = _resolve_cron_enabled_toolsets(
+                {"enabled_toolsets": value}, self.CFG
+            )
+        m_platform.assert_called_once()
+        assert result == ["web"]
+
 
 class TestResolveOrigin:
     def test_full_origin(self):

@@ -280,6 +280,25 @@ def test_run_job_no_agent_never_invokes_aiagent(hermes_env):
     ai_mock.assert_not_called()
 
 
+def test_run_job_no_agent_ignores_malformed_workdir(hermes_env):
+    """A hand-edited scalar workdir must not crash the watchdog path."""
+    from cron.scheduler import run_job
+
+    job = {
+        "id": "bad-workdir",
+        "name": "bad workdir",
+        "no_agent": True,
+        "script": "watchdog.sh",
+        "workdir": 123,
+    }
+    with patch("cron.scheduler._run_job_script_with_claim_heartbeat", return_value=(True, "ok")):
+        success, _doc, final_response, error = run_job(job)
+
+    assert success is True
+    assert final_response == "ok"
+    assert error is None
+
+
 # ---------------------------------------------------------------------------
 # _run_job_script: shell-script support
 # ---------------------------------------------------------------------------

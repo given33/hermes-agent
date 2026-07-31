@@ -11,6 +11,7 @@ from contextvars import ContextVar
 from dataclasses import dataclass
 import json
 import logging
+import math
 import shutil
 import tempfile
 import threading
@@ -397,6 +398,64 @@ def _normalize_skill_list(skill: Optional[str] = None, skills: Optional[Any] = N
     return normalized
 
 
+def _normalize_repeat_record(job: Dict[str, Any]) -> Tuple[Optional[Dict[str, Any]], bool]:
+    """Return a runtime-safe repeat record and whether storage was repaired.
+
+    ``jobs.json`` is intentionally user-editable and older writers did not
+    always emit the same shape.  Runtime paths must not assume that
+    ``repeat`` is a mapping with integer ``times``/``completed`` fields: a
+    scalar or malformed counter would otherwise abort ``mark_job_run`` or
+    ``claim_dispatch`` while holding the jobs lock.  Invalid limits are
+    treated as an unbounded repeat (the safest interpretation for a job that
+    is already scheduled), while a malformed completed counter is reset.
+    """
+    if "repeat" not in job or job.get("repeat") is None:
+        return None, False
+
+    raw = job.get("repeat")
+    if not isinstance(raw, dict):
+        normalized = {"times": None, "completed": 0}
+        job["repeat"] = normalized
+        return normalized, True
+
+    times = raw.get("times")
+    if isinstance(times, bool):
+        times = None
+    elif isinstance(times, int):
+        times = times if times > 0 else None
+    elif isinstance(times, str):
+        try:
+            parsed_times = int(times.strip())
+        except (TypeError, ValueError):
+            parsed_times = 0
+        times = parsed_times if parsed_times > 0 else None
+    else:
+        times = None
+
+    completed = raw.get("completed", 0)
+    if isinstance(completed, bool):
+        completed = 0
+    elif isinstance(completed, int):
+        completed = max(0, completed)
+    elif isinstance(completed, str):
+        try:
+            completed = max(0, int(completed.strip()))
+        except (TypeError, ValueError):
+            completed = 0
+    else:
+        completed = 0
+
+    normalized = dict(raw)
+    normalized["times"] = times
+    normalized["completed"] = completed
+    changed = normalized != raw
+    # Always attach the normalized mapping to the job.  Returning a shallow
+    # copy for an already-valid record would otherwise make lifecycle updates
+    # mutate only the temporary copy while the stored job remains unchanged.
+    job["repeat"] = normalized
+    return normalized, changed
+
+
 def _apply_skill_fields(job: Dict[str, Any]) -> Dict[str, Any]:
     """Return a job dict with canonical `skills` and legacy `skill` fields aligned."""
     normalized = dict(job)
@@ -703,7 +762,16 @@ def _compute_grace_seconds(schedule: dict) -> int:
     kind = schedule.get("kind")
 
     if kind == "interval":
-        period_seconds = schedule.get("minutes", 1) * 60
+        minutes = schedule.get("minutes", 1)
+        if (
+            isinstance(minutes, bool)
+            or not isinstance(minutes, (int, float))
+            or (isinstance(minutes, float) and not math.isfinite(minutes))
+        ):
+            return MIN_GRACE
+        if minutes <= 0:
+            return MIN_GRACE
+        period_seconds = minutes * 60
         grace = period_seconds // 2
         return max(MIN_GRACE, min(grace, MAX_GRACE))
 
@@ -743,7 +811,13 @@ def compute_next_run(schedule: Dict[str, Any], last_run_at: Optional[str] = None
 
     elif kind == "interval":
         minutes = schedule.get("minutes")
-        if minutes is None:
+        if (
+            minutes is None
+            or isinstance(minutes, bool)
+            or not isinstance(minutes, (int, float))
+            or (isinstance(minutes, float) and not math.isfinite(minutes))
+            or minutes <= 0
+        ):
             return None
         if last_run_at:
             try:
@@ -1574,8 +1648,8 @@ def mark_job_run(job_id: str, success: bool, error: Optional[str] = None,
                 # (issue #38758), which already incremented completed — do not
                 # double-count them here.  Recurring jobs and direct callers
                 # with no pre-run claim still get the legacy increment.
-                if job.get("repeat"):
-                    repeat = job["repeat"]
+                repeat, _ = _normalize_repeat_record(job)
+                if repeat:
                     times = repeat.get("times")
                     completed = repeat.get("completed", 0)
                     kind = job.get("schedule", {}).get("kind")
@@ -1658,7 +1732,11 @@ def claim_dispatch(job_id: str) -> bool:
                 continue
             if job.get("schedule", {}).get("kind") != "once":
                 return True  # recurring jobs use advance_next_run(), not dispatch claims
-            repeat = job.get("repeat")
+            repeat, repeat_repaired = _normalize_repeat_record(job)
+            if repeat_repaired:
+                # Persist the repaired shape before returning so a malformed
+                # hand-edited value cannot crash the next lifecycle call.
+                save_jobs(jobs)
             if not repeat:
                 return True  # no repeat limit — always dispatch
             times = repeat.get("times")
