@@ -2295,7 +2295,17 @@ class ShellFileOperations(FileOperations):
         else:
             glob_pattern = pattern
 
+        search_root = Path(path)
+        has_hidden_path_ancestor = any(
+            part not in {".", ".."} and part.startswith(".")
+            for part in search_root.parts
+        )
         fetch_limit = limit + offset
+        # When the requested root itself is hidden, collect the complete
+        # candidate set before filtering hidden descendants.  Applying
+        # ``head`` first can fill the page with dotfiles and truncate visible
+        # matches that occur later in the traversal.
+        pagination_pipe = "" if has_hidden_path_ancestor else f" | head -n {fetch_limit}"
         # Try mtime-sorted first (rg 13+); fall back to unsorted if not supported.
         cmd_sorted = (
             f"rg --files --sortr=modified -g {self._escape_shell_arg(glob_pattern)} "
@@ -2304,8 +2314,8 @@ class ShellFileOperations(FileOperations):
             # preserved, which means a Git-Bash ``/c/...`` path would reach
             # rg unchanged and silently match nothing.  Convert only the
             # filesystem operand back to a native path for this executable.
-            f"{self._escape_native_path_arg(path)} 2>/dev/null "
-            f"| head -n {fetch_limit}"
+            f"{self._escape_native_path_arg(path)} 2>/dev/null"
+            f"{pagination_pipe}"
         )
         result = self._exec(cmd_sorted, timeout=60)
         stdout, limit_reason = _search_stdout_and_limit(result)
@@ -2319,8 +2329,8 @@ class ShellFileOperations(FileOperations):
             # --sortr may have failed on older rg; retry without it.
             cmd_plain = (
                 f"rg --files -g {self._escape_shell_arg(glob_pattern)} "
-                f"{self._escape_native_path_arg(path)} 2>/dev/null "
-                f"| head -n {fetch_limit}"
+                f"{self._escape_native_path_arg(path)} 2>/dev/null"
+                f"{pagination_pipe}"
             )
             result = self._exec(cmd_plain, timeout=60)
             stdout, limit_reason = _search_stdout_and_limit(result)
@@ -2340,11 +2350,6 @@ class ShellFileOperations(FileOperations):
             self._normalize_search_result_path(file_path)
             for file_path in all_files
         ]
-        search_root = Path(path)
-        has_hidden_path_ancestor = any(
-            part not in {".", ".."} and part.startswith(".")
-            for part in search_root.parts
-        )
         if has_hidden_path_ancestor:
             normalized_root = search_root.resolve()
             visible_files = []
