@@ -169,10 +169,11 @@ def test_three_endpoint_updates_follow_only_a_committed_main_release():
     readable_stage = updater.index('chmod -R a+rX "${stage}"')
     install_dispatch = updater.index('case "${role}" in', archive)
     node_install = updater.index(
-        'bash "${stage}/deploy/dbb3/install-dbb3-cloud-connector-user.sh"',
+        'bash "${preflight_root}/deploy/dbb3/install-dbb3-cloud-connector-user.sh"',
         install_dispatch,
     )
     assert archive < readable_stage < node_install
+    assert 'preflight_root="${state_root}/preflight.$$"' in updater
     assert '-- "${archive_paths[@]}"' in updater
     for relative in (
         "deploy/automation/update-fabric-node.sh",
