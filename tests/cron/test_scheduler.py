@@ -3333,6 +3333,19 @@ class TestParallelTick:
         assert result == 1
         advance.assert_called_once_with("negative-cap")
 
+    def test_malformed_workdir_does_not_abort_tick_partition(self):
+        job = {"id": "bad-workdir", "name": "bad", "deliver": "local", "workdir": 123}
+
+        with patch("cron.scheduler.get_due_jobs", return_value=[job]), \
+             patch("cron.scheduler.advance_next_run"), \
+             patch("cron.scheduler.run_job", return_value=(True, "output", "response", None)), \
+             patch("cron.scheduler.save_job_output", return_value="/tmp/out.md"), \
+             patch("cron.scheduler._deliver_result", return_value=None), \
+             patch("cron.scheduler.mark_job_run"):
+            from cron.scheduler import tick
+
+            assert tick(verbose=False) == 1
+
 
 class TestDeliverResultTimeoutCancelsFuture:
     """When future.result(timeout=60) raises TimeoutError in the live adapter

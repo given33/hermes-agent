@@ -4131,8 +4131,12 @@ def tick(
         # That alone only keeps workdir jobs from overlapping EACH OTHER;
         # run_job's _terminal_cwd_lock is what additionally stops a concurrently
         # firing workdir-less parallel-pool job from observing the override.
-        sequential_jobs = [j for j in due_jobs if (j.get("workdir") or "").strip()]
-        parallel_jobs = [j for j in due_jobs if not (j.get("workdir") or "").strip()]
+        def _has_job_workdir(job: dict) -> bool:
+            workdir = job.get("workdir")
+            return isinstance(workdir, str) and bool(workdir.strip())
+
+        sequential_jobs = [j for j in due_jobs if _has_job_workdir(j)]
+        parallel_jobs = [j for j in due_jobs if not _has_job_workdir(j)]
 
         _results: list = []
         _all_futures: list = []
