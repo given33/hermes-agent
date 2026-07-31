@@ -1192,6 +1192,13 @@ def test_native_action_metadata_matches_device_contract(
     assert metadata["permission"] == permission
 
 
+@pytest.mark.parametrize("action", ["search", "state"])
+def test_unregistered_search_and_state_actions_fail_closed(action):
+    metadata = ios_native_action_metadata("ios-device", action)
+    assert metadata["risk"] == "destructive"
+    assert metadata["confirmation"] == "required"
+
+
 def test_pulled_commands_include_canonical_native_action_metadata(store):
     command = store.queue_device_command("alice", "ios-reminders", "create", {"title": "x"})
     pulled = store.pull_device_commands("alice", "iphone")["commands"][0]

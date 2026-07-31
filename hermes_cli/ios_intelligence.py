@@ -93,7 +93,7 @@ _IOS_NATIVE_ACTION_POLICY: dict[tuple[str, str], dict[str, Any]] = {
 
 _IOS_NATIVE_READ_ACTIONS = frozenset({
     "get", "latest", "list", "current", "refresh", "read", "today", "snapshot",
-    "history", "capabilities", "evaluate", "server", "query", "plan", "search", "state",
+    "history", "capabilities", "evaluate", "server", "query", "plan",
 })
 
 
