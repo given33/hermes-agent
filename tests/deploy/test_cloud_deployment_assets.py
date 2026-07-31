@@ -287,6 +287,10 @@ def test_production_release_synchronizes_the_ios_workflow_observably():
     assert 'if [ -z "${production_run_id}" ] && [ -n "${failed_production_run_id}" ]; then' in workflow
     assert 'gh run rerun "${failed_production_run_id}"' in workflow
     assert 'if [ -z "${run_id}" ] && [ -z "${production_run_id}" ]; then' in workflow
+    assert "dispatch_release()" in workflow
+    assert 'elif [ -z "${run_id}" ] || [ -z "${production_run_id}" ]; then' in workflow
+    assert "if [ -z \"${run_id}\" ] || [ -z \"${production_run_id}\" ]; then" in workflow
+    assert "emit a fresh repository_dispatch" in workflow
     assert "reusing existing dispatch" in workflow
     assert "production EAS run could not be observed" in workflow
     assert 'echo "Observing iOS production EAS run ${production_run_id}"' in workflow
