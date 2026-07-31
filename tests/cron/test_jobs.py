@@ -1329,6 +1329,12 @@ class TestGetDueJobs:
         monkeypatch.setenv("HERMES_CRON_TIMEOUT", "not-a-number")
         assert ttl() == 1800.0
 
+        # Non-finite values must not create an unbounded or non-comparable TTL.
+        monkeypatch.setenv("HERMES_CRON_TIMEOUT", "inf")
+        assert ttl() == 1800.0
+        monkeypatch.setenv("HERMES_CRON_TIMEOUT", "nan")
+        assert ttl() == 1800.0
+
 
     def test_mark_job_run_clears_one_shot_run_claim(self, tmp_cron_dir, monkeypatch):
         """mark_job_run() clears the run_claim on completion so a re-dispatched

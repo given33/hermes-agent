@@ -215,6 +215,8 @@ def _oneshot_run_claim_ttl_seconds() -> float:
             timeout = float(raw)
         except (ValueError, TypeError):
             timeout = _DEFAULT_CRON_INACTIVITY_TIMEOUT
+    if not math.isfinite(timeout):
+        timeout = _DEFAULT_CRON_INACTIVITY_TIMEOUT
     if timeout <= 0:
         # Unlimited runs — cannot bound; use the fixed fallback floor.
         return float(ONESHOT_RUN_CLAIM_TTL_SECONDS)
