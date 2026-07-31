@@ -43,6 +43,7 @@ esac
 evidence_file="$(mktemp /run/hermes-fabric-evidence.XXXXXX)"
 curl_config="$(mktemp /run/hermes-fabric-curl.XXXXXX)"
 stage="$(mktemp -d "/run/hermes-fabric-${role}.XXXXXX")"
+preflight_root="${state_root}/preflight.$$"
 automation_script_target="${HERMES_FABRIC_AUTOMATION_SCRIPT_TARGET:-/usr/local/lib/hermes-agent/update-fabric-node.sh}"
 automation_service_target="${HERMES_FABRIC_AUTOMATION_SERVICE_TARGET:-/etc/systemd/system/hermes-fabric-update.service}"
 automation_timer_target="${HERMES_FABRIC_AUTOMATION_TIMER_TARGET:-/etc/systemd/system/hermes-fabric-update.timer}"
@@ -90,13 +91,13 @@ cleanup() {
     connector_backup="$(cat -- "${connector_handle}" 2>/dev/null)"
     case "${role}" in
       dbb3)
-        bash "${stage}/deploy/dbb3/install-dbb3-cloud-connector-user.sh" \
-          "${stage}/deploy/dbb3/dbb3_cloud_connector.py" \
+        bash "${preflight_root}/deploy/dbb3/install-dbb3-cloud-connector-user.sh" \
+          "${preflight_root}/deploy/dbb3/dbb3_cloud_connector.py" \
           "--rollback-backup=${connector_backup}" \
           || rollback_failed=1
         ;;
       wsl)
-        bash "${stage}/deploy/pc/install-pc-cloud-connector-user.sh" \
+        bash "${preflight_root}/deploy/pc/install-pc-cloud-connector-user.sh" \
           "--rollback-backup=${connector_backup}" \
           || rollback_failed=1
         ;;
@@ -160,7 +161,7 @@ cleanup() {
         ;;
     esac
   fi
-  rm -rf -- "${stage}"
+  rm -rf -- "${stage}" "${preflight_root}"
   rm -f -- "${evidence_file}" "${curl_config}" \
     "${automation_script_temp}" "${automation_service_temp}" \
     "${automation_timer_temp}" "${release_evidence_temp:-}"
@@ -270,6 +271,48 @@ chmod -R a+rX "${stage}"
 # the snapshot before it is removed.
 find "${stage}" -type d -exec chmod a+rx {} +
 
+# Connector preflight runs as the service account.  Keep that delegated read
+# path outside the private /run snapshot: some systemd/DrvFs combinations
+# retain restrictive traversal semantics for a root-created temporary tree
+# even after chmod.  Copy only the connector assets, with no credentials, into
+# a root-owned stable directory and remove it with the transaction cleanup.
+[[ ! -e "${preflight_root}" && ! -L "${preflight_root}" ]] \
+  || die "connector preflight path already exists"
+case "${role}" in
+  dbb3)
+    install -d -o root -g root -m 0755 \
+      "${preflight_root}/deploy/dbb3"
+    install -o root -g root -m 0755 \
+      "${stage}/deploy/dbb3/install-dbb3-cloud-connector-user.sh" \
+      "${preflight_root}/deploy/dbb3/install-dbb3-cloud-connector-user.sh"
+    install -o root -g root -m 0644 \
+      "${stage}/deploy/dbb3/dbb3_cloud_connector.py" \
+      "${preflight_root}/deploy/dbb3/dbb3_cloud_connector.py"
+    install -o root -g root -m 0644 \
+      "${stage}/deploy/dbb3/dbb3-cloud-connector.service" \
+      "${preflight_root}/deploy/dbb3/dbb3-cloud-connector.service"
+    ;;
+  wsl)
+    install -d -o root -g root -m 0755 \
+      "${preflight_root}/deploy/pc" "${preflight_root}/deploy/dbb3"
+    install -o root -g root -m 0755 \
+      "${stage}/deploy/pc/install-pc-cloud-connector-user.sh" \
+      "${preflight_root}/deploy/pc/install-pc-cloud-connector-user.sh"
+    install -o root -g root -m 0644 \
+      "${stage}/deploy/pc/pc-cloud-connector.service" \
+      "${preflight_root}/deploy/pc/pc-cloud-connector.service"
+    install -o root -g root -m 0755 \
+      "${stage}/deploy/dbb3/install-dbb3-cloud-connector-user.sh" \
+      "${preflight_root}/deploy/dbb3/install-dbb3-cloud-connector-user.sh"
+    install -o root -g root -m 0644 \
+      "${stage}/deploy/dbb3/dbb3_cloud_connector.py" \
+      "${preflight_root}/deploy/dbb3/dbb3_cloud_connector.py"
+    install -o root -g root -m 0644 \
+      "${stage}/deploy/dbb3/dbb3-cloud-connector.service" \
+      "${preflight_root}/deploy/dbb3/dbb3-cloud-connector.service"
+    ;;
+esac
+
 automation_assets=(
   "deploy/automation/update-fabric-node.sh"
   "deploy/automation/hermes-fabric-update.service"
@@ -378,8 +421,8 @@ ensure_user_units_active() {
 
 case "${role}" in
   dbb3)
-    bash "${stage}/deploy/dbb3/install-dbb3-cloud-connector-user.sh" \
-      "${stage}/deploy/dbb3/dbb3_cloud_connector.py" \
+    bash "${preflight_root}/deploy/dbb3/install-dbb3-cloud-connector-user.sh" \
+      "${preflight_root}/deploy/dbb3/dbb3_cloud_connector.py" \
       "--handle-file=${connector_handle}"
     connector_installed=1
     [[ "${HERMES_FABRIC_FAILPOINT:-}" != after-connector ]] \
@@ -389,7 +432,7 @@ case "${role}" in
     receiver_installed=1
     ;;
   wsl)
-    bash "${stage}/deploy/pc/install-pc-cloud-connector-user.sh" \
+    bash "${preflight_root}/deploy/pc/install-pc-cloud-connector-user.sh" \
       "--handle-file=${connector_handle}"
     connector_installed=1
     [[ "${HERMES_FABRIC_FAILPOINT:-}" != after-connector ]] \
