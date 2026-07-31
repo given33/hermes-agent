@@ -283,6 +283,8 @@ def test_production_release_synchronizes_the_ios_workflow_observably():
     assert "ios-production-eas.yml" in workflow
     assert "already has unsigned run" in workflow
     assert "find_failed_release_run" in workflow
+    assert 'if [ -z "${run_id}" ] && [ -n "${failed_run_id}" ]; then' in workflow
+    assert 'if [ -z "${production_run_id}" ] && [ -n "${failed_production_run_id}" ]; then' in workflow
     assert 'gh run rerun "${failed_production_run_id}"' in workflow
     assert 'if [ -z "${run_id}" ] && [ -z "${production_run_id}" ]; then' in workflow
     assert "reusing existing dispatch" in workflow
