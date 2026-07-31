@@ -2319,12 +2319,40 @@ class ShellFileOperations(FileOperations):
             stdout, limit_reason = _search_stdout_and_limit(result)
             all_files = [f for f in stdout.strip().split('\n') if f]
 
-        page = all_files[offset:offset + limit]
+        # An explicitly requested hidden root is allowed, but hidden
+        # descendants still follow the normal search policy.  ripgrep's
+        # ``--files`` behavior differs across versions/platforms here: on
+        # Git Bash it can return dotfiles below an explicit ``.hermes`` root,
+        # while the ``find`` fallback filters them.  Apply the same policy to
+        # both paths so the result does not depend on which backend is found.
+        normalized_files = [
+            self._normalize_search_result_path(file_path)
+            for file_path in all_files
+        ]
+        search_root = Path(path)
+        has_hidden_path_ancestor = any(
+            part not in {".", ".."} and part.startswith(".")
+            for part in search_root.parts
+        )
+        if has_hidden_path_ancestor:
+            normalized_root = search_root.resolve()
+            visible_files = []
+            for file_path in normalized_files:
+                try:
+                    rel_parts = Path(file_path).resolve().relative_to(normalized_root).parts
+                except ValueError:
+                    rel_parts = Path(file_path).parts
+                if any(part not in {".", ".."} and part.startswith(".") for part in rel_parts):
+                    continue
+                visible_files.append(file_path)
+            normalized_files = visible_files
+
+        page = normalized_files[offset:offset + limit]
 
         return SearchResult(
             files=page,
-            total_count=len(all_files),
-            truncated=len(all_files) >= fetch_limit or bool(limit_reason),
+            total_count=len(normalized_files),
+            truncated=len(normalized_files) >= fetch_limit or bool(limit_reason),
             limit_reason=limit_reason,
         )
     
