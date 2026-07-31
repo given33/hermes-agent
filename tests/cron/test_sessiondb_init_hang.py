@@ -81,10 +81,11 @@ class TestSessionDbInitTimeout:
         kwargs = mock_agent_cls.call_args.kwargs
         assert kwargs["session_db"] is None
 
-    def test_invalid_timeout_env_falls_back_to_default(self, tmp_path, monkeypatch, caplog):
+    @pytest.mark.parametrize("value", ["not-a-number", "nan", "-1"])
+    def test_invalid_timeout_env_falls_back_to_default(self, tmp_path, monkeypatch, caplog, value):
         """A malformed HERMES_CRON_SESSION_DB_TIMEOUT logs a warning and still
         bounds the call (mirrors HERMES_CRON_TIMEOUT's own fallback)."""
-        monkeypatch.setenv("HERMES_CRON_SESSION_DB_TIMEOUT", "not-a-number")
+        monkeypatch.setenv("HERMES_CRON_SESSION_DB_TIMEOUT", value)
         fake_db = MagicMock()
         job = {"id": "bad-timeout-env", "name": "test", "prompt": "hello"}
 

@@ -2999,6 +2999,18 @@ def run_job(
                     "Failed to load cron.session_db_timeout_seconds from config: %s",
                     exc,
                 )
+        # Only an explicit zero opts into the legacy unlimited behavior.
+        # Negative or non-finite values otherwise fall through the ``> 0``
+        # check below and accidentally disable the timeout entirely.
+        if _session_db_timeout is not None and (
+            not math.isfinite(_session_db_timeout) or _session_db_timeout < 0
+        ):
+            logger.warning(
+                "Invalid HERMES_CRON_SESSION_DB_TIMEOUT or "
+                "cron.session_db_timeout_seconds value %r; using default 10s",
+                _session_db_timeout,
+            )
+            _session_db_timeout = None
         if _session_db_timeout is None:
             _session_db_timeout = 10.0
 
