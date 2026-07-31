@@ -295,11 +295,10 @@ class TestKillStaleDashboardPosix:
              patch("hermes_cli.main._find_process_descendants", return_value=[]), \
              patch("hermes_cli.main._pid_exists", return_value=True), \
              patch("os.kill", side_effect=fake_kill), \
-             patch("time.sleep"), \
-             patch("time.monotonic", side_effect=[0.0] + [10.0] * 20):
-            # monotonic jumps past the 3s deadline on the second read so the
-            # grace loop exits immediately after one iteration.
-            _kill_stale_dashboard_processes()
+             patch("time.sleep"):
+            # No grace delay is needed here: the fake process deliberately
+            # ignores SIGTERM, so the hard-kill branch is deterministic.
+            _kill_stale_dashboard_processes(grace_seconds=0.0)
 
         signals_sent = [sig for _, sig in sent]
         assert _signal.SIGTERM in signals_sent

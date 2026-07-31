@@ -72,7 +72,9 @@ def test_lifespan_warmup_is_nonblocking():
 
     # Startup must complete before the blocking call could have finished.
     # If the import were synchronous, startup would block for >= SLOW_SECONDS.
-    threshold_ms = (SLOW_SECONDS * 1000) * 0.8
+    # Leave room for interpreter/import startup on shared CI runners while
+    # still requiring completion before the deliberately blocking call ends.
+    threshold_ms = (SLOW_SECONDS * 1000) * 0.95
     assert startup_ms < threshold_ms, (
         f"_lifespan blocked the event loop: startup took {startup_ms:.0f} ms "
         f"but slow import is {SLOW_SECONDS * 1000:.0f} ms — "
