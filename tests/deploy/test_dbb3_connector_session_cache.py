@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import json
 
+import pytest
+
 from deploy.dbb3 import dbb3_cloud_connector as connector_module
 
 
@@ -111,6 +113,11 @@ def test_main_once_returns_failure_for_transient_sync_error(tmp_path, monkeypatc
         )
         == 75
     )
+
+
+def test_main_rejects_non_finite_interval():
+    with pytest.raises(SystemExit):
+        connector_module.main(["--cloud-url", "https://example.test", "--interval", "inf"])
 
 
 def test_session_snapshot_cache_is_bounded_lru(tmp_path, monkeypatch):

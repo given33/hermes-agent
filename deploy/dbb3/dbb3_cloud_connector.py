@@ -2256,6 +2256,8 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--probe", action="store_true")
     parser.add_argument("--quiet", action="store_true")
     args = parser.parse_args(argv)
+    if not math.isfinite(args.interval):
+        parser.error("--interval must be finite")
     if not args.cloud_url:
         parser.error("--cloud-url or HERMES_CLOUD_URL is required")
     token = _load_token(args.token_file)
