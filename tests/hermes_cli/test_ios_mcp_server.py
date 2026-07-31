@@ -87,6 +87,28 @@ def test_clipboard_tools_are_scoped_and_require_confirmation_for_writes(tmp_path
     assert queued[-1]["payload"] == {"text": "draft"}
 
 
+@pytest.mark.parametrize(
+    ("capability", "tools"),
+    [
+        ("ios-contacts", {"ios_contacts_search", "ios_contacts_create"}),
+        ("ios-photos", {"ios_photos_search", "ios_photos_capture", "ios_photos_scan"}),
+        ("ios-media", {"ios_media_get", "ios_media_control"}),
+        ("ios-bluetooth", {"ios_bluetooth_state", "ios_bluetooth_scan"}),
+        ("ios-nfc", {"ios_nfc_scan"}),
+        ("ios-homekit", {"ios_homekit_list", "ios_homekit_set"}),
+    ],
+)
+def test_native_action_capabilities_expose_queue_tools(tmp_path, capability, tools):
+    server = create_mcp_server(capability, store=IOSIntelligenceStore(tmp_path))
+    assert {tool.name for tool in _tools(server)} == tools
+
+
+def test_photos_scope_does_not_grant_unsupported_library_writes():
+    manifest = ios_mcp_manifests()["ios-photos"]
+    assert manifest["scope"] == ["photos:read", "camera:write"]
+    assert "photos:write" not in manifest["scope"]
+
+
 def test_screen_time_server_exposes_native_monitor_controls(tmp_path):
     store = IOSIntelligenceStore(tmp_path)
     names = {
@@ -724,8 +746,12 @@ def test_runtime_supervisor_starts_probes_and_blue_green_upgrades_a_real_mcp_pro
         upgraded = runtime.blue_green_upgrade("ios-power", "1.1.0")
         assert upgraded["upgraded"] is True
         assert upgraded["previous_endpoint"] == old_endpoint
-        assert runtime.endpoint_for("ios-power").endswith(f":{power_port + offset}/mcp")
-        assert persisted == [("ios-power", power_port + offset, "1.1.0")]
+        effective_offset = runtime.blue_green_port_offset
+        assert effective_offset >= len(CAPABILITIES) + 1
+        assert runtime.endpoint_for("ios-power").endswith(
+            f":{power_port + effective_offset}/mcp"
+        )
+        assert persisted == [("ios-power", power_port + effective_offset, "1.1.0")]
         assert runtime.health_service("ios-power")["pid"] != old_pid
 
         rolled_back = runtime.blue_green_upgrade(
@@ -735,7 +761,9 @@ def test_runtime_supervisor_starts_probes_and_blue_green_upgrades_a_real_mcp_pro
         )
         assert rolled_back["upgraded"] is False
         assert rolled_back["rolled_back"] is True
-        assert runtime.endpoint_for("ios-power").endswith(f":{power_port + offset}/mcp")
+        assert runtime.endpoint_for("ios-power").endswith(
+            f":{power_port + effective_offset}/mcp"
+        )
         assert runtime.health_service("ios-power")["ok"] is True
     finally:
         runtime.stop()
@@ -743,7 +771,7 @@ def test_runtime_supervisor_starts_probes_and_blue_green_upgrades_a_real_mcp_pro
 
 @pytest.mark.integration
 def test_all_supervised_http_mcps_are_discovered_by_hermes(tmp_path, monkeypatch):
-    """Release gate: 21 real endpoints expose all 44 semantic tools."""
+    """Release gate: every supervised endpoint exposes its manifest tools."""
     from hermes_cli.ios_mcp_supervisor import IOSMCPRuntimeSupervisor
     from tools import mcp_tool
 
@@ -770,6 +798,10 @@ def test_all_supervised_http_mcps_are_discovered_by_hermes(tmp_path, monkeypatch
         transport="streamable-http",
         base_port=base_port,
     )
+    expected_tool_count = sum(
+        len(entry["manifest"]["tool_scopes"])
+        for entry in configs.values()
+    )
     runtime = IOSMCPRuntimeSupervisor(
         tmp_path / "all-runtime.db",
         db_dir=tmp_path / "all-intelligence",
@@ -794,11 +826,11 @@ def test_all_supervised_http_mcps_are_discovered_by_hermes(tmp_path, monkeypatch
                 time.sleep(0.5)
 
         assert len(healthy) == count
-        assert sum(len(tools) for tools in healthy.values()) == 44
+        assert sum(len(tools) for tools in healthy.values()) == expected_tool_count
 
         names = mcp_tool.discover_mcp_tools()
         status = mcp_tool.get_mcp_status()
-        assert len(names) == 44
+        assert len(names) == expected_tool_count
         assert len(status) == count
         assert all(item["connected"] for item in status)
         assert mcp_tool._server_connect_errors == {}

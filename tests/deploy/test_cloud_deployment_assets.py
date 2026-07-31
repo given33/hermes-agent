@@ -745,15 +745,16 @@ def test_public_installer_quiesces_state_during_snapshot_and_rollback():
     ).read_text(encoding="utf-8")
     assert '"/api/plugins/ios-intelligence/health"' in ios_plugin
     assert 'required_scope="collaboration:connector"' in ios_plugin
-    assert 'healthy_count") == 21' in installer
-    assert 'sum(len(item.get("tools") or []) for item in services) == 44' in installer
+    assert 'required_count = int(runtime.get("required_count") or 0)' in installer
+    assert 'runtime.get("healthy_count") == required_count' in installer
+    assert 'len(services) == required_count' in installer
     assert 'HERMES_IOS_HEALTH_ATTEMPTS:-180' in installer
     assert 'runtime.get("running") is True' in installer
     assert 'runtime.get("starting") is not True' in installer
     assert 'for _ in $(seq 1 "${ios_health_attempts}")' in installer
     assert 'validate_ios_health "${ios_health_file}"' in installer
     assert (
-        "iOS intelligence runtime did not reach 21 healthy MCPs and 44 tools"
+        "iOS intelligence runtime did not reach all required healthy MCPs and tools"
         in installer
     )
 

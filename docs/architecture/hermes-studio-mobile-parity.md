@@ -142,7 +142,7 @@ screens. All values are server sourced unless explicitly marked device local.
 | P0 | Kanban | Root task, child tasks, assignees, evidence, reviewer status, and progress |
 | P0 | Workflows | Visual stage list on iPhone; graph view on iPad/web preview |
 | P0 | Jobs | Create, edit, pause, resume, run now, and execution history |
-| P0 | MCP | 21 iOS MCP services, 44 tools, scopes, health, version, and recent calls |
+| P0 | MCP | All iOS MCP services and tools, scopes, health, version, and recent calls |
 | P0 | Skills and memory | Search, inspect, enable, disable, and usage history |
 | P0 | Devices | Main server, DBB3, WSL, iPhone, and Watch from real heartbeat timestamps |
 | P0 | Logs and health | Refreshable source-specific logs and health; no fixture status |

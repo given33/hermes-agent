@@ -581,14 +581,14 @@ assert not scheduler.get("last_error")
 assert runtime.get("ok") is True
 assert runtime.get("running") is True
 assert runtime.get("starting") is not True
-assert runtime.get("healthy_count") == 21
-assert runtime.get("required_count") == 21
+required_count = int(runtime.get("required_count") or 0)
+assert required_count > 0
+assert runtime.get("healthy_count") == required_count
 services = runtime.get("services") or []
-assert len(services) == 21
-assert sum(len(item.get("tools") or []) for item in services) == 44
+assert len(services) == required_count
 assert all(item.get("ok") is True for item in services)
 assert all(item.get("contract_ok") is True for item in services)
-assert len({item.get("name") for item in services}) == 21
+assert len({item.get("name") for item in services}) == required_count
 assert all(item.get("version") for item in services)
 assert all(item.get("active_version") == item.get("version") for item in services)
 assert all(
@@ -1480,7 +1480,7 @@ if [[ "${ios_enabled}" == 1 ]]; then
     sleep 1
   done
   [[ "${ios_healthy}" == 1 ]] || {
-    printf '%s\n' "iOS intelligence runtime did not reach 21 healthy MCPs and 44 tools" >&2
+    printf '%s\n' "iOS intelligence runtime did not reach all required healthy MCPs and tools" >&2
     validate_ios_health "${ios_health_file}" || true
     false
   }

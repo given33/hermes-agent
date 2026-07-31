@@ -36,7 +36,8 @@ CAPABILITIES = (
     "ios-location", "ios-trajectory", "ios-places", "ios-motion", "ios-behavior",
     "qweather", "amap-route", "ios-map", "ios-power", "ios-health-sleep",
     "ios-health-heart", "ios-health-oxygen", "ios-health-activity", "ios-calendar",
-    "ios-reminders", "ios-clipboard", "ios-notes", "ios-screen-time", "ios-watch", "ios-notification",
+    "ios-reminders", "ios-clipboard", "ios-contacts", "ios-photos", "ios-media",
+    "ios-bluetooth", "ios-nfc", "ios-homekit", "ios-notes", "ios-screen-time", "ios-watch", "ios-notification",
     "ios-live-activity", "ios-device",
 )
 
@@ -58,6 +59,12 @@ _SCOPE_BY_CAPABILITY = {
     "ios-calendar": ("calendar:read", "calendar:write"),
     "ios-reminders": ("reminders:read", "reminders:write"),
     "ios-clipboard": ("clipboard:read", "clipboard:write"),
+    "ios-contacts": ("contacts:read", "contacts:write"),
+    "ios-photos": ("photos:read", "camera:write"),
+    "ios-media": ("media:read", "media:control"),
+    "ios-bluetooth": ("bluetooth:read",),
+    "ios-nfc": ("nfc:read",),
+    "ios-homekit": ("homekit:read", "homekit:control"),
     "ios-notes": ("notes:share",),
     "ios-screen-time": ("screen-time:read", "screen-time:control"),
     "ios-watch": ("watch:read", "watch:control"),
@@ -116,6 +123,28 @@ _TOOL_SCOPE_BY_CAPABILITY = {
     "ios-clipboard": {
         "ios_clipboard_read": ("clipboard:read",),
         "ios_clipboard_write": ("clipboard:write",),
+    },
+    "ios-contacts": {
+        "ios_contacts_search": ("contacts:read",),
+        "ios_contacts_create": ("contacts:write",),
+    },
+    "ios-photos": {
+        "ios_photos_search": ("photos:read",),
+        "ios_photos_capture": ("camera:write",),
+        "ios_photos_scan": ("camera:write",),
+    },
+    "ios-media": {
+        "ios_media_get": ("media:read",),
+        "ios_media_control": ("media:control",),
+    },
+    "ios-bluetooth": {
+        "ios_bluetooth_state": ("bluetooth:read",),
+        "ios_bluetooth_scan": ("bluetooth:read",),
+    },
+    "ios-nfc": {"ios_nfc_scan": ("nfc:read",)},
+    "ios-homekit": {
+        "ios_homekit_list": ("homekit:read",),
+        "ios_homekit_set": ("homekit:control",),
     },
     "ios-notes": {"ios_notes_share_text": ("notes:share",)},
     "ios-screen-time": {
@@ -858,6 +887,72 @@ def create_mcp_server(
             ios_clipboard_write,
             name="ios_clipboard_write",
             description="Use when Hermes should write task output to the iPhone clipboard after the user explicitly approves it.",
+        )
+        return mcp
+
+    if capability == "ios-contacts":
+        _queue_tool(
+            mcp, enforcer, store, capability, "ios_contacts_search", "search",
+            "Use when Hermes needs to search the user's authorized iPhone contacts. Payload may include query and limit.",
+        )
+        _queue_tool(
+            mcp, enforcer, store, capability, "ios_contacts_create", "create",
+            "Use when the user explicitly asks Hermes to create a contact on the iPhone. The native bridge requires confirmation.",
+        )
+        return mcp
+
+    if capability == "ios-photos":
+        _queue_tool(
+            mcp, enforcer, store, capability, "ios_photos_search", "search",
+            "Use when Hermes needs to search the user's authorized iPhone photo library by filename or date window.",
+        )
+        _queue_tool(
+            mcp, enforcer, store, capability, "ios_photos_capture", "capture",
+            "Use when the user asks Hermes to take a new photo on the iPhone; the app must be foregrounded and the native camera requires confirmation.",
+        )
+        _queue_tool(
+            mcp, enforcer, store, capability, "ios_photos_scan", "scan",
+            "Use when the user asks Hermes to scan a visual code with the iPhone camera; the app must be foregrounded.",
+        )
+        return mcp
+
+    if capability == "ios-media":
+        _queue_tool(
+            mcp, enforcer, store, capability, "ios_media_get", "get",
+            "Use when Hermes needs the current iPhone media playback state.",
+        )
+        _queue_tool(
+            mcp, enforcer, store, capability, "ios_media_control", "control",
+            "Use when the user asks Hermes to play, pause, stop, skip, or resume media. Payload must contain action.",
+        )
+        return mcp
+
+    if capability == "ios-bluetooth":
+        _queue_tool(
+            mcp, enforcer, store, capability, "ios_bluetooth_state", "state",
+            "Use when Hermes needs the iPhone Bluetooth adapter state.",
+        )
+        _queue_tool(
+            mcp, enforcer, store, capability, "ios_bluetooth_scan", "scan",
+            "Use when the user asks Hermes to scan nearby Bluetooth devices. Payload may contain seconds.",
+        )
+        return mcp
+
+    if capability == "ios-nfc":
+        _queue_tool(
+            mcp, enforcer, store, capability, "ios_nfc_scan", "scan",
+            "Use when the user asks Hermes to read an NFC tag; the iPhone presents the native reader session.",
+        )
+        return mcp
+
+    if capability == "ios-homekit":
+        _queue_tool(
+            mcp, enforcer, store, capability, "ios_homekit_list", "list",
+            "Use when Hermes needs the user's HomeKit homes and reachable accessory state.",
+        )
+        _queue_tool(
+            mcp, enforcer, store, capability, "ios_homekit_set", "set",
+            "Use when the user explicitly asks Hermes to change a HomeKit characteristic. Payload must include accessoryId, characteristicId, and value; the native bridge requires confirmation.",
         )
         return mcp
 

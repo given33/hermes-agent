@@ -68,11 +68,32 @@ _IOS_NATIVE_ACTION_POLICY: dict[tuple[str, str], dict[str, Any]] = {
     ("ios-live-activity", "start"): {"risk": "write", "confirmation": "required", "permission": None},
     ("ios-live-activity", "end"): {"risk": "write", "confirmation": "required", "permission": None},
     ("ios-device", "delete-account-data"): {"risk": "destructive", "confirmation": "required", "permission": None},
+    ("ios-contacts", "search"): {"risk": "read", "confirmation": "none", "permission": "contacts"},
+    ("ios-contacts", "list"): {"risk": "read", "confirmation": "none", "permission": "contacts"},
+    ("ios-contacts", "create"): {"risk": "write", "confirmation": "required", "permission": "contacts"},
+    ("ios-photos", "search"): {"risk": "read", "confirmation": "none", "permission": "photos"},
+    ("ios-photos", "list"): {"risk": "read", "confirmation": "none", "permission": "photos"},
+    ("ios-photos", "capture"): {"risk": "write", "confirmation": "required", "permission": "camera"},
+    ("ios-photos", "scan"): {"risk": "write", "confirmation": "required", "permission": "camera"},
+    ("ios-media", "get"): {"risk": "read", "confirmation": "none", "permission": "media"},
+    ("ios-media", "control"): {"risk": "write", "confirmation": "required", "permission": "media"},
+    ("ios-media", "play"): {"risk": "write", "confirmation": "required", "permission": "media"},
+    ("ios-media", "resume"): {"risk": "write", "confirmation": "required", "permission": "media"},
+    ("ios-media", "pause"): {"risk": "write", "confirmation": "required", "permission": "media"},
+    ("ios-media", "next"): {"risk": "write", "confirmation": "required", "permission": "media"},
+    ("ios-media", "previous"): {"risk": "write", "confirmation": "required", "permission": "media"},
+    ("ios-media", "stop"): {"risk": "write", "confirmation": "required", "permission": "media"},
+    ("ios-bluetooth", "state"): {"risk": "read", "confirmation": "none", "permission": "bluetooth"},
+    ("ios-bluetooth", "scan"): {"risk": "read", "confirmation": "none", "permission": "bluetooth"},
+    ("ios-nfc", "scan"): {"risk": "read", "confirmation": "required", "permission": "nfc"},
+    ("ios-homekit", "list"): {"risk": "read", "confirmation": "none", "permission": "homekit"},
+    ("ios-homekit", "get"): {"risk": "read", "confirmation": "none", "permission": "homekit"},
+    ("ios-homekit", "set"): {"risk": "write", "confirmation": "required", "permission": "homekit"},
 }
 
 _IOS_NATIVE_READ_ACTIONS = frozenset({
     "get", "latest", "list", "current", "refresh", "read", "today", "snapshot",
-    "history", "capabilities", "evaluate", "server", "query", "plan",
+    "history", "capabilities", "evaluate", "server", "query", "plan", "search", "state",
 })
 
 
@@ -1355,7 +1376,7 @@ class IOSIntelligenceStore:
             conn.execute("PRAGMA busy_timeout=30000")
             conn.execute("PRAGMA secure_delete=ON")
             # Changing journal mode takes a database-wide lock and can race
-            # when all 21 MCP processes start together. SQLite does not always
+            # when all iOS MCP processes start together. SQLite does not always
             # honor busy_timeout for this PRAGMA, so retry the locked operation
             # explicitly until the same bounded connection timeout elapses.
             deadline = time.monotonic() + 30.0

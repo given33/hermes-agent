@@ -1174,6 +1174,24 @@ def test_native_action_metadata_fails_closed_for_unknown_actions():
     assert unknown["confirmation"] == "required"
 
 
+@pytest.mark.parametrize(
+    ("capability", "action", "risk", "confirmation", "permission"),
+    [
+        ("ios-media", "get", "read", "none", "media"),
+        ("ios-media", "control", "write", "required", "media"),
+        ("ios-media", "pause", "write", "required", "media"),
+        ("ios-nfc", "scan", "read", "required", "nfc"),
+    ],
+)
+def test_native_action_metadata_matches_device_contract(
+    capability, action, risk, confirmation, permission,
+):
+    metadata = ios_native_action_metadata(capability, action)
+    assert metadata["risk"] == risk
+    assert metadata["confirmation"] == confirmation
+    assert metadata["permission"] == permission
+
+
 def test_pulled_commands_include_canonical_native_action_metadata(store):
     command = store.queue_device_command("alice", "ios-reminders", "create", {"title": "x"})
     pulled = store.pull_device_commands("alice", "iphone")["commands"][0]

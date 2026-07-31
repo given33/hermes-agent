@@ -902,7 +902,7 @@ class TestResolveProfileEnv:
         resolve_profile_env("coder")
 
         config = yaml.safe_load((profile_dir / "config.yaml").read_text(encoding="utf-8"))
-        assert len(config["mcp_servers"]) == 21
+        assert len(config["mcp_servers"]) == len(IOS_MCP_CAPABILITIES)
         assert config["mcp_servers"]["ios-motion"]["enabled"] is False
         assert config["mcp_servers"]["ios-motion"]["granted_scopes"] == ["motion:read"]
 

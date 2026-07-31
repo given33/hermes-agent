@@ -365,7 +365,7 @@ elif [[ "${url}" == */api/plugins/ios-intelligence/health ]]; then
 import json
 services = [
     {"name": f"service-{index}", "ok": True, "tools": ["read", "write"] + (["extra"] if index < 2 else [])}
-    for index in range(21)
+    for index in range(28)
 ]
 print(json.dumps({
     "ok": True,
@@ -373,8 +373,8 @@ print(json.dumps({
     "mcp_runtime": {
         "ok": True,
         "running": True,
-        "healthy_count": 21,
-        "required_count": 21,
+        "healthy_count": 28,
+        "required_count": 28,
         "services": services,
     },
 }))

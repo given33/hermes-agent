@@ -963,9 +963,10 @@ class IOSMCPRuntimeSupervisor:
         log_path = self.log_directory / f"{service}{suffix}.log"
         log_handle = log_path.open("ab", buffering=0)
         env = os.environ.copy()
-        # Keep 21 isolated Python services within a predictable memory and
-        # thread footprint. These are internal runtime controls, not user-facing
-        # behavioral configuration.
+        # Keep each configured iOS capability in its own isolated Python
+        # service so one native surface cannot poison the others while keeping
+        # total runtime memory predictable. These are internal runtime
+        # controls, not user-facing behavioral configuration.
         env["PYTHONUNBUFFERED"] = _IOS_MCP_PROCESS_ENV["PYTHONUNBUFFERED"]
         for key, value in _IOS_MCP_PROCESS_ENV.items():
             env.setdefault(key, value)
