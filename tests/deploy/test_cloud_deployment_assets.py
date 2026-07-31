@@ -288,9 +288,15 @@ def test_production_release_synchronizes_the_ios_workflow_observably():
     assert ".name == $name" not in workflow
     assert 'if [ -z "${run_id}" ] && [ -n "${failed_run_id}" ]; then' in workflow
     assert 'if [ -z "${production_run_id}" ] && [ -n "${failed_production_run_id}" ]; then' in workflow
-    assert 'gh run rerun "${failed_production_run_id}"' in workflow
+    assert 'rerun_release "${failed_production_run_id}"' in workflow
     assert 'if [ -z "${run_id}" ] && [ -z "${production_run_id}" ]; then' in workflow
     assert "dispatch_release()" in workflow
+    assert "run_list()" in workflow
+    assert "run-list attempt ${attempt}/3" in workflow
+    assert "repository-dispatch attempt ${attempt}/3" in workflow
+    assert "rerun_release()" in workflow
+    assert "rerun attempt ${attempt}/3" in workflow
+    assert "sleep $((attempt * 5))" in workflow
     assert 'elif [ -z "${run_id}" ] || [ -z "${production_run_id}" ]; then' in workflow
     assert "if [ -z \"${run_id}\" ] || [ -z \"${production_run_id}\" ]; then" in workflow
     assert "emit a fresh repository_dispatch" in workflow

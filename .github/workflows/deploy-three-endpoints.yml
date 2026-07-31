@@ -169,38 +169,65 @@ jobs:
           }
           release_name="Backend release ${RELEASE_COMMIT}"
           production_release_name="Backend release signed ${RELEASE_COMMIT}"
+          run_list() {
+            local workflow="$1"
+            local output=""
+            for attempt in 1 2 3; do
+              if output="$(gh run list \
+                --repo "${IOS_REPOSITORY}" \
+                --workflow "${workflow}" \
+                --event repository_dispatch \
+                --limit 50 \
+                --json databaseId,displayTitle,status,conclusion)"; then
+                printf '%s' "${output}"
+                return 0
+              fi
+              echo "::warning::GitHub Actions API run-list attempt ${attempt}/3 failed for ${workflow}" >&2
+              [ "${attempt}" -lt 3 ] && sleep $((attempt * 5))
+            done
+            return 1
+          }
           find_release_run() {
             local workflow="$1"
             local run_name="$2"
-            gh run list \
-              --repo "${IOS_REPOSITORY}" \
-              --workflow "${workflow}" \
-              --event repository_dispatch \
-              --limit 50 \
-              --json databaseId,displayTitle,status,conclusion \
+            run_list "${workflow}" \
               | jq -r --arg name "${run_name}" \
                 'map(select(.displayTitle == $name and (.status == "queued" or .status == "in_progress" or (.status == "completed" and .conclusion == "success")))) | sort_by(.databaseId) | reverse | .[0].databaseId // empty'
           }
           find_failed_release_run() {
             local workflow="$1"
             local run_name="$2"
-            gh run list \
-              --repo "${IOS_REPOSITORY}" \
-              --workflow "${workflow}" \
-              --event repository_dispatch \
-              --limit 50 \
-              --json databaseId,displayTitle,status,conclusion \
+            run_list "${workflow}" \
               | jq -r --arg name "${run_name}" \
                 'map(select(.displayTitle == $name and .status == "completed" and .conclusion != "success")) | sort_by(.databaseId) | reverse | .[0].databaseId // empty'
           }
           dispatch_release() {
-            jq -n \
+            local payload
+            payload="$(jq -n \
               --arg event_type "hermes-backend-release" \
               --arg commit "${RELEASE_COMMIT}" \
               --arg version "${release_version}" \
-              '{event_type: $event_type, client_payload: {commit: $commit, version: $version}}' \
-              | gh api --method POST "repos/${IOS_REPOSITORY}/dispatches" --input -
-            echo "Dispatched backend release ${RELEASE_COMMIT} (${release_version}) to ${IOS_REPOSITORY}"
+              '{event_type: $event_type, client_payload: {commit: $commit, version: $version}}')"
+            for attempt in 1 2 3; do
+              if printf '%s' "${payload}" | gh api --method POST "repos/${IOS_REPOSITORY}/dispatches" --input -; then
+                echo "Dispatched backend release ${RELEASE_COMMIT} (${release_version}) to ${IOS_REPOSITORY}"
+                return 0
+              fi
+              echo "::warning::GitHub repository-dispatch attempt ${attempt}/3 failed" >&2
+              [ "${attempt}" -lt 3 ] && sleep $((attempt * 5))
+            done
+            return 1
+          }
+          rerun_release() {
+            local run_id="$1"
+            for attempt in 1 2 3; do
+              if gh run rerun "${run_id}" --repo "${IOS_REPOSITORY}"; then
+                return 0
+              fi
+              echo "::warning::GitHub Actions rerun attempt ${attempt}/3 failed for ${run_id}" >&2
+              [ "${attempt}" -lt 3 ] && sleep $((attempt * 5))
+            done
+            return 1
           }
 
           # A repository_dispatch starts both child workflows. Reuse active or
@@ -212,12 +239,12 @@ jobs:
           failed_run_id="$(find_failed_release_run ios-unsigned.yml "${release_name}")"
           failed_production_run_id="$(find_failed_release_run ios-production-eas.yml "${production_release_name}")"
           if [ -z "${run_id}" ] && [ -n "${failed_run_id}" ]; then
-            gh run rerun "${failed_run_id}" --repo "${IOS_REPOSITORY}"
+            rerun_release "${failed_run_id}"
             run_id="${failed_run_id}"
             echo "Re-running failed iOS unsigned run ${run_id}"
           fi
           if [ -z "${production_run_id}" ] && [ -n "${failed_production_run_id}" ]; then
-            gh run rerun "${failed_production_run_id}" --repo "${IOS_REPOSITORY}"
+            rerun_release "${failed_production_run_id}"
             production_run_id="${failed_production_run_id}"
             echo "Re-running failed iOS production EAS run ${production_run_id}"
           fi
