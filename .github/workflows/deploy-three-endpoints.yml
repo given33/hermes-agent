@@ -181,17 +181,38 @@ jobs:
               | jq -r --arg name "${run_name}" \
                 'map(select(.name == $name and (.status == "queued" or .status == "in_progress" or (.status == "completed" and .conclusion == "success")))) | sort_by(.databaseId) | reverse | .[0].databaseId // empty'
           }
+          find_failed_release_run() {
+            local workflow="$1"
+            local run_name="$2"
+            gh run list \
+              --repo "${IOS_REPOSITORY}" \
+              --workflow "${workflow}" \
+              --event repository_dispatch \
+              --limit 50 \
+              --json databaseId,name,status,conclusion \
+              | jq -r --arg name "${run_name}" \
+                'map(select(.name == $name and .status == "completed" and .conclusion != "success")) | sort_by(.databaseId) | reverse | .[0].databaseId // empty'
+          }
 
-          # A repository_dispatch starts both child workflows. Seeing either
-          # child proves the event was already accepted, so never dispatch the
-          # same release again while the sibling is still appearing in the
-          # Actions API. Re-dispatching here can cancel an in-flight build via
-          # the child workflow's concurrency group.
+          # A repository_dispatch starts both child workflows. Reuse active or
+          # successful runs while the sibling is still appearing in the API;
+          # completed failures are rerun individually so one failed child does
+          # not block the other child from ever being observed.
           run_id="$(find_release_run ios-unsigned.yml "${release_name}")"
           production_run_id="$(find_release_run ios-production-eas.yml "${production_release_name}")"
-          if [ -n "${run_id}" ] || [ -n "${production_run_id}" ]; then
-            echo "iOS release ${RELEASE_COMMIT} already has unsigned run ${run_id:-none} and production run ${production_run_id:-none}; reusing existing dispatch"
-          else
+          failed_run_id="$(find_failed_release_run ios-unsigned.yml "${release_name}")"
+          failed_production_run_id="$(find_failed_release_run ios-production-eas.yml "${production_release_name}")"
+          if [ -z "${run_id}" ] && [ -n "${failed_run_id}" ]; then
+            gh run rerun "${failed_run_id}" --repo "${IOS_REPOSITORY}"
+            run_id="${failed_run_id}"
+            echo "Re-running failed iOS unsigned run ${run_id}"
+          fi
+          if [ -z "${production_run_id}" ] && [ -n "${failed_production_run_id}" ]; then
+            gh run rerun "${failed_production_run_id}" --repo "${IOS_REPOSITORY}"
+            production_run_id="${failed_production_run_id}"
+            echo "Re-running failed iOS production EAS run ${production_run_id}"
+          fi
+          if [ -z "${run_id}" ] && [ -z "${production_run_id}" ]; then
             jq -n \
               --arg event_type "hermes-backend-release" \
               --arg commit "${RELEASE_COMMIT}" \
@@ -199,6 +220,8 @@ jobs:
               '{event_type: $event_type, client_payload: {commit: $commit, version: $version}}' \
               | gh api --method POST "repos/${IOS_REPOSITORY}/dispatches" --input -
             echo "Dispatched backend release ${RELEASE_COMMIT} (${release_version}) to ${IOS_REPOSITORY}"
+          else
+            echo "iOS release ${RELEASE_COMMIT} already has unsigned run ${run_id:-none} and production run ${production_run_id:-none}; reusing existing dispatch"
           fi
           # Poll both workflows together. This covers the normal API delay and
           # the case where one workflow is queued before the other is visible.

@@ -76,8 +76,9 @@ iOS fan-out so they do not enqueue an app build every two hours.
 Configure the following repository settings before enabling this fan-out:
 
 - Secret `HERMES_IOS_WORKFLOW_TOKEN`: a short-lived or narrowly scoped token
-  with Contents write and Actions read access to the target iOS repository. It
-  must be able to call the repository dispatch API and read workflow runs.
+  with Contents write and Actions write access to the target iOS repository. It
+  must be able to dispatch events, rerun failed child workflows, and read
+  workflow runs.
 - Repository variable `HERMES_IOS_REPOSITORY`: optional; defaults to
   `given33/hermes-ios` and should be set when the iOS repository moves.
 - The target workflows must keep `repository_dispatch` enabled for event type

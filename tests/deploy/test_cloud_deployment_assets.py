@@ -282,7 +282,9 @@ def test_production_release_synchronizes_the_ios_workflow_observably():
     assert "jq -n" in workflow
     assert "ios-production-eas.yml" in workflow
     assert "already has unsigned run" in workflow
-    assert 'if [ -n "${run_id}" ] || [ -n "${production_run_id}" ]; then' in workflow
+    assert "find_failed_release_run" in workflow
+    assert 'gh run rerun "${failed_production_run_id}"' in workflow
+    assert 'if [ -z "${run_id}" ] && [ -z "${production_run_id}" ]; then' in workflow
     assert "reusing existing dispatch" in workflow
     assert "production EAS run could not be observed" in workflow
     assert 'echo "Observing iOS production EAS run ${production_run_id}"' in workflow
@@ -292,7 +294,7 @@ def test_production_release_synchronizes_the_ios_workflow_observably():
     assert "repository dispatch was accepted but its unsigned run could not be observed" in workflow
 
     operations = (ROOT / "docs" / "spec" / "OPERATIONS.md").read_text(encoding="utf-8")
-    assert "Contents write and Actions read access" in operations
+    assert "Contents write and Actions write access" in operations
 
 
 def test_site_pushes_trigger_vercel_and_pages_deployments():
