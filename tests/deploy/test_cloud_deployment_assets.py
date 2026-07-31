@@ -272,12 +272,14 @@ def test_production_release_synchronizes_the_ios_workflow_observably():
     assert "given33/hermes-ios" in workflow
     assert "ios-unsigned.yml" in workflow
     assert 'gh api --method POST "repos/${IOS_REPOSITORY}/dispatches"' in workflow
-    assert '"event_type":"hermes-backend-release"' in workflow
-    assert '"commit":"${RELEASE_COMMIT}"' in workflow
-    assert '"version":"${release_version}"' in workflow
+    assert '--arg event_type "hermes-backend-release"' in workflow
+    assert '--arg commit "${RELEASE_COMMIT}"' in workflow
+    assert '--arg version "${release_version}"' in workflow
     assert "release_name=\"Backend release ${RELEASE_COMMIT}\"" in workflow
     assert "production_release_name=\"Backend release signed ${RELEASE_COMMIT}\"" in workflow
     assert 'find_release_run ios-production-eas.yml "${production_release_name}"' in workflow
+    assert "Dashboard release version contains unsupported characters" in workflow
+    assert "jq -n" in workflow
     assert "ios-production-eas.yml" in workflow
     assert "already has unsigned run" in workflow
     assert 'if [ -n "${run_id}" ] || [ -n "${production_run_id}" ]; then' in workflow

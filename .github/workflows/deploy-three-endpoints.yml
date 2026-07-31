@@ -163,6 +163,10 @@ jobs:
           print(json.loads(Path('plugins/collaboration/dashboard/manifest.json').read_text(encoding='utf-8'))['version'])
           PY
           )"
+          [[ "${release_version}" =~ ^[0-9A-Za-z.+_-]+$ ]] || {
+            echo "::error::Dashboard release version contains unsupported characters: ${release_version}"
+            exit 1
+          }
           release_name="Backend release ${RELEASE_COMMIT}"
           production_release_name="Backend release signed ${RELEASE_COMMIT}"
           find_release_run() {
@@ -188,9 +192,12 @@ jobs:
           if [ -n "${run_id}" ] || [ -n "${production_run_id}" ]; then
             echo "iOS release ${RELEASE_COMMIT} already has unsigned run ${run_id:-none} and production run ${production_run_id:-none}; reusing existing dispatch"
           else
-            gh api --method POST "repos/${IOS_REPOSITORY}/dispatches" --input - <<EOF
-          {"event_type":"hermes-backend-release","client_payload":{"commit":"${RELEASE_COMMIT}","version":"${release_version}"}}
-          EOF
+            jq -n \
+              --arg event_type "hermes-backend-release" \
+              --arg commit "${RELEASE_COMMIT}" \
+              --arg version "${release_version}" \
+              '{event_type: $event_type, client_payload: {commit: $commit, version: $version}}' \
+              | gh api --method POST "repos/${IOS_REPOSITORY}/dispatches" --input -
             echo "Dispatched backend release ${RELEASE_COMMIT} (${release_version}) to ${IOS_REPOSITORY}"
           fi
           # Poll both workflows together. This covers the normal API delay and
