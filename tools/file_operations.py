@@ -2265,6 +2265,9 @@ class ShellFileOperations(FileOperations):
         """
         if os.name != "nt" or not path:
             return path
+        if re.match(r"^[A-Za-z]:[\\/]", path):
+            native = os.path.normpath(path)
+            return native if Path(native).exists() else path
         if not re.match(r"^/(?:mnt/|cygdrive/)?[A-Za-z](?:/|$)", path):
             return path
         try:
@@ -2306,7 +2309,11 @@ class ShellFileOperations(FileOperations):
         )
         result = self._exec(cmd_sorted, timeout=60)
         stdout, limit_reason = _search_stdout_and_limit(result)
-        all_files = [f for f in stdout.strip().split('\n') if f]
+        all_files = [
+            self._normalize_search_result_path(f)
+            for f in stdout.strip().split('\n')
+            if f
+        ]
 
         if not all_files and not limit_reason:
             # --sortr may have failed on older rg; retry without it.
@@ -2317,7 +2324,11 @@ class ShellFileOperations(FileOperations):
             )
             result = self._exec(cmd_plain, timeout=60)
             stdout, limit_reason = _search_stdout_and_limit(result)
-            all_files = [f for f in stdout.strip().split('\n') if f]
+            all_files = [
+                self._normalize_search_result_path(f)
+                for f in stdout.strip().split('\n')
+                if f
+            ]
 
         # An explicitly requested hidden root is allowed, but hidden
         # descendants still follow the normal search policy.  ripgrep's
