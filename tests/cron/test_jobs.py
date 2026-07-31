@@ -285,6 +285,28 @@ class TestJobCRUD:
         assert jobs[0]["schedule_display"] == "every 60m"
         assert jobs[0]["state"] == "scheduled"
 
+    def test_string_false_enabled_is_disabled_consistently(self, tmp_cron_dir):
+        past = (datetime.now(timezone.utc) - timedelta(seconds=5)).isoformat()
+        save_jobs([{
+            "id": "disabled-string",
+            "name": "disabled",
+            "enabled": "false",
+            "schedule": {"kind": "once", "run_at": past},
+            "next_run_at": past,
+        }, {
+            "id": "enabled-bool",
+            "name": "enabled",
+            "enabled": True,
+            "schedule": {"kind": "once", "run_at": past},
+            "next_run_at": past,
+        }])
+
+        due = get_due_jobs()
+
+        assert [job["id"] for job in due] == ["enabled-bool"]
+        assert load_jobs()[0]["enabled"] is False
+        assert [job["id"] for job in list_jobs()] == ["enabled-bool"]
+
     def test_remove_job(self, tmp_cron_dir):
         job = create_job(prompt="Temp job", schedule="30m")
         assert remove_job(job["id"]) is True
