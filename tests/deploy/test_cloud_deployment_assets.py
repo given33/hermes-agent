@@ -926,10 +926,7 @@ def test_dbb3_user_installer_rolls_back_each_mutating_failure_stage():
         wsl = shutil.which("wsl.exe")
         if not wsl:
             return
-        harness_path = subprocess.check_output(
-            [wsl, "wslpath", "-a", str(harness).replace("\\", "/")],
-            text=True,
-        ).strip()
+        harness_path = _posix_path(harness)
         command = [wsl, "sudo", "-n", "bash", harness_path]
     else:
         if os.geteuid() == 0:

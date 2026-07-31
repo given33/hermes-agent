@@ -307,6 +307,24 @@ class TestJobCRUD:
         assert load_jobs()[0]["enabled"] is False
         assert [job["id"] for job in list_jobs()] == ["enabled-bool"]
 
+    def test_string_false_no_agent_is_normalized(self, tmp_cron_dir):
+        created = create_job(
+            prompt="Use the model", schedule="every 5m", no_agent="false"
+        )
+        assert created["no_agent"] is False
+
+        save_jobs([{
+            "id": "agent-job",
+            "no_agent": "false",
+            "prompt": "Use the model",
+            "schedule": {"kind": "interval", "minutes": 5},
+            "next_run_at": (datetime.now(timezone.utc) + timedelta(minutes=5)).isoformat(),
+        }])
+
+        fetched = get_job("agent-job")
+
+        assert fetched["no_agent"] is False
+
     def test_remove_job(self, tmp_cron_dir):
         job = create_job(prompt="Temp job", schedule="30m")
         assert remove_job(job["id"]) is True

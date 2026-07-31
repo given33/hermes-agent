@@ -536,8 +536,9 @@ def _normalize_job_record(job: Dict[str, Any]) -> Dict[str, Any]:
         name = label_source[:50].strip() or "cron job"
     normalized["name"] = name
     normalized["schedule_display"] = _schedule_display_for_job(normalized)
-    if "enabled" in normalized:
-        normalized["enabled"] = _coerce_job_enabled(normalized.get("enabled"))
+    for flag, default in (("enabled", True), ("no_agent", False)):
+        if flag in normalized:
+            normalized[flag] = _coerce_job_enabled(normalized.get(flag), default)
 
     state = _coerce_job_text(normalized.get("state")).strip()
     if not state:
@@ -1152,7 +1153,7 @@ def _compute_provider_model_snapshots(
         base_url,
         strip_trailing_slash=True,
     )
-    if bool(no_agent):
+    if _coerce_job_enabled(no_agent, False):
         return None, None
 
     provider_snapshot: Optional[str] = None
@@ -1183,7 +1184,7 @@ def _normalized_inference_axes(job: Dict[str, Any]) -> Tuple[Optional[str], Opti
         _normalize_job_optional_text(job.get("provider")),
         _normalize_job_optional_text(job.get("model")),
         _normalize_job_optional_text(job.get("base_url"), strip_trailing_slash=True),
-        bool(job.get("no_agent")),
+        _coerce_job_enabled(job.get("no_agent"), False),
     )
 
 
@@ -1279,7 +1280,7 @@ def create_job(
     normalized_toolsets = [str(t).strip() for t in enabled_toolsets if str(t).strip()] if enabled_toolsets else None
     normalized_toolsets = normalized_toolsets or None
     normalized_workdir = _normalize_workdir(workdir)
-    normalized_no_agent = bool(no_agent)
+    normalized_no_agent = _coerce_job_enabled(no_agent, False)
     normalized_attach = attach_to_session if isinstance(attach_to_session, bool) else None
 
     # no_agent jobs are meaningless without a script — the script IS the job.
@@ -2110,12 +2111,13 @@ def _get_due_jobs_locked() -> List[Dict[str, Any]]:
     # malformed counter from a hand-edited jobs.json would otherwise raise in
     # that per-job guard and silently skip the job forever.
     for j, rj in zip(jobs, raw_jobs):
-        if "enabled" in j:
-            enabled = _coerce_job_enabled(j.get("enabled"))
-            if j.get("enabled") != enabled:
-                j["enabled"] = enabled
-                rj["enabled"] = enabled
-                needs_save = True
+        for flag, default in (("enabled", True), ("no_agent", False)):
+            if flag in j:
+                normalized_flag = _coerce_job_enabled(j.get(flag), default)
+                if j.get(flag) != normalized_flag:
+                    j[flag] = normalized_flag
+                    rj[flag] = normalized_flag
+                    needs_save = True
         _repeat, repaired = _normalize_repeat_record(j)
         if repaired:
             rj["repeat"] = copy.deepcopy(j["repeat"])

@@ -53,6 +53,21 @@ from hermes_time import now as _hermes_now
 logger = logging.getLogger(__name__)
 
 
+def _coerce_cron_bool(value: Any, default: bool = False) -> bool:
+    """Interpret bool-like values from legacy or hand-edited job records."""
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, (int, float)) and not isinstance(value, bool):
+        return value != 0
+    if isinstance(value, str):
+        normalized = value.strip().casefold()
+        if normalized in {"true", "yes", "on", "1"}:
+            return True
+        if normalized in {"false", "no", "off", "0", ""}:
+            return False
+    return default
+
+
 def _set_cron_session_title(session_db, session_id, base_title):
     """Robustly title a finished cron session before it is closed.
 
@@ -2839,7 +2854,7 @@ def run_job(
     #   - wakeAgent=false gate    → treated like empty stdout (silent), since
     #                               the whole point of no_agent is that there
     #                               is no agent to wake
-    if job.get("no_agent"):
+    if _coerce_cron_bool(job.get("no_agent"), False):
         script_path = job.get("script")
         if not script_path:
             err = "no_agent=True but no script is set for this job"
