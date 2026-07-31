@@ -167,7 +167,7 @@ def test_three_endpoint_updates_follow_only_a_committed_main_release():
     assert "refs/remotes/origin/main" in updater
     archive = updater.index('archive --format=tar "${release_commit}"')
     readable_stage = updater.index('chmod -R a+rX "${stage}"')
-    install_dispatch = updater.index('case "${role}" in', archive)
+    install_dispatch = updater.rindex('case "${role}" in')
     node_install = updater.index(
         'bash "${preflight_root}/deploy/dbb3/install-dbb3-cloud-connector-user.sh"',
         install_dispatch,
