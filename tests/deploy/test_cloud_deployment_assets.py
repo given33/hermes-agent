@@ -139,6 +139,21 @@ def test_deployment_shell_scripts_have_valid_syntax():
             wsl = shutil.which("wsl.exe")
             if not wsl:
                 continue
+            # `wsl.exe` can be present while the service is unavailable (for
+            # example when the current Windows account cannot start a distro).
+            # Treat that as an environment limitation instead of reporting a
+            # false shell syntax failure with WSL's unsigned exit code.
+            try:
+                probe = subprocess.run(
+                    [wsl, "-e", "true"],
+                    capture_output=True,
+                    timeout=15,
+                    check=False,
+                )
+            except (OSError, subprocess.TimeoutExpired) as exc:
+                pytest.skip(f"WSL is unavailable for deployment script tests: {exc}")
+            if probe.returncode != 0:
+                pytest.skip("WSL service is unavailable for deployment script tests")
             # wsl.exe can consume backslashes while forwarding argv to Linux.
             # wslpath accepts forward-slash Windows paths without ambiguity.
             posix_path = _posix_path(path)
