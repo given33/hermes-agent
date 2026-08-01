@@ -768,6 +768,9 @@ def test_public_installer_quiesces_state_during_snapshot_and_rollback():
     assert 'restore_sqlite "${backup}/state/mobile-auth.db"' in rollback
     assert 'backup_sqlite "${mobile_auth_target}" "${backup}/state/mobile-auth.db"' in installer
     assert "prepare_sqlite_runtime_target()" in installer
+    assert '"/tmp/hermes-agent-deploy/"*' in installer
+    assert '"/dev/shm/hermes-agent-deploy/"*' in installer
+    assert "approved Hermes deployment staging root" in installer
     assert 'for suffix in -wal -shm -journal' in installer
     assert 'chown "${service_user}:${service_group}" "${sidecar}"' in installer
     assert 'chmod 0600 "${sidecar}"' in installer

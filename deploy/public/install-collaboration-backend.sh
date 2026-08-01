@@ -49,8 +49,10 @@ release_phase() {
 stage_owner="${HERMES_STAGE_OWNER:-admin}"
 stage_root="$(realpath -e -- "${stage}")"
 case "${stage_root}" in
-  "/home/${stage_owner}/.cache/hermes-agent-deploy/"*) ;;
-  *) die "stage must be below /home/${stage_owner}/.cache/hermes-agent-deploy" ;;
+  "/home/${stage_owner}/.cache/hermes-agent-deploy/"*|\
+  "/tmp/hermes-agent-deploy/"*|\
+  "/dev/shm/hermes-agent-deploy/"*) ;;
+  *) die "stage must be below an approved Hermes deployment staging root" ;;
 esac
 [[ "$(stat -c '%U' "${stage_root}")" == "${stage_owner}" ]] || die "stage is not owned by ${stage_owner}"
 
