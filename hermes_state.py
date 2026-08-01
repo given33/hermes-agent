@@ -333,15 +333,26 @@ def _on_disk_journal_mode(conn: sqlite3.Connection) -> Optional[str]:
     return str(mode).strip().lower() if mode is not None else None
 
 
-def _sqlite_database_has_no_free_space(conn: sqlite3.Connection) -> bool:
-    """Return whether the database mount reports zero free bytes."""
+def _sqlite_database_has_no_free_space(
+    conn: sqlite3.Connection,
+    database_path: Optional[Path | str] = None,
+) -> bool:
+    """Return whether the database mount reports zero free bytes.
+
+    ``PRAGMA database_list`` is normally the best source of truth, but on a
+    completely full filesystem SQLite can fail that read with the same
+    ``disk I/O error`` that triggered this helper.  Callers that know the
+    opened path should pass it so the full-volume fallback remains reliable.
+    """
 
     try:
-        row = conn.execute("PRAGMA database_list").fetchone()
-        database_path = str(row[2]) if row and len(row) > 2 else ""
-        if not database_path or database_path == ":memory:":
+        resolved_path = str(database_path or "").strip()
+        if not resolved_path:
+            row = conn.execute("PRAGMA database_list").fetchone()
+            resolved_path = str(row[2]) if row and len(row) > 2 else ""
+        if not resolved_path or resolved_path == ":memory:":
             return False
-        return shutil.disk_usage(Path(database_path).parent).free == 0
+        return shutil.disk_usage(Path(resolved_path).expanduser().parent).free == 0
     except (OSError, sqlite3.OperationalError, TypeError):
         return False
 
@@ -415,6 +426,7 @@ def apply_wal_with_fallback(
     conn: sqlite3.Connection,
     *,
     db_label: str = "state.db",
+    database_path: Optional[Path | str] = None,
 ) -> str:
     """Set ``journal_mode=WAL`` on ``conn``, falling back to DELETE on failure.
 
@@ -454,7 +466,9 @@ def apply_wal_with_fallback(
         return "wal"
     except sqlite3.OperationalError as exc:
         msg = str(exc).lower()
-        disk_full = "disk i/o error" in msg and _sqlite_database_has_no_free_space(conn)
+        disk_full = "disk i/o error" in msg and _sqlite_database_has_no_free_space(
+            conn, database_path
+        )
         if not any(marker in msg for marker in _WAL_INCOMPAT_MARKERS) and not disk_full:
             # Unrelated OperationalError — don't silently swallow.
             raise
@@ -1100,7 +1114,9 @@ class SessionDB:
                     isolation_level=None,
                 )
                 self._conn.row_factory = sqlite3.Row
-                apply_wal_with_fallback(self._conn, db_label="state.db")
+                apply_wal_with_fallback(
+                    self._conn, db_label="state.db", database_path=self.db_path
+                )
                 self._conn.execute("PRAGMA foreign_keys=ON")
                 self._init_schema()
 

@@ -150,6 +150,32 @@ class TestApplyWalWithFallback:
         assert apply_wal_with_fallback(conn, db_label="full.db") == "default"
         conn.close()
 
+    def test_uses_explicit_database_path_when_database_list_probe_fails(
+        self, monkeypatch, tmp_path
+    ):
+        class _AllJournalPragmasFailConnection(sqlite3.Connection):
+            def execute(self, sql, *args, **kwargs):  # type: ignore[override]
+                if "journal_mode" in sql.lower() or "database_list" in sql.lower():
+                    raise sqlite3.OperationalError("disk I/O error")
+                return super().execute(sql, *args, **kwargs)
+
+        target = tmp_path / "full-explicit.db"
+        conn = sqlite3.connect(
+            str(target), factory=_AllJournalPragmasFailConnection, isolation_level=None
+        )
+        monkeypatch.setattr(
+            "hermes_state.shutil.disk_usage",
+            lambda path: SimpleNamespace(free=0),
+        )
+
+        assert (
+            apply_wal_with_fallback(
+                conn, db_label="full-explicit.db", database_path=target
+            )
+            == "default"
+        )
+        conn.close()
+
     def test_does_not_downgrade_when_disk_says_wal(self, tmp_path):
         """Refuse to downgrade an already-WAL DB even if the set-pragma path
         would have raised a downgrade-eligible marker.

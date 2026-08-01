@@ -167,7 +167,9 @@ def connect(db_path: Optional[Path] = None) -> sqlite3.Connection:
         conn.row_factory = sqlite3.Row
         from hermes_state import apply_wal_with_fallback
 
-        apply_wal_with_fallback(conn, db_label="projects.db")
+        apply_wal_with_fallback(
+            conn, db_label="projects.db", database_path=path
+        )
         conn.execute("PRAGMA foreign_keys=ON")
         if resolved not in _INITIALIZED_PATHS:
             conn.executescript(SCHEMA_SQL)

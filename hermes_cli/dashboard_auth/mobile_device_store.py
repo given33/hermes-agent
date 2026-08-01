@@ -215,7 +215,9 @@ class MobileDeviceStore:
             conn.execute("PRAGMA foreign_keys=ON")
             from hermes_state import apply_wal_with_fallback
 
-            apply_wal_with_fallback(conn, db_label="mobile-auth.db")
+            apply_wal_with_fallback(
+                conn, db_label="mobile-auth.db", database_path=path
+            )
             current_version = int(conn.execute("PRAGMA user_version").fetchone()[0])
             if current_version > SCHEMA_VERSION:
                 raise RuntimeError(
