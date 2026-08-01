@@ -16,6 +16,7 @@ import logging
 import multiprocessing
 import os
 from pathlib import Path
+import shutil
 import sqlite3
 import subprocess
 import sys
@@ -115,6 +116,54 @@ class _ClosingSQLiteConnection(sqlite3.Connection):
             self.close()
 
 
+def _configure_supervisor_journal_mode(
+    conn: sqlite3.Connection,
+    db_path: Path,
+) -> str:
+    """Enable WAL, with a guarded DELETE fallback for network-style mounts.
+
+    The supervisor database is single-owner state.  Some NFS/SMB/FUSE mounts
+    report ``disk I/O error`` rather than ``locking protocol`` when SQLite
+    probes WAL.  DELETE journaling is safe for this one-writer database, but a
+    real full/damaged disk must still fail closed, so only fall back when the
+    mount has usable free space and the on-disk journal is not already WAL.
+    """
+
+    try:
+        current = conn.execute("PRAGMA journal_mode").fetchone()
+        if current and str(current[0]).lower() == "wal":
+            return "wal"
+    except sqlite3.OperationalError:
+        pass
+
+    try:
+        conn.execute("PRAGMA journal_mode=WAL")
+        return "wal"
+    except sqlite3.OperationalError as exc:
+        if "disk i/o error" not in str(exc).lower():
+            raise
+        try:
+            free_bytes = shutil.disk_usage(db_path.parent).free
+        except OSError:
+            raise exc
+        if free_bytes < 16 * 1024 * 1024:
+            raise exc
+        try:
+            existing = conn.execute("PRAGMA journal_mode").fetchone()
+            if existing and str(existing[0]).lower() == "wal":
+                raise exc
+            conn.execute("PRAGMA journal_mode=DELETE")
+        except sqlite3.OperationalError:
+            raise exc
+        logger.warning(
+            "iOS MCP supervisor SQLite WAL is unavailable at %s (%s); "
+            "using journal_mode=DELETE because the mount has free space",
+            db_path,
+            exc,
+        )
+        return "delete"
+
+
 @dataclass
 class MCPService:
     name: str
@@ -203,7 +252,7 @@ class IOSMCPSupervisor:
     def _connect(self) -> sqlite3.Connection:
         conn = sqlite3.connect(self.path, timeout=30, isolation_level=None, factory=_ClosingSQLiteConnection)
         conn.row_factory = sqlite3.Row
-        conn.execute("PRAGMA journal_mode=WAL")
+        _configure_supervisor_journal_mode(conn, self.path)
         conn.execute("PRAGMA busy_timeout=30000")
         return conn
 
