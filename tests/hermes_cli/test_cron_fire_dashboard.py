@@ -157,3 +157,38 @@ def test_valid_token_accepts_and_fires(monkeypatch):
     finally:
         _restore(pa, ph)
         client.close()
+
+
+def test_valid_token_task_is_released_after_execution(monkeypatch):
+    """The dashboard retains the accepted task, then removes it on completion."""
+    fired = []
+    monkeypatch.setattr(
+        "plugins.cron_providers.chronos.verify.get_fire_verifier",
+        lambda: (lambda **kw: _claims("j2")),
+    )
+    monkeypatch.setattr(web_server, "_find_cron_job_profile", lambda jid: "default")
+    monkeypatch.setattr(
+        web_server,
+        "_fire_cron_job_for_profile",
+        lambda p, j, fire_at: fired.append((p, j, fire_at)) or True,
+    )
+
+    client, pa, ph = _client(auth_required=False)
+    try:
+        resp = client.post(
+            "/api/cron/fire",
+            headers={"Authorization": "Bearer good"},
+            json={"job_id": "j2", "fire_at": _FIRE_AT},
+        )
+        assert resp.status_code == 202
+        deadline = time.monotonic() + 2.0
+        while not fired and time.monotonic() < deadline:
+            time.sleep(0.01)
+        assert fired == [("default", "j2", _FIRE_AT)]
+        deadline = time.monotonic() + 2.0
+        while getattr(web_server.app.state, "_cron_fire_tasks", set()) and time.monotonic() < deadline:
+            time.sleep(0.01)
+        assert getattr(web_server.app.state, "_cron_fire_tasks", set()) == set()
+    finally:
+        _restore(pa, ph)
+        client.close()

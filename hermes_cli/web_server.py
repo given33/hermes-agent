@@ -12794,6 +12794,36 @@ def _fire_cron_job_for_profile(profile: str, job_id: str, fire_at: str) -> bool:
         reset_hermes_home_override(token)
 
 
+def _retain_cron_fire_task(task: asyncio.Task[Any]) -> None:
+    """Keep an accepted dashboard cron task alive until it settles.
+
+    ``asyncio`` only keeps weak references to tasks.  The aiohttp adapter owns
+    its accepted tasks explicitly, but the FastAPI route used to drop the
+    ``CronFireAcceptance.background_task`` immediately after returning 202.
+    Under runner load that allowed the task to be collected or cancelled
+    before ``fire_due`` ran.  Store it on the app and remove it on completion,
+    logging failures without turning the already-accepted HTTP response into
+    an unhandled task warning.
+    """
+
+    tasks = getattr(app.state, "_cron_fire_tasks", None)
+    if not isinstance(tasks, set):
+        tasks = set()
+        app.state._cron_fire_tasks = tasks
+    tasks.add(task)
+
+    def finish(completed: asyncio.Task[Any]) -> None:
+        tasks.discard(completed)
+        if completed.cancelled():
+            return
+        try:
+            completed.result()
+        except Exception:
+            _log.exception("accepted dashboard cron fire task failed")
+
+    task.add_done_callback(finish)
+
+
 @app.post("/api/cron/fire")
 async def cron_fire_webhook(request: Request):
     """Chronos managed-cron fire webhook (NAS -> agent).
@@ -12837,6 +12867,8 @@ async def cron_fire_webhook(request: Request):
         resolve_target=resolve_target,
         execute=execute,
     )
+    if accepted.background_task is not None:
+        _retain_cron_fire_task(accepted.background_task)
     return JSONResponse(dict(accepted.body), status_code=accepted.status_code)
 
 
