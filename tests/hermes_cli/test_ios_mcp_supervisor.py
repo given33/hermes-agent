@@ -6,7 +6,7 @@ from types import SimpleNamespace
 
 import pytest
 
-from hermes_cli.ios_mcp_supervisor import _configure_supervisor_journal_mode
+from hermes_cli.ios_mcp_supervisor import IOSMCPSupervisor, _configure_supervisor_journal_mode
 
 
 class _WalUnavailableConnection:
@@ -98,3 +98,44 @@ def test_supervisor_does_not_downgrade_an_existing_wal_database(
     assert _configure_supervisor_journal_mode(conn, tmp_path / "supervisor.db") == "wal"
 
     assert "PRAGMA journal_mode=DELETE" not in conn.statements
+
+
+def test_supervisor_uses_configured_fallback_when_home_mount_is_full(
+    monkeypatch, tmp_path: Path
+):
+    home = tmp_path / "full-home"
+    home.mkdir()
+    fallback = tmp_path / "runtime"
+    monkeypatch.delenv("HERMES_IOS_SUPERVISOR_DB", raising=False)
+    monkeypatch.setenv("HERMES_IOS_SUPERVISOR_FALLBACK_DIR", str(fallback))
+    monkeypatch.setattr("hermes_cli.ios_mcp_supervisor.get_hermes_home", lambda: home)
+
+    import shutil
+
+    real_disk_usage = shutil.disk_usage
+
+    def disk_usage(path):
+        if Path(path) == home:
+            return SimpleNamespace(free=0)
+        return real_disk_usage(path)
+
+    monkeypatch.setattr("hermes_cli.ios_mcp_supervisor.shutil.disk_usage", disk_usage)
+
+    supervisor = IOSMCPSupervisor()
+
+    assert supervisor.path == fallback / "ios-mcp-supervisor.db"
+
+
+def test_supervisor_honors_explicit_database_path_even_when_home_is_full(
+    monkeypatch, tmp_path: Path
+):
+    configured = tmp_path / "configured" / "supervisor.db"
+    monkeypatch.setenv("HERMES_IOS_SUPERVISOR_DB", str(configured))
+    monkeypatch.setattr(
+        "hermes_cli.ios_mcp_supervisor.shutil.disk_usage",
+        lambda path: SimpleNamespace(free=0),
+    )
+
+    supervisor = IOSMCPSupervisor()
+
+    assert supervisor.path == configured

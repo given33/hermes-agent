@@ -20,6 +20,7 @@ import shutil
 import sqlite3
 import subprocess
 import sys
+import tempfile
 import threading
 import time
 from typing import Any, Callable, Iterable, Mapping
@@ -252,8 +253,44 @@ class IOSMCPSupervisor:
         failure_threshold: int = 3,
         restart_backoff_seconds: float = 0.0,
     ) -> None:
-        path = Path(db_path) if db_path else Path(get_hermes_home()) / "ios-mcp-supervisor.db"
+        explicit_path = db_path is not None
+        if explicit_path:
+            path = Path(db_path)
+        else:
+            configured_path = os.environ.get("HERMES_IOS_SUPERVISOR_DB", "").strip()
+            path = (
+                Path(configured_path).expanduser()
+                if configured_path
+                else Path(get_hermes_home()) / "ios-mcp-supervisor.db"
+            )
         path.parent.mkdir(parents=True, exist_ok=True)
+        if not explicit_path and not os.environ.get("HERMES_IOS_SUPERVISOR_DB", "").strip():
+            try:
+                home_free = shutil.disk_usage(path.parent).free
+            except OSError:
+                home_free = None
+            if home_free == 0:
+                fallback_root = Path(
+                    os.environ.get("HERMES_IOS_SUPERVISOR_FALLBACK_DIR", "")
+                    or (Path(tempfile.gettempdir()) / "hermes-agent")
+                )
+                try:
+                    fallback_root.mkdir(parents=True, exist_ok=True)
+                    if shutil.disk_usage(fallback_root).free > 0:
+                        logger.warning(
+                            "iOS MCP supervisor home %s has no free space; "
+                            "using fallback database directory %s",
+                            path.parent,
+                            fallback_root,
+                        )
+                        path = fallback_root / path.name
+                except OSError:
+                    logger.warning(
+                        "iOS MCP supervisor home %s has no free space and fallback "
+                        "directory %s is unavailable",
+                        path.parent,
+                        fallback_root,
+                    )
         self.path = path
         self.failure_threshold = max(1, int(failure_threshold))
         self.restart_backoff_seconds = max(0.0, float(restart_backoff_seconds))
