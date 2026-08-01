@@ -126,7 +126,9 @@ def _configure_supervisor_journal_mode(
     report ``disk I/O error`` rather than ``locking protocol`` when SQLite
     probes WAL.  DELETE journaling is safe for this one-writer database, but a
     real full/damaged disk must still fail closed, so only fall back when the
-    mount has usable free space and the on-disk journal is not already WAL.
+    mount has usable free space and the on-disk journal is not already WAL.  A
+    mount that rejects both journal pragmas is allowed to keep SQLite's default
+    rollback mode; subsequent schema writes remain the final writability check.
     """
 
     try:
@@ -136,32 +138,52 @@ def _configure_supervisor_journal_mode(
     except sqlite3.OperationalError:
         pass
 
+    wal_error: sqlite3.OperationalError | None = None
     try:
         conn.execute("PRAGMA journal_mode=WAL")
         return "wal"
-    except sqlite3.OperationalError as exc:
-        if "disk i/o error" not in str(exc).lower():
+    except sqlite3.OperationalError as wal_exc:
+        if "disk i/o error" not in str(wal_exc).lower():
             raise
-        try:
-            free_bytes = shutil.disk_usage(db_path.parent).free
-        except OSError:
-            raise exc
-        if free_bytes < 16 * 1024 * 1024:
-            raise exc
-        try:
-            existing = conn.execute("PRAGMA journal_mode").fetchone()
-            if existing and str(existing[0]).lower() == "wal":
-                raise exc
-            conn.execute("PRAGMA journal_mode=DELETE")
-        except sqlite3.OperationalError:
-            raise exc
+        wal_error = wal_exc
+    assert wal_error is not None
+    try:
+        free_bytes = shutil.disk_usage(db_path.parent).free
+    except OSError:
+        raise wal_error
+    if free_bytes < 16 * 1024 * 1024:
+        raise wal_error
+    try:
+        existing = conn.execute("PRAGMA journal_mode").fetchone()
+    except sqlite3.OperationalError:
+        # A few network/FUSE mounts reject every journal-mode probe even
+        # though ordinary SQLite reads and writes remain usable.  Do not
+        # treat an unreadable probe as evidence that an existing WAL database
+        # may be downgraded.
+        existing = None
+    if existing and str(existing[0]).lower() == "wal":
+        raise wal_error
+    try:
+        conn.execute("PRAGMA journal_mode=DELETE")
+    except sqlite3.OperationalError:
+        # Leave SQLite's default rollback mode in place.  The schema/write
+        # operations immediately after this function still fail closed on a
+        # genuinely read-only or damaged filesystem, while mounts that only
+        # reject journal pragmas can continue using the supervisor database.
         logger.warning(
-            "iOS MCP supervisor SQLite WAL is unavailable at %s (%s); "
-            "using journal_mode=DELETE because the mount has free space",
+            "iOS MCP supervisor SQLite journal probes are unavailable at %s (%s); "
+            "leaving the mount's default journal mode in place",
             db_path,
-            exc,
+            wal_error,
         )
-        return "delete"
+        return "default"
+    logger.warning(
+        "iOS MCP supervisor SQLite WAL is unavailable at %s (%s); "
+        "using journal_mode=DELETE because the mount has free space",
+        db_path,
+        wal_error,
+    )
+    return "delete"
 
 
 @dataclass
