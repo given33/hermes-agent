@@ -190,32 +190,43 @@ def _fallback_mobile_auth_db_path(path: Path) -> Optional[Path]:
 
 
 def _copy_sqlite_database(source: Path, destination: Path) -> None:
-    """Copy a live SQLite database without losing WAL-backed rows."""
+    """Copy a quiesced SQLite database without losing sidecar-backed rows.
+
+    The deployment installer stops the service before this migration. A
+    SQLite ``backup()`` can still fail when the source mount has no free
+    blocks, even for a read-only source connection, so copy the database file
+    directly and carry the rollback/WAL sidecar that contains pending rows.
+    SQLite recreates the ``-shm`` coordination file on the destination.
+    """
 
     temporary = destination.with_name(f".{destination.name}.migrate-{os.getpid()}")
-    source_conn: Optional[sqlite3.Connection] = None
-    destination_conn: Optional[sqlite3.Connection] = None
+    temporary_sidecars: list[Path] = []
     try:
-        source_conn = sqlite3.connect(
-            f"file:{source}?mode=ro", uri=True, timeout=5.0
-        )
-        destination_conn = sqlite3.connect(str(temporary), timeout=5.0)
-        source_conn.backup(destination_conn)
-        destination_conn.commit()
-        destination_conn.close()
-        destination_conn = None
-        source_conn.close()
-        source_conn = None
+        shutil.copy2(source, temporary)
         os.replace(temporary, destination)
+        for suffix in ("-wal", "-journal"):
+            source_sidecar = Path(f"{source}{suffix}")
+            destination_sidecar = Path(f"{destination}{suffix}")
+            temporary_sidecar = Path(f"{temporary}{suffix}")
+            if source_sidecar.is_file():
+                temporary_sidecars.append(temporary_sidecar)
+                shutil.copy2(source_sidecar, temporary_sidecar)
+                os.replace(temporary_sidecar, destination_sidecar)
+            else:
+                try:
+                    destination_sidecar.unlink()
+                except FileNotFoundError:
+                    pass
     finally:
-        if source_conn is not None:
-            source_conn.close()
-        if destination_conn is not None:
-            destination_conn.close()
         try:
             temporary.unlink()
         except FileNotFoundError:
             pass
+        for temporary_sidecar in temporary_sidecars:
+            try:
+                temporary_sidecar.unlink()
+            except FileNotFoundError:
+                pass
 
 
 def _now() -> int:

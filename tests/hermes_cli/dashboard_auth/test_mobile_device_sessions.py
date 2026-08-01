@@ -108,6 +108,23 @@ def test_fallback_database_migrates_existing_auth_rows(tmp_path, monkeypatch):
     assert fallback_store.db_path.exists()
 
 
+def test_sqlite_fallback_snapshot_carries_pending_sidecars(tmp_path):
+    source = tmp_path / "source.db"
+    destination = tmp_path / "fallback" / "mobile-auth.db"
+    destination.parent.mkdir()
+    source.write_bytes(b"database")
+    Path(f"{source}-wal").write_bytes(b"wal")
+    Path(f"{source}-journal").write_bytes(b"journal")
+    Path(f"{destination}-wal").write_bytes(b"stale-wal")
+    Path(f"{destination}-journal").write_bytes(b"stale-journal")
+
+    mobile_device_store._copy_sqlite_database(source, destination)
+
+    assert destination.read_bytes() == b"database"
+    assert Path(f"{destination}-wal").read_bytes() == b"wal"
+    assert Path(f"{destination}-journal").read_bytes() == b"journal"
+
+
 def test_tokens_are_hashed_and_survive_store_reopen(tmp_path):
     db_path = tmp_path / "mobile-auth.db"
     store = MobileDeviceStore(db_path)
