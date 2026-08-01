@@ -189,7 +189,7 @@ fi
 [[ "${version}" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] || die "manifest version is invalid"
 
 timestamp="$(date +%Y%m%d-%H%M%S)-$$"
-stage="/home/admin/.cache/hermes-agent-deploy/${version}-${timestamp}"
+stage_root="${HERMES_PUBLIC_STAGE_ROOT:-}"
 ssh_args=(-o BatchMode=yes -o ConnectTimeout=12)
 if [[ -n "${HERMES_SSH_IDENTITY:-}" ]]; then
   ssh_args+=(-i "${HERMES_SSH_IDENTITY}" -o IdentitiesOnly=yes)
@@ -207,6 +207,33 @@ elif [[ "${HERMES_REQUIRE_PINNED_SSH_HOST_KEY:-0}" == 1 ]]; then
   die "a pinned SSH known-hosts file is required"
 fi
 
+if [[ -n "${stage_root}" ]]; then
+  [[ "${stage_root}" == /* ]] || die "HERMES_PUBLIC_STAGE_ROOT must be absolute"
+else
+  # The runtime home can be full even while a tmpfs still has room for the
+  # short-lived release stage. Probe remotely before creating any files so a
+  # failed tar stream cannot leave a half-uploaded deployment behind.
+  stage_root="$({
+    ssh "${ssh_args[@]}" "${remote}" '
+      for root in /dev/shm/hermes-agent-deploy /tmp/hermes-agent-deploy /home/admin/.cache/hermes-agent-deploy; do
+        if ! mkdir -p -- "$root" 2>/dev/null; then
+          continue
+        fi
+        available="$(df -Pk -- "$root" 2>/dev/null | awk '\''NR == 2 {print $4}'\'')"
+        case "$available" in
+          ""|*[!0-9]*) continue ;;
+        esac
+        if [ "$available" -ge 32768 ]; then
+          printf "%s\n" "$root"
+          exit 0
+        fi
+      done
+      exit 1
+    ' 2>/dev/null
+  } || true)"
+  [[ -n "${stage_root}" ]] || die "remote staging filesystems have insufficient free space"
+fi
+stage="${stage_root%/}/${version}-${timestamp}"
 stage_created=0
 cleanup_remote_stage() {
   local status=$?

@@ -271,6 +271,20 @@ def test_three_endpoint_updates_follow_only_a_committed_main_release():
     assert "StrictHostKeyChecking=yes" in deployer
 
 
+def test_public_deployer_selects_a_remote_staging_filesystem_with_space():
+    deployer = (PUBLIC / "deploy-collaboration-backend.sh").read_text(
+        encoding="utf-8"
+    )
+
+    assert 'stage_root="${HERMES_PUBLIC_STAGE_ROOT:-}"' in deployer
+    assert 'HERMES_PUBLIC_STAGE_ROOT must be absolute' in deployer
+    assert "/dev/shm/hermes-agent-deploy" in deployer
+    assert "/tmp/hermes-agent-deploy" in deployer
+    assert "/home/admin/.cache/hermes-agent-deploy" in deployer
+    assert 'df -Pk -- "$root"' in deployer
+    assert 'remote staging filesystems have insufficient free space' in deployer
+
+
 def test_production_release_synchronizes_the_ios_workflow_observably():
     workflow = DEPLOY_WORKFLOW.read_text(encoding="utf-8")
 
@@ -606,6 +620,10 @@ def test_public_deployer_uploads_the_complete_runtime_snapshot(tmp_path):
     capture = tmp_path / "deploy.log"
     fake_command = """#!/usr/bin/env bash
 printf '%s|%s\n' "$(basename "$0")" "$*" >>"$DEPLOY_CAPTURE"
+if [[ "$*" == *"for root in /dev/shm/hermes-agent-deploy"* ]]; then
+  printf '%s\n' '/tmp/hermes-agent-deploy'
+  exit 0
+fi
 cat >/dev/null
 """
     _write_executable(fake_bin / "ssh", fake_command)
