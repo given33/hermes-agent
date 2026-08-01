@@ -233,6 +233,15 @@ emit_service_failure_diagnostics() {
   systemctl show "${service}" --no-pager \
     --property=ActiveState,SubState,Result,ExecMainCode,ExecMainStatus,NRestarts \
     2>&1 || true
+  # ``systemctl show`` only reports the supervisor state. Include the exact
+  # unit and socket ownership so a process that exits cleanly before binding
+  # cannot look healthy merely because systemd keeps restarting it.
+  systemctl cat "${service}" --no-pager 2>&1 || true
+  if command -v ss >/dev/null 2>&1; then
+    ss --listening --numeric --tcp --process 2>&1 || true
+  elif command -v lsof >/dev/null 2>&1; then
+    lsof -nP -iTCP:9119 -sTCP:LISTEN 2>&1 || true
+  fi
   if command -v "${journalctl_binary}" >/dev/null 2>&1; then
     # Startup logs are the only useful explanation for a service that exits
     # before binding. Force the central redaction policy because CI logs are
@@ -1441,7 +1450,10 @@ if [[ "${dependency_update_enabled}" == 1 ]]; then
     "${runtime_python}" -c 'from hermes_cli.web_server import app; assert app' \
     || { printf '%s\n' "installed dashboard import preflight failed" >&2; false; }
 fi
-service_start_since="$(date --iso-8601=seconds)"
+# journalctl accepts the local ``YYYY-MM-DD HH:MM:SS`` form consistently
+# across systemd versions. ISO-8601's ``T`` and numeric offset are rejected
+# by older journalctl builds, which would hide the only useful crash log.
+service_start_since="$(date '+%Y-%m-%d %H:%M:%S')"
 systemctl start "${service}"
 
 health_file="$(mktemp /run/hermes-agent-status.XXXXXX)"

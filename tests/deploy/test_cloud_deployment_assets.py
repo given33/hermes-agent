@@ -816,6 +816,19 @@ def test_public_installer_uses_only_a_root_controlled_install_lock():
     assert 'chmod 0600 "${install_lock}"' in installer
 
 
+def test_public_installer_keeps_post_restart_diagnostics_parseable():
+    installer = (PUBLIC / "install-collaboration-backend.sh").read_text(
+        encoding="utf-8"
+    )
+
+    # journalctl on older systemd releases rejects ISO-8601's ``T`` and
+    # numeric offset in --since, which previously hid the service crash log.
+    assert "service_start_since=\"$(date '+%Y-%m-%d %H:%M:%S')\"" in installer
+    assert 'systemctl cat "${service}" --no-pager' in installer
+    assert "ss --listening --numeric --tcp --process" in installer
+    assert "lsof -nP -iTCP:9119 -sTCP:LISTEN" in installer
+
+
 def test_public_installer_validates_the_root_owned_snapshot_it_installs():
     installer = (PUBLIC / "install-collaboration-backend.sh").read_text(
         encoding="utf-8"
