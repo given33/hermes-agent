@@ -60,6 +60,16 @@ def test_supervisor_keeps_disk_io_error_on_full_mount(monkeypatch, tmp_path: Pat
         _configure_supervisor_journal_mode(conn, tmp_path / "supervisor.db")
 
 
+def test_supervisor_allows_low_but_nonzero_free_space(monkeypatch, tmp_path: Path):
+    conn = _WalUnavailableConnection()
+    monkeypatch.setattr(
+        "hermes_cli.ios_mcp_supervisor.shutil.disk_usage",
+        lambda path: SimpleNamespace(free=1),
+    )
+
+    assert _configure_supervisor_journal_mode(conn, tmp_path / "supervisor.db") == "delete"
+
+
 def test_supervisor_leaves_default_mode_when_mount_rejects_all_probes(
     monkeypatch, tmp_path: Path
 ):

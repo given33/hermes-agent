@@ -126,7 +126,7 @@ def _configure_supervisor_journal_mode(
     report ``disk I/O error`` rather than ``locking protocol`` when SQLite
     probes WAL.  DELETE journaling is safe for this one-writer database, but a
     real full/damaged disk must still fail closed, so only fall back when the
-    mount has usable free space and the on-disk journal is not already WAL.  A
+    mount has any usable free space and the on-disk journal is not already WAL.  A
     mount that rejects both journal pragmas is allowed to keep SQLite's default
     rollback mode; subsequent schema writes remain the final writability check.
     """
@@ -151,7 +151,7 @@ def _configure_supervisor_journal_mode(
         free_bytes = shutil.disk_usage(db_path.parent).free
     except OSError:
         raise wal_error
-    if free_bytes < 16 * 1024 * 1024:
+    if free_bytes <= 0:
         raise wal_error
     try:
         existing = conn.execute("PRAGMA journal_mode").fetchone()
@@ -172,16 +172,18 @@ def _configure_supervisor_journal_mode(
         # reject journal pragmas can continue using the supervisor database.
         logger.warning(
             "iOS MCP supervisor SQLite journal probes are unavailable at %s (%s); "
-            "leaving the mount's default journal mode in place",
+            "leaving the mount's default journal mode in place (free=%d)",
             db_path,
             wal_error,
+            free_bytes,
         )
         return "default"
     logger.warning(
         "iOS MCP supervisor SQLite WAL is unavailable at %s (%s); "
-        "using journal_mode=DELETE because the mount has free space",
+        "using journal_mode=DELETE because the mount has free space (free=%d)",
         db_path,
         wal_error,
+        free_bytes,
     )
     return "delete"
 
