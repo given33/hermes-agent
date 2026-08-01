@@ -326,6 +326,10 @@ set -euo pipefail
 command="${!#}"
 printf '%s\n' "${command}" >>"${FAKE_DEPLOY_SSH_LOG}"
 cat >/dev/null
+if [[ "${command}" == *"for root in /dev/shm/hermes-agent-deploy"* ]]; then
+  printf '%s\n' '/tmp/hermes-agent-deploy'
+  exit 0
+fi
 if [[ "${FAKE_DEPLOY_CONFIGURE_FAIL:-0}" == 1 \
   && "${command}" == *"sudo -n /bin/bash"* \
   && "${command}" == *"configure-main-managed-installation-ssh.sh"* ]]; then
