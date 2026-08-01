@@ -20,7 +20,6 @@ import shutil
 import sqlite3
 import subprocess
 import sys
-import tempfile
 import threading
 import time
 from typing import Any, Callable, Iterable, Mapping
@@ -270,26 +269,38 @@ class IOSMCPSupervisor:
             except OSError:
                 home_free = None
             if home_free == 0:
-                fallback_root = Path(
-                    os.environ.get("HERMES_IOS_SUPERVISOR_FALLBACK_DIR", "")
-                    or (Path(tempfile.gettempdir()) / "hermes-agent")
+                configured_fallback = os.environ.get(
+                    "HERMES_IOS_SUPERVISOR_FALLBACK_DIR", ""
+                ).strip()
+                fallback_roots = (
+                    [Path(configured_fallback).expanduser()]
+                    if configured_fallback
+                    else [
+                        Path("/dev/shm/hermes-agent"),
+                        Path("/tmp/hermes-agent"),
+                        Path("/var/tmp/hermes-agent"),
+                    ]
                 )
-                try:
-                    fallback_root.mkdir(parents=True, exist_ok=True)
-                    if shutil.disk_usage(fallback_root).free > 0:
-                        logger.warning(
-                            "iOS MCP supervisor home %s has no free space; "
-                            "using fallback database directory %s",
-                            path.parent,
-                            fallback_root,
-                        )
-                        path = fallback_root / path.name
-                except OSError:
+                for fallback_root in fallback_roots:
+                    try:
+                        fallback_root.mkdir(parents=True, exist_ok=True)
+                        if shutil.disk_usage(fallback_root).free <= 0:
+                            continue
+                    except OSError:
+                        continue
                     logger.warning(
-                        "iOS MCP supervisor home %s has no free space and fallback "
-                        "directory %s is unavailable",
+                        "iOS MCP supervisor home %s has no free space; "
+                        "using fallback database directory %s",
                         path.parent,
                         fallback_root,
+                    )
+                    path = fallback_root / path.name
+                    break
+                else:
+                    logger.warning(
+                        "iOS MCP supervisor home %s has no free space and fallback "
+                        "directories are unavailable",
+                        path.parent,
                     )
         self.path = path
         self.failure_threshold = max(1, int(failure_threshold))
