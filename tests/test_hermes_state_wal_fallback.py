@@ -14,6 +14,7 @@ filesystem".
 """
 
 import sqlite3
+from types import SimpleNamespace
 from unittest.mock import patch
 
 import pytest
@@ -128,6 +129,25 @@ class TestApplyWalWithFallback:
         )
         with pytest.raises(sqlite3.OperationalError, match="disk I/O error"):
             apply_wal_with_fallback(conn)
+        conn.close()
+
+    def test_leaves_default_mode_when_disk_is_full(self, monkeypatch, tmp_path):
+        class _AllJournalPragmasFailConnection(sqlite3.Connection):
+            def execute(self, sql, *args, **kwargs):  # type: ignore[override]
+                if "journal_mode" in sql.lower():
+                    raise sqlite3.OperationalError("disk I/O error")
+                return super().execute(sql, *args, **kwargs)
+
+        target = tmp_path / "full.db"
+        conn = sqlite3.connect(
+            str(target), factory=_AllJournalPragmasFailConnection, isolation_level=None
+        )
+        monkeypatch.setattr(
+            "hermes_state.shutil.disk_usage",
+            lambda path: SimpleNamespace(free=0),
+        )
+
+        assert apply_wal_with_fallback(conn, db_label="full.db") == "default"
         conn.close()
 
     def test_does_not_downgrade_when_disk_says_wal(self, tmp_path):

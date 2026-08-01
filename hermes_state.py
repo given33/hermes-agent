@@ -20,6 +20,7 @@ import logging
 import random
 import re
 import sqlite3
+import shutil
 import sys
 import threading
 import time
@@ -332,6 +333,19 @@ def _on_disk_journal_mode(conn: sqlite3.Connection) -> Optional[str]:
     return str(mode).strip().lower() if mode is not None else None
 
 
+def _sqlite_database_has_no_free_space(conn: sqlite3.Connection) -> bool:
+    """Return whether the database mount reports zero free bytes."""
+
+    try:
+        row = conn.execute("PRAGMA database_list").fetchone()
+        database_path = str(row[2]) if row and len(row) > 2 else ""
+        if not database_path or database_path == ":memory:":
+            return False
+        return shutil.disk_usage(Path(database_path).parent).free == 0
+    except (OSError, sqlite3.OperationalError, TypeError):
+        return False
+
+
 def _apply_macos_checkpoint_barrier(conn: sqlite3.Connection) -> None:
     """Enable ``PRAGMA checkpoint_fullfsync`` on macOS (no-op elsewhere).
 
@@ -440,7 +454,8 @@ def apply_wal_with_fallback(
         return "wal"
     except sqlite3.OperationalError as exc:
         msg = str(exc).lower()
-        if not any(marker in msg for marker in _WAL_INCOMPAT_MARKERS):
+        disk_full = "disk i/o error" in msg and _sqlite_database_has_no_free_space(conn)
+        if not any(marker in msg for marker in _WAL_INCOMPAT_MARKERS) and not disk_full:
             # Unrelated OperationalError — don't silently swallow.
             raise
         # Don't downgrade if another process already set WAL on disk.
@@ -448,7 +463,17 @@ def apply_wal_with_fallback(
         if existing == "wal":
             raise
         _log_wal_fallback_once(db_label, exc)
-        conn.execute("PRAGMA journal_mode=DELETE")
+        try:
+            conn.execute("PRAGMA journal_mode=DELETE")
+        except sqlite3.OperationalError:
+            if not disk_full:
+                raise
+            logger.warning(
+                "%s: SQLite journal probes are unavailable because the database "
+                "mount has no free space; leaving the default journal mode in place",
+                db_label,
+            )
+            return "default"
         return "delete"
 
 
