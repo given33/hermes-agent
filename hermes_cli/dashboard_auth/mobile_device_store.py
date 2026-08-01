@@ -10,7 +10,10 @@ from __future__ import annotations
 import contextlib
 import hashlib
 import json
+import logging
+import os
 import secrets
+import shutil
 import sqlite3
 import time
 import uuid
@@ -26,6 +29,9 @@ from hermes_cli.dashboard_auth.base import (
 )
 from hermes_cli.sqlite_util import write_txn
 from hermes_constants import get_hermes_home
+
+
+logger = logging.getLogger(__name__)
 
 
 ACCESS_TTL_SECONDS = 15 * 60
@@ -141,7 +147,75 @@ CREATE TABLE IF NOT EXISTS mobile_account_generations (
 
 
 def mobile_auth_db_path() -> Path:
+    configured = os.environ.get("HERMES_MOBILE_AUTH_DB", "").strip()
+    if configured:
+        return Path(configured).expanduser()
     return get_hermes_home() / "dashboard" / "mobile-auth.db"
+
+
+def _fallback_mobile_auth_db_path(path: Path) -> Optional[Path]:
+    """Choose a writable database mount when the normal Hermes home is full."""
+
+    try:
+        if shutil.disk_usage(path.parent).free > 0:
+            return None
+    except OSError:
+        return None
+
+    configured_root = os.environ.get("HERMES_MOBILE_AUTH_FALLBACK_DIR", "").strip()
+    roots = (
+        [Path(configured_root).expanduser()]
+        if configured_root
+        else [
+            Path("/var/lib/hermes-agent"),
+            Path("/dev/shm/hermes-agent"),
+            Path("/tmp/hermes-agent"),
+            Path("/var/tmp/hermes-agent"),
+        ]
+    )
+    for root in roots:
+        fallback_parent = root / "dashboard"
+        try:
+            fallback_parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+            if not os.access(fallback_parent, os.W_OK | os.X_OK):
+                continue
+            if shutil.disk_usage(fallback_parent).free <= 0:
+                continue
+        except OSError:
+            continue
+        fallback = fallback_parent / path.name
+        if fallback != path:
+            return fallback
+    return None
+
+
+def _copy_sqlite_database(source: Path, destination: Path) -> None:
+    """Copy a live SQLite database without losing WAL-backed rows."""
+
+    temporary = destination.with_name(f".{destination.name}.migrate-{os.getpid()}")
+    source_conn: Optional[sqlite3.Connection] = None
+    destination_conn: Optional[sqlite3.Connection] = None
+    try:
+        source_conn = sqlite3.connect(
+            f"file:{source}?mode=ro", uri=True, timeout=5.0
+        )
+        destination_conn = sqlite3.connect(str(temporary), timeout=5.0)
+        source_conn.backup(destination_conn)
+        destination_conn.commit()
+        destination_conn.close()
+        destination_conn = None
+        source_conn.close()
+        source_conn = None
+        os.replace(temporary, destination)
+    finally:
+        if source_conn is not None:
+            source_conn.close()
+        if destination_conn is not None:
+            destination_conn.close()
+        try:
+            temporary.unlink()
+        except FileNotFoundError:
+            pass
 
 
 def _now() -> int:
@@ -200,7 +274,21 @@ class MobileDeviceStore:
         clock: Callable[[], int] = _now,
     ) -> None:
         self._manage_parent_permissions = db_path is None
-        self.db_path = db_path if db_path is not None else mobile_auth_db_path()
+        requested_path = db_path if db_path is not None else mobile_auth_db_path()
+        self._fallback_source_path: Optional[Path] = None
+        if db_path is None:
+            fallback_path = _fallback_mobile_auth_db_path(requested_path)
+            if fallback_path is not None:
+                self._fallback_source_path = (
+                    requested_path if requested_path.exists() else None
+                )
+                requested_path = fallback_path
+                logger.warning(
+                    "mobile-auth.db is on a full filesystem; using fallback "
+                    "database path %s",
+                    requested_path,
+                )
+        self.db_path = requested_path
         self._clock = clock
 
     def connect(self) -> sqlite3.Connection:
@@ -208,6 +296,9 @@ class MobileDeviceStore:
         path.parent.mkdir(parents=True, exist_ok=True)
         if self._manage_parent_permissions:
             self._restrict_permissions(path.parent, 0o700)
+        if self._fallback_source_path and not path.exists():
+            _copy_sqlite_database(self._fallback_source_path, path)
+            self._fallback_source_path = None
         conn = sqlite3.connect(str(path), timeout=30.0)
         try:
             conn.row_factory = sqlite3.Row

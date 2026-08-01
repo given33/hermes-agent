@@ -4,6 +4,8 @@ from __future__ import annotations
 import contextlib
 import sqlite3
 import threading
+from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
@@ -57,6 +59,53 @@ def test_default_database_path_keeps_private_parent_permissions(tmp_path, monkey
 
     assert (db_path.parent, 0o700) in calls
     assert (db_path, 0o600) in calls
+
+
+def test_default_database_uses_writable_fallback_when_home_is_full(tmp_path, monkeypatch):
+    db_path = tmp_path / "full" / "dashboard" / "mobile-auth.db"
+    fallback_root = tmp_path / "fallback"
+    db_path.parent.mkdir(parents=True)
+    monkeypatch.setattr(mobile_device_store, "mobile_auth_db_path", lambda: db_path)
+    monkeypatch.setenv("HERMES_MOBILE_AUTH_FALLBACK_DIR", str(fallback_root))
+    real_disk_usage = mobile_device_store.shutil.disk_usage
+
+    def disk_usage(path):
+        if Path(path) == db_path.parent:
+            return SimpleNamespace(free=0)
+        return real_disk_usage(path)
+
+    monkeypatch.setattr(mobile_device_store.shutil, "disk_usage", disk_usage)
+
+    store = MobileDeviceStore()
+    assert store.db_path == fallback_root / "dashboard" / "mobile-auth.db"
+    store.connect().close()
+    assert store.db_path.exists()
+
+
+def test_fallback_database_migrates_existing_auth_rows(tmp_path, monkeypatch):
+    db_path = tmp_path / "full" / "dashboard" / "mobile-auth.db"
+    fallback_root = tmp_path / "fallback"
+    db_path.parent.mkdir(parents=True)
+    source_store = MobileDeviceStore(db_path)
+    tokens = source_store.create_session(
+        user_id="owner",
+        device=_device("device-primary", "Owner iPhone"),
+    )
+    monkeypatch.setattr(mobile_device_store, "mobile_auth_db_path", lambda: db_path)
+    monkeypatch.setenv("HERMES_MOBILE_AUTH_FALLBACK_DIR", str(fallback_root))
+    real_disk_usage = mobile_device_store.shutil.disk_usage
+
+    def disk_usage(path):
+        if Path(path) == db_path.parent:
+            return SimpleNamespace(free=0)
+        return real_disk_usage(path)
+
+    monkeypatch.setattr(mobile_device_store.shutil, "disk_usage", disk_usage)
+
+    fallback_store = MobileDeviceStore()
+    assert fallback_store.db_path != db_path
+    assert fallback_store.verify_access(tokens.access_token, touch=False) is not None
+    assert fallback_store.db_path.exists()
 
 
 def test_tokens_are_hashed_and_survive_store_reopen(tmp_path):
