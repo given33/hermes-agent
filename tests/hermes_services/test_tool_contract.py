@@ -19,6 +19,7 @@ from hermes_services.tool_contract import (
     register_tool_contract,
     reset_tool_contracts_for_tests,
 )
+from hermes_services.tool_isolation import default_tool_timeout_seconds
 from agent.tool_executor import (
     _resolve_concurrent_tool_timeout,
     _run_with_tool_contract_timeout,
@@ -44,6 +45,16 @@ def _call(identifier: str, name: str, arguments: str = "{}"):
 
 def teardown_function():
     reset_tool_contracts_for_tests()
+
+
+def test_default_registry_timeout_reserves_bounded_spawn_budget(monkeypatch):
+    """A short env override must not kill a worker during normal spawn/import."""
+    monkeypatch.setenv("HERMES_TOOL_TIMEOUT_S", "0.1")
+    monkeypatch.setenv("HERMES_CONCURRENT_TOOL_TIMEOUT_S", "3")
+
+    # Explicit ToolExecutionContract values are tested separately and remain
+    # exact; this floor applies only to ordinary registry-tool defaults.
+    assert default_tool_timeout_seconds() == 4.0
 
 
 def test_default_registry_exposes_process_safe_identity_without_pickling_handlers():

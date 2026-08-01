@@ -17,6 +17,12 @@ from typing import Any, Callable
 
 _PROCESS_START_TIMEOUT_SECONDS = 10.0
 _DEFAULT_TOOL_TIMEOUT_SECONDS = 420.0
+# Ordinary registry tools are configured through environment variables rather
+# than a per-tool contract.  Their timeout must leave a small, bounded budget
+# for ``multiprocessing`` spawn plus importing the handler module on a busy
+# host; otherwise a value such as 3s kills the worker before it can run even a
+# fast handler.  Explicit ToolExecutionContract deadlines remain exact.
+_DEFAULT_TOOL_TIMEOUT_FLOOR_SECONDS = 4.0
 _PR_SET_CHILD_SUBREAPER = 36
 logger = logging.getLogger(__name__)
 
@@ -130,7 +136,7 @@ def default_tool_timeout_seconds() -> float:
         except ValueError:
             continue
         if value > 0:
-            values.append(value)
+            values.append(max(value, _DEFAULT_TOOL_TIMEOUT_FLOOR_SECONDS))
     return min(values)
 
 
