@@ -279,7 +279,19 @@ _HOSTED_EXECUTION_GENERATION = threading.local()
 _COLLABORATION_DELETION_WRITE = threading.local()
 _ACCOUNT_DELETION_TOMBSTONES_KEY = "account_deletion_tombstones"
 _HOSTED_CONVERSATION_LOCKS_LOCK = threading.Lock()
-_HOSTED_CONVERSATION_LOCKS: dict[str, threading.Lock] = {}
+
+
+class _ConversationExecutionLock:
+    """A lock plus the number of callers holding or waiting for it."""
+
+    __slots__ = ("lock", "users")
+
+    def __init__(self) -> None:
+        self.lock = threading.Lock()
+        self.users = 0
+
+
+_HOSTED_CONVERSATION_LOCKS: dict[str, _ConversationExecutionLock] = {}
 _MOBILE_NOTIFICATION_DISPATCH_CONDITION = threading.Condition()
 _MOBILE_NOTIFICATION_DISPATCH_THREAD: Optional[threading.Thread] = None
 _MOBILE_NOTIFICATION_PENDING: dict[str, tuple[str, str, int]] = {}
@@ -11931,12 +11943,24 @@ def start_hosted_workflow(conversation_id: str, turn_id: str) -> threading.Threa
         return thread
 
 
-def _hosted_conversation_execution_lock(conversation_id: str) -> threading.Lock:
+@contextmanager
+def _hosted_conversation_execution_lock(conversation_id: str):
+    """Serialize one conversation and reclaim idle lock objects safely."""
+    key = str(conversation_id)
     with _HOSTED_CONVERSATION_LOCKS_LOCK:
-        return _HOSTED_CONVERSATION_LOCKS.setdefault(
-            str(conversation_id),
-            threading.Lock(),
-        )
+        entry = _HOSTED_CONVERSATION_LOCKS.get(key)
+        if entry is None:
+            entry = _ConversationExecutionLock()
+            _HOSTED_CONVERSATION_LOCKS[key] = entry
+        entry.users += 1
+    try:
+        with entry.lock:
+            yield
+    finally:
+        with _HOSTED_CONVERSATION_LOCKS_LOCK:
+            entry.users -= 1
+            if entry.users == 0 and _HOSTED_CONVERSATION_LOCKS.get(key) is entry:
+                _HOSTED_CONVERSATION_LOCKS.pop(key, None)
 
 
 def resume_unfinished_hosted_workflows(

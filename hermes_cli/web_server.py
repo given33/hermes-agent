@@ -204,7 +204,7 @@ async def _lifespan(app: "FastAPI"):
     # and Defender real-time scans that can stall the event loop for 15-30s.
     # Running in an executor means the cost is paid in a worker thread while
     # the server socket is already open and accepting probes.
-    asyncio.get_event_loop().run_in_executor(None, _warm_gateway_module)
+    asyncio.get_running_loop().run_in_executor(None, _warm_gateway_module)
 
     # Desktop-spawned backends (HERMES_DESKTOP=1) fire cron jobs themselves,
     # since the app has no gateway running the scheduler. Server `hermes
@@ -341,6 +341,16 @@ _REVEAL_MAX_PER_WINDOW = 5
 _REVEAL_WINDOW_SECONDS = 30
 
 
+class _RefCountedLock:
+    """A lock pool entry retained while callers hold or await the lock."""
+
+    __slots__ = ("lock", "users")
+
+    def __init__(self) -> None:
+        self.lock = threading.Lock()
+        self.users = 0
+
+
 # ---------------------------------------------------------------------------
 # Dashboard runtime state — single named owner for this module's mutable
 # globals (audit finding H5: containment, not a rewrite).
@@ -414,7 +424,7 @@ class DashboardRuntimeState:
         self._oauth_sessions_lock = threading.Lock()
         self._mcp_oauth_flows: dict[str, Any] = {}
         self._mcp_oauth_flows_lock = threading.Lock()
-        self._mcp_oauth_transactions: dict[tuple[str, str], threading.Lock] = {}
+        self._mcp_oauth_transactions: dict[tuple[str, str], _RefCountedLock] = {}
         self._mcp_oauth_transactions_lock = threading.Lock()
         self._telegram_onboarding_lock = threading.RLock()
         self._skills_profile_lock = threading.RLock()
@@ -471,7 +481,7 @@ class DashboardRuntimeState:
         return self._mcp_oauth_flows_lock
 
     @property
-    def mcp_oauth_transactions(self) -> "dict[tuple[str, str], threading.Lock]":
+    def mcp_oauth_transactions(self) -> "dict[tuple[str, str], _RefCountedLock]":
         """Per-(server, account) locks serialising MCP token exchanges."""
         return self._mcp_oauth_transactions
 
@@ -11046,7 +11056,7 @@ async def _start_device_code_flow(
                     code_challenge=challenge,
                     state=state,
                 )
-        device_data = await asyncio.get_event_loop().run_in_executor(
+        device_data = await asyncio.get_running_loop().run_in_executor(
             None, _do_minimax_request
         )
         sid, sess = _new_oauth_session("minimax-oauth", "device_code", profile=profile)
@@ -13219,10 +13229,23 @@ def _mcp_oauth_callback_url(request: Request, server_name: str) -> str:
     return urlunparse(base._replace(path=f"{prefix}{suffix}", params="", query="", fragment=""))
 
 
-def _mcp_oauth_transaction(flow) -> threading.Lock:
+@contextmanager
+def _mcp_oauth_transaction(flow):
     key = (flow.hermes_home, flow.server_name)
     with _mcp_oauth_transactions_lock:
-        return _mcp_oauth_transactions.setdefault(key, threading.Lock())
+        entry = _mcp_oauth_transactions.get(key)
+        if entry is None:
+            entry = _RefCountedLock()
+            _mcp_oauth_transactions[key] = entry
+        entry.users += 1
+    try:
+        with entry.lock:
+            yield
+    finally:
+        with _mcp_oauth_transactions_lock:
+            entry.users -= 1
+            if entry.users == 0 and _mcp_oauth_transactions.get(key) is entry:
+                _mcp_oauth_transactions.pop(key, None)
 
 
 def _run_dashboard_mcp_oauth(flow, cfg: dict) -> None:

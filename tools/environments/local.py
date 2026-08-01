@@ -136,6 +136,87 @@ def _quote_bash_path(path: str) -> str:
     return shlex.quote(_bash_safe_path(path))
 
 
+_NATIVE_WINDOWS_PATH_RE = re.compile(
+    r"(?<![A-Za-z0-9_])(?P<drive>[A-Za-z]):[\\/](?P<tail>[^\s\"';&|<>()]+)"
+)
+_QUOTED_NATIVE_WINDOWS_PATH_RE = re.compile(
+    r"(?P<quote>[\"'])(?P<path>[A-Za-z]:[\\/][^\"']+)(?P=quote)"
+)
+
+
+def _existing_native_windows_path(raw: str) -> bool:
+    """Return True when *raw* names an existing host file or directory."""
+    try:
+        return os.path.exists(raw) or os.path.exists(raw.rstrip("\\/"))
+    except (OSError, ValueError):
+        return False
+
+
+def _rewrite_native_windows_paths(command: str) -> str:
+    """Translate real native Windows path arguments for Git Bash.
+
+    ``LocalEnvironment`` intentionally executes through Git Bash, but callers
+    of its low-level ``execute`` API commonly pass ``C:\\...`` paths from
+    Python. Bash removes those backslashes before invoking ``cat``/``ls`` and
+    friends. Only existing drive-qualified paths are rewritten, which avoids
+    changing arbitrary command text or Windows-looking examples. Python
+    ``-c`` snippets are left untouched because their paths are interpreted by
+    native Python rather than by Git Bash.
+    """
+    if not _IS_WINDOWS or not command or re.search(r"\bpython(?:3)?\b[^\n]*\s-c(?:\s|$)", command):
+        return command
+    # ``rg.exe`` is a native Windows binary.  File operations pass it a
+    # drive-qualified argument deliberately (see ``_escape_native_path_arg``);
+    # converting that argument back to ``/c/...`` here would make ripgrep
+    # report a nonexistent path because MSYS argv conversion is disabled.
+    if re.search(r"(?m)^\s*(?:(?:set\s+-o\s+pipefail\s*;\s*)?)rg(?:\.exe)?\b", command):
+        return command
+
+    def replace_quoted(match: re.Match[str]) -> str:
+        raw = match.group("path")
+        return match.group("quote") + _bash_safe_path(raw) + match.group("quote") \
+            if _existing_native_windows_path(raw) else match.group(0)
+
+    rewritten = _QUOTED_NATIVE_WINDOWS_PATH_RE.sub(replace_quoted, command)
+
+    def replace_unquoted(match: re.Match[str]) -> str:
+        # ``tail`` intentionally excludes the separator so the regex can
+        # distinguish the drive prefix cleanly.  Preserve the complete match
+        # here; rebuilding from the capture groups would turn ``C:\\path``
+        # into ``C:path`` and silently defeat the translation.
+        raw = match.group(0)
+        return _bash_safe_path(raw) if _existing_native_windows_path(raw) else match.group(0)
+
+    return _NATIVE_WINDOWS_PATH_RE.sub(replace_unquoted, rewritten)
+
+
+def _normalize_local_path_probe_output(command: str, output: str) -> str:
+    """Expose native paths for the two local shell path probes.
+
+    Git Bash reports ``pwd`` and ``$HOME`` as ``/c/...`` while the local API's
+    cwd and file-operation paths are native Windows strings. Do not rewrite
+    arbitrary command output: file contents must remain byte-for-byte faithful.
+    """
+    if not _IS_WINDOWS or command.strip() not in {
+        "pwd",
+        "pwd -P",
+        "echo $HOME",
+    }:
+        return output
+    lines = output.splitlines(keepends=True)
+    for index, line in enumerate(lines):
+        ending = ""
+        body = line
+        if line.endswith("\r\n"):
+            body, ending = line[:-2], "\r\n"
+        elif line.endswith(("\n", "\r")):
+            body, ending = line[:-1], line[-1]
+        if re.match(r"^/[A-Za-z](?:/|$)", body):
+            lines[index] = _msys_to_windows_path(body) + ending
+            break
+    return "".join(lines)
+
+
 def _cwd_usable(path: str) -> bool:
     """True when *path* is a directory this process can actually chdir into.
 
@@ -1267,6 +1348,37 @@ class LocalEnvironment(BaseEnvironment):
     Session snapshot preserves env vars across calls.
     CWD persists via file-based read after each command.
     """
+
+    def execute(
+        self,
+        command: str,
+        cwd: str = "",
+        *,
+        timeout: int | None = None,
+        stdin_data: str | None = None,
+        rewrite_compound_background: bool = True,
+        bounded_capture: bool = False,
+    ) -> dict:
+        """Execute a local command with native Windows path compatibility."""
+        original_command = command
+        translated_command = _rewrite_native_windows_paths(command)
+        result = super().execute(
+            translated_command,
+            cwd=cwd,
+            timeout=timeout,
+            stdin_data=stdin_data,
+            rewrite_compound_background=rewrite_compound_background,
+            bounded_capture=bounded_capture,
+        )
+        if _IS_WINDOWS:
+            # The drain loop reads the Windows pipe as bytes, bypassing
+            # TextIOWrapper's universal-newline conversion.  Keep the public
+            # command result stable across shells by exposing LF line endings.
+            result["output"] = result.get("output", "").replace("\r\n", "\n")
+            result["output"] = _normalize_local_path_probe_output(
+                original_command, result.get("output", "")
+            )
+        return result
 
     def __init__(self, cwd: str = "", timeout: int = 60, env: dict = None):
         cwd = _resolve_local_initial_cwd(cwd)

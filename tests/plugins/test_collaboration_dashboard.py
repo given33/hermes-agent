@@ -5135,6 +5135,44 @@ class CollaborationDashboardTests(unittest.TestCase):
         self.assertFalse(thread.is_alive())
         self.assertNotIn(conversation["id"], module._HOSTED_THREADS)
 
+    def test_hosted_conversation_lock_pool_reclaims_idle_entries_without_splitting_waiters(self):
+        module = load_module()
+        module._HOSTED_CONVERSATION_LOCKS.clear()
+        entered = threading.Event()
+        release = threading.Event()
+        waiter_done = threading.Event()
+
+        def holder():
+            with module._hosted_conversation_execution_lock("conversation-lock"):
+                entered.set()
+                assert release.wait(timeout=5)
+
+        def waiter():
+            with module._hosted_conversation_execution_lock("conversation-lock"):
+                waiter_done.set()
+
+        first = threading.Thread(target=holder, daemon=True)
+        second = threading.Thread(target=waiter, daemon=True)
+        first.start()
+        assert entered.wait(timeout=5)
+        second.start()
+        deadline = time.monotonic() + 5
+        while time.monotonic() < deadline:
+            with module._HOSTED_CONVERSATION_LOCKS_LOCK:
+                entry = module._HOSTED_CONVERSATION_LOCKS.get("conversation-lock")
+                if entry is not None and entry.users == 2:
+                    break
+            time.sleep(0.01)
+        else:
+            raise AssertionError("waiting conversation lock was not retained in the pool")
+        release.set()
+        first.join(timeout=5)
+        second.join(timeout=5)
+        self.assertFalse(first.is_alive())
+        self.assertFalse(second.is_alive())
+        self.assertTrue(waiter_done.is_set())
+        self.assertNotIn("conversation-lock", module._HOSTED_CONVERSATION_LOCKS)
+
     def test_conversation_index_compacts_hosted_role_event_payloads(self):
         module = load_module()
         conversation = module.create_single_conversation("default")

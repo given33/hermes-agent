@@ -138,6 +138,7 @@ class ProcessSession:
     _lock: threading.Lock = field(default_factory=threading.Lock)
     _reader_thread: Optional[threading.Thread] = field(default=None, repr=False)
     _pty: Any = field(default=None, repr=False)  # ptyprocess handle (when use_pty=True)
+    _pty_at_line_start: bool = field(default=True, repr=False)
 
 
 class ProcessRegistry:
@@ -601,6 +602,8 @@ class ProcessRegistry:
                     ["taskkill", "/PID", str(pid), "/T", "/F"],
                     capture_output=True,
                     text=True,
+                    encoding="utf-8",
+                    errors="replace",
                     timeout=10,
                     creationflags=windows_hide_flags(),
                     stdin=subprocess.DEVNULL,
@@ -1616,6 +1619,8 @@ class ProcessRegistry:
                 else:
                     pty_data = data.encode("utf-8") if isinstance(data, str) else data
                 session._pty.write(pty_data)
+                if _IS_WINDOWS:
+                    session._pty_at_line_start = pty_data.endswith(("\r", "\n"))
                 return {"status": "ok", "bytes_written": len(data)}
             except Exception as e:
                 return {"status": "error", "error": str(e)}
@@ -1632,7 +1637,12 @@ class ProcessRegistry:
 
     def submit_stdin(self, session_id: str, data: str = "") -> dict:
         """Send data + newline to a running process's stdin (like pressing Enter)."""
-        return self.write_stdin(session_id, data + "\n")
+        # ConPTY line discipline requires CRLF to commit the current line;
+        # a bare LF leaves Ctrl-Z on the same input line, so the subsequent
+        # Windows EOF sequence cannot terminate readers such as ``sys.stdin``.
+        session = self.get(session_id)
+        newline = "\r\n" if _IS_WINDOWS and session is not None and getattr(session, "_pty", None) else "\n"
+        return self.write_stdin(session_id, data + newline)
 
     def request_close_terminal(self, session_id: str) -> dict:
         """Ask the desktop GUI to close the read-only terminal tab mirroring this
@@ -1675,7 +1685,16 @@ class ProcessRegistry:
 
         if hasattr(session, '_pty') and session._pty:
             try:
-                session._pty.sendeof()
+                if _IS_WINDOWS:
+                    # Windows console input does not interpret POSIX Ctrl-D
+                    # as EOF.  Ctrl-Z at the beginning of a line followed by
+                    # Enter is the CRT/ConPTY EOF sequence; without it,
+                    # ``sys.stdin.read()`` keeps waiting forever after the
+                    # desktop sends a close-stdin request.
+                    prefix = "" if session._pty_at_line_start else "\r\n"
+                    session._pty.write(f"{prefix}\x1a\r\n")
+                else:
+                    session._pty.sendeof()
                 return {"status": "ok", "message": "EOF sent"}
             except Exception as e:
                 return {"status": "error", "error": str(e)}

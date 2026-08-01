@@ -28,6 +28,7 @@ Usage:
 import os
 import re
 import difflib
+import fnmatch
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
 from typing import Optional, List, Dict, Any, ClassVar
@@ -975,6 +976,24 @@ class ShellFileOperations(FileOperations):
             result = self._exec("echo $HOME")
             if result.exit_code == 0 and result.stdout.strip():
                 home = result.stdout.strip()
+                # LocalEnvironment runs commands through Git Bash on native
+                # Windows, whose ``$HOME`` is reported as ``/c/...``.  File
+                # operations also use host-side Path/ACL checks, so keep the
+                # expanded value in native form at this boundary and let
+                # ``_escape_shell_arg`` translate it back for the shell.
+                try:
+                    from tools.environments.local import (
+                        LocalEnvironment,
+                        _msys_to_windows_path,
+                    )
+
+                    if isinstance(self.env, LocalEnvironment):
+                        home = _msys_to_windows_path(home)
+                except Exception:
+                    # Path expansion is best-effort; remote backends and
+                    # partially constructed test doubles should retain the
+                    # shell-provided value rather than failing the operation.
+                    pass
                 if path == '~':
                     return home
                 elif path.startswith('~/'):
@@ -1092,6 +1111,17 @@ class ShellFileOperations(FileOperations):
         or ``None`` if undetermined (new file, empty file, single-line
         file with no line break in the first chunk).
         """
+        # LocalEnvironment normalizes command output to LF on Windows so the
+        # public terminal API is stable.  Read the host bytes for this
+        # metadata probe instead of trying to infer CRLF from that normalized
+        # stream; remote environments continue to use the shell sample below.
+        if self._uses_host_file_metadata():
+            try:
+                sample = Path(path).read_bytes()[:4096].decode("utf-8", errors="replace")
+            except (OSError, UnicodeError):
+                sample = ""
+            if sample:
+                return _detect_line_ending(sample)
         if pre_content:
             return _detect_line_ending(pre_content)
         # File may not exist (new write) — `head` exits 0 with empty
@@ -1110,6 +1140,11 @@ class ShellFileOperations(FileOperations):
         marker. A missing/empty file returns False (new writes get no BOM
         unless the caller explicitly includes one).
         """
+        if self._uses_host_file_metadata():
+            try:
+                return Path(path).read_bytes()[:3] == _UTF8_BOM.encode("utf-8")
+            except OSError:
+                return False
         if pre_content is not None:
             return _has_bom(pre_content)
         head_cmd = f"head -c 3 {self._escape_shell_arg(path)} 2>/dev/null"
@@ -1117,6 +1152,17 @@ class ShellFileOperations(FileOperations):
         if head_result.exit_code != 0 or not head_result.stdout:
             return False
         return _has_bom(head_result.stdout)
+
+    def _uses_host_file_metadata(self) -> bool:
+        """Whether Windows metadata probes can read the local host directly."""
+        if os.name != "nt":
+            return False
+        try:
+            from tools.environments.local import LocalEnvironment
+
+            return isinstance(self.env, LocalEnvironment)
+        except Exception:
+            return False
 
 
     def _unified_diff(self, old_content: str, new_content: str, filename: str) -> str:
@@ -2204,7 +2250,13 @@ class ShellFileOperations(FileOperations):
         if not has_hidden_path_ancestor:
             pagination_expr = f" | tail -n +{offset + 1} | head -n {limit}"
 
-        cmd = f"find {self._escape_shell_arg(path)}{hidden_filter_expr} -type f -name {self._escape_shell_arg(search_pattern)} " \
+        # ``find`` is a shell utility on POSIX/Git Bash but the fallback is
+        # also exercised by native Windows test/remote shells.  Pass a
+        # drive-qualified root there; LocalEnvironment's command translator
+        # converts it to MSYS form before Git Bash runs it, while cmd.exe can
+        # resolve the same native spelling directly.
+        find_path = self._escape_native_path_arg(path)
+        cmd = f"find {find_path}{hidden_filter_expr} -type f -name {self._escape_shell_arg(search_pattern)} " \
               f"-printf '%T@ %p\\n' 2>/dev/null | sort -rn{pagination_expr}"
 
         result = self._exec(cmd, timeout=60)
@@ -2212,10 +2264,23 @@ class ShellFileOperations(FileOperations):
 
         if not stdout.strip() and not limit_reason:
             # Try without -printf (BSD find compatibility -- macOS)
-            cmd_simple = f"find {self._escape_shell_arg(path)}{hidden_filter_expr} -type f -name {self._escape_shell_arg(search_pattern)} " \
+            cmd_simple = f"find {find_path}{hidden_filter_expr} -type f -name {self._escape_shell_arg(search_pattern)} " \
                         f"2>/dev/null | sort -rn{pagination_expr}"
             result = self._exec(cmd_simple, timeout=60)
             stdout, limit_reason = _search_stdout_and_limit(result)
+
+        # A native Windows shell may expose ``find.exe`` (the text-search
+        # command) rather than POSIX find, so both commands can succeed with
+        # no file-list output.  When the requested root is also visible on the
+        # host, use a small Python fallback with the same hidden-descendant,
+        # mtime ordering, and pagination semantics.  Remote/POSIX backends
+        # keep the shell implementation and simply return ``None`` here.
+        if not stdout.strip() and not limit_reason and os.name == "nt":
+            host_files = self._search_files_host_fallback(
+                search_pattern, path, limit, offset
+            )
+            if host_files is not None:
+                return host_files
 
         files = []
         for line in stdout.strip().split('\n'):
@@ -2370,6 +2435,56 @@ class ShellFileOperations(FileOperations):
             total_count=len(normalized_files),
             truncated=len(normalized_files) >= fetch_limit or bool(limit_reason),
             limit_reason=limit_reason,
+        )
+
+    def _search_files_host_fallback(
+        self,
+        pattern: str,
+        path: str,
+        limit: int,
+        offset: int,
+    ) -> SearchResult | None:
+        """Search a host-visible Windows tree when POSIX ``find`` is absent."""
+        root = Path(path)
+        if os.name == "nt":
+            try:
+                from tools.environments.local import _msys_to_windows_path
+
+                root = Path(_msys_to_windows_path(path))
+            except Exception:
+                pass
+        if not root.is_dir():
+            return None
+
+        candidates: list[tuple[float, str]] = []
+        try:
+            for candidate in root.rglob("*"):
+                if not candidate.is_file() or not fnmatch.fnmatch(candidate.name, pattern):
+                    continue
+                try:
+                    relative_parts = candidate.relative_to(root).parts
+                except ValueError:
+                    continue
+                if any(
+                    part not in {".", ".."} and part.startswith(".")
+                    for part in relative_parts
+                ):
+                    continue
+                try:
+                    mtime = candidate.stat().st_mtime
+                except OSError:
+                    mtime = 0.0
+                candidates.append((mtime, str(candidate)))
+        except OSError:
+            return None
+
+        candidates.sort(key=lambda item: (-item[0], item[1]))
+        files = [item[1] for item in candidates]
+        page = files[offset:offset + limit]
+        return SearchResult(
+            files=page,
+            total_count=len(files),
+            truncated=len(files) >= offset + limit,
         )
     
     def _search_content(self, pattern: str, path: str, file_glob: Optional[str],

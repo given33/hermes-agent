@@ -266,6 +266,26 @@ def _run_runner(probe_dir: Path, *extra: str) -> subprocess.CompletedProcess:
     )
 
 
+def test_runner_help_exits_before_discovering_or_running_tests() -> None:
+    """The runner's own help must not be forwarded to every pytest file."""
+    repo_root = Path(__file__).resolve().parent.parent
+    runner = repo_root / "scripts" / "run_tests_parallel.py"
+    proc = subprocess.run(
+        [sys.executable, str(runner), "--help"],
+        cwd=repo_root,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+        timeout=10,
+    )
+    assert proc.returncode == 0, proc.stdout
+    assert "usage:" in proc.stdout
+    assert "Per-file parallel test runner" in proc.stdout
+    assert "Running tests" not in proc.stdout
+
+
 def test_bare_q_flag_passes_through(tmp_path: Path) -> None:
     """A bare ``-q`` (no ``--``) runs clean instead of erroring out."""
     probe_dir = _make_probe_dir(tmp_path)

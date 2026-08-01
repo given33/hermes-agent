@@ -2,6 +2,7 @@
 
 import json
 import os
+import shlex
 import signal
 import subprocess
 import sys
@@ -467,7 +468,24 @@ class TestStdinHelpers:
 
         result = registry.close_stdin(s.id)
 
-        pty.sendeof.assert_called_once()
+        if sys.platform == "win32":
+            pty.write.assert_called_once_with("\x1a\r\n")
+            pty.sendeof.assert_not_called()
+        else:
+            pty.sendeof.assert_called_once()
+        assert result["status"] == "ok"
+
+    @pytest.mark.skipif(sys.platform != "win32", reason="ConPTY-specific EOF framing")
+    def test_close_stdin_pty_mode_flushes_partial_windows_line(self, registry):
+        pty = MagicMock()
+        s = _make_session()
+        s._pty = pty
+        s._pty_at_line_start = False
+        registry._running[s.id] = s
+
+        result = registry.close_stdin(s.id)
+
+        pty.write.assert_called_once_with("\r\n\x1a\r\n")
         assert result["status"] == "ok"
 
     def test_close_stdin_allows_eof_driven_process_to_finish(self, registry, tmp_path):
@@ -478,8 +496,12 @@ class TestStdinHelpers:
         lockout (#17959). For interactive stdin → PTY mode is now the only
         supported path.
         """
+        # ``python3`` is not a guaranteed command name on native Windows.
+        # Use the interpreter running pytest, translated to a Git-Bash-safe
+        # path, so this test exercises PTY EOF semantics on every platform.
+        python_exe = shlex.quote(sys.executable.replace("\\", "/"))
         session = registry.spawn_local(
-            'python3 -c "import sys; print(sys.stdin.read().strip())"',
+            f'{python_exe} -c "import sys; print(sys.stdin.read().strip())"',
             cwd=str(tmp_path),
             use_pty=True,
         )
@@ -814,6 +836,7 @@ class TestSpawnEnvSanitization:
 class TestPopenLeakOnSetupFailure:
     """Regression for issue #2749: subprocess orphaned when post-Popen setup raises."""
 
+    @pytest.mark.skipif(sys.platform == "win32", reason="POSIX process-group cleanup path")
     def test_popen_killed_when_thread_creation_fails(self, registry):
         """If Thread() raises after Popen, proc must be killed — not orphaned."""
         killed = []
@@ -851,6 +874,7 @@ class TestPopenLeakOnSetupFailure:
 
         assert killed, "proc.kill() must be called when post-Popen setup raises"
 
+    @pytest.mark.skipif(sys.platform == "win32", reason="POSIX process-group cleanup path")
     def test_popen_killed_when_write_checkpoint_fails(self, registry):
         """If _write_checkpoint raises after Popen, proc must still be killed."""
         killed = []
@@ -1761,6 +1785,8 @@ class TestTerminateHostPidWindows:
         assert "12345" in captured["args"]
         assert "/T" in captured["args"], "Tree flag required to reach descendants"
         assert "/F" in captured["args"], "Force flag required for headless Chromium"
+        assert captured["kwargs"]["encoding"] == "utf-8"
+        assert captured["kwargs"]["errors"] == "replace"
 
     def test_windows_falls_back_to_os_kill_when_taskkill_missing(self, monkeypatch):
         """If ``taskkill.exe`` is somehow unavailable, fall back to a bare
