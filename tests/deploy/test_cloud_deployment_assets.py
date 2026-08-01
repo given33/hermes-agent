@@ -749,6 +749,17 @@ def test_public_installer_quiesces_state_during_snapshot_and_rollback():
     assert 'restore_sqlite "${backup}/state/ios-mcp-supervisor.db"' in rollback
     assert 'restore_sqlite "${backup}/state/mobile-auth.db"' in rollback
     assert 'backup_sqlite "${mobile_auth_target}" "${backup}/state/mobile-auth.db"' in installer
+    assert "prepare_sqlite_runtime_target()" in installer
+    assert 'for suffix in -wal -shm -journal' in installer
+    assert 'chown "${service_user}:${service_group}" "${sidecar}"' in installer
+    assert 'chmod 0600 "${sidecar}"' in installer
+    permission_normalization = installer.index(
+        'prepare_sqlite_runtime_target "${sqlite_target}"'
+    )
+    assert permission_normalization > installer.index("mutated=1")
+    assert permission_normalization < installer.index(
+        'install_atomic "${snapshot}/plugins/collaboration/dashboard/plugin_api.py"'
+    )
     mutated_start = rollback.index(
         'systemctl start "${service}"', rollback.index("restore_state")
     )

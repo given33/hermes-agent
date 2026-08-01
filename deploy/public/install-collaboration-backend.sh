@@ -1314,10 +1314,43 @@ install_root_atomic() {
   install -o root -g root -m 0644 "${source}" "${temporary}"
   mv -f -- "${temporary}" "${destination}"
 }
+# Normalize SQLite ownership and sidecars before the first service-user open.
+# A stale root-owned -wal/-shm file makes SQLite report a misleading
+# "disk I/O error" while enabling WAL, which previously aborted deployment.
+prepare_sqlite_runtime_target() {
+  local target="$1"
+  local parent
+  parent="$(dirname "${target}")"
+  install -d -o "${service_user}" -g "${service_group}" -m 0700 "${parent}"
+  if [[ -e "${target}" || -L "${target}" ]]; then
+    [[ -f "${target}" && ! -L "${target}" ]] \
+      || die "SQLite runtime target is not a regular file: ${target}"
+    chown "${service_user}:${service_group}" "${target}"
+    chmod 0600 "${target}"
+  fi
+  local suffix sidecar
+  for suffix in -wal -shm -journal; do
+    sidecar="${target}${suffix}"
+    if [[ -e "${sidecar}" || -L "${sidecar}" ]]; then
+      [[ -f "${sidecar}" && ! -L "${sidecar}" ]] \
+        || die "SQLite sidecar is not a regular file: ${sidecar}"
+      chown "${service_user}:${service_group}" "${sidecar}"
+      chmod 0600 "${sidecar}"
+    fi
+  done
+}
 # Point of no return: everything below replaces live files, so from here on
 # rollback must restore the snapshots taken above instead of merely
 # restarting the service.
 mutated=1
+for sqlite_target in \
+  "${cloud_files_database_target}" \
+  "${mobile_auth_target}" \
+  "${managed_installations_database_target}" \
+  "${ios_database_target}" \
+  "${ios_supervisor_target}"; do
+  prepare_sqlite_runtime_target "${sqlite_target}"
+done
 if [[ "${dependency_update_enabled}" == 1 ]]; then
   mv -f -- "${runtime_venv}" "${previous_venv}"
   venv_old_moved=1
