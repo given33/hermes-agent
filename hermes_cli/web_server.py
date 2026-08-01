@@ -112,6 +112,7 @@ try:
     from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, Response
     from fastapi.staticfiles import StaticFiles
     from pydantic import BaseModel, SecretStr
+    from starlette.background import BackgroundTask
     from starlette.concurrency import run_in_threadpool
 except ImportError:
     # First try lazy-installing the dashboard extras. Only the user actually
@@ -128,6 +129,7 @@ except ImportError:
         from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, Response
         from fastapi.staticfiles import StaticFiles
         from pydantic import BaseModel, SecretStr
+        from starlette.background import BackgroundTask
         from starlette.concurrency import run_in_threadpool
     except Exception:
         raise SystemExit(
@@ -12824,6 +12826,17 @@ def _retain_cron_fire_task(task: asyncio.Task[Any]) -> None:
     task.add_done_callback(finish)
 
 
+async def _await_cron_fire_task(task: asyncio.Task[Any]) -> None:
+    """Drain an accepted cron task from the ASGI response lifecycle."""
+
+    try:
+        await task
+    except asyncio.CancelledError:
+        # A server shutdown may cancel an accepted task. The done callback
+        # still releases the strong reference and avoids an unhandled warning.
+        return
+
+
 @app.post("/api/cron/fire")
 async def cron_fire_webhook(request: Request):
     """Chronos managed-cron fire webhook (NAS -> agent).
@@ -12867,9 +12880,15 @@ async def cron_fire_webhook(request: Request):
         resolve_target=resolve_target,
         execute=execute,
     )
+    background = None
     if accepted.background_task is not None:
         _retain_cron_fire_task(accepted.background_task)
-    return JSONResponse(dict(accepted.body), status_code=accepted.status_code)
+        background = BackgroundTask(_await_cron_fire_task, accepted.background_task)
+    return JSONResponse(
+        dict(accepted.body),
+        status_code=accepted.status_code,
+        background=background,
+    )
 
 
 # ---------------------------------------------------------------------------
