@@ -40,7 +40,7 @@ CAPABILITIES = (
     "ios-health-heart", "ios-health-oxygen", "ios-health-activity", "ios-health-write", "ios-calendar",
     "ios-reminders", "ios-clipboard", "ios-contacts", "ios-photos", "ios-media",
     "ios-vision", "ios-bluetooth", "ios-nfc", "ios-homekit", "ios-notes", "ios-screen-time", "ios-watch", "ios-notification",
-    "ios-live-activity", "ios-device",
+    "ios-live-activity", "ios-browser", "ios-device",
 )
 
 MCP_VERSION = "1.0.0"
@@ -73,6 +73,7 @@ _SCOPE_BY_CAPABILITY = {
     "ios-watch": ("watch:read", "watch:control"),
     "ios-notification": ("notification:send",),
     "ios-live-activity": ("live-activity:write",),
+    "ios-browser": ("browser:read", "browser:control"),
     "ios-device": ("device:read", "device:control"),
     "ios-health-write": ("health:write",),
 }
@@ -212,6 +213,30 @@ _TOOL_SCOPE_BY_CAPABILITY = {
     "ios-device": {
         "ios_device_get_latest": ("device:read",),
         "ios_device_open_url": ("device:control",),
+    },
+    "ios-browser": {
+        "ios_browser_navigate": ("browser:read",),
+        "ios_browser_screenshot": ("browser:read",),
+        "ios_browser_get_text": ("browser:read",),
+        "ios_browser_get_page_info": ("browser:read",),
+        "ios_browser_find_elements": ("browser:read",),
+        "ios_browser_get_readable": ("browser:read",),
+        "ios_browser_get_backbone": ("browser:read",),
+        "ios_browser_list_tabs": ("browser:read",),
+        "ios_browser_get_cookies": ("browser:read",),
+        "ios_browser_fetch": ("browser:read",),
+        "ios_browser_wait_for_dom_stable": ("browser:read",),
+        "ios_browser_click": ("browser:control",),
+        "ios_browser_type": ("browser:control",),
+        "ios_browser_scroll": ("browser:control",),
+        "ios_browser_hover": ("browser:control",),
+        "ios_browser_execute_js": ("browser:control",),
+        "ios_browser_set_user_agent": ("browser:control",),
+        "ios_browser_set_viewport": ("browser:control",),
+        "ios_browser_new_tab": ("browser:control",),
+        "ios_browser_close_tab": ("browser:control",),
+        "ios_browser_set_cookies": ("browser:control",),
+        "ios_browser_scroll_and_collect": ("browser:control",),
     },
     "ios-health-write": {
         "ios_health_write_authorize": ("health:write",),
@@ -1155,6 +1180,34 @@ def create_mcp_server(
             mcp, enforcer, store, capability, "ios_live_activity_end", "end",
             "Use when the user asks to end an existing iOS Lock Screen Live Activity by id.",
         )
+        return mcp
+
+    if capability == "ios-browser":
+        for tool_name, action, description in (
+            ("ios_browser_navigate", "navigate", "Use when Hermes needs the iPhone's native web runtime to open a bounded HTTP(S) URL."),
+            ("ios_browser_screenshot", "screenshot", "Use when Hermes needs a screenshot of the current iPhone browser tab; the result is stored in the owner-scoped app support directory."),
+            ("ios_browser_get_text", "get_text", "Use when Hermes needs the visible text from the current iPhone browser tab."),
+            ("ios_browser_get_page_info", "get_page_info", "Use when Hermes needs the title, URL, ready state, or viewport of the current iPhone browser tab."),
+            ("ios_browser_find_elements", "find_elements", "Use when Hermes needs bounded DOM element summaries matching a CSS selector."),
+            ("ios_browser_get_readable", "get_readable", "Use when Hermes needs readable page text with script/style noise removed."),
+            ("ios_browser_get_backbone", "get_backbone", "Use when Hermes needs a bounded structural outline of the current page."),
+            ("ios_browser_list_tabs", "list_tabs", "Use when Hermes needs to inspect the open native iPhone browser tabs."),
+            ("ios_browser_get_cookies", "get_cookies", "Use when Hermes needs cookies from the current native iPhone browser tab."),
+            ("ios_browser_fetch", "fetch", "Use when Hermes needs to fetch a bounded HTTP(S) response into the owner-scoped iPhone browser workspace."),
+            ("ios_browser_wait_for_dom_stable", "wait_for_dom_stable", "Use when Hermes needs to wait for a page's DOM text to stop changing."),
+            ("ios_browser_click", "click", "Use when the user explicitly asks Hermes to click a page element on the iPhone after confirmation."),
+            ("ios_browser_type", "type", "Use when the user explicitly asks Hermes to enter text into a page field on the iPhone after confirmation."),
+            ("ios_browser_scroll", "scroll", "Use when Hermes needs to scroll the current iPhone browser page after confirmation."),
+            ("ios_browser_hover", "hover", "Use when Hermes needs to dispatch hover events to a page element after confirmation."),
+            ("ios_browser_execute_js", "execute_js", "Use only for an explicitly confirmed browser automation request; arbitrary page JavaScript is treated as destructive."),
+            ("ios_browser_set_user_agent", "set_user_agent", "Use when the user explicitly asks Hermes to change the browser user agent after confirmation."),
+            ("ios_browser_set_viewport", "set_viewport", "Use when the user explicitly asks Hermes to change the browser viewport after confirmation."),
+            ("ios_browser_new_tab", "new_tab", "Use when the user explicitly asks Hermes to open another native iPhone browser tab after confirmation."),
+            ("ios_browser_close_tab", "close_tab", "Use when the user explicitly asks Hermes to close a native iPhone browser tab after confirmation."),
+            ("ios_browser_set_cookies", "set_cookies", "Use when the user explicitly asks Hermes to write browser cookies after confirmation."),
+            ("ios_browser_scroll_and_collect", "scroll_and_collect", "Use when the user explicitly asks Hermes to scroll and collect bounded page items after confirmation."),
+        ):
+            _queue_tool(mcp, enforcer, store, capability, tool_name, action, description)
         return mcp
 
     raise AssertionError(f"Capability registration missing: {capability}")

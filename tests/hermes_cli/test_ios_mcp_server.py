@@ -115,6 +115,15 @@ def test_generic_native_writes_require_idempotency_key(tmp_path):
         ("ios-homekit", {"ios_homekit_list", "ios_homekit_set", "ios_homekit_search", "ios_homekit_scenes", "ios_homekit_trigger"}),
         ("ios-health-write", {"ios_health_write_authorize", "ios_health_write", "ios_health_write_batch", "ios_health_delete"}),
         ("ios-device", {"ios_device_get_latest", "ios_device_open_url"}),
+        ("ios-browser", {
+            "ios_browser_navigate", "ios_browser_screenshot", "ios_browser_get_text",
+            "ios_browser_get_page_info", "ios_browser_find_elements", "ios_browser_get_readable",
+            "ios_browser_get_backbone", "ios_browser_list_tabs", "ios_browser_get_cookies",
+            "ios_browser_fetch", "ios_browser_wait_for_dom_stable", "ios_browser_click",
+            "ios_browser_type", "ios_browser_scroll", "ios_browser_hover", "ios_browser_execute_js",
+            "ios_browser_set_user_agent", "ios_browser_set_viewport", "ios_browser_new_tab",
+            "ios_browser_close_tab", "ios_browser_set_cookies", "ios_browser_scroll_and_collect",
+        }),
     ],
 )
 def test_native_action_capabilities_expose_queue_tools(tmp_path, capability, tools):
@@ -158,6 +167,9 @@ def test_new_native_actions_have_explicit_server_risk_and_permission_policies():
         ("ios-calendar", "delete"): ("destructive", "required", "calendar"),
         ("ios-reminders", "complete"): ("write", "required", "reminders"),
         ("ios-health-write", "batch"): ("write", "required", "health"),
+        ("ios-browser", "navigate"): ("read", "none", "network"),
+        ("ios-browser", "execute_js"): ("destructive", "required", "network"),
+        ("ios-browser", "set_cookies"): ("write", "required", "network"),
     }
     for action, (risk, confirmation, permission) in expected.items():
         metadata = ios_native_action_metadata(*action)
