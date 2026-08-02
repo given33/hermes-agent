@@ -385,6 +385,14 @@ def test_fabric_updater_transaction_and_rollback_behavior():
     assert "fabric updater transaction harness passed" in result.stdout
 
 
+def test_fabric_updater_stages_sqlite_fallback_dependency():
+    updater = (AUTOMATION / "update-fabric-node.sh").read_text(encoding="utf-8")
+    harness = (AUTOMATION / "test-update-fabric-node.sh").read_text(encoding="utf-8")
+
+    assert '"hermes_cli/sqlite_util.py"' in updater
+    assert "managed_node_recovery_service.py sqlite_util.py" in harness
+
+
 def test_public_release_contains_the_complete_application_service_layer():
     deployer = (PUBLIC / "deploy-collaboration-backend.sh").read_text(
         encoding="utf-8"
@@ -459,6 +467,9 @@ def test_public_release_contains_the_complete_application_service_layer():
     assert 'destination_parent="$(dirname "${target_root}/${relative}")"' in installer
     assert '"hermes_cli/sqlite_util.py"' in installer
     assert '"hermes_cli/sqlite_util.py"' in deployer
+    assert '"hermes_cli/sqlite_util.py"' in (AUTOMATION / "update-fabric-node.sh").read_text(
+        encoding="utf-8"
+    )
     assert 'backup_one "${target_root}/${relative}"' in installer
     assert 'install_atomic "${snapshot}/${relative}"' in installer
     assert 'restore_one "${backup}/${relative}"' in installer

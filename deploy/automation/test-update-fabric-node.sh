@@ -93,7 +93,7 @@ for asset in hermes-managed-installation-receiver.service \
 done
 printf '{}\n' >"${archive}/deploy/recovery/managed-installations.dbb3.json"
 printf '{}\n' >"${archive}/deploy/recovery/managed-installations.wsl.json"
-for module in __init__.py managed_installations.py managed_nodes.py managed_node_recovery_service.py; do
+for module in __init__.py managed_installations.py managed_nodes.py managed_node_recovery_service.py sqlite_util.py; do
   printf 'RELEASE = "new"\n' >"${archive}/hermes_cli/${module}"
 done
 for module in __init__.py config.py; do
@@ -158,7 +158,7 @@ run_case() {
   mkdir -p "${root}/runtime/hermes_cli" "${root}/runtime/hermes_runtime" \
     "${root}/runtime/hermes_services" "${root}/automation" \
     "${root}/home/.ssh" "${root}/backups" "${root}/state"
-  for module in __init__.py managed_installations.py managed_nodes.py managed_node_recovery_service.py; do
+  for module in __init__.py managed_installations.py managed_nodes.py managed_node_recovery_service.py sqlite_util.py; do
     printf 'RELEASE = "old"\n' >"${root}/runtime/hermes_cli/${module}"
   done
   for module in __init__.py config.py; do

@@ -263,6 +263,7 @@ archive_paths=(
   "hermes_cli/managed_installations.py"
   "hermes_cli/managed_nodes.py"
   "hermes_cli/managed_node_recovery_service.py"
+  "hermes_cli/sqlite_util.py"
   "hermes_cli/__init__.py"
   "hermes_runtime"
   "hermes_services"
@@ -364,6 +365,7 @@ runtime_assets=(
   "hermes_cli/managed_installations.py"
   "hermes_cli/managed_nodes.py"
   "hermes_cli/managed_node_recovery_service.py"
+  "hermes_cli/sqlite_util.py"
 )
 for runtime_root_path in hermes_runtime hermes_services; do
   while IFS= read -r -d '' runtime_path; do
