@@ -25,7 +25,14 @@ if [[ -e "${install_lock}" || -L "${install_lock}" ]]; then
 fi
 exec 8>"${install_lock}"
 chmod 0600 "${install_lock}"
-flock -n 8 || die "another collaboration deployment is already running"
+lock_wait_seconds="${HERMES_INSTALL_LOCK_WAIT_SECONDS:-900}"
+[[ "${lock_wait_seconds}" =~ ^[1-9][0-9]*$ ]] \
+  || die "HERMES_INSTALL_LOCK_WAIT_SECONDS must be a positive integer"
+# A cancelled CI SSH session can leave the remote installer finishing its
+# bounded recovery/health transaction. Wait for that owner to release the
+# lock instead of turning a safe serialized deployment into a false failure.
+flock --wait "${lock_wait_seconds}" 8 \
+  || die "another collaboration deployment is still running after ${lock_wait_seconds}s"
 
 version="${1:-}"
 stage="${2:-}"

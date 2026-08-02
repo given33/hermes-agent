@@ -540,7 +540,9 @@ def test_transactional_installers_serialize_deployments_and_use_unique_backups()
     public = (PUBLIC / "install-collaboration-backend.sh").read_text(encoding="utf-8")
     connector = (DBB3 / "install-dbb3-cloud-connector-user.sh").read_text(encoding="utf-8")
 
-    assert 'flock -n 8 || die "another collaboration deployment is already running"' in public
+    assert 'lock_wait_seconds="${HERMES_INSTALL_LOCK_WAIT_SECONDS:-900}"' in public
+    assert 'flock --wait "${lock_wait_seconds}" 8' in public
+    assert 'another collaboration deployment is still running after ${lock_wait_seconds}s' in public
     assert 'mktemp -d "${backup_root}/collaboration-${version}-${stamp}.XXXXXX"' in public
     assert 'flock -n 8 || die "another connector deployment is already running"' in connector
 
