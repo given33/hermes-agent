@@ -27,6 +27,7 @@ for node in dbb3 wsl; do
   last_state="unreachable"
   for _ in $(seq 1 "${attempts}"); do
     if curl --fail --silent --show-error --max-time 5 \
+        --noproxy '*' \
         --resolve 'daxueshenmai.top:443:127.0.0.1' \
         --config "${curl_config}" \
         "https://daxueshenmai.top/_hermes/installations/${node}/health" \

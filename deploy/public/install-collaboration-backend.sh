@@ -1679,7 +1679,7 @@ printf 'header = "X-DBB3-Token: %s"\nheader = "Accept: application/json"\n' \
 # Fabric nodes update from a two-minute systemd timer and may need several
 # minutes for dependency installation plus the receiver restart. Keep the
 # rollout fail-closed, but allow the normal timer/update transaction to finish.
-fabric_health_attempts="${HERMES_FABRIC_HEALTH_ATTEMPTS:-600}"
+fabric_health_attempts="${HERMES_FABRIC_HEALTH_ATTEMPTS:-60}"
 [[ "${fabric_health_attempts}" =~ ^[1-9][0-9]*$ ]] \
   || die "HERMES_FABRIC_HEALTH_ATTEMPTS must be a positive integer"
 for node in dbb3 wsl; do
@@ -1690,6 +1690,7 @@ for node in dbb3 wsl; do
     : >"${node_health}"
     : >"${node_http_status}"
     if curl --silent --show-error --max-time 5 \
+        --noproxy '*' \
         --resolve 'daxueshenmai.top:443:127.0.0.1' \
         --config "${installation_health_cfg}" \
         --write-out '%{http_code}' \
@@ -1757,11 +1758,13 @@ PY
     "${installation_probe_id}" "${installation_probe_id}" "${node}" \
     >"${installation_probe_body}"
   curl --fail --silent --show-error --max-time 8 \
+    --noproxy '*' \
     --resolve 'daxueshenmai.top:443:127.0.0.1' \
     --config "${installation_health_cfg}" -H 'Content-Type: application/json' \
     --data-binary "@${installation_probe_body}" -o "${installation_probe_post}" \
     "https://daxueshenmai.top/_hermes/installations/${node}"
   curl --fail --silent --show-error --max-time 8 \
+    --noproxy '*' \
     --resolve 'daxueshenmai.top:443:127.0.0.1' \
     --config "${installation_health_cfg}" -o "${installation_probe_get}" \
     "https://daxueshenmai.top/_hermes/installations/${node}/${installation_probe_id}"

@@ -965,6 +965,18 @@ def test_public_installer_allows_recovery_when_service_is_inactive():
     assert 'connector health preflight returned an invalid contract while ${service} is inactive' in preflight
 
 
+def test_public_installer_bounds_fabric_checks_and_bypasses_proxy_for_loopback():
+    installer = (PUBLIC / "install-collaboration-backend.sh").read_text(
+        encoding="utf-8"
+    )
+    verifier = (PUBLIC / "verify-fabric-release.sh").read_text(encoding="utf-8")
+
+    assert 'fabric_health_attempts="${HERMES_FABRIC_HEALTH_ATTEMPTS:-60}"' in installer
+    assert installer.count("--noproxy '*'") >= 7
+    assert 'attempts="${HERMES_FABRIC_VERIFY_ATTEMPTS:-60}"' in verifier
+    assert "--noproxy '*'" in verifier
+
+
 def test_public_installer_uses_effective_systemd_hermes_home_before_env_fallback():
     installer = (PUBLIC / "install-collaboration-backend.sh").read_text(
         encoding="utf-8"
