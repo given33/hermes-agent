@@ -391,6 +391,7 @@ def test_fabric_updater_stages_sqlite_fallback_dependency():
 
     assert '"hermes_cli/sqlite_util.py"' in updater
     assert "managed_node_recovery_service.py sqlite_util.py" in harness
+    assert "import hermes_cli.managed_node_recovery_service" in updater
 
 
 def test_public_release_contains_the_complete_application_service_layer():

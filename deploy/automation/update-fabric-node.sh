@@ -420,6 +420,12 @@ import pathlib, sys
 for name in sys.argv[1:]:
     compile(pathlib.Path(name).read_text(encoding="utf-8"), name, "exec")
 PY
+# Compilation alone cannot catch a missing transitive module. Import the
+# receiver entry point from the staged tree before replacing the live runtime,
+# so a fabric update cannot restart into an ImportError and disappear from the
+# public installation routes.
+PYTHONPATH="${stage}${PYTHONPATH:+:${PYTHONPATH}}" \
+  python3 -c 'import hermes_cli.managed_node_recovery_service'
 runtime_swapped=1
 for relative in "${runtime_assets[@]}"; do
   target="${runtime_root}/${relative}"
