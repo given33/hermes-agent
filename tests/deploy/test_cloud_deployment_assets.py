@@ -297,11 +297,13 @@ def test_production_release_synchronizes_the_ios_workflow_observably():
         "dispatch-ios:", 1
     )[1]
     assert "HERMES_IOS_WORKFLOW_TOKEN" in workflow
+    assert "HERMES_IOS_SIGNED_BUILD" in workflow
+    assert "hermes-backend-release-unsigned" in workflow
     assert "IOS_REPOSITORY" in workflow
     assert "given33/hermes-ios" in workflow
     assert "ios-unsigned.yml" in workflow
     assert 'gh api --method POST "repos/${IOS_REPOSITORY}/dispatches"' in workflow
-    assert '--arg event_type "hermes-backend-release"' in workflow
+    assert '--arg event_type "${event_type}"' in workflow
     assert '--arg commit "${RELEASE_COMMIT}"' in workflow
     assert '--arg version "${release_version}"' in workflow
     assert "release_name=\"Backend release ${RELEASE_COMMIT}\"" in workflow
@@ -331,6 +333,9 @@ def test_production_release_synchronizes_the_ios_workflow_observably():
     assert "failure|cancelled|timed_out|action_required|startup_failure|stale" in workflow
     assert 'watch_release "${run_id}" unsigned' in workflow
     assert 'watch_release "${production_run_id}" production' in workflow
+    assert 'dispatch_release "hermes-backend-release"' in workflow
+    assert 'dispatch_release "hermes-backend-release-unsigned"' in workflow
+    assert "Unsigned iOS IPA is the configured delivery artifact; signed EAS build is opt-in" in workflow
     assert 'elif [ -z "${run_id}" ] || [ -z "${production_run_id}" ]; then' in workflow
     assert "if [ -z \"${run_id}\" ] || [ -z \"${production_run_id}\" ]; then" in workflow
     assert "refusing a duplicate dispatch" in workflow

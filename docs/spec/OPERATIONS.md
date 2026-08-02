@@ -68,10 +68,17 @@ HERMES_UID=$(id -u) HERMES_GID=$(id -g) docker compose up -d
 The `deploy-three-endpoints.yml` workflow is the release gate for the public
 backend and its fabric nodes. A successful push to `main`, published release,
 or explicit manual run first waits for the same commit's complete `CI`
-workflow, then dispatches the `hermes-backend-release` event to the iOS
-repository. That event starts both the unsigned IPA verification and the signed
-production EAS workflow. Scheduled drift-healing runs intentionally skip the
-iOS fan-out so they do not enqueue an app build every two hours.
+workflow, then dispatches the unsigned release event to the iOS repository.
+By default the fan-out dispatches
+`hermes-backend-release-unsigned`; signed opt-in uses
+`hermes-backend-release` so both child workflows run. The unsigned artifact is
+the normal delivery because
+the operator signs that artifact with their own certificate tool. Set the
+repository variable `HERMES_IOS_SIGNED_BUILD=1` only when the target iOS
+repository has valid EAS credentials; that mode starts both the unsigned IPA
+verification and the signed production EAS workflow. Scheduled drift-healing
+runs intentionally skip the iOS fan-out so they do not enqueue an app build
+every two hours.
 
 Configure the following repository settings before enabling this fan-out:
 
@@ -81,12 +88,16 @@ Configure the following repository settings before enabling this fan-out:
   workflow runs.
 - Repository variable `HERMES_IOS_REPOSITORY`: optional; defaults to
   `given33/hermes-ios` and should be set when the iOS repository moves.
-- The target workflows must keep `repository_dispatch` enabled for event type
-  `hermes-backend-release`. A missing token, an unobservable dispatch, or a
-  failed unsigned iOS run fails the fan-out job after the backend deployment
-  has already completed, leaving an explicit GitHub check to prevent silent
-  drift. The signed EAS job separately fails closed when `EXPO_TOKEN` is not
-  configured.
+- Repository variable `HERMES_IOS_SIGNED_BUILD`: optional and defaults to
+  `0`. Set it to `1` only after configuring `EXPO_TOKEN` and `EXPO_PROJECT_ID`
+  in the iOS repository.
+- The unsigned target workflow must keep `repository_dispatch` enabled for
+  event types `hermes-backend-release-unsigned` and the legacy
+  `hermes-backend-release`; the signed workflow listens only to the latter.
+  A missing token, an unobservable dispatch, or a failed unsigned iOS run
+  fails the fan-out job after the backend deployment has already completed,
+  leaving an explicit GitHub check to prevent silent drift. The signed EAS job
+  remains an explicit opt-in and fails closed when its credentials are absent.
 
 The `deploy-site.yml` workflow deploys GitHub Pages and triggers the Vercel
 deploy hook for release events, matching `main` pushes, and manual runs. The

@@ -149,6 +149,7 @@ jobs:
         env:
           GH_TOKEN: ${{ secrets.HERMES_IOS_WORKFLOW_TOKEN }}
           IOS_REPOSITORY: ${{ vars.HERMES_IOS_REPOSITORY || 'given33/hermes-ios' }}
+          HERMES_IOS_SIGNED_BUILD: ${{ vars.HERMES_IOS_SIGNED_BUILD || '0' }}
           RELEASE_COMMIT: ${{ github.sha }}
         shell: bash
         run: |
@@ -157,6 +158,13 @@ jobs:
             echo "::error::HERMES_IOS_WORKFLOW_TOKEN is required to synchronize the iOS repository"
             exit 1
           }
+          case "${HERMES_IOS_SIGNED_BUILD}" in
+            0|1) ;;
+            *)
+              echo "::error::HERMES_IOS_SIGNED_BUILD must be 0 or 1"
+              exit 1
+              ;;
+          esac
           release_version="$(python3 - <<'PY'
           import json
           from pathlib import Path
@@ -202,9 +210,10 @@ jobs:
                 'map(select(.displayTitle == $name and .status == "completed" and .conclusion != "success")) | sort_by(.databaseId) | reverse | .[0].databaseId // empty'
           }
           dispatch_release() {
+            local event_type="$1"
             local payload
             payload="$(jq -n \
-              --arg event_type "hermes-backend-release" \
+              --arg event_type "${event_type}" \
               --arg commit "${RELEASE_COMMIT}" \
               --arg version "${release_version}" \
               '{event_type: $event_type, client_payload: {commit: $commit, version: $version}}')"
@@ -253,6 +262,37 @@ jobs:
             return 1
           }
 
+          # The normal mobile delivery contract is an unsigned IPA that the
+          # operator signs with their own certificate tool. Keep the EAS
+          # production workflow opt-in: the iOS repository has no signing
+          # credentials in this deployment, and a missing optional signed
+          # build must not block the usable unsigned artifact.
+          if [ "${HERMES_IOS_SIGNED_BUILD}" = "0" ]; then
+            run_id="$(find_release_run ios-unsigned.yml "${release_name}")"
+            failed_run_id="$(find_failed_release_run ios-unsigned.yml "${release_name}")"
+            if [ -z "${run_id}" ] && [ -n "${failed_run_id}" ]; then
+              rerun_release "${failed_run_id}"
+              run_id="${failed_run_id}"
+              echo "Re-running failed iOS unsigned run ${run_id}"
+            fi
+            if [ -z "${run_id}" ]; then
+              dispatch_release "hermes-backend-release-unsigned"
+              for _ in $(seq 1 60); do
+                run_id="$(find_release_run ios-unsigned.yml "${release_name}")"
+                [ -n "${run_id}" ] && break
+                sleep 2
+              done
+            fi
+            test -n "${run_id}" || {
+              echo "::error::iOS repository dispatch was accepted but its unsigned run could not be observed"
+              exit 1
+            }
+            echo "Observing iOS unsigned run ${run_id}"
+            watch_release "${run_id}" unsigned
+            echo "Unsigned iOS IPA is the configured delivery artifact; signed EAS build is opt-in"
+            exit 0
+          fi
+
           # A repository_dispatch starts both child workflows. Reuse active or
           # successful runs while the sibling is still appearing in the API;
           # completed failures are rerun individually so one failed child does
@@ -272,7 +312,7 @@ jobs:
             echo "Re-running failed iOS production EAS run ${production_run_id}"
           fi
           if [ -z "${run_id}" ] && [ -z "${production_run_id}" ]; then
-            dispatch_release
+            dispatch_release "hermes-backend-release"
           elif [ -z "${run_id}" ] || [ -z "${production_run_id}" ]; then
             # A partial/old dispatch can leave only one child workflow. Give
             # the missing sibling time to appear in the Actions API first;
