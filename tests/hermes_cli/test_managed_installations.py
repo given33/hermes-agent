@@ -64,6 +64,41 @@ def test_managed_installations_database_uses_fallback_when_home_is_full(
     assert resolved.with_name(resolved.name + ".hermes-fallback").is_file()
 
 
+def test_legacy_fabric_runtime_without_sqlite_helper_still_imports():
+    script = r'''
+import importlib.abc
+import sys
+
+class MissingSQLiteHelper(importlib.abc.MetaPathFinder):
+    def find_spec(self, fullname, path=None, target=None):
+        if fullname == "hermes_cli.sqlite_util":
+            raise ModuleNotFoundError(
+                "legacy fabric runtime has no sqlite_util.py",
+                name=fullname,
+            )
+        return None
+
+sys.meta_path.insert(0, MissingSQLiteHelper())
+from hermes_cli import managed_installations
+
+assert managed_installations.resolve_sqlite_fallback(
+    "/tmp/managed-installations.db",
+    env_var="IGNORED",
+    label="managed-installations.db",
+    fallback_relative="managed-installations.db",
+) == (managed_installations.Path("/tmp/managed-installations.db"), None)
+managed_installations.copy_sqlite_fallback(None, managed_installations.Path("/tmp/managed-installations.db"))
+'''
+    completed = subprocess.run(
+        [sys.executable, "-c", script],
+        cwd=Path(__file__).parents[2],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert completed.returncode == 0, completed.stderr
+
+
 def _wait_for_http_server(url: str, headers: dict[str, str] | None = None) -> None:
     deadline = time.monotonic() + 3
     while True:

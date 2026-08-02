@@ -35,7 +35,28 @@ from uuid import uuid4
 
 from hermes_constants import get_hermes_home
 from hermes_runtime.config import read_raw_config_strict
-from hermes_cli.sqlite_util import copy_sqlite_fallback, resolve_sqlite_fallback
+try:
+    from hermes_cli.sqlite_util import copy_sqlite_fallback, resolve_sqlite_fallback
+except ModuleNotFoundError as exc:
+    # A legacy fabric updater may have deployed this module before it learned
+    # to ship sqlite_util.py. Keep the receiver bootable long enough for that
+    # updater to recover the missing asset; all current nodes use the durable
+    # fallback implementation above.
+    if exc.name != "hermes_cli.sqlite_util":
+        raise
+
+    def resolve_sqlite_fallback(
+        path: Path,
+        *,
+        env_var: str,
+        label: str,
+        fallback_relative: str,
+    ) -> tuple[Path, Path | None]:
+        del env_var, label, fallback_relative
+        return Path(path), None
+
+    def copy_sqlite_fallback(source: Path | None, destination: Path) -> None:
+        del source, destination
 from hermes_services.resource_catalog import (
     ResourceRecord,
     resolve_resource_collisions,
