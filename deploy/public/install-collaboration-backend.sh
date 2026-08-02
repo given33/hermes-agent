@@ -556,7 +556,12 @@ validate_connector_health() {
   curl --fail --silent --show-error --max-time 8 \
     "${health_curl_proxy_args[@]}" \
     --config "${curl_cfg}" -o "${output}" "${health_url}" \
-    && "${runtime_python}" - "${output}" "${connector_id}" "${require_identity}" <<'PY'
+    && validate_connector_health_payload "${output}" "${require_identity}"
+}
+validate_connector_health_payload() {
+  local output="$1"
+  local require_identity="${2:-1}"
+  "${runtime_python}" - "${output}" "${connector_id}" "${require_identity}" <<'PY'
 import json, sys
 data = json.load(open(sys.argv[1], encoding="utf-8"))
 assert data.get("ok") is True
@@ -648,11 +653,15 @@ PY
 preflight_health="$(mktemp /run/hermes-agent-connector-preflight.XXXXXX)"
 if [[ -f "${plugin_target}/plugin_api.py" ]] \
   && grep -Fq '@router.get("/connector/health")' "${plugin_target}/plugin_api.py"; then
-  if ! validate_connector_health "${preflight_health}" 0; then
+  if ! curl --fail --silent --show-error --max-time 8 \
+    "${health_curl_proxy_args[@]}" \
+    --config "${curl_cfg}" -o "${preflight_health}" "${health_url}"; then
+    printf '%s\n' "connector health endpoint is unreachable; continuing with recovery transaction" >&2
+  elif ! validate_connector_health_payload "${preflight_health}" 0; then
     if systemctl is-active --quiet "${service}"; then
       die "connector health preflight failed while ${service} is active; no files were changed"
     fi
-    printf '%s\n' "connector health preflight is unavailable because ${service} is inactive; continuing with recovery transaction" >&2
+    printf '%s\n' "connector health preflight returned an invalid contract while ${service} is inactive; continuing with recovery transaction" >&2
   fi
 fi
 rm -f -- "${preflight_health}"

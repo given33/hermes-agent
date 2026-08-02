@@ -957,10 +957,12 @@ def test_public_installer_allows_recovery_when_service_is_inactive():
         'rm -f -- "${preflight_health}"'
     )]
 
-    assert 'if ! validate_connector_health "${preflight_health}" 0; then' in preflight
+    assert 'if ! curl --fail --silent --show-error --max-time 8' in preflight
+    assert 'elif ! validate_connector_health_payload "${preflight_health}" 0; then' in preflight
     assert 'if systemctl is-active --quiet "${service}"; then' in preflight
     assert 'connector health preflight failed while ${service} is active' in preflight
-    assert 'continuing with recovery transaction' in preflight
+    assert 'connector health endpoint is unreachable; continuing with recovery transaction' in preflight
+    assert 'connector health preflight returned an invalid contract while ${service} is inactive' in preflight
 
 
 def test_public_installer_uses_effective_systemd_hermes_home_before_env_fallback():
