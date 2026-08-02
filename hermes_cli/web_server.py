@@ -206,7 +206,15 @@ async def _lifespan(app: "FastAPI"):
     # and Defender real-time scans that can stall the event loop for 15-30s.
     # Running in an executor means the cost is paid in a worker thread while
     # the server socket is already open and accepting probes.
-    asyncio.get_running_loop().run_in_executor(None, _warm_gateway_module)
+    # Use a daemon thread rather than the loop's default executor. The default
+    # executor is joined during TestClient/uvicorn shutdown, which turns a
+    # deliberately fire-and-forget warmup into a startup/teardown stall when
+    # the import is slow on a cold Windows install.
+    threading.Thread(
+        target=_warm_gateway_module,
+        daemon=True,
+        name="hermes-gateway-warmup",
+    ).start()
 
     # Desktop-spawned backends (HERMES_DESKTOP=1) fire cron jobs themselves,
     # since the app has no gateway running the scheduler. Server `hermes

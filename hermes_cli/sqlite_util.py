@@ -126,7 +126,9 @@ def copy_sqlite_fallback(source: Path | None, destination: Path) -> None:
     coordination file and is intentionally recreated by SQLite.
     """
 
-    if source is None or destination.exists():
+    if source is None:
+        return
+    if destination.exists():
         _write_fallback_marker(destination, source)
         return
     destination.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
