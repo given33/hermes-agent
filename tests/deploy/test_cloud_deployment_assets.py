@@ -457,6 +457,8 @@ def test_public_release_contains_the_complete_application_service_layer():
     assert 'tar -C "${repo}" -cf - -- "${runtime_service_assets[@]}"' in deployer
     assert 'runtime_compile_assets+=("${snapshot}/${relative}")' in installer
     assert 'destination_parent="$(dirname "${target_root}/${relative}")"' in installer
+    assert '"hermes_cli/sqlite_util.py"' in installer
+    assert '"hermes_cli/sqlite_util.py"' in deployer
     assert 'backup_one "${target_root}/${relative}"' in installer
     assert 'install_atomic "${snapshot}/${relative}"' in installer
     assert 'restore_one "${backup}/${relative}"' in installer
@@ -541,6 +543,17 @@ def test_transactional_installers_serialize_deployments_and_use_unique_backups()
     assert 'flock -n 8 || die "another collaboration deployment is already running"' in public
     assert 'mktemp -d "${backup_root}/collaboration-${version}-${stamp}.XXXXXX"' in public
     assert 'flock -n 8 || die "another connector deployment is already running"' in connector
+
+
+def test_public_installer_reclaims_only_bounded_deployment_artifacts_on_disk_pressure():
+    public = (PUBLIC / "install-collaboration-backend.sh").read_text(encoding="utf-8")
+
+    assert "reclaim_runtime_disk_pressure()" in public
+    assert "HERMES_DEPLOY_MIN_FREE_KIB" in public
+    assert "HERMES_BACKUP_RETENTION" in public
+    assert "-name 'collaboration-*'" in public
+    assert "journalctl --vacuum-size" in public
+    assert 'business databases and runtime objects are never deleted' in public
 
 
 def test_pc_connector_delegates_complete_runtime_contract(tmp_path):

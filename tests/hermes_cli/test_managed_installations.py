@@ -29,6 +29,41 @@ INSTALL_TOKEN = "installation-private-token-0000000000000001"
 STATUS_TOKEN = "status-private-token-00000000000000000001"
 
 
+def test_managed_installations_database_uses_fallback_when_home_is_full(
+    monkeypatch, tmp_path: Path
+):
+    home = tmp_path / "full-home"
+    home.mkdir()
+    fallback = tmp_path / "fallback"
+    primary = home / "managed-installations.db"
+    with sqlite3.connect(primary) as conn:
+        conn.execute("CREATE TABLE preserved (value TEXT NOT NULL)")
+        conn.execute("INSERT INTO preserved VALUES ('kept')")
+    primary.with_name(primary.name + "-wal").write_bytes(b"pending-wal")
+
+    monkeypatch.setattr(managed_installations, "get_hermes_home", lambda: home)
+    monkeypatch.setenv("HERMES_MANAGED_INSTALLATIONS_FALLBACK_DIR", str(fallback))
+    real_disk_usage = managed_installations.shutil.disk_usage
+    state = {"full": True}
+
+    def disk_usage(path):
+        if Path(path) == home and state["full"]:
+            return SimpleNamespace(free=0)
+        return real_disk_usage(path)
+
+    monkeypatch.setattr(managed_installations.shutil, "disk_usage", disk_usage)
+    resolved = managed_installations.managed_installations_db_path()
+
+    assert resolved == fallback / primary.name
+    with sqlite3.connect(resolved) as conn:
+        assert conn.execute("SELECT value FROM preserved").fetchone() == ("kept",)
+    assert resolved.with_name(resolved.name + "-wal").read_bytes() == b"pending-wal"
+
+    state["full"] = False
+    assert managed_installations.managed_installations_db_path() == resolved
+    assert resolved.with_name(resolved.name + ".hermes-fallback").is_file()
+
+
 def _wait_for_http_server(url: str, headers: dict[str, str] | None = None) -> None:
     deadline = time.monotonic() + 3
     while True:

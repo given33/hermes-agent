@@ -85,6 +85,7 @@ runtime_files=(
   "hermes_runtime/urllib_security.py"
   "hermes_runtime/version.py"
   "hermes_cli/backup.py"
+  "hermes_cli/sqlite_util.py"
   "hermes_cli/dashboard_auth/base.py"
   "hermes_cli/dashboard_auth/client_ip.py"
   "hermes_cli/main.py"

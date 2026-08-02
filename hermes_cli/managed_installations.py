@@ -35,6 +35,7 @@ from uuid import uuid4
 
 from hermes_constants import get_hermes_home
 from hermes_runtime.config import read_raw_config_strict
+from hermes_cli.sqlite_util import copy_sqlite_fallback, resolve_sqlite_fallback
 from hermes_services.resource_catalog import (
     ResourceRecord,
     resolve_resource_collisions,
@@ -155,7 +156,15 @@ def _release_execution_fence(claimed: dict[str, Any]) -> None:
 
 
 def managed_installations_db_path() -> Path:
-    return Path(get_hermes_home()) / "managed-installations.db"
+    requested = Path(get_hermes_home()) / "managed-installations.db"
+    path, source = resolve_sqlite_fallback(
+        requested,
+        env_var="HERMES_MANAGED_INSTALLATIONS_FALLBACK_DIR",
+        label="managed-installations.db",
+        fallback_relative="managed-installations.db",
+    )
+    copy_sqlite_fallback(source, path)
+    return path
 
 
 def _utc_now() -> str:
@@ -163,6 +172,13 @@ def _utc_now() -> str:
 
 
 def _connect(path: Path) -> sqlite3.Connection:
+    path, source = resolve_sqlite_fallback(
+        Path(path),
+        env_var="HERMES_MANAGED_INSTALLATIONS_FALLBACK_DIR",
+        label="managed-installations.db",
+        fallback_relative="managed-installations.db",
+    )
+    copy_sqlite_fallback(source, path)
     path.parent.mkdir(parents=True, exist_ok=True)
     conn = sqlite3.connect(path, timeout=30, isolation_level=None)
     conn.row_factory = sqlite3.Row

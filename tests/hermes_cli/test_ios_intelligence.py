@@ -31,6 +31,41 @@ def store(tmp_path):
     return IOSIntelligenceStore(tmp_path)
 
 
+def test_intelligence_database_uses_fallback_when_home_is_full(monkeypatch, tmp_path: Path):
+    home = tmp_path / "full-home"
+    home.mkdir()
+    fallback = tmp_path / "fallback"
+    primary = home / "ios-intelligence.db"
+    with sqlite3.connect(primary) as conn:
+        conn.execute("CREATE TABLE preserved (value TEXT NOT NULL)")
+        conn.execute("INSERT INTO preserved VALUES ('kept')")
+    primary.with_name(primary.name + ".key").write_bytes(b"test-master-secret")
+    cold_file = home / "ios-cold" / "owner" / "segment.bin"
+    cold_file.parent.mkdir(parents=True)
+    cold_file.write_bytes(b"cold-data")
+
+    monkeypatch.setattr("hermes_cli.ios_intelligence.get_hermes_home", lambda: home)
+    monkeypatch.setenv("HERMES_IOS_INTELLIGENCE_FALLBACK_DIR", str(fallback))
+    monkeypatch.setattr(IOSIntelligenceStore, "_cleanup_orphan_cold_files", lambda self: {})
+    import hermes_cli.sqlite_util as sqlite_util
+
+    real_disk_usage = sqlite_util.shutil.disk_usage
+
+    def disk_usage(path):
+        if Path(path) == home:
+            return SimpleNamespace(free=0)
+        return real_disk_usage(path)
+
+    monkeypatch.setattr(sqlite_util.shutil, "disk_usage", disk_usage)
+    store = IOSIntelligenceStore()
+
+    assert store.path == fallback / primary.name
+    with sqlite3.connect(store.path) as conn:
+        assert conn.execute("SELECT value FROM preserved").fetchone() == ("kept",)
+    assert store.path.with_name(store.path.name + ".key").read_bytes() == b"test-master-secret"
+    assert (store.path.parent / "ios-cold" / "owner" / "segment.bin").read_bytes() == b"cold-data"
+
+
 def test_store_rejects_an_empty_sidecar_master_secret(tmp_path, monkeypatch):
     monkeypatch.delenv("HERMES_IOS_DATA_KEY", raising=False)
     monkeypatch.delenv("HERMES_DATA_ENCRYPTION_KEY", raising=False)

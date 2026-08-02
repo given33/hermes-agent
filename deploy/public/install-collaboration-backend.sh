@@ -121,6 +121,7 @@ runtime_service_assets=(
   "hermes_runtime/urllib_security.py"
   "hermes_runtime/version.py"
   "hermes_cli/backup.py"
+  "hermes_cli/sqlite_util.py"
   "hermes_cli/dashboard_auth/base.py"
   "hermes_cli/dashboard_auth/client_ip.py"
   "hermes_cli/main.py"
@@ -655,6 +656,51 @@ rm -f -- "${preflight_health}"
 stamp="$(date +%Y%m%d-%H%M%S)-$$"
 backup_root="${HERMES_BACKUP_ROOT:-/var/backups/hermes-agent}"
 install -d -o root -g root -m 0700 "${backup_root}"
+
+# A full runtime filesystem prevents SQLite from opening WAL databases even
+# when the release stage itself fits on tmpfs. Reclaim only bounded, known
+# deployment artifacts before taking the rollback snapshot. This is deliberately
+# conservative: business databases and runtime objects are never deleted.
+reclaim_runtime_disk_pressure() {
+  local mount_path="$1"
+  local backups_root="$2"
+  local minimum_kib="${HERMES_DEPLOY_MIN_FREE_KIB:-65536}"
+  local retention="${HERMES_BACKUP_RETENTION:-3}"
+  [[ "${minimum_kib}" =~ ^[0-9]+$ ]] || die "HERMES_DEPLOY_MIN_FREE_KIB must be an integer"
+  [[ "${retention}" =~ ^[1-9][0-9]*$ ]] || die "HERMES_BACKUP_RETENTION must be a positive integer"
+
+  local available_kib
+  available_kib="$(df -Pk -- "${mount_path}" | awk 'NR == 2 {print $4}')"
+  [[ "${available_kib}" =~ ^[0-9]+$ ]] || die "could not determine free space for ${mount_path}"
+  if (( available_kib >= minimum_kib )); then
+    return 0
+  fi
+
+  printf '%s\n' "runtime filesystem has ${available_kib} KiB free; reclaiming stale deployment artifacts" >&2
+  local -a old_backups=()
+  mapfile -d '' -t old_backups < <(
+    find "${backups_root}" -mindepth 1 -maxdepth 1 -type d \
+      -name 'collaboration-*' -printf '%T@\t%p\0' \
+      | sort -z -n \
+      | cut -z -f2-
+  )
+  local removable_count=$(( ${#old_backups[@]} - retention ))
+  if (( removable_count > 0 )); then
+    local index
+    for (( index = 0; index < removable_count; index++ )); do
+      rm -rf -- "${old_backups[index]}"
+    done
+  fi
+
+  if command -v journalctl >/dev/null 2>&1; then
+    journalctl --vacuum-size="${HERMES_DEPLOY_JOURNAL_VACUUM_SIZE:-256M}" >/dev/null 2>&1 || true
+  fi
+  available_kib="$(df -Pk -- "${mount_path}" | awk 'NR == 2 {print $4}')"
+  [[ "${available_kib}" =~ ^[0-9]+$ ]] || die "could not recheck free space for ${mount_path}"
+  printf '%s\n' "runtime filesystem has ${available_kib} KiB free after bounded reclaim" >&2
+}
+
+reclaim_runtime_disk_pressure "${runtime_home}" "${backup_root}"
 backup="$(mktemp -d "${backup_root}/collaboration-${version}-${stamp}.XXXXXX")"
 chown root:root "${backup}"
 chmod 0700 "${backup}"

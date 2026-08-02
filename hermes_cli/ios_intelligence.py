@@ -21,6 +21,7 @@ import os
 from pathlib import Path
 import re
 import secrets
+import shutil
 import sqlite3
 import stat
 import statistics
@@ -33,7 +34,7 @@ from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 import httpx
 
 from hermes_runtime.config import get_hermes_home
-from hermes_cli.sqlite_util import write_txn
+from hermes_cli.sqlite_util import copy_sqlite_fallback, resolve_sqlite_fallback, write_txn
 from hermes_cli.account_identity import (
     generation_scoped_owner_id,
     public_owner_id as _public_owner,
@@ -877,7 +878,24 @@ class IOSIntelligenceStore:
 
     def __init__(self, base_dir: str | os.PathLike[str] | None = None):
         root = Path(base_dir) if base_dir is not None else Path(get_hermes_home())
-        self.path = root if root.suffix in {".db", ".sqlite", ".sqlite3"} else root / "ios-intelligence.db"
+        requested = root if root.suffix in {".db", ".sqlite", ".sqlite3"} else root / "ios-intelligence.db"
+        self.path, fallback_source = resolve_sqlite_fallback(
+            requested,
+            env_var="HERMES_IOS_INTELLIGENCE_FALLBACK_DIR",
+            label="ios-intelligence.db",
+            fallback_relative=requested.name,
+        )
+        copy_sqlite_fallback(fallback_source, self.path)
+        if fallback_source is not None:
+            source_key = requested.with_name(requested.name + ".key")
+            destination_key = self.path.with_name(self.path.name + ".key")
+            if source_key.is_file() and not source_key.is_symlink() and not destination_key.exists():
+                shutil.copy2(source_key, destination_key)
+                destination_key.chmod(0o600)
+            source_cold = requested.parent / "ios-cold"
+            destination_cold = self.path.parent / "ios-cold"
+            if source_cold.is_dir() and not source_cold.is_symlink() and not destination_cold.exists():
+                shutil.copytree(source_cold, destination_cold, symlinks=True)
         self.path.parent.mkdir(parents=True, exist_ok=True)
         self._master_secret = self._load_master_secret()
         with self._schema_lock:
