@@ -52,14 +52,18 @@ class AuditEvent(enum.Enum):
 
 
 def _resolve_log_path() -> Path:
-    """``$HERMES_HOME/logs/dashboard-auth.log`` with the standard fallback.
+    """Resolve ``dashboard-auth.log`` through the centralized log fallback.
 
     Mirrors ``hermes_constants.get_hermes_home`` semantics: env var wins,
-    else ``~/.hermes``. A local copy avoids an import cycle with the
-    middleware which lives below ``hermes_cli``.
+    else ``~/.hermes``. The import is intentionally lazy so this module can
+    still load before the main logging subsystem during auth bootstrap.
     """
     home = os.environ.get("HERMES_HOME") or str(Path.home() / ".hermes")
-    return Path(home) / "logs" / "dashboard-auth.log"
+    try:
+        from hermes_logging import get_log_dir
+        return get_log_dir(Path(home)) / "dashboard-auth.log"
+    except Exception:
+        return Path(home) / "logs" / "dashboard-auth.log"
 
 
 def audit_log(event: AuditEvent, **fields: Any) -> None:

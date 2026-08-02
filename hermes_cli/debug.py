@@ -367,9 +367,10 @@ class LogSnapshot:
 def _primary_log_path(log_name: str) -> Optional[Path]:
     """Where *log_name* would live if present. Doesn't check existence."""
     from hermes_cli.logs import LOG_FILES
+    from hermes_logging import get_log_dir
 
     filename = LOG_FILES.get(log_name)
-    return (get_hermes_home() / "logs" / filename) if filename else None
+    return (get_log_dir() / filename) if filename else None
 
 
 def _resolve_log_path(log_name: str) -> Optional[Path]:
