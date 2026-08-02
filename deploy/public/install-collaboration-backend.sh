@@ -648,8 +648,12 @@ PY
 preflight_health="$(mktemp /run/hermes-agent-connector-preflight.XXXXXX)"
 if [[ -f "${plugin_target}/plugin_api.py" ]] \
   && grep -Fq '@router.get("/connector/health")' "${plugin_target}/plugin_api.py"; then
-  validate_connector_health "${preflight_health}" 0 \
-    || die "connector health preflight failed; no files were changed"
+  if ! validate_connector_health "${preflight_health}" 0; then
+    if systemctl is-active --quiet "${service}"; then
+      die "connector health preflight failed while ${service} is active; no files were changed"
+    fi
+    printf '%s\n' "connector health preflight is unavailable because ${service} is inactive; continuing with recovery transaction" >&2
+  fi
 fi
 rm -f -- "${preflight_health}"
 

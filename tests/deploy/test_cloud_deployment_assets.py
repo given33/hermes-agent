@@ -948,6 +948,21 @@ def test_public_installer_imports_installed_dashboard_before_service_restart():
     assert 'PYTHONPATH="${target_root}${PYTHONPATH:+:${PYTHONPATH}}"' in preflight
 
 
+def test_public_installer_allows_recovery_when_service_is_inactive():
+    installer = (PUBLIC / "install-collaboration-backend.sh").read_text(
+        encoding="utf-8"
+    )
+
+    preflight = installer[installer.index('preflight_health='):installer.index(
+        'rm -f -- "${preflight_health}"'
+    )]
+
+    assert 'if ! validate_connector_health "${preflight_health}" 0; then' in preflight
+    assert 'if systemctl is-active --quiet "${service}"; then' in preflight
+    assert 'connector health preflight failed while ${service} is active' in preflight
+    assert 'continuing with recovery transaction' in preflight
+
+
 def test_public_installer_uses_effective_systemd_hermes_home_before_env_fallback():
     installer = (PUBLIC / "install-collaboration-backend.sh").read_text(
         encoding="utf-8"
