@@ -488,6 +488,10 @@ export function ToolsetConfigPanel({ toolset, onConfiguredChange }: ToolsetConfi
   const [loading, setLoading] = useState(true)
   const [selecting, setSelecting] = useState<string | null>(null)
   const [activeProvider, setActiveProvider] = useState<string | null>(null)
+  // The default-selection effect can be queued at the same time as the first
+  // user click after config hydration. Keep the latest intent outside React's
+  // render closure so a stale effect cannot overwrite it with provider[0].
+  const activeProviderRef = useRef<string | null>(null)
   // Live per-key set/unset state, seeded from the endpoint then patched locally.
   const [envState, setEnvState] = useState<Record<string, boolean>>({})
   // Guard the Nous Portal sign-in poll loop against unmount/state updates.
@@ -535,7 +539,11 @@ export function ToolsetConfigPanel({ toolset, onConfiguredChange }: ToolsetConfi
   // panel highlighted the first keyless provider (e.g. Nous Portal) even when
   // the user had already selected another (e.g. DuckDuckGo).
   useEffect(() => {
-    if (activeProvider || providers.length === 0) {
+    if (providers.length === 0) {
+      return
+    }
+
+    if (activeProviderRef.current && providers.some(p => p.name === activeProviderRef.current)) {
       return
     }
 
@@ -545,10 +553,12 @@ export function ToolsetConfigPanel({ toolset, onConfiguredChange }: ToolsetConfi
       providers.find(p => providerConfigured(p, envState)) ??
       providers[0]
 
+    activeProviderRef.current = selected.name
     setActiveProvider(selected.name)
-  }, [activeProvider, providers, envState, cfg])
+  }, [providers, envState, cfg])
 
   async function handleSelect(provider: ToolProvider) {
+    activeProviderRef.current = provider.name
     setActiveProvider(provider.name)
     setSelecting(provider.name)
 
