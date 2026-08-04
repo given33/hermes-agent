@@ -31,6 +31,7 @@ EVENT_TYPES = frozenset(
         "turn.completed",
         "message.started",
         "message.delta",
+        "message.interim",
         "message.completed",
         "thinking.started",
         "thinking.delta",
@@ -50,6 +51,29 @@ EVENT_TYPES = frozenset(
         "connection.retry_scheduled",
         "connection.retry_started",
         "connection.retry_finished",
+        "notification.show",
+        "notification.clear",
+        "billing.step_up.verification",
+        "voice.status",
+        "voice.transcript",
+        "wake.detected",
+        "dashboard.new_session_requested",
+        "browser.progress",
+        "gateway.stderr",
+        "gateway.start_timeout",
+        "gateway.protocol_error",
+        "moa.reference",
+        "moa.aggregating",
+        "moa.progress",
+        "moa.phase",
+        "clarify.request",
+        "approval.request",
+        "sudo.request",
+        "secret.request",
+        "sudo.expire",
+        "secret.expire",
+        "background.complete",
+        "review.summary",
         "intervention.queued",
         "intervention.claimed",
         "intervention.replied",
@@ -83,10 +107,15 @@ TERMINAL_EVENT_TYPES = frozenset(
 PROGRESS_EVENT_TYPES = frozenset(
     {
         "message.delta",
+        "message.interim",
         "thinking.delta",
         "tool.progress",
         "subagent.progress",
         "command.output",
+        "browser.progress",
+        "moa.reference",
+        "moa.progress",
+        "moa.phase",
     }
 )
 
@@ -900,7 +929,9 @@ def normalize_legacy_profile_event(event: Any) -> tuple[str, dict[str, Any], str
     mapping = {
         "request.accepted": "agent.started",
         "session.info": "agent.started",
+        "message.start": "message.started",
         "message.delta": "message.delta",
+        "message.interim": "message.interim",
         "message.complete": "message.completed",
         "reasoning.delta": "thinking.delta",
         "reasoning.available": "thinking.completed",
@@ -925,9 +956,11 @@ def normalize_legacy_profile_event(event: Any) -> tuple[str, dict[str, Any], str
     }
     canonical = mapping.get(event_type)
     if canonical is None:
-        canonical = "command.output" if event_type == "status.update" else "message.delta"
+        canonical = event_type if event_type in EVENT_TYPES else "command.output"
     normalized_payload = _json_copy(payload)
     normalized_payload["source_event_type"] = event_type
+    if canonical == "command.output" and event_type != "status.update":
+        normalized_payload["unmapped_frontend_event"] = True
     return canonical, normalized_payload, entity_id
 
 
