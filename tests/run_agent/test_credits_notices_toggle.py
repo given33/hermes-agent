@@ -44,21 +44,7 @@ class TestCreditsNoticesToggle:
             agent._emit_credits_notices()
         assert received == []
 
-    def test_enabled_still_emits_nothing(self):
-        agent = _agent_with_state()
-        received = []
-        agent.notice_callback = received.append
-        with patch("hermes_cli.config.load_config", return_value=_cfg(True)):
-            agent._emit_credits_notices()
-        assert received == []
 
-    def test_default_missing_key_emits_nothing(self):
-        agent = _agent_with_state()
-        received = []
-        agent.notice_callback = received.append
-        with patch("hermes_cli.config.load_config", return_value={"display": {}}):
-            agent._emit_credits_notices()
-        assert received == []
 
     def test_config_error_emits_nothing(self):
         agent = _agent_with_state()

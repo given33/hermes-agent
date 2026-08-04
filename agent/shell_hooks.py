@@ -100,6 +100,7 @@ emitted by each built-in hook site.
     child_role      – role string of the child agent
     child_summary   – summary of the child's work
     child_status    – exit status string (e.g. "success", "error")
+    tool_call_history – redacted tool name/input summary/byte counts/status list
     duration_ms     – wall-clock time of the child run in milliseconds
 """
 
@@ -320,8 +321,9 @@ def _parse_hooks_block(hooks_cfg: Any) -> List[ShellHookSpec]:
     for event_name, entries in hooks_cfg.items():
         # Reserved sub-keys that aren't event names — skip silently. These
         # are config sub-sections nested under `hooks:` for related
-        # functionality (e.g. output-spill budgets).
-        if event_name in ("output_spill",):
+        # functionality (e.g. output-spill budgets, outbound webhooks —
+        # the latter parsed by agent/outbound_webhooks.py).
+        if event_name in ("output_spill", "outbound"):
             continue
         if event_name not in VALID_HOOKS:
             suggestion = difflib.get_close_matches(
@@ -467,43 +469,15 @@ def _spawn(spec: ShellHookSpec, stdin_json: str) -> Dict[str, Any]:
     else:
         _popen_kwargs = {"start_new_session": True}
     try:
-        # File-backed capture avoids the reader threads used by
-        # Popen.communicate() for Windows pipes. Those threads can wait forever
-        # when a timed-out grandchild inherits stdout/stderr handles.
-        with tempfile.TemporaryFile(mode="w+t", encoding="utf-8") as stdout_file, tempfile.TemporaryFile(
-            mode="w+t", encoding="utf-8"
-        ) as stderr_file:
-            proc = subprocess.Popen(
-                argv,
-                stdin=subprocess.PIPE,
-                stdout=stdout_file,
-                stderr=stderr_file,
-                text=True,
-                shell=False,
-                **_popen_kwargs,
-            )
-            try:
-                proc.communicate(input=stdin_json, timeout=spec.timeout)
-            except subprocess.TimeoutExpired:
-                _terminate_hook_process_tree(proc)
-                try:
-                    proc.wait(timeout=2)
-                except subprocess.TimeoutExpired:
-                    try:
-                        proc.kill()
-                    except OSError:
-                        pass
-                result["timed_out"] = True
-            stdout_file.seek(0)
-            stderr_file.seek(0)
-            stdout = stdout_file.read()
-            stderr = stderr_file.read()
-            result["returncode"] = proc.returncode
-            result["stdout"] = stdout or ""
-            result["stderr"] = stderr or ""
-            if result["timed_out"]:
-                result["elapsed_seconds"] = round(time.monotonic() - t0, 3)
-                return result
+        proc = subprocess.run(
+            argv,
+            input=stdin_json,
+            capture_output=True,
+            timeout=spec.timeout,
+            text=True, encoding='utf-8', errors='replace',
+            shell=False,
+            **_popen_kwargs,
+        )
     except subprocess.TimeoutExpired:
         result["timed_out"] = True
         result["elapsed_seconds"] = round(time.monotonic() - t0, 3)
@@ -695,7 +669,7 @@ def allowlist_path() -> Path:
 def load_allowlist() -> Dict[str, Any]:
     """Return the parsed allowlist, or an empty skeleton if absent."""
     try:
-        raw = json.loads(allowlist_path().read_text())
+        raw = json.loads(allowlist_path().read_text(encoding="utf-8"))
     except (FileNotFoundError, json.JSONDecodeError, OSError):
         return {"approvals": []}
     if not isinstance(raw, dict):

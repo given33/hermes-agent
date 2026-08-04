@@ -231,6 +231,41 @@ def atomic_replace(tmp_path: Union[str, Path], target: Union[str, Path]) -> str:
     return real_path
 
 
+def atomic_write_text(
+    path: Union[str, Path],
+    content: str,
+    *,
+    encoding: str = "utf-8",
+    tmp_prefix: str = ".tmp_",
+) -> None:
+    """Write *content* to *path* via temp file + fsync + atomic rename.
+
+    Ensures the target file is never left in a partially-written state if
+    the process crashes or is interrupted.  ``atomic_replace`` preserves
+    symlinks and handles cross-device / busy-file fallbacks.
+
+    Used by the memory store, skill manager, and agent importer so that
+    every destructive file rewrite in the codebase shares one implementation.
+    """
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fd, tmp_path = tempfile.mkstemp(
+        dir=str(path.parent), prefix=tmp_prefix, suffix=".tmp"
+    )
+    try:
+        with os.fdopen(fd, "w", encoding=encoding) as handle:
+            handle.write(content)
+            handle.flush()
+            os.fsync(handle.fileno())
+        atomic_replace(tmp_path, path)
+    except BaseException:
+        try:
+            os.unlink(tmp_path)
+        except OSError:
+            pass
+        raise
+
+
 def atomic_json_write(
     path: Union[str, Path],
     data: Any,
@@ -303,64 +338,45 @@ def atomic_json_write(
         raise
 
 
-def write_secret_file(
+def warn_if_credential_file_broadly_readable(
     path: Union[str, Path],
-    text: str,
     *,
-    mode: int = 0o600,
-    encoding: str = "utf-8",
-) -> None:
-    """Atomically write *text* to *path* with owner-only permissions.
+    label: str = "",
+    log: logging.Logger | None = None,
+) -> bool:
+    """Warn (once per call) when a credential file is group/world-readable.
 
-    The TOCTOU-safe primitive for secret-bearing plain-text files (.env
-    files, API-key profiles, generated passwords).  ``path.write_text(...)``
-    creates the file with the process umask (usually world-readable) and a
-    later ``chmod`` leaves a window where the secret is already on disk with
-    loose permissions — and a crash between the two calls makes that state
-    permanent.  Here the temp file is born 0o600 (``mkstemp``), pinned to
-    *mode* via ``fchmod`` **before** any secret byte is written, fsynced,
-    and atomically swapped into place, so the secret is never observable
-    with looser permissions than *mode*.
+    Secret-bearing files that users create by hand (or that older Hermes
+    versions wrote without an explicit mode) commonly end up 0o644 under the
+    default umask. This helper is the shared read-time check for that class:
+    call it before loading any token/credential file so the owner gets a
+    remediation hint in the logs.
 
-    Mirrors :func:`atomic_json_write` (symlink-preserving replace, owner
-    preservation, crash-safe temp cleanup); only the payload differs.
+    Returns True when a warning was emitted. No-ops (returns False) on
+    platforms without POSIX permission bits semantics (best effort), when the
+    file is missing, or when permissions are already tight.
     """
-    path = Path(path)
-    path.parent.mkdir(parents=True, exist_ok=True)
-
-    original_owner = _preserve_file_owner(path)
-
-    fd, tmp_path = tempfile.mkstemp(
-        dir=str(path.parent),
-        prefix=f".{path.stem}_",
-        suffix=".tmp",
-    )
+    p = Path(path)
+    _log = log or logger
     try:
-        if hasattr(os, "fchmod"):
-            # fchmod is Unix-only; Windows' os module has no fchmod. Skipping it
-            # here is safe — mkstemp already created the temp file as 0o600, and
-            # the post-replace os.chmod below applies the final mode durably.
-            os.fchmod(fd, mode)
-        with os.fdopen(fd, "w", encoding=encoding) as f:
-            f.write(text)
-            f.flush()
-            os.fsync(f.fileno())
-        # Preserve symlinks — swap in-place on the real file (GitHub #16743).
-        real_path = atomic_replace(tmp_path, path)
-        real_path_obj = Path(real_path)
-        _restore_file_owner(real_path_obj, original_owner)
-        try:
-            os.chmod(real_path_obj, mode)
-        except OSError:
-            pass
-    except BaseException:
-        # Intentionally catch BaseException so temp-file cleanup still runs for
-        # KeyboardInterrupt/SystemExit before re-raising the original signal.
-        try:
-            os.unlink(tmp_path)
-        except OSError:
-            pass
-        raise
+        file_mode = p.stat().st_mode
+    except OSError:
+        return False
+    if os.name != "posix":
+        # Windows ACLs don't map onto POSIX group/other bits; st_mode there
+        # is synthesized and would false-positive.
+        return False
+    if not (file_mode & (stat.S_IRGRP | stat.S_IROTH)):
+        return False
+    _log.warning(
+        "%s%s is group/world-readable (mode 0%o) and contains secrets. "
+        "Run: chmod 600 %s",
+        f"{label} " if label else "",
+        p.name,
+        stat.S_IMODE(file_mode),
+        p,
+    )
+    return True
 
 
 class IndentDumper(yaml.SafeDumper):

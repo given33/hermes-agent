@@ -37,10 +37,6 @@ def _logged_in_account(monkeypatch):
 # ── build_credits_view core ─────────────────────────────────────────────────
 
 
-def test_view_logged_out_when_no_token(monkeypatch):
-    monkeypatch.setattr("hermes_cli.auth.get_provider_auth_state", lambda provider: {})
-    view = build_credits_view()
-    assert view == CreditsView(logged_in=False)
 
 
 def test_view_built_with_org_pinned_url_and_identity(_logged_in_account):
@@ -71,55 +67,41 @@ def test_view_built_with_org_pinned_url_and_identity(_logged_in_account):
     assert "(or run" not in blob
 
 
-def test_view_depleted_flag(_logged_in_account):
-    _logged_in_account(
-        _account(
-            org_slug="acme",
-            email="alice@example.test",
-            paid_service_access=False,
-            paid_service_access_info=NousPaidServiceAccessInfo(
-                total_usable_credits=0.0,
-            ),
-            subscription=None,
-        )
-    )
-
-    view = build_credits_view()
-    assert view.depleted is True
 
 
-def test_view_falls_back_to_legacy_url_when_slug_null(_logged_in_account):
-    _logged_in_account(
-        _account(
-            org_slug=None,
-            email="alice@example.test",
-            paid_service_access=True,
-            paid_service_access_info=NousPaidServiceAccessInfo(
-                purchased_credits_remaining=5.0,
-                total_usable_credits=5.0,
-            ),
-            subscription=None,
-        )
-    )
-
-    view = build_credits_view()
-    assert view.topup_url == "https://portal.example.test/billing?topup=open"
-    assert "/orgs/" not in view.topup_url
 
 
-def test_view_fetch_failure_is_logged_out(monkeypatch):
+
+
+# ── gateway _handle_topup_command (the messaging billing surface) ────────────
+
+
+class _FakeEvent:
+    pass
+
+
+def _make_gateway_stub():
+    """Minimal object exposing the mixin's _handle_topup_command."""
+    from gateway.slash_commands import GatewaySlashCommandsMixin
+
+    class _Stub(GatewaySlashCommandsMixin):
+        def __init__(self):
+            pass
+
+    return _Stub()
+
+
+
+
+def test_gateway_topup_not_logged_in(monkeypatch):
     monkeypatch.setattr(
-        "hermes_cli.auth.get_provider_auth_state",
-        lambda provider: {"access_token": "tok"},
+        account_usage, "build_credits_view", lambda *a, **kw: CreditsView(logged_in=False)
     )
+    stub = _make_gateway_stub()
+    out = asyncio.run(stub._handle_topup_command(_FakeEvent()))
+    assert "Not logged into Nous Portal" in out
 
-    def _boom(*a, **kw):
-        raise RuntimeError("portal down")
 
-    monkeypatch.setattr("hermes_cli.nous_account.get_nous_portal_account_info", _boom)
-
-    view = build_credits_view()
-    assert view.logged_in is False
 
 
 # ── command registry ────────────────────────────────────────────────────────

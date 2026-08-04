@@ -19,7 +19,7 @@ import {
   Navigate,
   useLocation,
   useNavigate,
-} from "react-router-dom";
+} from "react-router";
 import {
   Activity,
   BarChart3,
@@ -74,18 +74,8 @@ import { ProfileSwitcher } from "@/components/ProfileSwitcher";
 import { ProfileScopeBanner } from "@/components/ProfileScopeBanner";
 import { useSystemActions } from "@/contexts/useSystemActions";
 import type { SystemAction } from "@/contexts/system-actions-context";
-import ChatPage from "@/pages/ChatPage";
-import { LanguageSwitcher } from "@/components/LanguageSwitcher";
-import { ThemeSwitcher } from "@/components/ThemeSwitcher";
-import { useI18n } from "@/i18n";
-import type { Translations } from "@/i18n/types";
-import { PluginPage, PluginSlot, usePlugins } from "@/plugins";
-import type { PluginManifest } from "@/plugins";
-import { useTheme } from "@/themes";
-import { isDashboardEmbeddedChatEnabled } from "@/lib/dashboard-flags";
-import { api } from "@/lib/api";
-import type { StatusResponse, UpdateCheckResponse } from "@/lib/api";
-
+// Route pages are lazy-loaded so the initial dashboard shell does not pay for
+// every admin surface (and heavy deps like xterm) up front.
 const ConfigPage = lazy(() => import("@/pages/ConfigPage"));
 const DocsPage = lazy(() => import("@/pages/DocsPage"));
 const EnvPage = lazy(() => import("@/pages/EnvPage"));
@@ -104,6 +94,33 @@ const PairingPage = lazy(() => import("@/pages/PairingPage"));
 const ChannelsPage = lazy(() => import("@/pages/ChannelsPage"));
 const WebhooksPage = lazy(() => import("@/pages/WebhooksPage"));
 const SystemPage = lazy(() => import("@/pages/SystemPage"));
+const ChatPage = lazy(() => import("@/pages/ChatPage"));
+import { LanguageSwitcher } from "@/components/LanguageSwitcher";
+import { ThemeSwitcher } from "@/components/ThemeSwitcher";
+import { useI18n } from "@/i18n";
+import type { Translations } from "@/i18n/types";
+import { PluginPage, PluginSlot, usePlugins } from "@/plugins";
+import type { PluginManifest } from "@/plugins";
+import { useTheme } from "@/themes";
+import { isDashboardEmbeddedChatEnabled } from "@/lib/dashboard-flags";
+import { latchChatActivation } from "@/lib/chat-activation";
+import { api } from "@/lib/api";
+import type { StatusResponse, UpdateCheckResponse } from "@/lib/api";
+
+function RouteFallback({ label = "Loading…" }: { label?: string }) {
+  return (
+    <div
+      className="flex min-h-[12rem] flex-1 items-center justify-center"
+      aria-busy="true"
+      aria-live="polite"
+    >
+      <div className="flex items-center gap-2 text-sm text-muted-foreground">
+        <Spinner />
+        <span>{label}</span>
+      </div>
+    </div>
+  );
+}
 
 function RootRedirect() {
   return <Navigate to="/sessions" replace />;
@@ -130,8 +147,10 @@ const CHAT_NAV_ITEM: NavItem = {
  * inline near the bottom of this file — so the PTY child, WebSocket,
  * and xterm instance survive when the user visits another tab and comes
  * back.  A `display:none` toggle hides the terminal without unmounting.
- * Routing still owns the URL so /chat deep-links, browser back/forward,
- * and nav highlight keep working.
+ * The host itself is still deferred until the first /chat visit so the
+ * xterm chunk is not downloaded on unrelated pages.  Routing still owns
+ * the URL so /chat deep-links, browser back/forward, and nav highlight
+ * keep working.
  */
 const BUILTIN_ROUTES_CORE: Record<string, ComponentType> = {
   "/": RootRedirect,
@@ -380,6 +399,13 @@ export default function App() {
   const normalizedPath = pathname.replace(/\/$/, "") || "/";
   const isChatRoute = normalizedPath === "/chat";
   const embeddedChat = isDashboardEmbeddedChatEnabled();
+  // Defer mounting the persistent chat host (and its xterm chunk) until the
+  // user has actually opened /chat at least once. Sticky after that so the
+  // PTY survives later tab switches.
+  const [chatHostMounted, setChatHostMounted] = useState(isChatRoute);
+  useEffect(() => {
+    setChatHostMounted((prev) => latchChatActivation(prev, isChatRoute));
+  }, [isChatRoute]);
 
   // `dashboard.show_token_analytics` gates the Analytics nav item.  The
   // page itself remains reachable by URL (it renders an explanation when
@@ -760,13 +786,7 @@ export default function App() {
                 )}
               >
                 <ProfileKeyedRoutes>
-                  <Suspense
-                    fallback={
-                      <div className="flex min-h-24 items-center justify-center">
-                        <Spinner />
-                      </div>
-                    }
-                  >
+                  <Suspense fallback={<RouteFallback />}>
                     <Routes>
                       {routes.map(({ key, path, element }) => (
                         <Route key={key} path={path} element={element} />
@@ -785,18 +805,9 @@ export default function App() {
                   !chatOverriddenByPlugin &&
                   (pluginsLoading ? (
                     isChatRoute ? (
-                      <div
-                        className="flex min-h-0 min-w-0 flex-1 items-center justify-center"
-                        aria-busy="true"
-                        aria-live="polite"
-                      >
-                        <div className="flex items-center gap-2 text-sm text-muted-foreground">
-                          <Spinner />
-                          <span>Loading chat…</span>
-                        </div>
-                      </div>
+                      <RouteFallback label="Loading chat…" />
                     ) : null
-                  ) : (
+                  ) : chatHostMounted ? (
                     <div
                       data-chat-active={isChatRoute ? "true" : "false"}
                       className={cn(
@@ -805,9 +816,19 @@ export default function App() {
                       )}
                       aria-hidden={!isChatRoute}
                     >
-                      <ChatPage isActive={isChatRoute} />
+                      <Suspense
+                        fallback={
+                          isChatRoute ? (
+                            <RouteFallback label="Loading chat…" />
+                          ) : null
+                        }
+                      >
+                        <ChatPage isActive={isChatRoute} />
+                      </Suspense>
                     </div>
-                  ))}
+                  ) : isChatRoute ? (
+                    <RouteFallback label="Loading chat…" />
+                  ) : null)}
               </div>
               <PluginSlot name="post-main" />
             </div>

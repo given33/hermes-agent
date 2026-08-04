@@ -1,35 +1,32 @@
 import { configure } from '@testing-library/react'
 
-// Node 25+ exposes an experimental process-wide localStorage. When Vitest
-// builds a jsdom project that property can shadow jsdom's per-worker storage,
-// making stateful tests leak across workers or see an unavailable store unless
-// --localstorage-file is configured. Pin UI tests to jsdom's isolated storage
-// so the suite behaves the same on the Node 22 CI floor and newer runtimes.
-const createMemoryStorage = (): Storage => {
-  const values = new Map<string, string>()
-
-  return {
+// Node 26 defines its own `localStorage` accessor on the global object, which
+// returns `undefined` unless the process was started with --localstorage-file
+// (it warns: "localStorage is not available because --localstorage-file was
+// not provided"). In the jsdom environment `globalThis` IS the window, so that
+// accessor shadows jsdom's Storage and every `localStorage.getItem(...)` in a
+// test throws "Cannot read properties of undefined". Install a real in-memory
+// Storage when the global resolves to nothing, before any test module reads it.
+if (typeof (globalThis as any).localStorage === 'undefined') {
+  const store = new Map<string, string>()
+  const storage: Storage = {
     get length() {
-      return values.size
+      return store.size
     },
-    clear: () => values.clear(),
-    getItem: key => values.get(String(key)) ?? null,
-    key: index => [...values.keys()][index] ?? null,
-    removeItem: key => values.delete(String(key)),
-    setItem: (key, value) => values.set(String(key), String(value))
+    key: (i: number) => [...store.keys()][i] ?? null,
+    getItem: (k: string) => store.get(String(k)) ?? null,
+    setItem: (k: string, v: string) => void store.set(String(k), String(v)),
+    removeItem: (k: string) => void store.delete(String(k)),
+    clear: () => store.clear(),
+  }
+  for (const target of [globalThis, (globalThis as any).window].filter(Boolean)) {
+    Object.defineProperty(target, 'localStorage', {
+      value: storage,
+      configurable: true,
+      writable: true,
+    })
   }
 }
-
-const jsdomStorage = window.localStorage ?? createMemoryStorage()
-Object.defineProperty(window, 'localStorage', {
-  configurable: true,
-  value: jsdomStorage
-})
-Object.defineProperty(globalThis, 'localStorage', {
-  configurable: true,
-  value: jsdomStorage
-})
-jsdomStorage.clear()
 
 // React 19 + Testing Library 16: opt into the act environment so render(),
 // fireEvent(), and findBy* queries automatically flush state updates without

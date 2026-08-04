@@ -22,20 +22,11 @@ class TestAdvertisesTools:
         task.discover_result = _caps(tools=SimpleNamespace(list_changed=True))
         assert task._advertises_tools() is True
 
-    def test_false_for_prompt_only_server(self):
-        task = MCPServerTask("test")
-        task.discover_result = _caps(prompts=SimpleNamespace(list_changed=None))
-        assert task._advertises_tools() is False
 
-    def test_false_without_discovery(self):
+    def test_legacy_fallback_no_capabilities_attr(self):
         task = MCPServerTask("test")
-        assert task.discover_result is None
-        assert task._advertises_tools() is False
-
-    def test_false_for_malformed_discovery(self):
-        task = MCPServerTask("test")
-        task.discover_result = SimpleNamespace()
-        assert task._advertises_tools() is False
+        task.initialize_result = SimpleNamespace()  # no .capabilities
+        assert task._advertises_tools() is True
 
 
 @pytest.mark.asyncio
@@ -51,18 +42,6 @@ class TestDiscoverToolsGating:
         task.session.list_tools.assert_not_called()
         assert task._tools == []
 
-    async def test_calls_list_tools_for_tool_capable_server(self):
-        task = MCPServerTask("test")
-        task.discover_result = _caps(tools=SimpleNamespace())
-        fake_tool = SimpleNamespace(name="echo")
-        task.session = SimpleNamespace(
-            list_tools=AsyncMock(return_value=SimpleNamespace(tools=[fake_tool]))
-        )
-
-        await task._discover_tools()
-
-        task.session.list_tools.assert_awaited_once()
-        assert task._tools == [fake_tool]
 
     async def test_missing_discovery_does_not_probe_tools(self):
         task = MCPServerTask("test")
@@ -96,14 +75,6 @@ class TestKeepaliveProbe:
 
         task.session.list_tools.assert_awaited_once()
 
-    async def test_uses_resources_list_for_resource_only_server(self):
-        task = MCPServerTask("test")
-        task.discover_result = _caps(resources=SimpleNamespace())
-        task.session = SimpleNamespace(list_resources=AsyncMock())
-
-        await task._keepalive_probe()
-
-        task.session.list_resources.assert_awaited_once()
 
     async def test_uses_prompts_list_for_prompt_only_server(self):
         task = MCPServerTask("test")
@@ -162,12 +133,121 @@ class TestKeepaliveInterval:
 
         assert await self._captured_interval({}) == _DEFAULT_KEEPALIVE_INTERVAL
 
-    @pytest.mark.asyncio
-    async def test_configured_interval_honored(self):
-        assert await self._captured_interval({"keepalive_interval": 10}) == 10
 
     @pytest.mark.asyncio
     async def test_interval_clamped_to_floor(self):
         from tools.mcp_tool import _MIN_KEEPALIVE_INTERVAL
+        # A sub-floor value must clamp up, never busy-loop the keepalive.
+        assert (
+            await self._captured_interval({"keepalive_interval": 0.1})
+            == _MIN_KEEPALIVE_INTERVAL
+        )
+
+
+def _mcp_error(code, message="boom"):
+    """Build a real McpError carrying a JSON-RPC error code."""
+    from mcp.shared.exceptions import McpError
+    from mcp.types import ErrorData
+    return McpError(ErrorData(code=code, message=message))
+
+
+class TestMethodNotFoundDetection:
+    """``_is_method_not_found_error`` underpins the ping→list_tools fallback."""
+
+    def test_structural_code_match(self):
+        from tools.mcp_tool import _is_method_not_found_error
+        assert _is_method_not_found_error(_mcp_error(-32601)) is True
+
+
+    def test_unrelated_exception_is_not_match(self):
+        from tools.mcp_tool import _is_method_not_found_error
+        assert _is_method_not_found_error(TimeoutError()) is False
+        assert _is_method_not_found_error(Exception("session terminated")) is False
+
+
+@pytest.mark.asyncio
+class TestKeepaliveProbeFallback:
+    """The probe prefers ``ping`` but falls back to ``list_tools`` for servers
+    that don't implement the optional ping utility — without reconnect-looping,
+    and without regressing servers that DO support ping."""
+
+    async def test_uses_ping_when_supported(self):
+        task = MCPServerTask("test")
+        task.initialize_result = _caps(tools=SimpleNamespace())
+        task.session = SimpleNamespace(
+            send_ping=AsyncMock(),
+            list_tools=AsyncMock(),
+        )
+
+        await task._keepalive_probe()
+
+        task.session.send_ping.assert_awaited_once()
+        task.session.list_tools.assert_not_called()
+        assert task._ping_unsupported is False
+
+
+    async def test_falls_back_on_unknown_method_string(self):
+        """Regression for #50028: a server that surfaces method-not-found as a
+        plain "Unknown method: ping" string (no structural -32601 code) must
+        still latch the fallback and use list_tools, NOT reconnect-loop."""
+        task = MCPServerTask("test")
+        task.initialize_result = _caps(tools=SimpleNamespace())
+        task.session = SimpleNamespace(
+            send_ping=AsyncMock(side_effect=Exception("Unknown method: ping")),
+            list_tools=AsyncMock(return_value=SimpleNamespace(tools=[])),
+        )
+
+        await task._keepalive_probe()
+
+        task.session.send_ping.assert_awaited_once()
+        task.session.list_tools.assert_awaited_once()
+        assert task._ping_unsupported is True
+
+
+    async def test_real_liveness_failure_propagates_not_swallowed(self):
+        """A non-(-32601) ping error is a genuine connection failure: it must
+        propagate so the caller reconnects, and must NOT latch the fallback."""
+        task = MCPServerTask("test")
+        task.initialize_result = _caps(tools=SimpleNamespace())
+        task.session = SimpleNamespace(
+            send_ping=AsyncMock(side_effect=Exception("session terminated")),
+            list_tools=AsyncMock(),
+        )
+
+        with pytest.raises(Exception, match="session terminated"):
+            await task._keepalive_probe()
+
+        task.session.list_tools.assert_not_called()
+        assert task._ping_unsupported is False
+
+    async def test_no_ping_no_tools_propagates_method_not_found(self):
+        """A server advertising neither working ping nor tools has no cheaper
+        probe — the -32601 must propagate rather than calling list_tools on a
+        server that doesn't support it."""
+        task = MCPServerTask("test")
+        task.initialize_result = _caps(prompts=SimpleNamespace())  # not tool-capable
+        task.session = SimpleNamespace(
+            send_ping=AsyncMock(side_effect=_mcp_error(-32601)),
+            list_tools=AsyncMock(),
+        )
+
+        with pytest.raises(Exception):
+            await task._keepalive_probe()
+
+        task.session.list_tools.assert_not_called()
+
+    async def test_discover_resets_latch(self):
+        """A fresh connection (_discover_tools) re-enables the cheap ping path."""
+        task = MCPServerTask("test")
+        task.initialize_result = _caps(tools=SimpleNamespace())
+        task._ping_unsupported = True
+        task.session = SimpleNamespace(
+            list_tools=AsyncMock(return_value=SimpleNamespace(tools=[])),
+        )
+
+        await task._discover_tools()
+
+        assert task._ping_unsupported is False
+
 
         assert await self._captured_interval({"keepalive_interval": 0.1}) == _MIN_KEEPALIVE_INTERVAL

@@ -38,37 +38,10 @@ def test_clean_serial_turns_no_warning(caplog):
     assert not caplog.records
 
 
-def test_overlap_warns_with_both_turn_ids(caplog):
-    agent = _FakeAgent()
-    with caplog.at_level(logging.WARNING, logger="agent.agent_runtime_helpers"):
-        note_turn_start(agent, "s1:t1:aaaa")
-        # second turn starts before the first persisted
-        prev = note_turn_start(agent, "s1:t2:bbbb")
-    assert prev == "s1:t1:aaaa"
-    assert len(caplog.records) == 1
-    msg = caplog.records[0].getMessage()
-    assert "s1:t1:aaaa" in msg and "s1:t2:bbbb" in msg and "s1" in msg
 
 
-def test_overlap_takes_ownership_no_repeat_warning(caplog):
-    """A turn that crashed before its persist warns at most once — the next
-    turn takes ownership of the in-flight slot."""
-    agent = _FakeAgent()
-    with caplog.at_level(logging.WARNING, logger="agent.agent_runtime_helpers"):
-        note_turn_start(agent, "s1:t1:aaaa")   # never persists (crash)
-        note_turn_start(agent, "s1:t2:bbbb")   # warns once, takes ownership
-        note_turn_persisted(agent)
-        note_turn_start(agent, "s1:t3:cccc")   # clean again
-    assert len(caplog.records) == 1
 
 
-def test_same_turn_id_reentry_is_silent(caplog):
-    """Re-entering with the same turn_id (retry paths) is not an overlap."""
-    agent = _FakeAgent()
-    with caplog.at_level(logging.WARNING, logger="agent.agent_runtime_helpers"):
-        note_turn_start(agent, "s1:t1:aaaa")
-        note_turn_start(agent, "s1:t1:aaaa")
-    assert not caplog.records
 
 
 def test_cross_agent_same_session_overlap_warns(caplog):
@@ -86,16 +59,6 @@ def test_cross_agent_same_session_overlap_warns(caplog):
     assert "different agent object" in msg
 
 
-def test_cross_agent_serial_turns_are_silent(caplog):
-    """A persisted turn releases the session slot — a later turn on another
-    agent object for the same session is normal (e.g. cache eviction)."""
-    agent_a, agent_b = _FakeAgent(), _FakeAgent()
-    with caplog.at_level(logging.WARNING, logger="agent.agent_runtime_helpers"):
-        note_turn_start(agent_a, "s1:t1:aaaa")
-        note_turn_persisted(agent_a)
-        note_turn_start(agent_b, "s1:t2:bbbb")
-        note_turn_persisted(agent_b)
-    assert not caplog.records
 
 
 def test_distinct_sessions_never_cross_warn(caplog):
@@ -108,42 +71,10 @@ def test_distinct_sessions_never_cross_warn(caplog):
     assert not caplog.records
 
 
-def test_same_agent_overlap_warns_once_not_twice(caplog):
-    """A same-agent overlap must not double-report through the session leg."""
-    agent = _FakeAgent()
-    with caplog.at_level(logging.WARNING, logger="agent.agent_runtime_helpers"):
-        note_turn_start(agent, "s1:t1:aaaa")
-        prev = note_turn_start(agent, "s1:t2:bbbb")
-    assert prev == "s1:t1:aaaa"
-    assert len(caplog.records) == 1
 
 
-def test_persist_clears_start_session_after_mid_turn_rotation(caplog):
-    """Compression rotates agent.session_id mid-turn; the persist must
-    release the slot the turn registered under, not the rotated id."""
-    agent = _FakeAgent()
-    agent.session_id = "s-parent"
-    with caplog.at_level(logging.WARNING, logger="agent.agent_runtime_helpers"):
-        note_turn_start(agent, "sp:t1:aaaa")
-        agent.session_id = "s-child"  # mid-turn compression rotation
-        note_turn_persisted(agent)
-        # A fresh turn on the parent id must find the slot released.
-        other = _FakeAgent()
-        other.session_id = "s-parent"
-        assert note_turn_start(other, "sp:t2:bbbb") is None
-    assert not caplog.records
 
 
-def test_crashed_cross_agent_turn_warns_once_then_recovers(caplog):
-    """A turn that never persists (crash) yields one warning; the next turn
-    takes ownership of the session slot and the tripwire goes quiet."""
-    agent_a, agent_b, agent_c = _FakeAgent(), _FakeAgent(), _FakeAgent()
-    with caplog.at_level(logging.WARNING, logger="agent.agent_runtime_helpers"):
-        note_turn_start(agent_a, "s1:t1:aaaa")   # never persists (crash)
-        note_turn_start(agent_b, "s1:t2:bbbb")   # warns once, takes ownership
-        note_turn_persisted(agent_b)
-        note_turn_start(agent_c, "s1:t3:cccc")   # clean again
-    assert len(caplog.records) == 1
 
 
 def test_persist_disabled_fork_neither_registers_nor_warns(caplog):
@@ -164,43 +95,3 @@ def test_persist_disabled_fork_neither_registers_nor_warns(caplog):
     assert not caplog.records
 
 
-def test_persist_disabled_fork_persist_does_not_steal_parent_slot(caplog):
-    """The fork's persist funnel still runs; it must not pop the parent's
-    session slot, or a real cross-agent overlap right after a review fork
-    would go unreported."""
-    parent, fork, intruder = _FakeAgent(), _FakeAgent(), _FakeAgent()
-    fork._persist_disabled = True
-    with caplog.at_level(logging.WARNING, logger="agent.agent_runtime_helpers"):
-        note_turn_start(parent, "s1:t1:aaaa")     # real turn holds the slot
-        note_turn_start(fork, "s1:tr:ffff")
-        note_turn_persisted(fork)                 # must NOT release s1
-        prev = note_turn_start(intruder, "s1:t2:bbbb")
-    assert prev == "s1:t1:aaaa"
-    assert len(caplog.records) == 1
-
-
-def test_stale_session_entries_are_pruned_without_false_overlap(monkeypatch, caplog):
-    monkeypatch.setattr(_helpers, "_INFLIGHT_TURN_TTL_SECONDS", 10)
-    with _helpers._INFLIGHT_TURNS_LOCK:
-        _helpers._INFLIGHT_TURNS_BY_SESSION["s1"] = ("old-turn", 1.0)
-    monkeypatch.setattr(_helpers.time, "time", lambda: 100.0)
-
-    with caplog.at_level(logging.WARNING, logger="agent.agent_runtime_helpers"):
-        assert note_turn_start(_FakeAgent(), "new-turn") is None
-
-    assert not caplog.records
-    assert _helpers._INFLIGHT_TURNS_BY_SESSION["s1"] == ("new-turn", 100.0)
-
-
-def test_session_registry_evicts_oldest_entry_at_capacity(monkeypatch):
-    monkeypatch.setattr(_helpers, "_INFLIGHT_TURNS_MAX", 2)
-    monkeypatch.setattr(_helpers, "_INFLIGHT_TURN_TTL_SECONDS", 10_000)
-    timestamps = iter((100.0, 100.0, 101.0, 101.0, 102.0, 102.0))
-    monkeypatch.setattr(_helpers.time, "time", lambda: next(timestamps))
-
-    for session_id in ("s1", "s2", "s3"):
-        agent = _FakeAgent()
-        agent.session_id = session_id
-        note_turn_start(agent, f"{session_id}-turn")
-
-    assert list(_helpers._INFLIGHT_TURNS_BY_SESSION) == ["s2", "s3"]

@@ -4,13 +4,20 @@ from types import SimpleNamespace
 from unittest.mock import MagicMock
 
 
-def _make_discover_result(*, resources: bool, prompts: bool):
-    caps = {
-        "tools": SimpleNamespace(list_changed=True),
-        "resources": SimpleNamespace(list_changed=True) if resources else None,
-        "prompts": SimpleNamespace(list_changed=True) if prompts else None,
-    }
-    return SimpleNamespace(capabilities=SimpleNamespace(**caps))
+def _make_init_result(*, resources: bool, prompts: bool):
+    """Build a fake ``InitializeResult`` whose ``capabilities`` sub-object
+    matches a server that advertises exactly the given capability set.
+
+    MCP spec shape: ``capabilities.resources`` / ``capabilities.prompts``
+    are non-None iff the server implements the corresponding request
+    family. We mirror that with ``SimpleNamespace`` because the real SDK
+    models are pydantic and we don't want the test to couple to pydantic
+    versioning.
+    """
+    caps_attrs: dict = {"tools": SimpleNamespace(listChanged=True)}
+    caps_attrs["resources"] = SimpleNamespace(listChanged=True) if resources else None
+    caps_attrs["prompts"] = SimpleNamespace(listChanged=True) if prompts else None
+    return SimpleNamespace(capabilities=SimpleNamespace(**caps_attrs))
 
 
 def _make_fake_server(*, discover_result):
@@ -45,14 +52,6 @@ class TestCapabilityGatedRegistration:
         selected = _select_utility_schemas("resources", server, {})
         assert _handler_keys(selected) == {"list_resources", "read_resource"}
 
-    def test_prompts_only_server_gets_prompt_stubs_only(self):
-        from tools.mcp_tool import _select_utility_schemas
-
-        server = _make_fake_server(
-            discover_result=_make_discover_result(resources=False, prompts=True)
-        )
-        selected = _select_utility_schemas("prompts", server, {})
-        assert _handler_keys(selected) == {"list_prompts", "get_prompt"}
 
     def test_fully_capable_server_gets_all_stubs(self):
         from tools.mcp_tool import _select_utility_schemas

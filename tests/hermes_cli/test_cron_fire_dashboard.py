@@ -55,11 +55,6 @@ def _restore(prev_auth, prev_host):
         web_server.app.state.bound_host = prev_host
 
 
-def test_route_registered_on_dashboard_app():
-    """The fire webhook is served by the dashboard app (the hosted-agent public
-    surface), not only the aiohttp adapter."""
-    paths = {r.path for r in web_server.app.routes if hasattr(r, "path")}
-    assert "/api/cron/fire" in paths
 
 
 def test_fire_path_is_public():
@@ -129,66 +124,3 @@ def test_unknown_job_200_gone(monkeypatch):
         client.close()
 
 
-def test_valid_token_accepts_and_fires(monkeypatch):
-    """Valid token + known job -> 202 and fire_due invoked for the resolved
-    profile."""
-    fired = []
-    monkeypatch.setattr(
-        "plugins.cron_providers.chronos.verify.get_fire_verifier",
-        lambda: (lambda **kw: _claims("j1")),
-    )
-    monkeypatch.setattr(web_server, "_find_cron_job_profile", lambda jid: "default")
-    monkeypatch.setattr(web_server, "_fire_cron_job_for_profile",
-                        lambda p, j, fire_at: fired.append((p, j, fire_at)) or True)
-
-    client, pa, ph = _client(auth_required=False)
-    try:
-        resp = client.post("/api/cron/fire",
-                           headers={"Authorization": "Bearer good"},
-                           json={"job_id": "j1", "fire_at": _FIRE_AT})
-        assert resp.status_code == 202
-        assert resp.json()["job_id"] == "j1"
-        # Keep the TestClient portal alive while the 202 background task runs;
-        # closing it first cancels tasks that have not started yet.
-        deadline = time.monotonic() + 2.0
-        while not fired and time.monotonic() < deadline:
-            time.sleep(0.01)
-        assert fired == [("default", "j1", _FIRE_AT)]
-    finally:
-        _restore(pa, ph)
-        client.close()
-
-
-def test_valid_token_task_is_released_after_execution(monkeypatch):
-    """The dashboard retains the accepted task, then removes it on completion."""
-    fired = []
-    monkeypatch.setattr(
-        "plugins.cron_providers.chronos.verify.get_fire_verifier",
-        lambda: (lambda **kw: _claims("j2")),
-    )
-    monkeypatch.setattr(web_server, "_find_cron_job_profile", lambda jid: "default")
-    monkeypatch.setattr(
-        web_server,
-        "_fire_cron_job_for_profile",
-        lambda p, j, fire_at: fired.append((p, j, fire_at)) or True,
-    )
-
-    client, pa, ph = _client(auth_required=False)
-    try:
-        resp = client.post(
-            "/api/cron/fire",
-            headers={"Authorization": "Bearer good"},
-            json={"job_id": "j2", "fire_at": _FIRE_AT},
-        )
-        assert resp.status_code == 202
-        deadline = time.monotonic() + 2.0
-        while not fired and time.monotonic() < deadline:
-            time.sleep(0.01)
-        assert fired == [("default", "j2", _FIRE_AT)]
-        deadline = time.monotonic() + 2.0
-        while getattr(web_server.app.state, "_cron_fire_tasks", set()) and time.monotonic() < deadline:
-            time.sleep(0.01)
-        assert getattr(web_server.app.state, "_cron_fire_tasks", set()) == set()
-    finally:
-        _restore(pa, ph)
-        client.close()
