@@ -34,6 +34,7 @@ from gateway.platforms.api_server import (
     _api_request_profile,
     _derive_chat_session_id,
     _hermes_version,
+    _idempotency_namespace,
     _redact_api_error_text,
     _request_agent_overrides,
     check_api_server_requirements,

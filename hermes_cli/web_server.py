@@ -276,10 +276,13 @@ async def _lifespan(app: "FastAPI"):
         selftest_task.cancel()
         auto_archive_task.cancel()
         await PTY_REGISTRY.close_all()
-        managed_install_stop.set()
-        managed_install_thread.join(timeout=2)
-        if managed_install_thread.is_alive():
-            _log.warning("managed installation dispatcher did not stop within 2 seconds")
+        managed_stop = globals().get("managed_install_stop")
+        managed_thread = globals().get("managed_install_thread")
+        if managed_stop is not None and managed_thread is not None:
+            managed_stop.set()
+            managed_thread.join(timeout=2)
+            if managed_thread.is_alive():
+                _log.warning("managed installation dispatcher did not stop within 2 seconds")
         if cron_stop is not None:
             cron_stop.set()
 

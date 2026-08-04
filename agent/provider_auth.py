@@ -4286,6 +4286,7 @@ def _save_xai_oauth_tokens(
     redirect_uri: str = "",
     last_refresh: Optional[str] = None,
     auth_mode: str = "oauth_device_code",
+    set_active: bool = True,
 ) -> None:
     if last_refresh is None:
         last_refresh = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
@@ -4304,7 +4305,10 @@ def _save_xai_oauth_tokens(
             state["discovery"] = discovery
         if redirect_uri:
             state["redirect_uri"] = redirect_uri
-        _save_provider_state(auth_store, "xai-oauth", state)
+        if set_active:
+            _save_provider_state(auth_store, "xai-oauth", state)
+        else:
+            _store_provider_state(auth_store, "xai-oauth", state, set_active=False)
         _save_auth_store(auth_store)
         if write_through_to_root:
             _write_through_xai_oauth_to_global_root(state)
@@ -5490,6 +5494,11 @@ def _agent_key_is_usable(state: Dict[str, Any], min_ttl_seconds: int) -> bool:
     )
 
 
+_RESOLVE_TOKEN_CACHE_LOCK = threading.Lock()
+_RESOLVE_TOKEN_CACHE: "tuple[float, str] | None" = None
+_RESOLVE_TOKEN_CACHE_TTL_S = 5.0
+
+
 def resolve_nous_access_token(
     *,
     timeout_seconds: float = 15.0,
@@ -5498,6 +5507,14 @@ def resolve_nous_access_token(
     refresh_skew_seconds: int = ACCESS_TOKEN_REFRESH_SKEW_SECONDS,
 ) -> str:
     """Resolve a refresh-aware Nous Portal access token for managed tool gateways."""
+    global _RESOLVE_TOKEN_CACHE
+    if not insecure and ca_bundle is None:
+        with _RESOLVE_TOKEN_CACHE_LOCK:
+            if _RESOLVE_TOKEN_CACHE is not None:
+                cached_at, cached_token = _RESOLVE_TOKEN_CACHE
+                if (time.monotonic() - cached_at) < _RESOLVE_TOKEN_CACHE_TTL_S:
+                    return cached_token
+
     with _provider_state_transaction("nous") as (
         auth_store,
         state,
@@ -5552,6 +5569,9 @@ def resolve_nous_access_token(
             if not _is_expiring(state.get("expires_at"), refresh_skew_seconds):
                 if merged_shared:
                     _save_provider_state_to_source(auth_store, "nous", state, state_source_path)
+                if not insecure and ca_bundle is None:
+                    with _RESOLVE_TOKEN_CACHE_LOCK:
+                        _RESOLVE_TOKEN_CACHE = (time.monotonic(), access_token)
                 return access_token
 
             if not isinstance(refresh_token, str) or not refresh_token:
@@ -5609,7 +5629,11 @@ def resolve_nous_access_token(
             }
             _save_provider_state_to_source(auth_store, "nous", state, state_source_path)
             _write_shared_nous_state(state)
-            return state["access_token"]
+            resolved = state["access_token"]
+            if not insecure and ca_bundle is None:
+                with _RESOLVE_TOKEN_CACHE_LOCK:
+                    _RESOLVE_TOKEN_CACHE = (time.monotonic(), resolved)
+            return resolved
 
 
 def refresh_nous_oauth_pure(
@@ -6337,6 +6361,51 @@ def _compute_nous_auth_status() -> Dict[str, Any]:
             return base_status
 
     return _snapshot_nous_pool_status()
+
+
+def get_nous_auth_status_local() -> Dict[str, Any]:
+    """Return a refresh-free Nous auth snapshot for read-only surfaces."""
+    try:
+        state = get_provider_auth_state("nous")
+    except Exception:
+        state = None
+
+    if not state:
+        return _snapshot_nous_pool_status()
+
+    access_token = state.get("access_token")
+    jwt_reason = _nous_invoke_jwt_status(
+        access_token,
+        scope=state.get("scope"),
+        expires_at=state.get("expires_at"),
+    )
+    last_err = state.get("last_auth_error")
+    terminal = bool(
+        isinstance(last_err, dict)
+        and last_err.get("relogin_required")
+        and not (access_token or state.get("refresh_token"))
+    )
+    logged_in = (jwt_reason is None) or (
+        bool(state.get("refresh_token")) and not terminal
+    )
+
+    status: Dict[str, Any] = {
+        "logged_in": logged_in,
+        "portal_base_url": state.get("portal_base_url"),
+        "inference_base_url": state.get("inference_base_url"),
+        "access_token": access_token,
+        "access_expires_at": state.get("expires_at"),
+        "agent_key_expires_at": state.get("agent_key_expires_at"),
+        "has_refresh_token": bool(state.get("refresh_token")),
+        "inference_credential_present": bool(access_token or state.get("agent_key")),
+        "credential_source": "auth_store",
+        "source": "auth_store_local",
+    }
+    if terminal and isinstance(last_err, dict):
+        status["relogin_required"] = True
+        status["error_code"] = last_err.get("code")
+        status["error"] = last_err.get("message") or "re-login required"
+    return status
 
 
 # Enum values reported on the dashboard /api/status as ``nous_session_valid``.
@@ -7089,6 +7158,18 @@ def _prompt_model_selection(
         choices.append("Enter custom model name")
         choices.append("Skip (keep current)")
 
+        from hermes_cli.model_search import model_search_text
+
+        model_search_labels = []
+        for mid in ordered:
+            label = _label(mid)
+            haystack = model_search_text(mid)
+            model_search_labels.append(
+                label if haystack == mid else f"{label} {haystack}"
+            )
+        model_search_labels.append("Enter custom model name")
+        model_search_labels.append("Skip (keep current)")
+
         _upgrade_url = (portal_url or DEFAULT_NOUS_PORTAL_URL).rstrip("/")
         unavailable_footer = unavailable_message.strip()
         if not unavailable_footer and _unavailable:
@@ -7117,6 +7198,7 @@ def _prompt_model_selection(
             cancel_returns=-1,
             description=description,
             searchable=True,
+            search_labels=model_search_labels,
         )
         if idx < 0:
             return None
@@ -7726,6 +7808,64 @@ def _codex_device_code_login() -> Dict[str, Any]:
 
 # ==================== MiniMax Portal OAuth ====================
 
+_MINIMAX_OAUTH_ERROR_BODY_LIMIT = 16 * 1024
+
+
+def _minimax_response_error_text(
+    response: httpx.Response,
+    *,
+    limit: int = _MINIMAX_OAUTH_ERROR_BODY_LIMIT,
+) -> str:
+    """Return a bounded error body from a streamed MiniMax OAuth response."""
+    limit = max(0, int(limit))
+    chunks: list[bytes] = []
+    total = 0
+    truncated = False
+    try:
+        if getattr(response, "is_stream_consumed", False):
+            text = response.text
+            return text[:limit] + ("...[truncated]" if len(text) > limit else "")
+
+        for chunk in response.iter_bytes():
+            if not chunk:
+                continue
+            remaining = limit + 1 - total
+            if remaining <= 0:
+                truncated = True
+                break
+            if len(chunk) > remaining:
+                chunks.append(chunk[:remaining])
+                total += remaining
+                truncated = True
+                break
+            chunks.append(chunk)
+            total += len(chunk)
+        raw = b"".join(chunks)
+        if len(raw) > limit:
+            raw = raw[:limit]
+            truncated = True
+        encoding = response.encoding or "utf-8"
+        text = raw.decode(encoding, errors="replace")
+        return text + ("...[truncated]" if truncated else "")
+    finally:
+        response.close()
+
+
+def _minimax_post_form(
+    client: httpx.Client,
+    url: str,
+    *,
+    data: Dict[str, Any],
+    headers: Dict[str, str],
+) -> httpx.Response:
+    """POST a MiniMax OAuth form without eagerly reading error bodies."""
+    request = client.build_request("POST", url, data=data, headers=headers)
+    response = client.send(request, stream=True)
+    if response.status_code == 200:
+        response.read()
+    return response
+
+
 def _minimax_pkce_pair() -> tuple:
     """Generate (code_verifier, code_challenge_S256, state) for MiniMax OAuth."""
     import secrets
@@ -7741,7 +7881,8 @@ def _minimax_request_user_code(
     client: httpx.Client, *, portal_base_url: str, client_id: str,
     code_challenge: str, state: str,
 ) -> Dict[str, Any]:
-    response = client.post(
+    response = _minimax_post_form(
+        client,
         f"{portal_base_url}/oauth/code",
         data={
             "response_type": "code",
@@ -7758,8 +7899,9 @@ def _minimax_request_user_code(
         },
     )
     if response.status_code != 200:
+        body = _minimax_response_error_text(response)
         raise AuthError(
-            f"MiniMax OAuth authorization failed: {response.text or response.reason_phrase}",
+            f"MiniMax OAuth authorization failed: {body or response.reason_phrase}",
             provider="minimax-oauth", code="authorization_failed",
         )
     payload = response.json()
@@ -7807,7 +7949,8 @@ def _minimax_poll_token(
     interval = max(2.0, (interval_ms or 2000) / 1000.0)
 
     while _time.time() < deadline:
-        response = client.post(
+        response = _minimax_post_form(
+            client,
             f"{portal_base_url}/oauth/token",
             data={
                 "grant_type": MINIMAX_OAUTH_GRANT_TYPE,
@@ -7820,17 +7963,22 @@ def _minimax_poll_token(
                 "Accept": "application/json",
             },
         )
-        try:
-            payload = response.json() if response.text else {}
-        except Exception:
-            payload = {}
-
         if response.status_code != 200:
-            msg = (payload.get("base_resp", {}) or {}).get("status_msg") or response.text
+            error_text = _minimax_response_error_text(response)
+            try:
+                payload = json.loads(error_text) if error_text else {}
+            except Exception:
+                payload = {}
+            msg = (payload.get("base_resp", {}) or {}).get("status_msg") or error_text
             raise AuthError(
                 f"MiniMax OAuth error: {msg or 'unknown'}",
                 provider="minimax-oauth", code="token_exchange_failed",
             )
+
+        try:
+            payload = response.json() if response.text else {}
+        except Exception:
+            payload = {}
 
         status = payload.get("status")
         if status == "error":
@@ -7966,7 +8114,8 @@ def _refresh_minimax_oauth_state(
     portal_base_url = state["portal_base_url"]
     with httpx.Client(timeout=httpx.Timeout(timeout_seconds),
                       follow_redirects=True) as client:
-        response = client.post(
+        response = _minimax_post_form(
+            client,
             f"{portal_base_url}/oauth/token",
             data={
                 "grant_type": "refresh_token",
@@ -7978,15 +8127,16 @@ def _refresh_minimax_oauth_state(
                 "Accept": "application/json",
             },
         )
-    if response.status_code != 200:
-        body = response.text.lower()
-        relogin = any(m in body for m in
-                      ("invalid_grant", "refresh_token_reused", "invalid_refresh_token"))
-        raise AuthError(
-            f"MiniMax OAuth refresh failed: {response.text or response.reason_phrase}",
-            provider="minimax-oauth", code="refresh_failed",
-            relogin_required=relogin,
-        )
+        if response.status_code != 200:
+            body = _minimax_response_error_text(response)
+            body_lower = body.lower()
+            relogin = any(m in body_lower for m in
+                          ("invalid_grant", "refresh_token_reused", "invalid_refresh_token"))
+            raise AuthError(
+                f"MiniMax OAuth refresh failed: {body or response.reason_phrase}",
+                provider="minimax-oauth", code="refresh_failed",
+                relogin_required=relogin,
+            )
     payload = response.json()
     if payload.get("status") != "success":
         raise AuthError(

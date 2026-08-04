@@ -44,6 +44,7 @@ from collections import OrderedDict
 from contextvars import copy_context
 from pathlib import Path
 from hermes_services.startup import bootstrap_trusted_runtime
+from hermes_runtime import process_probe
 from datetime import datetime
 from typing import Awaitable, Callable, Dict, Optional, Any, List, Tuple, Union, cast
 

@@ -76,32 +76,6 @@ def test_view_built_with_org_pinned_url_and_identity(_logged_in_account):
 # ── gateway _handle_topup_command (the messaging billing surface) ────────────
 
 
-class _FakeEvent:
-    pass
-
-
-def _make_gateway_stub():
-    """Minimal object exposing the mixin's _handle_topup_command."""
-    from gateway.slash_commands import GatewaySlashCommandsMixin
-
-    class _Stub(GatewaySlashCommandsMixin):
-        def __init__(self):
-            pass
-
-    return _Stub()
-
-
-
-
-def test_gateway_topup_not_logged_in(monkeypatch):
-    monkeypatch.setattr(
-        account_usage, "build_credits_view", lambda *a, **kw: CreditsView(logged_in=False)
-    )
-    stub = _make_gateway_stub()
-    out = asyncio.run(stub._handle_topup_command(_FakeEvent()))
-    assert "Not logged into Nous Portal" in out
-
-
 
 
 # ── command registry ────────────────────────────────────────────────────────

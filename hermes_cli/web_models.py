@@ -165,6 +165,7 @@ class ModelAssignment(BaseModel):
     # endpoint that requires auth works from the GUI. Mirrors the key the
     # ``hermes model`` custom flow collects.
     api_key: str = ""
+    api_mode: str = ""
     confirm_expensive_model: bool = False
     profile: Optional[str] = None
 

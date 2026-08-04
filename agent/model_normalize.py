@@ -129,6 +129,11 @@ _DEEPSEEK_REASONER_KEYWORDS: frozenset[str] = frozenset({
     "cot",
 })
 
+_DEEPSEEK_RETIRED_ALIASES: frozenset[str] = frozenset({
+    "deepseek-chat",
+    "deepseek-reasoner",
+})
+
 _DEEPSEEK_CANONICAL_MODELS: frozenset[str] = frozenset({
     "deepseek-chat",       # V3 on DeepSeek direct and most aggregators
     "deepseek-reasoner",   # R1-family reasoning model
@@ -165,6 +170,9 @@ def _normalize_for_deepseek(model_name: str) -> str:
     """
     bare = _strip_vendor_prefix(model_name).lower()
 
+    if bare in _DEEPSEEK_RETIRED_ALIASES:
+        return "deepseek-v4-flash"
+
     if bare in _DEEPSEEK_CANONICAL_MODELS:
         return bare
 
@@ -175,9 +183,9 @@ def _normalize_for_deepseek(model_name: str) -> str:
     # Check for reasoner-like keywords anywhere in the name
     for keyword in _DEEPSEEK_REASONER_KEYWORDS:
         if keyword in bare:
-            return "deepseek-reasoner"
+            return "deepseek-v4-flash"
 
-    return "deepseek-chat"
+    return "deepseek-v4-flash"
 
 
 # ---------------------------------------------------------------------------

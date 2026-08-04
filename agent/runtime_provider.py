@@ -889,10 +889,58 @@ def find_custom_provider_identity(base_url: str) -> Optional[str]:
     return None
 
 
+def find_custom_provider_identity_by_model(model: str) -> Optional[str]:
+    """Map a model id back to the configured custom provider that serves it."""
+    target = str(model or "").strip().lower()
+    if not target:
+        return None
+    try:
+        config = load_config()
+    except Exception:
+        return None
+
+    def _entry_serves_model(entry: Dict[str, Any]) -> bool:
+        for key in ("model", "default_model"):
+            value = entry.get(key)
+            if isinstance(value, str) and value.strip().lower() == target:
+                return True
+        models = entry.get("models")
+        if isinstance(models, dict):
+            return any(str(mid).strip().lower() == target for mid in models)
+        if isinstance(models, list):
+            for item in models:
+                if isinstance(item, str) and item.strip().lower() == target:
+                    return True
+                if isinstance(item, dict):
+                    mid = item.get("id") or item.get("name")
+                    if isinstance(mid, str) and mid.strip().lower() == target:
+                        return True
+        return False
+
+    providers = config.get("providers")
+    if isinstance(providers, dict):
+        for entry_name, entry in providers.items():
+            if isinstance(entry, dict) and _entry_serves_model(entry):
+                return f"custom:{_normalize_custom_provider_name(str(entry_name))}"
+
+    try:
+        custom_providers = get_compatible_custom_providers(config)
+    except Exception:
+        custom_providers = None
+    for entry in custom_providers or []:
+        if not isinstance(entry, dict):
+            continue
+        name = entry.get("name")
+        if isinstance(name, str) and name.strip() and _entry_serves_model(entry):
+            return f"custom:{_normalize_custom_provider_name(name)}"
+    return None
+
+
 def canonical_custom_identity(
     *,
     base_url: Optional[str] = None,
     config_provider: Optional[str] = None,
+    model: Optional[str] = None,
 ) -> Optional[str]:
     """Recover a routable ``custom:<name>`` identity for a bare custom provider.
 
@@ -926,7 +974,13 @@ def canonical_custom_identity(
         if identity:
             return identity
 
-    # 2. Fall back to the configured provider when it names a real entry.
+    # 2. Recover by the session model when the endpoint was not persisted.
+    if model:
+        identity = find_custom_provider_identity_by_model(model)
+        if identity:
+            return identity
+
+    # 3. Fall back to the configured provider when it names a real entry.
     candidate = str(config_provider or "").strip()
     if not candidate:
         try:
@@ -943,7 +997,13 @@ def canonical_custom_identity(
     # Only return it when it actually resolves to a configured custom entry,
     # so we never invent a `custom:<x>` that resolution can't honor.
     try:
-        if _get_named_custom_provider(candidate) is not None:
+        entry = _get_named_custom_provider(candidate)
+        if entry is not None:
+            identity = find_custom_provider_identity(
+                str(entry.get("base_url") or "")
+            )
+            if identity:
+                return identity
             if candidate_norm.startswith("custom:"):
                 return candidate_norm
             return f"custom:{candidate_norm}"

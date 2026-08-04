@@ -23,6 +23,11 @@ from unittest.mock import MagicMock, patch
 import pytest
 
 from run_agent import AIAgent
+from hermes_services.tool_contract import (
+    ToolExecutionContract,
+    register_tool_contract,
+    reset_tool_contracts_for_tests,
+)
 
 
 def _symlink_or_skip(link: Path, target: Path) -> None:

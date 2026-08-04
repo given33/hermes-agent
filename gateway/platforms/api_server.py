@@ -99,6 +99,7 @@ from hermes_services import (
     DEFAULT_MAX_REQUEST_BYTES,
     HermesApplicationKernel,
     accept_cron_fire_request,
+    openai_error_body,
 )
 
 from agent.secret_scope import UnscopedSecretError as _UnscopedSecretError
@@ -1236,9 +1237,13 @@ class _IdempotencyCache:
         return await asyncio.shield(task)
 
 
-def _make_request_fingerprint(body: Dict[str, Any]) -> str:
+def _make_request_fingerprint(
+    body: Dict[str, Any],
+    keys: Optional[List[str]] = None,
+) -> str:
+    fingerprint_body = body if keys is None else {key: body.get(key) for key in keys}
     canonical = json.dumps(
-        body,
+        fingerprint_body,
         ensure_ascii=False,
         sort_keys=True,
         separators=(",", ":"),
@@ -1581,7 +1586,7 @@ class APIServerAdapter(BasePlatformAdapter):
         """
         default = 10
         try:
-            from hermes_runtime.config import cfg_get, load_config
+            from hermes_cli.config import cfg_get, load_config
 
             raw = cfg_get(
                 load_config(),
@@ -4000,6 +4005,13 @@ class APIServerAdapter(BasePlatformAdapter):
             session_id = _derive_chat_session_id(system_prompt, first_user)
             # history already set from request body above
 
+        namespace = _idempotency_namespace(
+            request,
+            endpoint="/v1/chat/completions",
+            gateway_session_key=gateway_session_key,
+            session_id=session_id,
+        )
+
         completion_id = f"chatcmpl-{uuid.uuid4().hex[:29]}"
         model_name = body.get("model", self._model_name)
         created = int(time.time())
@@ -5158,6 +5170,13 @@ class APIServerAdapter(BasePlatformAdapter):
         # Reuse session from previous_response_id chain so the dashboard
         # groups the entire conversation under one session entry.
         session_id = stored_session_id or str(uuid.uuid4())
+
+        namespace = _idempotency_namespace(
+            request,
+            endpoint="/v1/responses",
+            gateway_session_key=gateway_session_key,
+            session_id=session_id,
+        )
 
         stream = _coerce_request_bool(body.get("stream"), default=False)
         route = self._resolve_route(body.get("model"))

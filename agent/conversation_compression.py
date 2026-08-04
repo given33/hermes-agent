@@ -3070,6 +3070,24 @@ def compress_context(
                 _release_lock()
                 return messages, _existing_sp
 
+        if _compression_hook_trace:
+            try:
+                from agent.context_compressor import (
+                    COMPRESSED_SUMMARY_METADATA_KEY as summary_marker,
+                )
+            except ImportError:
+                summary_marker = "_compressed_summary"
+            trace_target = next(
+                (
+                    item
+                    for item in compressed
+                    if isinstance(item, dict) and item.get(summary_marker)
+                ),
+                compressed[0] if compressed and isinstance(compressed[0], dict) else None,
+            )
+            if isinstance(trace_target, dict):
+                trace_target["hook_trace"] = list(_compression_hook_trace)
+
         summary_error = getattr(agent.context_compressor, "_last_summary_error", None)
         if summary_error:
             if getattr(agent, "_last_compression_summary_warning", None) != summary_error:

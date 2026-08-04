@@ -23,6 +23,18 @@ from agent.conversation_compression import (
     finalize_context_engine_compression_notification,
 )
 
+
+@contextmanager
+def _temporary_session_db():
+    from hermes_state import SessionDB
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        db = SessionDB(db_path=Path(tmpdir) / "test.db")
+        try:
+            yield db
+        finally:
+            db.close()
+
 class TestCompressionBoundaryHook:
     def _make_agent(self, session_db):
         with patch.dict(os.environ, {"OPENROUTER_API_KEY": "test-key"}):
@@ -97,11 +109,8 @@ class TestCompressionBoundaryHook:
             assert len(comp_calls) == 1
 
     def test_automatic_notification_follows_core_persistence(self):
-        from hermes_state import SessionDB
-
         events = []
-        with tempfile.TemporaryDirectory() as tmpdir:
-            db = SessionDB(db_path=Path(tmpdir) / "test.db")
+        with _temporary_session_db() as db:
             agent = self._make_agent(db)
             compressor = MagicMock()
             compressor.compress.return_value = [
@@ -137,10 +146,7 @@ class TestCompressionBoundaryHook:
             assert events == ["persist", "compression"]
 
     def test_failure_before_persistence_does_not_notify(self):
-        from hermes_state import SessionDB
-
-        with tempfile.TemporaryDirectory() as tmpdir:
-            db = SessionDB(db_path=Path(tmpdir) / "test.db")
+        with _temporary_session_db() as db:
             agent = self._make_agent(db)
             compressor = MagicMock()
             compressor.compress.side_effect = RuntimeError("synthetic compression failure")
@@ -157,10 +163,7 @@ class TestCompressionBoundaryHook:
 
 
     def test_no_progress_does_not_notify(self):
-        from hermes_state import SessionDB
-
-        with tempfile.TemporaryDirectory() as tmpdir:
-            db = SessionDB(db_path=Path(tmpdir) / "test.db")
+        with _temporary_session_db() as db:
             agent = self._make_agent(db)
             compressor = MagicMock()
             compressor.compress.side_effect = lambda messages, **_kwargs: messages

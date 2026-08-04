@@ -7,9 +7,12 @@ Add, remove, or reorder entries here — both `hermes setup` and
 
 from __future__ import annotations
 
+import copy
 import json
+import logging
 import os
 import re
+import threading
 import urllib.parse
 import urllib.request
 import urllib.error
@@ -21,6 +24,8 @@ from typing import Any, NamedTuple, Optional
 from hermes_runtime import model_catalog_cache
 from hermes_runtime.version import HERMES_VERSION as _HERMES_VERSION
 from hermes_runtime.urllib_security import open_credentialed_url
+
+logger = logging.getLogger(__name__)
 
 # Identify ourselves so endpoints fronted by Cloudflare's Browser Integrity
 # Check (error 1010) don't reject the default ``Python-urllib/*`` signature.
@@ -1758,6 +1763,14 @@ def fetch_ai_gateway_models(
     return list(curated)
 
 
+def ai_gateway_model_ids(*, force_refresh: bool = False) -> list[str]:
+    """Return just the AI Gateway model identifiers."""
+    return [
+        model_id
+        for model_id, _ in fetch_ai_gateway_models(force_refresh=force_refresh)
+    ]
+
+
 def fetch_ai_gateway_pricing(
     timeout: float = 8.0,
     *,
@@ -2123,11 +2136,22 @@ def _provider_keys(provider: str) -> set[str]:
     return {k for k in (key, normalized) if k}
 
 
+_PROVIDER_RETIRED_ALIASES: dict[str, tuple[str, ...]] = {
+    "deepseek": ("deepseek-chat", "deepseek-reasoner"),
+}
+
+
+def _provider_catalog_names(provider: str) -> tuple[str, ...]:
+    """Return active picker models plus retired detection aliases."""
+    active = tuple(_PROVIDER_MODELS.get(provider, []))
+    return active + _PROVIDER_RETIRED_ALIASES.get(provider, ())
+
+
 def _model_in_provider_catalog(name_lower: str, providers: set[str]) -> bool:
     return any(
         name_lower == model.lower()
         for provider in providers
-        for model in _PROVIDER_MODELS.get(provider, [])
+        for model in _provider_catalog_names(provider)
     )
 
 
@@ -2563,6 +2587,37 @@ _MODELS_DEV_PREFERRED: frozenset[str] = frozenset({
 })
 
 
+def _model_dedup_key(model_id: str) -> str:
+    """Return a case-insensitive key folded through picker aliases."""
+    key = str(model_id).strip().lower()
+    try:
+        from hermes_cli.model_search import model_alias_canonical
+
+        return model_alias_canonical(key)
+    except Exception:
+        return key
+
+
+def _openai_discovery_base_url(provider: str) -> str:
+    """Resolve the effective OpenAI endpoint using runtime precedence."""
+    env_raw = os.getenv("OPENAI_BASE_URL", "").strip().rstrip("/")
+    if env_raw:
+        return env_raw
+    try:
+        model_cfg = _get_model_config_dict()
+        cfg_provider = str(model_cfg.get("provider") or "").strip().lower()
+        if (
+            cfg_provider in ("openai", "openai-api")
+            and normalize_provider(provider) == normalize_provider(cfg_provider)
+        ):
+            cfg_url = str(model_cfg.get("base_url") or "").strip().rstrip("/")
+            if cfg_url:
+                return cfg_url
+    except Exception:
+        pass
+    return "https://api.openai.com/v1"
+
+
 def _merge_with_models_dev(provider: str, curated: list[str]) -> list[str]:
     """Merge curated list with fresh models.dev entries for a preferred provider.
 
@@ -2699,6 +2754,10 @@ def provider_model_ids(provider: Optional[str], *, force_refresh: bool = False) 
                     merged_lower.add(m.lower())
             return merged
         return list(_PROVIDER_MODELS.get("anthropic", []))
+    if normalized == "ai-gateway":
+        live = _fetch_ai_gateway_models()
+        if live:
+            return live
     if normalized == "deepinfra":
         # DeepInfra's generic /models endpoint mixes chat, image, video,
         # speech, and embedding models. The tagged catalog helper is the only
@@ -2711,8 +2770,7 @@ def provider_model_ids(provider: Optional[str], *, force_refresh: bool = False) 
     if normalized in ("openai", "openai-api"):
         api_key = os.getenv("OPENAI_API_KEY", "").strip()
         if api_key:
-            base_raw = os.getenv("OPENAI_BASE_URL", "").strip().rstrip("/")
-            base = base_raw or "https://api.openai.com/v1"
+            base = _openai_discovery_base_url(normalized)
             # Custom OpenAI-compatible endpoints (proxies, gateways, self-hosted)
             # may serve a small curated catalog — use the live list verbatim so
             # discovery works. But the canonical api.openai.com /v1/models dump
@@ -2720,10 +2778,9 @@ def provider_model_ids(provider: Optional[str], *, force_refresh: bool = False) 
             # legacy chat models — none of which belong in the agent model picker.
             # For the default endpoint, intersect the live list with our curated
             # agentic catalog so ``/model`` matches what ``hermes model`` shows.
-            is_default_openai = base.rstrip("/") in (
-                "https://api.openai.com/v1",
-                "https://api.openai.com",
-            )
+            from hermes_cli.providers import is_official_openai_host
+
+            is_default_openai = is_official_openai_host(base)
             try:
                 live = fetch_api_models(api_key, base)
                 if live:
@@ -2869,6 +2926,41 @@ def provider_model_ids(provider: Optional[str], *, force_refresh: bool = False) 
 #     to a live fetch — the picker keeps working.
 
 _PROVIDER_MODELS_CACHE_TTL = 3600  # 1h
+_PROVIDER_MODELS_STALE_SERVE_MAX = 7 * 24 * 3600  # 7d
+
+_swr_refresh_inflight: set[str] = set()
+_swr_refresh_lock = threading.Lock()
+
+
+def _spawn_swr_refresh(provider: str) -> None:
+    """Refresh one stale provider catalog in a deduplicated daemon thread."""
+    with _swr_refresh_lock:
+        if provider in _swr_refresh_inflight:
+            return
+        _swr_refresh_inflight.add(provider)
+
+    def _refresh() -> None:
+        try:
+            live = provider_model_ids(provider, force_refresh=True)
+            if live:
+                cache = _load_provider_models_cache()
+                cache[provider] = {
+                    "fp": _credential_fingerprint(provider),
+                    "at": time.time(),
+                    "models": list(live),
+                }
+                _save_provider_models_cache(cache)
+        except Exception:
+            logger.debug("SWR refresh failed for %s", provider, exc_info=True)
+        finally:
+            with _swr_refresh_lock:
+                _swr_refresh_inflight.discard(provider)
+
+    threading.Thread(
+        target=_refresh,
+        daemon=True,
+        name=f"model-cache-swr-{provider}",
+    ).start()
 
 
 def _provider_models_cache_path() -> Path:
@@ -2906,6 +2998,12 @@ def _credential_fingerprint(provider: str) -> str:
                 parts.append(f"{bev}={_os.environ.get(bev, '')}")
     except Exception:
         pass
+
+    if provider in ("openai", "openai-api"):
+        try:
+            parts.append(f"effective_base={_openai_discovery_base_url(provider)}")
+        except Exception:
+            pass
 
     # OAuth / external-file mtimes that change on re-auth
     try:
@@ -2997,9 +3095,13 @@ def cached_provider_model_ids(
         and entry.get("fp") == fp
         and isinstance(entry.get("models"), list)
         and entry["models"]
-        and (now - float(entry.get("at", 0))) < ttl_seconds
     ):
-        return list(entry["models"])
+        age = now - float(entry.get("at", 0))
+        if age < ttl_seconds:
+            return list(entry["models"])
+        if age < _PROVIDER_MODELS_STALE_SERVE_MAX:
+            _spawn_swr_refresh(normalized)
+            return list(entry["models"])
 
     # Cache miss / stale / forced refresh — call the live path.
     live = provider_model_ids(normalized, force_refresh=force_refresh)
@@ -3182,10 +3284,27 @@ def _copilot_catalog_item_is_text_model(item: dict[str, Any]) -> bool:
     return True
 
 
+_github_model_catalog_cache: Optional[list[dict[str, Any]]] = None
+_github_model_catalog_cache_key: Optional[str] = None
+_github_model_catalog_cache_time: float = 0.0
+_GITHUB_MODEL_CATALOG_CACHE_TTL = 300
+
+
 def fetch_github_model_catalog(
     api_key: Optional[str] = None, timeout: float = 5.0
 ) -> Optional[list[dict[str, Any]]]:
     """Fetch the live GitHub Copilot model catalog for this account."""
+    global _github_model_catalog_cache, _github_model_catalog_cache_key
+    global _github_model_catalog_cache_time
+
+    if (
+        _github_model_catalog_cache is not None
+        and _github_model_catalog_cache_key == api_key
+        and (time.monotonic() - _github_model_catalog_cache_time)
+        < _GITHUB_MODEL_CATALOG_CACHE_TTL
+    ):
+        return copy.deepcopy(_github_model_catalog_cache)
+
     attempts: list[dict[str, str]] = []
     if api_key:
         attempts.append({
@@ -3211,6 +3330,9 @@ def fetch_github_model_catalog(
                     seen_ids.add(model_id)
                     models.append(item)
                 if models:
+                    _github_model_catalog_cache = copy.deepcopy(models)
+                    _github_model_catalog_cache_key = api_key
+                    _github_model_catalog_cache_time = time.monotonic()
                     return models
         except Exception:
             continue
@@ -3604,6 +3726,38 @@ def ollama_model_supports_thinking(
     except Exception:
         return None
     return None
+
+
+def _fetch_ai_gateway_models(timeout: float = 5.0) -> Optional[list[str]]:
+    """Fetch language models with tool use from the configured AI Gateway."""
+    api_key = os.getenv("AI_GATEWAY_API_KEY", "").strip()
+    if not api_key:
+        return None
+    base_url = os.getenv("AI_GATEWAY_BASE_URL", "").strip()
+    if not base_url:
+        from hermes_constants import AI_GATEWAY_BASE_URL
+
+        base_url = AI_GATEWAY_BASE_URL
+
+    request = urllib.request.Request(
+        base_url.rstrip("/") + "/models",
+        headers={
+            "Authorization": f"Bearer {api_key}",
+            "User-Agent": _HERMES_USER_AGENT,
+        },
+    )
+    try:
+        with urllib.request.urlopen(request, timeout=timeout) as response:
+            payload = json.loads(response.read().decode())
+            return [
+                item["id"]
+                for item in payload.get("data", [])
+                if item.get("id")
+                and item.get("type") == "language"
+                and "tool-use" in (item.get("tags") or [])
+            ]
+    except Exception:
+        return None
 
 
 def _fetch_github_models(api_key: Optional[str] = None, timeout: float = 5.0) -> Optional[list[str]]:

@@ -871,7 +871,7 @@ class IOSMCPRuntimeSupervisor:
         self.lazy_start = bool(lazy_start)
         self.idle_timeout_seconds = max(0.0, float(idle_timeout_seconds))
         try:
-            from hermes_runtime.config import load_config
+            from hermes_cli.config import load_config
 
             configured_servers = load_config().get("mcp_servers") or {}
         except Exception:
@@ -920,7 +920,7 @@ class IOSMCPRuntimeSupervisor:
 
     def _configured_active_ports(self) -> dict[str, int]:
         try:
-            from hermes_runtime.config import load_config
+            from hermes_cli.config import load_config
 
             servers = (load_config().get("mcp_servers") or {})
         except Exception:
@@ -1011,7 +1011,7 @@ class IOSMCPRuntimeSupervisor:
         from hermes_cli.ios_mcp_server import MCP_VERSION, ios_mcp_manifests
 
         try:
-            from hermes_runtime.config import load_config
+            from hermes_cli.config import load_config
 
             configured_servers = load_config().get("mcp_servers") or {}
         except Exception:
@@ -1695,7 +1695,7 @@ class IOSMCPRuntimeSupervisor:
         """
 
         try:
-            from hermes_runtime.config import read_raw_config
+            from hermes_cli.config import read_raw_config
             from tools import mcp_tool
 
             config = read_raw_config() or {}

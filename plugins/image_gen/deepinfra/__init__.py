@@ -31,6 +31,7 @@ import logging
 import os
 from typing import Any, Dict, List, Optional
 
+from agent import model_catalog
 from agent.secret_scope import get_secret
 from agent.image_gen_provider import (
     DEFAULT_ASPECT_RATIO,

@@ -19,6 +19,7 @@ import time
 import unicodedata
 from dataclasses import dataclass, field
 from typing import Callable, ClassVar, Dict, Optional, Any, Tuple, List
+from urllib.parse import urlparse
 
 import aiohttp
 

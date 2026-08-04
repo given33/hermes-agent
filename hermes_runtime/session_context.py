@@ -36,8 +36,9 @@ needs to replace the import + call site:
     platform = get_session_env("HERMES_SESSION_PLATFORM", "")
 """
 
+from contextlib import contextmanager
 from contextvars import ContextVar
-from typing import Any
+from typing import Any, Iterator
 
 # Sentinel to distinguish "never set in this context" from "explicitly set to empty".
 # When a contextvar holds _UNSET, we fall back to os.environ (CLI/cron compat).
@@ -181,6 +182,18 @@ def set_current_session_id(session_id: str) -> None:
 
     os.environ["HERMES_SESSION_ID"] = session_id
     _SESSION_ID.set(session_id)
+
+
+@contextmanager
+def scoped_current_session_id(session_id: str | None = None) -> Iterator[None]:
+    """Bind a task-local session id and restore the prior value on exit."""
+    previous = _SESSION_ID.get()
+    if session_id is not None:
+        _SESSION_ID.set(session_id)
+    try:
+        yield
+    finally:
+        _SESSION_ID.set(previous)
 
 
 def set_session_vars(

@@ -76,6 +76,9 @@ SKILL_SUPPORT_DIRS = frozenset(("references", "templates", "assets", "scripts"))
 ORG_MIRROR_DIR_NAME = "_org"
 ORG_ACTIVE_MARKER = ".active_org"
 ORG_PROVENANCE_FILE = ".org-provenance.json"
+# Fingerprints of the last materialized upstream copy protect local edits from
+# being overwritten by a later organization sync.
+ORG_BASELINE_FILE = ".org-baseline.json"
 
 
 def read_active_org_id(skills_dir: Path) -> Optional[str]:
@@ -99,6 +102,15 @@ def org_id_of_path(path, skills_dir: Path) -> Optional[str]:
     if len(relative.parts) >= 2 and relative.parts[0] == ORG_MIRROR_DIR_NAME:
         return relative.parts[1]
     return None
+
+
+def is_org_mirror_path(path, skills_dir: Path) -> bool:
+    """Return whether *path* is inside the organization skill mirror."""
+    try:
+        relative = Path(path).resolve().relative_to(Path(skills_dir).resolve())
+    except (OSError, ValueError):
+        return False
+    return bool(relative.parts) and relative.parts[0] == ORG_MIRROR_DIR_NAME
 
 
 def is_excluded_skill_path(path) -> bool:
@@ -864,9 +876,15 @@ def iter_skill_index_files(skills_dir: Path, filename: str):
     ``skill_view(..., file_path=...)`` rather than active skill roots.
     """
     skills_dir_str = str(skills_dir)
+    active_org = read_active_org_id(skills_dir)
+    org_root = os.path.join(skills_dir_str, ORG_MIRROR_DIR_NAME)
     matches: list[str] = []
     for root, dirs, files in os.walk(skills_dir_str, followlinks=True):
         has_skill_md = "SKILL.md" in files
+        if root == skills_dir_str and ORG_MIRROR_DIR_NAME in dirs and active_org is None:
+            dirs.remove(ORG_MIRROR_DIR_NAME)
+        elif root == org_root:
+            dirs[:] = [directory for directory in dirs if directory == active_org]
         dirs[:] = [
             d
             for d in dirs

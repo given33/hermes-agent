@@ -104,6 +104,7 @@ from typing import Any, Coroutine, Dict, Iterable, List, Optional, Set, Tuple
 from urllib.parse import urlparse
 
 from tools.registry import tool_error
+from hermes_runtime import process_probe
 
 logger = logging.getLogger(__name__)
 
@@ -450,6 +451,26 @@ def _exc_str(exc: BaseException) -> str:
     """
     text = str(exc).strip()
     return text if text else repr(exc)
+
+
+try:
+    from mcp.types import METHOD_NOT_FOUND as _JSONRPC_METHOD_NOT_FOUND
+except Exception:
+    _JSONRPC_METHOD_NOT_FOUND = -32601
+
+
+def _is_method_not_found_error(exc: BaseException) -> bool:
+    """Return whether an MCP error reports JSON-RPC method-not-found."""
+    error = getattr(exc, "error", None)
+    if getattr(error, "code", None) == _JSONRPC_METHOD_NOT_FOUND:
+        return True
+    message = str(exc).lower()
+    return bool(message) and (
+        str(_JSONRPC_METHOD_NOT_FOUND) in message
+        or "method not found" in message
+        or "unknown method" in message
+        or "not found: ping" in message
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -3990,6 +4011,13 @@ _TRANSPORT_CLOSED_MARKERS: tuple = (
     "broken pipe",
     "end of file",
 )
+_SESSION_EXPIRED_MARKERS: tuple = (
+    "invalid or expired session",
+    "session expired",
+    "expired session",
+    "session not found",
+    "unknown session",
+)
 
 # Upper bound on exception-graph nodes inspected by
 # ``_is_session_expired_error``. The visited-identity set already breaks
@@ -4072,6 +4100,14 @@ def _is_session_expired_error(exc: BaseException) -> bool:
         stack.append(getattr(current, "__context__", None))
 
     return transport_error_found
+
+
+def _is_transport_closed_error(exc: BaseException) -> bool:
+    """Return true for a closed MCP transport or expired server session."""
+    if _is_session_expired_error(exc):
+        return True
+    text = _exc_str(exc).lower()
+    return any(marker in text for marker in _TRANSPORT_CLOSED_MARKERS)
 
 
 def _handle_transport_closed_and_retry(
@@ -5057,7 +5093,7 @@ def _make_tool_handler(server_name: str, tool_name: str, tool_timeout: float):
             _bump_server_error(server_name)
             return tool_error(f"MCP server '{server_name}' is not connected")
 
-        if getattr(server, "_lazy_start", False) and not server.session:
+        if getattr(server, "_lazy_start", False) is True and not server.session:
             if not _ensure_lazy_server_session(server_name, server):
                 error = server._lazy_start_error or "lazy MCP service is unavailable"
                 return tool_error(
@@ -5112,8 +5148,12 @@ def _make_tool_handler(server_name: str, tool_name: str, tool_timeout: float):
             _mark_proven = getattr(server, "_mark_session_proven", None)
             if _mark_proven is not None:
                 _mark_proven()
-            # MCP CallToolResult has .content (list of content blocks) and .isError
-            if result.isError:
+            # MCP SDK 2 uses snake_case fields; accept the camelCase field
+            # emitted by older SDKs and compatibility test doubles as well.
+            result_is_error = getattr(result, "is_error", None)
+            if not isinstance(result_is_error, bool):
+                result_is_error = getattr(result, "isError", False)
+            if bool(result_is_error):
                 error_text = ""
                 for block in (result.content or []):
                     if getattr(block, "text", None):
@@ -5184,6 +5224,11 @@ def _make_tool_handler(server_name: str, tool_name: str, tool_timeout: float):
             # is the primary payload; structuredContent supplements it.
             structured = getattr(result, "structured_content", None)
             if structured is not None:
+                try:
+                    json.dumps(structured)
+                except (TypeError, ValueError):
+                    structured = getattr(result, "structuredContent", None)
+            if structured is not None:
                 if text_result:
                     return json.dumps({
                         "result": text_result,
@@ -5244,8 +5289,7 @@ def _make_tool_handler(server_name: str, tool_name: str, tool_timeout: float):
 def _make_list_resources_handler(server_name: str, tool_timeout: float):
     """Return a sync handler that lists resources from an MCP server."""
 
-    def _handler(args: dict, **kwargs) -> str:
-        server = _get_connected_server_for_call(server_name)
+    def _handler(server: MCPServerTask, args: dict, **kwargs) -> str:
         if not server or not server.session:
             return tool_error(f"MCP server '{server_name}' is not connected")
 
@@ -5300,8 +5344,7 @@ def _make_list_resources_handler(server_name: str, tool_timeout: float):
 def _make_read_resource_handler(server_name: str, tool_timeout: float):
     """Return a sync handler that reads a resource by URI from an MCP server."""
 
-    def _handler(args: dict, **kwargs) -> str:
-        server = _get_connected_server_for_call(server_name)
+    def _handler(server: MCPServerTask, args: dict, **kwargs) -> str:
         if not server or not server.session:
             return tool_error(f"MCP server '{server_name}' is not connected")
 
@@ -5361,8 +5404,7 @@ def _make_read_resource_handler(server_name: str, tool_timeout: float):
 def _make_list_prompts_handler(server_name: str, tool_timeout: float):
     """Return a sync handler that lists prompts from an MCP server."""
 
-    def _handler(args: dict, **kwargs) -> str:
-        server = _get_connected_server_for_call(server_name)
+    def _handler(server: MCPServerTask, args: dict, **kwargs) -> str:
         if not server or not server.session:
             return tool_error(f"MCP server '{server_name}' is not connected")
 
@@ -5422,8 +5464,7 @@ def _make_list_prompts_handler(server_name: str, tool_timeout: float):
 def _make_get_prompt_handler(server_name: str, tool_timeout: float):
     """Return a sync handler that gets a prompt by name from an MCP server."""
 
-    def _handler(args: dict, **kwargs) -> str:
-        server = _get_connected_server_for_call(server_name)
+    def _handler(server: MCPServerTask, args: dict, **kwargs) -> str:
         if not server or not server.session:
             return tool_error(f"MCP server '{server_name}' is not connected")
 
