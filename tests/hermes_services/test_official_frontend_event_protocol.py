@@ -11,6 +11,9 @@ from hermes_services.hosted_event_protocol import normalize_legacy_profile_event
     [
         "notification.show",
         "notification.clear",
+        "gateway.ready",
+        "skin.changed",
+        "reaction",
         "billing.step_up.verification",
         "voice.status",
         "voice.transcript",
@@ -54,6 +57,19 @@ def test_interim_messages_keep_their_streaming_semantics():
 
     assert canonical == "message.interim"
     assert payload["already_streamed"] is True
+
+
+def test_subagent_spawn_request_keeps_queued_semantics():
+    canonical, payload, entity_id = normalize_legacy_profile_event(
+        {
+            "type": "subagent.spawn_requested",
+            "payload": {"child_session_id": "child-1", "profile": "reviewer"},
+        }
+    )
+
+    assert canonical == "subagent.queued"
+    assert entity_id == "child-1"
+    assert payload["source_event_type"] == "subagent.spawn_requested"
 
 
 def test_unknown_gateway_controls_never_become_assistant_text():
