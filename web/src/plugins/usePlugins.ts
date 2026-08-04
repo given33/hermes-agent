@@ -8,7 +8,7 @@
  */
 
 import { useState, useEffect, useMemo, useRef } from "react";
-import { useLocation } from "react-router-dom";
+import { useLocation } from "react-router";
 import { api, HERMES_BASE_PATH } from "@/lib/api";
 import type { PluginManifest, RegisteredPlugin } from "./types";
 import {
@@ -19,6 +19,12 @@ import {
 } from "./registry";
 
 export const MANIFEST_CACHE_KEY = "hermes:plugin-manifests";
+
+function normalizePluginPath(path: string | undefined): string {
+  const pathname = (path ?? "/").trim().split(/[?#]/, 1)[0] ?? "/";
+  const normalized = pathname.replace(/\/+$/, "");
+  return normalized || "/";
+}
 
 export function getCachedManifests(): PluginManifest[] | null {
   try {
@@ -59,6 +65,8 @@ export function canSeedLoadedFromCache(
 }
 
 export function usePlugins() {
+  const { pathname } = useLocation();
+  const normalizedPath = normalizePluginPath(pathname);
   // Lazy initialisers run once at mount — safe to read sessionStorage here.
   // This avoids the "cannot access ref during render" lint error that would
   // occur if we stored the cached value in a useRef and read .current in the

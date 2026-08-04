@@ -386,7 +386,7 @@ export const api = {
     limit = 20,
     offset = 0,
     profileOrOptions: string | SessionQueryOptions = getManagementProfile(),
-    order: "created" | "recent" = "created",
+    order: "created" | "recent" = "recent",
   ) => {
     const options = normalizeSessionQueryOptions(profileOrOptions, order);
     return fetchJSON<PaginatedSessions>(

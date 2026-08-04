@@ -60,12 +60,17 @@ afterEach(() => {
 
 async function renderMessaging() {
   const { MessagingView } = await import('./index')
+  let result: ReturnType<typeof render>
 
-  return render(
-    <MemoryRouter>
-      <MessagingView />
-    </MemoryRouter>
-  )
+  await act(async () => {
+    result = render(
+      <MemoryRouter>
+        <MessagingView />
+      </MemoryRouter>
+    )
+  })
+
+  return result!
 }
 
 describe('MessagingView setup-guide link', () => {
@@ -89,7 +94,9 @@ describe('MessagingView setup-guide link', () => {
     await renderMessaging()
 
     const link = await screen.findByText('Open setup guide')
-    fireEvent.click(link)
+    await act(async () => {
+      fireEvent.click(link)
+    })
 
     await waitFor(() => expect(openExternalLink).toHaveBeenCalledWith(docsUrl))
   })

@@ -267,7 +267,7 @@ function BuyCreditsOutcome({
   if (outcome.kind === 'success') {
     return (
       <div className="mt-2 text-[length:var(--conversation-caption-font-size)] text-(--ui-text-tertiary)">
-        {formatMoney(outcome.amountUsd ?? amount)} added. Balance is refreshing.
+        {`${formatMoney(outcome.amountUsd ?? amount)} added. Balance is refreshing.`}
       </div>
     )
   }

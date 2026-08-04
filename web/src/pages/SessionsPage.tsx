@@ -829,6 +829,7 @@ function SessionsPagination({
 }
 
 export default function SessionsPage() {
+  const navigate = useNavigate();
   const [sessions, setSessions] = useState<SessionInfo[]>([]);
   const [total, setTotal] = useState(0);
   const [page, setPage] = useState(0);
@@ -886,10 +887,15 @@ export default function SessionsPage() {
   const [pruning, setPruning] = useState(false);
   const [importingSessions, setImportingSessions] = useState(false);
   const { toast, showToast } = useToast();
-  const { locale, t } = useI18n();
+  const { t } = useI18n();
   const { setAfterTitle, setEnd } = usePageHeader();
   const { activeAction, actionStatus, dismissLog } = useSystemActions();
   const resumeInChatEnabled = isDashboardEmbeddedChatEnabled();
+  const resumeSessionInChat = useCallback((sessionId: string) => {
+    if (!resumeInChatEnabled) return;
+    if (!queueUnifiedSessionResume(window.sessionStorage, sessionId)) return;
+    navigate(`/chat?resume=${encodeURIComponent(sessionId.trim())}`);
+  }, [navigate, resumeInChatEnabled]);
   const selectedSources = sourceSelectionsByCategory[sessionCategory];
 
   const pinnedSourceSelections = useMemo(
