@@ -35,6 +35,7 @@ from pathlib import Path
 from agent.memory_manager import sanitize_context
 from agent.session_activity import ActivityProvenance
 from agent.message_sanitization import _sanitize_surrogates
+from hermes_runtime.text_safety import strip_internal_memory_context
 from agent.skill_commands import (
     SKILL_EXCERPT_JOINT,
     SKILL_SCAFFOLD_SQL_LIKE,
@@ -147,7 +148,7 @@ def _scrub_surrogates(value: Any) -> Any:
     such code point anywhere in a message aborts the whole write. No-op for
     well-formed text.
     """
-    return sanitize_surrogates(value) if isinstance(value, str) else value
+    return _sanitize_surrogates(value) if isinstance(value, str) else value
 
 
 def workspace_key(row: Dict[str, Any]) -> Optional[str]:
@@ -5184,7 +5185,7 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
 
         # Lone surrogates cannot be bound by sqlite3 (UnicodeEncodeError at
         # UTF-8 encode time) — scrub them like every other write path here.
-        title = sanitize_surrogates(title)
+        title = _sanitize_surrogates(title)
 
         # Remove ASCII control characters (0x00-0x1F, 0x7F) but keep
         # whitespace chars (\t=0x09, \n=0x0A, \r=0x0D) so they can be
@@ -5991,7 +5992,7 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
             # land. Left raw, sqlite3 raises UnicodeEncodeError, the flush is
             # abandoned, and the session silently stops persisting for the
             # rest of its life. Scrub so persistence never fails.
-            return sanitize_surrogates(content)
+            return _sanitize_surrogates(content)
         if content is None or isinstance(content, (bytes, int, float)):
             return content
         try:
@@ -6000,7 +6001,7 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
             return cls._CONTENT_JSON_PREFIX + json.dumps(content)
         except (TypeError, ValueError):
             # Last-resort fallback: stringify so persistence never fails.
-            return sanitize_surrogates(str(content))
+            return _sanitize_surrogates(str(content))
 
     @classmethod
     def _decode_content(cls, content: Any) -> Any:
@@ -6101,6 +6102,21 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
             return None
         return meta
 
+    @staticmethod
+    def _decode_hook_trace(raw: Any) -> Optional[List[Dict[str, Any]]]:
+        """Decode persisted internal-hook audit entries without exposing bad data."""
+        if raw is None:
+            return None
+        try:
+            trace = json.loads(raw) if isinstance(raw, str) else raw
+        except (json.JSONDecodeError, TypeError):
+            logger.warning("Ignoring invalid hook trace on message row")
+            return None
+        if not isinstance(trace, list) or not all(isinstance(item, dict) for item in trace):
+            logger.warning("Ignoring non-list hook trace on message row")
+            return None
+        return trace
+
     def append_message(
         self,
         session_id: str,
@@ -6123,6 +6139,7 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         api_content: Optional[str] = None,
         display_kind: Optional[str] = None,
         display_metadata: Optional[Dict[str, Any]] = None,
+        hook_trace: Optional[List[Dict[str, Any]]] = None,
         compression_lock_holder: Optional[str] = None,
     ) -> int:
         """
@@ -6198,8 +6215,8 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                 """INSERT INTO messages (session_id, role, content, tool_call_id,
                    tool_calls, tool_name, effect_disposition, timestamp, token_count, finish_reason,
                    reasoning, reasoning_content, reasoning_details, codex_reasoning_items,
-                   codex_message_items, platform_message_id, observed, active, api_content, display_kind, display_metadata)
-                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                   codex_message_items, platform_message_id, observed, active, api_content, display_kind, display_metadata, hook_trace)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
                 (
                     session_id,
                     role,
@@ -6222,6 +6239,7 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                     _scrub_surrogates(api_content) if isinstance(api_content, str) else None,
                     _scrub_surrogates(display_kind) if isinstance(display_kind, str) else None,
                     display_metadata_json,
+                    hook_trace_json,
                 ),
             )
             msg_id = cursor.lastrowid
@@ -6630,8 +6648,8 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                 """INSERT INTO messages (session_id, role, content, tool_call_id,
                    tool_calls, tool_name, effect_disposition, timestamp, token_count, finish_reason,
                    reasoning, reasoning_content, reasoning_details, codex_reasoning_items,
-                   codex_message_items, platform_message_id, observed, active, api_content, display_kind, display_metadata)
-                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                   codex_message_items, platform_message_id, observed, active, api_content, display_kind, display_metadata, hook_trace)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
                 (
                     session_id,
                     role,
@@ -6654,6 +6672,7 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                     _scrub_surrogates(api_content) if isinstance(api_content, str) else None,
                     _scrub_surrogates(msg.get("display_kind")) if isinstance(msg.get("display_kind"), str) else None,
                     self._encode_display_metadata(msg.get("display_metadata")),
+                    hook_trace_json,
                 ),
             )
             inserted += 1
@@ -6869,6 +6888,8 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                     msg["tool_calls"] = []
             if msg.get("display_metadata") is not None:
                 msg["display_metadata"] = self._decode_display_metadata(msg["display_metadata"])
+            if msg.get("hook_trace") is not None:
+                msg["hook_trace"] = self._decode_hook_trace(msg["hook_trace"])
             result.append(msg)
         return result
 
@@ -6940,6 +6961,8 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                     msg["tool_calls"] = []
             if msg.get("display_metadata") is not None:
                 msg["display_metadata"] = self._decode_display_metadata(msg["display_metadata"])
+            if msg.get("hook_trace") is not None:
+                msg["hook_trace"] = self._decode_hook_trace(msg["hook_trace"])
             result.append(msg)
 
         # before_rows includes the anchor itself; subtract 1 for the count of
@@ -7104,7 +7127,7 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         "id, role, content, tool_call_id, tool_calls, tool_name, effect_disposition, "
         "finish_reason, reasoning, reasoning_content, reasoning_details, "
         "codex_reasoning_items, codex_message_items, platform_message_id, observed, timestamp, "
-        "api_content, display_kind, display_metadata"
+        "api_content, display_kind, display_metadata, hook_trace"
     )
 
     def _rows_to_conversation(
@@ -7151,6 +7174,10 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                 decoded = self._decode_display_metadata(row["display_metadata"])
                 if decoded is not None:
                     msg["display_metadata"] = decoded
+            if row["hook_trace"]:
+                decoded_trace = self._decode_hook_trace(row["hook_trace"])
+                if decoded_trace is not None:
+                    msg["hook_trace"] = decoded_trace
             if row["timestamp"]:
                 msg["timestamp"] = row["timestamp"]
             if row["tool_call_id"]:

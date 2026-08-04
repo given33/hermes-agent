@@ -758,3 +758,10 @@ def _process_hermes_home() -> Path:
         return get_hermes_home()
     except Exception:
         return Path.home() / ".hermes"
+
+
+# Register the optional external-secret snapshot provider with the low-level
+# scope module without creating a runtime -> CLI import edge.
+from hermes_runtime.secret_scope import register_external_secret_loader
+
+register_external_secret_loader(get_secret_source_values)

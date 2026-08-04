@@ -272,7 +272,8 @@ CREATE TABLE IF NOT EXISTS messages (
     compacted INTEGER NOT NULL DEFAULT 0,
     api_content TEXT,
     display_kind TEXT,
-    display_metadata TEXT
+    display_metadata TEXT,
+    hook_trace TEXT
 );
 
 CREATE TABLE IF NOT EXISTS session_model_usage (

@@ -144,6 +144,26 @@ def detect_api_mode_for_url(base_url: str) -> Optional[str]:
     return _detect_api_mode_for_url(base_url)
 
 
+def _fallback_api_mode(provider: str, base_url: str, model: str = "") -> str:
+    """Use URL mandates first, then the provider's declared transport."""
+    detected = _detect_api_mode_for_url(base_url)
+    if detected:
+        return detected
+    from agent.provider_registry import determine_api_mode
+
+    return determine_api_mode(provider, base_url, model) or "chat_completions"
+
+
+def resolve_nous_runtime_credentials(**_kwargs: Any) -> Dict[str, Any]:
+    """Compatibility boundary for direct Nous API-key credentials.
+
+    The retired Portal OAuth flow is intentionally not restored. Keeping this
+    seam lets older callers and tests inject credentials without changing the
+    direct-key product policy.
+    """
+    return resolve_api_key_provider_credentials("nous")
+
+
 def _resolve_plain_custom_api_mode(model_cfg: Dict[str, Any], base_url: str) -> str:
     """Resolve api_mode for legacy/plain ``provider: custom`` endpoints.
 
@@ -459,7 +479,7 @@ def _resolve_runtime_from_pool_entry(
     elif provider == "xai":
         api_mode = "codex_responses"
     elif provider == "nous":
-        api_mode = "chat_completions"
+        api_mode = _fallback_api_mode("nous", base_url, effective_model)
         base_url = _nous_inference_base_url_override() or base_url
     elif provider == "copilot":
         api_mode = _copilot_runtime_api_mode(model_cfg, getattr(entry, "runtime_api_key", ""))
@@ -1393,6 +1413,7 @@ def _resolve_explicit_runtime(
     model_cfg: Dict[str, Any],
     explicit_api_key: Optional[str] = None,
     explicit_base_url: Optional[str] = None,
+    target_model: Optional[str] = None,
 ) -> Optional[Dict[str, Any]]:
     explicit_api_key = str(explicit_api_key or "").strip()
     explicit_base_url = str(explicit_base_url or "").strip().rstrip("/")
@@ -1466,7 +1487,11 @@ def _resolve_explicit_runtime(
             )
         return {
             "provider": "nous",
-            "api_mode": "chat_completions",
+            "api_mode": _fallback_api_mode(
+                "nous",
+                base_url,
+                target_model or str(model_cfg.get("default") or ""),
+            ),
             "base_url": base_url.rstrip("/"),
             "api_key": api_key,
             "source": "api-key",
@@ -1503,7 +1528,11 @@ def _resolve_explicit_runtime(
             if not base_url:
                 base_url = creds.get("base_url", "").rstrip("/")
 
-        api_mode = "chat_completions"
+        api_mode = _fallback_api_mode(
+            provider,
+            base_url,
+            target_model or str(model_cfg.get("default") or ""),
+        )
         if provider == "copilot":
             api_mode = _copilot_runtime_api_mode(model_cfg, api_key)
         elif provider == "xai":
@@ -1515,13 +1544,6 @@ def _resolve_explicit_runtime(
                 model_cfg.get("provider"),
             ):
                 api_mode = configured_mode
-            else:
-                # Auto-detect from URL (Anthropic /anthropic suffix,
-                # api.openai.com → Responses, Kimi /coding, etc.).
-                detected = _detect_api_mode_for_url(base_url)
-                if detected:
-                    api_mode = detected
-
         return {
             "provider": provider,
             "api_mode": api_mode,
@@ -1710,6 +1732,7 @@ def resolve_runtime_provider(
         model_cfg=model_cfg,
         explicit_api_key=explicit_api_key,
         explicit_base_url=explicit_base_url,
+        target_model=target_model,
     )
     if explicit_runtime:
         return explicit_runtime
@@ -1999,7 +2022,11 @@ def resolve_runtime_provider(
     # API-key providers (z.ai/GLM, Kimi, MiniMax, MiniMax-CN)
     pconfig = PROVIDER_REGISTRY.get(provider)
     if pconfig and pconfig.auth_type == "api_key":
-        creds = resolve_api_key_provider_credentials(provider)
+        creds = (
+            resolve_nous_runtime_credentials()
+            if provider == "nous"
+            else resolve_api_key_provider_credentials(provider)
+        )
         # An explicitly selected API-key provider is authoritative. Returning
         # a runtime with an empty key defers failure until the first request and
         # can make a later fallback look like a silent provider switch. Fail at
@@ -2036,7 +2063,11 @@ def resolve_runtime_provider(
         if cfg_provider == provider:
             cfg_base_url = (model_cfg.get("base_url") or "").strip().rstrip("/")
         base_url = cfg_base_url or creds.get("base_url", "").rstrip("/")
-        api_mode = "chat_completions"
+        api_mode = _fallback_api_mode(
+            provider,
+            base_url,
+            target_model or str(model_cfg.get("default") or ""),
+        )
         if provider == "copilot":
             api_mode = _copilot_runtime_api_mode(model_cfg, creds.get("api_key", ""))
         elif provider == "xai":
@@ -2059,13 +2090,6 @@ def resolve_runtime_provider(
                 api_mode = opencode_model_api_mode(provider, _effective)
             elif configured_mode and _provider_supports_explicit_api_mode(provider, configured_provider):
                 api_mode = configured_mode
-            else:
-                # Auto-detect Anthropic-compatible endpoints by URL convention
-                # (e.g. https://api.minimax.io/anthropic, https://dashscope.../anthropic)
-                # plus api.openai.com → codex_responses and api.x.ai → codex_responses.
-                detected = _detect_api_mode_for_url(base_url)
-                if detected:
-                    api_mode = detected
         # Normalize the /v1 suffix for OpenCode by API mode (see comment above).
         if provider in {"opencode-zen", "opencode-go"}:
             from agent.model_catalog import normalize_opencode_base_url

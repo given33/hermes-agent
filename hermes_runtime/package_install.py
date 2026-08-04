@@ -15,7 +15,7 @@ import subprocess
 import sys
 from typing import Sequence
 
-from hermes_runtime.subprocess_compat import windows_hide_flags
+from hermes_runtime.subprocess_compat import resolve_managed_uv, windows_hide_flags
 
 __all__ = ["install_python_packages"]
 
@@ -34,7 +34,13 @@ def install_python_packages(
     venv_root = Path(sys.executable).parent.parent
     uv_env = {**os.environ, "VIRTUAL_ENV": str(venv_root)}
 
-    uv_bin = shutil.which("uv")
+    uv_bin = resolve_managed_uv()
+    if uv_bin is None:
+        # A package-manager uv (for example Termux's) is a valid fallback when
+        # Hermes has not provisioned its private binary yet. Keep the managed
+        # path authoritative whenever it exists.
+        path_lookup = getattr(shutil, "which")
+        uv_bin = path_lookup("uv")
     if uv_bin:
         try:
             result = subprocess.run(

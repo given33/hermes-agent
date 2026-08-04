@@ -23,6 +23,7 @@ Design rationale lives in ``docs/design/multiplexing-gateway.md`` (Workstream A)
 from __future__ import annotations
 
 import os
+import re
 from contextvars import ContextVar, Token
 from pathlib import Path
 from typing import Dict, Mapping, Optional
@@ -55,6 +56,17 @@ def is_multiplex_active() -> bool:
 _SECRET_SCOPE: ContextVar[Optional[Mapping[str, str]]] = ContextVar(
     "_SECRET_SCOPE", default=None
 )
+
+# Optional integration hook installed by the higher-level dotenv loader. The
+# runtime foundation must not import that loader back, but profile scopes still
+# need its per-home external-secret snapshots when the integration is present.
+_EXTERNAL_SECRET_VALUES_LOADER = None
+
+
+def register_external_secret_loader(loader) -> None:
+    """Register a callable returning external secrets for one Hermes home."""
+    global _EXTERNAL_SECRET_VALUES_LOADER
+    _EXTERNAL_SECRET_VALUES_LOADER = loader
 
 
 class UnscopedSecretError(RuntimeError):
@@ -100,6 +112,10 @@ _GLOBAL_ENV_EXACT = frozenset({
     "HERMES_MAX_ITERATIONS", "HERMES_MAX_TOKENS", "HERMES_API_TIMEOUT",
     "HERMES_REDACT_SECRETS", "HERMES_NOUS_TIMEOUT_SECONDS",
     "_HERMES_GATEWAY",
+    # API-server listener settings are deployment configuration, not per-profile
+    # credentials. API_SERVER_KEY deliberately remains profile-scoped.
+    "API_SERVER_ENABLED", "API_SERVER_HOST", "API_SERVER_PORT",
+    "API_SERVER_CORS_ORIGINS",
     # OS / interpreter
     "PATH", "HOME", "USER", "LANG", "LC_ALL", "TZ", "PWD", "SHELL", "TMPDIR",
     "VIRTUAL_ENV", "PYTHONPATH", "SSL_CERT_FILE",
@@ -144,6 +160,13 @@ def get_secret(name: str, default: Optional[str] = None) -> Optional[str]:
     scope = _SECRET_SCOPE.get()
     if scope is not None:
         val = scope.get(name)
+        if val is not None:
+            return val
+        if _MULTIPLEX_ACTIVE:
+            return default
+        # A single-profile scope is an .env overlay. Let process-level secrets
+        # (for example systemd Environment=) continue to work in cron jobs.
+        val = os.environ.get(name)
         return val if val is not None else default
 
     if _MULTIPLEX_ACTIVE:
@@ -160,6 +183,50 @@ def get_secret(name: str, default: Optional[str] = None) -> Optional[str]:
     return val if val is not None else default
 
 
+def _strip_inline_comment(value: str) -> str:
+    """Strip dotenv-style comments without corrupting quoted secret values."""
+    value = value.strip()
+    if not value:
+        return value
+    quote = value[0]
+    if quote in ("'", '"'):
+        index = 1
+        while index < len(value):
+            char = value[index]
+            if quote == '"' and char == "\\":
+                index += 2
+                continue
+            if char == quote:
+                remainder = value[index + 1 :].lstrip()
+                return value[: index + 1] if remainder.startswith("#") else value
+            index += 1
+        return value
+    return re.split(r"\s+#", value, maxsplit=1)[0].strip()
+
+
+def _parse_env_value(raw_value: str) -> str:
+    """Parse the small dotenv value subset written by Hermes."""
+    value = raw_value.strip()
+    if len(value) >= 2 and value[0] == value[-1] == '"':
+        quoted = value[1:-1]
+        parsed: list[str] = []
+        index = 0
+        while index < len(quoted):
+            char = quoted[index]
+            if char == "\\" and index + 1 < len(quoted):
+                next_char = quoted[index + 1]
+                if next_char in {'"', "\\"}:
+                    parsed.append(next_char)
+                    index += 2
+                    continue
+            parsed.append(char)
+            index += 1
+        return "".join(parsed)
+    if len(value) >= 2 and value[0] == value[-1] == "'":
+        return value[1:-1]
+    return value
+
+
 def load_env_file(env_path: Path) -> Dict[str, str]:
     """Parse a ``.env`` file into a plain dict WITHOUT touching ``os.environ``.
 
@@ -170,7 +237,7 @@ def load_env_file(env_path: Path) -> Dict[str, str]:
     """
     secrets: Dict[str, str] = {}
     try:
-        text = env_path.read_text(encoding="utf-8")
+        text = env_path.read_text(encoding="utf-8-sig")
     except (FileNotFoundError, OSError, UnicodeDecodeError):
         return secrets
 
@@ -186,10 +253,7 @@ def load_env_file(env_path: Path) -> Dict[str, str]:
         key = key.strip()
         if not key:
             continue
-        value = value.strip()
-        if len(value) >= 2 and value[0] == value[-1] and value[0] in ("'", '"'):
-            value = value[1:-1]
-        secrets[key] = value
+        secrets[key] = _parse_env_value(_strip_inline_comment(value))
 
     return secrets
 
@@ -201,4 +265,17 @@ def build_profile_secret_scope(hermes_home: Path) -> Dict[str, str]:
     global vars are intentionally NOT copied in — ``get_secret`` reads those
     from ``os.environ`` directly, so the scope holds only profile secrets.
     """
-    return load_env_file(Path(hermes_home) / ".env")
+    home = Path(hermes_home)
+    secrets = load_env_file(home / ".env")
+    loader = _EXTERNAL_SECRET_VALUES_LOADER
+    if loader is None:
+        external_secrets = {}
+    else:
+        try:
+            external_secrets = loader(home)
+        except Exception:
+            external_secrets = {}
+    for key, value in external_secrets.items():
+        if not _is_global_env(key):
+            secrets[key] = value
+    return secrets

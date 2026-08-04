@@ -10,6 +10,8 @@ from typing import Any
 
 from agent import moa_config as _implementation
 
+DEFAULT_MOA_PRESET_NAME = _implementation.DEFAULT_MOA_PRESET_NAME
+
 DEFAULT_MOA_REFERENCE_MODELS: list[dict[str, str]] = [
     {"provider": "openai-codex", "model": "gpt-5.5"},
     {"provider": "openrouter", "model": "deepseek/deepseek-v4-pro"},

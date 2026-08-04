@@ -116,6 +116,35 @@ _API_CALL_MODULES = frozenset({
 })
 
 
+def _hosted_should_retry_client_error(agent: Any, status_code: Any) -> bool:
+    """Limit the mobile key-replacement grace period to hosted 401/403 turns."""
+    return bool(
+        (
+            getattr(agent, "_api_retry_client_errors", False)
+            or getattr(agent, "_hosted_retry_client_errors", False)
+        )
+        and status_code in {401, 403}
+    )
+
+
+def _model_retry_wait_seconds(
+    agent: Any,
+    *,
+    retry_after: Optional[float],
+    retry_count: int,
+) -> float:
+    """Resolve one retry delay while preserving provider Retry-After hints."""
+    configured_delay = getattr(agent, "_api_retry_delay_seconds", None)
+    if configured_delay is None:
+        configured_delay = getattr(agent, "_hosted_retry_delay_seconds", None)
+    if configured_delay is not None:
+        delay = max(0.0, float(configured_delay))
+        return max(delay, float(retry_after or 0.0))
+    if retry_after is not None:
+        return float(retry_after)
+    return jittered_backoff(retry_count, base_delay=2.0, max_delay=60.0)
+
+
 def _apply_active_turn_redirect(agent: Any, messages: List[Dict[str, Any]], text: str) -> None:
     """Append a provider-safe checkpoint and correction to the live turn.
 

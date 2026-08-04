@@ -553,6 +553,11 @@ def is_routing_aggregator(provider: str) -> bool:
     return is_aggregator(provider_norm)
 
 
+def is_official_openai_host(base_url: str) -> bool:
+    """Return whether a URL belongs to OpenAI's official API host family."""
+    return base_url_host_matches(base_url, "api.openai.com")
+
+
 def host_mandated_api_mode(base_url: str = "") -> Optional[str]:
     """Return the wire protocol a specific endpoint *requires*, or None.
 
@@ -580,14 +585,21 @@ def host_mandated_api_mode(base_url: str = "") -> Optional[str]:
         return "anthropic_messages"
     if hostname == "api.anthropic.com" or url_lower.endswith("/anthropic"):
         return "anthropic_messages"
-    if hostname == "api.openai.com":
+    if is_official_openai_host(base_url):
         return "codex_responses"
     if hostname.startswith("bedrock-runtime.") and base_url_host_matches(base_url, "amazonaws.com"):
         return "bedrock_converse"
     return None
 
 
-def determine_api_mode(provider: str, base_url: str = "") -> str:
+def nous_api_mode(model: str = "") -> str:
+    """Select the native Messages wire for Nous ``anthropic/*`` models."""
+    if str(model or "").strip().lower().startswith("anthropic/"):
+        return "anthropic_messages"
+    return "chat_completions"
+
+
+def determine_api_mode(provider: str, base_url: str = "", model: str = "") -> str:
     """Determine the API mode (wire protocol) for a provider/endpoint.
 
     Resolution order:
@@ -599,6 +611,10 @@ def determine_api_mode(provider: str, base_url: str = "") -> str:
     mandated = host_mandated_api_mode(base_url)
     if mandated is not None:
         return mandated
+
+    provider_norm = (provider or "").strip().lower()
+    if provider_norm in {"nous", "nous-portal", "nousresearch"}:
+        return nous_api_mode(model)
 
     pdef = get_provider(provider)
     if pdef is not None:

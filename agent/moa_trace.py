@@ -42,7 +42,7 @@ def _traces_enabled_and_dir() -> Optional[Path]:
     ``moa.trace_dir`` overrides the default ``<hermes_home>/moa-traces/``.
     """
     try:
-        from hermes_runtime.config import load_config
+        from hermes_cli.config import load_config
 
         moa_cfg = (load_config() or {}).get("moa") or {}
     except Exception:  # pragma: no cover - defensive: never break a turn over tracing

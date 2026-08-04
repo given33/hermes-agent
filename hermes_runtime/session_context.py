@@ -73,6 +73,7 @@ def session_context_engaged() -> bool:
 _SESSION_PLATFORM: ContextVar = ContextVar("HERMES_SESSION_PLATFORM", default=_UNSET)
 _SESSION_SOURCE: ContextVar = ContextVar("HERMES_SESSION_SOURCE", default=_UNSET)
 _SESSION_CHAT_ID: ContextVar = ContextVar("HERMES_SESSION_CHAT_ID", default=_UNSET)
+_SESSION_CHAT_TYPE: ContextVar = ContextVar("HERMES_SESSION_CHAT_TYPE", default=_UNSET)
 _SESSION_CHAT_NAME: ContextVar = ContextVar("HERMES_SESSION_CHAT_NAME", default=_UNSET)
 _SESSION_THREAD_ID: ContextVar = ContextVar("HERMES_SESSION_THREAD_ID", default=_UNSET)
 _SESSION_USER_ID: ContextVar = ContextVar("HERMES_SESSION_USER_ID", default=_UNSET)
@@ -105,6 +106,10 @@ _TOOL_ARTIFACT_CONVERSATION: ContextVar = ContextVar(
 _TOOL_ARTIFACT_TURN: ContextVar = ContextVar("HERMES_TOOL_ARTIFACT_TURN", default=_UNSET)
 _ACCOUNT_GENERATION: ContextVar = ContextVar("HERMES_ACCOUNT_GENERATION", default=_UNSET)
 
+# Per-session cron marker. ``_UNSET`` preserves the legacy environment fallback;
+# an explicit empty string masks stale process-global state for normal sessions.
+_CRON_SESSION: ContextVar = ContextVar("HERMES_CRON_SESSION", default=_UNSET)
+
 # Whether the current session's delivery channel can route an ASYNC completion
 # back to the agent AFTER the current turn ends (i.e. wake a fresh turn).
 #
@@ -136,6 +141,7 @@ _VAR_MAP = {
     "HERMES_SESSION_PLATFORM": _SESSION_PLATFORM,
     "HERMES_SESSION_SOURCE": _SESSION_SOURCE,
     "HERMES_SESSION_CHAT_ID": _SESSION_CHAT_ID,
+    "HERMES_SESSION_CHAT_TYPE": _SESSION_CHAT_TYPE,
     "HERMES_SESSION_CHAT_NAME": _SESSION_CHAT_NAME,
     "HERMES_SESSION_THREAD_ID": _SESSION_THREAD_ID,
     "HERMES_SESSION_USER_ID": _SESSION_USER_ID,
@@ -150,6 +156,7 @@ _VAR_MAP = {
     "HERMES_TOOL_ARTIFACT_CONVERSATION": _TOOL_ARTIFACT_CONVERSATION,
     "HERMES_TOOL_ARTIFACT_TURN": _TOOL_ARTIFACT_TURN,
     "HERMES_ACCOUNT_GENERATION": _ACCOUNT_GENERATION,
+    "HERMES_CRON_SESSION": _CRON_SESSION,
     "HERMES_CRON_AUTO_DELIVER_PLATFORM": _CRON_AUTO_DELIVER_PLATFORM,
     "HERMES_CRON_AUTO_DELIVER_CHAT_ID": _CRON_AUTO_DELIVER_CHAT_ID,
     "HERMES_CRON_AUTO_DELIVER_THREAD_ID": _CRON_AUTO_DELIVER_THREAD_ID,
@@ -180,6 +187,7 @@ def set_session_vars(
     platform: str = "",
     source: str = "",
     chat_id: str = "",
+    chat_type: str = "",
     chat_name: str = "",
     thread_id: str = "",
     user_id: str = "",
@@ -196,6 +204,7 @@ def set_session_vars(
     tool_artifact_conversation: str = "",
     tool_artifact_turn: str = "",
     account_generation: str = "",
+    cron_session: Any = _UNSET,
 ) -> list:
     """Set all session context variables and return reset tokens.
 
@@ -221,6 +230,7 @@ def set_session_vars(
         _SESSION_PLATFORM.set(platform),
         _SESSION_SOURCE.set(source),
         _SESSION_CHAT_ID.set(chat_id),
+        _SESSION_CHAT_TYPE.set(chat_type),
         _SESSION_CHAT_NAME.set(chat_name),
         _SESSION_THREAD_ID.set(thread_id),
         _SESSION_USER_ID.set(user_id),
@@ -235,6 +245,7 @@ def set_session_vars(
         _TOOL_ARTIFACT_CONVERSATION.set(tool_artifact_conversation),
         _TOOL_ARTIFACT_TURN.set(tool_artifact_turn),
         _ACCOUNT_GENERATION.set(account_generation),
+        _CRON_SESSION.set(cron_session),
         _SESSION_ASYNC_DELIVERY.set(bool(async_delivery)),
     ]
     try:
@@ -261,6 +272,7 @@ def clear_session_vars(tokens: list) -> None:
         _SESSION_PLATFORM,
         _SESSION_SOURCE,
         _SESSION_CHAT_ID,
+        _SESSION_CHAT_TYPE,
         _SESSION_CHAT_NAME,
         _SESSION_THREAD_ID,
         _SESSION_USER_ID,
@@ -275,6 +287,7 @@ def clear_session_vars(tokens: list) -> None:
         _TOOL_ARTIFACT_CONVERSATION,
         _TOOL_ARTIFACT_TURN,
         _ACCOUNT_GENERATION,
+        _CRON_SESSION,
     ):
         var.set("")
     # Reset async-delivery capability to the "never set" sentinel rather than a

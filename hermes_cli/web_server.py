@@ -358,19 +358,17 @@ def _resolve_session_token() -> str:
     return os.environ.get("HERMES_DASHBOARD_SESSION_TOKEN") or secrets.token_urlsafe(32)
 
 
-def _build_dashboard_http_boundary(session_token: str):
-    application = HermesApplicationKernel.for_http(
+def _build_dashboard_application(session_token: str):
+    return HermesApplicationKernel.for_http(
         surface="dashboard",
         bearer_secret=session_token,
         compatibility_mode=os.environ.get("HERMES_HTTP_CONTRACT_MODE", "dual"),
     )
-    return application, application.require_http_boundary()
 
 
 _SESSION_TOKEN = _resolve_session_token()
-_DASHBOARD_APPLICATION, _DASHBOARD_HTTP_BOUNDARY = _build_dashboard_http_boundary(
-    _SESSION_TOKEN
-)
+_DASHBOARD_APPLICATION = _build_dashboard_application(_SESSION_TOKEN)
+_DASHBOARD_HTTP_BOUNDARY = _DASHBOARD_APPLICATION.require_http_boundary()
 _SESSION_HEADER_NAME = "X-Hermes-Session-Token"
 _SSH_OWNER_NONCE: Optional[str] = None
 
@@ -379,9 +377,8 @@ def _apply_ssh_session_token(token: str) -> None:
     global _SESSION_TOKEN, _DASHBOARD_APPLICATION, _DASHBOARD_HTTP_BOUNDARY
     if token:
         _SESSION_TOKEN = token
-        _DASHBOARD_APPLICATION, _DASHBOARD_HTTP_BOUNDARY = (
-            _build_dashboard_http_boundary(token)
-        )
+        _DASHBOARD_APPLICATION = _build_dashboard_application(token)
+        _DASHBOARD_HTTP_BOUNDARY = _DASHBOARD_APPLICATION.require_http_boundary()
         runtime_state = globals().get("_RUNTIME_STATE")
         if runtime_state is not None:
             runtime_state.set_session_token(token)
@@ -12708,6 +12705,48 @@ async def _run_cron_dashboard_io(func, *args, **kwargs):
     if inspect.isawaitable(result):
         raise TypeError("_run_cron_dashboard_io sync callable returned an awaitable")
     return result
+
+
+async def _accept_dashboard_cron_fire_request(request: Request, verifier=None):
+    """Adapt the shared Chronos fire flow to the FastAPI dashboard."""
+    try:
+        body = await request.json()
+    except Exception:
+        body = {}
+
+    async def resolve_target(command):
+        return await _run_cron_dashboard_io(_find_cron_job_profile, command.job_id)
+
+    async def execute(command, profile):
+        if profile is None:
+            return
+        await asyncio.to_thread(
+            _fire_cron_job_for_profile,
+            profile,
+            command.job_id,
+            command.fire_at,
+        )
+
+    accepted = await accept_cron_fire_request(
+        request.headers.get("Authorization", ""),
+        body,
+        execute=execute,
+        resolve_target=resolve_target,
+        config=load_config(),
+        verifier=verifier,
+    )
+    task = accepted.background_task
+    if task is not None:
+        def _log_cron_task_failure(done_task):
+            try:
+                done_task.result()
+            except asyncio.CancelledError:
+                return
+            except Exception:
+                _log.exception("dashboard cron fire execution failed")
+
+        task.add_done_callback(_log_cron_task_failure)
+    return JSONResponse(dict(accepted.body), status_code=accepted.status_code)
 
 
 from hermes_cli.web_routers import cron as _cron_routes  # noqa: E402

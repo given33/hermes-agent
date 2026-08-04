@@ -3296,7 +3296,7 @@ def run_job(
     # statement raises.  A leaked writer would deadlock the whole scheduler
     # (every future job blocks on acquire_*); a leaked reader blocks all
     # future writers.  Acquire itself can't leak (it either blocks or returns).
-    _cron_session_var = _VAR_MAP["HERMES_CRON_SESSION"]
+    _cron_session_var = SESSION_CONTEXT_VARS["HERMES_CRON_SESSION"]
     _cron_session_token = None
     try:
         # Scope cron approval policy to this job. Keep the token so the finally
@@ -3369,7 +3369,7 @@ def run_job(
                     _cfg = managed_scope.apply_managed_overlay(_cfg)
                 except Exception:
                     pass
-                _cfg = expand_env_vars(_cfg)
+                _cfg = _expand_env_vars(_cfg)
                 # Coerce null/missing to {} so a falsy default never
                 # clobbers an already-resolved env value with ``None``.
                 _model_cfg = _cfg.get("model") or {}

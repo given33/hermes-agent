@@ -49,7 +49,7 @@ from hermes_runtime.config import (
     read_raw_config,
     require_readable_config_before_write,
 )
-from hermes_constants import OPENROUTER_BASE_URL, secure_parent_dir
+from hermes_constants import AI_GATEWAY_BASE_URL, OPENROUTER_BASE_URL, secure_parent_dir
 from hermes_services.auth import (
     AuthError,
     CODEX_RATE_LIMITED_CODE,
@@ -444,6 +444,14 @@ PROVIDER_REGISTRY: Dict[str, ProviderConfig] = {
         inference_base_url="",  # User-provided endpoint
         api_key_env_vars=("AZURE_FOUNDRY_API_KEY",),
         base_url_env_var="AZURE_FOUNDRY_BASE_URL",
+    ),
+    "ai-gateway": ProviderConfig(
+        id="ai-gateway",
+        name="Vercel AI Gateway",
+        auth_type="api_key",
+        inference_base_url=AI_GATEWAY_BASE_URL,
+        api_key_env_vars=("AI_GATEWAY_API_KEY",),
+        base_url_env_var="AI_GATEWAY_BASE_URL",
     ),
 }
 
@@ -3791,6 +3799,26 @@ def resolve_codex_runtime_credentials(
             }
         pool_rate_limit = _codex_pool_rate_limit_status()
         if pool_rate_limit:
+            frozen_token = str(pool_rate_limit.get("access_token") or "").strip()
+            base_url = (
+                os.getenv("HERMES_CODEX_BASE_URL", "").strip().rstrip("/")
+                or DEFAULT_CODEX_BASE_URL
+            )
+            if frozen_token and _probe_codex_quota_restored(
+                frozen_token,
+                base_url=base_url,
+            ) is True:
+                clear_codex_pool_quota_cooldowns(frozen_token)
+                pool_token = _pool_codex_access_token()
+                if pool_token:
+                    return {
+                        "provider": "openai-codex",
+                        "base_url": base_url,
+                        "api_key": pool_token,
+                        "source": "credential_pool",
+                        "last_refresh": None,
+                        "auth_mode": "chatgpt",
+                    }
             reset_at = pool_rate_limit.get("reset_at")
             if isinstance(reset_at, (int, float)) and reset_at > time.time():
                 remaining = int(reset_at - time.time())
@@ -3855,6 +3883,133 @@ def resolve_codex_runtime_credentials(
     }
 
 
+def _is_codex_rate_limit_shaped(code: Any, reason: Any, message: Any) -> bool:
+    """Return whether persisted pool metadata represents quota exhaustion."""
+    reason_l = str(reason or "").lower()
+    message_l = str(message or "").lower()
+    return (
+        code == 429
+        or "rate_limit" in reason_l
+        or "usage_limit" in reason_l
+        or "quota" in reason_l
+        or "rate limit" in message_l
+        or "usage limit" in message_l
+        or "quota" in message_l
+    )
+
+
+CODEX_QUOTA_PROBE_MIN_INTERVAL_SECONDS = 300
+_codex_quota_probe_cache: Dict[str, Tuple[float, Optional[bool]]] = {}
+_codex_quota_probe_lock = threading.Lock()
+
+
+def _codex_usage_probe_url(base_url: Optional[str]) -> str:
+    """Resolve the usage endpoint used by the Codex CLI backend."""
+    normalized = str(base_url or "").strip().rstrip("/")
+    if not normalized:
+        normalized = (
+            os.getenv("HERMES_CODEX_BASE_URL", "").strip().rstrip("/")
+            or DEFAULT_CODEX_BASE_URL
+        )
+    if normalized.endswith("/codex"):
+        normalized = normalized[: -len("/codex")]
+    prefix = normalized + ("/wham" if "/backend-api" in normalized else "/api/codex")
+    return prefix + "/usage"
+
+
+def _probe_codex_quota_restored(
+    access_token: Any,
+    *,
+    base_url: Optional[str] = None,
+    min_interval_seconds: float = CODEX_QUOTA_PROBE_MIN_INTERVAL_SECONDS,
+) -> Optional[bool]:
+    """Probe whether an upstream Codex quota window reopened early."""
+    token = str(access_token or "").strip()
+    if not token or not _decode_jwt_claims(token):
+        return None
+    cache_key = hashlib.sha256(token.encode("utf-8")).hexdigest()[:16]
+    now = time.monotonic()
+    with _codex_quota_probe_lock:
+        cached = _codex_quota_probe_cache.get(cache_key)
+        if cached is not None and now - cached[0] < min_interval_seconds:
+            return cached[1]
+        _codex_quota_probe_cache[cache_key] = (now, None)
+
+    result: Optional[bool] = None
+    try:
+        headers = {
+            "Authorization": f"Bearer {token}",
+            "Accept": "application/json",
+            "User-Agent": "codex-cli",
+        }
+        claims = _decode_jwt_claims(token)
+        auth_claims = claims.get("https://api.openai.com/auth")
+        account_id = (
+            auth_claims.get("chatgpt_account_id")
+            if isinstance(auth_claims, dict)
+            else None
+        )
+        if isinstance(account_id, str) and account_id.strip():
+            headers["ChatGPT-Account-Id"] = account_id.strip()
+        with httpx.Client(timeout=10.0) as client:
+            response = client.get(_codex_usage_probe_url(base_url), headers=headers)
+        if response.status_code == 200:
+            payload = response.json() or {}
+            rate_limit = payload.get("rate_limit") or {}
+            used_values = []
+            for key in ("primary_window", "secondary_window"):
+                used = (rate_limit.get(key) or {}).get("used_percent")
+                if isinstance(used, (int, float)):
+                    used_values.append(float(used))
+            if used_values:
+                result = max(used_values) < 100.0
+        elif response.status_code == 429:
+            result = False
+    except Exception:
+        logger.debug("Codex quota probe failed", exc_info=True)
+    with _codex_quota_probe_lock:
+        _codex_quota_probe_cache[cache_key] = (now, result)
+    return result
+
+
+def clear_codex_pool_quota_cooldowns(access_token: Optional[str] = None) -> int:
+    """Clear only quota-shaped cooldowns from persisted Codex pool entries."""
+    cleared = 0
+    try:
+        with _auth_store_lock():
+            auth_store = _load_auth_store()
+            pool = auth_store.get("credential_pool")
+            entries = pool.get("openai-codex") if isinstance(pool, dict) else None
+            if not isinstance(entries, list):
+                return 0
+            for entry in entries:
+                if not isinstance(entry, dict) or entry.get("last_status") != "exhausted":
+                    continue
+                if access_token and str(entry.get("access_token") or "") != access_token:
+                    continue
+                if not _is_codex_rate_limit_shaped(
+                    entry.get("last_error_code"),
+                    entry.get("last_error_reason"),
+                    entry.get("last_error_message"),
+                ):
+                    continue
+                for key in (
+                    "last_status",
+                    "last_status_at",
+                    "last_error_code",
+                    "last_error_reason",
+                    "last_error_message",
+                    "last_error_reset_at",
+                ):
+                    entry[key] = None
+                cleared += 1
+            if cleared:
+                _save_auth_store(auth_store)
+    except Exception:
+        logger.debug("Failed to clear Codex pool quota cooldowns", exc_info=True)
+    return cleared
+
+
 def _codex_pool_rate_limit_status() -> Optional[Dict[str, Any]]:
     """Return metadata for a pool-only Codex credential in quota cooldown."""
     def _parse_reset_at(value: Any) -> Optional[float]:
@@ -3917,6 +4072,7 @@ def _codex_pool_rate_limit_status() -> Optional[Dict[str, Any]]:
             if reset_at is not None and reset_at <= now:
                 continue
             return {
+                "access_token": token,
                 "label": entry.get("label"),
                 "last_refresh": entry.get("last_refresh"),
                 "reset_at": reset_at,
@@ -8225,8 +8381,8 @@ def step_up_nous_billing_scope(
     return isinstance(granted, str) and NOUS_BILLING_MANAGE_SCOPE in granted.split()
 
 
-def _login_nous(args, pconfig: ProviderConfig) -> None:
-    """Nous Portal device authorization flow."""
+def _legacy_login_nous(args, pconfig: ProviderConfig) -> None:
+    """Retained implementation for migration tooling; never a product entry point."""
     timeout_seconds = getattr(args, "timeout", None) or 15.0
     insecure = bool(getattr(args, "insecure", False))
     ca_bundle = (
@@ -8427,6 +8583,17 @@ def _login_nous(args, pconfig: ProviderConfig) -> None:
     except Exception as exc:
         print(f"Login failed: {exc}")
         raise SystemExit(1)
+
+
+def _login_nous(args, pconfig: ProviderConfig) -> None:
+    """Reject the retired Nous Portal device authorization flow."""
+    del args, pconfig
+    raise AuthError(
+        "Nous account login is disabled. Configure a direct inference API key "
+        "with `NOUS_API_KEY` or `hermes auth add nous --type api-key`.",
+        provider="nous",
+        relogin_required=False,
+    )
 
 
 def logout_command(args) -> None:

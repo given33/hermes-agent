@@ -47,7 +47,7 @@ import time
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
-from utils import atomic_write_text, atomic_yaml_write
+from utils import atomic_write_text, atomic_yaml_write, fast_safe_load
 
 logger = logging.getLogger(__name__)
 
@@ -116,8 +116,6 @@ def load_yaml_file(path: Path) -> Dict[str, Any]:
       :class:`ConfigReadError` so the caller refuses and leaves the file
       byte-identical.
     """
-    import yaml
-
     if not path.exists():
         return {}
     try:
@@ -128,8 +126,8 @@ def load_yaml_file(path: Path) -> Dict[str, Any]:
             f"({exc}). Fix the file permissions or move it aside first."
         ) from exc
     try:
-        data = yaml.safe_load(raw)
-    except yaml.YAMLError as exc:
+        data = fast_safe_load(raw)
+    except Exception as exc:
         raise ConfigReadError(
             f"Refusing to overwrite {path}: the existing file is not valid YAML "
             f"({exc}). Fix it with `hermes config edit` (or move it aside), then "

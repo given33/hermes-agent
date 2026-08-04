@@ -95,6 +95,11 @@ from gateway.platforms.base import (
 from agent.redact import redact_sensitive_text
 from agent.interrupt_compat import request_hard_interrupt
 from gateway.readiness import collect_runtime_readiness
+from hermes_services import (
+    DEFAULT_MAX_REQUEST_BYTES,
+    HermesApplicationKernel,
+    accept_cron_fire_request,
+)
 
 from agent.secret_scope import UnscopedSecretError as _UnscopedSecretError
 from agent.secret_scope import get_secret as _scoped_get_secret
@@ -1714,12 +1719,21 @@ class APIServerAdapter(BasePlatformAdapter):
         profile = _api_request_profile.get()
         is_named_profile = bool(profile and profile != "default")
         expected_key = self._expected_api_key()
-        if not expected_key:
-            # Preserve the historical no-key test/manual-wiring behavior only
-            # for the default listener. Named profiles must fail closed rather
-            # than inherit the listener owner's key.
-            if not is_named_profile:
-                return None
+        auth_header = request.headers.get("Authorization", "")
+        if is_named_profile:
+            boundary = HermesApplicationKernel.for_http(
+                surface="api",
+                bearer_secret=expected_key,
+                compatibility_mode=os.environ.get("HERMES_HTTP_CONTRACT_MODE", "dual"),
+            ).require_http_boundary()
+            authorization = boundary.authorize(auth_header)
+        else:
+            authorization = self._http_boundary.authorize(auth_header)
+
+        if authorization.authenticated:
+            return None
+
+        if not expected_key and is_named_profile:
             logger.warning(
                 "API server rejected request for profile %r: no profile-scoped "
                 "API_SERVER_KEY is configured; %s",
@@ -1736,18 +1750,6 @@ class APIServerAdapter(BasePlatformAdapter):
                 },
                 status=401,
             )
-
-        auth_header = request.headers.get("Authorization", "")
-        if auth_header.startswith("Bearer "):
-            token = auth_header[7:].strip()
-            # Compare as bytes: ``hmac.compare_digest`` raises TypeError on a
-            # str containing non-ASCII characters, and ``token`` is the raw
-            # client-supplied header. A stray non-ASCII byte in the key would
-            # otherwise crash this handler (500) instead of returning a clean
-            # 401. Encoding both sides keeps the timing-safe comparison and
-            # matches web_server.py's dashboard-token check.
-            if hmac.compare_digest(token.encode(), expected_key.encode()):
-                return None  # Auth OK
 
         logger.warning(
             "API server rejected invalid API key: %s",
@@ -5662,42 +5664,6 @@ class APIServerAdapter(BasePlatformAdapter):
         trips NAS's HTTP timeout. The store CAS claim inside fire_due guards
         against double-fire on a NAS/scheduler retry.
         """
-        from hermes_cli.config import cfg_get, load_config
-        from plugins.cron_providers.chronos.verify import get_fire_verifier
-
-        auth = request.headers.get("Authorization", "")
-        token = auth[7:].strip() if auth.startswith("Bearer ") else ""
-
-        cfg = load_config()
-        verifier = get_fire_verifier()
-        verify_kwargs = dict(
-            token=token,
-            expected_audience=cfg_get(cfg, "cron", "chronos", "expected_audience", default=""),
-            jwks_or_key=cfg_get(cfg, "cron", "chronos", "nas_jwks_url", default="") or None,
-            issuer=cfg_get(cfg, "cron", "chronos", "portal_url", default="") or None,
-        )
-        try:
-            if asyncio.iscoroutinefunction(verifier):
-                claims = await verifier(**verify_kwargs)
-            else:
-                # The verifier resolves the NAS signing key from a JWKS URL,
-                # which is a synchronous HTTP GET on a cache miss (cold client
-                # or a rotated kid) — keep that blocking I/O off the event loop
-                # so a slow or rate-limited portal can't stall every other
-                # adapter sharing this loop. Same hardening the platform HTTP
-                # event verifier already got.
-                claims = await asyncio.to_thread(verifier, **verify_kwargs)
-        except Exception:
-            # Fail closed: a crashing verifier must never admit a fire — this
-            # is the only inbound that can trigger remote job execution.
-            logger.exception("cron fire: verifier crashed; rejecting token")
-            claims = None
-        if claims is None:
-            logger.warning(
-                "cron fire: rejected invalid token: %s",
-                self._request_audit_log_suffix(request),
-            )
-            return web.json_response({"error": "invalid fire token"}, status=401)
         draining = self._draining_response()
         if draining is not None:
             return draining

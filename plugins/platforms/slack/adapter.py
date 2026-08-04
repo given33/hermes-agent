@@ -8198,6 +8198,7 @@ class SlackAdapter(BasePlatformAdapter):
         # forged file object from steering the Bearer-token download at an
         # arbitrary public host (token exfiltration), which the private-IP
         # check alone cannot prevent.
+        _check_slack_download_url(url)
         if not self._is_slack_cdn_url(url):
             raise ValueError(
                 "Blocked non-Slack-CDN file URL (token-exfiltration protection): "
@@ -8279,6 +8280,7 @@ class SlackAdapter(BasePlatformAdapter):
             )
 
         # Slack-CDN allowlist — see _download_slack_file for the rationale.
+        _check_slack_download_url(url)
         if not self._is_slack_cdn_url(url):
             raise ValueError(
                 "Blocked non-Slack-CDN file URL (token-exfiltration protection): "

@@ -142,3 +142,8 @@ def get_fire_verifier() -> Callable[..., Optional[Dict[str, Any]]]:
     — so the webhook handler never changes when the auth mode is swapped.
     """
     return verify_nas_fire_token
+
+
+from hermes_services.cron_fire import register_fire_verifier_resolver
+
+register_fire_verifier_resolver(lambda: get_fire_verifier())

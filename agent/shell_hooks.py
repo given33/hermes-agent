@@ -469,15 +469,28 @@ def _spawn(spec: ShellHookSpec, stdin_json: str) -> Dict[str, Any]:
     else:
         _popen_kwargs = {"start_new_session": True}
     try:
-        proc = subprocess.run(
+        proc = subprocess.Popen(
             argv,
-            input=stdin_json,
-            capture_output=True,
-            timeout=spec.timeout,
-            text=True, encoding='utf-8', errors='replace',
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
             shell=False,
             **_popen_kwargs,
         )
+        try:
+            output = proc.communicate(input=stdin_json, timeout=spec.timeout)
+        except subprocess.TimeoutExpired:
+            _terminate_hook_process_tree(proc)
+            try:
+                proc.communicate(timeout=2)
+            except (OSError, subprocess.TimeoutExpired):
+                pass
+            result["timed_out"] = True
+            result["elapsed_seconds"] = round(time.monotonic() - t0, 3)
+            return result
     except subprocess.TimeoutExpired:
         result["timed_out"] = True
         result["elapsed_seconds"] = round(time.monotonic() - t0, 3)
@@ -492,6 +505,13 @@ def _spawn(spec: ShellHookSpec, stdin_json: str) -> Dict[str, Any]:
         result["error"] = str(exc)
         return result
 
+    if output is None:
+        stdout, stderr = "", ""
+    else:
+        stdout, stderr = output
+    result["returncode"] = proc.returncode
+    result["stdout"] = stdout or ""
+    result["stderr"] = stderr or ""
     result["elapsed_seconds"] = round(time.monotonic() - t0, 3)
     return result
 

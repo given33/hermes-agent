@@ -35,10 +35,12 @@ from typing import Mapping, Sequence
 
 __all__ = [
     "IS_WINDOWS",
+    "resolve_managed_uv",
     "resolve_node_command",
     "windows_detach_flags",
     "windows_detach_flags_without_breakaway",
     "windows_hide_flags",
+    "suppress_platform_ver_console",
     "windows_detach_popen_kwargs",
     "noninteractive_git_env",
     "bounded_git_probe",
@@ -46,6 +48,19 @@ __all__ = [
 
 
 IS_WINDOWS = sys.platform == "win32"
+
+
+def resolve_managed_uv() -> str | None:
+    """Return Hermes' private uv executable, without consulting ambient PATH."""
+    try:
+        from hermes_constants import get_hermes_home
+
+        path = get_hermes_home() / "bin" / ("uv.exe" if IS_WINDOWS else "uv")
+        if path.is_file() and (IS_WINDOWS or os.access(path, os.X_OK)):
+            return str(path)
+    except (OSError, RuntimeError):
+        pass
+    return None
 
 
 # -----------------------------------------------------------------------------
@@ -203,6 +218,29 @@ def windows_hide_flags() -> int:
     if not IS_WINDOWS:
         return 0
     return _CREATE_NO_WINDOW
+
+
+def suppress_platform_ver_console() -> None:
+    """Avoid Windows' ``cmd /c ver`` probe and its transient console window."""
+    if not IS_WINDOWS:
+        return
+    try:
+        import platform
+
+        if hasattr(platform, "_syscmd_ver"):
+            def _quiet_syscmd_ver(
+                system="",
+                release="",
+                version="",
+                supported_platforms=("win32", "win16", "dos"),
+            ):
+                del supported_platforms
+                return system, release, version
+
+            platform._syscmd_ver = _quiet_syscmd_ver
+    except Exception:
+        # This is startup hardening and must never block an entry point.
+        pass
 
 
 def windows_detach_popen_kwargs() -> dict:

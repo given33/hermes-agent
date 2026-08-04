@@ -26,6 +26,15 @@ _MAX_JOB_ID_LENGTH = 512
 _MAX_FIRE_AT_LENGTH = 128
 _JWK_CLIENTS: Dict[str, Any] = {}
 _JWK_CLIENTS_LOCK = threading.Lock()
+_FIRE_VERIFIER_RESOLVER: Callable[[], Callable[..., Any]] | None = None
+
+
+def register_fire_verifier_resolver(
+    resolver: Callable[[], Callable[..., Any]] | None,
+) -> None:
+    """Install an optional provider-owned verifier factory."""
+    global _FIRE_VERIFIER_RESOLVER
+    _FIRE_VERIFIER_RESOLVER = resolver
 
 
 @dataclass(frozen=True, slots=True)
@@ -145,6 +154,8 @@ def verify_nas_fire_token(
 
 def get_fire_verifier() -> Callable[..., Optional[Dict[str, Any]]]:
     """Return the active inbound fire verifier."""
+    if _FIRE_VERIFIER_RESOLVER is not None:
+        return _FIRE_VERIFIER_RESOLVER()
     return verify_nas_fire_token
 
 
@@ -157,16 +168,20 @@ def authorize_cron_fire(
     """Authenticate a Chronos callback independently of an HTTP framework."""
     cfg = config if config is not None else load_config()
     active_verifier = verifier or get_fire_verifier()
-    claims = active_verifier(
-        token=extract_bearer_token(authorization_header),
-        expected_audience=cfg_get(
-            cfg, "cron", "chronos", "expected_audience", default=""
-        ),
-        jwks_or_key=cfg_get(
-            cfg, "cron", "chronos", "nas_jwks_url", default=""
-        ) or None,
-        issuer=cfg_get(cfg, "cron", "chronos", "portal_url", default="") or None,
-    )
+    try:
+        claims = active_verifier(
+            token=extract_bearer_token(authorization_header),
+            expected_audience=cfg_get(
+                cfg, "cron", "chronos", "expected_audience", default=""
+            ),
+            jwks_or_key=cfg_get(
+                cfg, "cron", "chronos", "nas_jwks_url", default=""
+            ) or None,
+            issuer=cfg_get(cfg, "cron", "chronos", "portal_url", default="") or None,
+        )
+    except Exception:
+        logger.exception("cron fire: verifier crashed; rejecting token")
+        claims = None
     if claims is None:
         return None, ServiceFailure(401, "invalid_fire_token", "invalid fire token")
     return CronFireAuthorization(claims=claims), None
@@ -227,12 +242,38 @@ async def accept_cron_fire_request(
     while the gateway executes inside its already-selected profile. The
     returned task lets each adapter attach its own drain/lifecycle accounting.
     """
-    authorization, failure = await asyncio.to_thread(
-        authorize_cron_fire,
-        authorization_header,
-        config=config,
-        verifier=verifier,
-    )
+    active_verifier = verifier or get_fire_verifier()
+    if asyncio.iscoroutinefunction(active_verifier):
+        cfg = config if config is not None else load_config()
+        try:
+            claims = await active_verifier(
+                token=extract_bearer_token(authorization_header),
+                expected_audience=cfg_get(
+                    cfg, "cron", "chronos", "expected_audience", default=""
+                ),
+                jwks_or_key=cfg_get(
+                    cfg, "cron", "chronos", "nas_jwks_url", default=""
+                ) or None,
+                issuer=cfg_get(
+                    cfg, "cron", "chronos", "portal_url", default=""
+                ) or None,
+            )
+        except Exception:
+            logger.exception("cron fire: async verifier crashed; rejecting token")
+            claims = None
+        if claims is None:
+            authorization = None
+            failure = ServiceFailure(401, "invalid_fire_token", "invalid fire token")
+        else:
+            authorization = CronFireAuthorization(claims=claims)
+            failure = None
+    else:
+        authorization, failure = await asyncio.to_thread(
+            authorize_cron_fire,
+            authorization_header,
+            config=config,
+            verifier=active_verifier,
+        )
     if failure is not None:
         return CronFireAcceptance(
             status_code=failure.status_code,
@@ -278,6 +319,7 @@ __all__ = [
     "accept_cron_fire_request",
     "authorize_cron_fire",
     "get_fire_verifier",
+    "register_fire_verifier_resolver",
     "parse_cron_fire_payload",
     "verify_nas_fire_token",
 ]

@@ -24,6 +24,62 @@ from hermes_cli.secret_prompt import masked_secret_prompt
 
 logger = logging.getLogger(__name__)
 
+# The runtime owns the cross-process writer implementation. Keep this public
+# compatibility surface here because CLI, gateway, and plugins historically
+# import config mutation helpers from ``hermes_cli.config``.
+from hermes_runtime import config as _runtime_config
+
+_CONFIG_FILE_LOCK_TIMEOUT_SECONDS = _runtime_config._CONFIG_FILE_LOCK_TIMEOUT_SECONDS
+_CONFIG_FILE_LOCK_UNSUPPORTED_PATHS: Set[str] = set()
+_CONFIG_FILE_LOCK_UNSUPPORTED_WARNED = False
+
+
+@contextmanager
+def config_write_lock(
+    config_path: Optional[Path] = None,
+    timeout: float = _CONFIG_FILE_LOCK_TIMEOUT_SECONDS,
+):
+    """Lock a config read-modify-write across processes.
+
+    Synchronizing the small compatibility state before and after delegation
+    keeps legacy callers observable while using the runtime's reentrant,
+    unsupported-filesystem-aware implementation.
+    """
+    global _CONFIG_FILE_LOCK_UNSUPPORTED_WARNED
+    _runtime_config._CONFIG_FILE_LOCK_UNSUPPORTED_PATHS = (
+        _CONFIG_FILE_LOCK_UNSUPPORTED_PATHS
+    )
+    _runtime_config._CONFIG_FILE_LOCK_UNSUPPORTED_WARNED = (
+        _CONFIG_FILE_LOCK_UNSUPPORTED_WARNED
+    )
+    try:
+        with _runtime_config.config_write_lock(config_path, timeout=timeout):
+            yield
+    finally:
+        runtime_paths = _runtime_config._CONFIG_FILE_LOCK_UNSUPPORTED_PATHS
+        if runtime_paths is not _CONFIG_FILE_LOCK_UNSUPPORTED_PATHS:
+            _CONFIG_FILE_LOCK_UNSUPPORTED_PATHS.clear()
+            _CONFIG_FILE_LOCK_UNSUPPORTED_PATHS.update(runtime_paths)
+        _CONFIG_FILE_LOCK_UNSUPPORTED_WARNED = (
+            _runtime_config._CONFIG_FILE_LOCK_UNSUPPORTED_WARNED
+        )
+
+
+def mutate_config(
+    mutate_fn,
+    *,
+    config_path: Optional[Path] = None,
+    timeout: float = _CONFIG_FILE_LOCK_TIMEOUT_SECONDS,
+    **write_kwargs: Any,
+) -> Optional[Dict[str, Any]]:
+    """Apply ``mutate_fn`` to the current raw config under ``config_write_lock``."""
+    return _runtime_config.mutate_config(
+        mutate_fn,
+        config_path=config_path,
+        timeout=timeout,
+        **write_kwargs,
+    )
+
 # Track which (config_path, mtime_ns, size) tuples we've already warned about
 # so concurrent CLI/gateway loads of a broken config.yaml don't spam stderr
 # every time. Cleared automatically when the file changes (different mtime).
@@ -2918,7 +2974,7 @@ def cfg_get(cfg: Optional[Dict[str, Any]], *keys: str, default: Any = None) -> A
 
 
 
-def read_raw_config() -> Dict[str, Any]:
+def read_raw_config(config_path: Optional[Path] = None) -> Dict[str, Any]:
     """Read ~/.hermes/config.yaml as-is, without merging defaults or migrating.
 
     Returns the raw YAML dict, or ``{}`` if the file doesn't exist or can't
@@ -2930,6 +2986,17 @@ def read_raw_config() -> Dict[str, Any]:
     ``load_config()``. Returns a deepcopy on every call since some callers
     mutate the result before passing to ``save_config()``.
     """
+    if config_path is not None:
+        try:
+            with open(config_path, encoding="utf-8") as f:
+                data = fast_safe_load(f) or {}
+        except FileNotFoundError:
+            return {}
+        except Exception as exc:
+            _warn_config_parse_failure(config_path, exc)
+            return {}
+        return data if isinstance(data, dict) else {}
+
     with _CONFIG_LOCK:
         try:
             config_path = get_config_path()
@@ -2954,6 +3021,13 @@ def read_raw_config() -> Dict[str, Any]:
             data = {}
         _RAW_CONFIG_CACHE[path_key] = (cache_key[0], cache_key[1], copy.deepcopy(data))
         return data
+
+
+def read_raw_config_strict(config_path: Optional[Path] = None) -> Dict[str, Any]:
+    """Read raw YAML for a write-back transaction and fail closed on damage."""
+    from hermes_runtime.config import read_raw_config_strict as _read_strict
+
+    return _read_strict(config_path=config_path)
 
 
 def read_user_config_raw(config_path: Optional[Path] = None) -> Dict[str, Any]:
@@ -3274,10 +3348,18 @@ def _load_config_impl(*, want_deepcopy: bool) -> Dict[str, Any]:
         config_path = get_config_path()
         path_key = str(config_path)
 
+        # `hermes chat --ignore-user-config` / HERMES_IGNORE_USER_CONFIG=1:
+        # treat the user file as absent while retaining administrator-managed
+        # settings below. Bypass the normal cache and last-known-good fallback
+        # so toggling the flag within one process cannot leak user settings.
+        ignore_user_config = os.environ.get("HERMES_IGNORE_USER_CONFIG") == "1"
+
         try:
             st = config_path.stat()
             user_sig: Optional[Tuple[int, int]] = (st.st_mtime_ns, st.st_size)
         except FileNotFoundError:
+            user_sig = None
+        if ignore_user_config:
             user_sig = None
 
         # Managed scope: fold the managed config file's (mtime, size) into the
@@ -3307,7 +3389,7 @@ def _load_config_impl(*, want_deepcopy: bool) -> Dict[str, Any]:
         else:
             cache_sig = None
 
-        cached = _LOAD_CONFIG_CACHE.get(path_key)
+        cached = None if ignore_user_config else _LOAD_CONFIG_CACHE.get(path_key)
         if cached is not None and cache_sig is not None and cached[:4] == cache_sig:
             # File signatures match, but the cached expansion is only valid if
             # every ${VAR} it was expanded against still has the same value.
@@ -3385,6 +3467,8 @@ def _load_config_impl(*, want_deepcopy: bool) -> Dict[str, Any]:
         if managed_config:
             managed_expanded = _expand_env_vars(managed_config)
             expanded = _deep_merge(expanded, managed_expanded)
+        if ignore_user_config:
+            return expanded
         _LAST_EXPANDED_CONFIG_BY_PATH[path_key] = copy.deepcopy(expanded)
         if cache_sig is not None:
             # Cache stores a separate deepcopy so subsequent ``load_config()``

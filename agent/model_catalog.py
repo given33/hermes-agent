@@ -99,6 +99,27 @@ OPENROUTER_MODELS: list[tuple[str, str]] = [
 
 _openrouter_catalog_cache: list[tuple[str, str]] | None = None
 
+# Curated fallback for Vercel AI Gateway when its live catalog is unavailable.
+VERCEL_AI_GATEWAY_MODELS: list[tuple[str, str]] = [
+    ("moonshotai/kimi-k2.6", "recommended"),
+    ("alibaba/qwen3.6-plus", ""),
+    ("zai/glm-5.1", ""),
+    ("minimax/minimax-m2.7", ""),
+    ("anthropic/claude-sonnet-4.6", ""),
+    ("anthropic/claude-opus-4.7", ""),
+    ("anthropic/claude-opus-4.6", ""),
+    ("anthropic/claude-haiku-4.5", ""),
+    ("openai/gpt-5.4", ""),
+    ("openai/gpt-5.4-mini", ""),
+    ("openai/gpt-5.3-codex", ""),
+    ("google/gemini-3.1-pro-preview", ""),
+    ("google/gemini-3-flash", ""),
+    ("google/gemini-3.1-flash-lite-preview", ""),
+    ("xai/grok-4.20-reasoning", ""),
+]
+
+_ai_gateway_catalog_cache: list[tuple[str, str]] | None = None
+
 
 
 
@@ -268,6 +289,7 @@ _PROVIDER_MODELS: dict[str, list[str]] = {
         "gpt-4o-mini",
     ],
     "openai-codex": _codex_curated_models(),
+    "ai-gateway": [mid for mid, _ in VERCEL_AI_GATEWAY_MODELS],
     "xai-oauth": _xai_curated_models(),
     "copilot-acp": [
         "copilot-acp",
@@ -1557,12 +1579,57 @@ def _format_price_per_mtok(per_token_str: str) -> str:
     return f"${per_m:.2f}"
 
 
+def compute_sale_discount(
+    prompt: str,
+    completion: str,
+    original: Any,
+) -> tuple[int, str, str] | None:
+    """Return sale percentage and original rates when pricing is discounted."""
+    if not isinstance(original, dict):
+        return None
+    was_prompt = original.get("prompt")
+    was_completion = original.get("completion")
+    if was_prompt in (None, "") and was_completion in (None, ""):
+        return None
+
+    def _number(raw: Any, *, allow_zero: bool) -> float | None:
+        try:
+            value = float(raw)
+        except (TypeError, ValueError):
+            return None
+        if value != value or value < 0 or (not allow_zero and value == 0):
+            return None
+        return value
+
+    current_prompt = _number(prompt, allow_zero=True)
+    current_completion = _number(completion, allow_zero=True)
+    if current_prompt == 0 and current_completion == 0:
+        return None
+
+    comparisons = (
+        (current_prompt, _number(was_prompt, allow_zero=False)),
+        (current_completion, _number(was_completion, allow_zero=False)),
+    )
+    for current, prior in comparisons:
+        if current is None or prior is None or current >= prior:
+            continue
+        percent = int(round((1.0 - current / prior) * 100))
+        if percent >= 1:
+            return (
+                percent,
+                "" if was_prompt in (None, "") else str(was_prompt),
+                "" if was_completion in (None, "") else str(was_completion),
+            )
+    return None
+
+
 def fetch_models_with_pricing(
     api_key: str | None = None,
     base_url: str = "https://openrouter.ai/api",
     timeout: float = 8.0,
     *,
     force_refresh: bool = False,
+    include_sale_original: bool = False,
 ) -> dict[str, dict[str, str]]:
     """Fetch ``/v1/models`` and return ``{model_id: {prompt, completion}}`` pricing.
 
@@ -1602,6 +1669,13 @@ def fetch_models_with_pricing(
                 entry["input_cache_read"] = str(pricing["input_cache_read"])
             if pricing.get("input_cache_write"):
                 entry["input_cache_write"] = str(pricing["input_cache_write"])
+            original = pricing.get("original")
+            if include_sale_original and isinstance(original, dict):
+                entry["original"] = {
+                    str(key): str(value)
+                    for key, value in original.items()
+                    if value is not None
+                }
             result[mid] = entry
 
     _pricing_cache[cache_key] = result
@@ -1611,6 +1685,119 @@ def fetch_models_with_pricing(
 def _resolve_openrouter_api_key() -> str:
     """Best-effort OpenRouter API key for pricing fetch."""
     return os.getenv("OPENROUTER_API_KEY", "").strip()
+
+
+def _ai_gateway_model_is_free(pricing: Any) -> bool:
+    """Return whether both AI Gateway input and output rates are zero."""
+    if not isinstance(pricing, dict):
+        return False
+    try:
+        return (
+            float(pricing.get("input", "0")) == 0
+            and float(pricing.get("output", "0")) == 0
+        )
+    except (TypeError, ValueError):
+        return False
+
+
+def fetch_ai_gateway_models(
+    timeout: float = 8.0,
+    *,
+    force_refresh: bool = False,
+) -> list[tuple[str, str]]:
+    """Return the curated AI Gateway list intersected with its live catalog."""
+    global _ai_gateway_catalog_cache
+    if _ai_gateway_catalog_cache is not None and not force_refresh:
+        return list(_ai_gateway_catalog_cache)
+
+    from hermes_constants import AI_GATEWAY_BASE_URL
+
+    fallback = list(VERCEL_AI_GATEWAY_MODELS)
+    try:
+        request = urllib.request.Request(
+            f"{AI_GATEWAY_BASE_URL.rstrip('/')}/models",
+            headers={"Accept": "application/json"},
+        )
+        with urllib.request.urlopen(request, timeout=timeout) as response:
+            payload = json.loads(response.read().decode())
+    except Exception:
+        return list(_ai_gateway_catalog_cache or fallback)
+
+    items = payload.get("data", []) if isinstance(payload, dict) else []
+    live = {
+        str(item.get("id") or "").strip(): item
+        for item in items
+        if isinstance(item, dict) and str(item.get("id") or "").strip()
+    }
+    curated = [
+        (
+            model_id,
+            "free" if _ai_gateway_model_is_free(live[model_id].get("pricing")) else "",
+        )
+        for model_id, _ in fallback
+        if model_id in live
+    ]
+    if not curated:
+        return list(_ai_gateway_catalog_cache or fallback)
+
+    free_moonshot = next(
+        (
+            model_id
+            for model_id, item in live.items()
+            if model_id.startswith("moonshotai/")
+            and _ai_gateway_model_is_free(item.get("pricing"))
+        ),
+        None,
+    )
+    if free_moonshot:
+        curated = [row for row in curated if row[0] != free_moonshot]
+        curated.insert(0, (free_moonshot, "recommended"))
+    else:
+        curated[0] = (curated[0][0], "recommended")
+    _ai_gateway_catalog_cache = curated
+    return list(curated)
+
+
+def fetch_ai_gateway_pricing(
+    timeout: float = 8.0,
+    *,
+    force_refresh: bool = False,
+) -> dict[str, dict[str, str]]:
+    """Translate Vercel AI Gateway pricing into Hermes pricing fields."""
+    from hermes_constants import AI_GATEWAY_BASE_URL
+
+    cache_key = AI_GATEWAY_BASE_URL.rstrip("/")
+    if not force_refresh and cache_key in _pricing_cache:
+        return _pricing_cache[cache_key]
+    try:
+        request = urllib.request.Request(
+            f"{cache_key}/models",
+            headers={"Accept": "application/json"},
+        )
+        with urllib.request.urlopen(request, timeout=timeout) as response:
+            payload = json.loads(response.read().decode())
+    except Exception:
+        _pricing_cache[cache_key] = {}
+        return {}
+
+    result: dict[str, dict[str, str]] = {}
+    for item in payload.get("data", []):
+        if not isinstance(item, dict):
+            continue
+        model_id = item.get("id")
+        pricing = item.get("pricing")
+        if not model_id or not isinstance(pricing, dict):
+            continue
+        entry = {
+            "prompt": str(pricing.get("input", "")),
+            "completion": str(pricing.get("output", "")),
+        }
+        for key in ("input_cache_read", "input_cache_write"):
+            if pricing.get(key):
+                entry[key] = str(pricing[key])
+        result[str(model_id)] = entry
+    _pricing_cache[cache_key] = result
+    return result
 
 
 _DEFAULT_NOUS_INFERENCE_BASE = "https://inference-api.nousresearch.com"
@@ -1628,18 +1815,22 @@ def _resolve_nous_pricing_credentials() -> tuple[str, str]:
     returning empty pricing because of an auth blip makes the picker
     look broken ("No free models currently available").
     """
+    env_base = os.getenv("NOUS_INFERENCE_BASE_URL", "").strip()
     try:
         from agent.provider_auth import resolve_api_key_provider_credentials
         creds = resolve_api_key_provider_credentials("nous")
         if creds:
-            return (creds.get("api_key", ""), creds.get("base_url", ""))
+            return (
+                creds.get("api_key", ""),
+                env_base or creds.get("base_url", "") or _DEFAULT_NOUS_INFERENCE_BASE,
+            )
     except Exception:
         pass
-    return ("", _DEFAULT_NOUS_INFERENCE_BASE)
+    return ("", env_base or _DEFAULT_NOUS_INFERENCE_BASE)
 
 
 def get_pricing_for_provider(provider: str, *, force_refresh: bool = False) -> dict[str, dict[str, str]]:
-    """Return live pricing for providers that support it (openrouter, nous, novita)."""
+    """Return live pricing for providers that expose it."""
     normalized = normalize_provider(provider)
     if normalized == "openrouter":
         return fetch_models_with_pricing(
@@ -1647,6 +1838,8 @@ def get_pricing_for_provider(provider: str, *, force_refresh: bool = False) -> d
             base_url="https://openrouter.ai/api",
             force_refresh=force_refresh,
         )
+    if normalized == "ai-gateway":
+        return fetch_ai_gateway_pricing(force_refresh=force_refresh)
     if normalized == "novita":
         return _fetch_novita_pricing(force_refresh=force_refresh)
     if normalized == "deepinfra":
@@ -1665,6 +1858,7 @@ def get_pricing_for_provider(provider: str, *, force_refresh: bool = False) -> d
                 api_key=api_key,
                 base_url=stripped,
                 force_refresh=force_refresh,
+                include_sale_original=True,
             )
     return {}
 
@@ -3203,23 +3397,54 @@ def fetch_lmstudio_models(
     return models or []
 
 
+class LMStudioLoadResult(NamedTuple):
+    """Verified LM Studio runtime plus load-attempt provenance."""
+
+    context_length: Optional[int]
+    load_attempted: bool = False
+    rejected: bool = False
+
+
 def ensure_lmstudio_model_loaded(
     model: str,
     base_url: Optional[str],
     api_key: Optional[str],
-    target_context_length: int,
+    target_context_length: Optional[int],
     timeout: float = 120.0,
-) -> Optional[int]:
-    """Ensure LM Studio has ``model`` loaded with at least ``target_context_length``.
+    *,
+    return_load_result: bool = False,
+) -> Optional[int] | LMStudioLoadResult:
+    """Ensure a model is active and return its verified runtime context."""
+    def _result(
+        context_length: Optional[int],
+        *,
+        load_attempted: bool = False,
+        rejected: bool = False,
+    ) -> Optional[int] | LMStudioLoadResult:
+        result = LMStudioLoadResult(context_length, load_attempted, rejected)
+        return result if return_load_result else context_length
 
-    No-op when an instance is already loaded with sufficient context. Otherwise
-    POSTs ``/api/v1/models/load`` to (re)load with the target context, capped
-    at the model's ``max_context_length``. Returns the resolved loaded context
-    length, or ``None`` when the probe / load failed.
-    """
+    def _positive_int(value: Any) -> Optional[int]:
+        if isinstance(value, int) and not isinstance(value, bool) and value > 0:
+            return value
+        return None
+
+    def _loaded_context(entry: dict[str, Any]) -> Optional[int]:
+        instances = entry.get("loaded_instances")
+        if not isinstance(instances, list):
+            return None
+        for instance in instances:
+            config = instance.get("config") if isinstance(instance, dict) else None
+            parsed = _positive_int(
+                config.get("context_length") if isinstance(config, dict) else None
+            )
+            if parsed is not None:
+                return parsed
+        return None
+
     server_root = _lmstudio_server_root(base_url)
     if not server_root:
-        return None
+        return _result(None)
 
     headers = _lmstudio_request_headers(api_key)
 
@@ -3228,7 +3453,7 @@ def ensure_lmstudio_model_loaded(
     except Exception:
         raw_models = None
     if raw_models is None:
-        return None
+        return _result(None)
 
     target_entry = None
     for raw in raw_models:
@@ -3238,22 +3463,27 @@ def ensure_lmstudio_model_loaded(
             target_entry = raw
             break
     if target_entry is None:
-        return None
+        return _result(None)
 
-    max_ctx = target_entry.get("max_context_length")
-    if isinstance(max_ctx, int) and max_ctx > 0:
-        target_context_length = min(target_context_length, max_ctx)
+    requested_context = _positive_int(target_context_length)
+    maximum_context = _positive_int(target_entry.get("max_context_length"))
+    if (
+        requested_context is not None
+        and maximum_context is not None
+        and requested_context > maximum_context
+    ):
+        return _result(None, rejected=True)
 
-    for inst in target_entry.get("loaded_instances") or []:
-        cfg = inst.get("config") if isinstance(inst, dict) else None
-        loaded_ctx = cfg.get("context_length") if isinstance(cfg, dict) else None
-        if isinstance(loaded_ctx, int) and loaded_ctx >= target_context_length:
-            return loaded_ctx
+    loaded_context = _loaded_context(target_entry)
+    if loaded_context is not None and (
+        requested_context is None or loaded_context >= requested_context
+    ):
+        return _result(loaded_context)
 
-    body = json.dumps({
-        "model": model,
-        "context_length": target_context_length,
-    }).encode()
+    body_payload: dict[str, Any] = {"model": model}
+    if requested_context is not None:
+        body_payload["context_length"] = requested_context
+    body = json.dumps(body_payload).encode()
     load_headers = dict(headers)
     load_headers["Content-Type"] = "application/json"
     try:
@@ -3263,11 +3493,36 @@ def ensure_lmstudio_model_loaded(
             headers=load_headers,
             method="POST",
         )
-        with _urlopen_model_catalog_request(load_request, timeout=timeout) as resp:
-            resp.read()
+        with _urlopen_model_catalog_request(load_request, timeout=timeout) as response:
+            response_payload = json.loads(response.read().decode() or "{}")
     except Exception:
-        return None
-    return target_context_length
+        return _result(None, load_attempted=True)
+
+    response_context = None
+    if isinstance(response_payload, dict):
+        response_context = _positive_int(response_payload.get("context_length"))
+        if response_context is None:
+            config = response_payload.get("config")
+            if isinstance(config, dict):
+                response_context = _positive_int(config.get("context_length"))
+    if response_context is not None:
+        return _result(response_context, load_attempted=True)
+
+    try:
+        refreshed = _lmstudio_fetch_raw_models(
+            api_key=api_key,
+            base_url=base_url,
+            timeout=10,
+        )
+    except Exception:
+        refreshed = None
+    if refreshed:
+        for entry in refreshed:
+            if not isinstance(entry, dict):
+                continue
+            if entry.get("key") == model or entry.get("id") == model:
+                return _result(_loaded_context(entry), load_attempted=True)
+    return _result(None, load_attempted=True)
 
 
 def lmstudio_model_reasoning_options(

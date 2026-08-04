@@ -73,6 +73,7 @@ from agent.context_engine import (
 )
 from agent.model_metadata import estimate_request_tokens_rough
 from agent.session_activity import ActivityProvenance, normalize_activity_provenance
+from hermes_services.internal_hooks import run_internal_hooks
 
 logger = logging.getLogger(__name__)
 
