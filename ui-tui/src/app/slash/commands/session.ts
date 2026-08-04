@@ -1,4 +1,3 @@
-import { usageBarsText } from '../../../components/overlayPrimitives.js'
 import { introMsg, toTranscriptMessages } from '../../../domain/messages.js'
 import { sessionScopedModelArg, TUI_SESSION_MODEL_FLAG } from '../../../domain/slash.js'
 import type {

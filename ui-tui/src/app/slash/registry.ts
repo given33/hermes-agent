@@ -10,7 +10,9 @@ import type { SlashCommand } from './types.js'
 
 export const SLASH_COMMANDS: SlashCommand[] = [
   ...coreCommands,
+  ...topupCommands,
   ...sessionCommands,
+  ...subscriptionCommands,
   ...opsCommands,
   ...wakeCommands,
   ...setupCommands,
