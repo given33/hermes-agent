@@ -1,4 +1,4 @@
-"""Persistent Hermes 0.19 TUI gateway sessions for hosted mobile chat.
+"""Persistent Hermes 0.20 TUI gateway sessions for hosted mobile chat.
 
 The collaboration API used to construct a fresh ``AIAgent`` subprocess for
 every message.  This client speaks the public JSON-RPC protocol exposed by
@@ -99,14 +99,14 @@ class _GatewayProcess:
         )
         if self.process.stdin is None or self.process.stdout is None:
             self.process.kill()
-            raise HostedTuiGatewayError("Hermes 0.19 gateway pipes are unavailable")
+            raise HostedTuiGatewayError("Hermes 0.20 gateway pipes are unavailable")
         threading.Thread(target=self._read_stdout, daemon=True).start()
         threading.Thread(target=self._read_stderr, daemon=True).start()
         if not self._ready.wait(timeout=20.0):
             detail = self._stderr_summary()
             self.close()
             raise HostedTuiGatewayError(
-                "Hermes 0.19 gateway did not become ready"
+                "Hermes 0.20 gateway did not become ready"
                 + (f": {detail}" if detail else "")
             )
 
@@ -229,7 +229,7 @@ class _GatewayProcess:
             error = {
                 "error": {
                     "code": 5032,
-                    "message": self._stderr_summary() or "Hermes 0.19 gateway exited",
+                    "message": self._stderr_summary() or "Hermes 0.20 gateway exited",
                 }
             }
             for waiter in pending:
@@ -283,7 +283,7 @@ class _GatewayProcess:
     def rpc(self, method: str, params: dict[str, Any], *, timeout: float = 30.0) -> dict[str, Any]:
         if not self.alive():
             raise HostedTuiGatewayError(
-                self._stderr_summary() or "Hermes 0.19 gateway is not running"
+                self._stderr_summary() or "Hermes 0.20 gateway is not running"
             )
         request_id = uuid.uuid4().hex
         waiter: queue.Queue[dict[str, Any]] = queue.Queue(maxsize=1)
@@ -305,7 +305,7 @@ class _GatewayProcess:
             with self._pending_lock:
                 self._pending.pop(request_id, None)
             raise HostedTuiGatewayError(
-                f"Hermes 0.19 gateway timed out handling {method}"
+                f"Hermes 0.20 gateway timed out handling {method}"
             ) from exc
         except BaseException:
             with self._pending_lock:
@@ -366,7 +366,7 @@ class _GatewayProcess:
                 result.get("stored_session_id") or requested_session_id
             ).strip()
             if not live_session_id:
-                raise HostedTuiGatewayError("Hermes 0.19 did not return a live session id")
+                raise HostedTuiGatewayError("Hermes 0.20 did not return a live session id")
             state = _HostedSessionState(
                 conversation_id=conversation_id,
                 live_session_id=live_session_id,
@@ -457,7 +457,7 @@ class _GatewayProcess:
                     timeout=min(30.0, timeout),
                 )
                 if str(response.get("status") or "") != "streaming":
-                    raise HostedTuiGatewayError("Hermes 0.19 rejected the prompt")
+                    raise HostedTuiGatewayError("Hermes 0.20 rejected the prompt")
                 deadline = time.monotonic() + timeout
                 while not state.agent_ready.is_set():
                     if cancel_check is not None and cancel_check():
@@ -467,7 +467,7 @@ class _GatewayProcess:
                         break
                     if time.monotonic() >= deadline:
                         self._interrupt(live_session_id)
-                        raise TimeoutError("Hermes 0.19 agent pre-warm timed out")
+                        raise TimeoutError("Hermes 0.20 agent pre-warm timed out")
                 if not sink.done.is_set():
                     if event_callback is not None:
                         try:
@@ -565,7 +565,7 @@ class _GatewayProcess:
         for state in states:
             sink = state.current_sink
             if sink is not None and not sink.done.is_set():
-                sink.error = HostedTuiGatewayError("Hermes 0.19 gateway closed")
+                sink.error = HostedTuiGatewayError("Hermes 0.20 gateway closed")
                 sink.done.set()
                 sink.events.put(None)
         if self.process.poll() is None:
@@ -590,7 +590,7 @@ def _pool_key(
     profile: str,
     artifact_root: str,
 ) -> tuple[str, str, str, str, str]:
-    # One official 0.19 gateway can host many isolated sessions. Reusing it by
+    # One official 0.20 gateway can host many isolated sessions. Reusing it by
     # account/profile avoids repeating Python imports and MCP discovery for
     # every new mobile conversation; artifact ownership remains per session.
     return (runtime_home, owner_id, account_generation, profile, artifact_root)

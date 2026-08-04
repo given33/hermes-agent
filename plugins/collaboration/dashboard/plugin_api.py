@@ -394,6 +394,7 @@ def _publish_live_hosted_role_projection(
     *,
     patch: Optional[dict[str, Any]] = None,
     message: Optional[dict[str, Any]] = None,
+    protocol_events: Optional[list[dict[str, Any]]] = None,
 ) -> None:
     """Publish a small hosted-chat projection without touching durable state.
 
@@ -412,11 +413,21 @@ def _publish_live_hosted_role_projection(
         current = _HOSTED_LIVE_CONVERSATIONS.get(normalized_conversation_id)
         if not isinstance(current, dict):
             return
-        conversation = deepcopy(current)
-        turns = conversation.setdefault("hosted_turns", {})
-        run = turns.get(normalized_turn_id)
-        if not isinstance(run, dict):
+        # Token cadence must not deepcopy the whole account conversation. Keep
+        # published snapshots immutable by copying only the branches touched
+        # by this projection; history, attachments and unrelated turns remain
+        # shared read-only values.
+        conversation = dict(current)
+        current_turns = current.get("hosted_turns")
+        if not isinstance(current_turns, dict):
             return
+        current_run = current_turns.get(normalized_turn_id)
+        if not isinstance(current_run, dict):
+            return
+        turns = dict(current_turns)
+        run = deepcopy(current_run)
+        turns[normalized_turn_id] = run
+        conversation["hosted_turns"] = turns
         for key, value in (patch or {}).items():
             if key == "role_events" and isinstance(value, dict):
                 role_events = run.setdefault("role_events", {})
@@ -455,7 +466,9 @@ def _publish_live_hosted_role_projection(
             incoming_meta.setdefault("runtime_turn_id", normalized_turn_id)
             incoming["meta"] = incoming_meta
             message_key = str(incoming_meta.get("message_key") or "")
-            messages = conversation.setdefault("messages", [])
+            current_messages = current.get("messages")
+            messages = list(current_messages) if isinstance(current_messages, list) else []
+            conversation["messages"] = messages
             existing_index: Optional[int] = None
             for index, item in enumerate(messages):
                 if not isinstance(item, dict):
@@ -482,6 +495,56 @@ def _publish_live_hosted_role_projection(
                 incoming["updated_at"] = now
                 _project_native_message(incoming)
                 messages[existing_index] = incoming
+        if protocol_events:
+            conversation["hosted_events"] = list(current.get("hosted_events") or [])
+            conversation["hosted_event_sequences"] = dict(
+                current.get("hosted_event_sequences") or {}
+            )
+            conversation["hosted_event_terminals"] = dict(
+                current.get("hosted_event_terminals") or {}
+            )
+            for key in (
+                "session_entries",
+                "session_entry_sequences",
+                "session_entry_terminals",
+                "_hosted_event_persistence_pending",
+            ):
+                value = current.get(key)
+                if isinstance(value, list):
+                    conversation[key] = list(value)
+                elif isinstance(value, dict):
+                    conversation[key] = dict(value)
+        account_generation = _account_generation_for_owner(
+            str(conversation.get("owner_id") or LOCAL_OWNER_ID)
+        )
+        for protocol_event in protocol_events or []:
+            if not isinstance(protocol_event, dict):
+                continue
+            append_hosted_event(
+                conversation,
+                conversation_id=normalized_conversation_id,
+                turn_id=normalized_turn_id,
+                role_stage=str(protocol_event.get("role_stage") or "chat"),
+                event_type=str(
+                    protocol_event.get("event_type") or "message.delta"
+                ),
+                payload=(
+                    protocol_event.get("payload")
+                    if isinstance(protocol_event.get("payload"), dict)
+                    else {}
+                ),
+                entity_id=str(protocol_event.get("entity_id") or ""),
+                idempotency_key=str(
+                    protocol_event.get("idempotency_key") or ""
+                ),
+                occurred_at=int(protocol_event.get("occurred_at") or now),
+                account_generation=account_generation,
+                # The live projection is cloned together with its current
+                # sequence and terminal indexes. Rebuilding those indexes and
+                # rescanning every retained idempotency key on each token makes
+                # long conversations progressively slower.
+                assume_current_indexes=True,
+            )
         _HOSTED_LIVE_CONVERSATIONS[normalized_conversation_id] = conversation
     _notify_hosted_update(normalized_conversation_id)
 
@@ -1667,7 +1730,9 @@ def _fsync_parent_directory(target: Path) -> None:
 
 def _atomic_write_state_document(target: Path, data: dict[str, Any]) -> None:
     _invalidate_single_state_cache(target)
-    payload = json.dumps(data, ensure_ascii=False, indent=2) + "\n"
+    # This is a machine-owned recovery document. Compact encoding cuts both
+    # fsync latency and storage without weakening the atomic-write contract.
+    payload = json.dumps(data, ensure_ascii=False, separators=(",", ":")) + "\n"
     target.parent.mkdir(parents=True, exist_ok=True)
     temporary = target.with_name(
         f".{target.name}.{os.getpid()}.{threading.get_ident()}.{uuid.uuid4().hex}.tmp"
@@ -1683,6 +1748,35 @@ def _atomic_write_state_document(target: Path, data: dict[str, Any]) -> None:
             os.fsync(handle.fileno())
         os.replace(temporary, target)
         _fsync_parent_directory(target)
+    finally:
+        try:
+            temporary.unlink()
+        except FileNotFoundError:
+            pass
+
+
+def _atomic_snapshot_state_document(source: Path, target: Path) -> bool:
+    """Atomically retain the current document without rewriting its bytes.
+
+    State saves replace ``source`` with a new inode.  A hard link made before
+    that replace therefore remains an immutable copy of the last committed
+    document, which is exactly the recovery contract for ``*.bak``.  Some
+    filesystems do not support links; callers fall back to serialization in
+    that case.
+    """
+
+    _invalidate_single_state_cache(target)
+    target.parent.mkdir(parents=True, exist_ok=True)
+    temporary = target.with_name(
+        f".{target.name}.{os.getpid()}.{threading.get_ident()}.{uuid.uuid4().hex}.tmp"
+    )
+    try:
+        os.link(source, temporary)
+        os.replace(temporary, target)
+        _fsync_parent_directory(target)
+        return True
+    except OSError:
+        return False
     finally:
         try:
             temporary.unlink()
@@ -1880,8 +1974,15 @@ def _save_state_store(
     # Keep the last known-good document in a separately atomic file. On first
     # creation the backup is written first, so a crash cannot leave an empty
     # store with no recovery source.
+    backup_state: dict[str, Any]
+    can_snapshot_previous = False
     if previous is None:
         backup_state = persisted_state
+        # ``save_single_state``'s fast path deliberately avoids reparsing the
+        # document it just loaded.  When a committed primary already exists,
+        # retain that inode as the backup instead of serializing the new state
+        # twice.  Deletion-tombstone writes leave the fast path above.
+        can_snapshot_previous = _state_path_present(target)
     else:
         # A deletion intent may have been added to the incoming state after
         # the previous document was read.  Carry that tombstone into the
@@ -1890,7 +1991,17 @@ def _save_state_store(
         backup_state = deepcopy(previous)
         _merge_account_deletion_tombstones(backup_state, persisted_state)
         backup_state = state_with_persistence_hook_outbox(backup_state)
-    _atomic_write_state_document(_state_backup_path(target), backup_state)
+        can_snapshot_previous = (
+            _state_path_present(target)
+            and _account_deletion_tombstones(backup_state)
+            == _account_deletion_tombstones(previous)
+        )
+    backup_target = _state_backup_path(target)
+    if not (
+        can_snapshot_previous
+        and _atomic_snapshot_state_document(target, backup_target)
+    ):
+        _atomic_write_state_document(backup_target, backup_state)
     _atomic_write_state_document(target, persisted_state)
     try:
         committed_state = _deliver_and_persist_hosted_event_hook_outbox(
@@ -6405,7 +6516,7 @@ _HOSTED_PREWARM_INFLIGHT: set[tuple[str, str, str, str]] = set()
 
 
 def _prewarm_hosted_chat(conversation: dict[str, Any]) -> None:
-    """Start the official 0.19 Agent while the user is reading or typing."""
+    """Start the official Hermes 0.20 gateway while the user is reading or typing."""
 
     owner_id = str(conversation.get("owner_id") or LOCAL_OWNER_ID).strip()
     account_generation = str(conversation.get("account_generation") or "").strip()
@@ -6449,7 +6560,7 @@ def _prewarm_hosted_chat(conversation: dict[str, Any]) -> None:
             )
         except Exception:
             logging.getLogger(__name__).warning(
-                "Hermes 0.19 hosted chat pre-warm failed for %s",
+                "Hermes 0.20 hosted chat pre-warm failed for %s",
                 conversation_id,
                 exc_info=True,
             )
@@ -7026,6 +7137,8 @@ def apply_profile_event(
         clear_transient_model_status_activities(clear_retry=not terminal_error)
 
     if event_type in {"session.info", "request.accepted"}:
+        if event_type == "request.accepted" and not int(state.get("model_started_at") or 0):
+            state["model_started_at"] = now
         state["runtime_session_id"] = str(
             payload.get("session_id") or state.get("runtime_session_id") or ""
         ).strip()
@@ -7379,6 +7492,8 @@ def _queue_hosted_protocol_event(
             entity_id = f"message-invocation-{invocation}"
         elif event_type.startswith("thinking."):
             entity_id = f"thinking-invocation-{invocation}"
+        elif event_type.startswith("subagent."):
+            entity_id = f"subagent-invocation-{invocation}"
         elif event_type.startswith("agent."):
             entity_id = f"agent-invocation-{invocation}"
     if entity_id:
@@ -7398,6 +7513,9 @@ def _queue_hosted_protocol_event(
         "message.completed": "message.started",
         "thinking.delta": "thinking.started",
         "thinking.completed": "thinking.started",
+        "subagent.progress": "subagent.started",
+        "subagent.completed": "subagent.started",
+        "subagent.failed": "subagent.started",
     }.get(event_type)
     started_key = f"{start_type}:{entity_id}" if start_type and entity_id else ""
 
@@ -7622,6 +7740,7 @@ def _persist_hosted_role_state(
             state.get("runtime_session_id") or ""
         ).strip(),
         "started_at": int(state.get("started_at") or now),
+        "model_started_at": int(state.get("model_started_at") or 0),
         "first_token_at": int(state.get("first_token_at") or 0),
         "completed_at": now if str(state.get("status") or "") in _HOSTED_TERMINAL_STATUSES else None,
         "milestone_count": int(state.get("milestone_count") or 0),
@@ -7650,6 +7769,8 @@ def _persist_hosted_role_state(
         patch["model_retry_attempt"] = snapshot["model_retry_attempt"]
     if base_stage == "chat" and snapshot["first_token_at"]:
         patch["model_first_token_at"] = snapshot["first_token_at"]
+    if base_stage == "chat" and snapshot["model_started_at"]:
+        patch["model_started_at"] = snapshot["model_started_at"]
     if base_stage != "chat":
         # Every hosted role joins the durable roster with its first persisted
         # stage event, so clients never hardcode the team composition.
@@ -7675,6 +7796,7 @@ def _persist_hosted_role_state(
             "member_id": member_id,
             "handoff_to": handoff_to,
             "started_at": snapshot["started_at"],
+            "model_started_at": snapshot["model_started_at"] or None,
             "first_token_at": snapshot["first_token_at"] or None,
             "completed_at": snapshot["completed_at"],
             "collapse_activities": True,
@@ -7725,15 +7847,25 @@ def _persist_hosted_role_state(
         )
         if pending_protocol_events:
             state["_protocol_events"] = []
+            state["_live_protocol_event_count"] = 0
         if pending_session_entries:
             state["_session_entry_events"] = []
     else:
+        live_event_offset = max(
+            0,
+            min(
+                int(state.get("_live_protocol_event_count") or 0),
+                len(pending_protocol_events),
+            ),
+        )
         _publish_live_hosted_role_projection(
             conversation_id,
             turn_id,
             patch=patch,
             message=projected_message if visible else None,
+            protocol_events=pending_protocol_events[live_event_offset:],
         )
+        state["_live_protocol_event_count"] = len(pending_protocol_events)
 
 
 def _run_hosted_role(
@@ -7804,6 +7936,7 @@ def _run_hosted_role(
         "actual_provider": "",
         "runtime_session_id": str(runtime_session_id or "").strip(),
         "started_at": int(time.time() * 1000),
+        "model_started_at": 0,
         "first_token_at": 0,
         "milestone_count": 0,
         "milestone_content": "",
@@ -7835,6 +7968,9 @@ def _run_hosted_role(
                 "started_at": int(
                     previous_state.get("started_at")
                     or state["started_at"]
+                ),
+                "model_started_at": int(
+                    previous_state.get("model_started_at") or 0
                 ),
                 "first_token_at": int(previous_state.get("first_token_at") or 0),
                 "milestone_count": int(previous_state.get("milestone_count") or 0),
@@ -7909,7 +8045,7 @@ def _run_hosted_role(
         )
     last_persisted_at = 0.0
     first_visible_published = False
-    chat_lifecycle_checkpoint_scheduled = False
+    last_live_published_at = 0.0
     atomic_depth = 0
 
     def claim_pending_intervention(
@@ -8015,8 +8151,7 @@ def _run_hosted_role(
         last_persisted_at = time.monotonic()
 
     def on_event(event: dict[str, Any]) -> None:
-        nonlocal atomic_depth, first_visible_published
-        nonlocal chat_lifecycle_checkpoint_scheduled
+        nonlocal atomic_depth, first_visible_published, last_live_published_at
         if _hosted_turn_cancellation_requested(conversation_id, turn_id):
             raise _HostedTurnCancelled("Hosted turn cancelled")
         protocol_event = event
@@ -8087,47 +8222,6 @@ def _run_hosted_role(
             first_status_update = False
         apply_profile_event(state, event)
         _queue_hosted_protocol_event(state, protocol_event)
-        # Publish the first chat lifecycle snapshot as soon as the gateway
-        # accepts the model turn.  The normal chat path intentionally avoids a
-        # synchronous multi-megabyte state rewrite for transient events, but
-        # waiting until the first token leaves the iOS UI blind during provider
-        # startup/reconnect.  One asynchronous checkpoint gives SSE a real
-        # conversation projection without blocking the provider stream or
-        # rewriting state for every token.
-        if (
-            role_stage.split(":", 1)[0] == "chat"
-            and not chat_lifecycle_checkpoint_scheduled
-            and event_type == "agent.started"
-        ):
-            chat_lifecycle_checkpoint_scheduled = True
-            lifecycle_state = deepcopy(state)
-
-            def _checkpoint_chat_lifecycle() -> None:
-                try:
-                    _persist_hosted_role_state(
-                        conversation_id,
-                        turn_id,
-                        profile=profile,
-                        role_stage=role_stage,
-                        role_label=role_label,
-                        state=lifecycle_state,
-                        content_fallback=start_text,
-                        final_report=final_report,
-                        visible=visible,
-                    )
-                except Exception:
-                    logger.debug(
-                        "Hosted chat lifecycle checkpoint failed for %s/%s",
-                        conversation_id,
-                        turn_id,
-                        exc_info=True,
-                    )
-
-            threading.Thread(
-                target=_checkpoint_chat_lifecycle,
-                name=f"hosted-chat-checkpoint-{turn_id[-10:]}",
-                daemon=True,
-            ).start()
         if event_type in {"tool.complete", "subagent.complete"}:
             atomic_depth = max(0, atomic_depth - 1)
         if event_type == "request.accepted":
@@ -8152,10 +8246,49 @@ def _run_hosted_role(
         # use the periodic checkpoint path because their tool/subagent state
         # must survive a worker restart.
         is_chat_role = role_stage.split(":", 1)[0] == "chat"
-        if is_chat_role and (
-            event_type in {"agent.started", "connection.retry"}
-            or first_visible_delta
-        ):
+        live_event_types = {
+            "agent.started",
+            "connection.retry",
+            "error",
+            "message.complete",
+            "message.delta",
+            "reasoning.available",
+            "reasoning.delta",
+            "request.accepted",
+            "session.info",
+            "status.update",
+            "subagent.complete",
+            "subagent.progress",
+            "subagent.start",
+            "thinking.delta",
+            "tool.complete",
+            "tool.generating",
+            "tool.progress",
+            "tool.start",
+        }
+        force_live_projection = event_type in {
+            "agent.started",
+            "connection.retry",
+            "error",
+            "message.complete",
+            "reasoning.available",
+            "request.accepted",
+            "session.info",
+            "subagent.complete",
+            "subagent.start",
+            "tool.complete",
+            "tool.start",
+        } or first_visible_delta
+        live_now = time.monotonic()
+        should_publish_live = (
+            is_chat_role
+            and event_type in live_event_types
+            and (
+                force_live_projection
+                or live_now - last_live_published_at >= 0.05
+            )
+        )
+        if should_publish_live:
             # Keep lifecycle/first-token rendering independent from the
             # durable JSON checkpoint.  The latter can take seconds under
             # load; the live projection is replaced by the next checkpoint.
@@ -8171,6 +8304,7 @@ def _run_hosted_role(
                 visible=visible,
                 persist=False,
             )
+            last_live_published_at = live_now
             if first_visible_delta:
                 first_visible_published = True
         should_persist = (
@@ -13888,6 +14022,9 @@ class EnqueueHostedTurnBody(BaseModel):
     delivery_context: str = ""
     required_provider: str = ""
     required_model: str = ""
+    create_conversation_if_missing: bool = False
+    conversation_profile: str = "default"
+    conversation_title: str = ""
 
 
 class HostedTurnCancellationBody(BaseModel):
@@ -15662,7 +15799,11 @@ def _hosted_event_stream_frame(
             str(conversation.get("owner_id") or LOCAL_OWNER_ID)
         ),
     }
-    if include_snapshot or page.has_gap:
+    if (
+        include_snapshot
+        or page.has_gap
+        or not page.events
+    ):
         envelope["conversation"] = _public_conversation(conversation)
     has_more = current_cursor < max(
         0,
@@ -15794,12 +15935,10 @@ async def stream_hosted_conversation_events(
                 conversation_id,
                 owner_id,
                 delivered_cursor=delivered_cursor,
-                # A persisted notification may represent cancellation,
-                # routing or another state transition without a lifecycle
-                # delta. Shipping the authoritative snapshot here also lets
-                # iOS reconcile directly instead of issuing a full GET for
-                # every SSE batch.
-                include_snapshot=True,
+                # Live token/tool/reasoning batches are event-only. State-only
+                # updates and terminal boundaries still receive an
+                # authoritative snapshot in _hosted_event_stream_frame.
+                include_snapshot=False,
                 limit=500,
             )
             if live_frame is not None:
@@ -15815,7 +15954,7 @@ async def stream_hosted_conversation_events(
                     envelope, has_more_events = _hosted_event_stream_frame(
                         conversation,
                         delivered_cursor=delivered_cursor,
-                        include_snapshot=True,
+                        include_snapshot=False,
                         limit=500,
                     )
             current_cursor = int(envelope["cursor"])
@@ -15996,6 +16135,15 @@ def _enqueue_payload_fingerprint(
         "attachment_ids": list(dict.fromkeys(payload.attachment_ids)),
         "attachment_context": payload.attachment_context,
         "delivery_context": payload.delivery_context,
+        "create_conversation_if_missing": bool(
+            getattr(payload, "create_conversation_if_missing", False)
+        ),
+        "conversation_profile": str(
+            getattr(payload, "conversation_profile", "") or ""
+        ).strip(),
+        "conversation_title": str(
+            getattr(payload, "conversation_title", "") or ""
+        ).strip(),
         "required_provider": str(
             getattr(payload, "required_provider", "") or ""
         ).strip(),
@@ -16411,12 +16559,31 @@ def enqueue_hosted_turn(
     replay_response: Optional[dict[str, Any]] = None
     with _STATE_LOCK:
         state = load_single_state()
-        conversation, _claimed = _owned_conversation_in_state(
-            state,
-            conversation_id,
-            owner_id,
+        existing_conversation = next(
+            (
+                item
+                for item in state.get("conversations") or []
+                if isinstance(item, dict)
+                and str(item.get("id") or "") == conversation_id
+            ),
+            None,
         )
-        conversation_profile = str(conversation.get("profile") or "default").strip() or "default"
+        if existing_conversation is None:
+            if not bool(getattr(payload, "create_conversation_if_missing", False)):
+                raise HTTPException(status_code=404, detail="Conversation not found")
+            conversation = None
+            conversation_profile = str(
+                getattr(payload, "conversation_profile", "") or "default"
+            ).strip() or "default"
+        else:
+            conversation, _claimed = _owned_conversation_in_state(
+                state,
+                conversation_id,
+                owner_id,
+            )
+            conversation_profile = (
+                str(conversation.get("profile") or "default").strip() or "default"
+            )
         runtime_binding = _required_runtime_binding(
             conversation_profile,
             required_provider=str(
@@ -16426,7 +16593,7 @@ def enqueue_hosted_turn(
                 getattr(payload, "required_model", "") or ""
             ),
         )
-        requests = conversation.get("enqueue_requests")
+        requests = conversation.get("enqueue_requests") if conversation is not None else None
         requests = requests if isinstance(requests, dict) else {}
         existing_request = requests.get(request_id)
         if isinstance(existing_request, dict):
@@ -16507,11 +16674,32 @@ def enqueue_hosted_turn(
 
     with _STATE_LOCK:
         state = load_single_state()
-        conversation, _claimed = _owned_conversation_in_state(
-            state,
-            conversation_id,
-            owner_id,
+        existing_conversation = next(
+            (
+                item
+                for item in state.get("conversations") or []
+                if isinstance(item, dict)
+                and str(item.get("id") or "") == conversation_id
+            ),
+            None,
         )
+        if existing_conversation is None:
+            if not bool(getattr(payload, "create_conversation_if_missing", False)):
+                raise HTTPException(status_code=404, detail="Conversation not found")
+            conversation = create_single_conversation(
+                conversation_profile,
+                str(getattr(payload, "conversation_title", "") or "").strip(),
+            )
+            conversation["id"] = conversation_id
+            conversation["owner_id"] = owner_id
+            conversation["account_generation"] = account_generation
+            state.setdefault("conversations", []).insert(0, conversation)
+        else:
+            conversation, _claimed = _owned_conversation_in_state(
+                state,
+                conversation_id,
+                owner_id,
+            )
         requests = conversation.get("enqueue_requests")
         if not isinstance(requests, dict):
             requests = {}
@@ -16733,7 +16921,7 @@ def enqueue_hosted_turn(
                 )[: len(requests) - 2000]
                 for key in oldest:
                     requests.pop(key, None)
-            # Start the official 0.19 gateway while the durable enqueue is
+            # Start the official 0.20 gateway while the durable enqueue is
             # being written.  The write is intentionally still synchronous,
             # but its JSON/atomic-I/O cost now overlaps agent imports and MCP
             # tool registration instead of delaying the first prompt.

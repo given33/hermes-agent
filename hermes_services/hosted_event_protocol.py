@@ -39,6 +39,10 @@ EVENT_TYPES = frozenset(
         "tool.progress",
         "tool.completed",
         "tool.failed",
+        "subagent.started",
+        "subagent.progress",
+        "subagent.completed",
+        "subagent.failed",
         "command.started",
         "command.output",
         "command.completed",
@@ -68,6 +72,8 @@ TERMINAL_EVENT_TYPES = frozenset(
         "thinking.completed",
         "tool.completed",
         "tool.failed",
+        "subagent.completed",
+        "subagent.failed",
         "command.completed",
         "command.failed",
         "intervention.completed",
@@ -79,6 +85,7 @@ PROGRESS_EVENT_TYPES = frozenset(
         "message.delta",
         "thinking.delta",
         "tool.progress",
+        "subagent.progress",
         "command.output",
     }
 )
@@ -162,6 +169,7 @@ def append_hosted_event(
     idempotency_key: str = "",
     occurred_at: int | None = None,
     entity_id: str = "",
+    assume_current_indexes: bool = False,
 ) -> AppendResult:
     """Append one lifecycle event with idempotency and terminal CAS guards."""
 
@@ -183,7 +191,8 @@ def append_hosted_event(
     cursor = _non_negative_int(conversation.get("hosted_event_cursor"))
     stored_sequences = conversation.get("hosted_event_sequences")
     sequences = stored_sequences if isinstance(stored_sequences, dict) else {}
-    _rebuild_retained_event_indexes(events, sequences=sequences)
+    if not assume_current_indexes:
+        _rebuild_retained_event_indexes(events, sequences=sequences)
     sequence_scope = f"{normalized_turn_id}:{normalized_role_stage}"
     sequence = _non_negative_int(sequences.get(sequence_scope)) + 1
     key = str(idempotency_key or "").strip()[:512]
@@ -201,17 +210,19 @@ def append_hosted_event(
             entity_id=normalized_entity_id,
         )
 
-    for existing in reversed(events):
-        if not isinstance(existing, dict):
-            continue
-        if str(existing.get("idempotency_key") or "") == key:
-            return AppendResult(deepcopy(existing), False, "duplicate")
+    if not assume_current_indexes:
+        for existing in reversed(events):
+            if not isinstance(existing, dict):
+                continue
+            if str(existing.get("idempotency_key") or "") == key:
+                return AppendResult(deepcopy(existing), False, "duplicate")
 
     stored_terminal_scopes = conversation.get("hosted_event_terminals")
     terminal_scopes = (
         stored_terminal_scopes if isinstance(stored_terminal_scopes, dict) else {}
     )
-    _rebuild_retained_event_indexes(events, terminal_scopes=terminal_scopes)
+    if not assume_current_indexes:
+        _rebuild_retained_event_indexes(events, terminal_scopes=terminal_scopes)
     turn_terminal_scope = f"turn:{normalized_turn_id}"
     prior_turn_terminal = str(terminal_scopes.get(turn_terminal_scope) or "")
     if prior_turn_terminal:
@@ -880,6 +891,9 @@ def normalize_legacy_profile_event(event: Any) -> tuple[str, dict[str, Any], str
     entity_id = str(
         payload.get("entity_id")
         or payload.get("tool_id")
+        or payload.get("child_session_id")
+        or payload.get("subagent_id")
+        or payload.get("task_id")
         or payload.get("id")
         or ""
     )
@@ -895,18 +909,33 @@ def normalize_legacy_profile_event(event: Any) -> tuple[str, dict[str, Any], str
         "tool.progress": "tool.progress",
         "tool.start": "tool.started",
         "tool.complete": "tool.failed" if payload.get("error") else "tool.completed",
+        "subagent.start": "subagent.started",
+        "subagent.progress": "subagent.progress",
+        "subagent.text": "subagent.progress",
+        "subagent.thinking": "subagent.progress",
+        "subagent.tool": "subagent.progress",
+        "subagent.complete": (
+            "subagent.failed"
+            if payload.get("error")
+            or str(payload.get("status") or "").lower() in {"error", "failed"}
+            else "subagent.completed"
+        ),
         "connection.retry": "connection.retry_started",
         "error": "turn.failed",
     }
     canonical = mapping.get(event_type)
     if canonical is None:
         canonical = "command.output" if event_type == "status.update" else "message.delta"
-    return canonical, _json_copy(payload), entity_id
+    normalized_payload = _json_copy(payload)
+    normalized_payload["source_event_type"] = event_type
+    return canonical, normalized_payload, entity_id
 
 
 def _entity_scope(turn_id: str, role_stage: str, event_type: str, entity_id: str) -> str:
     if event_type.startswith("tool."):
         category = "tool"
+    elif event_type.startswith("subagent."):
+        category = "subagent"
     elif event_type.startswith("command."):
         category = "command"
     elif event_type.startswith("message."):
