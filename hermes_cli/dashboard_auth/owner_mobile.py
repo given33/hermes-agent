@@ -198,7 +198,7 @@ def delete_owner_account_credentials(user_id: str) -> dict[str, Any]:
     unregister_provider(BasicAuthProvider.name, expected=provider)
     config_cleared = False
     try:
-        from hermes_runtime.config import load_config, save_config
+        from hermes_cli.config import load_config, save_config
 
         config = load_config()
         dashboard = config.setdefault("dashboard", {})
@@ -524,7 +524,7 @@ def mobile_register(request: Request, body: MobileRegisterBody):
             raise HTTPException(status_code=403, detail="Owner registration is closed")
         _validate_registration_code(email, body.verification_code)
 
-        from hermes_runtime.config import load_config, save_config
+        from hermes_cli.config import load_config, save_config
 
         config = load_config()
         mobile_store = _store()

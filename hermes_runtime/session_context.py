@@ -93,6 +93,18 @@ _SESSION_MESSAGE_ID: ContextVar = ContextVar("HERMES_SESSION_MESSAGE_ID", defaul
 
 _SESSION_PROFILE: ContextVar = ContextVar("HERMES_SESSION_PROFILE", default=_UNSET)
 
+# Hosted tool-output ownership follows the same concurrency rules as message
+# routing. Long-lived TUI/desktop gateways can serve multiple sessions, so
+# process-global environment variables are not sufficient once an Agent is
+# reused across turns.
+_TOOL_ARTIFACT_ROOT: ContextVar = ContextVar("HERMES_TOOL_ARTIFACT_ROOT", default=_UNSET)
+_TOOL_ARTIFACT_OWNER: ContextVar = ContextVar("HERMES_TOOL_ARTIFACT_OWNER", default=_UNSET)
+_TOOL_ARTIFACT_CONVERSATION: ContextVar = ContextVar(
+    "HERMES_TOOL_ARTIFACT_CONVERSATION", default=_UNSET
+)
+_TOOL_ARTIFACT_TURN: ContextVar = ContextVar("HERMES_TOOL_ARTIFACT_TURN", default=_UNSET)
+_ACCOUNT_GENERATION: ContextVar = ContextVar("HERMES_ACCOUNT_GENERATION", default=_UNSET)
+
 # Whether the current session's delivery channel can route an ASYNC completion
 # back to the agent AFTER the current turn ends (i.e. wake a fresh turn).
 #
@@ -133,6 +145,11 @@ _VAR_MAP = {
     "HERMES_UI_SESSION_ID": _SESSION_UI_SESSION_ID,
     "HERMES_SESSION_MESSAGE_ID": _SESSION_MESSAGE_ID,
     "HERMES_SESSION_PROFILE": _SESSION_PROFILE,
+    "HERMES_TOOL_ARTIFACT_ROOT": _TOOL_ARTIFACT_ROOT,
+    "HERMES_TOOL_ARTIFACT_OWNER": _TOOL_ARTIFACT_OWNER,
+    "HERMES_TOOL_ARTIFACT_CONVERSATION": _TOOL_ARTIFACT_CONVERSATION,
+    "HERMES_TOOL_ARTIFACT_TURN": _TOOL_ARTIFACT_TURN,
+    "HERMES_ACCOUNT_GENERATION": _ACCOUNT_GENERATION,
     "HERMES_CRON_AUTO_DELIVER_PLATFORM": _CRON_AUTO_DELIVER_PLATFORM,
     "HERMES_CRON_AUTO_DELIVER_CHAT_ID": _CRON_AUTO_DELIVER_CHAT_ID,
     "HERMES_CRON_AUTO_DELIVER_THREAD_ID": _CRON_AUTO_DELIVER_THREAD_ID,
@@ -174,6 +191,11 @@ def set_session_vars(
     cwd: str = "",
     async_delivery: bool = True,
     ui_session_id: str = "",
+    tool_artifact_root: str = "",
+    tool_artifact_owner: str = "",
+    tool_artifact_conversation: str = "",
+    tool_artifact_turn: str = "",
+    account_generation: str = "",
 ) -> list:
     """Set all session context variables and return reset tokens.
 
@@ -208,6 +230,11 @@ def set_session_vars(
         _SESSION_UI_SESSION_ID.set(ui_session_id),
         _SESSION_MESSAGE_ID.set(message_id),
         _SESSION_PROFILE.set(profile),
+        _TOOL_ARTIFACT_ROOT.set(tool_artifact_root),
+        _TOOL_ARTIFACT_OWNER.set(tool_artifact_owner),
+        _TOOL_ARTIFACT_CONVERSATION.set(tool_artifact_conversation),
+        _TOOL_ARTIFACT_TURN.set(tool_artifact_turn),
+        _ACCOUNT_GENERATION.set(account_generation),
         _SESSION_ASYNC_DELIVERY.set(bool(async_delivery)),
     ]
     try:
@@ -243,6 +270,11 @@ def clear_session_vars(tokens: list) -> None:
         _SESSION_UI_SESSION_ID,
         _SESSION_MESSAGE_ID,
         _SESSION_PROFILE,
+        _TOOL_ARTIFACT_ROOT,
+        _TOOL_ARTIFACT_OWNER,
+        _TOOL_ARTIFACT_CONVERSATION,
+        _TOOL_ARTIFACT_TURN,
+        _ACCOUNT_GENERATION,
     ):
         var.set("")
     # Reset async-delivery capability to the "never set" sentinel rather than a

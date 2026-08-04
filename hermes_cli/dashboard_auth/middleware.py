@@ -80,15 +80,7 @@ _GATE_PUBLIC_EXACT: frozenset[str] = frozenset(
 # Matched by prefix. Every entry MUST end in "/" so the match cannot run
 # past a path segment boundary; enforced by the assertion below.
 _GATE_PUBLIC_PREFIXES: tuple[str, ...] = (
-    "/auth/login",
-    "/auth/callback",
-    "/auth/native/authorize",
-    "/auth/native/token",
-    "/auth/native/refresh",
-    "/auth/password-login",
-    "/auth/logout",
-    "/login",
-    "/api/auth/providers",
+    "/auth/mobile/",
     "/api/mcp/oauth/callback/",
     "/assets/",
     "/ds-assets/",

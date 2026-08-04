@@ -1,13 +1,23 @@
-"""Compatibility alias for :mod:`hermes_runtime.config`.
+"""Configuration management for Hermes Agent."""
 
-The configuration authority moved out of the CLI package.  This module keeps
-the historical import path bound to the exact same module object so existing
-plugins and monkeypatch-based integrations continue to observe one cache,
-one write lock, and one set of functions.
-"""
-
-from importlib import import_module
+import copy
+import errno
+import json
+import logging
+import os
+import platform
+import re
+import shutil
+import stat
+import subprocess
 import sys
+import tempfile
+import threading
+import time
+from contextlib import contextmanager
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Dict, Any, Optional, List, Tuple, Set
 
 from hermes_cli.route_identity import normalize_route_base_url
 from hermes_cli.secret_prompt import masked_secret_prompt

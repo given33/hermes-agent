@@ -98,7 +98,12 @@ async def ios_intelligence_lifespan(_app):
                 restart_backoff_seconds=config.supervisor.restart_backoff_seconds,
                 blue_green_port_offset=config.supervisor.blue_green_port_offset,
                 drain_timeout_seconds=config.supervisor.drain_timeout_seconds,
+                idle_timeout_seconds=config.supervisor.idle_timeout_seconds,
                 owner_id=config.owner_id,
+                # Keep the complete MCP manifest available to hosted Agents,
+                # but defer each isolated iOS process until its first tool
+                # call.  A public TCP proxy owns the stable endpoint.
+                lazy_start=True,
                 log_directory=(
                     config.log_directory
                     if Path(config.log_directory).is_absolute()
@@ -255,9 +260,9 @@ def _bound_relay_identity(
 
 
 @router.get("/health")
-def health() -> dict[str, Any]:
+def health(probe: bool = Query(False)) -> dict[str, Any]:
     store = intelligence_store()
-    runtime_health = _MCP_RUNTIME.health() if _MCP_RUNTIME is not None else {
+    runtime_health = _MCP_RUNTIME.health(probe=probe) if _MCP_RUNTIME is not None else {
         "ok": False,
         "running": False,
         "healthy_count": 0,

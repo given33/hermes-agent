@@ -13,6 +13,35 @@ append-only progress, files, notifications, and the final user-facing answer.
 DBB3 and WSL are replaceable execution nodes. A phone disconnect never owns or
 cancels a server task.
 
+## Product routing contract
+
+Hosted execution is a durability and transport mechanism, not a user-visible
+conversation mode. Both ordinary chat and collaboration turns may use the
+hosted-turn API so they survive app suspension, network loss, or a killed phone.
+The client must never label an ordinary chat as hosted work merely because that
+transport was used.
+
+- Ordinary conversation, explanation, translation, summary, search, short
+  confirmations, numeric replies, and single-Hermes single-step requests stay
+  in the normal chat surface.
+- Concrete multi-step execution, code or system mutation, deployment, testing,
+  cross-device work, long-running work, or requested deliverables enter the
+  Manager -> Worker -> Reviewer -> Reporter collaboration workflow.
+- Completed or failed collaboration history does not promote a later ordinary
+  turn. Only a current non-terminal work turn may activate the group surface.
+- Reporter and workflow labels are reserved for collaboration turns. A simple
+  chat failure remains a Hermes chat failure and must not be presented as a
+  hosted task or final report.
+
+For a simple chat, the visible wait states are authoritative and ordered:
+
+`sending -> reconnecting (1/5 ... 5/5) -> thinking -> first token starts elapsed time -> completed | failed`
+
+HTTP acceptance only means the durable message was stored; it does not mean the
+model received it. `thinking` starts after model readiness succeeds but carries
+no elapsed timer. The timer starts exactly when the first model token is
+persisted. Intermediate runtime details remain collapsed by default.
+
 ## Task flow
 
 ```mermaid

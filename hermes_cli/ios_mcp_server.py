@@ -40,7 +40,7 @@ CAPABILITIES = (
     "ios-health-heart", "ios-health-oxygen", "ios-health-activity", "ios-health-write", "ios-calendar",
     "ios-reminders", "ios-clipboard", "ios-contacts", "ios-photos", "ios-media",
     "ios-vision", "ios-bluetooth", "ios-nfc", "ios-homekit", "ios-notes", "ios-screen-time", "ios-watch", "ios-notification",
-    "ios-live-activity", "ios-browser", "ios-device",
+    "ios-live-activity", "ios-browser", "ios-device", "ios-alarm", "ios-nlp",
 )
 
 MCP_VERSION = "1.0.0"
@@ -60,6 +60,8 @@ _SCOPE_BY_CAPABILITY = {
     "ios-health-activity": ("health:activity:read",),
     "ios-calendar": ("calendar:read", "calendar:write"),
     "ios-reminders": ("reminders:read", "reminders:write"),
+    "ios-alarm": ("reminders:read", "reminders:write", "notification:send"),
+    "ios-nlp": ("nlp:read",),
     "ios-clipboard": ("clipboard:read", "clipboard:write"),
     "ios-contacts": ("contacts:read", "contacts:write"),
     "ios-photos": ("photos:read", "photos:write", "camera:write"),
@@ -132,6 +134,12 @@ _TOOL_SCOPE_BY_CAPABILITY = {
         "ios_reminder_complete": ("reminders:write",),
         "ios_reminder_delete": ("reminders:write",),
     },
+    "ios-alarm": {
+        "ios_alarm_schedule": ("reminders:write", "notification:send"),
+        "ios_alarm_list": ("reminders:read",),
+        "ios_alarm_cancel": ("reminders:write", "notification:send"),
+    },
+    "ios-nlp": {"ios_nlp_analyze": ("nlp:read",)},
     "ios-clipboard": {
         "ios_clipboard_read": ("clipboard:read",),
         "ios_clipboard_write": ("clipboard:write",),
@@ -342,11 +350,45 @@ def ios_mcp_manifests(
                 for tool_name, scopes in _TOOL_SCOPE_BY_CAPABILITY[capability].items()
             },
             "health": {"command": "tools/list", "timeout_seconds": 10},
+            # The dashboard can advertise the complete MCP contract without
+            # starting the isolated service.  The client uses these schemas
+            # for tool registration and the runtime proxy starts the service
+            # only when a tool call is actually made.
+            "tool_definitions": ios_mcp_tool_definitions(capability),
             "log_namespace": f"hermes.mcp.{capability}",
             "deployment": {"supervised": True, "blue_green": True, "rollback": True},
         }
         for index, capability in enumerate(CAPABILITIES)
     }
+
+
+def ios_mcp_tool_definitions(capability: str) -> list[dict[str, Any]]:
+    """Return serializable tool schemas without starting an MCP server.
+
+    ``create_mcp_server`` only registers Python functions, so constructing it
+    here is side-effect free and gives the dashboard the same input schemas
+    that a live ``tools/list`` response would expose.
+    """
+
+    server = create_mcp_server(capability)
+    manager = getattr(server, "_tool_manager", None)
+    tools = getattr(manager, "_tools", {}) if manager is not None else {}
+    definitions: list[dict[str, Any]] = []
+    for tool in (tools.values() if isinstance(tools, Mapping) else ()):
+        name = str(getattr(tool, "name", "") or "").strip()
+        if not name:
+            continue
+        parameters = getattr(tool, "parameters", None)
+        if not isinstance(parameters, Mapping):
+            parameters = {"type": "object", "properties": {}}
+        definitions.append(
+            {
+                "name": name,
+                "description": str(getattr(tool, "description", "") or ""),
+                "input_schema": dict(parameters),
+            }
+        )
+    return definitions
 
 
 def ios_mcp_server_configs(
@@ -370,6 +412,7 @@ def ios_mcp_server_configs(
             "tools": {"resources": False, "prompts": False},
             "manifest": manifests[capability],
             "granted_scopes": list(granted_scopes),
+            "lazy_start": transport == "streamable-http",
         }
         if transport == "streamable-http":
             configs[capability] = {
@@ -502,6 +545,7 @@ _DEVICE_PERMISSION_BY_CAPABILITY = {
     "ios-health-write": "health",
     "ios-calendar": "calendar",
     "ios-reminders": "reminders",
+    "ios-alarm": "reminders",
     "ios-screen-time": "screenTime",
 }
 
@@ -950,6 +994,28 @@ def create_mcp_server(
         _queue_tool(mcp, enforcer, store, capability, "ios_reminder_update", "update", "Use when the user asks Hermes to update a reminder after confirmation.")
         _queue_tool(mcp, enforcer, store, capability, "ios_reminder_complete", "complete", "Use when the user asks Hermes to complete a reminder after confirmation.")
         _queue_tool(mcp, enforcer, store, capability, "ios_reminder_delete", "delete", "Use when the user asks Hermes to delete a reminder after confirmation.")
+        return mcp
+
+    if capability == "ios-alarm":
+        _queue_tool(
+            mcp, enforcer, store, capability, "ios_alarm_schedule", "schedule",
+            "Use when the user asks Hermes to schedule an iPhone alarm-style reminder and local notification. Payload requires title and fireAt.",
+        )
+        _queue_tool(
+            mcp, enforcer, store, capability, "ios_alarm_list", "list",
+            "Use when Hermes needs the user's current iPhone alarm-style reminders.",
+        )
+        _queue_tool(
+            mcp, enforcer, store, capability, "ios_alarm_cancel", "cancel",
+            "Use when the user asks Hermes to cancel an alarm-style reminder or notification after confirmation.",
+        )
+        return mcp
+
+    if capability == "ios-nlp":
+        _queue_tool(
+            mcp, enforcer, store, capability, "ios_nlp_analyze", "analyze",
+            "Use when Hermes needs on-device language identification, sentiment, or token counts for supplied text.",
+        )
         return mcp
 
     if capability == "ios-clipboard":

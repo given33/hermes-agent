@@ -266,6 +266,44 @@ def atomic_write_text(
         raise
 
 
+def write_secret_file(
+    path: Union[str, Path],
+    text: str,
+    *,
+    mode: int = 0o600,
+    encoding: str = "utf-8",
+) -> None:
+    """Atomically write text with restrictive permissions from creation."""
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+
+    original_owner = _preserve_file_owner(path)
+    fd, tmp_path = tempfile.mkstemp(
+        dir=str(path.parent),
+        prefix=f".{path.stem}_",
+        suffix=".tmp",
+    )
+    try:
+        if hasattr(os, "fchmod"):
+            os.fchmod(fd, mode)
+        with os.fdopen(fd, "w", encoding=encoding) as handle:
+            handle.write(text)
+            handle.flush()
+            os.fsync(handle.fileno())
+        real_path = Path(atomic_replace(tmp_path, path))
+        _restore_file_owner(real_path, original_owner)
+        try:
+            os.chmod(real_path, mode)
+        except OSError:
+            pass
+    except BaseException:
+        try:
+            os.unlink(tmp_path)
+        except OSError:
+            pass
+        raise
+
+
 def atomic_json_write(
     path: Union[str, Path],
     data: Any,

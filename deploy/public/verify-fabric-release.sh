@@ -11,7 +11,7 @@ expected_version="${2:-}"
 [[ "${expected_version}" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] || die "expected version is invalid"
 token_file="${HERMES_MANAGED_INSTALLATION_TOKEN_FILE:-/etc/hermes-agent/managed-installation-token}"
 [[ -f "${token_file}" && ! -L "${token_file}" ]] || die "managed installation credential is missing or unsafe"
-attempts="${HERMES_FABRIC_VERIFY_ATTEMPTS:-60}"
+attempts="${HERMES_FABRIC_VERIFY_ATTEMPTS:-300}"
 [[ "${attempts}" =~ ^[1-9][0-9]*$ ]] || die "verification attempts must be a positive integer"
 
 curl_config="$(mktemp /run/hermes-fabric-verify-curl.XXXXXX)"

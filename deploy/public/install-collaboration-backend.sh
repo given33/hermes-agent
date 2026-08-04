@@ -89,12 +89,29 @@ required=(
   "deploy/public/runtime-requirements.lock"
 )
 runtime_service_assets=(
+  "plugins/collaboration/dashboard/hosted_tui_runtime.py"
   "agent/agent_runtime_helpers.py"
   "agent/chat_completion_helpers.py"
+  "agent/codex_runtime.py"
   "agent/conversation_compression.py"
   "agent/conversation_loop.py"
   "agent/curator_backup.py"
+  "agent/memory_provider.py"
+  "agent/turn_context.py"
   "agent/lsp/workspace.py"
+  "agent/copilot_auth.py"
+  "agent/fallback_config.py"
+  "agent/image_routing.py"
+  "agent/moa_config.py"
+  "agent/model_catalog.py"
+  "agent/model_metadata.py"
+  "agent/models_dev.py"
+  "agent/model_cost_guard.py"
+  "agent/model_normalize.py"
+  "agent/nous_account.py"
+  "agent/provider_auth.py"
+  "agent/provider_registry.py"
+  "agent/runtime_provider.py"
   "agent/shell_hooks.py"
   "agent/tool_dispatch_helpers.py"
   "agent/tool_executor.py"
@@ -173,8 +190,10 @@ runtime_service_assets=(
   "plugins/cron_providers/__init__.py"
   "plugins/memory/__init__.py"
   "plugins/memory/config_schema.py"
+  "plugins/memory/honcho/__init__.py"
   "providers/__init__.py"
   "run_agent.py"
+  "tui_gateway/entry.py"
   "tools/code_execution_tool.py"
   "tools/computer_use/cua_backend.py"
   "tools/credential_files.py"
@@ -183,6 +202,7 @@ runtime_service_assets=(
   "tools/lazy_deps.py"
   "tools/mcp_oauth.py"
   "tools/mcp_oauth_manager.py"
+  "tools/mcp_schema_cache.py"
   "tools/registry.py"
   "tools/skills_guard.py"
   "tools/skills_hub.py"
@@ -1513,7 +1533,7 @@ fi
 if [[ "${dependency_update_enabled}" == 1 ]]; then
   sudo -u "${service_user}" -- env HERMES_HOME="${runtime_home}" \
     PYTHONPATH="${target_root}${PYTHONPATH:+:${PYTHONPATH}}" \
-    "${runtime_python}" -c 'from hermes_cli.web_server import app; assert app' \
+    "${runtime_python}" -c 'from agent.runtime_provider import resolve_runtime_provider; from hermes_cli.web_server import app; assert resolve_runtime_provider and app' \
     || { printf '%s\n' "installed dashboard import preflight failed" >&2; false; }
 fi
 # journalctl accepts the local ``YYYY-MM-DD HH:MM:SS`` form consistently
@@ -1685,8 +1705,9 @@ printf 'header = "X-DBB3-Token: %s"\nheader = "Accept: application/json"\n' \
   "$(cat -- "${managed_installation_token_file}")" >"${installation_health_cfg}"
 # Fabric nodes update from a two-minute systemd timer and may need several
 # minutes for dependency installation plus the receiver restart. Keep the
-# rollout fail-closed, but allow the normal timer/update transaction to finish.
-fabric_health_attempts="${HERMES_FABRIC_HEALTH_ATTEMPTS:-60}"
+# rollout fail-closed, but give a node that just missed the timer a full five
+# minute window to complete the normal update transaction.
+fabric_health_attempts="${HERMES_FABRIC_HEALTH_ATTEMPTS:-300}"
 [[ "${fabric_health_attempts}" =~ ^[1-9][0-9]*$ ]] \
   || die "HERMES_FABRIC_HEALTH_ATTEMPTS must be a positive integer"
 for node in dbb3 wsl; do

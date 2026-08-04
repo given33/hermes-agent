@@ -94,6 +94,12 @@ def _add_forward_compat_models(model_ids: List[str]) -> List[str]:
     return ordered
 
 
+# Public compatibility name used by the shared model catalog and third-party
+# provider plugins. Keep the implementation under the historical private name
+# so older imports continue to work while 0.20 callers use the stable API.
+add_forward_compat_models = _add_forward_compat_models
+
+
 def _extract_chatgpt_account_id(access_token: str) -> Optional[str]:
     """Best-effort extraction of ``chatgpt_account_id`` from the OAuth JWT.
 

@@ -774,7 +774,11 @@
       reporter: "Hermes 正在整理最终汇报",
     };
     for (const run of Object.values(conversation?.hosted_turns || {})) {
+      const runMode = String(
+        run?.mode || run?.route_metadata?.mode || "",
+      ).toLowerCase();
       if (
+        runMode !== "work" ||
         !["queued", "running"].includes(run?.status) ||
         !run?.turn_id ||
         representedTurnIds.has(run.turn_id)

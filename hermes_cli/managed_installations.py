@@ -37,12 +37,12 @@ from hermes_constants import get_hermes_home
 from hermes_runtime.config import read_raw_config_strict
 try:
     from hermes_cli.sqlite_util import copy_sqlite_fallback, resolve_sqlite_fallback
-except ModuleNotFoundError as exc:
-    # A legacy fabric updater may have deployed this module before it learned
-    # to ship sqlite_util.py. Keep the receiver bootable long enough for that
-    # updater to recover the missing asset; all current nodes use the durable
-    # fallback implementation above.
-    if exc.name != "hermes_cli.sqlite_util":
+except ImportError as exc:
+    # A legacy fabric updater may deploy this module without sqlite_util.py, or
+    # leave an older sqlite_util.py that predates these two helpers. Keep the
+    # receiver bootable across that one-release handoff; the current updater
+    # installs the complete helper on every subsequent fabric release.
+    if getattr(exc, "name", None) != "hermes_cli.sqlite_util":
         raise
 
     def resolve_sqlite_fallback(

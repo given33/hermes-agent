@@ -82,8 +82,10 @@ Thread safety:
 import asyncio
 import contextvars
 import concurrent.futures
+from dataclasses import dataclass
 import errno
 import fnmatch
+import functools
 import inspect
 import json
 import logging
@@ -98,7 +100,7 @@ import time
 from types import SimpleNamespace
 from typing import Callable
 from datetime import datetime
-from typing import Any, Coroutine, Dict, List, Optional, Set, Tuple
+from typing import Any, Coroutine, Dict, Iterable, List, Optional, Set, Tuple
 from urllib.parse import urlparse
 
 from tools.registry import tool_error
@@ -1754,9 +1756,11 @@ class MCPServerTask:
         "_registered_tool_names", "_auth_type", "_refresh_lock",
         "_rpc_lock", "_pending_refresh_tasks",
         "_pending_call_context",
+        "_accepting_calls", "_call_state_lock", "_inflight_calls", "_inflight_zero",
+        "_lazy_start", "_lazy_start_lock", "_lazy_start_error",
         "_lifecycle_started_at", "_last_tool_call_at",
         "_idle_timeout_seconds", "_max_lifetime_seconds", "_recycled_reason",
-        "initialize_result", "_ping_unsupported",
+        "initialize_result", "discover_result", "_ping_unsupported",
         "_reconnect_retries", "_session_proven", "_was_parked",
     )
 
@@ -1816,6 +1820,11 @@ class MCPServerTask:
         self._inflight_calls = 0
         self._inflight_zero = threading.Event()
         self._inflight_zero.set()
+        # Static/hosted MCP manifests expose the full tool contract before the
+        # transport is opened.  The first real tool call starts the service.
+        self._lazy_start = False
+        self._lazy_start_lock = threading.Lock()
+        self._lazy_start_error: Optional[str] = None
         self._pending_refresh_tasks: set[asyncio.Task] = set()
         # contextvars snapshot of the agent task that's currently in
         # session.call_tool(). The MCP recv loop dispatches incoming
@@ -4744,6 +4753,61 @@ async def _connect_server(name: str, config: dict) -> MCPServerTask:
     return server
 
 
+def _static_mcp_server(name: str, config: dict) -> MCPServerTask:
+    """Build a registry-only MCP task from a serialized tool manifest.
+
+    Hosted/mobile sessions need the complete tool contract during agent
+    construction, but starting every MCP child on the cold path is both slow
+    and brittle. The static task exposes schemas now and opens the transport
+    on its first actual tool call.
+    """
+    manifest = config.get("manifest") if isinstance(config, dict) else None
+    raw_definitions = config.get("tool_definitions") if isinstance(config, dict) else None
+    if not isinstance(raw_definitions, list) and isinstance(manifest, dict):
+        raw_definitions = manifest.get("tool_definitions")
+    if not isinstance(raw_definitions, list):
+        raw_definitions = []
+
+    if not raw_definitions:
+        try:
+            from hermes_cli.ios_mcp_server import ios_mcp_tool_definitions
+
+            raw_definitions = ios_mcp_tool_definitions(name)
+        except Exception:
+            scopes = manifest.get("tool_scopes") if isinstance(manifest, dict) else {}
+            raw_definitions = [
+                {
+                    "name": str(tool_name),
+                    "description": f"MCP tool {tool_name} from {name}",
+                    "input_schema": {"type": "object", "properties": {}},
+                }
+                for tool_name in (scopes.keys() if isinstance(scopes, dict) else ())
+            ]
+
+    server = MCPServerTask(name)
+    server._config = dict(config)
+    server.tool_timeout = float(config.get("timeout", _DEFAULT_TOOL_TIMEOUT))
+    server._lazy_start = True
+    server._tools = [
+        SimpleNamespace(
+            name=str(item.get("name") or "").strip(),
+            description=str(item.get("description") or ""),
+            input_schema=(
+                dict(item.get("input_schema"))
+                if isinstance(item.get("input_schema"), dict)
+                else (
+                    dict(item.get("inputSchema"))
+                    if isinstance(item.get("inputSchema"), dict)
+                    else {"type": "object", "properties": {}}
+                )
+            ),
+        )
+        for item in raw_definitions
+        if isinstance(item, dict) and str(item.get("name") or "").strip()
+    ]
+    return server
+
+
 # ---------------------------------------------------------------------------
 # Handler / check-fn factories
 # ---------------------------------------------------------------------------
@@ -4926,6 +4990,36 @@ def _mark_server_call_started(server: Any) -> None:
         mark_tool_call()
 
 
+def _ensure_lazy_server_session(
+    server_name: str,
+    server: "MCPServerTask",
+) -> bool:
+    """Start a static-manifest MCP server on its first real tool call."""
+    if server.session is not None and server._ready.is_set():
+        return True
+    with server._lazy_start_lock:
+        if server.session is not None and server._ready.is_set():
+            return True
+        config = dict(server._config or {})
+        timeout = max(
+            5.0,
+            float(config.get("connect_timeout", _DEFAULT_CONNECT_TIMEOUT)),
+        )
+        _ensure_mcp_loop()
+        try:
+            _run_on_mcp_loop(lambda: server.start(config), timeout=timeout)
+        except Exception as exc:
+            server._lazy_start_error = _format_connect_error(exc)
+            logger.warning(
+                "Lazy MCP startup failed for '%s': %s",
+                server_name,
+                server._lazy_start_error,
+            )
+            return False
+        server._lazy_start_error = None
+        return server.session is not None and server._ready.is_set()
+
+
 def _make_tool_handler(server_name: str, tool_name: str, tool_timeout: float):
     """Return a sync handler that calls an MCP tool via the background loop.
 
@@ -4962,6 +5056,13 @@ def _make_tool_handler(server_name: str, tool_name: str, tool_timeout: float):
         if not server:
             _bump_server_error(server_name)
             return tool_error(f"MCP server '{server_name}' is not connected")
+
+        if getattr(server, "_lazy_start", False) and not server.session:
+            if not _ensure_lazy_server_session(server_name, server):
+                error = server._lazy_start_error or "lazy MCP service is unavailable"
+                return tool_error(
+                    f"MCP server '{server_name}' failed to start: {error}"
+                )
 
         if not server.session:
             # No live session. A reconnect may already be completing (the
@@ -5391,6 +5492,7 @@ def _make_check_fn(server_name: str):
             server = _servers.get(server_name)
             if server is not None and (
                 server.session is not None or server._is_recycled_stdio()
+                or getattr(server, "_lazy_start", False)
             ):
                 return True
             # Lazy (schema-cache registered) servers are available: the
@@ -6409,7 +6511,7 @@ def register_mcp_servers(
     }
     if authoritative:
         with _lock:
-            retire_names = set(_servers) - enabled_names
+            retire_names = (set(_servers) | set(_lazy_server_configs)) - enabled_names
         _retire_mcp_servers(retire_names)
     if not servers:
         logger.debug("No explicit MCP servers provided")
@@ -6443,6 +6545,11 @@ def register_mcp_servers(
 
             async def _prepare(name: str, config: dict) -> MCPServerTask:
                 async with semaphore:
+                    if _parse_boolish(config.get("lazy_start", False), default=False):
+                        # Preserve the hosted/mobile lazy contract during a
+                        # blue-green config reload; never cold-start the child
+                        # merely because an endpoint or manifest changed.
+                        return _static_mcp_server(name, config)
                     connect_timeout = config.get(
                         "connect_timeout", _DEFAULT_CONNECT_TIMEOUT,
                     )
@@ -6602,6 +6709,32 @@ def register_mcp_servers(
             lazy_registered += len(names)
             lazy_server_count += 1
     new_servers = eager_servers
+
+    # Hosted/mobile manifests publish their complete schemas immediately while
+    # deferring every MCP handshake until a tool is actually selected. This is
+    # distinct from the official on-disk schema-cache ``lazy`` path above:
+    # ``lazy_start`` carries an explicit serialized contract and works even
+    # when no cache file exists.
+    lazy_servers = {
+        name: config
+        for name, config in new_servers.items()
+        if _parse_boolish(config.get("lazy_start", False), default=False)
+    }
+    for name, config in lazy_servers.items():
+        server = _static_mcp_server(name, config)
+        fingerprint = _fingerprint(config)
+        registered_names = _register_server_tools(name, server, config)
+        server._registered_tool_names = list(registered_names)
+        with _lock:
+            _servers[name] = server
+            _server_config_fingerprints[name] = fingerprint
+            _server_connect_errors.pop(name, None)
+            _server_connecting.discard(name)
+    new_servers = {
+        name: config
+        for name, config in new_servers.items()
+        if name not in lazy_servers
+    }
 
     if not new_servers:
         if lazy_registered:

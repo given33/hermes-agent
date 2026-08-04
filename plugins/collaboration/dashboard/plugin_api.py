@@ -34,6 +34,11 @@ from pathlib import Path
 from typing import Any, Callable, Optional
 from urllib.parse import quote, unquote
 
+_RUNTIME_IMPORT_ROOT = str(Path(__file__).resolve().parents[3])
+if _RUNTIME_IMPORT_ROOT in sys.path:
+    sys.path.remove(_RUNTIME_IMPORT_ROOT)
+sys.path.insert(0, _RUNTIME_IMPORT_ROOT)
+
 from hermes_services.startup import bootstrap_trusted_runtime
 
 # This module can be loaded directly from a dashboard manifest. Seal trusted
@@ -98,6 +103,12 @@ from hermes_services.session_entries import (
     normalize_session_entries,
 )
 from hermes_services.tool_output_artifacts import EncryptedToolArtifactStore
+from plugins.collaboration.dashboard.hosted_tui_runtime import (
+    HostedTuiGatewayCancelled,
+    prewarm_hosted_gateway,
+    release_hosted_gateway_conversation,
+    run_hosted_gateway_turn,
+)
 
 
 _WRITE_APPROVAL_RECOVERY_INTERVAL_SECONDS = 5.0
@@ -277,6 +288,16 @@ _HOSTED_ROUTING_THREADS_LOCK = threading.Lock()
 _HOSTED_ROUTING_THREADS: dict[str, threading.Thread] = {}
 _HOSTED_EXECUTION_GENERATION = threading.local()
 _COLLABORATION_DELETION_WRITE = threading.local()
+_STATE_THREAD_LOCAL = threading.local()
+# The hosted event stream and turn workers are separate threads, so the
+# thread-local fast path above cannot prevent them from reparsing the same
+# multi-megabyte document.  Keep one normalized single-store result keyed by
+# the atomic file's mtime/size fingerprint.  Writers invalidate it before an
+# atomic replace; an external writer is still detected by the fingerprint.
+_SINGLE_STATE_CACHE_LOCK = threading.RLock()
+_SINGLE_STATE_CACHE: dict[
+    tuple[str, bool], tuple[tuple[int, int], dict[str, Any]]
+] = {}
 _ACCOUNT_DELETION_TOMBSTONES_KEY = "account_deletion_tombstones"
 _HOSTED_CONVERSATION_LOCKS_LOCK = threading.Lock()
 
@@ -297,6 +318,19 @@ _MOBILE_NOTIFICATION_DISPATCH_THREAD: Optional[threading.Thread] = None
 _MOBILE_NOTIFICATION_PENDING: dict[str, tuple[str, str, int]] = {}
 _HOSTED_UPDATE_CONDITION = threading.Condition()
 _HOSTED_UPDATE_REVISION = 0
+_HOSTED_UPDATE_REVISIONS: dict[str, int] = {}
+# A hosted turn can produce a user-visible lifecycle event while the durable
+# single-conversation document is still being atomically rewritten.  Keep the
+# latest conversation projection outside the account-state lock so the SSE
+# reader can publish that event without waiting for a multi-megabyte JSON
+# write.  Snapshots are immutable after publication and are replaced on the
+# next state save.
+_HOSTED_LIVE_STATE_LOCK = threading.RLock()
+_HOSTED_LIVE_CONVERSATIONS: dict[str, dict[str, Any]] = {}
+_HOSTED_CANCEL_STATE_LOCK = threading.Lock()
+_HOSTED_CANCEL_SIGNALS: set[tuple[str, str]] = set()
+_HOSTED_CANCEL_CACHE: dict[tuple[str, str], tuple[float, bool]] = {}
+_HOSTED_CANCEL_CACHE_SECONDS = 0.75
 _HOSTED_TERMINAL_STATUSES = {"completed", "failed", "cancelled"}
 _MOBILE_NOTIFICATION_TERMINAL_STATUSES = {
     "delivered",
@@ -310,9 +344,181 @@ _HOSTED_CHAT_MODEL_BUDGET_SECONDS = 120
 _HOSTED_CHAT_TIMEOUT_SECONDS = 10 * 60
 _HOSTED_STDERR_TAIL_CHARS = 64 * 1024
 _HOSTED_REWORK_LIMIT = 2
-_HOSTED_EVENT_FLUSH_SECONDS = 0.45
+# Hosted SSE readers consume the live in-memory snapshot immediately.  The
+# durable document is a recovery/checkpoint store, so lifecycle chatter should
+# not rewrite the multi-megabyte account JSON for every protocol event.
+_HOSTED_EVENT_FLUSH_SECONDS = 1.5
+_STATE_STORE_PREVIOUS_UNSET = object()
+
+
+def _publish_live_conversations(state: dict[str, Any]) -> set[str]:
+    """Publish immutable hosted conversation snapshots before durable I/O."""
+
+    snapshots: dict[str, dict[str, Any]] = {}
+    for item in state.get("conversations") or []:
+        if not isinstance(item, dict):
+            continue
+        conversation_id = str(item.get("id") or "").strip()
+        if not conversation_id:
+            continue
+        snapshots[conversation_id] = deepcopy(item)
+    with _HOSTED_LIVE_STATE_LOCK:
+        _HOSTED_LIVE_CONVERSATIONS.clear()
+        _HOSTED_LIVE_CONVERSATIONS.update(snapshots)
+    return set(snapshots)
+
+
+def _live_conversation_snapshot(
+    conversation_id: str,
+    owner_id: str,
+) -> Optional[dict[str, Any]]:
+    """Return a published snapshot that is safe for this account to read."""
+
+    normalized_id = str(conversation_id or "").strip()
+    normalized_owner = str(owner_id or "").strip()
+    with _HOSTED_LIVE_STATE_LOCK:
+        snapshot = _HOSTED_LIVE_CONVERSATIONS.get(normalized_id)
+        if snapshot is None:
+            return None
+        snapshot_owner = str(snapshot.get("owner_id") or "").strip()
+        if snapshot_owner and snapshot_owner != normalized_owner:
+            return None
+        if snapshot.get("delete_requested"):
+            return None
+        return snapshot
+
+
+def _publish_live_hosted_role_projection(
+    conversation_id: str,
+    turn_id: str,
+    *,
+    patch: Optional[dict[str, Any]] = None,
+    message: Optional[dict[str, Any]] = None,
+) -> None:
+    """Publish a small hosted-chat projection without touching durable state.
+
+    The durable collaboration document is intentionally written at accepted,
+    checkpoint, and terminal boundaries.  A chat first-token event must not
+    wait for that multi-megabyte atomic write before the SSE reader can render
+    the lifecycle.  This copy is replaced by the next durable save and is not
+    used for recovery.
+    """
+
+    normalized_conversation_id = str(conversation_id or "").strip()
+    normalized_turn_id = str(turn_id or "").strip()
+    if not normalized_conversation_id or not normalized_turn_id:
+        return
+    with _HOSTED_LIVE_STATE_LOCK:
+        current = _HOSTED_LIVE_CONVERSATIONS.get(normalized_conversation_id)
+        if not isinstance(current, dict):
+            return
+        conversation = deepcopy(current)
+        turns = conversation.setdefault("hosted_turns", {})
+        run = turns.get(normalized_turn_id)
+        if not isinstance(run, dict):
+            return
+        for key, value in (patch or {}).items():
+            if key == "role_events" and isinstance(value, dict):
+                role_events = run.setdefault("role_events", {})
+                if not isinstance(role_events, dict):
+                    role_events = {}
+                    run["role_events"] = role_events
+                role_events.update(deepcopy(value))
+            elif key == "participants" and isinstance(value, list):
+                existing = run.setdefault("participants", [])
+                if not isinstance(existing, list):
+                    existing = []
+                    run["participants"] = existing
+                known = {
+                    str(item.get("member_id") or item.get("id") or "")
+                    for item in existing
+                    if isinstance(item, dict)
+                }
+                for item in value:
+                    if not isinstance(item, dict):
+                        continue
+                    member_key = str(item.get("member_id") or item.get("id") or "")
+                    if member_key and member_key in known:
+                        continue
+                    existing.append(deepcopy(item))
+                    if member_key:
+                        known.add(member_key)
+            else:
+                run[key] = deepcopy(value)
+        now = int(time.time() * 1000)
+        run["updated_at"] = now
+        conversation["updated_at"] = now
+
+        if isinstance(message, dict):
+            incoming = deepcopy(message)
+            incoming_meta = dict(incoming.get("meta") or {})
+            incoming_meta.setdefault("runtime_turn_id", normalized_turn_id)
+            incoming["meta"] = incoming_meta
+            message_key = str(incoming_meta.get("message_key") or "")
+            messages = conversation.setdefault("messages", [])
+            existing_index: Optional[int] = None
+            for index, item in enumerate(messages):
+                if not isinstance(item, dict):
+                    continue
+                item_meta = item.get("meta")
+                if not isinstance(item_meta, dict):
+                    continue
+                if str(item_meta.get("runtime_turn_id") or "") != normalized_turn_id:
+                    continue
+                if message_key and str(item_meta.get("message_key") or "") != message_key:
+                    continue
+                existing_index = index
+                break
+            if existing_index is None:
+                incoming.setdefault("id", f"live_{uuid.uuid4().hex[:14]}")
+                incoming.setdefault("created_at", now)
+                incoming["updated_at"] = now
+                _project_native_message(incoming)
+                messages.append(incoming)
+            else:
+                existing = messages[existing_index]
+                incoming["id"] = existing.get("id")
+                incoming.setdefault("created_at", existing.get("created_at") or now)
+                incoming["updated_at"] = now
+                _project_native_message(incoming)
+                messages[existing_index] = incoming
+        _HOSTED_LIVE_CONVERSATIONS[normalized_conversation_id] = conversation
+    _notify_hosted_update(normalized_conversation_id)
+
+
+def _single_state_cache_key(
+    target: Path,
+    dispatch_persistence_hooks: bool,
+) -> tuple[str, bool] | None:
+    if target.name != "single.json":
+        return None
+    return (os.path.abspath(os.fspath(target)), bool(dispatch_persistence_hooks))
+
+
+def _single_state_fingerprint(target: Path) -> tuple[int, int] | None:
+    try:
+        stat = target.stat()
+    except OSError:
+        return None
+    return (int(stat.st_mtime_ns), int(stat.st_size))
+
+
+def _invalidate_single_state_cache(target: Path) -> None:
+    """Invalidate primary/backup cache entries when a state file is written."""
+
+    primary = Path(os.path.abspath(os.fspath(target)))
+    if primary.name.endswith(".bak"):
+        primary = primary.with_name(primary.name[:-4])
+    backup = primary.with_name(f"{primary.name}.bak")
+    paths = {str(primary), str(backup)}
+    with _SINGLE_STATE_CACHE_LOCK:
+        for key in tuple(_SINGLE_STATE_CACHE):
+            if key[0] in paths:
+                _SINGLE_STATE_CACHE.pop(key, None)
 _MODEL_NOT_CONFIGURED_CODE = "model_not_configured"
 _MODEL_NOT_CONFIGURED_MESSAGE = "尚未配置可用模型。请先在“模型”中添加并选择模型后重试。"
+_SERVER_RUNTIME_INCOMPLETE_CODE = "server_runtime_incomplete"
+_SERVER_RUNTIME_INCOMPLETE_MESSAGE = "服务端运行组件不完整，请更新 Hermes 服务端后重试。"
 _RUNTIME_RUN_STALE_AFTER_MS = 30 * 60 * 1000
 _HOSTED_TURN_STALE_AFTER_MS = 36 * 60 * 60 * 1000
 _REMOTE_CONTRACT_VERSION = 2
@@ -605,6 +811,24 @@ _SIMPLE_CHAT_MARKERS = (
     "介绍",
     "总结一下",
     "聊聊",
+)
+_SINGLE_TURN_TOOL_MARKERS = (
+    "搜索",
+    "查一下",
+    "查询",
+    "上网",
+    "浏览器",
+    "网页",
+    "search",
+    "browse",
+    "look up",
+)
+_AMBIGUOUS_DELEGATION_MARKERS = (
+    "你看着办",
+    "帮我处理",
+    "处理一下",
+    "搞一下",
+    "take care of it",
 )
 _HARD_WORK_MARKERS = (
     "帮我修改",
@@ -1442,6 +1666,7 @@ def _fsync_parent_directory(target: Path) -> None:
 
 
 def _atomic_write_state_document(target: Path, data: dict[str, Any]) -> None:
+    _invalidate_single_state_cache(target)
     payload = json.dumps(data, ensure_ascii=False, indent=2) + "\n"
     target.parent.mkdir(parents=True, exist_ok=True)
     temporary = target.with_name(
@@ -1562,11 +1787,12 @@ def _load_state_store(
     # conversation document.
     with _backend_api().account_lifecycle_commit_guard():
         with _STATE_LOCK:
-            return _load_state_store_locked(
+            result = _load_state_store_locked(
                 target,
                 collection_key,
                 dispatch_persistence_hooks=dispatch_persistence_hooks,
             )
+    return result
 
 
 def _load_state_store_locked(
@@ -1624,20 +1850,26 @@ def _save_state_store(
     target: Path,
     state: dict[str, Any],
     collection_key: str,
+    *,
+    previous_state: Any = _STATE_STORE_PREVIOUS_UNSET,
 ) -> None:
-    previous: dict[str, Any] | None = None
-    if (
-        _state_path_present(target)
-        or _state_path_present(_state_backup_path(target))
-        or _state_quarantine_paths(target)
-    ):
-        previous = _load_state_store(
-            target,
-            collection_key,
-            dispatch_persistence_hooks=not bool(
-                getattr(_COLLABORATION_DELETION_WRITE, "active", False)
-            ),
-        )
+    if previous_state is _STATE_STORE_PREVIOUS_UNSET:
+        previous: dict[str, Any] | None = None
+        if (
+            _state_path_present(target)
+            or _state_path_present(_state_backup_path(target))
+            or _state_quarantine_paths(target)
+        ):
+            previous = _load_state_store(
+                target,
+                collection_key,
+                dispatch_persistence_hooks=not bool(
+                    getattr(_COLLABORATION_DELETION_WRITE, "active", False)
+                ),
+            )
+    else:
+        previous = previous_state
+    if previous is not None:
         # A stale in-memory writer may still carry a staged callback that a
         # recovery reader already delivered. Merge durable receipts before
         # promoting pending work so an ACK cannot be resurrected.
@@ -1702,7 +1934,31 @@ def load_single_state(
     *,
     dispatch_persistence_hooks: bool = True,
 ) -> dict[str, Any]:
-    target = path or single_state_path()
+    target = Path(path) if path is not None else single_state_path()
+    cache_key = _single_state_cache_key(target, dispatch_persistence_hooks)
+    if cache_key is not None:
+        # Check the cache while holding the same account/state fence used by
+        # writers.  This prevents an atomic replace from racing a cache hit
+        # and returning the previous document after a committed turn update.
+        with _STATE_LOCK:
+            fingerprint = _single_state_fingerprint(target)
+            if fingerprint is not None:
+                with _SINGLE_STATE_CACHE_LOCK:
+                    cached = _SINGLE_STATE_CACHE.get(cache_key)
+                if cached is not None and cached[0] == fingerprint:
+                    # Persistence-enabled callers mutate the returned state
+                    # before saving it.  Return a private snapshot so that a
+                    # staged mutation cannot silently rewrite the cache's
+                    # view of the last committed document.  The event stream
+                    # is read-only and can share its normalized snapshot.
+                    result = (
+                        deepcopy(cached[1])
+                        if dispatch_persistence_hooks
+                        else cached[1]
+                    )
+                    if path is None:
+                        _STATE_THREAD_LOCAL.last_single_state = result
+                    return result
     data = _load_state_store(
         target,
         "conversations",
@@ -1756,7 +2012,33 @@ def load_single_state(
     if tombstones:
         result[_ACCOUNT_DELETION_TOMBSTONES_KEY] = tombstones
     preserve_persistence_hook_outbox(data, result)
+    if cache_key is not None:
+        fingerprint = _single_state_fingerprint(target)
+        if fingerprint is not None:
+            with _SINGLE_STATE_CACHE_LOCK:
+                _SINGLE_STATE_CACHE[cache_key] = (
+                    fingerprint,
+                    deepcopy(result)
+                    if dispatch_persistence_hooks
+                    else result,
+                )
+    # Most hosted writers read, mutate, and save this exact object while the
+    # account lock is held.  Remember that identity so save_single_state can
+    # avoid reparsing the same multi-megabyte document on the hot path.
+    if path is None:
+        _STATE_THREAD_LOCAL.last_single_state = result
     return result
+
+
+def _load_single_state_for_event_stream() -> dict[str, Any]:
+    """Read the event source without running persistence observers."""
+
+    try:
+        return load_single_state(dispatch_persistence_hooks=False)
+    except TypeError:
+        # A few lightweight tests replace load_single_state with a zero-arg
+        # lambda; retain that test seam while keeping production reads cheap.
+        return load_single_state()
 
 
 def summarize_task_title(content: str) -> str:
@@ -1875,6 +2157,7 @@ def save_state(state: dict[str, Any], path: Optional[Path] = None) -> None:
     target = path or state_path()
     with _backend_api().account_lifecycle_commit_guard():
         with _STATE_LOCK:
+            previous_state: Any = _STATE_STORE_PREVIOUS_UNSET
             if not bool(getattr(_COLLABORATION_DELETION_WRITE, "active", False)):
                 current = (
                     _load_state_store(target, "rooms")
@@ -1888,25 +2171,84 @@ def save_state(state: dict[str, Any], path: Optional[Path] = None) -> None:
                     _merge_account_deletion_tombstones(current, load_single_state())
                 _merge_authoritative_account_deletion_intents(state, "rooms")
                 _assert_no_tombstoned_state_mutation(current, state, "rooms")
-            _save_state_store(target, state, "rooms")
+                if _state_path_present(target):
+                    previous_state = current
+            _save_state_store(
+                target,
+                state,
+                "rooms",
+                previous_state=previous_state,
+            )
 
 
 def save_single_state(state: dict[str, Any], path: Optional[Path] = None) -> None:
     target = path or single_state_path()
     with _backend_api().account_lifecycle_commit_guard():
         with _STATE_LOCK:
+            previous_state: Any = _STATE_STORE_PREVIOUS_UNSET
+            fast_loaded_state = (
+                path is None
+                and getattr(_STATE_THREAD_LOCAL, "last_single_state", None) is state
+            )
             if not bool(getattr(_COLLABORATION_DELETION_WRITE, "active", False)):
-                current = (
-                    _load_state_store(target, "conversations")
-                    if _state_path_present(target)
-                    else {"conversations": []}
-                )
-                _merge_authoritative_account_deletion_intents(
-                    state,
-                    "conversations",
-                )
-                _assert_no_tombstoned_state_mutation(current, state, "conversations")
-            _save_state_store(target, state, "conversations")
+                if fast_loaded_state:
+                    # The caller owns the same object returned by the guarded
+                    # load above, so no other in-process writer can have
+                    # changed the document.  The new state is validated and
+                    # written atomically below; reparsing it here only adds a
+                    # second JSON parse and normalization pass.
+                    _merge_authoritative_account_deletion_intents(
+                        state,
+                        "conversations",
+                    )
+                    # A deletion tombstone changes the conflict contract:
+                    # this state may be a staged copy from before the
+                    # deletion boundary.  Re-read the committed document in
+                    # that rare path so a late request cannot append a
+                    # tombstoned account back into the store.
+                    if _account_deletion_tombstones(state):
+                        current = _load_state_store(
+                            target,
+                            "conversations",
+                            dispatch_persistence_hooks=False,
+                        )
+                        _assert_no_tombstoned_state_mutation(
+                            current,
+                            state,
+                            "conversations",
+                        )
+                        previous_state = current
+                    else:
+                        previous_state = None
+                else:
+                    current = (
+                        _load_state_store(target, "conversations")
+                        if _state_path_present(target)
+                        else {"conversations": []}
+                    )
+                    _merge_authoritative_account_deletion_intents(
+                        state,
+                        "conversations",
+                    )
+                    _assert_no_tombstoned_state_mutation(current, state, "conversations")
+                    if _state_path_present(target):
+                        previous_state = current
+            if path is None:
+                # Make lifecycle updates visible to the SSE stream before the
+                # large atomic JSON write.  The snapshot is immutable and the
+                # subsequent durable commit remains the source of truth for
+                # restart/replay.
+                live_conversation_ids = _publish_live_conversations(state)
+                for conversation_id in live_conversation_ids:
+                    _notify_hosted_update(conversation_id)
+            _save_state_store(
+                target,
+                state,
+                "conversations",
+                previous_state=previous_state,
+            )
+            if path is None:
+                _STATE_THREAD_LOCAL.last_single_state = None
 
 
 def begin_owner_account_deletion(
@@ -4589,12 +4931,294 @@ def _manager_plan_prompt(
             f"是否要求交付文件：{'yes' if artifact_required else 'no'}",
             "最终交接输出一个 JSON 对象且不要附加解释；过程回报通过运行事件发送，不得混入最终 JSON。结构必须为：",
             '{"difficulty":"low|medium|high|critical","reason":"...","workers":["dbb3-worker"],"reviewer_target":"dbb3|pc","plan":[{"id":"step-1","title":"...","objective":"...","assignee":"dbb3-worker|pc-worker","depends_on":[]}]}',
+            "plan 是用户右滑后看到的 Todo List：按实际执行顺序列出可验证、可独立完成的步骤，title 要简短明确。",
+            "多步骤任务不得压缩成一个泛化的“执行任务”；每完成一个步骤，服务端会依据真实 Worker、审阅与汇报状态更新勾选。",
             "按任务真实需要选择一个或两个 Worker，不得使用其他节点，不得省略验收。",
             f"用户任务：\n{content}",
             attachment_context,
         )
         if item
     )
+
+
+def _hosted_manager_plan_todo_snapshot(
+    manager_plan: dict[str, Any],
+    *,
+    stage: str,
+    worker_statuses: Optional[dict[str, str]] = None,
+    reviewer_status: str = "",
+    reviewer_result: str = "",
+    reporter_status: str = "",
+    final_status: str = "",
+) -> dict[str, Any]:
+    """Project the model-authored manager plan onto one durable Todo snapshot."""
+
+    normalized_stage = str(stage or "").strip().lower()
+    normalized_final = str(final_status or "").strip().lower()
+    worker_states = {
+        str(profile): str(status or "").strip().lower()
+        for profile, status in (worker_statuses or {}).items()
+        if str(profile).strip()
+    }
+    terminal = normalized_final in _HOSTED_TERMINAL_STATUSES
+    todos: list[dict[str, str]] = []
+    for index, raw_step in enumerate(manager_plan.get("plan") or [], start=1):
+        if not isinstance(raw_step, dict):
+            continue
+        step_id = str(raw_step.get("id") or f"step-{index}").strip()[:80]
+        content = str(
+            raw_step.get("title")
+            or raw_step.get("objective")
+            or f"Step {index}"
+        ).strip()[:500]
+        assignee = str(raw_step.get("assignee") or "").strip()
+        worker_status = worker_states.get(assignee, "")
+        if normalized_final == "completed" or worker_status == "completed":
+            item_status = "completed"
+        elif worker_status in {"cancelled", "failed", "blocked"}:
+            item_status = "cancelled"
+        elif terminal:
+            item_status = "cancelled"
+        else:
+            item_status = "pending"
+        todos.append(
+            {
+                "id": step_id,
+                "content": content,
+                "status": item_status,
+            }
+        )
+
+    reviewer_verdict = (
+        _hosted_reviewer_verdict(reviewer_result)
+        if str(reviewer_result or "").strip()
+        else "unknown"
+    )
+    normalized_reviewer = str(reviewer_status or "").strip().lower()
+    review_completed = (
+        normalized_final == "completed"
+        or (normalized_reviewer == "completed" and reviewer_verdict == "pass")
+    )
+    review_cancelled = (
+        not review_completed
+        and (
+            normalized_reviewer in {"cancelled", "failed", "blocked"}
+            or terminal
+        )
+    )
+    todos.append(
+        {
+            "id": "workflow-review",
+            "content": "验收执行结果",
+            "status": (
+                "completed"
+                if review_completed
+                else "cancelled" if review_cancelled else "pending"
+            ),
+        }
+    )
+
+    normalized_reporter = str(reporter_status or "").strip().lower()
+    report_completed = normalized_final == "completed"
+    report_cancelled = (
+        not report_completed
+        and (
+            normalized_reporter in {"cancelled", "failed", "blocked"}
+            or terminal
+        )
+    )
+    todos.append(
+        {
+            "id": "workflow-report",
+            "content": "整理并汇报结果",
+            "status": (
+                "completed"
+                if report_completed
+                else "cancelled" if report_cancelled else "pending"
+            ),
+        }
+    )
+
+    if not terminal and not any(item["status"] == "in_progress" for item in todos):
+        preferred_ids: list[str] = []
+        if normalized_stage in {"manager_handoff", "reporting"}:
+            preferred_ids.extend(("workflow-report", "workflow-review"))
+        elif normalized_stage == "reviewing":
+            preferred_ids.extend(("workflow-review", "workflow-report"))
+        preferred_ids.extend(
+            item["id"]
+            for item in todos
+            if item["id"] not in {"workflow-review", "workflow-report"}
+        )
+        preferred_ids.extend(("workflow-review", "workflow-report"))
+        for item_id in preferred_ids:
+            candidate = next(
+                (
+                    item
+                    for item in todos
+                    if item["id"] == item_id and item["status"] == "pending"
+                ),
+                None,
+            )
+            if candidate is not None:
+                candidate["status"] = "in_progress"
+                break
+
+    completed = sum(item["status"] == "completed" for item in todos)
+    return {
+        "todos": todos,
+        "summary": {
+            "completed": completed,
+            "total": len(todos),
+        },
+    }
+
+
+def _persist_hosted_plan_snapshot(
+    conversation_id: str,
+    turn_id: str,
+    manager_plan: dict[str, Any],
+    *,
+    stage: str,
+    worker_statuses: Optional[dict[str, str]] = None,
+    reviewer_status: str = "",
+    reviewer_result: str = "",
+    reporter_status: str = "",
+    final_status: str = "",
+) -> dict[str, Any]:
+    """Persist one canonical Todo activity without adding a second plan bubble."""
+
+    snapshot = _hosted_manager_plan_todo_snapshot(
+        manager_plan,
+        stage=stage,
+        worker_statuses=worker_statuses,
+        reviewer_status=reviewer_status,
+        reviewer_result=reviewer_result,
+        reporter_status=reporter_status,
+        final_status=final_status,
+    )
+    now = int(time.time() * 1000)
+    activity_id = f"{turn_id}:manager-plan:todo"
+    with _STATE_LOCK:
+        state = load_single_state()
+        conversation = _conversation_by_id(state, conversation_id)
+        run = (conversation.get("hosted_turns") or {}).get(turn_id)
+        if not isinstance(run, dict):
+            raise RuntimeError("托管任务记录不存在")
+        started_at = int(run.get("todo_started_at") or now)
+        run["todo_started_at"] = started_at
+        run["todo_snapshot"] = snapshot
+        run["todo_updated_at"] = now
+        run["updated_at"] = now
+        conversation["updated_at"] = now
+        payload = json.dumps(snapshot, ensure_ascii=False, separators=(",", ":"))
+        activity = {
+            "id": activity_id,
+            "kind": "tool",
+            "category": "planning",
+            "name": "todo",
+            "tool_name": "todo",
+            "input": payload,
+            "output": payload,
+            "status": "completed",
+            "summary": (
+                f"Plan {snapshot['summary']['completed']}/"
+                f"{snapshot['summary']['total']}"
+            ),
+            "started_at": started_at,
+            "ended_at": now,
+            "completed_at": now,
+            "duration_ms": max(0, now - started_at),
+        }
+
+        messages = conversation.get("messages") or []
+        target = next(
+            (
+                message
+                for message in reversed(messages)
+                if isinstance(message, dict)
+                and isinstance(message.get("meta"), dict)
+                and str(message["meta"].get("runtime_turn_id") or "") == turn_id
+                and any(
+                    isinstance(item, dict) and str(item.get("id") or "") == activity_id
+                    for item in message["meta"].get("activities") or []
+                )
+            ),
+            None,
+        )
+        if target is None:
+            target = next(
+                (
+                    message
+                    for message in reversed(messages)
+                    if isinstance(message, dict)
+                    and isinstance(message.get("meta"), dict)
+                    and str(message["meta"].get("runtime_turn_id") or "") == turn_id
+                    and str(message["meta"].get("role_stage") or "").startswith(
+                        "manager_planning"
+                    )
+                ),
+                None,
+            )
+        plan_count = max(0, int(snapshot["summary"]["total"]) - 2)
+        if target is None:
+            target = _append_message(
+                conversation,
+                role="assistant",
+                name=_DBB3_MANAGER_PROFILE,
+                content=f"已生成 {plan_count} 项执行计划，正在按顺序推进。",
+                status="completed",
+                kind="message",
+                meta={
+                    "runtime_turn_id": turn_id,
+                    "role_stage": "manager_planning",
+                    "base_role_stage": "manager_planning",
+                    "phase": "completed",
+                    "message_key": f"{turn_id}:manager_planning:completed",
+                    "role_label": f"{_HERMES_MANAGER_LABEL} · 规划",
+                    "profile": _DBB3_MANAGER_PROFILE,
+                    "collapse_activities": True,
+                    "final_report": False,
+                    "activities": [activity],
+                    "completed_at": now,
+                },
+            )
+        else:
+            meta = dict(target.get("meta") or {})
+            activities = [
+                dict(item)
+                for item in meta.get("activities") or []
+                if isinstance(item, dict)
+                and str(item.get("id") or "") != activity_id
+            ]
+            activities.append(activity)
+            meta.update(
+                {
+                    "runtime_turn_id": turn_id,
+                    "role_stage": "manager_planning",
+                    "base_role_stage": "manager_planning",
+                    "phase": "completed",
+                    "message_key": f"{turn_id}:manager_planning:completed",
+                    "role_label": f"{_HERMES_MANAGER_LABEL} · 规划",
+                    "profile": _DBB3_MANAGER_PROFILE,
+                    "collapse_activities": True,
+                    "final_report": False,
+                    "activities": activities,
+                    "completed_at": now,
+                }
+            )
+            target.update(
+                {
+                    "content": f"已生成 {plan_count} 项执行计划，正在按顺序推进。",
+                    "status": "completed",
+                    "meta": meta,
+                    "updated_at": now,
+                }
+            )
+            _project_native_message(target)
+        save_single_state(state)
+    _notify_hosted_update(conversation_id)
+    return snapshot
 
 
 def _normalize_manager_handoff(
@@ -4676,10 +5300,32 @@ def _rule_based_user_intent(content: str) -> dict[str, Any]:
         any(marker in lowered for marker in _HARD_WORK_MARKERS)
         and (imperative or not explanatory)
     )
+    explicit_chat = any(marker in lowered for marker in _SIMPLE_CHAT_MARKERS)
+    single_turn_tools = any(
+        marker in lowered for marker in _SINGLE_TURN_TOOL_MARKERS
+    )
+    ambiguous_delegation = any(
+        marker in lowered for marker in _AMBIGUOUS_DELEGATION_MARKERS
+    )
+    trivial_chat = bool(text) and len(text) <= 16 and bool(
+        re.fullmatch(r"[\d０-９\s.,，。!?！？、+-]+", text)
+    )
+    plain_chat = (
+        not hard_work
+        and len(text) <= 80
+        and not matched
+        and not complex_matches
+        and not device_matches
+        and multi_step_count == 0
+        and explicit_role_count == 0
+        and not single_turn_tools
+        and not ambiguous_delegation
+        and not requires_artifact_delivery(text)
+    )
     hard_chat = (
         not hard_work
         and len(text) <= 80
-        and any(marker in lowered for marker in _SIMPLE_CHAT_MARKERS)
+        and (explicit_chat or trivial_chat or plain_chat or single_turn_tools)
     )
     score = min(6, len(complex_matches) * 2)
     score += min(3, len(device_matches) * 2)
@@ -4690,11 +5336,11 @@ def _rule_based_user_intent(content: str) -> dict[str, Any]:
         score = max(score, 4)
     if hard_work:
         score = max(score, 4)
-    if any(marker in lowered for marker in _SIMPLE_CHAT_MARKERS) and len(text) < 30:
+    if explicit_chat and len(text) < 30:
         score -= 3
 
     if score < 4:
-        if any(marker in lowered for marker in _SIMPLE_CHAT_MARKERS):
+        if explicit_chat or trivial_chat or plain_chat or single_turn_tools:
             confidence = 0.96
         elif not matched and len(text) <= 12:
             confidence = 0.62
@@ -4702,6 +5348,16 @@ def _rule_based_user_intent(content: str) -> dict[str, Any]:
             confidence = 0.82
         else:
             confidence = 0.68
+        if trivial_chat:
+            rationale_code = "rule.trivial_chat"
+        elif explicit_chat:
+            rationale_code = "rule.explicit_chat"
+        elif single_turn_tools:
+            rationale_code = "rule.single_turn_tools"
+        elif hard_chat:
+            rationale_code = "rule.plain_chat"
+        else:
+            rationale_code = "rule.ambiguous_chat_fallback"
         return {
             "mode": "chat",
             "label": "简单任务",
@@ -4712,10 +5368,9 @@ def _rule_based_user_intent(content: str) -> dict[str, Any]:
             "profiles": ["default"],
             "artifact_required": requires_artifact_delivery(text),
             "lock_level": "hard_chat" if hard_chat else "ambiguous",
+            "needs_tools": single_turn_tools,
             "capability_hints": [],
-            "rationale_codes": [
-                "rule.explicit_chat" if hard_chat else "rule.ambiguous_chat_fallback"
-            ],
+            "rationale_codes": [rationale_code],
         }
 
     profiles = _work_profiles(lowered)
@@ -4925,8 +5580,17 @@ def _profile_runtime_readiness(
     from hermes_runtime.config import load_config
     from hermes_cli.moa_config import resolve_moa_preset
     from hermes_cli.profiles import resolve_profile_env
-    from agent.runtime_provider import resolve_runtime_provider
     from hermes_constants import reset_hermes_home_override, set_hermes_home_override
+
+    try:
+        from agent.runtime_provider import resolve_runtime_provider
+    except ModuleNotFoundError:
+        return {
+            "ready": False,
+            "retryable": False,
+            "code": _SERVER_RUNTIME_INCOMPLETE_CODE,
+            "message": _SERVER_RUNTIME_INCOMPLETE_MESSAGE,
+        }
 
     token = set_hermes_home_override(resolve_profile_env(profile))
     try:
@@ -5105,7 +5769,7 @@ def _hosted_model_wait_state(
     status_text = (
         "正在思考"
         if thinking
-        else f"正在重连 ({attempt}/{_HOSTED_CHAT_API_ATTEMPTS})"
+        else f"正在重新连接 ({attempt}/{_HOSTED_CHAT_API_ATTEMPTS})"
     )
     state["activities"] = [
         {
@@ -5203,6 +5867,18 @@ def _wait_for_hosted_chat_model(
                 content_fallback="",
             )
             return True
+
+        if readiness.get("retryable") is False:
+            with _STATE_LOCK:
+                state = load_single_state()
+                conversation = _conversation_by_id(state, conversation_id)
+                run = (conversation.get("hosted_turns") or {}).get(turn_id)
+                if not isinstance(run, dict) or run.get("status") in _HOSTED_TERMINAL_STATUSES:
+                    return False
+                _fail_hosted_turn_preflight(conversation, run, readiness)
+                save_single_state(state)
+            _notify_hosted_update(conversation_id)
+            return False
 
         attempt += 1
         retry_state = _hosted_model_wait_state(
@@ -5532,18 +6208,36 @@ def build_single_prompt(
     user_message: str,
     *,
     include_projected_history: bool = True,
+    exclude_message_id: str = "",
 ) -> str:
     history = (
         conversation.get("messages")
         if isinstance(conversation.get("messages"), list)
         else []
     )
+    excluded_id = str(exclude_message_id or "").strip()
+    if excluded_id:
+        history = [
+            item
+            for item in history
+            if not (
+                isinstance(item, dict)
+                and str(item.get("id") or "").strip() == excluded_id
+            )
+        ]
     recent = (
         "\n".join(_message_line(item) for item in history[-_PROMPT_HISTORY:])
         if include_projected_history
         else ""
     )
+    planning_guidance = (
+        "Planning behavior: for a request with 3 or more actionable steps, or multiple "
+        "tasks, call the todo tool before execution. Keep exactly one item in_progress "
+        "and update the list immediately after each step. Do not create a todo list for "
+        "ordinary single-step chat."
+    )
     return (
+        f"{planning_guidance}\n\n"
         "你正在 Hermes 官方 WebUI 单聊中。\n"
         f"当前 Hermes Profile：{profile}\n"
         "请使用简体中文直接回答并执行用户请求。你仍可使用该 Profile 已配置的"
@@ -5680,6 +6374,96 @@ def _legacy_profile_turn(
     return response
 
 
+def _hosted_runtime_home(
+    profile: str,
+    artifact_context: Optional[dict[str, Any]] = None,
+) -> str:
+    from hermes_cli.profiles import resolve_profile_env
+
+    runtime_home = str(resolve_profile_env(profile))
+    runtime_owner = str((artifact_context or {}).get("owner_id") or "").strip()
+    runtime_generation = str(
+        (artifact_context or {}).get("account_generation") or ""
+    ).strip()
+    if runtime_owner and runtime_owner != LOCAL_OWNER_ID:
+        try:
+            runtime_home = str(
+                _backend_api().managed_account_runtime_home(
+                    runtime_owner,
+                    runtime_generation,
+                    profile,
+                    base_profile_home=Path(runtime_home),
+                )
+            )
+        except PermissionError as exc:
+            raise RuntimeError("stale hosted turn account generation") from exc
+    return runtime_home
+
+
+_HOSTED_PREWARM_LOCK = threading.Lock()
+_HOSTED_PREWARM_INFLIGHT: set[tuple[str, str, str, str]] = set()
+
+
+def _prewarm_hosted_chat(conversation: dict[str, Any]) -> None:
+    """Start the official 0.19 Agent while the user is reading or typing."""
+
+    owner_id = str(conversation.get("owner_id") or LOCAL_OWNER_ID).strip()
+    account_generation = str(conversation.get("account_generation") or "").strip()
+    conversation_id = str(conversation.get("id") or "").strip()
+    profile = str(conversation.get("profile") or "default").strip() or "default"
+    if not conversation_id or not account_generation or conversation.get("delete_requested"):
+        return
+    key = (owner_id, account_generation, conversation_id, profile)
+    with _HOSTED_PREWARM_LOCK:
+        if key in _HOSTED_PREWARM_INFLIGHT:
+            return
+        _HOSTED_PREWARM_INFLIGHT.add(key)
+
+    runtime_session_id = str(
+        (conversation.get("runtime_sessions") or {}).get(profile) or ""
+    ).strip()
+
+    def _run() -> None:
+        try:
+            artifact_context = {
+                "owner_id": owner_id,
+                "account_generation": account_generation,
+            }
+            prewarm_hosted_gateway(
+                runtime_home=_hosted_runtime_home(profile, artifact_context),
+                owner_id=owner_id,
+                account_generation=account_generation,
+                conversation_id=conversation_id,
+                profile=profile,
+                artifact_root=str(get_hermes_home()),
+                import_root=_RUNTIME_IMPORT_ROOT,
+                requested_session_id=runtime_session_id,
+                extra_env={
+                    "HERMES_API_MAX_RETRIES": str(_HOSTED_CHAT_API_ATTEMPTS),
+                    "HERMES_API_RETRY_CLIENT_ERRORS": "1",
+                    "HERMES_API_RETRY_DELAY_SECONDS": str(
+                        _HOSTED_CHAT_API_RETRY_DELAY_SECONDS
+                    ),
+                    "HERMES_API_RETRY_STATUS_LIVE": "1",
+                },
+            )
+        except Exception:
+            logging.getLogger(__name__).warning(
+                "Hermes 0.19 hosted chat pre-warm failed for %s",
+                conversation_id,
+                exc_info=True,
+            )
+        finally:
+            with _HOSTED_PREWARM_LOCK:
+                _HOSTED_PREWARM_INFLIGHT.discard(key)
+
+    threading.Thread(
+        target=_run,
+        name=f"hermes-prewarm-{conversation_id[-12:]}",
+        daemon=True,
+    ).start()
+
+
 def run_profile_turn(
     profile: str,
     prompt: str,
@@ -5708,37 +6492,26 @@ def run_profile_turn(
             kanban_task_id=kanban_task_id,
         )
 
-    from hermes_cli.profiles import resolve_profile_env
-
-    runtime_home = resolve_profile_env(profile)
-    if artifact_context:
-        runtime_owner = str(artifact_context.get("owner_id") or "").strip()
-        runtime_generation = str(
-            artifact_context.get("account_generation") or ""
-        ).strip()
-        if runtime_owner and runtime_owner != LOCAL_OWNER_ID:
-            try:
-                runtime_home = str(
-                    _backend_api().managed_account_runtime_home(
-                        runtime_owner,
-                        runtime_generation,
-                        profile,
-                        base_profile_home=Path(runtime_home),
-                    )
-                )
-            except PermissionError as exc:
-                raise RuntimeError("stale hosted turn account generation") from exc
-
+    runtime_home = _hosted_runtime_home(profile, artifact_context)
     env = {
         **os.environ,
         "HOME": os.environ.get("HOME", "/home/hermes"),
         "HERMES_HOME": runtime_home,
         "HERMES_SESSION_SOURCE": "dashboard-group",
+        # Keep the temporary fallback runner on the same full-schema/lazy-MCP
+        # contract as the persistent TUI gateway. It must not probe every
+        # configured service before the first model token.
+        "HERMES_FULL_TOOL_DEFINITIONS": "1",
         "HERMES_API_MAX_RETRIES": str(_HOSTED_CHAT_API_ATTEMPTS),
         "HERMES_API_RETRY_CLIENT_ERRORS": "1",
         "HERMES_API_RETRY_DELAY_SECONDS": str(_HOSTED_CHAT_API_RETRY_DELAY_SECONDS),
         "HERMES_API_RETRY_STATUS_LIVE": "1",
     }
+    inherited_pythonpath = str(env.get("PYTHONPATH") or "").strip()
+    pythonpath_entries = [_RUNTIME_IMPORT_ROOT]
+    if inherited_pythonpath:
+        pythonpath_entries.extend(inherited_pythonpath.split(os.pathsep))
+    env["PYTHONPATH"] = os.pathsep.join(dict.fromkeys(pythonpath_entries))
     if kanban_task_id:
         env["HERMES_KANBAN_TASK"] = kanban_task_id
     else:
@@ -5771,6 +6544,50 @@ def run_profile_turn(
                 "HERMES_API_RETRY_DEADLINE_EPOCH_MS": str(retry_deadline_at),
             }
         )
+    if (
+        action == "chat"
+        and process_factory is subprocess.Popen
+        and not kanban_task_id
+        and artifact_context
+        and str(artifact_context.get("conversation_id") or "").strip()
+    ):
+        try:
+            return run_hosted_gateway_turn(
+                prompt,
+                runtime_home=str(runtime_home),
+                owner_id=str(artifact_context.get("owner_id") or ""),
+                account_generation=str(
+                    artifact_context.get("account_generation") or ""
+                ),
+                conversation_id=str(artifact_context.get("conversation_id") or ""),
+                turn_id=str(artifact_context.get("turn_id") or ""),
+                profile=profile,
+                artifact_root=str(
+                    artifact_context.get("root") or get_hermes_home()
+                ),
+                import_root=_RUNTIME_IMPORT_ROOT,
+                requested_session_id=str(session_id or ""),
+                event_callback=event_callback,
+                cancel_check=cancel_check,
+                timeout=timeout,
+                extra_env={
+                    "HERMES_API_MAX_RETRIES": env["HERMES_API_MAX_RETRIES"],
+                    "HERMES_API_RETRY_CLIENT_ERRORS": "1",
+                    "HERMES_API_RETRY_DELAY_SECONDS": env[
+                        "HERMES_API_RETRY_DELAY_SECONDS"
+                    ],
+                    "HERMES_API_RETRY_STATUS_LIVE": "1",
+                    "HERMES_API_RETRY_ATTEMPT_OFFSET": str(
+                        env.get("HERMES_API_RETRY_ATTEMPT_OFFSET") or "0"
+                    ),
+                    "HERMES_API_RETRY_DEADLINE_EPOCH_MS": str(
+                        env.get("HERMES_API_RETRY_DEADLINE_EPOCH_MS") or "0"
+                    ),
+                },
+            )
+        except HostedTuiGatewayCancelled as exc:
+            raise _HostedTurnCancelled("Hosted turn cancelled") from exc
+
     command = [sys.executable, str(Path(__file__).resolve()), "--profile-event-runner"]
     deadline = time.monotonic() + timeout
     process = process_factory(
@@ -5808,6 +6625,9 @@ def run_profile_turn(
                             )
                             if str(item).strip()
                         ],
+                        "allow_tools": str(
+                            (artifact_context or {}).get("allow_tools", "1")
+                        ).strip().lower() not in {"0", "false", "no"},
                     },
                     ensure_ascii=False,
                 )
@@ -5862,6 +6682,7 @@ def run_profile_turn(
             "message.delta",
             "message.complete",
             "reasoning.delta",
+            "thinking.delta",
             "tool.start",
             "subagent.start",
         }:
@@ -6131,10 +6952,51 @@ def apply_profile_event(
                 )
             return
 
+    def clear_transient_model_status_activities(*, clear_retry: bool) -> None:
+        activities[:] = [
+            item
+            for item in activities
+            if (
+                item.get("id") != "model-runtime-status"
+                and not str(item.get("id") or "").startswith("model-readiness-")
+                and not (
+                    clear_retry
+                    and item.get("id") == "model-connection-retry"
+                )
+            )
+        ]
+
+    def is_model_spinner(text: str) -> bool:
+        """Recognize gateway lifecycle text without hiding real reasoning."""
+        normalized = " ".join(str(text or "").strip().lower().split())
+        if not normalized:
+            return True
+        if normalized in {
+            "thinking...",
+            "reflecting...",
+            "mulling...",
+            "正在思考",
+            "思考中",
+            "正在连接模型",
+            "连接模型中",
+        }:
+            return True
+        # Hermes emits animated face/status prefixes such as
+        # ``(◔_◔) mulling...`` while it is waiting for model output.
+        return normalized.startswith("(") and (
+            "mull" in normalized
+            or "think" in normalized
+            or normalized.endswith("...")
+        )
+
+    event_text = _structured_text(payload.get("text"))
+    thinking_is_reasoning = event_type == "thinking.delta" and not is_model_spinner(
+        event_text
+    )
     text_started_execution = (
         event_type in {"message.delta", "reasoning.delta", "reasoning.available"}
-        and bool(_structured_text(payload.get("text")))
-    )
+        or thinking_is_reasoning
+    ) and bool(event_text)
     tool_started_execution = event_type in {
         "tool.generating",
         "tool.progress",
@@ -6150,6 +7012,19 @@ def apply_profile_event(
         # waiting for message.delta leaves the client stuck in "thinking".
         state["first_token_at"] = now
 
+    if text_started_execution or tool_started_execution or event_type in {
+        "error",
+        "message.complete",
+    }:
+        terminal_error = (
+            event_type == "error"
+            or (
+                event_type == "message.complete"
+                and str(payload.get("status") or "").lower() == "error"
+            )
+        )
+        clear_transient_model_status_activities(clear_retry=not terminal_error)
+
     if event_type in {"session.info", "request.accepted"}:
         state["runtime_session_id"] = str(
             payload.get("session_id") or state.get("runtime_session_id") or ""
@@ -6158,9 +7033,12 @@ def apply_profile_event(
         state["actual_provider"] = str(
             payload.get("provider") or state.get("actual_provider") or ""
         )
-    elif event_type in {"reasoning.delta", "reasoning.available"}:
+    elif event_type in {
+        "reasoning.delta",
+        "reasoning.available",
+    } or thinking_is_reasoning:
         finish_retry_activity()
-        text = _structured_text(payload.get("text"))
+        text = event_text
         if text:
             activity = next(
                 (
@@ -6350,7 +7228,7 @@ def apply_profile_event(
             )
     elif event_type == "status.update":
         text = _structured_text(payload.get("text") or payload.get("status"))
-        if text:
+        if text and not int(state.get("first_token_at") or 0):
             activity = next(
                 (
                     item
@@ -6371,8 +7249,8 @@ def apply_profile_event(
             activity.update(
                 {
                     "output": text[:4000],
-                    "status": "completed",
-                    "ended_at": now,
+                    "status": "running",
+                    "ended_at": None,
                     "duration_ms": max(0, now - int(activity.get("started_at") or now)),
                 }
             )
@@ -6398,7 +7276,7 @@ def apply_profile_event(
             activities.append(activity)
         activity.update(
             {
-                "name": f"正在重连 ({attempt}/{max_attempts})",
+                "name": f"正在重新连接 ({attempt}/{max_attempts})",
                 # Intermediate causes stay server-side. The fifth failure is
                 # persisted once as the terminal assistant error.
                 "output": "",
@@ -6420,6 +7298,14 @@ def apply_profile_event(
         final_text = _structured_text(payload.get("text"))
         if final_text:
             state["content"] = final_text
+            if (
+                str(payload.get("status") or "").lower() != "error"
+                and not int(state.get("first_token_at") or 0)
+            ):
+                # Some providers expose only a terminal message instead of
+                # streaming deltas. Its arrival is the first visible model
+                # output, so it is also the correct first-token boundary.
+                state["first_token_at"] = now
         state["runtime_session_id"] = str(
             payload.get("session_id") or state.get("runtime_session_id") or ""
         ).strip()
@@ -6626,8 +7512,10 @@ def _run_local_intervention_reply(
     def on_event(event: dict[str, Any]) -> None:
         if _hosted_turn_cancellation_requested(conversation_id, turn_id):
             raise _HostedTurnCancelled("Hosted turn cancelled")
-        if str(event.get("type") or "") != "thinking.delta":
-            apply_profile_event(reply_state, event)
+        # ``thinking.delta`` is the Hermes lifecycle spinner, not model
+        # reasoning.  Preserve the event type so the reducer can discard the
+        # spinner and the first-token timer cannot start before real output.
+        apply_profile_event(reply_state, event)
 
     boundary_profile = runtime_profile or profile
     before = _runtime_session_boundary(
@@ -6672,6 +7560,7 @@ def _persist_hosted_role_state(
     final_report: bool = False,
     semantic_milestone: str = "",
     visible: bool = True,
+    persist: bool = True,
 ) -> None:
     state_content = str(state.get("content") or "").strip()
     state_status = str(state.get("status") or "streaming")
@@ -6699,7 +7588,14 @@ def _persist_hosted_role_state(
         phase = "progress"
     else:
         phase = "opening"
-    if semantic_milestone and state_status not in _HOSTED_TERMINAL_STATUSES:
+    if base_stage == "chat":
+        # A normal chat reply is one bubble whose content and status evolve in
+        # place. Keeping the durable key stable prevents the streaming/progress
+        # projection and the terminal projection from becoming duplicate
+        # assistant messages in the conversation history.
+        phase_role_stage = "chat"
+        message_key = f"{turn_id}:chat:completed"
+    elif semantic_milestone and state_status not in _HOSTED_TERMINAL_STATUSES:
         phase = "milestone"
         semantic_hash = hashlib.sha256(
             semantic_milestone.strip().encode("utf-8")
@@ -6814,22 +7710,30 @@ def _persist_hosted_role_state(
         for item in state.get("_session_entry_events") or []
         if isinstance(item, dict)
     ]
-    _persist_hosted_turn(
-        conversation_id,
-        turn_id,
-        patch=patch,
-        runtime_session=(
-            profile,
-            str(state.get("runtime_session_id") or "").strip(),
-        ),
-        message=projected_message if visible else None,
-        protocol_events=pending_protocol_events,
-        session_entries=pending_session_entries,
-    )
-    if pending_protocol_events:
-        state["_protocol_events"] = []
-    if pending_session_entries:
-        state["_session_entry_events"] = []
+    if persist:
+        _persist_hosted_turn(
+            conversation_id,
+            turn_id,
+            patch=patch,
+            runtime_session=(
+                profile,
+                str(state.get("runtime_session_id") or "").strip(),
+            ),
+            message=projected_message if visible else None,
+            protocol_events=pending_protocol_events,
+            session_entries=pending_session_entries,
+        )
+        if pending_protocol_events:
+            state["_protocol_events"] = []
+        if pending_session_entries:
+            state["_session_entry_events"] = []
+    else:
+        _publish_live_hosted_role_projection(
+            conversation_id,
+            turn_id,
+            patch=patch,
+            message=projected_message if visible else None,
+        )
 
 
 def _run_hosted_role(
@@ -6867,6 +7771,10 @@ def _run_hosted_role(
     live_generation = _account_generation_for_owner(artifact_owner_id)
     if captured_generation and captured_generation != live_generation:
         raise RuntimeError("stale hosted turn account generation")
+    # Every model turn receives the complete Hermes tool contract. Routing
+    # metadata describes likely use, but must never remove capabilities before
+    # the model has inspected the user's message itself.
+    allow_tools = True
     artifact_context = {
         "root": str(get_hermes_home()),
         "owner_id": artifact_owner_id,
@@ -6886,6 +7794,7 @@ def _run_hosted_role(
             ) or []
             if str(item).strip()
         ],
+        "allow_tools": "1",
     }
     state = {
         "content": "",
@@ -6999,6 +7908,8 @@ def _run_hosted_role(
             visible=visible,
         )
     last_persisted_at = 0.0
+    first_visible_published = False
+    chat_lifecycle_checkpoint_scheduled = False
     atomic_depth = 0
 
     def claim_pending_intervention(
@@ -7104,12 +8015,12 @@ def _run_hosted_role(
         last_persisted_at = time.monotonic()
 
     def on_event(event: dict[str, Any]) -> None:
-        nonlocal atomic_depth
+        nonlocal atomic_depth, first_visible_published
+        nonlocal chat_lifecycle_checkpoint_scheduled
         if _hosted_turn_cancellation_requested(conversation_id, turn_id):
             raise _HostedTurnCancelled("Hosted turn cancelled")
+        protocol_event = event
         event_type = str(event.get("type") or "")
-        if event_type == "thinking.delta":
-            return
         if event_type in {"tool.start", "subagent.start"} and atomic_depth == 0:
             intervention = claim_pending_intervention({"steer"})
             if isinstance(intervention, dict):
@@ -7162,8 +8073,61 @@ def _run_hosted_role(
             activity.get("kind") == "reasoning"
             for activity in state.get("activities") or []
         )
+        first_status_update = event_type == "status.update" and not any(
+            str(activity.get("id") or "") == "model-runtime-status"
+            for activity in state.get("activities") or []
+            if isinstance(activity, dict)
+        )
+        # Chat status is transient.  Persisting the first "thinking" marker
+        # synchronously rewrites the multi-megabyte profile before the model
+        # can produce its first visible token.  The accepted event, first
+        # visible delta, and terminal event still make the durable timeline
+        # complete without that extra write.
+        if role_stage.split(":", 1)[0] == "chat":
+            first_status_update = False
         apply_profile_event(state, event)
-        _queue_hosted_protocol_event(state, event)
+        _queue_hosted_protocol_event(state, protocol_event)
+        # Publish the first chat lifecycle snapshot as soon as the gateway
+        # accepts the model turn.  The normal chat path intentionally avoids a
+        # synchronous multi-megabyte state rewrite for transient events, but
+        # waiting until the first token leaves the iOS UI blind during provider
+        # startup/reconnect.  One asynchronous checkpoint gives SSE a real
+        # conversation projection without blocking the provider stream or
+        # rewriting state for every token.
+        if (
+            role_stage.split(":", 1)[0] == "chat"
+            and not chat_lifecycle_checkpoint_scheduled
+            and event_type == "agent.started"
+        ):
+            chat_lifecycle_checkpoint_scheduled = True
+            lifecycle_state = deepcopy(state)
+
+            def _checkpoint_chat_lifecycle() -> None:
+                try:
+                    _persist_hosted_role_state(
+                        conversation_id,
+                        turn_id,
+                        profile=profile,
+                        role_stage=role_stage,
+                        role_label=role_label,
+                        state=lifecycle_state,
+                        content_fallback=start_text,
+                        final_report=final_report,
+                        visible=visible,
+                    )
+                except Exception:
+                    logger.debug(
+                        "Hosted chat lifecycle checkpoint failed for %s/%s",
+                        conversation_id,
+                        turn_id,
+                        exc_info=True,
+                    )
+
+            threading.Thread(
+                target=_checkpoint_chat_lifecycle,
+                name=f"hosted-chat-checkpoint-{turn_id[-10:]}",
+                daemon=True,
+            ).start()
         if event_type in {"tool.complete", "subagent.complete"}:
             atomic_depth = max(0, atomic_depth - 1)
         if event_type == "request.accepted":
@@ -7171,21 +8135,60 @@ def _run_hosted_role(
         first_visible_delta = (
             event_type == "message.delta" and not had_content
         ) or (
-            event_type == "reasoning.delta" and not had_reasoning
+            event_type == "reasoning.delta"
+            and not had_reasoning
+            and not had_content
         )
-        if (
-            event_type == "request.accepted"
-            or event_type in {"error", "message.complete"}
-            or (
-                _coerce_flag(state.get("request_accepted"))
-                and event_type not in {"message.delta", "reasoning.delta"}
-            )
+        first_visible_delta = first_visible_delta and not first_visible_published
+        has_execution_activity = any(
+            isinstance(activity, dict)
+            and activity.get("kind") in {"tool", "subagent"}
+            for activity in state.get("activities") or []
+        )
+        # The enqueue transaction already durably records a normal chat's
+        # user message and turn shell.  Keep accepted/status events live over
+        # SSE, but do not rewrite the multi-megabyte profile on every transient
+        # chat event before the provider emits a token.  Workflow roles still
+        # use the periodic checkpoint path because their tool/subagent state
+        # must survive a worker restart.
+        is_chat_role = role_stage.split(":", 1)[0] == "chat"
+        if is_chat_role and (
+            event_type in {"agent.started", "connection.retry"}
             or first_visible_delta
+        ):
+            # Keep lifecycle/first-token rendering independent from the
+            # durable JSON checkpoint.  The latter can take seconds under
+            # load; the live projection is replaced by the next checkpoint.
+            _persist_hosted_role_state(
+                conversation_id,
+                turn_id,
+                profile=profile,
+                role_stage=role_stage,
+                role_label=role_label,
+                state=state,
+                content_fallback=start_text,
+                final_report=final_report,
+                visible=visible,
+                persist=False,
+            )
+            if first_visible_delta:
+                first_visible_published = True
+        should_persist = (
+            (
+                event_type == "request.accepted"
+                and not is_chat_role
+            )
+            or event_type in {"error", "message.complete"}
+            or first_status_update
+            or (first_visible_delta and not is_chat_role)
             or (
-                _coerce_flag(state.get("request_accepted"))
+                not is_chat_role
+                and _coerce_flag(state.get("request_accepted"))
+                and has_execution_activity
                 and time.monotonic() - last_persisted_at >= _HOSTED_EVENT_FLUSH_SECONDS
             )
-        ):
+        )
+        if should_persist:
             persist()
         if atomic_depth == 0:
             intervention = claim_pending_intervention({"steer"})
@@ -7930,6 +8933,7 @@ def create_hosted_turn_record(
     conversation: dict[str, Any],
     *,
     turn_id: str,
+    user_message_id: str = "",
     content: str,
     title: str,
     profiles: list[str],
@@ -7952,6 +8956,10 @@ def create_hosted_turn_record(
     existing = hosted_turns.get(normalized_turn_id)
     if isinstance(existing, dict):
         return existing
+    cancel_key = (str(conversation.get("id") or ""), normalized_turn_id)
+    with _HOSTED_CANCEL_STATE_LOCK:
+        _HOSTED_CANCEL_SIGNALS.discard(cancel_key)
+        _HOSTED_CANCEL_CACHE.pop(cancel_key, None)
     now = int(time.time() * 1000)
     normalized_mode = str(mode or "work").strip().lower()
     if normalized_mode not in {"chat", "work"}:
@@ -7969,6 +8977,10 @@ def create_hosted_turn_record(
     )
     record = {
         "turn_id": normalized_turn_id,
+        # The account-scoped conversation stores the optimistic user message
+        # before the official gateway receives the prompt. Keep its identity
+        # on the turn so a first-turn prompt can project only prior history.
+        "user_message_id": str(user_message_id or "").strip(),
         "account_generation": account_generation,
         "status": "queued",
         "stage": "accepted",
@@ -8159,24 +9171,18 @@ def create_hosted_kanban_task(
 def _notify_hosted_update(conversation_id: str = "") -> int:
     global _HOSTED_UPDATE_REVISION
     normalized_conversation_id = str(conversation_id or "").strip()
-    if normalized_conversation_id:
-        with _STATE_LOCK:
-            state = load_single_state()
-            try:
-                conversation = _conversation_by_id(state, normalized_conversation_id)
-            except HTTPException:
-                conversation = None
-            if conversation is not None:
-                conversation["event_cursor"] = max(
-                    0,
-                    int(conversation.get("event_cursor") or 0),
-                ) + 1
-                conversation["event_updated_at"] = int(time.time() * 1000)
-                save_single_state(state)
     with _HOSTED_UPDATE_CONDITION:
         _HOSTED_UPDATE_REVISION += 1
+        if normalized_conversation_id:
+            _HOSTED_UPDATE_REVISIONS[normalized_conversation_id] = (
+                _HOSTED_UPDATE_REVISIONS.get(normalized_conversation_id, 0) + 1
+            )
         _HOSTED_UPDATE_CONDITION.notify_all()
-        return _HOSTED_UPDATE_REVISION
+        return (
+            _HOSTED_UPDATE_REVISIONS[normalized_conversation_id]
+            if normalized_conversation_id
+            else _HOSTED_UPDATE_REVISION
+        )
 
 
 def _completion_notification_record(
@@ -8312,6 +9318,22 @@ def _mobile_notification_dispatch_loop() -> None:
     """Deliver all persistent APNs jobs without allocating one thread per job."""
 
     while True:
+        # A hosted server can legitimately run without APNs credentials (for
+        # example during local/self-hosted deployment). Keep the durable
+        # outbox retryable for a later configuration change, but do not drain
+        # every pending record in a tight loop and serialize the large
+        # collaboration state document for each failed attempt.
+        try:
+            from hermes_cli.dashboard_auth.mobile_notifications import apns_configured
+
+            if not apns_configured():
+                with _MOBILE_NOTIFICATION_DISPATCH_CONDITION:
+                    _MOBILE_NOTIFICATION_DISPATCH_CONDITION.wait(timeout=300.0)
+                continue
+        except Exception:
+            # Preserve the existing fail-open delivery behavior when the
+            # optional notification module is unavailable.
+            pass
         with _MOBILE_NOTIFICATION_DISPATCH_CONDITION:
             while not _MOBILE_NOTIFICATION_PENDING:
                 _MOBILE_NOTIFICATION_DISPATCH_CONDITION.wait()
@@ -8478,11 +9500,33 @@ def _notification_retry_delay_ms(attempts: int) -> int:
     return min(60 * 60 * 1000, 15_000 * (2**exponent))
 
 
-def _wait_for_hosted_update(revision: int, timeout: float = 15.0) -> int:
+def _hosted_update_revision(conversation_id: str = "") -> int:
+    normalized_conversation_id = str(conversation_id or "").strip()
     with _HOSTED_UPDATE_CONDITION:
-        if _HOSTED_UPDATE_REVISION <= revision:
-            _HOSTED_UPDATE_CONDITION.wait(timeout=timeout)
+        if normalized_conversation_id:
+            return _HOSTED_UPDATE_REVISIONS.get(normalized_conversation_id, 0)
         return _HOSTED_UPDATE_REVISION
+
+
+def _wait_for_hosted_update(
+    revision: int,
+    timeout: float = 15.0,
+    conversation_id: str = "",
+) -> int:
+    normalized_conversation_id = str(conversation_id or "").strip()
+    with _HOSTED_UPDATE_CONDITION:
+        current_revision = (
+            _HOSTED_UPDATE_REVISIONS.get(normalized_conversation_id, 0)
+            if normalized_conversation_id
+            else _HOSTED_UPDATE_REVISION
+        )
+        if current_revision <= revision:
+            _HOSTED_UPDATE_CONDITION.wait(timeout=timeout)
+        return (
+            _HOSTED_UPDATE_REVISIONS.get(normalized_conversation_id, 0)
+            if normalized_conversation_id
+            else _HOSTED_UPDATE_REVISION
+        )
 
 
 def _persist_hosted_turn(
@@ -8821,15 +9865,16 @@ def _persist_hosted_turn(
                     == str(message.get("kind") or "message")
                 )
 
-            existing = next(
+            messages = conversation.setdefault("messages", [])
+            existing_index = next(
                 (
-                    item
-                    for item in conversation.get("messages") or []
-                    if matches_message(item)
+                    index
+                    for index, item in enumerate(messages)
+                    if isinstance(item, dict) and matches_message(item)
                 ),
                 None,
             )
-            if existing is None:
+            if existing_index is None:
                 existing = _append_message(
                     conversation,
                     role=str(message.get("role") or "assistant"),
@@ -8840,16 +9885,21 @@ def _persist_hosted_turn(
                     meta=message_meta,
                 )
             else:
+                existing = messages[existing_index]
                 previous_content = str(existing.get("content") or "")
-                existing.update(
-                    {
-                        "content": str(message.get("content") or "").strip(),
-                        "status": str(message.get("status") or "completed"),
-                        "meta": {**existing.get("meta", {}), **message_meta},
-                        "updated_at": now,
-                    }
-                )
+                # Replace the snapshot instead of mutating it in place. Event
+                # consumers may still hold the pre-token object; mutating that
+                # object makes a blank processing snapshot appear to have
+                # contained the final reply all along.
+                existing = {
+                    **existing,
+                    "content": str(message.get("content") or "").strip(),
+                    "status": str(message.get("status") or "completed"),
+                    "meta": {**existing.get("meta", {}), **message_meta},
+                    "updated_at": now,
+                }
                 _project_native_message(existing)
+                messages[existing_index] = existing
                 message_status = str(existing.get("status") or "completed").lower()
                 message_content = str(existing.get("content") or "")
                 stream_entries = append_message_stream_entries(
@@ -9416,6 +10466,13 @@ def request_hosted_turn_cancellation(
     reason: str = "用户取消",
     request_id: str = "",
 ) -> dict[str, Any]:
+    cancel_key = (str(conversation_id), str(turn_id))
+    # Signal the running gateway callback before touching the multi-megabyte
+    # durable store. This makes the stop control immediate even while another
+    # event is being persisted.
+    with _HOSTED_CANCEL_STATE_LOCK:
+        _HOSTED_CANCEL_SIGNALS.add(cancel_key)
+        _HOSTED_CANCEL_CACHE[cancel_key] = (time.monotonic(), True)
     with _STATE_LOCK:
         state = load_single_state()
         conversation = _conversation_by_id(state, conversation_id)
@@ -9460,8 +10517,12 @@ def request_hosted_turn_cancellation(
                     pending.pop(key, None)
             conversation["updated_at"] = now
             save_single_state(state)
+            _notify_hosted_update(conversation_id)
             return dict(pending[turn_id])
         if run.get("status") in _HOSTED_TERMINAL_STATUSES:
+            with _HOSTED_CANCEL_STATE_LOCK:
+                _HOSTED_CANCEL_SIGNALS.discard(cancel_key)
+                _HOSTED_CANCEL_CACHE[cancel_key] = (time.monotonic(), False)
             return dict(run)
         now = int(time.time() * 1000)
         clean_reason = str(reason or "用户取消").strip() or "用户取消"
@@ -9509,13 +10570,9 @@ def request_hosted_turn_cancellation(
             payload={"entity_id": turn_id, "reason": clean_reason},
             occurred_at=now,
         )
-        save_single_state(state)
         persisted = dict(run)
-    with _STATE_LOCK:
-        state = load_single_state()
-        conversation = _conversation_by_id(state, conversation_id)
-        current = (conversation.get("hosted_turns") or {}).get(turn_id)
-        persisted = dict(current) if isinstance(current, dict) else persisted
+        save_single_state(state)
+    _notify_hosted_update(conversation_id)
     if str(persisted.get("status") or "") in _HOSTED_TERMINAL_STATUSES:
         _schedule_persisted_terminal_notification(
             conversation_id,
@@ -9530,14 +10587,27 @@ def _hosted_turn_cancellation_requested(
     conversation_id: str,
     turn_id: str,
 ) -> bool:
+    cancel_key = (str(conversation_id), str(turn_id))
+    now = time.monotonic()
+    with _HOSTED_CANCEL_STATE_LOCK:
+        if cancel_key in _HOSTED_CANCEL_SIGNALS:
+            return True
+        cached = _HOSTED_CANCEL_CACHE.get(cancel_key)
+        if cached is not None and now - cached[0] < _HOSTED_CANCEL_CACHE_SECONDS:
+            return cached[1]
     with _STATE_LOCK:
         state = load_single_state()
         conversation = _conversation_by_id(state, conversation_id)
         run = (conversation.get("hosted_turns") or {}).get(turn_id)
-        return bool(
+        requested = bool(
             isinstance(run, dict)
             and (run.get("cancel_requested") or run.get("status") == "cancelled")
         )
+    with _HOSTED_CANCEL_STATE_LOCK:
+        _HOSTED_CANCEL_CACHE[cancel_key] = (now, requested)
+        if requested:
+            _HOSTED_CANCEL_SIGNALS.add(cancel_key)
+    return requested
 
 
 def _finish_hosted_turn_if_cancelled(
@@ -9559,6 +10629,10 @@ def _finish_hosted_turn_if_cancelled(
         ):
             return False
         reason = str(run.get("cancel_reason") or "用户取消")
+        is_chat = str(run.get("mode") or "").strip().lower() == "chat"
+        cancellation_text = (
+            f"对话已取消：{reason}" if is_chat else f"任务已取消：{reason}"
+        )
     now = int(time.time() * 1000)
     _persist_hosted_turn(
         conversation_id,
@@ -9572,19 +10646,19 @@ def _finish_hosted_turn_if_cancelled(
                 conversation_id,
                 turn_id,
                 "cancelled",
-                f"任务已取消：{reason}",
+                cancellation_text,
             ),
         },
         message={
             "role": "assistant",
             "name": "default",
-            "content": f"任务已取消：{reason}",
+            "content": cancellation_text,
             "status": "cancelled",
             "kind": "message",
             "meta": {
-                "role_stage": "reporter",
-                "role_label": "Hermes · 任务取消",
-                "final_report": True,
+                "role_stage": "chat" if is_chat else "reporter",
+                "role_label": "Hermes" if is_chat else "Hermes · 任务取消",
+                "final_report": not is_chat,
             },
         },
         protocol_events=[
@@ -9892,25 +10966,12 @@ def execute_hosted_chat(
         run = dict(run)
     if _finish_hosted_turn_if_cancelled(conversation_id, turn_id):
         return
-    if runner is run_profile_turn:
-        if not _wait_for_hosted_chat_model(
-            conversation_id,
-            turn_id,
-            profile,
-            retry_delay_seconds=model_retry_delay_seconds,
-            sleeper=model_retry_sleeper,
-        ):
-            return
-        with _STATE_LOCK:
-            state = load_single_state()
-            conversation = _conversation_by_id(state, conversation_id)
-            refreshed_run = (conversation.get("hosted_turns") or {}).get(turn_id)
-            if not isinstance(refreshed_run, dict):
-                return
-            if refreshed_run.get("status") in _HOSTED_TERMINAL_STATUSES:
-                return
-            conversation_snapshot = dict(conversation)
-            run = dict(refreshed_run)
+    # The persistent official gateway is the source of truth for provider
+    # readiness and already emits bounded connection.retry events. Running a
+    # separate profile preflight duplicated the connection work and rewrote
+    # the large collaboration state before the first request. Let the gateway
+    # attempt the model directly; its retry/error events drive the same mobile
+    # state machine without adding a cold-start round trip.
     content = str(run.get("content") or "").strip()
     selected_profiles = [
         str(item).strip() for item in run.get("profiles") or [] if str(item).strip()
@@ -9937,6 +10998,23 @@ def execute_hosted_chat(
         )
         if item
     )
+    prompt_user_message_id = str(run.get("user_message_id") or "").strip()
+    if not prompt_user_message_id:
+        # Turns written before the identity field was introduced still need
+        # the same official-session semantics. Resolve only the newest user
+        # message with this turn's content as a compatibility fallback.
+        for item in reversed(conversation_snapshot.get("messages") or []):
+            if not isinstance(item, dict):
+                continue
+            if str(item.get("role") or "").strip().lower() != "user":
+                continue
+            if str(item.get("content") or "").strip() != str(
+                run.get("content") or ""
+            ).strip():
+                continue
+            prompt_user_message_id = str(item.get("id") or "").strip()
+            if prompt_user_message_id:
+                break
     runtime_session_id = str(
         (conversation_snapshot.get("runtime_sessions") or {}).get(profile) or ""
     ).strip()
@@ -9951,6 +11029,7 @@ def execute_hosted_chat(
             profile,
             content,
             include_projected_history=not bool(runtime_session_id),
+            exclude_message_id=prompt_user_message_id,
         ),
         runner=runner,
         kanban_task_id="",
@@ -9978,6 +11057,11 @@ def execute_hosted_chat(
             ).strip()
     now = int(time.time() * 1000)
     first_token_at = int(_role_state.get("first_token_at") or 0)
+    request_started_at = int(
+        run.get("started_at")
+        or _role_state.get("started_at")
+        or now
+    )
     persisted_run = _persist_hosted_turn(
         conversation_id,
         turn_id,
@@ -10023,10 +11107,10 @@ def execute_hosted_chat(
                 "role_label": "Hermes",
                 "profile": profile,
                 "attachments": published_attachments,
-                "started_at": first_token_at or None,
+                "started_at": request_started_at,
                 "first_token_at": first_token_at or None,
                 "completed_at": now,
-                "duration_ms": max(0, now - first_token_at) if first_token_at else 0,
+                "duration_ms": max(0, now - request_started_at),
                 "runtime_session_id": str(
                     _role_state.get("runtime_session_id") or ""
                 ).strip(),
@@ -10606,6 +11690,23 @@ def execute_hosted_workflow(
             },
         )
 
+    if manager_plan.get("plan"):
+        _persist_hosted_plan_snapshot(
+            conversation_id,
+            turn_id,
+            manager_plan,
+            stage="dispatching",
+            worker_statuses=(
+                run.get("worker_statuses")
+                if isinstance(run.get("worker_statuses"), dict)
+                else {}
+            ),
+            reviewer_status=str(run.get("reviewer_status") or ""),
+            reviewer_result=str(run.get("reviewer_result") or ""),
+            reporter_status=str(run.get("reporter_status") or ""),
+            final_status=str(run.get("status") or ""),
+        )
+
     worker_profiles = list(manager_plan.get("workers") or fallback_worker_profiles)
     if manager_plan.get("reviewer_target") == "pc":
         reviewer_connector_id = "pc-primary"
@@ -10939,6 +12040,14 @@ def execute_hosted_workflow(
                         "stage": "worker_running",
                     },
                 )
+                if manager_plan.get("plan"):
+                    _persist_hosted_plan_snapshot(
+                        conversation_id,
+                        turn_id,
+                        manager_plan,
+                        stage="worker_running",
+                        worker_statuses=worker_statuses,
+                    )
     worker_result = "\n\n".join(
         f"## {profile}\n{worker_results.get(profile, '')}".strip()
         for profile in worker_profiles
@@ -10966,6 +12075,14 @@ def execute_hosted_workflow(
             ],
         },
     )
+    if manager_plan.get("plan"):
+        _persist_hosted_plan_snapshot(
+            conversation_id,
+            turn_id,
+            manager_plan,
+            stage="reviewing",
+            worker_statuses=worker_statuses,
+        )
     if _finish_hosted_turn_if_cancelled(conversation_id, turn_id):
         return
 
@@ -11100,6 +12217,16 @@ def execute_hosted_workflow(
                 "stage": "reviewing",
             },
         )
+        if manager_plan.get("plan"):
+            _persist_hosted_plan_snapshot(
+                conversation_id,
+                turn_id,
+                manager_plan,
+                stage="reviewing",
+                worker_statuses=worker_statuses,
+                reviewer_status=reviewer_status,
+                reviewer_result=reviewer_result,
+            )
         if _finish_hosted_turn_if_cancelled(conversation_id, turn_id):
             return
 
@@ -11149,6 +12276,19 @@ def execute_hosted_workflow(
                 },
             },
         )
+        if manager_plan.get("plan"):
+            _persist_hosted_plan_snapshot(
+                conversation_id,
+                turn_id,
+                manager_plan,
+                stage="rework",
+                worker_statuses={
+                    **worker_statuses,
+                    **{profile: "running" for profile in worker_profiles},
+                },
+                reviewer_status="",
+                reviewer_result="",
+            )
         if _finish_hosted_turn_if_cancelled(conversation_id, turn_id):
             return
 
@@ -11235,6 +12375,14 @@ def execute_hosted_workflow(
                 "stage": "reviewing",
             },
         )
+        if manager_plan.get("plan"):
+            _persist_hosted_plan_snapshot(
+                conversation_id,
+                turn_id,
+                manager_plan,
+                stage="reviewing",
+                worker_statuses=worker_statuses,
+            )
         reviewer_prompt = "\n".join(
             item
             for item in (
@@ -11316,6 +12464,16 @@ def execute_hosted_workflow(
                 "stage": "reviewing",
             },
         )
+        if manager_plan.get("plan"):
+            _persist_hosted_plan_snapshot(
+                conversation_id,
+                turn_id,
+                manager_plan,
+                stage="reviewing",
+                worker_statuses=worker_statuses,
+                reviewer_status=reviewer_status,
+                reviewer_result=reviewer_result,
+            )
         if _finish_hosted_turn_if_cancelled(conversation_id, turn_id):
             return
 
@@ -11335,6 +12493,16 @@ def execute_hosted_workflow(
                 "reviewer_status": reviewer_status,
             },
         )
+        if manager_plan.get("plan"):
+            _persist_hosted_plan_snapshot(
+                conversation_id,
+                turn_id,
+                manager_plan,
+                stage="reporting",
+                worker_statuses=worker_statuses,
+                reviewer_status=reviewer_status,
+                reviewer_result=reviewer_result,
+            )
 
     review_supervision, review_supervision_status, _review_supervision = (
         _run_hosted_supervisor_check(
@@ -11471,6 +12639,16 @@ def execute_hosted_workflow(
                 "stage": "reporting",
             },
         )
+        if manager_plan.get("plan"):
+            _persist_hosted_plan_snapshot(
+                conversation_id,
+                turn_id,
+                manager_plan,
+                stage="reporting",
+                worker_statuses=worker_statuses,
+                reviewer_status=reviewer_status,
+                reviewer_result=reviewer_result,
+            )
     elif not manager_handoff:
         manager_handoff = _normalize_manager_handoff(
             {},
@@ -11719,6 +12897,18 @@ def execute_hosted_workflow(
             if isinstance(check, dict)
         }
     now = int(time.time() * 1000)
+    if manager_plan.get("plan"):
+        _persist_hosted_plan_snapshot(
+            conversation_id,
+            turn_id,
+            manager_plan,
+            stage="completed" if final_status == "completed" else "failed",
+            worker_statuses=worker_statuses,
+            reviewer_status=reviewer_status,
+            reviewer_result=reviewer_result,
+            reporter_status=reporter_status,
+            final_status=final_status,
+        )
     persisted_run = _persist_hosted_turn(
         conversation_id,
         turn_id,
@@ -11837,6 +13027,24 @@ def _hosted_turn_account_generation(conversation_id: str, turn_id: str) -> str:
         return live_generation
 
 
+def _hosted_turn_mode(conversation_id: str, turn_id: str) -> str:
+    with _STATE_LOCK:
+        state = load_single_state()
+        conversation = _conversation_by_id(state, conversation_id)
+        run = (conversation.get("hosted_turns") or {}).get(turn_id)
+        if not isinstance(run, dict):
+            return "work"
+        route_metadata = (
+            run.get("route_metadata")
+            if isinstance(run.get("route_metadata"), dict)
+            else {}
+        )
+        mode = str(
+            run.get("mode") or route_metadata.get("mode") or "work"
+        ).lower()
+        return "chat" if mode == "chat" else "work"
+
+
 def _set_hosted_execution_generation(account_generation: str) -> None:
     _HOSTED_EXECUTION_GENERATION.value = str(account_generation or "").strip()
 
@@ -11875,6 +13083,38 @@ def start_hosted_workflow(conversation_id: str, turn_id: str) -> threading.Threa
                     except Exception as exc:
                         clean_error = sanitize_runtime_error(exc)
                         try:
+                            failure_mode = _hosted_turn_mode(
+                                conversation_id,
+                                current_turn_id,
+                            )
+                            if failure_mode == "chat":
+                                failure_message = {
+                                    "role": "assistant",
+                                    "name": "default",
+                                    "content": f"对话运行失败：{clean_error}",
+                                    "status": "failed",
+                                    "kind": "message",
+                                    "meta": {
+                                        "role_stage": "chat",
+                                        "base_role_stage": "chat",
+                                        "role_label": "Hermes",
+                                        "final_report": False,
+                                    },
+                                }
+                            else:
+                                failure_message = {
+                                    "role": "assistant",
+                                    "name": "default",
+                                    "content": f"服务端任务失败：{clean_error}",
+                                    "status": "failed",
+                                    "kind": "message",
+                                    "meta": {
+                                        "role_stage": "reporter",
+                                        "base_role_stage": "reporter",
+                                        "role_label": "Hermes · 最终汇报",
+                                        "final_report": True,
+                                    },
+                                }
                             persisted_run = _persist_hosted_turn(
                                 conversation_id,
                                 current_turn_id,
@@ -11890,18 +13130,7 @@ def start_hosted_workflow(conversation_id: str, turn_id: str) -> threading.Threa
                                         clean_error,
                                     ),
                                 },
-                                message={
-                                    "role": "assistant",
-                                    "name": "default",
-                                    "content": f"服务端托管任务失败：{clean_error}",
-                                    "status": "failed",
-                                    "kind": "message",
-                                    "meta": {
-                                        "role_stage": "reporter",
-                                        "role_label": "Hermes · 最终汇报",
-                                        "final_report": True,
-                                    },
-                                },
+                                message=failure_message,
                             )
                         except Exception:
                             persisted_run = {}
@@ -14035,6 +15264,7 @@ def create_single_chat(payload: CreateSingleConversationBody, request: Request =
                 if not existing_generation:
                     existing["account_generation"] = account_generation
                     save_single_state(state)
+                _prewarm_hosted_chat(existing)
                 return {
                     "conversation": _public_conversation(existing),
                     "created": False,
@@ -14046,6 +15276,7 @@ def create_single_chat(payload: CreateSingleConversationBody, request: Request =
         conversation["account_generation"] = account_generation
         state["conversations"].insert(0, conversation)
         save_single_state(state)
+    _prewarm_hosted_chat(conversation)
     return {"conversation": _public_conversation(conversation), "created": True}
 
 
@@ -14123,6 +15354,7 @@ def get_single_conversation(
             save_single_state(state)
         result = {"conversation": _public_conversation(conversation)}
     resume_unfinished_hosted_workflows([conversation])
+    _prewarm_hosted_chat(conversation)
     return result
 
 
@@ -14439,6 +15671,27 @@ def _hosted_event_stream_frame(
     return envelope, has_more
 
 
+def _live_hosted_event_stream_frame(
+    conversation_id: str,
+    owner_id: str,
+    *,
+    delivered_cursor: int,
+    include_snapshot: bool,
+    limit: int = 500,
+) -> Optional[tuple[dict[str, Any], bool]]:
+    """Build an SSE frame without contending on the durable state lock."""
+
+    conversation = _live_conversation_snapshot(conversation_id, owner_id)
+    if conversation is None:
+        return None
+    return _hosted_event_stream_frame(
+        conversation,
+        delivered_cursor=delivered_cursor,
+        include_snapshot=include_snapshot,
+        limit=limit,
+    )
+
+
 @router.get("/single/conversations/{conversation_id}/hosted-events")
 async def stream_hosted_conversation_events(
     conversation_id: str,
@@ -14476,54 +15729,143 @@ async def stream_hosted_conversation_events(
             save_single_state(state)
 
     async def event_stream():
-        revision = -1
+        revision = _hosted_update_revision(conversation_id)
         delivered_cursor = requested_cursor
-        initial_snapshot = True
-        while not await request.is_disconnected():
-            with _STATE_LOCK:
-                state = load_single_state()
-                conversation, _claimed = _owned_conversation_in_state(
-                    state,
+        with _STATE_LOCK:
+            state = _load_single_state_for_event_stream()
+            conversation, _claimed = _owned_conversation_in_state(
+                state,
+                conversation_id,
+                owner_id,
+            )
+            envelope, has_more_events = _hosted_event_stream_frame(
+                conversation,
+                delivered_cursor=delivered_cursor,
+                include_snapshot=True,
+                limit=500,
+            )
+        while True:
+            current_cursor = int(envelope["cursor"])
+            yield (
+                f"id: {current_cursor}\n"
+                "event: conversation\n"
+                f"data: {json.dumps(envelope, ensure_ascii=False, separators=(',', ':'))}\n\n"
+            )
+            delivered_cursor = current_cursor
+            if has_more_events:
+                live_frame = _live_hosted_event_stream_frame(
                     conversation_id,
                     owner_id,
-                )
-                current_revision = _HOSTED_UPDATE_REVISION
-                envelope, has_more_events = _hosted_event_stream_frame(
-                    conversation,
                     delivered_cursor=delivered_cursor,
-                    include_snapshot=initial_snapshot,
+                    include_snapshot=False,
                     limit=500,
                 )
+                if live_frame is not None:
+                    envelope, has_more_events = live_frame
+                else:
+                    with _STATE_LOCK:
+                        state = _load_single_state_for_event_stream()
+                        conversation, _claimed = _owned_conversation_in_state(
+                            state,
+                            conversation_id,
+                            owner_id,
+                        )
+                        envelope, has_more_events = _hosted_event_stream_frame(
+                            conversation,
+                            delivered_cursor=delivered_cursor,
+                            include_snapshot=False,
+                            limit=500,
+                        )
+                continue
+            break
+
+        while not await request.is_disconnected():
+            next_revision = await asyncio.to_thread(
+                _wait_for_hosted_update,
+                revision,
+                15.0,
+                conversation_id,
+            )
+            if next_revision == revision:
+                yield ": keepalive\n\n"
+                continue
+            revision = next_revision
+            live_frame = _live_hosted_event_stream_frame(
+                conversation_id,
+                owner_id,
+                delivered_cursor=delivered_cursor,
+                # A persisted notification may represent cancellation,
+                # routing or another state transition without a lifecycle
+                # delta. Shipping the authoritative snapshot here also lets
+                # iOS reconcile directly instead of issuing a full GET for
+                # every SSE batch.
+                include_snapshot=True,
+                limit=500,
+            )
+            if live_frame is not None:
+                envelope, has_more_events = live_frame
+            else:
+                with _STATE_LOCK:
+                    state = _load_single_state_for_event_stream()
+                    conversation, _claimed = _owned_conversation_in_state(
+                        state,
+                        conversation_id,
+                        owner_id,
+                    )
+                    envelope, has_more_events = _hosted_event_stream_frame(
+                        conversation,
+                        delivered_cursor=delivered_cursor,
+                        include_snapshot=True,
+                        limit=500,
+                    )
+            current_cursor = int(envelope["cursor"])
+            payload = json.dumps(
+                envelope,
+                ensure_ascii=False,
+                separators=(",", ":"),
+            )
+            yield (
+                f"id: {current_cursor}\n"
+                "event: conversation\n"
+                f"data: {payload}\n\n"
+            )
+            delivered_cursor = current_cursor
+            while has_more_events:
+                live_frame = _live_hosted_event_stream_frame(
+                    conversation_id,
+                    owner_id,
+                    delivered_cursor=delivered_cursor,
+                    include_snapshot=False,
+                    limit=500,
+                )
+                if live_frame is not None:
+                    envelope, has_more_events = live_frame
+                else:
+                    with _STATE_LOCK:
+                        state = _load_single_state_for_event_stream()
+                        conversation, _claimed = _owned_conversation_in_state(
+                            state,
+                            conversation_id,
+                            owner_id,
+                        )
+                        envelope, has_more_events = _hosted_event_stream_frame(
+                            conversation,
+                            delivered_cursor=delivered_cursor,
+                            include_snapshot=False,
+                            limit=500,
+                        )
                 current_cursor = int(envelope["cursor"])
                 payload = json.dumps(
                     envelope,
                     ensure_ascii=False,
                     separators=(",", ":"),
                 )
-            if initial_snapshot or envelope["has_gap"] or envelope["events"]:
                 yield (
                     f"id: {current_cursor}\n"
                     "event: conversation\n"
                     f"data: {payload}\n\n"
                 )
-                initial_snapshot = False
                 delivered_cursor = current_cursor
-                revision = current_revision
-                if has_more_events:
-                    continue
-            else:
-                # Another conversation can advance the global revision without
-                # producing a frame for this stream. Mark that revision as
-                # observed before waiting; otherwise the condition returns
-                # immediately forever and this connection spins at 100% CPU.
-                revision = current_revision
-            next_revision = await asyncio.to_thread(
-                _wait_for_hosted_update,
-                revision,
-                15.0,
-            )
-            if next_revision == revision:
-                yield ": keepalive\n\n"
 
     return StreamingResponse(
         event_stream(),
@@ -14873,6 +16215,7 @@ def _complete_pending_hosted_route(conversation_id: str, turn_id: str) -> bool:
         return False
 
     output_dir = _hosted_turn_output_dir(conversation_id, turn_id).resolve()
+    prewarm_started = False
     user_delivery_context = str(item_snapshot.get("delivery_context") or "").strip()
     delivery_context = user_delivery_context
     if artifact_required:
@@ -15137,6 +16480,29 @@ def enqueue_hosted_turn(
             )
         return replay_response
 
+    hard_chat_route: Optional[dict[str, Any]] = None
+    hard_chat_profiles: list[str] = []
+    hard_chat_artifact_required = False
+    deterministic_route = classify_user_intent(message_content)
+    if (
+        str(deterministic_route.get("mode") or "") == "chat"
+        and str(deterministic_route.get("lock_level") or "") == "hard_chat"
+    ):
+        (
+            hard_chat_route,
+            _hard_chat_mode,
+            hard_chat_profiles,
+            hard_chat_artifact_required,
+        ) = _hosted_route_parameters(
+            route_metadata=deterministic_route,
+            content=message_content,
+            requested_mode="chat",
+            requested_profiles=[conversation_profile],
+            requested_artifact=_coerce_flag(
+                deterministic_route.get("artifact_required")
+            ),
+        )
+
     output_dir = _hosted_turn_output_dir(conversation_id, turn_id).resolve()
 
     with _STATE_LOCK:
@@ -15223,30 +16589,49 @@ def enqueue_hosted_turn(
             hosted = create_hosted_turn_record(
                 conversation,
                 turn_id=turn_id,
+                user_message_id=message_id,
                 content=message_content,
                 title=summarize_task_title(message_content),
-                profiles=[],
-                artifact_required=False,
+                profiles=hard_chat_profiles,
+                artifact_required=hard_chat_artifact_required,
                 attachment_context=payload.attachment_context,
                 delivery_context=payload.delivery_context,
                 user_delivery_context=payload.delivery_context,
-                mode="chat",
-                route_metadata={
-                    "mode": "pending",
-                    "lock_level": "pending",
-                    "source": "route-outbox",
-                },
+                mode="chat" if hard_chat_route is not None else "pending",
+                route_metadata=(
+                    hard_chat_route
+                    if hard_chat_route is not None
+                    else {
+                        "mode": "pending",
+                        "lock_level": "pending",
+                        "source": "route-outbox",
+                    }
+                ),
                 output_dir=str(output_dir),
                 attachment_ids=attachment_ids,
             )
-            hosted.update(
-                {
-                    "mode": "pending",
-                    "stage": "routing_pending",
-                    "profiles": [],
-                    "routing_requested_at": int(time.time() * 1000),
-                }
-            )
+            if hard_chat_route is not None:
+                routed_at = int(time.time() * 1000)
+                hosted.update(
+                    {
+                        "mode": "chat",
+                        "stage": "accepted",
+                        "profiles": hard_chat_profiles,
+                        "artifact_required": hard_chat_artifact_required,
+                        "artifact_producer_profiles": [],
+                        "routing_requested_at": routed_at,
+                        "routing_completed_at": routed_at,
+                    }
+                )
+            else:
+                hosted.update(
+                    {
+                        "mode": "pending",
+                        "stage": "routing_pending",
+                        "profiles": [],
+                        "routing_requested_at": int(time.time() * 1000),
+                    }
+                )
             pending_cancellations = conversation.get("pending_turn_cancellations")
             pending_cancellations = (
                 pending_cancellations
@@ -15284,15 +16669,19 @@ def enqueue_hosted_turn(
             if conversation.get("title") in {"", "新对话", None}:
                 conversation["title"] = summarize_task_title(message_content)
             now = int(time.time() * 1000)
-            pending_route = {
-                "mode": "pending",
-                "confidence": 0.0,
-                "lock_level": "pending",
-                "capability_hints": [],
-                "rationale_codes": ["route.accepted_pending"],
-                "source": "route-outbox",
-                "profiles": [],
-            }
+            pending_route = (
+                hard_chat_route
+                if hard_chat_route is not None
+                else {
+                    "mode": "pending",
+                    "confidence": 0.0,
+                    "lock_level": "pending",
+                    "capability_hints": [],
+                    "rationale_codes": ["route.accepted_pending"],
+                    "source": "route-outbox",
+                    "profiles": [],
+                }
+            )
             request_record = {
                 "request_id": request_id,
                 "fingerprint": fingerprint,
@@ -15300,12 +16689,19 @@ def enqueue_hosted_turn(
                 "message_id": message_id,
                 "route_message_id": "",
                 "route": pending_route,
-                "routing_state": "pending",
+                "routing_state": (
+                    "completed" if hard_chat_route is not None else "pending"
+                ),
                 "accepted": not isinstance(pending_cancellation, dict),
                 "created_at": now,
             }
+            if hard_chat_route is not None:
+                request_record["routing_completed_at"] = now
             requests[request_id] = request_record
-            if not isinstance(pending_cancellation, dict):
+            if (
+                not isinstance(pending_cancellation, dict)
+                and hard_chat_route is None
+            ):
                 route_outbox = conversation.get("route_outbox")
                 if not isinstance(route_outbox, dict):
                     route_outbox = {}
@@ -15337,6 +16733,13 @@ def enqueue_hosted_turn(
                 )[: len(requests) - 2000]
                 for key in oldest:
                     requests.pop(key, None)
+            # Start the official 0.19 gateway while the durable enqueue is
+            # being written.  The write is intentionally still synchronous,
+            # but its JSON/atomic-I/O cost now overlaps agent imports and MCP
+            # tool registration instead of delaying the first prompt.
+            if not isinstance(pending_cancellation, dict):
+                _prewarm_hosted_chat(conversation)
+                prewarm_started = True
             save_single_state(state)
             response = _enqueued_turn_response(
                 conversation,
@@ -15356,7 +16759,15 @@ def enqueue_hosted_turn(
         )
     hosted_response = response.get("hosted_turn") or {}
     if str(hosted_response.get("status") or "") not in _HOSTED_TERMINAL_STATUSES:
-        start_hosted_routing(conversation_id, turn_id)
+        if not prewarm_started:
+            _prewarm_hosted_chat(conversation)
+        if str(hosted_response.get("stage") or "") in {
+            "routing_pending",
+            "routing_failed",
+        }:
+            start_hosted_routing(conversation_id, turn_id)
+        else:
+            start_hosted_workflow(conversation_id, turn_id)
     if accepted:
         _notify_hosted_update(conversation_id)
     response["runtime_binding"] = runtime_binding
@@ -15890,6 +17301,11 @@ def _finalize_pending_conversation_deletion(conversation_id: str) -> bool:
         ]
         save_single_state(state)
     _remove_room_index_for_conversation(conversation_id, owner_id)
+    release_hosted_gateway_conversation(
+        conversation_id,
+        owner_id=owner_id,
+        account_generation=account_generation,
+    )
     for profile, session_id in runtime_sessions:
         try:
             _delete_runtime_session(profile, session_id)
@@ -15971,7 +17387,7 @@ async def send_single_message(
             owner_id_from_request(request),
         )
         profile = str(conversation.get("profile") or "default")
-        _append_message(
+        user_message = _append_message(
             conversation,
             role="user",
             name="用户",
@@ -15979,7 +17395,12 @@ async def send_single_message(
         )
         if conversation.get("title") in {"", "新对话", None}:
             conversation["title"] = summarize_task_title(content)
-        prompt = build_single_prompt(conversation, profile, content)
+        prompt = build_single_prompt(
+            conversation,
+            profile,
+            content,
+            exclude_message_id=str(user_message.get("id") or ""),
+        )
         save_single_state(state)
 
     try:
@@ -16286,6 +17707,7 @@ def send_message(room_id: str, payload: SendMessageBody, request: Request):
             run = create_hosted_turn_record(
                 conversation,
                 turn_id=turn_id,
+                user_message_id=request_id,
                 content=content,
                 title=summarize_task_title(content),
                 profiles=selected_profiles,
@@ -16392,22 +17814,49 @@ def _profile_runner_result_error(result: Any) -> str:
 def _discover_profile_toolsets(
     config: dict[str, Any],
     capability_hints: Optional[list[str]] = None,
+    *,
+    allow_tools: bool = True,
 ) -> list[str]:
     """Connect only route-selected MCPs before taking the hosted tool snapshot."""
+
+    if not allow_tools:
+        return []
 
     backend = _backend_api()
     hints = [str(item) for item in (capability_hints or []) if str(item).strip()]
     configured = config.get("mcp_servers") if isinstance(config, dict) else {}
     configured = configured if isinstance(configured, dict) else {}
-    selected = backend.select_mcp_servers_for_capabilities(configured, hints)
-    backend.discover_mcp_tools(capability_hints=hints)
-    live_selected = {
-        snapshot.name
-        for snapshot in backend.get_mcp_availability()
-        if snapshot.live
-        and snapshot.registered_tools
-        and snapshot.name in selected
+    full_static = str(os.environ.get("HERMES_FULL_TOOL_DEFINITIONS") or "").strip().lower() in {
+        "1", "true", "yes", "on"
     }
+    if full_static:
+        # Match the official 0.19 lazy path: register every cached/static MCP
+        # schema into the agent snapshot, but do not connect or discover any
+        # service here. A registered handler starts its service only when the
+        # model actually calls that tool; the supervisor then reaps it after
+        # its configured idle window.
+        from tools.mcp_tool import register_static_mcp_servers
+
+        register_static_mcp_servers()
+        selected = {
+            str(name)
+            for name, server in configured.items()
+            if isinstance(server, dict)
+            and str(name).strip()
+            and str(server.get("enabled", True)).strip().lower()
+            not in {"0", "false", "no", "off"}
+        }
+        live_selected = set(selected)
+    else:
+        selected = backend.select_mcp_servers_for_capabilities(configured, hints)
+        backend.discover_mcp_tools(capability_hints=hints)
+        live_selected = {
+            snapshot.name
+            for snapshot in backend.get_mcp_availability()
+            if snapshot.live
+            and snapshot.registered_tools
+            and snapshot.name in selected
+        }
     base_toolsets = set(
         backend._get_platform_tools(
             config,
@@ -16415,6 +17864,9 @@ def _discover_profile_toolsets(
             include_default_mcp_servers=False,
         )
     ) - backend.enabled_mcp_server_names(config)
+    # The chat plan is first-class product state. The todo tool is local,
+    # credential-free, and its schema already limits use to multi-step work.
+    base_toolsets.add("todo")
     return sorted(base_toolsets | live_selected)
 
 
@@ -16442,6 +17894,7 @@ def _profile_event_runner_main() -> int:
             for item in request_payload.get("capability_hints") or []
             if str(item).strip()
         ]
+        allow_tools = _coerce_flag(request_payload.get("allow_tools"), default=True)
         requested_session_id = _structured_text(
             request_payload.get("session_id")
         ).strip()
@@ -16473,9 +17926,13 @@ def _profile_event_runner_main() -> int:
         # This runner is a fresh process for a hosted chat turn. MCP names in
         # enabled_toolsets are only registry aliases; discovery must connect
         # and register their schemas before AIAgent snapshots its tool list.
-        enabled_toolsets = _discover_profile_toolsets(cfg, capability_hints)
+        enabled_toolsets = _discover_profile_toolsets(
+            cfg,
+            capability_hints,
+            allow_tools=allow_tools,
+        )
         backend = _backend_api()
-        selected_mcp_names = set(
+        selected_mcp_names = set() if not allow_tools else set(
             backend.select_mcp_servers_for_capabilities(
                 cfg.get("mcp_servers") or {},
                 capability_hints,
@@ -18625,6 +20082,7 @@ def retry_hosted_turn(
             result = create_hosted_turn_record(
                 conversation,
                 turn_id=retry_turn_id,
+                user_message_id=str(source.get("user_message_id") or ""),
                 content=str(source.get("content") or ""),
                 title=str(source.get("title") or ""),
                 profiles=list(source.get("profiles") or []),

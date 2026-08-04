@@ -1035,6 +1035,10 @@ DEFAULT_CONFIG = {
         # Set a positive value in config.yaml only if you explicitly want a
         # grace window on /restart (and keep it well under TimeoutStopSec).
         "restart_drain_timeout": 0,
+        # In-band restart waits for active turns before stop() begins. This
+        # avoids aborting the turn that requested a restart; 0 preserves the
+        # legacy immediate-drain behavior.
+        "restart_after_turn_timeout": 21600,
         # Max app-level retry attempts for API errors (connection drops,
         # provider timeouts, 5xx, etc.) before the agent surfaces the
         # failure.  The OpenAI SDK already does its own low-level retries
@@ -8489,6 +8493,16 @@ def save_env_value(key: str, value: str):
 
     os.environ[key] = value
     invalidate_env_cache()
+
+
+def custom_endpoint_key_env(identity: str) -> str:
+    """Return the environment key used for a custom model endpoint.
+
+    Keep this compatibility helper in the runtime-owned config module so the
+    0.20 dashboard can import the migrated configuration authority directly.
+    """
+    slug = re.sub(r"[^A-Z0-9]+", "_", str(identity or "").upper()).strip("_")
+    return f"HERMES_CUSTOM_{slug}_API_KEY" if slug else "HERMES_CUSTOM_API_KEY"
 
 
 def remove_env_value(key: str) -> bool:

@@ -358,15 +358,33 @@ def _resolve_session_token() -> str:
     return os.environ.get("HERMES_DASHBOARD_SESSION_TOKEN") or secrets.token_urlsafe(32)
 
 
+def _build_dashboard_http_boundary(session_token: str):
+    application = HermesApplicationKernel.for_http(
+        surface="dashboard",
+        bearer_secret=session_token,
+        compatibility_mode=os.environ.get("HERMES_HTTP_CONTRACT_MODE", "dual"),
+    )
+    return application, application.require_http_boundary()
+
+
 _SESSION_TOKEN = _resolve_session_token()
+_DASHBOARD_APPLICATION, _DASHBOARD_HTTP_BOUNDARY = _build_dashboard_http_boundary(
+    _SESSION_TOKEN
+)
 _SESSION_HEADER_NAME = "X-Hermes-Session-Token"
 _SSH_OWNER_NONCE: Optional[str] = None
 
 
 def _apply_ssh_session_token(token: str) -> None:
-    global _SESSION_TOKEN
+    global _SESSION_TOKEN, _DASHBOARD_APPLICATION, _DASHBOARD_HTTP_BOUNDARY
     if token:
         _SESSION_TOKEN = token
+        _DASHBOARD_APPLICATION, _DASHBOARD_HTTP_BOUNDARY = (
+            _build_dashboard_http_boundary(token)
+        )
+        runtime_state = globals().get("_RUNTIME_STATE")
+        if runtime_state is not None:
+            runtime_state.set_session_token(token)
 
 
 def _apply_ssh_owner_nonce(nonce: Optional[str]) -> None:
@@ -491,6 +509,9 @@ class DashboardRuntimeState:
     def session_token(self) -> str:
         """Per-process bearer token every /api call must present."""
         return self._session_token
+
+    def set_session_token(self, value: str) -> None:
+        self._session_token = value
 
     @property
     def reveal_timestamps(self) -> List[float]:
@@ -1611,6 +1632,9 @@ from hermes_cli.web_models import (  # noqa: F401
     MemoryProviderConfigUpdate,
     MemoryProviderSetupRequest,
     CustomEndpointUpdate,
+    CustomModelConnectionTest,
+    CustomModelDiscoveryRequest,
+    CustomModelConfiguration,
     MessagingPlatformUpdate,
     TelegramOnboardingStart,
     TelegramOnboardingApply,
@@ -1667,6 +1691,7 @@ from hermes_cli.web_models import (  # noqa: F401
     ProfileCreate,
     ProfileRename,
     ProfileSoulUpdate,
+    StudioMemoryUpdate,
     ProfileActiveUpdate,
     ProfileDescriptionUpdate,
     ProfileModelUpdate,
@@ -3310,6 +3335,57 @@ async def get_health():
         "ok": True,
         "version": __version__,
         "auth_required": bool(getattr(app.state, "auth_required", False)),
+    }
+
+
+_MOBILE_API_CAPABILITIES: tuple[str, ...] = (
+    "auth.owner",
+    "chat",
+    "devices",
+    "notifications.apns",
+    "profiles",
+    "sessions",
+    "config",
+    # Hermes 0.20 surfaces that the native client can discover and render.
+    "audio.transcription",
+    "voice.streaming",
+    "voice.barge_in",
+    "voice.wake_word",
+    "a2a.v1",
+    "browser",
+    "mcp.lazy",
+    "skills",
+    "artifacts",
+    "approvals",
+    "workflows",
+    "compression",
+    "citations",
+    "webhooks",
+    "webhooks.signed",
+    "tool.schema_cache",
+)
+
+
+@app.get("/api/mobile/v1/handshake")
+async def get_mobile_handshake(request: Request):
+    """Return the stable native-client contract without session content.
+
+    Profile enumeration is cached and runs off the event loop. Anonymous
+    callers receive only the count; authenticated iOS clients receive names
+    so the native profile picker can reflect the server topology.
+    """
+    topology = await asyncio.to_thread(_collect_profile_gateway_topology_cached)
+    authenticated = bool(
+        getattr(request.state, "token_authenticated", False)
+        or getattr(request.state, "session", None) is not None
+    )
+    return {
+        "api_version": 1,
+        "hermes_version": __version__,
+        "profiles": topology["profiles"] if authenticated else [],
+        "profile_count": len(topology["profiles"]),
+        "capabilities": list(_MOBILE_API_CAPABILITIES),
+        "server_time": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
     }
 
 

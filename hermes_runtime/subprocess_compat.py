@@ -28,8 +28,10 @@ guarantee.
 from __future__ import annotations
 
 import shutil
+import os
+import subprocess
 import sys
-from typing import Sequence
+from typing import Mapping, Sequence
 
 __all__ = [
     "IS_WINDOWS",
@@ -38,6 +40,8 @@ __all__ = [
     "windows_detach_flags_without_breakaway",
     "windows_hide_flags",
     "windows_detach_popen_kwargs",
+    "noninteractive_git_env",
+    "bounded_git_probe",
 ]
 
 
@@ -232,3 +236,62 @@ def windows_detach_popen_kwargs() -> dict:
     if IS_WINDOWS:
         return {"creationflags": windows_detach_flags()}
     return {"start_new_session": True}
+
+
+def noninteractive_git_env(
+    base: Mapping[str, str] | None = None,
+) -> dict[str, str]:
+    """Return an internal-git environment that can never block on prompts."""
+    env = dict(base if base is not None else os.environ)
+    env["GIT_TERMINAL_PROMPT"] = "0"
+    env["GCM_INTERACTIVE"] = "Never"
+    return env
+
+
+def _kill_git_process_tree(proc: subprocess.Popen) -> None:
+    """Best-effort cleanup for a timed-out Git probe."""
+    try:
+        proc.kill()
+    except OSError:
+        pass
+    if IS_WINDOWS:
+        try:
+            subprocess.run(
+                ["taskkill", "/T", "/F", "/PID", str(proc.pid)],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                stdin=subprocess.DEVNULL,
+                timeout=2,
+                check=False,
+                creationflags=windows_hide_flags(),
+            )
+        except Exception:
+            pass
+
+
+def bounded_git_probe(argv: Sequence[str], *, timeout: float) -> str:
+    """Run a short Git probe and return stdout, failing open on any error."""
+    popen_kwargs = {"creationflags": windows_hide_flags()} if IS_WINDOWS else {}
+    try:
+        proc = subprocess.Popen(
+            list(argv),
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            stdin=subprocess.DEVNULL,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            **popen_kwargs,
+        )
+    except Exception:
+        return ""
+    try:
+        stdout, _ = proc.communicate(timeout=timeout)
+    except Exception:
+        _kill_git_process_tree(proc)
+        try:
+            proc.communicate(timeout=1)
+        except Exception:
+            pass
+        return ""
+    return stdout.strip() if proc.returncode == 0 else ""

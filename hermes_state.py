@@ -613,6 +613,7 @@ def apply_wal_with_fallback(
     conn: sqlite3.Connection,
     *,
     db_label: str = "state.db",
+    database_path: Optional[Path | str] = None,
     require_wal: bool = False,
 ) -> str:
     """Set ``journal_mode=WAL`` on ``conn``, falling back to DELETE on failure.
@@ -2093,7 +2094,12 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                 )
                 self._conn.row_factory = sqlite3.Row
                 self._wal_active = (
-                    apply_wal_with_fallback(self._conn, db_label="state.db") == "wal"
+                    apply_wal_with_fallback(
+                        self._conn,
+                        db_label="state.db",
+                        database_path=self.db_path,
+                    )
+                    == "wal"
                 )
                 apply_database_pragmas(self._conn, db_label="state.db")
                 self._conn.execute("PRAGMA foreign_keys=ON")

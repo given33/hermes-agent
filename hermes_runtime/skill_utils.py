@@ -22,6 +22,9 @@ logger = logging.getLogger(__name__)
 _primary_skills_dir_resolver = get_skills_dir
 
 
+SKILL_PROMPT_DESC_LIMIT = 60
+
+
 def register_primary_skills_dir_resolver(resolver) -> None:
     """Register a callable returning the primary skill directory.
 
@@ -804,9 +807,18 @@ def extract_skill_description(frontmatter: Dict[str, Any]) -> str:
     if not raw_desc:
         return ""
     desc = str(raw_desc).strip().strip("'\"")
-    if len(desc) > 60:
-        return desc[:57] + "..."
+    if len(desc) > SKILL_PROMPT_DESC_LIMIT:
+        return desc[: SKILL_PROMPT_DESC_LIMIT - 3] + "..."
     return desc
+
+
+def is_skill_description_truncated_for_prompt(frontmatter: Dict[str, Any]) -> bool:
+    """Whether the frontmatter description exceeds the prompt display budget."""
+    raw_desc = frontmatter.get("description", "")
+    if not raw_desc:
+        return False
+    desc = str(raw_desc).strip().strip("'\"")
+    return len(desc) > SKILL_PROMPT_DESC_LIMIT
 
 
 # ── File iteration ────────────────────────────────────────────────────────

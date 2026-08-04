@@ -662,20 +662,44 @@ def _resolve_zai_base_url(api_key: str, default_url: str, env_override: str) -> 
         return default_url
 
     # Check provider-state cache for a previously-detected endpoint.
+    key_hash = hashlib.sha256(api_key.encode()).hexdigest()[:16]
     auth_store = _load_auth_store()
     state = _load_provider_state(auth_store, "zai") or {}
     cached = state.get("detected_endpoint")
     if isinstance(cached, dict) and cached.get("base_url"):
-        key_hash = cached.get("key_hash", "")
-        if key_hash == hashlib.sha256(api_key.encode()).hexdigest()[:16]:
+        cached_key_hash = cached.get("key_hash", "")
+        if cached_key_hash == key_hash:
             logger.debug("Z.AI: using cached endpoint %s", cached["base_url"])
             return cached["base_url"]
+
+    # Borrowed environment credentials are intentionally persisted without
+    # their secret, but their fingerprint and already-resolved endpoint are
+    # retained in the credential pool. Reuse that endpoint when it belongs to
+    # this exact key and is one of Hermes's built-in Z.AI URLs. Without this,
+    # every fresh hosted gateway repeats the live endpoint probe (~8 seconds)
+    # even though setup already resolved the same credential.
+    expected_fingerprint = f"sha256:{key_hash}"
+    official_urls = {str(endpoint[1]).rstrip("/") for endpoint in ZAI_ENDPOINTS}
+    try:
+        for entry in read_credential_pool("zai"):
+            if not isinstance(entry, dict):
+                continue
+            pool_url = str(entry.get("base_url") or "").rstrip("/")
+            if (
+                entry.get("secret_fingerprint") == expected_fingerprint
+                and pool_url in official_urls
+            ):
+                logger.debug("Z.AI: using credential-pool endpoint %s", pool_url)
+                return pool_url
+    except Exception:
+        # Credential-pool corruption or an unreadable auth store must not make
+        # provider resolution fail; the existing live probe remains fallback.
+        logger.debug("Z.AI: credential-pool endpoint lookup failed", exc_info=True)
 
     # Probe — may take up to ~8s per endpoint.
     detected = detect_zai_endpoint(api_key)
     if detected and detected.get("base_url"):
         # Persist the detection result keyed on the API key hash.
-        key_hash = hashlib.sha256(api_key.encode()).hexdigest()[:16]
         detected_endpoint = {
             "base_url": detected["base_url"],
             "endpoint_id": detected.get("id", ""),

@@ -356,12 +356,33 @@ def _resolve_inference_base_url(
 def _should_probe_ollama_vision(provider: str, base_url: str) -> bool:
     """True when the active provider likely fronts a local Ollama server."""
     p = (provider or "").strip().lower()
-    if p == "ollama":
+    if "ollama" in p:
         return True
     if not base_url:
         return False
     try:
-        from agent.model_metadata import detect_local_server_type
+        from agent.model_metadata import (
+            _infer_provider_from_url,
+            detect_local_server_type,
+            is_local_endpoint,
+        )
+
+        # Match the context-metadata Quicksilver path: a URL belonging to a
+        # known hosted provider cannot be a local Ollama server. Vision tool
+        # gating previously missed this guard and paid the full five-endpoint
+        # local-server waterfall against Z.AI during every fresh Agent build.
+        inferred = _infer_provider_from_url(base_url)
+        if inferred and "ollama" not in inferred:
+            return False
+
+        # Unknown public custom endpoints are ordinary hosted
+        # OpenAI-compatible APIs unless the provider was explicitly named as
+        # Ollama above. Probing their unrelated LM Studio/Ollama/llama.cpp/vLLM
+        # paths adds seconds to every cold start and can spray authenticated
+        # requests at endpoints the user never configured. Private, loopback,
+        # container, and Tailscale URLs keep automatic local detection.
+        if not is_local_endpoint(base_url):
+            return False
 
         return detect_local_server_type(base_url) == "ollama"
     except Exception:

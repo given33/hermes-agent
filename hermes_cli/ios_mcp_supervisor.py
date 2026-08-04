@@ -17,6 +17,7 @@ import multiprocessing
 import os
 from pathlib import Path
 import shutil
+import socket
 import sqlite3
 import subprocess
 import sys
@@ -90,14 +91,148 @@ class _ForkProcessAdapter:
         return int(exit_code)
 
     def terminate(self) -> None:
+        """Forward graceful termination to the multiprocessing child.
+
+        The supervisor intentionally wraps ``multiprocessing.Process`` in a
+        Popen-shaped adapter.  Idle MCP reaping uses the Popen lifecycle
+        methods, so the adapter must expose the same terminate/kill surface;
+        otherwise a lazy child can never be recycled after its idle timeout.
+        """
+
         self._process.terminate()
 
     def kill(self) -> None:
-        self._process.kill()
+        """Forward hard termination, falling back to terminate on old Python."""
+
+        kill = getattr(self._process, "kill", None)
+        if callable(kill):
+            kill()
+        else:
+            self._process.terminate()
 
     def close(self) -> None:
-        self._process.close()
+        """Release multiprocessing bookkeeping after the child is reaped."""
 
+        close = getattr(self._process, "close", None)
+        if callable(close):
+            close()
+
+
+class _LazyMCPProxy:
+    """Tiny TCP forwarder that starts one MCP child on first connection."""
+
+    def __init__(
+        self,
+        *,
+        host: str,
+        port: int,
+        ensure_service: Callable[[], bool],
+        upstream_port: Callable[[], int],
+        touch_activity: Callable[[], None] | None = None,
+    ) -> None:
+        self.host = str(host)
+        self.port = int(port)
+        self._ensure_service = ensure_service
+        self._upstream_port = upstream_port
+        self._touch_activity = touch_activity or (lambda: None)
+        self._stop = threading.Event()
+        self._socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        self._socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        self._socket.bind((self.host, self.port))
+        self._socket.listen(64)
+        self._socket.settimeout(0.5)
+        self._thread = threading.Thread(
+            target=self._serve,
+            name=f"ios-mcp-lazy-proxy-{self.port}",
+            daemon=True,
+        )
+
+    def start(self) -> None:
+        self._thread.start()
+
+    def close(self) -> None:
+        self._stop.set()
+        try:
+            self._socket.close()
+        except OSError:
+            pass
+        if self._thread.is_alive() and self._thread is not threading.current_thread():
+            self._thread.join(timeout=2.0)
+
+    def _relay(self, source: socket.socket, target: socket.socket) -> None:
+        try:
+            while True:
+                payload = source.recv(64 * 1024)
+                if not payload:
+                    try:
+                        target.shutdown(socket.SHUT_WR)
+                    except OSError:
+                        pass
+                    return
+                self._touch_activity()
+                target.sendall(payload)
+        except OSError:
+            return
+
+    def _handle(self, client: socket.socket) -> None:
+        try:
+            # A stable proxy connection is the activity boundary for a lazy
+            # MCP.  The supervisor uses byte traffic, rather than health
+            # probes, to decide when the child is genuinely idle.
+            self._touch_activity()
+            if not self._ensure_service():
+                return
+            deadline = time.monotonic() + 120.0
+            upstream: socket.socket | None = None
+            while not self._stop.is_set() and time.monotonic() < deadline:
+                try:
+                    upstream = socket.create_connection(
+                        (self.host, int(self._upstream_port())),
+                        timeout=2.0,
+                    )
+                    break
+                except OSError:
+                    time.sleep(0.1)
+            if upstream is None:
+                return
+            upstream.settimeout(None)
+            client.settimeout(None)
+            forward = threading.Thread(
+                target=self._relay,
+                args=(client, upstream),
+                name=f"ios-mcp-lazy-forward-{self.port}",
+                daemon=True,
+            )
+            reverse = threading.Thread(
+                target=self._relay,
+                args=(upstream, client),
+                name=f"ios-mcp-lazy-reverse-{self.port}",
+                daemon=True,
+            )
+            forward.start()
+            reverse.start()
+            forward.join()
+            reverse.join(timeout=2.0)
+        finally:
+            try:
+                client.close()
+            except OSError:
+                pass
+
+    def _serve(self) -> None:
+        while not self._stop.is_set():
+            try:
+                client, _address = self._socket.accept()
+            except socket.timeout:
+                continue
+            except OSError:
+                break
+            threading.Thread(
+                target=self._handle,
+                args=(client,),
+                name=f"ios-mcp-lazy-accept-{self.port}",
+                daemon=True,
+            ).start()
 
 class MCPState(str, Enum):
     RUNNING = "RUNNING"
@@ -695,6 +830,8 @@ class IOSMCPRuntimeSupervisor:
         recovery_probe_timeout_seconds: float = 30.0,
         owner_id: str = "",
         granted_scopes: Mapping[str, Iterable[str] | str] | None = None,
+        lazy_start: bool = False,
+        idle_timeout_seconds: float = 300.0,
     ) -> None:
         from hermes_cli.ios_mcp_server import CAPABILITIES, normalize_mcp_scope_grants
 
@@ -731,6 +868,8 @@ class IOSMCPRuntimeSupervisor:
         )
         self.python_executable = str(python_executable or sys.executable)
         self.owner_id = str(owner_id or "").strip()[:512]
+        self.lazy_start = bool(lazy_start)
+        self.idle_timeout_seconds = max(0.0, float(idle_timeout_seconds))
         try:
             from hermes_runtime.config import load_config
 
@@ -761,6 +900,8 @@ class IOSMCPRuntimeSupervisor:
         self._processes: dict[str, subprocess.Popen[Any]] = {}
         self._log_handles: dict[str, Any] = {}
         self._active_ports: dict[str, int] = {}
+        self._lazy_proxies: dict[str, _LazyMCPProxy] = {}
+        self._lazy_last_activity: dict[str, float] = {}
         self._lock = threading.RLock()
         self._health_cycle_lock = threading.Lock()
         self._health_generations = {name: 0 for name in self.capabilities}
@@ -770,6 +911,12 @@ class IOSMCPRuntimeSupervisor:
         self.starting = False
         self.running = False
         self._active_ports.update(self._configured_active_ports())
+        if self.lazy_start:
+            for service in self.capabilities:
+                stable = self.stable_port_for(service)
+                configured = self._active_ports.get(service, stable)
+                if configured == stable:
+                    self._active_ports[service] = stable + self.blue_green_port_offset
 
     def _configured_active_ports(self) -> dict[str, int]:
         try:
@@ -813,7 +960,10 @@ class IOSMCPRuntimeSupervisor:
         return stable if self.port_for(service) == alternate else alternate
 
     def endpoint_for(self, name: str) -> str:
-        return f"http://{self.host}:{self.port_for(name)}/mcp"
+        # Lazy mode owns the stable discovery port with a lightweight proxy;
+        # the isolated child uses the alternate port behind it.
+        port = self.stable_port_for(name) if self.lazy_start else self.port_for(name)
+        return f"http://{self.host}:{port}/mcp"
 
     def command_for(
         self,
@@ -903,6 +1053,104 @@ class IOSMCPRuntimeSupervisor:
             ):
                 self.supervisor.disable(name, "disabled in mcp_servers config")
 
+    def _start_lazy_proxies(self) -> None:
+        """Bind stable MCP endpoints without starting their child services."""
+
+        for name in self.capabilities:
+            if self.supervisor.status(name)["state"] == MCPState.DISABLED.value:
+                continue
+            with self._lock:
+                if name in self._lazy_proxies:
+                    continue
+            proxy = _LazyMCPProxy(
+                host=self.host,
+                port=self.stable_port_for(name),
+                ensure_service=lambda service=name: self.start_service(
+                    service,
+                    verify=False,
+                ),
+                upstream_port=lambda service=name: self.port_for(service),
+                touch_activity=lambda service=name: self._touch_lazy_activity(service),
+            )
+            proxy.start()
+            with self._lock:
+                self._lazy_proxies[name] = proxy
+
+    def _touch_lazy_activity(self, name: str) -> None:
+        """Record traffic through a lazy endpoint without probing the child."""
+
+        if not self.lazy_start:
+            return
+        service = self.supervisor._name(name)
+        with self._lock:
+            self._lazy_last_activity[service] = time.monotonic()
+
+    def _reap_idle_lazy_services(self) -> list[dict[str, Any]]:
+        """Stop lazy children that have had no MCP traffic for the idle window."""
+
+        if not self.lazy_start or self.idle_timeout_seconds <= 0:
+            return []
+        now = time.monotonic()
+        expired: list[tuple[str, Any]] = []
+        with self._lock:
+            for service, process in self._processes.items():
+                if process is None or process.poll() is not None:
+                    continue
+                last_activity = self._lazy_last_activity.get(service)
+                if last_activity is None:
+                    last_activity = now
+                    self._lazy_last_activity[service] = last_activity
+                if now - last_activity >= self.idle_timeout_seconds:
+                    expired.append((service, process))
+        results: list[dict[str, Any]] = []
+        for service, process in expired:
+            # Re-check under the process lock in stop_service; a new request
+            # can arrive between the scan and termination.
+            with self._lock:
+                last_activity = self._lazy_last_activity.get(service, now)
+            if now - last_activity < self.idle_timeout_seconds:
+                continue
+            if not self.stop_service(service, _expected_process=process):
+                continue
+            logger.info(
+                "Lazy iOS MCP '%s' recycled after %.0fs without MCP traffic",
+                service,
+                self.idle_timeout_seconds,
+            )
+            results.append({
+                "name": service,
+                "lazy": True,
+                "recycled": True,
+                "reason": "idle_timeout",
+            })
+        return results
+
+    def _start_lazy_runtime(self) -> None:
+        required_ok = True
+        try:
+            self._register_callbacks()
+            self._start_lazy_proxies()
+        except Exception:
+            required_ok = False
+            logger.exception("Failed to start lazy iOS MCP proxies")
+        finally:
+            with self._lock:
+                self.starting = False
+                self.running = required_ok and not self._stop_event.is_set()
+                if threading.current_thread() is self._startup_thread:
+                    self._startup_thread = None
+                if (
+                    self.running
+                    and not self._stop_event.is_set()
+                    and (self._thread is None or not self._thread.is_alive())
+                ):
+                    self._thread = threading.Thread(
+                        target=self._run,
+                        name="ios-mcp-runtime-supervisor",
+                        daemon=True,
+                    )
+                    self._thread.start()
+
     def _start_registered_services(self) -> None:
         """Start the required fleet without holding the runtime-wide lock.
 
@@ -912,6 +1160,9 @@ class IOSMCPRuntimeSupervisor:
         binding before all child interpreters have reached steady state.
         """
 
+        if self.lazy_start:
+            self._start_lazy_runtime()
+            return
         required_ok = True
         try:
             self._register_callbacks()
@@ -986,7 +1237,7 @@ class IOSMCPRuntimeSupervisor:
             self.starting = True
             self._stop_event.clear()
             startup = threading.Thread(
-                target=self._start_registered_services,
+                target=(self._start_lazy_runtime if self.lazy_start else self._start_registered_services),
                 name="ios-mcp-runtime-startup",
                 daemon=True,
             )
@@ -994,8 +1245,13 @@ class IOSMCPRuntimeSupervisor:
             startup.start()
             return startup
 
-    def health(self) -> dict[str, Any]:
-        """Return truthful fleet health, including per-service probes."""
+    def health(self, *, probe: bool = False) -> dict[str, Any]:
+        """Return fleet health, optionally forcing live MCP probes.
+
+        Lazy dashboard runtimes report the static manifest as healthy until a
+        tool call starts a service.  ``probe=True`` remains available for an
+        operator that explicitly wants to cold-start and verify every child.
+        """
 
         from hermes_cli.ios_mcp_server import ios_mcp_manifests
 
@@ -1010,14 +1266,18 @@ class IOSMCPRuntimeSupervisor:
             state = supervisor_status["state"]
             if state == MCPState.DISABLED.value:
                 continue
-            probe = self.health_service(name)
             manifest = manifests[name]
             expected_tools = sorted((manifest.get("tool_scopes") or {}).keys())
-            actual_tools = sorted(str(tool) for tool in (probe.get("tools") or ()))
             declared_scopes = list(manifest.get("scope") or ())
             granted_scopes = list(self.granted_scopes.get(name, ()))
+            live_probe = (
+                self.health_service(name)
+                if not (self.lazy_start and not probe)
+                else {}
+            )
+            actual_tools = sorted(str(tool) for tool in (live_probe.get("tools") or ()))
             contract_ok = (
-                bool(probe.get("ok"))
+                bool(live_probe.get("ok"))
                 and actual_tools == expected_tools
                 and set(granted_scopes).issubset(declared_scopes)
             )
@@ -1026,11 +1286,27 @@ class IOSMCPRuntimeSupervisor:
                 "state": state,
                 "version": str(supervisor_status.get("version") or ""),
                 "active_version": str(supervisor_status.get("active_version") or ""),
-                **probe,
+                **(
+                    {
+                        "ok": True,
+                        "lazy": True,
+                        "started": bool(
+                            self._processes.get(name)
+                            and self._processes[name].poll() is None
+                        ),
+                        "tools": expected_tools,
+                    }
+                    if self.lazy_start and not probe
+                    else live_probe
+                ),
                 "expected_tools": expected_tools,
                 "declared_scopes": declared_scopes,
                 "granted_scopes": granted_scopes,
-                "contract_ok": contract_ok,
+                "contract_ok": (
+                    True
+                    if self.lazy_start and not probe
+                    else contract_ok
+                ),
             })
         healthy = sum(
             1
@@ -1065,6 +1341,11 @@ class IOSMCPRuntimeSupervisor:
         self._thread = None
         self.starting = False
         self.running = False
+        with self._lock:
+            proxies = list(self._lazy_proxies.values())
+            self._lazy_proxies.clear()
+        for proxy in proxies:
+            proxy.close()
 
     close = stop
 
@@ -1175,11 +1456,26 @@ class IOSMCPRuntimeSupervisor:
     def _terminate_process(process: Any | None, log_handle: Any = None) -> None:
         try:
             if process is not None and process.poll() is None:
-                process.terminate()
+                terminate = getattr(process, "terminate", None)
+                if callable(terminate):
+                    terminate()
+                else:
+                    # Keep the cleanup path defensive for injected process
+                    # adapters.  A PID-only adapter is still better cleaned
+                    # up than left resident after an idle timeout.
+                    pid = int(getattr(process, "pid", 0) or 0)
+                    if pid > 0 and os.name == "posix":
+                        os.kill(pid, 15)
                 try:
                     process.wait(timeout=5)
                 except subprocess.TimeoutExpired:
-                    process.kill()
+                    kill = getattr(process, "kill", None)
+                    if callable(kill):
+                        kill()
+                    else:
+                        pid = int(getattr(process, "pid", 0) or 0)
+                        if pid > 0 and os.name == "posix":
+                            os.kill(pid, 9)
                     process.wait(timeout=5)
         finally:
             if process is not None:
@@ -1207,19 +1503,43 @@ class IOSMCPRuntimeSupervisor:
                 return False
             self._processes[service] = process
             self._log_handles[service] = log_handle
+            if self.lazy_start:
+                self._lazy_last_activity[service] = time.monotonic()
         if not verify:
             return True
         deadline = time.monotonic() + self.startup_timeout_seconds
         while time.monotonic() < deadline and not self._stop_event.is_set():
-            if self.health_service(service).get("ok"):
+            probe_url = (
+                f"http://{self.host}:{self.port_for(service)}/mcp"
+                if self.lazy_start
+                else self.endpoint_for(service)
+            )
+            try:
+                tools = self._probe_tools_with_timeout(
+                    probe_url,
+                    self.health_probe_timeout_seconds,
+                )
+            except Exception:
+                tools = []
+            if tools:
                 return True
             time.sleep(0.2)
         self.stop_service(service)
         return False
 
-    def stop_service(self, name: str) -> bool:
+    def stop_service(
+        self,
+        name: str,
+        *,
+        _expected_process: Any | None = None,
+    ) -> bool:
         service = self.supervisor._name(name)
         with self._lock:
+            if (
+                _expected_process is not None
+                and self._processes.get(service) is not _expected_process
+            ):
+                return False
             process = self._processes.pop(service, None)
             log_handle = self._log_handles.pop(service, None)
         self._terminate_process(process, log_handle)
@@ -1402,11 +1722,21 @@ class IOSMCPRuntimeSupervisor:
                 endpoint_matches = True
                 if isinstance(live_config, Mapping) and "url" in entry:
                     endpoint_matches = live_config.get("url") == entry.get("url")
+                lazy_registered = bool(
+                    entry.get("lazy_start")
+                    and getattr(server, "_lazy_start", False)
+                    and getattr(server, "_registered_tool_names", ())
+                )
                 return bool(
                     server is not None
                     and getattr(server, "accepting_calls", True)
-                    and getattr(server, "session", None) is not None
-                    and getattr(server, "_registered_tool_names", ())
+                    and (
+                        lazy_registered
+                        or (
+                            getattr(server, "session", None) is not None
+                            and getattr(server, "_registered_tool_names", ())
+                        )
+                    )
                     and actual_fingerprint == expected_fingerprint
                     and endpoint_matches
                 )
@@ -1609,6 +1939,16 @@ class IOSMCPRuntimeSupervisor:
             if self._stop_event.is_set():
                 self.running = False
                 return []
+            if self.lazy_start:
+                # A health probe is real MCP traffic and would start every
+                # child. Lazy mode only reaps children after inactivity; the
+                # stable proxy remains the readiness contract.
+                results = self._reap_idle_lazy_services()
+                if not self._stop_event.is_set():
+                    self._process_queue()
+                if not self._stop_event.is_set():
+                    self._refresh_runtime_running()
+                return results
             results: list[dict[str, Any]] = []
             for item in self.supervisor.statuses():
                 if self._stop_event.is_set():
@@ -1690,6 +2030,28 @@ class IOSMCPRuntimeSupervisor:
             for service in self.capabilities
         }
         with self._lock:
+            if self.lazy_start:
+                # Lazy mode's readiness contract is the stable proxy fleet,
+                # not the optional child-process fleet. A service is allowed
+                # to be absent here by design and starts on its first MCP
+                # request.
+                for service in self.capabilities:
+                    state = states[service]
+                    if state == MCPState.DISABLED.value:
+                        continue
+                    required.append(service)
+                    proxy = self._lazy_proxies.get(service)
+                    if (
+                        state in {
+                            MCPState.QUARANTINED.value,
+                            MCPState.UPGRADING.value,
+                        }
+                        or proxy is None
+                        or not proxy._thread.is_alive()
+                    ):
+                        ready = False
+                self.running = bool(required) and ready
+                return self.running
             for service in self.capabilities:
                 state = states[service]
                 if state == MCPState.DISABLED.value:

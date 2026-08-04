@@ -27,6 +27,7 @@ import re
 import shlex
 import uuid
 
+from hermes_runtime.session_context import get_session_env
 from hermes_services import internal_hooks, tool_contract, tool_output_artifacts
 from tools.budget_config import (
     DEFAULT_PREVIEW_SIZE_CHARS,
@@ -200,11 +201,11 @@ def maybe_persist_tool_result(
     remote_path = f"{storage_dir}/{_safe_result_filename(tool_use_id)}"
     preview, has_more = generate_preview(content, max_chars=config.preview_size)
     artifact_id = ""
-    owner_id = str(os.environ.get("HERMES_TOOL_ARTIFACT_OWNER") or "").strip()
+    owner_id = str(get_session_env("HERMES_TOOL_ARTIFACT_OWNER") or "").strip()
     account_generation = str(
-        os.environ.get("HERMES_ACCOUNT_GENERATION") or "legacy"
+        get_session_env("HERMES_ACCOUNT_GENERATION") or "legacy"
     ).strip() or "legacy"
-    artifact_root = str(os.environ.get("HERMES_TOOL_ARTIFACT_ROOT") or "").strip()
+    artifact_root = str(get_session_env("HERMES_TOOL_ARTIFACT_ROOT") or "").strip()
     artifact_error = ""
     if owner_id and artifact_root:
         try:
@@ -215,8 +216,10 @@ def maybe_persist_tool_result(
             ).put(
                 owner_id=owner_id,
                 account_generation=account_generation,
-                conversation_id=str(os.environ.get("HERMES_TOOL_ARTIFACT_CONVERSATION") or ""),
-                turn_id=str(os.environ.get("HERMES_TOOL_ARTIFACT_TURN") or ""),
+                conversation_id=str(
+                    get_session_env("HERMES_TOOL_ARTIFACT_CONVERSATION") or ""
+                ),
+                turn_id=str(get_session_env("HERMES_TOOL_ARTIFACT_TURN") or ""),
                 tool_call_id=tool_use_id,
                 tool_name=tool_name,
                 content=content,

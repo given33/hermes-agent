@@ -6265,6 +6265,23 @@ def _make_agent(
     if synthetic is not None:
         return synthetic
 
+    # Hosted mobile turns publish the complete cached MCP contract while each
+    # transport stays lazy. Register schemas before the agent snapshots its
+    # tools, and avoid the normal discovery wait that would cold-start every
+    # configured service before the first model token.
+    hosted_static_mcp = False
+    if is_truthy_value(os.environ.get("HERMES_FULL_TOOL_DEFINITIONS")):
+        try:
+            from tools.mcp_tool import (
+                all_configured_mcp_servers_lazy,
+                register_static_mcp_servers,
+            )
+
+            register_static_mcp_servers()
+            hosted_static_mcp = all_configured_mcp_servers_lazy()
+        except Exception:
+            logger.debug("Hosted static MCP registration skipped", exc_info=True)
+
     from run_agent import AIAgent
 
     # MCP tool discovery runs in a background daemon thread at startup so a
@@ -6273,18 +6290,19 @@ def _make_agent(
     # to land before building — bounded, so a slow/dead server still can't
     # block. Dashboard /api/ws uses hermes_cli.mcp_startup; TUI stdio keeps
     # its existing tui_gateway.entry-owned thread.
-    try:
-        from hermes_cli.mcp_startup import wait_for_mcp_discovery
+    if not hosted_static_mcp:
+        try:
+            from hermes_cli.mcp_startup import wait_for_mcp_discovery
 
-        wait_for_mcp_discovery()
-    except Exception:
-        pass
-    try:
-        from tui_gateway.entry import wait_for_mcp_discovery
+            wait_for_mcp_discovery()
+        except Exception:
+            pass
+        try:
+            from tui_gateway.entry import wait_for_mcp_discovery
 
-        wait_for_mcp_discovery()
-    except Exception:
-        pass
+            wait_for_mcp_discovery()
+        except Exception:
+            pass
 
     cfg = _load_cfg()
     agent_cfg = cfg.get("agent") or {}
@@ -6383,7 +6401,10 @@ def _make_agent(
                 raise RuntimeError("Auth fallback resolved without a model")
             model = resolution.selected_model
     _pr = _load_provider_routing()
-    return AIAgent(
+    resolved_platform = _resolve_agent_platform(platform_override)
+    ignore_rules = is_truthy_value(os.environ.get("HERMES_IGNORE_RULES"))
+    hosted_mobile = resolved_platform == "dashboard-group"
+    agent = AIAgent(
         model=model,
         max_iterations=_cfg_max_turns(cfg, 500),
         provider=runtime.get("provider"),
@@ -6419,17 +6440,21 @@ def _make_agent(
         provider_sort=_pr.get("sort"),
         provider_require_parameters=_pr.get("require_parameters", False),
         provider_data_collection=_pr.get("data_collection"),
-        platform=_resolve_agent_platform(platform_override),
+        platform=resolved_platform,
         session_id=session_id or key,
         session_db=session_db if session_db is not None else _get_db(),
         ephemeral_system_prompt=system_prompt or None,
         checkpoints_enabled=is_truthy_value(os.environ.get("HERMES_TUI_CHECKPOINTS")),
         pass_session_id=is_truthy_value(os.environ.get("HERMES_TUI_PASS_SESSION_ID")),
-        skip_context_files=is_truthy_value(os.environ.get("HERMES_IGNORE_RULES")),
-        skip_memory=is_truthy_value(os.environ.get("HERMES_IGNORE_RULES")),
+        skip_context_files=ignore_rules or hosted_mobile,
+        load_soul_identity=hosted_mobile,
+        skip_memory=ignore_rules,
         fallback_model=_load_fallback_model(),
         **_agent_cbs(sid),
     )
+    if hosted_static_mcp:
+        agent._skip_mcp_refresh = True
+    return agent
 
 
 def _init_session(

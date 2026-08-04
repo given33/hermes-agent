@@ -62,6 +62,10 @@ class SupervisorPolicy:
     drain_timeout_seconds: int = 30
     base_port: int = 8760
     blue_green_port_offset: int = 100
+    # Lazy iOS MCP children stay warm briefly after the last real request.
+    # Zero disables recycling for operators that explicitly need a resident
+    # process, while the production default keeps the fleet cold at startup.
+    idle_timeout_seconds: int = 300
 
 
 @dataclass(frozen=True)
@@ -253,6 +257,12 @@ def load_ios_intelligence_config(
                 supervisor_defaults.blue_green_port_offset,
                 22,
                 2000,
+            ),
+            idle_timeout_seconds=_bounded_int(
+                supervisor.get("idle_timeout_seconds"),
+                supervisor_defaults.idle_timeout_seconds,
+                0,
+                86_400,
             ),
         ),
     )
