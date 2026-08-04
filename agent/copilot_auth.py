@@ -78,10 +78,15 @@ def resolve_copilot_token() -> tuple[str, str]:
     Returns (token, source) where source describes where the token came from.
     Raises ValueError if only a classic PAT is available.
     """
-    # 1. Check env vars in priority order
+    # 1. Check env vars in priority order. An explicitly supplied but invalid
+    # token must not be silently replaced with a different token from `gh`.
+    # Besides honoring user intent, this avoids a slow `gh auth token` spawn on
+    # Windows cold starts.
+    any_env_var_set = False
     for env_var in COPILOT_ENV_VARS:
         val = os.getenv(env_var, "").strip()
         if val:
+            any_env_var_set = True
             valid, msg = validate_copilot_token(val)
             if not valid:
                 logger.warning(
@@ -90,7 +95,14 @@ def resolve_copilot_token() -> tuple[str, str]:
                 continue
             return val, env_var
 
-    # 2. Fall back to gh auth token
+    # 2. Fall back to gh auth token only when no explicit env token was set.
+    if any_env_var_set:
+        logger.debug(
+            "Copilot env var(s) set but none held a supported token; "
+            "skipping `gh auth token` fallback."
+        )
+        return "", ""
+
     token = _try_gh_cli_token()
     if token:
         valid, msg = validate_copilot_token(token)

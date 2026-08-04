@@ -70,6 +70,36 @@ EXCLUDED_SKILL_DIRS = frozenset(
 # archive workflow preserves a complete old skill package under references/.
 SKILL_SUPPORT_DIRS = frozenset(("references", "templates", "assets", "scripts"))
 
+# Organization-owned skills are mirrored under ``_org/<org_id>/``. The active
+# marker makes switching organizations atomic for prompt discovery without
+# mixing skills from a previous organization into the current agent session.
+ORG_MIRROR_DIR_NAME = "_org"
+ORG_ACTIVE_MARKER = ".active_org"
+ORG_PROVENANCE_FILE = ".org-provenance.json"
+
+
+def read_active_org_id(skills_dir: Path) -> Optional[str]:
+    """Return the active organization id, or ``None`` when no org is active."""
+    try:
+        marker = skills_dir / ORG_MIRROR_DIR_NAME / ORG_ACTIVE_MARKER
+        if not marker.exists():
+            return None
+        value = marker.read_text(encoding="utf-8").strip()
+        return value or None
+    except OSError:
+        return None
+
+
+def org_id_of_path(path, skills_dir: Path) -> Optional[str]:
+    """Return the organization id for a path below ``_org/<org_id>/``."""
+    try:
+        relative = Path(path).resolve().relative_to(Path(skills_dir).resolve())
+    except (OSError, ValueError):
+        return None
+    if len(relative.parts) >= 2 and relative.parts[0] == ORG_MIRROR_DIR_NAME:
+        return relative.parts[1]
+    return None
+
 
 def is_excluded_skill_path(path) -> bool:
     """True if *path* should be skipped by active skill scanners.

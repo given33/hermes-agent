@@ -3245,14 +3245,15 @@ class GatewaySlashCommandsMixin:
 
     def _save_gateway_config_key(self, key_path: str, value) -> bool:
         """Save a dot-separated key to config.yaml (shared by /reasoning, /fast
-        and their interactive pickers)."""
+        and their interactive pickers).
+
+        Uses ``mutate_config`` so the whole read-mutate-write happens under the
+        cross-process config lock.
+        """
         from gateway.run import _hermes_home
-        from hermes_cli.config import read_user_config_raw
         config_path = _hermes_home / "config.yaml"
-        try:
-            # Write-back round-trip: raw read is correct (merged defaults must
-            # not be persisted back to the user's file).
-            user_config = read_user_config_raw(config_path)
+
+        def _set_key(user_config: dict) -> dict:
             keys = key_path.split(".")
             current = user_config
             for k in keys[:-1]:

@@ -60,7 +60,7 @@ from hermes_runtime.credential_persistence import sanitize_borrowed_credential_p
 from hermes_runtime.version import HERMES_VERSION
 from utils import atomic_replace, atomic_yaml_write, env_float, is_truthy_value
 
-logger = logging.getLogger(__name__)
+logger = logging.getLogger("hermes_cli.auth")
 
 try:
     import fcntl
@@ -1089,19 +1089,44 @@ def _load_auth_store(auth_file: Optional[Path] = None) -> Dict[str, Any]:
         return {"version": AUTH_STORE_VERSION, "providers": {}}
 
     try:
-        raw = json.loads(auth_file.read_text())
+        raw = json.loads(auth_file.read_text(encoding="utf-8"))
+    except OSError:
+        logger.warning(
+            "auth: could not read %s, leaving the store on disk untouched "
+            "rather than degrading to an empty one",
+            auth_file,
+            exc_info=True,
+        )
+        raise
     except Exception as exc:
         corrupt_path = auth_file.with_suffix(".json.corrupt")
+        preserved = False
         try:
             import shutil
             shutil.copy2(auth_file, corrupt_path)
+            preserved = True
         except Exception:
-            pass
-        logger.warning(
-            "auth: failed to parse %s (%s) — starting with empty store. "
-            "Corrupt file preserved at %s",
-            auth_file, exc, corrupt_path,
-        )
+            logger.debug(
+                "auth: could not preserve a copy of the corrupt store at %s",
+                corrupt_path,
+                exc_info=True,
+            )
+        if preserved:
+            logger.warning(
+                "auth: failed to parse %s (%s) - starting with empty store. "
+                "Corrupt file preserved at %s",
+                auth_file,
+                exc,
+                corrupt_path,
+            )
+        else:
+            logger.warning(
+                "auth: failed to parse %s (%s) - starting with empty store. "
+                "A copy could NOT be preserved at %s",
+                auth_file,
+                exc,
+                corrupt_path,
+            )
         return {"version": AUTH_STORE_VERSION, "providers": {}}
 
     if isinstance(raw, dict) and (
@@ -3693,7 +3718,7 @@ def _import_codex_cli_tokens() -> Optional[Dict[str, str]]:
     if not auth_path.is_file():
         return None
     try:
-        payload = json.loads(auth_path.read_text())
+        payload = json.loads(auth_path.read_text(encoding="utf-8"))
         tokens = payload.get("tokens")
         if not isinstance(tokens, dict):
             return None
@@ -4914,7 +4939,7 @@ def _read_shared_nous_state() -> Optional[Dict[str, Any]]:
     if not path.is_file():
         return None
     try:
-        payload = json.loads(path.read_text())
+        payload = json.loads(path.read_text(encoding="utf-8"))
     except (OSError, ValueError) as exc:
         logger.debug("Shared Nous auth store at %s is unreadable: %s", path, exc)
         return None

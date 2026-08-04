@@ -1,4 +1,4 @@
-"""Retirement contract for the legacy Nous subscription CLI surface."""
+"""Tests for the /subscription CLI change flow (cli.py::_show_subscription).
 
 Parity with the TUI overlay: the classic CLI now previews + applies a plan change
 in-terminal (picker → preview → confirm → apply), allows remote spending inline on
@@ -19,12 +19,18 @@ from agent.subscription_view import CurrentSubscription, SubscriptionState, Subs
 from cli import HermesCLI
 
 
-def test_subscription_screen_is_not_exposed():
-    assert not hasattr(HermesCLI, "_show_subscription")
+@pytest.fixture
+def cli():
+    obj = HermesCLI.__new__(HermesCLI)  # bypass __init__ (no full app needed)
+    obj._app = None  # non-interactive by default; tests flip it on
+    return obj
 
 
-def test_subscription_slash_command_is_not_advertised():
-    from hermes_cli import cli_commands_mixin
+_TIERS = (
+    SubscriptionTier(tier_id="free", name="Free", tier_order=0, dollars_per_month=Decimal("0"), monthly_credits=Decimal("0"), is_current=False, is_enabled=True),
+    SubscriptionTier(tier_id="plus", name="Plus", tier_order=1, dollars_per_month=Decimal("20"), monthly_credits=Decimal("22"), is_current=False, is_enabled=True),
+    SubscriptionTier(tier_id="ultra", name="Ultra", tier_order=3, dollars_per_month=Decimal("200"), monthly_credits=Decimal("220"), is_current=True, is_enabled=True),
+)
 
 
 def _sub_state(**current_over) -> SubscriptionState:

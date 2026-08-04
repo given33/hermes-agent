@@ -472,7 +472,10 @@ def _resolve_runtime_from_pool_entry(
             if cfg_base_url:
                 base_url = cfg_base_url
             configured_mode = _parse_api_mode(model_cfg.get("api_mode"))
-            if configured_mode:
+            if configured_mode and _provider_supports_explicit_api_mode(
+                provider,
+                model_cfg.get("provider"),
+            ):
                 api_mode = configured_mode
         # Model-family inference for GPT-5.x / codex / o1-o4: Azure rejects
         # /chat/completions on these with 400 "operation unsupported" — see
@@ -1507,7 +1510,10 @@ def _resolve_explicit_runtime(
             api_mode = "codex_responses"
         else:
             configured_mode = _parse_api_mode(model_cfg.get("api_mode"))
-            if configured_mode:
+            if configured_mode and _provider_supports_explicit_api_mode(
+                provider,
+                model_cfg.get("provider"),
+            ):
                 api_mode = configured_mode
             else:
                 # Auto-detect from URL (Anthropic /anthropic suffix,
