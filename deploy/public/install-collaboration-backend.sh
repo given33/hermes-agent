@@ -1315,11 +1315,11 @@ if [[ "${dependency_update_enabled}" == 1 ]]; then
       -r "${snapshot}/deploy/public/runtime-requirements.lock"
   )
   "${candidate_venv}/bin/python" - <<'PY'
-from importlib.metadata import version
-
-assert version("mcp") == "2.0.0"
-assert version("starlette") == "1.0.1"
 import mcp  # noqa: F401
+from mcp.server.fastmcp import FastMCP
+from starlette.concurrency import run_in_threadpool
+
+assert FastMCP and run_in_threadpool
 PY
   # Root can import packages installed with mode 0700, while the systemd
   # service cannot. Validate the dashboard's real import surface as the
@@ -1345,25 +1345,25 @@ from fastapi.responses import (  # noqa: F401
     Response,
 )
 from fastapi.staticfiles import StaticFiles  # noqa: F401
-from mcp.server import MCPServer
+from mcp.server.fastmcp import FastMCP
 from pydantic import BaseModel, SecretStr  # noqa: F401
 from starlette.concurrency import run_in_threadpool  # noqa: F401
 
-assert FastAPI and MCPServer
+assert FastAPI and FastMCP
 PY
 fi
 
 # Dependency-backed release checks must use the fully resolved candidate.  A
-# live installation may still run MCP 1.x while this release upgrades it to
-# MCP 2, so checking runtime_python before building the candidate would reject
-# the exact upgrade that the transactional venv swap is designed to perform.
+# live installation may contain an older lock, so checking runtime_python
+# before building the candidate would reject the exact transactional upgrade
+# that the virtual-environment swap is designed to perform.
 dependency_validation_python="${runtime_python}"
 if [[ "${dependency_update_enabled}" == 1 ]]; then
   dependency_validation_python="${candidate_venv}/bin/python"
 fi
 if [[ "${ios_enabled}" == 1 ]]; then
-  "${dependency_validation_python}" -c 'from mcp.server import MCPServer; assert MCPServer' \
-    || die "Hermes runtime candidate is missing MCP SDK v2 required by iOS MCP services"
+  "${dependency_validation_python}" -c 'from mcp.server.fastmcp import FastMCP; assert FastMCP' \
+    || die "Hermes runtime candidate is missing the locked FastMCP SDK required by iOS MCP services"
   "${dependency_validation_python}" -c 'from cryptography.hazmat.primitives.ciphers.aead import AESGCM; assert AESGCM' \
     || die "Hermes runtime candidate is missing AES-GCM support required by encrypted iOS hot and cold storage"
   "${dependency_validation_python}" -c 'from agent.plugin_llm import PluginLlm; assert PluginLlm' \
