@@ -287,6 +287,27 @@ def test_public_deployer_selects_a_remote_staging_filesystem_with_space():
     assert 'remote staging filesystems have insufficient free space' in deployer
 
 
+def test_fabric_diagnostics_are_manual_read_only_and_keep_deploy_gated():
+    workflow = DEPLOY_WORKFLOW.read_text(encoding="utf-8")
+
+    diagnostics = workflow.split("\n  diagnose-fabric:\n", 1)[1].split(
+        "\n  verify:", 1
+    )[0]
+    assert "github.event_name == 'workflow_dispatch'" in diagnostics
+    assert "inputs.operation == 'diagnose-fabric'" in diagnostics
+    assert "StrictHostKeyChecking=yes" in diagnostics
+    assert "systemctl show hermes-fabric-update.timer" in diagnostics
+    assert "systemctl show hermes-fabric-update.service" in diagnostics
+    assert "journalctl -u hermes-fabric-update.service" in diagnostics
+    assert "systemctl restart" not in diagnostics
+    assert "systemctl enable" not in diagnostics
+    assert "StrictHostKeyChecking=no" not in diagnostics
+    assert (
+        "if: github.event_name != 'workflow_dispatch' || inputs.operation == 'deploy'"
+        in workflow
+    )
+
+
 def test_production_release_synchronizes_the_ios_workflow_observably():
     workflow = DEPLOY_WORKFLOW.read_text(encoding="utf-8")
 

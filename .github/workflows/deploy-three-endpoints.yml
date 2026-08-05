@@ -8,6 +8,15 @@ on:
   schedule:
     - cron: '17 */2 * * *'
   workflow_dispatch:
+    inputs:
+      operation:
+        description: Production operation to run
+        required: true
+        default: deploy
+        type: choice
+        options:
+          - deploy
+          - diagnose-fabric
 
 permissions:
   contents: read
@@ -18,8 +27,64 @@ concurrency:
   cancel-in-progress: false
 
 jobs:
+  diagnose-fabric:
+    name: Diagnose fabric updater without deployment
+    if: github.event_name == 'workflow_dispatch' && inputs.operation == 'diagnose-fabric'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    environment: production
+    steps:
+      - name: Configure pinned deployment SSH identity
+        env:
+          DEPLOY_KEY_B64: ${{ secrets.HERMES_PUBLIC_SSH_KEY_B64 }}
+          KNOWN_HOSTS: ${{ secrets.HERMES_PUBLIC_KNOWN_HOSTS }}
+        run: |
+          test -n "$DEPLOY_KEY_B64"
+          test -n "$KNOWN_HOSTS"
+          install -d -m 0700 "$RUNNER_TEMP/ssh"
+          printf '%s' "$DEPLOY_KEY_B64" | base64 --decode >"$RUNNER_TEMP/ssh/id_ed25519"
+          printf '%s\n' "$KNOWN_HOSTS" >"$RUNNER_TEMP/ssh/known_hosts"
+          chmod 0600 "$RUNNER_TEMP/ssh/id_ed25519" "$RUNNER_TEMP/ssh/known_hosts"
+          ssh-keygen -y -f "$RUNNER_TEMP/ssh/id_ed25519" >/dev/null
+      - name: Read the DBB3 fabric updater state
+        env:
+          REMOTE: ${{ secrets.HERMES_PUBLIC_USER }}@${{ secrets.HERMES_PUBLIC_HOST }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          ssh -i "$RUNNER_TEMP/ssh/id_ed25519" \
+            -o UserKnownHostsFile="$RUNNER_TEMP/ssh/known_hosts" \
+            -o StrictHostKeyChecking=yes "$REMOTE" \
+            'sudo -n /bin/bash -s' <<'PUBLIC'
+          set -euo pipefail
+          options=(
+            -o BatchMode=yes
+            -o ConnectTimeout=6
+            -o LogLevel=ERROR
+            -o StrictHostKeyChecking=yes
+          )
+          for target in dbb3-hermes root@10.66.0.2 hermes@10.66.0.2; do
+            if ssh "${options[@]}" "$target" true 2>/dev/null; then
+              printf 'diagnostic_target=%s\n' "$target"
+              ssh "${options[@]}" "$target" 'sudo -n /bin/bash -s' <<'NODE'
+          set -euo pipefail
+          systemctl show hermes-fabric-update.timer \
+            --property=LoadState,ActiveState,SubState,UnitFileState,LastTriggerUSec,NextElapseUSecRealtime
+          systemctl show hermes-fabric-update.service \
+            --property=LoadState,ActiveState,SubState,Result,ExecMainCode,ExecMainStatus,StateChangeTimestamp
+          systemctl list-timers hermes-fabric-update.timer --all --no-pager
+          journalctl -u hermes-fabric-update.service -n 160 --no-pager -o short-iso
+          NODE
+              exit 0
+            fi
+          done
+          printf '%s\n' 'No pinned, non-interactive DBB3 SSH route is configured on the public authority.' >&2
+          exit 1
+          PUBLIC
+
   verify:
     name: Verify production backend release
+    if: github.event_name != 'workflow_dispatch' || inputs.operation == 'deploy'
     runs-on: ubuntu-latest
     timeout-minutes: 20
     steps:
