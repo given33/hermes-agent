@@ -74,11 +74,9 @@ jobs:
             agent gateway hermes_cli hermes_services plugins tools utils.py
           uv run pytest -q \
             tests/deploy/test_cloud_deployment_assets.py \
-            tests/architecture/test_bare_config_reads.py \
-            tests/architecture/test_layering_policy.py \
-            tests/architecture/test_dependency_direction.py \
             tests/hermes_services/test_tool_contract.py \
             tests/hermes_services/test_internal_hooks.py \
+            tests/hermes_services/test_official_frontend_event_protocol.py \
             tests/run_agent/test_tool_batch_segmentation.py \
             tests/hermes_cli/test_account_cleanup.py \
             tests/hermes_cli/test_ios_intelligence.py \
