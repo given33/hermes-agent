@@ -611,7 +611,9 @@ async def get_profile_soul(name: str):
 async def update_profile_soul(name: str, body: ProfileSoulUpdate):
     soul_path = _resolve_profile_dir(name) / "SOUL.md"
     try:
-        soul_path.write_text(body.content, encoding="utf-8")
+        from utils import write_secret_file
+
+        write_secret_file(soul_path, body.content, mode=0o600)
     except OSError as e:
         _log.exception("PUT /api/profiles/%s/soul failed", name)
         raise HTTPException(status_code=500, detail=f"Could not write SOUL.md: {e}")

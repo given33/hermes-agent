@@ -17,7 +17,7 @@ from typing import Any
 from urllib.parse import urlsplit
 
 from utils import safe_json_loads
-from hermes_runtime.redaction import redact_sensitive_text
+from agent.redact import redact_sensitive_text
 from agent.tool_result_classification import file_mutation_result_landed
 
 # ANSI escape codes for coloring tool failure indicators

@@ -1,5 +1,20 @@
-"""Tests for MCP 2026-07-28 capability-gated discovery and liveness."""
+"""Tests for capability-gated MCP tool discovery and keepalive.
 
+Prompt-only / resource-only MCP servers do not implement the ``tools/*``
+request family. Per the MCP spec, ``InitializeResult.capabilities.tools``
+is non-None iff the server supports it. Before the capability gate, Hermes
+always called ``tools/list`` during discovery, which raised
+``McpError(-32601 Method not found)`` against such servers, so a prompt-only
+server could never stay connected. Discovery/refresh remain capability-gated.
+
+The keepalive probe uses ``ping`` (MCP base-protocol liveness) for every
+server regardless of capability: it works uniformly and stays a few bytes
+instead of pulling the full ``tools/list`` payload (which is ~1 MB on large
+servers like Unreal Engine's editor MCP). Its cadence is configurable via
+``keepalive_interval`` so servers with short session TTLs stay alive.
+
+Discovery gating ported from anomalyco/opencode#31271.
+"""
 import asyncio
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
@@ -10,7 +25,7 @@ from tools.mcp_tool import MCPServerTask
 
 
 def _caps(tools=None, prompts=None, resources=None):
-    """Build a minimal current-protocol DiscoverResult stand-in."""
+    """Build a fake InitializeResult with the given capability sub-objects."""
     return SimpleNamespace(
         capabilities=SimpleNamespace(tools=tools, prompts=prompts, resources=resources)
     )
@@ -19,7 +34,7 @@ def _caps(tools=None, prompts=None, resources=None):
 class TestAdvertisesTools:
     def test_true_when_tools_capability_present(self):
         task = MCPServerTask("test")
-        task.discover_result = _caps(tools=SimpleNamespace(list_changed=True))
+        task.initialize_result = _caps(tools=SimpleNamespace(listChanged=True))
         assert task._advertises_tools() is True
 
 
@@ -33,7 +48,7 @@ class TestAdvertisesTools:
 class TestDiscoverToolsGating:
     async def test_skips_list_tools_for_prompt_only_server(self):
         task = MCPServerTask("test")
-        task.discover_result = _caps(prompts=SimpleNamespace())
+        task.initialize_result = _caps(prompts=SimpleNamespace())
         task.session = SimpleNamespace(list_tools=AsyncMock())
         task._tools = ["stale"]
 
@@ -43,20 +58,22 @@ class TestDiscoverToolsGating:
         assert task._tools == []
 
 
-    async def test_missing_discovery_does_not_probe_tools(self):
+    async def test_legacy_fallback_still_calls_list_tools(self):
         task = MCPServerTask("test")
-        task.session = SimpleNamespace(list_tools=AsyncMock())
+        task.session = SimpleNamespace(
+            list_tools=AsyncMock(return_value=SimpleNamespace(tools=[]))
+        )
 
         await task._discover_tools()
 
-        task.session.list_tools.assert_not_called()
+        task.session.list_tools.assert_awaited_once()
 
 
 @pytest.mark.asyncio
 class TestRefreshToolsGating:
     async def test_refresh_noop_for_prompt_only_server(self):
         task = MCPServerTask("test")
-        task.discover_result = _caps(prompts=SimpleNamespace())
+        task.initialize_result = _caps(prompts=SimpleNamespace())
         task.session = SimpleNamespace(list_tools=AsyncMock())
 
         await task._refresh_tools()
@@ -66,48 +83,73 @@ class TestRefreshToolsGating:
 
 @pytest.mark.asyncio
 class TestKeepaliveProbe:
-    async def test_uses_tools_list_when_tools_are_advertised(self):
+    async def _run_one_keepalive_cycle(self, task):
+        """Drive _wait_for_lifecycle_event through exactly one keepalive
+        timeout, then fire shutdown so it returns."""
+        real_wait = asyncio.wait
+        cycles = {"n": 0}
+
+        async def fake_wait(tasks, timeout=None, return_when=None):
+            cycles["n"] += 1
+            if cycles["n"] == 1:
+                # Simulate keepalive timeout: nothing completed.
+                return set(), set(tasks)
+            # Second cycle: let shutdown win.
+            task._shutdown_event.set()
+            return await real_wait(
+                tasks, timeout=0.5, return_when=return_when or asyncio.FIRST_COMPLETED
+            )
+
+        import tools.mcp_tool as mcp_mod
+        orig = mcp_mod.asyncio.wait
+        mcp_mod.asyncio.wait = fake_wait
+        try:
+            return await task._wait_for_lifecycle_event()
+        finally:
+            mcp_mod.asyncio.wait = orig
+
+    async def test_keepalive_uses_ping_for_prompt_only_server(self):
         task = MCPServerTask("test")
-        task.discover_result = _caps(tools=SimpleNamespace())
-        task.session = SimpleNamespace(list_tools=AsyncMock())
+        task.initialize_result = _caps(prompts=SimpleNamespace())
+        task.session = SimpleNamespace(
+            list_tools=AsyncMock(),
+            send_ping=AsyncMock(),
+        )
 
-        await task._keepalive_probe()
+        reason = await self._run_one_keepalive_cycle(task)
 
-        task.session.list_tools.assert_awaited_once()
+        assert reason == "shutdown"
+        task.session.send_ping.assert_awaited_once()
+        task.session.list_tools.assert_not_called()
 
 
-    async def test_uses_prompts_list_for_prompt_only_server(self):
+    async def test_keepalive_uses_ping_legacy_fallback(self):
+        """No captured capabilities → still pings (no spurious list_tools)."""
         task = MCPServerTask("test")
-        task.discover_result = _caps(prompts=SimpleNamespace())
-        task.session = SimpleNamespace(list_prompts=AsyncMock())
+        assert task.initialize_result is None
+        task.session = SimpleNamespace(
+            list_tools=AsyncMock(),
+            send_ping=AsyncMock(),
+        )
 
-        await task._keepalive_probe()
+        reason = await self._run_one_keepalive_cycle(task)
 
-        task.session.list_prompts.assert_awaited_once()
-
-    async def test_no_capability_leaves_session_idle(self):
-        task = MCPServerTask("test")
-        task.discover_result = _caps()
-        task.session = SimpleNamespace()
-
-        await task._keepalive_probe()
-
-
-    async def test_list_failure_propagates_for_reconnect(self):
-        task = MCPServerTask("test")
-        task.discover_result = _caps(tools=SimpleNamespace())
-        task.session = SimpleNamespace(list_tools=AsyncMock(side_effect=RuntimeError("closed")))
-
-        with pytest.raises(RuntimeError, match="closed"):
-            await task._keepalive_probe()
+        assert reason == "shutdown"
+        task.session.send_ping.assert_awaited_once()
+        task.session.list_tools.assert_not_called()
 
 
 class TestKeepaliveInterval:
+    """The keepalive cadence is configurable so servers with short session
+    TTLs (e.g. Unreal Engine editor MCP, ~15s) can refresh fast enough to keep
+    the session alive instead of hitting an expired session on every idle call.
+    """
+
     async def _captured_interval(self, config):
+        """Run one keepalive cycle and capture the ``asyncio.wait`` timeout."""
         task = MCPServerTask("test")
         task._config = config
-        task.discover_result = _caps()
-        task.session = SimpleNamespace()
+        task.session = SimpleNamespace(send_ping=AsyncMock())
         captured = {}
         real_wait = asyncio.wait
 
@@ -119,18 +161,17 @@ class TestKeepaliveInterval:
             )
 
         import tools.mcp_tool as mcp_mod
-        original_wait = mcp_mod.asyncio.wait
+        orig = mcp_mod.asyncio.wait
         mcp_mod.asyncio.wait = fake_wait
         try:
             await task._wait_for_lifecycle_event()
         finally:
-            mcp_mod.asyncio.wait = original_wait
+            mcp_mod.asyncio.wait = orig
         return captured["timeout"]
 
     @pytest.mark.asyncio
     async def test_default_interval_when_unset(self):
         from tools.mcp_tool import _DEFAULT_KEEPALIVE_INTERVAL
-
         assert await self._captured_interval({}) == _DEFAULT_KEEPALIVE_INTERVAL
 
 
@@ -250,4 +291,3 @@ class TestKeepaliveProbeFallback:
         assert task._ping_unsupported is False
 
 
-        assert await self._captured_interval({"keepalive_interval": 0.1}) == _MIN_KEEPALIVE_INTERVAL

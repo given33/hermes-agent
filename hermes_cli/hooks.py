@@ -235,7 +235,7 @@ _DEFAULT_PAYLOADS = {
 
 
 def _cmd_test(args) -> None:
-    from hermes_runtime.config import load_config
+    from hermes_cli.config import load_config
     from hermes_cli.plugins import VALID_HOOKS
     from agent import shell_hooks
 
@@ -340,7 +340,7 @@ def _cmd_revoke(args) -> None:
 # ---------------------------------------------------------------------------
 
 def _cmd_doctor(_args) -> None:
-    from hermes_runtime.config import load_config
+    from hermes_cli.config import load_config
     from agent import shell_hooks
 
     specs = shell_hooks.iter_configured_hooks(load_config())

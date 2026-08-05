@@ -198,7 +198,7 @@ def test_cli_turn_routing_uses_primary_when_disabled(monkeypatch):
 
 
 
-def legacy_model_flow_nous_does_not_restore_stale_custom_api_key(tmp_path, monkeypatch):
+def test_model_flow_nous_does_not_restore_stale_custom_api_key(tmp_path, monkeypatch):
     import yaml
 
     config_home = tmp_path / "hermes"
@@ -259,7 +259,7 @@ def legacy_model_flow_nous_does_not_restore_stale_custom_api_key(tmp_path, monke
 
     hermes_main._model_flow_nous(stale_config, current_model="glm-5.2")
 
-    config = yaml.safe_load(config_path.read_text(encoding="utf-8")) or {}
+    config = yaml.safe_load(config_path.read_text()) or {}
     model = config.get("model")
     assert model["provider"] == "nous"
     assert model["default"] == selected_model
@@ -461,63 +461,56 @@ def test_model_flow_custom_persists_selected_api_mode(monkeypatch):
     assert saved_env[key_env] == "test-key"
 
 
-def test_model_flow_nous_delegates_to_direct_api_key_flow(monkeypatch):
-    from hermes_cli import model_setup_flows
-
-    captured = {}
-
-    def fake_flow(config, provider_id, current_model=""):
-        captured.update(
-            config=config,
-            provider_id=provider_id,
-            current_model=current_model,
-        )
-        return "configured"
-
-    monkeypatch.setattr(
-        model_setup_flows,
-        "_model_flow_api_key_provider",
-        fake_flow,
-    )
-    config = {"model": {"provider": "nous"}}
-
-    result = model_setup_flows._model_flow_nous(
-        config,
-        current_model="Hermes-4",
-        args=object(),
-    )
-
-    assert result == "configured"
-    assert captured == {
-        "config": config,
-        "provider_id": "nous",
-        "current_model": "Hermes-4",
-    }
-
-
-def test_cmd_model_routes_nous_to_direct_api_key_flow(monkeypatch):
+def test_cmd_model_forwards_nous_login_tls_options(monkeypatch):
     monkeypatch.setattr(hermes_main, "_require_tty", lambda *a: None)
     monkeypatch.setattr(
         "hermes_cli.config.load_config",
         lambda: {"model": {"default": "gpt-5", "provider": "nous"}},
     )
+    monkeypatch.setattr("hermes_cli.config.save_config", lambda cfg: None)
+    monkeypatch.setattr("hermes_cli.config.get_env_value", lambda key: "")
+    monkeypatch.setattr("hermes_cli.config.save_env_value", lambda key, value: None)
     monkeypatch.setattr("hermes_cli.auth.resolve_provider", lambda requested, **kwargs: "nous")
+    monkeypatch.setattr("hermes_cli.auth.get_provider_auth_state", lambda provider_id: None)
     monkeypatch.setattr(hermes_main, "_prompt_provider_choice", lambda choices, **kwargs: 0)
 
     captured = {}
 
-    def _fake_api_key_flow(config, provider_id, current_model=""):
-        captured["config"] = config
-        captured["provider_id"] = provider_id
-        captured["current_model"] = current_model
+    def _fake_login(login_args, provider_config):
+        captured["portal_url"] = login_args.portal_url
+        captured["inference_url"] = login_args.inference_url
+        captured["client_id"] = login_args.client_id
+        captured["scope"] = login_args.scope
+        captured["no_browser"] = login_args.no_browser
+        captured["timeout"] = login_args.timeout
+        captured["ca_bundle"] = login_args.ca_bundle
+        captured["insecure"] = login_args.insecure
 
-    monkeypatch.setattr(hermes_main, "_model_flow_api_key_provider", _fake_api_key_flow)
+    monkeypatch.setattr("hermes_cli.auth._login_nous", _fake_login)
 
-    hermes_main.cmd_model(SimpleNamespace(refresh=False))
+    hermes_main.cmd_model(
+        SimpleNamespace(
+            portal_url="https://portal.nousresearch.com",
+            inference_url="https://inference.nousresearch.com/v1",
+            client_id="hermes-local",
+            scope="openid profile",
+            no_browser=True,
+            timeout=7.5,
+            ca_bundle="/tmp/local-ca.pem",
+            insecure=True,
+        )
+    )
 
-    assert captured["provider_id"] == "nous"
-    assert captured["current_model"] == "gpt-5"
-    assert captured["config"]["model"]["provider"] == "nous"
+    assert captured == {
+        "portal_url": "https://portal.nousresearch.com",
+        "inference_url": "https://inference.nousresearch.com/v1",
+        "client_id": "hermes-local",
+        "scope": "openid profile",
+        "no_browser": True,
+        "timeout": 7.5,
+        "ca_bundle": "/tmp/local-ca.pem",
+        "insecure": True,
+    }
 
 
 # ---------------------------------------------------------------------------

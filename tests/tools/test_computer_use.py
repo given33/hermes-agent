@@ -1114,11 +1114,8 @@ class TestCuaDriverSessionReconnect:
             returncode = 0
             stderr = ""
             # Daemon returns a path, not inline base64.
-            stdout = json.dumps({
-                "element_count": 7,
-                "tree_markdown": "- [0] AXButton",
-                "screenshot_file_path": str(shot),
-            })
+            stdout = ('{"element_count": 7, "tree_markdown": "- [0] AXButton",'
+                      ' "screenshot_file_path": "%s"}' % str(shot))
 
         import subprocess as _sp
         orig_run = _sp.run
@@ -1391,7 +1388,7 @@ class TestCuaEnvironmentScrubbing:
 
                 # ClientSession(read, write) is used as `async with`.
                 fake_session = MagicMock()
-                fake_session.discover = AsyncMock()
+                fake_session.initialize = AsyncMock()
                 # tools/list yields nothing — keeps _populate_capabilities
                 # quiet without us needing to fully mock the response shape.
                 fake_session.list_tools = AsyncMock(return_value=MagicMock(tools=[]))
@@ -1650,11 +1647,11 @@ class TestImageMimeTypePropagation:
         image_part = MagicMock()
         image_part.type = "image"
         image_part.data = "iVBORw0K..."
-        image_part.mime_type = "image/png"
+        image_part.mimeType = "image/png"
 
         result = MagicMock()
-        result.is_error = False
-        result.structured_content = None
+        result.isError = False
+        result.structuredContent = None
         result.content = [image_part]
 
         out = _extract_tool_result(result)
@@ -2101,7 +2098,7 @@ class TestStartupTimeoutPhaseDetail:
         session._ready_event = threading.Event()  # never set → timeout path
         session._setup_error = None
         session._shutdown_event = None
-        session._startup_phase = "mcp-discover"
+        session._startup_phase = "mcp-initialize"
         session._signal_shutdown_locked = lambda: None
 
         fake_bridge = MagicMock()
@@ -2130,5 +2127,5 @@ class TestStartupTimeoutPhaseDetail:
                 assert False, "expected RuntimeError"
             except RuntimeError as e:
                 msg = str(e)
-                assert "stuck in phase: mcp-discover" in msg
+                assert "stuck in phase: mcp-initialize" in msg
                 assert "computer-use doctor" in msg

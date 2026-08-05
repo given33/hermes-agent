@@ -553,7 +553,7 @@ def _load_config_oauth_section() -> dict:
     through to ``{}`` so register() can rely on `.get(...)` access.
     """
     try:
-        from hermes_runtime.config import cfg_get, load_config
+        from hermes_cli.config import cfg_get, load_config
 
         cfg = load_config()
     except Exception as exc:  # noqa: BLE001 — broad catch is intentional
@@ -625,16 +625,7 @@ def register(ctx) -> None:
     with zero providers" case independently.
     """
     global LAST_SKIP_REASON
-    del ctx
-    LAST_SKIP_REASON = (
-        "The Nous Portal dashboard account provider is retired; configure "
-        "basic or self-hosted dashboard authentication instead."
-    )
-    logger.debug("dashboard-auth-nous: %s", LAST_SKIP_REASON)
-    return
-
-    # Legacy provider construction remains below as unreachable compatibility
-    # source for downstream patch sets.
+    LAST_SKIP_REASON = ""
 
     client_id = _resolve_client_id()
     portal_url = _resolve_portal_url()

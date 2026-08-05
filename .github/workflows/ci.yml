@@ -284,12 +284,11 @@ jobs:
       - uv-lockfile
       - lockfile-diff
       - docker-lint
+      - docker
       - supply-chain
       - review-labels
       - osv-scanner
       # comment-live is a polling job — it doesn't block the gate.
-      # we don't require docker to pass rn because it's so slow lol
-      # - docker
     if: always()
     runs-on: ubuntu-latest
     timeout-minutes: 10
@@ -309,7 +308,7 @@ jobs:
           print(f'needs-json={json.dumps(compact)}')
           with open('$GITHUB_OUTPUT', 'a') as f:
               f.write(f'needs-json={json.dumps(compact)}\n')
-          failed = [name for name, info in needs.items() if info['result'] == 'failure']
+          failed = [name for name, info in needs.items() if info['result'] not in ('success', 'skipped')]
           for name, info in sorted(needs.items()):
               result = info['result']
               icon = '✅' if result in ('success', 'skipped') else '❌'

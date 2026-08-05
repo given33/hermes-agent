@@ -32,13 +32,6 @@ from hermes_constants import (
     set_hermes_home_override,
 )
 from hermes_cli.env_loader import load_hermes_dotenv
-from hermes_runtime.config import read_raw_config
-from hermes_services import (
-    HermesApplicationKernel,
-    JsonRpcMethodRegistry,
-    LiveSessionRegistry,
-    has_usable_secret,
-)
 from utils import is_truthy_value
 from tools.environments.local import hermes_subprocess_env
 from agent.replay_cleanup import sanitize_replay_history
@@ -147,10 +140,8 @@ except Exception:
 
 from tui_gateway.render import make_stream_renderer, render_diff, render_message
 
-_APPLICATION = HermesApplicationKernel.for_local_rpc()
-_sessions: LiveSessionRegistry[dict[str, Any]] = _APPLICATION.sessions
-_rpc_registry: JsonRpcMethodRegistry = _APPLICATION.rpc
-_methods = _rpc_registry.methods
+_sessions: dict[str, dict] = {}
+_methods: dict[str, callable] = {}
 _pending: dict[str, tuple[str, threading.Event]] = {}
 _pending_prompt_payloads: dict[str, tuple[str, dict]] = {}
 _answers: dict[str, str] = {}
@@ -158,7 +149,7 @@ _db = None
 _db_error: str | None = None
 _stdout_lock = threading.Lock()
 _cfg_lock = threading.Lock()
-_sessions_lock = _sessions.lock  # reentrant: multi-step lifecycle operations share the registry lock
+_sessions_lock = threading.RLock()  # reentrant: _close_session_by_id may run under callers that already hold it
 _prompt_lock = threading.Lock()
 _cfg_cache: dict | None = None
 _cfg_mtime: float | None = None
@@ -201,7 +192,21 @@ _DETAIL_MODES = frozenset({"hidden", "collapsed", "expanded"})
 # response writes are safe.
 _LONG_HANDLERS = frozenset(
     {
+        # Billing/usage reads each do a blocking portal HTTP fetch (state + usage
+        # is two serial round-trips); keep them off the main stdin loop so a slow
+        # portal can't stall approval.respond / session.interrupt / other RPCs.
+        "billing.state",
+        "subscription.state",
+        # Subscription change (V3): preview + the pending-change mutations + upgrade
+        # each do a blocking portal round-trip (preview + upgrade also hit Stripe,
+        # which can take seconds) — keep them off the main stdin loop.
+        "subscription.preview",
+        "subscription.change",
+        "subscription.resume",
+        "subscription.upgrade",
+        "usage.bars",
         "session.usage",
+        "billing.step_up",
         "browser.manage",
         "cli.exec",
         # Completion RPCs run inline on the reader thread by default, but both
@@ -335,7 +340,7 @@ class _SlashWorker:
             argv += ["--model", model]
 
         self._closed = False
-        from hermes_runtime.subprocess_compat import windows_hide_flags
+        from hermes_cli._subprocess_compat import windows_hide_flags
 
         # slash_worker runs the Hermes agent → needs provider credentials.
         # Tier-1 secrets (gateway/GitHub/infra) are still stripped (#29157).
@@ -1846,24 +1851,50 @@ def _image_meta(path: Path) -> dict:
 
 
 def _ok(rid, result: dict) -> dict:
-    return _rpc_registry.success(rid, result)
+    return {"jsonrpc": "2.0", "id": rid, "result": result}
 
 
 def _err(rid, code: int, msg: str) -> dict:
-    return _rpc_registry.failure(rid, code, msg)
+    return {"jsonrpc": "2.0", "id": rid, "error": {"code": code, "message": msg}}
 
 
 def method(name: str):
-    return _rpc_registry.method(name)
+    def dec(fn):
+        _methods[name] = fn
+        return fn
+
+    return dec
 
 
 def _normalize_request(req: Any) -> tuple[Any, str, dict] | dict:
-    """Compatibility wrapper for the shared JSON-RPC request boundary."""
-    return _rpc_registry.normalize(req)
+    """Validate a JSON-RPC request enough for safe local dispatch."""
+    if not isinstance(req, dict):
+        return _err(None, -32600, "invalid request: expected an object")
+
+    rid = req.get("id")
+    method = req.get("method")
+    if not isinstance(method, str) or not method:
+        return _err(rid, -32600, "invalid request: method must be a non-empty string")
+
+    params = req.get("params", {})
+    if params is None:
+        params = {}
+    elif not isinstance(params, dict):
+        return _err(rid, -32602, "invalid params: expected an object")
+
+    return rid, method, params
 
 
 def handle_request(req: dict) -> dict | None:
-    return _rpc_registry.handle(req)
+    normalized = _normalize_request(req)
+    if isinstance(normalized, dict):
+        return normalized
+
+    rid, method, params = normalized
+    fn = _methods.get(method)
+    if not fn:
+        return _err(rid, -32601, f"unknown method: {method}")
+    return fn(rid, params)
 
 
 def dispatch(req: dict, transport: Optional[Transport] = None) -> dict | None:
@@ -2639,7 +2670,7 @@ def _ensure_session_db_row(session: dict) -> None:
     # start (matches _runtime_model_config's normalization).
     if str(model_config.get("provider") or "").strip().lower() == "custom":
         try:
-            from agent.runtime_provider import canonical_custom_identity
+            from hermes_cli.runtime_provider import canonical_custom_identity
 
             healed = canonical_custom_identity(
                 base_url=model_config.get("base_url") or None,
@@ -2964,7 +2995,7 @@ def _apply_managed(cfg: dict) -> dict:
     only — the raw user config is what gets cached and saved. Fail-open.
     """
     try:
-        from hermes_runtime import managed_scope
+        from hermes_cli import managed_scope
 
         return managed_scope.apply_managed_overlay(cfg if isinstance(cfg, dict) else {})
     except Exception:
@@ -2974,7 +3005,7 @@ def _apply_managed(cfg: dict) -> dict:
 def _save_cfg(cfg: dict):
     global _cfg_cache, _cfg_mtime, _cfg_path
 
-    from hermes_runtime.config import atomic_config_write
+    from hermes_cli.config import atomic_config_write
 
     path = _hermes_home / "config.yaml"
     atomic_config_write(path, cfg)
@@ -3010,7 +3041,7 @@ def _set_session_context(
     ui_session_id: str = "",
 ) -> list:
     try:
-        from hermes_runtime.session_context import set_session_vars
+        from gateway.session_context import set_session_vars
 
         # Ephemeral task IDs (background, preview) aren't in `_sessions`, so the
         # reverse-map returns "" and would clear the cwd override. Callers that
@@ -3052,7 +3083,7 @@ def _clear_session_context(tokens: list) -> None:
     if not tokens:
         return
     try:
-        from hermes_runtime.session_context import clear_session_vars
+        from gateway.session_context import clear_session_vars
 
         clear_session_vars(tokens)
     except Exception:
@@ -3433,7 +3464,7 @@ def _resolve_model() -> str:
     # default (catalog-labeled, cache-only read), never an expensive Anthropic
     # flagship the user didn't pick.
     try:
-        from agent.model_catalog import get_preferred_silent_default_model
+        from hermes_cli.models import get_preferred_silent_default_model
 
         return get_preferred_silent_default_model()
     except Exception:
@@ -3529,7 +3560,7 @@ def _resolve_startup_runtime() -> tuple[str, str | None]:
         return model, None
 
     try:
-        from agent.model_catalog import detect_static_provider_for_model
+        from hermes_cli.models import detect_static_provider_for_model
 
         cfg = _load_cfg().get("model") or {}
         current_provider = (
@@ -3612,7 +3643,7 @@ def _stored_session_runtime_overrides(row: dict | None) -> dict:
     if provider.strip().lower() == "custom":
         healed = None
         try:
-            from agent.runtime_provider import canonical_custom_identity
+            from hermes_cli.runtime_provider import canonical_custom_identity
 
             healed = canonical_custom_identity(
                 base_url=base_url or None, model=model or None
@@ -3675,7 +3706,7 @@ def _runtime_model_config(agent, existing: dict | None = None) -> dict:
             # bare "custom" with no base_url was persisted verbatim and routed
             # to OpenRouter with no key on the next resume).
             try:
-                from agent.runtime_provider import (
+                from hermes_cli.runtime_provider import (
                     canonical_custom_identity,
                 )
 
@@ -4088,8 +4119,8 @@ def _load_enabled_toolsets() -> list[str] | None:
         mcp_names: set[str] = set()
         mcp_disabled: set[str] = set()
         try:
-            from hermes_runtime.config import read_raw_config
-            from hermes_config_values import parse_enabled_flag
+            from hermes_cli.config import read_raw_config
+            from hermes_cli.tools_config import _parse_enabled_flag
 
             raw_cfg = read_raw_config()
             mcp_servers = (
@@ -4100,7 +4131,7 @@ def _load_enabled_toolsets() -> list[str] | None:
             for name, server_cfg in mcp_servers.items():
                 if not isinstance(server_cfg, dict):
                     continue
-                if parse_enabled_flag(server_cfg.get("enabled", True), default=True):
+                if _parse_enabled_flag(server_cfg.get("enabled", True), default=True):
                     mcp_names.add(str(name))
                 else:
                     mcp_disabled.add(str(name))
@@ -4140,7 +4171,7 @@ def _load_enabled_toolsets() -> list[str] | None:
         )
 
     try:
-        from hermes_runtime.config import load_config
+        from hermes_cli.config import load_config
         from hermes_cli.tools_config import _get_platform_tools
 
         cfg = cfg if cfg is not None else load_config()
@@ -4294,7 +4325,7 @@ def _apply_model_switch(
         MODEL_SWITCH_ERR_ONCE_WITH_GLOBAL,
         MODEL_SWITCH_ERROR_TEXT,
     )
-    from agent.runtime_provider import resolve_runtime_provider
+    from hermes_cli.runtime_provider import resolve_runtime_provider
 
     if parsed_flags is None:
         parsed_flags = parse_model_switch_args(raw_input)
@@ -4359,7 +4390,7 @@ def _apply_model_switch(
     custom_provs = None
     cfg = None
     try:
-        from hermes_runtime.config import get_compatible_custom_providers, load_config
+        from hermes_cli.config import get_compatible_custom_providers, load_config
 
         cfg = load_config()
         user_provs = cfg.get("providers")
@@ -5093,7 +5124,7 @@ def _session_info(agent, session: dict | None = None) -> dict:
         pass
     try:
         from hermes_cli.banner import get_update_result
-        from hermes_runtime.config import recommended_update_command
+        from hermes_cli.config import recommended_update_command
 
         info["update_behind"] = get_update_result(timeout=0.5)
         info["update_command"] = recommended_update_command()
@@ -5184,7 +5215,7 @@ def _cap_tui_verbose_text(text: str) -> str:
 
 def _redact_tui_verbose_text(text: str) -> str:
     try:
-        from hermes_runtime.redaction import redact_sensitive_text
+        from agent.redact import redact_sensitive_text
 
         redacted = redact_sensitive_text(str(text), force=True)
     except Exception:
@@ -5741,7 +5772,7 @@ def _wire_callbacks(sid: str):
                 "skipped": True,
                 "message": "skipped",
             }
-        from hermes_cli.credential_lifecycle import save_env_value_secure
+        from hermes_cli.config import save_env_value_secure
 
         return {
             **save_env_value_secure(env_var, val),
@@ -5770,7 +5801,7 @@ def _available_personalities(cfg: dict | None = None) -> dict:
         return (load_cli_config().get("agent") or {}).get("personalities", {}) or {}
     except Exception:
         try:
-            from hermes_runtime.config import load_config as _load_full_cfg
+            from hermes_cli.config import load_config as _load_full_cfg
 
             return (_load_full_cfg().get("agent") or {}).get("personalities", {}) or {}
         except Exception:
@@ -6199,8 +6230,8 @@ def _resolve_runtime_with_fallback(
     into a different runtime. ``used_fallback`` remains explicit rather than
     overloading a nullable model as control flow.
     """
-    from hermes_services.auth import AuthError
-    from agent.runtime_provider import resolve_runtime_provider
+    from hermes_cli.auth import AuthError
+    from hermes_cli.runtime_provider import resolve_runtime_provider
 
     kwargs = resolve_kwargs or {}
     try:
@@ -6265,23 +6296,6 @@ def _make_agent(
     if synthetic is not None:
         return synthetic
 
-    # Hosted mobile turns publish the complete cached MCP contract while each
-    # transport stays lazy. Register schemas before the agent snapshots its
-    # tools, and avoid the normal discovery wait that would cold-start every
-    # configured service before the first model token.
-    hosted_static_mcp = False
-    if is_truthy_value(os.environ.get("HERMES_FULL_TOOL_DEFINITIONS")):
-        try:
-            from tools.mcp_tool import (
-                all_configured_mcp_servers_lazy,
-                register_static_mcp_servers,
-            )
-
-            register_static_mcp_servers()
-            hosted_static_mcp = all_configured_mcp_servers_lazy()
-        except Exception:
-            logger.debug("Hosted static MCP registration skipped", exc_info=True)
-
     from run_agent import AIAgent
 
     # MCP tool discovery runs in a background daemon thread at startup so a
@@ -6290,19 +6304,18 @@ def _make_agent(
     # to land before building — bounded, so a slow/dead server still can't
     # block. Dashboard /api/ws uses hermes_cli.mcp_startup; TUI stdio keeps
     # its existing tui_gateway.entry-owned thread.
-    if not hosted_static_mcp:
-        try:
-            from hermes_cli.mcp_startup import wait_for_mcp_discovery
+    try:
+        from hermes_cli.mcp_startup import wait_for_mcp_discovery
 
-            wait_for_mcp_discovery()
-        except Exception:
-            pass
-        try:
-            from tui_gateway.entry import wait_for_mcp_discovery
+        wait_for_mcp_discovery()
+    except Exception:
+        pass
+    try:
+        from tui_gateway.entry import wait_for_mcp_discovery
 
-            wait_for_mcp_discovery()
-        except Exception:
-            pass
+        wait_for_mcp_discovery()
+    except Exception:
+        pass
 
     cfg = _load_cfg()
     agent_cfg = cfg.get("agent") or {}
@@ -6356,7 +6369,7 @@ def _make_agent(
             # the entry identity from the persisted base_url, falling back to
             # the configured provider when the override carries no base_url
             # (the recurring Desktop/TUI regression vector).
-            from agent.runtime_provider import canonical_custom_identity
+            from hermes_cli.runtime_provider import canonical_custom_identity
 
             recovered = canonical_custom_identity(
                 base_url=override_base_url or None, model=model or None
@@ -6401,10 +6414,7 @@ def _make_agent(
                 raise RuntimeError("Auth fallback resolved without a model")
             model = resolution.selected_model
     _pr = _load_provider_routing()
-    resolved_platform = _resolve_agent_platform(platform_override)
-    ignore_rules = is_truthy_value(os.environ.get("HERMES_IGNORE_RULES"))
-    hosted_mobile = resolved_platform == "dashboard-group"
-    agent = AIAgent(
+    return AIAgent(
         model=model,
         max_iterations=_cfg_max_turns(cfg, 500),
         provider=runtime.get("provider"),
@@ -6440,21 +6450,17 @@ def _make_agent(
         provider_sort=_pr.get("sort"),
         provider_require_parameters=_pr.get("require_parameters", False),
         provider_data_collection=_pr.get("data_collection"),
-        platform=resolved_platform,
+        platform=_resolve_agent_platform(platform_override),
         session_id=session_id or key,
         session_db=session_db if session_db is not None else _get_db(),
         ephemeral_system_prompt=system_prompt or None,
         checkpoints_enabled=is_truthy_value(os.environ.get("HERMES_TUI_CHECKPOINTS")),
         pass_session_id=is_truthy_value(os.environ.get("HERMES_TUI_PASS_SESSION_ID")),
-        skip_context_files=ignore_rules or hosted_mobile,
-        load_soul_identity=hosted_mobile,
-        skip_memory=ignore_rules,
+        skip_context_files=is_truthy_value(os.environ.get("HERMES_IGNORE_RULES")),
+        skip_memory=is_truthy_value(os.environ.get("HERMES_IGNORE_RULES")),
         fallback_model=_load_fallback_model(),
         **_agent_cbs(sid),
     )
-    if hosted_static_mcp:
-        agent._skip_mcp_refresh = True
-    return agent
 
 
 def _init_session(
@@ -7606,66 +7612,6 @@ def _emit_terminal_turn_error(sid: str, session: dict, error: Any) -> None:
     _emit("message.complete", sid, payload)
 
 
-def _set_mobile_notification_context(session: dict, params: dict) -> None:
-    """Attach the cloud conversation turn that owns this agent run.
-
-    These identifiers route an eventual APNs deep link. They never select a
-    Hermes home or partition server-side business data.
-    """
-    conversation_id = str(params.get("conversation_id") or "").strip()
-    turn_id = str(params.get("turn_id") or "").strip()
-    owner_id = str(params.get("owner_id") or "").strip()
-    if not conversation_id or not turn_id or not owner_id:
-        return
-    session["mobile_notification_context"] = {
-        "owner_id": owner_id[:512],
-        "conversation_id": conversation_id[:256],
-        "turn_id": turn_id[:256],
-    }
-
-
-def _schedule_mobile_turn_notification(
-    session: dict,
-    *,
-    status: str,
-    result: str,
-) -> bool:
-    """Schedule at most one completion push for the current mobile turn."""
-    context = session.get("mobile_notification_context")
-    if not isinstance(context, dict):
-        return False
-    conversation_id = str(context.get("conversation_id") or "").strip()
-    turn_id = str(context.get("turn_id") or "").strip()
-    owner_id = str(context.get("owner_id") or "").strip()
-    if not conversation_id or not turn_id or not owner_id:
-        return False
-    if session.get("mobile_notification_sent_turn_id") == turn_id:
-        return False
-
-    normalized_status = {
-        "complete": "completed",
-        "completed": "completed",
-        "error": "failed",
-    }.get(str(status or "").strip().lower(), str(status or "failed").strip().lower())
-    try:
-        from hermes_cli.dashboard_auth.mobile_notifications import (
-            schedule_task_completion_push,
-        )
-
-        schedule_task_completion_push(
-            owner_id=owner_id,
-            conversation_id=conversation_id,
-            turn_id=turn_id,
-            status=normalized_status,
-            result=str(result or ""),
-        )
-    except Exception as exc:
-        logger.warning("mobile turn notification scheduling failed: %s", exc)
-        return False
-    session["mobile_notification_sent_turn_id"] = turn_id
-    return True
-
-
 def _queued_prompt_snapshot(session: dict) -> dict | None:
     """Return the accepted next-turn prompt without its transport handle.
 
@@ -8125,7 +8071,7 @@ def _pet_config_scale() -> float:
     from agent.pet import constants
 
     try:
-        from hermes_runtime.config import load_config
+        from hermes_cli.config import load_config
 
         cfg = load_config()
         display = cfg.get("display", {}) if isinstance(cfg.get("display"), dict) else {}
@@ -8183,7 +8129,7 @@ def _pet_active_selection():
     from agent.pet import constants, store
 
     try:
-        from hermes_runtime.config import load_config
+        from hermes_cli.config import load_config
 
         cfg = load_config()
         display = cfg.get("display", {}) if isinstance(cfg.get("display"), dict) else {}
@@ -9540,7 +9486,7 @@ def _run_prompt_submit(
                         decide_image_input_mode,
                         build_native_content_parts,
                     )
-                    from hermes_runtime.config import load_config as _tui_load_config
+                    from hermes_cli.config import load_config as _tui_load_config
 
                     _cfg = _tui_load_config()
                     _provider, _model = _active_image_routing_identity(agent)
@@ -10645,7 +10591,7 @@ def _(rid, params: dict) -> dict:
 
         overrides = None
         if nv == "fast":
-            from agent.model_catalog import resolve_fast_mode_overrides
+            from hermes_cli.models import resolve_fast_mode_overrides
 
             if agent is not None:
                 target_model = getattr(agent, "model", None)
@@ -11988,7 +11934,7 @@ def _list_repo_files(root: str) -> list[str]:
             return cached[1]
 
     files: list[str] = []
-    from hermes_runtime.subprocess_compat import windows_hide_flags
+    from hermes_cli._subprocess_compat import windows_hide_flags
 
     _creationflags = windows_hide_flags()
     try:
@@ -13698,7 +13644,7 @@ def _resolve_browser_cdp_url() -> str:
     if env_url:
         return env_url
     try:
-        from hermes_runtime.config import read_raw_config
+        from hermes_cli.config import read_raw_config
 
         cfg = read_raw_config()
         browser_cfg = cfg.get("browser", {}) if isinstance(cfg, dict) else {}

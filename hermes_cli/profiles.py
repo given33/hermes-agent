@@ -32,11 +32,9 @@ import time
 from collections import OrderedDict
 from dataclasses import dataclass
 from pathlib import Path, PurePosixPath, PureWindowsPath
-from typing import Any, List, Optional, Tuple
+from typing import List, Optional, Tuple
 
-from hermes_runtime.skill_utils import is_excluded_skill_path
-from hermes_runtime.config import read_raw_config
-from hermes_runtime import process_probe
+from agent.skill_utils import is_excluded_skill_path
 
 _PROFILE_ID_RE = re.compile(r"^[a-z0-9][a-z0-9_-]{0,63}$")
 
@@ -136,27 +134,12 @@ _CLONE_ALL_HISTORY_EXCLUDE_ROOT: frozenset[str] = frozenset({
 # `hermes skills install` or drop SKILL.md files into the profile's skills/.
 # Delete the marker file to opt back in.
 NO_BUNDLED_SKILLS_MARKER = ".no-bundled-skills"
-MANAGED_INTERNAL_PROFILE_MARKER = ".managed-owner-boundary.json"
 
 
 def has_bundled_skills_opt_out(profile_dir: Path) -> bool:
     """Return True if the profile opted out of bundled-skill seeding."""
     try:
         return (profile_dir / NO_BUNDLED_SKILLS_MARKER).exists()
-    except OSError:
-        return False
-
-
-def _is_managed_internal_profile(profile_dir: Path) -> bool:
-    """Return True for account overlays that must stay out of public profile UI."""
-
-    try:
-        marker = profile_dir / MANAGED_INTERNAL_PROFILE_MARKER
-        return (
-            profile_dir.name.startswith("acct-")
-            and marker.is_file()
-            and not marker.is_symlink()
-        )
     except OSError:
         return False
 
@@ -539,7 +522,7 @@ def _migrate_profile_config_if_outdated(profile_dir: Path) -> None:
 
     try:
         from hermes_constants import reset_hermes_home_override, set_hermes_home_override
-        from hermes_runtime.config import check_config_version, migrate_config
+        from hermes_cli.config import check_config_version, migrate_config
 
         token = set_hermes_home_override(str(profile_dir))
         try:
@@ -553,101 +536,6 @@ def _migrate_profile_config_if_outdated(profile_dir: Path) -> None:
         # not be migrated. The next `hermes doctor --fix` can still surface the
         # detailed error in the target profile.
         pass
-
-
-def _install_managed_ios_mcp_for_profile(profile_dir: Path) -> None:
-    """Merge the managed iOS MCP fleet into one profile's config.
-
-    Profiles are independent HERMES_HOME roots; installing the fleet only in
-    the root profile leaves a newly-created profile without the 21 servers.
-    The merge is idempotent and keeps explicit enabled/scope overrides. The
-    root profile is also the discovery source for transport endpoints: a
-    production streamable-HTTP fleet (including blue-green port changes) must
-    not be replaced by the install helper's stdio defaults.
-    """
-
-    try:
-        import copy
-
-        from hermes_cli import config as config_module
-        from hermes_constants import reset_hermes_home_override, set_hermes_home_override
-        from hermes_cli.ios_mcp_server import (
-            CAPABILITIES,
-            install_ios_mcp_servers,
-            normalize_mcp_scope_grants,
-        )
-
-        profile_dir = profile_dir.resolve()
-        default_home = _get_default_hermes_home().resolve()
-
-        def _read_config(home: Path) -> dict:
-            token = set_hermes_home_override(str(home))
-            try:
-                return dict(config_module.read_raw_config() or {})
-            finally:
-                reset_hermes_home_override(token)
-
-        source_config = _read_config(default_home)
-        source_servers = source_config.get("mcp_servers")
-        has_managed_source = (
-            isinstance(source_servers, dict)
-            and all(isinstance(source_servers.get(name), dict) for name in CAPABILITIES)
-        )
-
-        # The default profile already owns the canonical managed endpoints.
-        # Do not run the stdio installer over a complete HTTP fleet.
-        if profile_dir == default_home and has_managed_source:
-            return
-
-        if has_managed_source:
-            target_config = _read_config(profile_dir)
-            raw_target_servers = target_config.get("mcp_servers")
-            target_servers = (
-                copy.deepcopy(raw_target_servers)
-                if isinstance(raw_target_servers, dict)
-                else {}
-            )
-            changed = False
-            for capability in CAPABILITIES:
-                desired = copy.deepcopy(source_servers[capability])
-                prior = target_servers.get(capability)
-                if isinstance(prior, dict):
-                    desired["enabled"] = prior.get(
-                        "enabled", desired.get("enabled", True),
-                    )
-                    if "granted_scopes" in prior:
-                        grants = normalize_mcp_scope_grants(
-                            capability,
-                            prior.get("granted_scopes") or (),
-                        )
-                        desired["granted_scopes"] = list(grants)
-                        if "command" in desired:
-                            args = ["-m", "hermes_cli.ios_mcp_server"]
-                            for scope in grants:
-                                args.extend(["--grant-scope", scope])
-                            args.append(capability)
-                            desired["args"] = args
-                if prior != desired:
-                    target_servers[capability] = desired
-                    changed = True
-            if changed:
-                target_config["mcp_servers"] = target_servers
-                token = set_hermes_home_override(str(profile_dir))
-                try:
-                    config_module.save_config(target_config)
-                finally:
-                    reset_hermes_home_override(token)
-            return
-
-        token = set_hermes_home_override(str(profile_dir))
-        try:
-            install_ios_mcp_servers()
-        finally:
-            reset_hermes_home_override(token)
-    except Exception:
-        # A profile can still be used without the optional iOS MCP runtime; a
-        # later startup retry repairs the managed entries.
-        return
 
 
 def find_alias_for_profile(profile_name: str) -> Optional[str]:
@@ -1035,8 +923,6 @@ def list_profiles() -> List[ProfileInfo]:
         for entry in sorted(profiles_root.iterdir()):
             if not entry.is_dir():
                 continue
-            if _is_managed_internal_profile(entry):
-                continue
             name = entry.name
             if name == "default":
                 continue  # already added as the built-in default above
@@ -1102,8 +988,6 @@ def profiles_to_serve(multiplex: bool) -> List[Tuple[str, Path]]:
     if profiles_root.is_dir():
         for entry in sorted(profiles_root.iterdir()):
             if not entry.is_dir():
-                continue
-            if _is_managed_internal_profile(entry):
                 continue
             name = entry.name
             if name == "default":
@@ -1258,7 +1142,7 @@ def create_profile(
     soul_path = profile_dir / "SOUL.md"
     if not soul_path.exists():
         try:
-            from hermes_runtime.default_soul import DEFAULT_SOUL_MD
+            from hermes_cli.default_soul import DEFAULT_SOUL_MD
             soul_path.write_text(DEFAULT_SOUL_MD, encoding="utf-8")
         except Exception:
             pass  # best-effort — don't fail profile creation over this
@@ -1296,13 +1180,6 @@ def create_profile(
             )
         except Exception:
             pass  # non-fatal — user can describe later with `hermes profile describe`
-
-    # Install the managed iOS MCP fleet before returning the new profile.  A
-    # profile can be selected by a multiplexed gateway immediately after this
-    # function returns, so waiting for a later profile switch/startup leaves a
-    # window where ordinary chats cannot discover the managed tools.  The
-    # helper is idempotent and preserves explicit enabled/scope overrides.
-    _install_managed_ios_mcp_for_profile(profile_dir)
 
     # Phase 4: when running inside a container under s6, register the
     # new profile's gateway as a runtime s6 service so
@@ -1538,7 +1415,7 @@ def _stop_profile_backends(canon: str, profile_dir: Path) -> None:
         return
 
     try:
-        from gateway.status import terminate_pid as _terminate_pid
+        from gateway.status import _pid_exists, terminate_pid as _terminate_pid
     except Exception:
         return
 
@@ -1551,12 +1428,12 @@ def _stop_profile_backends(canon: str, profile_dir: Path) -> None:
     # Wait up to 10s for graceful exit, then force-kill stragglers.
     deadline = time.time() + 10.0
     while time.time() < deadline:
-        if not any(process_probe.pid_exists(pid) for pid in pids):
+        if not any(_pid_exists(pid) for pid in pids):
             break
         time.sleep(0.5)
 
     for pid in pids:
-        if process_probe.pid_exists(pid):
+        if _pid_exists(pid):
             try:
                 _terminate_pid(pid, force=True)
             except (ProcessLookupError, PermissionError, OSError):
@@ -1899,12 +1776,13 @@ def _stop_gateway_process(profile_dir: Path) -> None:
         # and raw os.kill with SIGTERM doesn't cascade to child processes
         # the same way taskkill /T does.
         from gateway.status import terminate_pid as _terminate_pid
+        from gateway.status import _pid_exists
         _terminate_pid(pid)  # graceful first
         # Wait up to 10s for graceful shutdown. On Windows, os.kill(pid, 0)
         # is NOT a no-op — use the handle-based existence check.
         for _ in range(20):
             _time.sleep(0.5)
-            if not process_probe.pid_exists(pid):
+            if not _pid_exists(pid):
                 print(f"✓ Gateway stopped (PID {pid})")
                 return
         # Force kill
@@ -1951,11 +1829,6 @@ def set_active_profile(name: str) -> None:
             f"Create it with: hermes profile create {canon}"
         )
 
-    # Profile switching is also a lifecycle boundary for managed services.
-    # Repair profiles cloned before the iOS MCP fleet was installed before
-    # making one the sticky target for subsequent Hermes processes.
-    _install_managed_ios_mcp_for_profile(get_profile_dir(canon))
-
     path = _get_active_profile_path()
     path.parent.mkdir(parents=True, exist_ok=True)
     if canon == "default":
@@ -1969,10 +1842,30 @@ def set_active_profile(name: str) -> None:
 
 
 def get_active_profile_name() -> str:
-    """Compatibility export for the runtime-owned profile identity helper."""
-    from hermes_runtime.profile_identity import get_active_profile_name as resolve
+    """Infer the current profile name from HERMES_HOME.
 
-    return resolve()
+    Returns ``"default"`` if HERMES_HOME is not set or points to ``~/.hermes``.
+    Returns the profile name if HERMES_HOME points into ``~/.hermes/profiles/<name>``.
+    Returns ``"custom"`` if HERMES_HOME is set to an unrecognized path.
+    """
+    from hermes_constants import get_hermes_home
+    hermes_home = get_hermes_home()
+    resolved = hermes_home.resolve()
+
+    default_resolved = _get_default_hermes_home().resolve()
+    if resolved == default_resolved:
+        return "default"
+
+    profiles_root = _get_profiles_root().resolve()
+    try:
+        rel = resolved.relative_to(profiles_root)
+        parts = rel.parts
+        if len(parts) == 1 and _PROFILE_ID_RE.match(parts[0]):
+            return parts[0]
+    except ValueError:
+        pass
+
+    return "custom"
 
 
 # ---------------------------------------------------------------------------
@@ -2016,206 +1909,6 @@ def _default_export_ignore(root_dir: Path):
     return _ignore
 
 
-_PROFILE_SECRET_KEYS = frozenset({
-    "api_key",
-    "apikey",
-    "access_token",
-    "refresh_token",
-    "auth_token",
-    "session_token",
-    "token",
-    "password",
-    "passwd",
-    "secret",
-    "private_key",
-    "client_secret",
-})
-_PROFILE_CREDENTIAL_KEYS = frozenset({
-    "credential",
-    "credentials",
-    "credential_ref",
-    "credential_reference",
-})
-_PROFILE_INLINE_SECRET_RE = re.compile(
-    r"(?im)(\b(?:api[_ -]?key|access[_ -]?token|refresh[_ -]?token|"
-    r"auth[_ -]?token|session[_ -]?token|password|passwd|secret|"
-    r"client[_ -]?secret)\b\s*[:=]\s*)([^\s,;]+)"
-)
-_PROFILE_BEARER_RE = re.compile(r"(?i)(\bBearer\s+)[A-Za-z0-9._~+/=-]{8,}")
-_PROFILE_STRUCTURED_SUFFIXES = frozenset({".json", ".yaml", ".yml"})
-_PROFILE_TEXT_SUFFIXES = frozenset({
-    "", ".conf", ".ini", ".json", ".md", ".toml", ".txt", ".yaml", ".yml",
-})
-
-
-def _profile_secret_key(key: Any, *, credential_context: bool = False) -> bool:
-    normalized = re.sub(r"[^a-z0-9]+", "_", str(key).strip().lower()).strip("_")
-    if normalized == "credentials_configured":
-        return False
-    if normalized in _PROFILE_SECRET_KEYS or normalized.endswith("_api_key"):
-        return True
-    return credential_context and normalized in {"value", "ref", "reference"}
-
-
-def _credential_summary(value: Any) -> dict[str, Any]:
-    provider = ""
-    configured = False
-    if isinstance(value, dict):
-        provider = str(
-            value.get("provider") or value.get("name") or value.get("type") or ""
-        ).strip()
-        configured = bool(value.get("configured")) or any(
-            _profile_secret_key(key, credential_context=True) and bool(item)
-            for key, item in value.items()
-        )
-    else:
-        configured = bool(value)
-    summary: dict[str, Any] = {"configured": configured}
-    if provider:
-        summary["provider"] = provider
-    return summary
-
-
-def _redact_profile_export_value(value: Any) -> tuple[Any, int]:
-    if isinstance(value, dict):
-        result: dict[str, Any] = {}
-        removed = 0
-        credentials_configured = False
-        for key, item in value.items():
-            normalized = re.sub(
-                r"[^a-z0-9]+", "_", str(key).strip().lower()
-            ).strip("_")
-            if normalized in _PROFILE_CREDENTIAL_KEYS:
-                if isinstance(item, list):
-                    result[str(key)] = [_credential_summary(entry) for entry in item]
-                else:
-                    result[str(key)] = _credential_summary(item)
-                removed += 1
-                continue
-            if _profile_secret_key(key):
-                credentials_configured = credentials_configured or bool(item)
-                removed += 1
-                continue
-            clean, count = _redact_profile_export_value(item)
-            result[str(key)] = clean
-            removed += count
-        if credentials_configured:
-            result["credentials_configured"] = True
-        return result, removed
-    if isinstance(value, list):
-        clean_list = []
-        removed = 0
-        for item in value:
-            clean, count = _redact_profile_export_value(item)
-            clean_list.append(clean)
-            removed += count
-        return clean_list, removed
-    return value, 0
-
-
-def _scan_profile_export_value(value: Any, path: str = "$") -> list[str]:
-    findings: list[str] = []
-    if isinstance(value, dict):
-        for key, item in value.items():
-            child = f"{path}.{key}"
-            if _profile_secret_key(key):
-                findings.append(child)
-            findings.extend(_scan_profile_export_value(item, child))
-    elif isinstance(value, list):
-        for index, item in enumerate(value):
-            findings.extend(_scan_profile_export_value(item, f"{path}[{index}]"))
-    elif isinstance(value, str):
-        if _PROFILE_INLINE_SECRET_RE.search(value) or _PROFILE_BEARER_RE.search(value):
-            findings.append(path)
-    return findings
-
-
-def _sanitize_profile_export_tree(staged: Path) -> dict[str, int]:
-    scanned = 0
-    redactions = 0
-    residual: list[str] = []
-    for path in staged.rglob("*"):
-        if path.is_symlink() or not path.is_file() or path.suffix.lower() not in _PROFILE_TEXT_SUFFIXES:
-            continue
-        if path.stat().st_size > 16 * 1024 * 1024:
-            continue
-        scanned += 1
-        try:
-            text = path.read_text(encoding="utf-8")
-        except UnicodeDecodeError:
-            continue
-        parsed: Any = None
-        structured = path.suffix.lower() in _PROFILE_STRUCTURED_SUFFIXES
-        if structured:
-            try:
-                if path.suffix.lower() == ".json":
-                    parsed = json.loads(text)
-                else:
-                    import yaml
-
-                    parsed = yaml.safe_load(text)
-            except Exception:
-                structured = False
-        if structured:
-            clean, count = _redact_profile_export_value(parsed)
-            redactions += count
-            if count:
-                if path.suffix.lower() == ".json":
-                    rendered = json.dumps(clean, ensure_ascii=False, indent=2) + "\n"
-                else:
-                    import yaml
-
-                    rendered = yaml.safe_dump(clean, sort_keys=False, allow_unicode=True)
-                path.write_text(rendered, encoding="utf-8")
-            residual.extend(
-                f"{path.relative_to(staged).as_posix()}:{item}"
-                for item in _scan_profile_export_value(clean)
-            )
-        else:
-            clean, labelled = _PROFILE_INLINE_SECRET_RE.subn(r"\1[REDACTED]", text)
-            clean, bearer = _PROFILE_BEARER_RE.subn(r"\1[REDACTED]", clean)
-            redactions += labelled + bearer
-            if clean != text:
-                path.write_text(clean, encoding="utf-8")
-            if _PROFILE_INLINE_SECRET_RE.search(clean) or _PROFILE_BEARER_RE.search(clean):
-                residual.append(path.relative_to(staged).as_posix())
-    if residual:
-        raise RuntimeError(
-            "Profile export secret scanner blocked residual credential fields: "
-            + ", ".join(residual[:10])
-        )
-    return {"files_scanned": scanned, "redactions": redactions, "findings": 0}
-
-
-def _record_profile_export_audit(
-    profile: str,
-    output: Path,
-    scan: dict[str, int],
-    *,
-    status: str,
-) -> None:
-    audit = _get_profiles_root().parent / "audit" / "profile-exports.jsonl"
-    audit.parent.mkdir(parents=True, exist_ok=True)
-    record = {
-        "event": "profile.export",
-        "profile": profile,
-        "archive_name": output.name,
-        "status": status,
-        "files_scanned": int(scan.get("files_scanned") or 0),
-        "redactions": int(scan.get("redactions") or 0),
-        "findings": int(scan.get("findings") or 0),
-        "created_at": int(time.time()),
-    }
-    with audit.open("a", encoding="utf-8") as handle:
-        handle.write(json.dumps(record, ensure_ascii=False, separators=(",", ":")) + "\n")
-        handle.flush()
-        os.fsync(handle.fileno())
-    try:
-        audit.chmod(stat.S_IRUSR | stat.S_IWUSR)
-    except OSError:
-        pass
-
-
 def export_profile(name: str, output_path: str) -> Path:
     """Export a profile to a tar.gz archive.
 
@@ -2245,20 +1938,7 @@ def export_profile(name: str, output_path: str) -> Path:
                 symlinks=True,
                 ignore=_default_export_ignore(profile_dir),
             )
-            try:
-                scan = _sanitize_profile_export_tree(staged)
-            except Exception:
-                _record_profile_export_audit(
-                    canon,
-                    output,
-                    {"files_scanned": 0, "redactions": 0, "findings": 1},
-                    status="blocked",
-                )
-                raise
             result = shutil.make_archive(base, "gztar", tmpdir, "default")
-            _record_profile_export_audit(
-                canon, Path(result), scan, status="completed"
-            )
             return Path(result)
 
     # Named profiles — stage a filtered copy to exclude credentials
@@ -2271,18 +1951,7 @@ def export_profile(name: str, output_path: str) -> Path:
             symlinks=True,
             ignore=lambda d, contents: _CREDENTIAL_FILES & set(contents),
         )
-        try:
-            scan = _sanitize_profile_export_tree(staged)
-        except Exception:
-            _record_profile_export_audit(
-                canon,
-                output,
-                {"files_scanned": 0, "redactions": 0, "findings": 1},
-                status="blocked",
-            )
-            raise
         result = shutil.make_archive(base, "gztar", tmpdir, canon)
-        _record_profile_export_audit(canon, Path(result), scan, status="completed")
         return Path(result)
 
 
@@ -2565,5 +2234,4 @@ def resolve_profile_env(profile_name: str) -> str:
             f"Create it with: hermes profile create {canon}"
         )
 
-    _install_managed_ios_mcp_for_profile(profile_dir)
     return str(profile_dir)

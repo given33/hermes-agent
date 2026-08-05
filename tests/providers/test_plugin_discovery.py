@@ -9,9 +9,7 @@ Verifies that:
 from __future__ import annotations
 
 import sys
-import threading
 from pathlib import Path
-from types import SimpleNamespace
 
 
 
@@ -125,55 +123,3 @@ def test_user_plugin_overrides_bundled(tmp_path, monkeypatch):
     # No import means the module must NOT be in the plugins list as a loaded one.
     # We check that the general loader didn't crash and didn't raise from the
     # broken __init__.py.
-
-
-def test_concurrent_lookup_waits_for_complete_discovery(monkeypatch):
-    import providers as provider_module
-
-    original_registry = dict(provider_module._REGISTRY)
-    original_aliases = dict(provider_module._ALIASES)
-    original_discovered = provider_module._discovered
-    halfway = threading.Event()
-    release = threading.Event()
-    lookup_done = threading.Event()
-    result = []
-
-    def delayed_discovery():
-        provider_module.register_provider(SimpleNamespace(name="first", aliases=()))
-        halfway.set()
-        assert release.wait(timeout=5)
-        provider_module.register_provider(SimpleNamespace(name="second", aliases=()))
-
-    try:
-        provider_module._REGISTRY.clear()
-        provider_module._ALIASES.clear()
-        provider_module._discovered = False
-        monkeypatch.setattr(
-            provider_module, "_discover_providers_unlocked", delayed_discovery
-        )
-
-        discoverer = threading.Thread(target=provider_module.list_providers)
-        discoverer.start()
-        assert halfway.wait(timeout=5)
-
-        def lookup():
-            result.append(provider_module.get_provider_profile("second"))
-            lookup_done.set()
-
-        reader = threading.Thread(target=lookup)
-        reader.start()
-        assert not lookup_done.wait(timeout=0.1)
-        release.set()
-        discoverer.join(timeout=5)
-        reader.join(timeout=5)
-
-        assert not discoverer.is_alive() and not reader.is_alive()
-        assert result and result[0].name == "second"
-    finally:
-        release.set()
-        with provider_module._DISCOVERY_LOCK:
-            provider_module._REGISTRY.clear()
-            provider_module._REGISTRY.update(original_registry)
-            provider_module._ALIASES.clear()
-            provider_module._ALIASES.update(original_aliases)
-            provider_module._discovered = original_discovered

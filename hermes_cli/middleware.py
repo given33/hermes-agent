@@ -1,4 +1,9 @@
-"""Compatibility alias for :mod:`hermes_services.middleware`."""
+"""Hermes middleware contract helpers.
+
+Observer hooks report what happened. Middleware can change what happens by
+rewriting a request or wrapping the actual execution callback. Keep the small
+contract helpers here so agent-loop call sites and plugins share one vocabulary.
+"""
 
 from __future__ import annotations
 
@@ -7,7 +12,7 @@ from copy import deepcopy
 from dataclasses import dataclass, field
 from typing import Any, Callable, Dict, List
 
-from hermes_services import middleware as _implementation
+logger = logging.getLogger(__name__)
 
 OBSERVER_SCHEMA_VERSION = "hermes.observer.v1"
 MIDDLEWARE_SCHEMA_VERSION = "hermes.middleware.v1"

@@ -1,4 +1,4 @@
-"""Compatibility alias for the Agent mixture-of-agents configuration model."""
+"""Mixture-of-Agents configuration and slash-command helpers."""
 
 from __future__ import annotations
 
@@ -8,9 +8,8 @@ import math
 from copy import deepcopy
 from typing import Any
 
-from agent import moa_config as _implementation
-
-DEFAULT_MOA_PRESET_NAME = _implementation.DEFAULT_MOA_PRESET_NAME
+MOA_MARKER_PREFIX = "__HERMES_MOA_TURN_V1__"
+DEFAULT_MOA_PRESET_NAME = "default"
 
 DEFAULT_MOA_REFERENCE_MODELS: list[dict[str, str]] = [
     {"provider": "openai-codex", "model": "gpt-5.5"},

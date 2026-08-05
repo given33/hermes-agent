@@ -5,7 +5,7 @@ import {
   SETTLEMENT_POLL_INTERVAL_MS
 } from '@hermes/shared/charge-settlement'
 import { useQueryClient } from '@tanstack/react-query'
-import { useCallback, useEffect, useRef, useState } from 'react'
+import { useCallback, useRef, useState } from 'react'
 
 import type { BillingApi, BillingRefusal } from './api'
 import { useBillingApi } from './api'
@@ -77,11 +77,13 @@ export async function pollChargeSettlement(
       if (result.ok) {
         observed.refusal = undefined
         observed.status = result.data
+
         return result.data
       }
 
       observed.refusal = result.refusal
       observed.status = statusFromRefusal(result.refusal)
+
       return observed.status
     },
     isCancelled: () => false,
@@ -105,7 +107,6 @@ export async function pollChargeSettlement(
         retryFreshKey: true,
         title: 'Charge failed'
       }
-
     case 'ambiguous': {
       if (settlement.status && refusalPolicy(settlement.error).ambiguousMidPoll) {
         const refusal = observed.refusal ?? refusalFromStatus(settlement.error, settlement.status)
@@ -137,6 +138,7 @@ export async function pollChargeSettlement(
       }
 
     case 'cancelled':
+
     case 'timed_out':
       return timeoutOutcome(observed.status?.ok ? (observed.status.portal_url ?? opts.portalUrl) : opts.portalUrl)
   }
@@ -178,12 +180,6 @@ export function useChargeFlow() {
   const phaseRef = useRef<ChargeFlowPhase>('idle')
   const retryIntentRef = useRef<PendingChargeIntent | null>(null)
 
-  useEffect(() => {
-    if (phase === 'done' && outcome?.kind === 'success') {
-      void queryClient.invalidateQueries({ queryKey: ['billing', 'state'] })
-    }
-  }, [outcome, phase, queryClient])
-
   const setPhaseState = useCallback((next: ChargeFlowPhase) => {
     phaseRef.current = next
     setPhase(next)
@@ -211,6 +207,7 @@ export function useChargeFlow() {
 
       if (!chargeResult.ok) {
         const resolved = resolveRefusal(chargeResult.refusal)
+
         const action =
           resolved.action.type === 'portal'
             ? ({ type: 'portal', url: resolved.action.url } as const)
@@ -231,10 +228,12 @@ export function useChargeFlow() {
           title: resolved.title
         })
         setPhaseState('done')
+
         return
       }
 
       retryIntentRef.current = null
+
       const chargeId = chargeResult.data.charge_id
 
       if (!chargeId) {
@@ -245,18 +244,24 @@ export function useChargeFlow() {
           title: 'Charge could not be tracked'
         })
         setPhaseState('done')
+
         return
       }
 
       setPhaseState('polling')
+
       const pollOutcome = await pollChargeSettlement(api, chargeId, {
         portalUrl: chargeResult.data.portal_url
       })
+
       setOutcome(pollOutcome)
       setPhaseState('done')
 
+      if (pollOutcome.kind === 'success') {
+        void queryClient.invalidateQueries({ queryKey: ['billing', 'state'] })
+      }
     },
-    [api, setPhaseState]
+    [api, queryClient, setPhaseState]
   )
 
   return { outcome, phase, reset, start }

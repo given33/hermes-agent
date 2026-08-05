@@ -19,8 +19,6 @@ from __future__ import annotations
 
 import logging
 import os
-import threading
-from collections import OrderedDict
 from pathlib import Path
 from typing import Iterable, Optional, Tuple
 
@@ -29,17 +27,7 @@ logger = logging.getLogger("agent.lsp.workspace")
 # Cache: cwd → (worktree_root, is_git) so repeated calls don't re-stat.
 # Cleared on shutdown.  Keyed by absolute resolved path so symlink
 # folds collapse to one entry.
-_WORKSPACE_CACHE_MAX = 256
-_workspace_cache: OrderedDict[str, Tuple[Optional[str], bool]] = OrderedDict()
-_workspace_cache_lock = threading.Lock()
-
-
-def _cache_workspace(key: str, value: Tuple[Optional[str], bool]) -> None:
-    with _workspace_cache_lock:
-        _workspace_cache[key] = value
-        _workspace_cache.move_to_end(key)
-        while len(_workspace_cache) > _WORKSPACE_CACHE_MAX:
-            _workspace_cache.popitem(last=False)
+_workspace_cache: dict = {}
 
 
 def normalize_path(path: str) -> str:
@@ -50,18 +38,7 @@ def normalize_path(path: str) -> str:
     LSP servers (rust-analyzer cares about Cargo workspace identity)
     and we want the canonical path the user typed when possible.
     """
-    raw = os.fspath(path)
-    # ``ntpath.expanduser`` ignores HOME when USERPROFILE is present, while
-    # Hermes profiles and Unix-compatible test/deployment shells explicitly
-    # use HOME. Honor that contract for the current-user shorthand on every
-    # platform; retain the stdlib behavior for named-user forms.
-    if raw == "~" or raw.startswith(("~/", "~\\")):
-        home = os.environ.get("HOME") or os.path.expanduser("~")
-        suffix = raw[2:] if len(raw) > 1 else ""
-        expanded = os.path.join(home, suffix) if suffix else home
-    else:
-        expanded = os.path.expanduser(raw)
-    return os.path.abspath(expanded)
+    return os.path.abspath(os.path.expanduser(path))
 
 
 def find_git_worktree(start: str) -> Optional[str]:
@@ -83,11 +60,7 @@ def find_git_worktree(start: str) -> Optional[str]:
         return None
 
     # Cache check
-    cache_key = str(start_path)
-    with _workspace_cache_lock:
-        cached = _workspace_cache.get(cache_key)
-        if cached is not None:
-            _workspace_cache.move_to_end(cache_key)
+    cached = _workspace_cache.get(str(start_path))
     if cached is not None:
         root, _is_git = cached
         return root
@@ -101,7 +74,7 @@ def find_git_worktree(start: str) -> Optional[str]:
         try:
             if git_marker.exists():
                 resolved = str(cur)
-                _cache_workspace(cache_key, (resolved, True))
+                _workspace_cache[str(start_path)] = (resolved, True)
                 return resolved
         except OSError:
             # Permission error on a parent dir — bail out cleanly.
@@ -111,7 +84,7 @@ def find_git_worktree(start: str) -> Optional[str]:
             break
         cur = parent
 
-    _cache_workspace(cache_key, (None, False))
+    _workspace_cache[str(start_path)] = (None, False)
     return None
 
 
@@ -237,8 +210,7 @@ def clear_cache() -> None:
     Called on service shutdown so a subsequent re-init doesn't pick
     up stale results from a previous session.
     """
-    with _workspace_cache_lock:
-        _workspace_cache.clear()
+    _workspace_cache.clear()
 
 
 __all__ = [

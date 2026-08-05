@@ -349,7 +349,7 @@ function ModelTable({ models }: { models: AnalyticsModelEntry[] }) {
 }
 
 function SkillTable({ skills }: { skills: AnalyticsSkillEntry[] }) {
-  const { locale, t } = useI18n();
+  const { t } = useI18n();
   const { sorted, sortKey, sortDir, toggle } = useTableSort(skills, "total_count", "desc");
 
   if (skills.length === 0) return null;
@@ -391,9 +391,7 @@ function SkillTable({ skills }: { skills: AnalyticsSkillEntry[] }) {
                   </td>
                   <td className="text-right py-2 px-4">{skill.total_count}</td>
                   <td className="text-right py-2 pl-4 text-muted-foreground">
-                    {skill.last_used_at
-                      ? timeAgo(skill.last_used_at, locale)
-                      : "—"}
+                    {skill.last_used_at ? timeAgo(skill.last_used_at) : "—"}
                   </td>
                 </tr>
               ))}

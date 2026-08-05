@@ -45,7 +45,7 @@ from hermes_cli.config import (
     get_env_value,
     save_env_value,
 )
-from hermes_runtime.console_output import prompt as _prompt_input
+from hermes_cli.cli_output import prompt as _prompt_input
 
 _MANIFEST_VERSION = 1
 

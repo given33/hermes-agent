@@ -19,32 +19,24 @@ import inspect
 from agent import conversation_loop
 
 
-def test_nous_provider_is_not_in_oauth_401_set():
+def test_nous_provider_is_in_oauth_401_set():
+    """The provider-set gate that selects OAuth-specific guidance must
+    include ``nous`` alongside ``openai-codex`` and ``xai-oauth``.
+    """
     source = inspect.getsource(conversation_loop.run_conversation)
 
-    assert '_provider in {"openai-codex", "xai-oauth"}' in source
-    assert '_provider in {"openai-codex", "xai-oauth", "nous"}' not in source
+    # Be flexible about set element ordering — assert all three are listed
+    # near each other in the gating expression.
+    assert "\"openai-codex\"" in source
+    assert "\"xai-oauth\"" in source
+    assert "\"nous\"" in source
 
-
-def test_nous_401_guidance_uses_direct_api_key_copy():
-    source = inspect.getsource(conversation_loop._nous_entitlement_message)
-    assert "NOUS_API_KEY" in source
-    assert "Portal" not in source
-
-
-def test_nous_account_refresh_is_disabled():
-    source = inspect.getsource(
-        conversation_loop._try_refresh_nous_paid_entitlement_credentials
-    )
-    assert "return False" in source
-    assert "get_nous_portal_account_info" not in source
-
-
-def test_nous_direct_key_quota_errors_do_not_link_to_a_portal_account():
-    from agent.provider_auth import AuthError, format_auth_error
-
-    rendered = format_auth_error(
-        AuthError("Nous API rejected the configured key", provider="nous", code="insufficient_credits")
+    # And the gate string itself must mention all three so future refactors
+    # that split nous off into its own gate still get caught.
+    needle = "_provider in {\"openai-codex\", \"xai-oauth\", \"nous\"}"
+    assert needle in source, (
+        "Expected nous to be co-gated with the other OAuth providers in the "
+        "actionable-401-guidance branch of run_conversation."
     )
 
 

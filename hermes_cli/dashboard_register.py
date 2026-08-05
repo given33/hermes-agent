@@ -185,7 +185,7 @@ def _print_post_register_hint(
     public_url: str = "",
 ) -> None:
     """Print the success summary + the gate-engagement caveat."""
-    from hermes_runtime.config import get_env_path
+    from hermes_cli.config import get_env_path
 
     env_path = get_env_path()
     _cid = client_id
@@ -230,7 +230,7 @@ def _print_post_register_hint(
 def cmd_dashboard_register(args) -> None:
     """Register a self-hosted dashboard OAuth client with Nous Portal."""
     from hermes_cli.auth import AuthError, resolve_nous_access_token
-    from hermes_runtime.config import get_env_value, is_managed, save_env_value
+    from hermes_cli.config import get_env_value, is_managed, save_env_value
 
     # Managed (Docker/hosted) installs get their dashboard OAuth client_id
     # stamped in by the orchestrator (NAS sets HERMES_DASHBOARD_OAUTH_CLIENT_ID

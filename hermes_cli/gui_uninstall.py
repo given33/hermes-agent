@@ -42,7 +42,7 @@ from pathlib import Path
 
 from hermes_constants import get_hermes_home
 
-from hermes_runtime.colors import Colors, color
+from hermes_cli.colors import Colors, color
 
 
 def log_info(msg: str):

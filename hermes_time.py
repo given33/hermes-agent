@@ -16,7 +16,7 @@ crashes due to a bad timezone string.
 import logging
 import os
 from datetime import datetime
-from hermes_runtime.config import read_raw_config
+from hermes_constants import get_config_path
 from typing import Optional
 
 logger = logging.getLogger(__name__)
@@ -51,12 +51,22 @@ def _resolve_timezone_name() -> str:
         # libyaml C loader) — a direct yaml.safe_load of a large config.yaml
         # costs ~100ms+ and this used to run inside the FIRST system prompt
         # build, on the time-to-first-token critical path.
-        cfg = read_raw_config() or {}
+        try:
+            from hermes_cli.config import read_raw_config
+            cfg = read_raw_config() or {}
+        except Exception:
+            import yaml
+            config_path = get_config_path()
+            if config_path.exists():
+                with open(config_path, encoding="utf-8") as f:
+                    cfg = yaml.safe_load(f) or {}
+            else:
+                cfg = {}
         if cfg:
             # Managed scope: an administrator can pin ``timezone`` too. Overlay
             # via the shared helper (fail-open) since this reads config.yaml directly.
             try:
-                from hermes_runtime import managed_scope
+                from hermes_cli import managed_scope
                 cfg = managed_scope.apply_managed_overlay(cfg)
             except Exception:
                 pass

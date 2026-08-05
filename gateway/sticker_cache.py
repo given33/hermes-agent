@@ -9,16 +9,15 @@ Cache location: ~/.hermes/sticker_cache.json
 """
 
 import json
+import os
+import tempfile
 import time
-from pathlib import Path
 from typing import Optional
 
-from hermes_runtime.config import get_hermes_home
-from utils import advisory_file_lock, atomic_json_write
+from hermes_cli.config import get_hermes_home
 
 
 CACHE_PATH = get_hermes_home() / "sticker_cache.json"
-_IMPORT_CACHE_PATH = CACHE_PATH
 
 # Vision prompt for describing stickers -- kept concise to save tokens
 STICKER_VISION_PROMPT = (
@@ -27,27 +26,34 @@ STICKER_VISION_PROMPT = (
 )
 
 
-def _cache_path() -> Path:
-    if CACHE_PATH != _IMPORT_CACHE_PATH:
-        return CACHE_PATH
-    return get_hermes_home() / "sticker_cache.json"
-
-
-def _load_cache(path: Optional[Path] = None) -> dict:
+def _load_cache() -> dict:
     """Load the sticker cache from disk."""
-    path = path or _cache_path()
-    if path.exists():
+    if CACHE_PATH.exists():
         try:
-            cache = json.loads(path.read_text(encoding="utf-8"))
-            return cache if isinstance(cache, dict) else {}
+            return json.loads(CACHE_PATH.read_text(encoding="utf-8"))
         except (json.JSONDecodeError, OSError):
             return {}
     return {}
 
 
-def _save_cache(cache: dict, path: Optional[Path] = None) -> None:
+def _save_cache(cache: dict) -> None:
     """Save the sticker cache to disk atomically."""
-    atomic_json_write(path or _cache_path(), cache)
+    CACHE_PATH.parent.mkdir(parents=True, exist_ok=True)
+    fd, tmp_path = tempfile.mkstemp(
+        dir=str(CACHE_PATH.parent), suffix=".tmp"
+    )
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            json.dump(cache, f, indent=2, ensure_ascii=False)
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp_path, str(CACHE_PATH))
+    except BaseException:
+        try:
+            os.unlink(tmp_path)
+        except OSError:
+            pass
+        raise
 
 
 def get_cached_description(file_unique_id: str) -> Optional[dict]:
@@ -58,8 +64,7 @@ def get_cached_description(file_unique_id: str) -> Optional[dict]:
         dict with keys {description, emoji, set_name, cached_at} or None.
     """
     cache = _load_cache()
-    entry = cache.get(file_unique_id)
-    return entry if isinstance(entry, dict) else None
+    return cache.get(file_unique_id)
 
 
 def cache_sticker_description(
@@ -77,16 +82,14 @@ def cache_sticker_description(
         emoji:          Associated emoji (e.g. "😀").
         set_name:       Sticker set name if available.
     """
-    path = _cache_path()
-    with advisory_file_lock(path.with_suffix(".lock")):
-        cache = _load_cache(path)
-        cache[file_unique_id] = {
-            "description": description,
-            "emoji": emoji,
-            "set_name": set_name,
-            "cached_at": time.time(),
-        }
-        _save_cache(cache, path)
+    cache = _load_cache()
+    cache[file_unique_id] = {
+        "description": description,
+        "emoji": emoji,
+        "set_name": set_name,
+        "cached_at": time.time(),
+    }
+    _save_cache(cache)
 
 
 def build_sticker_injection(

@@ -93,12 +93,8 @@ def test_approved_command_genuine_interrupt_after_start_still_kills(tmp_path):
     holder = {}
 
     def worker():
-        # as_posix() + quotes: interpolating a raw Windows path into a bash
-        # command line lets bash eat the backslashes, so `touch` creates a
-        # mangled literal file in CWD (the repo root) and the sentinel wait
-        # times out. Forward slashes work in bash on every platform.
         holder["result"] = tt.terminal_tool(
-            command=f"touch '{sentinel.as_posix()}'; sleep 5; echo DONE", force=True
+            command=f"touch {sentinel}; sleep 5; echo DONE", force=True
         )
 
     t = threading.Thread(target=worker, daemon=True)
@@ -129,10 +125,7 @@ def test_approved_note_enriched_not_misleading_on_interrupt(monkeypatch, tmp_pat
     holder = {}
 
     def worker():
-        # See cmd_started_c above: POSIX-quote the path for bash.
-        holder["result"] = tt.terminal_tool(
-            command=f"touch '{sentinel.as_posix()}'; sleep 5; echo DONE"
-        )
+        holder["result"] = tt.terminal_tool(command=f"touch {sentinel}; sleep 5; echo DONE")
 
     t = threading.Thread(target=worker, daemon=True)
     t.start()

@@ -25,10 +25,6 @@ import importlib.util
 import logging
 from dataclasses import dataclass, field as dataclass_field
 
-from hermes_services.startup import bootstrap_trusted_runtime
-
-bootstrap_trusted_runtime()
-
 _log = logging.getLogger(__name__)
 
 # Field kinds understood by the generic renderer.

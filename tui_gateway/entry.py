@@ -414,23 +414,6 @@ def ensure_mcp_discovery_started() -> None:
 
     if not _has_configured_mcp_servers():
         return
-    if os.environ.get("HERMES_FULL_TOOL_DEFINITIONS", "").strip().lower() in {
-        "1", "true", "yes", "on"
-    }:
-        try:
-            from tools.mcp_tool import (
-                all_configured_mcp_servers_lazy,
-                register_static_mcp_servers,
-            )
-
-            register_static_mcp_servers()
-            if all_configured_mcp_servers_lazy():
-                # The hosted/mobile contract is schema-complete but transport
-                # lazy. Do not wake every MCP process during a new chat.
-                _mcp_discovery_enabled = False
-                return
-        except Exception:
-            logger.debug("Static hosted MCP registration failed", exc_info=True)
     _mcp_discovery_enabled = True
     try:
         from hermes_cli.mcp_startup import start_background_mcp_discovery

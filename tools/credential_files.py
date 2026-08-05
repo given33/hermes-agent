@@ -26,7 +26,7 @@ import posixpath
 from contextvars import ContextVar
 from pathlib import Path
 from typing import Dict, List, Optional
-from hermes_runtime.config import cfg_get
+from hermes_cli.config import cfg_get
 
 try:  # pragma: no cover - exercised via the fail-closed test below
     from agent.file_safety import get_read_block_error
@@ -142,9 +142,7 @@ def register_credential_file(
         )
         return False
 
-    container_path = (
-        f"{container_base.rstrip('/')}/{Path(relative_path).as_posix()}"
-    )
+    container_path = f"{container_base.rstrip('/')}/{relative_path}"
     _get_registered()[container_path] = str(resolved)
     logger.debug("credential_files: registered %s -> %s", resolved, container_path)
     return True
@@ -183,7 +181,7 @@ def _load_config_files() -> List[Dict[str, str]]:
 
     result: List[Dict[str, str]] = []
     try:
-        from hermes_runtime.config import read_raw_config
+        from hermes_cli.config import read_raw_config
         hermes_home = _resolve_hermes_home()
         cfg = read_raw_config()
         cred_files = cfg_get(cfg, "terminal", "credential_files")
@@ -208,7 +206,7 @@ def _load_config_files() -> List[Dict[str, str]]:
                         continue
                     resolved_path = host_path.resolve()
                     if resolved_path.is_file():
-                        container_path = f"/root/.hermes/{Path(rel).as_posix()}"
+                        container_path = f"/root/.hermes/{rel}"
                         result.append({
                             "host_path": str(resolved_path),
                             "container_path": container_path,
@@ -277,7 +275,7 @@ def get_skills_directory_mount(
 
     # Mount external skill dirs
     try:
-        from hermes_runtime.skill_utils import get_external_skills_dirs
+        from agent.skill_utils import get_external_skills_dirs
         for idx, ext_dir in enumerate(get_external_skills_dirs()):
             if ext_dir.is_dir():
                 host_path = _safe_skills_path(ext_dir)
@@ -359,12 +357,12 @@ def iter_skills_files(
             rel = item.relative_to(skills_dir)
             result.append({
                 "host_path": str(item),
-                "container_path": f"{container_root}/{rel.as_posix()}",
+                "container_path": f"{container_root}/{rel}",
             })
 
     # Include external skill dirs
     try:
-        from hermes_runtime.skill_utils import get_external_skills_dirs
+        from agent.skill_utils import get_external_skills_dirs
         for idx, ext_dir in enumerate(get_external_skills_dirs()):
             if not ext_dir.is_dir():
                 continue
@@ -375,7 +373,7 @@ def iter_skills_files(
                 rel = item.relative_to(ext_dir)
                 result.append({
                     "host_path": str(item),
-                    "container_path": f"{container_root}/{rel.as_posix()}",
+                    "container_path": f"{container_root}/{rel}",
                 })
     except ImportError:
         pass
@@ -520,7 +518,7 @@ def iter_cache_files(
             rel = item.relative_to(host_dir)
             result.append({
                 "host_path": str(item),
-                "container_path": f"{container_root}/{rel.as_posix()}",
+                "container_path": f"{container_root}/{rel}",
             })
     return result
 

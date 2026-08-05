@@ -1,6 +1,6 @@
-# Stripe MCP (`mcp.stripe.com`) — recurring OAuth grant revocation, fix with a restricted key
+# Stripe MCP (`mcp.stripe.com`) — recurring OAuth session revocation, fix with a restricted key
 
-A worked example of pitfall 9/10 in SKILL.md: a provider whose OAuth grant dies
+A worked example of pitfall 9/10 in SKILL.md: a provider whose OAuth session dies
 on a recurring basis, where the durable fix is to drop OAuth for a static API key.
 
 ## Symptom (the "dies after a while" complaint)
@@ -28,7 +28,7 @@ Per Stripe's OAuth docs (https://docs.stripe.com/stripe-apps/api-authentication/
   the tools enough" is irrelevant.
 
 So a *recurring* death cannot be refresh-token expiry (1yr) or "max OAuth session
-length" (no clean documented cap). It is server-side grant revocation. Do NOT
+length" (no clean documented cap). It is server-side session revocation. Do NOT
 loop on refresh.
 
 ## The durable fix: drop OAuth, use a restricted API key as a Bearer token
@@ -55,8 +55,8 @@ Grant least-privilege scopes for what the bot actually does:
 Then `/reload-mcp` (full restart only if the breaker is tripped, per pitfall 7).
 
 ## Decision rule
-For ANY unattended remote-gateway MCP server whose OAuth grant is repeatedly revoked
-(`invalid_grant` on refresh or a freshly issued token immediately gets `401 invalid_token`),
+For ANY unattended remote-gateway MCP server that keeps getting its session revoked
+(`invalid_grant` on refresh, or `-32002 "Session expired"` after a successful refresh),
 and whose provider offers a static API key — prefer the static key over OAuth. OAuth's
 refresh dance is for interactive clients; it is a liability for a headless gateway.
 Stripe (restricted key) and Linear (Personal API key) both fit this rule.

@@ -23,16 +23,6 @@ except ModuleNotFoundError:
     # means UTF-8 stdio setup is skipped on Windows; POSIX is unaffected.
     pass
 
-# Cross-platform UTF-8 stdio repair: hermes_bootstrap above is Windows-only,
-# this one also fixes legacy POSIX locales (latin-1/C on minimal Debian/Pi).
-# Explicit entry-point call — importing hermes_cli no longer does this as a
-# side effect (see hermes_cli.ensure_utf8_stdio's docstring for the callers
-# that must be wired). cli.py module init runs before any banner print for
-# both `python cli.py` and `hermes chat` (which imports this module).
-from hermes_cli import ensure_utf8_stdio as _hermes_ensure_utf8_stdio
-
-_hermes_ensure_utf8_stdio()
-
 import logging
 import copy
 import os
@@ -151,7 +141,7 @@ def _reverse_alias_for_display(model_name: str) -> str:
     if _REVERSE_ALIAS_CACHE is None:
         rmap: dict[str, str] = {}
         try:
-            from hermes_runtime.config import load_config
+            from hermes_cli.config import load_config
             cfg = load_config() or {}
             ma = cfg.get("model_aliases")
             if isinstance(ma, dict):
@@ -574,9 +564,9 @@ def load_cli_config() -> Dict[str, Any]:
     if config_path.exists():
         try:
             with open(config_path, "r", encoding="utf-8") as f:
-                from hermes_runtime.config import normalize_root_model_keys
+                from hermes_cli.config import _normalize_root_model_keys
 
-                file_config = normalize_root_model_keys(fast_safe_load(f) or {})
+                file_config = _normalize_root_model_keys(fast_safe_load(f) or {})
             
             _file_has_terminal_config = "terminal" in file_config
 
@@ -628,8 +618,8 @@ def load_cli_config() -> Dict[str, Any]:
             logger.warning("Failed to load cli-config.yaml: %s", e)
 
     # Expand ${ENV_VAR} references in config values before bridging to env vars.
-    from hermes_runtime.config import expand_env_vars
-    defaults = expand_env_vars(defaults)
+    from hermes_cli.config import _expand_env_vars
+    defaults = _expand_env_vars(defaults)
 
     # Managed scope: overlay administrator-pinned values LAST so they win over
     # the user's config here too. cli.py builds its config independently of
@@ -639,7 +629,7 @@ def load_cli_config() -> Dict[str, Any]:
     # `hermes config`/`doctor`/guards (which use load_config) honor it. The
     # shared helper mirrors _load_config_impl (env-only expansion, root-model
     # normalization, leaf-merge) and is fail-open.
-    from hermes_runtime import managed_scope
+    from hermes_cli import managed_scope
 
     defaults = managed_scope.apply_managed_overlay(defaults)
 
@@ -798,18 +788,7 @@ def load_cli_config() -> Dict[str, Any]:
 
     return defaults
 
-# Load configuration at module startup.
-#
-# DEPRECATED (in place): CLI_CONFIG is the legacy import-time snapshot used by
-# cli.py's own REPL paths and a tail of external importers. New code must use
-# hermes_cli.config.load_config() / load_config_readonly() instead — the
-# shared loader adds DEFAULT_CONFIG deep-merge, managed-scope overrides,
-# last-known-good fallback on parse errors, mtime-keyed caching, and (as of
-# the HERMES_IGNORE_USER_CONFIG convergence) the same --ignore-user-config
-# semantics as this loader, so there is no behavioral reason left to import
-# CLI_CONFIG from outside cli.py. Remaining migration: external importers of
-# cli.CLI_CONFIG (outside this module) should switch to the shared loader;
-# tools/delegate_tool.py already treats it as a fallback only.
+# Load configuration at module startup
 CLI_CONFIG = load_cli_config()
 
 
@@ -823,7 +802,7 @@ except Exception:
 
 # Validate config structure early — print warnings before user hits cryptic errors
 try:
-    from hermes_runtime.config import print_config_warnings
+    from hermes_cli.config import print_config_warnings
     print_config_warnings()
 except Exception:
     pass
@@ -963,7 +942,7 @@ def validate_toolset(*args, **kwargs):
 
 def _sync_process_session_id(session_id: str) -> None:
     """Keep process-local session-id consumers aligned after CLI switches."""
-    from hermes_runtime.session_context import set_current_session_id
+    from gateway.session_context import set_current_session_id
 
     set_current_session_id(session_id)
 
@@ -1066,7 +1045,7 @@ def _prepare_deferred_agent_startup() -> None:
         )
     try:
         from agent.shell_hooks import register_from_config
-        from hermes_runtime.config import load_config
+        from hermes_cli.config import load_config
 
         _hooks_cfg = load_config()
         register_from_config(_hooks_cfg, accept_hooks=_accept_hooks)
@@ -1809,16 +1788,13 @@ def _setup_worktree(repo_root: str = None, sync_base: bool = True) -> Optional[D
     return info
 
 
-def _revision_has_unpushed_commits(
-    repo_path: str,
-    revision: str,
-    *,
-    timeout: int = 10,
-) -> bool:
-    """Return whether *revision* is absent from every remote-tracking ref.
+def _worktree_has_unpushed_commits(worktree_path: str, timeout: int = 10) -> bool:
+    """Return whether a worktree has commits not reachable from any remote branch.
 
-    Local branches and tags are not proof that work was pushed. The check fails
-    closed when git cannot prove remote reachability.
+    ``git log HEAD --not --remotes`` compares against remote-tracking refs under
+    ``refs/remotes/*``. If a repo has no remote-tracking refs yet, there is no
+    usable remote baseline to compare against, so treat it as having no
+    "unpushed" commits.
     """
     import subprocess
 
@@ -1838,22 +1814,9 @@ def _revision_has_unpushed_commits(
         )
         if result.returncode != 0:
             return True
-        return not bool(result.stdout.strip())
+        return bool(result.stdout.strip())
     except Exception:
         return True
-
-
-def _worktree_has_unpushed_commits(worktree_path: str, timeout: int = 10) -> bool:
-    """Return whether deleting this worktree branch could lose commits.
-
-    A local branch or tag is not a sufficient safety baseline because it does
-    not prove that the work exists outside this repository.
-    """
-    return _revision_has_unpushed_commits(
-        worktree_path,
-        "HEAD",
-        timeout=timeout,
-    )
 
 
 def _worktree_is_dirty(worktree_path: str, timeout: int = 10) -> bool:
@@ -2038,7 +2001,8 @@ def _worktree_lock_is_live(repo_root: str, worktree_path: str, timeout: int = 10
     pruner tell the two apart:
 
     - ``"live"``  — locked and the owning pid is still running (skip it).
-    - ``"dead"``  — locked by hermes but the recorded owning pid is gone.
+    - ``"dead"``  — locked but the owning pid is gone, or the reason isn't a
+                    parseable hermes lock (safe to unlock + reap).
     - ``None``    — not locked at all.
 
     Fails SAFE toward ``"live"``: if git can't be queried at all we cannot
@@ -2071,13 +2035,16 @@ def _worktree_lock_is_live(repo_root: str, worktree_path: str, timeout: int = 10
             reason = line[len("locked"):].strip()
             m = re.search(r"hermes pid=(\d+)", reason)
             if not m:
-                # A foreign or malformed lock may belong to another live tool.
-                # Without a hermes pid we cannot prove it is stale.
-                return "live"
+                # Locked by something we don't recognize as a hermes session
+                # (or lock reason unavailable). Treat as dead — a foreign lock
+                # on a hermes -w worktree is almost certainly a leftover, and
+                # the age/dirty/unpushed gates already ran before we got here.
+                return "dead"
             pid = int(m.group(1))
             if pid == os.getpid():
                 return "live"
             try:
+                from gateway.status import _pid_exists
                 return "live" if _pid_exists(pid) else "dead"
             except Exception:
                 # Can't determine liveness — fail safe toward keeping it.
@@ -2088,9 +2055,10 @@ def _worktree_lock_is_live(repo_root: str, worktree_path: str, timeout: int = 10
 def _cleanup_worktree(info: Dict[str, str] = None) -> None:
     """Remove a worktree and its branch on exit.
 
-    Cleanup is fail-closed. Staged, unstaged, and untracked changes are user
-    work, as are commits that are not reachable from a remote-tracking ref.
-    Either condition preserves the worktree and branch.
+    Preserves the worktree only if it has unpushed commits (real work
+    that hasn't been pushed to any remote).  Uncommitted changes alone
+    (untracked files, test artifacts) are not enough to keep it — agent
+    work lives in commits/PRs, not the working tree.
     """
     global _active_worktree
     info = info or _active_worktree
@@ -2106,18 +2074,16 @@ def _cleanup_worktree(info: Dict[str, str] = None) -> None:
     if not Path(wt_path).exists():
         return
 
-    if _worktree_is_dirty(wt_path, timeout=10):
-        print(f"\n\033[33m⚠ Worktree has uncommitted changes, keeping: {wt_path}\033[0m")
+    has_unpushed = _worktree_has_unpushed_commits(wt_path, timeout=10)
+
+    if has_unpushed:
+        print(f"\n\033[33m⚠ Worktree has unpushed commits, keeping: {wt_path}\033[0m")
         print(f"  To clean up manually: git worktree remove --force {wt_path}")
         _active_worktree = None
         return
 
-    if _worktree_has_unpushed_commits(wt_path, timeout=10):
-        print(f"\n\033[33m⚠ Worktree has commits without a remote baseline, keeping: {wt_path}\033[0m")
-        print(f"  To clean up manually: git worktree remove --force {wt_path}")
-        _active_worktree = None
-        return
-
+    # Remove worktree (even if working tree is dirty — uncommitted
+    # changes without unpushed commits are just artifacts)
     # Unlock first so `git worktree remove` isn't blocked by the lock we
     # placed at creation time.  Fail-soft — never block cleanup.
     try:
@@ -2129,46 +2095,19 @@ def _cleanup_worktree(info: Dict[str, str] = None) -> None:
         logger.debug("git worktree unlock failed (non-fatal): %s", e)
 
     try:
-        remove_result = subprocess.run(
+        subprocess.run(
             ["git", "worktree", "remove", wt_path, "--force"],
             capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=15, cwd=repo_root,
         )
     except Exception as e:
         logger.debug("Failed to remove worktree: %s", e)
-        print(f"\n\033[33m⚠ Failed to remove worktree, keeping branch: {wt_path}\033[0m")
-        _active_worktree = None
-        return
 
-    if remove_result.returncode != 0 or Path(wt_path).exists():
-        logger.debug(
-            "Failed to remove worktree %s: %s",
-            wt_path, remove_result.stderr.strip(),
-        )
-        print(f"\n\033[33m⚠ Failed to remove worktree, keeping branch: {wt_path}\033[0m")
-        _active_worktree = None
-        return
-
-    # Re-check the recorded branch separately. A user may have switched the
-    # worktree to another branch after setup, leaving unique commits on the
-    # original auto branch even though the checked-out HEAD is pushed.
-    branch_ref = f"refs/heads/{branch}"
-    if _revision_has_unpushed_commits(repo_root, branch_ref, timeout=10):
-        logger.debug("Keeping branch without a remote baseline: %s", branch)
-        _active_worktree = None
-        print(f"\033[32m✓ Worktree cleaned up; branch preserved: {branch}\033[0m")
-        return
-
-    # Delete the branch only after git confirms that the worktree is gone.
+    # Delete the branch
     try:
-        branch_result = subprocess.run(
+        subprocess.run(
             ["git", "branch", "-D", branch],
             capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=10, cwd=repo_root,
         )
-        if branch_result.returncode != 0:
-            logger.debug(
-                "Failed to delete branch %s: %s",
-                branch, branch_result.stderr.strip(),
-            )
     except Exception as e:
         logger.debug("Failed to delete branch %s: %s", branch, e)
 
@@ -2190,7 +2129,7 @@ def _run_state_db_auto_maintenance(session_db) -> None:
     if session_db is None:
         return
     try:
-        from hermes_runtime.config import load_config as _load_full_config
+        from hermes_cli.config import load_config as _load_full_config
         from hermes_constants import get_hermes_home as _get_hermes_home
         _hermes_home_maint = _get_hermes_home()
 
@@ -2251,7 +2190,7 @@ def _run_checkpoint_auto_maintenance() -> None:
     Never raises — maintenance must never block interactive startup.
     """
     try:
-        from hermes_runtime.config import load_config as _load_full_config
+        from hermes_cli.config import load_config as _load_full_config
         cfg = (_load_full_config().get("checkpoints") or {})
         if not cfg.get("auto_prune", False):
             return
@@ -2443,19 +2382,12 @@ def _prune_stale_worktrees(repo_root: str, max_age_hours: int = 24) -> None:
 
         if lock_state == "dead":
             try:
-                unlock_result = subprocess.run(
+                subprocess.run(
                     ["git", "worktree", "unlock", str(entry)],
                     capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=10, cwd=repo_root,
                 )
-                if unlock_result.returncode != 0:
-                    logger.debug(
-                        "Failed to unlock dead worktree %s: %s",
-                        entry.name, unlock_result.stderr.strip(),
-                    )
-                    continue
             except Exception as e:
                 logger.debug("Failed to unlock dead worktree %s: %s", entry.name, e)
-                continue
 
         # Safe to remove
         try:
@@ -2469,7 +2401,7 @@ def _prune_stale_worktrees(repo_root: str, max_age_hours: int = 24) -> None:
                 ["git", "worktree", "remove", str(entry), "--force"],
                 capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=15, cwd=repo_root,
             )
-            if remove_result.returncode != 0 or entry.exists():
+            if remove_result.returncode != 0:
                 # Removal failed — keep the branch so any commits stay
                 # reachable rather than orphaning it.
                 logger.debug(
@@ -2500,8 +2432,8 @@ def _prune_orphaned_branches(repo_root: str) -> None:
     """Delete local ``hermes/hermes-*`` and ``pr-*`` branches with no worktree.
 
     These are auto-generated by ``hermes -w`` sessions and PR review
-    workflows respectively. A branch is deleted only when its tip remains
-    reachable from a remote-tracking branch.
+    workflows respectively.  Once their worktree is gone they serve no
+    purpose and just accumulate.
     """
     import subprocess
 
@@ -2523,8 +2455,6 @@ def _prune_orphaned_branches(repo_root: str) -> None:
             ["git", "worktree", "list", "--porcelain"],
             capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=10, cwd=repo_root,
         )
-        if wt_result.returncode != 0:
-            return
         for line in wt_result.stdout.split("\n"):
             if line.startswith("branch refs/heads/"):
                 active_branches.add(line.split("branch refs/heads/", 1)[-1].strip())
@@ -2553,31 +2483,18 @@ def _prune_orphaned_branches(repo_root: str) -> None:
     if not orphaned:
         return
 
-    pruned_count = 0
-    for branch in orphaned:
-        branch_ref = f"refs/heads/{branch}"
-        if _revision_has_unpushed_commits(
-            repo_root,
-            branch_ref,
-            timeout=10,
-        ):
-            continue
+    # Delete in batches
+    for i in range(0, len(orphaned), 50):
+        batch = orphaned[i:i + 50]
         try:
             subprocess.run(
                 ["git", "branch", "-D"] + batch,
                 capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=30, cwd=repo_root,
             )
-            if delete_result.returncode == 0:
-                pruned_count += 1
-            else:
-                logger.debug(
-                    "Failed to prune orphaned branch %s: %s",
-                    branch, delete_result.stderr.strip(),
-                )
         except Exception as e:
-            logger.debug("Failed to prune orphaned branch %s: %s", branch, e)
+            logger.debug("Failed to prune orphaned branches: %s", e)
 
-    logger.debug("Pruned %d orphaned branches", pruned_count)
+    logger.debug("Pruned %d orphaned branches", len(orphaned))
 
 # ============================================================================
 # ASCII Art & Branding
@@ -3325,8 +3242,6 @@ from hermes_constants import is_termux as _is_termux_environment
 
 def _termux_example_image_path(filename: str = "cat.png") -> str:
     """Return a realistic example media path for the current Termux setup."""
-    import posixpath
-
     candidates = [
         os.path.expanduser("~/storage/shared"),
         "/sdcard",
@@ -3421,15 +3336,7 @@ def _resolve_attachment_path(raw_path: str) -> Path | None:
                     expanded = expanded[1:]
         except Exception:
             expanded = token
-    expanded = os.path.expandvars(expanded)
-    if expanded.startswith(("~/", "~\\", "~")):
-        configured_home = os.environ.get("HOME") or os.environ.get("USERPROFILE")
-        if configured_home:
-            expanded = str(Path(configured_home) / expanded[2:].replace("\\", os.sep).replace("/", os.sep)) if expanded != "~" else configured_home
-        else:
-            expanded = os.path.expanduser(expanded)
-    else:
-        expanded = os.path.expanduser(expanded)
+    expanded = os.path.expandvars(os.path.expanduser(expanded))
     if os.name != "nt":
         normalized = expanded.replace("\\", "/")
         if len(normalized) >= 3 and normalized[1] == ":" and normalized[2] == "/" and normalized[0].isalpha():
@@ -5724,7 +5631,7 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
         try:
             from agent.pet import constants, store
             from agent.pet.render import PetRenderer
-            from hermes_runtime.config import load_config
+            from hermes_cli.config import load_config
 
             cfg = load_config()
             display = cfg.get("display", {}) if isinstance(cfg.get("display"), dict) else {}
@@ -6359,7 +6266,7 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
 
         if resolved_provider == "copilot":
             try:
-                from agent.model_catalog import copilot_model_api_mode, normalize_copilot_model_id
+                from hermes_cli.models import copilot_model_api_mode, normalize_copilot_model_id
 
                 canonical = normalize_copilot_model_id(current_model, api_key=self.api_key)
                 if canonical and canonical != current_model:
@@ -6381,7 +6288,7 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
 
         if resolved_provider in {"opencode-zen", "opencode-go"}:
             try:
-                from agent.model_catalog import normalize_opencode_model_id, opencode_model_api_mode
+                from hermes_cli.models import normalize_opencode_model_id, opencode_model_api_mode
 
                 canonical = normalize_opencode_model_id(resolved_provider, current_model)
                 if canonical and canonical != current_model:
@@ -7768,7 +7675,7 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
     
     def _fast_command_available(self) -> bool:
         try:
-            from agent.model_catalog import model_supports_fast_mode
+            from hermes_cli.models import model_supports_fast_mode
         except Exception:
             return False
         agent = getattr(self, "agent", None)
@@ -9344,7 +9251,7 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
             model_list = provider_data.get("models", [])
             if not model_list:
                 try:
-                    from agent.model_catalog import provider_model_ids
+                    from hermes_cli.models import provider_model_ids
                     live = provider_model_ids(provider_data["slug"])
                     if live:
                         model_list = live
@@ -9453,7 +9360,7 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
         # /v1/models endpoint on this open.
         if force_refresh:
             try:
-                from agent.model_catalog import clear_provider_models_cache
+                from hermes_cli.models import clear_provider_models_cache
                 clear_provider_models_cache()
                 _cprint("  Cleared model picker cache. Refreshing...")
             except Exception:
@@ -9697,7 +9604,7 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
 
         # Load + persist via the existing config helpers
         try:
-            from hermes_runtime.config import load_config, save_config
+            from hermes_cli.config import load_config, save_config
         except Exception as exc:
             _cprint(f"❌ could not load config: {exc}")
             return
@@ -10237,6 +10144,10 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
             self._manual_compress(cmd_original)
         elif canonical == "usage":
             self._handle_usage_command(cmd_original)
+        elif canonical == "subscription":
+            self._show_subscription()
+        elif canonical == "topup":
+            self._show_billing(cmd_original)
         elif canonical == "insights":
             self._show_insights(cmd_original)
         elif canonical == "copy":
@@ -10255,7 +10166,7 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
         elif canonical == "image":
             self._handle_image_command(cmd_original)
         elif canonical == "reload":
-            from hermes_runtime.config import reload_env
+            from hermes_cli.config import reload_env
             count = reload_env()
             print(f"  Reloaded .env ({count} var(s) updated)")
         elif canonical == "reload-mcp":
@@ -10462,7 +10373,7 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
                             )
                             output = result.stdout.strip() or result.stderr.strip()
                             if output:
-                                from hermes_runtime.redaction import redact_sensitive_text
+                                from agent.redact import redact_sensitive_text
                                 output = redact_sensitive_text(output)
                                 self._console_print(_rich_text_from_ansi(output))
                             else:
@@ -10639,7 +10550,7 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
         """
         try:
             from hermes_cli.goals import GoalManager
-            from hermes_runtime.config import load_config
+            from hermes_cli.config import load_config
         except Exception as exc:
             logging.debug("goal manager unavailable: %s", exc)
             return None
@@ -10911,7 +10822,7 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
         # prompt_toolkit's renderer.  self.console.print() with Rich markup
         # writes directly to stdout which patch_stdout's StdoutProxy mangles
         # into garbled sequences like '?[33mTool progress: NEW?[0m' (#2262).
-        from hermes_runtime.colors import Colors as _Colors
+        from hermes_cli.colors import Colors as _Colors
         labels = {
             "off": f"{_Colors.DIM}Tool progress: OFF{_Colors.RESET} — silent mode, just the final response.",
             "new": f"{_Colors.YELLOW}Tool progress: NEW{_Colors.RESET} — show each new tool (skip repeats).",
@@ -10996,7 +10907,7 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
         ``set_current_session_key`` so the bypass takes effect on the very
         next dangerous command in this run.
         """
-        from hermes_runtime.colors import Colors as _Colors
+        from hermes_cli.colors import Colors as _Colors
         from tools.approval import (
             disable_session_yolo,
             enable_session_yolo,
@@ -11381,16 +11292,28 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
         print()
 
     def _show_usage(self):
-        """Show rate limits and token usage for the active session."""
+        """Rate limits + session token usage (when a live agent exists) + Nous credits.
+
+        The Nous credits block is agent-independent (a portal fetch), so it runs even
+        with no live agent — important for the TUI, where /usage runs in a slash-worker
+        subprocess that resumes the session WITHOUT building an agent (self.agent is None),
+        which would otherwise early-return before any credits showed.
+        """
         if not self.agent:
-            print("(._.) No active agent -- send a message first.")
+            if self._print_nous_credits_block():
+                self._print_usage_cta()
+            else:
+                print("(._.) No active agent -- send a message first.")
             return
 
         agent = self.agent
         calls = agent.session_api_calls
 
         if calls == 0:
-            print("(._.) No API calls made yet in this session.")
+            if self._print_nous_credits_block():
+                self._print_usage_cta()
+            else:
+                print("(._.) No API calls made yet in this session.")
             return
 
         # ── Rate limits (shown first when available) ────────────────
@@ -11457,6 +11380,11 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
             print()
             for line in account_lines:
                 print(line)
+
+        # Nous credits magnitudes + monthly-grant gauge (agent-independent — also
+        # runs at the no-agent / no-calls early-returns above). See the helper.
+        if self._print_nous_credits_block():
+            self._print_usage_cta()
 
         if self.verbose:
             logging.getLogger().setLevel(logging.DEBUG)
@@ -11529,6 +11457,8 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
           other Hermes instances.
         """
 
+        import yaml as _yaml
+
         CONFIG_WATCH_INTERVAL = 5.0  # seconds between config.yaml stat() calls
 
         now = time.monotonic()
@@ -11536,7 +11466,7 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
             return
         self._last_config_check = now
 
-        from hermes_runtime.config import get_config_path as _get_config_path
+        from hermes_cli.config import get_config_path as _get_config_path
         cfg_path = _get_config_path()
         if not cfg_path.exists():
             return
@@ -11552,7 +11482,8 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
         # File changed — check whether mcp_servers section changed
         self._config_mtime = mtime
         try:
-            new_cfg = read_raw_config_strict(config_path=cfg_path)
+            with open(cfg_path, encoding="utf-8") as f:
+                new_cfg = _yaml.safe_load(f) or {}
         except Exception:
             return
 
@@ -11564,8 +11495,8 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
         # keys) triggers a false-positive MCP reload because the raw yaml
         # still has "${POWERMEM_API_KEY}" while the snapshot has the
         # expanded value.
-        from hermes_runtime.config import expand_env_vars
-        new_mcp = expand_env_vars(new_mcp)
+        from hermes_cli.config import _expand_env_vars
+        new_mcp = _expand_env_vars(new_mcp)
         if new_mcp == self._config_mcp_servers:
             return  # mcp_servers unchanged (some other section was edited)
 
@@ -12249,7 +12180,7 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
         # instead of crashing on ``.get()``.
         voice_cfg: dict = {}
         try:
-            from hermes_runtime.config import load_config
+            from hermes_cli.config import load_config
             _cfg = load_config().get("voice")
             voice_cfg = _cfg if isinstance(_cfg, dict) else {}
         except Exception:
@@ -12795,7 +12726,7 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
         # Check config for auto_tts (shape-safe — malformed ``voice:`` YAML
         # leaves ``voice_config`` as a non-dict, so guard before .get()).
         try:
-            from hermes_runtime.config import load_config
+            from hermes_cli.config import load_config
             _raw_voice = load_config().get("voice")
             voice_config = _raw_voice if isinstance(_raw_voice, dict) else {}
             if voice_config.get("auto_tts", False):
@@ -13764,7 +13695,7 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
                     build_native_content_parts,
                     decide_image_input_mode,
                 )
-                from hermes_runtime.config import load_config
+                from hermes_cli.config import load_config
 
                 _img_mode = decide_image_input_mode(
                     (self.provider or "").strip(),
@@ -15095,7 +15026,7 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
                     _resid_color = "#B8860B"
                 self._console_print(f"[{_resid_color}]{openclaw_residue_hint_cli()}[/]")
                 try:
-                    from hermes_runtime.config import get_config_path as _get_cfg_path_resid
+                    from hermes_cli.config import get_config_path as _get_cfg_path_resid
                     mark_seen(_get_cfg_path_resid(), OPENCLAW_RESIDUE_FLAG)
                 except Exception:
                     pass  # best-effort — banner will fire again next session
@@ -15170,7 +15101,7 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
         get_plugin_manager()._cli_ref = self
 
         # Config file watcher — detect mcp_servers changes and auto-reload
-        from hermes_runtime.config import get_config_path as _get_config_path
+        from hermes_cli.config import get_config_path as _get_config_path
         _cfg_path = _get_config_path()
         self._config_mtime: float = _cfg_path.stat().st_mtime if _cfg_path.exists() else 0.0
         self._config_mcp_servers: dict = self.config.get("mcp_servers") or {}
@@ -16166,7 +16097,7 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
         # TUI/CLI split instead of a silent mismatch (round-11).
         _raw_key: object = "ctrl+b"
         try:
-            from hermes_runtime.config import load_config
+            from hermes_cli.config import load_config
             from hermes_cli.voice import (
                 normalize_voice_record_key_for_prompt_toolkit,
                 voice_record_key_from_config,
@@ -18378,7 +18309,7 @@ def main(
                                 build_native_content_parts as _build_parts,  # noqa: F811
                             )
                             from agent.image_routing import decide_image_input_mode
-                            from hermes_runtime.config import load_config
+                            from hermes_cli.config import load_config
 
                             _img_mode = decide_image_input_mode(
                                 (cli.provider or "").strip(),

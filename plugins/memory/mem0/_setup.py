@@ -323,7 +323,7 @@ def _setup_platform(hermes_home: str, config: dict, flags: dict[str, str]) -> No
             "routing to the self-hosted server."
         )
 
-    from hermes_runtime.config import save_config
+    from hermes_cli.config import save_config
     config["memory"]["provider"] = "mem0"
     save_config(config)
 
@@ -417,7 +417,7 @@ def _setup_selfhosted(hermes_home: str, config: dict, flags: dict[str, str]) -> 
     provider_config["user_id"] = user_id
     provider_config["agent_id"] = agent_id
 
-    from hermes_runtime.config import save_config
+    from hermes_cli.config import save_config
     config["memory"]["provider"] = "mem0"
     save_config(config)
 
@@ -478,7 +478,7 @@ def _setup_oss(hermes_home: str, config: dict, flags: dict[str, str]) -> None:
 
     _install_provider_deps(llm_id, embedder_id, vector_id)
 
-    from hermes_runtime.config import save_config
+    from hermes_cli.config import save_config
     config["memory"]["provider"] = "mem0"
     save_config(config)
 
@@ -517,48 +517,7 @@ def _prompt_api_key(label: str, env_var: str, hermes_home: str) -> str:
 
 _PGVECTOR_CONTAINER = "hermes-pgvector"
 _PGVECTOR_IMAGE = "pgvector/pgvector:pg17"
-# No hardcoded password: the managed container gets a random one, generated
-# at install time and persisted (0o600) under the Hermes home so wizard
-# re-runs reuse it. HERMES_PGVECTOR_PASSWORD overrides both for users who
-# manage credentials themselves.
-_PGVECTOR_PASSWORD_ENV = "HERMES_PGVECTOR_PASSWORD"
-
-
-def _pgvector_password_file() -> Path:
-    return Path(get_hermes_home()) / "pgvector-password"
-
-
-def _load_pgvector_password() -> str | None:
-    """Return the env-provided or previously persisted password, if any."""
-    env_password = os.environ.get(_PGVECTOR_PASSWORD_ENV, "").strip()
-    if env_password:
-        return env_password
-    try:
-        stored = _pgvector_password_file().read_text(encoding="utf-8").strip()
-    except OSError:
-        return None
-    return stored or None
-
-
-def _ensure_pgvector_password() -> str:
-    """Load or create the password for the managed pgvector container.
-
-    Reuse matters for upgrades: POSTGRES_PASSWORD only takes effect on a
-    fresh initdb (i.e. after ``docker rm -f`` discards the anonymous data
-    volume). Persisting the generated password means a wizard re-run against
-    an existing container/volume keeps working instead of drifting to a new
-    password the database never learned.
-    """
-    existing = _load_pgvector_password()
-    if existing:
-        return existing
-    import secrets
-
-    from utils import write_secret_file
-
-    password = secrets.token_urlsafe(24)
-    write_secret_file(_pgvector_password_file(), password + "\n")
-    return password
+_PGVECTOR_PASSWORD = "hermes"
 
 
 def _ensure_pgvector(host: str = "localhost", port: int = 5432) -> dict | None:
@@ -618,17 +577,12 @@ def _start_pgvector_docker(host: str, port: int) -> dict | None:
                        capture_output=True, timeout=10,
                        stdin=subprocess.DEVNULL)
 
-        password = _ensure_pgvector_password()
         print(f"  Starting container '{_PGVECTOR_CONTAINER}' on port {port}...")
         subprocess.run([
             "docker", "run", "-d",
             "--name", _PGVECTOR_CONTAINER,
-            "-e", f"POSTGRES_PASSWORD={password}",
-            # Publish on loopback only. Docker's iptables rules sit in front
-            # of most host firewalls, so a bare "-p {port}:5432" exposes the
-            # database to the whole network even when the host firewall
-            # blocks the port. Mem0 always connects via localhost.
-            "-p", f"127.0.0.1:{port}:5432",
+            "-e", f"POSTGRES_PASSWORD={_PGVECTOR_PASSWORD}",
+            "-p", f"{port}:5432",
             _PGVECTOR_IMAGE,
         ], capture_output=True, timeout=30, check=True, stdin=subprocess.DEVNULL)
 
@@ -636,10 +590,9 @@ def _start_pgvector_docker(host: str, port: int) -> dict | None:
         ok, _ = _check_pgvector(host, port)
         if ok:
             print(f"  ✓ pgvector running on {host}:{port}")
-            print(f"  (generated password stored in {_pgvector_password_file()})")
             return {
                 "host": host, "port": port,
-                "user": "postgres", "password": password,
+                "user": "postgres", "password": _PGVECTOR_PASSWORD,
                 "dbname": "postgres",
             }
         else:
@@ -647,7 +600,7 @@ def _start_pgvector_docker(host: str, port: int) -> dict | None:
             print("  It may need a few more seconds. Config will be saved; retry later.")
             return {
                 "host": host, "port": port,
-                "user": "postgres", "password": password,
+                "user": "postgres", "password": _PGVECTOR_PASSWORD,
                 "dbname": "postgres",
             }
     except subprocess.CalledProcessError as e:
@@ -838,17 +791,7 @@ def _setup_oss_interactive(hermes_home: str, config: dict) -> None:
             pg_host = input("  PostgreSQL host [localhost]: ").strip() or "localhost"
             pg_port = input("  PostgreSQL port [5432]: ").strip() or "5432"
             pg_dbname = input("  PostgreSQL database [postgres]: ").strip() or "postgres"
-            # A saved hermes-pgvector password means this is likely our own
-            # managed container (e.g. it was already running or was just
-            # restarted, so _ensure_pgvector returned None) — offer it as
-            # the default instead of a blank password.
-            saved_password = _load_pgvector_password()
-            if saved_password:
-                pg_password = getpass.getpass(
-                    "  PostgreSQL password (blank to use the saved hermes-pgvector password): "
-                ).strip() or saved_password
-            else:
-                pg_password = getpass.getpass("  PostgreSQL password (blank if none): ").strip()
+            pg_password = getpass.getpass("  PostgreSQL password (blank if none): ").strip()
             pgvector_config = {
                 "host": pg_host, "port": int(pg_port),
                 "user": pg_user, "dbname": pg_dbname,
@@ -893,7 +836,7 @@ def _setup_oss_interactive(hermes_home: str, config: dict) -> None:
     if vector_id == "pgvector" and pgvector_config:
         _ensure_pgvector_extension(pgvector_config)
 
-    from hermes_runtime.config import save_config
+    from hermes_cli.config import save_config
     config["memory"]["provider"] = "mem0"
     save_config(config)
 

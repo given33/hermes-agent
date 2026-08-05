@@ -4,7 +4,7 @@ Tests for mcp_serve — Hermes MCP server.
 Three layers of tests:
 1. Unit tests — helpers, content extraction, attachment parsing
 2. EventBridge tests — queue mechanics, cursors, waiters, concurrency
-3. End-to-end tests — call actual MCP tools through MCPServer's tool manager
+3. End-to-end tests — call actual MCP tools through FastMCP's tool manager
    with real session data in SQLite and sessions.json
 """
 
@@ -221,14 +221,14 @@ class _FakeToolManager:
     def add_tool(self, fn):
         self._tools[fn.__name__] = _FakeTool(fn)
 
-    async def call_tool(self, name, args=None, context=None):
+    async def call_tool(self, name, args=None):
         return self._tools[name].fn(**(args or {}))
 
     def list_tools(self):
         return list(self._tools.values())
 
 
-class _FakeMCPServer:
+class _FakeFastMCP:
     def __init__(self, *args, **kwargs):
         self._tool_manager = _FakeToolManager()
 
@@ -248,7 +248,7 @@ def fake_mcp_server(populated_sessions_dir, mock_session_db, monkeypatch):
     monkeypatch.setattr(mcp_serve, "_get_session_db", lambda: mock_session_db)
     monkeypatch.setattr(mcp_serve, "_load_channel_directory", lambda: {})
     monkeypatch.setattr(mcp_serve, "_MCP_SERVER_AVAILABLE", True)
-    monkeypatch.setattr(mcp_serve, "MCPServer", _FakeMCPServer)
+    monkeypatch.setattr(mcp_serve, "FastMCP", _FakeFastMCP)
 
     bridge = mcp_serve.EventBridge()
     server = mcp_serve.create_mcp_server(event_bridge=bridge)
@@ -492,7 +492,7 @@ class TestEventBridge:
 
 
 # ---------------------------------------------------------------------------
-# 3. END-TO-END TESTS — call MCP tools through MCPServer
+# 3. END-TO-END TESTS — call MCP tools through FastMCP server
 # ---------------------------------------------------------------------------
 
 @pytest.fixture
@@ -510,9 +510,9 @@ def mcp_server_e2e(populated_sessions_dir, mock_session_db, monkeypatch):
 
 
 def _run_tool(server, name, args=None):
-    """Call an MCP tool through MCPServer's tool manager and return parsed JSON."""
+    """Call an MCP tool through FastMCP's tool manager and return parsed JSON."""
     result = asyncio.get_event_loop().run_until_complete(
-        server._tool_manager.call_tool(name, args or {}, None)
+        server._tool_manager.call_tool(name, args or {})
     )
     return json.loads(result) if isinstance(result, str) else result
 

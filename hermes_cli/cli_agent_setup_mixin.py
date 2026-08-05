@@ -223,16 +223,17 @@ class CLIAgentSetupMixin:
 
         Called from the interactive startup path when
         ``_runtime_credentials_ready()`` is False and stdin is a TTY. Runs the
-        exact same flow as ``hermes model`` so there is a single source of
-        truth for provider onboarding. Nous uses a direct inference API key;
-        the retired Portal OAuth route is not offered. Returns True when a
-        provider was configured.
+        exact same flow as ``hermes model`` (which fronts Quick Setup / Nous
+        Portal OAuth as the first, recommended option) so there is a single
+        source of truth for provider onboarding. Returns True when a provider
+        was configured.
         """
         from cli import _cprint, logger
 
         _cprint("")
         _cprint("⚕ No inference provider is configured yet — let's fix that.")
-        _cprint("  You'll pick a provider and a model. Nous uses a direct API key.")
+        _cprint("  You'll pick a provider (Nous Portal OAuth is the fastest; "
+                "no API key needed) and a model.")
         try:
             answer = input("  Set up a provider now? [Y/n]: ").strip().lower()
         except (KeyboardInterrupt, EOFError):
@@ -670,7 +671,7 @@ class CLIAgentSetupMixin:
         last ``MAX_DISPLAY_EXCHANGES`` user/assistant exchanges and shows
         an indicator for earlier hidden messages.
         """
-        from cli import _record_output_history_entry, _strip_reasoning_tags, _suspend_output_history
+        from cli import CLI_CONFIG, _record_output_history_entry, _strip_reasoning_tags, _suspend_output_history
         from tools.ansi_strip import sanitize_display_text as _sanitize_display_text
         display_history = getattr(self, "_resume_display_history", self.conversation_history)
         if not display_history:
@@ -681,8 +682,7 @@ class CLIAgentSetupMixin:
             return
 
         # Read limits from config (with hardcoded defaults)
-        _config = getattr(self, "config", {})
-        _disp = _config.get("display", {}) if isinstance(_config, dict) else {}
+        _disp = CLI_CONFIG.get("display", {})
         MAX_DISPLAY_EXCHANGES = int(_disp.get("resume_exchanges", 10))
         MAX_USER_LEN = int(_disp.get("resume_max_user_chars", 300))
         MAX_ASST_LEN = int(_disp.get("resume_max_assistant_chars", 200))

@@ -258,7 +258,7 @@ def _resolve_allow_private_urls() -> bool:
 
     # 2. Config file
     try:
-        from hermes_runtime.config import read_raw_config
+        from hermes_cli.config import read_raw_config
         cfg = read_raw_config()
         # security.allow_private_urls (preferred)
         sec = cfg.get("security", {})

@@ -33,24 +33,6 @@ services:
       - HERMES_UID=10000
       - HERMES_GID=10000
       - HERMES_DASHBOARD_HOST=0.0.0.0
-    # Host access stays loopback-only: the 127.0.0.1: prefix keeps the
-    # published port off the LAN, preserving docker-compose.yml's
-    # localhost-only contract. For remote access, tunnel via
-    # `ssh -L 9119:localhost:9119` — do not widen this mapping.
     ports:
       - "127.0.0.1:9119:9119"
-    # Inside the container the dashboard must bind 0.0.0.0: Docker Desktop
-    # has no host networking, so the proxied connections from the port
-    # mapping above arrive on the container's bridge interface, not its
-    # loopback. That is still a non-loopback bind as far as the server is
-    # concerned, so an auth provider must be configured — since the
-    # June 2026 hardening the auth gate engages on every non-loopback bind,
-    # `--insecure` is a no-op, and the server fails closed (exits) when no
-    # provider is registered; with restart: unless-stopped that becomes a
-    # crash loop. Before first start, either:
-    #   - set dashboard.basic_auth.username + password_hash in
-    #     %USERPROFILE%\.hermes\config.yaml (hash via `python -c "from
-    #     plugins.dashboard_auth.basic import hash_password;
-    #     print(hash_password('PW'))"`), or
-    #   - register OAuth via `hermes dashboard register`.
-    command: ["dashboard", "--host", "0.0.0.0", "--port", "9119", "--no-open"]
+    command: ["dashboard", "--host", "0.0.0.0", "--port", "9119", "--no-open", "--insecure"]

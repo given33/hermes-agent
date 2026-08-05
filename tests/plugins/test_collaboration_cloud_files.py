@@ -1433,7 +1433,7 @@ def test_atomic_enqueue_is_idempotent_and_persists_message_route_and_turn_togeth
         assert len(conversation["messages"]) == 2
         routed_save_count = len(saves)
         assert routed_save_count > accepted_save_count
-        assert conversation["event_cursor"] >= 1
+        assert module._hosted_update_revision(conversation["id"]) >= 1
 
         replay = client.post(
             f"{prefix}/single/conversations/{conversation['id']}/enqueue",

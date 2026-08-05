@@ -116,9 +116,10 @@ class TestProviderRegistry:
         assert PROVIDER_REGISTRY["gmi"].inference_base_url == "https://api.gmi-serving.com/v1"
         assert PROVIDER_REGISTRY["huggingface"].inference_base_url == "https://router.huggingface.co/v1"
 
-    def test_nous_is_a_direct_api_key_provider(self):
+    def test_oauth_providers_unchanged(self):
+        """Ensure we didn't break the existing OAuth providers."""
         assert "nous" in PROVIDER_REGISTRY
-        assert PROVIDER_REGISTRY["nous"].auth_type == "api_key"
+        assert PROVIDER_REGISTRY["nous"].auth_type == "oauth_device_code"
         assert "openai-codex" in PROVIDER_REGISTRY
         assert PROVIDER_REGISTRY["openai-codex"].auth_type == "oauth_external"
 

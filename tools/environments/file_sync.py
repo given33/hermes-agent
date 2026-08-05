@@ -350,20 +350,13 @@ class FileSyncManager:
         except Exception:
             file_mapping = []
 
-        # Close the temporary file before handing its path to the backend.
-        # Windows denies a second writer while ``NamedTemporaryFile`` still
-        # owns the handle, so a callback that creates the tar archive at that
-        # path fails with ``PermissionError`` and sync-back silently gives up
-        # after its retries.  A temporary directory keeps cleanup automatic
-        # while allowing every backend to open the archive normally.
-        with tempfile.TemporaryDirectory(prefix="hermes-sync-download-") as download_dir:
-            tar_path = Path(download_dir) / "remote.tar"
-            self._bulk_download_fn(tar_path)
+        with tempfile.NamedTemporaryFile(suffix=".tar") as tf:
+            self._bulk_download_fn(Path(tf.name))
 
             # Defensive size cap: a misbehaving sandbox could produce an
             # arbitrarily large tar. Refuse to extract if it exceeds the cap.
             try:
-                tar_size = os.path.getsize(tar_path)
+                tar_size = os.path.getsize(tf.name)
             except OSError:
                 tar_size = 0
             if tar_size > _SYNC_BACK_MAX_BYTES:
@@ -374,7 +367,7 @@ class FileSyncManager:
                 return
 
             with tempfile.TemporaryDirectory(prefix="hermes-sync-back-") as staging:
-                with tarfile.open(tar_path) as tar:
+                with tarfile.open(tf.name) as tar:
                     tar.extractall(staging, filter="data")
 
                 applied = 0
@@ -385,13 +378,7 @@ class FileSyncManager:
                     for fname in filenames:
                         staged_file = os.path.join(dirpath, fname)
                         rel = os.path.relpath(staged_file, staging)
-                        # Tar member names are POSIX paths even when the
-                        # staging directory lives on Windows.  Normalize the
-                        # host separator before resolving the remote mapping;
-                        # otherwise ``/root/.hermes/...`` becomes a string
-                        # containing backslashes and never matches the
-                        # uploaded path map.
-                        remote_path = "/" + rel.replace(os.sep, "/")
+                        remote_path = "/" + rel
 
                         pushed_hash = self._pushed_hashes.get(remote_path)
 
@@ -470,7 +457,7 @@ class FileSyncManager:
         for host, remote in mapping:
             if self._is_upload_only_host_path(host, upload_only_host_paths):
                 continue
-            remote_dir = posixpath.dirname(remote) or "."
+            remote_dir = str(Path(remote).parent)
             if remote_path.startswith(remote_dir + "/"):
                 host_dir = str(Path(host).parent)
                 suffix = remote_path[len(remote_dir):]

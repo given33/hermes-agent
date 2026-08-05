@@ -1102,15 +1102,11 @@ def _build_child_progress_callback(
                     spinner.print_above(f" {prefix}├─ 🔀 {summary_text}")
                 except Exception as e:
                     logger.debug("Spinner print_above failed: %s", e)
-            # Keep this on the same identity-aware relay path as every other
-            # child event. Calling parent_cb directly used to drop the current
-            # subagent/session identity, so two nested orchestrators could
-            # collapse into one activity in hosted clients.
-            _relay(
-                "subagent.progress",
-                preview=f"{prefix}{summary_text}",
-                **kwargs,
-            )
+            if parent_cb:
+                try:
+                    parent_cb("subagent_progress", f"{prefix}{summary_text}")
+                except Exception as e:
+                    logger.debug("Parent callback relay failed: %s", e)
             return
 
         # TASK_TOOL_STARTED — display and batch for parent relay
@@ -3176,7 +3172,7 @@ def delegate_task(
         # of handing out a handle with no durable consumer. Mirrors the
         # pool-at-capacity inline fallback below.
         try:
-            from hermes_runtime.session_context import async_delivery_supported
+            from gateway.session_context import async_delivery_supported
             _async_ok = async_delivery_supported()
         except Exception:
             _async_ok = True
@@ -3223,7 +3219,7 @@ def delegate_task(
         _session_key = get_current_session_key(default="")
         _origin_ui_session_id = ""
         try:
-            from hermes_runtime.session_context import get_session_env
+            from gateway.session_context import get_session_env
 
             _source = get_session_env("HERMES_SESSION_SOURCE", "")
             _origin_ui_session_id = get_session_env("HERMES_UI_SESSION_ID", "")
@@ -3532,11 +3528,11 @@ def _resolve_delegation_credentials(cfg: dict, parent_agent) -> dict:
         # proxies — pick the right transport automatically. Without this,
         # subagents would default to chat_completions and hit 404s on endpoints
         # that only speak the Anthropic Messages protocol. Fixes #10213.
-        from agent.runtime_provider import detect_api_mode_for_url
+        from hermes_cli.runtime_provider import _detect_api_mode_for_url
 
         base_lower = configured_base_url.lower()
         provider = "custom"
-        api_mode = detect_api_mode_for_url(configured_base_url) or "chat_completions"
+        api_mode = _detect_api_mode_for_url(configured_base_url) or "chat_completions"
         if (
             base_url_hostname(configured_base_url) == "chatgpt.com"
             and "/backend-api/codex" in base_lower
@@ -3577,7 +3573,7 @@ def _resolve_delegation_credentials(cfg: dict, parent_agent) -> dict:
 
     # Provider is configured — resolve full credentials
     try:
-        from agent.runtime_provider import resolve_runtime_provider
+        from hermes_cli.runtime_provider import resolve_runtime_provider
 
         runtime = resolve_runtime_provider(requested=configured_provider, target_model=configured_model)
     except Exception as exc:
@@ -3611,11 +3607,11 @@ def _resolve_delegation_credentials(cfg: dict, parent_agent) -> dict:
 def _load_config() -> dict:
     """Load delegation config from the active Hermes config.
 
-    The runtime configuration authority follows the active HERMES_HOME/profile
-    and is the only supported source.  The historical ``cli.CLI_CONFIG``
-    import-time snapshot is deliberately not a fallback: returning stale
-    values after a read failure is less safe than using the documented
-    delegation defaults.
+    Prefer the shared persistent loader because it follows the active
+    HERMES_HOME/profile. ``cli.CLI_CONFIG`` is a legacy fallback for entry
+    points that cannot import the shared loader; importing it first can return
+    an old default ``delegation`` block and hide user-set keys such as
+    ``max_concurrent_children``.
 
     Uses ``load_config_readonly()``: every consumer of this dict is read-only
     (``.get()`` lookups), and this runs on each ``get_definitions()`` schema
@@ -3623,20 +3619,26 @@ def _load_config() -> dict:
     deepcopy matters. Do NOT mutate the returned dict.
 
     ``HERMES_IGNORE_USER_CONFIG=1`` (``hermes chat --ignore-user-config``) is
-    honored by the shared loader itself (hermes_runtime.config._load_config_impl
-    treats the user file as absent), so the flag needs no loader-choice
-    compensation here anymore. Historically only the legacy ``cli`` loader
-    honored it, which forced this function to prefer ``cli.CLI_CONFIG`` under
-    the flag — tests/architecture/test_ignore_user_config_convergence.py
-    proves both entry points now agree.
+    only honored by the legacy ``cli`` loader, not the shared one, so when the
+    flag is set we keep ``cli.CLI_CONFIG`` authoritative to preserve the
+    flag's contract of suppressing user config.yaml settings.
     """
-    try:
-        from hermes_runtime.config import load_config_readonly
+    prefer_legacy = os.environ.get("HERMES_IGNORE_USER_CONFIG") == "1"
+    if not prefer_legacy:
+        try:
+            from hermes_cli.config import load_config_readonly
 
-        full = load_config_readonly()
-        cfg = full.get("delegation") or {}
-        if isinstance(cfg, dict):
-            return cfg
+            full = load_config_readonly()
+            cfg = full.get("delegation") or {}
+            if isinstance(cfg, dict):
+                return cfg
+        except Exception:
+            pass
+    try:
+        from cli import CLI_CONFIG
+
+        cfg = CLI_CONFIG.get("delegation") or {}
+        return cfg if isinstance(cfg, dict) else {}
     except Exception:
         return {}
 

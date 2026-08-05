@@ -308,15 +308,17 @@ def build_gateway_parser(
     gateway_enroll.set_defaults(func=cmd_gateway_enroll)
 
     # =========================================================================
-    # proxy command — local OpenAI-compatible proxy that attaches supported
-    # OAuth provider credentials to outbound requests.
+    # proxy command — local OpenAI-compatible proxy that attaches the user's
+    # OAuth-authenticated provider credentials to outbound requests. Lets
+    # external apps (OpenViking, Karakeep, Open WebUI, ...) ride a logged-in
+    # subscription without copy-pasting static API keys.
     # =========================================================================
     proxy_parser = subparsers.add_parser(
         "proxy",
         help="Local OpenAI-compatible proxy to OAuth providers",
         description=(
             "Run a local HTTP server that forwards OpenAI-compatible requests "
-            "to a supported OAuth-authenticated provider. External "
+            "to an OAuth-authenticated provider (e.g. Nous Portal). External "
             "apps can point at the proxy with any bearer token; the proxy "
             "attaches your real credentials."
         ),
@@ -328,8 +330,8 @@ def build_gateway_parser(
     )
     proxy_start.add_argument(
         "--provider",
-        default="xai",
-        help="Upstream provider: xai (default: xai). See `hermes proxy providers`.",
+        default="nous",
+        help="Upstream provider: nous or xai (default: nous). See `hermes proxy providers`.",
     )
     proxy_start.add_argument(
         "--host",

@@ -42,7 +42,7 @@ export function resolvePageTitle(
   }
   const key = BUILTIN[normalized];
   if (key) {
-    return t.app.nav[key] ?? key.charAt(0).toUpperCase() + key.slice(1);
+    return t.app.nav[key];
   }
   const literal = BUILTIN_LITERAL[normalized];
   if (literal) {

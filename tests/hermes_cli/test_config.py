@@ -36,12 +36,7 @@ class TestGetHermesHome:
         with patch.dict(os.environ, {}, clear=False):
             os.environ.pop("HERMES_HOME", None)
             home = get_hermes_home()
-            expected = (
-                Path(os.environ["LOCALAPPDATA"]) / "hermes"
-                if os.name == "nt"
-                else Path.home() / ".hermes"
-            )
-            assert home == expected
+            assert home == Path.home() / ".hermes"
 
 
 class TestEnsureHermesHome:
@@ -127,9 +122,9 @@ class TestLoadConfigParseFailure:
             baks = list(tmp_path.glob("config.yaml.corrupt.*.bak"))
             assert len(baks) == 1, f"expected one backup, got {baks}"
             # Backup preserves the original broken content verbatim
-            assert baks[0].read_text(encoding="utf-8") == broken
+            assert baks[0].read_text() == broken
             # Original config.yaml is left untouched (not reset to clean state)
-            assert (tmp_path / "config.yaml").read_text(encoding="utf-8") == broken
+            assert (tmp_path / "config.yaml").read_text() == broken
             # User is told where the backup landed
             assert str(baks[0]) in err
 
@@ -229,7 +224,7 @@ class TestSaveAndLoadRoundtrip:
             assert reloaded["model"] == "test/custom-model"
             assert reloaded["agent"]["max_turns"] == 42
 
-            saved = yaml.safe_load((tmp_path / "config.yaml").read_text(encoding="utf-8"))
+            saved = yaml.safe_load((tmp_path / "config.yaml").read_text())
             assert saved["agent"]["max_turns"] == 42
             assert "max_turns" not in saved
 
@@ -335,7 +330,7 @@ class TestRemoveEnvValue:
         with patch.dict(os.environ, {"HERMES_HOME": str(tmp_path), "KEY_B": "value_b"}):
             result = remove_env_value("KEY_B")
             assert result is True
-            content = env_path.read_text(encoding="utf-8")
+            content = env_path.read_text()
             assert "KEY_B" not in content
             assert "KEY_A=value_a" in content
             assert "KEY_C=value_c" in content
@@ -366,7 +361,7 @@ class TestRemoveEnvValue:
             removed = remove_env_value("DROP")
 
         assert removed is True
-        assert "DROP" not in env_path.read_text(encoding="utf-8")
+        assert "DROP" not in env_path.read_text()
         env_mode = env_path.stat().st_mode & 0o777
         assert env_mode == 0o640, f"expected 0o640, got {oct(env_mode)}"
 
@@ -1108,7 +1103,7 @@ class TestWriteApprovalMigration:
                         "_config_version: 28\nmemory:\n  write_mode: approve\n"
                         "skills:\n  write_mode: approve\n")
             migrate_config(interactive=False, quiet=True)
-            raw = yaml.safe_load((tmp_path / "config.yaml").read_text(encoding="utf-8"))
+            raw = yaml.safe_load((tmp_path / "config.yaml").read_text())
             assert raw["memory"]["write_approval"] is True
             assert raw["skills"]["write_approval"] is True
             assert "write_mode" not in raw["memory"]
@@ -1122,7 +1117,7 @@ class TestWriteApprovalMigration:
                         "_config_version: 28\nmemory:\n  write_mode: 'on'\n"
                         "skills:\n  write_mode: 'off'\n")
             migrate_config(interactive=False, quiet=True)
-            raw = yaml.safe_load((tmp_path / "config.yaml").read_text(encoding="utf-8"))
+            raw = yaml.safe_load((tmp_path / "config.yaml").read_text())
             loaded = load_config()
             # write_approval=False equals the schema default, so it is NOT
             # materialised to disk (lean-config invariant) — the legacy
@@ -1256,89 +1251,6 @@ platforms:
         assert raw["agent"]["max_turns"] == 60
         assert raw["_config_version"] == 32
 
-    # ── Fail-closed on a corrupt on-disk document ───────────────────────────
-    # read_raw_config() degrades a YAML parse error to {}, and _persist_migration
-    # writes via save_config(merge_existing=False). Without a guard, an
-    # unattended version bump against a config with one bad indent replaces the
-    # user's whole file with just the migrated section.
-    # require_readable_config_before_write() does NOT cover this: it proves the
-    # bytes are readable, not that they parse.
-
-    CORRUPT_CONFIG = (
-        "_config_version: 4\n"
-        "model:\n"
-        "  default: [unterminated\n"
-        "platforms:\n"
-        "  feishu:\n"
-        "    enabled: true\n"
-        "    extra:\n"
-        "      app_id: cli_xxx\n"
-    )
-
-    def test_persist_migration_refuses_to_write_over_a_corrupt_config(self, tmp_path):
-        """An existing-but-unparseable config.yaml aborts the write."""
-        from hermes_cli.config import _persist_migration
-
-        cfg_file = tmp_path / "config.yaml"
-        cfg_file.write_text(self.CORRUPT_CONFIG, encoding="utf-8")
-
-        with patch.dict(os.environ, {"HERMES_HOME": str(tmp_path)}):
-            with pytest.raises(yaml.YAMLError):
-                _persist_migration(
-                    {"_config_version": 99, "display": {"tool_progress": "all"}}
-                )
-
-        # Byte-identical: the user can still hand-fix the indent and keep
-        # everything. A wipe would have left only _config_version + display.
-        assert cfg_file.read_text(encoding="utf-8") == self.CORRUPT_CONFIG
-
-    def test_persist_migration_refuses_a_non_mapping_config(self, tmp_path):
-        """A valid-YAML-but-not-a-mapping document is refused, not coerced."""
-        from hermes_cli.config import _persist_migration
-
-        body = "- just\n- a\n- list\n"
-        cfg_file = tmp_path / "config.yaml"
-        cfg_file.write_text(body, encoding="utf-8")
-
-        with patch.dict(os.environ, {"HERMES_HOME": str(tmp_path)}):
-            with pytest.raises(ValueError):
-                _persist_migration({"_config_version": 99})
-
-        assert cfg_file.read_text(encoding="utf-8") == body
-
-    def test_migrate_config_leaves_a_corrupt_config_untouched(self, tmp_path):
-        """End-to-end: the unattended path (`hermes update`, first launch after a
-        version bump, `doctor --fix`, profile creation) must not destroy a
-        corrupt-but-recoverable config.yaml."""
-        import contextlib
-
-        from hermes_cli.config import migrate_config
-
-        cfg_file = tmp_path / "config.yaml"
-        cfg_file.write_text(self.CORRUPT_CONFIG, encoding="utf-8")
-
-        with patch.dict(os.environ, {"HERMES_HOME": str(tmp_path)}):
-            # Every production caller wraps this in try/except and reports the
-            # failure, so raising here is the designed outcome — what must never
-            # happen is a silent successful overwrite.
-            with contextlib.suppress(Exception):
-                migrate_config(interactive=False, quiet=True)
-
-        assert cfg_file.read_text(encoding="utf-8") == self.CORRUPT_CONFIG
-
-    def test_persist_migration_still_creates_an_absent_config(self, tmp_path):
-        """The guard must not break first-run: no file yet is not corruption."""
-        from hermes_cli.config import _persist_migration
-
-        cfg_file = tmp_path / "config.yaml"
-        assert not cfg_file.exists()
-
-        with patch.dict(os.environ, {"HERMES_HOME": str(tmp_path)}):
-            _persist_migration({"_config_version": 99, "timezone": "Asia/Shanghai"})
-            raw = yaml.safe_load(cfg_file.read_text(encoding="utf-8"))
-
-        assert raw["timezone"] == "Asia/Shanghai"
-
     def test_v30_to_latest_migration_keeps_platforms(self, tmp_path):
         """End-to-end: reporter's v30 feishu profile survives version bump."""
         body = """_config_version: 30
@@ -1383,7 +1295,7 @@ class TestDelegationCapUnificationMigration:
         with patch.dict(os.environ, {"HERMES_HOME": str(tmp_path)}):
             self._write(tmp_path, "_config_version: 32\nmodel:\n  provider: openrouter\n")
             migrate_config(interactive=False, quiet=True)
-            raw = yaml.safe_load((tmp_path / "config.yaml").read_text(encoding="utf-8"))
+            raw = yaml.safe_load((tmp_path / "config.yaml").read_text())
         # Migration must not materialize a delegation section it never had.
         assert "delegation" not in raw
 
@@ -1442,7 +1354,7 @@ class TestCodexAppServerAutoConfig:
 
             migrate_config(interactive=False, quiet=True)
 
-            raw = yaml.safe_load((tmp_path / "config.yaml").read_text(encoding="utf-8"))
+            raw = yaml.safe_load((tmp_path / "config.yaml").read_text())
             assert raw["compression"]["codex_app_server_auto"] == "hermes"
 
 

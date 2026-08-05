@@ -1883,21 +1883,21 @@ class IOSMCPRuntimeSupervisor:
         timeout_seconds = min(180.0, max(1.0, float(timeout_seconds)))
 
         async def probe() -> list[str]:
-            import httpx2
-            from mcp import Client
+            import httpx
+            from mcp import ClientSession
             from mcp.client.streamable_http import streamable_http_client
-            from mcp.types.version import LATEST_PROTOCOL_VERSION
 
             request_timeout = max(1.0, timeout_seconds - 1.0)
-            timeout = httpx2.Timeout(request_timeout, connect=min(5.0, request_timeout))
-            async with httpx2.AsyncClient(timeout=timeout) as http_client:
-                transport = streamable_http_client(
+            timeout = httpx.Timeout(request_timeout, connect=min(5.0, request_timeout))
+            async with httpx.AsyncClient(timeout=timeout) as http_client:
+                async with streamable_http_client(
                     url,
                     http_client=http_client,
                     terminate_on_close=True,
-                )
-                async with Client(transport, mode=LATEST_PROTOCOL_VERSION) as client:
-                    result = await client.list_tools()
+                ) as (read_stream, write_stream, _):
+                    async with ClientSession(read_stream, write_stream) as client:
+                        await client.initialize()
+                        result = await client.list_tools()
                     return [tool.name for tool in result.tools]
 
         async def bounded_probe() -> list[str]:

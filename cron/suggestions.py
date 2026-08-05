@@ -47,8 +47,6 @@ logger = logging.getLogger(__name__)
 # shared default root. See cron/jobs.py for the full rationale.
 CRON_DIR = get_hermes_home().resolve() / "cron"
 SUGGESTIONS_FILE = CRON_DIR / "suggestions.json"
-_IMPORT_CRON_DIR = CRON_DIR
-_IMPORT_SUGGESTIONS_FILE = SUGGESTIONS_FILE
 
 # In-process lock protecting load->modify->save cycles (the background review
 # fork and the main agent can both write).
@@ -64,14 +62,6 @@ _STATUS_ACCEPTED = "accepted"
 _STATUS_DISMISSED = "dismissed"
 
 
-def _current_paths() -> tuple[Path, Path]:
-    """Resolve the active profile store while preserving explicit overrides."""
-    if CRON_DIR != _IMPORT_CRON_DIR or SUGGESTIONS_FILE != _IMPORT_SUGGESTIONS_FILE:
-        return CRON_DIR, SUGGESTIONS_FILE
-    cron_dir = get_hermes_home().resolve() / "cron"
-    return cron_dir, cron_dir / "suggestions.json"
-
-
 def _secure_file(path: Path) -> None:
     try:
         os.chmod(path, 0o600)
@@ -80,16 +70,14 @@ def _secure_file(path: Path) -> None:
 
 
 def _ensure_dir() -> None:
-    cron_dir, _ = _current_paths()
-    cron_dir.mkdir(parents=True, exist_ok=True)
+    CRON_DIR.mkdir(parents=True, exist_ok=True)
 
 
 def _load_raw() -> Dict[str, Any]:
-    _, suggestions_file = _current_paths()
-    if not suggestions_file.exists():
+    if not SUGGESTIONS_FILE.exists():
         return {"suggestions": []}
     try:
-        with open(suggestions_file, "r", encoding="utf-8") as f:
+        with open(SUGGESTIONS_FILE, "r", encoding="utf-8") as f:
             data = json.load(f)
     except (json.JSONDecodeError, OSError) as e:
         logger.warning("suggestions.json unreadable (%s); starting empty", e)
@@ -104,8 +92,7 @@ def _load_raw() -> Dict[str, Any]:
 
 def _save_raw(suggestions: List[Dict[str, Any]]) -> None:
     _ensure_dir()
-    _, suggestions_file = _current_paths()
-    fd, tmp_path = tempfile.mkstemp(dir=str(suggestions_file.parent), suffix=".tmp", prefix=".sugg_")
+    fd, tmp_path = tempfile.mkstemp(dir=str(SUGGESTIONS_FILE.parent), suffix=".tmp", prefix=".sugg_")
     try:
         with os.fdopen(fd, "w", encoding="utf-8") as f:
             json.dump(
@@ -115,8 +102,8 @@ def _save_raw(suggestions: List[Dict[str, Any]]) -> None:
             )
             f.flush()
             os.fsync(f.fileno())
-        atomic_replace(tmp_path, suggestions_file)
-        _secure_file(suggestions_file)
+        atomic_replace(tmp_path, SUGGESTIONS_FILE)
+        _secure_file(SUGGESTIONS_FILE)
     except BaseException:
         try:
             os.unlink(tmp_path)

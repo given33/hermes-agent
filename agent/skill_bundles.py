@@ -286,7 +286,7 @@ def build_bundle_invocation_message(
     from agent.skill_commands import _load_skill_payload, _build_skill_message
 
     try:
-        from hermes_runtime.skill_utils import get_disabled_skill_names
+        from agent.skill_utils import get_disabled_skill_names
         disabled_names = get_disabled_skill_names(platform=platform)
     except Exception:
         disabled_names = set()

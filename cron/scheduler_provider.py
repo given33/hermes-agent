@@ -88,14 +88,7 @@ class CronScheduler(ABC):
 
         return recover_interrupted_executions()
 
-    def fire_due(
-        self,
-        job_id: str,
-        *,
-        fire_at: str | None = None,
-        adapters: Any = None,
-        loop: Any = None,
-    ) -> bool:
+    def fire_due(self, job_id: str, *, adapters: Any = None, loop: Any = None) -> bool:
         """Run a single job NOW via the shared orchestrator. Called by the
         inbound fire webhook when an external scheduler signals a job is due.
 
@@ -111,12 +104,7 @@ class CronScheduler(ABC):
         from cron.executions import create_execution
         from cron.scheduler import run_one_job
 
-        claimed = (
-            claim_job_for_fire(job_id, fire_at=fire_at)
-            if fire_at is not None
-            else claim_job_for_fire(job_id)
-        )
-        if not claimed:
+        if not claim_job_for_fire(job_id):
             return False  # another machine already claimed this fire
         job = get_job(job_id)
         if job is None:
@@ -145,7 +133,7 @@ def resolve_cron_scheduler() -> "CronScheduler":
 
     name = ""
     try:
-        from hermes_runtime.config import cfg_get, load_config
+        from hermes_cli.config import cfg_get, load_config
         name = (cfg_get(load_config(), "cron", "provider", default="") or "").strip()
     except Exception:
         pass

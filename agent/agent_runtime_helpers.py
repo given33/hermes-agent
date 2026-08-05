@@ -32,7 +32,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
-from hermes_runtime.timeouts import get_provider_request_timeout
+from hermes_cli.timeouts import get_provider_request_timeout
 from agent.prompt_builder import format_steer_marker
 from agent.tool_dispatch_helpers import _trajectory_normalize_msg, make_tool_result_message
 from agent.trajectory import convert_scratchpad_to_think
@@ -447,8 +447,6 @@ def sanitize_tool_call_arguments(
 # per-agent marker it extends.
 _INFLIGHT_TURNS_BY_SESSION: Dict[str, Tuple[str, float]] = {}
 _INFLIGHT_TURNS_LOCK = threading.Lock()
-_INFLIGHT_TURN_TTL_SECONDS = 6 * 60 * 60
-_INFLIGHT_TURNS_MAX = 4096
 
 
 def note_turn_start(agent, turn_id: str):
@@ -496,18 +494,8 @@ def note_turn_start(agent, turn_id: str):
     if session_id and not getattr(agent, "_persist_disabled", False):
         now = time.time()
         with _INFLIGHT_TURNS_LOCK:
-            stale_before = now - _INFLIGHT_TURN_TTL_SECONDS
-            for stale_session, (_, started_at) in list(
-                _INFLIGHT_TURNS_BY_SESSION.items()
-            ):
-                if started_at < stale_before:
-                    _INFLIGHT_TURNS_BY_SESSION.pop(stale_session, None)
             entry = _INFLIGHT_TURNS_BY_SESSION.get(session_id)
-            _INFLIGHT_TURNS_BY_SESSION.pop(session_id, None)
             _INFLIGHT_TURNS_BY_SESSION[session_id] = (turn_id, now)
-            while len(_INFLIGHT_TURNS_BY_SESSION) > _INFLIGHT_TURNS_MAX:
-                oldest_session = next(iter(_INFLIGHT_TURNS_BY_SESSION))
-                _INFLIGHT_TURNS_BY_SESSION.pop(oldest_session, None)
         # Stamp the session id this turn registered under: compression can
         # rotate agent.session_id mid-turn, and the persist-time clear must
         # pop the slot the turn actually holds, not the rotated id.
@@ -1905,7 +1893,7 @@ def dump_api_request_debug(
         # Run the serialized dump through the same scrubber used for logs/tool
         # output, then hand the resulting payload back to the shared atomic
         # JSON writer so request dumps keep the same write semantics as before.
-        from hermes_runtime.redaction import redact_sensitive_text
+        from agent.redact import redact_sensitive_text
         _serialized = json.dumps(dump_payload, ensure_ascii=False, indent=2, default=str)
         _redacted_payload = json.loads(redact_sensitive_text(_serialized, force=True))
         atomic_json_write(dump_file, _redacted_payload, default=str)
@@ -2118,9 +2106,9 @@ def anthropic_prompt_cache_policy(
     # the policy from the preset's real aggregator slot instead.
     if eff_provider.strip().lower() == "moa":
         try:
-            from hermes_runtime.config import load_config as _load_moa_cfg
-            from agent.moa_config import resolve_moa_preset
-            from agent.runtime_provider import resolve_runtime_provider
+            from hermes_cli.config import load_config as _load_moa_cfg
+            from hermes_cli.moa_config import resolve_moa_preset
+            from hermes_cli.runtime_provider import resolve_runtime_provider
 
             _preset = resolve_moa_preset(
                 _load_moa_cfg().get("moa") or {}, eff_model or None
@@ -2376,7 +2364,7 @@ def switch_model(agent, new_model, new_provider, api_key='', base_url='', api_mo
     change persists across turns (unlike fallback which is
     turn-scoped).
     """
-    from agent.provider_registry import determine_api_mode
+    from hermes_cli.providers import determine_api_mode
 
     # ── Determine api_mode if not provided ──
     # Pass model so dual-wire providers (Nous Portal anthropic/* → Messages)
@@ -2553,7 +2541,7 @@ def switch_model(agent, new_model, new_provider, api_key='', base_url='', api_mo
             # the matching block in agent_init.py for the full rationale.
             if new_provider == "minimax-oauth" and isinstance(effective_key, str) and effective_key:
                 try:
-                    from agent.provider_auth import build_minimax_oauth_token_provider
+                    from hermes_cli.auth import build_minimax_oauth_token_provider
                     effective_key = build_minimax_oauth_token_provider()
                 except Exception as _mm_exc:  # noqa: BLE001
                     import logging as _logging
@@ -2581,7 +2569,7 @@ def switch_model(agent, new_model, new_provider, api_key='', base_url='', api_mo
                 "base_url": effective_base,
             }
             try:
-                from hermes_runtime.config import (
+                from hermes_cli.config import (
                     apply_custom_provider_tls_to_client_kwargs,
                     get_compatible_custom_providers,
                     load_config_readonly,
@@ -2704,7 +2692,7 @@ def switch_model(agent, new_model, new_provider, api_key='', base_url='', api_mo
     # boolean False = disabled).
     try:
         from hermes_constants import resolve_reasoning_config
-        from hermes_runtime.config import load_config as _sm_load_config
+        from hermes_cli.config import load_config as _sm_load_config
 
         _reasoning_cfg = _sm_load_config() or {}
         agent.reasoning_config = resolve_reasoning_config(_reasoning_cfg, agent.model)
@@ -2821,7 +2809,7 @@ def invoke_tool(agent, function_name: str, function_args: dict, effective_task_i
 
     _tool_middleware_trace = list(tool_request_middleware_trace or [])
     try:
-        from hermes_services.middleware import apply_tool_request_middleware
+        from hermes_cli.middleware import apply_tool_request_middleware
 
         if not skip_tool_request_middleware:
             _tool_request_mw = apply_tool_request_middleware(
@@ -2999,7 +2987,6 @@ def invoke_tool(agent, function_name: str, function_args: dict, effective_task_i
                 enabled_toolsets=getattr(agent, "enabled_toolsets", None),
                 disabled_toolsets=getattr(agent, "disabled_toolsets", None),
                 tool_request_middleware_trace=list(_tool_middleware_trace),
-                enforce_tool_isolation=True,
             )
             if skip_tool_execution_middleware:
                 dispatch_kwargs["skip_tool_execution_middleware"] = True
@@ -3013,7 +3000,7 @@ def invoke_tool(agent, function_name: str, function_args: dict, effective_task_i
     if skip_tool_execution_middleware:
         return _execute(function_args)
 
-    from hermes_services.middleware import run_tool_execution_middleware
+    from hermes_cli.middleware import run_tool_execution_middleware
 
     return run_tool_execution_middleware(
         function_name,
@@ -3264,10 +3251,6 @@ def sanitize_api_messages(messages: List[Dict[str, Any]]) -> List[Dict[str, Any]
                 role,
             )
             continue
-        # Internal audit metadata must never cross the provider protocol
-        # boundary, including callers that bypass the normal builders.
-        if "hook_trace" in msg:
-            msg = {key: value for key, value in msg.items() if key != "hook_trace"}
         filtered.append(msg)
     messages = filtered
 

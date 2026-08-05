@@ -939,13 +939,13 @@ def test_write_json_drops_detached_ws_frames(monkeypatch):
 
 
 def test_tui_verbose_tool_details_fail_closed_when_redaction_fails(monkeypatch):
-    redact_module = types.ModuleType("hermes_runtime.redaction")
+    redact_module = types.ModuleType("agent.redact")
 
     def fail_redaction(*_args, **_kwargs):
         raise RuntimeError("redaction unavailable")
 
     setattr(redact_module, "redact_sensitive_text", fail_redaction)
-    monkeypatch.setitem(sys.modules, "hermes_runtime.redaction", redact_module)
+    monkeypatch.setitem(sys.modules, "agent.redact", redact_module)
 
     assert server._redact_tui_verbose_text("api_key=secret") == ""
     assert server._tool_args_text({"api_key": "secret"}) == ""
@@ -978,13 +978,13 @@ def test_tui_verbose_default_cap_stays_small(monkeypatch):
 
 
 def test_tui_verbose_tool_events_omit_details_when_redaction_fails(monkeypatch):
-    redact_module = types.ModuleType("hermes_runtime.redaction")
+    redact_module = types.ModuleType("agent.redact")
 
     def fail_redaction(*_args, **_kwargs):
         raise RuntimeError("redaction unavailable")
 
     setattr(redact_module, "redact_sensitive_text", fail_redaction)
-    monkeypatch.setitem(sys.modules, "hermes_runtime.redaction", redact_module)
+    monkeypatch.setitem(sys.modules, "agent.redact", redact_module)
 
     events: list[tuple[str, str, dict]] = []
     monkeypatch.setattr(
@@ -11994,67 +11994,6 @@ def test_prompt_submit_auto_titles_session_on_complete(monkeypatch):
     }
 
 
-def test_prompt_submit_schedules_one_mobile_completion_push(monkeypatch):
-    class _Agent:
-        def run_conversation(
-            self, prompt, conversation_history=None, stream_callback=None
-        ):
-            return {
-                "final_response": "The requested report is ready.",
-                "messages": [
-                    {"role": "user", "content": prompt},
-                    {"role": "assistant", "content": "The requested report is ready."},
-                ],
-            }
-
-    pushes = []
-    sid = "ios-mobile-notification"
-    server._sessions[sid] = _session(agent=_Agent())
-    monkeypatch.setattr(server.threading, "Thread", _ImmediateThread)
-    monkeypatch.setattr(server, "_emit", lambda *args, **kwargs: None)
-    monkeypatch.setattr(server, "make_stream_renderer", lambda cols: None)
-    monkeypatch.setattr(server, "render_message", lambda raw, cols: None)
-    monkeypatch.setattr(server, "_get_db", lambda: None)
-    monkeypatch.setattr(
-        "hermes_cli.dashboard_auth.mobile_notifications.schedule_task_completion_push",
-        lambda **kwargs: pushes.append(kwargs),
-    )
-
-    try:
-        response = server.handle_request(
-            {
-                "id": "mobile-turn",
-                "method": "prompt.submit",
-                "params": {
-                    "conversation_id": "conversation-42",
-                    "owner_id": "owner-42",
-                    "session_id": sid,
-                    "text": "Build the report",
-                    "turn_id": "turn-9",
-                },
-            }
-        )
-
-        assert response["result"]["status"] == "streaming"
-        assert pushes == [
-            {
-                "owner_id": "owner-42",
-                "conversation_id": "conversation-42",
-                "turn_id": "turn-9",
-                "status": "completed",
-                "result": "The requested report is ready.",
-            }
-        ]
-        assert server._schedule_mobile_turn_notification(
-            server._sessions[sid],
-            status="complete",
-            result="duplicate",
-        ) is False
-        assert len(pushes) == 1
-    finally:
-        server._sessions.pop(sid, None)
-
-
 def test_prompt_submit_skips_auto_title_when_interrupted(monkeypatch):
     """maybe_auto_title must NOT be called when the agent was interrupted."""
 
@@ -12713,7 +12652,7 @@ def test_browser_manage_status_falls_back_to_config_cdp_url(monkeypatch):
     fake_cfg = types.SimpleNamespace(
         read_raw_config=lambda: {"browser": {"cdp_url": "http://lan:9222"}}
     )
-    with patch.dict(sys.modules, {"hermes_runtime.config": fake_cfg}):
+    with patch.dict(sys.modules, {"hermes_cli.config": fake_cfg}):
         resp = server.handle_request(
             {"id": "1", "method": "browser.manage", "params": {"action": "status"}}
         )
@@ -13458,7 +13397,7 @@ def test_reload_env_rpc_calls_hermes_cli_reload_env(monkeypatch):
         return 7
 
     fake = types.SimpleNamespace(reload_env=_fake_reload)
-    with patch.dict(sys.modules, {"hermes_runtime.config": fake}):
+    with patch.dict(sys.modules, {"hermes_cli.config": fake}):
         resp = server.handle_request({"id": "1", "method": "reload.env", "params": {}})
 
     assert resp["result"] == {"updated": 7}
@@ -13470,7 +13409,7 @@ def test_reload_env_rpc_surfaces_errors(monkeypatch):
         raise RuntimeError("env path locked")
 
     fake = types.SimpleNamespace(reload_env=_broken)
-    with patch.dict(sys.modules, {"hermes_runtime.config": fake}):
+    with patch.dict(sys.modules, {"hermes_cli.config": fake}):
         resp = server.handle_request({"id": "1", "method": "reload.env", "params": {}})
 
     assert "error" in resp
@@ -14894,23 +14833,6 @@ def test_start_agent_build_passes_session_model_override(
 # ── billing/subscription state + error serialization ─────────────────
 
 
-def test_nous_account_rpc_methods_are_not_registered():
-    removed = {
-        "billing.state",
-        "billing.charge",
-        "billing.charge_status",
-        "billing.auto_reload",
-        "billing.step_up",
-        "usage.bars",
-        "subscription.state",
-        "subscription.preview",
-        "subscription.change",
-        "subscription.resume",
-        "subscription.upgrade",
-    }
-    assert removed.isdisjoint(server._methods)
-
-
 def test_reset_session_agent_clears_session_overrides(monkeypatch):
     """/new is a full conversation boundary: session-scoped /model, /reasoning,
     and /fast overrides do NOT carry into the fresh agent — it re-derives
@@ -15053,8 +14975,6 @@ def test_billing_rate_limit_without_error_defaults_wire_code():
 def _sub_rpc(method, params):
     # These RPCs are in _LONG_HANDLERS (pool-routed → dispatch returns None and the
     # worker writes via the transport), so drive the inline handler directly.
-    if method not in server._methods:
-        pytest.skip("Nous account product is removed from this fork")
     return server.handle_request({"id": "1", "method": method, "params": params})["result"]
 
 

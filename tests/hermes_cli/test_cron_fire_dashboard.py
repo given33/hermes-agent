@@ -13,24 +13,11 @@ hosted agents don't expose). It must:
     background, returning 202.
 """
 
-import time
-
 import pytest
 from starlette.testclient import TestClient
 
 from hermes_cli import web_server
 from hermes_cli.dashboard_auth.public_paths import PUBLIC_API_PATHS
-
-_FIRE_AT = "2026-08-01T00:00:00+00:00"
-
-
-def _claims(job_id):
-    return {
-        "purpose": "cron_fire",
-        "aud": "agent:x",
-        "job_id": job_id,
-        "fire_at": _FIRE_AT,
-    }
 
 
 def _client(auth_required: bool):
@@ -91,7 +78,7 @@ def test_bad_token_401(monkeypatch):
 def test_missing_job_id_400(monkeypatch):
     monkeypatch.setattr(
         "plugins.cron_providers.chronos.verify.get_fire_verifier",
-        lambda: (lambda **kw: _claims("ghost")),
+        lambda: (lambda **kw: {"purpose": "cron_fire"}),
     )
     client, pa, ph = _client(auth_required=False)
     try:
@@ -109,14 +96,14 @@ def test_unknown_job_200_gone(monkeypatch):
     (NAS shouldn't retry a fire for a cancelled/completed job)."""
     monkeypatch.setattr(
         "plugins.cron_providers.chronos.verify.get_fire_verifier",
-        lambda: (lambda **kw: _claims("ghost")),
+        lambda: (lambda **kw: {"purpose": "cron_fire"}),
     )
     monkeypatch.setattr(web_server, "_find_cron_job_profile", lambda jid: None)
     client, pa, ph = _client(auth_required=False)
     try:
         resp = client.post("/api/cron/fire",
                            headers={"Authorization": "Bearer good"},
-                           json={"job_id": "ghost", "fire_at": _FIRE_AT})
+                           json={"job_id": "ghost"})
         assert resp.status_code == 200
         assert resp.json().get("status") == "gone"
     finally:

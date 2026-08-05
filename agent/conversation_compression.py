@@ -73,7 +73,6 @@ from agent.context_engine import (
 )
 from agent.model_metadata import estimate_request_tokens_rough
 from agent.session_activity import ActivityProvenance, normalize_activity_provenance
-from hermes_services.internal_hooks import run_internal_hooks
 
 logger = logging.getLogger(__name__)
 
@@ -2684,7 +2683,6 @@ def compress_context(
     _activity_heartbeat: Optional[_CompressionActivityHeartbeat] = None
     messages_before_compression = None
     try:
-        messages_before_attempt = copy.deepcopy(messages)
         if _lock_holder is not None:
             _candidate_refresher = _CompressionLockLeaseRefresher(
                 _lock_db,
@@ -2755,27 +2753,6 @@ def compress_context(
                     memory_context = sanitize_memory_context(_maybe_ctx)
             except Exception:
                 pass
-
-        # Always cross the hook boundary, even when the registry is empty.
-        # ``run_internal_hooks`` owns payload/context validation, so guarding
-        # it with ``has_internal_hooks`` would make the contract depend on
-        # deployment-time registration state.
-        _compression_hook_result = run_internal_hooks(
-            "before_context_compaction",
-            copy.deepcopy(messages),
-            session_id=getattr(agent, "session_id", "") or "",
-            model=getattr(agent, "model", "") or "",
-            approx_tokens=approx_tokens,
-            focus_topic=focus_topic or "",
-            forced=bool(force),
-        )
-        hooked_messages = _compression_hook_result.payload
-        _compression_hook_trace = _compression_hook_result.trace
-        if not isinstance(hooked_messages, list) or not all(
-            isinstance(item, dict) for item in hooked_messages
-        ):
-            raise TypeError("before_context_compaction hooks must return a message list or None")
-        messages[:] = hooked_messages
 
         compress_fn = agent.context_compressor.compress
         compress_kwargs = _supported_compression_kwargs(
@@ -3070,24 +3047,6 @@ def compress_context(
                 _release_lock()
                 return messages, _existing_sp
 
-        if _compression_hook_trace:
-            try:
-                from agent.context_compressor import (
-                    COMPRESSED_SUMMARY_METADATA_KEY as summary_marker,
-                )
-            except ImportError:
-                summary_marker = "_compressed_summary"
-            trace_target = next(
-                (
-                    item
-                    for item in compressed
-                    if isinstance(item, dict) and item.get(summary_marker)
-                ),
-                compressed[0] if compressed and isinstance(compressed[0], dict) else None,
-            )
-            if isinstance(trace_target, dict):
-                trace_target["hook_trace"] = list(_compression_hook_trace)
-
         summary_error = getattr(agent.context_compressor, "_last_summary_error", None)
         if summary_error:
             if getattr(agent, "_last_compression_summary_warning", None) != summary_error:
@@ -3312,7 +3271,7 @@ def compress_context(
                     )
                     agent.session_id = new_session_id
                     try:
-                        from hermes_runtime.session_context import set_current_session_id
+                        from gateway.session_context import set_current_session_id
 
                         set_current_session_id(agent.session_id)
                     except Exception:

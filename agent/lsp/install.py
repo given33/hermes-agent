@@ -354,9 +354,9 @@ def _install_pip(pkg: str, bin_name: str) -> Optional[str]:
     pip_target.mkdir(parents=True, exist_ok=True)
     try:
         logger.info("[install] pip install --target %s %s", pip_target, pkg)
-        from hermes_runtime.package_install import install_python_packages
+        from hermes_cli.tools_config import _pip_install
 
-        proc = install_python_packages(
+        proc = _pip_install(
             ["--target", str(pip_target), "--quiet", pkg],
             timeout=300,
         )

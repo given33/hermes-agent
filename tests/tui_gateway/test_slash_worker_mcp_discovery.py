@@ -14,7 +14,7 @@ import threading
 import pytest
 import yaml
 
-pytest.importorskip("mcp.server.mcpserver")
+pytest.importorskip("mcp.server.fastmcp")
 
 
 def test_profile_local_mcp_tool_is_visible_in_slash_worker(tmp_path):
@@ -25,9 +25,9 @@ def test_profile_local_mcp_tool_is_visible_in_slash_worker(tmp_path):
     server.write_text(
         textwrap.dedent(
             f"""
-            from mcp.server import MCPServer
+            from mcp.server.fastmcp import FastMCP
 
-            mcp = MCPServer("profileprobe")
+            mcp = FastMCP("profileprobe")
 
             @mcp.tool()
             def hermes_61922_profile_probe() -> str:
@@ -42,7 +42,6 @@ def test_profile_local_mcp_tool_is_visible_in_slash_worker(tmp_path):
     (profile_home / "config.yaml").write_text(
         yaml.safe_dump(
             {
-                "mcp_discovery_timeout": 10.0,
                 "mcp_servers": {
                     "profileprobe": {
                         "enabled": True,

@@ -39,7 +39,6 @@ logger = logging.getLogger(__name__)
 MODELS_DEV_URL = "https://models.dev/api.json"
 _MODELS_DEV_CACHE_TTL = 3600  # 1 hour in-memory
 _MODELS_DEV_RETRY_DELAY = 300  # 5 minutes after a failed refresh
-_CACHE_FUTURE_SKEW_TOLERANCE_SECONDS = 5.0
 
 # In-memory cache
 _models_dev_cache: Dict[str, Any] = {}
@@ -228,12 +227,13 @@ def _disk_cache_age_seconds() -> Optional[float]:
             return None
         mtime = cache_path.stat().st_mtime
         age = time.time() - mtime
-        # Filesystem timestamp granularity can put a just-written cache a tiny
-        # amount in the future. Accept bounded skew as age zero while keeping
-        # materially future-dated files untrusted.
-        if age < -_CACHE_FUTURE_SKEW_TOLERANCE_SECONDS:
+        # Negative age means the file's mtime is in the future (clock skew
+        # or system clock reset). Treat as "unknown freshness" → fall
+        # through to network so we don't serve potentially-bad data
+        # forever.
+        if age < 0:
             return None
-        return max(0.0, age)
+        return age
     except Exception as e:
         logger.debug("Failed to stat models.dev disk cache: %s", e)
         return None
@@ -682,7 +682,7 @@ def list_provider_models(provider: str) -> List[str]:
 
     Returns an empty list if the provider is unknown or has no data.
     """
-    from agent.model_catalog import normalize_provider
+    from hermes_cli.models import normalize_provider
     provider = normalize_provider(provider) or provider
     
     models = _get_provider_models(provider)

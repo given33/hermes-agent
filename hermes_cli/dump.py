@@ -13,10 +13,10 @@ import subprocess
 import sys
 from pathlib import Path
 
-from hermes_runtime.config import get_hermes_home, get_env_path, get_project_root, load_config
+from hermes_cli.config import get_hermes_home, get_env_path, get_project_root, load_config
 from hermes_cli.env_loader import load_hermes_dotenv
 from hermes_constants import display_hermes_home
-from hermes_runtime.skill_utils import is_excluded_skill_path
+from agent.skill_utils import is_excluded_skill_path
 
 
 def _dotenv_key_names() -> set[str]:
@@ -115,11 +115,11 @@ def _get_git_commit_date(project_root: Path) -> str:
 def _redact(value: str) -> str:
     """Redact all but first 4 and last 4 chars.
 
-    Thin wrapper over :func:`hermes_runtime.redaction.mask_secret`. Returns ``""`` for
+    Thin wrapper over :func:`agent.redact.mask_secret`. Returns ``""`` for
     an empty value (matches the historical behavior of this helper —
     ``hermes dump`` formats empty values as blank, not as ``"(not set)"``).
     """
-    from hermes_runtime.redaction import mask_secret
+    from agent.redact import mask_secret
     return mask_secret(value)
 
 
@@ -228,7 +228,7 @@ def _config_overrides(config: dict) -> dict[str, str]:
     
     Returns a flat dict of dotpath -> value for interesting overrides.
     """
-    from hermes_runtime.config import DEFAULT_CONFIG
+    from hermes_cli.config import DEFAULT_CONFIG
 
     overrides = {}
 

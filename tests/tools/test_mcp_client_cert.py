@@ -77,7 +77,8 @@ class TestResolveClientCert:
 
 class TestHTTPClientCert:
     def test_cert_forwarded_to_async_client(self, tmp_path):
-        """When client_cert is set, the v2 path passes it to httpx2."""
+        """When client_cert is set, the new-SDK HTTP path passes ``cert=``
+        into ``httpx.AsyncClient``."""
         from tools.mcp_tool import MCPServerTask
 
         cert = tmp_path / "client.pem"
@@ -98,7 +99,7 @@ class TestHTTPClientCert:
 
         class DummyTransportCtx:
             async def __aenter__(self):
-                return MagicMock(), MagicMock()
+                return MagicMock(), MagicMock(), (lambda: None)
 
             async def __aexit__(self, *a):
                 return False
@@ -113,15 +114,16 @@ class TestHTTPClientCert:
             async def __aexit__(self, *a):
                 return False
 
-            async def discover(self):
-                return MagicMock()
+            async def initialize(self):
+                return None
 
         async def _discover_tools(self):
             self._shutdown_event.set()
 
         async def _drive():
             with patch("tools.mcp_tool._MCP_HTTP_AVAILABLE", True), \
-                 patch("httpx2.AsyncClient", DummyAsyncClient), \
+                 patch("tools.mcp_tool._MCP_NEW_HTTP", True), \
+                 patch("httpx.AsyncClient", DummyAsyncClient), \
                  patch("tools.mcp_tool.streamable_http_client",
                        return_value=DummyTransportCtx()), \
                  patch("tools.mcp_tool.ClientSession", DummySession), \
@@ -142,7 +144,8 @@ class TestHTTPClientCert:
         server = MCPServerTask("remote")
 
         async def _drive():
-            with patch("tools.mcp_tool._MCP_HTTP_AVAILABLE", True):
+            with patch("tools.mcp_tool._MCP_HTTP_AVAILABLE", True), \
+                 patch("tools.mcp_tool._MCP_NEW_HTTP", True):
                 await server._run_http({
                     "url": "https://example.com/mcp",
                     "client_cert": str(tmp_path / "nope.pem"),
@@ -152,13 +155,172 @@ class TestHTTPClientCert:
             asyncio.run(_drive())
 
 
-def test_deprecated_sse_transport_is_rejected():
-    from tools.mcp_tool import MCPServerTask
+# ---------------------------------------------------------------------------
+# SSE transport — cert + verify routed via httpx_client_factory
+# ---------------------------------------------------------------------------
 
-    server = MCPServerTask("sse-test")
-    with pytest.raises(ValueError, match=r"deprecated HTTP\+SSE.*Streamable HTTP"):
-        asyncio.run(
-            server.start(
-                {"url": "https://example.com/mcp/sse", "transport": "sse"}
-            )
-        )
+
+@pytest.fixture
+def patch_sse_client():
+    """Replace ``sse_client`` with a MagicMock that records its kwargs.
+
+    Returns the captured kwargs dict so tests can assert how ``_run_http``
+    called it.
+    """
+    captured_kwargs: dict = {}
+
+    class _FakeStream:
+        def __init__(self):
+            self._read = AsyncMock()
+            self._write = AsyncMock()
+
+        async def __aenter__(self):
+            return (self._read, self._write)
+
+        async def __aexit__(self, *a):
+            return False
+
+    def fake_sse_client(**kwargs):
+        captured_kwargs.clear()
+        captured_kwargs.update(kwargs)
+        return _FakeStream()
+
+    class _FakeSession:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        async def __aenter__(self):
+            mock_session = MagicMock()
+            mock_session.initialize = AsyncMock()
+            return mock_session
+
+        async def __aexit__(self, *a):
+            return False
+
+    with patch("tools.mcp_tool.sse_client", new=fake_sse_client), \
+         patch("tools.mcp_tool.ClientSession", new=_FakeSession):
+        yield captured_kwargs
+
+
+class TestSSEClientCert:
+    def test_no_factory_when_defaults(self, patch_sse_client):
+        """With no cert and ssl_verify=True (default), the SDK's own factory is
+        used — we don't inject one."""
+        from tools.mcp_tool import MCPServerTask
+
+        server = MCPServerTask("sse-test")
+        server._auth_type = ""
+        server._sampling = None
+
+        async def drive():
+            with patch.object(MCPServerTask, "_wait_for_lifecycle_event",
+                              new=AsyncMock(return_value="shutdown")), \
+                 patch.object(MCPServerTask, "_discover_tools", new=AsyncMock()):
+                try:
+                    await asyncio.wait_for(
+                        server._run_http({
+                            "url": "https://example.com/mcp/sse",
+                            "transport": "sse",
+                        }),
+                        timeout=2.0,
+                    )
+                except (asyncio.TimeoutError, StopAsyncIteration, Exception):
+                    pass
+
+        asyncio.run(drive())
+        assert "httpx_client_factory" not in patch_sse_client
+
+    def test_factory_injected_when_cert_set(self, patch_sse_client, tmp_path):
+        """With client_cert set, an httpx_client_factory is injected that
+        applies the cert (and follow_redirects=True to match the SDK)."""
+        from tools.mcp_tool import MCPServerTask
+
+        cert = tmp_path / "client.pem"
+        cert.write_text("dummy")
+
+        server = MCPServerTask("sse-test")
+        server._auth_type = ""
+        server._sampling = None
+
+        async def drive():
+            with patch.object(MCPServerTask, "_wait_for_lifecycle_event",
+                              new=AsyncMock(return_value="shutdown")), \
+                 patch.object(MCPServerTask, "_discover_tools", new=AsyncMock()):
+                try:
+                    await asyncio.wait_for(
+                        server._run_http({
+                            "url": "https://example.com/mcp/sse",
+                            "transport": "sse",
+                            "client_cert": str(cert),
+                        }),
+                        timeout=2.0,
+                    )
+                except (asyncio.TimeoutError, StopAsyncIteration, Exception):
+                    pass
+
+        asyncio.run(drive())
+
+        factory = patch_sse_client.get("httpx_client_factory")
+        assert factory is not None, "expected httpx_client_factory to be injected"
+
+        # Invoke the factory the way the SDK would; capture the resulting
+        # httpx.AsyncClient kwargs.
+        captured_client_kwargs: dict = {}
+
+        class DummyAsyncClient:
+            def __init__(self, **kwargs):
+                captured_client_kwargs.update(kwargs)
+
+        import httpx
+        with patch.object(httpx, "AsyncClient", DummyAsyncClient):
+            factory(headers={"x": "y"}, timeout=httpx.Timeout(30.0), auth=None)
+
+        assert captured_client_kwargs["cert"] == str(cert)
+        assert captured_client_kwargs["verify"] is True
+        assert captured_client_kwargs["follow_redirects"] is True
+        assert captured_client_kwargs["headers"] == {"x": "y"}
+
+    def test_factory_forwards_custom_ca_bundle(self, patch_sse_client, tmp_path):
+        """ssl_verify as a path is forwarded to the factory's httpx client."""
+        from tools.mcp_tool import MCPServerTask
+
+        ca_bundle = tmp_path / "ca.pem"
+        ca_bundle.write_text("dummy")
+
+        server = MCPServerTask("sse-test")
+        server._auth_type = ""
+        server._sampling = None
+
+        async def drive():
+            with patch.object(MCPServerTask, "_wait_for_lifecycle_event",
+                              new=AsyncMock(return_value="shutdown")), \
+                 patch.object(MCPServerTask, "_discover_tools", new=AsyncMock()):
+                try:
+                    await asyncio.wait_for(
+                        server._run_http({
+                            "url": "https://example.com/mcp/sse",
+                            "transport": "sse",
+                            "ssl_verify": str(ca_bundle),
+                        }),
+                        timeout=2.0,
+                    )
+                except (asyncio.TimeoutError, StopAsyncIteration, Exception):
+                    pass
+
+        asyncio.run(drive())
+
+        factory = patch_sse_client.get("httpx_client_factory")
+        assert factory is not None
+
+        captured_client_kwargs: dict = {}
+
+        class DummyAsyncClient:
+            def __init__(self, **kwargs):
+                captured_client_kwargs.update(kwargs)
+
+        import httpx
+        with patch.object(httpx, "AsyncClient", DummyAsyncClient):
+            factory(headers=None, timeout=None, auth=None)
+
+        assert captured_client_kwargs["verify"] == str(ca_bundle)
+        assert "cert" not in captured_client_kwargs

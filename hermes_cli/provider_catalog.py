@@ -107,7 +107,7 @@ def provider_catalog() -> list[ProviderDescriptor]:
         profiles = {}
 
     try:
-        from hermes_runtime.config import OPTIONAL_ENV_VARS
+        from hermes_cli.config import OPTIONAL_ENV_VARS
     except Exception:
         OPTIONAL_ENV_VARS = {}
 

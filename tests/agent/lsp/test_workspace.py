@@ -6,8 +6,6 @@ from pathlib import Path
 
 import pytest
 
-from agent.lsp import workspace as workspace_module
-
 from agent.lsp.workspace import (
     clear_cache,
     find_git_worktree,
@@ -75,19 +73,3 @@ def test_normalize_path_expands_tilde(monkeypatch):
     monkeypatch.setenv("HOME", "/home/user")
     p = normalize_path("~/x.py")
     assert p == os.path.abspath("/home/user/x.py")
-
-
-def test_workspace_cache_is_bounded_lru(tmp_path: Path, monkeypatch):
-    monkeypatch.setattr(workspace_module, "_WORKSPACE_CACHE_MAX", 2)
-    paths = []
-    for name in ("one", "two", "three"):
-        path = tmp_path / name
-        path.mkdir()
-        paths.append(str(path))
-
-    find_git_worktree(paths[0])
-    find_git_worktree(paths[1])
-    find_git_worktree(paths[0])
-    find_git_worktree(paths[2])
-
-    assert list(workspace_module._workspace_cache) == [paths[0], paths[2]]

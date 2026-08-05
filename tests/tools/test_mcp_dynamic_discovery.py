@@ -11,7 +11,7 @@ from tools.registry import ToolRegistry
 
 
 def _make_mcp_tool(name: str, desc: str = ""):
-    return SimpleNamespace(name=name, description=desc, input_schema=None)
+    return SimpleNamespace(name=name, description=desc, inputSchema=None)
 
 
 class TestRegisterServerTools:
@@ -49,9 +49,6 @@ class TestRefreshTools:
         server = MCPServerTask("live_srv")
         server._refresh_lock = asyncio.Lock()
         server._config = {}
-        server.discover_result = SimpleNamespace(
-            capabilities=SimpleNamespace(tools=SimpleNamespace())
-        )
         from toolsets import resolve_toolset
 
         # Seed initial state: one old tool registered
@@ -88,7 +85,7 @@ class TestMessageHandler:
         if not _MCP_NOTIFICATION_TYPES:
             pytest.skip("MCP SDK ToolListChangedNotification not available")
 
-        from mcp.types import ToolListChangedNotification
+        from mcp.types import ServerNotification, ToolListChangedNotification
 
         server = MCPServerTask("notif_srv")
         # Product now schedules the refresh as a background task (see
@@ -98,7 +95,9 @@ class TestMessageHandler:
         # reaching into asyncio.create_task internals.
         with patch.object(MCPServerTask, "_schedule_tools_refresh") as mock_schedule:
             handler = server._make_message_handler()
-            notification = ToolListChangedNotification()
+            notification = ServerNotification(
+                root=ToolListChangedNotification(method="notifications/tools/list_changed")
+            )
             await handler(notification)
             mock_schedule.assert_called_once()
 
@@ -112,41 +111,6 @@ class TestMessageHandler:
             # Unknown message types should not trigger refresh
             await handler({"jsonrpc": "2.0", "result": "ok"})
             mock_schedule.assert_not_called()
-
-
-class TestSubscriptions:
-    @pytest.mark.asyncio
-    async def test_tool_change_event_refreshes_tools(self):
-        from mcp.shared.subscriptions import ToolsListChanged
-
-        server = MCPServerTask("subscription_srv")
-
-        class _Subscription:
-            async def __aenter__(self):
-                return self
-
-            async def __aexit__(self, *_exc):
-                return False
-
-            def __aiter__(self):
-                return self
-
-            async def __anext__(self):
-                if getattr(self, "_sent", False):
-                    raise StopAsyncIteration
-                self._sent = True
-                return ToolsListChanged()
-
-        with patch(
-            "mcp.client.subscriptions.listen",
-            return_value=_Subscription(),
-        ) as mock_listen, patch.object(
-            MCPServerTask, "_refresh_tools", new=AsyncMock()
-        ) as mock_refresh:
-            await server._listen_for_tool_changes()
-
-        mock_listen.assert_called_once_with(server.session, tools_list_changed=True)
-        mock_refresh.assert_awaited_once()
 
 
 class TestDeregister:

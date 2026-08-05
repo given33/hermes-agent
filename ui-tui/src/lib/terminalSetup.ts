@@ -1,6 +1,6 @@
 import { copyFile, mkdir, readFile, writeFile } from 'node:fs/promises'
 import { homedir } from 'node:os'
-import { posix, win32 } from 'node:path'
+import { join } from 'node:path'
 
 export type SupportedTerminal = 'cursor' | 'vscode' | 'windsurf'
 
@@ -76,9 +76,6 @@ const BASE_BINDINGS: Keybinding[] = [
 
 const targetBindings = (platform: NodeJS.Platform): Keybinding[] =>
   platform === 'darwin' ? [MAC_COPY_BINDING, ...BASE_BINDINGS] : BASE_BINDINGS
-
-const joinForPlatform = (platform: NodeJS.Platform, ...parts: string[]): string =>
-  platform === 'win32' ? win32.join(...parts) : posix.join(...parts)
 
 export function detectVSCodeLikeTerminal(env: NodeJS.ProcessEnv = process.env): null | SupportedTerminal {
   const askpass = env['VSCODE_GIT_ASKPASS_MAIN']?.toLowerCase() ?? ''
@@ -168,14 +165,14 @@ export function getVSCodeStyleConfigDir(
   homeDir: string = homedir()
 ): null | string {
   if (platform === 'darwin') {
-    return joinForPlatform(platform, homeDir, 'Library', 'Application Support', appName, 'User')
+    return join(homeDir, 'Library', 'Application Support', appName, 'User')
   }
 
   if (platform === 'win32') {
-    return env['APPDATA'] ? joinForPlatform(platform, env['APPDATA'], appName, 'User') : null
+    return env['APPDATA'] ? join(env['APPDATA'], appName, 'User') : null
   }
 
-  return joinForPlatform(platform, homeDir, '.config', appName, 'User')
+  return join(homeDir, '.config', appName, 'User')
 }
 
 function isKeybinding(value: unknown): value is Keybinding {
@@ -306,7 +303,7 @@ export async function configureTerminalKeybindings(
     }
   }
 
-  const keybindingsFile = joinForPlatform(platform, configDir, 'keybindings.json')
+  const keybindingsFile = join(configDir, 'keybindings.json')
 
   try {
     await ops.mkdir(configDir, { recursive: true })
@@ -431,7 +428,7 @@ export async function shouldPromptForTerminalSetup(options?: {
   }
 
   try {
-    const content = await ops.readFile(joinForPlatform(platform, configDir, 'keybindings.json'), 'utf8')
+    const content = await ops.readFile(join(configDir, 'keybindings.json'), 'utf8')
     const parsed: unknown = JSON.parse(stripJsonComments(content))
 
     if (!Array.isArray(parsed)) {

@@ -31,7 +31,6 @@ import logging
 import os
 from typing import Any, Dict, List, Optional
 
-from agent import model_catalog
 from agent.secret_scope import get_secret
 from agent.image_gen_provider import (
     DEFAULT_ASPECT_RATIO,
@@ -59,7 +58,7 @@ _SIZES = {
 def _load_deepinfra_image_config() -> Dict[str, Any]:
     """Read ``image_gen.deepinfra`` from config.yaml."""
     try:
-        from hermes_runtime.config import load_config
+        from hermes_cli.config import load_config
 
         cfg = load_config()
         section = cfg.get("image_gen") if isinstance(cfg, dict) else None
@@ -72,7 +71,12 @@ def _load_deepinfra_image_config() -> Dict[str, Any]:
 
 def _live_models() -> Optional[List[Dict[str, Any]]]:
     """Fetch ``image-gen``-tagged models from the DeepInfra catalog."""
-    return model_catalog.fetch_deepinfra_models_by_tag("image-gen")
+    try:
+        from hermes_cli.models import _fetch_deepinfra_models_by_tag
+    except Exception as exc:
+        logger.debug("Cannot import _fetch_deepinfra_models_by_tag: %s", exc)
+        return None
+    return _fetch_deepinfra_models_by_tag("image-gen")
 
 
 def _format_catalog_row(item: Dict[str, Any]) -> Dict[str, Any]:
@@ -226,7 +230,7 @@ class DeepInfraImageGenProvider(ImageGenProvider):
                 aspect_ratio=aspect,
             )
         size = _SIZES.get(aspect, _SIZES["square"])
-        from agent.model_catalog import deepinfra_base_url
+        from hermes_cli.models import deepinfra_base_url
         base_url = deepinfra_base_url(di_cfg)
 
         # DeepInfra's /images/generations is OpenAI-compatible — use the

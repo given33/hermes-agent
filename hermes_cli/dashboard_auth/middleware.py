@@ -67,6 +67,9 @@ _GATE_PUBLIC_EXACT: frozenset[str] = frozenset(
         "/auth/login",
         "/auth/callback",
         "/auth/password-login",
+        "/auth/native/authorize",
+        "/auth/native/token",
+        "/auth/native/refresh",
         "/auth/logout",
         "/login",
         "/api/auth/providers",
@@ -372,6 +375,12 @@ async def gated_auth_middleware(
     # a cookie session and must not be bounced to /login. Pass it through; the
     # seam already attached ``request.state.token_principal``.
     if getattr(request.state, "token_authenticated", False):
+        return await call_next(request)
+
+    # The outer optional-token seam may already have identified an RFC 8252
+    # dashboard bearer after ruling out a mobile API key. Reuse that verified
+    # session instead of validating the same token twice.
+    if getattr(request.state, "session_bearer_authenticated", False):
         return await call_next(request)
 
     path = request.url.path

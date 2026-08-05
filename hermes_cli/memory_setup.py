@@ -14,7 +14,7 @@ import shlex
 from pathlib import Path
 
 from hermes_constants import get_hermes_home
-from hermes_runtime.secret_prompt import masked_secret_prompt
+from hermes_cli.secret_prompt import masked_secret_prompt
 
 _CANCELLED = -1
 
@@ -244,7 +244,7 @@ def _get_available_providers() -> list:
 
 def cmd_setup_provider(provider_name: str) -> None:
     """Run memory setup for a specific provider, skipping the picker."""
-    from hermes_runtime.config import load_config, save_config
+    from hermes_cli.config import load_config, save_config
 
     providers = _get_available_providers()
     match = None
@@ -282,7 +282,7 @@ def cmd_setup_provider(provider_name: str) -> None:
 
 def cmd_setup(args) -> None:
     """Interactive memory provider setup wizard."""
-    from hermes_runtime.config import load_config, save_config
+    from hermes_cli.config import load_config, save_config
 
     providers = _get_available_providers()
 
@@ -477,7 +477,7 @@ def _write_env_vars(env_path: Path, env_writes: dict) -> None:
 
 def cmd_status(args) -> None:
     """Show current memory provider config."""
-    from hermes_runtime.config import load_config
+    from hermes_cli.config import load_config
 
     config = load_config()
     mem_config = config.get("memory", {})

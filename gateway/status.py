@@ -20,7 +20,6 @@ import shlex
 import signal
 import subprocess
 import sys
-import tempfile
 import threading
 import time
 from datetime import datetime, timezone
@@ -86,47 +85,35 @@ def record_start_and_check_storm(
     try:
         path = _get_starts_log_path()
         path.parent.mkdir(parents=True, exist_ok=True)
-        with advisory_file_lock(path.with_suffix(".lock")):
-            now = datetime.now(timezone.utc).timestamp()
 
-            existing: list[float] = []
-            if path.exists():
-                for line in path.read_text(encoding="utf-8").splitlines():
-                    line = line.strip()
-                    if not line:
-                        continue
-                    try:
-                        existing.append(float(line))
-                    except ValueError:
-                        continue
+        now = datetime.now(timezone.utc).timestamp()
 
-            existing.append(now)
-
-            # Keep only starts within the sliding window for the storm decision.
-            recent = [ts for ts in existing if now - ts <= window_s]
-
-            # Ring-buffer what we persist so the file stays bounded even if the
-            # window is wide or starts are frequent.
-            keep = max(max_starts * 4, 40)
-            to_write = existing[-keep:]
-
-            fd, tmp_name = tempfile.mkstemp(
-                dir=str(path.parent), prefix=f".{path.stem}_", suffix=".tmp"
-            )
-            try:
-                with os.fdopen(fd, "w", encoding="utf-8") as tmp_file:
-                    tmp_file.write(
-                        "\n".join(repr(ts) for ts in to_write) + "\n"
-                    )
-                    tmp_file.flush()
-                    os.fsync(tmp_file.fileno())
-                os.replace(tmp_name, path)
-            except BaseException:
+        existing: list[float] = []
+        if path.exists():
+            for line in path.read_text(encoding="utf-8").splitlines():
+                line = line.strip()
+                if not line:
+                    continue
                 try:
-                    os.unlink(tmp_name)
-                except OSError:
-                    pass
-                raise
+                    existing.append(float(line))
+                except ValueError:
+                    continue
+
+        existing.append(now)
+
+        # Keep only starts within the sliding window for the storm decision.
+        recent = [ts for ts in existing if now - ts <= window_s]
+
+        # Ring-buffer what we persist so the file stays bounded even if the
+        # window is wide or starts are frequent.
+        keep = max(max_starts * 4, 40)
+        to_write = existing[-keep:]
+
+        tmp = path.with_suffix(".tmp")
+        tmp.write_text(
+            "\n".join(repr(ts) for ts in to_write) + "\n", encoding="utf-8"
+        )
+        os.replace(tmp, path)
 
         if len(recent) > max_starts:
             backoff = min(
@@ -267,7 +254,7 @@ def terminate_pid(pid: int, *, force: bool = False) -> None:
         # CREATE_NO_WINDOW: terminate_pid runs from the windowless pythonw.exe
         # gateway/desktop backend, so a bare taskkill spawn would flash a
         # conhost window on every force-kill.
-        from hermes_runtime.subprocess_compat import windows_hide_flags
+        from hermes_cli._subprocess_compat import windows_hide_flags
 
         try:
             result = subprocess.run(
@@ -748,11 +735,6 @@ def _try_acquire_file_lock(handle) -> bool:
         return False
 
 
-from hermes_runtime import process_probe
-
-# Compatibility for gateway-local callers while imports migrate to the
-# runtime foundation. Resolve through the module at call time so platform
-# implementations and test probes share one authoritative entry point.
 def _pid_exists(pid: int) -> bool:
     """Cross-platform "is this PID alive" check that does NOT kill the target.
 

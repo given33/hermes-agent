@@ -62,11 +62,6 @@ class TestHandleFunctionCall:
 
 
     def test_tool_request_and_execution_middleware_wrap_registry_dispatch(self, monkeypatch):
-        from hermes_services.middleware import (
-            install_middleware_backend,
-            restore_middleware_backend,
-        )
-
         seen = {}
 
         def fake_invoke_middleware(kind, **kwargs):
@@ -91,11 +86,8 @@ class TestHandleFunctionCall:
             (),
             {"_middleware": {"tool_request": [fake_invoke_middleware], "tool_execution": [execution_middleware]}},
         )()
-        previous_backend = install_middleware_backend(
-            invoke=fake_invoke_middleware,
-            has=lambda kind: bool(manager._middleware.get(kind)),
-            callbacks=lambda kind: list(manager._middleware.get(kind, [])),
-        )
+        monkeypatch.setattr("hermes_cli.plugins.invoke_middleware", fake_invoke_middleware)
+        monkeypatch.setattr("hermes_cli.plugins.get_plugin_manager", lambda: manager)
         hook_calls = []
         monkeypatch.setattr(
             "hermes_cli.plugins.invoke_hook",
@@ -104,18 +96,15 @@ class TestHandleFunctionCall:
         monkeypatch.setattr("hermes_cli.plugins.has_hook", lambda name: True)
         monkeypatch.setattr("model_tools.registry.dispatch", fake_dispatch)
 
-        try:
-            result = json.loads(
-                handle_function_call(
-                    "web_search",
-                    {"q": "test"},
-                    task_id="task-1",
-                    tool_call_id="tool-1",
-                    session_id="session-1",
-                )
+        result = json.loads(
+            handle_function_call(
+                "web_search",
+                {"q": "test"},
+                task_id="task-1",
+                tool_call_id="tool-1",
+                session_id="session-1",
             )
-        finally:
-            restore_middleware_backend(previous_backend)
+        )
 
         assert seen["execution_args"] == {"q": "test", "rewritten": True}
         assert seen["dispatch"][1] == {"q": "test", "rewritten": True, "wrapped": True}

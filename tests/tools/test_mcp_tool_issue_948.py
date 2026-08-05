@@ -74,11 +74,7 @@ def test_resolve_stdio_command_falls_back_to_usr_local_bin():
 
 def _stdio_mocks():
     mock_session = MagicMock()
-    mock_session.discover = AsyncMock(
-        return_value=SimpleNamespace(
-            capabilities=SimpleNamespace(tools=SimpleNamespace())
-        )
-    )
+    mock_session.initialize = AsyncMock()
     mock_session.list_tools = AsyncMock(return_value=SimpleNamespace(tools=[]))
     mock_stdio_cm = MagicMock()
     mock_stdio_cm.__aenter__ = AsyncMock(return_value=(object(), object()))

@@ -10,8 +10,6 @@ import inspect
 import io
 import json
 import logging
-import multiprocessing
-import os
 import re
 import threading
 import time
@@ -29,9 +27,6 @@ from run_agent import AIAgent
 from agent.error_classifier import FailoverReason
 from agent.memory_manager import MemoryManager
 from agent.prompt_builder import DEFAULT_AGENT_IDENTITY
-
-
-_DEFAULT_ISOLATION_TEST_TIMEOUT = "3"
 
 
 # ---------------------------------------------------------------------------
@@ -54,22 +49,6 @@ def _make_tool_defs(*names: str) -> list:
     ]
 
 
-@pytest.fixture(autouse=True)
-def _stable_model_context_length():
-    """Keep unit-only agent construction independent of models.dev network I/O."""
-    with (
-        patch(
-            "agent.context_compressor.get_model_context_length",
-            return_value=131_072,
-        ) as mock_context_length,
-        patch(
-            "agent.model_metadata.get_model_context_length",
-            return_value=131_072,
-        ),
-    ):
-        yield mock_context_length
-
-
 def test_is_destructive_command_treats_cp_as_mutating():
     assert run_agent._is_destructive_command("cp .env.local .env") is True
 
@@ -79,7 +58,7 @@ def test_is_destructive_command_treats_cp_as_mutating():
 
 
 @pytest.fixture()
-def agent(_stable_model_context_length):
+def agent():
     """Minimal AIAgent with mocked OpenAI client and tool loading."""
     with (
         patch(
@@ -95,7 +74,6 @@ def agent(_stable_model_context_length):
             skip_context_files=True,
             skip_memory=True,
         )
-        _stable_model_context_length.assert_called()
         a.client = MagicMock()
         return a
 
@@ -332,43 +310,6 @@ def _mock_tool_call(name="web_search", arguments="{}", call_id=None):
         type="function",
         function=SimpleNamespace(name=name, arguments=arguments),
     )
-
-
-def _default_isolation_never_returns(args, **kwargs):
-    """Pickleable registry handler used to prove executor process teardown."""
-    Path(args["pid_file"]).write_text(str(os.getpid()), encoding="utf-8")
-    while True:
-        time.sleep(0.01)
-
-
-def _default_isolation_returns(args, **kwargs):
-    return "isolated fast result"
-
-
-def _wait_for_file(path: Path, timeout: float = 2.0) -> None:
-    deadline = time.monotonic() + timeout
-    while time.monotonic() < deadline:
-        if path.exists():
-            return
-        time.sleep(0.01)
-    raise AssertionError(f"timed out waiting for {path}")
-
-
-def _register_default_isolation_tool(name: str, handler) -> None:
-    from tools.registry import registry
-
-    registry.register(
-        name=name,
-        toolset="test-default-isolation",
-        schema={"name": name, "parameters": {"type": "object"}},
-        handler=handler,
-    )
-
-
-def _deregister_default_isolation_tool(name: str) -> None:
-    from tools.registry import registry
-
-    registry.deregister(name)
 
 
 def _mock_response(
@@ -996,10 +937,10 @@ class TestBuildSystemPrompt:
         else:
             assert False, "Expected a 'Conversation started:' line in the system prompt"
 
-    def test_excludes_nous_subscription_prompt(self, agent, monkeypatch):
+    def test_includes_nous_subscription_prompt(self, agent, monkeypatch):
         monkeypatch.setattr(run_agent, "build_nous_subscription_prompt", lambda tool_names: "NOUS SUBSCRIPTION BLOCK")
         prompt = agent._build_system_prompt()
-        assert "NOUS SUBSCRIPTION BLOCK" not in prompt
+        assert "NOUS SUBSCRIPTION BLOCK" in prompt
 
     def test_skills_prompt_derives_available_toolsets_from_loaded_tools(self):
         tools = _make_tool_defs("web_search", "skills_list", "skill_view", "skill_manage")
@@ -1157,14 +1098,10 @@ class TestTaskCompletionGuidance:
     def test_default_injects_for_claude(self):
         """The block must reach Claude by default — that's the
         primary motivating model family."""
-        from agent.prompt_builder import (
-            EVIDENCE_FIRST_EXECUTION_GUIDANCE,
-            TASK_COMPLETION_GUIDANCE,
-        )
+        from agent.prompt_builder import TASK_COMPLETION_GUIDANCE
         agent = self._make_agent(model="anthropic/claude-opus-4.8")
         prompt = agent._build_system_prompt()
         assert TASK_COMPLETION_GUIDANCE in prompt
-        assert EVIDENCE_FIRST_EXECUTION_GUIDANCE in prompt
 
 
 
@@ -1481,18 +1418,6 @@ class TestBuildApiKwargs:
 
 
 class TestBuildAssistantMessage:
-    def test_provider_response_hook_trace_is_carried_into_session_message(self, agent):
-        msg = _mock_assistant_msg(content="Hello!")
-        msg.hermes_hook_trace = [{
-            "point": "after_provider_response",
-            "name": "response-observer",
-            "status": "completed",
-        }]
-
-        result = agent._build_assistant_message(msg, "stop")
-
-        assert result["hook_trace"] == msg.hermes_hook_trace
-
     def test_basic_message(self, agent):
         msg = _mock_assistant_msg(content="Hello!")
         result = agent._build_assistant_message(msg, "stop")
@@ -1554,44 +1479,6 @@ class TestFormatToolsForSystemMessage:
 
 
 class TestExecuteToolCalls:
-    def test_sequential_default_tool_deadline_kills_never_returning_handler(
-        self, agent, monkeypatch, tmp_path
-    ):
-        """Ordinary registry tools must not hold a sequential turn forever."""
-        name = f"default_isolation_seq_{uuid.uuid4().hex}"
-        pid_file = tmp_path / "seq-child.pid"
-        monkeypatch.setenv(
-            "HERMES_TOOL_TIMEOUT_S", _DEFAULT_ISOLATION_TEST_TIMEOUT
-        )
-        _register_default_isolation_tool(name, _default_isolation_never_returns)
-        from tools.registry import registry
-        agent._tool_snapshot_generation = registry._generation
-        agent.valid_tool_names.add(name)
-        messages = []
-        try:
-            started = time.monotonic()
-            agent._execute_tool_calls_sequential(
-                _mock_assistant_msg(
-                    content="",
-                    tool_calls=[_mock_tool_call(
-                        name=name,
-                        arguments=json.dumps({"pid_file": str(pid_file)}),
-                        call_id="default-seq",
-                    )],
-                ),
-                messages,
-                "task-default-isolation",
-            )
-            elapsed = time.monotonic() - started
-            _wait_for_file(pid_file)
-            child_pid = int(pid_file.read_text(encoding="utf-8"))
-
-            assert elapsed < 5.0
-            assert "deadline" in messages[0]["content"].lower()
-            assert all(child.pid != child_pid for child in multiprocessing.active_children())
-        finally:
-            _deregister_default_isolation_tool(name)
-
     def test_single_tool_executed(self, agent):
         tc = _mock_tool_call(name="web_search", arguments='{"q":"test"}', call_id="c1")
         mock_msg = _mock_assistant_msg(content="", tool_calls=[tc])
@@ -1863,106 +1750,6 @@ class TestRetryAfterCap:
 class TestConcurrentToolExecution:
     """Tests for _execute_tool_calls_concurrent and dispatch logic."""
 
-    def test_concurrent_default_deadline_releases_worker_slot_and_child(
-        self, agent, monkeypatch, tmp_path
-    ):
-        """A timed-out ordinary handler cannot strand its daemon worker slot."""
-        from agent.tool_executor import _MAX_TOOL_WORKERS, _TOOL_EXECUTION_SLOTS
-
-        slow_name = f"default_isolation_concurrent_{uuid.uuid4().hex}"
-        fast_name = f"default_isolation_fast_{uuid.uuid4().hex}"
-        pid_file = tmp_path / "concurrent-child.pid"
-        monkeypatch.setenv(
-            "HERMES_TOOL_TIMEOUT_S", _DEFAULT_ISOLATION_TEST_TIMEOUT
-        )
-        monkeypatch.setenv("HERMES_CONCURRENT_TOOL_TIMEOUT_S", "5")
-        _register_default_isolation_tool(slow_name, _default_isolation_never_returns)
-        _register_default_isolation_tool(fast_name, _default_isolation_returns)
-        from tools.registry import registry
-        agent._tool_snapshot_generation = registry._generation
-        agent.valid_tool_names.update({slow_name, fast_name})
-        try:
-            messages = []
-            agent._execute_tool_calls_concurrent(
-                _mock_assistant_msg(
-                    content="",
-                    tool_calls=[_mock_tool_call(
-                        name=slow_name,
-                        arguments=json.dumps({"pid_file": str(pid_file)}),
-                        call_id="default-concurrent-timeout",
-                    )],
-                ),
-                messages,
-                "task-default-isolation",
-            )
-            _wait_for_file(pid_file)
-            child_pid = int(pid_file.read_text(encoding="utf-8"))
-
-            assert "deadline" in messages[0]["content"].lower() or "timed out" in messages[0]["content"].lower()
-            assert all(child.pid != child_pid for child in multiprocessing.active_children())
-            assert _TOOL_EXECUTION_SLOTS._value == _MAX_TOOL_WORKERS
-
-            # A new turn must use the released slot rather than report the
-            # global worker cap from a detached never-returning thread.
-            next_turn_messages = []
-            agent._execute_tool_calls_concurrent(
-                _mock_assistant_msg(
-                    content="",
-                    tool_calls=[_mock_tool_call(
-                        name=fast_name,
-                        call_id="default-concurrent-followup",
-                    )],
-                ),
-                next_turn_messages,
-                "task-default-isolation",
-            )
-            assert "isolated fast result" in next_turn_messages[0]["content"]
-            assert _TOOL_EXECUTION_SLOTS._value == _MAX_TOOL_WORKERS
-        finally:
-            _deregister_default_isolation_tool(slow_name)
-            _deregister_default_isolation_tool(fast_name)
-
-    def test_concurrent_default_tool_interrupt_kills_child(self, agent, monkeypatch, tmp_path):
-        """Interrupting a normal handler terminates its child before shutdown."""
-        name = f"default_isolation_cancel_{uuid.uuid4().hex}"
-        pid_file = tmp_path / "cancel-child.pid"
-        monkeypatch.setenv("HERMES_TOOL_TIMEOUT_S", "10")
-        monkeypatch.setenv("HERMES_CONCURRENT_TOOL_TIMEOUT_S", "10")
-        _register_default_isolation_tool(name, _default_isolation_never_returns)
-        from tools.registry import registry
-        agent._tool_snapshot_generation = registry._generation
-        agent.valid_tool_names.add(name)
-
-        def interrupt_after_start() -> None:
-            _wait_for_file(pid_file)
-            agent.interrupt("test interrupt")
-
-        interrupter = threading.Thread(target=interrupt_after_start)
-        try:
-            interrupter.start()
-            messages = []
-            agent._execute_tool_calls_concurrent(
-                _mock_assistant_msg(
-                    content="",
-                    tool_calls=[_mock_tool_call(
-                        name=name,
-                        arguments=json.dumps({"pid_file": str(pid_file)}),
-                        call_id="default-concurrent-cancel",
-                    )],
-                ),
-                messages,
-                "task-default-isolation",
-            )
-            interrupter.join(2)
-            child_pid = int(pid_file.read_text(encoding="utf-8"))
-
-            assert not interrupter.is_alive()
-            assert "cancel" in messages[0]["content"].lower()
-            assert all(child.pid != child_pid for child in multiprocessing.active_children())
-        finally:
-            agent.clear_interrupt()
-            _deregister_default_isolation_tool(name)
-
     def test_single_tool_uses_sequential_path(self, agent):
         """Single tool call should use sequential path, not concurrent."""
         tc = _mock_tool_call(name="web_search", arguments='{"q":"test"}', call_id="c1")
@@ -2114,7 +1901,6 @@ class TestConcurrentToolExecution:
                 enabled_toolsets=agent.enabled_toolsets,
                 disabled_toolsets=agent.disabled_toolsets,
                 tool_request_middleware_trace=[],
-                enforce_tool_isolation=True,
             )
             assert result == "result"
 
@@ -3745,12 +3531,12 @@ class TestRunConversation:
         )
 
 
-    def test_nous_401_does_not_remint_removed_account_credentials(self, agent):
+    def test_nous_401_refreshes_after_remint_and_retries(self, agent):
         self._setup_agent(agent)
         agent.provider = "nous"
         agent.api_mode = "chat_completions"
 
-        calls = {"api": 0}
+        calls = {"api": 0, "refresh": 0}
 
         class _UnauthorizedError(RuntimeError):
             def __init__(self):
@@ -3759,22 +3545,32 @@ class TestRunConversation:
 
         def _fake_api_call(api_kwargs):
             calls["api"] += 1
-            raise _UnauthorizedError()
+            if calls["api"] == 1:
+                raise _UnauthorizedError()
+            return _mock_response(
+                content="Recovered after remint", finish_reason="stop"
+            )
+
+        def _fake_refresh(*, force=True):
+            calls["refresh"] += 1
+            assert force is True
+            return True
 
         with (
             patch.object(agent, "_persist_session"),
             patch.object(agent, "_save_trajectory"),
             patch.object(agent, "_cleanup_task_resources"),
             patch.object(agent, "_interruptible_api_call", side_effect=_fake_api_call),
-            patch.object(agent, "_try_refresh_nous_client_credentials") as refresh,
+            patch.object(
+                agent, "_try_refresh_nous_client_credentials", side_effect=_fake_refresh
+            ),
         ):
             result = agent.run_conversation("hello")
 
-        assert calls["api"] == 1
-        refresh.assert_not_called()
-        assert result["completed"] is False
-        assert result["failed"] is True
-        assert "401" in result["error"]
+        assert calls["api"] == 2
+        assert calls["refresh"] == 1
+        assert result["completed"] is True
+        assert result["final_response"] == "Recovered after remint"
 
     def test_context_compression_triggered(self, agent):
         """When compressor says should_compress, compression runs."""
@@ -4618,9 +4414,11 @@ class TestConversationHistoryNotMutated:
 
 
 class TestNousCredentialRefresh:
-    """The retired Nous account flow must never mint replacement credentials."""
+    """Verify Nous credential refresh rebuilds the runtime client."""
 
-    def test_try_refresh_nous_client_credentials_is_disabled(self, agent):
+    def test_try_refresh_nous_client_credentials_rebuilds_client(
+        self, agent, monkeypatch
+    ):
         agent.provider = "nous"
         agent.api_mode = "chat_completions"
 
@@ -5637,20 +5435,15 @@ class TestAnthropicInterruptHandler:
         from run_agent import AIAgent
         from agent.chat_completion_helpers import interruptible_api_call
 
-        with (
-            patch("run_agent.get_tool_definitions", return_value=[]),
-            patch("run_agent.check_toolset_requirements", return_value={}),
-            patch("agent.anthropic_adapter._anthropic_sdk"),
-        ):
-            agent = AIAgent(
-                api_key="test-key",
-                base_url="https://api.anthropic.com",
-                provider="anthropic",
-                model="claude-test",
-                quiet_mode=True,
-                skip_context_files=True,
-                skip_memory=True,
-            )
+        agent = AIAgent(
+            api_key="test-key",
+            base_url="https://api.anthropic.com",
+            provider="anthropic",
+            model="claude-test",
+            quiet_mode=True,
+            skip_context_files=True,
+            skip_memory=True,
+        )
         agent.api_mode = "anthropic_messages"
         agent._interrupt_requested = False
         agent._anthropic_client = MagicMock()

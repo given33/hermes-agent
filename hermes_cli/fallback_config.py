@@ -1,10 +1,9 @@
-"""Compatibility alias for the Agent fallback-chain policy."""
+"""Helpers for reading the effective fallback provider chain from config."""
 
 from __future__ import annotations
 
 from typing import Any
 
-from agent import fallback_config as _implementation
 
 def _normalized_base_url(value: Any) -> str:
     if not isinstance(value, str):

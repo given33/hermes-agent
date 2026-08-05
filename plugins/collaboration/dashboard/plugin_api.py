@@ -5694,7 +5694,7 @@ def _profile_runtime_readiness(
     from hermes_constants import reset_hermes_home_override, set_hermes_home_override
 
     try:
-        from agent.runtime_provider import resolve_runtime_provider
+        from hermes_cli.runtime_provider import resolve_runtime_provider
     except ModuleNotFoundError:
         return {
             "ready": False,
@@ -18023,9 +18023,13 @@ def _discover_profile_toolsets(
         # service here. A registered handler starts its service only when the
         # model actually calls that tool; the supervisor then reaps it after
         # its configured idle window.
-        from tools.mcp_tool import register_static_mcp_servers
+        from tools.mcp_tool import register_mcp_servers
 
-        register_static_mcp_servers()
+        register_mcp_servers({
+            name: {**server, "lazy": True}
+            for name, server in configured.items()
+            if isinstance(server, dict)
+        })
         selected = {
             str(name)
             for name, server in configured.items()
@@ -18041,7 +18045,7 @@ def _discover_profile_toolsets(
         live_selected = {
             snapshot.name
             for snapshot in backend.get_mcp_availability()
-            if snapshot.live
+            if (snapshot.live or getattr(snapshot, "state", "") == "ready")
             and snapshot.registered_tools
             and snapshot.name in selected
         }
@@ -18098,7 +18102,7 @@ def _profile_event_runner_main() -> int:
         from hermes_runtime.config import load_config
         from hermes_cli.env_loader import load_hermes_dotenv
         from hermes_cli.fallback_config import get_fallback_chain
-        from agent.runtime_provider import resolve_runtime_provider
+        from hermes_cli.runtime_provider import resolve_runtime_provider
         from hermes_runtime.session_context import declare_stateless_channel
         from hermes_state import SessionDB
         from run_agent import AIAgent

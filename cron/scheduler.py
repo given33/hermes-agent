@@ -14,13 +14,11 @@ import concurrent.futures
 import contextvars
 import json
 import logging
-import math
 import os
 import re
 import shutil
 import subprocess
 import sys
-import tempfile
 import threading
 import time
 
@@ -53,23 +51,6 @@ from hermes_time import now as _hermes_now
 from agent.interrupt_compat import request_hard_interrupt
 
 logger = logging.getLogger(__name__)
-
-
-def _coerce_cron_bool(value: Any, default: bool = False) -> bool:
-    """Interpret bool-like values from legacy or hand-edited job records."""
-    if isinstance(value, bool):
-        return value
-    if isinstance(value, (int, float)) and not isinstance(value, bool):
-        if isinstance(value, float) and not math.isfinite(value):
-            return default
-        return value != 0
-    if isinstance(value, str):
-        normalized = value.strip().casefold()
-        if normalized in {"true", "yes", "on", "1"}:
-            return True
-        if normalized in {"false", "no", "off", "0", ""}:
-            return False
-    return default
 
 
 def _set_cron_session_title(session_db, session_id, base_title):
@@ -191,23 +172,8 @@ def _resolve_cron_disabled_toolsets(cfg: dict) -> list[str]:
     past config.yaml's denylist).
     """
     disabled = ["cronjob", "messaging", "clarify"]
-    config = cfg if isinstance(cfg, dict) else {}
-    agent_cfg = config.get("agent") or {}
-    if not isinstance(agent_cfg, dict):
-        logger.warning(
-            "Ignoring malformed agent config value of type %s",
-            type(agent_cfg).__name__,
-        )
-        agent_cfg = {}
+    agent_cfg = (cfg or {}).get("agent") or {}
     user_disabled = agent_cfg.get("disabled_toolsets") or []
-    if isinstance(user_disabled, str):
-        user_disabled = [user_disabled]
-    elif not isinstance(user_disabled, (list, tuple, set)):
-        logger.warning(
-            "Ignoring malformed agent.disabled_toolsets value of type %s",
-            type(user_disabled).__name__,
-        )
-        user_disabled = []
     for name in user_disabled:
         name = str(name).strip()
         if name and name not in disabled:
@@ -265,26 +231,12 @@ def _resolve_cron_enabled_toolsets(job: dict, cfg: dict) -> list[str] | None:
     get cron WITHOUT ``moa`` by default (issue reported by Norbert —
     surprise $4.63 run).
     """
-    config = cfg if isinstance(cfg, dict) else {}
     per_job = job.get("enabled_toolsets")
-    if isinstance(per_job, str):
-        per_job = [per_job]
-    elif isinstance(per_job, (list, tuple, set)):
-        per_job = [str(name).strip() for name in per_job if str(name).strip()]
-    elif per_job:
-        # A hand-edited scalar/dict must not be passed to list() (which either
-        # raises for scalars or turns a dict into arbitrary key names). Fall
-        # through to the operator's cron platform policy instead.
-        logger.warning(
-            "Ignoring malformed cron enabled_toolsets value of type %s",
-            type(per_job).__name__,
-        )
-        per_job = None
     if per_job:
-        return _merge_mcp_into_per_job_toolsets(per_job, config)
+        return _merge_mcp_into_per_job_toolsets(list(per_job), cfg or {})
     try:
         from hermes_cli.tools_config import _get_platform_tools  # lazy: avoid heavy import at cron module load
-        return sorted(_get_platform_tools(config, "cron"))
+        return sorted(_get_platform_tools(cfg or {}, "cron"))
     except Exception as exc:
         logger.warning(
             "Cron toolset resolution failed, falling back to full default toolset: %s",
@@ -538,8 +490,6 @@ _terminal_cwd_lock = _ReadWriteLock()
 def _get_parallel_pool(max_workers: Optional[int]) -> concurrent.futures.ThreadPoolExecutor:
     """Return (or create) the persistent parallel pool."""
     global _parallel_pool, _parallel_pool_max_workers
-    if max_workers is not None and max_workers <= 0:
-        max_workers = None
     if _parallel_pool is None or _parallel_pool_max_workers != max_workers:
         if _parallel_pool is not None:
             _parallel_pool.shutdown(wait=False, cancel_futures=False)
@@ -549,40 +499,6 @@ def _get_parallel_pool(max_workers: Optional[int]) -> concurrent.futures.ThreadP
         )
         _parallel_pool_max_workers = max_workers
     return _parallel_pool
-
-
-def _resolve_max_parallel_workers() -> Optional[int]:
-    """Resolve a positive worker cap; zero/invalid values mean unbounded."""
-    raw_env = os.getenv("HERMES_CRON_MAX_PARALLEL", "").strip()
-    if raw_env:
-        try:
-            env_workers = int(raw_env)
-            if env_workers < 0:
-                raise ValueError
-            return env_workers or None
-        except (ValueError, TypeError):
-            logger.warning(
-                "Invalid HERMES_CRON_MAX_PARALLEL value; checking config.yaml"
-            )
-
-    try:
-        config = load_config() or {}
-        raw_config = (
-            config.get("cron", {}) if isinstance(config, dict) else {}
-        ).get("max_parallel_jobs")
-        if raw_config is None:
-            return None
-        config_workers = int(raw_config)
-        if config_workers < 0:
-            raise ValueError
-        return config_workers or None
-    except (ValueError, TypeError):
-        logger.warning(
-            "Invalid cron.max_parallel_jobs value; defaulting to unbounded"
-        )
-        return None
-    except Exception:
-        return None
 
 
 def _get_sequential_pool() -> concurrent.futures.ThreadPoolExecutor:
@@ -2144,23 +2060,7 @@ def _deliver_result(job: dict, content: str, adapters=None, loop=None) -> Option
                 try:
                     pool = concurrent.futures.ThreadPoolExecutor(max_workers=1)
                     try:
-                        # Create the retry coroutine inside the worker.  Calling
-                        # _send_to_platform before submit() leaves an orphaned
-                        # coroutine when executor startup/submit fails during
-                        # process shutdown.
-                        def run_standalone_retry():
-                            return asyncio.run(
-                                _send_to_platform(
-                                    platform,
-                                    pconfig,
-                                    chat_id,
-                                    cleaned_delivery_content,
-                                    thread_id=thread_id,
-                                    media_files=media_files,
-                                )
-                            )
-
-                        future = pool.submit(run_standalone_retry)
+                        future = pool.submit(asyncio.run, _send_to_platform(platform, pconfig, chat_id, cleaned_delivery_content, thread_id=thread_id, media_files=media_files))
                         result = future.result(timeout=30)
                     finally:
                         pool.shutdown(wait=False)
@@ -2373,7 +2273,6 @@ def _run_job_script(
     # shebang: the scripts dir is trusted, but keeping the interpreter
     # choice explicit here keeps the allowed surface small and auditable.
     suffix = path.suffix.lower()
-    temporary_script_path: Optional[Path] = None
     if suffix in {".sh", ".bash"}:
         # Resolve bash dynamically so Windows (Git Bash) and Linux/macOS
         # all work.  On native Windows without Git for Windows installed
@@ -2389,32 +2288,7 @@ def _run_job_script(
                 "On Windows, install Git for Windows (which ships Git Bash) "
                 "or rewrite the script as Python (.py)."
         )
-        execution_path = path
-        try:
-            script_bytes = path.read_bytes()
-            normalized_bytes = script_bytes.replace(b"\r\n", b"\n")
-            if normalized_bytes != script_bytes:
-                with tempfile.NamedTemporaryFile(
-                    mode="wb",
-                    prefix=f".{path.stem}-",
-                    suffix=path.suffix,
-                    dir=path.parent,
-                    delete=False,
-                ) as normalized_script:
-                    temporary_script_path = Path(normalized_script.name)
-                    normalized_script.write(normalized_bytes)
-                execution_path = temporary_script_path
-        except OSError as exc:
-            if temporary_script_path is not None:
-                try:
-                    temporary_script_path.unlink(missing_ok=True)
-                except OSError:
-                    pass
-            return False, f"Script preparation failed: {exc}"
-        # The subprocess cwd is the validated script directory, so a basename
-        # avoids incompatible absolute-path dialects across native POSIX,
-        # Git Bash, and the Windows WSL bash launcher.
-        argv = [_bash, "--", execution_path.name]
+        argv = [_bash, str(path)]
         env_overlay: dict[str, str] = {}
     else:
         python_exe, env_overlay = _windows_cron_python_invocation(sys.executable)
@@ -2451,7 +2325,7 @@ def _run_job_script(
 
         # Redact secrets from both stdout and stderr before any return path.
         try:
-            from hermes_runtime.redaction import redact_sensitive_text
+            from agent.redact import redact_sensitive_text
             stdout = redact_sensitive_text(stdout)
             stderr = redact_sensitive_text(stderr)
         except Exception as e:
@@ -2473,16 +2347,6 @@ def _run_job_script(
         return False, f"Script timed out after {script_timeout}s: {path}"
     except Exception as exc:
         return False, f"Script execution failed: {exc}"
-    finally:
-        if temporary_script_path is not None:
-            try:
-                temporary_script_path.unlink(missing_ok=True)
-            except OSError as exc:
-                logger.warning(
-                    "Failed to remove normalized cron script %s: %s",
-                    temporary_script_path,
-                    exc,
-                )
 
 
 def _run_job_script_with_claim_heartbeat(
@@ -2632,24 +2496,10 @@ def _build_job_prompt(job: dict, prerun_script: Optional[tuple] = None) -> str:
         from cron.jobs import get_cron_output_dir
         output_dir = get_cron_output_dir()
         if isinstance(context_from, str):
-            context_refs = [context_from]
-        elif isinstance(context_from, (list, tuple, set)):
-            context_refs = context_from
-        else:
-            logger.warning(
-                "context_from: ignoring malformed value of type %s for job_id=%r%s",
-                type(context_from).__name__,
-                job.get("id"),
-                _cron_job_origin_log_suffix(job),
-            )
-            context_refs = ()
-        for source_job_id in context_refs:
+            context_from = [context_from]
+        for source_job_id in context_from:
             # Guard against path traversal — valid job IDs are 12-char hex strings
-            if (
-                not isinstance(source_job_id, str)
-                or not source_job_id
-                or not all(c in "0123456789abcdef" for c in source_job_id)
-            ):
+            if not source_job_id or not all(c in "0123456789abcdef" for c in source_job_id):
                 logger.warning(
                     "context_from: skipping invalid job_id %r for job_id=%r name=%r%s",
                     source_job_id,
@@ -2708,13 +2558,6 @@ def _build_job_prompt(job: dict, prerun_script: Optional[tuple] = None) -> str:
         skills = [legacy] if legacy else []
     elif isinstance(skills, str):
         skills = [skills]
-    elif not isinstance(skills, (list, tuple, set)):
-        logger.warning(
-            "Ignoring malformed cron skills value of type %s for job_id=%r",
-            type(skills).__name__,
-            job.get("id"),
-        )
-        skills = []
 
     skill_names = [str(name).strip() for name in skills if str(name).strip()]
     if not skill_names:
@@ -2729,7 +2572,7 @@ def _build_job_prompt(job: dict, prerun_script: Optional[tuple] = None) -> str:
     from tools.skills_tool import skill_view
     from tools.skill_usage import bump_use
     from agent.skill_bundles import build_bundle_invocation_message, resolve_bundle_command_key
-    from hermes_runtime.skill_utils import normalize_skill_lookup_name
+    from agent.skill_utils import normalize_skill_lookup_name
 
     parts = []
     skipped: list[str] = []
@@ -2855,11 +2698,9 @@ def _scan_assembled_cron_prompt(
         # prompt is what actually runs.
         cleaned, scan_error = _scan_cron_skill_assembled(assembled)
         assembled = cleaned
-        if not scan_error and user_prompt:
-            # Runtime-loaded skill/data content uses the looser tier, but the
-            # original user-authored prompt must always retain the strict
-            # guarantee. This is a defense-in-depth backstop for legacy jobs
-            # that predate create/update-time prompt validation.
+        if not scan_error and not has_skills and user_prompt:
+            # Data-injection path: keep the strict guarantee on the
+            # user-authored prompt itself.
             scan_error = _scan_cron_prompt(user_prompt)
     else:
         scan_error = _scan_cron_prompt(assembled)
@@ -2960,7 +2801,7 @@ def run_job(
     #   - wakeAgent=false gate    → treated like empty stdout (silent), since
     #                               the whole point of no_agent is that there
     #                               is no agent to wake
-    if _coerce_cron_bool(job.get("no_agent"), False):
+    if job.get("no_agent"):
         script_path = job.get("script")
         if not script_path:
             err = "no_agent=True but no script is set for this job"
@@ -3085,7 +2926,7 @@ def run_job(
                 )
         if _session_db_timeout is None:
             try:
-                from hermes_runtime.config import load_config
+                from hermes_cli.config import load_config
                 _cfg = load_config() or {}
                 _cron_cfg = _cfg.get("cron", {}) if isinstance(_cfg, dict) else {}
                 _configured = _cron_cfg.get("session_db_timeout_seconds")
@@ -3096,18 +2937,6 @@ def run_job(
                     "Failed to load cron.session_db_timeout_seconds from config: %s",
                     exc,
                 )
-        # Only an explicit zero opts into the legacy unlimited behavior.
-        # Negative or non-finite values otherwise fall through the ``> 0``
-        # check below and accidentally disable the timeout entirely.
-        if _session_db_timeout is not None and (
-            not math.isfinite(_session_db_timeout) or _session_db_timeout < 0
-        ):
-            logger.warning(
-                "Invalid HERMES_CRON_SESSION_DB_TIMEOUT or "
-                "cron.session_db_timeout_seconds value %r; using default 10s",
-                _session_db_timeout,
-            )
-            _session_db_timeout = None
         if _session_db_timeout is None:
             _session_db_timeout = 10.0
 
@@ -3192,11 +3021,7 @@ def run_job(
 
     # Use ContextVars for per-job session/delivery state so parallel jobs
     # don't clobber each other's targets (os.environ is process-global).
-    from hermes_runtime.session_context import (
-        SESSION_CONTEXT_VARS,
-        clear_session_vars,
-        set_session_vars,
-    )
+    from gateway.session_context import set_session_vars, clear_session_vars, _VAR_MAP
 
     # Cron execution is an internal scheduler context, not a live inbound
     # gateway message. Do not seed HERMES_SESSION_* contextvars from the
@@ -3257,7 +3082,7 @@ def run_job(
         "HERMES_CRON_AUTO_DELIVER_THREAD_ID",
     )
     for _var_name in _cron_delivery_vars:
-        SESSION_CONTEXT_VARS[_var_name].set("")
+        _VAR_MAP[_var_name].set("")
 
     # Per-job working directory — _SESSION_CWD was already set via
     # set_session_vars(cwd=...) above. Here we only handle the
@@ -3296,7 +3121,7 @@ def run_job(
     # statement raises.  A leaked writer would deadlock the whole scheduler
     # (every future job blocks on acquire_*); a leaked reader blocks all
     # future writers.  Acquire itself can't leak (it either blocks or returns).
-    _cron_session_var = SESSION_CONTEXT_VARS["HERMES_CRON_SESSION"]
+    _cron_session_var = _VAR_MAP["HERMES_CRON_SESSION"]
     _cron_session_token = None
     try:
         # Scope cron approval policy to this job. Keep the token so the finally
@@ -3329,9 +3154,9 @@ def run_job(
 
         delivery_target = _resolve_delivery_target(job)
         if delivery_target:
-            SESSION_CONTEXT_VARS["HERMES_CRON_AUTO_DELIVER_PLATFORM"].set(delivery_target["platform"])
-            SESSION_CONTEXT_VARS["HERMES_CRON_AUTO_DELIVER_CHAT_ID"].set(str(delivery_target["chat_id"]))
-            SESSION_CONTEXT_VARS["HERMES_CRON_AUTO_DELIVER_THREAD_ID"].set(
+            _VAR_MAP["HERMES_CRON_AUTO_DELIVER_PLATFORM"].set(delivery_target["platform"])
+            _VAR_MAP["HERMES_CRON_AUTO_DELIVER_CHAT_ID"].set(str(delivery_target["chat_id"]))
+            _VAR_MAP["HERMES_CRON_AUTO_DELIVER_THREAD_ID"].set(
                 ""
                 if delivery_target.get("thread_id") is None
                 else str(delivery_target["thread_id"])
@@ -3365,7 +3190,7 @@ def run_job(
                 # builds its own dict, so overlay managed values via the shared
                 # helper (fail-open, no-op when no managed scope).
                 try:
-                    from hermes_runtime import managed_scope
+                    from hermes_cli import managed_scope
                     _cfg = managed_scope.apply_managed_overlay(_cfg)
                 except Exception:
                     pass
@@ -3457,7 +3282,7 @@ def run_job(
             resolve_runtime_provider,
             format_runtime_provider_error,
         )
-        from agent.provider_auth import AuthError
+        from hermes_cli.auth import AuthError
 
         # F8 runtime backstop: never resolve a stored provider/base_url pair that
         # would ship a named provider's stored credential to an off-host endpoint
@@ -3953,7 +3778,7 @@ def run_job(
         if _cron_session_token is not None:
             _cron_session_var.reset(_cron_session_token)
         for _var_name in _cron_delivery_vars:
-            SESSION_CONTEXT_VARS[_var_name].set("")
+            _VAR_MAP[_var_name].set("")
         if _session_db:
             # Compression can rotate the live agent onto a continuation while
             # this run is in flight. Finalize that continuation, not the stale
@@ -4113,7 +3938,7 @@ def run_one_job(job: dict, *, adapters=None, loop=None, verbose: bool = False) -
         # resolve_runtime_provider() raised UnscopedSecretError before model
         # selection, breaking every cron job. Mirrors the per-turn pattern in
         # gateway/run.py (_profile_runtime_scope).
-        from hermes_runtime.secret_scope import (
+        from agent.secret_scope import (
             build_profile_secret_scope,
             reset_secret_scope,
             set_secret_scope,
@@ -4352,10 +4177,6 @@ def tick(
         if verbose:
             logger.info("%s - %s job(s) due", _hermes_now().strftime('%H:%M:%S'), len(due_jobs))
 
-        # Validate executor configuration before mutating any due job. A bad
-        # value must not advance next_run_at and then abort dispatch.
-        _max_workers = _resolve_max_parallel_workers()
-
         # Advance next_run_at for all recurring jobs FIRST, under the file lock,
         # before any execution begins.  This preserves at-most-once semantics.
         # For parallel jobs that are already running, the advance keeps
@@ -4363,6 +4184,26 @@ def tick(
         # mark_job_run() overwrites next_run_at on completion.
         # Batched: one load + one save for the whole due set, not one per job.
         advance_next_runs([job["id"] for job in due_jobs])
+
+        # Resolve max parallel workers: env var > config.yaml > unbounded.
+        # Set HERMES_CRON_MAX_PARALLEL=1 to restore old serial behaviour.
+        _max_workers: Optional[int] = None
+        try:
+            _env_par = os.getenv("HERMES_CRON_MAX_PARALLEL", "").strip()
+            if _env_par:
+                _max_workers = int(_env_par) or None
+        except (ValueError, TypeError):
+            logger.warning("Invalid HERMES_CRON_MAX_PARALLEL value; defaulting to unbounded")
+        if _max_workers is None:
+            try:
+                _ucfg = load_config() or {}
+                _cfg_par = (
+                    _ucfg.get("cron", {}) if isinstance(_ucfg, dict) else {}
+                ).get("max_parallel_jobs")
+                if _cfg_par is not None:
+                    _max_workers = int(_cfg_par) or None
+            except Exception:
+                pass
 
         if verbose:
             logger.info(
@@ -4384,12 +4225,8 @@ def tick(
         # That alone only keeps workdir jobs from overlapping EACH OTHER;
         # run_job's _terminal_cwd_lock is what additionally stops a concurrently
         # firing workdir-less parallel-pool job from observing the override.
-        def _has_job_workdir(job: dict) -> bool:
-            workdir = job.get("workdir")
-            return isinstance(workdir, str) and bool(workdir.strip())
-
-        sequential_jobs = [j for j in due_jobs if _has_job_workdir(j)]
-        parallel_jobs = [j for j in due_jobs if not _has_job_workdir(j)]
+        sequential_jobs = [j for j in due_jobs if (j.get("workdir") or "").strip()]
+        parallel_jobs = [j for j in due_jobs if not (j.get("workdir") or "").strip()]
 
         _results: list = []
         _all_futures: list = []

@@ -8,7 +8,7 @@ import time
 from types import SimpleNamespace
 
 import pytest
-from mcp.server.mcpserver.exceptions import ToolError
+from mcp.server.fastmcp.exceptions import ToolError
 
 import hermes_cli.ios_mcp_server as ios_mcp_server_module
 from hermes_cli.ios_intelligence import IOSIntelligenceStore, ios_native_action_metadata
@@ -495,9 +495,8 @@ def test_runtime_supervisor_passes_configured_scope_grants_to_child_process(
 
 
 def test_supervised_http_process_enforces_restricted_scope_end_to_end(tmp_path):
-    from mcp import Client
+    from mcp import ClientSession
     from mcp.client.streamable_http import streamable_http_client
-    from mcp.types.version import LATEST_PROTOCOL_VERSION
 
     from hermes_cli.ios_mcp_supervisor import IOSMCPRuntimeSupervisor
 
@@ -528,17 +527,20 @@ def test_supervised_http_process_enforces_restricted_scope_end_to_end(tmp_path):
     )
 
     async def invoke_remote_tools():
-        transport = streamable_http_client(runtime.endpoint_for("ios-calendar"))
-        async with Client(transport, mode=LATEST_PROTOCOL_VERSION) as client:
-            listed = await client.call_tool(
-                "ios_calendar_list",
-                {"owner_id": "alice"},
-            )
-            denied = await client.call_tool(
-                "ios_calendar_create",
-                {"owner_id": "alice", "payload": {"title": "blocked"}},
-            )
-            return listed, denied
+        async with streamable_http_client(
+            runtime.endpoint_for("ios-calendar")
+        ) as (read_stream, write_stream, _):
+            async with ClientSession(read_stream, write_stream) as client:
+                await client.initialize()
+                listed = await client.call_tool(
+                    "ios_calendar_list",
+                    {"owner_id": "alice"},
+                )
+                denied = await client.call_tool(
+                    "ios_calendar_create",
+                    {"owner_id": "alice", "payload": {"title": "blocked"}},
+                )
+                return listed, denied
 
     try:
         runtime.start()
@@ -550,8 +552,8 @@ def test_supervised_http_process_enforces_restricted_scope_end_to_end(tmp_path):
         assert health["ok"] is True
 
         listed, denied = asyncio.run(invoke_remote_tools())
-        assert listed.is_error is False
-        assert denied.is_error is True
+        assert listed.isError is False
+        assert denied.isError is True
         assert "missing calendar:write" in denied.content[0].text
         assert IOSIntelligenceStore(data_dir).pull_device_commands(
             "alice",

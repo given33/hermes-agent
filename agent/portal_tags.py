@@ -12,7 +12,7 @@ Tag shape (sent in OpenAI-compatible ``extra_body['tags']``):
         "client=hermes-client-v<__version__>",
     ]
 
-    The version is sourced from ``hermes_runtime.version`` so it auto-aligns
+The version is sourced live from ``hermes_cli.__version__`` so it auto-aligns
 to whatever release is installed; the release script
 (``scripts/release.py``) regex-bumps that single string, and every Portal
 request picks up the new tag on the next process start.
@@ -25,7 +25,8 @@ Why one helper instead of inlining the literal at each site:
   assertion a one-liner against this module.
 
 Do NOT pre-compute these as module-level constants in the consumers. The
-runtime version module is the canonical import-safe source of truth.
+version can change at runtime (editable installs, hot-reload tooling), and
+``hermes_cli.__version__`` is the canonical source of truth.
 """
 
 from __future__ import annotations
@@ -84,11 +85,12 @@ def get_conversation_context() -> Optional[str]:
 def _hermes_version() -> str:
     """Return the current Hermes release version, e.g. ``"0.13.0"``.
 
-    Falls back to ``"unknown"`` if the runtime version module is unavailable.
+    Falls back to ``"unknown"`` if ``hermes_cli`` cannot be imported (should
+    never happen in a real install — guarded for defensive testing).
     """
     try:
-        from hermes_runtime.version import HERMES_VERSION
-        return HERMES_VERSION
+        from hermes_cli import __version__
+        return __version__
     except Exception:
         return "unknown"
 

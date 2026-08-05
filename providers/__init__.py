@@ -34,14 +34,7 @@ import importlib
 import importlib.util
 import logging
 import sys
-import threading
 from pathlib import Path
-
-from hermes_services.startup import bootstrap_trusted_runtime
-
-# Provider profiles are dynamically imported on first lookup, including when
-# this package is imported directly outside the CLI plugin manager.
-bootstrap_trusted_runtime()
 
 from providers.base import OMIT_TEMPERATURE, ProviderProfile  # noqa: F401
 
@@ -51,7 +44,6 @@ _REGISTRY: dict[str, ProviderProfile] = {}
 _ALIASES: dict[str, str] = {}
 _PROVIDER_LIST_CACHE: list[ProviderProfile] | None = None
 _discovered = False
-_DISCOVERY_LOCK = threading.RLock()
 
 # Repo-root ``plugins/model-providers/`` — populated at discovery time.
 _BUNDLED_PLUGINS_DIR = (
@@ -78,10 +70,10 @@ def get_provider_profile(name: str) -> ProviderProfile | None:
 
     Returns None if the provider has no profile (falls back to generic).
     """
-    _discover_providers()
-    with _DISCOVERY_LOCK:
-        canonical = _ALIASES.get(name, name)
-        return _REGISTRY.get(canonical)
+    if not _discovered:
+        _discover_providers()
+    canonical = _ALIASES.get(name, name)
+    return _REGISTRY.get(canonical)
 
 
 def list_providers() -> list[ProviderProfile]:
@@ -166,15 +158,7 @@ def _discover_providers() -> None:
     global _discovered
     if _discovered:
         return
-    with _DISCOVERY_LOCK:
-        if _discovered:
-            return
-        _discover_providers_unlocked()
-        _discovered = True
-
-
-def _discover_providers_unlocked() -> None:
-    """Perform one discovery sweep while ``_DISCOVERY_LOCK`` is held."""
+    _discovered = True
 
     # 1. Bundled plugins — shipped with hermes-agent.
     if _BUNDLED_PLUGINS_DIR.is_dir():

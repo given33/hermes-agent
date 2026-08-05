@@ -257,10 +257,7 @@ class TestCheckStructure:
         target.mkdir()
         link = tmp_path / "skill" / "escape"
         (tmp_path / "skill").mkdir()
-        try:
-            link.symlink_to(target, target_is_directory=True)
-        except OSError as exc:
-            pytest.skip(f"directory symlinks unavailable: {exc}")
+        link.symlink_to(target)
         findings = _check_structure(tmp_path / "skill")
         assert any(fi.pattern_id == "symlink_escape" for fi in findings)
 

@@ -189,10 +189,8 @@ class SessionManager:
             db:            Optional SessionDB instance. When omitted, the default
                            SessionDB (``~/.hermes/state.db``) is lazily created.
         """
-        from hermes_services.session_registry import LiveSessionRegistry
-
-        self._sessions: LiveSessionRegistry[SessionState] = LiveSessionRegistry()
-        self._lock = self._sessions.lock
+        self._sessions: Dict[str, SessionState] = {}
+        self._lock = Lock()
         self._agent_factory = agent_factory
         self._db_instance = db  # None → lazy-init on first use
 
@@ -603,7 +601,7 @@ class SessionManager:
             return self._agent_factory()
 
         from run_agent import AIAgent
-        from hermes_runtime.config import load_config
+        from hermes_cli.config import load_config
         from hermes_cli.runtime_provider import resolve_runtime_provider
 
         config = load_config()

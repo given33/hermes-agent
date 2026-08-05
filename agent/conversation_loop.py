@@ -37,7 +37,6 @@ from agent.conversation_compression import (
 )
 from agent.context_engine import automatic_compaction_status_message
 from agent.display import KawaiiSpinner
-from hermes_services.internal_hooks import run_internal_hooks
 from agent.error_classifier import FailoverReason, classify_api_error
 from agent.turn_context import (
     _compression_warrants_another_preflight_pass,
@@ -77,7 +76,6 @@ from agent.prompt_caching import (
 )
 from agent.retry_utils import (
     adaptive_rate_limit_backoff,
-    cloudflare_origin_retry_delay,
     is_zai_coding_overload_error,
     jittered_backoff,
     zai_coding_overload_retry_ceiling,
@@ -117,7 +115,7 @@ _API_CALL_MODULES = frozenset({
 
 
 def _hosted_should_retry_client_error(agent: Any, status_code: Any) -> bool:
-    """Limit the mobile key-replacement grace period to hosted 401/403 turns."""
+    """Limit the hosted credential-replacement grace period to 401/403."""
     return bool(
         (
             getattr(agent, "_api_retry_client_errors", False)
@@ -133,13 +131,12 @@ def _model_retry_wait_seconds(
     retry_after: Optional[float],
     retry_count: int,
 ) -> float:
-    """Resolve one retry delay while preserving provider Retry-After hints."""
+    """Resolve a retry delay while preserving provider Retry-After hints."""
     configured_delay = getattr(agent, "_api_retry_delay_seconds", None)
     if configured_delay is None:
         configured_delay = getattr(agent, "_hosted_retry_delay_seconds", None)
     if configured_delay is not None:
-        delay = max(0.0, float(configured_delay))
-        return max(delay, float(retry_after or 0.0))
+        return max(max(0.0, float(configured_delay)), float(retry_after or 0.0))
     if retry_after is not None:
         return float(retry_after)
     return jittered_backoff(retry_count, base_delay=2.0, max_delay=60.0)
@@ -357,10 +354,20 @@ def _ra():
 
 
 def _nous_entitlement_message(capability: str) -> str:
-    return (
-        f"{capability} requires a valid NOUS_API_KEY with access to the selected "
-        "model. Update the key or switch to another configured provider."
-    )
+    try:
+        from hermes_cli.nous_account import (
+            format_nous_portal_entitlement_message,
+            get_nous_portal_account_info,
+        )
+
+        account_info = get_nous_portal_account_info(force_fresh=True)
+        message = format_nous_portal_entitlement_message(
+            account_info,
+            capability=capability,
+        )
+        return message or ""
+    except Exception:
+        return ""
 
 
 def _print_nous_entitlement_guidance(agent, capability: str) -> bool:
@@ -474,9 +481,18 @@ def _print_billing_or_entitlement_guidance(
 
 
 def _try_refresh_nous_paid_entitlement_credentials(agent) -> bool:
-    """Account-managed credential refresh is disabled in this fork."""
-    del agent
-    return False
+    """Refresh Nous runtime credentials after a fresh paid-entitlement check."""
+    try:
+        from hermes_cli.nous_account import get_nous_portal_account_info
+
+        account_info = get_nous_portal_account_info(force_fresh=True)
+        if account_info.paid_service_access is not True:
+            return False
+        return agent._try_refresh_nous_client_credentials(
+            force=True,
+        )
+    except Exception:
+        return False
 
 
 def _restore_or_build_system_prompt(agent, system_message, conversation_history):
@@ -1280,7 +1296,7 @@ def run_conversation(
     """
     if moa_config is None:
         try:
-            from agent.moa_config import decode_moa_turn
+            from hermes_cli.moa_config import decode_moa_turn
 
             _decoded_message, _decoded_moa_config = decode_moa_turn(user_message)
             if _decoded_moa_config is not None:
@@ -1288,16 +1304,8 @@ def run_conversation(
                 moa_config = _decoded_moa_config
                 if persist_user_message is None:
                     persist_user_message = _decoded_message
-        except Exception as _moa_decode_err:
-            # decode_moa_turn already hands back the message unchanged for
-            # non-MoA payloads, so getting here means the hermes_cli import
-            # or preset normalization itself blew up.  Non-fatal — the turn
-            # proceeds with the raw message — but it must not be silent:
-            # a swallowed failure here looks like "MoA mysteriously off".
-            logger.warning(
-                "MoA turn decode failed; sending message as-is: %s",
-                _moa_decode_err,
-            )
+        except Exception:
+            pass
 
     # The gateway caches agents across user turns.  Compression state is
     # per-turn: carrying a prior in-place boundary forward would make a later
@@ -1513,30 +1521,19 @@ def run_conversation(
                     existing = _sm.get("content", "")
                     if isinstance(existing, str):
                         _sm["content"] = existing + marker
-                        _injected = True
                     else:
                         # Multimodal content blocks — append text block
                         try:
                             blocks = list(existing) if existing else []
                             blocks.append({"type": "text", "text": marker})
                             _sm["content"] = blocks
-                            _injected = True
-                        except Exception as _steer_err:
-                            # Leave _injected False: the requeue branch
-                            # below then preserves the steer for the
-                            # post-tool drain.  Marking it injected here
-                            # would silently drop the user's steer.
-                            logger.warning(
-                                "Pre-API-call steer drain: could not append to "
-                                "multimodal tool msg at index %d; requeueing steer: %s",
-                                _si,
-                                _steer_err,
-                            )
-                    if _injected:
-                        logger.debug(
-                            "Pre-API-call steer drain: injected into tool msg at index %d",
-                            _si,
-                        )
+                        except Exception:
+                            pass
+                    _injected = True
+                    logger.debug(
+                        "Pre-API-call steer drain: injected into tool msg at index %d",
+                        _si,
+                    )
                     break
             if not _injected:
                 # No tool message to inject into — put it back so
@@ -1612,9 +1609,6 @@ def run_conversation(
             # It is bookkeeping, never a provider field — pop it from EVERY
             # outgoing copy.
             _api_content = api_msg.pop("api_content", None)
-            # Hook traces are durable audit metadata, not provider message
-            # fields. Keep them on the canonical/session copy only.
-            api_msg.pop("hook_trace", None)
 
             # Display-only timeline metadata. Never a provider field — strip
             # from every outgoing copy so strict OpenAI-compatible backends
@@ -2160,8 +2154,6 @@ def run_conversation(
         agent._current_api_request_id = api_request_id
 
         while retry_count < max_retries:
-            if retry_count > 0 and getattr(agent, "_api_retry_status_live", False):
-                agent._emit_status("正在思考")
             # ── Nous Portal rate limit guard ──────────────────────
             # If another session already recorded that Nous is rate-
             # limited, skip the API call entirely.  Each attempt
@@ -2260,7 +2252,7 @@ def run_conversation(
                     api_kwargs["extra_headers"] = _xh
                     agent._is_user_initiated_turn = False
                 try:
-                    from hermes_services.middleware import apply_llm_request_middleware
+                    from hermes_cli.middleware import apply_llm_request_middleware
 
                     _llm_request_mw = apply_llm_request_middleware(
                         api_kwargs,
@@ -2281,27 +2273,6 @@ def run_conversation(
                 except Exception:
                     _original_api_kwargs = dict(api_kwargs)
                     _llm_middleware_trace = []
-
-                _request_hook_result = run_internal_hooks(
-                    "before_model_request",
-                    api_kwargs,
-                    task_id=effective_task_id or "",
-                    turn_id=turn_id,
-                    api_request_id=api_request_id,
-                    session_id=agent.session_id or "",
-                    model=agent.model,
-                    provider=agent.provider,
-                    api_call_count=api_call_count,
-                )
-                _hooked_api_kwargs = _request_hook_result.payload
-                _internal_request_trace = _request_hook_result.trace
-                if not isinstance(_hooked_api_kwargs, dict):
-                    raise TypeError("before_model_request hooks must return a dict or None")
-                api_kwargs = _hooked_api_kwargs
-                _llm_middleware_trace = [
-                    *_llm_middleware_trace,
-                    *_internal_request_trace,
-                ]
 
                 try:
                     from hermes_cli.lifecycle import (
@@ -2358,15 +2329,8 @@ def run_conversation(
                             middleware_trace=list(_llm_middleware_trace),
                             request=_request_payload,
                         )
-                except Exception as _pre_hook_err:
-                    # Plugin hooks are observability-only: a broken plugin
-                    # must never break the API call.  But swallowing the
-                    # error silently hid real hook bugs — log and continue.
-                    logger.warning(
-                        "pre_api_request plugin hook failed (api call #%s): %s",
-                        api_call_count,
-                        _pre_hook_err,
-                    )
+                except Exception:
+                    pass
 
                 if env_var_enabled("HERMES_DUMP_REQUESTS"):
                     agent._dump_api_request_debug(api_kwargs, reason="preflight")
@@ -2466,7 +2430,7 @@ def run_conversation(
                         defer_logical_completion=True,
                     )
 
-                from hermes_services.middleware import run_llm_execution_middleware
+                from hermes_cli.middleware import run_llm_execution_middleware
 
                 _model_request_active = getattr(agent, "_model_request_active", None)
                 _redirect_lock = getattr(agent, "_pending_redirect_lock", None)
@@ -2748,15 +2712,8 @@ def run_conversation(
                             "failed": True  # Mark as failure for filtering
                         }
                     
-                    # Hosted mobile turns use a stable one-minute cadence so
-                    # the UI state machine and the real provider attempts share
-                    # one clock. Other surfaces keep the adaptive backoff.
-                    configured_retry_delay = float(
-                        getattr(agent, "_api_retry_delay_seconds", 0.0) or 0.0
-                    )
-                    wait_time = configured_retry_delay or jittered_backoff(
-                        retry_count, base_delay=5.0, max_delay=120.0
-                    )
+                    # Backoff before retry — jittered exponential: 5s base, 120s cap
+                    wait_time = jittered_backoff(retry_count, base_delay=5.0, max_delay=120.0)
                     agent._buffer_vprint(f"⏳ Retrying in {wait_time:.1f}s ({_failure_hint})...")
                     logger.warning("Invalid API response (retry %d/%d): %s | Provider: %s", retry_count, max_retries, ', '.join(error_details), provider_name)
                     
@@ -3898,6 +3855,23 @@ def run_conversation(
                     retryable=classified.retryable,
                     reason=classified.reason.value,
                 )
+
+                if (
+                    classified.reason == FailoverReason.billing
+                    and _is_nous_inference_route(
+                        getattr(agent, "provider", "") or "",
+                        getattr(agent, "base_url", "") or "",
+                    )
+                    and not _retry.nous_paid_entitlement_refresh_attempted
+                ):
+                    _retry.nous_paid_entitlement_refresh_attempted = True
+                    if _try_refresh_nous_paid_entitlement_credentials(agent):
+                        agent._vprint(
+                            f"{agent.log_prefix}🔐 Nous paid access verified — "
+                            "refreshed runtime credentials and retrying request...",
+                            force=True,
+                        )
+                        continue
 
                 recovered_with_pool, _retry.has_retried_429 = agent._recover_with_credential_pool(
                     status_code=status_code,
@@ -5066,26 +5040,9 @@ def run_conversation(
                         }
                     )
                 ) and not is_context_length_error
+
                 if is_client_error and _hosted_should_retry_client_error(
                     agent, status_code
-                ):
-                    # The iOS hosted-turn contract intentionally gives the
-                    # user time to replace an expired key while the same child
-                    # keeps its session. Other Hermes surfaces retain the
-                    # normal fail-fast behavior for deterministic 4xx errors.
-                    is_client_error = False
-
-                if (
-                    getattr(agent, "_api_retry_client_errors", False)
-                    and status_code in {400, 401, 403, 404}
-                    and not is_local_validation_error
-                    and classified.reason not in {
-                        FailoverReason.billing,
-                        FailoverReason.content_policy_blocked,
-                        FailoverReason.context_overflow,
-                        FailoverReason.payload_too_large,
-                        FailoverReason.ssl_cert_verification,
-                    }
                 ):
                     is_client_error = False
 
@@ -5183,7 +5140,7 @@ def run_conversation(
                             "Nous model access",
                         ):
                             pass
-                        elif _provider in {"openai-codex", "xai-oauth"} and status_code == 401:
+                        elif _provider in {"openai-codex", "xai-oauth", "nous"} and status_code == 401:
                             if _provider == "openai-codex":
                                 agent._vprint(f"{agent.log_prefix}   💡 Codex OAuth token was rejected (HTTP 401). Your token may have been", force=True)
                                 agent._vprint(f"{agent.log_prefix}      refreshed by another client (Codex CLI, VS Code). To fix:", force=True)
@@ -5192,6 +5149,17 @@ def run_conversation(
                             elif _provider == "xai-oauth":
                                 agent._vprint(f"{agent.log_prefix}   💡 xAI OAuth token was rejected (HTTP 401). To fix:", force=True)
                                 agent._vprint(f"{agent.log_prefix}      re-authenticate with xAI Grok OAuth (SuperGrok / Premium+) from `hermes model`.", force=True)
+                            else:  # nous
+                                agent._vprint(f"{agent.log_prefix}   💡 Nous Portal OAuth token was rejected (HTTP 401). Your token may be", force=True)
+                                agent._vprint(f"{agent.log_prefix}      expired, revoked, or your account may be out of credits. To fix:", force=True)
+                                agent._vprint(f"{agent.log_prefix}      1. Re-authenticate: hermes portal", force=True)
+                                agent._vprint(f"{agent.log_prefix}      2. Check your portal account: https://portal.nousresearch.com", force=True)
+                                # ``:free`` is OpenRouter slug syntax; Nous Portal will reject
+                                # the model name even after a successful re-auth.
+                                if isinstance(_model, str) and _model.endswith(":free"):
+                                    agent._vprint(f"{agent.log_prefix}      ⚠️  Note: `{_model}` looks like an OpenRouter slug (`:free` suffix).", force=True)
+                                    agent._vprint(f"{agent.log_prefix}         Nous Portal won't recognize that model name. Either switch to a", force=True)
+                                    agent._vprint(f"{agent.log_prefix}         Nous catalog model, or run `/model openrouter:{_model}` to use OpenRouter.", force=True)
                         else:
                             agent._vprint(f"{agent.log_prefix}   💡 Your API key was rejected by the provider. Check:", force=True)
                             agent._vprint(f"{agent.log_prefix}      • Is the key valid? Run: hermes setup", force=True)
@@ -5523,12 +5491,9 @@ def run_conversation(
                         "billing_block": _billing_block,
                     }
 
-                # Respect Cloudflare origin retry hints carried in JSON bodies.
-                # Unlike rate-limit responses, these 502s commonly omit the
-                # Retry-After header and explicitly ask clients to wait 60s.
-                _cloudflare_origin_delay = cloudflare_origin_retry_delay(api_error)
-                _retry_after = _cloudflare_origin_delay
-                if is_rate_limited and _retry_after is None:
+                # For rate limits, respect the Retry-After header if present
+                _retry_after = None
+                if is_rate_limited:
                     _resp_headers = getattr(getattr(api_error, "response", None), "headers", None)
                     if _resp_headers and hasattr(_resp_headers, "get"):
                         _ra_raw = _resp_headers.get("retry-after") or _resp_headers.get("Retry-After")
@@ -5556,14 +5521,7 @@ def run_conversation(
                         error=api_error,
                         default_wait=wait_time,
                     )
-                if _cloudflare_origin_delay is not None:
-                    _backoff_policy = "cloudflare_origin_bad_gateway"
-                    _origin_status = (
-                        f"Upstream origin unavailable. Waiting {wait_time:.1f}s "
-                        f"(attempt {retry_count + 1}/{max_retries})..."
-                    )
-                    agent._emit_status(_origin_status)
-                elif is_rate_limited or _is_zai_coding_overload:
+                if is_rate_limited or _is_zai_coding_overload:
                     _policy_note = ""
                     if _backoff_policy == "zai_coding_overload_long":
                         _policy_note = " (Z.AI Coding overload adaptive long backoff)"
@@ -5580,10 +5538,6 @@ def run_conversation(
                         agent._buffer_status(_rate_limit_status)
                 else:
                     agent._buffer_status(f"⏳ Retrying in {wait_time:.1f}s (attempt {retry_count}/{max_retries})...")
-                if getattr(agent, "_api_retry_status_live", False):
-                    agent._emit_status(
-                        f"正在重连 ({retry_count}/{max_retries})"
-                    )
                 logger.warning(
                     "Retrying API call in %ss (attempt %s/%s) %s policy=%s error=%s",
                     wait_time,
@@ -5733,39 +5687,6 @@ def run_conversation(
                 else:
                     assistant_message.content = str(raw)
 
-            _response_hook_result = run_internal_hooks(
-                "after_provider_response",
-                {
-                    "content": assistant_message.content or "",
-                    "finish_reason": finish_reason or "",
-                    "tool_call_count": len(
-                        getattr(assistant_message, "tool_calls", None) or []
-                    ),
-                    "response_model": getattr(response, "model", None),
-                },
-                task_id=effective_task_id or "",
-                turn_id=turn_id,
-                api_request_id=api_request_id,
-                session_id=agent.session_id or "",
-                model=agent.model,
-                provider=agent.provider,
-                api_call_count=api_call_count,
-            )
-            _provider_payload = _response_hook_result.payload
-            _internal_response_trace = _response_hook_result.trace
-            if not isinstance(_provider_payload, dict):
-                raise TypeError("after_provider_response hooks must return a dict or None")
-            if isinstance(_provider_payload.get("content"), str):
-                assistant_message.content = _provider_payload["content"]
-            if isinstance(_provider_payload.get("finish_reason"), str):
-                finish_reason = _provider_payload["finish_reason"] or finish_reason
-            if _internal_response_trace:
-                setattr(
-                    assistant_message,
-                    "hermes_hook_trace",
-                    list(_internal_response_trace),
-                )
-
             try:
                 from hermes_cli.lifecycle import (
                     has_hook,
@@ -5805,14 +5726,8 @@ def run_conversation(
                         assistant_content_chars=len(_assistant_text),
                         assistant_tool_call_count=len(_assistant_tool_calls),
                     )
-            except Exception as _post_hook_err:
-                # Same contract as pre_api_request above: hook failures are
-                # non-fatal, but must be visible in the logs.
-                logger.warning(
-                    "post_api_request plugin hook failed (api call #%s): %s",
-                    api_call_count,
-                    _post_hook_err,
-                )
+            except Exception:
+                pass
 
             # Handle assistant response
             if assistant_message.content and not agent.quiet_mode:

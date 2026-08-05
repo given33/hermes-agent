@@ -1,12 +1,22 @@
-"""Compatibility alias for :mod:`hermes_services.cron_fire`.
+"""Inbound cron-fire token verification for Chronos (Phase 4E.1).
 
-Chronos callback verification is a shared transport security boundary, not a
-plugin-local HTTP implementation.  Keep the historical path as the exact same
-module object for third-party imports and monkeypatch-based integrations.
+When NAS relays an external scheduler fire to the agent, it POSTs
+``/api/cron/fire`` with a short-lived NAS-minted JWT. This module verifies that
+JWT before any job runs — the security boundary for remotely-triggered job
+execution.
+
+We verify a NAS-minted JWT (the trust path the agent already has) rather than
+let an external scheduler call the agent directly: the scheduler signs with
+NAS's keys, which the agent doesn't (and shouldn't) hold. See the plan's DQ-4.
+
+The verifier is pluggable (``get_fire_verifier``) so the escape-hatch mode
+(direct per-job cron-key) can swap in later with no handler change.
+
+Crypto is delegated to PyJWT (already a declared dependency) — we do NOT
+hand-roll JWT verification.
 """
 
-from importlib import import_module
-import sys
+from __future__ import annotations
 
 import logging
 import threading
@@ -142,8 +152,3 @@ def get_fire_verifier() -> Callable[..., Optional[Dict[str, Any]]]:
     — so the webhook handler never changes when the auth mode is swapped.
     """
     return verify_nas_fire_token
-
-
-from hermes_services.cron_fire import register_fire_verifier_resolver
-
-register_fire_verifier_resolver(lambda: get_fire_verifier())

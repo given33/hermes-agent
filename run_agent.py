@@ -97,7 +97,7 @@ def _launch_cwd_for_session(source: str) -> Optional[str]:
 
 def _session_source_for_agent(platform: Optional[str]) -> str:
     try:
-        from hermes_runtime.session_context import get_session_env
+        from gateway.session_context import get_session_env
 
         source = get_session_env("HERMES_SESSION_SOURCE", "")
     except Exception:
@@ -124,7 +124,7 @@ from agent.interrupt_compat import request_hard_interrupt
 
 
 from hermes_cli.env_loader import load_hermes_dotenv
-from hermes_runtime.timeouts import (
+from hermes_cli.timeouts import (
     get_provider_request_timeout,
     get_provider_stale_timeout,
 )
@@ -155,7 +155,7 @@ from tools.browser_tool import cleanup_browser
 from agent.memory_manager import sanitize_context
 from agent.memory_provider import is_trivial_prompt
 from agent.error_classifier import FailoverReason
-from hermes_runtime.redaction import redact_sensitive_text
+from agent.redact import redact_sensitive_text
 from agent.message_content import flatten_message_text
 from agent.session_activity import ActivityProvenance
 from agent.model_metadata import (
@@ -1600,8 +1600,8 @@ class AIAgent:
             return False
         if normalized_provider == "copilot":
             try:
-                from agent.model_catalog import should_use_copilot_responses_api
-                return should_use_copilot_responses_api(model)
+                from hermes_cli.models import _should_use_copilot_responses_api
+                return _should_use_copilot_responses_api(model)
             except Exception:
                 # Fall back to the generic GPT-5 rule if Copilot-specific
                 # logic is unavailable for any reason.
@@ -3446,7 +3446,7 @@ class AIAgent:
             # Read from the persisted config.yaml so gateway and CLI share
             # the same setting.  Import lazily to avoid a startup-time cycle.
             try:
-                from hermes_runtime.config import load_config as _load_config
+                from hermes_cli.config import load_config as _load_config
                 _cfg = _load_config() or {}
             except Exception:
                 _cfg = {}
@@ -3543,7 +3543,7 @@ class AIAgent:
             # Read from the persisted config.yaml so gateway and CLI share
             # the same setting.  Import lazily to avoid a startup-time cycle.
             try:
-                from hermes_runtime.config import load_config as _load_config
+                from hermes_cli.config import load_config as _load_config
                 _cfg = _load_config() or {}
             except Exception:
                 _cfg = {}
@@ -3959,7 +3959,7 @@ class AIAgent:
             return cached
         enabled = True
         try:
-            from hermes_runtime.config import load_config as _load_config
+            from hermes_cli.config import load_config as _load_config
             _cfg = _load_config() or {}
             _display = _cfg.get("display") if isinstance(_cfg, dict) else None
             if isinstance(_display, dict) and "credits_notices" in _display:
@@ -5623,7 +5623,7 @@ class AIAgent:
         elif base_url_host_matches(base_url, "api.routermint.com"):
             self._client_kwargs["default_headers"] = _routermint_headers()
         elif base_url_host_matches(base_url, "githubcopilot.com"):
-            from agent.model_catalog import copilot_default_headers
+            from hermes_cli.models import copilot_default_headers
 
             self._client_kwargs["default_headers"] = copilot_default_headers()
         elif base_url_host_matches(base_url, "api.kimi.com"):
@@ -5666,7 +5666,7 @@ class AIAgent:
         # SECURITY: values may carry credentials — never log them.
         if self.api_mode not in ("anthropic_messages", "bedrock_converse"):
             try:
-                from hermes_runtime.config import (
+                from hermes_cli.config import (
                     apply_custom_provider_extra_headers_to_client_kwargs,
                 )
 
@@ -6393,7 +6393,7 @@ class AIAgent:
         misclassified as non-vision and have their images stripped.
         """
         try:
-            from hermes_runtime.config import load_config
+            from hermes_cli.config import load_config
             from agent.image_routing import _lookup_supports_vision
             cfg = load_config()
             provider = (getattr(self, "provider", "") or "").strip()
@@ -6825,7 +6825,7 @@ class AIAgent:
             or base_url_host_matches(self._base_url_lower, "githubcopilot.com")
         ):
             try:
-                from agent.model_catalog import github_model_reasoning_efforts
+                from hermes_cli.models import github_model_reasoning_efforts
 
                 return bool(github_model_reasoning_efforts(self.model))
             except Exception:
@@ -6884,7 +6884,7 @@ class AIAgent:
             if opts or (_time.monotonic() - ts) < 60:
                 return opts
         try:
-            from agent.model_catalog import lmstudio_model_reasoning_options
+            from hermes_cli.models import lmstudio_model_reasoning_options
             opts = lmstudio_model_reasoning_options(
                 self.model, self.base_url, getattr(self, "api_key", ""),
             )
@@ -6915,7 +6915,7 @@ class AIAgent:
             if supported is not None or (_time.monotonic() - ts) < 60:
                 return bool(supported)
         try:
-            from agent.model_catalog import ollama_model_supports_thinking
+            from hermes_cli.models import ollama_model_supports_thinking
             supported = ollama_model_supports_thinking(
                 self.model, self.base_url, getattr(self, "api_key", "")
             )
@@ -6940,7 +6940,7 @@ class AIAgent:
     def _github_models_reasoning_extra_body(self) -> dict | None:
         """Format reasoning payload for GitHub Models/OpenAI-compatible routes."""
         try:
-            from agent.model_catalog import github_model_reasoning_efforts
+            from hermes_cli.models import github_model_reasoning_efforts
         except Exception:
             return None
 

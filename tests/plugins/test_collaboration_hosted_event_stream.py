@@ -1125,9 +1125,13 @@ async def test_unrelated_conversation_update_does_not_busy_loop_an_idle_stream(
         async def is_disconnected(self):
             return False
 
-    def wait_for_update(revision: int, _timeout: float) -> int:
+    def wait_for_update(
+        revision: int,
+        _timeout: float,
+        conversation_id: str,
+    ) -> int:
         waits.append(revision)
-        return module._HOSTED_UPDATE_REVISION
+        return module._hosted_update_revision(conversation_id)
 
     monkeypatch.setattr(module, "owner_id_from_request", lambda _request: module.LOCAL_OWNER_ID)
     monkeypatch.setattr(module, "_wait_for_hosted_update", wait_for_update)
@@ -1137,15 +1141,13 @@ async def test_unrelated_conversation_update_does_not_busy_loop_an_idle_stream(
     first = await anext(iterator)
     assert "event: conversation" in first
 
-    # Simulate a different conversation waking the global condition. This
-    # stream has no event to emit, so it must consume the observed revision and
-    # wait/keepalive once instead of repeatedly polling the state store.
-    previous_revision = module._HOSTED_UPDATE_REVISION
+    # A different conversation only advances the global revision. This stream
+    # must stay on its own conversation revision and emit one keepalive.
     module._HOSTED_UPDATE_REVISION += 1
     second = await anext(iterator)
 
     assert second == ": keepalive\n\n"
-    assert waits == [previous_revision, module._HOSTED_UPDATE_REVISION]
+    assert waits == [0]
     await iterator.aclose()
 
 

@@ -1,6 +1,6 @@
 // @vitest-environment jsdom
 import { QueryClientProvider } from '@tanstack/react-query'
-import { cleanup, fireEvent, render, screen, waitFor } from '@testing-library/react'
+import { act, cleanup, fireEvent, render, screen, waitFor } from '@testing-library/react'
 import { MemoryRouter } from 'react-router'
 import type * as ReactRouterDom from 'react-router'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
@@ -60,15 +60,19 @@ function toolset(overrides: Record<string, unknown> = {}) {
 
 async function renderSkills() {
   const { SkillsView } = await import('./index')
+  let result: ReturnType<typeof render>
+  await act(async () => {
+    result = render(
+      // SkillsView reads skills/toolsets via useQuery, so it needs a provider.
+      <QueryClientProvider client={queryClient}>
+        <MemoryRouter initialEntries={['/skills?tab=toolsets']}>
+          <SkillsView />
+        </MemoryRouter>
+      </QueryClientProvider>
+    )
+  })
 
-  return render(
-    // SkillsView reads skills/toolsets via useQuery, so it needs a provider.
-    <QueryClientProvider client={queryClient}>
-      <MemoryRouter initialEntries={['/skills?tab=toolsets']}>
-        <SkillsView />
-      </MemoryRouter>
-    </QueryClientProvider>
-  )
+  return result!
 }
 
 beforeEach(() => {
@@ -94,7 +98,9 @@ describe('SkillsView toolset management', () => {
     const sw = await screen.findByRole('switch', { name: 'Turn Web Search toolset off' })
     expect(sw.getAttribute('aria-checked')).toBe('true')
 
-    fireEvent.click(sw)
+    await act(async () => {
+      fireEvent.click(sw)
+    })
 
     await waitFor(() => expect(setToolsetEnabled).toHaveBeenCalledWith('web', false))
   })
@@ -140,7 +146,9 @@ describe('SkillsView toolset management', () => {
     expect(await screen.findByText(/auxiliary model configuration/)).toBeTruthy()
     const link = screen.getByRole('button', { name: /Choose vision model in Settings/ })
 
-    fireEvent.click(link)
+    await act(async () => {
+      fireEvent.click(link)
+    })
 
     // Internal route change into the Models section with the aux slot target —
     // consumed by ModelSettings' deep-link highlight. Never an external URL.

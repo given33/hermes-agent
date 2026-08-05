@@ -154,28 +154,21 @@ def test_shell_hooks_hide_hook_command_windows(monkeypatch):
 
     captured = []
 
-    class FakeProcess:
-        returncode = 0
-
-        def communicate(self, *, input, timeout):
-            captured.append(("communicate", input, timeout))
-
-    def fake_popen(cmd, **kwargs):
+    def fake_run(cmd, **kwargs):
         captured.append((cmd, kwargs))
-        return FakeProcess()
+        return SimpleNamespace(returncode=0, stdout="{}", stderr="")
 
     monkeypatch.setattr(shell_hooks, "IS_WINDOWS", True)
     monkeypatch.setattr(shell_hooks, "windows_hide_flags", lambda: _CREATE_NO_WINDOW)
-    monkeypatch.setattr(shell_hooks.subprocess, "Popen", fake_popen)
+    monkeypatch.setattr(shell_hooks.subprocess, "run", fake_run)
 
-    spec = shell_hooks.ShellHookSpec(event="post_tool_call", command="hook-bin --flag")
-    result = shell_hooks._spawn(spec, "{}")
+    result = shell_hooks._spawn(
+        shell_hooks.ShellHookSpec(event="post_tool_call", command="hook-bin --flag"),
+        "{}",
+    )
 
     assert result["returncode"] == 0
-    assert captured[0][0] == ["hook-bin", "--flag"]
-    assert captured[0][1]["shell"] is False
-    assert captured[0][1]["creationflags"] == _CREATE_NO_WINDOW | 0x00000200
-    assert captured[1] == ("communicate", "{}", spec.timeout)
+    assert captured[0][1]["creationflags"] == _CREATE_NO_WINDOW
 
 
 

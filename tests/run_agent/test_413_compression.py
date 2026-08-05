@@ -83,8 +83,6 @@ def agent():
         patch("run_agent.get_tool_definitions", return_value=_make_tool_defs("web_search")),
         patch("run_agent.check_toolset_requirements", return_value={}),
         patch("run_agent.OpenAI"),
-        patch("agent.model_metadata.get_model_context_length", return_value=128_000),
-        patch("agent.context_compressor.get_model_context_length", return_value=128_000),
     ):
         a = AIAgent(
             api_key="test-key-1234567890",

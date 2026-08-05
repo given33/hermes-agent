@@ -14,7 +14,7 @@ _mcp_discovery_thread: Optional[threading.Thread] = None
 def _has_configured_mcp_servers() -> bool:
     """Cheap config probe so non-MCP users avoid importing the MCP stack."""
     try:
-        from hermes_runtime.config import read_raw_config
+        from hermes_cli.config import read_raw_config
 
         mcp_servers = (read_raw_config() or {}).get("mcp_servers")
         return isinstance(mcp_servers, dict) and len(mcp_servers) > 0
@@ -141,7 +141,7 @@ def _resolve_discovery_timeout(
     )
     fallback = 15.0 if single_query else 1.5
     try:
-        from hermes_runtime.config import load_config, DEFAULT_CONFIG
+        from hermes_cli.config import load_config, DEFAULT_CONFIG
 
         default = float(DEFAULT_CONFIG.get(key, fallback))
         try:

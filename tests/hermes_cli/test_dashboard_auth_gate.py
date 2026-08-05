@@ -15,33 +15,6 @@ from fastapi.testclient import TestClient
 from hermes_cli import web_server
 
 
-_MISSING_APP_STATE = object()
-
-
-@pytest.fixture(autouse=True)
-def restore_dashboard_app_state():
-    """Keep bind/auth mutations from leaking into later test modules."""
-    names = ("auth_required", "bound_host", "bound_port")
-    previous = {
-        name: getattr(web_server.app.state, name, _MISSING_APP_STATE)
-        for name in names
-    }
-    for name in names:
-        try:
-            delattr(web_server.app.state, name)
-        except (AttributeError, KeyError):
-            pass
-    yield
-    for name, value in previous.items():
-        if value is _MISSING_APP_STATE:
-            try:
-                delattr(web_server.app.state, name)
-            except (AttributeError, KeyError):
-                pass
-        else:
-            setattr(web_server.app.state, name, value)
-
-
 @pytest.fixture
 def client_loopback():
     # Pin the bound-host state for host_header_middleware so requests with
@@ -99,7 +72,7 @@ def _stub_uvicorn_run(monkeypatch):
     import asyncio
     import contextlib
     import uvicorn
-    captured: dict = {"kwargs": {}, "shutdowns": 0}
+    captured: dict = {"kwargs": {}}
 
     class _FakeConfig:
         loaded = True
@@ -139,30 +112,14 @@ def _stub_uvicorn_run(monkeypatch):
             pass
 
         async def main_loop(self):
-            if captured.get("raise_main_loop"):
-                raise RuntimeError("injected main-loop failure")
+            pass
 
         async def shutdown(self, sockets=None):
-            captured["shutdowns"] += 1
+            pass
 
     monkeypatch.setattr(uvicorn, "Config", _FakeConfig)
     monkeypatch.setattr(uvicorn, "Server", lambda config: _FakeServer())
     return captured
-
-
-def test_start_server_shuts_down_lifespan_when_main_loop_raises(monkeypatch):
-    captured = _stub_uvicorn_run(monkeypatch)
-    captured["raise_main_loop"] = True
-
-    with pytest.raises(RuntimeError, match="injected main-loop failure"):
-        web_server.start_server(
-            host="127.0.0.1",
-            port=9119,
-            open_browser=False,
-            allow_public=False,
-        )
-
-    assert captured["shutdowns"] == 1
 
 
 def test_start_server_loopback_sets_auth_required_false(monkeypatch):

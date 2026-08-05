@@ -1220,103 +1220,6 @@ _MEDIA_DELIVERY_DENIED_HOME_SUBPATHS = (
     "Library/Keychains",  # macOS
 )
 
-# Secret-bearing *basenames* denied for delivery anywhere on disk — the
-# location-based denylists above cannot cover project trees. ``~/.hermes/.env``
-# was denied while ``/home/hermes/code/clientA/.env`` delivered fine, so a
-# single prompt-injected ``MEDIA:`` tag could exfiltrate any checked-out
-# repo's secrets in default (non-strict) mode. Matched against
-# ``resolved.name.lower()`` (mirrors the case-insensitive read guard in
-# ``agent/file_safety.py`` — case-preserving filesystems would otherwise let
-# ``.ENV`` / ``ID_RSA`` through).
-#
-# Exact names: the ``.env`` family, default SSH private-key filenames (their
-# ``.pub`` halves stay deliverable — sharing a public key is a legitimate
-# ask), and classic single-purpose credential stores. Deliberately broader
-# than ``agent/file_safety.py``'s enumerated ``.env.*`` read-block set (which
-# carves out ``.env.example`` as the documented-shape substitute for
-# *reading*): there is no equivalent need to deliver ANY env file as a native
-# chat attachment — the agent can always quote relevant non-secret lines as
-# text — so every ``.env`` / ``.env.*`` name fails closed here.
-_MEDIA_DELIVERY_DENIED_BASENAMES = frozenset(
-    {
-        ".env",
-        ".envrc",
-        # OpenSSH default private-key names (ssh-keygen -t <type>).
-        "id_rsa",
-        "id_dsa",
-        "id_ecdsa",
-        "id_ed25519",
-        "id_ecdsa_sk",
-        "id_ed25519_sk",
-        # AWS-style shared credentials file, and the GCP/Google OAuth
-        # convention (client secrets / authorized-user files).
-        "credentials",
-        "credentials.json",
-        # curl/git/ftp credentials (``_netrc`` is the Windows spelling).
-        ".netrc",
-        "_netrc",
-        # PostgreSQL password file — its only content is passwords.
-        ".pgpass",
-        # Apache basic-auth password hashes.
-        ".htpasswd",
-        # Well-known private-key basenames using the ``.key`` extension.
-        # ``.key`` is deliberately NOT in the suffix tuple below — Apple
-        # Keynote also uses ``*.key`` and MEDIA_DELIVERY_EXTS lists it as a
-        # presentation type, so a blanket ``*.key`` denial silently broke
-        # legitimate Keynote delivery. Instead the conventional private-key
-        # names are enumerated exactly: nginx/apache TLS (``server.key``),
-        # the generic ``private.key``, the Kubernetes TLS-secret pair
-        # (``tls.key``), Apple push-notification auth keys (``apns.key``),
-        # and the openssl-tutorial CA/mTLS trio (``ca.key``/``client.key``).
-        "private.key",
-        "server.key",
-        "tls.key",
-        "apns.key",
-        "ca.key",
-        "client.key",
-    }
-)
-
-# Extension / suffix matches for the same global basename denial. All are
-# conventional carriers of private-key or keystore material. ``.env`` here
-# additionally catches the docker-compose ``env_file`` convention
-# (``prod.env``) and, via plain suffix logic, every dotted ``.env.*`` variant
-# is caught by the ``startswith('.env.')`` branch in
-# ``_media_delivery_denied_basename``.
-#
-# Invariant: no entry here may also appear in MEDIA_DELIVERY_EXTS — a suffix
-# in both sets means a whole legitimate media type silently fails to deliver
-# (that happened to Apple Keynote when ``.key`` was listed here; its
-# private-key impersonators are handled by exact basenames above instead).
-# tests/gateway/test_platform_base.py asserts the two sets stay disjoint.
-_MEDIA_DELIVERY_DENIED_BASENAME_SUFFIXES = (
-    ".env",
-    ".pem",
-    ".p12",
-    ".pfx",
-    ".ppk",
-    ".jks",
-    ".keystore",
-)
-
-
-def _media_delivery_denied_basename(resolved: Path) -> bool:
-    """Return True if the filename itself marks the file as secret material.
-
-    Location-independent complement to ``_path_under_denied_prefix``: a
-    ``.env`` or ``id_rsa`` is credential material wherever it sits, including
-    project checkouts far outside $HOME and the Hermes root. Case-insensitive
-    on purpose (macOS/Windows filesystems are case-preserving).
-    """
-    name = resolved.name.lower()
-    if name in _MEDIA_DELIVERY_DENIED_BASENAMES:
-        return True
-    # .env.local, .env.production, .env.example, ... — see the constant's
-    # comment for why the example/template variants are not carved out.
-    if name.startswith(".env."):
-        return True
-    return name.endswith(_MEDIA_DELIVERY_DENIED_BASENAME_SUFFIXES)
-
 
 # Canonical cache subdirectories that hold deliverable artifacts. Used both
 # for the top-level safe roots above and to enumerate per-profile cache roots
@@ -1380,17 +1283,6 @@ def _kanban_attachment_roots() -> List[Path]:
 def _media_delivery_allowed_roots() -> List[Path]:
     """Return roots from which model-emitted local media may be delivered."""
     roots = [Path(root) for root in MEDIA_DELIVERY_SAFE_ROOTS]
-    active_home = get_hermes_home()
-    for legacy_dir in (
-        "image_cache",
-        "audio_cache",
-        "video_cache",
-        "document_cache",
-        "browser_screenshots",
-    ):
-        roots.append(active_home / legacy_dir)
-    for subdir in _MEDIA_DELIVERY_CACHE_SUBDIRS:
-        roots.append(active_home / "cache" / subdir)
     roots.extend(_profile_cache_roots())
     roots.extend(_kanban_attachment_roots())
     extra_roots = os.environ.get(MEDIA_DELIVERY_ALLOW_DIRS_ENV, "")
@@ -1403,15 +1295,6 @@ def _media_delivery_allowed_roots() -> List[Path]:
             if root.is_absolute():
                 roots.append(root)
     return roots
-
-
-def _media_delivery_user_home() -> Optional[Path]:
-    """Return the live user home without ignoring an explicit HOME on Windows."""
-    configured = os.environ.get("HOME", "").strip()
-    try:
-        return Path(configured or Path.home()).resolve(strict=False)
-    except (OSError, RuntimeError, ValueError):
-        return None
 
 
 def _media_delivery_recency_seconds() -> float:
@@ -1450,10 +1333,9 @@ def _media_delivery_strict_mode() -> bool:
 def _media_delivery_denied_paths() -> List[Path]:
     """Return absolute denylist paths under which delivery is never allowed."""
     denied = [Path(p) for p in _MEDIA_DELIVERY_DENIED_PREFIXES]
-    home = _media_delivery_user_home()
-    if home is not None:
-        for sub in _MEDIA_DELIVERY_DENIED_HOME_SUBPATHS:
-            denied.append(home / sub)
+    home = Path(os.path.expanduser("~"))
+    for sub in _MEDIA_DELIVERY_DENIED_HOME_SUBPATHS:
+        denied.append(home / sub)
     # The active Hermes profile and shared Hermes root both contain control
     # files and credentials. Only cache subdirectories under them are
     # explicitly allowlisted above (matched BEFORE this denylist in
@@ -1500,12 +1382,7 @@ def _media_delivery_denied_paths() -> List[Path]:
         "pairing",
         "mcp-tokens",
     )
-    # ``get_hermes_home`` can be a context-local dashboard/desktop profile
-    # override. Include it at check time; the import-time home alone would let
-    # active-profile credential directories such as mcp-tokens/ escape this
-    # denylist in a multi-profile process.
-    hermes_roots = dict.fromkeys((_HERMES_HOME, get_hermes_home(), _HERMES_ROOT))
-    for hermes_root in hermes_roots:
+    for hermes_root in (_HERMES_HOME, _HERMES_ROOT):
         for rel in _ROOT_CREDENTIAL_FILES:
             denied.append(hermes_root / rel)
         for rel in _ROOT_CREDENTIAL_DIRS:
@@ -1527,7 +1404,10 @@ def _path_under_denied_prefix(resolved: Path) -> bool:
     only un-block a plain file sitting in the running user's home tree, never a
     credential location or another user's home.
     """
-    home = _media_delivery_user_home()
+    try:
+        home = Path(os.path.expanduser("~")).resolve(strict=False)
+    except (OSError, RuntimeError, ValueError):
+        home = None
     for denied in _media_delivery_denied_paths():
         try:
             resolved_denied = denied.expanduser().resolve(strict=False)
@@ -1573,12 +1453,7 @@ def validate_media_delivery_path(path: str) -> Optional[str]:
 
     Default mode (single-user / private gateway): accept any existing regular
     file that isn't under the credential / system-path denylist
-    (``_MEDIA_DELIVERY_DENIED_PREFIXES`` + ``~/.ssh``, ``~/.aws``, etc.) and
-    whose basename isn't itself secret material
-    (``_MEDIA_DELIVERY_DENIED_BASENAMES`` — ``.env``, ``id_rsa``, ``*.pem``,
-    ``server.key``, ..., matched case-insensitively anywhere on disk; NOT a
-    blanket ``*.key`` — that extension is also Apple Keynote's and lives in
-    MEDIA_DELIVERY_EXTS, so only the enumerated private-key names are denied).
+    (``_MEDIA_DELIVERY_DENIED_PREFIXES`` + ``~/.ssh``, ``~/.aws``, etc.).
     This matches the symmetry of inbound delivery — Telegram/Discord/Slack
     will hand the agent any file the user uploads, and the agent can hand
     back any file that isn't a credential.
@@ -1635,12 +1510,9 @@ def validate_media_delivery_path(path: str) -> Optional[str]:
     # auth.json, .anthropic_oauth.json, google_token.json, pairing/, ...) —
     # so the obvious prompt-injection / credential-exfil sites
     # (``MEDIA:/etc/passwd``, ``MEDIA:~/.ssh/id_rsa``,
-    # ``MEDIA:~/.hermes/google_token.json``) remain rejected. The basename
-    # check closes the location gap: ``MEDIA:/home/hermes/code/clientA/.env``
-    # sits under none of the denied prefixes but is secret material all the
-    # same.
+    # ``MEDIA:~/.hermes/google_token.json``) remain rejected.
     if not _media_delivery_strict_mode():
-        if _path_under_denied_prefix(resolved) or _media_delivery_denied_basename(resolved):
+        if _path_under_denied_prefix(resolved):
             return None
         return str(resolved)
 
@@ -1648,15 +1520,9 @@ def validate_media_delivery_path(path: str) -> Optional[str]:
     # files (e.g. ``pandoc -o /tmp/report.pdf`` or
     # ``write_file("/home/user/report.pdf", ...)``). System paths and
     # credential locations remain blocked even when "recent" — see
-    # ``_MEDIA_DELIVERY_DENIED_PREFIXES`` for the denylist — and so do
-    # secret basenames: an ``id_ed25519`` that ``ssh-keygen`` minted seconds
-    # ago is exactly the file recency trust must NOT vouch for.
+    # ``_MEDIA_DELIVERY_DENIED_PREFIXES`` for the denylist.
     window = _media_delivery_recency_seconds()
-    if (
-        window > 0
-        and not _path_under_denied_prefix(resolved)
-        and not _media_delivery_denied_basename(resolved)
-    ):
+    if window > 0 and not _path_under_denied_prefix(resolved):
         if _file_is_recently_produced(resolved, window):
             return str(resolved)
 

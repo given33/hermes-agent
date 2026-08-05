@@ -51,7 +51,7 @@ logger = logging.getLogger(__name__)
 # ("hi!", "hey.", "thanks :)", "done???") do.
 TRIVIAL_PROMPT_RE = re.compile(
     r'^(yes|no|ok|okay|sure|thanks|thank you|y|n|yep|nope|yeah|nah|'
-    r'hi|hey|hello|yo|sup|\u4f60\u597d|\u60a8\u597d|\u55e8|\u54c8\u558e|'
+    r'hi|hey|hello|yo|sup|'
     r'continue|go ahead|do it|proceed|got it|cool|nice|great|done|next|lgtm|k)'
     r'[\s!?.:;,"' + "'" + r'~\u2018\u2019\u201c\u201d\u2014\u2013\u2026()\[\]{}<>*&^%$#@!+=`\u00a0]*$',
     re.IGNORECASE,

@@ -10,7 +10,6 @@ running loop.
 import asyncio
 import threading
 import warnings
-from pathlib import Path
 
 
 class TestGetRunningLoopReplacement:
@@ -129,10 +128,3 @@ class TestGetRunningLoopReplacement:
             f"process_loop simulation still emits RuntimeWarning: "
             f"{[str(w.message) for w in runtime_warnings]}"
         )
-
-    def test_web_server_executor_paths_use_running_loop(self):
-        source = (
-            Path(__file__).resolve().parents[1] / "hermes_cli" / "web_server.py"
-        ).read_text(encoding="utf-8")
-        assert "asyncio.get_event_loop().run_in_executor" not in source
-        assert source.count("asyncio.get_running_loop().run_in_executor") >= 2

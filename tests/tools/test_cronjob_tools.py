@@ -5,7 +5,6 @@ import pytest
 
 from tools.cronjob_tools import (
     _scan_cron_prompt,
-    _repeat_display,
     check_cronjob_requirements,
     cronjob,
 )
@@ -446,9 +445,6 @@ class TestAgentCannotSetModelPin:
 
 
 class TestLocalDeliveryNotice:
-    def test_repeat_display_tolerates_malformed_record(self):
-        assert _repeat_display({"repeat": "not-a-record"}) == "forever"
-
     """#51568 — TUI/CLI cron jobs are local-only; surface that at create time
     so the agent doesn't promise a delivery that never happens."""
 

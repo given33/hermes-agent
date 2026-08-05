@@ -1,5 +1,5 @@
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query'
-import { act, cleanup, fireEvent, render, screen, waitFor } from '@testing-library/react'
+import { cleanup, fireEvent, render, screen, waitFor } from '@testing-library/react'
 import type { ReactNode } from 'react'
 import { MemoryRouter } from 'react-router'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
@@ -168,7 +168,7 @@ describe('BillingSettings', () => {
       target: { value: '7.50' }
     })
 
-    await waitFor(() => expect(screen.getByText('Threshold: minimum is $10.')).toBeTruthy())
+    expect(screen.getByText('Threshold: minimum is $10.')).toBeTruthy()
     expect(screen.getByRole('button', { name: 'Save' }).hasAttribute('disabled')).toBe(true)
 
     fireEvent.click(screen.getByRole('button', { name: 'Save' }))
@@ -583,16 +583,13 @@ describe('BillingSettings', () => {
     expect(screen.getByRole('spinbutton', { name: 'Custom credit amount' }).hasAttribute('disabled')).toBe(true)
     expect(screen.getByRole('button', { name: /^Buy$/ }).hasAttribute('disabled')).toBe(true)
 
-    await act(async () => {
-      settleStatus({
-        data: {
-          amount_usd: '25',
-          ok: true,
-          status: 'settled'
-        },
-        ok: true
-      })
-      await statusPromise
+    settleStatus({
+      data: {
+        amount_usd: '25',
+        ok: true,
+        status: 'settled'
+      },
+      ok: true
     })
 
     await waitFor(() => expect(screen.getByText('$25 added. Balance is refreshing.')).toBeTruthy())

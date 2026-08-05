@@ -42,7 +42,7 @@ from gateway.restart import (
     parse_restart_drain_timeout,
     resolve_restart_exit_wait_budget,
 )
-from hermes_runtime.config import (
+from hermes_cli.config import (
     get_env_value,
     get_hermes_home,
     is_managed,
@@ -51,7 +51,6 @@ from hermes_runtime.config import (
     save_env_value,
     write_platform_config_field,
 )
-from hermes_runtime.process_probe import pid_exists as _pid_exists
 
 # display_hermes_home is imported lazily at call sites to avoid ImportError
 # when hermes_constants is cached from a pre-update version during `hermes update`.
@@ -65,7 +64,7 @@ from hermes_cli.setup import (
     prompt_choice,
     prompt_yes_no,
 )
-from hermes_runtime.colors import Colors, color
+from hermes_cli.colors import Colors, color
 
 logger = logging.getLogger(__name__)
 
@@ -299,6 +298,8 @@ def _graceful_restart_via_sigusr1(pid: int, drain_timeout: float) -> bool:
     # for sig=0, hard-killing the target. Use the cross-platform
     # ``_pid_exists`` helper in gateway.status which does OpenProcess +
     # WaitForSingleObject on Windows.
+    from gateway.status import _pid_exists
+
     while _time.monotonic() < deadline:
         if not _pid_exists(pid):
             return True
@@ -410,7 +411,7 @@ def _scan_gateway_pids(
             # Hide the console window: this scan runs inside the windowless
             # pythonw.exe gateway/desktop backend, so a bare wmic/powershell
             # spawn would flash a conhost window on every watchdog probe.
-            from hermes_runtime.subprocess_compat import windows_hide_flags
+            from hermes_cli._subprocess_compat import windows_hide_flags
 
             _no_window = {"creationflags": windows_hide_flags()}
             wmic_path = shutil.which("wmic")
@@ -764,7 +765,7 @@ def _spawn_gateway_restart_watcher(old_pid: int, run_argv: list[str]) -> bool:
     #
     # ``windows_detach_popen_kwargs()`` returns the right kwargs for the
     # host platform and is a no-op on POSIX (just ``start_new_session=True``).
-    from hermes_runtime.subprocess_compat import (
+    from hermes_cli._subprocess_compat import (
         windows_detach_flags_without_breakaway,
         windows_detach_popen_kwargs,
     )
@@ -807,7 +808,7 @@ def _spawn_gateway_restart_watcher(old_pid: int, run_argv: list[str]) -> bool:
         import subprocess
         import sys
         import time
-        from hermes_runtime.subprocess_compat import (
+        from hermes_cli._subprocess_compat import (
             windows_detach_flags,
             windows_detach_flags_without_breakaway,
         )
@@ -820,6 +821,7 @@ def _spawn_gateway_restart_watcher(old_pid: int, run_argv: list[str]) -> bool:
         while time.monotonic() < deadline:
             # ``os.kill(pid, 0)`` is not a no-op on Windows — use the
             # cross-platform existence check.
+            from gateway.status import _pid_exists
             if not _pid_exists(pid):
                 break
             time.sleep(0.2)
@@ -1532,7 +1534,7 @@ def _reap_unsupervised_gateway_orphans(extra_exclude: set | None = None) -> bool
     except Exception:
         return False
 
-    from gateway.status import write_planned_stop_marker
+    from gateway.status import _pid_exists, write_planned_stop_marker
 
     own = {os.getpid()}
     if extra_exclude:
@@ -1626,6 +1628,8 @@ def stop_profile_gateway() -> bool:
     # Wait briefly for it to exit. On Windows, os.kill(pid, 0) is NOT
     # a no-op — route through the cross-platform existence check.
     import time as _time
+    from gateway.status import _pid_exists
+
     for _ in range(20):
         if not _pid_exists(pid):
             break
@@ -3994,7 +3998,7 @@ def _spawn_detached_gateway() -> bool:
     gateway logs and the PID is tracked via the gateway.pid file that
     `run_gateway` writes, so stop/status/restart keep working.
     """
-    from hermes_runtime.subprocess_compat import windows_detach_popen_kwargs
+    from hermes_cli._subprocess_compat import windows_detach_popen_kwargs
 
     log_dir = get_hermes_home() / "logs"
     log_dir.mkdir(parents=True, exist_ok=True)
@@ -4756,7 +4760,7 @@ def _guard_named_profile_under_multiplexer(force: bool = False) -> None:
         rec = _read_pid_record(default_pid_path)
         if not rec:
             return
-        from gateway.status import _pid_from_record
+        from gateway.status import _pid_exists, _pid_from_record
         pid = _pid_from_record(rec)
         if not pid or not _pid_exists(pid):
             return
@@ -5065,7 +5069,7 @@ def run_gateway(verbose: int = 0, quiet: bool = False, replace: bool = False, fo
         _max_starts = 5
         _win = 120.0
         try:
-            from hermes_runtime.config import load_config
+            from hermes_cli.config import load_config
 
             _cfg = load_config()
             _gw = _cfg.get("gateway") if isinstance(_cfg, dict) else None

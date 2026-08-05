@@ -235,7 +235,7 @@ def run_whatsapp_cloud_setup() -> int:
     Returns 0 on full success, 1 on user abort, 2 on partial completion
     (some fields written but the user bailed before finishing).
     """
-    from hermes_runtime.config import get_env_value, save_env_value
+    from hermes_cli.config import get_env_value, save_env_value
 
     print()
     print("⚕ WhatsApp Business Cloud API Setup")

@@ -37,7 +37,7 @@ class TestPaginateFullList:
         async def evil_list(cursor=None):
             calls["n"] += 1
             return SimpleNamespace(
-                tools=[_tool(f"t{calls['n']}")], next_cursor=f"c{calls['n']}"
+                tools=[_tool(f"t{calls['n']}")], nextCursor=f"c{calls['n']}"
             )
 
         items = asyncio.run(_paginate_full_list(evil_list, "tools", "srv"))
@@ -53,7 +53,7 @@ class TestDiscoveryUsesPagination:
         server = MCPServerTask("pag_srv")
         server._config = {"command": "test"}
         pages = {
-            None: SimpleNamespace(tools=[_tool("first")], next_cursor="page-2"),
+            None: SimpleNamespace(tools=[_tool("first")], nextCursor="page-2"),
             "page-2": SimpleNamespace(tools=[_tool("second")]),
         }
 
@@ -62,9 +62,9 @@ class TestDiscoveryUsesPagination:
 
         server.session = MagicMock()
         server.session.list_tools = fake_list
-        server.discover_result = SimpleNamespace(
-            capabilities=SimpleNamespace(tools=SimpleNamespace())
-        )
+        # capability gate: _advertises_tools() returns True when no
+        # capability info was captured (legacy fallback), so no override
+        # is needed here.
 
         asyncio.run(server._discover_tools())
         assert [t.name for t in server._tools] == ["first", "second"]

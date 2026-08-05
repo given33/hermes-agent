@@ -42,7 +42,6 @@ from __future__ import annotations
 import argparse
 import json
 import os
-import re
 import subprocess
 import sys
 import threading
@@ -52,38 +51,8 @@ from pathlib import Path
 from typing import Dict, List, Tuple
 
 
-def _configure_output_stream(stream: object) -> None:
-    """Keep progress glyphs from crashing callback threads on Windows."""
-
-    reconfigure = getattr(stream, "reconfigure", None)
-    if not callable(reconfigure):
-        return
-    try:
-        reconfigure(encoding="utf-8", errors="backslashreplace")
-    except (OSError, ValueError):
-        # Captured or already-closed streams do not need reconfiguration.
-        return
-
-
-if os.name == "nt":
-    _configure_output_stream(sys.stdout)
-    _configure_output_stream(sys.stderr)
-
-
 # Default test discovery roots.
 _DEFAULT_ROOTS = ["tests"]
-
-
-def _split_path_list(value: str) -> list[str]:
-    normalized = str(value or "").strip()
-    if not normalized:
-        return []
-    if os.name == "nt":
-        if os.pathsep in normalized:
-            return [part for part in normalized.split(os.pathsep) if part.strip()]
-        if re.match(r"^[A-Za-z]:[\\/]", normalized):
-            return [normalized]
-    return [part for part in normalized.split(":") if part.strip()]
 
 # Directories to skip during discovery — these suites require real
 # external services (a model gateway, a docker daemon with a prebuilt
@@ -336,29 +305,7 @@ def _run_one_file_once(
     file_timeout: float,
 ) -> Tuple[Path, int, str, dict[str, int], float]:
     """Single attempt of a per-file pytest subprocess (see _run_one_file)."""
-    try:
-        file.resolve().relative_to(repo_root.resolve())
-        pytest_root = repo_root
-    except ValueError:
-        # Pytest 9 walks every ancestor between rootdir and an external test
-        # path. On Windows that includes the busy system temp directory, where
-        # a concurrently removed file can abort collection in samefile().
-        pytest_root = file.parent
-
-    cmd = [
-        sys.executable,
-        "-m",
-        "pytest",
-        "--rootdir",
-        str(pytest_root),
-        str(file),
-        *pytest_args,
-    ]
-    child_env = {
-        **os.environ,
-        "PYTHONIOENCODING": "utf-8",
-        "PYTHONUTF8": "1",
-    }
+    cmd = [sys.executable, "-m", "pytest", str(file), *pytest_args]
     
     subproc_start = time.monotonic()
     # launch the pytest process
@@ -741,7 +688,7 @@ def main() -> int:
     )
     parser.add_argument(
         "--paths",
-        default=os.environ.get("HERMES_TEST_PATHS", os.pathsep.join(_DEFAULT_ROOTS)),
+        default=os.environ.get("HERMES_TEST_PATHS", ":".join(_DEFAULT_ROOTS)),
         help="Colon-separated discovery roots (default: 'tests')",
     )
     parser.add_argument(
@@ -833,7 +780,7 @@ def main() -> int:
     # it never reaches our positional ``paths``. ``=``-joined forms
     # (``-k=expr``, ``--tb=long``) are self-contained and need no lookahead.
     OUR_FLAGS = {
-        "-h", "--help", "-j", "--jobs", "--paths", "--include-integration",
+        "-j", "--jobs", "--paths", "--include-integration",
         "--file-timeout", "--file-retries", "--slice", "--generate-slices", "--files",
     }
     # pytest short flags that consume the NEXT token as their value.
@@ -938,7 +885,7 @@ def main() -> int:
 
     # --files: explicit file list from the CI generate job — skip discovery.
     if args.files:
-        files = [repo_root / f for f in _split_path_list(args.files)]
+        files = [repo_root / f for f in args.files.split(":") if f.strip()]
         roots = []
     else:
         # Resolve discovery roots: positional path args override --paths if any
@@ -946,7 +893,7 @@ def main() -> int:
         if args.paths_positional:
             roots = [repo_root / p for p in args.paths_positional]
         else:
-            roots = [repo_root / p for p in _split_path_list(args.paths)]
+            roots = [repo_root / p for p in args.paths.split(":") if p]
 
         if args.include_integration:
             # Caller takes responsibility — typically used via explicit -k filter.
@@ -969,7 +916,7 @@ def main() -> int:
             "slice": [
                 {
                     "index": i + 1,
-                    "files": os.pathsep.join(_format_file(f, repo_root) for f in bucket),
+                    "files": ":".join(_format_file(f, repo_root) for f in bucket),
                 }
                 for i, bucket in enumerate(slices)
             ]

@@ -95,7 +95,7 @@ _catalog_cache_source_mtime: float = 0.0
 def _load_catalog_config() -> dict[str, Any]:
     """Load the ``model_catalog`` config block with defaults filled in."""
     try:
-        from hermes_runtime.config import load_config
+        from hermes_cli.config import load_config
         cfg = load_config() or {}
     except Exception:
         cfg = {}

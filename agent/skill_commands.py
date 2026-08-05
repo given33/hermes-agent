@@ -179,7 +179,7 @@ def _resolve_skill_commands_platform() -> Optional[str]:
     rollouts, standalone scripts).
     """
     try:
-        from hermes_runtime.session_context import get_session_env
+        from gateway.session_context import get_session_env
 
         resolved_platform = (
             os.getenv("HERMES_PLATFORM")
@@ -197,7 +197,7 @@ def _load_skill_payload(skill_identifier: str, task_id: str | None = None) -> tu
 
     try:
         from tools.skills_tool import SKILLS_DIR, skill_view
-        from hermes_runtime.skill_utils import normalize_skill_lookup_name
+        from agent.skill_utils import normalize_skill_lookup_name
 
         normalized = normalize_skill_lookup_name(raw_identifier)
 
@@ -238,7 +238,7 @@ def _inject_skill_config(loaded_skill: dict[str, Any], parts: list[str]) -> None
     without needing to read config.yaml itself.
     """
     try:
-        from hermes_runtime.skill_utils import (
+        from agent.skill_utils import (
             extract_skill_config_vars,
             parse_frontmatter,
             resolve_skill_config_values,
@@ -335,21 +335,13 @@ def _build_skill_message(
         if isinstance(entries, list):
             supporting.extend(entries)
 
-    # Linked-file metadata can be produced by platform-specific scanners and
-    # may carry native separators.  These are logical skill identifiers, so
-    # normalize them before rendering the model-facing block.
-    supporting = [str(item).replace("\\", "/") for item in supporting]
-
     if not supporting and skill_dir:
         for subdir in ("references", "templates", "scripts", "assets"):
             subdir_path = skill_dir / subdir
             if subdir_path.exists():
                 for f in sorted(subdir_path.rglob("*")):
                     if f.is_file() and not f.is_symlink():
-                        # Logical skill paths are portable identifiers even on
-                        # Windows; keep separators stable for skill_view and
-                        # model-facing instructions.
-                        rel = f.relative_to(skill_dir).as_posix()
+                        rel = str(f.relative_to(skill_dir))
                         supporting.append(rel)
 
     if supporting and skill_dir:
@@ -390,7 +382,7 @@ def scan_skill_commands() -> Dict[str, Dict[str, Any]]:
     _skill_commands = {}
     try:
         from tools.skills_tool import SKILLS_DIR, _parse_frontmatter, skill_matches_platform, skill_matches_environment, _get_disabled_skill_names
-        from hermes_runtime.skill_utils import get_external_skills_dirs, iter_skill_index_files
+        from agent.skill_utils import get_external_skills_dirs, iter_skill_index_files
         from hermes_cli.commands import resolve_command
         disabled = _get_disabled_skill_names()
         seen_names: set = set()
@@ -772,7 +764,7 @@ def build_preloaded_skills_prompt(
     missing: list[str] = []
 
     try:
-        from hermes_runtime.skill_utils import get_disabled_skill_names
+        from agent.skill_utils import get_disabled_skill_names
         disabled_names = get_disabled_skill_names()
     except Exception:
         disabled_names = set()

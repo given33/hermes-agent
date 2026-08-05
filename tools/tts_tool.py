@@ -56,7 +56,7 @@ from pathlib import Path
 from typing import Callable, Dict, Any, Iterator, Optional
 from urllib.parse import urljoin, urlparse
 
-from hermes_runtime.subprocess_compat import windows_hide_flags
+from hermes_cli._subprocess_compat import windows_hide_flags
 from hermes_constants import display_hermes_home
 
 logger = logging.getLogger(__name__)
@@ -68,7 +68,7 @@ def get_env_value(name, default=None):
     not keep a stale imported function for the rest of the test process.
     """
     try:
-        from hermes_runtime.config import get_env_value as _get_env_value
+        from hermes_cli.config import get_env_value as _get_env_value
     except ImportError:
         return os.getenv(name, default)
     value = _get_env_value(name)
@@ -474,7 +474,7 @@ def _load_tts_config() -> Dict[str, Any]:
     for any missing fields.
     """
     try:
-        from hermes_runtime.config import load_config
+        from hermes_cli.config import load_config
         config = load_config()
         return config.get("tts") or {}
     except ImportError:
@@ -1604,7 +1604,7 @@ def _generate_deepinfra_tts(text: str, output_path: str, tts_config: Dict[str, A
     if not isinstance(di_config, dict):
         di_config = {}
 
-    from agent.model_catalog import deepinfra_base_url, deepinfra_model_ids
+    from hermes_cli.models import deepinfra_base_url, deepinfra_model_ids
 
     model = di_config.get("model")
     if not isinstance(model, str) or not model.strip():

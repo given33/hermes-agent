@@ -59,7 +59,7 @@ def client(monkeypatch, isolated_profiles):
 
 
 def _load_cfg(home):
-    return yaml.safe_load((home / "config.yaml").read_text(encoding="utf-8")) or {}
+    return yaml.safe_load((home / "config.yaml").read_text()) or {}
 
 
 class TestProfileScopedSkills:

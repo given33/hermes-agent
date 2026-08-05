@@ -8,7 +8,6 @@ import asyncio
 import base64
 import io
 import logging
-import posixpath
 import shlex
 import tarfile
 import threading
@@ -297,7 +296,7 @@ class ModalEnvironment(BaseEnvironment):
         """Upload a single file via base64 piped through stdin."""
         content = Path(host_path).read_bytes()
         b64 = base64.b64encode(content).decode("ascii")
-        container_dir = posixpath.dirname(remote_path) or "."
+        container_dir = str(Path(remote_path).parent)
         cmd = (
             f"mkdir -p {shlex.quote(container_dir)} && "
             f"base64 -d > {shlex.quote(remote_path)}"

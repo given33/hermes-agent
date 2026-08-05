@@ -43,19 +43,10 @@ from typing import Any, Callable, Dict, List, Optional
 
 import yaml
 
-from hermes_runtime.config import get_hermes_home
-from hermes_services.startup import bootstrap_trusted_runtime
-
-bootstrap_trusted_runtime()
+from hermes_cli.config import get_hermes_home
 
 
-# ``None`` keeps the production path dynamic while preserving the test hook
-# used by integrations that patch this module attribute.
-HOOKS_DIR: Optional[object] = None
-
-
-def _hooks_dir():
-    return HOOKS_DIR if HOOKS_DIR is not None else get_hermes_home() / "hooks"
+HOOKS_DIR = get_hermes_home() / "hooks"
 
 
 class HookRegistry:
@@ -99,11 +90,10 @@ class HookRegistry:
         """
         self._register_builtin_hooks()
 
-        hooks_dir = _hooks_dir()
-        if not hooks_dir.exists():
+        if not HOOKS_DIR.exists():
             return
 
-        for hook_dir in sorted(hooks_dir.iterdir()):
+        for hook_dir in sorted(HOOKS_DIR.iterdir()):
             if not hook_dir.is_dir():
                 continue
 

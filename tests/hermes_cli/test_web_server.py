@@ -22,23 +22,6 @@ from hermes_cli.config import (
 )
 
 
-class _StreamingModelResponse:
-    def __init__(self, body=b"", *, status=200, chunks=None):
-        self.status_code = status
-        self.is_success = 200 <= status < 300
-        self._chunks = list(chunks if chunks is not None else [body])
-        self.chunks_read = 0
-        self.closed = False
-
-    async def aiter_bytes(self):
-        for chunk in self._chunks:
-            self.chunks_read += 1
-            yield chunk
-
-    async def aclose(self):
-        self.closed = True
-
-
 # ---------------------------------------------------------------------------
 # Shared fixtures
 # ---------------------------------------------------------------------------
@@ -52,42 +35,6 @@ class _StreamingModelResponse:
 _EXAMPLE_PLUGIN_FIXTURE = (
     Path(__file__).resolve().parent.parent / "fixtures" / "plugins" / "example-dashboard"
 )
-
-
-def test_dashboard_runtime_state_owns_mutable_process_state():
-    from hermes_cli import web_server
-
-    first = web_server.DashboardRuntimeState("first-token")
-    second = web_server.DashboardRuntimeState("second-token")
-
-    first.action_results["deploy"] = {"ok": True}
-    first.oauth_sessions["oauth-1"] = {"status": "pending"}
-    first.voice_list_last_error = "voice-error"
-    first.dashboard_plugins_cache = [{"name": "plugin-a"}]
-
-    assert first.session_token == "first-token"
-    assert second.session_token == "second-token"
-    assert second.action_results == {}
-    assert second.oauth_sessions == {}
-    assert second.voice_list_last_error is None
-    assert second.dashboard_plugins_cache is None
-    assert first.oauth_sessions_lock is not second.oauth_sessions_lock
-    assert first.console_executor_lock is not second.console_executor_lock
-
-
-def test_voice_error_log_latch_uses_dashboard_runtime_state():
-    from hermes_cli import web_server
-
-    state = web_server.get_runtime_state()
-    state.voice_list_last_error = None
-    try:
-        assert web_server._voice_list_error_logged_once("provider-down") is True
-        assert state.voice_list_last_error == "provider-down"
-        assert web_server._voice_list_error_logged_once("provider-down") is False
-        assert web_server._voice_list_error_logged_once(None) is False
-        assert state.voice_list_last_error is None
-    finally:
-        state.voice_list_last_error = None
 
 
 @pytest.fixture
@@ -155,7 +102,7 @@ def _install_example_plugin(_isolate_hermes_home):
     # list dynamically per request, so the rescan alone is enough for
     # the static-asset tests; the API auth tests additionally need the
     # route reorder below.
-    web_server.get_runtime_state().dashboard_plugins_cache = None
+    web_server._dashboard_plugins_cache = None
     web_server._get_dashboard_plugins(force_rescan=True)
     web_server._mount_plugin_api_routes()
 
@@ -181,7 +128,7 @@ def _install_example_plugin(_isolate_hermes_home):
         # routes so the next test sees a clean app — and clear the
         # cache for the same reason.
         app.router.routes[:] = original_routes
-        web_server.get_runtime_state().dashboard_plugins_cache = None
+        web_server._dashboard_plugins_cache = None
 
 
 # ---------------------------------------------------------------------------
@@ -310,8 +257,6 @@ class TestWebServerEndpoints:
 
         self.client = TestClient(app)
         self.client.headers[_SESSION_HEADER_NAME] = _SESSION_TOKEN
-        yield
-        self.client.close()
 
     @pytest.mark.requires_wal
     def test_get_sessions_poll_preserves_pending_wal(self):
@@ -1999,13 +1944,11 @@ class TestNewEndpoints:
         config = yaml.safe_load(config_text)
         servers = config["mcp_servers"]
 
-        from hermes_cli.ios_mcp_server import CAPABILITIES
-
-        assert set(servers) == set(CAPABILITIES) | {
+        assert sorted(servers) == [
             "Bearer Server",
             "local-server",
             "oauth-server",
-        }
+        ]
         assert servers["Bearer Server"] == {
             "url": "https://example.com/mcp",
             "headers": {
@@ -2174,8 +2117,8 @@ class TestNewEndpoints:
         assert all(p["status"] in valid for p in data["providers"])
         # Genuinely-free keyless row stays Ready.
         assert by_name["Microsoft Edge TTS"]["status"] == "ready"
-        # Removed account-managed rows are not exposed as selectable tools.
-        assert "Nous Subscription" not in by_name
+        # Keyless ≠ ready for gated rows:
+        assert by_name["Nous Subscription"]["status"] == "needs_auth"
         assert by_name["xAI TTS"]["status"] == "needs_auth"
         assert by_name["KittenTTS"]["status"] == "needs_setup"
         assert by_name["Piper"]["status"] == "needs_setup"
@@ -2187,7 +2130,24 @@ class TestNewEndpoints:
 
 
 
-    def test_select_managed_nous_provider_is_rejected(self):
+    def test_select_managed_nous_provider_reports_needs_nous_auth(self, monkeypatch):
+        """Selecting a managed Nous row while logged out flags needs_nous_auth.
+
+        Regression: the GUI PUT wrote browser.cloud_provider + use_gateway
+        but skipped the Portal entitlement handshake the CLI runs inline
+        (ensure_nous_portal_access) — so the row never activated and nothing
+        told the user to sign in. The endpoint now reports the entitlement
+        gap so the client can drive the existing Nous OAuth flow.
+        """
+        from hermes_cli.nous_account import NousPortalAccountInfo
+
+        monkeypatch.setattr(
+            "hermes_cli.nous_subscription.get_nous_portal_account_info",
+            lambda *a, **k: NousPortalAccountInfo(
+                logged_in=False, source="none", fresh=False, paid_service_access=None
+            ),
+        )
+
         resp = self.client.put(
             "/api/tools/toolsets/browser/provider",
             json={"provider": "Nous Subscription (Browser Use cloud)"},
@@ -3434,7 +3394,7 @@ class TestDashboardPluginManifestExtensions:
         })
         from hermes_cli import web_server
         # Bust the process-level cache so the test plugin is picked up.
-        web_server.get_runtime_state().dashboard_plugins_cache = None
+        web_server._dashboard_plugins_cache = None
         plugins = web_server._get_dashboard_plugins(force_rescan=True)
         entry = next(p for p in plugins if p["name"] == "skin-home")
         assert entry["tab"]["override"] == "/"

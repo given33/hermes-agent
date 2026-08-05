@@ -14,45 +14,12 @@ through.
 import os
 from unittest.mock import patch
 
-import pytest
-
 from hermes_cli.model_switch import (
     list_authenticated_providers,
     parse_model_flags,
     switch_model,
 )
 from hermes_cli.providers import resolve_provider_full
-
-
-@pytest.fixture(autouse=True)
-def _isolated_provider_catalog(monkeypatch, tmp_path):
-    import agent.model_catalog as model_catalog
-    import agent.models_dev as models_dev
-
-    monkeypatch.setenv("HERMES_HOME", str(tmp_path / "home"))
-    monkeypatch.delenv("KIMI_API_KEY", raising=False)
-    monkeypatch.delenv("KIMI_CN_API_KEY", raising=False)
-    catalog = {
-        "kimi-for-coding": {
-            "name": "Kimi For Coding",
-            "env": ["KIMI_API_KEY", "KIMI_CN_API_KEY"],
-            "models": {"kimi-k2.6": {}},
-        }
-    }
-    monkeypatch.setattr(models_dev, "fetch_models_dev", lambda *args, **kwargs: catalog)
-    monkeypatch.setattr(
-        model_catalog,
-        "cached_provider_model_ids",
-        lambda provider, *args, **kwargs: list(
-            model_catalog._PROVIDER_MODELS.get(provider, [])
-        ),
-    )
-    monkeypatch.setattr(
-        model_catalog,
-        "get_curated_nous_model_ids",
-        lambda: list(model_catalog._PROVIDER_MODELS.get("nous", [])),
-    )
-    monkeypatch.setattr(model_catalog, "fetch_ollama_cloud_models", lambda *args, **kwargs: [])
 
 
 # -- Only KIMI_CN_API_KEY set ------------------------------------------------

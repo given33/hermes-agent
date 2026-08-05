@@ -46,12 +46,19 @@ cleanup() {
 trap cleanup EXIT
 
 runtime_files=(
+  "plugins/collaboration/dashboard/hosted_tui_runtime.py"
   "agent/agent_runtime_helpers.py"
   "agent/chat_completion_helpers.py"
+  "agent/codex_runtime.py"
   "agent/conversation_compression.py"
   "agent/conversation_loop.py"
   "agent/curator_backup.py"
+  "agent/memory_provider.py"
+  "agent/turn_context.py"
   "agent/lsp/workspace.py"
+  "agent/image_routing.py"
+  "agent/model_metadata.py"
+  "agent/models_dev.py"
   "agent/shell_hooks.py"
   "agent/tool_dispatch_helpers.py"
   "agent/tool_executor.py"
@@ -92,6 +99,7 @@ runtime_files=(
   "hermes_cli/mcp_config.py"
   "hermes_cli/plugins.py"
   "hermes_cli/profile_distribution.py"
+  "hermes_cli/runtime_provider.py"
   "hermes_constants.py"
   "hermes_logging.py"
   "hermes_secret_compare.py"
@@ -102,8 +110,10 @@ runtime_files=(
   "plugins/cron_providers/__init__.py"
   "plugins/memory/__init__.py"
   "plugins/memory/config_schema.py"
+  "plugins/memory/honcho/__init__.py"
   "providers/__init__.py"
   "run_agent.py"
+  "tui_gateway/entry.py"
   "tools/code_execution_tool.py"
   "tools/computer_use/cua_backend.py"
   "tools/credential_files.py"
@@ -112,6 +122,7 @@ runtime_files=(
   "tools/lazy_deps.py"
   "tools/mcp_oauth.py"
   "tools/mcp_oauth_manager.py"
+  "tools/mcp_schema_cache.py"
   "tools/registry.py"
   "tools/skills_guard.py"
   "tools/skills_hub.py"
@@ -753,7 +764,7 @@ target = Path(sys.argv[1]).resolve()
 scratch = Path(sys.argv[2]).resolve()
 
 expected_symbols = {
-    "agent/prompt_builder.py": {"EVIDENCE_FIRST_EXECUTION_GUIDANCE"},
+    "agent/prompt_builder.py": {"TOOL_USE_ENFORCEMENT_GUIDANCE"},
     "agent/system_prompt.py": {"build_system_prompt"},
     "agent/context_diagnostics.py": {"analyze_context_sources"},
     "hermes_cli/doctor.py": {"_check_context_engineering"},
@@ -777,8 +788,6 @@ for relative, symbols in expected_symbols.items():
     )
     assert symbols <= declared, (relative, symbols - declared)
 
-prompt_source = (target / "agent/prompt_builder.py").read_text(encoding="utf-8")
-assert "# Evidence-first execution" in prompt_source
 assert scratch.is_dir()
 PY
 cmp -- "${stage}/deploy/public/nginx-00-hermes-security.conf" "${nginx_security_target}"

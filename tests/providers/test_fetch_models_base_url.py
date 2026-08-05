@@ -69,10 +69,11 @@ class TestCustomProviderBaseUrlPassthrough:
         """CustomProfile.fetch_models passes base_url to super()."""
         server, port = _start_server([{"id": "ollama-model"}])
         try:
-            from providers import get_provider_profile
-
-            profile = get_provider_profile("custom")
-            assert profile is not None
+            from plugins.model_providers.custom import CustomProfile
+            profile = CustomProfile(
+                name="custom",
+                base_url="http://127.0.0.1:1",  # wrong port
+            )
             result = profile.fetch_models(
                 api_key="",
                 base_url=f"http://127.0.0.1:{port}",

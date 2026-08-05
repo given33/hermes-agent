@@ -28,12 +28,7 @@ import logging
 import sys
 from pathlib import Path
 from typing import List, Optional, Tuple
-from hermes_runtime.config import cfg_get
-from utils import fast_safe_load
-
-from hermes_services.startup import bootstrap_trusted_runtime
-
-bootstrap_trusted_runtime()
+from hermes_cli.config import cfg_get
 
 logger = logging.getLogger(__name__)
 
@@ -173,8 +168,9 @@ def discover_memory_providers() -> List[Tuple[str, str, bool]]:
         yaml_file = child / "plugin.yaml"
         if yaml_file.exists():
             try:
+                import yaml
                 with open(yaml_file, encoding="utf-8-sig") as f:
-                    meta = fast_safe_load(f) or {}
+                    meta = yaml.safe_load(f) or {}
                 desc = meta.get("description", "")
             except Exception:
                 pass
@@ -359,7 +355,7 @@ def _get_active_memory_provider() -> Optional[str]:
     no plugin loading.
     """
     try:
-        from hermes_runtime.config import load_config
+        from hermes_cli.config import load_config
         config = load_config()
         return cfg_get(config, "memory", "provider") or None
     except Exception:
@@ -438,8 +434,9 @@ def discover_plugin_cli_commands() -> List[dict]:
         yaml_file = plugin_dir / "plugin.yaml"
         if yaml_file.exists():
             try:
+                import yaml
                 with open(yaml_file, encoding="utf-8-sig") as f:
-                    meta = fast_safe_load(f) or {}
+                    meta = yaml.safe_load(f) or {}
                 desc = meta.get("description", "")
                 if desc:
                     help_text = desc
@@ -447,7 +444,8 @@ def discover_plugin_cli_commands() -> List[dict]:
             except Exception:
                 pass
 
-        handler_fn = getattr(cli_mod, f"{active_provider}_command", None)
+        handler_fn = getattr(cli_mod, f"{active_provider}_command", None) or \
+                     getattr(cli_mod, "honcho_command", None)
 
         results.append({
             "name": active_provider,

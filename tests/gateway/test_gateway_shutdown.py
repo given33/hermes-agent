@@ -241,7 +241,6 @@ def test_pid_exists_zombie_via_psutil_returns_false(monkeypatch):
     import types
 
     from gateway import status
-    from hermes_runtime import process_probe
 
     fake_psutil = types.SimpleNamespace()
     fake_psutil.STATUS_ZOMBIE = "zombie"

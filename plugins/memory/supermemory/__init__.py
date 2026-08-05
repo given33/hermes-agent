@@ -603,7 +603,7 @@ class SupermemoryMemoryProvider(MemoryProvider):
     def post_setup(self, hermes_home: str, config: dict) -> None:
         from pathlib import Path
 
-        from hermes_runtime.config import save_config
+        from hermes_cli.config import save_config
         from hermes_cli.memory_setup import _prompt, _write_env_vars
 
         print("\n  Configuring supermemory:\n")

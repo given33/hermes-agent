@@ -38,7 +38,7 @@ def _raise_import():
 # managed_nous_tools_enabled
 # ---------------------------------------------------------------------------
 class TestManagedNousToolsEnabled:
-    """The fork never enables account-managed tool backends."""
+    """Subscription-based gate: True for paid Nous subscribers."""
 
     def test_disabled_when_not_logged_in(self, monkeypatch):
         monkeypatch.setattr(
@@ -58,18 +58,32 @@ class TestManagedNousToolsEnabled:
 
 
 class TestNousToolGatewayUnavailableMessage:
-    def test_points_to_direct_provider_without_querying_account(self, monkeypatch):
+    def test_uses_entitlement_reason_for_logged_in_user(self, monkeypatch):
         monkeypatch.setattr(
             "hermes_cli.nous_account.get_nous_portal_account_info",
-            lambda *args, **kwargs: (_ for _ in ()).throw(
-                AssertionError("Nous account state must not be queried")
+            lambda force_fresh=False: NousPortalAccountInfo(
+                logged_in=True,
+                source="account_api",
+                fresh=True,
+                paid_service_access=False,
+                portal_base_url="https://portal.example.test",
+                paid_service_access_info=NousPaidServiceAccessInfo(
+                    allowed=False,
+                    reason="no_usable_credits",
+                    has_active_subscription=True,
+                    active_subscription_is_paid=True,
+                    subscription_credits_remaining=0,
+                    purchased_credits_remaining=0,
+                    total_usable_credits=0,
+                ),
             ),
         )
 
         message = nous_tool_gateway_unavailable_message("managed image generation")
 
+        assert "credits are exhausted" in message
         assert "managed image generation" in message
-        assert "direct provider and API key" in message
+        assert "https://portal.example.test/billing" in message
 
 
 # ---------------------------------------------------------------------------

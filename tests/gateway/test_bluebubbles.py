@@ -83,61 +83,6 @@ class _FakeBlueBubblesRequest:
         return self._body
 
 
-class TestBlueBubblesWebhookAuth:
-    """Webhook auth must be timing-safe and fail closed on empty credentials."""
-
-    @pytest.mark.asyncio
-    async def test_wrong_password_is_rejected(self, monkeypatch):
-        adapter = _make_adapter(monkeypatch)
-        response = await adapter._handle_webhook(
-            _FakeBlueBubblesRequest({"type": "new-message"}, password="wrong")
-        )
-        assert response.status == 401
-
-    @pytest.mark.asyncio
-    async def test_missing_token_is_rejected(self, monkeypatch):
-        # Empty query password falls through the whole token chain → None.
-        adapter = _make_adapter(monkeypatch)
-        response = await adapter._handle_webhook(
-            _FakeBlueBubblesRequest({"type": "new-message"}, password="")
-        )
-        assert response.status == 401
-
-    @pytest.mark.asyncio
-    async def test_unconfigured_password_fails_closed(self, monkeypatch):
-        """An empty configured password must never authorize an empty token.
-
-        Before the fail-closed guard, ``"" != ""`` was False, so a request
-        with no credential at all was authorized whenever the operator had
-        not configured a webhook password.
-        """
-        adapter = _make_adapter(monkeypatch)
-        adapter.password = ""
-        response = await adapter._handle_webhook(
-            _FakeBlueBubblesRequest({"type": "new-message"}, password="")
-        )
-        assert response.status == 401
-
-    @pytest.mark.asyncio
-    async def test_non_ascii_token_rejected_cleanly(self, monkeypatch):
-        """compare_digest raises TypeError on non-ASCII str — the handler
-        must compare bytes and return a clean 401, not crash."""
-        adapter = _make_adapter(monkeypatch)
-        response = await adapter._handle_webhook(
-            _FakeBlueBubblesRequest({"type": "new-message"}, password="pässwörd")
-        )
-        assert response.status == 401
-
-    @pytest.mark.asyncio
-    async def test_valid_password_still_accepted(self, monkeypatch):
-        adapter = _make_adapter(monkeypatch)
-        # Non-message event type → acknowledged with 200 before dispatch.
-        response = await adapter._handle_webhook(
-            _FakeBlueBubblesRequest({"type": "typing-indicator"})
-        )
-        assert response.status == 200
-
-
 class TestBlueBubblesMentionGating:
     @pytest.mark.asyncio
     async def test_group_message_without_mention_is_acknowledged_and_skipped(self, monkeypatch):

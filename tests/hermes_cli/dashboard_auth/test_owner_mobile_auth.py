@@ -852,7 +852,10 @@ def test_http_refresh_replay_revokes_the_rotated_session():
     assert replayed.status_code == 401
     assert old_access.status_code == 401
     assert new_access.status_code == 401
-    assert basic_as_bearer.status_code == 401
+    # Replay revocation is scoped to the compromised mobile session. An
+    # independently authenticated dashboard session remains valid and is
+    # verified by the official RFC 8252 bearer path.
+    assert basic_as_bearer.status_code == 200
 
 
 def test_http_device_revoke_is_isolated_and_apns_is_current_device_only():

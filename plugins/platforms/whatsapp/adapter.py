@@ -27,8 +27,7 @@ _IS_WINDOWS = platform.system() == "Windows"
 from pathlib import Path
 from typing import Dict, Optional, Any
 
-from hermes_runtime.subprocess_compat import windows_detach_popen_kwargs
-from hermes_runtime.process_probe import pid_exists as _pid_exists
+from hermes_cli._subprocess_compat import windows_detach_popen_kwargs
 from hermes_constants import (
     find_node_executable,
     get_hermes_dir,
@@ -105,7 +104,7 @@ def _kill_port_process(port: int) -> None:
     """Kill any process *listening* on the given TCP port (a stale bridge)."""
     try:
         if _IS_WINDOWS:
-            from hermes_runtime.subprocess_compat import windows_hide_flags
+            from hermes_cli._subprocess_compat import windows_hide_flags
 
             # Use netstat to find the PID bound to this port, then taskkill
             result = subprocess.run(
@@ -153,6 +152,7 @@ def _bridge_pid_is_ours(pid: int, session_path: Path, expected_start) -> bool:
     command line, which must contain ``node`` and this session's unique path.
     A recycled PID (different start time / different cmdline) is never ours.
     """
+    from gateway.status import _pid_exists
     if not _pid_exists(pid):
         return False
     if expected_start is not None:
@@ -205,6 +205,7 @@ def _kill_stale_bridge_by_pidfile(session_path: Path) -> None:
         except (ProcessLookupError, PermissionError, OSError):
             pass
     else:
+        from gateway.status import _pid_exists
         if _pid_exists(pid):
             logger.warning(
                 "[whatsapp] Not killing pidfile PID %d: it is no longer the "

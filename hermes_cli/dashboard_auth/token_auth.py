@@ -285,4 +285,27 @@ async def token_auth_middleware(
         request.state.token_authenticated = True
         return await call_next(request)
 
+    # Optional API-key authentication shares /api with the official dashboard
+    # session bearer flow.  A native access token is intentionally unknown to
+    # token providers, so on a gated bind the session middleware must get the
+    # opportunity to verify it.  Exact token routes remain fail-closed, and a
+    # provider outage remains a 503 rather than being hidden by the fallback.
+    if optional_prefix and not exact_route and unreachable is None:
+        if getattr(request.app.state, "auth_required", False):
+            # The same Authorization header may carry an RFC 8252 native
+            # dashboard session instead of a mobile API key. Verify that
+            # identity explicitly before passing through; this preserves the
+            # fail-closed rule even on otherwise-public API endpoints.
+            from hermes_cli.dashboard_auth.middleware import _verify_bearer
+
+            bearer = extract_bearer_token(request)
+            try:
+                session = _verify_bearer(request, access_token=bearer)
+            except ProviderError as exc:
+                return token_failure_response(request, str(exc))
+            if session is not None:
+                request.state.session = session
+                request.state.session_bearer_authenticated = True
+                return await call_next(request)
+
     return token_failure_response(request, unreachable)

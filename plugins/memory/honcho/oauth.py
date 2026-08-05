@@ -260,11 +260,11 @@ def _atomic_write_config(path: Path, raw: dict[str, Any]) -> None:
     os.replace(tmp, path)
 
 
-def deep_merge(base: dict[str, Any], overlay: dict[str, Any]) -> dict[str, Any]:
+def _deep_merge(base: dict[str, Any], overlay: dict[str, Any]) -> dict[str, Any]:
     """Recursively merge ``overlay`` into ``base`` (overlay wins on scalars/lists)."""
     for key, value in overlay.items():
         if isinstance(value, dict) and isinstance(base.get(key), dict):
-            deep_merge(base[key], value)
+            _deep_merge(base[key], value)
         else:
             base[key] = value
     return base
@@ -376,7 +376,7 @@ def install_grant(
     if isinstance(granted_config, dict):
         cred.consent_peer_name = granted_config.get("peerName")
         if apply_config:
-            deep_merge(raw, granted_config)
+            _deep_merge(raw, granted_config)
     _expiry_cache[(str(path), host)] = (cred.expires_at, cred.access_token)
     hosts = raw.setdefault("hosts", {})
     block = hosts.setdefault(host, {})

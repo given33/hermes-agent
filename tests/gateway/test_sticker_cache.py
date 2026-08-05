@@ -1,6 +1,5 @@
 """Tests for gateway/sticker_cache.py — sticker description cache."""
 
-from concurrent.futures import ThreadPoolExecutor
 from unittest.mock import patch
 
 from gateway.sticker_cache import (

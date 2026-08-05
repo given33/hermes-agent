@@ -35,7 +35,6 @@ import sqlite3
 import threading
 import time
 from pathlib import Path
-from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -53,26 +52,16 @@ def _build_agent_with_db(
     with patch.dict(os.environ, {"OPENROUTER_API_KEY": "test-key"}):
         from run_agent import AIAgent
 
-        # Compression tests do not need tool discovery. Keeping it out of this
-        # helper also prevents unrelated TLS/provider initialization from
-        # making the concurrency regression depend on the host environment.
-        with (
-            patch("run_agent.get_tool_definitions", return_value=[]),
-            patch(
-                "agent.context_compressor.get_model_context_length",
-                return_value=131_072,
-            ),
-        ):
-            agent = AIAgent(
-                api_key="test-key",
-                base_url="https://openrouter.ai/api/v1",
-                model="test/model",
-                quiet_mode=True,
-                session_db=db,
-                session_id=session_id,
-                skip_context_files=True,
-                skip_memory=True,
-            )
+        agent = AIAgent(
+            api_key="test-key",
+            base_url="https://openrouter.ai/api/v1",
+            model="test/model",
+            quiet_mode=True,
+            session_db=db,
+            session_id=session_id,
+            skip_context_files=True,
+            skip_memory=True,
+        )
 
     # Stub the compressor so it returns deterministic output and DOESN'T make
     # an LLM call.  Sleep inside compress() so the two threads' rotations

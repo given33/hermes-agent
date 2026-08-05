@@ -29,14 +29,11 @@ Session context:
 
 import atexit
 import copy
-import errno
 import io
 import logging
 import os
 import queue
-import shutil
 import sys
-import tempfile
 import threading
 from logging.handlers import QueueHandler, QueueListener
 from pathlib import Path
@@ -73,27 +70,6 @@ else:
 
 
 from hermes_constants import get_config_path, get_hermes_home
-
-
-# A full HERMES_HOME filesystem must not prevent the dashboard/gateway from
-# binding its socket.  Logs are diagnostic state, so they may temporarily live
-# on a writable tmpfs while the primary volume is repaired.  The explicit env
-# var is useful for production deployments that have a dedicated scratch
-# volume; the remaining candidates are deliberately local and profile-neutral
-# because this module is imported before most runtime configuration exists.
-_LOG_FALLBACK_DIR_ENV = "HERMES_LOG_FALLBACK_DIR"
-_LOG_DIR_ENV = "HERMES_LOG_DIR"
-_DEFAULT_POSIX_LOG_FALLBACK_DIRS = (
-    Path("/dev/shm/hermes-agent/logs"),
-    Path("/tmp/hermes-agent/logs"),
-    Path("/var/tmp/hermes-agent/logs"),
-)
-_DISK_FULL_ERRNOS = frozenset(
-    value for value in (getattr(errno, "ENOSPC", None), getattr(errno, "EDQUOT", None))
-    if value is not None
-)
-_effective_log_dirs: dict[str, Path] = {}
-_log_fallback_notices: set[str] = set()
 
 # Sentinel to track whether setup_logging() has already run.  The function
 # is idempotent — calling it twice is safe but the second call is a no-op
@@ -160,23 +136,6 @@ def _is_windows_concurrent_log_lock_timeout(exc: BaseException | None) -> bool:
         sys.platform == "win32"
         and isinstance(exc, RuntimeError)
         and _CONCURRENT_LOG_LOCK_TIMEOUT in str(exc)
-    )
-
-
-def _is_disk_full_error(exc: BaseException | None) -> bool:
-    """Return True for filesystem-full errors raised by a log handler."""
-    if not isinstance(exc, OSError):
-        return False
-    if getattr(exc, "errno", None) in _DISK_FULL_ERRNOS:
-        return True
-    if getattr(exc, "winerror", None) == 112:
-        return True
-    message = str(exc).lower()
-    return (
-        "no space left" in message
-        or "disk quota" in message
-        or "not enough space" in message
-        or "disk full" in message
     )
 
 
@@ -293,159 +252,6 @@ COMPONENT_PREFIXES = {
 }
 
 
-def _log_home_key(home: Path) -> str:
-    """Return a stable key for the active home used by fallback markers."""
-    try:
-        return str(Path(home).expanduser().resolve())
-    except OSError:
-        return str(Path(home).expanduser())
-
-
-def _configured_log_dir(home: Path) -> Path:
-    """Return the configured primary log directory without touching disk."""
-    configured = os.environ.get(_LOG_DIR_ENV, "").strip()
-    return Path(configured).expanduser() if configured else Path(home) / "logs"
-
-
-def _log_fallback_candidates() -> list[Path]:
-    """Return ordered fallback directories, including the explicit override."""
-    candidates: list[Path] = []
-    configured = os.environ.get(_LOG_FALLBACK_DIR_ENV, "").strip()
-    if configured:
-        candidates.append(Path(configured).expanduser())
-    if os.name == "nt":
-        candidates.append(Path(tempfile.gettempdir()) / "hermes-agent" / "logs")
-    else:
-        candidates.extend(_DEFAULT_POSIX_LOG_FALLBACK_DIRS)
-
-    unique: list[Path] = []
-    seen: set[str] = set()
-    for candidate in candidates:
-        try:
-            key = str(candidate.resolve())
-        except OSError:
-            key = str(candidate)
-        if key not in seen:
-            seen.add(key)
-            unique.append(candidate)
-    return unique
-
-
-def _log_directory_is_usable(path: Path) -> bool:
-    """Check free space and perform a real create/unlink probe for *path*."""
-    try:
-        path = Path(path).expanduser()
-        path.mkdir(parents=True, exist_ok=True)
-        if path.is_symlink() or shutil.disk_usage(path).free <= 0:
-            return False
-        probe = path / f".hermes-log-probe-{os.getpid()}-{threading.get_ident()}"
-        with open(probe, "x", encoding="utf-8"):
-            pass
-        probe.unlink(missing_ok=True)
-        return True
-    except (OSError, ValueError):
-        return False
-
-
-def _fallback_marker_path(path: Path) -> Path:
-    return Path(path) / ".hermes-home"
-
-
-def _write_fallback_marker(path: Path, home: Path) -> None:
-    """Record which HERMES_HOME owns a temporary fallback directory."""
-    try:
-        marker = _fallback_marker_path(path)
-        marker.write_text(_log_home_key(home) + "\n", encoding="utf-8")
-        try:
-            os.chmod(marker, 0o600)
-        except OSError:
-            pass
-    except OSError:
-        # The log directory itself is still useful when a marker cannot be
-        # written (for example, a read-only but otherwise usable mount).
-        pass
-
-
-def _marked_fallback_for(home: Path, primary: Path) -> Optional[Path]:
-    """Find a prior fallback that still contains logs for *home*."""
-    home_key = _log_home_key(home)
-    primary_key = _log_home_key(primary)
-    for candidate in _log_fallback_candidates():
-        if _log_home_key(candidate) == primary_key:
-            continue
-        marker = _fallback_marker_path(candidate)
-        try:
-            if marker.read_text(encoding="utf-8").strip() != home_key:
-                continue
-            if not any(candidate.glob("*.log")):
-                continue
-            if _log_directory_is_usable(candidate):
-                return candidate
-        except OSError:
-            continue
-    return None
-
-
-def _announce_log_fallback(primary: Path, selected: Path) -> None:
-    """Emit one concise diagnostic without relying on the broken file log."""
-    key = f"{_log_home_key(primary)}->{_log_home_key(selected)}"
-    if key in _log_fallback_notices:
-        return
-    _log_fallback_notices.add(key)
-    try:
-        stream = _safe_stderr()
-        stream.write(
-            "Hermes log filesystem is unavailable; using fallback directory "
-            f"{selected} (primary: {primary})\n"
-        )
-        stream.flush()
-    except Exception:
-        pass
-
-
-def _select_log_dir(home: Path, *, force_fallback: bool = False) -> Path:
-    """Choose a writable log directory and remember the process-local choice."""
-    home = Path(home).expanduser()
-    primary = _configured_log_dir(home)
-    home_key = _log_home_key(home)
-    remembered = _effective_log_dirs.get(home_key)
-    if (
-        remembered is not None
-        and _log_directory_is_usable(remembered)
-        and (not force_fallback or _log_home_key(remembered) != _log_home_key(primary))
-    ):
-        return remembered
-
-    if not force_fallback:
-        marked = _marked_fallback_for(home, primary)
-        if marked is not None:
-            _effective_log_dirs[home_key] = marked
-            return marked
-        if _log_directory_is_usable(primary):
-            _effective_log_dirs[home_key] = primary
-            return primary
-
-    for candidate in _log_fallback_candidates():
-        if _log_home_key(candidate) == _log_home_key(primary):
-            continue
-        if _log_directory_is_usable(candidate):
-            _effective_log_dirs[home_key] = candidate
-            _write_fallback_marker(candidate, home)
-            _announce_log_fallback(primary, candidate)
-            return candidate
-
-    # Let _add_rotating_handler install a stream fallback if every filesystem
-    # is unavailable. Returning the primary keeps its public return contract.
-    _effective_log_dirs[home_key] = primary
-    return primary
-
-
-def get_log_dir(hermes_home: Optional[Path] = None) -> Path:
-    """Return the effective log directory used by the current process."""
-    home = Path(hermes_home or get_hermes_home()).expanduser()
-    return _select_log_dir(home)
-
-
 # ---------------------------------------------------------------------------
 # Main setup
 # ---------------------------------------------------------------------------
@@ -494,18 +300,9 @@ def setup_logging(
         The ``logs/`` directory where files are written.
     """
     global _logging_initialized
-    home = Path(hermes_home or get_hermes_home()).expanduser()
-    log_dir = _select_log_dir(home)
-    existing_log_dirs = {
-        Path(getattr(handler, "baseFilename", "")).parent.resolve()
-        for handler in _queued_file_handlers
-        if getattr(handler, "baseFilename", None)
-    }
-    if existing_log_dirs and any(directory != log_dir.resolve() for directory in existing_log_dirs):
-        # A previously healthy volume may fill while the process is alive.
-        # Rebuild the listener before attaching fallback handlers so old
-        # primary handlers cannot continue emitting duplicate errors.
-        _reset_queued_handlers()
+    home = hermes_home or get_hermes_home()
+    log_dir = home / "logs"
+    log_dir.mkdir(parents=True, exist_ok=True)
 
     # Read config defaults (best-effort — config may not be loaded yet).
     cfg_level, cfg_max_size, cfg_backup = _read_logging_config()
@@ -516,7 +313,7 @@ def setup_logging(
     backups = backup_count or cfg_backup or 3
 
     # Lazy import to avoid circular dependency at module load time.
-    from hermes_runtime.redaction import RedactingFormatter
+    from agent.redact import RedactingFormatter
 
     root = logging.getLogger()
 
@@ -528,7 +325,6 @@ def setup_logging(
         max_bytes=max_bytes,
         backup_count=backups,
         formatter=RedactingFormatter(_LOG_FORMAT),
-        fallback_home=home,
     )
 
     # --- errors.log (WARNING+) — quick triage log --------------------------
@@ -539,7 +335,6 @@ def setup_logging(
         max_bytes=2 * 1024 * 1024,
         backup_count=2,
         formatter=RedactingFormatter(_LOG_FORMAT),
-        fallback_home=home,
     )
 
     # --- gateway.log (INFO+, gateway component only) ------------------------
@@ -552,7 +347,6 @@ def setup_logging(
             backup_count=3,
             formatter=RedactingFormatter(_LOG_FORMAT),
             log_filter=_ComponentFilter(COMPONENT_PREFIXES["gateway"]),
-            fallback_home=home,
         )
 
     # --- gui.log (INFO+, dashboard/tui-gateway components) -----------------
@@ -565,7 +359,6 @@ def setup_logging(
             backup_count=5,
             formatter=RedactingFormatter(_LOG_FORMAT),
             log_filter=_ComponentFilter(COMPONENT_PREFIXES["gui"]),
-            fallback_home=home,
         )
 
     if _logging_initialized and not force:
@@ -588,7 +381,7 @@ def setup_verbose_logging() -> None:
 
     Called by ``AIAgent.__init__()`` when ``verbose_logging=True``.
     """
-    from hermes_runtime.redaction import RedactingFormatter
+    from agent.redact import RedactingFormatter
 
     root = logging.getLogger()
 
@@ -644,29 +437,10 @@ class _ManagedRotatingFileHandler(RotatingFileHandler):
         rotating handlers.
     """
 
-    def __init__(self, *args, fallback_home: Optional[Path] = None, **kwargs):
-        from hermes_runtime.config import is_managed
-        self._fallback_home = Path(fallback_home).expanduser() if fallback_home else None
-        self._using_fallback = False
-        self._disk_full_reported = False
+    def __init__(self, *args, **kwargs):
+        from hermes_cli.config import is_managed
         self._managed = is_managed()
-        # Keep eager file creation consistent across stdlib and
-        # concurrent-log-handler backends.  The Windows backend defaults to
-        # delay=True, which makes health checks and operator tooling report a
-        # missing log until the first record is emitted.
-        if sys.platform != "win32":
-            kwargs.setdefault("delay", False)
         super().__init__(*args, **kwargs)
-        if self.stream is None:
-            # concurrent-log-handler 0.9+ keeps the stream lazy regardless of
-            # ``delay``.  Materialize the base file for parity with the POSIX
-            # handler and for health/readiness tooling; a full filesystem is
-            # expected to fail here and is handled by the startup fallback.
-            try:
-                Path(self.baseFilename).touch(exist_ok=True)
-                self._chmod_if_managed()
-            except OSError:
-                pass
         # Snapshot the inode of the currently open stream so emit() can
         # detect external rotation without an extra fstat per write.
         self._stat_dev: Optional[int] = None
@@ -737,34 +511,6 @@ class _ManagedRotatingFileHandler(RotatingFileHandler):
             except Exception:
                 pass
 
-    def _switch_to_fallback(self) -> bool:
-        """Move this handler to a writable fallback after a runtime ENOSPC."""
-        if self._fallback_home is None or self._using_fallback:
-            return False
-        current_path = Path(self.baseFilename)
-        fallback_dir = _select_log_dir(self._fallback_home, force_fallback=True)
-        if _log_home_key(fallback_dir) == _log_home_key(current_path.parent):
-            return False
-
-        target = fallback_dir / current_path.name
-        old_base = self.baseFilename
-        old_stream = self.stream
-        try:
-            fallback_dir.mkdir(parents=True, exist_ok=True)
-            if old_stream is not None:
-                old_stream.close()
-            self.stream = None  # type: ignore[assignment]
-            self.baseFilename = os.path.abspath(str(target))
-            self.stream = self._open()
-            self._using_fallback = True
-            self._record_stream_stat()
-            _write_fallback_marker(fallback_dir, self._fallback_home)
-            return True
-        except Exception:
-            self.baseFilename = old_base
-            self.stream = None  # type: ignore[assignment]
-            return False
-
     def emit(self, record: logging.LogRecord) -> None:
         # Cheap-ish stat-per-record check; the kernel caches inode metadata
         # so the syscall is sub-microsecond on a hot file.
@@ -785,27 +531,6 @@ class _ManagedRotatingFileHandler(RotatingFileHandler):
         slash-worker, is captured and surfaced into chat output)."""
         exc = sys.exc_info()[1]
         if _is_windows_concurrent_log_lock_timeout(exc):
-            return
-        if _is_disk_full_error(exc):
-            if self._switch_to_fallback():
-                # Retry the record once on the new stream.  A second failure
-                # is suppressed by the branch below, so a full fallback disk
-                # cannot recurse indefinitely or flood stderr.
-                try:
-                    self.emit(record)
-                except Exception:
-                    pass
-            elif not self._disk_full_reported:
-                self._disk_full_reported = True
-                try:
-                    stream = _safe_stderr()
-                    stream.write(
-                        f"Hermes log handler disabled after filesystem-full error: "
-                        f"{self.baseFilename}\n"
-                    )
-                    stream.flush()
-                except Exception:
-                    pass
             return
         super().handleError(record)
 
@@ -982,10 +707,7 @@ def _reset_queued_handlers() -> None:
         _stop_queue_listener_locked()
         root = logging.getLogger()
         for h in list(root.handlers):
-            if (
-                getattr(h, "_hermes_queue", False)
-                or getattr(h, "_hermes_log_stream_fallback", False)
-            ):
+            if getattr(h, "_hermes_queue", False):
                 root.removeHandler(h)
         for h in list(_queued_file_handlers):
             try:
@@ -1005,7 +727,6 @@ def _add_rotating_handler(
     backup_count: int,
     formatter: logging.Formatter,
     log_filter: Optional[logging.Filter] = None,
-    fallback_home: Optional[Path] = None,
 ) -> None:
     """Add a ``RotatingFileHandler`` to *logger*, skipping if one already
     exists for the same resolved file path (idempotent).
@@ -1024,30 +745,11 @@ def _add_rotating_handler(
         ):
             return  # already attached
 
-    try:
-        path.parent.mkdir(parents=True, exist_ok=True)
-        handler = _ManagedRotatingFileHandler(
-            str(path), maxBytes=max_bytes, backupCount=backup_count,
-            encoding="utf-8", fallback_home=fallback_home,
-        )
-    except OSError as exc:
-        # If every file system is full or the selected mount becomes
-        # unavailable during startup, keep the service alive with stderr
-        # diagnostics instead of aborting before the HTTP socket binds.
-        if not _is_disk_full_error(exc):
-            raise
-        for existing in logger.handlers:
-            if getattr(existing, "_hermes_log_stream_fallback_path", None) == str(path.resolve()):
-                return
-        stream_handler = logging.StreamHandler(_safe_stderr())
-        stream_handler.setLevel(level)
-        stream_handler.setFormatter(formatter)
-        stream_handler._hermes_log_stream_fallback = True  # type: ignore[attr-defined]
-        stream_handler._hermes_log_stream_fallback_path = str(path.resolve())  # type: ignore[attr-defined]
-        if log_filter is not None:
-            stream_handler.addFilter(log_filter)
-        logger.addHandler(stream_handler)
-        return
+    path.parent.mkdir(parents=True, exist_ok=True)
+    handler = _ManagedRotatingFileHandler(
+        str(path), maxBytes=max_bytes, backupCount=backup_count,
+        encoding="utf-8",
+    )
     handler.setLevel(level)
     handler.setFormatter(formatter)
     if log_filter is not None:
@@ -1082,7 +784,7 @@ def _read_logging_config():
             # Managed scope: an administrator can pin logging.* too. Overlay via
             # the shared helper (fail-open) since this reads config.yaml directly.
             try:
-                from hermes_runtime import managed_scope
+                from hermes_cli import managed_scope
                 cfg = managed_scope.apply_managed_overlay(cfg)
             except Exception:
                 pass

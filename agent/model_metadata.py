@@ -132,7 +132,6 @@ _model_metadata_cache_time: float = 0
 _novita_metadata_cache: Dict[str, Dict[str, Any]] = {}
 _novita_metadata_cache_time: float = 0
 _MODEL_CACHE_TTL = 3600
-_CACHE_FUTURE_SKEW_TOLERANCE_SECONDS = 5.0
 _endpoint_model_metadata_cache: Dict[str, Dict[str, Dict[str, Any]]] = {}
 _endpoint_model_metadata_cache_time: Dict[str, float] = {}
 _ENDPOINT_MODEL_CACHE_TTL = 300
@@ -311,13 +310,9 @@ def _model_metadata_disk_cache_age_seconds() -> Optional[float]:
         if not cache_path.exists():
             return None
         age = time.time() - cache_path.stat().st_mtime
-        # Windows/filesystem timestamp granularity can make a file written in
-        # this process appear a fraction of a second in the future. Treat that
-        # bounded skew as brand new; a materially future-dated file remains
-        # untrusted so a broken clock cannot pin stale metadata indefinitely.
-        if age < -_CACHE_FUTURE_SKEW_TOLERANCE_SECONDS:
+        if age < 0:
             return None
-        return max(0.0, age)
+        return age
     except Exception:
         return None
 
@@ -2539,7 +2534,7 @@ def get_model_context_length(
     # See #15779.
     if custom_providers and base_url and model:
         try:
-            from hermes_runtime.config import get_custom_provider_context_length
+            from hermes_cli.config import get_custom_provider_context_length
             cp_ctx = get_custom_provider_context_length(
                 model=model,
                 base_url=base_url,
@@ -2812,7 +2807,7 @@ def get_model_context_length(
     # returns the provider-enforced limit which is what users can actually use.
     if effective_provider in {"copilot", "copilot-acp", "github-copilot"}:
         try:
-            from agent.model_catalog import get_copilot_model_context
+            from hermes_cli.models import get_copilot_model_context
             ctx = get_copilot_model_context(model, api_key=api_key)
             if ctx:
                 return ctx
@@ -2853,21 +2848,6 @@ def get_model_context_length(
         ctx = _resolve_endpoint_context_length(model, base_url, api_key=api_key)
         if ctx is not None:
             return ctx
-
-    # Z.AI's current GLM context windows are already curated in the local
-    # catalog below (including the empirically-verified 1M window for
-    # GLM-5.2). Prefer those values before consulting models.dev. The generic
-    # registry lookup performs a synchronous 15-second network fetch when its
-    # disk cache is absent, which made every fresh hosted gateway appear hung
-    # even though no remote metadata is needed for these known model families.
-    if effective_provider == "zai":
-        model_lower = model.lower()
-        for default_model, length in sorted(
-            DEFAULT_CONTEXT_LENGTHS.items(), key=lambda item: len(item[0]), reverse=True
-        ):
-            if default_model.startswith("glm") and default_model in model_lower:
-                return length
-
     # 5e. Ollama native /api/show probe — runs for providers whose base_url
     # is NOT a known non-Ollama provider.  Ollama-compatible servers expose
     # this endpoint regardless of hostname (local Ollama, Ollama Cloud,

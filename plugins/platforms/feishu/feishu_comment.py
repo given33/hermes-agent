@@ -25,7 +25,6 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
-from collections import OrderedDict
 from typing import Any, Dict, List, Optional, Tuple
 
 logger = logging.getLogger(__name__)
@@ -986,7 +985,7 @@ def _resolve_model_and_runtime() -> Tuple[str, dict]:
     # Fall back to provider's default model if none configured
     if not model and runtime_kwargs.get("provider"):
         try:
-            from agent.model_catalog import get_default_model_for_provider
+            from hermes_cli.models import get_default_model_for_provider
             model = get_default_model_for_provider(runtime_kwargs["provider"])
         except Exception:
             pass
@@ -1002,40 +1001,28 @@ import threading
 import time as _time
 
 _SESSION_MAX_MESSAGES = 50  # keep last N messages per document session
-_SESSION_MAX_ENTRIES = 256  # bound distinct document sessions per process
 _SESSION_TTL_S = 3600       # expire sessions after 1 hour of inactivity
 
 _session_cache_lock = threading.Lock()
-_session_cache: OrderedDict[str, Dict[str, Any]] = OrderedDict()
+_session_cache: Dict[str, Dict] = {}  # key -> {"messages": [...], "last_access": float}
 
 
 def _session_key(file_type: str, file_token: str) -> str:
     return f"comment-doc:{file_type}:{file_token}"
 
 
-def _prune_session_cache(now: float) -> None:
-    """Drop expired sessions and enforce the distinct-document LRU bound."""
-    expired = [
-        key
-        for key, entry in _session_cache.items()
-        if now - entry["last_access"] > _SESSION_TTL_S
-    ]
-    for key in expired:
-        del _session_cache[key]
-    while len(_session_cache) > _SESSION_MAX_ENTRIES:
-        _session_cache.popitem(last=False)
-
-
 def _load_session_history(key: str) -> List[Dict[str, Any]]:
     """Load conversation history for a document session."""
     with _session_cache_lock:
-        now = _time.monotonic()
-        _prune_session_cache(now)
         entry = _session_cache.get(key)
         if entry is None:
             return []
-        entry["last_access"] = now
-        _session_cache.move_to_end(key)
+        # Check TTL
+        if _time.time() - entry["last_access"] > _SESSION_TTL_S:
+            del _session_cache[key]
+            logger.info("[Feishu-Comment] Session expired: %s", key)
+            return []
+        entry["last_access"] = _time.time()
         return list(entry["messages"])
 
 
@@ -1050,14 +1037,10 @@ def _save_session_history(key: str, messages: List[Dict[str, Any]]) -> None:
     if len(cleaned) > _SESSION_MAX_MESSAGES:
         cleaned = cleaned[-_SESSION_MAX_MESSAGES:]
     with _session_cache_lock:
-        now = _time.monotonic()
-        _prune_session_cache(now)
         _session_cache[key] = {
             "messages": cleaned,
-            "last_access": now,
+            "last_access": _time.time(),
         }
-        _session_cache.move_to_end(key)
-        _prune_session_cache(now)
         logger.info("[Feishu-Comment] Session saved: %s (%d messages)", key, len(cleaned))
 
 

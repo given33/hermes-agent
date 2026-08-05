@@ -91,7 +91,6 @@ def test_qwen_oauth_auto_fallthrough_on_auth_failure(monkeypatch):
     from hermes_cli.auth import AuthError
 
     monkeypatch.setattr(rp, "resolve_provider", lambda *a, **k: "qwen-oauth")
-    monkeypatch.setattr(rp, "load_pool", lambda _provider: SimpleNamespace(has_credentials=lambda: False))
     monkeypatch.setattr(
         rp,
         "resolve_qwen_runtime_credentials",
@@ -831,7 +830,8 @@ def test_opencode_go_model_derivation_beats_stale_persisted_api_mode(monkeypatch
 
 
 def test_auto_detected_nous_auth_failure_falls_through_to_openrouter(monkeypatch):
-    """A stale auto-selected Nous provider without an API key falls through."""
+    """When auto-detect picks Nous but credentials are revoked, fall through to OpenRouter."""
+    from hermes_cli.auth import AuthError
 
     monkeypatch.setenv("OPENROUTER_API_KEY", "test-or-key")
     monkeypatch.delenv("OPENAI_API_KEY", raising=False)
@@ -845,10 +845,13 @@ def test_auto_detected_nous_auth_failure_falls_through_to_openrouter(monkeypatch
     monkeypatch.setattr(rp, "load_pool", lambda p: type("P", (), {
         "has_credentials": lambda self: False,
     })())
+    # Nous credential resolution fails with revoked token
     monkeypatch.setattr(
-        rp,
-        "resolve_api_key_provider_credentials",
-        lambda provider: {"api_key": "", "base_url": "", "source": "default"},
+        rp, "resolve_nous_runtime_credentials",
+        lambda **kw: (_ for _ in ()).throw(
+            AuthError("Refresh session has been revoked",
+                      provider="nous", code="invalid_grant", relogin_required=True)
+        ),
     )
 
     # With requested="auto", should fall through to OpenRouter

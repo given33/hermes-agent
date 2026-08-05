@@ -190,11 +190,7 @@ class SubdirectoryHintTracker:
     def _extract_paths_from_command(self, cmd: str, candidates: Set[Path]):
         """Extract path-like tokens from a shell command string."""
         try:
-            # POSIX shlex treats Windows backslashes as escape characters and
-            # silently turns ``C:\\repo\\file`` into ``C:repofile``. Keep
-            # them literal on Windows so hint discovery follows the actual
-            # command path.
-            tokens = shlex.split(cmd, posix=os.name != "nt")
+            tokens = shlex.split(cmd)
         except ValueError:
             tokens = cmd.split()
 
@@ -203,7 +199,7 @@ class SubdirectoryHintTracker:
             if token.startswith("-"):
                 continue
             # Must look like a path (contains / or .)
-            if "/" not in token and "\\" not in token and "." not in token:
+            if "/" not in token and "." not in token:
                 continue
             # Skip URLs
             if token.startswith(("http://", "https://", "git@")):

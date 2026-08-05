@@ -1,4 +1,4 @@
-"""Direct Nous inference API provider profile."""
+"""Nous Portal provider profile."""
 
 from typing import Any
 
@@ -8,7 +8,7 @@ from providers.base import ProviderProfile
 
 
 class NousProfile(ProviderProfile):
-    """Nous API — product tags and provider-specific reasoning behavior."""
+    """Nous Portal — product tags, reasoning with Nous-specific omission."""
 
     def build_extra_body(
         self, *, session_id: str | None = None, **context
@@ -81,7 +81,7 @@ nous = NousProfile(
         "hermes-3-70b",
     ),
     base_url="https://inference-api.nousresearch.com/v1",
-    auth_type="api_key",
+    auth_type="oauth_device_code",
 )
 
 register_provider(nous)

@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from typing import Any, Sequence
 
-from hermes_runtime.redaction import redact_sensitive_text
+from agent.redact import redact_sensitive_text
 
 
 def describe_compression_lock_skip(lock_signal: Any) -> str:

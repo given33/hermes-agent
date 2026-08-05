@@ -201,7 +201,7 @@ def test_save_platform_tools_preserves_mcp_server_names():
 
 
 
-def test_first_install_nous_does_not_auto_configure_account_managed_video(monkeypatch):
+def test_first_install_nous_auto_configures_video_gen(monkeypatch):
     """When a Nous subscriber checks video_gen in the toolset checklist,
     apply_nous_managed_defaults must write video_gen.provider and
     video_gen.use_gateway so the FAL plugin can route through the gateway
@@ -254,8 +254,10 @@ def test_first_install_nous_does_not_auto_configure_account_managed_video(monkey
 
     tools_command(first_install=True, config=config)
 
-    assert "video_gen" not in config
-    assert configured == ["video_gen"]
+    assert config["video_gen"]["provider"] == "fal"
+    assert config["video_gen"]["use_gateway"] is True
+    # video_gen should NOT appear in the manual configure list — it's auto-configured
+    assert "video_gen" not in configured
 
 # ── Platform / toolset consistency ────────────────────────────────────────────
 

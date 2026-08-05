@@ -215,7 +215,7 @@ class CollaborationDashboardTests(unittest.TestCase):
         ):
             resolved = module._discover_profile_toolsets(config, ["ios.location"])
 
-        self.assertEqual(resolved, ["file", "ios-location"])
+        self.assertEqual(resolved, ["file", "ios-location", "todo"])
         self.assertEqual(calls[0], ("discover", ["ios.location"]))
         self.assertEqual(
             calls[1],
@@ -234,7 +234,7 @@ class CollaborationDashboardTests(unittest.TestCase):
         self.assertIn("ios.location", routed["capability_hints"])
         self.assertTrue(routed["needs_tools"])
 
-    def test_hosted_event_cursor_survives_process_revision_changes(self):
+    def test_hosted_update_revision_is_conversation_scoped_without_state_rewrites(self):
         module = load_module()
         conversation = module.create_single_conversation("default")
         state = {"conversations": [conversation]}
@@ -248,8 +248,9 @@ class CollaborationDashboardTests(unittest.TestCase):
         module._HOSTED_UPDATE_REVISION = 0
         module._notify_hosted_update(conversation["id"])
 
-        self.assertEqual(conversation["event_cursor"], 2)
-        self.assertEqual(persisted, [1, 2])
+        self.assertEqual(module._hosted_update_revision(conversation["id"]), 2)
+        self.assertEqual(conversation["event_cursor"], 0)
+        self.assertEqual(persisted, [])
 
     def test_cancellation_stays_requested_until_execution_acknowledges_it(self):
         module = load_module()
@@ -338,7 +339,7 @@ class CollaborationDashboardTests(unittest.TestCase):
                 for message in conversation["messages"]
                 if message.get("meta", {}).get("final_report") is True
             ),
-            1,
+            0,
         )
 
     def test_profile_model_readiness_rejects_virtual_moa_without_real_credentials(self):
@@ -408,7 +409,7 @@ class CollaborationDashboardTests(unittest.TestCase):
         self.assertEqual(readiness["model"], "model-test")
         self.assertEqual(readiness["provider"], "custom")
 
-    def test_enqueue_without_model_credentials_is_durable_before_background_retries(self):
+    def test_simple_chat_enqueue_is_durable_before_direct_background_start(self):
         module = load_module()
         module.RouteMessageBody.model_rebuild(_types_namespace={"Any": Any})
         conversation = module.create_single_conversation("default")
@@ -461,6 +462,10 @@ class CollaborationDashboardTests(unittest.TestCase):
             module,
             "start_hosted_routing",
             side_effect=lambda *args: starts.append(args),
+        ), patch.object(
+            module,
+            "start_hosted_workflow",
+            side_effect=lambda *args: starts.append(args),
         ):
             first = module.enqueue_hosted_turn(conversation["id"], payload, SimpleNamespace())
             replay = module.enqueue_hosted_turn(conversation["id"], payload, SimpleNamespace())
@@ -472,9 +477,9 @@ class CollaborationDashboardTests(unittest.TestCase):
         self.assertEqual(len(starts), 2)
         hosted = conversation["hosted_turns"]["turn-no-model"]
         self.assertEqual(hosted["status"], "queued")
-        self.assertEqual(hosted["stage"], "routing_pending")
-        self.assertEqual(first["route"]["mode"], "pending")
-        self.assertEqual(conversation["route_outbox"]["turn-no-model"]["state"], "pending")
+        self.assertEqual(hosted["stage"], "accepted")
+        self.assertEqual(first["route"]["mode"], "chat")
+        self.assertNotIn("route_outbox", conversation)
         assistant_messages = [
             item for item in conversation["messages"] if item.get("role") == "assistant"
         ]
@@ -1611,7 +1616,7 @@ class CollaborationDashboardTests(unittest.TestCase):
         for event in events:
             module.apply_profile_event(state, event)
         self.assertEqual(len(state["activities"]), 1)
-        self.assertEqual(state["activities"][0]["name"], "正在重连 (2/5)")
+        self.assertEqual(state["activities"][0]["name"], "正在重新连接 (2/5)")
         self.assertEqual(state["activities"][0]["output"], "")
         self.assertEqual(state["activities"][0]["status"], "running")
 
@@ -4714,8 +4719,14 @@ class CollaborationDashboardTests(unittest.TestCase):
         with patch.object(module.time, "time", side_effect=[1.0, 2.0, 3.0]):
             module.apply_profile_event(
                 state,
-                {"type": "status.update", "payload": {"text": "正在重连 (1/5)"}},
+                {
+                    "type": "connection.retry",
+                    "payload": {"attempt": 1, "max_attempts": 5},
+                },
             )
+            retry_statuses = [
+                item for item in state["activities"] if item["kind"] == "status"
+            ]
             module.apply_profile_event(
                 state,
                 {"type": "message.delta", "payload": {"text": "你"}},
@@ -4727,10 +4738,14 @@ class CollaborationDashboardTests(unittest.TestCase):
 
         self.assertEqual(state["content"], "你好")
         self.assertEqual(state["first_token_at"], 2000)
+        self.assertEqual(
+            [item["name"] for item in retry_statuses],
+            ["正在重新连接 (1/5)"],
+        )
         statuses = [
             item for item in state["activities"] if item["kind"] == "status"
         ]
-        self.assertEqual([item["output"] for item in statuses], ["正在重连 (1/5)"])
+        self.assertEqual(statuses, [])
 
     def test_connection_retry_event_hides_intermediate_error_and_exposes_attempt(self):
         module = load_module()
@@ -4749,7 +4764,7 @@ class CollaborationDashboardTests(unittest.TestCase):
         )
 
         self.assertEqual(len(state["activities"]), 1)
-        self.assertEqual(state["activities"][0]["name"], "正在重连 (2/5)")
+        self.assertEqual(state["activities"][0]["name"], "正在重新连接 (2/5)")
         self.assertEqual(state["activities"][0]["output"], "")
         self.assertEqual(state["activities"][0]["status"], "running")
         self.assertNotIn("401", state["activities"][0]["output"])
@@ -6165,8 +6180,7 @@ class CollaborationDashboardTests(unittest.TestCase):
             runner=runner,
         )
 
-        self.assertTrue(visible_before_output)
-        self.assertTrue(all(not message["content"] for message in visible_before_output))
+        self.assertEqual(visible_before_output, [])
         chat_messages = [
             message
             for message in conversation["messages"]

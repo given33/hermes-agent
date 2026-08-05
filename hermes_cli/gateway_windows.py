@@ -39,12 +39,11 @@ import time
 from pathlib import Path
 from xml.sax.saxutils import escape
 
-from hermes_runtime.subprocess_compat import (
+from hermes_cli._subprocess_compat import (
     windows_detach_flags,
     windows_detach_flags_without_breakaway,
     windows_hide_flags,
 )
-from hermes_runtime.process_probe import pid_exists as _pid_exists
 
 # Short timeouts: schtasks occasionally wedges and we don't want to hang forever.
 _SCHTASKS_TIMEOUT_S = 15
@@ -96,7 +95,7 @@ def _preserve_hermes_home_path(path: str | Path) -> str:
     """
     candidate = Path(path)
     try:
-        from hermes_runtime.config import get_hermes_home
+        from hermes_cli.config import get_hermes_home
 
         home = Path(get_hermes_home())
         resolved_home = home.resolve()
@@ -317,7 +316,7 @@ def get_task_script_path() -> Path:
     Hermes installs stay self-contained).
     """
     _assert_windows()
-    from hermes_runtime.config import get_hermes_home
+    from hermes_cli.config import get_hermes_home
 
     script_dir = Path(get_hermes_home()) / "gateway-service"
     script_dir.mkdir(parents=True, exist_ok=True)
@@ -367,7 +366,7 @@ def _stable_gateway_working_dir(project_root: Path) -> str:
     configured spelling instead of resolving symlinks so AppData installs backed
     by a junction/symlink still identify themselves as AppData.
     """
-    from hermes_runtime.config import get_hermes_home
+    from hermes_cli.config import get_hermes_home
 
     try:
         home = get_hermes_home()
@@ -543,7 +542,7 @@ def _write_task_script() -> Path:
     """Generate and write the gateway.cmd wrapper. Return its absolute path."""
     _assert_windows()
     # Local imports to avoid circular-init at module load time.
-    from hermes_runtime.config import get_hermes_home
+    from hermes_cli.config import get_hermes_home
     from hermes_cli.gateway import (
         PROJECT_ROOT,
         _profile_arg,
@@ -787,7 +786,7 @@ def _build_gateway_argv() -> tuple[list[str], str, dict[str, str]]:
     layer in between.
     """
     _assert_windows()
-    from hermes_runtime.config import get_hermes_home
+    from hermes_cli.config import get_hermes_home
     from hermes_cli.gateway import (
         PROJECT_ROOT,
         _profile_arg,
@@ -850,7 +849,7 @@ def windowless_gateway_restart_spec(
     if sys.platform != "win32":
         return run_argv, "", {}
 
-    from hermes_runtime.config import get_hermes_home
+    from hermes_cli.config import get_hermes_home
     from hermes_cli.gateway import PROJECT_ROOT
 
     python_exe = run_argv[0]
@@ -932,7 +931,7 @@ def _spawn_detached(script_path: Path | None = None) -> int:
     # logging module writes to gateway.log through a FileHandler, so the
     # real gateway logs still land there — this just captures anything
     # that goes to print() or native stderr.
-    from hermes_runtime.config import get_hermes_home
+    from hermes_cli.config import get_hermes_home
 
     log_dir = Path(get_hermes_home()) / "logs"
     log_dir.mkdir(parents=True, exist_ok=True)
@@ -1186,13 +1185,13 @@ def _report_gateway_start(via: str) -> None:
     else:
         print(f"⚠ Launched gateway via {via}, but no process detected after 6s.")
         print("  Check the log for startup errors:")
-        from hermes_runtime.config import get_hermes_home
+        from hermes_cli.config import get_hermes_home
         print(f"    type {Path(get_hermes_home())}\\logs\\gateway.log")
         print(f"    type {Path(get_hermes_home())}\\logs\\gateway-stdio.log")
 
 
 def _print_next_steps() -> None:
-    from hermes_runtime.config import get_hermes_home
+    from hermes_cli.config import get_hermes_home
 
     hermes_home = Path(get_hermes_home())
     print()
@@ -1315,7 +1314,7 @@ def _print_deep_probes() -> None:
     import json
     from datetime import datetime, timezone
 
-    from hermes_runtime.config import get_hermes_home
+    from hermes_cli.config import get_hermes_home
 
     home = Path(get_hermes_home())
     pid_path = home / "gateway.pid"
@@ -1370,6 +1369,8 @@ def _print_deep_probes() -> None:
     candidate_pid = running_pid if running_pid is not None else pid_value
     if candidate_pid is not None:
         try:
+            from gateway.status import _pid_exists
+
             alive = bool(_pid_exists(candidate_pid))
             print(f"  [4] {_mark(alive):4s}  _pid_exists({candidate_pid}) => {alive}")
         except Exception as exc:
@@ -1520,7 +1521,7 @@ def _drain_gateway_pid(pid: int, drain_timeout: float) -> bool:
     if pid <= 0:
         return False
     try:
-        from gateway.status import write_planned_stop_marker
+        from gateway.status import write_planned_stop_marker, _pid_exists
     except ImportError:
         return False
 
@@ -1555,7 +1556,7 @@ def _windows_stop_drain_timeout() -> float:
 def _force_terminate_known_gateway_pids(pids: list[int]) -> int:
     """Force-kill known gateway PIDs without a broad process sweep."""
     try:
-        from gateway.status import terminate_pid
+        from gateway.status import _pid_exists, terminate_pid
     except ImportError:
         return 0
 

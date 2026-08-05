@@ -49,7 +49,7 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional, Set, Tuple
 
 from hermes_constants import get_hermes_home
-from hermes_runtime.skill_utils import is_excluded_skill_path
+from agent.skill_utils import is_excluded_skill_path
 
 logger = logging.getLogger(__name__)
 
@@ -609,19 +609,12 @@ def rollback(backup_id: Optional[str] = None) -> Tuple[bool, str, Optional[Path]
         # Protect the target from this snapshot's prune step: at the steady
         # keep limit, pruning the oldest snapshot would otherwise delete the
         # very snapshot we are about to extract from.
-        safety_snapshot = snapshot_skills(
+        snapshot_skills(
             reason=f"pre-rollback to {target.name}",
             protect_ids={target.name},
         )
     except Exception as e:
         return (False, f"pre-rollback safety snapshot failed: {e}", None)
-    if safety_snapshot is None:
-        return (
-            False,
-            "pre-rollback safety snapshot was not created "
-            "(backup may be disabled or unavailable)",
-            None,
-        )
 
     # Additionally move current entries into an internal staging dir so
     # the extract happens into an empty skills tree (predictable result).

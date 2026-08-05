@@ -221,7 +221,7 @@ async def send_sticker(
 
     Returns: ``{"success": bool, ...}``
     """
-    from hermes_runtime.session_context import get_session_env
+    from gateway.session_context import get_session_env
     from gateway.platforms.yuanbao_sticker import (
         get_sticker_by_id,
         get_sticker_by_name,
@@ -420,7 +420,7 @@ from tools.registry import registry, tool_result  # noqa: E402
 def _check_yuanbao():
     """Toolset availability check — True when running in a yuanbao gateway session."""
     try:
-        from hermes_runtime.session_context import get_session_env
+        from gateway.session_context import get_session_env
         if get_session_env("HERMES_SESSION_PLATFORM", "") == "yuanbao":
             return True
     except Exception:
@@ -448,7 +448,7 @@ async def _handle_yb_send_dm(args, **kw):
     group_code = args.get("group_code", "")
     if not group_code:
         try:
-            from hermes_runtime.session_context import get_session_env
+            from gateway.session_context import get_session_env
             chat_id = get_session_env("HERMES_SESSION_CHAT_ID", "")
             # chat_id format: "group:<code>" → extract the code part
             if chat_id.startswith("group:"):

@@ -20,16 +20,6 @@ from gateway.config import PlatformConfig
 from gateway.platforms.api_server import APIServerAdapter, cors_middleware
 
 _MOD = "gateway.platforms.api_server"
-_FIRE_AT = "2026-08-01T00:00:00+00:00"
-
-
-def _claims(job_id="abc123"):
-    return {
-        "purpose": "cron_fire",
-        "aud": "agent:x",
-        "job_id": job_id,
-        "fire_at": _FIRE_AT,
-    }
 
 
 def _make_adapter() -> APIServerAdapter:
@@ -54,9 +44,8 @@ class _SpyProvider:
     def __init__(self):
         self.fired = []
 
-    def fire_due(self, job_id, *, fire_at=None, adapters=None, loop=None):
+    def fire_due(self, job_id, *, adapters=None, loop=None):
         self.fired.append(job_id)
-        self.fire_at = fire_at
         return True
 
 
@@ -69,7 +58,7 @@ async def test_valid_fire_reservation_blocks_drain_before_body_and_task(adapter,
     release_fire = threading.Event()
 
     class BlockingProvider:
-        def fire_due(self, job_id, *, fire_at=None, adapters=None, loop=None):
+        def fire_due(self, job_id, *, adapters=None, loop=None):
             fired.set()
             release_fire.wait(timeout=2)
             return True
@@ -84,7 +73,7 @@ async def test_valid_fire_reservation_blocks_drain_before_body_and_task(adapter,
     monkeypatch.setattr("cron.scheduler_provider.resolve_cron_scheduler", BlockingProvider)
     monkeypatch.setattr(
         "plugins.cron_providers.chronos.verify.get_fire_verifier",
-        lambda: (lambda **kw: _claims()),
+        lambda: (lambda **kw: {"purpose": "cron_fire"}),
     )
     app = _create_app(adapter)
     with patch("gateway.run._gateway_runner_ref", lambda: runner), patch.object(
@@ -95,7 +84,7 @@ async def test_valid_fire_reservation_blocks_drain_before_body_and_task(adapter,
                 cli.post(
                     "/api/cron/fire",
                     headers={"Authorization": "Bearer good"},
-                    json={"job_id": "abc123", "fire_at": _FIRE_AT},
+                    json={"job_id": "abc123"},
                 )
             )
             await body_started.wait()
@@ -122,7 +111,7 @@ async def test_missing_job_id_400(adapter, monkeypatch):
     monkeypatch.setattr("cron.scheduler_provider.resolve_cron_scheduler", lambda: spy)
     monkeypatch.setattr(
         "plugins.cron_providers.chronos.verify.get_fire_verifier",
-        lambda: (lambda **kw: _claims("j9")),
+        lambda: (lambda **kw: {"purpose": "cron_fire"}),
     )
 
     app = _create_app(adapter)
@@ -142,7 +131,7 @@ async def test_fire_does_not_require_api_server_key(adapter, monkeypatch):
     monkeypatch.setattr("cron.scheduler_provider.resolve_cron_scheduler", lambda: spy)
     monkeypatch.setattr(
         "plugins.cron_providers.chronos.verify.get_fire_verifier",
-        lambda: (lambda **kw: _claims("j9")),
+        lambda: (lambda **kw: {"purpose": "cron_fire"}),
     )
 
     app = _create_app(adapter)
@@ -150,7 +139,7 @@ async def test_fire_does_not_require_api_server_key(adapter, monkeypatch):
         # Bearer is the FIRE token, not the API_SERVER_KEY "sk-secret".
         resp = await cli.post("/api/cron/fire",
                               headers={"Authorization": "Bearer nas-jwt"},
-                              json={"job_id": "j9", "fire_at": _FIRE_AT})
+                              json={"job_id": "j9"})
         assert resp.status == 202
     for _ in range(50):
         if spy.fired:

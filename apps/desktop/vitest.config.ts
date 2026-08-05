@@ -20,16 +20,12 @@ const electronNative: TestProjectConfiguration = {
   test: {
     name: 'electron',
     environment: 'node',
-    include:
-      process.platform === 'win32'
-        ? ['electron/**/*.test.ts', 'scripts/**.test.ts']
-        : ['electron/**/*.test.ts', 'scripts/**.test.{ts,mjs}']
+    include: ['electron/**/*.test.ts', 'scripts/**.test.{ts,mjs}']
   }
 }
 
 export default defineConfig({
   test: {
-    maxWorkers: 4,
     projects: [reactUi, electronNative]
   }
 })

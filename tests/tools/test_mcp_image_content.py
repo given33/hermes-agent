@@ -57,7 +57,7 @@ class TestCacheMcpImageBlock:
 
         block = SimpleNamespace(
             data=base64.b64encode(_png_bytes()).decode("ascii"),
-            mime_type="image/png",
+            mimeType="image/png",
         )
         tag = _cache_mcp_image_block(block)
         assert tag.startswith("MEDIA:"), f"expected MEDIA: tag, got {tag!r}"
@@ -80,7 +80,7 @@ class TestCacheMcpImageBlock:
 
         block = SimpleNamespace(
             data=base64.b64encode(b"some bytes").decode("ascii"),
-            mime_type="application/pdf",
+            mimeType="application/pdf",
         )
         assert _cache_mcp_image_block(block) == ""
 
@@ -88,7 +88,7 @@ class TestCacheMcpImageBlock:
         monkeypatch.setenv("HERMES_HOME", str(tmp_path))
         from tools.mcp_tool import _cache_mcp_image_block
 
-        block = SimpleNamespace(data=None, mime_type="image/png")
+        block = SimpleNamespace(data=None, mimeType="image/png")
         assert _cache_mcp_image_block(block) == ""
 
 
@@ -101,7 +101,7 @@ class TestCacheMcpImageBlock:
 
         block = SimpleNamespace(
             data=base64.b64encode(b"<html>error</html>").decode("ascii"),
-            mime_type="image/png",
+            mimeType="image/png",
         )
         assert _cache_mcp_image_block(block) == ""
 
@@ -114,7 +114,7 @@ class TestCacheMcpImageBlock:
         jpeg = b"\xff\xd8\xff\xe0" + b"\x00" * 100 + b"\xff\xd9"
         block = SimpleNamespace(
             data=base64.b64encode(jpeg).decode("ascii"),
-            mime_type="image/jpeg",
+            mimeType="image/jpeg",
         )
         tag = _cache_mcp_image_block(block)
         assert tag.startswith("MEDIA:")

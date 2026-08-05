@@ -49,6 +49,6 @@ class TestNamedProfileMultiplexerGuard:
         (tmp_path / "gateway.pid").write_text("12345", encoding="utf-8")
         monkeypatch.setattr(status, "_read_pid_record", lambda p: {"pid": 12345})
         monkeypatch.setattr(status, "_pid_from_record", lambda rec: 12345)
-        monkeypatch.setattr(gw, "_pid_exists", lambda pid: True)
+        monkeypatch.setattr(status, "_pid_exists", lambda pid: True)
 
 

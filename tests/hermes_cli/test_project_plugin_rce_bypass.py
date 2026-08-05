@@ -1,4 +1,4 @@
-﻿"""Regression coverage for GHSA-5qr3-c538-wm9j (#29156) — Remote Code
+"""Regression coverage for GHSA-5qr3-c538-wm9j (#29156) — Remote Code
 Execution via the ``HERMES_ENABLE_PROJECT_PLUGINS`` bypass in the web
 server's dashboard plugin loader.
 
@@ -46,9 +46,9 @@ def _reset_plugin_cache(monkeypatch):
     cache before *and* after each test so leakage between tests can't
     mask a regression — and so the production cache the import-time
     ``_mount_plugin_api_routes()`` populated doesn't bleed in."""
-    web_server.get_runtime_state().dashboard_plugins_cache = None
+    web_server._dashboard_plugins_cache = None
     yield
-    web_server.get_runtime_state().dashboard_plugins_cache = None
+    web_server._dashboard_plugins_cache = None
 
 
 def _write_plugin_manifest(root: Path, name: str, manifest: dict) -> Path:
@@ -229,7 +229,7 @@ class TestMountApiRoutesRefusesUntrusted:
 
     def test_project_source_api_is_not_imported(self, tmp_path):
         plugin = self._payload_plugin(tmp_path, source="project")
-        web_server.get_runtime_state().dashboard_plugins_cache = [plugin]
+        web_server._dashboard_plugins_cache = [plugin]
         with patch("importlib.util.spec_from_file_location") as spec:
             web_server._mount_plugin_api_routes()
         assert spec.call_count == 0, (
@@ -244,7 +244,7 @@ class TestMountApiRoutesRefusesUntrusted:
         file outside the dashboard dir."""
         plugin = self._payload_plugin(tmp_path, source="user",
                                        api_file="../../../tmp/evil.py")
-        web_server.get_runtime_state().dashboard_plugins_cache = [plugin]
+        web_server._dashboard_plugins_cache = [plugin]
         with patch("importlib.util.spec_from_file_location") as spec:
             web_server._mount_plugin_api_routes()
         assert spec.call_count == 0

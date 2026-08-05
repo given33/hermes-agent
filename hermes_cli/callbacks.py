@@ -10,9 +10,8 @@ import queue
 import time as _time
 
 from hermes_cli.banner import cprint, _DIM, _RST
-from hermes_cli.credential_lifecycle import save_env_value_secure
-from hermes_runtime.config import load_config, load_config_readonly
-from hermes_runtime.secret_prompt import masked_secret_prompt
+from hermes_cli.config import save_env_value_secure
+from hermes_cli.secret_prompt import masked_secret_prompt
 from hermes_constants import display_hermes_home
 
 
@@ -25,11 +24,12 @@ def clarify_callback(cli, question, choices, multi_select=False):
     When ``multi_select`` is True, shows checkboxes and the user can
     select multiple options with Space, confirming with Enter.
     """
+    from cli import CLI_CONFIG
     from tools.clarify_gateway import resolve_clarify_timeout
 
     # Canonical clarify timeout, shared with the gateway/TUI path. `<= 0`
     # means unlimited (never auto-skip mid-think) → a null deadline.
-    timeout = resolve_clarify_timeout(load_config_readonly())
+    timeout = resolve_clarify_timeout(CLI_CONFIG)
     response_queue = queue.Queue()
     is_open_ended = not choices
     effective_multi = multi_select and not is_open_ended
@@ -211,7 +211,8 @@ def approval_callback(cli, command: str, description: str) -> str:
         lock = cli._approval_lock
 
     with lock:
-        timeout = load_config_readonly().get("approvals", {}).get("timeout", 300)
+        from cli import CLI_CONFIG
+        timeout = CLI_CONFIG.get("approvals", {}).get("timeout", 300)
         response_queue = queue.Queue()
         choices = ["once", "session", "always", "deny"]
         if len(command) > 70:

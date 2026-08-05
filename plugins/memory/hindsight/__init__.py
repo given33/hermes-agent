@@ -49,7 +49,7 @@ from agent.secret_scope import get_secret
 from agent.memory_provider import MemoryProvider
 from hermes_constants import get_hermes_home
 from tools.registry import tool_error
-from hermes_runtime.config import cfg_get
+from hermes_cli.config import cfg_get
 
 logger = logging.getLogger(__name__)
 
@@ -602,8 +602,6 @@ def _validate_profile_env_permissions(profile_env) -> None:
 
 def _materialize_embedded_profile_env(config: dict[str, Any], *, llm_api_key: str | None = None):
     """Write the profile-scoped env file that standalone hindsight-embed uses."""
-    from utils import write_secret_file
-
     profile_env = _embedded_profile_env_path(config)
     profile_env.parent.mkdir(parents=True, exist_ok=True)
     env_values = _build_embedded_profile_env(config, llm_api_key=llm_api_key)
@@ -848,8 +846,8 @@ class HindsightMemoryProvider(MemoryProvider):
         import sys
         from pathlib import Path
 
-        from hermes_runtime.config import save_config
-        from hermes_runtime.secret_prompt import masked_secret_prompt
+        from hermes_cli.config import save_config
+        from hermes_cli.secret_prompt import masked_secret_prompt
 
         from hermes_cli.memory_setup import _CANCELLED, _curses_select, _print_cancelled_setup
 

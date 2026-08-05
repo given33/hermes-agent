@@ -8,7 +8,6 @@ their respective plugin subsystems (``plugins/image_gen/deepinfra`` and
 the TTS/STT dispatchers in ``tools/``).
 """
 
-from agent import model_catalog
 from providers import register_provider
 from providers.base import ProviderProfile
 
@@ -35,7 +34,8 @@ class _DeepInfraProfile(ProviderProfile):
         if not (get_secret("DEEPINFRA_API_KEY") or "").strip():
             return None
         try:
-            items = model_catalog.fetch_deepinfra_models_by_tag("chat")
+            from hermes_cli.models import _fetch_deepinfra_models_by_tag
+            items = _fetch_deepinfra_models_by_tag("chat")
         except Exception:
             return None
         for item in items or []:

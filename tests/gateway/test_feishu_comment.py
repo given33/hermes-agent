@@ -138,57 +138,5 @@ class TestWikiReverseLookup(unittest.TestCase):
         self.assertEqual(query_dict["obj_type"], "docx")
 
 
-class TestDocumentSessionCache(unittest.TestCase):
-    def setUp(self):
-        from plugins.platforms.feishu import feishu_comment
-
-        self.cache = feishu_comment
-        with self.cache._session_cache_lock:
-            self.cache._session_cache.clear()
-
-    def tearDown(self):
-        with self.cache._session_cache_lock:
-            self.cache._session_cache.clear()
-
-    @staticmethod
-    def _messages(label):
-        return [{"role": "user", "content": label}]
-
-    def test_saving_new_document_prunes_unrelated_expired_sessions(self):
-        with patch.object(self.cache, "_SESSION_TTL_S", 10), \
-             patch.object(self.cache._time, "monotonic", side_effect=[0, 20]):
-            self.cache._save_session_history("old", self._messages("old"))
-            self.cache._save_session_history("new", self._messages("new"))
-
-        self.assertEqual(list(self.cache._session_cache), ["new"])
-
-    def test_least_recently_used_session_is_evicted_at_capacity(self):
-        with patch.object(self.cache, "_SESSION_MAX_ENTRIES", 2), \
-             patch.object(self.cache._time, "monotonic", side_effect=[1, 2, 3, 4]):
-            self.cache._save_session_history("first", self._messages("first"))
-            self.cache._save_session_history("second", self._messages("second"))
-            self.assertEqual(
-                self.cache._load_session_history("first"),
-                self._messages("first"),
-            )
-            self.cache._save_session_history("third", self._messages("third"))
-
-        self.assertEqual(list(self.cache._session_cache), ["first", "third"])
-        self.assertEqual(self.cache._load_session_history("second"), [])
-
-    def test_many_document_tokens_never_exceed_capacity(self):
-        with patch.object(self.cache, "_SESSION_MAX_ENTRIES", 3), \
-             patch.object(self.cache._time, "monotonic", side_effect=range(10)):
-            for index in range(10):
-                self.cache._save_session_history(
-                    f"document-{index}", self._messages(str(index))
-                )
-
-        self.assertEqual(
-            list(self.cache._session_cache),
-            ["document-7", "document-8", "document-9"],
-        )
-
-
 if __name__ == "__main__":
     unittest.main()

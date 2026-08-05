@@ -71,7 +71,7 @@ Examples:
         action="store_true",
         help=(
             "Disable upload-time secret redaction (default: redact). Logs "
-            "are normally run through hermes_runtime.redaction.redact_sensitive_text "
+            "are normally run through agent.redact.redact_sensitive_text "
             "with force=True before upload so credentials are not leaked "
             "into the public paste service."
         ),

@@ -270,9 +270,9 @@ def _image_data_url(data: bytes, mime_type: str) -> str:
 def _path_from_file_uri(uri: str) -> Path | None:
     """Convert local file URIs/paths from ACP clients into a readable Path.
 
-    Zed may send POSIX file URIs from Linux/WSL workspaces or Windows drive
-    paths. Preserve native drive paths when Hermes runs on Windows; translate
-    them to /mnt/<drive>/... only for POSIX/WSL runtimes.
+    Zed may send POSIX file URIs from Linux/WSL workspaces or Windows-ish paths
+    when launched through wsl.exe. Translate the common Windows drive form to
+    /mnt/<drive>/... so Hermes running in WSL can read it.
     """
     raw = (uri or "").strip()
     if not raw:
@@ -293,14 +293,10 @@ def _path_from_file_uri(uri: str) -> Path | None:
     if len(path_text) >= 3 and path_text[0] == "/" and path_text[2] == ":" and path_text[1].isalpha():
         drive = path_text[1].lower()
         rest = path_text[3:].lstrip("/\\").replace("\\", "/")
-        if os.name == "nt":
-            return Path(f"{drive.upper()}:/{rest}")
         return Path("/mnt") / drive / rest
     if len(path_text) >= 2 and path_text[1] == ":" and path_text[0].isalpha():
         drive = path_text[0].lower()
         rest = path_text[2:].lstrip("/\\").replace("\\", "/")
-        if os.name == "nt":
-            return Path(f"{drive.upper()}:/{rest}")
         return Path("/mnt") / drive / rest
 
     return Path(path_text)
@@ -312,11 +308,10 @@ def _decode_text_bytes(data: bytes, mime_type: str | None) -> str | None:
         return None
     for encoding in ("utf-8-sig", "utf-8", "latin-1"):
         try:
-            decoded = data.decode(encoding)
-            return decoded.replace("\r\n", "\n").replace("\r", "\n")
+            return data.decode(encoding)
         except UnicodeDecodeError:
             continue
-    return data.decode("utf-8", errors="replace").replace("\r\n", "\n").replace("\r", "\n")
+    return data.decode("utf-8", errors="replace")
 
 
 def _format_resource_text(
@@ -832,7 +827,7 @@ class HermesACPAgent(acp.Agent):
         new_model = raw_model.strip()
 
         try:
-            from agent.model_catalog import detect_provider_for_model, parse_model_input
+            from hermes_cli.models import detect_provider_for_model, parse_model_input
 
             target_provider, new_model = parse_model_input(new_model, current_provider)
             if target_provider == current_provider:
@@ -1862,7 +1857,7 @@ class HermesACPAgent(acp.Agent):
             # inside a contextvars.copy_context() below, so the ContextVar
             # write is isolated from other concurrent ACP sessions.
             try:
-                from hermes_runtime.session_context import (
+                from gateway.session_context import (
                     clear_session_vars,
                     set_session_vars,
                 )

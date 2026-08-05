@@ -92,11 +92,6 @@ class TestResolveCommand:
 
 
 
-    def test_nous_account_commands_are_not_exposed(self):
-        assert resolve_command("subscription") is None
-        assert resolve_command("upgrade") is None
-        assert resolve_command("topup") is None
-
 
 # ---------------------------------------------------------------------------
 # Derived dicts (backwards compat)

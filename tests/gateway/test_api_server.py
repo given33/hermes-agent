@@ -31,10 +31,8 @@ from gateway.platforms.api_server import (
     APIServerAdapter,
     ResponseStore,
     _IdempotencyCache,
-    _api_request_profile,
     _derive_chat_session_id,
     _hermes_version,
-    _idempotency_namespace,
     _redact_api_error_text,
     _request_agent_overrides,
     check_api_server_requirements,
@@ -123,48 +121,6 @@ class TestResponseStore:
 
 
 class TestIdempotencyCache:
-    def test_request_namespace_changes_across_execution_boundaries(self):
-        request = MagicMock()
-        request.headers = {"Authorization": "Bearer client-a"}
-
-        token = _api_request_profile.set("profile-a")
-        try:
-            base = _idempotency_namespace(
-                request,
-                endpoint="chat.completions",
-                gateway_session_key="session-a",
-            )
-            other_endpoint = _idempotency_namespace(
-                request,
-                endpoint="responses",
-                gateway_session_key="session-a",
-            )
-            other_session = _idempotency_namespace(
-                request,
-                endpoint="chat.completions",
-                gateway_session_key="session-b",
-            )
-            request.headers = {"Authorization": "Bearer client-b"}
-            other_auth = _idempotency_namespace(
-                request,
-                endpoint="chat.completions",
-                gateway_session_key="session-a",
-            )
-            request.headers = {"Authorization": "Bearer client-a"}
-            profile_token = _api_request_profile.set("profile-b")
-            try:
-                other_profile = _idempotency_namespace(
-                    request,
-                    endpoint="chat.completions",
-                    gateway_session_key="session-a",
-                )
-            finally:
-                _api_request_profile.reset(profile_token)
-        finally:
-            _api_request_profile.reset(token)
-
-        assert len({base, other_endpoint, other_session, other_auth, other_profile}) == 5
-
     @pytest.mark.asyncio
     async def test_concurrent_same_key_and_fingerprint_runs_once(self):
         cache = _IdempotencyCache()
@@ -752,8 +708,7 @@ class TestHealthDetailedEndpoint:
             "active_agents": 2,
             "exit_reason": None,
             "updated_at": "2026-04-14T00:00:00Z",
-        }), patch("gateway.run._resolve_gateway_model", return_value="test/model"), \
-                patch("gateway.readiness._probe_disk", return_value={"status": "ok"}):
+        }), patch("gateway.run._resolve_gateway_model", return_value="test/model"):
             async with TestClient(TestServer(app)) as cli:
                 resp = await cli.get("/health/detailed")
                 assert resp.status == 200
@@ -1098,104 +1053,6 @@ class TestChatCompletionsEndpoint:
         assert kwargs["requested_provider"] == "minimax"
         assert kwargs["model_options"] == model_options
 
-
-    @pytest.mark.asyncio
-    async def test_idempotency_key_is_scoped_to_session(self, auth_adapter):
-        body = {
-            "model": "hermes-agent",
-            "messages": [{"role": "user", "content": "same request"}],
-        }
-        usage = {"input_tokens": 1, "output_tokens": 1, "total_tokens": 2}
-        results = [
-            ({"final_response": "session-a", "messages": []}, usage),
-            ({"final_response": "session-b", "messages": []}, usage),
-        ]
-        base_headers = {
-            "Authorization": "Bearer sk-secret",
-            "Idempotency-Key": "shared-client-key",
-        }
-
-        app = _create_app(auth_adapter)
-        async with TestClient(TestServer(app)) as cli:
-            with patch.object(
-                auth_adapter,
-                "_run_agent",
-                new_callable=AsyncMock,
-                side_effect=results,
-            ) as run_agent:
-                first = await cli.post(
-                    "/v1/chat/completions",
-                    json=body,
-                    headers={**base_headers, "X-Hermes-Session-Key": "session-a"},
-                )
-                first_data = await first.json()
-                second = await cli.post(
-                    "/v1/chat/completions",
-                    json=body,
-                    headers={**base_headers, "X-Hermes-Session-Key": "session-b"},
-                )
-                second_data = await second.json()
-                replay = await cli.post(
-                    "/v1/chat/completions",
-                    json=body,
-                    headers={**base_headers, "X-Hermes-Session-Key": "session-a"},
-                )
-                replay_data = await replay.json()
-
-        assert first_data["choices"][0]["message"]["content"] == "session-a"
-        assert second_data["choices"][0]["message"]["content"] == "session-b"
-        assert replay_data["choices"][0]["message"]["content"] == "session-a"
-        assert run_agent.await_count == 2
-
-    @pytest.mark.asyncio
-    async def test_idempotency_cache_is_not_shared_between_authenticated_adapters(self):
-        first_adapter = _make_adapter(api_key="adapter-alpha-secret")
-        second_adapter = _make_adapter(api_key="adapter-beta-secret")
-        body = {
-            "model": "hermes-agent",
-            "messages": [{"role": "user", "content": "same request"}],
-        }
-        usage = {"input_tokens": 1, "output_tokens": 1, "total_tokens": 2}
-        client_key = f"cross-adapter-{uuid.uuid4()}"
-
-        with patch.object(
-            first_adapter,
-            "_run_agent",
-            new_callable=AsyncMock,
-            return_value=({"final_response": "alpha", "messages": []}, usage),
-        ) as first_run:
-            async with TestClient(TestServer(_create_app(first_adapter))) as cli:
-                first = await cli.post(
-                    "/v1/chat/completions",
-                    json=body,
-                    headers={
-                        "Authorization": "Bearer adapter-alpha-secret",
-                        "Idempotency-Key": client_key,
-                    },
-                )
-                first_data = await first.json()
-
-        with patch.object(
-            second_adapter,
-            "_run_agent",
-            new_callable=AsyncMock,
-            return_value=({"final_response": "beta", "messages": []}, usage),
-        ) as second_run:
-            async with TestClient(TestServer(_create_app(second_adapter))) as cli:
-                second = await cli.post(
-                    "/v1/chat/completions",
-                    json=body,
-                    headers={
-                        "Authorization": "Bearer adapter-beta-secret",
-                        "Idempotency-Key": client_key,
-                    },
-                )
-                second_data = await second.json()
-
-        assert first_data["choices"][0]["message"]["content"] == "alpha"
-        assert second_data["choices"][0]["message"]["content"] == "beta"
-        first_run.assert_awaited_once()
-        second_run.assert_awaited_once()
 
     @pytest.mark.asyncio
     async def test_stream_task_done_callback_enqueues_eos_for_chat_completions(self, adapter):

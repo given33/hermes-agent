@@ -192,7 +192,7 @@ def _sync_allowlist_add(platform: str, user_id: str) -> None:
         return  # Already covered.
     ids.append(str(user_id))
     try:
-        from hermes_runtime.config import save_env_value
+        from hermes_cli.config import save_env_value
 
         save_env_value(env_var, ",".join(ids))
     except Exception:
@@ -316,7 +316,7 @@ def _sync_allowlist_remove(platform: str, user_id: str) -> None:
     if len(remaining) == len(ids):
         return  # Not present.
     try:
-        from hermes_runtime.config import save_env_value, remove_env_value
+        from hermes_cli.config import save_env_value, remove_env_value
 
         if remaining:
             save_env_value(env_var, ",".join(remaining))

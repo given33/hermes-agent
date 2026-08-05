@@ -48,8 +48,6 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
-from utils import atomic_json_write
-
 try:
     import httpx
 except ImportError:  # pragma: no cover - httpx is a hermes dependency
@@ -122,8 +120,8 @@ def _auth_json_path() -> Path:
         return Path(os.path.expanduser("~/.hermes")) / "auth.json"
 
 
-def _load_auth(path: Optional[Path] = None) -> Dict[str, Any]:
-    path = path or _auth_json_path()
+def _load_auth() -> Dict[str, Any]:
+    path = _auth_json_path()
     if not path.exists():
         return {}
     try:
@@ -363,7 +361,7 @@ def _persist_runtime_env(spectrum_project_id: str, project_secret: str) -> None:
     caller — same CodeQL-clean-flow rationale as the rest of this module.
     """
     try:
-        from hermes_runtime.config import save_env_value
+        from hermes_cli.config import save_env_value
     except ImportError:
         logger.warning("photon: hermes_cli.config unavailable — skipping .env write")
         return
@@ -1035,7 +1033,7 @@ def _configured_operator_phone() -> Optional[str]:
 
 def _get_config_env_value(key: str) -> Optional[str]:
     try:
-        from hermes_runtime.config import get_env_value
+        from hermes_cli.config import get_env_value
     except Exception:
         return os.getenv(key)
     return get_env_value(key)

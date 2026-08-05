@@ -27,7 +27,7 @@ import uuid
 from types import SimpleNamespace
 from typing import Any, Dict, Optional
 
-from hermes_runtime.timeouts import get_provider_request_timeout, get_provider_stale_timeout
+from hermes_cli.timeouts import get_provider_request_timeout, get_provider_stale_timeout
 from hermes_constants import PARTIAL_STREAM_STUB_ID, FINISH_REASON_LENGTH
 from agent.error_classifier import FailoverReason
 from agent.errors import EmptyStreamError
@@ -1455,7 +1455,7 @@ def build_assistant_message(agent, assistant_message, finish_reason: str) -> dic
     # Respects HERMES_REDACT_SECRETS via redact_sensitive_text — no-op
     # when disabled. (#19798)
     if isinstance(_san_content, str) and _san_content:
-        from hermes_runtime.redaction import redact_sensitive_text
+        from agent.redact import redact_sensitive_text
         _san_content = redact_sensitive_text(_san_content)
 
     # NOTE (empty-content class fix): textless assistant turns are NOT padded
@@ -1475,11 +1475,6 @@ def build_assistant_message(agent, assistant_message, finish_reason: str) -> dic
         "reasoning": reasoning_text,
         "finish_reason": finish_reason,
     }
-    hook_trace = getattr(assistant_message, "hermes_hook_trace", None)
-    if isinstance(hook_trace, list) and all(
-        isinstance(item, dict) for item in hook_trace
-    ):
-        msg["hook_trace"] = [dict(item) for item in hook_trace]
 
     raw_reasoning_content = getattr(assistant_message, "reasoning_content", None)
     if raw_reasoning_content is None and hasattr(assistant_message, "model_extra"):
@@ -1682,7 +1677,7 @@ def _fallback_entry_unavailable_without_network(agent, fb: dict) -> Optional[str
     if fb_provider != "nous":
         return None
     try:
-        from agent.provider_auth import get_provider_auth_state
+        from hermes_cli.auth import get_provider_auth_state
 
         state = get_provider_auth_state("nous") or {}
     except Exception as exc:
@@ -1816,7 +1811,7 @@ def try_activate_fallback(agent, reason: "FailoverReason | None" = None) -> bool
             unavailable.add(fb_key)
             return agent._try_activate_fallback(reason)  # try next in chain
         try:
-            from agent.model_normalize import normalize_model_for_provider
+            from hermes_cli.model_normalize import normalize_model_for_provider
 
             fb_model = normalize_model_for_provider(fb_model, fb_provider)
         except Exception as _norm_err:
@@ -2020,7 +2015,7 @@ def try_activate_fallback(agent, reason: "FailoverReason | None" = None) -> bool
         # (YAML boolean False = disabled). Wrapped in try/except because a
         # config load failure must not kill the swap.
         try:
-            from hermes_runtime.config import load_config
+            from hermes_cli.config import load_config
             from hermes_constants import resolve_reasoning_config
 
             agent.reasoning_config = resolve_reasoning_config(
@@ -2126,13 +2121,7 @@ def handle_max_iterations(agent, messages: list, api_call_count: int) -> str:
             # timestamp (preserved on gateway user replay entries for the
             # stale-confirmation expiry check — #47868 rejection class),
             # and every Hermes-internal underscore-prefixed scaffolding key.
-            for schema_foreign in (
-                "tool_name",
-                "codex_reasoning_items",
-                "codex_message_items",
-                "timestamp",
-                "hook_trace",
-            ):
+            for schema_foreign in ("tool_name", "codex_reasoning_items", "codex_message_items", "timestamp"):
                 api_msg.pop(schema_foreign, None)
             # api_content (the persist-what-you-send sidecar) carries the
             # exact bytes every main-loop call sent for this message —

@@ -466,19 +466,6 @@ class TestBuildCallKwargsMaxTokens:
 
 
 
-    def test_keeps_max_tokens_for_hubway_gpt_56(self):
-        from agent.auxiliary_client import _build_call_kwargs
-
-        kwargs = _build_call_kwargs(
-            provider="custom",
-            model="gpt-5.6-sol",
-            messages=[{"role": "user", "content": "hi"}],
-            max_tokens=4096,
-            base_url="https://hubway.cc/v1",
-        )
-
-        assert kwargs["max_tokens"] == 4096
-
 
 class TestNousTagsScoping:
     def test_tags_injected_when_provider_is_nous(self, monkeypatch):
@@ -1198,7 +1185,7 @@ class TestVisionClientFallback:
 
 class TestAuxiliaryPoolAwareness:
 
-    def test_try_nous_uses_direct_pool_key_without_portal_refresh(self):
+    def test_try_nous_refreshes_stale_pool_entry(self):
         stale_token = _jwt_with_claims({
             "scope": "inference:invoke",
             "exp": int(time.time() - 60),
@@ -1239,7 +1226,7 @@ class TestAuxiliaryPoolAwareness:
 
             client, model = _try_nous()
 
-        assert pool.refreshed is False
+        assert pool.refreshed is True
         assert client is not None
         assert model == _NOUS_MODEL
         assert mock_openai.call_args.kwargs["api_key"] == fresh_token
@@ -2542,14 +2529,13 @@ class TestAuxiliaryAuthRefreshRetry:
     def test_refresh_provider_credentials_force_refreshes_anthropic_oauth_and_evicts_cache(self, monkeypatch):
         stale_client = MagicMock()
         cache_key = ("anthropic", False, None, None, None)
-        patched_cache = {cache_key: (stale_client, "claude-haiku-4-5-20251001", None)}
 
         monkeypatch.setenv("ANTHROPIC_TOKEN", "")
         monkeypatch.setenv("CLAUDE_CODE_OAUTH_TOKEN", "")
         monkeypatch.setenv("ANTHROPIC_API_KEY", "")
 
         with (
-            patch("agent.auxiliary_client._client_cache", patched_cache),
+            patch("agent.auxiliary_client._client_cache", {cache_key: (stale_client, "claude-haiku-4-5-20251001", None)}),
             patch("agent.anthropic_adapter.read_claude_code_credentials", return_value={
                 "accessToken": "expired-token",
                 "refreshToken": "refresh-token",
@@ -2568,13 +2554,7 @@ class TestAuxiliaryAuthRefreshRetry:
 
         mock_refresh_oauth.assert_called_once_with("refresh-token", use_json=False)
         mock_write.assert_called_once_with("fresh-token", "refresh-token-2", 9999999999999)
-        # Eviction drops the cache reference so the next call rebuilds with
-        # fresh creds — but it must NOT force-close the stale client: sibling
-        # threads (MoA fan-out) may still be mid-request on it, and a close
-        # here surfaces as a spurious APIConnectionError in those threads.
-        # GC closes it once the in-flight users release their references.
-        assert patched_cache == {}
-        stale_client.close.assert_not_called()
+        stale_client.close.assert_called_once()
 
     def test_refresh_provider_credentials_remints_vertex_token_and_evicts_cache(self):
         """Vertex tokens live ~1h; on a long-running gateway the cached

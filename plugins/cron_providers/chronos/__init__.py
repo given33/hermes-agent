@@ -38,7 +38,7 @@ logger = logging.getLogger("cron.chronos")
 def _cfg(*keys: str, default: Any = "") -> Any:
     """Read a cron.chronos.* config value (no network)."""
     try:
-        from hermes_runtime.config import cfg_get, load_config
+        from hermes_cli.config import cfg_get, load_config
         return cfg_get(load_config(), *keys, default=default)
     except Exception:
         return default
@@ -81,7 +81,7 @@ class ChronosCronScheduler(CronScheduler):
         refresh-aware token is resolved lazily at provision time.
         """
         try:
-            from agent.provider_auth import get_provider_auth_state
+            from hermes_cli.auth import get_provider_auth_state
             state = get_provider_auth_state("nous") or {}
             return bool(state.get("access_token"))
         except Exception:
@@ -216,14 +216,7 @@ class ChronosCronScheduler(CronScheduler):
 
     # -- fire -------------------------------------------------------------
 
-    def fire_due(
-        self,
-        job_id: str,
-        *,
-        fire_at: str | None = None,
-        adapters: Any = None,
-        loop: Any = None,
-    ) -> bool:
+    def fire_due(self, job_id: str, *, adapters: Any = None, loop: Any = None) -> bool:
         """Run the due job (claim + run_one_job via the ABC default), then
         re-arm the NEXT one-shot through NAS.
 
@@ -231,12 +224,7 @@ class ChronosCronScheduler(CronScheduler):
         If the job is gone (one-shot completed / repeat-N exhausted), get_job
         returns None → nothing to re-arm (the schedule naturally stops).
         """
-        ran = super().fire_due(
-            job_id,
-            fire_at=fire_at,
-            adapters=adapters,
-            loop=loop,
-        )
+        ran = super().fire_due(job_id, adapters=adapters, loop=loop)
         if ran:
             from cron.jobs import get_job
             job = get_job(job_id)

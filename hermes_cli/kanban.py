@@ -182,7 +182,7 @@ def _check_dispatcher_presence(
 
     # Even if the gateway is up, dispatch_in_gateway may be off.
     try:
-        from hermes_runtime.config import load_config
+        from hermes_cli.config import load_config
         cfg = load_config()
         dispatch_on = bool(cfg.get("kanban", {}).get("dispatch_in_gateway", True))
     except Exception:
@@ -1700,7 +1700,7 @@ def _cmd_show(args: argparse.Namespace) -> int:
         print(f"  max-retries: {task.max_retries} (task)")
     else:
         try:
-            from hermes_runtime.config import load_config
+            from hermes_cli.config import load_config
             cfg = load_config()
             cfg_val = (cfg.get("kanban", {}) or {}).get("failure_limit")
         except Exception:
@@ -1867,7 +1867,7 @@ def _cmd_diagnostics(args: argparse.Namespace) -> int:
     the dashboard uses, so CLI output matches what the UI shows.
     """
     from hermes_cli import kanban_diagnostics as kd
-    from hermes_runtime.config import load_config
+    from hermes_cli.config import load_config
 
     diag_config = kd.config_from_runtime_config(load_config())
 
@@ -2442,7 +2442,7 @@ def _cmd_dispatch(args: argparse.Namespace) -> int:
     # matches whether the user runs the CLI directly or relies on the
     # gateway-embedded dispatcher.
     try:
-        from hermes_runtime.config import load_config
+        from hermes_cli.config import load_config
         _cfg = load_config()
         _kanban_cfg = _cfg.get("kanban", {}) if isinstance(_cfg, dict) else {}
         default_assignee = (_kanban_cfg.get("default_assignee") or "").strip() or None
@@ -3158,20 +3158,6 @@ Read-only commands are safe while an agent is running.\
 """
 
 
-def _split_slash_command(rest: str) -> list[str]:
-    """Split chat slash commands without corrupting native Windows paths."""
-    if os.name != "nt":
-        return shlex.split(rest)
-
-    tokens = shlex.split(rest, posix=False)
-    return [
-        token[1:-1]
-        if len(token) >= 2 and token[0] == token[-1] and token[0] in {'"', "'"}
-        else token
-        for token in tokens
-    ]
-
-
 def run_slash(rest: str) -> str:
     """Execute a ``/kanban …`` string and return captured stdout/stderr.
 
@@ -3182,7 +3168,7 @@ def run_slash(rest: str) -> str:
     import io
     import contextlib
 
-    tokens = _split_slash_command(rest) if rest and rest.strip() else []
+    tokens = shlex.split(rest) if rest and rest.strip() else []
 
     # Bare ``/kanban`` or ``/kanban help`` / ``--help`` / ``-h`` / ``?``:
     # show the curated short-help block instead of dumping argparse's full

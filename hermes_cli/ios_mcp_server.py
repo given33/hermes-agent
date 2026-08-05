@@ -31,7 +31,7 @@ from hermes_cli.ios_intelligence import (
 from hermes_cli.ios_intelligence_config import load_ios_intelligence_config
 
 if TYPE_CHECKING:
-    from mcp.server import MCPServer
+    from mcp.server.fastmcp import FastMCP as MCPServer
 
 
 CAPABILITIES = (
@@ -712,7 +712,7 @@ def create_mcp_server(
 ) -> MCPServer:
     """Build a server exposing tools for exactly one capability."""
 
-    from mcp.server import MCPServer
+    from mcp.server.fastmcp import FastMCP
 
     capability = str(capability).strip().lower()
     if capability not in CAPABILITIES:
@@ -720,7 +720,7 @@ def create_mcp_server(
     effective_scopes = normalize_mcp_scope_grants(capability, granted_scopes)
     enforcer = _ScopeEnforcer(capability, effective_scopes)
     store = store or IOSIntelligenceStore(os.getenv("HERMES_IOS_INTELLIGENCE_DIR") or None)
-    mcp = MCPServer(
+    mcp = FastMCP(
         capability,
         instructions=(
             f"Native iOS capability: {capability}. These tools contain the account's live, "
@@ -728,6 +728,9 @@ def create_mcp_server(
             "when the user's normal chat request depends on this information; the user does "
             "not need to ask for an MCP call explicitly. Never invent missing device data."
         ),
+        host=host,
+        port=port,
+        stateless_http=True,
     )
     mcp.granted_scopes = effective_scopes  # type: ignore[attr-defined]
 
@@ -1345,12 +1348,7 @@ def main(argv: list[str] | None = None) -> int:
         port=args.port,
         granted_scopes=args.grant_scope,
     )
-    run_kwargs: dict[str, Any] = {}
-    if args.transport != "stdio":
-        run_kwargs.update(host=args.host, port=args.port)
-    if args.transport == "streamable-http":
-        run_kwargs["stateless_http"] = True
-    server.run(transport=args.transport, **run_kwargs)
+    server.run(transport=args.transport)
     return 0
 
 

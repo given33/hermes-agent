@@ -103,7 +103,7 @@ class TestResolveAccessTokenEnvOverrideWins:
         monkeypatch.setattr(auth, "_refresh_access_token", _fake_refresh)
 
         caplog_records = []
-        logger = logging.getLogger(auth.__name__)
+        logger = logging.getLogger("hermes_cli.auth")
         handler = logging.Handler()
         handler.emit = lambda record: caplog_records.append(record.getMessage())
         logger.addHandler(handler)

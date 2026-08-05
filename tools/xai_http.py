@@ -114,7 +114,7 @@ def hermes_xai_default_headers() -> Dict[str, str]:
 def _load_config_section(section_name: str) -> Dict[str, Any]:
     """Return a top-level Hermes config section as a dict, or empty."""
     try:
-        from hermes_runtime.config import load_config
+        from hermes_cli.config import load_config
 
         cfg = load_config()
         section = cfg.get(section_name) if isinstance(cfg, dict) else None
@@ -275,7 +275,7 @@ def resolve_xai_http_credentials(
     """
     try:
         from agent.credential_pool import load_pool
-        import agent.provider_auth as auth_mod
+        import hermes_cli.auth as auth_mod
 
         pool = load_pool("xai-oauth")
         entry = (

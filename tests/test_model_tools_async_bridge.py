@@ -11,7 +11,6 @@ The fix replaces asyncio.run() with a persistent event loop in _run_async().
 """
 
 import asyncio
-import contextvars
 import json
 import threading
 from types import SimpleNamespace
@@ -198,86 +197,82 @@ class TestRunAsyncWithRunningLoop:
         assert result == 42
 
     @pytest.mark.asyncio
-    async def test_running_loop_branch_propagates_context_and_closes_owned_loop(self):
-        import model_tools
+    async def test_timeout_uses_nonblocking_executor_shutdown(self, monkeypatch):
+        """A timeout in the running-loop branch must not block the caller.
 
-        marker = contextvars.ContextVar("async_bridge_marker", default="missing")
-        token = marker.set("parent-value")
+        If shutdown ever waits for a stuck worker, a tool coroutine that
+        ignores (or can't observe) cancellation would hang the whole agent.
+        Guard: the caller must raise TimeoutError and pool.shutdown must be
+        called with wait=False. The worker's own event loop handles cleanup
+        (cancellation is scheduled via call_soon_threadsafe before the
+        caller returns).
+        """
+        import concurrent.futures
+        from model_tools import _run_async
 
-        async def _observe():
-            return marker.get(), asyncio.get_running_loop()
+        events = {
+            "result_timeout": None,
+            "shutdown_calls": [],
+            "submitted_fn": None,
+        }
 
-        try:
-            value, worker_loop = model_tools._run_async(_observe())
-        finally:
-            marker.reset(token)
+        class TimeoutFuture:
+            def result(self, timeout=None):
+                events["result_timeout"] = timeout
+                raise concurrent.futures.TimeoutError()
 
-        assert value == "parent-value"
-        assert worker_loop.is_closed()
+            def cancel(self):
+                return True
 
-    @pytest.mark.asyncio
-    async def test_stuck_workers_are_bounded(self, monkeypatch):
-        """A wedged native call consumes one bounded slot, not unlimited threads."""
-        import concurrent.futures as _cf
-        import model_tools
+        class FakeExecutor:
+            def __init__(self, *args, **kwargs):
+                pass
 
-        monkeypatch.setattr(model_tools, "_ASYNC_BRIDGE_TIMEOUT_SECONDS", 0.05)
-        slots = threading.BoundedSemaphore(1)
-        monkeypatch.setattr(model_tools, "_async_bridge_slots", slots)
-        release = threading.Event()
-        worker_started = threading.Event()
+            def __enter__(self):
+                return self
 
-        async def _blocking_native_call():
-            worker_started.set()
-            release.wait(timeout=5)
+            def __exit__(self, exc_type, exc, tb):
+                self.shutdown(wait=True)
+                return False
 
-        async def _second_call():
-            return 42
+            def submit(self, fn, *args, **kwargs):
+                # Record which function got submitted -- should be the
+                # in-function worker wrapper, not bare asyncio.run, so we
+                # know _run_async is using a loop it owns and can cancel.
+                events["submitted_fn"] = getattr(fn, "__name__", repr(fn))
+                return TimeoutFuture()
 
-        try:
-            with pytest.raises(_cf.TimeoutError):
-                model_tools._run_async(_blocking_native_call())
-            assert worker_started.is_set()
-            with pytest.raises(RuntimeError, match="worker limit"):
-                model_tools._run_async(_second_call())
-        finally:
-            release.set()
-            assert slots.acquire(timeout=5)
-            slots.release()
+            def shutdown(self, wait=True, cancel_futures=False):
+                events["shutdown_calls"].append((wait, cancel_futures))
 
-    @pytest.mark.asyncio
-    async def test_stuck_worker_capacity_is_isolated_by_session(self, monkeypatch):
-        import concurrent.futures as _cf
-        import model_tools
+        async def _never_finishes():
+            await asyncio.sleep(999)
 
-        monkeypatch.setattr(model_tools, "_ASYNC_BRIDGE_TIMEOUT_SECONDS", 0.05)
-        monkeypatch.setattr(model_tools, "_ASYNC_BRIDGE_MAX_WORKERS_PER_SESSION", 1)
         monkeypatch.setattr(
-            model_tools,
-            "_async_bridge_slots",
-            threading.BoundedSemaphore(2),
+            concurrent.futures,
+            "ThreadPoolExecutor",
+            FakeExecutor,
         )
-        current_session = ["session-a"]
-        monkeypatch.setattr(
-            model_tools,
-            "_async_bridge_session_key",
-            lambda: current_session[0],
+
+        with pytest.raises(concurrent.futures.TimeoutError):
+            _run_async(_never_finishes())
+
+        assert events["result_timeout"] == 300
+        # The worker wrapper creates its own event loop so _run_async can
+        # cancel the task on timeout — this must NOT be bare asyncio.run.
+        assert events["submitted_fn"] != "run", (
+            "_run_async submitted asyncio.run directly — it must submit a "
+            "worker wrapper that owns the event loop so timeouts can cancel "
+            "the task"
         )
-        release = threading.Event()
-
-        async def _blocking_native_call():
-            release.wait(timeout=5)
-
-        async def _healthy_call():
-            return 42
-
-        try:
-            with pytest.raises(_cf.TimeoutError):
-                model_tools._run_async(_blocking_native_call())
-            current_session[0] = "session-b"
-            assert model_tools._run_async(_healthy_call()) == 42
-        finally:
-            release.set()
+        # Critical: shutdown must NOT wait. If wait=True, a stuck coroutine
+        # would freeze the caller (converts a thread leak into a hang).
+        assert events["shutdown_calls"], "shutdown was never called"
+        for wait, _cancel in events["shutdown_calls"]:
+            assert wait is False, (
+                f"shutdown called with wait={wait} — a stuck tool coroutine "
+                f"would hang the caller indefinitely"
+            )
 
     @pytest.mark.asyncio
     async def test_timeout_cancels_coroutine_in_worker_loop(self, monkeypatch):
@@ -339,32 +334,6 @@ class TestRunAsyncWithRunningLoop:
             "(ThreadPoolExecutor.cancel() is a no-op on a running future; "
             "_run_async must cancel the task inside its worker loop)"
         )
-
-    @pytest.mark.asyncio
-    async def test_uncooperative_timeout_worker_is_daemon(self, monkeypatch):
-        """A coroutine stuck in blocking native work must not block process exit."""
-        import concurrent.futures as _cf
-        import model_tools
-
-        real_result = _cf.Future.result
-
-        def fast_result(self, timeout=None):
-            return real_result(self, timeout=0.05 if timeout == 300 else timeout)
-
-        monkeypatch.setattr(_cf.Future, "result", fast_result)
-        release = threading.Event()
-        worker_daemon = []
-
-        async def _blocking_native_call():
-            worker_daemon.append(threading.current_thread().daemon)
-            release.wait(timeout=5)
-
-        try:
-            with pytest.raises(_cf.TimeoutError):
-                model_tools._run_async(_blocking_native_call())
-            assert worker_daemon == [True]
-        finally:
-            release.set()
 
 
 # ---------------------------------------------------------------------------

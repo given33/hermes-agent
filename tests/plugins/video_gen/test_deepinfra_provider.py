@@ -118,9 +118,7 @@ def test_generate_text_to_video_downloads_url_and_saves_locally():
         )
     assert result["success"] is True
     assert result["modality"] == "text"
-    normalized_video_path = result["video"].replace("\\", "/")
-    assert normalized_video_path.endswith(".mp4")
-    assert "cache/videos" in normalized_video_path
+    assert result["video"].endswith(".mp4") and "cache/videos" in result["video"]
     assert captured["url"] == "https://cdn.example/out.mp4"
     assert "deepinfra" in captured["base_url"]
     assert captured["api_key"] == "test-key"

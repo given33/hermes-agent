@@ -102,7 +102,7 @@ def _redact(text: str) -> str:
     if not text:
         return text
     try:
-        from hermes_runtime.redaction import redact_sensitive_text
+        from agent.redact import redact_sensitive_text
 
         return redact_sensitive_text(text, force=True) or ""
     except Exception:  # pragma: no cover - core module; never leak on failure

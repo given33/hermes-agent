@@ -26,7 +26,7 @@ import subprocess
 import sys
 from pathlib import Path
 
-from hermes_runtime.colors import Colors, color
+from hermes_cli.colors import Colors, color
 
 from . import auth as photon_auth
 from .adapter import _NPM_ERROR_LOG_MAX_CHARS, sidecar_deps_installed
@@ -362,7 +362,7 @@ def _autoconfigure_access(phone: str) -> None:
     never clobbered on a re-run.
     """
     try:
-        from hermes_runtime.config import get_env_value, save_env_value
+        from hermes_cli.config import get_env_value, save_env_value
     except ImportError:
         return
     for key, label in (
@@ -417,7 +417,7 @@ def _telemetry_enabled() -> bool:
     always matches what the sidecar will actually do.
     """
     try:
-        from hermes_runtime.config import get_env_value
+        from hermes_cli.config import get_env_value
         raw = get_env_value("PHOTON_TELEMETRY")
     except ImportError:
         raw = os.getenv("PHOTON_TELEMETRY")
@@ -431,7 +431,7 @@ def _cmd_telemetry(args: argparse.Namespace) -> int:
         print("  Toggle with `hermes photon telemetry on` / `hermes photon telemetry off`.")
         return 0
     try:
-        from hermes_runtime.config import save_env_value
+        from hermes_cli.config import save_env_value
         save_env_value("PHOTON_TELEMETRY", "true" if state == "on" else "false")
     except Exception as e:
         print(f"could not save PHOTON_TELEMETRY: {e}", file=sys.stderr)

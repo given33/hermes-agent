@@ -443,7 +443,8 @@ export function useSessionLifecycle(opts: UseSessionLifecycleOptions) {
       newSession,
       resetSession,
       resetVisibleHistory,
-      resumeById
+      resumeById,
+      trimTail
     ]
   )
 }

@@ -99,34 +99,6 @@ def _base_xai_mocks(monkeypatch, tmp_path):
     return status_mod
 
 
-def test_oauth_provider_status_failures_are_isolated(monkeypatch, capsys, tmp_path):
-    import hermes_cli.auth as auth_mod
-
-    status_mod = _base_xai_mocks(monkeypatch, tmp_path)
-    monkeypatch.setattr(
-        auth_mod, "get_codex_auth_status", lambda: {"logged_in": True}
-    )
-    monkeypatch.setattr(
-        auth_mod,
-        "get_qwen_auth_status",
-        lambda: (_ for _ in ()).throw(RuntimeError("corrupt qwen auth")),
-    )
-    monkeypatch.setattr(
-        auth_mod, "get_minimax_oauth_auth_status", lambda: {"logged_in": True}
-    )
-    monkeypatch.setattr(auth_mod, "get_xai_oauth_auth_status", lambda: {})
-
-    status_mod.show_status(SimpleNamespace(all=False, deep=False))
-    output = capsys.readouterr().out
-
-    assert any(
-        "OpenAI Codex" in line and "logged in" in line
-        for line in output.splitlines()
-    )
-    minimax_line = next(line for line in output.splitlines() if "MiniMax OAuth" in line)
-    assert "logged in" in minimax_line
-
-
 class TestShowStatusXaiOAuth:
     """xAI OAuth row in hermes status."""
 

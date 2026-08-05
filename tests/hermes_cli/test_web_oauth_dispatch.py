@@ -21,10 +21,8 @@ These tests pin the corrected behavior.
 """
 import asyncio
 import json
-import threading
 import time
 from datetime import datetime, timezone
-from types import SimpleNamespace
 from unittest.mock import patch
 
 import httpx
@@ -32,53 +30,9 @@ import pytest
 from fastapi.testclient import TestClient
 
 from hermes_cli.web_server import _SESSION_TOKEN, app
-from hermes_cli import web_server
 
 client = TestClient(app)
 HEADERS = {"X-Hermes-Session-Token": _SESSION_TOKEN}
-
-
-def test_mcp_oauth_transaction_lock_pool_reclaims_idle_entries_without_splitting_waiters():
-    flow = SimpleNamespace(hermes_home="/tmp/hermes-home", server_name="oauth-server")
-    key = (flow.hermes_home, flow.server_name)
-    with web_server._mcp_oauth_transactions_lock:
-        web_server._mcp_oauth_transactions.clear()
-
-    entered = threading.Event()
-    release = threading.Event()
-    waiter_done = threading.Event()
-
-    def holder():
-        with web_server._mcp_oauth_transaction(flow):
-            entered.set()
-            assert release.wait(timeout=5)
-
-    def waiter():
-        with web_server._mcp_oauth_transaction(flow):
-            waiter_done.set()
-
-    first = threading.Thread(target=holder, daemon=True)
-    second = threading.Thread(target=waiter, daemon=True)
-    first.start()
-    assert entered.wait(timeout=5)
-    second.start()
-    deadline = time.monotonic() + 5
-    while time.monotonic() < deadline:
-        with web_server._mcp_oauth_transactions_lock:
-            entry = web_server._mcp_oauth_transactions.get(key)
-            if entry is not None and entry.users == 2:
-                break
-        time.sleep(0.01)
-    else:
-        raise AssertionError("waiting MCP OAuth transaction lock was not retained")
-    release.set()
-    first.join(timeout=5)
-    second.join(timeout=5)
-    assert not first.is_alive()
-    assert not second.is_alive()
-    assert waiter_done.is_set()
-    with web_server._mcp_oauth_transactions_lock:
-        assert key not in web_server._mcp_oauth_transactions
 
 
 def _make_profile_home(tmp_path, monkeypatch, profile="coder"):

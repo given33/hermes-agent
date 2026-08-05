@@ -4,8 +4,6 @@ from __future__ import annotations
 
 import io
 import json
-import os
-import shlex
 from contextlib import redirect_stdout
 from pathlib import Path
 from types import SimpleNamespace
@@ -31,13 +29,6 @@ def _hook_script(tmp_path: Path, body: str, name: str = "hook.sh") -> Path:
     p.write_text(body)
     p.chmod(0o755)
     return p
-
-
-def _bash_path(path: Path) -> str:
-    value = path.resolve().as_posix()
-    if os.name == "nt" and len(value) >= 3 and value[1:3] == ":/":
-        value = f"/{value[0].lower()}{value[2:]}"
-    return shlex.quote(value)
 
 
 def _run(sub_args: SimpleNamespace) -> str:
@@ -98,7 +89,7 @@ class TestHooksTest:
         capture = tmp_path / "captured.json"
         script = _hook_script(
             tmp_path,
-            f"#!/usr/bin/env bash\ncat - > {_bash_path(capture)}\nprintf '{{}}\\n'\n",
+            f"#!/usr/bin/env bash\ncat - > {capture}\nprintf '{{}}\\n'\n",
         )
         cfg = {"hooks": {"subagent_stop": [{"command": str(script)}]}}
         with patch("hermes_cli.config.load_config", return_value=cfg):

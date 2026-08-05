@@ -15,21 +15,13 @@ from contextlib import contextmanager
 from typing import Any, Dict, Iterator, List, Optional
 
 from hermes_constants import get_hermes_home
-from hermes_runtime.process_probe import pid_exists as _pid_exists
 from hermes_time import now as _hermes_now
 
 EXECUTIONS_FILE = get_hermes_home().resolve() / "cron" / "executions.db"
-_IMPORT_EXECUTIONS_FILE = EXECUTIONS_FILE
 MAX_TERMINAL_EXECUTIONS = 1000
 _TERMINAL_STATES = ("completed", "failed", "unknown")
 _lock = threading.RLock()
 _PROCESS_ID = uuid.uuid4().hex
-
-
-def _execution_file() -> Path:
-    if EXECUTIONS_FILE != _IMPORT_EXECUTIONS_FILE:
-        return EXECUTIONS_FILE
-    return get_hermes_home().resolve() / "cron" / "executions.db"
 
 
 def _connect() -> sqlite3.Connection:
@@ -117,6 +109,7 @@ def _process_start_time(pid: int) -> Optional[int]:
 
 def _owner_is_live(pid: int, started_at: Optional[int]) -> bool:
     try:
+        from gateway.status import _pid_exists
         if not _pid_exists(pid):
             return False
     except Exception:

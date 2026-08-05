@@ -1,10 +1,8 @@
 """Tests for cron/jobs.py — schedule parsing, job CRUD, and due-job detection."""
 
-import json
 import threading
 import pytest
 from datetime import datetime, timedelta, timezone
-from pathlib import Path
 
 from cron.jobs import (
     parse_duration,
@@ -14,7 +12,6 @@ from cron.jobs import (
     load_jobs,
     save_jobs,
     get_job,
-    resolve_job_ref,
     list_jobs,
     update_job,
     pause_job,
@@ -52,27 +49,12 @@ class TestParseDuration:
         with pytest.raises(ValueError):
             parse_duration("m30")
 
-    @pytest.mark.parametrize("value", [None, 30, {}, []])
-    def test_non_string_input_raises_value_error(self, value):
-        with pytest.raises(ValueError, match="expected a string"):
-            parse_duration(value)
-
-    @pytest.mark.parametrize("value", ["0m", "0h", "0d"])
-    def test_zero_duration_raises(self, value):
-        with pytest.raises(ValueError, match="greater than zero"):
-            parse_duration(value)
-
 
 # =========================================================================
 # parse_schedule
 # =========================================================================
 
 class TestParseSchedule:
-    @pytest.mark.parametrize("value", [None, 30, {}, []])
-    def test_non_string_input_raises_value_error(self, value):
-        with pytest.raises(ValueError, match="expected a string"):
-            parse_schedule(value)
-
     def test_duration_becomes_once(self):
         result = parse_schedule("30m")
         assert result["kind"] == "once"
@@ -90,14 +72,6 @@ class TestParseSchedule:
         assert result["kind"] == "interval"
         assert result["minutes"] == 120
 
-
-    def test_zero_interval_schedule_raises(self):
-        with pytest.raises(ValueError, match="greater than zero"):
-            parse_schedule("every 0m")
-
-    def test_oversized_interval_schedule_raises(self):
-        with pytest.raises(ValueError, match="too large"):
-            parse_schedule("999999999999999999999999999m")
 
     def test_cron_expression(self):
         pytest.importorskip("croniter")
@@ -231,67 +205,6 @@ class TestJobCRUD:
         jobs = list_jobs()
         assert len(jobs) == 2
 
-
-    def test_string_false_enabled_is_disabled_consistently(self, tmp_cron_dir):
-        past = (datetime.now(timezone.utc) - timedelta(seconds=5)).isoformat()
-        save_jobs([{
-            "id": "disabled-string",
-            "name": "disabled",
-            "enabled": "false",
-            "schedule": {"kind": "once", "run_at": past},
-            "next_run_at": past,
-        }, {
-            "id": "enabled-bool",
-            "name": "enabled",
-            "enabled": True,
-            "schedule": {"kind": "once", "run_at": past},
-            "next_run_at": past,
-        }])
-
-        due = get_due_jobs()
-
-        assert [job["id"] for job in due] == ["enabled-bool"]
-        assert load_jobs()[0]["enabled"] is False
-        assert [job["id"] for job in list_jobs()] == ["enabled-bool"]
-
-    def test_malformed_enabled_value_fails_closed(self, tmp_cron_dir):
-        """Invalid persisted enabled values must not run hand-edited jobs."""
-        past = (datetime.now(timezone.utc) - timedelta(seconds=5)).isoformat()
-        save_jobs([{
-            "id": "malformed-enabled",
-            "name": "malformed",
-            "enabled": float("nan"),
-            "schedule": {"kind": "once", "run_at": past},
-            "next_run_at": past,
-        }, {
-            "id": "object-enabled",
-            "name": "object",
-            "enabled": {},
-            "schedule": {"kind": "once", "run_at": past},
-            "next_run_at": past,
-        }])
-
-        assert get_due_jobs() == []
-        assert [job["enabled"] for job in load_jobs()] == [False, False]
-        assert list_jobs() == []
-
-    def test_string_false_no_agent_is_normalized(self, tmp_cron_dir):
-        created = create_job(
-            prompt="Use the model", schedule="every 5m", no_agent="false"
-        )
-        assert created["no_agent"] is False
-
-        save_jobs([{
-            "id": "agent-job",
-            "no_agent": "false",
-            "prompt": "Use the model",
-            "schedule": {"kind": "interval", "minutes": 5},
-            "next_run_at": (datetime.now(timezone.utc) + timedelta(minutes=5)).isoformat(),
-        }])
-
-        fetched = get_job("agent-job")
-
-        assert fetched["no_agent"] is False
 
     def test_remove_job(self, tmp_cron_dir):
         job = create_job(prompt="Temp job", schedule="30m")
@@ -451,95 +364,12 @@ class TestMarkJobRun:
         assert job["id"] not in {j["id"] for j in get_due_jobs()}
 
 
-    def test_repeat_numeric_string_is_normalized(self, tmp_cron_dir):
-        job = create_job(prompt="StringRepeat", schedule="every 1h", repeat="3")
-        assert job["repeat"]["times"] == 3
-
-    @pytest.mark.parametrize("value", [True, 1.5, {}, "bad", ""])
-    def test_malformed_repeat_input_is_rejected(self, tmp_cron_dir, value):
-        with pytest.raises(ValueError, match="repeat"):
-            create_job(prompt="BadRepeat", schedule="every 1h", repeat=value)
-
     def test_error_status(self, tmp_cron_dir):
         job = create_job(prompt="Fail", schedule="every 1h")
         mark_job_run(job["id"], success=False, error="timeout")
         updated = get_job(job["id"])
         assert updated["last_status"] == "error"
         assert updated["last_error"] == "timeout"
-
-    def test_malformed_repeat_is_repaired_before_marking_run(self, tmp_cron_dir):
-        """A corrupt repeat field must not abort completion under the jobs lock."""
-        save_jobs([{
-            "id": "bad-repeat",
-            "schedule": {"kind": "interval", "minutes": 5},
-            "next_run_at": (datetime.now(timezone.utc) - timedelta(minutes=1)).isoformat(),
-            "repeat": "not-a-record",
-        }])
-
-        mark_job_run("bad-repeat", success=True)
-
-        updated = get_job("bad-repeat")
-        assert updated is not None
-        assert updated["last_status"] == "ok"
-        assert updated["repeat"] == {"times": None, "completed": 1}
-
-    def test_malformed_repeat_is_safe_for_readers(self, tmp_cron_dir):
-        """Legacy scalar repeat records must not break get/list consumers."""
-        save_jobs([{
-            "id": "reader-bad-repeat",
-            "name": "reader",
-            "prompt": "check",
-            "repeat": "not-a-record",
-            "schedule": {"kind": "interval", "minutes": 5},
-            "next_run_at": (
-                datetime.now(timezone.utc) + timedelta(minutes=5)
-            ).isoformat(),
-        }])
-
-        fetched = get_job("reader-bad-repeat")
-        assert fetched is not None
-        assert fetched["repeat"] == {"times": None, "completed": 0}
-        listed = list_jobs()
-        assert listed[0]["repeat"] == {"times": None, "completed": 0}
-
-    def test_integral_float_repeat_fields_are_normalized(self, tmp_cron_dir):
-        save_jobs([{
-            "id": "float-repeat",
-            "repeat": {"times": 3.0, "completed": 1.0},
-            "schedule": {"kind": "interval", "minutes": 5},
-            "next_run_at": (
-                datetime.now(timezone.utc) + timedelta(minutes=5)
-            ).isoformat(),
-        }])
-
-        fetched = get_job("float-repeat")
-        assert fetched["repeat"] == {"times": 3, "completed": 1}
-
-    def test_malformed_schedule_does_not_abort_marking_run(self, tmp_cron_dir):
-        save_jobs([{
-            "id": "bad-schedule",
-            "schedule": "not-a-mapping",
-            "next_run_at": None,
-        }])
-
-        mark_job_run("bad-schedule", success=False, error="bad schedule")
-
-        updated = get_job("bad-schedule")
-        assert updated is not None
-        assert updated["last_status"] == "error"
-        assert updated["last_error"] == "bad schedule"
-
-    def test_missing_schedule_does_not_abort_marking_run(self, tmp_cron_dir):
-        save_jobs([{"id": "missing-schedule", "next_run_at": None}])
-
-        mark_job_run("missing-schedule", success=False, error="missing schedule")
-
-        updated = get_job("missing-schedule")
-        assert updated is not None
-        assert updated["last_status"] == "error"
-        assert updated["last_error"] == "missing schedule"
-        assert updated["state"] == "completed"
-        assert updated["enabled"] is False
 
     def test_delivery_error_tracked_separately(self, tmp_cron_dir):
         """Agent succeeds but delivery fails — both tracked independently."""
@@ -708,60 +538,6 @@ class TestGetDueJobs:
 
         # The healthy sibling is still discovered despite the malformed neighbor.
         assert any(d.get("id") == healthy["id"] for d in due)
-
-    def test_non_object_record_does_not_crash_or_block_sibling_jobs(self, tmp_cron_dir):
-        """Scalars in the JSON jobs array are discarded before scheduling.
-
-        JSON permits ``null`` and strings in an array, but cron records must
-        be mappings.  A malformed sibling must not make ``record.get`` abort
-        the scan and starve healthy jobs.
-        """
-        healthy = create_job(prompt="Healthy", schedule="every 1h")
-        jobs_path = Path(tmp_cron_dir) / "cron" / "jobs.json"
-        payload = json.loads(jobs_path.read_text(encoding="utf-8"))
-        payload["jobs"][0]["next_run_at"] = (
-            datetime.now(timezone.utc) - timedelta(minutes=5)
-        ).isoformat()
-        payload["jobs"].insert(0, None)
-        payload["jobs"].append("not-a-job")
-        jobs_path.write_text(json.dumps(payload), encoding="utf-8")
-
-        due = get_due_jobs()
-
-        assert [item["id"] for item in due] == [healthy["id"]]
-        loaded = load_jobs()
-        assert [item["id"] for item in loaded] == [healthy["id"]]
-        repaired = json.loads(jobs_path.read_text(encoding="utf-8"))
-        assert repaired["jobs"] == loaded
-
-    def test_non_string_name_does_not_crash_job_reference_resolution(self, tmp_cron_dir):
-        """Hand-edited numeric names are coerced by the reference resolver."""
-        save_jobs([{"id": "numeric-name", "name": 42, "enabled": True}])
-
-        resolved = resolve_job_ref("42")
-
-        assert resolved is not None
-        assert resolved["id"] == "numeric-name"
-        assert resolved["name"] == "42"
-
-    def test_malformed_skills_field_does_not_abort_due_scan(self, tmp_cron_dir):
-        """A scalar ``skills`` field is ignored instead of raising TypeError."""
-        healthy = create_job(prompt="Healthy", schedule="every 1h")
-        jobs_path = Path(tmp_cron_dir) / "cron" / "jobs.json"
-        payload = json.loads(jobs_path.read_text(encoding="utf-8"))
-        payload["jobs"][0]["next_run_at"] = (
-            datetime.now(timezone.utc) - timedelta(minutes=5)
-        ).isoformat()
-        malformed = dict(payload["jobs"][0])
-        malformed["id"] = "bad-skills"
-        malformed["skills"] = 42
-        malformed["skill"] = None
-        payload["jobs"].append(malformed)
-        jobs_path.write_text(json.dumps(payload), encoding="utf-8")
-
-        due = get_due_jobs()
-
-        assert {item["id"] for item in due} == {healthy["id"], "bad-skills"}
 
 
     def test_long_execution_does_not_perpetually_defer(self, tmp_cron_dir, monkeypatch):

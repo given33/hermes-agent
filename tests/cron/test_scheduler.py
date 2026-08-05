@@ -62,16 +62,6 @@ class TestPerJobToolsetMcpMerge:
         assert m_platform.call_args[0][1] == "cron"
         assert set(result) == set(sentinel)
 
-    @pytest.mark.parametrize("value", [123, {"web": True}])
-    def test_resolver_ignores_malformed_per_job_toolsets(self, value):
-        """Corrupt jobs.json values must not crash or become dict key lists."""
-        with patch("hermes_cli.tools_config._get_platform_tools", return_value={"web"}) as m_platform:
-            result = _resolve_cron_enabled_toolsets(
-                {"enabled_toolsets": value}, self.CFG
-            )
-        m_platform.assert_called_once()
-        assert result == ["web"]
-
 
 class TestResolveOrigin:
     def test_full_origin(self):
@@ -449,42 +439,6 @@ class TestDeliverResultErrorReturns:
             result = _deliver_result(job, "Output.")
         assert result is not None
         assert "not configured" in result
-
-
-class TestStandaloneRetryCoroutineLifecycle:
-    """The running-loop fallback must not allocate work before submit."""
-
-    def test_executor_submit_failure_does_not_create_second_coroutine(self):
-        from gateway.config import Platform
-
-        pconfig = MagicMock(enabled=True)
-        mock_cfg = MagicMock()
-        mock_cfg.platforms = {Platform.TELEGRAM: pconfig}
-        standalone_send = AsyncMock(return_value={"success": True})
-        pool = MagicMock()
-        pool.submit.side_effect = RuntimeError("executor unavailable")
-
-        with patch("gateway.config.load_gateway_config", return_value=mock_cfg), \
-             patch("cron.scheduler.load_config", return_value={"cron": {"wrap_response": False}}), \
-             patch("tools.send_message_tool._send_to_platform", new=standalone_send), \
-             patch("cron.scheduler.asyncio.run", side_effect=RuntimeError("loop already running")), \
-             patch("cron.scheduler.concurrent.futures.ThreadPoolExecutor", return_value=pool):
-            result = _deliver_result(
-                {
-                    "id": "submit-failure",
-                    "deliver": "origin",
-                    "origin": {"platform": "telegram", "chat_id": "123"},
-                },
-                "hello",
-            )
-
-        assert result is not None
-        assert "executor unavailable" in result
-        # One call creates the coroutine passed to the first asyncio.run().
-        # The retry is a factory executed by the worker, so failed submit()
-        # must not create a second un-awaited coroutine.
-        assert standalone_send.call_count == 1
-        pool.shutdown.assert_called_once_with(wait=False)
 
 
 class TestRunJobSessionPersistence:

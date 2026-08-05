@@ -7,7 +7,6 @@ import stat
 import threading
 import time
 from base64 import b64encode
-from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from typing import Any, Dict
 from unittest import mock

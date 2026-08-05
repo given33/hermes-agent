@@ -45,7 +45,6 @@ import hashlib
 import hmac
 import itertools
 import json
-import math
 from contextlib import contextmanager, nullcontext
 from contextvars import ContextVar
 from functools import wraps
@@ -95,12 +94,6 @@ from gateway.platforms.base import (
 from agent.redact import redact_sensitive_text
 from agent.interrupt_compat import request_hard_interrupt
 from gateway.readiness import collect_runtime_readiness
-from hermes_services import (
-    DEFAULT_MAX_REQUEST_BYTES,
-    HermesApplicationKernel,
-    accept_cron_fire_request,
-    openai_error_body,
-)
 
 from agent.secret_scope import UnscopedSecretError as _UnscopedSecretError
 from agent.secret_scope import get_secret as _scoped_get_secret
@@ -157,12 +150,7 @@ def _hermes_version() -> str:
 DEFAULT_HOST = "127.0.0.1"
 DEFAULT_PORT = 8642
 MAX_STORED_RESPONSES = 100
-MAX_REQUEST_BYTES = DEFAULT_MAX_REQUEST_BYTES
-_DEFAULT_API_APPLICATION = HermesApplicationKernel.for_http(
-    surface="api",
-    compatibility_mode=os.environ.get("HERMES_HTTP_CONTRACT_MODE", "dual"),
-)
-_DEFAULT_API_HTTP_BOUNDARY = _DEFAULT_API_APPLICATION.require_http_boundary()
+MAX_REQUEST_BYTES = 10_000_000  # 10 MB — accommodates long agent conversations with tool calls
 CHAT_COMPLETIONS_SSE_KEEPALIVE_SECONDS = 30.0
 MAX_NORMALIZED_TEXT_LENGTH = 65_536  # 64 KB cap for normalized content parts
 MAX_CONTENT_LIST_SIZE = 1_000  # Max items when content is an array
@@ -791,10 +779,9 @@ class ResponseStore:
 
     def __init__(self, max_size: int = MAX_STORED_RESPONSES, db_path: str = None):
         self._max_size = max_size
-        self._access_clock_lock = threading.Lock()
         if db_path is None:
             try:
-                from hermes_runtime.config import get_hermes_home
+                from hermes_cli.config import get_hermes_home
                 db_path = str(get_hermes_home() / "response_store.db")
             except Exception:
                 db_path = ":memory:"
@@ -809,11 +796,7 @@ class ResponseStore:
         # issue addressed for state.db/kanban.db — see
         # hermes_state._WAL_INCOMPAT_MARKERS).
         from hermes_state import apply_wal_with_fallback
-        apply_wal_with_fallback(
-            self._conn,
-            db_label="response_store.db",
-            database_path=self._db_path,
-        )
+        apply_wal_with_fallback(self._conn, db_label="response_store.db")
         self._conn.execute(
             """CREATE TABLE IF NOT EXISTS responses (
                 response_id TEXT PRIMARY KEY,
@@ -828,27 +811,12 @@ class ResponseStore:
             )"""
         )
         self._conn.commit()
-        row = self._conn.execute(
-            "SELECT MAX(accessed_at) FROM responses"
-        ).fetchone()
-        self._last_accessed_at = (
-            float(row[0]) if row and row[0] is not None else float("-inf")
-        )
         # response_store.db contains conversation history (tool payloads,
         # prompts, results). Tighten to owner-only after creation so other
         # local users on a shared box can't read it. Run once at __init__
         # rather than after every commit — chmod-on-every-write is wasted
         # syscalls on a hot path.
         self._tighten_file_permissions()
-
-    def _next_accessed_at(self) -> float:
-        """Return a strictly increasing LRU stamp even on coarse clocks."""
-        with self._access_clock_lock:
-            stamp = time.time()
-            if stamp <= self._last_accessed_at:
-                stamp = math.nextafter(self._last_accessed_at, math.inf)
-            self._last_accessed_at = stamp
-            return stamp
 
     def _tighten_file_permissions(self) -> None:
         """Force owner-only permissions on the DB and SQLite sidecars."""
@@ -878,7 +846,7 @@ class ResponseStore:
             return None
         self._conn.execute(
             "UPDATE responses SET accessed_at = ? WHERE response_id = ?",
-            (self._next_accessed_at(), response_id),
+            (time.time(), response_id),
         )
         self._conn.commit()
         try:
@@ -899,7 +867,7 @@ class ResponseStore:
         """Store a response, evicting the oldest if at capacity."""
         self._conn.execute(
             "INSERT OR REPLACE INTO responses (response_id, data, accessed_at) VALUES (?, ?, ?)",
-            (response_id, json.dumps(data, default=str), self._next_accessed_at()),
+            (response_id, json.dumps(data, default=str), time.time()),
         )
         # Evict oldest entries beyond max_size
         count = self._conn.execute("SELECT COUNT(*) FROM responses").fetchone()[0]
@@ -968,6 +936,12 @@ class ResponseStore:
 # ---------------------------------------------------------------------------
 # CORS middleware
 # ---------------------------------------------------------------------------
+
+_CORS_HEADERS = {
+    "Access-Control-Allow-Methods": "GET, POST, DELETE, OPTIONS",
+    "Access-Control-Allow-Headers": "Authorization, Content-Type, Idempotency-Key",
+}
+
 
 if AIOHTTP_AVAILABLE:
     @web.middleware
@@ -1067,12 +1041,14 @@ def _redact_api_error_text(value: Any, *, limit: int | None = None) -> str:
 
 def _openai_error(message: str, err_type: str = "invalid_request_error", param: str = None, code: str = None) -> Dict[str, Any]:
     """OpenAI-style error envelope."""
-    return openai_error_body(
-        _redact_api_error_text(message),
-        error_type=err_type,
-        param=param,
-        code=code,
-    )
+    return {
+        "error": {
+            "message": _redact_api_error_text(message),
+            "type": err_type,
+            "param": param,
+            "code": code,
+        }
+    }
 
 
 _api_agent_request_reservation: ContextVar[Optional[dict[str, bool]]] = ContextVar(
@@ -1139,21 +1115,14 @@ if AIOHTTP_AVAILABLE:
     @web.middleware
     async def body_limit_middleware(request, handler):
         """Reject overly large request bodies early based on Content-Length."""
-        adapter = request.app.get("api_server_adapter")
-        boundary = (
-            adapter._http_boundary
-            if adapter is not None
-            else _DEFAULT_API_HTTP_BOUNDARY
-        )
-        failure = boundary.validate_content_length(
-            request.method,
-            request.headers.get("Content-Length"),
-        )
-        if failure is not None:
-            return web.json_response(
-                _openai_error(failure.message, code=failure.code),
-                status=failure.status_code,
-            )
+        if request.method in {"POST", "PUT", "PATCH"}:
+            cl = request.headers.get("Content-Length")
+            if cl is not None:
+                try:
+                    if int(cl) > MAX_REQUEST_BYTES:
+                        return web.json_response(_openai_error("Request body too large.", code="body_too_large"), status=413)
+                except ValueError:
+                    return web.json_response(_openai_error("Invalid Content-Length header.", code="invalid_content_length"), status=400)
         try:
             return await handler(request)
         except web.HTTPRequestEntityTooLarge:
@@ -1167,12 +1136,23 @@ if AIOHTTP_AVAILABLE:
 else:
     body_limit_middleware = None  # type: ignore[assignment]
 
+_SECURITY_HEADERS = {
+    "Content-Security-Policy": "default-src 'none'; frame-ancestors 'none'",
+    "Permissions-Policy": "camera=(), microphone=(), geolocation=()",
+    "Strict-Transport-Security": "max-age=31536000; includeSubDomains",
+    "X-Content-Type-Options": "nosniff",
+    "X-Frame-Options": "DENY",
+    "X-XSS-Protection": "0",
+    "Referrer-Policy": "no-referrer",
+}
+
+
 if AIOHTTP_AVAILABLE:
     @web.middleware
     async def security_headers_middleware(request, handler):
         """Add security headers to all responses (including errors)."""
         response = await handler(request)
-        for k, v in _DEFAULT_API_HTTP_BOUNDARY.response_headers.items():
+        for k, v in _SECURITY_HEADERS.items():
             response.headers.setdefault(k, v)
         return response
 else:
@@ -1184,7 +1164,7 @@ class _IdempotencyCache:
     def __init__(self, max_items: int = 1000, ttl_seconds: int = 300):
         from collections import OrderedDict
         self._store = OrderedDict()
-        self._inflight: Dict[tuple[Any, ...], "asyncio.Task[Any]"] = {}
+        self._inflight: Dict[tuple[str, str], "asyncio.Task[Any]"] = {}
         self._ttl = ttl_seconds
         self._max = max_items
 
@@ -1196,32 +1176,19 @@ class _IdempotencyCache:
         while len(self._store) > self._max:
             self._store.popitem(last=False)
 
-    async def get_or_set(
-        self,
-        key: str,
-        fingerprint: str,
-        compute_coro,
-        *,
-        namespace: tuple[str, ...] = (),
-    ):
+    async def get_or_set(self, key: str, fingerprint: str, compute_coro):
         self._purge()
-        scoped_key = (namespace, key)
-        item = self._store.get(scoped_key)
+        item = self._store.get(key)
         if item and item["fp"] == fingerprint:
             return item["resp"]
 
-        inflight_key = (namespace, key, fingerprint)
+        inflight_key = (key, fingerprint)
         task = self._inflight.get(inflight_key)
         if task is None:
             async def _compute_and_store():
                 resp = await compute_coro()
                 import time as _t
-                self._store[scoped_key] = {
-                    "resp": resp,
-                    "fp": fingerprint,
-                    "ts": _t.time(),
-                }
-                self._store.move_to_end(scoped_key)
+                self._store[key] = {"resp": resp, "fp": fingerprint, "ts": _t.time()}
                 self._purge()
                 return resp
 
@@ -1237,37 +1204,13 @@ class _IdempotencyCache:
         return await asyncio.shield(task)
 
 
-def _make_request_fingerprint(
-    body: Dict[str, Any],
-    keys: Optional[List[str]] = None,
-) -> str:
-    fingerprint_body = body if keys is None else {key: body.get(key) for key in keys}
-    canonical = json.dumps(
-        fingerprint_body,
-        ensure_ascii=False,
-        sort_keys=True,
-        separators=(",", ":"),
-    )
-    return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+_idem_cache = _IdempotencyCache()
 
 
-def _idempotency_namespace(
-    request: "web.Request",
-    *,
-    endpoint: str,
-    gateway_session_key: Optional[str] = None,
-    session_id: Optional[str] = None,
-) -> tuple[str, ...]:
-    """Scope a client key to the request identity that can affect execution."""
-    authorization = request.headers.get("Authorization", "")
-    auth_digest = hashlib.sha256(authorization.encode("utf-8")).hexdigest()
-    return (
-        endpoint,
-        _api_request_profile.get() or "<default>",
-        auth_digest,
-        gateway_session_key or "",
-        session_id or "",
-    )
+def _make_request_fingerprint(body: Dict[str, Any], keys: List[str]) -> str:
+    from hashlib import sha256
+    subset = {k: body.get(k) for k in keys}
+    return sha256(repr(subset).encode("utf-8")).hexdigest()
 
 
 def _derive_chat_session_id(
@@ -1386,15 +1329,6 @@ class APIServerAdapter(BasePlatformAdapter):
         self._cors_origins: tuple[str, ...] = self._parse_cors_origins(
             extra.get("cors_origins", os.getenv("API_SERVER_CORS_ORIGINS", "")),
         )
-        self._application = HermesApplicationKernel.for_http(
-            surface="api",
-            bearer_secret=self._api_key,
-            allow_unconfigured_bearer=True,
-            allowed_origins=self._cors_origins,
-            max_request_bytes=MAX_REQUEST_BYTES,
-            compatibility_mode=os.environ.get("HERMES_HTTP_CONTRACT_MODE", "dual"),
-        )
-        self._http_boundary = self._application.require_http_boundary()
         self._model_name: str = self._resolve_model_name(
             extra.get("model_name", os.getenv("API_SERVER_MODEL_NAME", "")),
         )
@@ -1429,9 +1363,6 @@ class APIServerAdapter(BasePlatformAdapter):
         self._app: Optional["web.Application"] = None
         self._runner: Optional["web.AppRunner"] = None
         self._site: Optional["web.TCPSite"] = None
-        # Idempotency is adapter-local so listeners with different bearer
-        # credentials can never replay one another's cached responses.
-        self._idempotency_cache = _IdempotencyCache()
         self._response_store = ResponseStore()
         # Active run streams: run_id -> asyncio.Queue of SSE event dicts
         self._run_streams: Dict[str, "asyncio.Queue[Optional[Dict]]"] = {}
@@ -1627,11 +1558,33 @@ class APIServerAdapter(BasePlatformAdapter):
 
     def _cors_headers_for_origin(self, origin: str) -> Optional[Dict[str, str]]:
         """Return CORS headers for an allowed browser origin."""
-        return self._http_boundary.cors_headers(origin)
+        if not origin or not self._cors_origins:
+            return None
+
+        if "*" in self._cors_origins:
+            headers = dict(_CORS_HEADERS)
+            headers["Access-Control-Allow-Origin"] = "*"
+            headers["Access-Control-Max-Age"] = "600"
+            return headers
+
+        if origin not in self._cors_origins:
+            return None
+
+        headers = dict(_CORS_HEADERS)
+        headers["Access-Control-Allow-Origin"] = origin
+        headers["Vary"] = "Origin"
+        headers["Access-Control-Max-Age"] = "600"
+        return headers
 
     def _origin_allowed(self, origin: str) -> bool:
         """Allow non-browser clients and explicitly configured browser origins."""
-        return self._http_boundary.origin_allowed(origin)
+        if not origin:
+            return True
+
+        if not self._cors_origins:
+            return False
+
+        return "*" in self._cors_origins or origin in self._cors_origins
 
     @staticmethod
     def _clean_log_value(value: Any, *, max_len: int = 200) -> str:
@@ -1724,21 +1677,12 @@ class APIServerAdapter(BasePlatformAdapter):
         profile = _api_request_profile.get()
         is_named_profile = bool(profile and profile != "default")
         expected_key = self._expected_api_key()
-        auth_header = request.headers.get("Authorization", "")
-        if is_named_profile:
-            boundary = HermesApplicationKernel.for_http(
-                surface="api",
-                bearer_secret=expected_key,
-                compatibility_mode=os.environ.get("HERMES_HTTP_CONTRACT_MODE", "dual"),
-            ).require_http_boundary()
-            authorization = boundary.authorize(auth_header)
-        else:
-            authorization = self._http_boundary.authorize(auth_header)
-
-        if authorization.authenticated:
-            return None
-
-        if not expected_key and is_named_profile:
+        if not expected_key:
+            # Preserve the historical no-key test/manual-wiring behavior only
+            # for the default listener. Named profiles must fail closed rather
+            # than inherit the listener owner's key.
+            if not is_named_profile:
+                return None
             logger.warning(
                 "API server rejected request for profile %r: no profile-scoped "
                 "API_SERVER_KEY is configured; %s",
@@ -1755,6 +1699,18 @@ class APIServerAdapter(BasePlatformAdapter):
                 },
                 status=401,
             )
+
+        auth_header = request.headers.get("Authorization", "")
+        if auth_header.startswith("Bearer "):
+            token = auth_header[7:].strip()
+            # Compare as bytes: ``hmac.compare_digest`` raises TypeError on a
+            # str containing non-ASCII characters, and ``token`` is the raw
+            # client-supplied header. A stray non-ASCII byte in the key would
+            # otherwise crash this handler (500) instead of returning a clean
+            # 401. Encoding both sides keeps the timing-safe comparison and
+            # matches web_server.py's dashboard-token check.
+            if hmac.compare_digest(token.encode(), expected_key.encode()):
+                return None  # Auth OK
 
         logger.warning(
             "API server rejected invalid API key: %s",
@@ -1938,7 +1894,7 @@ class APIServerAdapter(BasePlatformAdapter):
         """
         if not profile:
             try:
-                from hermes_runtime.secret_scope import is_multiplex_active
+                from agent.secret_scope import is_multiplex_active
 
                 if is_multiplex_active():
                     from gateway.run import _profile_runtime_scope
@@ -3134,7 +3090,7 @@ class APIServerAdapter(BasePlatformAdapter):
             return auth_err
 
         try:
-            from hermes_runtime.config import load_config
+            from hermes_cli.config import load_config
             from hermes_cli.tools_config import (
                 _get_effective_configurable_toolsets,
                 _get_platform_tools,
@@ -4005,13 +3961,6 @@ class APIServerAdapter(BasePlatformAdapter):
             session_id = _derive_chat_session_id(system_prompt, first_user)
             # history already set from request body above
 
-        namespace = _idempotency_namespace(
-            request,
-            endpoint="/v1/chat/completions",
-            gateway_session_key=gateway_session_key,
-            session_id=session_id,
-        )
-
         completion_id = f"chatcmpl-{uuid.uuid4().hex[:29]}"
         model_name = body.get("model", self._model_name)
         created = int(time.time())
@@ -4149,12 +4098,7 @@ class APIServerAdapter(BasePlatformAdapter):
                 keys=["model", "provider", "model_options", "messages", "tools", "tool_choice", "stream"],
             )
             try:
-                result, usage = await self._idempotency_cache.get_or_set(
-                    idempotency_key,
-                    fp,
-                    _compute_completion,
-                    namespace=namespace,
-                )
+                result, usage = await _idem_cache.get_or_set(idempotency_key, fp, _compute_completion)
             except Exception as e:
                 logger.error("Error running agent for chat completions: %s", e, exc_info=True)
                 return web.json_response(
@@ -5171,13 +5115,6 @@ class APIServerAdapter(BasePlatformAdapter):
         # groups the entire conversation under one session entry.
         session_id = stored_session_id or str(uuid.uuid4())
 
-        namespace = _idempotency_namespace(
-            request,
-            endpoint="/v1/responses",
-            gateway_session_key=gateway_session_key,
-            session_id=session_id,
-        )
-
         stream = _coerce_request_bool(body.get("stream"), default=False)
         route = self._resolve_route(body.get("model"))
         agent_overrides = _request_agent_overrides(
@@ -5300,18 +5237,8 @@ class APIServerAdapter(BasePlatformAdapter):
                     "tools",
                 ],
             )
-
-            async def _compute_idempotent_response():
-                result, usage = await _compute_response()
-                return result, usage, session_id
-
             try:
-                result, usage, session_id = await self._idempotency_cache.get_or_set(
-                    idempotency_key,
-                    fp,
-                    _compute_idempotent_response,
-                    namespace=namespace,
-                )
+                result, usage = await _idem_cache.get_or_set(idempotency_key, fp, _compute_response)
             except Exception as e:
                 logger.error("Error running agent for responses: %s", e, exc_info=True)
                 return web.json_response(
@@ -5683,6 +5610,42 @@ class APIServerAdapter(BasePlatformAdapter):
         trips NAS's HTTP timeout. The store CAS claim inside fire_due guards
         against double-fire on a NAS/scheduler retry.
         """
+        from hermes_cli.config import cfg_get, load_config
+        from plugins.cron_providers.chronos.verify import get_fire_verifier
+
+        auth = request.headers.get("Authorization", "")
+        token = auth[7:].strip() if auth.startswith("Bearer ") else ""
+
+        cfg = load_config()
+        verifier = get_fire_verifier()
+        verify_kwargs = dict(
+            token=token,
+            expected_audience=cfg_get(cfg, "cron", "chronos", "expected_audience", default=""),
+            jwks_or_key=cfg_get(cfg, "cron", "chronos", "nas_jwks_url", default="") or None,
+            issuer=cfg_get(cfg, "cron", "chronos", "portal_url", default="") or None,
+        )
+        try:
+            if asyncio.iscoroutinefunction(verifier):
+                claims = await verifier(**verify_kwargs)
+            else:
+                # The verifier resolves the NAS signing key from a JWKS URL,
+                # which is a synchronous HTTP GET on a cache miss (cold client
+                # or a rotated kid) — keep that blocking I/O off the event loop
+                # so a slow or rate-limited portal can't stall every other
+                # adapter sharing this loop. Same hardening the platform HTTP
+                # event verifier already got.
+                claims = await asyncio.to_thread(verifier, **verify_kwargs)
+        except Exception:
+            # Fail closed: a crashing verifier must never admit a fire — this
+            # is the only inbound that can trigger remote job execution.
+            logger.exception("cron fire: verifier crashed; rejecting token")
+            claims = None
+        if claims is None:
+            logger.warning(
+                "cron fire: rejected invalid token: %s",
+                self._request_audit_log_suffix(request),
+            )
+            return web.json_response({"error": "invalid fire token"}, status=401)
         draining = self._draining_response()
         if draining is not None:
             return draining
@@ -5692,38 +5655,19 @@ class APIServerAdapter(BasePlatformAdapter):
                 body = await request.json()
             except Exception:
                 body = {}
+            job_id = (body or {}).get("job_id")
+            if not job_id:
+                return web.json_response({"error": "missing job_id"}, status=400)
 
             from cron.scheduler_provider import resolve_cron_scheduler
             provider = resolve_cron_scheduler()
 
             loop = asyncio.get_running_loop()
-
-            async def execute(command, _target):
-                return await asyncio.to_thread(
-                    provider.fire_due,
-                    command.job_id,
-                    fire_at=command.fire_at,
-                    adapters=None,
-                    loop=loop,
-                )
-
-            accepted = await accept_cron_fire_request(
-                request.headers.get("Authorization", ""),
-                body,
-                execute=execute,
+            # Fire in the background (202 immediately). fire_due claims via the
+            # store CAS, so a retry while this is in flight is de-duped.
+            task = asyncio.create_task(
+                asyncio.to_thread(provider.fire_due, job_id, adapters=None, loop=loop)
             )
-            if accepted.failure is not None:
-                logger.warning(
-                    "cron fire: rejected request (%s): %s",
-                    accepted.failure.code,
-                    self._request_audit_log_suffix(request),
-                )
-
-            task = accepted.background_task
-            if task is None:
-                return web.json_response(
-                    dict(accepted.body), status=accepted.status_code
-                )
             reservation["detached"] = True
             task.add_done_callback(
                 lambda _task: _release_pending_api_work(self, reservation)
@@ -5734,9 +5678,7 @@ class APIServerAdapter(BasePlatformAdapter):
             except (TypeError, AttributeError):
                 pass
 
-            return web.json_response(
-                dict(accepted.body), status=accepted.status_code
-            )
+            return web.json_response({"status": "accepted", "job_id": job_id}, status=202)
 
 
     # ------------------------------------------------------------------
@@ -5959,7 +5901,7 @@ class APIServerAdapter(BasePlatformAdapter):
         the turn — a session resumed later on a delivering interface, e.g. the
         CLI or a gateway platform, re-binds fresh and is NOT blocked).
         """
-        from hermes_runtime.session_context import set_session_vars
+        from gateway.session_context import set_session_vars
 
         return set_session_vars(
             platform="api_server",
@@ -6023,7 +5965,7 @@ class APIServerAdapter(BasePlatformAdapter):
         request_profile = _api_request_profile.get()
 
         def _run():
-            from hermes_runtime.session_context import clear_session_vars
+            from gateway.session_context import clear_session_vars
 
             with self._profile_scope(request_profile):
                 tokens = self._bind_api_server_session(
@@ -6507,7 +6449,7 @@ class APIServerAdapter(BasePlatformAdapter):
                         pass
 
                 def _run_sync():
-                    from hermes_runtime.session_context import clear_session_vars
+                    from gateway.session_context import clear_session_vars
                     from tools.approval import (
                         register_gateway_notify,
                         reset_current_session_key,
@@ -7071,7 +7013,7 @@ class APIServerAdapter(BasePlatformAdapter):
             # the operator may have an external firewall / strong key.
             if is_network_accessible(self._host):
                 try:
-                    from hermes_runtime.config import load_config as _load_cfg
+                    from hermes_cli.config import load_config as _load_cfg
                     _backend = (
                         ((_load_cfg() or {}).get("terminal") or {}).get(
                             "backend", "local"

@@ -2,7 +2,7 @@
 """Diagnose an OAuth-gated remote MCP server's connection state.
 
 Decides which recovery branch you're in WITHOUT mutating disk by default:
-  1. Smoke-test the stored access_token against the MCP endpoint (server/discover).
+  1. Smoke-test the stored access_token against the MCP endpoint (initialize).
   2. If 401, attempt a refresh and smoke-test the freshly-minted token.
 
 Branches printed at the end:
@@ -10,8 +10,9 @@ Branches printed at the end:
                          breaker (SKILL pitfall 7) -> restart the gateway.
   REFRESH_FIXED       -> refresh minted a working token; pass --write to persist
                          it (atomic, 0600), then restart to clear the breaker.
-  SESSION_REVOKED     -> refresh succeeds but the new token still receives the
-                         MCP -32002 session-expired error; full re-auth required.
+  SESSION_REVOKED     -> refresh succeeds but new token STILL gets -32002
+                         "Session expired" (pitfall 10) -> full interactive
+                         re-auth required; refresh loop will NOT help.
   REFRESH_DEAD        -> refresh grant itself returns invalid_grant (pitfall 9)
                          -> full interactive re-auth, or switch to a static API key.
 
@@ -63,38 +64,25 @@ def _get_json(url, timeout=20):
     return json.loads(urllib.request.urlopen(req, timeout=timeout).read())
 
 
-def _mcp_discover(mcp_url, access_token):
-    status, _hdrs, body = _post(
+def _mcp_initialize(mcp_url, access_token):
+    status, hdrs, body = _post(
         mcp_url,
         data={
-            "jsonrpc": "2.0", "id": 1, "method": "server/discover",
-            "params": {"_meta": {
-                "io.modelcontextprotocol/protocolVersion": "2026-07-28",
-                "io.modelcontextprotocol/clientCapabilities": {},
-                "io.modelcontextprotocol/clientInfo": {
-                    "name": "hermes-diag", "version": "2.0"
-                },
-            }},
+            "jsonrpc": "2.0", "id": 1, "method": "initialize",
+            "params": {"protocolVersion": "2025-06-18", "capabilities": {},
+                       "clientInfo": {"name": "hermes-diag", "version": "1.0"}},
         },
         headers={
             "Authorization": "Bearer " + access_token,
             "Accept": "application/json, text/event-stream",
             "Content-Type": "application/json",
-            "MCP-Protocol-Version": "2026-07-28",
-            "Mcp-Method": "server/discover",
+            "MCP-Protocol-Version": "2025-06-18",
         },
     )
-    decoded = body.decode(errors="replace")
-    txt = decoded[:400]
-    ok = status == 200 and ("supportedVersions" in txt or '"result"' in txt)
-    session_revoked = False
-    try:
-        payload = json.loads(decoded)
-        error = payload.get("error") if isinstance(payload, dict) else None
-        session_revoked = isinstance(error, dict) and error.get("code") == -32002
-    except (TypeError, ValueError):
-        pass
-    return ok, session_revoked, status, txt
+    txt = body[:400].decode(errors="replace")
+    ok = status == 200 and ("serverInfo" in txt or '"result"' in txt)
+    expired = "-32002" in txt or "Session expired" in txt or "invalid_token" in (hdrs.get("WWW-Authenticate") or "")
+    return ok, expired, status, txt
 
 
 def main():
@@ -122,8 +110,8 @@ def main():
         print(f"stored expires_at in {round((exp - time.time())/60)} min")
 
     # Step 1: stored token
-    ok, _session_revoked, status, txt = _mcp_discover(mcp_url, tok["access_token"])
-    print(f"[1] stored-token server/discover -> HTTP {status} ok={ok}")
+    ok, expired, status, txt = _mcp_initialize(mcp_url, tok["access_token"])
+    print(f"[1] stored-token initialize -> HTTP {status} ok={ok} expired={expired}")
     if ok:
         print("BRANCH=TOKEN_OK  -> stored token works; 'not connected' is the breaker (7). Restart the gateway.")
         return
@@ -159,8 +147,8 @@ def main():
           f"expires_in={j.get('expires_in')} rotated_refresh={bool(j.get('refresh_token'))}")
 
     # Step 2b: smoke-test the freshly-minted token
-    ok2, session_revoked2, status2, txt2 = _mcp_discover(mcp_url, new_at)
-    print(f"[2b] new-token server/discover -> HTTP {status2} ok={ok2}")
+    ok2, expired2, status2, txt2 = _mcp_initialize(mcp_url, new_at)
+    print(f"[2b] new-token initialize -> HTTP {status2} ok={ok2} expired={expired2}")
     if ok2:
         if args.write:
             new = dict(tok)
@@ -178,12 +166,12 @@ def main():
         print("BRANCH=REFRESH_FIXED  -> refreshed token works. Persist (--write) + restart gateway.")
         return
 
-    if session_revoked2:
-        print("BRANCH=SESSION_REVOKED  -> refreshed token still has an expired MCP session.")
-        print("     Refreshing again will not help. Full interactive re-auth is required.")
+    if expired2:
+        print("BRANCH=SESSION_REVOKED  -> refresh succeeds but new token STILL -32002 'Session expired' (10).")
+        print("     Refresh loop will NOT help. Full interactive authorization_code re-auth required.")
+        print("     For an unattended gateway, prefer a static Personal API key instead.")
         return
-
-    print(f"BRANCH=UNKNOWN  -> new token failed discovery: {txt2[:200]}")
+    print(f"BRANCH=UNKNOWN  -> new token failed for a non-session reason: {txt2[:200]}")
 
 
 if __name__ == "__main__":

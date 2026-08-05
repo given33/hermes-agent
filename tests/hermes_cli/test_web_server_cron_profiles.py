@@ -56,12 +56,10 @@ def test_fire_cron_job_scopes_store_and_runtime_home_together(
     worker_home = isolated_profiles["worker_alpha"]
     monkeypatch.setattr(scheduler, "_hermes_home", None)
     captured = {}
-    fire_at = "2026-08-01T00:00:00+00:00"
 
     class RecordingProvider:
-        def fire_due(self, job_id, *, fire_at=None, adapters=None, loop=None):
+        def fire_due(self, job_id, *, adapters=None, loop=None):
             captured["job_id"] = job_id
-            captured["fire_at"] = fire_at
             captured["runtime_home"] = scheduler._get_hermes_home()
             captured["jobs_file"] = cron_jobs._current_cron_store().jobs_file
             return True
@@ -73,14 +71,9 @@ def test_fire_cron_job_scopes_store_and_runtime_home_together(
 
     outer_token = set_hermes_home_override(default_home)
     try:
-        assert web_server._fire_cron_job_for_profile(
-            "worker_alpha",
-            "worker-job",
-            fire_at,
-        ) is True
+        assert web_server._fire_cron_job_for_profile("worker_alpha", "worker-job") is True
         assert captured == {
             "job_id": "worker-job",
-            "fire_at": fire_at,
             "runtime_home": worker_home,
             "jobs_file": worker_home / "cron" / "jobs.json",
         }

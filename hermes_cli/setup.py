@@ -136,7 +136,7 @@ def _set_reasoning_effort(config: Dict[str, Any], effort: str) -> None:
 
 
 # Import config helpers
-from hermes_runtime.config import (
+from hermes_cli.config import (
     cfg_get,
     DEFAULT_CONFIG,
     get_hermes_home,
@@ -151,7 +151,7 @@ from hermes_runtime.config import (
 )
 # display_hermes_home imported lazily at call sites (stale-module safety during hermes update)
 
-from hermes_runtime.colors import Colors, color
+from hermes_cli.colors import Colors, color
 
 
 def print_header(title: str):
@@ -160,13 +160,13 @@ def print_header(title: str):
     print(color(f"◆ {title}", Colors.CYAN, Colors.BOLD))
 
 
-from hermes_runtime.console_output import (  # noqa: E402
+from hermes_cli.cli_output import (  # noqa: E402
     print_error,
     print_info,
     print_success,
     print_warning,
 )
-from hermes_runtime.secret_prompt import masked_secret_prompt  # noqa: E402
+from hermes_cli.secret_prompt import masked_secret_prompt  # noqa: E402
 
 
 def is_interactive_stdin() -> bool:
@@ -881,7 +881,7 @@ def setup_model_provider(config: dict, *, quick: bool = False):
     When *quick* is True, skips credential rotation, vision, and TTS
     configuration — used by the streamlined first-time quick setup.
     """
-    from hermes_runtime.config import load_config, save_config
+    from hermes_cli.config import load_config, save_config
 
     print_header("Inference Provider")
     print_info("Choose how to connect to your main chat model.")
@@ -2514,7 +2514,7 @@ def _get_section_config_summary(config: dict, section_key: str) -> Optional[str]
     """Return a short summary if a setup section is already configured, else None.
 
     Used after OpenClaw migration to detect which sections can be skipped.
-    ``get_env_value`` is the module-level import from hermes_runtime.config
+    ``get_env_value`` is the module-level import from hermes_cli.config
     so that test patches on ``setup_mod.get_env_value`` take effect.
     """
     if section_key == "model":
@@ -2867,7 +2867,7 @@ def _run_portal_one_shot(config: dict) -> None:
     provider write here) means ``hermes portal`` always offers a model picker,
     and there is a single source of truth for the Nous onboarding steps.
     """
-    from hermes_runtime.config import load_config
+    from hermes_cli.config import load_config
 
     print()
     print(
@@ -2947,7 +2947,7 @@ def run_setup_wizard(args):
       hermes setup telemetry — just local shared metrics
       hermes setup agent     — just agent settings
     """
-    from hermes_runtime.config import is_managed, managed_error
+    from hermes_cli.config import is_managed, managed_error
     if is_managed():
         managed_error("run setup wizard")
         return
@@ -2988,6 +2988,11 @@ def run_setup_wizard(args):
         print_noninteractive_setup_guidance(
             "Running in a non-interactive environment (no TTY detected)."
         )
+        return
+
+    # --portal: one-shot Nous Portal setup. Skips the rest of the wizard.
+    if bool(getattr(args, "portal", False)):
+        _run_portal_one_shot(config)
         return
 
     # Check if a specific section was requested
@@ -3105,13 +3110,17 @@ def run_setup_wizard(args):
         setup_mode = prompt_choice(
             "How would you like to set up Hermes?",
             [
-                "Guided setup — configure your model provider, tools, and runtime",
+                "Quick Setup (Nous Portal) — free OAuth login, no API keys, model + tools (recommended)",
+                "Full setup — configure every provider, tool & option yourself (bring your own keys)",
                 "Blank Slate — everything off except the bare minimum; opt in to each capability",
             ],
             0,
         )
 
-        if setup_mode == 1:
+        if setup_mode == 0:
+            _run_first_time_quick_setup(config, hermes_home, is_existing)
+            return
+        if setup_mode == 2:
             _run_blank_slate_setup(config, hermes_home, is_existing)
             return
 
@@ -3170,7 +3179,7 @@ def _run_first_time_quick_setup(config: dict, hermes_home, is_existing: bool):
     settings, tools); the user can customize later via ``hermes setup <section>``
     or switch providers with ``hermes model``.
     """
-    from hermes_runtime.config import load_config
+    from hermes_cli.config import load_config
 
     # Step 1: Nous Portal — OAuth login + model selection.
     # _model_flow_nous() handles both the logged-out path (device-code OAuth,
@@ -3389,7 +3398,7 @@ def _run_blank_slate_setup(config: dict, hermes_home, is_existing: bool):
 
 def _blank_slate_walkthrough(config: dict, hermes_home):
     """Opt-in walkthrough for Blank Slate: skills, tools, plugins, MCP, gateway."""
-    from hermes_runtime.config import load_config
+    from hermes_cli.config import load_config
 
     # ── Bundled skills — default to NONE, offer to seed all ──
     print()
@@ -3472,7 +3481,7 @@ def _blank_slate_walkthrough(config: dict, hermes_home):
 
 def _run_quick_setup(config: dict, hermes_home):
     """Quick setup — only configure items that are missing."""
-    from hermes_runtime.config import (
+    from hermes_cli.config import (
         get_missing_env_vars,
         get_missing_config_fields,
         check_config_version,

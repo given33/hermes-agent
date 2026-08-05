@@ -45,8 +45,6 @@ def _base_claims(**over):
         "aud": AUD,
         "iss": ISS,
         "purpose": "cron_fire",
-        "job_id": "job-123",
-        "fire_at": "2026-08-01T00:00:00+00:00",
         "iat": now,
         "nbf": now - 5,
         "exp": now + 300,

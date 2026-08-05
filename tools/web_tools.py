@@ -130,7 +130,7 @@ def _env_value(name: str) -> str:
     auto-detect cascade and ``check_web_api_key()`` blind to it. See #34290.
     """
     try:
-        from hermes_runtime.config import get_env_value
+        from hermes_cli.config import get_env_value
 
         val = get_env_value(name)
     except Exception:
@@ -146,7 +146,7 @@ def _has_env(name: str) -> bool:
 def _load_web_config() -> dict:
     """Load the ``web:`` section from ~/.hermes/config.yaml."""
     try:
-        from hermes_runtime.config import load_config
+        from hermes_cli.config import load_config
         # ``or {}``: a present-but-null ``web:`` section (YAML ``web:`` with no
         # body) makes ``.get("web", {})`` return None, which would break every
         # caller that does ``_load_web_config().get(...)``. Honor the ``-> dict``
@@ -774,7 +774,7 @@ async def web_extract_tool(
     """
     # Block URLs containing embedded secrets (exfiltration prevention).
     # URL-decode first so percent-encoded secrets (%73k- = sk-) are caught.
-    from hermes_runtime.redaction import SECRET_PREFIX_PATTERN
+    from agent.redact import _PREFIX_RE
     from urllib.parse import unquote
     normalized_urls: List[str] = []
     normalized_indices: List[int] = []
@@ -794,10 +794,10 @@ async def web_extract_tool(
             continue
         normalized_url = normalize_url_for_request(_url)
         if (
-            SECRET_PREFIX_PATTERN.search(_url)
-            or SECRET_PREFIX_PATTERN.search(unquote(_url))
-            or SECRET_PREFIX_PATTERN.search(normalized_url)
-            or SECRET_PREFIX_PATTERN.search(unquote(normalized_url))
+            _PREFIX_RE.search(_url)
+            or _PREFIX_RE.search(unquote(_url))
+            or _PREFIX_RE.search(normalized_url)
+            or _PREFIX_RE.search(unquote(normalized_url))
         ):
             return json.dumps({
                 "success": False,
@@ -1094,7 +1094,7 @@ if __name__ == "__main__":
     # Check if API keys are available
     web_available = check_web_api_key()
     tool_gateway_available = _is_tool_gateway_ready()
-    from hermes_runtime.config import get_env_value as _gev
+    from hermes_cli.config import get_env_value as _gev
     firecrawl_key_available = bool((_gev("FIRECRAWL_API_KEY") or "").strip())
     firecrawl_url_available = bool((_gev("FIRECRAWL_API_URL") or "").strip())
 

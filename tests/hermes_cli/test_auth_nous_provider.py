@@ -13,11 +13,6 @@ import pytest
 from hermes_cli.auth import AuthError, get_provider_auth_state, resolve_nous_runtime_credentials
 
 
-pytestmark = pytest.mark.skip(
-    reason="This distribution supports Nous API keys, not the retired OAuth device-code flow."
-)
-
-
 # =============================================================================
 # _resolve_verify: CA bundle path validation
 # =============================================================================

@@ -15,14 +15,14 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional, Set, Tuple
 
 from hermes_constants import OPENROUTER_BASE_URL
-from hermes_runtime.config import load_env
-from hermes_runtime.secret_scope import get_secret as _get_secret
+from hermes_cli.config import load_env
+from agent.secret_scope import get_secret as _get_secret
 from agent.credential_persistence import (
     is_borrowed_credential_source,
     sanitize_borrowed_credential_payload,
 )
-import agent.provider_auth as auth_mod
-from agent.provider_auth import (
+import hermes_cli.auth as auth_mod
+from hermes_cli.auth import (
     CODEX_ACCESS_TOKEN_REFRESH_SKEW_SECONDS,
     PROVIDER_REGISTRY,
     _auth_store_lock,
@@ -56,7 +56,7 @@ def _load_config_safe() -> Optional[dict]:
     deep-copied) the full config again.
     """
     try:
-        from hermes_runtime.config import load_config_readonly
+        from hermes_cli.config import load_config_readonly
 
         return load_config_readonly()
     except Exception:
@@ -245,13 +245,22 @@ class PooledCredential:
     @property
     def runtime_api_key(self) -> str:
         if self.provider == "nous":
-            # Nous is a normal direct API-key provider.  Old Portal
-            # device-code credentials must never become runtime material.
-            if (
-                self.auth_type == AUTH_TYPE_API_KEY
-                and self.source not in {"device_code", "manual:device_code"}
+            # Nous stores the runtime inference credential in agent_key for
+            # compatibility. It must be a NAS invoke JWT.
+            for token, expires_at in (
+                (self.agent_key, self.agent_key_expires_at),
+                (self.access_token, self.expires_at),
             ):
-                return str(self.access_token or "").strip()
+                if (
+                    isinstance(token, str)
+                    and token.strip()
+                    and auth_mod._nous_invoke_jwt_is_usable(
+                        token,
+                        scope=getattr(self, "scope", None),
+                        expires_at=expires_at,
+                    )
+                ):
+                    return token.strip()
             return ""
         return str(self.access_token or "")
 
@@ -393,7 +402,7 @@ def _iter_custom_providers(config: Optional[dict] = None):
     if not isinstance(custom_providers, list):
         # Fall back to the v12+ providers dict via the compatibility layer
         try:
-            from hermes_runtime.config import get_compatible_custom_providers
+            from hermes_cli.config import get_compatible_custom_providers
 
             custom_providers = get_compatible_custom_providers(config)
         except Exception:
@@ -2333,7 +2342,7 @@ def _seed_from_singletons(provider: str, entries: List[PooledCredential]) -> Tup
     # Shared suppression gate — used at every upsert site so
     # `hermes auth remove <provider> <N>` is stable across all source types.
     try:
-        from agent.provider_auth import is_source_suppressed as _is_suppressed
+        from hermes_cli.auth import is_source_suppressed as _is_suppressed
     except ImportError:
         def _is_suppressed(_p, _s):  # type: ignore[misc]
             return False
@@ -2344,7 +2353,7 @@ def _seed_from_singletons(provider: str, entries: List[PooledCredential]) -> Tup
         # Without this gate, auxiliary client fallback chains silently read
         # ~/.claude/.credentials.json without user consent.  See PR #4210.
         try:
-            from agent.provider_auth import is_provider_explicitly_configured
+            from hermes_cli.auth import is_provider_explicitly_configured
             if not is_provider_explicitly_configured("anthropic"):
                 return changed, active_sources
         except ImportError:
@@ -2417,23 +2426,6 @@ def _seed_from_singletons(provider: str, entries: List[PooledCredential]) -> Tup
                 )
 
     elif provider == "nous":
-        # Portal/device-code credentials belonged to the retired consumer
-        # account product.  Prune them on every load and never seed singleton
-        # auth.json state into the direct API-key pool.  Manual API keys and
-        # NOUS_API_KEY entries are populated by the normal pool paths.
-        retained = [
-            entry
-            for entry in entries
-            if entry.source not in {"device_code", "manual:device_code"}
-            and entry.auth_type != AUTH_TYPE_OAUTH
-        ]
-        if len(retained) != len(entries):
-            entries[:] = retained
-            changed = True
-        return changed, active_sources
-
-        # Legacy singleton migration retained below as unreachable source for
-        # downstream compatibility patches.
         state = _load_provider_state(auth_store, "nous")
         has_runtime_material = bool(
             isinstance(state, dict)
@@ -2578,7 +2570,7 @@ def _seed_from_singletons(provider: str, entries: List[PooledCredential]) -> Tup
         # Use refresh_if_expiring=False to avoid network calls during
         # pool loading / provider discovery.
         try:
-            from agent.provider_auth import resolve_qwen_runtime_credentials
+            from hermes_cli.auth import resolve_qwen_runtime_credentials
             creds = resolve_qwen_runtime_credentials(refresh_if_expiring=False)
             token = creds.get("api_key", "")
             if token:
@@ -2609,7 +2601,7 @@ def _seed_from_singletons(provider: str, entries: List[PooledCredential]) -> Tup
         # always refreshes on expiry, so instead read raw state here to avoid
         # surprise network calls during provider discovery.
         try:
-            from agent.provider_auth import get_provider_auth_state
+            from hermes_cli.auth import get_provider_auth_state
             state = get_provider_auth_state("minimax-oauth")
             if state and state.get("access_token"):
                 source_name = "oauth"
@@ -2692,7 +2684,7 @@ def _seed_from_singletons(provider: str, entries: List[PooledCredential]) -> Tup
             if _is_suppressed(provider, source):
                 return changed, active_sources
             active_sources.add(source)
-            from agent.provider_auth import DEFAULT_XAI_OAUTH_BASE_URL
+            from hermes_cli.auth import DEFAULT_XAI_OAUTH_BASE_URL
 
             base_url = DEFAULT_XAI_OAUTH_BASE_URL
             changed |= _upsert_entry(
@@ -2759,14 +2751,14 @@ def _seed_from_env(provider: str, entries: List[PooledCredential]) -> Tuple[bool
     # Without this gate the removal is silently undone on the next
     # load_pool() call whenever the var is still exported by the shell.
     try:
-        from agent.provider_auth import is_source_suppressed as _is_source_suppressed
+        from hermes_cli.auth import is_source_suppressed as _is_source_suppressed
     except ImportError:
         def _is_source_suppressed(_p, _s):  # type: ignore[misc]
             return False
 
     def _secret_source_for_env(env_var: str) -> Optional[str]:
         try:
-            from hermes_runtime.secret_provenance import get_secret_source
+            from hermes_cli.env_loader import get_secret_source
             source_label = get_secret_source(env_var)
         except Exception:
             source_label = None
@@ -2899,7 +2891,7 @@ def _seed_custom_pool(pool_key: str, entries: List[PooledCredential]) -> Tuple[b
 
     # Shared suppression gate — same pattern as _seed_from_env/_seed_from_singletons.
     try:
-        from agent.provider_auth import is_source_suppressed as _is_suppressed
+        from hermes_cli.auth import is_source_suppressed as _is_suppressed
     except ImportError:
         def _is_suppressed(_p, _s):  # type: ignore[misc]
             return False

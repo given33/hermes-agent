@@ -112,8 +112,6 @@ import logging
 import os
 import re
 import shlex
-import shutil
-import signal
 import subprocess
 import sys
 import tempfile
@@ -125,7 +123,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable, Dict, Iterator, List, Optional, Set, Tuple
 
-from hermes_runtime.subprocess_compat import IS_WINDOWS, windows_hide_flags
+from hermes_cli._subprocess_compat import IS_WINDOWS, windows_hide_flags
 
 try:
     import fcntl  # POSIX only; Windows falls back to best-effort without flock.
@@ -452,7 +450,7 @@ def _spawn(spec: ShellHookSpec, stdin_json: str) -> Dict[str, Any]:
         "error": None,
     }
     try:
-        argv = _prepare_spawn_argv(spec.command)
+        argv = shlex.split(os.path.expanduser(spec.command))
     except ValueError as exc:
         result["error"] = f"command {spec.command!r} cannot be parsed: {exc}"
         return result
@@ -461,36 +459,17 @@ def _spawn(spec: ShellHookSpec, stdin_json: str) -> Dict[str, Any]:
         return result
 
     t0 = time.monotonic()
-    if IS_WINDOWS:
-        _popen_kwargs = {
-            "creationflags": windows_hide_flags()
-            | getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0x00000200),
-        }
-    else:
-        _popen_kwargs = {"start_new_session": True}
+    _popen_kwargs = {"creationflags": windows_hide_flags()} if IS_WINDOWS else {}
     try:
-        proc = subprocess.Popen(
+        proc = subprocess.run(
             argv,
-            stdin=subprocess.PIPE,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            text=True,
-            encoding="utf-8",
-            errors="replace",
+            input=stdin_json,
+            capture_output=True,
+            timeout=spec.timeout,
+            text=True, encoding='utf-8', errors='replace',
             shell=False,
             **_popen_kwargs,
         )
-        try:
-            output = proc.communicate(input=stdin_json, timeout=spec.timeout)
-        except subprocess.TimeoutExpired:
-            _terminate_hook_process_tree(proc)
-            try:
-                proc.communicate(timeout=2)
-            except (OSError, subprocess.TimeoutExpired):
-                pass
-            result["timed_out"] = True
-            result["elapsed_seconds"] = round(time.monotonic() - t0, 3)
-            return result
     except subprocess.TimeoutExpired:
         result["timed_out"] = True
         result["elapsed_seconds"] = round(time.monotonic() - t0, 3)
@@ -505,45 +484,11 @@ def _spawn(spec: ShellHookSpec, stdin_json: str) -> Dict[str, Any]:
         result["error"] = str(exc)
         return result
 
-    if output is None:
-        stdout, stderr = "", ""
-    else:
-        stdout, stderr = output
     result["returncode"] = proc.returncode
-    result["stdout"] = stdout or ""
-    result["stderr"] = stderr or ""
+    result["stdout"] = proc.stdout or ""
+    result["stderr"] = proc.stderr or ""
     result["elapsed_seconds"] = round(time.monotonic() - t0, 3)
     return result
-
-
-def _terminate_hook_process_tree(proc: subprocess.Popen) -> None:
-    """Terminate a timed-out hook and every child holding its stdio pipes."""
-
-    if proc.poll() is not None:
-        return
-    if IS_WINDOWS:
-        try:
-            subprocess.run(
-                ["taskkill", "/PID", str(proc.pid), "/T", "/F"],
-                stdout=subprocess.DEVNULL,
-                stderr=subprocess.DEVNULL,
-                timeout=5,
-                check=False,
-                creationflags=windows_hide_flags(),
-            )
-            return
-        except (OSError, subprocess.TimeoutExpired):
-            pass
-    else:
-        try:
-            os.killpg(proc.pid, signal.SIGKILL)  # windows-footgun: ok - POSIX-only branch
-            return
-        except (OSError, ProcessLookupError):
-            pass
-    try:
-        proc.kill()
-    except OSError:
-        pass
 
 
 def _make_callback(spec: ShellHookSpec) -> Callable[..., Optional[Dict[str, Any]]]:
@@ -861,78 +806,6 @@ _SCRIPT_EXTENSIONS: Tuple[str, ...] = (
 )
 
 
-def _split_command(command: str) -> List[str]:
-    """Split a configured command without corrupting Windows paths."""
-
-    parts = shlex.split(command, posix=not IS_WINDOWS)
-    if not IS_WINDOWS:
-        return parts
-    # ``posix=False`` preserves backslashes but also preserves surrounding
-    # quotes. subprocess expects the dequoted argv value.
-    return [
-        part[1:-1]
-        if len(part) >= 2 and part[0] == part[-1] and part[0] in {'"', "'"}
-        else part
-        for part in parts
-    ]
-
-
-def _expand_user_path(value: str) -> str:
-    """Expand ``~`` using an explicit HOME consistently on all platforms."""
-    candidate = str(value or "")
-    if candidate.startswith(("~/", "~\\", "~")):
-        configured_home = os.environ.get("HOME") or os.environ.get("USERPROFILE")
-        if configured_home:
-            if candidate == "~":
-                return configured_home
-            return str(Path(configured_home) / candidate[2:].replace("\\", os.sep).replace("/", os.sep))
-    return os.path.expanduser(candidate)
-
-
-def _windows_bash() -> Optional[str]:
-    """Locate Git Bash for native Windows shell-hook execution."""
-
-    configured = os.environ.get("HERMES_SHELL_HOOK_BASH", "").strip()
-    program_files = os.environ.get("ProgramFiles", r"C:\Program Files")
-    candidates = [
-        configured,
-        str(Path(program_files) / "Git" / "bin" / "bash.exe"),
-        str(Path(program_files) / "Git" / "usr" / "bin" / "bash.exe"),
-    ]
-    for candidate in candidates:
-        if candidate and Path(candidate).is_file():
-            return candidate
-    discovered = shutil.which("bash")
-    if discovered and "system32" not in discovered.casefold():
-        return discovered
-    return None
-
-
-def _prepare_spawn_argv(command: str) -> List[str]:
-    """Resolve platform-specific interpreter shims for a parsed command."""
-
-    argv = _split_command(_expand_user_path(command))
-    if not IS_WINDOWS or not argv:
-        return argv
-
-    first = argv[0]
-    first_path = Path(first)
-    if first_path.is_file() and first_path.suffix.casefold() in {".sh", ".bash"}:
-        bash = _windows_bash()
-        if bash:
-            return [bash, *argv]
-
-    if first.casefold() in {"python", "python3", "python3.exe"}:
-        return [sys.executable, *argv[1:]]
-    if (
-        first.replace("\\", "/").casefold().endswith("/usr/bin/env")
-        and len(argv) >= 2
-        and argv[1].casefold() in {"python", "python3", "python3.exe"}
-    ):
-        return [sys.executable, *argv[2:]]
-    return argv
-
-
 def _command_script_path(command: str) -> str:
     """Return the script path from ``command`` for doctor / drift checks.
 
@@ -942,7 +815,7 @@ def _command_script_path(command: str) -> str:
     common bare-path form.
     """
     try:
-        parts = _split_command(command)
+        parts = shlex.split(command)
     except ValueError:
         return command
     if not parts:
@@ -1006,7 +879,7 @@ def script_mtime_iso(command: str) -> Optional[str]:
     if not path:
         return None
     try:
-        expanded = _expand_user_path(path)
+        expanded = os.path.expanduser(path)
         return datetime.fromtimestamp(
             os.path.getmtime(expanded), tz=timezone.utc,
         ).isoformat().replace("+00:00", "Z")
@@ -1025,20 +898,14 @@ def script_is_executable(command: str) -> bool:
     path = _command_script_path(command)
     if not path:
         return False
-    expanded = _expand_user_path(path)
+    expanded = os.path.expanduser(path)
     if not os.path.isfile(expanded):
         return False
     try:
-        argv = _split_command(command)
+        argv = shlex.split(command)
     except ValueError:
         return False
     is_bare_invocation = bool(argv) and argv[0] == path
-    if IS_WINDOWS and is_bare_invocation:
-        suffix = Path(expanded).suffix.casefold()
-        if suffix in {".sh", ".bash"}:
-            return _windows_bash() is not None and os.access(expanded, os.R_OK)
-        # CreateProcess does not honor Unix execute bits or file associations.
-        return suffix in {".exe", ".com", ".cmd", ".bat"} and os.access(expanded, os.R_OK)
     required = os.X_OK if is_bare_invocation else os.R_OK
     return os.access(expanded, required)
 

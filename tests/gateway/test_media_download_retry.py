@@ -380,54 +380,6 @@ class TestSlackAttachmentDiagnostics:
         assert "403" in detail
         assert "permission or scope" in detail
 
-    def test_external_file_block_returns_user_notice(self):
-        """A Slack external/remote file (url_private outside Slack's own
-        hosts) is blocked by _check_slack_download_url before any request is
-        made. That ValueError must map to a user-visible notice — previously
-        it fell through every branch, returned None, and the attachment
-        vanished with no explanation."""
-        from plugins.platforms.slack.adapter import _check_slack_download_url
-
-        adapter = _make_slack_adapter()
-        with pytest.raises(ValueError) as excinfo:
-            _check_slack_download_url("https://drive.google.com/uc?id=abc123")
-        detail = adapter._describe_slack_download_failure(
-            excinfo.value, file_obj={"name": "roadmap.pdf"}
-        )
-        assert detail is not None
-        assert "roadmap.pdf" in detail
-        assert "outside Slack" in detail
-
-    def test_offhost_redirect_block_returns_same_external_notice(self):
-        """The redirect guard's off-Slack-host ValueError is the same user
-        story (file content lives outside Slack) and must not fall through
-        to a silent None either."""
-        adapter = _make_slack_adapter()
-        exc = ValueError("Blocked Slack file redirect off Slack-owned hosts")
-        detail = adapter._describe_slack_download_failure(exc, file_obj={"name": "deck.key"})
-        assert detail is not None
-        assert "deck.key" in detail
-        assert "outside Slack" in detail
-
-    def test_private_address_block_returns_user_notice(self):
-        adapter = _make_slack_adapter()
-        exc = ValueError(
-            "Blocked Slack file download resolving to a private/internal address: https://x"
-        )
-        detail = adapter._describe_slack_download_failure(exc, file_obj={"id": "F42"})
-        assert detail is not None
-        assert "F42" in detail
-        assert "private/internal" in detail
-
-    def test_unrelated_valueerror_still_returns_none(self):
-        """Only the download-guard ValueErrors get the external-file notice;
-        an unrelated ValueError must keep the generic-log fallback path."""
-        adapter = _make_slack_adapter()
-        detail = adapter._describe_slack_download_failure(
-            ValueError("something else entirely"), file_obj={"name": "x.bin"}
-        )
-        assert detail is None
-
 
 # ---------------------------------------------------------------------------
 # SlackAdapter._download_slack_file
@@ -435,13 +387,6 @@ class TestSlackAttachmentDiagnostics:
 
 class TestSlackDownloadSlackFile:
     """Tests for SlackAdapter._download_slack_file"""
-
-    @pytest.fixture(autouse=True)
-    def _stub_url_safety_dns(self, monkeypatch):
-        # The download now runs is_safe_url before attaching the bot token.
-        # Host pinning is a pure string check, but is_safe_url resolves DNS —
-        # unit tests must not depend on a live lookup of files.slack.com.
-        monkeypatch.setattr("tools.url_safety.is_safe_url", lambda url: True)
 
     def test_success_on_first_attempt(self, tmp_path, monkeypatch):
         """Successful download on first try returns a cached file path."""
@@ -505,11 +450,6 @@ class TestSlackDownloadSlackFile:
 class TestSlackDownloadSlackFileBytes:
     """Tests for SlackAdapter._download_slack_file_bytes"""
 
-    @pytest.fixture(autouse=True)
-    def _stub_url_safety_dns(self, monkeypatch):
-        # See TestSlackDownloadSlackFile — keep DNS out of unit tests.
-        monkeypatch.setattr("tools.url_safety.is_safe_url", lambda url: True)
-
     def test_success_returns_bytes(self):
         """Successful download returns raw bytes."""
         adapter = _make_slack_adapter()
@@ -532,119 +472,6 @@ class TestSlackDownloadSlackFileBytes:
 
         result = asyncio.run(run())
         assert result == b"raw bytes here"
-
-
-# ---------------------------------------------------------------------------
-# SlackAdapter inbound download SSRF / token-pinning guards
-# ---------------------------------------------------------------------------
-
-class TestSlackDownloadSsrfGuards:
-    """The inbound file URL comes from event JSON (url_private[_download]) and
-    Slack remote files let a workspace member point it anywhere — the bot
-    token must only ever be sent to Slack-owned file hosts, and neither the
-    initial URL nor any redirect may reach a private/internal address.
-    """
-
-    def test_is_slack_file_url_accepts_official_hosts(self):
-        from plugins.platforms.slack.adapter import _is_slack_file_url
-
-        assert _is_slack_file_url("https://files.slack.com/files-pri/T1-F1/x.png")
-        assert _is_slack_file_url("https://myteam.slack.com/files/U1/F1/x.png")
-        assert _is_slack_file_url("https://files.slack-files.com/legacy/x.png")
-
-    def test_is_slack_file_url_rejects_lookalikes_and_tricks(self):
-        from plugins.platforms.slack.adapter import _is_slack_file_url
-
-        # Arbitrary attacker host (the files.remote.add case).
-        assert not _is_slack_file_url("https://evil.test/steal")
-        # Suffix lookalike without the dot boundary.
-        assert not _is_slack_file_url("https://notslack.com/x")
-        assert not _is_slack_file_url("https://evilslack.com.attacker.net/x")
-        # Userinfo trick: hostname is evil.test, not files.slack.com.
-        assert not _is_slack_file_url("https://files.slack.com@evil.test/x")
-        # Plaintext scheme must never carry the bot token.
-        assert not _is_slack_file_url("http://files.slack.com/x")
-        # Metadata/localhost probes.
-        assert not _is_slack_file_url("https://169.254.169.254/latest/meta-data/")
-        assert not _is_slack_file_url("https://127.0.0.1:8443/admin")
-        assert not _is_slack_file_url("")
-
-    def test_download_rejects_non_slack_host_before_any_request(self, monkeypatch):
-        """A non-Slack url_private must be blocked without a single HTTP call
-        (that call would carry the xoxb bot token)."""
-        monkeypatch.setattr("tools.url_safety.is_safe_url", lambda url: True)
-        adapter = _make_slack_adapter()
-
-        mock_client = AsyncMock()
-        mock_client.get = AsyncMock()
-        mock_client.__aenter__ = AsyncMock(return_value=mock_client)
-        mock_client.__aexit__ = AsyncMock(return_value=False)
-
-        async def run():
-            with patch("httpx.AsyncClient", return_value=mock_client):
-                await adapter._download_slack_file_bytes("https://evil.test/f.bin")
-
-        with pytest.raises(ValueError, match="non-Slack host"):
-            asyncio.run(run())
-        mock_client.get.assert_not_called()
-
-    def test_download_file_rejects_non_slack_host(self, monkeypatch):
-        monkeypatch.setattr("tools.url_safety.is_safe_url", lambda url: True)
-        adapter = _make_slack_adapter()
-
-        async def run():
-            await adapter._download_slack_file("https://evil.test/img.jpg", ext=".jpg")
-
-        with pytest.raises(ValueError, match="non-Slack host"):
-            asyncio.run(run())
-
-    def test_download_rejects_private_resolution(self, monkeypatch):
-        """Even a pinned Slack host is refused when is_safe_url says the URL
-        resolves privately (split-horizon DNS / poisoning) — fail closed."""
-        monkeypatch.setattr("tools.url_safety.is_safe_url", lambda url: False)
-        adapter = _make_slack_adapter()
-
-        async def run():
-            await adapter._download_slack_file_bytes(
-                "https://files.slack.com/files-pri/T1-F1/x.bin"
-            )
-
-        with pytest.raises(ValueError, match="private/internal"):
-            asyncio.run(run())
-
-    def test_redirect_guard_blocks_off_slack_redirect(self, monkeypatch):
-        from plugins.platforms.slack.adapter import _slack_file_redirect_guard
-
-        monkeypatch.setattr("tools.url_safety.is_safe_url", lambda url: True)
-        resp = MagicMock()
-        resp.is_redirect = True
-        resp.headers = {"location": "https://evil.test/steal"}
-        resp.url = "https://files.slack.com/files-pri/T1-F1/x.png"
-
-        with pytest.raises(ValueError, match="off Slack-owned hosts"):
-            asyncio.run(_slack_file_redirect_guard(resp))
-
-    def test_redirect_guard_blocks_private_redirect_target(self, monkeypatch):
-        from plugins.platforms.slack.adapter import _slack_file_redirect_guard
-
-        monkeypatch.setattr("tools.url_safety.is_safe_url", lambda url: False)
-        resp = MagicMock()
-        resp.is_redirect = True
-        # Slack-owned host that (per stub) resolves to a private address.
-        resp.headers = {"location": "https://files.slack.com/next"}
-        resp.url = "https://files.slack.com/files-pri/T1-F1/x.png"
-
-        with pytest.raises(ValueError, match="private/internal"):
-            asyncio.run(_slack_file_redirect_guard(resp))
-
-    def test_redirect_guard_ignores_non_redirect_responses(self, monkeypatch):
-        from plugins.platforms.slack.adapter import _slack_file_redirect_guard
-
-        monkeypatch.setattr("tools.url_safety.is_safe_url", lambda url: True)
-        resp = MagicMock()
-        resp.is_redirect = False
-
-        asyncio.run(_slack_file_redirect_guard(resp))  # must not raise
 
 
 # ---------------------------------------------------------------------------

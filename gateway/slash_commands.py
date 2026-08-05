@@ -40,12 +40,7 @@ from gateway.session import (
     build_session_key,
     is_shared_multi_user_session,
 )
-from hermes_runtime.config import (
-    atomic_config_write,
-    cfg_get,
-    clear_model_endpoint_credentials,
-    mutate_config,
-)
+from hermes_cli.config import atomic_config_write, cfg_get, clear_model_endpoint_credentials
 from utils import (
     atomic_json_write,
     base_url_host_matches,
@@ -1724,7 +1719,7 @@ class GatewaySlashCommandsMixin:
         # --refresh: bust the disk cache so the picker shows live data.
         if force_refresh:
             try:
-                from agent.model_catalog import clear_provider_models_cache
+                from hermes_cli.models import clear_provider_models_cache
                 clear_provider_models_cache()
             except Exception:
                 pass
@@ -1748,7 +1743,7 @@ class GatewaySlashCommandsMixin:
                     current_base_url = model_cfg.get("base_url", "")
                 user_provs = cfg.get("providers")
                 try:
-                    from hermes_runtime.config import get_compatible_custom_providers
+                    from hermes_cli.config import get_compatible_custom_providers
                     custom_provs = get_compatible_custom_providers(cfg)
                 except Exception:
                     custom_provs = cfg.get("custom_providers")
@@ -1961,8 +1956,8 @@ class GatewaySlashCommandsMixin:
                             try:
                                 # Write-back round-trip: raw read is correct
                                 # (merged defaults must not be persisted).
-                                from hermes_cli.config import read_user_config_raw
-                                _persist_cfg = read_user_config_raw(config_path)
+                                from hermes_cli.config import read_raw_config_strict
+                                _persist_cfg = read_raw_config_strict(config_path)
                                 _raw_model = _persist_cfg.get("model")
                                 if isinstance(_raw_model, dict):
                                     _persist_model_cfg = _raw_model
@@ -2005,30 +2000,11 @@ class GatewaySlashCommandsMixin:
                                     if result.api_mode:
                                         _persist_model_cfg["api_mode"] = result.api_mode
                                     else:
-                                        _persist_model_cfg = {}
-                                        _persist_cfg["model"] = _persist_model_cfg
-                                    _persist_model_cfg["default"] = result.new_model
-                                    _persist_model_cfg["provider"] = result.target_provider
-                                    # Named providers always resolve base_url/api_mode fresh,
-                                    # so any leftover is cleared unconditionally below. Custom
-                                    # providers have no registry entry to re-derive from, so
-                                    # they need an explicit set-or-clear here — the previous
-                                    # lone `if result.base_url:` left a stale base_url behind
-                                    # when switching to a custom provider whose resolver
-                                    # returned an empty base_url (#25107).
-                                    _is_custom_target = str(result.target_provider or "").strip().lower() == "custom"
-                                    if result.base_url:
-                                        _persist_model_cfg["base_url"] = result.base_url
-                                    elif _is_custom_target:
-                                        _persist_model_cfg.pop("base_url", None)
-                                    if _is_custom_target:
-                                        if result.api_mode:
-                                            _persist_model_cfg["api_mode"] = result.api_mode
-                                        else:
-                                            _persist_model_cfg.pop("api_mode", None)
-                                    else:
-                                        clear_model_endpoint_credentials(_persist_model_cfg, clear_base_url=True)
-                                    save_config(_persist_cfg)
+                                        _persist_model_cfg.pop("api_mode", None)
+                                else:
+                                    clear_model_endpoint_credentials(_persist_model_cfg, clear_base_url=True)
+                                from hermes_cli.config import save_config
+                                save_config(_persist_cfg)
                             except Exception as e:
                                 logger.warning("Failed to persist model switch: %s", e)
 
@@ -2305,8 +2281,8 @@ class GatewaySlashCommandsMixin:
                 try:
                     # Write-back round-trip: raw read is correct (merged
                     # defaults must not be persisted back to the user's file).
-                    from hermes_cli.config import read_user_config_raw
-                    cfg = read_user_config_raw(config_path)
+                    from hermes_cli.config import read_raw_config_strict
+                    cfg = read_raw_config_strict(config_path)
                     # Coerce scalar/None ``model:`` into a dict before mutation —
                     # otherwise ``cfg.setdefault("model", {})`` returns the existing
                     # scalar and the next assignment raises
@@ -2349,25 +2325,11 @@ class GatewaySlashCommandsMixin:
                         if result.api_mode:
                             model_cfg["api_mode"] = result.api_mode
                         else:
-                            model_cfg = {}
-                            cfg["model"] = model_cfg
-                        model_cfg["default"] = result.new_model
-                        model_cfg["provider"] = result.target_provider
-                        # See the picker handler above for why custom providers need an
-                        # explicit set-or-clear instead of the old lone truthy check (#25107).
-                        _is_custom_target = str(result.target_provider or "").strip().lower() == "custom"
-                        if result.base_url:
-                            model_cfg["base_url"] = result.base_url
-                        elif _is_custom_target:
-                            model_cfg.pop("base_url", None)
-                        if _is_custom_target:
-                            if result.api_mode:
-                                model_cfg["api_mode"] = result.api_mode
-                            else:
-                                model_cfg.pop("api_mode", None)
-                        else:
-                            clear_model_endpoint_credentials(model_cfg, clear_base_url=True)
-                        save_config(cfg)
+                            model_cfg.pop("api_mode", None)
+                    else:
+                        clear_model_endpoint_credentials(model_cfg, clear_base_url=True)
+                    from hermes_cli.config import save_config
+                    save_config(cfg)
                 except Exception as e:
                     logger.warning("Failed to persist model switch: %s", e)
 
@@ -2503,27 +2465,9 @@ class GatewaySlashCommandsMixin:
 
         # Load + persist via the same helpers used for /model and /yolo
         try:
-            from hermes_runtime.config import (
-                load_config,
-                read_raw_config_strict,
-                save_config,
-            )
+            from hermes_cli.config import load_config, save_config
         except Exception as exc:
             return f"❌ Could not load config: {exc}"
-        if new_value is not None:
-            # Persist guard: load_config() fail-opens on a corrupt config.yaml
-            # (last-known-good in-process, else defaults). Feeding that into
-            # save_config would replace the user's corrupt-but-recoverable
-            # file with the fallback plus this one change. Probe the raw file
-            # strictly and refuse to persist until it parses — same stance as
-            # the /model handlers' read_raw_config_strict.
-            try:
-                read_raw_config_strict()
-            except Exception as exc:
-                return (
-                    "❌ config.yaml cannot be parsed; /codex-runtime was NOT "
-                    f"saved. Fix the file first: {exc}"
-                )
         cfg = load_config()
 
         result = crs.apply(
@@ -3245,15 +3189,14 @@ class GatewaySlashCommandsMixin:
 
     def _save_gateway_config_key(self, key_path: str, value) -> bool:
         """Save a dot-separated key to config.yaml (shared by /reasoning, /fast
-        and their interactive pickers).
-
-        Uses ``mutate_config`` so the whole read-mutate-write happens under the
-        cross-process config lock.
-        """
+        and their interactive pickers)."""
         from gateway.run import _hermes_home
+        from hermes_cli.config import read_user_config_raw
         config_path = _hermes_home / "config.yaml"
-
-        def _set_key(user_config: dict) -> dict:
+        try:
+            # Write-back round-trip: raw read is correct (merged defaults must
+            # not be persisted back to the user's file).
+            user_config = read_user_config_raw(config_path)
             keys = key_path.split(".")
             current = user_config
             for k in keys[:-1]:
@@ -3261,10 +3204,7 @@ class GatewaySlashCommandsMixin:
                     current[k] = {}
                 current = current[k]
             current[keys[-1]] = value
-            return user_config
-
-        try:
-            mutate_config(_set_key, config_path=config_path)
+            atomic_config_write(config_path, user_config)
             return True
         except Exception as e:
             logger.error("Failed to save config key %s: %s", key_path, e)
@@ -3595,7 +3535,7 @@ class GatewaySlashCommandsMixin:
         to config.yaml (parity with /model and /reasoning).
         """
         from gateway.run import _load_gateway_config, _resolve_gateway_model
-        from agent.model_catalog import model_supports_fast_mode
+        from hermes_cli.models import model_supports_fast_mode
 
         raw_args = event.get_command_args().strip().lower()
         # Reuse the /reasoning arg parser: strips --global (any position),
@@ -3752,26 +3692,17 @@ class GatewaySlashCommandsMixin:
         idx = (cycle.index(current) + 1) % len(cycle)
         new_mode = cycle[idx]
 
-        # Save to display.platforms.<platform>.tool_progress. mutate_config
-        # applies the change to the RAW on-disk document under the config
-        # lock — the old code wrote the merged _load_gateway_config() dict
-        # back, which both raced concurrent writers and froze the managed
-        # overlay into the user's file.
+        # Save to display.platforms.<platform>.tool_progress
         try:
-            def _set_tool_progress(raw_cfg: dict) -> dict:
-                display = raw_cfg.get("display")
-                if not isinstance(display, dict):
-                    display = raw_cfg["display"] = {}
-                platforms = display.get("platforms")
-                if not isinstance(platforms, dict):
-                    platforms = display["platforms"] = {}
-                plat_block = platforms.get(platform_key)
-                if not isinstance(plat_block, dict):
-                    plat_block = platforms[platform_key] = {}
-                plat_block["tool_progress"] = new_mode
-                return raw_cfg
-
-            mutate_config(_set_tool_progress, config_path=config_path)
+            if "display" not in user_config or not isinstance(user_config.get("display"), dict):
+                user_config["display"] = {}
+            display = user_config["display"]
+            if "platforms" not in display or not isinstance(display.get("platforms"), dict):
+                display["platforms"] = {}
+            if platform_key not in display["platforms"] or not isinstance(display["platforms"].get(platform_key), dict):
+                display["platforms"][platform_key] = {}
+            display["platforms"][platform_key]["tool_progress"] = new_mode
+            atomic_config_write(config_path, user_config)
             return (
                 f"{descriptions[new_mode]}\n"
                 + t("gateway.verbose.saved_suffix", platform=platform_key)
@@ -3839,22 +3770,14 @@ class GatewaySlashCommandsMixin:
             return t("gateway.footer.usage")
 
         # --- write global flag ---------------------------------------------
-        # mutate_config: apply only this key to the RAW on-disk document under
-        # the config lock. The old code wrote the merged _load_gateway_config()
-        # dict back, which raced concurrent writers and froze the managed
-        # overlay into the user's file.
         try:
-            def _set_footer(raw_cfg: dict) -> dict:
-                display = raw_cfg.get("display")
-                if not isinstance(display, dict):
-                    display = raw_cfg["display"] = {}
-                footer = display.get("runtime_footer")
-                if not isinstance(footer, dict):
-                    footer = display["runtime_footer"] = {}
-                footer["enabled"] = new_state
-                return raw_cfg
-
-            mutate_config(_set_footer, config_path=config_path)
+            if not isinstance(user_config.get("display"), dict):
+                user_config["display"] = {}
+            display = user_config["display"]
+            if not isinstance(display.get("runtime_footer"), dict):
+                display["runtime_footer"] = {}
+            display["runtime_footer"]["enabled"] = new_state
+            atomic_config_write(config_path, user_config)
         except Exception as e:
             logger.warning("Failed to save runtime_footer.enabled: %s", e)
             return t("gateway.config_save_failed", error=e)
@@ -4209,7 +4132,7 @@ class GatewaySlashCommandsMixin:
                 # Force-redact provider exception text at this UI boundary
                 # even when global redaction is disabled.
                 if _summary_err:
-                    from hermes_runtime.redaction import redact_sensitive_text
+                    from agent.redact import redact_sensitive_text
                     _summary_err = redact_sensitive_text(_summary_err, force=True)
                 # Separately: did the user's CONFIGURED aux model fail
                 # and we recovered via main?  Surface that as an info
@@ -4762,6 +4685,40 @@ class GatewaySlashCommandsMixin:
         key = "gateway.branch.branched_one" if msg_count == 1 else "gateway.branch.branched_many"
         return t(key, title=branch_title, count=msg_count, parent=parent_session_id, new=new_session_id)
 
+    async def _handle_topup_command(self, event: MessageEvent) -> str:
+        """Handle /topup -- show the Nous balance and hand off to the portal.
+
+        Renders the balance block + identity line + a tappable portal URL that
+        opens the billing page. Remote spending is managed on the portal: this
+        messaging command does NOT charge, confirm, or track payment here —
+        everything happens in the browser and the next /topup shows the new balance. The
+        tappable URL is the affordance and works on every platform (button-capable
+        or plain text like SMS/email). Fetched off the event loop; fail-open.
+        """
+        from agent.account_usage import build_credits_view
+
+        try:
+            view = await asyncio.to_thread(build_credits_view, markdown=True)
+        except Exception:
+            view = None
+
+        if view is None or not view.logged_in:
+            return t("gateway.credits.not_logged_in")
+
+        lines: list[str] = ["💳 **Nous balance**"]
+        for line in view.balance_lines:
+            if line.lstrip().startswith("📈"):
+                continue  # drop the helper's header; we print our own
+            lines.append(line)
+        if view.identity_line:
+            lines.append("")
+            lines.append(view.identity_line)
+        if view.topup_url:
+            lines.append("")
+            lines.append(f"Manage billing on the portal: {view.topup_url}")
+            lines.append("Top up and manage billing in the browser — your balance updates here after.")
+        return "\n".join(lines)
+
     def _context_breakdown_block(self, agent, source, expanded: bool) -> list[str]:
         """Render the /context per-category block (plain text, no grid).
 
@@ -4905,6 +4862,7 @@ class GatewaySlashCommandsMixin:
         # Fetch account usage off the event loop so slow provider APIs don't
         # block the gateway. Failures are non-fatal -- account_lines stays [].
         account_lines: list[str] = []
+        credits_lines: list[str] = []
         if provider:
             try:
                 account_snapshot = await asyncio.to_thread(
@@ -4917,6 +4875,21 @@ class GatewaySlashCommandsMixin:
                 account_snapshot = None
             if account_snapshot:
                 account_lines = render_account_usage_lines(account_snapshot, markdown=True)
+
+        # ── Nous credits magnitudes + monthly-grant % gauge ─────────────
+        # Shared with the CLI / TUI /usage block via nous_credits_lines(): a single
+        # auth-gate + portal-fetch + render path (which also honors the dev fixture).
+        # Run off the event loop. The helper gates on "a Nous account is logged in"
+        # — NOT the inference provider and NOT nested under `if provider:` — so a
+        # Nous-credentialled user running inference elsewhere (or with none resident)
+        # still sees their balance. NO recovery trigger: messaging binds no notice
+        # consumer, so /usage only displays. Fail-open: never break /usage.
+        try:
+            from agent.account_usage import nous_credits_lines
+
+            credits_lines = await asyncio.to_thread(nous_credits_lines, markdown=True)
+        except Exception:
+            credits_lines = []  # fail-open: never break /usage
 
         if agent and hasattr(agent, "session_total_tokens") and agent.session_api_calls > 0:
             lines = []
@@ -4962,6 +4935,10 @@ class GatewaySlashCommandsMixin:
             if account_lines:
                 lines.append("")
                 lines.extend(account_lines)
+            if credits_lines:
+                lines.append("")
+                lines.extend(credits_lines)
+
             return "\n".join(lines)
 
         # No agent at all -- check session history for a rough count
@@ -4980,9 +4957,18 @@ class GatewaySlashCommandsMixin:
             if account_lines:
                 lines.append("")
                 lines.extend(account_lines)
+            if credits_lines:
+                lines.append("")
+                lines.extend(credits_lines)
             return "\n".join(lines)
-        if account_lines:
-            return "\n".join(account_lines)
+        if account_lines or credits_lines:
+            # account-only, credits-only, or both — joined with a blank divider.
+            parts = list(account_lines)
+            if credits_lines:
+                if parts:
+                    parts.append("")
+                parts.extend(credits_lines)
+            return "\n".join(parts)
         return t("gateway.usage.no_data")
 
     async def _handle_insights_command(self, event: MessageEvent) -> str:
@@ -5410,7 +5396,7 @@ class GatewaySlashCommandsMixin:
         import shutil
         import subprocess
         from datetime import datetime
-        from hermes_runtime.config import is_managed, format_managed_message
+        from hermes_cli.config import is_managed, format_managed_message
 
         # Block non-messaging platforms (API server, webhooks, ACP)
         platform = event.source.platform
@@ -5486,7 +5472,7 @@ class GatewaySlashCommandsMixin:
         try:
             if sys.platform == "win32":
                 import textwrap
-                from hermes_runtime.subprocess_compat import windows_detach_popen_kwargs
+                from hermes_cli._subprocess_compat import windows_detach_popen_kwargs
 
                 # hermes_cmd is a list of argv parts we can pass directly
                 # (no shell-quoting needed).

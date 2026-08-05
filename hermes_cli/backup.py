@@ -40,7 +40,7 @@ logger = logging.getLogger(__name__)
 # HERMES_HOME gets walked file-by-file, ballooning a backup to hundreds of
 # thousands of entries that crawl for hours — the exact "backup stuck for
 # days / 426543 files" symptom users hit. The dependency/test-env names mostly
-# mirror ``hermes_runtime.skill_utils.EXCLUDED_SKILL_DIRS`` (the project's canonical
+# mirror ``agent.skill_utils.EXCLUDED_SKILL_DIRS`` (the project's canonical
 # "regeneratable dir" set); ``.cache`` is an additional backup-only entry, as
 # it names a broad regeneratable cache convention (pip/uv/etc.) that the skill
 # scanner doesn't need to prune but a backup walk does. We deliberately do NOT
@@ -130,20 +130,6 @@ _SECRET_FILE_NAMES = {".env", "auth.json", "state.db"}
 # relative to the user's home directory, and restored to their original
 # home-relative location on import. Anything not under home is skipped.
 _EXTERNAL_PREFIX = "_external/"
-
-# Keep import memory use independent of archive member size. Backups can
-# contain multi-gigabyte databases and provider state files.
-_IMPORT_COPY_CHUNK_BYTES = 1024 * 1024
-
-
-def _copy_zip_member(
-    zf: zipfile.ZipFile,
-    member: str,
-    target: Path,
-) -> None:
-    """Copy one archive member to disk without loading it all into memory."""
-    with zf.open(member) as src, open(target, "wb") as dst:
-        shutil.copyfileobj(src, dst, length=_IMPORT_COPY_CHUNK_BYTES)
 
 
 def _collect_memory_provider_external_paths() -> List[Path]:
@@ -826,7 +812,8 @@ def run_import(args) -> None:
                     continue
                 try:
                     target.parent.mkdir(parents=True, exist_ok=True)
-                    _copy_zip_member(zf, member, target)
+                    with zf.open(member) as src, open(target, "wb") as dst:
+                        dst.write(src.read())
                     # External provider configs commonly hold credentials.
                     if target.suffix in {".json", ".env", ".conf"} or target.name in _SECRET_FILE_NAMES:
                         try:
@@ -871,7 +858,8 @@ def run_import(args) -> None:
 
             try:
                 target.parent.mkdir(parents=True, exist_ok=True)
-                _copy_zip_member(zf, member, target)
+                with zf.open(member) as src, open(target, "wb") as dst:
+                    dst.write(src.read())
                 if target.name in _SECRET_FILE_NAMES:
                     os.chmod(target, 0o600)
                 restored += 1

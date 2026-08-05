@@ -14,7 +14,6 @@ profile's path is used.  They are the productionized form of the manual smoke
 probes used to confirm the bug class.
 """
 
-import json
 import threading
 from pathlib import Path
 
@@ -109,128 +108,7 @@ class TestRichSentStorePathResolution:
 
         b_seen = _under_override(prof_b, lambda: rss._store_path())
         assert b_seen.startswith(str(prof_b))
-        assert Path(b_seen).parts[-2:] == ("state", "rich_sent_index.json")
-
-
-class TestGatewayProfileLocalState:
-    def test_channel_directory_and_aliases_follow_override(self, two_profiles):
-        prof_a, prof_b = two_profiles
-        import gateway.channel_directory as directory
-
-        (prof_a / "channel_directory.json").write_text(
-            json.dumps({"platforms": {"telegram": [{"id": "a", "name": "A"}]}}),
-            encoding="utf-8",
-        )
-        (prof_b / "channel_directory.json").write_text(
-            json.dumps({"platforms": {"telegram": [{"id": "b", "name": "B"}]}}),
-            encoding="utf-8",
-        )
-        (prof_b / "channel_aliases.json").write_text(
-            json.dumps({"telegram": {"b": "Profile B"}}), encoding="utf-8"
-        )
-
-        seen_a = _under_override(prof_a, directory.load_directory)
-        seen_b = _under_override(prof_b, directory.load_directory)
-
-        assert seen_a["platforms"]["telegram"][0]["id"] == "a"
-        assert seen_b["platforms"]["telegram"][0]["name"] == "Profile B"
-
-    def test_sticker_cache_follows_override(self, two_profiles):
-        prof_a, prof_b = two_profiles
-        import gateway.sticker_cache as stickers
-
-        _under_override(
-            prof_a,
-            lambda: stickers.cache_sticker_description("same", "profile A"),
-        )
-        _under_override(
-            prof_b,
-            lambda: stickers.cache_sticker_description("same", "profile B"),
-        )
-
-        assert _under_override(
-            prof_a, lambda: stickers.get_cached_description("same")["description"]
-        ) == "profile A"
-        assert _under_override(
-            prof_b, lambda: stickers.get_cached_description("same")["description"]
-        ) == "profile B"
-
-    def test_legacy_mirror_lookup_follows_override(self, two_profiles):
-        prof_a, prof_b = two_profiles
-        import gateway.mirror as mirror
-
-        sessions = prof_b / "sessions"
-        sessions.mkdir(parents=True)
-        (sessions / "sessions.json").write_text(
-            json.dumps(
-                {
-                    "profile-b-session": {
-                        "session_id": "profile-b-session",
-                        "origin": {"platform": "telegram", "chat_id": "b-chat"},
-                    }
-                }
-            ),
-            encoding="utf-8",
-        )
-
-        assert _under_override(
-            prof_b, lambda: mirror._find_session_id("telegram", "b-chat")
-        ) == "profile-b-session"
-        assert _under_override(
-            prof_a, lambda: mirror._find_session_id("telegram", "b-chat")
-        ) is None
-
-
-class TestCronProfileLocalState:
-    def test_suggestions_follow_override(self, two_profiles):
-        prof_a, prof_b = two_profiles
-        import cron.suggestions as suggestions
-
-        def add(home, title):
-            return _under_override(
-                home,
-                lambda: suggestions.add_suggestion(
-                    title=title,
-                    description="test",
-                    source="usage",
-                    job_spec={"name": title, "prompt": "test", "schedule": "1d"},
-                    dedup_key=title,
-                ),
-            )
-
-        add(prof_a, "profile-a")
-        add(prof_b, "profile-b")
-
-        assert [item["title"] for item in _under_override(prof_a, suggestions.list_pending)] == ["profile-a"]
-        assert [item["title"] for item in _under_override(prof_b, suggestions.list_pending)] == ["profile-b"]
-
-    def test_execution_ledger_follows_override(self, two_profiles):
-        prof_a, prof_b = two_profiles
-        import cron.executions as executions
-
-        _under_override(
-            prof_b, lambda: executions.create_execution("profile-b-job", source="test")
-        )
-
-        assert _under_override(
-            prof_b, lambda: len(executions.list_executions(job_id="profile-b-job"))
-        ) == 1
-        assert _under_override(
-            prof_a, lambda: executions.list_executions(job_id="profile-b-job")
-        ) == []
-
-
-def test_media_delivery_blocks_active_profile_credentials(two_profiles):
-    _prof_a, prof_b = two_profiles
-    from gateway.platforms.base import validate_media_delivery_path
-
-    token_file = prof_b / "mcp-tokens" / "server.json"
-    token_file.parent.mkdir(parents=True)
-    token_file.write_text('{"access_token":"secret"}', encoding="utf-8")
-
-    assert _under_override(
-        prof_b, lambda: validate_media_delivery_path(str(token_file.resolve()))
-    ) is None
+        assert b_seen.endswith("state/rich_sent_index.json")
 
 
 # ---------------------------------------------------------------------------

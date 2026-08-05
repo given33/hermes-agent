@@ -60,7 +60,7 @@ def _auto_title_enabled() -> bool:
         # Lazy imports, matching _title_language(): title_generator is imported
         # from agent code paths where a module-level hermes_cli import risks
         # circularity, and the read-only loader avoids config-migration writes.
-        from hermes_runtime.config import load_config_readonly
+        from hermes_cli.config import load_config_readonly
         from utils import is_truthy_value
 
         config = load_config_readonly()

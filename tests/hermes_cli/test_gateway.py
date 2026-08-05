@@ -10,11 +10,6 @@ from types import ModuleType, SimpleNamespace
 
 import pytest
 
-try:
-    import pty
-except ModuleNotFoundError:  # pragma: no cover - Windows has no pty module
-    pty = None
-
 import hermes_cli.gateway as gateway
 
 
@@ -66,7 +61,6 @@ def _install_fake_gateway_run(monkeypatch, start_gateway):
         (False, "failure", 1),
     ],
 )
-@pytest.mark.skipif(pty is None, reason="POSIX pseudo-terminals are not available")
 def test_gateway_run_subprocess_preserves_daemon_exit_codes(
     tmp_path, stdin_is_tty, outcome, expected_exit
 ):
@@ -379,7 +373,7 @@ class TestStopProfileGateway:
 
         monkeypatch.setattr("gateway.status.get_running_pid", lambda: 12345)
         # Post-#21561: the stop loop sends one SIGTERM via ``os.kill`` then
-        # polls liveness via ``hermes_runtime.process_probe.pid_exists`` (safe on
+        # polls liveness via ``gateway.status._pid_exists`` (safe on
         # Windows — bpo-14484). Instrument both seams separately.
         monkeypatch.setattr(
             gateway.os,
@@ -387,8 +381,7 @@ class TestStopProfileGateway:
             lambda pid, sig: calls.__setitem__("kill", calls["kill"] + 1),
         )
         monkeypatch.setattr(
-            gateway,
-            "_pid_exists",
+            "gateway.status._pid_exists",
             lambda pid: calls.__setitem__("alive_probes", calls["alive_probes"] + 1) or True,
         )
         monkeypatch.setattr("time.sleep", lambda _: None)

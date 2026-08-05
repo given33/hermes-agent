@@ -92,7 +92,7 @@ Arm (or re-arm, idempotently) exactly one one-shot for a job.
     `fire_at` for the same `job_id` replaces the prior arm.
 - **Action:** arm one one-shot to fire at `fire_at`, destined for the NAS
   **relay** route (Endpoint 3) — NOT the agent directly, so NAS stays in the
-  loop to mint the agent JWT. Persist `(agent_id, job_id, fire_at, schedule_id,
+  loop to mint the agent JWT. Persist `(agent_id, job_id, schedule_id,
   agent_callback_url)`.
 - **Response:** `200 {"schedule_id": "<opaque>"}`.
 
@@ -111,8 +111,7 @@ Arm (or re-arm, idempotently) exactly one one-shot for a job.
   forged relay call must be rejected here.
 - **Action:**
   1. Look up `(agent_id, job_id) → agent_callback_url` from the persisted row.
-  2. Mint a **short-lived**, fire-bound JWT: `aud = "agent:{instance_id}"`,
-     `job_id = <row job_id>`, `fire_at = <row fire_at>`,
+  2. Mint a **short-lived** JWT: `aud = "agent:{instance_id}"`,
      `iss = {portal_url}`, `purpose = "cron_fire"`, small `exp` (≈60–120s),
      signed with NAS's normal asymmetric signing key (published via JWKS).
   3. `POST {agent_callback_url}/api/cron/fire` with
@@ -143,26 +142,18 @@ callback through to the verifier. (Also registered on the optional
   - `exp` / `nbf` (30s leeway),
   - `purpose == "cron_fire"` — a general agent JWT (no/other purpose) is
     rejected so it can't be replayed against this endpoint.
-  - non-empty `job_id` and timezone-aware ISO `fire_at` claims, both bound to
-    the callback body (semantically equivalent timestamp offsets are accepted).
-- **Body:** `{"job_id": "ab12cd34", "fire_at": "..."}`. Both fields are
-  required and form the durable fire identity.
+- **Body:** `{"job_id": "ab12cd34", "fire_at": "..."}` (only `job_id` is used).
 - **Behavior:**
   - invalid/missing/forged/expired/wrong-aud/wrong-purpose token → **401**, no
     execution.
-  - missing/invalid `job_id` or `fire_at` returns **400**.
-  - a body identity that does not match the signed claims returns **401**, with
-    no execution.
+  - missing `job_id` → **400**.
   - valid → **202 `{"status": "accepted", "job_id": "..."}`** immediately, and
     the job runs in the background. 202-before-run means a long agent turn never
     trips the relay's HTTP timeout.
-- **At-most-once:** the agent claims `(job_id, fire_at)` with a store-level
-  compare-and-set (`claim_job_for_fire`) before running. A retry while the first
-  fire is in flight loses the claim. After completion, a recurring job's
-  `next_run_at` no longer matches the old signed `fire_at`; a one-shot is
-  durably removed or marked completed. A delayed replay therefore also loses.
-  A stale same-identity claim may be reclaimed after its TTL when a worker
-  crashed, without advancing `next_run_at` twice.
+- **At-most-once:** the agent claims the job with a store-level compare-and-set
+  (`claim_job_for_fire`) before running. A relay/scheduler retry that arrives
+  while the first fire is in flight (or after it completed) loses the claim and
+  does not double-run.
 
 ---
 

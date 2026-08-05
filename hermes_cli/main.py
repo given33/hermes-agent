@@ -691,20 +691,15 @@ _apply_profile_override()
 
 # Load .env from ~/.hermes/.env first, then project root as dev fallback.
 # User-managed env files should override stale shell exports on restart.
+from hermes_cli.config import get_hermes_home
 from hermes_cli.env_loader import load_hermes_dotenv
 
-_EARLY_HERMES_HOME = Path(
-    os.environ.get("HERMES_HOME") or (Path.home() / ".hermes")
-)
-load_hermes_dotenv(
-    hermes_home=_EARLY_HERMES_HOME,
-    project_env=PROJECT_ROOT / ".env",
-)
+load_hermes_dotenv(project_env=PROJECT_ROOT / ".env")
 
 # Bridge security.redact_secrets from config.yaml → HERMES_REDACT_SECRETS env
-# var BEFORE hermes_logging imports hermes_runtime.redaction (which snapshots the flag at
+# var BEFORE hermes_logging imports agent.redact (which snapshots the flag at
 # module-import time). Without this, config.yaml's toggle is ignored because
-# the setup_logging() call below imports hermes_runtime.redaction, which reads the env var
+# the setup_logging() call below imports agent.redact, which reads the env var
 # exactly once. Env var in .env still wins — this is config.yaml fallback only.
 #
 # We also read network.force_ipv4 from the same yaml load to avoid two
@@ -718,7 +713,7 @@ try:
     # 3-4 config.yaml parses per invocation into one.
     from hermes_cli.config import read_raw_config as _read_raw_early
 
-    _cfg_path = _EARLY_HERMES_HOME / "config.yaml"
+    _cfg_path = get_hermes_home() / "config.yaml"
     if _cfg_path.exists():
         _early_cfg_raw = _read_raw_early() or {}
         # Managed scope: overlay administrator-pinned values so a managed
@@ -727,7 +722,7 @@ try:
         # without the overlay a managed redact_secrets toggle would be ignored.
         # Fail-open via the shared helper.
         try:
-            from hermes_runtime import managed_scope
+            from hermes_cli import managed_scope
             _early_cfg_raw = managed_scope.apply_managed_overlay(_early_cfg_raw)
         except Exception:
             pass
@@ -749,13 +744,6 @@ except Exception:
 # (chat, setup, gateway, config, etc.) write to agent.log + errors.log.
 # Dashboard entrypoints bootstrap with GUI mode so gui.log is always present
 # during GUI testing, including pre-dispatch startup failures.
-from hermes_runtime.redaction import finalize_redaction_config
-
-finalize_redaction_config()
-
-from hermes_runtime.config import get_hermes_home
-from hermes_runtime.process_probe import pid_exists as _pid_exists
-
 try:
     from hermes_logging import setup_logging as _setup_logging
 
@@ -769,48 +757,6 @@ try:
     )
 except Exception:
     pass  # best-effort — don't crash the CLI if logging setup fails
-
-# Subcommand modules may import providers and logging, which snapshot
-# profile-scoped environment settings such as secret redaction. Keep them
-# behind the profile, dotenv, config bridge, and logging bootstrap above.
-from hermes_cli.subcommands._shared import add_accept_hooks_flag as _add_accept_hooks_flag
-from hermes_cli.subcommands.cron import build_cron_parser
-from hermes_cli.subcommands.gateway import build_gateway_parser
-from hermes_cli.subcommands.profile import build_profile_parser
-from hermes_cli.subcommands.model import build_model_parser
-from hermes_cli.subcommands.setup import build_setup_parser
-from hermes_cli.subcommands.whatsapp import build_whatsapp_parser
-from hermes_cli.subcommands.slack import build_slack_parser
-from hermes_cli.subcommands.login import build_login_parser
-from hermes_cli.subcommands.logout import build_logout_parser
-from hermes_cli.subcommands.auth import build_auth_parser
-from hermes_cli.subcommands.status import build_status_parser
-from hermes_cli.subcommands.webhook import build_webhook_parser
-from hermes_cli.subcommands.hooks import build_hooks_parser
-from hermes_cli.subcommands.doctor import build_doctor_parser
-from hermes_cli.subcommands.security import build_security_parser
-from hermes_cli.subcommands.dump import build_dump_parser
-from hermes_cli.subcommands.debug import build_debug_parser
-from hermes_cli.subcommands.backup import build_backup_parser
-from hermes_cli.subcommands.import_cmd import build_import_cmd_parser
-from hermes_cli.subcommands.config import build_config_parser
-from hermes_cli.subcommands.console import build_console_parser
-from hermes_cli.subcommands.version import build_version_parser
-from hermes_cli.subcommands.update import build_update_parser
-from hermes_cli.subcommands.uninstall import build_uninstall_parser
-from hermes_cli.subcommands.dashboard import build_dashboard_parser
-from hermes_cli.subcommands.gui import build_gui_parser
-from hermes_cli.subcommands.logs import build_logs_parser
-from hermes_cli.subcommands.prompt_size import build_prompt_size_parser
-from hermes_cli.subcommands.memory import build_memory_parser
-from hermes_cli.subcommands.acp import build_acp_parser
-from hermes_cli.subcommands.tools import build_tools_parser
-from hermes_cli.subcommands.insights import build_insights_parser
-from hermes_cli.subcommands.skills import build_skills_parser
-from hermes_cli.subcommands.pairing import build_pairing_parser
-from hermes_cli.subcommands.plugins import build_plugins_parser
-from hermes_cli.subcommands.mcp import build_mcp_parser
-from hermes_cli.subcommands.claw import build_claw_parser
 
 # Apply IPv4 preference early, before any HTTP clients are created.
 # We already determined whether to force IPv4 from the raw yaml read above —
@@ -1011,14 +957,14 @@ def _relative_time(ts) -> str:
 
 def _has_any_provider_configured() -> bool:
     """Check if at least one inference provider is usable."""
-    from hermes_runtime.config import get_env_path, get_hermes_home, load_config
+    from hermes_cli.config import get_env_path, get_hermes_home, load_config
     from hermes_cli.auth import get_auth_status
 
     # Determine whether Hermes itself has been explicitly configured (model
     # in config that isn't the hardcoded default). Used below to gate external
     # tool credentials (Claude Code, Codex CLI) that shouldn't silently skip
     # the setup wizard on a fresh install.
-    from hermes_runtime.config import DEFAULT_CONFIG
+    from hermes_cli.config import DEFAULT_CONFIG
 
     _DEFAULT_MODEL = DEFAULT_CONFIG.get("model", "")
     cfg = load_config()
@@ -2352,7 +2298,7 @@ def _launch_tui(
     from tools.environments.local import build_subprocess_env
     env = build_subprocess_env(scrub_secrets=False, inherit_profile_home=True)
     try:
-        from hermes_runtime.config import apply_terminal_config_to_env
+        from hermes_cli.config import apply_terminal_config_to_env
         apply_terminal_config_to_env(env=env)
     except Exception:
         logger.debug("Failed to apply terminal config bridge for TUI launch", exc_info=True)
@@ -2567,7 +2513,7 @@ def _resolve_use_tui(args) -> bool:
     if os.environ.get("HERMES_TUI") == "1":
         return True
     try:
-        from hermes_runtime.config import load_config
+        from hermes_cli.config import load_config
 
         iface = (load_config().get("display", {}) or {}).get("interface", "cli")
         return isinstance(iface, str) and iface.strip().lower() == "tui"
@@ -2644,7 +2590,7 @@ def cmd_chat(args):
             find_retired_xai_refs,
             format_issue,
         )
-        from hermes_runtime.config import load_config as _load_config_for_xai_check
+        from hermes_cli.config import load_config as _load_config_for_xai_check
 
         _retired_xai_refs = find_retired_xai_refs(_load_config_for_xai_check())
         if _retired_xai_refs:
@@ -2811,7 +2757,7 @@ def cmd_proxy(args):
 def cmd_whatsapp(args):
     """Set up WhatsApp: choose mode, configure, install bridge, pair via QR."""
     _require_tty("whatsapp")
-    from hermes_runtime.config import get_env_value, save_env_value
+    from hermes_cli.config import get_env_value, save_env_value
     from hermes_constants import find_node_executable, with_hermes_node_path
 
     print()
@@ -3108,7 +3054,7 @@ def select_provider_and_model(args=None):
         AuthError,
         format_auth_error,
     )
-    from hermes_runtime.config import (
+    from hermes_cli.config import (
         get_compatible_custom_providers,
         load_config,
         get_env_value,
@@ -3137,7 +3083,7 @@ def select_provider_and_model(args=None):
     )
     compatible_custom_providers = get_compatible_custom_providers(config)
     def _named_custom_provider_map(cfg) -> dict[str, dict[str, str]]:
-        from hermes_runtime.config import read_raw_config
+        from hermes_cli.config import read_raw_config
 
         # Build lookups of raw (un-expanded) templates keyed by a
         # stable identity. We intentionally bypass
@@ -3469,7 +3415,7 @@ def select_provider_and_model(args=None):
     elif selected_provider == "ai-gateway":
         _model_flow_ai_gateway(config, current_model)
     elif selected_provider == "nous":
-        _model_flow_api_key_provider(config, "nous", current_model)
+        _model_flow_nous(config, current_model, args=args)
     elif selected_provider == "openai-codex":
         _model_flow_openai_codex(config, current_model)
     elif selected_provider == "xai-oauth":
@@ -3554,7 +3500,7 @@ def _clear_stale_openai_base_url():
     requests to the old custom endpoint instead of the newly selected
     provider.  See issue #5161.
     """
-    from hermes_runtime.config import get_env_value, save_env_value, load_config
+    from hermes_cli.config import get_env_value, save_env_value, load_config
 
     cfg = load_config()
     model_cfg = cfg.get("model", {})
@@ -3659,7 +3605,7 @@ def _save_aux_choice(
     other task-specific settings are preserved untouched. The main model
     config (``model.default``/``model.provider``) is never modified.
     """
-    from hermes_runtime.config import load_config, save_config
+    from hermes_cli.config import load_config, save_config
 
     cfg = load_config()
     aux = cfg.setdefault("auxiliary", {})
@@ -3683,7 +3629,7 @@ def _reset_aux_to_auto() -> int:
     Includes plugin-registered tasks (via ``_all_aux_tasks``) so a plugin
     that contributed an auxiliary task gets reset alongside built-ins.
     """
-    from hermes_runtime.config import load_config, save_config
+    from hermes_cli.config import load_config, save_config
 
     cfg = load_config()
     aux = cfg.setdefault("auxiliary", {})
@@ -3717,7 +3663,7 @@ def _aux_config_menu() -> None:
     Loops until the user picks "Back" so multiple tasks can be configured
     without returning to the main provider menu.
     """
-    from hermes_runtime.config import load_config
+    from hermes_cli.config import load_config
 
     while True:
         cfg = load_config()
@@ -3905,7 +3851,7 @@ def _aux_flow_provider_model(
 
 def _aux_flow_custom_endpoint(task: str, task_cfg: dict) -> None:
     """Prompt for a direct OpenAI-compatible base_url + optional api_key/model."""
-    from hermes_runtime.secret_prompt import masked_secret_prompt
+    from hermes_cli.secret_prompt import masked_secret_prompt
 
     display_name = next((name for key, name, _ in _all_aux_tasks() if key == task), task)
     current_base_url = str(task_cfg.get("base_url") or "").strip()
@@ -4135,7 +4081,7 @@ def _save_custom_provider(
     When *key_env* is set the caller has already written the key to ``.env``,
     so the entry references it instead of inlining the secret (#69449).
     """
-    from hermes_runtime.config import load_config, save_config
+    from hermes_cli.config import load_config, save_config
 
     cfg = load_config()
     providers = cfg.get("custom_providers") or []
@@ -4200,7 +4146,7 @@ def _save_custom_provider(
 
 def _remove_custom_provider(config):
     """Let the user remove a saved custom provider from config.yaml."""
-    from hermes_runtime.config import load_config, save_config
+    from hermes_cli.config import load_config, save_config
 
     cfg = load_config()
     providers = cfg.get("custom_providers") or []
@@ -4397,8 +4343,8 @@ def _prompt_api_key(
     cleared the key and is now unconfigured.
     """
     from hermes_cli.auth import LMSTUDIO_NOAUTH_PLACEHOLDER
-    from hermes_runtime.config import save_env_value
-    from hermes_runtime.secret_prompt import masked_secret_prompt
+    from hermes_cli.config import save_env_value
+    from hermes_cli.secret_prompt import masked_secret_prompt
 
     key_env = pconfig.api_key_env_vars[0] if pconfig.api_key_env_vars else ""
 
@@ -4512,7 +4458,7 @@ def _run_anthropic_oauth_flow(save_env_value):
         read_claude_code_credentials,
         is_claude_code_token_valid,
     )
-    from hermes_runtime.config import (
+    from hermes_cli.config import (
         save_anthropic_oauth_token,
         use_anthropic_claude_code_credentials,
     )
@@ -4552,7 +4498,7 @@ def _run_anthropic_oauth_flow(save_env_value):
         print()
         print("  If the setup-token was displayed above, paste it here:")
         print()
-        from hermes_runtime.secret_prompt import masked_secret_prompt
+        from hermes_cli.secret_prompt import masked_secret_prompt
 
         try:
             manual_token = masked_secret_prompt(
@@ -4583,7 +4529,7 @@ def _run_anthropic_oauth_flow(save_env_value):
         print()
         print("  Or paste an existing setup-token now (sk-ant-oat-...):")
         print()
-        from hermes_runtime.secret_prompt import masked_secret_prompt
+        from hermes_cli.secret_prompt import masked_secret_prompt
 
         try:
             token = masked_secret_prompt("  Setup-token (or Enter to cancel): ").strip()
@@ -4938,7 +4884,7 @@ def cmd_debug(args):
 
 def cmd_config(args):
     """Configuration management."""
-    from hermes_cli.config_commands import config_command
+    from hermes_cli.config import config_command
 
     config_command(args)
 
@@ -5001,7 +4947,7 @@ def _print_version_info(*, check_updates: bool = True) -> None:
     # Show update status (synchronous — acceptable since user asked for version info)
     try:
         from hermes_cli.banner import check_for_updates
-        from hermes_runtime.config import recommended_update_command
+        from hermes_cli.config import recommended_update_command
 
         behind = check_for_updates()
         if behind and behind > 0:
@@ -7000,7 +6946,7 @@ def _desktop_launch_options() -> tuple[list[str], str]:
     flags: list[str] = []
     disable_gpu = "auto"
     try:
-        from hermes_runtime.config import load_config
+        from hermes_cli.config import load_config
 
         desktop_cfg = (load_config() or {}).get("desktop") or {}
     except Exception:
@@ -9043,7 +8989,7 @@ def _install_hangup_protection(gateway_mode: bool = False):
     try:
         # Late-bound import so tests can monkeypatch
         # hermes_cli.config.get_hermes_home to simulate setup failure.
-        from hermes_runtime.config import get_hermes_home as _get_hermes_home
+        from hermes_cli.config import get_hermes_home as _get_hermes_home
 
         logs_dir = _get_hermes_home() / "logs"
         logs_dir.mkdir(parents=True, exist_ok=True)
@@ -9122,7 +9068,7 @@ def cmd_update(args):
     runs the update, then restores stdio on the way out (even on
     ``sys.exit`` or unhandled exceptions).
     """
-    from hermes_runtime.config import (
+    from hermes_cli.config import (
         detect_install_method,
         format_docker_update_message,
         is_managed,
@@ -9974,7 +9920,8 @@ def _maybe_setup_dashboard_auth_interactively(args) -> None:
     the June 2026 hardening), and ``start_server`` fails closed when no
     ``DashboardAuthProvider`` is registered. Rather than greet an interactive
     operator with that hard error, prompt them to set up the bundled
-    username/password provider on the spot.
+    username/password provider on the spot — or point them at
+    ``hermes dashboard register`` for OAuth.
 
     No-ops (so the existing fail-closed ``SystemExit`` remains the backstop)
     when:
@@ -10015,7 +9962,8 @@ def _maybe_setup_dashboard_auth_interactively(args) -> None:
     print()
     print("  How do you want to authenticate the dashboard?")
     print("    [1] Username & password (quickest; for a trusted LAN / VPN)")
-    print("    [2] Cancel")
+    print("    [2] OAuth via Nous Portal (run `hermes dashboard register`)")
+    print("    [3] Cancel")
     print()
 
     try:
@@ -10023,6 +9971,19 @@ def _maybe_setup_dashboard_auth_interactively(args) -> None:
     except (EOFError, KeyboardInterrupt):
         print("\n  Cancelled.")
         sys.exit(1)
+
+    if choice == "2":
+        print()
+        print(
+            "  Run this on the host where the dashboard lives, then start "
+            "the dashboard again:\n"
+            "    hermes dashboard register\n"
+            "  It provisions a Nous Portal OAuth client and writes "
+            "HERMES_DASHBOARD_OAUTH_CLIENT_ID into ~/.hermes/.env for you.\n"
+            "  Docs: https://hermes-agent.nousresearch.com/docs/"
+            "user-guide/features/web-dashboard#authentication-gated-mode"
+        )
+        sys.exit(0)
 
     if choice not in ("1",):
         print("  Cancelled.")
@@ -10059,7 +10020,7 @@ def _maybe_setup_dashboard_auth_interactively(args) -> None:
     secret = secrets.token_urlsafe(32)
 
     try:
-        from hermes_runtime.config import load_config, save_config
+        from hermes_cli.config import load_config, save_config
         from hermes_cli.plugins_cmd import ensure_basic_auth_plugin_enabled_in_config
 
         cfg = load_config()
@@ -10227,13 +10188,11 @@ def cmd_dashboard(args):
             print("No hermes dashboard processes running.")
             sys.exit(0)
         # Reuse the same SIGTERM-grace-SIGKILL path used after `hermes update`.
-        stopped_cleanly = _kill_stale_dashboard_processes(
-            reason="requested via --stop"
-        )
+        _kill_stale_dashboard_processes(reason="requested via --stop")
         # _kill_stale_dashboard_processes prints outcomes itself.  Exit 0 if
         # we killed at least one, 1 if they were all unkillable.
         remaining = _find_stale_dashboard_pids()
-        sys.exit(1 if remaining or not stopped_cleanly else 0)
+        sys.exit(1 if remaining else 0)
 
     # `serve` is the headless backend: no UI build, no SPA mount, neutral
     # ready sentinel. Resolved once and threaded through the re-exec, the
@@ -10401,7 +10360,7 @@ def cmd_dashboard(args):
     # (#63141, #54449, #61115, #65696). PTY chat spawns already bridge their
     # child env copy; this covers the in-process consumers.
     try:
-        from hermes_runtime.config import apply_terminal_config_to_env
+        from hermes_cli.config import apply_terminal_config_to_env
 
         apply_terminal_config_to_env()
     except Exception:
@@ -10838,7 +10797,7 @@ def _prepare_agent_startup(args) -> None:
                 exc_info=True,
             )
     try:
-        from hermes_runtime.config import load_config
+        from hermes_cli.config import load_config
         from agent.shell_hooks import register_from_config
 
         _hooks_cfg = load_config()
@@ -10993,7 +10952,7 @@ def _try_termux_fast_tui_launch() -> bool:
 def cmd_memory(args):
     sub = getattr(args, "memory_command", None)
     if sub == "off":
-        from hermes_runtime.config import load_config, save_config
+        from hermes_cli.config import load_config, save_config
 
         config = load_config()
         if not isinstance(config.get("memory"), dict):
@@ -11194,21 +11153,6 @@ def main():
     # Cosmetic: make the process show up as 'hermes' instead of 'python3.11'
     # in ps/top/htop.  Non-fatal — just a nicer UX.
     _set_process_title()
-
-    # Repair non-UTF-8 stdio before anything prints.  This used to run as a
-    # side effect of importing ``hermes_cli`` — which meant every
-    # ``from hermes_runtime.config import ...`` anywhere in agent/, tools/,
-    # gateway/ or plugins/ could replace the process's ``sys.stdout`` and
-    # write PYTHONUTF8/PYTHONIOENCODING into the environment inherited by
-    # every subprocess, and fought pytest's capture.  It belongs to the
-    # process entry point, which is here.  Idempotent, and a no-op when the
-    # streams are already UTF-8.  Catches the legacy POSIX locales that
-    # ``configure_windows_stdio`` (Windows-only) does not.
-    try:
-        from hermes_cli import ensure_utf8_stdio
-        ensure_utf8_stdio()
-    except Exception:
-        pass
 
     # Force UTF-8 stdio on Windows before anything prints.  No-op elsewhere.
     try:
@@ -11514,6 +11458,12 @@ def main():
     # webhook command  (parser built in hermes_cli/subcommands/webhook.py)
     # =========================================================================
     build_webhook_parser(subparsers, cmd_webhook=cmd_webhook)
+
+    # =========================================================================
+    # portal command — Nous Portal status + Tool Gateway routing
+    # =========================================================================
+    from hermes_cli.portal_cli import add_parser as _add_portal_parser
+    _add_portal_parser(subparsers)
 
     # =========================================================================
     # kanban command — multi-profile collaboration board
@@ -12456,7 +12406,7 @@ def main():
     # the managed container.  This MUST run before parse_args() so that
     # --help, unrecognised flags, and every subcommand are forwarded
     # transparently instead of being intercepted by argparse on the host.
-    from hermes_runtime.config import get_container_exec_info
+    from hermes_cli.config import get_container_exec_info
 
     container_info = get_container_exec_info()
     if container_info:

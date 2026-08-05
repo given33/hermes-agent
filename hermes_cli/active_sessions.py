@@ -17,7 +17,6 @@ from pathlib import Path
 from typing import Any, Optional
 
 from hermes_constants import get_hermes_home
-from hermes_runtime import process_probe
 
 logger = logging.getLogger(__name__)
 
@@ -231,7 +230,9 @@ def _pid_alive(pid: Any, process_start_time: Any = None) -> bool:
     if pid_int <= 0:
         return False
     try:
-        exists = bool(process_probe.pid_exists(pid_int))
+        from gateway.status import _pid_exists
+
+        exists = bool(_pid_exists(pid_int))
     except Exception:
         return False
     if not exists:

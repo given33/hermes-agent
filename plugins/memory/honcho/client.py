@@ -94,18 +94,7 @@ def resolve_active_host() -> str:
 
 def resolve_global_config_path() -> Path:
     """Return the shared Honcho config path for the current HOME."""
-    # ``Path.home()`` ignores HOME on Windows when USERPROFILE is present.
-    # Respect an explicit HOME so profile isolation, service accounts, and
-    # test sandboxes never read or mutate the interactive user's config. On
-    # POSIX, ``Path.home()`` is the platform authority and must be resolved at
-    # call time (services and test sandboxes can change their user context).
-    configured_home = os.environ.get("HOME", "").strip()
-    home = (
-        Path(configured_home).expanduser()
-        if os.name == "nt" and configured_home
-        else Path.home()
-    )
-    return home / ".honcho" / "config.json"
+    return Path.home() / ".honcho" / "config.json"
 
 
 def resolve_config_path() -> Path:
@@ -880,7 +869,7 @@ _honcho_json_timeout_memo: tuple[int | None, float | None] = (None, None)
 def _config_yaml_timeout() -> float | None:
     """Read honcho.timeout / honcho.request_timeout via the cached config loader."""
     try:
-        from hermes_runtime.config import load_config_readonly
+        from hermes_cli.config import load_config_readonly
 
         honcho_cfg = load_config_readonly().get("honcho", {})
         if isinstance(honcho_cfg, dict):
@@ -1045,7 +1034,7 @@ def get_honcho_client(config: HonchoClientConfig | None = None) -> Honcho:
         resolved_timeout = config.timeout
         if not resolved_base_url or resolved_timeout is None:
             try:
-                from hermes_runtime.config import load_config
+                from hermes_cli.config import load_config
                 hermes_cfg = load_config()
                 honcho_cfg = hermes_cfg.get("honcho", {})
                 if isinstance(honcho_cfg, dict):

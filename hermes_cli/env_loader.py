@@ -11,16 +11,6 @@ from pathlib import Path
 
 from dotenv import load_dotenv
 from utils import atomic_replace, fast_safe_load
-from hermes_runtime import managed_scope
-from hermes_runtime.secret_provenance import (
-    SECRET_SOURCES,
-    get_secret_source,
-    record_secret_source,
-)
-
-# Compatibility alias retained for callers and tests that inspect the old
-# process-local registry directly. New lower layers use the public runtime API.
-_SECRET_SOURCES = SECRET_SOURCES
 
 
 # Env var name suffixes that indicate credential values.  These are the
@@ -381,7 +371,7 @@ def _sanitize_env_file_if_needed(path: Path) -> None:
     if not path.exists():
         return
     try:
-        from hermes_runtime.config import sanitize_env_lines
+        from hermes_cli.config import _sanitize_env_lines
     except ImportError:
         return  # early bootstrap — config module not available yet
 
@@ -442,12 +432,12 @@ def _sanitize_env_file_if_needed(path: Path) -> None:
             return
 
     try:
-        # Strip null bytes before sanitize_env_lines so they never
+        # Strip null bytes before _sanitize_env_lines so they never
         # reach python-dotenv (which passes them to os.environ and
         # crashes with ValueError). Also intentionally repairs
         # BOM-less UTF-16 (NUL-padded ASCII) into clean UTF-8.
         stripped = [line.replace("\x00", "") for line in original]
-        sanitized = sanitize_env_lines(stripped)
+        sanitized = _sanitize_env_lines(stripped)
         if sanitized != original or force_utf8_rewrite:
             import tempfile
             fd, tmp = tempfile.mkstemp(
@@ -584,6 +574,8 @@ def _apply_managed_env() -> None:
     error here is swallowed so managed scope can never block startup.
     """
     try:
+        from hermes_cli import managed_scope
+
         managed_dir = managed_scope.get_managed_dir()
     except Exception:  # noqa: BLE001 — managed scope must never block startup
         return
@@ -758,10 +750,3 @@ def _process_hermes_home() -> Path:
         return get_hermes_home()
     except Exception:
         return Path.home() / ".hermes"
-
-
-# Register the optional external-secret snapshot provider with the low-level
-# scope module without creating a runtime -> CLI import edge.
-from hermes_runtime.secret_scope import register_external_secret_loader
-
-register_external_secret_loader(get_secret_source_values)

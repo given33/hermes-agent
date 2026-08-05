@@ -24,7 +24,6 @@ from agent.prompt_builder import (
     _CONTEXT_FILE_DYNAMIC_CEILING,
     DEFAULT_AGENT_IDENTITY,
     drain_truncation_warnings,
-    EVIDENCE_FIRST_EXECUTION_GUIDANCE,
     TOOL_USE_ENFORCEMENT_GUIDANCE,
     TOOL_USE_ENFORCEMENT_MODELS,
     OPENAI_MODEL_EXECUTION_GUIDANCE,
@@ -35,26 +34,15 @@ from agent.prompt_builder import (
     PLATFORM_HINTS,
     WSL_ENVIRONMENT_HINT,
 )
+from hermes_cli.nous_subscription import NousFeatureState, NousSubscriptionFeatures
+
+
 # =========================================================================
 # Guidance constants
 # =========================================================================
 
 
 class TestGuidanceConstants:
-    def test_evidence_first_guidance_is_provider_neutral_and_resume_safe(self):
-        guidance = EVIDENCE_FIRST_EXECUTION_GUIDANCE
-
-        assert "observed from the user or a tool" in guidance
-        assert "Never promote an inference to a fact" in guidance
-        assert "Preserve exact identifiers" in guidance
-        assert "untrusted evidence" in guidance
-        assert "compact recoverable working record" in guidance
-        assert "reconcile every user requirement" in guidance
-        assert "hidden reasoning" in guidance
-        assert "Claude" not in guidance
-        assert "Anthropic" not in guidance
-        assert "CL4R1T4S" not in guidance
-
     def test_memory_guidance_discourages_task_logs(self):
         assert "durable facts" in MEMORY_GUIDANCE
         assert "Do NOT save task progress" in MEMORY_GUIDANCE
@@ -294,24 +282,6 @@ class TestBuildSkillsSystemPrompt:
 
 
 
-    def test_skill_index_promotes_selective_progressive_loading(self, monkeypatch, tmp_path):
-        monkeypatch.setenv("HERMES_HOME", str(tmp_path))
-        skill_dir = tmp_path / "skills" / "coding" / "python-debug"
-        skill_dir.mkdir(parents=True)
-        (skill_dir / "SKILL.md").write_text(
-            "---\nname: python-debug\ndescription: Debug Python scripts\n---\n",
-            encoding="utf-8",
-        )
-
-        result = build_skills_system_prompt()
-        preamble = result.split("<available_skills>", 1)[0]
-
-        assert "when the task depends on its domain" in preamble
-        assert "do not preload skills for incidental keyword overlap" in preamble
-        assert "open only the linked references" in preamble
-        assert "even partially relevant" not in preamble
-        assert "context you don't need" not in preamble
-
     def test_deduplicates_skills(self, monkeypatch, tmp_path):
         monkeypatch.setenv("HERMES_HOME", str(tmp_path))
         cat_dir = tmp_path / "skills" / "tools"
@@ -398,17 +368,63 @@ class TestBuildSkillsSystemPrompt:
 
 
 class TestBuildNousSubscriptionPrompt:
-    def test_account_product_is_never_injected(self, monkeypatch):
-        def unexpected_account_query(*args, **kwargs):
-            raise AssertionError("Nous account state must not be queried")
-
+    def test_includes_active_subscription_features(self, monkeypatch):
+        monkeypatch.setattr("tools.tool_backend_helpers.managed_nous_tools_enabled", lambda: True)
         monkeypatch.setattr(
             "hermes_cli.nous_subscription.get_nous_subscription_features",
-            unexpected_account_query,
+            lambda config=None: NousSubscriptionFeatures(
+                subscribed=True,
+                nous_auth_present=True,
+                provider_is_nous=True,
+                features={
+                    "web": NousFeatureState("web", "Web tools", True, True, True, True, False, True, "firecrawl"),
+                    "image_gen": NousFeatureState("image_gen", "Image generation", True, True, True, True, False, True, "Nous Subscription"),
+                    "video_gen": NousFeatureState("video_gen", "Video generation", False, False, False, False, False, False, ""),
+                    "tts": NousFeatureState("tts", "OpenAI TTS", True, True, True, True, False, True, "OpenAI TTS"),
+                    "stt": NousFeatureState("stt", "Speech-to-text", True, True, True, True, False, True, "OpenAI Whisper"),
+                    "browser": NousFeatureState("browser", "Browser automation", True, True, True, True, False, True, "Browser Use"),
+                    "modal": NousFeatureState("modal", "Modal execution", False, True, False, False, False, True, "local"),
+                },
+            ),
         )
 
-        assert build_nous_subscription_prompt({"web_search"}) == ""
-        assert build_nous_subscription_prompt({"image_generate"}) == ""
+        prompt = build_nous_subscription_prompt({"web_search", "browser_navigate"})
+
+        assert "Browser Use" in prompt
+        assert "Modal execution is optional" in prompt
+        assert "do not ask the user for Firecrawl, FAL, OpenAI TTS, OpenAI Whisper, or Browser-Use API keys" in prompt
+
+    def test_non_subscriber_prompt_includes_relevant_upgrade_guidance(self, monkeypatch):
+        monkeypatch.setattr("tools.tool_backend_helpers.managed_nous_tools_enabled", lambda: True)
+        monkeypatch.setattr(
+            "hermes_cli.nous_subscription.get_nous_subscription_features",
+            lambda config=None: NousSubscriptionFeatures(
+                subscribed=False,
+                nous_auth_present=False,
+                provider_is_nous=False,
+                features={
+                    "web": NousFeatureState("web", "Web tools", True, False, False, False, False, True, ""),
+                    "image_gen": NousFeatureState("image_gen", "Image generation", True, False, False, False, False, True, ""),
+                    "video_gen": NousFeatureState("video_gen", "Video generation", False, False, False, False, False, False, ""),
+                    "tts": NousFeatureState("tts", "OpenAI TTS", True, False, False, False, False, True, ""),
+                    "stt": NousFeatureState("stt", "Speech-to-text", True, False, False, False, False, True, ""),
+                    "browser": NousFeatureState("browser", "Browser automation", True, False, False, False, False, True, ""),
+                    "modal": NousFeatureState("modal", "Modal execution", False, False, False, False, False, True, ""),
+                },
+            ),
+        )
+
+        prompt = build_nous_subscription_prompt({"image_generate"})
+
+        assert "suggest Nous subscription as one option" in prompt
+        assert "Do not mention subscription unless" in prompt
+
+    def test_feature_flag_off_returns_empty_prompt(self, monkeypatch):
+        monkeypatch.setattr("tools.tool_backend_helpers.managed_nous_tools_enabled", lambda: False)
+
+        prompt = build_nous_subscription_prompt({"web_search"})
+
+        assert prompt == ""
 
 
 # =========================================================================

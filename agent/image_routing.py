@@ -69,14 +69,6 @@ _LOCAL_IMAGE_PATH_RE = re.compile(
     r"(?<![/:\w.])(?:~/|/)(?:[\w.\-]+/)*[\w.\-]+\.(?:" + _IMAGE_EXT_PATTERN + r")\b",
     re.IGNORECASE,
 )
-# Windows drive-qualified and home-relative paths.  Keep this separate from
-# the POSIX expression so the URL guard remains easy to reason about.
-_WINDOWS_LOCAL_IMAGE_PATH_RE = re.compile(
-    r"(?<![\w/])(?:[A-Za-z]:[\\/]|~[\\/])"
-    r"(?:[^\\/\s<>\"'`]+[\\/])*[^\\/\s<>\"'`]+\."
-    r"(?:" + _IMAGE_EXT_PATTERN + r")\b",
-    re.IGNORECASE,
-)
 
 # http(s) URL ending in an image extension (optionally followed by a
 # query string). Case-insensitive on the extension. Strict ``http(s)://``
@@ -123,15 +115,11 @@ def extract_image_refs(text: str) -> Tuple[List[str], List[str]]:
 
     local_paths: list[str] = []
     seen_paths: set[str] = set()
-    local_matches = sorted(
-        [*_LOCAL_IMAGE_PATH_RE.finditer(text), *_WINDOWS_LOCAL_IMAGE_PATH_RE.finditer(text)],
-        key=lambda match: match.start(),
-    )
-    for match in local_matches:
+    for match in _LOCAL_IMAGE_PATH_RE.finditer(text):
         if _in_code(match.start()):
             continue
         raw = match.group(0)
-        expanded = _expand_image_path(raw)
+        expanded = os.path.expanduser(raw)
         try:
             if not os.path.isfile(expanded):
                 continue
@@ -158,15 +146,6 @@ def extract_image_refs(text: str) -> Tuple[List[str], List[str]]:
         urls.append(url)
 
     return local_paths, urls
-
-
-def _expand_image_path(raw: str) -> str:
-    """Expand a local image reference while honoring an explicit HOME."""
-    if raw.startswith(("~/", "~\\")):
-        configured_home = os.environ.get("HOME") or os.environ.get("USERPROFILE")
-        if configured_home:
-            return str(Path(configured_home) / raw[2:].replace("\\", os.sep).replace("/", os.sep))
-    return os.path.expanduser(raw)
 
 
 # Strict YAML/JSON boolean coercion for capability overrides.
@@ -356,33 +335,12 @@ def _resolve_inference_base_url(
 def _should_probe_ollama_vision(provider: str, base_url: str) -> bool:
     """True when the active provider likely fronts a local Ollama server."""
     p = (provider or "").strip().lower()
-    if "ollama" in p:
+    if p == "ollama":
         return True
     if not base_url:
         return False
     try:
-        from agent.model_metadata import (
-            _infer_provider_from_url,
-            detect_local_server_type,
-            is_local_endpoint,
-        )
-
-        # Match the context-metadata Quicksilver path: a URL belonging to a
-        # known hosted provider cannot be a local Ollama server. Vision tool
-        # gating previously missed this guard and paid the full five-endpoint
-        # local-server waterfall against Z.AI during every fresh Agent build.
-        inferred = _infer_provider_from_url(base_url)
-        if inferred and "ollama" not in inferred:
-            return False
-
-        # Unknown public custom endpoints are ordinary hosted
-        # OpenAI-compatible APIs unless the provider was explicitly named as
-        # Ollama above. Probing their unrelated LM Studio/Ollama/llama.cpp/vLLM
-        # paths adds seconds to every cold start and can spray authenticated
-        # requests at endpoints the user never configured. Private, loopback,
-        # container, and Tailscale URLs keep automatic local detection.
-        if not is_local_endpoint(base_url):
-            return False
+        from agent.model_metadata import detect_local_server_type
 
         return detect_local_server_type(base_url) == "ollama"
     except Exception:

@@ -166,6 +166,8 @@ class ModelAssignment(BaseModel):
     # ``hermes model`` custom flow collects.
     api_key: str = ""
     api_mode: str = ""
+    context_length: int = 0
+    reasoning_effort: str = ""
     confirm_expensive_model: bool = False
     profile: Optional[str] = None
 

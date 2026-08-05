@@ -333,10 +333,9 @@ class TestCallbackPortReservation:
             ).start()
             return await asyncio.wait_for(task, timeout=20)
 
-        callback = asyncio.run(drive())
-        assert callback.code == "abc123"
-        assert callback.state == "xyz"
-        assert callback.iss is None
+        code, state = asyncio.run(drive())
+        assert code == "abc123"
+        assert state == "xyz"
         # Reservation was consumed by adoption.
         assert port not in mod._reserved_sockets
 
@@ -375,13 +374,13 @@ class TestCallbackPortReservation:
             return await asyncio.wait_for(task, timeout=20)
 
         try:
-            callback = asyncio.run(drive())
+            code, state = asyncio.run(drive())
         finally:
             leftover = mod._reserved_sockets.pop(port_b, None)
             if leftover is not None:
                 leftover.close()
-        assert callback.code == "flowA"
-        assert callback.state == "sA"
+        assert code == "flowA"
+        assert state == "sA"
 
 
 # ---------------------------------------------------------------------------

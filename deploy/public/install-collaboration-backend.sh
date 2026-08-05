@@ -99,19 +99,9 @@ runtime_service_assets=(
   "agent/memory_provider.py"
   "agent/turn_context.py"
   "agent/lsp/workspace.py"
-  "agent/copilot_auth.py"
-  "agent/fallback_config.py"
   "agent/image_routing.py"
-  "agent/moa_config.py"
-  "agent/model_catalog.py"
   "agent/model_metadata.py"
   "agent/models_dev.py"
-  "agent/model_cost_guard.py"
-  "agent/model_normalize.py"
-  "agent/nous_account.py"
-  "agent/provider_auth.py"
-  "agent/provider_registry.py"
-  "agent/runtime_provider.py"
   "agent/shell_hooks.py"
   "agent/tool_dispatch_helpers.py"
   "agent/tool_executor.py"
@@ -152,6 +142,7 @@ runtime_service_assets=(
   "hermes_cli/mcp_config.py"
   "hermes_cli/plugins.py"
   "hermes_cli/profile_distribution.py"
+  "hermes_cli/runtime_provider.py"
   "hermes_services/__init__.py"
   "hermes_services/application.py"
   "hermes_services/auth.py"
@@ -1533,8 +1524,12 @@ fi
 if [[ "${dependency_update_enabled}" == 1 ]]; then
   sudo -u "${service_user}" -- env HERMES_HOME="${runtime_home}" \
     PYTHONPATH="${target_root}${PYTHONPATH:+:${PYTHONPATH}}" \
-    "${runtime_python}" -c 'from agent.runtime_provider import resolve_runtime_provider; from hermes_cli.web_server import app; assert resolve_runtime_provider and app' \
+    "${runtime_python}" -c 'from hermes_cli.web_server import app; assert app' \
     || { printf '%s\n' "installed dashboard import preflight failed" >&2; false; }
+  sudo -u "${service_user}" -- env HERMES_HOME="${runtime_home}" \
+    PYTHONPATH="${target_root}${PYTHONPATH:+:${PYTHONPATH}}" \
+    "${runtime_python}" -c 'from hermes_cli.runtime_provider import resolve_runtime_provider; assert resolve_runtime_provider' \
+    || { printf '%s\n' "installed runtime-provider import preflight failed" >&2; false; }
 fi
 # journalctl accepts the local ``YYYY-MM-DD HH:MM:SS`` form consistently
 # across systemd versions. ISO-8601's ``T`` and numeric offset are rejected
@@ -1703,11 +1698,9 @@ installation_health_cfg="$(mktemp /run/hermes-installation-route-health.XXXXXX)"
 chmod 0600 "${installation_health_cfg}"
 printf 'header = "X-DBB3-Token: %s"\nheader = "Accept: application/json"\n' \
   "$(cat -- "${managed_installation_token_file}")" >"${installation_health_cfg}"
-# Fabric nodes update from a two-minute systemd timer and may need several
-# minutes for dependency installation plus the receiver restart. Keep the
-# rollout fail-closed, but give a node that just missed the timer a full five
-# minute window to complete the normal update transaction.
-fabric_health_attempts="${HERMES_FABRIC_HEALTH_ATTEMPTS:-300}"
+# Fabric nodes update from a two-minute timer. Bound the default wait to one
+# minute; operators can raise it explicitly for a cold dependency install.
+fabric_health_attempts="${HERMES_FABRIC_HEALTH_ATTEMPTS:-60}"
 [[ "${fabric_health_attempts}" =~ ^[1-9][0-9]*$ ]] \
   || die "HERMES_FABRIC_HEALTH_ATTEMPTS must be a positive integer"
 for node in dbb3 wsl; do

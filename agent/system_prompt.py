@@ -10,7 +10,7 @@ fork inherits the cached prompt verbatim.
 Three tiers are joined with ``\\n\\n``:
 
 * ``stable``   — identity (SOUL.md or DEFAULT_AGENT_IDENTITY), tool
-  guidance, computer-use guidance, tool-use
+  guidance, computer-use guidance, nous subscription block, tool-use
   enforcement guidance + per-model operational guidance, skills prompt,
   alibaba model-name workaround, environment hints, coding guidance,
   platform hints.
@@ -32,7 +32,6 @@ from typing import Any, Dict, List, Optional
 
 from agent.prompt_builder import (
     DEFAULT_AGENT_IDENTITY,
-    EVIDENCE_FIRST_EXECUTION_GUIDANCE,
     GOOGLE_MODEL_OPERATIONAL_GUIDANCE,
     HERMES_AGENT_HELP_GUIDANCE,
     KANBAN_GUIDANCE,
@@ -49,7 +48,7 @@ from agent.prompt_builder import (
     TOOL_USE_ENFORCEMENT_MODELS,
     drain_truncation_warnings,
 )
-from hermes_runtime.runtime_cwd import resolve_context_cwd
+from agent.runtime_cwd import resolve_context_cwd
 from hermes_constants import get_hermes_home
 from utils import is_truthy_value
 
@@ -212,7 +211,6 @@ def build_system_prompt_parts(agent: Any, system_message: Optional[str] = None) 
     # users who want a leaner prompt can turn it off.
     if getattr(agent, "_task_completion_guidance", True) and agent.valid_tool_names:
         stable_parts.append(TASK_COMPLETION_GUIDANCE)
-        stable_parts.append(EVIDENCE_FIRST_EXECUTION_GUIDANCE)
 
     # Universal parallel-tool-call guidance.  Tells the model to batch
     # independent tool calls into one assistant turn rather than emitting one
@@ -259,6 +257,9 @@ def build_system_prompt_parts(agent: Any, system_message: Optional[str] = None) 
         from agent.prompt_builder import computer_use_guidance
         stable_parts.append(computer_use_guidance())
 
+    nous_subscription_prompt = _r.build_nous_subscription_prompt(agent.valid_tool_names)
+    if nous_subscription_prompt:
+        stable_parts.append(nous_subscription_prompt)
     # Tool-use enforcement: tells the model to actually call tools instead
     # of describing intended actions.  Controlled by config.yaml
     # agent.tool_use_enforcement:
@@ -451,7 +452,7 @@ def build_system_prompt_parts(agent: Any, system_message: Optional[str] = None) 
     # 10.1 guidance (tables, task lists, math, collapsible details, etc.).
     if platform_key == "telegram" and _default_hint:
         try:
-            from hermes_runtime.config import load_config_readonly
+            from hermes_cli.config import load_config_readonly
             _cfg = load_config_readonly()
             _tg_extra = ((_cfg.get("platforms") or {}).get("telegram") or {}).get("extra") or {}
             if _tg_extra.get("rich_messages"):

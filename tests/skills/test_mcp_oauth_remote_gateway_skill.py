@@ -10,7 +10,6 @@ from __future__ import annotations
 import importlib.util
 import io
 import json
-import os
 import re
 import sys
 import urllib.error
@@ -147,7 +146,7 @@ def test_requests_send_httpx_user_agent(tmp_path):
 
 def test_skill_md_frontmatter_invariants():
     yaml = pytest.importorskip("yaml")
-    content = SKILL_MD.read_text(encoding="utf-8")
+    content = SKILL_MD.read_text()
     assert content.startswith("---\n")
     fm = yaml.safe_load(re.search(r"^---\n(.*?)\n---", content, re.DOTALL).group(1))
     assert len(fm["description"]) <= 60

@@ -37,8 +37,6 @@ from dataclasses import dataclass, field, asdict
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional, Tuple
 
-from hermes_runtime.process_probe import pid_exists as _pid_exists
-
 logger = logging.getLogger(__name__)
 
 
@@ -632,7 +630,7 @@ def _truncate(text: str, limit: int) -> str:
 def _pid_alive(pid: int) -> bool:
     """Return True if a process with ``pid`` is currently alive.
 
-    Delegates to ``hermes_runtime.process_probe.pid_exists``, the canonical
+    Delegates to ``gateway.status._pid_exists`` — the canonical,
     cross-platform, footgun-safe liveness check (psutil with a ctypes /
     POSIX fallback). Critically this avoids ``os.kill(pid, 0)``, which on
     Windows is NOT a no-op: it routes to ``CTRL_C_EVENT`` and hard-kills the
@@ -643,6 +641,8 @@ def _pid_alive(pid: int) -> bool:
     if not pid or pid <= 0:
         return False
     try:
+        from gateway.status import _pid_exists
+
         return bool(_pid_exists(int(pid)))
     except Exception:
         pass
@@ -684,7 +684,7 @@ def _goal_judge_max_tokens() -> int:
     back to the default rather than crashing the goal loop.
     """
     try:
-        from hermes_runtime.config import load_config
+        from hermes_cli.config import load_config
 
         cfg = load_config()
         value = (

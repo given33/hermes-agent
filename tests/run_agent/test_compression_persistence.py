@@ -33,13 +33,7 @@ class TestFlushAfterCompression:
     the compressed messages list."""
 
     def _make_agent(self, session_db):
-        with patch.dict(
-            os.environ, {"OPENROUTER_API_KEY": "test-key"}
-        ), patch(
-            "agent.model_metadata.get_model_context_length", return_value=128_000
-        ), patch(
-            "agent.context_compressor.get_model_context_length", return_value=128_000
-        ):
+        with patch.dict(os.environ, {"OPENROUTER_API_KEY": "test-key"}):
             from run_agent import AIAgent
             agent = AIAgent(
                 api_key="test-key",
@@ -105,7 +99,6 @@ class TestFlushAfterCompression:
                 f"Expected 5 compressed messages in new session, got {len(new_rows)}. "
                 f"Compression persistence bug: messages not written to SQLite."
             )
-            db.close()
 
     def test_flush_with_stale_history_loses_messages(self):
         """Stale conversation_history no longer causes data loss."""
@@ -135,7 +128,6 @@ class TestFlushAfterCompression:
             rows = db.get_messages("new-session")
             assert len(rows) == 2
             assert [row["content"] for row in rows] == ["summary", "continuing..."]
-            db.close()
 
     def test_in_place_compression_rebaseline_prevents_duplicate_compacted_rows(self):
         """In-place compaction already persisted the compacted transcript.
@@ -198,7 +190,6 @@ class TestFlushAfterCompression:
                 "tool result",
                 "final answer",
             ]
-            db.close()
 
     def test_abort_after_in_place_compaction_preserves_flush_baseline(self):
         """An aborted retry must survive flush, restart, and resume."""

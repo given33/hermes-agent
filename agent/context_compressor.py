@@ -39,7 +39,7 @@ from agent.model_metadata import (
     estimate_messages_tokens_rough,
     estimate_tokens_rough,
 )
-from hermes_runtime.redaction import redact_sensitive_text
+from agent.redact import redact_sensitive_text
 from agent.turn_context import drop_stale_api_content
 from tools.todo_tool import TODO_INJECTION_HEADER
 

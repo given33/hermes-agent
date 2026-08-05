@@ -21,7 +21,6 @@ from pathlib import Path
 from typing import Any, Dict, Optional
 
 from hermes_constants import get_hermes_home
-from hermes_runtime.process_probe import pid_exists as _pid_exists
 
 # File + directory layout (under $HERMES_HOME):
 #
@@ -74,6 +73,7 @@ def _pid_alive(pid: int) -> bool:
     # ``os.kill(pid, 0)`` is NOT a no-op on Windows (bpo-14484) — it
     # routes through GenerateConsoleCtrlEvent and can kill the target.
     # Use the cross-platform existence check.
+    from gateway.status import _pid_exists
     return _pid_exists(pid)
 
 

@@ -211,7 +211,7 @@ class TestSigkillFallback:
 # OSError widening on liveness probes
 #
 # Post-#21561, ``ProcessRegistry._is_host_pid_alive`` delegates to
-# ``hermes_runtime.process_probe.pid_exists``, the cross-platform liveness
+# ``gateway.status._pid_exists``, which is the cross-platform liveness
 # primitive (psutil-first, ctypes/os.kill fallback). The tests below assert
 # (a) the delegation is correct and (b) ``_pid_exists`` correctly widens
 # Windows' ``OSError(WinError 87)`` / ``PermissionError`` behavior on the
@@ -220,13 +220,13 @@ class TestSigkillFallback:
 
 
 class TestProcessRegistryOSErrorWidening:
-    """_is_host_pid_alive delegates to hermes_runtime.process_probe.pid_exists."""
+    """_is_host_pid_alive delegates to gateway.status._pid_exists."""
 
     def test_oserror_treated_as_not_alive(self, monkeypatch):
         """_pid_exists → False propagates as _is_host_pid_alive → False."""
         from tools.process_registry import ProcessRegistry
 
-        monkeypatch.setattr("hermes_runtime.process_probe.pid_exists", lambda pid: False)
+        monkeypatch.setattr("gateway.status._pid_exists", lambda pid: False)
         assert ProcessRegistry._is_host_pid_alive(12345) is False
 
     def test_permission_error_treated_as_alive(self, monkeypatch):
@@ -242,19 +242,19 @@ class TestProcessRegistryOSErrorWidening:
         """
         from tools.process_registry import ProcessRegistry
 
-        monkeypatch.setattr("hermes_runtime.process_probe.pid_exists", lambda pid: True)
+        monkeypatch.setattr("gateway.status._pid_exists", lambda pid: True)
         assert ProcessRegistry._is_host_pid_alive(12345) is True
 
 
     def test_alive_pid_returns_true(self, monkeypatch):
         from tools.process_registry import ProcessRegistry
 
-        monkeypatch.setattr("hermes_runtime.process_probe.pid_exists", lambda pid: True)
+        monkeypatch.setattr("gateway.status._pid_exists", lambda pid: True)
         assert ProcessRegistry._is_host_pid_alive(os.getpid()) is True
 
 
 class TestPidExistsOSErrorWidening:
-    """The runtime process probe must widen platform errors correctly.
+    """gateway.status._pid_exists itself must widen Windows errors correctly.
 
     The POSIX fallback branch (reached when psutil isn't importable) is the
     only path where Python raises ``OSError(WinError 87)`` on Windows for a
@@ -264,36 +264,36 @@ class TestPidExistsOSErrorWidening:
 
     def test_oserror_gone_pid_returns_false(self, monkeypatch):
         """Simulate Windows' OSError(WinError 87) for a gone PID via the POSIX fallback."""
-        from hermes_runtime import process_probe
+        from gateway import status
 
         # Force the psutil-first branch to miss so we exercise the fallback.
         monkeypatch.setitem(
             __import__("sys").modules, "psutil",
             type("P", (), {"pid_exists": staticmethod(lambda pid: (_ for _ in ()).throw(ImportError()))})()
         )
-        monkeypatch.setattr(process_probe, "_IS_WINDOWS", False)
+        monkeypatch.setattr(status, "_IS_WINDOWS", False)
 
         def fake_kill(pid, sig):
             raise OSError(22, "Invalid argument")
 
-        monkeypatch.setattr(process_probe.os, "kill", fake_kill)
-        assert process_probe.pid_exists(12345) is False
+        monkeypatch.setattr(status.os, "kill", fake_kill)
+        assert status._pid_exists(12345) is False
 
     def test_permission_error_returns_true(self, monkeypatch):
         """POSIX fallback: PermissionError means alive (owned by another user)."""
-        from hermes_runtime import process_probe
+        from gateway import status
 
         monkeypatch.setitem(
             __import__("sys").modules, "psutil",
             type("P", (), {"pid_exists": staticmethod(lambda pid: (_ for _ in ()).throw(ImportError()))})()
         )
-        monkeypatch.setattr(process_probe, "_IS_WINDOWS", False)
+        monkeypatch.setattr(status, "_IS_WINDOWS", False)
 
         def fake_kill(pid, sig):
             raise PermissionError(1, "Operation not permitted")
 
-        monkeypatch.setattr(process_probe.os, "kill", fake_kill)
-        assert process_probe.pid_exists(12345) is True
+        monkeypatch.setattr(status.os, "kill", fake_kill)
+        assert status._pid_exists(12345) is True
 
 
 # ---------------------------------------------------------------------------
@@ -818,7 +818,7 @@ class TestGatewayDetachedWatcherWindowsFlags:
         end = text.find(").strip()", idx)
         assert end != -1, "watcher block end not found"
         block = text[idx:end]
-        assert "from hermes_runtime.subprocess_compat import" in block
+        assert "from hermes_cli._subprocess_compat import" in block
         assert "windows_detach_flags" in block
         assert "windows_detach_flags()" in block, (
             "Inlined respawn watcher must call windows_detach_flags() for the "

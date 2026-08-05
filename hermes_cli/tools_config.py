@@ -19,13 +19,11 @@ from pathlib import Path
 from typing import Dict, List, Optional, Set
 
 
-from hermes_runtime.config import (
+from hermes_cli.config import (
     cfg_get,
     load_config, save_config, get_env_value, save_env_value,
 )
-from hermes_runtime.colors import Colors, color
-from hermes_runtime.package_install import install_python_packages
-from hermes_config_values import parse_enabled_flag
+from hermes_cli.colors import Colors, color
 from hermes_cli.nous_subscription import (
     MANAGED_FEATURE_COVERAGE_CATEGORY,
     NousSubscriptionFeatures,
@@ -47,7 +45,7 @@ def _post_setup_no_window_flags(*, streams_to_console: bool = False) -> int:
     (npm.cmd, npx, pip, powershell, curl) spawned from that console-less
     parent materializes a brand-new console window — the "terminal flash"
     users see when clicking "Run setup". ``CREATE_NO_WINDOW`` (via
-    :func:`hermes_runtime.subprocess_compat.windows_hide_flags`) suppresses it
+    :func:`hermes_cli._subprocess_compat.windows_hide_flags`) suppresses it
     without breaking ``capture_output`` — unlike ``DETACHED_PROCESS``, stdio
     handles stay inheritable. Returns 0 on POSIX, so passing the result
     unconditionally is safe.
@@ -59,7 +57,7 @@ def _post_setup_no_window_flags(*, streams_to_console: bool = False) -> int:
     the current process has no usable console of its own (stdout is a
     pipe/log file — exactly the GUI-spawn case that flashes).
     """
-    from hermes_runtime.subprocess_compat import windows_hide_flags
+    from hermes_cli._subprocess_compat import windows_hide_flags
 
     flags = windows_hide_flags()
     if not flags:
@@ -82,7 +80,7 @@ PROJECT_ROOT = Path(__file__).parent.parent.resolve()
 
 # ─── UI Helpers (shared with setup.py) ────────────────────────────────────────
 
-from hermes_runtime.console_output import (  # noqa: E402 — late import block
+from hermes_cli.cli_output import (  # noqa: E402 — late import block
     print_error as _print_error,
     print_info as _print_info,
     print_success as _print_success,
@@ -864,6 +862,7 @@ def _pip_install(
             streams_to_console=not capture_output
         ),
     )
+
 
 
 # The asset-probe that lived here used to hit `/releases/latest` on
@@ -1970,7 +1969,7 @@ def _run_post_setup(post_setup_key: str):
                 prompt_choice,
                 prompt as _setup_prompt,
             )
-            from hermes_runtime.config import save_env_value
+            from hermes_cli.config import save_env_value
         except Exception as exc:
             _print_warning(f"    Could not load setup helpers: {exc}")
             _print_info("    Run later: hermes auth add xai-oauth   (or set XAI_API_KEY)")
@@ -2105,8 +2104,20 @@ def _platform_toolset_summary(config: dict, platforms: Optional[List[str]] = Non
 
 
 def _parse_enabled_flag(value, default: bool = True) -> bool:
-    """Compatibility alias for the public runtime parser."""
-    return parse_enabled_flag(value, default=default)
+    """Parse bool-like config values used by tool/platform settings."""
+    if value is None:
+        return default
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, int):
+        return value != 0
+    if isinstance(value, str):
+        lowered = value.strip().lower()
+        if lowered in {"true", "1", "yes", "on"}:
+            return True
+        if lowered in {"false", "0", "no", "off"}:
+            return False
+    return default
 
 
 def enabled_mcp_server_names(config: dict) -> Set[str]:
@@ -2123,7 +2134,7 @@ def enabled_mcp_server_names(config: dict) -> Set[str]:
         str(name)
         for name, server_cfg in mcp_servers.items()
         if isinstance(server_cfg, dict)
-        and parse_enabled_flag(server_cfg.get("enabled", True), default=True)
+        and _parse_enabled_flag(server_cfg.get("enabled", True), default=True)
     }
 
 
@@ -3101,8 +3112,6 @@ def _visible_providers(
     )
     visible = []
     for provider in cat.get("providers", []):
-        if provider.get("managed_nous_feature") or provider.get("requires_nous_auth"):
-            continue
         # Nous-managed Tool Gateway rows stay visible regardless of auth —
         # selecting one drives an inline Portal login. A `requires_nous_auth`
         # row that is NOT a managed gateway feature (pure pre-auth UX) is

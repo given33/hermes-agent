@@ -805,44 +805,6 @@ def _maybe_warn_line_oriented_newline_pattern(result: SearchResult, pattern: str
     return result
 
 
-def _line_safe_top_level_alternatives(pattern: str) -> Optional[str]:
-    """Drop top-level regex branches that require multiline matching.
-
-    This intentionally declines to rewrite nested alternations. Replaying the
-    original expression through grep changes ``\\n`` into ``n`` on GNU grep
-    and can create false positives.
-    """
-    branches: list[str] = []
-    start = 0
-    depth = 0
-    in_class = False
-    escaped = False
-    for index, character in enumerate(pattern):
-        if escaped:
-            escaped = False
-            continue
-        if character == "\\":
-            escaped = True
-            continue
-        if character == "[" and not in_class:
-            in_class = True
-        elif character == "]" and in_class:
-            in_class = False
-        elif not in_class:
-            if character == "(":
-                depth += 1
-            elif character == ")" and depth:
-                depth -= 1
-            elif character == "|" and depth == 0:
-                branches.append(pattern[start:index])
-                start = index + 1
-    branches.append(pattern[start:])
-    if len(branches) == 1:
-        return None
-    safe = [branch for branch in branches if not _pattern_has_regex_newline(branch)]
-    return "|".join(safe) if safe else None
-
-
 class ShellFileOperations(FileOperations):
     """
     File operations implemented via shell commands.
@@ -1001,24 +963,6 @@ class ShellFileOperations(FileOperations):
             result = self._exec("echo $HOME")
             if result.exit_code == 0 and result.stdout.strip():
                 home = result.stdout.strip()
-                # LocalEnvironment runs commands through Git Bash on native
-                # Windows, whose ``$HOME`` is reported as ``/c/...``.  File
-                # operations also use host-side Path/ACL checks, so keep the
-                # expanded value in native form at this boundary and let
-                # ``_escape_shell_arg`` translate it back for the shell.
-                try:
-                    from tools.environments.local import (
-                        LocalEnvironment,
-                        _msys_to_windows_path,
-                    )
-
-                    if isinstance(self.env, LocalEnvironment):
-                        home = _msys_to_windows_path(home)
-                except Exception:
-                    # Path expansion is best-effort; remote backends and
-                    # partially constructed test doubles should retain the
-                    # shell-provided value rather than failing the operation.
-                    pass
                 if path == '~':
                     return home
                 elif path.startswith('~/'):
@@ -1056,20 +1000,6 @@ class ShellFileOperations(FileOperations):
         arg = _bash_safe_path(arg)
         # Use single quotes and escape any single quotes in the string
         return "'" + arg.replace("'", "'\"'\"'") + "'"
-
-    def _escape_native_path_arg(self, path: str) -> str:
-        """Quote a path passed from Git Bash to a native host executable.
-
-        LocalEnvironment disables MSYS argv conversion so native Windows
-        tools keep option-like arguments intact. Consequently a native
-        ``rg.exe`` cannot resolve Git Bash's ``/c/...`` spelling and must
-        receive a drive-qualified path itself.
-        """
-        if os.name == "nt":
-            from tools.environments.local import _msys_to_windows_path
-
-            path = _msys_to_windows_path(path).replace("\\", "/")
-        return "'" + path.replace("'", "'\"'\"'") + "'"
 
     def _atomic_write(self, path: str, content: str) -> "ExecuteResult":
         """Write ``content`` to ``path`` atomically via temp-file + rename.
@@ -1159,17 +1089,6 @@ class ShellFileOperations(FileOperations):
         or ``None`` if undetermined (new file, empty file, single-line
         file with no line break in the first chunk).
         """
-        # LocalEnvironment normalizes command output to LF on Windows so the
-        # public terminal API is stable.  Read the host bytes for this
-        # metadata probe instead of trying to infer CRLF from that normalized
-        # stream; remote environments continue to use the shell sample below.
-        if self._uses_host_file_metadata():
-            try:
-                sample = Path(path).read_bytes()[:4096].decode("utf-8", errors="replace")
-            except (OSError, UnicodeError):
-                sample = ""
-            if sample:
-                return _detect_line_ending(sample)
         if pre_content:
             return _detect_line_ending(pre_content)
         # File may not exist (new write) — `head` exits 0 with empty
@@ -1188,11 +1107,6 @@ class ShellFileOperations(FileOperations):
         marker. A missing/empty file returns False (new writes get no BOM
         unless the caller explicitly includes one).
         """
-        if self._uses_host_file_metadata():
-            try:
-                return Path(path).read_bytes()[:3] == _UTF8_BOM.encode("utf-8")
-            except OSError:
-                return False
         if pre_content is not None:
             return _has_bom(pre_content)
         head_cmd = f"head -c 3 {self._escape_shell_arg(path)} 2>/dev/null"
@@ -1200,17 +1114,6 @@ class ShellFileOperations(FileOperations):
         if head_result.exit_code != 0 or not head_result.stdout:
             return False
         return _has_bom(head_result.stdout)
-
-    def _uses_host_file_metadata(self) -> bool:
-        """Whether Windows metadata probes can read the local host directly."""
-        if os.name != "nt":
-            return False
-        try:
-            from tools.environments.local import LocalEnvironment
-
-            return isinstance(self.env, LocalEnvironment)
-        except Exception:
-            return False
 
 
     def _unified_diff(self, old_content: str, new_content: str, filename: str) -> str:
@@ -2475,13 +2378,7 @@ class ShellFileOperations(FileOperations):
         if not has_hidden_path_ancestor:
             pagination_expr = f" | tail -n +{offset + 1} | head -n {limit}"
 
-        # ``find`` is a shell utility on POSIX/Git Bash but the fallback is
-        # also exercised by native Windows test/remote shells.  Pass a
-        # drive-qualified root there; LocalEnvironment's command translator
-        # converts it to MSYS form before Git Bash runs it, while cmd.exe can
-        # resolve the same native spelling directly.
-        find_path = self._escape_native_path_arg(path)
-        cmd = f"find {find_path}{hidden_filter_expr} -type f -name {self._escape_shell_arg(search_pattern)} " \
+        cmd = f"find {self._escape_shell_arg(path)}{hidden_filter_expr} -type f -name {self._escape_shell_arg(search_pattern)} " \
               f"-printf '%T@ %p\\n' 2>/dev/null | sort -rn{pagination_expr}"
 
         result = self._exec(cmd, timeout=60)
@@ -2489,23 +2386,10 @@ class ShellFileOperations(FileOperations):
 
         if not stdout.strip() and not limit_reason:
             # Try without -printf (BSD find compatibility -- macOS)
-            cmd_simple = f"find {find_path}{hidden_filter_expr} -type f -name {self._escape_shell_arg(search_pattern)} " \
+            cmd_simple = f"find {self._escape_shell_arg(path)}{hidden_filter_expr} -type f -name {self._escape_shell_arg(search_pattern)} " \
                         f"2>/dev/null | sort -rn{pagination_expr}"
             result = self._exec(cmd_simple, timeout=60)
             stdout, limit_reason = _search_stdout_and_limit(result)
-
-        # A native Windows shell may expose ``find.exe`` (the text-search
-        # command) rather than POSIX find, so both commands can succeed with
-        # no file-list output.  When the requested root is also visible on the
-        # host, use a small Python fallback with the same hidden-descendant,
-        # mtime ordering, and pagination semantics.  Remote/POSIX backends
-        # keep the shell implementation and simply return ``None`` here.
-        if not stdout.strip() and not limit_reason and os.name == "nt":
-            host_files = self._search_files_host_fallback(
-                search_pattern, path, limit, offset
-            )
-            if host_files is not None:
-                return host_files
 
         files = []
         for line in stdout.strip().split('\n'):
@@ -2513,9 +2397,9 @@ class ShellFileOperations(FileOperations):
                 continue
             parts = line.split(' ', 1)
             if len(parts) == 2 and parts[0].replace('.', '').isdigit():
-                files.append(self._normalize_search_result_path(parts[1]))
+                files.append(parts[1])
             else:
-                files.append(self._normalize_search_result_path(line))
+                files.append(line)
 
         # For explicit hidden roots, find's path-based filtering excludes every
         # file under the hidden path. Apply descendant filtering after command
@@ -2541,35 +2425,6 @@ class ShellFileOperations(FileOperations):
             limit_reason=limit_reason,
         )
 
-    @staticmethod
-    def _normalize_search_result_path(path: str) -> str:
-        """Normalize Git Bash drive paths emitted by local Windows searches.
-
-        ``find`` runs inside Git Bash and reports a native Windows file as
-        ``/c/Users/...``.  Feeding that spelling to ``pathlib.Path`` on the
-        host produces ``C:\\c\\Users\\...``; hidden-ancestor filtering then
-        treats the real ``.hermes``/``.git`` ancestor as a descendant and
-        drops every match.  Convert only paths that resolve to an existing
-        native file so remote backends that legitimately use ``/c`` retain
-        their original POSIX spelling.
-        """
-        if os.name != "nt" or not path:
-            return path
-        if re.match(r"^[A-Za-z]:[\\/]", path):
-            native = os.path.normpath(path)
-            return native if Path(native).exists() else path
-        if not re.match(r"^/(?:mnt/|cygdrive/)?[A-Za-z](?:/|$)", path):
-            return path
-        try:
-            from tools.environments.local import _msys_to_windows_path
-
-            native = _msys_to_windows_path(path)
-            if native != path and Path(native).exists():
-                return native
-        except (ImportError, OSError, ValueError):
-            pass
-        return path
-
     def _search_files_rg(self, pattern: str, path: str, limit: int, offset: int) -> SearchResult:
         """Search for files by name using ripgrep's --files mode.
 
@@ -2585,131 +2440,35 @@ class ShellFileOperations(FileOperations):
         else:
             glob_pattern = pattern
 
-        search_root = Path(path)
-        has_hidden_path_ancestor = any(
-            part not in {".", ".."} and part.startswith(".")
-            for part in search_root.parts
-        )
         fetch_limit = limit + offset
-        # When the requested root itself is hidden, collect the complete
-        # candidate set before filtering hidden descendants.  Applying
-        # ``head`` first can fill the page with dotfiles and truncate visible
-        # matches that occur later in the traversal.
-        pagination_pipe = "" if has_hidden_path_ancestor else f" | head -n {fetch_limit}"
         # Try mtime-sorted first (rg 13+); fall back to unsorted if not supported.
         cmd_sorted = (
             f"rg --files --sortr=modified -g {self._escape_shell_arg(glob_pattern)} "
-            # ``rg`` is a native Windows executable in Git Bash.  The local
-            # environment sets ``MSYS_NO_PATHCONV=1`` so option-like argv is
-            # preserved, which means a Git-Bash ``/c/...`` path would reach
-            # rg unchanged and silently match nothing.  Convert only the
-            # filesystem operand back to a native path for this executable.
-            f"{self._escape_native_path_arg(path)} 2>/dev/null"
-            f"{pagination_pipe}"
+            f"{self._escape_shell_arg(path)} 2>/dev/null "
+            f"| head -n {fetch_limit}"
         )
         result = self._exec(cmd_sorted, timeout=60)
         stdout, limit_reason = _search_stdout_and_limit(result)
-        all_files = [
-            self._normalize_search_result_path(f)
-            for f in stdout.strip().split('\n')
-            if f
-        ]
+        all_files = [f for f in stdout.strip().split('\n') if f]
 
         if not all_files and not limit_reason:
             # --sortr may have failed on older rg; retry without it.
             cmd_plain = (
                 f"rg --files -g {self._escape_shell_arg(glob_pattern)} "
-                f"{self._escape_native_path_arg(path)} 2>/dev/null"
-                f"{pagination_pipe}"
+                f"{self._escape_shell_arg(path)} 2>/dev/null "
+                f"| head -n {fetch_limit}"
             )
             result = self._exec(cmd_plain, timeout=60)
             stdout, limit_reason = _search_stdout_and_limit(result)
-            all_files = [
-                self._normalize_search_result_path(f)
-                for f in stdout.strip().split('\n')
-                if f
-            ]
+            all_files = [f for f in stdout.strip().split('\n') if f]
 
-        # An explicitly requested hidden root is allowed, but hidden
-        # descendants still follow the normal search policy.  ripgrep's
-        # ``--files`` behavior differs across versions/platforms here: on
-        # Git Bash it can return dotfiles below an explicit ``.hermes`` root,
-        # while the ``find`` fallback filters them.  Apply the same policy to
-        # both paths so the result does not depend on which backend is found.
-        normalized_files = [
-            self._normalize_search_result_path(file_path)
-            for file_path in all_files
-        ]
-        if has_hidden_path_ancestor:
-            normalized_root = search_root.resolve()
-            visible_files = []
-            for file_path in normalized_files:
-                try:
-                    rel_parts = Path(file_path).resolve().relative_to(normalized_root).parts
-                except ValueError:
-                    rel_parts = Path(file_path).parts
-                if any(part not in {".", ".."} and part.startswith(".") for part in rel_parts):
-                    continue
-                visible_files.append(file_path)
-            normalized_files = visible_files
-
-        page = normalized_files[offset:offset + limit]
+        page = all_files[offset:offset + limit]
 
         return SearchResult(
             files=page,
-            total_count=len(normalized_files),
-            truncated=len(normalized_files) >= fetch_limit or bool(limit_reason),
+            total_count=len(all_files),
+            truncated=len(all_files) >= fetch_limit or bool(limit_reason),
             limit_reason=limit_reason,
-        )
-
-    def _search_files_host_fallback(
-        self,
-        pattern: str,
-        path: str,
-        limit: int,
-        offset: int,
-    ) -> SearchResult | None:
-        """Search a host-visible Windows tree when POSIX ``find`` is absent."""
-        root = Path(path)
-        if os.name == "nt":
-            try:
-                from tools.environments.local import _msys_to_windows_path
-
-                root = Path(_msys_to_windows_path(path))
-            except Exception:
-                pass
-        if not root.is_dir():
-            return None
-
-        candidates: list[tuple[float, str]] = []
-        try:
-            for candidate in root.rglob("*"):
-                if not candidate.is_file() or not fnmatch.fnmatch(candidate.name, pattern):
-                    continue
-                try:
-                    relative_parts = candidate.relative_to(root).parts
-                except ValueError:
-                    continue
-                if any(
-                    part not in {".", ".."} and part.startswith(".")
-                    for part in relative_parts
-                ):
-                    continue
-                try:
-                    mtime = candidate.stat().st_mtime
-                except OSError:
-                    mtime = 0.0
-                candidates.append((mtime, str(candidate)))
-        except OSError:
-            return None
-
-        candidates.sort(key=lambda item: (-item[0], item[1]))
-        files = [item[1] for item in candidates]
-        page = files[offset:offset + limit]
-        return SearchResult(
-            files=page,
-            total_count=len(files),
-            truncated=len(files) >= offset + limit,
         )
     
     def _search_content(self, pattern: str, path: str, file_glob: Optional[str],
@@ -2721,19 +2480,6 @@ class ShellFileOperations(FileOperations):
             used_rg = True
             result = self._search_with_rg(pattern, path, file_glob, limit, offset,
                                           output_mode, context)
-            # ripgrep rejects an expression when any branch contains a
-            # newline escape. Retry only top-level branches proven not to
-            # contain one; grep changes ``\\n`` to ``n`` and creates false
-            # positives if it receives the original expression.
-            if (
-                _is_line_oriented_newline_error(result.error)
-                and "\n" not in pattern
-            ):
-                safe_pattern = _line_safe_top_level_alternatives(pattern)
-                if safe_pattern:
-                    result = self._search_with_rg(
-                        safe_pattern, path, file_glob, limit, offset, output_mode, context
-                    )
         elif self._has_command('grep'):
             result = self._search_with_grep(pattern, path, file_glob, limit, offset,
                                             output_mode, context)
@@ -2793,7 +2539,7 @@ class ShellFileOperations(FileOperations):
         
         # Add pattern and path
         cmd_parts.append(self._escape_shell_arg(pattern))
-        cmd_parts.append(self._escape_native_path_arg(path))
+        cmd_parts.append(self._escape_shell_arg(path))
         
         # Fetch extra rows so we can report the true total before slicing.
         # For context mode, rg emits separator lines ("--") between groups,
@@ -2907,9 +2653,7 @@ class ShellFileOperations(FileOperations):
     def _search_with_grep(self, pattern: str, path: str, file_glob: Optional[str],
                           limit: int, offset: int, output_mode: str, context: int) -> SearchResult:
         """Fallback search using grep."""
-        # Extended regex keeps fallback semantics aligned with ripgrep,
-        # including alternation with ``|``.
-        cmd_parts = ["grep", "-rnHE"]  # -H forces filename even for single-file searches
+        cmd_parts = ["grep", "-rnH"]  # -H forces filename even for single-file searches
         
         # Exclude hidden directories (matching ripgrep's default behavior).
         # This prevents searching inside .hub/index-cache/, .git/, etc.

@@ -75,12 +75,7 @@ class TestSharedConnection:
         real_dir = tmp_path / "real"
         real_dir.mkdir()
         link_dir = tmp_path / "link"
-        try:
-            link_dir.symlink_to(real_dir)
-        except OSError as exc:
-            if getattr(exc, "winerror", None) == 1314:
-                pytest.skip("directory symlinks require SeCreateSymbolicLinkPrivilege on Windows")
-            raise
+        link_dir.symlink_to(real_dir)
 
         a = MemoryStore(real_dir / "memory_store.db")
         b = MemoryStore(link_dir / "memory_store.db")

@@ -455,7 +455,7 @@ class TestProbeCapabilityGating:
             self.prompts = prompts
             self.resources = resources
 
-    class _DiscoverResult:
+    class _InitResult:
         def __init__(self, caps):
             self.capabilities = caps
 
@@ -483,7 +483,7 @@ class TestProbeCapabilityGating:
         class _FakeServer:
             _tools = [outer._FakeTool()]
             session = _Session()
-            discover_result = outer._DiscoverResult(caps)
+            initialize_result = outer._InitResult(caps)
 
             async def shutdown(self_inner):
                 return None

@@ -304,6 +304,9 @@ COMMAND_REGISTRY: list[CommandDef] = [
                gateway_only=True, busy_policy="dispatch"),
     CommandDef("usage", "Show token usage and rate limits; `reset` redeems a banked Codex limit reset", "Info",
                args_hint="[reset [--force]]"),
+    CommandDef("subscription", "View your Nous plan and change it in the browser", "Info",
+               cli_only=True, aliases=("upgrade",)),
+    CommandDef("topup", "Show your Nous balance and manage billing on the portal", "Info"),
     CommandDef("insights", "Show usage insights and analytics", "Info",
                args_hint="[days]"),
     CommandDef("platforms", "Show gateway/messaging platform status", "Info",
@@ -494,7 +497,7 @@ def _resolve_config_gates() -> set[str]:
     if not gated:
         return set()
     try:
-        from hermes_runtime.config import read_raw_config
+        from hermes_cli.config import read_raw_config
         cfg = read_raw_config()
     except Exception:
         return set()
@@ -680,7 +683,7 @@ def _telegram_command_menu_config() -> dict[str, Any]:
     ``platforms.telegram.extra.command_menu``.
     """
     try:
-        from hermes_runtime.config import read_raw_config
+        from hermes_cli.config import read_raw_config
         raw_cfg = read_raw_config() or {}
     except Exception:
         raw_cfg = {}
@@ -904,7 +907,7 @@ def _collect_gateway_skill_entries(
     # --- Tier 2: Built-in skill commands (trimmed at cap) -----------------
     _platform_disabled: set[str] = set()
     try:
-        from hermes_runtime.skill_utils import get_disabled_skill_names
+        from agent.skill_utils import get_disabled_skill_names
         _platform_disabled = get_disabled_skill_names(platform=platform)
     except Exception:
         pass
@@ -913,7 +916,7 @@ def _collect_gateway_skill_entries(
     try:
         from agent.skill_commands import get_skill_commands
         from tools.skills_tool import SKILLS_DIR
-        from hermes_runtime.skill_utils import get_external_skills_dirs
+        from agent.skill_utils import get_external_skills_dirs
         _skills_dir = str(SKILLS_DIR.resolve())
         _hub_dir = str((SKILLS_DIR / ".hub").resolve()).rstrip("/") + "/"
         # Build set of allowed directory prefixes: local skills dir + any
@@ -1075,7 +1078,7 @@ def discord_skill_commands_by_category(
 
     _platform_disabled: set[str] = set()
     try:
-        from hermes_runtime.skill_utils import get_disabled_skill_names
+        from agent.skill_utils import get_disabled_skill_names
         _platform_disabled = get_disabled_skill_names(platform="discord")
     except Exception:
         pass
@@ -1093,7 +1096,7 @@ def discord_skill_commands_by_category(
 
     try:
         from agent.skill_commands import get_skill_commands
-        from hermes_runtime.skill_utils import get_external_skills_dirs
+        from agent.skill_utils import get_external_skills_dirs
         from tools.skills_tool import SKILLS_DIR
 
         _skills_dir = SKILLS_DIR.resolve()
@@ -1904,7 +1907,7 @@ class SlashCommandCompleter(Completer):
         already = set(parts[1:] if trailing_space else parts[1:-1])
 
         try:
-            from hermes_runtime.config import load_config
+            from hermes_cli.config import load_config
             from hermes_cli.tools_config import (
                 CONFIGURABLE_TOOLSETS,
                 _get_platform_tools,

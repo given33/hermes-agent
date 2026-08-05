@@ -14,8 +14,8 @@ from pathlib import Path
 PROJECT_ROOT = Path(__file__).parent.parent.resolve()
 
 from hermes_cli.auth import AuthError, resolve_provider
-from hermes_runtime.colors import Colors, color
-from hermes_runtime.config import get_env_path, get_env_value, get_hermes_home, load_config
+from hermes_cli.colors import Colors, color
+from hermes_cli.config import get_env_path, get_env_value, get_hermes_home, load_config
 from hermes_cli.models import provider_label
 from hermes_cli.nous_account import (
     format_nous_portal_entitlement_message,
@@ -35,12 +35,12 @@ def check_mark(ok: bool) -> str:
 def redact_key(key: str) -> str:
     """Redact an API key for display.
 
-    Thin wrapper over :func:`hermes_runtime.redaction.mask_secret`. Preserves the
+    Thin wrapper over :func:`agent.redact.mask_secret`. Preserves the
     "(not set)" placeholder in dim color to match ``hermes config``'s
     output (previously this variant was missing the DIM color —
     consolidated via PR that also introduced ``mask_secret``).
     """
-    from hermes_runtime.redaction import mask_secret
+    from agent.redact import mask_secret
     return mask_secret(key, empty=color("(not set)", Colors.DIM))
 
 
@@ -249,6 +249,10 @@ def show_status(args):
         nous_label = "not logged in (Nous inference key configured)"
     else:
         nous_label = "not logged in (run: hermes portal)"
+    print(
+        f"  {'Nous Portal':<12}  {check_mark(nous_logged_in)} "
+        f"{nous_label}"
+    )
     portal_url = nous_status.get("portal_base_url") or "(unknown)"
     inference_url = (
         nous_status.get("inference_base_url")
@@ -257,23 +261,18 @@ def show_status(args):
     access_exp = _format_iso_timestamp(nous_status.get("access_expires_at"))
     key_exp = _format_iso_timestamp(nous_status.get("agent_key_expires_at"))
     refresh_label = "yes" if nous_status.get("has_refresh_token") else "no"
-    if nous_status:
-        print(
-            f"  {'Nous Portal':<12}  {check_mark(nous_logged_in)} "
-            f"{nous_label}"
-        )
-        if nous_logged_in or portal_url != "(unknown)" or nous_error:
-            print(f"    Portal URL: {portal_url}")
-        if nous_inference_present and inference_url:
-            print(f"    Inference:  {inference_url}")
-        if nous_logged_in or nous_status.get("access_expires_at"):
-            print(f"    Access exp: {access_exp}")
-        if nous_logged_in or nous_inference_present or nous_status.get("agent_key_expires_at"):
-            print(f"    Key exp:    {key_exp}")
-        if nous_logged_in or nous_status.get("has_refresh_token"):
-            print(f"    Refresh:    {refresh_label}")
-        if nous_error:
-            print(f"    Error:      {nous_error}")
+    if nous_logged_in or portal_url != "(unknown)" or nous_error:
+        print(f"    Portal URL: {portal_url}")
+    if nous_inference_present and inference_url:
+        print(f"    Inference:  {inference_url}")
+    if nous_logged_in or nous_status.get("access_expires_at"):
+        print(f"    Access exp: {access_exp}")
+    if nous_logged_in or nous_inference_present or nous_status.get("agent_key_expires_at"):
+        print(f"    Key exp:    {key_exp}")
+    if nous_logged_in or nous_status.get("has_refresh_token"):
+        print(f"    Refresh:    {refresh_label}")
+    if nous_error:
+        print(f"    Error:      {nous_error}")
 
     codex_logged_in = bool(codex_status.get("logged_in"))
     print(
@@ -362,12 +361,10 @@ def show_status(args):
                 state = "available via subscription (optional)"
             else:
                 state = "not configured"
-            print(
-                f"  {feature.label:<15} "
-                f"{check_mark(feature.available or feature.active or feature.managed_by_nous)} "
-                f"{state}"
-            )
+            print(f"  {feature.label:<15} {check_mark(feature.available or feature.active or feature.managed_by_nous)} {state}")
     elif nous_logged_in or nous_inference_present:
+        # Nous OAuth without entitlement, or an opaque inference key without
+        # Portal account information, cannot enable the Tool Gateway.
         print()
         print(color("◆ Nous Tool Gateway", Colors.CYAN, Colors.BOLD))
         message = format_nous_portal_entitlement_message(
@@ -385,7 +382,6 @@ def show_status(args):
     print(color("◆ API-Key Providers", Colors.CYAN, Colors.BOLD))
 
     apikey_providers = {
-        "Nous Inference":  ("NOUS_API_KEY",),
         "Z.AI / GLM":       ("GLM_API_KEY", "ZAI_API_KEY", "Z_AI_API_KEY"),
         "Kimi / Moonshot":  ("KIMI_API_KEY",),
         "StepFun Step Plan": ("STEPFUN_API_KEY",),

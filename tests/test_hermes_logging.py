@@ -73,64 +73,6 @@ class TestSetupLogging:
         assert log_dir == hermes_home / "logs"
         assert log_dir.is_dir()
 
-    def test_uses_writable_fallback_when_primary_filesystem_is_full(
-        self, hermes_home, tmp_path, monkeypatch,
-    ):
-        """A full HERMES_HOME must not prevent dashboard startup logging."""
-        fallback = tmp_path / "fallback-logs"
-        primary = hermes_home / "logs"
-        real_disk_usage = hermes_logging.shutil.disk_usage
-
-        def disk_usage(path):
-            if Path(path).resolve() == primary.resolve():
-                usage = real_disk_usage(path)
-                return usage._replace(free=0)
-            return real_disk_usage(path)
-
-        monkeypatch.setenv("HERMES_LOG_FALLBACK_DIR", str(fallback))
-        monkeypatch.setattr(hermes_logging.shutil, "disk_usage", disk_usage)
-
-        log_dir = hermes_logging.setup_logging(hermes_home=hermes_home, mode="gateway")
-        assert log_dir == fallback
-        assert (fallback / "agent.log").exists()
-        assert (fallback / "errors.log").exists()
-        assert (fallback / "gateway.log").exists()
-
-        logger = logging.getLogger("gateway.full_disk_fallback")
-        logger.info("fallback log record")
-        hermes_logging.flush_log_queue()
-        assert "fallback log record" in (fallback / "agent.log").read_text()
-        assert "fallback log record" in (fallback / "gateway.log").read_text()
-
-    def test_runtime_enospc_switches_handler_to_fallback(
-        self, hermes_home, tmp_path, monkeypatch,
-    ):
-        """A mount filling after startup should fail over without traceback spam."""
-        primary = hermes_home / "logs"
-        fallback = tmp_path / "runtime-fallback"
-        monkeypatch.setenv("HERMES_LOG_FALLBACK_DIR", str(fallback))
-        log_dir = hermes_logging.setup_logging(hermes_home=hermes_home)
-        assert log_dir == primary
-
-        handler = next(
-            h for h in hermes_logging.rotating_file_handlers()
-            if "agent.log" in getattr(h, "baseFilename", "")
-        )
-        logger = logging.getLogger("runtime.full_disk")
-        record = logger.makeRecord(
-            logger.name, logging.INFO, __file__, 0,
-            "runtime fallback record", (), None,
-        )
-        try:
-            raise OSError(28, "No space left on device")
-        except OSError:
-            handler.handleError(record)
-        logger.info("runtime fallback record")
-        hermes_logging.flush_log_queue()
-
-        assert handler._using_fallback is True
-        assert "runtime fallback record" in (fallback / "agent.log").read_text()
-
     def test_creates_agent_log_handler(self, hermes_home):
         hermes_logging.setup_logging(hermes_home=hermes_home)
         root = logging.getLogger()

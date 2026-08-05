@@ -15,7 +15,7 @@ from collections.abc import Mapping
 from pathlib import Path
 
 from tools.environments.base import BaseEnvironment, _pipe_stdin
-from hermes_runtime.subprocess_compat import windows_hide_flags
+from hermes_cli._subprocess_compat import windows_hide_flags
 
 _IS_WINDOWS = platform.system() == "Windows"
 
@@ -137,87 +137,6 @@ def _quote_bash_path(path: str) -> str:
     return shlex.quote(_bash_safe_path(path))
 
 
-_NATIVE_WINDOWS_PATH_RE = re.compile(
-    r"(?<![A-Za-z0-9_])(?P<drive>[A-Za-z]):[\\/](?P<tail>[^\s\"';&|<>()]+)"
-)
-_QUOTED_NATIVE_WINDOWS_PATH_RE = re.compile(
-    r"(?P<quote>[\"'])(?P<path>[A-Za-z]:[\\/][^\"']+)(?P=quote)"
-)
-
-
-def _existing_native_windows_path(raw: str) -> bool:
-    """Return True when *raw* names an existing host file or directory."""
-    try:
-        return os.path.exists(raw) or os.path.exists(raw.rstrip("\\/"))
-    except (OSError, ValueError):
-        return False
-
-
-def _rewrite_native_windows_paths(command: str) -> str:
-    """Translate real native Windows path arguments for Git Bash.
-
-    ``LocalEnvironment`` intentionally executes through Git Bash, but callers
-    of its low-level ``execute`` API commonly pass ``C:\\...`` paths from
-    Python. Bash removes those backslashes before invoking ``cat``/``ls`` and
-    friends. Only existing drive-qualified paths are rewritten, which avoids
-    changing arbitrary command text or Windows-looking examples. Python
-    ``-c`` snippets are left untouched because their paths are interpreted by
-    native Python rather than by Git Bash.
-    """
-    if not _IS_WINDOWS or not command or re.search(r"\bpython(?:3)?\b[^\n]*\s-c(?:\s|$)", command):
-        return command
-    # ``rg.exe`` is a native Windows binary.  File operations pass it a
-    # drive-qualified argument deliberately (see ``_escape_native_path_arg``);
-    # converting that argument back to ``/c/...`` here would make ripgrep
-    # report a nonexistent path because MSYS argv conversion is disabled.
-    if re.search(r"(?m)^\s*(?:(?:set\s+-o\s+pipefail\s*;\s*)?)rg(?:\.exe)?\b", command):
-        return command
-
-    def replace_quoted(match: re.Match[str]) -> str:
-        raw = match.group("path")
-        return match.group("quote") + _bash_safe_path(raw) + match.group("quote") \
-            if _existing_native_windows_path(raw) else match.group(0)
-
-    rewritten = _QUOTED_NATIVE_WINDOWS_PATH_RE.sub(replace_quoted, command)
-
-    def replace_unquoted(match: re.Match[str]) -> str:
-        # ``tail`` intentionally excludes the separator so the regex can
-        # distinguish the drive prefix cleanly.  Preserve the complete match
-        # here; rebuilding from the capture groups would turn ``C:\\path``
-        # into ``C:path`` and silently defeat the translation.
-        raw = match.group(0)
-        return _bash_safe_path(raw) if _existing_native_windows_path(raw) else match.group(0)
-
-    return _NATIVE_WINDOWS_PATH_RE.sub(replace_unquoted, rewritten)
-
-
-def _normalize_local_path_probe_output(command: str, output: str) -> str:
-    """Expose native paths for the two local shell path probes.
-
-    Git Bash reports ``pwd`` and ``$HOME`` as ``/c/...`` while the local API's
-    cwd and file-operation paths are native Windows strings. Do not rewrite
-    arbitrary command output: file contents must remain byte-for-byte faithful.
-    """
-    if not _IS_WINDOWS or command.strip() not in {
-        "pwd",
-        "pwd -P",
-        "echo $HOME",
-    }:
-        return output
-    lines = output.splitlines(keepends=True)
-    for index, line in enumerate(lines):
-        ending = ""
-        body = line
-        if line.endswith("\r\n"):
-            body, ending = line[:-2], "\r\n"
-        elif line.endswith(("\n", "\r")):
-            body, ending = line[:-1], line[-1]
-        if re.match(r"^/[A-Za-z](?:/|$)", body):
-            lines[index] = _msys_to_windows_path(body) + ending
-            break
-    return "".join(lines)
-
-
 def _cwd_usable(path: str) -> bool:
     """True when *path* is a directory this process can actually chdir into.
 
@@ -308,7 +227,7 @@ def _build_provider_env_blocklist() -> frozenset:
     blocked: set[str] = set()
 
     try:
-        from agent.provider_auth import PROVIDER_REGISTRY
+        from hermes_cli.auth import PROVIDER_REGISTRY
         for pconfig in PROVIDER_REGISTRY.values():
             blocked.update(pconfig.api_key_env_vars)
             if pconfig.auth_type == "aws_sdk":
@@ -319,7 +238,7 @@ def _build_provider_env_blocklist() -> frozenset:
         pass
 
     try:
-        from hermes_runtime.config import OPTIONAL_ENV_VARS
+        from hermes_cli.config import OPTIONAL_ENV_VARS
         for name, metadata in OPTIONAL_ENV_VARS.items():
             category = metadata.get("category")
             if category in {"tool", "messaging"}:
@@ -514,18 +433,18 @@ def _inject_session_context_env(env: dict) -> None:
     tests/tools/test_local_env_session_leak.py.
     """
     try:
-        from hermes_runtime.session_context import (
-            SESSION_CONTEXT_UNSET,
-            SESSION_CONTEXT_VARS,
+        from gateway.session_context import (
+            _UNSET,
+            _VAR_MAP,
             session_context_engaged,
         )
     except Exception:
         return
 
     _engaged = session_context_engaged()
-    for var_name, var in SESSION_CONTEXT_VARS.items():
+    for var_name, var in _VAR_MAP.items():
         value = var.get()
-        if value is not SESSION_CONTEXT_UNSET:
+        if value is not _UNSET:
             # Explicitly bound (including "") — authoritative for this task.
             env[var_name] = "" if value is None else str(value)
         elif _engaged:
@@ -1416,7 +1335,7 @@ def _read_terminal_shell_init_config() -> tuple[list[str], bool]:
     execution never breaks because the config file is unreadable.
     """
     try:
-        from hermes_runtime.config import load_config
+        from hermes_cli.config import load_config
 
         cfg = load_config() or {}
         terminal_cfg = cfg.get("terminal") or {}

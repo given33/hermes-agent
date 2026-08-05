@@ -18,7 +18,7 @@ from tools.file_operations import (
     normalize_search_pagination,
 )
 from tools import file_state
-from hermes_runtime.redaction import redact_sensitive_text
+from agent.redact import redact_sensitive_text
 
 logger = logging.getLogger(__name__)
 
@@ -72,7 +72,7 @@ def _get_max_read_chars() -> int:
     if _max_read_chars_cached is not None:
         return _max_read_chars_cached
     try:
-        from hermes_runtime.config import load_config
+        from hermes_cli.config import load_config
         cfg = load_config()
         val = cfg.get("file_read_max_chars")
         if isinstance(val, (int, float)) and val > 0:
@@ -514,15 +514,7 @@ def _rewrite_v4a_patch_paths_for_host(
 
 def _is_blocked_device_path(path: str) -> bool:
     """Return True for concrete device/fd paths that can hang reads."""
-    expanded = _expand_tilde(path)
-    # Device paths are POSIX namespaces even when Hermes itself runs on
-    # Windows. ntpath.normpath rewrites /dev/zero to \\dev\\zero, which used
-    # to bypass this guard before a Git Bash-backed read.
-    posix_candidate = expanded.replace("\\", "/")
-    if posix_candidate.startswith(("/dev/", "/proc/")):
-        normalized = posixpath.normpath(posix_candidate)
-    else:
-        normalized = os.path.normpath(expanded)
+    normalized = os.path.normpath(_expand_tilde(path))
     if normalized in _BLOCKED_DEVICE_PATHS:
         return True
     # /proc/self/fd/0-2 and /proc/<pid>/fd/0-2 are Linux aliases for stdio
@@ -670,7 +662,7 @@ def _get_hermes_config_resolved() -> str | None:
         return _hermes_config_resolved
     _hermes_config_resolved_loaded = True
     try:
-        from hermes_runtime.config import get_config_path
+        from hermes_cli.config import get_config_path
         _hermes_config_resolved = str(get_config_path().resolve())
     except Exception:
         try:

@@ -112,7 +112,7 @@ def _guard_agent_created_enabled() -> bool:
     on via `hermes config set skills.guard_agent_created true`.
     """
     try:
-        from hermes_runtime.config import load_config
+        from hermes_cli.config import load_config
         cfg = load_config()
         return is_truthy_value(
             cfg_get(cfg, "skills", "guard_agent_created"),
@@ -181,7 +181,7 @@ def _containing_skills_root(skill_path: Path) -> Path:
     match is found (defensive — callers should have located the skill via
     ``_find_skill`` first).
     """
-    from hermes_runtime.skill_utils import get_all_skills_dirs
+    from agent.skill_utils import get_all_skills_dirs
 
     try:
         resolved = skill_path.resolve()
@@ -229,7 +229,7 @@ def _validate_delete_target(skill_dir: Path) -> Optional[str]:
 
     Returns an error string to refuse on, or ``None`` when the delete is safe.
     """
-    from hermes_runtime.skill_utils import get_all_skills_dirs
+    from agent.skill_utils import get_all_skills_dirs
 
     # (3) Reject symlink/junction redirects on the skill directory itself.
     if _is_path_redirect(skill_dir):
@@ -339,7 +339,7 @@ def _background_review_write_guard(
         logger.debug("pinned skill guard lookup failed for %s", name, exc_info=True)
 
     try:
-        from hermes_runtime.skill_utils import is_external_skill_path
+        from agent.skill_utils import is_external_skill_path
         if is_external_skill_path(skill_dir):
             return {
                 "success": False,
@@ -650,7 +650,7 @@ def _find_skill(name: str) -> Optional[Dict[str, Any]]:
     external dirs configured via skills.external_dirs.  Returns
     {"path": Path} or None.
     """
-    from hermes_runtime.skill_utils import get_all_skills_dirs, is_excluded_skill_path
+    from agent.skill_utils import get_all_skills_dirs, is_excluded_skill_path
     for skills_dir in get_all_skills_dirs():
         if not skills_dir.exists():
             continue
@@ -749,7 +749,7 @@ def _find_skill_in_other_profiles(name: str) -> List[Tuple[str, Path]]:
     matches: List[Tuple[str, Path]] = []
     try:
         from hermes_constants import get_default_hermes_root
-        from hermes_runtime.skill_utils import is_excluded_skill_path
+        from agent.skill_utils import is_excluded_skill_path
     except Exception:
         return matches
 

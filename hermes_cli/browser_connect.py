@@ -125,13 +125,7 @@ def get_chrome_debug_candidates(system: str) -> list[str]:
             add(shutil.which(name))
         for path in paths:
             add(path)
-    # These are POSIX paths in WSL even when candidate discovery runs from a
-    # Windows Python process; os.path.join would otherwise emit backslashes
-    # and miss the mounted Chrome binary.
-    for _, group in _WINDOWS_BROWSER_GROUPS:
-        for base in ("/mnt/c/Program Files", "/mnt/c/Program Files (x86)"):
-            for parts in group:
-                add(posixpath.join(base, *parts))
+    add_windows_install_paths(("/mnt/c/Program Files", "/mnt/c/Program Files (x86)"), _WINDOWS_BROWSER_GROUPS)
     return candidates
 
 

@@ -43,12 +43,11 @@ import uuid
 
 _IS_WINDOWS = platform.system() == "Windows"
 from tools.environments.local import _find_shell, _resolve_safe_cwd, _sanitize_subprocess_env
-from hermes_runtime.subprocess_compat import windows_hide_flags
-from hermes_runtime import process_probe
+from hermes_cli._subprocess_compat import windows_hide_flags
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional
 
-from hermes_runtime.config import get_hermes_home
+from hermes_cli.config import get_hermes_home
 
 logger = logging.getLogger(__name__)
 
@@ -139,7 +138,6 @@ class ProcessSession:
     _lock: threading.Lock = field(default_factory=threading.Lock)
     _reader_thread: Optional[threading.Thread] = field(default=None, repr=False)
     _pty: Any = field(default=None, repr=False)  # ptyprocess handle (when use_pty=True)
-    _pty_at_line_start: bool = field(default=True, repr=False)
 
 
 class ProcessRegistry:
@@ -457,7 +455,8 @@ class ProcessRegistry:
             return False
         # ``os.kill(pid, 0)`` is NOT a no-op on Windows (bpo-14484) — use
         # the cross-platform existence check.
-        return process_probe.pid_exists(pid)
+        from gateway.status import _pid_exists
+        return _pid_exists(pid)
 
     @staticmethod
     def _safe_host_start_time(pid: Optional[int]) -> Optional[int]:
@@ -536,7 +535,7 @@ class ProcessRegistry:
         config is unreadable, so callers always get a sane number.
         """
         try:
-            from hermes_runtime.config import read_raw_config, cfg_get, DEFAULT_CONFIG
+            from hermes_cli.config import read_raw_config, cfg_get, DEFAULT_CONFIG
             cfg = read_raw_config()
             val = cfg_get(cfg, "terminal", "daemon_term_grace_seconds")
             if val is None:
@@ -1749,8 +1748,6 @@ class ProcessRegistry:
                 else:
                     pty_data = data.encode("utf-8") if isinstance(data, str) else data
                 session._pty.write(pty_data)
-                if _IS_WINDOWS:
-                    session._pty_at_line_start = pty_data.endswith(("\r", "\n"))
                 return {"status": "ok", "bytes_written": len(data)}
             except Exception as e:
                 return {"status": "error", "error": str(e)}
@@ -1767,12 +1764,7 @@ class ProcessRegistry:
 
     def submit_stdin(self, session_id: str, data: str = "") -> dict:
         """Send data + newline to a running process's stdin (like pressing Enter)."""
-        # ConPTY line discipline requires CRLF to commit the current line;
-        # a bare LF leaves Ctrl-Z on the same input line, so the subsequent
-        # Windows EOF sequence cannot terminate readers such as ``sys.stdin``.
-        session = self.get(session_id)
-        newline = "\r\n" if _IS_WINDOWS and session is not None and getattr(session, "_pty", None) else "\n"
-        return self.write_stdin(session_id, data + newline)
+        return self.write_stdin(session_id, data + "\n")
 
     def request_close_terminal(self, session_id: str) -> dict:
         """Ask the desktop GUI to close the read-only terminal tab mirroring this
@@ -1815,16 +1807,7 @@ class ProcessRegistry:
 
         if hasattr(session, '_pty') and session._pty:
             try:
-                if _IS_WINDOWS:
-                    # Windows console input does not interpret POSIX Ctrl-D
-                    # as EOF.  Ctrl-Z at the beginning of a line followed by
-                    # Enter is the CRT/ConPTY EOF sequence; without it,
-                    # ``sys.stdin.read()`` keeps waiting forever after the
-                    # desktop sends a close-stdin request.
-                    prefix = "" if session._pty_at_line_start else "\r\n"
-                    session._pty.write(f"{prefix}\x1a\r\n")
-                else:
-                    session._pty.sendeof()
+                session._pty.sendeof()
                 return {"status": "ok", "message": "EOF sent"}
             except Exception as e:
                 return {"status": "error", "error": str(e)}
@@ -2482,7 +2465,7 @@ def _redact_process_result(result: dict) -> dict:
     """
     if not isinstance(result, dict):
         return result
-    from hermes_runtime.redaction import redact_sensitive_text, redact_terminal_output
+    from agent.redact import redact_sensitive_text, redact_terminal_output
 
     command = result.get("command") or ""
     for field in ("output", "output_preview"):

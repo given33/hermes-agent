@@ -347,7 +347,7 @@ def node_tool_runnable(path: str | None) -> bool:
     import subprocess
 
     try:
-        from hermes_runtime.subprocess_compat import windows_hide_flags
+        from hermes_cli._subprocess_compat import windows_hide_flags
 
         result = subprocess.run(
             [path, "--version"],
@@ -713,7 +713,7 @@ def agent_browser_runnable(path: str | None) -> bool:
     import subprocess
 
     try:
-        from hermes_runtime.subprocess_compat import windows_hide_flags
+        from hermes_cli._subprocess_compat import windows_hide_flags
 
         result = subprocess.run(
             [path, "--version"],

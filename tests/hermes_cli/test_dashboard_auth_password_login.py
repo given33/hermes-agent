@@ -337,59 +337,6 @@ class TestRateLimit:
         )
         assert good.status_code == 429
 
-    def test_forged_x_forwarded_for_cannot_reset_the_bucket(self, gated_app):
-        # Regression: ``_client_ip`` used to return X-Forwarded-For's
-        # leftmost element unconditionally, so a fresh forged value per
-        # request bought a fresh rate-limit bucket per request and the
-        # limiter never fired — unlimited online password guessing.
-        # No trusted proxy is configured here (the default), so the
-        # header must carry no authority whatsoever.
-        last = None
-        for n in range(15):
-            last = gated_app.post(
-                "/auth/password-login",
-                json={
-                    "provider": "testpw",
-                    "username": "admin",
-                    "password": "WRONG",
-                },
-                headers={"X-Forwarded-For": f"198.51.100.{n}"},
-            )
-        assert last.status_code == 429
-
-    def test_account_bucket_survives_a_distributed_source(self, gated_app):
-        # The per-IP bucket alone cannot bound guessing against one
-        # account: an attacker with many source addresses gets a fresh
-        # allowance per address. Simulate that by declaring the test
-        # peer a trusted proxy so each request presents a *distinct,
-        # honoured* client address, and confirm the per-account budget
-        # still stops it.
-        import hermes_cli.dashboard_auth.client_ip as client_ip_mod
-
-        os_env = client_ip_mod.os.environ
-        prev = os_env.get(client_ip_mod.TRUSTED_PROXIES_ENV)
-        os_env[client_ip_mod.TRUSTED_PROXIES_ENV] = "0.0.0.0/0,::/0"
-        client_ip_mod.reset_trusted_proxy_cache()
-        try:
-            last = None
-            for n in range(1, 40):
-                last = gated_app.post(
-                    "/auth/password-login",
-                    json={
-                        "provider": "testpw",
-                        "username": "admin",
-                        "password": "WRONG",
-                    },
-                    headers={"X-Forwarded-For": f"198.51.100.{n}"},
-                )
-            assert last.status_code == 429
-        finally:
-            if prev is None:
-                os_env.pop(client_ip_mod.TRUSTED_PROXIES_ENV, None)
-            else:
-                os_env[client_ip_mod.TRUSTED_PROXIES_ENV] = prev
-            client_ip_mod.reset_trusted_proxy_cache()
-
 
 # ---------------------------------------------------------------------------
 # Login page rendering

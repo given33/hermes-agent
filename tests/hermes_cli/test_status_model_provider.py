@@ -2,6 +2,10 @@
 
 from types import SimpleNamespace
 
+from hermes_cli.nous_account import NousPaidServiceAccessInfo, NousPortalAccountInfo
+from hermes_cli.nous_subscription import NousFeatureState, NousSubscriptionFeatures
+
+
 def _patch_common_status_deps(monkeypatch, status_mod, tmp_path, *, openai_base_url=""):
     import hermes_cli.auth as auth_mod
 

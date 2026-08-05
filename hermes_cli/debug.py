@@ -4,7 +4,7 @@ Currently supports:
     hermes debug share    Upload debug report (system info + logs) to a
                           paste service and print a shareable URL.
                           By default, log content is run through
-                          ``hermes_runtime.redaction.redact_sensitive_text`` with
+                          ``agent.redact.redact_sensitive_text`` with
                           ``force=True`` before upload so credentials in
                           ``~/.hermes/logs/*.log`` are not leaked into
                           the public paste service. Pass ``--no-redact``
@@ -367,10 +367,9 @@ class LogSnapshot:
 def _primary_log_path(log_name: str) -> Optional[Path]:
     """Where *log_name* would live if present. Doesn't check existence."""
     from hermes_cli.logs import LOG_FILES
-    from hermes_logging import get_log_dir
 
     filename = LOG_FILES.get(log_name)
-    return (get_log_dir() / filename) if filename else None
+    return (get_hermes_home() / "logs" / filename) if filename else None
 
 
 def _resolve_log_path(log_name: str) -> Optional[Path]:
@@ -405,7 +404,7 @@ def _redact_log_text(text: str) -> str:
     """
     if not text:
         return text
-    from hermes_runtime.redaction import redact_sensitive_text
+    from agent.redact import redact_sensitive_text
 
     text = redact_sensitive_text(text, force=True)
     return _EMAIL_ADDRESS_RE.sub("[REDACTED_EMAIL]", text)

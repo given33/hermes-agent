@@ -44,8 +44,6 @@ from cron.jobs import (
     get_job,
     list_jobs,
     mark_job_run,
-    coerce_job_enabled,
-    normalize_repeat_limit,
     parse_schedule,
     pause_job,
     remove_job,
@@ -315,7 +313,7 @@ def _scan_cron_skill_assembled(assembled: str) -> tuple[str, str]:
 
 
 def _origin_from_env() -> Optional[Dict[str, str]]:
-    from hermes_runtime.session_context import get_session_env
+    from gateway.session_context import get_session_env
     origin_platform = get_session_env("HERMES_SESSION_PLATFORM")
     origin_chat_id = get_session_env("HERMES_SESSION_CHAT_ID")
     if origin_platform and origin_chat_id:
@@ -378,14 +376,8 @@ def _local_delivery_notice(job: Dict[str, Any], user_deliver: Optional[str]) -> 
 
 
 def _repeat_display(job: Dict[str, Any]) -> str:
-    repeat = job.get("repeat")
-    # ``_format_job`` is also used with freshly returned/legacy records that
-    # may bypass ``cron.jobs._normalize_job_record``. Keep display formatting
-    # total even when a hand-edited jobs.json contains a scalar repeat value.
-    if not isinstance(repeat, dict):
-        repeat = {}
-    times = repeat.get("times")
-    completed = repeat.get("completed", 0)
+    times = (job.get("repeat") or {}).get("times")
+    completed = (job.get("repeat") or {}).get("completed", 0)
     if times is None:
         return "forever"
     if times == 1:
@@ -469,12 +461,12 @@ def _validate_cron_base_url(
             "configured custom provider to use a custom endpoint."
         )
     try:
-        from agent.runtime_provider import (
-            get_named_custom_provider,
+        from hermes_cli.runtime_provider import (
             has_named_custom_provider,
             resolve_requested_provider,
+            _get_named_custom_provider,
         )
-        from agent.provider_auth import PROVIDER_REGISTRY
+        from hermes_cli.auth import PROVIDER_REGISTRY
         from utils import base_url_host_matches, base_url_hostname
     except Exception:
         # Can't resolve provider metadata -> fail closed.
@@ -491,7 +483,7 @@ def _validate_cron_base_url(
         # sending that stored key — so an off-host override exfiltrates it.
         # Require the override host to match the provider's CONFIGURED endpoint.
         try:
-            cp = get_named_custom_provider(prov)
+            cp = _get_named_custom_provider(prov)
         except Exception:
             cp = None
         cfg_host = base_url_hostname((cp or {}).get("base_url", "")) if cp else ""
@@ -748,7 +740,7 @@ def cronjob(
             if not schedule:
                 return tool_error("schedule is required for create", success=False)
             canonical_skills = _canonical_skills(skill, skills)
-            _no_agent = coerce_job_enabled(no_agent, False)
+            _no_agent = bool(no_agent)
             # Job-shape validation differs by mode:
             #   - no_agent=True → script is the job; prompt/skills are optional
             #     (and irrelevant to execution).
@@ -987,7 +979,7 @@ def cronjob(
             if enabled_toolsets is not None:
                 updates["enabled_toolsets"] = enabled_toolsets or None
             if attach_to_session is not None:
-                updates["attach_to_session"] = coerce_job_enabled(attach_to_session, False)
+                updates["attach_to_session"] = bool(attach_to_session)
             if workdir is not None:
                 # Empty string clears the field (restores old behaviour);
                 # otherwise pass raw — update_job() validates / normalizes.
@@ -996,7 +988,7 @@ def cronjob(
                 # Toggling no_agent on/off at update time. If flipping to True,
                 # we need a script to already exist on the job (or be part of
                 # the same update) — otherwise the next tick would error out.
-                target_no_agent = coerce_job_enabled(no_agent, False)
+                target_no_agent = bool(no_agent)
                 if target_no_agent:
                     effective_script = updates.get("script") if "script" in updates else job.get("script")
                     if not effective_script:
@@ -1008,7 +1000,7 @@ def cronjob(
                 updates["no_agent"] = target_no_agent
             if repeat is not None:
                 # Normalize: treat 0 or negative as None (infinite)
-                normalized_repeat = normalize_repeat_limit(repeat)
+                normalized_repeat = None if repeat <= 0 else repeat
                 repeat_state = dict(job.get("repeat") or {})
                 repeat_state["times"] = normalized_repeat
                 updates["repeat"] = repeat_state

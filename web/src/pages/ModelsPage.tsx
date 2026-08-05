@@ -381,7 +381,7 @@ function ModelCard({
   onAssigned(): void;
   showTokens: boolean;
 }) {
-  const { locale, t } = useI18n();
+  const { t } = useI18n();
   const provider = entry.provider || modelVendor(entry.model);
   const totalTokens = entry.input_tokens + entry.output_tokens;
   const caps = entry.capabilities;
@@ -525,7 +525,7 @@ function ModelCard({
             )}
           </div>
           {entry.last_used_at > 0 && (
-            <span>{timeAgo(entry.last_used_at, locale)}</span>
+            <span>{timeAgo(entry.last_used_at)}</span>
           )}
         </div>
 

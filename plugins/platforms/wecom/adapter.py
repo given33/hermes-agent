@@ -1757,7 +1757,7 @@ def interactive_setup() -> None:
     """
     from hermes_cli.config import get_env_value, remove_env_value, save_env_value
     from hermes_cli.setup import prompt_choice
-    from hermes_runtime.console_output import (
+    from hermes_cli.cli_output import (
         prompt,
         prompt_yes_no,
         print_header,

@@ -9,10 +9,6 @@ Provides subcommands for:
 - hermes setup         - Interactive setup wizard
 - hermes status        - Show status of all components
 - hermes cron          - Manage cron jobs
-
-Importing this package is side-effect free. The UTF-8 stdio repair that
-used to run here at import time is now an explicit entry-point call —
-see :func:`ensure_utf8_stdio` below for why and for who must call it.
 """
 
 import os
@@ -37,13 +33,12 @@ def _ensure_utf8():
     raises an unhandled UnicodeEncodeError that crashes the command before it
     can even start — e.g. `hermes setup` on a fresh Pi.
 
-    This is the raw repair worker; entry points should call
-    :func:`ensure_utf8_stdio` (the guarded wrapper) instead. It re-wraps
-    stdout/stderr as UTF-8 when their encoding is not already UTF-8,
-    preferring TextIOWrapper.reconfigure() so the existing stream object is
-    fixed in place (cached `sys.stdout` references keep working) and falling
-    back to reopening the file descriptor with closefd=False (the
-    CPython-recommended safe variant).
+    This runs at import time so it protects every CLI subcommand, on any
+    platform. It re-wraps stdout/stderr as UTF-8 when their encoding is not
+    already UTF-8, preferring TextIOWrapper.reconfigure() so the existing
+    stream object is fixed in place (cached `sys.stdout` references keep
+    working) and falling back to reopening the file descriptor with
+    closefd=False (the CPython-recommended safe variant).
 
     No-op when the streams are already UTF-8: a healthy UTF-8 system sees no
     stream change and no environment mutation.
@@ -94,52 +89,4 @@ def _ensure_utf8():
         os.environ.setdefault("PYTHONIOENCODING", "utf-8")
 
 
-_UTF8_STDIO_DONE = False
-
-
-def ensure_utf8_stdio(force: bool = False) -> None:
-    """Explicit entry-point hook for the UTF-8 stdio repair.
-
-    Historically :func:`_ensure_utf8` ran at package import time, which made
-    ``import hermes_cli`` (the most-imported package in the repo) mutate
-    process-global state: it could replace ``sys.stdout``/``sys.stderr`` and
-    write ``PYTHONUTF8``/``PYTHONIOENCODING`` into the environment inherited
-    by every later subprocess — and it fought pytest's stream capture. The
-    repair is real and still needed (cp1252 Windows consoles, latin-1/C
-    locales on minimal Debian/Raspberry Pi crash on the banner glyphs), but
-    it belongs to *process entry points*, not to library imports.
-
-    Call this once, early, from actual console entry points before anything
-    prints. Current callers / required wiring:
-
-    - ``cli.py`` module init (classic REPL bootstrap — covers ``hermes chat``
-      and any legacy ``python cli.py`` launch).
-    - ``hermes_cli/doctor.py::run_doctor`` (banner-heavy subcommand).
-    - ``hermes_cli/main.py::main`` should call this right before its
-      ``configure_windows_stdio()`` call so every ``hermes`` subcommand is
-      covered on every platform (configure_windows_stdio no-ops off-Windows;
-      this repair is the one that catches legacy POSIX locales).
-    - ``gateway/run.py`` startup, next to its ``configure_windows_stdio()``
-      call, for the long-lived gateway service.
-    - ``run_agent.py::main`` — the ``hermes-agent`` console script (pyproject
-      ``[project.scripts]``) lands there directly, bypassing every other
-      entry point above, and prints emoji banners immediately.
-
-    Guards (all skipped with ``force=True``):
-    - Idempotent per process — repeated calls are free.
-    - No-op under pytest (``PYTEST_CURRENT_TEST`` set or ``pytest`` already
-      imported): pytest owns the streams during capture, and reopening fd 1
-      behind its back corrupts captured output. Direct tests of the repair
-      call ``_ensure_utf8()`` itself.
-
-    The per-stream "already UTF-8 → untouched" no-op lives in the worker, so
-    a healthy UTF-8 host sees no stream or environment change either way.
-    """
-    global _UTF8_STDIO_DONE
-    if not force:
-        if _UTF8_STDIO_DONE:
-            return
-        if "PYTEST_CURRENT_TEST" in os.environ or "pytest" in sys.modules:
-            return
-    _UTF8_STDIO_DONE = True
-    _ensure_utf8()
+_ensure_utf8()

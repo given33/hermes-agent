@@ -65,7 +65,7 @@ def _redact(text: Any, enabled: bool) -> Any:
     if not enabled or not isinstance(text, str) or not text:
         return text
     try:
-        from hermes_runtime.redaction import redact_sensitive_text
+        from agent.redact import redact_sensitive_text
         return redact_sensitive_text(text, force=True)
     except Exception as exc:
         logger.warning("Trace upload redaction failed; refusing upload", exc_info=True)

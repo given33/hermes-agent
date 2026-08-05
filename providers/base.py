@@ -215,7 +215,7 @@ class ProviderProfile:
         import json
         import urllib.request
 
-        from hermes_runtime.urllib_security import open_credentialed_url
+        from hermes_cli.urllib_security import open_credentialed_url
 
         req = urllib.request.Request(url)
         if api_key:

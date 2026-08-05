@@ -15,9 +15,7 @@ from __future__ import annotations
 
 import importlib
 import os
-import subprocess
 import sys
-import time
 from unittest.mock import patch, MagicMock
 
 import pytest
@@ -29,7 +27,6 @@ from hermes_cli.main import (
     _restart_managed_dashboard_service,
     _warn_stale_dashboard_processes,  # back-compat alias
 )
-from hermes_runtime.process_probe import pid_exists
 
 
 @pytest.fixture(autouse=True)
@@ -211,18 +208,14 @@ class TestKillStaleDashboardWindows:
              patch("subprocess.run", side_effect=fake_run) as mock_run:
             _kill_stale_dashboard_processes()
 
-        # Each PID triggered a recursive taskkill invocation.
+        # Each PID triggered a taskkill /PID <n> /F invocation.
         taskkill_calls = [
             c for c in mock_run.call_args_list
             if c.args and isinstance(c.args[0], list) and c.args[0][:1] == ["taskkill"]
         ]
         assert len(taskkill_calls) == 2
-        assert ["taskkill", "/PID", "12345", "/T", "/F"] in [
-            c.args[0] for c in taskkill_calls
-        ]
-        assert ["taskkill", "/PID", "12346", "/T", "/F"] in [
-            c.args[0] for c in taskkill_calls
-        ]
+        assert ["taskkill", "/PID", "12345", "/F"] in [c.args[0] for c in taskkill_calls]
+        assert ["taskkill", "/PID", "12346", "/F"] in [c.args[0] for c in taskkill_calls]
 
         out = capsys.readouterr().out
         assert "✓ stopped PID 12345" in out

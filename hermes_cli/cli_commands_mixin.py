@@ -686,7 +686,7 @@ class CLICommandsMixin:
 
         # Reset session so the new tool config is picked up from a clean state
         from hermes_cli.tools_config import _get_platform_tools
-        from hermes_runtime.config import load_config
+        from hermes_cli.config import load_config
         self.enabled_toolsets = _get_platform_tools(load_config(), "cli")
         self.new_session()
         _cprint(f"{_DIM}Session reset. New tool configuration is active.{_RST}")
@@ -2833,8 +2833,8 @@ class CLICommandsMixin:
             /footer status    → show current state
         """
         from cli import _cprint, save_config_value
-        from hermes_runtime.config import load_config
-        from hermes_runtime.colors import Colors as _Colors
+        from hermes_cli.config import load_config
+        from hermes_cli.colors import Colors as _Colors
 
         # Parse arg
         arg = ""
@@ -2890,7 +2890,7 @@ class CLICommandsMixin:
             /timestamps status    → show current state
         """
         from cli import _cprint, save_config_value
-        from hermes_runtime.colors import Colors as _Colors
+        from hermes_cli.colors import Colors as _Colors
 
         arg = ""
         try:
@@ -2939,7 +2939,7 @@ class CLICommandsMixin:
             /reasoning full         Show complete thinking (no 10-line clamp)
             /reasoning clamp        Collapse long thinking to the first 10 lines
         """
-        from cli import _ACCENT, _DIM, _RST, _cprint, _parse_reasoning_config, save_config_value
+        from cli import CLI_CONFIG, _ACCENT, _DIM, _RST, _cprint, _parse_reasoning_config, save_config_value
         parts = cmd.strip().split(maxsplit=1)
 
         if len(parts) < 2:
@@ -3015,14 +3015,10 @@ class CLICommandsMixin:
         self.agent = None  # Force agent re-init with new reasoning config
 
         if explicit_global and save_config_value("agent.reasoning_effort", arg):
-            config = getattr(self, "config", None)
-            if not isinstance(config, dict):
-                config = {}
-                self.config = config
-            agent_cfg = config.get("agent")
+            agent_cfg = CLI_CONFIG.get("agent")
             if not isinstance(agent_cfg, dict):
                 agent_cfg = {}
-                config["agent"] = agent_cfg
+                CLI_CONFIG["agent"] = agent_cfg
             agent_cfg["reasoning_effort"] = arg
             _cprint(f"  {_ACCENT}✓ Reasoning effort set to '{arg}' (saved to config){_RST}")
         elif explicit_global:
@@ -3206,7 +3202,7 @@ class CLICommandsMixin:
         prompt_toolkit cleans up terminal modes).  Returns ``False`` / falsy
         when cancelled.
         """
-        from hermes_runtime.config import is_managed, format_managed_message
+        from hermes_cli.config import is_managed, format_managed_message
 
         if is_managed():
             print(f"  ✗ {format_managed_message('update Hermes Agent')}")

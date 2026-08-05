@@ -28,7 +28,7 @@ from contextlib import redirect_stderr, redirect_stdout
 from pathlib import Path
 from typing import Optional
 
-from hermes_runtime.session_context import declare_stateless_channel
+from gateway.session_context import declare_stateless_channel
 from hermes_cli.fallback_config import get_fallback_chain
 
 
@@ -89,15 +89,15 @@ def _validate_explicit_toolsets(toolsets: object = None) -> tuple[list[str] | No
     mcp_disabled: set[str] = set()
     if unresolved:
         try:
-            from hermes_runtime.config import read_raw_config
-            from hermes_config_values import parse_enabled_flag
+            from hermes_cli.config import read_raw_config
+            from hermes_cli.tools_config import _parse_enabled_flag
 
             cfg = read_raw_config()
             mcp_servers = cfg.get("mcp_servers") if isinstance(cfg.get("mcp_servers"), dict) else {}
             for name, server_cfg in mcp_servers.items():
                 if not isinstance(server_cfg, dict):
                     continue
-                if parse_enabled_flag(server_cfg.get("enabled", True), default=True):
+                if _parse_enabled_flag(server_cfg.get("enabled", True), default=True):
                     mcp_names.add(str(name))
                 else:
                     mcp_disabled.add(str(name))
@@ -321,7 +321,7 @@ def _run_agent(
     run a single conversation.  Returns ``(final_response, run_result)``."""
     # Imports are local so they don't run when hermes is invoked for
     # other commands (keeps top-level CLI startup cheap).
-    from hermes_runtime.config import load_config
+    from hermes_cli.config import load_config
     from hermes_cli.models import detect_provider_for_model
     from hermes_cli.runtime_provider import resolve_runtime_provider
     from hermes_cli.tools_config import _get_platform_tools

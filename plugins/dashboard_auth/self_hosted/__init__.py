@@ -754,7 +754,7 @@ def _load_config_oauth_section() -> dict:
     to ``{}`` so callers can rely on ``.get(...)``.
     """
     try:
-        from hermes_runtime.config import cfg_get, load_config
+        from hermes_cli.config import cfg_get, load_config
 
         cfg = load_config()
     except Exception as exc:  # noqa: BLE001 — broad catch is intentional

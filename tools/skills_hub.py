@@ -26,8 +26,8 @@ from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path, PurePosixPath
 from hermes_constants import get_hermes_home
-from hermes_runtime.subprocess_compat import windows_hide_flags
-from hermes_runtime.skill_utils import is_excluded_skill_path
+from hermes_cli._subprocess_compat import windows_hide_flags
+from agent.skill_utils import is_excluded_skill_path
 from typing import Any, Dict, List, Optional, Tuple, Union
 from urllib.parse import unquote, urljoin, urlparse, urlsplit, urlunparse
 
@@ -3336,7 +3336,7 @@ class OptionalSkillSource(SkillSource):
                 and "__pycache__" not in f.parts
                 and f.suffix != ".pyc"
             ):
-                rel_path = f.relative_to(skill_dir).as_posix()
+                rel_path = str(f.relative_to(skill_dir))
                 try:
                     files[rel_path] = f.read_bytes()
                 except OSError:
@@ -3352,7 +3352,7 @@ class OptionalSkillSource(SkillSource):
             name=name,
             files=files,
             source="official",
-            identifier=f"official/{skill_dir.relative_to(self._optional_dir).as_posix()}",
+            identifier=f"official/{skill_dir.relative_to(self._optional_dir)}",
             trust_level="builtin",
         )
 
@@ -3677,9 +3677,7 @@ def quarantine_bundle(bundle: SkillBundle) -> Path:
         if isinstance(file_content, bytes):
             file_dest.write_bytes(file_content)
         else:
-            # Keep the quarantined bytes identical to the bundle hash on every
-            # platform. Path.write_text translates LF to CRLF on Windows.
-            file_dest.write_bytes(file_content.encode("utf-8"))
+            file_dest.write_text(file_content, encoding="utf-8")
 
     return dest
 

@@ -20,7 +20,7 @@ import pytest
 
 
 # ---------------------------------------------------------------------------
-# _is_transport_closed_error — unit coverage
+# _is_session_expired_error — unit coverage
 # ---------------------------------------------------------------------------
 
 
@@ -70,7 +70,9 @@ def test_is_session_expired_traversal_is_budget_bounded():
 
 
 def _install_stub_server(name: str = "wpcom"):
-    """Register a server stub that replaces its client after reconnect."""
+    """Register a minimal server stub that _handle_session_expired_and_retry
+    can signal via _reconnect_event, and that reports ready+session after
+    the event fires."""
     from tools import mcp_tool
 
     mcp_tool._ensure_mcp_loop()
@@ -93,8 +95,10 @@ def _install_stub_server(name: str = "wpcom"):
 
     server._ready = _ReadyAdapter()
 
-    # The production reconnect path must not treat the old client object as
-    # fresh, so this test double swaps in a distinct object when requested.
+    # _reconnect_event is called via loop.call_soon_threadsafe(…set); use
+    # a threading-safe substitute.  The production reconnect path must not
+    # treat the old stale session as fresh, so this test double swaps in a
+    # distinct session object when reconnect is requested.
     reconnect_flag = threading.Event()
 
     class _EventAdapter:
@@ -203,14 +207,14 @@ def test_call_tool_handler_rebuilds_configured_server_transport(
         mcp_tool._server_breaker_opened_at.pop("resumed", None)
 
 
-def test_transport_closed_retry_waits_for_new_client(monkeypatch, tmp_path):
-    """Regression for long-lived MCP transports.
+def test_session_expired_retry_waits_for_new_session(monkeypatch, tmp_path):
+    """Regression for long-lived HTTP/stream MCP sessions.
 
-    If the reconnect helper only checks readiness and a non-null client, it can
-    return while the client still points at the stale transport. The retry then
-    hits the same closed transport
+    If the reconnect helper only checks ``_ready.is_set()`` and
+    ``session is not None``, it can return immediately while ``session`` still
+    points at the stale transport. The retry then hits the same dead session
     and the circuit breaker eventually reports the server as unreachable. The
-    handler must wait for a distinct client object before retrying.
+    handler must wait for a distinct session object before retrying.
     """
     monkeypatch.setenv("HERMES_HOME", str(tmp_path))
 
@@ -236,16 +240,16 @@ def test_transport_closed_retry_waits_for_new_client(monkeypatch, tmp_path):
     old_session = MagicMock()
 
     async def _old_call(*a, **kw):
-        raise RuntimeError("ClosedResourceError: connection closed")
+        raise RuntimeError("Session terminated")
 
     old_session.call_tool = _old_call
     new_session = MagicMock()
 
     async def _new_call(*a, **kw):
         result = MagicMock()
-        result.is_error = False
+        result.isError = False
         result.content = [MagicMock(type="text", text="bank ok")]
-        result.structured_content = None
+        result.structuredContent = None
         return result
 
     new_session.call_tool = _new_call
@@ -281,12 +285,12 @@ def test_transport_closed_retry_waits_for_new_client(monkeypatch, tmp_path):
         mcp_tool._server_breaker_opened_at.pop("hindsight", None)
 
 
-def test_transport_closed_handler_returns_none_without_loop(monkeypatch):
+def test_session_expired_handler_returns_none_without_loop(monkeypatch):
     """Defensive: if the MCP loop isn't running (cold start / shutdown
     race), the handler must fall through cleanly instead of hanging
     or raising."""
     from tools import mcp_tool
-    from tools.mcp_tool import _handle_transport_closed_and_retry
+    from tools.mcp_tool import _handle_session_expired_and_retry
 
     # Install a server stub but make the event loop unavailable.
     server = MagicMock()
@@ -299,26 +303,27 @@ def test_transport_closed_handler_returns_none_without_loop(monkeypatch):
     monkeypatch.setattr(mcp_tool, "_mcp_loop", None)
 
     try:
-        out = _handle_transport_closed_and_retry(
+        out = _handle_session_expired_and_retry(
             "srv-noloop",
-            RuntimeError("ClosedResourceError: transport is closed"),
+            RuntimeError("Invalid or expired session"),
             lambda: '{"ok": true}',
             "tools/call",
         )
         assert out is None, (
-            "Without an event loop, reconnect must fall through cleanly."
+            "Without an event loop, session-expired handler must fall "
+            "through to caller's generic error path — not hang or raise."
         )
     finally:
         mcp_tool._servers.pop("srv-noloop", None)
 
 
-def test_transport_closed_handler_returns_none_without_server_record():
+def test_session_expired_handler_returns_none_without_server_record():
     """If the server has been torn down / isn't in _servers, fall
-    through cleanly because there is nothing to reconnect."""
-    from tools.mcp_tool import _handle_transport_closed_and_retry
-    out = _handle_transport_closed_and_retry(
+    through cleanly — nothing to reconnect to."""
+    from tools.mcp_tool import _handle_session_expired_and_retry
+    out = _handle_session_expired_and_retry(
         "does-not-exist",
-        RuntimeError("ClosedResourceError: transport is closed"),
+        RuntimeError("Invalid or expired session"),
         lambda: '{"ok": true}',
         "tools/call",
     )
@@ -340,11 +345,11 @@ def test_transport_closed_handler_returns_none_without_server_record():
         ("_make_get_prompt_handler", {"tool_timeout": 10.0}, "get_prompt", "get_prompt"),
     ],
 )
-def test_non_tool_handlers_also_reconnect_on_transport_closed(
+def test_non_tool_handlers_also_reconnect_on_session_expired(
     monkeypatch, tmp_path, handler_factory, handler_kwargs, session_method, op_label
 ):
     """All four non-``tools/call`` MCP handlers share the recovery
-    pattern and must reconnect the same way on transport closure."""
+    pattern and must reconnect the same way on session-expired."""
     monkeypatch.setenv("HERMES_HOME", str(tmp_path))
 
     from tools import mcp_tool
@@ -358,7 +363,7 @@ def test_non_tool_handlers_also_reconnect_on_transport_closed(
     async def _sequence(*a, **kw):
         call_count["n"] += 1
         if call_count["n"] == 1:
-            raise RuntimeError("ClosedResourceError: transport is closed")
+            raise RuntimeError("Invalid or expired session")
         # Return something with the shapes each handler expects.
         # Explicitly set primitive attrs — MagicMock's default auto-attr
         # behaviour surfaces ``MagicMock`` values for optional fields
@@ -389,7 +394,7 @@ def test_non_tool_handlers_also_reconnect_on_transport_closed(
             f"{op_label}: expected retry success, got {parsed}"
         )
         assert reconnect_flag.is_set(), (
-            f"{op_label}: reconnect should fire for transport closure"
+            f"{op_label}: reconnect should fire for session-expired"
         )
         assert call_count["n"] == 2, (
             f"{op_label}: expected 1 original + 1 retry"

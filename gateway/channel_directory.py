@@ -13,7 +13,7 @@ import time
 from datetime import datetime
 from typing import Any, Dict, List, Optional
 
-from hermes_runtime.config import get_hermes_home
+from hermes_cli.config import get_hermes_home
 from utils import atomic_json_write
 
 logger = logging.getLogger(__name__)
@@ -34,28 +34,13 @@ _slack_directory_warning_last: Dict[tuple[str, str], float] = {}
 # letting you pre-name a chat before it has produced any traffic).
 # Format: {"<platform>": {"<chat_id>": "<friendly name>", ...}, ...}
 CHANNEL_ALIASES_PATH = get_hermes_home() / "channel_aliases.json"
-_IMPORT_DIRECTORY_PATH = DIRECTORY_PATH
-_IMPORT_CHANNEL_ALIASES_PATH = CHANNEL_ALIASES_PATH
-
-
-def _directory_path():
-    if DIRECTORY_PATH != _IMPORT_DIRECTORY_PATH:
-        return DIRECTORY_PATH
-    return get_hermes_home() / "channel_directory.json"
-
-
-def _channel_aliases_path():
-    if CHANNEL_ALIASES_PATH != _IMPORT_CHANNEL_ALIASES_PATH:
-        return CHANNEL_ALIASES_PATH
-    return get_hermes_home() / "channel_aliases.json"
 
 
 def _load_channel_aliases() -> Dict[str, Dict[str, str]]:
-    aliases_path = _channel_aliases_path()
-    if not aliases_path.exists():
+    if not CHANNEL_ALIASES_PATH.exists():
         return {}
     try:
-        with open(aliases_path, encoding="utf-8") as f:
+        with open(CHANNEL_ALIASES_PATH, encoding="utf-8") as f:
             data = json.load(f)
         return data if isinstance(data, dict) else {}
     except Exception:
@@ -221,7 +206,7 @@ async def build_channel_directory(adapters: Dict[Any, Any]) -> Dict[str, Any]:
     }
 
     try:
-        atomic_json_write(_directory_path(), directory)
+        atomic_json_write(DIRECTORY_PATH, directory)
     except Exception as e:
         logger.warning("Channel directory: failed to write: %s", e)
 
@@ -434,7 +419,7 @@ def _build_from_sessions_db(platform_name: str) -> List[Dict[str, str]]:
     entries: List[Dict[str, str]] = []
     try:
         from hermes_state import SessionDB
-        db = SessionDB(db_path=get_hermes_home() / "state.db")
+        db = SessionDB()
         try:
             lister = getattr(db, "list_gateway_sessions", None)
             if not callable(lister):
@@ -519,13 +504,12 @@ def _build_from_sessions_json(platform_name: str) -> List[Dict[str, str]]:
 
 def load_directory() -> Dict[str, Any]:
     """Load the cached channel directory from disk."""
-    directory_path = _directory_path()
-    if not directory_path.exists():
+    if not DIRECTORY_PATH.exists():
         base = {"updated_at": None, "platforms": {}}
         _apply_channel_aliases(base["platforms"])
         return base
     try:
-        with open(directory_path, encoding="utf-8") as f:
+        with open(DIRECTORY_PATH, encoding="utf-8") as f:
             data = json.load(f)
         # Re-apply aliases on read so friendly names take effect immediately,
         # even between timed rebuilds and for brand-new alias entries.

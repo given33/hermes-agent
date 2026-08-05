@@ -91,7 +91,6 @@ from typing import Any, Iterable, Mapping, Optional
 
 from hermes_cli.sqlite_util import add_column_if_missing as _add_column_if_missing
 from toolsets import get_toolset_names
-from hermes_runtime.process_probe import pid_exists as _pid_exists
 
 _log = logging.getLogger(__name__)
 
@@ -2193,11 +2192,7 @@ def connect(
             conn.row_factory = sqlite3.Row
             with _INIT_LOCK:
                 from hermes_state import apply_wal_with_fallback
-                apply_wal_with_fallback(
-                    conn,
-                    db_label=f"kanban.db ({path.name})",
-                    database_path=path,
-                )
+                apply_wal_with_fallback(conn, db_label=f"kanban.db ({path.name})")
                 conn.execute("PRAGMA synchronous=FULL")
                 conn.execute("PRAGMA wal_autocheckpoint=100")
                 conn.execute("PRAGMA foreign_keys=ON")
@@ -2235,11 +2230,7 @@ def connect(
                 # falls back to DELETE with one ERROR log so kanban stays usable there.
                 # See hermes_state._WAL_INCOMPAT_MARKERS for detection logic.
                 from hermes_state import apply_wal_with_fallback
-                apply_wal_with_fallback(
-                    conn,
-                    db_label=f"kanban.db ({path.name})",
-                    database_path=path,
-                )
+                apply_wal_with_fallback(conn, db_label=f"kanban.db ({path.name})")
                 # FULL (was NORMAL): fsync before each checkpoint to narrow the
                 # crash window that can leave a b-tree page header torn.
                 conn.execute("PRAGMA synchronous=FULL")
@@ -2887,22 +2878,6 @@ def _canonical_assignee(assignee: Optional[str]) -> Optional[str]:
     return normalize_profile_name(assignee)
 
 
-def _idempotent_task_id(
-    conn: sqlite3.Connection,
-    idempotency_key: str,
-    *,
-    include_archived: bool,
-) -> Optional[str]:
-    row = conn.execute(
-        "SELECT id FROM tasks WHERE idempotency_key = ? "
-        "AND (status != 'archived' OR ?) "
-        "ORDER BY CASE WHEN status = 'archived' THEN 1 ELSE 0 END, "
-        "created_at DESC, id DESC LIMIT 1",
-        (idempotency_key, 1 if include_archived else 0),
-    ).fetchone()
-    return str(row["id"]) if row is not None else None
-
-
 def create_task(
     conn: sqlite3.Connection,
     *,
@@ -2918,7 +2893,6 @@ def create_task(
     parents: Iterable[str] = (),
     triage: bool = False,
     idempotency_key: Optional[str] = None,
-    idempotency_includes_archived: bool = False,
     max_runtime_seconds: Optional[int] = None,
     skills: Optional[Iterable[str]] = None,
     max_retries: Optional[int] = None,
@@ -2943,9 +2917,8 @@ def create_task(
 
     If ``idempotency_key`` is provided and a non-archived task with the
     same key already exists, returns the existing task's id instead of
-    creating a duplicate. ``idempotency_includes_archived=True`` makes an
-    archived match permanent as well, for external outboxes whose replay
-    must never recreate a terminal task.
+    creating a duplicate. Useful for retried webhooks / automation that
+    should not double-write.
 
     ``max_runtime_seconds`` caps how long a worker may run before the
     dispatcher SIGTERMs (then SIGKILLs after a grace window) and
@@ -3144,17 +3117,19 @@ def create_task(
         skills_list = cleaned
 
     # Idempotency check — return the existing task instead of creating a
-    # duplicate. This transaction-external lookup keeps replays fast; the
-    # authoritative check is repeated inside write_txn after BEGIN IMMEDIATE
-    # has serialized concurrent creators.
+    # duplicate. Done BEFORE entering write_txn to keep the fast path fast
+    # and to avoid holding a write lock during the lookup. Race is
+    # acceptable: two concurrent creators with the same key might both
+    # insert, at which point both rows exist but the next lookup stabilises.
     if idempotency_key:
-        existing_id = _idempotent_task_id(
-            conn,
-            idempotency_key,
-            include_archived=idempotency_includes_archived,
-        )
-        if existing_id is not None:
-            return existing_id
+        row = conn.execute(
+            "SELECT id FROM tasks WHERE idempotency_key = ? "
+            "AND status != 'archived' "
+            "ORDER BY created_at DESC LIMIT 1",
+            (idempotency_key,),
+        ).fetchone()
+        if row:
+            return row["id"]
 
     now = int(time.time())
 
@@ -3183,18 +3158,6 @@ def create_task(
         task_id = _new_task_id()
         try:
             with write_txn(conn):
-                # The transaction-external lookup above is only a fast path.
-                # Recheck after BEGIN IMMEDIATE has serialized writers so two
-                # concurrent creators cannot both cross the insert boundary.
-                if idempotency_key:
-                    existing_id = _idempotent_task_id(
-                        conn,
-                        idempotency_key,
-                        include_archived=idempotency_includes_archived,
-                    )
-                    if existing_id is not None:
-                        return existing_id
-
                 # Determine task status from parent status, unless the caller
                 # parks it directly in blocked for human-ops review or in
                 # triage for a specifier.
@@ -6950,32 +6913,15 @@ def _classify_worker_exit(pid: int) -> "tuple[str, Optional[int]]":
         return ("unknown", None)
     raw, _ = entry
     try:
-        # ``os.WIFEXITED`` and friends are absent on native Windows.  The
-        # registry stores the POSIX wait-status returned by ``waitpid``, so
-        # decode that representation directly when those helpers are not
-        # available.  This also keeps classification deterministic for status
-        # values restored or injected by cross-platform callers/tests.
-        if hasattr(os, "WIFEXITED"):
-            exited = os.WIFEXITED(raw)
-            signaled = os.WIFSIGNALED(raw)
-            exit_code = os.WEXITSTATUS(raw) if exited else None
-            signal_code = os.WTERMSIG(raw) if signaled else None
-        else:
-            low_bits = raw & 0x7F
-            exited = low_bits == 0
-            signaled = low_bits not in (0, 0x7F)
-            exit_code = (raw >> 8) & 0xFF if exited else None
-            signal_code = low_bits if signaled else None
-
-        if exited:
-            code = int(exit_code)
+        if os.WIFEXITED(raw):
+            code = os.WEXITSTATUS(raw)
             if code == 0:
                 return ("clean_exit", 0)
             if code == KANBAN_RATE_LIMIT_EXIT_CODE:
                 return ("rate_limited", code)
             return ("nonzero_exit", code)
-        if signaled:
-            return ("signaled", int(signal_code))
+        if os.WIFSIGNALED(raw):
+            return ("signaled", os.WTERMSIG(raw))
     except Exception:
         pass
     return ("unknown", None)
@@ -7008,7 +6954,7 @@ def _pid_alive(pid: Optional[int]) -> bool:
     """Return True if ``pid`` is still running on this host.
 
     Cross-platform: uses ``OpenProcess`` + ``WaitForSingleObject`` on
-    Windows (via ``hermes_runtime.process_probe.pid_exists``) and ``os.kill(pid, 0)``
+    Windows (via ``gateway.status._pid_exists``) and ``os.kill(pid, 0)``
     on POSIX. Returns False for falsy PIDs or on any OS error.
 
     **DO NOT** use ``os.kill(pid, 0)`` directly on Windows — Python's
@@ -7029,6 +6975,7 @@ def _pid_alive(pid: Optional[int]) -> bool:
     """
     if not pid or pid <= 0:
         return False
+    from gateway.status import _pid_exists
     if not _pid_exists(int(pid)):
         return False
     # Still here → process exists. Check for zombie on platforms
@@ -7107,11 +7054,6 @@ def _terminate_reclaimed_worker(
         info["terminated"] = True
         return info
     except OSError:
-        # Windows reports an already-gone PID as a generic OSError rather
-        # than ProcessLookupError.  Recheck liveness so a dead worker is not
-        # misclassified as a survivor and held in ``running`` forever.
-        if not _pid_alive(pid):
-            info["terminated"] = True
         return info
 
     for _ in range(10):
@@ -8748,7 +8690,7 @@ def worker_log_rotation_config(kanban_cfg: Optional[dict] = None) -> tuple[int, 
     """
     if kanban_cfg is None:
         try:
-            from hermes_runtime.config import load_config
+            from hermes_cli.config import load_config
 
             kanban_cfg = (load_config().get("kanban") or {})
         except Exception:
@@ -8974,7 +8916,7 @@ def _resolve_worker_cli_toolsets(hermes_home: Optional[str]) -> Optional[list[st
         return None
     try:
         from hermes_constants import reset_hermes_home_override, set_hermes_home_override
-        from hermes_runtime.config import load_config
+        from hermes_cli.config import load_config
         from hermes_cli.tools_config import _get_platform_tools
 
         token = set_hermes_home_override(hermes_home)

@@ -39,7 +39,7 @@ class TestProviderPrecedence:
         """config.yaml model.provider wins over a logged-in OAuth active_provider."""
         _clear_provider_env(monkeypatch)
         _no_aws(monkeypatch)
-        _login(monkeypatch, "openai-codex")        # stale OAuth login
+        _login(monkeypatch, "anthropic")           # stale OAuth login
         _config(monkeypatch, {"provider": "zai", "default": "glm-4.6"})
         assert resolve_provider("auto") == "zai"
 
@@ -47,7 +47,7 @@ class TestProviderPrecedence:
         """An exported provider API key wins over a logged-in OAuth active_provider."""
         _clear_provider_env(monkeypatch)
         _no_aws(monkeypatch)
-        _login(monkeypatch, "openai-codex")
+        _login(monkeypatch, "anthropic")
         _config(monkeypatch, {"default": "some-model"})  # dict, NO provider key
         monkeypatch.setenv("OPENAI_API_KEY", "sk-test-key")
         assert resolve_provider("auto") == "openrouter"
@@ -58,9 +58,9 @@ class TestProviderPrecedence:
         is still used (it's the last-resort fallback, not removed)."""
         _clear_provider_env(monkeypatch)
         _no_aws(monkeypatch)
-        _login(monkeypatch, "openai-codex")
+        _login(monkeypatch, "anthropic")
         _config(monkeypatch, {})  # empty model config, no provider
-        assert resolve_provider("auto") == "openai-codex"
+        assert resolve_provider("auto") == "anthropic"
 
 
     def test_warns_on_silent_oauth_fallthrough(self, monkeypatch, caplog):
@@ -69,10 +69,10 @@ class TestProviderPrecedence:
         import logging
         _clear_provider_env(monkeypatch)
         _no_aws(monkeypatch)
-        _login(monkeypatch, "openai-codex")
+        _login(monkeypatch, "anthropic")
         _config(monkeypatch, {"default": "claude-x"})  # populated, no provider
         with caplog.at_level(logging.WARNING, logger="hermes_cli.auth"):
-            assert resolve_provider("auto") == "openai-codex"
+            assert resolve_provider("auto") == "anthropic"
         assert any("no `provider` key" in r.message for r in caplog.records)
 
 
@@ -81,7 +81,7 @@ class TestProviderPrecedence:
         OAuth provider — the pool rung sits above OAuth (#42130 + #29285)."""
         _clear_provider_env(monkeypatch)
         _no_aws(monkeypatch)
-        _login(monkeypatch, "openai-codex")
+        _login(monkeypatch, "anthropic")
         _config(monkeypatch, {})
 
         class _Pool:

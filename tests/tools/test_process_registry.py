@@ -2,7 +2,6 @@
 
 import json
 import os
-import shlex
 import signal
 import subprocess
 import sys
@@ -500,12 +499,8 @@ class TestStdinHelpers:
         lockout (#17959). For interactive stdin → PTY mode is now the only
         supported path.
         """
-        # ``python3`` is not a guaranteed command name on native Windows.
-        # Use the interpreter running pytest, translated to a Git-Bash-safe
-        # path, so this test exercises PTY EOF semantics on every platform.
-        python_exe = shlex.quote(sys.executable.replace("\\", "/"))
         session = registry.spawn_local(
-            f'{python_exe} -c "import sys; print(sys.stdin.read().strip())"',
+            'python3 -c "import sys; print(sys.stdin.read().strip())"',
             cwd=str(tmp_path),
             use_pty=True,
         )
@@ -740,7 +735,6 @@ class TestSpawnEnvSanitization:
 class TestPopenLeakOnSetupFailure:
     """Regression for issue #2749: subprocess orphaned when post-Popen setup raises."""
 
-    @pytest.mark.skipif(sys.platform == "win32", reason="POSIX process-group cleanup path")
     def test_popen_killed_when_thread_creation_fails(self, registry):
         """If Thread() raises after Popen, proc must be killed — not orphaned."""
         killed = []
@@ -921,7 +915,7 @@ class TestKillProcess:
         assert result["status"] == "already_exited"
 
 
-    def test_kill_detached_session_uses_host_pid(self, registry, monkeypatch):
+    def test_kill_detached_session_uses_host_pid(self, registry):
         s = _make_session(sid="proc_detached", command="sleep 999")
         s.pid = 424242
         s.detached = True
@@ -929,32 +923,32 @@ class TestKillProcess:
 
         terminate_calls = []
 
-        monkeypatch.setattr(
-            registry,
-            "_host_pid_is_ours",
-            lambda pid, expected_start: pid == 424242 and expected_start is None,
-        )
-        monkeypatch.setattr(
-            registry,
-            "_terminate_host_pid",
-            lambda pid, expected_start=None: terminate_calls.append(
-                (pid, expected_start)
-            ),
-        )
-        monkeypatch.setattr(registry, "_write_checkpoint", lambda: None)
+        class FakeProcess:
+            def __init__(self, pid):
+                self.pid = pid
+            def children(self, recursive=False):
+                return []
+            def terminate(self):
+                terminate_calls.append(("terminate", self.pid))
+
+        import psutil as _psutil
 
         try:
             # Post-#21561: liveness probe routes through
             # ``ProcessRegistry._is_host_pid_alive`` (→
-            # ``hermes_runtime.process_probe.pid_exists``), and the actual kill on POSIX
+            # ``gateway.status._pid_exists``), and the actual kill on POSIX
             # routes through ``psutil.Process(pid).terminate()``. Neither
             # touches ``os.kill`` directly. Mock both seams.  Disable the
             # SIGKILL-escalation step (grace=0) so it doesn't call
             # ``psutil.wait_procs`` on the FakeProcess.
-            result = registry.kill_process(s.id)
+            with patch("gateway.status._pid_exists", return_value=True), \
+                 patch.object(ProcessRegistry, "_daemon_term_grace_seconds",
+                              staticmethod(lambda: 0.0)), \
+                 patch.object(_psutil, "Process", side_effect=lambda pid: FakeProcess(pid)):
+                result = registry.kill_process(s.id)
 
             assert result["status"] == "killed"
-            assert terminate_calls == [(424242, None)]
+            assert ("terminate", 424242) in terminate_calls
         finally:
             registry._running.pop(s.id, None)
 
@@ -1137,8 +1131,6 @@ class TestTerminateHostPidWindows:
         assert "12345" in captured["args"]
         assert "/T" in captured["args"], "Tree flag required to reach descendants"
         assert "/F" in captured["args"], "Force flag required for headless Chromium"
-        assert captured["kwargs"]["encoding"] == "utf-8"
-        assert captured["kwargs"]["errors"] == "replace"
 
 class TestTerminateHostPidPosix:
     """POSIX branch walks the tree via psutil and SIGTERMs children first."""

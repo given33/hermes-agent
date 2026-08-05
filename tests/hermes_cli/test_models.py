@@ -293,7 +293,7 @@ class TestUnionWithPortalPaidRecommendations:
 
 
 class TestCheckNousFreeTierCache:
-    """Nous model selection never consults a removed account entitlement."""
+    """Tests for the TTL cache on check_nous_free_tier()."""
 
     def setup_method(self):
         _models_mod._free_tier_cache = None
@@ -329,7 +329,6 @@ class TestCheckNousFreeTierCache:
 
         assert check_nous_free_tier() is False
         assert check_nous_free_tier(force_fresh=True) is False
-        mock_account.assert_not_called()
 
         assert mock_account.call_count == 2
         mock_account.assert_called_with(force_fresh=True)

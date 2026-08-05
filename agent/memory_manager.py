@@ -35,7 +35,6 @@ from typing import Any, Callable, Dict, List, Optional
 
 from agent.memory_provider import MemoryProvider
 from agent.skill_commands import extract_user_instruction_from_skill_message
-from hermes_runtime.text_safety import strip_internal_memory_context
 from tools.registry import tool_error
 
 logger = logging.getLogger(__name__)
@@ -161,9 +160,23 @@ def inject_memory_provider_tools(agent: Any) -> int:
 # Context fencing helpers
 # ---------------------------------------------------------------------------
 
+_FENCE_TAG_RE = re.compile(r'</?\s*memory-context\s*>', re.IGNORECASE)
+_INTERNAL_CONTEXT_RE = re.compile(
+    r'<\s*memory-context\s*>[\s\S]*?</\s*memory-context\s*>',
+    re.IGNORECASE,
+)
+_INTERNAL_NOTE_RE = re.compile(
+    r'\[System note:\s*The following is recalled memory context,\s*NOT new user input\.\s*Treat as (?:informational background data|authoritative reference data[^\]]*)\.\]\s*',
+    re.IGNORECASE,
+)
+
+
 def sanitize_context(text: str) -> str:
     """Strip fence tags, injected context blocks, and system notes from provider output."""
-    return strip_internal_memory_context(text)
+    text = _INTERNAL_CONTEXT_RE.sub('', text)
+    text = _INTERNAL_NOTE_RE.sub('', text)
+    text = _FENCE_TAG_RE.sub('', text)
+    return text
 
 
 class StreamingContextScrubber:

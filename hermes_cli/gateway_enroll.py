@@ -257,7 +257,7 @@ def cmd_gateway_enroll(args) -> None:
             print(f"✗ Failed to write {key} to .env: {exc}")
             sys.exit(1)
 
-    from hermes_runtime.config import get_env_path
+    from hermes_cli.config import get_env_path
 
     print(f'✓ Enrolled gateway "{resolved_gateway_id}"' + (f" for tenant {tenant}" if tenant else ""))
     print()

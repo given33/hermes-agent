@@ -11,7 +11,6 @@ from contextvars import ContextVar
 from dataclasses import dataclass
 import json
 import logging
-import math
 import shutil
 import tempfile
 import threading
@@ -35,7 +34,6 @@ except ImportError:  # pragma: no cover - non-Windows
 from datetime import datetime, timedelta
 from pathlib import Path
 from hermes_constants import get_hermes_home
-from hermes_runtime.config import expand_env_vars, read_raw_config
 from typing import Optional, Dict, List, Any, Set, Tuple, Union
 
 logger = logging.getLogger(__name__)
@@ -229,8 +227,6 @@ def _oneshot_run_claim_ttl_seconds() -> float:
             timeout = float(raw)
         except (ValueError, TypeError):
             timeout = _DEFAULT_CRON_INACTIVITY_TIMEOUT
-    if not math.isfinite(timeout):
-        timeout = _DEFAULT_CRON_INACTIVITY_TIMEOUT
     if timeout <= 0:
         # Unlimited runs — cannot bound; use the fixed fallback floor.
         return float(ONESHOT_RUN_CLAIM_TTL_SECONDS)
@@ -397,14 +393,8 @@ def _normalize_skill_list(skill: Optional[str] = None, skills: Optional[Any] = N
         raw_items = [skill] if skill else []
     elif isinstance(skills, str):
         raw_items = [skills]
-    elif isinstance(skills, (list, tuple, set)):
-        raw_items = list(skills)
     else:
-        # jobs.json is user-editable; a scalar/dict in ``skills`` is corrupt
-        # but must not abort normalization of every sibling job. Treat the
-        # malformed field as absent and let the job run without optional skill
-        # instructions (the scheduler can still report other errors).
-        raw_items = []
+        raw_items = list(skills)
 
     normalized: List[str] = []
     for item in raw_items:
@@ -412,125 +402,6 @@ def _normalize_skill_list(skill: Optional[str] = None, skills: Optional[Any] = N
         if text and text not in normalized:
             normalized.append(text)
     return normalized
-
-
-def _normalize_repeat_record(job: Dict[str, Any]) -> Tuple[Optional[Dict[str, Any]], bool]:
-    """Return a runtime-safe repeat record and whether storage was repaired.
-
-    ``jobs.json`` is intentionally user-editable and older writers did not
-    always emit the same shape.  Runtime paths must not assume that
-    ``repeat`` is a mapping with integer ``times``/``completed`` fields: a
-    scalar or malformed counter would otherwise abort ``mark_job_run`` or
-    ``claim_dispatch`` while holding the jobs lock.  Invalid limits are
-    treated as an unbounded repeat (the safest interpretation for a job that
-    is already scheduled), while a malformed completed counter is reset.
-    """
-    if "repeat" not in job or job.get("repeat") is None:
-        return None, False
-
-    raw = job.get("repeat")
-    if not isinstance(raw, dict):
-        normalized = {"times": None, "completed": 0}
-        job["repeat"] = normalized
-        return normalized, True
-
-    times = raw.get("times")
-    if isinstance(times, bool):
-        times = None
-    elif isinstance(times, int):
-        times = times if times > 0 else None
-    elif isinstance(times, float):
-        if math.isfinite(times) and times.is_integer():
-            parsed_times = int(times)
-            times = parsed_times if parsed_times > 0 else None
-        else:
-            times = None
-    elif isinstance(times, str):
-        try:
-            parsed_times = int(times.strip())
-        except (TypeError, ValueError):
-            parsed_times = 0
-        times = parsed_times if parsed_times > 0 else None
-    else:
-        times = None
-
-    completed = raw.get("completed", 0)
-    if isinstance(completed, bool):
-        completed = 0
-    elif isinstance(completed, int):
-        completed = max(0, completed)
-    elif isinstance(completed, float):
-        if math.isfinite(completed) and completed.is_integer():
-            completed = max(0, int(completed))
-        else:
-            completed = 0
-    elif isinstance(completed, str):
-        try:
-            completed = max(0, int(completed.strip()))
-        except (TypeError, ValueError):
-            completed = 0
-    else:
-        completed = 0
-
-    normalized = dict(raw)
-    normalized["times"] = times
-    normalized["completed"] = completed
-    changed = normalized != raw
-    # Always attach the normalized mapping to the job.  Returning a shallow
-    # copy for an already-valid record would otherwise make lifecycle updates
-    # mutate only the temporary copy while the stored job remains unchanged.
-    job["repeat"] = normalized
-    return normalized, changed
-
-
-def normalize_repeat_limit(value: Any) -> Optional[int]:
-    """Normalize a create/update repeat limit without truthiness/type traps.
-
-    The cron tool schema advertises an integer, but direct callers and older
-    integrations can still send numeric strings. Treat non-positive values as
-    the documented unlimited mode and reject malformed values with a useful
-    ``ValueError`` instead of leaking a ``TypeError`` from ``repeat <= 0``.
-    """
-    if value is None:
-        return None
-    if isinstance(value, bool):
-        raise ValueError("repeat must be an integer, not a boolean")
-    if isinstance(value, int):
-        parsed = value
-    elif isinstance(value, str):
-        text = value.strip()
-        if not text:
-            raise ValueError("repeat must be a positive integer or omitted")
-        try:
-            parsed = int(text)
-        except ValueError as exc:
-            raise ValueError("repeat must be a positive integer or omitted") from exc
-    else:
-        raise ValueError("repeat must be a positive integer or omitted")
-    return parsed if parsed > 0 else None
-
-
-def _job_schedule_kind(job: Dict[str, Any]) -> Optional[str]:
-    """Return a stored job's schedule kind without trusting its JSON shape."""
-    schedule = job.get("schedule")
-    return schedule.get("kind") if isinstance(schedule, dict) else None
-
-
-def coerce_job_enabled(value: Any, default: bool = True) -> bool:
-    """Interpret legacy/user-edited enabled values without truthiness traps."""
-    if isinstance(value, bool):
-        return value
-    if isinstance(value, (int, float)) and not isinstance(value, bool):
-        if isinstance(value, float) and not math.isfinite(value):
-            return default
-        return value != 0
-    if isinstance(value, str):
-        normalized = value.strip().casefold()
-        if normalized in {"true", "yes", "on", "1"}:
-            return True
-        if normalized in {"false", "no", "off", "0", ""}:
-            return False
-    return default
 
 
 def _apply_skill_fields(job: Dict[str, Any]) -> Dict[str, Any]:
@@ -547,18 +418,6 @@ def _coerce_job_text(value: Any, fallback: str = "") -> str:
     if value is None:
         return fallback
     return str(value)
-
-
-def _normalize_enabled_toolsets(value: Any) -> Optional[List[str]]:
-    """Normalize a cron toolset allowlist without iterating scalar strings."""
-    if isinstance(value, str):
-        values = [value]
-    elif isinstance(value, (list, tuple, set)):
-        values = value
-    else:
-        return None
-    normalized = [str(item).strip() for item in values if str(item).strip()]
-    return normalized or None
 
 
 def _schedule_display_for_job(job: Dict[str, Any]) -> str:
@@ -604,22 +463,10 @@ def _normalize_job_record(job: Dict[str, Any]) -> Dict[str, Any]:
         name = label_source[:50].strip() or "cron job"
     normalized["name"] = name
     normalized["schedule_display"] = _schedule_display_for_job(normalized)
-    if "enabled_toolsets" in normalized:
-        normalized["enabled_toolsets"] = _normalize_enabled_toolsets(
-            normalized.get("enabled_toolsets")
-        )
-    # ``repeat`` is user-editable JSON too. Normalize malformed scalar
-    # records here so read-only consumers (cron list/API formatters) never
-    # crash while calling ``repeat.get(...)``. Due/lifecycle paths perform
-    # the same repair under the jobs lock and persist it when appropriate.
-    _normalize_repeat_record(normalized)
-    for flag, default in (("enabled", False), ("no_agent", False)):
-        if flag in normalized:
-            normalized[flag] = coerce_job_enabled(normalized.get(flag), default)
 
     state = _coerce_job_text(normalized.get("state")).strip()
     if not state:
-        state = "scheduled" if coerce_job_enabled(normalized.get("enabled", True)) else "paused"
+        state = "scheduled" if normalized.get("enabled", True) else "paused"
     normalized["state"] = state
 
     return normalized
@@ -702,18 +549,12 @@ def parse_duration(s: str) -> int:
         "2h" → 120
         "1d" → 1440
     """
-    if not isinstance(s, str):
-        raise ValueError(
-            f"Invalid duration: expected a string, got {type(s).__name__}"
-        )
     s = s.strip().lower()
     match = re.match(r'^(\d+)\s*(m|min|mins|minute|minutes|h|hr|hrs|hour|hours|d|day|days)$', s)
     if not match:
         raise ValueError(f"Invalid duration: '{s}'. Use format like '30m', '2h', or '1d'")
     
     value = int(match.group(1))
-    if value <= 0:
-        raise ValueError("Invalid duration: value must be greater than zero")
     unit = match.group(2)[0]  # First char: m, h, or d
     
     multipliers = {'m': 1, 'h': 60, 'd': 1440}
@@ -738,10 +579,6 @@ def parse_schedule(schedule: str) -> Dict[str, Any]:
         "0 9 * * *"        → cron expression
         "2026-02-03T14:00" → once at timestamp
     """
-    if not isinstance(schedule, str):
-        raise ValueError(
-            f"Invalid schedule: expected a string, got {type(schedule).__name__}"
-        )
     schedule = schedule.strip()
     original = schedule
     schedule_lower = schedule.lower()
@@ -812,8 +649,6 @@ def parse_schedule(schedule: str) -> Dict[str, Any]:
             "run_at": run_at.isoformat(),
             "display": f"once in {original}"
         }
-    except OverflowError as exc:
-        raise ValueError("Invalid duration: value is too large") from exc
     except ValueError:
         pass
     
@@ -913,16 +748,7 @@ def _compute_grace_seconds(schedule: dict) -> int:
     kind = schedule.get("kind")
 
     if kind == "interval":
-        minutes = schedule.get("minutes", 1)
-        if (
-            isinstance(minutes, bool)
-            or not isinstance(minutes, (int, float))
-            or (isinstance(minutes, float) and not math.isfinite(minutes))
-        ):
-            return MIN_GRACE
-        if minutes <= 0:
-            return MIN_GRACE
-        period_seconds = minutes * 60
+        period_seconds = schedule.get("minutes", 1) * 60
         grace = period_seconds // 2
         return max(MIN_GRACE, min(grace, MAX_GRACE))
 
@@ -962,27 +788,17 @@ def compute_next_run(schedule: Dict[str, Any], last_run_at: Optional[str] = None
 
     elif kind == "interval":
         minutes = schedule.get("minutes")
-        if (
-            minutes is None
-            or isinstance(minutes, bool)
-            or not isinstance(minutes, (int, float))
-            or (isinstance(minutes, float) and not math.isfinite(minutes))
-            or minutes <= 0
-        ):
+        if minutes is None:
             return None
-        try:
-            if last_run_at:
-                try:
-                    last = _ensure_aware(datetime.fromisoformat(last_run_at))
-                    next_run = last + timedelta(minutes=minutes)
-                except Exception:
-                    next_run = now + timedelta(minutes=minutes)
-            else:
-                # First run is now + interval
+        if last_run_at:
+            try:
+                last = _ensure_aware(datetime.fromisoformat(last_run_at))
+                next_run = last + timedelta(minutes=minutes)
+            except Exception:
                 next_run = now + timedelta(minutes=minutes)
-        except OverflowError:
-            logger.warning("Cannot compute next run for oversized interval: %r", minutes)
-            return None
+        else:
+            # First run is now + interval
+            next_run = now + timedelta(minutes=minutes)
         return next_run.isoformat()
 
     elif kind == "cron":
@@ -1226,25 +1042,8 @@ def load_jobs() -> List[Dict[str, Any]]:
     # list (auto-repair). Anything else (str/number/null) is corruption that
     # would otherwise raise an uncaught AttributeError on ``.get()`` and take
     # down the whole cron subsystem.
-    def _valid_records(raw_jobs: Any) -> List[Dict[str, Any]]:
-        if not isinstance(raw_jobs, list):
-            raise RuntimeError(
-                "Cron database corrupted: expected 'jobs' to be a list, "
-                f"got {type(raw_jobs).__name__}"
-            )
-        valid = [record for record in raw_jobs if isinstance(record, dict)]
-        dropped = len(raw_jobs) - len(valid)
-        if dropped:
-            logger.error(
-                "Ignoring %d malformed non-object record(s) in jobs.json; "
-                "rewriting the valid records so cron can continue",
-                dropped,
-            )
-            save_jobs(valid)
-        return valid
-
     if isinstance(data, dict):
-        jobs = _valid_records(data.get("jobs", []))
+        jobs = data.get("jobs", [])
         if _strict_retry and jobs:
             # Hit control-character corruption — rewrite with proper escaping.
             save_jobs(jobs)
@@ -1253,11 +1052,10 @@ def load_jobs() -> List[Dict[str, Any]]:
     if isinstance(data, list):
         # Bare array — likely saved/edited outside save_jobs(). Wrap it back
         # into the expected {"jobs": [...]} structure.
-        jobs = _valid_records(data)
         if data:
-            save_jobs(jobs)
+            save_jobs(data)
             logger.warning("Auto-repaired jobs.json (bare list wrapped as dict)")
-        return jobs
+        return data
 
     raise RuntimeError(
         f"Cron database corrupted: expected {{'jobs': [...]}}, got {type(data).__name__}"
@@ -1357,7 +1155,7 @@ def _resolve_default_model_snapshot() -> Optional[str]:
             return None
         cfg = read_user_config_raw(cfg_path)
         try:
-            from hermes_runtime import managed_scope
+            from hermes_cli import managed_scope
             cfg = managed_scope.apply_managed_overlay(cfg)
         except Exception:
             pass
@@ -1410,7 +1208,7 @@ def _compute_provider_model_snapshots(
         base_url,
         strip_trailing_slash=True,
     )
-    if coerce_job_enabled(no_agent, False):
+    if bool(no_agent):
         return None, None
 
     provider_snapshot: Optional[str] = None
@@ -1441,7 +1239,7 @@ def _normalized_inference_axes(job: Dict[str, Any]) -> Tuple[Optional[str], Opti
         _normalize_job_optional_text(job.get("provider")),
         _normalize_job_optional_text(job.get("model")),
         _normalize_job_optional_text(job.get("base_url"), strip_trailing_slash=True),
-        coerce_job_enabled(job.get("no_agent"), False),
+        bool(job.get("no_agent")),
     )
 
 
@@ -1513,9 +1311,9 @@ def create_job(
     """
     parsed_schedule = parse_schedule(schedule)
 
-    # Normalize repeat: treat 0 or negative values as None (infinite), while
-    # giving direct callers a stable validation error for malformed values.
-    repeat = normalize_repeat_limit(repeat)
+    # Normalize repeat: treat 0 or negative values as None (infinite)
+    if repeat is not None and repeat <= 0:
+        repeat = None
 
     # Auto-set repeat=1 for one-shot schedules if not specified
     if parsed_schedule["kind"] == "once" and repeat is None:
@@ -1534,9 +1332,10 @@ def create_job(
     normalized_base_url = _normalize_job_optional_text(base_url, strip_trailing_slash=True)
     normalized_script = str(script).strip() if isinstance(script, str) else None
     normalized_script = normalized_script or None
-    normalized_toolsets = _normalize_enabled_toolsets(enabled_toolsets)
+    normalized_toolsets = [str(t).strip() for t in enabled_toolsets if str(t).strip()] if enabled_toolsets else None
+    normalized_toolsets = normalized_toolsets or None
     normalized_workdir = _normalize_workdir(workdir)
-    normalized_no_agent = coerce_job_enabled(no_agent, False)
+    normalized_no_agent = bool(no_agent)
     normalized_attach = attach_to_session if isinstance(attach_to_session, bool) else None
 
     # no_agent jobs are meaningless without a script — the script IS the job.
@@ -1646,7 +1445,7 @@ def get_job(job_id: str) -> Optional[Dict[str, Any]]:
     """Get a job by ID."""
     jobs = load_jobs()
     for job in jobs:
-        if job.get("id") == job_id:
+        if job["id"] == job_id:
             return _normalize_job_record(job)
     return None
 
@@ -1657,7 +1456,7 @@ class AmbiguousJobReference(LookupError):
     def __init__(self, ref: str, matches: List[Dict[str, Any]]):
         self.ref = ref
         self.matches = matches
-        ids = ", ".join(str(m.get("id", "?")) for m in matches)
+        ids = ", ".join(m["id"] for m in matches)
         super().__init__(
             f"Job name '{ref}' is ambiguous — matches {len(matches)} jobs: {ids}. "
             f"Use the job ID instead."
@@ -1674,18 +1473,12 @@ def resolve_job_ref(ref: str) -> Optional[Dict[str, Any]]:
     """
     if not ref:
         return None
-    ref_text = str(ref).strip()
-    if not ref_text:
-        return None
     jobs = load_jobs()
     for job in jobs:
-        if job.get("id") == ref_text:
+        if job["id"] == ref:
             return _normalize_job_record(job)
-    ref_lower = ref_text.casefold()
-    name_matches = [
-        j for j in jobs
-        if _coerce_job_text(j.get("name")).strip().casefold() == ref_lower
-    ]
+    ref_lower = ref.lower()
+    name_matches = [j for j in jobs if (j.get("name") or "").lower() == ref_lower]
     if not name_matches:
         return None
     if len(name_matches) > 1:
@@ -1699,7 +1492,7 @@ def list_jobs(include_disabled: bool = False) -> List[Dict[str, Any]]:
     """List all jobs, optionally including disabled ones."""
     jobs = [_normalize_job_record(j) for j in load_jobs()]
     if not include_disabled:
-        jobs = [j for j in jobs if coerce_job_enabled(j.get("enabled", True))]
+        jobs = [j for j in jobs if j.get("enabled", True)]
     try:
         from cron.executions import latest_executions
 
@@ -1725,7 +1518,7 @@ def update_job(job_id: str, updates: Dict[str, Any]) -> Optional[Dict[str, Any]]
     with _jobs_lock():
         jobs = load_jobs()
         for i, job in enumerate(jobs):
-            if job.get("id") != job_id:
+            if job["id"] != job_id:
                 continue
 
             # Validate / normalize workdir if present in updates.  Empty string
@@ -1739,10 +1532,6 @@ def update_job(job_id: str, updates: Dict[str, Any]) -> Optional[Dict[str, Any]]
 
             previous_inference_axes = _normalized_inference_axes(job)
             updated = _apply_skill_fields({**job, **updates})
-            if "enabled_toolsets" in updates:
-                updated["enabled_toolsets"] = _normalize_enabled_toolsets(
-                    updated.get("enabled_toolsets")
-                )
             schedule_changed = "schedule" in updates
             inference_fields_changed = bool(
                 {"provider", "model", "base_url", "no_agent"}.intersection(updates)
@@ -1761,10 +1550,6 @@ def update_job(job_id: str, updates: Dict[str, Any]) -> Optional[Dict[str, Any]]
                 if isinstance(updated_schedule, str):
                     updated_schedule = parse_schedule(updated_schedule)
                     updated["schedule"] = updated_schedule
-                elif not isinstance(updated_schedule, dict):
-                    raise ValueError(
-                        "Cron schedule must be a schedule string or mapping"
-                    )
                 updated["schedule_display"] = updates.get(
                     "schedule_display",
                     updated_schedule.get("display", updated.get("schedule_display")),
@@ -1804,12 +1589,10 @@ def update_job(job_id: str, updates: Dict[str, Any]) -> Optional[Dict[str, Any]]
                 updated["provider_snapshot"] = provider_snapshot
                 updated["model_snapshot"] = model_snapshot
 
-            enabled_default = "enabled" not in updated
-            if coerce_job_enabled(updated.get("enabled", True), enabled_default) and updated.get("state") != "paused" and not updated.get("next_run_at"):
+            if updated.get("enabled", True) and updated.get("state") != "paused" and not updated.get("next_run_at"):
                 next_run = compute_next_run(updated["schedule"])
-                if next_run is None and _job_schedule_kind(updated) == "once":
-                    schedule = updated.get("schedule")
-                    run_at = schedule.get("run_at", "unknown") if isinstance(schedule, dict) else "unknown"
+                if next_run is None and updated["schedule"].get("kind") == "once":
+                    run_at = updated["schedule"].get("run_at", "unknown")
                     raise ValueError(
                         f"Requested one-shot time {run_at} is in the past "
                         f"(grace window: {ONESHOT_GRACE_SECONDS}s) and cannot be scheduled."
@@ -1844,10 +1627,9 @@ def resume_job(job_id: str) -> Optional[Dict[str, Any]]:
     if not job:
         return None
 
-    schedule = job.get("schedule")
-    next_run_at = compute_next_run(schedule)
-    if next_run_at is None and _job_schedule_kind(job) == "once":
-        run_at = schedule.get("run_at", "unknown") if isinstance(schedule, dict) else "unknown"
+    next_run_at = compute_next_run(job["schedule"])
+    if next_run_at is None and job["schedule"].get("kind") == "once":
+        run_at = job["schedule"].get("run_at", "unknown")
         raise ValueError(
             f"Cannot resume: one-shot time {run_at} is in the past "
             f"(grace window: {ONESHOT_GRACE_SECONDS}s) and will never fire."
@@ -1890,7 +1672,7 @@ def remove_job(job_id: str) -> bool:
     with _jobs_lock():
         jobs = load_jobs()
         original_len = len(jobs)
-        jobs = [j for j in jobs if j.get("id") != canonical_id]
+        jobs = [j for j in jobs if j["id"] != canonical_id]
         if len(jobs) < original_len:
             # Resolve the output dir BEFORE saving so a legacy unsafe ID (e.g.
             # left over from before the create-time guard) fails closed without
@@ -1918,7 +1700,7 @@ def mark_job_run(job_id: str, success: bool, error: Optional[str] = None,
     with _jobs_lock():
         jobs = load_jobs()
         for i, job in enumerate(jobs):
-            if job.get("id") == job_id:
+            if job["id"] == job_id:
                 now = _hermes_now().isoformat()
                 job["last_run_at"] = now
                 job["last_status"] = "ok" if success else "error"
@@ -1939,11 +1721,11 @@ def mark_job_run(job_id: str, success: bool, error: Optional[str] = None,
                 # (issue #38758), which already incremented completed — do not
                 # double-count them here.  Recurring jobs and direct callers
                 # with no pre-run claim still get the legacy increment.
-                repeat, _ = _normalize_repeat_record(job)
-                if repeat:
+                if job.get("repeat"):
+                    repeat = job["repeat"]
                     times = repeat.get("times")
                     completed = repeat.get("completed", 0)
-                    kind = _job_schedule_kind(job)
+                    kind = job.get("schedule", {}).get("kind")
                     preclaimed_oneshot = (
                         kind == "once"
                         and times is not None
@@ -1973,11 +1755,7 @@ def mark_job_run(job_id: str, success: bool, error: Optional[str] = None,
                         return
                 
                 # Compute next run
-                # A hand-edited legacy record may omit ``schedule`` entirely.
-                # ``compute_next_run`` is deliberately total for malformed
-                # values; use ``get`` here so marking the run still persists
-                # its terminal/error state instead of raising KeyError.
-                job["next_run_at"] = compute_next_run(job.get("schedule"), now)
+                job["next_run_at"] = compute_next_run(job["schedule"], now)
 
                 # If no next run, decide whether this is terminal completion
                 # (one-shot) or a transient failure (recurring schedule couldn't
@@ -1986,7 +1764,7 @@ def mark_job_run(job_id: str, success: bool, error: Optional[str] = None,
                 # missing runtime dep into "job completed" and the user's
                 # schedule quietly goes off. See issue #16265.
                 if job["next_run_at"] is None:
-                    kind = _job_schedule_kind(job)
+                    kind = job.get("schedule", {}).get("kind")
                     if kind in {"cron", "interval"}:
                         job["state"] = "error"
                         if not job.get("last_error"):
@@ -2078,15 +1856,11 @@ def claim_dispatch(job_id: str) -> bool:
     with _jobs_lock():
         jobs = load_jobs()
         for i, job in enumerate(jobs):
-            if job.get("id") != job_id:
+            if job["id"] != job_id:
                 continue
-            if _job_schedule_kind(job) != "once":
+            if job.get("schedule", {}).get("kind") != "once":
                 return True  # recurring jobs use advance_next_run(), not dispatch claims
-            repeat, repeat_repaired = _normalize_repeat_record(job)
-            if repeat_repaired:
-                # Persist the repaired shape before returning so a malformed
-                # hand-edited value cannot crash the next lifecycle call.
-                save_jobs(jobs)
+            repeat = job.get("repeat")
             if not repeat:
                 return True  # no repeat limit — always dispatch
             times = repeat.get("times")
@@ -2165,7 +1939,7 @@ def heartbeat_run_claim(job_id: str, *, expected_owner: str) -> bool:
         for job in jobs:
             if job.get("id") != job_id:
                 continue
-            if _job_schedule_kind(job) != "once":
+            if job.get("schedule", {}).get("kind") != "once":
                 return False
             claim = job.get("run_claim")
             if not isinstance(claim, dict) or claim.get("by") != expected_owner:
@@ -2247,39 +2021,7 @@ def _machine_id() -> str:
     return f"{host}:{os.getpid()}"
 
 
-def _fire_times_match(left: Any, right: Any) -> bool:
-    """Return whether two timezone-aware ISO timestamps name one instant."""
-    if not isinstance(left, str) or not isinstance(right, str):
-        return False
-    left = left.strip()
-    right = right.strip()
-    if not left or not right:
-        return False
-    try:
-        left_dt = datetime.fromisoformat(
-            left[:-1] + "+00:00" if left.endswith("Z") else left
-        )
-        right_dt = datetime.fromisoformat(
-            right[:-1] + "+00:00" if right.endswith("Z") else right
-        )
-    except ValueError:
-        return False
-    if (
-        left_dt.tzinfo is None
-        or left_dt.utcoffset() is None
-        or right_dt.tzinfo is None
-        or right_dt.utcoffset() is None
-    ):
-        return False
-    return left_dt == right_dt
-
-
-def claim_job_for_fire(
-    job_id: str,
-    fire_at: Optional[str] = None,
-    *,
-    claim_ttl_seconds: int = 300,
-) -> bool:
+def claim_job_for_fire(job_id: str, *, claim_ttl_seconds: int = 300) -> bool:
     """Atomically claim a job for a single external 'fire' (multi-machine
     at-most-once). Returns True iff THIS caller won the claim.
 
@@ -2289,14 +2031,10 @@ def claim_job_for_fire(
 
     Under the file lock: reject if the job is missing/disabled/paused. If a
     fresh claim (younger than ``claim_ttl_seconds``) already exists, lose.
-    Identity-bound callers also prove that ``fire_at`` is the job's current
-    scheduled occurrence. Otherwise stamp a ``fire_claim`` and, for recurring
-    jobs, advance
+    Otherwise stamp a ``fire_claim`` and, for recurring jobs, advance
     ``next_run_at`` (mirrors ``advance_next_run``'s at-most-once bump so a stale
-    re-delivery for the old time can't re-fire). A stale retry for the same
-    identity may reclaim a crashed attempt without advancing the schedule twice.
-    One-shots keep ``next_run_at`` but the fresh ``fire_claim`` blocks a
-    duplicate retry for the same fire.
+    re-delivery for the old time can't re-fire). One-shots keep ``next_run_at``
+    but the fresh ``fire_claim`` blocks a duplicate retry for the same fire.
     ``mark_job_run`` clears the claim on completion so a re-armed recurring job
     is claimable again next fire.
 
@@ -2304,17 +2042,12 @@ def claim_job_for_fire(
     completing doesn't wedge the job forever — after the TTL another fire can
     reclaim it.
     """
-    if fire_at is not None and (not isinstance(fire_at, str) or not fire_at.strip()):
-        return False
-    normalized_fire_at = fire_at.strip() if isinstance(fire_at, str) else None
-
     with _jobs_lock():
         jobs = load_jobs()
         for job in jobs:
-            if job.get("id") != job_id:
+            if job["id"] != job_id:
                 continue
-            enabled_default = "enabled" not in job
-            if not coerce_job_enabled(job.get("enabled", True), enabled_default) or job.get("state") == "paused":
+            if not job.get("enabled", True) or job.get("state") == "paused":
                 return False
             now = _hermes_now()
             existing = job.get("fire_claim")
@@ -2332,22 +2065,9 @@ def claim_job_for_fire(
                         return False  # someone holds a fresh claim
                 except Exception:
                     pass  # malformed claim → overwrite
-            reclaiming_same_fire = bool(
-                normalized_fire_at
-                and isinstance(existing, dict)
-                and _fire_times_match(existing.get("fire_at"), normalized_fire_at)
-            )
-            if normalized_fire_at and not reclaiming_same_fire and not _fire_times_match(
-                job.get("next_run_at"), normalized_fire_at
-            ):
-                return False
-
-            claim = {"at": now.isoformat(), "by": _machine_id()}
-            if normalized_fire_at:
-                claim["fire_at"] = normalized_fire_at
-            job["fire_claim"] = claim
-            kind = _job_schedule_kind(job)
-            if kind in {"cron", "interval"} and not reclaiming_same_fire:
+            job["fire_claim"] = {"at": now.isoformat(), "by": _machine_id()}
+            kind = job.get("schedule", {}).get("kind")
+            if kind in {"cron", "interval"}:
                 nxt = compute_next_run(job["schedule"], now.isoformat())
                 if nxt:
                     job["next_run_at"] = nxt
@@ -2547,23 +2267,6 @@ def _get_due_jobs_locked() -> List[Dict[str, Any]]:
                 rj.pop("last_run_at", None)
                 needs_save = True
 
-    # Normalize repeat records before the due loop.  The one-shot dispatch
-    # limit guard below reads ``times``/``completed`` directly; a scalar or
-    # malformed counter from a hand-edited jobs.json would otherwise raise in
-    # that per-job guard and silently skip the job forever.
-    for j, rj in zip(jobs, raw_jobs):
-        for flag, default in (("enabled", False), ("no_agent", False)):
-            if flag in j:
-                normalized_flag = coerce_job_enabled(j.get(flag), default)
-                if j.get(flag) != normalized_flag:
-                    j[flag] = normalized_flag
-                    rj[flag] = normalized_flag
-                    needs_save = True
-        _repeat, repaired = _normalize_repeat_record(j)
-        if repaired:
-            rj["repeat"] = copy.deepcopy(j["repeat"])
-            needs_save = True
-
     # Resolve the one-shot running-claim stale-recovery TTL once per scan
     # (derived from HERMES_CRON_TIMEOUT). See _oneshot_run_claim_ttl_seconds.
     _run_claim_ttl = _oneshot_run_claim_ttl_seconds()
@@ -2596,7 +2299,7 @@ def _get_due_jobs_locked() -> List[Dict[str, Any]]:
             # is treated as stale (the claiming tick died mid-run) and allowed
             # through so the job is recovered rather than wedged forever.
             existing_claim = job.get("run_claim")
-            if existing_claim and _job_schedule_kind(job) == "once":
+            if existing_claim and job.get("schedule", {}).get("kind") == "once":
                 try:
                     claimed_at = _ensure_aware(
                         datetime.fromisoformat(existing_claim["at"])
@@ -2829,7 +2532,7 @@ _CRON_OUTPUT_DEFAULT_KEEP = 50
 def _cron_output_keep() -> int:
     """Resolve the per-job output-file retention cap from config (``cron.output_retention``)."""
     try:
-        from hermes_runtime.config import load_config
+        from hermes_cli.config import load_config
         cfg = load_config() or {}
         cron_cfg = cfg.get("cron", {}) if isinstance(cfg, dict) else {}
         return int(cron_cfg.get("output_retention", _CRON_OUTPUT_DEFAULT_KEEP))

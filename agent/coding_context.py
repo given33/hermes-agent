@@ -365,7 +365,7 @@ def _coding_instructions(config: Optional[dict[str, Any]]) -> str:
     """
     if config is None:
         try:
-            from hermes_runtime.config import load_config
+            from hermes_cli.config import load_config
 
             config = load_config()
         except Exception:
@@ -380,7 +380,7 @@ def _resolve_cwd(cwd: Optional[str | Path]) -> Path:
     if cwd:
         return Path(cwd).expanduser()
     try:
-        from hermes_runtime.runtime_cwd import resolve_agent_cwd
+        from agent.runtime_cwd import resolve_agent_cwd
 
         return resolve_agent_cwd()
     except Exception:
@@ -699,13 +699,15 @@ def _enabled_mcp_servers(config: Optional[dict[str, Any]]) -> list[str]:
     of the coding workflow, not noise to strip.
     """
     try:
-        from hermes_runtime.config import read_raw_config
+        from hermes_cli.config import read_raw_config
+        from hermes_cli.tools_config import _parse_enabled_flag
+
         servers = read_raw_config().get("mcp_servers") or {}
         return [
             str(name)
             for name, cfg in servers.items()
             if isinstance(cfg, dict)
-            and parse_enabled_flag(cfg.get("enabled", True), default=True)
+            and _parse_enabled_flag(cfg.get("enabled", True), default=True)
         ]
     except Exception:
         return []

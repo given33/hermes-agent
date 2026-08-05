@@ -2,8 +2,6 @@
 
 from unittest.mock import patch
 
-import pytest
-
 from agent.skill_utils import (
     extract_skill_config_vars,
     extract_skill_conditions,

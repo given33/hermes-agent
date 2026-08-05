@@ -622,7 +622,7 @@ def test_load_pool_persists_bitwarden_origin_metadata_without_secret(tmp_path, m
     monkeypatch.setenv("HERMES_HOME", str(tmp_path / "hermes"))
     monkeypatch.setenv("OPENROUTER_API_KEY", sentinel)
     monkeypatch.setattr(
-        "hermes_runtime.secret_provenance.get_secret_source",
+        "hermes_cli.env_loader.get_secret_source",
         lambda env_var: "bitwarden" if env_var == "OPENROUTER_API_KEY" else None,
     )
     _write_auth_store(tmp_path, {"version": 1, "providers": {}})
@@ -938,9 +938,8 @@ def test_load_pool_falls_back_to_os_environ_when_dotenv_empty(tmp_path, monkeypa
 
 
 
-def test_load_pool_prefers_direct_nous_api_key_over_legacy_portal_state(tmp_path, monkeypatch):
+def test_load_pool_mirrors_nous_invoke_jwt_agent_key_runtime_api_key(tmp_path, monkeypatch):
     monkeypatch.setenv("HERMES_HOME", str(tmp_path / "hermes"))
-    monkeypatch.setenv("NOUS_API_KEY", "direct-nous-key")
     expires_at = datetime.fromtimestamp(time.time() + 3600, tz=timezone.utc).isoformat()
     token = _jwt_with_claims({
         "sub": "test-user",
@@ -975,14 +974,14 @@ def test_load_pool_prefers_direct_nous_api_key_over_legacy_portal_state(tmp_path
     entry = pool.select()
 
     assert entry is not None
-    assert entry.source == "env:NOUS_API_KEY"
-    assert entry.auth_type == "api_key"
-    assert entry.runtime_api_key == "direct-nous-key"
+    assert entry.source == "device_code"
+    assert entry.agent_key == token
+    assert entry.runtime_api_key == token
 
     auth_payload = json.loads((tmp_path / "hermes" / "auth.json").read_text())
     pool_entry = auth_payload["credential_pool"]["nous"][0]
-    assert pool_entry["source"] == "env:NOUS_API_KEY"
-    assert pool_entry.get("access_token") != "direct-nous-key"
+    assert pool_entry["agent_key"] == token
+    assert pool_entry["agent_key_expires_at"] == expires_at
 
 
 def test_nous_runtime_api_key_rejects_opaque_agent_key():
@@ -1548,7 +1547,6 @@ def test_load_pool_does_not_seed_qwen_oauth_when_no_token(tmp_path, monkeypatch)
     assert pool.entries() == []
 
 
-@pytest.mark.skip(reason="Nous Portal OAuth singleton seeding was removed")
 def test_nous_seed_from_singletons_preserves_obtained_at_timestamps(tmp_path, monkeypatch):
     """Regression test for #15099 secondary issue.
 

@@ -146,7 +146,7 @@ def test_prompt_enable_tool_gateway_pool_offers_covered_tools_only(monkeypatch):
 
 
 
-def test_apply_nous_managed_defaults_does_not_write_video_gen_config(monkeypatch):
+def test_apply_nous_managed_defaults_writes_video_gen_config(monkeypatch):
     """apply_nous_managed_defaults must write video_gen.provider and
     video_gen.use_gateway when a Nous subscriber selects video_gen
     without a direct FAL_KEY."""
@@ -163,12 +163,13 @@ def test_apply_nous_managed_defaults_does_not_write_video_gen_config(monkeypatch
         config, enabled_toolsets=["video_gen"],
     )
 
-    assert changed == set()
-    assert "video_gen" not in config
+    assert "video_gen" in changed
+    assert config["video_gen"]["provider"] == "fal"
+    assert config["video_gen"]["use_gateway"] is True
 
 
 # ---------------------------------------------------------------------------
-# Retired account-managed tool access
+# ensure_nous_portal_access — inline login gate for `hermes tools`
 # ---------------------------------------------------------------------------
 
 

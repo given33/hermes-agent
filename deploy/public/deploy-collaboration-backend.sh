@@ -10,7 +10,28 @@ die() { printf 'deploy-collaboration-backend: %s\n' "$*" >&2; exit 1; }
 repo="${HERMES_REPO:-$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)}"
 remote="${HERMES_PUBLIC_REMOTE:-admin@10.66.0.1}"
 version="${HERMES_COLLABORATION_VERSION:-}"
-release_commit="${HERMES_RELEASE_COMMIT:-$(git -C "${repo}" rev-parse HEAD 2>/dev/null || true)}"
+
+resolve_git_head() {
+  local gitdir head
+  head="$(git -C "${repo}" rev-parse HEAD 2>/dev/null || true)"
+  if [[ "${head}" =~ ^[0-9a-f]{40}$ ]]; then
+    printf '%s\n' "${head}"
+    return 0
+  fi
+
+  # Worktrees created by Git for Windows store a Windows gitdir path. Resolve
+  # it explicitly when this deployer runs from WSL.
+  if [[ -f "${repo}/.git" ]]; then
+    gitdir="$(sed -n 's/^gitdir: //p' "${repo}/.git")"
+    if [[ "${gitdir}" =~ ^[A-Za-z]:[/\\] ]] && command -v wslpath >/dev/null 2>&1; then
+      gitdir="$(wslpath -u "${gitdir}")"
+    fi
+    head="$(git --git-dir="${gitdir}" --work-tree="${repo}" rev-parse HEAD 2>/dev/null || true)"
+  fi
+  printf '%s\n' "${head}"
+}
+
+release_commit="${HERMES_RELEASE_COMMIT:-$(resolve_git_head)}"
 installer="${repo}/deploy/public/install-collaboration-backend.sh"
 local_python="${HERMES_LOCAL_PYTHON:-}"
 if [[ -z "${local_python}" ]]; then
@@ -82,19 +103,9 @@ runtime_service_assets=(
   "agent/memory_provider.py"
   "agent/turn_context.py"
   "agent/lsp/workspace.py"
-  "agent/copilot_auth.py"
-  "agent/fallback_config.py"
   "agent/image_routing.py"
-  "agent/moa_config.py"
-  "agent/model_catalog.py"
   "agent/model_metadata.py"
   "agent/models_dev.py"
-  "agent/model_cost_guard.py"
-  "agent/model_normalize.py"
-  "agent/nous_account.py"
-  "agent/provider_auth.py"
-  "agent/provider_registry.py"
-  "agent/runtime_provider.py"
   "agent/shell_hooks.py"
   "agent/tool_dispatch_helpers.py"
   "agent/tool_executor.py"
@@ -135,6 +146,7 @@ runtime_service_assets=(
   "hermes_cli/mcp_config.py"
   "hermes_cli/plugins.py"
   "hermes_cli/profile_distribution.py"
+  "hermes_cli/runtime_provider.py"
   "hermes_services/__init__.py"
   "hermes_services/application.py"
   "hermes_services/auth.py"

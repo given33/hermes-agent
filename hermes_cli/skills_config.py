@@ -13,8 +13,8 @@ Config stored in ~/.hermes/config.yaml under:
 """
 from typing import List, Optional, Set
 
-from hermes_runtime.config import cfg_get, load_config, save_config
-from hermes_runtime.colors import Colors, color
+from hermes_cli.config import cfg_get, load_config, save_config
+from hermes_cli.colors import Colors, color
 from hermes_cli.platforms import PLATFORMS as _PLATFORMS
 
 # Backward-compatible view: {key: label_string} so existing code that
@@ -27,7 +27,7 @@ PLATFORMS = {k: info.label for k, info in _PLATFORMS.items() if k != "api_server
 def _normalize_skill_names(values) -> Set[str]:
     """Normalize a config value into a set of skill names.
 
-    Mirrors ``hermes_runtime.skill_utils._normalize_string_set``: ``None`` (YAML null)
+    Mirrors ``agent.skill_utils._normalize_string_set``: ``None`` (YAML null)
     means empty, a bare scalar (``disabled: my-skill``) means a single-item
     list — NOT a set of its characters (#13026).
     """
@@ -47,7 +47,7 @@ def get_disabled_skills(config: dict, platform: Optional[str] = None) -> Set[str
 
     A globally-disabled skill stays disabled on every platform, so the
     platform list adds to the global list rather than replacing it. This
-    mirrors ``hermes_runtime.skill_utils.get_disabled_skill_names``.
+    mirrors ``agent.skill_utils.get_disabled_skill_names``.
     """
     skills_cfg = config.get("skills") or {}
     if not isinstance(skills_cfg, dict):

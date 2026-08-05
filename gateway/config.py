@@ -16,9 +16,8 @@ from dataclasses import asdict, dataclass, field, is_dataclass
 from typing import Dict, List, Optional, Any, Callable
 from enum import Enum
 
-from hermes_runtime.config import get_hermes_home
-from hermes_runtime.secret_scope import current_secret_scope, get_secret as _get_secret
-from hermes_services.auth import has_usable_secret
+from hermes_cli.config import get_hermes_home
+from agent.secret_scope import current_secret_scope, get_secret as _get_secret
 from utils import is_truthy_value
 
 logger = logging.getLogger(__name__)
@@ -1276,28 +1275,18 @@ def load_gateway_config() -> GatewayConfig:
 
     # Primary source: config.yaml
     try:
+        import yaml
         config_yaml_path = _home / "config.yaml"
         if config_yaml_path.exists():
-            # Shared raw reader (mtime-cached, thread-lock-guarded) instead of
-            # a bare yaml.safe_load. Raw semantics are deliberate: this loader
-            # maps user-written keys into GatewayConfig itself, and going
-            # through load_config() would merge DEFAULT_CONFIG in and break
-            # every ``key in yaml_cfg`` presence check below. One nuance vs.
-            # the old bare read: an unparseable config.yaml now yields {} plus
-            # a loud warning (instead of raising into the except below), so
-            # the managed overlay still applies — admin pins survive a corrupt
-            # user file.
-            from hermes_runtime.config import read_raw_config
-            yaml_cfg = read_raw_config(config_yaml_path)
+            with open(config_yaml_path, encoding="utf-8") as f:
+                yaml_cfg = yaml.safe_load(f) or {}
 
             # Managed scope: overlay administrator-pinned values so the gateway
             # honors them too. This loader builds its own dict instead of going
             # through hermes_cli.config.load_config, so without this a managed
             # session_reset / quick_commands / stt / model would be ignored by
-            # the messaging gateway. apply_managed_overlay IS the shared merge
-            # (extracted to hermes_cli.managed_scope so this loader and
-            # _load_config_impl can't drift). Fail-open via the shared helper.
-            from hermes_runtime import managed_scope
+            # the messaging gateway. Fail-open via the shared helper.
+            from hermes_cli import managed_scope
             yaml_cfg = managed_scope.apply_managed_overlay(yaml_cfg)
 
             # Shared nested-fallback source: settings meant to be top-level
@@ -1800,21 +1789,27 @@ def _validate_gateway_config(config: "GatewayConfig") -> None:
     # Ported from openclaw/openclaw#64586: users who copy .env.example
     # without changing placeholder values get a clear startup error instead
     # of a confusing "auth failed" from the platform API.
-    for platform, pconfig in config.platforms.items():
-        if not pconfig.enabled:
-            continue
-        env_name = _token_env_names.get(platform)
-        if not env_name:
-            continue
-        token = pconfig.token
-        if token and token.strip() and not has_usable_secret(token, min_length=4):
-            logger.error(
-                "%s is enabled but %s is set to a placeholder value ('%s'). "
-                "Set a real bot token before starting the gateway. "
-                "The adapter will NOT be started.",
-                platform.value, env_name, token.strip()[:6] + "...",
-            )
-            pconfig.enabled = False
+    try:
+        from hermes_cli.auth import has_usable_secret
+    except ImportError:
+        has_usable_secret = None  # type: ignore[assignment]
+
+    if has_usable_secret is not None:
+        for platform, pconfig in config.platforms.items():
+            if not pconfig.enabled:
+                continue
+            env_name = _token_env_names.get(platform)
+            if not env_name:
+                continue
+            token = pconfig.token
+            if token and token.strip() and not has_usable_secret(token, min_length=4):
+                logger.error(
+                    "%s is enabled but %s is set to a placeholder value ('%s'). "
+                    "Set a real bot token before starting the gateway. "
+                    "The adapter will NOT be started.",
+                    platform.value, env_name, token.strip()[:6] + "...",
+                )
+                pconfig.enabled = False
 
 
 def _apply_env_overrides(config: GatewayConfig) -> None:
