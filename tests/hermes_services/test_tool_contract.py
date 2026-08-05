@@ -250,7 +250,7 @@ def test_stateful_browser_and_terminal_calls_stay_in_the_owner_runtime(monkeypat
     assert "terminal-state" in terminal_close
 
 
-def test_one_sequential_contract_serializes_the_whole_provider_batch():
+def test_independent_path_scoped_calls_keep_overlap_aware_parallelism():
     calls = [
         _call("read-1", "read_file", '{"path":"a"}'),
         _call("write-1", "write_file", '{"path":"b"}'),
@@ -260,7 +260,7 @@ def test_one_sequential_contract_serializes_the_whole_provider_batch():
     plan = _plan_tool_batch_execution(calls)
 
     assert len(plan) == 1
-    assert plan[0][0] == "sequential"
+    assert plan[0][0] == "parallel"
     assert [call.id for call in plan[0][1]] == ["read-1", "write-1", "read-2"]
 
 
