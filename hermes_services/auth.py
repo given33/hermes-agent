@@ -5,11 +5,41 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Any
 
-from hermes_auth_errors import (
-    AuthError,
-    CODEX_RATE_LIMITED_CODE,
-    is_rate_limited_auth_error,
-)
+try:
+    from hermes_auth_errors import (
+        AuthError,
+        CODEX_RATE_LIMITED_CODE,
+        is_rate_limited_auth_error,
+    )
+except ImportError as exc:
+    # Fabric nodes running the pre-0.20 updater copy hermes_services as a
+    # package but do not know about the newer top-level auth contract yet.
+    # Keep that one upgrade hop bootable so it can install the current updater.
+    if getattr(exc, "name", None) != "hermes_auth_errors":
+        raise
+
+    CODEX_RATE_LIMITED_CODE = "codex_rate_limited"
+
+    class AuthError(RuntimeError):
+        def __init__(
+            self,
+            message: str,
+            *,
+            provider: str = "",
+            code: str | None = None,
+            relogin_required: bool = False,
+        ) -> None:
+            super().__init__(message)
+            self.provider = provider
+            self.code = code
+            self.relogin_required = relogin_required
+
+    def is_rate_limited_auth_error(error: Exception) -> bool:
+        return (
+            isinstance(error, AuthError)
+            and not error.relogin_required
+            and error.code == CODEX_RATE_LIMITED_CODE
+        )
 from hermes_secret_compare import bearer_matches
 
 

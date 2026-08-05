@@ -401,6 +401,43 @@ def test_fabric_updater_stages_sqlite_fallback_dependency():
     assert "import hermes_cli.managed_node_recovery_service" in updater
 
 
+def test_legacy_fabric_manifest_can_bootstrap_the_current_receiver(tmp_path):
+    """The updater deployed before 0.20 must be able to install its successor."""
+    legacy_snapshot = tmp_path / "legacy-fabric-snapshot"
+    legacy_snapshot.mkdir()
+    for package in ("hermes_runtime", "hermes_services"):
+        shutil.copytree(ROOT / package, legacy_snapshot / package)
+    for relative in (
+        "hermes_cli/__init__.py",
+        "hermes_cli/managed_installations.py",
+        "hermes_cli/managed_nodes.py",
+        "hermes_cli/managed_node_recovery_service.py",
+        "hermes_constants.py",
+        "hermes_secret_compare.py",
+    ):
+        source = ROOT / relative
+        target = legacy_snapshot / relative
+        target.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(source, target)
+
+    env = os.environ.copy()
+    env["PYTHONPATH"] = str(legacy_snapshot)
+    result = subprocess.run(
+        [sys.executable, "-I", "-c", (
+            "import sys; "
+            f"sys.path.insert(0, {str(legacy_snapshot)!r}); "
+            "import hermes_cli.managed_node_recovery_service"
+        )],
+        cwd=legacy_snapshot,
+        env=env,
+        capture_output=True,
+        text=True,
+        check=False,
+        timeout=30,
+    )
+    assert result.returncode == 0, result.stdout + "\n" + result.stderr
+
+
 def test_public_release_contains_the_complete_application_service_layer():
     deployer = (PUBLIC / "deploy-collaboration-backend.sh").read_text(
         encoding="utf-8"
