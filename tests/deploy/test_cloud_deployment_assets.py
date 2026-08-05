@@ -1028,7 +1028,7 @@ def test_public_installer_bounds_fabric_checks_and_bypasses_proxy_for_loopback()
     )
     verifier = (PUBLIC / "verify-fabric-release.sh").read_text(encoding="utf-8")
 
-    assert 'fabric_health_attempts="${HERMES_FABRIC_HEALTH_ATTEMPTS:-60}"' in installer
+    assert 'fabric_health_attempts="${HERMES_FABRIC_HEALTH_ATTEMPTS:-360}"' in installer
     assert installer.count("--noproxy '*'") >= 7
     assert 'attempts="${HERMES_FABRIC_VERIFY_ATTEMPTS:-60}"' in verifier
     assert "--noproxy '*'" in verifier

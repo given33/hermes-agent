@@ -1794,9 +1794,10 @@ installation_health_cfg="$(mktemp /run/hermes-installation-route-health.XXXXXX)"
 chmod 0600 "${installation_health_cfg}"
 printf 'header = "X-DBB3-Token: %s"\nheader = "Accept: application/json"\n' \
   "$(cat -- "${managed_installation_token_file}")" >"${installation_health_cfg}"
-# Fabric nodes update from a two-minute timer. Bound the default wait to one
-# minute; operators can raise it explicitly for a cold dependency install.
-fabric_health_attempts="${HERMES_FABRIC_HEALTH_ATTEMPTS:-60}"
+# Fabric nodes update from a two-minute timer with up to twenty seconds of
+# randomized delay. Allow enough time for that poll plus a cold transactional
+# node update while still failing within the production workflow timeout.
+fabric_health_attempts="${HERMES_FABRIC_HEALTH_ATTEMPTS:-360}"
 [[ "${fabric_health_attempts}" =~ ^[1-9][0-9]*$ ]] \
   || die "HERMES_FABRIC_HEALTH_ATTEMPTS must be a positive integer"
 for node in dbb3 wsl; do
