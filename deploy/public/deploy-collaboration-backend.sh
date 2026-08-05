@@ -205,6 +205,52 @@ runtime_service_assets=(
   "tools/tool_result_storage.py"
   "utils.py"
 )
+# Build the deployed Python surface from the immutable Git index instead of a
+# hand-maintained import subset. Hermes 0.20 split startup/runtime code across
+# many new modules; deploying only direct entrypoints leaves the public host on
+# a mixed 0.19/0.20 import graph. Only tracked production Python sources below
+# approved roots are eligible, so tests, caches, build output, and untracked
+# operator files can never enter the release stage.
+runtime_source_manifest="$(mktemp)"
+cleanup_runtime_source_manifest() {
+  rm -f -- "${runtime_source_manifest}"
+}
+trap cleanup_runtime_source_manifest EXIT
+git -C "${repo}" ls-files -z -- \
+  agent gateway hermes_cli hermes_runtime hermes_services tools tui_gateway \
+  providers cron acp_adapter plugins ':(top,glob)*.py' \
+  | while IFS= read -r -d '' relative; do
+      case "${relative}" in
+        *.py) ;;
+        *) continue ;;
+      esac
+      case "${relative}" in
+        */tests/*|*/test_*.py|*/__pycache__/*) continue ;;
+      esac
+      [[ "${relative}" =~ ^[A-Za-z0-9_.+/-]+$ ]] \
+        || die "runtime source path contains unsupported characters: ${relative}"
+      case "/${relative}/" in
+        *'//'*|*'/../'*|*'/./'*) die "unsafe runtime source path: ${relative}" ;;
+      esac
+      printf '%s\0' "${relative}"
+    done \
+  | sort -zu >"${runtime_source_manifest}"
+mapfile -d '' -t runtime_service_assets <"${runtime_source_manifest}"
+(( ${#runtime_service_assets[@]} >= 500 )) \
+  || die "runtime source manifest is unexpectedly incomplete"
+for required_runtime_source in \
+  hermes_auth_errors.py hermes_cli/web_models.py \
+  agent/interrupt_compat.py gateway/streaming_tts_consumer.py; do
+  runtime_source_found=0
+  for relative in "${runtime_service_assets[@]}"; do
+    if [[ "${relative}" == "${required_runtime_source}" ]]; then
+      runtime_source_found=1
+      break
+    fi
+  done
+  [[ "${runtime_source_found}" == 1 ]] \
+    || die "runtime source manifest omitted ${required_runtime_source}"
+done
 for relative in "${ios_hermes_assets[@]}" "${ios_plugin_assets[@]}" \
   "${ios_tool_assets[@]}" "${ios_support_assets[@]}" \
   "${runtime_service_assets[@]}"; do
@@ -277,6 +323,7 @@ cleanup_remote_stage() {
       [[ "${status}" != 0 ]] || status=1
     fi
   fi
+  cleanup_runtime_source_manifest
   exit "${status}"
 }
 trap cleanup_remote_stage EXIT
@@ -362,9 +409,9 @@ scp "${ssh_args[@]}" \
   "${repo}/hermes_cli/account_write_approvals.py" \
   "${repo}/hermes_cli/mobile_console.py" \
   "${remote}:${stage}/hermes_cli/"
-# Preserve relative paths for the complete changed runtime surface. The root
+# Preserve relative paths for the complete tracked runtime surface. The root
 # installer validates and snapshots every member before replacing live files.
-tar -C "${repo}" -cf - -- "${runtime_service_assets[@]}" \
+tar --null -T "${runtime_source_manifest}" -C "${repo}" -cf - \
   | ssh "${ssh_args[@]}" "${remote}" \
       "tar --no-same-owner -C '${stage}' -xf -"
 scp "${ssh_args[@]}" \
@@ -373,6 +420,9 @@ scp "${ssh_args[@]}" \
   "${repo}/deploy/public/managed-nodes.server.json" \
   "${repo}/deploy/public/runtime-requirements.lock" \
   "${remote}:${stage}/deploy/public/"
+scp "${ssh_args[@]}" \
+  "${runtime_source_manifest}" \
+  "${remote}:${stage}/deploy/public/runtime-source-files.nul"
 scp "${ssh_args[@]}" \
   "${repo}/deploy/recovery/configure-main-managed-installation-ssh.sh" \
   "${remote}:${stage}/deploy/recovery/"

@@ -201,6 +201,58 @@ runtime_service_assets=(
   "tools/tool_result_storage.py"
   "utils.py"
 )
+runtime_source_manifest_relative="deploy/public/runtime-source-files.nul"
+runtime_source_manifest="${stage_root}/${runtime_source_manifest_relative}"
+[[ -f "${runtime_source_manifest}" && ! -L "${runtime_source_manifest}" ]] \
+  || die "runtime source manifest is missing or unsafe"
+runtime_source_manifest_sha256="$(sha256sum "${runtime_source_manifest}" | cut -d' ' -f1)"
+[[ "${runtime_source_manifest_sha256}" =~ ^[0-9a-f]{64}$ ]] \
+  || die "runtime source manifest SHA-256 is invalid"
+mapfile -d '' -t staged_runtime_service_assets <"${runtime_source_manifest}"
+runtime_source_min_files="${HERMES_RUNTIME_SOURCE_MIN_FILES:-500}"
+[[ "${runtime_source_min_files}" =~ ^[1-9][0-9]*$ ]] \
+  || die "HERMES_RUNTIME_SOURCE_MIN_FILES must be a positive integer"
+(( ${#staged_runtime_service_assets[@]} >= runtime_source_min_files \
+   && ${#staged_runtime_service_assets[@]} <= 5000 )) \
+  || die "runtime source manifest entry count is outside the production boundary"
+runtime_service_assets+=("${staged_runtime_service_assets[@]}")
+declare -A runtime_asset_seen=()
+deduplicated_runtime_service_assets=()
+for relative in "${runtime_service_assets[@]}"; do
+  [[ -n "${relative}" && "${relative}" == *.py ]] \
+    || die "runtime source manifest contains a non-Python entry"
+  [[ "${relative}" =~ ^[A-Za-z0-9_.+/-]+$ ]] \
+    || die "runtime source path contains unsupported characters: ${relative}"
+  case "/${relative}/" in
+    *'//'*|*'/../'*|*'/./'*) die "unsafe runtime source path: ${relative}" ;;
+  esac
+  case "${relative}" in
+    */tests/*|*/test_*.py|*/__pycache__/*)
+      die "runtime source manifest contains a test or cache path: ${relative}"
+      ;;
+  esac
+  if [[ "${relative}" == */* ]]; then
+    case "${relative}" in
+      agent/*|gateway/*|hermes_cli/*|hermes_runtime/*|hermes_services/*|tools/*|\
+      tui_gateway/*|providers/*|cron/*|acp_adapter/*|plugins/*) ;;
+      *) die "runtime source path is outside approved roots: ${relative}" ;;
+    esac
+  fi
+  [[ -f "${stage_root}/${relative}" && ! -L "${stage_root}/${relative}" ]] \
+    || die "runtime source is missing or unsafe: ${relative}"
+  if [[ -z "${runtime_asset_seen[${relative}]:-}" ]]; then
+    runtime_asset_seen["${relative}"]=1
+    deduplicated_runtime_service_assets+=("${relative}")
+  fi
+done
+runtime_service_assets=("${deduplicated_runtime_service_assets[@]}")
+for required_runtime_source in \
+  hermes_auth_errors.py hermes_cli/web_models.py \
+  agent/interrupt_compat.py gateway/streaming_tts_consumer.py; do
+  [[ -n "${runtime_asset_seen[${required_runtime_source}]:-}" ]] \
+    || die "runtime source manifest omitted ${required_runtime_source}"
+done
+required+=("${runtime_source_manifest_relative}")
 required+=("${runtime_service_assets[@]}")
 # The iOS intelligence release is staged alongside the collaboration release.
 # Keep this list optional for one-release rollback compatibility: an older
@@ -298,6 +350,9 @@ fi
 for relative in "${required[@]}"; do
   [[ -f "${snapshot}/${relative}" && ! -L "${snapshot}/${relative}" ]] || die "unsafe snapshot ${relative}"
 done
+[[ "$(sha256sum "${snapshot}/${runtime_source_manifest_relative}" | cut -d' ' -f1)" \
+    == "${runtime_source_manifest_sha256}" ]] \
+  || die "runtime source manifest changed while the root snapshot was created"
 if [[ "${ios_enabled}" == 1 ]]; then
   for relative in "${ios_optional[@]}"; do
     [[ -f "${snapshot}/${relative}" && ! -L "${snapshot}/${relative}" ]] || die "unsafe snapshot ${relative}"

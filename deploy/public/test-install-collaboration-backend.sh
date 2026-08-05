@@ -54,6 +54,10 @@ cleanup() {
 trap cleanup EXIT
 
 runtime_files=(
+  "hermes_auth_errors.py"
+  "hermes_cli/web_models.py"
+  "agent/interrupt_compat.py"
+  "gateway/streaming_tts_consumer.py"
   "plugins/collaboration/dashboard/hosted_tui_runtime.py"
   "agent/agent_runtime_helpers.py"
   "agent/chat_completion_helpers.py"
@@ -244,6 +248,13 @@ for relative in "${runtime_files[@]}"; do
   install -D -m 0644 /dev/null "${target}/${relative}"
   printf 'old:%s\n' "${relative}" >"${target}/${relative}"
 done
+runtime_source_manifest="${stage}/deploy/public/runtime-source-files.nul"
+install -d -m 0700 "$(dirname "${runtime_source_manifest}")"
+for relative in "${runtime_files[@]}"; do
+  case "${relative}" in
+    *.py) printf '%s\0' "${relative}" ;;
+  esac
+done | sort -zu >"${runtime_source_manifest}"
 for relative in "${nginx_files[@]}"; do
   install -D -m 0644 "${repo}/${relative}" "${stage}/${relative}"
 done
@@ -604,6 +615,7 @@ run_installer() {
     FAKE_HANDSHAKE_FAIL="${3:-0}" \
     FAKE_NGINX_FAIL="${4:-0}" \
     HERMES_DEPLOY_FAIL_PHASE="${5:-}" \
+    HERMES_RUNTIME_SOURCE_MIN_FILES=1 \
     IOS_CAPABILITIES_COUNT="${ios_capabilities_count}" \
     HERMES_AGENT_ROOT="${target}" \
     HERMES_RUNTIME_PYTHON="${runtime_python}" \

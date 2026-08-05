@@ -470,7 +470,12 @@ def test_public_release_contains_the_complete_application_service_layer():
         assert relative in harness
 
     assert 'required+=("${runtime_service_assets[@]}")' in installer
-    assert 'tar -C "${repo}" -cf - -- "${runtime_service_assets[@]}"' in deployer
+    assert 'git -C "${repo}" ls-files -z --' in deployer
+    assert 'tar --null -T "${runtime_source_manifest}" -C "${repo}" -cf -' in deployer
+    assert 'runtime-source-files.nul' in deployer
+    assert 'runtime-source-files.nul' in installer
+    assert 'runtime source path is outside approved roots' in installer
+    assert 'runtime source manifest contains a test or cache path' in installer
     assert 'runtime_compile_assets+=("${snapshot}/${relative}")' in installer
     assert 'destination_parent="$(dirname "${target_root}/${relative}")"' in installer
     assert '"hermes_cli/sqlite_util.py"' in installer
