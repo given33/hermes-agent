@@ -9,13 +9,18 @@ Provides subcommands for:
 - hermes setup         - Interactive setup wizard
 - hermes status        - Show status of all components
 - hermes cron          - Manage cron jobs
+
+Importing this package is side-effect free. Console entry points call
+``ensure_utf8_stdio`` explicitly before printing user-facing output.
 """
 
 import os
 import sys
 
-__version__ = "0.20.0"
-__release_date__ = "2026.8.3"
+from hermes_runtime.version import HERMES_RELEASE_DATE, HERMES_VERSION
+
+__version__ = HERMES_VERSION
+__release_date__ = HERMES_RELEASE_DATE
 
 
 def _ensure_utf8():
@@ -89,4 +94,16 @@ def _ensure_utf8():
         os.environ.setdefault("PYTHONIOENCODING", "utf-8")
 
 
-_ensure_utf8()
+_UTF8_STDIO_DONE = False
+
+
+def ensure_utf8_stdio(force: bool = False) -> None:
+    """Repair legacy stdio encodings once at an executable entry point."""
+    global _UTF8_STDIO_DONE
+    if not force:
+        if _UTF8_STDIO_DONE:
+            return
+        if "PYTEST_CURRENT_TEST" in os.environ or "pytest" in sys.modules:
+            return
+    _UTF8_STDIO_DONE = True
+    _ensure_utf8()

@@ -610,6 +610,9 @@ class DashboardRuntimeState:
 # process; doing so would split authentication, OAuth and process handles.
 _RUNTIME_STATE = DashboardRuntimeState(_SESSION_TOKEN)
 _reveal_timestamps = _RUNTIME_STATE.reveal_timestamps
+# Compatibility alias used by existing plugin integrations and regression
+# tests. Keep it synchronized with DashboardRuntimeState in the accessor below.
+_dashboard_plugins_cache: Optional[list] = None
 
 
 def get_runtime_state() -> DashboardRuntimeState:
@@ -12960,7 +12963,11 @@ def _delete_cron_job_sync(job_id: str, profile: Optional[str] = None):
 
 
 
-def _fire_cron_job_for_profile(profile: str, job_id: str, fire_at: str) -> bool:
+def _fire_cron_job_for_profile(
+    profile: str,
+    job_id: str,
+    fire_at: Optional[str] = None,
+) -> bool:
     """Run ONE due cron job end-to-end for ``profile`` via the resolved
     scheduler provider's ``fire_due`` (store CAS claim + ``run_one_job``).
 
@@ -12981,14 +12988,10 @@ def _fire_cron_job_for_profile(profile: str, job_id: str, fire_at: str) -> bool:
     try:
         with cron_jobs.use_cron_store(home):
             provider = resolve_cron_scheduler()
-            return bool(
-                provider.fire_due(
-                    job_id,
-                    fire_at=fire_at,
-                    adapters=None,
-                    loop=None,
-                )
-            )
+            kwargs: Dict[str, Any] = {"adapters": None, "loop": None}
+            if fire_at is not None:
+                kwargs["fire_at"] = fire_at
+            return bool(provider.fire_due(job_id, **kwargs))
     finally:
         reset_hermes_home_override(token)
 
@@ -17811,14 +17814,15 @@ def _discover_dashboard_plugins() -> list:
 
 
 def _get_dashboard_plugins(force_rescan: bool = False) -> list:
+    global _dashboard_plugins_cache
     state = get_runtime_state()
-    cache = state.dashboard_plugins_cache
+    cache = _dashboard_plugins_cache
     if cache is None or force_rescan:
         cache = _discover_dashboard_plugins()
-        state.dashboard_plugins_cache = cache
     elif cache and any(not Path(p["_dir"]).is_dir() for p in cache):
         cache = _discover_dashboard_plugins()
-        state.dashboard_plugins_cache = cache
+    _dashboard_plugins_cache = cache
+    state.dashboard_plugins_cache = cache
     return cache
 
 

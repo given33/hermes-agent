@@ -135,7 +135,7 @@ def _prepare_smart_approval_observer(
     the auxiliary LLM from making its decision.
     """
     try:
-        from hermes_runtime.redaction import redact_sensitive_text
+        from agent.redact import redact_sensitive_text
 
         hook_command = redact_sensitive_text(command, force=True)
         hook_description = redact_sensitive_text(description, force=True)

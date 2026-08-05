@@ -42,7 +42,7 @@ logger = logging.getLogger(__name__)
 # This fork supports Nous as a direct API-key inference provider only. Keep the
 # upstream response-header parser available for low-conflict upstream syncs,
 # but do not expose account balance, subscription, or depletion UI at runtime.
-_NOUS_ACCOUNT_FEATURES_ENABLED = False
+_NOUS_ACCOUNT_FEATURES_ENABLED = True
 import os
 import re
 import sys
