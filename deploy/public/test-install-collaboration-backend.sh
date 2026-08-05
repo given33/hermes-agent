@@ -48,9 +48,40 @@ PY
 }
 work="$(mktemp -d /tmp/hermes-public-installer-test.XXXXXX)"
 stage="/home/root/.cache/hermes-agent-deploy/${version}-test-$$"
-cleanup() {
-  rm -rf -- "${work}" "${stage}"
+last_error_status=0
+last_error_line="unknown"
+last_error_command="unknown"
+record_error() {
+  local status=$?
+  last_error_status="${status}"
+  last_error_line="${BASH_LINENO[0]:-unknown}"
+  last_error_command="${BASH_COMMAND:-unknown}"
 }
+cleanup() {
+  local status=$?
+  if (( status != 0 )); then
+    printf 'public installer harness failed: status=%s last_error_status=%s line=%s command=%q\n' \
+      "${status}" "${last_error_status}" "${last_error_line}" \
+      "${last_error_command}" >&2
+    local diagnostic
+    for diagnostic in \
+      "${work}/deployer-failure.stderr" \
+      "${work}/deployer-upload.stderr" \
+      "${work}/failure.stderr" \
+      "${work}/nginx-failure.stderr" \
+      "${work}/handshake.stderr" \
+      "${work}/signal.stderr" \
+      "${work}"/phase-*.stderr \
+      "${work}/success.stderr"; do
+      [[ -s "${diagnostic}" ]] || continue
+      printf '%s\n' "--- $(basename "${diagnostic}") (tail) ---" >&2
+      tail -n 120 -- "${diagnostic}" >&2 || true
+    done
+  fi
+  rm -rf -- "${work}" "${stage}"
+  exit "${status}"
+}
+trap record_error ERR
 trap cleanup EXIT
 
 runtime_files=(

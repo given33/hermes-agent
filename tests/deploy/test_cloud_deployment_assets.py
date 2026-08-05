@@ -471,7 +471,7 @@ def test_public_release_contains_the_complete_application_service_layer():
 
     assert 'required+=("${runtime_service_assets[@]}")' in installer
     assert 'git -C "${repo}" ls-files -z --' in deployer
-    assert 'tar --null -T "${runtime_source_manifest}" -C "${repo}" -cf -' in deployer
+    assert 'tar -C "${repo}" --null -T "${runtime_source_manifest}" -cf -' in deployer
     assert 'runtime-source-files.nul' in deployer
     assert 'runtime-source-files.nul' in installer
     assert 'runtime source path is outside approved roots' in installer

@@ -411,7 +411,7 @@ scp "${ssh_args[@]}" \
   "${remote}:${stage}/hermes_cli/"
 # Preserve relative paths for the complete tracked runtime surface. The root
 # installer validates and snapshots every member before replacing live files.
-tar --null -T "${runtime_source_manifest}" -C "${repo}" -cf - \
+tar -C "${repo}" --null -T "${runtime_source_manifest}" -cf - \
   | ssh "${ssh_args[@]}" "${remote}" \
       "tar --no-same-owner -C '${stage}' -xf -"
 scp "${ssh_args[@]}" \
