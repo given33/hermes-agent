@@ -21,4 +21,5 @@ def test_production_deploy_waits_for_the_same_commit_ci_run():
     assert "--workflow ci.yml" in source
     assert "--commit \"$RELEASE_COMMIT\"" in source
     assert "Timed out waiting for the complete CI gate" in source
+    assert "--extra all --extra dev --extra hindsight" in source
     assert "  release:\n    types: [published]\n" in ci_source

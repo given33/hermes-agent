@@ -67,7 +67,10 @@ jobs:
             sleep 10
           done
       - name: Install the locked backend environment
-        run: uv sync --locked --python 3.11 --extra all --extra dev
+        # The release boundary exercises the Hindsight plugin explicitly.
+        # `[all]` intentionally excludes lazy-install feature SDKs, while CI
+        # disables runtime installs, so install this one tested extra up front.
+        run: uv sync --locked --python 3.11 --extra all --extra dev --extra hindsight
       - name: Verify deployable backend boundaries
         run: |
           uv run ruff check \
