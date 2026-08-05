@@ -713,6 +713,17 @@ def create_mcp_server(
     """Build a server exposing tools for exactly one capability."""
 
     from mcp.server.fastmcp import FastMCP
+    from mcp.server.fastmcp.server import Settings as FastMCPSettings
+
+    # Hermes supplies runtime configuration through the supervised process
+    # environment.  FastMCP otherwise probes ``.env`` in the inherited cwd;
+    # production deliberately keeps that secrets file unreadable to the MCP
+    # service user, so discovery and lazy child startup must not touch it.
+    if FastMCPSettings.model_config.get("env_file") is not None:
+        FastMCPSettings.model_config = {
+            **FastMCPSettings.model_config,
+            "env_file": None,
+        }
 
     capability = str(capability).strip().lower()
     if capability not in CAPABILITIES:

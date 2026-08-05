@@ -384,6 +384,24 @@ def test_discovered_schema_keeps_semantic_description_and_optional_owner(tmp_pat
     assert "owner_id" not in schema["parameters"].get("required", [])
 
 
+def test_mcp_server_does_not_probe_inherited_dotenv(monkeypatch, tmp_path):
+    from pathlib import Path
+
+    original_is_file = Path.is_file
+
+    def reject_dotenv_probe(path):
+        if path.name == ".env":
+            raise PermissionError("production dotenv is not readable by the service user")
+        return original_is_file(path)
+
+    monkeypatch.setattr(Path, "is_file", reject_dotenv_probe)
+    server = create_mcp_server(
+        "ios-location",
+        store=IOSIntelligenceStore(tmp_path),
+    )
+    assert _tools(server)
+
+
 def test_each_mcp_has_scoped_manifest_and_supervisor_registration(tmp_path):
     manifests = ios_mcp_manifests()
     assert set(manifests) == set(CAPABILITIES)
