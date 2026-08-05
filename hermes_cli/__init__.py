@@ -17,10 +17,8 @@ Importing this package is side-effect free. Console entry points call
 import os
 import sys
 
-from hermes_runtime.version import HERMES_RELEASE_DATE, HERMES_VERSION
-
-__version__ = HERMES_VERSION
-__release_date__ = HERMES_RELEASE_DATE
+__version__ = "0.20.0"
+__release_date__ = "2026.8.3"
 
 
 def _ensure_utf8():

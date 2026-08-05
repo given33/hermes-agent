@@ -267,6 +267,7 @@ archive_paths=(
   "hermes_cli/__init__.py"
   "hermes_runtime"
   "hermes_services"
+  "hermes_auth_errors.py"
   "hermes_constants.py"
   "hermes_secret_compare.py"
 )
@@ -372,7 +373,7 @@ for runtime_root_path in hermes_runtime hermes_services; do
     runtime_assets+=("${runtime_path#"${stage}/"}")
   done < <(find "${stage}/${runtime_root_path}" -type f -name '*.py' -print0 2>/dev/null)
 done
-runtime_assets+=("hermes_constants.py" "hermes_secret_compare.py")
+runtime_assets+=("hermes_auth_errors.py" "hermes_constants.py" "hermes_secret_compare.py")
 (( ${#runtime_assets[@]} > 8 )) || die "managed runtime package is incomplete"
 case "${role}" in
   dbb3) runtime_root="${HERMES_DBB3_AGENT_ROOT:-/usr/local/lib/hermes-agent}" ;;
@@ -424,8 +425,11 @@ PY
 # receiver entry point from the staged tree before replacing the live runtime,
 # so a fabric update cannot restart into an ImportError and disappear from the
 # public installation routes.
-PYTHONPATH="${stage}${PYTHONPATH:+:${PYTHONPATH}}" \
-  python3 -c 'import hermes_cli.managed_node_recovery_service'
+(
+  cd "${stage}"
+  PYTHONPATH="${stage}${PYTHONPATH:+:${PYTHONPATH}}" \
+    python3 -c 'import hermes_cli.managed_node_recovery_service'
+)
 runtime_swapped=1
 for relative in "${runtime_assets[@]}"; do
   target="${runtime_root}/${relative}"

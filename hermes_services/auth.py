@@ -5,12 +5,12 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Any
 
-from hermes_secret_compare import bearer_matches
-from hermes_cli.auth import (
+from hermes_auth_errors import (
     AuthError,
     CODEX_RATE_LIMITED_CODE,
     is_rate_limited_auth_error,
 )
+from hermes_secret_compare import bearer_matches
 
 
 _PLACEHOLDER_SECRET_VALUES = frozenset(

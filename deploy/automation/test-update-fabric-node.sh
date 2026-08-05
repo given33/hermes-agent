@@ -103,6 +103,7 @@ for module in __init__.py resource_catalog.py; do
   printf 'RELEASE = "new"\n' >"${archive}/hermes_services/${module}"
 done
 printf 'RELEASE = "new"\n' >"${archive}/hermes_constants.py"
+printf 'RELEASE = "new"\n' >"${archive}/hermes_auth_errors.py"
 printf 'RELEASE = "new"\n' >"${archive}/hermes_secret_compare.py"
 
 cat >"${archive}/deploy/dbb3/install-dbb3-cloud-connector-user.sh" <<'SH'
@@ -168,6 +169,7 @@ run_case() {
     printf 'RELEASE = "old"\n' >"${root}/runtime/hermes_services/${module}"
   done
   printf 'RELEASE = "old"\n' >"${root}/runtime/hermes_constants.py"
+  printf 'RELEASE = "old"\n' >"${root}/runtime/hermes_auth_errors.py"
   printf 'RELEASE = "old"\n' >"${root}/runtime/hermes_secret_compare.py"
   for asset in update-fabric-node.sh hermes-fabric-update.service hermes-fabric-update.timer; do
     printf 'old automation\n' >"${root}/automation/${asset}"
@@ -206,6 +208,18 @@ run_case() {
     >"${root}/stdout" 2>"${root}/stderr"
   status=$?
   set -e
+
+  if [[ -z "${failpoint}" && "${status}" != 0 ]]; then
+    printf 'fabric updater success case failed for role=%s (exit=%s)\n' \
+      "${role}" "${status}" >&2
+    cat "${root}/stdout" >&2
+    cat "${root}/stderr" >&2
+  elif [[ -n "${failpoint}" && "${status}" == 0 ]]; then
+    printf 'fabric updater failpoint unexpectedly succeeded for role=%s failpoint=%s\n' \
+      "${role}" "${failpoint}" >&2
+    cat "${root}/stdout" >&2
+    cat "${root}/stderr" >&2
+  fi
 
   if [[ -z "${failpoint}" ]]; then
     [[ "${status}" == 0 ]]

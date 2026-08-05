@@ -43,6 +43,11 @@ from urllib.parse import parse_qs, urlencode, urlparse
 
 import httpx
 
+from hermes_auth_errors import (
+    AuthError,
+    CODEX_RATE_LIMITED_CODE,
+    is_rate_limited_auth_error,
+)
 from hermes_cli.config import (
     get_hermes_home,
     get_config_path,
@@ -821,44 +826,6 @@ def _normalize_lmstudio_runtime_base_url(base_url: str) -> str:
 # =============================================================================
 # Error Types
 # =============================================================================
-
-# Error code marking upstream rate-limit / usage-quota exhaustion (HTTP 429).
-# Such failures are transient and re-authenticating cannot resolve them, so
-# they must be kept distinct from missing/expired-credential errors.
-CODEX_RATE_LIMITED_CODE = "codex_rate_limited"
-
-
-class AuthError(RuntimeError):
-    """Structured auth error with UX mapping hints."""
-
-    def __init__(
-        self,
-        message: str,
-        *,
-        provider: str = "",
-        code: Optional[str] = None,
-        relogin_required: bool = False,
-    ) -> None:
-        super().__init__(message)
-        self.provider = provider
-        self.code = code
-        self.relogin_required = relogin_required
-
-
-def is_rate_limited_auth_error(error: Exception) -> bool:
-    """True when an :class:`AuthError` represents upstream rate-limiting / quota
-    exhaustion rather than missing or invalid credentials.
-
-    These failures are transient — re-authenticating cannot resolve them — so
-    callers should surface a "retry later" notice and prefer a fallback chain
-    instead of prompting the operator to run ``hermes auth``.
-    """
-    return (
-        isinstance(error, AuthError)
-        and not error.relogin_required
-        and error.code == CODEX_RATE_LIMITED_CODE
-    )
-
 
 def _parse_retry_after_seconds(headers: Any) -> Optional[int]:
     """Best-effort parse of a ``Retry-After`` header into whole seconds.
