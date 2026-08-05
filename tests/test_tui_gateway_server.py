@@ -38,6 +38,18 @@ def _neuter_agent_prewarm_timer(request, monkeypatch):
     yield
 
 
+@pytest.fixture(autouse=True)
+def _neuter_unrelated_notification_pollers(monkeypatch):
+    """Keep session-init tests from leaking daemon pollers into later tests."""
+    # Synthetic sessions are often removed with a raw dict pop because those
+    # tests exercise startup state rather than teardown. Poller behavior has
+    # dedicated direct-loop tests below.
+    monkeypatch.setattr(
+        server, "_start_notification_poller", lambda *a, **k: threading.Event()
+    )
+    yield
+
+
 def test_session_slot_is_claimed_on_first_turn_not_on_create(monkeypatch, tmp_path):
     home = tmp_path / ".hermes"
     home.mkdir()
@@ -3851,10 +3863,28 @@ def test_finalize_session_closes_slash_worker(monkeypatch):
     assert session.get("_finalized") is True
 
     # Idempotent: a second finalize (or a follow-up teardown) must not
-    # re-close the worker — the _finalized guard short-circuits.
+    # re-close the worker.
     server._finalize_session(session)
     server._teardown_session(session)
     assert closed["count"] == 1
+
+
+def test_finalize_session_stops_and_joins_notification_poller(monkeypatch):
+    stopped = threading.Event()
+
+    class _PollerThread:
+        def join(self, *, timeout):
+            assert timeout == 1.0
+            assert stopped.is_set()
+
+    monkeypatch.setattr(server, "_notify_session_boundary", lambda *a, **k: None)
+    monkeypatch.setattr(server, "_get_db", lambda: None)
+    session = _session(_notif_stop=stopped, _notif_thread=_PollerThread())
+
+    server._finalize_session(session)
+
+    assert stopped.is_set()
+    assert session["_finalized"] is True
 
 
 def test_ws_orphan_reap_spares_reattached_session(monkeypatch):
@@ -4426,7 +4456,19 @@ class _StopAfterOneNotificationPoll:
 
     def is_set(self):
         self._checks += 1
-        return self._checks > 1
+        # The loop checks once before and once after its blocking dequeue so a
+        # real stop cannot race a late delivery.
+        return self._checks > 2
+
+
+class _StopAfterNotificationPolls:
+    def __init__(self, polls):
+        self._checks = 0
+        self._polls = polls
+
+    def is_set(self):
+        self._checks += 1
+        return self._checks > self._polls * 2
 
 
 def test_notification_poller_live_loop_requeues_foreign_completion_for_owner(
@@ -4623,11 +4665,10 @@ def test_notification_poller_drops_orphaned_events(monkeypatch, routing):
         }
     )
 
-    stop = threading.Event()
-    stop.set()
-
     try:
-        server._notification_poller_loop(stop, "sid_a", sess)
+        server._notification_poller_loop(
+            _StopAfterOneNotificationPoll(), "sid_a", sess
+        )
 
         assert [a for a in emitted if a[0] == "status.update"] == []
         assert delivered == []
@@ -4689,11 +4730,10 @@ def test_notification_poller_delivers_owned_events(
         }
     )
 
-    stop = threading.Event()
-    stop.set()
-
     try:
-        server._notification_poller_loop(stop, "sid_a", sess)
+        server._notification_poller_loop(
+            _StopAfterOneNotificationPoll(), "sid_a", sess
+        )
 
         status_calls = [a for a in emitted if a[0] == "status.update"]
         assert len(status_calls) == 1
@@ -4897,14 +4937,9 @@ def test_run_prompt_submit_requeues_all_unstarted_notifications_with_real_thread
         assert nested_started.wait(timeout=5)
         threads[0].join(timeout=5)
         assert not threads[0].is_alive()
-        # Membership, not order: the completion_queue is process-global, and
-        # notification pollers leaked by earlier session.init tests in this
-        # file legitimately steal-and-requeue foreign-session events (see
-        # _notification_poller_loop's belongs-elsewhere branch), rotating the
-        # queue. The requeue contract is that batch_2 and batch_3 both remain
-        # queued (never consumed) while batch_1's turn is in flight — so drain
-        # with a deadline (an event may be transiently held by a poller
-        # mid-cycle) and assert exactly {batch_2, batch_3} come back.
+        # Membership, not order: the requeue contract is that batch_2 and
+        # batch_3 both remain queued (never consumed) while batch_1's turn is in
+        # flight.
         queued: dict = {}
         deadline = time.time() + 5.0
         while time.time() < deadline and set(queued) != {
@@ -13652,10 +13687,6 @@ def test_notification_poller_delivers_completion(monkeypatch):
     monkeypatch.setattr(process_registry, "completion_queue", isolated_queue)
     process_registry._completion_consumed.discard("proc_poller_test")
 
-    stop = threading.Event()
-
-    # Put event on queue, then immediately signal stop so the poller
-    # runs exactly one iteration.
     isolated_queue.put({
         "type": "completion",
         "session_id": "proc_poller_test",
@@ -13663,10 +13694,10 @@ def test_notification_poller_delivers_completion(monkeypatch):
         "exit_code": 0,
         "output": "hello",
     })
-    stop.set()
-
     try:
-        server._notification_poller_loop(stop, "sid_poll", sess)
+        server._notification_poller_loop(
+            _StopAfterOneNotificationPoll(), "sid_poll", sess
+        )
 
         # Should have emitted a status.update with kind=process
         status_calls = [a for a in emitted if a[0] == "status.update"]
@@ -13680,6 +13711,43 @@ def test_notification_poller_delivers_completion(monkeypatch):
         server._sessions.pop("sid_poll", None)
         while not process_registry.completion_queue.empty():
             process_registry.completion_queue.get_nowait()
+
+
+def test_notification_poller_requeues_event_when_stop_races_dequeue(monkeypatch):
+    """A closing session cannot consume or emit an event dequeued during stop."""
+    import queue as _queue_mod
+
+    from tools.process_registry import process_registry
+
+    stop = threading.Event()
+    event = {
+        "type": "completion",
+        "session_id": "proc_stop_race",
+        "command": "echo late",
+        "exit_code": 0,
+        "output": "late",
+    }
+
+    class _StopOnGetQueue(_queue_mod.Queue):
+        def get(self, *args, **kwargs):
+            item = super().get(*args, **kwargs)
+            stop.set()
+            return item
+
+    isolated_queue = _StopOnGetQueue()
+    isolated_queue.put(event)
+    monkeypatch.setattr(process_registry, "completion_queue", isolated_queue)
+    monkeypatch.setattr(
+        server,
+        "_emit",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            AssertionError("stopped poller emitted a late frame")
+        ),
+    )
+
+    server._notification_poller_loop(stop, "sid_stop_race", _session())
+
+    assert isolated_queue.get_nowait() is event
 
 
 def test_notification_poller_skips_consumed(monkeypatch):
@@ -13724,11 +13792,10 @@ def test_notification_poller_skips_consumed(monkeypatch):
         "output": "x",
     })
 
-    stop = threading.Event()
-    stop.set()
-
     try:
-        server._notification_poller_loop(stop, "sid_skip", sess)
+        server._notification_poller_loop(
+            _StopAfterOneNotificationPoll(), "sid_skip", sess
+        )
         assert len(turns) == 0
     finally:
         server._sessions.pop("sid_skip", None)
@@ -13767,11 +13834,10 @@ def test_notification_poller_requeues_when_busy(monkeypatch):
     }
     isolated_queue.put(evt)
 
-    stop = threading.Event()
-    stop.set()
-
     try:
-        server._notification_poller_loop(stop, "sid_busy", sess)
+        server._notification_poller_loop(
+            _StopAfterOneNotificationPoll(), "sid_busy", sess
+        )
 
         # Status update was emitted (user sees it)
         status_calls = [a for a in emitted if a[0] == "status.update"]
@@ -13922,11 +13988,10 @@ def test_notification_poller_emits_distinct_watch_matches_once(monkeypatch):
     isolated_queue.put({**base, "output": "READY on port 9000"})
     isolated_queue.put(dict(base))
 
-    stop = threading.Event()
-    stop.set()
-
     try:
-        server._notification_poller_loop(stop, "sid_watch_dedup", sess)
+        server._notification_poller_loop(
+            _StopAfterNotificationPolls(3), "sid_watch_dedup", sess
+        )
         status_calls = [a for a in emitted if a[0] == "status.update"]
         assert len(status_calls) == 2
         status_text = "\n".join(call[2]["text"] for call in status_calls)

@@ -662,9 +662,7 @@ def _finalize_session(session: dict | None, end_reason: str = "tui_close") -> No
         return
     session["_finalized"] = True
     _release_active_session_slot(session)
-    stop_event = session.get("_notif_stop")
-    if stop_event is not None:
-        stop_event.set()
+    _stop_notification_poller(session)
 
     agent = session.get("agent")
     lock = session.get("history_lock")
@@ -9050,6 +9048,14 @@ def _notification_poller_loop(
         except Exception:
             continue
 
+        # Teardown can race the blocking queue read. Once this poller no longer
+        # owns a live session it must not emit a late frame or launch another
+        # agent turn; return the event so another live owner (or a later resume)
+        # can deliver it.
+        if stop_event.is_set() or session.get("_finalized"):
+            process_registry.completion_queue.put(evt)
+            return
+
         # Multiple desktop sessions share this one process-wide queue. Only
         # consume events that belong to *this* session — otherwise a background
         # process started in session A would surface its completion in whichever
@@ -9143,89 +9149,6 @@ def _notification_poller_loop(
             )
             with session["history_lock"]:
                 session["running"] = False
-
-    # Drain any remaining events after stop signal (process all pending
-    # before exiting so nothing is lost on shutdown). Events owned by other
-    # live sessions are set aside and re-queued so their poller still sees them.
-    # Orphaned events (owner gone) are dropped — same guard as the main loop.
-    deferred: list = []
-    while not process_registry.completion_queue.empty():
-        try:
-            evt = process_registry.completion_queue.get_nowait()
-        except Exception:
-            break
-        if _notification_event_belongs_elsewhere(sid, session, evt):
-            deferred.append(evt)
-            continue
-        # Same positive-proof rule as the live loop. Preserve the existing
-        # shutdown behavior for orphaned delegation payloads by deferring them
-        # for a later resume; ordinary addressed orphans are dropped.
-        requires_owner = _notification_event_requires_owner(evt)
-        if requires_owner and not _session_owns_notification_event(sid, session, evt):
-            if evt.get("type") == "async_delegation":
-                deferred.append(evt)
-            else:
-                logger.debug(
-                    "Dropping unowned %s notification during shutdown drain "
-                    "(origin=%r key=%r)",
-                    evt.get("type", "completion"),
-                    str(evt.get("origin_ui_session_id") or ""),
-                    str(evt.get("session_key") or ""),
-                )
-            continue
-        _evt_sid = evt.get("session_id", "")
-        if evt.get("type") == "completion" and process_registry.is_completion_consumed(_evt_sid):
-            continue
-        text = format_process_notification(evt)
-        if not text:
-            continue
-
-        _dedup_key = _notification_event_dedup_key(evt)
-        if _dedup_key not in _emitted:
-            _emit("status.update", sid, {"kind": "process", "text": text})
-            _emitted.add(_dedup_key)
-
-        with session["history_lock"]:
-            if session.get("running"):
-                process_registry.completion_queue.put(evt)
-                break
-            session["running"] = True
-
-        rid = f"__notif__{int(time.time() * 1000)}"
-        from tools.async_delegation import (
-            claim_event_delivery, complete_event_delivery, release_event_delivery,
-        )
-        _claim = claim_event_delivery(evt, "tui-poller")
-        if _claim is None:
-            continue
-        try:
-            _emit("message.start", sid)
-            if evt.get("type") == "async_delegation":
-                _run_prompt_submit(
-                    rid,
-                    sid,
-                    session,
-                    text,
-                    display_kind="async_delegation_complete",
-                    display_metadata=_async_delegation_display_metadata(evt),
-                )
-            else:
-                _run_prompt_submit(rid, sid, session, text)
-            complete_event_delivery(evt, _claim)
-        except Exception as exc:
-            release_event_delivery(evt, _claim)
-            print(
-                f"[tui_gateway] notification poller dispatch failed: "
-                f"{type(exc).__name__}: {exc}",
-                file=sys.stderr,
-            )
-            with session["history_lock"]:
-                session["running"] = False
-
-    # Hand any other sessions' events back to the shared queue.
-    for evt in deferred:
-        process_registry.completion_queue.put(evt)
-
 
 def _async_delegation_display_metadata(evt: dict) -> dict:
     """Build display-only metadata before the completion event is formatted."""
@@ -9329,10 +9252,27 @@ def _start_notification_poller(sid: str, session: dict) -> threading.Event:
     t = threading.Thread(
         target=_notification_poller_loop,
         args=(stop, sid, session),
+        name=f"tui-notification-{sid}",
         daemon=True,
     )
+    session["_notif_stop"] = stop
+    session["_notif_thread"] = t
     t.start()
     return stop
+
+
+def _stop_notification_poller(session: dict, *, timeout: float = 1.0) -> None:
+    """Stop one session's poller and wait briefly for its queue read to exit."""
+    stop_event = session.get("_notif_stop")
+    if stop_event is not None:
+        stop_event.set()
+    thread = session.get("_notif_thread")
+    if (
+        thread is not None
+        and thread is not threading.current_thread()
+        and hasattr(thread, "join")
+    ):
+        thread.join(timeout=timeout)
 
 
 def _run_prompt_submit(
