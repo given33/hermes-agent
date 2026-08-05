@@ -12,6 +12,14 @@ repository_url="${HERMES_FABRIC_REPOSITORY:-https://github.com/given33/hermes-ag
   || die "repository URL is not approved"
 cloud_url="${HERMES_CLOUD_URL:-https://daxueshenmai.top/api/plugins/collaboration}"
 case "${cloud_url}" in https://daxueshenmai.top/api/plugins/collaboration) ;; *) die "cloud URL is not approved" ;; esac
+git_network_timeout="${HERMES_FABRIC_GIT_TIMEOUT_SECONDS:-90}"
+[[ "${git_network_timeout}" =~ ^[1-9][0-9]*$ ]] \
+  || die "Git timeout must be a positive integer"
+command -v timeout >/dev/null 2>&1 || die "timeout command is missing"
+run_network_git() {
+  GIT_TERMINAL_PROMPT=0 timeout --signal=TERM --kill-after=10s \
+    "${git_network_timeout}s" git "$@"
+}
 
 state_root="${HERMES_FABRIC_STATE_ROOT:-/var/lib/hermes-agent-fabric-update/${role}}"
 allow_test_paths="${HERMES_FABRIC_ALLOW_TEST_PATHS:-0}"
@@ -223,12 +231,12 @@ fi
 if [[ ! -d "${mirror}" ]]; then
   temporary_mirror="${state_root}/repository.git.new.$$"
   rm -rf -- "${temporary_mirror}"
-  git clone --mirror -- "${repository_url}" "${temporary_mirror}"
+  run_network_git clone --mirror -- "${repository_url}" "${temporary_mirror}"
   mv -f -- "${temporary_mirror}" "${mirror}"
 fi
 [[ -d "${mirror}" && ! -L "${mirror}" ]] || die "repository mirror is unsafe"
 git --git-dir="${mirror}" remote set-url origin "${repository_url}"
-if ! git --git-dir="${mirror}" fetch --force --prune origin \
+if ! run_network_git --git-dir="${mirror}" fetch --force --prune origin \
   "+refs/heads/main:refs/remotes/origin/main"; then
   # A transient GitHub outage must not strand a node when the public release
   # is already present in its last verified mirror. Continue only for that

@@ -246,6 +246,12 @@ def test_three_endpoint_updates_follow_only_a_committed_main_release():
     )
     assert "Persistent=true" in timer
     assert "ProtectSystem=strict" in service
+    assert "TimeoutStartSec=5min" in service
+    assert "TimeoutStopSec=30s" in service
+    assert "KillMode=control-group" in service
+    assert 'git_network_timeout="${HERMES_FABRIC_GIT_TIMEOUT_SECONDS:-90}"' in updater
+    assert "run_network_git clone --mirror" in updater
+    assert 'run_network_git --git-dir="${mirror}" fetch' in updater
     assert "/var/lib/systemd/linger" in service
     assert "/etc/systemd/system" in service
     assert "/usr/local/lib/hermes-agent" in service
@@ -1090,6 +1096,25 @@ def test_public_installer_bounds_fabric_checks_and_bypasses_proxy_for_loopback()
     assert installer.count("--noproxy '*'") >= 7
     assert 'attempts="${HERMES_FABRIC_VERIFY_ATTEMPTS:-60}"' in verifier
     assert "--noproxy '*'" in verifier
+
+
+def test_public_deployer_keeps_desired_fabric_release_and_retries_transaction():
+    installer = (PUBLIC / "install-collaboration-backend.sh").read_text(
+        encoding="utf-8"
+    )
+    deployer = (PUBLIC / "deploy-collaboration-backend.sh").read_text(
+        encoding="utf-8"
+    )
+
+    assert "fabric_release_published=0" in installer
+    assert "fabric_release_published=1" in installer
+    assert 'if [[ "${fabric_release_published}" == 0 ]]; then' in installer
+    assert "fabric recovery remains pending" in installer
+    assert '[[ "${installed}" != 1 && "${fabric_release_published}" == 1 ]]' in installer
+    assert "exit_code=75" in installer
+    assert 'recovery_attempts="${HERMES_PUBLIC_FABRIC_RECOVERY_ATTEMPTS:-2}"' in deployer
+    assert 'installer_status}" != 75' in deployer
+    assert "fabric convergence is pending; retrying public transaction" in deployer
 
 
 def test_public_installer_uses_effective_systemd_hermes_home_before_env_fallback():

@@ -1152,6 +1152,7 @@ fi
 # be misreported as a failed restore and leave ${service} stopped.
 mutated=0
 nginx_reload_attempted=0
+fabric_release_published=0
 rollback() {
   local exit_code=$?
   local rollback_failed=0
@@ -1223,7 +1224,15 @@ rollback() {
       rollback_step tui-gateway restore_one "${backup}/tui_gateway/server.py" "${tui_gateway_target}"
       rollback_step nginx-security restore_root_file "${backup}/nginx/00-hermes-security.conf" "${nginx_security_target}"
       rollback_step nginx-site restore_root_file "${backup}/nginx/daxueshenmai.top.conf" "${nginx_site_target}"
-      rollback_step release-evidence restore_root_file "${backup}/release/release-evidence.json" "${release_evidence_target}"
+      if [[ "${fabric_release_published}" == 0 ]]; then
+        rollback_step release-evidence restore_root_file "${backup}/release/release-evidence.json" "${release_evidence_target}"
+      else
+        # Candidate health and the traffic switch already passed. Keep this
+        # immutable desired-release identity while restoring public traffic,
+        # so pull-based fabric nodes can converge after a transient outage.
+        printf 'fabric recovery remains pending for release %s\n' \
+          "${release_commit}" >&2
+      fi
       for relative in "${runtime_service_assets[@]}"; do
         rollback_step "${relative}" restore_one "${backup}/${relative}" "${target_root}/${relative}"
       done
@@ -1281,6 +1290,12 @@ rollback() {
       printf '%s\n' "rollback incomplete; ${service} remains stopped" >&2
     fi
     exit_code=70
+  elif [[ "${installed}" != 1 && "${fabric_release_published}" == 1 ]]; then
+    # The public service is healthy on its previous version, and the desired
+    # release pointer remains available to the pull-based fabric. Tell the
+    # outer deployer to retry the transaction after nodes have had time to
+    # consume it.
+    exit_code=75
   fi
   exit "${exit_code}"
 }
@@ -1788,6 +1803,7 @@ PY
 install -o root -g root -m 0644 \
   "${release_evidence_temp}" "${release_evidence_target}.new.$$"
 mv -f -- "${release_evidence_target}.new.$$" "${release_evidence_target}"
+fabric_release_published=1
 rm -f -- "${release_evidence_temp}"
 release_evidence_temp=""
 installation_health_cfg="$(mktemp /run/hermes-installation-route-health.XXXXXX)"

@@ -428,4 +428,21 @@ scp "${ssh_args[@]}" \
   "${remote}:${stage}/deploy/recovery/"
 scp "${ssh_args[@]}" "${installer}" "${remote}:${stage}/install-collaboration-backend.sh"
 ssh "${ssh_args[@]}" "${remote}" "chmod 0700 '${stage}/deploy/recovery/configure-main-managed-installation-ssh.sh'; sudo -n /bin/bash '${stage}/deploy/recovery/configure-main-managed-installation-ssh.sh'"
-ssh "${ssh_args[@]}" "${remote}" "chmod 0700 '${stage}/install-collaboration-backend.sh'; sudo -n /bin/bash '${stage}/install-collaboration-backend.sh' '${version}' '${stage}' '${release_commit}'"
+recovery_attempts="${HERMES_PUBLIC_FABRIC_RECOVERY_ATTEMPTS:-2}"
+[[ "${recovery_attempts}" =~ ^[1-9][0-9]*$ ]] \
+  || die "HERMES_PUBLIC_FABRIC_RECOVERY_ATTEMPTS must be a positive integer"
+for attempt in $(seq 1 "${recovery_attempts}"); do
+  installer_status=0
+  if ssh "${ssh_args[@]}" "${remote}" \
+      "chmod 0700 '${stage}/install-collaboration-backend.sh'; sudo -n /bin/bash '${stage}/install-collaboration-backend.sh' '${version}' '${stage}' '${release_commit}'"; then
+    break
+  else
+    installer_status=$?
+  fi
+  if [[ "${installer_status}" != 75 || "${attempt}" == "${recovery_attempts}" ]]; then
+    exit "${installer_status}"
+  fi
+  printf 'fabric convergence is pending; retrying public transaction (%s/%s)\n' \
+    "$((attempt + 1))" "${recovery_attempts}" >&2
+  sleep 30
+done
