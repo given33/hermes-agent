@@ -688,6 +688,30 @@ stamp="$(date +%Y%m%d-%H%M%S)-$$"
 backup_root="${HERMES_BACKUP_ROOT:-/var/backups/hermes-agent}"
 install -d -o root -g root -m 0700 "${backup_root}"
 
+# The install lock is already held, so candidate/rollback directories from an
+# earlier process are necessarily stale. They are complete virtual-environment
+# copies and can otherwise exhaust the host before SQLite records the release.
+reclaim_stale_runtime_artifacts() {
+  local artifact
+  while IFS= read -r -d '' artifact; do
+    case "${artifact}" in
+      "${target_root}"/.venv.candidate.*|\
+      "${target_root}"/.venv.failed.*|\
+      "${target_root}"/.venv.rollback-*|\
+      "${target_root}"/.collaboration-install.*) ;;
+      *) die "refusing to reclaim unexpected runtime artifact: ${artifact}" ;;
+    esac
+    [[ -d "${artifact}" && ! -L "${artifact}" ]] \
+      || die "stale runtime artifact is unsafe: ${artifact}"
+    rm -rf -- "${artifact}"
+  done < <(
+    find "${target_root}" -mindepth 1 -maxdepth 1 -type d \
+      \( -name '.venv.candidate.*' -o -name '.venv.failed.*' \
+         -o -name '.venv.rollback-*' -o -name '.collaboration-install.*' \) \
+      -print0
+  )
+}
+
 # A full runtime filesystem prevents SQLite from opening WAL databases even
 # when the release stage itself fits on tmpfs. Reclaim only bounded, known
 # deployment artifacts before taking the rollback snapshot. This is deliberately
@@ -696,9 +720,38 @@ reclaim_runtime_disk_pressure() {
   local mount_path="$1"
   local backups_root="$2"
   local minimum_kib="${HERMES_DEPLOY_MIN_FREE_KIB:-65536}"
+  local headroom_kib="${HERMES_DEPLOY_VENV_HEADROOM_KIB:-131072}"
   local retention="${HERMES_BACKUP_RETENTION:-3}"
   [[ "${minimum_kib}" =~ ^[0-9]+$ ]] || die "HERMES_DEPLOY_MIN_FREE_KIB must be an integer"
+  [[ "${headroom_kib}" =~ ^[0-9]+$ ]] || die "HERMES_DEPLOY_VENV_HEADROOM_KIB must be an integer"
   [[ "${retention}" =~ ^[1-9][0-9]*$ ]] || die "HERMES_BACKUP_RETENTION must be a positive integer"
+
+  local runtime_venv_kib required_kib
+  if [[ -d "${target_root}/.venv" && ! -L "${target_root}/.venv" ]]; then
+    runtime_venv_kib="$(du -sk -- "${target_root}/.venv" | awk '{print $1}')"
+    [[ "${runtime_venv_kib}" =~ ^[0-9]+$ ]] \
+      || die "could not determine the runtime virtual-environment size"
+    required_kib=$(( runtime_venv_kib + headroom_kib ))
+    if (( required_kib > minimum_kib )); then
+      minimum_kib="${required_kib}"
+    fi
+  fi
+
+  local -a old_backups=()
+  mapfile -d '' -t old_backups < <(
+    find "${backups_root}" -mindepth 1 -maxdepth 1 -type d \
+      -name 'collaboration-*' -printf '%T@\t%p\0' \
+      | sort -z -n \
+      | cut -z -f2-
+  )
+  local keep_before_current=$(( retention - 1 ))
+  local removable_count=$(( ${#old_backups[@]} - keep_before_current ))
+  if (( removable_count > 0 )); then
+    local index
+    for (( index = 0; index < removable_count; index++ )); do
+      rm -rf -- "${old_backups[index]}"
+    done
+  fi
 
   local available_kib
   available_kib="$(df -Pk -- "${mount_path}" | awk 'NR == 2 {print $4}')"
@@ -708,29 +761,17 @@ reclaim_runtime_disk_pressure() {
   fi
 
   printf '%s\n' "runtime filesystem has ${available_kib} KiB free; reclaiming stale deployment artifacts" >&2
-  local -a old_backups=()
-  mapfile -d '' -t old_backups < <(
-    find "${backups_root}" -mindepth 1 -maxdepth 1 -type d \
-      -name 'collaboration-*' -printf '%T@\t%p\0' \
-      | sort -z -n \
-      | cut -z -f2-
-  )
-  local removable_count=$(( ${#old_backups[@]} - retention ))
-  if (( removable_count > 0 )); then
-    local index
-    for (( index = 0; index < removable_count; index++ )); do
-      rm -rf -- "${old_backups[index]}"
-    done
-  fi
-
   if command -v journalctl >/dev/null 2>&1; then
     journalctl --vacuum-size="${HERMES_DEPLOY_JOURNAL_VACUUM_SIZE:-256M}" >/dev/null 2>&1 || true
   fi
   available_kib="$(df -Pk -- "${mount_path}" | awk 'NR == 2 {print $4}')"
   [[ "${available_kib}" =~ ^[0-9]+$ ]] || die "could not recheck free space for ${mount_path}"
   printf '%s\n' "runtime filesystem has ${available_kib} KiB free after bounded reclaim" >&2
+  (( available_kib >= minimum_kib )) \
+    || die "runtime filesystem requires ${minimum_kib} KiB free for the transactional dependency candidate"
 }
 
+reclaim_stale_runtime_artifacts
 reclaim_runtime_disk_pressure "${runtime_home}" "${backup_root}"
 backup="$(mktemp -d "${backup_root}/collaboration-${version}-${stamp}.XXXXXX")"
 chown root:root "${backup}"
@@ -1837,6 +1878,12 @@ mv -f -- "${release_evidence_target}.new.$$" "${release_evidence_target}"
 rm -f -- "${release_evidence_temp}"
 release_evidence_temp=""
 installed=1
+if [[ "${venv_swapped}" == 1 && -n "${previous_venv}" ]]; then
+  rm -rf -- "${previous_venv}" || \
+    printf 'warning: committed release could not remove old runtime environment: %s\n' \
+      "${previous_venv}" >&2
+  previous_venv=""
+fi
 rm -rf -- "${transaction}" "${health_file}" "${handshake_file}" \
   "${ios_health_file}" "${connector_health_file}" "${deployment_health_file}" \
   "${curl_cfg}"

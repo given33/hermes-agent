@@ -570,9 +570,17 @@ def test_public_installer_reclaims_only_bounded_deployment_artifacts_on_disk_pre
     public = (PUBLIC / "install-collaboration-backend.sh").read_text(encoding="utf-8")
 
     assert "reclaim_runtime_disk_pressure()" in public
+    assert "reclaim_stale_runtime_artifacts()" in public
     assert "HERMES_DEPLOY_MIN_FREE_KIB" in public
+    assert "HERMES_DEPLOY_VENV_HEADROOM_KIB" in public
     assert "HERMES_BACKUP_RETENTION" in public
     assert "-name 'collaboration-*'" in public
+    assert "-name '.venv.candidate.*'" in public
+    assert "-name '.venv.failed.*'" in public
+    assert "-name '.venv.rollback-*'" in public
+    assert "-name '.collaboration-install.*'" in public
+    assert 'du -sk -- "${target_root}/.venv"' in public
+    assert 'rm -rf -- "${previous_venv}"' in public
     assert "journalctl --vacuum-size" in public
     assert 'business databases and runtime objects are never deleted' in public
 

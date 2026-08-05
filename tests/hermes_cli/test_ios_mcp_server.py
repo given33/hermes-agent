@@ -426,6 +426,40 @@ def test_each_mcp_has_scoped_manifest_and_supervisor_registration(tmp_path):
     assert {item["name"] for item in result["services"]} == set(CAPABILITIES)
 
 
+def test_supervisor_registration_reuses_installed_manifests(
+    monkeypatch,
+    tmp_path,
+):
+    from hermes_cli import config as config_module
+    from hermes_cli import ios_mcp_server as server_module
+    from hermes_cli.ios_mcp_supervisor import register_default_mcp_services
+
+    configs = ios_mcp_server_configs(
+        "python",
+        transport="stdio",
+    )
+    configs["ios-notes"]["enabled"] = False
+    monkeypatch.setattr(
+        config_module,
+        "read_raw_config",
+        lambda: {"mcp_servers": configs},
+    )
+    monkeypatch.setattr(
+        server_module,
+        "ios_mcp_manifests",
+        lambda **_kwargs: (_ for _ in ()).throw(
+            AssertionError("installed manifests should avoid rebuilding FastMCP")
+        ),
+    )
+
+    result = register_default_mcp_services(tmp_path / "supervisor.db")
+
+    assert result["count"] == len(CAPABILITIES)
+    statuses = {item["name"]: item for item in result["services"]}
+    assert statuses["ios-notes"]["state"] == "DISABLED"
+    assert statuses["ios-location"]["metadata"]["tool_definitions"]
+
+
 def test_ios_mcp_manifests_reject_removed_sse_transport():
     with pytest.raises(ValueError, match="stdio.*streamable-http"):
         ios_mcp_manifests(transport="sse")

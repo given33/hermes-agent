@@ -10,8 +10,16 @@ umask 077
 here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 repo="$(cd "${here}/../.." && pwd)"
 installer="${here}/install-collaboration-backend.sh"
-runtime_python="${repo}/venv/bin/python"
-[[ -x "${runtime_python}" ]] || runtime_python="$(command -v python3)"
+runtime_python="${HERMES_TEST_RUNTIME_PYTHON:-${repo}/venv/bin/python}"
+if [[ -n "${HERMES_TEST_RUNTIME_PYTHON:-}" ]]; then
+  [[ -x "${runtime_python}" ]] || {
+    printf 'HERMES_TEST_RUNTIME_PYTHON is not executable: %s\n' \
+      "${runtime_python}" >&2
+    exit 1
+  }
+elif [[ ! -x "${runtime_python}" ]]; then
+  runtime_python="$(command -v python3)"
+fi
 version="$(python3 - "${repo}/plugins/collaboration/dashboard/manifest.json" <<'PY'
 import json, sys
 print(json.load(open(sys.argv[1], encoding="utf-8"))["version"])
@@ -201,6 +209,13 @@ nginx_security_target="${nginx_dir}/00-hermes-security.conf"
 nginx_site_target="${nginx_dir}/daxueshenmai.top.conf"
 install -d -m 0700 \
   "${stage}" "${target}" "${backup}" "${fake_bin}" "${nginx_dir}" "${runtime_home}"
+stale_runtime_artifacts=(
+  "${target}/.venv.candidate.stale"
+  "${target}/.venv.failed.stale"
+  "${target}/.venv.rollback-stale"
+  "${target}/.collaboration-install.stale"
+)
+install -d -m 0700 "${stale_runtime_artifacts[@]}"
 install -d -m 0700 "$(dirname "${state_file}")"
 printf '%s' "connector-test-token" >"${token_file}"
 printf '%s\n' "status-test-token-00000000000000000001" >"${status_token_file}"
@@ -631,6 +646,12 @@ if grep -Fq "super-secret-diagnostic-token-value" "${work}/failure.stderr"; then
   exit 1
 fi
 grep -Fq -- "--unit hermes-agent-test.service" "${work}/journalctl.log"
+for artifact in "${stale_runtime_artifacts[@]}"; do
+  [[ ! -e "${artifact}" && ! -L "${artifact}" ]] || {
+    printf 'stale runtime artifact was not reclaimed: %s\n' "${artifact}" >&2
+    exit 1
+  }
+done
 for relative in "${runtime_files[@]}"; do
   [[ "$(<"${target}/${relative}")" == "old:${relative}" ]] || {
     printf 'rollback mismatch: %s\n' "${relative}" >&2

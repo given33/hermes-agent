@@ -2240,20 +2240,60 @@ def register_default_mcp_services(
 ) -> dict[str, Any]:
     """Register the complete isolated iOS MCP fleet in the durable supervisor."""
 
-    from hermes_cli.ios_mcp_server import ios_mcp_manifests
+    from hermes_cli.ios_mcp_server import CAPABILITIES, MCP_VERSION, ios_mcp_manifests
 
     supervisor = IOSMCPSupervisor(db_path)
-    manifests = ios_mcp_manifests(
-        transport=transport,
-        host=host,
-        base_port=base_port,
-    )
+    manifests: dict[str, dict[str, Any]] = {}
+    enabled: dict[str, bool] = {}
+    try:
+        from hermes_cli.config import read_raw_config
+
+        configured = read_raw_config().get("mcp_servers") or {}
+    except Exception:
+        configured = {}
+    if isinstance(configured, Mapping):
+        for index, name in enumerate(CAPABILITIES):
+            entry = configured.get(name)
+            manifest = entry.get("manifest") if isinstance(entry, Mapping) else None
+            expected_endpoint = (
+                f"http://{host}:{base_port + index}/mcp"
+                if transport == "streamable-http"
+                else f"stdio://hermes/{name}"
+            )
+            definitions = (
+                manifest.get("tool_definitions")
+                if isinstance(manifest, Mapping)
+                else None
+            )
+            if (
+                not isinstance(entry, Mapping)
+                or not isinstance(manifest, Mapping)
+                or manifest.get("name") != name
+                or manifest.get("version") != MCP_VERSION
+                or manifest.get("transport") != transport
+                or manifest.get("endpoint") != expected_endpoint
+                or not isinstance(definitions, list)
+                or not definitions
+                or not isinstance(manifest.get("tool_scopes"), Mapping)
+            ):
+                manifests = {}
+                enabled = {}
+                break
+            manifests[name] = dict(manifest)
+            enabled[name] = bool(entry.get("enabled", True))
+    if set(manifests) != set(CAPABILITIES):
+        manifests = ios_mcp_manifests(
+            transport=transport,
+            host=host,
+            base_port=base_port,
+        )
+        enabled = {name: True for name in manifests}
     statuses = [
         supervisor.register(
             name,
             version=version,
             metadata=manifest,
-            enabled=True,
+            enabled=enabled[name],
         )
         for name, manifest in manifests.items()
     ]
@@ -2289,7 +2329,10 @@ def main(argv: list[str] | None = None) -> int:
             host=args.host,
             base_port=args.base_port,
         )
-        print(_json(result))
+        print(_json({
+            "count": result["count"],
+            "db_path": result["db_path"],
+        }))
         return 0
     supervisor = IOSMCPSupervisor(args.db)
     print(_json({"services": supervisor.statuses()}))
