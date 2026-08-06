@@ -673,7 +673,17 @@ def prewarm_hosted_gateway(
     requested_session_id: str = "",
     extra_env: Optional[dict[str, str]] = None,
 ) -> None:
-    """Start the official gateway and schedule its full Agent build off-path."""
+    """Start the official gateway and build its Agent off the request path.
+
+    ``session.create`` is intentionally lazy in Hermes 0.20: it returns the
+    session id before the Agent (and its tool registry) is ready.  That is the
+    right behavior for an idle session, but if we stop here the first user
+    prompt pays the entire cold Agent build.  The dashboard calls this helper
+    while the conversation is being opened/typed, so wait briefly for the
+    already-scheduled build in this background thread.  The wait never blocks
+    the API request and does not eagerly start MCP children; those remain
+    lazy until a tool is actually invoked.
+    """
 
     gateway = _gateway_for(
         runtime_home=runtime_home,
@@ -695,6 +705,11 @@ def prewarm_hosted_gateway(
             "account_generation": account_generation,
         },
     )
+    # A bounded wait lets the prewarm overlap the user's typing without
+    # turning a slow/unavailable model into a blocked request.  The prompt
+    # path still waits for readiness when necessary, so this is only a latency
+    # optimization for cold starts.
+    gateway.wait_until_warm(conversation_id, timeout=8.0)
 
 
 def run_hosted_gateway_turn(
