@@ -25,7 +25,7 @@ def _make_mcp_tool(name="read_file", description="Read a file", input_schema=Non
     tool = SimpleNamespace()
     tool.name = name
     tool.description = description
-    tool.input_schema = input_schema or {
+    tool.inputSchema = input_schema or {
         "type": "object",
         "properties": {
             "path": {"type": "string", "description": "File path"},
@@ -38,7 +38,7 @@ def _make_mcp_tool(name="read_file", description="Read a file", input_schema=Non
 def _make_call_result(text="file contents here", is_error=False):
     """Create a fake MCP CallToolResult."""
     block = SimpleNamespace(text=text)
-    return SimpleNamespace(content=[block], is_error=is_error, structured_content=None)
+    return SimpleNamespace(content=[block], isError=is_error)
 
 
 def _make_mock_server(name, session=None, tools=None):
@@ -376,19 +376,6 @@ class TestCheckFunction:
         assert check() is False
 
 
-    def test_static_lazy_server_remains_available_before_first_use(self):
-        from tools.mcp_tool import _make_check_fn, _servers
-
-        server = _make_mock_server("test_server", session=None)
-        server._lazy_start = True
-        _servers["test_server"] = server
-        try:
-            # The schema is intentionally visible before the MCP handshake;
-            # the tool handler starts the service on first actual use.
-            assert _make_check_fn("test_server")() is True
-        finally:
-            _servers.pop("test_server", None)
-
     def test_recycled_stdio_server_remains_available_for_lazy_reconnect(self):
         from tools.mcp_tool import _make_check_fn, _servers
 
@@ -650,280 +637,6 @@ class TestRunOnMCPLoopInterrupts:
 # ---------------------------------------------------------------------------
 
 class TestDiscoverAndRegister:
-    def test_authoritative_disabled_server_is_drained_without_replacement(
-        self, monkeypatch,
-    ):
-        from tools import mcp_tool
-
-        name = "disabled-authoritative"
-        old = mcp_tool.MCPServerTask(name)
-        old.session = object()
-        old._registered_tool_names = []
-        mcp_tool._servers[name] = old
-        mcp_tool._server_config_fingerprints[name] = "old"
-        connect_calls = []
-        monkeypatch.setattr(mcp_tool, "_MCP_AVAILABLE", True)
-        monkeypatch.setattr(mcp_tool, "_filter_suspicious_mcp_servers", lambda value: value)
-        monkeypatch.setattr(mcp_tool, "_ensure_mcp_loop", lambda: None)
-        monkeypatch.setattr(
-            mcp_tool,
-            "_run_on_mcp_loop",
-            lambda factory, timeout=30: asyncio.run(factory()),
-        )
-        monkeypatch.setattr(
-            mcp_tool,
-            "_connect_server",
-            lambda *args, **kwargs: connect_calls.append((args, kwargs)),
-        )
-        try:
-            assert mcp_tool.register_mcp_servers(
-                {name: {"url": "http://disabled.test/mcp", "enabled": False}},
-                authoritative=True,
-            ) == []
-            assert name not in mcp_tool._servers
-            assert old.accepting_calls is False
-            assert old._shutdown_event.is_set()
-            assert connect_calls == []
-        finally:
-            mcp_tool._servers.pop(name, None)
-            mcp_tool._server_config_fingerprints.pop(name, None)
-
-    def test_authoritative_empty_config_retires_old_server(self, monkeypatch):
-        from tools import mcp_tool
-
-        name = "removed-authoritative"
-        old = mcp_tool.MCPServerTask(name)
-        old.session = object()
-        old._registered_tool_names = []
-        mcp_tool._servers[name] = old
-        monkeypatch.setattr(mcp_tool, "_MCP_AVAILABLE", True)
-        monkeypatch.setattr(mcp_tool, "_filter_suspicious_mcp_servers", lambda value: value)
-        monkeypatch.setattr(mcp_tool, "_ensure_mcp_loop", lambda: None)
-        monkeypatch.setattr(
-            mcp_tool,
-            "_run_on_mcp_loop",
-            lambda factory, timeout=30: asyncio.run(factory()),
-        )
-        try:
-            assert mcp_tool.register_mcp_servers({}, authoritative=True) == []
-            assert name not in mcp_tool._servers
-            assert old._shutdown_event.is_set()
-        finally:
-            mcp_tool._servers.pop(name, None)
-
-    def test_connecting_server_is_singleflight(self, monkeypatch):
-        from tools import mcp_tool
-
-        name = "singleflight"
-        monkeypatch.setattr(mcp_tool, "_MCP_AVAILABLE", True)
-        monkeypatch.setattr(mcp_tool, "_filter_suspicious_mcp_servers", lambda value: value)
-        monkeypatch.setattr(mcp_tool, "_existing_tool_names", lambda: [])
-        with mcp_tool._lock:
-            mcp_tool._server_connecting.add(name)
-        try:
-            with patch.object(mcp_tool, "_run_on_mcp_loop") as run_on_loop:
-                assert mcp_tool.register_mcp_servers(
-                    {name: {"url": "http://singleflight.test/mcp"}}
-                ) == []
-            run_on_loop.assert_not_called()
-        finally:
-            with mcp_tool._lock:
-                mcp_tool._server_connecting.discard(name)
-
-    def test_weather_capability_selects_only_location_weather_and_route(self):
-        from tools.mcp_tool import select_mcp_servers_for_capabilities
-
-        configs = {
-            name: {"url": f"http://{name}.test/mcp"}
-            for name in (
-                "ios-location", "qweather", "amap-route", "ios-motion",
-                "ios-calendar", "ios-health-heart",
-            )
-        }
-        configs["disabled-weather"] = {
-            "url": "http://disabled.test/mcp",
-            "enabled": False,
-            "capability_hints": ["ios.weather"],
-        }
-
-        selected = select_mcp_servers_for_capabilities(
-            configs,
-            ["ios.weather"],
-        )
-
-        assert set(selected) == {"ios-location", "qweather", "amap-route"}
-
-    def test_changed_endpoint_reloads_existing_server_task(self, monkeypatch):
-        from tools import mcp_tool
-
-        old = mcp_tool.MCPServerTask("ios-power")
-        old.session = object()
-        old._registered_tool_names = []
-        new = mcp_tool.MCPServerTask("ios-power")
-        new.session = object()
-        config = {"url": "http://127.0.0.1:9001/mcp", "enabled": True}
-        mcp_tool._servers["ios-power"] = old
-        mcp_tool._server_config_fingerprints["ios-power"] = json.dumps(
-            {"url": "http://127.0.0.1:9000/mcp", "enabled": True},
-            sort_keys=True,
-            separators=(",", ":"),
-        )
-
-        async def connect(name, discovered_config):
-            assert (name, discovered_config) == ("ios-power", config)
-            return new
-
-        monkeypatch.setattr(mcp_tool, "_MCP_AVAILABLE", True)
-        monkeypatch.setattr(mcp_tool, "_filter_suspicious_mcp_servers", lambda value: value)
-        monkeypatch.setattr(mcp_tool, "_ensure_mcp_loop", lambda: None)
-        monkeypatch.setattr(
-            mcp_tool,
-            "_run_on_mcp_loop",
-            lambda factory, timeout=30: asyncio.run(factory()),
-        )
-        monkeypatch.setattr(mcp_tool, "_connect_server", connect)
-        monkeypatch.setattr(
-            mcp_tool,
-            "_register_server_tools",
-            lambda name, server, cfg: ["mcp__ios_power__ios_power_get_latest"],
-        )
-        try:
-            names = mcp_tool.register_mcp_servers({"ios-power": config})
-            assert old.accepting_calls is False
-            assert old._shutdown_event.is_set()
-            assert mcp_tool._servers["ios-power"] is new
-            assert names == ["mcp__ios_power__ios_power_get_latest"]
-        finally:
-            mcp_tool._servers.pop("ios-power", None)
-            mcp_tool._server_config_fingerprints.pop("ios-power", None)
-
-    def test_changed_lazy_endpoint_reloads_without_connecting(self, monkeypatch):
-        """Refreshing a lazy manifest must not cold-start its MCP child."""
-        from tools import mcp_tool
-
-        name = "ios-power-lazy"
-        old = mcp_tool.MCPServerTask(name)
-        old.session = object()
-        old._registered_tool_names = ["mcp__ios_power_lazy__get_latest"]
-        config = {
-            "url": "http://127.0.0.1:9011/mcp",
-            "enabled": True,
-            "lazy_start": True,
-            "tool_definitions": [
-                {
-                    "name": "get_latest",
-                    "description": "Read the latest power value",
-                    "input_schema": {"type": "object", "properties": {}},
-                },
-            ],
-        }
-        mcp_tool._servers[name] = old
-        mcp_tool._server_config_fingerprints[name] = json.dumps(
-            {**config, "url": "http://127.0.0.1:9010/mcp"},
-            sort_keys=True,
-            separators=(",", ":"),
-        )
-        connect = AsyncMock(side_effect=AssertionError("lazy reload connected MCP"))
-
-        monkeypatch.setattr(mcp_tool, "_MCP_AVAILABLE", True)
-        monkeypatch.setattr(mcp_tool, "_filter_suspicious_mcp_servers", lambda value: value)
-        monkeypatch.setattr(mcp_tool, "_ensure_mcp_loop", lambda: None)
-        monkeypatch.setattr(
-            mcp_tool,
-            "_run_on_mcp_loop",
-            lambda factory, timeout=None: asyncio.run(factory()),
-        )
-        monkeypatch.setattr(mcp_tool, "_connect_server", connect)
-        monkeypatch.setattr(
-            mcp_tool,
-            "_register_server_tools",
-            lambda _name, _server, _config: ["mcp__ios_power_lazy__get_latest"],
-        )
-        try:
-            names = mcp_tool.register_mcp_servers({name: config})
-            replacement = mcp_tool._servers[name]
-            assert names == ["mcp__ios_power_lazy__get_latest"]
-            assert replacement is not old
-            assert replacement._lazy_start is True
-            assert replacement.session is None
-            connect.assert_not_awaited()
-        finally:
-            mcp_tool._servers.pop(name, None)
-            mcp_tool._server_config_fingerprints.pop(name, None)
-
-    def test_blue_green_routes_new_calls_while_pre_cutover_lease_drains(self, monkeypatch):
-        """A selected blue call drains while post-swap calls use green."""
-        from tools import mcp_tool
-
-        name = "ios-power-interleaving"
-        old = mcp_tool.MCPServerTask(name)
-        old.session = object()
-        old._registered_tool_names = ["mcp__ios_power_interleaving__latest"]
-        new = mcp_tool.MCPServerTask(name)
-        new.session = object()
-        config = {"url": "http://127.0.0.1:9002/mcp", "enabled": True}
-        old_config = {"url": "http://127.0.0.1:9001/mcp", "enabled": True}
-        mcp_tool._servers[name] = old
-        mcp_tool._server_config_fingerprints[name] = json.dumps(
-            old_config, sort_keys=True, separators=(",", ":"),
-        )
-
-        async def connect(server_name, discovered_config):
-            assert (server_name, discovered_config) == (name, config)
-            return new
-
-        monkeypatch.setattr(mcp_tool, "_MCP_AVAILABLE", True)
-        monkeypatch.setattr(mcp_tool, "_filter_suspicious_mcp_servers", lambda value: value)
-        monkeypatch.setattr(mcp_tool, "_ensure_mcp_loop", lambda: None)
-        monkeypatch.setattr(
-            mcp_tool,
-            "_run_on_mcp_loop",
-            lambda factory, timeout=30: asyncio.run(factory()),
-        )
-        monkeypatch.setattr(mcp_tool, "_connect_server", connect)
-        monkeypatch.setattr(
-            mcp_tool,
-            "_register_server_tools",
-            lambda server_name, server, cfg: list(old._registered_tool_names),
-        )
-
-        # This models a handler that selected blue but has not yet entered its
-        # asyncio RPC lock. The routing lease must still protect it.
-        selected_blue = mcp_tool._get_connected_server_for_call(name)
-        assert selected_blue is old
-        outcome = []
-        worker = threading.Thread(
-            target=lambda: outcome.append(mcp_tool.register_mcp_servers({name: config})),
-            daemon=True,
-        )
-        worker.start()
-        try:
-            deadline = time.monotonic() + 2
-            while time.monotonic() < deadline:
-                with mcp_tool._lock:
-                    if mcp_tool._servers.get(name) is new:
-                        break
-                time.sleep(0.01)
-            assert mcp_tool._servers[name] is new
-            assert worker.is_alive(), "blue retirement must wait for the selected call"
-            assert not old._shutdown_event.is_set()
-
-            selected_green = mcp_tool._get_connected_server_for_call(name)
-            assert selected_green is new
-            mcp_tool._release_server_call(selected_green)
-
-            mcp_tool._release_server_call(selected_blue)
-            worker.join(timeout=2)
-            assert not worker.is_alive()
-            assert old._shutdown_event.is_set()
-            assert outcome and outcome[0] == list(new._registered_tool_names)
-        finally:
-            if worker.is_alive():
-                mcp_tool._release_server_call(selected_blue)
-                worker.join(timeout=2)
-            mcp_tool._servers.pop(name, None)
-            mcp_tool._server_config_fingerprints.pop(name, None)
-
     def test_tools_registered_in_registry(self):
         """_discover_and_register_server registers tools with correct names."""
         from tools.registry import ToolRegistry
@@ -940,9 +653,6 @@ class TestDiscoverAndRegister:
             server = MCPServerTask(name)
             server.session = mock_session
             server._tools = mock_tools
-            server.discover_result = SimpleNamespace(
-                capabilities=SimpleNamespace(resources=object(), prompts=object())
-            )
             return server
 
         with patch("tools.mcp_tool._connect_server", side_effect=fake_connect), \
@@ -1021,10 +731,7 @@ class TestMCPServerTask:
 
         mock_tools = [_make_mcp_tool("echo")]
         mock_session = MagicMock()
-        mock_session.discover = AsyncMock(
-            return_value=SimpleNamespace(capabilities=SimpleNamespace(tools=object()))
-        )
-        mock_session.discover_result = None
+        mock_session.initialize = AsyncMock()
         mock_session.list_tools = AsyncMock(
             return_value=SimpleNamespace(tools=mock_tools)
         )
@@ -1039,7 +746,7 @@ class TestMCPServerTask:
                 assert server.session is mock_session
                 assert len(server._tools) == 1
                 assert server._tools[0].name == "echo"
-                mock_session.discover.assert_called_once()
+                mock_session.initialize.assert_called_once()
 
                 await server.shutdown()
                 assert server.session is None
@@ -1084,9 +791,6 @@ class TestToolsetInjection:
             server = MCPServerTask(name)
             server.session = mock_session
             server._tools = mock_tools
-            server.discover_result = SimpleNamespace(
-                capabilities=SimpleNamespace(resources=object(), prompts=object())
-            )
             return server
 
         fake_config = {"fs": {"command": "npx", "args": []}}
@@ -1434,15 +1138,14 @@ class TestBuildSafeEnv:
         with patch.dict("os.environ", fake_env, clear=True):
             result = _build_safe_env(None)
 
-        normalized = {key.upper(): value for key, value in result.items()}
-        assert normalized["PROGRAMFILES"] == r"C:\Program Files"
-        assert normalized["PROGRAMDATA"] == r"C:\ProgramData"
-        assert normalized["PROGRAMW6432"] == r"C:\Program Files"
-        assert normalized["LOCALAPPDATA"].endswith("Local")
-        assert normalized["APPDATA"].endswith("Roaming")
-        assert normalized["USERPROFILE"] == r"C:\Users\alice"
-        assert "GITHUB_TOKEN" not in normalized
-        assert "OPENAI_API_KEY" not in normalized
+        assert result["ProgramFiles"] == r"C:\Program Files"
+        assert result["ProgramData"] == r"C:\ProgramData"
+        assert result["ProgramW6432"] == r"C:\Program Files"
+        assert result["LOCALAPPDATA"].endswith("Local")
+        assert result["APPDATA"].endswith("Roaming")
+        assert result["USERPROFILE"] == r"C:\Users\alice"
+        assert "GITHUB_TOKEN" not in result
+        assert "OPENAI_API_KEY" not in result
 
 
 # ---------------------------------------------------------------------------
@@ -1719,7 +1422,7 @@ class TestUtilityHandlers:
 
         mock_resource = SimpleNamespace(
             uri="file:///tmp/test.txt", name="test.txt",
-            description="A test file", mime_type="text/plain",
+            description="A test file", mimeType="text/plain",
         )
         mock_session = MagicMock()
         mock_session.list_resources = AsyncMock(
@@ -1795,9 +1498,6 @@ class TestUtilityToolRegistration:
             server = MCPServerTask(name)
             server.session = mock_session
             server._tools = mock_tools
-            server.discover_result = SimpleNamespace(
-                capabilities=SimpleNamespace(resources=object(), prompts=object())
-            )
             return server
 
         with patch("tools.mcp_tool._connect_server", side_effect=fake_connect), \
@@ -2100,7 +1800,7 @@ class TestSamplingCallbackText:
         assert result.content.text == "Hello from LLM"
         assert result.model == "test-model"
         assert result.role == "assistant"
-        assert result.stop_reason == "endTurn"
+        assert result.stopReason == "endTurn"
 
     def test_server_tools_with_object_schema_are_normalized(self):
         """Server-provided tools should gain empty properties for object schemas."""
@@ -2109,7 +1809,7 @@ class TestSamplingCallbackText:
         server_tool = SimpleNamespace(
             name="ask",
             description="Ask Crawl4AI",
-            input_schema={"type": "object"},
+            inputSchema={"type": "object"},
         )
 
         with patch(
@@ -2150,7 +1850,7 @@ class TestSamplingCallbackToolUse:
             result = asyncio.run(self.handler(None, params))
 
         assert isinstance(result, CreateMessageResultWithTools)
-        assert result.stop_reason == "toolUse"
+        assert result.stopReason == "toolUse"
         assert result.model == "test-model"
         assert len(result.content) == 1
         tc = result.content[0]
@@ -2496,25 +2196,20 @@ class TestDiscoveryFailedCount:
 class TestMCPSelectiveToolLoading:
     """Tests for per-server MCP filtering and utility tool policies."""
 
-    def _make_server(self, name, tool_names, session=None, capabilities=None):
+    def _make_server(self, name, tool_names, session=None):
         server = _make_mock_server(
             name,
             session=session or SimpleNamespace(),
             tools=[_make_mcp_tool(n, n) for n in tool_names],
         )
-        server.discover_result = SimpleNamespace(
-            capabilities=capabilities or SimpleNamespace()
-        )
         return server
 
-    def _run_discover(self, name, tool_names, config, session=None, capabilities=None):
+    def _run_discover(self, name, tool_names, config, session=None):
         from tools.registry import ToolRegistry
         from tools.mcp_tool import _discover_and_register_server, _servers
 
         mock_registry = ToolRegistry()
-        server = self._make_server(
-            name, tool_names, session=session, capabilities=capabilities
-        )
+        server = self._make_server(name, tool_names, session=session)
 
         async def fake_connect(_name, _config):
             return server

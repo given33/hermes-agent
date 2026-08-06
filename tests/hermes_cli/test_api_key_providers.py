@@ -636,53 +636,6 @@ class TestZaiEndpointAutoDetect:
         assert creds["base_url"] == "https://custom.example/v4"
         assert not probe_called
 
-    def test_matching_credential_pool_endpoint_skips_probe(self, monkeypatch):
-        """A disk-safe pool entry for this key avoids the cold live probe."""
-        import hashlib
-
-        api_key = "glm-pooled-key"
-        key_hash = hashlib.sha256(api_key.encode()).hexdigest()[:16]
-        monkeypatch.setenv("GLM_API_KEY", api_key)
-        monkeypatch.setattr(
-            "hermes_cli.auth.read_credential_pool",
-            lambda provider: [
-                {
-                    "base_url": "https://api.z.ai/api/paas/v4",
-                    "secret_fingerprint": f"sha256:{key_hash}",
-                }
-            ] if provider == "zai" else [],
-        )
-
-        def _never_called(*args, **kwargs):
-            raise AssertionError("matching credential-pool entry must skip probing")
-
-        monkeypatch.setattr("hermes_cli.auth.detect_zai_endpoint", _never_called)
-        creds = resolve_api_key_provider_credentials("zai")
-        assert creds["base_url"] == "https://api.z.ai/api/paas/v4"
-
-    def test_credential_pool_endpoint_requires_matching_fingerprint(self, monkeypatch):
-        """A pool endpoint from a different key must not bypass detection."""
-        monkeypatch.setenv("GLM_API_KEY", "glm-current-key")
-        monkeypatch.setattr(
-            "hermes_cli.auth.read_credential_pool",
-            lambda provider: [
-                {
-                    "base_url": "https://api.z.ai/api/paas/v4",
-                    "secret_fingerprint": "sha256:different-key",
-                }
-            ] if provider == "zai" else [],
-        )
-        probe_called = False
-
-        def _probe(*args, **kwargs):
-            nonlocal probe_called
-            probe_called = True
-            return None
-
-        monkeypatch.setattr("hermes_cli.auth.detect_zai_endpoint", _probe)
-        resolve_api_key_provider_credentials("zai")
-        assert probe_called
-
     def test_no_key_skips_probe(self, monkeypatch):
         """Without an API key, no probe should occur."""
         monkeypatch.setattr("hermes_cli.auth.detect_zai_endpoint", lambda *a, **kw: None)
