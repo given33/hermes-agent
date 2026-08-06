@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import sqlite3
+import time
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -139,3 +140,112 @@ def test_supervisor_honors_explicit_database_path_even_when_home_is_full(
     supervisor = IOSMCPSupervisor()
 
     assert supervisor.path == configured
+
+
+def test_fork_process_adapter_forwards_process_lifecycle_methods():
+    from hermes_cli.ios_mcp_supervisor import _ForkProcessAdapter
+
+    class _RawProcess:
+        pid = 4242
+        exitcode = None
+
+        def __init__(self):
+            self.calls = []
+
+        def is_alive(self):
+            return False
+
+        def join(self, _timeout=None):
+            self.calls.append("join")
+
+        def terminate(self):
+            self.calls.append("terminate")
+
+        def kill(self):
+            self.calls.append("kill")
+
+        def close(self):
+            self.calls.append("close")
+
+    raw = _RawProcess()
+    adapter = _ForkProcessAdapter(raw, ["python", "-m", "child"])
+
+    adapter.terminate()
+    adapter.kill()
+    adapter.close()
+
+    assert raw.calls == ["terminate", "kill", "close"]
+
+
+class _FakeProcess:
+    pid = 4242
+
+    def __init__(self):
+        self.terminated = False
+        self.closed = False
+
+    def poll(self):
+        return None if not self.terminated else 0
+
+    def terminate(self):
+        self.terminated = True
+
+    def wait(self, timeout=None):
+        return 0
+
+    def close(self):
+        self.closed = True
+
+
+def test_lazy_runtime_reaps_only_idle_child_without_health_probing(tmp_path, monkeypatch):
+    from hermes_cli.ios_mcp_supervisor import IOSMCPRuntimeSupervisor
+
+    runtime = IOSMCPRuntimeSupervisor(
+        tmp_path / "lazy-runtime.db",
+        capabilities=("ios-power",),
+        lazy_start=True,
+        idle_timeout_seconds=5,
+        log_directory=tmp_path / "logs",
+    )
+    process = _FakeProcess()
+    runtime._processes["ios-power"] = process
+    runtime._lazy_last_activity["ios-power"] = time.monotonic() - 10
+    monkeypatch.setattr(
+        runtime,
+        "health_service",
+        lambda *_args, **_kwargs: pytest.fail("lazy health cycle must not probe MCP"),
+    )
+
+    try:
+        results = runtime._reap_idle_lazy_services()
+        assert results == [{
+            "name": "ios-power",
+            "lazy": True,
+            "recycled": True,
+            "reason": "idle_timeout",
+        }]
+        assert process.terminated is True
+        assert process.closed is True
+        assert "ios-power" not in runtime._processes
+    finally:
+        runtime.stop()
+
+
+def test_lazy_runtime_keeps_recent_child_hot(tmp_path):
+    from hermes_cli.ios_mcp_supervisor import IOSMCPRuntimeSupervisor
+
+    runtime = IOSMCPRuntimeSupervisor(
+        tmp_path / "lazy-hot-runtime.db",
+        capabilities=("ios-power",),
+        lazy_start=True,
+        idle_timeout_seconds=30,
+        log_directory=tmp_path / "logs",
+    )
+    process = _FakeProcess()
+    runtime._processes["ios-power"] = process
+    runtime._lazy_last_activity["ios-power"] = time.monotonic()
+    try:
+        assert runtime._reap_idle_lazy_services() == []
+        assert process.terminated is False
+    finally:
+        runtime.stop()

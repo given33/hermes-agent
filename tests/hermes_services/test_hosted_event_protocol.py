@@ -5,6 +5,7 @@ import pytest
 from hermes_services.hosted_event_protocol import (
     append_hosted_event,
     hosted_event_page,
+    normalize_legacy_profile_event,
 )
 
 
@@ -16,6 +17,26 @@ def _conversation() -> dict:
         "hosted_event_terminals": {},
         "hosted_event_cursor": 0,
     }
+
+
+def test_subagent_profile_events_keep_their_structured_identity():
+    started = normalize_legacy_profile_event({
+        "type": "subagent.start",
+        "payload": {"child_session_id": "child-1", "profile": "reviewer"},
+    })
+    completed = normalize_legacy_profile_event({
+        "type": "subagent.complete",
+        "payload": {
+            "child_session_id": "child-1",
+            "profile": "reviewer",
+            "summary": "review passed",
+        },
+    })
+
+    assert started[0] == "subagent.started"
+    assert completed[0] == "subagent.completed"
+    assert started[2] == completed[2] == "child-1"
+    assert started[1]["source_event_type"] == "subagent.start"
 
 
 def test_progress_is_idempotent_and_rejected_after_terminal():
@@ -252,3 +273,36 @@ def test_turn_cancelled_fences_every_later_event():
         assert result.appended is False
         assert result.reason == "turn_terminal:turn.cancelled"
     assert conversation["hosted_event_cursor"] == 1
+
+
+def test_live_projection_appends_against_current_indexes_without_rebuild(monkeypatch):
+    conversation = _conversation()
+    append_hosted_event(
+        conversation,
+        conversation_id="chat-1",
+        turn_id="turn-live",
+        role_stage="chat",
+        event_type="agent.started",
+        idempotency_key="live-start",
+    )
+
+    def fail_rebuild(*_args, **_kwargs):
+        raise AssertionError("current live indexes must not be rebuilt")
+
+    monkeypatch.setattr(
+        "hermes_services.hosted_event_protocol._rebuild_retained_event_indexes",
+        fail_rebuild,
+    )
+    result = append_hosted_event(
+        conversation,
+        conversation_id="chat-1",
+        turn_id="turn-live",
+        role_stage="chat",
+        event_type="message.delta",
+        payload={"text": "hello"},
+        idempotency_key="live-delta-1",
+        assume_current_indexes=True,
+    )
+
+    assert result.appended is True
+    assert result.event["cursor"] == 2

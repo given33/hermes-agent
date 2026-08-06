@@ -23,6 +23,8 @@ suite stays free of timing flakes under parallel load.
 import concurrent.futures
 from unittest.mock import MagicMock, patch
 
+import pytest
+
 from cron.scheduler import run_job
 
 # Hold the real class: patching cron.scheduler.concurrent.futures.ThreadPoolExecutor

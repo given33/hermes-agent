@@ -99,6 +99,32 @@ managed_installations.copy_sqlite_fallback(None, managed_installations.Path("/tm
     assert completed.returncode == 0, completed.stderr
 
 
+def test_legacy_fabric_runtime_with_old_sqlite_helper_still_imports():
+    script = r'''
+import sys
+import types
+
+sys.modules["hermes_cli.sqlite_util"] = types.ModuleType("hermes_cli.sqlite_util")
+from hermes_cli import managed_installations
+
+assert managed_installations.resolve_sqlite_fallback(
+    "/tmp/managed-installations.db",
+    env_var="IGNORED",
+    label="managed-installations.db",
+    fallback_relative="managed-installations.db",
+) == (managed_installations.Path("/tmp/managed-installations.db"), None)
+managed_installations.copy_sqlite_fallback(None, managed_installations.Path("/tmp/managed-installations.db"))
+'''
+    completed = subprocess.run(
+        [sys.executable, "-c", script],
+        cwd=Path(__file__).parents[2],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert completed.returncode == 0, completed.stderr
+
+
 def _wait_for_http_server(url: str, headers: dict[str, str] | None = None) -> None:
     deadline = time.monotonic() + 3
     while True:

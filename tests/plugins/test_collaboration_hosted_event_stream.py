@@ -1113,10 +1113,12 @@ async def test_unrelated_conversation_update_does_not_busy_loop_an_idle_stream(
     monkeypatch,
 ):
     module = _load_module()
+    module._HOSTED_UPDATE_REVISIONS.clear()
     conversation = module.create_single_conversation(profile="default")
     conversation["owner_id"] = module.LOCAL_OWNER_ID
+    original_notify = module._notify_hosted_update
     _bind_in_memory_state(module, conversation)
-    waits: list[int] = []
+    waits: list[tuple[int, str]] = []
 
     class Request:
         query_params = {}
@@ -1128,9 +1130,9 @@ async def test_unrelated_conversation_update_does_not_busy_loop_an_idle_stream(
     def wait_for_update(
         revision: int,
         _timeout: float,
-        conversation_id: str,
+        conversation_id: str = "",
     ) -> int:
-        waits.append(revision)
+        waits.append((revision, conversation_id))
         return module._hosted_update_revision(conversation_id)
 
     monkeypatch.setattr(module, "owner_id_from_request", lambda _request: module.LOCAL_OWNER_ID)
@@ -1141,13 +1143,46 @@ async def test_unrelated_conversation_update_does_not_busy_loop_an_idle_stream(
     first = await anext(iterator)
     assert "event: conversation" in first
 
-    # A different conversation only advances the global revision. This stream
-    # must stay on its own conversation revision and emit one keepalive.
-    module._HOSTED_UPDATE_REVISION += 1
+    # An update for a different conversation must not cause this stream to
+    # reload the shared state document or emit a spurious conversation frame.
+    original_notify("chat-other")
     second = await anext(iterator)
 
     assert second == ": keepalive\n\n"
-    assert waits == [0]
+    assert waits == [(0, conversation["id"])]
+    await iterator.aclose()
+
+
+@pytest.mark.asyncio
+async def test_hosted_event_stream_pushes_an_authoritative_snapshot_on_update():
+    module = _load_module()
+    module._HOSTED_UPDATE_REVISIONS.clear()
+    conversation = module.create_single_conversation(profile="default")
+    conversation["owner_id"] = module.LOCAL_OWNER_ID
+    original_notify = module._notify_hosted_update
+    state = _bind_in_memory_state(module, conversation)
+
+    class Request:
+        query_params = {}
+        headers = {}
+
+        async def is_disconnected(self):
+            return False
+
+    module.owner_id_from_request = lambda _request: module.LOCAL_OWNER_ID
+    response = await module.stream_hosted_conversation_events(conversation["id"], Request())
+    iterator = response.body_iterator
+
+    first = await anext(iterator)
+    assert json.loads(first.split("data: ", 1)[1])["conversation"]["title"] != "Updated"
+
+    state["conversations"][0]["title"] = "Updated"
+    original_notify(conversation["id"])
+    second = await anext(iterator)
+    payload = json.loads(second.split("data: ", 1)[1])
+
+    assert payload["conversation"]["title"] == "Updated"
+    assert payload["cursor"] == 0
     await iterator.aclose()
 
 

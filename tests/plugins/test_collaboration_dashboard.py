@@ -222,6 +222,19 @@ class CollaborationDashboardTests(unittest.TestCase):
             ("resolve", config, "cli", {"include_default_mcp_servers": False}),
         )
 
+    def test_plain_chat_skips_tool_discovery(self):
+        module = load_module()
+
+        with patch.object(module, "_backend_api") as backend:
+            resolved = module._discover_profile_toolsets(
+                {"mcp_servers": {"ios-location": {"enabled": True}}},
+                [],
+                allow_tools=False,
+            )
+
+        self.assertEqual(resolved, [])
+        backend.assert_not_called()
+
     def test_personal_ios_mcp_request_adds_capability_hints_without_forcing_mode(self):
         module = load_module()
 
@@ -234,21 +247,21 @@ class CollaborationDashboardTests(unittest.TestCase):
         self.assertIn("ios.location", routed["capability_hints"])
         self.assertTrue(routed["needs_tools"])
 
-    def test_hosted_update_revision_is_conversation_scoped_without_state_rewrites(self):
+    def test_hosted_update_notification_is_in_memory_and_conversation_scoped(self):
         module = load_module()
         conversation = module.create_single_conversation("default")
         state = {"conversations": [conversation]}
         persisted = []
         module.load_single_state = lambda: state
-        module.save_single_state = lambda current: persisted.append(
-            int(current["conversations"][0].get("event_cursor") or 0)
-        )
+        module.save_single_state = lambda current: persisted.append(current)
 
-        module._notify_hosted_update(conversation["id"])
-        module._HOSTED_UPDATE_REVISION = 0
-        module._notify_hosted_update(conversation["id"])
+        first = module._notify_hosted_update(conversation["id"])
+        module._notify_hosted_update("chat-other")
+        second = module._notify_hosted_update(conversation["id"])
 
+        self.assertEqual((first, second), (1, 2))
         self.assertEqual(module._hosted_update_revision(conversation["id"]), 2)
+        self.assertEqual(module._hosted_update_revision("chat-other"), 1)
         self.assertEqual(conversation["event_cursor"], 0)
         self.assertEqual(persisted, [])
 
@@ -333,14 +346,75 @@ class CollaborationDashboardTests(unittest.TestCase):
             "turn-cancel-race",
         ))
         self.assertEqual(run["status"], "cancelled")
-        self.assertEqual(
-            sum(
-                1
-                for message in conversation["messages"]
-                if message.get("meta", {}).get("final_report") is True
-            ),
-            0,
+        cancellation = conversation["messages"][-1]
+        self.assertEqual(cancellation["meta"]["role_stage"], "chat")
+        self.assertFalse(cancellation["meta"]["final_report"])
+
+    def test_cancellation_request_signals_runner_and_sse_without_reread(self):
+        module = load_module()
+        conversation = module.create_single_conversation("default")
+        state = {"conversations": [conversation]}
+        loads = []
+        notifications = []
+
+        def load_state():
+            loads.append(True)
+            return state
+
+        module.load_single_state = load_state
+        module.save_single_state = lambda _state: None
+        module._notify_hosted_update = notifications.append
+        run = module.create_hosted_turn_record(
+            conversation,
+            turn_id="turn-fast-cancel",
+            content="cancel quickly",
+            title="cancel quickly",
+            profiles=["default"],
+            artifact_required=False,
+            mode="chat",
+            route_metadata={"mode": "chat"},
         )
+        run["status"] = "running"
+
+        module.request_hosted_turn_cancellation(
+            conversation["id"],
+            "turn-fast-cancel",
+        )
+        loads_after_request = len(loads)
+
+        self.assertTrue(module._hosted_turn_cancellation_requested(
+            conversation["id"],
+            "turn-fast-cancel",
+        ))
+        self.assertEqual(len(loads), loads_after_request)
+        self.assertEqual(notifications, [conversation["id"]])
+
+    def test_negative_cancellation_poll_is_cached(self):
+        module = load_module()
+        conversation = module.create_single_conversation("default")
+        state = {"conversations": [conversation]}
+        loads = []
+        module.load_single_state = lambda: loads.append(True) or state
+        module.create_hosted_turn_record(
+            conversation,
+            turn_id="turn-not-cancelled",
+            content="continue",
+            title="continue",
+            profiles=["default"],
+            artifact_required=False,
+            mode="chat",
+            route_metadata={"mode": "chat"},
+        )
+
+        self.assertFalse(module._hosted_turn_cancellation_requested(
+            conversation["id"],
+            "turn-not-cancelled",
+        ))
+        self.assertFalse(module._hosted_turn_cancellation_requested(
+            conversation["id"],
+            "turn-not-cancelled",
+        ))
+        self.assertEqual(len(loads), 1)
 
     def test_profile_model_readiness_rejects_virtual_moa_without_real_credentials(self):
         module = load_module()
@@ -409,7 +483,61 @@ class CollaborationDashboardTests(unittest.TestCase):
         self.assertEqual(readiness["model"], "model-test")
         self.assertEqual(readiness["provider"], "custom")
 
-    def test_simple_chat_enqueue_is_durable_before_direct_background_start(self):
+    def test_profile_model_readiness_classifies_missing_server_runtime(self):
+        module = load_module()
+        original_import = __import__
+
+        def import_without_runtime_provider(name, *args, **kwargs):
+            if name == "agent.runtime_provider":
+                raise ModuleNotFoundError("No module named 'agent.runtime_provider'")
+            return original_import(name, *args, **kwargs)
+
+        with patch("builtins.__import__", side_effect=import_without_runtime_provider):
+            readiness = module._profile_runtime_readiness(
+                "default",
+                "model-test",
+                "custom",
+            )
+
+        self.assertFalse(readiness["ready"])
+        self.assertFalse(readiness["retryable"])
+        self.assertEqual(readiness["code"], "server_runtime_incomplete")
+        self.assertEqual(
+            readiness["message"],
+            "服务端运行组件不完整，请更新 Hermes 服务端后重试。",
+        )
+
+    def test_cancelled_chat_stays_a_plain_hermes_message(self):
+        module = load_module()
+        conversation = module.create_single_conversation("default")
+        state = {"conversations": [conversation]}
+        module.load_single_state = lambda: state
+        module.save_single_state = lambda _state: None
+        module._schedule_persisted_terminal_notification = lambda *args, **kwargs: None
+        run = module.create_hosted_turn_record(
+            conversation,
+            turn_id="turn-cancel-chat",
+            content="你好",
+            title="你好",
+            profiles=["default"],
+            artifact_required=False,
+            mode="chat",
+            route_metadata={"mode": "chat", "needs_tools": False},
+        )
+        run.update({"cancel_requested": True, "cancel_reason": "用户取消"})
+
+        self.assertTrue(module._finish_hosted_turn_if_cancelled(
+            conversation["id"],
+            "turn-cancel-chat",
+        ))
+
+        message = conversation["messages"][-1]
+        self.assertEqual(message["meta"]["role_stage"], "chat")
+        self.assertEqual(message["meta"]["role_label"], "Hermes")
+        self.assertFalse(message["meta"]["final_report"])
+        self.assertIn("对话已取消", message["content"])
+
+    def test_hard_chat_enqueue_is_durable_without_route_outbox_delay(self):
         module = load_module()
         module.RouteMessageBody.model_rebuild(_types_namespace={"Any": Any})
         conversation = module.create_single_conversation("default")
@@ -432,36 +560,12 @@ class CollaborationDashboardTests(unittest.TestCase):
             attachment_context="",
             delivery_context="",
         )
-        route = {
-            "mode": "chat",
-            "label": "单聊",
-            "reason": "普通对话",
-            "title": "你好",
-            "profiles": ["default"],
-            "artifact_required": False,
-            "artifact": {"decision": "none", "types": []},
-            "source": "deterministic",
-            "confidence": 1.0,
-        }
-        readiness = {
-            "ready": False,
-            "code": "model_credentials_missing",
-            "message": module._MODEL_NOT_CONFIGURED_MESSAGE,
-            "profile": "default",
-            "model": "default",
-            "provider": "moa",
-        }
-
         with patch.object(module, "load_single_state", return_value=state), patch.object(
             module, "save_single_state", side_effect=lambda _state: None
         ), patch.object(
             module, "owner_id_from_request", return_value="owner-a"
         ), patch.object(
             module, "route_message", side_effect=AssertionError("routing ran before durable save")
-        ), patch.object(
-            module,
-            "start_hosted_routing",
-            side_effect=lambda *args: starts.append(args),
         ), patch.object(
             module,
             "start_hosted_workflow",
@@ -479,11 +583,74 @@ class CollaborationDashboardTests(unittest.TestCase):
         self.assertEqual(hosted["status"], "queued")
         self.assertEqual(hosted["stage"], "accepted")
         self.assertEqual(first["route"]["mode"], "chat")
+        self.assertEqual(first["route"]["lock_level"], "hard_chat")
         self.assertNotIn("route_outbox", conversation)
         assistant_messages = [
             item for item in conversation["messages"] if item.get("role") == "assistant"
         ]
         self.assertEqual(assistant_messages, [])
+
+    def test_enqueue_atomically_creates_a_missing_mobile_conversation(self):
+        module = load_module()
+        module.RouteMessageBody.model_rebuild(_types_namespace={"Any": Any})
+        state = {"conversations": []}
+        starts = []
+        payload = SimpleNamespace(
+            request_id="request-atomic-create",
+            turn_id="turn-atomic-create",
+            message={
+                "id": "message-atomic-create",
+                "role": "user",
+                "name": "user",
+                "content": "hello",
+                "status": "completed",
+            },
+            recent_messages=[],
+            profiles=[],
+            attachment_ids=[],
+            attachment_context="",
+            delivery_context="",
+            required_provider="",
+            required_model="",
+            create_conversation_if_missing=True,
+            conversation_profile="default",
+            conversation_title="Atomic chat",
+        )
+        with patch.object(module, "load_single_state", return_value=state), patch.object(
+            module, "save_single_state", side_effect=lambda _state: None
+        ), patch.object(
+            module, "owner_id_from_request", return_value="owner-atomic"
+        ), patch.object(
+            module, "_account_generation_for_request", return_value="generation-atomic"
+        ), patch.object(
+            module, "_account_generation_for_owner", return_value="generation-atomic"
+        ), patch.object(
+            module, "_prewarm_hosted_chat"
+        ), patch.object(
+            module,
+            "start_hosted_workflow",
+            side_effect=lambda *args: starts.append(args),
+        ):
+            first = module.enqueue_hosted_turn(
+                "chat-atomic-create", payload, SimpleNamespace()
+            )
+            replay = module.enqueue_hosted_turn(
+                "chat-atomic-create", payload, SimpleNamespace()
+            )
+
+        self.assertTrue(first["accepted"])
+        self.assertTrue(replay["replayed"])
+        self.assertEqual(len(state["conversations"]), 1)
+        conversation = state["conversations"][0]
+        self.assertEqual(conversation["id"], "chat-atomic-create")
+        self.assertEqual(conversation["owner_id"], "owner-atomic")
+        self.assertEqual(conversation["account_generation"], "generation-atomic")
+        self.assertEqual(conversation["title"], "Atomic chat")
+        self.assertEqual(
+            [message["id"] for message in conversation["messages"]],
+            ["message-atomic-create"],
+        )
+        self.assertEqual(len(starts), 2)
 
     def test_route_outbox_recovers_after_classifier_failure_without_duplicating_message(self):
         module = load_module()
@@ -705,6 +872,32 @@ class CollaborationDashboardTests(unittest.TestCase):
             )
             self.assertEqual(list(Path(tmp).glob(".*.tmp")), [])
 
+    def test_repeated_state_save_snapshots_previous_primary_without_reserializing_it(self):
+        module = load_module()
+
+        with TemporaryDirectory() as tmp:
+            state_path = Path(tmp) / "single.json"
+            first = module.create_single_conversation("default", "first")
+            second = module.create_single_conversation("default", "second")
+            module.save_single_state({"conversations": [first]}, state_path)
+            original_writer = module._atomic_write_state_document
+            written_targets = []
+
+            def record_write(target, data):
+                written_targets.append(Path(target))
+                return original_writer(target, data)
+
+            with patch.object(module, "_atomic_write_state_document", record_write):
+                module.save_single_state({"conversations": [second]}, state_path)
+
+            self.assertEqual(written_targets, [state_path])
+            self.assertEqual(
+                json.loads(
+                    state_path.with_name("single.json.bak").read_text(encoding="utf-8")
+                )["conversations"][0]["id"],
+                first["id"],
+            )
+
     def test_profile_turn_uses_argument_array_without_shell(self):
         module = load_module()
         captured = {}
@@ -789,8 +982,65 @@ class CollaborationDashboardTests(unittest.TestCase):
         self.assertEqual(captured["env"]["HERMES_API_RETRY_DELAY_SECONDS"], "15")
         self.assertEqual(captured["env"]["HERMES_API_RETRY_STATUS_LIVE"], "1")
         self.assertEqual(captured["env"]["HERMES_API_RETRY_CLIENT_ERRORS"], "1")
+        self.assertEqual(
+            captured["env"]["PYTHONPATH"].split(os.pathsep)[0],
+            str(MODULE_PATH.parents[3]),
+        )
         self.assertGreater(captured["wait_timeout"], 599)
         self.assertLessEqual(captured["wait_timeout"], 600)
+
+    def test_hosted_chat_uses_official_persistent_tui_gateway_by_default(self):
+        module = load_module()
+        captured = {}
+        events = []
+
+        def official_gateway(prompt, **kwargs):
+            captured["prompt"] = prompt
+            captured["kwargs"] = kwargs
+            kwargs["event_callback"](
+                {
+                    "type": "message.complete",
+                    "payload": {"text": "official-019", "status": "completed"},
+                }
+            )
+            return "official-019"
+
+        artifact_context = {
+            "root": "/artifacts",
+            "owner_id": "owner-1",
+            "account_generation": "generation-1",
+            "conversation_id": "conversation-1",
+            "turn_id": "turn-1",
+            "allow_tools": "1",
+        }
+        with patch.object(
+            module, "_hosted_runtime_home", return_value="/runtime/owner-1"
+        ), patch.object(
+            module, "run_hosted_gateway_turn", side_effect=official_gateway
+        ):
+            response = module.run_profile_turn(
+                "default",
+                "hello",
+                session_id="stored-session-1",
+                event_callback=events.append,
+                artifact_context=artifact_context,
+            )
+
+        self.assertEqual(response, "official-019")
+        self.assertEqual(captured["prompt"], "hello")
+        self.assertEqual(captured["kwargs"]["runtime_home"], "/runtime/owner-1")
+        self.assertEqual(captured["kwargs"]["requested_session_id"], "stored-session-1")
+        self.assertEqual(captured["kwargs"]["conversation_id"], "conversation-1")
+        self.assertEqual(captured["kwargs"]["turn_id"], "turn-1")
+        self.assertEqual(captured["kwargs"]["owner_id"], "owner-1")
+        self.assertEqual(captured["kwargs"]["account_generation"], "generation-1")
+        self.assertEqual(events[-1]["payload"]["text"], "official-019")
+
+    def test_plugin_entrypoint_prioritizes_its_project_runtime_root(self):
+        module = load_module()
+
+        self.assertEqual(module._RUNTIME_IMPORT_ROOT, str(MODULE_PATH.parents[3]))
+        self.assertEqual(sys.path[0], module._RUNTIME_IMPORT_ROOT)
 
     def test_structured_profile_turn_drains_large_stderr_concurrently(self):
         module = load_module()
@@ -851,6 +1101,56 @@ class CollaborationDashboardTests(unittest.TestCase):
         self.assertEqual(readiness_calls, [])
         self.assertEqual(run["status"], "failed")
         self.assertEqual(run["error_code"], "model_connection_deadline_exceeded")
+
+    def test_nonretryable_server_runtime_failure_skips_model_reconnect_loop(self):
+        module = load_module()
+        conversation = module.create_single_conversation("default")
+        state = {"conversations": [conversation]}
+        run = module.create_hosted_turn_record(
+            conversation,
+            turn_id="turn-runtime-incomplete",
+            content="你好",
+            title="你好",
+            profiles=["default"],
+            artifact_required=False,
+            mode="chat",
+            route_metadata={"mode": "chat"},
+        )
+        run.update(
+            {
+                "status": "running",
+                "model_retry_deadline_at": int(time.time() * 1000) + 120_000,
+            }
+        )
+        readiness_calls = []
+
+        with patch.object(module, "load_single_state", return_value=state), patch.object(
+            module, "save_single_state", side_effect=lambda _state: None
+        ), patch.object(
+            module, "_notify_hosted_update", side_effect=lambda _conversation_id: None
+        ), patch.object(
+            module,
+            "profile_model_readiness",
+            side_effect=lambda profile: readiness_calls.append(profile) or {
+                "ready": False,
+                "retryable": False,
+                "profile": profile,
+                "code": "server_runtime_incomplete",
+                "message": "服务端运行组件不完整，请更新 Hermes 服务端后重试。",
+            },
+        ):
+            recovered = module._wait_for_hosted_chat_model(
+                conversation["id"],
+                "turn-runtime-incomplete",
+                "default",
+                sleeper=lambda _seconds: self.fail("nonretryable failure slept before failing"),
+            )
+
+        self.assertFalse(recovered)
+        self.assertEqual(readiness_calls, ["default"])
+        self.assertEqual(run["status"], "failed")
+        self.assertEqual(run["error_code"], "server_runtime_incomplete")
+        self.assertEqual(run.get("model_readiness_attempt", 0), 0)
 
     def test_structured_account_turn_uses_managed_resource_runtime_overlay(self):
         module = load_module()
@@ -1039,6 +1339,27 @@ class CollaborationDashboardTests(unittest.TestCase):
         self.assertIn("用户: 先检查服务", prompt)
         self.assertIn("default: 服务正常", prompt)
         self.assertIn("继续检查网络", prompt)
+        self.assertIn("call the todo tool before execution", prompt)
+        self.assertIn("exactly one item in_progress", prompt)
+        self.assertIn("Do not create a todo list for ordinary single-step chat", prompt)
+
+    def test_single_chat_prompt_excludes_the_persisted_current_user_message(self):
+        module = load_module()
+        conversation = module.create_single_conversation("default")
+        conversation["messages"] = [
+            {"id": "previous", "role": "user", "name": "user", "content": "previous"},
+            {"id": "current", "role": "user", "name": "user", "content": "current"},
+        ]
+
+        prompt = module.build_single_prompt(
+            conversation,
+            "default",
+            "current",
+            exclude_message_id="current",
+        )
+
+        self.assertIn("user: previous", prompt)
+        self.assertEqual(prompt.count("current"), 1)
 
     def test_runtime_run_reconciles_background_result_into_original_conversation(self):
         module = load_module()
@@ -1701,10 +2022,12 @@ class CollaborationDashboardTests(unittest.TestCase):
             mode="chat",
         )
         calls = 0
+        artifact_contexts = []
 
         def production_runner(_profile, _prompt, **_kwargs):
             nonlocal calls
             calls += 1
+            artifact_contexts.append(dict(_kwargs.get("artifact_context") or {}))
             raise RuntimeError("HTTP 503 unavailable")
 
         module.run_profile_turn = production_runner
@@ -1721,6 +2044,7 @@ class CollaborationDashboardTests(unittest.TestCase):
         )
 
         self.assertEqual(calls, 1)
+        self.assertEqual(artifact_contexts[0]["allow_tools"], "1")
         self.assertEqual(status, "failed")
         self.assertEqual(result.count("HTTP 503"), 1)
 
@@ -1944,6 +2268,42 @@ class CollaborationDashboardTests(unittest.TestCase):
         self.assertIn("default", work["profiles"])
         self.assertIn("pc-worker", work["profiles"])
         self.assertIn("reviewer", work["profiles"])
+
+    def test_short_casual_question_is_locked_to_chat_without_model_routing(self):
+        module = load_module()
+        calls = []
+
+        routed = module.classify_user_intent(
+            "你很厉害吗",
+            model_classifier=lambda text: calls.append(text) or {
+                "mode": "work",
+                "confidence": 0.99,
+            },
+        )
+
+        self.assertEqual(calls, [])
+        self.assertEqual(routed["mode"], "chat")
+        self.assertEqual(routed["lock_level"], "hard_chat")
+        self.assertFalse(routed["needs_tools"])
+        self.assertIn("rule.plain_chat", routed["rationale_codes"])
+
+    def test_single_turn_search_stays_in_chat_and_keeps_tools(self):
+        module = load_module()
+        calls = []
+
+        routed = module.classify_user_intent(
+            "搜索今天的新闻",
+            model_classifier=lambda text: calls.append(text) or {
+                "mode": "work",
+                "confidence": 0.99,
+            },
+        )
+
+        self.assertEqual(calls, [])
+        self.assertEqual(routed["mode"], "chat")
+        self.assertEqual(routed["lock_level"], "hard_chat")
+        self.assertTrue(routed["needs_tools"])
+        self.assertIn("rule.single_turn_tools", routed["rationale_codes"])
 
     def test_explicit_work_lock_wins_and_ios_mcp_only_adds_capability_hints(self):
         module = load_module()
@@ -3840,7 +4200,9 @@ class CollaborationDashboardTests(unittest.TestCase):
         module.save_single_state = lambda _state: None
         module._notify_hosted_update = lambda *_args: None
         module._wait_for_hosted_update = (
-            lambda revision, _timeout: (time.sleep(0.005), revision + 1)[1]
+            lambda revision, _timeout, _conversation_id="": (
+                time.sleep(0.005), revision + 1
+            )[1]
         )
         run = module.create_hosted_turn_record(
             conversation,
@@ -4707,6 +5069,28 @@ class CollaborationDashboardTests(unittest.TestCase):
         ]
         self.assertEqual([item["output"] for item in reasoning], ["正在检查服务。"])
 
+    def test_hosted_event_reducer_accepts_delta_output_and_content_fields(self):
+        module = load_module()
+        state = {
+            "content": "",
+            "status": "streaming",
+            "activities": [],
+            "first_token_at": 0,
+        }
+
+        with patch.object(module.time, "time", return_value=2.0):
+            module.apply_profile_event(
+                state,
+                {"type": "message.delta", "payload": {"delta": "A"}},
+            )
+            module.apply_profile_event(
+                state,
+                {"type": "message.delta", "payload": {"content": "B"}},
+            )
+
+        self.assertEqual(state["content"], "AB")
+        self.assertEqual(state["first_token_at"], 2000)
+
     def test_hosted_event_reducer_freezes_first_token_and_exposes_retry_state_only(self):
         module = load_module()
         state = {
@@ -4719,14 +5103,8 @@ class CollaborationDashboardTests(unittest.TestCase):
         with patch.object(module.time, "time", side_effect=[1.0, 2.0, 3.0]):
             module.apply_profile_event(
                 state,
-                {
-                    "type": "connection.retry",
-                    "payload": {"attempt": 1, "max_attempts": 5},
-                },
+                {"type": "status.update", "payload": {"text": "正在重新连接 (1/5)"}},
             )
-            retry_statuses = [
-                item for item in state["activities"] if item["kind"] == "status"
-            ]
             module.apply_profile_event(
                 state,
                 {"type": "message.delta", "payload": {"text": "你"}},
@@ -4738,14 +5116,122 @@ class CollaborationDashboardTests(unittest.TestCase):
 
         self.assertEqual(state["content"], "你好")
         self.assertEqual(state["first_token_at"], 2000)
-        self.assertEqual(
-            [item["name"] for item in retry_statuses],
-            ["正在重新连接 (1/5)"],
-        )
         statuses = [
             item for item in state["activities"] if item["kind"] == "status"
         ]
         self.assertEqual(statuses, [])
+
+    def test_hosted_event_reducer_treats_nonstreaming_completion_as_first_token(self):
+        module = load_module()
+        state = {
+            "content": "",
+            "status": "streaming",
+            "activities": [
+                {
+                    "id": "model-readiness-ready",
+                    "kind": "status",
+                    "output": "正在思考",
+                    "status": "completed",
+                },
+                {
+                    "id": "model-connection-retry",
+                    "kind": "status",
+                    "output": "",
+                    "status": "completed",
+                },
+            ],
+            "first_token_at": 0,
+        }
+
+        with patch.object(module.time, "time", return_value=4.0):
+            module.apply_profile_event(
+                state,
+                {
+                    "type": "message.complete",
+                    "payload": {"text": "你好", "status": "completed"},
+                },
+            )
+
+        self.assertEqual(state["content"], "你好")
+        self.assertEqual(state["first_token_at"], 4000)
+        self.assertEqual(state["activities"], [])
+
+        failed = {
+            "content": "",
+            "status": "streaming",
+            "activities": [],
+            "first_token_at": 0,
+        }
+        with patch.object(module.time, "time", return_value=5.0):
+            module.apply_profile_event(
+                failed,
+                {
+                    "type": "message.complete",
+                    "payload": {"text": "HTTP 401", "status": "error"},
+                },
+            )
+        self.assertEqual(failed["first_token_at"], 0)
+
+    def test_hosted_chat_persists_thinking_and_request_to_completion_timing(self):
+        module = load_module()
+        conversation = module.create_single_conversation("default")
+        state = {"conversations": [conversation]}
+        module.load_single_state = lambda: state
+        module.save_single_state = lambda _state: None
+        module._schedule_mobile_completion_notification = lambda *_args: None
+        run = module.create_hosted_turn_record(
+            conversation,
+            turn_id="turn-reasoning-timing",
+            content="你好",
+            title="你好",
+            profiles=["default"],
+            artifact_required=False,
+            mode="chat",
+            route_metadata={"mode": "chat"},
+        )
+        run["started_at"] = int(time.time() * 1000) - 25_000
+
+        def runner(_profile, _prompt, *, event_callback, **_kwargs):
+            event_callback({
+                "type": "status.update",
+                "payload": {"text": "正在思考"},
+            })
+            event_callback({
+                "type": "thinking.delta",
+                "payload": {"text": "先确认用户的问候。"},
+            })
+            event_callback({
+                "type": "message.delta",
+                "payload": {"text": "你好！"},
+            })
+            return "你好！"
+
+        module.execute_hosted_chat(
+            conversation["id"],
+            "turn-reasoning-timing",
+            runner=runner,
+        )
+
+        final = next(
+            message
+            for message in conversation["messages"]
+            if message.get("meta", {}).get("message_key")
+            == "turn-reasoning-timing:chat:completed"
+        )
+        meta = final["meta"]
+        self.assertGreaterEqual(meta["duration_ms"], 24_000)
+        self.assertGreaterEqual(meta["first_token_at"], meta["started_at"])
+        self.assertLessEqual(meta["first_token_at"], meta["completed_at"])
+        reasoning = [
+            item
+            for item in meta["activities"]
+            if item.get("kind") == "reasoning"
+        ]
+        self.assertEqual([item["output"] for item in reasoning], ["先确认用户的问候。"])
+        self.assertFalse(any(
+            item.get("id") == "model-runtime-status"
+            for item in meta["activities"]
+        ))
 
     def test_connection_retry_event_hides_intermediate_error_and_exposes_attempt(self):
         module = load_module()
@@ -5137,6 +5623,49 @@ class CollaborationDashboardTests(unittest.TestCase):
             ],
         )
 
+    def test_hosted_chat_wrapper_failure_stays_an_ordinary_hermes_message(self):
+        module = load_module()
+        conversation = module.create_single_conversation("default")
+        conversation["owner_id"] = "owner-a"
+        conversation["account_generation"] = "generation-a"
+        run = module.create_hosted_turn_record(
+            conversation,
+            turn_id="turn-chat-failure",
+            content="你好",
+            title="你好",
+            profiles=["default"],
+            artifact_required=False,
+            mode="chat",
+            route_metadata={"mode": "chat"},
+        )
+        run["account_generation"] = "generation-a"
+        state = {"conversations": [conversation]}
+        module.load_single_state = lambda: state
+        module.save_single_state = lambda value: None
+        module._account_generation_for_owner = lambda owner_id: "generation-a"
+        module._schedule_persisted_terminal_notification = (
+            lambda *args, **kwargs: None
+        )
+        module._finalize_pending_conversation_deletion = lambda *args, **kwargs: None
+
+        def fail_chat(conversation_id, turn_id):
+            raise RuntimeError("model connection failed")
+
+        module.execute_hosted_workflow = fail_chat
+        thread = module.start_hosted_workflow(
+            conversation["id"],
+            "turn-chat-failure",
+        )
+        thread.join(timeout=2)
+
+        self.assertFalse(thread.is_alive())
+        failure = conversation["messages"][-1]
+        self.assertEqual(failure["meta"]["role_stage"], "chat")
+        self.assertEqual(failure["meta"]["role_label"], "Hermes")
+        self.assertFalse(failure["meta"]["final_report"])
+        self.assertIn("对话运行失败", failure["content"])
+        self.assertNotIn("托管", failure["content"])
+
     def test_hosted_workflow_consumer_exits_after_conversation_deletion(self):
         module = load_module()
         conversation = module.create_single_conversation("default")
@@ -5214,6 +5743,7 @@ class CollaborationDashboardTests(unittest.TestCase):
         module.reconcile_conversation_runtime_results = lambda _conversation: False
         module.compact_conversation_title = lambda _conversation: False
         module.resume_unfinished_hosted_workflows = lambda _conversations: None
+        module._prewarm_hosted_chat = lambda _conversation: None
 
         response = module.get_single_conversations()
 
@@ -5225,6 +5755,29 @@ class CollaborationDashboardTests(unittest.TestCase):
         self.assertNotIn("worker_result", hosted)
         self.assertNotIn("role_events", hosted)
         self.assertIn("role_events", conversation["hosted_turns"]["turn-heavy"])
+
+    def test_conversation_index_does_not_prewarm_inactive_conversations(self):
+        module = load_module()
+        newest_default = module.create_single_conversation("default")
+        older_default = module.create_single_conversation("default")
+        reviewer = module.create_single_conversation("reviewer")
+        state = {
+            "conversations": [newest_default, older_default, reviewer],
+        }
+        module.load_single_state = lambda: state
+        module.save_single_state = lambda _state: None
+        module.reconcile_conversation_runtime_results = lambda _conversation: False
+        module.reconcile_stale_hosted_turns = lambda _conversation: False
+        module.compact_conversation_title = lambda _conversation: False
+        module.resume_unfinished_hosted_workflows = lambda _conversations: None
+        prewarmed = []
+        module._prewarm_hosted_chat = lambda conversation: prewarmed.append(
+            conversation["id"]
+        )
+
+        module.get_single_conversations()
+
+        self.assertEqual(prewarmed, [])
 
     def test_hosted_roles_run_with_non_root_kanban_task_scopes(self):
         module = load_module()
@@ -6180,6 +6733,9 @@ class CollaborationDashboardTests(unittest.TestCase):
             runner=runner,
         )
 
+        # A request/status marker alone is not model output. The chat surface
+        # stays empty until a real reasoning/message delta arrives so the
+        # thinking clock cannot begin during gateway/tool startup.
         self.assertEqual(visible_before_output, [])
         chat_messages = [
             message
@@ -6187,6 +6743,14 @@ class CollaborationDashboardTests(unittest.TestCase):
             if message.get("meta", {}).get("role_stage") == "chat"
         ]
         self.assertEqual([message["content"] for message in chat_messages], ["真实模型回复"])
+        self.assertEqual(
+            sum(
+                1
+                for message in conversation["messages"]
+                if message.get("meta", {}).get("base_role_stage") == "chat"
+            ),
+            1,
+        )
         self.assertFalse(
             any("收到消息" in message.get("content", "") for message in chat_messages)
         )
@@ -6747,6 +7311,24 @@ class CollaborationDashboardTests(unittest.TestCase):
         self.assertEqual(routed["lock_level"], "hard_chat")
         self.assertFalse(routed["artifact_required"])
 
+    def test_numeric_reply_stays_in_chat_even_when_context_model_requests_work(self):
+        module = load_module()
+        calls = []
+
+        routed = module.classify_user_intent(
+            "1",
+            model_classifier=lambda text: calls.append(text) or {
+                "mode": "work",
+                "confidence": 0.99,
+                "profiles": ["dbb3-worker"],
+            },
+        )
+
+        self.assertEqual(calls, [])
+        self.assertEqual(routed["mode"], "chat")
+        self.assertEqual(routed["lock_level"], "hard_chat")
+        self.assertIn("rule.trivial_chat", routed["rationale_codes"])
+
     def test_hosted_turn_record_persists_route_contract(self):
         module = load_module()
         conversation = module.create_single_conversation("default")
@@ -6949,6 +7531,88 @@ class CollaborationDashboardTests(unittest.TestCase):
         self.assertEqual(result["reviewer_target"], "dbb3")
         self.assertEqual(result["plan"][0]["assignee"], "dbb3-worker")
 
+    def test_manager_plan_todo_snapshot_tracks_execution_review_and_report(self):
+        module = load_module()
+        plan = {
+            "plan": [
+                {
+                    "id": "inspect-dbb3",
+                    "title": "检查 DBB3 状态",
+                    "assignee": "dbb3-worker",
+                },
+                {
+                    "id": "inspect-wsl",
+                    "title": "检查 WSL 状态",
+                    "assignee": "pc-worker",
+                },
+            ]
+        }
+
+        initial = module._hosted_manager_plan_todo_snapshot(
+            plan,
+            stage="worker_running",
+        )
+        self.assertEqual(
+            [item["status"] for item in initial["todos"]],
+            ["in_progress", "pending", "pending", "pending"],
+        )
+
+        one_worker_done = module._hosted_manager_plan_todo_snapshot(
+            plan,
+            stage="worker_running",
+            worker_statuses={"dbb3-worker": "completed"},
+        )
+        self.assertEqual(
+            [item["status"] for item in one_worker_done["todos"]],
+            ["completed", "in_progress", "pending", "pending"],
+        )
+
+        reviewing = module._hosted_manager_plan_todo_snapshot(
+            plan,
+            stage="reviewing",
+            worker_statuses={
+                "dbb3-worker": "completed",
+                "pc-worker": "completed",
+            },
+        )
+        self.assertEqual(
+            [item["status"] for item in reviewing["todos"]],
+            ["completed", "completed", "in_progress", "pending"],
+        )
+
+        reporting = module._hosted_manager_plan_todo_snapshot(
+            plan,
+            stage="reporting",
+            worker_statuses={
+                "dbb3-worker": "completed",
+                "pc-worker": "completed",
+            },
+            reviewer_status="completed",
+            reviewer_result=review_control(),
+        )
+        self.assertEqual(
+            [item["status"] for item in reporting["todos"]],
+            ["completed", "completed", "completed", "in_progress"],
+        )
+
+        completed = module._hosted_manager_plan_todo_snapshot(
+            plan,
+            stage="completed",
+            worker_statuses={
+                "dbb3-worker": "completed",
+                "pc-worker": "completed",
+            },
+            reviewer_status="completed",
+            reviewer_result=review_control(),
+            reporter_status="completed",
+            final_status="completed",
+        )
+        self.assertEqual(
+            [item["status"] for item in completed["todos"]],
+            ["completed", "completed", "completed", "completed"],
+        )
+        self.assertEqual(completed["summary"], {"completed": 4, "total": 4})
+
     def test_complex_production_workflow_uses_dbb3_manager_and_server_reporter(self):
         module = load_module()
         conversation = module.create_single_conversation("default")
@@ -6978,6 +7642,7 @@ class CollaborationDashboardTests(unittest.TestCase):
                 )
             )
             if stage == "manager_planning":
+                self.assertIn("用户右滑后看到的 Todo List", kwargs["prompt"])
                 return (
                     json.dumps(
                         {
@@ -7068,6 +7733,24 @@ class CollaborationDashboardTests(unittest.TestCase):
         self.assertEqual(
             conversation["hosted_turns"]["turn-manager-owned"]["manager_plan"]["workers"],
             ["dbb3-worker"],
+        )
+        todo_activities = [
+            activity
+            for message in conversation["messages"]
+            if isinstance(message.get("meta"), dict)
+            for activity in message["meta"].get("activities") or []
+            if isinstance(activity, dict)
+            and activity.get("tool_name") == "todo"
+        ]
+        self.assertEqual(len(todo_activities), 1)
+        todo_snapshot = json.loads(todo_activities[0]["output"])
+        self.assertEqual(
+            [item["status"] for item in todo_snapshot["todos"]],
+            ["completed", "completed", "completed"],
+        )
+        self.assertEqual(
+            conversation["hosted_turns"]["turn-manager-owned"]["todo_snapshot"],
+            todo_snapshot,
         )
         manager_labels = {
             label

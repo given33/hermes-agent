@@ -589,6 +589,10 @@ _REMOTE_TERMINAL_STATUSES = {"completed", "failed", "cancelled", "timed_out"}
 _REMOTE_ARTIFACT_ACTIVE_STATUSES = {"leased", "running"}
 _REMOTE_RUN_LEASE_SECONDS = 60
 _REMOTE_CANCELLATION_GRACE_SECONDS = 60
+# A connector that cannot pull a queued role must never hold a group turn in
+# ``dispatching`` forever. After this short hand-off window the server Hermes
+# runtime takes the same role and keeps the durable turn cancellable.
+_REMOTE_SERVER_FALLBACK_SECONDS = 8
 _MAX_REMOTE_RUNS_PER_PULL = 20
 _PROMPT_HISTORY = 24
 _MAX_ATTACHMENT_BYTES = 64 * 1024 * 1024
@@ -7100,7 +7104,17 @@ def apply_profile_event(
             or normalized.endswith("...")
         )
 
-    event_text = _structured_text(payload.get("text"))
+    # Providers do not all use the same field for streamed model text.  Keep
+    # the first-token boundary tied to real visible output while accepting the
+    # delta/output/reasoning variants emitted by the official runtime.
+    event_text = _structured_text(
+        payload.get("text")
+        or payload.get("delta")
+        or payload.get("output")
+        or payload.get("reasoning")
+        or payload.get("content")
+        or payload.get("message")
+    )
     thinking_is_reasoning = event_type == "thinking.delta" and not is_model_spinner(
         event_text
     )
@@ -7108,22 +7122,13 @@ def apply_profile_event(
         event_type in {"message.delta", "reasoning.delta", "reasoning.available"}
         or thinking_is_reasoning
     ) and bool(event_text)
-    tool_started_execution = event_type in {
-        "tool.generating",
-        "tool.progress",
-        "tool.start",
-        "tool.complete",
-    }
-    if (
-        (text_started_execution or tool_started_execution)
-        and not int(state.get("first_token_at") or 0)
-    ):
-        # Reasoning and tool-call tokens are model output too. Some models do
-        # not emit assistant text until after a long reasoning/tool phase, so
-        # waiting for message.delta leaves the client stuck in "thinking".
+    if text_started_execution and not int(state.get("first_token_at") or 0):
+        # Only real reasoning/message text starts the user-visible model clock.
+        # Tool/MCP progress is execution detail and can precede the first token
+        # by seconds; counting it makes cold-start latency look misleading.
         state["first_token_at"] = now
 
-    if text_started_execution or tool_started_execution or event_type in {
+    if text_started_execution or event_type in {
         "error",
         "message.complete",
     }:
@@ -7196,7 +7201,7 @@ def apply_profile_event(
                 )
                 break
         state["content"] = _append_event_delta(
-            str(state.get("content") or ""), payload.get("text")
+            str(state.get("content") or ""), event_text
         )
     elif event_type in {"tool.generating", "tool.progress"}:
         name = str(payload.get("name") or "工具调用")
@@ -7408,7 +7413,12 @@ def apply_profile_event(
             if str(payload.get("status") or "").lower() == "error"
             else "completed"
         )
-        final_text = _structured_text(payload.get("text"))
+        final_text = _structured_text(
+            payload.get("text")
+            or payload.get("output")
+            or payload.get("content")
+            or payload.get("message")
+        )
         if final_text:
             state["content"] = final_text
             if (
@@ -8798,6 +8808,13 @@ def _run_hosted_remote_role(
             role_label=role_label,
         )
 
+    configured_fallback = _positive_int(
+        os.environ.get("HERMES_REMOTE_FALLBACK_SECONDS")
+    )
+    fallback_deadline = time.monotonic() + float(
+        min(configured_fallback or _REMOTE_SERVER_FALLBACK_SECONDS, 60)
+    )
+
     while True:
         if not _renew_hosted_active_role(
             conversation_id,
@@ -8865,6 +8882,42 @@ def _run_hosted_remote_role(
                 )
                 remote_intervention_id = str(claimed.get("id") or "")
         if turn_cancel_requested and status not in _REMOTE_TERMINAL_STATUSES:
+            # A queued run has not been claimed by a device, so it can be
+            # terminally cancelled on the server immediately. Waiting for a
+            # connector cancellation poll here was the reason the iOS stop
+            # button appeared stuck during a disconnected two-device run.
+            if status == "queued" or not str(remote.get("lease_owner") or "").strip():
+                now = int(time.time() * 1000)
+                with _STATE_LOCK:
+                    state = load_single_state()
+                    location = _remote_run_location(state, active_remote_id)
+                    if location is not None:
+                        _conversation, _hosted, _role_key, current = location
+                        current.update(
+                            {
+                                "status": "cancelled",
+                                "terminal": True,
+                                "cancel_requested": True,
+                                "cancel_kind": "turn",
+                                "completed_at": now,
+                                "updated_at": now,
+                            }
+                        )
+                        save_single_state(state)
+                _notify_hosted_update(conversation_id)
+                _clear_hosted_active_role(
+                    conversation_id,
+                    turn_id,
+                    role_stage=role_stage,
+                    remote_run_id=active_remote_id,
+                    execution_owner=coordinator_owner,
+                )
+                _finish_hosted_turn_if_cancelled(conversation_id, turn_id)
+                return "远程执行已取消。", "cancelled", {
+                    "content": "远程执行已取消。",
+                    "status": "cancelled",
+                    "activities": list(remote.get("activities") or []),
+                }
             _persist_hosted_turn(
                 conversation_id,
                 turn_id,
@@ -8885,6 +8938,101 @@ def _run_hosted_remote_role(
                 "status": "failed",
                 "activities": list(remote.get("activities") or []),
             }
+        # ``queued``/unclaimed is the precise signal that neither DBB3 nor PC
+        # has accepted the role. Do not wait for the much longer remote run
+        # deadline: hand the role to the server Hermes runtime while retaining
+        # the original role/profile in the audit record.
+        unclaimed = (
+            status in {"queued", "leased"}
+            and not str(remote.get("lease_owner") or "").strip()
+            and not _nonnegative_int(remote.get("started_at"))
+            and not str(remote.get("remote_task_id") or "").strip()
+        )
+        if unclaimed and time.monotonic() >= fallback_deadline:
+            now = int(time.time() * 1000)
+            with _STATE_LOCK:
+                state = load_single_state()
+                location = _remote_run_location(state, active_remote_id)
+                if location is not None:
+                    _conversation, hosted, _role_key, current = location
+                    current.update(
+                        {
+                            "status": "cancelled",
+                            "terminal": True,
+                            "cancel_requested": True,
+                            "cancel_kind": "server_fallback",
+                            "cancel_reason": "Remote connector unavailable; server Hermes fallback activated",
+                            "completed_at": now,
+                            "updated_at": now,
+                        }
+                    )
+                    hosted.update(
+                        {
+                            "stage": "server_fallback",
+                            "remote_fallback": True,
+                            "remote_fallback_at": now,
+                            "updated_at": now,
+                        }
+                    )
+                    save_single_state(state)
+            _notify_hosted_update(conversation_id)
+            _clear_hosted_active_role(
+                conversation_id,
+                turn_id,
+                role_stage=role_stage,
+                remote_run_id=active_remote_id,
+                execution_owner=coordinator_owner,
+            )
+            if _hosted_turn_cancellation_requested(conversation_id, turn_id):
+                _finish_hosted_turn_if_cancelled(conversation_id, turn_id)
+                return "任务已取消。", "cancelled", {
+                    "content": "任务已取消。",
+                    "status": "cancelled",
+                    "activities": [],
+                }
+            fallback_stage = f"{role_stage}:server-fallback"
+            fallback_result, fallback_status, fallback_state = _run_hosted_role(
+                conversation_id,
+                turn_id,
+                profile="default",
+                role_stage=fallback_stage,
+                role_label="Hermes · 服务器兜底",
+                prompt=(
+                    "远程成员当前不可达。你是服务器 Hermes 兜底执行器；"
+                    "请直接完成同一角色阶段，保留完整工具定义和用户目标，"
+                    "不要等待 DBB3 或 PC。\n\n"
+                    f"{prompt}"
+                ),
+                runner=run_profile_turn,
+                kanban_task_id="",
+                start_text="远程成员不可达，已切换服务器 Hermes 兜底。",
+                artifact_required=artifact_required,
+                delivery_context=delivery_context,
+                attachment_context=attachment_context,
+                rework_round=rework_round,
+                visible=True,
+            )
+            fallback_state = dict(fallback_state)
+            fallback_state.update(
+                {
+                    "server_fallback": True,
+                    "fallback_from_profile": profile,
+                    "fallback_from_role_stage": role_stage,
+                }
+            )
+            # Keep the original role key authoritative for workflow bookkeeping;
+            # the visible message belongs to the server Hermes role above.
+            _persist_hosted_role_state(
+                conversation_id,
+                turn_id,
+                profile=profile,
+                role_stage=role_stage,
+                role_label=role_label,
+                state=fallback_state,
+                content_fallback=fallback_result,
+                visible=False,
+            )
+            return fallback_result, fallback_status, fallback_state
         if status in _REMOTE_TERMINAL_STATUSES:
             pending_intervention = _pending_hosted_role_intervention(
                 conversation_id,
@@ -15859,39 +16007,87 @@ async def stream_hosted_conversation_events(
         requested_cursor = max(0, int(cursor_value or 0))
     except (TypeError, ValueError) as exc:
         raise HTTPException(status_code=422, detail="cursor must be a non-negative integer") from exc
-    with _STATE_LOCK:
-        state = load_single_state()
-        _conversation, claimed = _owned_conversation_in_state(
-            state,
-            conversation_id,
-            owner_id,
-        )
-        if claimed:
-            save_single_state(state)
-
-    async def event_stream():
-        revision = _hosted_update_revision(conversation_id)
-        delivered_cursor = requested_cursor
+    # The live projection already proves ownership for an active conversation.
+    # Avoid taking the account-state lock on every reconnect: the durable JSON
+    # may be undergoing a large checkpoint while the SSE headers need to leave
+    # immediately. Missing/stale projections still use the authoritative
+    # ownership check below.
+    live_conversation = _live_conversation_snapshot(conversation_id, owner_id)
+    live_generation = str(
+        (live_conversation or {}).get("account_generation") or ""
+    ).strip()
+    if (
+        live_conversation is not None
+        and live_generation
+        and live_generation != account_generation
+    ):
+        raise HTTPException(status_code=404, detail="Conversation not found")
+    if live_conversation is None:
         with _STATE_LOCK:
-            state = _load_single_state_for_event_stream()
-            conversation, _claimed = _owned_conversation_in_state(
+            state = load_single_state()
+            _conversation, claimed = _owned_conversation_in_state(
                 state,
                 conversation_id,
                 owner_id,
             )
+            if claimed:
+                save_single_state(state)
+
+    async def event_stream():
+        revision = _hosted_update_revision(conversation_id)
+        delivered_cursor = requested_cursor
+        # Reconnects from the iOS client usually carry the current event
+        # cursor.  Prefer the immutable in-memory projection so a large
+        # account JSON rewrite cannot delay response headers or the first
+        # live delta.  A full snapshot remains mandatory for cursor zero and
+        # gap recovery.
+        live_conversation = _live_conversation_snapshot(conversation_id, owner_id)
+        if live_conversation is not None:
+            conversation = live_conversation
             envelope, has_more_events = _hosted_event_stream_frame(
                 conversation,
                 delivered_cursor=delivered_cursor,
-                include_snapshot=True,
+                include_snapshot=delivered_cursor <= 0,
                 limit=500,
             )
+        else:
+            with _STATE_LOCK:
+                state = _load_single_state_for_event_stream()
+                conversation, _claimed = _owned_conversation_in_state(
+                    state,
+                    conversation_id,
+                    owner_id,
+                )
+                envelope, has_more_events = _hosted_event_stream_frame(
+                    conversation,
+                    delivered_cursor=delivered_cursor,
+                    include_snapshot=delivered_cursor <= 0,
+                    limit=500,
+                )
+        if (
+            delivered_cursor > 0
+            and not envelope.get("events")
+            and not envelope.get("has_gap")
+            and not has_more_events
+        ):
+            # A reconnect that is already caught up only needs a flushed
+            # comment. State-only revisions later in this stream still use
+            # the authoritative snapshot branch below.
+            envelope.pop("conversation", None)
         while True:
             current_cursor = int(envelope["cursor"])
-            yield (
-                f"id: {current_cursor}\n"
-                "event: conversation\n"
-                f"data: {json.dumps(envelope, ensure_ascii=False, separators=(',', ':'))}\n\n"
-            )
+            if envelope.get("conversation") is not None or envelope.get("events"):
+                yield (
+                    f"id: {current_cursor}\n"
+                    "event: conversation\n"
+                    f"data: {json.dumps(envelope, ensure_ascii=False, separators=(',', ':'))}\n\n"
+                )
+            else:
+                # Do not send an empty JSON envelope: the native parser quite
+                # correctly treats that as malformed.  A comment flushes the
+                # response and keeps the SSE connection alive without
+                # serializing a redundant full snapshot.
+                yield ": connected\n\n"
             delivered_cursor = current_cursor
             if has_more_events:
                 live_frame = _live_hosted_event_stream_frame(
@@ -16554,9 +16750,24 @@ def enqueue_hosted_turn(
         payload,
         message_content=message_content,
     )
+    # A first message creates its conversation atomically, so there is no
+    # durable row from which the normal prewarm hook can start. Begin the
+    # same gateway/session build before the initial state read; the request's
+    # durable create and route classification then overlap the cold startup.
+    if bool(getattr(payload, "create_conversation_if_missing", False)):
+        _prewarm_hosted_chat({
+            "id": conversation_id,
+            "owner_id": owner_id,
+            "account_generation": account_generation,
+            "profile": str(
+                getattr(payload, "conversation_profile", "") or "default"
+            ).strip() or "default",
+            "runtime_sessions": {},
+        })
 
     route_attachments: list[dict[str, Any]] = []
     replay_response: Optional[dict[str, Any]] = None
+    prewarm_conversation: dict[str, Any]
     with _STATE_LOCK:
         state = load_single_state()
         existing_conversation = next(
@@ -16584,6 +16795,17 @@ def enqueue_hosted_turn(
             conversation_profile = (
                 str(conversation.get("profile") or "default").strip() or "default"
             )
+        # Start the official 0.20 gateway before the second durable-state
+        # transaction and before routing. For a brand-new chat there is no
+        # server conversation yet, so use the same stable id/profile context
+        # that the create-if-missing enqueue will persist moments later.
+        prewarm_conversation = conversation or {
+            "id": conversation_id,
+            "owner_id": owner_id,
+            "account_generation": account_generation,
+            "profile": conversation_profile,
+            "runtime_sessions": {},
+        }
         runtime_binding = _required_runtime_binding(
             conversation_profile,
             required_provider=str(
@@ -16627,6 +16849,10 @@ def enqueue_hosted_turn(
                         "size": int(file_record.get("size") or 0),
                     }
                 )
+    if replay_response is None or str(
+        (replay_response.get("hosted_turn") or {}).get("status") or ""
+    ) not in _HOSTED_TERMINAL_STATUSES:
+        _prewarm_hosted_chat(prewarm_conversation)
     if replay_response is not None:
         replay_response["runtime_binding"] = runtime_binding
         hosted = replay_response.get("hosted_turn")

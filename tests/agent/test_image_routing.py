@@ -12,11 +12,64 @@ from agent.image_routing import (
     _coerce_mode,
     _explicit_aux_vision_override,
     _lookup_supports_vision,
+    _should_probe_ollama_vision,
     _supports_vision_override,
     build_native_content_parts,
     decide_image_input_mode,
     extract_image_refs,
 )
+
+
+class TestOllamaVisionProbeRouting:
+    def test_known_cloud_provider_endpoint_skips_local_server_probe(self):
+        with patch("agent.model_metadata.detect_local_server_type") as detect:
+            assert (
+                _should_probe_ollama_vision(
+                    "zai",
+                    "https://api.z.ai/api/paas/v4",
+                )
+                is False
+            )
+        detect.assert_not_called()
+
+    def test_unknown_custom_endpoint_still_detects_ollama(self):
+        with patch(
+            "agent.model_metadata.detect_local_server_type",
+            return_value="ollama",
+        ) as detect:
+            assert (
+                _should_probe_ollama_vision(
+                    "custom",
+                    "http://192.168.1.50:11434/v1",
+                )
+                is True
+            )
+        detect.assert_called_once_with("http://192.168.1.50:11434/v1")
+
+    def test_public_custom_endpoint_skips_local_server_probe(self):
+        with patch("agent.model_metadata.detect_local_server_type") as detect:
+            assert (
+                _should_probe_ollama_vision(
+                    "custom:hubway.cc",
+                    "https://hubway.cc/v1",
+                )
+                is False
+            )
+        detect.assert_not_called()
+
+    def test_explicit_public_ollama_provider_keeps_native_probe(self):
+        with patch(
+            "agent.model_metadata.detect_local_server_type",
+            return_value="ollama",
+        ) as detect:
+            assert (
+                _should_probe_ollama_vision(
+                    "custom:my-ollama",
+                    "https://models.example.com/v1",
+                )
+                is True
+            )
+        detect.assert_not_called()
 
 
 # ─── _coerce_mode ────────────────────────────────────────────────────────────

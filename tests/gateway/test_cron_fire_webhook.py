@@ -161,7 +161,7 @@ async def test_sync_verifier_runs_off_the_event_loop(adapter, monkeypatch):
 
     def blocking_verifier(**kw):
         seen["thread_id"] = threading.get_ident()
-        return {"purpose": "cron_fire"}
+        return _claims("off-loop")
 
     spy = _SpyProvider()
     monkeypatch.setattr("cron.scheduler_provider.resolve_cron_scheduler", lambda: spy)
@@ -174,7 +174,7 @@ async def test_sync_verifier_runs_off_the_event_loop(adapter, monkeypatch):
     async with TestClient(TestServer(app)) as cli:
         resp = await cli.post("/api/cron/fire",
                               headers={"Authorization": "Bearer good"},
-                              json={"job_id": "off-loop"})
+                              json={"job_id": "off-loop", "fire_at": _FIRE_AT})
         assert resp.status == 202
 
     # If the verifier had run inline on the loop, its thread id would equal the
@@ -219,7 +219,7 @@ async def test_async_verifier_is_awaited(adapter, monkeypatch):
     monkeypatch.setattr("cron.scheduler_provider.resolve_cron_scheduler", lambda: spy)
 
     async def async_verifier(**kw):
-        return {"purpose": "cron_fire", "aud": "agent:x"}
+        return _claims("async-ok")
 
     monkeypatch.setattr(
         "plugins.cron_providers.chronos.verify.get_fire_verifier",
@@ -230,7 +230,7 @@ async def test_async_verifier_is_awaited(adapter, monkeypatch):
     async with TestClient(TestServer(app)) as cli:
         resp = await cli.post("/api/cron/fire",
                               headers={"Authorization": "Bearer good"},
-                              json={"job_id": "async-ok"})
+                              json={"job_id": "async-ok", "fire_at": _FIRE_AT})
         assert resp.status == 202
 
     for _ in range(50):
