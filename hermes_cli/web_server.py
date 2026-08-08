@@ -18440,6 +18440,11 @@ def _mount_plugin_api_routes():
         if not api_path.exists():
             _log.warning("Plugin %s declares api=%s but file not found", plugin["name"], api_file_name)
             continue
+        # Plugin API files may import sibling modules (e.g. collab_bridge.py
+        # beside plugin_api.py). Expose the plugin dashboard directory so the
+        # module namespace resolves those imports.
+        if str(dashboard_dir) not in sys.path:
+            sys.path.insert(0, str(dashboard_dir))
         try:
             module_name = f"hermes_dashboard_plugin_{plugin['name']}"
             spec = importlib.util.spec_from_file_location(module_name, api_path)

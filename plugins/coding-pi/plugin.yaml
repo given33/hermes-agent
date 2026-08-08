@@ -1,0 +1,7 @@
+name: coding-pi
+version: 1.0.0
+description: "Dispatch independent oh-my-pi coding sessions from Hermes while preserving Chat, Group Chat, and Workflow concurrency."
+author: Hermes
+kind: standalone
+provides_tools:
+  - coding_pi_dispatch

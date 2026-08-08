@@ -1,0 +1,15 @@
+{
+  "name": "coding-pi",
+  "label": "Coding",
+  "description": "Hermes bridge for the unmodified oh-my-pi coding agent RPC runtime.",
+  "icon": "Code2",
+  "version": "1.0.0",
+  "tab": {
+    "path": "/coding",
+    "position": "after:chat",
+    "hidden": true
+  },
+  "entry": "",
+  "css": null,
+  "api": "plugin_api.py"
+}
