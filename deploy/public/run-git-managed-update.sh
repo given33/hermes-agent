@@ -63,6 +63,7 @@ printf '%s' "${remote_commit}" >"${agent_root}/.hermes-product-commit"
 
 # pip must run as the service user: running it as root chowns the venv
 # files and the service user can no longer import hermes_cli.
+chown -R "${service_user:-hermes-agent}:${service_user:-hermes-agent}"   "${agent_root}/.venv" 2>/dev/null || true
 service_user="$(stat -c '%U' "${agent_root}/.venv/bin/python" 2>/dev/null || echo hermes-agent)"
 runuser -u "${service_user}" -- \
   "${agent_root}/.venv/bin/python" -m pip install -q -e "${agent_root}" \
