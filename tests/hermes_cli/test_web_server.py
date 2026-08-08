@@ -1327,7 +1327,9 @@ class TestWebServerEndpoints:
         cfg = load_config()
         model_cfg = cfg.get("model")
         assert isinstance(model_cfg, dict)
-        assert model_cfg["provider"] == "custom"
+        # Explicit endpoints use a stable identity so a later session cannot
+        # resolve the bare custom bucket to a different saved relay.
+        assert model_cfg["provider"] == "custom:text.example.com"
         assert model_cfg["base_url"] == "https://text.example.com/v1"
         assert model_cfg["api_key"] == "sk-secret"
 
