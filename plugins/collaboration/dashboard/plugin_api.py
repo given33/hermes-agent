@@ -9076,11 +9076,18 @@ def _run_hosted_remote_role(
         # has accepted the role. Do not wait for the much longer remote run
         # deadline: hand the role to the server Hermes runtime while retaining
         # the original role/profile in the audit record.
+        lease_owner = str(remote.get("lease_owner") or "").strip()
+        lease_until = _nonnegative_int(remote.get("lease_until"))
+        lease_expired = (
+            bool(lease_owner)
+            and lease_until > 0
+            and int(time.time() * 1000) >= lease_until
+        )
         unclaimed = (
             status in {"queued", "leased"}
-            and not str(remote.get("lease_owner") or "").strip()
             and not _nonnegative_int(remote.get("started_at"))
             and not str(remote.get("remote_task_id") or "").strip()
+            and (not lease_owner or lease_expired)
         )
         if unclaimed and time.monotonic() >= fallback_deadline:
             now = int(time.time() * 1000)
@@ -9167,6 +9174,18 @@ def _run_hosted_remote_role(
                 visible=False,
             )
             return fallback_result, fallback_status, fallback_state
+        remote_deadline = _positive_int(remote.get("deadline_at"))
+        if (
+            remote_deadline is not None
+            and int(time.time() * 1000) >= remote_deadline
+        ):
+            _advance_remote_run_deadline(active_remote_id)
+            with _STATE_LOCK:
+                state = load_single_state()
+                location = _remote_run_location(state, active_remote_id)
+                if location is not None:
+                    remote = dict(location[3])
+            status = str(remote.get("status") or "queued")
         if status in _REMOTE_TERMINAL_STATUSES:
             pending_intervention = _pending_hosted_role_intervention(
                 conversation_id,
