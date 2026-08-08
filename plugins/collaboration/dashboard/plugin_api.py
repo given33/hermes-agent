@@ -9147,10 +9147,6 @@ def _run_hosted_remote_role(
                 runner=run_profile_turn,
                 kanban_task_id="",
                 start_text="远程成员不可达，已切换服务器 Hermes 兜底。",
-                artifact_required=artifact_required,
-                delivery_context=delivery_context,
-                attachment_context=attachment_context,
-                rework_round=rework_round,
                 visible=True,
             )
             fallback_state = dict(fallback_state)
