@@ -427,6 +427,20 @@ def ensure_mcp_discovery_started() -> None:
         )
 
 
+def _hosted_gateway_defers_mcp_discovery() -> bool:
+    """Return whether the hosted gateway should wait for an explicit tool turn.
+
+    Mobile hosted chat creates a persistent gateway before the user sends a
+    message.  Starting every configured MCP server from ``main()`` makes that
+    idle process perform network/stdio handshakes even when the session is a
+    plain text-only chat.  The hosted server can still call
+    ``ensure_mcp_discovery_started()`` when a later turn is explicitly routed
+    to tools; this flag only moves discovery off the gateway-ready boundary.
+    """
+
+    return os.environ.get("HERMES_HOSTED_GATEWAY_LAZY_MCP") == "1"
+
+
 def main():
     _install_sidecar_publisher()
 
@@ -438,7 +452,12 @@ def main():
     # already-spawning fast servers land in the tool snapshot.  The config
     # gate inside ensure_mcp_discovery_started keeps the ~200ms MCP SDK
     # import cost entirely off the path for users with no mcp_servers.
-    ensure_mcp_discovery_started()
+    if _hosted_gateway_defers_mcp_discovery():
+        logger.info(
+            "Hosted gateway: deferring MCP discovery until a tool-enabled turn"
+        )
+    else:
+        ensure_mcp_discovery_started()
 
     if not write_json({
         "jsonrpc": "2.0",

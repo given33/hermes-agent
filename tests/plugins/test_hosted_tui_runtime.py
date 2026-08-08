@@ -261,6 +261,28 @@ def test_gateway_replays_early_session_info_as_ready_boundary():
     assert gateway._early_session_info == {}
 
 
+def test_tool_free_hosted_session_does_not_disable_reasoning():
+    gateway = _GatewayProcess.__new__(_GatewayProcess)
+    gateway._session_lock = threading.Lock()
+    gateway._sessions_by_conversation = {}
+    gateway._sessions_by_live = {}
+    gateway.live_session_id = ""
+    gateway.stored_session_id = ""
+    calls = []
+    gateway.rpc = lambda method, params, *, timeout: calls.append(
+        (method, params, timeout)
+    ) or {"session_id": "live-a", "stored_session_id": "stored-a"}
+
+    gateway.ensure_session(
+        "conversation-a",
+        artifact_context={"allow_tools": "0"},
+    )
+
+    assert calls[0][0] == "session.create"
+    assert calls[0][1]["allow_tools"] is False
+    assert "reasoning_effort" not in calls[0][1]
+
+
 def test_gateway_runs_distinct_sessions_without_account_wide_serialization():
     gateway = _GatewayProcess.__new__(_GatewayProcess)
     gateway.last_used = 0.0

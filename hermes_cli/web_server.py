@@ -1740,7 +1740,12 @@ def _audio_extension_for_mime(mime_type: str) -> str:
     return _AUDIO_MIME_EXTENSIONS.get(normalized, ".webm")
 
 
-def _normalize_main_model_assignment(provider: str, model: str) -> tuple[str, str]:
+def _normalize_main_model_assignment(
+    provider: str,
+    model: str,
+    *,
+    base_url: str = "",
+) -> tuple[str, str]:
     """Normalize a main-slot (provider, model) pair before persisting.
 
     The Models page has two assignment paths and only one of them was safe:
@@ -1783,6 +1788,17 @@ def _normalize_main_model_assignment(provider: str, model: str) -> tuple[str, st
     prov_in = (provider or "").strip()
     model_in = (model or "").strip()
     canonical = normalize_provider(prov_in)
+
+    # The custom-model editor supplies the endpoint explicitly.  A bare
+    # ``custom`` in that request means "this URL", not "the first legacy
+    # custom_providers entry".  Resolving it through the compatibility list
+    # here can silently bind a newly entered endpoint to an older provider
+    # (for example, saving DeepSeek while the list still starts with Hubway),
+    # leaving model.base_url and model.provider describing different routes.
+    # Keep the explicit endpoint assignment intact; the caller registers it
+    # and upgrades it to a stable custom:<name> identity below.
+    if base_url.strip() and prov_in.lower() in {"custom", "local"}:
+        return prov_in, model_in
 
     # User-declared providers are real routing targets, not analytics vendor
     # labels. Resolve them before the unknown-vendor fallback. ``providers:``
@@ -7612,7 +7628,11 @@ def _apply_model_assignment_sync(
             "none", "minimal", "low", "medium", "high", "xhigh", "max", "ultra",
         }:
             raise HTTPException(status_code=400, detail="unsupported reasoning_effort")
-        provider, model = _normalize_main_model_assignment(provider, model)
+        provider, model = _normalize_main_model_assignment(
+            provider,
+            model,
+            base_url=base_url,
+        )
         providers_cfg = cfg.get("providers")
         provider_entry = providers_cfg.get(provider) if isinstance(providers_cfg, dict) else None
         if not base_url and isinstance(provider_entry, dict) and provider_entry.get("base_url"):
@@ -7690,6 +7710,30 @@ def _apply_model_assignment_sync(
                     model,
                     name=_auto_provider_name(base_url),
                 )
+
+                # ``_save_custom_provider`` has now made the endpoint
+                # discoverable.  Persist its durable identity instead of the
+                # ambiguous bare ``custom`` bucket so every new hosted/TUI
+                # session resolves the same URL and credentials.
+                if provider.strip().lower() == "custom":
+                    from hermes_cli.runtime_provider import canonical_custom_identity
+
+                    stable_provider = canonical_custom_identity(
+                        base_url=base_url,
+                        model=model,
+                        config_provider=provider,
+                    )
+                    if stable_provider:
+                        refreshed_cfg = load_config()
+                        refreshed_model = refreshed_cfg.get("model")
+                        if not isinstance(refreshed_model, dict):
+                            refreshed_model = {}
+                        refreshed_model["provider"] = stable_provider
+                        refreshed_cfg["model"] = refreshed_model
+                        save_config(refreshed_cfg)
+                        cfg = refreshed_cfg
+                        model_cfg = refreshed_model
+                        provider = stable_provider
             except Exception:
                 # Never block the assignment on the bookkeeping write —
                 # model.* is already persisted and routable.

@@ -2125,12 +2125,13 @@ def _start_agent_build(sid: str, session: dict) -> None:
                 except Exception:
                     session_db = None
 
-            try:
-                from tui_gateway.entry import ensure_mcp_discovery_started
+            if current.get("create_allow_tools") is not False:
+                try:
+                    from tui_gateway.entry import ensure_mcp_discovery_started
 
-                ensure_mcp_discovery_started()
-            except Exception:
-                logger.warning("MCP discovery startup failed", exc_info=True)
+                    ensure_mcp_discovery_started()
+                except Exception:
+                    logger.warning("MCP discovery startup failed", exc_info=True)
 
             try:
                 # Lazy-resumed (watch) sessions carry the stored conversation
@@ -2158,6 +2159,8 @@ def _start_agent_build(sid: str, session: dict) -> None:
                         kw["reasoning_config_override"] = reasoning
                     if (tier := current.get("create_service_tier_override")) is not None:
                         kw["service_tier_override"] = tier
+                if current.get("create_allow_tools") is False:
+                    kw["skip_mcp_discovery"] = True
                 agent = _make_agent(sid, key, **kw)
             finally:
                 _clear_session_context(tokens)
@@ -6284,6 +6287,7 @@ def _make_agent(
     reasoning_config_override: dict | None = None,
     service_tier_override: str | None = None,
     platform_override: str | None = None,
+    skip_mcp_discovery: bool = False,
 ):
     # AC-4 test seam: dead unless explicitly armed by the isolated certify
     # harness. Both inline and compute-host paths construct through _make_agent,
@@ -6302,18 +6306,19 @@ def _make_agent(
     # to land before building — bounded, so a slow/dead server still can't
     # block. Dashboard /api/ws uses hermes_cli.mcp_startup; TUI stdio keeps
     # its existing tui_gateway.entry-owned thread.
-    try:
-        from hermes_cli.mcp_startup import wait_for_mcp_discovery
+    if not skip_mcp_discovery:
+        try:
+            from hermes_cli.mcp_startup import wait_for_mcp_discovery
 
-        wait_for_mcp_discovery()
-    except Exception:
-        pass
-    try:
-        from tui_gateway.entry import wait_for_mcp_discovery
+            wait_for_mcp_discovery()
+        except Exception:
+            pass
+        try:
+            from tui_gateway.entry import wait_for_mcp_discovery
 
-        wait_for_mcp_discovery()
-    except Exception:
-        pass
+            wait_for_mcp_discovery()
+        except Exception:
+            pass
 
     cfg = _load_cfg()
     agent_cfg = cfg.get("agent") or {}
@@ -6395,7 +6400,26 @@ def _make_agent(
             if override_api_key:
                 runtime["api_key"] = override_api_key
             if override_api_mode:
-                runtime["api_mode"] = override_api_mode
+                # ``resolve_runtime_provider`` already validates the wire
+                # protocol against the resolved endpoint.  Re-applying a raw
+                # persisted session value here can resurrect a stale
+                # ``codex_responses`` selection on a generic custom relay
+                # (or a stale ``chat_completions`` selection on direct
+                # OpenAI), sending the request through the wrong transport.
+                # This is especially costly for hosted mobile chat: a relay
+                # may accept the Responses request, emit thinking events, and
+                # never produce the visible message that the client waits for.
+                resolved_api_mode = str(runtime.get("api_mode") or "").strip()
+                if resolved_api_mode and resolved_api_mode != str(override_api_mode):
+                    logger.info(
+                        "Ignoring persisted session api_mode=%s; using resolved "
+                        "api_mode=%s for %s",
+                        override_api_mode,
+                        resolved_api_mode,
+                        runtime.get("base_url") or override_base_url or "(unknown)",
+                    )
+                else:
+                    runtime["api_mode"] = override_api_mode
     else:
         model, requested_provider = _resolve_startup_runtime()
         if isinstance(model_override, str) and model_override:
@@ -6438,7 +6462,15 @@ def _make_agent(
             if service_tier_override is not None
             else _load_service_tier()
         ),
-        enabled_toolsets=_load_enabled_toolsets(),
+        # A plain hosted mobile chat is deliberately built as a tool-free
+        # session.  Passing ``[]`` here matters during construction: the
+        # normal ``None`` value means "all toolsets" to model_tools, so the
+        # later per-turn snapshot would still pay the cost of assembling the
+        # full registry/tool-search catalog before it can remove the tools.
+        # Explicit tool turns keep the configured profile toolsets.
+        enabled_toolsets=(
+            [] if skip_mcp_discovery else _load_enabled_toolsets()
+        ),
         # OpenRouter provider-routing prefs (config.yaml `provider_routing`).
         # Mirrors the messaging gateway + CLI so the desktop/TUI honors the same
         # routing instead of letting OpenRouter pick providers at random.
@@ -9275,6 +9307,94 @@ def _stop_notification_poller(session: dict, *, timeout: float = 1.0) -> None:
         thread.join(timeout=timeout)
 
 
+def _turn_tool_policy_snapshot(agent, allow_tools: bool | None) -> dict[str, Any] | None:
+    """Temporarily remove tools from one explicitly tool-free turn.
+
+    The official gateway keeps one AIAgent alive per session.  Mobile hosted
+    chat adds a per-turn route decision on top of that contract: a plain chat
+    should not send a large tool schema or allow an unrelated MCP call, while
+    a later explicit tool request can use the same warm agent again.  Keep all
+    mutable tool fields scoped to the synchronous turn and restore them in the
+    caller's ``finally`` block.  The model's configured reasoning policy is
+    deliberately left untouched: reasoning-capable upstreams such as
+    DeepSeek must receive their complete reasoning path even for a plain chat.
+    """
+
+    if allow_tools is not False:
+        return None
+    snapshot: dict[str, Any] = {}
+    for attribute in (
+        "tools",
+        "valid_tool_names",
+        "enabled_toolsets",
+        "_last_content_with_tools",
+        "_last_content_tools_all_housekeeping",
+    ):
+        if hasattr(agent, attribute):
+            snapshot[attribute] = getattr(agent, attribute)
+    if hasattr(agent, "tools"):
+        agent.tools = []
+    if hasattr(agent, "valid_tool_names"):
+        agent.valid_tool_names = set()
+    if hasattr(agent, "enabled_toolsets"):
+        agent.enabled_toolsets = []
+    if hasattr(agent, "_last_content_with_tools"):
+        agent._last_content_with_tools = None
+    if hasattr(agent, "_last_content_tools_all_housekeeping"):
+        agent._last_content_tools_all_housekeeping = False
+    return snapshot
+
+
+def _restore_turn_tool_policy(agent, snapshot: dict[str, Any] | None) -> None:
+    if not snapshot:
+        return
+    for attribute, value in snapshot.items():
+        setattr(agent, attribute, value)
+
+
+def _ensure_hosted_tools_for_turn(
+    sid: str,
+    session: dict,
+    agent,
+    allow_tools: bool | None,
+) -> None:
+    """Hydrate MCP tools only when a fast hosted session first needs them.
+
+    A plain mobile chat session is intentionally built without waiting for
+    MCP discovery.  If a later routed turn explicitly needs tools, activate
+    discovery at that boundary and refresh the agent's tool snapshot before
+    constructing the model request.  This keeps the ordinary-chat path fast
+    without leaving a persistent session permanently tool-less.
+    """
+
+    if allow_tools is not True or session.get("create_allow_tools") is not False:
+        return
+    if session.get("_hosted_tools_hydrated"):
+        return
+    try:
+        from tui_gateway.entry import (
+            ensure_mcp_discovery_started,
+            wait_for_mcp_discovery,
+        )
+
+        ensure_mcp_discovery_started()
+        wait_for_mcp_discovery()
+        from tools.mcp_tool import refresh_agent_mcp_tools
+
+        refresh_agent_mcp_tools(agent, quiet_mode=True)
+    except Exception:
+        # Built-in tools remain usable if an optional MCP server is down.  A
+        # later explicit /reload-mcp can still retry discovery, matching the
+        # official gateway's fail-open behavior.
+        logger.warning(
+            "Hosted tool hydration failed for session %s",
+            sid,
+            exc_info=True,
+        )
+    finally:
+        session["_hosted_tools_hydrated"] = True
+
+
 def _run_prompt_submit(
     rid,
     sid: str,
@@ -9285,6 +9405,7 @@ def _run_prompt_submit(
     display_metadata: dict | None = None,
     image_paths: list[str] | None = None,
     queued_prompt_generation: int | None = None,
+    allow_tools: bool | None = None,
 ) -> None:
     with session["history_lock"]:
         if (
@@ -9585,7 +9706,12 @@ def _run_prompt_submit(
             if display_kind and "persist_user_display_kind" in _run_params:
                 run_kwargs["persist_user_display_kind"] = display_kind
                 run_kwargs["persist_user_display_metadata"] = display_metadata
-            result = agent.run_conversation(run_message, **run_kwargs)
+            _ensure_hosted_tools_for_turn(sid, session, agent, allow_tools)
+            tool_policy_snapshot = _turn_tool_policy_snapshot(agent, allow_tools)
+            try:
+                result = agent.run_conversation(run_message, **run_kwargs)
+            finally:
+                _restore_turn_tool_policy(agent, tool_policy_snapshot)
             if display_kind and isinstance(text, str):
                 db = getattr(agent, "_session_db", None)
                 current_session_id = getattr(agent, "session_id", None) or session.get("session_key")

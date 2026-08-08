@@ -164,6 +164,26 @@ def _account_generation_for_conversation(conversation: dict[str, Any]) -> str:
     return generation or "legacy"
 
 
+def _hosted_event_account_generation(conversation: dict[str, Any]) -> str:
+    """Return a hosted conversation's captured generation without a DB hit.
+
+    Live hosted projections are emitted once per model delta. Looking up the
+    account generation through ``MobileDeviceStore`` in that hot path opens a
+    SQLite connection for every reasoning token; under the mobile API this
+    serialized the event callback and could leave a completed gateway turn
+    appearing to spin for tens of seconds. New conversations always carry
+    their generation, while the fallback preserves compatibility for legacy
+    in-memory/local records that predate the field.
+    """
+
+    captured = str(conversation.get("account_generation") or "").strip()
+    if captured:
+        return captured
+    return _account_generation_for_owner(
+        str(conversation.get("owner_id") or LOCAL_OWNER_ID)
+    )
+
+
 async def _run_mobile_write_approval_recovery_loop(stop: asyncio.Event) -> None:
     while not stop.is_set():
         try:
@@ -331,6 +351,11 @@ _HOSTED_CANCEL_STATE_LOCK = threading.Lock()
 _HOSTED_CANCEL_SIGNALS: set[tuple[str, str]] = set()
 _HOSTED_CANCEL_CACHE: dict[tuple[str, str], tuple[float, bool]] = {}
 _HOSTED_CANCEL_CACHE_SECONDS = 0.75
+# A plain chat turn has no tool boundary at which an intervention can be
+# applied. Polling the full account-state JSON on every streamed reasoning
+# delta nevertheless made the model callback wait on disk I/O. Keep the
+# intervention path responsive while bounding that hot-path poll to 4 Hz.
+_HOSTED_INTERVENTION_POLL_SECONDS = 0.25
 _HOSTED_TERMINAL_STATUSES = {"completed", "failed", "cancelled"}
 _MOBILE_NOTIFICATION_TERMINAL_STATUSES = {
     "delivered",
@@ -514,9 +539,7 @@ def _publish_live_hosted_role_projection(
                     conversation[key] = list(value)
                 elif isinstance(value, dict):
                     conversation[key] = dict(value)
-        account_generation = _account_generation_for_owner(
-            str(conversation.get("owner_id") or LOCAL_OWNER_ID)
-        )
+        account_generation = _hosted_event_account_generation(conversation)
         for protocol_event in protocol_events or []:
             if not isinstance(protocol_event, dict):
                 continue
@@ -6516,10 +6539,14 @@ def _hosted_runtime_home(
 
 
 _HOSTED_PREWARM_LOCK = threading.Lock()
-_HOSTED_PREWARM_INFLIGHT: set[tuple[str, str, str, str]] = set()
+_HOSTED_PREWARM_INFLIGHT: set[tuple[str, str, str, str, bool]] = set()
 
 
-def _prewarm_hosted_chat(conversation: dict[str, Any]) -> None:
+def _prewarm_hosted_chat(
+    conversation: dict[str, Any],
+    *,
+    allow_tools: bool = True,
+) -> None:
     """Start the official Hermes 0.20 gateway while the user is reading or typing."""
 
     owner_id = str(conversation.get("owner_id") or LOCAL_OWNER_ID).strip()
@@ -6528,7 +6555,7 @@ def _prewarm_hosted_chat(conversation: dict[str, Any]) -> None:
     profile = str(conversation.get("profile") or "default").strip() or "default"
     if not conversation_id or not account_generation or conversation.get("delete_requested"):
         return
-    key = (owner_id, account_generation, conversation_id, profile)
+    key = (owner_id, account_generation, conversation_id, profile, bool(allow_tools))
     with _HOSTED_PREWARM_LOCK:
         if key in _HOSTED_PREWARM_INFLIGHT:
             return
@@ -6553,6 +6580,7 @@ def _prewarm_hosted_chat(conversation: dict[str, Any]) -> None:
                 artifact_root=str(get_hermes_home()),
                 import_root=_RUNTIME_IMPORT_ROOT,
                 requested_session_id=runtime_session_id,
+                allow_tools=allow_tools,
                 extra_env={
                     "HERMES_API_MAX_RETRIES": str(_HOSTED_CHAT_API_ATTEMPTS),
                     "HERMES_API_RETRY_CLIENT_ERRORS": "1",
@@ -6577,6 +6605,36 @@ def _prewarm_hosted_chat(conversation: dict[str, Any]) -> None:
         name=f"hermes-prewarm-{conversation_id[-12:]}",
         daemon=True,
     ).start()
+
+
+def _hosted_conversation_prewarm_allows_tools(
+    conversation: dict[str, Any],
+) -> bool:
+    """Keep existing work conversations fully capable while opening chat fast.
+
+    A newly-created single conversation has no message that can require an
+    MCP tool, so its background session can skip discovery.  Once a
+    conversation contains an explicit work/tool turn, retain the normal
+    capability-rich prewarm when the user reopens it.
+    """
+
+    hosted_turns = conversation.get("hosted_turns")
+    if isinstance(hosted_turns, dict):
+        for run in hosted_turns.values():
+            if isinstance(run, dict) and _hosted_turn_allows_tools(run):
+                return True
+    messages = conversation.get("messages")
+    if isinstance(messages, list):
+        for message in messages:
+            if not isinstance(message, dict):
+                continue
+            meta = message.get("meta")
+            if isinstance(meta, dict) and (
+                _coerce_flag(meta.get("artifact_required"))
+                or any(str(item).strip() for item in meta.get("attachments") or [])
+            ):
+                return True
+    return False
 
 
 def run_profile_turn(
@@ -6682,6 +6740,9 @@ def run_profile_turn(
                 ),
                 import_root=_RUNTIME_IMPORT_ROOT,
                 requested_session_id=str(session_id or ""),
+                allow_tools=str(
+                    artifact_context.get("allow_tools", "1")
+                ).strip().lower() not in {"0", "false", "no", "off"},
                 event_callback=event_callback,
                 cancel_check=cancel_check,
                 timeout=timeout,
@@ -7589,6 +7650,40 @@ def _runner_supports_events(runner: Callable[..., Any]) -> bool:
     return _runner_supports_keyword(runner, "event_callback")
 
 
+def _hosted_turn_allows_tools(run: dict[str, Any]) -> bool:
+    """Skip tool/MCP discovery for ordinary one-shot chat turns.
+
+    A hosted chat process is short-lived, so discovering every configured MCP
+    before the model sees a trivial message is directly on the first-token
+    path.  The router already records the small set of chat requests that
+    genuinely need tools (for example, a local iOS capability or a file
+    artifact); preserve tools for those requests and for all work turns.
+    """
+
+    route_metadata = (
+        run.get("route_metadata")
+        if isinstance(run.get("route_metadata"), dict)
+        else {}
+    )
+    mode = str(
+        run.get("mode") or route_metadata.get("mode") or "work"
+    ).strip().lower()
+    if mode != "chat":
+        return True
+    if _coerce_flag(run.get("artifact_required")) or _coerce_flag(
+        route_metadata.get("artifact_required")
+    ):
+        return True
+    if any(str(item).strip() for item in run.get("attachment_ids") or []):
+        return True
+    if _coerce_flag(route_metadata.get("needs_tools")):
+        return True
+    return any(
+        str(item).strip()
+        for item in route_metadata.get("capability_hints") or []
+    )
+
+
 def _invoke_profile_runner(
     runner: Callable[..., str],
     profile: str,
@@ -7910,13 +8005,21 @@ def _run_hosted_role(
     captured_generation = str(
         getattr(_HOSTED_EXECUTION_GENERATION, "value", "")
     ).strip()
-    live_generation = _account_generation_for_owner(artifact_owner_id)
+    # start_hosted_workflow validates and captures the account generation once
+    # before entering the role. Reopening MobileDeviceStore here is redundant
+    # for every role setup (and costs a SQLite open on the first-token path).
+    # Direct/test callers without the execution capture retain the validated
+    # store lookup fallback.
+    live_generation = (
+        captured_generation
+        or _account_generation_for_owner(artifact_owner_id)
+    )
     if captured_generation and captured_generation != live_generation:
         raise RuntimeError("stale hosted turn account generation")
-    # Every model turn receives the complete Hermes tool contract. Routing
-    # metadata describes likely use, but must never remove capabilities before
-    # the model has inspected the user's message itself.
-    allow_tools = True
+    # Ordinary hosted chat turns do not need the expensive MCP/tool discovery
+    # path.  Explicit tool/capability requests and all work turns retain the
+    # full contract; a plain "你好" should reach the model directly.
+    allow_tools = _hosted_turn_allows_tools(artifact_run)
     artifact_context = {
         "root": str(get_hermes_home()),
         "owner_id": artifact_owner_id,
@@ -7936,7 +8039,7 @@ def _run_hosted_role(
             ) or []
             if str(item).strip()
         ],
-        "allow_tools": "1",
+        "allow_tools": "1" if allow_tools else "0",
     }
     state = {
         "content": "",
@@ -8056,11 +8159,23 @@ def _run_hosted_role(
     last_persisted_at = 0.0
     first_visible_published = False
     last_live_published_at = 0.0
+    last_intervention_poll_at = 0.0
     atomic_depth = 0
 
     def claim_pending_intervention(
         deliveries: Optional[set[str]] = None,
+        *,
+        force: bool = False,
     ) -> Optional[dict[str, Any]]:
+        nonlocal last_intervention_poll_at
+        now = time.monotonic()
+        if (
+            not force
+            and now - last_intervention_poll_at
+            < _HOSTED_INTERVENTION_POLL_SECONDS
+        ):
+            return None
+        last_intervention_poll_at = now
         pending = _pending_hosted_role_intervention(
             conversation_id,
             turn_id,
@@ -8100,14 +8215,7 @@ def _run_hosted_role(
             return True
         if atomic_depth != 0:
             return False
-        pending = _pending_hosted_role_intervention(
-            conversation_id,
-            turn_id,
-            role_stage=role_stage,
-            profile=profile,
-            include_processing=True,
-            deliveries={"steer"},
-        )
+        pending = claim_pending_intervention({"steer"})
         if not isinstance(pending, dict):
             return False
         if str(pending.get("status") or "pending") == "pending":
@@ -8167,7 +8275,7 @@ def _run_hosted_role(
         protocol_event = event
         event_type = str(event.get("type") or "")
         if event_type in {"tool.start", "subagent.start"} and atomic_depth == 0:
-            intervention = claim_pending_intervention({"steer"})
+            intervention = claim_pending_intervention({"steer"}, force=True)
             if isinstance(intervention, dict):
                 raise _HostedRoleIntervention(intervention)
         if event_type in {"tool.start", "subagent.start"}:
@@ -8335,7 +8443,10 @@ def _run_hosted_role(
         if should_persist:
             persist()
         if atomic_depth == 0:
-            intervention = claim_pending_intervention({"steer"})
+            intervention = claim_pending_intervention(
+                {"steer"},
+                force=event_type in {"tool.complete", "subagent.complete"},
+            )
             if isinstance(intervention, dict):
                 persist()
                 raise _HostedRoleIntervention(intervention)
@@ -8366,7 +8477,7 @@ def _run_hosted_role(
                 state["runtime_message_before"] = int(
                     before.get("tip_message_id") or 0
                 )
-            intervention = claim_pending_intervention({"steer"})
+            intervention = claim_pending_intervention({"steer"}, force=True)
             if isinstance(intervention, dict):
                 raise _HostedRoleIntervention(intervention)
             result = _invoke_profile_runner(
@@ -8379,7 +8490,10 @@ def _run_hosted_role(
                 cancellation_requested,
                 artifact_context,
             ).strip()
-            intervention = claim_pending_intervention({"steer", "follow_up"})
+            intervention = claim_pending_intervention(
+                {"steer", "follow_up"},
+                force=True,
+            )
             if isinstance(intervention, dict):
                 raise _HostedRoleIntervention(intervention)
             if not result:
@@ -8430,7 +8544,7 @@ def _run_hosted_role(
                 and isinstance(exc, _HostedTurnCancelled)
                 and not _hosted_turn_cancellation_requested(conversation_id, turn_id)
             ):
-                intervention = claim_pending_intervention({"steer"})
+                intervention = claim_pending_intervention({"steer"}, force=True)
             if isinstance(intervention, dict):
                 checkpoint = dict(intervention.get("checkpoint") or {})
                 if not checkpoint:
@@ -10877,6 +10991,26 @@ def _hosted_turn_cancellation_requested(
         cached = _HOSTED_CANCEL_CACHE.get(cancel_key)
         if cached is not None and now - cached[0] < _HOSTED_CANCEL_CACHE_SECONDS:
             return cached[1]
+    with _HOSTED_LIVE_STATE_LOCK:
+        live_conversation = _HOSTED_LIVE_CONVERSATIONS.get(
+            str(conversation_id or "").strip()
+        )
+        live_turns = (
+            live_conversation.get("hosted_turns")
+            if isinstance(live_conversation, dict)
+            else None
+        )
+        live_run = live_turns.get(turn_id) if isinstance(live_turns, dict) else None
+        if isinstance(live_run, dict):
+            requested = bool(
+                live_run.get("cancel_requested")
+                or live_run.get("status") == "cancelled"
+            )
+            with _HOSTED_CANCEL_STATE_LOCK:
+                _HOSTED_CANCEL_CACHE[cancel_key] = (now, requested)
+                if requested:
+                    _HOSTED_CANCEL_SIGNALS.add(cancel_key)
+            return requested
     with _STATE_LOCK:
         state = load_single_state()
         conversation = _conversation_by_id(state, conversation_id)
@@ -10896,6 +11030,25 @@ def _finish_hosted_turn_if_cancelled(
     conversation_id: str,
     turn_id: str,
 ) -> bool:
+    # The live projection is updated by the enqueue/cancel transactions. A
+    # normal chat almost always has no cancellation; avoid reopening the full
+    # durable JSON just to prove that negative case. If the live projection
+    # says cancellation is possible, fall through to the authoritative write.
+    with _HOSTED_LIVE_STATE_LOCK:
+        live_conversation = _HOSTED_LIVE_CONVERSATIONS.get(
+            str(conversation_id or "").strip()
+        )
+        if isinstance(live_conversation, dict):
+            live_turns = live_conversation.get("hosted_turns")
+            live_run = (
+                live_turns.get(turn_id)
+                if isinstance(live_turns, dict)
+                else None
+            )
+            if isinstance(live_run, dict) and not _coerce_flag(
+                live_run.get("cancel_requested")
+            ):
+                return False
     with _STATE_LOCK:
         state = load_single_state()
         conversation = _conversation_by_id(state, conversation_id)
@@ -11831,6 +11984,7 @@ def execute_hosted_workflow(
     if captured_generation and captured_generation != live_generation:
         raise RuntimeError("stale hosted turn account generation")
     execution_generation = captured_generation or live_generation
+    chat_mode = False
     with _STATE_LOCK:
         state = load_single_state()
         conversation = _conversation_by_id(state, conversation_id)
@@ -11839,17 +11993,35 @@ def execute_hosted_workflow(
             raise RuntimeError("托管任务记录不存在")
         if run.get("status") in _HOSTED_TERMINAL_STATUSES:
             return
-        run["status"] = "running"
-        if str(run.get("stage") or "") in {"", "accepted", "queued", "preparing"}:
-            run["stage"] = "routing"
-        run.setdefault("started_at", int(time.time() * 1000))
-        run["updated_at"] = int(time.time() * 1000)
-        _ensure_hosted_output_baseline(conversation_id, run)
-        save_single_state(state)
         conversation_snapshot = dict(conversation)
         run = dict(run)
+        route_metadata = (
+            run.get("route_metadata")
+            if isinstance(run.get("route_metadata"), dict)
+            else {}
+        )
+        chat_mode = str(
+            run.get("mode") or route_metadata.get("mode") or "work"
+        ).lower() == "chat"
+        if not chat_mode:
+            run_record = (conversation.get("hosted_turns") or {}).get(turn_id)
+            if not isinstance(run_record, dict):
+                raise RuntimeError("hosted turn record does not exist")
+            run_record["status"] = "running"
+            if str(run_record.get("stage") or "") in {
+                "",
+                "accepted",
+                "queued",
+                "preparing",
+            }:
+                run_record["stage"] = "routing"
+            run_record.setdefault("started_at", int(time.time() * 1000))
+            run_record["updated_at"] = int(time.time() * 1000)
+            _ensure_hosted_output_baseline(conversation_id, run_record)
+            save_single_state(state)
+            run = dict(run_record)
 
-    if str(run.get("mode") or "work").lower() == "chat":
+    if chat_mode:
         execute_hosted_chat(
             conversation_id,
             turn_id,
@@ -13280,6 +13452,30 @@ def _next_hosted_turn_id(
 
 
 def _hosted_turn_account_generation(conversation_id: str, turn_id: str) -> str:
+    # Enqueue has already authenticated and captured this generation before
+    # the worker is started. The immutable live projection is the same
+    # ownership-scoped record used by the SSE route, so use it to avoid a
+    # second full single.json read plus MobileDeviceStore SQLite open before
+    # the first gateway prompt. Recovery paths without a live projection keep
+    # the authoritative durable/store validation below.
+    with _HOSTED_LIVE_STATE_LOCK:
+        live_conversation = _HOSTED_LIVE_CONVERSATIONS.get(
+            str(conversation_id or "").strip()
+        )
+        if isinstance(live_conversation, dict):
+            live_generation = str(
+                live_conversation.get("account_generation") or ""
+            ).strip()
+            live_run = (
+                (live_conversation.get("hosted_turns") or {}).get(turn_id)
+                if isinstance(live_conversation.get("hosted_turns"), dict)
+                else None
+            )
+            run_generation = str(
+                live_run.get("account_generation") or ""
+            ).strip() if isinstance(live_run, dict) else ""
+            if live_generation and (not run_generation or run_generation == live_generation):
+                return live_generation
     with _STATE_LOCK:
         state = load_single_state()
         conversation = _conversation_by_id(state, conversation_id)
@@ -15549,7 +15745,10 @@ def create_single_chat(payload: CreateSingleConversationBody, request: Request =
                 if not existing_generation:
                     existing["account_generation"] = account_generation
                     save_single_state(state)
-                _prewarm_hosted_chat(existing)
+                _prewarm_hosted_chat(
+                    existing,
+                    allow_tools=_hosted_conversation_prewarm_allows_tools(existing),
+                )
                 return {
                     "conversation": _public_conversation(existing),
                     "created": False,
@@ -15561,7 +15760,7 @@ def create_single_chat(payload: CreateSingleConversationBody, request: Request =
         conversation["account_generation"] = account_generation
         state["conversations"].insert(0, conversation)
         save_single_state(state)
-    _prewarm_hosted_chat(conversation)
+    _prewarm_hosted_chat(conversation, allow_tools=False)
     return {"conversation": _public_conversation(conversation), "created": True}
 
 
@@ -15639,7 +15838,10 @@ def get_single_conversation(
             save_single_state(state)
         result = {"conversation": _public_conversation(conversation)}
     resume_unfinished_hosted_workflows([conversation])
-    _prewarm_hosted_chat(conversation)
+    _prewarm_hosted_chat(
+        conversation,
+        allow_tools=_hosted_conversation_prewarm_allows_tools(conversation),
+    )
     return result
 
 
@@ -15943,9 +16145,7 @@ def _hosted_event_stream_frame(
         "reset_reason": page.reset_reason,
         "events": page.events,
         "snapshot_cursor": max(0, int(conversation.get("event_cursor") or 0)),
-        "account_generation": _account_generation_for_owner(
-            str(conversation.get("owner_id") or LOCAL_OWNER_ID)
-        ),
+        "account_generation": _hosted_event_account_generation(conversation),
     }
     if (
         include_snapshot
@@ -16744,6 +16944,26 @@ def enqueue_hosted_turn(
         not item.startswith("file_") for item in attachment_ids
     ):
         raise HTTPException(status_code=422, detail="Invalid attachment_ids")
+    # Classify before the first prewarm.  A new conversation has no durable
+    # row yet, so this is the only point where the enqueue request can tell the
+    # persistent official gateway that a trivial chat session may skip the
+    # MCP readiness join. Tool discovery is optional for plain chat; the
+    # configured model reasoning policy remains enabled and is never changed
+    # by this route decision.
+    deterministic_route = classify_user_intent(message_content)
+    fast_chat_prewarm = (
+        str(deterministic_route.get("mode") or "").strip().lower() == "chat"
+        and str(deterministic_route.get("lock_level") or "").strip().lower()
+        == "hard_chat"
+        and not _coerce_flag(deterministic_route.get("artifact_required"))
+        and not _coerce_flag(deterministic_route.get("needs_tools"))
+        and not any(
+            str(item).strip()
+            for item in deterministic_route.get("capability_hints") or []
+        )
+        and not attachment_ids
+    )
+    prewarm_allow_tools = not fast_chat_prewarm
     owner_id = owner_id_from_request(request)
     account_generation = _account_generation_for_request(request, owner_id)
     fingerprint = _enqueue_payload_fingerprint(
@@ -16763,7 +16983,7 @@ def enqueue_hosted_turn(
                 getattr(payload, "conversation_profile", "") or "default"
             ).strip() or "default",
             "runtime_sessions": {},
-        })
+        }, allow_tools=prewarm_allow_tools)
 
     route_attachments: list[dict[str, Any]] = []
     replay_response: Optional[dict[str, Any]] = None
@@ -16852,7 +17072,10 @@ def enqueue_hosted_turn(
     if replay_response is None or str(
         (replay_response.get("hosted_turn") or {}).get("status") or ""
     ) not in _HOSTED_TERMINAL_STATUSES:
-        _prewarm_hosted_chat(prewarm_conversation)
+        _prewarm_hosted_chat(
+            prewarm_conversation,
+            allow_tools=prewarm_allow_tools,
+        )
     if replay_response is not None:
         replay_response["runtime_binding"] = runtime_binding
         hosted = replay_response.get("hosted_turn")
@@ -16876,7 +17099,6 @@ def enqueue_hosted_turn(
     hard_chat_route: Optional[dict[str, Any]] = None
     hard_chat_profiles: list[str] = []
     hard_chat_artifact_required = False
-    deterministic_route = classify_user_intent(message_content)
     if (
         str(deterministic_route.get("mode") or "") == "chat"
         and str(deterministic_route.get("lock_level") or "") == "hard_chat"
@@ -17152,7 +17374,10 @@ def enqueue_hosted_turn(
             # but its JSON/atomic-I/O cost now overlaps agent imports and MCP
             # tool registration instead of delaying the first prompt.
             if not isinstance(pending_cancellation, dict):
-                _prewarm_hosted_chat(conversation)
+                _prewarm_hosted_chat(
+                    conversation,
+                    allow_tools=prewarm_allow_tools,
+                )
                 prewarm_started = True
             save_single_state(state)
             response = _enqueued_turn_response(
@@ -17174,7 +17399,10 @@ def enqueue_hosted_turn(
     hosted_response = response.get("hosted_turn") or {}
     if str(hosted_response.get("status") or "") not in _HOSTED_TERMINAL_STATUSES:
         if not prewarm_started:
-            _prewarm_hosted_chat(conversation)
+            _prewarm_hosted_chat(
+                conversation,
+                allow_tools=prewarm_allow_tools,
+            )
         if str(hosted_response.get("stage") or "") in {
             "routing_pending",
             "routing_failed",

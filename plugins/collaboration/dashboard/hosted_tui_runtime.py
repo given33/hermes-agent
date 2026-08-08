@@ -34,9 +34,16 @@ class HostedTuiGatewayCancelled(HostedTuiGatewayError):
 # ``message.complete`` is the user-visible completion boundary.  The gateway
 # emits a follow-up ``session.info`` after it clears ``session["running"]``;
 # that diagnostic snapshot can be delayed by inventory/probe work and must not
-# hold a completed reply hostage.  Keep a short grace period for the normal
-# fast path, but return the reply when the diagnostics are slower than that.
-_GATEWAY_IDLE_GRACE_SECONDS = 0.35
+# hold a completed reply hostage.  Keep only a tiny grace period: the child
+# gateway continues consuming the eventual session.info after run_turn
+# returns, so this boundary does not discard durable state; it only prevents
+# diagnostics from extending mobile terminal latency.
+_GATEWAY_IDLE_GRACE_SECONDS = 0.05
+
+
+def _allow_tools_from_context(artifact_context: dict[str, str]) -> bool:
+    raw = str(artifact_context.get("allow_tools", "1") or "1").strip().lower()
+    return raw not in {"0", "false", "no", "off"}
 
 
 @dataclass
@@ -342,6 +349,14 @@ class _GatewayProcess:
                 "close_on_disconnect": False,
                 "tool_artifact_context": dict(artifact_context),
             }
+            if not _allow_tools_from_context(artifact_context):
+                # This is a plain mobile chat turn.  Let the official gateway
+                # build the persistent session without joining MCP discovery;
+                # the server's late-refresh path can still add capabilities
+                # before a later explicit tool turn.
+                session_params.update({
+                    "allow_tools": False,
+                })
             if requested_session_id:
                 try:
                     result = self.rpc(
@@ -453,6 +468,7 @@ class _GatewayProcess:
                         "session_id": live_session_id,
                         "text": prompt,
                         "tool_artifact_turn_id": str(turn_id or ""),
+                        "allow_tools": _allow_tools_from_context(artifact_context),
                     },
                     timeout=min(30.0, timeout),
                 )
@@ -651,6 +667,11 @@ def _gateway_for(
             # this shared process never leaks artifacts across conversations.
             "HERMES_TOOL_ARTIFACT_CONVERSATION": "",
             "HERMES_ACCOUNT_GENERATION": account_generation,
+            # Plain hosted mobile chat must reach gateway.ready without
+            # starting every configured MCP server.  The session/build path
+            # and the first explicitly tool-enabled turn start discovery on
+            # demand through tui_gateway.server.
+            "HERMES_HOSTED_GATEWAY_LAZY_MCP": "1",
         }
         inherited = str(env.get("PYTHONPATH") or "").strip()
         env["PYTHONPATH"] = os.pathsep.join(
@@ -671,6 +692,7 @@ def prewarm_hosted_gateway(
     artifact_root: str,
     import_root: str,
     requested_session_id: str = "",
+    allow_tools: bool = True,
     extra_env: Optional[dict[str, str]] = None,
 ) -> None:
     """Start the official gateway and build its Agent off the request path.
@@ -703,6 +725,7 @@ def prewarm_hosted_gateway(
             "owner_id": owner_id,
             "conversation_id": conversation_id,
             "account_generation": account_generation,
+            "allow_tools": "1" if allow_tools else "0",
         },
     )
     # A bounded wait lets the prewarm overlap the user's typing without
@@ -724,6 +747,7 @@ def run_hosted_gateway_turn(
     artifact_root: str,
     import_root: str,
     requested_session_id: str = "",
+    allow_tools: bool = True,
     event_callback: Optional[Callable[[dict[str, Any]], None]] = None,
     cancel_check: Optional[Callable[[], bool]] = None,
     timeout: float = 600.0,
@@ -752,6 +776,7 @@ def run_hosted_gateway_turn(
             "owner_id": owner_id,
             "conversation_id": conversation_id,
             "account_generation": account_generation,
+            "allow_tools": "1" if allow_tools else "0",
         },
     )
 

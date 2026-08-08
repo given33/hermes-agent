@@ -1000,6 +1000,59 @@ def test_501_events_are_available_as_back_to_back_incremental_pages():
     assert has_more_after_second is False
 
 
+def test_live_projection_reuses_captured_generation_without_reopening_auth_db(
+    monkeypatch,
+):
+    module = _load_module()
+    conversation = module.create_single_conversation(profile="default")
+    conversation.update(
+        {
+            "owner_id": "owner@example.test",
+            "account_generation": "generation-captured",
+        }
+    )
+    module.create_hosted_turn_record(
+        conversation,
+        turn_id="turn-live",
+        content="hello",
+        title="hello",
+        profiles=["default"],
+        artifact_required=False,
+        mode="chat",
+    )
+    _bind_in_memory_state(module, conversation)
+    module._HOSTED_LIVE_CONVERSATIONS[conversation["id"]] = conversation
+    monkeypatch.setattr(
+        module,
+        "_account_generation_for_owner",
+        lambda _owner: (_ for _ in ()).throw(
+            AssertionError("live event hot path reopened mobile auth DB")
+        ),
+    )
+
+    module._publish_live_hosted_role_projection(
+        conversation["id"],
+        "turn-live",
+        protocol_events=[
+            {
+                "event_type": "message.delta",
+                "payload": {"text": "ok"},
+                "entity_id": "message-live",
+                "idempotency_key": "message-live-1",
+                "occurred_at": int(time.time() * 1000),
+                "role_stage": "chat",
+            }
+        ],
+    )
+
+    live = module._live_conversation_snapshot(
+        conversation["id"],
+        conversation["owner_id"],
+    )
+    assert live is not None
+    assert live["hosted_events"][0]["account_generation"] == "generation-captured"
+
+
 def test_gap_forces_authoritative_snapshot_even_for_incremental_frame():
     module = _load_module()
     conversation = module.create_single_conversation(profile="default")

@@ -13506,6 +13506,17 @@ def test_make_agent_waits_for_shared_mcp_discovery(monkeypatch):
     assert waited == [0.75]
 
 
+def test_make_agent_builds_plain_hosted_session_without_toolsets(monkeypatch):
+    """The fast hosted-chat build must not assemble the full tool catalog."""
+    _setup_make_agent_mocks(monkeypatch, {})
+    monkeypatch.setattr(server, "_load_enabled_toolsets", lambda: ["web", "terminal"])
+
+    with patch("run_agent.AIAgent") as mock_agent:
+        server._make_agent("sid1", "key1", skip_mcp_discovery=True)
+
+    assert mock_agent.call_args.kwargs["enabled_toolsets"] == []
+
+
 def test_make_agent_nested_max_turns_takes_priority(monkeypatch):
     _setup_make_agent_mocks(
         monkeypatch, {"agent": {"max_turns": 400}, "max_turns": 100}
@@ -13563,6 +13574,41 @@ def test_make_agent_uses_session_runtime_overrides(monkeypatch):
     assert mock_agent.call_args.kwargs["provider"] == "openai-codex"
     assert mock_agent.call_args.kwargs["reasoning_config"] == {"enabled": True, "effort": "high"}
     assert mock_agent.call_args.kwargs["service_tier"] == "priority"
+
+
+def test_make_agent_keeps_resolved_transport_over_stale_custom_session_mode(monkeypatch):
+    """A generic relay must not resurrect a persisted Responses transport."""
+    from types import SimpleNamespace
+
+    _setup_make_agent_mocks(monkeypatch, {})
+    monkeypatch.setattr(
+        server,
+        "_resolve_runtime_with_fallback",
+        lambda _kwargs: SimpleNamespace(
+            runtime={
+                "provider": "custom",
+                "base_url": "https://relay.example/v1",
+                "api_key": "test-key",
+                "api_mode": "chat_completions",
+            },
+            used_fallback=False,
+            selected_model="",
+        ),
+    )
+
+    with patch("run_agent.AIAgent") as mock_agent:
+        server._make_agent(
+            "sid1",
+            "key1",
+            model_override={
+                "model": "gpt-5.6-sol",
+                "provider": "custom:relay",
+                "base_url": "https://relay.example/v1",
+                "api_mode": "codex_responses",
+            },
+        )
+
+    assert mock_agent.call_args.kwargs["api_mode"] == "chat_completions"
 
 
 def test_make_agent_handles_null_agent_config(monkeypatch):

@@ -4,6 +4,8 @@ Handler bodies are byte-identical to their pre-split server.py form; they
 are rebound onto server.py's globals at install time — see method_ctx.py.
 """
 
+import inspect
+
 from .method_ctx import HandlerRegistry
 
 import types
@@ -71,6 +73,12 @@ def _(rid, params: dict) -> dict:
     sid = params.get("session_id", "")
     raw_text = params.get("text", "")
     text = sanitize_user_prompt_text(raw_text) if isinstance(raw_text, str) else raw_text
+    raw_allow_tools = params.get("allow_tools")
+    allow_tools = (
+        None
+        if raw_allow_tools is None
+        else is_truthy_value(raw_allow_tools)
+    )
     # Typed bare stop phrase while backend voice mode is active ends the
     # voice chat instead of sending "stop" to the agent — the typed twin of
     # the spoken stop phrase (PR #73106), applied at the ONE server-side
@@ -323,7 +331,22 @@ def _(rid, params: dict) -> dict:
                     },
                 )
                 return
-        _run_prompt_submit(rid, sid, session, text)
+        # Some integrations and tests replace ``_run_prompt_submit`` with the
+        # original four-argument callback.  Inspect the replacement before
+        # passing the hosted route's optional policy keyword so that this
+        # extension point remains backward compatible.
+        try:
+            run_parameters = inspect.signature(_run_prompt_submit).parameters
+        except (TypeError, ValueError):
+            run_parameters = {}
+        accepts_allow_tools = "allow_tools" in run_parameters or any(
+            parameter.kind is inspect.Parameter.VAR_KEYWORD
+            for parameter in run_parameters.values()
+        )
+        if accepts_allow_tools:
+            _run_prompt_submit(rid, sid, session, text, allow_tools=allow_tools)
+        else:
+            _run_prompt_submit(rid, sid, session, text)
 
     run_thread = threading.Thread(target=run_after_agent_ready, daemon=True)
     # Keep a handle so session.interrupt can tell a live turn from a stuck

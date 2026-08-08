@@ -69,6 +69,12 @@ def _(rid, params: dict) -> dict:
         create_service_tier_override = (
             "priority" if is_truthy_value(params.get("fast")) else ""
         )
+    # Hosted mobile chat can tell the persistent gateway that this session
+    # starts with an ordinary tool-free turn.  Keep this tri-state so callers
+    # that omit the field retain the official TUI/desktop behavior.
+    create_allow_tools = None
+    if "allow_tools" in params:
+        create_allow_tools = is_truthy_value(params.get("allow_tools"))
 
     ready = threading.Event()
     now = time.time()
@@ -96,6 +102,7 @@ def _(rid, params: dict) -> dict:
             "model_override": session_model_override,
             "create_reasoning_override": create_reasoning_override,
             "create_service_tier_override": create_service_tier_override,
+            "create_allow_tools": create_allow_tools,
             "parent_session_id": parent_session_id,
             "pending_title": title or None,
             "profile_home": str(profile_home) if profile_home is not None else None,
