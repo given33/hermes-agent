@@ -5091,6 +5091,7 @@ def _manager_plan_prompt(
             '{"difficulty":"low|medium|high|critical","reason":"...","workers":["dbb3-worker"],"reviewer_target":"dbb3|pc","plan":[{"id":"step-1","title":"...","objective":"...","assignee":"dbb3-worker|pc-worker","depends_on":[]}]}',
             "plan 是用户右滑后看到的 Todo List：按实际执行顺序列出可验证、可独立完成的步骤，title 要简短明确。",
             "多步骤任务不得压缩成一个泛化的“执行任务”；每完成一个步骤，服务端会依据真实 Worker、审阅与汇报状态更新勾选。",
+            "把用户任务的每一个可验证要求映射为一个独立步骤。示例：用户要求「建目录、写文件、运行、用 todo 跟踪、总结」，则 plan 至少包含 5 个步骤（建目录 → 写文件 → 运行验证 → 更新 todo → 总结），每步 assignee 相同或按需分配；禁止把多个要求合并成单个执行节点。",
             "按任务真实需要选择一个或两个 Worker，不得使用其他节点，不得省略验收。",
             f"用户任务：\n{content}",
             attachment_context,
