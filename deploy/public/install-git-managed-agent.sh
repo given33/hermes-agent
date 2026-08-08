@@ -2,12 +2,13 @@
 set -Eeuo pipefail
 umask 077
 
-# Convert the server's /opt/hermes-agent install into a git-managed checkout
-# of github.com/given33/hermes-agent and install a systemd timer that pulls
-# the latest main and restarts the service. Keeps HERMES_HOME data untouched.
+# Convert the server's /opt/hermes-agent install into a GitHub-managed
+# checkout of given33/hermes-agent main and install a systemd timer that
+# pulls the latest main and restarts the service. Uses the codeload tarball
+# transport (see run-git-managed-update.sh). Keeps HERMES_HOME data intact.
 #
 # Usage: sudo bash install-git-managed-agent.sh
-# Idempotent: safe to re-run; a non-git directory is converted in place.
+# Idempotent: safe to re-run.
 
 die() { printf 'install-git-managed-agent: %s\n' "$*" >&2; exit 1; }
 [[ "$(id -u)" == 0 ]] || die "must run as root"
@@ -27,36 +28,29 @@ update_interval_min="${HERMES_AGENT_UPDATE_INTERVAL_MIN:-10}"
 venv="${agent_root}/.venv"
 [[ -x "${venv}/bin/python" ]] || die "agent venv is missing at ${venv}"
 
-# 1. Convert in place to a git checkout of main (keeps .venv and config).
-if [[ ! -d "${agent_root}/.git" ]]; then
-  git -C "${agent_root}" init -q
-  git -C "${agent_root}" remote add origin "${repository_url}"
+# 1. Record the current commit so the first timer run can compare.
+if [[ ! -f "${agent_root}/.hermes-product-commit" ]]; then
+  git -C "${agent_root}" rev-parse HEAD 2>/dev/null \
+    >"${agent_root}/.hermes-product-commit" || true
 fi
-git -C "${agent_root}" fetch --depth 1 origin main || die "git fetch failed"
-git -C "${agent_root}" checkout -q -B main origin/main || die "git checkout failed"
-git -C "${agent_root}" reset -q --hard origin/main
 
-# 2. Refresh the virtualenv for the new tree.
-"${venv}/bin/python" -m pip install -q --upgrade pip
-"${venv}/bin/pip" install -q -e "${agent_root}" || die "editable install failed"
-
-# 3. Restart the service with the new code.
+# 2. Restart with the current tree (already 0.20 from the release sync).
 systemctl restart "${service_name}" || die "service restart failed"
 systemctl is-active --quiet "${service_name}" || die "service is not active after restart"
 
-# 4. Install the auto-update timer (every N minutes, staggered).
+# 3. Install the auto-update timer (every N minutes, staggered).
 unit_name="hermes-git-update"
 unit_file="/etc/systemd/system/${unit_name}.service"
 timer_file="/etc/systemd/system/${unit_name}.timer"
 cat >"${unit_file}" <<EOF
 [Unit]
-Description=Pull github.com/given33/hermes-agent main and restart ${service_name}
+Description=Pull given33/hermes-agent main and restart ${service_name}
 After=network-online.target
 Wants=network-online.target
 
 [Service]
 Type=oneshot
-ExecStart=${agent_root}/deploy/public/run-git-managed-update.sh ${agent_root} ${repository_url} ${service_name}
+ExecStart=${agent_root}/deploy/public/run-git-managed-update.sh ${agent_root} given33/hermes-agent ${service_name} main
 EOF
 cat >"${timer_file}" <<EOF
 [Unit]
