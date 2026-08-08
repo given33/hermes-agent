@@ -61,7 +61,11 @@ tar -xzf "${tmp}/agent.tar.gz" -C "${tmp}/stage"
 )
 printf '%s' "${remote_commit}" >"${agent_root}/.hermes-product-commit"
 
-"${agent_root}/.venv/bin/python" -m pip install -q -e "${agent_root}" \
+# pip must run as the service user: running it as root chowns the venv
+# files and the service user can no longer import hermes_cli.
+service_user="$(stat -c '%U' "${agent_root}/.venv/bin/python" 2>/dev/null || echo hermes-agent)"
+runuser -u "${service_user}" -- \
+  "${agent_root}/.venv/bin/python" -m pip install -q -e "${agent_root}" \
   || die "editable install failed"
 systemctl restart "${service_name}"
 systemctl is-active --quiet "${service_name}" \
