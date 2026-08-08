@@ -470,18 +470,18 @@ class _GatewayProcess:
                         "tool_artifact_turn_id": str(turn_id or ""),
                         "allow_tools": _allow_tools_from_context(artifact_context),
                     },
-                    timeout=min(30.0, timeout),
+                    timeout=30.0 if timeout <= 0 else min(30.0, timeout),
                 )
                 if str(response.get("status") or "") != "streaming":
                     raise HostedTuiGatewayError("Hermes 0.20 rejected the prompt")
-                deadline = time.monotonic() + timeout
+                deadline = None if timeout <= 0 else time.monotonic() + timeout
                 while not state.agent_ready.is_set():
                     if cancel_check is not None and cancel_check():
                         self._interrupt(live_session_id)
                         raise HostedTuiGatewayCancelled("Hosted turn cancelled")
                     if sink.done.wait(timeout=0.05):
                         break
-                    if time.monotonic() >= deadline:
+                    if deadline is not None and time.monotonic() >= deadline:
                         self._interrupt(live_session_id)
                         raise TimeoutError("Hermes 0.20 agent pre-warm timed out")
                 if not sink.done.is_set():
@@ -508,7 +508,7 @@ class _GatewayProcess:
                         self._interrupt(live_session_id)
                         sink.error = HostedTuiGatewayCancelled("Hosted turn cancelled")
                         break
-                    if time.monotonic() >= deadline:
+                    if deadline is not None and time.monotonic() >= deadline:
                         self._interrupt(live_session_id)
                         sink.error = TimeoutError("Hermes profile execution timed out")
                         break
@@ -522,7 +522,7 @@ class _GatewayProcess:
                 # completion boundary. The following idle session.info is
                 # useful bookkeeping, but it may be delayed by diagnostics
                 # and inventory work; only give it a short grace window.
-                remaining = max(0.0, deadline - time.monotonic())
+                remaining = 0.0 if deadline is None else max(0.0, deadline - time.monotonic())
                 state.idle_after_turn.wait(
                     timeout=min(_GATEWAY_IDLE_GRACE_SECONDS, remaining)
                 )

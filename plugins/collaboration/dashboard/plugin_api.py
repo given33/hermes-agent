@@ -366,7 +366,27 @@ _HOSTED_TRANSIENT_RETRIES = 1
 _HOSTED_CHAT_API_ATTEMPTS = 5
 _HOSTED_CHAT_API_RETRY_DELAY_SECONDS = 15
 _HOSTED_CHAT_MODEL_BUDGET_SECONDS = 120
-_HOSTED_CHAT_TIMEOUT_SECONDS = 10 * 60
+def _hosted_chat_timeout_seconds() -> int:
+    """Per-turn hosted chat timeout, configurable via env; 0 = unlimited."""
+    raw = os.environ.get("HERMES_HOSTED_CHAT_TIMEOUT_SECONDS", "").strip()
+    if raw:
+        try:
+            value = int(raw)
+            if value >= 0:
+                return value
+        except (TypeError, ValueError):
+            pass
+    return 10 * 60
+
+
+def _hosted_chat_lease_ms() -> int:
+    """Lease length for the chat execution owner; unbounded when unlimited."""
+    if _HOSTED_CHAT_TIMEOUT_SECONDS == 0:
+        return 10 * 365 * 24 * 3600 * 1000
+    return (_HOSTED_CHAT_TIMEOUT_SECONDS + 60) * 1000
+
+
+_HOSTED_CHAT_TIMEOUT_SECONDS = _hosted_chat_timeout_seconds()
 _HOSTED_STDERR_TAIL_CHARS = 64 * 1024
 _HOSTED_REWORK_LIMIT = 2
 # Hosted SSE readers consume the live in-memory snapshot immediately.  The
@@ -8137,7 +8157,7 @@ def _run_hosted_role(
         profile=profile,
         execution="local",
         execution_owner=execution_owner,
-        lease_ms=(_HOSTED_CHAT_TIMEOUT_SECONDS + 60) * 1000,
+        lease_ms=_hosted_chat_lease_ms(),
     ):
         raise RuntimeError("同一角色阶段已有活动执行 owner")
     if role_stage.split(":", 1)[0] != "chat":
@@ -8200,7 +8220,7 @@ def _run_hosted_role(
             checkpoint=checkpoint,
             intervention_id=str(pending.get("id") or ""),
             execution_owner=execution_owner,
-            lease_ms=(_HOSTED_CHAT_TIMEOUT_SECONDS + 60) * 1000,
+            lease_ms=_hosted_chat_lease_ms(),
             deliveries=deliveries,
         )
         if (
@@ -10483,6 +10503,14 @@ def _assert_remote_run_account_boundary(
 
 
 def _remote_profile_server_cap_seconds(profile: str) -> int:
+    raw = os.environ.get("HERMES_REMOTE_SERVER_CAP_SECONDS", "").strip()
+    if raw:
+        try:
+            value = int(raw)
+            if value >= 0:
+                return value
+        except (TypeError, ValueError):
+            pass
     return 1800 if str(profile or "").strip() == "pc-worker" else 900
 
 
@@ -11388,8 +11416,9 @@ def execute_hosted_chat(
             "status": "running",
             "stage": "chat",
             "updated_at": now,
-            "deadline_at": now + (_HOSTED_CHAT_TIMEOUT_SECONDS * 1000),
-            "lease_expires_at": now + (_HOSTED_CHAT_TIMEOUT_SECONDS * 1000),
+            "deadline_at": None if _HOSTED_CHAT_TIMEOUT_SECONDS == 0
+                else now + (_HOSTED_CHAT_TIMEOUT_SECONDS * 1000),
+            "lease_expires_at": now + _hosted_chat_lease_ms(),
             "model_retry_started_at": model_retry_started_at,
             "model_retry_deadline_at": model_retry_deadline_at,
             "model_retry_max_attempts": _HOSTED_CHAT_API_ATTEMPTS,
