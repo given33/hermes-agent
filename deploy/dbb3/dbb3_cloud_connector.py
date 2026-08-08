@@ -2284,8 +2284,16 @@ def main(argv: list[str] | None = None) -> int:
             print(json.dumps({"timestamp": now_iso(), "error": "cloud authentication failed"}), flush=True)
             return 78
         except ConnectorContractError as exc:
-            print(json.dumps({"timestamp": now_iso(), "error": f"connector contract error ({exc.status})"}), flush=True)
-            return 65
+            # A service restart window can surface a 5xx error page instead of
+            # the expected JSON contract. Treat 5xx contract failures as
+            # transient and keep polling instead of crash-looping the unit.
+            if exc.status in (500, 502, 503, 504):
+                print(json.dumps({"timestamp": now_iso(), "error": f"connector temporary contract failure ({exc.status})"}), flush=True)
+                if args.once:
+                    return 75
+            else:
+                print(json.dumps({"timestamp": now_iso(), "error": f"connector contract error ({exc.status})"}), flush=True)
+                return 65
         except CloudHTTPError as exc:
             # 5xx responses are transient and leave the checkpoint pending;
             # auth/contract failures are handled above and stop the unit.
