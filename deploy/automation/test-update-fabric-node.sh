@@ -105,6 +105,7 @@ done
 printf 'RELEASE = "new"\n' >"${archive}/hermes_constants.py"
 printf 'RELEASE = "new"\n' >"${archive}/hermes_auth_errors.py"
 printf 'RELEASE = "new"\n' >"${archive}/hermes_secret_compare.py"
+printf 'RELEASE = "new"\n' >"${archive}/utils.py"
 
 cat >"${archive}/deploy/dbb3/install-dbb3-cloud-connector-user.sh" <<'SH'
 #!/usr/bin/env bash
@@ -171,6 +172,7 @@ run_case() {
   printf 'RELEASE = "old"\n' >"${root}/runtime/hermes_constants.py"
   printf 'RELEASE = "old"\n' >"${root}/runtime/hermes_auth_errors.py"
   printf 'RELEASE = "old"\n' >"${root}/runtime/hermes_secret_compare.py"
+  printf 'RELEASE = "old"\n' >"${root}/runtime/utils.py"
   for asset in update-fabric-node.sh hermes-fabric-update.service hermes-fabric-update.timer; do
     printf 'old automation\n' >"${root}/automation/${asset}"
   done
@@ -238,6 +240,7 @@ PY
     [[ "$(cat "${root}/state/${role}/deployed-commit")" == "${release_commit}" ]]
     grep -Fxq 'RELEASE = "new"' "${root}/runtime/hermes_runtime/config.py"
     grep -Fxq 'RELEASE = "new"' "${root}/runtime/hermes_services/resource_catalog.py"
+    grep -Fxq 'RELEASE = "new"' "${root}/runtime/utils.py"
   else
     [[ "${status}" != 0 ]]
     [[ "$(cat "${root}/connector.state")" == old ]]
@@ -247,6 +250,7 @@ PY
     grep -Fq 'RELEASE = "old"' "${root}/runtime/hermes_cli/managed_installations.py"
     grep -Fq 'RELEASE = "old"' "${root}/runtime/hermes_runtime/config.py"
     grep -Fq 'RELEASE = "old"' "${root}/runtime/hermes_services/resource_catalog.py"
+    grep -Fq 'RELEASE = "old"' "${root}/runtime/utils.py"
     if [[ "${failpoint}" == after-automation ]]; then
       for asset in update-fabric-node.sh hermes-fabric-update.service hermes-fabric-update.timer; do
         grep -Fxq 'old automation' "${root}/automation/${asset}"

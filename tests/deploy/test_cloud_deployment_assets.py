@@ -213,6 +213,7 @@ def test_three_endpoint_updates_follow_only_a_committed_main_release():
         "hermes_services",
         "hermes_constants.py",
         "hermes_secret_compare.py",
+        "utils.py",
     ):
         assert f'"{relative}"' in updater
     assert (
@@ -424,6 +425,7 @@ def test_fabric_updater_stages_sqlite_fallback_dependency():
     harness = (AUTOMATION / "test-update-fabric-node.sh").read_text(encoding="utf-8")
 
     assert '"hermes_cli/sqlite_util.py"' in updater
+    assert '"utils.py"' in updater
     assert "managed_node_recovery_service.py sqlite_util.py" in harness
     assert "import hermes_cli.managed_node_recovery_service" in updater
 
@@ -441,6 +443,7 @@ def test_legacy_fabric_manifest_can_bootstrap_the_current_receiver(tmp_path):
         "hermes_cli/managed_node_recovery_service.py",
         "hermes_constants.py",
         "hermes_secret_compare.py",
+        "utils.py",
     ):
         source = ROOT / relative
         target = legacy_snapshot / relative

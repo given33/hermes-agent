@@ -278,6 +278,7 @@ archive_paths=(
   "hermes_auth_errors.py"
   "hermes_constants.py"
   "hermes_secret_compare.py"
+  "utils.py"
 )
 if [[ "${role}" == wsl ]]; then
   archive_paths+=(
@@ -381,7 +382,7 @@ for runtime_root_path in hermes_runtime hermes_services; do
     runtime_assets+=("${runtime_path#"${stage}/"}")
   done < <(find "${stage}/${runtime_root_path}" -type f -name '*.py' -print0 2>/dev/null)
 done
-runtime_assets+=("hermes_auth_errors.py" "hermes_constants.py" "hermes_secret_compare.py")
+runtime_assets+=("hermes_auth_errors.py" "hermes_constants.py" "hermes_secret_compare.py" "utils.py")
 (( ${#runtime_assets[@]} > 8 )) || die "managed runtime package is incomplete"
 case "${role}" in
   dbb3) runtime_root="${HERMES_DBB3_AGENT_ROOT:-/usr/local/lib/hermes-agent}" ;;
