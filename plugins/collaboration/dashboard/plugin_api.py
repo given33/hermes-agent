@@ -2339,7 +2339,36 @@ def save_state(state: dict[str, Any], path: Optional[Path] = None) -> None:
             )
 
 
+_MAX_HOSTED_EVENTS_PER_CONVERSATION = 1000
+_MAX_HOSTED_TURNS_PER_CONVERSATION = 30
+
+
+def _trim_hosted_state(state: dict[str, Any]) -> None:
+    """Bound the append-only event/turn history so every state round-trip
+    (deepcopy + JSON write) stays cheap; a runaway hosted_events list made
+    the dashboard burn a core on deepcopy and stalled first-token latency."""
+    for conversation in state.get("conversations") or []:
+        if not isinstance(conversation, dict):
+            continue
+        events = conversation.get("hosted_events")
+        if isinstance(events, list) and len(events) > _MAX_HOSTED_EVENTS_PER_CONVERSATION:
+            conversation["hosted_events"] = events[-_MAX_HOSTED_EVENTS_PER_CONVERSATION:]
+        turns = conversation.get("hosted_turns")
+        if isinstance(turns, dict) and len(turns) > _MAX_HOSTED_TURNS_PER_CONVERSATION:
+            ordered = sorted(
+                turns.items(),
+                key=lambda item: (
+                    (item[1].get("created_at") or 0)
+                    if isinstance(item[1], dict)
+                    else 0
+                ),
+            )
+            for turn_id, _turn in ordered[: len(turns) - _MAX_HOSTED_TURNS_PER_CONVERSATION]:
+                turns.pop(turn_id, None)
+
+
 def save_single_state(state: dict[str, Any], path: Optional[Path] = None) -> None:
+    _trim_hosted_state(state)
     target = path or single_state_path()
     with _backend_api().account_lifecycle_commit_guard():
         with _STATE_LOCK:
