@@ -11219,7 +11219,16 @@ def _strict_json_object(text: str) -> Optional[dict[str, Any]]:
         return result
 
     raw = str(text or "").strip()
-    if not raw or not raw.startswith("{") or not raw.endswith("}"):
+    if not raw.startswith("{"):
+        # Real model output frequently wraps the verdict in a Markdown code
+        # fence even when the prompt forbids it. Accept exactly one fenced
+        # JSON object (```json ... ``` or ``` ... ```); any other prose or
+        # envelope is still rejected so prompt-injected text cannot pass.
+        fence = re.fullmatch(r"```(?:json)?[ \t]*\n?(.*?)\n?[ \t]*```", raw, re.DOTALL)
+        if fence is None:
+            return None
+        raw = fence.group(1).strip()
+    if not raw.endswith("}"):
         return None
     try:
         parsed = json.loads(raw, object_pairs_hook=unique_object)

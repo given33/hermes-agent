@@ -3020,7 +3020,6 @@ class CollaborationDashboardTests(unittest.TestCase):
             invalid = (
                 *narrative_bypasses,
                 f"> {valid}",
-                f"```json\n{valid}\n```",
                 f"prefix\n{valid}",
                 f"{valid}\ntail",
                 f"{valid}\n{valid}",
@@ -3029,6 +3028,10 @@ class CollaborationDashboardTests(unittest.TestCase):
             for result in invalid:
                 with self.subTest(result=result[:80]):
                     self.assertEqual(parser(result), "unknown")
+            # Models wrap the verdict in a Markdown code fence despite the
+            # prompt. That one wrapper is tolerated; arbitrary prose is not.
+            self.assertEqual(parser(f"```json\n{valid}\n```"), "pass")
+            self.assertEqual(parser(f"```\n{valid}\n```"), "pass")
 
     def test_closed_verdict_protocol_enforces_exact_schema_and_pass_invariants(self):
         module = load_module()
