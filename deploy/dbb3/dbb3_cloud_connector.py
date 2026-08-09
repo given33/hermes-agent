@@ -218,7 +218,7 @@ def _content_length_bytes(value: Any) -> int | None:
     return length
 
 
-def run(command: list[str], timeout: int = 30) -> tuple[int, str]:
+def run(command: list[str], timeout: int = 120) -> tuple[int, str]:
     try:
         proc = subprocess.run(
             command,
@@ -1356,7 +1356,7 @@ class DBB3CloudConnector:
                 task_id,
                 "--json",
             ),
-            timeout=10,
+            timeout=120,
         )
         if code != 0:
             raise RuntimeError(output[-1000:] or "hermes kanban show failed")
