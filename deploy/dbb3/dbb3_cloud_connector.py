@@ -1660,8 +1660,13 @@ class DBB3CloudConnector:
     ) -> Path:
         """Keep the authoritative UTF-8 prompt outside the ASCII Kanban argv."""
 
-        existing = Path(_text(local.get("objective_path"), 2048))
-        if existing.is_file() and existing.is_relative_to(self.attachment_root):
+        raw_objective_path = _text(local.get("objective_path"), 2048)
+        existing = Path(raw_objective_path) if raw_objective_path else None
+        if (
+            existing is not None
+            and existing.is_file()
+            and existing.is_relative_to(self.attachment_root)
+        ):
             return existing
         remote_id = _text(run_payload.get("remote_run_id"), 256)
         directory = self.attachment_root / (_SAFE_NAME_RE.sub("_", remote_id) or "run")
