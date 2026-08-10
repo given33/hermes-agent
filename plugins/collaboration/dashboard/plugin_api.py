@@ -2340,8 +2340,121 @@ def save_state(state: dict[str, Any], path: Optional[Path] = None) -> None:
             )
 
 
-_MAX_HOSTED_EVENTS_PER_CONVERSATION = 1000
-_MAX_HOSTED_TURNS_PER_CONVERSATION = 30
+_MAX_HOSTED_EVENTS_PER_CONVERSATION = 200
+_MAX_HOSTED_TURNS_PER_CONVERSATION = 20
+_MAX_HOSTED_MESSAGES_PER_CONVERSATION = 40
+_MAX_HOSTED_SESSION_ENTRIES_PER_CONVERSATION = 40
+_MAX_ROLE_EVENTS_PER_TURN = 10
+_MAX_SUPERVISOR_CHECKS_PER_TURN = 5
+_MAX_REMOTE_ACTIVITIES_PER_RUN = 30
+_MAX_ACTIVITY_FIELD_CHARS = 4000
+# Conversations whose hosted turns are all terminal and which have been
+# idle for this long are archived out of the hot single.json document into
+# per-conversation archive files. Restoring one is a lazy, locked read.
+_ARCHIVE_IDLE_AGE_SECONDS = 12 * 3600
+_ARCHIVE_RESTORE_GRACE_SECONDS = 3600
+
+
+def _archive_root() -> Path:
+    return Path(get_hermes_home()) / "collaboration" / "archive"
+
+
+def _conversation_terminal(conversation: dict[str, Any]) -> bool:
+    turns = conversation.get("hosted_turns")
+    if not isinstance(turns, dict):
+        return True
+    if not turns:
+        return True
+    return all(
+        isinstance(turn, dict)
+        and str(turn.get("status") or "").strip().lower()
+        in _HOSTED_TERMINAL_STATUSES
+        for turn in turns.values()
+    )
+
+
+def _archive_completed_conversations(state: dict[str, Any]) -> None:
+    """Move long-idle terminal conversations out of the hot state document.
+
+    The single.json document is read, deep-copied and rewritten on every
+    hosted mutation; unbounded per-conversation history (messages, hosted
+    events, role events, remote-run activities) made every round-trip take
+    tens of seconds. Terminal conversations that have been idle for over
+    ``_ARCHIVE_IDLE_AGE_SECONDS`` are written to
+    ``collaboration/archive/<id>.json`` and replaced in the hot document by
+    a small index placeholder. Accessing one lazily restores it (see
+    ``_conversation_by_id``), so archiving is invisible to callers.
+    """
+    now = int(time.time() * 1000)
+    root = _archive_root()
+    conversations = state.get("conversations")
+    if not isinstance(conversations, list):
+        return
+    for index, conversation in enumerate(conversations):
+        if not isinstance(conversation, dict):
+            continue
+        if conversation.get("archived"):
+            continue
+        if not _conversation_terminal(conversation):
+            continue
+        restored_at = int(conversation.get("restored_from_archive_at") or 0)
+        if restored_at and now - restored_at < _ARCHIVE_RESTORE_GRACE_SECONDS * 1000:
+            continue
+        updated_at = int(conversation.get("updated_at") or conversation.get("created_at") or 0)
+        if updated_at and now - updated_at < _ARCHIVE_IDLE_AGE_SECONDS * 1000:
+            continue
+        conversation_id = str(conversation.get("id") or "")
+        if not conversation_id:
+            continue
+        try:
+            root.mkdir(parents=True, exist_ok=True)
+            target = root / f"{conversation_id}.json"
+            tmp = target.with_suffix(".json.tmp")
+            tmp.write_text(
+                json.dumps(conversation, ensure_ascii=False),
+                encoding="utf-8",
+            )
+            tmp.replace(target)
+        except (OSError, UnicodeError, ValueError):
+            continue
+        placeholder = {
+            "id": conversation_id,
+            "title": conversation.get("title", ""),
+            "owner_id": conversation.get("owner_id", ""),
+            "account_generation": conversation.get("account_generation", ""),
+            "created_at": conversation.get("created_at", 0),
+            "updated_at": conversation.get("updated_at", 0),
+            "archived": True,
+            "archived_at": now,
+        }
+        conversations[index] = placeholder
+
+
+def _restore_archived_conversation(
+    state: dict[str, Any],
+    conversation_id: str,
+) -> Optional[dict[str, Any]]:
+    target = _archive_root() / f"{conversation_id}.json"
+    try:
+        restored = json.loads(target.read_text(encoding="utf-8"))
+    except (OSError, UnicodeError, ValueError):
+        return None
+    if not isinstance(restored, dict):
+        return None
+    restored["restored_from_archive_at"] = int(time.time() * 1000)
+    restored.pop("archived", None)
+    conversations = state.get("conversations")
+    if isinstance(conversations, list):
+        for index, conversation in enumerate(conversations):
+            if (
+                isinstance(conversation, dict)
+                and conversation.get("id") == conversation_id
+            ):
+                conversations[index] = restored
+                break
+        else:
+            conversations.append(restored)
+    return restored
 
 
 def _trim_hosted_state(state: dict[str, Any]) -> None:
@@ -2354,6 +2467,17 @@ def _trim_hosted_state(state: dict[str, Any]) -> None:
         events = conversation.get("hosted_events")
         if isinstance(events, list) and len(events) > _MAX_HOSTED_EVENTS_PER_CONVERSATION:
             conversation["hosted_events"] = events[-_MAX_HOSTED_EVENTS_PER_CONVERSATION:]
+        messages = conversation.get("messages")
+        if isinstance(messages, list) and len(messages) > _MAX_HOSTED_MESSAGES_PER_CONVERSATION:
+            conversation["messages"] = messages[-_MAX_HOSTED_MESSAGES_PER_CONVERSATION:]
+        session_entries = conversation.get("session_entries")
+        if (
+            isinstance(session_entries, list)
+            and len(session_entries) > _MAX_HOSTED_SESSION_ENTRIES_PER_CONVERSATION
+        ):
+            conversation["session_entries"] = session_entries[
+                -_MAX_HOSTED_SESSION_ENTRIES_PER_CONVERSATION:
+            ]
         turns = conversation.get("hosted_turns")
         if isinstance(turns, dict) and len(turns) > _MAX_HOSTED_TURNS_PER_CONVERSATION:
             ordered = sorted(
@@ -2366,9 +2490,61 @@ def _trim_hosted_state(state: dict[str, Any]) -> None:
             )
             for turn_id, _turn in ordered[: len(turns) - _MAX_HOSTED_TURNS_PER_CONVERSATION]:
                 turns.pop(turn_id, None)
+        turns = conversation.get("hosted_turns")
+        if isinstance(turns, dict):
+            for _turn_id, turn in turns.items():
+                if not isinstance(turn, dict):
+                    continue
+                role_events = turn.get("role_events")
+                if isinstance(role_events, dict) and len(role_events) > _MAX_ROLE_EVENTS_PER_TURN:
+                    ordered_events = sorted(
+                        role_events.items(),
+                        key=lambda item: (
+                            (item[1].get("updated_at") or 0)
+                            if isinstance(item[1], dict)
+                            else 0
+                        ),
+                    )
+                    for event_id, _event in ordered_events[
+                        : len(role_events) - _MAX_ROLE_EVENTS_PER_TURN
+                    ]:
+                        role_events.pop(event_id, None)
+                supervisor_checks = turn.get("supervisor_checks")
+                if (
+                    isinstance(supervisor_checks, dict)
+                    and len(supervisor_checks) > _MAX_SUPERVISOR_CHECKS_PER_TURN
+                ):
+                    ordered_checks = sorted(supervisor_checks.keys())
+                    for check_id in ordered_checks[
+                        : len(supervisor_checks) - _MAX_SUPERVISOR_CHECKS_PER_TURN
+                    ]:
+                        supervisor_checks.pop(check_id, None)
+                remote_runs = turn.get("remote_runs")
+                if isinstance(remote_runs, dict):
+                    for _stage, run in remote_runs.items():
+                        if not isinstance(run, dict):
+                            continue
+                        activities = run.get("activities")
+                        if isinstance(activities, list):
+                            if len(activities) > _MAX_REMOTE_ACTIVITIES_PER_RUN:
+                                activities = activities[-_MAX_REMOTE_ACTIVITIES_PER_RUN:]
+                                run["activities"] = activities
+                            for activity in activities:
+                                if not isinstance(activity, dict):
+                                    continue
+                                for field in ("output", "detail", "input", "summary"):
+                                    value = activity.get(field)
+                                    if (
+                                        isinstance(value, str)
+                                        and len(value) > _MAX_ACTIVITY_FIELD_CHARS
+                                    ):
+                                        activity[field] = value[
+                                            :_MAX_ACTIVITY_FIELD_CHARS
+                                        ]
 
 
 def save_single_state(state: dict[str, Any], path: Optional[Path] = None) -> None:
+    _archive_completed_conversations(state)
     _trim_hosted_state(state)
     target = path or single_state_path()
     with _backend_api().account_lifecycle_commit_guard():
@@ -14191,6 +14367,18 @@ def _conversation_by_id(
     for conversation in state.get("conversations") or []:
         if conversation.get("id") == conversation_id:
             return conversation
+    # Lazy restore of an archived conversation. The caller holds (or can
+    # acquire) _STATE_LOCK; the lock is reentrant, so restoring under it is
+    # safe and keeps the restore atomic with respect to other writers.
+    restored = _restore_archived_conversation(state, conversation_id)
+    if restored is not None:
+        try:
+            save_single_state(state)
+        except Exception:
+            # The in-memory restore already succeeded; a failed durable
+            # write must not break the caller. The next mutation retries.
+            pass
+        return restored
     raise HTTPException(status_code=404, detail="单聊会话不存在")
 
 
