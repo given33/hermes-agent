@@ -11056,6 +11056,10 @@ def _ensure_remote_run(
         remote_runs[role_stage] = record
         save_single_state(state)
     _notify_hosted_update(conversation_id)
+    _push_connector_event(
+        str(record.get("connector_id") or ""),
+        {"type": "run.created", "remote_run_id": remote_id},
+    )
     return dict(record)
 
 
@@ -15082,6 +15086,13 @@ def _apply_remote_checkpoint(
     )
     if expected_terminal:
         _finalize_pending_conversation_deletion(conversation_id)
+        # Wake the connector immediately: the server may create the next
+        # role run right after this checkpoint, and pushing here lets the
+        # connector poll it within its next cycle instead of a full interval.
+        _push_connector_event(
+            str(persisted.get("connector_id") or ""),
+            {"type": "run.terminal", "remote_run_id": str(persisted.get("id") or "")},
+        )
     if status == "cancelled":
         _finish_hosted_turn_if_cancelled(conversation_id, turn_id)
     return persisted, True
@@ -15095,6 +15106,75 @@ def _connector_relative_path(value: str) -> str:
     if not parts or any(part == ".." for part in parts):
         raise HTTPException(status_code=422, detail="relative_path is invalid")
     return "/".join(parts)[:1024]
+
+
+# Connector push channel: each connected connector holds a queue here; run
+# lifecycle events (created / terminal) are pushed so the connector can react
+# immediately instead of waiting for its next poll cycle. This collapses role
+# switch latency from one or two poll intervals down to ~1s on the wire.
+_CONNECTOR_STREAM_QUEUES: dict[str, "queue.Queue"] = {}
+_CONNECTOR_STREAM_LOCK = threading.Lock()
+
+
+def _push_connector_event(connector_id: str, event: dict[str, Any]) -> None:
+    normalized = str(connector_id or "").strip()[:128]
+    if not normalized:
+        return
+    with _CONNECTOR_STREAM_LOCK:
+        stream_queue = _CONNECTOR_STREAM_QUEUES.get(normalized)
+    if stream_queue is not None:
+        try:
+            stream_queue.put_nowait(dict(event))
+        except Exception:
+            pass
+
+
+@router.get("/connector/stream")
+def connector_stream(request: Request):
+    """Long-lived SSE channel for one connector.
+
+    The connector subscribes with its connector token; the server pushes
+    ``run.created`` / ``run.terminal`` events so the connector can poll
+    immediately. Heartbeats every 25s keep intermediaries from closing the
+    stream.
+    """
+    connector_id = _require_connector(request)
+    stream_queue: "queue.Queue" = queue.Queue()
+    with _CONNECTOR_STREAM_LOCK:
+        _CONNECTOR_STREAM_QUEUES[connector_id] = stream_queue
+
+    def event_stream():
+        try:
+            yield "event: connected\ndata: {\"type\":\"connected\"}\n\n"
+            while True:
+                try:
+                    event = stream_queue.get(timeout=25)
+                except Exception:
+                    yield ": keepalive\n\n"
+                    continue
+                yield (
+                    "data: "
+                    + json.dumps(
+                        event,
+                        ensure_ascii=False,
+                        separators=(",", ":"),
+                    )
+                    + "\n\n"
+                )
+        finally:
+            with _CONNECTOR_STREAM_LOCK:
+                if _CONNECTOR_STREAM_QUEUES.get(connector_id) is stream_queue:
+                    _CONNECTOR_STREAM_QUEUES.pop(connector_id, None)
+
+    return StreamingResponse(
+        event_stream(),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache",
+            "Connection": "keep-alive",
+            "X-Accel-Buffering": "no",
+        },
+    )
 
 
 @router.get("/connector/health")

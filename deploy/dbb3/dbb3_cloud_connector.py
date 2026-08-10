@@ -305,6 +305,45 @@ class CloudRelayClient:
             if isinstance(body, _FileBody):
                 body.close()
 
+    def _stream_events(self, wake: threading.Event, stop: threading.Event) -> None:
+        """Long-lived SSE subscription to /connector/stream.
+
+        The server pushes run.created / run.terminal events; each event sets
+        ``wake`` so the main loop polls immediately instead of sleeping the
+        full interval. Reconnects with backoff on any failure.
+        """
+        headers = {
+            "Authorization": f"Bearer {self.token}",
+            "X-Connector-ID": self.connector_id,
+            "Accept": "text/event-stream",
+            "User-Agent": "dbb3-cloud-connector/2.0",
+        }
+        backoff = 1.0
+        while not stop.is_set():
+            try:
+                request = urllib.request.Request(
+                    self.base_url + "/connector/stream",
+                    method="GET",
+                    headers=headers,
+                )
+                with urllib.request.urlopen(request, timeout=90) as response:
+                    backoff = 1.0
+                    for raw in response:
+                        if stop.is_set():
+                            return
+                        if raw.startswith(b"data:") and b'"type"' in raw:
+                            try:
+                                event = json.loads(raw[5:].strip())
+                            except (ValueError, TypeError):
+                                continue
+                            if event.get("type") in {"run.created", "run.terminal"}:
+                                wake.set()
+            except Exception:
+                pass
+            if stop.wait(backoff):
+                return
+            backoff = min(backoff * 2, 30.0)
+
     def probe(self) -> dict[str, Any]:
         result = self._request(
             "/connector/health",
@@ -1248,6 +1287,14 @@ class DBB3CloudConnector:
             "/home/hermes/.hermes:/opt/dbb3-team",
         ).split(os.pathsep)
         self.artifact_roots = [Path(root).expanduser().resolve() for root in roots if str(root).strip()]
+        self._wake_event = threading.Event()
+        self._stream_stop = threading.Event()
+        threading.Thread(
+            target=self.cloud_client._stream_events,
+            args=(self._wake_event, self._stream_stop),
+            name="connector-stream",
+            daemon=True,
+        ).start()
         private_artifact_root = self.attachment_root.resolve()
         if private_artifact_root not in self.artifact_roots:
             self.artifact_roots.append(private_artifact_root)
@@ -2361,7 +2408,10 @@ def main(argv: list[str] | None = None) -> int:
                 return 75
         if args.once:
             return 0
-        time.sleep(max(0.5, args.interval))
+        # Wait for the poll interval or an SSE push (run.created / terminal)
+        # that signals work may be waiting, then clear and poll again.
+        connector._wake_event.wait(timeout=max(0.5, args.interval))
+        connector._wake_event.clear()
 
 
 if __name__ == "__main__":
