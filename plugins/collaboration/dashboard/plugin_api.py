@@ -954,6 +954,16 @@ _HARD_WORK_MARKERS = (
     "迁移",
     "回滚",
     "生成文件",
+    "统计",
+    "计算",
+    "汇总",
+    "查询",
+    "扫描",
+    "读取",
+    "检查文件",
+    "清理",
+    "压缩",
+    "备份",
     "modify",
     "fix",
     "deploy",
@@ -963,6 +973,10 @@ _HARD_WORK_MARKERS = (
     "build",
     "migrate",
     "rollback",
+    "count",
+    "summarize",
+    "scan",
+    "read",
 )
 _EXPLANATION_MARKERS = (
     "如何",
@@ -2348,10 +2362,16 @@ _MAX_ROLE_EVENTS_PER_TURN = 10
 _MAX_SUPERVISOR_CHECKS_PER_TURN = 5
 _MAX_REMOTE_ACTIVITIES_PER_RUN = 30
 _MAX_ACTIVITY_FIELD_CHARS = 4000
+_MAX_MESSAGE_CONTENT_CHARS = 8000
+_MAX_ROLE_EVENT_ACTIVITY_CHARS = 4000
+_MAX_SUPERVISOR_EVIDENCE_CHARS = 4000
 # Conversations whose hosted turns are all terminal and which have been
 # idle for this long are archived out of the hot single.json document into
 # per-conversation archive files. Restoring one is a lazy, locked read.
-_ARCHIVE_IDLE_AGE_SECONDS = 12 * 3600
+# 10 minutes: every terminal test/one-shot conversation leaves the hot
+# document quickly, keeping the every-write round-trip cheap; access is
+# invisible to callers because _conversation_by_id restores on demand.
+_ARCHIVE_IDLE_AGE_SECONDS = 600
 _ARCHIVE_RESTORE_GRACE_SECONDS = 3600
 
 
@@ -2470,6 +2490,60 @@ def _trim_hosted_state(state: dict[str, Any]) -> None:
         messages = conversation.get("messages")
         if isinstance(messages, list) and len(messages) > _MAX_HOSTED_MESSAGES_PER_CONVERSATION:
             conversation["messages"] = messages[-_MAX_HOSTED_MESSAGES_PER_CONVERSATION:]
+        if isinstance(messages, list):
+            for message in messages:
+                if not isinstance(message, dict):
+                    continue
+                for field in ("content", "display_result", "summary"):
+                    value = message.get(field)
+                    if (
+                        isinstance(value, str)
+                        and len(value) > _MAX_MESSAGE_CONTENT_CHARS
+                    ):
+                        message[field] = value[: _MAX_MESSAGE_CONTENT_CHARS]
+                message_activities = message.get("activities")
+                if isinstance(message_activities, list):
+                    if len(message_activities) > _MAX_REMOTE_ACTIVITIES_PER_RUN:
+                        message_activities = message_activities[
+                            -_MAX_REMOTE_ACTIVITIES_PER_RUN:
+                        ]
+                        message["activities"] = message_activities
+                    for activity in message_activities:
+                        if not isinstance(activity, dict):
+                            continue
+                        for field in ("output", "detail", "input", "summary"):
+                            value = activity.get(field)
+                            if (
+                                isinstance(value, str)
+                                and len(value) > _MAX_ACTIVITY_FIELD_CHARS
+                            ):
+                                activity[field] = value[: _MAX_ACTIVITY_FIELD_CHARS]
+                meta = message.get("meta")
+                if isinstance(meta, dict):
+                    for field in ("display_result", "content"):
+                        value = meta.get(field)
+                        if (
+                            isinstance(value, str)
+                            and len(value) > _MAX_MESSAGE_CONTENT_CHARS
+                        ):
+                            meta[field] = value[: _MAX_MESSAGE_CONTENT_CHARS]
+                    meta_activities = meta.get("activities")
+                    if isinstance(meta_activities, list):
+                        if len(meta_activities) > _MAX_REMOTE_ACTIVITIES_PER_RUN:
+                            meta_activities = meta_activities[
+                                -_MAX_REMOTE_ACTIVITIES_PER_RUN:
+                            ]
+                            meta["activities"] = meta_activities
+                        for activity in meta_activities:
+                            if not isinstance(activity, dict):
+                                continue
+                            for field in ("output", "detail", "input", "summary"):
+                                value = activity.get(field)
+                                if (
+                                    isinstance(value, str)
+                                    and len(value) > _MAX_ACTIVITY_FIELD_CHARS
+                                ):
+                                    activity[field] = value[:_MAX_ACTIVITY_FIELD_CHARS]
         session_entries = conversation.get("session_entries")
         if (
             isinstance(session_entries, list)
@@ -2509,6 +2583,35 @@ def _trim_hosted_state(state: dict[str, Any]) -> None:
                         : len(role_events) - _MAX_ROLE_EVENTS_PER_TURN
                     ]:
                         role_events.pop(event_id, None)
+                if isinstance(role_events, dict):
+                    for _event_id, event in role_events.items():
+                        if not isinstance(event, dict):
+                            continue
+                        event_activities = event.get("activities")
+                        if isinstance(event_activities, list):
+                            if len(event_activities) > _MAX_REMOTE_ACTIVITIES_PER_RUN:
+                                event_activities = event_activities[
+                                    -_MAX_REMOTE_ACTIVITIES_PER_RUN:
+                                ]
+                                event["activities"] = event_activities
+                            for activity in event_activities:
+                                if not isinstance(activity, dict):
+                                    continue
+                                for field in ("output", "detail", "input", "summary"):
+                                    value = activity.get(field)
+                                    if (
+                                        isinstance(value, str)
+                                        and len(value) > _MAX_ROLE_EVENT_ACTIVITY_CHARS
+                                    ):
+                                        activity[field] = value[
+                                            :_MAX_ROLE_EVENT_ACTIVITY_CHARS
+                                        ]
+                        content_value = event.get("content")
+                        if (
+                            isinstance(content_value, str)
+                            and len(content_value) > _MAX_MESSAGE_CONTENT_CHARS
+                        ):
+                            event["content"] = content_value[:_MAX_MESSAGE_CONTENT_CHARS]
                 supervisor_checks = turn.get("supervisor_checks")
                 if (
                     isinstance(supervisor_checks, dict)
@@ -2519,6 +2622,36 @@ def _trim_hosted_state(state: dict[str, Any]) -> None:
                         : len(supervisor_checks) - _MAX_SUPERVISOR_CHECKS_PER_TURN
                     ]:
                         supervisor_checks.pop(check_id, None)
+                if isinstance(supervisor_checks, dict):
+                    for _check_id, check in supervisor_checks.items():
+                        if not isinstance(check, dict):
+                            continue
+                        for field in ("result", "display_result", "evidence"):
+                            value = check.get(field)
+                            if (
+                                isinstance(value, str)
+                                and len(value) > _MAX_SUPERVISOR_EVIDENCE_CHARS
+                            ):
+                                check[field] = value[:_MAX_SUPERVISOR_EVIDENCE_CHARS]
+                        check_activities = check.get("activities")
+                        if isinstance(check_activities, list):
+                            if len(check_activities) > _MAX_REMOTE_ACTIVITIES_PER_RUN:
+                                check_activities = check_activities[
+                                    -_MAX_REMOTE_ACTIVITIES_PER_RUN:
+                                ]
+                                check["activities"] = check_activities
+                            for activity in check_activities:
+                                if not isinstance(activity, dict):
+                                    continue
+                                for field in ("output", "detail", "input", "summary"):
+                                    value = activity.get(field)
+                                    if (
+                                        isinstance(value, str)
+                                        and len(value) > _MAX_ROLE_EVENT_ACTIVITY_CHARS
+                                    ):
+                                        activity[field] = value[
+                                            :_MAX_ROLE_EVENT_ACTIVITY_CHARS
+                                        ]
                 remote_runs = turn.get("remote_runs")
                 if isinstance(remote_runs, dict):
                     for _stage, run in remote_runs.items():

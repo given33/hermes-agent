@@ -2131,8 +2131,47 @@ class DBB3CloudConnector:
             try:
                 self.cloud_client.report_status(remote_id, pending)
             except CloudHTTPError as exc:
-                if exc.status in {401, 409, 422}:
+                if exc.status in {401, 422}:
                     raise
+                if exc.status in {404, 409}:
+                    # 404: the cloud no longer knows this run (archived or
+                    # pruned); 409: the claim was lost (lease expired, or the
+                    # cloud already accepted a terminal checkpoint and sealed
+                    # the claim). In both cases retrying the stale pending
+                    # payload forever only wastes a network round-trip on every
+                    # poll cycle. Re-sync the authoritative run; a terminal or
+                    # vanished remote run retires this local entry so the poll
+                    # loop stays fast.
+                    try:
+                        remote = self.cloud_client.get_run(remote_id)
+                    except (CloudHTTPError, ConnectorContractError, OSError, urllib.error.URLError):
+                        # Unreachable/vanished: retire the local entry rather
+                        # than spin on it.
+                        remote = {}
+                    remote_status = _text((remote or {}).get("status"), 64).lower()
+                    if remote_status in TERMINAL_STATUSES or not remote:
+                        local.update(
+                            {
+                                "status": remote_status or "failed",
+                                "terminal_acked": True,
+                                "checkpoint_cursor": max(
+                                    _checkpoint_cursor(local.get("checkpoint_cursor")),
+                                    _checkpoint_cursor((remote or {}).get("checkpoint_cursor")),
+                                ),
+                            }
+                        )
+                    else:
+                        # Still active remotely: refresh the claim token so a
+                        # future status push passes claim validation.
+                        remote_claim = _text((remote or {}).get("claim_token"), 256)
+                        if remote_claim:
+                            local["claim_token"] = remote_claim
+                        local["claim_stale"] = True
+                        local["status"] = "awaiting_claim"
+                    local.pop("pending_status", None)
+                    local.pop("pending_status_fingerprint", None)
+                    self.checkpoints.save(state)
+                    return 0, 0
                 return 0, 0
             except (OSError, urllib.error.URLError):
                 return 0, 0
