@@ -1196,6 +1196,11 @@ def build_root_task_command(run_payload: dict[str, Any]) -> list[str]:
         body,
         "--assignee",
         execution_profile,
+        # Official kanban flow: park the task in triage so the gateway
+        # auto-decomposer fans it out into a dependency chain and the
+        # dispatcher spawns steps back-to-back (dispatch_interval_seconds).
+        # Steps on the same node execute without connector round-trips.
+        "--triage",
         "--workspace",
         workspace,
         "--created-by",
@@ -1225,6 +1230,7 @@ class DBB3CloudConnector:
         clock: Callable[[], str] = now_iso,
     ) -> None:
         self.cloud_client = cloud_client
+        self._last_reported_terminal = False
         self.command_runner = command_runner
         self.clock = clock
         path = Path(
@@ -2093,6 +2099,11 @@ class DBB3CloudConnector:
                 local.pop("pending_status_fingerprint", None)
                 self.checkpoints.save(state)
                 reported = 1
+                if _coerce_flag(pending.get("terminal")):
+                    # A terminal checkpoint was accepted: the cloud can now
+                    # create the next role run. Signal the main loop to poll
+                    # again immediately instead of waiting a full interval.
+                    self._last_reported_terminal = True
         return reported, uploaded
 
     def _process_run(self, run_payload: dict[str, Any], state: dict[str, Any]) -> tuple[int, int]:
@@ -2176,6 +2187,8 @@ class DBB3CloudConnector:
         statuses = 0
         artifacts = 0
         cancelled = 0
+        terminal_pushed = 0
+        self._last_reported_terminal = False
         processed: set[str] = set()
         for run_payload in self.cloud_client.pull_runs(limit=5, lease_seconds=90):
             if not isinstance(run_payload, dict):
@@ -2250,6 +2263,8 @@ class DBB3CloudConnector:
                 continue
             created += made
             artifacts += uploaded
+            if made and self._last_reported_terminal:
+                terminal_pushed += 1
             statuses += int(made > 0)
         for item in self.cloud_client.pull_cancellations(limit=5, lease_seconds=90):
             if isinstance(item, dict):
@@ -2259,6 +2274,7 @@ class DBB3CloudConnector:
             "statuses": statuses,
             "artifacts": artifacts,
             "cancelled": cancelled,
+            "terminal_pushed": terminal_pushed,
         }
 
 
@@ -2309,6 +2325,11 @@ def main(argv: list[str] | None = None) -> int:
     while True:
         try:
             result = connector.sync_once()
+            if int(result.get("terminal_pushed") or 0) > 0:
+                # A terminal checkpoint was accepted; the cloud may have
+                # created the next role run. Poll again almost immediately.
+                time.sleep(0.3)
+                continue
             if not args.quiet or any(int(value) for value in result.values()):
                 print(json.dumps({"timestamp": now_iso(), **result}, ensure_ascii=False), flush=True)
         except ConnectorAuthError as exc:
