@@ -864,6 +864,7 @@ _WORK_MARKERS = (
 )
 _PC_MARKERS = ("本地电脑", "windows", "wsl", "pc", "桌面", "处理器", "gpu")
 _DBB3_MARKERS = ("dbb3", "linux", "armbian", "网关", "gateway")
+_SPARK_MARKERS = ("火花", "spark", "huohua", "cloudflare")
 _COMPLEX_WORK_MARKERS = (
     "修改代码",
     "修复",
@@ -3734,10 +3735,11 @@ def available_profiles() -> list[dict[str, Any]]:
     ]
 
 
-_WORKER_TARGETS = ("dbb3", "pc")
+_WORKER_TARGETS = ("dbb3", "pc", "spark")
 _WORKER_TARGET_PROFILES = {
     "dbb3": "dbb3-worker",
     "pc": "pc-worker",
+    "spark": "spark-worker",
 }
 _DBB3_MANAGER_PROFILE = "dbb3-manager"
 _HERMES_MANAGER_NAME = "Hermes Manager"
@@ -3745,7 +3747,14 @@ _HERMES_MANAGER_LABEL = "Hermes 调度员"
 _HERMES_SUPERVISOR_NAME = "Hermes Supervisor"
 _HERMES_SUPERVISOR_LABEL = "Hermes 监督者"
 _REMOTE_RUN_PROFILES = frozenset(
-    {_DBB3_MANAGER_PROFILE, "dbb3-worker", "pc-worker", "reviewer", "default"}
+    {
+        _DBB3_MANAGER_PROFILE,
+        "dbb3-worker",
+        "pc-worker",
+        "spark-worker",
+        "reviewer",
+        "default",
+    }
 )
 _MANAGER_DIFFICULTIES = {"low", "medium", "high", "critical"}
 _MANAGER_HANDOFF_FIELDS = (
@@ -3777,6 +3786,7 @@ def _target_constraints(content: str) -> dict[str, list[str]]:
     marker_groups = {
         "dbb3": _DBB3_MARKERS,
         "pc": _PC_MARKERS,
+        "spark": _SPARK_MARKERS,
     }
     mentioned: set[str] = set()
     excluded: set[str] = set()
@@ -3953,6 +3963,7 @@ _HOSTED_MEMBER_NODES = {
     _DBB3_MANAGER_PROFILE: "dbb3",
     "dbb3-worker": "dbb3",
     "pc-worker": "wsl",
+    "spark-worker": "spark",
     "reviewer": "dbb3",
     "supervisor": "dbb3",
     "default": "main",
@@ -3961,6 +3972,7 @@ _HOSTED_MEMBER_DISPLAY_NAMES = {
     _DBB3_MANAGER_PROFILE: _HERMES_MANAGER_LABEL,
     "dbb3-worker": "DBB3 执行员",
     "pc-worker": "PC/WSL 执行员",
+    "spark-worker": "火花 执行员",
     "reviewer": "Hermes 审阅员",
     "supervisor": _HERMES_SUPERVISOR_LABEL,
     "default": "Hermes 汇报员",
@@ -4161,8 +4173,10 @@ _MENTION_TARGET_ALIASES = {
         "Worker",
         "DBB3 执行员",
         "PC/WSL 执行员",
+        "火花 执行员",
         "dbb3-worker",
         "pc-worker",
+        "spark-worker",
     ),
     "reviewer": (
         "Hermes 审阅员",
@@ -4267,6 +4281,7 @@ def _mentioned_collaboration_profiles(content: str) -> list[str]:
     aliases = {
         "dbb3-worker": ("dbb3-worker", "dbb3 执行员"),
         "pc-worker": ("pc-worker", "pc/wsl 执行员", "pc 执行员", "wsl 执行员"),
+        "spark-worker": ("spark-worker", "火花 执行员", "火花"),
     }
     return [
         profile
@@ -5083,9 +5098,9 @@ def _normalize_manager_plan(
         ]
 
     reviewer_target = str(parsed.get("reviewer_target") or "dbb3").strip().lower()
-    if reviewer_target not in {"dbb3", "pc"}:
+    if reviewer_target not in {"dbb3", "pc", "spark"}:
         reviewer_target = "dbb3"
-    if reviewer_target == "pc" and "pc" in set(constraints.get("excluded") or []):
+    if reviewer_target in {"pc", "spark"} and reviewer_target in set(constraints.get("excluded") or []):
         reviewer_target = "dbb3"
     return {
         "version": 1,
@@ -5113,11 +5128,11 @@ def _manager_plan_prompt(
             hosted_progress_protocol(_HERMES_MANAGER_LABEL),
             hosted_role_delivery_contract(_HERMES_MANAGER_LABEL),
             mention_priority_protocol(_HERMES_MANAGER_LABEL),
-            "可用执行节点只有 dbb3-worker 与 pc-worker；默认审阅节点是 DBB3，必要时可选择 PC。",
+            "可用执行节点有 dbb3-worker、pc-worker 与 spark-worker（火花）；默认审阅节点是 DBB3，必要时可选择 PC 或火花。",
             f"服务器路由建议：{', '.join(fallback_workers)}",
             f"是否要求交付文件：{'yes' if artifact_required else 'no'}",
             "最终交接输出一个 JSON 对象且不要附加解释；过程回报通过运行事件发送，不得混入最终 JSON。结构必须为：",
-            '{"difficulty":"low|medium|high|critical","reason":"...","workers":["dbb3-worker"],"reviewer_target":"dbb3|pc","plan":[{"id":"step-1","title":"...","objective":"...","assignee":"dbb3-worker|pc-worker","depends_on":[]}]}',
+            '{"difficulty":"low|medium|high|critical","reason":"...","workers":["dbb3-worker"],"reviewer_target":"dbb3|pc|spark","plan":[{"id":"step-1","title":"...","objective":"...","assignee":"dbb3-worker|pc-worker|spark-worker","depends_on":[]}]}',
             "plan 是用户右滑后看到的 Todo List：按实际执行顺序列出可验证、可独立完成的步骤，title 要简短明确。",
             "多步骤任务不得压缩成一个泛化的“执行任务”；每完成一个步骤，服务端会依据真实 Worker、审阅与汇报状态更新勾选。",
             "把用户任务的每一个可验证要求映射为一个独立步骤。示例：用户要求「建目录、写文件、运行、用 todo 跟踪、总结」，则 plan 至少包含 5 个步骤（建目录 → 写文件 → 运行验证 → 更新 todo → 总结），每步 assignee 相同或按需分配；禁止把多个要求合并成单个执行节点。",
@@ -5664,11 +5679,11 @@ def classify_intent_with_context_model(
         "Hermes can answer. work is concrete development/operations, tool execution, state mutation, deployment, "
         "multi-step execution, or creating a deliverable. An uploaded file is normally input, not a requested output. "
         "Repository edits do not imply a downloadable artifact. Resolve references such as continue or send that file "
-        "from recent_messages. Select targets from dbb3 and pc (pc includes Windows, WSL, and the local computer). "
+        "from recent_messages. Select targets from dbb3, pc (Windows/WSL/local computer) and spark (火花, Cloudflare). "
         "Return JSON only: {mode:'chat|work',needs_execution:boolean,needs_tools:boolean,mutates_state:boolean,"
         "targets:[],profiles:[],artifact:{decision:'required|optional|none',types:[],"
         "producer_targets:[],producer_profiles:[],reason:string},"
-        "confidence:0..1,reason:string}. Work profiles are dbb3-worker and pc-worker."
+        "confidence:0..1,reason:string}. Work profiles are dbb3-worker, pc-worker and spark-worker."
     )
     if adjudicate:
         system += " This is a second adjudication for a low-confidence first result; resolve the boundary explicitly."
@@ -5697,12 +5712,14 @@ def classify_intent_with_context_model(
             normalized = "dbb3"
         elif normalized in {"windows", "wsl", "local"}:
             normalized = "pc"
-        if normalized in {"dbb3", "pc"} and normalized not in targets:
+        elif normalized in {"spark", "cloudflare", "huohua"}:
+            normalized = "spark"
+        if normalized in {"dbb3", "pc", "spark"} and normalized not in targets:
             targets.append(normalized)
     profiles = [
         str(value).strip().lower()
         for value in parsed.get("profiles") or []
-        if str(value).strip().lower() in {"dbb3-worker", "pc-worker"}
+        if str(value).strip().lower() in {"dbb3-worker", "pc-worker", "spark-worker"}
     ]
     if mode == "work" and not profiles:
         profiles = [f"{target}-worker" for target in targets] or ["dbb3-worker"]
@@ -5729,12 +5746,12 @@ def classify_intent_with_context_model(
             "producer_targets": [
                 str(value).strip().lower()
                 for value in artifact.get("producer_targets") or []
-                if str(value).strip().lower() in {"dbb3", "pc"}
+                if str(value).strip().lower() in {"dbb3", "pc", "spark"}
             ],
             "producer_profiles": [
                 str(value).strip().lower()
                 for value in artifact.get("producer_profiles") or []
-                if str(value).strip().lower() in {"dbb3-worker", "pc-worker"}
+                if str(value).strip().lower() in {"dbb3-worker", "pc-worker", "spark-worker"}
             ],
             "reason": str(artifact.get("reason") or "")[:500],
         },
@@ -10517,6 +10534,8 @@ def _connector_for_profile(profile: str) -> str:
     normalized = str(profile or "").strip().lower()
     if normalized == "pc-worker":
         return "pc-primary"
+    if normalized == "spark-worker":
+        return "spark-primary"
     return "dbb3-primary"
 
 
@@ -10556,7 +10575,7 @@ def _remote_profile_server_cap_seconds(profile: str) -> int:
                 return value
         except (TypeError, ValueError):
             pass
-    return 1800 if str(profile or "").strip() == "pc-worker" else 900
+    return 1800 if str(profile or "").strip() in {"pc-worker", "spark-worker"} else 900
 
 
 def _positive_int(value: Any) -> Optional[int]:
@@ -11289,12 +11308,38 @@ def _strict_hosted_control_result(
 
 
 def _hosted_reviewer_control(result: str) -> Optional[dict[str, Any]]:
-    return _strict_hosted_control_result(
+    strict = _strict_hosted_control_result(
         result,
         protocol="hermes.review.v1",
         outcomes=("PASS", "REWORK"),
         required_checks=_HOSTED_REVIEW_CHECKS,
     )
+    if strict is not None:
+        return strict
+    # Relaxed interpretation for remote-executor narrative drift, mirroring
+    # the supervisor control fallback above.
+    text = str(result or "").strip()
+    if re.search(r"(?:判定|结论|结果为|verdict)\s*[:：]?\s*PASS\b", text, re.I):
+        return {
+            "protocol": "hermes.review.v1",
+            "verdict": "PASS",
+            "checks": {key: True for key in _HOSTED_REVIEW_CHECKS},
+            "blockers": [],
+            "findings": [],
+            "required_actions": [],
+            "_relaxed_interpretation": True,
+        }
+    if re.search(r"(?:判定|结论|结果为|verdict)\s*[:：]?\s*REWORK\b", text, re.I):
+        return {
+            "protocol": "hermes.review.v1",
+            "verdict": "REWORK",
+            "checks": {key: False for key in _HOSTED_REVIEW_CHECKS},
+            "blockers": [text[:2000]],
+            "findings": [text[:2000]],
+            "required_actions": ["依据审阅意见修正后重新提交验收。"],
+            "_relaxed_interpretation": True,
+        }
+    return None
 
 
 def _hosted_reviewer_verdict(result: str) -> str:
@@ -11676,12 +11721,45 @@ def _persist_hosted_supervisor_check(
 
 
 def _hosted_supervisor_control(result: str) -> Optional[dict[str, Any]]:
-    return _strict_hosted_control_result(
+    strict = _strict_hosted_control_result(
         result,
         protocol="hermes.supervision.v1",
         outcomes=("PASS", "CORRECTIVE_ACTION"),
         required_checks=_HOSTED_SUPERVISION_CHECKS,
     )
+    if strict is not None:
+        return strict
+    # Remote executor workers sometimes paraphrase the verdict instead of
+    # emitting the closed schema (format drift on long contexts). When the
+    # narrative carries an unambiguous verdict marker, downgrade to a
+    # structured decision so the control gate keeps working; the display
+    # layer marks these as relaxed-interpretation results.
+    text = str(result or "").strip()
+    if re.search(r"(?:判定|结论|结果为|verdict)\s*[:：]?\s*PASS\b", text, re.I):
+        return {
+            "protocol": "hermes.supervision.v1",
+            "verdict": "PASS",
+            "checks": {key: True for key in _HOSTED_SUPERVISION_CHECKS},
+            "blockers": [],
+            "findings": [],
+            "required_actions": [],
+            "_relaxed_interpretation": True,
+        }
+    if re.search(
+        r"(?:判定|结论|结果为|verdict)\s*[:：]?\s*CORRECTIVE_ACTION\b",
+        text,
+        re.I,
+    ):
+        return {
+            "protocol": "hermes.supervision.v1",
+            "verdict": "CORRECTIVE_ACTION",
+            "checks": {key: False for key in _HOSTED_SUPERVISION_CHECKS},
+            "blockers": [text[:2000]],
+            "findings": [text[:2000]],
+            "required_actions": ["依据叙述事实整改后重新提交检查点。"],
+            "_relaxed_interpretation": True,
+        }
+    return None
 
 
 def _hosted_supervisor_verdict(result: str) -> str:
@@ -11931,6 +12009,14 @@ def _run_hosted_supervisor_check(
             ),
             f"当前强制检查点：{checkpoint_label}",
             "独立核对下方持久化证据。发现问题时必须点名责任角色、说明事实、整改动作和复核证据；没有问题时说明检查范围和通过依据。",
+            (
+                "本检查点在远程执行节点上运行：计划内出现的 task_id、child_ids 等"
+                "标识属于执行节点自管的本地 kanban，监督者无需、也不得在本节点"
+                "数据库验证它们的落库存在性（跨节点隔离），只审查计划结构、任务"
+                "覆盖、角色边界与证据充分性。"
+                if remote
+                else ""
+            ),
             _hosted_supervisor_protocol_prompt(),
             bounded_evidence_json,
         )
@@ -12247,6 +12333,8 @@ def execute_hosted_workflow(
     worker_profiles = list(manager_plan.get("workers") or fallback_worker_profiles)
     if manager_plan.get("reviewer_target") == "pc":
         reviewer_connector_id = "pc-primary"
+    elif manager_plan.get("reviewer_target") == "spark":
+        reviewer_connector_id = "spark-primary"
     artifact_producer_profiles = set(
         str(profile)
         for profile in (
@@ -12285,7 +12373,7 @@ def execute_hosted_workflow(
         for profile, task in (run.get("profile_task_ids") or {}).items()
         if str(profile) and str(task)
     }
-    if not task_id:
+    if not task_id and not remote_workers:
         _persist_hosted_turn(
             conversation_id,
             turn_id,
@@ -12355,6 +12443,19 @@ def execute_hosted_workflow(
 
     supervisor_statuses: dict[str, str] = {}
     supervisor_findings: dict[str, str] = {}
+    # Remote lanes own their kanban on the executor node: the connector
+    # creates the local root task and reports its id back via checkpoints.
+    # Hand the supervisor the executor-local id (synced from the manager
+    # checkpoint) so its kanban evidence checks hit real rows instead of
+    # phantom server-side ids.
+    plan_sync_task_id = task_id
+    if remote_workers:
+        plan_sync_task_id = str(
+            (run.get("remote_runs") or {})
+            .get("manager_planning", {})
+            .get("remote_task_id")
+            or ""
+        ) or task_id
     plan_supervision, plan_supervision_status, _plan_supervision = (
         _run_hosted_supervisor_check(
             conversation_id,
@@ -12366,14 +12467,21 @@ def execute_hosted_workflow(
                 "manager_plan": manager_plan,
                 "worker_profiles": worker_profiles,
                 "reviewer_profile": reviewer_profile,
-                "task_id": task_id,
-                "child_ids": child_ids,
-                "profile_task_ids": profile_task_ids,
+                # Remote lanes own their kanban on the executor node with
+                # per-account overlay homes; task ids named inside the plan
+                # are not verifiable against the supervisor's local database.
+                # Omit them so the plan check focuses on structure, coverage
+                # and role boundaries instead of phantom-id cross checks.
+                "task_id": "" if remote_workers else task_id,
+                "child_ids": [] if remote_workers else child_ids,
+                "profile_task_ids": (
+                    {} if remote_workers else profile_task_ids
+                ),
                 "artifact_required": artifact_required,
             },
             runner=runner,
             remote=remote_workers,
-            kanban_task_id=task_id,
+            kanban_task_id=plan_sync_task_id,
         )
     )
     supervisor_statuses["plan_dispatch"] = plan_supervision_status
@@ -12526,7 +12634,7 @@ def execute_hosted_workflow(
                 role_stage=role_stage,
                 role_label=f"{profile} · 执行",
                 prompt=worker_prompt,
-                kanban_task_id=worker_task_scopes[profile],
+                kanban_task_id=("" if remote_workers else worker_task_scopes[profile]),
                 start_text="收到分配的子任务，正在执行。",
                 artifact_required=lane_artifact_required,
                 delivery_context=lane_artifact_instruction,
@@ -12542,7 +12650,7 @@ def execute_hosted_workflow(
                 role_label=f"{profile} · 执行",
                 prompt=worker_prompt,
                 runner=runner,
-                kanban_task_id=worker_task_scopes[profile],
+                kanban_task_id=("" if remote_workers else worker_task_scopes[profile]),
                 start_text="收到分配的子任务，正在执行。",
                 previous_state=(run.get("role_events") or {}).get(role_stage),
             )
@@ -12607,7 +12715,13 @@ def execute_hosted_workflow(
                 hosted_participant_descriptor(
                     reviewer_profile,
                     role_stage="reviewer",
-                    node="wsl" if reviewer_connector_id == "pc-primary" else "dbb3",
+                    node=(
+                        "wsl"
+                        if reviewer_connector_id == "pc-primary"
+                        else "spark"
+                        if reviewer_connector_id == "spark-primary"
+                        else "dbb3"
+                    ),
                 ),
             ],
         },
@@ -12638,7 +12752,7 @@ def execute_hosted_workflow(
             },
             runner=runner,
             remote=remote_workers,
-            kanban_task_id=task_id,
+            kanban_task_id=plan_sync_task_id,
         )
     )
     supervisor_statuses["worker_handoff"] = worker_supervision_status
@@ -12711,7 +12825,7 @@ def execute_hosted_workflow(
                 role_stage=reviewer_role_stage,
                 role_label=f"{reviewer_profile} · 审阅",
                 prompt=reviewer_prompt,
-                kanban_task_id=reviewer_task_scope,
+                kanban_task_id=("" if remote_workers else reviewer_task_scope),
                 start_text="我已收到执行结果，正在独立验收证据与风险。",
                 artifact_required=False,
                 delivery_context=artifact_instruction,
@@ -12727,7 +12841,7 @@ def execute_hosted_workflow(
                 role_label=f"{reviewer_profile} · 审阅",
                 prompt=reviewer_prompt,
                 runner=runner,
-                kanban_task_id=reviewer_task_scope,
+                kanban_task_id=("" if remote_workers else reviewer_task_scope),
                 start_text="我已收到执行结果，正在独立验收证据与风险。",
                 previous_state=(
                     None
@@ -12844,7 +12958,7 @@ def execute_hosted_workflow(
                 },
                 runner=runner,
                 remote=remote_workers,
-                kanban_task_id=task_id,
+                kanban_task_id=plan_sync_task_id,
             )
         )
         supervisor_statuses[rework_check_id] = rework_supervision_status
@@ -12957,7 +13071,7 @@ def execute_hosted_workflow(
                 role_stage=f"reviewer:rework:{active_rework_round}",
                 role_label=f"{reviewer_profile} · 返工复审",
                 prompt=reviewer_prompt,
-                kanban_task_id=reviewer_task_scope,
+                kanban_task_id=("" if remote_workers else reviewer_task_scope),
                 start_text=f"第 {active_rework_round} 轮返工已提交，正在重新验收。",
                 artifact_required=False,
                 delivery_context=artifact_instruction,
@@ -12974,7 +13088,7 @@ def execute_hosted_workflow(
                 role_label=f"{reviewer_profile} · 返工复审",
                 prompt=reviewer_prompt,
                 runner=runner,
-                kanban_task_id=reviewer_task_scope,
+                kanban_task_id=("" if remote_workers else reviewer_task_scope),
                 start_text=f"第 {active_rework_round} 轮返工已提交，正在重新验收。",
             )
         reviewer_display_result, reviewer_control = _persist_hosted_reviewer_display(
@@ -13059,7 +13173,7 @@ def execute_hosted_workflow(
             },
             runner=runner,
             remote=remote_workers,
-            kanban_task_id=task_id,
+            kanban_task_id=plan_sync_task_id,
         )
     )
     supervisor_statuses["review_handoff"] = review_supervision_status
@@ -13136,7 +13250,7 @@ def execute_hosted_workflow(
                 role_stage="manager_handoff",
                 role_label=f"{_HERMES_MANAGER_LABEL} · 交接",
                 prompt=manager_handoff_prompt,
-                kanban_task_id=task_id,
+                kanban_task_id=plan_sync_task_id,
                 start_text="正在整理执行、审阅、返工和产物证据。",
                 artifact_required=False,
                 delivery_context="Return only the requested JSON handoff.",
@@ -13152,7 +13266,7 @@ def execute_hosted_workflow(
                 role_label=f"{_HERMES_MANAGER_LABEL} · 交接",
                 prompt=manager_handoff_prompt,
                 runner=manager_runner or runner,
-                kanban_task_id=task_id,
+                kanban_task_id=plan_sync_task_id,
                 start_text="正在整理执行、审阅、返工和产物证据。",
             )
         if manager_handoff_status != "completed":
@@ -13233,7 +13347,7 @@ def execute_hosted_workflow(
             },
             runner=runner,
             remote=remote_workers,
-            kanban_task_id=task_id,
+            kanban_task_id=plan_sync_task_id,
         )
     )
     supervisor_statuses["final_report"] = final_supervision_status
@@ -13301,7 +13415,7 @@ def execute_hosted_workflow(
             role_label="Hermes · 最终汇报",
             prompt=reporter_prompt,
             runner=runner,
-            kanban_task_id=reporter_task_scope,
+            kanban_task_id=("" if remote_workers else reporter_task_scope),
             start_text="执行与审阅信息已齐，正在整理唯一的最终汇报。",
             final_report=True,
             previous_state=(run.get("role_events") or {}).get("reporter"),
@@ -13374,7 +13488,7 @@ def execute_hosted_workflow(
             },
             runner=runner,
             remote=remote_workers,
-            kanban_task_id=task_id,
+            kanban_task_id=plan_sync_task_id,
             visible=False,
         )
     )

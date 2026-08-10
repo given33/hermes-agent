@@ -1196,7 +1196,6 @@ def build_root_task_command(run_payload: dict[str, Any]) -> list[str]:
         body,
         "--assignee",
         execution_profile,
-        "--triage",
         "--workspace",
         workspace,
         "--created-by",
@@ -1789,6 +1788,23 @@ class DBB3CloudConnector:
         )
         summary = _structured_text(detail.get("latest_summary") or task.get("result"), 4000)
         runs = detail.get("runs") if isinstance(detail.get("runs"), list) else []
+        # Structured handoffs (manager plans, supervisor verdicts, reviewer
+        # verdicts) are delivered via the terminal run's metadata when the
+        # worker follows the handoff protocol. Prefer that JSON over the
+        # free-text summary so the server-side strict parsers see the exact
+        # schema instead of a natural-language paraphrase.
+        terminal_handoff = ""
+        for item in reversed(runs):
+            if not isinstance(item, dict):
+                continue
+            run_meta = item.get("metadata")
+            if isinstance(run_meta, dict):
+                handoff = run_meta.get("final_handoff_json") or run_meta.get(
+                    "handoff_json"
+                )
+                if handoff:
+                    terminal_handoff = _structured_text(handoff, 8000)
+                    break
         errors = [
             _structured_text(item.get("error"), 1000)
             for item in runs[-10:]
@@ -1834,7 +1850,17 @@ class DBB3CloudConnector:
             "status": status,
             "terminal": status in TERMINAL_STATUSES,
             "summary": summary,
-            "result": _structured_text(task.get("result"), 8000),
+            # Workers hand off via ``task_runs.summary``; ``tasks.result``
+            # stays NULL unless explicitly passed. Prefer the structured
+            # handoff JSON (manager plans / supervisor verdicts), then the
+            # surfaced latest summary, so terminal checkpoints never report
+            # an empty or paraphrased result after a successful run.
+            "result": _structured_text(
+                terminal_handoff
+                or task.get("result")
+                or detail.get("latest_summary"),
+                8000,
+            ),
             "error": errors[-1] if errors else "",
             "activities": activities,
             "remote_task_id": _text(local.get("remote_task_id"), 256),
