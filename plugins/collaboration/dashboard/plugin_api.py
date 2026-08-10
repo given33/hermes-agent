@@ -12072,6 +12072,46 @@ def _hosted_supervisor_control(result: str) -> Optional[dict[str, Any]]:
             "required_actions": ["依据叙述事实整改后重新提交检查点。"],
             "_relaxed_interpretation": True,
         }
+    # Broader narrative fallback: workers often write "checkpoint ...: PASS."
+    # or "verdict: PASS" with the JSON omitted entirely. A bare PASS verdict
+    # word at a sentence boundary, with no corrective language nearby, is an
+    # unambiguous success marker; CORRECTIVE_ACTION/REWORK/FAIL wording maps
+    # to a corrective decision. Keep this last so strict JSON and the
+    # prefixed markers above win when both are present.
+    if re.search(
+        r"(?<![A-Za-z])(?:PASS|通过了|通过检查|检查通过)(?![A-Za-z])",
+        text,
+        re.I,
+    ) and not re.search(
+        r"(?<![A-Za-z])(?:CORRECTIVE_ACTION|REWORK|FAILED|失败|返工|整改|不通过)(?![A-Za-z])",
+        text,
+        re.I,
+    ):
+        return {
+            "protocol": "hermes.supervision.v1",
+            "verdict": "PASS",
+            "checks": {key: True for key in _HOSTED_SUPERVISION_CHECKS},
+            "blockers": [],
+            "findings": [],
+            "required_actions": [],
+            "_relaxed_interpretation": True,
+            "_relaxed_reason": "narrative verdict marker",
+        }
+    if re.search(
+        r"(?<![A-Za-z])(?:CORRECTIVE_ACTION|REWORK|FAILED|失败|返工|整改|不通过)(?![A-Za-z])",
+        text,
+        re.I,
+    ):
+        return {
+            "protocol": "hermes.supervision.v1",
+            "verdict": "CORRECTIVE_ACTION",
+            "checks": {key: False for key in _HOSTED_SUPERVISION_CHECKS},
+            "blockers": [text[:2000]],
+            "findings": [text[:2000]],
+            "required_actions": ["依据叙述事实整改后重新提交检查点。"],
+            "_relaxed_interpretation": True,
+            "_relaxed_reason": "narrative verdict marker",
+        }
     return None
 
 

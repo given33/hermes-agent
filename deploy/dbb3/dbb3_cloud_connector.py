@@ -170,6 +170,60 @@ def _structured_text(value: Any, limit: int = 12000) -> str:
     return _text(redacted, limit)
 
 
+def _extract_json_handoff(value: Any, limit: int = 8000) -> str:
+    """Pull the first embedded JSON object out of a natural-language handoff.
+
+    Remote workers occasionally wrap the required verdict schema in narrative
+    prose (format drift on long contexts): the JSON lands in stdout or the
+    summary while the summary itself reads like a report. The server-side
+    strict parsers need the exact object, so when a terminal checkpoint
+    carries prose, extract the first balanced JSON object and prefer it as
+    the structured result.
+    """
+    text = str(value or "").strip()
+    if not text:
+        return ""
+    # A lone object (already strict) round-trips as-is.
+    if text.startswith("{") and text.endswith("}"):
+        try:
+            json.loads(text)
+            return _structured_text(text, limit)
+        except (ValueError, TypeError):
+            pass
+    # Otherwise scan for the first balanced top-level object, including
+    # inside Markdown fences or trailing prose.
+    start = text.find("{")
+    while start >= 0:
+        depth = 0
+        in_string = False
+        escaped = False
+        for index in range(start, len(text)):
+            char = text[index]
+            if in_string:
+                if escaped:
+                    escaped = False
+                elif char == "\\":
+                    escaped = True
+                elif char == '"':
+                    in_string = False
+                continue
+            if char == '"':
+                in_string = True
+            elif char == "{":
+                depth += 1
+            elif char == "}":
+                depth -= 1
+                if depth == 0:
+                    candidate = text[start : index + 1]
+                    try:
+                        json.loads(candidate)
+                        return _structured_text(candidate, limit)
+                    except (ValueError, TypeError):
+                        break
+        start = text.find("{", start + 1)
+    return ""
+
+
 def _timestamp_ms(value: Any) -> int | None:
     if isinstance(value, bool) or not isinstance(value, (int, float)):
         return None
@@ -1905,12 +1959,16 @@ class DBB3CloudConnector:
             "summary": summary,
             # Workers hand off via ``task_runs.summary``; ``tasks.result``
             # stays NULL unless explicitly passed. Prefer the structured
-            # handoff JSON (manager plans / supervisor verdicts), then the
-            # surfaced latest summary, so terminal checkpoints never report
-            # an empty or paraphrased result after a successful run.
+            # handoff JSON (manager plans / supervisor verdicts), then any
+            # JSON embedded in the narrative summary (format drift wraps the
+            # required schema in prose), then the surfaced latest summary, so
+            # terminal checkpoints never report an empty or paraphrased result
+            # after a successful run.
             "result": _structured_text(
                 terminal_handoff
                 or task.get("result")
+                or _extract_json_handoff(summary)
+                or _extract_json_handoff(detail.get("latest_summary"))
                 or detail.get("latest_summary"),
                 8000,
             ),
