@@ -2093,6 +2093,18 @@ class DBB3CloudConnector:
             self._boundary_validated_runs.discard(remote_id)
         else:
             self._assert_local_account_boundary(local, state)
+        if str(local.get("status") or "") == "awaiting_claim":
+            # The cloud rotated the claim (lease expired / sealed after a
+            # terminal checkpoint won elsewhere). Pushing with a stale token
+            # only re-triggers 409; instead clear the claim so the next pull
+            # re-leases this run and we pick up the authoritative token.
+            # The kanban root is untouched, so re-ack resumes progress.
+            local.pop("claim_token", None)
+            local["claim_stale"] = False
+            local["status"] = "queued"
+            local["acked"] = False
+            self.checkpoints.save(state)
+            return 0, 0
         detail = self._show_task(_text(local.get("root_task_id"), 256), local)
         payload, artifact_paths = self._compact_status(detail, local)
         if artifact_paths:
@@ -2219,13 +2231,41 @@ class DBB3CloudConnector:
                             }
                         )
                     else:
-                        # Still active remotely: refresh the claim token so a
-                        # future status push passes claim validation.
+                        # Still active remotely: refresh the claim token and
+                        # retry the pending payload immediately — the kanban
+                        # root is terminal on our side, so the terminal
+                        # checkpoint must land rather than wait for a pull
+                        # cycle that the server skips while lease is active.
                         remote_claim = _text((remote or {}).get("claim_token"), 256)
                         if remote_claim:
                             local["claim_token"] = remote_claim
-                        local["claim_stale"] = True
-                        local["status"] = "awaiting_claim"
+                        # The pending payload was built with the stale claim;
+                        # refresh it so the retry passes claim validation.
+                        if isinstance(pending, dict):
+                            pending["claim_token"] = remote_claim
+                        try:
+                            self.cloud_client.report_status(remote_id, pending)
+                        except (CloudHTTPError, ConnectorContractError, OSError, urllib.error.URLError):
+                            local["claim_stale"] = True
+                            local["status"] = "awaiting_claim"
+                            local.pop("pending_status", None)
+                            local.pop("pending_status_fingerprint", None)
+                            self.checkpoints.save(state)
+                            return 0, 0
+                        local["checkpoint_cursor"] = _checkpoint_cursor(
+                            pending["checkpoint_cursor"]
+                        )
+                        local["last_status_fingerprint"] = str(
+                            local.get("pending_status_fingerprint") or fingerprint
+                        )
+                        local["status"] = pending["status"]
+                        local.pop("pending_status", None)
+                        local.pop("pending_status_fingerprint", None)
+                        self.checkpoints.save(state)
+                        reported = 1
+                        if _coerce_flag(pending.get("terminal")):
+                            self._last_reported_terminal = True
+                        return reported, 0
                     local.pop("pending_status", None)
                     local.pop("pending_status_fingerprint", None)
                     self.checkpoints.save(state)
