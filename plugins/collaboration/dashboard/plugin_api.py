@@ -12063,13 +12063,22 @@ def _hosted_supervisor_control(result: str) -> Optional[dict[str, Any]]:
         r"(?<![A-Za-z])(?:CORRECTIVE_ACTION|REWORK|FAILED|失败|返工|整改|不通过)(?![A-Za-z])",
         re.I,
     )
-    _corrective_negated = re.compile(
-        r"(?:未|无|不|没有|无需|未发现|没有发现|不存在|避免|排除)[^。；;\n]{0,6}?"
+    # Neutral/structural uses of corrective wording that must NOT flip a PASS:
+    #  - checkpoint names like "审阅与返工交接" / "返工记录" / "rework_history"
+    #  - negated clauses "未发现问题" / "未制造返工" / "无需整改"
+    _corrective_neutral = re.compile(
+        r"(?:返工交接|返工记录|返工历史|rework_history|rework_log|rework_items|返工列表)"
+        r"|(?:未|无|不|没有|无需|未发现|没有发现|不存在|避免|排除)[^。；;\n]{0,6}?"
         r"(?<![A-Za-z])(?:CORRECTIVE_ACTION|REWORK|FAILED|失败|返工|整改|不通过)(?![A-Za-z])",
         re.I,
     )
-    _has_negated_corrective = bool(_corrective_negated.search(text))
-    _has_plain_corrective = bool(_corrective_pattern.search(text)) and not _has_negated_corrective
+    _corrective_matches = [
+        m for m in _corrective_pattern.finditer(text)
+        if not _corrective_neutral.search(
+            text[max(0, m.start() - 24) : min(len(text), m.end() + 24)]
+        )
+    ]
+    _has_plain_corrective = bool(_corrective_matches)
     if re.search(
         r"(?<![A-Za-z])(?:PASS|通过了|通过检查|检查通过)(?![A-Za-z])",
         text,
