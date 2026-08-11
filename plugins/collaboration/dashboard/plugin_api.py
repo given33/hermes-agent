@@ -426,7 +426,10 @@ def _live_conversation_snapshot(
         if snapshot is None:
             return None
         snapshot_owner = str(snapshot.get("owner_id") or "").strip()
-        if snapshot_owner and snapshot_owner != normalized_owner:
+        # A live projection is not the legacy-owner claim path.  Ownerless
+        # snapshots must go through the durable compatibility gate below; an
+        # arbitrary caller who knows a conversation id must not read them.
+        if not snapshot_owner or snapshot_owner != normalized_owner:
             return None
         if snapshot.get("delete_requested"):
             return None
@@ -864,7 +867,6 @@ _WORK_MARKERS = (
 )
 _PC_MARKERS = ("本地电脑", "windows", "wsl", "pc", "桌面", "处理器", "gpu")
 _DBB3_MARKERS = ("dbb3", "linux", "armbian", "网关", "gateway")
-_SPARK_MARKERS = ("火花", "spark", "huohua", "cloudflare")
 _COMPLEX_WORK_MARKERS = (
     "修改代码",
     "修复",
@@ -4044,11 +4046,10 @@ def available_profiles() -> list[dict[str, Any]]:
     ]
 
 
-_WORKER_TARGETS = ("dbb3", "pc", "spark")
+_WORKER_TARGETS = ("dbb3", "pc")
 _WORKER_TARGET_PROFILES = {
     "dbb3": "dbb3-worker",
     "pc": "pc-worker",
-    "spark": "spark-worker",
 }
 _DBB3_MANAGER_PROFILE = "dbb3-manager"
 _HERMES_MANAGER_NAME = "Hermes Manager"
@@ -4060,7 +4061,6 @@ _REMOTE_RUN_PROFILES = frozenset(
         _DBB3_MANAGER_PROFILE,
         "dbb3-worker",
         "pc-worker",
-        "spark-worker",
         "reviewer",
         "default",
     }
@@ -4095,7 +4095,6 @@ def _target_constraints(content: str) -> dict[str, list[str]]:
     marker_groups = {
         "dbb3": _DBB3_MARKERS,
         "pc": _PC_MARKERS,
-        "spark": _SPARK_MARKERS,
     }
     mentioned: set[str] = set()
     excluded: set[str] = set()
@@ -4272,7 +4271,6 @@ _HOSTED_MEMBER_NODES = {
     _DBB3_MANAGER_PROFILE: "dbb3",
     "dbb3-worker": "dbb3",
     "pc-worker": "wsl",
-    "spark-worker": "spark",
     "reviewer": "dbb3",
     "supervisor": "dbb3",
     "default": "main",
@@ -4281,7 +4279,6 @@ _HOSTED_MEMBER_DISPLAY_NAMES = {
     _DBB3_MANAGER_PROFILE: _HERMES_MANAGER_LABEL,
     "dbb3-worker": "DBB3 执行员",
     "pc-worker": "PC/WSL 执行员",
-    "spark-worker": "火花 执行员",
     "reviewer": "Hermes 审阅员",
     "supervisor": _HERMES_SUPERVISOR_LABEL,
     "default": "Hermes 汇报员",
@@ -4482,10 +4479,8 @@ _MENTION_TARGET_ALIASES = {
         "Worker",
         "DBB3 执行员",
         "PC/WSL 执行员",
-        "火花 执行员",
         "dbb3-worker",
         "pc-worker",
-        "spark-worker",
     ),
     "reviewer": (
         "Hermes 审阅员",
@@ -4590,7 +4585,6 @@ def _mentioned_collaboration_profiles(content: str) -> list[str]:
     aliases = {
         "dbb3-worker": ("dbb3-worker", "dbb3 执行员"),
         "pc-worker": ("pc-worker", "pc/wsl 执行员", "pc 执行员", "wsl 执行员"),
-        "spark-worker": ("spark-worker", "火花 执行员", "火花"),
     }
     return [
         profile
@@ -5437,11 +5431,11 @@ def _manager_plan_prompt(
             hosted_progress_protocol(_HERMES_MANAGER_LABEL),
             hosted_role_delivery_contract(_HERMES_MANAGER_LABEL),
             mention_priority_protocol(_HERMES_MANAGER_LABEL),
-            "可用执行节点有 dbb3-worker、pc-worker 与 spark-worker（火花）；默认审阅节点是 DBB3，必要时可选择 PC 或火花。",
+            "可用执行节点有 dbb3-worker 与 pc-worker；默认审阅节点是 DBB3，必要时可选择 PC。",
             f"服务器路由建议：{', '.join(fallback_workers)}",
             f"是否要求交付文件：{'yes' if artifact_required else 'no'}",
             "最终交接输出一个 JSON 对象且不要附加解释；过程回报通过运行事件发送，不得混入最终 JSON。结构必须为：",
-            '{"difficulty":"low|medium|high|critical","reason":"...","workers":["dbb3-worker"],"reviewer_target":"dbb3|pc|spark","plan":[{"id":"step-1","title":"...","objective":"...","assignee":"dbb3-worker|pc-worker|spark-worker","depends_on":[]}]}',
+            '{"difficulty":"low|medium|high|critical","reason":"...","workers":["dbb3-worker"],"reviewer_target":"dbb3|pc","plan":[{"id":"step-1","title":"...","objective":"...","assignee":"dbb3-worker|pc-worker","depends_on":[]}]}',
             "plan 是用户右滑后看到的 Todo List：按实际执行顺序列出可验证、可独立完成的步骤，title 要简短明确。",
             "多步骤任务不得压缩成一个泛化的“执行任务”；每完成一个步骤，服务端会依据真实 Worker、审阅与汇报状态更新勾选。",
             "把用户任务的每一个可验证要求映射为一个独立步骤。示例：用户要求「建目录、写文件、运行、用 todo 跟踪、总结」，则 plan 至少包含 5 个步骤（建目录 → 写文件 → 运行验证 → 更新 todo → 总结），每步 assignee 相同或按需分配；禁止把多个要求合并成单个执行节点。",
@@ -5988,11 +5982,11 @@ def classify_intent_with_context_model(
         "Hermes can answer. work is concrete development/operations, tool execution, state mutation, deployment, "
         "multi-step execution, or creating a deliverable. An uploaded file is normally input, not a requested output. "
         "Repository edits do not imply a downloadable artifact. Resolve references such as continue or send that file "
-        "from recent_messages. Select targets from dbb3, pc (Windows/WSL/local computer) and spark (火花, Cloudflare). "
+        "from recent_messages. Select targets from dbb3 and pc (Windows/WSL/local computer). "
         "Return JSON only: {mode:'chat|work',needs_execution:boolean,needs_tools:boolean,mutates_state:boolean,"
         "targets:[],profiles:[],artifact:{decision:'required|optional|none',types:[],"
         "producer_targets:[],producer_profiles:[],reason:string},"
-        "confidence:0..1,reason:string}. Work profiles are dbb3-worker, pc-worker and spark-worker."
+        "confidence:0..1,reason:string}. Work profiles are dbb3-worker and pc-worker."
     )
     if adjudicate:
         system += " This is a second adjudication for a low-confidence first result; resolve the boundary explicitly."
@@ -6021,14 +6015,12 @@ def classify_intent_with_context_model(
             normalized = "dbb3"
         elif normalized in {"windows", "wsl", "local"}:
             normalized = "pc"
-        elif normalized in {"spark", "cloudflare", "huohua"}:
-            normalized = "spark"
-        if normalized in {"dbb3", "pc", "spark"} and normalized not in targets:
+        if normalized in {"dbb3", "pc"} and normalized not in targets:
             targets.append(normalized)
     profiles = [
         str(value).strip().lower()
         for value in parsed.get("profiles") or []
-        if str(value).strip().lower() in {"dbb3-worker", "pc-worker", "spark-worker"}
+        if str(value).strip().lower() in {"dbb3-worker", "pc-worker"}
     ]
     if mode == "work" and not profiles:
         profiles = [f"{target}-worker" for target in targets] or ["dbb3-worker"]
@@ -6055,12 +6047,12 @@ def classify_intent_with_context_model(
             "producer_targets": [
                 str(value).strip().lower()
                 for value in artifact.get("producer_targets") or []
-                if str(value).strip().lower() in {"dbb3", "pc", "spark"}
+                if str(value).strip().lower() in {"dbb3", "pc"}
             ],
             "producer_profiles": [
                 str(value).strip().lower()
                 for value in artifact.get("producer_profiles") or []
-                if str(value).strip().lower() in {"dbb3-worker", "pc-worker", "spark-worker"}
+                if str(value).strip().lower() in {"dbb3-worker", "pc-worker"}
             ],
             "reason": str(artifact.get("reason") or "")[:500],
         },
@@ -6278,6 +6270,7 @@ def _hosted_model_wait_state(
             "milestone_count": 0,
             "milestone_content": "",
             "request_accepted": False,
+            "request_accepted_at": 0,
         }
     )
     status_text = (
@@ -7581,6 +7574,9 @@ def apply_profile_event(
     if event_type in {"session.info", "request.accepted"}:
         if event_type == "request.accepted" and not int(state.get("model_started_at") or 0):
             state["model_started_at"] = now
+        if event_type == "request.accepted":
+            state["request_accepted"] = True
+            state["request_accepted_at"] = int(state.get("request_accepted_at") or now)
         state["runtime_session_id"] = str(
             payload.get("session_id") or state.get("runtime_session_id") or ""
         ).strip()
@@ -8227,6 +8223,7 @@ def _persist_hosted_role_state(
         "milestone_count": int(state.get("milestone_count") or 0),
         "milestone_content": str(state.get("milestone_content") or ""),
         "request_accepted": _coerce_flag(state.get("request_accepted")),
+        "request_accepted_at": int(state.get("request_accepted_at") or 0),
         "model_retry_attempt": int(state.get("model_retry_attempt") or 0),
         "model_retry_max_attempts": int(
             state.get("model_retry_max_attempts") or _HOSTED_CHAT_API_ATTEMPTS
@@ -8260,7 +8257,7 @@ def _persist_hosted_role_state(
         ]
     if snapshot["request_accepted"]:
         patch["request_accepted"] = True
-        patch["request_accepted_at"] = now
+        patch["request_accepted_at"] = snapshot["request_accepted_at"] or now
     projected_message = {
         "role": "assistant",
         "name": profile,
@@ -8430,6 +8427,7 @@ def _run_hosted_role(
         "milestone_count": 0,
         "milestone_content": "",
         "request_accepted": False,
+        "request_accepted_at": 0,
         "model_retry_attempt": 0,
         "model_retry_max_attempts": _HOSTED_CHAT_API_ATTEMPTS,
         "runtime_message_before": 0,
@@ -8465,6 +8463,7 @@ def _run_hosted_role(
                 "milestone_count": int(previous_state.get("milestone_count") or 0),
                 "milestone_content": str(previous_state.get("milestone_content") or ""),
                 "request_accepted": _coerce_flag(previous_state.get("request_accepted")),
+                "request_accepted_at": int(previous_state.get("request_accepted_at") or 0),
                 "model_retry_attempt": int(
                     previous_state.get("model_retry_attempt") or 0
                 ),
@@ -8617,7 +8616,11 @@ def _run_hosted_role(
                 patch.update(
                     {
                         "request_accepted": True,
-                        "request_accepted_at": int(time.time() * 1000),
+                        # Preserve the actual gateway request.accepted edge;
+                        # this fast chat projection may run much later.
+                        "request_accepted_at": int(
+                            state.get("request_accepted_at") or time.time() * 1000
+                        ),
                     }
                 )
             _persist_hosted_turn(
@@ -10843,8 +10846,6 @@ def _connector_for_profile(profile: str) -> str:
     normalized = str(profile or "").strip().lower()
     if normalized == "pc-worker":
         return "pc-primary"
-    if normalized == "spark-worker":
-        return "spark-primary"
     return "dbb3-primary"
 
 
@@ -10884,7 +10885,7 @@ def _remote_profile_server_cap_seconds(profile: str) -> int:
                 return value
         except (TypeError, ValueError):
             pass
-    return 1800 if str(profile or "").strip() in {"pc-worker", "spark-worker"} else 900
+    return 1800 if str(profile or "").strip() == "pc-worker" else 900
 
 
 def _positive_int(value: Any) -> Optional[int]:
@@ -11551,12 +11552,13 @@ def _strict_json_object(text: str) -> Optional[dict[str, Any]]:
         return result
 
     raw = str(text or "").strip()
+    # The control protocol is deliberately closed: accept only one bare JSON
+    # object or one complete Markdown JSON fence. Prefixes, suffixes, and
+    # narrative text must never reach the reviewer/supervisor gate.
     if not raw.startswith("{"):
-        # Real model output frequently wraps the verdict in a Markdown code
-        # fence even when the prompt forbids it. Accept exactly one fenced
-        # JSON object (```json ... ``` or ``` ... ```); any other prose or
-        # envelope is still rejected so prompt-injected text cannot pass.
-        fence = re.fullmatch(r"```(?:json)?[ \t]*\n?(.*?)\n?[ \t]*```", raw, re.DOTALL)
+        fence = re.fullmatch(
+            r"```(?:json)?[ \t]*\n?(.*?)\n?[ \t]*```", raw, re.DOTALL
+        )
         if fence is None:
             return None
         raw = fence.group(1).strip()
@@ -11621,38 +11623,12 @@ def _strict_hosted_control_result(
 
 
 def _hosted_reviewer_control(result: str) -> Optional[dict[str, Any]]:
-    strict = _strict_hosted_control_result(
+    return _strict_hosted_control_result(
         result,
         protocol="hermes.review.v1",
         outcomes=("PASS", "REWORK"),
         required_checks=_HOSTED_REVIEW_CHECKS,
     )
-    if strict is not None:
-        return strict
-    # Relaxed interpretation for remote-executor narrative drift, mirroring
-    # the supervisor control fallback above.
-    text = str(result or "").strip()
-    if re.search(r"(?:判定|结论|结果为|verdict)\s*[:：]?\s*PASS\b", text, re.I):
-        return {
-            "protocol": "hermes.review.v1",
-            "verdict": "PASS",
-            "checks": {key: True for key in _HOSTED_REVIEW_CHECKS},
-            "blockers": [],
-            "findings": [],
-            "required_actions": [],
-            "_relaxed_interpretation": True,
-        }
-    if re.search(r"(?:判定|结论|结果为|verdict)\s*[:：]?\s*REWORK\b", text, re.I):
-        return {
-            "protocol": "hermes.review.v1",
-            "verdict": "REWORK",
-            "checks": {key: False for key in _HOSTED_REVIEW_CHECKS},
-            "blockers": [text[:2000]],
-            "findings": [text[:2000]],
-            "required_actions": ["依据审阅意见修正后重新提交验收。"],
-            "_relaxed_interpretation": True,
-        }
-    return None
 
 
 def _hosted_reviewer_verdict(result: str) -> str:
@@ -12034,85 +12010,12 @@ def _persist_hosted_supervisor_check(
 
 
 def _hosted_supervisor_control(result: str) -> Optional[dict[str, Any]]:
-    strict = _strict_hosted_control_result(
+    return _strict_hosted_control_result(
         result,
         protocol="hermes.supervision.v1",
         outcomes=("PASS", "CORRECTIVE_ACTION"),
         required_checks=_HOSTED_SUPERVISION_CHECKS,
     )
-    if strict is not None:
-        return strict
-    # Remote executor workers sometimes paraphrase the verdict instead of
-    # emitting the closed schema (format drift on long contexts). When the
-    # narrative carries an unambiguous verdict marker, downgrade to a
-    # structured decision so the control gate keeps working; the display
-    # layer marks these as relaxed-interpretation results.
-    text = str(result or "").strip()
-    if re.search(r"(?:判定|结论|结果为|verdict)\s*[:：]?\s*PASS\b", text, re.I):
-        return {
-            "protocol": "hermes.supervision.v1",
-            "verdict": "PASS",
-            "checks": {key: True for key in _HOSTED_SUPERVISION_CHECKS},
-            "blockers": [],
-            "findings": [],
-            "required_actions": [],
-            "_relaxed_interpretation": True,
-        }
-    if re.search(
-        r"(?:判定|结论|结果为|verdict)\s*[:：]?\s*CORRECTIVE_ACTION\b",
-        text,
-        re.I,
-    ):
-        return {
-            "protocol": "hermes.supervision.v1",
-            "verdict": "CORRECTIVE_ACTION",
-            "checks": {key: False for key in _HOSTED_SUPERVISION_CHECKS},
-            "blockers": [text[:2000]],
-            "findings": [text[:2000]],
-            "required_actions": ["依据叙述事实整改后重新提交检查点。"],
-            "_relaxed_interpretation": True,
-        }
-    # Broader narrative fallback: workers often write "checkpoint ...: PASS."
-    # or "verdict: PASS" with the JSON omitted entirely. A bare PASS verdict
-    # word at a sentence boundary, with no corrective language nearby, is an
-    # unambiguous success marker; CORRECTIVE_ACTION/REWORK/FAIL wording maps
-    # to a corrective decision. Keep this last so strict JSON and the
-    # prefixed markers above win when both are present.
-    if re.search(
-        r"(?<![A-Za-z])(?:PASS|通过了|通过检查|检查通过)(?![A-Za-z])",
-        text,
-        re.I,
-    ) and not re.search(
-        r"(?<![A-Za-z])(?:CORRECTIVE_ACTION|REWORK|FAILED|失败|返工|整改|不通过)(?![A-Za-z])",
-        text,
-        re.I,
-    ):
-        return {
-            "protocol": "hermes.supervision.v1",
-            "verdict": "PASS",
-            "checks": {key: True for key in _HOSTED_SUPERVISION_CHECKS},
-            "blockers": [],
-            "findings": [],
-            "required_actions": [],
-            "_relaxed_interpretation": True,
-            "_relaxed_reason": "narrative verdict marker",
-        }
-    if re.search(
-        r"(?<![A-Za-z])(?:CORRECTIVE_ACTION|REWORK|FAILED|失败|返工|整改|不通过)(?![A-Za-z])",
-        text,
-        re.I,
-    ):
-        return {
-            "protocol": "hermes.supervision.v1",
-            "verdict": "CORRECTIVE_ACTION",
-            "checks": {key: False for key in _HOSTED_SUPERVISION_CHECKS},
-            "blockers": [text[:2000]],
-            "findings": [text[:2000]],
-            "required_actions": ["依据叙述事实整改后重新提交检查点。"],
-            "_relaxed_interpretation": True,
-            "_relaxed_reason": "narrative verdict marker",
-        }
-    return None
 
 
 def _hosted_supervisor_verdict(result: str) -> str:
@@ -12686,8 +12589,6 @@ def execute_hosted_workflow(
     worker_profiles = list(manager_plan.get("workers") or fallback_worker_profiles)
     if manager_plan.get("reviewer_target") == "pc":
         reviewer_connector_id = "pc-primary"
-    elif manager_plan.get("reviewer_target") == "spark":
-        reviewer_connector_id = "spark-primary"
     artifact_producer_profiles = set(
         str(profile)
         for profile in (
@@ -13071,8 +12972,6 @@ def execute_hosted_workflow(
                     node=(
                         "wsl"
                         if reviewer_connector_id == "pc-primary"
-                        else "spark"
-                        if reviewer_connector_id == "spark-primary"
                         else "dbb3"
                     ),
                 ),
@@ -15285,7 +15184,7 @@ def _connector_relative_path(value: str) -> str:
 # lifecycle events (created / terminal) are pushed so the connector can react
 # immediately instead of waiting for its next poll cycle. This collapses role
 # switch latency from one or two poll intervals down to ~1s on the wire.
-_CONNECTOR_STREAM_QUEUES: dict[str, "queue.Queue"] = {}
+_CONNECTOR_STREAM_QUEUES: dict[str, set["queue.Queue"]] = {}
 _CONNECTOR_STREAM_LOCK = threading.Lock()
 
 
@@ -15294,10 +15193,20 @@ def _push_connector_event(connector_id: str, event: dict[str, Any]) -> None:
     if not normalized:
         return
     with _CONNECTOR_STREAM_LOCK:
-        stream_queue = _CONNECTOR_STREAM_QUEUES.get(normalized)
-    if stream_queue is not None:
+        stream_queues = tuple(_CONNECTOR_STREAM_QUEUES.get(normalized, ()))
+    # A reconnect can overlap the old SSE request briefly.  Fan out to every
+    # live subscription instead of replacing the previous queue and silently
+    # losing its wake event.  Bounded queues keep a stalled client from
+    # retaining an unbounded lifecycle backlog in the server process.
+    for stream_queue in stream_queues:
         try:
             stream_queue.put_nowait(dict(event))
+        except queue.Full:
+            try:
+                stream_queue.get_nowait()
+                stream_queue.put_nowait(dict(event))
+            except Exception:
+                pass
         except Exception:
             pass
 
@@ -15312,9 +15221,9 @@ def connector_stream(request: Request):
     stream.
     """
     connector_id = _require_connector(request)
-    stream_queue: "queue.Queue" = queue.Queue()
+    stream_queue: "queue.Queue" = queue.Queue(maxsize=32)
     with _CONNECTOR_STREAM_LOCK:
-        _CONNECTOR_STREAM_QUEUES[connector_id] = stream_queue
+        _CONNECTOR_STREAM_QUEUES.setdefault(connector_id, set()).add(stream_queue)
 
     def event_stream():
         try:
@@ -15336,8 +15245,11 @@ def connector_stream(request: Request):
                 )
         finally:
             with _CONNECTOR_STREAM_LOCK:
-                if _CONNECTOR_STREAM_QUEUES.get(connector_id) is stream_queue:
-                    _CONNECTOR_STREAM_QUEUES.pop(connector_id, None)
+                stream_queues = _CONNECTOR_STREAM_QUEUES.get(connector_id)
+                if stream_queues is not None:
+                    stream_queues.discard(stream_queue)
+                    if not stream_queues:
+                        _CONNECTOR_STREAM_QUEUES.pop(connector_id, None)
 
     return StreamingResponse(
         event_stream(),

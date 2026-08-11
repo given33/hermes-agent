@@ -3,6 +3,7 @@ import importlib.util
 import io
 import json
 import os
+import queue
 import threading
 import time
 import subprocess
@@ -48,6 +49,30 @@ def test_connector_flags_normalize_textual_values():
     assert module._coerce_flag("true") is True
     assert module._coerce_flag(" false ") is False
     assert module._coerce_flag("unexpected") is False
+
+
+def test_connector_stream_fans_out_wake_events_to_overlapping_reconnects():
+    module = load_module()
+    first = queue.Queue(maxsize=1)
+    second = queue.Queue(maxsize=1)
+    module._CONNECTOR_STREAM_QUEUES["dbb3-primary"] = {first, second}
+    try:
+        module._push_connector_event(
+            "dbb3-primary",
+            {"type": "run.created", "remote_run_id": "run-1"},
+        )
+        assert first.get_nowait()["remote_run_id"] == "run-1"
+        assert second.get_nowait()["remote_run_id"] == "run-1"
+        # A stalled stream is bounded; the newest wake replaces stale data
+        # instead of growing an unbounded process-local queue.
+        first.put_nowait({"type": "stale"})
+        module._push_connector_event(
+            "dbb3-primary",
+            {"type": "run.terminal", "remote_run_id": "run-1"},
+        )
+        assert first.get_nowait()["type"] == "run.terminal"
+    finally:
+        module._CONNECTOR_STREAM_QUEUES.pop("dbb3-primary", None)
 
 
 def test_artifact_claim_accepts_persisted_false_cancel_flag():

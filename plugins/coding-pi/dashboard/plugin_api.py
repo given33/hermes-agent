@@ -36,9 +36,28 @@ from pydantic import BaseModel, Field
 try:
     from .collab_bridge import PiCollabBridge, public_collab_metadata, public_origin
 except ImportError:
-    # The Hermes plugin loader imports dashboard modules from their directory,
-    # while the standalone service places that directory on sys.path.
-    from collab_bridge import PiCollabBridge, public_collab_metadata, public_origin
+    try:
+        # The standalone service normally places this directory on sys.path.
+        from collab_bridge import PiCollabBridge, public_collab_metadata, public_origin
+    except ImportError:
+        # Some Hermes plugin loaders execute plugin_api.py directly from a
+        # manifest path without adding its sibling directory to sys.path.
+        # Load the official sibling bridge by file location rather than
+        # requiring a second package/import convention.
+        import importlib.util
+
+        _bridge_path = Path(__file__).with_name("collab_bridge.py")
+        _bridge_spec = importlib.util.spec_from_file_location(
+            "hermes_coding_pi_collab_bridge", _bridge_path,
+        )
+        if _bridge_spec is None or _bridge_spec.loader is None:
+            raise
+        _bridge_module = importlib.util.module_from_spec(_bridge_spec)
+        sys.modules[_bridge_spec.name] = _bridge_module
+        _bridge_spec.loader.exec_module(_bridge_module)
+        PiCollabBridge = _bridge_module.PiCollabBridge
+        public_collab_metadata = _bridge_module.public_collab_metadata
+        public_origin = _bridge_module.public_origin
 
 _STANDALONE_MODE = os.environ.get("CODING_PI_STANDALONE") == "1"
 
@@ -50,9 +69,11 @@ if _STANDALONE_MODE:
         value = (
             request.headers.get("x-coding-pi-owner")
             or request.headers.get("x-client-id")
-            or "default"
+            or ""
         ).strip()
-        return value[:256] or "default"
+        if not value:
+            raise HTTPException(status_code=401, detail="Coding Pi owner identity required")
+        return value[:256]
 
     def normalize_profile_name(value: str) -> str:
         normalized = str(value or "default").strip()

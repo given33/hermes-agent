@@ -140,7 +140,7 @@ jobs:
         run: |
           uv run ruff check \
             agent gateway hermes_cli hermes_services plugins tools utils.py
-          uv run pytest -q \
+          scripts/run_tests.sh \
             tests/deploy/test_cloud_deployment_assets.py \
             tests/hermes_cli/test_config_read_guard.py \
             tests/hermes_services/test_tool_contract.py \
