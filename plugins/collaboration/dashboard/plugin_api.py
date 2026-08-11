@@ -12066,10 +12066,13 @@ def _hosted_supervisor_control(result: str) -> Optional[dict[str, Any]]:
     # Neutral/structural uses of corrective wording that must NOT flip a PASS:
     #  - checkpoint names like "审阅与返工交接" / "返工记录" / "rework_history"
     #  - negated clauses "未发现问题" / "未制造返工" / "无需整改"
+    #  - status enums like "active/inactive/failed" or "running/stopped/failed"
+    #    (the failed token is a service/step state, not a control verdict)
     _corrective_neutral = re.compile(
         r"(?:返工交接|返工记录|返工历史|rework_history|rework_log|rework_items|返工列表)"
         r"|(?:未|无|不|没有|无需|未发现|没有发现|不存在|避免|排除)[^。；;\n]{0,6}?"
-        r"(?<![A-Za-z])(?:CORRECTIVE_ACTION|REWORK|FAILED|失败|返工|整改|不通过)(?![A-Za-z])",
+        r"(?<![A-Za-z])(?:CORRECTIVE_ACTION|REWORK|FAILED|失败|返工|整改|不通过)(?![A-Za-z])"
+        r"|(?:[A-Za-z]+/){0,2}(?:active|running|stopped|inactive|pending|completed)/failed\b",
         re.I,
     )
     _corrective_matches = [
