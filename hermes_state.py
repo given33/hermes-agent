@@ -7482,6 +7482,7 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
             return None
         return trace
 
+    @staticmethod
     def _reasoning_json_text(value: Any) -> Optional[str]:
         """Serialize a structured reasoning field for its TEXT column.
 
