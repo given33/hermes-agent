@@ -17,7 +17,9 @@
  *      the dashboard fanned out.  The sidebar uses it for `session.info`
  *      (live chat title) and `dashboard.new_session_requested`.  The
  *      `channel` id ties this listener to the same chat tab's PTY child —
- *      see `ChatPage.tsx` for where the id is generated.
+ *      see `ChatPage.tsx` for where the id is generated.  Transient drops
+ *      (gateway restart, network blip) auto-reconnect with exponential
+ *      backoff; auth rejections are terminal.  See `lib/events-reconnect`.
  *
  * Best-effort throughout: WS failures show in the badge / banner, the
  * terminal pane keeps working unimpaired.
@@ -32,6 +34,19 @@ import { ReasoningPicker } from "@/components/ReasoningPicker";
 import { useI18n } from "@/i18n";
 import { GatewayClient, type ConnectionState } from "@/lib/gatewayClient";
 import { api, buildWsUrl } from "@/lib/api";
+import { maybeReloadForLoopbackWsAuthFailure } from "@/lib/dashboard-auth-reload";
+import {
+  EVENTS_CONNECT_TIMEOUT_MS,
+  EVENTS_DISCONNECTED_MESSAGE,
+  EVENTS_MAX_RECONNECT_ATTEMPTS,
+  eventsGaveUpMessage,
+  eventsReconnectDelayMs,
+  eventsReconnectingMessage,
+  eventsRejectedMessage,
+  isEventsAuthRejection,
+  isEventsFeedMessage,
+  shouldRetryEventsClose,
+} from "@/lib/events-reconnect";
 import { titleFromSessionInfoPayload } from "@/lib/chat-title";
 
 import { cn } from "@/lib/utils";
@@ -519,7 +534,21 @@ export function ChatSidebar({
         <Card className="flex items-start gap-2 border-destructive/40 bg-destructive/5 px-3 py-2 text-xs">
           <AlertCircle className="mt-0.5 h-3.5 w-3.5 shrink-0 text-destructive" />
 
-          <div className="wrap-break-word min-w-0 flex-1 text-destructive">{banner}</div>
+          <div className="min-w-0 flex-1">
+            <div className="wrap-break-word text-destructive">{banner}</div>
+
+            {error && (
+              <Button
+                size="sm"
+                outlined
+                className="mt-1"
+                onClick={reconnect}
+                prefix={<RefreshCw />}
+              >
+                reconnect events feed
+              </Button>
+            )}
+          </div>
         </Card>
       )}
 
