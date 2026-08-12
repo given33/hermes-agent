@@ -5405,12 +5405,26 @@ def _normalize_manager_plan(
         reviewer_target = "dbb3"
     if reviewer_target in {"pc", "spark"} and reviewer_target in set(constraints.get("excluded") or []):
         reviewer_target = "dbb3"
+    acceptance_criteria = [
+        str(item).strip()[:2000]
+        for item in parsed.get("acceptance_criteria") or []
+        if str(item).strip()
+    ][:32]
     return {
-        "version": 1,
+        "version": 2,
         "difficulty": difficulty,
         "reason": str(parsed.get("reason") or f"{_HERMES_MANAGER_NAME} selected a bounded execution plan.").strip()[:1000],
         "workers": worker_profiles,
         "reviewer_target": reviewer_target,
+        "approach": str(parsed.get("approach") or "").strip()[:12000],
+        "task_requirements": str(parsed.get("task_requirements") or "").strip()[:12000],
+        "acceptance_criteria": acceptance_criteria,
+        "test_plan": str(parsed.get("test_plan") or "").strip()[:12000],
+        "flow": [
+            str(item).strip()[:2000]
+            for item in parsed.get("flow") or []
+            if str(item).strip()
+        ][:48],
         "plan": steps,
         "constraints": constraints,
     }
@@ -5426,8 +5440,28 @@ def _manager_plan_prompt(
     return "\n".join(
         item
         for item in (
-            "你是 Hermes Manager，负责复杂任务的难度判断、拆分和执行节点选择。",
-            "只规划和调度，不执行用户任务，也不向用户生成最终答案。",
+            "你是 Hermes Manager（调度员/规划者），是整个 agent team 的调度中枢。",
+            "你的职责：完整理解用户任务 → 收集一切必要信息和问题（可以调用工具，"
+            "也可以调用 delegate_task 派调查子代理去核实环境、统计、检索、验证文件/服务/数据）"
+            "→ 输出一份可执行的完整方案。你不亲手执行任务，也不向用户生成最终答案。",
+            "调查自主判断：任务信息不足或需要核实外部状态时，先派 1-2 个 leaf 调查子代理收集信息，"
+            "把调查结论写进方案；信息已经足够时直接规划，不要为简单任务增加无谓延迟。"
+            "调查子代理运行期间，用 subagent_list 查看其进展；"
+            "发现方向偏离时用 subagent_send(subagent_id=..., text=...) 发送调整指令，"
+            "不需要等它结束。",
+            "方案必须包含以下全部要素（写入最终 JSON，不要省略）：",
+            "  - approach：整体方案与思路（如何完成任务、各阶段做什么）；",
+            "  - task_requirements：任务要求（把用户任务的每一条可验证要求逐条列出）；",
+            "  - acceptance_criteria：验收标准（每条可验证、可检查的通过条件）；",
+            "  - test_plan：测试方案（如何验证每个交付物/每项功能，含具体验证动作）；",
+            "  - flow：流程方案（按执行顺序的完整流程步骤）。",
+            "  - plan：Todo List（按实际执行顺序列出可验证、可独立完成的步骤，title 简短明确，"
+            "每步 objective 写明目标、做法与验收要点，assignee 为具体 worker，depends_on 表达依赖）。",
+            "多步骤任务不得压缩成一个泛化的“执行任务”；每完成一个步骤，服务端会依据真实 Worker、"
+            "审阅与汇报状态更新勾选。示例：用户要求「建目录、写文件、运行、用 todo 跟踪、总结」，"
+            "则 plan 至少包含 5 个步骤（建目录 → 写文件 → 运行验证 → 更新 todo → 总结），"
+            "禁止把多个要求合并成单个执行节点。",
+            "按任务真实需要选择一个或两个 Worker，不得使用其他节点，不得省略验收。",
             hosted_progress_protocol(_HERMES_MANAGER_LABEL),
             hosted_role_delivery_contract(_HERMES_MANAGER_LABEL),
             mention_priority_protocol(_HERMES_MANAGER_LABEL),
@@ -5435,11 +5469,13 @@ def _manager_plan_prompt(
             f"服务器路由建议：{', '.join(fallback_workers)}",
             f"是否要求交付文件：{'yes' if artifact_required else 'no'}",
             "最终交接输出一个 JSON 对象且不要附加解释；过程回报通过运行事件发送，不得混入最终 JSON。结构必须为：",
-            '{"difficulty":"low|medium|high|critical","reason":"...","workers":["dbb3-worker"],"reviewer_target":"dbb3|pc","plan":[{"id":"step-1","title":"...","objective":"...","assignee":"dbb3-worker|pc-worker","depends_on":[]}]}',
-            "plan 是用户右滑后看到的 Todo List：按实际执行顺序列出可验证、可独立完成的步骤，title 要简短明确。",
-            "多步骤任务不得压缩成一个泛化的“执行任务”；每完成一个步骤，服务端会依据真实 Worker、审阅与汇报状态更新勾选。",
-            "把用户任务的每一个可验证要求映射为一个独立步骤。示例：用户要求「建目录、写文件、运行、用 todo 跟踪、总结」，则 plan 至少包含 5 个步骤（建目录 → 写文件 → 运行验证 → 更新 todo → 总结），每步 assignee 相同或按需分配；禁止把多个要求合并成单个执行节点。",
-            "按任务真实需要选择一个或两个 Worker，不得使用其他节点，不得省略验收。",
+            '{"difficulty":"low|medium|high|critical","reason":"...","workers":["dbb3-worker"],'
+            '"reviewer_target":"dbb3|pc","approach":"整体方案","task_requirements":"任务要求逐条",'
+            '"acceptance_criteria":["验收标准1","验收标准2"],"test_plan":"测试方案",'
+            '"flow":["流程步骤1","流程步骤2"],'
+            '"plan":[{"id":"step-1","title":"...","objective":"...","assignee":"dbb3-worker|pc-worker","depends_on":[]}]}',
+            "plan 是用户右滑后看到的 Todo List；approach/task_requirements/acceptance_criteria/"
+            "test_plan/flow 会写入看板任务并随任务链传给每个 Worker。",
             f"用户任务：\n{content}",
             attachment_context,
         )
@@ -6673,6 +6709,9 @@ def build_group_prompt(
         "worker": (
             "你是执行者。只负责实际执行、调用工具并提交证据、结果和遗留问题；"
             "不要向用户做最终总结，也不要替审阅者下结论。"
+            "任务含可并行子步骤或需要独立调查时，可用 delegate_task 派 leaf 子代理"
+            "并行执行（并发数量由你根据任务和节点资源自行判断）；"
+            "子代理结果必须汇总进你的交接证据。"
         ),
         "reviewer": (
             "你是审阅者。基于执行者已经提交的结果做验收、风险检查和通过/退回判断；"
@@ -9896,6 +9935,7 @@ def create_hosted_kanban_task(
     content: str,
     profiles: Optional[list[str]] = None,
     output_dir: str = "",
+    manager_plan: Optional[dict[str, Any]] = None,
 ) -> dict[str, Any]:
     from hermes_cli import kanban_db, kanban_decompose
 
@@ -9905,10 +9945,32 @@ def create_hosted_kanban_task(
         lane_context = ", ".join(profiles or [])
         # The execution path stays in the hosted run and role prompt. Kanban
         # bodies are user-visible and must not expose server filesystem paths.
+        plan_blocks: list[str] = []
+        if isinstance(manager_plan, dict):
+            for label, value in (
+                ("执行方案", manager_plan.get("approach")),
+                ("任务要求", manager_plan.get("task_requirements")),
+                ("测试方案", manager_plan.get("test_plan")),
+            ):
+                if str(value or "").strip():
+                    plan_blocks.append(f"【{label}】\n{str(value).strip()[:12000]}")
+            criteria = manager_plan.get("acceptance_criteria") or []
+            if criteria:
+                plan_blocks.append(
+                    "【验收标准】\n"
+                    + "\n".join(f"- {str(item).strip()[:2000]}" for item in criteria if str(item).strip())
+                )
+            flow = manager_plan.get("flow") or []
+            if flow:
+                plan_blocks.append(
+                    "【流程方案】\n"
+                    + "\n".join(f"{index}. {str(item).strip()[:2000]}" for index, item in enumerate(flow, start=1) if str(item).strip())
+                )
         task_body = "\n\n".join(
             item
             for item in (
                 content,
+                *plan_blocks,
                 f"Required execution lanes: {lane_context}." if lane_context else "",
             )
             if item
@@ -11229,6 +11291,46 @@ def _remote_run_state_message(
         content = result or "已连接远程执行器，正在执行。"
     else:
         content = "已排队等待远程执行器领取。"
+    activities = [
+        dict(item)
+        for item in remote_run.get("activities") or []
+        if isinstance(item, dict)
+    ]
+    # Worker-delegated subagents (agent team) recorded in the completion
+    # metadata: render each as a terminal subagent card alongside the run's
+    # activity stream, mirroring the server-side manager's subagent events.
+    for index, sub in enumerate(remote_run.get("subagents") or []):
+        if not isinstance(sub, dict):
+            continue
+        goal = str(sub.get("goal") or "子 Agent").strip()[:2000]
+        outcome = str(sub.get("outcome") or "completed").strip().lower()
+        summary = str(sub.get("summary") or "").strip()[:4000]
+        now_ms = int(time.time() * 1000)
+        activities.append(
+            {
+                "id": f"remote-subagent:{profile}:{index}:{goal[:64]}",
+                "kind": "subagent",
+                "category": "subagent",
+                "name": goal,
+                "tool_name": "delegate_task",
+                "status": (
+                    "failed"
+                    if outcome in {"failed", "error", "interrupted", "cancelled"}
+                    else "completed"
+                ),
+                "input": "",
+                "output": summary,
+                "detail": summary,
+                "summary": summary or goal,
+                "error": "",
+                "model": str(remote_run.get("actual_model") or ""),
+                "provider": str(remote_run.get("actual_provider") or ""),
+                "created_at": now_ms,
+                "started_at": now_ms,
+                "completed_at": now_ms,
+                "duration_ms": 0,
+            }
+        )
     state = {
         "content": content,
         "status": (
@@ -11240,7 +11342,7 @@ def _remote_run_state_message(
             if status in {"failed", "cancelled"}
             else "streaming"
         ),
-        "activities": [dict(item) for item in remote_run.get("activities") or [] if isinstance(item, dict)],
+        "activities": activities,
         "actual_model": str(remote_run.get("actual_model") or ""),
         "actual_provider": str(remote_run.get("actual_provider") or ""),
         "started_at": int(remote_run.get("started_at") or remote_run.get("created_at") or int(time.time() * 1000)),
@@ -11623,12 +11725,92 @@ def _strict_hosted_control_result(
 
 
 def _hosted_reviewer_control(result: str) -> Optional[dict[str, Any]]:
-    return _strict_hosted_control_result(
+    strict = _strict_hosted_control_result(
         result,
         protocol="hermes.review.v1",
         outcomes=("PASS", "REWORK"),
         required_checks=_HOSTED_REVIEW_CHECKS,
     )
+    if strict is not None:
+        return strict
+    # Format drift on long contexts: reviewer models sometimes paraphrase the
+    # verdict, wrap the schema in extra keys (e.g. "checks": {"c1":"pass"}),
+    # or emit narrative only. Downgrade to a structured decision when the
+    # text carries an unambiguous verdict marker — same policy as the
+    # supervisor's relaxed interpretation.
+    text = str(result or "").strip()
+    if re.search(r"(?:判定|结论|结果为|verdict)\s*[:：]?\s*PASS\b", text, re.I):
+        return {
+            "protocol": "hermes.review.v1",
+            "verdict": "PASS",
+            "checks": {key: True for key in _HOSTED_REVIEW_CHECKS},
+            "blockers": [],
+            "findings": [],
+            "required_actions": [],
+            "_relaxed_interpretation": True,
+        }
+    if re.search(
+        r"(?:判定|结论|结果为|verdict)\s*[:：]?\s*REWORK\b",
+        text,
+        re.I,
+    ):
+        return {
+            "protocol": "hermes.review.v1",
+            "verdict": "REWORK",
+            "checks": {key: False for key in _HOSTED_REVIEW_CHECKS},
+            "blockers": [text[:2000]],
+            "findings": [text[:2000]],
+            "required_actions": ["依据审阅结论返工后重新提交。"],
+            "_relaxed_interpretation": True,
+        }
+    # Narrative fallback. A bare PASS verdict word at a sentence boundary
+    # with no rework/fail language nearby is a success marker; REWORK/FAIL
+    # wording maps to a rework decision. Negation guard mirrors the
+    # supervisor's: "未发现问题 / 无需返工 / 未要求整改" must not flip a PASS.
+    _rework_pattern = re.compile(
+        r"(?<![A-Za-z])(?:REWORK|FAILED|返工|不通过|未通过)(?![A-Za-z])",
+        re.I,
+    )
+    _rework_neutral = re.compile(
+        r"(?:返工交接|返工记录|返工历史|rework_history|rework_log|rework_items|返工列表)"
+        r"|(?:未|无|不|没有|无需|未发现|没有发现|不存在|避免|排除)[^。；;\n]{0,6}?"
+        r"(?<![A-Za-z])(?:REWORK|FAILED|返工|不通过|未通过)(?![A-Za-z])"
+        r"|(?:[A-Za-z]+/){0,2}(?:active|running|stopped|inactive|pending|completed)/failed\b",
+        re.I,
+    )
+    _rework_matches = [
+        m for m in _rework_pattern.finditer(text)
+        if not _rework_neutral.search(
+            text[max(0, m.start() - 24) : min(len(text), m.end() + 24)]
+        )
+    ]
+    if re.search(
+        r"(?<![A-Za-z])(?:PASS|通过了|通过检查|检查通过|验收通过)(?![A-Za-z])",
+        text,
+        re.I,
+    ) and not _rework_matches:
+        return {
+            "protocol": "hermes.review.v1",
+            "verdict": "PASS",
+            "checks": {key: True for key in _HOSTED_REVIEW_CHECKS},
+            "blockers": [],
+            "findings": [],
+            "required_actions": [],
+            "_relaxed_interpretation": True,
+            "_relaxed_reason": "narrative verdict marker",
+        }
+    if _rework_matches:
+        return {
+            "protocol": "hermes.review.v1",
+            "verdict": "REWORK",
+            "checks": {key: False for key in _HOSTED_REVIEW_CHECKS},
+            "blockers": [text[:2000]],
+            "findings": [text[:2000]],
+            "required_actions": ["依据审阅结论返工后重新提交。"],
+            "_relaxed_interpretation": True,
+            "_relaxed_reason": "narrative verdict marker",
+        }
+    return None
 
 
 def _hosted_reviewer_verdict(result: str) -> str:
@@ -12750,6 +12932,7 @@ def execute_hosted_workflow(
             content=content,
             profiles=[*worker_profiles, reviewer_profile],
             output_dir=str(run.get("output_dir") or ""),
+            manager_plan=manager_plan,
         )
         task_id = str(task_info.get("task_id") or "")
         child_ids = [str(item) for item in task_info.get("child_ids") or [] if item]
@@ -12916,6 +13099,36 @@ def execute_hosted_workflow(
         if str(profile) and str(status)
     }
 
+    manager_plan_blocks: list[str] = []
+    if isinstance(manager_plan, dict):
+        for label, value in (
+            ("执行方案", manager_plan.get("approach")),
+            ("任务要求", manager_plan.get("task_requirements")),
+            ("测试方案", manager_plan.get("test_plan")),
+        ):
+            if str(value or "").strip():
+                manager_plan_blocks.append(f"【{label}】\n{str(value).strip()[:12000]}")
+        criteria = manager_plan.get("acceptance_criteria") or []
+        if criteria:
+            manager_plan_blocks.append(
+                "【验收标准】\n"
+                + "\n".join(
+                    f"- {str(item).strip()[:2000]}"
+                    for item in criteria
+                    if str(item).strip()
+                )
+            )
+        flow = manager_plan.get("flow") or []
+        if flow:
+            manager_plan_blocks.append(
+                "【流程方案】\n"
+                + "\n".join(
+                    f"{index}. {str(item).strip()[:2000]}"
+                    for index, item in enumerate(flow, start=1)
+                    if str(item).strip()
+                )
+            )
+
     def execute_worker(
         profile: str,
         *,
@@ -12951,6 +13164,7 @@ def execute_hosted_workflow(
                 "你是任务执行者。只完成调度分配给当前 Profile 和目标设备的子任务。",
                 "负责实际执行、工具调用、证据收集和必要产物创建。",
                 "可以使用所有已配置的 Skill、MCP 和工具；正常的搜索、命令、取证和验证属于执行过程。",
+                *manager_plan_blocks,
                 hosted_progress_protocol(profile),
                 hosted_role_delivery_contract(profile),
                 mention_priority_protocol(profile),
@@ -13154,6 +13368,7 @@ def execute_hosted_workflow(
                 ),
                 "不要创建新的交付文件，也不要向用户做最终总结。",
                 _hosted_reviewer_protocol_prompt(),
+                *manager_plan_blocks,
                 f"用户任务：{content}",
                 "执行者提交：",
                 worker_result,
@@ -15139,6 +15354,22 @@ def _sanitize_remote_activities(value: Any) -> list[dict[str, Any]]:
     return sanitized
 
 
+def _sanitize_remote_subagents(value: Any) -> list[dict[str, Any]]:
+    """Bound and redact worker-delegated subagent records (agent team)."""
+    if not isinstance(value, list):
+        return []
+    sanitized: list[dict[str, Any]] = []
+    for item in value[:50]:
+        if not isinstance(item, dict):
+            continue
+        clean = _redact_sensitive(dict(item))
+        for key in ("goal", "summary"):
+            if key in clean and isinstance(clean[key], str):
+                clean[key] = clean[key][:4000]
+        sanitized.append(clean)
+    return sanitized
+
+
 def _apply_remote_checkpoint(
     remote_run_id: str,
     payload: dict[str, Any],
@@ -15212,6 +15443,7 @@ def _apply_remote_checkpoint(
                 "result": str(payload.get("result") or "")[:50000],
                 "error": str(payload.get("error") or "")[:4000],
                 "activities": _sanitize_remote_activities(payload.get("activities")),
+                "subagents": _sanitize_remote_subagents(payload.get("subagents")),
                 "updated_at": now,
             }
         )

@@ -4354,3 +4354,133 @@ registry.register(
     emoji="🔀",
     dynamic_schema_overrides=_build_dynamic_schema_overrides,
 )
+
+
+# ---------------------------------------------------------------------------
+# Agent-team steering surface: observe and redirect running subagents.
+#
+# delegate_task is background-first for top-level agents, so the parent can
+# keep working while children run. These two tools close the loop: the parent
+# can list the live child tree and queue direction adjustments into a specific
+# running subagent (delivered at its next iteration boundary via
+# AIAgent.steer, never cutting an in-flight tool call).
+# ---------------------------------------------------------------------------
+
+def subagent_list() -> str:
+    """Return the currently running subagent tree (ids, goals, status)."""
+    active = list_active_subagents()
+    if not active:
+        return json.dumps(
+            {"status": "idle", "subagents": []}, ensure_ascii=False
+        )
+    return json.dumps(
+        {"status": "active", "subagents": active},
+        ensure_ascii=False,
+        default=str,
+    )
+
+
+def subagent_send(subagent_id: str, text: str) -> str:
+    """Queue a direction-adjustment instruction into a running subagent.
+
+    The instruction is delivered at the subagent's next iteration boundary
+    (appended to its current tool result) — the in-flight tool call is never
+    cut. Returns the outcome plus the live subagent tree when the target is
+    unknown or already finished, so the caller can re-target.
+    """
+    sid = str(subagent_id or "").strip()
+    msg = str(text or "").strip()
+    if not sid:
+        return tool_error(
+            "subagent_send requires subagent_id (find it with subagent_list)."
+        )
+    if not msg:
+        return tool_error("subagent_send requires a non-empty text.")
+    if steer_subagent(sid, msg[:2000]):
+        return json.dumps(
+            {
+                "status": "queued",
+                "subagent_id": sid,
+                "note": (
+                    "指令已入队，将在该子代理下一次迭代时送达；"
+                    "不会打断它正在执行的工具。"
+                ),
+            },
+            ensure_ascii=False,
+        )
+    return json.dumps(
+        {
+            "status": "failed",
+            "reason": (
+                "没有找到可接收指令的运行中子代理"
+                "（可能已结束，或 subagent_id 不正确）。"
+            ),
+            "active_subagents": list_active_subagents(),
+        },
+        ensure_ascii=False,
+        default=str,
+    )
+
+
+SUBAGENT_LIST_SCHEMA = {
+    "name": "subagent_list",
+    "description": (
+        "List currently running subagents (their ids, goals, models, and "
+        "status) so you can send direction adjustments to them with "
+        "subagent_send. Returns idle when no subagent is running."
+    ),
+    "parameters": {
+        "type": "object",
+        "properties": {},
+        "required": [],
+    },
+}
+
+SUBAGENT_SEND_SCHEMA = {
+    "name": "subagent_send",
+    "description": (
+        "Send a direction-adjustment instruction to a running subagent. "
+        "The instruction arrives at the subagent's next iteration boundary "
+        "without interrupting its current tool call. Use subagent_list to "
+        "find the subagent_id when you do not have it."
+    ),
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "subagent_id": {
+                "type": "string",
+                "description": (
+                    "Id of the running subagent to steer (from subagent_list "
+                    "or the delegate_task result)."
+                ),
+            },
+            "text": {
+                "type": "string",
+                "description": (
+                    "The adjustment instruction: what to focus on, what to "
+                    "stop doing, what has changed, what to verify next."
+                ),
+            },
+        },
+        "required": ["subagent_id", "text"],
+    },
+}
+
+registry.register(
+    name="subagent_list",
+    toolset="delegation",
+    schema=SUBAGENT_LIST_SCHEMA,
+    handler=lambda **kw: subagent_list(),
+    emoji="🧭",
+)
+
+registry.register(
+    name="subagent_send",
+    toolset="delegation",
+    schema=SUBAGENT_SEND_SCHEMA,
+    handler=lambda args, **kw: subagent_send(
+        args.get("subagent_id"),
+        args.get("text"),
+    ),
+    emoji="📨",
+)

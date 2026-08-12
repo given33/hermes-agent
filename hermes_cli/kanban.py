@@ -1215,9 +1215,83 @@ def _is_delegated_child_cli_mutation(args: argparse.Namespace) -> bool:
     try:
         from agent.delegation_context import is_delegated_child_process_context
 
-        return is_delegated_child_process_context()
+        if is_delegated_child_process_context():
+            return True
     except Exception:
-        return bool(os.environ.get("HERMES_DELEGATED_CHILD_CONTEXT"))
+        if os.environ.get("HERMES_DELEGATED_CHILD_CONTEXT"):
+            return True
+    # Durable trust boundary: a subagent can strip the env marker with
+    # ``env -u HERMES_DELEGATED_CHILD_CONTEXT`` and re-enter this CLI. The
+    # process ancestor chain cannot be forged from inside the terminal tool,
+    # so when this CLI was spawned from within a Hermes agent session, a
+    # lifecycle mutation is only legal for the task this process owns
+    # (HERMES_KANBAN_TASK) — a delegated child has no such env (it is scrubbed
+    # at spawn), so every mutation it attempts is rejected.
+    if not _spawned_inside_hermes_agent_session():
+        return False
+    owned_task = (os.environ.get("HERMES_KANBAN_TASK") or "").strip()
+    target_ids = _cli_mutation_target_ids(args)
+    if not target_ids:
+        # No task target on a denied action (e.g. `kanban gc` from inside an
+        # agent session) — treat as suspicious and refuse.
+        return True
+    if owned_task and all(tid == owned_task for tid in target_ids):
+        return False
+    return True
+
+
+def _cli_mutation_target_ids(args: argparse.Namespace) -> list[str]:
+    """Return the task ids a kanban CLI mutation targets, if any."""
+    ids = getattr(args, "task_ids", None)
+    if isinstance(ids, (list, tuple)):
+        return [str(value).strip() for value in ids if str(value).strip()]
+    single = getattr(args, "task_id", None)
+    if single:
+        return [str(single).strip()]
+    return []
+
+
+def _spawned_inside_hermes_agent_session() -> bool:
+    """Walk the ancestor process chain looking for a Hermes agent process.
+
+    Agent sessions run the terminal tool in-process, so commands spawned
+    from inside a session (worker or delegated subagent) have an ancestor
+    whose cmdline is the hermes agent process (``hermes ... chat``,
+    ``hermes ... dashboard``, or the gateway). Commands typed by a human
+    into a real terminal (sshd, desktop shell) do not. Best-effort: any
+    failure to read /proc falls back to False (allow).
+    """
+    import re as _re
+
+    pid = os.getpid()
+    seen = 0
+    while pid and pid > 1 and seen < 10:
+        seen += 1
+        try:
+            with open(f"/proc/{pid}/cmdline", "rb") as fh:
+                raw = fh.read().rstrip(b"\0")
+            # argv[0] is the executable; a `bash -c "script text"` ancestor
+            # embeds arbitrary text in argv[1..] that could echo these
+            # keywords, so only the executable path may decide.
+            argv0 = raw.split(b"\0", 1)[0].decode("utf-8", "replace")
+            cmdline = raw.replace(b"\0", b" ").decode("utf-8", "replace")
+        except OSError:
+            return False
+        if "hermes" in argv0 and _re.search(
+            r"(?:chat|dashboard|gateway|--cli)\b", cmdline
+        ):
+            return True
+        try:
+            with open(f"/proc/{pid}/stat", "rb") as fh:
+                stat = fh.read().decode("utf-8", "replace")
+            # comm is in parens; ppid is the 4th field after the closing ')'.
+            ppid = int(stat.rsplit(")", 1)[1].split()[1])
+        except (OSError, ValueError, IndexError):
+            return False
+        if ppid == pid:
+            return False
+        pid = ppid
+    return False
 
 
 # ---------------------------------------------------------------------------

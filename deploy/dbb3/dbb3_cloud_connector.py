@@ -781,10 +781,13 @@ def _event_activity(event: dict[str, Any], index: int) -> dict[str, Any]:
     )
     if not tool_name and any(marker in kind for marker in ("tool", "command", "search", "browser")):
         tool_name = _text(payload.get("name") or kind, 256)
+    is_subagent_kind = "subagent" in kind or tool_name.lower() == "delegate_task"
     category = _text(payload.get("category"), 80)
     if not category:
         category = (
-            "tool"
+            "subagent"
+            if is_subagent_kind
+            else "tool"
             if tool_name
             else "reasoning"
             if any(marker in kind for marker in ("reason", "think"))
@@ -1160,25 +1163,46 @@ def _session_record_activities(
                 error = _tool_result_error(
                     result.get("content") if result is not None else ""
                 )
+                arguments = _structured_text(
+                    function.get("arguments") or tool_call.get("arguments"),
+                    12000,
+                )
+                # delegate_task calls are the worker's agent-team surface:
+                # surface them as subagent cards (name = delegated goal) so
+                # the iOS/WebUI activity renderer shows the child-agent
+                # hierarchy instead of a bare tool row.
+                is_delegate = tool_name.lower() == "delegate_task"
+                delegate_goal = ""
+                if is_delegate:
+                    try:
+                        parsed_args = json.loads(arguments or "{}")
+                        if isinstance(parsed_args, dict):
+                            delegate_goal = _text(parsed_args.get("goal"), 512)
+                    except (TypeError, ValueError):
+                        pass
                 activities.append(
                     {
                         "id": f"session:{session_id}:tool:{call_id}",
-                        "kind": "tool",
+                        "kind": "subagent" if is_delegate else "tool",
                         "category": (
-                            "search"
+                            "subagent"
+                            if is_delegate
+                            else "search"
                             if any(
                                 marker in tool_name.lower()
                                 for marker in ("search", "browse", "fetch", "web")
                             )
                             else "tool"
                         ),
-                        "name": tool_name,
+                        "name": (
+                            delegate_goal
+                            or "子 Agent"
+                            if is_delegate
+                            else tool_name
+                        ),
                         "tool_name": tool_name,
                         "status": "failed" if error else "completed" if result is not None else "running",
-                        "input": _structured_text(
-                            function.get("arguments") or tool_call.get("arguments"),
-                            12000,
-                        ),
+                        "input": arguments,
                         "output": result_text,
                         "detail": result_text,
                         "summary": result_text[:2000] or tool_name,
@@ -1942,6 +1966,30 @@ class DBB3CloudConnector:
             for item in runs[-10:]
             if isinstance(item, dict) and item.get("error")
         ]
+        # Worker-delegated subagents (agent team) recorded by the worker in
+        # its completion metadata: {goal, outcome, summary}. Surfaced to the
+        # cloud so the hosted conversation can render child-agent cards for
+        # the worker's delegation tree.
+        subagents: list[dict[str, Any]] = []
+        for item in reversed(runs):
+            if not isinstance(item, dict):
+                continue
+            run_meta = item.get("metadata")
+            if not isinstance(run_meta, dict):
+                continue
+            raw = run_meta.get("subagents")
+            if isinstance(raw, list):
+                for entry in raw:
+                    if not isinstance(entry, dict):
+                        continue
+                    subagents.append(
+                        {
+                            "goal": _structured_text(entry.get("goal"), 2000),
+                            "outcome": _text(entry.get("outcome"), 64),
+                            "summary": _structured_text(entry.get("summary"), 4000),
+                        }
+                    )
+            break
         activities = _remote_activities(detail)
         session_snapshot = self._session_snapshot(
             detail,
@@ -1999,6 +2047,7 @@ class DBB3CloudConnector:
             ),
             "error": errors[-1] if errors else "",
             "activities": activities,
+            "subagents": subagents,
             "remote_task_id": _text(local.get("remote_task_id"), 256),
             "root_task_id": _text(local.get("root_task_id"), 256),
             "session_id": _text(
