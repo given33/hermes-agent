@@ -1887,13 +1887,38 @@ class DBB3CloudConnector:
     def _compact_status(self, detail: dict[str, Any], local: dict[str, Any]) -> tuple[dict[str, Any], list[str]]:
         task = detail.get("task") if isinstance(detail.get("task"), dict) else {}
         raw_status = _text(task.get("status"), 64).lower()
-        status = (
-            "completed" if raw_status in {"done", "completed"}
-            else "cancelled" if raw_status in {"cancelled", "canceled"}
-            else "failed" if raw_status in {"failed", "blocked"}
-            else "running"
-        )
+        block_kind = _text(task.get("block_kind"), 64).lower()
+        if raw_status == "blocked" and block_kind not in {"needs_input"}:
+            # Official kanban can park a task in `blocked` for reasons that
+            # are not a worker failure: waiting on a dependency
+            # (`dependency`), a missing capability (`capability`), or a
+            # transient flake (`transient`). The worker did not fail — the
+            # task is still in flight. Report it as running so the cloud
+            # keeps polling instead of tearing the turn down. Only a
+            # `needs_input` block (worker asked a human a question) is a
+            # durable stop; surface that as failed with the reason visible.
+            status = "running"
+        else:
+            status = (
+                "completed" if raw_status in {"done", "completed"}
+                else "cancelled" if raw_status in {"cancelled", "canceled"}
+                else "failed" if raw_status in {"failed", "blocked"}
+                else "running"
+            )
         summary = _structured_text(detail.get("latest_summary") or task.get("result"), 4000)
+        if raw_status == "blocked" and block_kind == "needs_input":
+            block_reason = _structured_text(
+                task.get("last_failure_error")
+                or task.get("block_reason")
+                or "",
+                1000,
+            )
+            if block_reason:
+                summary = (f"等待人工输入：{block_reason}。\n" if summary else f"等待人工输入：{block_reason}")
+                if summary and not summary.startswith("等待人工输入"):
+                    summary = f"等待人工输入：{block_reason}。\n{summary}"
+            else:
+                summary = "等待人工输入：worker 请求人工决策后暂停。"
         runs = detail.get("runs") if isinstance(detail.get("runs"), list) else []
         # Structured handoffs (manager plans, supervisor verdicts, reviewer
         # verdicts) are delivered via the terminal run's metadata when the
