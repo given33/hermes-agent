@@ -413,6 +413,14 @@ class CloudRelayClient:
                                 continue
                             if event.get("type") in {"run.created", "run.terminal"}:
                                 wake.set()
+                            elif event.get("type") == "run.steer":
+                                # User answered an awaiting_input choice (or
+                                # sent a steer): unblock the local task with
+                                # the answer injected as a comment so the
+                                # worker continues with the decision.
+                                with self._pending_steers_lock:
+                                    self._pending_steers.append(dict(event))
+                                wake.set()
             except Exception:
                 pass
             if stop.wait(backoff):
@@ -1201,6 +1209,33 @@ def _session_record_activities(
                             delegate_goal = _text(parsed_args.get("goal"), 512)
                     except (TypeError, ValueError):
                         pass
+                # File-touch extraction (hermes desktop Agents panel style):
+                # record which paths this tool call read/wrote so the mobile
+                # activity card can show "+/- path" without opening details.
+                files: list[str] = []
+                if not is_delegate:
+                    try:
+                        parsed_args = json.loads(arguments or "{}")
+                        if isinstance(parsed_args, dict):
+                            for key in ("path", "file_path", "filename", "target"):
+                                value = _text(parsed_args.get(key), 2048)
+                                if value and value not in files:
+                                    files.append(value)
+                            for key in ("paths", "files", "file_paths"):
+                                for value in parsed_args.get(key) or []:
+                                    value = _text(value, 2048)
+                                    if value and value not in files:
+                                        files.append(value)
+                    except (TypeError, ValueError):
+                        pass
+                    if not files and tool_name.lower() in {
+                        "read_file", "write_file", "patch", "search_files",
+                    }:
+                        # Fallback: first path-looking token from arguments.
+                        for token in (arguments or "").replace('"', " ").split():
+                            if "/" in token and "." in token:
+                                files.append(_text(token, 2048))
+                                break
                 activities.append(
                     {
                         "id": f"session:{session_id}:tool:{call_id}",
@@ -1227,6 +1262,7 @@ def _session_record_activities(
                         "output": result_text,
                         "detail": result_text,
                         "summary": result_text[:2000] or tool_name,
+                        "files": files[:8],
                         "error": error,
                         "model": model,
                         "provider": provider,
@@ -1371,6 +1407,8 @@ class DBB3CloudConnector:
         self._last_reported_terminal = False
         self.command_runner = command_runner
         self.clock = clock
+        self._pending_steers: list[dict[str, Any]] = []
+        self._pending_steers_lock = threading.Lock()
         path = Path(
             state_file
             or os.environ.get(
@@ -1939,10 +1977,16 @@ class DBB3CloudConnector:
             # (`dependency`), a missing capability (`capability`), or a
             # transient flake (`transient`). The worker did not fail — the
             # task is still in flight. Report it as running so the cloud
-            # keeps polling instead of tearing the turn down. Only a
-            # `needs_input` block (worker asked a human a question) is a
-            # durable stop; surface that as failed with the reason visible.
+            # keeps polling instead of tearing the turn down.
             status = "running"
+        elif raw_status == "blocked" and block_kind == "needs_input":
+            # Worker asked a human a question (awaiting a decision). This is
+            # NOT terminal: the user picks an option (A/B/C or custom) via
+            # the hosted UI, the server pushes run.steer, and the connector
+            # unblocks the task with the chosen answer so the worker
+            # continues. Report awaiting_input so the cloud keeps polling
+            # and can surface the choice card.
+            status = "awaiting_input"
         else:
             status = (
                 "completed" if raw_status in {"done", "completed"}
@@ -2394,6 +2438,43 @@ class DBB3CloudConnector:
             return 0, 0
         return self._sync_local_run(remote_id, local, state)
 
+    def _drain_steers(self, state: dict[str, Any]) -> int:
+        """Apply pending run.steer events: unblock the local task with the
+        user's answer injected as a comment (UNBLOCK: <choice>) so the
+        worker's next context includes the decision."""
+        with self._pending_steers_lock:
+            pending = list(self._pending_steers)
+            self._pending_steers.clear()
+        applied = 0
+        for event in pending:
+            remote_id = _text(event.get("remote_run_id"), 256)
+            text = _text(event.get("text") or event.get("content"), 2000)
+            if not remote_id or not text:
+                continue
+            local = (state.get("runs") or {}).get(remote_id)
+            if not isinstance(local, dict) or not local.get("root_task_id"):
+                continue
+            root_id = _text(local.get("root_task_id"), 256)
+            profile = _text(local.get("execution_profile"), 128)
+            code, output = self.command_runner(
+                _profiled_hermes_command(
+                    profile,
+                    "kanban",
+                    "unblock",
+                    root_id,
+                    "--reason",
+                    text,
+                ),
+                timeout=60,
+            )
+            if code != 0:
+                continue
+            local["status"] = "unblocked"
+            applied += 1
+        if applied:
+            self.checkpoints.save(state)
+        return applied
+
     def _process_cancellation(self, item: dict[str, Any], state: dict[str, Any]) -> int:
         remote_id = _text(item.get("remote_run_id"), 256)
         if not remote_id:
@@ -2548,11 +2629,13 @@ class DBB3CloudConnector:
         for item in self.cloud_client.pull_cancellations(limit=5, lease_seconds=90):
             if isinstance(item, dict):
                 cancelled += self._process_cancellation(item, state)
+        steered = self._drain_steers(state)
         return {
             "created": created,
             "statuses": statuses,
             "artifacts": artifacts,
             "cancelled": cancelled,
+            "steered": steered,
             "terminal_pushed": terminal_pushed,
         }
 

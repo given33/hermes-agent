@@ -299,7 +299,7 @@ TOOLSETS = {
     
     "delegation": {
         "description": "Spawn subagents with isolated context for complex subtasks",
-        "tools": ["delegate_task", "subagent_list", "subagent_send"],
+        "tools": ["delegate_task", "subagent_list", "subagent_send", "subagent_kill"],
         "includes": []
     },
 

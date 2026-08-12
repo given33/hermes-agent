@@ -9388,6 +9388,41 @@ def _run_hosted_remote_role(
             remote,
             role_label=role_label,
         )
+        if status == "awaiting_input":
+            # Emit the choice card event once per awaiting transition.
+            try:
+                with _STATE_LOCK:
+                    state = load_single_state()
+                    conversation = _conversation_by_id(state, conversation_id)
+                    append_hosted_event(
+                        conversation,
+                        conversation_id=conversation_id,
+                        turn_id=turn_id,
+                        role_stage=str(remote_run.get("role_stage") or role_key),
+                        event_type="awaiting.choice",
+                        entity_id=f"awaiting:{remote_run_id}",
+                        idempotency_key=(
+                            f"awaiting-choice:{remote_run_id}:{cursor}"
+                        ),
+                        account_generation=_account_generation_for_owner(
+                            str(conversation.get("owner_id") or LOCAL_OWNER_ID)
+                        ),
+                        payload={
+                            "remote_run_id": str(remote_run_id),
+                            "profile": str(remote_run.get("profile") or ""),
+                            "question": str(
+                                payload.get("summary")
+                                or remote_run.get("summary")
+                                or ""
+                            )[:2000],
+                            "options": list(remote_run.get("choice_options") or []),
+                            "allow_custom": True,
+                        },
+                    )
+                    save_single_state(state)
+                    _notify_hosted_update(conversation_id)
+            except Exception:
+                logger.exception("awaiting.choice event failed")
 
     configured_fallback = _positive_int(
         os.environ.get("HERMES_REMOTE_FALLBACK_SECONDS")
@@ -11315,6 +11350,37 @@ def _ensure_remote_run(
     return dict(record)
 
 
+def _parse_choice_options(text: str) -> list[dict[str, str]]:
+    """Parse A./B./C. choice options out of an awaiting-input reason.
+
+    Workers format the question as::
+
+        需要你决定：选哪个方案？
+        选项：
+        A. 方案一
+        B. 方案二
+        C. 方案三
+
+    Returns [{"id": "A", "label": "方案一"}, ...]. Custom input is always
+    available on the client side, so no fallback option is synthesized.
+    """
+    options: list[dict[str, str]] = []
+    if not text:
+        return options
+    for line in str(text).splitlines():
+        line = line.strip()
+        match = re.match(r"^([A-Za-z])[.、．:：]\s*(.+)$", line)
+        if not match:
+            continue
+        label = match.group(2).strip()
+        if not label:
+            continue
+        options.append({"id": match.group(1).upper(), "label": label[:500]})
+        if len(options) >= 6:
+            break
+    return options
+
+
 def _remote_run_state_message(
     conversation_id: str,
     turn_id: str,
@@ -11337,6 +11403,8 @@ def _remote_run_state_message(
     )
     if intervention_pause:
         content = result or "远程角色已在安全边界暂停，正在优先处理定向干预。"
+    elif status == "awaiting_input":
+        content = result or "等待用户决策：该成员已暂停，等待你选择方向后继续。"
     elif status in _REMOTE_TERMINAL_STATUSES:
         content = result or (
             f"远程执行已结束：{remote_run.get('error')}"
@@ -12477,6 +12545,47 @@ def _require_supervisor_pass(
     raise RuntimeError(reason)
 
 
+def _emit_rework_state_event(
+    conversation_id: str,
+    turn_id: str,
+    *,
+    phase: str,
+    rework_round: int,
+    checkpoint_label: str,
+    feedback: str,
+) -> None:
+    """Emit rework state transitions for the mobile UI.
+
+    phase="started" → "正在打回给 worker"；phase="dispatched" → "已打回给
+    worker 重做"。Rendered as status chips on the rework card.
+    """
+    try:
+        with _STATE_LOCK:
+            state = load_single_state()
+            conversation = _conversation_by_id(state, conversation_id)
+            append_hosted_event(
+                conversation,
+                conversation_id=conversation_id,
+                turn_id=turn_id,
+                role_stage="rework",
+                event_type=f"rework.{phase}",
+                entity_id=f"rework:{rework_round}",
+                idempotency_key=f"rework-{phase}:{turn_id}:{rework_round}",
+                account_generation=_account_generation_for_owner(
+                    str(conversation.get("owner_id") or LOCAL_OWNER_ID)
+                ),
+                payload={
+                    "rework_round": int(rework_round),
+                    "checkpoint": str(checkpoint_label or ""),
+                    "feedback": str(feedback or "")[:4000],
+                },
+            )
+            save_single_state(state)
+            _notify_hosted_update(conversation_id)
+    except Exception:
+        logger.exception("rework state event failed")
+
+
 def _run_hosted_supervisor_check(
     conversation_id: str,
     turn_id: str,
@@ -12720,6 +12829,40 @@ def _run_hosted_supervisor_check(
             "completed_at": completed_at,
         },
     )
+    if visible and verdict in {"pass", "corrective_action"}:
+        # Supervisor verdict card: severity drives the mobile badge/color
+        # (pass = green, corrective = red with rework state changes).
+        try:
+            with _STATE_LOCK:
+                state = load_single_state()
+                conversation = _conversation_by_id(state, conversation_id)
+                append_hosted_event(
+                    conversation,
+                    conversation_id=conversation_id,
+                    turn_id=turn_id,
+                    role_stage=role_stage,
+                    event_type="supervisor.verdict",
+                    entity_id=f"supervisor:{check_id}",
+                    idempotency_key=f"supervisor-verdict:{turn_id}:{check_id}",
+                    account_generation=_account_generation_for_owner(
+                        str(conversation.get("owner_id") or LOCAL_OWNER_ID)
+                    ),
+                    payload={
+                        "checkpoint": str(checkpoint_label),
+                        "verdict": verdict,
+                        "severity": (
+                            "pass"
+                            if verdict == "pass"
+                            else "corrective"
+                        ),
+                        "display": str(display_result)[:4000],
+                        "check_id": str(check_id),
+                    },
+                )
+                save_single_state(state)
+                _notify_hosted_update(conversation_id)
+        except Exception:
+            logger.exception("supervisor verdict event failed")
     return result, persisted_status, persisted
 
 
@@ -13559,6 +13702,14 @@ def execute_hosted_workflow(
                 "requested_at": int(time.time() * 1000),
             }
         )
+        _emit_rework_state_event(
+            conversation_id,
+            turn_id,
+            phase="started",
+            rework_round=active_rework_round,
+            checkpoint_label="",
+            feedback=reviewer_display_result,
+        )
         _persist_hosted_turn(
             conversation_id,
             turn_id,
@@ -13671,6 +13822,14 @@ def execute_hosted_workflow(
                 for profile in worker_profiles
             )
             else "failed"
+        )
+        _emit_rework_state_event(
+            conversation_id,
+            turn_id,
+            phase="dispatched",
+            rework_round=active_rework_round,
+            checkpoint_label="",
+            feedback="",
         )
         _persist_hosted_turn(
             conversation_id,
@@ -15474,7 +15633,7 @@ def _apply_remote_checkpoint(
     payload = _redact_sensitive(payload)
     status = str(payload.get("status") or "").strip().lower()
     terminal = _coerce_flag(payload.get("terminal"))
-    if status not in {"running", "completed", "failed", "cancelled", "timed_out"}:
+    if status not in {"running", "awaiting_input", "completed", "failed", "cancelled", "timed_out"}:
         raise HTTPException(status_code=422, detail="Invalid remote run status")
     expected_terminal = status in _REMOTE_TERMINAL_STATUSES
     if terminal != expected_terminal:
@@ -15561,6 +15720,15 @@ def _apply_remote_checkpoint(
                 ),
             )
             remote_run["lease_until"] = now + lease_seconds * 1000
+        if status == "awaiting_input":
+            # Worker asked a human a question. Surface a choice card: parse
+            # A./B./C. options from the block reason so the mobile client can
+            # render selectable options plus a custom input.
+            remote_run["awaiting_input"] = True
+            options = _parse_choice_options(
+                str(payload.get("summary") or remote_run.get("summary") or "")
+            )
+            remote_run["choice_options"] = options
         if expected_terminal:
             remote_run["completed_at"] = now
             _seal_remote_run_claim(remote_run, now=now)
@@ -18776,6 +18944,26 @@ def intervene_hosted_turn(
                 ):
                     continue
                 if delivery != "steer":
+                    continue
+                if remote_status == "awaiting_input":
+                    # The member asked the user a question and is parked in
+                    # needs_input. The user's answer (choice or custom text)
+                    # steers the worker: push run.steer so the connector
+                    # unblocks the task with the answer injected as a
+                    # comment; the worker resumes with the decision.
+                    try:
+                        _push_connector_event(
+                            str(remote_run.get("connector_id") or connector_id),
+                            {
+                                "type": "run.steer",
+                                "remote_run_id": remote_id,
+                                "text": content[:2000],
+                            },
+                        )
+                        remote_run["steered_at"] = now
+                        dispatched_to.append(remote_id)
+                    except Exception:
+                        logger.exception("run.steer push failed")
                     continue
                 remote_run.update(
                     {

@@ -7817,6 +7817,7 @@ class AIAgent:
             acceptance_criteria=function_args.get("acceptance_criteria"),
             inherit_turns=function_args.get("inherit_turns"),
             context_variables=function_args.get("context_variables"),
+            name=function_args.get("name"),
             parent_agent=self,
         )
 
