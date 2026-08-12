@@ -171,14 +171,20 @@ def _structured_text(value: Any, limit: int = 12000) -> str:
 
 
 def _extract_json_handoff(value: Any, limit: int = 8000) -> str:
-    """Pull the first embedded JSON object out of a natural-language handoff.
+    """Pull the embedded JSON object out of a natural-language handoff.
 
     Remote workers occasionally wrap the required verdict schema in narrative
     prose (format drift on long contexts): the JSON lands in stdout or the
     summary while the summary itself reads like a report. The server-side
     strict parsers need the exact object, so when a terminal checkpoint
-    carries prose, extract the first balanced JSON object and prefer it as
-    the structured result.
+    carries prose, extract the balanced JSON object and prefer it as the
+    structured result.
+
+    Manager plans may open with a small context_variables object before the
+    full plan JSON, so a plain "first object" scan would return the wrong
+    fragment. Prefer the object that carries plan-shaped keys (difficulty /
+    workers / plan array) or a protocol marker (protocol / verdict); fall
+    back to the first balanced object.
     """
     text = str(value or "").strip()
     if not text:
@@ -190,8 +196,10 @@ def _extract_json_handoff(value: Any, limit: int = 8000) -> str:
             return _structured_text(text, limit)
         except (ValueError, TypeError):
             pass
-    # Otherwise scan for the first balanced top-level object, including
-    # inside Markdown fences or trailing prose.
+    # Otherwise scan every balanced top-level object, including inside
+    # Markdown fences or trailing prose, and prefer the plan/protocol-shaped
+    # one over the first fragment.
+    candidates: list[str] = []
     start = text.find("{")
     while start >= 0:
         depth = 0
@@ -216,12 +224,25 @@ def _extract_json_handoff(value: Any, limit: int = 8000) -> str:
                 if depth == 0:
                     candidate = text[start : index + 1]
                     try:
-                        json.loads(candidate)
-                        return _structured_text(candidate, limit)
+                        parsed = json.loads(candidate)
+                        if isinstance(parsed, dict):
+                            candidates.append(candidate)
                     except (ValueError, TypeError):
                         break
         start = text.find("{", start + 1)
-    return ""
+    if not candidates:
+        return ""
+    preferred_keys = ("difficulty", "workers", "plan", "protocol", "verdict")
+    for candidate in candidates:
+        try:
+            parsed = json.loads(candidate)
+            if isinstance(parsed, dict) and any(
+                key in parsed for key in preferred_keys
+            ):
+                return _structured_text(candidate, limit)
+        except (ValueError, TypeError):
+            continue
+    return _structured_text(candidates[0], limit)
 
 
 def _timestamp_ms(value: Any) -> int | None:

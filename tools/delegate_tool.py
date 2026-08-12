@@ -30,6 +30,7 @@ import time
 from concurrent.futures import (
     TimeoutError as FuturesTimeoutError,
 )
+from pathlib import Path
 from typing import Any, Dict, List, Optional
 from urllib.parse import urlsplit, urlunsplit
 
@@ -905,6 +906,11 @@ def _build_child_system_prompt(
     role: str = "leaf",
     max_spawn_depth: int = 2,
     child_depth: int = 1,
+    expected_output: Optional[str] = None,
+    acceptance_criteria: Optional[List[str]] = None,
+    inherited_context: Optional[str] = None,
+    context_variables: Optional[Dict[str, Any]] = None,
+    rules_text: Optional[str] = None,
 ) -> str:
     """Build a focused system prompt for a child agent.
 
@@ -921,6 +927,48 @@ def _build_child_system_prompt(
     ]
     if context and context.strip():
         parts.append(f"\nCONTEXT:\n{context}")
+    if expected_output and expected_output.strip():
+        parts.append(
+            "\nEXPECTED OUTPUT:\n"
+            f"{expected_output.strip()}\n"
+            "This is the deliverable your parent needs from you. Shape your "
+            "final summary so it satisfies this contract explicitly."
+        )
+    if acceptance_criteria:
+        criteria = [
+            str(item).strip()
+            for item in acceptance_criteria
+            if str(item).strip()
+        ]
+        if criteria:
+            parts.append(
+                "\nACCEPTANCE CRITERIA (verify each one before finishing):\n"
+                + "\n".join(f"- {item}" for item in criteria)
+                + "\nIn your final summary, address every criterion explicitly "
+                "(satisfied / not satisfied + why)."
+            )
+    if inherited_context and inherited_context.strip():
+        parts.append(
+            "\nPARENT CONTEXT (last turns, provided by your parent):\n"
+            f"{inherited_context.strip()}\n"
+            "This is a selective excerpt of your parent's conversation. Treat "
+            "it as background only — your task above remains authoritative."
+        )
+    if context_variables:
+        try:
+            cv_text = json.dumps(context_variables, ensure_ascii=False, sort_keys=True)
+            if len(cv_text) <= 8000:
+                parts.append(
+                    "\nSHARED CONTEXT (structured state from your parent):\n"
+                    f"```json\n{cv_text}\n```"
+                )
+        except (TypeError, ValueError):
+            pass
+    if rules_text and rules_text.strip():
+        parts.append(
+            "\nTEAM RULES (read before acting):\n"
+            f"{rules_text.strip()}"
+        )
     if workspace_path and str(workspace_path).strip():
         parts.append(
             "\nWORKSPACE PATH:\n"
@@ -1000,6 +1048,120 @@ def _resolve_workspace_hint(parent_agent) -> Optional[str]:
         if os.path.isabs(text) and os.path.isdir(text):
             return text
     return None
+
+
+_MAX_RULES_TEXT_CHARS = 6000
+_MAX_INHERITED_CONTEXT_CHARS = 6000
+
+
+def _collect_team_rules(parent_agent, workspace_hint: Optional[str]) -> Optional[str]:
+    """Collect team rule files for injection into the child system prompt.
+
+    opencode-style (instruction.ts): global rules (HERMES_HOME/SOUL.md, the
+    agent's personality/standing instructions) plus the nearest project-level
+    AGENTS.md (findUp — first match wins, no stacking of every ancestor).
+    The child gets the rules injected instead of having to discover them,
+    solving the "subagent doesn't know the team rules" gap.
+    """
+    candidates: List[Path] = []
+    seen: set = set()
+    hermes_home = os.environ.get("HERMES_HOME") or ""
+    if hermes_home:
+        for name in ("SOUL.md", "AGENTS.md"):
+            path = Path(hermes_home) / name
+            if path.is_file():
+                key = str(path.resolve())
+                if key not in seen:
+                    seen.add(key)
+                    candidates.append(path)
+    # Nearest project-level AGENTS.md from the workspace (first match wins).
+    if workspace_hint:
+        current = Path(workspace_hint).resolve()
+        for directory in (current, *current.parents):
+            candidate = directory / "AGENTS.md"
+            if candidate.is_file():
+                key = str(candidate.resolve())
+                if key not in seen:
+                    seen.add(key)
+                    candidates.append(candidate)
+                break
+    if not candidates:
+        return None
+    blocks: List[str] = []
+    budget = _MAX_RULES_TEXT_CHARS
+    for path in candidates:
+        try:
+            text = path.read_text(encoding="utf-8", errors="replace").strip()
+        except OSError:
+            continue
+        if not text:
+            continue
+        if len(text) > budget:
+            text = text[:budget] + "\n… [truncated]"
+        budget -= len(text)
+        blocks.append(f"## {path.name} ({path})\n{text}")
+        if budget <= 0:
+            break
+    return "\n\n".join(blocks) if blocks else None
+
+
+def _collect_inherited_context(
+    parent_agent,
+    inherit_turns: int,
+) -> Optional[str]:
+    """Collect the last N parent turns as selective shallow inheritance.
+
+    codex fork_turns adaptation (control/spawn.rs keep_forked_rollout_item):
+    only user messages and assistant final text are inherited — reasoning,
+    tool calls and tool outputs are dropped, so the excerpt stays a compact
+    narrative of what was asked and what was concluded. Default 0 = no
+    inheritance (fresh-context subagent).
+    """
+    if not inherit_turns or inherit_turns < 1:
+        return None
+    session_db = getattr(parent_agent, "session_db", None)
+    session_id = getattr(parent_agent, "session_id", "") or ""
+    if session_db is None or not session_id:
+        return None
+    try:
+        messages = session_db.get_messages_as_conversation(session_id)
+    except Exception:
+        return None
+    if not messages:
+        return None
+    # Filter to the narrative: user messages verbatim; assistant messages
+    # keep only plain content (no tool-call batches / tool results).
+    narrative: List[Dict[str, str]] = []
+    for message in messages:
+        role = str(message.get("role") or "").lower()
+        content = str(message.get("content") or "").strip()
+        if not content:
+            continue
+        if role == "user":
+            narrative.append({"role": "user", "text": content})
+        elif role == "assistant" and not message.get("tool_calls"):
+            narrative.append({"role": "assistant", "text": content})
+    if not narrative:
+        return None
+    # Keep the last N user-turn boundaries (codex truncate_rollout_to_last_n_fork_turns).
+    user_indices = [i for i, item in enumerate(narrative) if item["role"] == "user"]
+    if len(user_indices) > inherit_turns:
+        start = user_indices[-inherit_turns]
+        narrative = narrative[start:]
+    lines: List[str] = []
+    budget = _MAX_INHERITED_CONTEXT_CHARS
+    for item in narrative:
+        text = item["text"]
+        if len(text) > 2000:
+            text = text[:2000] + "…"
+        if len(text) > budget:
+            text = text[:budget] + "…"
+        budget -= len(text)
+        prefix = "User asked:" if item["role"] == "user" else "Assistant concluded:"
+        lines.append(f"{prefix} {text}")
+        if budget <= 0:
+            break
+    return "\n\n".join(lines) if lines else None
 
 
 def _strip_blocked_tools(toolsets: List[str]) -> List[str]:
@@ -1325,6 +1487,11 @@ def _build_child_agent(
     # 'leaf' (default) cannot; 'orchestrator' retains the delegation
     # toolset subject to depth/kill-switch bounds applied below.
     role: str = "leaf",
+    expected_output: Optional[str] = None,
+    acceptance_criteria: Optional[List[str]] = None,
+    inherited_context: Optional[str] = None,
+    context_variables: Optional[Dict[str, Any]] = None,
+    rules_text: Optional[str] = None,
 ):
     """
     Build a child AIAgent on the main thread (thread-safe construction).
@@ -1434,6 +1601,11 @@ def _build_child_agent(
         role=effective_role,
         max_spawn_depth=max_spawn,
         child_depth=child_depth,
+        expected_output=expected_output,
+        acceptance_criteria=acceptance_criteria,
+        inherited_context=inherited_context,
+        context_variables=context_variables,
+        rules_text=rules_text,
     )
     # Extract parent's API key so subagents inherit auth (e.g. Nous Portal).
     parent_api_key = getattr(parent_agent, "api_key", None)
@@ -3137,6 +3309,10 @@ def delegate_task(
     role: Optional[str] = None,
     background: Optional[bool] = None,
     output_schema: Optional[Dict[str, Any]] = None,
+    expected_output: Optional[str] = None,
+    acceptance_criteria: Optional[List[str]] = None,
+    inherit_turns: Optional[int] = None,
+    context_variables: Optional[Dict[str, Any]] = None,
     parent_agent=None,
 ) -> str:
     """
@@ -3150,6 +3326,20 @@ def delegate_task(
     'leaf' (default) cannot; 'orchestrator' retains the delegation
     toolset and can spawn its own workers, bounded by
     delegation.max_spawn_depth.  Per-task role beats the top-level one.
+
+    Agent-team contract fields:
+      - expected_output: what the subagent must deliver (injected into its
+        system prompt as the deliverable contract).
+      - acceptance_criteria: list of verifiable pass conditions the
+        subagent must address explicitly in its final summary.
+      - inherit_turns: selective shallow inheritance (codex fork_turns) —
+        the last N user/assistant turns of THIS conversation, filtered to
+        narrative only (no reasoning/tool traces). Default 0 = fresh
+        context.
+      - context_variables: small structured KV shared with the subagent
+        (swarm-style), distinct from free-text context.
+    Batch tasks may carry the same fields per task, overriding the
+    top-level values.
 
     Returns JSON with results array, one entry per task.
     """
@@ -3167,6 +3357,21 @@ def delegate_task(
 
     # Normalise the top-level role once; per-task overrides re-normalise.
     top_role = _normalize_role(role)
+    # Agent-team contract fields (top-level defaults; per-task overrides).
+    top_expected_output = str(expected_output).strip() if expected_output else ""
+    top_acceptance = (
+        [str(item).strip() for item in acceptance_criteria if str(item).strip()]
+        if isinstance(acceptance_criteria, list)
+        else []
+    )
+    try:
+        top_inherit_turns = int(inherit_turns or 0)
+    except (TypeError, ValueError):
+        top_inherit_turns = 0
+    top_inherit_turns = max(0, min(top_inherit_turns, 20))
+    top_context_variables = (
+        dict(context_variables) if isinstance(context_variables, dict) else None
+    )
 
     # Background (async) delegation now applies to BOTH single tasks and
     # batches. A batch is dispatched as ONE async unit: the whole fan-out runs
@@ -3238,6 +3443,14 @@ def delegate_task(
         single_task: Dict[str, Any] = {"goal": goal, "context": context, "role": top_role}
         if output_schema is not None:
             single_task["output_schema"] = output_schema
+        if expected_output:
+            single_task["expected_output"] = expected_output
+        if acceptance_criteria:
+            single_task["acceptance_criteria"] = acceptance_criteria
+        if inherit_turns:
+            single_task["inherit_turns"] = inherit_turns
+        if context_variables:
+            single_task["context_variables"] = context_variables
         task_list = [single_task]
     else:
         return tool_error("Provide either 'goal' (single task) or 'tasks' (batch).")
@@ -3342,6 +3555,25 @@ def delegate_task(
             from tools.delegation_output_schema import append_output_contract
 
             _child_context = append_output_contract(_child_context, _task_schema)
+        # Agent-team contract fields (expected_output / acceptance_criteria /
+        # inherit_turns / context_variables) resolve per task, falling back
+        # to the top-level arguments.
+        _expected_output = t.get("expected_output") or top_expected_output
+        _acceptance = t.get("acceptance_criteria") or top_acceptance
+        _inherit = int(t.get("inherit_turns") if t.get("inherit_turns") is not None else top_inherit_turns or 0) or 0
+        _cvars = t.get("context_variables") or top_context_variables
+        # Selective shallow inheritance (codex fork_turns): collect the
+        # parent's last N turns once per child that asks for it.
+        _inherited = (
+            _collect_inherited_context(parent_agent, _inherit)
+            if _inherit
+            else None
+        )
+        # Team rules (opencode findUp style): global SOUL.md + nearest
+        # project AGENTS.md, injected instead of self-discovered.
+        _rules = _collect_team_rules(
+            parent_agent, _resolve_workspace_hint(parent_agent)
+        )
         child = _build_child_preserving_parent_tools(
             task_index=i,
             goal=t["goal"],
@@ -3362,6 +3594,11 @@ def delegate_task(
             override_acp_command=creds.get("command"),
             override_acp_args=creds.get("args"),
             role=effective_role,
+            expected_output=_expected_output,
+            acceptance_criteria=_acceptance,
+            inherited_context=_inherited,
+            context_variables=_cvars,
+            rules_text=_rules,
         )
         # Attach the validated schema for the completion-side validation
         # hook in _run_single_child. Absent (None) on schema-less tasks.
@@ -4254,6 +4491,43 @@ DELEGATE_TASK_SCHEMA = {
                                 "require only fields you will actually read."
                             ),
                         },
+                        "expected_output": {
+                            "type": "string",
+                            "description": (
+                                "What the subagent must deliver. Injected "
+                                "into its system prompt as the deliverable "
+                                "contract so its summary satisfies this "
+                                "explicitly."
+                            ),
+                        },
+                        "acceptance_criteria": {
+                            "type": "array",
+                            "items": {"type": "string"},
+                            "description": (
+                                "Verifiable pass conditions the subagent "
+                                "must address one-by-one in its final "
+                                "summary (satisfied / not + why)."
+                            ),
+                        },
+                        "inherit_turns": {
+                            "type": "integer",
+                            "minimum": 0,
+                            "maximum": 20,
+                            "description": (
+                                "Selectively inherit the last N turns of "
+                                "this conversation (narrative only — user "
+                                "messages and assistant conclusions, no "
+                                "tool traces). 0 = fresh context (default)."
+                            ),
+                        },
+                        "context_variables": {
+                            "type": "object",
+                            "description": (
+                                "Small structured KV shared with the "
+                                "subagent (swarm-style context_variables), "
+                                "distinct from free-text context."
+                            ),
+                        },
                     },
                     "required": ["goal"],
                 },
@@ -4273,6 +4547,39 @@ DELEGATE_TASK_SCHEMA = {
                     "Optional JSON Schema for the single-goal form — the "
                     "subagent's final answer must validate against it "
                     "(same semantics as tasks[].output_schema)."
+                ),
+            },
+            "expected_output": {
+                "type": "string",
+                "description": (
+                    "What the subagent must deliver (single-goal form). "
+                    "Injected into its system prompt as the deliverable "
+                    "contract."
+                ),
+            },
+            "acceptance_criteria": {
+                "type": "array",
+                "items": {"type": "string"},
+                "description": (
+                    "Verifiable pass conditions the subagent must address "
+                    "one-by-one in its final summary (single-goal form)."
+                ),
+            },
+            "inherit_turns": {
+                "type": "integer",
+                "minimum": 0,
+                "maximum": 20,
+                "description": (
+                    "Selectively inherit the last N turns of this "
+                    "conversation (narrative only, no tool traces). "
+                    "0 = fresh context (default)."
+                ),
+            },
+            "context_variables": {
+                "type": "object",
+                "description": (
+                    "Small structured KV shared with the subagent "
+                    "(swarm-style context_variables)."
                 ),
             },
             "background": {

@@ -361,6 +361,20 @@ def build_parser(parent_subparsers: argparse._SubParsersAction) -> argparse.Argu
                                "(repeatable). The kanban lifecycle is already "
                                "injected automatically. Example: "
                                "--skill translation --skill github-code-review")
+    p_create.add_argument("--context-variables", default=None, dest="context_variables",
+                          help="Shared small state as a JSON object; injected "
+                               "into every worker's context for this task chain "
+                               "(swarm-style context_variables).")
+    p_create.add_argument("--context-ref", action="append", default=[], dest="context_refs",
+                          help="Upstream task id to reference as context "
+                               "(repeatable). Its title/status/summary are "
+                               "injected; workers pull full text on demand.")
+    p_create.add_argument("--input-artifact", action="append", default=[], dest="input_artifacts",
+                          help="Declared input artifact for the handoff contract "
+                               "(repeatable).")
+    p_create.add_argument("--output-artifact", action="append", default=[], dest="output_artifacts",
+                          help="Declared output artifact this card must produce "
+                               "(repeatable).")
     p_create.add_argument("--max-retries", type=int, default=None,
                           metavar="N",
                           help="Per-task override for the consecutive-failure "
@@ -1640,6 +1654,14 @@ def _cmd_create(args: argparse.Namespace) -> int:
             goal_mode=bool(getattr(args, "goal_mode", False)),
             goal_max_turns=getattr(args, "goal_max_turns", None),
             initial_status=getattr(args, "initial_status", "running"),
+            context_variables=(
+                json.loads(args.context_variables)
+                if getattr(args, "context_variables", None)
+                else None
+            ),
+            context_refs=getattr(args, "context_refs", None) or None,
+            input_artifacts=getattr(args, "input_artifacts", None) or None,
+            output_artifacts=getattr(args, "output_artifacts", None) or None,
         )
         task = kb.get_task(conn, task_id)
     if getattr(args, "json", False):

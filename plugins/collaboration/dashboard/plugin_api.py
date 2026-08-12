@@ -5386,6 +5386,24 @@ def _normalize_manager_plan(
                     for value in item.get("depends_on") or []
                     if str(value).strip()
                 ][:24],
+                # A2A reference_task_ids style: upstream task ids this step
+                # needs as context (summaries injected, full text on demand).
+                "context_refs": [
+                    str(value).strip()[:128]
+                    for value in item.get("context_refs") or []
+                    if str(value).strip()
+                ][:16],
+                # MetaGPT/OpenHands-style artifact handoff contract.
+                "input_artifacts": [
+                    str(value).strip()[:500]
+                    for value in item.get("input_artifacts") or []
+                    if str(value).strip()
+                ][:16],
+                "output_artifacts": [
+                    str(value).strip()[:500]
+                    for value in item.get("output_artifacts") or []
+                    if str(value).strip()
+                ][:16],
             }
         )
     if not steps:
@@ -5410,8 +5428,32 @@ def _normalize_manager_plan(
         for item in parsed.get("acceptance_criteria") or []
         if str(item).strip()
     ][:32]
+    context_variables = (
+        dict(parsed.get("context_variables"))
+        if isinstance(parsed.get("context_variables"), dict)
+        else None
+    )
+    for step in steps:
+        # A2A reference_task_ids style: upstream task ids this step needs as
+        # context (full text pulled on demand, summaries injected).
+        step["context_refs"] = [
+            str(value).strip()[:128]
+            for value in step.get("context_refs") or []
+            if str(value).strip()
+        ][:16]
+        # MetaGPT/OpenHands-style artifact handoff contract.
+        step["input_artifacts"] = [
+            str(value).strip()[:500]
+            for value in step.get("input_artifacts") or []
+            if str(value).strip()
+        ][:16]
+        step["output_artifacts"] = [
+            str(value).strip()[:500]
+            for value in step.get("output_artifacts") or []
+            if str(value).strip()
+        ][:16]
     return {
-        "version": 2,
+        "version": 3,
         "difficulty": difficulty,
         "reason": str(parsed.get("reason") or f"{_HERMES_MANAGER_NAME} selected a bounded execution plan.").strip()[:1000],
         "workers": worker_profiles,
@@ -5425,6 +5467,7 @@ def _normalize_manager_plan(
             for item in parsed.get("flow") or []
             if str(item).strip()
         ][:48],
+        "context_variables": context_variables,
         "plan": steps,
         "constraints": constraints,
     }
@@ -5457,6 +5500,11 @@ def _manager_plan_prompt(
             "  - flow：流程方案（按执行顺序的完整流程步骤）。",
             "  - plan：Todo List（按实际执行顺序列出可验证、可独立完成的步骤，title 简短明确，"
             "每步 objective 写明目标、做法与验收要点，assignee 为具体 worker，depends_on 表达依赖）。",
+            "  - plan 每步可选携带：context_refs（本步骤需要引用的上游任务 id 列表，worker 按需拉全文）、"
+            "input_artifacts（本步骤消费的上游产物，如 \"upstream/report.md\"）、"
+            "output_artifacts（本步骤必须产出的交付物路径）。"
+            "  - context_variables（可选）：跨步骤共享的小型结构化状态对象（如 {\"target_host\":\"dbb3\",\"mode\":\"verify\"}），"
+            "随任务链传给每个 worker，不要放对话历史里。",
             "多步骤任务不得压缩成一个泛化的“执行任务”；每完成一个步骤，服务端会依据真实 Worker、"
             "审阅与汇报状态更新勾选。示例：用户要求「建目录、写文件、运行、用 todo 跟踪、总结」，"
             "则 plan 至少包含 5 个步骤（建目录 → 写文件 → 运行验证 → 更新 todo → 总结），"
@@ -5472,8 +5520,9 @@ def _manager_plan_prompt(
             '{"difficulty":"low|medium|high|critical","reason":"...","workers":["dbb3-worker"],'
             '"reviewer_target":"dbb3|pc","approach":"整体方案","task_requirements":"任务要求逐条",'
             '"acceptance_criteria":["验收标准1","验收标准2"],"test_plan":"测试方案",'
-            '"flow":["流程步骤1","流程步骤2"],'
-            '"plan":[{"id":"step-1","title":"...","objective":"...","assignee":"dbb3-worker|pc-worker","depends_on":[]}]}',
+            '"flow":["流程步骤1","流程步骤2"],"context_variables":{"k":"v"},'
+            '"plan":[{"id":"step-1","title":"...","objective":"...","assignee":"dbb3-worker|pc-worker",'
+            '"depends_on":[],"context_refs":["t_xxx"],"input_artifacts":["path"],"output_artifacts":["path"]}]}',
             "plan 是用户右滑后看到的 Todo List；approach/task_requirements/acceptance_criteria/"
             "test_plan/flow 会写入看板任务并随任务链传给每个 Worker。",
             f"用户任务：\n{content}",
@@ -9985,6 +10034,13 @@ def create_hosted_kanban_task(
             idempotency_key=f"collaboration:{conversation_id}:{turn_id}",
             goal_mode=True,
             session_id=conversation_id,
+            context_variables=(
+                dict(manager_plan.get("context_variables"))
+                if isinstance(manager_plan, dict)
+                and isinstance(manager_plan.get("context_variables"), dict)
+                and manager_plan.get("context_variables")
+                else None
+            ),
         )
     finally:
         conn.close()
@@ -13128,6 +13184,40 @@ def execute_hosted_workflow(
                     if str(item).strip()
                 )
             )
+        cvars = manager_plan.get("context_variables")
+        if isinstance(cvars, dict) and cvars:
+            try:
+                cv_text = json.dumps(cvars, ensure_ascii=False, sort_keys=True)
+                manager_plan_blocks.append(
+                    "【共享上下文变量】\n"
+                    f"```json\n{cv_text[:8000]}\n```\n"
+                    "_跨步骤共享的结构化状态，视为权威；不要静默覆盖 manager 设置的键。_"
+                )
+            except (TypeError, ValueError):
+                pass
+
+    def _step_contract_blocks(step: dict[str, Any]) -> list[str]:
+        """Render one plan step's handoff contract (refs + artifact I/O)."""
+        blocks: list[str] = []
+        refs = step.get("context_refs") or []
+        if refs:
+            blocks.append(
+                "【本步骤上下文引用】\n"
+                + "\n".join(f"- {str(item)[:128]}" for item in refs)
+                + "\n_用 kanban_show 拉取引用任务的完整内容（正文/结果/评论）。_"
+            )
+        inputs = step.get("input_artifacts") or []
+        outputs = step.get("output_artifacts") or []
+        if inputs or outputs:
+            contract_lines = []
+            if inputs:
+                contract_lines.append("输入（消费这些上游产物）：")
+                contract_lines.extend(f"- {str(item)[:500]}" for item in inputs)
+            if outputs:
+                contract_lines.append("输出（本步骤必须产出）：")
+                contract_lines.extend(f"- {str(item)[:500]}" for item in outputs)
+            blocks.append("【产物交接契约】\n" + "\n".join(contract_lines))
+        return blocks
 
     def execute_worker(
         profile: str,
@@ -13165,6 +13255,13 @@ def execute_hosted_workflow(
                 "负责实际执行、工具调用、证据收集和必要产物创建。",
                 "可以使用所有已配置的 Skill、MCP 和工具；正常的搜索、命令、取证和验证属于执行过程。",
                 *manager_plan_blocks,
+                *(
+                    block
+                    for step in manager_plan.get("plan") or []
+                    if isinstance(step, dict)
+                    and str(step.get("assignee") or "").strip().lower() == profile
+                    for block in _step_contract_blocks(step)
+                ),
                 hosted_progress_protocol(profile),
                 hosted_role_delivery_contract(profile),
                 mention_priority_protocol(profile),

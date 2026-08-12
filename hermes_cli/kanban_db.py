@@ -335,6 +335,21 @@ _CTX_MAX_BODY_BYTES     = 8 * 1024   # 8 KB per task.body (opening post)
 _CTX_MAX_COMMENT_BYTES  = 2 * 1024   # 2 KB per comment
 
 
+def _parse_json_list_or_dict(value: Any, *, expect_dict: bool) -> Any:
+    """Parse a JSON-encoded column back to a list or dict; None on garbage."""
+    if value is None:
+        return None
+    try:
+        parsed = json.loads(value)
+    except (TypeError, ValueError):
+        return None
+    if expect_dict and isinstance(parsed, dict):
+        return parsed
+    if not expect_dict and isinstance(parsed, list):
+        return parsed
+    return None
+
+
 def _relative_age(ts: Optional[int], now: Optional[int] = None) -> str:
     """Render the age of an epoch-seconds timestamp as a coarse, human-
     readable string like ``just now``, ``18h ago``, ``3d ago``.
@@ -993,6 +1008,14 @@ class Task:
     # Unblock-loop counter. See the column comment in SCHEMA_SQL and
     # ``BLOCK_RECURRENCE_LIMIT``. Reset only on successful completion.
     block_recurrences: int = 0
+    # Shared small state (JSON object) injected into every worker context.
+    context_variables: Optional[dict] = None
+    # Upstream task ids referenced as context (titles/status/summaries are
+    # injected; full text pulled on demand via kanban_show).
+    context_refs: Optional[list] = None
+    # Declared artifact handoff contract (MetaGPT/OpenHands-style).
+    input_artifacts: Optional[list] = None
+    output_artifacts: Optional[list] = None
 
     @classmethod
     def from_row(cls, row: sqlite3.Row) -> "Task":
@@ -1086,6 +1109,26 @@ class Task:
                 int(row["block_recurrences"])
                 if "block_recurrences" in keys and row["block_recurrences"] is not None
                 else 0
+            ),
+            context_variables=(
+                _parse_json_list_or_dict(row["context_variables"], expect_dict=True)
+                if "context_variables" in keys
+                else None
+            ),
+            context_refs=(
+                _parse_json_list_or_dict(row["context_refs"], expect_dict=False)
+                if "context_refs" in keys
+                else None
+            ),
+            input_artifacts=(
+                _parse_json_list_or_dict(row["input_artifacts"], expect_dict=False)
+                if "input_artifacts" in keys
+                else None
+            ),
+            output_artifacts=(
+                _parse_json_list_or_dict(row["output_artifacts"], expect_dict=False)
+                if "output_artifacts" in keys
+                else None
             ),
         )
 
@@ -1274,7 +1317,20 @@ CREATE TABLE IF NOT EXISTS tasks (
     -- ``blocked`` so a cron can't spin it forever. Reset to 0 only on a
     -- successful completion — NOT on unblock (resetting on unblock is exactly
     -- the amnesia that let the loop run unbounded).
-    block_recurrences    INTEGER NOT NULL DEFAULT 0
+    block_recurrences    INTEGER NOT NULL DEFAULT 0,
+    -- Swarm-style shared small state: JSON object injected into every
+    -- worker's context for this task chain. Structured KV the manager can
+    -- set (targets, shared config, accumulators) without touching body.
+    context_variables    TEXT,
+    -- Upstream task ids this card references as context (JSON array).
+    -- Worker context injects titles/status/summaries; full text is pulled
+    -- on demand via kanban_show(task_id=...).
+    context_refs         TEXT,
+    -- Declared artifact handoff contract (JSON arrays, MetaGPT/OpenHands
+    -- style): inputs this card consumes from upstream, outputs it must
+    -- produce. Rendered in the worker context so handoff is explicit.
+    input_artifacts      TEXT,
+    output_artifacts     TEXT
 );
 
 CREATE TABLE IF NOT EXISTS task_links (
@@ -2474,6 +2530,26 @@ def _migrate_add_optional_columns(conn: sqlite3.Connection) -> None:
             "block_recurrences INTEGER NOT NULL DEFAULT 0",
         )
 
+    if "context_variables" not in cols:
+        # Swarm-style shared small state: JSON object injected into every
+        # worker context for this task chain.
+        _add_column_if_missing(
+            conn, "tasks", "context_variables", "context_variables TEXT"
+        )
+    if "context_refs" not in cols:
+        # Upstream task ids referenced as context (JSON array).
+        _add_column_if_missing(conn, "tasks", "context_refs", "context_refs TEXT")
+    if "input_artifacts" not in cols:
+        # Declared input artifact contract (JSON array).
+        _add_column_if_missing(
+            conn, "tasks", "input_artifacts", "input_artifacts TEXT"
+        )
+    if "output_artifacts" not in cols:
+        # Declared output artifact contract (JSON array).
+        _add_column_if_missing(
+            conn, "tasks", "output_artifacts", "output_artifacts TEXT"
+        )
+
     # Indexes over additive ``tasks`` columns must be created after the
     # columns exist. Keeping them in SCHEMA_SQL breaks legacy boards: SQLite
     # parses each statement in ``executescript`` against the live schema, so a
@@ -2940,6 +3016,20 @@ def create_task(
     board: Optional[str] = None,
     project_id: Optional[str] = None,
     project_source_task_id: Optional[str] = None,
+    # Shared small state (swarm-style context_variables): a JSON object the
+    # dispatcher injects into every worker's context for this task chain.
+    # Unlike body/comments it is structured KV, machine-readable, and
+    # intended for small cross-worker state (targets, config, accumulators).
+    context_variables: Optional[dict] = None,
+    # Upstream task ids this card explicitly references as context. The
+    # worker context injects their titles/status/summaries (reference, not
+    # full copy); the worker pulls full text on demand via kanban_show.
+    context_refs: Optional[Iterable[str]] = None,
+    # Artifact handoff contract (MetaGPT/OpenHands-style): declared inputs
+    # (paths/ids of upstream artifacts this card consumes) and outputs
+    # (paths this card must produce). Rendered in the worker context.
+    input_artifacts: Optional[Iterable[str]] = None,
+    output_artifacts: Optional[Iterable[str]] = None,
 ) -> str:
     """Create a new task and optionally link it under parent tasks.
 
@@ -3254,8 +3344,10 @@ def create_task(
                         max_runtime_seconds,
                         skills, max_retries, model_override, provider_override,
                         reasoning_effort,
-                        goal_mode, goal_max_turns, session_id
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        goal_mode, goal_max_turns, session_id,
+                        context_variables, context_refs,
+                        input_artifacts, output_artifacts
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """,
                     (
                         task_id,
@@ -3281,6 +3373,35 @@ def create_task(
                         1 if goal_mode else 0,
                         int(goal_max_turns) if goal_max_turns is not None else None,
                         session_id,
+                        (
+                            json.dumps(context_variables, ensure_ascii=False)
+                            if isinstance(context_variables, dict) and context_variables
+                            else None
+                        ),
+                        (
+                            json.dumps(
+                                [str(value).strip() for value in context_refs if str(value).strip()],
+                                ensure_ascii=False,
+                            )
+                            if context_refs
+                            else None
+                        ),
+                        (
+                            json.dumps(
+                                [str(value).strip() for value in input_artifacts if str(value).strip()],
+                                ensure_ascii=False,
+                            )
+                            if input_artifacts
+                            else None
+                        ),
+                        (
+                            json.dumps(
+                                [str(value).strip() for value in output_artifacts if str(value).strip()],
+                                ensure_ascii=False,
+                            )
+                            if output_artifacts
+                            else None
+                        ),
                     ),
                 )
                 for pid in parents:
@@ -10345,6 +10466,67 @@ def build_worker_context(conn: sqlite3.Connection, task_id: str) -> str:
     if task.branch_name:
         lines.append(f"Branch:   {task.branch_name}")
     lines.append("")
+
+    # Artifact handoff contract (MetaGPT/OpenHands-style): declared inputs
+    # this card consumes and outputs it must produce. Explicit contracts
+    # replace free-text handoff prose — the worker knows exactly which
+    # upstream artifact it is fed and what it must deliver.
+    if task.input_artifacts or task.output_artifacts:
+        lines.append("## Artifact contract")
+        if task.input_artifacts:
+            lines.append("Inputs (consume these):")
+            for item in task.input_artifacts:
+                lines.append(f"- {item}")
+        if task.output_artifacts:
+            lines.append("Outputs (you must produce these):")
+            for item in task.output_artifacts:
+                lines.append(f"- {item}")
+        lines.append("")
+
+    # Shared small state (swarm-style context_variables): structured KV the
+    # manager set for the whole task chain. Machine-readable, distinct from
+    # body prose; workers treat it as authoritative cross-task state.
+    if task.context_variables:
+        lines.append("## Shared context variables")
+        lines.append(
+            "_Structured state shared across this task chain. Treat as "
+            "authoritative; do not silently overwrite keys set by the "
+            "manager or upstream cards._"
+        )
+        try:
+            cv_text = json.dumps(task.context_variables, ensure_ascii=False, sort_keys=True)
+            lines.append(f"```json\n{_cap(cv_text, 8000)}\n```")
+        except Exception:
+            pass
+        lines.append("")
+
+    # Explicit upstream references (A2A reference_task_ids style): titles /
+    # status / summaries are injected here; the worker pulls full text on
+    # demand via kanban_show(task_id=...) — reference, not full copy.
+    if task.context_refs:
+        lines.append("## Referenced tasks")
+        lines.append(
+            "_Upstream cards this task explicitly references. Summaries are "
+            "injected below; call kanban_show(task_id=...) for full bodies, "
+            "results and comment threads when you need them._"
+        )
+        for ref_id in task.context_refs:
+            ref = get_task(conn, ref_id)
+            if ref is None:
+                lines.append(f"- {ref_id} — (unknown task)")
+                continue
+            ref_runs = [r for r in list_runs(conn, ref_id) if r.outcome == "completed"]
+            ref_runs.sort(key=lambda r: r.started_at, reverse=True)
+            ref_run = ref_runs[0] if ref_runs else None
+            ref_summary = ""
+            if ref_run is not None and ref_run.summary:
+                ref_summary = _cap(ref_run.summary)
+            elif ref.result:
+                ref_summary = _cap(ref.result)
+            lines.append(f"- {ref_id} [{ref.status}] {ref.title}")
+            if ref_summary:
+                lines.append(f"  {ref_summary}")
+        lines.append("")
 
     if task.body and task.body.strip():
         lines.append("## Body")

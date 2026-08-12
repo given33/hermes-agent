@@ -7813,6 +7813,10 @@ class AIAgent:
             max_iterations=function_args.get("max_iterations"),
             role=function_args.get("role"),
             background=(not _is_subagent),
+            expected_output=function_args.get("expected_output"),
+            acceptance_criteria=function_args.get("acceptance_criteria"),
+            inherit_turns=function_args.get("inherit_turns"),
+            context_variables=function_args.get("context_variables"),
             parent_agent=self,
         )
 
