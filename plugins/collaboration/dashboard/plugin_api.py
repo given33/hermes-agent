@@ -5488,10 +5488,15 @@ def _manager_plan_prompt(
             "也可以调用 delegate_task 派调查子代理去核实环境、统计、检索、验证文件/服务/数据）"
             "→ 输出一份可执行的完整方案。你不亲手执行任务，也不向用户生成最终答案。",
             "调查自主判断：任务信息不足或需要核实外部状态时，先派 1-2 个 leaf 调查子代理收集信息，"
+            "每个子代理用 name 给一个中文职业名（如“资料调查员”“环境核查员”），"
             "把调查结论写进方案；信息已经足够时直接规划，不要为简单任务增加无谓延迟。"
             "调查子代理运行期间，用 subagent_list 查看其进展；"
             "发现方向偏离时用 subagent_send(subagent_id=..., text=...) 发送调整指令，"
+            "发现子代理卡死时用 subagent_kill(subagent_id=...) 终止并重新派出，"
             "不需要等它结束。",
+            "方向或需求确实不清楚、必须由用户拍板时，用 kanban_block(kind=\"needs_input\") "
+            "提问，reason 用“问题 + 选项：A. ... B. ... C. ...”格式，"
+            "让用户在手机上直接点选（也可自定义回答）；能自行判断的不要打扰用户。",
             "方案必须包含以下全部要素（写入最终 JSON，不要省略）：",
             "  - approach：整体方案与思路（如何完成任务、各阶段做什么）；",
             "  - task_requirements：任务要求（把用户任务的每一条可验证要求逐条列出）；",
@@ -6759,8 +6764,12 @@ def build_group_prompt(
             "你是执行者。只负责实际执行、调用工具并提交证据、结果和遗留问题；"
             "不要向用户做最终总结，也不要替审阅者下结论。"
             "任务含可并行子步骤或需要独立调查时，可用 delegate_task 派 leaf 子代理"
-            "并行执行（并发数量由你根据任务和节点资源自行判断）；"
+            "并行执行（并发数量由你根据任务和节点资源自行判断），"
+            "每个子代理用 name 给中文职业名；运行中用 subagent_list 查看进展、"
+            "subagent_send 调整方向、subagent_kill 终止卡死的子代理并重新派出；"
             "子代理结果必须汇总进你的交接证据。"
+            "方向或需求必须由用户拍板时用 kanban_block(kind=\"needs_input\") 提问，"
+            "reason 用“问题 + 选项：A. ... B. ...”格式；能自行判断的不要打扰用户。"
         ),
         "reviewer": (
             "你是审阅者。基于执行者已经提交的结果做验收、风险检查和通过/退回判断；"
@@ -9388,7 +9397,7 @@ def _run_hosted_remote_role(
             remote,
             role_label=role_label,
         )
-        if status == "awaiting_input":
+        if entered_awaiting:
             # Emit the choice card event once per awaiting transition.
             try:
                 with _STATE_LOCK:
@@ -15720,6 +15729,11 @@ def _apply_remote_checkpoint(
                 ),
             )
             remote_run["lease_until"] = now + lease_seconds * 1000
+            # The member resumed after an awaiting choice: clear the parked
+            # flags so a later needs_input can re-enter awaiting cleanly.
+            remote_run.pop("awaiting_input", None)
+            remote_run.pop("choice_options", None)
+        was_awaiting = _coerce_flag(remote_run.get("awaiting_input"))
         if status == "awaiting_input":
             # Worker asked a human a question. Surface a choice card: parse
             # A./B./C. options from the block reason so the mobile client can
@@ -15729,6 +15743,9 @@ def _apply_remote_checkpoint(
                 str(payload.get("summary") or remote_run.get("summary") or "")
             )
             remote_run["choice_options"] = options
+        entered_awaiting = (
+            status == "awaiting_input" and not was_awaiting
+        )
         if expected_terminal:
             remote_run["completed_at"] = now
             _seal_remote_run_claim(remote_run, now=now)
