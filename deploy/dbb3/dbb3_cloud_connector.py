@@ -29,7 +29,7 @@ import urllib.error
 import urllib.parse
 import urllib.request
 from datetime import datetime, timezone
-from typing import Any, Callable, Iterable
+from typing import Any, Callable, Iterable, Optional
 
 
 CONTRACT_VERSION = 2
@@ -2147,6 +2147,13 @@ class DBB3CloudConnector:
             "actual_model": actual_model,
             "actual_provider": actual_provider,
             "observed_at": self.clock(),
+            # Steer acks: which durable steers this connector has applied.
+            # The server keeps unapplied pending_steers for the next pull
+            # instead of dropping a second answer that arrived while the
+            # first one was being consumed.
+            "applied_steer_ids": list(
+                (local.get("applied_steer_ids") or [])[-32:]
+            ),
         }
         return payload, _artifact_paths(detail)
 
@@ -2480,8 +2487,11 @@ class DBB3CloudConnector:
             if not isinstance(local, dict) or not local.get("root_task_id"):
                 continue
             # Dedupe by steer id so a steer delivered both over SSE and via
-            # the durable pull payload unblocks exactly once.
-            steer_id = _text(event.get("steer_id"), 64) or hashlib.sha256(
+            # the durable pull payload unblocks exactly once. Pull payloads
+            # carry "id" (SSE uses "steer_id"); accept either.
+            steer_id = _text(
+                event.get("steer_id") or event.get("id"), 64
+            ) or hashlib.sha256(
                 f"{remote_id}\n{text}".encode("utf-8")
             ).hexdigest()[:16]
             applied_ids = local.get("applied_steer_ids")
@@ -2522,14 +2532,34 @@ class DBB3CloudConnector:
             return 0
         root_id = _text(item.get("root_task_id") or local.get("root_task_id"), 256)
         reason = _text(item.get("reason"), 500) or "Cancelled by cloud user"
-        code, output = self.command_runner(
-            self._build_cancel_command(
-                root_id,
-                reason,
-                _text(local.get("execution_profile"), 128),
-            ),
-            timeout=30,
-        )
+        # An already-blocked task (e.g. parked in needs_input awaiting a
+        # human decision) cannot be re-blocked — `kanban block` fails on it —
+        # and a task that already reached a terminal state needs no stop.
+        # Either way the worker is not running, so the cancellation intent is
+        # already satisfied locally: ack without issuing a command that would
+        # never succeed and would strand the run in `cancelling` forever.
+        detail: dict[str, Any] = {}
+        try:
+            detail = self._show_task(root_id, local)
+        except Exception:
+            detail = {}
+        task = detail.get("task") if isinstance(detail.get("task"), dict) else {}
+        local_task_status = _text(task.get("status"), 64).lower()
+        if local_task_status in {
+            "blocked", "cancelled", "canceled", "done", "completed", "failed",
+        }:
+            code, output = 0, _text(
+                task.get("block_reason") or f"Already {local_task_status}", 1000
+            )
+        else:
+            code, output = self.command_runner(
+                self._build_cancel_command(
+                    root_id,
+                    reason,
+                    _text(local.get("execution_profile"), 128),
+                ),
+                timeout=30,
+            )
         if code != 0:
             return 0
         cursor = max(

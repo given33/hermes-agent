@@ -1642,7 +1642,7 @@ def _build_child_agent(
         model=effective_model_for_cb,
         toolsets=child_toolsets,
         session_ref=child_session_ref,
-        name=_subagent_name,
+        name=name,
     )
 
     # Each subagent gets its own iteration budget capped at max_iterations

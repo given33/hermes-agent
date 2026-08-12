@@ -87,6 +87,10 @@ EVENT_TYPES = frozenset(
         "turn.cancel_requested",
         "turn.cancelled",
         "turn.failed",
+        "awaiting.choice",
+        "supervisor.verdict",
+        "rework.started",
+        "rework.dispatched",
     }
 )
 

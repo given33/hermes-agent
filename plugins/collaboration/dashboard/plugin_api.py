@@ -49,6 +49,8 @@ from fastapi import APIRouter, Header, HTTPException, Request
 from fastapi.responses import FileResponse, Response, StreamingResponse
 from pydantic import BaseModel, Field
 
+logger = logging.getLogger(__name__)
+
 try:
     from hermes_cli.cloud_file_library import (
         account_generation_from_request,
@@ -638,6 +640,11 @@ _REMOTE_CANCELLATION_GRACE_SECONDS = 60
 # While a worker is parked awaiting a human decision, its claim gets a longer
 # lease floor so a slow answer cannot expire the claim mid-conversation.
 _REMOTE_AWAITING_LEASE_SECONDS = 900
+# User-requested cancellations force-terminal this long after the request when
+# the connector never comes back to acknowledge — long enough for a transient
+# device outage, short enough that "cancelling" cannot hang for the full task
+# deadline.
+_REMOTE_USER_CANCEL_FORCE_SECONDS = 300
 # A connector that cannot pull a queued role must never hold a group turn in
 # ``dispatching`` forever. After this short hand-off window the server Hermes
 # runtime takes the same role and keeps the durable turn cancellable.
@@ -10620,6 +10627,9 @@ def _persist_hosted_turn(
                             run.get("cancel_reason") or "用户取消"
                         )[:1000]
                         child_state["cancel_requested_at"] = now
+                        child_state["cancel_force_terminal_at"] = (
+                            now + _REMOTE_USER_CANCEL_FORCE_SECONDS * 1000
+                        )
                         # The hosted turn is terminal immediately, but a live
                         # device worker still needs a durable cancellation to
                         # pull and acknowledge.  `cancelling` is deliberately
@@ -11109,28 +11119,36 @@ def _request_remote_timeout_locked(
     if status in _REMOTE_TERMINAL_STATUSES:
         return False
     deadline_at = _positive_int(remote_run.get("deadline_at"))
-    timeout_requested = (
-        _coerce_flag(remote_run.get("cancel_requested"))
-        and str(remote_run.get("cancel_kind") or "") == "timeout"
-    )
-    if not timeout_requested and (deadline_at is None or now < deadline_at):
-        return False
-    if timeout_requested:
+    cancel_requested = _coerce_flag(remote_run.get("cancel_requested"))
+    if cancel_requested:
+        # Any requested cancellation (timeout, user turn cancel, intervention
+        # pause) gets a bounded force-terminal window: if the connector stays
+        # offline past it, the run is sealed here so the hosted bookkeeping
+        # converges instead of hanging in `cancelling` for the full deadline.
         force_terminal_at = _positive_int(remote_run.get("cancel_force_terminal_at"))
         if force_terminal_at is None or now < force_terminal_at:
             return False
+        kind = str(remote_run.get("cancel_kind") or "")
+        final_status = "timed_out" if kind == "timeout" else "cancelled"
         remote_run.update(
             {
-                "status": "timed_out",
+                "status": final_status,
                 "terminal": True,
-                "error": remote_run.get("error") or "Remote run timed out",
-                "summary": remote_run.get("summary") or "Remote run timed out",
+                "error": remote_run.get("error") or f"Remote run {final_status}",
+                "summary": remote_run.get("summary") or f"Remote run {final_status}",
                 "completed_at": now,
                 "updated_at": now,
             }
         )
         _seal_remote_run_claim(remote_run, now=now)
+        # The hosted turn must also carry the cancellation flag so the
+        # turn-level finisher converges even when the workflow thread that
+        # originally observed the run is gone (crash / restart / gap).
+        hosted["cancel_requested"] = True
+        hosted.setdefault("cancel_kind", kind or "cancel")
         return True
+    if deadline_at is None or now < deadline_at:
+        return False
 
     old_token = str(remote_run.pop("claim_token", "") or "")
     if old_token:
@@ -11154,6 +11172,8 @@ def _request_remote_timeout_locked(
         {
             "stage": "awaiting_cancellation",
             "remote_cancel_pending": True,
+            "cancel_requested": True,
+            "cancel_kind": "timeout",
             "updated_at": now,
         }
     )
@@ -11354,20 +11374,31 @@ def _parse_choice_options(text: str) -> list[dict[str, str]]:
         B. 方案二
         C. 方案三
 
-    Returns [{"id": "A", "label": "方案一"}, ...]. Custom input is always
-    available on the client side, so no fallback option is synthesized.
+    Returns [{"id": "A", "label": "方案一"}, ...]. Letter and 1-2 digit
+    numeric numbering are both accepted (1. 方案一 → id "1"). Custom input
+    is always available on the client side, so no fallback option is
+    synthesized. Scanning stops at the first non-option line after the list
+    so trailing prose is never parsed as an option.
     """
     options: list[dict[str, str]] = []
     if not text:
         return options
+    seen_option = False
     for line in str(text).splitlines():
         line = line.strip()
-        match = re.match(r"^([A-Za-z])[.、．:：]\s*(.+)$", line)
+        if not line:
+            continue
+        if re.match(r"^(选项|options?|choices?)\s*[:：]$", line, re.IGNORECASE):
+            continue
+        match = re.match(r"^([A-Za-z]|\d{1,2})[.、．:：]\s*(.+)$", line)
         if not match:
+            if seen_option:
+                break
             continue
         label = match.group(2).strip()
         if not label:
             continue
+        seen_option = True
         options.append({"id": match.group(1).upper(), "label": label[:500]})
         if len(options) >= 6:
             break
@@ -11379,13 +11410,22 @@ def _strip_choice_options(text: str) -> str:
 
     The choice card renders the question separately from the tappable
     options, so the question payload should not repeat the option list.
+    Only lines inside the options section (after the 选项/Options header)
+    are removed — prose elsewhere in the reason is left untouched.
     """
     if not text:
         return ""
     kept: list[str] = []
+    in_options = False
     for line in str(text).splitlines():
-        if re.match(r"^([A-Za-z])[.、．:：]\s*", line.strip()):
+        stripped = line.strip()
+        if re.match(r"^(选项|options?|choices?)\s*[:：]$", stripped, re.IGNORECASE):
+            in_options = True
             continue
+        if in_options:
+            if re.match(r"^([A-Za-z]|\d{1,2})[.、．:：]\s*", stripped):
+                continue
+            in_options = False
         kept.append(line)
     return "\n".join(kept).strip()
 
@@ -12866,6 +12906,10 @@ def _run_hosted_supervisor_check(
                             else "corrective"
                         ),
                         "display": str(display_result)[:4000],
+                        # The mobile client's output fallback chain reads
+                        # output/result/summary; duplicate the verdict body so
+                        # the card always renders its text.
+                        "summary": str(display_result)[:4000],
                         "check_id": str(check_id),
                     },
                 )
@@ -15494,7 +15538,12 @@ def _require_remote_run_claim(
         raise _connector_conflict("claim_lost", "Remote run claim was lost")
     instant = int(time.time() * 1000) if now is None else int(now)
     if _nonnegative_int(remote_run.get("lease_until")) <= instant:
-        raise _connector_conflict("lease_expired", "Remote run lease expired")
+        # An awaiting run is parked on a human decision: a long think time
+        # must not 409 the resume checkpoint purely on lease expiry (the
+        # secret token above already proved the claim). Lease expiry stays
+        # fatal for actively executing runs so stale claims are arbitrated.
+        if str(remote_run.get("status") or "") != "awaiting_input":
+            raise _connector_conflict("lease_expired", "Remote run lease expired")
 
 
 def _seal_remote_run_claim(
@@ -15596,7 +15645,14 @@ def _remote_run_connector_payload(remote_run: dict[str, Any]) -> dict[str, Any]:
     pending_steers = remote_run.get("pending_steers")
     if isinstance(pending_steers, list) and pending_steers:
         payload["pending_steers"] = [
-            dict(item) for item in pending_steers if isinstance(item, dict)
+            {
+                **dict(item),
+                # SSE delivery uses "steer_id"; keep both keys so the
+                # connector's dedupe applies across both channels.
+                "steer_id": str(item.get("id") or ""),
+            }
+            for item in pending_steers
+            if isinstance(item, dict)
         ]
     return payload
 
@@ -15673,6 +15729,8 @@ def _apply_remote_checkpoint(
         if location is None:
             raise HTTPException(status_code=404, detail="Remote run not found")
         conversation, hosted, role_key, remote_run = location
+        conversation_id = str(conversation.get("id") or "")
+        turn_id = str(hosted.get("turn_id") or "")
         _require_connector_account_boundary(conversation, remote_run)
         connector_id = str(payload.get("connector_id") or "").strip()[:128]
         _require_remote_run_claim(
@@ -15742,11 +15800,34 @@ def _apply_remote_checkpoint(
             )
             remote_run["lease_until"] = now + lease_seconds * 1000
             # The member resumed after an awaiting choice: clear the parked
-            # flags so a later needs_input can re-enter awaiting cleanly, and
-            # drop durable steers — the answer was consumed.
+            # flags so a later needs_input can re-enter awaiting cleanly.
+            # Durable steers are cleared per-ack: the connector reports the
+            # ids it applied, so a second answer that arrived while the first
+            # was being consumed survives for the next pull.
             remote_run.pop("awaiting_input", None)
             remote_run.pop("choice_options", None)
-            remote_run.pop("pending_steers", None)
+            applied_steer_ids = {
+                str(item).strip()[:64]
+                for item in (payload.get("applied_steer_ids") or [])
+                if str(item).strip()
+            }
+            pending_steers = remote_run.get("pending_steers")
+            if isinstance(pending_steers, list) and pending_steers:
+                if applied_steer_ids:
+                    kept = [
+                        item
+                        for item in pending_steers
+                        if isinstance(item, dict)
+                        and str(item.get("id") or "") not in applied_steer_ids
+                    ]
+                    if kept:
+                        remote_run["pending_steers"] = kept
+                    else:
+                        remote_run.pop("pending_steers", None)
+                else:
+                    # Older connectors do not report acks: the resume itself
+                    # proves the awaiting answer was consumed.
+                    remote_run.pop("pending_steers", None)
         was_awaiting = _coerce_flag(remote_run.get("awaiting_input"))
         if status == "awaiting_input":
             # Worker asked a human a question. Surface a choice card: parse
@@ -15765,6 +15846,15 @@ def _apply_remote_checkpoint(
                 int(payload.get("lease_seconds") or _REMOTE_RUN_LEASE_SECONDS),
                 _REMOTE_AWAITING_LEASE_SECONDS,
             ) * 1000
+            # The overall deadline must not fire while the human is still
+            # thinking — otherwise a slow answer gets hard-cancelled by the
+            # timeout sweep (the very thing the awaiting lease prevents for
+            # the claim).
+            deadline_at = _positive_int(remote_run.get("deadline_at"))
+            remote_run["deadline_at"] = max(
+                deadline_at or 0,
+                now + _REMOTE_AWAITING_LEASE_SECONDS * 1000,
+            )
         entered_awaiting = (
             status == "awaiting_input" and not was_awaiting
         )
@@ -15803,8 +15893,6 @@ def _apply_remote_checkpoint(
             remote_run["cancel_requested"] = True
         save_single_state(state)
         persisted = dict(remote_run)
-        conversation_id = str(conversation.get("id") or "")
-        turn_id = str(hosted.get("turn_id") or "")
         role_label = f"{remote_run.get('profile') or role_key} · 执行"
     _notify_hosted_update(conversation_id)
     _remote_run_state_message(
@@ -15822,7 +15910,11 @@ def _apply_remote_checkpoint(
             str(persisted.get("connector_id") or ""),
             {"type": "run.terminal", "remote_run_id": str(persisted.get("id") or "")},
         )
-    if status == "cancelled":
+    # Any terminal checkpoint on a cancel-requested run (cancelled via
+    # cancel-ack, or timed_out via the force-terminal sweep) must drive the
+    # turn-level finisher — the workflow thread that originally observed the
+    # run may already be gone.
+    if expected_terminal and _coerce_flag(persisted.get("cancel_requested")):
         _finish_hosted_turn_if_cancelled(conversation_id, turn_id)
     return persisted, True
 
@@ -19066,6 +19158,9 @@ def intervene_hosted_turn(
                         "cancel_intervention_id": message_id,
                         "cancel_reason": content[:1000],
                         "cancel_requested_at": now,
+                        "cancel_force_terminal_at": (
+                            now + _REMOTE_USER_CANCEL_FORCE_SECONDS * 1000
+                        ),
                         "updated_at": now,
                     }
                 )

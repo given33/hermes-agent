@@ -252,3 +252,30 @@ def test_turn_cancelled_fences_every_later_event():
         assert result.appended is False
         assert result.reason == "turn_terminal:turn.cancelled"
     assert conversation["hosted_event_cursor"] == 1
+
+
+def test_mobile_interactive_card_event_types_are_registered():
+    """awaiting/supervisor/rework card events must pass protocol validation.
+
+    These are the only events the iOS client renders as interactive cards
+    (decision card, verdict card, rework chips). If they are not registered
+    the append raises instead of persisting, and the cards silently never
+    appear — regression guard for the C-2 incident.
+    """
+    conversation = _conversation()
+    for event_type in (
+        "awaiting.choice",
+        "supervisor.verdict",
+        "rework.started",
+        "rework.dispatched",
+    ):
+        result = append_hosted_event(
+            conversation,
+            conversation_id="chat-1",
+            turn_id="turn-1",
+            role_stage="worker",
+            event_type=event_type,
+            idempotency_key=f"card-{event_type}",
+        )
+        assert result.appended is True, event_type
+    assert conversation["hosted_event_cursor"] == 4
