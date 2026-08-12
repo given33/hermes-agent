@@ -5494,17 +5494,50 @@ def _normalize_manager_plan(
     }
 
 
+def _parse_slash_directive(content: str) -> tuple[str, str, str]:
+    """Detect a leading /plan or /goal directive in a user message.
+
+    Returns (directive, argument, content): directive is "" when the message
+    has no directive; content is the argument when one was supplied, else the
+    original message. /plan asks the manager to investigate and produce a
+    plan without dispatching workers; /goal sets the user's goal as the
+    highest-priority objective for the turn.
+    """
+    stripped = str(content or "").strip()
+    match = re.match(r"^/(plan|goal)\b[ \t]*([\s\S]*)", stripped, re.IGNORECASE)
+    if not match:
+        return "", "", stripped
+    directive = match.group(1).lower()
+    argument = match.group(2).strip()
+    return directive, argument, argument or stripped
+
+
 def _manager_plan_prompt(
     *,
     content: str,
     fallback_workers: list[str],
     attachment_context: str,
     artifact_required: bool,
+    goal_override: str = "",
+    plan_only: bool = False,
 ) -> str:
+    directive_lines: list[str] = []
+    if plan_only:
+        directive_lines.append(
+            "用户使用了 /plan 指令：本轮**只做调查与方案制定**。"
+            "输出完整方案后直接结束，绝不派发执行节点、绝不调用任务板创建执行任务；"
+            "方案本身就是最终交付物，写得更详尽一些。"
+        )
+    if goal_override:
+        directive_lines.append(
+            "用户刚刚通过 /goal 明确了目标（最高优先级，任务内容如与其冲突以目标为准）："
+            f"{goal_override}"
+        )
     return "\n".join(
         item
         for item in (
             "你是 Hermes Manager（调度员/规划者），是整个 agent team 的调度中枢。",
+            *directive_lines,
             "你的职责：完整理解用户任务 → 收集一切必要信息和问题（可以调用工具，"
             "也可以调用 delegate_task 派调查子代理去核实环境、统计、检索、验证文件/服务/数据）"
             "→ 输出一份可执行的完整方案。你不亲手执行任务，也不向用户生成最终答案。",
@@ -5558,6 +5591,67 @@ def _manager_plan_prompt(
         )
         if item
     )
+
+
+def _render_manager_plan_report(
+    manager_plan: dict[str, Any],
+    content: str,
+    argument: str,
+) -> str:
+    """Render the structured manager plan as the final /plan answer."""
+
+    sections: list[str] = []
+    sections.append(f"# 执行方案：{argument or summarize_task_title(content)}")
+    difficulty = str(manager_plan.get("difficulty") or "").strip()
+    reason = str(manager_plan.get("reason") or "").strip()
+    if difficulty or reason:
+        head = f"难度：{difficulty or '未标注'}"
+        if reason:
+            head += f"（{reason}）"
+        sections.append(head)
+    approach = str(manager_plan.get("approach") or "").strip()
+    if approach:
+        sections.append(f"## 整体方案\n\n{approach}")
+    requirements = str(manager_plan.get("task_requirements") or "").strip()
+    if requirements:
+        sections.append(f"## 任务要求\n\n{requirements}")
+    acceptance = manager_plan.get("acceptance_criteria")
+    if isinstance(acceptance, list) and acceptance:
+        sections.append(
+            "## 验收标准\n\n"
+            + "\n".join(
+                f"- {item}" for item in acceptance if str(item).strip()
+            )
+        )
+    elif str(acceptance or "").strip():
+        sections.append(f"## 验收标准\n\n{acceptance}")
+    test_plan = str(manager_plan.get("test_plan") or "").strip()
+    if test_plan:
+        sections.append(f"## 测试方案\n\n{test_plan}")
+    flow = manager_plan.get("flow")
+    if isinstance(flow, list) and flow:
+        sections.append(
+            "## 流程\n\n"
+            + "\n".join(
+                f"{index}. {item}"
+                for index, item in enumerate(flow, 1)
+                if str(item).strip()
+            )
+        )
+    plan_steps = manager_plan.get("plan")
+    if isinstance(plan_steps, list) and plan_steps:
+        lines: list[str] = []
+        for step in plan_steps:
+            if not isinstance(step, dict):
+                continue
+            label = str(step.get("title") or step.get("id") or "步骤")
+            assignee = str(step.get("assignee") or "").strip()
+            lines.append(f"- {label}" + (f"（{assignee}）" if assignee else ""))
+            objective = str(step.get("objective") or "").strip()
+            if objective:
+                lines.append(f"  - {objective}")
+        sections.append("## 执行步骤\n\n" + "\n".join(lines))
+    return "\n\n".join(sections)
 
 
 def _hosted_manager_plan_todo_snapshot(
@@ -13221,6 +13315,20 @@ def execute_hosted_workflow(
 
     content = str(run.get("content") or "").strip()
     title = str(run.get("title") or summarize_task_title(content))
+    # Hermes slash directives persisted on the run record at enqueue time
+    # (the router may rewrite route_metadata, so the record is authoritative).
+    slash_directive = str(
+        run.get("slash_command")
+        or (route_metadata.get("slash_command") if isinstance(route_metadata, dict) else "")
+        or ""
+    ).strip().lower()
+    slash_argument = str(
+        run.get("slash_argument")
+        or (route_metadata.get("slash_argument") if isinstance(route_metadata, dict) else "")
+        or ""
+    ).strip()
+    plan_only = slash_directive == "plan"
+    goal_override = slash_argument if slash_directive == "goal" else ""
     profiles = list(run.get("profiles") or ["default", "dbb3-worker", "reviewer"])
     ordered = collaboration_execution_order(profiles)
     fallback_worker_profiles = [
@@ -13270,6 +13378,8 @@ def execute_hosted_workflow(
                     fallback_workers=fallback_worker_profiles,
                     attachment_context=attachment_context,
                     artifact_required=artifact_required,
+                    goal_override=goal_override,
+                    plan_only=plan_only,
                 ),
                 hosted_intervention_context(
                     conversation_id,
@@ -13323,6 +13433,60 @@ def execute_hosted_workflow(
                 "stage": "dispatching",
             },
         )
+
+    if plan_only:
+        # /plan 模式：方案本身就是交付物。整理成最终答复并结束本轮，
+        # 不派发 worker，复用 reporter 阶段的完成持久化与推送路径。
+        plan_report = _render_manager_plan_report(manager_plan, content, slash_argument)
+        now = int(time.time() * 1000)
+        _persist_hosted_plan_snapshot(
+            conversation_id,
+            turn_id,
+            manager_plan,
+            stage="completed",
+            worker_statuses={},
+            reviewer_status="",
+            reviewer_result="",
+            reporter_status="completed",
+            final_status="completed",
+        )
+        persisted_run = _persist_hosted_turn(
+            conversation_id,
+            turn_id,
+            patch={
+                "reporter_result": plan_report,
+                "reporter_status": "completed",
+                "status": "completed",
+                "stage": "completed",
+                "completed_at": now,
+                "notification": _completion_notification_record(
+                    conversation_id,
+                    turn_id,
+                    "completed",
+                    plan_report,
+                ),
+            },
+            message={
+                "role": "assistant",
+                "name": _DBB3_MANAGER_PROFILE,
+                "content": plan_report,
+                "status": "completed",
+                "kind": "message",
+                "meta": {
+                    "role_stage": "reporter",
+                    "role_label": "Hermes · 方案",
+                    "collapse_activities": True,
+                    "final_report": True,
+                },
+            },
+        )
+        _schedule_persisted_terminal_notification(
+            conversation_id,
+            turn_id,
+            persisted_run,
+            fallback_result=plan_report,
+        )
+        return
 
     if manager_plan.get("plan"):
         _persist_hosted_plan_snapshot(
@@ -18501,11 +18665,16 @@ def enqueue_hosted_turn(
     if not turn_id:
         raise HTTPException(status_code=400, detail="turn_id is required")
     message_source = dict(payload.message or {})
-    message_content = _message_content_text(message_source)
-    if not message_content:
+    original_message_content = _message_content_text(message_source)
+    if not original_message_content:
         raise HTTPException(status_code=400, detail="消息不能为空")
     if str(message_source.get("role") or "user").strip().lower() != "user":
         raise HTTPException(status_code=422, detail="message.role must be user")
+    # Hermes slash directives: /plan (investigate + plan only, no dispatch)
+    # and /goal (set the turn goal as the highest-priority objective).
+    slash_directive, slash_argument, message_content = _parse_slash_directive(
+        original_message_content
+    )
     attachment_ids = list(
         dict.fromkeys(str(item).strip() for item in payload.attachment_ids)
     )
@@ -18520,6 +18689,16 @@ def enqueue_hosted_turn(
     # configured model reasoning policy remains enabled and is never changed
     # by this route decision.
     deterministic_route = classify_user_intent(message_content)
+    if slash_directive:
+        # /plan and /goal always route to the full manager workflow: the
+        # directive needs a planner, not a plain chat answer.
+        deterministic_route = {
+            "mode": "work",
+            "lock_level": "hard_work",
+            "source": "slash-directive",
+            "slash_command": slash_directive,
+            "slash_argument": slash_argument,
+        }
     fast_chat_prewarm = (
         str(deterministic_route.get("mode") or "").strip().lower() == "chat"
         and str(deterministic_route.get("lock_level") or "").strip().lower()
@@ -18768,7 +18947,7 @@ def enqueue_hosted_turn(
                 conversation,
                 role="user",
                 name=str(message_source.get("name") or "user"),
-                content=message_content,
+                content=original_message_content,
                 status=str(message_source.get("status") or "completed"),
                 kind=str(message_source.get("kind") or "message"),
                 meta=dict(message_source.get("meta") or {}),
@@ -18810,11 +18989,23 @@ def enqueue_hosted_turn(
                         "mode": "pending",
                         "lock_level": "pending",
                         "source": "route-outbox",
+                        "slash_command": slash_directive,
+                        "slash_argument": slash_argument,
                     }
                 ),
                 output_dir=str(output_dir),
                 attachment_ids=attachment_ids,
             )
+            if slash_directive:
+                # Persist the directive on the run record itself: the router
+                # may rewrite route_metadata, and the workflow must not lose
+                # the /plan // /goal semantics mid-routing.
+                hosted.update(
+                    {
+                        "slash_command": slash_directive,
+                        "slash_argument": slash_argument,
+                    }
+                )
             if hard_chat_route is not None:
                 routed_at = int(time.time() * 1000)
                 hosted.update(
