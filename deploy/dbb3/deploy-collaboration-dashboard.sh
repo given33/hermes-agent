@@ -2,7 +2,7 @@
 set -euo pipefail
 
 remote="${HERMES_DBB3_REMOTE:-dbb3-hermes}"
-version="2.1.46"
+version="2.1.49"
 repo="${HERMES_REPO:-$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)}"
 stage="/home/hermes/.hermes/deploy/collaboration-${version}"
 
