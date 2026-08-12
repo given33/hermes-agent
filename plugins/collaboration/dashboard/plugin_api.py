@@ -5489,6 +5489,8 @@ def _manager_plan_prompt(
             "→ 输出一份可执行的完整方案。你不亲手执行任务，也不向用户生成最终答案。",
             "调查自主判断：任务信息不足或需要核实外部状态时，先派 1-2 个 leaf 调查子代理收集信息，"
             "每个子代理用 name 给一个中文职业名（如“资料调查员”“环境核查员”），"
+            "并用 expected_output 写明要交付什么、acceptance_criteria 写明验收条件"
+            "（inherit_turns 保持 0，子代理用全新上下文）；"
             "把调查结论写进方案；信息已经足够时直接规划，不要为简单任务增加无谓延迟。"
             "调查子代理运行期间，用 subagent_list 查看其进展；"
             "发现方向偏离时用 subagent_send(subagent_id=..., text=...) 发送调整指令，"
@@ -6765,8 +6767,11 @@ def build_group_prompt(
             "不要向用户做最终总结，也不要替审阅者下结论。"
             "任务含可并行子步骤或需要独立调查时，可用 delegate_task 派 leaf 子代理"
             "并行执行（并发数量由你根据任务和节点资源自行判断），"
-            "每个子代理用 name 给中文职业名；运行中用 subagent_list 查看进展、"
-            "subagent_send 调整方向、subagent_kill 终止卡死的子代理并重新派出；"
+            "每个子代理用 name 给中文职业名，用 expected_output 写明交付物、"
+            "acceptance_criteria 写明验收条件（inherit_turns 保持 0、"
+            "context_variables 仅在需要跨子代理共享小状态时传递）；"
+            "运行中用 subagent_list 查看进展、subagent_send 调整方向、"
+            "subagent_kill 终止卡死的子代理并重新派出；"
             "子代理结果必须汇总进你的交接证据。"
             "方向或需求必须由用户拍板时用 kanban_block(kind=\"needs_input\") 提问，"
             "reason 用“问题 + 选项：A. ... B. ...”格式；能自行判断的不要打扰用户。"
@@ -11058,6 +11063,17 @@ def _positive_int(value: Any) -> Optional[int]:
     return parsed if parsed > 0 else None
 
 
+def _positive_int_or_none(value: Any) -> Optional[int]:
+    """Non-negative int or None (0 stays 0 — a fresh session at 0% is real)."""
+    if isinstance(value, bool):
+        return None
+    try:
+        parsed = int(value)
+    except (TypeError, ValueError, OverflowError):
+        return None
+    return parsed if parsed >= 0 else None
+
+
 def _nonnegative_int(value: Any, default: int = 0) -> int:
     if isinstance(value, bool):
         return default
@@ -11478,6 +11494,7 @@ def _remote_run_state_message(
         "activities": activities,
         "actual_model": str(remote_run.get("actual_model") or ""),
         "actual_provider": str(remote_run.get("actual_provider") or ""),
+        "context_used_percent": remote_run.get("context_used_percent"),
         "started_at": int(remote_run.get("started_at") or remote_run.get("created_at") or int(time.time() * 1000)),
         "completed_at": int(remote_run.get("completed_at") or 0) or None,
         "updated_at": int(remote_run.get("updated_at") or int(time.time() * 1000)),
@@ -15709,6 +15726,9 @@ def _apply_remote_checkpoint(
                 "error": str(payload.get("error") or "")[:4000],
                 "activities": _sanitize_remote_activities(payload.get("activities")),
                 "subagents": _sanitize_remote_subagents(payload.get("subagents")),
+                "context_used_percent": _positive_int_or_none(
+                    payload.get("context_used_percent")
+                ),
                 "updated_at": now,
             }
         )

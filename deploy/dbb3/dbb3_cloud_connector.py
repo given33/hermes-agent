@@ -1026,6 +1026,24 @@ def _tool_result_error(value: Any) -> str:
     return ""
 
 
+def _context_used_percent(record: dict[str, Any]) -> Optional[int]:
+    """Context-window usage percent for a session record, or None.
+
+    input_tokens / context_length * 100, rounded. Missing either field (or
+    a context_length of 0) returns None so clients render an honest "—"
+    instead of an estimate (pi Agent Hub's `usage —` principle).
+    """
+    try:
+        input_tokens = int(record.get("input_tokens") or 0)
+        context_length = int(record.get("context_length") or 0)
+    except (TypeError, ValueError):
+        return None
+    if context_length <= 0:
+        return None
+    percent = round(input_tokens * 100 / context_length)
+    return max(0, min(percent, 999))
+
+
 def _session_record_activities(
     record: dict[str, Any],
     *,
@@ -1690,6 +1708,12 @@ class DBB3CloudConnector:
                 profile=profile,
                 terminal=terminal,
             ),
+            # Context-window usage: how much of the model's context the
+            # worker's conversation currently occupies. The client renders
+            # this as a ring gauge next to the composer (OMC-style ctx%).
+            # context_length may be missing on legacy session rows — the
+            # field then reports None and the client shows an honest "—".
+            "context_used_percent": _context_used_percent(record),
         }
         with self._session_cache_lock:
             self._session_cache[remote_id] = {
@@ -2113,6 +2137,7 @@ class DBB3CloudConnector:
             "error": errors[-1] if errors else "",
             "activities": activities,
             "subagents": subagents,
+            "context_used_percent": session_snapshot.get("context_used_percent"),
             "remote_task_id": _text(local.get("remote_task_id"), 256),
             "root_task_id": _text(local.get("root_task_id"), 256),
             "session_id": _text(
