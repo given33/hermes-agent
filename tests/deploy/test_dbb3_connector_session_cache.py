@@ -136,8 +136,14 @@ def test_session_snapshot_cache_is_bounded_lru(tmp_path, monkeypatch):
         calls.append(session_id)
         return 0, json.dumps({"id": session_id, "model": "test-model"})
 
+    class _FakeCloudClient:
+        # The connector constructor starts a stream watcher thread against
+        # the cloud client; a fake only needs the entry point to exist.
+        def _stream_events(self, wake, stop):
+            stop.wait()
+
     connector = connector_module.DBB3CloudConnector(
-        object(),
+        _FakeCloudClient(),
         command_runner=command_runner,
         state_file=tmp_path / "checkpoint.json",
         artifact_roots=[tmp_path],

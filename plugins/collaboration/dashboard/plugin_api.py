@@ -337,7 +337,18 @@ class _ConversationExecutionLock:
 _HOSTED_CONVERSATION_LOCKS: dict[str, _ConversationExecutionLock] = {}
 _MOBILE_NOTIFICATION_DISPATCH_CONDITION = threading.Condition()
 _MOBILE_NOTIFICATION_DISPATCH_THREAD: Optional[threading.Thread] = None
-_MOBILE_NOTIFICATION_PENDING: dict[str, tuple[str, str, int]] = {}
+# kind ∈ {"completion", "awaiting"}: which persisted notification field to
+# deliver and how to build the push payload.
+_MOBILE_NOTIFICATION_PENDING: dict[str, tuple[str, str, int, str]] = {}
+# Conversation SSE presence: active hosted-events watchers per conversation.
+# While the user watches the turn live, loud pushes are suppressed; the
+# moment the stream drops (app backgrounded or killed) the dispatcher is
+# kicked and the pending notification fires within seconds.
+_CONVERSATION_SSE_PRESENCE: dict[str, int] = {}
+_CONVERSATION_SSE_PRESENCE_LOCK = threading.Lock()
+# Suppressed-online notifications re-check at this cadence while a watcher
+# stays connected.
+_NOTIFICATION_ONLINE_RECHECK_MS = 5_000
 _HOSTED_UPDATE_CONDITION = threading.Condition()
 _HOSTED_UPDATE_REVISION = 0
 _HOSTED_UPDATE_REVISIONS: dict[str, int] = {}
@@ -10142,16 +10153,24 @@ def _completion_notification_record(
     }
 
 
-def _schedule_mobile_completion_notification(
+def _schedule_mobile_notification(
     conversation_id: str,
     turn_id: str,
+    kind: str,
     status: str,
     result: str,
 ) -> None:
-    """Queue a persisted notification on the process-wide APNs dispatcher."""
+    """Queue a persisted notification on the process-wide APNs dispatcher.
+
+    kind="completion" delivers a task-completion push; kind="awaiting"
+    delivers a "needs your decision" push while the member parks on a
+    human question. Each kind has its own durable record so an awaiting
+    push followed by a completion push do not overwrite each other.
+    """
 
     global _MOBILE_NOTIFICATION_DISPATCH_THREAD
 
+    field = "notification" if kind == "completion" else "notification_awaiting"
     try:
         with _STATE_LOCK:
             state = load_single_state()
@@ -10160,7 +10179,7 @@ def _schedule_mobile_completion_notification(
             if not isinstance(run, dict):
                 return
             owner_id = str(conversation.get("owner_id") or "").strip()
-            notification = run.get("notification")
+            notification = run.get(field)
             if not isinstance(notification, dict):
                 notification = _completion_notification_record(
                     conversation_id,
@@ -10168,7 +10187,7 @@ def _schedule_mobile_completion_notification(
                     status,
                     result,
                 )
-                run["notification"] = notification
+                run[field] = notification
                 save_single_state(state)
             notification_state = str(notification.get("state") or "queued")
         if notification_state in _MOBILE_NOTIFICATION_TERMINAL_STATUSES:
@@ -10177,6 +10196,7 @@ def _schedule_mobile_completion_notification(
             _persist_notification_outcome(
                 conversation_id,
                 turn_id,
+                kind,
                 {
                     "state": "no_recipients",
                     "deliveries": {},
@@ -10184,7 +10204,7 @@ def _schedule_mobile_completion_notification(
                 },
             )
             return
-        key = f"{conversation_id}:{turn_id}"
+        key = f"{conversation_id}:{turn_id}:{kind}"
         due_at = max(
             int(time.time() * 1000),
             int(notification.get("next_attempt_at") or 0),
@@ -10196,6 +10216,7 @@ def _schedule_mobile_completion_notification(
                     conversation_id,
                     turn_id,
                     due_at,
+                    kind,
                 )
             if (
                 _MOBILE_NOTIFICATION_DISPATCH_THREAD is None
@@ -10212,6 +10233,72 @@ def _schedule_mobile_completion_notification(
             _MOBILE_NOTIFICATION_DISPATCH_CONDITION.notify()
     except Exception:
         # The persisted outbox remains available for startup replay.
+        return
+
+
+def _schedule_mobile_completion_notification(
+    conversation_id: str,
+    turn_id: str,
+    status: str,
+    result: str,
+) -> None:
+    """Queue a persisted task-completion notification (background exit UX)."""
+
+    _schedule_mobile_notification(conversation_id, turn_id, "completion", status, result)
+
+
+def _schedule_mobile_awaiting_notification(
+    conversation_id: str,
+    turn_id: str,
+    question: str,
+) -> None:
+    """Queue a "needs your decision" notification for a parked member.
+
+    The member asked the user a question and is waiting. If the app is in
+    the background this is the highest-priority signal — without it the
+    workflow parks silently until the user reopens the app.
+    """
+
+    _schedule_mobile_notification(
+        conversation_id,
+        turn_id,
+        "awaiting",
+        "awaiting",
+        str(question or "等待你的决定").strip()[:4000],
+    )
+
+
+def _cancel_pending_awaiting_notification(
+    conversation_id: str,
+    turn_id: str,
+) -> None:
+    """Retire an unanswered awaiting push: the member resumed (answer applied)."""
+
+    try:
+        with _STATE_LOCK:
+            state = load_single_state()
+            conversation = _conversation_by_id(state, conversation_id)
+            run = (conversation.get("hosted_turns") or {}).get(turn_id)
+            if not isinstance(run, dict):
+                return
+            notification = run.get("notification_awaiting")
+            if not isinstance(notification, dict):
+                return
+            if str(notification.get("state") or "queued") in _MOBILE_NOTIFICATION_TERMINAL_STATUSES:
+                return
+            now = int(time.time() * 1000)
+            run["notification_awaiting"] = {
+                **notification,
+                "state": "delivered",
+                "last_error": "awaiting_resolved",
+                "completed_at": now,
+                "updated_at": now,
+            }
+            save_single_state(state)
+        key = f"{conversation_id}:{turn_id}:awaiting"
+        with _MOBILE_NOTIFICATION_DISPATCH_CONDITION:
+            _MOBILE_NOTIFICATION_PENDING.pop(key, None)
+    except Exception:
         return
 
 
@@ -10246,9 +10333,57 @@ def _schedule_persisted_terminal_notification(
     )
 
 
+def _replay_persisted_mobile_notifications() -> None:
+    """Re-enqueue every durable non-terminal notification after a restart."""
+
+    try:
+        with _STATE_LOCK:
+            state = load_single_state()
+            for conversation in state.get("conversations") or []:
+                if not isinstance(conversation, dict):
+                    continue
+                conversation_id = str(conversation.get("id") or "")
+                if not conversation_id:
+                    continue
+                for turn_id, run in (conversation.get("hosted_turns") or {}).items():
+                    if not isinstance(run, dict):
+                        continue
+                    for field, kind in (
+                        ("notification", "completion"),
+                        ("notification_awaiting", "awaiting"),
+                    ):
+                        notification = run.get(field)
+                        if not isinstance(notification, dict):
+                            continue
+                        if (
+                            str(notification.get("state") or "queued")
+                            in _MOBILE_NOTIFICATION_TERMINAL_STATUSES
+                        ):
+                            continue
+                        key = f"{conversation_id}:{turn_id}:{kind}"
+                        due_at = max(
+                            int(time.time() * 1000),
+                            int(notification.get("next_attempt_at") or 0),
+                        )
+                        with _MOBILE_NOTIFICATION_DISPATCH_CONDITION:
+                            current = _MOBILE_NOTIFICATION_PENDING.get(key)
+                            if current is None or due_at < current[2]:
+                                _MOBILE_NOTIFICATION_PENDING[key] = (
+                                    conversation_id,
+                                    str(turn_id),
+                                    due_at,
+                                    kind,
+                                )
+        with _MOBILE_NOTIFICATION_DISPATCH_CONDITION:
+            _MOBILE_NOTIFICATION_DISPATCH_CONDITION.notify()
+    except Exception:
+        logger.exception("mobile notification replay failed")
+
+
 def _mobile_notification_dispatch_loop() -> None:
     """Deliver all persistent APNs jobs without allocating one thread per job."""
 
+    _replay_persisted_mobile_notifications()
     while True:
         # A hosted server can legitimately run without APNs credentials (for
         # example during local/self-hosted deployment). Keep the durable
@@ -10273,7 +10408,7 @@ def _mobile_notification_dispatch_loop() -> None:
                 _MOBILE_NOTIFICATION_PENDING.items(),
                 key=lambda item: item[1][2],
             )
-            conversation_id, turn_id, due_at = pending
+            conversation_id, turn_id, due_at, kind = pending
             remaining_ms = due_at - int(time.time() * 1000)
             if remaining_ms > 0:
                 _MOBILE_NOTIFICATION_DISPATCH_CONDITION.wait(
@@ -10283,9 +10418,10 @@ def _mobile_notification_dispatch_loop() -> None:
             _MOBILE_NOTIFICATION_PENDING.pop(key, None)
 
         try:
-            retry_delay_ms = _deliver_persisted_completion_notification(
+            retry_delay_ms = _deliver_persisted_notification(
                 conversation_id,
                 turn_id,
+                kind,
             )
         except Exception:
             retry_delay_ms = 60_000
@@ -10295,21 +10431,24 @@ def _mobile_notification_dispatch_loop() -> None:
                     conversation_id,
                     turn_id,
                     int(time.time() * 1000) + max(0, retry_delay_ms),
+                    kind,
                 )
                 _MOBILE_NOTIFICATION_DISPATCH_CONDITION.notify()
 
 
-def _deliver_persisted_completion_notification(
+def _deliver_persisted_notification(
     conversation_id: str,
     turn_id: str,
+    kind: str,
 ) -> Optional[int]:
+    field = "notification" if kind == "completion" else "notification_awaiting"
     with _STATE_LOCK:
         state = load_single_state()
         conversation = _conversation_by_id(state, conversation_id)
         run = (conversation.get("hosted_turns") or {}).get(turn_id)
         if not isinstance(run, dict):
             return None
-        notification = run.get("notification")
+        notification = run.get(field)
         if not isinstance(notification, dict):
             return None
         notification_state = str(notification.get("state") or "queued")
@@ -10326,17 +10465,35 @@ def _deliver_persisted_completion_notification(
             "attempts": int(notification.get("attempts") or 0) + 1,
             "updated_at": now,
         }
-        run["notification"] = claimed
+        run[field] = claimed
         save_single_state(state)
 
     if not owner_id:
         return _persist_notification_outcome(
             conversation_id,
             turn_id,
+            kind,
             {
                 "state": "no_recipients",
                 "deliveries": dict(claimed.get("deliveries") or {}),
                 "error": "notification_owner_missing",
+            },
+        )
+
+    # Presence suppression: while the owner watches this conversation live
+    # (hosted-events SSE open), a loud push is noise — the terminal state
+    # renders in-app. The moment the stream drops (app backgrounded/killed),
+    # _sse_presence_leave forces the due time to now and the dispatcher fires
+    # within seconds. This is the core of the background-exit completion UX.
+    if _has_active_sse_watcher(conversation_id):
+        return _persist_notification_outcome(
+            conversation_id,
+            turn_id,
+            kind,
+            {
+                "state": "retry",
+                "deliveries": dict(claimed.get("deliveries") or {}),
+                "error": "notification_suppressed_online",
             },
         )
 
@@ -10347,10 +10504,10 @@ def _deliver_persisted_completion_notification(
             current_run = (current_conversation.get("hosted_turns") or {}).get(turn_id)
             if not isinstance(current_run, dict):
                 return
-            current = current_run.get("notification")
+            current = current_run.get(field)
             if not isinstance(current, dict):
                 return
-            current_run["notification"] = {
+            current_run[field] = {
                 **current,
                 "deliveries": deliveries,
                 "updated_at": int(time.time() * 1000),
@@ -10358,41 +10515,69 @@ def _deliver_persisted_completion_notification(
             save_single_state(current_state)
 
     try:
-        from hermes_cli.dashboard_auth.mobile_notifications import (
-            deliver_task_completion_push,
-        )
+        if kind == "awaiting":
+            from hermes_cli.dashboard_auth.mobile_notifications import (
+                deliver_account_notification_push,
+            )
 
-        outcome = deliver_task_completion_push(
-            owner_id=owner_id,
-            conversation_id=conversation_id,
-            turn_id=turn_id,
-            status=str(claimed.get("task_status") or "completed"),
-            result=str(claimed.get("result") or ""),
-            collapse_id=str(claimed.get("collapse_id") or claimed.get("id") or ""),
-            previous_deliveries=dict(claimed.get("deliveries") or {}),
-            progress_callback=persist_progress,
-        )
+            outcome = deliver_account_notification_push(
+                owner_id=owner_id,
+                notification_id=(
+                    "awaiting:" + claimed.get("collapse_id", "turn")
+                )[:256],
+                title="Hermes 成员需要你的决定",
+                body=str(claimed.get("result") or "等待你的决定")[:180],
+                category="awaiting",
+                deep_link=(
+                    "hermes-agent://conversation/"
+                    f"{quote(conversation_id, safe='')}"
+                    f"?turn={quote(turn_id, safe='')}"
+                ),
+                data={
+                    "conversation_id": conversation_id,
+                    "turn_id": turn_id,
+                },
+                previous_deliveries=dict(claimed.get("deliveries") or {}),
+                progress_callback=persist_progress,
+            )
+        else:
+            from hermes_cli.dashboard_auth.mobile_notifications import (
+                deliver_task_completion_push,
+            )
+
+            outcome = deliver_task_completion_push(
+                owner_id=owner_id,
+                conversation_id=conversation_id,
+                turn_id=turn_id,
+                status=str(claimed.get("task_status") or "completed"),
+                result=str(claimed.get("result") or ""),
+                collapse_id=str(claimed.get("collapse_id") or claimed.get("id") or ""),
+                previous_deliveries=dict(claimed.get("deliveries") or {}),
+                progress_callback=persist_progress,
+            )
     except Exception as exc:
         outcome = {
             "state": "retry",
             "deliveries": dict(claimed.get("deliveries") or {}),
             "error": f"notification_delivery_failed:{type(exc).__name__}"[:240],
         }
-    return _persist_notification_outcome(conversation_id, turn_id, outcome)
+    return _persist_notification_outcome(conversation_id, turn_id, kind, outcome)
 
 
 def _persist_notification_outcome(
     conversation_id: str,
     turn_id: str,
+    kind: str,
     outcome: dict[str, Any],
 ) -> Optional[int]:
+    field = "notification" if kind == "completion" else "notification_awaiting"
     with _STATE_LOCK:
         state = load_single_state()
         conversation = _conversation_by_id(state, conversation_id)
         run = (conversation.get("hosted_turns") or {}).get(turn_id)
         if not isinstance(run, dict):
             return None
-        notification = run.get("notification")
+        notification = run.get(field)
         if not isinstance(notification, dict):
             return None
         now = int(time.time() * 1000)
@@ -10401,13 +10586,18 @@ def _persist_notification_outcome(
         next_attempt_at = 0
         retry_delay_ms: Optional[int] = None
         if outcome_state == "retry":
-            retry_delay_ms = _notification_retry_delay_ms(
-                int(notification.get("attempts") or 1)
-            )
-            if error == "apns_not_configured":
-                retry_delay_ms = 5 * 60 * 1000
+            if error == "notification_suppressed_online":
+                # The user is watching live: re-check on a short cadence so
+                # the push fires within seconds of the app going offline.
+                retry_delay_ms = _NOTIFICATION_ONLINE_RECHECK_MS
+            else:
+                retry_delay_ms = _notification_retry_delay_ms(
+                    int(notification.get("attempts") or 1)
+                )
+                if error == "apns_not_configured":
+                    retry_delay_ms = 5 * 60 * 1000
             next_attempt_at = now + retry_delay_ms
-        run["notification"] = {
+        run[field] = {
             **notification,
             "state": outcome_state,
             "deliveries": dict(outcome.get("deliveries") or {}),
@@ -10430,6 +10620,43 @@ def _persist_notification_outcome(
 def _notification_retry_delay_ms(attempts: int) -> int:
     exponent = max(0, min(int(attempts) - 1, 8))
     return min(60 * 60 * 1000, 15_000 * (2**exponent))
+
+
+def _has_active_sse_watcher(conversation_id: str) -> bool:
+    with _CONVERSATION_SSE_PRESENCE_LOCK:
+        return _CONVERSATION_SSE_PRESENCE.get(str(conversation_id or ""), 0) > 0
+
+
+def _sse_presence_enter(conversation_id: str) -> None:
+    with _CONVERSATION_SSE_PRESENCE_LOCK:
+        _CONVERSATION_SSE_PRESENCE[conversation_id] = (
+            _CONVERSATION_SSE_PRESENCE.get(conversation_id, 0) + 1
+        )
+
+
+def _sse_presence_leave(conversation_id: str) -> None:
+    """The last watcher dropped: fire any push suppressed while they watched."""
+
+    became_absent = False
+    with _CONVERSATION_SSE_PRESENCE_LOCK:
+        count = _CONVERSATION_SSE_PRESENCE.get(conversation_id, 0) - 1
+        if count <= 0:
+            _CONVERSATION_SSE_PRESENCE.pop(conversation_id, None)
+            became_absent = True
+        else:
+            _CONVERSATION_SSE_PRESENCE[conversation_id] = count
+    if not became_absent:
+        return
+    with _MOBILE_NOTIFICATION_DISPATCH_CONDITION:
+        for key, pending in list(_MOBILE_NOTIFICATION_PENDING.items()):
+            if pending[0] == conversation_id:
+                _MOBILE_NOTIFICATION_PENDING[key] = (
+                    pending[0],
+                    pending[1],
+                    0,
+                    pending[3],
+                )
+        _MOBILE_NOTIFICATION_DISPATCH_CONDITION.notify()
 
 
 def _hosted_update_revision(conversation_id: str = "") -> int:
@@ -15894,7 +16121,28 @@ def _apply_remote_checkpoint(
         save_single_state(state)
         persisted = dict(remote_run)
         role_label = f"{remote_run.get('profile') or role_key} · 执行"
+        schedule_awaiting_push = entered_awaiting
+        awaiting_question = (
+            _strip_choice_options(
+                str(payload.get("summary") or remote_run.get("summary") or "")
+            )
+            if entered_awaiting
+            else ""
+        )
+        resumed_from_awaiting = status == "running" and was_awaiting
     _notify_hosted_update(conversation_id)
+    if schedule_awaiting_push:
+        # Background-exit UX: a parked member is the highest-priority signal.
+        # If the app is open the dispatcher suppresses the push (presence);
+        # the moment it leaves, the push fires within seconds.
+        _schedule_mobile_awaiting_notification(
+            conversation_id,
+            turn_id,
+            awaiting_question,
+        )
+    elif resumed_from_awaiting or expected_terminal:
+        # The answer landed (or the run ended unanswered): retire the push.
+        _cancel_pending_awaiting_notification(conversation_id, turn_id)
     _remote_run_state_message(
         conversation_id,
         turn_id,
@@ -17712,8 +17960,19 @@ async def stream_hosted_conversation_events(
                 )
                 delivered_cursor = current_cursor
 
+    async def presence_tracked_stream():
+        # Track watcher presence so the APNs dispatcher suppresses pushes
+        # while the user watches live and fires them the moment the app
+        # leaves (background exit → instant completion notification).
+        _sse_presence_enter(conversation_id)
+        try:
+            async for frame in event_stream():
+                yield frame
+        finally:
+            _sse_presence_leave(conversation_id)
+
     return StreamingResponse(
-        event_stream(),
+        presence_tracked_stream(),
         media_type="text/event-stream",
         headers={
             "Cache-Control": "no-cache, no-transform",
