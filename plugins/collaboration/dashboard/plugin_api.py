@@ -635,6 +635,9 @@ _REMOTE_TERMINAL_STATUSES = {"completed", "failed", "cancelled", "timed_out"}
 _REMOTE_ARTIFACT_ACTIVE_STATUSES = {"leased", "running"}
 _REMOTE_RUN_LEASE_SECONDS = 60
 _REMOTE_CANCELLATION_GRACE_SECONDS = 60
+# While a worker is parked awaiting a human decision, its claim gets a longer
+# lease floor so a slow answer cannot expire the claim mid-conversation.
+_REMOTE_AWAITING_LEASE_SECONDS = 900
 # A connector that cannot pull a queued role must never hold a group turn in
 # ``dispatching`` forever. After this short hand-off window the server Hermes
 # runtime takes the same role and keeps the durable turn cancellable.
@@ -9402,41 +9405,6 @@ def _run_hosted_remote_role(
             remote,
             role_label=role_label,
         )
-        if entered_awaiting:
-            # Emit the choice card event once per awaiting transition.
-            try:
-                with _STATE_LOCK:
-                    state = load_single_state()
-                    conversation = _conversation_by_id(state, conversation_id)
-                    append_hosted_event(
-                        conversation,
-                        conversation_id=conversation_id,
-                        turn_id=turn_id,
-                        role_stage=str(remote_run.get("role_stage") or role_key),
-                        event_type="awaiting.choice",
-                        entity_id=f"awaiting:{remote_run_id}",
-                        idempotency_key=(
-                            f"awaiting-choice:{remote_run_id}:{cursor}"
-                        ),
-                        account_generation=_account_generation_for_owner(
-                            str(conversation.get("owner_id") or LOCAL_OWNER_ID)
-                        ),
-                        payload={
-                            "remote_run_id": str(remote_run_id),
-                            "profile": str(remote_run.get("profile") or ""),
-                            "question": str(
-                                payload.get("summary")
-                                or remote_run.get("summary")
-                                or ""
-                            )[:2000],
-                            "options": list(remote_run.get("choice_options") or []),
-                            "allow_custom": True,
-                        },
-                    )
-                    save_single_state(state)
-                    _notify_hosted_update(conversation_id)
-            except Exception:
-                logger.exception("awaiting.choice event failed")
 
     configured_fallback = _positive_int(
         os.environ.get("HERMES_REMOTE_FALLBACK_SECONDS")
@@ -11404,6 +11372,22 @@ def _parse_choice_options(text: str) -> list[dict[str, str]]:
         if len(options) >= 6:
             break
     return options
+
+
+def _strip_choice_options(text: str) -> str:
+    """Remove the trailing 选项：A./B./C. list from an awaiting-input reason.
+
+    The choice card renders the question separately from the tappable
+    options, so the question payload should not repeat the option list.
+    """
+    if not text:
+        return ""
+    kept: list[str] = []
+    for line in str(text).splitlines():
+        if re.match(r"^([A-Za-z])[.、．:：]\s*", line.strip()):
+            continue
+        kept.append(line)
+    return "\n".join(kept).strip()
 
 
 def _remote_run_state_message(
@@ -15606,6 +15590,14 @@ def _remote_run_for_connector(
 def _remote_run_connector_payload(remote_run: dict[str, Any]) -> dict[str, Any]:
     payload = _remote_run_public(remote_run)
     payload["remote_run_id"] = payload.pop("id", "")
+    # Durable steers ride along with the pull payload so an answer the user
+    # sent while the connector's SSE stream was down is still delivered on
+    # the next poll cycle.
+    pending_steers = remote_run.get("pending_steers")
+    if isinstance(pending_steers, list) and pending_steers:
+        payload["pending_steers"] = [
+            dict(item) for item in pending_steers if isinstance(item, dict)
+        ]
     return payload
 
 
@@ -15750,9 +15742,11 @@ def _apply_remote_checkpoint(
             )
             remote_run["lease_until"] = now + lease_seconds * 1000
             # The member resumed after an awaiting choice: clear the parked
-            # flags so a later needs_input can re-enter awaiting cleanly.
+            # flags so a later needs_input can re-enter awaiting cleanly, and
+            # drop durable steers — the answer was consumed.
             remote_run.pop("awaiting_input", None)
             remote_run.pop("choice_options", None)
+            remote_run.pop("pending_steers", None)
         was_awaiting = _coerce_flag(remote_run.get("awaiting_input"))
         if status == "awaiting_input":
             # Worker asked a human a question. Surface a choice card: parse
@@ -15763,11 +15757,47 @@ def _apply_remote_checkpoint(
                 str(payload.get("summary") or remote_run.get("summary") or "")
             )
             remote_run["choice_options"] = options
+            # Parked while a human decides: give the claim a floor far above
+            # the normal execution window so a long think time does not
+            # expire the claim before the answer arrives. The connector's
+            # pull cycle can still re-lease it if the user takes even longer.
+            remote_run["lease_until"] = now + max(
+                int(payload.get("lease_seconds") or _REMOTE_RUN_LEASE_SECONDS),
+                _REMOTE_AWAITING_LEASE_SECONDS,
+            ) * 1000
         entered_awaiting = (
             status == "awaiting_input" and not was_awaiting
         )
+        if entered_awaiting:
+            # Emit awaiting.choice exactly once per awaiting entry so the
+            # mobile client renders the decision card. The idempotency key is
+            # stable per remote run + cursor: connector retries of this same
+            # checkpoint dedupe, and a fresh question (new cursor, after the
+            # worker resumed and re-asked) emits a new card.
+            summary_text = str(
+                payload.get("summary") or remote_run.get("summary") or ""
+            )
+            append_hosted_event(
+                conversation,
+                conversation_id=conversation_id,
+                turn_id=turn_id,
+                role_stage=role_key,
+                event_type="awaiting.choice",
+                entity_id=f"awaiting:{remote_run_id}",
+                idempotency_key=f"awaiting-choice:{remote_run_id}:{cursor}",
+                account_generation=_account_generation_for_owner(
+                    str(conversation.get("owner_id") or LOCAL_OWNER_ID)
+                ),
+                payload={
+                    "question": _strip_choice_options(summary_text),
+                    "options": list(remote_run.get("choice_options") or []),
+                    "remote_run_id": str(remote_run.get("id") or ""),
+                    "profile": str(remote_run.get("profile") or role_key or ""),
+                },
+            )
         if expected_terminal:
             remote_run["completed_at"] = now
+            remote_run.pop("pending_steers", None)
             _seal_remote_run_claim(remote_run, now=now)
         if status == "cancelled":
             remote_run["cancel_requested"] = True
@@ -16193,7 +16223,13 @@ def connector_pull_runs(payload: ConnectorPullBody, request: Request):
                         continue
                     status = str(remote_run.get("status") or "queued")
                     old_lease = _nonnegative_int(remote_run.get("lease_until"))
-                    if status not in {"queued", "leased", "running"}:
+                    reawaken_awaiting = (
+                        status == "awaiting_input" and old_lease <= now
+                    )
+                    if (
+                        status not in {"queued", "leased", "running"}
+                        and not reawaken_awaiting
+                    ):
                         continue
                     if _coerce_flag(remote_run.get("cancel_requested")):
                         continue
@@ -16204,8 +16240,13 @@ def connector_pull_runs(payload: ConnectorPullBody, request: Request):
                             # A running item must remain visibly running while
                             # the connector renews its lease to poll terminal
                             # Kanban state. Only pre-ack work is marked leased.
+                            # An awaiting item whose lease lapsed keeps its
+                            # awaiting state: the mobile decision card stays
+                            # visible and the answer can still be delivered.
                             "status": (
-                                "running" if status == "running" else "leased"
+                                "awaiting_input"
+                                if reawaken_awaiting
+                                else ("running" if status == "running" else "leased")
                             ),
                             "lease_owner": connector_id,
                             "claim_token": secrets.token_urlsafe(32),
@@ -18985,15 +19026,31 @@ def intervene_hosted_turn(
                 if remote_status == "awaiting_input":
                     # The member asked the user a question and is parked in
                     # needs_input. The user's answer (choice or custom text)
-                    # steers the worker: push run.steer so the connector
-                    # unblocks the task with the answer injected as a
-                    # comment; the worker resumes with the decision.
+                    # steers the worker: persist the steer durably on the run
+                    # (survives a lost push / connector reconnect — the pull
+                    # payload re-delivers it), then push run.steer so the
+                    # connector unblocks the task with the answer injected as
+                    # a comment; the worker resumes with the decision.
+                    steer_id = f"steer_{uuid.uuid4().hex[:16]}"
+                    pending_steers = remote_run.get("pending_steers")
+                    if not isinstance(pending_steers, list):
+                        pending_steers = []
+                        remote_run["pending_steers"] = pending_steers
+                    pending_steers.append(
+                        {
+                            "id": steer_id,
+                            "text": content[:2000],
+                            "created_at": now,
+                        }
+                    )
+                    del pending_steers[:-8]
                     try:
                         _push_connector_event(
-                            str(remote_run.get("connector_id") or connector_id),
+                            _remote_run_connector_id(remote_run),
                             {
                                 "type": "run.steer",
                                 "remote_run_id": remote_id,
+                                "steer_id": steer_id,
                                 "text": content[:2000],
                             },
                         )

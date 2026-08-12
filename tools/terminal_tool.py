@@ -2976,6 +2976,18 @@ def terminal_tool(
                 desc = approval.get("description", "flagged as dangerous")
                 approval_note = f"Command was flagged ({desc}) and auto-approved by smart approval."
 
+        # High-risk backup: commands run with full access by default, so
+        # snapshot destructive targets BEFORE execution — the user can
+        # recover later without an approval round-trip. Local sessions only
+        # (the paths resolve on this machine); best-effort, never blocks.
+        risk_backup = None
+        if env_type == "local":
+            try:
+                from tools.risk_backup import backup_risky_command
+                risk_backup = backup_risky_command(command, guard_cwd)
+            except Exception:
+                logger.exception("pre-exec risk backup failed")
+
         # Prepare command for execution
         pty_disabled_reason = None
         effective_pty = pty
@@ -3032,6 +3044,8 @@ def terminal_tool(
                 # cannot occur here and this note never co-occurs with rc=130.
                 if approval_note:
                     result_data["approval"] = approval_note
+                if risk_backup:
+                    result_data["risk_backup"] = risk_backup
                 if pty_disabled_reason:
                     result_data["pty_note"] = pty_disabled_reason
 
@@ -3491,6 +3505,8 @@ def terminal_tool(
                     result_dict["approval"] = approval_note.rstrip(".") + ", then interrupted."
                 else:
                     result_dict["approval"] = approval_note
+            if risk_backup:
+                result_dict["risk_backup"] = risk_backup
             if exit_note:
                 result_dict["exit_code_meaning"] = exit_note
             if failure_hint:

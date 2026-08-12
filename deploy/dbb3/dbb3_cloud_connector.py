@@ -2479,6 +2479,17 @@ class DBB3CloudConnector:
             local = (state.get("runs") or {}).get(remote_id)
             if not isinstance(local, dict) or not local.get("root_task_id"):
                 continue
+            # Dedupe by steer id so a steer delivered both over SSE and via
+            # the durable pull payload unblocks exactly once.
+            steer_id = _text(event.get("steer_id"), 64) or hashlib.sha256(
+                f"{remote_id}\n{text}".encode("utf-8")
+            ).hexdigest()[:16]
+            applied_ids = local.get("applied_steer_ids")
+            if not isinstance(applied_ids, list):
+                applied_ids = []
+                local["applied_steer_ids"] = applied_ids
+            if steer_id in applied_ids:
+                continue
             root_id = _text(local.get("root_task_id"), 256)
             profile = _text(local.get("execution_profile"), 128)
             code, output = self.command_runner(
@@ -2494,6 +2505,8 @@ class DBB3CloudConnector:
             )
             if code != 0:
                 continue
+            applied_ids.append(steer_id)
+            del applied_ids[:-32]
             local["status"] = "unblocked"
             applied += 1
         if applied:
@@ -2581,6 +2594,15 @@ class DBB3CloudConnector:
             remote_id = _text(run_payload.get("remote_run_id"), 256)
             if remote_id:
                 processed.add(remote_id)
+            # Durable steers ride on the pull payload: if the SSE push was
+            # lost (stream down, server restart), the answer still arrives
+            # here and gets applied by _drain_steers below.
+            pending_steers = run_payload.get("pending_steers")
+            if isinstance(pending_steers, list) and pending_steers:
+                with self._pending_steers_lock:
+                    for steer in pending_steers:
+                        if isinstance(steer, dict):
+                            self._pending_steers.append(dict(steer))
             try:
                 made, uploaded = self._process_run(run_payload, state)
             except RuntimeError as exc:
