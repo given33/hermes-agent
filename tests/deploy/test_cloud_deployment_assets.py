@@ -1471,6 +1471,8 @@ def test_deleted_account_remote_run_fails_without_local_execution(tmp_path, monk
         "statuses": 1,
         "artifacts": 0,
         "cancelled": 0,
+        "steered": 0,
+        "terminal_pushed": 0,
     }
     assert commands == []
     assert len(cloud.failures) == 1
@@ -1927,6 +1929,13 @@ def test_connector_cancellation_advances_the_server_cursor_and_requires_terminal
 
     assert instance._process_cancellation(item, state) == 0
     assert commands[0] == [
+        "hermes",
+        "kanban",
+        "show",
+        "task-cancel",
+        "--json",
+    ]
+    assert commands[1] == [
         "hermes",
         "kanban",
         "block",

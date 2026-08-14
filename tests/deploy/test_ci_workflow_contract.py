@@ -4,10 +4,11 @@ from pathlib import Path
 WORKFLOW = Path(__file__).parents[2] / ".github" / "workflows" / "ci.yml"
 
 
-def test_all_checks_gate_requires_docker_and_rejects_nonterminal_results():
+def test_all_checks_gate_uses_independent_docker_workflow_and_rejects_nonterminal_results():
     workflow = WORKFLOW.read_text(encoding="utf-8")
 
-    assert "      - docker\n" in workflow
+    assert "      - docker\n" not in workflow
+    assert "The image build runs in its own workflow (docker.yml)" in workflow
     assert "info['result'] not in ('success', 'skipped')" in workflow
     assert "required job(s) did not pass" in workflow
 

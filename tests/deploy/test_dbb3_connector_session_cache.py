@@ -100,12 +100,17 @@ def test_content_length_parser_rejects_invalid_headers():
 
 
 def test_main_once_returns_failure_for_transient_sync_error(tmp_path, monkeypatch):
+    closed = []
+
     class FailingConnector:
         def __init__(self, *_args, **_kwargs):
             pass
 
         def sync_once(self):
             raise OSError("cloud unavailable")
+
+        def close(self):
+            closed.append(True)
 
     monkeypatch.setattr(connector_module, "_load_token", lambda _path: "token")
     monkeypatch.setattr(connector_module, "DBB3CloudConnector", FailingConnector)
@@ -121,11 +126,39 @@ def test_main_once_returns_failure_for_transient_sync_error(tmp_path, monkeypatc
         )
         == 75
     )
+    assert closed == [True]
 
 
 def test_main_rejects_non_finite_interval():
     with pytest.raises(SystemExit):
         connector_module.main(["--cloud-url", "https://example.test", "--interval", "inf"])
+
+
+def test_connector_keeps_polling_when_event_stream_is_unavailable(tmp_path):
+    connector = connector_module.DBB3CloudConnector(
+        object(),
+        state_file=tmp_path / "checkpoint.json",
+        artifact_roots=[tmp_path],
+    )
+    assert connector._stream_thread is None
+    connector.close()
+
+
+def test_connector_routes_stream_steers_to_its_owned_queue(tmp_path):
+    event = {"type": "run.steer", "remote_run_id": "run-1", "message": "continue"}
+
+    class _StreamingCloudClient:
+        def _stream_events(self, wake, stop, on_steer):
+            on_steer(event)
+
+    connector = connector_module.DBB3CloudConnector(
+        _StreamingCloudClient(),
+        state_file=tmp_path / "checkpoint.json",
+        artifact_roots=[tmp_path],
+    )
+    assert connector._wake_event.wait(timeout=1)
+    assert connector._pending_steers == [event]
+    connector.close()
 
 
 def test_session_snapshot_cache_is_bounded_lru(tmp_path, monkeypatch):
@@ -173,3 +206,4 @@ def test_session_snapshot_cache_is_bounded_lru(tmp_path, monkeypatch):
 
     assert list(connector._session_cache) == ["remote-one", "remote-three"]
     assert calls == ["one", "two", "three"]
+    connector.close()

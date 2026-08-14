@@ -13,6 +13,7 @@ from __future__ import annotations
 import argparse
 from collections import OrderedDict
 import hashlib
+import inspect
 import json
 import math
 import os
@@ -380,7 +381,12 @@ class CloudRelayClient:
             if isinstance(body, _FileBody):
                 body.close()
 
-    def _stream_events(self, wake: threading.Event, stop: threading.Event) -> None:
+    def _stream_events(
+        self,
+        wake: threading.Event,
+        stop: threading.Event,
+        on_steer: Callable[[dict[str, Any]], None] | None = None,
+    ) -> None:
         """Long-lived SSE subscription to /connector/stream.
 
         The server pushes run.created / run.terminal events; each event sets
@@ -418,8 +424,8 @@ class CloudRelayClient:
                                 # sent a steer): unblock the local task with
                                 # the answer injected as a comment so the
                                 # worker continues with the decision.
-                                with self._pending_steers_lock:
-                                    self._pending_steers.append(dict(event))
+                                if on_steer is not None:
+                                    on_steer(dict(event))
                                 wake.set()
             except Exception:
                 pass
@@ -1444,12 +1450,7 @@ class DBB3CloudConnector:
         self.artifact_roots = [Path(root).expanduser().resolve() for root in roots if str(root).strip()]
         self._wake_event = threading.Event()
         self._stream_stop = threading.Event()
-        threading.Thread(
-            target=self.cloud_client._stream_events,
-            args=(self._wake_event, self._stream_stop),
-            name="connector-stream",
-            daemon=True,
-        ).start()
+        self._stream_thread: threading.Thread | None = None
         private_artifact_root = self.attachment_root.resolve()
         if private_artifact_root not in self.artifact_roots:
             self.artifact_roots.append(private_artifact_root)
@@ -1461,6 +1462,39 @@ class DBB3CloudConnector:
             or os.environ.get("HERMES_CONNECTOR_CANCEL_COMMAND", "").strip()
             or _DEFAULT_CANCEL_COMMAND
         )
+        stream_events = getattr(self.cloud_client, "_stream_events", None)
+        if callable(stream_events):
+            stream_args: tuple[Any, ...] = (self._wake_event, self._stream_stop)
+            try:
+                inspect.signature(stream_events).bind(
+                    self._wake_event,
+                    self._stream_stop,
+                    self._queue_steer,
+                )
+            except (TypeError, ValueError):
+                pass
+            else:
+                stream_args = (*stream_args, self._queue_steer)
+            self._stream_thread = threading.Thread(
+                target=stream_events,
+                args=stream_args,
+                name="connector-stream",
+                daemon=True,
+            )
+            self._stream_thread.start()
+
+    def _queue_steer(self, event: dict[str, Any]) -> None:
+        with self._pending_steers_lock:
+            self._pending_steers.append(dict(event))
+        self._wake_event.set()
+
+    def close(self, timeout: float = 2.0) -> None:
+        """Stop the optional event stream without blocking connector shutdown."""
+        self._stream_stop.set()
+        self._wake_event.set()
+        thread = self._stream_thread
+        if thread is not None and thread is not threading.current_thread():
+            thread.join(timeout=max(0.0, timeout))
 
     def _build_cancel_command(
         self,
@@ -2761,6 +2795,11 @@ def main(argv: list[str] | None = None) -> int:
         artifact_roots=roots,
         cancel_command=args.cancel_command or None,
     )
+
+    def finish(exit_code: int) -> int:
+        connector.close()
+        return exit_code
+
     while True:
         try:
             result = connector.sync_once()
@@ -2773,7 +2812,7 @@ def main(argv: list[str] | None = None) -> int:
                 print(json.dumps({"timestamp": now_iso(), **result}, ensure_ascii=False), flush=True)
         except ConnectorAuthError as exc:
             print(json.dumps({"timestamp": now_iso(), "error": "cloud authentication failed"}), flush=True)
-            return 78
+            return finish(78)
         except ConnectorContractError as exc:
             # A service restart window can surface a 5xx error page instead of
             # the expected JSON contract. Treat 5xx contract failures as
@@ -2781,25 +2820,25 @@ def main(argv: list[str] | None = None) -> int:
             if exc.status in (500, 502, 503, 504):
                 print(json.dumps({"timestamp": now_iso(), "error": f"connector temporary contract failure ({exc.status})"}), flush=True)
                 if args.once:
-                    return 75
+                    return finish(75)
             else:
                 print(json.dumps({"timestamp": now_iso(), "error": f"connector contract error ({exc.status})"}), flush=True)
-                return 65
+                return finish(65)
         except CloudHTTPError as exc:
             # 5xx responses are transient and leave the checkpoint pending;
             # auth/contract failures are handled above and stop the unit.
             if exc.status < 500:
                 print(json.dumps({"timestamp": now_iso(), "error": f"cloud request failed ({exc.status})"}), flush=True)
-                return 65
+                return finish(65)
             print(json.dumps({"timestamp": now_iso(), "error": f"cloud temporary failure ({exc.status})"}), flush=True)
             if args.once:
-                return 75
+                return finish(75)
         except (OSError, urllib.error.URLError, json.JSONDecodeError, ValueError, RuntimeError) as exc:
             print(json.dumps({"timestamp": now_iso(), "error": f"{type(exc).__name__}: {_text(exc, 500)}"}), flush=True)
             if args.once:
-                return 75
+                return finish(75)
         if args.once:
-            return 0
+            return finish(0)
         # Wait for the poll interval or an SSE push (run.created / terminal)
         # that signals work may be waiting, then clear and poll again.
         connector._wake_event.wait(timeout=max(0.5, args.interval))
