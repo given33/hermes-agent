@@ -22,7 +22,7 @@ PLUGIN_DIR = REPO_ROOT / "plugins" / "observability" / "langfuse"
 class TestManifest:
 
     def test_manifest_fields(self):
-        data = yaml.safe_load((PLUGIN_DIR / "plugin.yaml").read_text())
+        data = yaml.safe_load((PLUGIN_DIR / "plugin.yaml").read_text(encoding="utf-8"))
         assert data["name"] == "langfuse"
         assert data["version"]
         # All six hooks the plugin implements.

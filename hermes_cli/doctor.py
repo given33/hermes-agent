@@ -111,7 +111,9 @@ def _hermes_database_paths(hermes_home: Path) -> list[tuple[str, Path]]:
     ]
     # Non-default kanban boards each keep their own kanban.db.
     for board_db in sorted((hermes_home / "kanban" / "boards").glob("*/kanban.db")):
-        entries.append((str(board_db.relative_to(hermes_home)), board_db))
+        # Display paths use the protocol-independent slash form so doctor
+        # output and tests are stable on Windows as well as POSIX hosts.
+        entries.append((board_db.relative_to(hermes_home).as_posix(), board_db))
     return entries
 
 

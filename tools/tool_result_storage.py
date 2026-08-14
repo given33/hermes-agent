@@ -21,11 +21,13 @@ Defense against context-window overflow operates at three levels:
 """
 
 import hashlib
+import json
 import logging
 import os
 import re
 import shlex
 import uuid
+from typing import Any
 
 from hermes_runtime.session_context import get_session_env
 from hermes_services import internal_hooks, tool_contract, tool_output_artifacts
@@ -43,6 +45,24 @@ HEREDOC_MARKER = "HERMES_PERSIST_EOF"
 _BUDGET_TOOL_NAME = "__budget_enforcement__"
 _UNSAFE_RESULT_FILENAME_CHARS = re.compile(r"[^A-Za-z0-9_.-]+")
 _MAX_RESULT_FILENAME_STEM = 120
+
+
+def _canonical_tool_result_text(content: Any) -> str:
+    """Normalize structured tool output before string-only runtime hooks."""
+    if isinstance(content, str):
+        return content
+    if content is None:
+        return ""
+    try:
+        return json.dumps(
+            content,
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+            default=str,
+        )
+    except (TypeError, ValueError, OverflowError):
+        return str(content)
 
 
 def _resolve_storage_dir(env) -> str:
@@ -150,7 +170,7 @@ def _build_persisted_message(
 
 
 def maybe_persist_tool_result(
-    content: str,
+    content: Any,
     tool_name: str,
     tool_use_id: str,
     env=None,
@@ -166,7 +186,7 @@ def maybe_persist_tool_result(
     active execution backend can read the full result during the same run.
 
     Args:
-        content: Raw tool result string.
+        content: Raw tool result. Structured values become canonical JSON.
         tool_name: Name of the tool (used for threshold lookup).
         tool_use_id: Unique ID for this tool call (used as filename).
         env: The active BaseEnvironment instance, or None.
@@ -177,6 +197,7 @@ def maybe_persist_tool_result(
     Returns:
         Original content if small, or <persisted-output> replacement.
     """
+    content = _canonical_tool_result_text(content)
     if apply_hooks:
         hook_result = internal_hooks.run_internal_hooks(
             "after_tool_result",

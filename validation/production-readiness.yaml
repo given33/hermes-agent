@@ -1,0 +1,101 @@
+schema_version: "1.0"
+status: local_validation_ready_production_authorization_required
+
+visual_mcp:
+  provider_id: hermes-visual-evidence
+  executable: C:\Users\given\hermes-audit\hermes-agent\.venv\Scripts\python.exe
+  module: hermes_cli.visual_evidence_mcp
+  transport: stdio
+  root: C:\Users\given\hermes-audit\validation-targets\visual
+  scopes:
+    - visual:read
+  mutating_operations: false
+  upstream_endpoint: not_configured
+
+rea_provider:
+  provider_id: rea-local-readonly
+  executable: C:\Users\given\hermes-audit\hermes-agent\.venv\Scripts\python.exe
+  module: hermes_cli.rea_mcp_server
+  transport: stdio
+  root: C:\Users\given\hermes-audit\validation-targets\rea
+  scopes:
+    - artifact:read
+    - reverse_engineering:read
+  execute_artifact: false
+  extract_artifact: false
+  upstream_endpoint: not_verified
+
+irreversible_side_effects:
+  mode: local_sandbox_only
+  production_enabled: false
+  root: C:\Users\given\hermes-audit\validation-targets\side-effects
+  allowlist:
+    - operation_id: validation.append_irreversible_record
+      target: irreversible-ledger.jsonl
+      classification: irreversible
+      approval_subject: hermes-validation-irreversible-sandbox
+    - operation_id: validation.write_compensatable_record
+      target: compensatable-ledger.jsonl
+      classification: compensatable
+      approval_subject: hermes-validation-compensatable-sandbox
+  approval:
+    exact_operation_and_target: true
+    approver_required: true
+    expires_at_required: true
+    single_use: true
+  forbidden_targets:
+    - payment
+    - email
+    - remote_delete
+    - production_deploy
+
+deployment_control:
+  mode: local_validation_only
+  executable: C:\Users\given\hermes-audit\hermes-agent\.venv\Scripts\python.exe
+  controller: hermes_runtime.composability.validation_deployment.ValidationDeploymentController
+  root: C:\Users\given\hermes-audit\validation-targets\deployment
+  strategy: blue_green_pointer_switch
+  health_gate: required
+  artifact_digest: required
+  drain_deadline_seconds: 30
+  local_rollback_owner: local-validation-operator
+  production:
+    status: blocked
+    controller: deploy/public/deploy-collaboration-backend.sh
+    default_remote: admin@10.66.0.1
+    required_environment:
+      - HERMES_SSH_IDENTITY
+      - HERMES_SSH_KNOWN_HOSTS
+      - HERMES_RELEASE_COMMIT
+      - HERMES_PUBLIC_REMOTE
+    authorized_control_path: not_configured
+    required_before_enable:
+      - deployment_target
+      - authenticated_control_channel
+      - least_privilege_deploy_identity
+      - health_endpoint
+      - rollback_owner
+      - change_window
+
+soak:
+  mode: local_validation_only
+  default_duration_hours: 2
+  stop_policy:
+    max_consecutive_errors: 3
+    stop_on_provider_generation_change: true
+    stop_on_structured_failure: true
+    stop_on_unclosed_session: true
+    stop_on_artifact_digest_mismatch: true
+    operator_interrupt: graceful_session_close
+  monitor_targets:
+    - mcp_initialize_success
+    - tools_list_success
+    - tool_call_success_rate
+    - provider_id_and_generation
+    - p95_latency
+    - consecutive_errors
+    - session_close_success
+    - drain_deadline_and_inflight_count
+  rollback:
+    local_owner: local-validation-operator
+    production_owner: required_before_production_soak

@@ -27,6 +27,7 @@ from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Set
 
 from hermes_services import tool_contract, tool_isolation
+from hermes_runtime.capabilities import normalize_capability_tags, normalize_role_names
 
 logger = logging.getLogger(__name__)
 
@@ -208,12 +209,15 @@ class ToolEntry:
     __slots__ = (
         "name", "toolset", "schema", "handler", "check_fn",
         "requires_env", "is_async", "description", "emoji",
-        "max_result_size_chars", "dynamic_schema_overrides",
+        "max_result_size_chars", "dynamic_schema_overrides", "effect_metadata",
+        "prompt_guidance", "capability_tags", "allowed_roles",
     )
 
     def __init__(self, name, toolset, schema, handler, check_fn,
                  requires_env, is_async, description, emoji,
-                 max_result_size_chars=None, dynamic_schema_overrides=None):
+                 max_result_size_chars=None, dynamic_schema_overrides=None,
+                 effect_metadata=None, prompt_guidance=None,
+                 capability_tags=None, allowed_roles=None):
         self.name = name
         self.toolset = toolset
         self.schema = schema
@@ -232,6 +236,56 @@ class ToolEntry:
         # on every get_definitions() call; results are merged shallow on top
         # of the base schema before the {"type": "function", ...} wrap.
         self.dynamic_schema_overrides = dynamic_schema_overrides
+        self.effect_metadata = _normalize_tool_effect_metadata(effect_metadata)
+        if prompt_guidance is not None and not isinstance(prompt_guidance, str):
+            raise TypeError("prompt_guidance must be text")
+        self.prompt_guidance = str(prompt_guidance or "").strip()
+        self.capability_tags = normalize_capability_tags(capability_tags)
+        self.allowed_roles = normalize_role_names(allowed_roles)
+
+
+_TOOL_EFFECT_DURABILITIES = frozenset({
+    "in_memory", "local_durable", "remote_durable", "external",
+})
+_TOOL_EFFECT_REVERSIBILITY = frozenset({
+    "reversible", "compensatable", "irreversible", "unknown",
+})
+
+
+def _normalize_tool_effect_metadata(value: Any) -> dict[str, Any]:
+    """Validate the auditable side-effect contract attached to a tool."""
+
+    if value is None:
+        return {}
+    if not isinstance(value, dict):
+        raise TypeError("effect_metadata must be a dictionary")
+    allowed = {
+        "durability", "external_boundary", "reversibility", "compensation",
+        "approval", "idempotency_key", "resource_class",
+    }
+    unknown = set(value) - allowed
+    if unknown:
+        raise ValueError(
+            "effect_metadata contains unsupported field(s): "
+            + ", ".join(sorted(str(item) for item in unknown))
+        )
+    normalized = dict(value)
+    string_fields = (
+        "durability", "external_boundary", "reversibility", "approval",
+        "idempotency_key", "resource_class",
+    )
+    for key in string_fields:
+        if key in normalized and not isinstance(normalized[key], str):
+            raise TypeError(f"effect_metadata.{key} must be a string")
+    if normalized.get("durability") not in {None, *_TOOL_EFFECT_DURABILITIES}:
+        raise ValueError("effect_metadata.durability is invalid")
+    if normalized.get("reversibility") not in {None, *_TOOL_EFFECT_REVERSIBILITY}:
+        raise ValueError("effect_metadata.reversibility is invalid")
+    if "compensation" in normalized and not isinstance(
+        normalized["compensation"], (str, list, tuple)
+    ):
+        raise TypeError("effect_metadata.compensation must be text or a sequence")
+    return normalized
 
 
 class ToolRegistryResolutionError(RuntimeError):
@@ -278,6 +332,7 @@ _PARENT_RUNTIME_TOOLSETS = frozenset({
     "browser-cdp",
     "computer_use",
     "terminal",
+    "desktop_ui",
 })
 
 
@@ -585,6 +640,13 @@ class ToolRegistry:
             "dynamic_schema_module": getattr(dynamic, "__module__", "") if dynamic else "",
             "dynamic_schema_qualname": getattr(dynamic, "__qualname__", "") if dynamic else "",
             "dynamic_schema_identity": id(dynamic) if dynamic else 0,
+            "effect_metadata": entry.effect_metadata,
+            # Model-facing guidance is part of the tool contract.  A plugin
+            # reload that changes guidance must invalidate the same contract
+            # snapshot as a schema or handler change.
+            "prompt_guidance": entry.prompt_guidance,
+            "capability_tags": sorted(entry.capability_tags),
+            "allowed_roles": sorted(entry.allowed_roles),
         }
         encoded = json.dumps(
             payload,
@@ -815,6 +877,10 @@ class ToolRegistry:
         max_result_size_chars: int | float | None = None,
         dynamic_schema_overrides: Callable = None,
         override: bool = False,
+        effect_metadata: dict | None = None,
+        prompt_guidance: str | None = None,
+        capability_tags: Set[str] | List[str] | None = None,
+        allowed_roles: Set[str] | List[str] | None = None,
     ):
         """Register a tool.  Called at module-import time by each tool file.
 
@@ -874,6 +940,10 @@ class ToolRegistry:
                 emoji=emoji,
                 max_result_size_chars=max_result_size_chars,
                 dynamic_schema_overrides=dynamic_schema_overrides,
+                effect_metadata=effect_metadata,
+                prompt_guidance=prompt_guidance,
+                capability_tags=capability_tags,
+                allowed_roles=allowed_roles,
             )
             # Availability is now derived per-tool (_toolset_has_exposable_tools),
             # so this map no longer gates a toolset. It is still consumed by
@@ -1003,6 +1073,52 @@ class ToolRegistry:
                         name, exc,
                     )
             result.append({"type": "function", "function": schema_with_name})
+        return result
+
+    def get_prompt_guidance(self, tool_names: Set[str]) -> Dict[str, str]:
+        """Return model guidance owned by the visible capability entries."""
+
+        entries = {entry.name: entry for entry in self._snapshot_entries()}
+        return {
+            name: entries[name].prompt_guidance
+            for name in sorted(tool_names)
+            if name in entries and entries[name].prompt_guidance
+        }
+
+    def get_capability_metadata(self, tool_names: Set[str] | None = None) -> Dict[str, dict]:
+        """Return capability tags and role visibility without exposing handlers."""
+
+        names = self.get_all_tool_names() if tool_names is None else set(tool_names)
+        return {
+            entry.name: {
+                "toolset": entry.toolset,
+                "capability_tags": sorted(entry.capability_tags),
+                "allowed_roles": sorted(entry.allowed_roles),
+                "effect_metadata": dict(entry.effect_metadata),
+            }
+            for entry in self._snapshot_entries()
+            if entry.name in names
+        }
+
+    def get_tool_names_for_role(self, role: str, tool_names: Set[str] | None = None) -> Set[str]:
+        """Filter a visible set for a collaboration role.
+
+        Untagged legacy tools remain visible; only explicitly tagged tools are
+        narrowed during the migration window.
+        """
+
+        from hermes_runtime.capabilities import role_allows
+
+        names = self.get_all_tool_names() if tool_names is None else set(tool_names)
+        result: Set[str] = set()
+        for entry in self._snapshot_entries():
+            if entry.name not in names:
+                continue
+            if not entry.capability_tags and not entry.allowed_roles:
+                result.add(entry.name)
+                continue
+            if role_allows(role, entry.capability_tags, explicit_roles=entry.allowed_roles):
+                result.add(entry.name)
         return result
 
     # ------------------------------------------------------------------

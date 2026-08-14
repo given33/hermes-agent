@@ -3029,10 +3029,24 @@ def _(rid, params: dict) -> dict:
         _get_max_spawn_depth,
     )
 
+    _invoking_session, err = _sess_nowait(params, rid)
+    if err:
+        return err
+    invoking_session_id = str(params.get("session_id") or "").strip()
+    invoking_transport, invoking_record = _current_session_steer_authority(
+        invoking_session_id
+    )
+    if invoking_transport is None or invoking_record is None:
+        return _err(rid, 4003, "session authority unavailable")
     return _ok(
         rid,
         {
-            "active": list_active_subagents(),
+            "active": list_active_subagents(
+                owner_session_id=invoking_session_id,
+                owner_transport=invoking_transport,
+                owner_session_record=invoking_record,
+                include_control_fields=True,
+            ),
             "paused": is_spawn_paused(),
             "max_spawn_depth": _get_max_spawn_depth(),
             "max_concurrent_children": _get_max_concurrent_children(),
@@ -3055,7 +3069,19 @@ def _(rid, params: dict) -> dict:
     subagent_id = str(params.get("subagent_id") or "").strip()
     if not subagent_id:
         return _err(rid, 4000, "subagent_id required")
-    ok = interrupt_subagent(subagent_id)
+    _invoking_session, err = _sess_nowait(params, rid)
+    if err:
+        return err
+    invoking_session_id = str(params.get("session_id") or "").strip()
+    invoking_transport, invoking_record = _current_session_steer_authority(
+        invoking_session_id
+    )
+    ok = interrupt_subagent(
+        subagent_id,
+        owner_session_id=invoking_session_id,
+        owner_transport=invoking_transport,
+        owner_session_record=invoking_record,
+    )
     return _ok(rid, {"found": ok, "subagent_id": subagent_id})
 
 

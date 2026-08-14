@@ -75,7 +75,10 @@ class TestSharedConnection:
         real_dir = tmp_path / "real"
         real_dir.mkdir()
         link_dir = tmp_path / "link"
-        link_dir.symlink_to(real_dir)
+        try:
+            link_dir.symlink_to(real_dir)
+        except OSError as exc:
+            pytest.skip(f"directory symlinks unavailable on this host: {exc}")
 
         a = MemoryStore(real_dir / "memory_store.db")
         b = MemoryStore(link_dir / "memory_store.db")

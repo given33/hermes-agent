@@ -446,14 +446,17 @@ class TestF6ExecutorSaturation:
             assert fence.cancel_before_commit() is True
 
             messages = [{"role": "user", "content": f"m{i}"} for i in range(20)]
-            returned, _sp = agent._compress_context(
-                messages, "sys", approx_tokens=120_000, commit_fence=fence
-            )
+            try:
+                returned, _sp = agent._compress_context(
+                    messages, "sys", approx_tokens=120_000, commit_fence=fence
+                )
 
-            compressor.compress.assert_not_called()
-            assert returned is messages
-            # The cancelled attempt must not leave the durable lock held.
-            assert db.get_compression_lock_holder(session_id) is None
+                compressor.compress.assert_not_called()
+                assert returned is messages
+                # The cancelled attempt must not leave the durable lock held.
+                assert db.get_compression_lock_holder(session_id) is None
+            finally:
+                db.close()
 
 
 class TestS3IdleChargedFromLastProgress:

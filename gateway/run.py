@@ -23152,6 +23152,89 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         if parsed.get("thread_id"):
             evt["thread_id"] = parsed["thread_id"]
 
+    @staticmethod
+    def _async_delegation_group_key(evt: dict) -> tuple[str, ...]:
+        """Keep one consolidated turn per complete gateway routing identity."""
+
+        return tuple(
+            str(evt.get(field) or "")
+            for field in (
+                "session_key",
+                "parent_session_id",
+                "platform",
+                "chat_type",
+                "chat_id",
+                "thread_id",
+                "user_id",
+            )
+        )
+
+    @staticmethod
+    def _format_coalesced_async_delegations(blocks: list[str]) -> str:
+        header = (
+            f"[IMPORTANT: {len(blocks)} background subagent delegations completed "
+            "for this session. Treat these results as one completion batch and "
+            "send at most one consolidated user-facing response.]"
+        )
+        return "\n\n".join([header, *blocks])
+
+    async def _deliver_async_delegation_group(
+        self, group: list[dict],
+    ) -> Optional[bool]:
+        """Deliver a same-route completion batch with honest durable claims."""
+
+        deliverable = [
+            (event, text)
+            for event in group
+            if (text := _format_gateway_process_notification(event))
+        ]
+        if not deliverable:
+            return None
+        if len(deliverable) == 1:
+            event, text = deliverable[0]
+            return await self._deliver_completion_notification(text, event)
+
+        from tools.async_delegation import (
+            claim_event_delivery,
+            complete_event_delivery,
+            release_event_delivery,
+        )
+        primary, primary_text = deliverable[0]
+        siblings: list[tuple[dict, str]] = []
+        blocks = [primary_text]
+        for event, text in deliverable[1:]:
+            claim_id = claim_event_delivery(event, f"gateway-batch:{id(self)}")
+            if claim_id is None:
+                continue
+            siblings.append((event, claim_id))
+            blocks.append(text)
+        if not siblings:
+            return await self._deliver_completion_notification(primary_text, primary)
+
+        delivered: Optional[bool] = False
+        try:
+            delivered = await self._deliver_completion_notification(
+                self._format_coalesced_async_delegations(blocks), primary,
+            )
+            if delivered is True:
+                for event, claim_id in siblings:
+                    complete_event_delivery(event, claim_id)
+            else:
+                for event, claim_id in siblings:
+                    release_event_delivery(event, claim_id)
+                if delivered is None:
+                    from tools.process_registry import process_registry as _pr
+                    for event, _claim_id in siblings:
+                        _pr.completion_queue.put(event)
+            return delivered
+        except Exception:
+            for event, claim_id in siblings:
+                try:
+                    release_event_delivery(event, claim_id)
+                except Exception:
+                    logger.debug("Could not release coalesced completion claim", exc_info=True)
+            raise
+
     async def _async_delegation_watcher(self, interval: float = 2.0) -> None:
         """Drain async-delegation completions and inject them as new turns.
 
@@ -23186,17 +23269,25 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                         requeue.append(evt)
                 for evt in requeue:
                     _pr.completion_queue.put(evt)
+                groups: dict[tuple[str, ...], list[dict]] = {}
+                order: list[tuple[str, ...]] = []
                 for evt in async_events:
                     self._enrich_async_delegation_routing(evt)
-                    synth_text = _format_gateway_process_notification(evt)
-                    if not synth_text:
-                        continue
+                    key = self._async_delegation_group_key(evt)
+                    if key not in groups:
+                        groups[key] = []
+                        order.append(key)
+                    groups[key].append(evt)
+                for key in order:
+                    group = groups[key]
                     try:
-                        delivered = await self._deliver_completion_notification(synth_text, evt)
+                        delivered = await self._deliver_async_delegation_group(group)
                         if delivered is False:
-                            _pr.completion_queue.put(evt)
+                            for evt in group:
+                                _pr.completion_queue.put(evt)
                     except Exception as e:
-                        _pr.completion_queue.put(evt)
+                        for evt in group:
+                            _pr.completion_queue.put(evt)
                         logger.error("Async delegation injection error: %s", e)
             except Exception as e:
                 logger.debug("Async delegation watcher error: %s", e)

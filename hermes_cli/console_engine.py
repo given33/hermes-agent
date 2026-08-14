@@ -14,6 +14,7 @@ import functools
 import importlib
 import io
 import json
+import os
 import shlex
 import sys
 from dataclasses import dataclass
@@ -118,9 +119,17 @@ def _table_summary(summary: str, *, limit: int = 76) -> str:
 
 def _split_line(line: str) -> list[str]:
     try:
-        return shlex.split(line, comments=False, posix=True)
+        tokens = shlex.split(line, comments=False, posix=os.name != "nt")
     except ValueError as exc:
         raise ConsoleCommandError(f"Could not parse command: {exc}") from exc
+    if os.name == "nt":
+        tokens = [
+            token[1:-1]
+            if len(token) >= 2 and token[0] == token[-1] and token[0] in {'"', "'"}
+            else token
+            for token in tokens
+        ]
+    return tokens
 
 
 def _contains_shell_syntax(line: str, tokens: Sequence[str]) -> bool:

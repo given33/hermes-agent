@@ -394,6 +394,7 @@ def get_tool_definitions(
     disabled_toolsets: Optional[List[str]] = None,
     quiet_mode: bool = False,
     skip_tool_search_assembly: bool = False,
+    tool_role: Optional[str] = None,
 ) -> List[Dict[str, Any]]:
     """
     Get tool definitions for model API calls with toolset-based filtering.
@@ -442,6 +443,7 @@ def get_tool_definitions(
                 _is_delegated_child_context(),
                 _is_dispatcher_owned_worker(),
                 profile_scope,
+                str(tool_role or "").strip().lower(),
             )
         cached = _tool_defs_cache.get(cache_key) if cache_key is not None else None
         if cached is not None:
@@ -453,8 +455,13 @@ def get_tool_definitions(
             # schemas are treated as read-only by all known callers.
             return list(cached)
 
-    result = _compute_tool_definitions(enabled_toolsets, disabled_toolsets, quiet_mode,
-                                       skip_tool_search_assembly=skip_tool_search_assembly)
+    result = _compute_tool_definitions(
+        enabled_toolsets,
+        disabled_toolsets,
+        quiet_mode,
+        skip_tool_search_assembly=skip_tool_search_assembly,
+        tool_role=tool_role,
+    )
     if quiet_mode and cache_key is not None:
         # Cache the freshly-computed list, but hand callers a shallow copy so
         # downstream mutations (e.g. run_agent appending memory/LCM tool
@@ -480,6 +487,7 @@ def _compute_tool_definitions(
     disabled_toolsets: Optional[List[str]] = None,
     quiet_mode: bool = False,
     skip_tool_search_assembly: bool = False,
+    tool_role: Optional[str] = None,
 ) -> List[Dict[str, Any]]:
     """Uncached implementation of :func:`get_tool_definitions`."""
     # Determine which tool names the caller wants
@@ -569,6 +577,15 @@ def _compute_tool_definitions(
 
     # Ask the registry for schemas (only returns tools whose check_fn passes)
     filtered_tools = registry.get_definitions(tools_to_include, quiet=quiet_mode)
+    if tool_role:
+        allowed_names = registry.get_tool_names_for_role(
+            str(tool_role).strip().lower(),
+            {item["function"]["name"] for item in filtered_tools},
+        )
+        filtered_tools = [
+            item for item in filtered_tools
+            if item.get("function", {}).get("name") in allowed_names
+        ]
 
     # The set of tool names that actually passed check_fn filtering.
     # Use this (not tools_to_include) for any downstream schema that references
@@ -1261,6 +1278,7 @@ def handle_function_call(
     api_request_id: Optional[str] = None,
     user_task: Optional[str] = None,
     enabled_tools: Optional[List[str]] = None,
+    tool_role: Optional[str] = None,
     skip_pre_tool_call_hook: bool = False,
     skip_tool_request_middleware: bool = False,
     skip_tool_execution_middleware: bool = False,
@@ -1281,6 +1299,8 @@ def handle_function_call(
                        execute_code uses this list to determine which sandbox
                        tools to generate.  Falls back to the process-global
                        ``_last_resolved_tool_names`` for backward compat.
+        tool_role: Optional collaboration role used for execution-time
+                   capability enforcement, including nested Code Mode calls.
         enabled_toolsets: The session's enabled toolsets.  Used to scope the
                        Tool Search bridge catalog so ``tool_search`` /
                        ``tool_describe`` / ``tool_call`` only see and invoke
@@ -1349,6 +1369,7 @@ def handle_function_call(
                 enabled_toolsets=enabled_toolsets,
                 disabled_toolsets=disabled_toolsets,
                 quiet_mode=True, skip_tool_search_assembly=True,
+                tool_role=tool_role,
             ) or []
         except Exception:
             current_defs = []
@@ -1404,6 +1425,7 @@ def handle_function_call(
                 api_request_id=api_request_id,
                 user_task=user_task,
                 enabled_tools=enabled_tools,
+                tool_role=tool_role,
                 skip_pre_tool_call_hook=skip_pre_tool_call_hook,
                 skip_tool_request_middleware=skip_tool_request_middleware,
                 skip_tool_execution_middleware=skip_tool_execution_middleware,
@@ -1436,6 +1458,21 @@ def handle_function_call(
     try:
         if function_name in _AGENT_LOOP_TOOLS:
             return tool_error(f"{function_name} must be handled by the agent loop")
+
+        # Schema filtering is model-facing only. Enforce the same role policy
+        # at dispatch time so a hidden tool name or nested Code Mode request
+        # cannot bypass the capability boundary.
+        if tool_role:
+            registry_entry = registry.get_entry(function_name)
+            if registry_entry is not None:
+                allowed = registry.get_tool_names_for_role(
+                    str(tool_role).strip().lower(), {function_name}
+                )
+                if function_name not in allowed:
+                    return tool_error(
+                        f"Tool '{function_name}' is not available for role "
+                        f"'{str(tool_role).strip().lower()}'."
+                    )
 
         # Check plugin hooks for a block/approve directive (unless caller
         # already checked — e.g. run_agent._invoke_tool passes skip=True to
@@ -1563,7 +1600,10 @@ def handle_function_call(
                         function_name, next_args,
                         task_id=task_id,
                         session_id=session_id,
+                        tool_call_id=tool_call_id,
+                        turn_id=turn_id,
                         enabled_tools=sandbox_enabled,
+                        tool_role=tool_role,
                         isolate=enforce_tool_isolation,
                     )
             else:

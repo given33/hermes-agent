@@ -427,6 +427,34 @@ class _GatewayProcess:
             and self.alive()
         )
 
+    def control_subagent(
+        self,
+        conversation_id: str,
+        action: str,
+        *,
+        subagent_id: str = "",
+        message: str = "",
+    ) -> dict[str, Any]:
+        """Run one owner-scoped delegation control RPC for a hosted session."""
+
+        with self._session_lock:
+            state = self._sessions_by_conversation.get(str(conversation_id))
+        if state is None:
+            raise HostedTuiGatewayError("Hosted conversation session is not active")
+        method = {
+            "list": "delegation.status",
+            "steer": "subagent.steer",
+            "stop": "subagent.interrupt",
+        }.get(str(action or "").strip().lower())
+        if method is None:
+            raise ValueError("unsupported subagent control action")
+        params: dict[str, Any] = {"session_id": state.live_session_id}
+        if method != "delegation.status":
+            params["subagent_id"] = str(subagent_id or "").strip()
+        if method == "subagent.steer":
+            params["text"] = str(message or "").strip()
+        return self.rpc(method, params, timeout=10.0)
+
     def run_turn(
         self,
         prompt: str,
@@ -779,6 +807,77 @@ def run_hosted_gateway_turn(
             "allow_tools": "1" if allow_tools else "0",
         },
     )
+
+
+def control_hosted_subagents(
+    conversation_id: str,
+    *,
+    owner_id: str,
+    account_generation: str,
+    action: str,
+    subagent_id: str = "",
+    message: str = "",
+) -> dict[str, Any]:
+    """Control only subagents belonging to an existing hosted conversation.
+
+    The caller must already have passed the durable conversation ownership
+    check. This function adds the process-pool account/generation boundary and
+    never starts a new gateway merely to service a control request.
+    """
+
+    normalized_action = str(action or "").strip().lower()
+    normalized_conversation = str(conversation_id or "").strip()
+    normalized_owner = str(owner_id or "").strip()
+    normalized_generation = str(account_generation or "").strip()
+    if normalized_action not in {"list", "steer", "stop"}:
+        raise ValueError("unsupported subagent control action")
+    with _POOL_LOCK:
+        candidates = [
+            (key[3], gateway)
+            for key, gateway in _POOL.items()
+            if key[1] == normalized_owner
+            and key[2] == normalized_generation
+            and gateway.alive()
+        ]
+    if normalized_action == "list":
+        entries: list[dict[str, Any]] = []
+        for profile, gateway in candidates:
+            try:
+                result = gateway.control_subagent(normalized_conversation, "list")
+            except Exception:
+                continue
+            for entry in result.get("active") or []:
+                if not isinstance(entry, dict):
+                    continue
+                public = dict(entry)
+                public["profile"] = profile
+                # The mobile client receives event data, never a host path.
+                public.pop("live_transcript", None)
+                entries.append(public)
+        entries.sort(key=lambda item: str(item.get("subagent_id") or ""))
+        return {"action": "list", "count": len(entries), "subagents": entries}
+
+    for profile, gateway in candidates:
+        try:
+            result = gateway.control_subagent(
+                normalized_conversation,
+                normalized_action,
+                subagent_id=subagent_id,
+                message=message,
+            )
+        except Exception:
+            continue
+        if result.get("status") in {"queued", "found", "rejected"} or result.get("found"):
+            return {
+                **result,
+                "profile": profile,
+                "action": normalized_action,
+            }
+    return {
+        "action": normalized_action,
+        "subagent_id": str(subagent_id or "").strip(),
+        "status": "not_found",
+    }
 
 
 def release_hosted_gateway_conversation(

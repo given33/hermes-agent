@@ -198,7 +198,7 @@ def test_curator_rewrites_cron_skills_when_skill_consolidated(curator_env_with_c
     assert detail["jobs_updated"] == 1
 
     # Markdown surfaces the change
-    md = (run_dir / "REPORT.md").read_text()
+    md = (run_dir / "REPORT.md").read_text(encoding="utf-8")
     assert "Cron job skill references rewritten" in md
     assert "foo-watcher" in md
     assert "foo-umbrella" in md

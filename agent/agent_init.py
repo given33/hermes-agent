@@ -526,6 +526,8 @@ def init_agent(
     iteration_budget: "IterationBudget" = None,
     fallback_model: Dict[str, Any] = None,
     credential_pool=None,
+    prompt_runtime_mode: str = "native",
+    tool_role: str | None = None,
     checkpoints_enabled: bool = False,
     checkpoint_max_snapshots: int = 20,
     checkpoint_max_total_size_mb: int = 500,
@@ -585,6 +587,17 @@ def init_agent(
     _install_safe_stdio()
 
     agent.model = model
+    agent._prompt_runtime_mode = str(prompt_runtime_mode or "native").strip().lower()
+    agent.tool_role = str(tool_role or "").strip().lower() or None
+    if agent.tool_role and agent.tool_role not in {"dispatcher", "worker", "reviewer", "reporter"}:
+        raise ValueError(
+            f"unknown tool_role {tool_role!r}; expected dispatcher, worker, reviewer, or reporter"
+        )
+    if agent._prompt_runtime_mode not in {"native", "ptc", "creation"}:
+        raise ValueError(
+            f"unknown prompt_runtime_mode {prompt_runtime_mode!r}; "
+            "expected native, ptc, or creation"
+        )
     agent.max_iterations = max_iterations
     # Shared iteration budget — parent creates, children inherit.
     # Consumed by every LLM turn across parent + all subagents.
@@ -923,6 +936,15 @@ def init_agent(
     # Rate-limit durable SessionDB activity stamps from _touch_activity (#72016).
     agent._session_activity_last_persist_mono: float = 0.0
     agent._current_tool: str | None = None
+    # Bounded canonical tool lifecycle records consumed by desktop/iOS
+    # projections. Raw arguments/results remain in the existing redacted tool
+    # pipeline; this ledger stores digests and presentation metadata only.
+    try:
+        from hermes_runtime.tool_execution import ToolExecutionLedger
+        agent._tool_execution_ledger = ToolExecutionLedger()
+    except Exception:
+        agent._tool_execution_ledger = None
+    agent._active_tool_parent_call_id = ""
     agent._api_call_count: int = 0
     # Opt-out flag for the between-turns MCP tool refresh (build_turn_context).
     # Set on internal forks (e.g. background_review) that must keep ``tools[]``
@@ -1449,11 +1471,16 @@ def init_agent(
         agent._tool_snapshot_generation = _snapshot_registry._generation
     except Exception:
         agent._tool_snapshot_generation = 0
-    agent.tools = _ra().get_tool_definitions(
-        enabled_toolsets=enabled_toolsets,
-        disabled_toolsets=disabled_toolsets,
-        quiet_mode=agent.quiet_mode,
-    )
+    tool_definition_kwargs = {
+        "enabled_toolsets": enabled_toolsets,
+        "disabled_toolsets": disabled_toolsets,
+        "quiet_mode": agent.quiet_mode,
+    }
+    # Keep legacy integrations that replace get_tool_definitions() compatible;
+    # role filtering is opt-in and only needs the new keyword when requested.
+    if agent.tool_role:
+        tool_definition_kwargs["tool_role"] = agent.tool_role
+    agent.tools = _ra().get_tool_definitions(**tool_definition_kwargs)
     
     # Show tool configuration and store valid tool names for validation
     agent.valid_tool_names = set()
@@ -1574,6 +1601,9 @@ def init_agent(
     # Cross-session-stable prefix of the cached prompt. It remains separate
     # from the persisted string and is used only to place an early cache marker.
     agent._cached_system_prompt_static: Optional[str] = None
+    # Non-sensitive provenance for the Prompt Runtime/tool-schema assembly.
+    # Prompt text remains the authoritative cache value.
+    agent._prompt_runtime_metadata: Dict[str, Any] = {}
     
     # Filesystem checkpoint manager (transparent — not a tool)
     from tools.checkpoint_manager import CheckpointManager

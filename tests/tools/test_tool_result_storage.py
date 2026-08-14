@@ -169,6 +169,17 @@ class TestBuildPersistedMessage:
 # ── maybe_persist_tool_result ─────────────────────────────────────────
 
 class TestMaybePersistToolResult:
+    def test_structured_result_is_canonicalized_before_runtime_hooks(self):
+        result = maybe_persist_tool_result(
+            content={"z": 2, "ok": True},
+            tool_name="terminal",
+            tool_use_id="tc_structured",
+            env=None,
+            threshold=float("inf"),
+        )
+
+        assert result == '{"ok":true,"z":2}'
+
     def test_below_threshold_returns_unchanged(self):
         content = "small result"
         result = maybe_persist_tool_result(

@@ -2732,7 +2732,16 @@ def _resolve_copilot_catalog_api_key() -> str:
             if not valid:
                 continue
             try:
-                api_token, _expires_at = exchange_copilot_token(raw)
+                # ``exchange_copilot_token`` now returns
+                # (api_token, expires_at, base_url). Keep accepting the
+                # historical two-item shape for downstream integrations
+                # that still provide a compatibility stub.
+                exchange_result = exchange_copilot_token(raw)
+                api_token = (
+                    exchange_result[0]
+                    if isinstance(exchange_result, (tuple, list)) and exchange_result
+                    else ""
+                )
             except Exception:
                 continue
             if api_token:

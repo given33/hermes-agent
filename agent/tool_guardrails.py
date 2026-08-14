@@ -481,6 +481,11 @@ class ToolCallGuardrailController:
             return None
 
         if tool_name == "delegate_task":
+            action = str(args.get("action") or "").strip().lower()
+            if action in {"list", "steer", "stop"}:
+                # The operator must still be able to inspect or rein in a
+                # runaway tree after the spawn cap has been reached.
+                return None
             cap = caps.max_subagents
             if not cap:
                 return None
@@ -618,6 +623,10 @@ def _subagent_spawn_count(args: Mapping[str, Any]) -> int:
     when present, otherwise 1, so the session subagent cap reflects real spawns
     rather than delegate_task invocations.
     """
+    if isinstance(args, Mapping):
+        action = str(args.get("action") or "").strip().lower()
+        if action in {"list", "steer", "stop"}:
+            return 0
     tasks = args.get("tasks") if isinstance(args, Mapping) else None
     if isinstance(tasks, list) and tasks:
         return len(tasks)

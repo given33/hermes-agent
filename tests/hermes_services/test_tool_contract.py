@@ -329,6 +329,34 @@ def test_contract_approval_uses_existing_human_gate(monkeypatch):
     assert seen[0][2]["rule_key"] == "tool_contract:sensitive_lookup"
 
 
+def test_irreversible_effect_metadata_uses_existing_human_gate(monkeypatch):
+    from tools.registry import registry
+
+    name = f"irreversible_test_{uuid.uuid4().hex}"
+    registry.register(
+        name=name,
+        toolset="effect-metadata-test",
+        schema={"description": name, "parameters": {"type": "object"}},
+        handler=lambda: None,
+        effect_metadata={
+            "durability": "external",
+            "external_boundary": "payment-provider",
+            "reversibility": "irreversible",
+        },
+    )
+    seen = []
+    monkeypatch.setattr(
+        "tools.approval.request_tool_approval",
+        lambda tool_name, reason, **kwargs: seen.append((tool_name, reason, kwargs))
+        or {"approved": False, "message": "approval denied"},
+    )
+    try:
+        assert _tool_contract_approval_block(name) == "approval denied"
+        assert seen[0][2]["rule_key"] == f"irreversible_effect:{name}"
+    finally:
+        registry.deregister(name)
+
+
 def test_side_effect_class_prevents_unsafe_parallel_execution():
     register_tool_contract(
         "mislabelled_writer",

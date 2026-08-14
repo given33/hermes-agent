@@ -2985,6 +2985,53 @@ class CollaborationDashboardTests(unittest.TestCase):
         self.assertEqual(persisted["verdict"], "pass")
         self.assertNotIn("没有通过", persisted["result"])
 
+    def test_supervisor_cache_revalidates_without_artifact_witness(self):
+        module = load_module()
+        conversation = module.create_single_conversation("default")
+        state = {"conversations": [conversation]}
+        module.load_single_state = lambda: state
+        module.save_single_state = lambda _state: None
+        run = module.create_hosted_turn_record(
+            conversation,
+            turn_id="turn-supervisor-cache-witness",
+            content="鎵ц",
+            title="鎵ц",
+            profiles=["default", "dbb3-worker", "reviewer"],
+            artifact_required=False,
+        )
+        calls = []
+
+        def runner(_profile, _prompt, **_kwargs):
+            calls.append(1)
+            return supervision_control()
+
+        evidence = {"result": "same-evidence", "artifacts": [{"id": "artifact-1"}]}
+        module._run_hosted_supervisor_check(
+            conversation["id"],
+            "turn-supervisor-cache-witness",
+            check_id="worker_handoff",
+            checkpoint_label="Worker 浜ゆ帴",
+            evidence=evidence,
+            runner=runner,
+            remote=False,
+        )
+        durable_run = state["conversations"][0]["hosted_turns"][
+            "turn-supervisor-cache-witness"
+        ]
+        durable_run["supervisor_checks"]["worker_handoff"]["supervisor_verdict"].pop(
+            "artifact_digest", None
+        )
+        module._run_hosted_supervisor_check(
+            conversation["id"],
+            "turn-supervisor-cache-witness",
+            check_id="worker_handoff",
+            checkpoint_label="Worker 浜ゆ帴",
+            evidence=evidence,
+            runner=runner,
+            remote=False,
+        )
+        self.assertEqual(len(calls), 2)
+
     def test_supervisor_unknown_and_truncated_evidence_fail_closed(self):
         module = load_module()
         conversation = module.create_single_conversation("default")
@@ -4996,9 +5043,10 @@ class CollaborationDashboardTests(unittest.TestCase):
             "hermes_cli.dashboard_auth.mobile_notifications.deliver_task_completion_push",
             side_effect=deliver,
         ):
-            delay = module._deliver_persisted_completion_notification(
+            delay = module._deliver_persisted_notification(
                 conversation["id"],
                 "turn-notification",
+                "completion",
             )
 
         self.assertIsNone(delay)
@@ -7214,6 +7262,64 @@ class CollaborationDashboardTests(unittest.TestCase):
             )
         )
         self.assertEqual(notifications, [])
+
+    def test_subagent_control_replay_does_not_repeat_real_gateway_side_effect(self):
+        module = load_module()
+        conversation = {
+            "id": "conversation-control",
+            "owner_id": "owner-a",
+            "hosted_turns": {
+                "turn-control": {
+                    "status": "completed",
+                    "subagent_controls": [
+                        {
+                            "request_id": "control-request-1",
+                            "subagent_id": "worker-1",
+                            "control_action": "steer",
+                            "control_status": "queued",
+                        }
+                    ],
+                }
+            },
+        }
+        state = {"conversations": [conversation]}
+        request = SimpleNamespace()
+        module._owned_conversation = lambda _request, _conversation_id: (
+            "owner-a",
+            conversation,
+        )
+        module._account_generation_for_request = lambda _request, _owner_id: "generation-1"
+        module.load_single_state = lambda: state
+
+        with patch.object(module, "control_hosted_subagents") as gateway_control:
+            replay = module._control_hosted_subagent(
+                "conversation-control",
+                "turn-control",
+                "worker-1",
+                request,
+                action="steer",
+                payload=module.HostedSubagentControlBody(
+                    request_id="control-request-1",
+                ),
+            )
+
+        self.assertTrue(replay["accepted"])
+        self.assertTrue(replay["replayed"])
+        self.assertEqual(replay["control"]["status"], "queued")
+        gateway_control.assert_not_called()
+
+        with self.assertRaisesRegex(Exception, "request_id is already bound"):
+            module._control_hosted_subagent(
+                "conversation-control",
+                "turn-control",
+                "worker-2",
+                request,
+                action="steer",
+                payload=module.HostedSubagentControlBody(
+                    request_id="control-request-1",
+                    message="redirect",
+                ),
+            )
 
 
 if __name__ == "__main__":

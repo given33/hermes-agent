@@ -90,6 +90,7 @@ except ModuleNotFoundError as exc:
 from hermes_runtime.config import get_hermes_home
 from hermes_cli.profiles import list_profiles
 from hermes_services.hosted_event_protocol import (
+    _PENDING_PERSISTENCE_HOOKS,
     append_hosted_event as _append_hosted_event_protocol,
     dispatch_persisted_hosted_event_hooks,
     drop_account_persistence_hook_work,
@@ -105,8 +106,34 @@ from hermes_services.session_entries import (
     normalize_session_entries,
 )
 from hermes_services.tool_output_artifacts import EncryptedToolArtifactStore
+from hermes_runtime.composability.supervisor_verdict import (
+    build_supervisor_verdict,
+    digest_json,
+)
+from hermes_runtime.composability import (
+    EffectScope,
+    ProviderCatalog,
+    PromptMetrics,
+    build_hosted_turn_plan,
+    hosted_turn_plan_snapshot,
+    next_ready_plan_nodes,
+    track_hosted_role_claim,
+)
+from hermes_runtime.trajectory import (
+    DEFAULT_MAX_RECORDS as TRAJECTORY_DEFAULT_MAX_RECORDS,
+    MAX_RECORDS as TRAJECTORY_MAX_RECORDS,
+    project_hosted_trajectory,
+)
+from hermes_runtime.collaboration import (
+    CollaborationDependency,
+    DependencyGraph,
+    MailboxMessage,
+    append_mailbox,
+    read_mailbox,
+)
 from plugins.collaboration.dashboard.hosted_tui_runtime import (
     HostedTuiGatewayCancelled,
+    control_hosted_subagents,
     prewarm_hosted_gateway,
     release_hosted_gateway_conversation,
     run_hosted_gateway_turn,
@@ -117,6 +144,114 @@ _WRITE_APPROVAL_RECOVERY_INTERVAL_SECONDS = 5.0
 _TOOL_ARTIFACT_CLEANUP_INTERVAL_SECONDS = 60 * 60
 _ACCOUNT_DELETION_STORE_LOCK = threading.Lock()
 _ACCOUNT_DELETION_STORES: dict[str, Any] = {}
+_RUNTIME_PROVIDER_CATALOG = ProviderCatalog()
+_RUNTIME_PROVIDER_LOCK = threading.RLock()
+_HOSTED_PROMPT_METRICS = PromptMetrics()
+
+
+def _runtime_provider_id(kind: str, identity: str) -> str:
+    return f"{str(kind or 'provider').strip()}:{str(identity or 'unknown').strip()}"
+
+
+def _provider_witness_ref(witness: Optional[dict[str, Any]]) -> str:
+    if not isinstance(witness, dict):
+        return ""
+    provider_id = str(witness.get("provider_id") or "").strip()
+    generation = witness.get("generation")
+    if not provider_id or not isinstance(generation, int) or generation < 0:
+        return ""
+    return f"{provider_id}@{generation}"
+
+
+def _observe_runtime_provider(
+    *,
+    provider_id: str,
+    interface_key: str,
+    health: str = "unknown",
+    metadata: Optional[dict[str, Any]] = None,
+    capacity: int = 1,
+) -> Optional[dict[str, Any]]:
+    """Publish a process-local provider witness without owning its transport."""
+
+    normalized_id = str(provider_id or "").strip()
+    if not normalized_id:
+        return None
+    with _RUNTIME_PROVIDER_LOCK:
+        current = _RUNTIME_PROVIDER_CATALOG.get(normalized_id)
+        if current is not None and current.status.value == "draining":
+            # A draining generation remains the witness for turns that still
+            # reference it. Re-observation must not overwrite its inflight
+            # count or silently create a replacement under the same identity.
+            record = current
+        elif current is None or current.status.value == "removed":
+            record = _RUNTIME_PROVIDER_CATALOG.register(
+                provider_id=normalized_id,
+                interface_key=str(interface_key or "provider").strip(),
+                version=str((metadata or {}).get("version") or "unknown"),
+                health=str(health or "unknown"),
+                capacity=max(1, int(capacity)),
+                metadata=dict(metadata or {}),
+            )
+        else:
+            record = _RUNTIME_PROVIDER_CATALOG.update_health(
+                normalized_id,
+                str(health or current.health),
+            )
+        return {
+            "provider_id": record.provider_id,
+            "interface_key": record.interface_key,
+            "version": record.version,
+            "generation": record.generation,
+            "health": record.health,
+            "status": record.status.value,
+        }
+
+
+def _runtime_event_kwargs(event: dict[str, Any]) -> dict[str, Any]:
+    runtime = event.get("runtime")
+    if not isinstance(runtime, dict):
+        return {}
+    return {
+        "component_id": runtime.get("component_id") or "",
+        "parent_component_id": runtime.get("parent_component_id") or "",
+        "provider_refs": runtime.get("provider_refs") or (),
+        "dependency_state": runtime.get("dependency_state") or {},
+        "lifecycle_state": runtime.get("lifecycle_state") or "",
+        "effect_scope_id": runtime.get("effect_scope_id") or "",
+        "plan_node_id": runtime.get("plan_node_id") or "",
+        "artifact_refs": runtime.get("artifact_refs") or (),
+        "contract_revision": runtime.get("contract_revision") or "",
+        "policy_snapshot_hash": runtime.get("policy_snapshot_hash") or "",
+    }
+
+
+def _refresh_mcp_provider_catalog(capability_hints: Optional[list[str]] = None) -> None:
+    """Mirror selected MCP readiness into the live provider catalog."""
+
+    try:
+        backend = _backend_api()
+        snapshots = backend.get_mcp_availability()
+        hints = {str(item).strip().lower() for item in capability_hints or [] if str(item).strip()}
+        for snapshot in snapshots:
+            name = str(getattr(snapshot, "name", "") or "").strip()
+            if not name:
+                continue
+            state = str(getattr(snapshot, "state", "") or "").strip().lower()
+            live = bool(getattr(snapshot, "live", False))
+            health = "healthy" if live or state in {"ready", "connected"} else state or "unknown"
+            if hints and name.lower() not in hints and not any(name.lower() in hint for hint in hints):
+                continue
+            _observe_runtime_provider(
+                provider_id=_runtime_provider_id("mcp", name),
+                interface_key=f"mcp:{name}",
+                health=health,
+                metadata={
+                    "mcp_name": name,
+                    "registered_tools": list(getattr(snapshot, "registered_tools", ()) or ())[:100],
+                },
+            )
+    except Exception:
+        logger.debug("MCP provider catalog refresh unavailable", exc_info=True)
 
 
 def _backend_api():
@@ -361,6 +496,7 @@ _HOSTED_UPDATE_REVISIONS: dict[str, int] = {}
 _HOSTED_LIVE_STATE_LOCK = threading.RLock()
 _HOSTED_LIVE_CONVERSATIONS: dict[str, dict[str, Any]] = {}
 _HOSTED_CANCEL_STATE_LOCK = threading.Lock()
+_SUBAGENT_CONTROL_LOCK = threading.Lock()
 _HOSTED_CANCEL_SIGNALS: set[tuple[str, str]] = set()
 _HOSTED_CANCEL_CACHE: dict[tuple[str, str], tuple[float, bool]] = {}
 _HOSTED_CANCEL_CACHE_SECONDS = 0.75
@@ -598,6 +734,7 @@ def _publish_live_hosted_role_projection(
                 ),
                 occurred_at=int(protocol_event.get("occurred_at") or now),
                 account_generation=account_generation,
+                **_runtime_event_kwargs(protocol_event),
                 # The live projection is cloned together with its current
                 # sequence and terminal indexes. Rebuilding those indexes and
                 # rescanning every retained idempotency key on each token makes
@@ -675,6 +812,13 @@ def append_hosted_event(
 ):
     """Append a canonical event and its durable session-history projection."""
 
+    # Legacy profile projections carry the optional runtime envelope as one
+    # nested field. The protocol authority accepts the typed fields at its
+    # boundary, so normalize the envelope here and preserve old producers.
+    runtime = kwargs.pop("runtime", None)
+    if isinstance(runtime, dict):
+        for key, value in _runtime_event_kwargs({"runtime": runtime}).items():
+            kwargs.setdefault(key, value)
     result = _append_hosted_event_protocol(conversation, **kwargs)
     if not result.appended:
         return result
@@ -2118,6 +2262,13 @@ def load_state(
         dispatch_persistence_hooks=dispatch_persistence_hooks,
     )
     result = {"rooms": data["rooms"]}
+    for room in result["rooms"]:
+        if not isinstance(room, dict):
+            continue
+        if not isinstance(room.get("mailbox"), list):
+            room["mailbox"] = []
+        if not isinstance(room.get("dependencies"), list):
+            room["dependencies"] = []
     tombstones = _account_deletion_tombstones(data)
     if tombstones:
         result[_ACCOUNT_DELETION_TOMBSTONES_KEY] = tombstones
@@ -2437,6 +2588,12 @@ def _archive_completed_conversations(state: dict[str, Any]) -> None:
         if not isinstance(conversation, dict):
             continue
         if conversation.get("archived"):
+            continue
+        if conversation.get(_PENDING_PERSISTENCE_HOOKS):
+            # Post-persistence observers are staged on this conversation and
+            # must be promoted into the root durable outbox on this save.
+            # Archiving now would strand the pending delivery in the archive
+            # file where nothing dispatches it.
             continue
         if not _conversation_terminal(conversation):
             continue
@@ -2959,6 +3116,8 @@ def create_room_record(
         "account_generation": str(account_generation or "").strip()
         or "local-owner-generation",
         "messages": [],
+        "mailbox": [],
+        "dependencies": [],
         "created_at": now,
         "updated_at": now,
     }
@@ -3601,6 +3760,13 @@ def build_runtime_activity_timeline(
                 activities.append(activity)
             output = _message_content_text(message)
             activity["output"] = output
+            execution_envelope = message.get("_tool_execution")
+            if isinstance(execution_envelope, dict):
+                activity["call_id"] = str(execution_envelope.get("call_id") or tool_id)
+                activity["parent_call_id"] = str(execution_envelope.get("parent_call_id") or "")
+                presentation_meta = execution_envelope.get("presentation_meta")
+                if isinstance(presentation_meta, dict):
+                    activity["presentation_meta"] = _redact_sensitive(presentation_meta)
             activity["status"] = (
                 "failed"
                 if message.get("error") or str(message.get("status") or "").lower() in {"error", "failed"}
@@ -7801,6 +7967,31 @@ def apply_profile_event(
         state["actual_provider"] = str(
             payload.get("provider") or state.get("actual_provider") or ""
         )
+    elif event_type == "provider.registered":
+        witness_ref = _provider_witness_ref(payload)
+        if witness_ref:
+            runtime = state.setdefault("_runtime_metadata", {})
+            refs = [
+                str(item).strip()
+                for item in runtime.get("provider_refs") or []
+                if str(item).strip()
+            ]
+            if witness_ref not in refs:
+                refs.append(witness_ref)
+            runtime["provider_refs"] = refs
+            # Keep the top-level durable projection in sync.  Subsequent
+            # protocol events are built from this projection, not from a
+            # transient child-process event, so the exact provider generation
+            # remains visible for the whole turn.
+            state["provider_refs"] = list(refs)
+            bindings = state.setdefault("provider_bindings", {})
+            if isinstance(bindings, dict):
+                bindings[str(payload.get("interface_key") or witness_ref)] = {
+                    "provider_id": str(payload.get("provider_id") or ""),
+                    "generation": int(payload.get("generation") or 0),
+                    "interface_key": str(payload.get("interface_key") or ""),
+                    "status": str(payload.get("status") or ""),
+                }
     elif event_type in {
         "reasoning.delta",
         "reasoning.available",
@@ -8185,12 +8376,16 @@ def _queue_hosted_protocol_event(
         pending.append(
             {
                 "event_type": kind,
-                "payload": body,
+                # Profile events may contain tool arguments, connector errors,
+                # or model output.  Persist the redacted projection only; the
+                # runtime does not need raw credentials to replay a lifecycle.
+                "payload": _redact_sensitive(body),
                 "entity_id": staged_entity_id,
                 "idempotency_key": (
                     f"profile-event:{next_index}:{kind}:{staged_entity_id}"
                 ),
                 "occurred_at": int(body.get("timestamp") or time.time() * 1000),
+                "runtime": dict(state.get("_runtime_metadata") or {}),
             }
         )
 
@@ -8205,6 +8400,48 @@ def _queue_hosted_protocol_event(
     stage(event_type, payload, entity_id)
     if event_type == "message.completed":
         state["_saw_message_complete"] = True
+
+
+def _hosted_runtime_metadata(
+    state: dict[str, Any],
+    *,
+    turn_id: str,
+    role_stage: str,
+    lifecycle_state: str = "",
+) -> dict[str, Any]:
+    """Build typed event metadata from durable role state, never UI labels."""
+
+    runtime_refs = (state.get("_runtime_metadata") or {}).get("provider_refs")
+    provider_refs = [
+        str(item).strip()
+        for item in (state.get("provider_refs") or runtime_refs or [])
+        if str(item).strip()
+    ]
+    dependency_state = state.get("dependency_state")
+    return {
+        "component_id": str(
+            state.get("component_id") or f"fiber:{turn_id}:{role_stage}"
+        ),
+        "parent_component_id": str(
+            state.get("parent_component_id") or f"fiber:turn:{turn_id}"
+        ),
+        "provider_refs": provider_refs,
+        "dependency_state": _redact_sensitive(dict(dependency_state)) if isinstance(dependency_state, dict) else {},
+        "lifecycle_state": str(
+            lifecycle_state
+            or state.get("lifecycle_state")
+            or ("completed" if state.get("status") == "completed" else "failed" if state.get("status") == "failed" else "active")
+        ),
+        "effect_scope_id": str(state.get("effect_scope_id") or ""),
+        "plan_node_id": str(state.get("plan_node_id") or role_stage),
+        "artifact_refs": [
+            str(item).strip()[:512]
+            for item in state.get("artifact_refs") or []
+            if str(item).strip()
+        ],
+        "contract_revision": str(state.get("contract_revision") or "hosted-role.v1"),
+        "policy_snapshot_hash": str(state.get("policy_snapshot_hash") or ""),
+    }
 
 
 def _remove_duplicate_reasoning_activities(
@@ -8317,6 +8554,8 @@ def _run_local_intervention_reply(
         "activities": [],
         "actual_model": "",
         "actual_provider": "",
+        "provider_bindings": {},
+        "provider_refs": [],
         "runtime_session_id": str(runtime_session_id or "").strip(),
         "started_at": int(time.time() * 1000),
     }
@@ -8430,6 +8669,10 @@ def _persist_hosted_role_state(
         "activities": activities,
         "actual_model": str(state.get("actual_model") or ""),
         "actual_provider": str(state.get("actual_provider") or ""),
+        "provider_bindings": dict(state.get("provider_bindings") or {}),
+        "provider_refs": list(
+            (state.get("_runtime_metadata") or {}).get("provider_refs") or []
+        ),
         "runtime_session_id": str(
             state.get("runtime_session_id") or ""
         ).strip(),
@@ -8655,6 +8898,18 @@ def _run_hosted_role(
         "_protocol_started_entities": [],
         "_protocol_events": [],
         "_saw_message_complete": False,
+        "_runtime_metadata": {
+            "component_id": f"fiber:{turn_id}:{role_stage}",
+            "parent_component_id": f"fiber:turn:{turn_id}",
+            "provider_refs": [],
+            "dependency_state": {},
+            "lifecycle_state": "activating",
+            "effect_scope_id": f"hosted-role:{execution_owner}",
+            "plan_node_id": role_stage,
+            "artifact_refs": [],
+            "contract_revision": "hosted-role.v1",
+            "policy_snapshot_hash": "",
+        },
     }
     if isinstance(previous_state, dict):
         state.update(
@@ -8663,6 +8918,12 @@ def _run_hosted_role(
                 "activities": [dict(item) for item in previous_state.get("activities") or []],
                 "actual_model": str(previous_state.get("actual_model") or ""),
                 "actual_provider": str(previous_state.get("actual_provider") or ""),
+                "provider_bindings": dict(previous_state.get("provider_bindings") or {}),
+                "provider_refs": [
+                    str(item).strip()
+                    for item in previous_state.get("provider_refs") or []
+                    if str(item).strip()
+                ],
                 "runtime_session_id": str(
                     previous_state.get("runtime_session_id")
                     or runtime_session_id
@@ -8713,6 +8974,20 @@ def _run_hosted_role(
                 ),
             }
         )
+        previous_runtime = previous_state.get("_runtime_metadata")
+        if isinstance(previous_runtime, dict):
+            state["_runtime_metadata"].update(
+                {
+                    "provider_refs": [
+                        str(item).strip()
+                        for item in previous_runtime.get("provider_refs") or []
+                        if str(item).strip()
+                    ],
+                    "dependency_state": dict(previous_runtime.get("dependency_state") or {})
+                    if isinstance(previous_runtime.get("dependency_state"), dict)
+                    else {},
+                }
+            )
     if (
         str(state.get("status") or "") in _HOSTED_TERMINAL_STATUSES
         and str(state.get("content") or "").strip()
@@ -8732,6 +9007,37 @@ def _run_hosted_role(
         lease_ms=_hosted_chat_lease_ms(),
     ):
         raise RuntimeError("同一角色阶段已有活动执行 owner")
+    role_effect_scope = EffectScope(
+        owner_id=f"hosted-role:{conversation_id}:{turn_id}:{role_stage}",
+        scope_id=f"hosted-role:{execution_owner}",
+    )
+    track_hosted_role_claim(
+        role_effect_scope,
+        lambda: _clear_hosted_active_role(
+            conversation_id,
+            turn_id,
+            role_stage=role_stage,
+            execution_owner=execution_owner,
+        ),
+        role_stage=role_stage,
+        owner=execution_owner,
+    )
+    state["_runtime_metadata"] = {
+        **dict(state.get("_runtime_metadata") or {}),
+        **_hosted_runtime_metadata(
+            state,
+            turn_id=turn_id,
+            role_stage=role_stage,
+            lifecycle_state="active",
+        ),
+        "effect_scope_id": role_effect_scope.scope_id,
+    }
+
+    def release_role_claim() -> None:
+        try:
+            role_effect_scope.close_sync()
+        except Exception:
+            logger.exception("hosted role effect scope cleanup failed")
     if role_stage.split(":", 1)[0] != "chat":
         _queue_hosted_protocol_event(
             state,
@@ -9122,12 +9428,7 @@ def _run_hosted_role(
                 result,
             )
             persist()
-            _clear_hosted_active_role(
-                conversation_id,
-                turn_id,
-                role_stage=role_stage,
-                execution_owner=execution_owner,
-            )
+            release_role_claim()
             return result, "completed", state
         except Exception as exc:
             intervention = (
@@ -9171,12 +9472,7 @@ def _run_hosted_role(
                 except _HostedTurnCancelled:
                     _finish_hosted_turn_if_cancelled(conversation_id, turn_id)
                     state["status"] = "cancelled"
-                    _clear_hosted_active_role(
-                        conversation_id,
-                        turn_id,
-                        role_stage=role_stage,
-                        execution_owner=execution_owner,
-                    )
+                    release_role_claim()
                     return str(state.get("content") or "").strip(), "cancelled", state
                 except Exception as reply_exc:
                     intervention_reply = (
@@ -9208,6 +9504,7 @@ def _run_hosted_role(
                     ]
                 state["content"] = ""
                 state["status"] = "streaming"
+                release_role_claim()
                 return _run_hosted_role(
                     conversation_id,
                     turn_id,
@@ -9238,12 +9535,7 @@ def _run_hosted_role(
             ):
                 _finish_hosted_turn_if_cancelled(conversation_id, turn_id)
                 state["status"] = "cancelled"
-                _clear_hosted_active_role(
-                    conversation_id,
-                    turn_id,
-                    role_stage=role_stage,
-                    execution_owner=execution_owner,
-                )
+                release_role_claim()
                 return str(state.get("content") or "").strip(), "cancelled", state
             terminal_content = str(state.get("content") or "").strip()
             if str(state.get("status") or "") == "failed" and terminal_content:
@@ -9254,12 +9546,7 @@ def _run_hosted_role(
                     terminal_content,
                 )
                 persist()
-                _clear_hosted_active_role(
-                    conversation_id,
-                    turn_id,
-                    role_stage=role_stage,
-                    execution_owner=execution_owner,
-                )
+                release_role_claim()
                 return terminal_content, "failed", state
             transient = _is_transient_runtime_error(exc)
             has_tool_activity = any(
@@ -9295,20 +9582,10 @@ def _run_hosted_role(
                 result,
             )
             persist()
-            _clear_hosted_active_role(
-                conversation_id,
-                turn_id,
-                role_stage=role_stage,
-                execution_owner=execution_owner,
-            )
+            release_role_claim()
             return result, "failed", state
 
-    _clear_hosted_active_role(
-        conversation_id,
-        turn_id,
-        role_stage=role_stage,
-        execution_owner=execution_owner,
-    )
+    release_role_claim()
     raise RuntimeError("Hermes 托管角色执行状态异常")
 
 
@@ -9460,6 +9737,28 @@ def _run_hosted_remote_role(
         connector_id=connector_id,
     )
     active_remote_id = str(remote.get("id") or "")
+    connector_provider = _observe_runtime_provider(
+        provider_id=_runtime_provider_id("connector", connector_id or "server"),
+        interface_key="connector:hosted-remote",
+        health="healthy" if str(remote.get("status") or "") not in {"failed", "cancelled"} else "unhealthy",
+        metadata={
+            "connector_id": connector_id,
+            "remote_run_id": active_remote_id,
+            "version": str(remote.get("worker_version") or "unknown"),
+        },
+    )
+    if connector_provider:
+        connector_ref = _provider_witness_ref(connector_provider)
+        _persist_hosted_turn(
+            conversation_id,
+            turn_id,
+            patch={
+                "provider_bindings": {
+                    f"connector:{connector_id or 'server'}": connector_provider,
+                },
+                "provider_refs": [connector_ref] if connector_ref else [],
+            },
+        )
     coordinator_owner = f"remote-coordinator:{active_remote_id}:{uuid.uuid4().hex}"
     revision = -1
     remaining_seconds = max(
@@ -9510,6 +9809,28 @@ def _run_hosted_remote_role(
             _advance_remote_run_deadline(active_remote_id)
             deadline = time.monotonic() + _REMOTE_CANCELLATION_GRACE_SECONDS
         revision = _wait_for_hosted_update(revision, 15.0)
+    remote_effect_scope = EffectScope(
+        owner_id=f"hosted-remote-role:{conversation_id}:{turn_id}:{role_stage}",
+        scope_id=f"hosted-remote-role:{coordinator_owner}",
+    )
+    track_hosted_role_claim(
+        remote_effect_scope,
+        lambda: _clear_hosted_active_role(
+            conversation_id,
+            turn_id,
+            role_stage=role_stage,
+            remote_run_id=active_remote_id,
+            execution_owner=coordinator_owner,
+        ),
+        role_stage=role_stage,
+        owner=coordinator_owner,
+    )
+
+    def release_remote_role_claim() -> None:
+        try:
+            remote_effect_scope.close_sync()
+        except Exception:
+            logger.exception("remote hosted role effect scope cleanup failed")
     if visible and str(remote.get("status") or "queued") not in _REMOTE_TERMINAL_STATUSES:
         _remote_run_state_message(
             conversation_id,
@@ -9532,6 +9853,7 @@ def _run_hosted_remote_role(
             role_stage=role_stage,
             execution_owner=coordinator_owner,
         ):
+            release_remote_role_claim()
             return _run_hosted_remote_role(
                 conversation_id,
                 turn_id,
@@ -9615,13 +9937,7 @@ def _run_hosted_remote_role(
                         )
                         save_single_state(state)
                 _notify_hosted_update(conversation_id)
-                _clear_hosted_active_role(
-                    conversation_id,
-                    turn_id,
-                    role_stage=role_stage,
-                    remote_run_id=active_remote_id,
-                    execution_owner=coordinator_owner,
-                )
+                release_remote_role_claim()
                 _finish_hosted_turn_if_cancelled(conversation_id, turn_id)
                 return "远程执行已取消。", "cancelled", {
                     "content": "远程执行已取消。",
@@ -9636,13 +9952,7 @@ def _run_hosted_remote_role(
                     "stage": "cancel_requested",
                 },
             )
-            _clear_hosted_active_role(
-                conversation_id,
-                turn_id,
-                role_stage=role_stage,
-                remote_run_id=active_remote_id,
-                execution_owner=coordinator_owner,
-            )
+            release_remote_role_claim()
             return "远程执行已请求取消。", "failed", {
                 "content": "远程执行已请求取消。",
                 "status": "failed",
@@ -9693,13 +10003,7 @@ def _run_hosted_remote_role(
                     )
                     save_single_state(state)
             _notify_hosted_update(conversation_id)
-            _clear_hosted_active_role(
-                conversation_id,
-                turn_id,
-                role_stage=role_stage,
-                remote_run_id=active_remote_id,
-                execution_owner=coordinator_owner,
-            )
+            release_remote_role_claim()
             if _hosted_turn_cancellation_requested(conversation_id, turn_id):
                 _finish_hosted_turn_if_cancelled(conversation_id, turn_id)
                 return "任务已取消。", "cancelled", {
@@ -9811,13 +10115,7 @@ def _run_hosted_remote_role(
                     resume_stage = f"{role_stage}:resume:{digest}"
                     intervention_reply = str(intervention.get("reply") or "").strip()
                     if str(intervention.get("status") or "") != "completed":
-                        _clear_hosted_active_role(
-                            conversation_id,
-                            turn_id,
-                            role_stage=role_stage,
-                            remote_run_id=active_remote_id,
-                            execution_owner=coordinator_owner,
-                        )
+                        release_remote_role_claim()
                         reply_result, reply_status, _reply_state = _run_hosted_remote_role(
                             conversation_id,
                             turn_id,
@@ -9915,13 +10213,7 @@ def _run_hosted_remote_role(
                 content_fallback=result,
                 visible=visible,
             )
-            _clear_hosted_active_role(
-                conversation_id,
-                turn_id,
-                role_stage=role_stage,
-                remote_run_id=active_remote_id,
-                execution_owner=coordinator_owner,
-            )
+            release_remote_role_claim()
             return result, role_state["status"], role_state
         if visible:
             _remote_run_state_message(
@@ -11061,6 +11353,7 @@ def _persist_hosted_turn(
                 idempotency_key=str(protocol_event.get("idempotency_key") or ""),
                 occurred_at=int(protocol_event.get("occurred_at") or now),
                 account_generation=expected_generation,
+                **_runtime_event_kwargs(protocol_event),
             )
 
         for session_entry in session_entries or []:
@@ -12219,6 +12512,23 @@ def _strict_hosted_control_result(
     return parsed
 
 
+def _control_result_has_json_envelope(text: str) -> bool:
+    """True when the text contains any JSON-object envelope.
+
+    The closed control protocol accepts exactly one strict JSON object.
+    When a model emits malformed JSON (string booleans, duplicate keys,
+    extra fields, prefixed/fenced envelopes), the narrative fallback must
+    never reinterpret the literal ``"PASS"`` inside that JSON as a passing
+    verdict. Any brace-delimited envelope defeats the relaxed path.
+    """
+    raw = str(text or "").strip()
+    if not raw:
+        return False
+    start = raw.find("{")
+    end = raw.rfind("}")
+    return start != -1 and end > start
+
+
 def _hosted_reviewer_control(result: str) -> Optional[dict[str, Any]]:
     strict = _strict_hosted_control_result(
         result,
@@ -12233,6 +12543,8 @@ def _hosted_reviewer_control(result: str) -> Optional[dict[str, Any]]:
     # or emit narrative only. Downgrade to a structured decision when the
     # text carries an unambiguous verdict marker — same policy as the
     # supervisor's relaxed interpretation.
+    if _control_result_has_json_envelope(result):
+        return None
     text = str(result or "").strip()
     if re.search(r"(?:判定|结论|结果为|verdict)\s*[:：]?\s*PASS\b", text, re.I):
         return {
@@ -12700,6 +13012,8 @@ def _hosted_supervisor_control(result: str) -> Optional[dict[str, Any]]:
     # narrative carries an unambiguous verdict marker, downgrade to a
     # structured decision so the control gate keeps working; the display
     # layer marks these as relaxed-interpretation results.
+    if _control_result_has_json_envelope(result):
+        return None
     text = str(result or "").strip()
     if re.search(r"(?:判定|结论|结果为|verdict)\s*[:：]?\s*PASS\b", text, re.I):
         return {
@@ -12957,6 +13271,37 @@ def _emit_rework_state_event(
         logger.exception("rework state event failed")
 
 
+
+def _supervisor_result_contradicts_verdict(result: str, verdict: str) -> bool:
+    """Detect a cached supervisor verdict that contradicts its own text.
+
+    A pre-upgrade (or model-error) record may contain a PASS verdict while
+    the result text explicitly says the check did not pass. Trusting such a
+    cache would let the supervisor gate pass without revalidation.
+    """
+    if verdict not in {"pass", "corrective_action"}:
+        return False
+    text = str(result or "").strip()
+    if not text:
+        return False
+    fail_marker = re.compile(
+        r"(?:没有通过|未通过|不通过|不能通过|无法通过|检查失败|校验失败|"
+        r"测试失败|审核不通过|审阅不通过|FAILED|FAIL\b)",
+        re.I,
+    )
+    neutral = re.compile(
+        r"(?:没有发现|未发现|无|不存在|没有|未出现)"
+        r"[^。；;\n]{0,8}?(?:未通过|不通过|失败|FAILED)",
+        re.I,
+    )
+    for match in fail_marker.finditer(text):
+        window = text[max(0, match.start() - 12):match.end() + 12]
+        if neutral.search(window):
+            continue
+        return True
+    return False
+
+
 def _run_hosted_supervisor_check(
     conversation_id: str,
     turn_id: str,
@@ -12972,6 +13317,25 @@ def _run_hosted_supervisor_check(
     """Execute, expose, and persist one independent supervisor check."""
 
     redacted_evidence = _redact_sensitive(dict(evidence))
+    with _STATE_LOCK:
+        current_state = load_single_state()
+        current_conversation = _conversation_by_id(current_state, conversation_id)
+        current_run = (current_conversation.get("hosted_turns") or {}).get(turn_id)
+        current_run = current_run if isinstance(current_run, dict) else {}
+    plan_revision = int(current_run.get("turn_plan_revision") or 0)
+    source_revision = str(
+        redacted_evidence.get("source_revision")
+        or redacted_evidence.get("git_revision")
+        or redacted_evidence.get("revision")
+        or f"turn:{turn_id}:plan:{plan_revision or 0}"
+    ).strip()
+    prompt_version = str(
+        redacted_evidence.get("prompt_version")
+        or f"hermes.supervision.v1:{hashlib.sha256(_hosted_supervisor_protocol_prompt().encode('utf-8')).hexdigest()[:16]}"
+    ).strip()
+    if source_revision:
+        redacted_evidence.setdefault("source_revision", source_revision)
+    redacted_evidence.setdefault("prompt_version", prompt_version)
     evidence_json = json.dumps(
         redacted_evidence,
         ensure_ascii=False,
@@ -13003,6 +13367,13 @@ def _run_hosted_supervisor_check(
         )
 
     cached_result_invalid = False
+    expected_artifact_digest = str(redacted_evidence.get("artifact_digest") or "").strip()
+    if not expected_artifact_digest:
+        expected_artifact_digest = (
+            digest_json(redacted_evidence.get("artifacts"))
+            if redacted_evidence.get("artifacts")
+            else "none"
+        )
     with _STATE_LOCK:
         state = load_single_state()
         conversation = _conversation_by_id(state, conversation_id)
@@ -13016,6 +13387,17 @@ def _run_hosted_supervisor_check(
             isinstance(existing, dict)
             and str(existing.get("status") or "") == "completed"
             and str(existing.get("result") or "").strip()
+            and (
+                isinstance(existing.get("supervisor_verdict"), dict)
+                and bool((existing.get("supervisor_verdict") or {}).get("valid"))
+                and str((existing.get("supervisor_verdict") or {}).get("schema_version") or "")
+                == "hermes.supervisor-verdict.v1"
+                and str((existing.get("supervisor_verdict") or {}).get("artifact_digest") or "")
+                == expected_artifact_digest
+                and bool((existing.get("supervisor_verdict") or {}).get("evidence_refs"))
+                and str((existing.get("supervisor_verdict") or {}).get("source_revision") or "").strip()
+                and str((existing.get("supervisor_verdict") or {}).get("prompt_version") or "").strip()
+            )
             and hmac.compare_digest(
                 str(existing.get("evidence_sha256") or ""),
                 evidence_digest,
@@ -13024,9 +13406,16 @@ def _run_hosted_supervisor_check(
         ):
             result = str(existing["result"])
             cached_verdict = _hosted_supervisor_verdict(result)
-            if cached_verdict in {"pass", "corrective_action"} and hmac.compare_digest(
-                str(existing.get("verdict") or ""),
-                cached_verdict,
+            if (
+                cached_verdict in {"pass", "corrective_action"}
+                and hmac.compare_digest(
+                    str(existing.get("verdict") or ""),
+                    cached_verdict,
+                )
+                and not _supervisor_result_contradicts_verdict(
+                    result,
+                    cached_verdict,
+                )
             ):
                 display_result = str(existing.get("display_result") or "").strip()
                 if not display_result:
@@ -13035,7 +13424,24 @@ def _run_hosted_supervisor_check(
                         kind="supervisor",
                         checkpoint_label=checkpoint_label,
                     )
-                return result, "completed", dict(existing)
+                cached_state = dict(existing)
+                _HOSTED_PROMPT_METRICS.observe(
+                    schema_valid=True,
+                    verdict=cached_verdict,
+                    prompt_cache_hit=True,
+                    token_cost=0,
+                    context=f"{check_id}:cache",
+                )
+                return result, "completed", cached_state
+            cached_result_invalid = True
+        elif (
+            isinstance(existing, dict)
+            and str(existing.get("status") or "") == "completed"
+            and str(existing.get("result") or "").strip()
+        ):
+            # A completed pre-upgrade or partially migrated record is not a
+            # reusable role result. Mark it invalid so execution gets a fresh
+            # role_stage instead of returning the completed role projection.
             cached_result_invalid = True
 
     now = int(time.time() * 1000)
@@ -13131,10 +13537,47 @@ def _run_hosted_supervisor_check(
         if evidence_truncated or status != "completed"
         else _hosted_supervisor_verdict(result)
     )
+    control = _hosted_supervisor_control(result) if not evidence_truncated else None
+    runtime_verdict = build_supervisor_verdict(
+        control,
+        evidence=redacted_evidence,
+        evidence_digest=evidence_digest,
+        artifact_digest=str(redacted_evidence.get("artifact_digest") or ""),
+        source_revision=source_revision,
+        prompt_version=prompt_version,
+        model=str(
+            redacted_evidence.get("model")
+            or role_state.get("actual_model")
+            or ""
+        ),
+    )
+    # The runtime witness is authoritative. A legacy parser may recognize a
+    # narrative marker, but it cannot turn an invalid witness into PASS.
+    if not runtime_verdict.valid:
+        verdict = "unknown"
+    else:
+        verdict = runtime_verdict.verdict
     persisted_status = (
         "completed"
         if status == "completed" and verdict in {"pass", "corrective_action"}
         else "failed"
+    )
+    _HOSTED_PROMPT_METRICS.observe(
+        schema_valid=runtime_verdict.valid,
+        verdict=verdict,
+        false_pass=(_hosted_supervisor_verdict(result) == "pass" and not runtime_verdict.valid),
+        strict_reject=not runtime_verdict.valid,
+        rework_requested=verdict == "corrective_action",
+        rework_accepted=verdict == "corrective_action" and persisted_status == "completed",
+        prompt_cache_hit=(
+            bool(role_state.get("prompt_cache_hit"))
+            if "prompt_cache_hit" in role_state
+            else None
+        ),
+        token_cost=int(role_state.get("token_cost") or 0),
+        artifact_checked=bool(redacted_evidence.get("artifact_required") or redacted_evidence.get("artifacts")),
+        artifact_accepted=verdict == "pass" and runtime_verdict.artifact_digest not in {"", "none"},
+        context=check_id,
     )
     display_result = _hosted_control_display(
         result,
@@ -13191,12 +13634,14 @@ def _run_hosted_supervisor_check(
             "result": result,
             "display_result": display_result,
             "verdict": verdict,
+            "supervisor_verdict": runtime_verdict.public_dict(),
             "profile": supervisor_profile,
             "role_stage": role_stage,
             "evidence_sha256": evidence_digest,
             "evidence": bounded_evidence,
             "evidence_truncated": evidence_truncated,
             "activities": list(role_state.get("activities") or []),
+            "prompt_metrics": _HOSTED_PROMPT_METRICS.snapshot(),
             "completed_at": completed_at,
         },
     )
@@ -13232,6 +13677,13 @@ def _run_hosted_supervisor_check(
                         # the card always renders its text.
                         "summary": str(display_result)[:4000],
                         "check_id": str(check_id),
+                        "schema_version": runtime_verdict.schema_version,
+                        "evidence_refs": list(runtime_verdict.evidence_refs),
+                        "artifact_digest": runtime_verdict.artifact_digest,
+                        "source_revision": runtime_verdict.source_revision,
+                        "prompt_version": runtime_verdict.prompt_version,
+                        "evidence_digest": runtime_verdict.evidence_digest,
+                        "witness_valid": runtime_verdict.valid,
                     },
                 )
                 save_single_state(state)
@@ -13508,6 +13960,57 @@ def execute_hosted_workflow(
     worker_profiles = list(manager_plan.get("workers") or fallback_worker_profiles)
     if manager_plan.get("reviewer_target") == "pc":
         reviewer_connector_id = "pc-primary"
+    turn_plan = build_hosted_turn_plan(
+        turn_id=turn_id,
+        worker_profiles=worker_profiles,
+        reviewer_profile=reviewer_profile,
+        reporter_profile=reporter_profile,
+        artifact_required=artifact_required,
+        revision=max(1, int(run.get("turn_plan_revision") or 1)),
+    )
+    # Manager planning has already completed before the plan is materialized;
+    # the persisted ready queue must therefore expose dispatch as the next
+    # executable node, not replay an obsolete initial state.
+    turn_plan_snapshot = hosted_turn_plan_snapshot(
+        turn_plan,
+        completed=("manager_planning",),
+    )
+    _persist_hosted_turn(
+        conversation_id,
+        turn_id,
+        patch={
+            "turn_plan": turn_plan_snapshot,
+            "turn_plan_revision": turn_plan.revision,
+            "turn_plan_critical_path": turn_plan_snapshot["critical_path"],
+            "turn_plan_ready_nodes": turn_plan_snapshot["initial_ready_nodes"],
+        },
+        protocol_events=[
+            {
+                "event_type": "turn.plan_created",
+                "role_stage": "turn",
+                "entity_id": f"{turn_id}:plan:{turn_plan.revision}",
+                "idempotency_key": f"turn-plan:{turn_id}:{turn_plan.revision}",
+                "payload": {
+                    "plan_id": turn_plan.plan_id,
+                    "revision": turn_plan.revision,
+                    "critical_path": list(turn_plan.critical_path()),
+                    "ready_nodes": list(turn_plan_snapshot["initial_ready_nodes"]),
+                },
+                "runtime": {
+                    "component_id": f"fiber:plan:{turn_id}",
+                    "lifecycle_state": "declared",
+                    "plan_node_id": "dispatch",
+                    "contract_revision": "hosted-turn-plan.v1",
+                },
+            }
+        ],
+    )
+    _observe_runtime_provider(
+        provider_id=_runtime_provider_id("model", str(run.get("model_provider") or "default")),
+        interface_key="model:hosted",
+        health="healthy" if str(run.get("model_provider") or "") else "unknown",
+        metadata={"turn_id": turn_id, "generation": execution_generation},
+    )
     artifact_producer_profiles = set(
         str(profile)
         for profile in (
@@ -13652,6 +14155,7 @@ def execute_hosted_workflow(
                     {} if remote_workers else profile_task_ids
                 ),
                 "artifact_required": artifact_required,
+                "artifact_acceptance_required": False,
             },
             runner=runner,
             remote=remote_workers,
@@ -13670,6 +14174,63 @@ def execute_hosted_workflow(
     )
     if _finish_hosted_turn_if_cancelled(conversation_id, turn_id):
         return
+
+    ready_worker_nodes = next_ready_plan_nodes(
+        turn_plan,
+        completed=("manager_planning", "dispatch"),
+    )
+    ready_worker_ids = {node.node_id for node in ready_worker_nodes}
+    _persist_hosted_turn(
+        conversation_id,
+        turn_id,
+        patch={
+            "turn_plan_ready_nodes": sorted(ready_worker_ids),
+        },
+        protocol_events=[
+            {
+                "event_type": "turn.node_completed",
+                "role_stage": "turn",
+                "entity_id": f"{turn_id}:node:manager_planning",
+                "idempotency_key": f"turn-node-completed:{turn_id}:manager_planning",
+                "payload": {"plan_node_id": "manager_planning", "status": "completed"},
+                "runtime": {
+                    "component_id": f"fiber:{turn_id}:manager_planning",
+                    "lifecycle_state": "completed",
+                    "plan_node_id": "manager_planning",
+                    "contract_revision": "hosted-turn-plan.v1",
+                },
+            },
+            {
+                "event_type": "turn.node_completed",
+                "role_stage": "turn",
+                "entity_id": f"{turn_id}:node:dispatch",
+                "idempotency_key": f"turn-node-completed:{turn_id}:dispatch",
+                "payload": {"plan_node_id": "dispatch", "status": "completed"},
+                "runtime": {
+                    "component_id": f"fiber:{turn_id}:dispatch",
+                    "lifecycle_state": "completed",
+                    "plan_node_id": "dispatch",
+                    "contract_revision": "hosted-turn-plan.v1",
+                },
+            },
+            *(
+                {
+                    "event_type": "turn.node_ready",
+                    "role_stage": "turn",
+                    "entity_id": f"{turn_id}:node:{node.node_id}",
+                    "idempotency_key": f"turn-node-ready:{turn_id}:{node.node_id}",
+                    "payload": {"plan_node_id": node.node_id, "status": "ready"},
+                    "runtime": {
+                        "component_id": f"fiber:{node.node_id}",
+                        "lifecycle_state": "active",
+                        "plan_node_id": node.node_id,
+                        "contract_revision": "hosted-turn-plan.v1",
+                    },
+                }
+                for node in ready_worker_nodes
+            ),
+        ],
+    )
 
     _persist_hosted_turn(
         conversation_id,
@@ -13905,6 +14466,7 @@ def execute_hosted_workflow(
     pending_workers = [
         profile
         for profile in worker_profiles
+        if f"worker:{profile}" in ready_worker_ids
         if worker_statuses.get(profile) != "completed" or not worker_results.get(profile)
     ]
     if pending_workers:
@@ -13930,6 +14492,30 @@ def execute_hosted_workflow(
                         "worker_statuses": dict(worker_statuses),
                         "stage": "worker_running",
                     },
+                    protocol_events=[
+                        {
+                            "event_type": (
+                                "turn.node_completed"
+                                if status == "completed"
+                                else "turn.node_blocked"
+                            ),
+                            "role_stage": "turn",
+                            "entity_id": f"{turn_id}:node:worker:{profile}",
+                            "idempotency_key": f"turn-node-result:{turn_id}:worker:{profile}",
+                            "payload": {
+                                "plan_node_id": f"worker:{profile}",
+                                "status": status,
+                            },
+                            "runtime": {
+                                "component_id": f"fiber:worker:{profile}",
+                                "lifecycle_state": (
+                                    "completed" if status == "completed" else "failed"
+                                ),
+                                "plan_node_id": f"worker:{profile}",
+                                "contract_revision": "hosted-turn-plan.v1",
+                            },
+                        }
+                    ],
                 )
                 if manager_plan.get("plan"):
                     _persist_hosted_plan_snapshot(
@@ -14605,6 +15191,10 @@ def execute_hosted_workflow(
                 "supervisor_findings": supervisor_findings,
                 "artifact_required": artifact_required,
                 "artifacts": handoff_artifacts,
+                # A final report must bind to artifacts only when this turn's
+                # route actually requires a deliverable. Ordinary hosted
+                # turns remain evidence-bound without inventing a file digest.
+                "artifact_acceptance_required": bool(artifact_required),
             },
             runner=runner,
             remote=remote_workers,
@@ -15343,6 +15933,11 @@ def _room_projection(
 ) -> dict[str, Any]:
     projected = dict(room)
     projected.pop("owner_id", None)
+    # Direct member mailboxes are fetched through their recipient-scoped
+    # endpoint; never include private messages in a room snapshot.
+    projected.pop("mailbox", None)
+    projected["mailbox_count"] = len(room.get("mailbox") or []) if isinstance(room.get("mailbox"), list) else 0
+    projected["dependencies"] = list(room.get("dependencies") or []) if isinstance(room.get("dependencies"), list) else []
     room_owner = str(room.get("owner_id") or "").strip()
     conversation_id = str(room.get("conversation_id") or "").strip()
     conversation = next(
@@ -15768,6 +16363,17 @@ class SendMessageBody(BaseModel):
     turn_id: str = ""
 
 
+class MailboxMessageBody(BaseModel):
+    sender_id: str
+    recipient_id: str
+    body: dict[str, Any] = Field(default_factory=dict)
+    idempotency_key: str = ""
+
+
+class DependencyGraphBody(BaseModel):
+    nodes: list[dict[str, Any]] = Field(default_factory=list)
+
+
 class CreateSingleConversationBody(BaseModel):
     profile: str = "default"
     client_id: str = ""
@@ -15851,6 +16457,12 @@ class HostedTurnInterventionBody(BaseModel):
     message_id: str = ""
     delivery: str = "steer"
     queue_mode: str = "one_at_a_time"
+
+
+class HostedSubagentControlBody(BaseModel):
+    message: str = ""
+    request_id: str = ""
+    reason: str = "user requested stop"
 
 
 class ConnectorPullBody(BaseModel):
@@ -19307,6 +19919,267 @@ def cancel_hosted_turn(
     return {"hosted_turn": _public_hosted_turn(run)}
 
 
+@router.get(
+    "/single/conversations/{conversation_id}/hosted-turns/{turn_id}/subagents"
+)
+def list_hosted_subagents(
+    conversation_id: str,
+    turn_id: str,
+    request: Request,
+):
+    owner_id, conversation = _owned_conversation(request, conversation_id)
+    run = (conversation.get("hosted_turns") or {}).get(turn_id)
+    if not isinstance(run, dict):
+        raise HTTPException(status_code=404, detail="Hosted turn not found")
+    generation = _account_generation_for_request(request, owner_id)
+    try:
+        result = control_hosted_subagents(
+            conversation_id,
+            owner_id=owner_id,
+            account_generation=generation,
+            action="list",
+        )
+    except (ValueError, RuntimeError) as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+    return {
+        "turn_id": turn_id,
+        "account_generation": generation,
+        "subagents": result.get("subagents") or [],
+    }
+
+
+@router.get(
+    "/single/conversations/{conversation_id}/hosted-turns/{turn_id}/trajectory"
+)
+def get_hosted_turn_trajectory(
+    conversation_id: str,
+    turn_id: str,
+    request: Request,
+):
+    """Return a bounded Codex-Trajectory-shaped view of one Hosted turn."""
+
+    owner_id, conversation = _owned_conversation(request, conversation_id)
+    run = (conversation.get("hosted_turns") or {}).get(turn_id)
+    if not isinstance(run, dict):
+        raise HTTPException(status_code=404, detail="Hosted turn not found")
+    generation = _account_generation_for_request(request, owner_id)
+    detail = str(
+        request.query_params.get("detailLevel")
+        or request.query_params.get("detail_level")
+        or "summary"
+    ).strip().lower()
+    raw_limit = request.query_params.get("maxRecords") or request.query_params.get("max_records")
+    try:
+        max_records = (
+            TRAJECTORY_DEFAULT_MAX_RECORDS
+            if raw_limit in {None, ""}
+            else int(str(raw_limit))
+        )
+    except (TypeError, ValueError) as exc:
+        raise HTTPException(status_code=422, detail="maxRecords must be an integer") from exc
+    if detail not in {"summary", "full"}:
+        raise HTTPException(status_code=422, detail="detailLevel must be summary or full")
+    if not 50 <= max_records <= TRAJECTORY_MAX_RECORDS:
+        raise HTTPException(
+            status_code=422,
+            detail=f"maxRecords must be between 50 and {TRAJECTORY_MAX_RECORDS}",
+        )
+    events = [
+        event
+        for event in (conversation.get("hosted_events") or [])
+        if isinstance(event, dict)
+        and str(event.get("turn_id") or "") == turn_id
+        and str(event.get("account_generation") or "") == generation
+    ]
+    route = run.get("route_metadata") if isinstance(run.get("route_metadata"), dict) else {}
+    trajectory = project_hosted_trajectory(
+        events,
+        session_id=turn_id,
+        title=str(run.get("title") or run.get("content") or "Hermes hosted task"),
+        model=str(route.get("model") or "") or None,
+        detail_level=detail,
+        max_records=max_records,
+    )
+    return {
+        "turn_id": turn_id,
+        "account_generation": generation,
+        "trajectory": trajectory,
+    }
+
+
+def _control_hosted_subagent(
+    conversation_id: str,
+    turn_id: str,
+    subagent_id: str,
+    request: Request,
+    *,
+    action: str,
+    payload: HostedSubagentControlBody,
+) -> dict[str, Any]:
+    normalized_id = str(subagent_id or "").strip()[:256]
+    if not normalized_id:
+        raise HTTPException(status_code=422, detail="subagent_id is required")
+    owner_id, conversation = _owned_conversation(request, conversation_id)
+    run = (conversation.get("hosted_turns") or {}).get(turn_id)
+    if not isinstance(run, dict):
+        raise HTTPException(status_code=404, detail="Hosted turn not found")
+    generation = _account_generation_for_request(request, owner_id)
+    message = str(payload.message or "").strip()
+    request_id = str(payload.request_id or "").strip()[:256]
+    if not request_id:
+        request_id = f"subagent:{action}:{turn_id}:{normalized_id}:{uuid.uuid4().hex[:12]}"
+    with _SUBAGENT_CONTROL_LOCK:
+        # Check the durable request ledger before calling the real gateway.
+        # A retry must not send a second steer/stop to a live child merely
+        # because the first HTTP response was lost.
+        with _STATE_LOCK:
+            state = load_single_state()
+            persisted_conversation = _conversation_by_id(state, conversation_id)
+            persisted_run = (persisted_conversation.get("hosted_turns") or {}).get(turn_id)
+            if not isinstance(persisted_run, dict):
+                raise HTTPException(status_code=404, detail="Hosted turn not found")
+            controls = persisted_run.get("subagent_controls")
+            controls = controls if isinstance(controls, list) else []
+            existing = next(
+                (
+                    item for item in controls
+                    if isinstance(item, dict)
+                    and str(item.get("request_id") or "") == request_id
+                ),
+                None,
+            )
+        if existing is not None:
+            existing_target = str(
+                existing.get("subagent_id") or existing.get("entity_id") or ""
+            )
+            if (
+                str(existing.get("control_action") or "") != action
+                or existing_target != normalized_id
+            ):
+                raise HTTPException(
+                    status_code=409,
+                    detail="request_id is already bound to another subagent control",
+                )
+            return {
+                "accepted": True,
+                "replayed": True,
+                "turn_id": turn_id,
+                "subagent_id": normalized_id,
+                "action": action,
+                "control": {
+                    "status": existing.get("control_status") or "accepted",
+                    "replayed": True,
+                },
+            }
+        if str(persisted_run.get("status") or "") in _HOSTED_TERMINAL_STATUSES:
+            raise HTTPException(status_code=409, detail="Hosted turn is already terminal")
+        if action == "steer" and not message:
+            raise HTTPException(status_code=422, detail="message is required")
+        result = control_hosted_subagents(
+            conversation_id,
+            owner_id=owner_id,
+            account_generation=generation,
+            action=action,
+            subagent_id=normalized_id,
+            message=message[:2000],
+        )
+        accepted = (
+            result.get("status") == "queued"
+            if action == "steer"
+            else bool(result.get("found"))
+        )
+        if not accepted:
+            raise HTTPException(status_code=409, detail="Subagent is not controllable")
+        now = int(time.time() * 1000)
+        event_payload: dict[str, Any] = {
+            "entity_id": normalized_id,
+            "subagent_id": normalized_id,
+            "control_action": action,
+            "control_status": "queued" if action == "steer" else "stop_requested",
+            "request_id": request_id,
+        }
+        if action == "steer":
+            event_payload.update(
+                {
+                    "message_chars": len(message),
+                    "message_digest": hashlib.sha256(message.encode("utf-8")).hexdigest(),
+                }
+            )
+        else:
+            reason = str(payload.reason or "user requested stop").strip()[:500]
+            event_payload["reason"] = reason
+        with _STATE_LOCK:
+            state = load_single_state()
+            persisted_conversation = _conversation_by_id(state, conversation_id)
+            persisted_run = (persisted_conversation.get("hosted_turns") or {}).get(turn_id)
+            if not isinstance(persisted_run, dict):
+                raise HTTPException(status_code=404, detail="Hosted turn not found")
+            persisted_run.setdefault("subagent_controls", []).append(event_payload)
+            persisted_run["updated_at"] = now
+            append_hosted_event(
+                persisted_conversation,
+                conversation_id=conversation_id,
+                turn_id=turn_id,
+                role_stage="subagent",
+                event_type="subagent.progress",
+                entity_id=normalized_id,
+                idempotency_key=request_id,
+                account_generation=generation,
+                payload=event_payload,
+                occurred_at=now,
+            )
+            persisted_conversation["updated_at"] = now
+            save_single_state(state)
+    _notify_hosted_update(conversation_id)
+    return {
+        "accepted": True,
+        "turn_id": turn_id,
+        "subagent_id": normalized_id,
+        "action": action,
+        "control": result,
+    }
+
+
+@router.post(
+    "/single/conversations/{conversation_id}/hosted-turns/{turn_id}/subagents/{subagent_id}/steer"
+)
+def steer_hosted_subagent(
+    conversation_id: str,
+    turn_id: str,
+    subagent_id: str,
+    payload: HostedSubagentControlBody,
+    request: Request,
+):
+    return _control_hosted_subagent(
+        conversation_id,
+        turn_id,
+        subagent_id,
+        request,
+        action="steer",
+        payload=payload,
+    )
+
+
+@router.post(
+    "/single/conversations/{conversation_id}/hosted-turns/{turn_id}/subagents/{subagent_id}/stop"
+)
+def stop_hosted_subagent(
+    conversation_id: str,
+    turn_id: str,
+    subagent_id: str,
+    payload: HostedSubagentControlBody,
+    request: Request,
+):
+    return _control_hosted_subagent(
+        conversation_id,
+        turn_id,
+        subagent_id,
+        request,
+        action="stop",
+        payload=payload,
+    )
+
+
 @router.post(
     "/single/conversations/{conversation_id}/hosted-turns/{turn_id}/interventions"
 )
@@ -19956,6 +20829,116 @@ def get_room(room_id: str, request: Request):
         }
 
 
+@router.get("/rooms/{room_id}/mailbox")
+def get_room_mailbox(room_id: str, request: Request, recipient_id: str = "", after_id: str = "", limit: int = 100):
+    """Read direct member messages without broadcasting the room mailbox."""
+
+    owner_id = owner_id_from_request(request)
+    account_generation = _account_generation_for_request(request, owner_id)
+    recipient = str(recipient_id or "").strip()[:256]
+    if not recipient:
+        raise HTTPException(status_code=400, detail="recipient_id is required")
+    with _STATE_LOCK:
+        state = load_state()
+        room = _owned_room_in_state(state, room_id, owner_id, account_generation)
+        messages = read_mailbox(
+            room.get("mailbox") or [],
+            recipient,
+            account_generation,
+            after_id=str(after_id or "").strip()[:256],
+            limit=limit,
+        )
+    return {"room_id": room_id, "recipient_id": recipient, "messages": messages}
+
+
+@router.post("/rooms/{room_id}/mailbox")
+def send_room_mailbox_message(room_id: str, payload: MailboxMessageBody, request: Request):
+    """Append one idempotent, generation-bound direct member message."""
+
+    owner_id = owner_id_from_request(request)
+    account_generation = _account_generation_for_request(request, owner_id)
+    sender = str(payload.sender_id or "").strip()[:256]
+    recipient = str(payload.recipient_id or "").strip()[:256]
+    if not sender or not recipient or sender == recipient:
+        raise HTTPException(status_code=400, detail="sender_id and recipient_id must be distinct")
+    if len(json.dumps(payload.body, ensure_ascii=False, default=str)) > 64_000:
+        raise HTTPException(status_code=413, detail="mailbox body is too large")
+    with _STATE_LOCK:
+        state = load_state()
+        room = _owned_room_in_state(state, room_id, owner_id, account_generation)
+        member_ids = {hosted_member_id(profile) for profile in room.get("profiles") or []}
+        member_ids.update({"user", owner_id})
+        if sender not in member_ids or recipient not in member_ids:
+            raise HTTPException(status_code=403, detail="sender or recipient is not a room member")
+        mailbox = room.setdefault("mailbox", [])
+        record = append_mailbox(
+            mailbox,
+            MailboxMessage(
+                sender_id=sender,
+                recipient_id=recipient,
+                body=dict(payload.body),
+                idempotency_key=str(payload.idempotency_key or "").strip()[:256],
+                account_generation=account_generation,
+            ),
+        )
+        room["updated_at"] = int(time.time() * 1000)
+        save_state(state)
+    return {"ok": True, "message": record}
+
+
+@router.get("/rooms/{room_id}/dependencies")
+def get_room_dependencies(room_id: str, request: Request):
+    owner_id = owner_id_from_request(request)
+    account_generation = _account_generation_for_request(request, owner_id)
+    with _STATE_LOCK:
+        state = load_state()
+        room = _owned_room_in_state(state, room_id, owner_id, account_generation)
+        nodes = [
+            CollaborationDependency(
+                node_id=str(item.get("node_id") or ""),
+                requires=tuple(str(value) for value in item.get("requires") or ()),
+                acceptance_contract=str(item.get("acceptance_contract") or ""),
+                conflict_key=str(item.get("conflict_key") or ""),
+                budget=dict(item.get("budget") or {}),
+                state=str(item.get("state") or "pending"),
+            )
+            for item in room.get("dependencies") or []
+            if isinstance(item, dict)
+        ]
+        graph = DependencyGraph(nodes)
+    return {"room_id": room_id, "nodes": graph.snapshot(), "ready": graph.ready()}
+
+
+@router.put("/rooms/{room_id}/dependencies")
+def put_room_dependencies(room_id: str, payload: DependencyGraphBody, request: Request):
+    owner_id = owner_id_from_request(request)
+    account_generation = _account_generation_for_request(request, owner_id)
+    if len(payload.nodes) > 256:
+        raise HTTPException(status_code=413, detail="dependency graph is too large")
+    try:
+        nodes = [
+            CollaborationDependency(
+                node_id=str(item.get("node_id") or "").strip()[:256],
+                requires=tuple(str(value).strip()[:256] for value in item.get("requires") or ()),
+                acceptance_contract=str(item.get("acceptance_contract") or "")[:2000],
+                conflict_key=str(item.get("conflict_key") or "")[:256],
+                budget={str(key): max(0, int(value)) for key, value in dict(item.get("budget") or {}).items()},
+                state=str(item.get("state") or "pending"),
+            )
+            for item in payload.nodes
+        ]
+        graph = DependencyGraph(nodes)
+    except (TypeError, ValueError) as exc:
+        raise HTTPException(status_code=400, detail=f"invalid dependency graph: {exc}") from exc
+    with _STATE_LOCK:
+        state = load_state()
+        room = _owned_room_in_state(state, room_id, owner_id, account_generation)
+        room["dependencies"] = graph.snapshot()
+        room["updated_at"] = int(time.time() * 1000)
+        save_state(state)
+    return {"ok": True, "room_id": room_id, "nodes": graph.snapshot(), "ready": graph.ready()}
+
+
 @router.delete("/rooms/{room_id}")
 def delete_room(room_id: str, request: Request):
     owner_id = owner_id_from_request(request)
@@ -20265,6 +21248,7 @@ def _discover_profile_toolsets(
 
     backend = _backend_api()
     hints = [str(item) for item in (capability_hints or []) if str(item).strip()]
+    _refresh_mcp_provider_catalog(hints)
     configured = config.get("mcp_servers") if isinstance(config, dict) else {}
     configured = configured if isinstance(configured, dict) else {}
     full_static = str(os.environ.get("HERMES_FULL_TOOL_DEFINITIONS") or "").strip().lower() in {
@@ -20302,6 +21286,13 @@ def _discover_profile_toolsets(
             and snapshot.registered_tools
             and snapshot.name in selected
         }
+    for selected_name in sorted(live_selected):
+        _observe_runtime_provider(
+            provider_id=_runtime_provider_id("mcp", selected_name),
+            interface_key=f"mcp:{selected_name}",
+            health="healthy",
+            metadata={"selected": True, "capability_hints": hints},
+        )
     base_toolsets = set(
         backend._get_platform_tools(
             config,
@@ -20319,8 +21310,46 @@ def _profile_event_runner_main() -> int:
     """Child-process entrypoint that emits only structured Hermes JSONL events."""
     real_stdout = sys.stdout
     emit_lock = threading.Lock()
+    agent_ref: list[Any] = [None]
+    last_model_witness_ref = ""
 
     def emit(event_type: str, payload: Optional[dict[str, Any]] = None) -> None:
+        nonlocal last_model_witness_ref
+        current_agent = agent_ref[0]
+        if current_agent is not None and event_type != "provider.registered":
+            current_provider = str(getattr(current_agent, "provider", "") or "").strip()
+            current_model = str(getattr(current_agent, "model", "") or "").strip()
+            if current_provider:
+                current_witness = _observe_runtime_provider(
+                    provider_id=_runtime_provider_id(
+                        "model",
+                        f"{current_provider}:{current_model or 'default'}",
+                    ),
+                    interface_key="model:hosted",
+                    health="healthy",
+                    metadata={
+                        "provider": current_provider,
+                        "model": current_model,
+                    },
+                )
+                current_ref = _provider_witness_ref(current_witness)
+                if current_ref and current_ref != last_model_witness_ref:
+                    last_model_witness_ref = current_ref
+                    witness_event = {
+                        "type": "provider.registered",
+                        "payload": current_witness or {},
+                    }
+                    with emit_lock:
+                        real_stdout.write(
+                            json.dumps(
+                                witness_event,
+                                ensure_ascii=False,
+                                separators=(",", ":"),
+                                default=str,
+                            )
+                            + "\n"
+                        )
+                        real_stdout.flush()
         event = {"type": event_type, "payload": payload or {}}
         line = json.dumps(event, ensure_ascii=False, separators=(",", ":"), default=str)
         with emit_lock:
@@ -20388,6 +21417,26 @@ def _profile_event_runner_main() -> int:
             for snapshot in backend.get_mcp_availability()
             if snapshot.name in selected_mcp_names
         ]
+        for snapshot in mcp_availability:
+            mcp_name = str(snapshot.get("name") or "").strip()
+            if not mcp_name:
+                continue
+            mcp_witness = _observe_runtime_provider(
+                provider_id=_runtime_provider_id("mcp", mcp_name),
+                interface_key=f"mcp:{mcp_name}",
+                health=(
+                    "healthy"
+                    if bool(snapshot.get("live"))
+                    or str(snapshot.get("state") or "").lower() in {"ready", "connected"}
+                    else str(snapshot.get("state") or "unknown")
+                ),
+                metadata={
+                    "mcp_name": mcp_name,
+                    "registered_tools": list(snapshot.get("registered_tools") or ())[:100],
+                },
+            )
+            if mcp_witness:
+                emit("provider.registered", mcp_witness)
         managed_mcp_servers = sorted(
             name
             for name, server in (cfg.get("mcp_servers") or {}).items()
@@ -20415,6 +21464,23 @@ def _profile_event_runner_main() -> int:
             requested=provider,
             target_model=model or None,
         )
+        model_provider_id = _runtime_provider_id(
+            "model",
+            f"{str(getattr(runtime, 'provider', None) or provider or 'default')}:{model or 'default'}",
+        )
+        model_witness = _observe_runtime_provider(
+            provider_id=model_provider_id,
+            interface_key="model:hosted",
+            health="healthy",
+            metadata={
+                "provider": str(getattr(runtime, "provider", None) or provider or "default"),
+                "model": model or "",
+                "generation": str(request_payload.get("account_generation") or ""),
+            },
+        )
+        if model_witness:
+            last_model_witness_ref = _provider_witness_ref(model_witness)
+            emit("provider.registered", model_witness)
         fallback = get_fallback_chain(cfg)
         tool_started_at: dict[str, float] = {}
 
@@ -20542,6 +21608,7 @@ def _profile_event_runner_main() -> int:
                 dict(payload) if isinstance(payload, dict) else {},
             ),
         )
+        agent_ref[0] = agent
         # The hosted child owns the model retry loop. Keeping this inside the
         # child preserves one session and prevents the outer workflow from
         # replaying a prompt or repeating a tool side effect.

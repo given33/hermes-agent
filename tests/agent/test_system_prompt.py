@@ -5,6 +5,8 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
 
+import pytest
+
 from agent.system_prompt import build_system_prompt, build_system_prompt_parts
 
 
@@ -145,7 +147,7 @@ def test_coding_prompt_preserves_legacy_workspace_order(monkeypatch):
 
     expected_profile = (
         "Active Hermes profile: default. Other profiles (if any) live "
-        "under /hermes/profiles/<name>/. Each profile has its own skills/, "
+        f"under {Path('/hermes')}/profiles/<name>/. Each profile has its own skills/, "
         "plugins/, cron/, and memories/ that affect a different session than "
         "this one. Do not modify another profile's skills/plugins/cron/memories "
         "unless the user explicitly directs you to."
@@ -183,6 +185,56 @@ def test_coding_prompt_preserves_legacy_workspace_order(monkeypatch):
 
     assert prompt == expected
     assert agent._cached_system_prompt_static == "\n\n".join(expected.split("\n\n")[:4])
+
+
+def test_prompt_runtime_injects_capability_owned_ptc_guidance():
+    agent = _make_agent(
+        valid_tool_names=["execute_code"],
+        tools=[{"type": "function", "function": {"name": "execute_code"}}],
+        _prompt_runtime_mode="ptc",
+    )
+    with patch(
+        "tools.registry.registry.get_prompt_guidance",
+        return_value={"execute_code": "CAPABILITY OWNED GUIDANCE"},
+    ):
+        stable = _stable_prompt(agent)
+
+    assert "PTC mode is active" in stable
+    assert "CAPABILITY OWNED GUIDANCE" in stable
+    assert agent._prompt_runtime_metadata["tool_count"] == 1
+
+
+def test_creation_guidance_requires_visible_creation_capability():
+    without_skill = _make_agent(
+        valid_tool_names=["read_file"],
+        _prompt_runtime_mode="creation",
+    )
+    with_skill = _make_agent(
+        valid_tool_names=["skill_manage"],
+        _prompt_runtime_mode="creation",
+    )
+
+    assert "Creation mode is active" not in _stable_prompt(without_skill)
+    assert "Creation mode is active" in _stable_prompt(with_skill)
+
+
+def test_prompt_runtime_template_error_fails_before_model_assembly():
+    from hermes_runtime.prompt_runtime import (
+        PromptFragment,
+        PromptTemplateError,
+        default_prompt_runtime,
+    )
+
+    dispose = default_prompt_runtime().register_fragment(PromptFragment(
+        name="test:strict-template",
+        section="persona",
+        text="{{missing_test_variable}}",
+    ))
+    try:
+        with pytest.raises(PromptTemplateError, match="unknown prompt variable"):
+            _stable_prompt(_make_agent())
+    finally:
+        dispose()
 
 
 class TestTelegramRichMessagesHint:

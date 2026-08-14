@@ -47,6 +47,7 @@ from hermes_services.tool_contract import (
     tool_contract_event_metadata,
     validate_tool_contract_binding,
 )
+from hermes_runtime.tool_execution import ToolExecutionLedger, build_envelope
 from tools import (
     approval as _tool_approval,
     budget_config as _budget_config,
@@ -259,13 +260,30 @@ def _resolve_concurrent_tool_timeout(tool_names: list[str] | None = None) -> flo
 
 def _tool_contract_approval_block(function_name: str) -> str | None:
     contract = resolve_tool_contract(function_name)
-    if not contract.requires_approval:
+    entry = _tool_registry.registry.get_entry(function_name)
+    effect_metadata = entry.effect_metadata if entry is not None else {}
+    irreversible = effect_metadata.get("reversibility") == "irreversible"
+    if not contract.requires_approval and not irreversible:
         return None
+
+    if contract.requires_approval:
+        reason = (
+            f"The {function_name} tool is marked as requiring approval by its "
+            "execution contract."
+        )
+        rule_key = f"tool_contract:{function_name}"
+    else:
+        boundary = str(effect_metadata.get("external_boundary") or "external")
+        reason = (
+            f"The {function_name} tool declares an irreversible side effect "
+            f"across the {boundary} boundary."
+        )
+        rule_key = f"irreversible_effect:{function_name}"
 
     decision = _tool_approval.request_tool_approval(
         function_name,
-        f"The {function_name} tool is marked as requiring approval by its execution contract.",
-        rule_key=f"tool_contract:{function_name}",
+        reason,
+        rule_key=rule_key,
         approval_callback=get_approval_callback(),
     )
     if decision.get("approved") is True:
@@ -405,6 +423,20 @@ def _emit_terminal_post_tool_call(
     error_message: str | None = None,
     middleware_trace: Optional[list[dict[str, Any]]] = None,
 ) -> None:
+    ledger = getattr(agent, "_tool_execution_ledger", None)
+    if ledger is not None and tool_call_id:
+        terminal_status = status
+        if terminal_status is None:
+            terminal_status = "failed" if error_type or _detect_tool_failure(function_name, result)[0] else "completed"
+        try:
+            ledger.finish(
+                str(tool_call_id),
+                terminal_status,
+                result=result,
+                error_type=error_type or "",
+            )
+        except Exception:
+            logger.debug("tool execution ledger finish failed", exc_info=True)
     try:
         from model_tools import _emit_post_tool_call_hook
         _emit_post_tool_call_hook(
@@ -424,6 +456,18 @@ def _emit_terminal_post_tool_call(
         )
     except Exception:
         pass
+
+
+def _execution_metadata(agent, tool_call_id: str) -> dict | None:
+    ledger = getattr(agent, "_tool_execution_ledger", None)
+    if ledger is None or not tool_call_id:
+        return None
+    try:
+        envelope = ledger.get(str(tool_call_id))
+        return envelope.as_dict() if envelope is not None else None
+    except Exception:
+        logger.debug("tool execution ledger projection failed", exc_info=True)
+        return None
 
 
 def _cancelled_tool_result(reason: str = "user interrupt") -> str:
@@ -700,6 +744,16 @@ def _run_agent_tool_execution_middleware(
                 else authorization_gate.run(_resolve_pre_tool_block)
             )
 
+        if block_message is None:
+            approval_check = lambda: _tool_contract_approval_block(function_name)
+            block_message = (
+                approval_check()
+                if authorization_gate is None
+                else authorization_gate.run(approval_check)
+            )
+            if block_message is not None:
+                block_error_type = "tool_contract_approval"
+
         guardrail_decision = None
         if block_message is None:
             guardrail_decision = agent._tool_guardrails.before_call(
@@ -807,6 +861,27 @@ def _begin_tool_execution(
     display_index: int | None,
 ) -> None:
     """Run user-visible and checkpoint preflight on final tool arguments."""
+    try:
+        ledger = getattr(agent, "_tool_execution_ledger", None)
+        if ledger is None:
+            ledger = ToolExecutionLedger()
+            agent._tool_execution_ledger = ledger
+        from tools.registry import registry as _execution_registry
+        entry = _execution_registry.get_entry(function_name)
+        ledger.start(build_envelope(
+            tool_name=function_name,
+            args=function_args,
+            call_id=str(tool_call_id or ""),
+            parent_call_id=str(getattr(agent, "_active_tool_parent_call_id", "") or ""),
+            owner_id=str(getattr(agent, "owner_id", "") or ""),
+            session_id=str(getattr(agent, "session_id", "") or ""),
+            turn_id=str(getattr(agent, "_current_turn_id", "") or ""),
+            profile=str(getattr(agent, "profile", "") or ""),
+            registry_generation=int(getattr(_execution_registry, "_generation", 0) or 0),
+            effect_metadata=getattr(entry, "effect_metadata", {}) if entry else {},
+        ))
+    except Exception:
+        logger.debug("tool execution ledger start failed", exc_info=True)
     if not agent.quiet_mode and getattr(agent, "tool_progress_mode", "all") != "off":
         display_args = (
             _redact_tool_args_for_display(function_name, function_args) or function_args
@@ -1633,6 +1708,7 @@ def execute_tool_calls_concurrent(agent, assistant_message, messages: list, effe
             _tool_content,
             tc.id,
             effect_disposition=effect_disposition,
+            execution_envelope=_execution_metadata(agent, tc.id),
         )
         messages.append(tool_message)
         risk_metadata = tool_message.get("_tool_output_risk")
@@ -2171,6 +2247,7 @@ def execute_tool_calls_sequential(agent, assistant_message, messages: list, effe
                             if agent.valid_tool_names
                             else None
                         ),
+                        tool_role=getattr(agent, "tool_role", None),
                         skip_pre_tool_call_hook=True,
                         skip_tool_request_middleware=True,
                         skip_tool_execution_middleware=True,
@@ -2250,6 +2327,7 @@ def execute_tool_calls_sequential(agent, assistant_message, messages: list, effe
                             if agent.valid_tool_names
                             else None
                         ),
+                        tool_role=getattr(agent, "tool_role", None),
                         skip_pre_tool_call_hook=True,
                         skip_tool_request_middleware=True,
                         skip_tool_execution_middleware=True,
@@ -2398,7 +2476,12 @@ def execute_tool_calls_sequential(agent, assistant_message, messages: list, effe
         # Unwrap _multimodal dicts to an OpenAI-style content list
         # (see parallel path for rationale). String results pass through.
         _tool_content = agent._tool_result_content_for_active_model(function_name, function_result)
-        tool_message = make_tool_result_message(function_name, _tool_content, tool_call.id)
+        tool_message = make_tool_result_message(
+            function_name,
+            _tool_content,
+            tool_call.id,
+            execution_envelope=_execution_metadata(agent, tool_call.id),
+        )
         messages.append(tool_message)
         risk_metadata = tool_message.get("_tool_output_risk")
         if not _flush_session_db_after_tool_progress(

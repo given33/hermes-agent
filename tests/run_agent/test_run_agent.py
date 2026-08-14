@@ -147,6 +147,11 @@ def test_direct_session_db_flushes_share_marker_claim(agent):
                 self.rows.append(m["content"])
             return list(range(1, len(messages) + 1))
 
+        def flush_token_counts(self):
+            """Match the SessionDB persistence contract without I/O."""
+
+            return None
+
     db = _BarrierDB()
     agent._session_db = db
     agent._session_db_created = True
@@ -2272,6 +2277,50 @@ class TestConcurrentToolExecution:
         assert dispatched == [{"command": "true"}]
         assert errors == ["Hermes tool execution callback invoked more than once"]
         assert outcome.blocked is False
+
+    def test_managed_tool_pipeline_enforces_contract_approval_before_dispatch(
+        self,
+        agent,
+        monkeypatch,
+    ):
+        from agent import relay_tools, tool_executor
+
+        dispatched = []
+        monkeypatch.setattr(
+            "hermes_cli.middleware.apply_tool_request_middleware",
+            lambda _name, args, **_kwargs: SimpleNamespace(payload=args, trace=[]),
+        )
+        monkeypatch.setattr(
+            "hermes_cli.middleware.run_tool_execution_middleware",
+            lambda _name, args, callback, **_kwargs: callback(args),
+        )
+        monkeypatch.setattr(
+            "hermes_cli.plugins.resolve_pre_tool_block",
+            lambda *_args, **_kwargs: None,
+        )
+        monkeypatch.setattr(
+            tool_executor,
+            "_tool_contract_approval_block",
+            lambda _name: "irreversible operation was not approved",
+        )
+        monkeypatch.setattr(
+            relay_tools,
+            "execute",
+            lambda _name, args, callback, **_kwargs: (callback(args), args),
+        )
+
+        outcome = tool_executor._run_agent_tool_execution_middleware(
+            agent,
+            function_name="external_publish",
+            function_args={"target": "production"},
+            effective_task_id="task-1",
+            tool_call_id="call-1",
+            execute=lambda args: dispatched.append(args) or "published",
+        )
+
+        assert dispatched == []
+        assert outcome.blocked is True
+        assert "not approved" in outcome.result
 
 
 class TestAgentRuntimePostHookOwnershipSync:

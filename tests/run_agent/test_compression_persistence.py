@@ -99,6 +99,7 @@ class TestFlushAfterCompression:
                 f"Expected 5 compressed messages in new session, got {len(new_rows)}. "
                 f"Compression persistence bug: messages not written to SQLite."
             )
+            db.close()
 
     def test_flush_with_stale_history_loses_messages(self):
         """Stale conversation_history no longer causes data loss."""
@@ -128,6 +129,7 @@ class TestFlushAfterCompression:
             rows = db.get_messages("new-session")
             assert len(rows) == 2
             assert [row["content"] for row in rows] == ["summary", "continuing..."]
+            db.close()
 
     def test_in_place_compression_rebaseline_prevents_duplicate_compacted_rows(self):
         """In-place compaction already persisted the compacted transcript.
@@ -190,6 +192,7 @@ class TestFlushAfterCompression:
                 "tool result",
                 "final answer",
             ]
+            db.close()
 
     def test_abort_after_in_place_compaction_preserves_flush_baseline(self):
         """An aborted retry must survive flush, restart, and resume."""
@@ -404,13 +407,15 @@ class TestStoredPromptCwdDrift:
         from agent.conversation_loop import _stored_prompt_matches_runtime
 
         agent = self._make_agent()
+        old_cwd = os.path.normpath("/project/old")
+        new_cwd = os.path.normpath("/project/new")
         stored_prompt = (
-            self._host_block("/project/old")
+            self._host_block(old_cwd)
             + "Model: test/model\n"
             "Provider: openrouter\n"
         )
 
-        with patch("os.getcwd", return_value="/project/new"):
+        with patch("os.getcwd", return_value=new_cwd):
             assert _stored_prompt_matches_runtime(agent, stored_prompt) is False, (
                 "Expected False when stored cwd differs from current cwd"
             )
@@ -421,7 +426,7 @@ class TestStoredPromptCwdDrift:
         from agent.conversation_loop import _stored_prompt_matches_runtime
 
         agent = self._make_agent()
-        current_cwd = "/project/current"
+        current_cwd = os.path.normpath("/project/current")
         stored_prompt = (
             self._host_block(current_cwd)
             + "Model: test/model\n"
@@ -449,7 +454,7 @@ class TestStoredPromptCwdDrift:
         from agent.conversation_loop import _stored_prompt_matches_runtime
 
         agent = self._make_agent()
-        current_cwd = "/project/current"
+        current_cwd = os.path.normpath("/project/current")
         stored_prompt = (
             self._host_block(current_cwd)
             + "\n# AGENTS.md\n\n"
@@ -478,15 +483,17 @@ class TestStoredPromptCwdDrift:
         from agent.conversation_loop import _stored_prompt_matches_runtime
 
         agent = self._make_agent()
+        old_cwd = os.path.normpath("/project/old")
+        new_cwd = os.path.normpath("/project/new")
         stored_prompt = (
-            self._host_block("/project/old")
+            self._host_block(old_cwd)
             + "\n# AGENTS.md\n\n"
             "Current working directory: /project/new\n\n"
             "Model: test/model\n"
             "Provider: openrouter\n"
         )
 
-        with patch("os.getcwd", return_value="/project/new"):
+        with patch("os.getcwd", return_value=new_cwd):
             assert _stored_prompt_matches_runtime(agent, stored_prompt) is False, (
                 "Embedded project text naming the new cwd must not mask real "
                 "drift in the host-info block"
@@ -521,6 +528,7 @@ class TestStoredPromptCwdDrift:
                 )
             agent.platform = "cli"
             parts = build_system_prompt_parts(agent)
+            db.close()
             assert "Platform: cli" in parts["volatile"], (
                 "Built prompt missing 'Platform: cli' — drift detection cannot read it"
             )

@@ -1,0 +1,141 @@
+schema_version: "1.0"
+status: staging_golden_path_ready
+feature_freeze: true
+
+# Native Agent Loop does not import this path. Enabling it requires both
+# gates; the default process configuration leaves both false.
+runtime_layer:
+  enabled_by_default: false
+  feature_flag: HERMES_GOLDEN_PATH_ENABLED
+  runtime_gate: HERMES_RUNTIME_LAYER_ENABLED
+  native_mode_compatibility: required
+  rollback: unset_flag_and_restart
+  pure_functions_in_runtime: false
+
+golden_path:
+  flow:
+    - user_task
+    - pinned_provider_generation
+    - local_tool
+    - mcp_tool
+    - json_artifact
+    - strict_supervisor_verdict
+    - canonical_result
+    - desktop_ios_event_reducer
+  runner: hermes_runtime.golden_path.GoldenPathRunner
+  schema_version: hermes.golden-path.v1
+  contract_revision: golden-path/v1
+  artifact_kind: json
+  admitted_tool_count: 2
+  max_retries: 1
+  failure_recovery: transient_tool_or_provider_failure_only
+  provider_binding: provider_id_and_generation_are_fixed_per_turn
+
+provider:
+  staging_provider_id: model:golden-validation
+  interface_key: model:golden
+  version_range: ^1.0
+  health_required: healthy
+  generation_resolution: once_before_turn
+  generation_change_during_turn: fail_closed
+  production_model_binding: pending_authorized_staging_provider
+
+tools:
+  local:
+    name: local.read_task
+    boundary: internal_read_only
+  mcp:
+    name: mcp.visual.inspect_image
+    provider_id: hermes-visual-evidence
+    generation: 1
+    transport: stdio_adapter_or_supervised_mcp
+    scope: visual:read
+    mutation: false
+
+artifact:
+  store: hermes_runtime.golden_path.JsonArtifactStore
+  format: canonical_json
+  atomic_write: true
+  digest: sha256
+  absolute_paths_in_result: false
+  sensitive_tool_result_policy: digest_only
+
+supervisor:
+  builder: hermes_runtime.composability.supervisor_verdict.build_supervisor_verdict
+  schema_version: hermes.supervisor-verdict.v1
+  required_witnesses:
+    - evidence_refs
+    - artifact_digest
+    - source_revision
+    - prompt_version
+  pass_requires_all_checks: true
+  false_pass_hard_limit: 0
+
+quality_gate:
+  metrics: hermes_runtime.composability.golden_metrics.GoldenPathMetrics
+  hard_constraints:
+    false_pass: 0
+    stale_event_rejection_rate: 1.0
+    provider_drain_completion_rate: 1.0
+    process_recovery_rate: 1.0
+    replay_consistency_rate: 1.0
+  monitored_together:
+    - task_success_rate
+    - tool_success_rate
+    - schema_valid_rate
+    - false_reject_rate
+    - rework_precision
+    - token_cost
+    - prompt_cache_hit_rate
+    - artifact_acceptance_rate
+    - provider_drain_completion_rate
+    - stale_event_rejection_rate
+    - process_recovery_rate
+    - replay_consistency_rate
+  optimization_warning: no_single_metric_may_override_hard_constraints
+
+staging_phases:
+  - name: local_acceptance
+    duration: one_run
+    target: validation-targets
+    credential: none
+    allowlist: local_read_task_and_visual_inspect_image
+    approval_owner: local-validation-operator
+    monitor: canonical_result_and_event_lifecycle
+    stop_condition: any_schema_or_lifecycle_failure
+    rollback_owner: local-validation-operator
+  - name: short_soak
+    duration: 30m
+    target: local_mcp_sidecars
+    credential: none
+    allowlist: visual_read_and_rea_read_only
+    approval_owner: local-validation-operator
+    monitor: validation_soak_stop_policy
+    stop_condition: three_consecutive_errors_or_generation_change_or_unclosed_session
+    rollback_owner: local-validation-operator
+  - name: extended_soak
+    duration: 2h
+    target: authorized_staging_target
+    credential: pending
+    allowlist: pending_staging_allowlist
+    approval_owner: pending
+    monitor: pending_monitoring_destination
+    stop_condition: same_as_short_soak_plus_artifact_digest_mismatch
+    rollback_owner: pending_named_owner
+  - name: multi_hour
+    duration: multi_hour
+    target: authorized_staging_target
+    credential: pending
+    allowlist: pending_staging_allowlist
+    approval_owner: pending
+    monitor: pending_monitoring_destination
+    stop_condition: approved_change_window_stop_policy
+    rollback_owner: pending_named_owner
+
+production_blockers:
+  - authorized_model_provider_and_generation
+  - production_or_staging_mcp_endpoint
+  - irreversible_effect_sandbox_tenant
+  - authorized_deployment_control_channel
+  - named_monitoring_destination
+  - named_rollback_owner

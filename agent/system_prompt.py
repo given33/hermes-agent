@@ -172,6 +172,89 @@ def build_system_prompt_parts(agent: Any, system_message: Optional[str] = None) 
     # we resolve through ``_ra()`` to honor those patches.
     _r = _ra()
 
+    # Capability-owned model guidance is assembled once with the stable
+    # system prefix. Runtime context remains in Hermes' existing context and
+    # volatile tiers, preserving prompt-cache boundaries and avoiding a
+    # mid-session toolset/prompt mutation.
+    prompt_runtime_guidance = ""
+    prompt_runtime_context = ""
+    prompt_runtime_metadata = {}
+    from hermes_runtime.prompt_runtime import (
+        PromptFragment,
+        PromptRuntimeError,
+        default_prompt_runtime,
+    )
+    try:
+        from tools.registry import registry as _tool_registry
+
+        _tool_names = set(getattr(agent, "valid_tool_names", ()) or ())
+        _guidance = _tool_registry.get_prompt_guidance(_tool_names)
+        _mode = getattr(agent, "_prompt_runtime_mode", "native") or "native"
+        _fragments = []
+        for _name, _text in sorted(_guidance.items()):
+            _fragments.append(PromptFragment(
+                name=f"registry:{_name}",
+                section="tool_guidance",
+                text=_text,
+                order=100,
+                capability=_name,
+            ))
+        if _mode == "ptc" and "execute_code" in _tool_names:
+            _fragments.append(PromptFragment(
+                name="mode:ptc",
+                section="mode_guidance",
+                text=(
+                    "PTC mode is active: use execute_code for multi-step tool "
+                    "orchestration with filtering, loops, and branching. Direct "
+                    "calls remain appropriate for one-off operations, approvals, "
+                    "or interactive tools."
+                ),
+                order=90,
+            ))
+        elif _mode == "creation" and "skill_manage" in _tool_names:
+            _fragments.append(PromptFragment(
+                name="mode:creation",
+                section="mode_guidance",
+                text=(
+                    "Creation mode is active: use skill_manage to inspect the "
+                    "existing skill before creating or editing it, keep the "
+                    "change bounded and reversible where possible, validate "
+                    "the result, and do not claim activation before it is "
+                    "confirmed."
+                ),
+                order=90,
+            ))
+        _assembly = default_prompt_runtime().assemble(
+            agent_scope=str(getattr(agent, "_prompt_agent_scope", "") or ""),
+            override_scope=str(getattr(agent, "_prompt_override_scope", "") or ""),
+            # Only model is stable enough for this session-level prefix.
+            # Provider can change during failover and belongs in the existing
+            # request/runtime context path, not a cacheable instruction.
+            variables={"model": str(getattr(agent, "model", "") or "")},
+            tool_names=tuple(sorted(_tool_names)),
+            tool_schemas=tuple(getattr(agent, "tools", ()) or ()),
+            mode=_mode,
+            extra_fragments=_fragments,
+        )
+        prompt_runtime_guidance = _assembly.model_instructions
+        prompt_runtime_context = _assembly.runtime_context
+        prompt_runtime_metadata = _assembly.as_metadata()
+    except PromptRuntimeError:
+        # Prompt contributions are executable configuration.  A malformed or
+        # unresolved contribution must fail before a partial prompt reaches
+        # the model; silently dropping it creates a presentation/dispatch
+        # mismatch that is harder to diagnose than a load-time refusal.
+        logger.error("Prompt Runtime assembly rejected", exc_info=True)
+        raise
+    except Exception:
+        # Non-contract integration failures preserve the legacy prompt. Prompt
+        # Runtime validation errors take the strict branch above.
+        logger.warning("Prompt Runtime guidance skipped", exc_info=True)
+    try:
+        agent._prompt_runtime_metadata = prompt_runtime_metadata
+    except Exception:
+        pass
+
     # Resolve the model's context window once so context-file caps can scale
     # to it (dynamic cap — see prompt_builder._dynamic_context_file_max_chars).
     # None falls back to the historical flat default. This value is stable for
@@ -185,6 +268,9 @@ def build_system_prompt_parts(agent: Any, system_message: Optional[str] = None) 
 
     # ── Stable tier ────────────────────────────────────────────────
     stable_parts: List[str] = []
+
+    if prompt_runtime_guidance:
+        stable_parts.append(prompt_runtime_guidance)
 
     # Try SOUL.md as primary identity unless the caller explicitly skipped it.
     # Some execution modes (cron) still want HERMES_HOME persona while keeping
@@ -479,6 +565,12 @@ def build_system_prompt_parts(agent: Any, system_message: Optional[str] = None) 
         context_parts.extend(coding_workspace_parts)
         context_parts.extend(coding_trailing_parts)
         context_parts.extend(post_workspace_parts)
+
+    if prompt_runtime_context:
+        context_parts.append(
+            "Current Prompt Runtime context. This snapshot applies to this "
+            "assembled request:\n" + prompt_runtime_context
+        )
 
     # Note: ephemeral_system_prompt is NOT included here. It's injected at
     # API-call time only so it stays out of the cached/stored system prompt.

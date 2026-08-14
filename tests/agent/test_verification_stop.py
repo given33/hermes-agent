@@ -152,7 +152,10 @@ def test_no_suite_nudge_uses_canonical_temp_dir(tmp_path, monkeypatch):
     real_temp = tmp_path / "real-temp"
     real_temp.mkdir()
     linked_temp = tmp_path / "linked-temp"
-    linked_temp.symlink_to(real_temp, target_is_directory=True)
+    try:
+        linked_temp.symlink_to(real_temp, target_is_directory=True)
+    except (OSError, NotImplementedError) as exc:
+        pytest.skip(f"symlinks unavailable in test environment: {exc}")
     monkeypatch.setattr(tempfile, "gettempdir", lambda: str(linked_temp))
 
     nudge = build_verify_on_stop_nudge(

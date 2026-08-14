@@ -11,13 +11,33 @@ from copy import deepcopy
 from dataclasses import dataclass
 import hashlib
 import json
+import re
 import time
 from typing import Any, Iterable, Mapping, MutableMapping
 import uuid
 
+from hermes_runtime.composability.lifecycle import (
+    assert_lifecycle_transition,
+    normalize_lifecycle_state,
+)
+
 
 SCHEMA_VERSION = "hermes.hosted-event.v1"
 MAX_RETAINED_EVENTS = 20_000
+RUNTIME_FIELDS = frozenset(
+    {
+        "component_id",
+        "parent_component_id",
+        "provider_refs",
+        "dependency_state",
+        "lifecycle_state",
+        "effect_scope_id",
+        "plan_node_id",
+        "artifact_refs",
+        "contract_revision",
+        "policy_snapshot_hash",
+    }
+)
 _PENDING_PERSISTENCE_HOOKS = "_hosted_event_persistence_pending"
 _PERSISTENCE_HOOK_OUTBOX = "_hosted_event_persistence_outbox"
 _PERSISTENCE_HOOK_ACKS = "_hosted_event_persistence_acks"
@@ -91,6 +111,27 @@ EVENT_TYPES = frozenset(
         "supervisor.verdict",
         "rework.started",
         "rework.dispatched",
+        "component.declared",
+        "component.waiting",
+        "component.activating",
+        "component.active",
+        "component.quiescing",
+        "component.leaving",
+        "component.unloading",
+        "component.recovering",
+        "component.failed",
+        "component.completed",
+        "provider.registered",
+        "provider.health_changed",
+        "provider.draining",
+        "provider.removed",
+        "dependency.waiting",
+        "dependency.satisfied",
+        "dependency.lost",
+        "turn.plan_created",
+        "turn.node_ready",
+        "turn.node_blocked",
+        "turn.node_completed",
     }
 )
 
@@ -109,6 +150,10 @@ TERMINAL_EVENT_TYPES = frozenset(
         "command.completed",
         "command.failed",
         "intervention.completed",
+        "component.failed",
+        "component.completed",
+        "provider.removed",
+        "turn.node_completed",
     }
 )
 
@@ -206,6 +251,16 @@ def append_hosted_event(
     idempotency_key: str = "",
     occurred_at: int | None = None,
     entity_id: str = "",
+    component_id: str = "",
+    parent_component_id: str = "",
+    provider_refs: Iterable[str] | None = None,
+    dependency_state: Mapping[str, Any] | None = None,
+    lifecycle_state: str = "",
+    effect_scope_id: str = "",
+    plan_node_id: str = "",
+    artifact_refs: Iterable[str] | None = None,
+    contract_revision: str = "",
+    policy_snapshot_hash: str = "",
     assume_current_indexes: bool = False,
 ) -> AppendResult:
     """Append one lifecycle event with idempotency and terminal CAS guards."""
@@ -218,10 +273,17 @@ def append_hosted_event(
         raise HostedEventProtocolError("conversation_id is required")
     if not normalized_turn_id:
         raise HostedEventProtocolError("turn_id is required")
-    normalized_payload = _json_copy(payload or {})
+    normalized_payload = _json_copy(_sanitize_event_value(payload or {}))
     normalized_entity_id = str(
         entity_id or _payload_entity_id(normalized_payload)
     ).strip()[:512]
+    normalized_component_id = str(component_id or "").strip()[:512]
+    normalized_lifecycle_state = str(lifecycle_state or "").strip().lower()[:128]
+    if normalized_lifecycle_state:
+        try:
+            normalize_lifecycle_state(normalized_lifecycle_state)
+        except ValueError as exc:
+            raise HostedEventProtocolError(str(exc)) from exc
 
     stored_events = conversation.get("hosted_events")
     events = stored_events if isinstance(stored_events, list) else []
@@ -290,6 +352,21 @@ def append_hosted_event(
             f"terminal:{prior_terminal}",
         )
 
+    # Idempotent replay and terminal CAS checks run first. A delayed duplicate
+    # from before completion is not a new state transition and must remain a
+    # no-op instead of being rejected as completed -> active.
+    if normalized_component_id and normalized_lifecycle_state:
+        previous_lifecycle = _latest_component_lifecycle(
+            events,
+            turn_id=normalized_turn_id,
+            component_id=normalized_component_id,
+        )
+        if previous_lifecycle is not None:
+            try:
+                assert_lifecycle_transition(previous_lifecycle, normalized_lifecycle_state)
+            except ValueError as exc:
+                raise HostedEventProtocolError(str(exc)) from exc
+
     next_cursor = cursor + 1
     timestamp = int(occurred_at if occurred_at is not None else time.time() * 1000)
     event = {
@@ -307,6 +384,26 @@ def append_hosted_event(
         "payload": normalized_payload,
         "schema_version": SCHEMA_VERSION,
     }
+    # Runtime metadata is optional so v1 producers remain compatible. When
+    # present, it is typed at the envelope boundary and becomes the canonical
+    # source for Fiber/provider reducers; clients must not infer it from a
+    # display-oriented role_stage string.
+    normalized_provider_refs = _sanitize_runtime_refs(provider_refs or (), "provider")
+    normalized_artifact_refs = _sanitize_runtime_refs(artifact_refs or (), "artifact")
+    runtime_metadata = {
+        "component_id": normalized_component_id,
+        "parent_component_id": str(parent_component_id or "").strip()[:512],
+        "provider_refs": list(normalized_provider_refs),
+        "dependency_state": _json_copy(_sanitize_event_value(dependency_state or {})),
+        "lifecycle_state": normalized_lifecycle_state,
+        "effect_scope_id": str(effect_scope_id or "").strip()[:512],
+        "plan_node_id": str(plan_node_id or "").strip()[:512],
+        "artifact_refs": list(normalized_artifact_refs),
+        "contract_revision": str(contract_revision or "").strip()[:256],
+        "policy_snapshot_hash": str(policy_snapshot_hash or "").strip()[:256],
+    }
+    if any(runtime_metadata.values()):
+        event["runtime"] = runtime_metadata
     owner_id = str(conversation.get("owner_id") or "").strip().lower()
     if owner_id:
         # This metadata is intentionally part of the event envelope so a
@@ -915,6 +1012,39 @@ def validate_event_envelope(value: Any) -> dict[str, Any]:
         raise HostedEventProtocolError("payload must be an object")
     if "entity_id" in value and not isinstance(value.get("entity_id"), str):
         raise HostedEventProtocolError("entity_id must be a string")
+    runtime = value.get("runtime")
+    if runtime is not None:
+        if not isinstance(runtime, dict):
+            raise HostedEventProtocolError("runtime must be an object")
+        unknown_fields = sorted(set(runtime).difference(RUNTIME_FIELDS))
+        if unknown_fields:
+            raise HostedEventProtocolError(
+                "runtime has unsupported field(s): " + ", ".join(unknown_fields)
+            )
+        string_fields = {
+            "component_id",
+            "parent_component_id",
+            "lifecycle_state",
+            "effect_scope_id",
+            "plan_node_id",
+            "contract_revision",
+            "policy_snapshot_hash",
+        }
+        for field in string_fields:
+            if field in runtime and not isinstance(runtime.get(field), str):
+                raise HostedEventProtocolError(f"runtime.{field} must be a string")
+        if "lifecycle_state" in runtime and runtime.get("lifecycle_state"):
+            try:
+                normalize_lifecycle_state(runtime.get("lifecycle_state"))
+            except ValueError as exc:
+                raise HostedEventProtocolError(str(exc)) from exc
+        for field in ("provider_refs", "artifact_refs"):
+            if field in runtime:
+                refs = runtime.get(field)
+                if not isinstance(refs, list) or any(not isinstance(item, str) for item in refs):
+                    raise HostedEventProtocolError(f"runtime.{field} must be a string list")
+        if "dependency_state" in runtime and not isinstance(runtime.get("dependency_state"), dict):
+            raise HostedEventProtocolError("runtime.dependency_state must be an object")
     return _json_copy(value)
 
 
@@ -988,6 +1118,14 @@ def _entity_scope(turn_id: str, role_stage: str, event_type: str, entity_id: str
         category = "intervention"
     elif event_type.startswith("agent."):
         category = "agent"
+    elif event_type.startswith("component."):
+        category = "component"
+    elif event_type.startswith("provider."):
+        category = "provider"
+    elif event_type.startswith("dependency."):
+        category = "dependency"
+    elif event_type.startswith("turn.node_"):
+        category = "turn_node"
     else:
         category = "turn"
     return f"{turn_id}:{role_stage}:{category}:{entity_id}"
@@ -1026,6 +1164,28 @@ def _rebuild_retained_event_indexes(
             terminal_scopes.setdefault(f"turn:{turn_id}", event_type)
 
 
+def _latest_component_lifecycle(
+    events: Iterable[Any],
+    *,
+    turn_id: str,
+    component_id: str,
+) -> str | None:
+    """Find the last structured lifecycle witness for one component."""
+
+    for raw in reversed(list(events)):
+        if not isinstance(raw, dict) or str(raw.get("turn_id") or "") != turn_id:
+            continue
+        runtime = raw.get("runtime")
+        if not isinstance(runtime, dict):
+            continue
+        if str(runtime.get("component_id") or "") != component_id:
+            continue
+        state = str(runtime.get("lifecycle_state") or "").strip().lower()
+        if state:
+            return state
+    return None
+
+
 def _payload_entity_id(payload: MutableMapping[str, Any] | dict[str, Any]) -> str:
     for key in (
         "entity_id",
@@ -1057,6 +1217,74 @@ def _non_negative_int(value: Any) -> int:
         return max(0, int(value or 0))
     except (TypeError, ValueError):
         return 0
+
+
+_SENSITIVE_KEY_PARTS = (
+    "api_key",
+    "access_token",
+    "refresh_token",
+    "auth_token",
+    "session_token",
+    "password",
+    "passwd",
+    "secret",
+    "credential",
+    "private_key",
+)
+_INLINE_BEARER_RE = re.compile(r"(?i)\b(bearer)\s+[A-Za-z0-9._~+/=-]+")
+_INLINE_SECRET_RE = re.compile(
+    r"(?i)\b(api[_-]?key|access[_-]?token|refresh[_-]?token|password|secret)"
+    r"\s*[:=]\s*([^\s,;]+)"
+)
+_ABSOLUTE_PATH_RE = re.compile(r"^(?:[A-Za-z]:[\\/]|/|\\\\|file:)", re.I)
+
+
+def _sensitive_key(value: Any) -> bool:
+    normalized = re.sub(r"[^a-z0-9]+", "_", str(value or "").strip().lower())
+    return any(part in normalized for part in _SENSITIVE_KEY_PARTS)
+
+
+def _sanitize_event_value(value: Any) -> Any:
+    """Redact credential-shaped values at the durable protocol boundary."""
+
+    if isinstance(value, Mapping):
+        return {
+            str(key)[:256]: (
+                "[REDACTED]"
+                if _sensitive_key(key)
+                else _sanitize_event_value(item)
+            )
+            for key, item in value.items()
+        }
+    if isinstance(value, (list, tuple, set)):
+        return [_sanitize_event_value(item) for item in value]
+    if not isinstance(value, str):
+        return value
+    redacted = _INLINE_BEARER_RE.sub(r"\1 [REDACTED]", value)
+    return _INLINE_SECRET_RE.sub(r"\1=[REDACTED]", redacted)
+
+
+def _sanitize_runtime_ref(value: Any, kind: str) -> str:
+    """Keep stable IDs while replacing host paths with opaque witnesses."""
+
+    text = str(_sanitize_event_value(str(value or "")) or "").strip()
+    if not text:
+        return ""
+    if _ABSOLUTE_PATH_RE.match(text):
+        digest = hashlib.sha256(text.encode("utf-8")).hexdigest()
+        return f"{kind}:{digest}"
+    return text[:512]
+
+
+def _sanitize_runtime_refs(values: Iterable[Any], kind: str) -> tuple[str, ...]:
+    refs: list[str] = []
+    for value in values:
+        ref = _sanitize_runtime_ref(value, kind)
+        if ref:
+            refs.append(ref)
+        if len(refs) >= 100:
+            break
+    return tuple(refs)
 
 
 def _json_copy(value: Any) -> Any:

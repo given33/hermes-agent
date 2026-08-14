@@ -508,6 +508,8 @@ class AIAgent:
         iteration_budget: "IterationBudget" = None,
         fallback_model: Dict[str, Any] = None,
         credential_pool=None,
+        prompt_runtime_mode: str = "native",
+        tool_role: str | None = None,
         checkpoints_enabled: bool = False,
         checkpoint_max_snapshots: int = 20,
         checkpoint_max_total_size_mb: int = 500,
@@ -595,6 +597,8 @@ class AIAgent:
             iteration_budget=iteration_budget,
             fallback_model=fallback_model,
             credential_pool=credential_pool,
+            prompt_runtime_mode=prompt_runtime_mode,
+            tool_role=tool_role,
             checkpoints_enabled=checkpoints_enabled,
             checkpoint_max_snapshots=checkpoint_max_snapshots,
             checkpoint_max_total_size_mb=checkpoint_max_total_size_mb,
@@ -7818,6 +7822,9 @@ class AIAgent:
             inherit_turns=function_args.get("inherit_turns"),
             context_variables=function_args.get("context_variables"),
             name=function_args.get("name"),
+            action=function_args.get("action"),
+            subagent_id=function_args.get("subagent_id"),
+            message=function_args.get("message"),
             parent_agent=self,
         )
 

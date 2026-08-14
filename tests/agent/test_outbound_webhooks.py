@@ -517,7 +517,7 @@ class TestDelivery:
             "outbound_webhooks.register_from_config(cfg)\n"
             "get_plugin_manager().invoke_hook('on_session_end', session_id='exit_test')\n"
             "# exit immediately — no explicit flush\n"
-        )
+        , encoding="utf-8")
         proc = subprocess.run(
             [_sys.executable, str(script)], capture_output=True, timeout=30,
         )

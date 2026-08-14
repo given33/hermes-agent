@@ -193,6 +193,25 @@ class TestClassifyApiError:
         assert result.retryable is False
         assert result.should_fallback is True
 
+    def test_401_explicit_model_rejection_does_not_rotate_credential(self):
+        """OpenCode Zen returns 401 for an unsupported model identifier."""
+        e = MockAPIError(
+            "Model deepseekv4flash is not supported",
+            status_code=401,
+        )
+
+        result = classify_api_error(
+            e,
+            provider="custom:opencode-zen",
+            model="deepseekv4flash",
+        )
+
+        assert result.reason == FailoverReason.model_not_found
+        assert result.is_auth is False
+        assert result.should_rotate_credential is False
+        assert result.should_fallback is True
+        assert result.retryable is False
+
     def test_403_classified_as_auth(self):
         e = MockAPIError("Forbidden", status_code=403)
         result = classify_api_error(e, provider="anthropic")

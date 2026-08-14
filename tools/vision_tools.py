@@ -1802,6 +1802,11 @@ registry.register(
     handler=_handle_vision_analyze,
     check_fn=check_vision_requirements,
     is_async=True,
+    capability_tags={"visual_evidence", "network"},
+    prompt_guidance=(
+        "Visual evidence capability: use region when the question targets a bounded area. "
+        "Treat OCR/grounding output as evidence with a source image and verify important claims."
+    ),
     emoji="👁️",
 )
 
@@ -2220,5 +2225,6 @@ registry.register(
     handler=_handle_video_analyze,
     check_fn=check_vision_requirements,
     is_async=True,
+    capability_tags={"visual_evidence", "network"},
     emoji="🎬",
 )

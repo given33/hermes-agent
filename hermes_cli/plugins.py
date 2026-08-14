@@ -56,6 +56,7 @@ from hermes_services.middleware import (
     VALID_MIDDLEWARE,
     install_middleware_backend,
 )
+from hermes_runtime.composability.effects import EffectHandle, EffectScope
 
 # Explicit production boundary: manifest scanning, entry-point loading, and
 # plugin ``register`` callbacks run only after trusted hooks are sealed.
@@ -368,6 +369,9 @@ class LoadedPlugin:
     # imported) loader. The module loads on first real use via the
     # platform_registry; see PluginManager._register_deferred_platform.
     deferred: bool = False
+    # Runtime-owned registrations for this plugin. Kept separate from the
+    # presentation lists above so a reload can dispose exact callbacks/tools.
+    effect_scope: Optional[EffectScope] = None
 
 
 # ---------------------------------------------------------------------------
@@ -380,9 +384,38 @@ class PluginContext:
     def __init__(self, manifest: PluginManifest, manager: "PluginManager"):
         self.manifest = manifest
         self._manager = manager
+        self._effect_scope = EffectScope(
+            owner_id=f"plugin:{manifest.key or manifest.name}"
+        )
         # Lazy-built host-owned LLM facade — see ctx.llm property below.
         self._llm: Any = None
         self._subagent_lifecycle: Any = None
+
+    @property
+    def effects(self) -> EffectScope:
+        """Return the scope owning registrations made through this context."""
+
+        return self._effect_scope
+
+    def close_effects(self) -> None:
+        """Synchronously dispose registrations made by this context."""
+
+        self._effect_scope.close_sync()
+
+    def _track_registration(
+        self,
+        disposer: Callable[[], Any],
+        *,
+        description: str,
+        idempotency_key: str,
+    ) -> EffectHandle:
+        return self._effect_scope.add(
+            disposer,
+            description=description,
+            idempotency_key=idempotency_key,
+            durability="in_memory",
+            external_boundary="internal",
+        )
 
     # -- host-owned LLM access ----------------------------------------------
 
@@ -457,7 +490,9 @@ class PluginContext:
         description: str = "",
         emoji: str = "",
         override: bool = False,
-    ) -> None:
+        effect_metadata: dict | None = None,
+        prompt_guidance: str | None = None,
+    ) -> EffectHandle:
         """Register a tool in the global registry **and** track it as plugin-provided.
 
         Pass ``override=True`` to replace an existing built-in tool with the
@@ -495,11 +530,87 @@ class PluginContext:
             description=description,
             emoji=emoji,
             override=override,
+            effect_metadata=effect_metadata,
+            prompt_guidance=prompt_guidance,
+        )
+        # Capture the exact handler witness. A later plugin or provider may
+        # legitimately replace the same name; cleanup must not deregister that
+        # newer binding by name alone.
+        def dispose_tool() -> None:
+            entry = registry.get_entry(name)
+            if entry is not None and entry.handler is handler:
+                registry.deregister(name)
+
+        handle = self._track_registration(
+            dispose_tool,
+            description=f"plugin-tool:{name}",
+            idempotency_key=f"plugin-tool:{self.manifest.key or self.manifest.name}:{name}",
         )
         self._manager._plugin_tool_names.add(name)
         logger.debug(
             "Plugin %s registered tool: %s%s",
             self.manifest.name, name, " (override)" if override else "",
+        )
+        return handle
+
+    def register_prompt_fragment(self, fragment=None, **kwargs):
+        """Register a scoped model-facing prompt contribution."""
+
+        from hermes_runtime.prompt_runtime import PromptFragment, default_prompt_runtime
+
+        if isinstance(fragment, PromptFragment):
+            if kwargs:
+                raise TypeError("prompt fragment kwargs cannot accompany a PromptFragment")
+        elif fragment is None:
+            fragment = PromptFragment(**kwargs)
+        elif isinstance(fragment, str):
+            fragment = PromptFragment(name=fragment, **kwargs)
+        else:
+            raise TypeError("fragment must be a PromptFragment or a fragment name")
+        disposer = default_prompt_runtime().register_fragment(fragment)
+        return self._track_registration(
+            disposer,
+            description=f"plugin-prompt:{fragment.name}",
+            idempotency_key=f"plugin-prompt:{self.manifest.key or self.manifest.name}:{fragment.name}",
+        )
+
+    def register_prompt_variable(self, name: str, provider, *, scope: str = "global"):
+        """Register a strict prompt variable owned by this plugin."""
+
+        from hermes_runtime.prompt_runtime import default_prompt_runtime
+
+        disposer = default_prompt_runtime().register_variable(name, provider, scope=scope)
+        return self._track_registration(
+            disposer,
+            description=f"plugin-prompt-variable:{name}",
+            idempotency_key=f"plugin-prompt-variable:{self.manifest.key or self.manifest.name}:{name}:{scope}",
+        )
+
+    def register_prompt_middleware(
+        self,
+        name: str,
+        callback,
+        *,
+        order: int = 0,
+        scope: str = "global",
+    ):
+        """Register deterministic prompt middleware owned by this plugin."""
+
+        from hermes_runtime.prompt_runtime import default_prompt_runtime
+
+        disposer = default_prompt_runtime().register_middleware(
+            name,
+            callback,
+            order=order,
+            scope=scope,
+        )
+        return self._track_registration(
+            disposer,
+            description=f"plugin-prompt-middleware:{name}",
+            idempotency_key=(
+                f"plugin-prompt-middleware:{self.manifest.key or self.manifest.name}:"
+                f"{scope}:{name}"
+            ),
         )
 
     # -- override trust gate ------------------------------------------------
@@ -1220,7 +1331,7 @@ class PluginContext:
             display_name,
         )
 
-    def register_hook(self, hook_name: str, callback: Callable) -> None:
+    def register_hook(self, hook_name: str, callback: Callable) -> EffectHandle:
         """Register a lifecycle hook callback.
 
         Unknown hook names produce a warning but are still stored so
@@ -1235,11 +1346,23 @@ class PluginContext:
                 ", ".join(sorted(VALID_HOOKS)),
             )
         self._manager._hooks.setdefault(hook_name, []).append(callback)
+        def dispose_hook() -> None:
+            callbacks = self._manager._hooks.get(hook_name, [])
+            self._manager._hooks[hook_name] = [item for item in callbacks if item is not callback]
+            if not self._manager._hooks[hook_name]:
+                self._manager._hooks.pop(hook_name, None)
+
+        handle = self._track_registration(
+            dispose_hook,
+            description=f"plugin-hook:{hook_name}",
+            idempotency_key=f"plugin-hook:{self.manifest.key or self.manifest.name}:{hook_name}:{id(callback)}",
+        )
         logger.debug("Plugin %s registered hook: %s", self.manifest.name, hook_name)
+        return handle
 
     # -- middleware registration -------------------------------------------
 
-    def register_middleware(self, kind: str, callback: Callable) -> None:
+    def register_middleware(self, kind: str, callback: Callable) -> EffectHandle:
         """Register a behavior-changing middleware callback.
 
         Middleware is separate from observer hooks: request middleware may
@@ -1256,7 +1379,19 @@ class PluginContext:
                 ", ".join(sorted(VALID_MIDDLEWARE)),
             )
         self._manager._middleware.setdefault(kind, []).append(callback)
+        def dispose_middleware() -> None:
+            callbacks = self._manager._middleware.get(kind, [])
+            self._manager._middleware[kind] = [item for item in callbacks if item is not callback]
+            if not self._manager._middleware[kind]:
+                self._manager._middleware.pop(kind, None)
+
+        handle = self._track_registration(
+            dispose_middleware,
+            description=f"plugin-middleware:{kind}",
+            idempotency_key=f"plugin-middleware:{self.manifest.key or self.manifest.name}:{kind}:{id(callback)}",
+        )
         logger.debug("Plugin %s registered middleware: %s", self.manifest.name, kind)
+        return handle
 
     # -- skill registration -------------------------------------------------
 
@@ -1342,6 +1477,28 @@ class PluginManager:
         # ``re.Pattern``, or a constraint dict); ``callback`` is an async
         # function with the slack_bolt signature ``(ack, body, action)``.
         self._slack_action_handlers: List[tuple] = []
+        self._plugin_scopes: Dict[str, EffectScope] = {}
+
+    def _dispose_plugin_scopes(self) -> None:
+        """Dispose old plugin registrations before a force reload."""
+
+        errors: list[BaseException] = []
+        for plugin_id, scope in list(self._plugin_scopes.items()):
+            try:
+                scope.close_sync()
+            except BaseException as exc:
+                errors.append(exc)
+                logger.error(
+                    "Plugin effect scope failed to close during reload: %s",
+                    plugin_id,
+                    exc_info=True,
+                )
+        self._plugin_scopes.clear()
+        if errors:
+            logger.error(
+                "Plugin reload completed with %d disposer error(s); see effect scope logs",
+                len(errors),
+            )
 
     # -----------------------------------------------------------------------
     # Public
@@ -1361,6 +1518,7 @@ class PluginManager:
             self._discovered = True
             return
         if force:
+            self._dispose_plugin_scopes()
             self._plugins.clear()
             self._hooks.clear()
             self._middleware.clear()
@@ -1958,6 +2116,8 @@ class PluginManager:
                     kind: len(cbs) for kind, cbs in self._middleware.items()
                 }
                 register_fn(ctx)
+                self._plugin_scopes[manifest.key or manifest.name] = ctx.effects
+                loaded.effect_scope = ctx.effects
                 loaded.tools_registered = [
                     t for t in self._plugin_tool_names
                     if t not in _tools_before
@@ -1990,6 +2150,15 @@ class PluginManager:
                 )
 
         except Exception as exc:
+            try:
+                if "ctx" in locals():
+                    ctx.close_effects()
+            except BaseException:
+                logger.error(
+                    "Failed to dispose partial plugin registration for '%s'",
+                    manifest.name,
+                    exc_info=True,
+                )
             loaded.error = str(exc)
             logger.warning(
                 "Failed to load plugin '%s': %s",

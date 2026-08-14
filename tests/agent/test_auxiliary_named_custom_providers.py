@@ -72,6 +72,60 @@ class TestResolveProviderClientMainAlias:
         assert client is not None
         assert "beans.local" in str(client.base_url)
 
+    def test_main_resolves_direct_model_alias_before_dispatch(self, tmp_path):
+        """Auxiliary routing must send the canonical model behind a direct alias."""
+        _write_config(tmp_path, {
+            "model": {"default": "canonical-model", "provider": "custom:beans"},
+            "model_aliases": {
+                "friendly-model": {
+                    "model": "canonical-model",
+                    "provider": "custom:beans",
+                },
+            },
+            "custom_providers": [
+                {"name": "beans", "base_url": "http://beans.local/v1", "api_key": "k"},
+            ],
+        })
+        from agent.auxiliary_client import resolve_provider_client
+
+        client, model = resolve_provider_client("main", "friendly-model")
+
+        assert client is not None
+        assert model == "canonical-model"
+        assert "beans.local" in str(client.base_url)
+
+    def test_cached_dispatch_keeps_direct_alias_canonical(self, tmp_path):
+        """The cache layer must not put a resolved alias back on the wire."""
+        _write_config(tmp_path, {
+            "model": {"default": "canonical-model", "provider": "custom:beans"},
+            "model_aliases": {
+                "friendly-model": {
+                    "model": "canonical-model",
+                    "provider": "custom:beans",
+                },
+            },
+            "custom_providers": [
+                {"name": "beans", "base_url": "http://beans.local/v1", "api_key": "k"},
+            ],
+        })
+        from agent.auxiliary_client import _get_cached_client
+
+        sentinel_client = MagicMock()
+        with patch(
+            "agent.auxiliary_client.resolve_provider_client",
+            return_value=(sentinel_client, "canonical-model"),
+        ) as resolver:
+            client, model = _get_cached_client(
+                "custom:beans",
+                "friendly-model",
+                base_url="http://beans.local/v1/friendly-model",
+                api_key="k",
+            )
+
+        assert client is sentinel_client
+        assert model == "canonical-model"
+        assert resolver.call_args.args[1] == "canonical-model"
+
     def test_main_resolves_github_copilot_alias(self, tmp_path):
         _write_config(tmp_path, {
             "model": {"default": "gpt-5.4", "provider": "github-copilot"},

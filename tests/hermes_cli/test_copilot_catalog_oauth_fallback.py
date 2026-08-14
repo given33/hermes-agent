@@ -27,7 +27,7 @@ class TestCopilotCatalogApiKeyResolution:
             return_value=[{"access_token": "gho_abc123"}],
         ), patch(
             "hermes_cli.copilot_auth.exchange_copilot_token",
-            return_value=("tid_exchanged_xyz", 1234567890.0),
+            return_value=("tid_exchanged_xyz", 1234567890.0, "https://api.githubcopilot.com"),
         ):
             assert _resolve_copilot_catalog_api_key() == "tid_exchanged_xyz"
 

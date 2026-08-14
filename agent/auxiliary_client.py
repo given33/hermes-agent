@@ -1010,6 +1010,10 @@ def _resolve_provider_vision_default(provider: str) -> Optional[str]:
 # describe as having no image_in capability. Vision lives on the separate
 # Kimi Platform (api.moonshot.ai, OpenAI-wire, pay-as-you-go).  See #17076.
 _PROVIDERS_WITHOUT_VISION: frozenset = frozenset({
+    # The direct DeepSeek endpoint currently exposes text/reasoning models;
+    # multimodal DeepSeek variants must be reached through an explicit
+    # vision-capable aggregator or custom endpoint.
+    "deepseek",
     "kimi-coding",
     "kimi-coding-cn",
 })
@@ -3970,7 +3974,7 @@ def _is_payment_error(exc: Exception) -> bool:
     status = getattr(exc, "status_code", None)
     if status == 402:
         return True
-    err_lower = str(exc).lower()
+    err_lower = _aux_exception_text(exc)
     # OpenRouter and other providers include "credits" or "afford" in 402 bodies,
     # but sometimes wrap them in 429 or other codes.
     # Daily quota exhaustion from Bedrock, Vertex AI, and similar providers
@@ -4018,7 +4022,7 @@ def _is_rate_limit_error(exc: Exception) -> bool:
     .status_code on the exception object.
     """
     status = getattr(exc, "status_code", None)
-    err_lower = str(exc).lower()
+    err_lower = _aux_exception_text(exc)
 
     # OpenAI SDK's RateLimitError sometimes omits .status_code —
     # detect by class name so we don't miss these.  (PR #8023 pattern)
@@ -4085,7 +4089,7 @@ def _is_connection_error(exc: Exception) -> bool:
     err_type = type(exc).__name__
     if any(kw in err_type for kw in ("Connection", "Timeout", "DNS", "SSL")):
         return True
-    err_lower = str(exc).lower()
+    err_lower = _aux_exception_text(exc)
     if any(kw in err_lower for kw in (
         "connection refused", "name or service not known",
         "no route to host", "network is unreachable",
@@ -4152,12 +4156,36 @@ def _transient_retry_count() -> int:
         return _DEFAULT_TRANSIENT_RETRIES
 
 
+def _aux_exception_text(exc: Exception) -> str:
+    """Collect SDK error text and structured response bodies for classifiers."""
+    parts = [str(exc)]
+    body = getattr(exc, "body", None)
+    if body is not None:
+        try:
+            parts.append(json.dumps(body, ensure_ascii=False, default=str))
+        except Exception:
+            parts.append(str(body))
+    response = getattr(exc, "response", None)
+    if response is not None:
+        response_body = getattr(response, "text", None)
+        if response_body:
+            parts.append(str(response_body))
+    return " ".join(part for part in parts if part).lower()
+
+
 def _is_auth_error(exc: Exception) -> bool:
     """Detect auth failures that should trigger provider-specific refresh."""
     status = getattr(exc, "status_code", None)
+    err_lower = _aux_exception_text(exc)
+    model_rejected = "model" in err_lower and (
+        " is not supported" in err_lower
+        or "unsupported model" in err_lower
+        or "model_not_supported" in err_lower
+    )
+    if status == 401 and model_rejected:
+        return False
     if status == 401:
         return True
-    err_lower = str(exc).lower()
     if "error code: 401" in err_lower or "authenticationerror" in type(exc).__name__.lower():
         return True
     # xAI returns HTTP 403 with "unauthenticated:bad-credentials" when an OAuth2
@@ -4189,7 +4217,7 @@ def _is_unsupported_parameter_error(exc: Exception, param: str) -> bool:
     param_lower = (param or "").lower()
     if not param_lower:
         return False
-    err_lower = str(exc).lower()
+    err_lower = _aux_exception_text(exc)
     if param_lower not in err_lower:
         return False
     return any(marker in err_lower for marker in (
@@ -4202,6 +4230,53 @@ def _is_unsupported_parameter_error(exc: Exception, param: str) -> bool:
         "unrecognized parameter",
         "invalid parameter",
     ))
+
+
+def _response_format_fallback_kwargs(
+    kwargs: Dict[str, Any], exc: Exception,
+) -> Optional[Dict[str, Any]]:
+    """Return the next bounded response-format fallback after a provider 400.
+
+    Some OpenAI-compatible gateways reject ``json_schema`` while accepting
+    ``json_object``. Keep the schema in the prompt and let Hermes validate the
+    returned JSON locally. If the gateway also rejects ``json_object``, the
+    final retry removes the hint and relies on the prompt plus local parsing.
+    Only explicit response-format capability errors enter this path; unrelated
+    400s must retain their normal classification and fallback behavior.
+    """
+    if not _is_unsupported_parameter_error(exc, "response_format"):
+        err_lower = _aux_exception_text(exc)
+        if "response_format" not in err_lower and "response format" not in err_lower:
+            return None
+        if not any(marker in err_lower for marker in (
+            "unavailable", "unsupported", "not supported", "unknown",
+            "unrecognized", "invalid",
+        )):
+            return None
+    extra = kwargs.get("extra_body")
+    if not isinstance(extra, dict):
+        return None
+    response_format = extra.get("response_format")
+    if not isinstance(response_format, dict):
+        return None
+    format_type = str(response_format.get("type") or "").strip().lower()
+    if format_type == "json_schema":
+        next_format: Optional[Dict[str, Any]] = {"type": "json_object"}
+    elif format_type == "json_object":
+        next_format = None
+    else:
+        return None
+    retry_kwargs = dict(kwargs)
+    retry_extra = dict(extra)
+    if next_format is None:
+        retry_extra.pop("response_format", None)
+    else:
+        retry_extra["response_format"] = next_format
+    if retry_extra:
+        retry_kwargs["extra_body"] = retry_extra
+    else:
+        retry_kwargs.pop("extra_body", None)
+    return retry_kwargs
 
 
 def _is_unsupported_temperature_error(exc: Exception) -> bool:
@@ -4230,7 +4305,7 @@ def _is_model_not_found_error(exc: Exception) -> bool:
     that the payment path already owns so the two predicates don't overlap.
     """
     status = getattr(exc, "status_code", None)
-    err_lower = str(exc).lower()
+    err_lower = _aux_exception_text(exc)
     # Billing/quota 404s belong to _is_payment_error — don't claim them here.
     if any(kw in err_lower for kw in (
         "credits", "insufficient funds", "billing", "out of funds",
@@ -4238,7 +4313,7 @@ def _is_model_not_found_error(exc: Exception) -> bool:
         "not available on the free tier",
     )):
         return False
-    if status not in {404, 400, None}:
+    if status not in {401, 404, 400, None}:
         return False
     return any(kw in err_lower for kw in (
         "model does not exist",
@@ -4278,9 +4353,9 @@ def _is_model_incompatible_error(exc: Exception) -> bool:
     explicitly excludes both so the three don't overlap.
     """
     status = getattr(exc, "status_code", None)
-    if status not in {400, None}:
+    if status not in {400, 401, None}:
         return False
-    err_lower = str(exc).lower()
+    err_lower = _aux_exception_text(exc)
     # Not-found 400s ("invalid model ID", "model does not exist") are owned by
     # _is_model_not_found_error. Billing/free-tier 400s are owned by the
     # payment path — key on the billing keywords directly here rather than
@@ -4296,7 +4371,9 @@ def _is_model_incompatible_error(exc: Exception) -> bool:
         "model_not_supported_on_free_tier", "quota",
     )):
         return False
-    return any(kw in err_lower for kw in (
+    return (
+        "model" in err_lower and " is not supported" in err_lower
+    ) or any(kw in err_lower for kw in (
         "is not supported when using",   # codex/ChatGPT-account model gating
         "model is not supported",
         "not supported with this",
@@ -5958,6 +6035,43 @@ def _normalize_resolved_model(model_name: Optional[str], provider: str) -> Optio
         return model_name
 
 
+def _resolve_configured_direct_model_alias(
+    model_name: Optional[str], provider: str,
+) -> Optional[str]:
+    """Resolve a configured direct alias before an auxiliary request is sent.
+
+    ``hermes_cli.model_switch`` owns the direct-alias table used by the
+    interactive model switch path. Auxiliary calls enter through this module,
+    so they must consume the same mapping or an alias can work in the UI but
+    be sent verbatim to the provider. Only aliases whose declared provider
+    matches the already-selected provider are rewritten; this keeps routing
+    decisions outside this helper and avoids catalog lookups for ordinary
+    model names.
+    """
+    if not model_name:
+        return model_name
+    try:
+        from hermes_cli.model_switch import DIRECT_ALIASES, _ensure_direct_aliases
+
+        _ensure_direct_aliases()
+        direct = DIRECT_ALIASES.get(str(model_name).strip().lower())
+        if direct is None:
+            return model_name
+        selected_provider = str(provider).strip().lower()
+        declared_provider = str(direct.provider).strip().lower()
+        if selected_provider.startswith("custom:"):
+            selected_provider = selected_provider.split(":", 1)[1].strip()
+        if declared_provider.startswith("custom:"):
+            declared_provider = declared_provider.split(":", 1)[1].strip()
+        if declared_provider != selected_provider:
+            return model_name
+        return direct.model
+    except Exception:
+        # Alias loading is compatibility convenience. A malformed optional
+        # mapping must not prevent the normal provider path from resolving.
+        return model_name
+
+
 def resolve_provider_client(
     provider: str,
     model: str = None,
@@ -6009,6 +6123,7 @@ def resolve_provider_client(
     original_provider = (provider or "").strip().lower()
     # Normalise aliases
     provider = _normalize_aux_provider(provider)
+    model = _resolve_configured_direct_model_alias(model, provider)
 
     # MoA virtual provider chokepoint: "moa" is not a real HTTP provider —
     # its acting model is the preset's aggregator slot. The two resolver
@@ -7514,6 +7629,12 @@ def _get_cached_client(
     preventing the fd-exhaustion that previously occurred in long-running
     gateways where recycled worker threads created unbounded entries (#10200).
     """
+    # Direct model aliases are resolved by ``resolve_provider_client`` while
+    # creating a client. Normalize them here as well so cache hits and the
+    # returned wire model cannot reintroduce the alias after client creation.
+    model = _resolve_configured_direct_model_alias(
+        model, _normalize_aux_provider(provider),
+    )
     # Resolve the current event loop for async clients so we can validate
     # cached entries.  Loop identity is NOT in the cache key — instead we
     # check at hit time whether the cached loop is still current and open.
@@ -9233,6 +9354,44 @@ def _call_llm_impl(
             # Retries exhausted — fall through to first_err fallback handling.
             raise _last_transient
     except Exception as first_err:
+        _response_format_retry = _response_format_fallback_kwargs(kwargs, first_err)
+        if _response_format_retry is not None:
+            logger.info(
+                "Auxiliary %s: provider rejected response_format; retrying with "
+                "a less restrictive format",
+                task or "call",
+            )
+            try:
+                return _validate_llm_response(
+                    _relay_sync_completion(
+                        client,
+                        _response_format_retry,
+                        provider=resolved_provider,
+                        api_mode=resolved_api_mode,
+                    ),
+                    task,
+                )
+            except Exception as retry_err:
+                _response_format_retry_2 = _response_format_fallback_kwargs(
+                    _response_format_retry, retry_err
+                )
+                if _response_format_retry_2 is None:
+                    first_err = retry_err
+                else:
+                    try:
+                        return _validate_llm_response(
+                            _relay_sync_completion(
+                                client,
+                                _response_format_retry_2,
+                                provider=resolved_provider,
+                                api_mode=resolved_api_mode,
+                            ),
+                            task,
+                        )
+                    except Exception as final_err:
+                        first_err = final_err
+                        _response_format_retry = _response_format_retry_2
+                kwargs = _response_format_retry
         if "temperature" in kwargs and _is_unsupported_temperature_error(first_err):
             retry_kwargs = dict(kwargs)
             retry_kwargs.pop("temperature", None)
@@ -9937,6 +10096,44 @@ async def _async_call_llm_impl(
                 ),
                 task)
     except Exception as first_err:
+        _response_format_retry = _response_format_fallback_kwargs(kwargs, first_err)
+        if _response_format_retry is not None:
+            logger.info(
+                "Auxiliary %s (async): provider rejected response_format; "
+                "retrying with a less restrictive format",
+                task or "call",
+            )
+            try:
+                return _validate_llm_response(
+                    await _relay_async_completion(
+                        client,
+                        _response_format_retry,
+                        provider=resolved_provider,
+                        api_mode=resolved_api_mode,
+                    ),
+                    task,
+                )
+            except Exception as retry_err:
+                _response_format_retry_2 = _response_format_fallback_kwargs(
+                    _response_format_retry, retry_err
+                )
+                if _response_format_retry_2 is None:
+                    first_err = retry_err
+                else:
+                    try:
+                        return _validate_llm_response(
+                            await _relay_async_completion(
+                                client,
+                                _response_format_retry_2,
+                                provider=resolved_provider,
+                                api_mode=resolved_api_mode,
+                            ),
+                            task,
+                        )
+                    except Exception as final_err:
+                        first_err = final_err
+                        _response_format_retry = _response_format_retry_2
+                kwargs = _response_format_retry
         if "temperature" in kwargs and _is_unsupported_temperature_error(first_err):
             retry_kwargs = dict(kwargs)
             retry_kwargs.pop("temperature", None)

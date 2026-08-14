@@ -11,7 +11,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
-import os
+import sys
 from io import StringIO
 
 import pytest
@@ -19,6 +19,14 @@ import pytest
 from acp.exceptions import RequestError
 
 from acp_adapter.entry import _BenignProbeMethodFilter
+
+
+@pytest.fixture
+def event_loop_policy():
+    """Use a pipe-compatible loop for the stdio-shaped ACP test on Windows."""
+    if sys.platform == "win32":
+        return asyncio.WindowsSelectorEventLoopPolicy()
+    return asyncio.get_event_loop_policy()
 
 
 # -- Unit tests on the filter itself ----------------------------------------
@@ -121,33 +129,27 @@ async def test_bare_ping_request_produces_proper_response_and_no_stderr_noise(
     # Also suppress propagation of caplog's default handler interfering with
     # our stream (caplog still captures via its own propagation hook).
     try:
-        loop = asyncio.get_running_loop()
-
-        # Pipe client -> agent
-        client_to_agent_r, client_to_agent_w = os.pipe()
-        # Pipe agent -> client
-        agent_to_client_r, agent_to_client_w = os.pipe()
-
-        in_read_file = os.fdopen(client_to_agent_r, "rb", buffering=0)
-        in_write_file = os.fdopen(client_to_agent_w, "wb", buffering=0)
-        out_read_file = os.fdopen(agent_to_client_r, "rb", buffering=0)
-        out_write_file = os.fdopen(agent_to_client_w, "wb", buffering=0)
-
-        # Agent reads its input from this StreamReader:
-        agent_input = asyncio.StreamReader(limit=1024 * 1024, loop=loop)
-        agent_input_proto = asyncio.StreamReaderProtocol(agent_input, loop=loop)
-        await loop.connect_read_pipe(lambda: agent_input_proto, in_read_file)
-
-        # Agent writes its output via this StreamWriter:
-        out_transport, out_protocol = await loop.connect_write_pipe(
-            asyncio.streams.FlowControlMixin, out_write_file
+        # Use a loopback stream instead of anonymous pipes.  Windows' Proactor
+        # loop cannot register ordinary pipe handles with IOCP, while Selector
+        # loops do not implement pipe transports.  A TCP stream exercises the
+        # same ACP JSON-RPC framing and works on every supported platform.
+        agent_streams: asyncio.Future[tuple[asyncio.StreamReader, asyncio.StreamWriter]] = (
+            asyncio.get_running_loop().create_future()
         )
-        agent_output = asyncio.StreamWriter(out_transport, out_protocol, None, loop)
 
-        # Test harness reads agent output via this StreamReader:
-        client_input = asyncio.StreamReader(limit=1024 * 1024, loop=loop)
-        client_input_proto = asyncio.StreamReaderProtocol(client_input, loop=loop)
-        await loop.connect_read_pipe(lambda: client_input_proto, out_read_file)
+        async def accept_agent_streams(
+            reader: asyncio.StreamReader, writer: asyncio.StreamWriter
+        ) -> None:
+            if not agent_streams.done():
+                agent_streams.set_result((reader, writer))
+            else:
+                writer.close()
+                await writer.wait_closed()
+
+        server = await asyncio.start_server(accept_agent_streams, "127.0.0.1", 0)
+        address = server.sockets[0].getsockname()
+        client_input, client_output = await asyncio.open_connection(*address)
+        agent_input, agent_output = await asyncio.wait_for(agent_streams, timeout=2.0)
 
         agent_task = asyncio.create_task(
             acp.run_agent(
@@ -160,8 +162,8 @@ async def test_bare_ping_request_produces_proper_response_and_no_stderr_noise(
 
         # Send a bare `ping`
         request = {"jsonrpc": "2.0", "id": 1, "method": "ping", "params": {}}
-        in_write_file.write((json.dumps(request) + "\n").encode())
-        in_write_file.flush()
+        client_output.write((json.dumps(request) + "\n").encode())
+        await client_output.drain()
 
         response_line = await asyncio.wait_for(client_input.readline(), timeout=5.0)
         # Give the supervisor task a tick to fire (filter should eat it)
@@ -177,7 +179,8 @@ async def test_bare_ping_request_produces_proper_response_and_no_stderr_noise(
         )
 
         # Clean shutdown
-        in_write_file.close()
+        client_output.close()
+        await client_output.wait_closed()
         try:
             await asyncio.wait_for(agent_task, timeout=2.0)
         except (asyncio.TimeoutError, Exception):
@@ -186,6 +189,10 @@ async def test_bare_ping_request_produces_proper_response_and_no_stderr_noise(
                 await agent_task
             except BaseException:  # noqa: BLE001
                 pass
+        agent_output.close()
+        await agent_output.wait_closed()
+        server.close()
+        await server.wait_closed()
     finally:
         root.handlers = prior_handlers
         root.setLevel(prior_level)

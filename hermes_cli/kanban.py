@@ -3427,7 +3427,17 @@ def run_slash(rest: str) -> str:
     import io
     import contextlib
 
-    tokens = shlex.split(rest) if rest and rest.strip() else []
+    # Windows: POSIX splitting strips backslashes from drive paths
+    # (C:\dir -> C:dir).  Use non-POSIX splitting there, then unwrap any
+    # fully-quoted token so '--metadata {"a":1}' still arrives as JSON.
+    tokens = shlex.split(rest, posix=os.name != "nt") if rest and rest.strip() else []
+    if os.name == "nt":
+        _unquoted: list[str] = []
+        for _token in tokens:
+            if len(_token) >= 2 and _token[0] == _token[-1] and _token[0] in {"'", '"'}:
+                _token = _token[1:-1]
+            _unquoted.append(_token)
+        tokens = _unquoted
 
     # Bare ``/kanban`` or ``/kanban help`` / ``--help`` / ``-h`` / ``?``:
     # show the curated short-help block instead of dumping argparse's full

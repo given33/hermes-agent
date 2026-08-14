@@ -71,6 +71,22 @@ SANDBOX_ALLOWED_TOOLS = frozenset([
     "terminal",
 ])
 
+
+def _resolve_sandbox_tools(
+    enabled_tools: Optional[List[str]],
+    tool_role: Optional[str] = None,
+) -> frozenset[str]:
+    """Resolve the Code Mode child allow-list without widening a role scope."""
+
+    session_tools = set(enabled_tools) if enabled_tools is not None else set()
+    sandbox_tools = frozenset(SANDBOX_ALLOWED_TOOLS & session_tools)
+    # The all-tools fallback is retained for legacy callers with no role. An
+    # explicit role is an authority boundary, so its empty intersection must
+    # stay empty instead of becoming the global catalog.
+    if not sandbox_tools and not tool_role:
+        return SANDBOX_ALLOWED_TOOLS
+    return sandbox_tools
+
 # Resource limit defaults (overridable via config.yaml → code_execution.*)
 DEFAULT_TIMEOUT = 300        # 5 minutes
 DEFAULT_MAX_TOOL_CALLS = 50
@@ -659,6 +675,8 @@ def _rpc_server_loop(
     allowed_tools: frozenset,
     stop_event: threading.Event,
     rpc_token: str,
+    parent_call_id: str = "",
+    tool_role: str = "",
 ):
     """
     Accept one client connection and dispatch tool-call requests until
@@ -716,6 +734,7 @@ def _rpc_server_loop(
 
                 tool_name = request.get("tool", "")
                 tool_args = request.get("args", {})
+                child_call_id = f"{parent_call_id or 'execute_code'}:child:{tool_call_counter[0] + 1}"
 
                 # Enforce the allow-list
                 if tool_name not in allowed_tools:
@@ -747,7 +766,9 @@ def _rpc_server_loop(
                 try:
                     with thread_scoped_silence():
                         result = handle_function_call(
-                            tool_name, tool_args, task_id=task_id
+                            tool_name, tool_args, task_id=task_id,
+                            tool_call_id=child_call_id,
+                            tool_role=tool_role or None,
                         )
                 except Exception as exc:
                     logger.error("Tool call failed in sandbox: %s", exc, exc_info=True)
@@ -759,6 +780,8 @@ def _rpc_server_loop(
                 # Log for observability
                 args_preview = str(tool_args)[:80]
                 tool_call_log.append({
+                    "call_id": child_call_id,
+                    "parent_call_id": str(parent_call_id or ""),
                     "tool": tool_name,
                     "args_preview": args_preview,
                     "duration": round(call_duration, 2),
@@ -929,6 +952,8 @@ def _rpc_poll_loop(
     allowed_tools: frozenset,
     stop_event: threading.Event,
     rpc_token: str,
+    parent_call_id: str = "",
+    tool_role: str = "",
 ):
     """Poll the remote filesystem for tool call requests and dispatch them.
 
@@ -994,6 +1019,7 @@ def _rpc_poll_loop(
 
                 tool_name = request.get("tool", "")
                 tool_args = request.get("args", {})
+                child_call_id = f"{parent_call_id or 'execute_code'}:child:{tool_call_counter[0] + 1}"
                 seq = request.get("seq", 0)
                 seq_str = f"{seq:06d}"
                 res_file = f"{rpc_dir}/res_{seq_str}"
@@ -1022,7 +1048,9 @@ def _rpc_poll_loop(
                     try:
                         with thread_scoped_silence():
                             tool_result = handle_function_call(
-                                tool_name, tool_args, task_id=task_id
+                                tool_name, tool_args, task_id=task_id,
+                                tool_call_id=child_call_id,
+                                tool_role=tool_role or None,
                             )
                     except Exception as exc:
                         logger.error("Tool call failed in remote sandbox: %s",
@@ -1032,6 +1060,8 @@ def _rpc_poll_loop(
                     tool_call_counter[0] += 1
                     call_duration = time.monotonic() - call_start
                     tool_call_log.append({
+                        "call_id": child_call_id,
+                        "parent_call_id": str(parent_call_id or ""),
                         "tool": tool_name,
                         "args_preview": str(tool_args)[:80],
                         "duration": round(call_duration, 2),
@@ -1065,6 +1095,8 @@ def _execute_remote(
     code: str,
     task_id: Optional[str],
     enabled_tools: Optional[List[str]],
+    parent_call_id: Optional[str] = None,
+    tool_role: Optional[str] = None,
 ) -> str:
     """Run a script on the remote terminal backend via file-based RPC.
 
@@ -1077,10 +1109,7 @@ def _execute_remote(
     timeout = _cfg.get("timeout", DEFAULT_TIMEOUT)
     max_tool_calls = _cfg.get("max_tool_calls", DEFAULT_MAX_TOOL_CALLS)
 
-    session_tools = set(enabled_tools) if enabled_tools else set()
-    sandbox_tools = frozenset(SANDBOX_ALLOWED_TOOLS & session_tools)
-    if not sandbox_tools:
-        sandbox_tools = SANDBOX_ALLOWED_TOOLS
+    sandbox_tools = _resolve_sandbox_tools(enabled_tools, tool_role)
 
     effective_task_id = task_id or "default"
     env, env_type = _get_or_create_env(effective_task_id)
@@ -1137,7 +1166,8 @@ def _execute_remote(
             args=(
                 env, f"{sandbox_dir}/rpc", effective_task_id,
                 tool_call_log, tool_call_counter, max_tool_calls,
-                sandbox_tools, stop_event, rpc_token,
+                sandbox_tools, stop_event, rpc_token, parent_call_id or "",
+                tool_role or "",
             ),
             daemon=True,
         )
@@ -1223,6 +1253,11 @@ def _execute_remote(
         "tool_calls_made": tool_call_counter[0],
         "duration_seconds": duration,
     }
+    result["call_tree"] = {
+        "schema_version": "tool-execution/v1",
+        "parent_call_id": str(parent_call_id or ""),
+        "children": list(tool_call_log),
+    }
     result.update(stdout_metadata)
 
     if status == "timeout":
@@ -1257,6 +1292,8 @@ def execute_code(
     code: str,
     task_id: Optional[str] = None,
     enabled_tools: Optional[List[str]] = None,
+    parent_call_id: Optional[str] = None,
+    tool_role: Optional[str] = None,
 ) -> str:
     """
     Run a Python script in a sandboxed child process with RPC access
@@ -1318,7 +1355,7 @@ def execute_code(
         clear_current_thread_interrupt()
 
     if env_type != "local":
-        return _execute_remote(code, task_id, enabled_tools)
+        return _execute_remote(code, task_id, enabled_tools, parent_call_id, tool_role)
 
     # --- Local execution path (UDS) --- below this line is unchanged ---
 
@@ -1330,12 +1367,8 @@ def execute_code(
     timeout = _cfg.get("timeout", DEFAULT_TIMEOUT)
     max_tool_calls = _cfg.get("max_tool_calls", DEFAULT_MAX_TOOL_CALLS)
 
-    # Determine which tools the sandbox can call
-    session_tools = set(enabled_tools) if enabled_tools else set()
-    sandbox_tools = frozenset(SANDBOX_ALLOWED_TOOLS & session_tools)
-
-    if not sandbox_tools:
-        sandbox_tools = SANDBOX_ALLOWED_TOOLS
+    # Determine which tools the sandbox can call.
+    sandbox_tools = _resolve_sandbox_tools(enabled_tools, tool_role)
 
     # --- Set up temp directory with hermes_tools.py and script.py ---
     tmpdir = tempfile.mkdtemp(prefix="hermes_sandbox_")
@@ -1413,6 +1446,8 @@ def execute_code(
             args=(
                 server_sock, task_id, tool_call_log,
                 tool_call_counter, max_tool_calls, sandbox_tools, stop_event, rpc_token,
+                parent_call_id or "",
+                tool_role or "",
             ),
             daemon=True,
         )
@@ -1648,6 +1683,11 @@ def execute_code(
             "duration_seconds": duration,
         }
         result.update(stdout_metadata)
+        result["call_tree"] = {
+            "schema_version": "tool-execution/v1",
+            "parent_call_id": str(parent_call_id or ""),
+            "children": list(tool_call_log),
+        }
 
         if status == "timeout":
             timeout_msg = f"Script timed out after {timeout}s and was killed."
@@ -2070,8 +2110,21 @@ registry.register(
     handler=lambda args, **kw: execute_code(
         code=args.get("code", ""),
         task_id=kw.get("task_id"),
-        enabled_tools=kw.get("enabled_tools")),
+        enabled_tools=kw.get("enabled_tools"),
+        parent_call_id=kw.get("tool_call_id"),
+        tool_role=kw.get("tool_role")),
     check_fn=check_sandbox_requirements,
     emoji="🐍",
     max_result_size_chars=100_000,
+    prompt_guidance=(
+        "Programmatic Tool Calling (PTC): use execute_code when the task needs "
+        "multiple Hermes tool calls with loops, filtering, branching, or "
+        "aggregation. Keep the program small, call only tools listed in this "
+        "schema, and print a concise final result. Use direct tool calls when "
+        "the user needs to inspect each intermediate result or when approval "
+        "or interaction is required. The sandbox and approval boundary still "
+        "apply to every nested call."
+    ),
+    capability_tags={"process", "provider"},
+    allowed_roles={"dispatcher", "worker"},
 )
