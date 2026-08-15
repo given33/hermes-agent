@@ -536,6 +536,10 @@ def _hosted_chat_lease_ms() -> int:
 
 
 _HOSTED_CHAT_TIMEOUT_SECONDS = _hosted_chat_timeout_seconds()
+# The final reporter is the last user-visible step. Even when the general
+# hosted-chat timeout is disabled, cap this local server-side role so a stuck
+# gateway cannot leave iOS clients waiting forever for turn.completed.
+_HOSTED_REPORTER_TIMEOUT_SECONDS = 300
 _HOSTED_STDERR_TAIL_CHARS = 64 * 1024
 _HOSTED_REWORK_LIMIT = 2
 # Hosted SSE readers consume the live in-memory snapshot immediately.  The
@@ -15258,6 +15262,12 @@ def execute_hosted_workflow(
                 ],
             },
         )
+        reporter_runner = runner
+        if _runner_supports_keyword(runner, "timeout"):
+            def _bounded_reporter_runner(profile, prompt, **kwargs):
+                kwargs["timeout"] = _HOSTED_REPORTER_TIMEOUT_SECONDS
+                return runner(profile, prompt, **kwargs)
+            reporter_runner = _bounded_reporter_runner
         reporter_result, reporter_status, _reporter_state = _run_hosted_role(
             conversation_id,
             turn_id,
@@ -15265,7 +15275,7 @@ def execute_hosted_workflow(
             role_stage="reporter",
             role_label="Hermes · 最终汇报",
             prompt=reporter_prompt,
-            runner=runner,
+            runner=reporter_runner,
             kanban_task_id=("" if remote_workers else reporter_task_scope),
             start_text="执行与审阅信息已齐，正在整理唯一的最终汇报。",
             final_report=True,
