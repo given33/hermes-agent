@@ -540,6 +540,11 @@ _HOSTED_CHAT_TIMEOUT_SECONDS = _hosted_chat_timeout_seconds()
 # hosted-chat timeout is disabled, cap this local server-side role so a stuck
 # gateway cannot leave iOS clients waiting forever for turn.completed.
 _HOSTED_REPORTER_TIMEOUT_SECONDS = 300
+# Remote connector roles (supervisor checks, manager handoff, worker/reviewer)
+# must not wait forever for a claimed-but-stalled remote run. This is an
+# absolute per-role cap; a stuck connector therefore produces a terminal
+# failed event instead of leaving iOS clients on an open SSE stream.
+_HOSTED_REMOTE_ROLE_TIMEOUT_SECONDS = 1800
 _HOSTED_STDERR_TAIL_CHARS = 64 * 1024
 _HOSTED_REWORK_LIMIT = 2
 # Hosted SSE readers consume the live in-memory snapshot immediately.  The
@@ -9849,8 +9854,56 @@ def _run_hosted_remote_role(
     fallback_deadline = time.monotonic() + float(
         min(configured_fallback or _REMOTE_SERVER_FALLBACK_SECONDS, 60)
     )
+    # Absolute per-role cap so a claimed-but-stalled remote run cannot leave
+    # the hosted turn in `streaming` forever. This is deliberately generous
+    # (default 30 minutes) but finite; operators can tune it with
+    # HERMES_REMOTE_RUN_WAIT_SECONDS.
+    role_wait_deadline = time.monotonic() + float(
+        configured_wait or _HOSTED_REMOTE_ROLE_TIMEOUT_SECONDS
+    )
 
     while True:
+        if time.monotonic() >= role_wait_deadline:
+            now_ms = int(time.time() * 1000)
+            with _STATE_LOCK:
+                timeout_state = load_single_state()
+                timeout_location = _remote_run_location(
+                    timeout_state,
+                    active_remote_id,
+                )
+                if timeout_location is not None:
+                    _timeout_conversation, _timeout_hosted, _role_key, current = timeout_location
+                    current.update(
+                        {
+                            "status": "timed_out",
+                            "terminal": True,
+                            "cancel_requested": True,
+                            "cancel_kind": "timeout",
+                            "cancel_reason": "Hosted remote role exceeded bounded wait",
+                            "error": "Hosted remote role timed out",
+                            "summary": "Hosted remote role timed out",
+                            "completed_at": now_ms,
+                            "updated_at": now_ms,
+                        }
+                    )
+                    _timeout_hosted.update(
+                        {
+                            "stage": "failed",
+                            "remote_cancel_pending": True,
+                            "cancel_requested": True,
+                            "cancel_kind": "timeout",
+                            "updated_at": now_ms,
+                        }
+                    )
+                    save_single_state(timeout_state)
+            _notify_hosted_update(conversation_id)
+            release_remote_role_claim()
+            return "", "failed", {
+                "content": "",
+                "status": "failed",
+                "error": "Hosted remote role timed out",
+                "activities": [],
+            }
         if not _renew_hosted_active_role(
             conversation_id,
             turn_id,
