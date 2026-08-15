@@ -506,9 +506,31 @@ def run_gate(gate: GoalGate, *, cwd: Optional[str] = None) -> Tuple[bool, int, s
     ``_GATE_OUTPUT_TAIL_CHARS``.
     """
     try:
-        proc = subprocess.run(
+        command: object = gate.command
+        shell = True
+        # Goal gates are commonly authored with POSIX command syntax because
+        # they also run in CI and remote workspaces.  ``cmd.exe`` treats
+        # ``>&2; exit 3`` and ``sleep`` differently, which previously made a
+        # failing gate pass on Windows and turned a timeout into exit code 1.
+        # Keep native commands (including quoted Windows Python paths) on the
+        # platform shell, but route unambiguous POSIX gate syntax through the
+        # bundled Git Bash when available.
+        if os.name == "nt" and re.search(
+            r"(?:[;&|]|\b(?:sleep|true|false|printf|export|unset)\b)",
             gate.command,
-            shell=True,
+        ):
+            try:
+                from tools.environments.local import _find_bash
+
+                bash = _find_bash()
+            except Exception:
+                bash = ""
+            if bash:
+                command = [bash, "-lc", gate.command]
+                shell = False
+        proc = subprocess.run(
+            command,
+            shell=shell,
             capture_output=True,
             text=True,
             # A gate runs whatever the operator configured, so its output is
@@ -519,7 +541,7 @@ def run_gate(gate: GoalGate, *, cwd: Optional[str] = None) -> Tuple[bool, int, s
             # and the tail the agent needs to fix the failure arrives empty.
             encoding="utf-8",
             errors="replace",
-            timeout=max(1, int(gate.timeout_seconds)),
+            timeout=max(0.05, float(gate.timeout_seconds)),
             cwd=cwd or None,
         )
         combined = (proc.stdout or "") + (("\n" + proc.stderr) if proc.stderr else "")

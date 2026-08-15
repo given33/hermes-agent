@@ -30,6 +30,8 @@ from pathlib import Path
 
 import pytest
 
+from scripts import run_tests_parallel as parallel_runner
+
 
 # Both tests share the same handoff file: the leaker writes here, the
 # verifier reads here. We park it in $TMPDIR with a unique-per-run name
@@ -91,7 +93,8 @@ def test_progress_output_tolerates_legacy_stdout_encoding(tmp_path: Path) -> Non
         env=env,
         stdout=subprocess.PIPE,
         stderr=subprocess.STDOUT,
-        text=True,
+        encoding="utf-8",
+        errors="replace",
         timeout=60,
     )
 
@@ -270,6 +273,42 @@ def _run_runner(probe_dir: Path, *extra: str) -> subprocess.CompletedProcess:
     )
 
 
+def test_nested_runner_uses_isolated_failure_manifest(tmp_path: Path) -> None:
+    top_level = parallel_runner._failure_manifest_path(tmp_path, runner_depth=0)
+    nested = parallel_runner._failure_manifest_path(tmp_path, runner_depth=1)
+
+    assert top_level.name == "hermes-parallel-failures.jsonl"
+    assert nested.name == f"hermes-parallel-failures-{os.getpid()}.jsonl"
+    assert nested != top_level
+
+
+def test_worker_subprocess_increments_runner_depth(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    probe = tmp_path / "test_depth_probe.py"
+    probe.write_text("def test_smoke():\n    assert True\n", encoding="utf-8")
+    captured: dict[str, str] = {}
+
+    class _Proc:
+        pid = 123
+        returncode = 0
+
+        def communicate(self, timeout: float):
+            return "1 passed in 0.01s\n", None
+
+    def fake_popen(*args, **kwargs):
+        captured.update(kwargs["env"])
+        return _Proc()
+
+    monkeypatch.setattr(parallel_runner.subprocess, "Popen", fake_popen)
+    monkeypatch.setattr(parallel_runner, "_kill_tree", lambda *args, **kwargs: None)
+    parallel_runner._run_one_file_once(probe, [], tmp_path, 30)
+
+    assert captured["HERMES_PARALLEL_RUNNER_DEPTH"] == str(
+        parallel_runner._RUNNER_DEPTH + 1
+    )
+
+
 
 
 def test_bare_value_flag_keeps_its_value(tmp_path: Path) -> None:
@@ -349,7 +388,8 @@ def test_file_retry_self_heals_and_prints_both_attempts(tmp_path: Path) -> None:
         cwd=repo_root,
         stdout=subprocess.PIPE,
         stderr=subprocess.STDOUT,
-        text=True,
+        encoding="utf-8",
+        errors="replace",
         timeout=60,
     )
 
@@ -391,7 +431,7 @@ def test_node_id_selector_runs_the_named_test(tmp_path: Path) -> None:
         [sys.executable, str(repo_root / "scripts" / "run_tests_parallel.py"),
          f"{target}::test_alpha", "-j", "1", "--file-timeout", "30"],
         cwd=repo_root, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-        text=True, timeout=60,
+        encoding="utf-8", errors="replace", timeout=60,
     )
     assert proc.returncode == 0, proc.stdout
     assert "No test files to run" not in proc.stdout
@@ -410,7 +450,7 @@ def test_explicit_k_wins_over_node_id_inference(tmp_path: Path) -> None:
          f"{target}::test_alpha", "-k", "test_beta",
          "-j", "1", "--file-timeout", "30"],
         cwd=repo_root, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-        text=True, timeout=60,
+        encoding="utf-8", errors="replace", timeout=60,
     )
     # -k test_beta wins: one test ran, and it wasn't filtered to nothing.
     assert proc.returncode == 0, proc.stdout

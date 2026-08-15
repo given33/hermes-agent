@@ -224,7 +224,7 @@ async def test_admin_runs_quick_command_when_gating_enabled():
         }
     )
     runner.config.quick_commands = {
-        "limits": {"type": "exec", "command": "printf quick-command-admin"}
+        "limits": {"type": "exec", "command": "echo quick-command-admin"}
     }
 
     result = await runner._handle_message(

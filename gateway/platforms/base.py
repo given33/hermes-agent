@@ -21,7 +21,7 @@ import time
 import uuid
 import weakref
 from abc import ABC, abstractmethod
-from urllib.parse import urlsplit
+from urllib.parse import unquote, urlsplit
 
 from utils import normalize_proxy_url
 
@@ -569,7 +569,7 @@ def is_host_excluded_by_no_proxy(hostname: str, no_proxy_value: str | None = Non
 import dataclasses
 from dataclasses import dataclass, field
 from datetime import datetime
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from typing import TYPE_CHECKING, Dict, List, Optional, Any, Callable, Awaitable, Tuple, Union
 from enum import Enum
 
@@ -582,6 +582,44 @@ from hermes_constants import get_default_hermes_root, get_hermes_dir, get_hermes
 
 if TYPE_CHECKING:
     from agent.display import ToolPreview
+
+
+def _expand_user_path(value: str) -> str:
+    """Expand ``~/`` using an explicit HOME override on every platform."""
+    if value == "~" or value.startswith(("~/", "~\\")):
+        home = os.environ.get("HOME")
+        if home:
+            suffix = value[2:] if len(value) > 1 else ""
+            return str(Path(home) / Path(suffix.replace("/", os.sep)))
+    return os.path.expanduser(value)
+
+
+def local_file_uri(path: str) -> str:
+    """Return a canonical file URI for an absolute local path."""
+    return Path(_expand_user_path(str(path))).resolve(strict=False).as_uri()
+
+
+def local_path_from_file_uri(uri: str) -> str:
+    """Decode canonical and legacy Hermes ``file://`` URIs to local paths."""
+    parsed = urlsplit(str(uri))
+    if parsed.scheme.lower() != "file":
+        return str(uri)
+
+    netloc = unquote(parsed.netloc or "")
+    path = unquote(parsed.path or "")
+    if netloc and not path and re.match(r"^[A-Za-z]:[\\/]", netloc):
+        return netloc
+    if os.name == "nt":
+        if netloc and netloc.lower() != "localhost":
+            return "\\\\" + netloc + path.replace("/", "\\")
+        if re.match(r"^/[A-Za-z]:/", path):
+            return path[1:].replace("/", "\\")
+        # A drive-less URI is a POSIX path from a remote/container context.
+        # Preserve it instead of silently rebasing it onto the Windows drive.
+        return path
+    if netloc and netloc.lower() != "localhost":
+        return f"//{netloc}{path}"
+    return path
 
 
 # ---------------------------------------------------------------------------
@@ -1362,7 +1400,7 @@ def _media_delivery_strict_mode() -> bool:
 def _media_delivery_denied_paths() -> List[Path]:
     """Return absolute denylist paths under which delivery is never allowed."""
     denied = [Path(p) for p in _MEDIA_DELIVERY_DENIED_PREFIXES]
-    home = Path(os.path.expanduser("~"))
+    home = Path(_expand_user_path("~"))
     for sub in _MEDIA_DELIVERY_DENIED_HOME_SUBPATHS:
         denied.append(home / sub)
     # The active Hermes profile and shared Hermes root both contain control
@@ -1434,7 +1472,7 @@ def _path_under_denied_prefix(resolved: Path) -> bool:
     credential location or another user's home.
     """
     try:
-        home = Path(os.path.expanduser("~")).resolve(strict=False)
+        home = Path(_expand_user_path("~")).resolve(strict=False)
     except (OSError, RuntimeError, ValueError):
         home = None
     for denied in _media_delivery_denied_paths():
@@ -1477,7 +1515,7 @@ def _path_is_within(path: Path, root: Path) -> bool:
         return False
 
 
-def _parse_docker_volume_mounts() -> List[Tuple[Path, Path]]:
+def _parse_docker_volume_mounts() -> List[Tuple[Path, PurePosixPath]]:
     """Parse configured Docker volume mounts into ``(host_path, container_path)``.
 
     Source of truth is ``TERMINAL_DOCKER_VOLUMES`` (JSON list of
@@ -1497,7 +1535,7 @@ def _parse_docker_volume_mounts() -> List[Tuple[Path, Path]]:
     if not isinstance(parsed, list):
         return []
 
-    mounts: List[Tuple[Path, Path]] = []
+    mounts: List[Tuple[Path, PurePosixPath]] = []
     for entry in parsed:
         if not isinstance(entry, str):
             continue
@@ -1522,7 +1560,7 @@ def _parse_docker_volume_mounts() -> List[Tuple[Path, Path]]:
             continue
         try:
             host_path = Path(host_expanded).resolve(strict=False)
-            container_path = Path(container_raw)
+            container_path = PurePosixPath(container_raw)
         except (OSError, RuntimeError, ValueError):
             continue
         if not container_path.is_absolute():
@@ -1591,7 +1629,7 @@ def _docker_persistent_home_host_root() -> Optional[Path]:
     return root if root.is_dir() else None
 
 
-def _cache_dir_container_mounts() -> List[Tuple[Path, Path]]:
+def _cache_dir_container_mounts() -> List[Tuple[Path, PurePosixPath]]:
     """(host, container) pairs for the auto-mounted Hermes cache dirs.
 
     The agent legitimately sees generated artifacts at ``/root/.hermes/...``
@@ -1606,14 +1644,17 @@ def _cache_dir_container_mounts() -> List[Tuple[Path, Path]]:
         from tools.credential_files import get_cache_directory_mounts
 
         return [
-            (Path(m["host_path"]), Path(m["container_path"]))
+            (Path(m["host_path"]), PurePosixPath(m["container_path"]))
             for m in get_cache_directory_mounts()
         ]
     except Exception:
         return []
 
 
-def _translate_docker_container_media_path(candidate: Path) -> Optional[Path]:
+def _translate_docker_container_media_path(
+    candidate: Path,
+    raw_candidate: Optional[str] = None,
+) -> Optional[Path]:
     """Translate a container-absolute path to its host path when possible.
 
     Uses longest-prefix match across configured ``docker_volumes``, the
@@ -1621,7 +1662,11 @@ def _translate_docker_container_media_path(candidate: Path) -> Optional[Path]:
     persistent Docker ``/workspace`` host root, and the persistent ``/root``
     home mount.
     """
-    if not candidate.is_absolute():
+    candidate_posix = str(
+        raw_candidate if raw_candidate is not None else candidate
+    ).replace("\\", "/")
+    container_candidate = PurePosixPath(candidate_posix)
+    if not container_candidate.is_absolute():
         return None
 
     # In-process gateways (Desktop backend, `hermes serve`) may not have
@@ -1640,7 +1685,7 @@ def _translate_docker_container_media_path(candidate: Path) -> Optional[Path]:
     # Synthetic /workspace mount for default persistent sandbox / cwd bind.
     default_ws = _default_docker_workspace_host_root()
     if default_ws is not None and not any(c.as_posix() == "/workspace" for _, c in mounts):
-        mounts.append((default_ws, Path("/workspace")))
+        mounts.append((default_ws, PurePosixPath("/workspace")))
     # Synthetic /root mount for the persistent home bind. Cache mounts above
     # are longer prefixes, so /root/.hermes/... still translates to the host
     # cache — this only catches stray home writes like /root/out.png.
@@ -1652,15 +1697,15 @@ def _translate_docker_container_media_path(candidate: Path) -> Optional[Path]:
         # the home mount would resolve to sandbox-home copies OUTSIDE the
         # host-side credential denylist prefixes — refuse instead so the
         # normal "container path doesn't exist on host" rejection applies.
-        if not candidate.as_posix().startswith("/root/.hermes"):
-            mounts.append((default_home, Path("/root")))
+        if not container_candidate.as_posix().startswith("/root/.hermes"):
+            mounts.append((default_home, PurePosixPath("/root")))
 
     if not mounts:
         return None
 
     # Longest container-prefix match.
-    best: Optional[Tuple[Path, Path, int]] = None
-    candidate_posix = candidate.as_posix()
+    best: Optional[Tuple[Path, PurePosixPath, int]] = None
+    candidate_posix = container_candidate.as_posix()
     for host_root, container_root in mounts:
         container_posix = container_root.as_posix().rstrip("/") or "/"
         if candidate_posix == container_posix or candidate_posix.startswith(container_posix + "/"):
@@ -1672,8 +1717,8 @@ def _translate_docker_container_media_path(candidate: Path) -> Optional[Path]:
 
     host_root, container_root, _ = best
     try:
-        relative = candidate.relative_to(container_root)
-        translated = (host_root / relative).resolve(strict=True)
+        relative = container_candidate.relative_to(container_root)
+        translated = host_root.joinpath(*relative.parts).resolve(strict=True)
     except (OSError, RuntimeError, ValueError):
         return None
     if translated != host_root and not _path_is_within(translated, host_root):
@@ -1712,20 +1757,19 @@ def validate_media_delivery_path(path: str) -> Optional[str]:
         return None
 
     try:
-        expanded = Path(os.path.expanduser(candidate))
+        expanded = Path(_expand_user_path(candidate))
     except (OSError, RuntimeError, ValueError):
         # expanduser raises ValueError("embedded null byte") for a ~\x00 path.
         return None
-    if not expanded.is_absolute():
-        return None
-
     # Docker agents emit MEDIA:/workspace/... (or other configured container
     # mount paths). Resolve those to host paths before the normal host-side
     # existence / denylist checks.
-    translated = _translate_docker_container_media_path(expanded)
+    translated = _translate_docker_container_media_path(expanded, candidate)
     if translated is not None:
         resolved = translated
     else:
+        if not expanded.is_absolute():
+            return None
         try:
             resolved = expanded.resolve(strict=True)
         except (OSError, RuntimeError, ValueError):
@@ -4305,8 +4349,6 @@ class BasePlatformAdapter(ABC):
         Override in subclasses to bundle into a single native API call
         (e.g. Signal's multi-attachment RPC)
         """
-        from urllib.parse import unquote as _unquote
-
         for image_url, alt_text in images:
             if human_delay > 0:
                 await asyncio.sleep(human_delay)
@@ -4320,7 +4362,7 @@ class BasePlatformAdapter(ABC):
                 if image_url.startswith("file://"):
                     img_result = await self.send_image_file(
                         chat_id=chat_id,
-                        image_path=_unquote(image_url[7:]),
+                        image_path=local_path_from_file_uri(image_url),
                         caption=alt_text if alt_text else None,
                         metadata=metadata,
                     )
@@ -4897,7 +4939,7 @@ class BasePlatformAdapter(ABC):
                 ext = os.path.splitext(path)[1].lower()
                 is_voice = has_voice_tag and ext in _AUDIO_EXTS
                 try:
-                    expanded = os.path.expanduser(path)
+                    expanded = _expand_user_path(path)
                 except (OSError, RuntimeError, ValueError):
                     # Skip a crafted ~\x00 path rather than aborting extraction
                     # and dropping every other attachment in the response.
@@ -5018,7 +5060,7 @@ class BasePlatformAdapter(ABC):
             if _in_code(match.start()):
                 continue
             raw = match.group(0)
-            expanded = os.path.expanduser(raw)
+            expanded = _expand_user_path(raw)
             if os.path.isfile(expanded):
                 found.append((raw, expanded))
             else:
@@ -6551,7 +6593,6 @@ class BasePlatformAdapter(ABC):
                 # files skip the photo path and route to send_document below
                 # so they're delivered with original bytes (no Telegram
                 # sendPhoto recompression).
-                from urllib.parse import quote as _quote
                 _image_paths: list = []
                 _non_image_media: list = []
                 for media_path, is_voice in media_files:
@@ -6572,7 +6613,7 @@ class BasePlatformAdapter(ABC):
 
                 if _image_paths:
                     try:
-                        _batch = [(f"file://{_quote(p)}", "") for p in _image_paths]
+                        _batch = [(local_file_uri(p), "") for p in _image_paths]
                         await self.send_multiple_images(
                             chat_id=event.source.chat_id,
                             images=_batch,

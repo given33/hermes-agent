@@ -2471,6 +2471,7 @@ from gateway.platforms.base import (
     _reply_anchor_for_event,
     build_auto_tts_output_path,
     merge_pending_message_event,
+    local_file_uri,
     utf16_len,
 )
 from gateway.shutdown_watchdog import (
@@ -20137,8 +20138,6 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         attachment contract — trigger post-stream uploads.
         """
         from pathlib import Path
-        from urllib.parse import quote as _quote
-
         try:
             # Capture [[as_document]] before extract_media strips it, so the
             # dispatch partition below can route image-extension files
@@ -20194,7 +20193,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
 
             if image_paths:
                 try:
-                    images = [(f"file://{_quote(p)}", "") for p in image_paths]
+                    images = [(local_file_uri(p), "") for p in image_paths]
                     await adapter.send_multiple_images(
                         chat_id=event.source.chat_id,
                         images=images,

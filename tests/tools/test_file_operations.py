@@ -4,6 +4,7 @@ import os
 import re
 import pytest
 import subprocess
+import shutil
 from pathlib import Path
 from unittest.mock import MagicMock
 
@@ -245,30 +246,45 @@ def file_ops(mock_env):
 def make_real_subprocess_env(cwd: str, include_stderr: bool = False) -> MagicMock:
     """Mock env whose execute() runs the command in a real subprocess.
 
-    For tests that need the generated shell scripts to actually run
-    (search fallback, atomic-write permissions) instead of being
-    intercepted by a bare MagicMock.  ``include_stderr`` folds stderr
-    into ``output`` for tests that surface shell error text; leave it
-    off for tests that parse structured stdout (e.g. find results).
+    On Windows the product local backend uses Git Bash, so run the generated
+    POSIX scripts through the same shell instead of accidentally sending them
+    to cmd.exe.
     """
     env = MagicMock()
     env.cwd = cwd
 
     def execute(command, **kwargs):
-        completed = subprocess.run(
-            command,
-            shell=True,
-            text=True,
-            capture_output=True,
-            input=kwargs.get("stdin_data"),
-        )
-        output = completed.stdout
+        run_cwd = kwargs.get("cwd", cwd)
+        if os.name == "nt":
+            bash = next((candidate for candidate in (
+                r"C:\\Program Files\\Git\\bin\\bash.exe",
+                shutil.which("bash.exe"),
+            ) if candidate and os.path.exists(candidate)), None)
+            if bash:
+                argv = [bash, "-lc", command]
+                stdin_data = kwargs.get("stdin_data")
+                completed = subprocess.run(
+                    argv,
+                    cwd=run_cwd,
+                    text=False,
+                    capture_output=True,
+                    input=stdin_data.encode("utf-8") if isinstance(stdin_data, str) else stdin_data,
+                )
+            else:
+                completed = subprocess.run(
+                    command, shell=True, cwd=run_cwd, text=True,
+                    capture_output=True, input=kwargs.get("stdin_data"),
+                )
+        else:
+            completed = subprocess.run(
+                command, shell=True, cwd=run_cwd, text=True,
+                capture_output=True, input=kwargs.get("stdin_data"),
+            )
+        output = completed.stdout.decode("utf-8", "replace") if isinstance(completed.stdout, bytes) else completed.stdout
         if include_stderr:
-            output += completed.stderr
-        return {
-            "output": output,
-            "returncode": completed.returncode,
-        }
+            stderr = completed.stderr.decode("utf-8", "replace") if isinstance(completed.stderr, bytes) else completed.stderr
+            output += stderr
+        return {"output": output, "returncode": completed.returncode}
 
     env.execute = execute
     return env
@@ -607,6 +623,8 @@ class TestAtomicWriteNewFilePermissions:
 
         assert result.error is None, f"write failed: {result.error}"
         assert dest.read_text() == "test content\n"
+        if os.name == "nt":
+            pytest.skip("NTFS does not expose POSIX umask mode bits")
         expected_mode = 0o666 & ~test_umask
         actual_mode = dest.stat().st_mode & 0o777
         assert actual_mode == expected_mode, (
@@ -626,6 +644,8 @@ class TestAtomicWriteNewFilePermissions:
 
         assert result.error is None, f"write failed: {result.error}"
         assert dest.read_text() == "#!/bin/sh\necho updated\n"
+        if os.name == "nt":
+            pytest.skip("NTFS does not expose POSIX executable mode bits")
         assert dest.stat().st_mode & 0o777 == 0o755
 
 
@@ -636,6 +656,7 @@ class TestAtomicWriteThroughSymlink:
     plain file, orphaning the real target and destroying the link (data-loss).
     """
 
+    @pytest.mark.require_symlinks
     def test_write_follows_symlink_and_preserves_link(self, tmp_path):
         ops = ShellFileOperations(make_real_subprocess_env(str(tmp_path)))
         real = tmp_path / "real.txt"
@@ -652,6 +673,7 @@ class TestAtomicWriteThroughSymlink:
         assert real.read_text() == "newcontent\n"
         assert os.path.realpath(link) == str(real)
 
+    @pytest.mark.require_symlinks
     def test_write_through_broken_symlink_falls_back(self, tmp_path):
         """A broken link resolves through readlink -f and creates the target."""
         ops = ShellFileOperations(make_real_subprocess_env(str(tmp_path)))

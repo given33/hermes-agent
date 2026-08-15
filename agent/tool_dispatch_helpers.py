@@ -604,10 +604,10 @@ def make_tool_result_message(
             message["_tool_output_risk"] = risk_metadata
     if effect_disposition is not None:
         message["effect_disposition"] = effect_disposition
-    if isinstance(execution_envelope, dict):
-        # Internal metadata is intentionally namespaced. Provider adapters can
-        # drop it while the desktop/iOS projection and session replay retain it.
-        message["_tool_execution"] = dict(execution_envelope)
+    # Execution envelopes live in ToolExecutionLedger/session trace and UI
+    # lifecycle events. They must not enter canonical conversation messages:
+    # timestamps, generations and digests would churn the model-facing prefix
+    # and some provider adapters forward unknown message keys verbatim.
     return message
 
 

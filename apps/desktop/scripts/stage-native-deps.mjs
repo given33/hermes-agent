@@ -1,4 +1,3 @@
-#!/usr/bin/env node
 // stage-native-deps.mjs — stages node-pty's native runtime dependencies
 //
 // Usage:

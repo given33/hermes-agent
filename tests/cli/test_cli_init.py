@@ -150,6 +150,7 @@ class TestBusyInputMode:
 
 
 class TestPromptToolkitTerminalCompatibility:
+    @pytest.mark.skipif(sys.platform == "win32", reason="POSIX terminal contract")
     def test_lf_enter_binds_to_submit_handler_posix(self):
         """Some thin PTYs deliver Enter as LF/c-j instead of CR/enter.
 
@@ -234,6 +235,7 @@ class TestPromptToolkitTerminalCompatibility:
 
 
 
+    @pytest.mark.skipif(sys.platform == "win32", reason="POSIX terminal contract")
     def test_cpr_gating_posix_suppresses_without_ssh(self, monkeypatch):
         """POSIX suppresses CPR without SSH.
 

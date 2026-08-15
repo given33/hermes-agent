@@ -116,7 +116,7 @@ class TestDumpSubagentTimeoutDiagnostic:
         assert p.name.startswith("subagent-timeout-sa-7-abc123-")
         assert p.suffix == ".log"
 
-        content = p.read_text()
+        content = p.read_text(encoding="utf-8")
         # Header references the issue for future grep-ability
         assert "issue #14726" in content
         # Timeout facts

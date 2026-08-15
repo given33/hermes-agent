@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import socket
+import sys
 
 import pytest
 
@@ -27,6 +28,7 @@ def test_notify_supports_systemd_abstract_socket(monkeypatch):
         receiver.close()
 
 
+@pytest.mark.skipif(sys.platform == "win32", reason="systemd is POSIX-only")
 def test_notify_uses_nonblocking_datagram_send(monkeypatch):
     calls: list[object] = []
 
@@ -55,6 +57,7 @@ def test_notify_uses_nonblocking_datagram_send(monkeypatch):
     assert calls[0] == ("setblocking", False)
 
 
+@pytest.mark.skipif(sys.platform == "win32", reason="systemd is POSIX-only")
 @pytest.mark.asyncio
 async def test_watchdog_sends_ready_heartbeat_and_stopping(monkeypatch):
     calls: list[str] = []

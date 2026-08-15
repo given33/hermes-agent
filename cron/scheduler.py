@@ -2465,10 +2465,13 @@ def _run_job_script(
         # reach fire time — fail the run with a report instead of crashing
         # the scheduler with an unhandled exception.
         return False, f"Blocked: script path is not a valid filesystem path: {script_path!r}"
-    if raw.is_absolute():
-        path = raw.resolve()
-    else:
-        path = (scripts_dir / raw).resolve()
+    try:
+        if raw.is_absolute():
+            path = raw.resolve()
+        else:
+            path = (scripts_dir / raw).resolve()
+    except (ValueError, RuntimeError, OSError):
+        return False, f"Blocked: script path is not a valid filesystem path: {script_path!r}"
 
     # Guard against path traversal, absolute path injection, and symlink
     # escape — scripts MUST reside within HERMES_HOME/scripts/.
@@ -2507,7 +2510,18 @@ def _run_job_script(
                 "On Windows, install Git for Windows (which ships Git Bash) "
                 "or rewrite the script as Python (.py)."
         )
-        argv = [_bash, str(path)]
+        script_arg = str(path)
+        if sys.platform == "win32":
+            bash_normalized = os.path.normcase(os.path.abspath(_bash))
+            system32_bash = os.path.normcase(
+                os.path.join(os.environ.get("SystemRoot", r"C:\Windows"), "System32", "bash.exe")
+            )
+            if bash_normalized == system32_bash and path.drive:
+                drive = path.drive.rstrip(":").lower()
+                script_arg = "/mnt/" + drive + "/" + "/".join(path.parts[1:])
+            else:
+                script_arg = path.as_posix()
+        argv = [_bash, script_arg]
         env_overlay: dict[str, str] = {}
     else:
         python_exe, env_overlay = _windows_cron_python_invocation(sys.executable)

@@ -367,6 +367,8 @@ def test_ca_key_created_with_0o600(hermes_home, monkeypatch):
 
     ca_crt, ca_key = ip.ensure_ca_cert()
     assert ca_key.exists()
+    if os.name == "nt":
+        pytest.skip("Windows ACLs are not represented by POSIX st_mode bits")
     mode = ca_key.stat().st_mode & 0o777
     assert mode == 0o600, f"CA key has perms {oct(mode)}, expected 0o600"
 
@@ -380,6 +382,8 @@ def test_ensure_audit_log_creates_with_0o600(hermes_home, tmp_path):
     audit = tmp_path / "audit.log"
     ip.ensure_audit_log(audit)
     assert audit.exists()
+    if os.name == "nt":
+        pytest.skip("Windows ACLs are not represented by POSIX st_mode bits")
     mode = audit.stat().st_mode & 0o777
     assert mode == 0o600
 
@@ -389,6 +393,8 @@ def test_ensure_audit_log_tightens_existing_perms(hermes_home, tmp_path):
     audit.write_text("preexisting content\n")
     os.chmod(audit, 0o644)
     ip.ensure_audit_log(audit)
+    if os.name == "nt":
+        pytest.skip("Windows ACLs are not represented by POSIX st_mode bits")
     mode = audit.stat().st_mode & 0o777
     assert mode == 0o600
 
@@ -400,6 +406,8 @@ def test_ensure_audit_log_tightens_existing_perms(hermes_home, tmp_path):
 
 def test_proxy_state_dir_is_0o700(hermes_home):
     state = ip._proxy_state_dir()
+    if os.name == "nt":
+        pytest.skip("Windows ACLs are not represented by POSIX st_mode bits")
     mode = state.stat().st_mode & 0o777
     assert mode == 0o700
 
@@ -492,6 +500,8 @@ def test_ensure_management_token_persists_and_is_stable(hermes_home):
     assert t1.startswith("hermes-mgmt-")
     p = ip._proxy_state_dir() / "management.token"
     assert p.exists()
+    if os.name == "nt":
+        return
     assert (p.stat().st_mode & 0o777) == 0o600
 
 

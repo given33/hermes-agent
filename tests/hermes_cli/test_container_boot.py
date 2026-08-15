@@ -14,6 +14,8 @@ from pathlib import Path
 
 import pytest
 
+pytestmark = pytest.mark.linux_only
+
 from hermes_cli.container_boot import (
     ReconcileAction,
     reconcile_profile_gateways,

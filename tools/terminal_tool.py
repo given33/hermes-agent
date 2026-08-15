@@ -2026,7 +2026,11 @@ def _cleanup_thread_worker():
     while _cleanup_running:
         try:
             config = _get_env_config()
-            _cleanup_inactive_envs(config["lifetime_seconds"])
+            # Test doubles and older config readers may omit the optional
+            # lifetime field.  The cleanup worker must remain self-healing;
+            # one incomplete config snapshot must not produce a permanent
+            # warning loop or prevent stale environments from being reaped.
+            _cleanup_inactive_envs(config.get("lifetime_seconds", 300))
         except Exception as e:
             logger.warning("Error in cleanup thread: %s", e, exc_info=True)
 
@@ -3407,7 +3411,7 @@ def terminal_tool(
             # (code_file=False) to mask opaque tokens with no vendor prefix.
             # Real prefixes, auth headers, JWTs, private keys are masked in
             # both modes. See issue #43025.
-            from hermes_runtime.redaction import redact_terminal_output
+            from agent.redact import redact_terminal_output
             output = redact_terminal_output(output.strip(), command) if output else ""
 
             # Interpret non-zero exit codes that aren't real errors

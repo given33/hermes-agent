@@ -2653,6 +2653,7 @@ def _run_single_child(
         # Capture the worker thread so the timeout diagnostic can dump its
         # Python stack (see #14726 — 0-API-call hangs are opaque without it).
         _worker_thread_holder: Dict[str, Optional[threading.Thread]] = {"t": None}
+        _child_call_started = threading.Event()
 
         def _relay_child_text(delta: str) -> None:
             # Forward the child's streamed reply text up the progress relay so
@@ -2670,6 +2671,7 @@ def _run_single_child(
             from agent.delegation_context import delegated_child_context
 
             with delegated_child_context(str(getattr(child, "session_id", "") or "")):
+                _child_call_started.set()
                 return child.run_conversation(
                     user_message=goal,
                     task_id=child_task_id,
@@ -2682,6 +2684,12 @@ def _run_single_child(
             _run_with_thread_capture,
         )
         try:
+            # A child execution timeout measures the child's work, not thread
+            # scheduling delay. Keep executor startup separately bounded so a
+            # saturated host cannot consume the entire turn budget before the
+            # child has acquired its conversation lease.
+            if not _child_call_started.wait(timeout=10.0):
+                raise RuntimeError("subagent worker did not start within 10 seconds")
             result = _child_future.result(timeout=child_timeout)
         except Exception as _timeout_exc:
             # No consumer boundary remains once this owner stops waiting for

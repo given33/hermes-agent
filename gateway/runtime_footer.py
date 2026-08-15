@@ -34,7 +34,10 @@ piecemeal, the footer is sent as a separate trailing message via
 
 from __future__ import annotations
 
+import ntpath
 import os
+import posixpath
+import re
 from typing import Any, Iterable, Optional
 
 _DEFAULT_FIELDS: tuple[str, ...] = ("model", "context_pct", "cwd")
@@ -46,10 +49,23 @@ def _home_relative_cwd(cwd: str) -> str:
     if not cwd:
         return ""
     try:
-        home = os.path.expanduser("~")
-        p = os.path.abspath(cwd)
-        if home and (p == home or p.startswith(home + os.sep)):
-            return "~" + p[len(home):]
+        is_windows_path = bool(re.match(r"^[A-Za-z]:[\\/]", cwd)) or cwd.startswith("\\\\")
+        is_posix_path = cwd.startswith("/") and not is_windows_path
+        path_module = posixpath if is_posix_path else ntpath if is_windows_path else os.path
+        p = path_module.normpath(cwd) if (is_posix_path or is_windows_path) else path_module.abspath(cwd)
+
+        home = os.environ.get("HOME") or os.path.expanduser("~")
+        if home:
+            home_windows = bool(re.match(r"^[A-Za-z]:[\\/]", home)) or home.startswith("\\\\")
+            home_posix = home.startswith("/") and not home_windows
+            if home_windows == is_windows_path and home_posix == is_posix_path:
+                normalized_home = path_module.normpath(home)
+                comparison_p = path_module.normcase(p)
+                comparison_home = path_module.normcase(normalized_home)
+                if comparison_p == comparison_home or comparison_p.startswith(
+                    comparison_home + path_module.sep
+                ):
+                    return "~" + p[len(normalized_home):].replace("\\", "/")
         return p
     except Exception:
         return cwd

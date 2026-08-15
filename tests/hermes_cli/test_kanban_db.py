@@ -566,7 +566,9 @@ def test_worktree_workspace_explicit_target_materializes_linked_worktree(kanban_
         capture_output=True,
         text=True,
     ).stdout
-    assert f"worktree {target}" in listed
+    # Git emits forward-slash paths even on Windows; compare canonical textual
+    # forms so this assertion covers both native Git output conventions.
+    assert f"worktree {target}".replace("\\", "/") in listed.replace("\\", "/")
     assert f"branch refs/heads/{branch}" in listed
 
 

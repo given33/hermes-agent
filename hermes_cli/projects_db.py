@@ -25,6 +25,7 @@ from __future__ import annotations
 
 import contextlib
 import os
+import posixpath
 import re
 import secrets
 import sqlite3
@@ -141,7 +142,16 @@ def _now() -> int:
 
 def _normalize_path(path: str) -> str:
     """Absolute, user-expanded, separator-normalized path (no trailing sep)."""
-    p = os.path.abspath(os.path.expanduser(str(path).strip()))
+    raw = str(path).strip()
+    # A leading slash is a valid POSIX project path even when the database is
+    # opened by the Windows desktop.  Do not reinterpret portable/remote
+    # paths such as ``/workspace/repo`` as ``C:\workspace\repo``.  Local
+    # Windows paths arrive with a drive or UNC prefix and still use native
+    # resolution below.
+    if os.name == "nt" and raw.startswith("/") and not raw.startswith("//"):
+        p = posixpath.normpath(raw)
+    else:
+        p = os.path.abspath(os.path.expanduser(raw))
     return p.rstrip("/\\") or p
 
 

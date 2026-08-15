@@ -771,7 +771,12 @@ class TestMediaDeliveryDefaultMode:
         workdir = fake_home / "work"
         workdir.mkdir()
         link = workdir / "innocent.pdf"
-        link.symlink_to(key)
+        try:
+            link.symlink_to(key)
+        except OSError as exc:
+            if os.name == "nt" and getattr(exc, "winerror", None) == 1314:
+                pytest.skip("Windows symlink privilege is unavailable")
+            raise
         monkeypatch.setenv("HOME", str(fake_home))
         monkeypatch.setattr(
             "gateway.platforms.base._MEDIA_DELIVERY_DENIED_PREFIXES",

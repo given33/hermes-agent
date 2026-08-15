@@ -566,15 +566,17 @@ def _export_dump_excluding_session_vars(
         extra_unset = f" {extra_unset}"
     return (
         "{ ( "
-        "unset ${!HERMES_SESSION_*} ${!HERMES_CRON_AUTO_DELIVER_*} "
+        "unset ${!HERMES_SESSION_*} ${!HERMES_TOOL_ARTIFACT_*} "
+        "${!HERMES_CRON_AUTO_DELIVER_*} "
         # AI_AGENT / HERMES_AGENT are per-command attribution markers
         # (re-exported by every _wrap_command with outer-harness-preserving
         # ${VAR:-default} semantics).  Persisting them into the snapshot
         # would make the FIRST command's value override a later outer
         # harness value arriving via the process env, exactly like the
         # session-var leak this dump already guards against.
-        "AI_AGENT HERMES_AGENT "
-        f"HERMES_UI_SESSION_ID{extra_unset} 2>/dev/null; "
+        "AI_AGENT HERMES_AGENT HERMES_UI_SESSION_ID "
+        "HERMES_ACCOUNT_GENERATION HERMES_CRON_SESSION"
+        f"{extra_unset} 2>/dev/null; "
         "export -p; "
         ") || true; } "
         f"> {tmp_path}"
@@ -1307,6 +1309,14 @@ class BaseEnvironment(ABC):
     def _finalize_wait_result(collector: "_BoundedOutputCollector",
                               rendered: str, returncode: int | None) -> dict:
         """Assemble a wait result, attaching spill metadata when overflow occurred."""
+        # The local Windows backend executes through Git Bash, whose stdout
+        # pipe is opened in text mode by the host-side process wrapper. Bash
+        # therefore commonly hands us CRLF even when the child emitted the
+        # canonical POSIX newline. Hermes tool results are a text protocol;
+        # normalize the transport boundary once so every consumer (file tools,
+        # reducers, and model-facing tool output) sees stable LF text.
+        if os.name == "nt":
+            rendered = rendered.replace("\r\n", "\n").replace("\r", "\n")
         result = {"output": rendered, "returncode": returncode}
         spill = collector.close_spill()
         if spill:

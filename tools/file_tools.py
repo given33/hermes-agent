@@ -7,6 +7,7 @@ import json
 import logging
 import os
 import posixpath
+import re
 import sys
 import threading
 from pathlib import Path, PurePosixPath
@@ -45,7 +46,14 @@ def _expand_tilde(path: str) -> str:
     except Exception:
         home = None
     if home and (path == "~" or path.startswith("~/")):
-        return home if path == "~" else os.path.join(home, path[2:])
+        if path == "~":
+            return home
+        # A profile home may be POSIX-shaped even on Windows (Git Bash/WSL).
+        # Do not let ntpath turn its separator into a backslash before the
+        # host/container path resolver classifies it.
+        if sys.platform == "win32" and str(home).startswith("/"):
+            return posixpath.join(str(home), path[2:])
+        return os.path.join(home, path[2:])
     return os.path.expanduser(path)
 
 
@@ -382,8 +390,19 @@ def _resolve_path_for_task(filepath: str, task_id: str = "default") -> Path | Pu
 
     # Host paths only — never rewrite Linux paths inside a container/WSL env.
     from tools.environments.local import _msys_to_windows_path
+    expanded = _expand_tilde(filepath)
 
-    expanded = _expand_tilde(_msys_to_windows_path(filepath))
+    # Plain POSIX absolute paths are meaningful to the Git Bash shell even on
+    # Windows (for example ``/tmp/out.txt`` or a sensitive ``/etc/hosts``
+    # probe). Preserve them textually instead of turning them into ``\\tmp``;
+    # drive-qualified MSYS paths remain translated below.
+    if sys.platform == "win32" and expanded.startswith("/") and not re.match(
+        r"^/(?:[A-Za-z](?:/|$)|cygdrive/[A-Za-z](?:/|$)|mnt/[A-Za-z](?:/|$))",
+        expanded,
+    ):
+        return _normalize_without_host_deref(expanded)
+
+    expanded = _expand_tilde(_msys_to_windows_path(expanded))
     if sys.platform == "win32":
         import ntpath
 
@@ -430,8 +449,8 @@ def _path_resolution_warning(filepath: str, resolved: Path, task_id: str = "defa
             return None  # Inside the workspace — expected.
         except ValueError:
             return (
-                f"Relative path {filepath!r} resolved to {str(resolved)!r}, which is "
-                f"OUTSIDE the active workspace ({str(root)!r}). The edit will land in "
+                f"Relative path {filepath!r} resolved to '{str(resolved)}', which is "
+                f"OUTSIDE the active workspace ('{str(root)}'). The edit will land in "
                 f"a different directory than the terminal's cwd. If this is not "
                 f"intended (e.g. a git-worktree session writing into the main "
                 f"checkout), pass an absolute path under the workspace instead."
@@ -515,7 +534,18 @@ def _rewrite_v4a_patch_paths_for_host(
 
 def _is_blocked_device_path(path: str) -> bool:
     """Return True for concrete device/fd paths that can hang reads."""
-    normalized = os.path.normpath(_expand_tilde(path))
+    expanded = _expand_tilde(path)
+    # These are shell-namespace safety rules, not host-filesystem probes.
+    # On Windows ntpath.normpath('/dev/zero') becomes '\\dev\\zero' and
+    # bypasses the POSIX blocklist even though the same path may be sent to
+    # Git Bash, a container, or a remote POSIX backend. Keep drive-qualified
+    # paths native, but normalize rooted POSIX spellings with posixpath.
+    if sys.platform == "win32" and expanded.startswith(("/", "\\")) and not re.match(
+        r"^[A-Za-z]:[\\/]", expanded
+    ):
+        normalized = posixpath.normpath(expanded.replace("\\", "/"))
+    else:
+        normalized = os.path.normpath(expanded)
     if normalized in _BLOCKED_DEVICE_PATHS:
         return True
     # /proc/self/fd/0-2 and /proc/<pid>/fd/0-2 are Linux aliases for stdio

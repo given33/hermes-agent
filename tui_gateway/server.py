@@ -10073,22 +10073,20 @@ def _run_prompt_submit(
             if display_kind and "persist_user_display_kind" in _run_params:
                 run_kwargs["persist_user_display_kind"] = display_kind
                 run_kwargs["persist_user_display_metadata"] = display_metadata
+
+            # Auto-titling runs inside the shared turn prologue. Install the
+            # live rename hook before the one authoritative conversation call
+            # so a title emitted during that prologue reaches the sidebar.
+            _title_key = session.get("session_key") or sid
+            agent._on_session_title = lambda t, _src, _k=_title_key: _emit(
+                "session.title", sid, {"session_id": _k, "title": t}
+            )
             _ensure_hosted_tools_for_turn(sid, session, agent, allow_tools)
             tool_policy_snapshot = _turn_tool_policy_snapshot(agent, allow_tools)
             try:
                 result = agent.run_conversation(run_message, **run_kwargs)
             finally:
                 _restore_turn_tool_policy(agent, tool_policy_snapshot)
-
-            # Auto-titling now fires inside the turn prologue (shared by every
-            # surface). Hand the agent this session's live-rename hook so the
-            # sidebar repaints the moment a title lands, rather than waiting
-            # for the next list refresh.
-            _title_key = session.get("session_key") or sid
-            agent._on_session_title = lambda t, _src, _k=_title_key: _emit(
-                "session.title", sid, {"session_id": _k, "title": t}
-            )
-            result = agent.run_conversation(run_message, **run_kwargs)
             if display_kind and isinstance(text, str):
                 db = getattr(agent, "_session_db", None)
                 current_session_id = getattr(agent, "session_id", None) or session.get("session_key")

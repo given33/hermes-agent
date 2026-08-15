@@ -257,7 +257,20 @@ def _expand(value: str, plugin_root: Path, data_root: Path) -> str:
         "PLUGIN_ROOT": str(plugin_root),
         "PLUGIN_DATA": str(data_root),
     }
-    return _PLACEHOLDER_RE.sub(lambda match: replacements[match.group(1)], value)
+    expanded = _PLACEHOLDER_RE.sub(lambda match: replacements[match.group(1)], value)
+    # Placeholder-backed local paths must use host-native separators. Plain
+    # string substitution creates ``C:\\plugin/server.py`` on Windows, which
+    # some MCP runtimes treat as a different or invalid path.
+    for root in (plugin_root, data_root):
+        root_text = str(root)
+        if expanded == root_text:
+            return root_text
+        for separator in ("/", "\\"):
+            prefix = root_text + separator
+            if expanded.startswith(prefix):
+                suffix = expanded[len(prefix):].replace("\\", "/")
+                return str(root.joinpath(*[part for part in suffix.split("/") if part]))
+    return expanded
 
 
 def _resolve_scoped_path(

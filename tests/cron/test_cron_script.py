@@ -175,6 +175,7 @@ class TestRunJobScript:
         assert str(site_packages) in env["PYTHONPATH"]
 
 
+    @pytest.mark.skipif(sys.platform == "win32", reason="POSIX subprocess contract")
     def test_non_windows_script_preserves_default_text_decoding(self, cron_env, monkeypatch):
         # No platform patching: the Linux CI host already takes this branch.
         from cron import scheduler as sched_mod

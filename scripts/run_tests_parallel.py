@@ -53,6 +53,16 @@ from concurrent.futures import ThreadPoolExecutor, Future
 from pathlib import Path
 from typing import Dict, List, Tuple
 
+# MSYS `env -i` does not reliably expose its inline PYTHONUTF8 assignment to
+# native Windows CPython. Reassert it in the runner so every per-file Python
+# subprocess starts in UTF-8 mode and inherits UTF-8 stdio on cp936 systems.
+os.environ["PYTHONUTF8"] = "1"
+os.environ["PYTHONIOENCODING"] = "utf-8"
+
+# A test file can invoke this runner recursively.  Keep nested runs from
+# unlinking or overwriting the parent run's failure evidence.
+_RUNNER_DEPTH = int(os.environ.get("HERMES_PARALLEL_RUNNER_DEPTH", "0") or "0")
+
 
 # Default test discovery roots.
 _DEFAULT_ROOTS = ["tests"]
@@ -371,6 +381,40 @@ _FLAKY_RESULTS: List[Tuple[Path, str]] = []
 _flaky_lock = threading.Lock()
 
 
+def _subprocess_group_kwargs() -> dict[str, object]:
+    """Return platform-native process-group isolation for a pytest worker."""
+    if sys.platform == "win32":
+        return {"creationflags": subprocess.CREATE_NEW_PROCESS_GROUP}
+    return {"start_new_session": True}
+
+
+def _append_failure_manifest(
+    manifest: Path,
+    file: Path,
+    output: str,
+    summary: Dict[str, int],
+    repo_root: Path,
+) -> None:
+    """Persist a bounded failure record before a long run can be interrupted."""
+    record = {
+        "schema_version": 1,
+        "file": _format_file(file, repo_root),
+        "summary": summary,
+        "output_tail": output[-16000:],
+    }
+    with manifest.open("a", encoding="utf-8") as handle:
+        handle.write(json.dumps(record, ensure_ascii=False) + "\n")
+
+
+def _failure_manifest_path(repo_root: Path, runner_depth: int | None = None) -> Path:
+    """Return the stable top-level manifest or an isolated nested-run path."""
+    depth = _RUNNER_DEPTH if runner_depth is None else runner_depth
+    name = "hermes-parallel-failures.jsonl"
+    if depth > 0:
+        name = f"hermes-parallel-failures-{os.getpid()}.jsonl"
+    return repo_root / ".pytest_cache" / name
+
+
 def _run_one_file_once(
     file: Path,
     pytest_args: List[str],
@@ -382,18 +426,19 @@ def _run_one_file_once(
     
     subproc_start = time.monotonic()
     # launch the pytest process
+    child_env = os.environ.copy()
+    child_env["HERMES_PARALLEL_RUNNER_DEPTH"] = str(_RUNNER_DEPTH + 1)
     proc = subprocess.Popen(
         cmd,
         cwd=repo_root,
         stdout=subprocess.PIPE,
         stderr=subprocess.STDOUT,
         text=True, encoding="utf-8", errors="replace",
-        env=os.environ,
-        # POSIX: place the child at the head of its own process group so
-        # _kill_tree can SIGKILL the group atomically.
-        # Windows: this maps to CREATE_NEW_PROCESS_GROUP in CPython 3.12+;
-        # _kill_tree handles the Windows path via taskkill /F /T.
-        start_new_session=True,
+        env=child_env,
+        # POSIX gets a new session; Windows gets an explicit process group.
+        # The latter prevents a test-generated console signal from reaching
+        # the parent runner while retaining taskkill /T tree cleanup.
+        **_subprocess_group_kwargs(),
     )
 
     # Capture the pgid NOW, before the leader can exit and be reaped. Once
@@ -1031,6 +1076,9 @@ def main() -> int:
     # Capture and print on completion (out-of-order is fine — keeps the
     # terminal clean rather than interleaving N parallel pytest outputs).
     failures: List[Tuple[Path, str, Dict[str, int]]] = []
+    failure_manifest = _failure_manifest_path(repo_root)
+    failure_manifest.parent.mkdir(parents=True, exist_ok=True)
+    failure_manifest.unlink(missing_ok=True)
     file_times: List[Tuple[Path, float]] = []  # (file, subprocess_wall) for distribution
     started = time.monotonic()
     files_done = 0
@@ -1058,7 +1106,11 @@ def main() -> int:
                 files_done += 1
                 tests_done += n_tests
                 fail_count += 1
-                failures.append((file, f"runner crashed: {exc!r}", {}))
+                failure_output = f"runner crashed: {exc!r}"
+                failures.append((file, failure_output, {}))
+                _append_failure_manifest(
+                    failure_manifest, file, failure_output, {}, repo_root
+                )
                 _print_progress(
                     tests_done, approx_total_tests, file, 1,
                     time.monotonic() - started_at,
@@ -1084,6 +1136,9 @@ def main() -> int:
             else:
                 fail_count += 1
                 failures.append((fpath, output, summary))
+                _append_failure_manifest(
+                    failure_manifest, fpath, output, summary, repo_root
+                )
             _print_progress(
                 tests_done, approx_total_tests, fpath, rc,
                 time.monotonic() - started_at,
@@ -1108,8 +1163,18 @@ def main() -> int:
         # Block until everything's done. ThreadPoolExecutor.__exit__ waits
         # for all submitted work, but doing it explicitly here makes the
         # control flow obvious.
-        for fut in futures:
-            fut.result() if fut.exception() is None else None
+        try:
+            for fut in futures:
+                fut.result() if fut.exception() is None else None
+        except KeyboardInterrupt:
+            # Windows can deliver a console interrupt after the isolated test
+            # process has exited.  Continue only when every worker is already
+            # complete; a real in-progress user interrupt must still abort.
+            # A future can be complete while its done callback is still being
+            # scheduled.  The callback count is the reliable signal that the
+            # run has reached the reporting phase.
+            if files_done < len(files):
+                raise
 
     elapsed = time.monotonic() - started
     print()
@@ -1197,6 +1262,7 @@ def main() -> int:
 
     if failures:
         print()
+        print(f"Failure manifest: {failure_manifest}")
         print("=== Failure output ===")
         for file, output, _summary in failures:
             print()
@@ -1228,6 +1294,7 @@ def main() -> int:
     if no_tests_ran_at_all:
         return 1
 
+    failure_manifest.unlink(missing_ok=True)
     return 0
 
 

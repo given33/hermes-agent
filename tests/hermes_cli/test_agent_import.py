@@ -11,6 +11,7 @@ the real ~/.hermes.
 """
 
 import json
+import os
 from pathlib import Path
 
 import pytest
@@ -649,7 +650,12 @@ class TestExistingConfigPreserved:
         clobber it.  ``atomic_replace`` keeps the link and writes the target."""
         real = tmp_path / "real-config.yaml"
         real.write_text(EXISTING_CONFIG, encoding="utf-8")
-        config_path.symlink_to(real)
+        try:
+            config_path.symlink_to(real)
+        except OSError as exc:
+            if os.name == "nt" and getattr(exc, "winerror", None) == 1314:
+                pytest.skip("Windows symlink privilege is unavailable")
+            raise
 
         run_import("claude-code", claude_tree, hermes_home, execute=True)
 

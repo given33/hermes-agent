@@ -100,6 +100,12 @@ def _tail(text: str, limit: int = _TAIL_CHARS) -> str:
     return text[-limit:] if len(text) > limit else text
 
 
+def _process_group_kwargs() -> dict[str, Any]:
+    if os.name == "nt":
+        return {"creationflags": subprocess.CREATE_NEW_PROCESS_GROUP}
+    return {"start_new_session": True}
+
+
 def _run_phase_command(
     phase: str,
     command: str,
@@ -108,26 +114,28 @@ def _run_phase_command(
     on_output: Callable[[str], None] | None = None,
 ) -> PhaseResult:
     started = time.monotonic()
+    proc = subprocess.Popen(
+        command,
+        shell=True,  # project-authored commands; see module docstring
+        cwd=str(root),
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        text=True,
+        errors="replace",
+        **_process_group_kwargs(),
+    )
+    pgid = proc.pid if os.name != "nt" else None
     try:
-        proc = subprocess.run(
-            command,
-            shell=True,  # project-authored commands; see module docstring
-            cwd=str(root),
-            stdout=subprocess.PIPE,
-            stderr=subprocess.STDOUT,
-            timeout=timeout,
-            text=True,
-            errors="replace",
-        )
-        output = proc.stdout or ""
+        output, _ = proc.communicate(timeout=timeout)
+        output = output or ""
         exit_code: int | None = proc.returncode
         timed_out = False
-    except subprocess.TimeoutExpired as exc:
-        raw = exc.output
-        if isinstance(raw, bytes):
-            output = raw.decode("utf-8", errors="replace")
-        else:
-            output = raw or ""
+    except subprocess.TimeoutExpired:
+        _terminate_process_group(proc, pgid=pgid)
+        try:
+            output, _ = proc.communicate(timeout=5)
+        except subprocess.TimeoutExpired:
+            output = ""
         exit_code = None
         timed_out = True
     duration = time.monotonic() - started
@@ -159,19 +167,38 @@ def _poll_readiness(url: str, timeout: float, interval: float = 1.0) -> tuple[bo
     return False, None, last_error
 
 
-def _terminate_process_group(proc: subprocess.Popen) -> None:
+def _terminate_process_group(proc: subprocess.Popen, pgid: int | None = None) -> None:
     """Terminate the started app and its whole process group cleanly.
 
-    On POSIX the child is spawned with ``start_new_session=True`` so we can
-    signal the whole group; on Windows (no ``os.killpg``) we fall back to
-    terminating just the direct child.
+    POSIX uses the captured process group. Windows uses ``taskkill /T`` so
+    shell-launched grandchildren cannot retain stdout or survive teardown.
     """
-    if proc.poll() is not None:
+    if os.name == "nt":
+        if proc.poll() is None:
+            try:
+                subprocess.run(
+                    ["taskkill", "/F", "/T", "/PID", str(proc.pid)],
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
+                    timeout=10,
+                    check=False,
+                )
+            except (FileNotFoundError, OSError, subprocess.TimeoutExpired):
+                try:
+                    proc.terminate()
+                except (ProcessLookupError, PermissionError, OSError):
+                    pass
+        try:
+            proc.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+        return
+
+    if proc.poll() is not None and pgid is None:
         return
     killpg = getattr(os, "killpg", None)
     getpgid = getattr(os, "getpgid", None)
-    pgid = None
-    if killpg is not None and getpgid is not None:
+    if pgid is None and killpg is not None and getpgid is not None:
         try:
             pgid = getpgid(proc.pid)
         except (ProcessLookupError, PermissionError):
@@ -215,19 +242,20 @@ def _run_start_phase(
         cwd=str(root),
         stdout=subprocess.PIPE,
         stderr=subprocess.STDOUT,
-        start_new_session=True,  # own process group for clean teardown
         text=True,
         errors="replace",
+        **_process_group_kwargs(),
     )
+    pgid = proc.pid if os.name != "nt" else None
     output = ""
     try:
         ready, status, error = _poll_readiness(url, ready_timeout)
     finally:
-        _terminate_process_group(proc)
+        _terminate_process_group(proc, pgid=pgid)
         try:
-            if proc.stdout is not None:
-                output = proc.stdout.read() or ""
-        except (OSError, ValueError):
+            output, _ = proc.communicate(timeout=5)
+            output = output or ""
+        except (OSError, ValueError, subprocess.TimeoutExpired):
             output = ""
     return ReadinessResult(
         url=url,

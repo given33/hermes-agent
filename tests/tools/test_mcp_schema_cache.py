@@ -4,6 +4,9 @@ The module landed in #56832's extraction without its tests; these cover the
 fingerprint keying, read/write round-trip, and invalidation behavior.
 """
 
+import os
+import pytest
+
 import tools.mcp_schema_cache as msc
 
 
@@ -87,6 +90,8 @@ class TestCacheFileLocation:
         assert path == tmp_path / "cache" / "mcp_schema_cache.json"
         msc.write_cache_entry("srv", "fp", tools=[], utility_tools=[])
         assert path.exists()
+        if os.name == "nt":
+            pytest.skip("Windows ACLs are not represented by POSIX st_mode bits")
         assert (path.stat().st_mode & 0o777) == 0o600
 
 

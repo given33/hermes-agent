@@ -84,6 +84,7 @@ class TestDetection:
         assert required_npm_range(broken) is None
 
 
+@pytest.mark.require_symlinks
 class TestManagedDetection:
     """The upgrade must fire for every spelling of the managed npm, and for
     no other npm — this is the boundary between "Hermes fixes it" and "the

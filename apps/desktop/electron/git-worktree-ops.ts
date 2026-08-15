@@ -381,10 +381,17 @@ async function listBranches(repoPath, gitBin) {
   }
 
   try {
-    const [localOut, remoteOut] = await Promise.all([
+    // Promise.all returns after the first rejection while the sibling git
+    // process may still hold `cwd`. Windows then cannot remove or reuse the
+    // directory. Settle both probes before returning the non-repo fallback.
+    const refs = await Promise.allSettled([
       runGit(gitBin, ['for-each-ref', '--format=%(refname:short)', '--sort=-committerdate', 'refs/heads'], resolved),
       runGit(gitBin, ['for-each-ref', '--format=%(refname:short)', '--sort=-committerdate', 'refs/remotes'], resolved)
     ])
+    if (refs.some(result => result.status === 'rejected')) {
+      return []
+    }
+    const [localOut, remoteOut] = refs.map(result => (result as PromiseFulfilledResult<string>).value)
 
     const trees = await listWorktrees(resolved, gitBin)
     const pathByBranch = new Map(trees.filter(tree => tree.branch).map(tree => [tree.branch, tree.path]))

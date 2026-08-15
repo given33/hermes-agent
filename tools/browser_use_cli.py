@@ -33,7 +33,10 @@ _STDERR_CAP_CHARS = 4000
 _TASK_ID_SAFE_RE = re.compile(r"[^A-Za-z0-9._-]+")
 
 # Screenshot paths printed by capture_screenshot() in the exec output
-_IMAGE_PATH_RE = re.compile(r"(/[^\s\"']+?\.(?:png|jpe?g|webp))", re.IGNORECASE)
+_IMAGE_PATH_RE = re.compile(
+    r"(?:(?:[A-Za-z]:[\\/])|/)[^\s\"']+?\.(?:png|jpe?g|webp)",
+    re.IGNORECASE,
+)
 
 # http(s) URL literals in exec code checked against browser_navigate's policy
 _URL_RE = re.compile(r"https?://[^\s'\"\\)]+", re.IGNORECASE)
@@ -209,12 +212,53 @@ def _find_cli() -> Optional[List[str]]:
             direct = shutil.which("browser-use", path=probe_path)
             if direct:
                 return [direct]
+            if probe_path:
+                # Windows PATHEXT-aware ``which`` ignores a POSIX shebang
+                # script without an extension. It is still a valid managed
+                # CLI when Git Bash is available.
+                for name in (
+                    "browser-use",
+                    "browser-use.exe",
+                    "browser-use.cmd",
+                    "browser-use.bat",
+                ):
+                    candidate = Path(probe_path) / name
+                    if candidate.is_file():
+                        return [str(candidate)]
     for probe_path in (None, bin_dir):
         if probe_path is None or probe_path:
             uvx = shutil.which("uvx", path=probe_path)
             if uvx:
                 return [uvx, "browser-use"]
+            if probe_path:
+                for name in ("uvx", "uvx.exe", "uvx.cmd", "uvx.bat"):
+                    candidate = Path(probe_path) / name
+                    if candidate.is_file():
+                        return [str(candidate), "browser-use"]
     return None
+
+
+def _prepare_cli_command(cmd: List[str]) -> List[str]:
+    """Run a shebang CLI through Git Bash on Windows when necessary."""
+    if os.name != "nt" or not cmd:
+        return cmd
+    first = Path(cmd[0])
+    try:
+        is_script = first.is_file() and (
+            first.suffix.lower() in {".sh", ".py"}
+            or first.read_bytes()[:2] == b"#!"
+        )
+    except OSError:
+        is_script = False
+    if not is_script:
+        return cmd
+    try:
+        from tools.environments.local import _find_bash
+
+        bash = _find_bash()
+    except Exception:
+        bash = ""
+    return [bash, str(first), *cmd[1:]] if bash else cmd
 
 
 def install_cli(timeout_s: int = 600) -> Tuple[bool, str]:
@@ -262,7 +306,7 @@ def install_cli(timeout_s: int = 600) -> Tuple[bool, str]:
 
     try:
         result = subprocess.run(
-            [uv_bin, "tool", "install", "browser-use"],
+            _prepare_cli_command([uv_bin, "tool", "install", "browser-use"]),
             capture_output=True,
             text=True,
             encoding="utf-8",
@@ -350,7 +394,7 @@ def _native_screenshot_result(result: Dict[str, Any], path: str) -> Optional[Dic
                 },
                 {"type": "image_url", "image_url": {"url": data_url}},
             ],
-            "text_summary": text,
+            "text_summary": text + f"\nScreenshot path: {path}",
             "meta": {"screenshot_path": path, "native_vision": True},
         }
     except Exception as e:
@@ -508,7 +552,7 @@ def browser_exec(
     started = time.time()
     try:
         proc = subprocess.run(
-            cmd,
+            _prepare_cli_command(cmd),
             input=code,
             capture_output=True,
             text=True,

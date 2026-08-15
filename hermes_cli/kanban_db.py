@@ -7896,15 +7896,30 @@ def _classify_worker_exit(pid: int) -> "tuple[str, Optional[int]]":
         return ("unknown", None)
     raw, _ = entry
     try:
-        if os.WIFEXITED(raw):
+        # ``reap_worker_zombies`` is POSIX-only, but tests and integrations
+        # can feed the same wait-status representation on Windows.  Windows
+        # does not expose the POSIX WIF* helpers, so decode the conventional
+        # ``exit_code << 8`` representation directly there.  Without this,
+        # clean protocol exits and the rate-limit sentinel both became
+        # ``unknown`` crashes and consumed the wrong retry budget.
+        if hasattr(os, "WIFEXITED") and os.WIFEXITED(raw):
             code = os.WEXITSTATUS(raw)
             if code == 0:
                 return ("clean_exit", 0)
             if code == KANBAN_RATE_LIMIT_EXIT_CODE:
                 return ("rate_limited", code)
             return ("nonzero_exit", code)
-        if os.WIFSIGNALED(raw):
+        if hasattr(os, "WIFSIGNALED") and os.WIFSIGNALED(raw):
             return ("signaled", os.WTERMSIG(raw))
+        if os.name == "nt":
+            raw_status = int(raw)
+            if raw_status == 0:
+                return ("clean_exit", 0)
+            if raw_status > 0 and raw_status % 256 == 0:
+                code = raw_status >> 8
+                if code == KANBAN_RATE_LIMIT_EXIT_CODE:
+                    return ("rate_limited", code)
+                return ("nonzero_exit", code)
     except Exception:
         pass
     return ("unknown", None)

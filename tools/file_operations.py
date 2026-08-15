@@ -1106,6 +1106,10 @@ class ShellFileOperations(FileOperations):
             result = self._exec("echo $HOME")
             if result.exit_code == 0 and result.stdout.strip():
                 home = result.stdout.strip()
+                if os.name == "nt":
+                    from tools.environments.local import _msys_to_windows_path
+
+                    home = _msys_to_windows_path(home)
                 if path == '~':
                     return home
                 elif path.startswith('~/'):
@@ -1143,6 +1147,15 @@ class ShellFileOperations(FileOperations):
         arg = _bash_safe_path(arg)
         # Use single quotes and escape any single quotes in the string
         return "'" + arg.replace("'", "'\"'\"'") + "'"
+
+    def _escape_native_tool_path(self, path: str) -> str:
+        """Quote a path for a native Windows executable invoked from Bash."""
+        if os.name == "nt":
+            from tools.environments.local import _msys_to_windows_path
+
+            native = _msys_to_windows_path(path).replace("\\\\", "/")
+            return "'" + native.replace("'", "'\"'\"'") + "'"
+        return self._escape_shell_arg(path)
 
     def _atomic_write(self, path: str, content: str) -> "ExecuteResult":
         """Write ``content`` to ``path`` atomically via temp-file + rename.
@@ -2819,6 +2832,10 @@ class ShellFileOperations(FileOperations):
             else:
                 files.append(line)
 
+        if os.name == "nt":
+            from tools.environments.local import _msys_to_windows_path
+            files = [_msys_to_windows_path(item) for item in files]
+
         # For explicit hidden roots, find's path-based filtering excludes every
         # file under the hidden path. Apply descendant filtering after command
         # execution so only the explicit root ancestry is bypassed.
@@ -2862,7 +2879,7 @@ class ShellFileOperations(FileOperations):
         # Try mtime-sorted first (rg 13+); fall back to unsorted if not supported.
         cmd_sorted = (
             f"rg --files --sortr=modified -g {self._escape_shell_arg(glob_pattern)} "
-            f"{self._escape_shell_arg(path)} 2>/dev/null "
+            f"{self._escape_native_tool_path(path)} 2>/dev/null "
             f"| head -n {fetch_limit}"
         )
         result = self._exec(cmd_sorted, timeout=60)
@@ -2873,7 +2890,7 @@ class ShellFileOperations(FileOperations):
             # --sortr may have failed on older rg; retry without it.
             cmd_plain = (
                 f"rg --files -g {self._escape_shell_arg(glob_pattern)} "
-                f"{self._escape_shell_arg(path)} 2>/dev/null "
+                f"{self._escape_native_tool_path(path)} 2>/dev/null "
                 f"| head -n {fetch_limit}"
             )
             result = self._exec(cmd_plain, timeout=60)
@@ -2957,7 +2974,7 @@ class ShellFileOperations(FileOperations):
         
         # Add pattern and path
         cmd_parts.append(self._escape_shell_arg(pattern))
-        cmd_parts.append(self._escape_shell_arg(path))
+        cmd_parts.append(self._escape_native_tool_path(path))
         
         # Fetch extra rows so we can report the true total before slicing.
         # For context mode, rg emits separator lines ("--") between groups,
@@ -3093,7 +3110,7 @@ class ShellFileOperations(FileOperations):
         
         # Add pattern and path
         cmd_parts.append(self._escape_shell_arg(pattern))
-        cmd_parts.append(self._escape_shell_arg(path))
+        cmd_parts.append(self._escape_native_tool_path(path))
         
         # Fetch generously so we can compute total before slicing
         fetch_limit = limit + offset + (200 if context > 0 else 0)
