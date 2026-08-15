@@ -536,15 +536,12 @@ def _hosted_chat_lease_ms() -> int:
 
 
 _HOSTED_CHAT_TIMEOUT_SECONDS = _hosted_chat_timeout_seconds()
-# The final reporter is the last user-visible step. Even when the general
-# hosted-chat timeout is disabled, cap this local server-side role so a stuck
-# gateway cannot leave iOS clients waiting forever for turn.completed.
-_HOSTED_REPORTER_TIMEOUT_SECONDS = 300
 # Remote connector roles (supervisor checks, manager handoff, worker/reviewer)
-# must not wait forever for a claimed-but-stalled remote run. This is an
-# absolute per-role cap; a stuck connector therefore produces a terminal
-# failed event instead of leaving iOS clients on an open SSE stream.
-_HOSTED_REMOTE_ROLE_TIMEOUT_SECONDS = 1800
+# must not wait forever for a claimed-but-stalled remote run. This is a
+# liveness threshold: if the remote run's persisted state stops advancing for
+# this many seconds, the server seals it as failed so iOS receives a terminal
+# event. It is not a total runtime cap.
+_HOSTED_REMOTE_ROLE_STALL_SECONDS = 300
 _HOSTED_STDERR_TAIL_CHARS = 64 * 1024
 _HOSTED_REWORK_LIMIT = 2
 # Hosted SSE readers consume the live in-memory snapshot immediately.  The
@@ -7517,6 +7514,12 @@ def run_profile_turn(
                     "HERMES_API_RETRY_ATTEMPT_OFFSET": str(
                         env.get("HERMES_API_RETRY_ATTEMPT_OFFSET") or "0"
                     ),
+                    # Hosted server-side roles (reporter, server fallback) are
+                    # not user-facing long-thinking turns. If the provider
+                    # stops producing output, fail fast instead of waiting up
+                    # to the reasoning-model stale floor (600s) and looping.
+                    "HERMES_STREAM_STALE_TIMEOUT": "120",
+                    "HERMES_STREAM_STALE_GIVEUP": "2",
                     "HERMES_API_RETRY_DEADLINE_EPOCH_MS": str(
                         env.get("HERMES_API_RETRY_DEADLINE_EPOCH_MS") or "0"
                     ),
@@ -9854,56 +9857,13 @@ def _run_hosted_remote_role(
     fallback_deadline = time.monotonic() + float(
         min(configured_fallback or _REMOTE_SERVER_FALLBACK_SECONDS, 60)
     )
-    # Absolute per-role cap so a claimed-but-stalled remote run cannot leave
-    # the hosted turn in `streaming` forever. This is deliberately generous
-    # (default 30 minutes) but finite; operators can tune it with
-    # HERMES_REMOTE_RUN_WAIT_SECONDS.
-    role_wait_deadline = time.monotonic() + float(
-        configured_wait or _HOSTED_REMOTE_ROLE_TIMEOUT_SECONDS
-    )
+    # Progress-based stall detection. A claimed remote run that stops updating
+    # (no status/checkpoint/activity change) is treated as stuck. This is not
+    # an arbitrary total-time cap; it reacts to actual liveness.
+    last_seen_remote_updated_at = -1
+    last_remote_progress_at = time.monotonic()
 
     while True:
-        if time.monotonic() >= role_wait_deadline:
-            now_ms = int(time.time() * 1000)
-            with _STATE_LOCK:
-                timeout_state = load_single_state()
-                timeout_location = _remote_run_location(
-                    timeout_state,
-                    active_remote_id,
-                )
-                if timeout_location is not None:
-                    _timeout_conversation, _timeout_hosted, _role_key, current = timeout_location
-                    current.update(
-                        {
-                            "status": "timed_out",
-                            "terminal": True,
-                            "cancel_requested": True,
-                            "cancel_kind": "timeout",
-                            "cancel_reason": "Hosted remote role exceeded bounded wait",
-                            "error": "Hosted remote role timed out",
-                            "summary": "Hosted remote role timed out",
-                            "completed_at": now_ms,
-                            "updated_at": now_ms,
-                        }
-                    )
-                    _timeout_hosted.update(
-                        {
-                            "stage": "failed",
-                            "remote_cancel_pending": True,
-                            "cancel_requested": True,
-                            "cancel_kind": "timeout",
-                            "updated_at": now_ms,
-                        }
-                    )
-                    save_single_state(timeout_state)
-            _notify_hosted_update(conversation_id)
-            release_remote_role_claim()
-            return "", "failed", {
-                "content": "",
-                "status": "failed",
-                "error": "Hosted remote role timed out",
-                "activities": [],
-            }
         if not _renew_hosted_active_role(
             conversation_id,
             turn_id,
@@ -9936,6 +9896,55 @@ def _run_hosted_remote_role(
             remote = dict(current)
             turn_cancel_requested = _coerce_flag(_hosted.get("cancel_requested"))
         status = str(remote.get("status") or "queued")
+        current_updated_at = int(remote.get("updated_at") or 0)
+        if current_updated_at != last_seen_remote_updated_at:
+            last_seen_remote_updated_at = current_updated_at
+            last_remote_progress_at = time.monotonic()
+        elif (
+            status not in _REMOTE_TERMINAL_STATUSES
+            and time.monotonic() - last_remote_progress_at
+            >= _HOSTED_REMOTE_ROLE_STALL_SECONDS
+        ):
+            now_ms = int(time.time() * 1000)
+            with _STATE_LOCK:
+                stall_state = load_single_state()
+                stall_location = _remote_run_location(
+                    stall_state,
+                    active_remote_id,
+                )
+                if stall_location is not None:
+                    _stall_conversation, _stall_hosted, _role_key, current = stall_location
+                    current.update(
+                        {
+                            "status": "timed_out",
+                            "terminal": True,
+                            "cancel_requested": True,
+                            "cancel_kind": "stall",
+                            "cancel_reason": "Remote run stopped advancing; liveness timeout",
+                            "error": "Remote run stalled (no persisted state update)",
+                            "summary": "Remote run stalled (no persisted state update)",
+                            "completed_at": now_ms,
+                            "updated_at": now_ms,
+                        }
+                    )
+                    _stall_hosted.update(
+                        {
+                            "stage": "failed",
+                            "remote_cancel_pending": True,
+                            "cancel_requested": True,
+                            "cancel_kind": "stall",
+                            "updated_at": now_ms,
+                        }
+                    )
+                    save_single_state(stall_state)
+            _notify_hosted_update(conversation_id)
+            release_remote_role_claim()
+            return "", "failed", {
+                "content": "",
+                "status": "failed",
+                "error": "Remote run stalled (no persisted state update)",
+                "activities": [],
+            }
         pending_intervention = _pending_hosted_role_intervention(
             conversation_id,
             turn_id,
@@ -15294,10 +15303,10 @@ def execute_hosted_workflow(
                     role_stage="reporter",
                 ),
                 "清楚区分已完成、失败、未完成和需要用户决定的事项。",
-                "Hermes Manager 结构化交接：",
-                json.dumps(manager_handoff, ensure_ascii=False, default=str),
-                "监督者在最终汇报前的检查：",
-                final_supervision,
+                "Hermes Manager 结构化交接（截断到 8000 字符，完整证据在 role_events 中可审计）：",
+                json.dumps(manager_handoff, ensure_ascii=False, default=str)[:8000],
+                "监督者在最终汇报前的检查（截断到 4000 字符）：",
+                str(final_supervision)[:4000],
                 artifact_instruction,
             )
             if item
@@ -15315,12 +15324,6 @@ def execute_hosted_workflow(
                 ],
             },
         )
-        reporter_runner = runner
-        if _runner_supports_keyword(runner, "timeout"):
-            def _bounded_reporter_runner(profile, prompt, **kwargs):
-                kwargs["timeout"] = _HOSTED_REPORTER_TIMEOUT_SECONDS
-                return runner(profile, prompt, **kwargs)
-            reporter_runner = _bounded_reporter_runner
         reporter_result, reporter_status, _reporter_state = _run_hosted_role(
             conversation_id,
             turn_id,
@@ -15328,7 +15331,7 @@ def execute_hosted_workflow(
             role_stage="reporter",
             role_label="Hermes · 最终汇报",
             prompt=reporter_prompt,
-            runner=reporter_runner,
+            runner=runner,
             kanban_task_id=("" if remote_workers else reporter_task_scope),
             start_text="执行与审阅信息已齐，正在整理唯一的最终汇报。",
             final_report=True,
