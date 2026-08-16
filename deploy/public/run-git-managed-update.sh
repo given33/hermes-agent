@@ -65,8 +65,11 @@ printf '%s' "${remote_commit}" >"${agent_root}/.hermes-product-commit"
 # files and the service user can no longer import hermes_cli.
 chown -R "${service_user:-hermes-agent}:${service_user:-hermes-agent}"   "${agent_root}/.venv" 2>/dev/null || true
 service_user="$(stat -c '%U' "${agent_root}/.venv/bin/python" 2>/dev/null || echo hermes-agent)"
-runuser -u "${service_user}" -- \
-  "${agent_root}/.venv/bin/python" -m pip install -q -e "${agent_root}" \
+# The editable install must not hang on PyPI/network during a managed update.
+# The repo ships with a complete venv; --no-deps --no-build-isolation makes the
+# refresh local-only and fast, and PIP_DEFAULT_TIMEOUT bounds any residual I/O.
+PIP_DEFAULT_TIMEOUT=30 PIP_NO_INDEX=1 runuser -u "${service_user}" -- \
+  "${agent_root}/.venv/bin/python" -m pip install -q --no-deps --no-build-isolation -e "${agent_root}" \
   || die "editable install failed"
 systemctl restart "${service_name}"
 systemctl is-active --quiet "${service_name}" \
