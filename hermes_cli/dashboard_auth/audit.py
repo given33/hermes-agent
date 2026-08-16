@@ -54,6 +54,16 @@ class AuditEvent(enum.Enum):
     NATIVE_CODE_ISSUED = "native_code_issued"
     NATIVE_TOKEN_SUCCESS = "native_token_success"
     NATIVE_TOKEN_FAILURE = "native_token_failure"
+    # Hosted connector operations (append-only operator audit).
+    CONNECTOR_PULL = "connector_pull"
+    CONNECTOR_ACK = "connector_ack"
+    CONNECTOR_STATUS = "connector_status"
+    CONNECTOR_FAIL = "connector_fail"
+    CONNECTOR_CANCEL = "connector_cancel"
+    CONNECTOR_CANCEL_ACK = "connector_cancel_ack"
+    CONNECTOR_ARTIFACT = "connector_artifact"
+    CONNECTOR_DOWNLOAD = "connector_download"
+    CONNECTOR_METRICS = "connector_metrics"
 
 
 def _resolve_log_path() -> Path:

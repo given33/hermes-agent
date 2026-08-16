@@ -10,7 +10,7 @@ from __future__ import annotations
 
 import asyncio
 from copy import deepcopy
-from collections import Counter
+from collections import Counter, defaultdict, deque
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from contextlib import asynccontextmanager, contextmanager, redirect_stderr, redirect_stdout
 import hashlib
@@ -45,7 +45,7 @@ from hermes_services.startup import bootstrap_trusted_runtime
 # state before importing runtime fallbacks or executing plugin-owned code.
 bootstrap_trusted_runtime()
 
-from fastapi import APIRouter, Header, HTTPException, Request
+from fastapi import APIRouter, Depends, Header, HTTPException, Request
 from fastapi.responses import FileResponse, Response, StreamingResponse
 from pydantic import BaseModel, Field
 
@@ -292,6 +292,79 @@ def _account_generation_for_request(request: Request, owner_id: str) -> str:
     if authenticated_generation not in {"legacy", live_generation}:
         raise HTTPException(status_code=410, detail="Account generation is no longer active")
     return live_generation
+
+
+def _require_owner(request: Request) -> str:
+    """Return the authenticated owner id or raise 401.
+
+    The dashboard's global middleware normally handles this, but plugin
+    endpoints that trigger LLM work or expose profile metadata must not rely
+    on a single middleware layer.  This helper is fail-closed: it only accepts
+    a verified dashboard session/principal, or the legacy loopback session
+    token when the server is bound to a loopback address and auth is disabled.
+    """
+    state = getattr(request, "state", None)
+    if getattr(state, "session", None) is not None:
+        return owner_id_from_request(request)
+    principal = getattr(state, "token_principal", None)
+    if principal is not None:
+        return owner_id_from_request(request)
+    if getattr(getattr(request, "app", None), "state", None) is not None:
+        auth_required = bool(
+            getattr(request.app.state, "auth_required", False)
+        )
+    else:
+        auth_required = False
+    if auth_required:
+        raise HTTPException(status_code=401, detail="Unauthorized")
+    # Loopback / legacy mode: the legacy auth middleware has already checked
+    # the ephemeral _SESSION_TOKEN before reaching an /api route.  Belt-and-
+    # braces: verify it here as well when the web_server module is available.
+    try:
+        from hermes_cli.web_server import _has_valid_session_token
+
+        if _has_valid_session_token(request):
+            return owner_id_from_request(request)
+    except Exception:
+        # In standalone plugin tests there is no web_server module; only the
+        # explicit session/principal paths above are trusted.
+        pass
+    raise HTTPException(status_code=401, detail="Unauthorized")
+
+
+def _rate_limit_key(request: Request, fallback: str) -> str:
+    """Best-effort per-owner/per-connector key, falling back to client IP."""
+    state = getattr(request, "state", None)
+    if getattr(state, "session", None) is not None:
+        return f"owner:{owner_id_from_request(request)}"
+    principal = getattr(state, "token_principal", None)
+    if principal is not None:
+        return f"principal:{str(getattr(principal, 'principal', '') or '')}"
+    client = request.client
+    if client is not None and getattr(client, "host", ""):
+        return f"ip:{client.host}"
+    return fallback
+
+
+async def _enforce_route_body_size(request: Request) -> None:
+    """Reject oversized /route JSON before FastAPI buffers it into memory."""
+    content_length = request.headers.get("content-length")
+    if content_length:
+        try:
+            length = int(content_length)
+        except (TypeError, ValueError):
+            raise HTTPException(status_code=411, detail="Length Required") from None
+        if length > _ROUTE_BODY_MAX_BYTES:
+            raise HTTPException(
+                status_code=413,
+                detail=f"Request body exceeds {_ROUTE_BODY_MAX_BYTES} bytes",
+            )
+    body = await request.body()
+    if len(body) > _ROUTE_BODY_MAX_BYTES:
+        raise HTTPException(
+            status_code=413,
+            detail=f"Request body exceeds {_ROUTE_BODY_MAX_BYTES} bytes",
+        )
 
 
 def _account_generation_for_conversation(conversation: dict[str, Any]) -> str:
@@ -811,6 +884,61 @@ _ATTACHMENT_BUCKETS = {"uploads", "outputs"}
 _ACCOUNT_FILE_MIGRATION_LOCK = threading.Lock()
 _ACCOUNT_FILE_MIGRATION_VERSION = "conversation-files-v1"
 
+# Application-layer abuse protection.  nginx remains a first line of defence;
+# these bounds protect the Python process when a deployment is reached
+# directly, behind a misconfigured proxy, or on a loopback bind.
+_ROUTE_BODY_MAX_BYTES = 256 * 1024
+_ROUTE_RATE_LIMIT = 30
+_ROUTE_RATE_WINDOW_SECONDS = 60
+_CONNECTOR_RATE_LIMIT = 120
+_CONNECTOR_RATE_WINDOW_SECONDS = 60
+_SSE_MAX_CONNECTIONS_PER_CONNECTOR = 4
+_SSE_MAX_IDLE_SECONDS = 6 * 60 * 60
+
+
+class _SlidingWindowRateLimiter:
+    """Small in-process sliding-window limiter.
+
+    This is a defence-in-depth layer for a single Python process.  Multi-worker
+    deployments should also enforce the same limits in nginx/API gateway; the
+    in-process bucket prevents a direct-to-server client from exhausting model
+    budget or connector worker threads even when the proxy is absent.
+    """
+
+    def __init__(self, max_events: int, window_seconds: float) -> None:
+        self.max_events = max(1, int(max_events))
+        self.window_seconds = max(0.1, float(window_seconds))
+        self._hits: dict[str, deque[float]] = defaultdict(deque)
+        self._lock = threading.Lock()
+
+    def allow(self, key: str, *, cost: int = 1) -> bool:
+        if cost < 1:
+            cost = 1
+        now = time.monotonic()
+        with self._lock:
+            bucket = self._hits[str(key or "")]
+            while bucket and bucket[0] <= now - self.window_seconds:
+                bucket.popleft()
+            if len(bucket) + cost > self.max_events:
+                return False
+            for _ in range(cost):
+                bucket.append(now)
+            return True
+
+    def reset(self, key: str) -> None:
+        with self._lock:
+            self._hits.pop(str(key or ""), None)
+
+
+_ROUTE_RATE_LIMITER = _SlidingWindowRateLimiter(
+    _ROUTE_RATE_LIMIT,
+    _ROUTE_RATE_WINDOW_SECONDS,
+)
+_CONNECTOR_RATE_LIMITER = _SlidingWindowRateLimiter(
+    _CONNECTOR_RATE_LIMIT,
+    _CONNECTOR_RATE_WINDOW_SECONDS,
+)
+
 
 def append_hosted_event(
     conversation: dict[str, Any],
@@ -1309,18 +1437,52 @@ def _configured_connector_token() -> str:
     return ""
 
 
-def _configured_connector_tokens() -> dict[str, str]:
-    """Return connector credentials keyed by their immutable device id.
+def _connector_token_values(value: Any) -> tuple[list[str], dict[str, Any]]:
+    """Normalise one connector credential entry into accepted tokens + metadata.
 
-    The original single-token deployment remains supported, but that token is
-    deliberately bound only to DBB3. Additional devices use the JSON secret
-    map so presenting a valid token never lets a caller choose its identity.
+    Supported shapes for ``HERMES_COLLABORATION_CONNECTOR_TOKENS`` /
+    ``..._TOKENS_FILE`` values:
+
+    * ``"current-token"`` — legacy simple string.
+    * ``["current-token", "previous-token"]`` — dual-secret rotation window.
+    * ``{"token": "...", "previous_token": "...", "expires_at": "..."}`` —
+      explicit rotation record.
     """
+    if isinstance(value, str):
+        token = str(value).strip()
+        return ([token] if token else [], {})
+    if isinstance(value, list):
+        tokens = [
+            str(item).strip()
+            for item in value
+            if isinstance(item, str) and str(item).strip()
+        ]
+        return tokens, {}
+    if isinstance(value, dict):
+        current = str(
+            value.get("token")
+            or value.get("current")
+            or value.get("current_token")
+            or ""
+        ).strip()
+        previous = str(
+            value.get("previous")
+            or value.get("previous_token")
+            or value.get("old_token")
+            or ""
+        ).strip()
+        tokens = [token for token in (current, previous) if token]
+        metadata = {str(key): item for key, item in value.items() if key not in {"token", "current", "current_token", "previous", "previous_token", "old_token"}}
+        return tokens, metadata
+    return [], {}
 
-    configured: dict[str, str] = {}
+
+def _configured_connector_token_records() -> dict[str, dict[str, Any]]:
+    """Return connector credentials plus rotation metadata by device id."""
+    records: dict[str, dict[str, Any]] = {}
     legacy = _configured_connector_token()
     if legacy:
-        configured["dbb3-primary"] = legacy
+        records["dbb3-primary"] = {"tokens": [legacy], "metadata": {}}
     raw = os.environ.get("HERMES_COLLABORATION_CONNECTOR_TOKENS", "").strip()
     map_file = os.environ.get(
         "HERMES_COLLABORATION_CONNECTOR_TOKENS_FILE",
@@ -1337,12 +1499,26 @@ def _configured_connector_tokens() -> dict[str, str]:
         except (TypeError, ValueError):
             parsed = {}
         if isinstance(parsed, dict):
-            for connector_id, token in parsed.items():
+            for connector_id, value in parsed.items():
                 normalized_id = str(connector_id or "").strip()[:128]
-                normalized_token = str(token or "").strip()
-                if normalized_id and normalized_token:
-                    configured[normalized_id] = normalized_token
-    return configured
+                tokens, metadata = _connector_token_values(value)
+                if normalized_id and tokens:
+                    records[normalized_id] = {"tokens": tokens, "metadata": metadata}
+    return records
+
+
+def _configured_connector_tokens() -> dict[str, str]:
+    """Return the current connector credential keyed by immutable device id.
+
+    The original single-token deployment remains supported, but that token is
+    deliberately bound only to DBB3. Additional devices use the JSON secret
+    map so presenting a valid token never lets a caller choose its identity.
+    """
+
+    return {
+        connector_id: record["tokens"][0]
+        for connector_id, record in _configured_connector_token_records().items()
+    }
 
 
 def _connector_bearer(request: Request) -> str:
@@ -1356,8 +1532,20 @@ def _connector_identity(request: Request) -> str:
     claimed = str(request.headers.get("x-connector-id") or "").strip()[:128]
     if not supplied or not claimed:
         return ""
-    expected = _configured_connector_tokens().get(claimed, "")
-    return claimed if expected and hmac.compare_digest(supplied, expected) else ""
+    record = _configured_connector_token_records().get(claimed)
+    if record is None:
+        # Backwards compatibility with tests/older deployments that only
+        # override the flat current-token map.
+        current = _configured_connector_tokens().get(claimed, "")
+        expected_tokens = [current] if current else []
+    else:
+        expected_tokens = record.get("tokens") or []
+    if any(
+        token and hmac.compare_digest(supplied, token)
+        for token in expected_tokens
+    ):
+        return claimed
+    return ""
 
 
 def _connector_authorized(request: Request) -> bool:
@@ -1371,6 +1559,16 @@ def _require_connector(request: Request) -> str:
     if not connector_id:
         raise HTTPException(status_code=401, detail="Unauthorized")
     return connector_id
+
+
+def _rate_limit_connector(request: Request, connector_id: str, action: str) -> None:
+    """Per-connector application-layer rate limit for hosted endpoints."""
+    _record_connector_metric(connector_id, action)
+    if not _CONNECTOR_RATE_LIMITER.allow(
+        f"connector:{connector_id}:{action}",
+        cost=2 if action in {"pull", "cancellations/pull", "artifacts"} else 1,
+    ):
+        raise HTTPException(status_code=429, detail="Too Many Requests")
 
 
 def _register_connector_token_auth() -> None:
@@ -1400,11 +1598,30 @@ def _register_connector_token_auth() -> None:
         supports_token = True
 
         def verify_token(self, *, token: str) -> Optional[TokenPrincipal]:
-            matches = [
-                connector_id
-                for connector_id, expected in _configured_connector_tokens().items()
-                if token and hmac.compare_digest(token, expected)
-            ]
+            matches: list[str] = []
+            seen: set[str] = set()
+            for connector_id, record in _configured_connector_token_records().items():
+                expected_tokens = record.get("tokens") or []
+                for expected in expected_tokens:
+                    if (
+                        expected
+                        and token
+                        and hmac.compare_digest(token, expected)
+                        and connector_id not in seen
+                    ):
+                        matches.append(connector_id)
+                        seen.add(connector_id)
+            # Backwards compatibility: a flat current-token map may be the only
+            # configured source (or the only source tests override).
+            for connector_id, expected in _configured_connector_tokens().items():
+                if (
+                    expected
+                    and token
+                    and hmac.compare_digest(token, expected)
+                    and connector_id not in seen
+                ):
+                    matches.append(connector_id)
+                    seen.add(connector_id)
             if len(matches) != 1:
                 return None
             return TokenPrincipal(
@@ -16730,6 +16947,8 @@ def _remote_run_connector_payload(remote_run: dict[str, Any]) -> dict[str, Any]:
 def connector_get_run(remote_run_id: str, request: Request):
     """Return authoritative claim/terminal state for conflict reconciliation."""
 
+    connector_id = _require_connector(request)
+    _rate_limit_connector(request, connector_id, "run")
     _conversation, _hosted, remote_run = _remote_run_for_connector(
         request,
         remote_run_id,
@@ -17024,14 +17243,56 @@ def _connector_relative_path(value: str) -> str:
 # immediately instead of waiting for its next poll cycle. This collapses role
 # switch latency from one or two poll intervals down to ~1s on the wire.
 _CONNECTOR_STREAM_QUEUES: dict[str, set["queue.Queue"]] = {}
+_CONNECTOR_STREAM_COUNTS: dict[str, int] = {}
+_CONNECTOR_STREAM_HISTORY: dict[str, deque[dict[str, Any]]] = {}
+_CONNECTOR_STREAM_SEQUENCE = 0
+_CONNECTOR_STREAM_HISTORY_MAX = 200
 _CONNECTOR_STREAM_LOCK = threading.Lock()
+_CONNECTOR_METRICS_LOCK = threading.Lock()
+_CONNECTOR_METRICS: dict[str, dict[str, int]] = {}
+
+
+def _record_connector_metric(connector_id: str, action: str) -> None:
+    normalized = str(connector_id or "").strip()[:128]
+    action = str(action or "").strip()[:64] or "unknown"
+    if not normalized:
+        return
+    with _CONNECTOR_METRICS_LOCK:
+        bucket = _CONNECTOR_METRICS.setdefault(normalized, {})
+        bucket[action] = int(bucket.get(action) or 0) + 1
+
+
+def _audit_connector(connector_id: str, event_name: str, **fields: Any) -> None:
+    """Append an append-only connector operation audit line (best effort)."""
+    try:
+        from hermes_cli.dashboard_auth.audit import AuditEvent, audit_log
+
+        audit_log(
+            AuditEvent[event_name],
+            connector_id=str(connector_id or "")[:128],
+            **fields,
+        )
+    except Exception:
+        # Audit is observability, never a request blocker.
+        pass
 
 
 def _push_connector_event(connector_id: str, event: dict[str, Any]) -> None:
+    global _CONNECTOR_STREAM_SEQUENCE
     normalized = str(connector_id or "").strip()[:128]
     if not normalized:
         return
     with _CONNECTOR_STREAM_LOCK:
+        _CONNECTOR_STREAM_SEQUENCE += 1
+        event_id = str(_CONNECTOR_STREAM_SEQUENCE)
+        stamped = dict(event)
+        stamped["id"] = event_id
+        stamped["event_id"] = event_id
+        history = _CONNECTOR_STREAM_HISTORY.setdefault(
+            normalized,
+            deque(maxlen=_CONNECTOR_STREAM_HISTORY_MAX),
+        )
+        history.append(dict(stamped))
         stream_queues = tuple(_CONNECTOR_STREAM_QUEUES.get(normalized, ()))
     # A reconnect can overlap the old SSE request briefly.  Fan out to every
     # live subscription instead of replacing the previous queue and silently
@@ -17039,11 +17300,11 @@ def _push_connector_event(connector_id: str, event: dict[str, Any]) -> None:
     # retaining an unbounded lifecycle backlog in the server process.
     for stream_queue in stream_queues:
         try:
-            stream_queue.put_nowait(dict(event))
+            stream_queue.put_nowait(dict(stamped))
         except queue.Full:
             try:
                 stream_queue.get_nowait()
-                stream_queue.put_nowait(dict(event))
+                stream_queue.put_nowait(dict(stamped))
             except Exception:
                 pass
         except Exception:
@@ -17057,24 +17318,63 @@ def connector_stream(request: Request):
     The connector subscribes with its connector token; the server pushes
     ``run.created`` / ``run.terminal`` events so the connector can poll
     immediately. Heartbeats every 25s keep intermediaries from closing the
-    stream.
+    stream.  Each event carries an ``id`` so a reconnecting connector can send
+    ``Last-Event-ID`` and receive events that arrived while it was offline.
     """
     connector_id = _require_connector(request)
+    _rate_limit_connector(request, connector_id, "stream")
+    last_event_id = str(request.headers.get("last-event-id") or "").strip()
     stream_queue: "queue.Queue" = queue.Queue(maxsize=32)
     with _CONNECTOR_STREAM_LOCK:
+        active = _CONNECTOR_STREAM_COUNTS.get(connector_id, 0)
+        if active >= _SSE_MAX_CONNECTIONS_PER_CONNECTOR:
+            raise HTTPException(
+                status_code=429,
+                detail="Too many active connector streams",
+            )
+        _CONNECTOR_STREAM_COUNTS[connector_id] = active + 1
         _CONNECTOR_STREAM_QUEUES.setdefault(connector_id, set()).add(stream_queue)
 
     def event_stream():
         try:
             yield "event: connected\ndata: {\"type\":\"connected\"}\n\n"
+            # Replay events that arrived while the previous stream was down.
+            if last_event_id:
+                try:
+                    resume_after = int(last_event_id)
+                except (TypeError, ValueError):
+                    resume_after = 0
+                with _CONNECTOR_STREAM_LOCK:
+                    replay = list(_CONNECTOR_STREAM_HISTORY.get(connector_id, ()))
+                for event in replay:
+                    try:
+                        if int(event.get("id") or 0) > resume_after:
+                            yield (
+                                f"id: {event['id']}\n"
+                                "data: "
+                                + json.dumps(
+                                    event,
+                                    ensure_ascii=False,
+                                    separators=(",", ":"),
+                                )
+                                + "\n\n"
+                            )
+                    except (TypeError, ValueError):
+                        continue
+            started = time.monotonic()
             while True:
                 try:
                     event = stream_queue.get(timeout=25)
                 except Exception:
+                    if time.monotonic() - started > _SSE_MAX_IDLE_SECONDS:
+                        yield ": idle-timeout\n\n"
+                        return
                     yield ": keepalive\n\n"
                     continue
+                event_id = str(event.get("id") or "")
                 yield (
-                    "data: "
+                    (f"id: {event_id}\n" if event_id else "")
+                    + "data: "
                     + json.dumps(
                         event,
                         ensure_ascii=False,
@@ -17089,6 +17389,11 @@ def connector_stream(request: Request):
                     stream_queues.discard(stream_queue)
                     if not stream_queues:
                         _CONNECTOR_STREAM_QUEUES.pop(connector_id, None)
+                remaining = max(0, _CONNECTOR_STREAM_COUNTS.get(connector_id, 1) - 1)
+                if remaining:
+                    _CONNECTOR_STREAM_COUNTS[connector_id] = remaining
+                else:
+                    _CONNECTOR_STREAM_COUNTS.pop(connector_id, None)
 
     return StreamingResponse(
         event_stream(),
@@ -17104,6 +17409,7 @@ def connector_stream(request: Request):
 @router.get("/connector/health")
 def connector_health(request: Request):
     connector_id = _require_connector(request)
+    _rate_limit_connector(request, connector_id, "health")
     return {
         "ok": True,
         "connector_id": connector_id,
@@ -17117,7 +17423,22 @@ def connector_health(request: Request):
             "cancel",
             "artifact-upload",
             "attachment-download",
+            "metrics",
         ],
+    }
+
+
+@router.get("/connector/metrics")
+def connector_metrics(request: Request) -> dict[str, Any]:
+    """Return process-local connector operation counters for observability."""
+    connector_id = _require_connector(request)
+    _rate_limit_connector(request, connector_id, "metrics")
+    with _CONNECTOR_METRICS_LOCK:
+        counts = deepcopy(_CONNECTOR_METRICS.get(connector_id, {}))
+    return {
+        "connector_id": connector_id,
+        "metrics": counts,
+        "server_time": int(time.time() * 1000),
     }
 
 
@@ -17304,6 +17625,8 @@ def _connector_run_attachments(
 
 @router.get("/connector/runs/{remote_run_id}/attachments")
 def connector_list_run_attachments(remote_run_id: str, request: Request):
+    connector_id = _require_connector(request)
+    _rate_limit_connector(request, connector_id, "attachments")
     conversation, hosted, _remote_run = _remote_run_for_connector(
         request,
         remote_run_id,
@@ -17323,6 +17646,8 @@ def connector_download_run_attachment(
     file_id: str,
     request: Request,
 ):
+    connector_id = _require_connector(request)
+    _rate_limit_connector(request, connector_id, "attachment-download")
     conversation, hosted, _remote_run = _remote_run_for_connector(
         request,
         remote_run_id,
@@ -17350,6 +17675,13 @@ def connector_download_run_attachment(
         )
     except (KeyError, FileNotFoundError, ValueError) as exc:
         raise HTTPException(status_code=404, detail="Attachment not found") from exc
+    _audit_connector(
+        connector_id,
+        "CONNECTOR_DOWNLOAD",
+        remote_run_id=remote_run_id,
+        file_id=file_id,
+        sha256=str(record.get("sha256") or "")[:64],
+    )
     return FileResponse(
         path=str(path),
         filename=str(record["name"]),
@@ -17366,6 +17698,7 @@ def connector_download_run_attachment(
 @router.post("/connector/runs/pull")
 def connector_pull_runs(payload: ConnectorPullBody, request: Request):
     authenticated = _require_connector(request)
+    _rate_limit_connector(request, authenticated, "pull")
     connector_id, limit, lease_seconds = _validate_connector_batch(payload, authenticated)
     now = int(time.time() * 1000)
     lease_until = now + lease_seconds * 1000
@@ -17450,6 +17783,12 @@ def connector_pull_runs(payload: ConnectorPullBody, request: Request):
     if changed:
         for changed_conversation_id in changed_conversation_ids:
             _notify_hosted_update(changed_conversation_id)
+    _audit_connector(
+        authenticated,
+        "CONNECTOR_PULL",
+        count=len(selected),
+        remote_run_ids=[str(item.get("remote_run_id") or "") for item in selected][:20],
+    )
     return {"runs": selected, "server_time": now}
 
 
@@ -17457,6 +17796,7 @@ def connector_pull_runs(payload: ConnectorPullBody, request: Request):
 def connector_ack_run(remote_run_id: str, payload: ConnectorAckBody, request: Request):
     conversation, hosted, _remote_run = _remote_run_for_connector(request, remote_run_id)
     connector_id = _require_connector(request)
+    _rate_limit_connector(request, connector_id, "ack")
     _validate_connector_claim(payload.connector_id, connector_id)
     now = int(time.time() * 1000)
     with _STATE_LOCK:
@@ -17510,32 +17850,54 @@ def connector_ack_run(remote_run_id: str, payload: ConnectorAckBody, request: Re
         persisted,
         role_label=f"{persisted.get('profile') or 'worker'} · 执行",
     )
+    _audit_connector(
+        connector_id,
+        "CONNECTOR_ACK",
+        remote_run_id=remote_run_id,
+        root_task_id=str(payload.root_task_id or "")[:256],
+    )
     return {"run": _remote_run_connector_payload(persisted), "applied": True}
 
 
 @router.post("/connector/runs/{remote_run_id}/status")
 def connector_status_run(remote_run_id: str, payload: ConnectorStatusBody, request: Request):
     connector_id = _require_connector(request)
+    _rate_limit_connector(request, connector_id, "status")
     _remote_run_for_connector(request, remote_run_id)
     _validate_connector_claim(payload.connector_id, connector_id)
     persisted, applied = _apply_remote_checkpoint(remote_run_id, payload.model_dump())
+    _audit_connector(
+        connector_id,
+        "CONNECTOR_STATUS",
+        remote_run_id=remote_run_id,
+        status=str(payload.status or "")[:32],
+        applied=applied,
+    )
     return {"run": _remote_run_connector_payload(persisted), "applied": applied}
 
 
 @router.post("/connector/runs/{remote_run_id}/fail")
 def connector_fail_run(remote_run_id: str, payload: ConnectorStatusBody, request: Request):
     connector_id = _require_connector(request)
+    _rate_limit_connector(request, connector_id, "fail")
     _remote_run_for_connector(request, remote_run_id)
     _validate_connector_claim(payload.connector_id, connector_id)
     body = payload.model_dump()
     body.update({"status": "failed", "terminal": True})
     persisted, applied = _apply_remote_checkpoint(remote_run_id, body)
+    _audit_connector(
+        connector_id,
+        "CONNECTOR_FAIL",
+        remote_run_id=remote_run_id,
+        applied=applied,
+    )
     return {"run": _remote_run_connector_payload(persisted), "applied": applied}
 
 
 @router.post("/connector/cancellations/pull")
 def connector_pull_cancellations(payload: ConnectorPullBody, request: Request):
     authenticated = _require_connector(request)
+    _rate_limit_connector(request, authenticated, "cancellations/pull")
     connector_id, limit, lease_seconds = _validate_connector_batch(payload, authenticated)
     now = int(time.time() * 1000)
     selected: list[dict[str, Any]] = []
@@ -17623,12 +17985,19 @@ def connector_pull_cancellations(payload: ConnectorPullBody, request: Request):
     if changed:
         for changed_conversation_id in changed_conversation_ids:
             _notify_hosted_update(changed_conversation_id)
+    _audit_connector(
+        authenticated,
+        "CONNECTOR_CANCEL",
+        count=len(selected),
+        remote_run_ids=[str(item.get("remote_run_id") or "") for item in selected][:20],
+    )
     return {"cancellations": selected, "server_time": now}
 
 
 @router.post("/connector/runs/{remote_run_id}/cancel-ack")
 def connector_cancel_ack(remote_run_id: str, payload: ConnectorCancelAckBody, request: Request):
     connector_id = _require_connector(request)
+    _rate_limit_connector(request, connector_id, "cancel-ack")
     _conversation, _hosted, remote_run = _remote_run_for_connector(
         request, remote_run_id
     )
@@ -17641,12 +18010,19 @@ def connector_cancel_ack(remote_run_id: str, payload: ConnectorCancelAckBody, re
     )
     body.update({"status": terminal_status, "terminal": True})
     persisted, applied = _apply_remote_checkpoint(remote_run_id, body)
+    _audit_connector(
+        connector_id,
+        "CONNECTOR_CANCEL_ACK",
+        remote_run_id=remote_run_id,
+        applied=applied,
+    )
     return {"run": _remote_run_connector_payload(persisted), "applied": applied}
 
 
 @router.post("/connector/runs/{remote_run_id}/artifacts")
 async def connector_upload_artifact(remote_run_id: str, request: Request):
     connector_id = _require_connector(request)
+    _rate_limit_connector(request, connector_id, "artifacts")
     claim_token = str(request.headers.get("x-claim-token") or "").strip()
     header_id = str(request.headers.get("x-remote-run-id") or "").strip()
     if header_id != remote_run_id:
@@ -17981,16 +18357,32 @@ async def connector_upload_artifact(remote_run_id: str, request: Request):
     finally:
         temp.unlink(missing_ok=True)
     _notify_hosted_update(str(conversation.get("id") or ""))
+    _audit_connector(
+        connector_id,
+        "CONNECTOR_ARTIFACT",
+        remote_run_id=remote_run_id,
+        file_id=str((attachment or {}).get("id") or "")[:256],
+        sha256=expected_sha,
+        relative_path=relative_path,
+    )
     return {"artifact": attachment, "applied": True}
 
 
 @router.get("/profiles")
-def get_profiles():
+def get_profiles(request: Request = None):
+    if request is not None:
+        _require_owner(request)
+        if not _ROUTE_RATE_LIMITER.allow(_rate_limit_key(request, "profiles")):
+            raise HTTPException(status_code=429, detail="Too Many Requests")
     return {"profiles": available_profiles()}
 
 
-@router.post("/route")
-def route_message(payload: RouteMessageBody):
+@router.post("/route", dependencies=[Depends(_enforce_route_body_size)])
+def route_message(payload: RouteMessageBody, request: Request = None):
+    if request is not None:
+        _require_owner(request)
+        if not _ROUTE_RATE_LIMITER.allow(_rate_limit_key(request, "route")):
+            raise HTTPException(status_code=429, detail="Too Many Requests")
     mode = payload.mode.strip().lower()
     if mode in {"chat", "work"}:
         routed = classify_user_intent(payload.content)

@@ -36,6 +36,23 @@ def register_mobile_api_provider_if_configured() -> bool:
     if not os.environ.get(MOBILE_API_KEY_ENV, "").strip():
         return False
 
+    # Prefer the owner-mobile short-lived token flow.  If the operator has
+    # configured the official owner account (password + per-device
+    # access/refresh tokens), the shared static key is no longer needed and
+    # keeping it registered would leave an unrevocable backdoor.
+    try:
+        from hermes_cli.dashboard_auth.owner_mobile import owner_account_configured
+
+        if owner_account_configured():
+            _log.warning(
+                "dashboard-auth: HERMES_MOBILE_API_KEY is ignored because "
+                "owner-mobile short-lived token auth is configured; remove the "
+                "static key from the environment"
+            )
+            return False
+    except Exception:
+        pass
+
     provider = MobileApiKeyProvider()
     assert_protocol_compliance(type(provider))
     registered = False

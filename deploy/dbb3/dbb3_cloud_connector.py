@@ -329,11 +329,26 @@ class CloudRelayClient:
         *,
         connector_id: str = "dbb3-primary",
         timeout: float = 20,
+        token_path: str | Path | None = None,
     ) -> None:
         self.base_url = base_url.rstrip("/")
         self.token = token.strip()
+        self.token_path = Path(token_path) if token_path else None
         self.connector_id = _text(connector_id, 128) or "dbb3-primary"
         self.timeout = timeout
+
+    def _reload_token(self) -> bool:
+        """Reload the token file so a rotated credential is picked up live."""
+        if self.token_path is None or not self.token_path.is_file():
+            return False
+        try:
+            new_token = self.token_path.read_text(encoding="utf-8").strip()
+        except (OSError, UnicodeError):
+            return False
+        if not new_token or new_token == self.token:
+            return False
+        self.token = new_token
+        return True
 
     def _request(
         self,
@@ -344,42 +359,47 @@ class CloudRelayClient:
         body_path: Path | None = None,
         headers: dict[str, str] | None = None,
     ) -> Any:
-        body: bytes | _FileBody | None = None
+        body: bytes | None = None
         if payload is not None:
             body = json.dumps(payload, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
-        elif body_path is not None:
-            body = _FileBody(body_path)
-        request_headers = {
-            "Authorization": f"Bearer {self.token}",
-            "X-Connector-ID": self.connector_id,
-            "User-Agent": "dbb3-cloud-connector/2.0",
-            **(headers or {}),
-        }
-        if payload is not None:
-            request_headers["Content-Type"] = "application/json; charset=utf-8"
-        if body_path is not None:
-            request_headers.setdefault("Content-Length", str(body_path.stat().st_size))
-        request = urllib.request.Request(
-            self.base_url + path,
-            data=body,
-            method=method,
-            headers=request_headers,
-        )
-        try:
-            with urllib.request.urlopen(request, timeout=self.timeout) as response:
-                return _json_body(response.read())
-        except urllib.error.HTTPError as exc:
-            detail = exc.read(4096).decode("utf-8", "replace")
-            if exc.code == 401:
-                raise ConnectorAuthError(exc.code, detail) from exc
-            if exc.code in {409, 422}:
-                raise ConnectorContractError(exc.code, detail) from exc
-            raise CloudHTTPError(exc.code, detail) from exc
-        except (OSError, urllib.error.URLError):
-            raise
-        finally:
-            if isinstance(body, _FileBody):
-                body.close()
+        for attempt in (0, 1):
+            file_body: _FileBody | None = None
+            if body_path is not None:
+                file_body = _FileBody(body_path)
+            request_headers = {
+                "Authorization": f"Bearer {self.token}",
+                "X-Connector-ID": self.connector_id,
+                "User-Agent": "dbb3-cloud-connector/2.0",
+                **(headers or {}),
+            }
+            if payload is not None:
+                request_headers["Content-Type"] = "application/json; charset=utf-8"
+            if body_path is not None:
+                request_headers.setdefault("Content-Length", str(body_path.stat().st_size))
+            request = urllib.request.Request(
+                self.base_url + path,
+                data=body if payload is not None else file_body,
+                method=method,
+                headers=request_headers,
+            )
+            try:
+                with urllib.request.urlopen(request, timeout=self.timeout) as response:
+                    return _json_body(response.read())
+            except urllib.error.HTTPError as exc:
+                detail = exc.read(4096).decode("utf-8", "replace")
+                if exc.code == 401 and attempt == 0 and self._reload_token():
+                    continue
+                if exc.code == 401:
+                    raise ConnectorAuthError(exc.code, detail) from exc
+                if exc.code in {409, 422}:
+                    raise ConnectorContractError(exc.code, detail) from exc
+                raise CloudHTTPError(exc.code, detail) from exc
+            except (OSError, urllib.error.URLError):
+                raise
+            finally:
+                if file_body is not None:
+                    file_body.close()
+        raise ConnectorAuthError(401, "connector token rotation retry exhausted")
 
     def _stream_events(
         self,
@@ -393,14 +413,16 @@ class CloudRelayClient:
         ``wake`` so the main loop polls immediately instead of sleeping the
         full interval. Reconnects with backoff on any failure.
         """
-        headers = {
-            "Authorization": f"Bearer {self.token}",
-            "X-Connector-ID": self.connector_id,
-            "Accept": "text/event-stream",
-            "User-Agent": "dbb3-cloud-connector/2.0",
-        }
         backoff = 1.0
         while not stop.is_set():
+            headers = {
+                "Authorization": f"Bearer {self.token}",
+                "X-Connector-ID": self.connector_id,
+                "Accept": "text/event-stream",
+                "User-Agent": "dbb3-cloud-connector/2.0",
+            }
+            if getattr(self, "_last_stream_event_id", ""):
+                headers["Last-Event-ID"] = self._last_stream_event_id
             try:
                 request = urllib.request.Request(
                     self.base_url + "/connector/stream",
@@ -409,14 +431,21 @@ class CloudRelayClient:
                 )
                 with urllib.request.urlopen(request, timeout=90) as response:
                     backoff = 1.0
+                    current_id = ""
                     for raw in response:
                         if stop.is_set():
                             return
+                        if raw.startswith(b"id:"):
+                            current_id = raw[3:].strip().decode("utf-8", "replace")
+                            continue
                         if raw.startswith(b"data:") and b'"type"' in raw:
                             try:
                                 event = json.loads(raw[5:].strip())
                             except (ValueError, TypeError):
                                 continue
+                            event_id = str(event.get("id") or event.get("event_id") or current_id or "")
+                            if event_id:
+                                self._last_stream_event_id = event_id
                             if event.get("type") in {"run.created", "run.terminal"}:
                                 wake.set()
                             elif event.get("type") == "run.steer":
@@ -427,6 +456,9 @@ class CloudRelayClient:
                                 if on_steer is not None:
                                     on_steer(dict(event))
                                 wake.set()
+            except urllib.error.HTTPError as exc:
+                if exc.code == 401:
+                    self._reload_token()
             except Exception:
                 pass
             if stop.wait(backoff):
@@ -1429,6 +1461,7 @@ class DBB3CloudConnector:
     ) -> None:
         self.cloud_client = cloud_client
         self._last_reported_terminal = False
+        self._lease_conflicts = 0
         self.command_runner = command_runner
         self.clock = clock
         self._pending_steers: list[dict[str, Any]] = []
@@ -1451,6 +1484,12 @@ class DBB3CloudConnector:
         self._wake_event = threading.Event()
         self._stream_stop = threading.Event()
         self._stream_thread: threading.Thread | None = None
+        self._heartbeat_stop = threading.Event()
+        self._heartbeat_thread: threading.Thread | None = None
+        self._drain_file = Path(
+            os.environ.get("HERMES_CONNECTOR_DRAIN_FILE", "")
+            or Path.home() / ".hermes" / ".drain_request.json"
+        )
         private_artifact_root = self.attachment_root.resolve()
         if private_artifact_root not in self.artifact_roots:
             self.artifact_roots.append(private_artifact_root)
@@ -1489,12 +1528,76 @@ class DBB3CloudConnector:
         self._wake_event.set()
 
     def close(self, timeout: float = 2.0) -> None:
-        """Stop the optional event stream without blocking connector shutdown."""
+        """Stop the optional event stream/heartbeat without blocking shutdown."""
         self._stream_stop.set()
+        self._heartbeat_stop.set()
         self._wake_event.set()
         thread = self._stream_thread
         if thread is not None and thread is not threading.current_thread():
             thread.join(timeout=max(0.0, timeout))
+        heartbeat = self._heartbeat_thread
+        if heartbeat is not None and heartbeat is not threading.current_thread():
+            heartbeat.join(timeout=max(0.0, timeout))
+
+    def start_heartbeat(self, interval: float = 30.0) -> None:
+        """Start a lightweight lease-renewal thread for active remote runs."""
+        if self._heartbeat_thread is not None and self._heartbeat_thread.is_alive():
+            return
+        self._heartbeat_stop.clear()
+        self._heartbeat_thread = threading.Thread(
+            target=self._heartbeat_loop,
+            args=(max(5.0, float(interval)),),
+            name="connector-heartbeat",
+            daemon=True,
+        )
+        self._heartbeat_thread.start()
+
+    def _heartbeat_loop(self, interval: float) -> None:
+        while not self._heartbeat_stop.wait(interval):
+            try:
+                self._send_heartbeats()
+            except Exception:
+                # Heartbeat must never take down the connector; the next
+                # sync_once / SSE cycle is still the durable path.
+                continue
+
+    def _send_heartbeats(self) -> None:
+        state = self.checkpoints.load()
+        now = now_iso()
+        for remote_id, local in (state.get("runs") or {}).items():
+            if not isinstance(local, dict):
+                continue
+            if not _coerce_flag(local.get("acked")) or not local.get("root_task_id"):
+                continue
+            status = str(local.get("status") or "").lower()
+            if status in TERMINAL_STATUSES or status in {"queued", "leased", "cancelling", "awaiting_claim"}:
+                continue
+            claim_token = _text(local.get("claim_token"), 256)
+            if not claim_token:
+                continue
+            payload = {
+                "connector_id": self.cloud_client.connector_id,
+                "claim_token": claim_token,
+                "lease_seconds": 90,
+                "checkpoint_cursor": _checkpoint_cursor(local.get("checkpoint_cursor")),
+                "status": status,
+                "terminal": False,
+                "summary": _text(local.get("last_summary"), 4000),
+                "observed_at": now,
+            }
+            try:
+                self.cloud_client.report_status(remote_id, payload)
+            except (ConnectorAuthError, ConnectorContractError, CloudHTTPError, OSError, urllib.error.URLError):
+                continue
+
+    def _drain_requested(self) -> bool:
+        """Honour the shared gateway drain marker so node upgrades drain first."""
+        try:
+            from gateway.drain_control import drain_requested
+
+            return drain_requested()
+        except Exception:
+            return self._drain_file.is_file()
 
     def _build_cancel_command(
         self,
@@ -1817,6 +1920,7 @@ class DBB3CloudConnector:
         except ConnectorContractError as exc:
             if exc.status != 409:
                 raise
+            self._lease_conflicts += 1
             try:
                 response = {
                     "applied": False,
@@ -2220,6 +2324,15 @@ class DBB3CloudConnector:
         permanent_errors: list[str] = []
         transient_failure = False
         root_id = _text(local.get("root_task_id"), 256)
+        try:
+            existing_attachments = self.cloud_client.list_run_attachments(remote_id)
+        except (CloudHTTPError, ConnectorContractError, OSError, urllib.error.URLError):
+            existing_attachments = []
+        existing_sha256 = {
+            _text(item.get("sha256"), 64).lower()
+            for item in existing_attachments
+            if isinstance(item, dict) and _text(item.get("sha256"), 64)
+        }
         for raw_path in paths:
             path = self._allowed_artifact(raw_path)
             if path is None:
@@ -2236,6 +2349,18 @@ class DBB3CloudConnector:
             filename = _safe_filename(path)
             key = f"{remote_id}:{path}:{digest}"
             if key in uploaded:
+                continue
+            if digest in existing_sha256:
+                relative = f"{root_id}/{digest[:16]}-{filename}"
+                uploaded[key] = {
+                    "sha256": digest,
+                    "size": size,
+                    "relative_path": relative,
+                    "uploaded_at": self.clock(),
+                    "deduplicated": True,
+                }
+                count += 1
+                self.checkpoints.save(state)
                 continue
             relative = f"{root_id}/{digest[:16]}-{filename}"
             media_type = "application/octet-stream"
@@ -2310,8 +2435,11 @@ class DBB3CloudConnector:
             local["acked"] = False
             self.checkpoints.save(state)
             return 0, 0
+        sync_started = time.monotonic()
         detail = self._show_task(_text(local.get("root_task_id"), 256), local)
         payload, artifact_paths = self._compact_status(detail, local)
+        payload["latency_ms"] = max(0, int((time.monotonic() - sync_started) * 1000))
+        payload["lease_conflicts"] = self._lease_conflicts
         if artifact_paths:
             local["artifact_paths"] = list(artifact_paths)
             self.checkpoints.save(state)
@@ -2409,6 +2537,8 @@ class DBB3CloudConnector:
                 if exc.status in {401, 422}:
                     raise
                 if exc.status in {404, 409}:
+                    if exc.status == 409:
+                        self._lease_conflicts += 1
                     # 404: the cloud no longer knows this run (archived or
                     # pruned); 409: the claim was lost (lease expired, or the
                     # cloud already accepted a terminal checkpoint and sealed
@@ -2614,6 +2744,7 @@ class DBB3CloudConnector:
         except ConnectorContractError as exc:
             if exc.status != 409:
                 raise
+            self._lease_conflicts += 1
             # Older servers used 409 when completion won the cancellation
             # race. Treat that terminal conflict as acknowledged so the user
             # service keeps polling instead of exiting permanently.
@@ -2652,7 +2783,12 @@ class DBB3CloudConnector:
         terminal_pushed = 0
         self._last_reported_terminal = False
         processed: set[str] = set()
-        for run_payload in self.cloud_client.pull_runs(limit=5, lease_seconds=90):
+        pull_payloads = (
+            []
+            if self._drain_requested()
+            else self.cloud_client.pull_runs(limit=5, lease_seconds=90)
+        )
+        for run_payload in pull_payloads:
             if not isinstance(run_payload, dict):
                 continue
             remote_id = _text(run_payload.get("remote_run_id"), 256)
@@ -2773,9 +2909,10 @@ def main(argv: list[str] | None = None) -> int:
         "--cancel-command",
         default=os.environ.get("HERMES_CONNECTOR_CANCEL_COMMAND", ""),
     )
-    parser.add_argument("--interval", type=float, default=2.0)
+    parser.add_argument("--interval", type=float, default=0.5)
     parser.add_argument("--once", action="store_true")
     parser.add_argument("--probe", action="store_true")
+    parser.add_argument("--probe-full", action="store_true")
     parser.add_argument("--quiet", action="store_true")
     args = parser.parse_args(argv)
     if not math.isfinite(args.interval):
@@ -2783,10 +2920,38 @@ def main(argv: list[str] | None = None) -> int:
     if not args.cloud_url:
         parser.error("--cloud-url or HERMES_CLOUD_URL is required")
     token = _load_token(args.token_file)
-    client = CloudRelayClient(args.cloud_url, token, connector_id=args.connector_id)
+    client = CloudRelayClient(
+        args.cloud_url,
+        token,
+        connector_id=args.connector_id,
+        token_path=args.token_file,
+    )
     if args.probe:
         result = client.probe()
         print(json.dumps({"ok": True, "contract_version": result.get("contract_version")}, ensure_ascii=False))
+        return 0
+    if args.probe_full:
+        health = client.probe()
+        pulled = client.pull_runs(limit=1, lease_seconds=15)
+        cancellations = client.pull_cancellations(limit=1, lease_seconds=15)
+        try:
+            metrics = client._request("/connector/metrics")
+        except Exception:
+            metrics = {}
+        print(
+            json.dumps(
+                {
+                    "ok": True,
+                    "contract_version": health.get("contract_version"),
+                    "pull_ok": isinstance(pulled, list),
+                    "cancel_pull_ok": isinstance(cancellations, list),
+                    "metrics_ok": isinstance(metrics, dict),
+                    "pulled": len(pulled),
+                    "cancellations": len(cancellations),
+                },
+                ensure_ascii=False,
+            )
+        )
         return 0
     roots = args.artifact_roots.split(os.pathsep) if args.artifact_roots else None
     connector = DBB3CloudConnector(
@@ -2795,6 +2960,8 @@ def main(argv: list[str] | None = None) -> int:
         artifact_roots=roots,
         cancel_command=args.cancel_command or None,
     )
+    if hasattr(connector, "start_heartbeat"):
+        connector.start_heartbeat(interval=float(os.environ.get("HERMES_CONNECTOR_HEARTBEAT_SECONDS", "30") or 30))
 
     def finish(exit_code: int) -> int:
         connector.close()
