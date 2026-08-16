@@ -3141,10 +3141,6 @@ class CollaborationDashboardTests(unittest.TestCase):
                     '"required_actions":["补齐证据并重新验收"]',
                     '"required_actions":[]',
                 ),
-                review_control("REWORK", blockers=[]).replace(
-                    '"blockers":["验收证据不足"]',
-                    '"blockers":[]',
-                ),
                 '{"protocol":"hermes.review.v1","protocol":"hermes.review.v1",'
                 '"verdict":"PASS","checks":{"requirements_met":true,'
                 '"evidence_verified":true,"tests_passed":true,"risks_resolved":true},'
@@ -3180,10 +3176,6 @@ class CollaborationDashboardTests(unittest.TestCase):
                     '"required_actions":["按职责整改并提交复核证据"]',
                     '"required_actions":[]',
                 ),
-                supervision_control("CORRECTIVE_ACTION").replace(
-                    '"blockers":["职责或证据存在阻断"]',
-                    '"blockers":[]',
-                ),
                 '{"protocol":"hermes.supervision.v1",'
                 '"verdict":"PASS","verdict":"PASS","checks":{'
                 '"role_boundaries_respected":true,"task_coverage_complete":true,'
@@ -3199,6 +3191,21 @@ class CollaborationDashboardTests(unittest.TestCase):
         for result in invalid_supervision_objects:
             with self.subTest(result=result[:100], protocol="supervision"):
                 self.assertEqual(module._hosted_supervisor_verdict(result), "unknown")
+
+        # Empty blockers are allowed for corrective/rework when findings and
+        # required_actions carry the concrete problems and remediation steps.
+        review_no_blockers = json.loads(review_control("REWORK"))
+        review_no_blockers["blockers"] = []
+        self.assertEqual(
+            module._hosted_reviewer_verdict(json.dumps(review_no_blockers)),
+            "rework",
+        )
+        supervision_no_blockers = json.loads(supervision_control("CORRECTIVE_ACTION"))
+        supervision_no_blockers["blockers"] = []
+        self.assertEqual(
+            module._hosted_supervisor_verdict(json.dumps(supervision_no_blockers)),
+            "corrective_action",
+        )
 
     def test_manager_handoff_cannot_override_authoritative_execution_evidence(self):
         module = load_module()
@@ -3311,6 +3318,95 @@ class CollaborationDashboardTests(unittest.TestCase):
                 for message in conversation["messages"]
             )
         )
+
+    def test_supervisor_worker_handoff_corrective_action_triggers_rework_loop(self):
+        module = load_module()
+        conversation = module.create_single_conversation("default")
+        state = {"conversations": [conversation]}
+        module.load_single_state = lambda: state
+        module.save_single_state = lambda _state: None
+        module.create_hosted_turn_record(
+            conversation,
+            turn_id="turn-supervisor-rework",
+            content="执行",
+            title="执行",
+            profiles=["default", "dbb3-worker", "reviewer"],
+            artifact_required=False,
+        )
+        calls = []
+        worker_handoff_calls = {"n": 0}
+        worker_calls = {"n": 0}
+
+        def runner(profile, prompt, **kwargs):
+            calls.append(profile)
+            if profile == "dbb3-manager":
+                return json.dumps(
+                    {
+                        "difficulty": "low",
+                        "reason": "single lane",
+                        "workers": ["dbb3-worker"],
+                        "reviewer_target": "dbb3",
+                        "plan": [
+                            {
+                                "id": "step-1",
+                                "title": "run",
+                                "objective": "execute",
+                                "assignee": "dbb3-worker",
+                                "depends_on": [],
+                            }
+                        ],
+                    }
+                )
+            if profile == "supervisor":
+                if "计划形成与首次派发" in prompt:
+                    return supervision_control()
+                if "Worker 交接" in prompt:
+                    if worker_handoff_calls["n"] == 0:
+                        worker_handoff_calls["n"] += 1
+                        return supervision_control(
+                            "CORRECTIVE_ACTION",
+                            blockers=[],
+                            findings=["worker did not execute"],
+                            required_actions=["actually create file"],
+                        )
+                    return supervision_control()
+                if "审阅与返工交接" in prompt:
+                    return supervision_control()
+                if "最终汇报" in prompt:
+                    return supervision_control()
+                if "post_report" in prompt or "最终汇报后" in prompt:
+                    return supervision_control()
+                raise AssertionError(f"unexpected supervisor prompt: {prompt[:80]}")
+            if profile == "dbb3-worker":
+                worker_calls["n"] += 1
+                if worker_calls["n"] == 1:
+                    return "worker first attempt no artifact"
+                return "worker second attempt with artifact"
+            if profile == "reviewer":
+                return review_control()
+            if profile == "default":
+                return "final report"
+            raise AssertionError(f"unexpected profile {profile}")
+
+        module.execute_hosted_workflow(
+            conversation["id"],
+            "turn-supervisor-rework",
+            runner=runner,
+            task_creator=lambda **_kwargs: {
+                "task_id": "root-rework",
+                "child_ids": ["child-worker", "child-reviewer"],
+                "profile_task_ids": {
+                    "dbb3-worker": "child-worker",
+                    "reviewer": "child-reviewer",
+                },
+                "fanout": True,
+            },
+        )
+        run = conversation["hosted_turns"]["turn-supervisor-rework"]
+        self.assertEqual(run["status"], "completed")
+        self.assertEqual(worker_handoff_calls["n"], 1)
+        self.assertEqual(worker_calls["n"], 2)
+        self.assertEqual(run.get("supervisor_rework_round"), 1)
 
     def test_terminal_cas_notification_uses_cancel_winner(self):
         module = load_module()

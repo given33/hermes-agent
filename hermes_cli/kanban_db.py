@@ -10312,14 +10312,19 @@ def _default_spawn(
     cmd.extend([
         "chat",
         "-q", prompt,
+        # All kanban workers must use the fully-quiet single-query path
+        # (`-Q`). `-q` alone runs the human-facing one-shot path, which
+        # always exits 0 even when the agent turn failed (e.g. a
+        # session-persistence failure from a corrupt state.db). That turns
+        # real worker failures into false "exited cleanly without
+        # kanban_complete/kanban_block" protocol violations and burns the
+        # task's retry budget. `-Q` propagates result.failed as exit code 1
+        # (and the rate-limit sentinel when applicable) so the dispatcher
+        # classifies those runs as crashed/rate-limited instead.
+        # Goal-mode workers also need this path: the kanban goal-loop hook
+        # (_run_kanban_goal_loop_q) only runs in cli.py's quiet branch.
+        "-Q",
     ])
-    if task.goal_mode:
-        # Goal-mode workers must take the fully-quiet single-query path:
-        # the kanban goal-loop hook (_run_kanban_goal_loop_q) only runs in
-        # cli.py's quiet branch. Without -Q the worker gets exactly one
-        # turn, prints text, exits rc=0, and the dispatcher records a
-        # protocol violation (incident 2026-06-09 t_d9cbe312).
-        cmd.append("-Q")
     # Redirect output to a per-task log under <board-root>/logs/.
     # Anchored at the board root (not the shared kanban root), so
     # `hermes kanban log` on a specific board reads its own file and

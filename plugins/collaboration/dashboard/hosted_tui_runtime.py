@@ -365,7 +365,7 @@ class _GatewayProcess:
                             **session_params,
                             "session_id": requested_session_id,
                         },
-                        timeout=30.0,
+                        timeout=120.0,
                     )
                 except HostedTuiGatewayError as exc:
                     if getattr(exc, "code", None) != 4007:
@@ -374,7 +374,7 @@ class _GatewayProcess:
                 result = self.rpc(
                     "session.create",
                     session_params,
-                    timeout=30.0,
+                    timeout=120.0,
                 )
             live_session_id = str(result.get("session_id") or "").strip()
             stored_session_id = str(

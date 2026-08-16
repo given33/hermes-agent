@@ -134,6 +134,49 @@ def test_default_spawn_model_override_survives_real_cli_parse(monkeypatch, tmp_p
     assert args.query == "work kanban task t_spawn_tools"
 
 
+def test_default_spawn_non_goal_worker_uses_quiet_exit_code_path(monkeypatch, tmp_path):
+    """Non-goal kanban workers must run `chat -q ... -Q`.
+
+    Regression: `-q` alone uses the human-facing one-shot path, which exits 0
+    even when the agent turn failed (e.g. session persistence failure). The
+    dispatcher then misclassifies the run as a clean-exit protocol violation.
+    `-Q` makes the CLI propagate result.failed as a non-zero exit code.
+    """
+    root = tmp_path / ".hermes"
+    (root / "profiles" / "elias").mkdir(parents=True)
+    root.joinpath("config.yaml").write_text("{}\n", encoding="utf-8")
+    monkeypatch.setenv("HERMES_HOME", str(root))
+
+    from hermes_cli import kanban_db as kb
+    from hermes_cli._parser import build_top_level_parser
+
+    monkeypatch.setattr(kb, "_resolve_hermes_argv", lambda: ["hermes"])
+    captured = {}
+
+    class FakeProc:
+        pid = 4245
+
+    def fake_popen(cmd, *args, **kwargs):
+        captured["cmd"] = list(cmd)
+        return FakeProc()
+
+    monkeypatch.setattr(subprocess, "Popen", fake_popen)
+
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    task = _make_task(kb, assignee="elias")
+    task.goal_mode = 0
+    kb._default_spawn(task, str(workspace))
+
+    assert captured["cmd"][1:3] == ["-p", "elias"]
+    parser, _subparsers, _chat_parser = build_top_level_parser()
+    args = parser.parse_args(captured["cmd"][3:])
+    assert args.command == "chat"
+    assert args.query == "work kanban task t_spawn_tools"
+    assert args.quiet is True
+    assert "-Q" in captured["cmd"]
+
+
 def test_resolve_worker_cli_toolsets_uses_profile_home_not_parent_config(monkeypatch, tmp_path):
     root = tmp_path / ".hermes"
     profile = root / "profiles" / "elias"

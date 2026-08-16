@@ -7731,12 +7731,12 @@ def run_profile_turn(
                     "HERMES_API_RETRY_ATTEMPT_OFFSET": str(
                         env.get("HERMES_API_RETRY_ATTEMPT_OFFSET") or "0"
                     ),
-                    # Hosted server-side roles (reporter, server fallback) are
-                    # not user-facing long-thinking turns. If the provider
-                    # stops producing output, fail fast instead of waiting up
-                    # to the reasoning-model stale floor (600s) and looping.
-                    "HERMES_STREAM_STALE_TIMEOUT": "120",
-                    "HERMES_STREAM_STALE_GIVEUP": "2",
+                    # Hosted server-side roles (reporter, server fallback) use
+                    # the same provider stale-stream safety as normal turns:
+                    # deepseek-v4-flash has a 600s reasoning floor, so long
+                    # internal prompts are not killed by an artificial 120s
+                    # fail-fast timeout. The product's existing stale detector
+                    # still bounds a genuinely wedged connection.
                     "HERMES_API_RETRY_DEADLINE_EPOCH_MS": str(
                         env.get("HERMES_API_RETRY_DEADLINE_EPOCH_MS") or "0"
                     ),
@@ -12784,13 +12784,16 @@ def _strict_hosted_control_result(
         if issue_count or not all(checks[key] for key in required_checks):
             return None
     elif (
-        not parsed["blockers"]
-        or not parsed["required_actions"]
+        not parsed["required_actions"]
         or issue_count == 0
         or all(checks[key] for key in required_checks)
     ):
-        # A negative control decision must identify both a failed check and an
-        # actionable structured reason. Empty pessimistic verdicts are invalid.
+        # A negative control decision must identify a failed check and an
+        # actionable structured reason. `blockers` may be empty when the model
+        # puts the concrete problems in `findings` and the remediation steps in
+        # `required_actions`; only the union of the three arrays must be
+        # non-empty. Requiring `blockers` alone rejected valid CORRECTIVE_ACTION
+        # results and made remote supervisor checkpoints fail with "格式无效".
         return None
     return parsed
 
@@ -14707,7 +14710,7 @@ def execute_hosted_workflow(
                 "不要做最终总结；把结果、证据、耗时和遗留问题提交给审阅者。",
                 f"用户任务：{content}",
                 (
-                    f"审阅者退回意见（第 {rework_round} 轮返工）：\n{rework_feedback}"
+                    f"返工意见（第 {rework_round} 轮）：\n{rework_feedback}"
                     if rework_feedback
                     else ""
                 ),
@@ -14746,138 +14749,216 @@ def execute_hosted_workflow(
             )
         return profile, result, status, role_state
 
-    pending_workers = [
-        profile
-        for profile in worker_profiles
-        if f"worker:{profile}" in ready_worker_ids
-        if worker_statuses.get(profile) != "completed" or not worker_results.get(profile)
-    ]
-    if pending_workers:
-        with ThreadPoolExecutor(
-            max_workers=len(pending_workers),
-            thread_name_prefix=f"hosted-workers-{turn_id[-8:]}",
-            initializer=_set_hosted_execution_generation,
-            initargs=(execution_generation,),
-        ) as executor:
-            futures = {
-                executor.submit(execute_worker, profile): profile
-                for profile in pending_workers
-            }
-            for future in as_completed(futures):
-                profile, result, status, _worker_state = future.result()
-                worker_results[profile] = result
-                worker_statuses[profile] = status
-                _persist_hosted_turn(
-                    conversation_id,
-                    turn_id,
-                    patch={
-                        "worker_results": dict(worker_results),
-                        "worker_statuses": dict(worker_statuses),
-                        "stage": "worker_running",
-                    },
-                    protocol_events=[
-                        {
-                            "event_type": (
-                                "turn.node_completed"
-                                if status == "completed"
-                                else "turn.node_blocked"
-                            ),
-                            "role_stage": "turn",
-                            "entity_id": f"{turn_id}:node:worker:{profile}",
-                            "idempotency_key": f"turn-node-result:{turn_id}:worker:{profile}",
-                            "payload": {
-                                "plan_node_id": f"worker:{profile}",
-                                "status": status,
-                            },
-                            "runtime": {
-                                "component_id": f"fiber:worker:{profile}",
-                                "lifecycle_state": (
-                                    "completed" if status == "completed" else "failed"
-                                ),
-                                "plan_node_id": f"worker:{profile}",
-                                "contract_revision": "hosted-turn-plan.v1",
-                            },
-                        }
-                    ],
-                )
-                if manager_plan.get("plan"):
-                    _persist_hosted_plan_snapshot(
+    supervisor_rework_round = 0
+    supervisor_rework_feedback = ""
+    while True:
+        pending_workers = [
+            profile
+            for profile in worker_profiles
+            if f"worker:{profile}" in ready_worker_ids
+            if worker_statuses.get(profile) != "completed" or not worker_results.get(profile)
+        ]
+        if pending_workers:
+            with ThreadPoolExecutor(
+                max_workers=len(pending_workers),
+                thread_name_prefix=f"hosted-workers-{turn_id[-8:]}",
+                initializer=_set_hosted_execution_generation,
+                initargs=(execution_generation,),
+            ) as executor:
+                futures = {
+                    executor.submit(
+                        execute_worker,
+                        profile,
+                        rework_feedback=supervisor_rework_feedback,
+                        rework_round=supervisor_rework_round,
+                    ): profile
+                    for profile in pending_workers
+                }
+                for future in as_completed(futures):
+                    profile, result, status, _worker_state = future.result()
+                    worker_results[profile] = result
+                    worker_statuses[profile] = status
+                    _persist_hosted_turn(
                         conversation_id,
                         turn_id,
-                        manager_plan,
-                        stage="worker_running",
-                        worker_statuses=worker_statuses,
+                        patch={
+                            "worker_results": dict(worker_results),
+                            "worker_statuses": dict(worker_statuses),
+                            "stage": "worker_running",
+                        },
+                        protocol_events=[
+                            {
+                                "event_type": (
+                                    "turn.node_completed"
+                                    if status == "completed"
+                                    else "turn.node_blocked"
+                                ),
+                                "role_stage": "turn",
+                                "entity_id": f"{turn_id}:node:worker:{profile}",
+                                "idempotency_key": f"turn-node-result:{turn_id}:worker:{profile}",
+                                "payload": {
+                                    "plan_node_id": f"worker:{profile}",
+                                    "status": status,
+                                },
+                                "runtime": {
+                                    "component_id": f"fiber:worker:{profile}",
+                                    "lifecycle_state": (
+                                        "completed" if status == "completed" else "failed"
+                                    ),
+                                    "plan_node_id": f"worker:{profile}",
+                                    "contract_revision": "hosted-turn-plan.v1",
+                                },
+                            }
+                        ],
                     )
-    worker_result = "\n\n".join(
-        f"## {profile}\n{worker_results.get(profile, '')}".strip()
-        for profile in worker_profiles
-    )
-    worker_status = (
-        "completed"
-        if all(worker_statuses.get(profile) == "completed" for profile in worker_profiles)
-        else "failed"
-    )
-    _persist_hosted_turn(
-        conversation_id,
-        turn_id,
-        patch={
-            "worker_result": worker_result,
-            "worker_status": worker_status,
-            "worker_results": dict(worker_results),
-            "worker_statuses": dict(worker_statuses),
-            "stage": "reviewing",
-            "participants": [
-                hosted_participant_descriptor(
-                    reviewer_profile,
-                    role_stage="reviewer",
-                    node=(
-                        "wsl"
-                        if reviewer_connector_id == "pc-primary"
-                        else "dbb3"
+                    if manager_plan.get("plan"):
+                        _persist_hosted_plan_snapshot(
+                            conversation_id,
+                            turn_id,
+                            manager_plan,
+                            stage="worker_running",
+                            worker_statuses=worker_statuses,
+                        )
+        worker_result = "\n\n".join(
+            f"## {profile}\n{worker_results.get(profile, '')}".strip()
+            for profile in worker_profiles
+        )
+        worker_status = (
+            "completed"
+            if all(worker_statuses.get(profile) == "completed" for profile in worker_profiles)
+            else "failed"
+        )
+        _persist_hosted_turn(
+            conversation_id,
+            turn_id,
+            patch={
+                "worker_result": worker_result,
+                "worker_status": worker_status,
+                "worker_results": dict(worker_results),
+                "worker_statuses": dict(worker_statuses),
+                "stage": "reviewing",
+                "participants": [
+                    hosted_participant_descriptor(
+                        reviewer_profile,
+                        role_stage="reviewer",
+                        node=(
+                            "wsl"
+                            if reviewer_connector_id == "pc-primary"
+                            else "dbb3"
+                        ),
                     ),
-                ),
-            ],
-        },
-    )
-    if manager_plan.get("plan"):
-        _persist_hosted_plan_snapshot(
-            conversation_id,
-            turn_id,
-            manager_plan,
-            stage="reviewing",
-            worker_statuses=worker_statuses,
-        )
-    if _finish_hosted_turn_if_cancelled(conversation_id, turn_id):
-        return
-
-    worker_supervision, worker_supervision_status, _worker_supervision = (
-        _run_hosted_supervisor_check(
-            conversation_id,
-            turn_id,
-            check_id="worker_handoff",
-            checkpoint_label="Worker 交接",
-            evidence={
-                "task_goal": content,
-                "manager_plan": manager_plan,
-                "worker_results": worker_results,
-                "worker_statuses": worker_statuses,
-                "artifact_required": artifact_required,
+                ],
             },
-            runner=runner,
-            remote=remote_workers,
-            kanban_task_id=plan_sync_task_id,
         )
-    )
-    supervisor_statuses["worker_handoff"] = worker_supervision_status
-    supervisor_findings["worker_handoff"] = str(
-        _worker_supervision.get("display_result") or worker_supervision
-    )
-    _require_supervisor_pass(
-        "Worker 交接",
-        _worker_supervision,
-        conversation_id=conversation_id,
-        turn_id=turn_id,
-    )
+        if manager_plan.get("plan"):
+            _persist_hosted_plan_snapshot(
+                conversation_id,
+                turn_id,
+                manager_plan,
+                stage="reviewing",
+                worker_statuses=worker_statuses,
+            )
+        if _finish_hosted_turn_if_cancelled(conversation_id, turn_id):
+            return
+
+        worker_supervision, worker_supervision_status, _worker_supervision = (
+            _run_hosted_supervisor_check(
+                conversation_id,
+                turn_id,
+                check_id="worker_handoff",
+                checkpoint_label="Worker 交接",
+                evidence={
+                    "task_goal": content,
+                    "manager_plan": manager_plan,
+                    "worker_results": worker_results,
+                    "worker_statuses": worker_statuses,
+                    "artifact_required": artifact_required,
+                    "supervisor_rework_round": supervisor_rework_round,
+                    "supervisor_rework_feedback": supervisor_rework_feedback,
+                },
+                runner=runner,
+                remote=remote_workers,
+                kanban_task_id=plan_sync_task_id,
+            )
+        )
+        supervisor_statuses["worker_handoff"] = worker_supervision_status
+        supervisor_findings["worker_handoff"] = str(
+            _worker_supervision.get("display_result") or worker_supervision
+        )
+        worker_verdict = str(_worker_supervision.get("verdict") or "unknown")
+        worker_check_status = str(_worker_supervision.get("status") or "failed")
+        if worker_check_status == "completed" and worker_verdict == "pass":
+            break
+        if (
+            worker_verdict == "corrective_action"
+            and supervisor_rework_round < _HOSTED_REWORK_LIMIT
+        ):
+            supervisor_rework_round += 1
+            supervisor_rework_feedback = "\n\n".join(
+                item
+                for item in (
+                    str(_worker_supervision.get("display_result") or ""),
+                    "整改要求：",
+                    "\n".join(
+                        str(item)
+                        for item in (_worker_supervision.get("required_actions") or [])
+                        if str(item).strip()
+                    ),
+                    "问题：",
+                    "\n".join(
+                        str(item)
+                        for item in (_worker_supervision.get("findings") or [])
+                        if str(item).strip()
+                    ),
+                )
+                if str(item).strip()
+            )
+            for profile in worker_profiles:
+                worker_statuses[profile] = ""
+                worker_results[profile] = ""
+            _persist_hosted_turn(
+                conversation_id,
+                turn_id,
+                patch={
+                    "stage": "worker_running",
+                    "worker_status": "failed",
+                    "worker_statuses": dict(worker_statuses),
+                    "worker_results": dict(worker_results),
+                    "supervisor_rework_round": supervisor_rework_round,
+                    "supervisor_rework_feedback": supervisor_rework_feedback,
+                },
+                message={
+                    "role": "assistant",
+                    "name": _HERMES_SUPERVISOR_LABEL,
+                    "content": (
+                        f"监督者要求返工（第 {supervisor_rework_round} 轮）："
+                        f"{supervisor_rework_feedback}"
+                    ),
+                    "status": "completed",
+                    "kind": "message",
+                    "meta": {
+                        "role_stage": "supervisor.rework-request",
+                        "base_role_stage": "supervisor",
+                        "phase": "rework",
+                        "message_key": f"{turn_id}:supervisor:rework:{supervisor_rework_round}",
+                        "role_label": _HERMES_SUPERVISOR_LABEL,
+                        "profile": "supervisor",
+                        "final_report": False,
+                    },
+                },
+            )
+            if _finish_hosted_turn_if_cancelled(conversation_id, turn_id):
+                return
+            continue
+        # Unknown/failed verdict, or corrective action after the rework limit:
+        # the supervisor gate is authoritative and the turn must fail.
+        _require_supervisor_pass(
+            "Worker 交接",
+            _worker_supervision,
+            conversation_id=conversation_id,
+            turn_id=turn_id,
+        )
+        break
     if _finish_hosted_turn_if_cancelled(conversation_id, turn_id):
         return
 
