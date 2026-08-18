@@ -19291,10 +19291,26 @@ def get_single_conversations(request: Request = None):
         state = load_single_state()
         conversations = state.get("conversations") or []
         owned: list[dict[str, Any]] = []
+        # Deletion tombstones travel WITH the list so other devices can drop
+        # their cached copies instead of preserving them forever: a
+        # delete_requested record matching this owner+generation is server
+        # truth that the conversation no longer exists remotely.
+        deleted_tombstones: list[tuple[int, str]] = []
         changed = False
         for conversation in conversations:
             existing_owner = str(conversation.get("owner_id") or "").strip()
             if conversation.get("delete_requested"):
+                if existing_owner == owner_id:
+                    stored_generation = str(
+                        conversation.get("account_generation") or ""
+                    ).strip()
+                    if not stored_generation or stored_generation == account_generation:
+                        deleted_tombstones.append(
+                            (
+                                int(conversation.get("delete_requested_at") or 0),
+                                str(conversation.get("id") or ""),
+                            )
+                        )
                 continue
             if existing_owner != owner_id and _legacy_owner_claim_allowed(
                 existing_owner,
@@ -19335,7 +19351,12 @@ def get_single_conversations(request: Request = None):
             for message_count, last_message in [_conversation_history_summary(conversation)]
         ]
     resume_unfinished_hosted_workflows(owned)
-    return {"conversations": summaries}
+    deleted_tombstones.sort(reverse=True)
+    return {
+        "conversations": summaries,
+        # Bounded, newest-first ids of conversations deleted on the server.
+        "deleted": [item[1] for item in deleted_tombstones[:500] if item[1]],
+    }
 
 
 @router.post("/single/conversations")
@@ -23488,18 +23509,245 @@ def set_room_typing(room_id: str, payload: RoomTypingBody, request: Request):
     return {"ok": True}
 
 
+
+_ROOM_SUMMARY_MIN_EVERY_TURNS = 1
+_ROOM_SUMMARY_DEFAULT_EVERY_TURNS = 20
+_ROOM_SUMMARY_TRANSCRIPT_TAIL = 40
+_ROOM_SUMMARY_ATTEMPT_BACKOFF_MS = 60_000
+_ROOM_SUMMARY_STALE_LEASE_MS = 10 * 60_000
+_ROOM_SUMMARY_THREADS: dict[str, threading.Thread] = {}
+_ROOM_SUMMARY_THREADS_LOCK = threading.Lock()
+
+
+def _room_terminal_turn_count(conversation: Optional[dict[str, Any]]) -> int:
+    """Number of hosted turns that have reached a terminal state."""
+    if not isinstance(conversation, dict):
+        return 0
+    return sum(
+        1
+        for run in (conversation.get("hosted_turns") or {}).values()
+        if isinstance(run, dict)
+        and str(run.get("status") or "queued") in _HOSTED_TERMINAL_STATUSES
+    )
+
+
+def _room_summary_due(
+    room: dict[str, Any],
+    conversation: Optional[dict[str, Any]],
+) -> bool:
+    config = room.get("summary_config") if isinstance(room.get("summary_config"), dict) else {}
+    profile = str(config.get("profile") or "").strip()
+    if not profile:
+        return False
+    try:
+        every = max(
+            _ROOM_SUMMARY_MIN_EVERY_TURNS,
+            int(config.get("every_turns") or _ROOM_SUMMARY_DEFAULT_EVERY_TURNS),
+        )
+    except (TypeError, ValueError):
+        every = _ROOM_SUMMARY_DEFAULT_EVERY_TURNS
+    summary = room.get("summary") if isinstance(room.get("summary"), dict) else {}
+    status = str(summary.get("status") or "idle")
+    if status == "summarizing":
+        lease_started = int(summary.get("lease_started_at") or 0)
+        if lease_started and int(time.time() * 1000) - lease_started < _ROOM_SUMMARY_STALE_LEASE_MS:
+            return False
+    last_attempt = int(summary.get("last_attempt_at") or 0)
+    if last_attempt and int(time.time() * 1000) - last_attempt < _ROOM_SUMMARY_ATTEMPT_BACKOFF_MS:
+        return False
+    terminal_now = _room_terminal_turn_count(conversation)
+    anchor = int(summary.get("turn_count") or 0)
+    return terminal_now - anchor >= every
+
+
+def _room_summary_prompt(room: dict[str, Any], conversation: dict[str, Any]) -> str:
+    messages = [
+        item
+        for item in (conversation.get("messages") or [])
+        if isinstance(item, dict)
+    ]
+    tail = messages[-_ROOM_SUMMARY_TRANSCRIPT_TAIL:]
+    lines = []
+    for message in tail:
+        role = "User" if str(message.get("role") or "") == "user" else "Agent"
+        name = str(message.get("name") or "").strip()
+        content = str(message.get("content") or "").strip()
+        if not content:
+            continue
+        lines.append(f"[{role}{':' + name if name and role == 'Agent' else ''}] {content[:1200]}")
+    transcript = "\n".join(lines) or "(no messages yet)"
+    return (
+        "You are the summarizer for a team chat room. Summarize the recent "
+        "conversation below into a concise rolling summary in the conversation "
+        "language: key decisions, current task states, open questions, and "
+        "each member's latest responsibility. Keep it under 2500 characters, "
+        "plain text, no headings.\n\n"
+        f"Room: {str(room.get('name') or '')}\n\n{transcript}"
+    )
+
+
+def _summarize_room_async(
+    room_id: str,
+    conversation_id: str,
+    owner_id: str,
+    account_generation: str,
+) -> None:
+    """Single-flight background summarizer; result persists on room.summary."""
+
+    with _ROOM_SUMMARY_THREADS_LOCK:
+        existing = _ROOM_SUMMARY_THREADS.get(room_id)
+        if existing is not None and existing.is_alive():
+            return
+
+        def worker() -> None:
+            try:
+                profile = ""
+                prompt = ""
+                with _STATE_LOCK:
+                    state = load_state()
+                    room = _owned_room_in_state(
+                        state, room_id, owner_id, account_generation
+                    )
+                    single_state = load_single_state()
+                    conversation = next(
+                        (
+                            item
+                            for item in single_state.get("conversations") or []
+                            if isinstance(item, dict)
+                            and str(item.get("id") or "") == conversation_id
+                        ),
+                        None,
+                    )
+                    if not isinstance(conversation, dict) or not _room_summary_due(
+                        room, conversation
+                    ):
+                        return
+                    config = room.get("summary_config") or {}
+                    profile = str(config.get("profile") or "").strip()
+                    if not profile:
+                        return
+                    prompt = _room_summary_prompt(room, conversation)
+                    summary = room.get("summary")
+                    if not isinstance(summary, dict):
+                        summary = {}
+                        room["summary"] = summary
+                    summary["status"] = "summarizing"
+                    summary["lease_started_at"] = int(time.time() * 1000)
+                    summary["last_attempt_at"] = int(time.time() * 1000)
+                    save_state(state)
+
+                text = run_single_turn(profile, prompt)
+                clean = str(text or "").strip()
+                if not clean:
+                    raise RuntimeError("summarizer returned empty output")
+
+                with _STATE_LOCK:
+                    state = load_state()
+                    room = _owned_room_in_state(
+                        state, room_id, owner_id, account_generation
+                    )
+                    single_state = load_single_state()
+                    conversation = next(
+                        (
+                            item
+                            for item in single_state.get("conversations") or []
+                            if isinstance(item, dict)
+                            and str(item.get("id") or "") == conversation_id
+                        ),
+                        None,
+                    )
+                    summary = room.get("summary")
+                    if not isinstance(summary, dict):
+                        summary = {}
+                        room["summary"] = summary
+                    summary.update(
+                        {
+                            "text": clean[:20_000],
+                            "status": "success",
+                            "version": int(summary.get("version") or 0) + 1,
+                            "updated_at": int(time.time() * 1000),
+                            "last_error": None,
+                            "turn_count": _room_terminal_turn_count(conversation),
+                            "through_message_id": "",
+                        }
+                    )
+                    summary.pop("lease_started_at", None)
+                    _touch_room(room)
+                    save_state(state)
+                _notify_hosted_update(conversation_id)
+            except Exception as exc:
+                try:
+                    with _STATE_LOCK:
+                        state = load_state()
+                        room = _owned_room_in_state(
+                            state, room_id, owner_id, account_generation
+                        )
+                        summary = room.get("summary")
+                        if not isinstance(summary, dict):
+                            summary = {}
+                            room["summary"] = summary
+                        summary["status"] = "failed"
+                        summary["last_error"] = str(exc)[:1000]
+                        summary["updated_at"] = int(time.time() * 1000)
+                        summary.pop("lease_started_at", None)
+                        save_state(state)
+                except Exception:
+                    pass
+            finally:
+                with _ROOM_SUMMARY_THREADS_LOCK:
+                    if _ROOM_SUMMARY_THREADS.get(room_id) is threading.current_thread():
+                        _ROOM_SUMMARY_THREADS.pop(room_id, None)
+
+        thread = threading.Thread(
+            target=worker,
+            name=f"hermes-room-summary-{room_id}",
+            daemon=True,
+        )
+        _ROOM_SUMMARY_THREADS[room_id] = thread
+    thread.start()
+
+
 @router.get("/rooms/{room_id}/summary")
 def get_room_summary(room_id: str, request: Request):
     owner_id = owner_id_from_request(request)
     account_generation = _account_generation_for_request(request, owner_id)
+    conversation_id = ""
+    due = False
     with _STATE_LOCK:
         state = load_state()
         room = _accessible_room_in_state(state, room_id, owner_id, account_generation)
-        return {
-            "summary": _room_summary_state(room),
-            "anchor": None,
-            "config": dict(room.get("summary_config") or {}),
-        }
+        conversation_id = str(room.get("conversation_id") or "")
+        if conversation_id:
+            single_state = load_single_state()
+            conversation = next(
+                (
+                    item
+                    for item in single_state.get("conversations") or []
+                    if isinstance(item, dict)
+                    and str(item.get("id") or "") == conversation_id
+                ),
+                None,
+            )
+            due = _room_summary_due(room, conversation)
+            summary = _room_summary_state(room)
+            config = dict(room.get("summary_config") or {})
+        else:
+            summary = _room_summary_state(room)
+            config = dict(room.get("summary_config") or {})
+    if due and conversation_id:
+        # The client polls this endpoint; crossing the every_turns threshold
+        # here dispatches the single-flight background summarizer.
+        _summarize_room_async(
+            room_id,
+            conversation_id,
+            str(room.get("owner_id") or owner_id),
+            account_generation,
+        )
+    return {
+        "summary": summary,
+        "anchor": None,
+        "config": config,
+    }
 
 
 @router.put("/rooms/{room_id}/summary")
