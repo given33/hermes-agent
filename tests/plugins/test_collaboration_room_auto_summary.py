@@ -189,3 +189,71 @@ class TestBackgroundSummarizer:
         assert dispatched == [(room["id"], "chat_room_sum1", "owner-a", "gen-a")]
         assert response["summary"]["room_id"] == room["id"]
         assert response["config"]["profile"] == "default"
+
+
+class TestDurableDeletionTombstones:
+    def test_finalize_records_tombstone_visible_in_list(self):
+        import json as _json
+        module = load_module()
+        conversation = {
+            "id": "chat_durable_del01",
+            "owner_id": "owner-a",
+            "account_generation": "gen-a",
+            "delete_requested": True,
+            "delete_requested_at": 123,
+            "messages": [],
+            "hosted_turns": {},
+        }
+        saved = {}
+        module.load_single_state = lambda: {"conversations": [conversation]}
+        module.save_single_state = lambda state: saved.update(state)
+        module._remove_room_index_for_conversation = lambda _cid, _owner: None
+        module._delete_runtime_session = lambda profile, sid: True
+        library = SimpleNamespace()
+        library.delete_conversation = lambda *a, **k: {"files": 0}
+        module._file_library = lambda: library
+        module.release_hosted_gateway_conversation = lambda *a, **k: 0
+        module._notify_hosted_update = lambda _cid="": 0
+
+        ok = module._finalize_pending_conversation_deletion("chat_durable_del01")
+        assert ok is True
+        tombstones = saved.get("deletion_tombstones") or []
+        assert any(
+            isinstance(item, dict) and item.get("id") == "chat_durable_del01" for item in tombstones
+        )
+
+        # The tombstone surfaces in the list response for the owning account.
+        responses = {}
+
+        def capture_list(request=None):
+            responses["value"] = module.get_single_conversations(request)
+            return responses["value"]
+
+        module.owner_id_from_request = lambda _request: "owner-a"
+        module._account_generation_for_owner = lambda _owner: "gen-a"
+        module.load_single_state = lambda: {"conversations": [], "deletion_tombstones": tombstones}
+        module.save_single_state = lambda state: None
+        module.resume_unfinished_hosted_workflows = lambda owned: None
+        module.reconcile_conversation_runtime_results = lambda conversation: False
+        module.reconcile_stale_hosted_turns = lambda conversation: False
+        module.comp_conversation_title = lambda conversation: False
+        result = module.get_single_conversations(SimpleNamespace(query_params={}))
+        assert "chat_durable_del01" in (result.get("deleted") or [])
+
+    def test_tombstones_expire_and_cap(self):
+        module = load_module()
+        now = int(time.time() * 1000)
+        state = {
+            "deletion_tombstones": [
+                {"id": f"old-{i}", "owner_id": "o", "account_generation": "g", "deleted_at": now - 100 * 24 * 3600 * 1000}
+                for i in range(3)
+            ]
+            + [
+                {"id": f"new-{i}", "owner_id": "o", "account_generation": "g", "deleted_at": now - i}
+                for i in range(module._DELETION_TOMBSTONE_MAX + 10)
+            ]
+        }
+        assert module._prune_deletion_tombstones(state) is True
+        kept = state["deletion_tombstones"]
+        assert len(kept) <= module._DELETION_TOMBSTONE_MAX
+        assert all(str(item.get("id", "")).startswith("new-") for item in kept)

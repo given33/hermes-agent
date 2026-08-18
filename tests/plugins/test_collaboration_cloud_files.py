@@ -564,7 +564,10 @@ def test_mobile_conversation_list_does_not_claim_owner_email_legacy_data(
 
     response = module.get_single_conversations(request)
 
-    assert response == {"conversations": []}
+    assert response["conversations"] == []
+    # Deletion tombstones ride with the list (remote deletion propagation);
+    # this account has none.
+    assert response["deleted"] == []
     assert conversation["owner_id"] == module.LOCAL_OWNER_ID
     assert saves == []
 

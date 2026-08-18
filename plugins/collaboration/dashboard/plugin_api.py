@@ -3801,6 +3801,21 @@ def delete_owner_account_data(
 
     with _STATE_LOCK:
         state = load_single_state()
+        for conversation in state.get("conversations") or []:
+            if not isinstance(conversation, dict):
+                continue
+            if (
+                str(conversation.get("owner_id") or "").strip() == normalized_owner
+                or _legacy_owner_claim_allowed(
+                    str(conversation.get("owner_id") or "").strip(),
+                    normalized_owner,
+                )
+            ) and (
+                not str(conversation.get("account_generation") or "").strip()
+                or str(conversation.get("account_generation") or "").strip()
+                    == normalized_generation
+            ):
+                _record_deletion_tombstone(state, conversation)
         state["conversations"] = [
             conversation
             for conversation in state.get("conversations") or []
@@ -19336,8 +19351,21 @@ def get_single_conversations(request: Request = None):
             changed = reconcile_stale_hosted_turns(conversation) or changed
             changed = compact_conversation_title(conversation) or changed
             owned.append(conversation)
-        if changed:
+        if changed or _prune_deletion_tombstones(state):
             save_single_state(state)
+        for item in state.get("deletion_tombstones") or []:
+            if not isinstance(item, dict):
+                continue
+            if str(item.get("owner_id") or "").strip() != owner_id:
+                continue
+            stored_generation = str(item.get("account_generation") or "").strip()
+            if stored_generation and stored_generation != account_generation:
+                continue
+            tombstone_id = str(item.get("id") or "").strip()
+            if tombstone_id:
+                deleted_tombstones.append(
+                    (int(item.get("deleted_at") or 0), tombstone_id)
+                )
         summaries = [
             {
                 **_conversation_index_projection(conversation),
@@ -21987,6 +22015,9 @@ def _finalize_pending_conversation_deletion(conversation_id: str) -> bool:
                 return False
         except OSError:
             return False
+        # Durable cross-device tombstone: the row is about to disappear, so
+        # record the deletion for other devices' list syncs (bounded TTL).
+        _record_deletion_tombstone(state, conversation)
         previous_conversations = state.get("conversations")
         state["conversations"] = [
             item
@@ -22933,6 +22964,71 @@ def _room_active_typing(room: dict[str, Any]) -> list[dict[str, Any]]:
     return active
 
 
+
+_DELETION_TOMBSTONE_TTL_MS = 14 * 24 * 3600 * 1000
+_DELETION_TOMBSTONE_MAX = 500
+
+
+def _record_deletion_tombstone(
+    single_state: dict[str, Any],
+    conversation: dict[str, Any],
+    *,
+    now: Optional[int] = None,
+) -> None:
+    """Persist a bounded deletion tombstone for cross-device propagation.
+
+    The delete_requested row is removed as soon as the deletion finalizes,
+    which left other devices no window to observe it (they preserved their
+    cached copies forever). These tombstones keep the id visible in the
+    conversation list's `deleted` array for a TTL so every sync'ing device
+    drops its copy.
+    """
+    entry = {
+        "id": str(conversation.get("id") or "").strip(),
+        "owner_id": str(conversation.get("owner_id") or "").strip(),
+        "account_generation": str(conversation.get("account_generation") or "").strip(),
+        "deleted_at": int(now if now is not None else time.time() * 1000),
+    }
+    if not entry["id"]:
+        return
+    tombstones = [
+        item
+        for item in (single_state.get("deletion_tombstones") or [])
+        if isinstance(item, dict) and str(item.get("id") or "").strip()
+    ]
+    tombstones = [item for item in tombstones if item.get("id") != entry["id"]]
+    tombstones.append(entry)
+    tombstones.sort(key=lambda item: int(item.get("deleted_at") or 0), reverse=True)
+    cutoff = int(time.time() * 1000) - _DELETION_TOMBSTONE_TTL_MS
+    tombstones = [
+        item
+        for item in tombstones[: _DELETION_TOMBSTONE_MAX]
+        if int(item.get("deleted_at") or 0) >= cutoff
+    ]
+    single_state["deletion_tombstones"] = tombstones
+
+
+def _prune_deletion_tombstones(single_state: dict[str, Any]) -> bool:
+    """Drop expired/over-cap tombstones; True when the list changed."""
+    tombstones = [
+        item
+        for item in (single_state.get("deletion_tombstones") or [])
+        if isinstance(item, dict)
+    ]
+    if not tombstones:
+        return False
+    cutoff = int(time.time() * 1000) - _DELETION_TOMBSTONE_TTL_MS
+    kept = [
+        item
+        for item in tombstones
+        if int(item.get("deleted_at") or 0) >= cutoff
+    ][:_DELETION_TOMBSTONE_MAX]
+    if len(kept) != len(tombstones):
+        single_state["deletion_tombstones"] = kept
+        return True
+    return False
+
+
 def _room_summary_state(room: dict[str, Any]) -> dict[str, Any]:
     summary = room.get("summary") if isinstance(room.get("summary"), dict) else {}
     now = int(time.time() * 1000)
@@ -23679,9 +23775,23 @@ def _summarize_room_async(
                 try:
                     with _STATE_LOCK:
                         state = load_state()
-                        room = _owned_room_in_state(
-                            state, room_id, owner_id, account_generation
+                        # Lenient by-id lookup: the ownership fence may have
+                        # legitimately changed mid-run (that 404 was the
+                        # original exception); still verify the owner before
+                        # recording so a re-registered account's room is never
+                        # touched by the previous era's summarizer.
+                        room = next(
+                            (
+                                item
+                                for item in state.get("rooms") or []
+                                if isinstance(item, dict)
+                                and item.get("id") == room_id
+                                and str(item.get("owner_id") or "").strip() == owner_id
+                            ),
+                            None,
                         )
+                        if room is None:
+                            return
                         summary = room.get("summary")
                         if not isinstance(summary, dict):
                             summary = {}
