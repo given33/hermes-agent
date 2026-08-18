@@ -25287,11 +25287,13 @@ def _mobile_owned_conversations(
             if isinstance(conversation, dict)
             and not conversation.get("delete_requested")
             and str(conversation.get("owner_id") or "").strip() == normalized_owner
-            and (
-                not str(conversation.get("account_generation") or "").strip()
-                or str(conversation.get("account_generation") or "").strip()
-                == normalized_generation
-            )
+            # Mobile scoping is strict: a record written before this account
+            # carried a generation fence belongs to the pre-fence era and must
+            # NOT surface (or get bound) under a re-registered account with
+            # the same owner id. Legacy visibility stays available to the
+            # loopback desktop owner through the conversation-list paths.
+            and str(conversation.get("account_generation") or "").strip()
+            == normalized_generation
         ]
 
 

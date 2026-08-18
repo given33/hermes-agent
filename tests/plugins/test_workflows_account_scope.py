@@ -130,3 +130,47 @@ def test_workflow_store_migrates_v1_account_tombstones(tmp_path):
         "deleted_at": 123,
     }
     assert version == 3
+
+
+def test_legacy_generation_rows_rekey_once_to_live_generation(tmp_path, monkeypatch):
+    """Pre-fence "1" workflows move to the account's live generation exactly once."""
+    store = WorkflowStore(tmp_path / "workflows.db", audit_key=b"a" * 32)
+    legacy_scope = WorkflowScope("alice", "1", "default")
+    store.create_definition(
+        legacy_scope,
+        name="legacy",
+        description="",
+        spec=_spec(),
+        idempotency_key="legacy-1",
+    )
+    assert store.list_definitions(WorkflowScope("alice", "acctgen-live", "default")) == []
+    assert store.legacy_generation_accounts() == ["alice"]
+    assert not store.legacy_generation_migration_done()
+
+    generations = iter(["acctgen-live", "acctgen-live"])
+
+    class FakeMobileStore:
+        def account_generation(self, owner_id: str, *, create: bool):
+            assert owner_id == "alice"
+            return next(generations)
+
+    monkeypatch.setattr(
+        "hermes_cli.dashboard_auth.mobile_device_store.MobileDeviceStore",
+        FakeMobileStore,
+    )
+    plugin_api._STORE = None
+    monkeypatch.setattr(plugin_api, "workflow_store", lambda: store)
+
+    scope = plugin_api._scope(_request("alice", "acctgen-live"), "default")
+    assert scope.account_generation == "acctgen-live"
+    migrated = store.list_definitions(WorkflowScope("alice", "acctgen-live", "default"))
+    assert [d["name"] for d in migrated] == ["legacy"]
+    assert store.list_definitions(legacy_scope) == []
+    assert store.legacy_generation_migration_done()
+
+    # After the marker commits, a later era (account reset → new generation)
+    # must never resurrect or re-key the old rows again.
+    generations = iter(["acctgen-newera", "acctgen-newera"])
+    plugin_api._scope(_request("alice", "acctgen-newera"), "default")
+    assert store.list_definitions(WorkflowScope("alice", "acctgen-live", "default"))
+    assert store.list_definitions(WorkflowScope("alice", "acctgen-newera", "default")) == []

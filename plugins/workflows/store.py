@@ -42,6 +42,7 @@ SENSITIVE_PARTS = {".env", ".git", "auth.json", "credentials", "secrets"}
 # opaque numeric generations such as ``"01"`` into the same value as ``"1"``.
 # The migration below rebuilds the complete workflow graph so foreign keys and
 # immutable-version triggers remain valid after the type change.
+_LOCAL_ACCOUNT_ID = "local-owner"
 _WORKFLOW_TABLES = (
     "workflow_account_deletions",
     "workflow_definitions",
@@ -71,6 +72,10 @@ _GENERATION_TABLES = (
 
 SCHEMA = r"""
 CREATE TABLE IF NOT EXISTS workflow_schema(version INTEGER NOT NULL);
+CREATE TABLE IF NOT EXISTS workflow_migration_markers(
+    key TEXT PRIMARY KEY,
+    created_at INTEGER NOT NULL
+);
 CREATE TABLE IF NOT EXISTS workflow_account_deletions(
  account_id TEXT NOT NULL, account_generation TEXT NOT NULL, deleted_at INTEGER NOT NULL,
  PRIMARY KEY(account_id, account_generation)
@@ -440,6 +445,63 @@ class WorkflowStore:
             raise
         finally:
             conn.close()
+
+    def legacy_generation_migration_done(self) -> bool:
+        """True once the one-time pre-fence generation rekey has committed."""
+        with self.connect() as conn:
+            row = conn.execute(
+                "SELECT 1 FROM workflow_migration_markers WHERE key='legacy_generation_migrated'"
+            ).fetchone()
+            return row is not None
+
+    def mark_legacy_generation_migrated(self) -> None:
+        with self.transaction() as conn:
+            conn.execute(
+                "INSERT OR IGNORE INTO workflow_migration_markers(key, created_at) "
+                "VALUES ('legacy_generation_migrated', strftime('%s','now'))"
+            )
+
+    def legacy_generation_accounts(self, legacy_generation: str = "1") -> list[str]:
+        """Distinct account ids that still own pre-fence generation rows."""
+        with self.connect() as conn:
+            rows = conn.execute(
+                "SELECT DISTINCT account_id FROM workflow_definitions "
+                "WHERE account_generation=? AND account_id<>?",
+                (legacy_generation, _LOCAL_ACCOUNT_ID),
+            ).fetchall()
+            return [str(row["account_id"]) for row in rows]
+
+    def rekey_account_generation(
+        self,
+        account_id: str,
+        from_generation: str,
+        to_generation: str,
+    ) -> int:
+        """Atomically move one account's rows between generation fences.
+
+        Used once, at upgrade time, to carry a mobile account's pre-fence
+        "1" rows into its live ``acctgen_*`` generation so the schema upgrade
+        does not orphan them. Every workflow table participates in the same
+        transaction, so a failure leaves the legacy rows exactly where they
+        were for a later retry.
+        """
+        from_generation = str(from_generation or "").strip()
+        to_generation = str(to_generation or "").strip()
+        account_id = str(account_id or "").strip()
+        if not from_generation or not to_generation or from_generation == to_generation:
+            raise ValueError("rekey requires distinct non-empty generations")
+        moved = 0
+        with self.transaction() as conn:
+            # Only the account-scoped tables carry the generation column;
+            # child tables (versions, node runs, …) inherit scope via FKs.
+            for table in _GENERATION_TABLES:
+                cursor = conn.execute(
+                    f"UPDATE {table} SET account_generation=? "
+                    "WHERE account_id=? AND account_generation=?",
+                    (to_generation, account_id, from_generation),
+                )
+                moved += cursor.rowcount if cursor.rowcount > 0 else 0
+        return moved
 
     @staticmethod
     def _scope(scope: WorkflowScope) -> WorkflowScope:

@@ -13,6 +13,10 @@ die() { printf 'install-hermes-studio: %s\n' "$*" >&2; exit 1; }
 
 studio_root="${HERMES_STUDIO_ROOT:-/opt/hermes-studio}"
 studio_repository="${HERMES_STUDIO_REPOSITORY:-https://github.com/EKKOLearnAI/hermes-studio.git}"
+# Pinned revision: reinstalls must produce the code this script was validated
+# against, not whatever origin/HEAD happens to point at that day. Override
+# only with an explicit full commit SHA after validating the new build.
+studio_ref="${HERMES_STUDIO_REF:-4751fd36e3b6fde93e356b2c47b04bfe433722cc}"
 studio_user="${HERMES_STUDIO_USER:-hermes}"
 studio_port="${HERMES_STUDIO_PORT:-8647}"
 nginx_conf="/etc/nginx/conf.d/hermes-studio.conf"
@@ -23,13 +27,15 @@ if ! command -v node >/dev/null 2>&1 || [[ "$(node --version 2>/dev/null | sed '
 fi
 command -v npm >/dev/null 2>&1 || die "npm is required"
 
-# 2. Clone or refresh the studio tree.
+# 2. Clone or refresh the studio tree at the pinned revision.
 if [[ ! -d "${studio_root}/.git" ]]; then
   install -d -o "${studio_user}" -g "${studio_user}" -m 0755 "$(dirname "${studio_root}")"
   sudo -u "${studio_user}" git clone --depth 1 "${studio_repository}" "${studio_root}"
+  sudo -u "${studio_user}" git -C "${studio_root}" fetch --depth 1 origin "${studio_ref}"
+  sudo -u "${studio_user}" git -C "${studio_root}" checkout -q -f "${studio_ref}"
 else
-  sudo -u "${studio_user}" git -C "${studio_root}" fetch --depth 1 origin
-  sudo -u "${studio_user}" git -C "${studio_root}" checkout -q -f origin/HEAD
+  sudo -u "${studio_user}" git -C "${studio_root}" fetch --depth 1 origin "${studio_ref}"
+  sudo -u "${studio_user}" git -C "${studio_root}" checkout -q -f "${studio_ref}"
 fi
 
 # 3. Build (dist/server + web assets).

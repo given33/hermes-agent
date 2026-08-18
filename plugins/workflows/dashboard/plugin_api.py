@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import asyncio
+import logging
+import threading
 from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Any
@@ -26,6 +28,8 @@ from plugins.workflows.models import (
 )
 from plugins.workflows.runtime import WorkflowRuntime
 from plugins.workflows.store import SCHEMA_VERSION, WorkflowStore, default_store_path
+
+logger = logging.getLogger(__name__)
 
 
 _STORE: WorkflowStore | None = None
@@ -113,6 +117,44 @@ class ApprovalBody(BaseModel):
     request_id: str = ""
 
 
+_LEGACY_GENERATION_MIGRATION_LOCK = threading.Lock()
+
+
+def _migrate_legacy_workflow_generations_once() -> None:
+    """One-time rekey of pre-fence generation "1" rows to live generations.
+
+    Rows written before the account-generation fence existed all carry
+    generation "1". Without this pass, every mobile account's workflows
+    vanish at the schema upgrade. The database-level marker makes the pass
+    run exactly once ever: after it commits, an account deletion followed by
+    re-registration starts a clean era and never resurrects old rows.
+    """
+    store = workflow_store()
+    if store.legacy_generation_migration_done():
+        return
+    with _LEGACY_GENERATION_MIGRATION_LOCK:
+        if store.legacy_generation_migration_done():
+            return
+        try:
+            from hermes_cli.dashboard_auth.mobile_device_store import MobileDeviceStore
+
+            device_store = MobileDeviceStore()
+            for account_id in store.legacy_generation_accounts():
+                try:
+                    live = device_store.account_generation(account_id, create=False)
+                except (PermissionError, LookupError, ValueError):
+                    # Unknown or deleting account: leave its legacy rows
+                    # frozen rather than guessing a destination era.
+                    continue
+                if live and live != "1":
+                    store.rekey_account_generation(account_id, "1", live)
+            store.mark_legacy_generation_migrated()
+        except Exception:
+            # A failed pass keeps the marker unset and the legacy rows in
+            # place; the next authenticated request retries the migration.
+            logger.exception("workflow legacy generation migration failed")
+
+
 def _scope(request: Request, profile_id: str) -> WorkflowScope:
     try:
         profile = normalize_profile_name(profile_id or "default")
@@ -131,6 +173,7 @@ def _scope(request: Request, profile_id: str) -> WorkflowScope:
             live_generation = MobileDeviceStore().account_generation(owner_id, create=True)
         except PermissionError as exc:
             raise HTTPException(status_code=410, detail="Account deletion is in progress") from exc
+        _migrate_legacy_workflow_generations_once()
     authenticated_generation = account_generation_from_request(request)
     principal = getattr(getattr(request, "state", None), "token_principal", None)
     if (
