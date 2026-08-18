@@ -202,6 +202,38 @@ def _json_load(value: str | bytes | None, default: Any = None) -> Any:
     return loaded
 
 
+@contextmanager
+def _workflow_schema_init_lock(db_path: Path) -> Iterator[None]:
+    """Cross-process exclusive lock guarding workflow schema initialization."""
+    lock_path = db_path.with_suffix(".init.lock")
+    lock_path.parent.mkdir(parents=True, exist_ok=True)
+    handle = open(lock_path, "a+b")
+    try:
+        if os.name == "nt":
+            import msvcrt
+
+            handle.seek(0)
+            msvcrt.locking(handle.fileno(), msvcrt.LK_LOCK, 1)
+        else:
+            import fcntl
+
+            fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
+        yield
+    finally:
+        try:
+            if os.name == "nt":
+                import msvcrt
+
+                handle.seek(0)
+                msvcrt.locking(handle.fileno(), msvcrt.LK_UNLCK, 1)
+            else:
+                import fcntl
+
+                fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+        finally:
+            handle.close()
+
+
 class WorkflowStore:
     def __init__(self, path: str | Path | None = None, *, audit_key: bytes | None = None):
         self.path = Path(path) if path else default_store_path()
@@ -209,7 +241,12 @@ class WorkflowStore:
         self._audit_key = audit_key or self._load_audit_key()
         if len(self._audit_key) != 32:
             raise ValueError("workflow audit key must be 32 bytes")
-        self._init_schema()
+        # Schema initialization (DDL + migrations) is serialized across
+        # processes with an exclusive sidecar lock: SQLite's own busy timeout
+        # does not stop two processes from racing CREATE TABLE / trigger
+        # creation into "already exists" and "database is locked" failures.
+        with _workflow_schema_init_lock(self.path):
+            self._init_schema()
 
     def _load_audit_key(self) -> bytes:
         configured = os.getenv("HERMES_WORKFLOW_AUDIT_KEY", "").strip()
@@ -237,9 +274,11 @@ class WorkflowStore:
     def connect(self) -> sqlite3.Connection:
         conn = sqlite3.connect(self.path, timeout=30, isolation_level=None)
         conn.row_factory = sqlite3.Row
+        # busy_timeout must precede the journal-mode switch: WAL itself takes
+        # a write lock and can collide with a concurrent opener.
+        conn.execute("PRAGMA busy_timeout=30000")
         conn.execute("PRAGMA foreign_keys=ON")
         conn.execute("PRAGMA journal_mode=WAL")
-        conn.execute("PRAGMA busy_timeout=30000")
         return conn
 
     @staticmethod
@@ -391,6 +430,19 @@ class WorkflowStore:
 
     def _init_schema(self) -> None:
         with self.connect() as conn:
+            # Fail closed on a future schema before touching anything: the
+            # old sequence ran DDL and migrations first and only rejected an
+            # unknown version afterwards, mutating a database this build
+            # cannot safely interpret.
+            existing = conn.execute(
+                "SELECT name FROM sqlite_master WHERE type='table' AND name='workflow_schema'"
+            ).fetchone()
+            if existing is not None:
+                row = conn.execute("SELECT version FROM workflow_schema LIMIT 1").fetchone()
+                if row is not None and int(row["version"]) > SCHEMA_VERSION:
+                    raise RuntimeError(
+                        "workflow database was created by a newer Hermes version"
+                    )
             conn.executescript(SCHEMA)
             deletion_columns = {
                 str(row[1])
@@ -399,18 +451,27 @@ class WorkflowStore:
             if "account_generation" not in deletion_columns:
                 # v1 used account_id as the sole tombstone key. Preserve those
                 # rows as legacy-generation tombstones while allowing a newly
-                # registered account with the same public id to proceed.
-                conn.execute("ALTER TABLE workflow_account_deletions RENAME TO workflow_account_deletions_v1")
-                conn.execute(
-                    "CREATE TABLE workflow_account_deletions("
-                    "account_id TEXT NOT NULL, account_generation TEXT NOT NULL, "
-                    "deleted_at INTEGER NOT NULL, PRIMARY KEY(account_id, account_generation))"
-                )
-                conn.execute(
-                    "INSERT INTO workflow_account_deletions(account_id,account_generation,deleted_at) "
-                    "SELECT account_id,'legacy',deleted_at FROM workflow_account_deletions_v1"
-                )
-                conn.execute("DROP TABLE workflow_account_deletions_v1")
+                # registered account with the same public id to proceed. The
+                # rename/create/copy/drop runs inside ONE transaction: SQLite
+                # DDL is transactional, so a crash mid-migration rolls back to
+                # the intact v1 table instead of an empty canonical one.
+                conn.execute("BEGIN IMMEDIATE")
+                try:
+                    conn.execute("ALTER TABLE workflow_account_deletions RENAME TO workflow_account_deletions_v1")
+                    conn.execute(
+                        "CREATE TABLE workflow_account_deletions("
+                        "account_id TEXT NOT NULL, account_generation TEXT NOT NULL, "
+                        "deleted_at INTEGER NOT NULL, PRIMARY KEY(account_id, account_generation))"
+                    )
+                    conn.execute(
+                        "INSERT INTO workflow_account_deletions(account_id,account_generation,deleted_at) "
+                        "SELECT account_id,'legacy',deleted_at FROM workflow_account_deletions_v1"
+                    )
+                    conn.execute("DROP TABLE workflow_account_deletions_v1")
+                    conn.commit()
+                except BaseException:
+                    conn.rollback()
+                    raise
             if self._generation_schema_needs_rebuild(conn):
                 # PRAGMA foreign_keys must be changed outside an explicit
                 # transaction. The connection is clean after executescript,
@@ -446,19 +507,27 @@ class WorkflowStore:
         finally:
             conn.close()
 
-    def legacy_generation_migration_done(self) -> bool:
-        """True once the one-time pre-fence generation rekey has committed."""
+    def legacy_generation_migration_done(self, account_id: str) -> bool:
+        """True once THIS account's pre-fence generation rekey has committed.
+
+        Per-account state instead of one global marker: an account that had
+        no live generation when the pass first ran (deletion in flight) gets
+        its rekey the next time it resolves a scope, rather than being
+        skipped forever by someone else's marker.
+        """
         with self.connect() as conn:
             row = conn.execute(
-                "SELECT 1 FROM workflow_migration_markers WHERE key='legacy_generation_migrated'"
+                "SELECT 1 FROM workflow_migration_markers WHERE key=?",
+                (f"legacy_generation_migrated:{str(account_id or '').strip()}",),
             ).fetchone()
             return row is not None
 
-    def mark_legacy_generation_migrated(self) -> None:
+    def mark_legacy_generation_migrated(self, account_id: str) -> None:
         with self.transaction() as conn:
             conn.execute(
                 "INSERT OR IGNORE INTO workflow_migration_markers(key, created_at) "
-                "VALUES ('legacy_generation_migrated', strftime('%s','now'))"
+                "VALUES (?, strftime('%s','now'))",
+                (f"legacy_generation_migrated:{str(account_id or '').strip()}",),
             )
 
     def legacy_generation_accounts(self, legacy_generation: str = "1") -> list[str]:
@@ -470,6 +539,19 @@ class WorkflowStore:
                 (legacy_generation, _LOCAL_ACCOUNT_ID),
             ).fetchall()
             return [str(row["account_id"]) for row in rows]
+
+    def account_has_generation_tombstone(
+        self,
+        account_id: str,
+        account_generation: str,
+    ) -> bool:
+        with self.connect() as conn:
+            row = conn.execute(
+                "SELECT 1 FROM workflow_account_deletions "
+                "WHERE account_id=? AND account_generation=?",
+                (account_id, account_generation),
+            ).fetchone()
+            return row is not None
 
     def rekey_account_generation(
         self,
@@ -492,9 +574,24 @@ class WorkflowStore:
             raise ValueError("rekey requires distinct non-empty generations")
         moved = 0
         with self.transaction() as conn:
+            # A tombstone in the SOURCE generation means that era was
+            # explicitly deleted: rekeying it would both resurrect deleted
+            # content into the live era AND mark the live era as deleted.
+            # Frozen tombstones keep deletion isolation intact.
+            tombstone = conn.execute(
+                "SELECT 1 FROM workflow_account_deletions "
+                "WHERE account_id=? AND account_generation=?",
+                (account_id, from_generation),
+            ).fetchone()
+            if tombstone is not None:
+                return 0
             # Only the account-scoped tables carry the generation column;
             # child tables (versions, node runs, …) inherit scope via FKs.
+            # workflow_account_deletions is deliberately excluded: tombstones
+            # stay at the generation they were recorded under.
             for table in _GENERATION_TABLES:
+                if table == "workflow_account_deletions":
+                    continue
                 cursor = conn.execute(
                     f"UPDATE {table} SET account_generation=? "
                     "WHERE account_id=? AND account_generation=?",

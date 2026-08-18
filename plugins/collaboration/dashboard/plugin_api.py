@@ -29,6 +29,7 @@ import subprocess
 import sys
 import threading
 import time
+from datetime import datetime, timezone
 import uuid
 from pathlib import Path
 from typing import Any, Callable, Optional
@@ -47,7 +48,7 @@ bootstrap_trusted_runtime()
 
 from fastapi import APIRouter, Depends, Header, HTTPException, Request
 from fastapi.responses import FileResponse, Response, StreamingResponse
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
 
 logger = logging.getLogger(__name__)
 
@@ -480,7 +481,33 @@ async def collaboration_dashboard_lifespan(_app):
         )
 
 
-router = APIRouter(lifespan=collaboration_dashboard_lifespan)
+async def _enforce_active_account_generation(request: Request) -> None:
+    """Router-wide stale-generation fence (P1-15).
+
+    Owner-mobile bearer tokens carry the generation they were minted for.
+    Routes that resolve records by owner alone previously let a token from a
+    previous account era act on the re-registered account's live records.
+    Enforcing principal-generation == live-generation here, for every route
+    on this router, closes that uniformly; cookie sessions ("legacy") and
+    connector-token requests (no mobile principal) are unaffected, exactly
+    matching the per-route `_account_generation_for_request` semantics.
+    """
+
+    principal = getattr(getattr(request, "state", None), "token_principal", None)
+    if getattr(principal, "provider", "") != "owner-mobile":
+        return
+    owner_id = owner_id_from_request(request)
+    if not owner_id:
+        return
+    live_generation = _account_generation_for_owner(owner_id)
+    if account_generation_from_request(request) != live_generation:
+        raise HTTPException(status_code=410, detail="Account generation is no longer active")
+
+
+router = APIRouter(
+    lifespan=collaboration_dashboard_lifespan,
+    dependencies=[Depends(_enforce_active_account_generation)],
+)
 
 
 class _AccountStateLock:
@@ -1503,9 +1530,35 @@ def _connector_token_values(value: Any) -> tuple[list[str], dict[str, Any]]:
             or ""
         ).strip()
         tokens = [token for token in (current, previous) if token]
-        metadata = {str(key): item for key, item in value.items() if key not in {"token", "current", "current_token", "previous", "previous_token", "old_token"}}
+        # expires_at applies to the whole rotation record: past that moment
+        # neither secret authenticates anymore, regardless of string match.
+        expiry = _parse_connector_token_expiry(value.get("expires_at"))
+        if expiry is not None and time.time() >= expiry:
+            tokens = []
+        metadata = {str(key): item for key, item in value.items() if key not in {"token", "current", "current_token", "previous", "previous_token", "old_token", "expires_at"}}
         return tokens, metadata
     return [], {}
+
+
+def _parse_connector_token_expiry(value: Any) -> Optional[float]:
+    """Parse an expires_at field as epoch seconds or an ISO-8601 timestamp."""
+
+    if value is None:
+        return None
+    if isinstance(value, (int, float)) and not isinstance(value, bool):
+        return float(value)
+    text = str(value).strip()
+    if not text:
+        return None
+    if re.fullmatch(r"-?\d+(?:\.\d+)?", text):
+        return float(text)
+    try:
+        parsed = datetime.fromisoformat(text.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    return parsed.timestamp()
 
 
 def _configured_connector_token_records() -> dict[str, dict[str, Any]]:
@@ -3792,10 +3845,62 @@ def delete_owner_account_data(
             ):
                 removed_rooms += 1
                 continue
+            # The deleted account may still live inside rooms owned by OTHER
+            # accounts (joined via invite): scrub its membership, typing
+            # presence, and direct mailbox traffic so a same-id re-registration
+            # can never resurrect the old era's membership.
+            members = [
+                member
+                for member in (room.get("members") or [])
+                if not (
+                    isinstance(member, dict)
+                    and str(member.get("user_id") or "").strip() == normalized_owner
+                )
+            ]
+            if len(members) != len(room.get("members") or []):
+                room["members"] = members
+            typing = room.get("typing") if isinstance(room.get("typing"), dict) else {}
+            if typing.pop(normalized_owner, None) is not None:
+                room["typing"] = typing
+            mailbox = room.get("mailbox")
+            if isinstance(mailbox, list):
+                room["mailbox"] = [
+                    item
+                    for item in mailbox
+                    if not (
+                        isinstance(item, dict)
+                        and normalized_owner in {
+                            str(item.get("sender_id") or "").strip(),
+                            str(item.get("recipient_id") or "").strip(),
+                        }
+                    )
+                ]
             kept_rooms.append(room)
         room_state["rooms"] = kept_rooms
         with _collaboration_deletion_write():
             save_state(room_state)
+
+    # Terminate live hosted state for every removed conversation: gateway
+    # session leases, and any queued completion pushes. Persisted tombstones
+    # already request cancellation; this releases the in-memory footprint so
+    # nothing from the deleted era keeps running in the background.
+    for conversation_id in conversation_ids:
+        if not conversation_id:
+            continue
+        try:
+            release_hosted_gateway_conversation(
+                conversation_id,
+                owner_id=normalized_owner,
+                account_generation=normalized_generation,
+            )
+        except Exception:
+            # Release is best-effort; the persisted deletion tombstone stays
+            # authoritative for any straggler discovered by a later retry.
+            logger.exception(
+                "hosted gateway release failed during account deletion for %s",
+                conversation_id,
+            )
+        _notify_hosted_update(conversation_id)
 
     return {
         "conversations": len(conversation_ids),
@@ -17381,19 +17486,29 @@ class HostedTurnBody(BaseModel):
 
 
 class EnqueueHostedTurnBody(BaseModel):
-    request_id: str
-    turn_id: str
+    request_id: str = Field(max_length=256)
+    turn_id: str = Field(max_length=256)
     message: dict[str, Any]
-    recent_messages: list[dict[str, Any]] = Field(default_factory=list)
-    profiles: list[str] = Field(default_factory=list)
-    attachment_ids: list[str] = Field(default_factory=list)
-    attachment_context: str = ""
-    delivery_context: str = ""
-    required_provider: str = ""
-    required_model: str = ""
+    recent_messages: list[dict[str, Any]] = Field(default_factory=list, max_length=200)
+    profiles: list[str] = Field(default_factory=list, max_length=64)
+    attachment_ids: list[str] = Field(default_factory=list, max_length=32)
+    attachment_context: str = Field(default="", max_length=64_000)
+    delivery_context: str = Field(default="", max_length=64_000)
+    required_provider: str = Field(default="", max_length=128)
+    required_model: str = Field(default="", max_length=256)
     create_conversation_if_missing: bool = False
-    conversation_profile: str = "default"
-    conversation_title: str = ""
+    conversation_profile: str = Field(default="default", max_length=128)
+    conversation_title: str = Field(default="", max_length=500)
+
+    @field_validator("message")
+    @classmethod
+    def _bound_message_size(cls, value: dict[str, Any]) -> dict[str, Any]:
+        # The nested message dict has no per-field schema; bound its
+        # serialized size so a single request cannot hold the global state
+        # lock with a multi-megabyte payload.
+        if len(json.dumps(value, ensure_ascii=False, default=str)) > 400_000:
+            raise ValueError("message payload is too large")
+        return value
 
 
 class HostedTurnCancellationBody(BaseModel):
@@ -17618,7 +17733,10 @@ def connector_get_run(remote_run_id: str, request: Request):
     _conversation, _hosted, remote_run = _remote_run_for_connector(
         request,
         remote_run_id,
-        enforce_account_boundary=False,
+        # The reconciliation view carries the same goal/context payload as
+        # the pull, so it must enforce the identical account-generation
+        # boundary — a deleted-era run is a conflict, not readable state.
+        enforce_account_boundary=True,
     )
     return {"run": _remote_run_connector_payload(remote_run)}
 
@@ -22725,15 +22843,15 @@ def _accessible_room_in_state(
         if str(room.get("owner_id") or "") == owner_id or _room_is_member(room, owner_id):
             return room
     # Members reach rooms owned by another account: the invite code created a
-    # durable membership entry. The room's own generation fence still applies.
+    # durable membership entry. The CALLER's generation is their own active
+    # fence; the room record carries the OWNER's era, which a member must
+    # never be required to match — that comparison made every joined room
+    # 404 for members of a different-generation owner.
     for candidate in state.get("rooms") or []:
         if not isinstance(candidate, dict) or candidate.get("id") != room_id:
             continue
         if not _room_is_member(candidate, owner_id):
             continue
-        stored_generation = str(candidate.get("account_generation") or "").strip()
-        if stored_generation and stored_generation != account_generation:
-            raise HTTPException(status_code=404, detail="Room not found")
         return candidate
     raise HTTPException(status_code=404, detail="Room not found")
 
@@ -22819,12 +22937,17 @@ def _room_workspace_root(room: dict[str, Any]) -> Path:
     return root
 
 
-def _room_workspace_child(room: dict[str, Any], relative: str) -> Path:
+def _room_workspace_child(room: dict[str, Any], relative: str, *, allow_root: bool = False) -> Path:
     root = _room_workspace_root(room)
     cleaned = str(relative or "").strip().replace("\\", "/").lstrip("/")
     parts = [part for part in cleaned.split("/") if part not in {"", ".", ".."}]
     if not parts:
-        return root
+        if allow_root:
+            return root
+        # The root itself is only addressable by read/list operations; a
+        # resolved-to-root delete/rmtree must be refused, not interpreted as
+        # "delete the whole workspace".
+        raise HTTPException(status_code=400, detail="Workspace path is required")
     try:
         return _contained_storage_path(root, *parts)
     except ValueError as exc:
@@ -23407,8 +23530,32 @@ def clear_room_context(room_id: str, request: Request):
             )
             if isinstance(conversation, dict):
                 conversation["messages"] = []
+                conversation["session_entries"] = []
+                conversation["session_entry_cursor"] = 0
+                conversation["session_entry_leaf_id"] = ""
+                conversation["history_message_count"] = 0
+                conversation["history_last_message"] = None
+                conversation["history_session_entry_count"] = 0
+                conversation["history_complete"] = True
                 conversation["updated_at"] = int(time.time() * 1000)
                 save_single_state(single_state)
+            # The retained history sidecar is the durable transcript: without
+            # removing it, the very next detail read re-hydrates everything
+            # the caller just asked to clear.
+            sidecar = _conversation_history_path(conversation_id)
+            if sidecar is not None:
+                try:
+                    sidecar.unlink()
+                except FileNotFoundError:
+                    pass
+                except OSError as exc:
+                    raise HTTPException(
+                        status_code=503,
+                        detail={
+                            "reason": "room_clear_pending",
+                            "message": "Room history clear is pending; retry.",
+                        },
+                    ) from exc
         room["mailbox"] = []
         _touch_room(room)
         save_state(state)
@@ -23424,7 +23571,7 @@ def list_room_workspace_files(room_id: str, request: Request, path: str = ""):
     with _STATE_LOCK:
         state = load_state()
         room = _accessible_room_in_state(state, room_id, owner_id, account_generation)
-        target = _room_workspace_child(room, path)
+        target = _room_workspace_child(room, path, allow_root=True)
     if not target.is_dir():
         raise HTTPException(status_code=404, detail="Workspace path not found")
     return _workspace_listing(target)
@@ -25898,11 +26045,13 @@ def _mobile_write_approval_context(
     plan: Optional[dict[str, Any]] = None,
 ) -> Any:
     from hermes_constants import reset_hermes_home_override, set_hermes_home_override
-    from tools import write_approval as wa
 
     normalized, home = _mobile_profile_home(profile)
+    # The pending/apply paths resolve through get_hermes_home(), so the home
+    # override below is the owner+profile scope: the legacy
+    # set/reset_write_approval_scope helpers no longer exist upstream and
+    # calling them aborted every approval with AttributeError.
     owner_id = str(record["owner_id"])
-    scope_tokens = wa.set_write_approval_scope(owner_id, normalized)
     home_token = set_hermes_home_override(str(home))
     try:
         from hermes_cli.account_write_approval_apply import (
@@ -25919,7 +26068,6 @@ def _mobile_write_approval_context(
         return False, str(exc)
     finally:
         reset_hermes_home_override(home_token)
-        wa.reset_write_approval_scope(scope_tokens)
 
 
 def _finish_mobile_write_approval_claim(

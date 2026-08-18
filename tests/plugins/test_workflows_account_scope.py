@@ -145,7 +145,7 @@ def test_legacy_generation_rows_rekey_once_to_live_generation(tmp_path, monkeypa
     )
     assert store.list_definitions(WorkflowScope("alice", "acctgen-live", "default")) == []
     assert store.legacy_generation_accounts() == ["alice"]
-    assert not store.legacy_generation_migration_done()
+    assert not store.legacy_generation_migration_done("alice")
 
     generations = iter(["acctgen-live", "acctgen-live"])
 
@@ -166,7 +166,7 @@ def test_legacy_generation_rows_rekey_once_to_live_generation(tmp_path, monkeypa
     migrated = store.list_definitions(WorkflowScope("alice", "acctgen-live", "default"))
     assert [d["name"] for d in migrated] == ["legacy"]
     assert store.list_definitions(legacy_scope) == []
-    assert store.legacy_generation_migration_done()
+    assert store.legacy_generation_migration_done("alice")
 
     # After the marker commits, a later era (account reset → new generation)
     # must never resurrect or re-key the old rows again.

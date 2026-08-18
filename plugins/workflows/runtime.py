@@ -45,7 +45,10 @@ class KanbanWorkflowAdapter:
                     if config.get("workspace_path") is not None
                     else None
                 ),
-                tenant=f"workflow:{intent['account_id']}",
+                # The tenant key carries the account generation: an account
+                # deleted and re-registered with the same public id must not
+                # land its workflow tasks in the previous era's tenant board.
+                tenant=f"workflow:{intent['account_id']}:{intent.get('account_generation', '')}",
                 # The Workflow runtime releases this gate only after the
                 # encrypted pre-execution snapshot is durable.
                 initial_status="blocked",

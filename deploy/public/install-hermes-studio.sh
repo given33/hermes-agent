@@ -11,6 +11,19 @@ umask 077
 die() { printf 'install-hermes-studio: %s\n' "$*" >&2; exit 1; }
 [[ "$(id -u)" == 0 ]] || die "must run as root"
 
+# Every override below is interpolated into root-owned systemd/nginx config:
+# reject anything outside a conservative allowlist so a hostile environment
+# variable cannot inject new directives into either file.
+_validate_config_value() {
+  local label="$1" value="$2"
+  [[ "$value" =~ ^[A-Za-z0-9._/:@+-]+$ ]] || die "invalid ${label}: must match [A-Za-z0-9._/:@+-]+"
+}
+_validate_config_value "HERMES_STUDIO_ROOT" "${HERMES_STUDIO_ROOT:-/opt/hermes-studio}"
+_validate_config_value "HERMES_STUDIO_USER" "${HERMES_STUDIO_USER:-hermes}"
+_validate_config_value "HERMES_STUDIO_PORT" "${HERMES_STUDIO_PORT:-8647}"
+_validate_config_value "HERMES_STUDIO_REF" "${HERMES_STUDIO_REF:-4751fd36e3b6fde93e356b2c47b04bfe433722cc}"
+_validate_config_value "HERMES_STUDIO_REPOSITORY" "${HERMES_STUDIO_REPOSITORY:-https://github.com/EKKOLearnAI/hermes-studio.git}"
+
 studio_root="${HERMES_STUDIO_ROOT:-/opt/hermes-studio}"
 studio_repository="${HERMES_STUDIO_REPOSITORY:-https://github.com/EKKOLearnAI/hermes-studio.git}"
 # Pinned revision: reinstalls must produce the code this script was validated
