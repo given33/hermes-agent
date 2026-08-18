@@ -3540,27 +3540,6 @@ class PluginManager:
         # function with the slack_bolt signature ``(ack, body, action)``.
         self._slack_action_handlers: List[tuple] = []
         self._plugin_scopes: Dict[str, EffectScope] = {}
-
-    def _dispose_plugin_scopes(self) -> None:
-        """Dispose old plugin registrations before a force reload."""
-
-        errors: list[BaseException] = []
-        for plugin_id, scope in list(self._plugin_scopes.items()):
-            try:
-                scope.close_sync()
-            except BaseException as exc:
-                errors.append(exc)
-                logger.error(
-                    "Plugin effect scope failed to close during reload: %s",
-                    plugin_id,
-                    exc_info=True,
-                )
-        self._plugin_scopes.clear()
-        if errors:
-            logger.error(
-                "Plugin reload completed with %d disposer error(s); see effect scope logs",
-                len(errors),
-            )
         # Registration handles are kept both per plugin (ownership lookup) and
         # globally (reverse-order teardown for overrides spanning plugins).
         #
@@ -3586,6 +3565,27 @@ class PluginManager:
         # full plugin loads.
         self._predeclared_modules: Dict[str, types.ModuleType] = {}
         self._predeclared_tools: Dict[str, List[str]] = {}
+
+    def _dispose_plugin_scopes(self) -> None:
+        """Dispose old plugin registrations before a force reload."""
+
+        errors: list[BaseException] = []
+        for plugin_id, scope in list(self._plugin_scopes.items()):
+            try:
+                scope.close_sync()
+            except BaseException as exc:
+                errors.append(exc)
+                logger.error(
+                    "Plugin effect scope failed to close during reload: %s",
+                    plugin_id,
+                    exc_info=True,
+                )
+        self._plugin_scopes.clear()
+        if errors:
+            logger.error(
+                "Plugin reload completed with %d disposer error(s); see effect scope logs",
+                len(errors),
+            )
 
     # -----------------------------------------------------------------------
     # Registration ledger internals
