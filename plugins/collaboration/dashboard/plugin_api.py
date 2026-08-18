@@ -905,18 +905,49 @@ class _SlidingWindowRateLimiter:
     budget or connector worker threads even when the proxy is absent.
     """
 
+    # A caller can create an arbitrary number of owner/IP/connector keys.  A
+    # plain dict with no bound would therefore turn this defence into a small
+    # memory-exhaustion surface on a long-running public deployment.  Keep a
+    # generous cap and evict expired/oldest buckets only when it is reached;
+    # normal traffic never pays an O(n) cleanup cost.
+    _MAX_KEYS = 8_192
+
     def __init__(self, max_events: int, window_seconds: float) -> None:
         self.max_events = max(1, int(max_events))
         self.window_seconds = max(0.1, float(window_seconds))
         self._hits: dict[str, deque[float]] = defaultdict(deque)
         self._lock = threading.Lock()
 
+    def _bound_keys_locked(self, now: float) -> None:
+        if len(self._hits) < self._MAX_KEYS:
+            return
+        cutoff = now - self.window_seconds
+        expired = [
+            key
+            for key, bucket in self._hits.items()
+            if not bucket or bucket[-1] <= cutoff
+        ]
+        for key in expired:
+            self._hits.pop(key, None)
+        if len(self._hits) < self._MAX_KEYS:
+            return
+        # All remaining buckets have a live hit. Evict the least-recently-hit
+        # key so a burst of unique addresses cannot grow the process forever.
+        oldest_key = min(
+            self._hits,
+            key=lambda key: self._hits[key][-1] if self._hits[key] else float("-inf"),
+        )
+        self._hits.pop(oldest_key, None)
+
     def allow(self, key: str, *, cost: int = 1) -> bool:
         if cost < 1:
             cost = 1
         now = time.monotonic()
         with self._lock:
-            bucket = self._hits[str(key or "")]
+            normalized_key = str(key or "")
+            if normalized_key not in self._hits:
+                self._bound_keys_locked(now)
+            bucket = self._hits[normalized_key]
             while bucket and bucket[0] <= now - self.window_seconds:
                 bucket.popleft()
             if len(bucket) + cost > self.max_events:
@@ -1532,20 +1563,28 @@ def _connector_identity(request: Request) -> str:
     claimed = str(request.headers.get("x-connector-id") or "").strip()[:128]
     if not supplied or not claimed:
         return ""
-    record = _configured_connector_token_records().get(claimed)
-    if record is None:
-        # Backwards compatibility with tests/older deployments that only
-        # override the flat current-token map.
-        current = _configured_connector_tokens().get(claimed, "")
-        expected_tokens = [current] if current else []
-    else:
+    records = _configured_connector_token_records()
+    matches: set[str] = set()
+    for connector_id, record in records.items():
         expected_tokens = record.get("tokens") or []
-    if any(
-        token and hmac.compare_digest(supplied, token)
-        for token in expected_tokens
-    ):
-        return claimed
-    return ""
+        if any(
+            token and hmac.compare_digest(supplied, token)
+            for token in expected_tokens
+        ):
+            matches.add(str(connector_id))
+
+    # Backwards compatibility with tests/older deployments that only expose
+    # the flat current-token map.  In normal production configuration this is
+    # derived from ``records`` and adds no extra entries.  We still collect all
+    # matches rather than checking only the claimed id: a token accidentally
+    # assigned to two devices must fail closed instead of allowing the caller
+    # to select either device with X-Connector-ID.
+    for connector_id, expected in _configured_connector_tokens().items():
+        if expected and hmac.compare_digest(supplied, expected):
+            matches.add(str(connector_id))
+    if len(matches) != 1 or claimed not in matches:
+        return ""
+    return claimed
 
 
 def _connector_authorized(request: Request) -> bool:
@@ -1677,19 +1716,53 @@ def safe_attachment_name(filename: str) -> str:
     return name
 
 
+_CONVERSATION_ID_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,249}")
+_WINDOWS_RESERVED_COMPONENTS = frozenset(
+    {"CON", "PRN", "AUX", "NUL"}
+    | {f"COM{index}" for index in range(1, 10)}
+    | {f"LPT{index}" for index in range(1, 10)}
+)
+
+
+def _safe_conversation_id(conversation_id: str) -> str:
+    """Return an id that is safe to use as one filesystem path component."""
+
+    raw = str(conversation_id or "")
+    normalized = raw.strip()
+    windows_stem = normalized.split(".", 1)[0].upper()
+    if (
+        not normalized
+        or normalized != raw
+        or not _CONVERSATION_ID_RE.fullmatch(normalized)
+        or normalized in {".", ".."}
+        or normalized[-1] in ". "
+        or windows_stem in _WINDOWS_RESERVED_COMPONENTS
+    ):
+        raise ValueError("Invalid conversation_id")
+    return normalized
+
+
+def _contained_storage_path(root: Path, *components: str) -> Path:
+    """Resolve a storage child and reject component or external-symlink escapes."""
+
+    resolved_root = Path(root).resolve()
+    target = resolved_root.joinpath(*components).resolve()
+    if target == resolved_root or not target.is_relative_to(resolved_root):
+        raise ValueError("Storage path escapes its root")
+    return target
+
+
 def conversation_files_root(conversation_id: str) -> Path:
-    return (
-        Path(get_hermes_home())
-        / "collaboration"
-        / "files"
-        / conversation_id
-    )
+    normalized = _safe_conversation_id(conversation_id)
+    base = Path(get_hermes_home()) / "collaboration" / "files"
+    return _contained_storage_path(base, normalized)
 
 
 def _conversation_file_dir(conversation_id: str, bucket: str) -> Path:
     if bucket not in _ATTACHMENT_BUCKETS:
         raise HTTPException(status_code=404, detail="附件目录不存在")
-    target = conversation_files_root(conversation_id) / bucket
+    root = conversation_files_root(conversation_id)
+    target = _contained_storage_path(root, bucket)
     target.mkdir(parents=True, exist_ok=True)
     return target
 
@@ -1699,7 +1772,9 @@ def _hosted_turn_output_dir(conversation_id: str, turn_id: str) -> Path:
     if not normalized_turn_id:
         raise ValueError("turn_id is required")
     turn_key = hashlib.sha256(normalized_turn_id.encode("utf-8")).hexdigest()[:32]
-    target = _conversation_file_dir(conversation_id, "outputs") / "turns" / turn_key
+    output_root = _conversation_file_dir(conversation_id, "outputs")
+    turns_root = _contained_storage_path(output_root, "turns")
+    target = _contained_storage_path(turns_root, turn_key)
     target.mkdir(parents=True, exist_ok=True)
     return target
 
@@ -2775,22 +2850,22 @@ _ARCHIVE_RESTORE_GRACE_SECONDS = 3600
 def _conversation_history_path(conversation_id: str) -> Optional[Path]:
     """Return the sidecar used to retain history beyond the hot-state cap."""
 
-    normalized = str(conversation_id or "").strip()
-    # Conversation IDs are server-generated, but keep the sidecar path
-    # contained even when a legacy/imported record contains a path separator.
-    if (
-        not normalized
-        or normalized in {".", ".."}
-        or Path(normalized).name != normalized
-        or "\x00" in normalized
-    ):
+    try:
+        normalized = _safe_conversation_id(conversation_id)
+        root = conversation_files_root(normalized)
+        return _contained_storage_path(root, "history.json")
+    except ValueError:
         return None
-    return conversation_files_root(normalized) / "history.json"
 
 
 def _conversation_history_meta_path(conversation_id: str) -> Optional[Path]:
     target = _conversation_history_path(conversation_id)
-    return target.with_name("history.meta.json") if target is not None else None
+    if target is None:
+        return None
+    try:
+        return _contained_storage_path(target.parent, "history.meta.json")
+    except ValueError:
+        return None
 
 
 def _history_item_key(item: Any, index: int) -> str:
@@ -3124,15 +3199,14 @@ def _archive_root() -> Path:
 
 
 def _conversation_archive_path(conversation_id: str) -> Optional[Path]:
-    normalized = str(conversation_id or "").strip()
-    if (
-        not normalized
-        or normalized in {".", ".."}
-        or Path(normalized).name != normalized
-        or "\x00" in normalized
-    ):
+    try:
+        normalized = _safe_conversation_id(conversation_id)
+    except ValueError:
         return None
-    return _archive_root() / f"{normalized}.json"
+    try:
+        return _contained_storage_path(_archive_root(), f"{normalized}.json")
+    except ValueError:
+        return None
 
 
 def _conversation_terminal(conversation: dict[str, Any]) -> bool:
@@ -19132,9 +19206,18 @@ def create_single_chat(payload: CreateSingleConversationBody, request: Request =
         raise HTTPException(status_code=400, detail="Hermes Profile 不存在")
     owner_id = owner_id_from_request(request)
     account_generation = _account_generation_for_owner(owner_id)
-    client_id = payload.client_id.strip()
-    if client_id and not re.fullmatch(r"chat_[A-Za-z0-9._:-]{8,251}", client_id):
-        raise HTTPException(status_code=422, detail="Invalid client_id")
+    raw_client_id = str(payload.client_id or "")
+    client_id = raw_client_id.strip()
+    if raw_client_id:
+        try:
+            _safe_conversation_id(client_id)
+        except ValueError as exc:
+            raise HTTPException(status_code=422, detail="Invalid client_id") from exc
+        if (
+            client_id != raw_client_id
+            or not re.fullmatch(r"chat_[A-Za-z0-9._-]{8,245}", client_id)
+        ):
+            raise HTTPException(status_code=422, detail="Invalid client_id")
     with _STATE_LOCK:
         state = load_single_state()
         if client_id:
@@ -20355,6 +20438,10 @@ def enqueue_hosted_turn(
     payload: EnqueueHostedTurnBody,
     request: Request,
 ):
+    try:
+        conversation_id = _safe_conversation_id(conversation_id)
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
     request_id = payload.request_id.strip()[:256]
     turn_id = payload.turn_id.strip()[:256]
     if not request_id:
@@ -21712,7 +21799,7 @@ def _finalize_pending_conversation_deletion(conversation_id: str) -> bool:
                 shutil.rmtree(files_root)
             if files_root.exists():
                 return False
-        except OSError:
+        except (OSError, ValueError):
             return False
         archive_target = _conversation_archive_path(conversation_id)
         if archive_target is None:
@@ -24250,7 +24337,14 @@ def _mobile_conversation_session(
         ).strip()
         if claimed:
             save_single_state(state)
-        snapshot = json.loads(json.dumps(conversation, ensure_ascii=False))
+        # Copy the bounded hot row while it is stable, but do not perform the
+        # sidecar read/JSON decode under the account-wide state lock.
+        snapshot = deepcopy(conversation)
+    # Branch/session-state routes are detailed reads.  The durable sidecar owns
+    # the full transcript beyond the bounded hot tail, and its atomic replace
+    # makes this lock-free read safe.  Hydrating here keeps a long transcript
+    # from blocking unrelated conversation writes.
+    snapshot = _hydrate_conversation_history(snapshot)
     if not session_id:
         raise HTTPException(status_code=409, detail="Conversation has no runtime session")
     try:
@@ -24270,7 +24364,8 @@ def _mobile_conversation_session(
                 )
                 set_conversation_runtime_session(current, normalized, resolved)
                 save_single_state(state)
-                snapshot = json.loads(json.dumps(current, ensure_ascii=False))
+                snapshot = deepcopy(current)
+            snapshot = _hydrate_conversation_history(snapshot)
             session_id = resolved
         return owner_id, normalized, session_id, facade, snapshot
     except HTTPException:
@@ -24359,6 +24454,7 @@ def mobile_fork_conversation_message(
     owner_id, normalized, _current_session_id, _facade, conversation = (
         _mobile_conversation_session(request, conversation_id, body.profile)
     )
+    account_generation = _account_generation_for_request(request, owner_id)
     messages = [
         item
         for item in conversation.get("messages") or []
@@ -24425,6 +24521,7 @@ def mobile_fork_conversation_message(
                 {
                     "id": child_conversation_id,
                     "owner_id": owner_id,
+                    "account_generation": account_generation,
                     "parent_conversation_id": conversation_id,
                     "branch_point_message_id": message_id,
                     "branch_source_session_id": source_session_id,

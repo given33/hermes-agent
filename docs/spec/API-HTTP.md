@@ -281,7 +281,7 @@ WS 认证（`_ws_auth_reason` L17242-17328）：回环模式 `?token=<_SESSION_T
 | GET | `/profiles` | 11039 | 可路由 profile 列表 | — |
 | POST | `/route` | 11044 | 消息→profile 分类（路由模型） | 422 |
 | GET | `/single/conversations` | 11107 | 会话列表（owner 作用域） | — |
-| POST | `/single/conversations` | 11149 | 创建（client_id 幂等;正则 `chat_[A-Za-z0-9._:-]{8,251}`） | 400、422 |
+| POST | `/single/conversations` | 11149 | 创建（client_id 幂等；跨平台文件名安全正则 `chat_[A-Za-z0-9._-]{8,245}`） | 400、422 |
 | POST | `/single/conversations/adopt` | 11186 | 收编既有 CLI 会话 | 400/422 |
 | GET | `/single/conversations/{id}` | 11230 | 详情 + 消息 | 404 |
 | PATCH | `/single/conversations/{id}` | 11254 | 重命名 | 400/404 |

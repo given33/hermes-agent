@@ -110,6 +110,121 @@ def test_hosted_route_does_not_treat_text_false_as_artifact_request():
     assert artifact_required is False
 
 
+def test_mobile_conversation_session_hydrates_full_history(monkeypatch):
+    module = load_module()
+    conversation = module.create_single_conversation("default", "History")
+    conversation.update(
+        {
+            "id": "chat-history",
+            "owner_id": "owner-a",
+            "account_generation": "generation-a",
+            "runtime_sessions": {"default": "session-a"},
+            "messages": [{"id": "message-hot", "role": "assistant", "content": "hot"}],
+        }
+    )
+    state = {"conversations": [conversation]}
+    monkeypatch.setattr(module, "_STATE_LOCK", threading.RLock())
+    monkeypatch.setattr(module, "owner_id_from_request", lambda _request: "owner-a")
+    monkeypatch.setattr(module, "_account_generation_for_owner", lambda _owner: "generation-a")
+    monkeypatch.setattr(module, "load_single_state", lambda: state)
+    monkeypatch.setattr(module, "save_single_state", lambda _state: None)
+    monkeypatch.setattr(
+        module,
+        "_hydrate_conversation_history",
+        lambda value: {
+            **value,
+            "messages": [
+                {"id": "message-old", "role": "user", "content": "old"},
+                *value["messages"],
+            ],
+            "history_complete": True,
+        },
+    )
+    facade = SimpleNamespace(
+        db=SimpleNamespace(resolve_resume_session_id=lambda session_id: session_id)
+    )
+    monkeypatch.setattr(
+        module,
+        "_mobile_session_facade",
+        lambda _request, _profile, _session_id: ("owner-a", "default", facade),
+    )
+
+    *_binding, snapshot = module._mobile_conversation_session(
+        SimpleNamespace(), "chat-history"
+    )
+
+    assert [item["id"] for item in snapshot["messages"]] == [
+        "message-old",
+        "message-hot",
+    ]
+    assert snapshot["history_complete"] is True
+
+
+def test_mobile_conversation_fork_captures_account_generation(monkeypatch):
+    module = load_module()
+    source = {
+        "id": "chat-source",
+        "profile": "default",
+        "messages": [
+            {
+                "id": "message-source",
+                "role": "user",
+                "content": "branch here",
+                "meta": {
+                    "runtime_session_id": "session-source",
+                    "runtime_message_id": 7,
+                },
+            }
+        ],
+    }
+    facade = SimpleNamespace(
+        context=lambda **_kwargs: {"tip_message_id": 9},
+        fork=lambda **_kwargs: {
+            "session": {"id": "session-child", "title": "Branch"},
+            "replayed": False,
+        },
+        bind_existing=lambda **_kwargs: True,
+    )
+    state = {"conversations": []}
+    monkeypatch.setattr(module, "_STATE_LOCK", threading.RLock())
+    monkeypatch.setattr(
+        module,
+        "_mobile_conversation_session",
+        lambda *_args, **_kwargs: (
+            "owner-a",
+            "default",
+            "session-source",
+            facade,
+            source,
+        ),
+    )
+    monkeypatch.setattr(
+        module,
+        "_mobile_session_facade",
+        lambda *_args, **_kwargs: ("owner-a", "default", facade),
+    )
+    monkeypatch.setattr(
+        module,
+        "_account_generation_for_request",
+        lambda _request, _owner: "generation-a",
+    )
+    monkeypatch.setattr(module, "load_single_state", lambda: state)
+    monkeypatch.setattr(module, "save_single_state", lambda _state: None)
+
+    result = module.mobile_fork_conversation_message(
+        "chat-source",
+        "message-source",
+        module.MobileConversationForkBody(
+            idempotency_key="fork-request-123",
+        ),
+        SimpleNamespace(),
+    )
+
+    assert result["created"] is True
+    assert result["conversation"]["account_generation"] == "generation-a"
+    assert state["conversations"][0]["account_generation"] == "generation-a"
+
+
 def review_control(
     verdict: str = "PASS",
     *,

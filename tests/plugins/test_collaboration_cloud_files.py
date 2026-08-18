@@ -1886,6 +1886,46 @@ def test_connector_credentials_and_profiles_are_bound_to_devices(tmp_path, monke
         assert hidden.status_code == 404
 
 
+def test_connector_identity_rejects_a_secret_bound_to_multiple_devices(monkeypatch):
+    """A duplicated connector secret must not be selectable by header."""
+
+    module = _load_module()
+    monkeypatch.setattr(
+        module,
+        "_configured_connector_token_records",
+        lambda: {
+            "dbb3-primary": {"tokens": ["shared-secret"]},
+            "pc-primary": {"tokens": ["shared-secret"]},
+        },
+    )
+    monkeypatch.setattr(
+        module,
+        "_configured_connector_tokens",
+        lambda: {
+            "dbb3-primary": "shared-secret",
+            "pc-primary": "shared-secret",
+        },
+    )
+
+    request = SimpleNamespace(
+        headers={
+            "authorization": "Bearer shared-secret",
+            "x-connector-id": "pc-primary",
+        }
+    )
+    assert module._connector_identity(request) == ""
+
+
+def test_sliding_window_rate_limiter_bounds_unique_keys():
+    module = _load_module()
+    limiter = module._SlidingWindowRateLimiter(10, 60)
+    limiter._MAX_KEYS = 2
+    assert limiter.allow("first")
+    assert limiter.allow("second")
+    assert limiter.allow("third")
+    assert len(limiter._hits) <= 2
+
+
 def test_terminal_checkpoint_seals_claim_and_rejects_conflicting_old_token(
     tmp_path,
     monkeypatch,
@@ -3067,3 +3107,78 @@ def test_sidecar_cleanup_failure_returns_retryable_status_and_preserves_files(
     assert conversation["delete_requested"] is True
     assert files_root.exists()
     assert single_state["conversations"] == [conversation]
+
+
+@pytest.mark.parametrize(
+    "conversation_id",
+    [
+        "",
+        ".",
+        "..",
+        "../escape",
+        r"..\escape",
+        "chat:bad",
+        "chat*bad",
+        "chat?bad",
+        "chat.bad.",
+        "chat.bad ",
+        "CON",
+        "CON.txt",
+        "NUL",
+        "LPT1.log",
+    ],
+)
+def test_conversation_storage_rejects_traversal_and_windows_dangerous_ids(
+    tmp_path,
+    monkeypatch,
+    conversation_id,
+):
+    module = _load_module()
+    monkeypatch.setattr(module, "get_hermes_home", lambda: tmp_path)
+
+    with pytest.raises(ValueError):
+        module.conversation_files_root(conversation_id)
+    assert module._conversation_history_path(conversation_id) is None
+    assert module._conversation_archive_path(conversation_id) is None
+
+
+def test_enqueue_rejects_an_invalid_conversation_id_before_side_effects():
+    module = _load_module()
+    payload = module.EnqueueHostedTurnBody(
+        request_id="request-1",
+        turn_id="turn-1",
+        message={"role": "user", "content": "hello"},
+    )
+
+    with pytest.raises(HTTPException) as error:
+        module.enqueue_hosted_turn(r"..\escape", payload, None)
+
+    assert error.value.status_code == 422
+
+
+@pytest.mark.parametrize(
+    "client_id",
+    [
+        "chat_namespace:12345678",
+        "chat_bad?12345678",
+        "chat_client-stable-001 ",
+    ],
+)
+def test_create_rejects_ids_that_are_not_cross_platform_path_components(
+    tmp_path,
+    monkeypatch,
+    client_id,
+):
+    module = _load_module()
+    monkeypatch.setattr(module, "get_hermes_home", lambda: tmp_path)
+    monkeypatch.setattr(module, "available_profiles", lambda: [{"name": "default"}])
+    monkeypatch.setattr(module, "load_single_state", lambda: {"conversations": []})
+    monkeypatch.setattr(module, "save_single_state", lambda _state: None)
+
+    with _client(module, owner="owner-a") as client:
+        response = client.post(
+            "/api/plugins/collaboration/single/conversations",
+            json={"client_id": client_id, "profile": "default"},
+        )
+
+    assert response.status_code == 422
