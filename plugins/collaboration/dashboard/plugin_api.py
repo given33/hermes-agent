@@ -16497,6 +16497,7 @@ def _next_hosted_turn_id(
             )
             if isinstance(run, dict)
             and str(run.get("status") or "queued") in {"queued", "running"}
+            and not run.get("paused")
             and str(run.get("stage") or "") not in {"routing_pending", "routing_failed"}
             and str(candidate_turn_id) not in (excluded or set())
         ]
@@ -23134,13 +23135,21 @@ def add_room_agent(room_id: str, payload: RoomAgentBody, request: Request):
         if not isinstance(agents, list):
             agents = []
             room["agents"] = agents
-        agents.append(
-            {
-                "profile": profile,
-                "name": payload.name.strip()[:120],
-                "description": payload.description.strip()[:2_000],
-            }
+        record = next(
+            (
+                item
+                for item in agents
+                if isinstance(item, dict) and str(item.get("profile") or "") == profile
+            ),
+            None,
         )
+        if record is None:
+            record = {"profile": profile, "name": "", "description": ""}
+            agents.append(record)
+        if payload.name.strip():
+            record["name"] = payload.name.strip()[:120]
+        if payload.description.strip():
+            record["description"] = payload.description.strip()[:2_000]
         _touch_room(room)
         save_state(state)
         projection = _room_agents_projection(room)
@@ -23162,6 +23171,11 @@ def update_room_agent(room_id: str, agent_id: str, payload: RoomAgentUpdateBody,
         if new_profile and new_profile != current:
             if new_profile not in {item["name"] for item in available_profiles()}:
                 raise HTTPException(status_code=404, detail=f"Unknown Hermes profile: {new_profile}")
+            if new_profile in profiles:
+                raise HTTPException(
+                    status_code=409,
+                    detail=f"Room already contains profile {new_profile}",
+                )
             profiles[profiles.index(current)] = new_profile
             room["profiles"] = profiles
             current = new_profile
@@ -23285,6 +23299,13 @@ def rotate_room_invite_code(room_id: str, payload: RoomInviteCodeBody, request: 
         room = _owned_room_in_state(state, room_id, owner_id, account_generation)
         requested = payload.invite_code.strip()
         code = requested[:64] if requested else _generate_room_invite_code()
+        existing_codes = {
+            str(item.get("invite_code") or "")
+            for item in state.get("rooms") or []
+            if isinstance(item, dict) and item.get("id") != room_id
+        }
+        if requested and code in existing_codes:
+            raise HTTPException(status_code=409, detail="Invite code is already used by another room")
         if not requested:
             # Generated codes must stay unique across every room in the file.
             existing = {
@@ -23419,10 +23440,7 @@ def retract_room_message(room_id: str, message_id: str, request: Request):
         sender = str(meta.get("sender_id") or "")
         is_own = str(message.get("role") or "") == "user" and (
             sender == owner_id
-            or (
-                not sender
-                and (room_owner == owner_id or str(meta.get("room_id") or "") == room_id)
-            )
+            or (not sender and room_owner == owner_id)
         )
         is_owner = room_owner == owner_id
         if not (is_own or is_owner):
@@ -23529,6 +23547,21 @@ def clear_room_context(room_id: str, request: Request):
                 None,
             )
             if isinstance(conversation, dict):
+                active_turns = [
+                    turn_id
+                    for turn_id, run in (conversation.get("hosted_turns") or {}).items()
+                    if isinstance(run, dict)
+                    and str(run.get("status") or "queued") not in _HOSTED_TERMINAL_STATUSES
+                ]
+                if active_turns:
+                    raise HTTPException(
+                        status_code=409,
+                        detail={
+                            "reason": "room_clear_active_turn",
+                            "message": "Cancel or wait for the running turn before clearing.",
+                            "turn_ids": active_turns[:10],
+                        },
+                    )
                 conversation["messages"] = []
                 conversation["session_entries"] = []
                 conversation["session_entry_cursor"] = 0
@@ -23564,6 +23597,13 @@ def clear_room_context(room_id: str, request: Request):
     return {"success": True}
 
 
+def _room_workspace_read_allowed(room: dict[str, Any], owner_id: str) -> bool:
+    if str(room.get("owner_id") or "") == owner_id:
+        return True
+    settings = room.get("settings") if isinstance(room.get("settings"), dict) else {}
+    return bool(int(settings.get("allow_remote_workspace_access") or 0))
+
+
 @router.get("/rooms/{room_id}/workspace/files")
 def list_room_workspace_files(room_id: str, request: Request, path: str = ""):
     owner_id = owner_id_from_request(request)
@@ -23571,6 +23611,8 @@ def list_room_workspace_files(room_id: str, request: Request, path: str = ""):
     with _STATE_LOCK:
         state = load_state()
         room = _accessible_room_in_state(state, room_id, owner_id, account_generation)
+        if not _room_workspace_read_allowed(room, owner_id):
+            raise HTTPException(status_code=403, detail="Room workspace access is not enabled for members")
         target = _room_workspace_child(room, path, allow_root=True)
     if not target.is_dir():
         raise HTTPException(status_code=404, detail="Workspace path not found")
@@ -23584,6 +23626,8 @@ def read_room_workspace_file(room_id: str, request: Request, path: str = ""):
     with _STATE_LOCK:
         state = load_state()
         room = _accessible_room_in_state(state, room_id, owner_id, account_generation)
+        if not _room_workspace_read_allowed(room, owner_id):
+            raise HTTPException(status_code=403, detail="Room workspace access is not enabled for members")
         target = _room_workspace_child(room, path)
     if not target.is_file():
         raise HTTPException(status_code=404, detail="Workspace file not found")
@@ -23616,16 +23660,19 @@ class RoomWorkspaceTwoPathBody(BaseModel):
 def write_room_workspace_file(room_id: str, payload: RoomWorkspaceWriteBody, request: Request):
     owner_id = owner_id_from_request(request)
     account_generation = _account_generation_for_request(request, owner_id)
+    if len(payload.content.encode("utf-8")) > 2_000_000:
+        raise HTTPException(status_code=413, detail="Workspace file is too large")
     with _STATE_LOCK:
         state = load_state()
         room = _owned_room_in_state(state, room_id, owner_id, account_generation)
+        # Resolve + validate containment under the lock; the file IO runs on
+        # the immutable per-conversation workspace root, outside the lock
+        # (_STATE_LOCK also holds the cross-process lifecycle OS lock).
         target = _room_workspace_child(room, payload.path)
-        if len(payload.content.encode("utf-8")) > 2_000_000:
-            raise HTTPException(status_code=413, detail="Workspace file is too large")
-        target.parent.mkdir(parents=True, exist_ok=True)
-        tmp = target.with_name(target.name + ".tmp-" + uuid.uuid4().hex[:8])
-        tmp.write_text(payload.content, encoding="utf-8")
-        os.replace(tmp, target)
+    target.parent.mkdir(parents=True, exist_ok=True)
+    tmp = target.with_name(target.name + ".tmp-" + uuid.uuid4().hex[:8])
+    tmp.write_text(payload.content, encoding="utf-8")
+    os.replace(tmp, target)
     return {"ok": True, "path": str(payload.path)}
 
 
@@ -23637,7 +23684,7 @@ def mkdir_room_workspace_path(room_id: str, payload: RoomWorkspaceWriteBody, req
         state = load_state()
         room = _owned_room_in_state(state, room_id, owner_id, account_generation)
         target = _room_workspace_child(room, payload.path)
-        target.mkdir(parents=True, exist_ok=True)
+    target.mkdir(parents=True, exist_ok=True)
     return {"ok": True, "path": str(payload.path)}
 
 
@@ -23649,15 +23696,15 @@ def delete_room_workspace_path(room_id: str, request: Request, path: str = "", r
         state = load_state()
         room = _owned_room_in_state(state, room_id, owner_id, account_generation)
         target = _room_workspace_child(room, path)
-        if not target.exists():
-            raise HTTPException(status_code=404, detail="Workspace path not found")
-        if target.is_dir():
-            if recursive:
-                shutil.rmtree(target)
-            else:
-                target.rmdir()
+    if not target.exists():
+        raise HTTPException(status_code=404, detail="Workspace path not found")
+    if target.is_dir():
+        if recursive:
+            shutil.rmtree(target)
         else:
-            target.unlink()
+            target.rmdir()
+    else:
+        target.unlink()
     return {"ok": True}
 
 
@@ -23670,10 +23717,10 @@ def rename_room_workspace_path(room_id: str, payload: RoomWorkspaceTwoPathBody, 
         room = _owned_room_in_state(state, room_id, owner_id, account_generation)
         source = _room_workspace_child(room, payload.old_path)
         destination = _room_workspace_child(room, payload.new_path)
-        if not source.exists():
-            raise HTTPException(status_code=404, detail="Workspace path not found")
-        destination.parent.mkdir(parents=True, exist_ok=True)
-        shutil.move(str(source), str(destination))
+    if not source.exists():
+        raise HTTPException(status_code=404, detail="Workspace path not found")
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    shutil.move(str(source), str(destination))
     return {"ok": True}
 
 
@@ -23686,13 +23733,13 @@ def copy_room_workspace_path(room_id: str, payload: RoomWorkspaceTwoPathBody, re
         room = _owned_room_in_state(state, room_id, owner_id, account_generation)
         source = _room_workspace_child(room, payload.source_path or payload.old_path)
         destination = _room_workspace_child(room, payload.destination_path or payload.new_path)
-        if not source.exists():
-            raise HTTPException(status_code=404, detail="Workspace path not found")
-        destination.parent.mkdir(parents=True, exist_ok=True)
-        if source.is_dir():
-            shutil.copytree(source, destination, dirs_exist_ok=True)
-        else:
-            shutil.copy2(source, destination)
+    if not source.exists():
+        raise HTTPException(status_code=404, detail="Workspace path not found")
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    if source.is_dir():
+        shutil.copytree(source, destination, dirs_exist_ok=True)
+    else:
+        shutil.copy2(source, destination)
     return {"ok": True}
 
 
@@ -23702,7 +23749,10 @@ def list_room_approvals(room_id: str, request: Request):
     account_generation = _account_generation_for_request(request, owner_id)
     with _STATE_LOCK:
         state = load_state()
-        room = _accessible_room_in_state(state, room_id, owner_id, account_generation)
+        # Owner-only: the pending write-approval store belongs to the host
+        # ACCOUNT, not to the room. A joined member enumerating or deciding
+        # those records was a confused-deputy onto the host's memory/skills.
+        room = _owned_room_in_state(state, room_id, owner_id, account_generation)
         profiles = list(dict.fromkeys(room.get("profiles") or [])) or ["default"]
     approvals: list[dict[str, Any]] = []
     for profile in profiles:
@@ -23710,7 +23760,7 @@ def list_room_approvals(room_id: str, request: Request):
         try:
             approvals.extend(
                 store.list(
-                    owner_id=str(room.get("owner_id") or owner_id),
+                    owner_id=owner_id,
                     profile=normalized,
                     states=("pending",),
                     limit=50,
@@ -23732,11 +23782,12 @@ def decide_room_approval(room_id: str, approval_id: str, payload: RoomApprovalDe
     account_generation = _account_generation_for_request(request, owner_id)
     with _STATE_LOCK:
         state = load_state()
-        room = _accessible_room_in_state(state, room_id, owner_id, account_generation)
+        # Owner-only, mirroring list_room_approvals.
+        _owned_room_in_state(state, room_id, owner_id, account_generation)
     normalized, _home, store = _mobile_approval_store(payload.profile)
     try:
         record = store.claim_decision(
-            owner_id=str(room.get("owner_id") or owner_id),
+            owner_id=owner_id,
             profile=normalized,
             approval_id=approval_id,
             expected_revision=payload.expected_revision,
@@ -26438,17 +26489,117 @@ def mobile_runtime_run_control(
     if conversation is None:
         raise HTTPException(status_code=404, detail="Runtime run not found")
     conversation_id = str(conversation.get("id") or "")
-    if action in {"cancel", "pause"}:
+    with _STATE_LOCK:
+        single_state = load_single_state()
+        conversation_for_control = next(
+            (
+                item for item in single_state.get("conversations") or []
+                if isinstance(item, dict) and str(item.get("id") or "") == conversation_id
+            ),
+            None,
+        )
+        run_record = (
+            (conversation_for_control or {}).get("hosted_turns", {}).get(turn_id)
+            if isinstance(conversation_for_control, dict)
+            else None
+        )
+        run_status = str((run_record or {}).get("status") or "queued")
+        run_paused = bool((run_record or {}).get("paused"))
+
+    if action == "pause":
+        if run_status == "queued" and not run_paused:
+            # True pause for not-yet-started turns: park the record without
+            # cancelling so resume re-dispatches the SAME turn id.
+            with _STATE_LOCK:
+                single_state = load_single_state()
+                conversation_for_control = next(
+                    (
+                        item for item in single_state.get("conversations") or []
+                        if isinstance(item, dict) and str(item.get("id") or "") == conversation_id
+                    ),
+                    None,
+                )
+                run_record = (
+                    (conversation_for_control or {}).get("hosted_turns", {}).get(turn_id)
+                    if isinstance(conversation_for_control, dict)
+                    else None
+                )
+                if isinstance(run_record, dict) and not run_record.get("paused"):
+                    if str(run_record.get("status") or "queued") != "queued":
+                        raise HTTPException(
+                            status_code=409,
+                            detail="Turn already started; pause falls back to cancellation",
+                        )
+                    run_record["paused"] = True
+                    run_record["paused_at"] = int(time.time() * 1000)
+                    run_record["updated_at"] = int(time.time() * 1000)
+                    save_single_state(single_state)
+                else:
+                    raise HTTPException(status_code=409, detail="Turn is already paused")
+            _notify_hosted_update(conversation_id)
+            return {
+                "action": "pause",
+                "mode": "parked",
+                "hosted_turn": _public_hosted_turn(run_record),
+            }
+        # Running/terminal turns: pause degrades to cancellation-with-reason
+        # (the hosted runtime cannot freeze a worker mid-turn); resume then
+        # re-dispatches with the turn's durable context via the retry path.
         try:
             run = request_hosted_turn_cancellation(
                 conversation_id,
                 turn_id,
-                reason=body.reason if action == "cancel" else "paused from iOS task control",
+                reason="paused from iOS task control",
                 request_id=body.request_id,
             )
         except RuntimeError as exc:
             raise HTTPException(status_code=404, detail=str(exc)) from exc
-        return {"action": action, "hosted_turn": _public_hosted_turn(run)}
+        return {"action": "pause", "mode": "cancelled", "hosted_turn": _public_hosted_turn(run)}
+
+    if action == "resume" and run_paused:
+        # Resume a parked (never-started) turn: same turn id, real dispatch.
+        with _STATE_LOCK:
+            single_state = load_single_state()
+            conversation_for_control = next(
+                (
+                    item for item in single_state.get("conversations") or []
+                    if isinstance(item, dict) and str(item.get("id") or "") == conversation_id
+                ),
+                None,
+            )
+            run_record = (
+                (conversation_for_control or {}).get("hosted_turns", {}).get(turn_id)
+                if isinstance(conversation_for_control, dict)
+                else None
+            )
+            if not isinstance(run_record, dict) or not run_record.get("paused"):
+                raise HTTPException(status_code=409, detail="Turn is not paused")
+            run_record["paused"] = False
+            run_record["resumed_at"] = int(time.time() * 1000)
+            run_record["updated_at"] = int(time.time() * 1000)
+            save_single_state(single_state)
+        start_hosted_workflow(conversation_id, turn_id)
+        _notify_hosted_update(conversation_id)
+        return {
+            "action": "resume",
+            "mode": "redispatched",
+            "hosted_turn": _public_hosted_turn(run_record),
+        }
+
+    if action == "cancel":
+        try:
+            run = request_hosted_turn_cancellation(
+                conversation_id,
+                turn_id,
+                reason=body.reason,
+                request_id=body.request_id,
+            )
+        except RuntimeError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+        return {"action": "cancel", "hosted_turn": _public_hosted_turn(run)}
+
+    # retry / resume-of-cancelled both re-dispatch through the durable retry
+    # path with the turn's original context.
     request_id = body.request_id.strip() or f"mobile-retry-{uuid.uuid4().hex}"
     retry = retry_hosted_turn(
         conversation_id,

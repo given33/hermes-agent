@@ -62,9 +62,11 @@ tar -xzf "${tmp}/agent.tar.gz" -C "${tmp}/stage"
 printf '%s' "${remote_commit}" >"${agent_root}/.hermes-product-commit"
 
 # pip must run as the service user: running it as root chowns the venv
-# files and the service user can no longer import hermes_cli.
-chown -R "${service_user:-hermes-agent}:${service_user:-hermes-agent}"   "${agent_root}/.venv" 2>/dev/null || true
+# files and the service user can no longer import hermes_cli. Resolve the
+# service user from the existing venv BEFORE chown so the restore targets
+# the real owner, not the fallback.
 service_user="$(stat -c '%U' "${agent_root}/.venv/bin/python" 2>/dev/null || echo hermes-agent)"
+chown -R "${service_user}:${service_user}" "${agent_root}/.venv" 2>/dev/null || true
 # The editable install must not hang on PyPI/network during a managed update.
 # The repo ships with a complete venv; --no-deps --no-build-isolation makes the
 # refresh local-only and fast, and PIP_DEFAULT_TIMEOUT bounds any residual I/O.

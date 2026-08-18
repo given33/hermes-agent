@@ -144,7 +144,7 @@ def purge_owner_operational_state(
 
         workflow_result = _account_cleanup_plugins().WorkflowStore(
             root / "workflows.db"
-        ).delete_account(normalized, account_generation=generation)
+        ).delete_account_all_generations(normalized)
         for key, value in workflow_result.items():
             workflows[key] = workflows.get(key, 0) + int(value)
     pending_cancellations = int(workflows.get("pending_cancellations", 0))

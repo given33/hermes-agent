@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import sqlite3
 import threading
 from contextlib import asynccontextmanager
 from pathlib import Path
@@ -141,9 +142,21 @@ def _migrate_legacy_workflow_generations_for(owner_id: str, live_generation: str
         try:
             store.rekey_account_generation(owner_id, "1", live_generation)
             store.mark_legacy_generation_migrated(owner_id)
+        except sqlite3.IntegrityError:
+            # UNIQUE collision with rows already written under the live
+            # generation (same definition name / idempotency key): retrying
+            # can never succeed. Record a terminal failure marker so this
+            # account stops paying an exception on every request; both eras
+            # stay readable in place.
+            store.mark_legacy_generation_migration_failed(owner_id)
+            logger.error(
+                "workflow legacy generation rekey hit a UNIQUE conflict for %s; "
+                "legacy rows remain at generation '1'",
+                owner_id,
+            )
         except Exception:
-            # A failed pass keeps the marker unset and the legacy rows in
-            # place; the next authenticated request retries the migration.
+            # A transient failure keeps the marker unset and the legacy rows
+            # in place; the next authenticated request retries the migration.
             logger.exception(
                 "workflow legacy generation migration failed for %s", owner_id
             )

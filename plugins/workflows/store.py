@@ -522,6 +522,22 @@ class WorkflowStore:
             ).fetchone()
             return row is not None
 
+    def mark_legacy_generation_migration_failed(self, account_id: str) -> None:
+        """Record a terminal rekey failure so it stops retrying per request.
+
+        A UNIQUE collision between the legacy rows and rows already written
+        under the live generation (same definition name, same idempotency
+        key) can never succeed by retrying: mark it failed, surface the
+        conflict, and leave both eras readable in place instead of paying an
+        exception + traceback on every authenticated request forever.
+        """
+        with self.transaction() as conn:
+            conn.execute(
+                "INSERT OR REPLACE INTO workflow_migration_markers(key, created_at) "
+                "VALUES (?, strftime('%s','now'))",
+                (f"legacy_generation_migrated_failed:{str(account_id or '').strip()}",),
+            )
+
     def mark_legacy_generation_migrated(self, account_id: str) -> None:
         with self.transaction() as conn:
             conn.execute(
@@ -2303,6 +2319,40 @@ class WorkflowStore:
                     (account, generation),
                 )
             return len(rows)
+
+    def delete_account_all_generations(
+        self,
+        account_id: str,
+        *,
+        now: int | None = None,
+    ) -> dict[str, int]:
+        """Remove EVERY generation fence for one account id.
+
+        Account deletion ends the account, not one era: leftover rows under
+        older generations (pre-fence "1", superseded acctgen_* values) would
+        otherwise stay orphaned forever — invisible to any live scope but
+        still on disk. Aggregates per-table counts across eras.
+        """
+        account = str(account_id or "").strip()
+        if not account:
+            raise ValueError("account_id is required")
+        totals: dict[str, int] = {}
+        generations: list[str] = []
+        with self.connect() as conn:
+            rows = conn.execute(
+                "SELECT DISTINCT account_generation FROM workflow_definitions "
+                "WHERE account_id=? UNION "
+                "SELECT DISTINCT account_generation FROM workflow_account_deletions "
+                "WHERE account_id=? UNION "
+                "SELECT DISTINCT account_generation FROM workflow_runs WHERE account_id=?",
+                (account, account, account),
+            ).fetchall()
+            generations = [str(row[0]) for row in rows if str(row[0] or "").strip()]
+        for generation in generations:
+            removed = self.delete_account(account, account_generation=generation, now=now)
+            for key, value in removed.items():
+                totals[key] = totals.get(key, 0) + int(value)
+        return totals
 
     def delete_account(
         self,
