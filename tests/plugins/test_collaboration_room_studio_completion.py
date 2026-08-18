@@ -237,7 +237,8 @@ class TestInviteCodesAndMembership:
                 module.RoomAgentBody(profile="default"),
                 request(),
             )
-        assert excinfo.value.status_code == 404
+        # Owner-only surface: permission denied (403), not "does not exist".
+        assert excinfo.value.status_code == 403
 
     def test_owner_cannot_be_removed_as_member(self):
         module = load_module()

@@ -16878,10 +16878,20 @@ def _owned_room_in_state(
     owner_id: str,
     account_generation: str = "",
 ) -> dict[str, Any]:
+    """Resolve one room record owned by ``owner_id``.
+
+    A room that exists but belongs to another owner is 403, not 404: the
+    mobile delete-outbox treats 404 as "already deleted on the server" and
+    silently drops the room, so a member tapping delete used to see success
+    while the owner's room survived.
+    """
     room = _room_by_id(state, room_id)
     existing_owner = str(room.get("owner_id") or "").strip()
     if existing_owner != owner_id:
-        raise HTTPException(status_code=404, detail="Room not found")
+        raise HTTPException(
+            status_code=403,
+            detail="Only the room owner can manage this room",
+        )
     generation = str(
         account_generation or _account_generation_for_owner(owner_id)
     ).strip()
@@ -22130,10 +22140,7 @@ def delete_single_conversation(
             start_hosted_workflow(conversation_id, turn_id)
         raise HTTPException(
             status_code=503,
-            detail={
-                "reason": "conversation_deletion_pending",
-                "message": "Conversation deletion is pending; retry.",
-            },
+            detail="Conversation deletion is pending; retry. (retryable)",
         ) from exc
     _notify_hosted_update(conversation_id)
     if not _finalize_pending_conversation_deletion(conversation_id):
@@ -22141,10 +22148,7 @@ def delete_single_conversation(
             start_hosted_workflow(conversation_id, turn_id)
         raise HTTPException(
             status_code=503,
-            detail={
-                "reason": "conversation_deletion_pending",
-                "message": "Conversation deletion is pending; retry.",
-            },
+            detail="Conversation deletion is pending; retry. (retryable)",
         )
     return {"ok": True}
 
@@ -22550,10 +22554,7 @@ def delete_room(room_id: str, request: Request):
             return {"ok": True}
         raise HTTPException(
             status_code=503,
-            detail={
-                "reason": "conversation_deletion_pending",
-                "message": "Conversation deletion is pending; retry.",
-            },
+            detail="Conversation deletion is pending; retry. (retryable)",
         )
 
     if linked_conversation_id:
@@ -22900,7 +22901,9 @@ def _accessible_room_in_state(
     try:
         room = _owned_room_in_state(state, room_id, owner_id, account_generation)
     except HTTPException as exc:
-        if exc.status_code != 404:
+        # 404 = no such room; 403 = exists but owned by someone else (the
+        # member scan below decides actual access). Both fall through.
+        if exc.status_code not in (403, 404):
             raise
         room = None
     if room is not None:
@@ -23220,6 +23223,7 @@ def _room_detail_response(
     projection["members"] = _room_members(room, str(room.get("owner_id") or owner_id))
     projection["typing_users"] = _room_active_typing(room)
     projection["summary_state"] = _room_summary_state(room)
+    projection["can_manage"] = str(room.get("owner_id") or "") == str(owner_id or "").strip()
     return {
         "room": projection,
         "messages": projection.get("messages") or [],
@@ -23954,10 +23958,7 @@ def clear_room_context(room_id: str, request: Request):
                 except OSError as exc:
                     raise HTTPException(
                         status_code=503,
-                        detail={
-                            "reason": "room_clear_pending",
-                            "message": "Room history clear is pending; retry.",
-                        },
+                        detail="Room history clear is pending; retry. (retryable)",
                     ) from exc
         room["mailbox"] = []
         _touch_room(room)

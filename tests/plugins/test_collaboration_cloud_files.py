@@ -1283,7 +1283,7 @@ def test_deleting_active_remote_conversation_retains_cancellation_until_ack(
             f"{prefix}/single/conversations/{conversation['id']}"
         )
         assert deleted.status_code == 503
-        assert deleted.json()["detail"]["reason"] == "conversation_deletion_pending"
+        assert "pending" in deleted.json()["detail"].lower()
         assert state["conversations"] == [conversation]
         assert conversation["delete_requested"] is True
         assert hosted["cancel_requested"] is True
@@ -3016,7 +3016,7 @@ def test_delete_cleanup_failure_returns_retryable_status_and_keeps_tombstone(
         )
 
     assert response.status_code == 503
-    assert response.json()["detail"]["reason"] == "conversation_deletion_pending"
+    assert "pending" in response.json()["detail"].lower()
     assert conversation["delete_requested"] is True
     assert single_state["conversations"] == [conversation]
 
