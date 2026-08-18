@@ -11,6 +11,7 @@ import os
 import threading
 from typing import List, Optional
 
+from hermes_constants import hermes_home_key
 from hermes_cli.dashboard_auth.base import (
     DashboardAuthProvider,
     assert_protocol_compliance,
@@ -19,6 +20,49 @@ from hermes_cli.dashboard_auth.base import (
 _log = logging.getLogger(__name__)
 _lock = threading.Lock()
 _providers: dict[str, DashboardAuthProvider] = {}
+_scoped_providers: dict[str, dict[str, DashboardAuthProvider]] = {}
+
+
+def _merged(scope: Optional[str] = None) -> dict[str, DashboardAuthProvider]:
+    providers = dict(_providers)
+    providers.update(_scoped_providers.get(scope or hermes_home_key(), {}))
+    return providers
+
+
+def register_provider(
+    provider: DashboardAuthProvider,
+    *,
+    scope: Optional[str] = None,
+) -> None:
+    """Register a provider.
+
+    Raises:
+        TypeError: on protocol violation.
+        ValueError: if a provider with the same name is already registered.
+    """
+    assert_protocol_compliance(type(provider))
+    with _lock:
+        target = _providers if scope is None else _scoped_providers.setdefault(scope, {})
+        effective = target if scope is None else _merged(scope)
+        if provider.name in effective:
+            raise ValueError(
+                f"dashboard-auth provider already registered: {provider.name!r}"
+            )
+        target[provider.name] = provider
+    _log.info(
+        "dashboard-auth: registered provider %r (%s)",
+        provider.name, provider.display_name,
+    )
+
+
+def get_provider(
+    name: str,
+    *,
+    scope: Optional[str] = None,
+) -> Optional[DashboardAuthProvider]:
+    """Return the registered provider for ``name``, or None if unknown."""
+    with _lock:
+        return _merged(scope).get(name)
 
 
 def register_mobile_api_provider_if_configured() -> bool:
@@ -75,31 +119,6 @@ def register_mobile_api_provider_if_configured() -> bool:
     return True
 
 
-def register_provider(provider: DashboardAuthProvider) -> None:
-    """Register a provider.
-
-    Raises:
-        TypeError: on protocol violation.
-        ValueError: if a provider with the same name is already registered.
-    """
-    assert_protocol_compliance(type(provider))
-    with _lock:
-        if provider.name in _providers:
-            raise ValueError(
-                f"dashboard-auth provider already registered: {provider.name!r}"
-            )
-        _providers[provider.name] = provider
-    _log.info(
-        "dashboard-auth: registered provider %r (%s)",
-        provider.name, provider.display_name,
-    )
-
-
-def get_provider(name: str) -> Optional[DashboardAuthProvider]:
-    """Return the registered provider for ``name``, or None if unknown."""
-    with _lock:
-        return _providers.get(name)
-
 
 def unregister_provider(
     name: str,
@@ -117,10 +136,41 @@ def unregister_provider(
     return True
 
 
-def list_providers() -> List[DashboardAuthProvider]:
+def snapshot_registration(
+    name: str,
+    *,
+    scope: Optional[str] = None,
+) -> Optional[DashboardAuthProvider]:
+    with _lock:
+        target = _providers if scope is None else _scoped_providers.get(scope, {})
+        return target.get(name)
+
+
+def restore_registration(
+    name: str,
+    current: DashboardAuthProvider,
+    previous: Optional[DashboardAuthProvider],
+    *,
+    scope: Optional[str] = None,
+) -> bool:
+    """Restore a host-owned provider registration if it is still current."""
+    with _lock:
+        target = _providers if scope is None else _scoped_providers.setdefault(scope, {})
+        if target.get(name) is not current:
+            return False
+        if previous is None:
+            target.pop(name, None)
+        else:
+            target[name] = previous
+        if scope is not None and not target:
+            _scoped_providers.pop(scope, None)
+    return True
+
+
+def list_providers(*, scope: Optional[str] = None) -> List[DashboardAuthProvider]:
     """All registered providers, in registration order."""
     with _lock:
-        return list(_providers.values())
+        return list(_merged(scope).values())
 
 
 def list_token_providers() -> List[DashboardAuthProvider]:
@@ -133,8 +183,7 @@ def list_token_providers() -> List[DashboardAuthProvider]:
     no token provider is registered — a token-authable route then fails
     closed (401), never open.
     """
-    with _lock:
-        return [p for p in _providers.values() if getattr(p, "supports_token", False)]
+    return [p for p in list_providers() if getattr(p, "supports_token", False)]
 
 
 def list_session_providers() -> List[DashboardAuthProvider]:
@@ -142,11 +191,11 @@ def list_session_providers() -> List[DashboardAuthProvider]:
     sessions). The login page, /auth/login, and the gate's verify/refresh loops
     consult only these. Mirror of list_token_providers.
     """
-    with _lock:
-        return [p for p in _providers.values() if getattr(p, "supports_session", True)]
+    return [p for p in list_providers() if getattr(p, "supports_session", True)]
 
 
 def clear_providers() -> None:
     """Test-only: drop all registrations."""
     with _lock:
         _providers.clear()
+        _scoped_providers.clear()

@@ -15,7 +15,6 @@ import importlib
 import io
 import json
 import os
-import shlex
 import sys
 from dataclasses import dataclass
 from pathlib import Path
@@ -119,17 +118,14 @@ def _table_summary(summary: str, *, limit: int = 76) -> str:
 
 def _split_line(line: str) -> list[str]:
     try:
-        tokens = shlex.split(line, comments=False, posix=os.name != "nt")
+        # Windows-safe splitter: plain shlex posix=True eats backslashes, so
+        # `sessions export C:\Users\me\out.jsonl` silently became a mangled
+        # relative filename in the cwd (#83934).
+        from hermes_cli._subprocess_compat import split_command_line
+
+        return split_command_line(line)
     except ValueError as exc:
         raise ConsoleCommandError(f"Could not parse command: {exc}") from exc
-    if os.name == "nt":
-        tokens = [
-            token[1:-1]
-            if len(token) >= 2 and token[0] == token[-1] and token[0] in {'"', "'"}
-            else token
-            for token in tokens
-        ]
-    return tokens
 
 
 def _contains_shell_syntax(line: str, tokens: Sequence[str]) -> bool:
@@ -1258,7 +1254,10 @@ def _apply_confirmed_defaults(args: argparse.Namespace) -> None:
             setattr(args, attr, True)
     if getattr(args, "_console_command", None) == "import":
         setattr(args, "force", True)
-    if getattr(args, "checkpoints_command", None) in {"clear", "clear-legacy"}:
+    # Every checkpoints subcommand the console registers as mutating gates its
+    # own confirmation on --force, so all three belong here. `prune` reaches
+    # _confirm() for its orphan preview, and the console never redirects stdin.
+    if getattr(args, "checkpoints_command", None) in {"prune", "clear", "clear-legacy"}:
         setattr(args, "force", True)
     if getattr(args, "plugins_action", None) == "install":
         if not getattr(args, "enable", False) and not getattr(args, "no_enable", False):
