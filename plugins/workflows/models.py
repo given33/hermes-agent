@@ -57,7 +57,7 @@ TERMINAL_NODE_STATES = {"succeeded", "failed", "skipped", "cancelled"}
 @dataclass(frozen=True)
 class WorkflowScope:
     account_id: str
-    account_generation: int
+    account_generation: str
     profile_id: str
 
     def validate(self) -> "WorkflowScope":
@@ -65,11 +65,12 @@ class WorkflowScope:
         profile_id = str(self.profile_id or "").strip()
         if not account_id or len(account_id) > 512:
             raise ValueError("account_id is required and must be at most 512 characters")
-        if int(self.account_generation) < 1:
-            raise ValueError("account_generation must be at least 1")
+        account_generation = str(self.account_generation or "").strip()
+        if not account_generation or len(account_generation) > 512:
+            raise ValueError("account_generation is required and must be at most 512 characters")
         if not profile_id or len(profile_id) > 128:
             raise ValueError("profile_id is required and must be at most 128 characters")
-        return WorkflowScope(account_id, int(self.account_generation), profile_id)
+        return WorkflowScope(account_id, account_generation, profile_id)
 
 
 @dataclass(frozen=True)

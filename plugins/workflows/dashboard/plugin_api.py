@@ -10,7 +10,11 @@ from typing import Any
 from fastapi import APIRouter, Header, HTTPException, Request
 from pydantic import BaseModel, Field
 
-from hermes_cli.cloud_file_library import owner_id_from_request
+from hermes_cli.cloud_file_library import (
+    LOCAL_OWNER_ID,
+    account_generation_from_request,
+    owner_id_from_request,
+)
 from hermes_cli.profiles import normalize_profile_name
 from plugins.workflows.models import (
     SecurityVerdict,
@@ -21,7 +25,7 @@ from plugins.workflows.models import (
     WorkflowValidationError,
 )
 from plugins.workflows.runtime import WorkflowRuntime
-from plugins.workflows.store import WorkflowStore, default_store_path
+from plugins.workflows.store import SCHEMA_VERSION, WorkflowStore, default_store_path
 
 
 _STORE: WorkflowStore | None = None
@@ -114,9 +118,29 @@ def _scope(request: Request, profile_id: str) -> WorkflowScope:
         profile = normalize_profile_name(profile_id or "default")
     except ValueError as exc:
         raise HTTPException(status_code=422, detail=str(exc)) from exc
-    # Deleted usernames are permanently retired, so generation 1 remains a
-    # stable account boundary for the current mobile authentication contract.
-    return WorkflowScope(owner_id_from_request(request), 1, profile)
+    owner_id = owner_id_from_request(request)
+    if owner_id == LOCAL_OWNER_ID:
+        # The loopback desktop owner has no account-replacement lifecycle.
+        # Keep its historical generation value so existing local workflows
+        # remain readable after the mobile generation schema upgrade.
+        live_generation = "1"
+    else:
+        try:
+            from hermes_cli.dashboard_auth.mobile_device_store import MobileDeviceStore
+
+            live_generation = MobileDeviceStore().account_generation(owner_id, create=True)
+        except PermissionError as exc:
+            raise HTTPException(status_code=410, detail="Account deletion is in progress") from exc
+    authenticated_generation = account_generation_from_request(request)
+    principal = getattr(getattr(request, "state", None), "token_principal", None)
+    if (
+        getattr(principal, "provider", "") == "owner-mobile"
+        and authenticated_generation != live_generation
+    ):
+        raise HTTPException(status_code=410, detail="Account generation is no longer active")
+    if authenticated_generation not in {"legacy", live_generation}:
+        raise HTTPException(status_code=410, detail="Account generation is no longer active")
+    return WorkflowScope(owner_id, live_generation, profile)
 
 
 def _key(value: str | None) -> str:
@@ -147,7 +171,7 @@ def health() -> dict[str, Any]:
         recoverable = int(conn.execute(
             "SELECT COUNT(*) FROM workflow_runs WHERE state='running'"
         ).fetchone()[0])
-    return {"ok": True, "schema_version": 1, "recoverable_runs": recoverable}
+    return {"ok": True, "schema_version": SCHEMA_VERSION, "recoverable_runs": recoverable}
 
 
 @router.get("/definitions")

@@ -100,10 +100,16 @@ class AccountSessionFacade:
             raise ValueError("invalid session_id")
         return value
 
-    def bind_existing(self, *, owner_id: str, session_id: str) -> bool:
+    def bind_existing(
+        self,
+        *,
+        owner_id: str,
+        session_id: str,
+        account_generation: str | None = None,
+    ) -> bool:
         """Bind a session only after the API caller proved external ownership."""
 
-        owner = self._owner(owner_id)
+        owner = self._owner(owner_id, account_generation)
         sid = self._session_id(session_id)
 
         def _bind(conn):
@@ -131,8 +137,14 @@ class AccountSessionFacade:
 
         return bool(self.db._execute_write(_bind))
 
-    def is_bound(self, *, owner_id: str, session_id: str) -> bool:
-        owner = self._owner(owner_id)
+    def is_bound(
+        self,
+        *,
+        owner_id: str,
+        session_id: str,
+        account_generation: str | None = None,
+    ) -> bool:
+        owner = self._owner(owner_id, account_generation)
         sid = self._session_id(session_id)
         with self.db._lock:
             deleted = self.db._conn.execute(
@@ -149,10 +161,19 @@ class AccountSessionFacade:
             ).fetchall()
         return {str(row["owner_id"]) for row in rows} == {owner}
 
-    def _require_bound(self, owner_id: str, session_id: str) -> tuple[str, str]:
-        owner = self._owner(owner_id)
+    def _require_bound(
+        self,
+        owner_id: str,
+        session_id: str,
+        account_generation: str | None = None,
+    ) -> tuple[str, str]:
+        owner = self._owner(owner_id, account_generation)
         sid = self._session_id(session_id)
-        if not self.is_bound(owner_id=owner, session_id=sid):
+        if not self.is_bound(
+            owner_id=owner,
+            session_id=sid,
+            account_generation=None,
+        ):
             raise SessionScopeDenied("session is not bound to this account profile")
         return owner, sid
 
@@ -226,8 +247,13 @@ class AccountSessionFacade:
         expected_tip_id: int,
         idempotency_key: str,
         title: str = "",
+        account_generation: str | None = None,
     ) -> dict[str, Any]:
-        owner, source_id = self._require_bound(owner_id, source_session_id)
+        owner, source_id = self._require_bound(
+            owner_id,
+            source_session_id,
+            account_generation,
+        )
         boundary = int(at_message_id)
         expected_tip = int(expected_tip_id)
         key = str(idempotency_key or "").strip()[:256]
@@ -379,8 +405,14 @@ class AccountSessionFacade:
         session, replayed = self.db._execute_write(_fork)
         return {"session": session, "replayed": replayed}
 
-    def lineage(self, *, owner_id: str, session_id: str) -> dict[str, Any]:
-        owner, sid = self._require_bound(owner_id, session_id)
+    def lineage(
+        self,
+        *,
+        owner_id: str,
+        session_id: str,
+        account_generation: str | None = None,
+    ) -> dict[str, Any]:
+        owner, sid = self._require_bound(owner_id, session_id, account_generation)
         with self.db._lock:
             rows = self.db._conn.execute(
                 "SELECT s.* FROM sessions s JOIN mobile_session_bindings b "
@@ -414,8 +446,14 @@ class AccountSessionFacade:
         roots = [item["id"] for item in selected if item.get("parent_session_id") not in component]
         return {"current_session_id": sid, "roots": roots, "sessions": selected, "edges": edges}
 
-    def context(self, *, owner_id: str, session_id: str) -> dict[str, Any]:
-        _owner, sid = self._require_bound(owner_id, session_id)
+    def context(
+        self,
+        *,
+        owner_id: str,
+        session_id: str,
+        account_generation: str | None = None,
+    ) -> dict[str, Any]:
+        _owner, sid = self._require_bound(owner_id, session_id, account_generation)
         session = self.db.get_session(sid)
         if session is None:
             raise SessionNotFound("session does not exist")

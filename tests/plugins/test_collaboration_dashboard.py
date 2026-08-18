@@ -160,8 +160,89 @@ def test_mobile_conversation_session_hydrates_full_history(monkeypatch):
     assert snapshot["history_complete"] is True
 
 
+def test_mobile_owned_conversations_filter_account_generation(monkeypatch):
+    module = load_module()
+    state = {
+        "conversations": [
+            {
+                "id": "chat-current",
+                "owner_id": "owner-a",
+                "account_generation": "generation-current",
+                "runtime_sessions": {"default": "session-current"},
+            },
+            {
+                "id": "chat-old",
+                "owner_id": "owner-a",
+                "account_generation": "generation-old",
+                "runtime_sessions": {"default": "session-old"},
+            },
+            {
+                "id": "chat-peer",
+                "owner_id": "owner-b",
+                "account_generation": "generation-current",
+                "runtime_sessions": {"default": "session-peer"},
+            },
+        ]
+    }
+    monkeypatch.setattr(module, "_STATE_LOCK", threading.RLock())
+    monkeypatch.setattr(module, "load_single_state", lambda: state)
+    monkeypatch.setattr(
+        module,
+        "_account_generation_for_owner",
+        lambda _owner: "generation-current",
+    )
+
+    conversations = module._mobile_owned_conversations("owner-a")
+    assert [item["id"] for item in conversations] == ["chat-current"]
+    assert module._mobile_owned_session_ids("owner-a", "default") == {
+        "session-current"
+    }
+
+
+def test_mobile_runtime_runs_passes_authenticated_generation(monkeypatch, tmp_path):
+    module = load_module()
+    import hermes_cli.account_runtime_aggregate as aggregate
+
+    captured = {}
+    monkeypatch.setattr(
+        module,
+        "owner_id_from_request",
+        lambda _request: "owner-a",
+    )
+    monkeypatch.setattr(
+        module,
+        "_account_generation_for_request",
+        lambda _request, _owner: "generation-current",
+    )
+    monkeypatch.setattr(
+        module,
+        "_mobile_profile_home",
+        lambda _profile: ("default", tmp_path),
+    )
+    monkeypatch.setattr(
+        module,
+        "_mobile_owned_conversations",
+        lambda owner, generation: captured.update(
+            {"owner": owner, "generation": generation}
+        )
+        or [],
+    )
+    monkeypatch.setattr(module, "reconcile_stale_hosted_turns", lambda _item: False)
+    monkeypatch.setattr(
+        aggregate,
+        "aggregate_account_runtime",
+        lambda **kwargs: kwargs,
+    )
+
+    result = module.mobile_runtime_runs(SimpleNamespace(), profile="default")
+
+    assert captured == {"owner": "owner-a", "generation": "generation-current"}
+    assert result["account_generation"] == "generation-current"
+
+
 def test_mobile_conversation_fork_captures_account_generation(monkeypatch):
     module = load_module()
+    captured: dict[str, dict[str, Any]] = {}
     source = {
         "id": "chat-source",
         "profile": "default",
@@ -177,12 +258,20 @@ def test_mobile_conversation_fork_captures_account_generation(monkeypatch):
             }
         ],
     }
-    facade = SimpleNamespace(
-        context=lambda **_kwargs: {"tip_message_id": 9},
-        fork=lambda **_kwargs: {
+    def context(**kwargs):
+        captured["context"] = kwargs
+        return {"tip_message_id": 9}
+
+    def fork(**kwargs):
+        captured["fork"] = kwargs
+        return {
             "session": {"id": "session-child", "title": "Branch"},
             "replayed": False,
-        },
+        }
+
+    facade = SimpleNamespace(
+        context=context,
+        fork=fork,
         bind_existing=lambda **_kwargs: True,
     )
     state = {"conversations": []}
@@ -223,6 +312,8 @@ def test_mobile_conversation_fork_captures_account_generation(monkeypatch):
     assert result["created"] is True
     assert result["conversation"]["account_generation"] == "generation-a"
     assert state["conversations"][0]["account_generation"] == "generation-a"
+    assert captured["context"]["account_generation"] == "generation-a"
+    assert captured["fork"]["account_generation"] == "generation-a"
 
 
 def review_control(
@@ -2017,6 +2108,7 @@ class CollaborationDashboardTests(unittest.TestCase):
         module.save_single_state = lambda value: saved.append(value)
         module._delete_runtime_session = (
             lambda profile, session_id: deleted.append((profile, session_id))
+            or True
         )
 
         response = module.delete_single_conversation(conversation["id"])
@@ -2030,6 +2122,29 @@ class CollaborationDashboardTests(unittest.TestCase):
             ],
         )
         self.assertEqual(saved[-1]["conversations"], [])
+
+    def test_deletion_finalizer_keeps_tombstone_when_runtime_cleanup_fails(self):
+        module = load_module()
+        conversation = module.create_single_conversation("default", "Retry delete")
+        conversation.update(
+            {
+                "owner_id": "owner-a",
+                "account_generation": "generation-a",
+                "delete_requested": True,
+                "runtime_sessions": {"default": "session-a"},
+            }
+        )
+        state = {"conversations": [conversation]}
+        saved = []
+        module._STATE_LOCK = threading.RLock()
+        module.load_single_state = lambda: state
+        module.save_single_state = lambda value: saved.append(value)
+        module._remove_room_index_for_conversation = lambda *_args: True
+        module._delete_runtime_session = lambda *_args: False
+
+        assert module._finalize_pending_conversation_deletion(conversation["id"]) is False
+        assert state["conversations"] == [conversation]
+        assert saved == []
 
     def test_single_turn_uses_official_profile_and_dashboard_source(self):
         module = load_module()

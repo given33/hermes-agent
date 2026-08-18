@@ -43,6 +43,7 @@ def _hosted_records(
     conversations: list[dict[str, Any]],
     owner_id: str,
     profile: str,
+    account_generation: str = "",
 ) -> tuple[list[dict[str, Any]], set[str]]:
     records: list[dict[str, Any]] = []
     session_ids: set[str] = set()
@@ -50,6 +51,15 @@ def _hosted_records(
         if not isinstance(conversation, dict):
             continue
         if str(conversation.get("owner_id") or "").strip() != owner_id:
+            continue
+        stored_generation = str(
+            conversation.get("account_generation") or ""
+        ).strip()
+        if (
+            account_generation
+            and stored_generation
+            and stored_generation != account_generation
+        ):
             continue
         conversation_id = str(conversation.get("id") or "")
         conversation_profile = str(conversation.get("profile") or "default").lower()
@@ -214,6 +224,7 @@ def aggregate_account_runtime(
     profile: str,
     profile_home: Path,
     conversations: list[dict[str, Any]],
+    account_generation: str = "",
     limit: int = 200,
 ) -> dict[str, Any]:
     """Return persisted source records without inferring client-side status."""
@@ -222,7 +233,12 @@ def aggregate_account_runtime(
     profile_name = str(profile or "").strip().lower()
     if not owner or not profile_name:
         raise ValueError("owner_id and profile are required")
-    records, session_ids = _hosted_records(conversations, owner, profile_name)
+    records, session_ids = _hosted_records(
+        conversations,
+        owner,
+        profile_name,
+        account_generation=account_generation,
+    )
     records.extend(_delegation_records(Path(profile_home), session_ids, profile_name))
     records.sort(
         key=lambda item: (

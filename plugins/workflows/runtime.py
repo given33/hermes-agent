@@ -182,7 +182,7 @@ class WorkflowRuntime:
     def _scope_for(item: dict[str, Any]) -> WorkflowScope:
         return WorkflowScope(
             str(item["account_id"]),
-            int(item["account_generation"]),
+            str(item["account_generation"]),
             str(item["profile_id"]),
         )
 

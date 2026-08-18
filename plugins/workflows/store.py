@@ -7,6 +7,7 @@ import hashlib
 import hmac
 import json
 import os
+import re
 import secrets
 import sqlite3
 import time
@@ -31,22 +32,54 @@ from plugins.workflows.models import (
 from plugins.workflows.validator import canonical_digest, canonical_json, condition_matches, validate_definition
 from plugins.workflows.workspace_audit import redact_secrets
 
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 3
 MAX_WORKSPACE_FILES = 80
 MAX_WORKSPACE_FILE_BYTES = 1_048_576
 SENSITIVE_PARTS = {".env", ".git", "auth.json", "credentials", "secrets"}
+
+# v1 declared these columns INTEGER.  SQLite keeps that affinity when a table
+# already exists, even after the CREATE TABLE text is upgraded, which folds
+# opaque numeric generations such as ``"01"`` into the same value as ``"1"``.
+# The migration below rebuilds the complete workflow graph so foreign keys and
+# immutable-version triggers remain valid after the type change.
+_WORKFLOW_TABLES = (
+    "workflow_account_deletions",
+    "workflow_definitions",
+    "workflow_versions",
+    "workflow_runs",
+    "workflow_node_runs",
+    "workflow_edge_events",
+    "workflow_dispatch_intents",
+    "workflow_run_artifacts",
+    "workflow_workspace_change_sets",
+    "workflow_workspace_change_files",
+    "workflow_workspace_baselines",
+    "workflow_tool_approval_requests",
+    "workflow_idempotency",
+)
+_GENERATION_TABLES = (
+    "workflow_account_deletions",
+    "workflow_definitions",
+    "workflow_runs",
+    "workflow_dispatch_intents",
+    "workflow_workspace_change_sets",
+    "workflow_workspace_baselines",
+    "workflow_tool_approval_requests",
+    "workflow_idempotency",
+)
 
 
 SCHEMA = r"""
 CREATE TABLE IF NOT EXISTS workflow_schema(version INTEGER NOT NULL);
 CREATE TABLE IF NOT EXISTS workflow_account_deletions(
- account_id TEXT PRIMARY KEY, deleted_at INTEGER NOT NULL
+ account_id TEXT NOT NULL, account_generation TEXT NOT NULL, deleted_at INTEGER NOT NULL,
+ PRIMARY KEY(account_id, account_generation)
 );
 CREATE TABLE IF NOT EXISTS workflow_deleting_definitions(
  id TEXT PRIMARY KEY
 );
 CREATE TABLE IF NOT EXISTS workflow_definitions(
- id TEXT PRIMARY KEY, account_id TEXT NOT NULL, account_generation INTEGER NOT NULL,
+ id TEXT PRIMARY KEY, account_id TEXT NOT NULL, account_generation TEXT NOT NULL,
  profile_id TEXT NOT NULL, name TEXT NOT NULL, description TEXT NOT NULL DEFAULT '',
  current_version INTEGER NOT NULL, revision INTEGER NOT NULL, created_at INTEGER NOT NULL,
  updated_at INTEGER NOT NULL,
@@ -65,7 +98,7 @@ CREATE TRIGGER workflow_versions_no_delete
  WHEN NOT EXISTS(SELECT 1 FROM workflow_deleting_definitions WHERE id=OLD.definition_id)
  BEGIN SELECT RAISE(ABORT, 'workflow versions are immutable'); END;
 CREATE TABLE IF NOT EXISTS workflow_runs(
- id TEXT PRIMARY KEY, account_id TEXT NOT NULL, account_generation INTEGER NOT NULL,
+ id TEXT PRIMARY KEY, account_id TEXT NOT NULL, account_generation TEXT NOT NULL,
  profile_id TEXT NOT NULL, definition_id TEXT NOT NULL REFERENCES workflow_definitions(id),
  version_id TEXT NOT NULL REFERENCES workflow_versions(id), state TEXT NOT NULL,
  revision INTEGER NOT NULL, input_json TEXT NOT NULL, cancel_reason TEXT NOT NULL DEFAULT '',
@@ -90,7 +123,7 @@ CREATE TABLE IF NOT EXISTS workflow_edge_events(
  UNIQUE(source_node_run_id, edge_key, target_iteration, event_type)
 );
 CREATE TABLE IF NOT EXISTS workflow_dispatch_intents(
- id TEXT PRIMARY KEY, account_id TEXT NOT NULL, account_generation INTEGER NOT NULL,
+ id TEXT PRIMARY KEY, account_id TEXT NOT NULL, account_generation TEXT NOT NULL,
  profile_id TEXT NOT NULL, run_id TEXT NOT NULL REFERENCES workflow_runs(id) ON DELETE CASCADE,
  node_run_id TEXT NOT NULL REFERENCES workflow_node_runs(id) ON DELETE CASCADE,
  state TEXT NOT NULL, payload_json TEXT NOT NULL, attempts INTEGER NOT NULL DEFAULT 0,
@@ -106,7 +139,7 @@ CREATE TABLE IF NOT EXISTS workflow_run_artifacts(
  name TEXT NOT NULL, opaque_ref TEXT NOT NULL, metadata_json TEXT NOT NULL, created_at INTEGER NOT NULL
 );
 CREATE TABLE IF NOT EXISTS workflow_workspace_change_sets(
- id TEXT PRIMARY KEY, account_id TEXT NOT NULL, account_generation INTEGER NOT NULL,
+ id TEXT PRIMARY KEY, account_id TEXT NOT NULL, account_generation TEXT NOT NULL,
  profile_id TEXT NOT NULL, run_id TEXT NOT NULL REFERENCES workflow_runs(id) ON DELETE CASCADE,
  turn_id TEXT NOT NULL, summary TEXT NOT NULL DEFAULT '', created_at INTEGER NOT NULL
 );
@@ -118,7 +151,7 @@ CREATE TABLE IF NOT EXISTS workflow_workspace_change_files(
 );
 CREATE TABLE IF NOT EXISTS workflow_workspace_baselines(
  node_run_id TEXT PRIMARY KEY REFERENCES workflow_node_runs(id) ON DELETE CASCADE,
- account_id TEXT NOT NULL, account_generation INTEGER NOT NULL, profile_id TEXT NOT NULL,
+ account_id TEXT NOT NULL, account_generation TEXT NOT NULL, profile_id TEXT NOT NULL,
  run_id TEXT NOT NULL REFERENCES workflow_runs(id) ON DELETE CASCADE,
  state TEXT NOT NULL, reason TEXT NOT NULL DEFAULT '', file_count INTEGER NOT NULL DEFAULT 0,
  byte_count INTEGER NOT NULL DEFAULT 0, nonce BLOB, ciphertext BLOB,
@@ -128,7 +161,7 @@ CREATE TABLE IF NOT EXISTS workflow_workspace_baselines(
 CREATE INDEX IF NOT EXISTS workflow_workspace_baselines_scope_idx
  ON workflow_workspace_baselines(account_id, account_generation, profile_id, run_id);
 CREATE TABLE IF NOT EXISTS workflow_tool_approval_requests(
- id TEXT PRIMARY KEY, account_id TEXT NOT NULL, account_generation INTEGER NOT NULL,
+ id TEXT PRIMARY KEY, account_id TEXT NOT NULL, account_generation TEXT NOT NULL,
  profile_id TEXT NOT NULL, run_id TEXT NOT NULL REFERENCES workflow_runs(id) ON DELETE CASCADE,
  node_run_id TEXT NOT NULL REFERENCES workflow_node_runs(id) ON DELETE CASCADE,
  tool_name TEXT NOT NULL, args_hash TEXT NOT NULL, state TEXT NOT NULL,
@@ -137,7 +170,7 @@ CREATE TABLE IF NOT EXISTS workflow_tool_approval_requests(
  UNIQUE(run_id, node_run_id, tool_name, args_hash, state)
 );
 CREATE TABLE IF NOT EXISTS workflow_idempotency(
- account_id TEXT NOT NULL, account_generation INTEGER NOT NULL, profile_id TEXT NOT NULL,
+ account_id TEXT NOT NULL, account_generation TEXT NOT NULL, profile_id TEXT NOT NULL,
  operation TEXT NOT NULL, idempotency_key TEXT NOT NULL, payload_hash TEXT NOT NULL,
  response_json TEXT NOT NULL, created_at INTEGER NOT NULL,
  PRIMARY KEY(account_id, account_generation, profile_id, operation, idempotency_key)
@@ -204,14 +237,196 @@ class WorkflowStore:
         conn.execute("PRAGMA busy_timeout=30000")
         return conn
 
+    @staticmethod
+    def _quote_identifier(value: str) -> str:
+        return '"' + str(value).replace('"', '""') + '"'
+
+    @classmethod
+    def _generation_schema_needs_rebuild(cls, conn: sqlite3.Connection) -> bool:
+        for table in _GENERATION_TABLES:
+            columns = conn.execute(
+                f"PRAGMA table_info({cls._quote_identifier(table)})"
+            ).fetchall()
+            for row in columns:
+                if str(row[1]) == "account_generation":
+                    if str(row[2] or "").strip().upper() != "TEXT":
+                        return True
+                    break
+        return False
+
+    @classmethod
+    def _rebuild_generation_schema(cls, conn: sqlite3.Connection) -> None:
+        """Rebuild old INTEGER-affinity workflow tables as TEXT tables.
+
+        SQLite has no portable ALTER COLUMN operation.  All workflow tables
+        are copied together into temporary tables with their foreign-key
+        references rewritten to the temporary graph, then swapped in one
+        transaction.  This keeps old rows, constraints, and immutable-version
+        triggers intact while making opaque generations lossless.
+        """
+
+        suffix = "__generation_text_v3"
+        existing_tables = [
+            table
+            for table in _WORKFLOW_TABLES
+            if conn.execute(
+                "SELECT 1 FROM sqlite_master WHERE type='table' AND name=?",
+                (table,),
+            ).fetchone()
+        ]
+        if not existing_tables:
+            return
+
+        temp_names = {table: f"{table}{suffix}" for table in existing_tables}
+        for table, temp in temp_names.items():
+            conn.execute(f"DROP TABLE IF EXISTS {cls._quote_identifier(temp)}")
+
+        # Drop triggers before replacing their tables.  SCHEMA recreates the
+        # canonical definitions after the swap.
+        conn.execute("DROP TRIGGER IF EXISTS workflow_versions_no_update")
+        conn.execute("DROP TRIGGER IF EXISTS workflow_versions_no_delete")
+
+        for table in existing_tables:
+            row = conn.execute(
+                "SELECT sql FROM sqlite_master WHERE type='table' AND name=?",
+                (table,),
+            ).fetchone()
+            if row is None or not row[0]:
+                raise RuntimeError(f"workflow table definition is missing: {table}")
+            sql = str(row[0])
+            for referenced in existing_tables:
+                sql = re.sub(
+                    rf"(REFERENCES\s+){re.escape(referenced)}\b",
+                    rf"\1{temp_names[referenced]}",
+                    sql,
+                    flags=re.IGNORECASE,
+                )
+            sql = re.sub(
+                rf"(CREATE\s+TABLE\s+(?:IF\s+NOT\s+EXISTS\s+)?){re.escape(table)}\b",
+                rf"\1{temp_names[table]}",
+                sql,
+                count=1,
+                flags=re.IGNORECASE,
+            )
+            sql = re.sub(
+                r"(\baccount_generation\s+)INTEGER\b",
+                r"\1TEXT",
+                sql,
+                flags=re.IGNORECASE,
+            )
+            conn.execute(sql)
+
+        for table in existing_tables:
+            old_columns = [
+                str(row[1])
+                for row in conn.execute(
+                    f"PRAGMA table_info({cls._quote_identifier(table)})"
+                ).fetchall()
+            ]
+            if not old_columns:
+                raise RuntimeError(f"workflow table has no columns: {table}")
+            columns = ",".join(cls._quote_identifier(column) for column in old_columns)
+            select_columns = ",".join(
+                (
+                    f"CAST({cls._quote_identifier(column)} AS TEXT)"
+                    if column == "account_generation"
+                    else cls._quote_identifier(column)
+                )
+                for column in old_columns
+            )
+            conn.execute(
+                f"INSERT INTO {cls._quote_identifier(temp_names[table])} ({columns}) "
+                f"SELECT {select_columns} FROM {cls._quote_identifier(table)}"
+            )
+
+        for table in existing_tables:
+            conn.execute(f"DROP TABLE {cls._quote_identifier(table)}")
+        for table in existing_tables:
+            conn.execute(
+                f"ALTER TABLE {cls._quote_identifier(temp_names[table])} "
+                f"RENAME TO {cls._quote_identifier(table)}"
+            )
+        # Do not call executescript here: sqlite3 implicitly commits before a
+        # script, which would make the table swap non-atomic.  These are the
+        # only schema objects outside the table definitions and can be created
+        # transactionally one statement at a time.
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS workflow_runs_recovery_idx "
+            "ON workflow_runs(state, updated_at)"
+        )
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS workflow_node_runs_run_idx "
+            "ON workflow_node_runs(run_id, node_key, iteration, attempt DESC)"
+        )
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS workflow_dispatch_claim_idx "
+            "ON workflow_dispatch_intents(state, available_at, lease_expires_at)"
+        )
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS workflow_workspace_baselines_scope_idx "
+            "ON workflow_workspace_baselines(account_id, account_generation, profile_id, run_id)"
+        )
+        conn.execute(
+            "CREATE TRIGGER workflow_versions_no_update "
+            "BEFORE UPDATE ON workflow_versions BEGIN "
+            "SELECT RAISE(ABORT, 'workflow versions are immutable'); END"
+        )
+        conn.execute(
+            "CREATE TRIGGER workflow_versions_no_delete "
+            "BEFORE DELETE ON workflow_versions "
+            "WHEN NOT EXISTS(SELECT 1 FROM workflow_deleting_definitions WHERE id=OLD.definition_id) "
+            "BEGIN SELECT RAISE(ABORT, 'workflow versions are immutable'); END"
+        )
+        foreign_key_errors = conn.execute("PRAGMA foreign_key_check").fetchall()
+        if foreign_key_errors:
+            raise RuntimeError(
+                "workflow schema migration produced invalid foreign keys: "
+                + repr([tuple(row) for row in foreign_key_errors[:5]])
+            )
+
     def _init_schema(self) -> None:
         with self.connect() as conn:
             conn.executescript(SCHEMA)
+            deletion_columns = {
+                str(row[1])
+                for row in conn.execute("PRAGMA table_info(workflow_account_deletions)").fetchall()
+            }
+            if "account_generation" not in deletion_columns:
+                # v1 used account_id as the sole tombstone key. Preserve those
+                # rows as legacy-generation tombstones while allowing a newly
+                # registered account with the same public id to proceed.
+                conn.execute("ALTER TABLE workflow_account_deletions RENAME TO workflow_account_deletions_v1")
+                conn.execute(
+                    "CREATE TABLE workflow_account_deletions("
+                    "account_id TEXT NOT NULL, account_generation TEXT NOT NULL, "
+                    "deleted_at INTEGER NOT NULL, PRIMARY KEY(account_id, account_generation))"
+                )
+                conn.execute(
+                    "INSERT INTO workflow_account_deletions(account_id,account_generation,deleted_at) "
+                    "SELECT account_id,'legacy',deleted_at FROM workflow_account_deletions_v1"
+                )
+                conn.execute("DROP TABLE workflow_account_deletions_v1")
+            if self._generation_schema_needs_rebuild(conn):
+                # PRAGMA foreign_keys must be changed outside an explicit
+                # transaction. The connection is clean after executescript,
+                # and the swap itself is committed atomically below.
+                conn.execute("PRAGMA foreign_keys=OFF")
+                try:
+                    conn.execute("BEGIN IMMEDIATE")
+                    self._rebuild_generation_schema(conn)
+                    conn.commit()
+                except BaseException:
+                    conn.rollback()
+                    raise
+                finally:
+                    conn.execute("PRAGMA foreign_keys=ON")
             row = conn.execute("SELECT version FROM workflow_schema LIMIT 1").fetchone()
             if row is None:
                 conn.execute("INSERT INTO workflow_schema(version) VALUES (?)", (SCHEMA_VERSION,))
             elif int(row["version"]) > SCHEMA_VERSION:
                 raise RuntimeError("workflow database was created by a newer Hermes version")
+            elif int(row["version"]) < SCHEMA_VERSION:
+                conn.execute("UPDATE workflow_schema SET version=?", (SCHEMA_VERSION,))
 
     @contextmanager
     def transaction(self) -> Iterator[sqlite3.Connection]:
@@ -237,8 +452,8 @@ class WorkflowStore:
     def _replay(self, conn: sqlite3.Connection, scope: WorkflowScope, operation: str,
                 key: str, payload: Any) -> dict[str, Any] | None:
         if conn.execute(
-            "SELECT 1 FROM workflow_account_deletions WHERE account_id=?",
-            (scope.account_id,),
+            "SELECT 1 FROM workflow_account_deletions WHERE account_id=? AND account_generation=?",
+            (scope.account_id, scope.account_generation),
         ).fetchone() is not None:
             raise WorkflowSecurityError("account has been deleted")
         key = str(key or "").strip()
@@ -1864,27 +2079,40 @@ class WorkflowStore:
             )
 
     @staticmethod
-    def _purge_account_rows(conn: sqlite3.Connection, account: str) -> None:
+    def _purge_account_rows(
+        conn: sqlite3.Connection,
+        account: str,
+        account_generation: str,
+    ) -> None:
         conn.execute(
             "INSERT OR IGNORE INTO workflow_deleting_definitions(id) "
-            "SELECT id FROM workflow_definitions WHERE account_id=?",
-            (account,),
-        )
-        conn.execute("DELETE FROM workflow_idempotency WHERE account_id=?", (account,))
-        conn.execute(
-            "DELETE FROM workflow_tool_approval_requests WHERE account_id=?",
-            (account,),
+            "SELECT id FROM workflow_definitions WHERE account_id=? AND account_generation=?",
+            (account, account_generation),
         )
         conn.execute(
-            "DELETE FROM workflow_workspace_change_sets WHERE account_id=?",
-            (account,),
+            "DELETE FROM workflow_idempotency WHERE account_id=? AND account_generation=?",
+            (account, account_generation),
         )
         conn.execute(
-            "DELETE FROM workflow_dispatch_intents WHERE account_id=?",
-            (account,),
+            "DELETE FROM workflow_tool_approval_requests WHERE account_id=? AND account_generation=?",
+            (account, account_generation),
         )
-        conn.execute("DELETE FROM workflow_runs WHERE account_id=?", (account,))
-        conn.execute("DELETE FROM workflow_definitions WHERE account_id=?", (account,))
+        conn.execute(
+            "DELETE FROM workflow_workspace_change_sets WHERE account_id=? AND account_generation=?",
+            (account, account_generation),
+        )
+        conn.execute(
+            "DELETE FROM workflow_dispatch_intents WHERE account_id=? AND account_generation=?",
+            (account, account_generation),
+        )
+        conn.execute(
+            "DELETE FROM workflow_runs WHERE account_id=? AND account_generation=?",
+            (account, account_generation),
+        )
+        conn.execute(
+            "DELETE FROM workflow_definitions WHERE account_id=? AND account_generation=?",
+            (account, account_generation),
+        )
         conn.execute(
             "DELETE FROM workflow_deleting_definitions WHERE id NOT IN "
             "(SELECT id FROM workflow_definitions)"
@@ -1896,55 +2124,70 @@ class WorkflowStore:
         bounded = max(1, min(int(limit), 100))
         with self.transaction() as conn:
             rows = conn.execute(
-                "SELECT d.account_id FROM workflow_account_deletions d "
+                "SELECT d.account_id,d.account_generation FROM workflow_account_deletions d "
                 "WHERE (EXISTS(SELECT 1 FROM workflow_definitions w "
-                "WHERE w.account_id=d.account_id) OR EXISTS("
-                "SELECT 1 FROM workflow_runs r WHERE r.account_id=d.account_id)) "
+                "WHERE w.account_id=d.account_id AND w.account_generation=d.account_generation) "
+                "OR EXISTS(SELECT 1 FROM workflow_runs r WHERE r.account_id=d.account_id "
+                "AND r.account_generation=d.account_generation)) "
                 "AND NOT EXISTS(SELECT 1 FROM workflow_dispatch_intents i "
-                "WHERE i.account_id=d.account_id AND i.state!='cancelled') "
-                "ORDER BY d.deleted_at,d.account_id LIMIT ?",
+                "WHERE i.account_id=d.account_id AND i.account_generation=d.account_generation "
+                "AND i.state!='cancelled') "
+                "ORDER BY d.deleted_at,d.account_id,d.account_generation LIMIT ?",
                 (bounded,),
             ).fetchall()
             for row in rows:
-                self._purge_account_rows(conn, str(row["account_id"]))
+                account = str(row["account_id"])
+                generation = str(row["account_generation"])
+                self._purge_account_rows(conn, account, generation)
+                conn.execute(
+                    "DELETE FROM workflow_account_deletions WHERE account_id=? AND account_generation=?",
+                    (account, generation),
+                )
             return len(rows)
 
     def delete_account(
         self,
         account_id: str,
         *,
+        account_generation: str = "legacy",
         now: int | None = None,
     ) -> dict[str, int]:
         account = str(account_id or "").strip()
         if not account:
             raise ValueError("account_id is required")
+        generation = str(account_generation or "").strip()
+        if not generation or len(generation) > 512:
+            raise ValueError("account_generation is required and must be at most 512 characters")
         with self.transaction() as conn:
             current = int(_now() if now is None else now)
             conn.execute(
-                "INSERT OR IGNORE INTO workflow_account_deletions(account_id,deleted_at) VALUES(?,?)",
-                (account, current),
+                "INSERT OR IGNORE INTO workflow_account_deletions(account_id,account_generation,deleted_at) "
+                "VALUES(?,?,?)",
+                (account, generation, current),
             )
             run_count = int(conn.execute(
-                "SELECT COUNT(*) FROM workflow_runs WHERE account_id=?", (account,)
+                "SELECT COUNT(*) FROM workflow_runs WHERE account_id=? AND account_generation=?",
+                (account, generation),
             ).fetchone()[0])
             definition_count = int(conn.execute(
-                "SELECT COUNT(*) FROM workflow_definitions WHERE account_id=?", (account,)
+                "SELECT COUNT(*) FROM workflow_definitions WHERE account_id=? AND account_generation=?",
+                (account, generation),
             ).fetchone()[0])
 
             conn.execute(
                 "UPDATE workflow_runs SET state='cancelled',revision=revision+1,"
                 "cancel_reason=CASE WHEN cancel_reason='' THEN 'account_deleted' "
                 "ELSE cancel_reason END,updated_at=?,finished_at=? "
-                "WHERE account_id=? AND state='running'",
-                (current, current, account),
+                "WHERE account_id=? AND account_generation=? AND state='running'",
+                (current, current, account, generation),
             )
             placeholders = ",".join("?" for _ in TERMINAL_NODE_STATES)
             conn.execute(
                 f"UPDATE workflow_node_runs SET state='cancelled',revision=revision+1,"
                 f"updated_at=?,finished_at=? WHERE run_id IN ("
-                f"SELECT id FROM workflow_runs WHERE account_id=?) "
+                f"SELECT id FROM workflow_runs WHERE account_id=? AND account_generation=?) "
                 f"AND state NOT IN ({placeholders})",
-                (current, current, account, *sorted(TERMINAL_NODE_STATES)),
+                (current, current, account, generation, *sorted(TERMINAL_NODE_STATES)),
             )
             # A claimed intent may have crossed the external create boundary
             # even when its reference was never recorded. Keep those rows as a
@@ -1953,15 +2196,15 @@ class WorkflowStore:
                 "UPDATE workflow_dispatch_intents SET state=CASE WHEN "
                 "attempts>0 OR external_ref!='' THEN 'cancel_pending' "
                 "ELSE 'cancelled' END,available_at=?,lease_token=NULL,"
-                "lease_expires_at=NULL,updated_at=? WHERE account_id=? "
+                "lease_expires_at=NULL,updated_at=? WHERE account_id=? AND account_generation=? "
                 "AND state NOT IN ('cancelled','cancel_pending','cancel_retry',"
                 "'cancel_delivering')",
-                (current, current, account),
+                (current, current, account, generation),
             )
             pending = int(conn.execute(
                 "SELECT COUNT(*) FROM workflow_dispatch_intents "
-                "WHERE account_id=? AND state!='cancelled'",
-                (account,),
+                "WHERE account_id=? AND account_generation=? AND state!='cancelled'",
+                (account, generation),
             ).fetchone()[0])
             if pending:
                 return {
@@ -1970,5 +2213,12 @@ class WorkflowStore:
                     "pending_cancellations": pending,
                 }
 
-            self._purge_account_rows(conn, account)
-            return {"definitions": definition_count, "runs": run_count}
+            self._purge_account_rows(conn, account, generation)
+            conn.execute(
+                "DELETE FROM workflow_account_deletions WHERE account_id=? AND account_generation=?",
+                (account, generation),
+            )
+            return {
+                "definitions": definition_count,
+                "runs": run_count,
+            }

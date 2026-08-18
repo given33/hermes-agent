@@ -3697,7 +3697,10 @@ def delete_owner_account_data(
     # Delete external/runtime state before dropping the only persisted list of
     # identifiers. A failure leaves the conversation tombstones for retry.
     for profile, session_id in runtime_sessions:
-        _delete_runtime_session(profile, session_id)
+        if not _delete_runtime_session(profile, session_id):
+            raise OSError(
+                f"unable to remove runtime session {profile}:{session_id}"
+            )
     for conversation_id in conversation_ids:
         if not conversation_id:
             continue
@@ -4092,14 +4095,23 @@ def _delete_runtime_session(profile: str, session_id: str) -> bool:
 
     normalized_session_id = session_id.strip()
     if not normalized_session_id:
-        return False
+        # The caller only persists non-empty ids. Treat an empty value as an
+        # already-complete cleanup so a malformed legacy row cannot strand a
+        # deletion tombstone forever.
+        return True
     db_path = _backend_api().get_profile_dir(profile.strip() or "default") / "state.db"
     if not db_path.exists():
-        return False
+        # The profile database may have been removed by an independent
+        # account/profile cleanup. There is no runtime state left to delete.
+        return True
     db = SessionDB(db_path=db_path)
     try:
         resolved = db.resolve_session_id(normalized_session_id)
-        return bool(resolved and db.delete_session(resolved))
+        if not resolved:
+            # Deletion is idempotent: a previous retry may already have
+            # removed the session.
+            return True
+        return bool(db.delete_session(resolved))
     finally:
         db.close()
 
@@ -21778,6 +21790,22 @@ def _finalize_pending_conversation_deletion(conversation_id: str) -> bool:
             _remove_room_index_for_conversation(conversation_id, owner_id)
         except Exception:
             return False
+        # Runtime session databases are outside the collaboration document.
+        # Keep the tombstone authoritative until every mapped session is
+        # deleted (or confirmed already absent), so a transient SQLite or
+        # filesystem failure remains retryable instead of silently orphaning
+        # the user's transcript after the conversation row is removed.
+        for profile, session_id in runtime_sessions:
+            try:
+                if not _delete_runtime_session(profile, session_id):
+                    return False
+            except Exception:
+                logging.getLogger(__name__).exception(
+                    "Failed to delete runtime session %s:%s",
+                    profile,
+                    session_id,
+                )
+                return False
         # Account-file rows are a separate durable store.  Remove them before
         # dropping the conversation tombstone so a crash leaves a retryable
         # deletion intent rather than an orphaned file index/object.
@@ -21831,11 +21859,6 @@ def _finalize_pending_conversation_deletion(conversation_id: str) -> bool:
         owner_id=owner_id,
         account_generation=account_generation,
     )
-    for profile, session_id in runtime_sessions:
-        try:
-            _delete_runtime_session(profile, session_id)
-        except Exception:
-            pass
     return True
 
 
@@ -24239,7 +24262,14 @@ def _mobile_profile_home(profile: str) -> tuple[str, Path]:
         raise HTTPException(status_code=404, detail="Profile not found") from exc
 
 
-def _mobile_owned_conversations(owner_id: str) -> list[dict[str, Any]]:
+def _mobile_owned_conversations(
+    owner_id: str,
+    account_generation: str = "",
+) -> list[dict[str, Any]]:
+    normalized_owner = str(owner_id or "").strip()
+    normalized_generation = str(
+        account_generation or _account_generation_for_owner(normalized_owner)
+    ).strip()
     with _STATE_LOCK:
         state = load_single_state()
         return [
@@ -24247,13 +24277,22 @@ def _mobile_owned_conversations(owner_id: str) -> list[dict[str, Any]]:
             for conversation in (state.get("conversations") or [])
             if isinstance(conversation, dict)
             and not conversation.get("delete_requested")
-            and str(conversation.get("owner_id") or "").strip() == owner_id
+            and str(conversation.get("owner_id") or "").strip() == normalized_owner
+            and (
+                not str(conversation.get("account_generation") or "").strip()
+                or str(conversation.get("account_generation") or "").strip()
+                == normalized_generation
+            )
         ]
 
 
-def _mobile_owned_session_ids(owner_id: str, profile: str) -> set[str]:
+def _mobile_owned_session_ids(
+    owner_id: str,
+    profile: str,
+    account_generation: str = "",
+) -> set[str]:
     result: set[str] = set()
-    for conversation in _mobile_owned_conversations(owner_id):
+    for conversation in _mobile_owned_conversations(owner_id, account_generation):
         conversation_profile = str(conversation.get("profile") or "default").lower()
         sessions = conversation.get("runtime_sessions") or {}
         if isinstance(sessions, dict):
@@ -24282,12 +24321,25 @@ def _mobile_session_facade(
     from hermes_cli.account_session_facade import AccountSessionFacade
 
     owner_id = owner_id_from_request(request)
+    account_generation = _account_generation_for_request(request, owner_id)
     normalized, home = _mobile_profile_home(profile)
     facade = AccountSessionFacade(home, normalized)
-    if not facade.is_bound(owner_id=owner_id, session_id=session_id):
-        if session_id not in _mobile_owned_session_ids(owner_id, normalized):
+    if not facade.is_bound(
+        owner_id=owner_id,
+        session_id=session_id,
+        account_generation=account_generation,
+    ):
+        if session_id not in _mobile_owned_session_ids(
+            owner_id,
+            normalized,
+            account_generation,
+        ):
             raise HTTPException(status_code=404, detail="Session not found")
-        if not facade.bind_existing(owner_id=owner_id, session_id=session_id):
+        if not facade.bind_existing(
+            owner_id=owner_id,
+            session_id=session_id,
+            account_generation=account_generation,
+        ):
             raise HTTPException(status_code=404, detail="Session not found")
     return owner_id, normalized, facade
 
@@ -24316,6 +24368,7 @@ def _mobile_conversation_session(
     """Resolve an account conversation to its current authoritative session."""
 
     owner_id = owner_id_from_request(request)
+    account_generation = _account_generation_for_request(request, owner_id)
     with _STATE_LOCK:
         state = load_single_state()
         conversation, claimed = _owned_conversation_in_state(
@@ -24355,7 +24408,11 @@ def _mobile_conversation_session(
             facade.db.resolve_resume_session_id(session_id) or session_id
         ).strip()
         if resolved != session_id:
-            if not facade.bind_existing(owner_id=owner_id, session_id=resolved):
+            if not facade.bind_existing(
+                owner_id=owner_id,
+                session_id=resolved,
+                account_generation=account_generation,
+            ):
                 raise HTTPException(status_code=404, detail="Session not found")
             with _STATE_LOCK:
                 state = load_single_state()
@@ -24409,10 +24466,19 @@ def mobile_conversation_session_state(
     owner_id, normalized, session_id, facade, conversation = (
         _mobile_conversation_session(request, conversation_id, profile)
     )
+    account_generation = _account_generation_for_request(request, owner_id)
     try:
-        context = facade.context(owner_id=owner_id, session_id=session_id)
+        context = facade.context(
+            owner_id=owner_id,
+            session_id=session_id,
+            account_generation=account_generation,
+        )
         lineage = _public_mobile_lineage(
-            facade.lineage(owner_id=owner_id, session_id=session_id)
+            facade.lineage(
+                owner_id=owner_id,
+                session_id=session_id,
+                account_generation=account_generation,
+            )
         )
     except Exception as exc:
         raise _mobile_session_error(exc) from exc
@@ -24478,7 +24544,9 @@ def mobile_fork_conversation_message(
             request, normalized, source_session_id
         )
         source_context = facade.context(
-            owner_id=owner_id, session_id=source_session_id
+            owner_id=owner_id,
+            session_id=source_session_id,
+            account_generation=account_generation,
         )
         forked = facade.fork(
             owner_id=owner_id,
@@ -24487,6 +24555,7 @@ def mobile_fork_conversation_message(
             expected_tip_id=int(source_context.get("tip_message_id") or 0),
             idempotency_key=body.idempotency_key,
             title=body.title,
+            account_generation=account_generation,
         )
     except Exception as exc:
         raise _mobile_session_error(exc) from exc
@@ -24554,6 +24623,7 @@ def mobile_compress_conversation(
     owner_id, normalized, session_id, facade, _conversation = (
         _mobile_conversation_session(request, conversation_id, body.profile)
     )
+    account_generation = _account_generation_for_request(request, owner_id)
     fingerprint = hashlib.sha256(
         json.dumps(
             {
@@ -24612,10 +24682,16 @@ def mobile_compress_conversation(
         )
         new_session_id = str(completion.get("session_id") or "").strip()
         if not new_session_id or not facade.bind_existing(
-            owner_id=owner_id, session_id=new_session_id
+            owner_id=owner_id,
+            session_id=new_session_id,
+            account_generation=account_generation,
         ):
             raise RuntimeError("compressed continuation session was not persisted")
-        context = facade.context(owner_id=owner_id, session_id=new_session_id)
+        context = facade.context(
+            owner_id=owner_id,
+            session_id=new_session_id,
+            account_generation=account_generation,
+        )
         response = {
             "conversation_id": conversation_id,
             "profile": normalized,
@@ -24675,6 +24751,7 @@ def mobile_fork_session(
     owner_id, _profile, facade = _mobile_session_facade(
         request, body.profile, session_id
     )
+    account_generation = _account_generation_for_request(request, owner_id)
     try:
         return facade.fork(
             owner_id=owner_id,
@@ -24683,6 +24760,7 @@ def mobile_fork_session(
             expected_tip_id=body.expected_tip_id,
             idempotency_key=body.idempotency_key,
             title=body.title,
+            account_generation=account_generation,
         )
     except Exception as exc:
         raise _mobile_session_error(exc) from exc
@@ -24697,8 +24775,13 @@ def mobile_session_lineage(
     owner_id, _profile, facade = _mobile_session_facade(
         request, profile, session_id
     )
+    account_generation = _account_generation_for_request(request, owner_id)
     try:
-        return facade.lineage(owner_id=owner_id, session_id=session_id)
+        return facade.lineage(
+            owner_id=owner_id,
+            session_id=session_id,
+            account_generation=account_generation,
+        )
     except Exception as exc:
         raise _mobile_session_error(exc) from exc
 
@@ -24712,8 +24795,13 @@ def mobile_session_context(
     owner_id, _profile, facade = _mobile_session_facade(
         request, profile, session_id
     )
+    account_generation = _account_generation_for_request(request, owner_id)
     try:
-        return facade.context(owner_id=owner_id, session_id=session_id)
+        return facade.context(
+            owner_id=owner_id,
+            session_id=session_id,
+            account_generation=account_generation,
+        )
     except Exception as exc:
         raise _mobile_session_error(exc) from exc
 
@@ -25047,8 +25135,9 @@ def mobile_runtime_runs(
     from hermes_cli.account_runtime_aggregate import aggregate_account_runtime
 
     owner_id = owner_id_from_request(request)
+    account_generation = _account_generation_for_request(request, owner_id)
     normalized, home = _mobile_profile_home(profile)
-    conversations = _mobile_owned_conversations(owner_id)
+    conversations = _mobile_owned_conversations(owner_id, account_generation)
     for conversation in conversations:
         reconcile_stale_hosted_turns(conversation)
     return aggregate_account_runtime(
@@ -25056,6 +25145,7 @@ def mobile_runtime_runs(
         profile=normalized,
         profile_home=home,
         conversations=conversations,
+        account_generation=account_generation,
         limit=limit,
     )
 
@@ -25174,7 +25264,8 @@ def mobile_runtime_run_control(
         _prefix, conversation_id, turn_id = token.split(":", 2) if token.count(":") >= 2 else ("", "", "")
     else:
         turn_id = token
-    conversations = _mobile_owned_conversations(owner_id)
+    account_generation = _account_generation_for_request(request, owner_id)
+    conversations = _mobile_owned_conversations(owner_id, account_generation)
     conversation = next(
         (
             item for item in conversations
