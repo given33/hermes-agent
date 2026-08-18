@@ -516,11 +516,16 @@ class WorkflowStore:
         skipped forever by someone else's marker.
         """
         with self.connect() as conn:
-            row = conn.execute(
-                "SELECT 1 FROM workflow_migration_markers WHERE key=?",
-                (f"legacy_generation_migrated:{str(account_id or '').strip()}",),
-            ).fetchone()
-            return row is not None
+            rows = conn.execute(
+                "SELECT 1 FROM workflow_migration_markers WHERE key IN (?, ?)",
+                (
+                    f"legacy_generation_migrated:{str(account_id or '').strip()}",
+                    # A terminal IntegrityError failure is equally "done":
+                    # the rekey can never succeed and must stop retrying.
+                    f"legacy_generation_migrated_failed:{str(account_id or '').strip()}",
+                ),
+            ).fetchall()
+            return bool(rows)
 
     def mark_legacy_generation_migration_failed(self, account_id: str) -> None:
         """Record a terminal rekey failure so it stops retrying per request.
@@ -2339,13 +2344,16 @@ class WorkflowStore:
         totals: dict[str, int] = {}
         generations: list[str] = []
         with self.connect() as conn:
+            discovery_tables = [
+                table for table in _GENERATION_TABLES
+            ]
+            union_sql = " UNION ".join(
+                f"SELECT DISTINCT account_generation FROM {table} WHERE account_id=?"
+                for table in discovery_tables
+            )
             rows = conn.execute(
-                "SELECT DISTINCT account_generation FROM workflow_definitions "
-                "WHERE account_id=? UNION "
-                "SELECT DISTINCT account_generation FROM workflow_account_deletions "
-                "WHERE account_id=? UNION "
-                "SELECT DISTINCT account_generation FROM workflow_runs WHERE account_id=?",
-                (account, account, account),
+                union_sql,
+                (account,) * len(discovery_tables),
             ).fetchall()
             generations = [str(row[0]) for row in rows if str(row[0] or "").strip()]
         for generation in generations:

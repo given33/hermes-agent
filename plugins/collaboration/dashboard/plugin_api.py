@@ -23554,13 +23554,14 @@ def clear_room_context(room_id: str, request: Request):
                     and str(run.get("status") or "queued") not in _HOSTED_TERMINAL_STATUSES
                 ]
                 if active_turns:
+                    # Plain-string detail: the iOS error surface renders
+                    # string details verbatim and drops structured objects.
                     raise HTTPException(
                         status_code=409,
-                        detail={
-                            "reason": "room_clear_active_turn",
-                            "message": "Cancel or wait for the running turn before clearing.",
-                            "turn_ids": active_turns[:10],
-                        },
+                        detail=(
+                            "Cancel or wait for the running turn before clearing. "
+                            f"Active turns: {', '.join(active_turns[:10])}"
+                        ),
                     )
                 conversation["messages"] = []
                 conversation["session_entries"] = []
@@ -23698,13 +23699,17 @@ def delete_room_workspace_path(room_id: str, request: Request, path: str = "", r
         target = _room_workspace_child(room, path)
     if not target.exists():
         raise HTTPException(status_code=404, detail="Workspace path not found")
-    if target.is_dir():
-        if recursive:
-            shutil.rmtree(target)
+    try:
+        if target.is_dir():
+            if recursive:
+                shutil.rmtree(target)
+            else:
+                target.rmdir()
         else:
-            target.rmdir()
-    else:
-        target.unlink()
+            target.unlink()
+    except FileNotFoundError as exc:
+        # A concurrent delete won the race once the state lock was released.
+        raise HTTPException(status_code=404, detail="Workspace path not found") from exc
     return {"ok": True}
 
 
@@ -23719,8 +23724,11 @@ def rename_room_workspace_path(room_id: str, payload: RoomWorkspaceTwoPathBody, 
         destination = _room_workspace_child(room, payload.new_path)
     if not source.exists():
         raise HTTPException(status_code=404, detail="Workspace path not found")
-    destination.parent.mkdir(parents=True, exist_ok=True)
-    shutil.move(str(source), str(destination))
+    try:
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        shutil.move(str(source), str(destination))
+    except FileNotFoundError as exc:
+        raise HTTPException(status_code=404, detail="Workspace path not found") from exc
     return {"ok": True}
 
 
@@ -26577,8 +26585,14 @@ def mobile_runtime_run_control(
             run_record["paused"] = False
             run_record["resumed_at"] = int(time.time() * 1000)
             run_record["updated_at"] = int(time.time() * 1000)
+            stage = str(run_record.get("stage") or "")
             save_single_state(single_state)
-        start_hosted_workflow(conversation_id, turn_id)
+        # routing-stage turns are invisible to the work consumer; they resume
+        # through the routing dispatcher instead of the workflow starter.
+        if stage in {"routing_pending", "routing_failed"}:
+            start_hosted_routing(conversation_id, turn_id)
+        else:
+            start_hosted_workflow(conversation_id, turn_id)
         _notify_hosted_update(conversation_id)
         return {
             "action": "resume",
