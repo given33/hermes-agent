@@ -110,13 +110,17 @@ def test_list_shows_only_own_children():
     parent = _StubParent()
     mine = _StubChild(parent)
     foreign = _StubChild(_StubParent())
-    _register("sid-ctl-list-1", mine)
+    _register("sid-ctl-list-1", mine, name="资料调查员", owner_agent_session_id="sess-a")
     _register("sid-ctl-list-2", foreign)
+    parent.session_id = "sess-a"
     try:
         out = json.loads(_handle_control_action("list", None, None, parent))
         assert out["count"] == 1
         entry = out["subagents"][0]
         assert entry["subagent_id"] == "sid-ctl-list-1"
+        # The fork's model-chosen display name survives the live list
+        # projection (the shadowed pre-merge copy dropped it).
+        assert entry["name"] == "资料调查员"
         assert entry["goal"] == "test goal"
         assert entry["accepting_steer"] is True
         assert entry["live_transcript"] == "/tmp/live/task-0.log"
