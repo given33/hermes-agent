@@ -46,6 +46,21 @@ def _isolate(tmp_path, monkeypatch):
         _interrupted_threads.clear()
 
 
+
+def _quoted_bash_path(path) -> str:
+    """A native Windows temp path, bash-safe and shell-quoted.
+
+    Unquoted ``C:\...`` paths lose their backslashes inside Git Bash and the
+    sentinel lands in the repo root; the quoted native form is treated as a
+    relative name instead. Rewriting to the MSYS form first keeps the file at
+    the pytest-managed location on every host.
+    """
+    import shlex as _shlex
+
+    from tools.environments.local import _bash_safe_path
+
+    return _shlex.quote(_bash_safe_path(str(path)))
+
 def _wait_for_sentinel(sentinel, timeout=10.0):
     """Block until the running command created its sentinel (proving the
     clean-slate clear already ran and the command is in its poll loop)."""
@@ -94,7 +109,7 @@ def test_approved_command_genuine_interrupt_after_start_still_kills(tmp_path):
 
     def worker():
         holder["result"] = tt.terminal_tool(
-            command=f"touch {sentinel}; sleep 5; echo DONE", force=True
+            command=f"touch {_quoted_bash_path(sentinel)}; sleep 5; echo DONE", force=True
         )
 
     t = threading.Thread(target=worker, daemon=True)
@@ -125,7 +140,7 @@ def test_approved_note_enriched_not_misleading_on_interrupt(monkeypatch, tmp_pat
     holder = {}
 
     def worker():
-        holder["result"] = tt.terminal_tool(command=f"touch {sentinel}; sleep 5; echo DONE")
+        holder["result"] = tt.terminal_tool(command=f"touch {_quoted_bash_path(sentinel)}; sleep 5; echo DONE")
 
     t = threading.Thread(target=worker, daemon=True)
     t.start()
