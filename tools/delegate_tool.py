@@ -407,119 +407,6 @@ def list_active_subagents(
         return snapshots
 
 
-def _is_descendant_of(child_agent: Any, parent_agent: Any, max_hops: int = 32) -> bool:
-    """Return whether ``child_agent`` belongs to ``parent_agent``'s spawn tree."""
-
-    if child_agent is None or parent_agent is None:
-        return False
-    current = child_agent
-    for _ in range(max_hops):
-        parent_ref = getattr(current, "_delegate_parent_ref", None)
-        ancestor = parent_ref() if callable(parent_ref) else None
-        if ancestor is None:
-            return False
-        if ancestor is parent_agent:
-            return True
-        current = ancestor
-    return False
-
-
-_CONTROL_ACTIONS = frozenset({"list", "steer", "stop"})
-
-
-def _handle_control_action(
-    action: str,
-    subagent_id: Optional[str],
-    message: Optional[str],
-    parent_agent: Any,
-) -> str:
-    """Control only live descendants of the invoking parent agent."""
-
-    if action == "list":
-        with _active_subagents_lock:
-            records = list(_active_subagents.values())
-        entries: List[Dict[str, Any]] = []
-        for record in records:
-            agent = record.get("agent")
-            if not _is_descendant_of(agent, parent_agent):
-                continue
-            started_at = record.get("started_at")
-            entries.append(
-                {
-                    "subagent_id": record.get("subagent_id"),
-                    "parent_id": record.get("parent_id"),
-                    "name": record.get("name"),
-                    "goal": record.get("goal"),
-                    "model": record.get("model"),
-                    "status": record.get("status"),
-                    "running_seconds": (
-                        round(time.time() - started_at, 1)
-                        if isinstance(started_at, (int, float))
-                        else None
-                    ),
-                    "accepting_steer": bool(record.get("accepting_steer", False)),
-                    "live_transcript": getattr(agent, "_live_transcript_path", None),
-                }
-            )
-        payload: Dict[str, Any] = {
-            "action": "list",
-            "count": len(entries),
-            "subagents": entries,
-        }
-        if not entries:
-            payload["note"] = "No live subagents in this conversation's spawn tree."
-        return json.dumps(payload, ensure_ascii=False)
-
-    sid = str(subagent_id or "").strip()
-    if not sid:
-        return tool_error(
-            f"action='{action}' requires subagent_id from the spawn response "
-            "or action='list'."
-        )
-    with _active_subagents_lock:
-        record = _active_subagents.get(sid)
-        target_agent = record.get("agent") if record else None
-    if record is None or not _is_descendant_of(target_agent, parent_agent):
-        return tool_error(
-            f"No live subagent '{sid}' in this conversation's spawn tree. "
-            "It may already have finished; use action='list' to refresh."
-        )
-
-    if action == "stop":
-        if interrupt_subagent(sid):
-            return json.dumps(
-                {
-                    "action": "stop",
-                    "subagent_id": sid,
-                    "status": "interrupt_requested",
-                    "note": (
-                        "The subagent will stop at an iteration boundary; any "
-                        "partial result still returns through normal completion."
-                    ),
-                },
-                ensure_ascii=False,
-            )
-        return tool_error(f"Subagent '{sid}' stopped accepting control.")
-
-    text = str(message or "").strip()
-    if not text:
-        return tool_error("action='steer' requires a non-empty message.")
-    if steer_subagent(sid, text):
-        return json.dumps(
-            {
-                "action": "steer",
-                "subagent_id": sid,
-                "status": "queued",
-                "note": (
-                    "Steering is queued for the next tool boundary. If the "
-                    "child finishes first, completion reports missed_steer."
-                ),
-            },
-            ensure_ascii=False,
-        )
-    return tool_error(f"Subagent '{sid}' is no longer accepting steering.")
-
-
 def _is_descendant_of(child_agent: Any, parent_agent: Any, max_hops: int = 8) -> bool:
     """True when *child_agent* sits below *parent_agent* in the spawn tree.
 
@@ -631,6 +518,10 @@ def _handle_control_action(
                 {
                     "subagent_id": r.get("subagent_id"),
                     "parent_id": r.get("parent_id"),
+                    # The model chooses display names for its children (a
+                    # Chinese job title etc.); showing them alongside the
+                    # opaque id makes steer/stop addressing far easier.
+                    "name": r.get("name"),
                     "goal": r.get("goal"),
                     "model": r.get("model"),
                     "status": r.get("status"),
@@ -5465,10 +5356,14 @@ def subagent_send(subagent_id: str, text: str, parent_agent=None) -> str:
         return tool_error("subagent_send requires a parent agent context.")
     with _active_subagents_lock:
         target_record = _active_subagents.get(sid)
-        target_agent = target_record.get("agent") if target_record else None
-    if target_record is None or not _is_descendant_of(target_agent, parent_agent):
+    # Durable session lineage, not the weakref chain alone: the parent
+    # AIAgent can be rebuilt mid-session (/model, credential refresh), and
+    # identity-only checks then strand every running child (the same class
+    # of live incident upstream fixed for delegate_task(action=steer)).
+    if target_record is None or not _owns_subagent_record(target_record, parent_agent):
         return tool_error("subagent_send target is outside this spawn tree.")
-    if steer_subagent(sid, msg[:2000]):
+    steered_text = msg[:2000]
+    if steer_subagent(sid, steered_text):
         return json.dumps(
             {
                 "status": "queued",
@@ -5476,6 +5371,11 @@ def subagent_send(subagent_id: str, text: str, parent_agent=None) -> str:
                 "note": (
                     "指令已入队，将在该子代理下一次迭代时送达；"
                     "不会打断它正在执行的工具。"
+                ),
+                **(
+                    {"truncated": True, "original_length": len(msg)}
+                    if len(msg) > 2000
+                    else {}
                 ),
             },
             ensure_ascii=False,
@@ -5556,8 +5456,8 @@ def subagent_kill(subagent_id: str, parent_agent=None) -> str:
         return tool_error("subagent_kill requires a parent agent context.")
     with _active_subagents_lock:
         target_record = _active_subagents.get(sid)
-        target_agent = target_record.get("agent") if target_record else None
-    if target_record is None or not _is_descendant_of(target_agent, parent_agent):
+    # Same durable-lineage ownership as subagent_send / delegate_task.
+    if target_record is None or not _owns_subagent_record(target_record, parent_agent):
         return tool_error("subagent_kill target is outside this spawn tree.")
     try:
         accepted = interrupt_subagent(sid)
