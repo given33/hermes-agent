@@ -31,6 +31,7 @@ test('collectSshConfigHosts follows Include directives (read-only)', () => {
   const homeDir = path.join(path.parse(process.cwd()).root, 'home', 'u')
   const sshDir = path.join(homeDir, '.ssh')
   const root = path.join(sshDir, 'config')
+
   const files = {
     [root]: 'Host main\nInclude work\nInclude ~/abs_inc',
     [path.join(sshDir, 'work')]: 'Host work-box\nInclude nested',
@@ -54,6 +55,7 @@ test('collectSshConfigHosts does not loop on a self-include cycle', () => {
   const homeDir = path.join(path.parse(process.cwd()).root, 'home', 'u')
   const sshDir = path.join(homeDir, '.ssh')
   const root = path.join(sshDir, 'config')
+
   const files = {
     [root]: 'Host a\nInclude loop',
     [path.join(sshDir, 'loop')]: 'Host b\nInclude config' // points back at config
@@ -71,6 +73,7 @@ test('collectSshConfigHosts expands globbed includes via injected globSync', () 
   const homeDir = path.join(path.parse(process.cwd()).root, 'home', 'u')
   const sshDir = path.join(homeDir, '.ssh')
   const root = path.join(sshDir, 'config')
+
   const files = {
     [root]: 'Host root\nInclude config.d/*',
     [path.join(sshDir, 'config.d', '10-work')]: 'Host work',
