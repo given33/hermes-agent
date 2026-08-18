@@ -17295,6 +17295,10 @@ def _append_message(
 class CreateRoomBody(BaseModel):
     name: str = "新群聊"
     profiles: list[str] = Field(default_factory=list)
+    invite_code: str = ""
+    workspace: str = ""
+    summary: dict[str, Any] = Field(default_factory=dict)
+    settings: dict[str, Any] = Field(default_factory=dict)
 
 
 class SendMessageBody(BaseModel):
@@ -17302,6 +17306,10 @@ class SendMessageBody(BaseModel):
     profiles: Optional[list[str]] = None
     request_id: str = ""
     turn_id: str = ""
+    # Structured mentions: [{"type": "agent"|"all", "participantId": "..."}].
+    # Agent mentions route the turn to the targeted room profiles only; an
+    # "all" mention (or no mentions at all) addresses every room profile.
+    mentions: Optional[list[dict[str, Any]]] = None
 
 
 class MailboxMessageBody(BaseModel):
@@ -22033,7 +22041,10 @@ def get_rooms(request: Request):
         rooms = [
             room
             for room in state.get("rooms") or []
-            if str(room.get("owner_id") or "") == owner_id
+            if (
+                str(room.get("owner_id") or "") == owner_id
+                or _room_is_member(room, owner_id)
+            )
             and str(room.get("account_generation") or "") == account_generation
             and not _room_maps_to_deleting_conversation(room, single_state)
         ]
@@ -22055,10 +22066,16 @@ def get_rooms(request: Request):
             save_state(state)
         elif claimed:
             save_state(state)
-        summaries = [
-            _room_projection(room, single_state, summary=True)
-            for room in rooms
-        ]
+        summaries = []
+        for room in rooms:
+            projection = _room_projection(room, single_state, summary=True)
+            projection["agents"] = _room_agents_projection(room)
+            projection["members"] = _room_members(
+                room, str(room.get("owner_id") or owner_id)
+            )
+            projection["can_mention_all"] = True
+            projection["can_manage"] = str(room.get("owner_id") or "") == owner_id
+            summaries.append(projection)
     return {"rooms": summaries}
 
 
@@ -22079,6 +22096,24 @@ def create_room(payload: CreateRoomBody, request: Request):
             owner_id,
             account_generation,
         )
+        requested_code = payload.invite_code.strip()
+        if requested_code:
+            room["invite_code"] = requested_code[:64]
+        if payload.workspace.strip():
+            room["workspace"] = payload.workspace.strip()[:500]
+        if isinstance(payload.summary, dict) and payload.summary:
+            room["summary_config"] = {
+                key: payload.summary[key]
+                for key in _ROOM_SUMMARY_FIELDS
+                if key in payload.summary
+            }
+        if isinstance(payload.settings, dict) and payload.settings:
+            room["settings"] = {
+                key: payload.settings[key]
+                for key in _ROOM_SETTINGS_FIELDS
+                if key in payload.settings
+            }
+        room["members"] = [_room_owner_member(room, owner_id)]
         _room_conversation_in_state(
             room,
             single_state,
@@ -22088,7 +22123,11 @@ def create_room(payload: CreateRoomBody, request: Request):
         state["rooms"].insert(0, room)
         save_single_state(single_state)
         save_state(state)
-    return {"room": _room_projection(room, single_state, summary=False)}
+        projection = _room_projection(room, single_state, summary=False)
+        projection["agents"] = _room_agents_projection(room)
+        projection["members"] = _room_members(room, owner_id)
+        projection["can_mention_all"] = True
+    return {"room": projection}
 
 
 @router.get("/rooms/{room_id}")
@@ -22103,7 +22142,7 @@ def get_room(room_id: str, request: Request):
             account_generation=account_generation,
             requested_room_id=room_id,
         )
-        room = _owned_room_in_state(
+        room = _accessible_room_in_state(
             state,
             room_id,
             owner_id,
@@ -22133,21 +22172,13 @@ def get_room(room_id: str, request: Request):
             limit = max(1, min(500, int(raw_limit))) if raw_limit else None
         except (TypeError, ValueError):
             limit = None
-        projection = _room_projection(
+        return _room_detail_response(
             room,
             single_state,
-            summary=False,
+            owner_id,
             offset=offset,
             limit=limit,
         )
-        return {
-            "room": projection,
-            "messages": projection.get("messages") or [],
-            "total": projection.get("message_count", 0),
-            "offset": projection.get("offset", offset),
-            "limit": projection.get("limit", limit or 0),
-            "has_more": projection.get("has_more", False),
-        }
 
 
 @router.get("/rooms/{room_id}/mailbox")
@@ -22389,7 +22420,7 @@ def send_message(room_id: str, payload: SendMessageBody, request: Request):
             account_generation=account_generation,
             requested_room_id=room_id,
         )
-        room = _owned_room_in_state(
+        room = _accessible_room_in_state(
             state,
             room_id,
             owner_id,
@@ -22397,6 +22428,13 @@ def send_message(room_id: str, payload: SendMessageBody, request: Request):
         )
         known_profiles = set(room.get("profiles") or [])
         requested = payload.profiles or list(room.get("profiles") or [])
+        mention_profiles = _resolve_room_mention_profiles(
+            room,
+            payload.mentions,
+            known_profiles,
+        )
+        if mention_profiles is not None:
+            requested = mention_profiles
         targets = collaboration_execution_order(
             [name for name in requested if name in known_profiles]
         )
@@ -22411,10 +22449,11 @@ def send_message(room_id: str, payload: SendMessageBody, request: Request):
             ).encode("utf-8")
         ).hexdigest()
         single_state = load_single_state()
+        room_owner_id = str(room.get("owner_id") or owner_id)
         conversation, _created = _room_conversation_in_state(
             room,
             single_state,
-            owner_id,
+            room_owner_id,
             account_generation,
         )
         room_requests = room.get("hosted_requests")
@@ -22512,12 +22551,20 @@ def send_message(room_id: str, payload: SendMessageBody, request: Request):
                     status_code=409,
                     detail="message_id 已用于会话中的另一条消息",
                 )
+            message_meta: dict[str, Any] = {
+                "room_id": room_id,
+                "request_id": request_id,
+                "sender_id": owner_id,
+            }
+            normalized_mentions = _normalized_room_mentions(payload.mentions)
+            if normalized_mentions:
+                message_meta["mentions"] = normalized_mentions
             user_message = _append_message(
                 conversation,
                 role="user",
                 name="User",
                 content=content,
-                meta={"room_id": room_id, "request_id": request_id},
+                meta=message_meta,
             )
             user_message["id"] = request_id
             _project_native_message(user_message)
@@ -22608,6 +22655,968 @@ def cancel_room_hosted_turn(
     except RuntimeError as exc:
         raise HTTPException(status_code=404, detail=str(exc)) from exc
     return {"hosted_turn": _public_hosted_turn(hosted)}
+
+
+# ---------------------------------------------------------------------------
+# Studio group-chat completion: agent roster management, invite codes and
+# membership, typing presence, message retraction, room summary/context
+# settings, room workspace files, and room-scoped write approvals.  These
+# routes share the room state file, ownership fencing, and the linked
+# hosted-conversation transcript with the core room API above.
+# ---------------------------------------------------------------------------
+
+_ROOM_TYPING_TTL_MS = 6_000
+_ROOM_INVITE_CODE_ALPHABET = "abcdefghjkmnpqrstuvwxyz23456789"
+_ROOM_SUMMARY_FIELDS = ("profile", "provider", "model", "api_mode", "every_turns")
+_ROOM_CONTEXT_FIELDS = ("trigger_tokens", "max_history_tokens", "tail_messages")
+_ROOM_SETTINGS_FIELDS = (
+    "allow_guest_agents",
+    "guest_agent_approval",
+    "max_guest_agents_per_member",
+    "allow_remote_workspace_access",
+)
+_ROOM_MAX_LIST_ENTRIES = 2_000
+
+
+def _generate_room_invite_code() -> str:
+    return "".join(secrets.choice(_ROOM_INVITE_CODE_ALPHABET) for _ in range(10))
+
+
+def _room_owner_member(room: dict[str, Any], owner_id: str) -> dict[str, Any]:
+    now = int(time.time() * 1000)
+    return {
+        "id": f"member-owner-{owner_id}",
+        "user_id": owner_id,
+        "name": "Owner",
+        "role": "owner",
+        "joined_at": int(room.get("created_at") or now),
+    }
+
+
+def _room_members(room: dict[str, Any], owner_id: str) -> list[dict[str, Any]]:
+    members = [m for m in (room.get("members") or []) if isinstance(m, dict)]
+    if not any(str(m.get("user_id") or "") == owner_id for m in members):
+        members.insert(0, _room_owner_member(room, owner_id))
+    return members
+
+
+def _room_is_member(room: dict[str, Any], owner_id: str) -> bool:
+    return any(
+        isinstance(m, dict) and str(m.get("user_id") or "") == owner_id
+        for m in room.get("members") or []
+    )
+
+
+def _accessible_room_in_state(
+    state: dict[str, Any],
+    room_id: str,
+    owner_id: str,
+    account_generation: str,
+) -> dict[str, Any]:
+    """Owner OR invited-member room lookup with the same fencing as _owned_room_in_state."""
+
+    try:
+        room = _owned_room_in_state(state, room_id, owner_id, account_generation)
+    except HTTPException as exc:
+        if exc.status_code != 404:
+            raise
+        room = None
+    if room is not None:
+        if str(room.get("owner_id") or "") == owner_id or _room_is_member(room, owner_id):
+            return room
+    # Members reach rooms owned by another account: the invite code created a
+    # durable membership entry. The room's own generation fence still applies.
+    for candidate in state.get("rooms") or []:
+        if not isinstance(candidate, dict) or candidate.get("id") != room_id:
+            continue
+        if not _room_is_member(candidate, owner_id):
+            continue
+        stored_generation = str(candidate.get("account_generation") or "").strip()
+        if stored_generation and stored_generation != account_generation:
+            raise HTTPException(status_code=404, detail="Room not found")
+        return candidate
+    raise HTTPException(status_code=404, detail="Room not found")
+
+
+def _room_agents_projection(room: dict[str, Any]) -> list[dict[str, Any]]:
+    profiles = list(dict.fromkeys(room.get("profiles") or []))
+    metadata: dict[str, dict[str, Any]] = {}
+    for item in room.get("agents") or []:
+        if isinstance(item, dict):
+            key = str(item.get("profile") or "").strip()
+            if key:
+                metadata[key] = item
+    try:
+        known = {p["name"]: p for p in available_profiles()}
+    except Exception:
+        known = {}
+    agents = []
+    for profile in profiles:
+        meta = metadata.get(profile) or {}
+        info = known.get(profile) or {}
+        agents.append(
+            {
+                "id": f"{room.get('id')}:profile:{profile}",
+                "room_id": room.get("id"),
+                "agent_id": profile,
+                "agent": "hermes",
+                "profile": profile,
+                "provider": str(meta.get("provider") or info.get("provider") or ""),
+                "model": str(meta.get("model") or info.get("model") or ""),
+                "name": str(meta.get("name") or profile),
+                "description": str(meta.get("description") or info.get("description") or ""),
+                "avatar": str(meta.get("avatar") or ""),
+                "connection_status": "online" if (profile in known or not known) else "offline",
+            }
+        )
+    return agents
+
+
+def _room_active_typing(room: dict[str, Any]) -> list[dict[str, Any]]:
+    now = int(time.time() * 1000)
+    typing = room.get("typing") if isinstance(room.get("typing"), dict) else {}
+    active = []
+    for member_key, record in list(typing.items()):
+        if not isinstance(record, dict):
+            continue
+        expires_at = int(record.get("expires_at") or 0)
+        if expires_at <= now:
+            typing.pop(member_key, None)
+            continue
+        active.append(
+            {
+                "id": str(record.get("id") or member_key),
+                "name": str(record.get("name") or member_key),
+                "expires_at": expires_at,
+            }
+        )
+    return active
+
+
+def _room_summary_state(room: dict[str, Any]) -> dict[str, Any]:
+    summary = room.get("summary") if isinstance(room.get("summary"), dict) else {}
+    now = int(time.time() * 1000)
+    return {
+        "room_id": str(room.get("id") or ""),
+        "summary": str(summary.get("text") or ""),
+        "summary_through_message_id": str(summary.get("through_message_id") or ""),
+        "summary_through_message_timestamp": int(summary.get("through_timestamp") or 0),
+        "summarized_turn_count": int(summary.get("turn_count") or 0),
+        "status": str(summary.get("status") or "idle"),
+        "version": int(summary.get("version") or 0),
+        "updated_at": int(summary.get("updated_at") or 0),
+        "last_error": summary.get("last_error") if summary.get("last_error") is not None else None,
+        "server_time": now,
+    }
+
+
+def _room_workspace_root(room: dict[str, Any]) -> Path:
+    conversation_id = str(room.get("conversation_id") or "")
+    if not conversation_id:
+        raise HTTPException(status_code=409, detail="Room workspace is not ready yet; retry")
+    root = _contained_storage_path(conversation_files_root(conversation_id), "workspace")
+    root.mkdir(parents=True, exist_ok=True)
+    return root
+
+
+def _room_workspace_child(room: dict[str, Any], relative: str) -> Path:
+    root = _room_workspace_root(room)
+    cleaned = str(relative or "").strip().replace("\\", "/").lstrip("/")
+    parts = [part for part in cleaned.split("/") if part not in {"", ".", ".."}]
+    if not parts:
+        return root
+    try:
+        return _contained_storage_path(root, *parts)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail="Invalid workspace path") from exc
+
+
+def _workspace_listing(target: Path) -> dict[str, Any]:
+    entries = []
+    try:
+        children = sorted(target.iterdir(), key=lambda p: (p.is_file(), p.name.lower()))
+    except OSError:
+        children = []
+    for child in children[:_ROOM_MAX_LIST_ENTRIES]:
+        try:
+            stat = child.stat()
+        except OSError:
+            continue
+        entries.append(
+            {
+                "name": child.name,
+                "path": child.name,
+                "type": "directory" if child.is_dir() else "file",
+                "size": stat.st_size if child.is_file() else 0,
+                "modified_at": int(stat.st_mtime * 1000),
+            }
+        )
+    return {"entries": entries, "truncated": len(children) > _ROOM_MAX_LIST_ENTRIES}
+
+
+def _normalized_room_mentions(mentions: Any) -> list[dict[str, Any]]:
+    normalized = []
+    for item in mentions or []:
+        if not isinstance(item, dict):
+            continue
+        kind = str(item.get("type") or "").strip().lower()
+        if kind not in {"agent", "all"}:
+            continue
+        normalized.append(
+            {
+                "type": kind,
+                "participant_id": str(item.get("participantId") or item.get("participant_id") or "").strip(),
+                "display_name": str(item.get("displayName") or item.get("display_name") or "").strip(),
+            }
+        )
+    return normalized
+
+
+def _resolve_room_mention_profiles(
+    room: dict[str, Any],
+    mentions: Any,
+    known_profiles: set[str],
+) -> Optional[list[str]]:
+    """Map structured mentions to room profiles; None keeps the default targeting."""
+
+    normalized = _normalized_room_mentions(mentions)
+    if not normalized:
+        return None
+    if any(item["type"] == "all" for item in normalized):
+        return list(known_profiles)
+    by_profile = {profile.lower(): profile for profile in known_profiles}
+    by_name = {
+        str(agent.get("name") or "").strip().lower(): str(agent.get("profile") or "")
+        for agent in _room_agents_projection(room)
+    }
+    targets: list[str] = []
+    for item in normalized:
+        key = item["participant_id"].strip().lower()
+        profile = by_profile.get(key) or by_name.get(key)
+        if profile and profile not in targets:
+            targets.append(profile)
+    if not targets:
+        # Unresolvable mentions must not silently drop the message: address
+        # every member so the turn still runs, mirroring the @all fallback.
+        return list(known_profiles)
+    return targets
+
+
+class RoomAgentBody(BaseModel):
+    profile: str
+    name: str = ""
+    description: str = ""
+
+
+class RoomAgentUpdateBody(BaseModel):
+    profile: str = ""
+    name: str = ""
+    description: str = ""
+
+
+class RoomConfigBody(BaseModel):
+    name: str = ""
+    workspace: str = ""
+    summary: dict[str, Any] = Field(default_factory=dict)
+    context: dict[str, Any] = Field(default_factory=dict)
+    settings: dict[str, Any] = Field(default_factory=dict)
+
+
+class RoomInviteCodeBody(BaseModel):
+    invite_code: str = ""
+
+
+class RoomJoinBody(BaseModel):
+    invite_code: str = ""
+
+
+class RoomTypingBody(BaseModel):
+    state: str = "start"
+    name: str = ""
+
+
+class RoomSummaryBody(BaseModel):
+    summary: str = ""
+
+
+class RoomApprovalDecisionBody(BaseModel):
+    profile: str = "default"
+    expected_revision: int = Field(gt=0)
+    decision: str
+    payload_digest: str = ""
+
+
+def _touch_room(room: dict[str, Any]) -> None:
+    room["updated_at"] = int(time.time() * 1000)
+
+
+def _room_detail_response(
+    room: dict[str, Any],
+    single_state: dict[str, Any],
+    owner_id: str,
+    offset: int = 0,
+    limit: Optional[int] = None,
+) -> dict[str, Any]:
+    projection = _room_projection(
+        room,
+        single_state,
+        summary=False,
+        offset=offset,
+        limit=limit,
+    )
+    projection["agents"] = _room_agents_projection(room)
+    projection["members"] = _room_members(room, str(room.get("owner_id") or owner_id))
+    projection["typing_users"] = _room_active_typing(room)
+    projection["summary_state"] = _room_summary_state(room)
+    return {
+        "room": projection,
+        "messages": projection.get("messages") or [],
+        "agents": projection["agents"],
+        "members": projection["members"],
+        "total": projection.get("message_count", 0),
+        "offset": projection.get("offset", offset),
+        "limit": projection.get("limit", limit or 0),
+        "has_more": projection.get("has_more", False),
+        "typing_users": projection["typing_users"],
+        "summary_state": projection["summary_state"],
+    }
+
+
+@router.get("/rooms/{room_id}/agents")
+def list_room_agents(room_id: str, request: Request):
+    owner_id = owner_id_from_request(request)
+    account_generation = _account_generation_for_request(request, owner_id)
+    with _STATE_LOCK:
+        state = load_state()
+        room = _accessible_room_in_state(state, room_id, owner_id, account_generation)
+        return {"agents": _room_agents_projection(room)}
+
+
+@router.post("/rooms/{room_id}/agents")
+def add_room_agent(room_id: str, payload: RoomAgentBody, request: Request):
+    owner_id = owner_id_from_request(request)
+    account_generation = _account_generation_for_request(request, owner_id)
+    profile = payload.profile.strip()
+    if not profile:
+        raise HTTPException(status_code=400, detail="profile is required")
+    with _STATE_LOCK:
+        state = load_state()
+        room = _owned_room_in_state(state, room_id, owner_id, account_generation)
+        if profile not in {item["name"] for item in available_profiles()}:
+            raise HTTPException(status_code=404, detail=f"Unknown Hermes profile: {profile}")
+        profiles = room.setdefault("profiles", [])
+        if profile not in profiles:
+            profiles.append(profile)
+        agents = room.get("agents")
+        if not isinstance(agents, list):
+            agents = []
+            room["agents"] = agents
+        agents.append(
+            {
+                "profile": profile,
+                "name": payload.name.strip()[:120],
+                "description": payload.description.strip()[:2_000],
+            }
+        )
+        _touch_room(room)
+        save_state(state)
+        projection = _room_agents_projection(room)
+    return {"agent": next((a for a in projection if a["profile"] == profile), {})}
+
+
+@router.put("/rooms/{room_id}/agents/{agent_id}")
+def update_room_agent(room_id: str, agent_id: str, payload: RoomAgentUpdateBody, request: Request):
+    owner_id = owner_id_from_request(request)
+    account_generation = _account_generation_for_request(request, owner_id)
+    with _STATE_LOCK:
+        state = load_state()
+        room = _owned_room_in_state(state, room_id, owner_id, account_generation)
+        profiles = list(room.get("profiles") or [])
+        current = _agent_profile_from_identifier(agent_id, profiles)
+        if current is None:
+            raise HTTPException(status_code=404, detail="Room agent not found")
+        new_profile = payload.profile.strip()
+        if new_profile and new_profile != current:
+            if new_profile not in {item["name"] for item in available_profiles()}:
+                raise HTTPException(status_code=404, detail=f"Unknown Hermes profile: {new_profile}")
+            profiles[profiles.index(current)] = new_profile
+            room["profiles"] = profiles
+            current = new_profile
+        agents = room.get("agents")
+        if not isinstance(agents, list):
+            agents = []
+            room["agents"] = agents
+        record = next(
+            (
+                item
+                for item in agents
+                if isinstance(item, dict) and str(item.get("profile") or "") == current
+            ),
+            None,
+        )
+        if record is None:
+            record = {"profile": current, "name": "", "description": ""}
+            agents.append(record)
+        if payload.name.strip():
+            record["name"] = payload.name.strip()[:120]
+        if payload.description.strip():
+            record["description"] = payload.description.strip()[:2_000]
+        _touch_room(room)
+        save_state(state)
+        agents_projection = _room_agents_projection(room)
+    return {
+        "agent": next((a for a in agents_projection if a["profile"] == current), {}),
+        "agents": agents_projection,
+        "members": _room_members(room, owner_id),
+    }
+
+
+def _agent_profile_from_identifier(agent_id: str, profiles: list[str]) -> Optional[str]:
+    cleaned = str(agent_id or "").strip()
+    for profile in profiles:
+        if cleaned in {profile, f"profile:{profile}"} or cleaned.endswith(f":profile:{profile}"):
+            return profile
+    lowered = cleaned.lower()
+    for profile in profiles:
+        if profile.lower() == lowered:
+            return profile
+    return None
+
+
+@router.delete("/rooms/{room_id}/agents/{agent_id}")
+def remove_room_agent(room_id: str, agent_id: str, request: Request):
+    owner_id = owner_id_from_request(request)
+    account_generation = _account_generation_for_request(request, owner_id)
+    with _STATE_LOCK:
+        state = load_state()
+        room = _owned_room_in_state(state, room_id, owner_id, account_generation)
+        profiles = list(room.get("profiles") or [])
+        current = _agent_profile_from_identifier(agent_id, profiles)
+        if current is None:
+            raise HTTPException(status_code=404, detail="Room agent not found")
+        if len(profiles) <= 1:
+            raise HTTPException(status_code=409, detail="A room must keep at least one agent")
+        profiles.remove(current)
+        room["profiles"] = profiles
+        agents = room.get("agents")
+        if isinstance(agents, list):
+            room["agents"] = [
+                item
+                for item in agents
+                if not (isinstance(item, dict) and str(item.get("profile") or "") == current)
+            ]
+        _touch_room(room)
+        save_state(state)
+        agents_projection = _room_agents_projection(room)
+    return {
+        "success": True,
+        "agents": agents_projection,
+        "members": _room_members(room, owner_id),
+    }
+
+
+@router.put("/rooms/{room_id}")
+def update_room_config(room_id: str, payload: RoomConfigBody, request: Request):
+    owner_id = owner_id_from_request(request)
+    account_generation = _account_generation_for_request(request, owner_id)
+    with _STATE_LOCK:
+        state = load_state()
+        room = _owned_room_in_state(state, room_id, owner_id, account_generation)
+        if payload.name.strip():
+            room["name"] = payload.name.strip()[:200]
+        if payload.workspace.strip():
+            room["workspace"] = payload.workspace.strip()[:500]
+        summary_config = dict(room.get("summary_config") or {})
+        for field in _ROOM_SUMMARY_FIELDS:
+            if field in payload.summary:
+                summary_config[field] = payload.summary[field]
+        room["summary_config"] = summary_config
+        context_config = dict(room.get("context_config") or {})
+        for field in _ROOM_CONTEXT_FIELDS:
+            if field in payload.context:
+                try:
+                    context_config[field] = max(0, int(payload.context[field]))
+                except (TypeError, ValueError):
+                    continue
+        room["context_config"] = context_config
+        settings = dict(room.get("settings") or {})
+        for field in _ROOM_SETTINGS_FIELDS:
+            if field in payload.settings:
+                settings[field] = payload.settings[field]
+        room["settings"] = settings
+        _touch_room(room)
+        save_state(state)
+        single_state = load_single_state()
+        response = _room_detail_response(room, single_state, owner_id)
+        conversation_id = str(room.get("conversation_id") or "")
+    _notify_hosted_update(conversation_id)
+    return response
+
+
+@router.post("/rooms/{room_id}/invite-code")
+def rotate_room_invite_code(room_id: str, payload: RoomInviteCodeBody, request: Request):
+    owner_id = owner_id_from_request(request)
+    account_generation = _account_generation_for_request(request, owner_id)
+    with _STATE_LOCK:
+        state = load_state()
+        room = _owned_room_in_state(state, room_id, owner_id, account_generation)
+        requested = payload.invite_code.strip()
+        code = requested[:64] if requested else _generate_room_invite_code()
+        if not requested:
+            # Generated codes must stay unique across every room in the file.
+            existing = {
+                str(item.get("invite_code") or "")
+                for item in state.get("rooms") or []
+                if isinstance(item, dict)
+            }
+            while code in existing:
+                code = _generate_room_invite_code()
+        room["invite_code"] = code
+        _touch_room(room)
+        save_state(state)
+    return {"success": True, "invite_code": code}
+
+
+@router.post("/rooms/join")
+def join_room_by_code(payload: RoomJoinBody, request: Request):
+    owner_id = owner_id_from_request(request)
+    account_generation = _account_generation_for_request(request, owner_id)
+    code = payload.invite_code.strip()
+    if not code:
+        raise HTTPException(status_code=400, detail="invite_code is required")
+    with _STATE_LOCK:
+        state = load_state()
+        room = next(
+            (
+                item
+                for item in state.get("rooms") or []
+                if isinstance(item, dict) and str(item.get("invite_code") or "") == code
+            ),
+            None,
+        )
+        if not isinstance(room, dict):
+            raise HTTPException(status_code=404, detail="Invite code not found")
+        room_owner = str(room.get("owner_id") or "").strip()
+        if room_owner == owner_id or _room_is_member(room, owner_id):
+            _touch_room(room)
+            save_state(state)
+        else:
+            members = room.setdefault("members", [])
+            members.append(
+                {
+                    "id": f"member-{uuid.uuid4().hex[:10]}",
+                    "user_id": owner_id,
+                    "name": "Member",
+                    "role": "member",
+                    "joined_at": int(time.time() * 1000),
+                }
+            )
+            _touch_room(room)
+            save_state(state)
+        single_state = load_single_state()
+        response = _room_detail_response(room, single_state, room_owner)
+        conversation_id = str(room.get("conversation_id") or "")
+    _notify_hosted_update(conversation_id)
+    return response
+
+
+@router.delete("/rooms/{room_id}/members/{member_user_id}")
+def remove_room_member(room_id: str, member_user_id: str, request: Request):
+    owner_id = owner_id_from_request(request)
+    account_generation = _account_generation_for_request(request, owner_id)
+    with _STATE_LOCK:
+        state = load_state()
+        room = _owned_room_in_state(state, room_id, owner_id, account_generation)
+        target = str(member_user_id or "").strip()
+        if not target or target == str(room.get("owner_id") or ""):
+            raise HTTPException(status_code=409, detail="The room owner cannot be removed")
+        members = [m for m in (room.get("members") or []) if isinstance(m, dict)]
+        remaining = [m for m in members if str(m.get("user_id") or "") != target]
+        if len(remaining) == len(members):
+            raise HTTPException(status_code=404, detail="Room member not found")
+        room["members"] = remaining
+        _touch_room(room)
+        save_state(state)
+        agents_projection = _room_agents_projection(room)
+        conversation_id = str(room.get("conversation_id") or "")
+    _notify_hosted_update(conversation_id)
+    return {
+        "success": True,
+        "agents": agents_projection,
+        "members": _room_members(room, owner_id),
+    }
+
+
+@router.delete("/rooms/{room_id}/messages/{message_id}")
+def retract_room_message(room_id: str, message_id: str, request: Request):
+    owner_id = owner_id_from_request(request)
+    account_generation = _account_generation_for_request(request, owner_id)
+    with _STATE_LOCK:
+        state = load_state()
+        room = _accessible_room_in_state(state, room_id, owner_id, account_generation)
+        conversation_id = str(room.get("conversation_id") or "")
+        if not conversation_id:
+            raise HTTPException(status_code=409, detail="Room transcript is not ready yet; retry")
+        room_owner = str(room.get("owner_id") or owner_id)
+        single_state = load_single_state()
+        conversation = next(
+            (
+                item
+                for item in single_state.get("conversations") or []
+                if isinstance(item, dict) and str(item.get("id") or "") == conversation_id
+            ),
+            None,
+        )
+        if not isinstance(conversation, dict):
+            raise HTTPException(status_code=404, detail="Message not found")
+        message = next(
+            (
+                item
+                for item in conversation.get("messages") or []
+                if isinstance(item, dict) and str(item.get("id") or "") == str(message_id)
+            ),
+            None,
+        )
+        if not isinstance(message, dict):
+            # Older tails may live in the hydrated sidecar.
+            hydrated = _hydrate_conversation_history(conversation)
+            message = next(
+                (
+                    item
+                    for item in hydrated.get("messages") or []
+                    if isinstance(item, dict) and str(item.get("id") or "") == str(message_id)
+                ),
+                None,
+            )
+            if isinstance(message, dict):
+                conversation = hydrated
+        if not isinstance(message, dict):
+            raise HTTPException(status_code=404, detail="Message not found")
+        meta = message.get("meta") if isinstance(message.get("meta"), dict) else {}
+        sender = str(meta.get("sender_id") or "")
+        is_own = str(message.get("role") or "") == "user" and (
+            sender == owner_id
+            or (
+                not sender
+                and (room_owner == owner_id or str(meta.get("room_id") or "") == room_id)
+            )
+        )
+        is_owner = room_owner == owner_id
+        if not (is_own or is_owner):
+            raise HTTPException(status_code=403, detail="Only the sender or room owner can retract")
+        if meta.get("retracted"):
+            save_single_state(single_state)
+            return {"ok": True, "retracted": True, "replayed": True}
+        message["content"] = "[已撤回]"
+        message["meta"] = {**meta, "retracted": True, "retracted_at": int(time.time() * 1000)}
+        conversation["updated_at"] = int(time.time() * 1000)
+        save_single_state(single_state)
+    _notify_hosted_update(conversation_id)
+    return {"ok": True, "retracted": True, "replayed": False}
+
+
+@router.post("/rooms/{room_id}/typing")
+def set_room_typing(room_id: str, payload: RoomTypingBody, request: Request):
+    owner_id = owner_id_from_request(request)
+    account_generation = _account_generation_for_request(request, owner_id)
+    conversation_id = ""
+    with _STATE_LOCK:
+        state = load_state()
+        room = _accessible_room_in_state(state, room_id, owner_id, account_generation)
+        conversation_id = str(room.get("conversation_id") or "")
+        typing = room.get("typing")
+        if not isinstance(typing, dict):
+            typing = {}
+            room["typing"] = typing
+        member_key = owner_id
+        if str(payload.state or "").strip().lower() == "stop":
+            typing.pop(member_key, None)
+        else:
+            display = payload.name.strip()[:120] or "Member"
+            typing[member_key] = {
+                "id": member_key,
+                "name": display,
+                "expires_at": int(time.time() * 1000) + _ROOM_TYPING_TTL_MS,
+            }
+        _touch_room(room)
+        save_state(state)
+    if conversation_id:
+        # Watchers on the hosted-event stream re-read the room projection, so
+        # typing presence reaches every online member without a poll tick.
+        _notify_hosted_update(conversation_id)
+    return {"ok": True}
+
+
+@router.get("/rooms/{room_id}/summary")
+def get_room_summary(room_id: str, request: Request):
+    owner_id = owner_id_from_request(request)
+    account_generation = _account_generation_for_request(request, owner_id)
+    with _STATE_LOCK:
+        state = load_state()
+        room = _accessible_room_in_state(state, room_id, owner_id, account_generation)
+        return {
+            "summary": _room_summary_state(room),
+            "anchor": None,
+            "config": dict(room.get("summary_config") or {}),
+        }
+
+
+@router.put("/rooms/{room_id}/summary")
+def update_room_summary(room_id: str, payload: RoomSummaryBody, request: Request):
+    owner_id = owner_id_from_request(request)
+    account_generation = _account_generation_for_request(request, owner_id)
+    with _STATE_LOCK:
+        state = load_state()
+        room = _owned_room_in_state(state, room_id, owner_id, account_generation)
+        summary = room.get("summary")
+        if not isinstance(summary, dict):
+            summary = {}
+            room["summary"] = summary
+        summary.update(
+            {
+                "text": payload.summary[:20_000],
+                "status": "success",
+                "version": int(summary.get("version") or 0) + 1,
+                "updated_at": int(time.time() * 1000),
+                "last_error": None,
+            }
+        )
+        _touch_room(room)
+        save_state(state)
+    return {"summary": _room_summary_state(room)}
+
+
+@router.post("/rooms/{room_id}/clear")
+def clear_room_context(room_id: str, request: Request):
+    owner_id = owner_id_from_request(request)
+    account_generation = _account_generation_for_request(request, owner_id)
+    conversation_id = ""
+    with _STATE_LOCK:
+        state = load_state()
+        room = _owned_room_in_state(state, room_id, owner_id, account_generation)
+        conversation_id = str(room.get("conversation_id") or "")
+        if conversation_id:
+            single_state = load_single_state()
+            conversation = next(
+                (
+                    item
+                    for item in single_state.get("conversations") or []
+                    if isinstance(item, dict) and str(item.get("id") or "") == conversation_id
+                ),
+                None,
+            )
+            if isinstance(conversation, dict):
+                conversation["messages"] = []
+                conversation["updated_at"] = int(time.time() * 1000)
+                save_single_state(single_state)
+        room["mailbox"] = []
+        _touch_room(room)
+        save_state(state)
+    if conversation_id:
+        _notify_hosted_update(conversation_id)
+    return {"success": True}
+
+
+@router.get("/rooms/{room_id}/workspace/files")
+def list_room_workspace_files(room_id: str, request: Request, path: str = ""):
+    owner_id = owner_id_from_request(request)
+    account_generation = _account_generation_for_request(request, owner_id)
+    with _STATE_LOCK:
+        state = load_state()
+        room = _accessible_room_in_state(state, room_id, owner_id, account_generation)
+        target = _room_workspace_child(room, path)
+    if not target.is_dir():
+        raise HTTPException(status_code=404, detail="Workspace path not found")
+    return _workspace_listing(target)
+
+
+@router.get("/rooms/{room_id}/workspace/file")
+def read_room_workspace_file(room_id: str, request: Request, path: str = ""):
+    owner_id = owner_id_from_request(request)
+    account_generation = _account_generation_for_request(request, owner_id)
+    with _STATE_LOCK:
+        state = load_state()
+        room = _accessible_room_in_state(state, room_id, owner_id, account_generation)
+        target = _room_workspace_child(room, path)
+    if not target.is_file():
+        raise HTTPException(status_code=404, detail="Workspace file not found")
+    try:
+        content = target.read_text(encoding="utf-8")
+    except (OSError, UnicodeDecodeError) as exc:
+        raise HTTPException(status_code=422, detail="Workspace file is not readable text") from exc
+    return {
+        "path": str(path),
+        "name": target.name,
+        "content": content,
+        "size": len(content.encode("utf-8")),
+        "modified_at": int(target.stat().st_mtime * 1000),
+    }
+
+
+class RoomWorkspaceWriteBody(BaseModel):
+    content: str = ""
+    path: str = ""
+
+
+class RoomWorkspaceTwoPathBody(BaseModel):
+    old_path: str = ""
+    new_path: str = ""
+    source_path: str = ""
+    destination_path: str = ""
+
+
+@router.put("/rooms/{room_id}/workspace/file")
+def write_room_workspace_file(room_id: str, payload: RoomWorkspaceWriteBody, request: Request):
+    owner_id = owner_id_from_request(request)
+    account_generation = _account_generation_for_request(request, owner_id)
+    with _STATE_LOCK:
+        state = load_state()
+        room = _owned_room_in_state(state, room_id, owner_id, account_generation)
+        target = _room_workspace_child(room, payload.path)
+        if len(payload.content.encode("utf-8")) > 2_000_000:
+            raise HTTPException(status_code=413, detail="Workspace file is too large")
+        target.parent.mkdir(parents=True, exist_ok=True)
+        tmp = target.with_name(target.name + ".tmp-" + uuid.uuid4().hex[:8])
+        tmp.write_text(payload.content, encoding="utf-8")
+        os.replace(tmp, target)
+    return {"ok": True, "path": str(payload.path)}
+
+
+@router.post("/rooms/{room_id}/workspace/file")
+def mkdir_room_workspace_path(room_id: str, payload: RoomWorkspaceWriteBody, request: Request):
+    owner_id = owner_id_from_request(request)
+    account_generation = _account_generation_for_request(request, owner_id)
+    with _STATE_LOCK:
+        state = load_state()
+        room = _owned_room_in_state(state, room_id, owner_id, account_generation)
+        target = _room_workspace_child(room, payload.path)
+        target.mkdir(parents=True, exist_ok=True)
+    return {"ok": True, "path": str(payload.path)}
+
+
+@router.delete("/rooms/{room_id}/workspace/file")
+def delete_room_workspace_path(room_id: str, request: Request, path: str = "", recursive: bool = False):
+    owner_id = owner_id_from_request(request)
+    account_generation = _account_generation_for_request(request, owner_id)
+    with _STATE_LOCK:
+        state = load_state()
+        room = _owned_room_in_state(state, room_id, owner_id, account_generation)
+        target = _room_workspace_child(room, path)
+        if not target.exists():
+            raise HTTPException(status_code=404, detail="Workspace path not found")
+        if target.is_dir():
+            if recursive:
+                shutil.rmtree(target)
+            else:
+                target.rmdir()
+        else:
+            target.unlink()
+    return {"ok": True}
+
+
+@router.post("/rooms/{room_id}/workspace/rename")
+def rename_room_workspace_path(room_id: str, payload: RoomWorkspaceTwoPathBody, request: Request):
+    owner_id = owner_id_from_request(request)
+    account_generation = _account_generation_for_request(request, owner_id)
+    with _STATE_LOCK:
+        state = load_state()
+        room = _owned_room_in_state(state, room_id, owner_id, account_generation)
+        source = _room_workspace_child(room, payload.old_path)
+        destination = _room_workspace_child(room, payload.new_path)
+        if not source.exists():
+            raise HTTPException(status_code=404, detail="Workspace path not found")
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        shutil.move(str(source), str(destination))
+    return {"ok": True}
+
+
+@router.post("/rooms/{room_id}/workspace/copy")
+def copy_room_workspace_path(room_id: str, payload: RoomWorkspaceTwoPathBody, request: Request):
+    owner_id = owner_id_from_request(request)
+    account_generation = _account_generation_for_request(request, owner_id)
+    with _STATE_LOCK:
+        state = load_state()
+        room = _owned_room_in_state(state, room_id, owner_id, account_generation)
+        source = _room_workspace_child(room, payload.source_path or payload.old_path)
+        destination = _room_workspace_child(room, payload.destination_path or payload.new_path)
+        if not source.exists():
+            raise HTTPException(status_code=404, detail="Workspace path not found")
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        if source.is_dir():
+            shutil.copytree(source, destination, dirs_exist_ok=True)
+        else:
+            shutil.copy2(source, destination)
+    return {"ok": True}
+
+
+@router.get("/rooms/{room_id}/approvals")
+def list_room_approvals(room_id: str, request: Request):
+    owner_id = owner_id_from_request(request)
+    account_generation = _account_generation_for_request(request, owner_id)
+    with _STATE_LOCK:
+        state = load_state()
+        room = _accessible_room_in_state(state, room_id, owner_id, account_generation)
+        profiles = list(dict.fromkeys(room.get("profiles") or [])) or ["default"]
+    approvals: list[dict[str, Any]] = []
+    for profile in profiles:
+        normalized, _home, store = _mobile_approval_store(profile)
+        try:
+            approvals.extend(
+                store.list(
+                    owner_id=str(room.get("owner_id") or owner_id),
+                    profile=normalized,
+                    states=("pending",),
+                    limit=50,
+                )
+            )
+        except Exception:
+            continue
+    return {"approvals": approvals}
+
+
+@router.post("/rooms/{room_id}/approvals/{approval_id}")
+def decide_room_approval(room_id: str, approval_id: str, payload: RoomApprovalDecisionBody, request: Request):
+    from hermes_cli.account_write_approvals import (
+        ApprovalConflict,
+        ApprovalPayloadMismatch,
+    )
+
+    owner_id = owner_id_from_request(request)
+    account_generation = _account_generation_for_request(request, owner_id)
+    with _STATE_LOCK:
+        state = load_state()
+        room = _accessible_room_in_state(state, room_id, owner_id, account_generation)
+    normalized, _home, store = _mobile_approval_store(payload.profile)
+    try:
+        record = store.claim_decision(
+            owner_id=str(room.get("owner_id") or owner_id),
+            profile=normalized,
+            approval_id=approval_id,
+            expected_revision=payload.expected_revision,
+            decision=payload.decision,
+            decision_by=owner_id,
+            idempotency_key=f"room:{room_id}:{approval_id}:{payload.decision}:{payload.expected_revision}",
+            payload_digest=payload.payload_digest,
+        )
+    except ApprovalPayloadMismatch as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    except ApprovalConflict as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+    if payload.decision.strip().lower() == "reject":
+        return {"approval": record}
+    if not record.get("_claim_acquired"):
+        return {"approval": record}
+    try:
+        record = _finish_mobile_write_approval_claim(
+            profile=normalized,
+            store=store,
+            record=record,
+        )
+    except ApprovalConflict as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    return {"approval": record}
 
 
 def _profile_runner_result_error(result: Any) -> str:
