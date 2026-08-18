@@ -23086,7 +23086,7 @@ def _room_workspace_child(room: dict[str, Any], relative: str, *, allow_root: bo
         raise HTTPException(status_code=400, detail="Invalid workspace path") from exc
 
 
-def _workspace_listing(target: Path) -> dict[str, Any]:
+def _workspace_listing(target: Path, listing_path: str = "") -> dict[str, Any]:
     entries = []
     try:
         children = sorted(target.iterdir(), key=lambda p: (p.is_file(), p.name.lower()))
@@ -23100,7 +23100,14 @@ def _workspace_listing(target: Path) -> dict[str, Any]:
         entries.append(
             {
                 "name": child.name,
-                "path": child.name,
+                # Path relative to the ROOM workspace root (what every file
+                # operation consumes), not a bare basename: nested files
+                # resolved their basename against the root and 404'd.
+                "path": (
+                    f"{listing_path.strip().strip('/')}/{child.name}"
+                    if listing_path.strip().strip('/')
+                    else child.name
+                ),
                 "type": "directory" if child.is_dir() else "file",
                 "size": stat.st_size if child.is_file() else 0,
                 "modified_at": int(stat.st_mtime * 1000),
@@ -23490,7 +23497,10 @@ def join_room_by_code(payload: RoomJoinBody, request: Request):
             _touch_room(room)
             save_state(state)
         single_state = load_single_state()
-        response = _room_detail_response(room, single_state, room_owner)
+        # Pass the CALLER (joiner) so can_manage correctly reflects that the
+        # joining member cannot manage the room — passing the room owner made
+        # it always true.
+        response = _room_detail_response(room, single_state, owner_id)
         conversation_id = str(room.get("conversation_id") or "")
     _notify_hosted_update(conversation_id)
     return response
@@ -23987,7 +23997,7 @@ def list_room_workspace_files(room_id: str, request: Request, path: str = ""):
         target = _room_workspace_child(room, path, allow_root=True)
     if not target.is_dir():
         raise HTTPException(status_code=404, detail="Workspace path not found")
-    return _workspace_listing(target)
+    return _workspace_listing(target, listing_path=str(path or ""))
 
 
 @router.get("/rooms/{room_id}/workspace/file")
