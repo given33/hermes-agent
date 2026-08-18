@@ -2709,6 +2709,17 @@ def load_single_state(
     tombstones = _account_deletion_tombstones(data)
     if tombstones:
         result[_ACCOUNT_DELETION_TOMBSTONES_KEY] = tombstones
+    # Cross-device deletion tombstones must survive the load rebuild: this
+    # function's key whitelist is exactly what persists across read→write
+    # cycles, and dropping the key here erased every durable tombstone on
+    # the first subsequent save.
+    durable_tombstones = [
+        item
+        for item in (data.get("deletion_tombstones") or [])
+        if isinstance(item, dict) and str(item.get("id") or "").strip()
+    ]
+    if durable_tombstones:
+        result["deletion_tombstones"] = durable_tombstones
     preserve_persistence_hook_outbox(data, result)
     if cache_key is not None:
         fingerprint = _single_state_fingerprint(target)

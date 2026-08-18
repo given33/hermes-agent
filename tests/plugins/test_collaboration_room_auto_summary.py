@@ -257,3 +257,48 @@ class TestDurableDeletionTombstones:
         kept = state["deletion_tombstones"]
         assert len(kept) <= module._DELETION_TOMBSTONE_MAX
         assert all(str(item.get("id", "")).startswith("new-") for item in kept)
+
+
+class TestDurableTombstonePersistenceRoundTrip:
+    def test_load_preserves_and_survives_save_round_trip(self, tmp_path):
+        """Real disk round-trip: load must keep deletion_tombstones and a
+        subsequent save must not erase them (the load key whitelist
+        previously dropped the key, erasing every tombstone on the first
+        following write)."""
+        import json as _json
+
+        module = load_module()
+        state_path = tmp_path / "single.json"
+        state_path.write_text(
+            _json.dumps(
+                {
+                    "conversations": [],
+                    "deletion_tombstones": [
+                        {
+                            "id": "chat_rt01",
+                            "owner_id": "owner-a",
+                            "account_generation": "gen-a",
+                            "deleted_at": 12345,
+                        }
+                    ],
+                }
+            ),
+            encoding="utf-8",
+        )
+
+        loaded = module.load_single_state(path=state_path)
+        assert [
+            item.get("id") for item in loaded.get("deletion_tombstones") or []
+        ] == ["chat_rt01"]
+
+        # A read-modify-write cycle must persist the tombstones back.
+        loaded["conversations"].append(
+            {"id": "chat_new", "owner_id": "owner-a", "account_generation": "gen-a"}
+        )
+        module.save_single_state(loaded, path=state_path)
+
+        reloaded = module.load_single_state(path=state_path)
+        assert [
+            item.get("id") for item in reloaded.get("deletion_tombstones") or []
+        ] == ["chat_rt01"]
+        assert [item.get("id") for item in reloaded["conversations"]] == ["chat_new"]
