@@ -2772,8 +2772,367 @@ _ARCHIVE_IDLE_AGE_SECONDS = 600
 _ARCHIVE_RESTORE_GRACE_SECONDS = 3600
 
 
+def _conversation_history_path(conversation_id: str) -> Optional[Path]:
+    """Return the sidecar used to retain history beyond the hot-state cap."""
+
+    normalized = str(conversation_id or "").strip()
+    # Conversation IDs are server-generated, but keep the sidecar path
+    # contained even when a legacy/imported record contains a path separator.
+    if (
+        not normalized
+        or normalized in {".", ".."}
+        or Path(normalized).name != normalized
+        or "\x00" in normalized
+    ):
+        return None
+    return conversation_files_root(normalized) / "history.json"
+
+
+def _conversation_history_meta_path(conversation_id: str) -> Optional[Path]:
+    target = _conversation_history_path(conversation_id)
+    return target.with_name("history.meta.json") if target is not None else None
+
+
+def _history_item_key(item: Any, index: int) -> str:
+    if isinstance(item, dict):
+        for field in (
+            "id",
+            "entry_id",
+            "message_id",
+            "cursor",
+            "sequence",
+            "request_id",
+        ):
+            value = str(item.get(field) or "").strip()
+            if value:
+                return f"{field}:{value}"
+    try:
+        encoded = json.dumps(item, ensure_ascii=False, sort_keys=True, default=str)
+    except (TypeError, ValueError):
+        encoded = repr(item)
+    return f"value:{hashlib.sha256(encoded.encode('utf-8')).hexdigest()}:{index}"
+
+
+def _merge_history_items(
+    existing: Any,
+    incoming: Any,
+) -> list[dict[str, Any]]:
+    """Merge hot-state updates into an append-only full-history sidecar."""
+
+    merged: list[dict[str, Any]] = []
+    positions: dict[str, int] = {}
+    for source in (existing, incoming):
+        if not isinstance(source, list):
+            continue
+        for index, item in enumerate(source):
+            if not isinstance(item, dict):
+                continue
+            value = deepcopy(item)
+            key = _history_item_key(value, index)
+            previous = positions.get(key)
+            if previous is None:
+                positions[key] = len(merged)
+                merged.append(value)
+            else:
+                merged[previous] = value
+    return merged
+
+
+def _read_conversation_history(conversation_id: str) -> dict[str, Any]:
+    target = _conversation_history_path(conversation_id)
+    if target is None:
+        return {}
+    try:
+        value = json.loads(target.read_text(encoding="utf-8"))
+    except (OSError, UnicodeError, ValueError):
+        return {}
+    return value if isinstance(value, dict) else {}
+
+
+def _read_conversation_history_meta(conversation_id: str) -> dict[str, Any]:
+    target = _conversation_history_meta_path(conversation_id)
+    if target is None:
+        return {}
+    try:
+        value = json.loads(target.read_text(encoding="utf-8"))
+    except (OSError, UnicodeError, ValueError):
+        return {}
+    return value if isinstance(value, dict) else {}
+
+
+def _history_matches_conversation(
+    history: dict[str, Any],
+    conversation: dict[str, Any],
+) -> bool:
+    if not history:
+        return False
+    expected_id = str(conversation.get("id") or "").strip()
+    stored_id = str(history.get("conversation_id") or "").strip()
+    if expected_id and stored_id != expected_id:
+        return False
+    if history.get("version") not in (None, 1):
+        return False
+    for field in ("owner_id", "account_generation"):
+        expected = str(conversation.get(field) or "").strip()
+        stored = str(history.get(field) or "").strip()
+        # A missing identity on an old sidecar is not proof that it belongs to
+        # the current account.  Refuse to hydrate it rather than risking a
+        # cross-account or cross-generation transcript leak.
+        if stored != expected:
+            return False
+    return True
+
+
+def _atomic_write_json_file(target: Path, document: Any) -> None:
+    target.parent.mkdir(parents=True, exist_ok=True)
+    temporary = target.with_name(
+        f".{target.name}.{os.getpid()}.{threading.get_ident()}.{uuid.uuid4().hex}.tmp"
+    )
+    try:
+        with temporary.open("x", encoding="utf-8", newline="\n") as handle:
+            try:
+                os.chmod(temporary, 0o600)
+            except OSError:
+                pass
+            handle.write(json.dumps(document, ensure_ascii=False, separators=(",", ":")))
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temporary, target)
+        _fsync_parent_directory(target)
+    finally:
+        try:
+            temporary.unlink()
+        except FileNotFoundError:
+            pass
+
+
+def _write_conversation_history(
+    conversation: dict[str, Any],
+    *,
+    existing: Optional[dict[str, Any]] = None,
+) -> None:
+    conversation_id = str(conversation.get("id") or "").strip()
+    target = _conversation_history_path(conversation_id)
+    if target is None:
+        # This path is reached before hot-state trimming.  Silently returning
+        # would make the subsequent trim destroy the only copy of history.
+        raise ValueError("invalid conversation id for history sidecar")
+    previous = existing if existing is not None else _read_conversation_history(conversation_id)
+    if previous and not _history_matches_conversation(previous, conversation):
+        previous = {}
+    incoming_messages = [
+        _sanitize_history_message(deepcopy(item))
+        for item in conversation.get("messages") or []
+        if isinstance(item, dict)
+    ]
+    messages = _merge_history_items(previous.get("messages"), incoming_messages)
+    session_entries = _merge_history_items(
+        previous.get("session_entries"),
+        conversation.get("session_entries"),
+    )
+    if not messages and not session_entries:
+        return
+    document = {
+        "version": 1,
+        "conversation_id": conversation_id,
+        "owner_id": conversation.get("owner_id", previous.get("owner_id", "")),
+        "account_generation": conversation.get(
+            "account_generation",
+            previous.get("account_generation", ""),
+        ),
+        "messages": messages,
+        "session_entries": session_entries,
+        "message_count": len(messages),
+        "last_message": deepcopy(messages[-1]) if messages else None,
+        "session_entry_count": len(session_entries),
+        "updated_at": max(
+            _nonnegative_int(conversation.get("updated_at")),
+            _nonnegative_int(previous.get("updated_at")),
+        ),
+    }
+    conversation["history_message_count"] = document["message_count"]
+    conversation["history_last_message"] = document["last_message"]
+    conversation["history_session_entry_count"] = document["session_entry_count"]
+    existing_meta = _read_conversation_history_meta(conversation_id)
+    if (
+        previous.get("messages") == messages
+        and previous.get("session_entries") == session_entries
+        and previous.get("message_count") == document["message_count"]
+        and previous.get("last_message") == document["last_message"]
+        and previous.get("session_entry_count") == document["session_entry_count"]
+        and previous.get("owner_id") == document["owner_id"]
+        and previous.get("account_generation") == document["account_generation"]
+        and existing_meta.get("message_count") == document["message_count"]
+        and existing_meta.get("last_message") == document["last_message"]
+        and existing_meta.get("session_entry_count") == document["session_entry_count"]
+        and existing_meta.get("owner_id") == document["owner_id"]
+        and existing_meta.get("account_generation") == document["account_generation"]
+    ):
+        return
+    _atomic_write_json_file(target, document)
+    meta_target = _conversation_history_meta_path(conversation_id)
+    if meta_target is not None:
+        _atomic_write_json_file(meta_target, {
+            "version": 1,
+            "conversation_id": conversation_id,
+            "owner_id": document["owner_id"],
+            "account_generation": document["account_generation"],
+            "message_count": document["message_count"],
+            "last_message": document["last_message"],
+            "session_entry_count": document["session_entry_count"],
+        })
+
+
+def _rewrite_conversation_history_messages(
+    conversation_id: str,
+    rewrite: Callable[[list[dict[str, Any]]], list[dict[str, Any]]],
+) -> None:
+    """Apply an explicit chat-message delete/rollback to the full sidecar."""
+
+    history = _read_conversation_history(conversation_id)
+    if not history or not isinstance(history.get("messages"), list):
+        return
+    current = [deepcopy(item) for item in history["messages"] if isinstance(item, dict)]
+    messages = [
+        _sanitize_history_message(deepcopy(item))
+        for item in rewrite(current)
+        if isinstance(item, dict)
+    ]
+    if messages == current:
+        return
+    history["messages"] = messages
+    history["message_count"] = len(messages)
+    history["last_message"] = deepcopy(messages[-1]) if messages else None
+    target = _conversation_history_path(conversation_id)
+    meta_target = _conversation_history_meta_path(conversation_id)
+    if target is None or meta_target is None:
+        return
+    _atomic_write_json_file(target, history)
+    _atomic_write_json_file(meta_target, {
+        "version": 1,
+        "conversation_id": conversation_id,
+        "owner_id": history.get("owner_id", ""),
+        "account_generation": history.get("account_generation", ""),
+        "message_count": history["message_count"],
+        "last_message": history["last_message"],
+        "session_entry_count": int(history.get("session_entry_count") or 0),
+    })
+
+
+def _persist_conversation_histories(state: dict[str, Any]) -> None:
+    """Persist complete transcripts before trimming the hot single-state file."""
+
+    for conversation in state.get("conversations") or []:
+        if not isinstance(conversation, dict):
+            continue
+        messages = conversation.get("messages")
+        entries = conversation.get("session_entries")
+        if not isinstance(messages, list) and not isinstance(entries, list):
+            continue
+        conversation_id = str(conversation.get("id") or "").strip()
+        if not conversation_id:
+            continue
+        previous = _read_conversation_history(conversation_id)
+        # Avoid touching disk for the common short-conversation case until a
+        # transcript actually exceeds the hot-state bound or already exists.
+        if (
+            not previous
+            and len(messages or []) <= _MAX_HOSTED_MESSAGES_PER_CONVERSATION
+            and len(entries or []) <= _MAX_HOSTED_SESSION_ENTRIES_PER_CONVERSATION
+        ):
+            continue
+        # Do not trim this conversation if its full-history sidecar cannot be
+        # committed. Raising keeps the previous hot state and deletion intent
+        # durable, instead of silently destroying the only older messages.
+        _write_conversation_history(conversation, existing=previous)
+
+
+def _hydrate_conversation_history(conversation: dict[str, Any]) -> dict[str, Any]:
+    """Merge a retained sidecar into one hot conversation on detailed reads."""
+
+    history = _read_conversation_history(str(conversation.get("id") or ""))
+    if not _history_matches_conversation(history, conversation):
+        return conversation
+    messages = _merge_history_items(history.get("messages"), conversation.get("messages"))
+    entries = _merge_history_items(
+        history.get("session_entries"),
+        conversation.get("session_entries"),
+    )
+    if messages:
+        conversation["messages"] = messages
+    if entries:
+        conversation["session_entries"] = entries
+    if history.get("message_count") is not None:
+        # The merged list is authoritative.  Never let a corrupt/stale count
+        # manufacture an endless pagination tail.
+        conversation["history_message_count"] = len(messages)
+        conversation["history_last_message"] = (
+            deepcopy(messages[-1]) if messages else None
+        )
+    if history.get("session_entry_count") is not None:
+        conversation["history_session_entry_count"] = len(entries)
+    conversation["history_complete"] = True
+    return conversation
+
+
+def _conversation_history_summary(
+    conversation: dict[str, Any],
+) -> tuple[int, Optional[dict[str, Any]]]:
+    """Read the bounded index metadata without expanding the transcript."""
+
+    messages = conversation.get("messages")
+    count = max(
+        len(messages) if isinstance(messages, list) else 0,
+        _nonnegative_int(conversation.get("history_message_count")),
+        _nonnegative_int(conversation.get("message_count"))
+        if conversation.get("archived")
+        else 0,
+    )
+    last = conversation.get("history_last_message")
+    if not isinstance(last, dict):
+        last = messages[-1] if isinstance(messages, list) and messages else None
+    # A complete internal summary is safe to use without touching disk.  At
+    # the hot-state cap, however, an older sidecar may exist without these
+    # fields; fall through so index polling can discover its full count.
+    if (
+        isinstance(last, dict)
+        and "history_message_count" in conversation
+        and (len(messages or []) < _MAX_HOSTED_MESSAGES_PER_CONVERSATION)
+    ):
+        return count, last
+    # Read the tiny metadata sidecar during index polling. Older installs may
+    # not have it yet, so fall back to the full document once and promote it.
+    conversation_id = str(conversation.get("id") or "")
+    history = _read_conversation_history_meta(conversation_id)
+    if not history:
+        history = _read_conversation_history(conversation_id)
+    if history and not _history_matches_conversation(history, conversation):
+        history = {}
+    if history:
+        history_count = _nonnegative_int(history.get("message_count"))
+        count = max(count, history_count)
+        candidate = history.get("last_message")
+        if isinstance(candidate, dict) and history_count >= len(messages or []):
+            last = candidate
+        conversation["history_message_count"] = count
+        conversation["history_last_message"] = deepcopy(last) if last else None
+    return count, last if isinstance(last, dict) else None
+
+
 def _archive_root() -> Path:
     return Path(get_hermes_home()) / "collaboration" / "archive"
+
+
+def _conversation_archive_path(conversation_id: str) -> Optional[Path]:
+    normalized = str(conversation_id or "").strip()
+    if (
+        not normalized
+        or normalized in {".", ".."}
+        or Path(normalized).name != normalized
+        or "\x00" in normalized
+    ):
+        return None
+    return _archive_root() / f"{normalized}.json"
 
 
 def _conversation_terminal(conversation: dict[str, Any]) -> bool:
@@ -2812,6 +3171,10 @@ def _archive_completed_conversations(state: dict[str, Any]) -> None:
             continue
         if conversation.get("archived"):
             continue
+        # A deletion tombstone is a durable operation, not an idle transcript.
+        # Never replace it with an archive placeholder that omits the intent.
+        if conversation.get("delete_requested"):
+            continue
         if conversation.get(_PENDING_PERSISTENCE_HOOKS):
             # Post-persistence observers are staged on this conversation and
             # must be promoted into the root durable outbox on this save.
@@ -2827,26 +3190,29 @@ def _archive_completed_conversations(state: dict[str, Any]) -> None:
         if updated_at and now - updated_at < _ARCHIVE_IDLE_AGE_SECONDS * 1000:
             continue
         conversation_id = str(conversation.get("id") or "")
-        if not conversation_id:
+        target = _conversation_archive_path(conversation_id)
+        if target is None:
             continue
         try:
             root.mkdir(parents=True, exist_ok=True)
-            target = root / f"{conversation_id}.json"
-            tmp = target.with_suffix(".json.tmp")
-            tmp.write_text(
-                json.dumps(conversation, ensure_ascii=False),
-                encoding="utf-8",
-            )
-            tmp.replace(target)
+            _atomic_write_json_file(target, conversation)
         except (OSError, UnicodeError, ValueError):
             continue
+        message_count, last_message = _conversation_history_summary(conversation)
         placeholder = {
             "id": conversation_id,
             "title": conversation.get("title", ""),
             "owner_id": conversation.get("owner_id", ""),
             "account_generation": conversation.get("account_generation", ""),
+            "profile": conversation.get("profile", "default"),
+            "source": conversation.get("source", ""),
+            "room_id": conversation.get("room_id", ""),
             "created_at": conversation.get("created_at", 0),
             "updated_at": conversation.get("updated_at", 0),
+            # Keep an index preview so mobile history can decide that the row
+            # is incomplete and fetch detail before lazy restoration.
+            "messages": [deepcopy(last_message)] if last_message else [],
+            "message_count": message_count,
             "archived": True,
             "archived_at": now,
         }
@@ -2857,13 +3223,36 @@ def _restore_archived_conversation(
     state: dict[str, Any],
     conversation_id: str,
 ) -> Optional[dict[str, Any]]:
-    target = _archive_root() / f"{conversation_id}.json"
+    placeholder = next(
+        (
+            item
+            for item in state.get("conversations") or []
+            if isinstance(item, dict)
+            and item.get("id") == conversation_id
+            and item.get("archived")
+        ),
+        None,
+    )
+    # An archive file without its hot-state placeholder is orphaned.  Do not
+    # resurrect it into a newly-created conversation by ID alone.
+    if not isinstance(placeholder, dict):
+        return None
+    target = _conversation_archive_path(conversation_id)
+    if target is None:
+        return None
     try:
         restored = json.loads(target.read_text(encoding="utf-8"))
     except (OSError, UnicodeError, ValueError):
         return None
     if not isinstance(restored, dict):
         return None
+    if str(restored.get("id") or "").strip() != str(conversation_id).strip():
+        return None
+    for field in ("owner_id", "account_generation"):
+        expected = str(placeholder.get(field) or "").strip()
+        stored = str(restored.get(field) or "").strip()
+        if stored != expected:
+            return None
     restored["restored_from_archive_at"] = int(time.time() * 1000)
     restored.pop("archived", None)
     conversations = state.get("conversations")
@@ -2878,6 +3267,42 @@ def _restore_archived_conversation(
         else:
             conversations.append(restored)
     return restored
+
+
+def _sanitize_history_activities(value: Any) -> list[Any] | Any:
+    if not isinstance(value, list):
+        return value
+    activities = value[-_MAX_REMOTE_ACTIVITIES_PER_RUN:]
+    for activity in activities:
+        if not isinstance(activity, dict):
+            continue
+        for field in ("output", "detail", "input", "summary"):
+            field_value = activity.get(field)
+            if isinstance(field_value, str) and len(field_value) > _MAX_ACTIVITY_FIELD_CHARS:
+                activity[field] = field_value[:_MAX_ACTIVITY_FIELD_CHARS]
+    return activities
+
+
+def _sanitize_history_message(message: dict[str, Any]) -> dict[str, Any]:
+    """Apply the hot-state field bounds without dropping the message row."""
+
+    for field in ("content", "display_result", "summary"):
+        value = message.get(field)
+        if isinstance(value, str) and len(value) > _MAX_MESSAGE_CONTENT_CHARS:
+            message[field] = value[:_MAX_MESSAGE_CONTENT_CHARS]
+    activities = _sanitize_history_activities(message.get("activities"))
+    if isinstance(activities, list):
+        message["activities"] = activities
+    meta = message.get("meta")
+    if isinstance(meta, dict):
+        for field in ("display_result", "content"):
+            value = meta.get(field)
+            if isinstance(value, str) and len(value) > _MAX_MESSAGE_CONTENT_CHARS:
+                meta[field] = value[:_MAX_MESSAGE_CONTENT_CHARS]
+        meta_activities = _sanitize_history_activities(meta.get("activities"))
+        if isinstance(meta_activities, list):
+            meta["activities"] = meta_activities
+    return message
 
 
 def _trim_hosted_state(state: dict[str, Any]) -> None:
@@ -2895,58 +3320,8 @@ def _trim_hosted_state(state: dict[str, Any]) -> None:
             conversation["messages"] = messages[-_MAX_HOSTED_MESSAGES_PER_CONVERSATION:]
         if isinstance(messages, list):
             for message in messages:
-                if not isinstance(message, dict):
-                    continue
-                for field in ("content", "display_result", "summary"):
-                    value = message.get(field)
-                    if (
-                        isinstance(value, str)
-                        and len(value) > _MAX_MESSAGE_CONTENT_CHARS
-                    ):
-                        message[field] = value[: _MAX_MESSAGE_CONTENT_CHARS]
-                message_activities = message.get("activities")
-                if isinstance(message_activities, list):
-                    if len(message_activities) > _MAX_REMOTE_ACTIVITIES_PER_RUN:
-                        message_activities = message_activities[
-                            -_MAX_REMOTE_ACTIVITIES_PER_RUN:
-                        ]
-                        message["activities"] = message_activities
-                    for activity in message_activities:
-                        if not isinstance(activity, dict):
-                            continue
-                        for field in ("output", "detail", "input", "summary"):
-                            value = activity.get(field)
-                            if (
-                                isinstance(value, str)
-                                and len(value) > _MAX_ACTIVITY_FIELD_CHARS
-                            ):
-                                activity[field] = value[: _MAX_ACTIVITY_FIELD_CHARS]
-                meta = message.get("meta")
-                if isinstance(meta, dict):
-                    for field in ("display_result", "content"):
-                        value = meta.get(field)
-                        if (
-                            isinstance(value, str)
-                            and len(value) > _MAX_MESSAGE_CONTENT_CHARS
-                        ):
-                            meta[field] = value[: _MAX_MESSAGE_CONTENT_CHARS]
-                    meta_activities = meta.get("activities")
-                    if isinstance(meta_activities, list):
-                        if len(meta_activities) > _MAX_REMOTE_ACTIVITIES_PER_RUN:
-                            meta_activities = meta_activities[
-                                -_MAX_REMOTE_ACTIVITIES_PER_RUN:
-                            ]
-                            meta["activities"] = meta_activities
-                        for activity in meta_activities:
-                            if not isinstance(activity, dict):
-                                continue
-                            for field in ("output", "detail", "input", "summary"):
-                                value = activity.get(field)
-                                if (
-                                    isinstance(value, str)
-                                    and len(value) > _MAX_ACTIVITY_FIELD_CHARS
-                                ):
-                                    activity[field] = value[:_MAX_ACTIVITY_FIELD_CHARS]
+                if isinstance(message, dict):
+                    _sanitize_history_message(message)
         session_entries = conversation.get("session_entries")
         if (
             isinstance(session_entries, list)
@@ -3080,6 +3455,10 @@ def _trim_hosted_state(state: dict[str, Any]) -> None:
 
 
 def save_single_state(state: dict[str, Any], path: Optional[Path] = None) -> None:
+    if path is None:
+        # Preserve the complete transcript before the compact hot-state
+        # projection is archived/truncated for fast request round-trips.
+        _persist_conversation_histories(state)
     _archive_completed_conversations(state)
     _trim_hosted_state(state)
     target = path or single_state_path()
@@ -3248,9 +3627,47 @@ def delete_owner_account_data(
     for conversation_id in conversation_ids:
         if not conversation_id:
             continue
-        root = conversation_files_root(conversation_id)
+        history_target = _conversation_history_path(conversation_id)
+        if history_target is None:
+            raise ValueError("invalid conversation id in account deletion")
+        root = history_target.parent
         if root.exists():
             shutil.rmtree(root)
+
+    # Archived conversations live outside single.json and therefore are not
+    # covered by the conversation file root above.  Read each candidate before
+    # unlinking it so an account deletion cannot remove another owner's or
+    # another generation's archive.  Known archive rows with unreadable
+    # metadata fail closed and leave the account tombstone for a retry.
+    known_archive_names = {
+        f"{conversation_id}.json"
+        for conversation_id in conversation_ids
+        if conversation_id
+    }
+    archive_root = _archive_root()
+    if archive_root.exists():
+        for archive_target in archive_root.glob("*.json"):
+            try:
+                document = json.loads(archive_target.read_text(encoding="utf-8"))
+            except (OSError, UnicodeError, ValueError) as exc:
+                if archive_target.name in known_archive_names:
+                    raise OSError(
+                        f"unable to validate archived conversation {archive_target.name}"
+                    ) from exc
+                continue
+            if not isinstance(document, dict):
+                continue
+            if (
+                str(document.get("owner_id") or "").strip() != normalized_owner
+                or str(document.get("account_generation") or "").strip()
+                != normalized_generation
+            ):
+                continue
+            archive_target.unlink()
+            if archive_target.exists():
+                raise OSError(
+                    f"unable to remove archived conversation {archive_target.name}"
+                )
 
     with _STATE_LOCK:
         state = load_single_state()
@@ -13906,6 +14323,23 @@ def _run_hosted_supervisor_check(
                 )
             ]
             if len(retained) != len(messages):
+                _rewrite_conversation_history_messages(
+                    conversation_id,
+                    lambda history_messages: [
+                        item
+                        for item in history_messages
+                        if not (
+                            isinstance(item.get("meta"), dict)
+                            and str(item["meta"].get("runtime_turn_id") or "") == turn_id
+                            and (
+                                str(item["meta"].get("role_stage") or "") == role_stage
+                                or str(item["meta"].get("role_stage") or "").startswith(
+                                    f"{role_stage}."
+                                )
+                            )
+                        )
+                    ],
+                )
                 conversation["messages"] = retained
                 conversation["updated_at"] = int(time.time() * 1000)
                 save_single_state(state)
@@ -14710,7 +15144,7 @@ def execute_hosted_workflow(
                 "不要做最终总结；把结果、证据、耗时和遗留问题提交给审阅者。",
                 f"用户任务：{content}",
                 (
-                    f"返工意见（第 {rework_round} 轮）：\n{rework_feedback}"
+                    f"审阅者退回意见（第 {rework_round} 轮）：\n{rework_feedback}"
                     if rework_feedback
                     else ""
                 ),
@@ -15660,6 +16094,23 @@ def execute_hosted_workflow(
                 )
             ]
             if len(retained_messages) != len(draft_messages):
+                _rewrite_conversation_history_messages(
+                    conversation_id,
+                    lambda history_messages: [
+                        item
+                        for item in history_messages
+                        if not (
+                            isinstance(item.get("meta"), dict)
+                            and str(item["meta"].get("runtime_turn_id") or "") == turn_id
+                            and (
+                                str(item["meta"].get("role_stage") or "") == "reporter"
+                                or str(item["meta"].get("role_stage") or "").startswith(
+                                    "reporter."
+                                )
+                            )
+                        )
+                    ],
+                )
                 draft_conversation["messages"] = retained_messages
                 draft_conversation["updated_at"] = int(time.time() * 1000)
                 save_single_state(draft_state)
@@ -16294,6 +16745,8 @@ def _room_projection(
     single_state: dict[str, Any],
     *,
     summary: bool,
+    offset: int = 0,
+    limit: int | None = None,
 ) -> dict[str, Any]:
     projected = dict(room)
     projected.pop("owner_id", None)
@@ -16316,13 +16769,42 @@ def _room_projection(
         ),
         None,
     )
+    if isinstance(conversation, dict) and conversation.get("archived") and not summary:
+        restored = _restore_archived_conversation(single_state, conversation_id)
+        if restored is not None:
+            conversation = restored
+    if isinstance(conversation, dict) and not summary:
+        # Room detail is the mobile transcript endpoint. Hydrate the full
+        # sidecar here because the compact single-state index intentionally
+        # keeps only a bounded tail.
+        conversation = _hydrate_conversation_history(conversation)
     messages = (
         list(conversation.get("messages") or [])
         if isinstance(conversation, dict)
         else list(room.get("messages") or [])
     )
-    projected["messages"] = messages[-1:] if summary else messages
-    projected["message_count"] = len(messages)
+    summary_last: Optional[dict[str, Any]] = None
+    total_messages = len(messages)
+    if isinstance(conversation, dict):
+        total_messages, summary_last = _conversation_history_summary(conversation)
+    if summary:
+        projected_messages = [summary_last] if summary_last else messages[-1:]
+        projected["offset"] = max(0, total_messages - len(projected_messages))
+        projected["limit"] = len(projected_messages) or 1
+        projected["has_more"] = False
+    else:
+        safe_offset = max(0, int(offset or 0))
+        safe_limit = None if limit is None else max(1, min(500, int(limit)))
+        projected_messages = (
+            messages[safe_offset:]
+            if safe_limit is None
+            else messages[safe_offset:safe_offset + safe_limit]
+        )
+        projected["offset"] = safe_offset
+        projected["limit"] = safe_limit if safe_limit is not None else len(projected_messages)
+        projected["has_more"] = safe_offset + len(projected_messages) < total_messages
+    projected["messages"] = projected_messages
+    projected["message_count"] = total_messages
     if isinstance(conversation, dict):
         projected["hosted_turns"] = _public_hosted_turns(
             conversation.get("hosted_turns")
@@ -16393,6 +16875,10 @@ def _public_conversation(conversation: dict[str, Any]) -> dict[str, Any]:
         "session_entries",
         "session_entry_quarantine",
         "session_entry_diagnostics",
+        "history_message_count",
+        "history_last_message",
+        "history_session_entry_count",
+        "history_complete",
     ):
         projected.pop(internal_key, None)
     projected["hosted_turns"] = _public_hosted_turns(
@@ -16410,7 +16896,12 @@ def _conversation_by_id(
 ) -> dict[str, Any]:
     for conversation in state.get("conversations") or []:
         if conversation.get("id") == conversation_id:
-            return conversation
+            if not conversation.get("archived"):
+                return conversation
+            # The row is only an archive placeholder.  Resolve the durable
+            # transcript before any owner check, mutation, or deletion so a
+            # placeholder can never be treated as an empty conversation.
+            break
     # Lazy restore of an archived conversation. The caller holds (or can
     # acquire) _STATE_LOCK; the lock is reentrant, so restoring under it is
     # safe and keeps the restore atomic with respect to other writers.
@@ -18392,6 +18883,17 @@ async def connector_upload_artifact(remote_run_id: str, request: Request):
                             ]
                         if message_added and file_id:
                             message_key = f"{remote_run_id}:artifact:{file_id}"
+                            _rewrite_conversation_history_messages(
+                                str(failure_conversation.get("id") or ""),
+                                lambda history_messages, key=message_key: [
+                                    item
+                                    for item in history_messages
+                                    if not (
+                                        isinstance(item.get("meta"), dict)
+                                        and str(item["meta"].get("message_key") or "") == key
+                                    )
+                                ],
+                            )
                             failure_conversation["messages"] = [
                                 item
                                 for item in failure_conversation.get("messages") or []
@@ -18406,6 +18908,36 @@ async def connector_upload_artifact(remote_run_id: str, request: Request):
                             message_key = f"{remote_run_id}:artifact:{file_id}"
                             messages = failure_conversation.get("messages") or []
                             previous_message = deepcopy(intent["previous_message"])
+                            restore_index = int(intent.get("previous_message_index") or -1)
+
+                            def restore_failure_history_message(
+                                history_messages: list[dict[str, Any]],
+                                key: str = message_key,
+                                replacement: dict[str, Any] = previous_message,
+                                index: int = restore_index,
+                            ) -> list[dict[str, Any]]:
+                                candidate_index = next(
+                                    (
+                                        item_index
+                                        for item_index, item in enumerate(history_messages)
+                                        if isinstance(item.get("meta"), dict)
+                                        and str(item["meta"].get("message_key") or "") == key
+                                    ),
+                                    -1,
+                                )
+                                if candidate_index >= 0:
+                                    history_messages[candidate_index] = deepcopy(replacement)
+                                else:
+                                    history_messages.insert(
+                                        max(0, min(index, len(history_messages))),
+                                        deepcopy(replacement),
+                                    )
+                                return history_messages
+
+                            _rewrite_conversation_history_messages(
+                                str(failure_conversation.get("id") or ""),
+                                restore_failure_history_message,
+                            )
                             current_index = next(
                                 (
                                     index
@@ -18420,7 +18952,6 @@ async def connector_upload_artifact(remote_run_id: str, request: Request):
                             if current_index >= 0:
                                 messages[current_index] = previous_message
                             else:
-                                restore_index = int(intent.get("previous_message_index") or -1)
                                 messages.insert(
                                     max(0, min(restore_index, len(messages))),
                                     previous_message,
@@ -18527,6 +19058,18 @@ def compact_hosted_turns_for_index(
     }
 
 
+def _conversation_index_projection(conversation: dict[str, Any]) -> dict[str, Any]:
+    projected = dict(conversation)
+    for key in (
+        "history_message_count",
+        "history_last_message",
+        "history_session_entry_count",
+        "history_complete",
+    ):
+        projected.pop(key, None)
+    return projected
+
+
 @router.get("/single/conversations")
 def get_single_conversations(request: Request = None):
     owner_id = owner_id_from_request(request)
@@ -18568,14 +19111,15 @@ def get_single_conversations(request: Request = None):
             save_single_state(state)
         summaries = [
             {
-                **conversation,
-                "messages": (conversation.get("messages") or [])[-1:],
-                "message_count": len(conversation.get("messages") or []),
+                **_conversation_index_projection(conversation),
+                "messages": ([last_message] if last_message else []),
+                "message_count": message_count,
                 "hosted_turns": compact_hosted_turns_for_index(
                     conversation.get("hosted_turns")
                 ),
             }
             for conversation in owned
+            for message_count, last_message in [_conversation_history_summary(conversation)]
         ]
     resume_unfinished_hosted_workflows(owned)
     return {"conversations": summaries}
@@ -18709,7 +19253,8 @@ def get_single_conversation(
         changed = compact_conversation_title(conversation) or changed
         if changed:
             save_single_state(state)
-        result = {"conversation": _public_conversation(conversation)}
+        detailed = _hydrate_conversation_history(deepcopy(conversation))
+        result = {"conversation": _public_conversation(detailed)}
     resume_unfinished_hosted_workflows([conversation])
     _prewarm_hosted_chat(
         conversation,
@@ -19316,6 +19861,7 @@ def list_conversation_session_entries(
             conversation_id,
             owner_id,
         )
+        conversation = _hydrate_conversation_history(conversation)
         if claimed:
             save_single_state(state)
         authoritative_cursor = max(
@@ -21111,6 +21657,7 @@ def _finalize_pending_conversation_deletion(conversation_id: str) -> bool:
 
     runtime_sessions: list[tuple[str, str]] = []
     owner_id = ""
+    account_generation = ""
     with _STATE_LOCK:
         state = load_single_state()
         conversation = next(
@@ -21136,6 +21683,14 @@ def _finalize_pending_conversation_deletion(conversation_id: str) -> bool:
         ]
         owner_id = str(conversation.get("owner_id") or LOCAL_OWNER_ID)
         account_generation = _account_generation_for_conversation(conversation)
+        # Remove the room alias while the tombstone is still present.  If the
+        # separate room store is temporarily unavailable, retain the
+        # tombstone and retry; otherwise a later room request could recreate a
+        # fresh linked conversation after this row is dropped.
+        try:
+            _remove_room_index_for_conversation(conversation_id, owner_id)
+        except Exception:
+            return False
         # Account-file rows are a separate durable store.  Remove them before
         # dropping the conversation tombstone so a crash leaves a retryable
         # deletion intent rather than an orphaned file index/object.
@@ -21147,13 +21702,43 @@ def _finalize_pending_conversation_deletion(conversation_id: str) -> bool:
             )
         except Exception:
             return False
+        # The transcript sidecar lives under the conversation file root. It
+        # must be removed while the deletion tombstone is still present so a
+        # crash or filesystem failure leaves a retryable intent instead of an
+        # orphaned cloud transcript.
+        try:
+            files_root = conversation_files_root(conversation_id)
+            if files_root.exists():
+                shutil.rmtree(files_root)
+            if files_root.exists():
+                return False
+        except OSError:
+            return False
+        archive_target = _conversation_archive_path(conversation_id)
+        if archive_target is None:
+            return False
+        try:
+            if archive_target.exists():
+                archive_target.unlink()
+            if archive_target.exists():
+                return False
+        except OSError:
+            return False
+        previous_conversations = state.get("conversations")
         state["conversations"] = [
             item
             for item in state.get("conversations") or []
             if item.get("id") != conversation_id
         ]
-        save_single_state(state)
-    _remove_room_index_for_conversation(conversation_id, owner_id)
+        try:
+            save_single_state(state)
+        except Exception:
+            # The durable tombstone remains in the on-disk state when the
+            # atomic commit fails. Restore the caller's in-memory view too so
+            # a retry in the same process cannot observe a phantom deletion.
+            if isinstance(previous_conversations, list):
+                state["conversations"] = previous_conversations
+            return False
     release_hosted_gateway_conversation(
         conversation_id,
         owner_id=owner_id,
@@ -21164,7 +21749,6 @@ def _finalize_pending_conversation_deletion(conversation_id: str) -> bool:
             _delete_runtime_session(profile, session_id)
         except Exception:
             pass
-    shutil.rmtree(conversation_files_root(conversation_id), ignore_errors=True)
     return True
 
 
@@ -21177,20 +21761,43 @@ def delete_single_conversation(
     owner_id = owner_id_from_request(request)
     with _STATE_LOCK:
         state = load_single_state()
-        conversation, _claimed = _owned_conversation_in_state(
-            state,
-            conversation_id,
-            owner_id,
-        )
-        _remove_room_index_for_conversation(conversation_id, owner_id)
+        existing = _conversation_by_id(state, conversation_id)
+        already_pending = bool(existing.get("delete_requested"))
         now = int(time.time() * 1000)
-        conversation.update(
-            {
-                "delete_requested": True,
-                "delete_requested_at": now,
-                "updated_at": now,
-            }
-        )
+        if already_pending:
+            # Deletion is an idempotent, retryable operation.  A prior request
+            # may have committed the tombstone but failed while removing the
+            # room/index, account files, archive, or sidecar.  Do not turn
+            # that durable pending intent into a misleading 404.
+            existing_owner = str(existing.get("owner_id") or "").strip()
+            if existing_owner != owner_id:
+                if not _legacy_owner_claim_allowed(existing_owner, owner_id):
+                    raise HTTPException(status_code=404, detail="Conversation not found")
+                existing["owner_id"] = owner_id
+            current_generation = _account_generation_for_owner(owner_id)
+            stored_generation = str(existing.get("account_generation") or "").strip()
+            if stored_generation and stored_generation != current_generation:
+                raise HTTPException(status_code=404, detail="Conversation not found")
+            if not stored_generation:
+                existing["account_generation"] = current_generation
+            conversation = existing
+        else:
+            conversation, _claimed = _owned_conversation_in_state(
+                state,
+                conversation_id,
+                owner_id,
+            )
+            conversation.update(
+                {
+                    "delete_requested": True,
+                    "delete_requested_at": now,
+                    "updated_at": now,
+                }
+            )
+            # The tombstone (and any cancellation flags below) is committed
+            # before touching the separate room index.  If the latter fails,
+            # the next request can still locate and retry this conversation by
+            # its room_id.
         for turn_id, run in (conversation.get("hosted_turns") or {}).items():
             if not isinstance(run, dict):
                 continue
@@ -21215,10 +21822,30 @@ def delete_single_conversation(
                 )
                 pending_turn_ids.append(str(turn_id))
         save_single_state(state)
+    try:
+        _remove_room_index_for_conversation(conversation_id, owner_id)
+    except Exception as exc:
+        _notify_hosted_update(conversation_id)
+        for turn_id in pending_turn_ids:
+            start_hosted_workflow(conversation_id, turn_id)
+        raise HTTPException(
+            status_code=503,
+            detail={
+                "reason": "conversation_deletion_pending",
+                "message": "Conversation deletion is pending; retry.",
+            },
+        ) from exc
     _notify_hosted_update(conversation_id)
     if not _finalize_pending_conversation_deletion(conversation_id):
         for turn_id in pending_turn_ids:
             start_hosted_workflow(conversation_id, turn_id)
+        raise HTTPException(
+            status_code=503,
+            detail={
+                "reason": "conversation_deletion_pending",
+                "message": "Conversation deletion is pending; retry.",
+            },
+        )
     return {"ok": True}
 
 
@@ -21287,12 +21914,11 @@ def get_rooms(request: Request):
     account_generation = _account_generation_for_request(request, owner_id)
     with _STATE_LOCK:
         state = load_state()
-        if _claim_legacy_rooms_in_state(
+        claimed = _claim_legacy_rooms_in_state(
             state,
             owner_id,
             account_generation=account_generation,
-        ):
-            save_state(state)
+        )
         single_state = load_single_state()
         rooms = [
             room
@@ -21301,6 +21927,24 @@ def get_rooms(request: Request):
             and str(room.get("account_generation") or "") == account_generation
             and not _room_maps_to_deleting_conversation(room, single_state)
         ]
+        # Older room records predate the linked SingleConversation index and
+        # kept their transcript directly on the room. Materialize that link
+        # while listing so the mobile cache can download the complete history
+        # even when the user has never sent a new message in the room.
+        migrated = False
+        for room in rooms:
+            _conversation, created = _room_conversation_in_state(
+                room,
+                single_state,
+                owner_id,
+                account_generation,
+            )
+            migrated = migrated or created
+        if migrated:
+            save_single_state(single_state)
+            save_state(state)
+        elif claimed:
+            save_state(state)
         summaries = [
             _room_projection(room, single_state, summary=True)
             for room in rooms
@@ -21343,13 +21987,12 @@ def get_room(room_id: str, request: Request):
     account_generation = _account_generation_for_request(request, owner_id)
     with _STATE_LOCK:
         state = load_state()
-        if _claim_legacy_rooms_in_state(
+        claimed = _claim_legacy_rooms_in_state(
             state,
             owner_id,
             account_generation=account_generation,
             requested_room_id=room_id,
-        ):
-            save_state(state)
+        )
         room = _owned_room_in_state(
             state,
             room_id,
@@ -21359,12 +22002,41 @@ def get_room(room_id: str, request: Request):
         single_state = load_single_state()
         if _room_maps_to_deleting_conversation(room, single_state):
             raise HTTPException(status_code=404, detail="Room not found")
+        _conversation, migrated = _room_conversation_in_state(
+            room,
+            single_state,
+            owner_id,
+            account_generation,
+        )
+        if migrated:
+            save_single_state(single_state)
+            save_state(state)
+        elif claimed:
+            save_state(state)
+        raw_offset = request.query_params.get("offset")
+        raw_limit = request.query_params.get("limit")
+        try:
+            offset = max(0, int(raw_offset or 0))
+        except (TypeError, ValueError):
+            offset = 0
+        try:
+            limit = max(1, min(500, int(raw_limit))) if raw_limit else None
+        except (TypeError, ValueError):
+            limit = None
+        projection = _room_projection(
+            room,
+            single_state,
+            summary=False,
+            offset=offset,
+            limit=limit,
+        )
         return {
-            "room": _room_projection(
-                room,
-                single_state,
-                summary=False,
-            )
+            "room": projection,
+            "messages": projection.get("messages") or [],
+            "total": projection.get("message_count", 0),
+            "offset": projection.get("offset", offset),
+            "limit": projection.get("limit", limit or 0),
+            "has_more": projection.get("has_more", False),
         }
 
 
@@ -21482,34 +22154,106 @@ def put_room_dependencies(room_id: str, payload: DependencyGraphBody, request: R
 def delete_room(room_id: str, request: Request):
     owner_id = owner_id_from_request(request)
     account_generation = _account_generation_for_request(request, owner_id)
+    linked_conversation_id = ""
+    pending_conversation_id = ""
     with _STATE_LOCK:
         state = load_state()
-        _claim_legacy_rooms_in_state(
-            state,
-            owner_id,
-            account_generation=account_generation,
-            requested_room_id=room_id,
+        try:
+            claimed = _claim_legacy_rooms_in_state(
+                state,
+                owner_id,
+                account_generation=account_generation,
+                requested_room_id=room_id,
+            )
+        except HTTPException as exc:
+            if exc.status_code != 404:
+                raise
+            # The room alias may already be gone while its linked deletion
+            # tombstone is still retryable; defer to the lookup below.
+            claimed = False
+        try:
+            room = _owned_room_in_state(
+                state,
+                room_id,
+                owner_id,
+                account_generation,
+            )
+        except HTTPException as exc:
+            if exc.status_code != 404:
+                raise
+            # The first delete request removes the room alias before the
+            # linked conversation is physically purged.  Locate that durable
+            # tombstone by room_id so a retry cannot be mistaken for a fully
+            # deleted 404 and acknowledged by the mobile outbox.
+            single_state = load_single_state()
+            pending = next(
+                (
+                    item
+                    for item in single_state.get("conversations") or []
+                    if isinstance(item, dict)
+                    and item.get("delete_requested")
+                    and (
+                        str(item.get("room_id") or "").strip() == room_id
+                        or str(item.get("id") or "").strip()
+                        == f"chat_room_{str(room_id).removeprefix('room_')}"
+                    )
+                    and str(item.get("owner_id") or "").strip() == owner_id
+                    and str(item.get("account_generation") or "").strip()
+                    == account_generation
+                ),
+                None,
+            )
+            if not isinstance(pending, dict):
+                raise
+            pending_conversation_id = str(pending.get("id") or "").strip()
+        else:
+            if claimed:
+                save_state(state)
+            linked_conversation_id = str(room.get("conversation_id") or "").strip()
+            if not linked_conversation_id:
+                before = len(state.get("rooms") or [])
+                state["rooms"] = [
+                    item
+                    for item in state.get("rooms") or []
+                    if item.get("id") != room_id
+                ]
+                if len(state["rooms"]) == before:
+                    raise HTTPException(status_code=404, detail="群聊不存在")
+                save_state(state)
+                return {"ok": True}
+
+    if pending_conversation_id:
+        if _finalize_pending_conversation_deletion(pending_conversation_id):
+            return {"ok": True}
+        raise HTTPException(
+            status_code=503,
+            detail={
+                "reason": "conversation_deletion_pending",
+                "message": "Conversation deletion is pending; retry.",
+            },
         )
+
+    if linked_conversation_id:
+        try:
+            return delete_single_conversation(linked_conversation_id, request)
+        except HTTPException as exc:
+            if exc.status_code != 404:
+                raise
+
+    # A legacy room can outlive its linked conversation.  Remove only the
+    # already-owner-checked room index; never turn an unrelated 404 into a
+    # cross-account deletion.
+    with _STATE_LOCK:
+        state = load_state()
         room = _owned_room_in_state(
             state,
             room_id,
             owner_id,
             account_generation,
         )
-        conversation_id = str(room.get("conversation_id") or "")
-        if conversation_id:
-            try:
-                delete_single_conversation(conversation_id, request)
-                return {"ok": True}
-            except HTTPException as exc:
-                if exc.status_code != 404:
-                    raise
-        before = len(state.get("rooms") or [])
         state["rooms"] = [
-            room for room in state.get("rooms") or [] if room.get("id") != room_id
+            item for item in state.get("rooms") or [] if item.get("id") != room_id
         ]
-        if len(state["rooms"]) == before:
-            raise HTTPException(status_code=404, detail="群聊不存在")
         save_state(state)
     return {"ok": True}
 
@@ -22460,6 +23204,17 @@ def _recover_connector_artifact_upload_intents(
                                 ]
                             if file_id and _coerce_flag(intent.get("message_added")):
                                 message_key = f"{remote_id}:artifact:{file_id}"
+                                _rewrite_conversation_history_messages(
+                                    str(conversation.get("id") or ""),
+                                    lambda history_messages, key=message_key: [
+                                        message
+                                        for message in history_messages
+                                        if not (
+                                            isinstance(message.get("meta"), dict)
+                                            and str(message["meta"].get("message_key") or "") == key
+                                        )
+                                    ],
+                                )
                                 conversation["messages"] = [
                                     message
                                     for message in conversation.get("messages") or []
@@ -22474,6 +23229,38 @@ def _recover_connector_artifact_upload_intents(
                                 message_key = f"{remote_id}:artifact:{file_id}"
                                 messages = conversation.get("messages") or []
                                 previous_message = deepcopy(intent["previous_message"])
+                                restore_index = int(
+                                    intent.get("previous_message_index") or -1
+                                )
+
+                                def restore_history_message(
+                                    history_messages: list[dict[str, Any]],
+                                    key: str = message_key,
+                                    replacement: dict[str, Any] = previous_message,
+                                    index: int = restore_index,
+                                ) -> list[dict[str, Any]]:
+                                    current_index = next(
+                                        (
+                                            candidate_index
+                                            for candidate_index, candidate in enumerate(history_messages)
+                                            if isinstance(candidate.get("meta"), dict)
+                                            and str(candidate["meta"].get("message_key") or "") == key
+                                        ),
+                                        -1,
+                                    )
+                                    if current_index >= 0:
+                                        history_messages[current_index] = deepcopy(replacement)
+                                    else:
+                                        history_messages.insert(
+                                            max(0, min(index, len(history_messages))),
+                                            deepcopy(replacement),
+                                        )
+                                    return history_messages
+
+                                _rewrite_conversation_history_messages(
+                                    str(conversation.get("id") or ""),
+                                    restore_history_message,
+                                )
                                 current_index = next(
                                     (
                                         index
@@ -22488,9 +23275,6 @@ def _recover_connector_artifact_upload_intents(
                                 if current_index >= 0:
                                     messages[current_index] = previous_message
                                 else:
-                                    restore_index = int(
-                                        intent.get("previous_message_index") or -1
-                                    )
                                     messages.insert(
                                         max(0, min(restore_index, len(messages))),
                                         previous_message,

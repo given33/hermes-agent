@@ -156,6 +156,74 @@ def test_delete_owner_account_data_removes_only_owned_collaboration_state(
     assert conversation_root.exists() is False
 
 
+def test_account_deletion_removes_owned_archive_but_preserves_other_generation(
+    tmp_path,
+    monkeypatch,
+):
+    module = _load_module()
+    monkeypatch.setattr(module, "get_hermes_home", lambda: tmp_path)
+    owner_archive = {
+        "id": "chat-owner-archived",
+        "owner_id": "owner-a",
+        "account_generation": "generation-a",
+        "messages": [{"id": "old", "content": "private"}],
+    }
+    peer_archive = {
+        "id": "chat-peer-archived",
+        "owner_id": "owner-b",
+        "account_generation": "generation-b",
+        "messages": [{"id": "peer", "content": "keep"}],
+    }
+    archive_root = tmp_path / "collaboration" / "archive"
+    archive_root.mkdir(parents=True)
+    (archive_root / f"{owner_archive['id']}.json").write_text(
+        json.dumps(owner_archive), encoding="utf-8"
+    )
+    peer_target = archive_root / f"{peer_archive['id']}.json"
+    peer_target.write_text(json.dumps(peer_archive), encoding="utf-8")
+    state = {
+        "conversations": [
+            {
+                "id": owner_archive["id"],
+                "owner_id": "owner-a",
+                "account_generation": "generation-a",
+                "archived": True,
+            },
+            {
+                "id": "chat-owner-hot",
+                "owner_id": "owner-a",
+                "account_generation": "generation-a",
+            },
+            {
+                "id": "chat-peer-hot",
+                "owner_id": "owner-b",
+                "account_generation": "generation-b",
+            },
+        ]
+    }
+    rooms = {"rooms": []}
+    monkeypatch.setattr(module, "load_single_state", lambda **_kwargs: state)
+    monkeypatch.setattr(module, "save_single_state", lambda _state: None)
+    monkeypatch.setattr(module, "load_state", lambda: rooms)
+    monkeypatch.setattr(module, "save_state", lambda _state: None)
+    monkeypatch.setattr(
+        module,
+        "_file_library",
+        lambda: SimpleNamespace(
+            delete_owner=lambda *_args, **_kwargs: {"files": 0},
+        ),
+    )
+
+    module.delete_owner_account_data(
+        "owner-a",
+        account_generation="generation-a",
+    )
+
+    assert not (archive_root / f"{owner_archive['id']}.json").exists()
+    assert peer_target.exists()
+    assert [item["id"] for item in state["conversations"]] == ["chat-peer-hot"]
+
+
 def test_account_file_routes_cover_upload_artifact_link_download_and_delete(
     tmp_path,
     monkeypatch,
@@ -634,7 +702,7 @@ def test_rooms_are_account_scoped_and_enqueue_the_durable_hosted_workflow(
         deleted = client.delete(
             f"{prefix}/single/conversations/{room['conversation_id']}"
         )
-        assert deleted.status_code == 200
+        assert deleted.status_code == 503
         assert rooms_state["rooms"] == []
         assert conversation["delete_requested"] is True
         assert single_state["conversations"] == [conversation]
@@ -1211,8 +1279,8 @@ def test_deleting_active_remote_conversation_retains_cancellation_until_ack(
         deleted = client.delete(
             f"{prefix}/single/conversations/{conversation['id']}"
         )
-        assert deleted.status_code == 200
-        assert deleted.json() == {"ok": True}
+        assert deleted.status_code == 503
+        assert deleted.json()["detail"]["reason"] == "conversation_deletion_pending"
         assert state["conversations"] == [conversation]
         assert conversation["delete_requested"] is True
         assert hosted["cancel_requested"] is True
@@ -2871,3 +2939,131 @@ def test_remote_progress_creates_semantic_milestones_and_redacts_activity_secret
         assert "[REDACTED]" in redacted
     stored_activity = conversation["hosted_turns"]["turn-milestones"]["remote_runs"]["worker"]["activities"][0]
     assert stored_activity["input"]["token_count"] == 12
+
+
+def test_delete_cleanup_failure_returns_retryable_status_and_keeps_tombstone(
+    tmp_path,
+    monkeypatch,
+):
+    module = _load_module()
+    monkeypatch.setattr(module, "get_hermes_home", lambda: tmp_path)
+    monkeypatch.setattr(
+        module, "_account_generation_for_owner", lambda _owner: "generation-a"
+    )
+    conversation = module.create_single_conversation("default", "Retry delete")
+    conversation.update({"owner_id": "owner-a", "account_generation": "generation-a"})
+    single_state = {"conversations": [conversation]}
+    room_state = {"rooms": []}
+    monkeypatch.setattr(module, "load_single_state", lambda: single_state)
+    monkeypatch.setattr(module, "save_single_state", lambda _state: None)
+    monkeypatch.setattr(module, "load_state", lambda: room_state)
+    monkeypatch.setattr(module, "save_state", lambda _state: None)
+    monkeypatch.setattr(module, "_notify_hosted_update", lambda *_args: None)
+
+    class FailingLibrary:
+        def delete_conversation(self, *_args, **_kwargs):
+            raise OSError("account file store unavailable")
+
+    monkeypatch.setattr(module, "_file_library", lambda: FailingLibrary())
+    prefix = "/api/plugins/collaboration"
+
+    with _client(module, owner="owner-a") as client:
+        response = client.delete(
+            f"{prefix}/single/conversations/{conversation['id']}"
+        )
+
+    assert response.status_code == 503
+    assert response.json()["detail"]["reason"] == "conversation_deletion_pending"
+    assert conversation["delete_requested"] is True
+    assert single_state["conversations"] == [conversation]
+
+
+def test_room_delete_retry_finds_tombstone_after_room_alias_was_removed(
+    tmp_path,
+    monkeypatch,
+):
+    module = _load_module()
+    monkeypatch.setattr(module, "get_hermes_home", lambda: tmp_path)
+    monkeypatch.setattr(
+        module, "_account_generation_for_owner", lambda _owner: "generation-a"
+    )
+    conversation = module.create_single_conversation("default", "Retry room")
+    conversation.update({"owner_id": "owner-a", "account_generation": "generation-a"})
+    room = module.create_room_record(
+        "Retry room", ["default"], "owner-a", "generation-a"
+    )
+    room["conversation_id"] = conversation["id"]
+    conversation["room_id"] = room["id"]
+    single_state = {"conversations": [conversation]}
+    room_state = {"rooms": [room]}
+    monkeypatch.setattr(module, "load_single_state", lambda: single_state)
+    monkeypatch.setattr(module, "save_single_state", lambda _state: None)
+    monkeypatch.setattr(module, "load_state", lambda: room_state)
+    monkeypatch.setattr(module, "save_state", lambda _state: None)
+    monkeypatch.setattr(module, "_notify_hosted_update", lambda *_args: None)
+
+    attempts = []
+
+    class FlakyLibrary:
+        def delete_conversation(self, *_args, **_kwargs):
+            attempts.append(True)
+            if len(attempts) == 1:
+                raise OSError("transient cloud failure")
+
+    monkeypatch.setattr(module, "_file_library", lambda: FlakyLibrary())
+    prefix = "/api/plugins/collaboration"
+
+    with _client(module, owner="owner-a") as client:
+        first = client.delete(f"{prefix}/rooms/{room['id']}")
+        assert first.status_code == 503
+        assert room_state["rooms"] == []
+        assert conversation["delete_requested"] is True
+
+        second = client.delete(f"{prefix}/rooms/{room['id']}")
+
+    assert second.status_code == 200
+    assert second.json() == {"ok": True}
+    assert single_state["conversations"] == []
+    assert len(attempts) == 2
+
+
+def test_sidecar_cleanup_failure_returns_retryable_status_and_preserves_files(
+    tmp_path,
+    monkeypatch,
+):
+    module = _load_module()
+    monkeypatch.setattr(module, "get_hermes_home", lambda: tmp_path)
+    monkeypatch.setattr(
+        module, "_account_generation_for_owner", lambda _owner: "generation-a"
+    )
+    conversation = module.create_single_conversation("default", "Sidecar retry")
+    conversation.update({"owner_id": "owner-a", "account_generation": "generation-a"})
+    single_state = {"conversations": [conversation]}
+    room_state = {"rooms": []}
+    files_root = module.conversation_files_root(conversation["id"])
+    files_root.mkdir(parents=True)
+    (files_root / "history.json").write_text("{}", encoding="utf-8")
+    monkeypatch.setattr(module, "load_single_state", lambda: single_state)
+    monkeypatch.setattr(module, "save_single_state", lambda _state: None)
+    monkeypatch.setattr(module, "load_state", lambda: room_state)
+    monkeypatch.setattr(module, "save_state", lambda _state: None)
+    monkeypatch.setattr(module, "_notify_hosted_update", lambda *_args: None)
+    monkeypatch.setattr(module, "_file_library", lambda: SimpleNamespace(
+        delete_conversation=lambda *_args, **_kwargs: None,
+    ))
+    monkeypatch.setattr(
+        module.shutil,
+        "rmtree",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(OSError("disk busy")),
+    )
+
+    prefix = "/api/plugins/collaboration"
+    with _client(module, owner="owner-a") as client:
+        response = client.delete(
+            f"{prefix}/single/conversations/{conversation['id']}"
+        )
+
+    assert response.status_code == 503
+    assert conversation["delete_requested"] is True
+    assert files_root.exists()
+    assert single_state["conversations"] == [conversation]
