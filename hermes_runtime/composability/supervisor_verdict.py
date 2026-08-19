@@ -32,6 +32,7 @@ class SupervisorVerdict:
     findings: tuple[str, ...]
     required_actions: tuple[str, ...]
     model: str = "unknown"
+    directional: bool = False
     valid: bool = True
 
     def public_dict(self) -> dict[str, Any]:
@@ -48,6 +49,7 @@ class SupervisorVerdict:
             "findings": list(self.findings),
             "required_actions": list(self.required_actions),
             "model": self.model,
+            "directional": self.directional,
             "valid": self.valid,
         }
 
@@ -136,6 +138,12 @@ def build_supervisor_verdict(
         "",
     )
     resolved_model = _string(model or evidence.get("model"), "unknown")
+    directional = bool(
+        control
+        and isinstance(control, Mapping)
+        and control.get("directional")
+        and verdict == "corrective_action"
+    )
     refs = _refs(evidence, evidence_hash)
     valid = bool(
         control
@@ -165,5 +173,6 @@ def build_supervisor_verdict(
         findings=findings,
         required_actions=required_actions,
         model=resolved_model,
+        directional=directional,
         valid=valid,
     )

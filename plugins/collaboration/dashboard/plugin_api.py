@@ -5576,26 +5576,43 @@ def hosted_intervention_context(
             else []
         )
         snapshot = [dict(item) for item in interventions if isinstance(item, dict)]
-    if not snapshot:
-        return ""
     base_role = str(role_stage or "").split(":", 1)[0]
+    stage_role = _hosted_stage_target_role(str(role_stage or ""))
+    active_items = [
+        item
+        for item in snapshot
+        if isinstance(item, dict)
+        and str(item.get("status") or "pending") in _INTERVENTION_ACTIVE_STATUSES
+        and (
+            base_role
+            in [str(value) for value in item.get("targets") or [] if str(value)]
+            or (
+                stage_role
+                in [str(value) for value in item.get("targets") or [] if str(value)]
+            )
+        )
+    ]
+    if not active_items:
+        return ""
+    completed_count = sum(
+        1
+        for item in snapshot
+        if isinstance(item, dict) and str(item.get("status") or "") == "completed"
+    )
     lines = [
         "【任务进行中的持久化 @ 干预】",
-        "以下控制消息属于当前托管任务。pending/processing 且被点名的成员必须按 @ 干预协议优先回应；completed 只用于核对落实情况，不得重复回复。",
+        "以下 pending/processing 控制消息点名了当前成员，必须按 @ 干预协议优先回应。",
     ]
-    for item in snapshot[-50:]:
+    if completed_count:
+        lines.append(
+            f"（另有 {completed_count} 条已处理干预，供核对落实情况，不再逐条展开。）"
+        )
+    for item in active_items[-10:]:
         targets = [str(value) for value in item.get("targets") or [] if str(value)]
         target_note = "、".join(targets) or "未识别"
         intervention_status = str(item.get("status") or "pending")
-        relevance = (
-            "当前角色被点名"
-            if base_role in targets and intervention_status in _INTERVENTION_ACTIVE_STATUSES
-            else "已处理，供复核"
-            if intervention_status == "completed"
-            else "供流程监督核对"
-        )
         lines.append(
-            f"- [{relevance}; status={intervention_status}; targets={target_note}] "
+            f"- [当前角色被点名; status={intervention_status}; targets={target_note}] "
             f"{str(item.get('content') or '').strip()}"
         )
     return "\n".join(lines)
@@ -10231,6 +10248,15 @@ def _run_hosted_role(
             ),
         )
     )
+    companion_handle: Optional[dict[str, Any]] = None
+    if _hosted_companion_stage_eligible(role_stage):
+        companion_handle = _start_hosted_companion(
+            conversation_id,
+            turn_id,
+            role_stage=role_stage,
+            profile=profile,
+            runner=runner,
+        )
     for attempt in range(1, attempts + 1):
         try:
             boundary_profile = runtime_profile or profile
@@ -10292,6 +10318,7 @@ def _run_hosted_role(
             )
             persist()
             release_role_claim()
+            _stop_hosted_companion(companion_handle)
             return result, "completed", state
         except Exception as exc:
             intervention = (
@@ -10399,6 +10426,7 @@ def _run_hosted_role(
                 _finish_hosted_turn_if_cancelled(conversation_id, turn_id)
                 state["status"] = "cancelled"
                 release_role_claim()
+                _stop_hosted_companion(companion_handle)
                 return str(state.get("content") or "").strip(), "cancelled", state
             terminal_content = str(state.get("content") or "").strip()
             if str(state.get("status") or "") == "failed" and terminal_content:
@@ -10410,6 +10438,7 @@ def _run_hosted_role(
                 )
                 persist()
                 release_role_claim()
+                _stop_hosted_companion(companion_handle)
                 return terminal_content, "failed", state
             transient = _is_transient_runtime_error(exc)
             has_tool_activity = any(
@@ -10446,9 +10475,11 @@ def _run_hosted_role(
             )
             persist()
             release_role_claim()
+            _stop_hosted_companion(companion_handle)
             return result, "failed", state
 
     release_role_claim()
+    _stop_hosted_companion(companion_handle)
     raise RuntimeError("Hermes 托管角色执行状态异常")
 
 
@@ -13384,11 +13415,19 @@ def _strict_hosted_control_result(
     protocol: str,
     outcomes: tuple[str, ...],
     required_checks: tuple[str, ...],
+    optional_keys: tuple[str, ...] = (),
 ) -> Optional[dict[str, Any]]:
     """Validate the closed verdict schema without interpreting narrative text."""
 
     parsed = _strict_json_object(result)
-    if parsed is None or set(parsed) != _HOSTED_CONTROL_ROOT_KEYS:
+    allowed_keys = set(_HOSTED_CONTROL_ROOT_KEYS) | set(optional_keys)
+    if (
+        parsed is None
+        or not set(_HOSTED_CONTROL_ROOT_KEYS) <= set(parsed)
+        or not set(parsed) <= allowed_keys
+    ):
+        return None
+    if "directional" in parsed and type(parsed.get("directional")) is not bool:
         return None
     if parsed.get("protocol") != protocol or parsed.get("verdict") not in outcomes:
         return None
@@ -13567,6 +13606,11 @@ def _hosted_control_display(
             return f"监督控制结果格式无效，{label} 已按未通过处理。"
         if control["verdict"] == "PASS":
             return f"监督检查通过：{label} 的职责、覆盖、证据和流程均已确认。"
+        if control.get("directional"):
+            return (
+                f"监督判定方案方向偏离：{label} 的问题影响整个方案方向，"
+                "需回到计划阶段从头执行，不得局部返工。"
+            )
         prefix = f"监督要求整改：{label}"
     details = [
         *control["blockers"],
@@ -13924,6 +13968,7 @@ def _hosted_supervisor_control(result: str) -> Optional[dict[str, Any]]:
         protocol="hermes.supervision.v1",
         outcomes=("PASS", "CORRECTIVE_ACTION"),
         required_checks=_HOSTED_SUPERVISION_CHECKS,
+        optional_keys=("directional",),
     )
     if strict is not None:
         return strict
@@ -13943,6 +13988,7 @@ def _hosted_supervisor_control(result: str) -> Optional[dict[str, Any]]:
             "blockers": [],
             "findings": [],
             "required_actions": [],
+            "directional": False,
             "_relaxed_interpretation": True,
         }
     if re.search(
@@ -13957,6 +14003,7 @@ def _hosted_supervisor_control(result: str) -> Optional[dict[str, Any]]:
             "blockers": [text[:2000]],
             "findings": [text[:2000]],
             "required_actions": ["依据叙述事实整改后重新提交检查点。"],
+            "directional": False,
             "_relaxed_interpretation": True,
         }
     # Broader narrative fallback: workers often write "checkpoint ...: PASS."
@@ -14005,6 +14052,7 @@ def _hosted_supervisor_control(result: str) -> Optional[dict[str, Any]]:
             "blockers": [],
             "findings": [],
             "required_actions": [],
+            "directional": False,
             "_relaxed_interpretation": True,
             "_relaxed_reason": "narrative verdict marker",
         }
@@ -14016,6 +14064,7 @@ def _hosted_supervisor_control(result: str) -> Optional[dict[str, Any]]:
             "blockers": [text[:2000]],
             "findings": [text[:2000]],
             "required_actions": ["依据叙述事实整改后重新提交检查点。"],
+            "directional": False,
             "_relaxed_interpretation": True,
             "_relaxed_reason": "narrative verdict marker",
         }
@@ -14036,10 +14085,16 @@ def _hosted_supervisor_protocol_prompt() -> str:
         '"checks":{"role_boundaries_respected":true|false,'
         '"task_coverage_complete":true|false,"evidence_sufficient":true|false,'
         '"process_compliant":true|false},"blockers":["..."],'
-        '"findings":["..."],"required_actions":["..."]}。'
-        "键集、类型和枚举必须完全一致。PASS 时四项 checks 必须全为 true，且三个数组"
-        "必须全空；CORRECTIVE_ACTION 时至少一项 check 为 false，并在数组中给出责任"
-        "对象、事实、整改动作和复核证据。"
+        '"findings":["..."],"required_actions":["..."],'
+        '"directional":true|false}。'
+        "键集、类型和枚举必须完全一致（directional 为可选布尔键，省略时视为 false）。"
+        "判定为 PASS 时：四项 checks 必须全为 true，三个数组必须全空，且除该 JSON 外"
+        "不得输出任何解释文字——直接签字，不做汇报。"
+        "判定为 CORRECTIVE_ACTION 时：至少一项 check 为 false，directional 仅在问题"
+        "影响整个方案方向（继续执行会偏离用户目标）时为 true，其余情况必须为 false；"
+        "blockers 写清违反了哪条职责边界、交付契约或验收标准（先给标准），"
+        "findings 写清观察到的事实和出现位置，required_actions 写清要接着完成的具体"
+        "动作，以及复查时必须提交的验收证据。"
     )
 
 
@@ -14096,11 +14151,22 @@ def _require_supervisor_pass(
     status = str(check.get("status") or "failed")
     if status == "completed" and verdict == "pass":
         return
+    supervisor_verdict_record = (
+        check.get("supervisor_verdict")
+        if isinstance(check.get("supervisor_verdict"), dict)
+        else {}
+    )
+    directional = (
+        bool(supervisor_verdict_record.get("directional"))
+        and verdict == "corrective_action"
+    )
     finding = str(
         check.get("display_result") or check.get("result") or ""
     ).strip()
     reason = (
-        f"监督检查要求返工：{checkpoint_label}"
+        f"监督检查判定方案方向性问题，需回到计划阶段从头执行：{checkpoint_label}"
+        if directional
+        else f"监督检查要求返工：{checkpoint_label}"
         if verdict == "corrective_action"
         else f"监督检查未形成可验证结论：{checkpoint_label}"
     )
@@ -14116,6 +14182,7 @@ def _require_supervisor_pass(
                 "supervisor_corrective_action": {
                     "checkpoint": checkpoint_label,
                     "verdict": verdict,
+                    "directional": directional,
                     "finding": finding,
                     "required_action": reason,
                     "created_at": now,
@@ -14220,6 +14287,430 @@ def _supervisor_result_contradicts_verdict(result: str, verdict: str) -> bool:
             continue
         return True
     return False
+
+
+# --- Companion supervision (伴随监督) ---------------------------------------
+# The supervisor's stated design is continuous oversight ("群聊拉起即开始
+# 监督"), but the gate implementation only fires at stage boundaries.  These
+# helpers run a lightweight supervisor thread alongside each supervised local
+# role: it tails the persisted role state, makes a few small delta-scoped
+# checks while the stage runs, and can raise an urgent @ intervention through
+# the SAME mid-run steer delivery the user-facing endpoint uses.  Companion
+# failures must never break the stage: every path is best-effort.
+
+_HOSTED_COMPANION_POLL_SECONDS = 15.0
+_HOSTED_COMPANION_MIN_CALL_SECONDS = 40.0
+_HOSTED_COMPANION_MAX_CALLS = 4
+_HOSTED_COMPANION_MAX_URGENT = 2
+_HOSTED_COMPANION_MAX_LIFETIME_SECONDS = 1800.0
+_HOSTED_COMPANION_DELTA_CHARS = 3000
+_HOSTED_COMPANION_NOTE_MAX_CHARS = 600
+_HOSTED_COMPANION_NOTES_KEPT = 20
+_HOSTED_COMPANION_STAGE_PREFIXES = frozenset(
+    {"worker", "reviewer", "reporter", "dispatcher", "manager"}
+)
+
+
+def _hosted_companion_stage_eligible(role_stage: str) -> bool:
+    """Companion runs for supervised stages only (never chat/supervisor).
+
+    Worker/reviewer/reporter stages use colon form ("worker:dbb3-worker"),
+    but local manager stages use underscore form ("manager_planning",
+    "manager_handoff") — cover both so the dispatcher really gets watched.
+    """
+
+    base = str(role_stage or "").split(":", 1)[0]
+    return (
+        base in _HOSTED_COMPANION_STAGE_PREFIXES
+        or base.startswith("manager")
+        or base.startswith("dispatch")
+    )
+_HOSTED_COMPANION_REGISTRY: dict[tuple[str, str], dict[str, Any]] = {}
+_HOSTED_COMPANION_REGISTRY_LOCK = threading.Lock()
+
+
+def _hosted_companion_protocol_prompt() -> str:
+    return "\n".join(
+        (
+            "【伴随检查输出协议】",
+            "只输出一个 JSON 对象，无代码块、无解释文字。schema：",
+            '{"notes":"...","urgent":true|false,"urgent_message":"...","directional":true|false}',
+            "notes：仅记录本次新增观察，不超过 600 字；没有新发现就写“无新增发现”，不要复述已覆盖内容。",
+            "urgent：仅当发现可立即纠正的局部问题时为 true（不影响方案方向）；",
+            "urgent_message 按“@成员名：已观察到的事实；违反的职责边界；必须整改的动作；完成时需提交的验收证据”格式，"
+            "只指出问题位置和整改动作，不要求从头重做。",
+            "directional：仅当发现影响整个方案方向的问题时为 true（此时 urgent 必须为 false，留给关卡处理）。",
+        )
+    )
+
+
+def _hosted_companion_role_snapshot(
+    conversation_id: str,
+    turn_id: str,
+    role_stage: str,
+) -> Optional[dict[str, Any]]:
+    """Read-only view of the currently persisted role state for one stage."""
+
+    with _STATE_LOCK:
+        state = load_single_state()
+        conversation = _conversation_by_id(state, conversation_id)
+        run = (conversation.get("hosted_turns") or {}).get(turn_id)
+        if not isinstance(run, dict):
+            return None
+        role_state = (run.get("role_events") or {}).get(role_stage)
+        if not isinstance(role_state, dict):
+            return {
+                "status": "",
+                "turn_status": str(run.get("status") or ""),
+                "content_len": 0,
+                "milestone_count": 0,
+                "activities_len": 0,
+                "content_tail": "",
+            }
+        content = str(role_state.get("content") or "")
+        return {
+            "status": str(role_state.get("status") or ""),
+            "turn_status": str(run.get("status") or ""),
+            "content_len": len(content),
+            "milestone_count": int(role_state.get("milestone_count") or 0),
+            "activities_len": len(role_state.get("activities") or []),
+            "content_tail": content[-_HOSTED_COMPANION_DELTA_CHARS:],
+        }
+
+
+def _hosted_companion_parse(result: str) -> Optional[dict[str, Any]]:
+    parsed = _strict_json_object(str(result or ""))
+    if not isinstance(parsed, dict):
+        return None
+    if not {"notes", "urgent", "directional"} <= set(parsed):
+        return None
+    if type(parsed.get("urgent")) is not bool or type(parsed.get("directional")) is not bool:
+        return None
+    if not isinstance(parsed.get("notes"), str):
+        return None
+    message = parsed.get("urgent_message")
+    if message is not None and not isinstance(message, str):
+        return None
+    return {
+        "notes": parsed["notes"][:_HOSTED_COMPANION_NOTE_MAX_CHARS],
+        "urgent": parsed["urgent"] and not parsed["directional"],
+        "urgent_message": str(message or "").strip()[:1200],
+        "directional": parsed["directional"],
+    }
+
+
+def _persist_hosted_companion_record(
+    conversation_id: str,
+    turn_id: str,
+    role_stage: str,
+    patch: dict[str, Any],
+) -> None:
+    """Merge one companion record; never touches supervisor_checks trimming."""
+
+    now = int(time.time() * 1000)
+    with _STATE_LOCK:
+        state = load_single_state()
+        conversation = _conversation_by_id(state, conversation_id)
+        run = (conversation.get("hosted_turns") or {}).get(turn_id)
+        if not isinstance(run, dict):
+            return
+        bucket = run.get("supervisor_companion")
+        if not isinstance(bucket, dict):
+            bucket = {}
+            run["supervisor_companion"] = bucket
+        record = bucket.get(role_stage)
+        record = dict(record) if isinstance(record, dict) else {}
+        record.update(_redact_sensitive(dict(patch)))
+        record["role_stage"] = role_stage
+        record["updated_at"] = now
+        bucket[role_stage] = record
+        run["updated_at"] = now
+        conversation["updated_at"] = now
+        save_single_state(state)
+
+
+def _append_supervisor_companion_intervention(
+    conversation_id: str,
+    turn_id: str,
+    *,
+    role_stage: str,
+    profile: str,
+    message: str,
+) -> Optional[str]:
+    """Raise one urgent @ steer through the standard mid-run delivery path."""
+
+    content = f"【监督者当场纠偏】{str(message or '').strip()}"[:4000]
+    if not str(message or "").strip():
+        return None
+    target_role = _hosted_stage_target_role(role_stage, profile)
+    now = int(time.time() * 1000)
+    intervention_id = f"companion_{uuid.uuid4().hex[:20]}"
+    with _STATE_LOCK:
+        state = load_single_state()
+        conversation = _conversation_by_id(state, conversation_id)
+        run = (conversation.get("hosted_turns") or {}).get(turn_id)
+        if not isinstance(run, dict):
+            return None
+        if str(run.get("status") or "queued") in _HOSTED_TERMINAL_STATUSES:
+            return None
+        interventions = run.get("interventions")
+        if not isinstance(interventions, list):
+            interventions = []
+            run["interventions"] = interventions
+        interventions.append(
+            {
+                "id": intervention_id,
+                "content": content,
+                "targets": [target_role],
+                "target_profiles": [str(profile)],
+                "status": "pending",
+                "delivery": "steer",
+                "queue_mode": "one_at_a_time",
+                "queued_for_future_stage": False,
+                "source": "supervisor_companion",
+                "created_at": now,
+                "updated_at": now,
+            }
+        )
+        message_record = _append_message(
+            conversation,
+            role="assistant",
+            name=_HERMES_SUPERVISOR_LABEL,
+            content=content,
+            status="completed",
+            meta={
+                "intervention": True,
+                "intervention_for": [target_role],
+                "intervention_profiles": [str(profile)],
+                "runtime_turn_id": turn_id,
+                "source": "supervisor_companion",
+            },
+        )
+        message_record["id"] = intervention_id
+        _project_native_message(message_record)
+        run["updated_at"] = now
+        conversation["updated_at"] = now
+        save_single_state(state)
+    _notify_hosted_update(conversation_id)
+    return intervention_id
+
+
+def _hosted_companion_loop(
+    handle: dict[str, Any],
+    conversation_id: str,
+    turn_id: str,
+    role_stage: str,
+    profile: str,
+    runner: Callable[..., str],
+) -> None:
+    """Watch one running role; small delta checks; urgent steer when needed."""
+
+    logger = logging.getLogger(__name__)
+    try:
+        while not handle["stop"].wait(_HOSTED_COMPANION_POLL_SECONDS):
+            if time.time() - handle["started_at"] > _HOSTED_COMPANION_MAX_LIFETIME_SECONDS:
+                break
+            snapshot = _hosted_companion_role_snapshot(
+                conversation_id,
+                turn_id,
+                role_stage,
+            )
+            if snapshot is None:
+                break
+            if str(snapshot.get("turn_status") or "") in _HOSTED_TERMINAL_STATUSES:
+                break
+            if str(snapshot.get("status") or "") in _HOSTED_TERMINAL_STATUSES:
+                break
+            change_key = (
+                snapshot.get("content_len"),
+                snapshot.get("milestone_count"),
+                snapshot.get("activities_len"),
+            )
+            now = time.monotonic()
+            if (
+                change_key == handle["last_key"]
+                or handle["calls"] >= _HOSTED_COMPANION_MAX_CALLS
+                or now - handle["last_call_at"] < _HOSTED_COMPANION_MIN_CALL_SECONDS
+            ):
+                continue
+            handle["last_key"] = change_key
+            handle["last_call_at"] = now
+            handle["calls"] += 1
+            notes_text = "\n".join(
+                f"- {note}" for note in handle["notes"][-5:]
+            ) or "（暂无）"
+            prompt = "\n".join(
+                item
+                for item in (
+                    supervisor_role_prompt(),
+                    "【伴随检查（阶段进行中的滚动抽查）】",
+                    f"正在观察的角色阶段：{role_stage}（profile={profile}）。",
+                    "该角色仍在执行中。你只依据下方“新增内容”更新滚动观察记录，不重复检查已覆盖内容，"
+                    "不下最终验收结论（最终验收在关卡进行），不替代该角色执行任何工作。",
+                    _hosted_companion_protocol_prompt(),
+                    "【既有观察记录】",
+                    notes_text,
+                    "【自上次检查以来的新增内容】",
+                    str(snapshot.get("content_tail") or "") or "（无文本增量，仅有活动变化）",
+                )
+                if str(item or "").strip()
+            )
+            result = _invoke_profile_runner(
+                runner,
+                "supervisor",
+                prompt,
+                lambda event: None,
+                "",
+                "",
+                lambda: bool(handle["stop"].is_set()),
+                None,
+            )
+            parsed = _hosted_companion_parse(result)
+            if parsed is None:
+                continue
+            handle["notes"].append(
+                f"[{datetime.now().strftime('%H:%M:%S')}] {parsed['notes']}"
+            )
+            handle["notes"] = handle["notes"][-_HOSTED_COMPANION_NOTES_KEPT:]
+            if parsed["directional"]:
+                handle["directional_hint"] = True
+            _persist_hosted_companion_record(
+                conversation_id,
+                turn_id,
+                role_stage,
+                {
+                    "notes": list(handle["notes"]),
+                    "checks_made": handle["calls"],
+                    "urgent_sent": handle["urgent_sent"],
+                    "directional_hint": handle["directional_hint"],
+                    "profile": profile,
+                },
+            )
+            if (
+                parsed["urgent"]
+                and parsed["urgent_message"]
+                and handle["urgent_sent"] < _HOSTED_COMPANION_MAX_URGENT
+            ):
+                intervention_id = _append_supervisor_companion_intervention(
+                    conversation_id,
+                    turn_id,
+                    role_stage=role_stage,
+                    profile=profile,
+                    message=parsed["urgent_message"],
+                )
+                if intervention_id:
+                    handle["urgent_sent"] += 1
+                    _persist_hosted_companion_record(
+                        conversation_id,
+                        turn_id,
+                        role_stage,
+                        {
+                            "notes": list(handle["notes"]),
+                            "checks_made": handle["calls"],
+                            "urgent_sent": handle["urgent_sent"],
+                            "directional_hint": handle["directional_hint"],
+                            "last_intervention_id": intervention_id,
+                            "profile": profile,
+                        },
+                    )
+    except Exception:
+        logger.exception(
+            "hosted companion supervisor failed for %s/%s",
+            turn_id,
+            role_stage,
+        )
+    finally:
+        # Natural exit (terminal stage/turn, lifetime cap): unregister so the
+        # registry never retains dead handles in a long-lived process.
+        registry_key = handle.get("registry_key")
+        if isinstance(registry_key, tuple):
+            with _HOSTED_COMPANION_REGISTRY_LOCK:
+                if _HOSTED_COMPANION_REGISTRY.get(registry_key) is handle:
+                    del _HOSTED_COMPANION_REGISTRY[registry_key]
+
+
+def _start_hosted_companion(
+    conversation_id: str,
+    turn_id: str,
+    *,
+    role_stage: str,
+    profile: str,
+    runner: Optional[Callable[..., str]],
+) -> Optional[dict[str, Any]]:
+    if runner is None:
+        return None
+    key = (str(turn_id), str(role_stage))
+    with _HOSTED_COMPANION_REGISTRY_LOCK:
+        existing = _HOSTED_COMPANION_REGISTRY.get(key)
+        if isinstance(existing, dict) and existing["thread"].is_alive():
+            return existing
+        stop = threading.Event()
+        handle: dict[str, Any] = {
+            "stop": stop,
+            "thread": None,
+            "notes": [],
+            "last_key": None,
+            "last_call_at": 0.0,
+            "calls": 0,
+            "urgent_sent": 0,
+            "directional_hint": False,
+            "started_at": time.time(),
+            "registry_key": key,
+        }
+        thread = threading.Thread(
+            target=_hosted_companion_loop,
+            args=(handle, conversation_id, turn_id, role_stage, profile, runner),
+            name=f"hosted-companion-{str(turn_id)[-8:]}-{str(role_stage).split(':', 1)[0]}",
+            daemon=True,
+        )
+        handle["thread"] = thread
+        _HOSTED_COMPANION_REGISTRY[key] = handle
+        thread.start()
+        return handle
+
+
+def _stop_hosted_companion(handle: Optional[dict[str, Any]]) -> None:
+    if not isinstance(handle, dict):
+        return
+    handle["stop"].set()
+    thread = handle.get("thread")
+    if isinstance(thread, threading.Thread):
+        thread.join(timeout=2.0)
+    key = handle.get("registry_key")
+    if isinstance(key, tuple):
+        with _HOSTED_COMPANION_REGISTRY_LOCK:
+            if _HOSTED_COMPANION_REGISTRY.get(key) is handle:
+                del _HOSTED_COMPANION_REGISTRY[key]
+
+
+def _hosted_companion_notes_text(
+    conversation_id: str,
+    turn_id: str,
+) -> str:
+    """Render the turn's companion notes as bounded gate-prompt context."""
+
+    with _STATE_LOCK:
+        state = load_single_state()
+        conversation = _conversation_by_id(state, conversation_id)
+        run = (conversation.get("hosted_turns") or {}).get(turn_id)
+        bucket = run.get("supervisor_companion") if isinstance(run, dict) else None
+        if not isinstance(bucket, dict) or not bucket:
+            return ""
+        lines: list[str] = []
+        for stage in sorted(bucket):
+            record = bucket.get(stage)
+            if not isinstance(record, dict):
+                continue
+            notes = [
+                str(item).strip()
+                for item in record.get("notes") or []
+                if str(item).strip()
+            ]
+            if not notes:
+                continue
+            hint = "；含方向性疑点" if record.get("directional_hint") else ""
+            lines.append(f"- {stage}{hint}：" + " / ".join(notes[-3:]))
+    return "\n".join(lines)[:4000]
 
 
 def _run_hosted_supervisor_check(
@@ -14389,6 +14880,19 @@ def _run_hosted_supervisor_check(
         evidence_digest,
     ):
         role_stage = f"{role_stage}:evidence:{evidence_digest[:12]}"
+    companion_notes_text = _hosted_companion_notes_text(conversation_id, turn_id)
+    companion_section = (
+        "\n".join(
+            (
+                "【伴随监督记录（本监督者在各阶段执行期间的滚动观察）】",
+                "以下是你自己在阶段进行中留下的抽查记录，可供本检查点直接引用；"
+                "它们不能替代下方持久化证据，最终判定仍必须基于证据核对。",
+                companion_notes_text,
+            )
+        )
+        if companion_notes_text
+        else ""
+    )
     prompt = "\n".join(
         item
         for item in (
@@ -14410,6 +14914,7 @@ def _run_hosted_supervisor_check(
                 if remote
                 else ""
             ),
+            companion_section,
             _hosted_supervisor_protocol_prompt(),
             bounded_evidence_json,
         )
@@ -14607,6 +15112,9 @@ def _run_hosted_supervisor_check(
                             "pass"
                             if verdict == "pass"
                             else "corrective"
+                        ),
+                        "directional": bool(
+                            (runtime_verdict.public_dict() or {}).get("directional")
                         ),
                         "display": str(display_result)[:4000],
                         # The mobile client's output fallback chain reads
