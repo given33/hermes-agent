@@ -7,7 +7,6 @@ The auth gate middleware iterates ``list_providers()`` and uses
 from __future__ import annotations
 
 import logging
-import os
 import threading
 from typing import List, Optional
 
@@ -63,77 +62,6 @@ def get_provider(
     """Return the registered provider for ``name``, or None if unknown."""
     with _lock:
         return _merged(scope).get(name)
-
-
-def register_mobile_api_provider_if_configured() -> bool:
-    """Register the built-in mobile provider when its secret is configured.
-
-    Registration is idempotent so app assembly and startup checks may safely
-    call this from different threads. The provider reads the current secret at
-    verification time; the registry never stores or logs the value.
-    """
-    from hermes_cli.dashboard_auth.mobile_api_provider import (
-        MOBILE_API_KEY_ENV,
-        MobileApiKeyProvider,
-    )
-
-    if not os.environ.get(MOBILE_API_KEY_ENV, "").strip():
-        return False
-
-    # Prefer the owner-mobile short-lived token flow.  If the operator has
-    # configured the official owner account (password + per-device
-    # access/refresh tokens), the shared static key is no longer needed and
-    # keeping it registered would leave an unrevocable backdoor.
-    try:
-        from hermes_cli.dashboard_auth.owner_mobile import owner_account_configured
-
-        if owner_account_configured():
-            _log.warning(
-                "dashboard-auth: HERMES_MOBILE_API_KEY is ignored because "
-                "owner-mobile short-lived token auth is configured; remove the "
-                "static key from the environment"
-            )
-            return False
-    except Exception:
-        pass
-
-    provider = MobileApiKeyProvider()
-    assert_protocol_compliance(type(provider))
-    registered = False
-    with _lock:
-        existing = _providers.get(provider.name)
-        if existing is None:
-            _providers[provider.name] = provider
-            registered = True
-        elif not isinstance(existing, MobileApiKeyProvider):
-            raise ValueError(
-                f"dashboard-auth provider already registered: {provider.name!r}"
-            )
-
-    if registered:
-        _log.info(
-            "dashboard-auth: registered provider %r (%s)",
-            provider.name,
-            provider.display_name,
-        )
-    return True
-
-
-
-def unregister_provider(
-    name: str,
-    *,
-    expected: DashboardAuthProvider | None = None,
-) -> bool:
-    """Remove one provider without disturbing a concurrent replacement."""
-
-    with _lock:
-        current = _providers.get(name)
-        if current is None or (expected is not None and current is not expected):
-            return False
-        del _providers[name]
-    _log.info("dashboard-auth: unregistered provider %r", name)
-    return True
 
 
 def snapshot_registration(
@@ -199,3 +127,13 @@ def clear_providers() -> None:
     with _lock:
         _providers.clear()
         _scoped_providers.clear()
+
+def unregister_provider(name: str, *, expected: str | None = None) -> None:
+    """Remove a registered dashboard auth provider by name."""
+    with _registry_lock:
+        current = _providers.get(name)
+        if current is None:
+            return
+        if expected is not None and current.name != expected:
+            raise ValueError(f"provider mismatch: {current.name!r} != {expected!r}")
+        del _providers[name]
