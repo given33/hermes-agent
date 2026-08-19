@@ -1788,7 +1788,10 @@ class IOSIntelligenceStore:
                         # pipeline: raising rolled back the whole batch and
                         # the cursor never advanced, so the client re-uploaded
                         # the same poison batch forever. Skip and count it —
-                        # identical to the blocked-kind handling above.
+                        # identical to the blocked-kind handling above. The
+                        # accepted counter was already bumped above, so undo
+                        # it: this event is discarded, not accepted.
+                        accepted -= 1
                         discarded += 1
                         duplicates += 1
                         continue
