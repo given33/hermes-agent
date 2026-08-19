@@ -328,12 +328,7 @@ def review_control(
         {
             "protocol": "hermes.review.v1",
             "verdict": verdict,
-            "checks": {
-                "requirements_met": passing,
-                "evidence_verified": passing,
-                "tests_passed": passing,
-                "risks_resolved": passing,
-            },
+            "checks": {"user_task_completed": passing},
             "blockers": [] if passing else (blockers or ["验收证据不足"]),
             "findings": [] if passing else (findings or ["缺少必要覆盖"]),
             "required_actions": (
@@ -357,12 +352,7 @@ def supervision_control(
         {
             "protocol": "hermes.supervision.v1",
             "verdict": verdict,
-            "checks": {
-                "role_boundaries_respected": passing,
-                "task_coverage_complete": passing,
-                "evidence_sufficient": passing,
-                "process_compliant": passing,
-            },
+            "checks": {"user_task_completed": passing},
             "blockers": [] if passing else (blockers or ["职责或证据存在阻断"]),
             "findings": [] if passing else (findings or ["监督检查未通过"]),
             "required_actions": (
@@ -2493,8 +2483,8 @@ class CollaborationDashboardTests(unittest.TestCase):
         self.assertIn("返工记录、产物路径与哈希", manager)
         self.assertIn("实际动作与证据绑定", worker)
         self.assertIn("尚未运行的测试必须标为未验证", worker)
-        self.assertIn("独立证据", reviewer)
-        self.assertIn("异常、并发、离线、恢复或权限场景", reviewer)
+        self.assertIn("验收只有一条标准", reviewer)
+        self.assertIn("不得因格式、详略、风格、缺少测试或风险表述而退回", reviewer)
         self.assertIn("不调用工具补洞", reporter)
         self.assertIn("不得选择更乐观的版本", reporter)
         self.assertIn("不等待任务结束才监督", supervisor)
@@ -3358,9 +3348,9 @@ class CollaborationDashboardTests(unittest.TestCase):
             lambda value: value.update({"extra": True}),
             lambda value: value.pop("findings"),
             lambda value: value["checks"].update({"extra": True}),
-            lambda value: value["checks"].update({"tests_passed": "true"}),
+            lambda value: value["checks"].update({"legacy_key": "true"}),
             lambda value: value.update({"blockers": ["one blocker"]}),
-            lambda value: value["checks"].update({"tests_passed": False}),
+            lambda value: value["checks"].update({"legacy_key": False}),
         ):
             candidate = json.loads(review_control())
             mutation(candidate)
@@ -3372,8 +3362,7 @@ class CollaborationDashboardTests(unittest.TestCase):
                     '"required_actions":[]',
                 ),
                 '{"protocol":"hermes.review.v1","protocol":"hermes.review.v1",'
-                '"verdict":"PASS","checks":{"requirements_met":true,'
-                '"evidence_verified":true,"tests_passed":true,"risks_resolved":true},'
+                '"verdict":"PASS","checks":{"user_task_completed":true},'
                 '"blockers":[],"findings":[],"required_actions":[]}',
             )
         )
@@ -3388,11 +3377,11 @@ class CollaborationDashboardTests(unittest.TestCase):
             lambda value: value.pop("findings"),
             lambda value: value["checks"].update({"extra": True}),
             lambda value: value["checks"].update(
-                {"evidence_sufficient": "true"}
+                {"legacy_key": "true"}
             ),
             lambda value: value.update({"blockers": ["one blocker"]}),
             lambda value: value["checks"].update(
-                {"evidence_sufficient": False}
+                {"legacy_key": False}
             ),
         ):
             candidate = json.loads(supervision_control())
@@ -3408,13 +3397,11 @@ class CollaborationDashboardTests(unittest.TestCase):
                 ),
                 '{"protocol":"hermes.supervision.v1",'
                 '"verdict":"PASS","verdict":"PASS","checks":{'
-                '"role_boundaries_respected":true,"task_coverage_complete":true,'
-                '"evidence_sufficient":true,"process_compliant":true},'
+                '"user_task_completed":true},'
                 '"blockers":[],"findings":[],"required_actions":[]}',
                 '{"protocol":"hermes.supervision.v1","verdict":"PASS",'
-                '"checks":{"role_boundaries_respected":true,'
-                '"task_coverage_complete":true,"evidence_sufficient":true,'
-                '"evidence_sufficient":true,"process_compliant":true},'
+                '"checks":{"user_task_completed":true,'
+                '"user_task_completed":true},'
                 '"blockers":[],"findings":[],"required_actions":[]}',
             )
         )
@@ -3500,7 +3487,7 @@ class CollaborationDashboardTests(unittest.TestCase):
             "可供 Reporter 参考的表述",
         )
 
-    def test_supervisor_corrective_action_blocks_worker_dispatch(self):
+    def test_supervisor_corrective_action_fails_the_turn_after_bounded_rework(self):
         module = load_module()
         conversation = module.create_single_conversation("default")
         state = {"conversations": [conversation]}
@@ -3515,12 +3502,14 @@ class CollaborationDashboardTests(unittest.TestCase):
             artifact_required=False,
         )
         calls = []
+        worker_calls = {"n": 0}
 
         def runner(profile, _prompt, **_kwargs):
             calls.append(profile)
             if profile == "supervisor":
                 return supervision_control("CORRECTIVE_ACTION")
-            return "不应执行"
+            worker_calls["n"] += 1
+            return "不应通过"
 
         with self.assertRaisesRegex(RuntimeError, "要求返工"):
             module.execute_hosted_workflow(
@@ -3533,7 +3522,9 @@ class CollaborationDashboardTests(unittest.TestCase):
                     "fanout": False,
                 },
             )
-        self.assertEqual(calls, ["supervisor"])
+        # 快检 (a) 存疑 → 1 次追问 + 最多 2 轮返工，全部 corrective 后 fail closed。
+        self.assertEqual(worker_calls["n"], 4)
+        self.assertEqual(calls.count("supervisor"), 4)
         run = conversation["hosted_turns"]["turn-supervisor-control"]
         self.assertEqual(run["status"], "failed")
         self.assertEqual(run["stage"], "failed")
@@ -3549,7 +3540,7 @@ class CollaborationDashboardTests(unittest.TestCase):
             )
         )
 
-    def test_supervisor_worker_handoff_corrective_action_triggers_rework_loop(self):
+    def test_supervisor_todo_check_corrective_action_triggers_followup_then_rework(self):
         module = load_module()
         conversation = module.create_single_conversation("default")
         state = {"conversations": [conversation]}
@@ -3564,7 +3555,7 @@ class CollaborationDashboardTests(unittest.TestCase):
             artifact_required=False,
         )
         calls = []
-        worker_handoff_calls = {"n": 0}
+        todo_check_calls = {"n": 0}
         worker_calls = {"n": 0}
 
         def runner(profile, prompt, **kwargs):
@@ -3588,11 +3579,9 @@ class CollaborationDashboardTests(unittest.TestCase):
                     }
                 )
             if profile == "supervisor":
-                if "计划形成与首次派发" in prompt:
-                    return supervision_control()
-                if "Worker 交接" in prompt:
-                    if worker_handoff_calls["n"] == 0:
-                        worker_handoff_calls["n"] += 1
+                if "Todo 完成：" in prompt:
+                    todo_check_calls["n"] += 1
+                    if todo_check_calls["n"] == 1:
                         return supervision_control(
                             "CORRECTIVE_ACTION",
                             blockers=[],
@@ -3600,28 +3589,23 @@ class CollaborationDashboardTests(unittest.TestCase):
                             required_actions=["actually create file"],
                         )
                     return supervision_control()
-                if "审阅与返工交接" in prompt:
-                    return supervision_control()
-                if "最终汇报" in prompt:
-                    return supervision_control()
-                if "post_report" in prompt or "最终汇报后" in prompt:
+                if "最终汇报前" in prompt:
                     return supervision_control()
                 raise AssertionError(f"unexpected supervisor prompt: {prompt[:80]}")
             if profile == "dbb3-worker":
                 worker_calls["n"] += 1
-                if worker_calls["n"] == 1:
-                    return "worker first attempt no artifact"
-                return "worker second attempt with artifact"
-            if profile == "reviewer":
-                return review_control()
-            if profile == "default":
-                return "final report"
+                if worker_calls["n"] == 2:
+                    # 第一次快检存疑后的追问，而不是直接打回。
+                    self.assertIn("监督者追问", prompt)
+                    self.assertIn("actually create file", prompt)
+                return "worker attempt result"
             raise AssertionError(f"unexpected profile {profile}")
 
         module.execute_hosted_workflow(
             conversation["id"],
             "turn-supervisor-rework",
             runner=runner,
+            manager_runner=runner,
             task_creator=lambda **_kwargs: {
                 "task_id": "root-rework",
                 "child_ids": ["child-worker", "child-reviewer"],
@@ -3634,9 +3618,25 @@ class CollaborationDashboardTests(unittest.TestCase):
         )
         run = conversation["hosted_turns"]["turn-supervisor-rework"]
         self.assertEqual(run["status"], "completed")
-        self.assertEqual(worker_handoff_calls["n"], 1)
+        self.assertEqual(todo_check_calls["n"], 2)
         self.assertEqual(worker_calls["n"], 2)
-        self.assertEqual(run.get("supervisor_rework_round"), 1)
+        # 存疑先以追问卡片呈现，未进入返工轮次。
+        self.assertTrue(
+            any(
+                message.get("meta", {}).get("role_stage")
+                == "supervisor.followup:step-1"
+                for message in conversation["messages"]
+            )
+        )
+        self.assertFalse(
+            any(
+                str(message.get("meta", {}).get("role_stage") or "").startswith(
+                    "supervisor.rework-request"
+                )
+                for message in conversation["messages"]
+            )
+        )
+        self.assertIn("todo_step-1", run["supervisor_checks"])
 
     def test_terminal_cas_notification_uses_cancel_winner(self):
         module = load_module()
@@ -5211,7 +5211,7 @@ class CollaborationDashboardTests(unittest.TestCase):
         )
         self.assertIn('if (!matched && event.type !== "tool.generating")', bundle)
 
-    def test_backend_hosted_workflow_runs_roles_serially_and_publishes_one_final_report(self):
+    def test_backend_hosted_workflow_orchestrates_todo_items_and_publishes_one_deterministic_report(self):
         module = load_module()
         conversation = module.create_single_conversation("default")
         state = {"conversations": [conversation]}
@@ -5259,13 +5259,15 @@ class CollaborationDashboardTests(unittest.TestCase):
             },
         )
 
+        # 编排工作流重构：reviewer/reporter 通道已删除，业务调用只剩 worker；
+        # 监督改为事件驱动快检（每个 todo 项一次 + 最终汇报前一次）。
         self.assertEqual(
             [profile for profile, _prompt in calls if profile != "supervisor"],
-            ["dbb3-worker", "reviewer", "default"],
+            ["dbb3-worker"],
         )
         self.assertEqual(
             [profile for profile, _prompt in calls].count("supervisor"),
-            5,
+            2,
         )
         assistant_messages = [
             message
@@ -5276,22 +5278,19 @@ class CollaborationDashboardTests(unittest.TestCase):
             sum(bool(message.get("meta", {}).get("final_report")) for message in assistant_messages),
             1,
         )
-        self.assertEqual(assistant_messages[-1]["content"], "最终汇报：任务完成")
+        run = conversation["hosted_turns"]["turn-hosted-1"]
+        final_message = assistant_messages[-1]
+        # 最终汇报由确定性看板生成（零 LLM），不是 runner 里 "default" 的文本。
+        self.assertEqual(final_message["content"], run["reporter_result"])
+        self.assertIn("任务执行看板", final_message["content"])
+        self.assertIn("执行完成，服务已恢复", final_message["content"])
+        self.assertIn("dbb3-worker", final_message["content"])
+        self.assertEqual(run["status"], "completed")
         self.assertEqual(
-            conversation["hosted_turns"]["turn-hosted-1"]["status"],
-            "completed",
+            set(run["supervisor_checks"]),
+            {"todo_todo-1", "final_report"},
         )
-        self.assertEqual(
-            set(conversation["hosted_turns"]["turn-hosted-1"]["supervisor_checks"]),
-            {
-                "plan_dispatch",
-                "worker_handoff",
-                "review_handoff",
-                "final_report",
-                "post_report",
-            },
-        )
-        notification = conversation["hosted_turns"]["turn-hosted-1"]["notification"]
+        notification = run["notification"]
         self.assertEqual(notification["state"], "queued")
         self.assertEqual(notification["task_status"], "completed")
         self.assertTrue(notification["collapse_id"].startswith("hermes-turn-"))
@@ -5301,13 +5300,14 @@ class CollaborationDashboardTests(unittest.TestCase):
                 conversation["id"],
                 "turn-hosted-1",
                 "completed",
-                "最终汇报：任务完成",
+                run["reporter_result"],
             )],
         )
-        business_calls = [item for item in calls if item[0] != "supervisor"]
-        worker_prompt = business_calls[0][1]
-        reviewer_prompt = business_calls[1][1]
-        reporter_prompt = business_calls[2][1]
+        worker_prompt = next(
+            prompt
+            for profile, prompt in calls
+            if profile == "dbb3-worker"
+        )
 
         self.assertIn("可以使用所有已配置的 Skill、MCP 和工具", worker_prompt)
         self.assertIn("信息增量事件 + 静默时长", worker_prompt)
@@ -5315,14 +5315,6 @@ class CollaborationDashboardTests(unittest.TestCase):
         self.assertIn("可以读取根任务和已分配工作项", worker_prompt)
         self.assertIn("可以向已分配工作项写入进度、证据和交接评论", worker_prompt)
         self.assertNotIn("不要主动查询或修改 Kanban 内部状态", worker_prompt)
-
-        self.assertIn("独立抽样复核", reviewer_prompt)
-        self.assertIn("采用的独立证据", reviewer_prompt)
-        self.assertIn("正常的 Skill、MCP、命令和取证调用不属于过度执行", reviewer_prompt)
-        self.assertNotIn("不要主动查询或修改 Kanban 内部状态", reviewer_prompt)
-        self.assertIn("不得创建、改派、关闭或删除根任务", reporter_prompt)
-        self.assertIn("不调用工具补洞", reporter_prompt)
-        self.assertIn("不得选择更乐观的版本", reporter_prompt)
 
     def test_notification_delivery_progress_and_terminal_state_are_persisted(self):
         module = load_module()
@@ -5664,9 +5656,8 @@ class CollaborationDashboardTests(unittest.TestCase):
         )
 
         business_calls = [item for item in calls if item[0] != "supervisor"]
-        self.assertEqual(business_calls[0], ("pc-worker", "child-worker"))
-        self.assertEqual(business_calls[1], ("reviewer", "child-reviewer"))
-        self.assertTrue(business_calls[2][1].startswith("hosted-reporter-"))
+        # 编排工作流重构：reviewer/reporter 通道已删除，业务角色只剩 worker。
+        self.assertEqual(business_calls, [("pc-worker", "child-worker")])
         self.assertNotIn("root-scoped", [scope for _profile, scope in business_calls])
 
     def test_hosted_roles_persist_separate_live_messages_with_nested_activities(self):
@@ -5757,20 +5748,20 @@ class CollaborationDashboardTests(unittest.TestCase):
             for message in conversation["messages"]
             if message.get("meta", {}).get("runtime_turn_id") == "turn-live-roles"
             and message.get("meta", {}).get("role_stage")
-            in {"dispatch", "worker", "reviewer", "reporter"}
+            in {"dispatch", "worker", "reporter"}
         ]
         self.assertEqual(
             [message["meta"]["role_stage"] for message in role_messages],
-            ["dispatch", "worker", "reviewer", "reporter"],
+            ["dispatch", "worker", "reporter"],
         )
-        # Reporter is intentionally invisible until the independent
-        # post-report supervisor gate accepts the candidate.
-        self.assertEqual(len(observed_running_messages), 2)
-        for message in role_messages[1:]:
-            self.assertTrue(message["meta"]["collapse_activities"])
-            self.assertEqual(message["meta"]["actual_model"], "gpt-5.6-sol")
-            self.assertEqual(message["meta"]["activities"][1]["category"], "command")
-            self.assertEqual(message["meta"]["activities"][1]["duration_ms"], 420)
+        # 编排工作流重构：reviewer 通道已删除，流式角色消息只剩 worker；
+        # reporter 为确定性看板汇报，不再经过 LLM 流式投影。
+        self.assertEqual(len(observed_running_messages), 1)
+        worker_final = role_messages[1]
+        self.assertTrue(worker_final["meta"]["collapse_activities"])
+        self.assertEqual(worker_final["meta"]["actual_model"], "gpt-5.6-sol")
+        self.assertEqual(worker_final["meta"]["activities"][1]["category"], "command")
+        self.assertEqual(worker_final["meta"]["activities"][1]["duration_ms"], 420)
 
     def test_hosted_workflow_retries_transient_502_without_losing_partial_progress(self):
         module = load_module()
@@ -6836,7 +6827,7 @@ class CollaborationDashboardTests(unittest.TestCase):
         self.assertEqual([item["name"] for item in final["meta"]["attachments"]], ["report.pdf"])
         self.assertNotIn("path", final["meta"]["attachments"][0])
 
-    def test_two_hosted_workers_run_concurrently_before_reviewer_and_reporter(self):
+    def test_two_hosted_todo_items_run_concurrently_before_the_deterministic_report(self):
         module = load_module()
         conversation = module.create_single_conversation("default")
         state = {"conversations": [conversation]}
@@ -6901,11 +6892,7 @@ class CollaborationDashboardTests(unittest.TestCase):
                 with call_lock:
                     worker_finished.add(profile)
                 return f"{profile} 完成"
-            if profile == "reviewer":
-                self.assertEqual(worker_finished, {"dbb3-worker", "pc-worker"})
-                return review_control()
-            self.assertEqual(worker_finished, {"dbb3-worker", "pc-worker"})
-            return "最终汇报完成"
+            raise AssertionError(f"unexpected profile {profile}")
 
         module.execute_hosted_workflow(
             conversation["id"],
@@ -6927,8 +6914,12 @@ class CollaborationDashboardTests(unittest.TestCase):
             for profile, phase, _at, _scope in calls
             if phase == "start" and profile != "supervisor"
         ]
-        self.assertEqual(set(start_profiles[:2]), {"dbb3-worker", "pc-worker"})
-        self.assertEqual(start_profiles[2:], ["reviewer", "default"])
+        # 无依赖的两个 todo 项并行派发；reviewer/reporter 通道已删除。
+        self.assertEqual(set(start_profiles), {"dbb3-worker", "pc-worker"})
+        self.assertEqual(
+            [profile for profile, _phase, _at, _scope in calls].count("supervisor"),
+            3,
+        )
 
         worker_messages = [
             message
@@ -6952,7 +6943,7 @@ class CollaborationDashboardTests(unittest.TestCase):
         self.assertEqual(len(final_workers), 2)
         for message in final_workers:
             self.assertEqual(message["role"], "assistant")
-            self.assertEqual(message["handoff_to"], ["reviewer"])
+            self.assertEqual(message["handoff_to"], ["reporter"])
             self.assertEqual(message["activity_count"], 1)
             self.assertEqual(message["activities"][0]["tool_name"], "terminal")
             self.assertEqual(message["activities"][0]["duration_ms"], 50)
@@ -6962,6 +6953,14 @@ class CollaborationDashboardTests(unittest.TestCase):
             sum(bool(message.get("meta", {}).get("final_report")) for message in conversation["messages"]),
             1,
         )
+        final_message = next(
+            message
+            for message in reversed(conversation["messages"])
+            if message.get("meta", {}).get("final_report")
+        )
+        self.assertIn("任务执行看板", final_message["content"])
+        self.assertIn("dbb3-worker 完成", final_message["content"])
+        self.assertIn("pc-worker 完成", final_message["content"])
 
     def test_dispatch_to_two_workers_registers_participants_with_member_ids(self):
         module = load_module()
@@ -7055,7 +7054,7 @@ class CollaborationDashboardTests(unittest.TestCase):
             set(participants),
         )
 
-    def test_reviewer_rework_runs_workers_again_before_final_report(self):
+    def test_todo_completion_check_rework_runs_worker_again_before_final_report(self):
         module = load_module()
         conversation = module.create_single_conversation("default")
         state = {"conversations": [conversation]}
@@ -7074,26 +7073,35 @@ class CollaborationDashboardTests(unittest.TestCase):
         )
         calls = []
         worker_attempt = 0
-        reviewer_attempt = 0
+        todo_check_attempt = 0
 
         def runner(profile, prompt, **_kwargs):
-            nonlocal worker_attempt, reviewer_attempt
+            nonlocal worker_attempt, todo_check_attempt
             calls.append(profile)
             if profile == "supervisor":
-                return supervision_control()
+                if "Todo 完成：" in prompt:
+                    todo_check_attempt += 1
+                    if todo_check_attempt <= 2:
+                        return supervision_control(
+                            "CORRECTIVE_ACTION",
+                            blockers=["部署未验证"],
+                            findings=["声称完成但缺少验证结果"],
+                            required_actions=["重新执行并给出验证输出"],
+                        )
+                    return supervision_control()
+                if "最终汇报前" in prompt:
+                    return supervision_control()
+                raise AssertionError(f"unexpected supervisor prompt: {prompt[:80]}")
             if profile == "dbb3-worker":
                 worker_attempt += 1
                 if worker_attempt == 2:
-                    self.assertIn("审阅者退回意见", prompt)
+                    # 第一次快检存疑后的追问（不是直接打回）。
+                    self.assertIn("监督者追问", prompt)
+                if worker_attempt == 3:
+                    # 追问后仍判定未完成，才确认打回重做。
+                    self.assertIn("退回返工意见", prompt)
                 return f"执行结果 {worker_attempt}"
-            if profile == "reviewer":
-                reviewer_attempt += 1
-                if reviewer_attempt == 1:
-                    return review_control("REWORK")
-                self.assertIn("返工后的执行者提交", prompt)
-                return review_control()
-            self.assertEqual(reviewer_attempt, 2)
-            return "最终汇报"
+            raise AssertionError(f"unexpected profile {profile}")
 
         module.execute_hosted_workflow(
             conversation["id"],
@@ -7109,28 +7117,19 @@ class CollaborationDashboardTests(unittest.TestCase):
         run = conversation["hosted_turns"]["turn-review-rework"]
         self.assertEqual(
             [profile for profile in calls if profile != "supervisor"],
-            ["dbb3-worker", "reviewer", "dbb3-worker", "reviewer", "default"],
+            ["dbb3-worker", "dbb3-worker", "dbb3-worker"],
         )
+        self.assertEqual(todo_check_attempt, 3)
         self.assertEqual(run["rework_round"], 1)
         self.assertEqual(run["status"], "completed")
-        self.assertEqual(
-            json.loads(run["reviewer_result"])["verdict"],
-            "PASS",
-        )
-        rework_request = next(
-            message
+        role_stages = {
+            message.get("meta", {}).get("role_stage")
             for message in conversation["messages"]
-            if message.get("meta", {}).get("role_stage")
-            == "reviewer:rework-request:1"
-        )
-        self.assertEqual(rework_request["handoff_to"], ["dbb3-worker"])
-        self.assertTrue(
-            any(
-                message.get("meta", {}).get("role_stage")
-                == "worker:dbb3-worker:rework:1"
-                for message in conversation["messages"]
-            )
-        )
+        }
+        self.assertIn("worker:dbb3-worker:followup:1", role_stages)
+        self.assertIn("worker:dbb3-worker:rework:1", role_stages)
+        self.assertIn("supervisor.followup:todo-1", role_stages)
+        self.assertIn("supervisor.rework-request:1", role_stages)
 
     def test_intent_classifier_hard_chat_lock_rejects_conflicting_model(self):
         module = load_module()
@@ -7451,24 +7450,19 @@ class CollaborationDashboardTests(unittest.TestCase):
             [stage for stage, _profile, _connector, _label in remote_stages],
             [
                 "manager_planning",
-                "supervisor:plan_dispatch",
                 "worker",
-                "supervisor:worker_handoff",
-                "reviewer",
-                "supervisor:review_handoff",
-                "manager_handoff",
+                "supervisor:todo_step-1",
                 "supervisor:final_report",
-                "supervisor:post_report",
             ],
         )
-        self.assertEqual(local_stages[0][:2], ("reporter", "default"))
-        self.assertIn("结构化交接", local_stages[0][2])
+        # Reporter 通道已删除：最终汇报由确定性看板生成，不再有本地 LLM 角色。
+        self.assertEqual(local_stages, [])
+        run = conversation["hosted_turns"]["turn-manager-owned"]
+        self.assertEqual(run["stage"], "completed")
+        self.assertIn("任务执行看板", run["reporter_result"])
+        self.assertIn("worker evidence", run["reporter_result"])
         self.assertEqual(
-            conversation["hosted_turns"]["turn-manager-owned"]["stage"],
-            "completed",
-        )
-        self.assertEqual(
-            conversation["hosted_turns"]["turn-manager-owned"]["manager_plan"]["workers"],
+            run["manager_plan"]["workers"],
             ["dbb3-worker"],
         )
         manager_labels = {
@@ -7478,23 +7472,20 @@ class CollaborationDashboardTests(unittest.TestCase):
         }
         self.assertEqual(
             manager_labels,
-            {"Hermes 调度员 · 规划", "Hermes 调度员 · 交接"},
+            {"Hermes 调度员 · 规划"},
         )
         self.assertFalse(
             any("DBB3 Manager" in str(label) for label in manager_labels)
         )
         self.assertEqual(
-            set(conversation["hosted_turns"]["turn-manager-owned"]["supervisor_checks"]),
+            set(run["supervisor_checks"]),
             {
-                "plan_dispatch",
-                "worker_handoff",
-                "review_handoff",
+                "todo_step-1",
                 "final_report",
-                "post_report",
             },
         )
 
-    def test_post_report_corrective_gate_rejects_candidate_before_publication(self):
+    def test_final_report_corrective_gate_rejects_publication_before_the_deterministic_report(self):
         module = load_module()
         conversation = module.create_single_conversation("default")
         state = {"conversations": [conversation]}
@@ -7537,13 +7528,9 @@ class CollaborationDashboardTests(unittest.TestCase):
                     "completed",
                     {},
                 )
-            if stage == "worker":
+            if stage == "worker" or stage.startswith("worker:"):
                 return "verified worker evidence", "completed", {}
-            if stage == "reviewer":
-                return review_control(), "completed", {}
-            if stage == "manager_handoff":
-                return '{"suggested_conclusion":"candidate conclusion"}', "completed", {}
-            if stage == "supervisor:post_report":
+            if stage.startswith("supervisor:final_report"):
                 return supervision_control("CORRECTIVE_ACTION"), "completed", {}
             if stage.startswith("supervisor:"):
                 return supervision_control(), "completed", {}
@@ -7551,7 +7538,7 @@ class CollaborationDashboardTests(unittest.TestCase):
 
         def local_role(_conversation_id, _turn_id, **kwargs):
             visibility[kwargs["role_stage"]] = kwargs.get("visible", True)
-            return "未经监督批准的 Reporter 草稿", "completed", {"activities": []}
+            raise AssertionError("确定性汇报不应触发本地 LLM 角色")
 
         module._run_hosted_remote_role = remote_role
         module._run_hosted_role = local_role
@@ -7577,13 +7564,13 @@ class CollaborationDashboardTests(unittest.TestCase):
 
         run = conversation["hosted_turns"]["turn-post-report-reject"]
         self.assertEqual(run["status"], "failed")
-        self.assertEqual(run["supervisor_checks"]["post_report"]["verdict"], "corrective_action")
-        self.assertFalse(visibility["reporter"])
-        self.assertFalse(visibility["supervisor:post_report"])
+        self.assertEqual(
+            run["supervisor_checks"]["final_report_2"]["verdict"],
+            "corrective_action",
+        )
         self.assertFalse(
             any(
                 message.get("meta", {}).get("final_report")
-                or message.get("content") == "未经监督批准的 Reporter 草稿"
                 for message in conversation["messages"]
             )
         )
@@ -7722,19 +7709,18 @@ class CollaborationDashboardTests(unittest.TestCase):
         protocol = module._hosted_supervisor_protocol_prompt()
         self.assertIn("directional", protocol)
         self.assertIn("直接签字", protocol)
-        self.assertIn("违反了哪条职责边界", protocol)
-        self.assertIn("验收证据", protocol)
-        self.assertIn("影响整个方案方向", protocol)
+        self.assertIn("监督只有一条标准：用户的原始任务", protocol)
+        self.assertIn("blockers 写清用户任务中哪一项未完成", protocol)
+        self.assertIn("directional 仅在计划方向偏离用户目标时为 true", protocol)
 
     def test_strict_control_accepts_optional_directional_for_supervisor_only(self):
         module = load_module()
         good = (
             '{"protocol":"hermes.supervision.v1","verdict":"CORRECTIVE_ACTION",'
-            '"checks":{"role_boundaries_respected":false,'
-            '"task_coverage_complete":true,"evidence_sufficient":true,'
-            '"process_compliant":true},"blockers":["违反交付契约：缺少证据"],'
-            '"findings":["Worker 自称完成但无测试结果"],'
-            '"required_actions":["补跑测试并提交输出"],"directional":true}'
+            '"checks":{"user_task_completed":false},'
+            '"blockers":["用户任务未完成：缺少状态查询结果"],'
+            '"findings":["用户要求的状态信息未出现在结果中"],'
+            '"required_actions":["补查状态并返回结果"],"directional":true}'
         )
         control = module._hosted_supervisor_control(good)
         self.assertIsNotNone(control)
@@ -7746,8 +7732,7 @@ class CollaborationDashboardTests(unittest.TestCase):
 
         reviewer_json = (
             '{"protocol":"hermes.review.v1","verdict":"REWORK",'
-            '"checks":{"requirements_met":false,"evidence_verified":true,'
-            '"tests_passed":true,"risks_resolved":true},'
+            '"checks":{"user_task_completed":false},'
             '"blockers":["违反交付契约：缺少证据"],'
             '"findings":["Worker 自称完成但无测试结果"],'
             '"required_actions":["补跑测试并提交输出"]}'
@@ -7786,9 +7771,7 @@ class CollaborationDashboardTests(unittest.TestCase):
         module = load_module()
         result = (
             '{"protocol":"hermes.supervision.v1","verdict":"CORRECTIVE_ACTION",'
-            '"checks":{"role_boundaries_respected":false,'
-            '"task_coverage_complete":true,"evidence_sufficient":true,'
-            '"process_compliant":true},"blockers":["违反职责边界：偏离去重目标"],'
+            '"checks":{"user_task_completed":false},"blockers":["用户任务未完成：偏离去重目标"],'
             '"findings":["Worker 在改无关模块"],'
             '"required_actions":["停止并回到计划阶段"],"directional":true}'
         )
@@ -7852,7 +7835,7 @@ class CollaborationDashboardTests(unittest.TestCase):
         control = {
             "protocol": "hermes.supervision.v1",
             "verdict": "CORRECTIVE_ACTION",
-            "checks": {"role_boundaries_respected": False},
+            "checks": {"user_task_completed": False},
             "blockers": ["b"],
             "findings": ["f"],
             "required_actions": ["a"],
@@ -7867,7 +7850,7 @@ class CollaborationDashboardTests(unittest.TestCase):
         pass_control = {
             "protocol": "hermes.supervision.v1",
             "verdict": "PASS",
-            "checks": {"role_boundaries_respected": True},
+            "checks": {"user_task_completed": True},
             "blockers": [],
             "findings": [],
             "required_actions": [],

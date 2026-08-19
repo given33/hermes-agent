@@ -5469,9 +5469,9 @@ def hosted_role_delivery_contract(role_name: str) -> str:
         )
     elif "review" in normalized or "审阅" in normalized:
         rules = (
-            "审阅员的更新必须指明正在核对的验收标准、采用的独立证据以及当前 PASS/REWORK 倾向；不能只复述 Worker 的结论。",
-            "发现缺陷时说明复现条件、影响、严重度和最小整改要求；退回必须可执行，复审必须逐项对应上轮意见。",
-            "没有证据覆盖的场景标为未验证，不得因主路径通过而推断异常、并发、离线、恢复或权限场景也通过。",
+            "验收只有一条标准：用户的原始任务是否已经完成。用户要求的每一项都有对应完成结果即通过。",
+            "更新中说明用户任务的每一项对应的结果在哪里；不得因格式、详略、风格、缺少测试或风险表述而退回。",
+            "退回只用于用户任务存在未完成事项：列出未完成项即可执行地补做；复审只核对上轮列出的未完成项。",
         )
     elif "report" in normalized or "汇报" in normalized:
         rules = (
@@ -6452,12 +6452,18 @@ def _normalize_manager_plan(
         objective = str(item.get("objective") or item.get("title") or "").strip()
         if not objective:
             continue
+        # 编排工作流重构：todo 项只保留 4 个业务字段；objective 仅作为
+        # 旧持久化记录的兼容投影，不再由提示词要求生成。
+        user_task_fragment = str(
+            item.get("user_task_fragment") or objective
+        ).strip()
         steps.append(
             {
                 "id": str(item.get("id") or f"step-{index}").strip()[:80],
                 "title": str(item.get("title") or objective).strip()[:180],
                 "objective": objective[:8000],
                 "assignee": assignee,
+                "user_task_fragment": user_task_fragment[:2000],
                 "depends_on": [
                     str(value).strip()[:80]
                     for value in item.get("depends_on") or []
@@ -6490,6 +6496,7 @@ def _normalize_manager_plan(
                 "title": f"{profile} execution",
                 "objective": content[:8000],
                 "assignee": profile,
+                "user_task_fragment": content[:2000],
                 "depends_on": [],
             }
             for index, profile in enumerate(worker_profiles, start=1)
@@ -6577,12 +6584,15 @@ def _manager_plan_prompt(
     goal_override: str = "",
     plan_only: bool = False,
 ) -> str:
+    # 编排工作流重构（orchestrator-worker 模式）：manager 不再做深度规划，
+    # 不产出 objective/验收标准/证据要求/测试方案，只把用户任务拆成一个
+    # 可直接派发的 todolist；节点状态与能力由服务端确定性代码读取。
     directive_lines: list[str] = []
     if plan_only:
         directive_lines.append(
-            "用户使用了 /plan 指令：本轮**只做调查与方案制定**。"
-            "输出完整方案后直接结束，绝不派发执行节点、绝不调用任务板创建执行任务；"
-            "方案本身就是最终交付物，写得更详尽一些。"
+            "用户使用了 /plan 指令：本轮**只做任务拆分**。"
+            "输出 todolist 后直接结束，绝不派发执行节点、绝不调用任务板创建执行任务；"
+            "todolist 本身就是最终交付物，拆分得完整一些。"
         )
     if goal_override:
         directive_lines.append(
@@ -6594,54 +6604,28 @@ def _manager_plan_prompt(
         for item in (
             "你是 Hermes Manager（调度员/规划者），是整个 agent team 的调度中枢。",
             *directive_lines,
-            "你的职责：完整理解用户任务 → 收集一切必要信息和问题（可以调用工具，"
-            "也可以调用 delegate_task 派调查子代理去核实环境、统计、检索、验证文件/服务/数据）"
-            "→ 输出一份可执行的完整方案。你不亲手执行任务，也不向用户生成最终答案。",
-            "调查自主判断：任务信息不足或需要核实外部状态时，先派 1-2 个 leaf 调查子代理收集信息，"
-            "每个子代理用 name 给一个中文职业名（如“资料调查员”“环境核查员”），"
-            "并用 expected_output 写明要交付什么、acceptance_criteria 写明验收条件"
-            "（inherit_turns 保持 0，子代理用全新上下文）；"
-            "把调查结论写进方案；信息已经足够时直接规划，不要为简单任务增加无谓延迟。"
-            "调查子代理运行期间，用 subagent_list 查看其进展；"
-            "发现方向偏离时用 subagent_send(subagent_id=..., text=...) 发送调整指令，"
-            "发现子代理卡死时用 subagent_kill(subagent_id=...) 终止并重新派出，"
-            "不需要等它结束。",
-            "方向或需求确实不清楚、必须由用户拍板时，用 kanban_block(kind=\"needs_input\") "
-            "提问，reason 用“问题 + 选项：A. ... B. ... C. ...”格式，"
-            "让用户在手机上直接点选（也可自定义回答）；能自行判断的不要打扰用户。",
-            "方案必须包含以下全部要素（写入最终 JSON，不要省略）：",
-            "  - approach：整体方案与思路（如何完成任务、各阶段做什么）；",
-            "  - task_requirements：任务要求（把用户任务的每一条可验证要求逐条列出）；",
-            "  - acceptance_criteria：验收标准（每条可验证、可检查的通过条件）；",
-            "  - test_plan：测试方案（如何验证每个交付物/每项功能，含具体验证动作）；",
-            "  - flow：流程方案（按执行顺序的完整流程步骤）。",
-            "  - plan：Todo List（按实际执行顺序列出可验证、可独立完成的步骤，title 简短明确，"
-            "每步 objective 写明目标、做法与验收要点，assignee 为具体 worker，depends_on 表达依赖）。",
-            "  - plan 每步可选携带：context_refs（本步骤需要引用的上游任务 id 列表，worker 按需拉全文）、"
-            "input_artifacts（本步骤消费的上游产物，如 \"upstream/report.md\"）、"
-            "output_artifacts（本步骤必须产出的交付物路径）。"
-            "  - context_variables（可选）：跨步骤共享的小型结构化状态对象（如 {\"target_host\":\"dbb3\",\"mode\":\"verify\"}），"
-            "随任务链传给每个 worker，不要放对话历史里。",
-            "多步骤任务不得压缩成一个泛化的“执行任务”；每完成一个步骤，服务端会依据真实 Worker、"
-            "审阅与汇报状态更新勾选。示例：用户要求「建目录、写文件、运行、用 todo 跟踪、总结」，"
-            "则 plan 至少包含 5 个步骤（建目录 → 写文件 → 运行验证 → 更新 todo → 总结），"
-            "禁止把多个要求合并成单个执行节点。",
-            "按任务真实需要选择一个或两个 Worker，不得使用其他节点，不得省略验收。",
+            "你的职责只有一步：理解用户任务，把它拆成一个可直接派发的 Todo List。",
+            "不做深度规划：不写 objective、验收标准、证据要求或测试方案；"
+            "不调查环境、不派调查子代理、不调用任何工具，直接输出拆分结果。",
+            "拆分要求：",
+            "- 用户任务里有几个可独立交付的片段就拆几项；单一简单任务只拆一项；"
+            "禁止把多个要求合并成一项，也禁止拆出用户没有要求的项。",
+            "- 每项 4 个字段：title 一句话说清做什么；assignee 从可用执行节点中选择；"
+            "depends_on 填前一项的 id（串行依赖），可并行的项用空数组；"
+            "user_task_fragment 摘录用户任务原文中对应这一个项的片段。",
             hosted_progress_protocol(_HERMES_MANAGER_LABEL),
             hosted_role_delivery_contract(_HERMES_MANAGER_LABEL),
             mention_priority_protocol(_HERMES_MANAGER_LABEL),
-            "可用执行节点有 dbb3-worker 与 pc-worker；默认审阅节点是 DBB3，必要时可选择 PC。",
+            # 可用执行节点由服务端按当前节点状态确定性注入（零 LLM 调用）。
+            f"可用执行节点（服务端确定性提供）：{', '.join(sorted(set(fallback_workers) | {'dbb3-worker', 'pc-worker'}))}",
             f"服务器路由建议：{', '.join(fallback_workers)}",
             f"是否要求交付文件：{'yes' if artifact_required else 'no'}",
-            "最终交接输出一个 JSON 对象且不要附加解释；过程回报通过运行事件发送，不得混入最终 JSON。结构必须为：",
-            '{"difficulty":"low|medium|high|critical","reason":"...","workers":["dbb3-worker"],'
-            '"reviewer_target":"dbb3|pc","approach":"整体方案","task_requirements":"任务要求逐条",'
-            '"acceptance_criteria":["验收标准1","验收标准2"],"test_plan":"测试方案",'
-            '"flow":["流程步骤1","流程步骤2"],"context_variables":{"k":"v"},'
-            '"plan":[{"id":"step-1","title":"...","objective":"...","assignee":"dbb3-worker|pc-worker",'
-            '"depends_on":[],"context_refs":["t_xxx"],"input_artifacts":["path"],"output_artifacts":["path"]}]}',
-            "plan 是用户右滑后看到的 Todo List；approach/task_requirements/acceptance_criteria/"
-            "test_plan/flow 会写入看板任务并随任务链传给每个 Worker。",
+            "最终输出一个 JSON 对象且不要附加解释；过程回报通过运行事件发送，不得混入最终 JSON。结构必须为：",
+            '{"workers":["dbb3-worker"],"plan":['
+            '{"id":"todo-1","title":"一句话做什么","assignee":"dbb3-worker",'
+            '"depends_on":[],"user_task_fragment":"用户任务原文片段"}]}',
+            "plan 是用户右滑后看到的 Todo List，也是服务端并行派发的依据："
+            "depends_on 为空数组的项目会被同时派发给各自的执行者。",
             f"用户任务：\n{content}",
             attachment_context,
         )
@@ -6694,20 +6678,169 @@ def _render_manager_plan_report(
                 if str(item).strip()
             )
         )
-    plan_steps = manager_plan.get("plan")
-    if isinstance(plan_steps, list) and plan_steps:
-        lines: list[str] = []
-        for step in plan_steps:
-            if not isinstance(step, dict):
-                continue
-            label = str(step.get("title") or step.get("id") or "步骤")
-            assignee = str(step.get("assignee") or "").strip()
-            lines.append(f"- {label}" + (f"（{assignee}）" if assignee else ""))
-            objective = str(step.get("objective") or "").strip()
-            if objective:
-                lines.append(f"  - {objective}")
-        sections.append("## 执行步骤\n\n" + "\n".join(lines))
+        plan_steps = manager_plan.get("plan")
+        if isinstance(plan_steps, list) and plan_steps:
+            lines: list[str] = []
+            for step in plan_steps:
+                if not isinstance(step, dict):
+                    continue
+                label = str(step.get("title") or step.get("id") or "步骤")
+                assignee = str(step.get("assignee") or "").strip()
+                lines.append(f"- {label}" + (f"（{assignee}）" if assignee else ""))
+                objective = str(step.get("objective") or "").strip()
+                if objective:
+                    lines.append(f"  - {objective}")
+            sections.append("## 执行步骤\n\n" + "\n".join(lines))
     return "\n\n".join(sections)
+
+
+def _hosted_workflow_todo_items(
+    manager_plan: dict[str, Any],
+    *,
+    content: str,
+    worker_profiles: list[str],
+) -> list[dict[str, Any]]:
+    """从 manager 计划确定性提取工作流 todo 项（零 LLM 调用）。
+
+    编排工作流重构：todo 项是派发的唯一单元，每项只有 4 个业务字段
+    （title / assignee / depends_on / user_task_fragment）。manager 没有
+    产出计划（本地注入 runner 的测试或旧持久化记录）时，按 worker 通道
+    合成每通道一项，保证派发循环总能推进。
+    """
+
+    raw_steps = [
+        item
+        for item in (manager_plan.get("plan") or [])
+        if isinstance(item, dict)
+    ]
+    items: list[dict[str, Any]] = []
+    known_ids: set[str] = set()
+    for index, raw in enumerate(raw_steps, start=1):
+        item_id = str(raw.get("id") or f"todo-{index}").strip()[:80]
+        if not item_id or item_id in known_ids:
+            item_id = f"todo-{index}"
+        known_ids.add(item_id)
+        assignee = str(raw.get("assignee") or "").strip().lower()
+        if assignee not in worker_profiles:
+            # assignee 越界时按序回落到可用通道，保证项不丢。
+            assignee = worker_profiles[min(index - 1, len(worker_profiles) - 1)]
+        title = str(raw.get("title") or raw.get("objective") or f"Step {index}").strip()[:500]
+        items.append(
+            {
+                "id": item_id,
+                "title": title,
+                "assignee": assignee,
+                "depends_on": [
+                    str(dep).strip()[:80]
+                    for dep in raw.get("depends_on") or []
+                    if str(dep).strip()
+                ],
+                "user_task_fragment": str(
+                    raw.get("user_task_fragment")
+                    or raw.get("objective")
+                    or title
+                    or content
+                ).strip()[:2000],
+            }
+        )
+    if not items:
+        items = [
+            {
+                "id": f"todo-{index}",
+                "title": content.strip()[:180] or f"{profile} execution",
+                "assignee": profile,
+                "depends_on": [],
+                "user_task_fragment": content.strip()[:2000],
+            }
+            for index, profile in enumerate(worker_profiles, start=1)
+        ]
+    # 依赖只允许指向已知项；未知引用会导致派发死锁，确定性剔除。
+    for item in items:
+        item["depends_on"] = [
+            dep for dep in item["depends_on"] if dep in known_ids and dep != item["id"]
+        ]
+    return items
+
+
+def _sanitize_hosted_check_id(value: str) -> str:
+    """把 todo 项 id 压成 supervisor check_id 的安全字符集。"""
+
+    sanitized = re.sub(r"[^0-9A-Za-z_.-]+", "-", str(value or "").strip()).strip("-")
+    return sanitized[:60] or "item"
+
+
+def _hosted_todo_status_label(status: str) -> str:
+    """把内部执行状态映射为看板汇报的三态文案。"""
+
+    normalized = str(status or "").strip().lower()
+    if normalized == "completed":
+        return "完成"
+    if normalized in {"failed", "cancelled", "blocked"}:
+        return "失败"
+    return "未完成"
+
+
+def _render_deterministic_hosted_report(
+    *,
+    content: str,
+    todo_items: list[dict[str, Any]],
+    item_statuses: dict[str, str],
+    item_results: dict[str, str],
+    attachments: list[dict[str, Any]],
+) -> str:
+    """确定性看板汇报（纯 Python，零 LLM 调用）。
+
+    取代原 Reporter 通道：逐项列出「任务项 → 执行者 → 状态 → 结果摘录
+    （前 200 字）→ 产物」，最后附一行总计。
+    """
+
+    lines: list[str] = []
+    lines.append("# 任务执行看板")
+    lines.append("")
+    lines.append(f"用户任务：{str(content or '').strip()[:500]}")
+    lines.append("")
+    lines.append("## 执行明细")
+    for index, item in enumerate(todo_items, start=1):
+        item_id = str(item.get("id") or f"todo-{index}")
+        status = str(item_statuses.get(item_id) or "")
+        label = _hosted_todo_status_label(status)
+        excerpt = str(item_results.get(item_id) or "").strip().replace("\n", " ")[:200]
+        lines.append(f"{index}. {str(item.get('title') or item_id)}")
+        lines.append(f"   - 执行者：{item.get('assignee')}")
+        lines.append(f"   - 状态：{label}")
+        if excerpt:
+            lines.append(f"   - 结果：{excerpt}")
+        else:
+            lines.append("   - 结果：（执行者未提交文本结果）")
+    artifact_links: list[str] = []
+    for attachment in attachments:
+        if not isinstance(attachment, dict):
+            continue
+        name = str(attachment.get("name") or "产物").strip()
+        artifact_id = str(attachment.get("id") or "").strip()
+        artifact_links.append(f"{name}（附件 ID: {artifact_id}）" if artifact_id else name)
+    if artifact_links:
+        lines.append("")
+        lines.append("## 产物")
+        lines.extend(f"- {link}" for link in artifact_links)
+    total = len(todo_items)
+    completed = sum(
+        1
+        for item in todo_items
+        if str(item_statuses.get(str(item.get("id") or "")) or "") == "completed"
+    )
+    failed = sum(
+        1
+        for item in todo_items
+        if _hosted_todo_status_label(
+            str(item_statuses.get(str(item.get("id") or "")) or "")
+        )
+        == "失败"
+    )
+    unfinished = total - completed - failed
+    lines.append("")
+    lines.append(f"**总计**：共 {total} 项，完成 {completed} 项，失败 {failed} 项，未完成 {unfinished} 项。")
+    return "\n".join(lines)
 
 
 def _hosted_manager_plan_todo_snapshot(
@@ -9523,8 +9656,10 @@ def _persist_hosted_role_state(
         if isinstance(item, dict)
     ]
     base_stage = role_stage.split(":", 1)[0]
+    # 编排工作流重构：reviewer 通道已从工作流调用链移除，worker 的交接
+    # 对象直接指向最终汇报（reporter 阶段由确定性看板生成）。
     handoff_to = {
-        "worker": ["reviewer"],
+        "worker": ["reporter"],
         "reviewer": ["reporter"],
         "dispatch": ["worker"],
     }.get(base_stage, [])
@@ -13378,16 +13513,15 @@ _HOSTED_CONTROL_ROOT_KEYS = frozenset(
     {"protocol", "verdict", "checks", "blockers", "findings", "required_actions"}
 )
 _HOSTED_REVIEW_CHECKS = (
-    "requirements_met",
-    "evidence_verified",
-    "tests_passed",
-    "risks_resolved",
+    # Sole acceptance standard: did the worker complete THE USER'S task?
+    # Everything else (format, style, extra detail, test coverage, risk
+    # wording, plan-letter adherence) is explicitly out of scope.
+    "user_task_completed",
 )
 _HOSTED_SUPERVISION_CHECKS = (
-    "role_boundaries_respected",
-    "task_coverage_complete",
-    "evidence_sufficient",
-    "process_compliant",
+    # Sole standard: every item of the user's task is addressed (at plan
+    # gates: covered by the plan; at output gates: completed with a result).
+    "user_task_completed",
 )
 
 
@@ -13641,11 +13775,15 @@ def _hosted_reviewer_protocol_prompt() -> str:
         "最终控制结果只允许输出一个 JSON 对象，不得使用 Markdown 代码块、引用、"
         "解释正文、前后缀或第二个对象。严格 schema："
         '{"protocol":"hermes.review.v1","verdict":"PASS|REWORK",'
-        '"checks":{"requirements_met":true|false,"evidence_verified":true|false,'
-        '"tests_passed":true|false,"risks_resolved":true|false},'
+        '"checks":{"user_task_completed":true|false},'
         '"blockers":["..."],"findings":["..."],"required_actions":["..."]}。'
-        "键集、类型和枚举必须完全一致。PASS 时四项 checks 必须全为 true，且三个数组"
-        "必须全空；REWORK 时至少一项 check 为 false，并在数组中给出具体问题和整改动作。"
+        "键集、类型和枚举必须完全一致。"
+        "验收只有一条标准：用户的原始任务是否已经完成——用户明确要求的每一项都有"
+        "对应的完成结果即为 PASS，checks 只含 user_task_completed 且为 true，三个数组"
+        "必须全空。禁止因为格式、详略、风格、额外信息、缺少测试、风险表述、证据形式"
+        "或与计划措辞不一致而退回。"
+        "REWORK 只用于用户任务中仍有未完成事项的情形：user_task_completed 为 false，"
+        "required_actions 只列出这些未完成的用户任务项。"
     )
 
 
@@ -14098,19 +14236,19 @@ def _hosted_supervisor_protocol_prompt() -> str:
         "解释正文、前后缀或第二个对象。严格 schema："
         '{"protocol":"hermes.supervision.v1",'
         '"verdict":"PASS|CORRECTIVE_ACTION",'
-        '"checks":{"role_boundaries_respected":true|false,'
-        '"task_coverage_complete":true|false,"evidence_sufficient":true|false,'
-        '"process_compliant":true|false},"blockers":["..."],'
+        '"checks":{"user_task_completed":true|false},"blockers":["..."],'
         '"findings":["..."],"required_actions":["..."],'
         '"directional":true|false}。'
         "键集、类型和枚举必须完全一致（directional 为可选布尔键，省略时视为 false）。"
-        "判定为 PASS 时：四项 checks 必须全为 true，三个数组必须全空，且除该 JSON 外"
-        "不得输出任何解释文字——直接签字，不做汇报。"
-        "判定为 CORRECTIVE_ACTION 时：至少一项 check 为 false，directional 仅在问题"
-        "影响整个方案方向（继续执行会偏离用户目标）时为 true，其余情况必须为 false；"
-        "blockers 写清违反了哪条职责边界、交付契约或验收标准（先给标准），"
-        "findings 写清观察到的事实和出现位置，required_actions 写清要接着完成的具体"
-        "动作，以及复查时必须提交的验收证据。"
+        "监督只有一条标准：用户的原始任务。在计划/派发检查点，user_task_completed "
+        "的含义是计划覆盖了用户任务的每一项；在产出/交接/汇报检查点，含义是用户任务"
+        "的每一项已有完成的结果。"
+        "判定为 PASS 时：user_task_completed 为 true，三个数组必须全空，且除该 JSON "
+        "外不得输出任何解释文字——直接签字，不做汇报。禁止因流程、证据形式、边界、"
+        "格式、详略或风格问题要求整改。"
+        "判定为 CORRECTIVE_ACTION 时：user_task_completed 为 false（用户任务存在未覆"
+        "盖或未完成的事项），directional 仅在计划方向偏离用户目标时为 true；blockers "
+        "写清用户任务中哪一项未完成，required_actions 写清要接着完成的具体事项。"
     )
 
 
@@ -15594,47 +15732,15 @@ def execute_hosted_workflow(
             .get("remote_task_id")
             or ""
         ) or task_id
-    plan_supervision, plan_supervision_status, _plan_supervision = (
-        _run_hosted_supervisor_check(
-            conversation_id,
-            turn_id,
-            check_id="plan_dispatch",
-            checkpoint_label="计划形成与首次派发",
-            evidence={
-                "task_goal": content,
-                "manager_plan": manager_plan,
-                "worker_profiles": worker_profiles,
-                "reviewer_profile": reviewer_profile,
-                # Remote lanes own their kanban on the executor node with
-                # per-account overlay homes; task ids named inside the plan
-                # are not verifiable against the supervisor's local database.
-                # Omit them so the plan check focuses on structure, coverage
-                # and role boundaries instead of phantom-id cross checks.
-                "task_id": "" if remote_workers else task_id,
-                "child_ids": [] if remote_workers else child_ids,
-                "profile_task_ids": (
-                    {} if remote_workers else profile_task_ids
-                ),
-                "artifact_required": artifact_required,
-                "artifact_acceptance_required": False,
-            },
-            runner=runner,
-            remote=remote_workers,
-            kanban_task_id=plan_sync_task_id,
-        )
+
+    # ── 编排核心：todo 项驱动的并行派发（orchestrator-worker 模式）──────────
+    # todo 项由确定性代码从 manager 拆分结果读取（零 LLM 调用）；无依赖的项
+    # 同时派发给各自的 worker，depends_on 指向的项完成后才派发下游项。
+    todo_items = _hosted_workflow_todo_items(
+        manager_plan,
+        content=content,
+        worker_profiles=worker_profiles,
     )
-    supervisor_statuses["plan_dispatch"] = plan_supervision_status
-    supervisor_findings["plan_dispatch"] = str(
-        _plan_supervision.get("display_result") or plan_supervision
-    )
-    _require_supervisor_pass(
-        "计划形成与首次派发",
-        _plan_supervision,
-        conversation_id=conversation_id,
-        turn_id=turn_id,
-    )
-    if _finish_hosted_turn_if_cancelled(conversation_id, turn_id):
-        return
 
     ready_worker_nodes = next_ready_plan_nodes(
         turn_plan,
@@ -15700,11 +15806,21 @@ def execute_hosted_workflow(
             "stage": "worker_running",
             # Dispatch is the authoritative join point: the manager and every
             # dispatched worker become first-class roster members here.
+            # 编排工作流重构：reviewer/reporter 通道不再执行，但仍在花名册中
+            # 登记（保持 iOS 参与者渲染协议不变），最终汇报由确定性看板生成。
             "participants": [
                 hosted_participant_descriptor(_DBB3_MANAGER_PROFILE),
                 *(
                     hosted_participant_descriptor(profile, role_stage="worker")
                     for profile in worker_profiles
+                ),
+                hosted_participant_descriptor(
+                    reviewer_profile,
+                    role_stage="reviewer",
+                ),
+                hosted_participant_descriptor(
+                    reporter_profile,
+                    role_stage="reporter",
                 ),
             ],
         },
@@ -15712,8 +15828,8 @@ def execute_hosted_workflow(
             "role": "assistant",
             "name": reporter_profile,
             "content": (
-                f"任务已由 DBB3 托管并派发给 {', '.join(worker_profiles)}。"
-                f"完成后由 {reviewer_profile} 验收，再由我统一汇报。"
+                f"任务已由 DBB3 托管并拆分为 {len(todo_items)} 个 Todo 项，"
+                f"无依赖的项已并行派发给 {', '.join(worker_profiles)}，完成后我直接汇总汇报。"
             ),
             "status": "completed",
             "kind": "message",
@@ -15734,8 +15850,6 @@ def execute_hosted_workflow(
             profile: profile_task_ids.get(profile, "")
             for profile in worker_profiles
         }
-        reviewer_task_scope = profile_task_ids.get(reviewer_profile, "")
-        reporter_task_scope = ""
     else:
         # Compatibility for pre-mapping persisted turns and injected task
         # creators in tests. New production turns always persist assignments.
@@ -15747,12 +15861,6 @@ def execute_hosted_workflow(
             )
             for index, profile in enumerate(worker_profiles)
         }
-        reviewer_task_scope = (
-            child_ids[len(worker_profiles)]
-            if len(child_ids) > len(worker_profiles)
-            else f"hosted-reviewer-{turn_id}"
-        )
-        reporter_task_scope = f"hosted-reporter-{turn_id}"
 
     worker_results = {
         str(profile): str(result)
@@ -15764,97 +15872,89 @@ def execute_hosted_workflow(
         for profile, status in (run.get("worker_statuses") or {}).items()
         if str(profile) and str(status)
     }
+    # 断点恢复：从持久化记录回填 todo 项状态，已终态的项不再重复派发
+    # （监督快检的证据缓存也会命中，恢复路径零额外 LLM 成本）。
+    item_results = {
+        str(key): str(value)
+        for key, value in (run.get("todo_item_results") or {}).items()
+        if str(key) and str(value)
+    }
+    item_statuses = {
+        str(key): str(value)
+        for key, value in (run.get("todo_item_statuses") or {}).items()
+        if str(key) and str(value)
+    }
+    item_rework_rounds: dict[str, int] = {item["id"]: 0 for item in todo_items}
+    item_followup_rounds: dict[str, int] = {item["id"]: 0 for item in todo_items}
+    # 每个 todo 项的快检尝试计数：同一项的复查使用递增的 check_id，
+    # 避免与上一次检查的 role_events 记录碰撞后被 _run_hosted_role 的
+    # 断点续跑短路重放旧结论。
+    item_check_attempts: dict[str, int] = {item["id"]: 0 for item in todo_items}
+    rework_history = [
+        dict(item)
+        for item in run.get("rework_history") or []
+        if isinstance(item, dict)
+    ]
+    rework_round = int(run.get("rework_round") or 0)
+    completed_node_profiles: set[str] = set()
 
-    manager_plan_blocks: list[str] = []
-    if isinstance(manager_plan, dict):
-        for label, value in (
-            ("执行方案", manager_plan.get("approach")),
-            ("任务要求", manager_plan.get("task_requirements")),
-            ("测试方案", manager_plan.get("test_plan")),
-        ):
-            if str(value or "").strip():
-                manager_plan_blocks.append(f"【{label}】\n{str(value).strip()[:12000]}")
-        criteria = manager_plan.get("acceptance_criteria") or []
-        if criteria:
-            manager_plan_blocks.append(
-                "【验收标准】\n"
-                + "\n".join(
-                    f"- {str(item).strip()[:2000]}"
-                    for item in criteria
-                    if str(item).strip()
-                )
+    def _todo_board_text() -> str:
+        # 紧凑看板视图：注入每个 worker 的提示词，保持共享上下文。
+        rows: list[str] = []
+        for index, item in enumerate(todo_items, start=1):
+            status = item_statuses.get(item["id"]) or "待执行"
+            rows.append(
+                f"{index}. {item['title']}（执行者 {item['assignee']}，{status}）"
             )
-        flow = manager_plan.get("flow") or []
-        if flow:
-            manager_plan_blocks.append(
-                "【流程方案】\n"
-                + "\n".join(
-                    f"{index}. {str(item).strip()[:2000]}"
-                    for index, item in enumerate(flow, start=1)
-                    if str(item).strip()
-                )
-            )
-        cvars = manager_plan.get("context_variables")
-        if isinstance(cvars, dict) and cvars:
-            try:
-                cv_text = json.dumps(cvars, ensure_ascii=False, sort_keys=True)
-                manager_plan_blocks.append(
-                    "【共享上下文变量】\n"
-                    f"```json\n{cv_text[:8000]}\n```\n"
-                    "_跨步骤共享的结构化状态，视为权威；不要静默覆盖 manager 设置的键。_"
-                )
-            except (TypeError, ValueError):
-                pass
+        return "\n".join(rows)
 
-    def _step_contract_blocks(step: dict[str, Any]) -> list[str]:
-        """Render one plan step's handoff contract (refs + artifact I/O)."""
+    def _upstream_context_blocks(item: dict[str, Any]) -> list[str]:
+        # 依赖项的结果作为下游项的确定性上下文注入。
         blocks: list[str] = []
-        refs = step.get("context_refs") or []
-        if refs:
-            blocks.append(
-                "【本步骤上下文引用】\n"
-                + "\n".join(f"- {str(item)[:128]}" for item in refs)
-                + "\n_用 kanban_show 拉取引用任务的完整内容（正文/结果/评论）。_"
-            )
-        inputs = step.get("input_artifacts") or []
-        outputs = step.get("output_artifacts") or []
-        if inputs or outputs:
-            contract_lines = []
-            if inputs:
-                contract_lines.append("输入（消费这些上游产物）：")
-                contract_lines.extend(f"- {str(item)[:500]}" for item in inputs)
-            if outputs:
-                contract_lines.append("输出（本步骤必须产出）：")
-                contract_lines.extend(f"- {str(item)[:500]}" for item in outputs)
-            blocks.append("【产物交接契约】\n" + "\n".join(contract_lines))
+        for dep in item.get("depends_on") or []:
+            dep_result = str(item_results.get(dep) or "").strip()
+            if dep_result:
+                blocks.append(f"【上游结果：{dep}】\n{dep_result[:4000]}")
         return blocks
 
-    def execute_worker(
-        profile: str,
+    def execute_todo_item(
+        item: dict[str, Any],
         *,
         rework_feedback: str = "",
         rework_round: int = 0,
-    ) -> tuple[str, str, str, dict[str, Any]]:
+        followup_question: str = "",
+        followup_round: int = 0,
+    ) -> tuple[str, str]:
+        profile = str(item["assignee"])
         lane_artifact_required = (
             artifact_required and profile in artifact_producer_profiles
         )
-        lane_artifact_instruction = (
-            artifact_instruction
-            if lane_artifact_required
-            else (
+        if lane_artifact_required:
+            lane_artifact_instruction = artifact_instruction
+        elif artifact_required:
+            lane_artifact_instruction = (
                 "This execution lane is not the designated file producer. "
-                "Return evidence and results to the reviewer, and do not fail "
+                "Return evidence and results to the dispatcher, and do not fail "
                 "only because this lane creates no deliverable file."
             )
-        )
-        role_stage = (
-            f"worker:{profile}:rework:{rework_round}"
-            if rework_round
-            else "worker" if len(worker_profiles) == 1 else f"worker:{profile}"
-        )
+        else:
+            # 本任务未要求交付文件：沿用全局“不要创建文件”的确定性指令。
+            lane_artifact_instruction = artifact_instruction
+        if rework_round:
+            role_stage = f"worker:{profile}:rework:{rework_round}"
+        elif followup_round:
+            role_stage = f"worker:{profile}:followup:{followup_round}"
+        else:
+            role_stage = "worker" if len(worker_profiles) == 1 else f"worker:{profile}"
+        if followup_round:
+            start_text = "收到监督者追问，正在核实该 Todo 项的缺口。"
+        elif rework_round:
+            start_text = f"收到退回意见（第 {rework_round} 轮），正在返工。"
+        else:
+            start_text = "收到分配的子任务，正在执行。"
         worker_prompt = "\n".join(
-            item
-            for item in (
+            entry
+            for entry in (
                 "你正在 DBB3 唯一控制面的服务端托管工作流中。",
                 f"你的 Profile：{profile}",
                 f"官方 Kanban 根任务：{task_id}"
@@ -15864,14 +15964,12 @@ def execute_hosted_workflow(
                 "你是任务执行者。只完成调度分配给当前 Profile 和目标设备的子任务。",
                 "负责实际执行、工具调用、证据收集和必要产物创建。",
                 "可以使用所有已配置的 Skill、MCP 和工具；正常的搜索、命令、取证和验证属于执行过程。",
-                *manager_plan_blocks,
-                *(
-                    block
-                    for step in manager_plan.get("plan") or []
-                    if isinstance(step, dict)
-                    and str(step.get("assignee") or "").strip().lower() == profile
-                    for block in _step_contract_blocks(step)
-                ),
+                "【本轮 Todo 项】",
+                f"- 标题：{item['title']}",
+                f"- 用户任务片段：{item.get('user_task_fragment') or ''}",
+                *_upstream_context_blocks(item),
+                "【整体 Todo 看板（了解全局用，不要越权执行他人项）】",
+                _todo_board_text(),
                 hosted_progress_protocol(profile),
                 hosted_role_delivery_contract(profile),
                 mention_priority_protocol(profile),
@@ -15880,37 +15978,40 @@ def execute_hosted_workflow(
                     turn_id,
                     role_stage=role_stage,
                 ),
-                "监督者对计划与派发的检查：",
-                plan_supervision,
-                "不要做最终总结；把结果、证据、耗时和遗留问题提交给审阅者。",
+                "不要做最终总结；把结果、证据、耗时和遗留问题提交给调度者。",
                 f"用户任务：{content}",
                 (
-                    f"审阅者退回意见（第 {rework_round} 轮）：\n{rework_feedback}"
+                    f"监督者追问（核实该 Todo 项是否确已完成）：\n{followup_question}"
+                    if followup_question
+                    else ""
+                ),
+                (
+                    f"退回返工意见（第 {rework_round} 轮）：\n{rework_feedback}"
                     if rework_feedback
                     else ""
                 ),
                 attachment_context,
                 lane_artifact_instruction,
             )
-            if item
+            if entry
         )
         if remote_workers:
-            result, status, role_state = _run_hosted_remote_role(
+            result, status, _role_state = _run_hosted_remote_role(
                 conversation_id,
                 turn_id,
                 profile=profile,
                 role_stage=role_stage,
                 role_label=f"{profile} · 执行",
                 prompt=worker_prompt,
-                kanban_task_id=("" if remote_workers else worker_task_scopes[profile]),
-                start_text="收到分配的子任务，正在执行。",
+                kanban_task_id="",
+                start_text=start_text,
                 artifact_required=lane_artifact_required,
                 delivery_context=lane_artifact_instruction,
                 attachment_context=attachment_context,
                 rework_round=rework_round,
             )
         else:
-            result, status, role_state = _run_hosted_role(
+            result, status, _role_state = _run_hosted_role(
                 conversation_id,
                 turn_id,
                 profile=profile,
@@ -15918,667 +16019,564 @@ def execute_hosted_workflow(
                 role_label=f"{profile} · 执行",
                 prompt=worker_prompt,
                 runner=runner,
-                kanban_task_id=("" if remote_workers else worker_task_scopes[profile]),
-                start_text="收到分配的子任务，正在执行。",
+                kanban_task_id=worker_task_scopes.get(profile, ""),
+                start_text=start_text,
                 previous_state=(run.get("role_events") or {}).get(role_stage),
             )
-        return profile, result, status, role_state
+        return result, status
 
-    supervisor_rework_round = 0
-    supervisor_rework_feedback = ""
-    while True:
-        pending_workers = [
-            profile
-            for profile in worker_profiles
-            if f"worker:{profile}" in ready_worker_ids
-            if worker_statuses.get(profile) != "completed" or not worker_results.get(profile)
-        ]
-        if pending_workers:
-            with ThreadPoolExecutor(
-                max_workers=len(pending_workers),
-                thread_name_prefix=f"hosted-workers-{turn_id[-8:]}",
-                initializer=_set_hosted_execution_generation,
-                initargs=(execution_generation,),
-            ) as executor:
-                futures = {
-                    executor.submit(
-                        execute_worker,
-                        profile,
-                        rework_feedback=supervisor_rework_feedback,
-                        rework_round=supervisor_rework_round,
-                    ): profile
-                    for profile in pending_workers
-                }
-                for future in as_completed(futures):
-                    profile, result, status, _worker_state = future.result()
-                    worker_results[profile] = result
-                    worker_statuses[profile] = status
-                    _persist_hosted_turn(
-                        conversation_id,
-                        turn_id,
-                        patch={
-                            "worker_results": dict(worker_results),
-                            "worker_statuses": dict(worker_statuses),
-                            "stage": "worker_running",
+    def _aggregate_lane_states() -> None:
+        # 把 todo 项状态聚合回 per-profile 的 worker 状态与结果，
+        # 保持既有持久化结构（turn plan 节点 / iOS 渲染）不变。
+        for profile in worker_profiles:
+            profile_items = [
+                item for item in todo_items if item["assignee"] == profile
+            ]
+            if not profile_items:
+                continue
+            sections = [
+                f"## {item['title']}\n{item_results.get(item['id'], '')}".strip()
+                for item in profile_items
+                if str(item_results.get(item["id"]) or "").strip()
+            ]
+            if sections:
+                worker_results[profile] = "\n\n".join(sections)
+            if all(
+                item_statuses.get(item["id"]) == "completed"
+                for item in profile_items
+            ):
+                worker_statuses[profile] = "completed"
+            else:
+                worker_statuses[profile] = next(
+                    (
+                        str(item_statuses.get(item["id"]))
+                        for item in profile_items
+                        if item_statuses.get(item["id"])
+                        in {"failed", "cancelled", "blocked"}
+                    ),
+                    "running",
+                )
+
+    def _persist_workflow_progress(*, stage: str = "worker_running") -> None:
+        _aggregate_lane_states()
+        protocol_events = []
+        for profile in worker_profiles:
+            if (
+                worker_statuses.get(profile) == "completed"
+                and profile not in completed_node_profiles
+            ):
+                completed_node_profiles.add(profile)
+                protocol_events.append(
+                    {
+                        "event_type": "turn.node_completed",
+                        "role_stage": "turn",
+                        "entity_id": f"{turn_id}:node:worker:{profile}",
+                        "idempotency_key": (
+                            f"turn-node-result:{turn_id}:worker:{profile}"
+                        ),
+                        "payload": {
+                            "plan_node_id": f"worker:{profile}",
+                            "status": "completed",
                         },
-                        protocol_events=[
-                            {
-                                "event_type": (
-                                    "turn.node_completed"
-                                    if status == "completed"
-                                    else "turn.node_blocked"
-                                ),
-                                "role_stage": "turn",
-                                "entity_id": f"{turn_id}:node:worker:{profile}",
-                                "idempotency_key": f"turn-node-result:{turn_id}:worker:{profile}",
-                                "payload": {
-                                    "plan_node_id": f"worker:{profile}",
-                                    "status": status,
-                                },
-                                "runtime": {
-                                    "component_id": f"fiber:worker:{profile}",
-                                    "lifecycle_state": (
-                                        "completed" if status == "completed" else "failed"
-                                    ),
-                                    "plan_node_id": f"worker:{profile}",
-                                    "contract_revision": "hosted-turn-plan.v1",
-                                },
-                            }
-                        ],
-                    )
-                    if manager_plan.get("plan"):
-                        _persist_hosted_plan_snapshot(
-                            conversation_id,
-                            turn_id,
-                            manager_plan,
-                            stage="worker_running",
-                            worker_statuses=worker_statuses,
-                        )
-        worker_result = "\n\n".join(
-            f"## {profile}\n{worker_results.get(profile, '')}".strip()
-            for profile in worker_profiles
-        )
-        worker_status = (
-            "completed"
-            if all(worker_statuses.get(profile) == "completed" for profile in worker_profiles)
-            else "failed"
-        )
+                        "runtime": {
+                            "component_id": f"fiber:worker:{profile}",
+                            "lifecycle_state": "completed",
+                            "plan_node_id": f"worker:{profile}",
+                            "contract_revision": "hosted-turn-plan.v1",
+                        },
+                    }
+                )
         _persist_hosted_turn(
             conversation_id,
             turn_id,
             patch={
-                "worker_result": worker_result,
-                "worker_status": worker_status,
                 "worker_results": dict(worker_results),
                 "worker_statuses": dict(worker_statuses),
-                "stage": "reviewing",
-                "participants": [
-                    hosted_participant_descriptor(
-                        reviewer_profile,
-                        role_stage="reviewer",
-                        node=(
-                            "wsl"
-                            if reviewer_connector_id == "pc-primary"
-                            else "dbb3"
-                        ),
-                    ),
-                ],
-            },
-        )
-        if manager_plan.get("plan"):
-            _persist_hosted_plan_snapshot(
-                conversation_id,
-                turn_id,
-                manager_plan,
-                stage="reviewing",
-                worker_statuses=worker_statuses,
-            )
-        if _finish_hosted_turn_if_cancelled(conversation_id, turn_id):
-            return
-
-        worker_supervision, worker_supervision_status, _worker_supervision = (
-            _run_hosted_supervisor_check(
-                conversation_id,
-                turn_id,
-                check_id="worker_handoff",
-                checkpoint_label="Worker 交接",
-                evidence={
-                    "task_goal": content,
-                    "manager_plan": manager_plan,
-                    "worker_results": worker_results,
-                    "worker_statuses": worker_statuses,
-                    "artifact_required": artifact_required,
-                    "supervisor_rework_round": supervisor_rework_round,
-                    "supervisor_rework_feedback": supervisor_rework_feedback,
+                "stage": stage,
+                "todo_item_statuses": dict(item_statuses),
+                "todo_item_results": {
+                    key: str(value)[:4000] for key, value in item_results.items()
                 },
-                runner=runner,
-                remote=remote_workers,
-                kanban_task_id=plan_sync_task_id,
-            )
-        )
-        supervisor_statuses["worker_handoff"] = worker_supervision_status
-        supervisor_findings["worker_handoff"] = str(
-            _worker_supervision.get("display_result") or worker_supervision
-        )
-        worker_verdict = str(_worker_supervision.get("verdict") or "unknown")
-        worker_check_status = str(_worker_supervision.get("status") or "failed")
-        if worker_check_status == "completed" and worker_verdict == "pass":
-            break
-        if (
-            worker_verdict == "corrective_action"
-            and supervisor_rework_round < _HOSTED_REWORK_LIMIT
-        ):
-            supervisor_rework_round += 1
-            supervisor_rework_feedback = "\n\n".join(
-                item
-                for item in (
-                    str(_worker_supervision.get("display_result") or ""),
-                    "整改要求：",
-                    "\n".join(
-                        str(item)
-                        for item in (_worker_supervision.get("required_actions") or [])
-                        if str(item).strip()
-                    ),
-                    "问题：",
-                    "\n".join(
-                        str(item)
-                        for item in (_worker_supervision.get("findings") or [])
-                        if str(item).strip()
-                    ),
-                )
-                if str(item).strip()
-            )
-            for profile in worker_profiles:
-                worker_statuses[profile] = ""
-                worker_results[profile] = ""
-            _persist_hosted_turn(
-                conversation_id,
-                turn_id,
-                patch={
-                    "stage": "worker_running",
-                    "worker_status": "failed",
-                    "worker_statuses": dict(worker_statuses),
-                    "worker_results": dict(worker_results),
-                    "supervisor_rework_round": supervisor_rework_round,
-                    "supervisor_rework_feedback": supervisor_rework_feedback,
-                },
-                message={
-                    "role": "assistant",
-                    "name": _HERMES_SUPERVISOR_LABEL,
-                    "content": (
-                        f"监督者要求返工（第 {supervisor_rework_round} 轮）："
-                        f"{supervisor_rework_feedback}"
-                    ),
-                    "status": "completed",
-                    "kind": "message",
-                    "meta": {
-                        # Round-suffixed like the reviewer's "reviewer:rework-request:N" so
-                        # clients can parse the rework round from the stage (the
-                        # unsuffixed form left supervisor rounds invisible in
-                        # team badges).
-                        "role_stage": f"supervisor.rework-request:{supervisor_rework_round}",
-                        "base_role_stage": "supervisor",
-                        "phase": "rework",
-                        "message_key": f"{turn_id}:supervisor:rework:{supervisor_rework_round}",
-                        "role_label": _HERMES_SUPERVISOR_LABEL,
-                        "profile": "supervisor",
-                        "final_report": False,
-                    },
-                },
-            )
-            if _finish_hosted_turn_if_cancelled(conversation_id, turn_id):
-                return
-            continue
-        # Unknown/failed verdict, or corrective action after the rework limit:
-        # the supervisor gate is authoritative and the turn must fail.
-        _require_supervisor_pass(
-            "Worker 交接",
-            _worker_supervision,
-            conversation_id=conversation_id,
-            turn_id=turn_id,
-        )
-        break
-    if _finish_hosted_turn_if_cancelled(conversation_id, turn_id):
-        return
-
-    reviewer_result = str(run.get("reviewer_result") or "")
-    reviewer_status = str(run.get("reviewer_status") or "")
-    reviewer_display_result = str(run.get("reviewer_display_result") or "")
-    reviewer_control = _hosted_reviewer_control(reviewer_result)
-    reviewer_revalidation = bool(reviewer_result and reviewer_control is None)
-    reviewer_role_stage = "reviewer"
-    if reviewer_revalidation:
-        legacy_digest = hashlib.sha256(reviewer_result.encode("utf-8")).hexdigest()[:12]
-        reviewer_role_stage = f"reviewer:protocol-revalidation:{legacy_digest}"
-        reviewer_result = ""
-        reviewer_status = ""
-        reviewer_display_result = ""
-        reviewer_control = None
-    if reviewer_result and not reviewer_display_result:
-        reviewer_display_result = _hosted_control_display(
-            reviewer_result,
-            kind="reviewer",
-        )
-    if not reviewer_result:
-        reviewer_prompt = "\n".join(
-            item
-            for item in (
-                "你正在 DBB3 唯一控制面的服务端托管工作流中。",
-                f"你的 Profile：{reviewer_profile}",
-                f"官方 Kanban 根任务：{task_id}"
-                if task_id and not remote_workers
-                else "",
-                reviewer_kanban_instruction,
-                "你是结果审阅者。基于执行者结果做验收、风险检查和通过或退回判断。",
-                "允许使用 Skill、MCP 和工具做必要的独立抽样复核，但不要完整重做整个任务。",
-                "正常的 Skill、MCP、命令和取证调用不属于过度执行；只有明显超出用户目标、增加风险或无效成本时才指出越界。",
-                hosted_progress_protocol("Hermes 审阅员"),
-                hosted_role_delivery_contract("Hermes 审阅员"),
-                mention_priority_protocol("Hermes 审阅员"),
-                hosted_intervention_context(
-                    conversation_id,
-                    turn_id,
-                    role_stage="reviewer",
-                ),
-                "不要创建新的交付文件，也不要向用户做最终总结。",
-                _hosted_reviewer_protocol_prompt(),
-                *manager_plan_blocks,
-                f"用户任务：{content}",
-                "执行者提交：",
-                worker_result,
-                "监督者对 Worker 交接的检查：",
-                worker_supervision,
-            )
-            if item
-        )
-        if remote_workers:
-            reviewer_result, reviewer_status, _reviewer_state = _run_hosted_remote_role(
-                conversation_id,
-                turn_id,
-                profile=reviewer_profile,
-                role_stage=reviewer_role_stage,
-                role_label=f"{reviewer_profile} · 审阅",
-                prompt=reviewer_prompt,
-                kanban_task_id=("" if remote_workers else reviewer_task_scope),
-                start_text="我已收到执行结果，正在独立验收证据与风险。",
-                artifact_required=False,
-                delivery_context=artifact_instruction,
-                attachment_context=attachment_context,
-                connector_id=reviewer_connector_id,
-            )
-        else:
-            reviewer_result, reviewer_status, _reviewer_state = _run_hosted_role(
-                conversation_id,
-                turn_id,
-                profile=reviewer_profile,
-                role_stage=reviewer_role_stage,
-                role_label=f"{reviewer_profile} · 审阅",
-                prompt=reviewer_prompt,
-                runner=runner,
-                kanban_task_id=("" if remote_workers else reviewer_task_scope),
-                start_text="我已收到执行结果，正在独立验收证据与风险。",
-                previous_state=(
-                    None
-                    if reviewer_revalidation
-                    else (run.get("role_events") or {}).get("reviewer")
-                ),
-            )
-        reviewer_display_result, reviewer_control = _persist_hosted_reviewer_display(
-            conversation_id,
-            turn_id,
-            profile=reviewer_profile,
-            role_stage=reviewer_role_stage,
-            role_label=f"{reviewer_profile} · 审阅",
-            raw_result=reviewer_result,
-            status=reviewer_status,
-            role_state=_reviewer_state,
-        )
-        _persist_hosted_turn(
-            conversation_id,
-            turn_id,
-            patch={
-                "reviewer_result": reviewer_result,
-                "reviewer_status": reviewer_status,
-                "stage": "reviewing",
-            },
-        )
-        if manager_plan.get("plan"):
-            _persist_hosted_plan_snapshot(
-                conversation_id,
-                turn_id,
-                manager_plan,
-                stage="reviewing",
-                worker_statuses=worker_statuses,
-                reviewer_status=reviewer_status,
-                reviewer_result=reviewer_result,
-            )
-        if _finish_hosted_turn_if_cancelled(conversation_id, turn_id):
-            return
-
-    rework_round = int(run.get("rework_round") or 0)
-    rework_history = [
-        dict(item)
-        for item in run.get("rework_history") or []
-        if isinstance(item, dict)
-    ]
-    while (
-        reviewer_status == "completed"
-        and _review_requests_rework(reviewer_result)
-        and rework_round < _HOSTED_REWORK_LIMIT
-    ):
-        active_rework_round = rework_round + 1
-        rework_history.append(
-            {
-                "round": active_rework_round,
-                "reviewer_feedback": reviewer_display_result,
-                "reviewer_control": reviewer_control or {},
-                "worker_results_before": dict(worker_results),
-                "requested_at": int(time.time() * 1000),
-            }
-        )
-        _emit_rework_state_event(
-            conversation_id,
-            turn_id,
-            phase="started",
-            rework_round=active_rework_round,
-            checkpoint_label="",
-            feedback=reviewer_display_result,
-        )
-        _persist_hosted_turn(
-            conversation_id,
-            turn_id,
-            patch={
-                "active_rework_round": active_rework_round,
                 "rework_history": list(rework_history),
-                "stage": "rework",
+                "rework_round": rework_round,
             },
+            protocol_events=protocol_events,
+        )
+        if manager_plan.get("plan"):
+            _persist_hosted_plan_snapshot(
+                conversation_id,
+                turn_id,
+                manager_plan,
+                stage=stage,
+                worker_statuses=worker_statuses,
+            )
+
+    def _supervisor_gap_text(check: dict[str, Any]) -> str:
+        # 从监督记录中提取缺口描述（展示文本 + 结构化 required_actions/findings）。
+        control = _hosted_supervisor_control(str(check.get("result") or ""))
+        entries = [
+            str(check.get("display_result") or check.get("result") or "").strip(),
+        ]
+        if isinstance(control, dict):
+            entries.append(
+                "\n".join(
+                    f"- {action}"
+                    for action in control.get("required_actions") or []
+                    if str(action).strip()
+                )
+            )
+            entries.append(
+                "\n".join(
+                    f"- {finding}"
+                    for finding in control.get("findings") or []
+                    if str(finding).strip()
+                )
+            )
+        return "\n".join(entry for entry in entries if entry.strip())
+
+    def _persist_supervisor_followup_message(
+        item: dict[str, Any],
+        gap_text: str,
+    ) -> None:
+        # 快检存疑时的追问卡片：先问 worker，不直接打回。
+        _persist_hosted_turn(
+            conversation_id,
+            turn_id,
+            patch={"stage": "supervisor_followup"},
             message={
                 "role": "assistant",
-                "name": reviewer_profile,
-                "content": reviewer_display_result,
+                "name": _HERMES_SUPERVISOR_LABEL,
+                "content": (
+                    f"对「{item['title']}」的完成情况存疑，"
+                    f"正在向 {item['assignee']} 追问：\n{gap_text}"
+                ),
                 "status": "completed",
                 "kind": "message",
                 "meta": {
-                    "role_stage": f"reviewer:rework-request:{active_rework_round}",
-                    "role_label": f"{reviewer_profile} · 退回返工",
-                    "phase": "handoff",
-                    "message_key": f"{turn_id}:reviewer:rework-request:{active_rework_round}",
-                    "profile": reviewer_profile,
-                    "handoff_to": worker_profiles,
+                    "role_stage": (
+                        f"supervisor.followup:{_sanitize_hosted_check_id(item['id'])}"
+                    ),
+                    "base_role_stage": "supervisor",
+                    "phase": "followup",
+                    "message_key": f"{turn_id}:supervisor:followup:{item['id']}",
+                    "role_label": _HERMES_SUPERVISOR_LABEL,
+                    "profile": "supervisor",
+                    "handoff_to": [item["assignee"]],
                     "final_report": False,
                 },
             },
         )
-        if manager_plan.get("plan"):
-            _persist_hosted_plan_snapshot(
-                conversation_id,
-                turn_id,
-                manager_plan,
-                stage="rework",
-                worker_statuses={
-                    **worker_statuses,
-                    **{profile: "running" for profile in worker_profiles},
-                },
-                reviewer_status="",
-                reviewer_result="",
-            )
-        if _finish_hosted_turn_if_cancelled(conversation_id, turn_id):
-            return
 
-        rework_check_id = f"rework_{active_rework_round}"
-        rework_supervision, rework_supervision_status, _rework_supervision = (
-            _run_hosted_supervisor_check(
-                conversation_id,
-                turn_id,
-                check_id=rework_check_id,
-                checkpoint_label=f"第 {active_rework_round} 轮返工",
-                evidence={
-                    "task_goal": content,
-                    "reviewer_feedback": reviewer_result,
-                    "worker_results_before": worker_results,
-                    "rework_round": active_rework_round,
-                },
-                runner=runner,
-                remote=remote_workers,
-                kanban_task_id=plan_sync_task_id,
-            )
-        )
-        supervisor_statuses[rework_check_id] = rework_supervision_status
-        supervisor_findings[rework_check_id] = str(
-            _rework_supervision.get("display_result") or rework_supervision
-        )
-        _require_supervisor_pass(
-            f"第 {active_rework_round} 轮返工",
-            _rework_supervision,
-            conversation_id=conversation_id,
-            turn_id=turn_id,
-        )
-        if _finish_hosted_turn_if_cancelled(conversation_id, turn_id):
-            return
-        supervised_rework_feedback = "\n\n".join(
-            (
-                reviewer_result,
-                f"监督者返工检查：\n{rework_supervision}",
-            )
-        )
-
-        round_results: dict[str, str] = {}
-        round_statuses: dict[str, str] = {}
-        with ThreadPoolExecutor(
-            max_workers=len(worker_profiles),
-            thread_name_prefix=f"hosted-rework-{turn_id[-8:]}-{active_rework_round}",
-            initializer=_set_hosted_execution_generation,
-            initargs=(execution_generation,),
-        ) as executor:
-            futures = {
-                executor.submit(
-                    execute_worker,
-                    profile,
-                    rework_feedback=supervised_rework_feedback,
-                    rework_round=active_rework_round,
-                ): profile
-                for profile in worker_profiles
-            }
-            for future in as_completed(futures):
-                profile, result, status, _worker_state = future.result()
-                round_results[profile] = result
-                round_statuses[profile] = status
-        worker_results.update(round_results)
-        worker_statuses.update(round_statuses)
-        worker_result = "\n\n".join(
-            f"## {profile}\n{worker_results.get(profile, '')}".strip()
-            for profile in worker_profiles
-        )
-        worker_status = (
-            "completed"
-            if all(
-                worker_statuses.get(profile) == "completed"
-                for profile in worker_profiles
-            )
-            else "failed"
-        )
-        _emit_rework_state_event(
-            conversation_id,
-            turn_id,
-            phase="dispatched",
-            rework_round=active_rework_round,
-            checkpoint_label="",
-            feedback="",
-        )
+    def _persist_supervisor_rework_message(
+        item: dict[str, Any],
+        feedback: str,
+        round_number: int,
+    ) -> None:
+        # 确认未完成后的打回消息（有界返工）。
         _persist_hosted_turn(
             conversation_id,
             turn_id,
             patch={
-                "worker_result": worker_result,
-                "worker_status": worker_status,
-                "worker_results": dict(worker_results),
-                "worker_statuses": dict(worker_statuses),
-                "stage": "reviewing",
+                "stage": "rework",
+                "active_rework_round": round_number,
+                "supervisor_rework_round": round_number,
+                "supervisor_rework_feedback": feedback,
             },
-        )
-        if manager_plan.get("plan"):
-            _persist_hosted_plan_snapshot(
-                conversation_id,
-                turn_id,
-                manager_plan,
-                stage="reviewing",
-                worker_statuses=worker_statuses,
-            )
-        reviewer_prompt = "\n".join(
-            item
-            for item in (
-                "你正在 DBB3 唯一控制面的服务端托管工作流中。",
-                f"你的 Profile：{reviewer_profile}",
-                f"官方 Kanban 根任务：{task_id}"
-                if task_id and not remote_workers
-                else "",
-                reviewer_kanban_instruction,
-                f"这是第 {active_rework_round} 轮返工后的重新验收。",
-                "逐项核对上轮退回意见和新的执行证据。",
-                hosted_progress_protocol("Hermes 审阅员"),
-                hosted_role_delivery_contract("Hermes 审阅员"),
-                mention_priority_protocol("Hermes 审阅员"),
-                hosted_intervention_context(
-                    conversation_id,
-                    turn_id,
-                    role_stage="reviewer",
+            message={
+                "role": "assistant",
+                "name": _HERMES_SUPERVISOR_LABEL,
+                "content": (
+                    f"「{item['title']}」确认未完成，要求 {item['assignee']} "
+                    f"返工（第 {round_number} 轮）：\n{feedback}"
                 ),
-                "不要创建新的交付文件，也不要向用户做最终总结。",
-                _hosted_reviewer_protocol_prompt(),
-                f"用户任务：{content}",
-                "上轮退回意见：",
-                reviewer_result,
-                "返工后的执行者提交：",
-                worker_result,
-            )
-            if item
-        )
-        if remote_workers:
-            reviewer_result, reviewer_status, _reviewer_state = _run_hosted_remote_role(
-                conversation_id,
-                turn_id,
-                profile=reviewer_profile,
-                role_stage=f"reviewer:rework:{active_rework_round}",
-                role_label=f"{reviewer_profile} · 返工复审",
-                prompt=reviewer_prompt,
-                kanban_task_id=("" if remote_workers else reviewer_task_scope),
-                start_text=f"第 {active_rework_round} 轮返工已提交，正在重新验收。",
-                artifact_required=False,
-                delivery_context=artifact_instruction,
-                attachment_context=attachment_context,
-                rework_round=active_rework_round,
-                connector_id=reviewer_connector_id,
-            )
-        else:
-            reviewer_result, reviewer_status, _reviewer_state = _run_hosted_role(
-                conversation_id,
-                turn_id,
-                profile=reviewer_profile,
-                role_stage=f"reviewer:rework:{active_rework_round}",
-                role_label=f"{reviewer_profile} · 返工复审",
-                prompt=reviewer_prompt,
-                runner=runner,
-                kanban_task_id=("" if remote_workers else reviewer_task_scope),
-                start_text=f"第 {active_rework_round} 轮返工已提交，正在重新验收。",
-            )
-        reviewer_display_result, reviewer_control = _persist_hosted_reviewer_display(
-            conversation_id,
-            turn_id,
-            profile=reviewer_profile,
-            role_stage=f"reviewer:rework:{active_rework_round}",
-            role_label=f"{reviewer_profile} · 返工复审",
-            raw_result=reviewer_result,
-            status=reviewer_status,
-            role_state=_reviewer_state,
-        )
-        rework_round = active_rework_round
-        _persist_hosted_turn(
-            conversation_id,
-            turn_id,
-            patch={
-                "reviewer_result": reviewer_result,
-                "reviewer_control": reviewer_control or {},
-                "reviewer_display_result": reviewer_display_result,
-                "reviewer_status": reviewer_status,
-                "active_rework_round": 0,
-                "rework_round": rework_round,
-                "stage": "reviewing",
+                "status": "completed",
+                "kind": "message",
+                "meta": {
+                    "role_stage": f"supervisor.rework-request:{round_number}",
+                    "base_role_stage": "supervisor",
+                    "phase": "rework",
+                    "message_key": f"{turn_id}:supervisor:rework:{round_number}",
+                    "role_label": _HERMES_SUPERVISOR_LABEL,
+                    "profile": "supervisor",
+                    "final_report": False,
+                },
             },
         )
-        if manager_plan.get("plan"):
-            _persist_hosted_plan_snapshot(
-                conversation_id,
-                turn_id,
-                manager_plan,
-                stage="reviewing",
-                worker_statuses=worker_statuses,
-                reviewer_status=reviewer_status,
-                reviewer_result=reviewer_result,
-            )
-        if _finish_hosted_turn_if_cancelled(conversation_id, turn_id):
-            return
 
-    if reviewer_status == "completed" and _review_requests_rework(reviewer_result):
-        reviewer_status = "failed"
-        reviewer_display_result = (
-            f"{reviewer_display_result}\n"
-            f"已达到 {_HOSTED_REWORK_LIMIT} 轮自动返工上限，任务保留为未通过。"
+    def run_todo_completion_check(
+        item: dict[str, Any],
+        claimed_result: str,
+    ) -> dict[str, Any]:
+        # 事件驱动快检 (a)：单个 todo 项完成后的一次短检查。
+        # 输入只有「用户原话 + 该项声称的结果」，验收标准是 user_task_completed。
+        sanitized_item_id = _sanitize_hosted_check_id(item["id"])
+        item_check_attempts[item["id"]] += 1
+        attempt = item_check_attempts[item["id"]]
+        check_id = (
+            f"todo_{sanitized_item_id}"
+            if attempt == 1
+            else f"todo_{sanitized_item_id}_{attempt}"
         )
-        _persist_hosted_turn(
+        _result, _status, check = _run_hosted_supervisor_check(
             conversation_id,
             turn_id,
-            patch={
-                "reviewer_result": reviewer_result,
-                "reviewer_control": reviewer_control or {},
-                "reviewer_display_result": reviewer_display_result,
-                "reviewer_status": reviewer_status,
-            },
-        )
-        if manager_plan.get("plan"):
-            _persist_hosted_plan_snapshot(
-                conversation_id,
-                turn_id,
-                manager_plan,
-                stage="reporting",
-                worker_statuses=worker_statuses,
-                reviewer_status=reviewer_status,
-                reviewer_result=reviewer_result,
-            )
-
-    review_supervision, review_supervision_status, _review_supervision = (
-        _run_hosted_supervisor_check(
-            conversation_id,
-            turn_id,
-            check_id="review_handoff",
-            checkpoint_label="审阅与返工交接",
+            check_id=check_id,
+            checkpoint_label=f"Todo 完成：{str(item['title'])[:40]}",
             evidence={
                 "task_goal": content,
-                "worker_results": worker_results,
-                "worker_statuses": worker_statuses,
-                "reviewer_result": reviewer_result,
-                "reviewer_control": reviewer_control or {},
-                "reviewer_display_result": reviewer_display_result,
-                "reviewer_status": reviewer_status,
-                "rework_history": rework_history,
+                "todo_item": {
+                    "id": item["id"],
+                    "title": item["title"],
+                    "assignee": item["assignee"],
+                    "user_task_fragment": item.get("user_task_fragment") or "",
+                },
+                "claimed_result": str(claimed_result or "")[:4000],
             },
             runner=runner,
             remote=remote_workers,
             kanban_task_id=plan_sync_task_id,
         )
-    )
-    supervisor_statuses["review_handoff"] = review_supervision_status
-    supervisor_findings["review_handoff"] = str(
-        _review_supervision.get("display_result") or review_supervision
-    )
-    _require_supervisor_pass(
-        "审阅与返工交接",
-        _review_supervision,
-        conversation_id=conversation_id,
-        turn_id=turn_id,
-    )
+        supervisor_statuses[check_id] = _status
+        supervisor_findings[check_id] = str(
+            check.get("display_result") or _result
+        )
+        return check
+
+    def settle_todo_item_after_check(
+        item: dict[str, Any],
+        initial_result: str,
+    ) -> bool:
+        # 快检 (a) 的裁决路径：通过 → 记录；存疑 → 先追问 worker 再判；
+        # 确认未完成 → 有界返工；仍不收敛 → 监督门失败（fail closed）。
+        # 返回 False 表示本轮任务已被取消，调用方应立即退出。
+        nonlocal rework_round
+        item_id = item["id"]
+        result = str(initial_result or "")
+        check = run_todo_completion_check(item, result)
+        verdict = str(check.get("verdict") or "unknown")
+        check_status = str(check.get("status") or "failed")
+        if check_status == "completed" and verdict == "pass":
+            return True
+        if verdict == "corrective_action":
+            gap = _supervisor_gap_text(check)
+            if item_followup_rounds[item_id] < 1:
+                # 不直接打回：先向对应 worker 追问，等回复后再判。
+                item_followup_rounds[item_id] = 1
+                _persist_supervisor_followup_message(item, gap)
+                if _finish_hosted_turn_if_cancelled(conversation_id, turn_id):
+                    return False
+                reply, reply_status = execute_todo_item(
+                    item,
+                    followup_question=gap,
+                    followup_round=1,
+                )
+                combined = "\n\n".join(entry for entry in (result, reply) if entry)
+                item_results[item_id] = combined
+                item_statuses[item_id] = (
+                    "completed" if reply_status == "completed" else reply_status
+                )
+                _persist_workflow_progress()
+                if _finish_hosted_turn_if_cancelled(conversation_id, turn_id):
+                    return False
+                check = run_todo_completion_check(item, combined)
+                verdict = str(check.get("verdict") or "unknown")
+                check_status = str(check.get("status") or "failed")
+                if check_status == "completed" and verdict == "pass":
+                    item_statuses[item_id] = "completed"
+                    _persist_workflow_progress()
+                    return True
+                gap = _supervisor_gap_text(check)
+                result = combined
+            while item_rework_rounds[item_id] < _HOSTED_REWORK_LIMIT:
+                # 追问后仍判定未完成：确认打回重做（有界）。
+                item_rework_rounds[item_id] += 1
+                round_number = item_rework_rounds[item_id]
+                rework_round = max(rework_round, round_number)
+                rework_history.append(
+                    {
+                        "round": round_number,
+                        "todo_id": item_id,
+                        "supervisor_feedback": gap[:4000],
+                        "requested_at": int(time.time() * 1000),
+                    }
+                )
+                _emit_rework_state_event(
+                    conversation_id,
+                    turn_id,
+                    phase="started",
+                    rework_round=round_number,
+                    checkpoint_label=f"Todo：{item['title']}"[:60],
+                    feedback=gap,
+                )
+                _persist_supervisor_rework_message(item, gap, round_number)
+                if _finish_hosted_turn_if_cancelled(conversation_id, turn_id):
+                    return False
+                rework_result, rework_status = execute_todo_item(
+                    item,
+                    rework_feedback=gap,
+                    rework_round=round_number,
+                )
+                item_results[item_id] = rework_result or result
+                item_statuses[item_id] = rework_status
+                _emit_rework_state_event(
+                    conversation_id,
+                    turn_id,
+                    phase="dispatched",
+                    rework_round=round_number,
+                    checkpoint_label="",
+                    feedback="",
+                )
+                _persist_workflow_progress()
+                if _finish_hosted_turn_if_cancelled(conversation_id, turn_id):
+                    return False
+                check = run_todo_completion_check(item, item_results[item_id])
+                verdict = str(check.get("verdict") or "unknown")
+                check_status = str(check.get("status") or "failed")
+                if check_status == "completed" and verdict == "pass":
+                    item_statuses[item_id] = "completed"
+                    _persist_workflow_progress()
+                    return True
+                gap = _supervisor_gap_text(check)
+            item_statuses[item_id] = "failed"
+            _persist_workflow_progress()
+            _require_supervisor_pass(
+                f"Todo 完成：{item['title']}"[:60],
+                check,
+                conversation_id=conversation_id,
+                turn_id=turn_id,
+            )
+            return True
+        # 无法形成可验证结论：fail closed。
+        _require_supervisor_pass(
+            f"Todo 完成：{item['title']}"[:60],
+            check,
+            conversation_id=conversation_id,
+            turn_id=turn_id,
+        )
+        return True
+
+    # ── 依赖驱动的波次派发：无依赖项并行，depends_on 项等前项完成 ──────────
+    dispatched_item_ids: set[str] = {
+        item["id"]
+        for item in todo_items
+        if item_statuses.get(item["id"])
+        in {"completed", "failed", "cancelled", "blocked"}
+    }
+    while True:
+        remaining_items = [
+            item for item in todo_items if item["id"] not in dispatched_item_ids
+        ]
+        if not remaining_items:
+            break
+        ready_items = [
+            item
+            for item in remaining_items
+            if all(
+                dep in dispatched_item_ids
+                for dep in (item.get("depends_on") or [])
+            )
+        ]
+        if not ready_items:
+            # 依赖图异常（例如成环）：确定性兜底，按声明顺序全部派发。
+            ready_items = remaining_items
+        with ThreadPoolExecutor(
+            max_workers=len(ready_items),
+            thread_name_prefix=f"hosted-workers-{turn_id[-8:]}",
+            initializer=_set_hosted_execution_generation,
+            initargs=(execution_generation,),
+        ) as executor:
+            futures = {
+                executor.submit(execute_todo_item, item): item
+                for item in ready_items
+            }
+            for future in as_completed(futures):
+                item = futures[future]
+                result, status = future.result()
+                dispatched_item_ids.add(item["id"])
+                item_results[item["id"]] = result
+                item_statuses[item["id"]] = status
+                _persist_workflow_progress()
+                if _finish_hosted_turn_if_cancelled(conversation_id, turn_id):
+                    return
+                if status == "completed":
+                    if not settle_todo_item_after_check(item, result):
+                        return
+                    _persist_workflow_progress()
+                # 执行失败的项：留给最终快检 (b) 统一裁决（追问/返工）。
+        if _finish_hosted_turn_if_cancelled(conversation_id, turn_id):
+            return
+
+    _persist_workflow_progress(stage="worker_running")
     if _finish_hosted_turn_if_cancelled(conversation_id, turn_id):
         return
 
+    # ── 事件驱动快检 (b)：最终汇报前的一次短检查 ──────────────────────────
+    # 输入只有「用户原话 + 全部 todo 项状态」，判定是否有未完成项。
+    final_followup_done = False
+    final_rework_round = 0
+    final_check_iterations = 0
+    while True:
+        final_check_iterations += 1
+        final_check_id = (
+            "final_report"
+            if final_check_iterations == 1
+            else f"final_report_{final_check_iterations}"
+        )
+        final_supervision, final_supervision_status, _final_supervision = (
+            _run_hosted_supervisor_check(
+                conversation_id,
+                turn_id,
+                check_id=final_check_id,
+                checkpoint_label="最终汇报前",
+                evidence={
+                    "task_goal": content,
+                    "todo_items": [
+                        {
+                            "id": item["id"],
+                            "title": item["title"],
+                            "assignee": item["assignee"],
+                            "user_task_fragment": item.get("user_task_fragment") or "",
+                            "status": item_statuses.get(item["id"]) or "pending",
+                        }
+                        for item in todo_items
+                    ],
+                    "artifact_required": artifact_required,
+                },
+                runner=runner,
+                remote=remote_workers,
+                kanban_task_id=plan_sync_task_id,
+            )
+        )
+        supervisor_statuses[final_check_id] = final_supervision_status
+        supervisor_findings[final_check_id] = str(
+            _final_supervision.get("display_result") or final_supervision
+        )
+        if _finish_hosted_turn_if_cancelled(conversation_id, turn_id):
+            return
+        final_verdict = str(_final_supervision.get("verdict") or "unknown")
+        final_check_status = str(_final_supervision.get("status") or "failed")
+        if final_check_status == "completed" and final_verdict == "pass":
+            break
+        if final_verdict != "corrective_action":
+            _require_supervisor_pass(
+                "最终汇报前",
+                _final_supervision,
+                conversation_id=conversation_id,
+                turn_id=turn_id,
+            )
+            return
+        final_gap = _supervisor_gap_text(_final_supervision)
+        unfinished_items = [
+            item
+            for item in todo_items
+            if item_statuses.get(item["id"]) != "completed"
+        ]
+        if not final_followup_done:
+            # 疑似未完成：先向对应 worker 追问，等回复后再判。
+            final_followup_done = True
+            followup_targets = unfinished_items or list(todo_items)
+            for item in followup_targets:
+                # 追问轮次递增，保证 role_stage 唯一，避免断点续跑短路重放。
+                item_followup_rounds[item["id"]] += 1
+                _persist_supervisor_followup_message(item, final_gap)
+                reply, reply_status = execute_todo_item(
+                    item,
+                    followup_question=final_gap,
+                    followup_round=item_followup_rounds[item["id"]],
+                )
+                combined = "\n\n".join(
+                    entry
+                    for entry in (item_results.get(item["id"], ""), reply)
+                    if entry
+                )
+                item_results[item["id"]] = combined
+                item_statuses[item["id"]] = reply_status
+            _persist_workflow_progress()
+            if _finish_hosted_turn_if_cancelled(conversation_id, turn_id):
+                return
+            continue
+        if final_rework_round < _HOSTED_REWORK_LIMIT and unfinished_items:
+            # 确认未完成：打回对应项重做（有界）。
+            final_rework_round += 1
+            rework_round = max(rework_round, final_rework_round)
+            for item in unfinished_items:
+                item_rework_rounds[item["id"]] += 1
+                round_number = item_rework_rounds[item["id"]]
+                rework_history.append(
+                    {
+                        "round": round_number,
+                        "todo_id": item["id"],
+                        "supervisor_feedback": final_gap[:4000],
+                        "requested_at": int(time.time() * 1000),
+                    }
+                )
+                _emit_rework_state_event(
+                    conversation_id,
+                    turn_id,
+                    phase="started",
+                    rework_round=round_number,
+                    checkpoint_label=f"Todo：{item['title']}"[:60],
+                    feedback=final_gap,
+                )
+                _persist_supervisor_rework_message(item, final_gap, round_number)
+            if _finish_hosted_turn_if_cancelled(conversation_id, turn_id):
+                return
+            with ThreadPoolExecutor(
+                max_workers=max(1, len(unfinished_items)),
+                thread_name_prefix=(
+                    f"hosted-rework-{turn_id[-8:]}-{final_rework_round}"
+                ),
+                initializer=_set_hosted_execution_generation,
+                initargs=(execution_generation,),
+            ) as executor:
+                futures = {
+                    executor.submit(
+                        execute_todo_item,
+                        item,
+                        rework_feedback=final_gap,
+                        rework_round=item_rework_rounds[item["id"]],
+                    ): item
+                    for item in unfinished_items
+                }
+                for future in as_completed(futures):
+                    item = futures[future]
+                    result, status = future.result()
+                    item_results[item["id"]] = result
+                    item_statuses[item["id"]] = status
+            _emit_rework_state_event(
+                conversation_id,
+                turn_id,
+                phase="dispatched",
+                rework_round=final_rework_round,
+                checkpoint_label="",
+                feedback="",
+            )
+            _persist_workflow_progress()
+            if _finish_hosted_turn_if_cancelled(conversation_id, turn_id):
+                return
+            continue
+        # 无法收敛（追问与返工均用尽仍未通过）：监督门失败。
+        _require_supervisor_pass(
+            "最终汇报前",
+            _final_supervision,
+            conversation_id=conversation_id,
+            turn_id=turn_id,
+        )
+        return
+
+    # ── 确定性看板汇报（零 LLM 调用）：取代原 Reporter 通道 ────────────────
+    worker_result = "\n\n".join(
+        f"## {profile}\n{worker_results.get(profile, '')}".strip()
+        for profile in worker_profiles
+    )
+    worker_status = (
+        "completed"
+        if all(
+            worker_statuses.get(profile) == "completed"
+            for profile in worker_profiles
+        )
+        else "failed"
+    )
     handoff_artifacts = (
         _hosted_turn_output_attachments(
             conversation_id,
@@ -16589,127 +16587,21 @@ def execute_hosted_workflow(
         else []
     )
     handoff_failures = [
-        f"{profile}: {worker_results.get(profile, '')}".strip()
-        for profile in worker_profiles
-        if worker_statuses.get(profile) != "completed"
+        f"{item['id']}（{item['assignee']}）：{item_results.get(item['id'], '')}".strip()
+        for item in todo_items
+        if item_statuses.get(item["id"]) != "completed"
     ]
-    if reviewer_status != "completed":
-        handoff_failures.append(f"reviewer: {reviewer_result}".strip())
-    source_handoff = {
-        "task_goal": content,
-        "plan": list(manager_plan.get("plan") or []),
-        "worker_results": dict(worker_results),
-        "review_verdict": reviewer_result,
-        "supervisor_review": review_supervision,
-        "rework_history": list(rework_history),
-        "artifacts": handoff_artifacts,
-        "failures": handoff_failures,
-    }
-    manager_handoff = (
-        dict(run.get("manager_handoff") or {})
-        if isinstance(run.get("manager_handoff"), dict)
-        else {}
-    )
-    if (remote_workers or manager_runner is not None) and not manager_handoff:
-        _persist_hosted_turn(
-            conversation_id,
-            turn_id,
-            patch={"stage": "manager_handoff"},
-        )
-        manager_handoff_prompt = "\n".join(
-            (
-                "你是 Hermes Manager。根据下方已经完成的执行与审阅记录生成结构化交接，不能重新执行任务，不能补写不存在的证据。",
-                hosted_progress_protocol(_HERMES_MANAGER_LABEL),
-                hosted_role_delivery_contract(_HERMES_MANAGER_LABEL),
-                mention_priority_protocol(_HERMES_MANAGER_LABEL),
-                hosted_intervention_context(
-                    conversation_id,
-                    turn_id,
-                    role_stage="dispatcher",
-                ),
-                "服务端会固定 task_goal、plan、worker_results、review_verdict、rework_history、artifacts 和 failures；你无权覆盖这些字段。",
-                '只输出一个 JSON 对象：{"suggested_conclusion":"..."}，不得附加正文或伪造权威字段。',
-                json.dumps(source_handoff, ensure_ascii=False, default=str),
-            )
-        )
-        if remote_workers:
-            manager_handoff_result, manager_handoff_status, _handoff_state = _run_hosted_remote_role(
-                conversation_id,
-                turn_id,
-                profile=_DBB3_MANAGER_PROFILE,
-                role_stage="manager_handoff",
-                role_label=f"{_HERMES_MANAGER_LABEL} · 交接",
-                prompt=manager_handoff_prompt,
-                kanban_task_id=plan_sync_task_id,
-                start_text="正在整理执行、审阅、返工和产物证据。",
-                artifact_required=False,
-                delivery_context="Return only the requested JSON handoff.",
-                attachment_context="",
-                connector_id="dbb3-primary",
-            )
-        else:
-            manager_handoff_result, manager_handoff_status, _handoff_state = _run_hosted_role(
-                conversation_id,
-                turn_id,
-                profile=_DBB3_MANAGER_PROFILE,
-                role_stage="manager_handoff",
-                role_label=f"{_HERMES_MANAGER_LABEL} · 交接",
-                prompt=manager_handoff_prompt,
-                runner=manager_runner or runner,
-                kanban_task_id=plan_sync_task_id,
-                start_text="正在整理执行、审阅、返工和产物证据。",
-            )
-        if manager_handoff_status != "completed":
-            raise RuntimeError(manager_handoff_result or f"{_HERMES_MANAGER_NAME} handoff failed")
-        manager_handoff = _normalize_manager_handoff(
-            manager_handoff_result,
-            task_goal=content,
-            plan=manager_plan,
-            worker_results=worker_results,
-            review_verdict=reviewer_result,
-            rework_history=rework_history,
-            artifacts=handoff_artifacts,
-            failures=handoff_failures,
-        )
-        _persist_hosted_turn(
-            conversation_id,
-            turn_id,
-            patch={
-                "manager_handoff": manager_handoff,
-                "manager_handoff_result": manager_handoff_result,
-                "stage": "reporting",
-            },
-        )
-        if manager_plan.get("plan"):
-            _persist_hosted_plan_snapshot(
-                conversation_id,
-                turn_id,
-                manager_plan,
-                stage="reporting",
-                worker_statuses=worker_statuses,
-                reviewer_status=reviewer_status,
-                reviewer_result=reviewer_result,
-            )
-    elif not manager_handoff:
-        manager_handoff = _normalize_manager_handoff(
-            {},
-            task_goal=content,
-            plan=manager_plan,
-            worker_results=worker_results,
-            review_verdict=reviewer_result,
-            rework_history=rework_history,
-            artifacts=handoff_artifacts,
-            failures=handoff_failures,
-        )
-
-    # Rebind cached or model-proposed handoffs to the current authoritative
-    # server state. This also protects resumed pre-upgrade runs.
+    # 确定性 handoff：不再调用 manager 的 LLM 交接，直接由服务端权威状态构造。
     manager_handoff = _normalize_manager_handoff(
-        manager_handoff,
+        (
+            run.get("manager_handoff")
+            if isinstance(run.get("manager_handoff"), dict)
+            else {}
+        ),
         task_goal=content,
         plan=manager_plan,
         worker_results=worker_results,
-        review_verdict=reviewer_result,
+        review_verdict=str(_final_supervision.get("display_result") or "")[:4000],
         rework_history=rework_history,
         artifacts=handoff_artifacts,
         failures=handoff_failures,
@@ -16717,219 +16609,47 @@ def execute_hosted_workflow(
     _persist_hosted_turn(
         conversation_id,
         turn_id,
-        patch={"manager_handoff": manager_handoff},
+        patch={
+            "manager_handoff": manager_handoff,
+            "worker_result": worker_result,
+            "worker_status": worker_status,
+            "worker_results": dict(worker_results),
+            "worker_statuses": dict(worker_statuses),
+            "rework_history": list(rework_history),
+            "rework_round": rework_round,
+            "active_rework_round": 0,
+            "stage": "reporting",
+        },
     )
-
-    final_supervision, final_supervision_status, _final_supervision = (
-        _run_hosted_supervisor_check(
+    if manager_plan.get("plan"):
+        _persist_hosted_plan_snapshot(
             conversation_id,
             turn_id,
-            check_id="final_report",
-            checkpoint_label="最终汇报前",
-            evidence={
-                "manager_handoff": manager_handoff,
-                "worker_status": worker_status,
-                "reviewer_status": reviewer_status,
-                "supervisor_statuses": supervisor_statuses,
-                "supervisor_findings": supervisor_findings,
-                "artifact_required": artifact_required,
-                "artifacts": handoff_artifacts,
-                # A final report must bind to artifacts only when this turn's
-                # route actually requires a deliverable. Ordinary hosted
-                # turns remain evidence-bound without inventing a file digest.
-                "artifact_acceptance_required": bool(artifact_required),
-            },
-            runner=runner,
-            remote=remote_workers,
-            kanban_task_id=plan_sync_task_id,
+            manager_plan,
+            stage="reporting",
+            worker_statuses=worker_statuses,
         )
-    )
-    supervisor_statuses["final_report"] = final_supervision_status
-    supervisor_findings["final_report"] = str(
-        _final_supervision.get("display_result") or final_supervision
-    )
-    _require_supervisor_pass(
-        "最终汇报前",
-        _final_supervision,
-        conversation_id=conversation_id,
-        turn_id=turn_id,
-    )
     if _finish_hosted_turn_if_cancelled(conversation_id, turn_id):
         return
 
-    reporter_result = str(run.get("reporter_result") or "")
-    reporter_status = str(run.get("reporter_status") or "")
-    if not reporter_result:
-        reporter_prompt = "\n".join(
-            item
-            for item in (
-                "你是这个服务端托管任务唯一的最终汇报者。",
-                f"你的 Profile：{reporter_profile}",
-                f"官方 Kanban 根任务：{task_id}"
-                if task_id and not remote_workers
-                else "",
-                reporter_kanban_instruction,
-                "你只能根据 Hermes Manager 已验证的结构化交接生成一次用户答案。",
-                "不得重新执行任务，不得调用工具补做工作，不得编造交接中缺失的结果或证据。",
-                hosted_progress_protocol("Hermes 汇报员"),
-                hosted_role_delivery_contract("Hermes 汇报员"),
-                mention_priority_protocol("Hermes 汇报员"),
-                hosted_intervention_context(
-                    conversation_id,
-                    turn_id,
-                    role_stage="reporter",
-                ),
-                "清楚区分已完成、失败、未完成和需要用户决定的事项。",
-                "Hermes Manager 结构化交接（截断到 8000 字符，完整证据在 role_events 中可审计）：",
-                json.dumps(manager_handoff, ensure_ascii=False, default=str)[:8000],
-                "监督者在最终汇报前的检查（截断到 4000 字符）：",
-                str(final_supervision)[:4000],
-                artifact_instruction,
-            )
-            if item
-        )
-        _persist_hosted_turn(
-            conversation_id,
-            turn_id,
-            patch={
-                "stage": "reporting",
-                "participants": [
-                    hosted_participant_descriptor(
-                        reporter_profile,
-                        role_stage="reporter",
-                    ),
-                ],
-            },
-        )
-        reporter_result, reporter_status, _reporter_state = _run_hosted_role(
-            conversation_id,
-            turn_id,
-            profile=reporter_profile,
-            role_stage="reporter",
-            role_label="Hermes · 最终汇报",
-            prompt=reporter_prompt,
-            runner=runner,
-            kanban_task_id=("" if remote_workers else reporter_task_scope),
-            start_text="执行与审阅信息已齐，正在整理唯一的最终汇报。",
-            final_report=True,
-            previous_state=(run.get("role_events") or {}).get("reporter"),
-            visible=False,
-        )
-
-        # Reporter output is a candidate until the independent post-report
-        # gate accepts it. Keep its role_event for audit, but do not expose a
-        # draft message that may subsequently be rejected.
-        with _STATE_LOCK:
-            draft_state = load_single_state()
-            draft_conversation = _conversation_by_id(draft_state, conversation_id)
-            draft_messages = draft_conversation.get("messages") or []
-            retained_messages = [
-                item
-                for item in draft_messages
-                if not (
-                    isinstance(item, dict)
-                    and isinstance(item.get("meta"), dict)
-                    and str(item["meta"].get("runtime_turn_id") or "") == turn_id
-                    and (
-                        str(item["meta"].get("role_stage") or "") == "reporter"
-                        or str(item["meta"].get("role_stage") or "").startswith(
-                            "reporter."
-                        )
-                    )
-                )
-            ]
-            if len(retained_messages) != len(draft_messages):
-                _rewrite_conversation_history_messages(
-                    conversation_id,
-                    lambda history_messages: [
-                        item
-                        for item in history_messages
-                        if not (
-                            isinstance(item.get("meta"), dict)
-                            and str(item["meta"].get("runtime_turn_id") or "") == turn_id
-                            and (
-                                str(item["meta"].get("role_stage") or "") == "reporter"
-                                or str(item["meta"].get("role_stage") or "").startswith(
-                                    "reporter."
-                                )
-                            )
-                        )
-                    ],
-                )
-                draft_conversation["messages"] = retained_messages
-                draft_conversation["updated_at"] = int(time.time() * 1000)
-                save_single_state(draft_state)
-
-    if _finish_hosted_turn_if_cancelled(conversation_id, turn_id):
-        return
-
-    # The attachment snapshot was captured once before the authoritative
-    # manager handoff. Reporter is presentation-only and cannot publish files,
-    # so reusing that immutable snapshot avoids a second TOCTOU lookup.
+    # 附件快照在汇报前一次性固化；确定性汇报不产生新文件，无 TOCTOU 风险。
     attachments = list(handoff_artifacts)
-    def artifact_identity(item: dict[str, Any]) -> tuple[str, str, int]:
-        return (
-            str(item.get("id") or ""),
-            str(item.get("sha256") or ""),
-            int(item.get("size") or 0),
-        )
-    artifacts_match = {
-        artifact_identity(item)
-        for item in handoff_artifacts
-        if isinstance(item, dict)
-    } == {
-        artifact_identity(item)
-        for item in attachments
-        if isinstance(item, dict)
-    }
-    post_report_supervision, post_report_status, _post_report_supervision = (
-        _run_hosted_supervisor_check(
-            conversation_id,
-            turn_id,
-            check_id="post_report",
-            checkpoint_label="最终汇报成稿",
-            evidence={
-                "authoritative_handoff": manager_handoff,
-                "reporter_result": reporter_result,
-                "reporter_status": reporter_status,
-                "expected_artifacts": handoff_artifacts,
-                "verified_attachments": attachments,
-                "attachments_match_handoff": artifacts_match,
-                "artifact_required": artifact_required,
-            },
-            runner=runner,
-            remote=remote_workers,
-            kanban_task_id=plan_sync_task_id,
-            visible=False,
-        )
-    )
-    supervisor_statuses["post_report"] = post_report_status
-    supervisor_findings["post_report"] = str(
-        _post_report_supervision.get("display_result") or post_report_supervision
-    )
-    _require_supervisor_pass(
-        "最终汇报成稿",
-        _post_report_supervision,
-        conversation_id=conversation_id,
-        turn_id=turn_id,
-    )
-    if _finish_hosted_turn_if_cancelled(conversation_id, turn_id):
-        return
-
     missing_required_artifact = artifact_required and not attachments
-    reporter_state_snapshot = (
-        _reporter_state
-        if "_reporter_state" in locals()
-        else (run.get("role_events") or {}).get("reporter") or {}
+    reporter_result = _render_deterministic_hosted_report(
+        content=content,
+        todo_items=todo_items,
+        item_statuses=item_statuses,
+        item_results=item_results,
+        attachments=attachments,
     )
+    reporter_status = "completed" if worker_status == "completed" else "failed"
     final_status = (
         "completed"
         if (
-            worker_status == reviewer_status == reporter_status == "completed"
+            worker_status == "completed"
+            and reporter_status == "completed"
             and all(status == "completed" for status in supervisor_statuses.values())
-            and _hosted_supervisor_verdict(final_supervision) == "pass"
-            and _hosted_supervisor_verdict(post_report_supervision) == "pass"
-            and artifacts_match
+            and str(_final_supervision.get("verdict") or "") == "pass"
             and not missing_required_artifact
         )
         else "failed"
@@ -16966,8 +16686,6 @@ def execute_hosted_workflow(
             manager_plan,
             stage="completed" if final_status == "completed" else "failed",
             worker_statuses=worker_statuses,
-            reviewer_status=reviewer_status,
-            reviewer_result=reviewer_result,
             reporter_status=reporter_status,
             final_status=final_status,
         )
@@ -17002,11 +16720,9 @@ def execute_hosted_workflow(
                 "final_report": True,
                 "attachments": attachments,
                 "task_id": task_id,
-                "activities": list(reporter_state_snapshot.get("activities") or []),
-                "actual_model": str(reporter_state_snapshot.get("actual_model") or ""),
-                "actual_provider": str(
-                    reporter_state_snapshot.get("actual_provider") or ""
-                ),
+                "activities": [],
+                "actual_model": "",
+                "actual_provider": "",
             },
         },
     )
