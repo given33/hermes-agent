@@ -566,6 +566,18 @@ def deep(
             if confirm(item):
                 try:
                     p = Path(item["path"])
+                    # Same containment + category re-validation as quick():
+                    # deep() deletes every category with no per-item check,
+                    # so a forged tracked.json entry must never reach the
+                    # delete path regardless of what the user confirmed.
+                    if not is_safe_path(p):
+                        _log(f"REJECT unsafe path in deep(): {p}")
+                        continue
+                    stored_cat = str(item.get("category") or "")
+                    actual_cat = guess_category(p)
+                    if stored_cat in {"test", "temp", "cron-output"} and actual_cat != stored_cat:
+                        _log(f"REJECT category mismatch in deep(): {p} stored={stored_cat} actual={actual_cat}")
+                        continue
                     if p.is_file():
                         p.unlink()
                     elif p.is_dir():
