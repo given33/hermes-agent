@@ -1370,28 +1370,47 @@ class AccountWriteApprovalStore:
         """Legacy pending JSON files this owner consumed (via sidecars)."""
 
         results: list[Path] = []
+        seen: set[Path] = set()
         for subsystem in ("memory", "skills"):
-            base = self._legacy_pending_dir(subsystem)
-            if base is None:
-                continue
-            for sidecar in sorted(base.glob("*.json.migrated.json")):
-                try:
-                    decoded = json.loads(sidecar.read_text(encoding="utf-8"))
-                except (OSError, json.JSONDecodeError):
+            for base in self._legacy_pending_dirs(subsystem):
+                if base in seen:
                     continue
-                if not isinstance(decoded, dict):
-                    continue
-                if str(decoded.get("owner_id") or "") != str(owner_id or ""):
-                    continue
-                source = sidecar.with_name(
-                    sidecar.name[: -len(".migrated.json")]
-                )
-                if source.exists():
-                    results.append(source)
+                seen.add(base)
+                for sidecar in sorted(base.glob("*.json.migrated.json")):
+                    try:
+                        decoded = json.loads(sidecar.read_text(encoding="utf-8"))
+                    except (OSError, json.JSONDecodeError):
+                        continue
+                    if not isinstance(decoded, dict):
+                        continue
+                    if str(decoded.get("owner_id") or "") != str(owner_id or ""):
+                        continue
+                    source = sidecar.with_name(
+                        sidecar.name[: -len(".migrated.json")]
+                    )
+                    if source.exists():
+                        results.append(source)
         return results
 
-    def _legacy_pending_dir(self, subsystem: str):
+    def _legacy_pending_dirs(self, subsystem: str) -> list[Path]:
+        """Both pending roots that can hold this store's legacy sidecars.
+
+        Migration receives its pending_dir from the caller (profile env),
+        which for multi-profile deployments can differ from the global home;
+        cleanup must scan the global home AND this store's own root.
+        """
+        candidates: list[Path] = []
         try:
-            return get_hermes_home() / "pending" / subsystem
+            candidates.append(get_hermes_home() / "pending" / subsystem)
         except Exception:
-            return None
+            pass
+        try:
+            candidates.append(self.db_path.parent / "pending" / subsystem)
+        except Exception:
+            pass
+        dirs: list[Path] = []
+        for candidate in candidates:
+            resolved = candidate.resolve()
+            if resolved not in dirs:
+                dirs.append(resolved)
+        return dirs
