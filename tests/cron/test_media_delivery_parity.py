@@ -231,7 +231,7 @@ class TestMediaPolicyEnvBridge:
         (home / "config.yaml").write_text(
             "gateway:\n"
             "  strict: true\n"
-            f"  media_delivery_allow_dirs: [{str(allow_dir)!r}]\n"
+            f"  media_delivery_allow_dirs: [{allow_dir.as_posix()}]\n"
             "  trust_recent_files: false\n"
         )
         monkeypatch.setenv("HERMES_HOME", str(home))
@@ -247,7 +247,7 @@ class TestMediaPolicyEnvBridge:
         apply_media_policy_env()
 
         assert os.environ.get("HERMES_MEDIA_DELIVERY_STRICT") == "1"
-        assert str(allow_dir) in os.environ.get("HERMES_MEDIA_ALLOW_DIRS", "")
+        assert allow_dir.as_posix() in os.environ.get("HERMES_MEDIA_ALLOW_DIRS", "")
         assert os.environ.get("HERMES_MEDIA_TRUST_RECENT_FILES") == "0"
 
     def test_standalone_filter_honors_bridged_allowlist(self, monkeypatch, tmp_path):
@@ -266,7 +266,7 @@ class TestMediaPolicyEnvBridge:
         (home / "config.yaml").write_text(
             "gateway:\n"
             "  strict: true\n"
-            f"  media_delivery_allow_dirs: [{str(allow_dir)!r}]\n"
+            f"  media_delivery_allow_dirs: [{allow_dir.as_posix()}]\n"
         )
         monkeypatch.setenv("HERMES_HOME", str(home))
         for var in ("HERMES_MEDIA_DELIVERY_STRICT", "HERMES_MEDIA_ALLOW_DIRS"):
@@ -296,11 +296,12 @@ class TestMediaPolicyEnvBridge:
         home = tmp_path / "hermes-home"
         home.mkdir()
         media_dir = str(Path(media_file).parent)
+        media_dir_posix = Path(media_file).parent.as_posix()
         (home / "config.yaml").write_text(
             "platforms:\n  slack:\n    enabled: true\n    token: xoxb-test\n"
             "gateway:\n"
             "  strict: true\n"
-            f"  media_delivery_allow_dirs: [{media_dir!r}]\n"
+            f"  media_delivery_allow_dirs: [{media_dir_posix}]\n"
             "  trust_recent_files: false\n"
         )
         monkeypatch.setenv("HERMES_HOME", str(home))

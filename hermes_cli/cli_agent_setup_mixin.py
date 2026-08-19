@@ -598,6 +598,7 @@ class CLIAgentSetupMixin:
             return False
 
     def _resume_history_limit_error(self, tip_only: bool = False):
+        from cli import logger  # lazy: avoids the cli import cycle
         """Return a safe-resume error without materializing transcript rows.
 
         ``tip_only`` matches call sites that load only the tip session's rows

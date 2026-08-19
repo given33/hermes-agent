@@ -36,6 +36,11 @@ logger = logging.getLogger(__name__)
 
 ACCESS_TTL_SECONDS = 15 * 60
 REFRESH_TTL_SECONDS = 30 * 24 * 60 * 60
+# A benign concurrent double-send (HTTP retry racing the keychain write,
+# main app + extension refreshing together) replays a token seconds after
+# its winning rotation. Revoking on that single race logged users out and
+# silently disabled APNs; only replays older than this window are hostile.
+_REFRESH_REPLAY_GRACE_SECONDS = 120
 ACCOUNT_DELETION_LEASE_SECONDS = 300
 SCHEMA_VERSION = 7
 
@@ -725,10 +730,19 @@ class MobileDeviceStore:
             ).fetchone()
             if row is None:
                 replayed = conn.execute(
-                    "SELECT session_id FROM mobile_refresh_history WHERE token_hash=?",
+                    "SELECT session_id, rotated_at FROM mobile_refresh_history WHERE token_hash=?",
                     (old_hash,),
                 ).fetchone()
                 if replayed is not None:
+                    rotated_at = int(replayed["rotated_at"] or 0)
+                    if now - rotated_at <= _REFRESH_REPLAY_GRACE_SECONDS:
+                        # Concurrent double-send: the winning rotation already
+                        # replaced this token moments ago. Return None WITHOUT
+                        # revoking — the winner's fresh pair stays valid and
+                        # the client's next attempt uses it. Revoking here used
+                        # to destroy the whole session and disable APNs on a
+                        # single lost race.
+                        return None
                     self._revoke_replayed_session(
                         conn,
                         str(replayed["session_id"]),

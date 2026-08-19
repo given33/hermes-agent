@@ -110,9 +110,14 @@ def _chain_ending_at(boots: List[float], ts: float, gap: float) -> List[float]:
     prev = ts
     for t in sorted(boots, reverse=True):
         if t > ts:
-            # Clock moved backwards (NTP step, restored state file). Treat the
-            # future entry as adjacent rather than dropping the whole chain.
-            chain.append(t)
+            # Clock moved backwards (NTP step, restored state file). A future
+            # entry is only adjacent when it is plausibly the NEXT boot
+            # (within the gap); a single far-future stamp used to chain every
+            # subsequent boot together into a false loop-trip that skipped
+            # auto-resume.
+            if t - ts <= gap:
+                chain.append(t)
+                prev = t
             continue
         if prev - t > gap:
             break

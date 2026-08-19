@@ -849,13 +849,73 @@ def test_http_refresh_replay_revokes_the_rotated_session():
             setattr(web_server.app.state, name, value)
 
     assert refreshed.status_code == 200
+    # Immediate replay = benign concurrent double-send inside the grace
+    # window: the replay request itself is refused, but the WINNER's fresh
+    # pair stays valid (revoking here used to log the user out and disable
+    # APNs on a single lost race).
     assert replayed.status_code == 401
     assert old_access.status_code == 401
-    assert new_access.status_code == 401
-    # Replay revocation is scoped to the compromised mobile session. An
-    # independently authenticated dashboard session remains valid and is
-    # verified by the official RFC 8252 bearer path.
+    assert new_access.status_code == 200
     assert basic_as_bearer.status_code == 200
+
+
+def test_http_refresh_replay_outside_grace_window_revokes_session():
+    """A replay older than the grace window is hostile and revokes + kills APNs."""
+    from hermes_cli import web_server
+    from hermes_cli.dashboard_auth.mobile_device_store import (
+        _REFRESH_REPLAY_GRACE_SECONDS,
+        MobileDeviceStore,
+    )
+
+    previous = {
+        name: getattr(web_server.app.state, name, None)
+        for name in ("bound_host", "bound_port", "auth_required")
+    }
+    web_server.app.state.bound_host = "owner.test"
+    web_server.app.state.bound_port = 443
+    web_server.app.state.auth_required = True
+    client = TestClient(web_server.app, base_url="https://owner.test")
+    try:
+        registered = client.post(
+            "/auth/mobile/register",
+            json=_registration_payload(
+                device={"id": "refresh-replay-old", "name": "Owner iPhone"},
+            ),
+        )
+        assert registered.status_code == 200
+        original = registered.json()
+        refreshed = client.post(
+            "/auth/mobile/refresh",
+            json={"refresh_token": original["refresh_token"]},
+        )
+        assert refreshed.status_code == 200
+
+        # Age the rotation beyond the grace window.
+        store = MobileDeviceStore()
+        with store.connection() as conn:
+            conn.execute(
+                "UPDATE mobile_refresh_history SET rotated_at=rotated_at-?",
+                (_REFRESH_REPLAY_GRACE_SECONDS + 60,),
+            )
+            conn.commit()
+
+        replayed = client.post(
+            "/auth/mobile/refresh",
+            json={"refresh_token": original["refresh_token"]},
+        )
+        winner_access = client.get(
+            "/api/sessions",
+            headers={
+                "Authorization": f"Bearer {refreshed.json()['access_token']}"
+            },
+        )
+    finally:
+        client.close()
+        for name, value in previous.items():
+            setattr(web_server.app.state, name, value)
+
+    assert replayed.status_code == 401
+    assert winner_access.status_code == 401
 
 
 def test_http_device_revoke_is_isolated_and_apns_is_current_device_only():

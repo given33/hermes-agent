@@ -8579,11 +8579,20 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
     def _scale_to_zero_is_idle(self) -> bool:
         from gateway.scale_to_zero import is_idle
 
+        # Mirror _active_work_count: cron jobs and API runs execute outside
+        # _running_agents (on the scheduler's own thread pool), and cron
+        # triggers deliberately do not stamp the inbound clock — without
+        # this, the exact instance scale-to-zero targets (Chronos-only)
+        # would be suspended MID-JOB by the overnight watcher.
         return is_idle(
             running_agent_count=self._running_agent_count(),
             seconds_since_last_inbound=time.time() - self._last_inbound_at,
             idle_timeout_seconds=self._scale_to_zero_idle_timeout_seconds(),
-            has_live_background_work=self._scale_to_zero_has_live_background_work(),
+            has_live_background_work=(
+                self._scale_to_zero_has_live_background_work()
+                or self._active_cron_job_count() > 0
+                or self._active_api_run_count() > 0
+            ),
         )
 
     def _scale_to_zero_note_real_inbound(self) -> None:

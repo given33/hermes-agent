@@ -72,6 +72,27 @@ _PROVIDER_ENV_HINTS = (
 from hermes_constants import is_termux as _is_termux
 
 
+def _mutate_config(mutate_fn, config_path=None) -> bool:
+    """Read-modify-write config.yaml under the config lock.
+
+    The raw on-disk document is re-read under the lock (a concurrent writer
+    may have fixed or changed it since the diagnostic read); ``mutate_fn``
+    returning None skips the write entirely. Restored after the helper was
+    lost in a merge — the call site predated the definition's removal.
+    """
+    from hermes_cli.config import _CONFIG_LOCK, get_config_path, read_user_config_raw
+    from utils import atomic_yaml_write
+
+    target = Path(config_path) if config_path else get_config_path()
+    with _CONFIG_LOCK:
+        cfg = read_user_config_raw(target)
+        mutated = mutate_fn(cfg)
+        if mutated is None:
+            return False
+        atomic_yaml_write(target, mutated)
+        return True
+
+
 def _python_install_cmd() -> str:
     return "python -m pip install" if _is_termux() else "uv pip install"
 
@@ -1518,7 +1539,7 @@ def run_doctor(args):
                                 cfg.pop(k)
                         return cfg
 
-                    mutate_config(_migrate_stale_root_keys, config_path=config_path)
+                    _mutate_config(_migrate_stale_root_keys, config_path=config_path)
                     check_ok("Migrated stale root-level keys into model section")
                     fixed_count += 1
                 else:

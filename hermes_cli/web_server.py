@@ -3215,6 +3215,8 @@ async def fs_list(path: str):
 @app.get("/api/fs/read-text")
 async def fs_read_text(path: str):
     target, st = _fs_regular_file(_fs_path(path))
+    if _is_sensitive_path(target):
+        raise HTTPException(status_code=403, detail="Access to sensitive files is not allowed")
     if st.st_size > _FS_TEXT_SOURCE_MAX_BYTES:
         raise HTTPException(status_code=413, detail="File too large")
     bytes_to_read = min(st.st_size, _FS_TEXT_PREVIEW_MAX_BYTES)
@@ -3286,6 +3288,8 @@ async def fs_write_text(payload: FsWriteText):
 @app.get("/api/fs/read-data-url")
 async def fs_read_data_url(path: str):
     target, st = _fs_regular_file(_fs_path(path))
+    if _is_sensitive_path(target):
+        raise HTTPException(status_code=403, detail="Access to sensitive files is not allowed")
     if st.st_size > _FS_DATA_URL_MAX_BYTES:
         raise HTTPException(status_code=413, detail="File too large")
     try:

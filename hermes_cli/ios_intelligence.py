@@ -1784,7 +1784,14 @@ class IOSIntelligenceStore:
                     latitude = payload.get("latitude", payload.get("lat"))
                     longitude = payload.get("longitude", payload.get("lon", payload.get("lng")))
                     if latitude is None or longitude is None:
-                        raise ValueError("Location events require latitude and longitude")
+                        # One malformed event must never wedge the device
+                        # pipeline: raising rolled back the whole batch and
+                        # the cursor never advanced, so the client re-uploaded
+                        # the same poison batch forever. Skip and count it —
+                        # identical to the blocked-kind handling above.
+                        discarded += 1
+                        duplicates += 1
+                        continue
                     conn.execute(
                         "INSERT OR IGNORE INTO ios_trajectory VALUES(?,?,?,?,?,?,?,?,?,?,?,?)",
                         (
