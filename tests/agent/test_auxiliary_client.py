@@ -24,7 +24,6 @@ from agent.auxiliary_client import (
     _get_provider_chain,
     _is_payment_error,
     _is_rate_limit_error,
-    _is_auth_error,
     _is_model_not_found_error,
     _is_model_incompatible_error,
     _refresh_nous_recommended_model,
@@ -1400,29 +1399,6 @@ class TestIsModelIncompatibleError:
             "supported when using Codex with a ChatGPT account.\"}"
         )
         exc.status_code = 400
-        assert _is_model_incompatible_error(exc) is True
-
-    def test_opencode_401_model_rejection_is_not_auth(self):
-        """A model-scoped 401 must not rotate a healthy gateway credential."""
-        exc = Exception("Model deepseekv4flash is not supported")
-        exc.status_code = 401
-
-        assert _is_auth_error(exc) is False
-        assert _is_model_incompatible_error(exc) is True
-
-    def test_structured_gateway_body_is_classified_without_rotating_auth(self):
-        """SDK exceptions can hide the model error in ``exc.body``."""
-        exc = Exception("Error code: 401")
-        exc.status_code = 401
-        exc.body = {
-            "type": "error",
-            "error": {
-                "type": "ModelError",
-                "message": "Model deepseek-v4-flash is not supported",
-            },
-        }
-
-        assert _is_auth_error(exc) is False
         assert _is_model_incompatible_error(exc) is True
 
 
@@ -3152,7 +3128,6 @@ class TestVisionAutoSkipsKimiCoding:
         """Guard against accidental widening of the skip list."""
         from agent.auxiliary_client import _PROVIDERS_WITHOUT_VISION
         assert _PROVIDERS_WITHOUT_VISION == frozenset({
-            "deepseek",
             "kimi-coding",
             "kimi-coding-cn",
         })

@@ -38,34 +38,18 @@ from agent.tool_dispatch_helpers import (
     _is_multimodal_tool_result,
     _multimodal_text_summary,
     _append_subdir_hint_to_multimodal,
-    _plan_tool_batch_execution,
+    _plan_tool_batch_segments,
     make_tool_result_message,
 )
-from hermes_services.internal_hooks import run_internal_hooks
-from hermes_services.tool_contract import (
-    contract_timeout_seconds,
-    resolve_tool_contract,
-    tool_contract_event_metadata,
-    validate_tool_contract_binding,
+from tools.terminal_tool import (
+    get_active_env,
 )
-from hermes_runtime.tool_execution import ToolExecutionLedger, build_envelope
-from tools import (
-    approval as _tool_approval,
-    budget_config as _budget_config,
-    registry as _tool_registry,
-    terminal_tool as _terminal_tool,
-    thread_context as _thread_context,
-    tool_result_storage as _tool_result_storage,
+from tools.thread_context import propagate_context_to_thread
+from tools.tool_result_storage import (
+    maybe_persist_tool_result,
+    enforce_turn_budget,
 )
-
-BudgetConfig = _budget_config.BudgetConfig
-DEFAULT_BUDGET = _budget_config.DEFAULT_BUDGET
-budget_for_context_window = _budget_config.budget_for_context_window
-enforce_turn_budget = _tool_result_storage.enforce_turn_budget
-get_active_env = _terminal_tool.get_active_env
-get_approval_callback = _terminal_tool.get_approval_callback
-maybe_persist_tool_result = _tool_result_storage.maybe_persist_tool_result
-propagate_context_to_thread = _thread_context.propagate_context_to_thread
+from tools.budget_config import BudgetConfig, DEFAULT_BUDGET, budget_for_context_window
 
 logger = logging.getLogger(__name__)
 
@@ -110,18 +94,6 @@ def _budget_for_agent(agent) -> BudgetConfig:
 # Maximum number of concurrent worker threads for parallel tool execution.
 # Mirrors the constant in ``run_agent`` for tests/imports that look here.
 _MAX_TOOL_WORKERS = 8
-# Preserve eight fully occupied agents before process-wide backpressure.
-_MAX_PROCESS_TOOL_WORKERS = _MAX_TOOL_WORKERS * 8
-_TOOL_EXECUTION_SLOT_SETUP_LOCK = threading.Lock()
-# Compatibility export for integrations that inspect the historical global
-# budget. Execution uses the per-agent budget returned below.
-_TOOL_EXECUTION_SLOTS = threading.BoundedSemaphore(_MAX_TOOL_WORKERS)
-# A timed-out Python thread cannot be killed safely. Per-agent capacity can be
-# restored after abandonment, but the orphan keeps this process-wide lease
-# until it really exits so repeated timeouts cannot grow threads without bound.
-_PROCESS_TOOL_EXECUTION_SLOTS = threading.BoundedSemaphore(
-    _MAX_PROCESS_TOOL_WORKERS
-)
 _DEFAULT_IMAGE_PARALLEL_REQUESTS = 4
 # Keep this above the stock auxiliary.web_extract timeout (360s) so the batch
 # guard does not preempt a slow-but-valid summarization attempt.
@@ -167,59 +139,6 @@ class _BatchAbandoned(BaseException):
     """
 
 
-def _agent_tool_execution_slots(agent):
-    """Return a per-agent worker budget without cross-agent starvation."""
-    slots = getattr(agent, "_tool_execution_slots", None)
-    if slots is not None:
-        return slots
-    with _TOOL_EXECUTION_SLOT_SETUP_LOCK:
-        slots = getattr(agent, "_tool_execution_slots", None)
-        if slots is None:
-            slots = threading.BoundedSemaphore(_MAX_TOOL_WORKERS)
-            agent._tool_execution_slots = slots
-        return slots
-
-
-class _ToolExecutionLease:
-    """Own per-agent and process capacity for one concurrent tool worker."""
-
-    def __init__(self, agent_slots, process_slots):
-        self._agent_slots = agent_slots
-        self._process_slots = process_slots
-        self._lock = threading.Lock()
-        self._agent_released = False
-        self._process_released = False
-
-    def abandon(self) -> None:
-        """Restore the session after timeout while retaining the orphan bound."""
-        with self._lock:
-            if self._agent_released:
-                return
-            self._agent_released = True
-            self._agent_slots.release()
-
-    def finish(self) -> None:
-        """Release all capacity exactly once when the worker really exits."""
-        with self._lock:
-            if not self._agent_released:
-                self._agent_released = True
-                self._agent_slots.release()
-            if not self._process_released:
-                self._process_released = True
-                self._process_slots.release()
-
-
-def _acquire_tool_execution_lease(agent) -> tuple[Optional[_ToolExecutionLease], str]:
-    if not _PROCESS_TOOL_EXECUTION_SLOTS.acquire(blocking=False):
-        return None, "process tool worker limit reached"
-
-    agent_slots = _agent_tool_execution_slots(agent)
-    if not agent_slots.acquire(blocking=False):
-        _PROCESS_TOOL_EXECUTION_SLOTS.release()
-        return None, "agent tool worker limit reached"
-    return _ToolExecutionLease(agent_slots, _PROCESS_TOOL_EXECUTION_SLOTS), ""
-
-
 def _parse_tool_arguments(raw_arguments: Any) -> tuple[dict, Optional[str]]:
     """Parse model-emitted arguments without repairing or coercing them."""
     try:
@@ -239,97 +158,20 @@ def _parse_tool_arguments(raw_arguments: Any) -> tuple[dict, Optional[str]]:
     )
 
 
-def _resolve_concurrent_tool_timeout(tool_names: list[str] | None = None) -> float | None:
+def _resolve_concurrent_tool_timeout() -> float | None:
     """Resolve the per-batch concurrent tool deadline.
 
-    Delegates the base bound to the unified resolver (#85125): config.yaml
-    ``timeouts.tools.concurrent_batch`` wins, the legacy
-    ``HERMES_CONCURRENT_TOOL_TIMEOUT_S`` env var remains the back-compat
-    bridge, and ``0``/negative still disables the bound. The batch deadline
-    never outlives the strictest tool-contract deadline of the batch.
+    Delegates to the unified resolver (#85125): ``timeouts.tools.concurrent_batch``
+    in config.yaml wins, the legacy ``HERMES_CONCURRENT_TOOL_TIMEOUT_S`` env var
+    remains the back-compat bridge, and ``0``/negative still disables the bound.
     """
     from agent.deadline import resolve_timeout
 
-    configured = resolve_timeout(
+    return resolve_timeout(
         "tools.concurrent_batch",
         default=_DEFAULT_CONCURRENT_TOOL_TIMEOUT_S,
         env_var="HERMES_CONCURRENT_TOOL_TIMEOUT_S",
     )
-    contract_timeout = contract_timeout_seconds(list(tool_names or []))
-    if configured is None:
-        # Explicitly unbounded: still honor a declared tool-contract deadline.
-        return contract_timeout
-    return min(configured, contract_timeout) if contract_timeout is not None else configured
-
-
-def _tool_contract_approval_block(function_name: str) -> str | None:
-    contract = resolve_tool_contract(function_name)
-    entry = _tool_registry.registry.get_entry(function_name)
-    effect_metadata = entry.effect_metadata if entry is not None else {}
-    irreversible = effect_metadata.get("reversibility") == "irreversible"
-    if not contract.requires_approval and not irreversible:
-        return None
-
-    if contract.requires_approval:
-        reason = (
-            f"The {function_name} tool is marked as requiring approval by its "
-            "execution contract."
-        )
-        rule_key = f"tool_contract:{function_name}"
-    else:
-        boundary = str(effect_metadata.get("external_boundary") or "external")
-        reason = (
-            f"The {function_name} tool declares an irreversible side effect "
-            f"across the {boundary} boundary."
-        )
-        rule_key = f"irreversible_effect:{function_name}"
-
-    decision = _tool_approval.request_tool_approval(
-        function_name,
-        reason,
-        rule_key=rule_key,
-        approval_callback=get_approval_callback(),
-    )
-    if decision.get("approved") is True:
-        return None
-    return str(
-        decision.get("message")
-        or f"Tool '{function_name}' was not approved."
-    )
-
-
-def _tool_contract_event_metadata(function_name: str) -> dict[str, Any]:
-    return tool_contract_event_metadata(function_name)
-
-
-def _tool_contract_consistency_block(agent, function_name: str) -> str | None:
-    """Validate the live handler/policy against this agent's advertised tools."""
-
-    snapshot_generation = getattr(agent, "_tool_snapshot_generation", None)
-    if not isinstance(snapshot_generation, int):
-        # Lightweight legacy/test agents do not own a production tool snapshot.
-        return None
-    return validate_tool_contract_binding(
-        function_name,
-        advertised_registry_generation=snapshot_generation,
-    )
-
-
-def _run_with_tool_contract_timeout(agent, function_name: str, execute) -> Any:
-    consistency_error = _tool_contract_consistency_block(agent, function_name)
-    if consistency_error is not None:
-        raise RuntimeError(consistency_error)
-    contract = resolve_tool_contract(function_name)
-    if contract.timeout_seconds is not None:
-        if _tool_registry.registry.get_entry(function_name) is None:
-            raise RuntimeError(
-                f"Tool '{function_name}' declares a hard deadline but is not "
-                "registry-dispatched and cannot be process-isolated"
-            )
-    # Registry-dispatched bounded handlers enforce their deadline in a
-    # disposable process. The outer agent wrapper must not add a second thread
-    # timeout around hooks, approvals, persistence, or result normalization.
-    return execute()
 
 
 def _flush_session_db_after_tool_progress(
@@ -427,20 +269,6 @@ def _emit_terminal_post_tool_call(
     error_message: str | None = None,
     middleware_trace: Optional[list[dict[str, Any]]] = None,
 ) -> None:
-    ledger = getattr(agent, "_tool_execution_ledger", None)
-    if ledger is not None and tool_call_id:
-        terminal_status = status
-        if terminal_status is None:
-            terminal_status = "failed" if error_type or _detect_tool_failure(function_name, result)[0] else "completed"
-        try:
-            ledger.finish(
-                str(tool_call_id),
-                terminal_status,
-                result=result,
-                error_type=error_type or "",
-            )
-        except Exception:
-            logger.debug("tool execution ledger finish failed", exc_info=True)
     try:
         from model_tools import _emit_post_tool_call_hook
         _emit_post_tool_call_hook(
@@ -460,18 +288,6 @@ def _emit_terminal_post_tool_call(
         )
     except Exception:
         pass
-
-
-def _execution_metadata(agent, tool_call_id: str) -> dict | None:
-    ledger = getattr(agent, "_tool_execution_ledger", None)
-    if ledger is None or not tool_call_id:
-        return None
-    try:
-        envelope = ledger.get(str(tool_call_id))
-        return envelope.as_dict() if envelope is not None else None
-    except Exception:
-        logger.debug("tool execution ledger projection failed", exc_info=True)
-        return None
 
 
 def _cancelled_tool_result(reason: str = "user interrupt") -> str:
@@ -812,16 +628,6 @@ def _run_agent_tool_execution_middleware(
                 else authorization_gate.run(_resolve_pre_tool_block)
             )
 
-        if block_message is None:
-            approval_check = lambda: _tool_contract_approval_block(function_name)
-            block_message = (
-                approval_check()
-                if authorization_gate is None
-                else authorization_gate.run(approval_check)
-            )
-            if block_message is not None:
-                block_error_type = "tool_contract_approval"
-
         guardrail_decision = None
         if block_message is None:
             guardrail_decision = agent._tool_guardrails.before_call(
@@ -1156,27 +962,6 @@ def _begin_tool_execution(
     display_index: int | None,
 ) -> None:
     """Run user-visible and checkpoint preflight on final tool arguments."""
-    try:
-        ledger = getattr(agent, "_tool_execution_ledger", None)
-        if ledger is None:
-            ledger = ToolExecutionLedger()
-            agent._tool_execution_ledger = ledger
-        from tools.registry import registry as _execution_registry
-        entry = _execution_registry.get_entry(function_name)
-        ledger.start(build_envelope(
-            tool_name=function_name,
-            args=function_args,
-            call_id=str(tool_call_id or ""),
-            parent_call_id=str(getattr(agent, "_active_tool_parent_call_id", "") or ""),
-            owner_id=str(getattr(agent, "owner_id", "") or ""),
-            session_id=str(getattr(agent, "session_id", "") or ""),
-            turn_id=str(getattr(agent, "_current_turn_id", "") or ""),
-            profile=str(getattr(agent, "profile", "") or ""),
-            registry_generation=int(getattr(_execution_registry, "_generation", 0) or 0),
-            effect_metadata=getattr(entry, "effect_metadata", {}) if entry else {},
-        ))
-    except Exception:
-        logger.debug("tool execution ledger start failed", exc_info=True)
     if not agent.quiet_mode and getattr(agent, "tool_progress_mode", "all") != "off":
         display_args = (
             _redact_tool_args_for_display(function_name, function_args) or function_args
@@ -2003,7 +1788,6 @@ def execute_tool_calls_concurrent(agent, assistant_message, messages: list, effe
             _tool_content,
             tc.id,
             effect_disposition=effect_disposition,
-            execution_envelope=_execution_metadata(agent, tc.id),
         )
         messages.append(tool_message)
         risk_metadata = tool_message.get("_tool_output_risk")
@@ -2336,6 +2120,7 @@ def execute_tool_calls_sequential(agent, assistant_message, messages: list, effe
                     question=next_args.get("question", ""),
                     choices=next_args.get("choices"),
                     multi_select=next_args.get("multi_select", False),
+                    questions=next_args.get("questions"),
                     callback=agent.clarify_callback,
                 )
             function_result, function_args, middleware_trace, _execution_blocked, _execution_dispatched = _managed_values(_run_agent_tool_execution_middleware(
@@ -2412,6 +2197,33 @@ def execute_tool_calls_sequential(agent, assistant_message, messages: list, effe
             tool_duration = time.time() - tool_start_time
             if agent._should_emit_quiet_tool_messages():
                 agent._vprint(f"  {_get_cute_tool_message_impl('read_window_below', function_args, tool_duration, result=function_result)}")
+        elif function_name == "tour":
+            def _execute(next_args: dict) -> Any:
+                from tools.tour_tool import tour_tool as _tour_tool
+                return _tour_tool(
+                    action=next_args.get("action", ""),
+                    surface=next_args.get("surface"),
+                    selector=next_args.get("selector"),
+                    title=next_args.get("title"),
+                    text=next_args.get("text"),
+                    side=next_args.get("side"),
+                    steps=next_args.get("steps"),
+                    step_index=next_args.get("step_index"),
+                    callback=getattr(agent, "tour_callback", None),
+                )
+            function_result, function_args, middleware_trace, _execution_blocked, _execution_dispatched = _managed_values(_run_agent_tool_execution_middleware(
+                agent,
+                function_name=function_name,
+                function_args=function_args,
+                effective_task_id=effective_task_id,
+                tool_call_id=getattr(tool_call, "id", "") or "",
+                execute=_execute,
+                scope_block=_ts_scope_block,
+                display_index=i,
+            ))
+            tool_duration = time.time() - tool_start_time
+            if agent._should_emit_quiet_tool_messages():
+                agent._vprint(f"  {_get_cute_tool_message_impl('tour', function_args, tool_duration, result=function_result)}")
         elif function_name == "setup_mcp":
             def _execute(next_args: dict) -> Any:
                 from tools.setup_mcp_tool import setup_mcp_tool as _setup_mcp_tool
@@ -2577,7 +2389,6 @@ def execute_tool_calls_sequential(agent, assistant_message, messages: list, effe
                                 if agent.valid_tool_names
                                 else None
                             ),
-                            tool_role=getattr(agent, "tool_role", None),
                             skip_pre_tool_call_hook=True,
                             skip_tool_request_middleware=True,
                             skip_tool_execution_middleware=True,
@@ -2660,7 +2471,6 @@ def execute_tool_calls_sequential(agent, assistant_message, messages: list, effe
                                 if agent.valid_tool_names
                                 else None
                             ),
-                            tool_role=getattr(agent, "tool_role", None),
                             skip_pre_tool_call_hook=True,
                             skip_tool_request_middleware=True,
                             skip_tool_execution_middleware=True,
@@ -2813,7 +2623,6 @@ def execute_tool_calls_sequential(agent, assistant_message, messages: list, effe
             function_name,
             _tool_content,
             tool_call.id,
-            execution_envelope=_execution_metadata(agent, tool_call.id),
             effect_disposition="unknown" if _execution_timed_out else None,
         )
         messages.append(tool_message)
@@ -2918,7 +2727,7 @@ def execute_tool_calls_segmented(agent, assistant_message, messages: list, effec
     """Execute a mixed tool-call batch as ordered parallel/sequential segments.
 
     ``segments`` is the ``(kind, calls)`` plan from
-    ``_plan_tool_batch_execution``: conservative provider-batch execution
+    ``_plan_tool_batch_segments``: maximal contiguous runs of parallel-safe
     calls execute on the concurrent path, barrier calls on the sequential
     path, strictly in the model's original call order. Because segments are
     contiguous, every tool result is still appended one-per-call in emission
@@ -2942,10 +2751,7 @@ def execute_tool_calls_segmented(agent, assistant_message, messages: list, effec
     if segments is None:
         _active_env = get_active_env(effective_task_id)
         _exec_cwd = Path(_active_env.cwd) if _active_env is not None and _active_env.cwd else None
-        segments = _plan_tool_batch_execution(
-            assistant_message.tool_calls,
-            execution_cwd=_exec_cwd,
-        )
+        segments = _plan_tool_batch_segments(assistant_message.tool_calls, execution_cwd=_exec_cwd)
 
     for kind, calls in segments:
         if getattr(agent, "_incremental_persistence_failed", False):

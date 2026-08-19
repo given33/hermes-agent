@@ -3179,6 +3179,31 @@ def cmd_chat(args):
     # Import and run the CLI
     from cli import main as cli_main
 
+    # --query-file: read the single query from a file (or stdin via '-') so
+    # callers never have to shell-quote message bodies. This is the transport
+    # the Bot Mode DM protocol uses — interpolating arbitrary text into a
+    # double-quoted shell argument truncates on quotes and executes $(...)
+    # (see tools/bot_mode_probe.py).
+    _qfile = getattr(args, "query_file", None)
+    if _qfile:
+        if args.query:
+            # argparse's mutually-exclusive group catches the normal CLI path;
+            # this guards programmatic callers that fill the namespace directly.
+            print("Error: -q/--query and --query-file are mutually exclusive", file=sys.stderr)
+            sys.exit(2)
+        try:
+            if _qfile == "-":
+                args.query = sys.stdin.read()
+            else:
+                with open(_qfile, "r", encoding="utf-8", errors="replace") as _fh:
+                    args.query = _fh.read()
+        except OSError as _e:
+            print(f"Error: cannot read --query-file {_qfile}: {_e}", file=sys.stderr)
+            sys.exit(2)
+        if not (args.query or "").strip():
+            print(f"Error: --query-file {_qfile} is empty", file=sys.stderr)
+            sys.exit(2)
+
     # Build kwargs from args
     kwargs = {
         "model": args.model,
@@ -3664,9 +3689,11 @@ def select_provider_and_model(args=None):
                 "name": name,
                 "base_url": base_url,
                 "api_key": entry.get("api_key", ""),
-                "key_env": entry.get("key_env", ""),
+                "key_env": entry.get("key_env") or entry.get("api_key_env", ""),
                 "model": entry.get("model", ""),
                 "models": entry.get("models", {}),
+                "models_discovered": entry.get("models_discovered", False),
+                "extra_headers": entry.get("extra_headers", {}),
                 "discover_models": entry.get("discover_models", True),
                 "api_mode": entry.get("api_mode", ""),
                 "provider_key": provider_key,
@@ -9903,6 +9930,7 @@ def cmd_update(args):
         detect_install_method,
         format_docker_update_message,
         is_managed,
+        is_nix_install_method,
         managed_error,
         recommended_update_command_for_method,
     )
@@ -9922,7 +9950,7 @@ def cmd_update(args):
         print(format_docker_update_message())
         sys.exit(1)
 
-    if install_method in {"nix", "nixos", "apt"}:
+    if is_nix_install_method(install_method) or install_method == "apt":
         print(recommended_update_command_for_method(install_method))
         sys.exit(1)
 
@@ -11299,26 +11327,25 @@ def cmd_dashboard(args):
         # the missing-provider state if it matters.
         print(f"⚠ Plugin discovery failed: {exc}", file=sys.stderr)
 
-    # Dashboard agent construction is profile-aware now: tool-enabled
-    # sessions start discovery after their profile context is bound, while
-    # plain hosted mobile chat sessions explicitly skip it.  Starting every
-    # configured MCP server in the dashboard parent defeats that per-session
-    # policy and can leave dozens of HTTP handshakes/processes competing with
-    # the first model request.  Keep an opt-in escape hatch for deployments
-    # that deliberately require eager dashboard-wide discovery.
-    if os.environ.get("HERMES_DASHBOARD_EAGER_MCP") == "1":
-        try:
-            from hermes_cli.mcp_startup import start_background_mcp_discovery
+    # Desktop chat uses the dashboard's in-process /api/ws gateway, which builds
+    # agents via tui_gateway.server._make_agent.  That path only snapshots the
+    # tool registry — it never starts MCP discovery (the stdio TUI does that in
+    # tui_gateway/entry.py, which the dashboard process doesn't run).  Without
+    # this, a profile's configured MCP servers never connect, so desktop
+    # sessions show no MCP tools.  Spawn discovery in the background here so a
+    # slow/dead server can't block dashboard startup.
+    try:
+        from hermes_cli.mcp_startup import start_background_mcp_discovery
 
-            start_background_mcp_discovery(
-                logger=logger,
-                thread_name="dashboard-mcp-discovery",
-            )
-        except Exception:
-            logger.debug(
-                "Background MCP tool discovery failed at dashboard startup",
-                exc_info=True,
-            )
+        start_background_mcp_discovery(
+            logger=logger,
+            thread_name="dashboard-mcp-discovery",
+        )
+    except Exception:
+        logger.debug(
+            "Background MCP tool discovery failed at dashboard startup",
+            exc_info=True,
+        )
 
     from hermes_cli.web_server import start_server
 

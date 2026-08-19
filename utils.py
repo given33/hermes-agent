@@ -7,11 +7,9 @@ import os
 import shutil
 import stat
 import tempfile
-import threading
 import time
-from contextlib import contextmanager
 from pathlib import Path
-from typing import Any, Iterator, Union
+from typing import Any, Union
 from urllib.parse import urlparse
 
 import yaml
@@ -20,80 +18,6 @@ logger = logging.getLogger(__name__)
 
 
 TRUTHY_STRINGS = frozenset({"1", "true", "yes", "on"})
-
-_advisory_locks_guard = threading.Lock()
-_advisory_locks: dict[str, threading.Lock] = {}
-
-
-@contextmanager
-def advisory_file_lock(path: Union[str, Path], *, timeout: float = 30.0) -> Iterator[None]:
-    """Hold a cross-process advisory lock for a short file transaction.
-
-    A process-local lock is paired with ``fcntl.flock``/``msvcrt.locking`` so
-    threads and sibling processes serialize the same read-modify-write cycle.
-    The lock file is durable bookkeeping only; releasing the OS lock, rather
-    than deleting the file, is what hands ownership to the next caller.
-    """
-    lock_path = Path(path)
-    try:
-        lock_key = str(lock_path.resolve(strict=False))
-    except (OSError, RuntimeError, ValueError):
-        lock_key = str(lock_path.absolute())
-
-    with _advisory_locks_guard:
-        process_lock = _advisory_locks.setdefault(lock_key, threading.Lock())
-
-    wait_seconds = max(0.0, float(timeout))
-    if not process_lock.acquire(timeout=wait_seconds):
-        raise TimeoutError(f"Timed out waiting for file lock: {lock_path}")
-
-    handle = None
-    locked = False
-    try:
-        lock_path.parent.mkdir(parents=True, exist_ok=True)
-        handle = lock_path.open("a+b")
-        deadline = time.monotonic() + wait_seconds
-        while True:
-            try:
-                if os.name == "nt":
-                    import msvcrt
-
-                    handle.seek(0, os.SEEK_END)
-                    if handle.tell() == 0:
-                        handle.write(b" ")
-                        handle.flush()
-                    handle.seek(0)
-                    msvcrt.locking(handle.fileno(), msvcrt.LK_NBLCK, 1)
-                else:
-                    import fcntl
-
-                    fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
-                locked = True
-                break
-            except (BlockingIOError, OSError, PermissionError) as exc:
-                if time.monotonic() >= deadline:
-                    raise TimeoutError(
-                        f"Timed out waiting for file lock: {lock_path}"
-                    ) from exc
-                time.sleep(0.05)
-        yield
-    finally:
-        if handle is not None:
-            if locked:
-                try:
-                    if os.name == "nt":
-                        import msvcrt
-
-                        handle.seek(0)
-                        msvcrt.locking(handle.fileno(), msvcrt.LK_UNLCK, 1)
-                    else:
-                        import fcntl
-
-                        fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
-                except OSError:
-                    pass
-            handle.close()
-        process_lock.release()
 
 
 def is_truthy_value(value: Any, default: bool = False) -> bool:
@@ -419,44 +343,6 @@ def atomic_write_text(
         raise
 
 
-def write_secret_file(
-    path: Union[str, Path],
-    text: str,
-    *,
-    mode: int = 0o600,
-    encoding: str = "utf-8",
-) -> None:
-    """Atomically write text with restrictive permissions from creation."""
-    path = Path(path)
-    path.parent.mkdir(parents=True, exist_ok=True)
-
-    original_owner = _preserve_file_owner(path)
-    fd, tmp_path = tempfile.mkstemp(
-        dir=str(path.parent),
-        prefix=f".{path.stem}_",
-        suffix=".tmp",
-    )
-    try:
-        if hasattr(os, "fchmod"):
-            os.fchmod(fd, mode)
-        with os.fdopen(fd, "w", encoding=encoding) as handle:
-            handle.write(text)
-            handle.flush()
-            os.fsync(handle.fileno())
-        real_path = Path(atomic_replace(tmp_path, path))
-        _restore_file_owner(real_path, original_owner)
-        try:
-            os.chmod(real_path, mode)
-        except OSError:
-            pass
-    except BaseException:
-        try:
-            os.unlink(tmp_path)
-        except OSError:
-            pass
-        raise
-
-
 def atomic_json_write(
     path: Union[str, Path],
     data: Any,
@@ -592,7 +478,6 @@ def atomic_yaml_write(
     *,
     default_flow_style: bool = False,
     sort_keys: bool = False,
-    mode: int | None = None,
     extra_content: str | None = None,
     create_mode: "int | None" = None,
 ) -> None:
@@ -607,11 +492,6 @@ def atomic_yaml_write(
         data: YAML-serializable data to write.
         default_flow_style: YAML flow style (default False).
         sort_keys: Whether to sort dict keys (default False).
-        mode: Optional final permission mode. When set, the temp file is
-            created and replaced with this mode, avoiding chmod-after-write
-            TOCTOU exposure for secret-bearing files (matches
-            atomic_json_write). When None the target's existing mode is
-            preserved, as before.
         extra_content: Optional string to append after the YAML dump
             (e.g. commented-out sections for user reference).
         create_mode: Permission bits to apply when the target does not yet
@@ -621,7 +501,7 @@ def atomic_yaml_write(
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
 
-    original_mode = None if mode is not None else _preserve_file_mode(path)
+    original_mode = _preserve_file_mode(path)
     original_owner = _preserve_file_owner(path)
     if original_mode is None and create_mode is not None and not path.exists():
         original_mode = create_mode
@@ -632,11 +512,6 @@ def atomic_yaml_write(
         suffix=".tmp",
     )
     try:
-        if mode is not None and hasattr(os, "fchmod"):
-            # fchmod is Unix-only; Windows' os module has no fchmod. Skipping it
-            # here is safe — mkstemp already created the temp file as 0o600, and
-            # the post-replace os.chmod below applies the final mode durably.
-            os.fchmod(fd, mode)
         with os.fdopen(fd, "w", encoding="utf-8") as f:
             if original_mode is not None and hasattr(os, "fchmod"):
                 # Apply the mode to the temp fd BEFORE the replace so the
@@ -667,13 +542,7 @@ def atomic_yaml_write(
         real_path = atomic_replace(tmp_path, path)
         real_path_obj = Path(real_path)
         _restore_file_owner(real_path_obj, original_owner)
-        if mode is not None:
-            try:
-                os.chmod(real_path_obj, mode)
-            except OSError:
-                pass
-        else:
-            _restore_file_mode(real_path_obj, original_mode)
+        _restore_file_mode(real_path_obj, original_mode)
     except BaseException:
         # Match atomic_json_write: cleanup must also happen for process-level
         # interruptions before we re-raise them.

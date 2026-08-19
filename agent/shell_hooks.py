@@ -140,7 +140,6 @@ import logging
 import os
 import re
 import shlex
-import shutil
 import subprocess
 import sys
 import tempfile
@@ -181,53 +180,6 @@ _BLOCKING_EVENTS = frozenset({"pre_tool_call"})
 
 # Cap on stderr excerpt reused as a block message.
 _STDERR_MESSAGE_LIMIT = 400
-_BASH_SCRIPT_EXTENSIONS = frozenset({".sh", ".bash"})
-
-
-def _expand_explicit_home(value: str) -> str:
-    """Expand a leading ``~`` while respecting an explicit HOME on Windows."""
-    raw = str(value)
-    explicit_home = os.environ.get("HOME", "").strip()
-    if explicit_home and (raw == "~" or raw.startswith(("~/", "~\\"))):
-        return os.path.join(explicit_home, raw[2:])
-    return os.path.expanduser(raw)
-
-
-def _split_command(command: str) -> List[str]:
-    """Split an approved command without discarding Windows path separators."""
-    expanded = _expand_explicit_home(command)
-    if IS_WINDOWS and Path(expanded).is_file():
-        return [expanded]
-    # Canonical Windows-safe splitter (#78293): posix=True eats backslashes,
-    # posix=False keeps surrounding quotes, so one layer is stripped per token.
-    from hermes_cli._subprocess_compat import split_command_line
-
-    return split_command_line(expanded)
-
-
-def _windows_path_for_bash(path: str, bash_executable: str) -> str:
-    """Translate a native absolute path for WSL or Git-for-Windows Bash."""
-    parsed = Path(path)
-    if not parsed.drive:
-        return path
-    drive = parsed.drive[0].lower()
-    rest = parsed.as_posix()[3:].lstrip("/")
-    if "git" in bash_executable.lower():
-        return f"/{drive}/{rest}"
-    return f"/mnt/{drive}/{rest}"
-
-
-def _resolve_windows_script_argv(argv: List[str]) -> List[str]:
-    """Add an explicit interpreter for bare Bash scripts on Windows."""
-    if not IS_WINDOWS or not argv:
-        return argv
-    script = Path(argv[0])
-    if script.suffix.lower() not in _BASH_SCRIPT_EXTENSIONS or not script.is_file():
-        return argv
-    bash = shutil.which("bash")
-    if not bash:
-        return argv
-    return [bash, _windows_path_for_bash(str(script), bash), *argv[1:]]
 
 
 # (event, matcher, command) triples that have been wired to the plugin
@@ -597,14 +549,16 @@ def _spawn(spec: ShellHookSpec, stdin_json: str) -> Dict[str, Any]:
         "error": None,
     }
     try:
-        argv = _split_command(spec.command)
+        # Windows-safe: plain shlex.split eats backslashes in paths (#78293).
+        from hermes_cli._subprocess_compat import split_command_line
+
+        argv = split_command_line(os.path.expanduser(spec.command))
     except ValueError as exc:
         result["error"] = f"command {spec.command!r} cannot be parsed: {exc}"
         return result
     if not argv:
         result["error"] = "empty command"
         return result
-    argv = _resolve_windows_script_argv(argv)
 
     t0 = time.monotonic()
     # Spawn the hook in its own process group on POSIX (``process_group=0``,
@@ -1080,7 +1034,9 @@ def _command_script_path(command: str) -> str:
     common bare-path form.
     """
     try:
-        parts = _split_command(command)
+        from hermes_cli._subprocess_compat import split_command_line
+
+        parts = split_command_line(command)
     except ValueError:
         return command
     if not parts:
@@ -1144,7 +1100,7 @@ def script_mtime_iso(command: str) -> Optional[str]:
     if not path:
         return None
     try:
-        expanded = _expand_explicit_home(path)
+        expanded = os.path.expanduser(path)
         return datetime.fromtimestamp(
             os.path.getmtime(expanded), tz=timezone.utc,
         ).isoformat().replace("+00:00", "Z")
@@ -1163,11 +1119,13 @@ def script_is_executable(command: str) -> bool:
     path = _command_script_path(command)
     if not path:
         return False
-    expanded = _expand_explicit_home(path)
+    expanded = os.path.expanduser(path)
     if not os.path.isfile(expanded):
         return False
     try:
-        argv = _split_command(command)
+        from hermes_cli._subprocess_compat import split_command_line
+
+        argv = split_command_line(command)
     except ValueError:
         return False
     is_bare_invocation = bool(argv) and argv[0] == path

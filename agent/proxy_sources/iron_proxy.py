@@ -395,29 +395,6 @@ def _proxy_state_dir() -> Path:
     return d
 
 
-def _tighten_file_permissions(path: Path, mode: int, *, fd: int | None = None) -> None:
-    """Apply owner-only POSIX permissions where the host exposes them.
-
-    Windows does not implement ``os.fchmod`` and its ``st_mode`` bits do not
-    represent the ACL that controls access. The proxy has no upstream Windows
-    binary, so keep diagnostics functional without pretending chmod bits are
-    a Windows security policy.
-    """
-    if fd is not None and hasattr(os, "fchmod"):
-        os.fchmod(fd, mode)
-        return
-    try:
-        os.chmod(path, mode)
-    except OSError:
-        if os.name != "nt":
-            raise
-        logger.warning(
-            "POSIX permissions %s cannot be enforced for %s on Windows; "
-            "iron-proxy remains unsupported until a Windows ACL policy exists",
-            oct(mode), path,
-        )
-
-
 def _platform_binary_name() -> str:
     return "iron-proxy.exe" if platform.system() == "Windows" else "iron-proxy"
 
@@ -825,7 +802,6 @@ def ensure_ca_cert(*, force: bool = False) -> Tuple[Path, Path]:
             pass
         fd = os.open(str(key_staged), open_flags, 0o600)
         try:
-            _tighten_file_permissions(key_staged, 0o600, fd=fd)
             with os.fdopen(fd, "wb") as f:
                 f.write(key_bytes)
         except Exception:
@@ -890,10 +866,9 @@ def ensure_management_token(*, force: bool = False) -> str:
         0o600,
     )
     try:
-        _tighten_file_permissions(p, 0o600, fd=fd)
-    except OSError:
-        if os.name != "nt":
-            raise
+        os.fchmod(fd, 0o600)
+    except (OSError, AttributeError):
+        pass
     try:
         os.write(fd, token.encode("utf-8"))
     finally:
@@ -1370,7 +1345,7 @@ def ensure_audit_log(audit_path: Path) -> None:
         try:
             # Tighten perms even if the file already existed under a
             # slacker umask.
-            _tighten_file_permissions(audit_path, 0o600, fd=fd)
+            os.fchmod(fd, 0o600)
         finally:
             os.close(fd)
     except OSError as exc:
@@ -1870,7 +1845,7 @@ def start_proxy(
             "Remove that path manually and retry."
         ) from exc
     try:
-        _tighten_file_permissions(log_path, 0o600, fd=log_fd)
+        os.fchmod(log_fd, 0o600)  # tighten if file pre-existed
     except OSError:
         pass
     # Verify ownership — same st_uid check the pidfile uses.

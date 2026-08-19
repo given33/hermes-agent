@@ -34,17 +34,11 @@ from hermes_cli.dashboard_auth import list_session_providers
 # are doubled (``{{`` / ``}}``).
 _LOGIN_HTML_TEMPLATE = """\
 <!doctype html>
-<html lang="zh-CN">
+<html lang="en">
 <head>
 <meta charset="utf-8">
-<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
-<meta name="theme-color" content="#170d02">
-<meta name="apple-mobile-web-app-capable" content="yes">
-<meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
-<meta name="apple-mobile-web-app-title" content="Hermes Agent">
-<link rel="apple-touch-icon" sizes="180x180" href="/apple-touch-icon.png">
-<link rel="manifest" href="/manifest.webmanifest">
-<title>登录 — Hermes Agent</title>
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Sign in — Hermes Agent</title>
 <style>
   /* Brand fonts shipped by @nous-research/ui — same files the SPA loads. */
   @font-face {{
@@ -310,14 +304,14 @@ _LOGIN_HTML_TEMPLATE = """\
 <main>
   <div class="brand">Nous<span class="dot"></span>Research</div>
   <div class="card">
-    <h1>{page_heading}</h1>
-    <p class="subtitle">{page_subtitle}</p>
+    <h1>Sign in</h1>
+    <p class="subtitle">Choose a sign-in method to continue to the Hermes Agent dashboard.</p>
     <div class="provider-list">
 {provider_buttons}
     </div>
   </div>
   <footer>
-    <span class="sep"></span>公网访问 &middot; 需要身份验证<span class="sep"></span>
+    <span class="sep"></span>Public bind &middot; Auth required<span class="sep"></span>
   </footer>
 </main>
 {password_script}
@@ -327,11 +321,11 @@ _LOGIN_HTML_TEMPLATE = """\
 
 _EMPTY_HTML = """\
 <!doctype html>
-<html lang="zh-CN">
+<html lang="en">
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>暂时无法登录 — Hermes Agent</title>
+<title>Sign-in unavailable — Hermes Agent</title>
 <style>
   @font-face {
     font-family: 'Collapse';
@@ -395,10 +389,12 @@ _EMPTY_HTML = """\
 </head>
 <body>
 <main>
-<h1>暂时无法登录</h1>
-<p>此管理面板已开放到非本机地址，但尚未安装身份验证提供程序。</p>
-<p>请安装默认的 <code>plugins/dashboard-auth-nous</code> 或其他身份验证插件。
-不建议在公网环境使用 <code>--insecure</code> 绕过登录验证。</p>
+<h1>Sign-in unavailable</h1>
+<p>This dashboard is bound to a non-loopback host but no authentication
+providers are installed.</p>
+<p>Install <code>plugins/dashboard-auth-nous</code> (default) or another
+auth provider, or restart with <code>--insecure</code> to bypass the
+auth gate (not recommended on untrusted networks).</p>
 </main>
 </body>
 </html>
@@ -441,111 +437,19 @@ _PASSWORD_FORM_SCRIPT = """\
           });
         }
         var msg = resp.status === 429
-          ? '尝试次数过多，请稍后再试。'
-          : (resp.status === 401 ? '用户名或密码错误。'
-                                 : '登录失败，请重试。');
+          ? 'Too many attempts. Please wait and try again.'
+          : (resp.status === 401 ? 'Invalid username or password.'
+                                 : 'Sign-in failed. Please try again.');
         if (err) { err.textContent = msg; err.hidden = false; }
         if (btn) { btn.disabled = false; }
       }).catch(function () {
-        if (err) { err.textContent = '网络连接失败，请重试。'; err.hidden = false; }
+        if (err) { err.textContent = 'Network error. Please try again.'; err.hidden = false; }
         if (btn) { btn.disabled = false; }
       });
     });
   }
   var forms = document.querySelectorAll('form.provider-form');
   for (var i = 0; i < forms.length; i++) { handle(forms[i]); }
-})();
-</script>
-"""
-
-_OWNER_REGISTRATION_SCRIPT = """\
-<script>
-(function () {
-  var form = document.querySelector('form.owner-registration-form');
-  if (!form) { return; }
-  var sendCode = form.querySelector('button.send-code');
-  if (sendCode) {
-    sendCode.addEventListener('click', function () {
-      var err = form.querySelector('.form-error');
-      var email = (form.querySelector('input[name=email]') || {}).value || '';
-      if (err) { err.hidden = true; err.textContent = ''; }
-      sendCode.disabled = true;
-      fetch('/auth/mobile/registration-code', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ email: email }),
-        credentials: 'same-origin'
-      }).then(function (resp) {
-        if (!resp.ok) {
-          var message = resp.status === 429
-            ? '验证码发送过于频繁，请稍后再试。'
-            : '验证码发送失败，请检查 QQ 邮箱。';
-          throw new Error(message);
-        }
-        sendCode.textContent = '验证码已发送';
-        window.setTimeout(function () {
-          sendCode.disabled = false;
-          sendCode.textContent = '发送验证码';
-        }, 60000);
-      }).catch(function (error) {
-        if (err) { err.textContent = error.message || '验证码发送失败。'; err.hidden = false; }
-        sendCode.disabled = false;
-      });
-    });
-  }
-  form.addEventListener('submit', function (ev) {
-    ev.preventDefault();
-    var err = form.querySelector('.form-error');
-    var btn = form.querySelector('button[type=submit]');
-    var username = (form.querySelector('input[name=username]') || {}).value || '';
-    var password = (form.querySelector('input[name=password]') || {}).value || '';
-    var confirmation = (form.querySelector('input[name=confirmation]') || {}).value || '';
-    var email = (form.querySelector('input[name=email]') || {}).value || '';
-    var verificationCode = (form.querySelector('input[name=verification_code]') || {}).value || '';
-    var next = (form.querySelector('input[name=next]') || {}).value || '';
-    if (err) { err.hidden = true; err.textContent = ''; }
-    if (password !== confirmation) {
-      if (err) { err.textContent = '两次输入的密码不一致。'; err.hidden = false; }
-      return;
-    }
-    if (btn) { btn.disabled = true; }
-    fetch('/auth/mobile/register', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({
-        email: email,
-        verification_code: verificationCode,
-        username: username,
-        password: password
-      }),
-      credentials: 'same-origin'
-    }).then(function (resp) {
-      if (!resp.ok) {
-        var message = resp.status === 403
-          ? '验证码错误、已过期或注册暂未开放。'
-          : (resp.status === 409
-              ? '所有者账号已经存在。'
-              : '注册失败，请检查账号和密码。');
-        throw new Error(message);
-      }
-      return fetch('/auth/password-login', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          provider: 'basic', username: username, password: password, next: next
-        }),
-        credentials: 'same-origin'
-      });
-    }).then(function (resp) {
-      if (!resp.ok) { throw new Error('账号已创建，但登录失败，请重新登录。'); }
-      return resp.json();
-    }).then(function (data) {
-      window.location.assign((data && data.next) || '/');
-    }).catch(function (error) {
-      if (err) { err.textContent = error.message || '注册失败，请重试。'; err.hidden = false; }
-      if (btn) { btn.disabled = false; }
-    });
-  });
 })();
 </script>
 """
@@ -563,15 +467,6 @@ def render_login_html(*, next_path: str = "") -> str:
     """
     providers = list_session_providers()
     if not providers:
-        from hermes_cli.dashboard_auth.owner_mobile import owner_registration_open
-
-        if owner_registration_open():
-            return _LOGIN_HTML_TEMPLATE.format(
-                page_heading="注册",
-                page_subtitle="创建此 Hermes 服务器的所有者账号。",
-                provider_buttons=_render_owner_registration_form(next_path),
-                password_script=_OWNER_REGISTRATION_SCRIPT,
-            )
         return _EMPTY_HTML
 
     if next_path:
@@ -594,56 +489,12 @@ def render_login_html(*, next_path: str = "") -> str:
             buttons.append(
                 f'      <a class="provider-btn" '
                 f'href="/auth/login?provider={html.escape(p.name, quote=True)}{next_qs}">'
-                f'使用 {html.escape(p.display_name)} 登录</a>'
+                f'Sign in with {html.escape(p.display_name)}</a>'
             )
     script = _PASSWORD_FORM_SCRIPT if needs_password_script else ""
     return _LOGIN_HTML_TEMPLATE.format(
-        page_heading="登录",
-        page_subtitle="登录后继续使用 Hermes Agent 管理面板。",
         provider_buttons="\n".join(buttons),
         password_script=script,
-    )
-
-
-def _render_owner_registration_form(
-    next_path: str,
-) -> str:
-    safe_next = html.escape(next_path, quote=True) if next_path else ""
-    return (
-        '      <form class="provider-form owner-registration-form" autocomplete="on">\n'
-        f'        <input type="hidden" name="next" value="{safe_next}">\n'
-        '        <label class="field">\n'
-        '          <span class="field-label">QQ 邮箱</span>\n'
-        '          <input class="field-input" type="email" name="email" '
-        'autocomplete="email" autocapitalize="none" autocorrect="off" '
-        'spellcheck="false" required>\n'
-        '        </label>\n'
-        '        <label class="field">\n'
-        '          <span class="field-label">邮箱验证码</span>\n'
-        '          <input class="field-input" type="text" name="verification_code" '
-        'autocomplete="one-time-code" inputmode="numeric" pattern="[0-9]{6}" '
-        'maxlength="6" required>\n'
-        '        </label>\n'
-        '        <button class="provider-btn send-code" type="button">发送验证码</button>\n'
-        '        <label class="field">\n'
-        '          <span class="field-label">账号</span>\n'
-        '          <input class="field-input" type="text" name="username" '
-        'autocomplete="username" autocapitalize="none" autocorrect="off" '
-        'spellcheck="false" required>\n'
-        '        </label>\n'
-        '        <label class="field">\n'
-        '          <span class="field-label">密码</span>\n'
-        '          <input class="field-input" type="password" name="password" '
-        'autocomplete="new-password" minlength="8" required>\n'
-        '        </label>\n'
-        '        <label class="field">\n'
-        '          <span class="field-label">确认密码</span>\n'
-        '          <input class="field-input" type="password" name="confirmation" '
-        'autocomplete="new-password" minlength="8" required>\n'
-        '        </label>\n'
-        '        <div class="form-error" role="alert" hidden></div>\n'
-        '        <button class="provider-btn" type="submit">注册并登录</button>\n'
-        '      </form>'
     )
 
 
@@ -664,20 +515,20 @@ def _render_password_form(provider, next_path: str) -> str:
     return (
         f'      <form class="provider-form" data-provider="{pname}" '
         f'autocomplete="on">\n'
-        f'        <div class="form-title">使用 {plabel} 登录</div>\n'
+        f'        <div class="form-title">Sign in with {plabel}</div>\n'
         f'        <input type="hidden" name="next" value="{safe_next}">\n'
         f'        <label class="field">\n'
-        f'          <span class="field-label">用户名</span>\n'
+        f'          <span class="field-label">Username</span>\n'
         f'          <input class="field-input" type="text" name="username" '
         f'autocomplete="username" autocapitalize="none" '
         f'autocorrect="off" spellcheck="false" required>\n'
         f'        </label>\n'
         f'        <label class="field">\n'
-        f'          <span class="field-label">密码</span>\n'
+        f'          <span class="field-label">Password</span>\n'
         f'          <input class="field-input" type="password" name="password" '
         f'autocomplete="current-password" required>\n'
         f'        </label>\n'
         f'        <div class="form-error" role="alert" hidden></div>\n'
-        f'        <button class="provider-btn" type="submit">登录</button>\n'
+        f'        <button class="provider-btn" type="submit">Sign in</button>\n'
         f'      </form>'
     )

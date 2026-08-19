@@ -41,7 +41,6 @@ from gateway.platforms.base import (
     cache_audio_from_bytes,
     cache_document_from_bytes,
     cache_image_from_url,
-    local_path_from_file_uri,
 )
 from gateway.platforms.helpers import redact_phone
 from gateway.platforms.media_cache import DEFAULT_EXT_TO_MIME, mime_for_ext
@@ -1207,7 +1206,7 @@ class SignalAdapter(BasePlatformAdapter):
         skipped_oversize = 0
         for image_url, _alt_text in images:
             if image_url.startswith("file://"):
-                file_path = local_path_from_file_uri(image_url)
+                file_path = unquote(image_url[7:])
             else:
                 try:
                     file_path = await cache_image_from_url(image_url)
@@ -1377,7 +1376,7 @@ class SignalAdapter(BasePlatformAdapter):
 
         # Resolve image to local path
         if image_url.startswith("file://"):
-            file_path = local_path_from_file_uri(image_url)
+            file_path = unquote(image_url[7:])
         else:
             # Download remote image to cache
             try:

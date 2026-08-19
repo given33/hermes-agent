@@ -62,27 +62,6 @@ class CustomEndpointUpdate(BaseModel):
     models: Optional[List[str]] = None
 
 
-class CustomModelConnectionTest(BaseModel):
-    base_url: str
-    api_key: str = ""
-    model: str
-    api_mode: str = "chat_completions"
-    profile: Optional[str] = None
-
-
-class CustomModelDiscoveryRequest(BaseModel):
-    base_url: str
-    api_key: str = ""
-    profile: Optional[str] = None
-
-
-class CustomModelConfiguration(CustomModelConnectionTest):
-    context_length: int = 0
-    reasoning_effort: str = "medium"
-    # Empty preserves compatibility with clients that only send a masked key.
-    api_key_action: str = ""
-
-
 class MessagingPlatformUpdate(BaseModel):
     enabled: Optional[bool] = None
     env: Dict[str, str] = {}
@@ -165,9 +144,6 @@ class ModelAssignment(BaseModel):
     # endpoint that requires auth works from the GUI. Mirrors the key the
     # ``hermes model`` custom flow collects.
     api_key: str = ""
-    api_mode: str = ""
-    context_length: int = 0
-    reasoning_effort: str = ""
     confirm_expensive_model: bool = False
     profile: Optional[str] = None
 
@@ -635,11 +611,6 @@ class ProfileImport(BaseModel):
 
 
 class ProfileSoulUpdate(BaseModel):
-    content: str
-
-
-class StudioMemoryUpdate(BaseModel):
-    section: str
     content: str
 
 

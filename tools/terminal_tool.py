@@ -276,12 +276,6 @@ def _get_approval_callback():
     return getattr(_callback_tls, "approval", None)
 
 
-def get_approval_callback():
-    """Return the current thread's approval callback for tool adapters."""
-
-    return _get_approval_callback()
-
-
 def set_sudo_password_callback(cb):
     """Register a callback for sudo password prompts (used by CLI).
 
@@ -304,7 +298,7 @@ def set_approval_callback(cb):
 def _get_sudo_password_cache_scope() -> str:
     """Return the cache scope for interactive sudo passwords."""
     try:
-        from hermes_runtime.session_context import get_session_env
+        from gateway.session_context import get_session_env
 
         session_key = get_session_env("HERMES_SESSION_KEY", "")
     except Exception:
@@ -1081,17 +1075,7 @@ import sys
 
 
 # Tool description for LLM
-#
-# Backend-neutral on purpose: every backend runs commands through POSIX bash —
-# _find_bash() resolves git-bash on Windows-local hosts and system bash on
-# macOS/Linux, and the remote backends (docker/modal/ssh/...) are Linux — but
-# the HOST OS varies, and the system prompt's environment-hints block already
-# names it precisely ("Host: Windows (...)", "Terminal backend: docker...",
-# plus _WINDOWS_BASH_SHELL_HINT). Claiming "a Linux environment" here
-# contradicted those hints on Windows/macOS local backends and steered models
-# toward Linux-only commands (apt-get, /proc) the host can't run. Say "POSIX
-# bash" — true everywhere — and let the environment hints carry the OS facts.
-TERMINAL_TOOL_DESCRIPTION = """Execute shell commands in a persistent POSIX bash shell. Filesystem, current working directory, and exported environment variables persist between calls.
+TERMINAL_TOOL_DESCRIPTION = """Execute shell commands on a Linux environment. Filesystem, current working directory, and exported environment variables persist between calls.
 
 Do NOT use cat/head/tail (use read_file), grep/rg/find/ls (use search_files), sed/awk (use patch), or echo/heredoc file creation (use write_file). Reserve terminal for: builds, installs, git, processes, scripts, network, package managers, and anything that needs a shell.
 NEVER pipe a build/test command through tail/head/cat to shorten output (e.g. `cargo build | tail -20`): output is auto-truncated with the full text saved to a file, and the pipe makes exit_code report the LAST pipeline command's status (tail's 0), masking real failures. Run the command bare; the same applies to `cmd || echo failed`, which also masks the exit code.
@@ -2028,11 +2012,7 @@ def _cleanup_thread_worker():
     while _cleanup_running:
         try:
             config = _get_env_config()
-            # Test doubles and older config readers may omit the optional
-            # lifetime field.  The cleanup worker must remain self-healing;
-            # one incomplete config snapshot must not produce a permanent
-            # warning loop or prevent stale environments from being reaped.
-            _cleanup_inactive_envs(config.get("lifetime_seconds", 300))
+            _cleanup_inactive_envs(config["lifetime_seconds"])
         except Exception as e:
             logger.warning("Error in cleanup thread: %s", e, exc_info=True)
 
@@ -3068,18 +3048,6 @@ def terminal_tool(
                 desc = approval.get("description", "flagged as dangerous")
                 approval_note = f"Command was flagged ({desc}) and auto-approved by smart approval."
 
-        # High-risk backup: commands run with full access by default, so
-        # snapshot destructive targets BEFORE execution — the user can
-        # recover later without an approval round-trip. Local sessions only
-        # (the paths resolve on this machine); best-effort, never blocks.
-        risk_backup = None
-        if env_type == "local":
-            try:
-                from tools.risk_backup import backup_risky_command
-                risk_backup = backup_risky_command(command, guard_cwd)
-            except Exception:
-                logger.exception("pre-exec risk backup failed")
-
         # Prepare command for execution
         pty_disabled_reason = None
         effective_pty = pty
@@ -3136,8 +3104,6 @@ def terminal_tool(
                 # cannot occur here and this note never co-occurs with rc=130.
                 if approval_note:
                     result_data["approval"] = approval_note
-                if risk_backup:
-                    result_data["risk_backup"] = risk_backup
                 if pty_disabled_reason:
                     result_data["pty_note"] = pty_disabled_reason
 
@@ -3250,7 +3216,7 @@ def terminal_tool(
                 # watch-pattern and completion notifications can be
                 # routed back to the correct chat/thread.
                 if background and (notify_on_complete or watch_patterns):
-                    from hermes_runtime.session_context import (
+                    from gateway.session_context import (
                         async_delivery_supported as _async_ok,
                         get_session_env as _gse,
                     )
@@ -3640,8 +3606,6 @@ def terminal_tool(
                     result_dict["approval"] = approval_note.rstrip(".") + ", then interrupted."
                 else:
                     result_dict["approval"] = approval_note
-            if risk_backup:
-                result_dict["risk_backup"] = risk_backup
             if exit_note:
                 result_dict["exit_code_meaning"] = exit_note
             if failure_hint:
@@ -3905,10 +3869,7 @@ TERMINAL_SCHEMA = {
         "properties": {
             "command": {
                 "type": "string",
-                # "on the VM" predated the multi-backend split — local
-                # backends run on the host, not a VM. Keep it neutral; the
-                # tool description + environment hints name the real target.
-                "description": "The shell command to execute"
+                "description": "The command to execute on the VM"
             },
             "background": {
                 "type": "boolean",

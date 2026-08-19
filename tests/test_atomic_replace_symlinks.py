@@ -224,7 +224,6 @@ def test_atomic_replace_broken_symlink_creates_target(tmp_path: Path) -> None:
 
 
 
-@pytest.mark.require_symlinks
 def test_atomic_replace_copy_fallback_preserves_symlink(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

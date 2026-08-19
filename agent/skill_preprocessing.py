@@ -98,14 +98,6 @@ def run_inline_shell(command: str, cwd: Path | None, timeout: int) -> str:
     output = (completed.stdout or "").rstrip("\n")
     if not output and completed.stderr:
         output = completed.stderr.rstrip("\n")
-    if IS_WINDOWS and cwd and output:
-        native_cwd = Path(cwd).resolve()
-        drive = native_cwd.drive[:1].lower()
-        if drive:
-            rest = native_cwd.as_posix()[3:].lstrip("/")
-            bash_cwd = f"/mnt/{drive}/{rest}".rstrip("/")
-            if output.rstrip("/") == bash_cwd:
-                output = str(native_cwd)
     if len(output) > _INLINE_SHELL_MAX_OUTPUT:
         output = output[:_INLINE_SHELL_MAX_OUTPUT] + "...[truncated]"
     return output

@@ -190,6 +190,7 @@ const BUILTIN_NAV_REST: NavItem[] = [
     label: "Sessions",
     icon: MessageSquare,
   },
+  { path: "/files", label: "Files", icon: FolderOpen },
   {
     path: "/analytics",
     labelKey: "analytics",
@@ -207,13 +208,13 @@ const BUILTIN_NAV_REST: NavItem[] = [
   { path: "/skills", labelKey: "skills", label: "Skills", icon: Package },
   { path: "/plugins", labelKey: "plugins", label: "Plugins", icon: Puzzle },
   { path: "/mcp", label: "MCP", icon: Plug },
-  { path: "/channels", labelKey: "channels", label: "Channels", icon: Radio },
-  { path: "/webhooks", labelKey: "webhooks", label: "Webhooks", icon: Webhook },
-  { path: "/pairing", labelKey: "pairing", label: "Pairing", icon: ShieldCheck },
+  { path: "/channels", label: "Channels", icon: Radio },
+  { path: "/webhooks", label: "Webhooks", icon: Webhook },
+  { path: "/pairing", label: "Pairing", icon: ShieldCheck },
   { path: "/profiles", labelKey: "profiles", label: "Profiles", icon: Users },
   { path: "/config", labelKey: "config", label: "Config", icon: Settings },
   { path: "/env", labelKey: "keys", label: "Keys", icon: KeyRound },
-  { path: "/system", labelKey: "system", label: "System", icon: Wrench },
+  { path: "/system", label: "System", icon: Wrench },
   {
     path: "/docs",
     labelKey: "documentation",
@@ -508,29 +509,11 @@ export default function App() {
     return () => mql.removeEventListener("change", onChange);
   }, []);
 
-  useEffect(() => {
-    const openUnifiedNavigation = () => setMobileOpen(true);
-    window.addEventListener(
-      "hermes:open-navigation",
-      openUnifiedNavigation,
-    );
-    return () => {
-      window.removeEventListener(
-        "hermes:open-navigation",
-        openUnifiedNavigation,
-      );
-    };
-  }, []);
-
   return (
     <ProfileProvider>
     <div
       data-layout-variant={layoutVariant}
-      className="flex min-h-0 flex-col overflow-hidden bg-background-base text-text-primary antialiased"
-      style={{
-        height: "var(--hermes-viewport-height, 100dvh)",
-        maxHeight: "var(--hermes-viewport-height, 100dvh)",
-      }}
+      className="flex h-dvh max-h-dvh min-h-0 flex-col overflow-hidden bg-background-base text-text-primary antialiased"
     >
       <SelectionSwitcher />
 
@@ -544,7 +527,7 @@ export default function App() {
       <header
         className={cn(
           "lg:hidden fixed top-0 left-0 right-0 z-40 min-h-14",
-          "flex items-center gap-2 px-4 pb-2 pt-[calc(0.5rem+env(safe-area-inset-top,0px))]",
+          "flex items-center gap-2 px-4 py-2",
           "border-b border-current/20",
           "bg-background-base",
         )}
@@ -592,12 +575,13 @@ export default function App() {
       <ProfileScopeBanner />
       <MemoryPressureBanner status={sidebarStatus} />
 
-      <div className="flex min-h-0 min-w-0 flex-1 flex-col overflow-hidden pt-[calc(3.5rem+env(safe-area-inset-top,0px))] lg:pt-0">        <div className="flex min-h-0 min-w-0 flex-1">
+      <div className="flex min-h-0 min-w-0 flex-1 flex-col overflow-hidden">
+        <div className="flex min-h-0 min-w-0 flex-1">
           <aside
             id="app-sidebar"
             aria-label={t.app.navigation}
             className={cn(
-              "fixed top-0 left-0 z-50 flex h-dvh max-h-dvh w-64 min-h-0 flex-col pb-[env(safe-area-inset-bottom,0px)] pt-[env(safe-area-inset-top,0px)] font-sans",
+              "fixed top-0 left-0 z-50 flex h-dvh max-h-dvh w-64 min-h-0 flex-col font-sans",
               "border-r border-current/20",
               "bg-background-base",
               "transition-[transform] duration-200 ease-[cubic-bezier(0.23,1,0.32,1)]",
@@ -772,9 +756,6 @@ export default function App() {
               className={cn(
                 "relative z-2 flex min-w-0 min-h-0 flex-1 flex-col",
                 "px-3 sm:px-6",
-                isChatRoute
-                  ? "overflow-hidden"
-                  : "overflow-y-auto overflow-x-hidden overscroll-contain",
                 isChatRoute
                   ? "pb-0 pt-1 sm:pt-2 lg:pt-4"
                   : "pt-2 sm:pt-4 lg:pt-6",

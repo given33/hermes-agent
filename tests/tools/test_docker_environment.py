@@ -301,14 +301,8 @@ def test_wrapped_exec_scopes_explicit_forward_env_across_profiles(monkeypatch, t
 
     env = _make_execute_only_env(forward_env=["EXPLICIT_TOKEN"])
     env.cwd = str(tmp_path)
-    # The generated script runs in a real local Git Bash: hand it the MSYS
-    # form so the atomic-write temp snapshot lands beside the real file
-    # instead of a mangled name in the repo root. Python-side reads below
-    # keep using the pytest tmp_path directly.
-    from tools.environments.local import _bash_safe_path
-
-    env._snapshot_path = _bash_safe_path(str(tmp_path / "snapshot.sh"))
-    env._cwd_file = _bash_safe_path(str(tmp_path / "cwd.txt"))
+    env._snapshot_path = str(tmp_path / "snapshot.sh")
+    env._cwd_file = str(tmp_path / "cwd.txt")
     env._snapshot_passthrough_names = set()
     (tmp_path / "snapshot.sh").write_text(
         "export EXPLICIT_TOKEN=stale-from-previous-profile\n",
@@ -328,10 +322,8 @@ def test_wrapped_exec_scopes_explicit_forward_env_across_profiles(monkeypatch, t
             child_env[key] = value
             index += 2
         assert cmd[container_index + 1 : container_index + 3] == ["bash", "-c"]
-        from tools.environments.local import _find_bash
-
         return subprocess.Popen(
-            [_find_bash() or "bash", "-c", cmd[container_index + 3]],
+            ["bash", "-c", cmd[container_index + 3]],
             stdout=subprocess.PIPE,
             stderr=subprocess.STDOUT,
             stdin=subprocess.PIPE if stdin_data is not None else subprocess.DEVNULL,

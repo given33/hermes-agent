@@ -43,7 +43,6 @@ import functools
 import json
 import logging
 import os
-import posixpath
 import re
 import shutil
 import subprocess
@@ -569,7 +568,7 @@ def _wsl_windows_path_to_posix(path: str) -> str:
     drive = (win.drive or "").rstrip(":").lower()
     if not drive:
         return path
-    return posixpath.join("/mnt", drive, *(str(part) for part in win.parts[1:]))
+    return os.path.join("/mnt", drive, *(str(part) for part in win.parts[1:]))
 
 
 class _EmbeddedCuaDaemon:

@@ -202,7 +202,7 @@ class BasicAuthProvider(DashboardAuthProvider):
     """Username/password provider with stateless HMAC-signed sessions."""
 
     name = "basic"
-    display_name = "账号与密码"
+    display_name = "Username & Password"
     supports_password = True
 
     def __init__(
@@ -244,8 +244,6 @@ class BasicAuthProvider(DashboardAuthProvider):
     def complete_password_login(
         self, *, username: str, password: str
     ) -> Session:
-        if self._account_deleted():
-            raise InvalidCredentialsError("invalid username or password")
         # Constant-time-ish: always run a scrypt verify (against the real
         # hash if the username matches, else a dummy hash) so an unknown
         # username and a wrong password take comparable time. Compare the
@@ -263,8 +261,6 @@ class BasicAuthProvider(DashboardAuthProvider):
     # ---- session lifecycle -------------------------------------------------
 
     def verify_session(self, *, access_token: str) -> Optional[Session]:
-        if self._account_deleted():
-            return None
         payload = _unsign(access_token, self._secret)
         if (
             payload is None
@@ -275,8 +271,6 @@ class BasicAuthProvider(DashboardAuthProvider):
         return self._session_from_payload(access_token, "", payload)
 
     def refresh_session(self, *, refresh_token: str) -> Session:
-        if self._account_deleted():
-            raise RefreshExpiredError("refresh token expired or invalid")
         if not refresh_token:
             raise RefreshExpiredError("no refresh token present in session")
         payload = _unsign(refresh_token, self._secret)
@@ -293,16 +287,6 @@ class BasicAuthProvider(DashboardAuthProvider):
         # expires within its TTL. Best-effort no-op, must not raise.
         _ = refresh_token
         return None
-
-    def _account_deleted(self) -> bool:
-        try:
-            from hermes_cli.dashboard_auth.mobile_device_store import MobileDeviceStore
-
-            return MobileDeviceStore().account_deletion_status(self._username) is not None
-        except Exception:
-            # Authentication fails closed while the durable account boundary
-            # cannot be checked.
-            return True
 
     # ---- internals ---------------------------------------------------------
 
@@ -355,7 +339,7 @@ def _load_config_basic_auth_section() -> dict:
     not being a dict — every shape falls through to ``{}``.
     """
     try:
-        from hermes_runtime.config import cfg_get, load_config
+        from hermes_cli.config import cfg_get, load_config
 
         cfg = load_config()
     except Exception as exc:  # noqa: BLE001 — broad catch is intentional
@@ -420,9 +404,6 @@ def register(ctx) -> None:
     LAST_SKIP_REASON = ""
 
     section = _load_config_basic_auth_section()
-    if section.get("disabled") is True:
-        LAST_SKIP_REASON = "dashboard.basic_auth is disabled"
-        return
     username = _resolve(
         "HERMES_DASHBOARD_BASIC_AUTH_USERNAME", section, "username"
     )

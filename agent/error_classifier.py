@@ -377,20 +377,6 @@ _MODEL_NOT_FOUND_PATTERNS = [
 ]
 
 
-def _is_model_unavailable_message(message: str) -> bool:
-    """Return True when an error explicitly rejects the requested model.
-
-    Most providers use 400/404 for this condition, but OpenCode Zen's Go
-    gateway has been observed returning HTTP 401 with ``Model <id> is not
-    supported``. The wording, not that non-standard status, is the reliable
-    recovery signal: switch model/provider without rotating a healthy key.
-    """
-    normalized = (message or "").lower()
-    if any(pattern in normalized for pattern in _MODEL_NOT_FOUND_PATTERNS):
-        return True
-    return "model" in normalized and " is not supported" in normalized
-
-
 def _model_id_missing_known_prefix(model: str, provider: str) -> bool:
     """True when a bare model id is only known to the provider as ``vendor/id``.
 
@@ -1170,13 +1156,6 @@ def _classify_by_status(
     """Classify based on HTTP status code with message-aware refinement."""
 
     if status_code == 401:
-        if _is_model_unavailable_message(error_msg):
-            return result_fn(
-                FailoverReason.model_not_found,
-                retryable=False,
-                should_rotate_credential=False,
-                should_fallback=True,
-            )
         # Not retryable on its own — credential pool rotation and
         # provider-specific refresh (Codex, Anthropic, Nous) run before
         # the retryability check in run_agent.py.  If those succeed, the

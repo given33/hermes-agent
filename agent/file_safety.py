@@ -108,52 +108,6 @@ def get_safe_write_roots() -> set[str]:
     return roots
 
 
-def _fold(path: str) -> str:
-    """Fold a path for denylist comparison: case-insensitive, separator-normalised.
-
-    The denylist entries are built from lowercase literals (``.ssh``,
-    ``.aws``, ``.gnupg``, …) and were previously compared **case
-    sensitively** against ``os.path.realpath`` output. ``realpath`` does
-    not case-normalise, so on a case-insensitive filesystem the guard
-    could be walked straight past:
-
-        agent writes ~/.SSH/authorized_keys
-          → realpath yields "/Users/x/.SSH/authorized_keys"
-          → != "/Users/x/.ssh/authorized_keys", prefix doesn't match
-          → classified as ALLOWED
-          → the OS writes the real ~/.ssh/authorized_keys
-
-    which turns a prompt injection into a persistent SSH public key. The
-    same trick applies to ``.AWS/credentials``, ``.GNUPG/`` and friends.
-    macOS (APFS/HFS+) is case-insensitive by default; on Windows an
-    *existing* file is normalised by ``_getfinalpathname`` but a target
-    that does not exist yet is not.
-
-    Note ``os.path.normcase`` alone is NOT sufficient: it is a no-op on
-    POSIX, which is exactly where the macOS bypass lives. We therefore
-    also ``casefold``.
-
-    Folding unconditionally (rather than only on platforms detected as
-    case-insensitive) is deliberate. It can only ever deny *more*, the
-    extra denials are paths like ``~/.SSH/authorized_keys`` that nothing
-    legitimately writes, and it avoids depending on a platform guess that
-    is wrong for case-insensitive volumes mounted on Linux, network
-    shares, and bind-mounted Docker volumes on macOS.
-
-    Sibling precedent in this module: :func:`get_read_block_error` at the
-    project-``.env`` check already normalises with ``.lower()``. This
-    makes the two guards agree.
-    """
-    return os.path.normcase(path).casefold()
-
-
-def _is_within(resolved: str, prefix: str) -> bool:
-    """True if ``resolved`` is at or under directory ``prefix`` (folded)."""
-    folded_prefix = _fold(prefix)
-    folded = _fold(resolved)
-    return folded == folded_prefix.rstrip(os.sep) or folded.startswith(folded_prefix)
-
-
 def build_write_approval_paths(home: str) -> set[str]:
     """Return paths that require human APPROVAL to write, but are not
     hard-denied credentials.
@@ -176,29 +130,22 @@ def build_write_approval_paths(home: str) -> set[str]:
 
 
 def _classify_write_denial(path: str) -> Optional[str]:
-    """Classify why writes to ``path`` are blocked.
-
-    Returns ``'credential'``, ``'session_state'``, ``'safe_root'``, or
-    ``None`` when writes are allowed.
-    """
+    """Return ``'credential'``, ``'safe_root'``, or ``None`` if writes are allowed."""
     home = os.path.realpath(os.path.expanduser("~"))
     resolved = os.path.realpath(os.path.expanduser(str(path)))
-    folded = _fold(resolved)
 
     # Approval-gated paths (e.g. ~/.ssh/config) are NOT hard-denied here:
     # they are allowed at this layer so the interactive file tools can run
     # their approval prompt, and only blocked for non-interactive callers
     # via get_write_approval_error(). Checked before the credential deny so
     # the ``.ssh/`` directory prefix below doesn't swallow the config file.
-    # Comparison stays folded so a case-variant target (~/.SSH/config on a
-    # case-insensitive filesystem) cannot slip past the approval gate.
-    if folded in {_fold(p) for p in build_write_approval_paths(home)}:
+    if resolved in build_write_approval_paths(home):
         return None
 
-    if folded in {_fold(p) for p in build_write_denied_paths(home)}:
+    if resolved in build_write_denied_paths(home):
         return "credential"
     for prefix in build_write_denied_prefixes(home):
-        if folded.startswith(_fold(prefix)):
+        if resolved.startswith(prefix):
             return "credential"
 
     mcp_tokens_dir_name = "mcp-tokens"
@@ -217,22 +164,22 @@ def _classify_write_denial(path: str) -> Optional[str]:
         # generic file tools rewrite state.db or legacy JSON snapshots can
         # falsify conversation history and invalidate resume/compression state.
         try:
-            if folded == _fold(os.path.realpath(os.path.join(base_real, "state.db"))):
-                return "session_state"
+            if resolved == os.path.realpath(os.path.join(base_real, "state.db")):
+                return True
             sessions_real = os.path.realpath(os.path.join(base_real, "sessions"))
-            if _is_within(resolved, sessions_real + os.sep):
-                return "session_state"
+            if resolved == sessions_real or resolved.startswith(sessions_real + os.sep):
+                return True
         except Exception:
             pass
         try:
             mcp_real = os.path.realpath(os.path.join(base_real, mcp_tokens_dir_name))
-            if _is_within(resolved, mcp_real + os.sep):
+            if resolved == mcp_real or resolved.startswith(mcp_real + os.sep):
                 return "credential"
         except Exception:
             pass
         try:
             pairing_real = os.path.realpath(os.path.join(base_real, "pairing"))
-            if _is_within(resolved, pairing_real + os.sep):
+            if resolved == pairing_real or resolved.startswith(pairing_real + os.sep):
                 return "credential"
         except Exception:
             pass
@@ -241,7 +188,7 @@ def _classify_write_denial(path: str) -> Optional[str]:
     if safe_roots:
         allowed = False
         for safe_root in safe_roots:
-            if _is_within(resolved, safe_root + os.sep):
+            if resolved == safe_root or resolved.startswith(safe_root + os.sep):
                 allowed = True
                 break
         if not allowed:
@@ -265,17 +212,6 @@ def get_write_denied_error(path: str, *, verb: str = "Write") -> Optional[str]:
         return (
             f"{verb} denied: '{path}' is outside HERMES_WRITE_SAFE_ROOT "
             f"({roots_display}). Unset the variable or add this path's directory prefix."
-        )
-    if denial == "session_state":
-        # Previously these two branches returned the boolean ``True``,
-        # which is neither of the documented categories, so they fell
-        # through to the credential wording below and reported session
-        # transcripts as "a protected system/credential file". Blocking
-        # was always correct; only the reason was wrong.
-        return (
-            f"{verb} denied: '{path}' is Hermes session state "
-            "(transcripts / resume data) and is owned by the application. "
-            "Rewriting it would falsify conversation history."
         )
     return f"{verb} denied: '{path}' is a protected system/credential file."
 
@@ -406,11 +342,7 @@ def get_read_block_error(path: str) -> Optional[str]:
                 blocked = (hd / name).resolve()
             except Exception:
                 continue
-            # Folded compare for the same reason the write guard folds —
-            # ``resolve()`` does not case-normalise, so on a
-            # case-insensitive filesystem ``~/.hermes/AUTH.json`` reaches
-            # the same bytes while missing an exact-match denylist.
-            if _fold(str(resolved)) == _fold(str(blocked)):
+            if resolved == blocked:
                 return (
                     f"Access denied: {path} is a Hermes credential store "
                     "and cannot be read directly. Provider tools consume "
@@ -426,13 +358,15 @@ def get_read_block_error(path: str) -> Optional[str]:
             mcp_tokens = (hd / "mcp-tokens").resolve()
         except Exception:
             continue
-        if _fold(str(resolved)) == _fold(str(mcp_tokens)):
+        if resolved == mcp_tokens:
             return (
                 f"Access denied: {path} is the Hermes MCP token directory "
                 "and cannot be read directly. (Defense-in-depth — not a "
                 "security boundary; the terminal tool can still bypass.)"
             )
-        if not _is_within(str(resolved), str(mcp_tokens) + os.sep):
+        try:
+            resolved.relative_to(mcp_tokens)
+        except ValueError:
             continue
         return (
             f"Access denied: {path} is a Hermes MCP token file "
@@ -693,16 +627,8 @@ def classify_sandbox_mirror_target(path: str) -> Optional[dict]:
     if inner_idx is None:
         return None
 
-    # Keep the model-facing path fields platform-independent.  The absolute
-    # target path remains native for filesystem diagnostics, while these
-    # logical mirror paths are part of the warning contract and must be
-    # comparable on Windows and POSIX hosts.
-    mirror_root = Path(*parts[: inner_idx + 1]).as_posix()
-    inner_path = (
-        Path(*parts[inner_idx + 1 :]).as_posix()
-        if inner_idx + 1 < len(parts)
-        else ""
-    )
+    mirror_root = str(Path(*parts[: inner_idx + 1]))
+    inner_path = str(Path(*parts[inner_idx + 1 :])) if inner_idx + 1 < len(parts) else ""
 
     return {
         "target_path": str(target),

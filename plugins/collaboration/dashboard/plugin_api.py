@@ -7083,6 +7083,9 @@ def _persist_hosted_plan_snapshot(
                     "final_report": False,
                     "activities": [activity],
                     "completed_at": now,
+                    # Expose the todolist on the message metadata so the iOS
+                    # TodoListCard can render it (reads meta.manager_plan).
+                    "manager_plan": manager_plan if isinstance(manager_plan, dict) else None,
                 },
             )
         else:

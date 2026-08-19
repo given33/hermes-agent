@@ -13,9 +13,9 @@ How it fits the existing auth framework:
     single request. That is what this seam verifies.
 
   * A route opts in by registering its exact path via
-    :func:`register_token_route`. An API family may additionally accept an
-    admin bearer while preserving cookie auth via
-    :func:`register_optional_token_prefix`.
+    :func:`register_token_route`. Only registered paths are token-authable;
+    everything else is untouched, so this can never accidentally widen the
+    auth surface of an existing route.
 
   * :func:`token_auth_middleware` runs OUTERMOST (installed last in
     ``web_server.py``). For a token route it fully owns the auth decision:
@@ -48,20 +48,13 @@ from fastapi.responses import JSONResponse, Response
 from hermes_cli.dashboard_auth import list_token_providers
 from hermes_cli.dashboard_auth.audit import AuditEvent, audit_log
 from hermes_cli.dashboard_auth.base import ProviderError, TokenPrincipal
-from hermes_cli.dashboard_auth.client_ip import client_ip as _resolve_client_ip
 
 _log = logging.getLogger(__name__)
 
-# Exact paths that require non-interactive bearer-token auth, plus prefixes
-# that optionally accept an admin bearer and otherwise preserve cookie auth.
+# Exact paths that accept non-interactive bearer-token auth. A route registers
+# itself here at import/startup; the seam only acts on registered paths.
 _token_routes: set[str] = set()
-_optional_token_prefixes: set[str] = set()
-# Keep the legacy set public for test fixtures and plugins that only need the
-# default admin scope. A separate map lets narrowly-scoped service prefixes
-# coexist with the broad /api bearer prefix without granting extra access.
-_optional_token_scopes: dict[str, str] = {}
 _lock = threading.Lock()
-_OPTIONAL_PREFIX_SCOPE = "dashboard:admin"
 
 
 def register_token_route(path: str) -> None:
@@ -75,52 +68,10 @@ def register_token_route(path: str) -> None:
         _token_routes.add(path)
 
 
-def register_optional_token_prefix(
-    prefix: str,
-    *,
-    required_scope: str = _OPTIONAL_PREFIX_SCOPE,
-) -> None:
-    """Allow a bearer under ``prefix`` while preserving cookie auth.
-
-    The most specific matching prefix supplies the required scope. Existing
-    callers retain the dashboard-admin default; service plugins can register a
-    narrower scope for their own route subtree.
-    """
-    normalized = "/" + prefix.strip("/")
-    scope = str(required_scope or _OPTIONAL_PREFIX_SCOPE).strip()
-    with _lock:
-        _optional_token_prefixes.add(normalized)
-        _optional_token_scopes[normalized] = scope or _OPTIONAL_PREFIX_SCOPE
-
-
 def is_token_route(path: str) -> bool:
     """True if ``path`` was registered as token-authable (exact match)."""
     with _lock:
         return path in _token_routes
-
-
-def is_optional_token_path(path: str) -> bool:
-    """True when ``path`` is at or below a registered optional prefix."""
-    with _lock:
-        prefixes = tuple(_optional_token_prefixes)
-    return any(
-        path == prefix or path.startswith(f"{prefix}/")
-        for prefix in prefixes
-    )
-
-
-def optional_token_scope(path: str) -> str:
-    """Return the required scope for the longest matching optional prefix."""
-    with _lock:
-        matches = [
-            prefix
-            for prefix in _optional_token_prefixes
-            if path == prefix or path.startswith(f"{prefix}/")
-        ]
-        if not matches:
-            return _OPTIONAL_PREFIX_SCOPE
-        prefix = max(matches, key=len)
-        return _optional_token_scopes.get(prefix, _OPTIONAL_PREFIX_SCOPE)
 
 
 def clear_token_routes() -> None:
@@ -129,21 +80,11 @@ def clear_token_routes() -> None:
         _token_routes.clear()
 
 
-def clear_optional_token_prefixes() -> None:
-    """Test-only: drop all optional token prefixes."""
-    with _lock:
-        _optional_token_prefixes.clear()
-        _optional_token_scopes.clear()
-
-
 def _client_ip(request: Request) -> str:
-    """Resolve the client IP for audit records.
-
-    Shared trusted-proxy-aware resolver — a caller must not be able to
-    name itself in the audit trail by sending ``X-Forwarded-For``. See
-    :mod:`hermes_cli.dashboard_auth.client_ip`.
-    """
-    return _resolve_client_ip(request)
+    fwd = request.headers.get("x-forwarded-for", "")
+    if fwd:
+        return fwd.split(",")[0].strip()
+    return request.client.host if request.client else ""
 
 
 def extract_bearer_token(request: Request) -> str:
@@ -160,23 +101,10 @@ def extract_bearer_token(request: Request) -> str:
     return ""
 
 
-def _has_explicit_bearer_scheme(request: Request) -> bool:
-    """Detect a Bearer attempt even when the header has no usable token."""
-    auth = request.headers.get("authorization", "").lstrip()
-    if not auth:
-        return False
-    return auth.split(None, 1)[0].lower() == "bearer"
-
-
 def authenticate_token(
     request: Request,
-    *,
-    required_scope: Optional[str] = None,
 ) -> Tuple[Optional[TokenPrincipal], Optional[str]]:
     """Try every token provider against the request's bearer token.
-
-    When ``required_scope`` is set, a recognised principal without that scope
-    is skipped and cannot authorise the request.
 
     Returns ``(principal, unreachable_provider_name)``:
       * ``(TokenPrincipal, None)`` — a provider recognised and accepted the token.
@@ -191,7 +119,6 @@ def authenticate_token(
     if not token:
         return None, None
     unreachable: Optional[str] = None
-    recognised_without_scope = False
     for provider in list_token_providers():
         try:
             principal = provider.verify_token(token=token)
@@ -209,18 +136,39 @@ def authenticate_token(
                 provider.name, e,
             )
             continue
-        if principal is not None and (
-            required_scope is None or required_scope in principal.scopes
-        ):
-            return principal, None
         if principal is not None:
-            recognised_without_scope = True
-    return None, None if recognised_without_scope else unreachable
+            return principal, None
+    return None, unreachable
 
 
-def token_failure_response(request: Request, unreachable: Optional[str]) -> Response:
-    """Build the shared fail-closed response without exposing credentials."""
+async def token_auth_middleware(
+    request: Request,
+    call_next: Callable[[Request], Awaitable[Response]],
+) -> Response:
+    """Outermost auth seam for token-authable routes.
+
+    No-op pass-through for any path not registered via
+    :func:`register_token_route`. For a registered path, token auth is the
+    only accepted scheme:
+
+      * valid token  → attach principal + ``token_authenticated`` flag, pass through.
+      * unreachable  → 503 (provider backing store down; not "bad credentials").
+      * otherwise    → 401 unauthenticated.
+
+    Runs before the cookie/session gates (installed last in ``web_server.py``).
+    The cookie gates honour ``request.state.token_authenticated`` and skip
+    enforcement, so a token-authed request is never redirected to ``/login``.
+    """
     path = request.url.path
+    if not is_token_route(path):
+        return await call_next(request)
+
+    principal, unreachable = authenticate_token(request)
+    if principal is not None:
+        request.state.token_principal = principal
+        request.state.token_authenticated = True
+        return await call_next(request)
+
     if unreachable:
         audit_log(
             AuditEvent.TOKEN_AUTH_FAILURE,
@@ -244,68 +192,3 @@ def token_failure_response(request: Request, unreachable: Optional[str]) -> Resp
         {"error": "unauthenticated", "detail": "Unauthorized"},
         status_code=401,
     )
-
-
-async def token_auth_middleware(
-    request: Request,
-    call_next: Callable[[Request], Awaitable[Response]],
-) -> Response:
-    """Outermost auth seam for token-authable routes.
-
-    No-op pass-through for paths outside the exact-route and optional-prefix
-    registries. Exact routes remain token-only. Optional prefixes accept an
-    admin bearer, but delegate to the existing cookie gate when no Bearer was
-    attempted:
-
-      * valid token  → attach principal + ``token_authenticated`` flag, pass through.
-      * unreachable  → 503 (provider backing store down; not "bad credentials").
-      * otherwise    → 401 unauthenticated.
-
-    Runs before the cookie/session gates (installed last in ``web_server.py``).
-    The cookie gates honour ``request.state.token_authenticated`` and skip
-    enforcement, so a token-authed request is never redirected to ``/login``.
-    """
-    path = request.url.path
-    exact_route = is_token_route(path)
-    optional_prefix = is_optional_token_path(path)
-    if not exact_route and not optional_prefix:
-        return await call_next(request)
-
-    if optional_prefix and not exact_route and not extract_bearer_token(request):
-        if _has_explicit_bearer_scheme(request):
-            return token_failure_response(request, None)
-        return await call_next(request)
-
-    principal, unreachable = authenticate_token(
-        request,
-        required_scope=None if exact_route else optional_token_scope(path),
-    )
-    if principal is not None:
-        request.state.token_principal = principal
-        request.state.token_authenticated = True
-        return await call_next(request)
-
-    # Optional API-key authentication shares /api with the official dashboard
-    # session bearer flow.  A native access token is intentionally unknown to
-    # token providers, so on a gated bind the session middleware must get the
-    # opportunity to verify it.  Exact token routes remain fail-closed, and a
-    # provider outage remains a 503 rather than being hidden by the fallback.
-    if optional_prefix and not exact_route and unreachable is None:
-        if getattr(request.app.state, "auth_required", False):
-            # The same Authorization header may carry an RFC 8252 native
-            # dashboard session instead of a mobile API key. Verify that
-            # identity explicitly before passing through; this preserves the
-            # fail-closed rule even on otherwise-public API endpoints.
-            from hermes_cli.dashboard_auth.middleware import _verify_bearer
-
-            bearer = extract_bearer_token(request)
-            try:
-                session = _verify_bearer(request, access_token=bearer)
-            except ProviderError as exc:
-                return token_failure_response(request, str(exc))
-            if session is not None:
-                request.state.session = session
-                request.state.session_bearer_authenticated = True
-                return await call_next(request)
-
-    return token_failure_response(request, unreachable)

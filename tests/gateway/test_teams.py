@@ -170,44 +170,7 @@ _teams_mod = load_plugin_adapter("teams")
 
 _teams_mod.AIOHTTP_AVAILABLE = True
 # SDK import is deferred (#62935); bind mocked symbols the same way connect() does.
-_teams_mod.App = sys.modules["microsoft_teams.apps"].App
-_teams_mod.ActivityContext = sys.modules["microsoft_teams.apps"].ActivityContext
-_teams_mod.ClientOptions = sys.modules["microsoft_teams.common.http.client"].ClientOptions
-_teams_mod.MessageActivity = sys.modules["microsoft_teams.api"].MessageActivity
-_teams_mod.ConversationReference = sys.modules["microsoft_teams.api"].ConversationReference
-_teams_mod.TypingActivityInput = sys.modules[
-    "microsoft_teams.api.activities.typing"
-].TypingActivityInput
-_teams_mod.AdaptiveCardInvokeActivity = sys.modules[
-    "microsoft_teams.api.activities.invoke.adaptive_card"
-].AdaptiveCardInvokeActivity
-_teams_mod.AdaptiveCardActionCardResponse = sys.modules[
-    "microsoft_teams.api.models.adaptive_card"
-].AdaptiveCardActionCardResponse
-_teams_mod.AdaptiveCardActionMessageResponse = sys.modules[
-    "microsoft_teams.api.models.adaptive_card"
-].AdaptiveCardActionMessageResponse
-_teams_mod.InvokeResponse = sys.modules[
-    "microsoft_teams.api.models.invoke_response"
-].InvokeResponse
-_teams_mod.AdaptiveCardInvokeResponse = sys.modules[
-    "microsoft_teams.api.models.invoke_response"
-].AdaptiveCardInvokeResponse
-_teams_mod.HttpMethod = sys.modules[
-    "microsoft_teams.apps.http.adapter"
-].HttpMethod
-_teams_mod.HttpRequest = sys.modules[
-    "microsoft_teams.apps.http.adapter"
-].HttpRequest
-_teams_mod.HttpResponse = sys.modules[
-    "microsoft_teams.apps.http.adapter"
-].HttpResponse
-_teams_mod.HttpRouteHandler = sys.modules[
-    "microsoft_teams.apps.http.adapter"
-].HttpRouteHandler
-_teams_mod.AdaptiveCard = sys.modules["microsoft_teams.cards"].AdaptiveCard
-_teams_mod.ExecuteAction = sys.modules["microsoft_teams.cards"].ExecuteAction
-_teams_mod.TextBlock = sys.modules["microsoft_teams.cards"].TextBlock
+assert _teams_mod.check_teams_requirements() is True
 _teams_mod.TEAMS_SDK_AVAILABLE = True
 
 # Ensure SDK symbols that were None (import failed on Python <3.12) are

@@ -29,7 +29,6 @@ from hermes_cli.dashboard_auth.base import (
     ProviderError,
     RefreshExpiredError,
 )
-from hermes_cli.dashboard_auth.client_ip import client_ip as _resolve_client_ip
 from hermes_cli.dashboard_auth.cookies import (
     clear_sso_attempt_cookie,
     read_session_cookies,
@@ -42,93 +41,56 @@ from hermes_cli.dashboard_auth.public_paths import PUBLIC_API_PATHS
 
 _log = logging.getLogger(__name__)
 
-# Routes that bypass the auth gate: auth-bootstrap (login page, OAuth
-# round trip, provider listing) and static asset mounts.
-#
-# Split into two tuples with *different* matching semantics, because the
-# single ``startswith`` list they used to share silently over-matched.
-# The old comment claimed ``/assets/`` matches ``/assets/foo.css`` but
-# not ``/assetsleak`` — true only for the entries that end in a slash.
-# Half the list did not: ``/auth/logout`` also matched a hypothetical
-# ``/auth/logout-all``, and ``/api/auth/providers`` also matched
-# ``/api/auth/providersXXX``. No such route exists today (I enumerated
-# the registrations), so this was not exploitable — but it meant a future
-# route like ``/api/auth/providers/{id}/credentials`` would bypass
-# authentication *silently*, with no test able to catch it.
-#
-# ``PUBLIC_API_PATHS`` in the sibling module already made the stricter
-# choice, with a comment explaining exactly this hazard ("so adding
-# ``/api/status`` doesn't accidentally expose
-# ``/api/status/secret-extension``"). These two allowlists now agree.
-
-# Matched exactly. A subpath of any of these is NOT public.
-_GATE_PUBLIC_EXACT: frozenset[str] = frozenset(
-    {
-        "/auth/login",
-        "/auth/callback",
-        "/auth/password-login",
-        "/auth/native/authorize",
-        "/auth/native/token",
-        "/auth/native/refresh",
-        "/auth/logout",
-        "/login",
-        "/api/auth/providers",
-        "/favicon.ico",
-        "/manifest.webmanifest",
-        "/apple-touch-icon.png",
-        "/hermes-official.png",
-    }
-)
-
-# Matched by prefix. Every entry MUST end in "/" so the match cannot run
-# past a path segment boundary; enforced by the assertion below.
+# Prefixes that bypass the auth gate. Match via ``path == prefix`` or
+# ``path.startswith(prefix)`` — so ``/assets/`` (with trailing slash)
+# matches ``/assets/foo.css`` but not ``/assetsleak``. Auth-bootstrap
+# (login page, OAuth round trip, provider listing) and static asset
+# mounts go here.
 _GATE_PUBLIC_PREFIXES: tuple[str, ...] = (
-    "/auth/mobile/",
+    "/auth/login",
+    "/auth/callback",
+    "/auth/native/authorize",
+    "/auth/native/token",
+    "/auth/native/refresh",
+    "/auth/password-login",
+    "/auth/logout",
+    "/login",
+    "/api/auth/providers",
     "/api/mcp/oauth/callback/",
     "/assets/",
+    "/favicon.ico",
     "/ds-assets/",
     "/fonts/",
     "/fonts-terminal/",
 )
 
-assert all(
-    prefix.endswith("/") for prefix in _GATE_PUBLIC_PREFIXES
-), "public prefixes must end in '/' so they cannot match past a segment boundary"
-
 
 def _path_is_public(path: str) -> bool:
     """True if ``path`` bypasses the OAuth auth gate.
 
-    Three sources of public-ness, none of which expand across a path
-    segment boundary:
+    Two sources of public-ness:
 
     * :data:`PUBLIC_API_PATHS` — the shared ``/api/*`` allowlist that
-      the legacy ``_SESSION_TOKEN`` middleware also honours. Exact.
-    * :data:`_GATE_PUBLIC_EXACT` — auth-bootstrap routes and single
-      static files. Exact.
-    * :data:`_GATE_PUBLIC_PREFIXES` — static mounts and route families.
-      Prefix-matched, and every entry ends in ``/``, so ``/assets/``
-      lights up ``/assets/foo.css`` but not ``/assetsleak``. The bare
-      mount point itself (``/assets``) is also accepted so a directory
-      URL without its trailing slash still resolves.
+      the legacy ``_SESSION_TOKEN`` middleware also honours. Matched
+      exactly (no prefix expansion) so adding ``/api/status`` doesn't
+      accidentally expose ``/api/status/secret-extension``.
+    * :data:`_GATE_PUBLIC_PREFIXES` — auth-bootstrap routes and static
+      mounts. Prefix-matched so ``/assets/foo.css`` lights up via
+      ``/assets/``.
     """
-    if path in PUBLIC_API_PATHS or path in _GATE_PUBLIC_EXACT:
+    if path in PUBLIC_API_PATHS:
         return True
     return any(
-        path.startswith(prefix) or path == prefix.rstrip("/")
+        path == prefix or path.startswith(prefix)
         for prefix in _GATE_PUBLIC_PREFIXES
     )
 
 
 def _client_ip(request: Request) -> str:
-    """Resolve the client IP for audit records.
-
-    Delegates to the shared trusted-proxy-aware resolver so the gate, the
-    auth routes and the token seam cannot drift apart — and so a client
-    cannot name itself by sending ``X-Forwarded-For``. See
-    :mod:`hermes_cli.dashboard_auth.client_ip`.
-    """
-    return _resolve_client_ip(request)
+    fwd = request.headers.get("x-forwarded-for", "")
+    if fwd:
+        return fwd.split(",")[0].strip()
+    return request.client.host if request.client else ""
 
 
 def _ordered_session_providers(
@@ -375,12 +337,6 @@ async def gated_auth_middleware(
     # a cookie session and must not be bounced to /login. Pass it through; the
     # seam already attached ``request.state.token_principal``.
     if getattr(request.state, "token_authenticated", False):
-        return await call_next(request)
-
-    # The outer optional-token seam may already have identified an RFC 8252
-    # dashboard bearer after ruling out a mobile API key. Reuse that verified
-    # session instead of validating the same token twice.
-    if getattr(request.state, "session_bearer_authenticated", False):
         return await call_next(request)
 
     path = request.url.path

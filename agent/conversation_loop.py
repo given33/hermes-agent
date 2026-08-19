@@ -214,34 +214,6 @@ _API_CALL_MODULES = frozenset({
 })
 
 
-def _hosted_should_retry_client_error(agent: Any, status_code: Any) -> bool:
-    """Limit the hosted credential-replacement grace period to 401/403."""
-    return bool(
-        (
-            getattr(agent, "_api_retry_client_errors", False)
-            or getattr(agent, "_hosted_retry_client_errors", False)
-        )
-        and status_code in {401, 403}
-    )
-
-
-def _model_retry_wait_seconds(
-    agent: Any,
-    *,
-    retry_after: Optional[float],
-    retry_count: int,
-) -> float:
-    """Resolve a retry delay while preserving provider Retry-After hints."""
-    configured_delay = getattr(agent, "_api_retry_delay_seconds", None)
-    if configured_delay is None:
-        configured_delay = getattr(agent, "_hosted_retry_delay_seconds", None)
-    if configured_delay is not None:
-        return max(max(0.0, float(configured_delay)), float(retry_after or 0.0))
-    if retry_after is not None:
-        return float(retry_after)
-    return jittered_backoff(retry_count, base_delay=2.0, max_delay=60.0)
-
-
 def _moa_client_consumes_prepared_request(client: Any) -> bool:
     """True when ``client`` is the in-process MoA facade.
 
@@ -359,6 +331,19 @@ def _apply_active_turn_redirect(agent: Any, messages: List[Dict[str, Any]], text
         }
         if not visible:
             placeholder["display_kind"] = "hidden"
+            # Keep the transcript hidden and empty, but give the historical
+            # API projection a non-empty neutral assistant turn so the
+            # pre-call sanitizer (repair_empty_non_final_messages) does not
+            # re-heal this row on every later call (#88955). display_kind is
+            # stripped before sanitization, while api_content is projected
+            # back into content for historical assistant rows. Use the
+            # canonical neutral interruption placeholder, never
+            # _INTERRUPT_SCAFFOLD_MARKER: replaying the scaffold as assistant
+            # text made the model echo it and self-replicate ghost rows
+            # (#81841).
+            from agent.agent_runtime_helpers import _INTERRUPTED_PLACEHOLDER
+
+            placeholder["api_content"] = _INTERRUPTED_PLACEHOLDER
         append_message(messages, placeholder)
         append_message(
             messages,
@@ -2151,8 +2136,28 @@ def run_conversation(
             # from every outgoing copy so strict OpenAI-compatible backends
             # don't reject the request after a model switch or resumed typed
             # event row enters the live history.
-            api_msg.pop("display_kind", None)
+            _display_kind = api_msg.pop("display_kind", None)
             api_msg.pop("display_metadata", None)
+
+            # Legacy hidden redirect placeholders (#88955): rows persisted
+            # BEFORE the writer-side api_content stamp in
+            # _apply_active_turn_redirect are content="" with no sidecar.
+            # Once display_kind is stripped the pre-call sanitizer
+            # (repair_empty_non_final_messages) would re-heal such a row on
+            # every call forever, since the durable transcript is never
+            # mutated. Give the wire copy the same neutral payload here so
+            # old sessions converge too. Never the interrupt scaffold —
+            # replaying scaffold bytes as assistant text is #81841.
+            if (
+                _display_kind == "hidden"
+                and api_msg.get("role") == "assistant"
+                and not _api_content
+                and not (api_msg.get("content") or "").strip()
+                and not api_msg.get("tool_calls")
+            ):
+                from agent.agent_runtime_helpers import _INTERRUPTED_PLACEHOLDER
+
+                api_msg["content"] = _INTERRUPTED_PLACEHOLDER
 
             # Durable row identity stamped by _rows_to_conversation so the
             # desktop can address a specific persisted message (reactions).
@@ -5897,11 +5902,6 @@ def run_conversation(
                     )
                 ) and not is_context_length_error
 
-                if is_client_error and _hosted_should_retry_client_error(
-                    agent, status_code
-                ):
-                    is_client_error = False
-
                 if is_client_error:
                     # Copilot self-heal BEFORE fallback: a stale/degraded
                     # credential surfaces as a 400
@@ -6374,11 +6374,7 @@ def run_conversation(
                                 _retry_after = min(float(_ra_raw), 600)
                             except (TypeError, ValueError):
                                 pass
-                wait_time = _model_retry_wait_seconds(
-                    agent,
-                    retry_after=_retry_after,
-                    retry_count=retry_count,
-                )
+                wait_time = _retry_after if _retry_after else jittered_backoff(retry_count, base_delay=2.0, max_delay=60.0)
                 _backoff_policy = None
                 if (is_rate_limited or _is_zai_coding_overload) and not _retry_after:
                     wait_time, _backoff_policy = adaptive_rate_limit_backoff(

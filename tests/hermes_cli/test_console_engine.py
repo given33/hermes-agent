@@ -6,17 +6,7 @@ from pathlib import Path
 
 import pytest
 
-from hermes_cli.console_engine import HermesConsoleEngine, _split_line, run_console_repl
-
-
-@pytest.mark.skipif(sys.platform != "win32", reason="Windows lexer regression")
-def test_console_lexer_preserves_quoted_and_unquoted_windows_paths():
-    assert _split_line(r"sessions export C:\tmp\all-sessions.jsonl")[-1] == (
-        r"C:\tmp\all-sessions.jsonl"
-    )
-    assert _split_line(r'sessions export "C:\tmp\with space\all.jsonl"')[-1] == (
-        r"C:\tmp\with space\all.jsonl"
-    )
+from hermes_cli.console_engine import HermesConsoleEngine, run_console_repl
 
 
 EXPECTED_CONSOLE_COMMANDS = {

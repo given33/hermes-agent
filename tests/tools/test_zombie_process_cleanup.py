@@ -6,6 +6,7 @@ gateway deployments.
 """
 
 import os
+import signal
 import subprocess
 import sys
 import threading
@@ -35,14 +36,12 @@ class TestZombieReproduction:
         """REPRODUCTION: processes spawned directly survive if no one kills
         them — this models the gap that causes zombie accumulation when
         the gateway drops agent references without calling close()."""
-        procs = []
+        pids = []
 
         try:
             for _ in range(3):
                 proc = _spawn_sleep(60)
-                procs.append(proc)
-
-            pids = [proc.pid for proc in procs]
+                pids.append(proc.pid)
 
             for pid in pids:
                 assert _pid_alive(pid), f"PID {pid} should be alive after spawn"
@@ -57,11 +56,10 @@ class TestZombieReproduction:
                     f"expected it to survive (demonstrating the bug)"
                 )
         finally:
-            for proc in procs:
+            for pid in pids:
                 try:
-                    proc.kill()
-                    proc.wait(timeout=5)
-                except (ProcessLookupError, PermissionError, subprocess.TimeoutExpired):
+                    os.kill(pid, signal.SIGKILL)
+                except (ProcessLookupError, PermissionError):
                     pass
 
     def test_explicit_terminate_reaps_processes(self):

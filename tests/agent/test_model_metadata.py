@@ -371,26 +371,6 @@ class TestDefaultContextLengths:
                     f"{model_id}: expected {expected_ctx}, got {actual}"
                 )
 
-    def test_deepseek_custom_endpoint_uses_catalog_before_network_probe(self):
-        """A known DeepSeek model must not cold-start on endpoint metadata."""
-        from unittest.mock import patch as mock_patch
-
-        with mock_patch(
-            "agent.model_metadata._resolve_endpoint_context_length",
-            side_effect=AssertionError("custom endpoint probe should be skipped"),
-        ), mock_patch(
-            "agent.models_dev.lookup_models_dev_context",
-            side_effect=AssertionError("models.dev lookup should be skipped"),
-        ):
-            actual = get_model_context_length(
-                "deepseek-v4-flash",
-                base_url="https://api.deepseek.com",
-                api_key="configured",
-                provider="custom",
-            )
-
-        assert actual == 1_000_000
-
 
 
 

@@ -87,7 +87,6 @@ class TestSkillsDirectoryMount:
 
         assert mounts[0]["container_path"] == "/home/user/.hermes/skills"
 
-    @pytest.mark.require_symlinks
     def test_symlinks_are_sanitized(self, tmp_path):
         """Symlinks in skills dir should be excluded from the mount."""
         hermes_home = tmp_path / ".hermes"
@@ -127,8 +126,6 @@ class TestSkillsDirectoryMount:
 
 
 class TestIterSkillsFiles:
-    pytestmark = pytest.mark.require_symlinks
-
     def test_returns_files_skipping_symlinks(self, tmp_path):
         hermes_home = tmp_path / ".hermes"
         skills_dir = hermes_home / "skills"
@@ -477,8 +474,6 @@ class TestToAgentVisiblePathPerBackend:
 
 
 class TestIterCacheFiles:
-    pytestmark = pytest.mark.require_symlinks
-
     """Tests for iter_cache_files()."""
 
     def test_enumerates_files(self, tmp_path, monkeypatch):

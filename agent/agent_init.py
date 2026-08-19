@@ -529,6 +529,7 @@ def init_agent(
     read_preview_callback: callable = None,
     read_window_below_callback: callable = None,
     setup_mcp_callback: callable = None,
+    tour_callback: callable = None,
     step_callback: callable = None,
     stream_delta_callback: callable = None,
     interim_assistant_callback: callable = None,
@@ -561,8 +562,6 @@ def init_agent(
     iteration_budget: "IterationBudget" = None,
     fallback_model: Dict[str, Any] = None,
     credential_pool=None,
-    prompt_runtime_mode: str = "native",
-    tool_role: str | None = None,
     checkpoints_enabled: bool = False,
     checkpoint_max_snapshots: int = 20,
     checkpoint_max_total_size_mb: int = 500,
@@ -622,17 +621,6 @@ def init_agent(
     _install_safe_stdio()
 
     agent.model = model
-    agent._prompt_runtime_mode = str(prompt_runtime_mode or "native").strip().lower()
-    agent.tool_role = str(tool_role or "").strip().lower() or None
-    if agent.tool_role and agent.tool_role not in {"dispatcher", "worker", "reviewer", "reporter"}:
-        raise ValueError(
-            f"unknown tool_role {tool_role!r}; expected dispatcher, worker, reviewer, or reporter"
-        )
-    if agent._prompt_runtime_mode not in {"native", "ptc", "creation"}:
-        raise ValueError(
-            f"unknown prompt_runtime_mode {prompt_runtime_mode!r}; "
-            "expected native, ptc, or creation"
-        )
     agent.max_iterations = max_iterations
     # Shared iteration budget — parent creates, children inherit.
     # Consumed by every LLM turn across parent + all subagents.
@@ -837,6 +825,7 @@ def init_agent(
     agent.read_preview_callback = read_preview_callback
     agent.read_window_below_callback = read_window_below_callback
     agent.setup_mcp_callback = setup_mcp_callback
+    agent.tour_callback = tour_callback
     agent.step_callback = step_callback
     agent.stream_delta_callback = stream_delta_callback
     agent.interim_assistant_callback = interim_assistant_callback
@@ -991,15 +980,6 @@ def init_agent(
     # Rate-limit durable SessionDB activity stamps from _touch_activity (#72016).
     agent._session_activity_last_persist_mono: float = 0.0
     agent._current_tool: str | None = None
-    # Bounded canonical tool lifecycle records consumed by desktop/iOS
-    # projections. Raw arguments/results remain in the existing redacted tool
-    # pipeline; this ledger stores digests and presentation metadata only.
-    try:
-        from hermes_runtime.tool_execution import ToolExecutionLedger
-        agent._tool_execution_ledger = ToolExecutionLedger()
-    except Exception:
-        agent._tool_execution_ledger = None
-    agent._active_tool_parent_call_id = ""
     agent._api_call_count: int = 0
     # Opt-out flag for the between-turns MCP tool refresh (build_turn_context).
     # Set on internal forks (e.g. background_review) that must keep ``tools[]``
@@ -1536,16 +1516,11 @@ def init_agent(
         agent._tool_snapshot_generation = _snapshot_registry._generation
     except Exception:
         agent._tool_snapshot_generation = 0
-    tool_definition_kwargs = {
-        "enabled_toolsets": enabled_toolsets,
-        "disabled_toolsets": disabled_toolsets,
-        "quiet_mode": agent.quiet_mode,
-    }
-    # Keep legacy integrations that replace get_tool_definitions() compatible;
-    # role filtering is opt-in and only needs the new keyword when requested.
-    if agent.tool_role:
-        tool_definition_kwargs["tool_role"] = agent.tool_role
-    agent.tools = _ra().get_tool_definitions(**tool_definition_kwargs)
+    agent.tools = _ra().get_tool_definitions(
+        enabled_toolsets=enabled_toolsets,
+        disabled_toolsets=disabled_toolsets,
+        quiet_mode=agent.quiet_mode,
+    )
     
     # Show tool configuration and store valid tool names for validation
     agent.valid_tool_names = set()
@@ -1666,9 +1641,6 @@ def init_agent(
     # Cross-session-stable prefix of the cached prompt. It remains separate
     # from the persisted string and is used only to place an early cache marker.
     agent._cached_system_prompt_static: Optional[str] = None
-    # Non-sensitive provenance for the Prompt Runtime/tool-schema assembly.
-    # Prompt text remains the authoritative cache value.
-    agent._prompt_runtime_metadata: Dict[str, Any] = {}
     
     # Filesystem checkpoint manager (transparent — not a tool)
     from tools.checkpoint_manager import CheckpointManager
@@ -1990,31 +1962,15 @@ def init_agent(
         _platform_hints_cfg = {}
     agent._platform_hint_overrides = _platform_hints_cfg
 
-    # App-level API retry count (wraps each model API call).  Hosted surfaces
-    # may impose a tighter, user-visible retry contract through the process
-    # environment without mutating the account's persisted config.
+    # App-level API retry count (wraps each model API call).  Default 3,
+    # overridable via agent.api_max_retries in config.yaml.  See #11616.
     try:
-        _raw_api_retries = os.environ.get(
-            "HERMES_API_MAX_RETRIES",
-            _agent_section.get("api_max_retries", 3),
-        )
+        _raw_api_retries = _agent_section.get("api_max_retries", 3)
         _api_retries = int(_raw_api_retries)
-        _api_retries = min(max(_api_retries, 1), 10)
+        _api_retries = max(_api_retries, 1)  # 1 = no retry (single attempt)
     except (TypeError, ValueError):
         _api_retries = 3
     agent._api_max_retries = _api_retries
-    try:
-        _retry_delay = float(os.environ.get("HERMES_API_RETRY_DELAY_SECONDS", "0") or 0)
-        _retry_delay = min(max(_retry_delay, 0.0), 600.0)
-    except (TypeError, ValueError):
-        _retry_delay = 0.0
-    agent._api_retry_delay_seconds = _retry_delay
-    agent._api_retry_status_live = str(
-        os.environ.get("HERMES_API_RETRY_STATUS_LIVE", "")
-    ).strip().lower() in {"1", "true", "yes", "on"}
-    agent._api_retry_client_errors = str(
-        os.environ.get("HERMES_API_RETRY_CLIENT_ERRORS", "")
-    ).strip().lower() in {"1", "true", "yes", "on"}
 
     # Initialize context compressor for automatic context management
     # Compresses conversation when approaching model's context limit

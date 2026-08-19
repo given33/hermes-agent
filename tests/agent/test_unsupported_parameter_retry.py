@@ -25,7 +25,6 @@ from agent.auxiliary_client import (
     async_call_llm,
     _is_unsupported_parameter_error,
     _is_unsupported_temperature_error,
-    _response_format_fallback_kwargs,
 )
 
 
@@ -57,33 +56,6 @@ class TestIsUnsupportedParameterError:
         # And the unrelated-case still holds
         assert _is_unsupported_temperature_error(
             RuntimeError("max_tokens is too large")) is False
-
-    def test_response_format_fallback_steps_down_only_for_capability_error(self):
-        err = RuntimeError(
-            "Error code: 400 - response_format type is unavailable now"
-        )
-        err.status_code = 400
-        schema_kwargs = {
-            "model": "deepseek-v4-flash",
-            "extra_body": {
-                "response_format": {
-                    "type": "json_schema",
-                    "json_schema": {"name": "probe", "schema": {}},
-                },
-                "metadata": {"request_kind": "test"},
-            },
-        }
-
-        json_object_kwargs = _response_format_fallback_kwargs(schema_kwargs, err)
-        assert json_object_kwargs["extra_body"]["response_format"] == {
-            "type": "json_object"
-        }
-        assert json_object_kwargs["extra_body"]["metadata"] == {"request_kind": "test"}
-
-        second_err = RuntimeError("response_format is unsupported")
-        second_err.status_code = 400
-        plain_kwargs = _response_format_fallback_kwargs(json_object_kwargs, second_err)
-        assert "response_format" not in plain_kwargs["extra_body"]
 
 
 def _dummy_response():
@@ -126,99 +98,6 @@ class TestMaxTokensRetryHardening:
 
         # Only the initial attempt — no retry because the gate blocked it
         assert client.chat.completions.create.call_count == 1
-
-
-class TestResponseFormatFallback:
-    """Unsupported json_schema should retry as json_object on both paths."""
-
-    @staticmethod
-    def _format_error():
-        err = RuntimeError(
-            "Error code: 400 - {'message': 'This response_format type is unavailable now'}"
-        )
-        err.status_code = 400
-        return err
-
-    def test_sync_json_schema_falls_back_to_json_object(self):
-        client = MagicMock()
-        client.base_url = "https://opencode.ai/zen/go/v1"
-        client.chat.completions.create.side_effect = [
-            self._format_error(),
-            {"ok": True},
-        ]
-        with (
-            patch(
-                "agent.auxiliary_client._resolve_task_provider_model",
-                return_value=("custom", "deepseek-v4-flash", None, None, None),
-            ),
-            patch(
-                "agent.auxiliary_client._get_cached_client",
-                return_value=(client, "deepseek-v4-flash"),
-            ),
-            patch(
-                "agent.auxiliary_client._validate_llm_response",
-                side_effect=lambda response, _task, **_kw: response,
-            ),
-        ):
-            result = call_llm(
-                task="structured_probe",
-                provider="custom",
-                model="deepseek-v4-flash",
-                messages=[{"role": "user", "content": "return JSON"}],
-                extra_body={
-                    "response_format": {
-                        "type": "json_schema",
-                        "json_schema": {"name": "probe", "schema": {}},
-                    }
-                },
-            )
-
-        assert result == {"ok": True}
-        assert client.chat.completions.create.call_count == 2
-        first_extra = client.chat.completions.create.call_args_list[0].kwargs["extra_body"]
-        second_extra = client.chat.completions.create.call_args_list[1].kwargs["extra_body"]
-        assert first_extra["response_format"]["type"] == "json_schema"
-        assert second_extra["response_format"] == {"type": "json_object"}
-
-    @pytest.mark.asyncio
-    async def test_async_json_schema_falls_back_to_json_object(self):
-        client = MagicMock()
-        client.base_url = "https://opencode.ai/zen/go/v1"
-        client.chat.completions.create = AsyncMock(side_effect=[
-            self._format_error(),
-            {"ok": True},
-        ])
-        with (
-            patch(
-                "agent.auxiliary_client._resolve_task_provider_model",
-                return_value=("custom", "deepseek-v4-flash", None, None, None),
-            ),
-            patch(
-                "agent.auxiliary_client._get_cached_client",
-                return_value=(client, "deepseek-v4-flash"),
-            ),
-            patch(
-                "agent.auxiliary_client._validate_llm_response",
-                side_effect=lambda response, _task, **_kw: response,
-            ),
-        ):
-            result = await async_call_llm(
-                task="structured_probe",
-                provider="custom",
-                model="deepseek-v4-flash",
-                messages=[{"role": "user", "content": "return JSON"}],
-                extra_body={
-                    "response_format": {
-                        "type": "json_schema",
-                        "json_schema": {"name": "probe", "schema": {}},
-                    }
-                },
-            )
-
-        assert result == {"ok": True}
-        assert client.chat.completions.create.await_count == 2
-        second_extra = client.chat.completions.create.await_args_list[1].kwargs["extra_body"]
-        assert second_extra["response_format"] == {"type": "json_object"}
 
 
     @pytest.mark.asyncio

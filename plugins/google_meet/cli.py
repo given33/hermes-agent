@@ -92,12 +92,8 @@ def register_cli(subparser: argparse.ArgumentParser) -> None:
         # If the node module fails to import for any reason (optional dep
         # missing at import time etc.), leave the subparser present but
         # flag it. The argparse dispatch will surface a clear error.
-        # Capture the reason NOW: Python unbinds `e` when the except block
-        # exits, so the closure below must not reference it.
-        reason = str(e)
-
         def _node_unavailable(args):
-            print(f"hermes meet node: module unavailable ({reason})")
+            print(f"hermes meet node: module unavailable ({e})")
             return 1
         node_p.set_defaults(func=_node_unavailable)
 

@@ -16,8 +16,6 @@ import sys
 from pathlib import Path
 from types import SimpleNamespace
 
-import pytest
-
 
 def _run_apply_profile_override(
     tmp_path, monkeypatch, *, hermes_home: str | None, active_profile: str | None,
@@ -28,13 +26,7 @@ def _run_apply_profile_override(
     Returns the value of os.environ["HERMES_HOME"] after the call,
     or None if unset.
     """
-    if hermes_home is not None:
-        hermes_root = Path(hermes_home)
-    elif sys.platform == "win32":
-        monkeypatch.setenv("LOCALAPPDATA", str(tmp_path))
-        hermes_root = tmp_path / "hermes"
-    else:
-        hermes_root = tmp_path / ".hermes"
+    hermes_root = tmp_path / ".hermes"
     hermes_root.mkdir(parents=True, exist_ok=True)
 
     if active_profile is not None:
@@ -94,7 +86,6 @@ class TestApplyProfileOverrideHermesHomeGuard:
         )
 
 
-    @pytest.mark.skipif(sys.platform == "win32", reason="sudo/pwd is POSIX-only")
     def test_sudo_explicit_profile_resolves_invoking_users_profile(self, tmp_path, monkeypatch):
         """sudo elias ... should resolve `-p elias` under SUDO_USER, not root."""
         root_home = tmp_path / "root"
@@ -155,11 +146,7 @@ class TestSupervisedChildIgnoresStickyProfile:
         """A supervised named-profile slot passes ``-p <name>`` explicitly;
         that must still resolve (the sentinel guard only skips the sticky
         active_profile fallback, never an explicit flag)."""
-        if sys.platform == "win32":
-            monkeypatch.setenv("LOCALAPPDATA", str(tmp_path))
-            hermes_root = tmp_path / "hermes"
-        else:
-            hermes_root = tmp_path / ".hermes"
+        hermes_root = tmp_path / ".hermes"
         hermes_root.mkdir(parents=True, exist_ok=True)
         (hermes_root / "active_profile").write_text("briefer")
         (hermes_root / "profiles" / "briefer").mkdir(parents=True, exist_ok=True)

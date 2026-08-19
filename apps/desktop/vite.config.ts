@@ -5,8 +5,6 @@ import path from 'path'
 import fs from 'fs'
 import { createRequire } from 'module'
 
-const configDir = import.meta.dirname
-
 // `hgui` symlinks a worktree's node_modules to the main checkout. Vite realpaths
 // those before enforcing server.fs.allow, so codicon/font assets resolve outside
 // the worktree root and 404. Whitelist the real node_modules locations.
@@ -21,9 +19,9 @@ const real = (p: string): string | null => {
 const fsAllow = [
   ...new Set(
     [
-      path.resolve(configDir, '../..'),
-      real(path.resolve(configDir, 'node_modules')),
-      real(path.resolve(configDir, '../../node_modules'))
+      path.resolve(__dirname, '../..'),
+      real(path.resolve(__dirname, 'node_modules')),
+      real(path.resolve(__dirname, '../../node_modules'))
     ].filter((p): p is string => p !== null)
   )
 ]
@@ -50,16 +48,16 @@ const reactDomDir = path.dirname(requireFromApp.resolve('react-dom/package.json'
 // the perf harness opts a production build back in with VITE_PERF_PROBE=1.
 const debugEntry = (command: string, env: Record<string, string>) =>
   command === 'serve' || env.VITE_PERF_PROBE === '1'
-    ? path.resolve(configDir, './src/debug/dev-only.ts')
-    : path.resolve(configDir, './src/debug/dev-only.noop.ts')
+    ? path.resolve(__dirname, './src/debug/dev-only.ts')
+    : path.resolve(__dirname, './src/debug/dev-only.noop.ts')
 
 // The emoji picker (frimousse) fetches `<emojibaseUrl>/<locale>/data.json` at
 // runtime. Its default is a CDN; Electron must work offline, so serve the
 // bundled emojibase-data package at a stable local path instead — middleware
 // in dev, emitted assets in the build. Only the files a locale actually needs.
 const emojibaseDir =
-  real(path.resolve(configDir, 'node_modules/emojibase-data')) ??
-  real(path.resolve(configDir, '../../node_modules/emojibase-data'))
+  real(path.resolve(__dirname, 'node_modules/emojibase-data')) ??
+  real(path.resolve(__dirname, '../../node_modules/emojibase-data'))
 
 const EMOJIBASE_PATH = /^[a-z-]+\/(data|messages|shortcodes\/emojibase)\.json$/
 
@@ -157,13 +155,43 @@ export default defineConfig(({ command }) => ({
       }
     }
   },
+  // driver.js only enters the graph through the tour's DYNAMIC import chain
+  // (lib/tour/run-tour.ts), so the dep scanner never sees it at startup. Left
+  // alone, first use registers it as a missing dep at runtime — which (a)
+  // esbuild-prebundles the `?raw` IIFE import as a JS module, breaking the
+  // raw-text transform ("does not provide an export named 'default'"), and
+  // (b) triggers Vite's "new dependencies optimized" full page reload mid-
+  // session. It's pure ESM with no CJS deps, so serving it unoptimized is
+  // free. Query and bare forms all listed — exclusion matches exact ids.
+  optimizeDeps: {
+    exclude: [
+      'driver.js',
+      'driver.js/dist/driver.js.iife.js',
+      'driver.js/dist/driver.js.iife.js?raw',
+      'driver.js/dist/driver.css?raw'
+    ]
+  },
   resolve: {
     alias: {
       '@/debug/dev-only': debugEntry(command, process.env as Record<string, string>),
-      '@': path.resolve(configDir, './src'),
-      '@hermes/plugin-sdk': path.resolve(configDir, './src/sdk/index.ts'),
-      '@hermes/shared/billing': path.resolve(configDir, '../shared/src/billing-types.ts'),
-      '@hermes/shared': path.resolve(configDir, '../shared/src'),
+      '@': path.resolve(__dirname, './src'),
+      '@hermes/plugin-sdk': path.resolve(__dirname, './src/sdk/index.ts'),
+      '@hermes/shared/billing': path.resolve(__dirname, '../shared/src/billing-types.ts'),
+      '@hermes/shared': path.resolve(__dirname, '../shared/src'),
+      // The tour tool's preview surface injects driver.js's prebuilt IIFE into
+      // the pane's guest page as raw source; the package's exports map doesn't
+      // expose that dist file (nor ./package.json), so resolve the main entry
+      // (dist/driver.js.cjs) and point at its sibling. Both keys on purpose:
+      // alias matching is exact, and the id reaches it with the `?raw` query
+      // still attached in dev but stripped in some build paths.
+      'driver.js/dist/driver.js.iife.js?raw': `${path.join(
+        path.dirname(requireFromApp.resolve('driver.js')),
+        'driver.js.iife.js'
+      )}?raw`,
+      'driver.js/dist/driver.js.iife.js': path.join(
+        path.dirname(requireFromApp.resolve('driver.js')),
+        'driver.js.iife.js'
+      ),
       react: reactDir,
       'react-dom': reactDomDir,
       'react/jsx-dev-runtime': path.join(reactDir, 'jsx-dev-runtime.js'),

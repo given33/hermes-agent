@@ -2795,27 +2795,6 @@ def get_model_context_length(
     if endpoint_context is not None:
         return endpoint_context
 
-    # Known DeepSeek V4 models have a stable, provider-published 1M context
-    # window. Custom-provider profiles commonly identify the runtime as
-    # ``custom`` even when the endpoint is the official DeepSeek API, so URL
-    # inference is part of this fast path. Keep it before the generic custom
-    # endpoint /models and models.dev lookups: those are useful for unknown
-    # models, but a cold hosted gateway must not pay a several-second metadata
-    # request when the local catalog already knows the answer.
-    inferred_provider = _infer_provider_from_url(base_url) if base_url else None
-    if (
-        str(provider or "").strip().lower() == "deepseek"
-        or inferred_provider == "deepseek"
-    ):
-        model_lower = model.lower()
-        for default_model, length in sorted(
-            DEFAULT_CONTEXT_LENGTHS.items(),
-            key=lambda x: len(x[0]),
-            reverse=True,
-        ):
-            if default_model in model_lower:
-                return length
-
     is_bedrock_context = provider == "bedrock" or (
         base_url
         and base_url_hostname(base_url).startswith("bedrock-runtime.")

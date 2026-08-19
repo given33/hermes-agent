@@ -4708,28 +4708,10 @@ def test_finalize_session_closes_slash_worker(monkeypatch):
     assert session.get("_finalized") is True
 
     # Idempotent: a second finalize (or a follow-up teardown) must not
-    # re-close the worker.
+    # re-close the worker — the _finalized guard short-circuits.
     server._finalize_session(session)
     server._teardown_session(session)
     assert closed["count"] == 1
-
-
-def test_finalize_session_stops_and_joins_notification_poller(monkeypatch):
-    stopped = threading.Event()
-
-    class _PollerThread:
-        def join(self, *, timeout):
-            assert timeout == 1.0
-            assert stopped.is_set()
-
-    monkeypatch.setattr(server, "_notify_session_boundary", lambda *a, **k: None)
-    monkeypatch.setattr(server, "_get_db", lambda: None)
-    session = _session(_notif_stop=stopped, _notif_thread=_PollerThread())
-
-    server._finalize_session(session)
-
-    assert stopped.is_set()
-    assert session["_finalized"] is True
 
 
 def test_ws_orphan_reap_spares_reattached_session(monkeypatch):
@@ -5877,19 +5859,7 @@ class _StopAfterOneNotificationPoll:
 
     def is_set(self):
         self._checks += 1
-        # The loop checks once before and once after its blocking dequeue so a
-        # real stop cannot race a late delivery.
-        return self._checks > 2
-
-
-class _StopAfterNotificationPolls:
-    def __init__(self, polls):
-        self._checks = 0
-        self._polls = polls
-
-    def is_set(self):
-        self._checks += 1
-        return self._checks > self._polls * 2
+        return self._checks > 1
 
 
 def test_notification_poller_live_loop_requeues_foreign_completion_for_owner(
@@ -6086,10 +6056,11 @@ def test_notification_poller_drops_orphaned_events(monkeypatch, routing):
         }
     )
 
+    stop = threading.Event()
+    stop.set()
+
     try:
-        server._notification_poller_loop(
-            _StopAfterOneNotificationPoll(), "sid_a", sess
-        )
+        server._notification_poller_loop(stop, "sid_a", sess)
 
         assert [a for a in emitted if a[0] == "status.update"] == []
         assert delivered == []
@@ -6151,10 +6122,11 @@ def test_notification_poller_delivers_owned_events(
         }
     )
 
+    stop = threading.Event()
+    stop.set()
+
     try:
-        server._notification_poller_loop(
-            _StopAfterOneNotificationPoll(), "sid_a", sess
-        )
+        server._notification_poller_loop(stop, "sid_a", sess)
 
         status_calls = [a for a in emitted if a[0] == "status.update"]
         assert len(status_calls) == 1
@@ -6460,9 +6432,14 @@ def test_run_prompt_submit_requeues_all_unstarted_notifications_with_real_thread
         assert nested_started.wait(timeout=5)
         threads[0].join(timeout=5)
         assert not threads[0].is_alive()
-        # Membership, not order: the requeue contract is that batch_2 and
-        # batch_3 both remain queued (never consumed) while batch_1's turn is in
-        # flight.
+        # Membership, not order: the completion_queue is process-global, and
+        # notification pollers leaked by earlier session.init tests in this
+        # file legitimately steal-and-requeue foreign-session events (see
+        # _notification_poller_loop's belongs-elsewhere branch), rotating the
+        # queue. The requeue contract is that batch_2 and batch_3 both remain
+        # queued (never consumed) while batch_1's turn is in flight — so drain
+        # with a deadline (an event may be transiently held by a poller
+        # mid-cycle) and assert exactly {batch_2, batch_3} come back.
         queued: dict = {}
         deadline = time.time() + 5.0
         while time.time() < deadline and set(queued) != {
@@ -15796,17 +15773,6 @@ def test_make_agent_waits_for_shared_mcp_discovery(monkeypatch):
     assert waited == [0.75]
 
 
-def test_make_agent_builds_plain_hosted_session_without_toolsets(monkeypatch):
-    """The fast hosted-chat build must not assemble the full tool catalog."""
-    _setup_make_agent_mocks(monkeypatch, {})
-    monkeypatch.setattr(server, "_load_enabled_toolsets", lambda: ["web", "terminal"])
-
-    with patch("run_agent.AIAgent") as mock_agent:
-        server._make_agent("sid1", "key1", skip_mcp_discovery=True)
-
-    assert mock_agent.call_args.kwargs["enabled_toolsets"] == []
-
-
 def test_make_agent_nested_max_turns_takes_priority(monkeypatch):
     _setup_make_agent_mocks(
         monkeypatch, {"agent": {"max_turns": 400}, "max_turns": 100}
@@ -15864,41 +15830,6 @@ def test_make_agent_uses_session_runtime_overrides(monkeypatch):
     assert mock_agent.call_args.kwargs["provider"] == "openai-codex"
     assert mock_agent.call_args.kwargs["reasoning_config"] == {"enabled": True, "effort": "high"}
     assert mock_agent.call_args.kwargs["service_tier"] == "priority"
-
-
-def test_make_agent_keeps_resolved_transport_over_stale_custom_session_mode(monkeypatch):
-    """A generic relay must not resurrect a persisted Responses transport."""
-    from types import SimpleNamespace
-
-    _setup_make_agent_mocks(monkeypatch, {})
-    monkeypatch.setattr(
-        server,
-        "_resolve_runtime_with_fallback",
-        lambda _kwargs: SimpleNamespace(
-            runtime={
-                "provider": "custom",
-                "base_url": "https://relay.example/v1",
-                "api_key": "test-key",
-                "api_mode": "chat_completions",
-            },
-            used_fallback=False,
-            selected_model="",
-        ),
-    )
-
-    with patch("run_agent.AIAgent") as mock_agent:
-        server._make_agent(
-            "sid1",
-            "key1",
-            model_override={
-                "model": "gpt-5.6-sol",
-                "provider": "custom:relay",
-                "base_url": "https://relay.example/v1",
-                "api_mode": "codex_responses",
-            },
-        )
-
-    assert mock_agent.call_args.kwargs["api_mode"] == "chat_completions"
 
 
 def test_make_agent_handles_null_agent_config(monkeypatch):
@@ -16023,6 +15954,10 @@ def test_notification_poller_delivers_completion(monkeypatch):
     monkeypatch.setattr(process_registry, "completion_queue", isolated_queue)
     process_registry._completion_consumed.discard("proc_poller_test")
 
+    stop = threading.Event()
+
+    # Put event on queue, then immediately signal stop so the poller
+    # runs exactly one iteration.
     isolated_queue.put({
         "type": "completion",
         "session_id": "proc_poller_test",
@@ -16030,10 +15965,10 @@ def test_notification_poller_delivers_completion(monkeypatch):
         "exit_code": 0,
         "output": "hello",
     })
+    stop.set()
+
     try:
-        server._notification_poller_loop(
-            _StopAfterOneNotificationPoll(), "sid_poll", sess
-        )
+        server._notification_poller_loop(stop, "sid_poll", sess)
 
         # Should have emitted a status.update with kind=process
         status_calls = [a for a in emitted if a[0] == "status.update"]
@@ -16047,43 +15982,6 @@ def test_notification_poller_delivers_completion(monkeypatch):
         server._sessions.pop("sid_poll", None)
         while not process_registry.completion_queue.empty():
             process_registry.completion_queue.get_nowait()
-
-
-def test_notification_poller_requeues_event_when_stop_races_dequeue(monkeypatch):
-    """A closing session cannot consume or emit an event dequeued during stop."""
-    import queue as _queue_mod
-
-    from tools.process_registry import process_registry
-
-    stop = threading.Event()
-    event = {
-        "type": "completion",
-        "session_id": "proc_stop_race",
-        "command": "echo late",
-        "exit_code": 0,
-        "output": "late",
-    }
-
-    class _StopOnGetQueue(_queue_mod.Queue):
-        def get(self, *args, **kwargs):
-            item = super().get(*args, **kwargs)
-            stop.set()
-            return item
-
-    isolated_queue = _StopOnGetQueue()
-    isolated_queue.put(event)
-    monkeypatch.setattr(process_registry, "completion_queue", isolated_queue)
-    monkeypatch.setattr(
-        server,
-        "_emit",
-        lambda *_args, **_kwargs: (_ for _ in ()).throw(
-            AssertionError("stopped poller emitted a late frame")
-        ),
-    )
-
-    server._notification_poller_loop(stop, "sid_stop_race", _session())
-
-    assert isolated_queue.get_nowait() is event
 
 
 def test_notification_poller_skips_consumed(monkeypatch):
@@ -16128,10 +16026,11 @@ def test_notification_poller_skips_consumed(monkeypatch):
         "output": "x",
     })
 
+    stop = threading.Event()
+    stop.set()
+
     try:
-        server._notification_poller_loop(
-            _StopAfterOneNotificationPoll(), "sid_skip", sess
-        )
+        server._notification_poller_loop(stop, "sid_skip", sess)
         assert len(turns) == 0
     finally:
         server._sessions.pop("sid_skip", None)
@@ -16170,10 +16069,11 @@ def test_notification_poller_requeues_when_busy(monkeypatch):
     }
     isolated_queue.put(evt)
 
+    stop = threading.Event()
+    stop.set()
+
     try:
-        server._notification_poller_loop(
-            _StopAfterOneNotificationPoll(), "sid_busy", sess
-        )
+        server._notification_poller_loop(stop, "sid_busy", sess)
 
         # Status update was emitted (user sees it)
         status_calls = [a for a in emitted if a[0] == "status.update"]
@@ -16324,10 +16224,11 @@ def test_notification_poller_emits_distinct_watch_matches_once(monkeypatch):
     isolated_queue.put({**base, "output": "READY on port 9000"})
     isolated_queue.put(dict(base))
 
+    stop = threading.Event()
+    stop.set()
+
     try:
-        server._notification_poller_loop(
-            _StopAfterNotificationPolls(3), "sid_watch_dedup", sess
-        )
+        server._notification_poller_loop(stop, "sid_watch_dedup", sess)
         status_calls = [a for a in emitted if a[0] == "status.update"]
         assert len(status_calls) == 2
         status_text = "\n".join(call[2]["text"] for call in status_calls)

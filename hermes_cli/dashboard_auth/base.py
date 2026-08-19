@@ -51,7 +51,6 @@ class TokenPrincipal:
     principal: str
     provider: str
     scopes: tuple[str, ...] = ()
-    account_generation: str = ""
 
 
 @dataclass(frozen=True)

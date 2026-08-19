@@ -439,38 +439,16 @@ class SessionSchemaMixin:
                 self._conn.rollback()
             except sqlite3.Error:
                 pass
-            # A malformed FTS5 shadow table can make ``DROP TABLE
-            # messages_fts`` itself fail with ``vtable constructor failed``.
-            # The canonical messages table is still healthy, so use SQLite's
-            # controlled schema-repair escape hatch to remove only the known
-            # FTS virtual table and shadow objects, then recreate them from
-            # canonical rows. This path is reached only after ordinary DDL
-            # recovery failed and never deletes application tables.
-            try:
-                self._force_remove_corrupt_fts_objects(cursor)
-                cursor.executescript(
-                    "BEGIN IMMEDIATE;"
-                    + schema_sql
-                    + rebuild_sql
-                    + f"DELETE FROM state_meta WHERE key = '{FTS_STALE_KEY}';"
-                    + "COMMIT;"
-                )
-            except sqlite3.DatabaseError as force_exc:
-                try:
-                    self._conn.rollback()
-                except sqlite3.Error:
-                    pass
-                # Stale indexes must remain detached even on SQLite builds
-                # whose DDL transaction behavior differs.
-                self._drop_all_fts_triggers(cursor)
-                self._conn.commit()
-                logger.error(
-                    "Automatic rebuild of stale FTS indexes failed (%s; "
-                    "schema repair: %s); canonical writes remain enabled "
-                    "with FTS detached.",
-                    exc, force_exc,
-                )
-                return False
+            # Stale indexes must remain detached even on SQLite builds whose
+            # DDL transaction behavior differs.
+            self._drop_all_fts_triggers(cursor)
+            self._conn.commit()
+            logger.error(
+                "Automatic rebuild of stale FTS indexes failed (%s); "
+                "canonical writes remain enabled with FTS detached.",
+                exc,
+            )
+            return False
 
         self._fts_stale = False
         self._fts_enabled = True
@@ -480,38 +458,6 @@ class SessionSchemaMixin:
             "restored sync triggers."
         )
         return True
-
-    def _force_remove_corrupt_fts_objects(self, cursor: sqlite3.Cursor) -> None:
-        """Remove only corrupted base/trigram FTS objects from ``sqlite_master``.
-
-        SQLite may refuse a normal ``DROP TABLE`` after an FTS5 shadow page
-        has been damaged because dropping the virtual table constructs it
-        first. The database's canonical tables are unaffected, so deleting
-        this explicitly allow-listed derived schema is a safe last-resort
-        repair before the indexes are recreated. The caller must rebuild the
-        objects in the same recovery path; this is not a general schema API.
-        """
-        self._drop_all_fts_triggers(cursor)
-        rows = cursor.execute(
-            "SELECT name FROM sqlite_master WHERE "
-            "(name = 'messages_fts' OR name LIKE 'messages_fts_%') "
-            "AND type IN ('table', 'view', 'trigger')"
-        ).fetchall()
-        names = [str(row[0]) for row in rows]
-        if not names:
-            return
-        placeholders = ",".join("?" for _ in names)
-        cursor.execute("PRAGMA writable_schema = ON")
-        try:
-            cursor.execute(
-                f"DELETE FROM sqlite_master WHERE name IN ({placeholders})",
-                names,
-            )
-            version = int(cursor.execute("PRAGMA schema_version").fetchone()[0])
-            cursor.execute(f"PRAGMA schema_version = {version + 1}")
-        finally:
-            cursor.execute("PRAGMA writable_schema = OFF")
-        self._conn.commit()
 
     @staticmethod
     def _parse_schema_columns(schema_sql: str) -> Dict[str, Dict[str, str]]:

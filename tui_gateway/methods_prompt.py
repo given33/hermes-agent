@@ -4,8 +4,6 @@ Handler bodies are byte-identical to their pre-split server.py form; they
 are rebound onto server.py's globals at install time — see method_ctx.py.
 """
 
-import inspect
-
 from .method_ctx import HandlerRegistry
 
 import types
@@ -274,12 +272,6 @@ def _(rid, params: dict) -> dict:
     sid = params.get("session_id", "")
     raw_text = params.get("text", "")
     text = sanitize_user_prompt_text(raw_text) if isinstance(raw_text, str) else raw_text
-    raw_allow_tools = params.get("allow_tools")
-    allow_tools = (
-        None
-        if raw_allow_tools is None
-        else is_truthy_value(raw_allow_tools)
-    )
     # Off-screen sends (widget intents): type the persisted user row so no
     # client renders it as a bubble. Whitelisted to "hidden" — display_kind
     # is a DB-only sidecar and this RPC must not mint arbitrary kinds.
@@ -807,26 +799,7 @@ def _(rid, params: dict) -> dict:
                     },
                 )
                 return
-        # Some integrations and tests replace ``_run_prompt_submit`` with the
-        # original four-argument callback.  Inspect the replacement before
-        # passing the optional policy/display keywords so that this
-        # extension point remains backward compatible.
-        try:
-            run_parameters = inspect.signature(_run_prompt_submit).parameters
-        except (TypeError, ValueError):
-            run_parameters = {}
-        optional_kwargs: dict = {}
-        if "display_kind" in run_parameters or any(
-            parameter.kind is inspect.Parameter.VAR_KEYWORD
-            for parameter in run_parameters.values()
-        ):
-            optional_kwargs["display_kind"] = display_kind
-        if "allow_tools" in run_parameters or any(
-            parameter.kind is inspect.Parameter.VAR_KEYWORD
-            for parameter in run_parameters.values()
-        ):
-            optional_kwargs["allow_tools"] = allow_tools
-        _run_prompt_submit(rid, sid, session, text, **optional_kwargs)
+        _run_prompt_submit(rid, sid, session, text, display_kind=display_kind)
 
     run_thread = threading.Thread(target=run_after_agent_ready, daemon=True)
     # Keep a handle so session.interrupt can tell a live turn from a stuck
@@ -1456,6 +1429,16 @@ def _(rid, params: dict) -> dict:
     # window (read_window_below tool). allow_expired=True for the same reason
     # as terminal.read: the tool's bounded wait can expire while the renderer's
     # round-trip to the main process is still in flight.
+    return _respond(rid, params, "text", allow_expired=True)
+
+
+@method("tour.respond")
+def _(rid, params: dict) -> dict:
+    # `text` is a JSON string with the tour action's outcome (tour tool) —
+    # matched targets, the active step, or an error naming the bad selector.
+    # allow_expired=True for the same reason as terminal.read: a preview tour
+    # injecting driver.js into a slow page can lose the race with the tool's
+    # bounded wait.
     return _respond(rid, params, "text", allow_expired=True)
 
 

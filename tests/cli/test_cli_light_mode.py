@@ -8,7 +8,6 @@ before the terminal query, which is the path most users hit.
 
 from __future__ import annotations
 
-import sys
 
 import pytest
 
@@ -187,7 +186,6 @@ class TestOsc11DrainGuard:
     stragglers that slip past TCSAFLUSH.
     """
 
-    @pytest.mark.skipif(sys.platform == "win32", reason="termios is POSIX-only")
     def test_late_reply_is_consumed_not_leaked(self, cli_mod, monkeypatch):
         """Simulate a terminal that sends the OSC 11 reply 150ms after the
         query.  With the DA1 fence the main loop is still listening, so the
@@ -237,7 +235,6 @@ class TestOsc11DrainGuard:
         os.close(read_fd)
         os.close(write_fd)
 
-    @pytest.mark.skipif(sys.platform == "win32", reason="termios is POSIX-only")
     def test_post_deadline_straggler_is_drained(self, cli_mod, monkeypatch):
         """Bytes that arrive after the main loop has already finished (DA1
         answered instantly, reply straggles in during teardown) are eaten

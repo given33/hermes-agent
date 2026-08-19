@@ -97,7 +97,6 @@ Thread safety:
 import asyncio
 import contextvars
 import concurrent.futures
-from dataclasses import dataclass
 import errno
 import fnmatch
 import inspect
@@ -114,7 +113,7 @@ import time
 from types import SimpleNamespace
 from typing import Callable
 from datetime import datetime
-from typing import Any, Coroutine, Dict, Iterable, List, Optional, Set, Tuple
+from typing import Any, Coroutine, Dict, List, Optional, Set, Tuple
 from urllib.parse import urlparse
 
 from tools.registry import tool_error
@@ -592,12 +591,6 @@ _SAFE_ENV_KEYS_CASE_INSENSITIVE = frozenset({
     "WINDIR",
 })
 
-_WINDOWS_ENV_CANONICAL_NAMES = {
-    "PROGRAMFILES": "ProgramFiles",
-    "PROGRAMDATA": "ProgramData",
-    "PROGRAMW6432": "ProgramW6432",
-}
-
 # Regex for credential patterns to strip from error messages
 _CREDENTIAL_PATTERN = re.compile(
     r"(?:"
@@ -705,7 +698,7 @@ def _build_safe_env(user_env: Optional[dict]) -> dict:
             or key.startswith("XDG_")
             or (get_secret_source is not None and get_secret_source(key))
         ):
-            env[_WINDOWS_ENV_CANONICAL_NAMES.get(key.upper(), key)] = value
+            env[key] = value
     if user_env:
         env.update(user_env)
     return env
@@ -4226,34 +4219,6 @@ _CONNECT_RETRY_BASE_BACKOFF_SEC = 30.0
 _CONNECT_RETRY_MAX_BACKOFF_SEC = 600.0
 
 
-@dataclass(frozen=True)
-class MCPAvailability:
-    """A network-free snapshot of one configured MCP server."""
-
-    name: str
-    configured: bool
-    state: str
-    registered_tools: tuple[str, ...] = ()
-    last_error: str = ""
-    transport: str = "stdio"
-    disabled: bool = False
-
-    @property
-    def live(self) -> bool:
-        return self.state == "live"
-
-    def as_dict(self) -> dict[str, Any]:
-        return {
-            "name": self.name,
-            "configured": self.configured,
-            "state": self.state,
-            "registered_tools": list(self.registered_tools),
-            "last_error": self.last_error,
-            "transport": self.transport,
-            "disabled": self.disabled,
-        }
-
-
 def _record_connect_failure(server_name: str) -> None:
     """Stamp an exponential-backoff cooldown after a failed connect.
 
@@ -7203,62 +7168,6 @@ async def _discover_and_register_server(name: str, config: dict) -> List[str]:
 # Public API
 # ---------------------------------------------------------------------------
 
-_CAPABILITY_HINT_SERVERS: dict[str, frozenset[str]] = {
-    "ios.location": frozenset({
-        "ios-location", "ios-trajectory", "ios-places", "ios-map", "amap-route",
-    }),
-    "ios.weather": frozenset({"ios-location", "qweather", "amap-route"}),
-    "ios.health": frozenset({
-        "ios-health-sleep", "ios-health-heart", "ios-health-oxygen",
-        "ios-health-activity",
-    }),
-    "ios.calendar": frozenset({"ios-calendar", "ios-reminders"}),
-    "ios.screen_time": frozenset({"ios-screen-time"}),
-    "ios.motion": frozenset({"ios-motion", "ios-behavior"}),
-    "ios.power": frozenset({"ios-power"}),
-}
-
-
-def select_mcp_servers_for_capabilities(
-    servers: Dict[str, dict],
-    capability_hints: Iterable[str],
-) -> Dict[str, dict]:
-    """Select enabled MCP servers explicitly named by route capabilities."""
-
-    normalized_hints = {
-        str(value or "").strip().lower()
-        for value in capability_hints
-        if str(value or "").strip()
-    }
-    selected_names: set[str] = set()
-    for hint in normalized_hints:
-        selected_names.update(_CAPABILITY_HINT_SERVERS.get(hint, ()))
-        if hint.startswith("mcp."):
-            selected_names.add(hint[4:])
-
-    selected: Dict[str, dict] = {}
-    for name, config in servers.items():
-        if not isinstance(config, dict):
-            continue
-        if not _parse_boolish(config.get("enabled", True), default=True):
-            continue
-        declared = config.get("capability_hints", config.get("capabilities", ()))
-        if isinstance(declared, str):
-            declared = [declared]
-        declared_hints = {
-            str(value or "").strip().lower()
-            for value in (declared or ())
-            if str(value or "").strip()
-        }
-        normalized_name = str(name).strip().lower()
-        if (
-            normalized_name in selected_names
-            or normalized_name in normalized_hints
-            or bool(declared_hints & normalized_hints)
-        ):
-            selected[name] = config
-    return selected
-
 def register_mcp_servers(servers: Dict[str, dict]) -> List[str]:
     """Connect to explicit MCP servers and register their tools.
 
@@ -7473,9 +7382,7 @@ def register_mcp_servers(servers: Dict[str, dict]) -> List[str]:
     return _existing_tool_names()
 
 
-def discover_mcp_tools(
-    capability_hints: Optional[Iterable[str]] = None,
-) -> List[str]:
+def discover_mcp_tools() -> List[str]:
     """Entry point: load config, connect to MCP servers, register tools.
 
     Called from ``model_tools`` after ``discover_builtin_tools()``. Safe to call even when
@@ -7488,8 +7395,6 @@ def discover_mcp_tools(
         List of all registered MCP tool names.
     """
     servers = _load_mcp_config()
-    if capability_hints is not None:
-        servers = select_mcp_servers_for_capabilities(servers, capability_hints)
     if not servers:
         logger.debug("No MCP servers configured")
         return []
@@ -7579,71 +7484,6 @@ def is_mcp_tool_parallel_safe(tool_name: str) -> bool:
     with _lock:
         server_name = _mcp_tool_server_names.get(tool_name)
         return bool(server_name and server_name in _parallel_safe_servers)
-
-
-def get_mcp_availability() -> List[MCPAvailability]:
-    """Return configured, live, and lazy-ready MCP state without network I/O."""
-
-    configured = _load_mcp_config()
-    with _lock:
-        active_servers = dict(_servers)
-        connecting = set(_server_connecting)
-        connect_errors = dict(_server_connect_errors)
-        lazy_tools = {
-            name: tuple(sorted(tool_names))
-            for name, tool_names in _lazy_server_tool_names.items()
-        }
-
-    snapshots: List[MCPAvailability] = []
-    for name, cfg in configured.items():
-        if not isinstance(cfg, dict):
-            continue
-        transport = str(cfg.get("transport", "http") if "url" in cfg else "stdio")
-        enabled = _parse_boolish(cfg.get("enabled", True), default=True)
-        server = active_servers.get(name)
-        live_tools = tuple(
-            sorted(getattr(server, "_registered_tool_names", ()) or ())
-        )
-        if not enabled:
-            state = "unavailable"
-            error = "disabled"
-            tools = ()
-        elif name in connecting:
-            state = "connecting"
-            error = ""
-            tools = ()
-        elif server is not None and server.session is not None:
-            state = "live"
-            error = ""
-            tools = live_tools
-        elif name in lazy_tools:
-            state = "ready"
-            error = ""
-            tools = lazy_tools[name]
-        elif server is not None:
-            state = "degraded"
-            error = connect_errors.get(name, "transport reconnecting")
-            tools = ()
-        elif name in connect_errors:
-            state = "unavailable"
-            error = connect_errors[name]
-            tools = ()
-        else:
-            state = "configured"
-            error = ""
-            tools = ()
-        snapshots.append(
-            MCPAvailability(
-                name=name,
-                configured=True,
-                state=state,
-                registered_tools=tools,
-                last_error=error,
-                transport=transport,
-                disabled=not enabled,
-            )
-        )
-    return snapshots
 
 
 def get_mcp_status() -> List[dict]:

@@ -31,7 +31,6 @@ import weakref
 from concurrent.futures import (
     TimeoutError as FuturesTimeoutError,
 )
-from pathlib import Path
 from typing import Any, Dict, List, Optional
 from urllib.parse import urlsplit, urlunsplit
 
@@ -264,13 +263,7 @@ def _close_subagent_steering(subagent_id: str, agent: Any) -> Optional[str]:
         return pending if isinstance(pending, str) and pending.strip() else None
 
 
-def interrupt_subagent(
-    subagent_id: str,
-    *,
-    owner_session_id: Optional[str] = None,
-    owner_transport: Any = None,
-    owner_session_record: Any = None,
-) -> bool:
+def interrupt_subagent(subagent_id: str) -> bool:
     """Request that a single running subagent stop at its next iteration boundary.
 
     Does not hard-kill the worker thread (Python can't); sets the child's
@@ -281,14 +274,6 @@ def interrupt_subagent(
     with _active_subagents_lock:
         record = _active_subagents.get(subagent_id)
     if not record:
-        return False
-    if owner_session_id is not None and (
-        record.get("owner_session_id") != owner_session_id
-        or owner_transport is None
-        or record.get("owner_transport") is not owner_transport
-        or owner_session_record is None
-        or record.get("owner_session_record") is not owner_session_record
-    ):
         return False
     agent = record.get("agent")
     if agent is None:
@@ -368,31 +353,18 @@ def _capture_gateway_steer_authority(
         return None, None
 
 
-def list_active_subagents(
-    *,
-    owner_session_id: Optional[str] = None,
-    owner_transport: Any = None,
-    owner_session_record: Any = None,
-    include_control_fields: bool = False,
-) -> List[Dict[str, Any]]:
+def list_active_subagents() -> List[Dict[str, Any]]:
     """Snapshot of the currently running subagent tree.
 
     Each record: {subagent_id, parent_id, depth, goal, model, started_at,
     tool_count, status}.  Safe to call from any thread — returns a copy.
     """
     with _active_subagents_lock:
-        snapshots = []
-        for record in _active_subagents.values():
-            if owner_session_id is not None and not (
-                record.get("owner_session_id") == owner_session_id
-                and record.get("owner_transport") is owner_transport
-                and record.get("owner_session_record") is owner_session_record
-            ):
-                continue
-            snapshot = {
-                key: value
-                for key, value in record.items()
-                if key
+        return [
+            {
+                k: v
+                for k, v in r.items()
+                if k
                 not in {
                     "agent",
                     "owner_session_id",
@@ -401,10 +373,8 @@ def list_active_subagents(
                     "accepting_steer",
                 }
             }
-            if include_control_fields:
-                snapshot["accepting_steer"] = bool(record.get("accepting_steer", False))
-            snapshots.append(snapshot)
-        return snapshots
+            for r in _active_subagents.values()
+        ]
 
 
 def _is_descendant_of(child_agent: Any, parent_agent: Any, max_hops: int = 8) -> bool:
@@ -518,10 +488,6 @@ def _handle_control_action(
                 {
                     "subagent_id": r.get("subagent_id"),
                     "parent_id": r.get("parent_id"),
-                    # The model chooses display names for its children (a
-                    # Chinese job title etc.); showing them alongside the
-                    # opaque id makes steer/stop addressing far easier.
-                    "name": r.get("name"),
                     "goal": r.get("goal"),
                     "model": r.get("model"),
                     "status": r.get("status"),
@@ -1212,12 +1178,6 @@ def _build_child_system_prompt(
     role: str = "leaf",
     max_spawn_depth: int = 2,
     child_depth: int = 1,
-    expected_output: Optional[str] = None,
-    acceptance_criteria: Optional[List[str]] = None,
-    inherited_context: Optional[str] = None,
-    context_variables: Optional[Dict[str, Any]] = None,
-    rules_text: Optional[str] = None,
-    name: Optional[str] = None,
 ) -> str:
     """Build a focused system prompt for a child agent.
 
@@ -1227,61 +1187,13 @@ def _build_child_system_prompt(
     The depth note is literal truth (grounded in the passed config) so
     the LLM doesn't confabulate nesting capabilities that don't exist.
     """
-    identity = (
-        f"Your name is {name}."
-        if name and str(name).strip()
-        else f"You are subagent {child_depth}."
-    )
     parts = [
-        identity,
         "You are a focused subagent working on a specific delegated task.",
         "",
         f"YOUR TASK:\n{goal}",
     ]
     if context and context.strip():
         parts.append(f"\nCONTEXT:\n{context}")
-    if expected_output and expected_output.strip():
-        parts.append(
-            "\nEXPECTED OUTPUT:\n"
-            f"{expected_output.strip()}\n"
-            "This is the deliverable your parent needs from you. Shape your "
-            "final summary so it satisfies this contract explicitly."
-        )
-    if acceptance_criteria:
-        criteria = [
-            str(item).strip()
-            for item in acceptance_criteria
-            if str(item).strip()
-        ]
-        if criteria:
-            parts.append(
-                "\nACCEPTANCE CRITERIA (verify each one before finishing):\n"
-                + "\n".join(f"- {item}" for item in criteria)
-                + "\nIn your final summary, address every criterion explicitly "
-                "(satisfied / not satisfied + why)."
-            )
-    if inherited_context and inherited_context.strip():
-        parts.append(
-            "\nPARENT CONTEXT (last turns, provided by your parent):\n"
-            f"{inherited_context.strip()}\n"
-            "This is a selective excerpt of your parent's conversation. Treat "
-            "it as background only — your task above remains authoritative."
-        )
-    if context_variables:
-        try:
-            cv_text = json.dumps(context_variables, ensure_ascii=False, sort_keys=True)
-            if len(cv_text) <= 8000:
-                parts.append(
-                    "\nSHARED CONTEXT (structured state from your parent):\n"
-                    f"```json\n{cv_text}\n```"
-                )
-        except (TypeError, ValueError):
-            pass
-    if rules_text and rules_text.strip():
-        parts.append(
-            "\nTEAM RULES (read before acting):\n"
-            f"{rules_text.strip()}"
-        )
     if workspace_path and str(workspace_path).strip():
         parts.append(
             "\nWORKSPACE PATH:\n"
@@ -1363,120 +1275,6 @@ def _resolve_workspace_hint(parent_agent) -> Optional[str]:
     return None
 
 
-_MAX_RULES_TEXT_CHARS = 6000
-_MAX_INHERITED_CONTEXT_CHARS = 6000
-
-
-def _collect_team_rules(parent_agent, workspace_hint: Optional[str]) -> Optional[str]:
-    """Collect team rule files for injection into the child system prompt.
-
-    opencode-style (instruction.ts): global rules (HERMES_HOME/SOUL.md, the
-    agent's personality/standing instructions) plus the nearest project-level
-    AGENTS.md (findUp — first match wins, no stacking of every ancestor).
-    The child gets the rules injected instead of having to discover them,
-    solving the "subagent doesn't know the team rules" gap.
-    """
-    candidates: List[Path] = []
-    seen: set = set()
-    hermes_home = os.environ.get("HERMES_HOME") or ""
-    if hermes_home:
-        for name in ("SOUL.md", "AGENTS.md"):
-            path = Path(hermes_home) / name
-            if path.is_file():
-                key = str(path.resolve())
-                if key not in seen:
-                    seen.add(key)
-                    candidates.append(path)
-    # Nearest project-level AGENTS.md from the workspace (first match wins).
-    if workspace_hint:
-        current = Path(workspace_hint).resolve()
-        for directory in (current, *current.parents):
-            candidate = directory / "AGENTS.md"
-            if candidate.is_file():
-                key = str(candidate.resolve())
-                if key not in seen:
-                    seen.add(key)
-                    candidates.append(candidate)
-                break
-    if not candidates:
-        return None
-    blocks: List[str] = []
-    budget = _MAX_RULES_TEXT_CHARS
-    for path in candidates:
-        try:
-            text = path.read_text(encoding="utf-8", errors="replace").strip()
-        except OSError:
-            continue
-        if not text:
-            continue
-        if len(text) > budget:
-            text = text[:budget] + "\n… [truncated]"
-        budget -= len(text)
-        blocks.append(f"## {path.name} ({path})\n{text}")
-        if budget <= 0:
-            break
-    return "\n\n".join(blocks) if blocks else None
-
-
-def _collect_inherited_context(
-    parent_agent,
-    inherit_turns: int,
-) -> Optional[str]:
-    """Collect the last N parent turns as selective shallow inheritance.
-
-    codex fork_turns adaptation (control/spawn.rs keep_forked_rollout_item):
-    only user messages and assistant final text are inherited — reasoning,
-    tool calls and tool outputs are dropped, so the excerpt stays a compact
-    narrative of what was asked and what was concluded. Default 0 = no
-    inheritance (fresh-context subagent).
-    """
-    if not inherit_turns or inherit_turns < 1:
-        return None
-    session_db = getattr(parent_agent, "session_db", None)
-    session_id = getattr(parent_agent, "session_id", "") or ""
-    if session_db is None or not session_id:
-        return None
-    try:
-        messages = session_db.get_messages_as_conversation(session_id)
-    except Exception:
-        return None
-    if not messages:
-        return None
-    # Filter to the narrative: user messages verbatim; assistant messages
-    # keep only plain content (no tool-call batches / tool results).
-    narrative: List[Dict[str, str]] = []
-    for message in messages:
-        role = str(message.get("role") or "").lower()
-        content = str(message.get("content") or "").strip()
-        if not content:
-            continue
-        if role == "user":
-            narrative.append({"role": "user", "text": content})
-        elif role == "assistant" and not message.get("tool_calls"):
-            narrative.append({"role": "assistant", "text": content})
-    if not narrative:
-        return None
-    # Keep the last N user-turn boundaries (codex truncate_rollout_to_last_n_fork_turns).
-    user_indices = [i for i, item in enumerate(narrative) if item["role"] == "user"]
-    if len(user_indices) > inherit_turns:
-        start = user_indices[-inherit_turns]
-        narrative = narrative[start:]
-    lines: List[str] = []
-    budget = _MAX_INHERITED_CONTEXT_CHARS
-    for item in narrative:
-        text = item["text"]
-        if len(text) > 2000:
-            text = text[:2000] + "…"
-        if len(text) > budget:
-            text = text[:budget] + "…"
-        budget -= len(text)
-        prefix = "User asked:" if item["role"] == "user" else "Assistant concluded:"
-        lines.append(f"{prefix} {text}")
-        if budget <= 0:
-            break
-    return "\n\n".join(lines) if lines else None
-
-
 def _strip_blocked_tools(toolsets: List[str]) -> List[str]:
     """Remove toolsets that contain only blocked tools.
 
@@ -1511,15 +1309,12 @@ def _blocked_toolsets_for_role(role: str) -> List[str]:
     blocked_names = set(DELEGATE_BLOCKED_TOOLS)
     if role == "orchestrator":
         blocked_names.discard("delegate_task")
-    result = sorted(
+    return sorted(
         name
         for name, defn in TOOLSETS.items()
         if defn.get("tools")
         and set(defn.get("tools", ())).issubset(blocked_names)
     )
-    if role != "orchestrator" and "delegation" not in result:
-        result.append("delegation")
-    return result
 
 
 def _emit_parent_console(parent_agent, line: str) -> None:
@@ -1546,7 +1341,6 @@ def _build_child_progress_callback(
     parent_agent,
     task_count: int = 1,
     *,
-    name: Optional[str] = None,
     subagent_id: Optional[str] = None,
     parent_id: Optional[str] = None,
     depth: Optional[int] = None,
@@ -1590,8 +1384,6 @@ def _build_child_progress_callback(
             "task_count": task_count,
             "goal": goal_label,
         }
-        if name and str(name).strip():
-            kw["name"] = str(name).strip()[:64]
         if subagent_id is not None:
             kw["subagent_id"] = subagent_id
         if parent_id is not None:
@@ -1806,12 +1598,6 @@ def _build_child_agent(
     # 'leaf' (default) cannot; 'orchestrator' retains the delegation
     # toolset subject to depth/kill-switch bounds applied below.
     role: str = "leaf",
-    expected_output: Optional[str] = None,
-    acceptance_criteria: Optional[List[str]] = None,
-    inherited_context: Optional[str] = None,
-    context_variables: Optional[Dict[str, Any]] = None,
-    rules_text: Optional[str] = None,
-    name: Optional[str] = None,
 ):
     """
     Build a child AIAgent on the main thread (thread-safe construction).
@@ -1921,12 +1707,6 @@ def _build_child_agent(
         role=effective_role,
         max_spawn_depth=max_spawn,
         child_depth=child_depth,
-        expected_output=expected_output,
-        acceptance_criteria=acceptance_criteria,
-        inherited_context=inherited_context,
-        context_variables=context_variables,
-        rules_text=rules_text,
-        name=name,
     )
     # Extract parent's API key so subagents inherit auth (e.g. Nous Portal).
     parent_api_key = getattr(parent_agent, "api_key", None)
@@ -1951,7 +1731,6 @@ def _build_child_agent(
         model=effective_model_for_cb,
         toolsets=child_toolsets,
         session_ref=child_session_ref,
-        name=name,
     )
 
     # Each subagent gets its own iteration budget capped at max_iterations
@@ -2225,7 +2004,6 @@ def _build_child_agent(
     child._subagent_id = subagent_id
     child._parent_subagent_id = parent_subagent_id
     child._subagent_goal = goal
-    child._delegate_parent_ref = weakref.ref(parent_agent)
     child._parent_turn_id = getattr(parent_agent, "_current_turn_id", "") or ""
     # Ownership chain for the model-facing control plane (action=list/steer/
     # stop): a parent may only control agents whose weakref chain reaches it.
@@ -2819,10 +2597,6 @@ def _run_single_child(
                 "parent_id": _parent_sid if isinstance(_parent_sid, str) else None,
                 "depth": _tui_depth,
                 "goal": goal,
-                "name": (
-                    str(getattr(child, "_subagent_name", "") or "").strip()
-                    or None
-                ),
                 "delegation_id": (
                     _delegation_id if isinstance(_delegation_id, str) else None
                 ),
@@ -2997,7 +2771,6 @@ def _run_single_child(
         # Capture the worker thread so the timeout diagnostic can dump its
         # Python stack (see #14726 — 0-API-call hangs are opaque without it).
         _worker_thread_holder: Dict[str, Optional[threading.Thread]] = {"t": None}
-        _child_call_started = threading.Event()
 
         def _relay_child_text(delta: str) -> None:
             # Forward the child's streamed reply text up the progress relay so
@@ -3015,7 +2788,6 @@ def _run_single_child(
             from agent.delegation_context import delegated_child_context
 
             with delegated_child_context(str(getattr(child, "session_id", "") or "")):
-                _child_call_started.set()
                 return child.run_conversation(
                     user_message=goal,
                     task_id=child_task_id,
@@ -3028,12 +2800,6 @@ def _run_single_child(
             _run_with_thread_capture,
         )
         try:
-            # A child execution timeout measures the child's work, not thread
-            # scheduling delay. Keep executor startup separately bounded so a
-            # saturated host cannot consume the entire turn budget before the
-            # child has acquired its conversation lease.
-            if not _child_call_started.wait(timeout=10.0):
-                raise RuntimeError("subagent worker did not start within 10 seconds")
             result = _child_future.result(timeout=child_timeout)
         except Exception as _timeout_exc:
             # No consumer boundary remains once this owner stops waiting for
@@ -3836,11 +3602,7 @@ def delegate_task(
     role: Optional[str] = None,
     background: Optional[bool] = None,
     output_schema: Optional[Dict[str, Any]] = None,
-    expected_output: Optional[str] = None,
-    acceptance_criteria: Optional[List[str]] = None,
-    inherit_turns: Optional[int] = None,
-    context_variables: Optional[Dict[str, Any]] = None,
-    name: Optional[str] = None,    action: Optional[str] = None,
+    action: Optional[str] = None,
     subagent_id: Optional[str] = None,
     message: Optional[str] = None,
     parent_agent=None,
@@ -3863,20 +3625,6 @@ def delegate_task(
     'leaf' (default) cannot; 'orchestrator' retains the delegation
     toolset and can spawn its own workers, bounded by
     delegation.max_spawn_depth.  Per-task role beats the top-level one.
-
-    Agent-team contract fields:
-      - expected_output: what the subagent must deliver (injected into its
-        system prompt as the deliverable contract).
-      - acceptance_criteria: list of verifiable pass conditions the
-        subagent must address explicitly in its final summary.
-      - inherit_turns: selective shallow inheritance (codex fork_turns) —
-        the last N user/assistant turns of THIS conversation, filtered to
-        narrative only (no reasoning/tool traces). Default 0 = fresh
-        context.
-      - context_variables: small structured KV shared with the subagent
-        (swarm-style), distinct from free-text context.
-    Batch tasks may carry the same fields per task, overriding the
-    top-level values.
 
     Returns JSON with results array, one entry per task.
     """
@@ -3907,22 +3655,6 @@ def delegate_task(
 
     # Normalise the top-level role once; per-task overrides re-normalise.
     top_role = _normalize_role(role)
-    # Agent-team contract fields (top-level defaults; per-task overrides).
-    top_expected_output = str(expected_output).strip() if expected_output else ""
-    top_acceptance = (
-        [str(item).strip() for item in acceptance_criteria if str(item).strip()]
-        if isinstance(acceptance_criteria, list)
-        else []
-    )
-    try:
-        top_inherit_turns = int(inherit_turns or 0)
-    except (TypeError, ValueError):
-        top_inherit_turns = 0
-    top_inherit_turns = max(0, min(top_inherit_turns, 20))
-    top_context_variables = (
-        dict(context_variables) if isinstance(context_variables, dict) else None
-    )
-    top_subagent_name = str(name or "").strip()[:64] if name else ""
 
     # Background (async) delegation now applies to BOTH single tasks and
     # batches. A batch is dispatched as ONE async unit: the whole fan-out runs
@@ -4001,16 +3733,6 @@ def delegate_task(
         single_task: Dict[str, Any] = {"goal": goal, "context": context, "role": top_role}
         if output_schema is not None:
             single_task["output_schema"] = output_schema
-        if expected_output:
-            single_task["expected_output"] = expected_output
-        if acceptance_criteria:
-            single_task["acceptance_criteria"] = acceptance_criteria
-        if inherit_turns:
-            single_task["inherit_turns"] = inherit_turns
-        if context_variables:
-            single_task["context_variables"] = context_variables
-        if top_subagent_name:
-            single_task["name"] = top_subagent_name
         task_list = [single_task]
     else:
         return tool_error("Provide either 'goal' (single task) or 'tasks' (batch).")
@@ -4115,61 +3837,33 @@ def delegate_task(
             from tools.delegation_output_schema import append_output_contract
 
             _child_context = append_output_contract(_child_context, _task_schema)
-    # Agent-team contract fields (expected_output / acceptance_criteria /
-    # inherit_turns / context_variables) resolve per task, falling back
-    # to the top-level arguments.
-        _expected_output = t.get("expected_output") or top_expected_output
-        _acceptance = t.get("acceptance_criteria") or top_acceptance
-        _inherit = int(t.get("inherit_turns") if t.get("inherit_turns") is not None else top_inherit_turns or 0) or 0
-        _cvars = t.get("context_variables") or top_context_variables
-    # Subagent display name (model-chosen, ideally a Chinese job title like
-    # "资料调查员"); surfaced in events, the registry and transcripts so the
-    # parent and the UI can address the child by name (codex/pi style).
-        _subagent_name = str(t.get("name") or top_subagent_name or "").strip()[:64] or None
-    # Selective shallow inheritance (codex fork_turns): collect the
-    # parent's last N turns once per child that asks for it.
-        _inherited = (
-            _collect_inherited_context(parent_agent, _inherit)
-            if _inherit
-            else None
-        )
-    # Team rules (opencode findUp style): global SOUL.md + nearest
-    # project AGENTS.md, injected instead of self-discovered.
-        _rules = _collect_team_rules(
-            parent_agent, _resolve_workspace_hint(parent_agent)
-        )
-        child = _build_child_preserving_parent_tools(
-            task_index=i,
-            goal=t["goal"],
-            context=_child_context,
-            # Subagents always inherit the parent's toolsets; the model
-            # cannot choose or narrow them (no model-facing toolsets arg).
-            toolsets=None,
-            model=creds["model"],
-            max_iterations=effective_max_iter,
-            task_count=n_tasks,
-            parent_agent=parent_agent,
-            override_provider=creds["provider"],
-            override_base_url=creds["base_url"],
-            override_api_key=creds["api_key"],
-            override_api_mode=creds["api_mode"],
-            override_request_overrides=creds.get("request_overrides"),
-            override_max_tokens=creds.get("max_output_tokens"),
-            override_acp_command=creds.get("command"),
-            override_acp_args=creds.get("args"),
-            role=effective_role,
-            expected_output=_expected_output,
-            acceptance_criteria=_acceptance,
-            inherited_context=_inherited,
-            context_variables=_cvars,
-            rules_text=_rules,
-            name=_subagent_name,
-        )
-        if _subagent_name:
-            try:
-                child._subagent_name = _subagent_name
-            except Exception:
-                logger.debug("Could not attach subagent name to child %d", i)        # Attach the validated schema for the completion-side validation
+        try:
+            child = _build_child_preserving_parent_tools(
+                task_index=i,
+                goal=t["goal"],
+                context=_child_context,
+                # Subagents always inherit the parent's toolsets; the model
+                # cannot choose or narrow them (no model-facing toolsets arg).
+                toolsets=None,
+                model=creds["model"],
+                max_iterations=effective_max_iter,
+                task_count=n_tasks,
+                parent_agent=parent_agent,
+                override_provider=creds["provider"],
+                override_base_url=creds["base_url"],
+                override_api_key=creds["api_key"],
+                override_api_mode=creds["api_mode"],
+                override_request_overrides=creds.get("request_overrides"),
+                override_max_tokens=creds.get("max_output_tokens"),
+                override_acp_command=creds.get("command"),
+                override_acp_args=creds.get("args"),
+                role=effective_role,
+            )
+        except ValueError as exc:
+            # Explicit-pin preflight failures (e.g. pinned delegation.command
+            # missing from PATH) refuse the spawn loudly (#80450).
+            return tool_error(str(exc))
+        # Attach the validated schema for the completion-side validation
         # hook in _run_single_child. Absent (None) on schema-less tasks.
         if _task_schema is not None:
             try:
@@ -5095,52 +4789,6 @@ DELEGATE_TASK_SCHEMA = {
                                 "require only fields you will actually read."
                             ),
                         },
-                        "expected_output": {
-                            "type": "string",
-                            "description": (
-                                "What the subagent must deliver. Injected "
-                                "into its system prompt as the deliverable "
-                                "contract so its summary satisfies this "
-                                "explicitly."
-                            ),
-                        },
-                        "acceptance_criteria": {
-                            "type": "array",
-                            "items": {"type": "string"},
-                            "description": (
-                                "Verifiable pass conditions the subagent "
-                                "must address one-by-one in its final "
-                                "summary (satisfied / not + why)."
-                            ),
-                        },
-                        "inherit_turns": {
-                            "type": "integer",
-                            "minimum": 0,
-                            "maximum": 20,
-                            "description": (
-                                "Selectively inherit the last N turns of "
-                                "this conversation (narrative only — user "
-                                "messages and assistant conclusions, no "
-                                "tool traces). 0 = fresh context (default)."
-                            ),
-                        },
-                        "name": {
-                            "type": "string",
-                            "description": (
-                                "A short display name for this subagent — "
-                                "prefer a Chinese job title (e.g. \"资料调查员\", "
-                                "\"代码审查员\"). The name identifies the child in "
-                                "events, the agent roster and transcripts."
-                            ),
-                        },
-                        "context_variables": {
-                            "type": "object",
-                            "description": (
-                                "Small structured KV shared with the "
-                                "subagent (swarm-style context_variables), "
-                                "distinct from free-text context."
-                            ),
-                        },
                     },
                     "required": ["goal"],
                 },
@@ -5160,47 +4808,6 @@ DELEGATE_TASK_SCHEMA = {
                     "Optional JSON Schema for the single-goal form — the "
                     "subagent's final answer must validate against it "
                     "(same semantics as tasks[].output_schema)."
-                ),
-            },
-            "expected_output": {
-                "type": "string",
-                "description": (
-                    "What the subagent must deliver (single-goal form). "
-                    "Injected into its system prompt as the deliverable "
-                    "contract."
-                ),
-            },
-            "acceptance_criteria": {
-                "type": "array",
-                "items": {"type": "string"},
-                "description": (
-                    "Verifiable pass conditions the subagent must address "
-                    "one-by-one in its final summary (single-goal form)."
-                ),
-            },
-            "inherit_turns": {
-                "type": "integer",
-                "minimum": 0,
-                "maximum": 20,
-                "description": (
-                    "Selectively inherit the last N turns of this "
-                    "conversation (narrative only, no tool traces). "
-                    "0 = fresh context (default)."
-                ),
-            },
-            "name": {
-                "type": "string",
-                "description": (
-                    "A short display name for the subagent — prefer a "
-                    "Chinese job title (e.g. \"资料调查员\"). Identifies the "
-                    "child in events, the roster and transcripts."
-                ),
-            },
-            "context_variables": {
-                "type": "object",
-                "description": (
-                    "Small structured KV shared with the subagent "
-                    "(swarm-style context_variables)."
                 ),
             },
             "background": {
@@ -5316,230 +4923,4 @@ registry.register(
     check_fn=check_delegate_requirements,
     emoji="🔀",
     dynamic_schema_overrides=_build_dynamic_schema_overrides,
-)
-
-
-# ---------------------------------------------------------------------------
-# Agent-team steering surface: observe and redirect running subagents.
-#
-# delegate_task is background-first for top-level agents, so the parent can
-# keep working while children run. These two tools close the loop: the parent
-# can list the live child tree and queue direction adjustments into a specific
-# running subagent (delivered at its next iteration boundary via
-# AIAgent.steer, never cutting an in-flight tool call).
-# ---------------------------------------------------------------------------
-
-def subagent_list(parent_agent=None) -> str:
-    """Return the currently running subagent tree (ids, goals, status)."""
-    if parent_agent is None:
-        return tool_error("subagent_list requires a parent agent context.")
-    return _handle_control_action("list", None, None, parent_agent)
-
-
-def subagent_send(subagent_id: str, text: str, parent_agent=None) -> str:
-    """Queue a direction-adjustment instruction into a running subagent.
-
-    The instruction is delivered at the subagent's next iteration boundary
-    (appended to its current tool result) — the in-flight tool call is never
-    cut. Returns the outcome plus the live subagent tree when the target is
-    unknown or already finished, so the caller can re-target.
-    """
-    sid = str(subagent_id or "").strip()
-    msg = str(text or "").strip()
-    if not sid:
-        return tool_error(
-            "subagent_send requires subagent_id (find it with subagent_list)."
-        )
-    if not msg:
-        return tool_error("subagent_send requires a non-empty text.")
-    if parent_agent is None:
-        return tool_error("subagent_send requires a parent agent context.")
-    with _active_subagents_lock:
-        target_record = _active_subagents.get(sid)
-    # Durable session lineage, not the weakref chain alone: the parent
-    # AIAgent can be rebuilt mid-session (/model, credential refresh), and
-    # identity-only checks then strand every running child (the same class
-    # of live incident upstream fixed for delegate_task(action=steer)).
-    if target_record is None or not _owns_subagent_record(target_record, parent_agent):
-        return tool_error("subagent_send target is outside this spawn tree.")
-    steered_text = msg[:2000]
-    if steer_subagent(sid, steered_text):
-        return json.dumps(
-            {
-                "status": "queued",
-                "subagent_id": sid,
-                "note": (
-                    "指令已入队，将在该子代理下一次迭代时送达；"
-                    "不会打断它正在执行的工具。"
-                ),
-                **(
-                    {"truncated": True, "original_length": len(msg)}
-                    if len(msg) > 2000
-                    else {}
-                ),
-            },
-            ensure_ascii=False,
-        )
-    return json.dumps(
-        {
-            "status": "failed",
-            "reason": (
-                "没有找到可接收指令的运行中子代理"
-                "（可能已结束，或 subagent_id 不正确）。"
-            ),
-            "active_subagents": list_active_subagents(),
-        },
-        ensure_ascii=False,
-        default=str,
-    )
-
-
-SUBAGENT_LIST_SCHEMA = {
-    "name": "subagent_list",
-    "description": (
-        "List currently running subagents (their ids, names, goals, models, "
-        "status and progress) so you can steer, kill or wait for them. "
-        "Returns idle when no subagent is running."
-    ),
-    "parameters": {
-        "type": "object",
-        "properties": {},
-        "required": [],
-    },
-}
-
-SUBAGENT_SEND_SCHEMA = {
-    "name": "subagent_send",
-    "description": (
-        "Send a direction-adjustment instruction to a running subagent. "
-        "The instruction arrives at the subagent's next iteration boundary "
-        "without interrupting its current tool call. Use subagent_list to "
-        "find the subagent_id when you do not have it."
-    ),
-    "parameters": {
-        "type": "object",
-        "properties": {
-            "subagent_id": {
-                "type": "string",
-                "description": (
-                    "Id of the running subagent to steer (from subagent_list "
-                    "or the delegate_task result)."
-                ),
-            },
-            "text": {
-                "type": "string",
-                "description": (
-                    "The adjustment instruction: what to focus on, what to "
-                    "stop doing, what has changed, what to verify next."
-                ),
-            },
-        },
-        "required": ["subagent_id", "text"],
-    },
-}
-
-
-def subagent_kill(subagent_id: str, parent_agent=None) -> str:
-    """Terminate a running subagent at its next iteration boundary.
-
-    The creator's kill switch (pi Agent Hub `x`): stops the child without
-    aborting the parent session. Inspect the child's transcript first via
-    subagent_list / live transcripts, then decide — kill it, keep waiting,
-    or spawn a replacement that continues from where it stopped.
-    """
-    sid = str(subagent_id or "").strip()
-    if not sid:
-        return tool_error(
-            "subagent_kill requires subagent_id (find it with subagent_list)."
-        )
-    if parent_agent is None:
-        return tool_error("subagent_kill requires a parent agent context.")
-    with _active_subagents_lock:
-        target_record = _active_subagents.get(sid)
-    # Same durable-lineage ownership as subagent_send / delegate_task.
-    if target_record is None or not _owns_subagent_record(target_record, parent_agent):
-        return tool_error("subagent_kill target is outside this spawn tree.")
-    try:
-        accepted = interrupt_subagent(sid)
-    except Exception as exc:  # noqa: BLE001 - tool must return JSON, not raise
-        return json.dumps(
-            {
-                "status": "failed",
-                "reason": f"中断请求失败：{type(exc).__name__}: {exc}",
-                "active_subagents": list_active_subagents(),
-            },
-            ensure_ascii=False,
-            default=str,
-        )
-    if accepted:
-        return json.dumps(
-            {
-                "status": "kill_requested",
-                "subagent_id": sid,
-                "note": "已请求终止该子代理，它会在当前迭代边界停止（正在执行的工具会安全结束）。",
-            },
-            ensure_ascii=False,
-        )
-    return json.dumps(
-        {
-            "status": "failed",
-            "reason": "没有找到可终止的运行中子代理（可能已结束，或 subagent_id 不正确）。",
-            "active_subagents": list_active_subagents(),
-        },
-        ensure_ascii=False,
-        default=str,
-    )
-
-
-SUBAGENT_KILL_SCHEMA = {
-    "name": "subagent_kill",
-    "description": (
-        "Terminate a running subagent at its next iteration boundary — the "
-        "parent session and other subagents keep running. Use after checking "
-        "the child's status with subagent_list: if it is stalled or the task "
-        "changed, kill it and spawn a replacement."
-    ),
-    "parameters": {
-        "type": "object",
-        "properties": {
-            "subagent_id": {
-                "type": "string",
-                "description": (
-                    "Id of the running subagent to terminate (from "
-                    "subagent_list or the delegate_task result)."
-                ),
-            },
-        },
-        "required": ["subagent_id"],
-    },
-}
-
-registry.register(
-    name="subagent_list",
-    toolset="delegation",
-    schema=SUBAGENT_LIST_SCHEMA,
-    handler=lambda **kw: subagent_list(kw.get("parent_agent")),
-    emoji="🧭",
-)
-
-registry.register(
-    name="subagent_send",
-    toolset="delegation",
-    schema=SUBAGENT_SEND_SCHEMA,
-    handler=lambda args, **kw: subagent_send(
-        args.get("subagent_id"),
-        args.get("text"),
-        kw.get("parent_agent"),
-    ),
-    emoji="📨",
-)
-
-registry.register(
-    name="subagent_kill",
-    toolset="delegation",
-    schema=SUBAGENT_KILL_SCHEMA,
-    handler=lambda args, **kw: subagent_kill(
-        args.get("subagent_id"), kw.get("parent_agent")
-    ),
-    emoji="🛑",
 )

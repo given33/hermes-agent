@@ -15,9 +15,7 @@ Import chain (circular-import safe):
 """
 
 import ast
-from dataclasses import dataclass
 import functools
-import hashlib
 import importlib
 import json
 import logging
@@ -25,10 +23,7 @@ import sys
 import threading
 import time
 from pathlib import Path
-from typing import Any, Callable, Dict, List, Optional, Set
-
-from hermes_services import tool_contract, tool_isolation
-from hermes_runtime.capabilities import normalize_capability_tags, normalize_role_names
+from typing import Callable, Dict, List, Optional, Set
 
 from hermes_constants import hermes_home_key
 
@@ -212,15 +207,12 @@ class ToolEntry:
     __slots__ = (
         "name", "toolset", "schema", "handler", "check_fn",
         "requires_env", "is_async", "description", "emoji",
-        "max_result_size_chars", "dynamic_schema_overrides", "effect_metadata",
-        "prompt_guidance", "capability_tags", "allowed_roles",
+        "max_result_size_chars", "dynamic_schema_overrides",
     )
 
     def __init__(self, name, toolset, schema, handler, check_fn,
                  requires_env, is_async, description, emoji,
-                 max_result_size_chars=None, dynamic_schema_overrides=None,
-                 effect_metadata=None, prompt_guidance=None,
-                 capability_tags=None, allowed_roles=None):
+                 max_result_size_chars=None, dynamic_schema_overrides=None):
         self.name = name
         self.toolset = toolset
         self.schema = schema
@@ -239,145 +231,6 @@ class ToolEntry:
         # on every get_definitions() call; results are merged shallow on top
         # of the base schema before the {"type": "function", ...} wrap.
         self.dynamic_schema_overrides = dynamic_schema_overrides
-        self.effect_metadata = _normalize_tool_effect_metadata(effect_metadata)
-        if prompt_guidance is not None and not isinstance(prompt_guidance, str):
-            raise TypeError("prompt_guidance must be text")
-        self.prompt_guidance = str(prompt_guidance or "").strip()
-        self.capability_tags = normalize_capability_tags(capability_tags)
-        self.allowed_roles = normalize_role_names(allowed_roles)
-
-
-_TOOL_EFFECT_DURABILITIES = frozenset({
-    "in_memory", "local_durable", "remote_durable", "external",
-})
-_TOOL_EFFECT_REVERSIBILITY = frozenset({
-    "reversible", "compensatable", "irreversible", "unknown",
-})
-
-
-def _normalize_tool_effect_metadata(value: Any) -> dict[str, Any]:
-    """Validate the auditable side-effect contract attached to a tool."""
-
-    if value is None:
-        return {}
-    if not isinstance(value, dict):
-        raise TypeError("effect_metadata must be a dictionary")
-    allowed = {
-        "durability", "external_boundary", "reversibility", "compensation",
-        "approval", "idempotency_key", "resource_class",
-    }
-    unknown = set(value) - allowed
-    if unknown:
-        raise ValueError(
-            "effect_metadata contains unsupported field(s): "
-            + ", ".join(sorted(str(item) for item in unknown))
-        )
-    normalized = dict(value)
-    string_fields = (
-        "durability", "external_boundary", "reversibility", "approval",
-        "idempotency_key", "resource_class",
-    )
-    for key in string_fields:
-        if key in normalized and not isinstance(normalized[key], str):
-            raise TypeError(f"effect_metadata.{key} must be a string")
-    if normalized.get("durability") not in {None, *_TOOL_EFFECT_DURABILITIES}:
-        raise ValueError("effect_metadata.durability is invalid")
-    if normalized.get("reversibility") not in {None, *_TOOL_EFFECT_REVERSIBILITY}:
-        raise ValueError("effect_metadata.reversibility is invalid")
-    if "compensation" in normalized and not isinstance(
-        normalized["compensation"], (str, list, tuple)
-    ):
-        raise TypeError("effect_metadata.compensation must be text or a sequence")
-    return normalized
-
-
-class ToolRegistryResolutionError(RuntimeError):
-    """Raised when a registered handler cannot be reconstructed in a worker.
-
-    The isolated dispatcher deliberately transports a tool *identity*, not a
-    callable.  This exception keeps the failure explicit for handlers that are
-    created at runtime (for example an MCP connection or a test-only closure)
-    and therefore have no restart-safe registry identity.
-    """
-
-
-@dataclass(frozen=True)
-class HandlerDescriptor:
-    """Restart-safe identity and explicit isolation contract for one handler."""
-
-    tool_name: str
-    toolset: str
-    handler_module: Optional[str]
-    handler_qualname: Optional[str]
-    resolution: str
-    isolation_mode: str
-    isolation_contract: str
-    is_async: bool
-
-    def as_identity(self) -> dict[str, Any]:
-        return {
-            "tool_name": self.tool_name,
-            "toolset": self.toolset,
-            "handler_module": self.handler_module,
-            "handler_qualname": self.handler_qualname,
-            "resolution": self.resolution,
-            "isolation_mode": self.isolation_mode,
-            "isolation_contract": self.isolation_contract,
-            "is_async": self.is_async,
-        }
-
-
-_PARENT_RUNTIME_TOOLSETS = frozenset({
-    # These handlers address state owned by the long-lived agent process. A
-    # spawned registry would create a different browser/terminal/desktop
-    # session and make navigate->snapshot or terminal->read/close incoherent.
-    "browser",
-    "browser-cdp",
-    "computer_use",
-    "terminal",
-    "desktop_ui",
-})
-
-
-def _handler_isolation_mode(toolset: str) -> str:
-    normalized = str(toolset or "")
-    if normalized in _PARENT_RUNTIME_TOOLSETS or normalized.startswith("mcp-"):
-        return "parent_runtime"
-    return "registry_child"
-
-
-def _handler_resolution_kind(handler: Callable, toolset: str) -> str:
-    """Classify how an isolated child should resolve ``handler``.
-
-    Most built-ins are registered at module import time, including lambdas and
-    factory closures.  Those are resolved by importing the defining module and
-    looking up the stable registry name.  A normal module-level function also
-    gets a qualname fallback, which supports plugins and test fixtures that
-    register a handler dynamically.  Nested callables cannot be reconstructed
-    without serializing their closure and are intentionally rejected.
-    """
-    if str(toolset or "").startswith("mcp-"):
-        return "dynamic_mcp"
-    module = getattr(handler, "__module__", None)
-    qualname = getattr(handler, "__qualname__", None)
-    if not isinstance(module, str) or not module:
-        return "unresolvable"
-    if not isinstance(qualname, str) or not qualname:
-        return "unresolvable"
-    if "<locals>" in qualname:
-        return "registry_name"
-    if qualname == "<lambda>":
-        return "registry_name"
-    return "module_qualname"
-
-
-def _handler_isolation_contract(toolset: str, resolution: str) -> str:
-    mode = _handler_isolation_mode(toolset)
-    if mode == "parent_runtime":
-        return "parent_cooperative"
-    if resolution == "unresolvable":
-        return "unsupported"
-    return "child_rehydratable"
 
 
 class _PluginOverridePolicy:
@@ -675,163 +528,6 @@ class ToolRegistry:
             target = self._tools if scope is None else self._scoped_tools.get(scope, {})
             return target.get(name)
 
-    def registration_fingerprint(self, name: str) -> str | None:
-        """Return the stable execution identity advertised for one entry."""
-
-        entry = self.get_entry(name)
-        if entry is None:
-            return None
-        handler = entry.handler
-        dynamic = entry.dynamic_schema_overrides
-        payload = {
-            "name": entry.name,
-            "toolset": entry.toolset,
-            "schema": entry.schema,
-            "handler_module": getattr(handler, "__module__", ""),
-            "handler_qualname": getattr(handler, "__qualname__", ""),
-            "handler_identity": id(handler),
-            "is_async": bool(entry.is_async),
-            "requires_env": list(entry.requires_env),
-            "dynamic_schema_module": getattr(dynamic, "__module__", "") if dynamic else "",
-            "dynamic_schema_qualname": getattr(dynamic, "__qualname__", "") if dynamic else "",
-            "dynamic_schema_identity": id(dynamic) if dynamic else 0,
-            "effect_metadata": entry.effect_metadata,
-            # Model-facing guidance is part of the tool contract.  A plugin
-            # reload that changes guidance must invalidate the same contract
-            # snapshot as a schema or handler change.
-            "prompt_guidance": entry.prompt_guidance,
-            "capability_tags": sorted(entry.capability_tags),
-            "allowed_roles": sorted(entry.allowed_roles),
-        }
-        encoded = json.dumps(
-            payload,
-            sort_keys=True,
-            separators=(",", ":"),
-            ensure_ascii=False,
-            default=str,
-        ).encode("utf-8")
-        return hashlib.sha256(encoded).hexdigest()
-
-    def get_handler_descriptor(self, name: str) -> HandlerDescriptor:
-        """Return the immutable process-isolation descriptor for a tool."""
-
-        entry = self.get_entry(name)
-        if entry is None:
-            raise ToolRegistryResolutionError(f"unknown tool: {name}")
-        handler = entry.handler
-        resolution = _handler_resolution_kind(handler, entry.toolset)
-        isolation_mode = _handler_isolation_mode(entry.toolset)
-        return HandlerDescriptor(
-            tool_name=str(entry.name),
-            toolset=str(entry.toolset or ""),
-            handler_module=getattr(handler, "__module__", None),
-            handler_qualname=getattr(handler, "__qualname__", None),
-            resolution=resolution,
-            isolation_mode=isolation_mode,
-            isolation_contract=_handler_isolation_contract(
-                entry.toolset,
-                resolution,
-            ),
-            is_async=bool(entry.is_async),
-        )
-
-    def get_isolation_identity(self, name: str) -> dict:
-        """Return the process-safe identity for a registered tool.
-
-        Only immutable metadata crosses the process boundary.  In particular,
-        this method never returns ``entry.handler``: a callable may be a lambda,
-        closure, or an object tied to a live MCP session and pickling it would
-        either fail or accidentally capture mutable parent state.
-        """
-        return self.get_handler_descriptor(name).as_identity()
-
-    def resolve_handler_for_isolation(self, identity: dict) -> tuple[Callable, bool]:
-        """Resolve a child-process handler from a stable identity.
-
-        The defining module is imported first so import-time registrations can
-        repopulate the child registry.  Built-in lambdas and factory closures
-        are then found by their registry name.  For dynamically registered
-        module-level functions, the qualname is used as a narrow fallback.
-        Nested closures and dynamic MCP handlers have no safe reconstruction
-        path and receive an explicit ``ToolRegistryResolutionError``.
-        """
-        if not isinstance(identity, dict):
-            raise ToolRegistryResolutionError("invalid tool identity envelope")
-        name = str(identity.get("tool_name") or "").strip()
-        toolset = str(identity.get("toolset") or "")
-        module_name = identity.get("handler_module")
-        qualname = identity.get("handler_qualname")
-        resolution = str(identity.get("resolution") or "unresolvable")
-        expected_async = bool(identity.get("is_async", False))
-        if not name:
-            raise ToolRegistryResolutionError("tool identity is missing tool_name")
-        if resolution == "dynamic_mcp" or toolset.startswith("mcp-"):
-            raise ToolRegistryResolutionError(
-                f"tool '{name}' uses a live MCP handler and cannot be reconstructed "
-                "inside an isolated worker; dynamic MCP calls require a dedicated "
-                "process-safe adapter"
-            )
-        if not isinstance(module_name, str) or not module_name:
-            raise ToolRegistryResolutionError(
-                f"tool '{name}' has no importable handler module"
-            )
-
-        try:
-            importlib.import_module(module_name)
-        except Exception as exc:
-            raise ToolRegistryResolutionError(
-                f"tool '{name}' handler module '{module_name}' could not be imported: "
-                f"{type(exc).__name__}: {exc}"
-            ) from exc
-
-        entry = self.get_entry(name)
-        if entry is not None:
-            if str(entry.toolset or "") != toolset:
-                raise ToolRegistryResolutionError(
-                    f"tool '{name}' registry identity changed (expected toolset "
-                    f"{toolset!r}, found {entry.toolset!r})"
-                )
-            actual_module = getattr(entry.handler, "__module__", None)
-            if actual_module != module_name:
-                raise ToolRegistryResolutionError(
-                    f"tool '{name}' registry identity changed (expected module "
-                    f"{module_name!r}, found {actual_module!r})"
-                )
-            if bool(entry.is_async) != expected_async:
-                raise ToolRegistryResolutionError(
-                    f"tool '{name}' registry async identity changed"
-                )
-            return entry.handler, bool(entry.is_async)
-
-        if resolution != "module_qualname" or not isinstance(qualname, str):
-            raise ToolRegistryResolutionError(
-                f"tool '{name}' was not registered by module '{module_name}' and "
-                "has no stable module-level handler identity"
-            )
-        if "<locals>" in qualname or qualname == "<lambda>":
-            raise ToolRegistryResolutionError(
-                f"tool '{name}' was registered dynamically with a non-addressable "
-                f"handler ({module_name}.{qualname})"
-            )
-        try:
-            target: Any = importlib.import_module(module_name)
-            for component in qualname.split("."):
-                target = getattr(target, component)
-        except Exception as exc:
-            raise ToolRegistryResolutionError(
-                f"tool '{name}' module-level handler '{module_name}.{qualname}' "
-                f"could not be resolved: {type(exc).__name__}: {exc}"
-            ) from exc
-        if not callable(target):
-            raise ToolRegistryResolutionError(
-                f"tool '{name}' resolved handler '{module_name}.{qualname}' is not callable"
-            )
-        if getattr(target, "__module__", None) != module_name:
-            raise ToolRegistryResolutionError(
-                f"tool '{name}' resolved handler module does not match its identity"
-            )
-        return target, expected_async
-
     def get_registered_toolset_names(self) -> List[str]:
         """Return sorted unique toolset names present in the registry."""
         return sorted({entry.toolset for entry in self._snapshot_entries()})
@@ -1052,10 +748,6 @@ class ToolRegistry:
         max_result_size_chars: int | float | None = None,
         dynamic_schema_overrides: Callable = None,
         override: bool = False,
-        effect_metadata: dict | None = None,
-        prompt_guidance: str | None = None,
-        capability_tags: Set[str] | List[str] | None = None,
-        allowed_roles: Set[str] | List[str] | None = None,
         scope: Optional[str] = None,
     ):
         """Register a tool.  Called at module-import time by each tool file.
@@ -1152,10 +844,6 @@ class ToolRegistry:
                 emoji=emoji,
                 max_result_size_chars=max_result_size_chars,
                 dynamic_schema_overrides=dynamic_schema_overrides,
-                effect_metadata=effect_metadata,
-                prompt_guidance=prompt_guidance,
-                capability_tags=capability_tags,
-                allowed_roles=allowed_roles,
             )
             # Availability is now derived per-tool (_toolset_has_exposable_tools),
             # so this map no longer gates a toolset. It is still consumed by
@@ -1376,52 +1064,6 @@ class ToolRegistry:
             result.append({"type": "function", "function": schema_with_name})
         return result
 
-    def get_prompt_guidance(self, tool_names: Set[str]) -> Dict[str, str]:
-        """Return model guidance owned by the visible capability entries."""
-
-        entries = {entry.name: entry for entry in self._snapshot_entries()}
-        return {
-            name: entries[name].prompt_guidance
-            for name in sorted(tool_names)
-            if name in entries and entries[name].prompt_guidance
-        }
-
-    def get_capability_metadata(self, tool_names: Set[str] | None = None) -> Dict[str, dict]:
-        """Return capability tags and role visibility without exposing handlers."""
-
-        names = self.get_all_tool_names() if tool_names is None else set(tool_names)
-        return {
-            entry.name: {
-                "toolset": entry.toolset,
-                "capability_tags": sorted(entry.capability_tags),
-                "allowed_roles": sorted(entry.allowed_roles),
-                "effect_metadata": dict(entry.effect_metadata),
-            }
-            for entry in self._snapshot_entries()
-            if entry.name in names
-        }
-
-    def get_tool_names_for_role(self, role: str, tool_names: Set[str] | None = None) -> Set[str]:
-        """Filter a visible set for a collaboration role.
-
-        Untagged legacy tools remain visible; only explicitly tagged tools are
-        narrowed during the migration window.
-        """
-
-        from hermes_runtime.capabilities import role_allows
-
-        names = self.get_all_tool_names() if tool_names is None else set(tool_names)
-        result: Set[str] = set()
-        for entry in self._snapshot_entries():
-            if entry.name not in names:
-                continue
-            if not entry.capability_tags and not entry.allowed_roles:
-                result.add(entry.name)
-                continue
-            if role_allows(role, entry.capability_tags, explicit_roles=entry.allowed_roles):
-                result.add(entry.name)
-        return result
-
     # ------------------------------------------------------------------
     # Dispatch
     # ------------------------------------------------------------------
@@ -1462,7 +1104,6 @@ class ToolRegistry:
         name: str,
         args: dict,
         *,
-        isolate: bool = False,
         scope: Optional[str] = None,
         **kwargs,
     ) -> str | dict:
@@ -1478,48 +1119,12 @@ class ToolRegistry:
         if not entry:
             return tool_error(f"Unknown tool: {name}")
         try:
-            contract = tool_contract.resolve_tool_contract(name)
-
-            identity = self.get_isolation_identity(name)
-            use_child = (
-                (isolate or contract.timeout_seconds is not None)
-                and identity.get("isolation_mode") == "registry_child"
-            )
-            if use_child:
-                # Agent executors opt into process isolation for stateless
-                # registry handlers. Stateful browser/terminal/MCP handlers
-                # stay in the owning runtime so their sessions remain
-                # coherent; those handlers enforce their own deadlines.
-                result = tool_isolation.run_tool_handler_isolated(
-                    self.get_isolation_identity(name),
-                    args,
-                    kwargs,
-                    timeout_seconds=(
-                        float(contract.timeout_seconds)
-                        if contract.timeout_seconds is not None
-                        else tool_isolation.default_tool_timeout_seconds()
-                    ),
-                    tool_name=name,
-                    handler_resolver=_resolve_isolated_handler,
-                    interrupt_check=_tool_interrupt_requested,
-                )
-            elif entry.is_async:
+            if entry.is_async:
                 from model_tools import _run_async
                 result = _run_async(entry.handler(args, **kwargs))
             else:
                 result = entry.handler(args, **kwargs)
             return self._normalize_handler_result(name, result)
-        except tool_isolation.ToolIsolationResolutionError as e:
-            # A dynamic closure/live MCP handler cannot be reconstructed in a
-            # spawned worker. Return a typed, non-retryable error rather than
-            # silently falling back to a thread (which could outlive a turn).
-            logger.warning("Tool %s cannot be isolated: %s", name, e)
-            return json.dumps({
-                "error": str(e),
-                "error_type": "tool_isolation_resolution",
-                "tool": name,
-                "retryable": False,
-            }, ensure_ascii=False)
         except Exception as e:
             # exc_info already renders the exception, so keep the message copy bounded.
             logger.exception(
@@ -1656,52 +1261,6 @@ class ToolRegistry:
 
 # Module-level singleton
 registry = ToolRegistry()
-
-
-def _resolve_isolated_handler(identity: dict) -> tuple[Callable[..., Any], bool]:
-    """Resolve registry metadata inside a spawned tool worker."""
-
-    try:
-        return registry.resolve_handler_for_isolation(identity)
-    except ToolRegistryResolutionError as exc:
-        raise tool_isolation.ToolIsolationResolutionError(str(exc)) from exc
-    except tool_isolation.ToolIsolationResolutionError:
-        raise
-    except Exception as exc:
-        raise tool_isolation.ToolIsolationResolutionError(
-            f"isolated registry resolver failed: {type(exc).__name__}: {exc}"
-        ) from exc
-
-
-def _tool_interrupt_requested() -> bool:
-    from tools.interrupt import is_interrupted
-
-    return bool(is_interrupted())
-
-
-def _tool_contract_registry_generation() -> int:
-    with registry._lock:
-        return int(registry._generation)
-
-
-def _bump_tool_contract_registry_generation() -> None:
-    with registry._lock:
-        registry._generation += 1
-
-
-def _invalidate_model_tool_definitions() -> None:
-    module = sys.modules.get("model_tools")
-    clear = getattr(module, "_clear_tool_defs_cache", None)
-    if callable(clear):
-        clear()
-
-
-tool_contract.configure_tool_contract_runtime(
-    registry_generation=_tool_contract_registry_generation,
-    bump_registry_generation=_bump_tool_contract_registry_generation,
-    registration_fingerprint=registry.registration_fingerprint,
-    invalidate_definition_cache=_invalidate_model_tool_definitions,
-)
 
 
 # ---------------------------------------------------------------------------

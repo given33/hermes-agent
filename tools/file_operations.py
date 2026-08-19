@@ -1107,10 +1107,6 @@ class ShellFileOperations(FileOperations):
             result = self._exec("echo $HOME")
             if result.exit_code == 0 and result.stdout.strip():
                 home = result.stdout.strip()
-                if os.name == "nt":
-                    from tools.environments.local import _msys_to_windows_path
-
-                    home = _msys_to_windows_path(home)
                 if path == '~':
                     return home
                 elif path.startswith('~/'):
@@ -3023,10 +3019,6 @@ class ShellFileOperations(FileOperations):
                 files.append(parts[1])
             else:
                 files.append(line)
-
-        if os.name == "nt":
-            from tools.environments.local import _msys_to_windows_path
-            files = [_msys_to_windows_path(item) for item in files]
 
         # For explicit hidden roots, find's path-based filtering excludes every
         # file under the hidden path. Apply descendant filtering after command

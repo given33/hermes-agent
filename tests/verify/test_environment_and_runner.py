@@ -2,8 +2,6 @@
 
 import http.server
 import json
-import subprocess
-import sys
 import threading
 import time
 
@@ -15,15 +13,6 @@ from agent.verify.environment import (
 )
 from agent.verify.recipes import Recipe
 from agent.verify.runner import run_verify
-
-
-def _python_command(code: str) -> str:
-    return subprocess.list2cmdline([sys.executable, "-c", code])
-
-
-_PASS = _python_command("pass")
-_FAIL = _python_command("raise SystemExit(1)")
-_SLEEP = _python_command("import time; time.sleep(30)")
 
 
 class TestManifest:
@@ -84,7 +73,7 @@ class TestManifest:
 
 class TestRunner:
     def test_all_phases_pass(self, tmp_path):
-        recipe = Recipe(name="x", bootstrap=[_PASS], build=[_PASS], test=[_PASS])
+        recipe = Recipe(name="x", bootstrap=["true"], build=["true"], test=["true"])
         result = run_verify(tmp_path, recipe, skip_start=True)
         assert result.ok
         assert [p.phase for p in result.phases] == ["bootstrap", "build", "test"]
@@ -92,7 +81,7 @@ class TestRunner:
         assert all(p.duration >= 0 for p in result.phases)
 
     def test_failure_stops_pipeline(self, tmp_path):
-        recipe = Recipe(name="x", build=[_FAIL], test=[_PASS])
+        recipe = Recipe(name="x", build=["false"], test=["true"])
         result = run_verify(tmp_path, recipe, skip_start=True)
         assert not result.ok
         assert len(result.phases) == 1
@@ -104,12 +93,12 @@ class TestRunner:
         assert "hello-verify" in result.phases[0].output_tail
 
     def test_phase_selection(self, tmp_path):
-        recipe = Recipe(name="x", bootstrap=[_PASS], build=[_PASS], test=[_PASS])
+        recipe = Recipe(name="x", bootstrap=["true"], build=["true"], test=["true"])
         result = run_verify(tmp_path, recipe, phases=("test",))
         assert [p.phase for p in result.phases] == ["test"]
 
     def test_phase_timeout(self, tmp_path):
-        recipe = Recipe(name="x", test=[_python_command("import time; time.sleep(5)")])
+        recipe = Recipe(name="x", test=["sleep 5"])
         result = run_verify(tmp_path, recipe, phase_timeout=0.3, skip_start=True)
         assert not result.ok
         assert result.phases[0].timed_out
@@ -117,19 +106,16 @@ class TestRunner:
 
     def test_commands_run_in_project_root(self, tmp_path):
         (tmp_path / "marker.txt").write_text("here", encoding="utf-8")
-        recipe = Recipe(
-            name="x",
-            test=[_python_command("from pathlib import Path; Path('marker.txt').read_text()")],
-        )
+        recipe = Recipe(name="x", test=["cat marker.txt"])
         result = run_verify(tmp_path, recipe, skip_start=True)
         assert result.ok
 
     def test_result_to_dict(self, tmp_path):
-        recipe = Recipe(name="x", test=[_PASS])
+        recipe = Recipe(name="x", test=["true"])
         payload = run_verify(tmp_path, recipe, skip_start=True).to_dict()
         assert payload["ok"] is True
         assert payload["recipe"] == "x"
-        assert payload["phases"][0]["command"] == _PASS
+        assert payload["phases"][0]["command"] == "true"
         assert payload["readiness"] is None
 
 
@@ -146,9 +132,7 @@ class TestReadiness:
         port = _free_port()
         recipe = Recipe(
             name="x",
-            start=subprocess.list2cmdline(
-                [sys.executable, "-m", "http.server", str(port), "--bind", "127.0.0.1"]
-            ),
+            start=f"python3 -m http.server {port} --bind 127.0.0.1",
             port=port,
         )
         result = run_verify(tmp_path, recipe, phases=("start",), ready_timeout=15)
@@ -160,20 +144,20 @@ class TestReadiness:
 
     def test_readiness_timeout_when_nothing_listens(self, tmp_path):
         port = _free_port()
-        recipe = Recipe(name="x", start=_SLEEP, port=port)
+        recipe = Recipe(name="x", start="sleep 30", port=port)
         result = run_verify(tmp_path, recipe, phases=("start",), ready_timeout=1.5)
         assert result.readiness is not None
         assert not result.readiness.ready
         assert not result.ok
 
     def test_skip_start(self, tmp_path):
-        recipe = Recipe(name="x", test=[_PASS], start=_SLEEP, port=1)
+        recipe = Recipe(name="x", test=["true"], start="sleep 30", port=1)
         result = run_verify(tmp_path, recipe, skip_start=True)
         assert result.readiness is None
         assert result.ok
 
     def test_start_skipped_after_phase_failure(self, tmp_path):
-        recipe = Recipe(name="x", test=[_FAIL], start=_SLEEP, port=1)
+        recipe = Recipe(name="x", test=["false"], start="sleep 30", port=1)
         result = run_verify(tmp_path, recipe, stop_on_failure=False)
         assert result.readiness is None
         assert not result.ok
@@ -194,7 +178,7 @@ class TestReadiness:
         thread.start()
         time.sleep(0.05)
         try:
-            recipe = Recipe(name="x", start=_SLEEP, port=1)
+            recipe = Recipe(name="x", start="sleep 30", port=1)
             result = run_verify(
                 tmp_path, recipe, phases=("start",), ready_timeout=10, port_override=port
             )

@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import json
-import os
 from pathlib import Path
 
 import pytest
@@ -141,12 +140,7 @@ def test_symlink_escape_is_isolated_to_component(tmp_path: Path) -> None:
     _write_skill(root)
     outside = tmp_path / "outside.json"
     _write_json(outside, {"$schema": MCP_SCHEMA_V1, "mcpServers": {}})
-    try:
-        (root / "mcp.json").symlink_to(outside)
-    except OSError as exc:
-        if os.name == "nt" and getattr(exc, "winerror", None) == 1314:
-            pytest.skip("Windows symlink privilege is unavailable")
-        raise
+    (root / "mcp.json").symlink_to(outside)
 
     package = load_agent_plugin(root, tmp_path / "data")
 

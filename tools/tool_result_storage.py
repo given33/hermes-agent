@@ -7,11 +7,6 @@ Defense against context-window overflow operates at three levels:
    of defense and the only one the tool author controls.
 
 2. **Per-result persistence** (maybe_persist_tool_result): After a tool
-   returns, if its output exceeds the tool's registered threshold, an
-   account-scoped hosted run stores one encrypted artifact and returns its
-   durable identifier. Unscoped interactive runs may instead write into the
-   active sandbox temp directory through env.execute(), replacing the
-   in-context content with a bounded preview and a run-local file reference.
    returns, if its output exceeds the tool's registered threshold
    (registry.get_max_result_size), the full output is persisted and the
    in-context content is replaced with a preview + file path reference.
@@ -48,7 +43,6 @@ Defense against context-window overflow operates at three levels:
 """
 
 import hashlib
-import json
 import logging
 import os
 import re
@@ -56,10 +50,7 @@ import shlex
 import threading
 import time
 import uuid
-from typing import Any
 
-from hermes_runtime.session_context import get_session_env
-from hermes_services import internal_hooks, tool_contract, tool_output_artifacts
 from tools.budget_config import (
     DEFAULT_PREVIEW_SIZE_CHARS,
     BudgetConfig,
@@ -203,24 +194,6 @@ def _sandbox_visible_spillover_path(host_path: str, env) -> str | None:
     return None
 
 
-def _canonical_tool_result_text(content: Any) -> str:
-    """Normalize structured tool output before string-only runtime hooks."""
-    if isinstance(content, str):
-        return content
-    if content is None:
-        return ""
-    try:
-        return json.dumps(
-            content,
-            ensure_ascii=False,
-            sort_keys=True,
-            separators=(",", ":"),
-            default=str,
-        )
-    except (TypeError, ValueError, OverflowError):
-        return str(content)
-
-
 def _resolve_storage_dir(env) -> str:
     """Return the best temp-backed storage dir for this environment."""
     if env is not None:
@@ -297,8 +270,6 @@ def _build_persisted_message(
     has_more: bool,
     original_size: int,
     file_path: str,
-    artifact_id: str = "",
-    retention_error: str = "",
 ) -> str:
     """Build the <persisted-output> replacement block."""
     size_kb = original_size / 1024
@@ -309,14 +280,8 @@ def _build_persisted_message(
 
     msg = f"{PERSISTED_OUTPUT_TAG}\n"
     msg += f"This tool result was too large ({original_size:,} characters, {size_str}).\n"
-    if artifact_id:
-        msg += f"Account artifact: {artifact_id}\n"
-    if file_path:
-        msg += f"Full output saved to: {file_path}\n"
-        msg += "Use read_file with offset and limit during this run to access specific sections.\n"
-    if retention_error:
-        msg += f"Retention status: {retention_error}\n"
-    msg += "\n"
+    msg += f"Full output saved to: {file_path}\n"
+    msg += "Use the read_file tool with offset and limit to access specific sections of this output.\n\n"
     msg += f"Preview (first {len(preview)} chars):\n"
     msg += preview
     if has_more:
@@ -326,49 +291,33 @@ def _build_persisted_message(
 
 
 def maybe_persist_tool_result(
-    content: Any,
+    content: str,
     tool_name: str,
     tool_use_id: str,
     env=None,
     config: BudgetConfig = DEFAULT_BUDGET,
     threshold: int | float | None = None,
-    *,
-    apply_hooks: bool = True,
 ) -> str:
-    """Layer 2: retain oversized output and return a bounded reference.
+    """Layer 2: persist oversized result into the sandbox, return preview + path.
 
-    Account-scoped hosted runs use encrypted artifacts and fail closed to a
-    preview when retention fails. Other runs may write through ``env`` so the
-    active execution backend can read the full result during the same run.
+    Writes via env.execute() so the file is accessible from any backend
+    (local, Docker, SSH, Modal, Daytona). Falls back to inline truncation
+    if write fails or no env is available.
 
     Args:
-        content: Raw tool result. Structured values become canonical JSON.
+        content: Raw tool result string.
         tool_name: Name of the tool (used for threshold lookup).
         tool_use_id: Unique ID for this tool call (used as filename).
         env: The active BaseEnvironment instance, or None.
         config: BudgetConfig controlling thresholds and preview size.
         threshold: Explicit override; takes precedence over config resolution.
-        apply_hooks: Apply the trusted after-tool-result hook exactly once.
 
     Returns:
         Original content if small, or <persisted-output> replacement.
     """
-    content = _canonical_tool_result_text(content)
-    if apply_hooks:
-        hook_result = internal_hooks.run_internal_hooks(
-            "after_tool_result",
-            content,
-            tool_name=tool_name,
-            tool_use_id=tool_use_id,
-        )
-        content = str(hook_result.payload)
-        hook_trace = hook_result.trace
-        if hook_trace:
-            logger.debug("after_tool_result hooks for %s: %s", tool_use_id, hook_trace)
     effective_threshold = threshold if threshold is not None else config.resolve_threshold(tool_name)
-    output_policy = tool_contract.resolve_tool_contract(tool_name).output_policy
 
-    if output_policy == "inline" or effective_threshold == float("inf"):
+    if effective_threshold == float("inf"):
         return content
 
     if len(content) <= effective_threshold:
@@ -376,60 +325,6 @@ def maybe_persist_tool_result(
 
     filename = _safe_result_filename(tool_use_id)
     preview, has_more = generate_preview(content, max_chars=config.preview_size)
-    artifact_id = ""
-    owner_id = str(get_session_env("HERMES_TOOL_ARTIFACT_OWNER") or "").strip()
-    account_generation = str(
-        get_session_env("HERMES_ACCOUNT_GENERATION") or "legacy"
-    ).strip() or "legacy"
-    artifact_root = str(get_session_env("HERMES_TOOL_ARTIFACT_ROOT") or "").strip()
-    artifact_error = ""
-    if owner_id and artifact_root:
-        try:
-            from pathlib import Path
-
-            artifact = tool_output_artifacts.EncryptedToolArtifactStore(
-                Path(artifact_root)
-            ).put(
-                owner_id=owner_id,
-                account_generation=account_generation,
-                conversation_id=str(
-                    get_session_env("HERMES_TOOL_ARTIFACT_CONVERSATION") or ""
-                ),
-                turn_id=str(get_session_env("HERMES_TOOL_ARTIFACT_TURN") or ""),
-                tool_call_id=tool_use_id,
-                tool_name=tool_name,
-                content=content,
-            )
-            artifact_id = str(artifact.get("id") or "")
-        except Exception as exc:
-            logger.warning("Encrypted tool artifact write failed for %s: %s", tool_use_id, exc)
-            artifact_error = "encrypted artifact storage failed; full output was not retained"
-    elif owner_id:
-        artifact_error = "encrypted artifact storage is unavailable; full output was not retained"
-
-    # Account-scoped hosted runs must have exactly one retained full-output
-    # copy. Writing the same plaintext into a sandbox would escape account
-    # generation deletion and defeat the encrypted artifact boundary.
-    if artifact_id:
-        return _build_persisted_message(
-            preview,
-            has_more,
-            len(content),
-            "",
-            artifact_id,
-        )
-
-    # Once a hosted account boundary is present, confidentiality is
-    # fail-closed. Never downgrade to a process/sandbox plaintext copy when
-    # encrypted persistence is unavailable.
-    if owner_id:
-        return _build_persisted_message(
-            preview,
-            has_more,
-            len(content),
-            "",
-            retention_error=artifact_error,
-        )
 
     # Always persist host-side first: $HERMES_HOME/cache/spillover is the
     # single canonical home for spilled results (with the other Hermes-owned
@@ -465,13 +360,7 @@ def maybe_persist_tool_result(
                     "Persisted large tool result: %s (%s, %d chars -> %s)",
                     tool_name, tool_use_id, len(content), remote_path,
                 )
-                return _build_persisted_message(
-                    preview,
-                    has_more,
-                    len(content),
-                    remote_path,
-                    artifact_id,
-                )
+                return _build_persisted_message(preview, has_more, len(content), remote_path)
         except Exception as exc:
             logger.warning("Sandbox write failed for %s: %s", tool_use_id, exc)
 
@@ -527,7 +416,6 @@ def enforce_turn_budget(
             env=env,
             config=config,
             threshold=0,
-            apply_hooks=False,
         )
         if replacement != content:
             total_size -= size

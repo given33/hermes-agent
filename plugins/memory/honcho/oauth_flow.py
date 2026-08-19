@@ -49,7 +49,7 @@ def _display_config_path(path: object) -> str:
 
     p = _Path(str(path))
     try:
-        return "~/" + str(p.relative_to(_Path.home())).replace("\\", "/")
+        return "~/" + str(p.relative_to(_Path.home()))
     except ValueError:
         return p.name
 

@@ -86,16 +86,6 @@ SHUTDOWN_GRACE = 1.0  # seconds between SIGTERM and SIGKILL
 MAX_CONTENT_MODIFIED_RETRIES = 3
 RETRY_BASE_DELAY = 0.5  # 0.5, 1.0, 2.0 — exponential
 
-# Cap on tracked documents (_docs).  Each entry holds the full document
-# text, and long agent sessions touch hundreds of files, so an unbounded
-# map is a slow memory leak.  When the cap is exceeded the least-recently
-# opened documents are evicted with a paired textDocument/didClose (so the
-# server can drop its copy too); diagnostics-only entries that were never
-# opened (publishDiagnostics / relatedDocuments spillover) are trimmed
-# without didClose.  64 comfortably exceeds the working set of one edit
-# cycle while keeping worst-case retained text bounded.
-MAX_OPEN_DOCS = 64
-
 
 def file_uri(path: str) -> str:
     """Return ``file://`` URI for an absolute filesystem path.
@@ -221,15 +211,6 @@ class LSPClient:
         # Request/response correlation
         self._next_id: int = 0
         self._pending: Dict[int, asyncio.Future] = {}
-        # Strong references to in-flight server→client request dispatch
-        # tasks.  The event loop only keeps *weak* refs to tasks, so the
-        # bare create_task() in _reader_loop could be garbage-collected
-        # mid-flight — the server's workspace/configuration or
-        # window/workDoneProgress/create request would then never get a
-        # response and servers like rust-analyzer/vtsls block forever.
-        # (_stderr_task/_reader_task survive by being instance attributes;
-        # these need an explicit set + done-callback discard.)
-        self._pending_dispatch: Set[asyncio.Task] = set()
 
         # Server-side request handlers (server → client requests).
         # Kept small and explicit; everything else returns method-not-found.
@@ -379,12 +360,7 @@ class LSPClient:
                 if kind == "response":
                     self._dispatch_response(key, msg)
                 elif kind == "request":
-                    # Hold a strong ref until the dispatch completes —
-                    # see _pending_dispatch in __init__ for why a bare
-                    # create_task() here is unsafe.
-                    task = asyncio.create_task(self._dispatch_request(key, msg))
-                    self._pending_dispatch.add(task)
-                    task.add_done_callback(self._pending_dispatch.discard)
+                    asyncio.create_task(self._dispatch_request(key, msg))
                 elif kind == "notification":
                     self._dispatch_notification(key, msg)
                 else:
@@ -510,17 +486,6 @@ class LSPClient:
                 await self._stderr_task
             except (asyncio.CancelledError, Exception):  # noqa: BLE001
                 pass
-        # Drain in-flight server→client request dispatches.  Their
-        # responses have nowhere to go once the process is dead, and
-        # cancelling here guarantees none outlive the client.
-        for task in list(self._pending_dispatch):
-            if not task.done():
-                task.cancel()
-            try:
-                await task
-            except (asyncio.CancelledError, Exception):  # noqa: BLE001
-                pass
-        self._pending_dispatch.clear()
         proc = self._proc
         self._proc = None
         if proc is None:
@@ -726,9 +691,6 @@ class LSPClient:
         version = params.get("version")
 
         doc = self._docs.setdefault(path, _DocState(version=-1))
-        # Keep never-opened entries bounded (this push may have just
-        # created one); the entry for this push is protected.
-        self._trim_unopened_docs(exclude=path)
         if self._seed_first_push and not doc.seed_seen:
             # First push: seed the store WITHOUT a freshness tag.  It
             # arrives before the user-triggered didChange could've
@@ -809,10 +771,6 @@ class LSPClient:
             # stale by definition (see _DocState).
             doc.version = new_version
             doc.text = text
-            # Move to MRU position (dict insertion order is the LRU
-            # order used by _evict_lru_docs).
-            self._docs.pop(abs_path, None)
-            self._docs[abs_path] = doc
             return new_version
 
         # First open: didChangeWatchedFiles CREATED + didOpen.
@@ -822,9 +780,6 @@ class LSPClient:
         )
         # Fresh doc state — anything stashed under this path by a
         # pre-open push (relatedDocuments spillover etc.) is discarded.
-        # pop() first so an existing spillover entry is re-inserted at
-        # the MRU end of the dict (plain assignment keeps the old slot).
-        self._docs.pop(abs_path, None)
         self._docs[abs_path] = _DocState(version=0, text=text)
         await self._send_notification(
             "textDocument/didOpen",
@@ -837,10 +792,6 @@ class LSPClient:
                 }
             },
         )
-        # Enforce the document cap now that a new entry exists.  The
-        # freshly opened doc sits at the MRU end, so it can never be the
-        # one evicted here.
-        await self._evict_lru_docs()
         return 0
 
     async def save_file(self, path: str) -> None:
@@ -852,66 +803,6 @@ class LSPClient:
             "textDocument/didSave",
             {"textDocument": {"uri": file_uri(abs_path)}},
         )
-
-    async def close_file(self, path: str) -> None:
-        """Send didClose for ``path`` and drop its tracked state.
-
-        Safe to call for paths that were never opened: diagnostics-only
-        spillover entries are dropped without notifying the server
-        (which never had them open).  No-op for unknown paths.
-        """
-        abs_path = os.path.abspath(path)
-        doc = self._docs.pop(abs_path, None)
-        if doc is None:
-            return
-        if doc.version >= 0 and self.is_running:
-            await self._send_didclose(abs_path)
-
-    async def _send_didclose(self, abs_path: str) -> None:
-        await self._send_notification(
-            "textDocument/didClose",
-            {"textDocument": {"uri": file_uri(abs_path)}},
-        )
-
-    async def _evict_lru_docs(self) -> None:
-        """Evict least-recently-opened documents above ``MAX_OPEN_DOCS``.
-
-        Dict insertion order is the LRU order: open_file re-inserts on
-        every (re-)open, so ``next(iter(...))`` is always the coldest
-        entry.  Pop-then-notify keeps the map consistent across the
-        awaited didClose.  A waiter racing an eviction of its path is
-        safe: wait_for_diagnostics re-reads ``self._docs`` every loop,
-        so it just times out with the documented "no data" ``False`` —
-        it can never observe stale data for an evicted doc.
-        """
-        while len(self._docs) > MAX_OPEN_DOCS:
-            oldest_path = next(iter(self._docs))
-            doc = self._docs.pop(oldest_path)
-            if doc.version >= 0 and self.is_running:
-                # Pair eviction with didClose so the server releases its
-                # copy too — evicting only our side would leak server
-                # memory and desync open-document bookkeeping.
-                await self._send_didclose(oldest_path)
-
-    def _trim_unopened_docs(self, *, exclude: Optional[str] = None) -> None:
-        """Bound diagnostics-only entries (never opened, ``version < 0``).
-
-        publishDiagnostics and relatedDocuments create entries for files
-        we never sent didOpen for; a chatty server (rust-analyzer on a
-        large workspace) could otherwise grow ``_docs`` without any
-        open_file call ever running the LRU eviction.  No didClose is
-        needed — the server never had these documents open.  ``exclude``
-        protects the entry the caller just updated.  Opened documents
-        are never touched here, so a path being waited on (always
-        opened, version >= 0) cannot be dropped by a diagnostics push.
-        """
-        if len(self._docs) <= MAX_OPEN_DOCS:
-            return
-        for path, doc in list(self._docs.items()):
-            if len(self._docs) <= MAX_OPEN_DOCS:
-                break
-            if doc.version < 0 and path != exclude:
-                self._docs.pop(path, None)
 
     # ------------------------------------------------------------------
     # diagnostics: pull + wait
@@ -961,9 +852,6 @@ class LSPClient:
                     # Same send-anchored tagging: fresh only if that
                     # doc hasn't changed since the request went out.
                     rel.pull_version = rel.version
-            # relatedDocuments can spill entries for arbitrarily many
-            # never-opened files — keep them bounded like pushes.
-            self._trim_unopened_docs(exclude=abs_path)
 
     async def wait_for_diagnostics(
         self,
@@ -1138,5 +1026,4 @@ __all__ = [
     "INITIALIZE_TIMEOUT",
     "DIAGNOSTICS_DOCUMENT_WAIT",
     "DIAGNOSTICS_FULL_WAIT",
-    "MAX_OPEN_DOCS",
 ]

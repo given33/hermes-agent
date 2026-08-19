@@ -36,7 +36,6 @@ from agent.message_metadata import stamp_message_timestamp
 from agent.tool_result_classification import (
     FILE_MUTATING_TOOL_NAMES as _FILE_MUTATING_TOOLS,
 )
-from hermes_services.tool_contract import resolve_tool_contract
 from tools.threat_patterns import scan_for_threats
 
 logger = logging.getLogger(__name__)
@@ -217,11 +216,7 @@ def _plan_tool_batch_segments(tool_calls, *, execution_cwd: Optional[Path] = Non
             current.append(tool_call)
             continue
 
-        if (
-            tool_name in _PARALLEL_SAFE_TOOLS
-            or _is_mcp_tool_parallel_safe(tool_name)
-            or resolve_tool_contract(tool_name).execution_mode == "parallel"
-        ):
+        if tool_name in _PARALLEL_SAFE_TOOLS or _is_mcp_tool_parallel_safe(tool_name):
             current.append(tool_call)
             continue
 
@@ -249,33 +244,8 @@ def _should_parallelize_tool_batch(tool_calls) -> bool:
     """
     if len(tool_calls) <= 1:
         return False
-    segments = _plan_tool_batch_execution(tool_calls)
+    segments = _plan_tool_batch_segments(tool_calls)
     return len(segments) == 1 and segments[0][0] == "parallel"
-
-
-def _plan_tool_batch_execution(
-    tool_calls,
-    *,
-    execution_cwd: Optional[Path] = None,
-) -> List[tuple]:
-    """Return the authoritative, source-ordered execution plan for a batch.
-
-    Parallel-safe runs retain concurrency even when an unsafe call appears
-    later in the provider batch. Sequential segments remain hard barriers, so
-    no later call can cross an earlier side effect.
-    """
-
-    return _plan_tool_batch_segments(tool_calls, execution_cwd=execution_cwd)
-
-
-def plan_tool_batch_execution(
-    tool_calls,
-    *,
-    execution_cwd: Optional[Path] = None,
-) -> List[tuple]:
-    """Public application entry point for authoritative batch planning."""
-
-    return _plan_tool_batch_execution(tool_calls, execution_cwd=execution_cwd)
 
 
 def _canonical_path(raw_path: str, execution_cwd: Optional[Path] = None) -> Path:
@@ -567,7 +537,6 @@ def make_tool_result_message(
     tool_call_id: str,
     *,
     effect_disposition: str | None = None,
-    execution_envelope: dict | None = None,
 ) -> dict:
     """Build a tool-result message dict with both the OpenAI-format ``name``
     field (required by the wire format and provider adapters) and the internal
@@ -605,10 +574,6 @@ def make_tool_result_message(
             message["_tool_output_risk"] = risk_metadata
     if effect_disposition is not None:
         message["effect_disposition"] = effect_disposition
-    # Execution envelopes live in ToolExecutionLedger/session trace and UI
-    # lifecycle events. They must not enter canonical conversation messages:
-    # timestamps, generations and digests would churn the model-facing prefix
-    # and some provider adapters forward unknown message keys verbatim.
     return message
 
 
@@ -753,8 +718,6 @@ __all__ = [
     "_is_destructive_command",
     "_plan_tool_batch_segments",
     "_should_parallelize_tool_batch",
-    "_plan_tool_batch_execution",
-    "plan_tool_batch_execution",
     "_canonical_path",
     "_extract_parallel_scope_path",
     "_extract_parallel_scope_paths",

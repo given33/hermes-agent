@@ -197,34 +197,82 @@ class TestRunAsyncWithRunningLoop:
         assert result == 42
 
     @pytest.mark.asyncio
-    async def test_timeout_returns_without_waiting_for_daemon_worker(self, monkeypatch):
+    async def test_timeout_uses_nonblocking_executor_shutdown(self, monkeypatch):
         """A timeout in the running-loop branch must not block the caller.
 
-        The bounded daemon bridge owns its worker loop and schedules
-        cancellation without joining the worker before returning.
+        If shutdown ever waits for a stuck worker, a tool coroutine that
+        ignores (or can't observe) cancellation would hang the whole agent.
+        Guard: the caller must raise TimeoutError and pool.shutdown must be
+        called with wait=False. The worker's own event loop handles cleanup
+        (cancellation is scheduled via call_soon_threadsafe before the
+        caller returns).
         """
         import concurrent.futures
-        import time
-        import model_tools
         from model_tools import _run_async
 
-        cancel_observed = threading.Event()
+        events = {
+            "result_timeout": None,
+            "shutdown_calls": [],
+            "submitted_fn": None,
+        }
+
+        class TimeoutFuture:
+            def result(self, timeout=None):
+                events["result_timeout"] = timeout
+                raise concurrent.futures.TimeoutError()
+
+            def cancel(self):
+                return True
+
+        class FakeExecutor:
+            def __init__(self, *args, **kwargs):
+                pass
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, exc_type, exc, tb):
+                self.shutdown(wait=True)
+                return False
+
+            def submit(self, fn, *args, **kwargs):
+                # Record which function got submitted -- should be the
+                # in-function worker wrapper, not bare asyncio.run, so we
+                # know _run_async is using a loop it owns and can cancel.
+                events["submitted_fn"] = getattr(fn, "__name__", repr(fn))
+                return TimeoutFuture()
+
+            def shutdown(self, wait=True, cancel_futures=False):
+                events["shutdown_calls"].append((wait, cancel_futures))
 
         async def _never_finishes():
-            try:
-                await asyncio.sleep(999)
-            except asyncio.CancelledError:
-                cancel_observed.set()
-                raise
+            await asyncio.sleep(999)
 
-        monkeypatch.setattr(model_tools, "_ASYNC_BRIDGE_TIMEOUT_SECONDS", 1.0)
-        started = time.monotonic()
+        monkeypatch.setattr(
+            concurrent.futures,
+            "ThreadPoolExecutor",
+            FakeExecutor,
+        )
+
         with pytest.raises(concurrent.futures.TimeoutError):
             _run_async(_never_finishes())
-        elapsed = time.monotonic() - started
 
-        assert elapsed < 2.5, f"timeout blocked the caller for {elapsed:.2f}s"
-        assert cancel_observed.wait(timeout=5), "daemon worker was not cancelled"
+        assert events["result_timeout"] == 300
+        # The worker wrapper creates its own event loop so _run_async can
+        # cancel the task on timeout — this must NOT be bare asyncio.run.
+        assert events["submitted_fn"] != "run", (
+            "_run_async submitted asyncio.run directly — it must submit a "
+            "worker wrapper that owns the event loop so timeouts can cancel "
+            "the task"
+        )
+        # Critical: shutdown must NOT wait. If wait=True, a stuck coroutine
+        # would freeze the caller (converts a thread leak into a hang).
+        assert events["shutdown_calls"], "shutdown was never called"
+        for wait, _cancel in events["shutdown_calls"]:
+            assert wait is False, (
+                f"shutdown called with wait={wait} — a stuck tool coroutine "
+                f"would hang the caller indefinitely"
+            )
 
     @pytest.mark.asyncio
     async def test_timeout_cancels_coroutine_in_worker_loop(self, monkeypatch):

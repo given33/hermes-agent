@@ -456,18 +456,7 @@ async def test_profile_command_reports_source_stamped_profile(monkeypatch, tmp_p
     result = await runner._handle_profile_command(event)
 
     assert "**Profile:** `milo`" in result
-    from hermes_constants import (
-        display_hermes_home,
-        reset_hermes_home_override,
-        set_hermes_home_override,
-    )
-
-    token = set_hermes_home_override(profile_home)
-    try:
-        expected_home = display_hermes_home()
-    finally:
-        reset_hermes_home_override(token)
-    assert f"**Home:** `{expected_home}`" in result
+    assert f"**Home:** `{profile_home}`" in result
 
 
 # ── /context command tests ────────────────────────────────────────────────

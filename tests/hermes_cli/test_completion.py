@@ -86,16 +86,12 @@ class TestGenerateBash:
 
     def test_valid_bash_syntax(self):
         """Script must pass `bash -n` syntax check."""
-        from tools.environments.local import _bash_safe_path, _find_bash
-
         out = generate_bash(_make_parser())
         with tempfile.NamedTemporaryFile(mode="w", suffix=".bash", delete=False) as f:
             f.write(out)
             path = f.name
         try:
-            result = subprocess.run(
-                [_find_bash(), "-n", _bash_safe_path(path)], capture_output=True
-            )
+            result = subprocess.run(["bash", "-n", path], capture_output=True)
             assert result.returncode == 0, result.stderr.decode()
         finally:
             os.unlink(path)

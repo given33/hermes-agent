@@ -36,7 +36,6 @@ from hermes_cli.dashboard_auth.base import (
     InvalidCredentialsError,
     ProviderError,
 )
-from hermes_cli.dashboard_auth.client_ip import client_ip as _resolve_client_ip
 from hermes_cli.dashboard_auth.cookies import (
     clear_pkce_cookie,
     clear_session_cookies,
@@ -107,14 +106,10 @@ def _redirect_uri(request: Request) -> str:
 
 
 def _client_ip(request: Request) -> str:
-    """Resolve the client IP, honouring ``X-Forwarded-For`` only from a
-    declared trusted proxy.
-
-    This value keys the password-login rate limiter below and every audit
-    log entry, so it must not be client-controlled. See
-    :mod:`hermes_cli.dashboard_auth.client_ip` for the resolution rules.
-    """
-    return _resolve_client_ip(request)
+    fwd = request.headers.get("x-forwarded-for", "")
+    if fwd:
+        return fwd.split(",")[0].strip()
+    return request.client.host if request.client else ""
 
 
 def _prefix(request: Request) -> str:
@@ -650,129 +645,46 @@ def _validate_post_login_target(raw: str) -> str:
 #
 # Brute-force throttle. The OAuth flow has no guessable secret on our side
 # (the IDP owns credentials), but ``/auth/password-login`` accepts a
-# password we verify locally, so it's a credential-stuffing target.
-# Sliding-window limiters raise the cost of online guessing without any
-# external dependency. Still process-local (resets on restart), so this
-# remains defence-in-depth on top of the provider's own constant-time
-# verify — but it is no longer bypassable.
-#
-# Two independent buckets, because either one alone has a hole:
-#
-#   * per client IP — the classic bucket. Its key comes from
-#     :func:`_client_ip`, which ignores ``X-Forwarded-For`` unless the
-#     peer is a declared trusted proxy. Before that fix an attacker could
-#     send a different forged XFF on every request and land each guess in
-#     a brand-new bucket, making the limit a no-op.
-#   * per (provider, username) — caps guesses against a *single account*
-#     no matter how many source addresses the attacker controls. An IP
-#     bucket cannot do that: a botnet or a large NAT'd cloud range gets a
-#     fresh budget per address. This is the bucket that actually bounds
-#     password guessing for a targeted account.
-#
-# The username bucket is deliberately more generous than the IP bucket so
-# that a user fumbling their own password is not locked out by an
-# unrelated attacker hammering the same account from elsewhere; it exists
-# to bound guesses, not to be a precise lockout.
+# password we verify locally, so it's a credential-stuffing target. A
+# simple in-process sliding-window limiter per client IP raises the cost
+# of online guessing without any external dependency. It is intentionally
+# best-effort: process-local (resets on restart), and behind a trusting
+# proxy the IP is the proxy's unless X-Forwarded-For is set — which is why
+# this is defence-in-depth on top of the provider's own constant-time
+# verify, not the only line of defence.
 
 _PW_RATE_MAX_ATTEMPTS = 10
 _PW_RATE_WINDOW_SEC = 60.0
-_PW_ACCOUNT_MAX_ATTEMPTS = 20
-_PW_ACCOUNT_WINDOW_SEC = 300.0
-# Cap on distinct tracked keys. Buckets are keyed by attacker-influenced
-# values (address, username), so without a ceiling a spray attack grows
-# these dicts without bound. On overflow we prune expired buckets first
-# and only then refuse to track new keys — refusing to track means
-# falling back to the shared overflow bucket, which throttles *harder*,
-# never softer.
-_PW_RATE_MAX_KEYS = 4096
-_PW_OVERFLOW_KEY = "_overflow_"
 _pw_attempts: Dict[str, Deque[float]] = defaultdict(deque)
-_pw_account_attempts: Dict[str, Deque[float]] = defaultdict(deque)
 _pw_attempts_lock = threading.Lock()
 
 
-def _consume_attempt(
-    buckets: Dict[str, Deque[float]],
-    key: str,
-    *,
-    max_attempts: int,
-    window_sec: float,
-    now: float,
-) -> bool:
-    """True if ``key`` has exhausted its budget in ``buckets``.
+def _password_rate_limited(ip: str) -> bool:
+    """True if ``ip`` has exceeded the password-login attempt budget.
 
-    Caller must hold ``_pw_attempts_lock``. Sliding window: prune
-    attempts older than the window, then check the count, recording the
-    attempt when allowed.
-    """
-    cutoff = now - window_sec
-    if key not in buckets and len(buckets) >= _PW_RATE_MAX_KEYS:
-        # Drop buckets that have fully aged out before giving up on
-        # tracking this key precisely.
-        for stale in [
-            k for k, v in buckets.items() if not v or v[-1] < cutoff
-        ]:
-            del buckets[stale]
-        if len(buckets) >= _PW_RATE_MAX_KEYS:
-            key = _PW_OVERFLOW_KEY
-    bucket = buckets[key]
-    while bucket and bucket[0] < cutoff:
-        bucket.popleft()
-    if len(bucket) >= max_attempts:
-        return True
-    bucket.append(now)
-    return False
-
-
-def _password_rate_limited(ip: str, account: str = "") -> bool:
-    """True if this attempt exceeds the IP or the per-account budget.
-
-    An empty IP (no discernible client) shares a single bucket —
-    fail-safe toward throttling rather than letting unattributable
-    traffic through unmetered. ``account`` is the ``provider:username``
-    pair; when empty only the IP bucket applies.
-
-    Both buckets are consumed even when the first one already refuses, so
-    an attacker cannot use a cheap IP-bucket rejection to avoid spending
-    the account budget.
+    Sliding window: prune attempts older than the window, then check the
+    count. Records the attempt timestamp when allowed. An empty IP (no
+    discernible client) shares a single bucket — fail-safe toward
+    throttling rather than letting unattributable traffic through
+    unmetered.
     """
     now = time.monotonic()
+    cutoff = now - _PW_RATE_WINDOW_SEC
+    key = ip or "_unknown_"
     with _pw_attempts_lock:
-        limited = _consume_attempt(
-            _pw_attempts,
-            ip or "_unknown_",
-            max_attempts=_PW_RATE_MAX_ATTEMPTS,
-            window_sec=_PW_RATE_WINDOW_SEC,
-            now=now,
-        )
-        if account:
-            limited = (
-                _consume_attempt(
-                    _pw_account_attempts,
-                    account,
-                    max_attempts=_PW_ACCOUNT_MAX_ATTEMPTS,
-                    window_sec=_PW_ACCOUNT_WINDOW_SEC,
-                    now=now,
-                )
-                or limited
-            )
-        return limited
-
-
-def _account_rate_key(provider: str, username: str) -> str:
-    """Bucket key for the per-account limiter.
-
-    Case-folded so ``Alice`` and ``alice`` cannot each get their own
-    budget against the same account on a case-insensitive backing store.
-    """
-    return f"{provider.strip().lower()}:{username.strip().casefold()}"
+        bucket = _pw_attempts[key]
+        while bucket and bucket[0] < cutoff:
+            bucket.popleft()
+        if len(bucket) >= _PW_RATE_MAX_ATTEMPTS:
+            return True
+        bucket.append(now)
+        return False
 
 
 def _reset_password_rate_limit() -> None:
     """Test-only: clear all rate-limit buckets."""
     with _pw_attempts_lock:
         _pw_attempts.clear()
-        _pw_account_attempts.clear()
 
 
 class _PasswordLoginBody(BaseModel):
@@ -806,11 +718,10 @@ async def auth_password_login(request: Request, body: _PasswordLoginBody):
       * unknown provider / provider lacks password support → 404
       * bad credentials → 401 ("Invalid credentials")
       * backing store unreachable → 503
-      * too many attempts from this IP, or against this account from any
-        set of addresses → 429
+      * too many attempts from this IP → 429
     """
     ip = _client_ip(request)
-    if _password_rate_limited(ip, _account_rate_key(body.provider, body.username)):
+    if _password_rate_limited(ip):
         audit_log(
             AuditEvent.LOGIN_FAILURE,
             provider=body.provider,
@@ -1020,7 +931,7 @@ async def api_auth_me(request: Request):
 
 @router.post("/api/auth/ws-ticket", name="auth_ws_ticket")
 async def api_auth_ws_ticket(request: Request):
-    """Mint a short-lived single-use ticket for a session or admin token.
+    """Mint a short-lived single-use ticket for the authenticated session.
 
     Browsers cannot set ``Authorization`` on a WebSocket upgrade, so in
     gated mode the SPA POSTs this endpoint to get a ``?ticket=`` value to
@@ -1032,31 +943,19 @@ async def api_auth_ws_ticket(request: Request):
     expected pattern.
     """
     sess = getattr(request.state, "session", None)
-    if sess is not None:
-        user_id = sess.user_id
-        provider = sess.provider
-    else:
-        principal = getattr(request.state, "token_principal", None)
-        token_is_admin = (
-            getattr(request.state, "token_authenticated", False)
-            and principal is not None
-            and "dashboard:admin" in principal.scopes
-        )
-        if not token_is_admin:
-            # Middleware should already have rejected, but check defensively.
-            raise HTTPException(status_code=401, detail="Unauthorized")
-        user_id = principal.principal
-        provider = principal.provider
+    if sess is None:
+        # Middleware should already have rejected, but check defensively.
+        raise HTTPException(status_code=401, detail="Unauthorized")
 
     # Import here so the routes module stays usable in test contexts that
     # don't load the ticket store.
     from hermes_cli.dashboard_auth.ws_tickets import TTL_SECONDS, mint_ticket
 
-    ticket = mint_ticket(user_id=user_id, provider=provider)
+    ticket = mint_ticket(user_id=sess.user_id, provider=sess.provider)
     audit_log(
         AuditEvent.WS_TICKET_MINTED,
-        provider=provider,
-        user_id=user_id,
+        provider=sess.provider,
+        user_id=sess.user_id,
         ip=_client_ip(request),
     )
     return {"ticket": ticket, "ttl_seconds": TTL_SECONDS}

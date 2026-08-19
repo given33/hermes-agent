@@ -32,8 +32,6 @@ def test_dashboard_oauth_write_uses_owner_only_permissions(oauth_file):
         os.umask(old_umask)
 
     assert oauth_file.exists()
-    if os.name == "nt":
-        pytest.skip("Windows ACLs are not represented by POSIX st_mode bits")
     mode = oauth_file.stat().st_mode & 0o777
     assert mode == 0o600
 

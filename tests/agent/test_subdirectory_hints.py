@@ -190,10 +190,7 @@ class TestContentDeduplication:
 
         mirror = tmp_path / "mirror"
         mirror.mkdir()
-        try:
-            (mirror / "AGENTS.md").symlink_to(real / "AGENTS.md")
-        except (OSError, NotImplementedError) as exc:
-            pytest.skip(f"symlinks unavailable in test environment: {exc}")
+        (mirror / "AGENTS.md").symlink_to(real / "AGENTS.md")
 
         tracker = SubdirectoryHintTracker(working_dir=str(tmp_path))
         first = tracker.check_tool_call("read_file", {"path": str(real / "x.py")})

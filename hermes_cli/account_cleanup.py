@@ -87,7 +87,19 @@ def _cleanup_generation_is_current(owner_id: str, account_generation: str) -> bo
     from hermes_cli.dashboard_auth.mobile_device_store import MobileDeviceStore
 
     active = MobileDeviceStore().account_generation(owner_id, create=False)
-    return not active or active == generation
+    if not active:
+        # Generation record missing (store rebuild, migration failure):
+        # fail CLOSED. Returning True here let an old-era tombstone replay
+        # wipe a re-registered account's data because "no record = match
+        # anything". The delete-recreate-same-id scenario is exactly when
+        # the record is most likely to be inconsistent.
+        logger.warning(
+            "account cleanup generation fence: no active generation record "
+            "for owner=%s; refusing to proceed (fail-closed)",
+            owner_id,
+        )
+        return False
+    return active == generation
 
 
 def purge_owner_operational_state(

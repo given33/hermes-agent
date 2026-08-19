@@ -30,8 +30,8 @@ import { Badge } from "@nous-research/ui/ui/components/badge";
 import { Card } from "@nous-research/ui/ui/components/card";
 
 import { ModelPickerDialog } from "@/components/ModelPickerDialog";
+import { ModelReloadConfirm } from "@/components/ModelReloadConfirm";
 import { ReasoningPicker } from "@/components/ReasoningPicker";
-import { useI18n } from "@/i18n";
 import { GatewayClient, type ConnectionState } from "@/lib/gatewayClient";
 import { api, buildWsUrl } from "@/lib/api";
 import { maybeReloadForLoopbackWsAuthFailure } from "@/lib/dashboard-auth-reload";
@@ -50,7 +50,7 @@ import {
 import { titleFromSessionInfoPayload } from "@/lib/chat-title";
 
 import { cn } from "@/lib/utils";
-import { AlertCircle, ChevronDown, MessageSquarePlus } from "lucide-react";
+import { AlertCircle, ChevronDown, RefreshCw } from "lucide-react";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 
 interface SessionInfo {
@@ -65,8 +65,6 @@ interface RpcEnvelope {
   method?: string;
   params?: { type?: string; payload?: unknown };
 }
-
-type EventFeedState = "connecting" | "open" | "waiting" | "error";
 
 const STATE_LABEL: Record<ConnectionState, string> = {
   idle: "idle",
@@ -118,17 +116,6 @@ export function ChatSidebar({
   onDashboardNewSessionRequest,
   onSessionTitleChange,
 }: ChatSidebarProps) {
-  const { locale } = useI18n();
-  const isChinese = locale.startsWith("zh");
-  const stateLabel: Record<ConnectionState, string> = isChinese
-    ? {
-        idle: "空闲",
-        connecting: "连接中",
-        open: "在线",
-        closed: "已断开",
-        error: "错误",
-      }
-    : STATE_LABEL;
   // `version` bumps on reconnect; gw is derived so we never call setState
   // for it inside an effect (React 19's set-state-in-effect rule). The
   // counter is the dependency on purpose — it's not read in the memo body,
@@ -141,11 +128,6 @@ export function ChatSidebar({
   const [info, setInfo] = useState<SessionInfo>({});
   const [modelOpen, setModelOpen] = useState(false);
   const [error, setError] = useState<string | null>(null);
-  const [eventFeedState, setEventFeedState] =
-    useState<EventFeedState>("connecting");
-  const [eventFeedDetail, setEventFeedDetail] = useState(
-    isChinese ? "正在连接" : "Connecting",
-  );
   // The badge shows config.yaml's main model (`model.default`) via
   // `/api/model/info` — the same value the Models page writes and a new chat
   // session boots from. We deliberately don't use the sidecar's `session.info`
@@ -163,9 +145,14 @@ export function ChatSidebar({
   // Bumped on model change/save so ReasoningPicker re-reads the saved effort
   // (config is profile-scoped the same way the model badge is).
   const [modelRefreshKey, setModelRefreshKey] = useState(0);
-  // The unified chat listens for the model-change event and rebuilds only its
-  // Hermes runtime session, preserving the visible Web conversation history.
+  // Set after the picker saves a model and the user declines the reload: config
+  // is updated but the running session keeps its model until rebuilt.
   const [modelNotice, setModelNotice] = useState<string | null>(null);
+  // Short name of a just-saved model awaiting confirm to reload (a fresh chat
+  // session is how the running chat adopts it; we confirm before discarding it).
+  const [pendingReloadModel, setPendingReloadModel] = useState<string | null>(
+    null,
+  );
 
   const refreshEffectiveModel = useCallback(() => {
     void api
@@ -205,10 +192,7 @@ export function ChatSidebar({
       setInfo({});
       setError(null);
     });
-    const offState = gw.onState((nextState) => {
-      setState(nextState);
-      if (nextState === "open") setError(null);
-    });
+    const offState = gw.onState(setState);
 
     const offSessionInfo = gw.on<SessionInfo>("session.info", (ev) => {
       if (ev.payload) {
@@ -254,61 +238,162 @@ export function ChatSidebar({
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [gw]);
 
-  useEffect(() => {
-    if (state === "open") return;
-    if (state === "idle" || state === "connecting") return;
-    if (navigator.onLine === false) return;
-    const timer = window.setTimeout(
-      () => setVersion((current) => current + 1),
-      state === "error" ? 1500 : 3000,
-    );
-    return () => window.clearTimeout(timer);
-  }, [state]);
-
   // Event subscriber WebSocket — receives the rebroadcast of every
   // dispatcher emit from the PTY child's gateway.  See /api/pub +
   // /api/events in hermes_cli/web_server.py for the broadcast hop.
   //
-  // The passive tool-event feed owns its retry lifecycle. Reconnects mint a
-  // fresh gated-mode ticket, pause while offline, and wake immediately when
-  // iOS returns the WebView to the foreground.
+  // Failures (auth/loopback rejection, server too old to expose the
+  // endpoint, transient drops) surface in the same banner as the
+  // JSON-RPC sidecar so the sidebar matches its documented best-effort
+  // UX and the user always has a reconnect affordance.
   useEffect(() => {
-    if (!channel) return;
-    let stopped = false;
+    if (!channel) {
+      return;
+    }
+    // In loopback mode the legacy ?token=<session> path is fine; in gated
+    // mode we have to mint a single-use ticket from the cookie. `connect`
+    // keeps the outer effect synchronous so its ``return cleanup`` stays at
+    // the top level; `ws` is a closed-over binding the cleanup reads.
+    let unmounting = false;
     let ws: WebSocket | null = null;
-    let retryTimer: number | null = null;
-    let retryAttempt = 0;
+    let reconnectTimer: ReturnType<typeof setTimeout> | null = null;
+    let connectTimer: ReturnType<typeof setTimeout> | null = null;
+    let connectGeneration = 0;
+    let attempt = 0;
 
-    const clearRetry = () => {
-      if (retryTimer !== null) window.clearTimeout(retryTimer);
-      retryTimer = null;
+    const clearConnectTimer = () => {
+      if (connectTimer) {
+        clearTimeout(connectTimer);
+        connectTimer = null;
+      }
     };
 
-    const show = (nextState: EventFeedState, zh: string, en: string) => {
-      if (stopped) return;
-      setEventFeedState(nextState);
-      setEventFeedDetail(isChinese ? zh : en);
-    };
+    // The banner is shared with `info.credential_warning` and the JSON-RPC
+    // sidecar, and `error` is those messages' only home — the sidecar does
+    // not re-emit. So the events feed may only write over an empty banner
+    // or one of its own messages, and may only clear its own.
+    const surface = (msg: string) =>
+      !unmounting &&
+      setError((current) =>
+        isEventsFeedMessage(current) ? msg : (current ?? msg),
+      );
 
+    const clearEventsBanner = () =>
+      !unmounting &&
+      setError((current) => (isEventsFeedMessage(current) ? null : current));
+
+    // Single scheduling path. `close` always follows `error` for a failed
+    // socket, so scheduling from `error` too would queue two timers and
+    // leak the first — only the latest is tracked for cleanup.
     const scheduleReconnect = () => {
-      if (stopped) return;
-      clearRetry();
-      if (navigator.onLine === false) {
-        show("waiting", "网络断开，恢复后自动连接", "Offline; reconnecting automatically");
+      if (unmounting || reconnectTimer) {
         return;
       }
-      retryAttempt += 1;
-      const delay = Math.min(30000, 750 * 2 ** Math.min(retryAttempt - 1, 5));
-      show(
-        "connecting",
-        `${Math.max(1, Math.ceil(delay / 1000))} 秒后自动重连`,
-        `Reconnecting automatically in ${Math.max(1, Math.ceil(delay / 1000))}s`,
-      );
-      retryTimer = window.setTimeout(connect, delay);
+      if (attempt >= EVENTS_MAX_RECONNECT_ATTEMPTS) {
+        surface(eventsGaveUpMessage());
+        return;
+      }
+
+      const delay = eventsReconnectDelayMs(attempt);
+      attempt += 1;
+      surface(eventsReconnectingMessage(delay));
+
+      reconnectTimer = setTimeout(() => {
+        reconnectTimer = null;
+        void connect();
+      }, delay);
     };
 
-    const handleMessage = (ev: MessageEvent) => {
+    const connect = async () => {
+      if (unmounting) {
+        return;
+      }
+
+      const generation = ++connectGeneration;
+      let socket: WebSocket | null = null;
+
+      // Cover the whole connection attempt, including gated-mode ticket
+      // minting. A failed or hanging pre-socket request otherwise emits no
+      // WebSocket close event and permanently strands the retry loop at its
+      // last "reconnecting in ..." banner.
+      clearConnectTimer();
+      connectTimer = setTimeout(() => {
+        connectTimer = null;
+        if (unmounting || generation !== connectGeneration) {
+          return;
+        }
+
+        // Invalidate any late ticket result or socket event from this attempt
+        // before scheduling its replacement.
+        connectGeneration += 1;
+        if (socket && ws === socket) {
+          ws = null;
+          socket.close();
+        }
+        scheduleReconnect();
+      }, EVENTS_CONNECT_TIMEOUT_MS);
+
+      try {
+        // Re-minted every attempt: tickets are single-use with a short TTL,
+        // so a reconnect cannot replay the URL from the first connection.
+        const url = await buildWsUrl("/api/events", { channel });
+        if (unmounting || generation !== connectGeneration) {
+          return;
+        }
+        socket = new WebSocket(url);
+        ws = socket;
+      } catch {
+        if (unmounting || generation !== connectGeneration) {
+          return;
+        }
+        clearConnectTimer();
+        connectGeneration += 1;
+        scheduleReconnect();
+        return;
+      }
+
+      // A superseded socket's late close must not schedule a retry on top
+      // of the one that replaced it.
+      const isCurrent = () => ws === socket;
+
+      socket.addEventListener("open", () => {
+        if (!isCurrent()) {
+          return;
+        }
+        clearConnectTimer();
+        attempt = 0;
+        clearEventsBanner();
+      });
+
+      // `unmounting` suppresses the banner during cleanup — `ws.close()`
+      // from the effect's return fires a close event with code 1005 that
+      // would otherwise look like an unexpected drop.
+      socket.addEventListener("error", () => {
+        if (isCurrent()) {
+          surface(EVENTS_DISCONNECTED_MESSAGE);
+        }
+      });
+
+      socket.addEventListener("close", (ev) => {
+        if (!isCurrent()) {
+          return;
+        }
+        clearConnectTimer();
+        if (maybeReloadForLoopbackWsAuthFailure(ev.code)) {
+          return;
+        }
+        if (isEventsAuthRejection(ev.code)) {
+          surface(eventsRejectedMessage(ev.code));
+          return;
+        }
+        if (shouldRetryEventsClose(ev.code)) {
+          scheduleReconnect();
+        }
+      });
+
+      socket.addEventListener("message", (ev) => {
         let frame: RpcEnvelope;
+
         try {
           frame = JSON.parse(ev.data);
         } catch {
@@ -329,87 +414,35 @@ export function ChatSidebar({
         } else if (type === "dashboard.new_session_requested") {
           onDashboardNewSessionRequest?.();
         }
+      });
     };
 
-    async function connect() {
-      clearRetry();
-      if (stopped) return;
-      if (navigator.onLine === false) {
-        scheduleReconnect();
-        return;
-      }
-      show("connecting", "正在连接", "Connecting");
-      try {
-        const url = await buildWsUrl("/api/events", { channel });
-        if (stopped) return;
-        const socket = new WebSocket(url);
-        ws = socket;
-        socket.addEventListener("open", () => {
-          if (stopped || ws !== socket) return;
-          retryAttempt = 0;
-          show("open", "已连接，工具调用实时同步", "Connected; tool calls are live");
-        });
-        socket.addEventListener("message", handleMessage);
-        socket.addEventListener("close", (event) => {
-          if (stopped || ws !== socket || event.code === 1000) return;
-          ws = null;
-          if (event.code === 4401 || event.code === 4403) {
-            show("error", "连接凭证已失效，正在自动刷新", "Refreshing event credentials");
-          } else {
-            show("error", "连接中断，正在自动恢复", "Connection lost; recovering automatically");
-          }
-          scheduleReconnect();
-        });
-        socket.addEventListener("error", () => {
-          if (!stopped && ws === socket) {
-            show("error", "工具事件流暂时不可用", "Tool events are temporarily unavailable");
-          }
-        });
-      } catch {
-        show("error", "连接失败，正在自动恢复", "Connection failed; recovering automatically");
-        scheduleReconnect();
-      }
-    }
-
-    const wake = () => {
-      if (stopped || ws?.readyState === WebSocket.OPEN) return;
-      retryAttempt = 0;
-      void connect();
-    };
-    const handleOffline = () => {
-      clearRetry();
-      show("waiting", "网络断开，恢复后自动连接", "Offline; reconnecting automatically");
-      ws?.close(1000);
-      ws = null;
-    };
-    const handleVisibility = () => {
-      if (document.visibilityState === "visible") wake();
-    };
-
-    window.addEventListener("online", wake);
-    window.addEventListener("offline", handleOffline);
-    window.addEventListener("pageshow", wake);
-    window.addEventListener("focus", wake);
-    document.addEventListener("visibilitychange", handleVisibility);
     void connect();
 
     return () => {
-      stopped = true;
-      clearRetry();
-      window.removeEventListener("online", wake);
-      window.removeEventListener("offline", handleOffline);
-      window.removeEventListener("pageshow", wake);
-      window.removeEventListener("focus", wake);
-      document.removeEventListener("visibilitychange", handleVisibility);
-      ws?.close(1000);
+      unmounting = true;
+      connectGeneration += 1;
+      clearConnectTimer();
+      if (reconnectTimer) {
+        clearTimeout(reconnectTimer);
+        reconnectTimer = null;
+      }
+      ws?.close();
     };
-  }, [channel, isChinese, onDashboardNewSessionRequest, onSessionTitleChange, version]);
+  }, [channel, onDashboardNewSessionRequest, onSessionTitleChange, version]);
 
   // Seed the badge on mount and re-read it whenever the sockets are rebuilt
   // (a profile/channel switch bumps `version`).
   useEffect(() => {
     refreshEffectiveModel();
   }, [refreshEffectiveModel, version]);
+
+  const reconnect = useCallback(() => {
+    setError(null);
+    setModelNotice(null);
+    setPendingReloadModel(null);
+    setVersion((v) => v + 1);
+  }, []);
 
   // The picker writes config.yaml over REST and reloads — it doesn't ride the
   // sidecar gateway session, so it's available whenever the sidebar is mounted.
@@ -424,19 +457,10 @@ export function ChatSidebar({
         className,
       )}
     >
-      <Button
-        outlined
-        className="w-full justify-start"
-        prefix={<MessageSquarePlus />}
-        onClick={onDashboardNewSessionRequest}
-      >
-        {isChinese ? "新建对话" : "New chat"}
-      </Button>
-
-      <Card className="grid min-w-0 grid-cols-[minmax(0,1fr)_auto] items-center gap-2 px-3 py-2">
-        <div className="min-w-0">
+      <Card className="flex items-center justify-between gap-2 px-3 py-2">
+        <div className="min-w-0 flex-1">
           <div className="text-display text-xs tracking-wider text-text-tertiary">
-            {isChinese ? "模型" : "model"}
+            model
           </div>
 
           <Button
@@ -444,20 +468,14 @@ export function ChatSidebar({
             size="sm"
             onClick={() => setModelOpen(true)}
             className={cn(
-              "w-full min-w-0 justify-start px-0 py-0",
-              "normal-case tracking-normal text-sm font-medium",
+              "max-w-full min-w-0 px-0 py-0",
+              "self-start normal-case tracking-normal text-sm font-medium",
               "hover:underline disabled:no-underline",
             )}
-            title={
-              modelName === "—"
-                ? isChinese
-                  ? "切换模型"
-                  : "switch model"
-                : modelName
-            }
+            title={modelName === "—" ? "switch model" : modelName}
           >
-            <span className="grid w-full min-w-0 grid-cols-[minmax(0,1fr)_auto] items-center gap-1">
-              <span className="min-w-0 truncate text-left">{modelLabel}</span>
+            <span className="flex min-w-0 max-w-full items-center gap-1">
+              <span className="truncate">{modelLabel}</span>
 
               <ChevronDown className="size-3.5 shrink-0 text-text-secondary" />
             </span>
@@ -465,36 +483,7 @@ export function ChatSidebar({
         </div>
 
         <Badge tone={STATE_TONE[state]} className="shrink-0">
-          {stateLabel[state]}
-        </Badge>
-      </Card>
-
-      <Card className="grid min-w-0 grid-cols-[minmax(0,1fr)_auto] items-center gap-2 px-3 py-2">
-        <div className="min-w-0">
-          <div className="text-display text-xs tracking-wider text-text-tertiary">
-            {isChinese ? "工具事件流" : "Tool events"}
-          </div>
-          <div className="mt-0.5 truncate text-xs text-text-secondary" title={eventFeedDetail}>
-            {eventFeedDetail}
-          </div>
-        </div>
-        <Badge
-          tone={
-            eventFeedState === "open"
-              ? "success"
-              : eventFeedState === "error"
-                ? "destructive"
-                : "warning"
-          }
-          className="shrink-0"
-        >
-          {eventFeedState === "open"
-            ? isChinese ? "在线" : "Live"
-            : eventFeedState === "waiting"
-              ? isChinese ? "等待网络" : "Waiting"
-              : eventFeedState === "error"
-                ? isChinese ? "恢复中" : "Recovering"
-                : isChinese ? "连接中" : "Connecting"}
+          {STATE_LABEL[state]}
         </Badge>
       </Card>
 
@@ -504,18 +493,11 @@ export function ChatSidebar({
             currentModel={modelName}
             profile={profile}
             refreshKey={modelRefreshKey}
-            onChanged={(effort) => {
-              window.dispatchEvent(
-                new CustomEvent("hermes:model-changed", {
-                  detail: { profile: profile || "default" },
-                }),
-              );
+            onChanged={(effort) =>
               setModelNotice(
-                isChinese
-                  ? `推理强度已设为 ${effort}，下一条消息立即生效。`
-                  : `Reasoning effort set to ${effort}. It applies to the next message.`,
-              );
-            }}
+                `Reasoning effort set to ${effort}. Run /new or refresh the page to apply it to this chat.`,
+              )
+            }
           />
         </Card>
       )}
@@ -561,6 +543,7 @@ export function ChatSidebar({
           alwaysGlobal
           onApply={async ({ provider, model, confirmExpensiveModel }) => {
             setModelNotice(null);
+            setPendingReloadModel(null);
             const result = await api.setModelAssignment(
               {
                 confirm_expensive_model: confirmExpensiveModel,
@@ -574,21 +557,8 @@ export function ChatSidebar({
             // and calls back; don't announce until the user confirms.
             if (!result.confirm_required) {
               refreshEffectiveModel();
-              window.dispatchEvent(
-                new CustomEvent("hermes:model-changed", {
-                  detail: {
-                    model,
-                    profile: profile || "default",
-                    provider,
-                  },
-                }),
-              );
-              const shortModel = model.split("/").slice(-1)[0];
-              setModelNotice(
-                isChinese
-                  ? `模型已切换为 ${shortModel}，下一条消息立即使用新模型。`
-                  : `Model set to ${shortModel}. The next message uses it immediately.`,
-              );
+              // Ask before reloading: applying the model starts a fresh chat.
+              setPendingReloadModel(model.split("/").slice(-1)[0]);
             }
             return result;
           }}
@@ -598,6 +568,17 @@ export function ChatSidebar({
           }}
         />
       )}
+
+      <ModelReloadConfirm
+        model={pendingReloadModel}
+        onCancel={() => {
+          const m = pendingReloadModel;
+          setPendingReloadModel(null);
+          setModelNotice(
+            `Model set to ${m}. Run /new or refresh the page to apply it to this chat.`,
+          );
+        }}
+      />
     </aside>
   );
 }

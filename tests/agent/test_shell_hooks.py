@@ -9,7 +9,6 @@ covered in ``test_shell_hooks_consent.py``.
 from __future__ import annotations
 
 import json
-import os
 from pathlib import Path
 
 import pytest
@@ -22,16 +21,9 @@ from agent import shell_hooks
 
 def _write_script(tmp_path: Path, name: str, body: str) -> Path:
     path = tmp_path / name
-    path.write_bytes(body.encode("utf-8"))
+    path.write_text(body)
     path.chmod(0o755)
     return path
-
-
-def _bash_path(path: Path) -> str:
-    if os.name == "nt" and path.drive:
-        drive = path.drive[0].lower()
-        return f"/mnt/{drive}/{path.as_posix()[3:].lstrip('/')}"
-    return path.as_posix()
 
 
 def _allowlist_pair(monkeypatch, tmp_path, event: str, command: str) -> None:
@@ -215,7 +207,7 @@ class TestCallbackSubprocess:
         script = _write_script(
             tmp_path, "log.sh",
             f"#!/usr/bin/env bash\n"
-            f"echo \"$(cat -)\" >> {_bash_path(calls)}\n"
+            f"echo \"$(cat -)\" >> {calls}\n"
             f"printf '{{}}\\n'\n",
         )
         spec = shell_hooks.ShellHookSpec(
@@ -235,7 +227,7 @@ class TestCallbackSubprocess:
         capture = tmp_path / "payload.json"
         script = _write_script(
             tmp_path, "capture.sh",
-            f"#!/usr/bin/env bash\ncat - > {_bash_path(capture)}\nprintf '{{}}\\n'\n",
+            f"#!/usr/bin/env bash\ncat - > {capture}\nprintf '{{}}\\n'\n",
         )
         spec = shell_hooks.ShellHookSpec(
             event="pre_tool_call", command=str(script),

@@ -8,8 +8,6 @@ byte-identical because it never becomes a turn.
 import copy
 import json
 import os
-import subprocess
-import sys
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -21,10 +19,6 @@ from hermes_cli.bang_shell import (
     parse_bang_command,
     run_bang_command,
 )
-
-
-def _python_command(source: str) -> str:
-    return subprocess.list2cmdline([sys.executable, "-c", source])
 
 
 # ── detection / parsing ────────────────────────────────────────────────────
@@ -97,20 +91,14 @@ class TestBangContextGating:
 class TestBangExecution:
     def test_output_is_streamed_to_writer(self):
         lines = []
-        code = run_bang_command(
-            _python_command("print('bang-one'); print('bang-two')"),
-            writer=lines.append,
-        )
+        code = run_bang_command("echo bang-one; echo bang-two", writer=lines.append)
         assert code == 0
         assert "bang-one" in lines
         assert "bang-two" in lines
 
     def test_stderr_is_merged_into_output(self):
         lines = []
-        run_bang_command(
-            _python_command("import sys; print('to-stderr', file=sys.stderr)"),
-            writer=lines.append,
-        )
+        run_bang_command("echo to-stderr >&2", writer=lines.append)
         assert "to-stderr" in lines
 
     def test_nonzero_exit_code_is_returned(self):
@@ -120,11 +108,7 @@ class TestBangExecution:
 
     def test_runs_in_requested_cwd(self, tmp_path):
         lines = []
-        code = run_bang_command(
-            _python_command("import os; print(os.getcwd())"),
-            cwd=str(tmp_path),
-            writer=lines.append,
-        )
+        code = run_bang_command("pwd", cwd=str(tmp_path), writer=lines.append)
         assert code == 0
         # macOS resolves /tmp through /private, so compare realpaths.
         assert os.path.realpath(lines[-1].strip()) == os.path.realpath(str(tmp_path))
@@ -190,7 +174,7 @@ class TestBangHandlerDispatch:
 
     def test_zero_exit_prints_no_exit_line(self):
         cli = _make_cli()
-        cli.handle_bang_shell("!echo ok")
+        cli.handle_bang_shell("!true")
         assert not any("exited" in line for line in _printed(cli))
 
     def test_disabled_context_falls_through(self, monkeypatch):

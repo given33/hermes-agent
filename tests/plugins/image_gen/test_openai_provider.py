@@ -236,7 +236,7 @@ class TestGenerate:
             result = provider.generate("a cat")
 
         assert result["success"] is True
-        assert result["image"].replace("\\", "/").startswith("/")
+        assert result["image"].startswith("/")
         assert "example.com" not in result["image"]
         mock_save_url.assert_called_once()
 

@@ -485,18 +485,6 @@ class WebSocketRelayTransport:
     async def _dial_and_start(self) -> None:
         """Open the socket, start the reader, send hello. Used by connect() and
         by the reconnect supervisor on a re-dial."""
-        # A previous dial can leave a half-open pair behind when hello fails:
-        # cancel/close them BEFORE overwriting, or the old reader task and
-        # socket leak on every such reconnect.
-        stale_reader = self._reader
-        stale_ws = self._ws
-        if stale_reader is not None and not stale_reader.done():
-            stale_reader.cancel()
-        if stale_ws is not None:
-            try:
-                await stale_ws.close()
-            except Exception:
-                pass
         loop = asyncio.get_running_loop()
         self._descriptor_ready = loop.create_future()
         # A fresh handshake is coming; clear any stale descriptor so handshake()

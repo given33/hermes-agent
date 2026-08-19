@@ -180,7 +180,7 @@ class TeamsSummaryWriter:
         platform_config: PlatformConfig | None = None,
         *,
         graph_client: Any | None = None,
-        transport: "httpx.AsyncBaseTransport | None" = None,
+        transport: httpx.AsyncBaseTransport | None = None,
     ) -> None:
         self._platform_config = platform_config
         self._graph_client = graph_client
@@ -1213,7 +1213,8 @@ class TeamsAdapter(BasePlatformAdapter):
             return SendResult(success=True, message_id=message_id)
         except Exception as e:
             logger.error("[teams] send_exec_approval failed: %s", e, exc_info=True)
-            return SendResult(success=False, error=str(e), retryable=True)
+            _is_timeout = isinstance(e, (asyncio.TimeoutError, TimeoutError)) or 'timed out' in str(e).lower() or 'timeout' in str(e).lower()
+            return SendResult(success=False, error=str(e), retryable=not _is_timeout)
 
     async def send(
         self,
@@ -1247,7 +1248,8 @@ class TeamsAdapter(BasePlatformAdapter):
                     result = await self._app.send(chat_id, chunk)
                 last_message_id = getattr(result, "id", None)
             except Exception as e:
-                return SendResult(success=False, error=str(e), retryable=True)
+                _is_timeout = isinstance(e, (asyncio.TimeoutError, TimeoutError)) or 'timed out' in str(e).lower() or 'timeout' in str(e).lower()
+            return SendResult(success=False, error=str(e), retryable=not _is_timeout)
 
         return SendResult(success=True, message_id=last_message_id)
 
@@ -1307,7 +1309,8 @@ class TeamsAdapter(BasePlatformAdapter):
             return SendResult(success=True, message_id=getattr(result, "id", None))
         except Exception as e:
             logger.error("[teams] send_%s failed: %s", media_label, e, exc_info=True)
-            return SendResult(success=False, error=str(e), retryable=True)
+            _is_timeout = isinstance(e, (asyncio.TimeoutError, TimeoutError)) or 'timed out' in str(e).lower() or 'timeout' in str(e).lower()
+            return SendResult(success=False, error=str(e), retryable=not _is_timeout)
 
     async def send_image(
         self,

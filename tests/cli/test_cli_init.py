@@ -150,7 +150,6 @@ class TestBusyInputMode:
 
 
 class TestPromptToolkitTerminalCompatibility:
-    @pytest.mark.skipif(sys.platform == "win32", reason="POSIX terminal contract")
     def test_lf_enter_binding_respects_multiline_shortcuts(self):
         """Ctrl+J is reserved by default, with legacy LF-submit available as an opt-out.
 
@@ -248,7 +247,6 @@ class TestPromptToolkitTerminalCompatibility:
 
 
 
-    @pytest.mark.skipif(sys.platform == "win32", reason="POSIX terminal contract")
     def test_cpr_gating_posix_suppresses_without_ssh(self, monkeypatch):
         """POSIX suppresses CPR without SSH.
 

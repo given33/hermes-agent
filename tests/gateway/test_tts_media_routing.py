@@ -16,13 +16,7 @@ from unittest.mock import AsyncMock
 import pytest
 
 from gateway.config import Platform, PlatformConfig
-from gateway.platforms.base import (
-    BasePlatformAdapter,
-    MessageEvent,
-    MessageType,
-    SendResult,
-    local_path_from_file_uri,
-)
+from gateway.platforms.base import BasePlatformAdapter, MessageEvent, MessageType, SendResult
 from gateway.run import GatewayRunner
 from gateway.session import SessionSource, build_session_key
 
@@ -245,7 +239,7 @@ async def test_queued_followup_delivery_strips_media_tag_from_text_and_sends_ima
     )
     adapter.send_multiple_images.assert_awaited_once_with(
         chat_id="chat-1",
-        images=[(media_file.as_uri(), "")],
+        images=[(f"file://{media_file.as_posix()}", "")],
         metadata={"thread_id": "topic-1"},
     )
 
@@ -295,7 +289,7 @@ async def test_queued_followup_delivery_reuses_routing_metadata_for_media(
     )
     adapter.send_multiple_images.assert_awaited_once_with(
         chat_id="chat-1",
-        images=[(media_file.as_uri(), "")],
+        images=[(f"file://{media_file.as_posix()}", "")],
         metadata=routing_metadata,
     )
 
@@ -482,7 +476,9 @@ class _QueuedMediaCaptureAdapter(BasePlatformAdapter):
 
     async def send_multiple_images(self, chat_id, images, metadata=None, human_delay=0.0):
         for image_url, _alt in images:
-            path = local_path_from_file_uri(image_url)
+            path = image_url
+            if path.startswith("file://"):
+                path = path[len("file://"):]
             self.images.append({"chat_id": chat_id, "image_path": path, "metadata": metadata})
 
     async def get_chat_info(self, chat_id):

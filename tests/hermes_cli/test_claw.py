@@ -2,7 +2,6 @@
 
 from argparse import Namespace
 import subprocess
-import sys
 from types import ModuleType
 from unittest.mock import MagicMock, patch
 
@@ -351,7 +350,6 @@ class TestPrintMigrationReport:
 
 
 class TestDetectOpenclawProcesses:
-    @pytest.mark.skipif(sys.platform == "win32", reason="pgrep is POSIX-only")
     def test_returns_match_when_pgrep_finds_openclaw(self):
         with patch.object(claw_mod, "subprocess") as mock_subprocess:
             # systemd check misses, pgrep finds openclaw

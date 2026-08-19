@@ -31,6 +31,7 @@ import { createPortal } from "react-dom";
 import { useSearchParams } from "react-router";
 
 import { ChatSidebar } from "@/components/ChatSidebar";
+import { ChatSessionList } from "@/components/ChatSessionList";
 import { usePageHeader } from "@/contexts/usePageHeader";
 import { useI18n } from "@/i18n";
 import { api } from "@/lib/api";
@@ -39,9 +40,6 @@ import { copyTextToClipboard } from "@/lib/clipboard";
 import { normalizeSessionTitle } from "@/lib/chat-title";
 import { createPtyCompositionForwarder } from "@/lib/pty-composition";
 import { PtyResumeSanitizer } from "@/lib/pty-resume-sanitizer";
-import {
-  PENDING_UNIFIED_SESSION_KEY,
-} from "@/lib/unified-session";
 import {
   PTY_CONNECTING_TIMEOUT_MS,
   PTY_RECONNECT_INPUT_MESSAGE,
@@ -281,17 +279,7 @@ export default function ChatPage({ isActive = true }: { isActive?: boolean }) {
     setPtyState("connecting");
     setReconnectNonce((n) => n + 1);
   }, [clearReconnectTimer]);
-  const [mobilePanelOpenRaw, setMobilePanelOpenRaw] = useState(false);
-  const [unifiedChatActive, setUnifiedChatActive] = useState(false);
   const startFreshDashboardChat = useCallback(() => {
-    if (unifiedChatActive) {
-      window.dispatchEvent(
-        new CustomEvent("hermes:new-unified-conversation"),
-      );
-      setMobilePanelOpenRaw(false);
-      return;
-    }
-
     const next = new URLSearchParams(searchParams);
 
     next.delete("resume");
@@ -306,12 +294,7 @@ export default function ChatPage({ isActive = true }: { isActive?: boolean }) {
     setLastCloseCode(null);
     setPtyState("connecting");
     setReconnectNonce((n) => n + 1);
-  }, [
-    clearReconnectTimer,
-    searchParams,
-    setSearchParams,
-    unifiedChatActive,
-  ]);
+  }, [clearReconnectTimer, searchParams, setSearchParams]);
   // Raw state for the mobile side-sheet + a derived value that force-
   // closes whenever the chat tab isn't active.  The *derived* value is
   // what side-effects (body-scroll lock, keydown listener, portal render)
@@ -320,6 +303,7 @@ export default function ChatPage({ isActive = true }: { isActive?: boolean }) {
   // /chat re-runs the effect (derived flips back to true) and re-locks.
   // Keying on the raw state would leak the body.overflow="hidden" across
   // tabs because the dep wouldn't change on tab switch.
+  const [mobilePanelOpenRaw, setMobilePanelOpenRaw] = useState(false);
   const mobilePanelOpen = isActive && mobilePanelOpenRaw;
 
   // Collapse toggle for the desktop chat side panel (model + sessions),
@@ -353,38 +337,6 @@ export default function ChatPage({ isActive = true }: { isActive?: boolean }) {
       ? window.matchMedia("(max-width: 1023px)").matches
       : false,
   );
-
-  useEffect(() => {
-    const syncUnifiedChat = () => {
-      setUnifiedChatActive(
-        Boolean(
-          document.querySelector(
-            '[data-chat-active="true"] .hc-single-chat',
-          ),
-        ),
-      );
-    };
-    syncUnifiedChat();
-    const observer = new MutationObserver(syncUnifiedChat);
-    observer.observe(document.body, { childList: true, subtree: true });
-    return () => observer.disconnect();
-  }, []);
-
-  useEffect(() => {
-    if (!isActive) return;
-    const frame = window.requestAnimationFrame(() => {
-      const pendingSessionId = window.sessionStorage.getItem(
-        PENDING_UNIFIED_SESSION_KEY,
-      );
-      if (!pendingSessionId) return;
-      window.dispatchEvent(
-        new CustomEvent("hermes:resume-unified-session", {
-          detail: { sessionId: pendingSessionId },
-        }),
-      );
-    });
-    return () => window.cancelAnimationFrame(frame);
-  }, [isActive]);
 
   const { theme } = useTheme();
   const terminalBg = theme.terminalBackground ?? DEFAULT_TERMINAL_BACKGROUND;
@@ -493,20 +445,6 @@ export default function ChatPage({ isActive = true }: { isActive?: boolean }) {
       document.body.style.overflow = prevOverflow;
     };
   }, [mobilePanelOpen, closeMobilePanel]);
-
-  useEffect(() => {
-    const openUnifiedModelTools = () => setMobilePanelOpenRaw(true);
-    window.addEventListener(
-      "hermes:open-model-tools",
-      openUnifiedModelTools,
-    );
-    return () => {
-      window.removeEventListener(
-        "hermes:open-model-tools",
-        openUnifiedModelTools,
-      );
-    };
-  }, []);
 
   useEffect(() => {
     const mql = window.matchMedia("(min-width: 1024px)");
@@ -1747,7 +1685,7 @@ export default function ChatPage({ isActive = true }: { isActive?: boolean }) {
   });
   const mobileModelToolsPortal =
     isActive &&
-    (narrow || unifiedChatActive) &&
+    narrow &&
     portalRoot &&
     createPortal(
       <>
@@ -1782,8 +1720,7 @@ export default function ChatPage({ isActive = true }: { isActive?: boolean }) {
         >
           <div
             className={cn(
-              "flex min-h-14 shrink-0 items-center justify-between gap-2 border-b border-current/20 px-5",
-              "pt-[env(safe-area-inset-top,0px)]",
+              "flex h-14 shrink-0 items-center justify-between gap-2 border-b border-current/20 px-5",
             )}
           >
             <Typography
@@ -1812,14 +1749,20 @@ export default function ChatPage({ isActive = true }: { isActive?: boolean }) {
               "border-t border-current/10",
             )}
           >
-            <div className="px-1 py-2">
+            <div className="border-b border-current/10 px-1 py-2">
               <ChatSidebar
                 channel={channel}
-              profile={scopedProfile}
+                profile={scopedProfile}
                 onDashboardNewSessionRequest={startFreshDashboardChat}
                 onSessionTitleChange={handleSessionTitleChange}
               />
             </div>
+            <ChatSessionList
+              activeSessionId={resumeParam}
+              profile={scopedProfile}
+              onPicked={closeMobilePanel}
+              onNewChat={startFreshDashboardChat}
+            />
           </div>
         </div>
       </>,
@@ -1984,6 +1927,15 @@ export default function ChatPage({ isActive = true }: { isActive?: boolean }) {
                 profile={scopedProfile}
                 onDashboardNewSessionRequest={startFreshDashboardChat}
                 onSessionTitleChange={handleSessionTitleChange}
+              />
+            </div>
+
+            {/* Session switcher fills the remaining height below the model box. */}
+            <div className="min-h-0 flex-1 overflow-hidden">
+              <ChatSessionList
+                activeSessionId={resumeParam}
+                profile={scopedProfile}
+                onNewChat={startFreshDashboardChat}
               />
             </div>
           </div>

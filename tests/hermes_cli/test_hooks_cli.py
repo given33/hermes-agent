@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import io
 import json
-import os
 from contextlib import redirect_stdout
 from pathlib import Path
 from types import SimpleNamespace
@@ -27,16 +26,9 @@ def _isolated_home(tmp_path, monkeypatch):
 
 def _hook_script(tmp_path: Path, body: str, name: str = "hook.sh") -> Path:
     p = tmp_path / name
-    p.write_bytes(body.encode("utf-8"))
+    p.write_text(body)
     p.chmod(0o755)
     return p
-
-
-def _bash_path(path: Path) -> str:
-    if os.name == "nt" and path.drive:
-        drive = path.drive[0].lower()
-        return f"/mnt/{drive}/{path.as_posix()[3:].lstrip('/')}"
-    return path.as_posix()
 
 
 def _run(sub_args: SimpleNamespace) -> str:
@@ -97,7 +89,7 @@ class TestHooksTest:
         capture = tmp_path / "captured.json"
         script = _hook_script(
             tmp_path,
-            f"#!/usr/bin/env bash\ncat - > {_bash_path(capture)}\nprintf '{{}}\\n'\n",
+            f"#!/usr/bin/env bash\ncat - > {capture}\nprintf '{{}}\\n'\n",
         )
         cfg = {"hooks": {"subagent_stop": [{"command": str(script)}]}}
         with patch("hermes_cli.config.load_config", return_value=cfg):
@@ -199,7 +191,7 @@ class TestHooksDoctor:
         # Script would touch the sentinel if executed; we assert it wasn't.
         script = _hook_script(
             tmp_path,
-            f"#!/usr/bin/env bash\ntouch {_bash_path(sentinel)}\nprintf '{{}}\\n'\n",
+            f"#!/usr/bin/env bash\ntouch {sentinel}\nprintf '{{}}\\n'\n",
         )
         cfg = {"hooks": {"on_session_start": [{"command": str(script)}]}}
         with patch("hermes_cli.config.load_config", return_value=cfg):

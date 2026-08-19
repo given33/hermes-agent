@@ -565,17 +565,6 @@ class TestEnvVarFiltering(unittest.TestCase):
 
 class TestExecuteCodeEdgeCases(unittest.TestCase):
 
-    def test_role_scoped_empty_intersection_does_not_fallback(self):
-        from tools.code_execution_tool import _resolve_sandbox_tools
-
-        self.assertEqual(
-            _resolve_sandbox_tools(["vision_analyze"], tool_role="reporter"),
-            frozenset(),
-        )
-        self.assertEqual(
-            _resolve_sandbox_tools(["vision_analyze"], tool_role=None),
-            frozenset(SANDBOX_ALLOWED_TOOLS),
-        )
     def test_command_argument_points_to_terminal(self):
         result = json.loads(registry.dispatch(
             "execute_code",
@@ -784,17 +773,16 @@ class TestRpcTokenAuthorization(unittest.TestCase):
     """
 
     def _drive_server(self, rpc_token, requests):
-        """Run _rpc_server_loop against a real local socketpair.
+        """Run _rpc_server_loop against a real AF_UNIX socketpair.
 
         Sends each dict in *requests* as a newline-delimited JSON message
         and returns the list of decoded JSON responses.
         """
         from tools.code_execution_tool import _rpc_server_loop
 
-        # socketpair chooses the platform-supported local transport. Passing
-        # AF_UNIX explicitly breaks on Windows Python builds that expose the
-        # socketpair API without the AF_UNIX constant.
-        srv, cli = socket.socketpair()
+        # socketpair gives us a connected client end and a "server" end we
+        # can hand to accept() by wrapping it in a tiny listener shim.
+        srv, cli = socket.socketpair(socket.AF_UNIX, socket.SOCK_STREAM)
 
         class _OneShotListener:
             """Minimal object exposing the .accept()/.settimeout() the loop uses."""

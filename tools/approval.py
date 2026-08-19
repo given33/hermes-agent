@@ -24,7 +24,7 @@ import time
 import unicodedata
 import uuid
 from typing import Optional
-from hermes_runtime.config import cfg_get
+from hermes_cli.config import cfg_get
 
 from tools.interrupt import is_interrupted
 from utils import env_var_enabled, is_truthy_value
@@ -235,14 +235,14 @@ def get_current_session_key(default: str = "default") -> str:
     session_key = _approval_session_key.get()
     if session_key:
         return session_key
-    from hermes_runtime.session_context import get_session_env
+    from gateway.session_context import get_session_env
     return get_session_env("HERMES_SESSION_KEY", default)
 
 
 def _get_session_platform() -> str:
     """Return the current gateway platform from contextvars/env fallback."""
     try:
-        from hermes_runtime.session_context import get_session_env
+        from gateway.session_context import get_session_env
 
         return get_session_env("HERMES_SESSION_PLATFORM", "") or ""
     except Exception:
@@ -2949,7 +2949,7 @@ def load_permanent_allowlist() -> set:
 def save_permanent_allowlist(patterns: set):
     """Save permanently allowed command patterns to config."""
     try:
-        from hermes_runtime.config import load_config, save_config
+        from hermes_cli.config import load_config, save_config
         config = load_config()
         config["command_allowlist"] = list(patterns)
         save_config(config)
@@ -3012,7 +3012,7 @@ def _prompt_dangerous_approval_inner(command: str, description: str,
     # `command` is still what executes after approval; only the displayed
     # copy is scrubbed. Reuses the same redaction module used for memory
     # and log sanitization so tokens mask consistently across surfaces.
-    from hermes_runtime.redaction import redact_sensitive_text
+    from agent.redact import redact_sensitive_text
     display_command = redact_sensitive_text(command)
     display_description = redact_sensitive_text(description)
 
@@ -3558,7 +3558,7 @@ def _run_approval_gate(
             notify_cb = _gateway_notify_cbs.get(session_key)
 
         if notify_cb is not None:
-            from hermes_runtime.redaction import redact_sensitive_text
+            from agent.redact import redact_sensitive_text
             approval_data = {
                 "command": redact_sensitive_text(display_target),
                 "pattern_key": pattern_key,
@@ -4768,7 +4768,7 @@ def check_all_command_guards(command: str, env_type: str,
             # via the closure below, so redaction is display-only. Approval
             # persistence keys off pattern_key (not the command text), so the
             # allowlist is unaffected.
-            from hermes_runtime.redaction import redact_sensitive_text
+            from agent.redact import redact_sensitive_text
             approval_data = {
                 "command": redact_sensitive_text(command),
                 "pattern_key": primary_key,
@@ -4871,7 +4871,7 @@ def check_all_command_guards(command: str, env_type: str,
             # Return approval_required for backward compat. Redact secrets in the
             # user-facing copy — the raw `command` is preserved for execution and
             # the allowlist keys off pattern_key, so redaction is display-only.
-            from hermes_runtime.redaction import redact_sensitive_text
+            from agent.redact import redact_sensitive_text
             _disp_command = redact_sensitive_text(command)
             _disp_combined_desc = redact_sensitive_text(combined_desc)
             pending_data = {
@@ -5139,7 +5139,7 @@ def check_execute_code_guard(code: str, env_type: str,
     # screenshottable. The raw `command`/`code` are still what get assessed by
     # smart approval and executed; redaction is display-only. Approval
     # persistence keys off pattern_key, so the allowlist is unaffected.
-    from hermes_runtime.redaction import redact_sensitive_text
+    from agent.redact import redact_sensitive_text
     display_command = redact_sensitive_text(command)
     display_code = redact_sensitive_text(code)
     display_description = redact_sensitive_text(description)

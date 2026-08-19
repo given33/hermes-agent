@@ -682,10 +682,7 @@ class TestPathCanonicalization:
         target.touch()
 
         alias_dir = tmp_path / "alias"
-        try:
-            alias_dir.symlink_to(real_dir)
-        except (OSError, NotImplementedError) as exc:
-            pytest.skip(f"symlinks unavailable in test environment: {exc}")
+        alias_dir.symlink_to(real_dir)
 
         real_path = _canonical_path(str(target))
         alias_path = _canonical_path(str(alias_dir / "config.json"))

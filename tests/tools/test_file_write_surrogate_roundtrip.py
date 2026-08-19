@@ -19,14 +19,8 @@ from tools.file_operations import ShellFileOperations
 
 def _cat_to_file_proc(out_path):
     """A real child that copies its stdin to a file, byte for byte."""
-    # Git Bash must receive the MSYS form: a quoted native ``C:\...`` path is
-    # treated as a relative name and materialises as a private-use-character
-    # garbage file in the repo root instead of the intended temp file.
-    from tools.environments.local import _bash_safe_path, _find_bash
-
-    bash_path = _bash_safe_path(str(out_path))
     return subprocess.Popen(
-        [_find_bash() or "bash", "-c", f"cat > {shlex.quote(bash_path)}"],
+        ["bash", "-c", f"cat > {shlex.quote(str(out_path))}"],
         stdin=subprocess.PIPE,
         stdout=subprocess.PIPE,
         stderr=subprocess.STDOUT,
@@ -196,10 +190,8 @@ class TestPipeStdinRemainingBranches:
 
     def test_bytes_input_passes_through_untouched(self, tmp_path):
         out = tmp_path / "out.bin"
-        from tools.environments.local import _bash_safe_path, _find_bash
-
         proc = subprocess.Popen(
-            [_find_bash() or "bash", "-c", f"cat > {shlex.quote(_bash_safe_path(str(out)))}"],
+            ["bash", "-c", f"cat > {shlex.quote(str(out))}"],
             stdin=subprocess.PIPE, stdout=subprocess.PIPE,
             stderr=subprocess.STDOUT, text=True,
             encoding="utf-8", errors="replace",

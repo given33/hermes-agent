@@ -16,25 +16,10 @@ exactly:
 
 2. **Inbound delivery signature** (connector → gateway): the connector signs
    each inbound POST with the per-tenant *delivery key*, carried as
-   ``x-relay-timestamp`` + ``x-relay-signature`` headers. Mirrors the
-   connector's ``deliverySigning.ts``: ``sig = HMAC_SHA256(f"{ts}.{body_json}",
-   key).hexdigest()`` over the EXACT request body bytes, with a replay-window
-   skew check.
-
-   UNWIRED: ``verify_delivery_signature`` / ``DELIVERY_TS_HEADER`` /
-   ``DELIVERY_SIG_HEADER`` have NO production call site. The Python gateway
-   currently has no inbound HTTP delivery route — inbound events arrive over
-   the gateway's own outbound, upgrade-authenticated WebSocket
-   (``ws_transport.py``) — so nothing verifies scheme 2 today. It is reserved
-   for a future HTTP delivery endpoint; whoever adds that endpoint MUST call
-   ``verify_delivery_signature`` on every inbound POST before accepting the
-   event. Do not assume it is already wired.
-
-   (Scheme 1 pointing the other way is deliberate, not the same gap: the
-   gateway only *mints* the upgrade token via ``make_upgrade_token`` and the
-   connector's TypeScript verifies it, so ``verify_token`` having no Python
-   caller is correct — it exists to mirror the wire contract and for the
-   conformance tests.)
+   ``x-relay-timestamp`` + ``x-relay-signature`` headers; the gateway verifies
+   before accepting the event. Mirrors the connector's ``deliverySigning.ts``:
+   ``sig = HMAC_SHA256(f"{ts}.{body_json}", key).hexdigest()`` over the EXACT
+   request body bytes, with a replay-window skew check.
 
 Both schemes use a **multi-secret verify list** (primary first, then a secondary
 during a rotation window), exactly like ``api/src/handlers/stats_oauth.ts`` — so
@@ -164,11 +149,6 @@ def verify_delivery_signature(
     now: Optional[int] = None,
 ) -> bool:
     """Verify a connector→gateway inbound delivery signature.
-
-    UNWIRED — no production call site yet (see module docstring, scheme 2):
-    the gateway has no inbound HTTP delivery route, so this is reserved for
-    the endpoint that will add one and MUST be called there before an event
-    is accepted.
 
     ``body_json`` MUST be the exact request body bytes decoded as UTF-8 — the
     connector signs over the literal serialized body, so the gateway verifies

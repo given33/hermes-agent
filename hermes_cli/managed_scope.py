@@ -120,7 +120,7 @@ def load_managed_config() -> dict:
     parsed = _cached_read(
         managed_dir / "config.yaml",
         _CONFIG_CACHE,
-        lambda f: yaml.load(f, Loader=yaml.SafeLoader) or {},
+        lambda f: yaml.safe_load(f) or {},
     )
     return parsed if isinstance(parsed, dict) else {}
 

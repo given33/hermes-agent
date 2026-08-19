@@ -48,11 +48,8 @@ def test_export_snippet_shape():
     # continuation lines in the snapshot (issue #71296).
     assert "unset" in snippet
     assert "${!HERMES_SESSION_*}" in snippet
-    assert "${!HERMES_TOOL_ARTIFACT_*}" in snippet
     assert "${!HERMES_CRON_AUTO_DELIVER_*}" in snippet
     assert "HERMES_UI_SESSION_ID" in snippet
-    assert "HERMES_ACCOUNT_GENERATION" in snippet
-    assert "HERMES_CRON_SESSION" in snippet
     assert "grep -vE" not in snippet
     assert '"$__hermes_snap_tmp"' in snippet
     # The redirection must be attached to a brace group wrapping the dump,

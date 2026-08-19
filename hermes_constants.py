@@ -8,7 +8,6 @@ import os
 import shutil
 import stat
 import sys
-import tempfile
 from contextvars import ContextVar, Token
 from pathlib import Path
 
@@ -55,16 +54,7 @@ def _get_platform_default_hermes_home() -> Path:
     """Return the platform-native default Hermes home path."""
     if sys.platform == "win32":
         local_appdata = os.environ.get("LOCALAPPDATA", "").strip()
-        if local_appdata:
-            base = Path(local_appdata)
-        else:
-            try:
-                base = Path.home() / "AppData" / "Local"
-            except RuntimeError:
-                # Service managers and hermetic workers can launch with every
-                # profile variable removed. Keep diagnostics/readiness alive
-                # without guessing another user's profile directory.
-                base = Path(tempfile.gettempdir())
+        base = Path(local_appdata) if local_appdata else Path.home() / "AppData" / "Local"
         return base / "hermes"
     return Path.home() / ".hermes"
 

@@ -2037,8 +2037,8 @@ class GatewaySlashCommandsMixin:
                             try:
                                 # Write-back round-trip: raw read is correct
                                 # (merged defaults must not be persisted).
-                                from hermes_cli.config import read_raw_config_strict
-                                _persist_cfg = read_raw_config_strict(config_path)
+                                from hermes_cli.config import read_user_config_raw
+                                _persist_cfg = read_user_config_raw(config_path)
                                 _raw_model = _persist_cfg.get("model")
                                 if isinstance(_raw_model, dict):
                                     _persist_model_cfg = _raw_model
@@ -2363,8 +2363,8 @@ class GatewaySlashCommandsMixin:
                 try:
                     # Write-back round-trip: raw read is correct (merged
                     # defaults must not be persisted back to the user's file).
-                    from hermes_cli.config import read_raw_config_strict
-                    cfg = read_raw_config_strict(config_path)
+                    from hermes_cli.config import read_user_config_raw
+                    cfg = read_user_config_raw(config_path)
                     # Coerce scalar/None ``model:`` into a dict before mutation —
                     # otherwise ``cfg.setdefault("model", {})`` returns the existing
                     # scalar and the next assignment raises
@@ -2729,6 +2729,27 @@ class GatewaySlashCommandsMixin:
             state = mgr.resume()
             if state is None:
                 return t("gateway.goal.no_resume")
+            # Resume must restart work, not just flip persisted state
+            # (#75362): enqueue the canonical continuation through the
+            # adapter FIFO — the same path the post-turn judge uses — so
+            # the next turn fires as soon as this reply is delivered. A
+            # real user message already queued still preempts naturally,
+            # and pause/clear's stale-continuation cleanup recognizes it.
+            prompt = mgr.next_continuation_prompt()
+            try:
+                adapter = self.adapters.get(event.source.platform) if event.source else None
+                _quick_key = self._session_key_for_source(event.source) if event.source else None
+                if prompt and adapter and _quick_key:
+                    cont_event = MessageEvent(
+                        text=prompt,
+                        message_type=MessageType.TEXT,
+                        source=event.source,
+                        message_id=None,
+                        channel_prompt=None,
+                    )
+                    self._enqueue_fifo(_quick_key, cont_event, adapter)
+            except Exception as exc:
+                logger.debug("goal resume: continuation enqueue failed: %s", exc)
             return t("gateway.goal.resumed", goal=state.goal)
 
         if lower in {"clear", "stop", "done"}:
@@ -3038,6 +3059,10 @@ class GatewaySlashCommandsMixin:
         except Exception as exc:
             logger.debug("loop manager unavailable: %s", exc)
             return None, None
+        # Warm the SessionDB cache off-loop. A cold cache drops the first
+        # /loop write while the reply claims the loop was set (same class
+        # as the /goal false-ack fix).
+        await self._warm_goals_session_db("loop manager")
         try:
             session_entry = await self.async_session_store.get_or_create_session(event.source)
         except Exception:

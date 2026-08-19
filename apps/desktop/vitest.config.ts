@@ -9,10 +9,6 @@ const reactUi: TestProjectConfiguration = {
     setupFiles: ['./vitest.setup.ts'],
     include: ['src/**/*.test.{ts,tsx}'],
     globals: true,
-    // Each UI worker owns a full jsdom + React module graph. Letting Vitest
-    // match all logical CPUs starves async renders on Windows CI and turns
-    // successful tests into cascading act()/cleanup timeouts.
-    maxWorkers: 4,
     // The first test in each file pays jsdom env init + full module transform,
     // which can exceed vitest's 5000ms default under CI/load. 15s gives the
     // cold start headroom without masking genuinely hung tests.

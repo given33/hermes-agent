@@ -69,12 +69,6 @@ _LOCAL_IMAGE_PATH_RE = re.compile(
     r"(?<![/:\w.])(?:~/|/)(?:[\w.\-]+/)*[\w.\-]+\.(?:" + _IMAGE_EXT_PATTERN + r")\b",
     re.IGNORECASE,
 )
-_WINDOWS_LOCAL_IMAGE_PATH_RE = re.compile(
-    r"(?<![\w.])[A-Za-z]:[\\/](?:[\w.\-]+[\\/])*[\w.\-]+\.(?:"
-    + _IMAGE_EXT_PATTERN
-    + r")\b",
-    re.IGNORECASE,
-)
 
 # http(s) URL ending in an image extension (optionally followed by a
 # query string). Case-insensitive on the extension. Strict ``http(s)://``
@@ -121,22 +115,21 @@ def extract_image_refs(text: str) -> Tuple[List[str], List[str]]:
 
     local_paths: list[str] = []
     seen_paths: set[str] = set()
-    for path_pattern in (_LOCAL_IMAGE_PATH_RE, _WINDOWS_LOCAL_IMAGE_PATH_RE):
-        for match in path_pattern.finditer(text):
-            if _in_code(match.start()):
+    for match in _LOCAL_IMAGE_PATH_RE.finditer(text):
+        if _in_code(match.start()):
+            continue
+        raw = match.group(0)
+        expanded = os.path.expanduser(raw)
+        try:
+            if not os.path.isfile(expanded):
                 continue
-            raw = match.group(0)
-            expanded = _expand_image_path(raw)
-            try:
-                if not os.path.isfile(expanded):
-                    continue
-            except OSError:
+        except OSError:
             # ENAMETOOLONG / EINVAL on pathological inputs — skip rather than crash.
-                continue
-            if expanded in seen_paths:
-                continue
-            seen_paths.add(expanded)
-            local_paths.append(expanded)
+            continue
+        if expanded in seen_paths:
+            continue
+        seen_paths.add(expanded)
+        local_paths.append(expanded)
 
     urls: list[str] = []
     seen_urls: set[str] = set()
@@ -153,16 +146,6 @@ def extract_image_refs(text: str) -> Tuple[List[str], List[str]]:
         urls.append(url)
 
     return local_paths, urls
-
-
-def _expand_image_path(raw: str) -> str:
-    """Expand image paths using an explicit HOME before host defaults."""
-
-    if raw == "~" or raw.startswith(("~/", "~\\")):
-        home = os.environ.get("HOME") or os.environ.get("USERPROFILE")
-        if home:
-            return os.path.join(home, raw[2:])
-    return os.path.expanduser(raw)
 
 
 # Strict YAML/JSON boolean coercion for capability overrides.

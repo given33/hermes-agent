@@ -32,30 +32,7 @@ from __future__ import annotations
 import os
 import sys
 
-__all__ = ["configure_windows_stdio", "ensure_utf8_stdio", "is_windows"]
-
-
-def ensure_utf8_stdio(force: bool = False) -> None:
-    """Re-export of :func:`hermes_cli.ensure_utf8_stdio`.
-
-    The two stdio repairs are one concern from an entry point's point of
-    view — ``configure_windows_stdio`` fixes the Windows console code page,
-    ``ensure_utf8_stdio`` fixes non-UTF-8 stream encodings on any platform
-    (legacy POSIX locales included) — so entry points should be able to
-    reach both through this module in a single import.
-
-    That matters beyond tidiness: ``gateway/run.py`` reaches these across a
-    package boundary, and ``tests/architecture/test_dependency_direction.py``
-    ratchets deferred cross-package import statements. Re-exporting here
-    keeps one concern to one import statement.
-
-    Deferred import: ``hermes_cli/__init__`` imports nothing from this
-    module, but keeping it lazy means importing ``hermes_cli.stdio`` alone
-    stays cheap.
-    """
-    from hermes_cli import ensure_utf8_stdio as _ensure
-
-    _ensure(force=force)
+__all__ = ["configure_windows_stdio", "is_windows"]
 
 
 _CONFIGURED = False

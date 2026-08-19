@@ -1,27 +1,6 @@
 from types import SimpleNamespace
 
 from agent.agent_init import _merge_custom_provider_extra_body
-from agent.transports.chat_completions import ChatCompletionsTransport
-from providers import get_provider_profile
-
-
-def test_custom_profile_maps_disabled_reasoning_without_unknown_sdk_keyword():
-    profile = get_provider_profile("custom")
-    assert profile is not None
-
-    kwargs = ChatCompletionsTransport().build_kwargs(
-        model="gpt-5.6-sol",
-        messages=[{"role": "user", "content": "ping"}],
-        provider_profile=profile,
-        base_url="https://hubway.cc/v1",
-        reasoning_config={"enabled": False},
-        request_overrides={"service_tier": "normal"},
-    )
-
-    assert kwargs["reasoning_effort"] == "none"
-    assert kwargs["extra_body"]["think"] is False
-    assert "reasoning" not in kwargs
-    assert kwargs["service_tier"] == "normal"
 
 
 

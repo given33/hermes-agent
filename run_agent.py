@@ -38,11 +38,6 @@ import hashlib
 import json
 import logging
 logger = logging.getLogger(__name__)
-
-# This fork supports Nous as a direct API-key inference provider only. Keep the
-# upstream response-header parser available for low-conflict upstream syncs,
-# but do not expose account balance, subscription, or depletion UI at runtime.
-_NOUS_ACCOUNT_FEATURES_ENABLED = True
 import os
 import re
 import sys
@@ -477,6 +472,7 @@ class AIAgent:
         read_preview_callback: callable = None,
         read_window_below_callback: callable = None,
         setup_mcp_callback: callable = None,
+        tour_callback: callable = None,
         step_callback: callable = None,
         stream_delta_callback: callable = None,
         interim_assistant_callback: callable = None,
@@ -509,8 +505,6 @@ class AIAgent:
         iteration_budget: "IterationBudget" = None,
         fallback_model: Dict[str, Any] = None,
         credential_pool=None,
-        prompt_runtime_mode: str = "native",
-        tool_role: str | None = None,
         checkpoints_enabled: bool = False,
         checkpoint_max_snapshots: int = 20,
         checkpoint_max_total_size_mb: int = 500,
@@ -567,6 +561,7 @@ class AIAgent:
             read_preview_callback=read_preview_callback,
             read_window_below_callback=read_window_below_callback,
             setup_mcp_callback=setup_mcp_callback,
+            tour_callback=tour_callback,
             step_callback=step_callback,
             stream_delta_callback=stream_delta_callback,
             interim_assistant_callback=interim_assistant_callback,
@@ -599,8 +594,6 @@ class AIAgent:
             iteration_budget=iteration_budget,
             fallback_model=fallback_model,
             credential_pool=credential_pool,
-            prompt_runtime_mode=prompt_runtime_mode,
-            tool_role=tool_role,
             checkpoints_enabled=checkpoints_enabled,
             checkpoint_max_snapshots=checkpoint_max_snapshots,
             checkpoint_max_total_size_mb=checkpoint_max_total_size_mb,
@@ -4089,8 +4082,6 @@ class AIAgent:
         EVALUATION/EMIT is a SEPARATE block that WARNS on failure (R1-M2): a bug in the
         depletion-notice path must not vanish silently under the parse swallow.
         """
-        if not _NOUS_ACCOUNT_FEATURES_ENABLED:
-            return
         # Dev test fixture (HERMES_DEV_CREDITS_FIXTURE): inject a chosen notice state
         # each turn for repeatable testing, bypassing real headers. Throwaway scaffolding.
         try:
@@ -4177,8 +4168,6 @@ class AIAgent:
         swallowing (R1-M2): a depletion-path bug must not vanish silently. Emits clears
         FIRST, then shows (so depleted lands last in a latest-wins slot).
         """
-        if not _NOUS_ACCOUNT_FEATURES_ENABLED:
-            return
         if getattr(self, "notice_callback", None) is None and getattr(self, "notice_clear_callback", None) is None:
             return
         if not self._credits_notices_enabled():
@@ -4214,8 +4203,6 @@ class AIAgent:
         config flip applying on the next session is fine.  Fail-open True
         (preserve current behaviour) on any config error.
         """
-        if not _NOUS_ACCOUNT_FEATURES_ENABLED:
-            return False
         cached = getattr(self, "_credits_notices_enabled_cache", None)
         if cached is not None:
             return cached
@@ -8201,13 +8188,10 @@ class AIAgent:
                     assistant_message, messages, effective_task_id, api_call_count
                 )
 
-            from agent.tool_dispatch_helpers import plan_tool_batch_execution
+            from agent.tool_dispatch_helpers import _plan_tool_batch_segments
             _active_env = get_active_env(effective_task_id)
             _exec_cwd = Path(_active_env.cwd) if _active_env is not None and _active_env.cwd else None
-            segments = plan_tool_batch_execution(
-                tool_calls,
-                execution_cwd=_exec_cwd,
-            )
+            segments = _plan_tool_batch_segments(tool_calls, execution_cwd=_exec_cwd)
 
             if len(segments) == 1:
                 kind = segments[0][0]
@@ -8256,11 +8240,6 @@ class AIAgent:
             max_iterations=function_args.get("max_iterations"),
             role=function_args.get("role"),
             background=(not _is_subagent),
-            expected_output=function_args.get("expected_output"),
-            acceptance_criteria=function_args.get("acceptance_criteria"),
-            inherit_turns=function_args.get("inherit_turns"),
-            context_variables=function_args.get("context_variables"),
-            name=function_args.get("name"),
             action=function_args.get("action"),
             subagent_id=function_args.get("subagent_id"),
             message=function_args.get("message"),
@@ -8891,29 +8870,6 @@ def main(
     Toolset Examples:
         - "research": Web search, extract, crawl + vision tools
     """
-    # Force UTF-8 stdio before anything prints — this function opens with
-    # emoji banners that UnicodeEncodeError on cp1252 consoles otherwise.
-    #
-    # ``ensure_utf8_stdio`` is the repair that used to run as an import-time
-    # side effect of ``hermes_cli``; it now belongs to process entry points,
-    # and the ``hermes-agent`` console script (pyproject ``[project.scripts]``)
-    # lands directly here without passing through ``cli.py`` or
-    # ``hermes_cli/main.py``, so this entry point must call it itself.
-    # ``configure_windows_stdio`` layers on the Windows-only extras (console
-    # code-page flip, EDITOR default, PATH augmentation); ``ensure_utf8_stdio``
-    # covers the legacy POSIX locales it does not.  Both are idempotent.
-    #
-    # Both come from ``hermes_cli.stdio`` in a single import statement on
-    # purpose — same reasoning as ``gateway/run.py::main``:
-    # ``tests/architecture/test_dependency_direction.py`` ratchets deferred
-    # cross-package imports, and this is really one concern.
-    try:
-        from hermes_cli.stdio import configure_windows_stdio, ensure_utf8_stdio
-        ensure_utf8_stdio()
-        configure_windows_stdio()
-    except Exception:
-        pass
-
     print("🤖 AI Agent with Tool Calling")
     print("=" * 50)
     

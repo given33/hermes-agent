@@ -24,13 +24,11 @@ import os
 import json
 import re
 import asyncio
-import concurrent.futures
 from contextlib import contextmanager
 from contextvars import ContextVar
 import logging
 import threading
 import time
-from collections import OrderedDict
 from typing import Dict, Any, List, Optional, Tuple
 
 from tools.registry import (
@@ -90,61 +88,6 @@ def _is_dispatcher_owned_worker() -> bool:
 _tool_loop = None          # persistent loop for the main (CLI) thread
 _tool_loop_lock = threading.Lock()
 _worker_thread_local = threading.local()  # per-worker-thread persistent loops
-_ASYNC_BRIDGE_TIMEOUT_SECONDS = 300
-_ASYNC_BRIDGE_MAX_WORKERS = 128
-_ASYNC_BRIDGE_MAX_WORKERS_PER_SESSION = 32
-_async_bridge_slots = threading.BoundedSemaphore(_ASYNC_BRIDGE_MAX_WORKERS)
-_async_bridge_session_lock = threading.Lock()
-_async_bridge_session_slots: dict[str, tuple[threading.BoundedSemaphore, int]] = {}
-
-
-def _async_bridge_session_key() -> str:
-    try:
-        from tools.approval import get_current_session_key
-
-        key = get_current_session_key("").strip()
-    except Exception:
-        key = ""
-    return key or f"thread:{threading.get_ident()}"
-
-
-def _acquire_async_bridge_slot() -> tuple[str, threading.BoundedSemaphore]:
-    if not _async_bridge_slots.acquire(blocking=False):
-        raise RuntimeError("async bridge process worker limit reached")
-    key = _async_bridge_session_key()
-    with _async_bridge_session_lock:
-        state = _async_bridge_session_slots.get(key)
-        slots, active = state or (
-            threading.BoundedSemaphore(_ASYNC_BRIDGE_MAX_WORKERS_PER_SESSION),
-            0,
-        )
-        if not slots.acquire(blocking=False):
-            _async_bridge_slots.release()
-            raise RuntimeError("async bridge session worker limit reached")
-        _async_bridge_session_slots[key] = (slots, active + 1)
-    return key, slots
-
-
-def _release_async_bridge_slot(
-    key: str,
-    slots: threading.BoundedSemaphore,
-) -> None:
-    slots.release()
-    with _async_bridge_session_lock:
-        current = _async_bridge_session_slots.get(key)
-        if current is not None and current[0] is slots:
-            active = current[1] - 1
-            if active:
-                _async_bridge_session_slots[key] = (slots, active)
-            else:
-                _async_bridge_session_slots.pop(key, None)
-    _async_bridge_slots.release()
-
-
-def _close_awaitable(awaitable: Any) -> None:
-    close = getattr(awaitable, "close", None)
-    if callable(close):
-        close()
 
 
 def _get_tool_loop():
@@ -184,89 +127,6 @@ def _get_worker_loop():
     return loop
 
 
-def _run_async_in_daemon_thread(coro):
-    """Run one awaitable on a bounded daemon worker with its own loop."""
-    try:
-        session_key, session_slots = _acquire_async_bridge_slot()
-    except BaseException:
-        _close_awaitable(coro)
-        raise
-
-    worker_loop: Optional[asyncio.AbstractEventLoop] = None
-    loop_ready = threading.Event()
-    cancel_requested = threading.Event()
-    future: concurrent.futures.Future = concurrent.futures.Future()
-
-    def _run_in_worker():
-        nonlocal worker_loop
-        worker_loop = asyncio.new_event_loop()
-        loop_ready.set()
-        try:
-            asyncio.set_event_loop(worker_loop)
-            if cancel_requested.is_set():
-                _close_awaitable(coro)
-                raise concurrent.futures.CancelledError()
-            return worker_loop.run_until_complete(coro)
-        finally:
-            try:
-                pending = asyncio.all_tasks(worker_loop)
-                for task in pending:
-                    task.cancel()
-                if pending:
-                    worker_loop.run_until_complete(
-                        asyncio.gather(*pending, return_exceptions=True)
-                    )
-            except Exception:
-                pass
-            worker_loop.close()
-
-    from tools.thread_context import propagate_context_to_thread
-
-    propagated_worker = propagate_context_to_thread(_run_in_worker)
-
-    def _complete_future() -> None:
-        try:
-            if not future.set_running_or_notify_cancel():
-                _close_awaitable(coro)
-                return
-            try:
-                result = propagated_worker()
-            except BaseException as exc:
-                future.set_exception(exc)
-            else:
-                future.set_result(result)
-        finally:
-            _release_async_bridge_slot(session_key, session_slots)
-
-    worker = threading.Thread(
-        target=_complete_future,
-        name="hermes-async-bridge",
-        daemon=True,
-    )
-    try:
-        worker.start()
-    except BaseException:
-        _release_async_bridge_slot(session_key, session_slots)
-        _close_awaitable(coro)
-        raise
-
-    try:
-        return future.result(timeout=_ASYNC_BRIDGE_TIMEOUT_SECONDS)
-    except concurrent.futures.TimeoutError:
-        cancel_requested.set()
-        future.cancel()
-        if loop_ready.wait(timeout=1.0) and worker_loop is not None:
-            try:
-                def _cancel_pending() -> None:
-                    for task in asyncio.all_tasks(worker_loop):
-                        task.cancel()
-
-                worker_loop.call_soon_threadsafe(_cancel_pending)
-            except RuntimeError:
-                pass
-        raise
-
-
 def _run_async(coro):
     """Run an async coroutine from a sync context.
 
@@ -293,7 +153,62 @@ def _run_async(coro):
         loop = None
 
     if loop and loop.is_running():
-        return _run_async_in_daemon_thread(coro)
+        # Inside an async context (gateway, RL env) — run in a fresh thread
+        # with its own event loop we own a reference to, so on timeout we
+        # can cancel the task inside that loop (ThreadPoolExecutor.cancel()
+        # only works on not-yet-started futures — it's a no-op on a running
+        # worker, which previously leaked the thread on every 300 s timeout).
+        import concurrent.futures
+
+        worker_loop: Optional[asyncio.AbstractEventLoop] = None
+        loop_ready = threading.Event()
+
+        def _run_in_worker():
+            nonlocal worker_loop
+            worker_loop = asyncio.new_event_loop()
+            loop_ready.set()
+            try:
+                asyncio.set_event_loop(worker_loop)
+                return worker_loop.run_until_complete(coro)
+            finally:
+                try:
+                    # Cancel anything still pending (e.g. task cancelled
+                    # externally via call_soon_threadsafe on timeout).
+                    pending = asyncio.all_tasks(worker_loop)
+                    for t in pending:
+                        t.cancel()
+                    if pending:
+                        worker_loop.run_until_complete(
+                            asyncio.gather(*pending, return_exceptions=True)
+                        )
+                except Exception:
+                    pass
+                worker_loop.close()
+
+        pool = concurrent.futures.ThreadPoolExecutor(max_workers=1)
+        # Carry the active profile + approval/sudo callbacks into the worker so
+        # async tools resolve get_hermes_home() under the active profile.
+        from tools.thread_context import propagate_context_to_thread
+
+        future = pool.submit(propagate_context_to_thread(_run_in_worker))
+        try:
+            return future.result(timeout=300)
+        except concurrent.futures.TimeoutError:
+            # Cancel the coroutine inside its own loop so the worker thread
+            # can wind down instead of running forever.
+            if loop_ready.wait(timeout=1.0) and worker_loop is not None:
+                try:
+                    for t in asyncio.all_tasks(worker_loop):
+                        worker_loop.call_soon_threadsafe(t.cancel)
+                except RuntimeError:
+                    # Loop already closed — nothing to cancel.
+                    pass
+            raise
+        finally:
+            # wait=False: don't block the caller on a stuck coroutine. We've
+            # already requested cancellation above; the worker will exit
+            # once the coroutine observes it (usually at the next await).
+            pool.shutdown(wait=False)
 
     # If we're on a worker thread (e.g., parallel tool execution in
     # delegate_task), use a per-thread persistent loop.  This avoids
@@ -410,7 +325,6 @@ def get_tool_definitions(
     disabled_toolsets: Optional[List[str]] = None,
     quiet_mode: bool = False,
     skip_tool_search_assembly: bool = False,
-    tool_role: Optional[str] = None,
 ) -> List[Dict[str, Any]]:
     """
     Get tool definitions for model API calls with toolset-based filtering.
@@ -460,7 +374,6 @@ def get_tool_definitions(
                 _is_delegated_child_context(),
                 _is_dispatcher_owned_worker(),
                 profile_scope,
-                str(tool_role or "").strip().lower(),
             )
         with _tool_defs_cache_lock:
             cached = _tool_defs_cache.get(cache_key) if cache_key is not None else None
@@ -473,13 +386,8 @@ def get_tool_definitions(
             # schemas are treated as read-only by all known callers.
             return list(cached)
 
-    result = _compute_tool_definitions(
-        enabled_toolsets,
-        disabled_toolsets,
-        quiet_mode,
-        skip_tool_search_assembly=skip_tool_search_assembly,
-        tool_role=tool_role,
-    )
+    result = _compute_tool_definitions(enabled_toolsets, disabled_toolsets, quiet_mode,
+                                       skip_tool_search_assembly=skip_tool_search_assembly)
     if quiet_mode and cache_key is not None:
         # Cache the freshly-computed list, but hand callers a shallow copy so
         # downstream mutations (e.g. run_agent appending memory/LCM tool
@@ -511,7 +419,6 @@ def _compute_tool_definitions(
     disabled_toolsets: Optional[List[str]] = None,
     quiet_mode: bool = False,
     skip_tool_search_assembly: bool = False,
-    tool_role: Optional[str] = None,
 ) -> List[Dict[str, Any]]:
     """Uncached implementation of :func:`get_tool_definitions`."""
     # Determine which tool names the caller wants
@@ -601,15 +508,6 @@ def _compute_tool_definitions(
 
     # Ask the registry for schemas (only returns tools whose check_fn passes)
     filtered_tools = registry.get_definitions(tools_to_include, quiet=quiet_mode)
-    if tool_role:
-        allowed_names = registry.get_tool_names_for_role(
-            str(tool_role).strip().lower(),
-            {item["function"]["name"] for item in filtered_tools},
-        )
-        filtered_tools = [
-            item for item in filtered_tools
-            if item.get("function", {}).get("name") in allowed_names
-        ]
 
     # The set of tool names that actually passed check_fn filtering.
     # Use this (not tools_to_include) for any downstream schema that references
@@ -750,13 +648,6 @@ def _compute_tool_definitions(
             filtered_tools = assembly.tool_defs
     except Exception as e:  # pragma: no cover — never break tool loading
         logger.warning("Tool search assembly skipped: %s", e)
-
-    # Bind and publish contracts for the definitions the model will actually
-    # receive. Tool-search assembly can replace deferred tools with bridge
-    # tools, so annotating earlier would leave those final capabilities without
-    # an execution contract and would bind definitions that were not exposed.
-    from hermes_services.tool_contract import annotate_tool_definitions
-    filtered_tools = annotate_tool_definitions(filtered_tools)
 
     return filtered_tools
 
@@ -1308,14 +1199,12 @@ def handle_function_call(
     api_request_id: Optional[str] = None,
     user_task: Optional[str] = None,
     enabled_tools: Optional[List[str]] = None,
-    tool_role: Optional[str] = None,
     skip_pre_tool_call_hook: bool = False,
     skip_tool_request_middleware: bool = False,
     skip_tool_execution_middleware: bool = False,
     tool_request_middleware_trace: Optional[List[Dict[str, Any]]] = None,
     enabled_toolsets: Optional[List[str]] = None,
     disabled_toolsets: Optional[List[str]] = None,
-    enforce_tool_isolation: bool = False,
 ) -> str:
     """
     Main function call dispatcher that routes calls to the tool registry.
@@ -1329,8 +1218,6 @@ def handle_function_call(
                        execute_code uses this list to determine which sandbox
                        tools to generate.  Falls back to the process-global
                        ``_last_resolved_tool_names`` for backward compat.
-        tool_role: Optional collaboration role used for execution-time
-                   capability enforcement, including nested Code Mode calls.
         enabled_toolsets: The session's enabled toolsets.  Used to scope the
                        Tool Search bridge catalog so ``tool_search`` /
                        ``tool_describe`` / ``tool_call`` only see and invoke
@@ -1339,9 +1226,6 @@ def handle_function_call(
                        matching ``get_tool_definitions`` semantics.
         disabled_toolsets: The session's disabled toolsets, applied as a
                        subtraction when scoping the bridge catalog.
-        enforce_tool_isolation: Run registry handlers in a disposable process
-                       with the runtime hard deadline. Agent executors set
-                       this; direct callers retain legacy dispatch.
 
     Returns:
         Function result as a JSON string.
@@ -1399,7 +1283,6 @@ def handle_function_call(
                 enabled_toolsets=enabled_toolsets,
                 disabled_toolsets=disabled_toolsets,
                 quiet_mode=True, skip_tool_search_assembly=True,
-                tool_role=tool_role,
             ) or []
         except Exception:
             current_defs = []
@@ -1455,14 +1338,12 @@ def handle_function_call(
                 api_request_id=api_request_id,
                 user_task=user_task,
                 enabled_tools=enabled_tools,
-                tool_role=tool_role,
                 skip_pre_tool_call_hook=skip_pre_tool_call_hook,
                 skip_tool_request_middleware=skip_tool_request_middleware,
                 skip_tool_execution_middleware=skip_tool_execution_middleware,
                 tool_request_middleware_trace=list(_tool_middleware_trace),
                 enabled_toolsets=enabled_toolsets,
                 disabled_toolsets=disabled_toolsets,
-                enforce_tool_isolation=enforce_tool_isolation,
             )
 
     _tool_original_args = dict(function_args)
@@ -1488,21 +1369,6 @@ def handle_function_call(
     try:
         if function_name in _AGENT_LOOP_TOOLS:
             return tool_error(f"{function_name} must be handled by the agent loop")
-
-        # Schema filtering is model-facing only. Enforce the same role policy
-        # at dispatch time so a hidden tool name or nested Code Mode request
-        # cannot bypass the capability boundary.
-        if tool_role:
-            registry_entry = registry.get_entry(function_name)
-            if registry_entry is not None:
-                allowed = registry.get_tool_names_for_role(
-                    str(tool_role).strip().lower(), {function_name}
-                )
-                if function_name not in allowed:
-                    return tool_error(
-                        f"Tool '{function_name}' is not available for role "
-                        f"'{str(tool_role).strip().lower()}'."
-                    )
 
         # Check plugin hooks for a block/approve/modify directive (unless caller
         # already checked — e.g. run_agent._invoke_tool passes skip=True to
@@ -1633,11 +1499,7 @@ def handle_function_call(
                         function_name, next_args,
                         task_id=task_id,
                         session_id=session_id,
-                        tool_call_id=tool_call_id,
-                        turn_id=turn_id,
                         enabled_tools=sandbox_enabled,
-                        tool_role=tool_role,
-                        isolate=enforce_tool_isolation,
                     )
             else:
                 def _dispatch(next_args: Dict[str, Any]) -> Any:
@@ -1646,7 +1508,6 @@ def handle_function_call(
                         task_id=task_id,
                         session_id=session_id,
                         user_task=user_task,
-                        isolate=enforce_tool_isolation,
                     )
             if skip_tool_execution_middleware:
                 result = _dispatch(function_args)

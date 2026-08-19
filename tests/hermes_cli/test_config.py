@@ -36,9 +36,7 @@ class TestGetHermesHome:
         with patch.dict(os.environ, {}, clear=False):
             os.environ.pop("HERMES_HOME", None)
             home = get_hermes_home()
-            from hermes_constants import _get_platform_default_hermes_home
-
-            assert home == _get_platform_default_hermes_home()
+            assert home == Path.home() / ".hermes"
 
 
 class TestEnsureHermesHome:
@@ -226,9 +224,7 @@ class TestSaveAndLoadRoundtrip:
             assert reloaded["model"] == "test/custom-model"
             assert reloaded["agent"]["max_turns"] == 42
 
-            saved = yaml.safe_load(
-                (tmp_path / "config.yaml").read_text(encoding="utf-8")
-            )
+            saved = yaml.safe_load((tmp_path / "config.yaml").read_text())
             assert saved["agent"]["max_turns"] == 42
             assert "max_turns" not in saved
 
@@ -1113,13 +1109,11 @@ class TestWriteApprovalMigration:
                         "_config_version: 28\nmemory:\n  write_mode: approve\n"
                         "skills:\n  write_mode: approve\n")
             migrate_config(interactive=False, quiet=True)
-        raw = yaml.safe_load(
-            (tmp_path / "config.yaml").read_text(encoding="utf-8")
-        )
-        assert raw["memory"]["write_approval"] is True
-        assert raw["skills"]["write_approval"] is True
-        assert "write_mode" not in raw["memory"]
-        assert "write_mode" not in raw["skills"]
+            raw = yaml.safe_load((tmp_path / "config.yaml").read_text())
+            assert raw["memory"]["write_approval"] is True
+            assert raw["skills"]["write_approval"] is True
+            assert "write_mode" not in raw["memory"]
+            assert "write_mode" not in raw["skills"]
 
     def test_on_and_off_map_to_false(self, tmp_path):
         with patch.dict(os.environ, {"HERMES_HOME": str(tmp_path)}):
@@ -1129,18 +1123,16 @@ class TestWriteApprovalMigration:
                         "_config_version: 28\nmemory:\n  write_mode: 'on'\n"
                         "skills:\n  write_mode: 'off'\n")
             migrate_config(interactive=False, quiet=True)
-        raw = yaml.safe_load(
-            (tmp_path / "config.yaml").read_text(encoding="utf-8")
-        )
-        loaded = load_config()
-        # write_approval=False equals the schema default, so it is NOT
-        # materialised to disk (lean-config invariant) — the legacy
-        # write_mode key is gone and the effective value resolves to False
-        # via load_config()'s deep-merge.
-        assert "write_mode" not in raw.get("memory", {})
-        assert "write_mode" not in raw.get("skills", {})
-        assert loaded["memory"]["write_approval"] is False
-        assert loaded["skills"]["write_approval"] is False
+            raw = yaml.safe_load((tmp_path / "config.yaml").read_text())
+            loaded = load_config()
+            # write_approval=False equals the schema default, so it is NOT
+            # materialised to disk (lean-config invariant) — the legacy
+            # write_mode key is gone and the effective value resolves to False
+            # via load_config()'s deep-merge.
+            assert "write_mode" not in raw.get("memory", {})
+            assert "write_mode" not in raw.get("skills", {})
+            assert loaded["memory"]["write_approval"] is False
+            assert loaded["skills"]["write_approval"] is False
 
 
 class TestMigrationWriteInvariant:
@@ -1316,9 +1308,7 @@ class TestDelegationCapUnificationMigration:
         with patch.dict(os.environ, {"HERMES_HOME": str(tmp_path)}):
             self._write(tmp_path, "_config_version: 32\nmodel:\n  provider: openrouter\n")
             migrate_config(interactive=False, quiet=True)
-        raw = yaml.safe_load(
-            (tmp_path / "config.yaml").read_text(encoding="utf-8")
-        )
+            raw = yaml.safe_load((tmp_path / "config.yaml").read_text())
         # Migration must not materialize a delegation section it never had.
         assert "delegation" not in raw
 
@@ -1425,10 +1415,8 @@ class TestCodexAppServerAutoConfig:
 
             migrate_config(interactive=False, quiet=True)
 
-        raw = yaml.safe_load(
-            (tmp_path / "config.yaml").read_text(encoding="utf-8")
-        )
-        assert raw["compression"]["codex_app_server_auto"] == "hermes"
+            raw = yaml.safe_load((tmp_path / "config.yaml").read_text())
+            assert raw["compression"]["codex_app_server_auto"] == "hermes"
 
 
 class TestIsProviderEnabled:

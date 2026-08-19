@@ -15,13 +15,9 @@ platform the gateway truncates it and points the user at the dashboard / file.
 
 from __future__ import annotations
 
+import json
 from typing import List, Optional
 
-from hermes_cli.account_write_approval_apply import (
-    WriteApprovalApplyError,
-    apply_write_approval,
-    prepare_write_approval,
-)
 from tools import write_approval as wa
 
 
@@ -143,58 +139,20 @@ def _approve(subsystem: str, rest: List[str], memory_store) -> str:
 
 
 def _apply_one(subsystem: str, rec, memory_store):
-    """Apply one approved write with before/after convergence.
-
-    This path (interactive CLI + gateway, backed by the legacy JSON
-    pending store) used to call ``apply_memory_pending`` /
-    ``apply_skill_pending`` directly on the payload captured at stage
-    time, with no check that the target still looked the way it did when
-    the user was shown it. Between staging and approval the file can be
-    edited by the user, by another Hermes process, or by a concurrently
-    applied approval — and the stale payload would simply overwrite that,
-    silently losing the newer change.
-
-    The account-scoped store solved this with a prepare/apply pair that
-    records ``before``/``after`` digests and refuses to write when the
-    target has moved ("memory changed after approval was claimed",
-    "skill changed after approval was claimed"). The two paths approve
-    the *same kind of operation*, so they now share the same guarantee
-    rather than differing by which entry point the user happened to use.
-
-    ``prepare_write_approval`` also re-derives the outcome from the
-    payload, so a plan whose ``after`` no longer matches its payload is
-    rejected too. Idempotence is preserved: if the target already equals
-    ``after`` the apply is a no-op success, so re-approving a write that
-    landed does not error.
-
-    One behavioural detail this path must preserve: the converged applier
-    writes through its own on-disk :class:`MemoryStore` (it needs the file
-    lock and the drift check), so the caller's *live* store — the one the
-    running agent holds and renders from — would otherwise still show the
-    pre-approval state. We therefore re-read it from disk on success.
-    """
     payload = rec.get("payload", {})
-    if subsystem == wa.MEMORY and memory_store is None:
-        return False, "memory store unavailable"
-    record = {"payload": payload, "subsystem": subsystem}
     try:
-        plan = prepare_write_approval(record)
-    except WriteApprovalApplyError as exc:
-        return False, str(exc)
-    except Exception as exc:  # noqa: BLE001 — surface, don't crash the REPL
-        return False, str(exc)
-    try:
-        ok, message = apply_write_approval(record, plan)
-    except Exception as exc:  # noqa: BLE001
-        return False, str(exc)
-    if ok and subsystem == wa.MEMORY and memory_store is not None:
-        try:
-            memory_store.load_from_disk()
-        except Exception:  # noqa: BLE001 — the write already succeeded
-            # Refreshing the in-memory view is a convenience, not part of
-            # the durability guarantee: the bytes are on disk either way.
-            pass
-    return ok, message
+        if subsystem == wa.MEMORY:
+            if memory_store is None:
+                return False, "memory store unavailable"
+            from tools.memory_tool import apply_memory_pending
+            result = apply_memory_pending(payload, memory_store)
+            return bool(result.get("success")), result.get("error", "")
+        else:
+            from tools.skill_manager_tool import apply_skill_pending
+            result = json.loads(apply_skill_pending(payload))
+            return bool(result.get("success")), result.get("error", "")
+    except Exception as e:
+        return False, str(e)
 
 
 def _reject(subsystem: str, rest: List[str]) -> str:

@@ -1305,13 +1305,13 @@ class TestSanePathIncludesHomebrew:
         minimal_env = {"PATH": "/some/custom/bin"}
         with patch.dict(os.environ, minimal_env, clear=True):
             result = _make_run_env({})
-        # A POSIX-shaped PATH value is treated POSIX-style by the sanitizer on
-        # every host (_path_separator sniffs the value, not the OS), so the
-        # result is always ":"-joined here — including on Windows.
-        path_entries = result["PATH"].split(":")
+        path_entries = result["PATH"].split(os.pathsep)
         assert path_entries[0] == "/some/custom/bin"
-        for entry in _SANE_PATH.split(":"):
-            assert entry in path_entries
+        if sys.platform == "win32":
+            assert result["PATH"] == "/some/custom/bin"
+        else:
+            for entry in _SANE_PATH.split(os.pathsep):
+                assert entry in path_entries
 
 
     @pytest.mark.macos_only
@@ -1388,11 +1388,13 @@ class TestHermesBinDirOnPath:
         from tools.environments.local import _make_run_env
         self._reset_cache()
         local_mod._HERMES_BIN_DIR = "/opt/hermes/bin"
-        path_sep = os.pathsep
-        base_path = path_sep.join(("/usr/bin", "/bin"))
-        with patch.dict(os.environ, {"PATH": base_path}, clear=True):
+        with patch.dict(
+            os.environ,
+            {"PATH": os.pathsep.join(["/usr/bin", "/bin"])},
+            clear=True,
+        ):
             result = _make_run_env({})
-        entries = result["PATH"].split(path_sep)
+        entries = result["PATH"].split(os.pathsep)
         assert entries[0] == "/opt/hermes/bin"
         assert "/usr/bin" in entries
 

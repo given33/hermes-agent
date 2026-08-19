@@ -1,5 +1,4 @@
 import assert from 'node:assert/strict'
-import path from 'node:path'
 
 import { test } from 'vitest'
 
@@ -28,18 +27,15 @@ test('parseSshConfigIncludes extracts include tokens', () => {
 })
 
 test('collectSshConfigHosts follows Include directives (read-only)', () => {
-  const homeDir = path.join(path.parse(process.cwd()).root, 'home', 'u')
-  const sshDir = path.join(homeDir, '.ssh')
-  const root = path.join(sshDir, 'config')
   const files = {
-    [root]: 'Host main\nInclude work\nInclude ~/abs_inc',
-    [path.join(sshDir, 'work')]: 'Host work-box\nInclude nested',
-    [path.join(sshDir, 'nested')]: 'Host deep',
-    [path.join(homeDir, 'abs_inc')]: 'Host home-abs'
+    '/home/u/.ssh/config': 'Host main\nInclude work\nInclude ~/abs_inc',
+    '/home/u/.ssh/work': 'Host work-box\nInclude nested',
+    '/home/u/.ssh/nested': 'Host deep',
+    '/home/u/abs_inc': 'Host home-abs'
   }
 
-  const hosts = collectSshConfigHosts(root, {
-    homeDir,
+  const hosts = collectSshConfigHosts('/home/u/.ssh/config', {
+    homeDir: '/home/u',
     readFile: p => files[p] ?? null
   })
 
@@ -51,16 +47,13 @@ test('collectSshConfigHosts tolerates a missing config file', () => {
 })
 
 test('collectSshConfigHosts does not loop on a self-include cycle', () => {
-  const homeDir = path.join(path.parse(process.cwd()).root, 'home', 'u')
-  const sshDir = path.join(homeDir, '.ssh')
-  const root = path.join(sshDir, 'config')
   const files = {
-    [root]: 'Host a\nInclude loop',
-    [path.join(sshDir, 'loop')]: 'Host b\nInclude config' // points back at config
+    '/home/u/.ssh/config': 'Host a\nInclude loop',
+    '/home/u/.ssh/loop': 'Host b\nInclude config' // points back at config
   }
 
-  const hosts = collectSshConfigHosts(root, {
-    homeDir,
+  const hosts = collectSshConfigHosts('/home/u/.ssh/config', {
+    homeDir: '/home/u',
     readFile: p => files[p] ?? null
   })
 
@@ -68,22 +61,17 @@ test('collectSshConfigHosts does not loop on a self-include cycle', () => {
 })
 
 test('collectSshConfigHosts expands globbed includes via injected globSync', () => {
-  const homeDir = path.join(path.parse(process.cwd()).root, 'home', 'u')
-  const sshDir = path.join(homeDir, '.ssh')
-  const root = path.join(sshDir, 'config')
   const files = {
-    [root]: 'Host root\nInclude config.d/*',
-    [path.join(sshDir, 'config.d', '10-work')]: 'Host work',
-    [path.join(sshDir, 'config.d', '20-home')]: 'Host home'
+    '/home/u/.ssh/config': 'Host root\nInclude config.d/*',
+    '/home/u/.ssh/config.d/10-work': 'Host work',
+    '/home/u/.ssh/config.d/20-home': 'Host home'
   }
 
-  const hosts = collectSshConfigHosts(root, {
-    homeDir,
+  const hosts = collectSshConfigHosts('/home/u/.ssh/config', {
+    homeDir: '/home/u',
     readFile: p => files[p] ?? null,
     globSync: pattern =>
-      pattern.endsWith(path.join('config.d', '*'))
-        ? [path.join(sshDir, 'config.d', '10-work'), path.join(sshDir, 'config.d', '20-home')]
-        : [pattern]
+      pattern.endsWith('config.d/*') ? ['/home/u/.ssh/config.d/10-work', '/home/u/.ssh/config.d/20-home'] : [pattern]
   })
 
   assert.deepEqual(hosts.sort(), ['home', 'root', 'work'].sort())

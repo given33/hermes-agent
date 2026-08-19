@@ -5,9 +5,9 @@ from unittest.mock import patch
 from hermes_cli.web_server import _normalize_main_model_assignment
 
 
-def _normalize(config, provider, model="vendor/model-a", *, base_url=""):
+def _normalize(config, provider, model="vendor/model-a"):
     with patch("hermes_cli.web_server.load_config", return_value=config):
-        return _normalize_main_model_assignment(provider, model, base_url=base_url)
+        return _normalize_main_model_assignment(provider, model)
 
 
 def test_providers_block_keeps_declared_bare_slug():
@@ -31,21 +31,6 @@ def test_custom_provider_name_canonicalizes_to_durable_slug():
         "custom:us-azure",
         "vendor/model-a",
     )
-
-
-def test_explicit_custom_endpoint_is_not_bound_to_first_legacy_entry():
-    config = {
-        "custom_providers": [
-            {"name": "Old Relay", "base_url": "https://old.example/v1"}
-        ]
-    }
-
-    assert _normalize(
-        config,
-        "custom",
-        "deepseek-v4-flash",
-        base_url="https://api.deepseek.com",
-    ) == ("custom", "deepseek-v4-flash")
 
 
 def test_unknown_vendor_still_uses_aggregator_fallback():

@@ -65,7 +65,6 @@ from gateway.platforms.base import (
     cache_audio_from_bytes,
     cache_document_from_bytes,
     cache_image_from_bytes,
-    local_path_from_file_uri,
 )
 from hermes_constants import get_hermes_home
 from utils import atomic_json_write
@@ -2059,7 +2058,7 @@ class WeixinAdapter(BasePlatformAdapter):
             file_path = await self._download_remote_media(image_url)
             cleanup = True
         else:
-            file_path = local_path_from_file_uri(image_url)
+            file_path = image_url.replace("file://", "")
             if not os.path.isabs(file_path):
                 file_path = os.path.abspath(file_path)
             cleanup = False

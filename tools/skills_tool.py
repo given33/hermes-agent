@@ -1059,7 +1059,7 @@ def _plugin_skill_linked_files(skill_root: Path) -> Dict[str, List[str]] | None:
         if not base.is_dir():
             continue
         files = [
-            path.relative_to(skill_root).as_posix()
+            str(path.relative_to(skill_root))
             for path in sorted(base.rglob("*"))
             if path.is_file()
             and validate_within_dir(path, skill_root) is None
@@ -1628,7 +1628,7 @@ def skill_view(
             references_dir = skill_dir / "references"
             if references_dir.exists():
                 reference_files = [
-                    f.relative_to(skill_dir).as_posix() for f in references_dir.glob("*.md")
+                    str(f.relative_to(skill_dir)) for f in references_dir.glob("*.md")
                 ]
 
             templates_dir = skill_dir / "templates"
@@ -1644,7 +1644,7 @@ def skill_view(
                 ]:
                     template_files.extend(
                         [
-                            f.relative_to(skill_dir).as_posix()
+                            str(f.relative_to(skill_dir))
                             for f in templates_dir.rglob(ext)
                         ]
                     )
@@ -1654,13 +1654,13 @@ def skill_view(
             if assets_dir.exists():
                 for f in assets_dir.rglob("*"):
                     if f.is_file():
-                        asset_files.append(f.relative_to(skill_dir).as_posix())
+                        asset_files.append(str(f.relative_to(skill_dir)))
 
             scripts_dir = skill_dir / "scripts"
             if scripts_dir.exists():
                 for ext in ["*.py", "*.sh", "*.bash", "*.js", "*.ts", "*.rb"]:
                     script_files.extend(
-                        [f.relative_to(skill_dir).as_posix() for f in scripts_dir.glob(ext)]
+                        [str(f.relative_to(skill_dir)) for f in scripts_dir.glob(ext)]
                     )
 
         # Read tags/related_skills with backward compat:

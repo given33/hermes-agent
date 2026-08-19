@@ -38,15 +38,7 @@ def normalize_path(path: str) -> str:
     LSP servers (rust-analyzer cares about Cargo workspace identity)
     and we want the canonical path the user typed when possible.
     """
-    # Git Bash, WSL and CI commonly provide an explicit POSIX-style HOME even
-    # on Windows, where os.path.expanduser() otherwise prefers USERPROFILE.
-    # Honor that explicit contract for the leading-user shorthand before
-    # applying the platform's normal absolute-path normalization.
-    raw = str(path)
-    explicit_home = os.environ.get("HOME", "").strip()
-    if explicit_home and (raw == "~" or raw.startswith(("~/", "~\\"))):
-        raw = os.path.join(explicit_home, raw[2:])
-    return os.path.abspath(os.path.expanduser(raw))
+    return os.path.abspath(os.path.expanduser(path))
 
 
 def find_git_worktree(start: str) -> Optional[str]:

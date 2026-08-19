@@ -20,8 +20,6 @@ import os
 import time
 from typing import Optional
 
-from utils import advisory_file_lock, atomic_json_write
-
 _MAX_ENTRIES = 1000
 _MAX_TEXT_CHARS = 2000
 
@@ -44,41 +42,30 @@ def record(chat_id, message_id, text: Optional[str]) -> None:
         return
     path = _store_path()
     try:
-        with advisory_file_lock(f"{path}.lock"):
-            try:
-                with open(path, "r", encoding="utf-8") as fh:
-                    data = json.load(fh)
-                if not isinstance(data, dict):
-                    data = {}
-                else:
-                    data = {
-                        key: entry
-                        for key, entry in data.items()
-                        if isinstance(entry, dict)
-                    }
-            except (FileNotFoundError, ValueError):
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        try:
+            with open(path, "r", encoding="utf-8") as fh:
+                data = json.load(fh)
+            if not isinstance(data, dict):
                 data = {}
-            data[_key(chat_id, message_id)] = {
-                "t": text[:_MAX_TEXT_CHARS],
-                "ts": int(time.time()),
-            }
-            # Trim oldest by timestamp when over cap.
-            if len(data) > _MAX_ENTRIES:
-                for k, _ in sorted(
-                    data.items(), key=lambda kv: _entry_timestamp(kv[1])
-                )[: len(data) - _MAX_ENTRIES]:
-                    data.pop(k, None)
-            atomic_json_write(path, data, indent=None)
+        except (FileNotFoundError, ValueError):
+            data = {}
+        data[_key(chat_id, message_id)] = {
+            "t": text[:_MAX_TEXT_CHARS],
+            "ts": int(time.time()),
+        }
+        # Trim oldest by timestamp when over cap.
+        if len(data) > _MAX_ENTRIES:
+            for k, _ in sorted(
+                data.items(), key=lambda kv: kv[1].get("ts", 0)
+            )[: len(data) - _MAX_ENTRIES]:
+                data.pop(k, None)
+        tmp = f"{path}.tmp.{os.getpid()}"
+        with open(tmp, "w", encoding="utf-8") as fh:
+            json.dump(data, fh, ensure_ascii=False)
+        os.replace(tmp, path)  # atomic; tolerates concurrent writers racing
     except Exception:
         return
-
-
-def _entry_timestamp(entry: dict) -> float:
-    try:
-        timestamp = float(entry.get("ts", 0))
-    except (TypeError, ValueError, OverflowError):
-        return 0.0
-    return timestamp if timestamp == timestamp else 0.0
 
 
 def lookup(chat_id, message_id) -> Optional[str]:

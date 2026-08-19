@@ -6,26 +6,6 @@ import sys
 from hermes_cli.env_loader import load_hermes_dotenv
 
 
-def test_default_home_matches_canonical_hermes_home(tmp_path, monkeypatch):
-    """Implicit dotenv loading must use the platform-native Hermes home.
-
-    On Windows the canonical home is ``%LOCALAPPDATA%\\hermes``.  Keeping
-    this path in sync with config/provider resolution is required for keys in
-    the active profile's ``.env`` to reach provider clients.
-    """
-    home = tmp_path / "canonical-hermes-home"
-    home.mkdir()
-    env_file = home / ".env"
-    env_file.write_text("HERMES_ENV_LOADER_CANONICAL_HOME=loaded\n", encoding="utf-8")
-
-    monkeypatch.delenv("HERMES_HOME", raising=False)
-    monkeypatch.delenv("HERMES_ENV_LOADER_CANONICAL_HOME", raising=False)
-    monkeypatch.setattr("hermes_cli.env_loader.get_hermes_home", lambda: home)
-
-    loaded = load_hermes_dotenv()
-
-    assert loaded == [env_file]
-    assert os.getenv("HERMES_ENV_LOADER_CANONICAL_HOME") == "loaded"
 def test_recovered_update_retry_skips_external_secret_sources(tmp_path, monkeypatch):
     """The post-recovery updater must not remap native vault dependencies."""
     import hermes_cli.env_loader as env_loader

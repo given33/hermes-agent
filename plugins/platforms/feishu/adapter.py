@@ -3428,6 +3428,7 @@ class FeishuAdapter(BasePlatformAdapter):
             event.source,
             group_sessions_per_user=self.config.extra.get("group_sessions_per_user", True),
             thread_sessions_per_user=self.config.extra.get("thread_sessions_per_user", False),
+            profile=self._session_key_profile(event.source),
         )
         return f"{session_key}:media:{event.message_type.value}"
 
@@ -3736,7 +3737,7 @@ class FeishuAdapter(BasePlatformAdapter):
             event.source,
             group_sessions_per_user=self.config.extra.get("group_sessions_per_user", True),
             thread_sessions_per_user=self.config.extra.get("thread_sessions_per_user", False),
-            profile=event.source.profile,
+            profile=self._session_key_profile(event.source),
         )
 
     @staticmethod
@@ -5040,6 +5041,10 @@ class FeishuAdapter(BasePlatformAdapter):
             except Exception as exc:
                 last_error = exc
                 if msg_type == "post" and _POST_CONTENT_INVALID_RE.search(str(exc)):
+                    raise
+                # Read timeouts may have already delivered — do not retry
+                # (same policy as base._send_with_retry's first-attempt guard).
+                if isinstance(exc, (asyncio.TimeoutError, TimeoutError)) or "timeout" in str(exc).lower():
                     raise
                 if attempt >= _FEISHU_SEND_ATTEMPTS - 1:
                     raise

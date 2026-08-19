@@ -110,41 +110,18 @@ fi
 
 # ── Windows location variables (computed before we drop env) ───────────────
 # `env -i` forwards HOME, which is enough on POSIX. Native Windows CPython
-# resolves Path.home() from USERPROFILE (or HOMEDRIVE+HOMEPATH), shell=True
-# needs COMSPEC/SYSTEMROOT, and tempfile needs TEMP/TMP. Under WSL, Bash does
-# not see those variables even though WSL interop injects them when an .exe is
-# launched. Ask the selected native Python for this explicit non-secret
-# allowlist before clearing the environment. This preserves hermeticity while
-# making the canonical runner valid for a Windows Python launched from WSL.
+# resolves Path.home() from USERPROFILE (or HOMEDRIVE+HOMEPATH), stdlib
+# platform paths come from LOCALAPPDATA/APPDATA, ssl/sockets need SYSTEMROOT,
+# and tempfile needs TEMP/TMP. Dropping them breaks collection on native
+# Windows (issues #67385, #70813). These are location variables, not
+# credentials, so forwarding them keeps the isolation intent intact. Each is
+# only forwarded when actually set, so POSIX runs are byte-for-byte unchanged.
 WIN_ENV=()
-_WIN_ENV_NAMES=(
-  USERPROFILE HOMEDRIVE HOMEPATH LOCALAPPDATA APPDATA SYSTEMROOT COMSPEC
-  WINDIR SYSTEMDRIVE PATHEXT PROGRAMDATA TEMP TMP
-)
-PYTHON_PLATFORM="$("$PYTHON" -c 'import sys; print(sys.platform)')"
-PYTHON_PLATFORM="${PYTHON_PLATFORM//$'\r'/}"
-if [ "$PYTHON_PLATFORM" = "win32" ]; then
-  while IFS= read -r -d '' _win_entry; do
-    WIN_ENV+=("$_win_entry")
-  done < <(
-    "$PYTHON" -c '
-import os
-import sys
-
-names = sys.argv[1:]
-for name in names:
-    value = os.environ.get(name)
-    if value:
-        sys.stdout.buffer.write(f"{name}={value}".encode("utf-8") + b"\0")
-' "${_WIN_ENV_NAMES[@]}"
-  )
-else
-  for _win_var in "${_WIN_ENV_NAMES[@]}"; do
-    if [ -n "${!_win_var:-}" ]; then
-      WIN_ENV+=("$_win_var=${!_win_var}")
-    fi
-  done
-fi
+for _win_var in USERPROFILE HOMEDRIVE HOMEPATH LOCALAPPDATA APPDATA SYSTEMROOT TEMP TMP; do
+  if [ -n "${!_win_var:-}" ]; then
+    WIN_ENV+=("$_win_var=${!_win_var}")
+  fi
+done
 
 # ── Test-runner knobs (computed before we drop env) ────────────────────────
 # The runner's own documented environment knobs must survive the hermetic

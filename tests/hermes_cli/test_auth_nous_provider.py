@@ -3,7 +3,6 @@
 import base64
 import json
 import logging
-import os
 import sys
 import time
 from datetime import datetime, timezone
@@ -552,13 +551,13 @@ class TestLoginNousSkipKeepsCurrent:
         _login_nous(args, PROVIDER_REGISTRY["nous"])
 
         # config.yaml model section must be unchanged
-        cfg_after = yaml.safe_load(config_path.read_text(encoding="utf-8"))
+        cfg_after = yaml.safe_load(config_path.read_text())
         assert cfg_after["model"]["provider"] == "openrouter"
         assert cfg_after["model"]["default"] == "anthropic/claude-opus-4.6"
         assert "base_url" not in cfg_after["model"]
 
         # auth.json: active_provider restored to openrouter, but Nous creds saved
-        auth_after = json.loads(auth_path.read_text(encoding="utf-8"))
+        auth_after = json.loads(auth_path.read_text())
         assert auth_after["active_provider"] == "openrouter"
         assert "nous" in auth_after["providers"]
         assert auth_after["providers"]["nous"]["access_token"] == "fake-nous-token"
@@ -584,12 +583,12 @@ class TestLoginNousSkipKeepsCurrent:
         )
         _login_nous(args, PROVIDER_REGISTRY["nous"])
 
-        cfg_after = yaml.safe_load(config_path.read_text(encoding="utf-8"))
+        cfg_after = yaml.safe_load(config_path.read_text())
         assert cfg_after["model"]["provider"] == "nous"
         assert cfg_after["model"]["default"] == "xiaomi/mimo-v2-pro"
         assert free_tier_calls == [{"force_fresh": True}]
 
-        auth_after = json.loads(auth_path.read_text(encoding="utf-8"))
+        auth_after = json.loads(auth_path.read_text())
         assert auth_after["active_provider"] == "nous"
 
     def test_skip_with_no_prior_active_provider_clears_it(self, tmp_path, monkeypatch):
@@ -905,9 +904,8 @@ def test_shared_store_write_and_read_roundtrip(shared_store_env):
     assert path.is_file()
 
     # Permissions should be 0600 where the platform supports it.
-    if os.name != "nt":
-        mode = path.stat().st_mode & 0o777
-        assert mode in {0o600, 0o644}
+    mode = path.stat().st_mode & 0o777
+    assert mode == 0o600 or mode == 0o644  # 0o644 on platforms without chmod
 
     loaded = _read_shared_nous_state()
     assert loaded is not None

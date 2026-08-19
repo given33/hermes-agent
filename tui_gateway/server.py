@@ -145,6 +145,10 @@ _methods: dict[str, callable] = {}
 _pending: dict[str, tuple[str, threading.Event]] = {}
 _pending_prompt_payloads: dict[str, tuple[str, dict]] = {}
 _answers: dict[str, str] = {}
+# Batch clarify accumulators: rid → {"qids": [...], "answers": {qid: answer}}.
+# Written by clarify.respond (per-question lock, update-in-place), read out by
+# _block on resolution/timeout so locked answers survive the deadline.
+_batch_clarify: dict[str, dict] = {}
 _db = None
 _db_error: str | None = None
 _stdout_lock = threading.Lock()
@@ -744,7 +748,9 @@ def _finalize_session(session: dict | None, end_reason: str = "tui_close") -> No
         session["resume_history_error"] = "session resume cancelled"
         history_ready.set()
     _release_active_session_slot(session)
-    _stop_notification_poller(session)
+    stop_event = session.get("_notif_stop")
+    if stop_event is not None:
+        stop_event.set()
 
     agent = session.get("agent")
     lock = session.get("history_lock")
@@ -1950,7 +1956,14 @@ def _pending_clarify_request_payload(sid: str) -> dict | None:
                 continue
             event, prompt_payload = _pending_prompt_payloads.get(rid, ("", {}))
             if event == "clarify.request":
-                return dict(prompt_payload)
+                snapshot = dict(prompt_payload)
+                # Batch clarify: replay the answers locked so far, so a
+                # reconnecting client restores its per-question ✓ state
+                # instead of presenting every question as unanswered.
+                batch = _batch_clarify.get(rid)
+                if batch is not None and batch["answers"]:
+                    snapshot["answers"] = dict(batch["answers"])
+                return snapshot
     return None
 
 
@@ -2340,13 +2353,12 @@ def _start_agent_build(sid: str, session: dict) -> None:
                 except Exception:
                     session_db = None
 
-            if current.get("create_allow_tools") is not False:
-                try:
-                    from tui_gateway.entry import ensure_mcp_discovery_started
+            try:
+                from tui_gateway.entry import ensure_mcp_discovery_started
 
-                    ensure_mcp_discovery_started()
-                except Exception:
-                    logger.warning("MCP discovery startup failed", exc_info=True)
+                ensure_mcp_discovery_started()
+            except Exception:
+                logger.warning("MCP discovery startup failed", exc_info=True)
 
             try:
                 # Lazy-resumed (watch) sessions carry the stored conversation
@@ -2374,8 +2386,6 @@ def _start_agent_build(sid: str, session: dict) -> None:
                         kw["reasoning_config_override"] = reasoning
                     if (tier := current.get("create_service_tier_override")) is not None:
                         kw["service_tier_override"] = tier
-                if current.get("create_allow_tools") is False:
-                    kw["skip_mcp_discovery"] = True
                 agent = _make_agent(sid, key, **kw)
             finally:
                 _clear_session_context(tokens)
@@ -3470,16 +3480,28 @@ def _enable_gateway_prompts() -> None:
 # ── Blocking prompt factory ──────────────────────────────────────────
 
 
-def _block(event: str, sid: str, payload: dict, timeout: float | None = 300) -> str:
+def _block(
+    event: str,
+    sid: str,
+    payload: dict,
+    timeout: float | None = 300,
+    batch_qids: list[str] | None = None,
+) -> str:
     rid = uuid.uuid4().hex[:8]
     ev = threading.Event()
     with _prompt_lock:
         _pending[rid] = (sid, ev)
         payload["request_id"] = rid
         _pending_prompt_payloads[rid] = (event, dict(payload))
+        if batch_qids:
+            # Multi-question clarify: per-question answers accumulate here
+            # (update-in-place until every qid is locked). Locked answers
+            # survive a timeout — see the batch read-out below.
+            _batch_clarify[rid] = {"qids": list(batch_qids), "answers": {}}
     answered = False
     answer = ""
     answer_present = False
+    batch_answers: dict | None = None
     try:
         _emit(event, sid, payload)
         # Natural Event semantics: None → wait forever (clarify configured with
@@ -3492,6 +3514,27 @@ def _block(event: str, sid: str, payload: dict, timeout: float | None = 300) -> 
             _pending_prompt_payloads.pop(rid, None)
             answer_present = rid in _answers
             answer = _answers.pop(rid, "")
+            batch_state = _batch_clarify.pop(rid, None)
+            if batch_state is not None:
+                batch_answers = dict(batch_state["answers"])
+
+    if batch_qids is not None:
+        # Cancel-all (respond with no question_id) resolves via _answers with
+        # an empty string — that stays a plain cancel, not a partial result.
+        if answer_present:
+            return answer
+        result: dict[str, object] = {"answers": batch_answers or {}}
+        if not answered:
+            # Deadline hit: keep whatever was locked, tell the tool the rest
+            # are absences (not skips), and still fire the expire
+            # notification so live cards tear down.
+            result["timed_out"] = True
+            _emit(
+                f"{event.removesuffix('.request')}.expire",
+                sid,
+                {"request_id": rid},
+            )
+        return json.dumps(result, ensure_ascii=False)
 
     # Emit an `.expire` notification on timeout for every blocking request type
     # whose `*.respond` handler tolerates a late reply (allow_expired=True).
@@ -3508,6 +3551,7 @@ def _block(event: str, sid: str, payload: dict, timeout: float | None = 300) -> 
         "preview.read.request",
         "window.read.request",
         "mcp.setup.request",
+        "tour.request",
     }:
         _emit(
             f"{event.removesuffix('.request')}.expire",
@@ -3528,6 +3572,50 @@ def _clarify_timeout_seconds() -> float | None:
         return timeout if timeout > 0 else None
     except Exception:
         return 300
+
+
+def _clarify_block(sid: str, q, c, multi_select=False, questions=None) -> str:
+    """Bridge the clarify tool callback onto _block.
+
+    Single-question calls keep the exact historical payload shape (older
+    renderers never see a new field). Batch calls emit one clarify.request
+    carrying the question list — only wire fields (qid/question/choices/
+    multi_select) are forwarded; the tool-side normalized entries also carry
+    result-assembly keys (id, choices_offered) the renderer must not see.
+    The tool decodes the JSON reply via its batch answer parser.
+    """
+    if questions:
+        wire = [
+            {
+                "qid": entry["qid"],
+                "question": entry["question"],
+                "choices": entry["choices"],
+                "multi_select": bool(entry["multi_select"]),
+            }
+            for entry in questions
+        ]
+        return _block(
+            "clarify.request",
+            sid,
+            {"questions": wire},
+            timeout=_clarify_timeout_seconds(),
+            batch_qids=[entry["qid"] for entry in questions],
+        )
+    # multi_select is a pass-through hint: renderers with checkbox
+    # support can honor it; older renderers ignore the extra field
+    # and stay single-select (a single answer still parses as a
+    # one-element list on the tool side). Only emitted when True so
+    # single-select payloads keep the exact pre-multi-select shape.
+    return _block(
+        "clarify.request",
+        sid,
+        (
+            {"question": q, "choices": c, "multi_select": True}
+            if multi_select
+            else {"question": q, "choices": c}
+        ),
+        timeout=_clarify_timeout_seconds(),
+    )
 
 
 def _clear_pending(sid: str | None = None) -> None:
@@ -5688,6 +5776,20 @@ def _emit_session_info_for_session(sid: str, session: dict) -> None:
         pass
 
 
+def broadcast_session_info() -> None:
+    """Re-emit ``session.info`` to every live session.
+
+    For approvals-config writers that bypass the ``config.set`` RPC (which
+    re-emits itself): the REST config saves and the ``/approvals`` slash
+    mirror. Only reaches sessions in THIS process; a spawned
+    ``tui_gateway.entry`` child gateway has its own ``_sessions``.
+    """
+    with _sessions_lock:
+        sessions = list(_sessions.items())
+    for sid, sess in sessions:
+        _emit_session_info_for_session(sid, sess)
+
+
 # Tool Args/Result text shipped to the TUI for the verbose trail line. The TUI
 # renders only a small persisted preview (ui-tui VERBOSE_TRAIL_MAX_CHARS), kept
 # all session and expanded by default — so shipping more than that is pure pipe
@@ -6177,20 +6279,8 @@ def _agent_cbs(sid: str) -> dict:
         "notice_clear_callback": lambda key: _emit(
             "notification.clear", sid, {"key": key}
         ),
-        "clarify_callback": lambda q, c, multi_select=False: _block(
-            "clarify.request",
-            sid,
-            # multi_select is a pass-through hint: renderers with checkbox
-            # support can honor it; older renderers ignore the extra field
-            # and stay single-select (a single answer still parses as a
-            # one-element list on the tool side). Only emitted when True so
-            # single-select payloads keep the exact pre-multi-select shape.
-            (
-                {"question": q, "choices": c, "multi_select": True}
-                if multi_select
-                else {"question": q, "choices": c}
-            ),
-            timeout=_clarify_timeout_seconds(),
+        "clarify_callback": lambda q, c, multi_select=False, questions=None: (
+            _clarify_block(sid, q, c, multi_select=multi_select, questions=questions)
         ),
         # read_terminal tool (desktop GUI): same blocking bridge as clarify — the
         # renderer answers terminal.read.respond with the serialized buffer.
@@ -6231,6 +6321,17 @@ def _agent_cbs(sid: str) -> dict:
             sid,
             {"server": server, "action": action, "reason": reason},
             timeout=600,
+        ),
+        # tour tool (desktop GUI): the renderer drives driver.js — highlighting
+        # elements in the app's own DOM or injecting the engine into the
+        # preview pane's webview — and answers tour.respond with the outcome
+        # (did the selector match, which step is active). Generous timeout: a
+        # preview tour's first action loads the engine into a live page.
+        "tour_callback": lambda payload: _block(
+            "tour.request",
+            sid,
+            dict(payload),
+            timeout=45,
         ),
     }
 
@@ -6844,7 +6945,6 @@ def _make_agent(
     reasoning_config_override: dict | None = None,
     service_tier_override: str | None = None,
     platform_override: str | None = None,
-    skip_mcp_discovery: bool = False,
 ):
     # AC-4 test seam: dead unless explicitly armed by the isolated certify
     # harness. Both inline and compute-host paths construct through _make_agent,
@@ -6863,19 +6963,18 @@ def _make_agent(
     # to land before building — bounded, so a slow/dead server still can't
     # block. Dashboard /api/ws uses hermes_cli.mcp_startup; TUI stdio keeps
     # its existing tui_gateway.entry-owned thread.
-    if not skip_mcp_discovery:
-        try:
-            from hermes_cli.mcp_startup import wait_for_mcp_discovery
+    try:
+        from hermes_cli.mcp_startup import wait_for_mcp_discovery
 
-            wait_for_mcp_discovery()
-        except Exception:
-            pass
-        try:
-            from tui_gateway.entry import wait_for_mcp_discovery
+        wait_for_mcp_discovery()
+    except Exception:
+        pass
+    try:
+        from tui_gateway.entry import wait_for_mcp_discovery
 
-            wait_for_mcp_discovery()
-        except Exception:
-            pass
+        wait_for_mcp_discovery()
+    except Exception:
+        pass
 
     cfg = _load_cfg()
     from hermes_cli.config import resolve_ephemeral_system_prompt_from_config
@@ -6958,26 +7057,7 @@ def _make_agent(
             if override_api_key:
                 runtime["api_key"] = override_api_key
             if override_api_mode:
-                # ``resolve_runtime_provider`` already validates the wire
-                # protocol against the resolved endpoint.  Re-applying a raw
-                # persisted session value here can resurrect a stale
-                # ``codex_responses`` selection on a generic custom relay
-                # (or a stale ``chat_completions`` selection on direct
-                # OpenAI), sending the request through the wrong transport.
-                # This is especially costly for hosted mobile chat: a relay
-                # may accept the Responses request, emit thinking events, and
-                # never produce the visible message that the client waits for.
-                resolved_api_mode = str(runtime.get("api_mode") or "").strip()
-                if resolved_api_mode and resolved_api_mode != str(override_api_mode):
-                    logger.info(
-                        "Ignoring persisted session api_mode=%s; using resolved "
-                        "api_mode=%s for %s",
-                        override_api_mode,
-                        resolved_api_mode,
-                        runtime.get("base_url") or override_base_url or "(unknown)",
-                    )
-                else:
-                    runtime["api_mode"] = override_api_mode
+                runtime["api_mode"] = override_api_mode
     else:
         model, requested_provider = _resolve_startup_runtime()
         if isinstance(model_override, str) and model_override:
@@ -7020,15 +7100,7 @@ def _make_agent(
             if service_tier_override is not None
             else _load_service_tier()
         ),
-        # A plain hosted mobile chat is deliberately built as a tool-free
-        # session.  Passing ``[]`` here matters during construction: the
-        # normal ``None`` value means "all toolsets" to model_tools, so the
-        # later per-turn snapshot would still pay the cost of assembling the
-        # full registry/tool-search catalog before it can remove the tools.
-        # Explicit tool turns keep the configured profile toolsets.
-        enabled_toolsets=(
-            [] if skip_mcp_discovery else _load_enabled_toolsets(_resolve_agent_platform(platform_override))
-        ),
+        enabled_toolsets=_load_enabled_toolsets(_resolve_agent_platform(platform_override)),
         # OpenRouter provider-routing prefs (config.yaml `provider_routing`).
         # Mirrors the messaging gateway + CLI so the desktop/TUI honors the same
         # routing instead of letting OpenRouter pick providers at random.
@@ -10012,14 +10084,6 @@ def _notification_poller_loop(
         except Exception:
             continue
 
-        # Teardown can race the blocking queue read. Once this poller no longer
-        # owns a live session it must not emit a late frame or launch another
-        # agent turn; return the event so another live owner (or a later resume)
-        # can deliver it.
-        if stop_event.is_set() or session.get("_finalized"):
-            process_registry.completion_queue.put(evt)
-            return
-
         # Multiple desktop sessions share this one process-wide queue. Only
         # consume events that belong to *this* session — otherwise a background
         # process started in session A would surface its completion in whichever
@@ -10113,6 +10177,89 @@ def _notification_poller_loop(
             )
             with session["history_lock"]:
                 session["running"] = False
+
+    # Drain any remaining events after stop signal (process all pending
+    # before exiting so nothing is lost on shutdown). Events owned by other
+    # live sessions are set aside and re-queued so their poller still sees them.
+    # Orphaned events (owner gone) are dropped — same guard as the main loop.
+    deferred: list = []
+    while not process_registry.completion_queue.empty():
+        try:
+            evt = process_registry.completion_queue.get_nowait()
+        except Exception:
+            break
+        if _notification_event_belongs_elsewhere(sid, session, evt):
+            deferred.append(evt)
+            continue
+        # Same positive-proof rule as the live loop. Preserve the existing
+        # shutdown behavior for orphaned delegation payloads by deferring them
+        # for a later resume; ordinary addressed orphans are dropped.
+        requires_owner = _notification_event_requires_owner(evt)
+        if requires_owner and not _session_owns_notification_event(sid, session, evt):
+            if evt.get("type") == "async_delegation":
+                deferred.append(evt)
+            else:
+                logger.debug(
+                    "Dropping unowned %s notification during shutdown drain "
+                    "(origin=%r key=%r)",
+                    evt.get("type", "completion"),
+                    str(evt.get("origin_ui_session_id") or ""),
+                    str(evt.get("session_key") or ""),
+                )
+            continue
+        _evt_sid = evt.get("session_id", "")
+        if evt.get("type") == "completion" and process_registry.is_completion_consumed(_evt_sid):
+            continue
+        text = format_process_notification(evt)
+        if not text:
+            continue
+
+        _dedup_key = _notification_event_dedup_key(evt)
+        if _dedup_key not in _emitted:
+            _emit("status.update", sid, {"kind": "process", "text": text})
+            _emitted.add(_dedup_key)
+
+        with session["history_lock"]:
+            if session.get("running"):
+                process_registry.completion_queue.put(evt)
+                break
+            session["running"] = True
+
+        rid = f"__notif__{int(time.time() * 1000)}"
+        from tools.async_delegation import (
+            claim_event_delivery, complete_event_delivery, release_event_delivery,
+        )
+        _claim = claim_event_delivery(evt, "tui-poller")
+        if _claim is None:
+            continue
+        try:
+            _emit("message.start", sid)
+            if evt.get("type") == "async_delegation":
+                _run_prompt_submit(
+                    rid,
+                    sid,
+                    session,
+                    text,
+                    display_kind="async_delegation_complete",
+                    display_metadata=_async_delegation_display_metadata(evt),
+                )
+            else:
+                _run_prompt_submit(rid, sid, session, text)
+            complete_event_delivery(evt, _claim)
+        except Exception as exc:
+            release_event_delivery(evt, _claim)
+            print(
+                f"[tui_gateway] notification poller dispatch failed: "
+                f"{type(exc).__name__}: {exc}",
+                file=sys.stderr,
+            )
+            with session["history_lock"]:
+                session["running"] = False
+
+    # Hand any other sessions' events back to the shared queue.
+    for evt in deferred:
+        process_registry.completion_queue.put(evt)
+
 
 def _async_delegation_display_metadata(evt: dict) -> dict:
     """Build display-only metadata before the completion event is formatted."""
@@ -10226,8 +10373,6 @@ def _start_notification_poller(sid: str, session: dict) -> threading.Event:
         # Stable, greppable name for debuggers and test teardowns.
         name=f"tui-notif-poller-{sid}",
     )
-    session["_notif_stop"] = stop
-    session["_notif_thread"] = t
     # Registry of (stop, thread) pairs so test teardowns can reap pollers
     # leaked by session.init/create tests — an unjoined poller steals
     # events off the process-global completion_queue mid-assertion in a
@@ -10240,107 +10385,6 @@ def _start_notification_poller(sid: str, session: dict) -> threading.Event:
     t.start()
     return stop
 
-
-def _stop_notification_poller(session: dict, *, timeout: float = 1.0) -> None:
-    """Stop one session's poller and wait briefly for its queue read to exit."""
-    stop_event = session.get("_notif_stop")
-    if stop_event is not None:
-        stop_event.set()
-    thread = session.get("_notif_thread")
-    if (
-        thread is not None
-        and thread is not threading.current_thread()
-        and hasattr(thread, "join")
-    ):
-        thread.join(timeout=timeout)
-
-
-def _turn_tool_policy_snapshot(agent, allow_tools: bool | None) -> dict[str, Any] | None:
-    """Temporarily remove tools from one explicitly tool-free turn.
-
-    The official gateway keeps one AIAgent alive per session.  Mobile hosted
-    chat adds a per-turn route decision on top of that contract: a plain chat
-    should not send a large tool schema or allow an unrelated MCP call, while
-    a later explicit tool request can use the same warm agent again.  Keep all
-    mutable tool fields scoped to the synchronous turn and restore them in the
-    caller's ``finally`` block.  The model's configured reasoning policy is
-    deliberately left untouched: reasoning-capable upstreams such as
-    DeepSeek must receive their complete reasoning path even for a plain chat.
-    """
-
-    if allow_tools is not False:
-        return None
-    snapshot: dict[str, Any] = {}
-    for attribute in (
-        "tools",
-        "valid_tool_names",
-        "enabled_toolsets",
-        "_last_content_with_tools",
-        "_last_content_tools_all_housekeeping",
-    ):
-        if hasattr(agent, attribute):
-            snapshot[attribute] = getattr(agent, attribute)
-    if hasattr(agent, "tools"):
-        agent.tools = []
-    if hasattr(agent, "valid_tool_names"):
-        agent.valid_tool_names = set()
-    if hasattr(agent, "enabled_toolsets"):
-        agent.enabled_toolsets = []
-    if hasattr(agent, "_last_content_with_tools"):
-        agent._last_content_with_tools = None
-    if hasattr(agent, "_last_content_tools_all_housekeeping"):
-        agent._last_content_tools_all_housekeeping = False
-    return snapshot
-
-
-def _restore_turn_tool_policy(agent, snapshot: dict[str, Any] | None) -> None:
-    if not snapshot:
-        return
-    for attribute, value in snapshot.items():
-        setattr(agent, attribute, value)
-
-
-def _ensure_hosted_tools_for_turn(
-    sid: str,
-    session: dict,
-    agent,
-    allow_tools: bool | None,
-) -> None:
-    """Hydrate MCP tools only when a fast hosted session first needs them.
-
-    A plain mobile chat session is intentionally built without waiting for
-    MCP discovery.  If a later routed turn explicitly needs tools, activate
-    discovery at that boundary and refresh the agent's tool snapshot before
-    constructing the model request.  This keeps the ordinary-chat path fast
-    without leaving a persistent session permanently tool-less.
-    """
-
-    if allow_tools is not True or session.get("create_allow_tools") is not False:
-        return
-    if session.get("_hosted_tools_hydrated"):
-        return
-    try:
-        from tui_gateway.entry import (
-            ensure_mcp_discovery_started,
-            wait_for_mcp_discovery,
-        )
-
-        ensure_mcp_discovery_started()
-        wait_for_mcp_discovery()
-        from tools.mcp_tool import refresh_agent_mcp_tools
-
-        refresh_agent_mcp_tools(agent, quiet_mode=True)
-    except Exception:
-        # Built-in tools remain usable if an optional MCP server is down.  A
-        # later explicit /reload-mcp can still retry discovery, matching the
-        # official gateway's fail-open behavior.
-        logger.warning(
-            "Hosted tool hydration failed for session %s",
-            sid,
-            exc_info=True,
-        )
-    finally:
-        session["_hosted_tools_hydrated"] = True
 
 def _hud_surface_note(session: dict) -> str:
     """The HUD-mode note for this turn, or "" when it was not typed there."""
@@ -10538,7 +10582,6 @@ def _run_prompt_submit(
     display_metadata: dict | None = None,
     image_paths: list[str] | None = None,
     queued_prompt_generation: int | None = None,
-    allow_tools: bool | None = None,
 ) -> bool:
     with session["history_lock"]:
         if session.get("_closing"):
@@ -10871,16 +10914,14 @@ def _run_prompt_submit(
             if display_kind and "persist_user_display_kind" in _run_params:
                 run_kwargs["persist_user_display_kind"] = display_kind
                 run_kwargs["persist_user_display_metadata"] = display_metadata
-
-            # Auto-titling runs inside the shared turn prologue. Install the
-            # live rename hook before the one authoritative conversation call
-            # so a title emitted during that prologue reaches the sidebar.
+            # Auto-titling now fires inside the turn prologue (shared by every
+            # surface). Hand the agent this session's live-rename hook so the
+            # sidebar repaints the moment a title lands, rather than waiting
+            # for the next list refresh.
             _title_key = session.get("session_key") or sid
             agent._on_session_title = lambda t, _src, _k=_title_key: _emit(
                 "session.title", sid, {"session_id": _k, "title": t}
             )
-            _ensure_hosted_tools_for_turn(sid, session, agent, allow_tools)
-            tool_policy_snapshot = _turn_tool_policy_snapshot(agent, allow_tools)
             _usage_stop, _usage_thread = _start_usage_ticker(sid, agent)
             try:
                 result = agent.run_conversation(run_message, **run_kwargs)
@@ -10896,9 +10937,6 @@ def _run_prompt_submit(
                 # message.complete.
                 _usage_stop.set()
                 _usage_thread.join()
-                # Restore the turn tool policy after the ticker drained so the
-                # policy window covers every emit the turn produced.
-                _restore_turn_tool_policy(agent, tool_policy_snapshot)
             if display_kind and isinstance(text, str):
                 db = getattr(agent, "_session_db", None)
                 current_session_id = getattr(agent, "session_id", None) or session.get("session_key")
@@ -11775,6 +11813,7 @@ def _stage_session_file_attachment(
 
 def _respond(rid, params, key, *, allow_expired=False):
     r = params.get("request_id", "")
+    question_id = str(params.get("question_id") or "")
     with _prompt_lock:
         entry = _pending.get(r)
         if not entry:
@@ -11782,6 +11821,21 @@ def _respond(rid, params, key, *, allow_expired=False):
                 return _ok(rid, {"status": "expired"})
             return _err(rid, 4009, f"no pending {key} request")
         _, ev = entry
+        batch = _batch_clarify.get(r)
+        if batch is not None and question_id:
+            # Per-question lock (multi-question clarify). Update-in-place is
+            # deliberate: a locked answer stays editable until the batch
+            # completes, and completion is exactly "every qid locked" — the
+            # final lock is the Confirm-and-continue click.
+            if question_id not in batch["qids"]:
+                return _err(rid, 4002, f"unknown question_id {question_id!r}")
+            batch["answers"][question_id] = params.get(key, "")
+            remaining = [
+                qid for qid in batch["qids"] if qid not in batch["answers"]
+            ]
+            if not remaining:
+                ev.set()
+            return _ok(rid, {"status": "ok", "remaining": remaining})
         _answers[r] = params.get(key, "")
         ev.set()
     return _ok(rid, {"status": "ok"})
@@ -13899,6 +13953,10 @@ def _mirror_slash_side_effects(sid: str, session: dict, command: str) -> str:
         if name == "model" and arg and agent:
             result = _apply_model_switch(sid, session, arg)
             return result.get("warning", "")
+        elif name == "approvals" and arg:
+            # The slash worker already persisted the new approvals.mode; the
+            # bare (read-only) form has no arg and needs no repaint.
+            broadcast_session_info()
         elif name == "personality" and arg and agent:
             pname, new_prompt = _validate_personality(arg, _load_cfg())
             # Persist through the single owner so this surface can never

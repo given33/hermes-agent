@@ -51,28 +51,6 @@ def _msys_to_windows_path(cwd: str) -> str:
     return f"{drive}:{tail or chr(92)}"  # chr(92) = backslash, avoid raw-string escape
 
 
-def _normalize_msys_path_lines(output: str) -> str:
-    """Normalize standalone Git-Bash cwd lines in local Windows output.
-
-    Git Bash intentionally reports ``pwd`` as ``/c/Users/...`` while Hermes'
-    local file and session-cwd APIs expose native Windows paths.  Convert only
-    lines that are an existing drive-qualified directory, so ordinary model
-    output containing a POSIX-looking path is left untouched.
-    """
-    if not _IS_WINDOWS or not output:
-        return output
-
-    normalized_lines: list[str] = []
-    for line in output.splitlines(keepends=True):
-        body = line.rstrip("\r\n")
-        translated = _msys_to_windows_path(body)
-        if translated != body and ntpath.isabs(translated) and os.path.isdir(translated):
-            newline = line[len(body):]
-            line = translated + newline
-        normalized_lines.append(line)
-    return "".join(normalized_lines)
-
-
 def _resolve_local_initial_cwd(cwd: str) -> str:
     """Resolve the local backend's initial cwd to an absolute host path.
 
@@ -217,13 +195,6 @@ def _resolve_safe_cwd(cwd: str) -> str:
             # genuinely nothing to fall back to except the temp dir.
             break
         parent = next_parent
-    # ``cwd`` can be a POSIX-rooted spelling supplied by Git Bash even on a
-    # Windows host.  The native root is the last usable recovery target; do
-    # not skip it merely because the path module used a different slash for
-    # the incoming spelling.
-    native_root = os.path.splitdrive(cwd)[0] + os.path.sep if cwd else os.path.sep
-    if _cwd_usable(native_root):
-        return native_root
     return tempfile.gettempdir()
 
 
@@ -976,27 +947,6 @@ def _bash_starts(bash: str) -> bool:
 _git_bash_bin_dirs_cache: "list[str] | None" = None
 
 
-def _path_separator(path_value: str | None = None) -> str:
-    """Return the separator used by a PATH value at the shell boundary.
-
-    ``os.pathsep`` describes the host Python process, but a Windows Hermes
-    process can be handed a POSIX-shaped PATH by Git Bash, MSYS, a test
-    harness, or a delegated shell profile. Treating that value as a native
-    ``;``-separated PATH silently turns ``/usr/bin:/bin`` into one unusable
-    entry (and can inject native drive fragments into it). Native drive paths
-    remain ``;``-separated; POSIX-shaped values remain ``:``-separated.
-    """
-    if not _IS_WINDOWS:
-        return ":"
-
-    value = str(path_value or "")
-    if ";" in value or re.match(r"^[A-Za-z]:[\\/]", value):
-        return ";"
-    if ":" in value or value.startswith(("/", "~", ".")):
-        return ":"
-    return os.pathsep
-
-
 def _git_bash_bin_dirs() -> list[str]:
     """Git Bash's coreutils/binary dirs, in ``/etc/profile`` precedence order.
 
@@ -1062,11 +1012,7 @@ def _prepend_git_bash_dirs(existing_path: str) -> str:
     git_dirs = _git_bash_bin_dirs()
     if not git_dirs:
         return existing_path
-    sep = _path_separator(existing_path)
-    # The resolved Git-for-Windows directories are native paths. Do not mix
-    # them into a POSIX-shaped PATH supplied by a foreign shell namespace.
-    if _IS_WINDOWS and sep != os.pathsep:
-        return existing_path
+    sep = os.pathsep
     entries = [e for e in existing_path.split(sep) if e] if existing_path else []
     missing = [d for d in git_dirs if d not in entries]
     if not missing:
@@ -1202,11 +1148,7 @@ def _prepend_hermes_bin_dir(existing_path: str) -> str:
     bin_dir = _resolve_hermes_bin_dir()
     if not bin_dir:
         return existing_path
-    sep = _path_separator(existing_path)
-    if _IS_WINDOWS and sep != os.pathsep and not bin_dir.startswith(("/", "~", ".")):
-        # A POSIX shell path cannot safely contain a native drive-qualified
-        # install directory; keep the namespaces separate.
-        return existing_path
+    sep = os.pathsep
     entries = [e for e in existing_path.split(sep) if e] if existing_path else []
     if bin_dir in entries:
         return existing_path
@@ -1268,8 +1210,7 @@ def _append_missing_sane_path_entries(existing_path: str) -> str:
     sane entries are appended. On Windows this is a no-op passthrough (the
     separator is ``;`` and the native PATH must not be touched).
     """
-    sep = _path_separator(existing_path)
-    if _IS_WINDOWS and sep != ":":
+    if _IS_WINDOWS:
         return existing_path
 
     sane_entries = [entry for entry in _SANE_PATH.split(":") if entry]
@@ -1283,7 +1224,7 @@ def _append_missing_sane_path_entries(existing_path: str) -> str:
     # entries before merging in the sane fallbacks.
     seen: set[str] = set()
     ordered_entries: list[str] = []
-    for entry in existing_path.split(sep):
+    for entry in existing_path.split(":"):
         if not entry or entry in seen:
             continue
         seen.add(entry)
@@ -1295,7 +1236,7 @@ def _append_missing_sane_path_entries(existing_path: str) -> str:
         if entry not in seen:
             ordered_entries.append(entry)
 
-    return sep.join(ordered_entries)
+    return ":".join(ordered_entries)
 
 
 def _apply_windows_msys_bash_env_defaults(env: dict) -> None:
@@ -1779,14 +1720,6 @@ class LocalEnvironment(BaseEnvironment):
         super().__init__(cwd=cwd, timeout=timeout, env=env)
         self.init_session()
 
-    @staticmethod
-    def _finalize_wait_result(collector, rendered: str, returncode: int | None) -> dict:
-        """Finalize output and expose native paths at the Windows boundary."""
-        result = BaseEnvironment._finalize_wait_result(collector, rendered, returncode)
-        if _IS_WINDOWS:
-            result["output"] = _normalize_msys_path_lines(result.get("output", ""))
-        return result
-
     def get_temp_dir(self) -> str:
         """Return a shell-safe writable temp dir for local execution.
 
@@ -1843,45 +1776,6 @@ class LocalEnvironment(BaseEnvironment):
     def _quote_shell_path(self, path: str) -> str:
         """Rewrite native/mixed Windows paths before quoting for Git Bash."""
         return _quote_bash_path(path)
-
-    def _wrap_command(self, command: str, cwd: str) -> str:
-        """Normalize native Windows paths in direct shell commands.
-
-        File operations already quote paths through ``_quote_shell_path``, but
-        callers of ``terminal.execute`` commonly pass ``cat C:\\...``
-        directly. The outer wrapper evaluates that command inside Git Bash;
-        backslashes would otherwise be consumed as escapes and turn the path
-        into ``C:Users...``. Rewrite drive-qualified path tokens once at the
-        local-shell boundary, leaving POSIX and already-MS​YS paths unchanged.
-        """
-        if _IS_WINDOWS and command:
-            # Git for Windows has ``python``/``py`` but commonly no
-            # ``python3`` command.  Hermes tests, plugins, and model-generated
-            # shell snippets use the portable POSIX spelling, so provide a
-            # shell-local compatibility function without mutating the user's
-            # PATH or installing files on disk.
-            command = (
-                "if ! command -v python3 >/dev/null 2>&1; then "
-                "if command -v python >/dev/null 2>&1; then "
-                'python3() { command python "$@"; }; '
-                "elif command -v py >/dev/null 2>&1; then "
-                'python3() { command py -3 "$@"; }; '
-                "fi; fi\n"
-                + command
-            )
-            # ``rg`` on PATH is a native Windows executable. Its arguments
-            # must remain drive-qualified when MSYS argument conversion is
-            # disabled; converting them to ``/c/...`` makes rg.exe reject the
-            # path. POSIX utilities (cat/find/etc.) still use the normal
-            # Git-Bash rewrite below.
-            if re.search(r"(^|[;&|]\s*)rg(?:\.exe)?\s", command):
-                return super()._wrap_command(command, cwd)
-            command = re.sub(
-                r"(?<![A-Za-z0-9_])([A-Za-z]:[\\/][^\s'\"`;&|<>]+)",
-                lambda match: _bash_safe_path(match.group(1)),
-                command,
-            )
-        return super()._wrap_command(command, cwd)
 
     def _run_bash(self, cmd_string: str, *, login: bool = False,
                   timeout: int = 120,

@@ -1328,29 +1328,11 @@ class TestMultiAgentRouting:
         assert route["agent"]["slug"] == "research"
         assert route["subpath"] == "/.well-known/agent-card.json"
 
-        # The card advertises configured toolsets that are actually registered
-        # in the live tool registry. Register both configured toolsets so this
-        # assertion is deterministic regardless of prior suite state.
-        from tools.registry import registry as tool_registry
-        registered_names = []
-        for toolset in ("research", "web"):
-            name = f"__a2a_test_{toolset}_probe"
-            registered_names.append(name)
-            tool_registry.register(
-                name=name,
-                toolset=toolset,
-                schema={"name": name, "parameters": {"type": "object"}},
-                handler=lambda args, **_kwargs: "probe",
-            )
-        try:
-            card = adapter._build_card("http://agents.example.com/", agent=route["agent"])
-            assert card["name"] == "Research Agent"
-            assert card["supportedInterfaces"][0]["url"] == "http://agents.example.com/research/"
-            assert card["supportedInterfaces"][0]["tenant"] == "research"
-            assert {s["name"] for s in card["skills"]} == {"research", "web"}
-        finally:
-            for name in registered_names:
-                tool_registry.deregister(name)
+        card = adapter._build_card("http://agents.example.com/", agent=route["agent"])
+        assert card["name"] == "Research Agent"
+        assert card["supportedInterfaces"][0]["url"] == "http://agents.example.com/research/"
+        assert card["supportedInterfaces"][0]["tenant"] == "research"
+        assert {s["name"] for s in card["skills"]} == {"research", "web"}
 
     def test_tenant_routing_selects_agent_without_path_prefix(self):
         from plugins.platforms.a2a.adapter import A2AAdapter
@@ -1588,7 +1570,6 @@ class TestV1SpecRegressionFixes:
         assert "one" in adapter._agents
         assert "two" not in adapter._agents
 
-    @pytest.mark.skipif(os.name == "nt", reason="fake hermes shebang script is POSIX-only")
     def test_forward_to_profile_first_contact_creates_then_resumes_fake_hermes(self, monkeypatch, tmp_path):
         from plugins.platforms.a2a.adapter import A2AAdapter
         from gateway.config import PlatformConfig
