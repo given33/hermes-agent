@@ -12,7 +12,7 @@ import unittest
 from tempfile import TemporaryDirectory
 from pathlib import Path
 from types import SimpleNamespace
-from typing import Any
+from typing import Any, Optional
 from unittest.mock import patch
 
 
@@ -8246,6 +8246,113 @@ class CollaborationDashboardTests(unittest.TestCase):
             room_id,
             [str(item["id"]) for item in listed_after_revoke["rooms"]],
         )
+
+    def test_cross_account_member_can_send_messages(self):
+        module = load_module()
+        rooms_state = {"rooms": []}
+        single_state = {"conversations": []}
+        module.load_state = lambda: rooms_state
+        module.save_state = lambda _state: None
+        module.load_single_state = lambda: single_state
+        module.save_single_state = lambda _state: None
+        module._notify_hosted_update = lambda *_args: None
+        module.owner_id_from_request = lambda request: getattr(request, "owner", "owner-a")
+        generations = {"owner-a": "gen-a-1", "owner-b": "gen-b-1"}
+        module._account_generation_for_request = (
+            lambda _request, owner_id: generations.get(str(owner_id), "gen-x")
+        )
+        # _owned_conversation_in_state validates against the OWNER's live
+        # generation (the real store); the test's room era must match it.
+        module._account_generation_for_owner = (
+            lambda owner_id: generations.get(str(owner_id), "gen-x")
+        )
+        module.CreateRoomBody.model_rebuild(_types_namespace={"Any": Any})
+        module.SendMessageBody.model_rebuild(_types_namespace={"Any": Any, "Optional": Optional})
+        request_a = SimpleNamespace(owner="owner-a", query_params={})
+        request_b = SimpleNamespace(owner="owner-b", query_params={})
+
+        created = module.create_room(
+            module.CreateRoomBody(
+                name="成员发言房间",
+                profiles=["default"],
+                invite_code="SENDX",
+            ),
+            request_a,
+        )
+        room_id = str(created["room"]["id"])
+        module.join_room_by_code(module.RoomJoinBody(invite_code="SENDX"), request_b)
+
+        # The consumer thread must not run in the test env; the assertion is
+        # that member sends resolve the room conversation (no generation 404)
+        # and enqueue a durable turn.
+        started: list[tuple[str, str]] = []
+        module.start_hosted_workflow = (
+            lambda conversation_id, turn_id: started.append((conversation_id, turn_id))
+            or None
+        )
+        response = module.send_message(
+            room_id,
+            module.SendMessageBody(content="@Hermes 你好", request_id="member-send-1"),
+            request_b,
+        )
+
+        self.assertEqual(str(response["conversation_id"])[:9], "chat_room")
+        self.assertTrue(str(response["turn_id"]))
+        self.assertEqual(len(started), 1)
+        turn = (
+            single_state["conversations"][0]
+            .get("hosted_turns", {})
+            .get(str(response["turn_id"]))
+        )
+        self.assertIsNotNone(turn)
+        self.assertEqual(str(turn.get("status") or ""), "queued")
+
+    def test_hosted_turn_consumer_marks_unresolvable_turn_failed(self):
+        """A bad turn record must fail closed, never crash-loop the consumer."""
+        module = load_module()
+        conversation = module.create_single_conversation("default")
+        conversation["owner_id"] = "owner-a"
+        conversation["hosted_turns"]["turn-broken"] = {
+            "status": "running",
+            "created_at": 1,
+            "account_generation": "gen-OLD",
+            "content": "stale era turn",
+        }
+        conversation["hosted_turns"]["turn-healthy"] = {
+            "status": "queued",
+            "created_at": 2,
+            "account_generation": "gen-live",
+            "content": "healthy turn",
+        }
+        state = {"conversations": [conversation]}
+        module.load_single_state = lambda: state
+        module.save_single_state = lambda _state: None
+        module._notify_hosted_update = lambda *_args: None
+        module._account_generation_for_owner = lambda _owner: "gen-live"
+        executed: list[str] = []
+        module.execute_hosted_workflow = (
+            lambda conversation_id, turn_id: executed.append(str(turn_id))
+        )
+        module._schedule_persisted_terminal_notification = lambda *args, **kwargs: None
+
+        module.start_hosted_workflow(conversation["id"], "turn-broken")
+
+        deadline = time.time() + 10
+        while time.time() < deadline:
+            broken = conversation["hosted_turns"]["turn-broken"]
+            healthy = conversation["hosted_turns"]["turn-healthy"]
+            if broken.get("status") == "failed" and healthy.get("status") in {
+                "queued",
+                "running",
+                "completed",
+            }:
+                break
+            time.sleep(0.05)
+        self.assertEqual(
+            conversation["hosted_turns"]["turn-broken"]["status"],
+            "failed",
+        )
+        self.assertIn("stale", str(conversation["hosted_turns"]["turn-broken"].get("error") or ""))
 
     def test_owner_generation_fence_still_excludes_stale_owner_rooms(self):
         module = load_module()

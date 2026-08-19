@@ -17141,13 +17141,19 @@ def start_hosted_workflow(conversation_id: str, turn_id: str) -> threading.Threa
                     if not current_turn_id:
                         break
                     attempted_turn_ids.add(current_turn_id)
-                    _set_hosted_execution_generation(
-                        _hosted_turn_account_generation(
-                            conversation_id,
-                            current_turn_id,
-                        )
-                    )
                     try:
+                        # Resolve the turn's generation INSIDE the failure
+                        # handling: a stale-era or deleted turn record used
+                        # to raise out of the loop, killing the consumer —
+                        # the finally's rescan then respawned it into an
+                        # infinite crash loop that left the bad turn running
+                        # and every later turn queued forever.
+                        _set_hosted_execution_generation(
+                            _hosted_turn_account_generation(
+                                conversation_id,
+                                current_turn_id,
+                            )
+                        )
                         with _hosted_conversation_execution_lock(conversation_id):
                             execute_hosted_workflow(
                                 conversation_id,
@@ -17155,6 +17161,36 @@ def start_hosted_workflow(conversation_id: str, turn_id: str) -> threading.Threa
                             )
                     except Exception as exc:
                         clean_error = sanitize_runtime_error(exc)
+                        if "stale hosted turn account generation" in str(exc):
+                            # The record belongs to a previous account era:
+                            # _persist_hosted_turn's own generation fence
+                            # refuses to touch it, which would leave the turn
+                            # "running" forever. Fail it closed directly.
+                            try:
+                                with _STATE_LOCK:
+                                    state = load_single_state()
+                                    conversation = _conversation_by_id(
+                                        state,
+                                        conversation_id,
+                                    )
+                                    run = (conversation.get("hosted_turns") or {}).get(
+                                        current_turn_id
+                                    )
+                                    if isinstance(run, dict):
+                                        now_ms = int(time.time() * 1000)
+                                        run.update(
+                                            {
+                                                "status": "failed",
+                                                "stage": "failed",
+                                                "error": clean_error,
+                                                "completed_at": now_ms,
+                                                "updated_at": now_ms,
+                                            }
+                                        )
+                                        conversation["updated_at"] = now_ms
+                                        save_single_state(state)
+                            except Exception:
+                                pass
                         try:
                             failure_mode = _hosted_turn_mode(
                                 conversation_id,
@@ -23276,11 +23312,15 @@ def send_message(room_id: str, payload: SendMessageBody, request: Request):
         ).hexdigest()
         single_state = load_single_state()
         room_owner_id = str(room.get("owner_id") or owner_id)
+        # The linked conversation belongs to the room OWNER's era. A member
+        # sender must never be fenced by their own (different) generation —
+        # that made every member send 404. _owned_conversation_in_state
+        # below still authoritatively re-checks the owner's live generation.
         conversation, _created = _room_conversation_in_state(
             room,
             single_state,
             room_owner_id,
-            account_generation,
+            str(room.get("account_generation") or account_generation),
         )
         room_requests = room.get("hosted_requests")
         if not isinstance(room_requests, dict):
@@ -23928,7 +23968,13 @@ def _room_detail_response(
     )
     projection["agents"] = _room_agents_projection(room)
     projection["members"] = _room_members(room, str(room.get("owner_id") or owner_id))
-    projection["typing_users"] = _room_active_typing(room)
+    # Exclude the requester's own presence: each viewer's indicator must
+    # only ever list OTHER members typing.
+    projection["typing_users"] = [
+        entry
+        for entry in _room_active_typing(room)
+        if str(entry.get("id") or "") != str(owner_id or "").strip()
+    ]
     projection["summary_state"] = _room_summary_state(room)
     projection["can_manage"] = str(room.get("owner_id") or "") == str(owner_id or "").strip()
     return {
@@ -24498,6 +24544,14 @@ def _summarize_room_async(
                     save_state(state)
                 _notify_hosted_update(conversation_id)
             except Exception as exc:
+                # Access/ownership/generation fences are not summarizer
+                # failures: recording them poisoned the room's summary with
+                # "404: Room not found" whenever a dispatch raced an era
+                # change. Let the next due cycle retry instead.
+                if isinstance(exc, HTTPException) and int(
+                    getattr(exc, "status_code", 0) or 0
+                ) in (403, 404, 410):
+                    return
                 try:
                     with _STATE_LOCK:
                         state = load_state()
@@ -24656,12 +24710,15 @@ def get_room_summary(room_id: str, request: Request):
             config = dict(room.get("summary_config") or {})
     if due and conversation_id:
         # The client polls this endpoint; crossing the every_turns threshold
-        # here dispatches the single-flight background summarizer.
+        # here dispatches the single-flight background summarizer. Always
+        # dispatch under the ROOM OWNER's era: a member polling with their
+        # own generation used to fail the worker's ownership fence and write
+        # a poisoned "failed" summary into the owner's room.
         _summarize_room_async(
             room_id,
             conversation_id,
             str(room.get("owner_id") or owner_id),
-            account_generation,
+            str(room.get("account_generation") or account_generation),
         )
     return {
         "summary": summary,
