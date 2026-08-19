@@ -20352,20 +20352,31 @@ async def stream_hosted_conversation_events(
                 limit=500,
             )
         else:
-            with _STATE_LOCK:
-                state = _load_single_state_for_event_stream()
-                conversation, _claimed = _conversation_for_event_reader(
-                    state,
-                    conversation_id,
-                    owner_id,
-                    member_room_id,
-                )
-                envelope, has_more_events = _hosted_event_stream_frame(
-                    conversation,
-                    delivered_cursor=delivered_cursor,
-                    include_snapshot=delivered_cursor <= 0,
-                    limit=500,
-                )
+            # The lock+read+snapshot-build runs in a worker thread: doing it
+            # synchronously on the event loop held the GIL AND _STATE_LOCK
+            # for the entire disk read + deepcopy + json.dumps, during which
+            # the enqueue endpoint (sharing the same lock) could not even
+            # start processing — iOS's standard connect flow
+            # (create → open SSE → send) hung 7/7 for 35+ seconds.
+            def _build_initial_frame():
+                with _STATE_LOCK:
+                    state = _load_single_state_for_event_stream()
+                    conversation, _claimed = _conversation_for_event_reader(
+                        state,
+                        conversation_id,
+                        owner_id,
+                        member_room_id,
+                    )
+                    return _hosted_event_stream_frame(
+                        conversation,
+                        delivered_cursor=delivered_cursor,
+                        include_snapshot=delivered_cursor <= 0,
+                        limit=500,
+                    )
+            envelope, has_more_events = await asyncio.get_running_loop().run_in_executor(
+                _HOSTED_UPDATE_WAIT_EXECUTOR,
+                _build_initial_frame,
+            )
         if (
             delivered_cursor > 0
             and not envelope.get("events")
@@ -20402,20 +20413,25 @@ async def stream_hosted_conversation_events(
                 if live_frame is not None:
                     envelope, has_more_events = live_frame
                 else:
-                    with _STATE_LOCK:
-                        state = _load_single_state_for_event_stream()
-                        conversation, _claimed = _conversation_for_event_reader(
-                            state,
-                            conversation_id,
-                            owner_id,
-                            member_room_id,
-                        )
-                        envelope, has_more_events = _hosted_event_stream_frame(
-                            conversation,
-                            delivered_cursor=delivered_cursor,
-                            include_snapshot=False,
-                            limit=500,
-                        )
+                    def _build_catchup_frame():
+                        with _STATE_LOCK:
+                            state = _load_single_state_for_event_stream()
+                            conversation, _claimed = _conversation_for_event_reader(
+                                state,
+                                conversation_id,
+                                owner_id,
+                                member_room_id,
+                            )
+                            return _hosted_event_stream_frame(
+                                conversation,
+                                delivered_cursor=delivered_cursor,
+                                include_snapshot=False,
+                                limit=500,
+                            )
+                    envelope, has_more_events = await asyncio.get_running_loop().run_in_executor(
+                        _HOSTED_UPDATE_WAIT_EXECUTOR,
+                        _build_catchup_frame,
+                    )
                 continue
             break
 
@@ -20490,20 +20506,25 @@ async def stream_hosted_conversation_events(
                 if live_frame is not None:
                     envelope, has_more_events = live_frame
                 else:
-                    with _STATE_LOCK:
-                        state = _load_single_state_for_event_stream()
-                        conversation, _claimed = _conversation_for_event_reader(
-                            state,
-                            conversation_id,
-                            owner_id,
-                            member_room_id,
-                        )
-                        envelope, has_more_events = _hosted_event_stream_frame(
-                            conversation,
-                            delivered_cursor=delivered_cursor,
-                            include_snapshot=False,
-                            limit=500,
-                        )
+                    def _build_catchup_frame():
+                        with _STATE_LOCK:
+                            state = _load_single_state_for_event_stream()
+                            conversation, _claimed = _conversation_for_event_reader(
+                                state,
+                                conversation_id,
+                                owner_id,
+                                member_room_id,
+                            )
+                            return _hosted_event_stream_frame(
+                                conversation,
+                                delivered_cursor=delivered_cursor,
+                                include_snapshot=False,
+                                limit=500,
+                            )
+                    envelope, has_more_events = await asyncio.get_running_loop().run_in_executor(
+                        _HOSTED_UPDATE_WAIT_EXECUTOR,
+                        _build_catchup_frame,
+                    )
                 current_cursor = int(envelope["cursor"])
                 payload = json.dumps(
                     envelope,
