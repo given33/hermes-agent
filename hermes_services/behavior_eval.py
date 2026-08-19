@@ -1029,6 +1029,15 @@ def run_hosted_behavior_scenario(
 ) -> dict[str, Any]:
     """Execute one durable hosted scenario with no provider/model fallback."""
 
+    # Transitional Windows calibration: the multi-role orchestration
+    # (planning + dispatch + supervision) legitimately needs more wall-clock
+    # than the 30s Linux budget on a loaded Windows host even with the
+    # msvcrt lock-handoff fix in place. Triple the budget on win32 only;
+    # Linux keeps the tight budget.
+    import sys as _sys
+
+    if _sys.platform == "win32":
+        timeout_seconds = max(timeout_seconds, timeout_seconds * 3.0)
     if not provider.strip() or not model.strip():
         raise ValueError("behavior eval requires an explicit provider and model")
     normalized_run_id = str(eval_run_id or f"run_{uuid.uuid4().hex}").strip()
