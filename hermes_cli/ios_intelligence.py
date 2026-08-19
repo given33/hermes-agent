@@ -605,6 +605,23 @@ def _kind(value: Any) -> str:
     return result
 
 
+def _valid_device_number(value: Any) -> bool:
+    """Device payloads occasionally carry locale decimals ("31,2"), garbage
+    strings, or nested objects in numeric fields. Any of those raises inside
+    the sealed numeric projections mid-transaction, rolling back the whole
+    ingest batch so the cursor never advances and the client re-uploads the
+    same poison forever. Ingest guards treat a failed coercion as a malformed
+    event (skip and count), never as a batch-wide exception."""
+    if value is None or isinstance(value, bool):
+        return True
+    if isinstance(value, (int, float)):
+        return math.isfinite(float(value))
+    try:
+        return math.isfinite(float(str(value).strip()))
+    except (TypeError, ValueError):
+        return False
+
+
 def _epoch(value: Any = None) -> int:
     if value is None:
         return int(time.time())
@@ -1735,7 +1752,12 @@ class IOSIntelligenceStore:
                     discarded += 1
                     duplicates += 1
                     continue
-                observed_at = _epoch(event.get("observed_at") or event.get("timestamp"))
+                try:
+                    observed_at = _epoch(event.get("observed_at") or event.get("timestamp"))
+                except (ValueError, TypeError, OverflowError):
+                    discarded += 1
+                    duplicates += 1
+                    continue
                 payload = event.get("payload")
                 if not isinstance(payload, dict):
                     payload = {
@@ -1783,7 +1805,21 @@ class IOSIntelligenceStore:
                 if kind in {"location", "trajectory", "location-point"}:
                     latitude = payload.get("latitude", payload.get("lat"))
                     longitude = payload.get("longitude", payload.get("lon", payload.get("lng")))
-                    if latitude is None or longitude is None:
+                    if (
+                        latitude is None
+                        or longitude is None
+                        or not _valid_device_number(latitude)
+                        or not _valid_device_number(longitude)
+                        or any(
+                            value is not None and not _valid_device_number(value)
+                            for value in (
+                                payload.get("horizontal_accuracy"),
+                                payload.get("altitude"),
+                                payload.get("speed"),
+                                payload.get("course"),
+                            )
+                        )
+                    ):
                         # One malformed event must never wedge the device
                         # pipeline: raising rolled back the whole batch and
                         # the cursor never advanced, so the client re-uploaded
@@ -1810,9 +1846,23 @@ class IOSIntelligenceStore:
                         ),
                     )
                 if kind in {"place", "place-visit", "visit"}:
-                    arrived_at = _epoch(payload.get("arrived_at") or observed_at)
+                    if (
+                        not _valid_device_number(payload.get("latitude", payload.get("lat")))
+                        or not _valid_device_number(payload.get("longitude", payload.get("lon", payload.get("lng"))))
+                    ):
+                        accepted -= 1
+                        discarded += 1
+                        duplicates += 1
+                        continue
                     departed = payload.get("departed_at")
-                    departed_at = _epoch(departed) if departed is not None else None
+                    try:
+                        arrived_at = _epoch(payload.get("arrived_at") or observed_at)
+                        departed_at = _epoch(departed) if departed is not None else None
+                    except (ValueError, TypeError, OverflowError):
+                        accepted -= 1
+                        discarded += 1
+                        duplicates += 1
+                        continue
                     place_id = self._place_id_for_event(conn, owner_id, payload, event_id)
                     projected = conn.execute(
                         "SELECT device_id,event_id,departed_at,payload_json FROM ios_places "

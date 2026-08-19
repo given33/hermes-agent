@@ -24,6 +24,23 @@ from utils import base_url_host_matches
 class CLIAgentSetupMixin:
     """Agent construction + session-resume display methods for ``HermesCLI``."""
 
+    def _credential_diagnostic(self, text: str) -> None:
+        """Auth diagnostics must never pollute stdout in quiet mode.
+
+        ``hermes chat -Q`` promises machine-readable stdout (kanban
+        dispatcher and other wrappers parse the agent reply out of it);
+        these provider-resolution failures used to print styled text to
+        stdout and got ingested as the "reply".
+        """
+        import sys
+
+        if getattr(getattr(self, "agent", None), "quiet_mode", False):
+            print(text, file=sys.stderr)
+        else:
+            from cli import ChatConsole
+
+            ChatConsole().print(text)
+
     def _ensure_runtime_credentials(self) -> bool:
         """
         Ensure runtime credentials are resolved before agent use.
@@ -82,7 +99,7 @@ class CLIAgentSetupMixin:
 
         if runtime is None:
             message = format_runtime_provider_error(_primary_exc) if _primary_exc else "Provider resolution failed."
-            ChatConsole().print(f"[bold red]{message}[/]")
+            self._credential_diagnostic(f"[bold red]{message}[/]")
             return False
 
         api_key = runtime.get("api_key")
@@ -119,15 +136,15 @@ class CLIAgentSetupMixin:
             else:
                 _prov = (resolved_provider or self.requested_provider or "").strip()
                 if _prov and _prov != "auto":
-                    print(f"\n⚠️  No API key found for provider '{_prov}'.")
+                    self._credential_diagnostic(f"\n⚠️  No API key found for provider '{_prov}'.")
                 else:
-                    print("\n⚠️  No inference provider is configured.")
-                print("   Run 'hermes model' to choose a provider, or "
-                      "'hermes setup' for first-time setup.")
+                    self._credential_diagnostic("\n⚠️  No inference provider is configured.")
+                self._credential_diagnostic("   Run 'hermes model' to choose a provider, or "
+                                            "'hermes setup' for first-time setup.")
                 return False
         if not isinstance(base_url, str) or not base_url:
-            print("\n⚠️  Provider resolver returned an empty base URL. "
-                  "Check your provider config or run: hermes setup")
+            self._credential_diagnostic("\n⚠️  Provider resolver returned an empty base URL. "
+                                        "Check your provider config or run: hermes setup")
             return False
 
         credentials_changed = api_key != self.api_key or base_url != self.base_url
@@ -598,7 +615,6 @@ class CLIAgentSetupMixin:
             return False
 
     def _resume_history_limit_error(self, tip_only: bool = False):
-        from cli import logger  # lazy: avoids the cli import cycle
         """Return a safe-resume error without materializing transcript rows.
 
         ``tip_only`` matches call sites that load only the tip session's rows

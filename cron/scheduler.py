@@ -3479,6 +3479,26 @@ def _windows_cron_bootstrap_argv(
     return [python_exe, "-c", bootstrap, script_path]
 
 
+# Script output budget: script stdout/stderr feeds the agent prompt, chat
+# delivery chunking, monitor diffs, and the cron/output/ store. 200k chars
+# matches the tool-result spillover budget; head+tail keeps both the error
+# context at the start and the final status lines of long listings.
+_CRON_SCRIPT_OUTPUT_MAX_CHARS = 200_000
+
+
+def _truncate_cron_script_output(text: str, label: str) -> str:
+    if len(text) <= _CRON_SCRIPT_OUTPUT_MAX_CHARS:
+        return text
+    head_chars = _CRON_SCRIPT_OUTPUT_MAX_CHARS // 2
+    tail_chars = _CRON_SCRIPT_OUTPUT_MAX_CHARS // 4
+    return (
+        f"{text[:head_chars]}\n\n"
+        f"[... {label} truncated: {len(text)} chars total; "
+        f"showing first {head_chars} and last {tail_chars} ...]"
+        f"\n\n{text[-tail_chars:]}"
+    )
+
+
 def _run_job_script(
     script_path: str,
     workdir: Optional[str] = None,
@@ -3546,13 +3566,10 @@ def _run_job_script(
         # reach fire time — fail the run with a report instead of crashing
         # the scheduler with an unhandled exception.
         return False, f"Blocked: script path is not a valid filesystem path: {script_path!r}"
-    try:
-        if raw.is_absolute():
-            path = raw.resolve()
-        else:
-            path = (scripts_dir / raw).resolve()
-    except (ValueError, RuntimeError, OSError):
-        return False, f"Blocked: script path is not a valid filesystem path: {script_path!r}"
+    if raw.is_absolute():
+        path = raw.resolve()
+    else:
+        path = (scripts_dir / raw).resolve()
 
     # Guard against path traversal, absolute path injection, and symlink
     # escape — scripts MUST reside within HERMES_HOME/scripts/.
@@ -3591,18 +3608,7 @@ def _run_job_script(
                 "On Windows, install Git for Windows (which ships Git Bash) "
                 "or rewrite the script as Python (.py)."
         )
-        script_arg = str(path)
-        if sys.platform == "win32":
-            bash_normalized = os.path.normcase(os.path.abspath(_bash))
-            system32_bash = os.path.normcase(
-                os.path.join(os.environ.get("SystemRoot", r"C:\Windows"), "System32", "bash.exe")
-            )
-            if bash_normalized == system32_bash and path.drive:
-                drive = path.drive.rstrip(":").lower()
-                script_arg = "/mnt/" + drive + "/" + "/".join(path.parts[1:])
-            else:
-                script_arg = path.as_posix()
-        argv = [_bash, script_arg]
+        argv = [_bash, str(path)]
         env_overlay: dict[str, str] = {}
     else:
         python_exe, env_overlay = _windows_cron_python_invocation(sys.executable)
@@ -3617,7 +3623,15 @@ def _run_job_script(
     try:
         from tools.environments.local import build_subprocess_env
 
-        popen_kwargs: dict[str, Any] = {"start_new_session": True}
+        popen_kwargs: dict[str, Any] = {
+            "start_new_session": True,
+            # POSIX too: with a non-UTF-8 locale, communicate() raised
+            # UnicodeDecodeError on scripts emitting Latin-1/GBK bytes (git
+            # log names, `file` banners), failing the whole job. Same
+            # utf-8+replace contract the Windows branch already has.
+            "encoding": "utf-8",
+            "errors": "replace",
+        }
         if sys.platform == "win32":
             popen_kwargs = {
                 "creationflags": windows_hide_flags()
@@ -3670,6 +3684,14 @@ def _run_job_script(
             logger.warning("Failed to redact sensitive text from output: %s", e)
             stdout = "[REDACTED - redaction failed]"
             stderr = "[REDACTED - redaction failed]"
+
+        # Bound the output before it fans out (agent prompt injection, chat
+        # delivery chunking, monitor diffing, cron/output/ files): every
+        # other data-injection path has an explicit cap — the script path
+        # alone was unbounded, so one `cat huge.log` blew up memory,
+        # tokens, and delivered thousands of message chunks.
+        stdout = _truncate_cron_script_output(stdout, "stdout")
+        stderr = _truncate_cron_script_output(stderr, "stderr")
 
         if proc.returncode != 0:
             parts = [f"Script exited with code {proc.returncode}"]

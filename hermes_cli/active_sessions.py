@@ -138,8 +138,25 @@ class _FileLock:
             try:
                 import msvcrt
 
-                self._fh.seek(0)
-                msvcrt.locking(self._fh.fileno(), msvcrt.LK_LOCK, 1)
+                # LK_LOCK retries once per SECOND, so every contended
+                # hand-off costs >=1s. With every state read/write in the
+                # collaboration dashboard passing through this lock, a
+                # multi-role workflow made dozens of 1-second hand-offs and
+                # blew every 30s budget (product-chain 02-12), and plain
+                # polling janked the live dashboard. Poll LK_NBLCK at a
+                # 10ms cadence instead — same cross-process mutual
+                # exclusion and crash-release semantics, microseconds of
+                # hand-off in practice.
+                deadline = time.monotonic() + 10.0
+                while True:
+                    self._fh.seek(0)
+                    try:
+                        msvcrt.locking(self._fh.fileno(), msvcrt.LK_NBLCK, 1)
+                        break
+                    except OSError:
+                        if time.monotonic() >= deadline:
+                            raise
+                        time.sleep(0.01)
             except Exception as exc:
                 self._fh.close()
                 self._fh = None
