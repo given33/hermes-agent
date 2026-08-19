@@ -22,7 +22,6 @@ from __future__ import annotations
 
 import logging
 import re
-import shlex
 import threading
 from pathlib import Path
 from typing import Any, Dict, Optional, Set
@@ -107,13 +106,12 @@ def _extract_paths_from_terminal(args: Dict[str, Any], result: str) -> Set[str]:
     paths: Set[str] = set()
     cmd = args.get("command") or ""
     if isinstance(cmd, str) and cmd:
-        # Tokenise the command — catches `touch /tmp/hermes-x/test_foo.py`
-        try:
-            for tok in shlex.split(cmd, posix=True):
-                if tok.startswith(("/", "~")) or re.match(r"^[A-Za-z]:[\\/]", tok):
-                    paths.add(tok)
-        except ValueError:
-            pass
+        # Regex-scan instead of shlex tokenising: shlex(posix=True) eats
+        # backslashes, so Windows drive paths never survived tokenisation
+        # and scratch files created via terminal on Windows were silently
+        # never tracked.
+        for match in _TERMINAL_PATH_REGEX.findall(cmd):
+            paths.add(match)
     # Only scan the result text if it's a reasonable size (avoid 50KB dumps).
     if isinstance(result, str) and len(result) < 4096:
         for match in _TERMINAL_PATH_REGEX.findall(result):

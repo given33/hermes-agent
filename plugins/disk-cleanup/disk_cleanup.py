@@ -23,7 +23,10 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 import shutil
+import sys
+import tempfile
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
@@ -64,20 +67,42 @@ def get_log_file() -> Path:
 # ---------------------------------------------------------------------------
 
 def is_safe_path(path: Path) -> bool:
-    """Accept only paths under HERMES_HOME or ``/tmp/hermes-*``.
+    """Accept only absolute paths under HERMES_HOME or the system temp
+    dir's ``hermes-*`` scratch trees.
 
     Rejects Windows mounts (``/mnt/c`` etc.) and any system directory.
+    Fail-closed on anything ambiguous: relative paths (a forged
+    ``foo/tmp/hermes-x/victim`` tracked.json entry used to pass the
+    ``/tmp/hermes-*`` check relative to the process CWD), drive-relative
+    Windows paths (``D:tmp\\hermes-x``), and — on Windows — ``\\tmp\\hermes-*``
+    on an arbitrary drive, which is not a temp directory at all.
     """
+    if not path.is_absolute():
+        return False
     hermes_home = get_hermes_home()
     try:
         path.resolve().relative_to(hermes_home)
         return True
     except (ValueError, OSError):
         pass
-    # Allow /tmp/hermes-* explicitly
-    parts = path.parts
-    if len(parts) >= 3 and parts[1] == "tmp" and parts[2].startswith("hermes-"):
-        return True
+    # Scratch scope: the system temp dir's hermes-* subtree, plus the
+    # literal POSIX /tmp/hermes-* form on POSIX hosts.
+    try:
+        resolved = path.resolve()
+        rel = resolved.relative_to(Path(tempfile.gettempdir()).resolve())
+        if rel.parts and rel.parts[0].startswith("hermes-"):
+            return True
+    except (ValueError, OSError):
+        pass
+    if os.name == "posix":
+        parts = path.parts
+        if (
+            len(parts) >= 3
+            and parts[0] == "/"
+            and parts[1] == "tmp"
+            and parts[2].startswith("hermes-")
+        ):
+            return True
     return False
 
 
@@ -159,6 +184,28 @@ _EMPTY_DIR_SWEEP_PRUNE_DIRS = frozenset({
 })
 
 
+def _is_symlink_like(p: Path) -> bool:
+    """True for symlinks AND NTFS junctions/mount points.
+
+    On Python 3.11 a junction is not ``is_symlink()`` but ``is_dir()``
+    follows it, so the sweep would recurse into whatever the junction
+    points at (e.g. a user Documents tree) and rmdir() empty directories
+    outside HERMES_HOME. Any resolve-divergence counts as a link — pruning
+    is fail-closed (worst case we skip sweeping one directory).
+    """
+    if p.is_symlink():
+        return True
+    if sys.platform == "win32":
+        try:
+            return (
+                os.path.normcase(os.path.realpath(p))
+                != os.path.normcase(str(p))
+            )
+        except OSError:
+            return True
+    return False
+
+
 # Paths under $HERMES_HOME that must NEVER be deleted by quick(),
 # regardless of what the stored category says.  This is a defense-in-depth
 # guard against stale tracked.json entries from before #34840.
@@ -189,6 +236,19 @@ def _is_protected_cron_path(p: Path) -> bool:
             _PROTECTED_CRON_PATHS.add(str(base / ".tick.lock"))
     resolved = str(p.resolve())
     return resolved in _PROTECTED_CRON_PATHS
+
+
+def _age_days(item, now) -> object:
+    """Days since the entry's timestamp; None when malformed.
+
+    A naive timestamp or a missing/garbage field previously raised out of
+    quick()/dry_run() — killing the whole session-end cleanup — and did so
+    before save_tracked, so the poison entry never left the file.
+    """
+    try:
+        return (now - datetime.fromisoformat(str(item["timestamp"]))).days
+    except (KeyError, TypeError, ValueError):
+        return None
 
 
 def fmt_size(n: float) -> str:
@@ -268,7 +328,9 @@ def dry_run() -> Tuple[List[Dict], List[Dict]]:
         p = Path(item["path"])
         if not p.exists():
             continue
-        age = (now - datetime.fromisoformat(item["timestamp"])).days
+        age = _age_days(item, now)
+        if age is None:
+            continue
         cat = item["category"]
         size = item["size"]
 
@@ -321,7 +383,10 @@ def quick() -> Dict[str, Any]:
             _log(f"STALE: {p} (removed from tracking)")
             continue
 
-        age = (now - datetime.fromisoformat(item["timestamp"])).days
+        age = _age_days(item, now)
+        if age is None:
+            _log(f"SKIP malformed tracking entry: {p} (bad timestamp)")
+            continue
 
         # ---- stale-state migration (fixes #37721) ----
         # Old tracked.json entries may carry a "cron-output" category for
@@ -351,6 +416,15 @@ def quick() -> Dict[str, Any]:
                 _log(
                     f"SKIP stale test entry: {p} "
                     f"(re-classified as {re_cat!r} — under protected tree)"
+                )
+                continue
+
+        if cat == "temp":
+            re_cat = guess_category(p)
+            if re_cat != "temp":
+                _log(
+                    f"SKIP stale temp entry: {p} "
+                    f"(re-classified as {re_cat!r} — not a cache/scratch tree)"
                 )
                 continue
 
@@ -389,13 +463,15 @@ def quick() -> Dict[str, Any]:
     hermes_home = get_hermes_home()
     empty_removed = 0
     sweep_stack: List[Tuple[Path, bool]] = []
+    protected_lower = {name.lower() for name in _EMPTY_DIR_PROTECTED_TOP_LEVEL}
+    prune_lower = {name.lower() for name in _EMPTY_DIR_SWEEP_PRUNE_DIRS}
     try:
         for top in hermes_home.iterdir():
             if (
                 top.is_dir()
-                and not top.is_symlink()
-                and top.name not in _EMPTY_DIR_PROTECTED_TOP_LEVEL
-                and top.name not in _EMPTY_DIR_SWEEP_PRUNE_DIRS
+                and not _is_symlink_like(top)
+                and top.name.lower() not in protected_lower
+                and top.name.lower() not in prune_lower
             ):
                 sweep_stack.append((top, False))
     except OSError:
@@ -418,8 +494,8 @@ def quick() -> Dict[str, Any]:
             for child in dirpath.iterdir():
                 if (
                     child.is_dir()
-                    and not child.is_symlink()
-                    and child.name not in _EMPTY_DIR_SWEEP_PRUNE_DIRS
+                    and not _is_symlink_like(child)
+                    and child.name.lower() not in prune_lower
                 ):
                     sweep_stack.append((child, False))
         except OSError:
@@ -467,7 +543,9 @@ def deep(
         p = Path(item["path"])
         if not p.exists():
             continue
-        age = (now - datetime.fromisoformat(item["timestamp"])).days
+        age = _age_days(item, now)
+        if age is None:
+            continue
         cat = item["category"]
 
         if cat == "research" and age > 30:
@@ -568,44 +646,63 @@ def guess_category(path: Path) -> Optional[str]:
     """Return a category label for *path*, or None if we shouldn't track it.
 
     Used by the ``post_tool_call`` hook to auto-track ephemeral files.
+
+    Default-deny: automatic deletion eligibility is decided by WHERE the
+    file lives, never by its name alone. A maintainer-curated list of
+    protected top-level names can never keep up with the real HERMES_HOME
+    layout (worktrees, workspace, collaboration, plugin-data, ...), and any
+    gap meant a user's ``test_*.py`` inside those trees was silently
+    unlinked at session end. Auto-tracking now only recognizes:
+
+    - files directly under the HERMES_HOME root (the agent's own scratch
+      area — never inside a subdirectory the agent did not create itself),
+    - the ``cache/`` tree (temp),
+    - the disposable ``cron/output/`` subtree (cron-output),
+    - the system temp dir's ``hermes-*`` scratch trees.
+
+    Anything else returns None; users can still track files explicitly via
+    ``/disk-cleanup track``.
     """
     if not is_safe_path(path):
         return None
 
-    # Skip the state dir itself, logs, memory files, sessions, config.
     hermes_home = get_hermes_home()
     try:
         rel = path.resolve().relative_to(hermes_home)
-        top = rel.parts[0] if rel.parts else ""
-        if top in {
-            "disk-cleanup", "logs", "memories", "sessions", "config.yaml",
-            "skills", "plugins", ".env", "USER.md", "MEMORY.md", "SOUL.md",
-            "auth.json", "hermes-agent",
-            # User-authored and project trees — never auto-delete files
-            # inside these just because they happen to be named test_* or
-            # tmp_* (#75403, also #32164, #37721).
-            "patches", "projects", "skins", "themes", "contributors",
-            "profiles", "backups", "optional-skills",
-        }:
-            return None
-        if top == "cron" or top == "cronjobs":
-            # Only files under the disposable ``output/`` subtree are
-            # cleanup candidates. Top-level cron control-plane state
-            # (e.g. ``jobs.json``, ``.tick.lock``) must never be
-            # auto-tracked — deleting it wipes the live scheduler
-            # registry. See issue #32164.
-            if len(rel.parts) >= 3 and rel.parts[1] == "output":
-                return "cron-output"
-            return None
-        if top == "cache":
-            return "temp"
-    except ValueError:
-        # Path isn't under HERMES_HOME (e.g. /tmp/hermes-*) — fall through.
-        pass
+    except (ValueError, OSError):
+        # Not under HERMES_HOME: only the temp-dir hermes-* scratch trees
+        # remain, and is_safe_path already gated that. Inside them, name
+        # patterns are meaningful (the agent created the file this turn);
+        # anything else stays untracked, as before.
+        name = path.name
+        if name.startswith(_TEST_PATTERNS):
+            return "test"
+        if any(name.endswith(sfx) for sfx in _TEST_SUFFIXES):
+            return "test"
+        return None
 
-    name = path.name
-    if name.startswith(_TEST_PATTERNS):
-        return "test"
-    if any(name.endswith(sfx) for sfx in _TEST_SUFFIXES):
-        return "test"
+    parts = rel.parts
+    if not parts:
+        return None
+    top = parts[0]
+    if top == "cache":
+        return "temp"
+    if top in {"cron", "cronjobs"}:
+        # Only files under the disposable ``output/`` subtree are cleanup
+        # candidates; top-level control-plane state (jobs.json, .tick.lock)
+        # must never be auto-tracked (#32164).
+        if len(parts) >= 3 and parts[1] == "output":
+            return "cron-output"
+        return None
+    if len(parts) == 1:
+        # Directly at the HERMES_HOME root: the agent's own scratch files
+        # and scratch dirs (e.g. a test_probe.py written during a task).
+        # Subdirectories are NEVER name-matched — they may hold user code
+        # (.worktrees/, workspace/, collaboration/, plugin-data/, ...).
+        name = path.name
+        if name.startswith(_TEST_PATTERNS):
+            return "test"
+        if any(name.endswith(sfx) for sfx in _TEST_SUFFIXES):
+            return "test"
+        return None
     return None

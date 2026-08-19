@@ -593,6 +593,16 @@ _NOTIFICATION_ONLINE_RECHECK_MS = 5_000
 _HOSTED_UPDATE_CONDITION = threading.Condition()
 _HOSTED_UPDATE_REVISION = 0
 _HOSTED_UPDATE_REVISIONS: dict[str, int] = {}
+# Every hosted-events SSE watcher parks a `_wait_for_hosted_update` call in a
+# thread for up to 15s (renewed for the stream's lifetime). Routing those
+# through asyncio's default executor (min(32, cpu+4) threads — 8 on a 4-core
+# VPS) meant the 9th concurrent watcher stalled keepalives AND queued every
+# other to_thread user (enqueue transactions) behind parked waiters. A
+# dedicated pool isolates the long-pollers; other API work keeps its threads.
+_HOSTED_UPDATE_WAIT_EXECUTOR = ThreadPoolExecutor(
+    max_workers=64,
+    thread_name_prefix="hermes-hosted-wait",
+)
 # A hosted turn can produce a user-visible lifecycle event while the durable
 # single-conversation document is still being atomically rewritten.  Keep the
 # latest conversation projection outside the account-state lock so the SSE
@@ -16102,7 +16112,11 @@ def execute_hosted_workflow(
                     "status": "completed",
                     "kind": "message",
                     "meta": {
-                        "role_stage": "supervisor.rework-request",
+                        # Round-suffixed like the reviewer's "reviewer:rework-request:N" so
+                        # clients can parse the rework round from the stage (the
+                        # unsuffixed form left supervisor rounds invisible in
+                        # team badges).
+                        "role_stage": f"supervisor.rework-request:{supervisor_rework_round}",
                         "base_role_stage": "supervisor",
                         "phase": "rework",
                         "message_key": f"{turn_id}:supervisor:rework:{supervisor_rework_round}",
@@ -20690,7 +20704,8 @@ async def stream_hosted_conversation_events(
             break
 
         while not await request.is_disconnected():
-            next_revision = await asyncio.to_thread(
+            next_revision = await asyncio.get_running_loop().run_in_executor(
+                _HOSTED_UPDATE_WAIT_EXECUTOR,
                 _wait_for_hosted_update,
                 revision,
                 15.0,
@@ -20728,6 +20743,15 @@ async def stream_hosted_conversation_events(
                         limit=500,
                     )
             current_cursor = int(envelope["cursor"])
+            # An event-only frame that carries no new events carries no
+            # information: the revision bump was a state/presence touch
+            # served by the snapshot path. Sending it anyway pushed 8-10
+            # empty envelopes per second to every live iOS client during
+            # active turns — pure parse/battery/bandwidth burn. Skip back
+            # to the wait loop instead.
+            frame_events = envelope.get("events")
+            if current_cursor <= delivered_cursor and not frame_events:
+                continue
             payload = json.dumps(
                 envelope,
                 ensure_ascii=False,
@@ -21262,6 +21286,70 @@ def _complete_pending_hosted_route(conversation_id: str, turn_id: str) -> bool:
     return True
 
 
+def _fail_exhausted_routing_turn(conversation_id: str, turn_id: str) -> None:
+    """Commit a failed terminal once the routing dispatcher's retry budget is
+    exhausted. Without this the turn stays `status=queued, stage=routing_failed`
+    forever: no terminal SSE event, no push, and the client spins until the
+    36h stale reconcile. The turn keeps `retryable=True` so the durable retry
+    path (and pause/resume restarts) still work."""
+    with _STATE_LOCK:
+        state = load_single_state()
+        conversation = _conversation_by_id(state, conversation_id)
+        run = (conversation.get("hosted_turns") or {}).get(turn_id)
+        outbox = conversation.get("route_outbox")
+        item = outbox.get(turn_id) if isinstance(outbox, dict) else None
+        if (
+            not isinstance(run, dict)
+            or run.get("status") in _HOSTED_TERMINAL_STATUSES
+            or bool(run.get("paused"))
+            or str(run.get("stage") or "") != "routing_failed"
+            or not isinstance(item, dict)
+            or str(item.get("state") or "") != "retryable"
+        ):
+            return
+        clean_error = sanitize_runtime_error(
+            str(run.get("routing_error") or item.get("last_error") or "routing failed")
+        )
+    try:
+        persisted = _persist_hosted_turn(
+            conversation_id,
+            turn_id,
+            patch={
+                "status": "failed",
+                "stage": "failed",
+                "error": clean_error,
+                "retryable": True,
+                "completed_at": int(time.time() * 1000),
+                "notification": _completion_notification_record(
+                    conversation_id,
+                    turn_id,
+                    "failed",
+                    clean_error,
+                ),
+            },
+        )
+    except Exception:
+        return
+    if not persisted:
+        return
+    with _STATE_LOCK:
+        state = load_single_state()
+        conversation = _conversation_by_id(state, conversation_id)
+        outbox = conversation.get("route_outbox")
+        if isinstance(outbox, dict) and turn_id in outbox:
+            outbox.pop(turn_id, None)
+            if not outbox:
+                conversation.pop("route_outbox", None)
+            save_single_state(state)
+    _schedule_persisted_terminal_notification(
+        conversation_id,
+        turn_id,
+        persisted,
+        fallback_result=clean_error,
+    )
+    _notify_hosted_update(conversation_id)
+
+
 def start_hosted_routing(conversation_id: str, turn_id: str) -> threading.Thread:
     key = f"{conversation_id}:{turn_id}"
     with _HOSTED_ROUTING_THREADS_LOCK:
@@ -21292,6 +21380,7 @@ def start_hosted_routing(conversation_id: str, turn_id: str) -> threading.Thread
                             / 1000,
                         )
                     time.sleep(min(30.0, delay))
+                _fail_exhausted_routing_turn(conversation_id, turn_id)
             finally:
                 with _HOSTED_ROUTING_THREADS_LOCK:
                     _HOSTED_ROUTING_THREADS.pop(key, None)
@@ -24567,6 +24656,11 @@ def _summarize_room_async(
                                 if isinstance(item, dict)
                                 and item.get("id") == room_id
                                 and str(item.get("owner_id") or "").strip() == owner_id
+                                and (
+                                    not str(account_generation or "").strip()
+                                    or str(item.get("account_generation") or "").strip()
+                                    == str(account_generation).strip()
+                                )
                             ),
                             None,
                         )

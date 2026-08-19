@@ -23,11 +23,14 @@ import time
 import uuid
 import urllib.error
 import urllib.request
+import logging
 from collections import deque
 from contextlib import asynccontextmanager, suppress
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, AsyncIterator
+
+logger = logging.getLogger(__name__)
 
 from fastapi import APIRouter, HTTPException, Query, Request, WebSocket
 from fastapi.responses import Response, StreamingResponse
@@ -607,6 +610,11 @@ def _response_data(frame: Any) -> Any:
 
 _NODE_REGISTRY: dict[str, dict[str, Any]] = {}
 
+# Wall-clock budget for a non-streaming request forwarded through a node
+# tunnel. Without it a half-open TCP connection (or a hung local Pi
+# service on the worker) parks the pending future forever.
+_TUNNEL_REQUEST_TIMEOUT_SECONDS = 300.0
+
 
 @dataclass
 class _TunnelCall:
@@ -677,7 +685,14 @@ class _NodeTunnel:
             return call
         assert call.future is not None
         try:
-            return await call.future
+            return await asyncio.wait_for(call.future, timeout=_TUNNEL_REQUEST_TIMEOUT_SECONDS)
+        except asyncio.TimeoutError:
+            error = RuntimeError(
+                f"Pi node tunnel request timed out after {_TUNNEL_REQUEST_TIMEOUT_SECONDS}s"
+            )
+            if not call.future.done():
+                call.future.set_exception(error)
+            raise
         finally:
             self.pending.pop(request_id, None)
 
@@ -1815,7 +1830,33 @@ def _tunnel_authorized(websocket: WebSocket) -> bool:
         or os.environ.get("CODING_PI_SERVER_TOKEN", "").strip()
     )
     if not expected:
-        return True
+        client = str(websocket.client.host if websocket.client else "") or ""
+        loopback = False
+        try:
+            import ipaddress
+
+            loopback = ipaddress.ip_address(client.split("%")[0]).is_loopback
+        except ValueError:
+            loopback = False
+        if loopback:
+            return True
+        # Explicit, loudly-logged legacy opt-out for deployments that have
+        # not distributed a coordinator token to their node agents yet.
+        # Without it the endpoint is FAIL-CLOSED for non-loopback peers:
+        # with the token unset it used to accept anyone who could reach the
+        # port — anyone could register a node, capture a node_id, and have
+        # the coordinator proxy requests (or hand off session context) to
+        # their server. Set CODING_PI_COORDINATOR_TOKEN on the coordinator
+        # AND every node agent to migrate off this switch.
+        if os.environ.get("CODING_PI_TUNNEL_UNAUTHENTICATED", "").strip() == "1":
+            logger.warning(
+                "coding-pi node tunnel accepted UNAUTHENTICATED non-loopback peer %s "
+                "(CODING_PI_TUNNEL_UNAUTHENTICATED=1); set CODING_PI_COORDINATOR_TOKEN "
+                "on the coordinator and all node agents",
+                client,
+            )
+            return True
+        return False
     return hmac.compare_digest(websocket.headers.get("authorization", ""), f"Bearer {expected}")
 
 
