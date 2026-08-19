@@ -427,6 +427,24 @@ def quick() -> Dict[str, Any]:
                     f"(re-classified as {re_cat!r} — under protected tree)"
                 )
                 continue
+            # Cross-session race note: a concurrently-running session's
+            # freshly-tracked test file could be deleted here while still
+            # in use. The 1-hour timestamp check below is advisory only —
+            # we log it but proceed, since blocking all same-day deletions
+            # defeats the test category's immediate-cleanup purpose.
+            try:
+                from datetime import datetime, timezone
+                tracked_at = datetime.fromisoformat(str(item.get("timestamp") or ""))
+                if tracked_at.tzinfo is None:
+                    tracked_at = tracked_at.replace(tzinfo=timezone.utc)
+                age_seconds = (datetime.now(timezone.utc) - tracked_at).total_seconds()
+                if age_seconds < 3600:
+                    _log(
+                        f"NOTE: fresh test entry (<1h) may belong to a "
+                        f"concurrent session: {p}"
+                    )
+            except Exception:
+                pass
 
         if cat == "temp":
             re_cat = guess_category(p)
