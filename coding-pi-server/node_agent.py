@@ -16,6 +16,7 @@ import hmac
 import json
 import logging
 import os
+import random
 import subprocess
 import sys
 import time
@@ -315,8 +316,18 @@ async def reverse_tunnel_loop(supervisor: PiNodeSupervisor) -> None:
     import websockets
 
     logger = logging.getLogger("coding-pi-node-agent")
+
+    # Reconnect budget: a fixed 5s retry turned every coordinator restart
+    # into a 503 reconnect storm (all clients reconnect at once, the
+    # coordinator stays saturated, the storm self-sustains). Exponential
+    # backoff with jitter spreads retries out; the budget resets after a
+    # connection stayed healthy for a while.
+    backoff_seconds = 5.0
+    healthy_uptime_seconds = 0.0
     while True:
         tasks: set[asyncio.Task[None]] = set()
+        connected_at = None
+        replaced = False
         collab_sockets: dict[str, Any] = {}
         try:
             token = os.environ.get("CODING_PI_COORDINATOR_TOKEN", "").strip()
@@ -328,6 +339,7 @@ async def reverse_tunnel_loop(supervisor: PiNodeSupervisor) -> None:
                 ping_interval=20,
                 ping_timeout=20,
             ) as websocket:
+                connected_at = asyncio.get_running_loop().time()
                 await websocket.send(json.dumps({"type": "hello", "node_id": tunnel_record()["node_id"], "record": tunnel_record()}))
                 hello = json.loads(await asyncio.wait_for(websocket.recv(), timeout=15))
                 if not isinstance(hello, dict) or hello.get("type") != "hello_ack":
@@ -362,13 +374,34 @@ async def reverse_tunnel_loop(supervisor: PiNodeSupervisor) -> None:
                 task.cancel()
             raise
         except Exception as exc:
-            logger.warning("Pi coordinator tunnel unavailable: %s", exc)
+            replaced = "replaced" in str(exc) or getattr(exc, "code", None) == 4000
+            logger.warning(
+                "Pi coordinator tunnel unavailable: %s%s",
+                exc,
+                " (replaced by a newer connection)" if replaced else "",
+            )
         finally:
             for task in tasks:
                 task.cancel()
             if tasks:
                 await asyncio.gather(*tasks, return_exceptions=True)
-        await asyncio.sleep(5)
+        # Backoff with jitter. Close code 4000 means the coordinator
+        # replaced this connection with a newer one for the same node_id
+        # (duplicate agent process / same-id second worker): reconnecting
+        # immediately would displace THAT connection and the two agents
+        # flip-flop every few seconds, failing all in-flight requests each
+        # time. Back off much longer when replaced, and let a healthy
+        # connection reset the budget.
+        if connected_at is not None:
+            healthy_uptime_seconds = asyncio.get_running_loop().time() - connected_at
+        if healthy_uptime_seconds >= 60.0:
+            backoff_seconds = 5.0
+            healthy_uptime_seconds = 0.0
+        base_wait = max(backoff_seconds, 60.0) if replaced else backoff_seconds
+        wait = base_wait * random.uniform(0.75, 1.25)
+        backoff_seconds = min(backoff_seconds * 2.0, 300.0)
+        logger.info("Pi coordinator tunnel reconnect in %.1fs", wait)
+        await asyncio.sleep(wait)
 
 
 def build_app(supervisor: PiNodeSupervisor) -> FastAPI:

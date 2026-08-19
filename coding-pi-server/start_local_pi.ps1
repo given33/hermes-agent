@@ -2,7 +2,7 @@ param(
   [string]$Python = "$env:LOCALAPPDATA\Programs\Python\Python311\python.exe",
   [string]$SourceRoot = "$env:LOCALAPPDATA\hermes\coding-pi\source-private",
   [string]$RuntimeHome = "$env:LOCALAPPDATA\hermes\coding-pi\standalone-runtime",
-  [string]$Workspace = "C:\Users\given\hermes-audit\hermes-v20-release",
+  [string]$Workspace = "",
   [string]$NodeId = "local-pc",
   [string]$CoordinatorUrl = ""
 )
@@ -12,6 +12,7 @@ if (-not $CoordinatorUrl -and $env:CODING_PI_COORDINATOR_URL) {
   $CoordinatorUrl = $env:CODING_PI_COORDINATOR_URL
 }
 $releaseRoot = (Resolve-Path (Join-Path $PSScriptRoot "..")).Path
+$Workspace = if ($Workspace) { (Resolve-Path -LiteralPath $Workspace).Path } else { $releaseRoot }
 $serviceScript = Join-Path $PSScriptRoot "standalone_server.py"
 $agentScript = Join-Path $PSScriptRoot "node_agent.py"
 $bun = Join-Path $env:USERPROFILE ".bun\bin\bun.exe"
@@ -33,6 +34,14 @@ $env:CODING_PI_NODE_SERVICE_ORIGIN = "http://127.0.0.1:8787"
 $env:CODING_PI_PUBLIC_HOST = "auto"
 $env:CODING_PI_COORDINATOR_URL = $CoordinatorUrl
 
+# Both the LAN-facing node supervisor and the Pi HTTP service must have an
+# explicit bearer secret. Do not silently start an unauthenticated code/
+# workspace endpoint from a scheduled task.
+if (-not $env:CODING_PI_SERVER_TOKEN) {
+  throw "Set CODING_PI_SERVER_TOKEN before starting the local Pi node"
+}
+$env:CODING_PI_NODE_AGENT_TOKEN = if ($env:CODING_PI_NODE_AGENT_TOKEN) { $env:CODING_PI_NODE_AGENT_TOKEN } else { $env:CODING_PI_SERVER_TOKEN }
+
 # The API key is intentionally not embedded in this script or a scheduled-task
 # argument. The optional setup helper stores it as a Windows-user DPAPI blob.
 $secretPath = Join-Path $RuntimeHome "secrets\DEEPSEEK_API_KEY.dpapi"
@@ -49,7 +58,7 @@ if (Test-Path -LiteralPath $secretPath) {
   }
 }
 $serviceArgs = @(
-  "--host", "0.0.0.0",
+  "--host", "127.0.0.1",
   "--port", "8787",
   "--root", $SourceRoot,
   "--repository", $repository,
@@ -72,7 +81,7 @@ if ($CoordinatorUrl) {
 }
 
 $agentArgs = @(
-  "--host", "0.0.0.0",
+  "--host", "127.0.0.1",
   "--port", "8786",
   "--python", $Python,
   "--script", $serviceScript,
@@ -82,5 +91,15 @@ foreach ($argument in $serviceArgs) {
   $agentArgs += "--service-arg=$argument"
 }
 
-& $Python $agentScript @agentArgs
+# PS 5.1 + ErrorActionPreference=Stop turns the agent's stderr INFO lines
+# (uvicorn banner) into terminating errors that killed the wrapper right
+# after startup — the task exited with code 3 while an orphaned service
+# lingered. Redirect stderr to a rotating log instead; it doubles as the
+# node agent's log output.
+$agentStderrLog = Join-Path $RuntimeHome "node-agent.err.log"
+if (Test-Path -LiteralPath $agentStderrLog) {
+  Remove-Item -LiteralPath $agentStderrLog -Force -ErrorAction SilentlyContinue
+}
+$ErrorActionPreference = 'Continue'
+& $Python $agentScript @agentArgs 2> "$agentStderrLog"
 exit $LASTEXITCODE

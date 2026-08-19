@@ -23,7 +23,7 @@ import secrets
 import socket
 import struct
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Awaitable, Callable
 from urllib.parse import urlparse
@@ -244,6 +244,9 @@ def public_collab_metadata(collab: dict[str, Any] | None) -> dict[str, Any] | No
     }
 
 
+_PEER_OUTBOUND_QUEUE_LIMIT = 64
+
+
 @dataclass
 class _Peer:
     websocket: WebSocket
@@ -251,6 +254,16 @@ class _Peer:
     name: str
     can_write: bool
     send_lock: asyncio.Lock
+    # Bounded outbound queue drained by a per-peer sender task. A slow or
+    # stalled client (weak mobile network, backgrounded app no longer
+    # reading its socket) used to park `websocket.send_bytes` under
+    # send_lock, which froze broadcast -> _publish -> the RPC stdout pump
+    # -> SSE and every other client. Slow peers now lag at most one queue
+    # before being dropped instead of freezing the session pipeline.
+    outbound: "asyncio.Queue[bytes | None]" = field(
+        default_factory=lambda: asyncio.Queue(maxsize=_PEER_OUTBOUND_QUEUE_LIMIT)
+    )
+    sender: "asyncio.Task[None] | None" = None
 
 
 class PiCollabBridge:
@@ -265,7 +278,9 @@ class PiCollabBridge:
         self._next_peer_id = 1
         self._peer_lock = asyncio.Lock()
         self._state_refresh_task: asyncio.Task[None] | None = None
-        self._state_refresh_lock = asyncio.Lock()
+        self._state_refresh_lock: asyncio.Lock()
+        self._entries_refresh_task: asyncio.Task[None] | None = None
+        self._entries_refresh_lock: asyncio.Lock()
         self._entries: list[dict[str, Any]] = []
         self._entry_ids: set[str] = set()
         self._header: dict[str, Any] | None = None
@@ -312,7 +327,10 @@ class PiCollabBridge:
         event = self._to_wire_event(frame)
         if event is not None:
             await self.broadcast({"t": "event", "event": event})
-            await self._refresh_entries(emit=True)
+            # Debounced: streaming emits many frames per second, and each
+            # refresh re-reads and re-parses the whole session .jsonl —
+            # doing it per frame saturated the loop on long sessions.
+            self._schedule_entries_refresh()
             if frame_type in {
                 "agent_start",
                 "agent_end",
@@ -475,6 +493,17 @@ class PiCollabBridge:
     def _schedule_state_refresh(self) -> None:
         if self._state_refresh_task is None or self._state_refresh_task.done():
             self._state_refresh_task = asyncio.create_task(self._refresh_state())
+
+    def _schedule_entries_refresh(self, delay: float = 0.25) -> None:
+        """Coalesce entry refreshes during streaming bursts into one pass."""
+
+        async def refresh() -> None:
+            await asyncio.sleep(delay)
+            async with self._entries_refresh_lock:
+                await self._refresh_entries(emit=True)
+
+        if self._entries_refresh_task is None or self._entries_refresh_task.done():
+            self._entries_refresh_task = asyncio.create_task(refresh())
 
     async def _refresh_state(self) -> None:
         async with self._state_refresh_lock:
@@ -701,8 +730,41 @@ class PiCollabBridge:
 
     async def _send(self, peer: _Peer, frame: dict[str, Any]) -> None:
         payload = _pack(0, _sealed(self.key, frame))
-        async with peer.send_lock:
-            await peer.websocket.send_bytes(payload)
+        try:
+            peer.outbound.put_nowait(payload)
+        except asyncio.QueueFull:
+            # This peer is at least a full queue behind the session. Drop it
+            # rather than block the publishing pipeline (which used to
+            # freeze every client behind one stalled phone).
+            self._peers.pop(peer.peer_id, None)
+            raise RuntimeError(f"collab peer {peer.peer_id} outbound queue overflow")
+
+    def _start_peer_sender(self, peer: _Peer) -> None:
+        if peer.sender is not None and not peer.sender.done():
+            return
+
+        async def _sender_loop() -> None:
+            while True:
+                payload = await peer.outbound.get()
+                if payload is None:
+                    return
+                try:
+                    async with peer.send_lock:
+                        await peer.websocket.send_bytes(payload)
+                except Exception:
+                    self._peers.pop(peer.peer_id, None)
+                    return
+
+        peer.sender = asyncio.create_task(_sender_loop())
+
+    def _stop_peer_sender(self, peer: _Peer) -> None:
+        sender = peer.sender
+        peer.sender = None
+        if sender is not None and not sender.done():
+            try:
+                peer.outbound.put_nowait(None)
+            except asyncio.QueueFull:
+                sender.cancel()
 
     async def broadcast(self, frame: dict[str, Any]) -> None:
         for peer in tuple(self._peers.values()):
@@ -717,6 +779,7 @@ class PiCollabBridge:
             peer = _Peer(websocket, self._next_peer_id, f"guest-{self._next_peer_id}", False, asyncio.Lock())
             self._next_peer_id += 1
             self._peers[peer.peer_id] = peer
+        self._start_peer_sender(peer)
         try:
             while True:
                 message = await websocket.receive()
@@ -737,6 +800,7 @@ class PiCollabBridge:
         except Exception:
             pass
         finally:
+            self._stop_peer_sender(peer)
             self._peers.pop(peer.peer_id, None)
             with_context = self._build_state()
             await self.broadcast({"t": "state", "state": with_context})
