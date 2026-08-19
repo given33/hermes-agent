@@ -176,6 +176,15 @@ _EMPTY_DIR_PROTECTED_TOP_LEVEL = frozenset({
     # User-authored project trees — never sweep empty directories
     # inside these (#75403).
     "patches", "projects", "skins", "themes", "contributors",
+    # Durable state trees referenced throughout the codebase — sweeping
+    # empty subdirectories here breaks existence probes and managed
+    # installations (audit: the curated list could never keep up with the
+    # real HERMES_HOME layout).
+    "checkpoints", "state", "plugin-data", "gateway", "dashboard",
+    "runtime", "telemetry", "session-exports", "profile-exports",
+    "pastes", "hooks", "lsp", "mcp-installs", "spawn-trees",
+    "terminal-sessions", "sandboxes", "collaboration", "workspace",
+    "browser_screenshots", "chrome-debug", "moa-traces",
 })
 
 _EMPTY_DIR_SWEEP_PRUNE_DIRS = frozenset({
