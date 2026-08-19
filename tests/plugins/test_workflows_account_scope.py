@@ -174,3 +174,43 @@ def test_legacy_generation_rows_rekey_once_to_live_generation(tmp_path, monkeypa
     plugin_api._scope(_request("alice", "acctgen-newera"), "default")
     assert store.list_definitions(WorkflowScope("alice", "acctgen-live", "default"))
     assert store.list_definitions(WorkflowScope("alice", "acctgen-newera", "default")) == []
+
+
+def test_legacy_generation_conflict_migrates_per_row_and_stays_visible(tmp_path):
+    """A UNIQUE collision must not strand the rest of the legacy era."""
+    store = WorkflowStore(tmp_path / "workflows.db", audit_key=b"a" * 32)
+    legacy_scope = WorkflowScope("alice", "1", "default")
+    live_scope = WorkflowScope("alice", "acctgen-live", "default")
+    store.create_definition(legacy_scope, name="shared", description="", spec=_spec(), idempotency_key="k1")
+    store.create_definition(legacy_scope, name="only-legacy", description="", spec=_spec(), idempotency_key="k2")
+    # The live era re-created "shared": rekeying it would collide on
+    # UNIQUE(account_id, account_generation, profile_id, name).
+    store.create_definition(live_scope, name="shared", description="", spec=_spec(), idempotency_key="k3")
+
+    # The bulk rekey raises IntegrityError; the fallback moves what fits.
+    with pytest.raises(sqlite3.IntegrityError):
+        store.rekey_account_generation("alice", "1", "acctgen-live")
+    moved, conflicts = store.rekey_account_generation_per_row("alice", "1", "acctgen-live")
+
+    assert moved >= 1
+    assert conflicts == [
+        {
+            "table": "workflow_definitions",
+            "key": "default/shared",
+            "detail": "definition 'shared' already exists in the live generation",
+        }
+    ]
+    store.mark_legacy_generation_migration_partial("alice", conflicts)
+
+    # Partial counts as done (no per-request retries) but is distinguishable.
+    assert store.legacy_generation_migration_done("alice") is True
+    status = store.legacy_generation_migration_status("alice")
+    assert status["status"] == "partial"
+    assert status["conflicts"][0]["key"] == "default/shared"
+
+    # The non-conflicting legacy row reached the live era...
+    live_names = {d["name"] for d in store.list_definitions(live_scope)}
+    assert "only-legacy" in live_names
+    # ...while the conflicted workflow stays visible and flagged.
+    conflict_defs = store.legacy_conflict_definitions("alice")
+    assert [d["name"] for d in conflict_defs] == ["shared"]

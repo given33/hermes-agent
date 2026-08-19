@@ -1255,8 +1255,17 @@ class AccountWriteApprovalStore:
         subsystem: str,
         pending_dir: Path,
     ) -> int:
-        """Bind legacy JSON records to one explicit owner/profile exactly once."""
+        """Bind legacy JSON records to one explicit owner/profile exactly once.
 
+        Legacy pending/*.json files carry no owner or generation, and the
+        per-generation DB marker dies with the account's era: after a delete
+        + re-register of the same public owner id the marker table starts
+        empty and the same files would be re-imported ("reviving" deleted
+        approvals). A sidecar marker next to each consumed file binds it to
+        the ORIGINAL owner across eras: nobody re-imports a file another era
+        already consumed, and account cleanup can delete exactly the files
+        this owner owns.
+        """
         owner, profile_name = self._scope(owner_id, profile)
         if subsystem not in {"memory", "skills"}:
             raise ValueError("unsupported write approval subsystem")
@@ -1265,7 +1274,14 @@ class AccountWriteApprovalStore:
             return 0
         migrated = 0
         for path in sorted(directory.glob("*.json")):
+            if path.name.endswith(".migrated.json"):
+                continue
             source = str(path.resolve())
+            sidecar = path.with_name(path.name + ".migrated.json")
+            if sidecar.exists():
+                # Consumed once by its original owner — never re-import,
+                # not even under a new account era of the same user id.
+                continue
             with self._lock, self._connect() as conn:
                 seen = conn.execute(
                     "SELECT 1 FROM account_write_approval_migrations "
@@ -1314,6 +1330,68 @@ class AccountWriteApprovalStore:
                         "owner_id,profile,subsystem,source_path,migrated_at) VALUES(?,?,?,?,?)",
                         (owner, profile_name, subsystem, source, time.time()),
                     )
+                # Sidecar LAST: it is only written once the DB marker
+                # committed, so an interrupted migration retries cleanly.
+                try:
+                    sidecar.write_text(
+                        json.dumps(
+                            {
+                                "schema": "hermes.legacy-approval-migration.v1",
+                                "owner_id": str(owner_id),
+                                "account_generation": str(
+                                    self._live_generation_for(owner_id)
+                                ),
+                                "source_path": source,
+                                "migrated_at": time.time(),
+                            },
+                            ensure_ascii=False,
+                        ),
+                        encoding="utf-8",
+                    )
+                except OSError:
+                    # The DB marker still fences this era; a missing sidecar
+                    # only loses cross-era protection for this one file.
+                    continue
             except (OSError, ValueError, TypeError, json.JSONDecodeError):
                 continue
         return migrated
+
+    def _live_generation_for(self, owner_id: str) -> str:
+        # Informational only — the sidecar's owner_id is the load-bearing
+        # field; keep this best-effort so migration never fails on it.
+        try:
+            from hermes_cli.dashboard_auth.mobile_device_store import MobileDeviceStore
+
+            return str(MobileDeviceStore().account_generation(str(owner_id or "")) or "")
+        except Exception:
+            return ""
+
+    def legacy_json_sidecars_for_owner(self, owner_id: str) -> list[Path]:
+        """Legacy pending JSON files this owner consumed (via sidecars)."""
+
+        results: list[Path] = []
+        for subsystem in ("memory", "skills"):
+            base = self._legacy_pending_dir(subsystem)
+            if base is None:
+                continue
+            for sidecar in sorted(base.glob("*.json.migrated.json")):
+                try:
+                    decoded = json.loads(sidecar.read_text(encoding="utf-8"))
+                except (OSError, json.JSONDecodeError):
+                    continue
+                if not isinstance(decoded, dict):
+                    continue
+                if str(decoded.get("owner_id") or "") != str(owner_id or ""):
+                    continue
+                source = sidecar.with_name(
+                    sidecar.name[: -len(".migrated.json")]
+                )
+                if source.exists():
+                    results.append(source)
+        return results
+
+    def _legacy_pending_dir(self, subsystem: str):
+        try:
+            return get_hermes_home() / "pending" / subsystem
+        except Exception:
+            return None

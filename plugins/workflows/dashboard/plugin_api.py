@@ -144,16 +144,30 @@ def _migrate_legacy_workflow_generations_for(owner_id: str, live_generation: str
             store.mark_legacy_generation_migrated(owner_id)
         except sqlite3.IntegrityError:
             # UNIQUE collision with rows already written under the live
-            # generation (same definition name / idempotency key): retrying
-            # can never succeed. Record a terminal failure marker so this
-            # account stops paying an exception on every request; both eras
-            # stay readable in place.
-            store.mark_legacy_generation_migration_failed(owner_id)
-            logger.error(
-                "workflow legacy generation rekey hit a UNIQUE conflict for %s; "
-                "legacy rows remain at generation '1'",
-                owner_id,
-            )
+            # generation (same definition name / idempotency key). Fall back
+            # to a per-row migration: move everything that fits, keep the
+            # collided rows visible at the legacy generation, and record a
+            # partial marker — never silently mark the account "done".
+            try:
+                moved, conflicts = store.rekey_account_generation_per_row(
+                    owner_id, "1", live_generation
+                )
+                if conflicts:
+                    store.mark_legacy_generation_migration_partial(owner_id, conflicts)
+                    logger.error(
+                        "workflow legacy generation rekey for %s moved %d row(s); "
+                        "%d conflict(s) stay visible at generation '1'",
+                        owner_id,
+                        moved,
+                        len(conflicts),
+                    )
+                else:
+                    store.mark_legacy_generation_migrated(owner_id)
+            except Exception:
+                logger.exception(
+                    "workflow legacy per-row migration failed for %s", owner_id
+                )
+                store.mark_legacy_generation_migration_failed(owner_id)
         except Exception:
             # A transient failure keeps the marker unset and the legacy rows
             # in place; the next authenticated request retries the migration.
@@ -227,7 +241,22 @@ def health() -> dict[str, Any]:
 @router.get("/definitions")
 def list_definitions(request: Request, profile_id: str = "default"):
     try:
-        return {"definitions": workflow_store().list_definitions(_scope(request, profile_id))}
+        scope = _scope(request, profile_id)
+        definitions = workflow_store().list_definitions(scope)
+        # Surface migration state instead of hiding conflicted legacy
+        # workflows: a partial migration keeps old rows reachable and the
+        # client can show them flagged rather than "vanished".
+        migration = workflow_store().legacy_generation_migration_status(scope.account_id)
+        legacy_conflicts: list[dict] = []
+        if migration.get("status") == "partial":
+            legacy_conflicts = workflow_store().legacy_conflict_definitions(
+                scope.account_id
+            )
+        return {
+            "definitions": definitions,
+            "legacy_migration": migration,
+            "legacy_conflict_definitions": legacy_conflicts,
+        }
     except Exception as exc:
         _raise(exc)
 

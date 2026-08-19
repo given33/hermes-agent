@@ -73,8 +73,16 @@ _GENERATION_TABLES = (
 SCHEMA = r"""
 CREATE TABLE IF NOT EXISTS workflow_schema(version INTEGER NOT NULL);
 CREATE TABLE IF NOT EXISTS workflow_migration_markers(
-    key TEXT PRIMARY KEY,
-    created_at INTEGER NOT NULL
+ key TEXT PRIMARY KEY,
+ created_at INTEGER NOT NULL
+);
+CREATE TABLE IF NOT EXISTS workflow_migration_conflicts(
+ id INTEGER PRIMARY KEY AUTOINCREMENT,
+ account_id TEXT NOT NULL,
+ table_name TEXT NOT NULL,
+ conflict_key TEXT NOT NULL,
+ detail TEXT NOT NULL DEFAULT '',
+ created_at INTEGER NOT NULL
 );
 CREATE TABLE IF NOT EXISTS workflow_account_deletions(
  account_id TEXT NOT NULL, account_generation TEXT NOT NULL, deleted_at INTEGER NOT NULL,
@@ -517,15 +525,91 @@ class WorkflowStore:
         """
         with self.connect() as conn:
             rows = conn.execute(
-                "SELECT 1 FROM workflow_migration_markers WHERE key IN (?, ?)",
+                "SELECT 1 FROM workflow_migration_markers WHERE key IN (?, ?, ?)",
                 (
                     f"legacy_generation_migrated:{str(account_id or '').strip()}",
                     # A terminal IntegrityError failure is equally "done":
                     # the rekey can never succeed and must stop retrying.
                     f"legacy_generation_migrated_failed:{str(account_id or '').strip()}",
+                    # A partial (per-row) migration resolved every conflict
+                    # it could and recorded the rest; retrying is done.
+                    f"legacy_generation_migrated_partial:{str(account_id or '').strip()}",
                 ),
             ).fetchall()
             return bool(rows)
+
+    def legacy_generation_migration_status(self, account_id: str) -> dict:
+        """Terminal migration state for one account, for API surfacing."""
+
+        account_id = str(account_id or "").strip()
+        status = ""
+        with self.connect() as conn:
+            row = conn.execute(
+                "SELECT key FROM workflow_migration_markers WHERE key IN (?, ?, ?)",
+                (
+                    f"legacy_generation_migrated:{account_id}",
+                    f"legacy_generation_migrated_failed:{account_id}",
+                    f"legacy_generation_migrated_partial:{account_id}",
+                ),
+            ).fetchall()
+            keys = {str(item["key"]) for item in row}
+            if f"legacy_generation_migrated_partial:{account_id}" in keys:
+                status = "partial"
+            elif f"legacy_generation_migrated:{account_id}" in keys:
+                status = "done"
+            elif f"legacy_generation_migrated_failed:{account_id}" in keys:
+                status = "failed"
+            conflicts = conn.execute(
+                "SELECT table_name, conflict_key, detail, created_at "
+                "FROM workflow_migration_conflicts WHERE account_id=? "
+                "ORDER BY created_at, id",
+                (account_id,),
+            ).fetchall()
+        return {
+            "status": status,
+            "conflicts": [
+                {
+                    "table": str(item["table_name"]),
+                    "key": str(item["conflict_key"]),
+                    "detail": str(item["detail"] or ""),
+                    "created_at": int(item["created_at"] or 0),
+                }
+                for item in conflicts
+            ],
+        }
+
+    def legacy_conflict_definitions(
+        self,
+        account_id: str,
+        legacy_generation: str = "1",
+    ) -> list[dict]:
+        """Legacy definitions whose (profile, name) already exists live.
+
+        These rows can never be rekeyed (UNIQUE collision with a definition
+        the user re-created in the live era). Listing them flagged keeps the
+        old workflow VISIBLE instead of silently unreachable.
+        """
+        account_id = str(account_id or "").strip()
+        with self.connect() as conn:
+            rows = conn.execute(
+                "SELECT d.profile_id, d.name, d.id, d.updated_at "
+                "FROM workflow_definitions d "
+                "WHERE d.account_id=? AND d.account_generation=? "
+                "AND EXISTS (SELECT 1 FROM workflow_definitions live "
+                " WHERE live.account_id=d.account_id "
+                " AND live.account_generation<>d.account_generation "
+                " AND live.profile_id=d.profile_id AND live.name=d.name)",
+                (account_id, legacy_generation),
+            ).fetchall()
+            return [
+                {
+                    "id": str(row["id"]),
+                    "profile_id": str(row["profile_id"]),
+                    "name": str(row["name"]),
+                    "updated_at": int(row["updated_at"] or 0),
+                }
+                for row in rows
+            ]
 
     def mark_legacy_generation_migration_failed(self, account_id: str) -> None:
         """Record a terminal rekey failure so it stops retrying per request.
@@ -550,6 +634,108 @@ class WorkflowStore:
                 "VALUES (?, strftime('%s','now'))",
                 (f"legacy_generation_migrated:{str(account_id or '').strip()}",),
             )
+
+    def mark_legacy_generation_migration_partial(
+        self,
+        account_id: str,
+        conflicts: list[dict],
+    ) -> None:
+        """Record a per-row migration outcome: moved what fit, kept the rest.
+
+        Conflict rows stay at the legacy generation but remain visible via
+        legacy_conflict_definitions(); the marker stops per-request retries
+        without pretending the account migrated cleanly.
+        """
+        account_id = str(account_id or "").strip()
+        with self.transaction() as conn:
+            conn.execute(
+                "INSERT OR REPLACE INTO workflow_migration_markers(key, created_at) "
+                "VALUES (?, strftime('%s','now'))",
+                (f"legacy_generation_migrated_partial:{account_id}",),
+            )
+            conn.execute(
+                "DELETE FROM workflow_migration_conflicts WHERE account_id=?",
+                (account_id,),
+            )
+            for conflict in conflicts:
+                conn.execute(
+                    "INSERT INTO workflow_migration_conflicts"
+                    "(account_id, table_name, conflict_key, detail, created_at) "
+                    "VALUES (?, ?, ?, ?, strftime('%s','now'))",
+                    (
+                        account_id,
+                        str(conflict.get("table") or ""),
+                        str(conflict.get("key") or ""),
+                        str(conflict.get("detail") or "")[:2000],
+                    ),
+                )
+
+    def rekey_account_generation_per_row(
+        self,
+        account_id: str,
+        from_generation: str,
+        to_generation: str,
+    ) -> tuple[int, list[dict]]:
+        """Row-by-row rekey fallback after a bulk UNIQUE collision.
+
+        Every row migrates inside its own SAVEPOINT: a collision rolls that
+        row back alone, everything else moves. Returns (moved, conflicts).
+        """
+        from_generation = str(from_generation or "").strip()
+        to_generation = str(to_generation or "").strip()
+        account_id = str(account_id or "").strip()
+        if not from_generation or not to_generation or from_generation == to_generation:
+            raise ValueError("rekey requires distinct non-empty generations")
+        moved = 0
+        conflicts: list[dict] = []
+        with self.transaction() as conn:
+            tombstone = conn.execute(
+                "SELECT 1 FROM workflow_account_deletions "
+                "WHERE account_id=? AND account_generation=?",
+                (account_id, from_generation),
+            ).fetchone()
+            if tombstone is not None:
+                return 0, []
+            for table in _GENERATION_TABLES:
+                if table == "workflow_account_deletions":
+                    continue
+                rows = conn.execute(
+                    f"SELECT rowid, {table}.* FROM {table} "
+                    "WHERE account_id=? AND account_generation=?",
+                    (account_id, from_generation),
+                ).fetchall()
+                for row in rows:
+                    conn.execute("SAVEPOINT rekey_row")
+                    try:
+                        cursor = conn.execute(
+                            f"UPDATE {table} SET account_generation=? WHERE rowid=?",
+                            (to_generation, row["rowid"]),
+                        )
+                        moved += cursor.rowcount if cursor.rowcount > 0 else 0
+                        conn.execute("RELEASE SAVEPOINT rekey_row")
+                    except sqlite3.IntegrityError:
+                        conn.execute("ROLLBACK TO SAVEPOINT rekey_row")
+                        conn.execute("RELEASE SAVEPOINT rekey_row")
+                        if table == "workflow_definitions":
+                            conflicts.append(
+                                {
+                                    "table": table,
+                                    "key": f"{row['profile_id']}/{row['name']}",
+                                    "detail": (
+                                        f"definition '{row['name']}' already exists "
+                                        "in the live generation"
+                                    ),
+                                }
+                            )
+                        else:
+                            conflicts.append(
+                                {
+                                    "table": table,
+                                    "key": f"rowid:{row['rowid']}",
+                                    "detail": "unique-key collision with a live-era row",
+                                }
+                            )
+        return moved, conflicts
 
     def legacy_generation_accounts(self, legacy_generation: str = "1") -> list[str]:
         """Distinct account ids that still own pre-fence generation rows."""

@@ -22,6 +22,7 @@ enforced only in SQL — the file landed at the default umask.
 
 from __future__ import annotations
 
+import json
 import os
 import sqlite3
 import stat
@@ -319,3 +320,110 @@ class TestDatabasePermissions:
         finally:
             conn.close()
         assert "attacker.example" in raw
+
+
+class TestLegacyJsonSidecarIsolation:
+    """Cross-era isolation for owner-less legacy pending/*.json files."""
+
+    def _write_legacy_file(self, pending_dir, name="legacy-1.json"):
+        pending_dir.mkdir(parents=True, exist_ok=True)
+        path = pending_dir / name
+        path.write_text(
+            json.dumps(
+                {
+                    "id": "legacy-approval-1",
+                    "summary": "legacy write",
+                    "origin": "foreground",
+                    "payload": {"action": "memory.write", "content": "x"},
+                }
+            ),
+            encoding="utf-8",
+        )
+        return path
+
+    def test_sidecar_prevents_reimport_after_reregistration(self, tmp_path, monkeypatch):
+        import pathlib
+
+        store = AccountWriteApprovalStore(db_path=tmp_path / "write-approvals.db")
+        pending_dir = tmp_path / "pending" / "memory"
+        legacy = self._write_legacy_file(pending_dir)
+        monkeypatch.setattr(
+            "hermes_cli.account_write_approvals.get_hermes_home",
+            lambda: pathlib.Path(tmp_path),
+        )
+        # Silence the informational live-generation lookup.
+        monkeypatch.setattr(
+            store,
+            "_live_generation_for",
+            lambda _owner_id: "gen-1",
+        )
+
+        first = store.migrate_legacy_json(
+            owner_id="owner-a",
+            profile="default",
+            subsystem="memory",
+            pending_dir=pending_dir,
+        )
+        assert first == 1
+        sidecar = pending_dir / "legacy-1.json.migrated.json"
+        assert sidecar.exists()
+
+        # A NEW era of the same public owner id (delete + re-register wiped
+        # the per-generation DB markers): the sidecar must block re-import.
+        fresh_store = AccountWriteApprovalStore(
+            db_path=tmp_path / "era2" / "write-approvals.db"
+        )
+        monkeypatch.setattr(
+            fresh_store,
+            "_live_generation_for",
+            lambda _owner_id: "gen-2",
+        )
+        revived = fresh_store.migrate_legacy_json(
+            owner_id="owner-a",
+            profile="default",
+            subsystem="memory",
+            pending_dir=pending_dir,
+        )
+        assert revived == 0
+        rows = fresh_store.list(owner_id="owner-a", profile="default", subsystem="memory")
+        assert rows == []
+
+    def test_account_cleanup_deletes_sidecar_owned_legacy_files(self, tmp_path, monkeypatch):
+        import pathlib
+
+        store = AccountWriteApprovalStore(db_path=tmp_path / "write-approvals.db")
+        pending_dir = tmp_path / "pending" / "memory"
+        legacy = self._write_legacy_file(pending_dir)
+        other = self._write_legacy_file(pending_dir, name="legacy-other.json")
+        monkeypatch.setattr(
+            "hermes_cli.account_write_approvals.get_hermes_home",
+            lambda: pathlib.Path(tmp_path),
+        )
+        monkeypatch.setattr(store, "_live_generation_for", lambda _owner_id: "gen-1")
+
+        store.migrate_legacy_json(
+            owner_id="owner-a",
+            profile="default",
+            subsystem="memory",
+            pending_dir=pending_dir,
+        )
+        # Both files were consumed by owner-a; a hand-stamped sidecar for a
+        # DIFFERENT owner must not leak into owner-a's cleanup set.
+        stranger = self._write_legacy_file(pending_dir, name="legacy-stranger.json")
+        (pending_dir / "legacy-stranger.json.migrated.json").write_text(
+            json.dumps({"schema": "hermes.legacy-approval-migration.v1", "owner_id": "owner-b"}),
+            encoding="utf-8",
+        )
+        owned = store.legacy_json_sidecars_for_owner("owner-a")
+        assert sorted(path.name for path in owned) == [
+            "legacy-1.json",
+            "legacy-other.json",
+        ]
+
+        for path in owned:
+            path.unlink()
+            path.with_name(path.name + ".migrated.json").unlink()
+
+        assert not legacy.exists()
+        assert not other.exists()
+        assert stranger.exists()

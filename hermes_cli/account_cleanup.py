@@ -126,14 +126,31 @@ def purge_owner_operational_state(
     session_branches = {"branch_sessions": 0, "fork_records": 0, "bindings": 0}
     workflows = {"definitions": 0, "runs": 0}
     for root, profile_name in profile_roots:
-        approval_result = AccountWriteApprovalStore(
-            root / "write-approvals.db"
-        ).delete_owner(
+        approval_store = AccountWriteApprovalStore(root / "write-approvals.db")
+        approval_result = approval_store.delete_owner(
             normalized,
             account_generation=generation,
         )
         for key, value in approval_result.items():
             approvals[key] = approvals.get(key, 0) + int(value)
+        # Legacy pending/*.json carry no owner, but the migration sidecars
+        # prove which owner consumed them: delete exactly those files (and
+        # their sidecars) so a re-registered same-id account cannot have the
+        # old era's approvals re-imported ("revived") on first read.
+        try:
+            legacy_files = approval_store.legacy_json_sidecars_for_owner(normalized)
+        except Exception:
+            legacy_files = []
+        for legacy_file in legacy_files:
+            for victim in (
+                legacy_file,
+                legacy_file.with_name(legacy_file.name + ".migrated.json"),
+            ):
+                try:
+                    victim.unlink()
+                    approvals["legacy_files"] = approvals.get("legacy_files", 0) + 1
+                except OSError:
+                    pass
 
         branch_result = AccountSessionFacade(root, profile_name).delete_owner(
             normalized,

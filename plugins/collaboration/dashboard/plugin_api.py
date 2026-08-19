@@ -472,12 +472,18 @@ async def collaboration_dashboard_lifespan(_app):
     artifact_cleanup_task = asyncio.create_task(
         _run_tool_artifact_cleanup_loop(recovery_stop)
     )
+    summary_scheduler_task = asyncio.create_task(
+        _run_room_summary_scheduler_loop(recovery_stop)
+    )
     try:
         yield
     finally:
         recovery_stop.set()
         await asyncio.gather(
-            recovery_task, artifact_cleanup_task, return_exceptions=True
+            recovery_task,
+            artifact_cleanup_task,
+            summary_scheduler_task,
+            return_exceptions=True,
         )
 
 
@@ -17952,46 +17958,72 @@ class CreateRoomBody(BaseModel):
 
 
 class SendMessageBody(BaseModel):
-    content: str
-    profiles: Optional[list[str]] = None
-    request_id: str = ""
-    turn_id: str = ""
+    # Authenticated users must not be able to hand the state lock a
+    # multi-megabyte payload: bound every free-form field like the
+    # enqueue route already does.
+    content: str = Field(max_length=256_000)
+    profiles: Optional[list[str]] = Field(default=None, max_length=64)
+    request_id: str = Field(default="", max_length=256)
+    turn_id: str = Field(default="", max_length=256)
     # Structured mentions: [{"type": "agent"|"all", "participantId": "..."}].
     # Agent mentions route the turn to the targeted room profiles only; an
     # "all" mention (or no mentions at all) addresses every room profile.
-    mentions: Optional[list[dict[str, Any]]] = None
+    mentions: Optional[list[dict[str, Any]]] = Field(default=None, max_length=64)
+
+    @field_validator("mentions")
+    @classmethod
+    def _bound_mentions_size(cls, value: Optional[list[dict[str, Any]]]) -> Optional[list[dict[str, Any]]]:
+        if value is None:
+            return value
+        if len(json.dumps(value, ensure_ascii=False, default=str)) > 64_000:
+            raise ValueError("mentions payload is too large")
+        return value
 
 
 class MailboxMessageBody(BaseModel):
-    sender_id: str
-    recipient_id: str
+    sender_id: str = Field(max_length=256)
+    recipient_id: str = Field(max_length=256)
     body: dict[str, Any] = Field(default_factory=dict)
-    idempotency_key: str = ""
+    idempotency_key: str = Field(default="", max_length=256)
+
+    @field_validator("body")
+    @classmethod
+    def _bound_body_size(cls, value: dict[str, Any]) -> dict[str, Any]:
+        if len(json.dumps(value, ensure_ascii=False, default=str)) > 256_000:
+            raise ValueError("mailbox body payload is too large")
+        return value
 
 
 class DependencyGraphBody(BaseModel):
-    nodes: list[dict[str, Any]] = Field(default_factory=list)
+    nodes: list[dict[str, Any]] = Field(default_factory=list, max_length=2000)
 
 
 class CreateSingleConversationBody(BaseModel):
-    profile: str = "default"
-    client_id: str = ""
-    title: str = "新对话"
+    profile: str = Field(default="default", max_length=128)
+    client_id: str = Field(default="", max_length=256)
+    title: str = Field(default="新对话", max_length=500)
 
 
 class RenameSingleConversationBody(BaseModel):
-    title: str
+    title: str = Field(max_length=500)
 
 
 class AdoptSingleConversationBody(BaseModel):
-    profile: str = "default"
-    session_id: str
-    title: str = "Imported session"
-    messages: list[dict[str, Any]] = Field(default_factory=list)
+    profile: str = Field(default="default", max_length=128)
+    session_id: str = Field(max_length=256)
+    title: str = Field(default="Imported session", max_length=500)
+    messages: list[dict[str, Any]] = Field(default_factory=list, max_length=5000)
+
+    @field_validator("messages")
+    @classmethod
+    def _bound_messages_size(cls, value: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        if len(json.dumps(value, ensure_ascii=False, default=str)) > 2_000_000:
+            raise ValueError("adopted messages payload is too large")
+        return value
 
 
 class SendSingleMessageBody(BaseModel):
-    content: str
+    content: str = Field(max_length=256_000)
 
 
 class RouteMessageBody(BaseModel):
@@ -18002,32 +18034,46 @@ class RouteMessageBody(BaseModel):
 
 
 class RecordMessageBody(BaseModel):
-    role: str
-    name: str
-    content: str
-    status: str = "completed"
-    kind: str = "message"
+    role: str = Field(max_length=64)
+    name: str = Field(max_length=256)
+    content: str = Field(max_length=256_000)
+    status: str = Field(default="completed", max_length=64)
+    kind: str = Field(default="message", max_length=64)
     meta: dict[str, Any] = Field(default_factory=dict)
+
+    @field_validator("meta")
+    @classmethod
+    def _bound_meta_size(cls, value: dict[str, Any]) -> dict[str, Any]:
+        if len(json.dumps(value, ensure_ascii=False, default=str)) > 128_000:
+            raise ValueError("message meta payload is too large")
+        return value
 
 
 class RuntimeSessionBody(BaseModel):
-    profile: str = "default"
-    session_id: str
-    turn_id: str = ""
-    status: str = "running"
+    profile: str = Field(default="default", max_length=128)
+    session_id: str = Field(max_length=256)
+    turn_id: str = Field(default="", max_length=256)
+    status: str = Field(default="running", max_length=64)
 
 
 class HostedTurnBody(BaseModel):
-    turn_id: str
-    content: str
-    title: str = ""
-    profiles: list[str] = Field(default_factory=list)
+    turn_id: str = Field(max_length=256)
+    content: str = Field(max_length=256_000)
+    title: str = Field(default="", max_length=500)
+    profiles: list[str] = Field(default_factory=list, max_length=64)
     artifact_required: bool = False
-    attachment_ids: list[str] = Field(default_factory=list)
-    attachment_context: str = ""
-    delivery_context: str = ""
-    mode: str = "work"
+    attachment_ids: list[str] = Field(default_factory=list, max_length=32)
+    attachment_context: str = Field(default="", max_length=64_000)
+    delivery_context: str = Field(default="", max_length=64_000)
+    mode: str = Field(default="work", max_length=64)
     route_metadata: dict[str, Any] = Field(default_factory=dict)
+
+    @field_validator("route_metadata")
+    @classmethod
+    def _bound_route_metadata_size(cls, value: dict[str, Any]) -> dict[str, Any]:
+        if len(json.dumps(value, ensure_ascii=False, default=str)) > 128_000:
+            raise ValueError("route metadata payload is too large")
+        return value
 
 
 class EnqueueHostedTurnBody(BaseModel):
@@ -20399,6 +20445,64 @@ def _live_hosted_event_stream_frame(
     )
 
 
+def _room_membership_room_id(conversation_id: str, owner_id: str) -> str:
+    """Room id when the caller owns or joined the room linked to this conversation."""
+
+    with _STATE_LOCK:
+        rooms_state = load_state()
+        room = next(
+            (
+                item
+                for item in rooms_state.get("rooms") or []
+                if isinstance(item, dict)
+                and str(item.get("conversation_id") or "") == str(conversation_id)
+            ),
+            None,
+        )
+        if not isinstance(room, dict):
+            return ""
+        if (
+            str(room.get("owner_id") or "") == owner_id
+            or _room_is_member(room, owner_id)
+        ):
+            return str(room.get("id") or "")
+        return ""
+
+
+def _conversation_for_event_reader(
+    state: dict[str, Any],
+    conversation_id: str,
+    owner_id: str,
+    member_room_id: str,
+) -> tuple[dict[str, Any], bool]:
+    """Resolve a conversation for the SSE reader: owner first, room member next.
+
+    Membership is re-verified on every durable read so revoking a member
+    ends their live stream at the next frame boundary instead of leaking a
+    permanent subscription.
+    """
+
+    try:
+        return _owned_conversation_in_state(state, conversation_id, owner_id)
+    except HTTPException as exc:
+        if exc.status_code != 404 or not member_room_id:
+            raise
+        conversation = next(
+            (
+                item
+                for item in state.get("conversations") or []
+                if isinstance(item, dict)
+                and str(item.get("id") or "") == str(conversation_id)
+            ),
+            None,
+        )
+        if not isinstance(conversation, dict):
+            raise
+        if _room_membership_room_id(conversation_id, owner_id) != member_room_id:
+            raise HTTPException(status_code=404, detail="Conversation not found")
+        return conversation, False
+
+
 @router.get("/single/conversations/{conversation_id}/hosted-events")
 async def stream_hosted_conversation_events(
     conversation_id: str,
@@ -20441,15 +20545,28 @@ async def stream_hosted_conversation_events(
     ):
         raise HTTPException(status_code=404, detail="Conversation not found")
     if live_conversation is None:
+        member_room_id = ""
         with _STATE_LOCK:
             state = load_single_state()
-            _conversation, claimed = _owned_conversation_in_state(
-                state,
-                conversation_id,
-                owner_id,
-            )
+            try:
+                _conversation, claimed = _owned_conversation_in_state(
+                    state,
+                    conversation_id,
+                    owner_id,
+                )
+            except HTTPException as exc:
+                # Room members reach the linked conversation's live stream
+                # without owning it: authorize through room membership.
+                if exc.status_code != 404:
+                    raise
+                member_room_id = _room_membership_room_id(conversation_id, owner_id)
+                if not member_room_id:
+                    raise
+                claimed = False
             if claimed:
                 save_single_state(state)
+    else:
+        member_room_id = ""
 
     async def event_stream():
         revision = _hosted_update_revision(conversation_id)
@@ -20471,10 +20588,11 @@ async def stream_hosted_conversation_events(
         else:
             with _STATE_LOCK:
                 state = _load_single_state_for_event_stream()
-                conversation, _claimed = _owned_conversation_in_state(
+                conversation, _claimed = _conversation_for_event_reader(
                     state,
                     conversation_id,
                     owner_id,
+                    member_room_id,
                 )
                 envelope, has_more_events = _hosted_event_stream_frame(
                     conversation,
@@ -20520,10 +20638,11 @@ async def stream_hosted_conversation_events(
                 else:
                     with _STATE_LOCK:
                         state = _load_single_state_for_event_stream()
-                        conversation, _claimed = _owned_conversation_in_state(
+                        conversation, _claimed = _conversation_for_event_reader(
                             state,
                             conversation_id,
                             owner_id,
+                            member_room_id,
                         )
                         envelope, has_more_events = _hosted_event_stream_frame(
                             conversation,
@@ -20560,10 +20679,11 @@ async def stream_hosted_conversation_events(
             else:
                 with _STATE_LOCK:
                     state = _load_single_state_for_event_stream()
-                    conversation, _claimed = _owned_conversation_in_state(
+                    conversation, _claimed = _conversation_for_event_reader(
                         state,
                         conversation_id,
                         owner_id,
+                        member_room_id,
                     )
                     envelope, has_more_events = _hosted_event_stream_frame(
                         conversation,
@@ -20596,10 +20716,11 @@ async def stream_hosted_conversation_events(
                 else:
                     with _STATE_LOCK:
                         state = _load_single_state_for_event_stream()
-                        conversation, _claimed = _owned_conversation_in_state(
+                        conversation, _claimed = _conversation_for_event_reader(
                             state,
                             conversation_id,
                             owner_id,
+                            member_room_id,
                         )
                         envelope, has_more_events = _hosted_event_stream_frame(
                             conversation,
@@ -22736,18 +22857,25 @@ def get_rooms(request: Request):
             room
             for room in state.get("rooms") or []
             if (
-                str(room.get("owner_id") or "") == owner_id
+                (
+                    str(room.get("owner_id") or "") == owner_id
+                    and str(room.get("account_generation") or "") == account_generation
+                )
                 or _room_is_member(room, owner_id)
             )
-            and str(room.get("account_generation") or "") == account_generation
             and not _room_maps_to_deleting_conversation(room, single_state)
         ]
         # Older room records predate the linked SingleConversation index and
         # kept their transcript directly on the room. Materialize that link
         # while listing so the mobile cache can download the complete history
         # even when the user has never sent a new message in the room.
+        # Member rooms are skipped: the linked conversation belongs to the
+        # room OWNER's era and only the owner may materialize it — the member
+        # path resolves projections by conversation id without ownership.
         migrated = False
         for room in rooms:
+            if str(room.get("owner_id") or "") != owner_id:
+                continue
             _conversation, created = _room_conversation_in_state(
                 room,
                 single_state,
@@ -22807,7 +22935,9 @@ def create_room(payload: CreateRoomBody, request: Request):
                 for key in _ROOM_SETTINGS_FIELDS
                 if key in payload.settings
             }
-        room["members"] = [_room_owner_member(room, owner_id)]
+        room["members"] = [
+            _room_owner_member(room, owner_id, account_generation)
+        ]
         _room_conversation_in_state(
             room,
             single_state,
@@ -22845,12 +22975,17 @@ def get_room(room_id: str, request: Request):
         single_state = load_single_state()
         if _room_maps_to_deleting_conversation(room, single_state):
             raise HTTPException(status_code=404, detail="Room not found")
-        _conversation, migrated = _room_conversation_in_state(
-            room,
-            single_state,
-            owner_id,
-            account_generation,
-        )
+        migrated = False
+        if str(room.get("owner_id") or "") == owner_id:
+            _conversation, migrated = _room_conversation_in_state(
+                room,
+                single_state,
+                owner_id,
+                account_generation,
+            )
+        # Members never materialize the owner's linked conversation: they
+        # read the room through projections, which resolve the conversation
+        # by id without an ownership or generation fence.
         if migrated:
             save_single_state(single_state)
             save_state(state)
@@ -23373,15 +23508,25 @@ def _generate_room_invite_code() -> str:
     return "".join(secrets.choice(_ROOM_INVITE_CODE_ALPHABET) for _ in range(10))
 
 
-def _room_owner_member(room: dict[str, Any], owner_id: str) -> dict[str, Any]:
+def _room_owner_member(
+    room: dict[str, Any],
+    owner_id: str,
+    account_generation: str = "",
+) -> dict[str, Any]:
     now = int(time.time() * 1000)
-    return {
+    member: dict[str, Any] = {
         "id": f"member-owner-{owner_id}",
         "user_id": owner_id,
         "name": "Owner",
         "role": "owner",
         "joined_at": int(room.get("created_at") or now),
     }
+    # Bind the membership to the era that created it so later deletion or
+    # re-registration of the same public user id can never be confused with
+    # this membership (B4: memberships must not silently cross eras).
+    if str(account_generation or "").strip():
+        member["account_generation"] = str(account_generation).strip()
+    return member
 
 
 def _room_members(room: dict[str, Any], owner_id: str) -> list[dict[str, Any]]:
@@ -23580,7 +23725,15 @@ def _room_workspace_root(room: dict[str, Any]) -> Path:
 def _room_workspace_child(room: dict[str, Any], relative: str, *, allow_root: bool = False) -> Path:
     root = _room_workspace_root(room)
     cleaned = str(relative or "").strip().replace("\\", "/").lstrip("/")
-    parts = [part for part in cleaned.split("/") if part not in {"", ".", ".."}]
+    # Reject traversal instead of silently stripping it: `a/../b` must NOT be
+    # quietly rewritten to `a/b` — the caller believes they addressed one
+    # path while the operation touched another.
+    if ".." in cleaned.split("/"):
+        raise HTTPException(
+            status_code=422,
+            detail="Workspace path must not contain '..'",
+        )
+    parts = [part for part in cleaned.split("/") if part not in {"", "."}]
     if not parts:
         if allow_root:
             return root
@@ -23592,6 +23745,45 @@ def _room_workspace_child(room: dict[str, Any], relative: str, *, allow_root: bo
         return _contained_storage_path(root, *parts)
     except ValueError as exc:
         raise HTTPException(status_code=400, detail="Invalid workspace path") from exc
+
+
+# Workspace tree operations are owner-triggered and unbounded by default:
+# repeated deep copies could exhaust disk or hold worker threads forever.
+_WORKSPACE_TREE_MAX_BYTES = 256 * 1024 * 1024
+_WORKSPACE_TREE_MAX_FILES = 20_000
+
+
+def _assert_workspace_tree_bounds(source: Path) -> None:
+    """Bound copy/move sources by total bytes and file count (413 on breach)."""
+
+    total_bytes = 0
+    total_files = 0
+    if source.is_file():
+        total_bytes = source.stat().st_size
+        total_files = 1
+    else:
+        for child in source.rglob("*"):
+            total_files += 1
+            if total_files > _WORKSPACE_TREE_MAX_FILES:
+                raise HTTPException(
+                    status_code=413,
+                    detail="Workspace operation exceeds the file-count limit",
+                )
+            if child.is_file():
+                try:
+                    total_bytes += child.stat().st_size
+                except OSError:
+                    total_bytes += 1
+            if total_bytes > _WORKSPACE_TREE_MAX_BYTES:
+                raise HTTPException(
+                    status_code=413,
+                    detail="Workspace operation exceeds the total-size limit",
+                )
+    if total_files > _WORKSPACE_TREE_MAX_FILES or total_bytes > _WORKSPACE_TREE_MAX_BYTES:
+        raise HTTPException(
+            status_code=413,
+            detail="Workspace operation exceeds resource limits",
+        )
 
 
 def _workspace_listing(target: Path, listing_path: str = "") -> dict[str, Any]:
@@ -24000,6 +24192,7 @@ def join_room_by_code(payload: RoomJoinBody, request: Request):
                     "name": "Member",
                     "role": "member",
                     "joined_at": int(time.time() * 1000),
+                    "account_generation": account_generation,
                 }
             )
             _touch_room(room)
@@ -24350,6 +24543,90 @@ def _summarize_room_async(
     thread.start()
 
 
+_ROOM_SUMMARY_SCHEDULER_INTERVAL_SECONDS = 120.0
+_ROOM_SUMMARY_SCHEDULER_MAX_PER_CYCLE = 8
+
+
+def _dispatch_due_room_summaries() -> int:
+    """Dispatch single-flight summarizers for every due room, server-side.
+
+    The client-driven dispatch (GET /rooms/{id}/summary) only fires while
+    someone is polling; this scheduler keeps rooms fresh with no client
+    attached. The due-check reads a state snapshot; the worker re-validates
+    ownership under the lock before summarizing.
+    """
+
+    logger = logging.getLogger(__name__)
+    try:
+        with _STATE_LOCK:
+            state = load_state()
+            single_state = load_single_state()
+            rooms = [
+                room
+                for room in state.get("rooms") or []
+                if isinstance(room, dict)
+            ]
+            conversations = [
+                conversation
+                for conversation in single_state.get("conversations") or []
+                if isinstance(conversation, dict)
+            ]
+    except Exception:
+        logger.exception("room summary scheduler failed to read state")
+        return 0
+    dispatched = 0
+    for room in rooms:
+        if dispatched >= _ROOM_SUMMARY_SCHEDULER_MAX_PER_CYCLE:
+            break
+        conversation_id = str(room.get("conversation_id") or "").strip()
+        room_id = str(room.get("id") or "").strip()
+        if not conversation_id or not room_id:
+            continue
+        conversation = next(
+            (
+                item
+                for item in conversations
+                if str(item.get("id") or "") == conversation_id
+            ),
+            None,
+        )
+        if conversation is None or conversation.get("delete_requested"):
+            continue
+        try:
+            if not _room_summary_due(room, conversation):
+                continue
+        except Exception:
+            continue
+        _summarize_room_async(
+            room_id,
+            conversation_id,
+            str(room.get("owner_id") or LOCAL_OWNER_ID),
+            str(room.get("account_generation") or ""),
+        )
+        dispatched += 1
+    return dispatched
+
+
+async def _run_room_summary_scheduler_loop(stop: asyncio.Event) -> None:
+    """Keep due room summaries flowing without a polling client."""
+
+    logger = logging.getLogger(__name__)
+    while not stop.is_set():
+        try:
+            count = await asyncio.to_thread(_dispatch_due_room_summaries)
+            if count:
+                logger.info("room summary scheduler dispatched %d room(s)", count)
+        except Exception:
+            logger.exception("room summary scheduler cycle failed")
+        try:
+            await asyncio.wait_for(
+                stop.wait(),
+                timeout=_ROOM_SUMMARY_SCHEDULER_INTERVAL_SECONDS,
+            )
+        except asyncio.TimeoutError:
+            continue
+
+
 @router.get("/rooms/{room_id}/summary")
 def get_room_summary(room_id: str, request: Request):
     owner_id = owner_id_from_request(request)
@@ -24612,6 +24889,10 @@ def rename_room_workspace_path(room_id: str, payload: RoomWorkspaceTwoPathBody, 
         destination = _room_workspace_child(room, payload.new_path)
     if not source.exists():
         raise HTTPException(status_code=404, detail="Workspace path not found")
+    if destination == source or destination.is_relative_to(source):
+        # Moving a directory into its own subtree is unrecoverable.
+        raise HTTPException(status_code=422, detail="Cannot move a workspace directory into itself")
+    _assert_workspace_tree_bounds(source)
     try:
         destination.parent.mkdir(parents=True, exist_ok=True)
         shutil.move(str(source), str(destination))
@@ -24631,6 +24912,11 @@ def copy_room_workspace_path(room_id: str, payload: RoomWorkspaceTwoPathBody, re
         destination = _room_workspace_child(room, payload.destination_path or payload.new_path)
     if not source.exists():
         raise HTTPException(status_code=404, detail="Workspace path not found")
+    if destination == source or destination.is_relative_to(source):
+        # copytree(dir, dir/subdir, dirs_exist_ok=True) self-amplifies until
+        # the disk fills or the path-length limit blows up.
+        raise HTTPException(status_code=422, detail="Cannot copy a workspace directory into itself")
+    _assert_workspace_tree_bounds(source)
     destination.parent.mkdir(parents=True, exist_ok=True)
     if source.is_dir():
         shutil.copytree(source, destination, dirs_exist_ok=True)

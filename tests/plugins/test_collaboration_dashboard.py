@@ -8132,6 +8132,150 @@ class CollaborationDashboardTests(unittest.TestCase):
             module._HOSTED_COMPANION_REGISTRY,
         )
 
+    # --- Cross-account room membership (跨账号房间) -------------------------
+
+    def test_cross_account_member_room_list_detail_join_and_sse_access(self):
+        module = load_module()
+        rooms_state = {"rooms": []}
+        single_state = {"conversations": []}
+        module.load_state = lambda: rooms_state
+        module.save_state = lambda _state: None
+        module.load_single_state = lambda: single_state
+        module.save_single_state = lambda _state: None
+        module._notify_hosted_update = lambda *_args: None
+        module.owner_id_from_request = lambda request: getattr(request, "owner", "owner-a")
+        generations = {"owner-a": "gen-a-1", "owner-b": "gen-b-1"}
+        module._account_generation_for_request = (
+            lambda _request, owner_id: generations.get(str(owner_id), "gen-x")
+        )
+        request_a = SimpleNamespace(owner="owner-a", query_params={})
+        request_b = SimpleNamespace(owner="owner-b", query_params={})
+        # load_module() execs the plugin outside sys.modules, so pydantic
+        # cannot resolve `Any` annotations lazily — rebuild once explicitly.
+        module.CreateRoomBody.model_rebuild(_types_namespace={"Any": Any})
+
+        created = module.create_room(
+            module.CreateRoomBody(
+                name="跨账号房间",
+                profiles=["default"],
+                invite_code="JOINX",
+            ),
+            request_a,
+        )
+        room_id = str(created["room"]["id"])
+        conversation_id = str(created["room"]["conversation_id"])
+        self.assertTrue(conversation_id)
+
+        joined = module.join_room_by_code(
+            module.RoomJoinBody(invite_code="JOINX"),
+            request_b,
+        )
+        self.assertFalse(joined["room"]["can_manage"])
+        joining_member = next(
+            member
+            for member in joined["room"]["members"]
+            if str(member.get("user_id")) == "owner-b"
+        )
+        self.assertEqual(joining_member["account_generation"], "gen-b-1")
+
+        listed_b = module.get_rooms(request_b)
+        listed_ids = [str(item["id"]) for item in listed_b["rooms"]]
+        self.assertIn(room_id, listed_ids)
+        member_projection = next(
+            item for item in listed_b["rooms"] if str(item["id"]) == room_id
+        )
+        self.assertFalse(member_projection["can_manage"])
+
+        detail_b = module.get_room(room_id, request_b)
+        self.assertFalse(detail_b["room"]["can_manage"])
+        self.assertEqual(
+            str(detail_b["room"]["conversation_id"]),
+            conversation_id,
+        )
+
+        # SSE reader authorization: member resolves the owner's conversation
+        # through room membership; strangers cannot; revocation ends access.
+        self.assertEqual(
+            module._room_membership_room_id(conversation_id, "owner-b"),
+            room_id,
+        )
+        self.assertEqual(
+            module._room_membership_room_id(conversation_id, "owner-c"),
+            "",
+        )
+        conversation, claimed = module._conversation_for_event_reader(
+            single_state,
+            conversation_id,
+            "owner-b",
+            room_id,
+        )
+        self.assertEqual(str(conversation["id"]), conversation_id)
+        self.assertFalse(claimed)
+        with self.assertRaises(module.HTTPException):
+            module._conversation_for_event_reader(
+                single_state,
+                conversation_id,
+                "owner-b",
+                "",
+            )
+        with self.assertRaises(module.HTTPException):
+            module._conversation_for_event_reader(
+                single_state,
+                conversation_id,
+                "owner-c",
+                room_id,
+            )
+
+        room_record = next(
+            item for item in rooms_state["rooms"] if str(item.get("id")) == room_id
+        )
+        room_record["members"] = [
+            member
+            for member in room_record.get("members") or []
+            if str(member.get("user_id")) != "owner-b"
+        ]
+        with self.assertRaises(module.HTTPException):
+            module._conversation_for_event_reader(
+                single_state,
+                conversation_id,
+                "owner-b",
+                room_id,
+            )
+        listed_after_revoke = module.get_rooms(request_b)
+        self.assertNotIn(
+            room_id,
+            [str(item["id"]) for item in listed_after_revoke["rooms"]],
+        )
+
+    def test_owner_generation_fence_still_excludes_stale_owner_rooms(self):
+        module = load_module()
+        rooms_state = {
+            "rooms": [
+                {
+                    "id": "room-stale",
+                    "owner_id": "owner-a",
+                    "account_generation": "gen-a-OLD",
+                    "name": "旧代房间",
+                    "members": [],
+                    "conversation_id": "chat_room_stale",
+                }
+            ]
+        }
+        single_state = {"conversations": []}
+        module.load_state = lambda: rooms_state
+        module.save_state = lambda _state: None
+        module.load_single_state = lambda: single_state
+        module.save_single_state = lambda _state: None
+        module.owner_id_from_request = lambda _request: "owner-a"
+        module._account_generation_for_request = lambda _request, _owner_id: "gen-a-NEW"
+
+        listed = module.get_rooms(SimpleNamespace(query_params={}))
+
+        self.assertEqual(
+            [str(item["id"]) for item in listed["rooms"]],
+            [],
+        )
+
 
 if __name__ == "__main__":
     unittest.main()
