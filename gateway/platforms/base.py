@@ -5604,6 +5604,11 @@ class BasePlatformAdapter(ABC):
                 if result.retry_after is not None:
                     server_retry_after = result.retry_after
                 if not (result.retryable or self._is_retryable_error(error_str)):
+                    # A timeout or silent failure mid-retry may have already
+                    # delivered — the plain-text fallback below would duplicate
+                    # it. Same guard as the first-attempt path above.
+                    if self._is_timeout_error(error_str) or not error_str:
+                        return result
                     break  # error switched to non-transient — fall through to plain-text fallback
             else:
                 # All retries exhausted (loop completed without break) — notify user
