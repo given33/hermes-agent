@@ -56,6 +56,30 @@ _log = logging.getLogger(__name__)
 _token_routes: set[str] = set()
 _lock = threading.Lock()
 
+# Path prefixes that accept a bearer token as an alternative to the session
+# cookie. A plugin/module registers its API subtree here when token auth is
+# optional (i.e. the auth seam should try the bearer token if present but
+# fall back to cookie-gated access).
+_optional_token_prefixes: set[str] = set()
+_optional_prefix_lock = threading.Lock()
+
+
+def register_optional_token_prefix(prefix: str) -> None:
+    """Mark every path under ``prefix`` as accepting optional bearer auth.
+
+    Idempotent. The prefix is matched with ``path.startswith(prefix)``
+    — include the leading slash, no trailing slash (e.g. ``"/api"``).
+    """
+    with _optional_prefix_lock:
+        normalized = prefix.rstrip("/") or "/"
+        _optional_token_prefixes.add(normalized)
+
+
+def is_optional_token_prefix(path: str) -> bool:
+    """True if ``path`` falls under any registered optional-token prefix."""
+    with _optional_prefix_lock:
+        return any(path.startswith(prefix) for prefix in _optional_token_prefixes)
+
 
 def register_token_route(path: str) -> None:
     """Mark ``path`` (exact match) as token-authable.

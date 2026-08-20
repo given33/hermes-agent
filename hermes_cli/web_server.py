@@ -483,8 +483,16 @@ app = FastAPI(title="Hermes Agent", version=__version__, lifespan=_lifespan)
 
 # Memory-provider OAuth connect routes live in the memory layer, not here.
 from hermes_cli.memory_oauth import router as _memory_oauth_router  # noqa: E402
+from hermes_cli.dashboard_auth.owner_mobile import router as _owner_mobile_router  # noqa: E402
 
 app.include_router(_memory_oauth_router)
+app.include_router(_owner_mobile_router)  # /auth/mobile/* Bearer endpoints
+
+# Register the mobile token provider so the auth middleware's bearer
+# verification recognizes hma_* tokens for /api/* paths (RFC 8252 native-app
+# auth — the desktop/mobile client authenticates REST with Bearer, no cookie).
+from hermes_cli.dashboard_auth.owner_mobile import ensure_mobile_token_provider  # noqa: E402
+ensure_mobile_token_provider()
 
 # ---------------------------------------------------------------------------
 # Session token for protecting sensitive endpoints (reveal).

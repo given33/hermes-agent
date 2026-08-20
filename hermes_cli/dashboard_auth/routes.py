@@ -659,18 +659,26 @@ _pw_attempts: Dict[str, Deque[float]] = defaultdict(deque)
 _pw_attempts_lock = threading.Lock()
 
 
-def _password_rate_limited(ip: str) -> bool:
-    """True if ``ip`` has exceeded the password-login attempt budget.
+def _account_rate_key(namespace: str, identifier: str) -> str:
+    """Composite rate-limit key for account-scoped password attempts."""
+    return f"{namespace}:{(identifier or '_unknown_').lower()}"
+
+
+def _password_rate_limited(ip: str, account_key: str | None = None) -> bool:
+    """True if the caller has exceeded the password-login attempt budget.
 
     Sliding window: prune attempts older than the window, then check the
     count. Records the attempt timestamp when allowed. An empty IP (no
     discernible client) shares a single bucket — fail-safe toward
     throttling rather than letting unattributable traffic through
-    unmetered.
+    unmetered. When ``account_key`` is provided (e.g. from
+    :func:`_account_rate_key`), rate-limit on that key instead of the IP
+    so attempts from different IPs against the same account are counted
+    together.
     """
     now = time.monotonic()
     cutoff = now - _PW_RATE_WINDOW_SEC
-    key = ip or "_unknown_"
+    key = account_key or ip or "_unknown_"
     with _pw_attempts_lock:
         bucket = _pw_attempts[key]
         while bucket and bucket[0] < cutoff:
