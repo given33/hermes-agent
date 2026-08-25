@@ -1055,8 +1055,9 @@ def remove_board(slug: str, *, archive: bool = True) -> dict:
         d.rename(target)
         return {"slug": normed, "action": "archived", "new_path": str(target)}
     else:
-        import shutil
-        shutil.rmtree(d)
+        from hermes_cli.safe_delete import safe_rmtree
+
+        safe_rmtree(d, boards_root())
         return {"slug": normed, "action": "deleted", "new_path": ""}
 
 
@@ -1683,17 +1684,18 @@ def _cross_process_init_lock(path: Path):
     try:
         deadline = time.monotonic() + _INIT_LOCK_TIMEOUT_SECONDS
         if _IS_WINDOWS:
-            import msvcrt
+            import portalocker
 
-            locking = getattr(msvcrt, "locking")
-            nb_lock = getattr(msvcrt, "LK_NBLCK")
+            nb_lock = (
+                portalocker.LockFlags.EXCLUSIVE | portalocker.LockFlags.NON_BLOCKING
+            )
             while True:
                 try:
                     handle.seek(0)
-                    locking(handle.fileno(), nb_lock, 1)
+                    portalocker.lock(handle.fileno(), nb_lock)
                     acquired = True
                     break
-                except OSError:
+                except (OSError, portalocker.exceptions.AlreadyLocked):
                     if time.monotonic() >= deadline:
                         break
                     time.sleep(_INIT_LOCK_POLL_SECONDS)
@@ -1722,12 +1724,9 @@ def _cross_process_init_lock(path: Path):
         try:
             if acquired:
                 if _IS_WINDOWS:
-                    import msvcrt
+                    import portalocker
 
-                    handle.seek(0)
-                    locking = getattr(msvcrt, "locking")
-                    unlock_mode = getattr(msvcrt, "LK_UNLCK")
-                    locking(handle.fileno(), unlock_mode, 1)
+                    portalocker.unlock(handle.fileno())
                 else:
                     import fcntl
 
@@ -3061,8 +3060,15 @@ def _check_file_length_invariant(conn: sqlite3.Connection) -> None:
     of concurrent writers (and of a running VACUUM) and let other processes
     write into a database a writer still believed it owned. That is the
     documented corruption route in sqlite.org/howtocorrupt.html section 2.2.
+
+    Windows is exempt: Defender/indexer activity can stall stat() for many
+    seconds on a newly written DB, turning every Kanban transaction into an
+    outage. SQLite integrity checks still cover structural corruption there.
     """
     from hermes_cli.sqlite_safe_read import file_length_matches_header
+
+    if sys.platform == "win32":
+        return
 
     # In WAL mode a just-committed page can still live in the -wal file, so
     # the main file legitimately lags its page count. Only enforce the
@@ -3117,7 +3123,12 @@ def _execute_boundary_with_retry(conn: sqlite3.Connection, sql: str) -> None:
 
 
 @contextlib.contextmanager
-def write_txn(conn: sqlite3.Connection, *, allow_nested: bool = False):
+def write_txn(
+    conn: sqlite3.Connection,
+    *,
+    allow_nested: bool = False,
+    check_file_length: bool = True,
+):
     """Context manager for an IMMEDIATE write transaction.
 
     Use for any multi-statement write (creating a task + link, claiming a
@@ -3186,9 +3197,13 @@ def write_txn(conn: sqlite3.Connection, *, allow_nested: bool = False):
             except sqlite3.OperationalError:
                 pass
             raise
-        # Post-commit file-length check: header page_count must match actual file pages.
-        # A discrepancy means a torn-extend — raise now rather than silently corrupt.
-        _check_file_length_invariant(conn)
+        # Post-commit file-length check: header page_count must match actual
+        # file pages. Schema migrations are exempt: on Windows, antivirus and
+        # indexer probes can stall stat() for the fresh database and turn a
+        # one-time upgrade into a hosted-turn outage. Runtime writes retain
+        # the torn-extend guard.
+        if check_file_length:
+            _check_file_length_invariant(conn)
 
 
 # ---------------------------------------------------------------------------
@@ -4370,7 +4385,12 @@ def get_attachment(conn: sqlite3.Connection, attachment_id: int) -> Optional[Att
     )
 
 
-def delete_attachment(conn: sqlite3.Connection, attachment_id: int) -> Optional[Attachment]:
+def delete_attachment(
+    conn: sqlite3.Connection,
+    attachment_id: int,
+    *,
+    board: Optional[str] = None,
+) -> Optional[Attachment]:
     """Delete an attachment row and its on-disk blob. Returns the removed row.
 
     Returns ``None`` when no row matched. The blob is removed best-effort
@@ -4387,7 +4407,17 @@ def delete_attachment(conn: sqlite3.Connection, attachment_id: int) -> Optional[
         )
     try:
         p = Path(att.stored_path)
-        if p.is_file():
+        root = attachments_root(board=board).resolve()
+        resolved = p.resolve()
+        # A tampered/synchronized metadata row or a swapped blob must never
+        # turn attachment deletion into an arbitrary-file unlink.
+        if (
+            p.is_file()
+            and not p.is_symlink()
+            and resolved.is_file()
+            and root != resolved
+            and root in resolved.parents
+        ):
             p.unlink()
     except OSError:
         pass
@@ -5171,7 +5201,7 @@ def release_stale_claims(
                 reason="ttl_expired_worker_alive",
             )
             continue
-        with write_txn(conn):
+        with write_txn(conn, check_file_length=False):
             retry_status = _retry_status_for_run(conn, row["id"])
             cur = conn.execute(
                 "UPDATE tasks SET status = ?, claim_lock = NULL, "
@@ -5783,7 +5813,7 @@ def _persist_scratch_completion_artifacts(
         return
 
     workspace = Path(row["workspace_path"]).expanduser()
-    is_managed, board = _managed_scratch_path_info(workspace)
+    is_managed, board, _root = _managed_scratch_path_info(workspace)
     if not is_managed:
         return
 
@@ -5915,8 +5945,10 @@ def _unique_attachment_path(directory: Path, filename: str, used: set[Path]) -> 
         idx += 1
 
 
-def _managed_scratch_path_info(p: Path) -> tuple[bool, Optional[str]]:
-    """Return whether *p* is managed scratch storage and the matching board."""
+def _managed_scratch_path_info(
+    p: Path,
+) -> tuple[bool, Optional[str], Optional[Path]]:
+    """Return managed status, matching board, and approved deletion root."""
     try:
         p_abs = p.resolve(strict=False)
     except OSError:
@@ -5961,10 +5993,10 @@ def _managed_scratch_path_info(p: Path) -> tuple[bool, Optional[str]]:
             continue
         try:
             if p_abs.is_relative_to(root):
-                return True, board
+                return True, board, root
         except ValueError:
             continue
-    return False, None
+    return False, None, None
 
 
 def _is_managed_scratch_path(p: Path) -> bool:
@@ -5992,7 +6024,7 @@ def _is_managed_scratch_path(p: Path) -> bool:
     real source tree can otherwise pair with ``workspace_kind='scratch'`` and
     cause task completion to delete user data (#28818).
     """
-    is_managed, _board = _managed_scratch_path_info(p)
+    is_managed, _board, _root = _managed_scratch_path_info(p)
     return is_managed
 
 
@@ -6053,9 +6085,15 @@ def _cleanup_workspace(conn: sqlite3.Connection, task_id: str) -> None:
             # pointing at a real source tree. Without this check, task
             # completion would unconditionally ``shutil.rmtree`` that path
             # and silently delete the user's source data.
-            if _is_managed_scratch_path(wp):
-                shutil.rmtree(wp, ignore_errors=True)
-                _log.debug("Removed scratch workspace: %s", wp)
+            is_managed, _board, allowed_root = _managed_scratch_path_info(wp)
+            if is_managed and allowed_root is not None:
+                from hermes_cli.safe_delete import safe_rmtree
+
+                try:
+                    safe_rmtree(wp, allowed_root)
+                    _log.debug("Removed scratch workspace: %s", wp)
+                except (OSError, ValueError):
+                    _log.warning("Refusing unsafe scratch cleanup for task %s: %s", task_id, wp)
             else:
                 _log.warning(
                     "Refusing to remove out-of-scratch workspace for task %s: %s "
@@ -6179,9 +6217,15 @@ def _try_cleanup_parent_workspaces(conn: sqlite3.Connection, task_id: str) -> No
                 continue
             import shutil
             wp = Path(row["workspace_path"])
-            if wp.is_dir() and _is_managed_scratch_path(wp):
-                shutil.rmtree(wp, ignore_errors=True)
-                _log.debug("Deferred cleanup: removed parent %s scratch workspace: %s", parent_id, wp)
+            is_managed, _board, allowed_root = _managed_scratch_path_info(wp)
+            if wp.is_dir() and is_managed and allowed_root is not None:
+                from hermes_cli.safe_delete import safe_rmtree
+
+                try:
+                    safe_rmtree(wp, allowed_root)
+                    _log.debug("Deferred cleanup: removed parent %s scratch workspace: %s", parent_id, wp)
+                except (OSError, ValueError):
+                    _log.warning("Refusing unsafe deferred scratch cleanup for task %s: %s", parent_id, wp)
     except Exception:
         pass  # best-effort
 

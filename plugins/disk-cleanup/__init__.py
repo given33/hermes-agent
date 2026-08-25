@@ -21,6 +21,7 @@ needs to remember to run commands.
 from __future__ import annotations
 
 import logging
+import os
 import re
 import threading
 from pathlib import Path
@@ -37,6 +38,7 @@ logger = logging.getLogger(__name__)
 # parallel tool calls.
 _recent_test_tracks: Dict[str, Set[str]] = {}
 _lock = threading.Lock()
+_pre_tool_existence: Dict[str, Set[str]] = {}
 
 
 # Tool-call result shapes we can parse
@@ -50,6 +52,19 @@ _TERMINAL_PATH_REGEX = re.compile(r"(?:^|\s)((?:/|~/|[A-Za-z]:[\\/]|\\\\)[^\s'\"
 
 def _tracker_key(task_id: str, session_id: str) -> str:
     return task_id or session_id or "default"
+
+
+def _tool_state_key(
+    tool_name: str, task_id: str, session_id: str, tool_call_id: str
+) -> str:
+    return tool_call_id or f"{task_id}\0{session_id}\0{tool_name}"
+
+
+def _path_key(path: Path) -> str:
+    try:
+        return os.path.normcase(str(path.expanduser().resolve()))
+    except (OSError, RuntimeError):
+        return os.path.normcase(str(path.expanduser()))
 
 
 def _record_track(task_id: str, session_id: str, path: Path, category: str) -> None:
@@ -119,6 +134,54 @@ def _extract_paths_from_terminal(args: Dict[str, Any], result: str) -> Set[str]:
     return paths
 
 
+def _candidate_paths(
+    tool_name: str,
+    args: Dict[str, Any],
+    result: Any = None,
+) -> Set[Path]:
+    if tool_name == "write_file":
+        raw = _extract_paths_from_write_file(args)
+    elif tool_name == "patch":
+        raw = _extract_paths_from_patch(args)
+    elif tool_name == "terminal":
+        raw = _extract_paths_from_terminal(
+            args,
+            result if isinstance(result, str) else "",
+        )
+    else:
+        return set()
+    try:
+        return {Path(path).expanduser() for path in raw}
+    except Exception:
+        return set()
+
+
+def _on_pre_tool_call(
+    tool_name: str = "",
+    args: Optional[Dict[str, Any]] = None,
+    task_id: str = "",
+    session_id: str = "",
+    tool_call_id: str = "",
+    **_: Any,
+) -> None:
+    """Snapshot which candidate paths already existed before execution."""
+    if not isinstance(args, dict) or tool_name not in {"write_file", "patch", "terminal"}:
+        return
+    existed = {
+        _path_key(path)
+        for path in _candidate_paths(tool_name, args)
+        if path.exists()
+    }
+    key = _tool_state_key(tool_name, task_id, session_id, tool_call_id)
+    with _lock:
+        # Bound abandoned snapshots so a host that never calls the matching
+        # post-hook cannot grow this map indefinitely.
+        if len(_pre_tool_existence) >= 4096:
+            for stale_key in list(_pre_tool_existence)[:1024]:
+                _pre_tool_existence.pop(stale_key, None)
+        _pre_tool_existence[key] = existed
+
+
 # ---------------------------------------------------------------------------
 # Hooks
 # ---------------------------------------------------------------------------
@@ -136,18 +199,19 @@ def _on_post_tool_call(
     if not isinstance(args, dict):
         return
 
-    candidates: Set[str] = set()
-    if tool_name == "write_file":
-        candidates = _extract_paths_from_write_file(args)
-    elif tool_name == "patch":
-        candidates = _extract_paths_from_patch(args)
-    elif tool_name == "terminal":
-        candidates = _extract_paths_from_terminal(args, result if isinstance(result, str) else "")
-    else:
+    key = _tool_state_key(tool_name, task_id, session_id, tool_call_id)
+    with _lock:
+        existed_before = _pre_tool_existence.pop(key, None)
+    if existed_before is None:
+        # Without a pre-execution snapshot we cannot distinguish a newly
+        # created scratch file from a user's long-lived test_*.py. Default to
+        # preserving the latter; explicit /disk-cleanup track remains available.
         return
 
-    for path_str in candidates:
-        _attempt_track(path_str, task_id, session_id)
+    for path in _candidate_paths(tool_name, args, result):
+        if _path_key(path) in existed_before:
+            continue
+        _attempt_track(str(path), task_id, session_id)
 
 
 def _on_session_end(
@@ -305,6 +369,7 @@ def _handle_slash(raw_args: str) -> Optional[str]:
 # ---------------------------------------------------------------------------
 
 def register(ctx) -> None:
+    ctx.register_hook("pre_tool_call", _on_pre_tool_call)
     ctx.register_hook("post_tool_call", _on_post_tool_call)
     ctx.register_hook("on_session_end", _on_session_end)
     ctx.register_command(

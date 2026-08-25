@@ -226,6 +226,8 @@ def test_stateful_browser_and_terminal_calls_stay_in_the_owner_runtime(monkeypat
     monkeypatch.setattr(close_module, "process_registry", _ProcessRegistry())
 
     assert registry.get_isolation_identity("browser_navigate")["isolation_mode"] == "parent_runtime"
+    assert registry.get_isolation_identity("read_terminal")["isolation_mode"] == "parent_runtime"
+    assert registry.get_isolation_identity("close_terminal")["isolation_mode"] == "parent_runtime"
     assert registry.dispatch(
         "browser_navigate", {"url": "https://example.test"},
         isolate=True, task_id="browser-state",

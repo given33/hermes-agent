@@ -959,7 +959,7 @@ def test_account_delete_removes_registered_custom_cold_segment(store):
     assert store.list_cold_segments("alice") == []
 
 
-def test_cold_archive_install_failure_and_restart_remove_unindexed_files(
+def test_cold_archive_restart_removes_only_reserved_partial_files(
     store,
     tmp_path,
     monkeypatch,
@@ -987,6 +987,7 @@ def test_cold_archive_install_failure_and_restart_remove_unindexed_files(
         / "ios-cold"
         / hashlib.sha256(b"alice").hexdigest()[:24]
     )
+    # The failed install's durable intent owns its target, so recovery removes it.
     assert list(owner_dir.glob("*")) == []
     assert store.list_cold_segments("alice") == []
 
@@ -997,8 +998,11 @@ def test_cold_archive_install_failure_and_restart_remove_unindexed_files(
 
     reopened = IOSIntelligenceStore(store.path)
 
-    assert not orphan.exists()
+    # An unindexed ciphertext is not provably an orphan: a restored/empty DB
+    # would otherwise destroy the only recoverable copy.
+    assert orphan.exists()
     assert not partial.exists()
+    assert [path.name for path in owner_dir.glob("*")] == ["unindexed.jsonl.gz.enc"]
     deleted = reopened.delete_account("alice")
     assert deleted["state"] == "complete"
 

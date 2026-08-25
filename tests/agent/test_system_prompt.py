@@ -152,12 +152,15 @@ class TestNamedProfileHintIntegration:
             prompt = "\n\n".join(_prompt_parts(agent).values())
 
         assert "Active Hermes profile: coder." in prompt
-        assert f"reads and writes {profile_home}/." in prompt
+        # The system prompt normalizes path separators to forward slashes so
+        # the prompt text is portable across POSIX and Windows hosts. Use
+        # ``as_posix()`` on the Path objects to produce the same form.
+        assert f"reads and writes {profile_home.as_posix()}/." in prompt
         # The doubled form must not appear anywhere.
-        assert f"{profile_home}/profiles/coder" not in prompt
+        assert f"{profile_home.as_posix()}/profiles/coder" not in prompt
         # Default-profile pointers belong at the root, not inside the profile.
-        assert f"The default profile's data lives at {root}/skills/" in prompt
-        assert f"{profile_home}/skills/" not in prompt
+        assert f"The default profile's data lives at {root.as_posix()}/skills/" in prompt
+        assert f"{profile_home.as_posix()}/skills/" not in prompt
 
     def test_real_default_home_renders_default_branch(self, tmp_path, monkeypatch):
         """HERMES_HOME at the root resolves to the default profile, unchanged."""
@@ -177,7 +180,7 @@ class TestNamedProfileHintIntegration:
             prompt = "\n\n".join(_prompt_parts(agent).values())
 
         assert "Active Hermes profile: default." in prompt
-        assert f"under {root}/profiles/<name>/." in prompt
+        assert f"under {root.as_posix()}/profiles/<name>/." in prompt
 
 
 def test_build_system_prompt_records_stable_prefix():

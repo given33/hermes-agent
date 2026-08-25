@@ -1368,21 +1368,24 @@ class WebhookAdapter(BasePlatformAdapter):
             )
 
         try:
-            result = subprocess.run(
-                [
-                    "gh",
-                    "pr",
-                    "comment",
-                    str(pr_int),
-                    "--repo",
-                    repo,
-                    "--body",
-                    content,
-                ],
-                capture_output=True,
-                text=True, encoding='utf-8', errors='replace',
-                timeout=30,
-            )
+            def _run_gh_comment():
+                return subprocess.run(
+                    [
+                        "gh",
+                        "pr",
+                        "comment",
+                        str(pr_int),
+                        "--repo",
+                        repo,
+                        "--body",
+                        content,
+                    ],
+                    capture_output=True,
+                    text=True, encoding='utf-8', errors='replace',
+                    timeout=30,
+                )
+
+            result = await asyncio.to_thread(_run_gh_comment)
             if result.returncode == 0:
                 logger.info(
                     "[webhook] Posted comment on %s#%s", repo, pr_number

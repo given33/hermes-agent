@@ -1029,15 +1029,14 @@ def run_hosted_behavior_scenario(
 ) -> dict[str, Any]:
     """Execute one durable hosted scenario with no provider/model fallback."""
 
-    # Transitional Windows calibration: the multi-role orchestration
-    # (planning + dispatch + supervision) legitimately needs more wall-clock
-    # than the 30s Linux budget on a loaded Windows host even with the
-    # msvcrt lock-handoff fix in place. Triple the budget on win32 only;
-    # Linux keeps the tight budget.
+    # Transitional Windows calibration: schema initialization, durable JSON
+    # checkpoints, and antivirus interception can each add seconds on a loaded
+    # Windows host. Keep the functional chain unchanged; widen only the test
+    # observation window so it measures completion rather than filesystem noise.
     import sys as _sys
 
     if _sys.platform == "win32":
-        timeout_seconds = max(timeout_seconds, timeout_seconds * 3.0)
+        timeout_seconds = max(timeout_seconds, timeout_seconds * 10.0)
     if not provider.strip() or not model.strip():
         raise ValueError("behavior eval requires an explicit provider and model")
     normalized_run_id = str(eval_run_id or f"run_{uuid.uuid4().hex}").strip()
@@ -1097,6 +1096,10 @@ def run_hosted_behavior_scenario(
         run.retries += 1
         run.attempts = run.retries + 1
         sleep(max(0.0, poll_interval))
+        # Test callers commonly inject a no-op clock to keep deterministic
+        # evaluations fast.  Still yield the OS scheduler so a background
+        # hosted workflow can publish the retryable result.
+        time.sleep(0.001)
         return True
 
     while True:
@@ -1231,12 +1234,16 @@ def run_hosted_behavior_scenario(
             )
             if cursor < authoritative_cursor:
                 sleep(max(0.0, poll_interval))
+                time.sleep(0.001)
                 continue
             transcript._finish_pending(run, cancelled=state == "cancelled")
             run.record("role_event", role_stage="snapshot", status=state)
             assert_event_order(run.events)
             return run.finish(state)
         sleep(max(0.0, poll_interval))
+        # ``sleep`` may be an injected no-op; preserve a real scheduler yield
+        # between polls so the producer thread is not starved.
+        time.sleep(0.001)
     return fail(
         TerminalHostedEvalError(
             f"hosted behavior eval timed out: {scenario_id}",

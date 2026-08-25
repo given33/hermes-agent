@@ -1187,7 +1187,6 @@ def _run_cleanup(*, notify_session_finalize: bool = True):
     global _cleanup_done, _cleanup_in_progress
     if _cleanup_done:
         return
-    _cleanup_done = True
     _cleanup_in_progress = True
 
     try:
@@ -1196,11 +1195,14 @@ def _run_cleanup(*, notify_session_finalize: bool = True):
         # leaving a zombie CLI holding the terminal for minutes.
         _arm_exit_watchdog()
 
-        # Reset terminal input modes first, before the slower resource teardown
-        # below (MCP / browser / memory shutdown can take seconds). On Ctrl+C the
-        # user's terminal becomes usable immediately, and a later step raising
-        # can't skip the reset (#36823). No-op unless the TUI actually ran.
-        _reset_terminal_input_modes_on_exit()
+        try:
+            # Reset terminal input modes first, before the slower resource teardown
+            # below (MCP / browser / memory shutdown can take seconds). On Ctrl+C the
+            # user's terminal becomes usable immediately, and a later step raising
+            # can't skip the reset (#36823). No-op unless the TUI actually ran.
+            _reset_terminal_input_modes_on_exit()
+        except Exception:
+            logger.debug("CLI terminal-mode cleanup failed", exc_info=True)
 
         try:
             from tools.wake_word import stop_listening as _stop_wake_word
@@ -1282,6 +1284,9 @@ def _run_cleanup(*, notify_session_finalize: bool = True):
         except Exception as e:
             logger.warning("CLI cleanup memory shutdown failed: %s", e, exc_info=True)
     finally:
+        # Mark completion only when the whole bounded sequence has run. A raise
+        # from one barrier must not make later shutdown skip remaining owners.
+        _cleanup_done = True
         _cleanup_in_progress = False
 
 
@@ -2303,8 +2308,7 @@ def _worktree_lock_is_live(repo_root: str, worktree_path: str, timeout: int = 10
     pruner tell the two apart:
 
     - ``"live"``  — locked and the owning pid is still running (skip it).
-    - ``"dead"``  — locked but the owning pid is gone, or the reason isn't a
-                    parseable hermes lock (safe to unlock + reap).
+    - ``"dead"``  — locked by an exact Hermes lock whose owning pid is gone.
     - ``None``    — not locked at all.
 
     Fails SAFE toward ``"live"``: if git can't be queried at all we cannot
@@ -2335,13 +2339,11 @@ def _worktree_lock_is_live(repo_root: str, worktree_path: str, timeout: int = 10
             if current != target:
                 continue
             reason = line[len("locked"):].strip()
-            m = re.search(r"hermes pid=(\d+)", reason)
+            m = re.fullmatch(r"hermes pid=(\d+)", reason)
             if not m:
-                # Locked by something we don't recognize as a hermes session
-                # (or lock reason unavailable). Treat as dead — a foreign lock
-                # on a hermes -w worktree is almost certainly a leftover, and
-                # the age/dirty/unpushed gates already ran before we got here.
-                return "dead"
+                # A foreign or malformed owner is not proof that this Hermes
+                # process owns the checkout. Fail closed toward preservation.
+                return "live"
             pid = int(m.group(1))
             if pid == os.getpid():
                 return "live"
@@ -2393,8 +2395,23 @@ def _cleanup_worktree(info: Dict[str, str] = None) -> None:
         _active_worktree = None
         return
 
-    # Remove worktree (even if working tree is dirty — uncommitted
-    # changes without unpushed commits are just artifacts)
+    try:
+        status = subprocess.run(
+            ["git", "status", "--porcelain"],
+            capture_output=True, text=True, encoding="utf-8", errors="replace",
+            timeout=10, cwd=wt_path,
+        )
+        dirty = status.returncode != 0 or bool(status.stdout.strip())
+    except Exception:
+        dirty = True
+
+    if dirty:
+        # Pushed commits do not authorize deleting uncommitted user data.
+        print(f"\n\033[33m⚠ Worktree has uncommitted changes, keeping: {wt_path}\033[0m")
+        print("  Commit or remove them before automatic worktree cleanup.")
+        _active_worktree = None
+        return
+
     # Unlock first so `git worktree remove` isn't blocked by the lock we
     # placed at creation time.  Fail-soft — never block cleanup.
     try:

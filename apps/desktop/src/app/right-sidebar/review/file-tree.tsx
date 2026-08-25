@@ -1,6 +1,6 @@
 import { useStore } from '@nanostores/react'
 import { useVirtualizer } from '@tanstack/react-virtual'
-import { AnimatePresence, motion } from 'motion/react'
+import { AnimatePresence, motion } from 'framer-motion'
 import { type CSSProperties, type ReactNode, type RefObject, useEffect, useMemo, useRef, useState } from 'react'
 
 import { Button } from '@/components/ui/button'

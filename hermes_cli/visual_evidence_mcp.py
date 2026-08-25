@@ -25,9 +25,12 @@ except ImportError:  # pragma: no cover - the validation environment installs it
     np = None  # type: ignore[assignment]
 
 try:
-    from mcp.server.fastmcp import FastMCP
-except ImportError:  # pragma: no cover - exercised by the CLI doctor instead
-    FastMCP = None  # type: ignore[assignment,misc]
+    from mcp.server import MCPServer as FastMCP
+except ImportError:  # pragma: no cover - MCP 1.x compatibility
+    try:
+        from mcp.server.fastmcp import FastMCP
+    except ImportError:  # pragma: no cover - exercised by the CLI doctor instead
+        FastMCP = None  # type: ignore[assignment,misc]
 
 
 PROVIDER_ID = "hermes-visual-evidence"

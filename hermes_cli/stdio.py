@@ -32,10 +32,25 @@ from __future__ import annotations
 import os
 import sys
 
-__all__ = ["configure_windows_stdio", "is_windows"]
+__all__ = ["configure_windows_stdio", "ensure_utf8_stdio", "is_windows"]
 
 
 _CONFIGURED = False
+
+
+def ensure_utf8_stdio(force: bool = False) -> None:
+    """Run the platform-agnostic UTF-8 stream repair.
+
+    ``hermes_cli`` applies this guard at package import time, but standalone
+    entry points such as ``hermes-agent`` must also call it explicitly before
+    their first banner. ``force`` is retained for entry-point compatibility;
+    the underlying repair is already idempotent and only changes streams that
+    are not UTF-8.
+    """
+    del force
+    from hermes_cli import _ensure_utf8
+
+    _ensure_utf8()
 
 
 def is_windows() -> bool:

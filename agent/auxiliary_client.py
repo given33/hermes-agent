@@ -1005,11 +1005,15 @@ def _resolve_provider_vision_default(provider: str) -> Optional[str]:
 # it must skip straight to the aggregator chain instead of returning a client
 # that will 404 on every vision request.
 #
+# deepseek: the native DeepSeek API is text-only; its multimodal models are
+# exposed by other providers/aggregators, not by api.deepseek.com.
+#
 # kimi-coding / kimi-coding-cn: the Kimi Coding Plan routes through
 # api.kimi.com/coding (Anthropic Messages wire) which Kimi's own docs
 # describe as having no image_in capability. Vision lives on the separate
 # Kimi Platform (api.moonshot.ai, OpenAI-wire, pay-as-you-go).  See #17076.
 _PROVIDERS_WITHOUT_VISION: frozenset = frozenset({
+    "deepseek",
     "kimi-coding",
     "kimi-coding-cn",
 })
@@ -7105,6 +7109,13 @@ def _main_model_supports_vision(provider: str, model: Optional[str]) -> bool:
     except Exception:  # pragma: no cover - defensive
         return True
     if supports is None:
+        # DeepSeek's direct endpoint is text-only. When the catalog is cold
+        # or unavailable, treating this provider as "unknown" would return a
+        # client that later rejects the image part at request time. Keep the
+        # permissive fallback for other providers so new/custom endpoints do
+        # not silently lose vision routing.
+        if str(provider or "").strip().lower() == "deepseek":
+            return False
         # No capability data — keep current behaviour and let the call attempt
         # happen rather than silently skipping. This avoids false-positive
         # skips for new/custom providers.

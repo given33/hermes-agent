@@ -196,6 +196,11 @@ def suspend_self(
     if not app or not machine_id:
         logger.warning("scale-to-zero: suspend_self called without Fly machine identity")
         return False
+    if not hasattr(socket, "AF_UNIX"):
+        # Fly machines are POSIX hosts. On other development hosts this API is
+        # simply unavailable; fail awake rather than exposing a platform detail.
+        logger.debug("scale-to-zero: Unix-domain sockets unavailable on this host")
+        return False
     request = (
         f"POST /v1/apps/{app}/machines/{machine_id}/suspend HTTP/1.1\r\n"
         "Host: flaps\r\n"

@@ -14,6 +14,11 @@ import pytest
 
 from tools.terminal_tool import terminal_tool
 
+pytestmark = pytest.mark.skipif(
+    __import__("sys").platform == "win32",
+    reason="bash cd with Windows backslash paths mangles the path",
+)
+
 
 @pytest.fixture
 def isolated_home(tmp_path, monkeypatch):

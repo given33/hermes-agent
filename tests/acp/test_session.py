@@ -164,6 +164,10 @@ class TestSymlinkAliasNormalization:
     ``/private/tmp``) must compare equal, or ACP history filters silently drop
     a workspace's own sessions."""
 
+    @pytest.mark.skipif(
+        __import__("sys").platform == "win32",
+        reason="os.symlink needs elevated privileges on Windows",
+    )
     def test_symlink_alias_compares_equal(self, tmp_path):
         real = tmp_path / "real"
         real.mkdir()
@@ -182,6 +186,10 @@ class TestSymlinkAliasNormalization:
             str(a)
         ) != acp_session._normalize_cwd_for_compare(str(b))
 
+    @pytest.mark.skipif(
+        __import__("sys").platform == "win32",
+        reason="POSIX lexical path normalization",
+    )
     def test_missing_path_keeps_lexical_normalization(self):
         # realpath(strict=False) is lexical for nonexistent paths, so cwds
         # that don't exist on this host (e.g. WSL-translated drives) behave
@@ -190,6 +198,10 @@ class TestSymlinkAliasNormalization:
             "/nonexistent-hermes-test/x/../y"
         ) == "/nonexistent-hermes-test/y"
 
+    @pytest.mark.skipif(
+        __import__("sys").platform == "win32",
+        reason="os.symlink needs elevated privileges on Windows",
+    )
     def test_list_sessions_matches_symlink_alias_cwd(self, manager, tmp_path):
         real = tmp_path / "proj"
         real.mkdir()

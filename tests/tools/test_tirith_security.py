@@ -13,9 +13,12 @@ import pytest
 import tools.tirith_security as _tirith_mod
 from tools.tirith_security import check_command_security, ensure_installed
 
+_REAL_DETECT_TARGET = _tirith_mod._detect_target
+_REAL_IS_PLATFORM_SUPPORTED = _tirith_mod.is_platform_supported
+
 
 @pytest.fixture(autouse=True)
-def _reset_resolved_path():
+def _reset_resolved_path(monkeypatch):
     """Pre-set cached path to skip auto-install in scan tests.
     Tests that specifically test ensure_installed / resolve behavior
     reset this to None themselves.
@@ -25,6 +28,10 @@ def _reset_resolved_path():
     _tirith_mod._install_failure_reason = ""
     _tirith_mod._crash_count = 0
     _tirith_mod._circuit_open = False
+    # Default: pretend the platform is supported so scan/install logic runs.
+    # TestUnsupportedPlatform patches this back to False explicitly.
+    monkeypatch.setattr(_tirith_mod, "is_platform_supported", lambda: True)
+    monkeypatch.setattr(_tirith_mod, "_detect_target", lambda: "x86_64-unknown-linux-gnu")
     yield
     _tirith_mod._resolved_path = None
     _tirith_mod._install_thread = None
@@ -244,6 +251,15 @@ class TestUnsupportedPlatform:
     the entire subsystem must stay silent: no PATH probes, no download thread,
     no disk failure marker, no spawn attempts, no CLI banner. Pattern-matching
     guards still cover the gap; tirith content scanning is just absent."""
+
+    @pytest.fixture(autouse=True)
+    def _restore_platform_check(self, monkeypatch):
+        """Undo the module autouse patch so the real mapping runs."""
+        monkeypatch.setattr(
+            _tirith_mod, "is_platform_supported",
+            _REAL_IS_PLATFORM_SUPPORTED,
+        )
+        monkeypatch.setattr(_tirith_mod, "_detect_target", _REAL_DETECT_TARGET)
 
     @pytest.mark.parametrize("system, machine, expected", [
         ("Linux", "x86_64", True),

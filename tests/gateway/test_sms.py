@@ -7,6 +7,7 @@ requirements check, toolset verification, and Twilio signature validation.
 import base64
 import hashlib
 import hmac
+import asyncio
 import os
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -299,6 +300,19 @@ class TestWebhookSignatureEnforcement:
         resp = await adapter._handle_webhook(request)
         assert resp.status == 200
 
+
+    @pytest.mark.asyncio
+    async def test_duplicate_message_sid_is_dispatched_once(self):
+        adapter = self._make_adapter(webhook_url="")
+        body = b"From=%2B15551234567&To=%2B15550001111&Body=hello&MessageSid=SM123"
+
+        first = await adapter._handle_webhook(self._mock_request(body))
+        second = await adapter._handle_webhook(self._mock_request(body))
+        assert first.status == 200
+        assert second.status == 200
+
+        await asyncio.gather(*adapter._background_tasks)
+        assert adapter._message_handler.await_count == 1
 
     @pytest.mark.asyncio
     async def test_missing_signature_returns_403(self):

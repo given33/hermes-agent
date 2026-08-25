@@ -65,12 +65,22 @@ def test_make_tui_argv_uses_bundled_tui_when_workspace_missing(
     bundled_entry.write_text("// bundled TUI")
     monkeypatch.setattr(main_mod, "_find_bundled_tui", lambda: bundled_entry)
 
-    def which(name: str) -> str | None:
-        if name == "node":
-            return "/usr/bin/node"
-        raise AssertionError(f"unexpected shutil.which({name!r}) call — bundled path must not need npm/git")
+    # Patch the seam _make_tui_argv actually resolves node through:
+    # hermes_constants.find_node_executable (imported inside the function
+    # at call time). The old patch of main_mod.shutil.which only worked
+    # on POSIX by accident -- a real shutil.which happened to resolve
+    # /usr/bin/node on CI.
+    import hermes_constants
 
-    monkeypatch.setattr(main_mod.shutil, "which", which)
+    def fake_find_node(bin_name: str) -> str | None:
+        if bin_name == "node":
+            return "/usr/bin/node"
+        raise AssertionError(
+            f"unexpected find_node_executable({bin_name!r}) call — bundled"
+            " path must not need npm/git"
+        )
+
+    monkeypatch.setattr(hermes_constants, "find_node_executable", fake_find_node)
 
     def fail_run(*_args, **_kwargs):
         raise AssertionError("bundled TUI path must not spawn any subprocess (no npm install/build, no git restore)")

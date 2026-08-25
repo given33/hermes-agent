@@ -28,7 +28,9 @@ import shutil
 import stat
 import subprocess
 import sys
+import threading
 import time
+from collections import OrderedDict
 from dataclasses import dataclass
 from pathlib import Path, PurePosixPath, PureWindowsPath
 from typing import Dict, List, Optional, Tuple
@@ -748,7 +750,9 @@ def _check_gateway_running(profile_dir: Path) -> bool:
 # renders "全部智能体 0". We cache the count keyed by the skills dir, invalidated
 # when the dir tree's signature (skills_dir + immediate category dirs mtimes)
 # changes (catches skill add/remove) or after a short TTL (catches deep edits).
-_SKILL_COUNT_CACHE: dict[str, tuple[float, float, int]] = {}
+_SKILL_COUNT_CACHE: OrderedDict[str, tuple[float, float, int]] = OrderedDict()
+_SKILL_COUNT_CACHE_MAX = 256
+_SKILL_COUNT_CACHE_LOCK = threading.RLock()
 _SKILL_COUNT_TTL_SECONDS = 30.0
 
 
@@ -788,20 +792,26 @@ def _count_skills(profile_dir: Path) -> int:
     key = str(skills_dir)
     signature = _skills_dir_signature(skills_dir)
     now = time.time()
-    cached = _SKILL_COUNT_CACHE.get(key)
-    if (
-        cached is not None
-        and cached[0] == signature
-        and (now - cached[1]) < _SKILL_COUNT_TTL_SECONDS
-    ):
-        return cached[2]
+    with _SKILL_COUNT_CACHE_LOCK:
+        cached = _SKILL_COUNT_CACHE.get(key)
+        if (
+            cached is not None
+            and cached[0] == signature
+            and (now - cached[1]) < _SKILL_COUNT_TTL_SECONDS
+        ):
+            _SKILL_COUNT_CACHE.move_to_end(key)
+            return cached[2]
 
     count = 0
     for md in skills_dir.rglob("SKILL.md"):
         if is_excluded_skill_path(md):
             continue
         count += 1
-    _SKILL_COUNT_CACHE[key] = (signature, now, count)
+    with _SKILL_COUNT_CACHE_LOCK:
+        _SKILL_COUNT_CACHE[key] = (signature, now, count)
+        _SKILL_COUNT_CACHE.move_to_end(key)
+        while len(_SKILL_COUNT_CACHE) > _SKILL_COUNT_CACHE_MAX:
+            _SKILL_COUNT_CACHE.popitem(last=False)
     return count
 
 
@@ -1719,7 +1729,14 @@ def delete_profile(name: str, yes: bool = False) -> Path:
             else:
                 raise
 
-        _rmtree_with_retry(profile_dir, _make_writable)
+        from hermes_cli.safe_delete import safe_rmtree
+
+        profile_root = (
+            get_profile_dir(canon).parent
+            if canon != "default"
+            else _get_default_hermes_home()
+        )
+        safe_rmtree(profile_dir, profile_root, onerror=_make_writable)
         print(f"✓ Removed {profile_dir}")
     except Exception as e:
         print(f"⚠ Could not remove {profile_dir}: {e}")
@@ -2205,8 +2222,22 @@ def _safe_extract_profile_archive(archive: Path, destination: Path) -> None:
     """Extract a profile archive without allowing path escapes or links."""
     import tarfile
 
+    # Profile archives are operator-supplied compressed trees.  Bound both the
+    # compressed upload and logical expansion so a small bomb cannot exhaust
+    # disk or hold the import executor indefinitely.
+    _MAX_ARCHIVE_BYTES = 256 * 1024 * 1024
+    _MAX_ARCHIVE_MEMBERS = 20_000
+    _MAX_MEMBER_BYTES = 64 * 1024 * 1024
+    _MAX_EXPANDED_BYTES = 512 * 1024 * 1024
+    if archive.stat().st_size > _MAX_ARCHIVE_BYTES:
+        raise ValueError("Profile archive exceeds 256 MiB")
+
+    expanded_bytes = 0
     with tarfile.open(archive, "r:gz") as tf:
-        for member in tf.getmembers():
+        members = tf.getmembers()
+        if len(members) > _MAX_ARCHIVE_MEMBERS:
+            raise ValueError("Profile archive contains too many entries")
+        for member in members:
             parts = _normalize_profile_archive_parts(member.name)
             target = destination.joinpath(*parts)
 
@@ -2223,6 +2254,12 @@ def _safe_extract_profile_archive(archive: Path, destination: Path) -> None:
             extracted = tf.extractfile(member)
             if extracted is None:
                 raise ValueError(f"Cannot read archive member: {member.name}")
+
+            if member.size > _MAX_MEMBER_BYTES:
+                raise ValueError(f"Archive member exceeds 64 MiB: {member.name}")
+            expanded_bytes += member.size
+            if expanded_bytes > _MAX_EXPANDED_BYTES:
+                raise ValueError("Profile archive expands beyond 512 MiB")
 
             with extracted, open(target, "wb") as dst:
                 shutil.copyfileobj(extracted, dst)

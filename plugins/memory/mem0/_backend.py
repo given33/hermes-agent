@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 from abc import ABC, abstractmethod
+import os
+import re
 from typing import Any
 
 
@@ -164,6 +166,10 @@ class OSSBackend(Mem0Backend):
             block = dict(oss_config[name])
             provider = str(block.get("provider") or "").strip().lower()
             provider_config = dict(block.get("config", {}))
+            provider_config = {
+                key: _expand_secret_refs(value)
+                for key, value in provider_config.items()
+            }
             legacy_base = provider_config.pop("api_base", None)
             if legacy_base:
                 from ._oss_providers import EMBEDDER_PROVIDERS, LLM_PROVIDERS
@@ -179,6 +185,17 @@ class OSSBackend(Mem0Backend):
 
         vector_store = dict(oss_config["vector_store"])
         vs_config = dict(vector_store.get("config", {}))
+
+        def _expand_secret_refs(value):
+            if not isinstance(value, str):
+                return value
+            match = re.fullmatch(r"\$\{([A-Za-z_][A-Za-z0-9_]*)\}", value)
+            if not match:
+                return value
+            return os.getenv(match.group(1), "")
+
+        for key, value in list(vs_config.items()):
+            vs_config[key] = _expand_secret_refs(value)
 
         if "path" in vs_config:
             vs_config["path"] = os.path.expanduser(vs_config["path"])

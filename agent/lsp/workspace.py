@@ -38,7 +38,16 @@ def normalize_path(path: str) -> str:
     LSP servers (rust-analyzer cares about Cargo workspace identity)
     and we want the canonical path the user typed when possible.
     """
-    return os.path.abspath(os.path.expanduser(path))
+    # Windows normally prefers USERPROFILE and ignores HOME, but Hermes
+    # launchers and tests use HOME to select an isolated profile home. Honor
+    # an explicit HOME so LSP workspace identity is deterministic across OSes.
+    home = os.environ.get("HOME")
+    expanded = (
+        os.path.join(home, path[2:] if path.startswith("~/") else "")
+        if home and (path == "~" or path.startswith("~/"))
+        else os.path.expanduser(path)
+    )
+    return os.path.abspath(expanded)
 
 
 def find_git_worktree(start: str) -> Optional[str]:

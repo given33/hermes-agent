@@ -48,6 +48,22 @@ from hermes_cli.profiles import (
 from hermes_cli.config import DEFAULT_CONFIG
 
 
+def _symlink_or_skip(target: Path, link: Path) -> None:
+    """symlink_to() that skips where the OS forbids symlinks.
+
+    Unprivileged Windows raises OSError winerror 1314 on any symlink
+    creation; the dotfiles-layout scenario can't even be constructed
+    there, so skip instead of failing (POSIX and Developer-Mode Windows
+    still run the full assertion set).
+    """
+    try:
+        link.symlink_to(target)
+    except OSError as e:
+        if getattr(e, "winerror", None) == 1314:
+            pytest.skip("symbolic link privilege unavailable on this host")
+        raise
+
+
 # ---------------------------------------------------------------------------
 # Shared fixture: redirect Path.home() and HERMES_HOME for profile tests
 # ---------------------------------------------------------------------------
@@ -129,8 +145,11 @@ class TestCreateProfile:
             line.startswith("#") or not line.strip()
             for line in content.splitlines()
         )
-        mode = stat.S_IMODE(env_path.stat().st_mode)
-        assert mode == 0o600
+        # POSIX owner-only bits have no Windows equivalent: os.chmod there
+        # only toggles the read-only flag, so the raw mode reads back 0o666.
+        if sys.platform != "win32":
+            mode = stat.S_IMODE(env_path.stat().st_mode)
+            assert mode == 0o600
 
 
 
@@ -145,7 +164,7 @@ class TestCreateProfile:
 
         profile_dir = create_profile("coder", clone_config=True, no_alias=True)
 
-        cloned_config = yaml.safe_load((profile_dir / "config.yaml").read_text())
+        cloned_config = yaml.safe_load((profile_dir / "config.yaml").read_text(encoding="utf-8"))
         assert cloned_config["_config_version"] == DEFAULT_CONFIG["_config_version"]
         assert cloned_config["model"] == "test"
         assert (profile_dir / ".env").read_text().strip() == "KEY=val"
@@ -231,8 +250,10 @@ class TestBackfillProfileEnvs:
 
         assert sorted(backfilled) == ["old1", "old2"]
         for p in (p1, p2):
-            assert (p / ".env").read_text() == "OPENROUTER_API_KEY=root-key\n"
-            assert stat.S_IMODE((p / ".env").stat().st_mode) == 0o600
+            assert (p / ".env").read_text(encoding="utf-8") == "OPENROUTER_API_KEY=root-key\n"
+            # POSIX-only assertion — see test_seeds_placeholder_env_file.
+            if sys.platform != "win32":
+                assert stat.S_IMODE((p / ".env").stat().st_mode) == 0o600
 
 
     def test_placeholder_when_default_has_no_env(self, profile_env):
@@ -266,7 +287,7 @@ class TestDeleteProfile:
 
         with patch("hermes_cli.profiles._cleanup_gateway_service"), \
              patch("hermes_cli.profiles.time.sleep"), \
-             patch("hermes_cli.profiles.shutil.rmtree", side_effect=PermissionError("locked")):
+             patch("hermes_cli.safe_delete.safe_rmtree", side_effect=PermissionError("locked")):
             with pytest.raises(RuntimeError, match="Could not remove profile directory"):
                 delete_profile("coder", yes=True)
 
@@ -575,10 +596,18 @@ class TestWrapperScript:
         from hermes_cli.profiles import create_wrapper_script
         wrapper = create_wrapper_script("mybot")
         assert wrapper is not None
-        assert wrapper.name == "mybot"
-        content = wrapper.read_text()
-        assert content.startswith("#!/bin/sh")
-        assert "exec /opt/hermes/bin/hermes -p mybot" in content
+        if sys.platform == "win32":
+            # The Windows wrapper is a .bat shim that invokes `hermes` from
+            # PATH (create_wrapper_script documents this branch).
+            assert wrapper.name == "mybot.bat"
+            content = wrapper.read_text(encoding="utf-8")
+            assert content.startswith("@echo off")
+            assert "hermes -p mybot %*" in content
+        else:
+            assert wrapper.name == "mybot"
+            content = wrapper.read_text(encoding="utf-8")
+            assert content.startswith("#!/bin/sh")
+            assert "exec /opt/hermes/bin/hermes -p mybot" in content
 
 
     @pytest.mark.windows_only
@@ -655,7 +684,8 @@ class TestFindAliasForProfile:
         info = next(p for p in list_profiles() if p.name == "steve")
         assert info.alias_name == "qiaobusi"
         assert info.alias_path is not None
-        assert info.alias_path.name == "qiaobusi"
+        expected_alias_name = "qiaobusi.bat" if sys.platform == "win32" else "qiaobusi"
+        assert info.alias_path.name == expected_alias_name
 
 
 # ===================================================================
@@ -764,11 +794,12 @@ class TestExportImport:
         # following and crashing.
         broken_dir = default_dir / "skills" / "with-broken-links"
         broken_dir.mkdir(parents=True)
-        (broken_dir / "broken_link").symlink_to("/nonexistent/path")
+        _symlink_or_skip(Path("/nonexistent/path"), broken_dir / "broken_link")
         # Valid symlink for comparison
-        (broken_dir / "valid_target.txt").write_text("real data")
-        (broken_dir / "valid_link").symlink_to(
-            broken_dir / "valid_target.txt"
+        (broken_dir / "valid_target.txt").write_text("real data", encoding="utf-8")
+        _symlink_or_skip(
+            broken_dir / "valid_target.txt",
+            broken_dir / "valid_link",
         )
 
         output = tmp_path / "export" / "default.tar.gz"
@@ -939,7 +970,7 @@ class TestWriteProfileMetaDurability:
         real_dir.mkdir()
         real = real_dir / "profile.yaml"
         real.write_text("description: from dotfiles\n", encoding="utf-8")
-        (profile_dir / "profile.yaml").symlink_to(real)
+        _symlink_or_skip(real, profile_dir / "profile.yaml")
 
         profiles.write_profile_meta(profile_dir, description="updated")
 
@@ -1024,7 +1055,7 @@ class TestEdgeCases:
         target_dir = create_profile(
             "target", clone_from="source", clone_config=True, no_alias=True,
         )
-        cloned_config = yaml.safe_load((target_dir / "config.yaml").read_text())
+        cloned_config = yaml.safe_load((target_dir / "config.yaml").read_text(encoding="utf-8"))
         assert cloned_config["_config_version"] == DEFAULT_CONFIG["_config_version"]
         assert cloned_config["model"] == "cloned"
         assert (target_dir / ".env").read_text().strip() == "SECRET=yes"

@@ -94,6 +94,18 @@ def _budget_for_agent(agent) -> BudgetConfig:
 # Maximum number of concurrent worker threads for parallel tool execution.
 # Mirrors the constant in ``run_agent`` for tests/imports that look here.
 _MAX_TOOL_WORKERS = 8
+# Preserve eight fully occupied agents before process-wide backpressure.
+_MAX_PROCESS_TOOL_WORKERS = _MAX_TOOL_WORKERS * 8
+_TOOL_EXECUTION_SLOT_SETUP_LOCK = threading.Lock()
+# Compatibility export for integrations that inspect the historical global
+# budget. Execution uses the per-agent budget returned below.
+_TOOL_EXECUTION_SLOTS = threading.BoundedSemaphore(_MAX_TOOL_WORKERS)
+# A timed-out Python thread cannot be killed safely. Per-agent capacity can be
+# restored after abandonment, but the orphan keeps this process-wide lease
+# until it really exits so repeated timeouts cannot grow threads without bound.
+_PROCESS_TOOL_EXECUTION_SLOTS = threading.BoundedSemaphore(
+    _MAX_PROCESS_TOOL_WORKERS
+)
 _DEFAULT_IMAGE_PARALLEL_REQUESTS = 4
 # Keep this above the stock auxiliary.web_extract timeout (360s) so the batch
 # guard does not preempt a slow-but-valid summarization attempt.
@@ -131,6 +143,59 @@ def _authorization_gate_lock_timeout() -> float:
         return _AUTHORIZATION_GATE_LOCK_TIMEOUT_S
 
 
+def _agent_tool_execution_slots(agent):
+    """Return a per-agent worker budget without cross-agent starvation."""
+    slots = getattr(agent, "_tool_execution_slots", None)
+    if slots is not None:
+        return slots
+    with _TOOL_EXECUTION_SLOT_SETUP_LOCK:
+        slots = getattr(agent, "_tool_execution_slots", None)
+        if slots is None:
+            slots = threading.BoundedSemaphore(_MAX_TOOL_WORKERS)
+            agent._tool_execution_slots = slots
+        return slots
+
+
+class _ToolExecutionLease:
+    """Own per-agent and process capacity for one concurrent tool worker."""
+
+    def __init__(self, agent_slots, process_slots):
+        self._agent_slots = agent_slots
+        self._process_slots = process_slots
+        self._lock = threading.Lock()
+        self._agent_released = False
+        self._process_released = False
+
+    def abandon(self) -> None:
+        """Restore the session after timeout while retaining the orphan bound."""
+        with self._lock:
+            if self._agent_released:
+                return
+            self._agent_released = True
+            self._agent_slots.release()
+
+    def finish(self) -> None:
+        """Release all capacity exactly once when the worker really exits."""
+        with self._lock:
+            if not self._agent_released:
+                self._agent_released = True
+                self._agent_slots.release()
+            if not self._process_released:
+                self._process_released = True
+                self._process_slots.release()
+
+
+def _acquire_tool_execution_lease(agent) -> tuple[Optional[_ToolExecutionLease], str]:
+    if not _PROCESS_TOOL_EXECUTION_SLOTS.acquire(blocking=False):
+        return None, "process tool worker limit reached"
+
+    agent_slots = _agent_tool_execution_slots(agent)
+    if not agent_slots.acquire(blocking=False):
+        _PROCESS_TOOL_EXECUTION_SLOTS.release()
+        return None, "agent tool worker limit reached"
+    return _ToolExecutionLease(agent_slots, _PROCESS_TOOL_EXECUTION_SLOTS), ""
+
+
 class _BatchAbandoned(BaseException):
     """Raised inside a worker when the batch was abandoned before dispatch.
 
@@ -158,7 +223,7 @@ def _parse_tool_arguments(raw_arguments: Any) -> tuple[dict, Optional[str]]:
     )
 
 
-def _resolve_concurrent_tool_timeout() -> float | None:
+def _resolve_concurrent_tool_timeout(tool_names: Optional[list[str]] = None) -> float | None:
     """Resolve the per-batch concurrent tool deadline.
 
     Delegates to the unified resolver (#85125): ``timeouts.tools.concurrent_batch``
@@ -167,11 +232,97 @@ def _resolve_concurrent_tool_timeout() -> float | None:
     """
     from agent.deadline import resolve_timeout
 
-    return resolve_timeout(
+    timeout = resolve_timeout(
         "tools.concurrent_batch",
         default=_DEFAULT_CONCURRENT_TOOL_TIMEOUT_S,
         env_var="HERMES_CONCURRENT_TOOL_TIMEOUT_S",
     )
+    if tool_names:
+        from hermes_services.tool_contract import contract_timeout_seconds
+
+        contract_timeout = contract_timeout_seconds(tool_names)
+        if contract_timeout is not None:
+            return min(timeout, contract_timeout)
+    return timeout
+
+
+def _tool_contract_event_metadata(tool_name: str) -> dict[str, Any]:
+    from hermes_services.tool_contract import tool_contract_event_metadata
+
+    return tool_contract_event_metadata(tool_name)
+
+
+def _tool_contract_approval_block(tool_name: str) -> str | None:
+    """Run the human gate for explicit contracts or irreversible effects."""
+    from hermes_services.tool_contract import (
+        has_registered_tool_contract,
+        resolve_tool_contract,
+    )
+    from tools import registry as _tool_registry
+
+    contract = resolve_tool_contract(tool_name)
+    entry = _tool_registry.registry.get_entry(tool_name)
+    effect_metadata = getattr(entry, "effect_metadata", None) or {}
+    irreversible = effect_metadata.get("reversibility") == "irreversible"
+    if not has_registered_tool_contract(tool_name) and not irreversible:
+        return None
+
+    if contract.requires_approval:
+        reason = (
+            f"The {tool_name} tool is marked as requiring approval by its "
+            "execution contract."
+        )
+        rule_key = f"tool_contract:{tool_name}"
+    elif irreversible:
+        boundary = str(effect_metadata.get("external_boundary") or "external")
+        reason = (
+            f"The {tool_name} tool declares an irreversible side effect "
+            f"across the {boundary} boundary."
+        )
+        rule_key = f"irreversible_effect:{tool_name}"
+    else:
+        return None
+
+    from tools.approval import request_tool_approval
+    from tools.terminal_tool import _get_approval_callback
+
+    result = request_tool_approval(
+        tool_name,
+        reason,
+        rule_key=rule_key,
+        approval_callback=_get_approval_callback(),
+    )
+    if result is True or (isinstance(result, dict) and result.get("approved")):
+        return None
+    if isinstance(result, dict):
+        return str(result.get("message") or "Tool approval denied")
+    return "Tool approval denied"
+
+
+def _run_with_tool_contract_timeout(agent, tool_name, handler):
+    """Run a tool only if its advertised contract still matches live state."""
+    from hermes_services.tool_contract import (
+        resolve_tool_contract,
+        validate_tool_contract_binding,
+    )
+    from tools.registry import registry
+
+    expected = getattr(agent, "_tool_snapshot_generation", None)
+    if isinstance(expected, int):
+        consistency_error = validate_tool_contract_binding(
+            tool_name,
+            advertised_registry_generation=expected,
+        )
+        if consistency_error is not None:
+            raise RuntimeError(consistency_error)
+
+    contract = resolve_tool_contract(tool_name)
+    if contract.timeout_seconds is not None and registry.get_entry(tool_name) is None:
+        raise RuntimeError(
+            f"Tool '{tool_name}' declares a hard deadline but is not "
+            "registry-dispatched and cannot be process-isolated"
+        )
+    return handler()
 
 
 def _flush_session_db_after_tool_progress(
@@ -530,6 +681,13 @@ def _run_tool_activity_heartbeat(
     """
 
     try:
+        # Stamp once immediately so short calls and callers that start this
+        # helper directly do not lose the first heartbeat to scheduler jitter.
+        # The stop check preserves the no-touch-after-return contract when a
+        # caller sets the event before the thread gets scheduled.
+        if stop_event.is_set():
+            return
+        agent._touch_activity(label)
         while not stop_event.wait(interval):
             agent._touch_activity(label)
     except Exception:
@@ -636,6 +794,10 @@ def _run_agent_tool_execution_middleware(
             if guardrail_decision.allows_execution:
                 guardrail_decision = None
 
+        if block_message is None:
+            block_error_type = "tool_contract_block"
+            block_message = _tool_contract_approval_block(function_name)
+
         if block_message is not None or guardrail_decision is not None:
             _advance_start_order()
             state["blocked"] = True
@@ -687,7 +849,11 @@ def _run_agent_tool_execution_middleware(
         )
         _hb_thread.start()
         try:
-            return execute(final_args)
+            return _run_with_tool_contract_timeout(
+                agent,
+                function_name,
+                lambda: execute(final_args),
+            )
         finally:
             _hb_stop.set()
             _hb_thread.join(timeout=2.0)
@@ -751,7 +917,9 @@ def _run_agent_tool_execution_middleware(
 _SEQUENTIAL_INTERRUPT_POLL_SECONDS = 1.0
 
 
-def _resolve_sequential_tool_timeout() -> float | None:
+def _resolve_sequential_tool_timeout(
+    tool_names: Optional[list[str]] = None,
+) -> float | None:
     """Deadline for one sequential tool call (#85125 Phase 2a).
 
     ``timeouts.tools.sequential_call`` in config.yaml wins; when unset, the
@@ -774,6 +942,19 @@ def _resolve_sequential_tool_timeout() -> float | None:
     )
 
 
+def _clamp_to_tool_contract_timeout(
+    timeout_s: float | None,
+    tool_names: list[str],
+) -> float | None:
+    """Apply an explicit per-tool hard deadline without changing config seams."""
+    from hermes_services.tool_contract import contract_timeout_seconds
+
+    contract_timeout = contract_timeout_seconds(tool_names)
+    if contract_timeout is None:
+        return timeout_s
+    return min(timeout_s, contract_timeout) if timeout_s is not None else contract_timeout
+
+
 def _run_sequential_tool_execution_middleware(
     agent,
     *,
@@ -793,7 +974,10 @@ def _run_sequential_tool_execution_middleware(
     ``<= 0``) owns that wait. Applying the generic tool deadline here would
     return ``tool_timeout`` while the prompt and worker stay active.
     """
-    timeout_s = _resolve_sequential_tool_timeout()
+    timeout_s = _clamp_to_tool_contract_timeout(
+        _resolve_sequential_tool_timeout(),
+        [function_name],
+    )
     kwargs = {
         "function_name": function_name,
         "function_args": function_args,
@@ -810,6 +994,19 @@ def _run_sequential_tool_execution_middleware(
     from tools.daemon_pool import DaemonThreadPoolExecutor
 
     authorization_gate = _ConcurrentToolAuthorizationGate()
+    execution_lease, capacity_error = _acquire_tool_execution_lease(agent)
+    if execution_lease is None:
+        message = (
+            f"Error executing tool '{function_name}': {capacity_error}"
+        )
+        trace = middleware_trace if middleware_trace is not None else []
+        return _ManagedToolResult(
+            result=message,
+            args=function_args,
+            middleware_trace=trace,
+            blocked=False,
+            dispatched=False,
+        )
     worker_tid: list[int] = []
 
     def _run() -> _ManagedToolResult:
@@ -828,9 +1025,17 @@ def _run_sequential_tool_execution_middleware(
                 _ra()._set_interrupt(False, tid)
             except Exception:
                 pass
+            execution_lease.finish()
 
     executor = DaemonThreadPoolExecutor(max_workers=1)
-    future = executor.submit(propagate_context_to_thread(_run))
+    try:
+        future = executor.submit(propagate_context_to_thread(_run))
+    except BaseException:
+        # No worker owns the lease when submit fails (for example during
+        # interpreter shutdown), so release both levels before propagating.
+        execution_lease.finish()
+        executor.shutdown(wait=False, cancel_futures=True)
+        raise
     # ``timeout_s`` disabled (None) still runs on the worker: the wait loop
     # below is what makes a non-cooperative tool interruptible at all, so
     # "no deadline" must not mean "no interrupt checks" (#86xxx class fix —
@@ -879,7 +1084,15 @@ def _run_sequential_tool_execution_middleware(
             if future.done() and not future.cancelled():
                 return future.result()
             timed_out = True  # reuse the abandon-shutdown path in finally
-            future.cancel()
+            if future.cancel():
+                # The worker never started, so no finally block can release
+                # the lease on its behalf.
+                execution_lease.finish()
+            else:
+                # A running Python thread cannot be killed safely. Restore
+                # this agent's capacity while retaining the process-wide
+                # orphan bound until the worker really exits.
+                execution_lease.abandon()
             message = (
                 f"[Tool execution cancelled — {function_name} was abandoned "
                 "after user interrupt]"
@@ -919,7 +1132,10 @@ def _run_sequential_tool_execution_middleware(
         logger.warning(
             "sequential tool %s timed out after %.1fs", function_name, timeout_s
         )
-        future.cancel()
+        if future.cancel():
+            execution_lease.finish()
+        else:
+            execution_lease.abandon()
         for tid in worker_tid:
             try:
                 _ra()._set_interrupt(True, tid)
@@ -1163,19 +1379,24 @@ def execute_tool_calls_concurrent(agent, assistant_message, messages: list, effe
         )
 
     # ── Logging / callbacks ──────────────────────────────────────────
-    tool_names_str = ", ".join(name for _, name, _, _, _, _ in parsed_calls)
+    tool_name_list = [name for _, name, _, _, _, _ in parsed_calls]
+    tool_names_str = ", ".join(tool_name_list)
     if not agent.quiet_mode and getattr(agent, "tool_progress_mode", "all") != "off":
         print(f"  ⚡ Concurrent: {num_tools} tool calls — {tool_names_str}")
 
     # ── Concurrent execution ─────────────────────────────────────────
     # Each slot holds (function_name, function_args, function_result, duration, error_flag, blocked_flag, middleware_trace)
     results = [None] * num_tools
+    execution_leases: dict[int, _ToolExecutionLease] = {}
+    abandoned_indices: set[int] = set()
+    execution_leases_lock = threading.Lock()
     for i, (tc, name, args, middleware_trace, block_result, _scope_block) in enumerate(parsed_calls):
         if block_result is not None:
             results[i] = (name, args, block_result, 0.0, True, True, middleware_trace)
 
     start_condition = threading.Condition()
     next_start_order = 0
+    skipped_start_orders: set[int] = set()
     # Set once the batch is abandoned (deadline or interrupt) so a worker parked
     # at the start-order gate exits immediately instead of waking up minutes
     # later and dispatching a tool the turn has already reported as timed out.
@@ -1197,11 +1418,25 @@ def execute_tool_calls_concurrent(agent, assistant_message, messages: list, effe
             return _START_ORDER_GATE_TIMEOUT_S
         return min(_START_ORDER_GATE_TIMEOUT_S, batch_timeout / 2)
 
+    def _advance_skipped_orders() -> None:
+        nonlocal next_start_order
+        while next_start_order in skipped_start_orders:
+            skipped_start_orders.remove(next_start_order)
+            next_start_order += 1
+
+    def _skip_start_order(order: int) -> None:
+        """Consume an order for a worker that never dispatches a tool."""
+        with start_condition:
+            skipped_start_orders.add(order)
+            _advance_skipped_orders()
+            start_condition.notify_all()
+
     def _begin_in_order(
         order: int, callback=None, *, tool_name: str = "", gate_timeout: float | None = None
     ) -> bool:
         """Serialize dispatch by submit order. Returns False if abandoned."""
         nonlocal next_start_order
+
         with start_condition:
             # Bounded wait: a tool that wedges during its dispatch must not
             # park every later-ordered worker forever. Without the timeout,
@@ -1218,8 +1453,12 @@ def execute_tool_calls_concurrent(agent, assistant_message, messages: list, effe
             # monotonic when workers advance out of order. batch_abandoned
             # short-circuits the wait so an abandoned batch releases its
             # parked workers in milliseconds instead of one gate timeout.
+            def _gate_ready() -> bool:
+                _advance_skipped_orders()
+                return next_start_order >= order or batch_abandoned.is_set()
+
             in_order = start_condition.wait_for(
-                lambda: next_start_order >= order or batch_abandoned.is_set(),
+                _gate_ready,
                 timeout=(
                     _START_ORDER_GATE_TIMEOUT_S if gate_timeout is None else gate_timeout
                 ),
@@ -1241,12 +1480,13 @@ def execute_tool_calls_concurrent(agent, assistant_message, messages: list, effe
                     callback()
             finally:
                 next_start_order = max(next_start_order, order + 1)
+                _advance_skipped_orders()
                 start_condition.notify_all()
         return True
 
     # Resolved before the workers are defined so the start-order gate can clamp
     # its own bound against the batch deadline it must stay under.
-    timeout_s = _resolve_concurrent_tool_timeout()
+    timeout_s = _resolve_concurrent_tool_timeout(tool_name_list)
     gate_timeout_s = _start_order_gate_timeout(timeout_s)
 
     # Touch activity before launching workers so the gateway knows
@@ -1264,6 +1504,28 @@ def execute_tool_calls_concurrent(agent, assistant_message, messages: list, effe
         start_order,
     ):
         """Worker function executed in a thread."""
+        execution_lease, capacity_error = _acquire_tool_execution_lease(agent)
+        if execution_lease is None:
+            results[index] = (
+                function_name,
+                function_args,
+                f"Error executing tool '{function_name}': {capacity_error}",
+                0.0,
+                True,
+                False,
+                middleware_trace,
+            )
+            # This worker has no side effect to serialize, but its order must
+            # still be consumed or every later worker can park at the gate
+            # until the full batch deadline.  Track the skipped order so an
+            # earlier real dispatch remains a barrier for later workers.
+            _skip_start_order(start_order)
+            return
+        with execution_leases_lock:
+            execution_leases[index] = execution_lease
+            abandon_immediately = index in abandoned_indices
+        if abandon_immediately:
+            execution_lease.abandon()
         # Register this worker tid so the agent can fan out an interrupt
         # to it — see AIAgent.interrupt().  Must happen first thing, and
         # must be paired with discard + clear in the finally block.
@@ -1433,6 +1695,7 @@ def execute_tool_calls_concurrent(agent, assistant_message, messages: list, effe
                 _ra()._set_interrupt(False, _worker_tid)
             except Exception:
                 pass
+            execution_lease.finish()
 
     # Start spinner for CLI mode (skip when TUI handles tool progress)
     spinner = None
@@ -1574,6 +1837,20 @@ def execute_tool_calls_concurrent(agent, assistant_message, messages: list, effe
                         # fan-out so none of them wakes up later and dispatches
                         # a tool this loop just reported as timed out.
                         _abandon_batch()
+                        with execution_leases_lock:
+                            abandoned_indices.update(
+                                future_to_index[f]
+                                for f in not_done
+                                if f in future_to_index
+                            )
+                            leases_to_abandon = [
+                                execution_leases.get(future_to_index[f])
+                                for f in not_done
+                                if f in future_to_index
+                            ]
+                        for lease in leases_to_abandon:
+                            if lease is not None:
+                                lease.abandon()
                         with agent._tool_worker_threads_lock:
                             worker_tids = list(agent._tool_worker_threads)
                         for tid in worker_tids:
@@ -1605,6 +1882,20 @@ def execute_tool_calls_concurrent(agent, assistant_message, messages: list, effe
                         # Give already-running tools a moment to notice the
                         # per-thread interrupt signal and exit gracefully.
                         concurrent.futures.wait(not_done, timeout=3.0)
+                        with execution_leases_lock:
+                            abandoned_indices.update(
+                                future_to_index[f]
+                                for f in not_done
+                                if f in future_to_index
+                            )
+                            leases_to_abandon = [
+                                execution_leases.get(future_to_index[f])
+                                for f in not_done
+                                if f in future_to_index
+                            ]
+                        for lease in leases_to_abandon:
+                            if lease is not None:
+                                lease.abandon()
                         break
 
                     _conc_elapsed = int(time.time() - _conc_start)

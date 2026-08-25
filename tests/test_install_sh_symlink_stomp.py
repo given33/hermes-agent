@@ -15,20 +15,56 @@ in ``command_link_dir`` and the venv entry point is left intact.
 
 from __future__ import annotations
 
+import os
 import re
+import shutil
 import stat
 import subprocess
+import sys
 from pathlib import Path
 
+import pytest
 
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 INSTALL_SH = REPO_ROOT / "scripts" / "install.sh"
 
 
+def _working_bash() -> str | None:
+    """Locate a POSIX shell that can run extracted install.sh blocks.
+
+    On Windows, ``bash`` on PATH is frequently the WSL launcher stub
+    (``system32\\bash.exe``), which exits non-zero whenever WSL has no
+    installed distro -- so ``shutil.which('bash')`` alone proves nothing.
+    Validate candidates by executing them, preferring an explicit
+    Git-for-Windows installation over whatever PATH order says.
+    """
+    candidates: list[str] = []
+    if sys.platform == "win32":
+        pf = os.environ.get("ProgramFiles", "C:\\Program Files")
+        candidates.append(os.path.join(pf, "Git", "bin", "bash.exe"))
+        pf86 = os.environ.get("ProgramFiles(x86)")
+        if pf86:
+            candidates.append(os.path.join(pf86, "Git", "bin", "bash.exe"))
+    which_bash = shutil.which("bash")
+    if which_bash:
+        candidates.append(which_bash)
+    for cand in candidates:
+        try:
+            probe = subprocess.run([cand, "-c", ":"], capture_output=True, timeout=30)
+        except (OSError, subprocess.TimeoutExpired):
+            continue
+        if probe.returncode == 0:
+            return cand
+    return None
+
+
+_BASH = _working_bash()
+
+
 def _extract_setup_path_shim_block() -> str:
     """Return the install.sh shim-write block used by setup_path()."""
-    text = INSTALL_SH.read_text()
+    text = INSTALL_SH.read_text(encoding="utf-8")
     match = re.search(
         r"(?P<block>mkdir -p \"\$command_link_dir\".*?chmod \+x \"\$command_link_dir/hermes\")",
         text,
@@ -57,6 +93,8 @@ def test_setup_path_shim_block_removes_old_link_before_writing() -> None:
     )
 
 
+@pytest.mark.require_symlinks
+@pytest.mark.skipif(_BASH is None, reason="needs a working bash")
 def test_re_running_setup_path_block_preserves_pip_entry_point(tmp_path: Path) -> None:
     """Behavioral repro: simulate prior-install symlink + new-install heredoc.
 
@@ -92,9 +130,10 @@ def test_re_running_setup_path_block_preserves_pip_entry_point(tmp_path: Path) -
     # Drive the block with the real env vars setup_path() sets.
     script = f'set -e\nHERMES_BIN={pip_entry!s}\ncommand_link_dir={command_link_dir!s}\n{block}\n'
     result = subprocess.run(
-        ["bash", "-c", script],
+        [_BASH, "-c", script],
         capture_output=True,
         text=True,
+        encoding="utf-8",
         cwd=tmp_path,
     )
     assert result.returncode == 0, (
@@ -103,7 +142,7 @@ def test_re_running_setup_path_block_preserves_pip_entry_point(tmp_path: Path) -
 
     # The pip entry point must still be the original pip script — not a
     # re-written self-recursing bash shim.
-    assert pip_entry.read_text() == pip_marker, (
+    assert pip_entry.read_text(encoding="utf-8") == pip_marker, (
         "venv/bin/hermes was overwritten by setup_path() — symlink-stomp "
         "regression (#21454)."
     )
@@ -114,7 +153,7 @@ def test_re_running_setup_path_block_preserves_pip_entry_point(tmp_path: Path) -
         "command_link_dir/hermes must be replaced with a regular file, not "
         "left as a symlink — otherwise the next install will stomp again."
     )
-    shim_text = shim_path.read_text()
+    shim_text = shim_path.read_text(encoding="utf-8")
     assert "unset PYTHONPATH" in shim_text
     assert "unset PYTHONHOME" in shim_text
     assert f'exec "{pip_entry}"' in shim_text

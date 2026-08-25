@@ -25,6 +25,7 @@ from __future__ import annotations
 
 import contextlib
 import os
+import posixpath
 import re
 import secrets
 import sqlite3
@@ -34,7 +35,7 @@ from pathlib import Path
 from typing import Iterable, List, Optional
 
 from hermes_cli.sqlite_util import add_column_if_missing as _add_column_if_missing, write_txn
-from hermes_constants import get_hermes_home
+from hermes_constants import expand_user_path, get_hermes_home
 
 # ---------------------------------------------------------------------------
 # Paths
@@ -141,7 +142,17 @@ def _now() -> int:
 
 def _normalize_path(path: str) -> str:
     """Absolute, user-expanded, separator-normalized path (no trailing sep)."""
-    p = os.path.abspath(os.path.expanduser(str(path).strip()))
+    raw = str(path).strip()
+    if not raw:
+        return ""
+    # Project paths can name a remote/container workspace. On Windows, the
+    # native path helper would reinterpret an explicit POSIX root such as
+    # ``/var/repo`` as ``C:\\var\\repo`` and lose that namespace. Keep
+    # single-root POSIX inputs lexical; UNC paths remain native Windows.
+    if os.name == "nt" and raw.startswith("/") and not raw.startswith("//"):
+        p = posixpath.normpath(raw)
+    else:
+        p = os.path.abspath(expand_user_path(raw))
     return p.rstrip("/\\") or p
 
 

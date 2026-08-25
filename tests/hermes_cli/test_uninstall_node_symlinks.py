@@ -25,6 +25,21 @@ def fake_home(tmp_path, monkeypatch):
     return home
 
 
+def _symlink_or_skip(target, link) -> None:
+    """symlink_to() that skips where the OS forbids symlinks.
+
+    Unprivileged Windows raises OSError winerror 1314 on any symlink
+    creation; the scenario under test can't even be constructed there,
+    so skip instead of failing (POSIX and Developer-Mode Windows run).
+    """
+    try:
+        link.symlink_to(target)
+    except OSError as e:
+        if getattr(e, "winerror", None) == 1314:
+            pytest.skip("symbolic link privilege unavailable on this host")
+        raise
+
+
 def _make_hermes_node(hermes_home: Path) -> Path:
     """Create a fake $HERMES_HOME/node/bin/{node,npm,npx} tree."""
     node_bin = hermes_home / "node" / "bin"
@@ -47,7 +62,7 @@ def test_leaves_unrelated_symlinks_untouched(fake_home):
     nvm_bin = fake_home / ".nvm" / "versions" / "node" / "v20.0.0" / "bin"
     nvm_bin.mkdir(parents=True)
     (nvm_bin / "node").write_text("#!/bin/sh\n")
-    (local_bin / "node").symlink_to(nvm_bin / "node")
+    _symlink_or_skip(nvm_bin / "node", local_bin / "node")
 
     removed = uninstall.remove_node_symlinks(hermes_home)
 
@@ -77,7 +92,7 @@ def test_removes_fhs_symlinks_in_usr_local_bin(fake_home, tmp_path, monkeypatch)
     fhs_bin = tmp_path / "usr_local_bin"
     fhs_bin.mkdir()
     for name in ("node", "npm", "npx"):
-        (fhs_bin / name).symlink_to(node_bin / name)
+        _symlink_or_skip(node_bin / name, fhs_bin / name)
 
     # Ensure ~/.local/bin has NO symlinks (simulate pure FHS install).
     local_bin = fake_home / ".local" / "bin"

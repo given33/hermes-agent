@@ -17,31 +17,40 @@ _profile_scoped = _registry.profile_scoped
 
 
 @method("projects.discover_repos")
+@_profile_scoped
 def _(rid, params: dict) -> dict:
     """Repos for the desktop overview: scanned-from-disk (cached) ∪ session-derived."""
     try:
-        db = _get_db()
-        if db is None:
-            return _ok(rid, {"repos": []})
-        from hermes_cli import projects_db as pdb
+        with _profile_db(params) as db:
+            if db is None:
+                return _ok(rid, {"repos": []})
+            from hermes_cli import projects_db as pdb
 
-        policy = _repo_discovery_policy()
-        policy_key = _repo_discovery_policy_key(policy)
-        with pdb.connect_closing() as conn:
-            pdb.reconcile_discovered_repos_policy(
-                conn,
-                policy_key,
-                preserve_unversioned=_repo_discovery_policy_is_default(policy),
-            )
-            repos = _discover_repos_payload(
-                db, conn=conn, include_cached=policy["enabled"]
-            )
-        return _ok(rid, {"repos": repos, "discovery_policy": policy})
+            policy = _repo_discovery_policy()
+            policy_key = _repo_discovery_policy_key(policy)
+            with pdb.connect_closing() as conn:
+                pdb.reconcile_discovered_repos_policy(
+                    conn,
+                    policy_key,
+                    preserve_unversioned=_repo_discovery_policy_is_default(policy),
+                )
+                # `scan=true` (set by the desktop in remote-gateway mode): run a
+                # backend-side filesystem scan of the policy roots so repos with
+                # zero Hermes sessions still surface. The desktop's native scan
+                # only runs on the local filesystem; on a remote connection it
+                # must ask the host to scan itself (#81723).
+                if params.get("scan") and policy["enabled"]:
+                    _scan_discovered_repos_remote(conn, policy)
+                repos = _discover_repos_payload(
+                    db, conn=conn, include_cached=policy["enabled"]
+                )
+            return _ok(rid, {"repos": repos, "discovery_policy": policy})
     except Exception as e:
         return _err(rid, 5061, str(e))
 
 
 @method("projects.record_repos")
+@_profile_scoped
 def _(rid, params: dict) -> dict:
     """Persist git repo roots found by the client's filesystem scan, then return
     the merged repo list. The native crawl runs on the desktop (local fs); this
@@ -88,24 +97,25 @@ def _(rid, params: dict) -> dict:
             elif not policy["enabled"]:
                 pdb.clear_discovered_repos(conn, policy_key=policy_key)
 
-        db = _get_db()
-        return _ok(
-            rid,
-            {
-                "repos": _discover_repos_payload(
-                    db, include_cached=policy["enabled"]
-                )
-                if db is not None
-                else [],
-                "accepted": accepted,
-                "discovery_policy": policy,
-            },
-        )
+        with _profile_db(params) as db:
+            return _ok(
+                rid,
+                {
+                    "repos": _discover_repos_payload(
+                        db, include_cached=policy["enabled"]
+                    )
+                    if db is not None
+                    else [],
+                    "accepted": accepted,
+                    "discovery_policy": policy,
+                },
+            )
     except Exception as e:
         return _err(rid, 5061, str(e))
 
 
 @method("projects.tree")
+@_profile_scoped
 def _(rid, params: dict) -> dict:
     """Authoritative project overview: project -> repo -> lane structure with
     counts + a few preview sessions per project, plus the flat set of session
@@ -113,26 +123,27 @@ def _(rid, params: dict) -> dict:
     Lanes carry no session rows here; drill-in uses ``projects.project_sessions``.
     """
     try:
-        db = _get_db()
-        if db is None:
-            return _ok(rid, {"projects": [], "active_id": None, "scoped_session_ids": []})
+        with _profile_db(params) as db:
+            if db is None:
+                return _ok(rid, {"projects": [], "active_id": None, "scoped_session_ids": []})
 
-        tree, active_id = _build_project_tree(
-            db,
-            preview_limit=int(params.get("preview_limit") or 3),
-            hydrate=False,
-            session_limit=int(params.get("session_limit") or 2000),
-            include_discovered=True,
-        )
-        return _ok(
-            rid,
-            {"projects": tree["projects"], "active_id": active_id, "scoped_session_ids": tree["scoped_session_ids"]},
-        )
+            tree, active_id = _build_project_tree(
+                db,
+                preview_limit=int(params.get("preview_limit") or 3),
+                hydrate=False,
+                session_limit=int(params.get("session_limit") or 2000),
+                include_discovered=True,
+            )
+            return _ok(
+                rid,
+                {"projects": tree["projects"], "active_id": active_id, "scoped_session_ids": tree["scoped_session_ids"]},
+            )
     except Exception as e:
         return _err(rid, 5061, str(e))
 
 
 @method("projects.project_sessions")
+@_profile_scoped
 def _(rid, params: dict) -> dict:
     """Fully hydrated lanes (repo -> lane -> session rows) for one project,
     built from the same authoritative grouping as ``projects.tree`` so ids and
@@ -142,18 +153,18 @@ def _(rid, params: dict) -> dict:
         if not project_id:
             return _err(rid, 5063, "project_id required")
 
-        db = _get_db()
-        if db is None:
-            return _ok(rid, {"project": None})
+        with _profile_db(params) as db:
+            if db is None:
+                return _ok(rid, {"project": None})
 
-        # Drill-in only needs the entered project (which has sessions), so skip
-        # the zero-session discovery tier entirely.
-        tree, _active = _build_project_tree(
-            db, preview_limit=0, hydrate=True, session_limit=int(params.get("session_limit") or 5000),
-            include_discovered=False,
-        )
-        proj = next((p for p in tree["projects"] if p["id"] == project_id), None)
-        return _ok(rid, {"project": proj})
+            # Drill-in only needs the entered project (which has sessions), so skip
+            # the zero-session discovery tier entirely.
+            tree, _active = _build_project_tree(
+                db, preview_limit=0, hydrate=True, session_limit=int(params.get("session_limit") or 5000),
+                include_discovered=False,
+            )
+            proj = next((p for p in tree["projects"] if p["id"] == project_id), None)
+            return _ok(rid, {"project": proj})
     except Exception as e:
         return _err(rid, 5061, str(e))
 
@@ -421,6 +432,105 @@ def _(rid, params: dict) -> dict:
         return _ok(rid, {"ok": False, "error": str(e)})
 
 
+def _scan_discovered_repos_remote(conn, policy: dict) -> bool:
+    """Backend-side disk scan of the discovery policy roots.
+
+    The desktop's native repo scan only runs on the local filesystem. On a
+    remote gateway connection the host must scan its own disk so repos with
+    zero Hermes sessions still appear in the sidebar (#81723). Mirrors the
+    desktop's behavior: walk each root (bounded depth), find `.git`
+    directories, record (root, label) pairs into the discovery cache.
+
+    Best-effort: any failure logs and leaves the cache untouched — the
+    session-derived repos from `_discover_repos_payload` still surface.
+
+    Returns True when the scan is authoritative (every root was walked to
+    completion without error and the per-scan cap was not hit). Only then may
+    the caller treat the result as a full replacement and pass ``replace=True``
+    to the cache write — a partial or errored scan must merge, never wipe, so
+    a failed remote refresh can't blank the previously cached repos into the
+    silent, unpopulated sidebar of #81723.
+    """
+    import logging
+    import os
+
+    from hermes_cli import projects_db as pdb
+
+    # Late import: this helper's upstream home is server.py (which owns the
+    # policy-key canonicalization); resolving it at call time avoids the
+    # import cycle while keeping the logic single-sourced.
+    from .server import _repo_discovery_policy_key
+
+    logger = logging.getLogger("tui_gateway.server")
+
+    roots = policy.get("roots") or []
+    excludes = policy.get("exclude_paths") or []
+    pairs: list[tuple[str, str | None]] = []
+    seen: set[str] = set()
+    authoritative = True
+
+    def _is_excluded(path: str) -> bool:
+        return any(path == ex or path.startswith(ex.rstrip("/\\") + os.sep) for ex in excludes if ex)
+
+    for root in roots:
+        if not os.path.isdir(root):
+            # `os.walk` on a missing root silently yields nothing instead of
+            # raising, so a temporarily unavailable root (unmounted volume,
+            # moved path) would otherwise look like a genuinely empty scan and
+            # let `authoritative` stay True — letting the replace wipe every
+            # cached repo that lived under the missing root. A missing root
+            # contributes nothing and must not be treated as authoritative.
+            authoritative = False
+            logger.debug("discover_repos scan root missing, skipping: %s", root)
+            continue
+        try:
+            for dirpath, dirnames, _filenames in os.walk(root):
+                if _is_excluded(dirpath):
+                    dirnames[:] = []
+                    continue
+                # A `.git` directory marks this directory as a repo root. Check
+                # BEFORE pruning hidden dirs — `.git` is itself hidden, so a
+                # prune-first order would drop it and never detect any repo.
+                if ".git" in dirnames:
+                    repo_root = dirpath
+                    if repo_root not in seen:
+                        seen.add(repo_root)
+                        pairs.append((repo_root, os.path.basename(repo_root)))
+                    # Don't descend into the repo's own .git to hunt nested repos.
+                    dirnames[:] = []
+                else:
+                    # Not a repo: skip hidden dirs (e.g. .hermes) and node_modules.
+                    dirnames[:] = [d for d in dirnames if not d.startswith(".") and d not in ("node_modules",)]
+                if len(pairs) >= 500:
+                    break
+        except Exception:
+            # A root that can't be walked yields no authoritative set — fall back
+            # to merging, never replacing, so the prior cache survives.
+            authoritative = False
+            logger.debug("discover_repos scan failed for root %s", root, exc_info=True)
+        if len(pairs) >= 500:
+            # Cap hit means the walk didn't cover the full roots; the collected
+            # set must not be treated as the complete authoritative universe.
+            authoritative = False
+            break
+
+    if pairs:
+        try:
+            pdb.record_discovered_repos(
+                conn, pairs, replace=authoritative, policy_key=_repo_discovery_policy_key(policy)
+            )
+        except Exception:
+            logger.debug("discover_repos cache write failed", exc_info=True)
+            authoritative = False
+    return authoritative
+
+
 def register(server) -> None:
     """Bind this module's handlers onto ``server``'s globals and registry."""
+    # After install() the handler bodies resolve globals through server.py's
+    # namespace, so the scan helper must be visible there under its pre-split
+    # name (upstream it lives in server.py; injected here because that file
+    # is out of scope for this change).
+    if "_scan_discovered_repos_remote" not in vars(server):
+        server._scan_discovered_repos_remote = _scan_discovered_repos_remote
     _registry.install(server)

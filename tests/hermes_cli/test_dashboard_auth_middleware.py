@@ -14,12 +14,17 @@ without any external IDP.  Exercises:
 """
 from __future__ import annotations
 
+import hashlib
+import threading
+import time
+
 import pytest
 
 from fastapi.testclient import TestClient
 
 from hermes_cli import web_server
 from hermes_cli.dashboard_auth import clear_providers, register_provider
+from hermes_cli.dashboard_auth.base import ProviderError
 from hermes_cli.dashboard_auth.cookies import SESSION_AT_COOKIE
 from tests.hermes_cli.conftest_dashboard_auth import StubAuthProvider
 
@@ -356,5 +361,230 @@ def test_all_providers_unreachable_returns_503(_gated_state):
     r = client.get("/api/auth/me")
     assert r.status_code == 503
     assert "unreachable" in r.text.lower()
+
+
+# ---------------------------------------------------------------------------
+# Refresh-token rotation single-flight
+#
+# Portal rotates the RT on every refresh; two requests presenting the SAME
+# cookie must not both reach the provider or the loser replays a rotated
+# token and revokes the session (forced-logout bursts).
+# ---------------------------------------------------------------------------
+
+
+class _BlockingRefreshProvider:
+    """Fake provider whose refresh blocks until the test releases it."""
+
+    name = "blocking"
+
+    def __init__(self, *, error=None):
+        self.session = object()
+        self.error = error
+        self.release = threading.Event()
+        self.calls = 0
+
+    def refresh_session(self, *, refresh_token):
+        self.calls += 1
+        if not self.release.wait(10):
+            raise AssertionError("refresh provider was never released")
+        if self.error is not None:
+            raise self.error
+        return self.session
+
+
+@pytest.fixture
+def flight_env(monkeypatch):
+    """Isolate the process-wide flight table and audit side effects."""
+    from hermes_cli.dashboard_auth import middleware as mw
+
+    with mw._refresh_flights_lock:
+        mw._refresh_flights.clear()
+    monkeypatch.setattr(mw, "audit_log", lambda *a, **k: None)
+    monkeypatch.setattr(mw, "_client_ip", lambda request: "203.0.113.9")
+    yield mw
+    with mw._refresh_flights_lock:
+        mw._refresh_flights.clear()
+
+
+def test_same_refresh_token_rotates_once_and_shares_outcome(flight_env, monkeypatch):
+    mw = flight_env
+    provider = _BlockingRefreshProvider()
+    monkeypatch.setattr(
+        mw, "_ordered_session_providers", lambda hint=None: [provider]
+    )
+    outcomes: dict[int, tuple[str, object]] = {}
+    start = threading.Barrier(4)
+
+    def call():
+        start.wait(5)
+        try:
+            outcomes[id(threading.current_thread())] = (
+                "ok",
+                mw._attempt_refresh(None, refresh_token="tok-A"),
+            )
+        except BaseException as exc:  # noqa: BLE001 - captured on purpose
+            outcomes[id(threading.current_thread())] = ("error", exc)
+
+    threads = [threading.Thread(target=call) for _ in range(4)]
+    for t in threads:
+        t.start()
+    deadline = time.time() + 5
+    while provider.calls < 1 and time.time() < deadline:
+        time.sleep(0.01)
+    # Let the waiters pile up on the leader's flight before it settles.
+    time.sleep(0.2)
+    provider.release.set()
+    for t in threads:
+        t.join(10)
+    assert not any(t.is_alive() for t in threads)
+    assert provider.calls == 1
+    assert [kind for kind, _ in outcomes.values()] == ["ok"] * 4
+    assert len({id(value) for _, value in outcomes.values()}) == 1
+
+
+def test_provider_error_is_relayed_verbatim_to_waiters(flight_env, monkeypatch):
+    mw = flight_env
+    boom = ProviderError("portal down")
+    provider = _BlockingRefreshProvider(error=boom)
+    monkeypatch.setattr(
+        mw, "_ordered_session_providers", lambda hint=None: [provider]
+    )
+    caught: list[BaseException] = []
+    start = threading.Barrier(3)
+
+    def call():
+        start.wait(5)
+        try:
+            mw._attempt_refresh(None, refresh_token="tok-B")
+            caught.append(AssertionError("expected ProviderError"))
+        except ProviderError as exc:
+            caught.append(exc)
+
+    threads = [threading.Thread(target=call) for _ in range(3)]
+    for t in threads:
+        t.start()
+    deadline = time.time() + 5
+    while provider.calls < 1 and time.time() < deadline:
+        time.sleep(0.01)
+    time.sleep(0.2)
+    provider.release.set()
+    for t in threads:
+        t.join(10)
+    assert not any(t.is_alive() for t in threads)
+    assert provider.calls == 1
+    assert len(caught) == 3
+    # The SAME failure outcome reaches every waiter: the uncached rotation
+    # converts the provider-level error into its own ProviderError (which
+    # the middleware turns into a 503) and relays ONE shared instance, so
+    # no waiter re-attempts against the failing provider.
+    assert all(isinstance(exc, ProviderError) for exc in caught)
+    assert len({id(exc) for exc in caught}) == 1
+    assert all(str(exc) == str(caught[0]) for exc in caught)
+
+
+def test_distinct_refresh_tokens_rotate_independently(flight_env, monkeypatch):
+    mw = flight_env
+    provider = _BlockingRefreshProvider()
+    provider.release.set()
+    monkeypatch.setattr(
+        mw, "_ordered_session_providers", lambda hint=None: [provider]
+    )
+    first = mw._attempt_refresh(None, refresh_token="tok-C1")
+    second = mw._attempt_refresh(None, refresh_token="tok-C2")
+    assert provider.calls == 2
+    assert first is not second
+
+
+def test_flight_key_hashes_the_token_and_raw_secret_is_not_stored(
+    flight_env, monkeypatch
+):
+    mw = flight_env
+    token = "super-secret-refresh-token"
+    assert mw._refresh_flight_key(token) == hashlib.sha256(
+        token.encode("utf-8")
+    ).hexdigest()
+    provider = _BlockingRefreshProvider()
+    provider.release.set()
+    monkeypatch.setattr(
+        mw, "_ordered_session_providers", lambda hint=None: [provider]
+    )
+    outcome = mw._attempt_refresh(None, refresh_token=token)
+    assert outcome == (provider.session, "blocking")
+    assert token not in mw._refresh_flights
+    # Keys are sha256 hex digests, never the raw presented token.
+    assert all(
+        len(key) == 64 and all(ch in "0123456789abcdef" for ch in key)
+        for key in mw._refresh_flights
+    )
+
+
+def test_sweep_evicts_expired_completed_flights_only(flight_env):
+    mw = flight_env
+    now = time.monotonic()
+    stale = mw._RefreshFlight()
+    stale.done.set()
+    stale.completed_at = now - (mw._REFRESH_SINGLEFLIGHT_TTL_SECONDS + 1)
+    fresh_done = mw._RefreshFlight()
+    fresh_done.done.set()
+    fresh_done.completed_at = now
+    inflight = mw._RefreshFlight()
+    with mw._refresh_flights_lock:
+        mw._refresh_flights.update(
+            {"stale": stale, "fresh": fresh_done, "live": inflight}
+        )
+        mw._sweep_refresh_flights_locked(time.monotonic())
+        assert set(mw._refresh_flights) == {"fresh", "live"}
+
+
+def test_entry_cap_evicts_oldest_finished_flight_first(flight_env):
+    mw = flight_env
+    cap = mw._REFRESH_SINGLEFLIGHT_MAX_ENTRIES
+    now = time.monotonic()
+    with mw._refresh_flights_lock:
+        for i in range(cap):
+            flight = mw._RefreshFlight()
+            flight.done.set()
+            flight.completed_at = now + i * 0.001
+            mw._refresh_flights[f"filler-{i}"] = flight
+        mw._sweep_refresh_flights_locked(now + 1)
+        assert len(mw._refresh_flights) < cap
+        # The oldest finished entry went first.
+        assert "filler-0" not in mw._refresh_flights
+        assert f"filler-{cap - 1}" in mw._refresh_flights
+
+
+def test_stalled_leader_degrades_to_direct_attempt(flight_env, monkeypatch):
+    mw = flight_env
+    monkeypatch.setattr(mw, "_REFRESH_SINGLEFLIGHT_TTL_SECONDS", 0.05)
+    provider = _BlockingRefreshProvider()
+    monkeypatch.setattr(
+        mw, "_ordered_session_providers", lambda hint=None: [provider]
+    )
+
+    def leader():
+        mw._attempt_refresh(None, refresh_token="tok-D")
+
+    lead = threading.Thread(target=leader)
+    lead.start()
+    deadline = time.time() + 5
+    while provider.calls < 1 and time.time() < deadline:
+        time.sleep(0.01)
+    waiter_outcome: dict[str, object] = {}
+
+    def waiter():
+        waiter_outcome["value"] = mw._attempt_refresh(
+            None, refresh_token="tok-D"
+        )
+
+    w = threading.Thread(target=waiter)
+    w.start()
+    w.join(5)
+    provider.release.set()
+    lead.join(10)
+    assert not lead.is_alive() and not w.is_alive()
+    # The waiter outlived the TTL window, so it performed its own attempt
+    # instead of hanging on a stalled leader.
+    assert provider.calls == 2
+    assert waiter_outcome["value"] == (provider.session, "blocking")
 
 

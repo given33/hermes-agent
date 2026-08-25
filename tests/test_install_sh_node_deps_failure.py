@@ -7,6 +7,10 @@ import os
 import subprocess
 from pathlib import Path
 
+import pytest
+
+_IS_POSIX = __import__("sys").platform != "win32"
+
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 INSTALL_SH = REPO_ROOT / "scripts" / "install.sh"
@@ -92,6 +96,8 @@ def _stage_result(proc: subprocess.CompletedProcess[str]) -> dict[str, object]:
     return json.loads(proc.stdout.splitlines()[-1])
 
 
+
+@pytest.mark.skipif(not _IS_POSIX, reason="POSIX shell + shebang execution")
 def test_root_node_dependency_failure_is_fatal(tmp_path: Path) -> None:
     install_dir = tmp_path / "install"
     proc, actual_install_dir, calls = _run_node_deps_stage(
@@ -113,6 +119,7 @@ def test_root_node_dependency_failure_is_fatal(tmp_path: Path) -> None:
     assert not (install_dir / "node_modules").exists()
 
 
+@pytest.mark.skipif(not _IS_POSIX, reason="POSIX shell + shebang execution")
 def test_tui_node_dependency_failure_is_fatal(tmp_path: Path) -> None:
     install_dir = tmp_path / "install"
     tui_dir = install_dir / "ui-tui"
@@ -128,6 +135,7 @@ def test_tui_node_dependency_failure_is_fatal(tmp_path: Path) -> None:
     assert "TUI dependencies installed" not in proc.stdout
 
 
+@pytest.mark.skipif(not _IS_POSIX, reason="POSIX shell + shebang execution")
 def test_node_dependency_success_remains_successful(tmp_path: Path) -> None:
     proc, install_dir, calls = _run_node_deps_stage(
         tmp_path,

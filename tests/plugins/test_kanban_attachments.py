@@ -268,7 +268,7 @@ def test_cli_attach_attachments_and_rm(kanban_home, tmp_path):
     src = tmp_path / "upload.txt"
     src.write_bytes(b"cli file body")
 
-    out = run_slash(f"attach {task_id} {src}")
+    out = run_slash(f"attach {task_id} {src.as_posix()}")
     assert "Attached" in out, out
 
     conn = kb.connect()
@@ -291,5 +291,4 @@ def test_cli_attach_attachments_and_rm(kanban_home, tmp_path):
         assert kb.list_attachments(conn, task_id) == []
     finally:
         conn.close()
-
 

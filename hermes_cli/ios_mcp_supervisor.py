@@ -1894,7 +1894,10 @@ class IOSMCPRuntimeSupervisor:
                     url,
                     http_client=http_client,
                     terminate_on_close=True,
-                ) as (read_stream, write_stream, _):
+                ) as streams:
+                    # MCP 1.x yields a session-id callback as its third item;
+                    # 2.0 removed it. Health probing only needs the streams.
+                    read_stream, write_stream = streams[0], streams[1]
                     async with ClientSession(read_stream, write_stream) as client:
                         await client.initialize()
                         result = await client.list_tools()

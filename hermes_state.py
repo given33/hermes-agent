@@ -438,28 +438,65 @@ _STATE_DB_GUARD_BYPASS_ENV = "HERMES_STATE_DB_GUARD_BYPASS"
 _STATE_DB_GUARD_EXTRA_DENY_ROOTS: Tuple[Path, ...] = ()
 
 
+def _platform_default_state_roots() -> List[Path]:
+    """Enumerate every REAL platform-default Hermes root, primary first.
+
+    Mirrors ``hermes_constants._get_platform_default_hermes_home()`` so the
+    guard can never be blind to the root an unredirected
+    ``_default_db_path()`` actually resolves (#82770): an explicit ``HOME``
+    is the profile-isolation contract used by launchers, tests, containers,
+    and subprocess spawners and wins on EVERY platform — including native
+    Windows, where Git Bash, MSYS, and CI runners routinely export HOME.
+    The platform cache directory (``%LOCALAPPDATA%\\hermes``, or the passwd
+    home's ``.hermes`` on POSIX) is production only when ``HOME`` is absent,
+    but BOTH spellings are refused: a spawned child may inherit either env
+    shape depending on who launched it.
+
+    Deliberately avoids ``Path.home()`` / calling into ``hermes_constants``:
+    tests routinely monkeypatch ``Path.home`` to a tempdir, and
+    ``hermes_state`` is often imported lazily *while* such a patch is
+    active — resolving through the patched callable would misidentify the
+    test's own hermetic home as "production" (false positive) or, worse,
+    miss the real one (false negative).  Reading the environment variables
+    directly keeps the answer anchored to the real machine; the hermetic
+    conftest never rewrites ``HOME``.
+    """
+    candidates: List[Path] = []
+    home_env = os.environ.get("HOME", "").strip()
+    if home_env:
+        # Explicit HOME is the profile-isolation contract (launchers,
+        # tests, containers, spawners) — same precedence as
+        # hermes_constants._get_platform_default_hermes_home().
+        candidates.append(Path(home_env) / ".hermes")
+    if sys.platform == "win32":
+        base = os.environ.get("LOCALAPPDATA", "").strip()
+        if base:
+            candidates.append(Path(base) / "hermes")
+        else:
+            candidates.append(
+                Path(os.path.expanduser("~")) / "AppData" / "Local" / "hermes"
+            )
+    else:
+        try:
+            import pwd
+
+            candidates.append(Path(pwd.getpwuid(os.getuid()).pw_dir) / ".hermes")
+        except (ImportError, KeyError, OSError):
+            pass
+        candidates.append(Path(os.path.expanduser("~")) / ".hermes")
+    return candidates
+
+
 def _real_platform_state_root() -> Optional[Path]:
     """Resolve the REAL platform-default Hermes root for the guard.
 
-    Deliberately avoids ``Path.home()`` / ``hermes_constants``: tests
-    routinely monkeypatch ``Path.home`` to a tempdir, and ``hermes_state``
-    is often imported lazily *while* such a patch is active — resolving
-    through the patched callable would misidentify the test's own hermetic
-    home as "production" (false positive) or, worse, miss the real one
-    (false negative).  ``os.path.expanduser`` reads the HOME environment
-    variable / passwd entry, which the hermetic conftest never rewrites.
+    The primary candidate from :func:`_platform_default_state_roots` —
+    i.e. exactly the root an unredirected ``_default_db_path()`` resolves
+    in this environment.
     """
     try:
-        if sys.platform == "win32":
-            base = os.environ.get("LOCALAPPDATA", "").strip()
-            root = (
-                Path(base) / "hermes"
-                if base
-                else Path(os.path.expanduser("~")) / "AppData" / "Local" / "hermes"
-            )
-        else:
-            root = Path(os.path.expanduser("~")) / ".hermes"
-        return root.resolve()
+        candidates = _platform_default_state_roots()
+        return candidates[0].resolve() if candidates else None
     except Exception:
         return None
 
@@ -567,14 +604,23 @@ def _in_test_context() -> bool:
 
 def _production_state_roots() -> List[Path]:
     roots: List[Path] = []
-    real_root = _real_platform_state_root()
-    if real_root is not None:
-        roots.append(real_root)
-    for extra in _STATE_DB_GUARD_EXTRA_DENY_ROOTS:
+    seen = set()
+    for cand in _platform_default_state_roots():
         try:
-            roots.append(Path(extra).expanduser().resolve())
+            resolved = cand.expanduser().resolve()
         except Exception:
             continue
+        if resolved not in seen:
+            seen.add(resolved)
+            roots.append(resolved)
+    for extra in _STATE_DB_GUARD_EXTRA_DENY_ROOTS:
+        try:
+            resolved = Path(extra).expanduser().resolve()
+        except Exception:
+            continue
+        if resolved not in seen:
+            seen.add(resolved)
+            roots.append(resolved)
     return roots
 
 
@@ -11418,15 +11464,36 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         """
         if sessions_dir is None:
             return
+        # Imported rows are untrusted until they pass this boundary. A path
+        # separator, drive prefix, wildcard, or ``..`` must never reach file
+        # construction below.
+        if (
+            not session_id
+            or len(session_id) > 200
+            or session_id[0] == "."
+            or any(ch not in "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789._-" for ch in session_id)
+        ):
+            return
+        sessions_dir = sessions_dir.resolve(strict=False)
         for suffix in (".json", ".jsonl"):
             p = sessions_dir / f"{session_id}{suffix}"
+            try:
+                if p.parent.resolve(strict=False) != sessions_dir:
+                    continue
+            except OSError:
+                continue
             try:
                 p.unlink(missing_ok=True)
             except OSError:
                 pass
         # request_dump files use session_id as a prefix component
         try:
-            for p in sessions_dir.glob(f"request_dump_{session_id}_*.json"):
+            for p in tuple(sessions_dir.glob(f"request_dump_{session_id}_*.json")):
+                try:
+                    if p.parent.resolve(strict=False) != sessions_dir:
+                        continue
+                except OSError:
+                    continue
                 try:
                     p.unlink(missing_ok=True)
                 except OSError:
@@ -12262,10 +12329,24 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
             return 0
 
         def _do(conn):
+            # Legacy rows may have been persisted with either slash style
+            # (for example by a subprocess using ``Path.as_posix()``). Match
+            # after converting stored backslashes to slash separators while
+            # retaining the raw arms for SQLite indexes and POSIX paths.
+            slash_prefix = prefix.replace("\\", "/")
             cursor = conn.execute(
                 "UPDATE sessions SET source = 'kanban' "
-                "WHERE source = 'cli' AND (cwd = ? OR cwd LIKE ? ESCAPE '\\')",
-                (prefix, _escape_like(prefix) + "/%"),
+                "WHERE source = 'cli' AND (cwd = ? OR cwd LIKE ? ESCAPE '\\' "
+                "OR cwd LIKE ? ESCAPE '\\' "
+                "OR REPLACE(cwd, char(92), '/') = ? "
+                "OR REPLACE(cwd, char(92), '/') LIKE ? ESCAPE '\\')",
+                (
+                    prefix,
+                    _escape_like(prefix) + "/%",
+                    _escape_like(prefix) + "\\\\%",
+                    slash_prefix,
+                    _escape_like(slash_prefix) + "/%",
+                ),
             )
             # Read rowcount before set_meta reuses this cursor for its INSERT,
             # which would otherwise overwrite it with the meta write's count.

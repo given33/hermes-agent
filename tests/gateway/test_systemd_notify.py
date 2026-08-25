@@ -27,6 +27,10 @@ def test_notify_supports_systemd_abstract_socket(monkeypatch):
         receiver.close()
 
 
+@pytest.mark.skipif(
+    not hasattr(socket, "AF_UNIX"),
+    reason="Windows: no AF_UNIX datagram support, notify() short-circuits",
+)
 def test_notify_uses_nonblocking_datagram_send(monkeypatch):
     calls: list[object] = []
 
@@ -55,6 +59,10 @@ def test_notify_uses_nonblocking_datagram_send(monkeypatch):
     assert calls[0] == ("setblocking", False)
 
 
+@pytest.mark.skipif(
+    not hasattr(socket, "AF_UNIX"),
+    reason="Windows: no AF_UNIX datagram support, watchdog can't send heartbeats",
+)
 @pytest.mark.asyncio
 async def test_watchdog_sends_ready_heartbeat_and_stopping(monkeypatch):
     calls: list[str] = []

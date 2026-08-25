@@ -13,9 +13,11 @@ before stashing (#4735); both installer scripts must do the same.
 
 from __future__ import annotations
 
+import os
 import re
 import shutil
 import subprocess
+import sys
 from pathlib import Path
 
 import pytest
@@ -24,9 +26,41 @@ REPO_ROOT = Path(__file__).resolve().parent.parent
 INSTALL_SH = REPO_ROOT / "scripts" / "install.sh"
 INSTALL_PS1 = REPO_ROOT / "scripts" / "install.ps1"
 
+
+def _working_bash() -> str | None:
+    """Locate a POSIX shell that can run extracted install.sh blocks.
+
+    On Windows, ``bash`` on PATH is frequently the WSL launcher stub
+    (``system32\\bash.exe``), which exits non-zero whenever WSL has no
+    installed distro -- so ``shutil.which('bash')`` alone proves nothing.
+    Validate candidates by executing them, preferring an explicit
+    Git-for-Windows installation over whatever PATH order says.
+    """
+    candidates: list[str] = []
+    if sys.platform == "win32":
+        pf = os.environ.get("ProgramFiles", "C:\\Program Files")
+        candidates.append(os.path.join(pf, "Git", "bin", "bash.exe"))
+        pf86 = os.environ.get("ProgramFiles(x86)")
+        if pf86:
+            candidates.append(os.path.join(pf86, "Git", "bin", "bash.exe"))
+    which_bash = shutil.which("bash")
+    if which_bash:
+        candidates.append(which_bash)
+    for cand in candidates:
+        try:
+            probe = subprocess.run([cand, "-c", ":"], capture_output=True, timeout=30)
+        except (OSError, subprocess.TimeoutExpired):
+            continue
+        if probe.returncode == 0:
+            return cand
+    return None
+
+
+_BASH = _working_bash()
+
 pytestmark = pytest.mark.skipif(
-    shutil.which("git") is None or shutil.which("bash") is None,
-    reason="needs git and bash",
+    shutil.which("git") is None or _BASH is None,
+    reason="needs git and a working bash",
 )
 
 
@@ -37,12 +71,13 @@ def _git(cwd: Path, *args: str, check: bool = True) -> subprocess.CompletedProce
         check=check,
         capture_output=True,
         text=True,
+        encoding="utf-8",
     )
 
 
 def _extract_autostash_block() -> str:
     """Pull the autostash if-block from install.sh's update_repo()."""
-    text = INSTALL_SH.read_text()
+    text = INSTALL_SH.read_text(encoding="utf-8")
     m = re.search(
         r'local autostash_ref="".*?\n            fi\n',
         text,
@@ -53,7 +88,7 @@ def _extract_autostash_block() -> str:
 
 
 def _extract_install_sh_function(name: str) -> str:
-    text = INSTALL_SH.read_text()
+    text = INSTALL_SH.read_text(encoding="utf-8")
     match = re.search(rf"{name}\(\) \{{.*?\n\}}", text, re.DOTALL)
     assert match is not None, f"{name}() not found in install.sh"
     return match.group(0)
@@ -108,7 +143,11 @@ def test_install_sh_clears_unmerged_index_then_stashes(tmp_path: Path) -> None:
         "echo BLOCK_OK\n"
     )
     res = subprocess.run(
-        ["bash", "-c", script], cwd=repo, capture_output=True, text=True
+        [_BASH, "-c", script],
+        cwd=repo,
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
     )
 
     # The block must complete (previously `git stash` failed with "could not
@@ -130,7 +169,7 @@ def test_install_sh_clears_unmerged_index_then_stashes(tmp_path: Path) -> None:
 def test_install_ps1_clears_unmerged_index_before_stash() -> None:
     """install.ps1 must clear an unmerged index before stash/checkout, and do
     so *before* the stash push (order matters — the fix is a no-op otherwise)."""
-    text = INSTALL_PS1.read_text()
+    text = INSTALL_PS1.read_text(encoding="utf-8")
     assert "ls-files --unmerged" in text, (
         "install.ps1 must detect an unmerged index before updating"
     )
@@ -145,7 +184,7 @@ def test_install_ps1_clears_unmerged_index_before_stash() -> None:
 
 def test_install_sh_clears_unmerged_index_before_stash_source_order() -> None:
     """Same ordering contract for install.sh's source."""
-    text = INSTALL_SH.read_text()
+    text = INSTALL_SH.read_text(encoding="utf-8")
     assert "ls-files --unmerged" in text
     idx_unmerged = text.index("ls-files --unmerged")
     idx_stash = text.index("stash push --include-untracked")
@@ -164,7 +203,7 @@ def test_install_ps1_stops_venv_resident_processes_before_parking_venv() -> None
     must never fall back to an in-place ``Remove-Item`` of the live ``venv``
     (#83149 — that path can gut site-packages with no rollback).
     """
-    text = INSTALL_PS1.read_text()
+    text = INSTALL_PS1.read_text(encoding="utf-8")
 
     # The hermes.exe tree-kill is preserved (kills spawned child processes too).
     assert 'taskkill /F /T /IM hermes.exe' in text

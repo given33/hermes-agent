@@ -1,6 +1,7 @@
 """Sibling regression test for #79178: background-PTY stdin must round-trip
 surrogateescape content instead of crashing on the strict UTF-8 encode."""
 import shlex
+import sys
 import time
 
 import pytest
@@ -29,10 +30,17 @@ def test_write_stdin_pty_surrogateescape_roundtrip(tmp_path):
         result = registry.write_stdin(
             session.id, b"\xff".decode("utf-8", "surrogateescape") + "\n"
         )
-        assert result["status"] == "ok", result
-        deadline = time.monotonic() + 10
-        while time.monotonic() < deadline and not out.exists():
-            time.sleep(0.05)
-        assert out.read_bytes() == b"\xff\n"
+        if sys.platform == "win32":
+            # ConPTY accepts UTF-16 text, not Python surrogateescape bytes.
+            # The registry must reject the operation rather than let pywinpty's
+            # native boundary panic the whole process.
+            assert result["status"] == "error", result
+            assert "Windows PTY input requires valid Unicode" in result["error"]
+        else:
+            assert result["status"] == "ok", result
+            deadline = time.monotonic() + 10
+            while time.monotonic() < deadline and not out.exists():
+                time.sleep(0.05)
+            assert out.read_bytes() == b"\xff\n"
     finally:
         registry.kill_process(session.id)

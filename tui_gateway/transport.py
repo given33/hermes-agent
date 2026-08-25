@@ -97,6 +97,22 @@ def reset_transport(token) -> None:
     _current_transport.reset(token)
 
 
+def _sanitize_line(line: str, stream: Any) -> str:
+    """Re-encode *line* through *stream*'s codec with replacement characters.
+
+    A POSIX gateway can start under ``LC_ALL=C``/``POSIX``, where stdout's
+    codec is ASCII and the first non-ASCII JSON frame raises
+    UnicodeEncodeError — killing the gateway before ``gateway.ready``.
+    Degrading unencodable characters keeps the newline-delimited framing
+    intact (one line, trailing `\\n` preserved) instead of crashing.
+    """
+    encoding = getattr(stream, "encoding", None) or "utf-8"
+    try:
+        return line.encode(encoding, "replace").decode(encoding, "replace")
+    except (LookupError, ValueError):
+        return line.encode("utf-8", "replace").decode("utf-8")
+
+
 class StdioTransport:
     """Writes JSON frames to a stream (usually ``sys.stdout``).
 
@@ -116,11 +132,16 @@ class StdioTransport:
 
         Returning ``False`` is the dispatcher's "broken stdout pipe" signal
         — ``entry.py`` calls ``sys.exit(0)`` when ``write_json`` reports
-        ``False``.  So programming errors (non-JSON-safe payloads, encoding
-        misconfig, unexpected ValueErrors, host I/O bugs like ENOSPC) MUST
-        NOT return ``False``, otherwise a real bug looks like a clean
-        disconnect and is harder to diagnose.  Those re-raise so the
-        existing crash-log infrastructure records the traceback.
+        ``False``.  So programming errors (non-JSON-safe payloads,
+        unexpected ValueErrors, host I/O bugs like ENOSPC) MUST NOT return
+        ``False``, otherwise a real bug looks like a clean disconnect and
+        is harder to diagnose.  Those re-raise so the existing crash-log
+        infrastructure records the traceback.  The one deliberate
+        non-raising case is a UnicodeEncodeError from a misconfigured
+        locale codec (e.g. ``LC_ALL=C`` ⇒ ASCII stdout): that frame is
+        degraded to replacement characters instead of killing the process
+        before ``gateway.ready`` — matching the Windows UTF-8 bootstrap's
+        ``errors="replace"`` posture in ``hermes_bootstrap.py``.
 
         Peer-gone branches:
           * ``BrokenPipeError``
@@ -142,13 +163,18 @@ class StdioTransport:
                 stream.write(line)
             except BrokenPipeError:
                 return False
+            except UnicodeEncodeError:
+                # Misconfigured locale codec (LC_ALL=C ⇒ ascii stdout):
+                # degrade THIS frame to replacement characters and keep the
+                # newline-delimited framing intact rather than raising — a
+                # raise here kills the whole gateway pre-ready.
+                stream.write(_sanitize_line(line, stream))
             except ValueError as e:
                 # ValueError("I/O operation on closed file") is the
-                # ONLY ValueError that means "peer gone".  Anything
-                # else — including UnicodeEncodeError, which is a
-                # ValueError subclass for misconfigured locales —
-                # is a real bug; re-raise so it surfaces in the crash log.
-                if isinstance(e, UnicodeEncodeError) or "closed file" not in str(e):
+                # ONLY remaining ValueError that means "peer gone".
+                # Anything else is a real bug; re-raise so it
+                # surfaces in the crash log.
+                if "closed file" not in str(e):
                     raise
                 return False
             except OSError as e:

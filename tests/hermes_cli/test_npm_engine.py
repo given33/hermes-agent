@@ -6,6 +6,7 @@ npm it owns, and every other case leaves the original failure alone.
 """
 
 import json
+import os
 import subprocess
 from pathlib import Path
 
@@ -98,7 +99,13 @@ class TestManagedDetection:
         (node / "lib" / "node_modules" / "npm" / "bin").mkdir(parents=True)
         cli = node / "lib" / "node_modules" / "npm" / "bin" / "npm-cli.js"
         cli.write_text("#!/usr/bin/env node\n", encoding="utf-8")
-        (node / "bin" / "npm").symlink_to(cli)
+        if os.name == "nt":
+            # Creating symlinks needs an elevated/Developer-Mode token here;
+            # a same-volume hardlink keeps node/bin/npm backed by the exact
+            # managed npm-cli.js bytes, which is all detection resolves.
+            os.link(cli, node / "bin" / "npm")
+        else:
+            (node / "bin" / "npm").symlink_to(cli)
         monkeypatch.setenv("HERMES_HOME", str(home))
         return home
 
@@ -110,9 +117,17 @@ class TestManagedDetection:
         """An install links ~/.local/bin/npm at the managed tree; that link is
         the npm a user's PATH actually resolves, so it must count as managed."""
         local_bin = tmp_path / "local-bin"
-        local_bin.mkdir()
         link = local_bin / "npm"
-        link.symlink_to(managed_tree / "node" / "bin" / "npm")
+        if os.name == "nt":
+            # File symlinks are privilege-gated here; a directory junction
+            # (no privilege) is the same out-of-tree alias: resolving the
+            # PATH-level npm through it must land inside the managed tree.
+            import _winapi
+
+            _winapi.CreateJunction(str(managed_tree / "node" / "bin"), str(local_bin))
+        else:
+            local_bin.mkdir()
+            link.symlink_to(managed_tree / "node" / "bin" / "npm")
         assert managed_npm_prefix(link) == managed_tree / "node"
 
     def test_system_npm_is_not_managed(self, managed_tree, tmp_path):

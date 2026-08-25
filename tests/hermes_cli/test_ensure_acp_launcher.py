@@ -8,6 +8,7 @@ launcher from ``scripts/install.sh``; existing installs get it from
 
 import os
 import stat
+import sys
 from pathlib import Path
 from unittest.mock import patch
 
@@ -31,6 +32,13 @@ def fake_home(tmp_path, monkeypatch):
 
 
 
+# _ensure_acp_launcher() is a documented no-op on native Windows
+# (install.ps1 ships hermes-acp.exe onto the user PATH instead), and the
+# POSIX launcher-write path it self-heals (symlinks, chmod, geteuid,
+# directory write bits) only exists there — same gating as the sibling
+# test_ensure_hermes_home_uid_34107.py.
+@pytest.mark.skipif(sys.platform == "win32",
+                    reason="_ensure_acp_launcher is a no-op on Windows")
 def test_does_not_follow_symlink_into_venv(fake_home, tmp_path):
     """#21454 failure mode: never write through a symlinked hermes-acp."""
     (fake_home / "hermes").write_text("#!/bin/sh\n", encoding="utf-8")
@@ -50,6 +58,9 @@ def test_does_not_follow_symlink_into_venv(fake_home, tmp_path):
 
 
 
+@pytest.mark.skipif(sys.platform == "win32",
+                    reason="_ensure_acp_launcher is a no-op on Windows; "
+                    "POSIX dir write-bit semantics do not apply")
 def test_unwritable_bin_dir_is_skipped(fake_home):
     (fake_home / "hermes").write_text("#!/bin/sh\n", encoding="utf-8")
     if os.geteuid() == 0:

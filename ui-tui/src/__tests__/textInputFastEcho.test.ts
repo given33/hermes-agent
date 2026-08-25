@@ -5,6 +5,8 @@ import {
   canFastAppendShape,
   canFastBackspaceShape,
   colorizeEcho,
+  colorizeHint,
+  hintCursorCell,
   supportsFastEchoTerminal
 } from '../components/textInput.js'
 
@@ -205,6 +207,48 @@ describe('colorizeEcho', () => {
   it('passes through on a non-color value (never emit a garbage SGR)', () => {
     expect(colorizeEcho('x', 'red')).toBe('x')
     expect(colorizeEcho('x', '#fff')).toBe('x')
+  })
+})
+
+describe('colorizeHint', () => {
+  // Same hazard as colorizeEcho: the placeholder is painted past Ink, so its
+  // fg must come from the renderer's own colorize — a hand-rolled truecolor
+  // escape is unparseable on 256-color terminals (Apple Terminal takes a
+  // bespoke rich-8-bit path), where it read GRAY or leaked SGR-2 dim into
+  // every subsequent frame.
+  it('matches Ink exactly, never a hand-rolled truecolor escape', () => {
+    for (const tone of ['#808080', '#ff2d95', '#e77fa3']) {
+      expect(colorizeHint('~', tone)).toBe(colorize('~', tone, 'foreground'))
+    }
+  })
+
+  it('falls back to the hint gray for missing/invalid hex (never garbage SGR)', () => {
+    expect(colorizeHint('~')).toBe(colorize('~', '#808080', 'foreground'))
+    expect(colorizeHint('~', 'not-a-color')).toBe(colorize('~', '#808080', 'foreground'))
+  })
+})
+
+describe('hintCursorCell', () => {
+  // Both halves (luminance-picked ink over the chip background) must be
+  // produced by Ink's colorize so they match the terminal's real depth —
+  // the synthetic cursor paints raw cells just like the fast-echo bypass.
+  it('paints ink and background through Ink colorize at real depth', () => {
+    const cases: Array<[string, string]> = [
+      ['#808080', '#ffffff'], // mid-gray chip ⇒ light ink
+      ['#ff2d95', '#ffffff'], // accent chip ⇒ light ink
+      ['#f5f5f5', '#000000'] // near-white chip ⇒ dark ink
+    ]
+    for (const [tone, ink] of cases) {
+      expect(hintCursorCell('\u2328', tone)).toBe(
+        colorize(colorize('\u2328', ink, 'foreground'), tone, 'background')
+      )
+    }
+  })
+
+  it('uses the hint-gray fallback for invalid hex (never garbage SGR)', () => {
+    expect(hintCursorCell(' ', 'bogus')).toBe(
+      colorize(colorize(' ', '#ffffff', 'foreground'), '#808080', 'background')
+    )
   })
 })
 

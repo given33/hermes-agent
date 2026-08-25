@@ -3005,6 +3005,7 @@ class TestAssistantThreadLifecycle:
         assert runner._thread_metadata_for_source(msg_event.source) == {
             "thread_id": "171.111",
             "slack_team_id": "T_OTHER",
+            "user_id": "U_USER",
         }
 
     @pytest.mark.asyncio

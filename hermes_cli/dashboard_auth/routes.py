@@ -31,6 +31,7 @@ from hermes_cli.dashboard_auth import (
     list_session_providers,
 )
 from hermes_cli.dashboard_auth.audit import AuditEvent, audit_log
+from hermes_cli.dashboard_auth.client_ip import client_ip as _client_ip
 from hermes_cli.dashboard_auth.base import (
     InvalidCodeError,
     InvalidCredentialsError,
@@ -103,13 +104,6 @@ def _redirect_uri(request: Request) -> str:
         return base
     parsed = urlparse(base)
     return urlunparse(parsed._replace(path=f"{prefix}{parsed.path}"))
-
-
-def _client_ip(request: Request) -> str:
-    fwd = request.headers.get("x-forwarded-for", "")
-    if fwd:
-        return fwd.split(",")[0].strip()
-    return request.client.host if request.client else ""
 
 
 def _prefix(request: Request) -> str:
@@ -921,6 +915,21 @@ async def api_auth_me(request: Request):
     """Return the verified session as JSON. Auth-required (gate enforces)."""
     sess = getattr(request.state, "session", None)
     if sess is None:
+        principal = getattr(request.state, "token_principal", None)
+        if principal is not None:
+            from hermes_cli.dashboard_auth.base import Session
+
+            sess = Session(
+                user_id=str(principal.principal),
+                email="",
+                display_name=str(principal.principal),
+                org_id="",
+                provider=str(principal.provider),
+                access_token="",
+                refresh_token="",
+                expires_at=0,
+            )
+    if sess is None:
         raise HTTPException(status_code=401, detail="Unauthorized")
     return {
         "user_id": sess.user_id,
@@ -952,8 +961,26 @@ async def api_auth_ws_ticket(request: Request):
     """
     sess = getattr(request.state, "session", None)
     if sess is None:
-        # Middleware should already have rejected, but check defensively.
-        raise HTTPException(status_code=401, detail="Unauthorized")
+        principal = getattr(request.state, "token_principal", None)
+        if principal is not None:
+            # Bearer-authenticated native clients do not have a cookie
+            # session.  Keep the WS-ticket contract identical for both
+            # interactive and machine identities.
+            from hermes_cli.dashboard_auth.base import Session
+
+            sess = Session(
+                user_id=str(principal.principal),
+                email="",
+                display_name=str(principal.principal),
+                org_id="",
+                provider=str(principal.provider),
+                access_token="",
+                refresh_token="",
+                expires_at=0,
+            )
+        else:
+            # Middleware should already have rejected, but check defensively.
+            raise HTTPException(status_code=401, detail="Unauthorized")
 
     # Import here so the routes module stays usable in test contexts that
     # don't load the ticket store.

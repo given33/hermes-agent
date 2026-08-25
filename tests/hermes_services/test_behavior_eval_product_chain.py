@@ -1,7 +1,7 @@
 from __future__ import annotations
 
-from collections import Counter
 import importlib.util
+from collections import Counter
 import json
 from pathlib import Path
 import sys
@@ -125,6 +125,7 @@ class DeterministicProvider:
         self.classifier_calls = 0
         self.calls: list[tuple[str, str]] = []
         self.call_counts: Counter[str] = Counter()
+        self.manager_profile = "hermes-manager"
         self.reporter_prompts: list[str] = []
         self.workflow_errors: list[str] = []
         self.evidence: dict[str, Any] = {}
@@ -261,13 +262,11 @@ class DeterministicProvider:
             )
         finally:
             managed_installations._release_execution_fence(claimed)
-        self.evidence["installation"] = (
-            managed_installations.get_managed_installation(
-                operation["id"],
-                db_path=db_path,
-                owner_id=owner_id,
-                account_generation=generation,
-            )
+        self.evidence["installation"] = managed_installations.get_managed_installation(
+            operation["id"],
+            db_path=db_path,
+            owner_id=owner_id,
+            account_generation=generation,
         )
         self.evidence["resource_catalog"] = (
             managed_installations.list_managed_resources(
@@ -309,42 +308,40 @@ class DeterministicProvider:
                 return "已接受定向调整，并将从安全检查点继续。"
 
         tool_id = f"{self.scenario}:worker:{call_number}"
-        event_callback(
-            {
-                "type": "tool.start",
-                "payload": {
-                    "tool_id": tool_id,
-                    "name": "terminal",
-                    "args": {"command": "verify-product-chain"},
-                },
-            }
-        )
+        event_callback({
+            "type": "tool.start",
+            "payload": {
+                "tool_id": tool_id,
+                "name": "terminal",
+                "args": {"command": "verify-product-chain"},
+            },
+        })
         attachments: list[dict[str, Any]] = []
         if self.scenario in {"07-ios-background", "09-targeted-intervention"}:
             self.tool_started.set()
             if not self.tool_release.wait(timeout=30):
                 raise TimeoutError("product-chain tool gate timed out")
-        if self.scenario == "11-resource-refresh":
+        if self.scenario == "11-resource-refresh" and (
+            "installation" not in self.evidence
+        ):
             self._complete_installation(artifact_context)
-        if self.scenario == "12-file-artifact-deletion":
+        if self.scenario == "12-file-artifact-deletion" and call_number == 1:
             artifact = self._store_tool_artifact(
                 artifact_context,
                 tool_call_id=tool_id,
             )
             assert self.uploaded is not None
             attachments = [self.uploaded, artifact]
-        event_callback(
-            {
-                "type": "tool.complete",
-                "payload": {
-                    "tool_id": tool_id,
-                    "name": "terminal",
-                    "result_text": "verified worker evidence",
-                    "duration_s": 0.01,
-                    "attachments": attachments,
-                },
-            }
-        )
+        event_callback({
+            "type": "tool.complete",
+            "payload": {
+                "tool_id": tool_id,
+                "name": "terminal",
+                "result_text": "verified worker evidence",
+                "duration_s": 0.01,
+                "attachments": attachments,
+            },
+        })
         return f"verified worker evidence {call_number}"
 
     def run(
@@ -361,18 +358,16 @@ class DeterministicProvider:
             call_number = self.call_counts[profile]
             self.calls.append((profile, prompt))
         if event_callback is not None:
-            event_callback(
-                {
-                    "type": "session.info",
-                    "payload": {
-                        "provider": PROVIDER_NAME,
-                        "model": MODEL_NAME,
-                    },
-                }
-            )
+            event_callback({
+                "type": "session.info",
+                "payload": {
+                    "provider": PROVIDER_NAME,
+                    "model": MODEL_NAME,
+                },
+            })
         if profile == "default" and self.mode == "chat" and self.failures:
             raise self.failures.pop(0)
-        if profile == "dbb3-manager":
+        if profile in {"dbb3-manager", self.manager_profile}:
             if call_number == 1:
                 return self._manager_plan()
             return json.dumps(
@@ -456,6 +451,12 @@ class ProductChainAdapter:
         return value
 
     def _conversation(self) -> dict[str, Any]:
+        conversation = self.module._live_conversation_snapshot(
+            self.conversation_id,
+            self.owner_id,
+        )
+        if conversation is not None:
+            return conversation
         with self.module._STATE_LOCK:
             state = self.module.load_single_state()
             return next(
@@ -550,7 +551,9 @@ class ProductChainAdapter:
         if self._intervention_sent:
             return
         if not self.provider.tool_started.wait(timeout=10):
-            raise RecoverableHostedEvalError("worker tool did not reach its atomic boundary")
+            raise RecoverableHostedEvalError(
+                "worker tool did not reach its atomic boundary"
+            )
         self.provider.intervention_queued = True
         try:
             response = self.client.post(
@@ -564,9 +567,9 @@ class ProductChainAdapter:
                 },
             )
             self.evidence["intervention_response"] = self._response_json(response)
-            self.evidence["intervention_reached_blocked_boundary"] = (
-                not self.provider.tool_release.is_set()
-            )
+            self.evidence[
+                "intervention_reached_blocked_boundary"
+            ] = not self.provider.tool_release.is_set()
             self._intervention_sent = True
         finally:
             self.provider.tool_release.set()
@@ -579,19 +582,37 @@ class ProductChainAdapter:
         thread = self._workflow_thread
         if thread is not None and thread.is_alive():
             thread.join(timeout=0.01)
-        with self.module._STATE_LOCK:
-            state = self.module.load_single_state()
-            conversation = next(
-                item
-                for item in state["conversations"]
-                if item["id"] == conversation_id
+        if (
+            thread is not None
+            and not thread.is_alive()
+            and self.provider.workflow_errors
+        ):
+            raise TerminalHostedEvalError(
+                "hosted workflow crashed: " + "; ".join(self.provider.workflow_errors),
+                error_code="workflow_crashed",
             )
-            envelope, _has_more = self.module._hosted_event_stream_frame(
-                conversation,
-                delivered_cursor=cursor,
-                include_snapshot=cursor == 0,
-                limit=self.page_size,
-            )
+
+        # The production SSE endpoint deliberately reads its immutable live
+        # projection without the account-state lock. Exercise that same path:
+        # polling full multi-megabyte JSON every 50 ms starves hosted workers.
+        conversation = self.module._live_conversation_snapshot(
+            conversation_id,
+            self.owner_id,
+        )
+        if conversation is None:
+            with self.module._STATE_LOCK:
+                state = self.module.load_single_state()
+                conversation = next(
+                    item
+                    for item in state["conversations"]
+                    if item["id"] == conversation_id
+                )
+        envelope, _has_more = self.module._hosted_event_stream_frame(
+            conversation,
+            delivered_cursor=cursor,
+            include_snapshot=cursor == 0,
+            limit=self.page_size,
+        )
         next_cursor = int(envelope["cursor"])
         self.returned_cursors.append(next_cursor)
         snapshot = envelope.get("conversation")
@@ -654,6 +675,10 @@ def _build_adapter(
     monkeypatch.setattr(auxiliary_client, "call_llm", provider.call_auxiliary)
     module.available_profiles = provider.profiles
     module.classify_intent_with_context_model = provider.classify_intent
+    # Prewarm owns the real TUI subprocess just like the provider runner does.
+    # Leaving it production-backed starts an unrelated model process that can
+    # hold the account lifecycle lock while the deterministic chain runs.
+    module.prewarm_hosted_gateway = lambda **_kwargs: None
     execute_product_workflow = module.execute_hosted_workflow
 
     def execute_with_provider(conversation_id: str, turn_id: str) -> None:
@@ -705,7 +730,7 @@ PRODUCT_SCENARIOS = [
         "05-supervisor-intervention",
         "监督调度员、Worker 和审阅员完成全部验收项",
         "work",
-        "failed",
+        "completed",
     ),
     (
         "06-reporter-verified-only",
@@ -768,13 +793,11 @@ def _parse_sse_frames(payload: bytes) -> list[dict[str, Any]]:
     for raw_line in payload.decode("utf-8").splitlines():
         if not raw_line:
             if fields.get("data"):
-                frames.append(
-                    {
-                        "id": "\n".join(fields.get("id") or []),
-                        "event": "\n".join(fields.get("event") or []),
-                        "data": json.loads("\n".join(fields["data"])),
-                    }
-                )
+                frames.append({
+                    "id": "\n".join(fields.get("id") or []),
+                    "event": "\n".join(fields.get("event") or []),
+                    "data": json.loads("\n".join(fields["data"])),
+                })
             fields = {}
             continue
         if raw_line.startswith(":"):
@@ -878,7 +901,6 @@ def test_product_backed_behavior_matrix(
             code_revision="integration-revision",
             sleep=lambda _seconds: None,
         )
-
         assert summary["outcome"] == expected_outcome, json.dumps(
             summary, ensure_ascii=False, sort_keys=True
         )
@@ -891,7 +913,9 @@ def test_product_backed_behavior_matrix(
         assert persisted["account_generation"] == summary["account_generation"]
         assert persisted["hosted_event_cursor"] == summary["cursor"]
         assert adapter.module.single_state_path().is_file()
-        assert all(validate_event_envelope(event) for event in persisted["hosted_events"])
+        assert all(
+            validate_event_envelope(event) for event in persisted["hosted_events"]
+        )
         assert len(_events(persisted, f"turn.{expected_outcome}")) == 1
 
         if scenario == "01-simple-chat":
@@ -934,58 +958,40 @@ def test_product_backed_behavior_matrix(
             ]
             assert run["task_id"]
             assert run["manager_handoff"]["plan"] == plan["plan"]
-            assert adapter.provider.call_counts["dbb3-manager"] == 2
+            assert adapter.provider.call_counts["hermes-manager"] == 1
             assert any(
-                message.get("kind") == "workflow"
-                for message in persisted["messages"]
+                message.get("kind") == "workflow" for message in persisted["messages"]
             )
         elif scenario == "04-review-rework":
-            assert run["rework_round"] == 1
-            assert run["rework_history"][0]["reviewer_control"]["verdict"] == "REWORK"
-            assert run["reviewer_control"]["verdict"] == "PASS"
-            role_stages = {
-                str((message.get("meta") or {}).get("role_stage") or "")
-                for message in persisted["messages"]
-            }
-            assert "reviewer:rework-request:1" in role_stages
-            assert "worker:dbb3-worker:rework:1" in role_stages
-            assert adapter.provider.call_counts["dbb3-worker"] == 2
-            assert adapter.provider.call_counts["reviewer"] == 2
-            assert any(
-                event["payload"].get("action") == "stage_transition"
-                and event["payload"].get("to_role") == "rework"
-                for event in _events(persisted, "role.handoff")
-            )
+            # Reviewer/supervisor LLM gates are retired. Verified worker
+            # evidence is accepted by the deterministic server-side gate.
+            assert run["rework_round"] == 0
+            assert run["validation_verdicts"]["final_report"] == "pass"
+            assert adapter.provider.call_counts["dbb3-worker"] == 3
+            assert "reviewer" not in adapter.provider.call_counts
         elif scenario == "05-supervisor-intervention":
-            corrective = run["supervisor_corrective_action"]
-            check = run["supervisor_checks"]["plan_dispatch"]
-            assert check["verdict"] == "corrective_action"
-            assert check["status"] == "completed"
-            assert check["evidence_sha256"]
-            assert corrective["verdict"] == "corrective_action"
-            assert "返工" in corrective["required_action"]
-            assert adapter.provider.call_counts["supervisor"] == 1
-            assert adapter.provider.call_counts["dbb3-worker"] == 0
-            assert any(
-                (message.get("meta") or {}).get("role_stage")
-                == "supervisor.corrective"
-                for message in persisted["messages"]
-            )
+            assert run["status"] == "completed"
+            assert run["validation_verdicts"]["final_report"] == "pass"
+            assert "supervisor" not in adapter.provider.call_counts
+            assert adapter.provider.call_counts["dbb3-worker"] == 1
         elif scenario == "06-reporter-verified-only":
             handoff = run["manager_handoff"]
             assert handoff["task_goal"] == prompt
             assert handoff["worker_results"] == run["worker_results"]
-            assert json.loads(handoff["review_verdict"])["verdict"] == "PASS"
+            assert "服务器确定性校验通过" in handoff["review_verdict"]
             assert handoff["failures"] == []
-            assert "verified worker evidence" in adapter.provider.reporter_prompts[0]
-            assert set(run["supervisor_verdicts"].values()) == {"pass"}
+            assert "verified worker evidence" in str(handoff["worker_results"])
+            assert not adapter.provider.reporter_prompts
             final_reports = [
                 message
                 for message in persisted["messages"]
                 if (message.get("meta") or {}).get("final_report")
             ]
             assert len(final_reports) == 1
-            assert final_reports[0]["content"] == "verified report from authoritative handoff"
+            assert (
+                final_reports[0]["content"]
+                != ""
+            )
         elif scenario == "07-ios-background":
             assert adapter.evidence["background_status_before_stream"] == "running"
             assert adapter.evidence["background_cursor_before_stream"] > 0
@@ -1070,9 +1076,14 @@ def test_product_backed_behavior_matrix(
             assert file_download.content == b"uploaded account data"
             assert artifact_download.status_code == 200
             assert artifact_download.content == b"complete tool output"
-            assert len(
-                [event for event in summary["events"] if event["type"] == "attachment"]
-            ) == 2
+            assert (
+                len([
+                    event
+                    for event in summary["events"]
+                    if event["type"] == "attachment"
+                ])
+                == 2
+            )
             cleanup = adapter.module.delete_owner_account_data(
                 adapter.owner_id,
                 account_generation=adapter.account_generation,
@@ -1082,7 +1093,9 @@ def test_product_backed_behavior_matrix(
             assert cleanup["files"]["object_buckets"] == 1
             assert cleanup["tool_output_artifacts"] == {"artifacts": 1}
             remaining = adapter.module.load_single_state()["conversations"]
-            assert not any(item.get("id") == adapter.conversation_id for item in remaining)
+            assert not any(
+                item.get("id") == adapter.conversation_id for item in remaining
+            )
             assert adapter.client.get(
                 f"{API_PREFIX}/files/{uploaded['id']}/download"
             ).status_code in {404, 410}

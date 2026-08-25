@@ -31,7 +31,7 @@ from hermes_cli.ios_intelligence import (
 from hermes_cli.ios_intelligence_config import load_ios_intelligence_config
 
 if TYPE_CHECKING:
-    from mcp.server.fastmcp import FastMCP as MCPServer
+    from mcp.server import MCPServer
 
 
 CAPABILITIES = (
@@ -712,18 +712,7 @@ def create_mcp_server(
 ) -> MCPServer:
     """Build a server exposing tools for exactly one capability."""
 
-    from mcp.server.fastmcp import FastMCP
-    from mcp.server.fastmcp.server import Settings as FastMCPSettings
-
-    # Hermes supplies runtime configuration through the supervised process
-    # environment.  FastMCP otherwise probes ``.env`` in the inherited cwd;
-    # production deliberately keeps that secrets file unreadable to the MCP
-    # service user, so discovery and lazy child startup must not touch it.
-    if FastMCPSettings.model_config.get("env_file") is not None:
-        FastMCPSettings.model_config = {
-            **FastMCPSettings.model_config,
-            "env_file": None,
-        }
+    from mcp.server import MCPServer as FastMCP
 
     capability = str(capability).strip().lower()
     if capability not in CAPABILITIES:
@@ -739,10 +728,12 @@ def create_mcp_server(
             "when the user's normal chat request depends on this information; the user does "
             "not need to ask for an MCP call explicitly. Never invent missing device data."
         ),
-        host=host,
-        port=port,
-        stateless_http=True,
     )
+    mcp._http_runtime_options = {
+        "host": host,
+        "port": port,
+        "stateless_http": True,
+    }  # type: ignore[attr-defined]
     mcp.granted_scopes = effective_scopes  # type: ignore[attr-defined]
 
     if capability in _LATEST_KINDS:
@@ -1359,7 +1350,10 @@ def main(argv: list[str] | None = None) -> int:
         port=args.port,
         granted_scopes=args.grant_scope,
     )
-    server.run(transport=args.transport)
+    server.run(
+        transport=args.transport,
+        **getattr(server, "_http_runtime_options", {}),
+    )
     return 0
 
 

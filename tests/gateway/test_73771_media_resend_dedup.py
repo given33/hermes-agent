@@ -495,7 +495,10 @@ async def test_streamed_explicit_media_resend_is_delivered(tmp_path, monkeypatch
 
     adapter.send_multiple_images.assert_awaited_once()
     sent_paths = [p for p, _cap in adapter.send_multiple_images.await_args.kwargs["images"]]
-    assert str(img) in sent_paths[0]
+    from gateway.platforms.base import _local_path_from_file_uri
+
+    assert sent_paths[0].startswith("file:///")
+    assert _local_path_from_file_uri(sent_paths[0]) == str(img)
 
 
 def test_stream_rescan_accepts_no_history_dedup_input():

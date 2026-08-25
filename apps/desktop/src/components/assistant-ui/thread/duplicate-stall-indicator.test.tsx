@@ -163,7 +163,9 @@ describe('StreamStallIndicator tail gating (#68634)', () => {
     expect(roots.length).toBe(2)
     // The second assistant root is also the thread's any-role tail.
     expect(roots[0]?.querySelector('[data-slot="aui_stream-stall"]')).toBeNull()
-    expect(roots[1]?.querySelector('[data-slot="aui_stream-stall"]')).not.toBeNull()
+    expect(
+      roots[1]?.querySelector('[data-slot="aui_turn-activity"]')
+    ).not.toBeNull()
   })
 
   it('keeps a running assistant silent when a queued user prompt trails it and the runtime is idle', () => {

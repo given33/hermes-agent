@@ -128,9 +128,99 @@ git -C "${repo}" ls-files -z -- \
 mapfile -d '' -t runtime_service_assets <"${runtime_source_manifest}"
 (( ${#runtime_service_assets[@]} >= 500 )) \
   || die "runtime source manifest is unexpectedly incomplete"
-for required_runtime_source in \
-  hermes_auth_errors.py hermes_cli/web_models.py \
-  agent/interrupt_compat.py gateway/streaming_tts_consumer.py; do
+required_runtime_sources=(
+  "hermes_auth_errors.py"
+  "hermes_cli/web_models.py"
+  "agent/interrupt_compat.py"
+  "gateway/streaming_tts_consumer.py"
+  "hermes_services/__init__.py"
+  "hermes_services/application.py"
+  "hermes_services/auth.py"
+  "hermes_services/behavior_eval.py"
+  "hermes_services/bounded_dict.py"
+  "hermes_services/contexts.py"
+  "hermes_services/contracts.py"
+  "hermes_services/cron_fire.py"
+  "hermes_services/hosted_event_protocol.py"
+  "hermes_services/hosted_role_migration.py"
+  "hermes_services/http_boundary.py"
+  "hermes_services/http_policy.py"
+  "hermes_services/internal_hooks.py"
+  "hermes_services/jsonrpc.py"
+  "hermes_services/low_latency_protocol.py"
+  "hermes_services/middleware.py"
+  "hermes_services/resource_catalog.py"
+  "hermes_services/session_entries.py"
+  "hermes_services/session_registry.py"
+  "hermes_services/startup.py"
+  "hermes_services/tool_contract.py"
+  "hermes_services/tool_isolation.py"
+  "hermes_services/tool_output_artifacts.py"
+  "hermes_services/worker_channel.py"
+  "hermes_runtime/__init__.py"
+  "hermes_runtime/capabilities.py"
+  "hermes_runtime/collaboration.py"
+  "hermes_runtime/colors.py"
+  "hermes_runtime/config.py"
+  "hermes_runtime/console_output.py"
+  "hermes_runtime/credential_persistence.py"
+  "hermes_runtime/default_soul.py"
+  "hermes_runtime/evidence.py"
+  "hermes_runtime/golden_path.py"
+  "hermes_runtime/managed_scope.py"
+  "hermes_runtime/mcp_security.py"
+  "hermes_runtime/model_catalog_cache.py"
+  "hermes_runtime/package_install.py"
+  "hermes_runtime/plugin_compatibility.py"
+  "hermes_runtime/process_probe.py"
+  "hermes_runtime/profile_identity.py"
+  "hermes_runtime/prompt_runtime.py"
+  "hermes_runtime/redaction.py"
+  "hermes_runtime/runtime_cwd.py"
+  "hermes_runtime/secret_prompt.py"
+  "hermes_runtime/secret_provenance.py"
+  "hermes_runtime/secret_scope.py"
+  "hermes_runtime/session_context.py"
+  "hermes_runtime/session_trace.py"
+  "hermes_runtime/skill_utils.py"
+  "hermes_runtime/subprocess_compat.py"
+  "hermes_runtime/text_safety.py"
+  "hermes_runtime/timeouts.py"
+  "hermes_runtime/tool_execution.py"
+  "hermes_runtime/toolset_validation.py"
+  "hermes_runtime/trajectory.py"
+  "hermes_runtime/urllib_security.py"
+  "hermes_runtime/version.py"
+  "hermes_runtime/viewer_registry.py"
+  "hermes_runtime/visual_evidence.py"
+  "hermes_constants.py"
+  "hermes_logging.py"
+  "hermes_secret_compare.py"
+  "utils.py"
+  "hermes_cli/account_identity.py"
+  "hermes_cli/account_lifecycle.py"
+  "hermes_cli/collaboration_plugin_backend.py"
+  "hermes_cli/ios_plugin_backend.py"
+  "hermes_cli/account_session_facade.py"
+  "hermes_cli/account_write_approvals.py"
+  "hermes_cli/mobile_console.py"
+  "plugins/account_cleanup_backend.py"
+  "agent/conversation_loop.py"
+  "agent/tool_executor.py"
+  "agent/transports/hermes_tools_mcp_server.py"
+  "gateway/platforms/api_server.py"
+  "hermes_cli/dashboard_auth/client_ip.py"
+  "hermes_cli/mcp_config.py"
+  "plugins/memory/config_schema.py"
+  "run_agent.py"
+  "tools/file_operations.py"
+  "tools/mcp_oauth_manager.py"
+  "tools/registry.py"
+  "tools/skills_guard.py"
+  "tools/terminal_tool.py"
+  "hermes_cli/sqlite_util.py"
+)
+for required_runtime_source in "${required_runtime_sources[@]}"; do
   runtime_source_found=0
   for relative in "${runtime_service_assets[@]}"; do
     if [[ "${relative}" == "${required_runtime_source}" ]]; then
@@ -290,7 +380,30 @@ scp "${ssh_args[@]}" \
   "${repo}/plugins/dashboard_auth/basic/__init__.py" \
   "${remote}:${stage}/plugins/dashboard_auth/basic/"
 scp "${ssh_args[@]}" \
-  "${repo}"/hermes_services/*.py \
+  "${repo}/hermes_services/__init__.py" \
+  "${repo}/hermes_services/application.py" \
+  "${repo}/hermes_services/auth.py" \
+  "${repo}/hermes_services/behavior_eval.py" \
+  "${repo}/hermes_services/bounded_dict.py" \
+  "${repo}/hermes_services/contexts.py" \
+  "${repo}/hermes_services/contracts.py" \
+  "${repo}/hermes_services/cron_fire.py" \
+  "${repo}/hermes_services/hosted_event_protocol.py" \
+  "${repo}/hermes_services/hosted_role_migration.py" \
+  "${repo}/hermes_services/http_boundary.py" \
+  "${repo}/hermes_services/http_policy.py" \
+  "${repo}/hermes_services/internal_hooks.py" \
+  "${repo}/hermes_services/jsonrpc.py" \
+  "${repo}/hermes_services/low_latency_protocol.py" \
+  "${repo}/hermes_services/middleware.py" \
+  "${repo}/hermes_services/resource_catalog.py" \
+  "${repo}/hermes_services/session_entries.py" \
+  "${repo}/hermes_services/session_registry.py" \
+  "${repo}/hermes_services/startup.py" \
+  "${repo}/hermes_services/tool_contract.py" \
+  "${repo}/hermes_services/tool_isolation.py" \
+  "${repo}/hermes_services/tool_output_artifacts.py" \
+  "${repo}/hermes_services/worker_channel.py" \
   "${remote}:${stage}/hermes_services/"
 scp "${ssh_args[@]}" \
   "${repo}/hermes_cli/account_identity.py" \

@@ -11,6 +11,7 @@ from __future__ import annotations
 import asyncio
 from copy import deepcopy
 from collections import Counter, defaultdict, deque
+from collections.abc import Mapping
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from contextlib import asynccontextmanager, contextmanager, redirect_stderr, redirect_stdout
 import hashlib
@@ -46,8 +47,9 @@ from hermes_services.startup import bootstrap_trusted_runtime
 # state before importing runtime fallbacks or executing plugin-owned code.
 bootstrap_trusted_runtime()
 
-from fastapi import APIRouter, Depends, Header, HTTPException, Request
+from fastapi import APIRouter, Depends, Header, HTTPException, Request, WebSocket, WebSocketDisconnect
 from fastapi.responses import FileResponse, Response, StreamingResponse
+from starlette.background import BackgroundTask
 from pydantic import BaseModel, Field, field_validator
 
 logger = logging.getLogger(__name__)
@@ -100,6 +102,10 @@ from hermes_services.hosted_event_protocol import (
     preserve_persistence_hook_outbox,
     state_with_persistence_hook_outbox,
 )
+from hermes_services.hosted_role_migration import migrate_hosted_container
+from hermes_services.low_latency_protocol import ProtocolError, protocol_int
+from hermes_services.worker_channel import WorkerChannelRegistry
+from hermes_services import latency_trace as _latency_trace
 from hermes_services.session_entries import (
     append_message_stream_entries,
     append_session_entry,
@@ -342,8 +348,19 @@ def _rate_limit_key(request: Request, fallback: str) -> str:
     if principal is not None:
         return f"principal:{str(getattr(principal, 'principal', '') or '')}"
     client = request.client
-    if client is not None and getattr(client, "host", ""):
-        return f"ip:{client.host}"
+    peer = str(getattr(client, "host", "") or "") if client is not None else ""
+    if peer:
+        # Shared trusted-proxy-aware resolver (same hardening as the
+        # dashboard_auth rate limiters); the raw peer host remains only as
+        # a last-resort fallback when the resolver is unavailable.
+        try:
+            from hermes_cli.dashboard_auth.client_ip import (
+                client_ip as _resolve_client_ip,
+            )
+
+            return f"ip:{_resolve_client_ip(request)}"
+        except Exception:
+            return f"ip:{peer}"
     return fallback
 
 
@@ -365,6 +382,30 @@ async def _enforce_route_body_size(request: Request) -> None:
         raise HTTPException(
             status_code=413,
             detail=f"Request body exceeds {_ROUTE_BODY_MAX_BYTES} bytes",
+        )
+
+
+async def _enforce_general_json_body_size(request: Request) -> None:
+    """Bound JSON before Pydantic/FastAPI materializes nested request data."""
+    content_type = request.headers.get("content-type", "").lower()
+    if content_type and "application/json" not in content_type:
+        return
+    content_length = request.headers.get("content-length")
+    if content_length:
+        try:
+            length = int(content_length)
+        except (TypeError, ValueError):
+            raise HTTPException(status_code=411, detail="Length Required") from None
+        if length > _GENERAL_JSON_BODY_MAX_BYTES:
+            raise HTTPException(
+                status_code=413,
+                detail=f"Request body exceeds {_GENERAL_JSON_BODY_MAX_BYTES} bytes",
+            )
+    body = await request.body()
+    if len(body) > _GENERAL_JSON_BODY_MAX_BYTES:
+        raise HTTPException(
+            status_code=413,
+            detail=f"Request body exceeds {_GENERAL_JSON_BODY_MAX_BYTES} bytes",
         )
 
 
@@ -527,7 +568,13 @@ class _AccountStateLock:
         guard = _backend_api().account_lifecycle_commit_guard()
         guard.__enter__()
         try:
-            self._lock.acquire()
+            # Latency instrumentation: measure pure acquisition wait (including
+            # re-entrant instant acquires, which cost ~zero and stay quiet).
+            if _latency_trace.enabled():
+                with _latency_trace.lock_wait("account_state"):
+                    self._lock.acquire()
+            else:
+                self._lock.acquire()
         except BaseException:
             guard.__exit__(*sys.exc_info())
             raise
@@ -547,6 +594,7 @@ class _AccountStateLock:
 _STATE_LOCK = _AccountStateLock()
 _HOSTED_THREADS_LOCK = threading.Lock()
 _HOSTED_THREADS: dict[str, threading.Thread] = {}
+_WORKER_CHANNEL = WorkerChannelRegistry()
 _HOSTED_ROUTING_THREADS_LOCK = threading.Lock()
 _HOSTED_ROUTING_THREADS: dict[str, threading.Thread] = {}
 _HOSTED_EXECUTION_GENERATION = threading.local()
@@ -587,6 +635,42 @@ _MOBILE_NOTIFICATION_PENDING: dict[str, tuple[str, str, int, str]] = {}
 # kicked and the pending notification fires within seconds.
 _CONVERSATION_SSE_PRESENCE: dict[str, int] = {}
 _CONVERSATION_SSE_PRESENCE_LOCK = threading.Lock()
+# Each waiter occupies one dedicated thread. Admission limits protect the
+# pool from a buggy/reconnecting client or an authenticated flood while
+# leaving ample headroom for legitimate multi-device/multi-room use.
+_HOSTED_SSE_MAX_TOTAL = 256
+_HOSTED_SSE_MAX_PER_OWNER = 16
+_HOSTED_SSE_MAX_PER_CONVERSATION = 4
+_HOSTED_SSE_COUNTS: dict[tuple[str, str], int] = {}
+
+
+def _acquire_hosted_sse_slot(owner_id: str, conversation_id: str) -> bool:
+    owner_key = ("owner", owner_id)
+    conversation_key = ("conversation", conversation_id)
+    with _CONVERSATION_SSE_PRESENCE_LOCK:
+        total = sum(_HOSTED_SSE_COUNTS.values())
+        if (
+            total >= _HOSTED_SSE_MAX_TOTAL
+            or _HOSTED_SSE_COUNTS.get(owner_key, 0) >= _HOSTED_SSE_MAX_PER_OWNER
+            or _HOSTED_SSE_COUNTS.get(conversation_key, 0)
+            >= _HOSTED_SSE_MAX_PER_CONVERSATION
+        ):
+            return False
+        _HOSTED_SSE_COUNTS[owner_key] = _HOSTED_SSE_COUNTS.get(owner_key, 0) + 1
+        _HOSTED_SSE_COUNTS[conversation_key] = (
+            _HOSTED_SSE_COUNTS.get(conversation_key, 0) + 1
+        )
+        return True
+
+
+def _release_hosted_sse_slot(owner_id: str, conversation_id: str) -> None:
+    for key in (("owner", owner_id), ("conversation", conversation_id)):
+        with _CONVERSATION_SSE_PRESENCE_LOCK:
+            remaining = _HOSTED_SSE_COUNTS.get(key, 0) - 1
+            if remaining > 0:
+                _HOSTED_SSE_COUNTS[key] = remaining
+            else:
+                _HOSTED_SSE_COUNTS.pop(key, None)
 # Suppressed-online notifications re-check at this cadence while a watcher
 # stays connected.
 _NOTIFICATION_ONLINE_RECHECK_MS = 5_000
@@ -670,18 +754,20 @@ _STATE_STORE_PREVIOUS_UNSET = object()
 def _publish_live_conversations(state: dict[str, Any]) -> set[str]:
     """Publish immutable hosted conversation snapshots before durable I/O."""
 
-    snapshots: dict[str, dict[str, Any]] = {}
-    for item in state.get("conversations") or []:
-        if not isinstance(item, dict):
-            continue
-        conversation_id = str(item.get("id") or "").strip()
-        if not conversation_id:
-            continue
-        snapshots[conversation_id] = deepcopy(item)
-    with _HOSTED_LIVE_STATE_LOCK:
-        _HOSTED_LIVE_CONVERSATIONS.clear()
-        _HOSTED_LIVE_CONVERSATIONS.update(snapshots)
-    return set(snapshots)
+    with _latency_trace.span("state.publish_live") as pub:
+        snapshots: dict[str, dict[str, Any]] = {}
+        for item in state.get("conversations") or []:
+            if not isinstance(item, dict):
+                continue
+            conversation_id = str(item.get("id") or "").strip()
+            if not conversation_id:
+                continue
+            snapshots[conversation_id] = deepcopy(item)
+        with _HOSTED_LIVE_STATE_LOCK:
+            _HOSTED_LIVE_CONVERSATIONS.clear()
+            _HOSTED_LIVE_CONVERSATIONS.update(snapshots)
+        pub.attr("conversations", len(snapshots))
+        return set(snapshots)
 
 
 def _live_conversation_snapshot(
@@ -931,6 +1017,7 @@ _ACCOUNT_FILE_MIGRATION_VERSION = "conversation-files-v1"
 # these bounds protect the Python process when a deployment is reached
 # directly, behind a misconfigured proxy, or on a loopback bind.
 _ROUTE_BODY_MAX_BYTES = 256 * 1024
+_GENERAL_JSON_BODY_MAX_BYTES = 4 * 1024 * 1024
 _ROUTE_RATE_LIMIT = 30
 _ROUTE_RATE_WINDOW_SECONDS = 60
 _CONNECTOR_RATE_LIMIT = 120
@@ -1012,6 +1099,10 @@ _CONNECTOR_RATE_LIMITER = _SlidingWindowRateLimiter(
     _CONNECTOR_RATE_LIMIT,
     _CONNECTOR_RATE_WINDOW_SECONDS,
 )
+_ROOM_JOIN_RATE_LIMITER = _SlidingWindowRateLimiter(10, 60)
+_MOBILE_RESOURCE_STREAM_LIMIT = 8
+_MOBILE_RESOURCE_STREAMS: dict[str, int] = {}
+_MOBILE_RESOURCE_STREAM_LOCK = asyncio.Lock()
 
 
 def append_hosted_event(
@@ -1380,7 +1471,7 @@ _MULTI_STEP_MARKERS = (
     "finally",
     "as well as",
 )
-_EXPLICIT_WORKFLOW_ROLE_MARKERS = ("worker", "reviewer", "reporter")
+_EXPLICIT_WORKFLOW_ROLE_MARKERS = ("worker", "reporter")
 _EXPLICIT_WORKFLOW_PHRASES = (
     "group workflow",
     "multi participant workflow",
@@ -1627,6 +1718,21 @@ def _connector_bearer(request: Request) -> str:
     return token.strip() if separator and scheme.lower() == "bearer" else ""
 
 
+def _timing_safe_token_equal(left: str, right: str) -> bool:
+    """compare_digest that tolerates non-ASCII (latin-1-decoded) headers.
+
+    hmac.compare_digest raises TypeError when either str operand contains
+    non-ASCII characters, and Authorization headers arrive latin-1-decoded:
+    a stray non-ASCII byte must fail closed cleanly instead of raising past
+    the auth boundary (500 / dead WS upgrade). Mirrors the byte-encoding
+    used by gateway/platforms/api_server.py's API-key check.
+    """
+    return hmac.compare_digest(
+        str(left).encode("utf-8", errors="replace"),
+        str(right).encode("utf-8", errors="replace"),
+    )
+
+
 def _connector_identity(request: Request) -> str:
     supplied = _connector_bearer(request)
     claimed = str(request.headers.get("x-connector-id") or "").strip()[:128]
@@ -1637,7 +1743,7 @@ def _connector_identity(request: Request) -> str:
     for connector_id, record in records.items():
         expected_tokens = record.get("tokens") or []
         if any(
-            token and hmac.compare_digest(supplied, token)
+            token and _timing_safe_token_equal(supplied, token)
             for token in expected_tokens
         ):
             matches.add(str(connector_id))
@@ -1649,7 +1755,7 @@ def _connector_identity(request: Request) -> str:
     # assigned to two devices must fail closed instead of allowing the caller
     # to select either device with X-Connector-ID.
     for connector_id, expected in _configured_connector_tokens().items():
-        if expected and hmac.compare_digest(supplied, expected):
+        if expected and _timing_safe_token_equal(supplied, expected):
             matches.add(str(connector_id))
     if len(matches) != 1 or claimed not in matches:
         return ""
@@ -1667,6 +1773,211 @@ def _require_connector(request: Request) -> str:
     if not connector_id:
         raise HTTPException(status_code=401, detail="Unauthorized")
     return connector_id
+
+
+def _connector_identity_from_websocket(websocket: WebSocket) -> str:
+    """Validate the same connector token contract used by REST pull routes."""
+    authorization = str(websocket.headers.get("authorization") or "")
+    scheme, separator, supplied = authorization.partition(" ")
+    supplied = supplied.strip() if separator and scheme.lower() == "bearer" else ""
+    claimed = str(websocket.headers.get("x-connector-id") or "").strip()[:128]
+    if not supplied or not claimed:
+        return ""
+    matches: set[str] = set()
+    for connector_id, record in _configured_connector_token_records().items():
+        if any(
+            token and _timing_safe_token_equal(supplied, token)
+            for token in (record.get("tokens") or [])
+        ):
+            matches.add(str(connector_id))
+    return claimed if len(matches) == 1 and claimed in matches else ""
+
+
+@router.websocket("/worker/ws")
+async def worker_websocket(websocket: WebSocket) -> None:
+    """Low-latency DBB3/WSL worker channel with durable-queue fallback."""
+    connector_id = _connector_identity_from_websocket(websocket)
+    if not connector_id:
+        await websocket.close(code=4401, reason="Unauthorized worker connector")
+        return
+    await websocket.accept()
+    node_id = ""
+    lease_id = ""
+    sent_sequence = 0
+    receive_task: asyncio.Task[Any] | None = None
+    replay_task: asyncio.Task[list[dict[str, Any]]] | None = None
+    replay_cancel_event = threading.Event()
+
+    async def send_replay_events(
+        events: list[dict[str, Any]],
+        *,
+        skip_already_sent: bool = True,
+    ) -> None:
+        """Send replay frames only while this websocket still owns its lease."""
+
+        nonlocal sent_sequence
+        for event in events:
+            # The registry result can be produced just before a replacement
+            # connection fences this lease. Recheck immediately before every
+            # frame so initial, publish-wakeup, and explicit resume replay all
+            # use the same stale-connection boundary.
+            if not _WORKER_CHANNEL.lease_alive(node_id, lease_id):
+                raise ProtocolError("worker lease expired")
+            sequence = protocol_int(event.get("sequence"), "sequence", default=0)
+            if skip_already_sent and sequence <= sent_sequence:
+                continue
+            await websocket.send_json(event)
+            sent_sequence = max(sent_sequence, sequence)
+
+    try:
+        hello = await asyncio.wait_for(websocket.receive_json(), timeout=10.0)
+        if not isinstance(hello, dict) or str(hello.get("type") or "") != "hello":
+            raise ProtocolError("first worker frame must be hello")
+        node_id = str(hello.get("node_id") or "").strip()
+        resume_after = protocol_int(hello.get("cursor"), "cursor", default=0)
+        connection = _WORKER_CHANNEL.connect(
+            node_id,
+            connection_generation=str(hello.get("connection_generation") or ""),
+            capabilities=list(hello.get("capabilities") or []) if isinstance(hello.get("capabilities"), list) else [],
+            version=str(hello.get("version") or ""),
+            connector_id=connector_id,
+            expected_connector_id=_connector_for_profile(node_id),
+        )
+        lease_id = connection.lease_id
+        await websocket.send_json({
+            "type": "hello.accepted",
+            "schema_version": "hermes.low-latency.v1",
+            "node_id": node_id,
+            "connector_id": connector_id,
+            "lease_id": lease_id,
+            "server_time": int(time.time() * 1000),
+        })
+        await send_replay_events(_WORKER_CHANNEL.replay(node_id, resume_after))
+
+        # Keep one receive task and one condition-backed replay waiter alive.
+        # The previous 250 ms timeout loop woke every connected worker four
+        # times per second even when no work existed, adding up to 250 ms of
+        # avoidable queue latency and CPU churn.  The registry wakes the
+        # replay waiter when a publisher appends a frame; the 30 s timeout is
+        # only the heartbeat cadence.  The receive task is intentionally kept
+        # across replay wakeups so incoming heartbeats/events are never polled.
+        replay_task = asyncio.create_task(
+            asyncio.to_thread(
+                _WORKER_CHANNEL.wait_for_replay,
+                node_id,
+                sent_sequence,
+                timeout=30.0,
+                lease_id=lease_id,
+                cancel_event=replay_cancel_event,
+            )
+        )
+        while True:
+            if receive_task is None:
+                receive_task = asyncio.create_task(websocket.receive_json())
+            assert replay_task is not None
+            done, _ = await asyncio.wait(
+                {receive_task, replay_task},
+                return_when=asyncio.FIRST_COMPLETED,
+            )
+            if replay_task in done and receive_task not in done:
+                events = replay_task.result()
+                await send_replay_events(events)
+                if not events:
+                    if not _WORKER_CHANNEL.lease_alive(node_id, lease_id):
+                        raise ProtocolError("worker lease expired")
+                    await websocket.send_json({
+                        "type": "heartbeat",
+                        "node_id": node_id,
+                        "timestamp": int(time.time() * 1000),
+                    })
+                replay_task = asyncio.create_task(
+                    asyncio.to_thread(
+                        _WORKER_CHANNEL.wait_for_replay,
+                        node_id,
+                        sent_sequence,
+                        timeout=30.0,
+                        lease_id=lease_id,
+                        cancel_event=replay_cancel_event,
+                    )
+                )
+                continue
+            # A client frame wins if both tasks complete at the same instant.
+            # Any replay result is retained in the bounded registry and will
+            # be picked up by the next waiter using the current cursor.
+            message = receive_task.result()
+            receive_task = None
+            if not isinstance(message, dict):
+                raise ProtocolError("worker frame must be an object")
+            message_type = str(message.get("type") or "").strip().lower()
+            if message_type == "heartbeat":
+                if not _WORKER_CHANNEL.heartbeat(node_id, lease_id):
+                    raise ProtocolError("stale worker lease")
+                await websocket.send_json({"type": "heartbeat.ack", "node_id": node_id, "timestamp": int(time.time() * 1000)})
+                continue
+            if message_type == "resume":
+                cursor = protocol_int(message.get("cursor"), "cursor", default=0)
+                if not _WORKER_CHANNEL.lease_alive(node_id, lease_id):
+                    raise ProtocolError("worker lease expired")
+                await send_replay_events(
+                    _WORKER_CHANNEL.replay(node_id, cursor),
+                    skip_already_sent=False,
+                )
+                continue
+            if message_type == "event":
+                event, duplicate = _WORKER_CHANNEL.append(node_id, lease_id, message.get("event") or {})
+                # A worker ACK is the transport's backpressure boundary.  The
+                # projection bridge performs a full account-state read/write
+                # under ``_STATE_LOCK`` and can take seconds for a large
+                # profile.  Running it inline here delayed the ACK (and held
+                # the FastAPI event loop) until that disk checkpoint finished,
+                # making DBB3/Windows workers appear stalled.  Acknowledge the
+                # validated frame first, then perform the durable bridge off
+                # the event loop; the worker channel replay remains the
+                # recovery source if the bridge fails.
+                # A duplicate may be a retry after the transport ACK was sent
+                # but the projection bridge failed.  The bridge's idempotency
+                # key makes retrying the canonical event safe and prevents an
+                # ACKed-but-unprojected event from becoming permanent loss.
+                bridge_event = event
+                await websocket.send_json({
+                    "type": "event.ack",
+                    "event_id": event.get("event_id"),
+                    "sequence": event.get("sequence"),
+                    "duplicate": duplicate,
+                })
+                if bridge_event is not None:
+                    try:
+                        bridged = await asyncio.to_thread(
+                            _bridge_worker_channel_event, bridge_event
+                        )
+                        if not bridged:
+                            logger.warning(
+                                "Worker event was accepted but not projected; "
+                                "retaining it for replay: %s",
+                                bridge_event.get("event_id"),
+                            )
+                    except Exception:
+                        # The durable queue/replay path remains authoritative
+                        # if a malformed worker payload cannot be projected.
+                        logger.exception("Failed to bridge worker event")
+                continue
+            raise ProtocolError("unsupported worker frame")
+    except (WebSocketDisconnect, asyncio.TimeoutError):
+        pass
+    except Exception as exc:
+        try:
+            await websocket.send_json({"type": "error", "code": "worker_protocol_error", "detail": str(exc)[:256]})
+            await websocket.close(code=4400, reason="Worker protocol error")
+        except Exception:
+            pass
+    finally:
+        replay_cancel_event.set()
+        _WORKER_CHANNEL.wake_replay_waiters()
+        for task in (receive_task, replay_task):
+            if task is not None and not task.done():
+                task.cancel()
+        if node_id and lease_id:
+            _WORKER_CHANNEL.disconnect(node_id, lease_id)
 
 
 def _rate_limit_connector(request: Request, connector_id: str, action: str) -> None:
@@ -1814,9 +2125,43 @@ def _safe_conversation_id(conversation_id: str) -> str:
 def _contained_storage_path(root: Path, *components: str) -> Path:
     """Resolve a storage child and reject component or external-symlink escapes."""
 
+    import os
+
     resolved_root = Path(root).resolve()
-    target = resolved_root.joinpath(*components).resolve()
-    if target == resolved_root or not target.is_relative_to(resolved_root):
+
+    current = resolved_root
+    for raw_component in components:
+        component = str(raw_component)
+        if (
+            not component
+            or component in {".", ".."}
+            or "/" in component
+            or "\\" in component
+            or ":" in component
+            or "\x00" in component
+            or Path(component).name != component
+            or component[-1] in ". "
+            or component.split(".", 1)[0].upper() in _WINDOWS_RESERVED_COMPONENTS
+        ):
+            raise ValueError("Invalid storage path component")
+        candidate = current / component
+        # Resolve only existing reparse points. Resolving a nonexistent final
+        # leaf is both unnecessary and unsafe on Windows: concurrent creation
+        # plus ntpath.realpath has crashed the hosted worker with an access
+        # violation, which left the turn running and stalled iOS delivery.
+        if os.path.lexists(candidate):
+            resolved_candidate = candidate.resolve(strict=True)
+            if (
+                resolved_candidate == resolved_root
+                or not resolved_candidate.is_relative_to(resolved_root)
+            ):
+                raise ValueError("Storage path escapes its root")
+            current = resolved_candidate
+        else:
+            current = candidate
+
+    target = current
+    if target == resolved_root:
         raise ValueError("Storage path escapes its root")
     return target
 
@@ -2328,22 +2673,29 @@ def _atomic_write_state_document(target: Path, data: dict[str, Any]) -> None:
     _invalidate_single_state_cache(target)
     # This is a machine-owned recovery document. Compact encoding cuts both
     # fsync latency and storage without weakening the atomic-write contract.
-    payload = json.dumps(data, ensure_ascii=False, separators=(",", ":")) + "\n"
+    # Spans are micro-cheap when tracing is disabled; these steps are
+    # milliseconds-wide, so unconditional wrapping costs nothing measurable.
+    with _latency_trace.span("state.encode", path=target.name) as enc:
+        payload = json.dumps(data, ensure_ascii=False, separators=(",", ":")) + "\n"
+        enc.attr("bytes", len(payload))
     target.parent.mkdir(parents=True, exist_ok=True)
     temporary = target.with_name(
         f".{target.name}.{os.getpid()}.{threading.get_ident()}.{uuid.uuid4().hex}.tmp"
     )
     try:
-        with temporary.open("x", encoding="utf-8", newline="\n") as handle:
-            try:
-                os.chmod(temporary, 0o600)
-            except OSError:
-                pass
-            handle.write(payload)
-            handle.flush()
-            os.fsync(handle.fileno())
-        os.replace(temporary, target)
-        _fsync_parent_directory(target)
+        with _latency_trace.span(
+            "state.write_fsync", path=target.name, bytes=len(payload)
+        ):
+            with temporary.open("x", encoding="utf-8", newline="\n") as handle:
+                try:
+                    os.chmod(temporary, 0o600)
+                except OSError:
+                    pass
+                handle.write(payload)
+                handle.flush()
+                os.fsync(handle.fileno())
+            os.replace(temporary, target)
+            _fsync_parent_directory(target)
     finally:
         try:
             temporary.unlink()
@@ -2482,7 +2834,58 @@ def _load_state_store(
                 collection_key,
                 dispatch_persistence_hooks=dispatch_persistence_hooks,
             )
+            result = _migrate_hosted_roles_on_load_locked(
+                target,
+                collection_key,
+                result,
+            )
     return result
+
+
+_HOSTED_ROLE_MIGRATION_MARKER = "_hosted_role_migration_version"
+_HOSTED_ROLE_MIGRATION_VERSION = 1
+
+
+def _migrate_hosted_roles_on_load_locked(
+    target: Path,
+    collection_key: str,
+    state: dict[str, Any],
+) -> dict[str, Any]:
+    """Apply the hosted-role migration at the state-store boundary.
+
+    Role migration is intentionally structural and idempotent.  Performing it
+    while the state lock is held prevents a stale reader from reintroducing a
+    retired turn after the migrated document has been committed.  The marker
+    is stored in the same atomic document, so a crash leaves either the old
+    document or the complete migrated document, never a half-migrated list.
+    """
+    if not isinstance(state, dict):
+        return state
+    try:
+        version = int(state.get(_HOSTED_ROLE_MIGRATION_MARKER) or 0)
+    except (TypeError, ValueError):
+        version = 0
+    if version >= _HOSTED_ROLE_MIGRATION_VERSION:
+        return state
+    migrated, removed, changed = migrate_hosted_container(state)
+    if not isinstance(migrated, dict):
+        return state
+    migrated[_HOSTED_ROLE_MIGRATION_MARKER] = _HOSTED_ROLE_MIGRATION_VERSION
+    changed = changed or removed > 0 or state.get(_HOSTED_ROLE_MIGRATION_MARKER) != (
+        _HOSTED_ROLE_MIGRATION_VERSION
+    )
+    if not changed:
+        return migrated
+    _validate_state_document(migrated, collection_key, target)
+    if _state_path_present(target):
+        _atomic_write_state_document(target, migrated)
+    logger.info(
+        "Migrated hosted roles in %s: removed=%s version=%s",
+        target,
+        removed,
+        _HOSTED_ROLE_MIGRATION_VERSION,
+    )
+    return migrated
 
 
 def _load_state_store_locked(
@@ -2537,6 +2940,17 @@ def _load_state_store_locked(
 
 
 def _save_state_store(
+    target: Path,
+    state: dict[str, Any],
+    collection_key: str,
+    *,
+    previous_state: Any = _STATE_STORE_PREVIOUS_UNSET,
+) -> None:
+    with _latency_trace.span("state.save", path=target.name, collection=collection_key):
+        _save_state_store_locked(target, state, collection_key, previous_state=previous_state)
+
+
+def _save_state_store_locked(
     target: Path,
     state: dict[str, Any],
     collection_key: str,
@@ -3789,7 +4203,9 @@ def delete_owner_account_data(
             raise ValueError("invalid conversation id in account deletion")
         root = history_target.parent
         if root.exists():
-            shutil.rmtree(root)
+            from hermes_cli.safe_delete import safe_rmtree
+
+            safe_rmtree(root, conversation_files_root(conversation_id))
 
     # Archived conversations live outside single.json and therefore are not
     # covered by the conversation file root above.  Read each candidate before
@@ -5103,6 +5519,10 @@ def available_profiles() -> list[dict[str, Any]]:
             "gateway_running": bool(profile.gateway_running),
         }
         for profile in list_profiles()
+        if str(profile.name or "").strip().lower()
+        not in _RETIRED_AI_PROFILES
+        and str(profile.name or "").strip().lower()
+        != _LEGACY_DBB3_MANAGER_PROFILE
     ]
 
 
@@ -5111,20 +5531,121 @@ _WORKER_TARGET_PROFILES = {
     "dbb3": "dbb3-worker",
     "pc": "pc-worker",
 }
-_DBB3_MANAGER_PROFILE = "dbb3-manager"
+# Canonical server-local scheduler.  The legacy name is accepted only by the
+# migration boundary and is never emitted in new profiles, participants, or
+# remote connector tasks.
+_HERMES_MANAGER_PROFILE = "hermes-manager"
+_LEGACY_DBB3_MANAGER_PROFILE = "dbb3-manager"
+_DBB3_MANAGER_PROFILE = _HERMES_MANAGER_PROFILE
 _HERMES_MANAGER_NAME = "Hermes Manager"
 _HERMES_MANAGER_LABEL = "Hermes 调度员"
-_HERMES_SUPERVISOR_NAME = "Hermes Supervisor"
-_HERMES_SUPERVISOR_LABEL = "Hermes 监督者"
+_HERMES_SUPERVISOR_NAME = ""
+_HERMES_SUPERVISOR_LABEL = ""
 _REMOTE_RUN_PROFILES = frozenset(
     {
-        _DBB3_MANAGER_PROFILE,
         "dbb3-worker",
         "pc-worker",
-        "reviewer",
-        "default",
+        # Keep pulling records written by the pre-canonicalization DBB3
+        # manager.  The canonical Hermes manager is handled separately below
+        # so ordinary server-local manager stages do not become remote work.
+        _LEGACY_DBB3_MANAGER_PROFILE,
     }
 )
+
+
+def _remote_run_is_pullable(remote_run: Mapping[str, Any]) -> bool:
+    """Return whether a persisted run belongs in a connector pull batch.
+
+    Worker lanes and legacy ``dbb3-manager`` records are explicit remote
+    profiles.  ``hermes-manager`` is normally server-local; only a supervisor
+    run explicitly marked by the remote supervisor path (or an older persisted
+    ``supervisor:`` record) is eligible for a connector.
+    """
+
+    profile = str(remote_run.get("profile") or "").strip().lower()
+    if profile in _REMOTE_RUN_PROFILES:
+        return True
+    if profile != _HERMES_MANAGER_PROFILE:
+        return False
+    return _coerce_flag(remote_run.get("remote_supervisor")) or str(
+        remote_run.get("role_stage") or ""
+    ).strip().lower().startswith("supervisor:")
+
+
+def _bridge_worker_channel_event(event: Mapping[str, Any]) -> bool:
+    """Persist one worker frame into the same live event stream consumed by iOS.
+
+    WebSocket acknowledgements are transport-level only. Without this bridge a
+    worker could report progress successfully while the conversation SSE never
+    received it, forcing the client back to slow REST polling.
+    """
+
+    raw_type = str(event.get("type") or "").strip().lower()
+    event_type = {
+        "accepted": "turn.accepted",
+        "started": "worker.started",
+        "completed": "worker.completed",
+        "failed": "worker.failed",
+    }.get(raw_type, raw_type)
+    payload = dict(event.get("payload") or {}) if isinstance(event.get("payload"), Mapping) else {}
+    task = payload.get("task") if isinstance(payload.get("task"), Mapping) else {}
+    conversation_id = str(
+        payload.get("conversation_id")
+        or task.get("conversation_id")
+        or ""
+    ).strip()
+    turn_id = str(event.get("turn_id") or payload.get("turn_id") or task.get("turn_id") or "").strip()
+    if not conversation_id or not turn_id or not event_type:
+        return False
+    request_id = str(event.get("request_id") or payload.get("request_id") or "").strip()
+    with _STATE_LOCK:
+        state = load_single_state()
+        conversation = next(
+            (item for item in state.get("conversations") or []
+             if isinstance(item, dict) and str(item.get("id") or "") == conversation_id),
+            None,
+        )
+        if not isinstance(conversation, dict):
+            return False
+        hosted = (conversation.get("hosted_turns") or {}).get(turn_id)
+        remote_runs = hosted.get("remote_runs") if isinstance(hosted, dict) else None
+        remote_run = next(
+            (
+                run for run in (remote_runs or {}).values()
+                if isinstance(run, dict) and (
+                    str(run.get("id") or "") == request_id
+                    or str(run.get("idempotency_key") or "") == request_id
+                )
+            ),
+            None,
+        ) if request_id else None
+        if not isinstance(remote_run, dict):
+            # A worker event without a durable active-run binding is untrusted.
+            return False
+        node_id = str(event.get("node_id") or "").strip()
+        if node_id and node_id != str(remote_run.get("profile") or ""):
+            return False
+        expected_connector = _remote_run_connector_id(remote_run)
+        if expected_connector and str(remote_run.get("connector_id") or "") != expected_connector:
+            return False
+        if remote_run.get("terminal") is True or remote_run.get("cancel_requested") is True:
+            return False
+        payload.setdefault("node_id", str(event.get("node_id") or ""))
+        payload.setdefault("request_id", str(event.get("request_id") or ""))
+        append_hosted_event(
+            conversation,
+            conversation_id=conversation_id,
+            turn_id=turn_id,
+            role_stage=str(payload.get("role_stage") or "worker"),
+            event_type=event_type,
+            payload=payload,
+            account_generation=str(conversation.get("account_generation") or "legacy"),
+            idempotency_key=f"worker-channel:{event.get('node_id') or ''}:{event.get('event_id') or ''}",
+        )
+        save_single_state(state)
+    _notify_hosted_update(conversation_id)
+    return True
+_RETIRED_AI_PROFILES = frozenset({"supervisor", "reviewer"})
 _MANAGER_DIFFICULTIES = {"low", "medium", "high", "critical"}
 _MANAGER_HANDOFF_FIELDS = (
     "task_goal",
@@ -5136,6 +5657,26 @@ _MANAGER_HANDOFF_FIELDS = (
     "failures",
     "suggested_conclusion",
 )
+
+
+def _legacy_hosted_request_profile(profile: Any) -> str:
+    """Map an explicitly requested retired profile to its live runtime.
+
+    Retired roles stay out of ``available_profiles`` so new clients cannot
+    select them from the catalog. Existing rooms and clients may still send
+    their persisted names, however; those requests use the deterministic
+    default runtime while retaining the original name in durable state.
+    """
+
+    normalized = str(profile or "").strip().lower()
+    if normalized in _RETIRED_AI_PROFILES or normalized == _LEGACY_DBB3_MANAGER_PROFILE:
+        return "default"
+    return ""
+
+
+def _profile_is_known_or_legacy(profile: Any, known: set[str]) -> bool:
+    normalized = str(profile or "").strip()
+    return normalized in known or bool(_legacy_hosted_request_profile(normalized))
 
 
 def _target_marker_pattern(markers: tuple[str, ...]) -> str:
@@ -5239,7 +5780,9 @@ def _constrained_worker_profiles(
 
 def _work_profiles(lowered: str) -> list[str]:
     worker_profiles, _constraints = _constrained_worker_profiles(lowered)
-    return ["default", *worker_profiles, "reviewer"]
+    # ``default`` is the deterministic server-side reporter/aggregator, not
+    # an additional model role.  Supervisor and Reviewer are retired AI roles.
+    return ["default", *worker_profiles]
 
 
 def _contains_intent_marker(text: str, marker: str) -> bool:
@@ -5289,17 +5832,17 @@ def requires_artifact_delivery(content: str) -> bool:
 
 def collaboration_role(profile: str) -> str:
     normalized = str(profile or "").strip().lower()
-    if normalized == "supervisor" or "supervis" in normalized or "监督" in normalized:
-        return "supervisor"
-    if normalized == "reviewer" or "review" in normalized:
-        return "reviewer"
+    if normalized in _RETIRED_AI_PROFILES or "supervis" in normalized or "review" in normalized or "监督" in normalized:
+        return "retired"
+    if normalized in {_HERMES_MANAGER_PROFILE, _LEGACY_DBB3_MANAGER_PROFILE, "dispatcher", "manager"}:
+        return "manager"
     if normalized.endswith("worker") or "worker" in normalized:
         return "worker"
     return "reporter"
 
 
 def collaboration_execution_order(profiles: list[str]) -> list[str]:
-    """Order supervisors, workers, reviewers, then exactly one final reporter."""
+    """Order manager, workers, and one deterministic final reporter."""
     selected = list(dict.fromkeys(str(item).strip() for item in profiles if str(item).strip()))
     if not selected:
         return []
@@ -5312,58 +5855,64 @@ def collaboration_execution_order(profiles: list[str]) -> list[str]:
         for item in selected
         if item != reporter and collaboration_role(item) == "worker"
     ]
-    reviewers = [
+    managers = [
         item
         for item in selected
-        if item != reporter and collaboration_role(item) == "reviewer"
+        if item != reporter and collaboration_role(item) == "manager"
     ]
-    supervisors = [
-        item
-        for item in selected
-        if item != reporter and collaboration_role(item) == "supervisor"
-    ]
-    return [*supervisors, *workers, *reviewers, reporter]
+    retired = {
+        item for item in selected
+        if collaboration_role(item) == "retired"
+    }
+    return [item for item in [*managers, *workers, reporter] if item not in retired]
 
 
 # Execution node per hosted member Profile; the parity contract exposes it so
 # native clients can label where each team member actually runs.
 _HOSTED_MEMBER_NODES = {
-    _DBB3_MANAGER_PROFILE: "dbb3",
+    "hermes-manager": "server",
+    "dbb3-manager": "dbb3",
     "dbb3-worker": "dbb3",
     "pc-worker": "wsl",
-    "reviewer": "dbb3",
-    "supervisor": "dbb3",
-    "default": "main",
 }
 _HOSTED_MEMBER_DISPLAY_NAMES = {
-    _DBB3_MANAGER_PROFILE: _HERMES_MANAGER_LABEL,
+    "hermes-manager": _HERMES_MANAGER_LABEL,
+    "dbb3-manager": _HERMES_MANAGER_LABEL,
     "dbb3-worker": "DBB3 执行员",
     "pc-worker": "PC/WSL 执行员",
-    "reviewer": "Hermes 审阅员",
-    "supervisor": _HERMES_SUPERVISOR_LABEL,
     "default": "Hermes 汇报员",
 }
 
 
 def hosted_member_role(profile: str, role_stage: str = "") -> str:
-    """Roster role of one hosted member: manager/worker/reviewer/reporter/supervisor."""
+    """Roster role of one hosted member: manager, worker, or reporter."""
 
     normalized = str(profile or "").strip().lower()
-    if normalized in {_DBB3_MANAGER_PROFILE, "dispatcher", "manager"}:
+    if normalized in {_HERMES_MANAGER_PROFILE, _LEGACY_DBB3_MANAGER_PROFILE, "dispatcher", "manager"}:
         return "manager"
     base_stage = str(role_stage or "").strip().lower().split(":", 1)[0].split(".", 1)[0]
     if base_stage.startswith("manager") or base_stage in {"dispatch", "workflow"}:
         return "manager"
-    if base_stage in {"worker", "reviewer", "supervisor", "reporter"}:
+    if base_stage in {"worker", "reporter"}:
         return base_stage
+    if base_stage in _RETIRED_AI_PROFILES:
+        return "retired"
     return collaboration_role(normalized)
 
 
 def hosted_member_id(profile: str, role_stage: str = "") -> str:
-    """Canonical member id; every manager/dispatcher alias collapses to dbb3-manager."""
+    """Return a stable member id while preserving explicit legacy aliases.
 
+    New workflow state uses ``hermes-manager``.  A caller that explicitly
+    supplies the retired ``dbb3-manager`` profile still needs its persisted
+    mobile copy context and participant identity to round-trip unchanged.
+    """
+
+    normalized = str(profile or "").strip().lower()
+    if normalized == _LEGACY_DBB3_MANAGER_PROFILE:
+        return _LEGACY_DBB3_MANAGER_PROFILE
     if hosted_member_role(profile, role_stage) == "manager":
-        return _DBB3_MANAGER_PROFILE
+        return _HERMES_MANAGER_PROFILE
     return str(profile or "").strip() or "default"
 
 
@@ -5542,23 +6091,11 @@ _MENTION_TARGET_ALIASES = {
         "dbb3-worker",
         "pc-worker",
     ),
-    "reviewer": (
-        "Hermes 审阅员",
-        "审阅员",
-        "Hermes Reviewer",
-        "Reviewer",
-    ),
     "reporter": (
         "Hermes 汇报员",
         "汇报员",
         "Hermes Reporter",
         "Reporter",
-    ),
-    "supervisor": (
-        "Hermes 监督者",
-        "监督者",
-        "Hermes Supervisor",
-        "Supervisor",
     ),
 }
 
@@ -6613,6 +7150,12 @@ def _manager_plan_prompt(
             "- 每项 4 个字段：title 一句话说清做什么；assignee 从可用执行节点中选择；"
             "depends_on 填前一项的 id（串行依赖），可并行的项用空数组；"
             "user_task_fragment 摘录用户任务原文中对应这一个项的片段。",
+            "执行者会用 delegate_task 的 name 给每个子代理取中文职业名，用 "
+            "expected_output 写交付物、acceptance_criteria 写验收条件、"
+            "inherit_turns 控制上下文继承、context_variables 共享小状态。"
+            "运行中用 subagent_list 查看、subagent_send 调整、subagent_kill 终止。"
+            "需要用户拍板时用 kanban_block(kind=\"needs_input\")，"
+            "reason 格式：问题 + 选项（A. ... B. ...）。",
             hosted_progress_protocol(_HERMES_MANAGER_LABEL),
             hosted_role_delivery_contract(_HERMES_MANAGER_LABEL),
             mention_priority_protocol(_HERMES_MANAGER_LABEL),
@@ -6805,7 +7348,7 @@ def _render_deterministic_hosted_report(
         status = str(item_statuses.get(item_id) or "")
         label = _hosted_todo_status_label(status)
         excerpt = str(item_results.get(item_id) or "").strip().replace("\n", " ")[:200]
-        lines.append(f"{index}. {str(item.get('title') or item_id)}")
+        lines.append(f"{index}. {str(item.get('title') or item_id)}（ID: {item_id}）")
         lines.append(f"   - 执行者：{item.get('assignee')}")
         lines.append(f"   - 状态：{label}")
         if excerpt:
@@ -8005,7 +8548,7 @@ def classify_user_intent(
     selected_profiles = (
         ["default"]
         if mode == "chat"
-        else ["default", *worker_profiles, "reviewer"]
+        else ["default", *worker_profiles]
     )
     routed.update(
         {
@@ -8068,6 +8611,17 @@ def build_group_prompt(
     recent = "\n".join(_message_line(item) for item in history[-_PROMPT_HISTORY:])
     members = "、".join(str(item) for item in room.get("profiles") or [])
     role = collaboration_role(profile)
+    # Retired reviewer/supervisor profiles remain accepted at the prompt
+    # boundary for old rooms and explicit API requests.  Their role-specific
+    # instructions are still valid even though new workflows use the
+    # deterministic server-side aggregator.
+    prompt_role = role
+    if role == "retired":
+        prompt_role = (
+            "supervisor"
+            if str(profile or "").strip().lower() == "supervisor"
+            else "reviewer"
+        )
     role_instruction = {
         "worker": (
             "你是执行者。只负责实际执行、调用工具并提交证据、结果和遗留问题；"
@@ -8092,7 +8646,7 @@ def build_group_prompt(
             "你是唯一最终汇报者。综合执行者和审阅者的信息，向用户给出一次清晰的最终结论、"
             "完成状态、关键证据、问题和下一步；不要重新执行已经完成的工作。"
         ),
-    }[role]
+    }[prompt_role]
     if artifact_required:
         artifact_instruction = (
             "用户明确要求文件交付。只有执行者可以创建所需的最终文件；审阅者只核验，"
@@ -8110,7 +8664,7 @@ def build_group_prompt(
         f"{role_instruction}\n"
         f"{artifact_instruction}\n"
         f"{hosted_progress_protocol(profile)}\n"
-        f"{hosted_role_delivery_contract(role)}\n"
+        f"{hosted_role_delivery_contract(prompt_role)}\n"
         f"{mention_priority_protocol(profile)}\n"
         "请使用简体中文，避免机械重复其他成员。\n\n"
         f"最近讨论：\n{recent or '暂无'}\n\n"
@@ -8247,6 +8801,24 @@ def _profile_status_event(kind: Any, text: Any) -> Optional[dict[str, Any]]:
     }
 
 
+def _decode_subprocess_output(value: Any) -> str:
+    """Decode UTF-8 first, then the Windows GBK-compatible code page."""
+    if isinstance(value, str):
+        return value
+    if isinstance(value, (bytes, bytearray, memoryview)):
+        raw = bytes(value)
+        try:
+            return raw.decode("utf-8")
+        except UnicodeDecodeError:
+            try:
+                # ``gb18030`` is a strict superset of the GBK code page and is
+                # available in the Python standard library on every platform.
+                return raw.decode("gb18030")
+            except UnicodeDecodeError:
+                return raw.decode("utf-8", errors="replace")
+    return str(value or "")
+
+
 def _legacy_profile_turn(
     profile: str,
     prompt: str,
@@ -8268,23 +8840,39 @@ def _legacy_profile_turn(
         "--max-turns",
         "45",
     ]
-    env = {**os.environ, "HOME": os.environ.get("HOME", "/home/hermes")}
+    env = {
+        **os.environ,
+        "HOME": os.environ.get("HOME", "/home/hermes"),
+        "PYTHONIOENCODING": "utf-8",
+    }
     if kanban_task_id:
         env["HERMES_KANBAN_TASK"] = kanban_task_id
     else:
         env.pop("HERMES_KANBAN_TASK", None)
+    # Windows console tools are not consistent about their output code page:
+    # Hermes/Python uses UTF-8, while a native helper may still emit GBK.  The
+    # real subprocess path therefore keeps bytes until the decoder can choose
+    # the correct codec; injected runners retain the text-mode test contract.
+    binary_output = os.name == "nt" and runner is subprocess.run
     result = runner(
         command,
         shell=False,
         capture_output=True,
-        text=True,
+        text=not binary_output,
+        **(
+            {}
+            if binary_output
+            else {"encoding": "utf-8", "errors": "replace"}
+        ),
         timeout=600,
         env=env,
     )
+    stdout = _decode_subprocess_output(result.stdout)
+    stderr = _decode_subprocess_output(result.stderr)
     if result.returncode != 0:
-        error = result.stderr or result.stdout or "Hermes profile execution failed"
+        error = stderr or stdout or "Hermes profile execution failed"
         raise RuntimeError(sanitize_runtime_error(error))
-    response = (result.stdout or "").strip()
+    response = stdout.strip()
     if not response:
         raise RuntimeError("Hermes profile returned an empty response")
     return response
@@ -8296,7 +8884,22 @@ def _hosted_runtime_home(
 ) -> str:
     from hermes_cli.profiles import resolve_profile_env
 
-    runtime_home = str(resolve_profile_env(profile))
+    requested_profile = str(profile or "default").strip() or "default"
+    try:
+        runtime_home = str(resolve_profile_env(requested_profile))
+    except FileNotFoundError:
+        # Reviewer/supervisor and the old DBB3 manager name are accepted at
+        # the API boundary for existing rooms, but their profile directories
+        # were retired by the hosted-role migration.  Run those explicit
+        # requests with the deterministic default runtime rather than
+        # returning a false prewarm/queue failure.
+        if (
+            requested_profile.lower() in _RETIRED_AI_PROFILES
+            or requested_profile.lower() == _LEGACY_DBB3_MANAGER_PROFILE
+        ):
+            runtime_home = str(resolve_profile_env("default"))
+        else:
+            raise
     runtime_owner = str((artifact_context or {}).get("owner_id") or "").strip()
     runtime_generation = str(
         (artifact_context or {}).get("account_generation") or ""
@@ -8448,6 +9051,7 @@ def run_profile_turn(
         **os.environ,
         "HOME": os.environ.get("HOME", "/home/hermes"),
         "HERMES_HOME": runtime_home,
+        "PYTHONIOENCODING": "utf-8",
         "HERMES_SESSION_SOURCE": "dashboard-group",
         # Keep the temporary fallback runner on the same full-schema/lazy-MCP
         # contract as the persistent TUI gateway. It must not probe every
@@ -8550,47 +9154,51 @@ def run_profile_turn(
 
     command = [sys.executable, str(Path(__file__).resolve()), "--profile-event-runner"]
     deadline = time.monotonic() + timeout
-    process = process_factory(
-        command,
-        shell=False,
-        stdin=subprocess.PIPE,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-        text=True,
-        encoding="utf-8",
-        bufsize=1,
-        env=env,
-    )
+    binary_output = os.name == "nt" and process_factory is subprocess.Popen
+    process_kwargs = {
+        "shell": False,
+        "stdin": subprocess.PIPE,
+        "stdout": subprocess.PIPE,
+        "stderr": subprocess.PIPE,
+        "text": not binary_output,
+        "bufsize": 0 if binary_output else 1,
+        "env": env,
+    }
+    if not binary_output:
+        process_kwargs.update(encoding="utf-8", errors="replace")
+    process = process_factory(command, **process_kwargs)
     if process.stdin is None or process.stdout is None:
         process.kill()
         raise RuntimeError("Hermes 结构化执行通道启动失败")
     line_queue: queue.Queue[Optional[str]] = queue.Queue()
     writer_errors: queue.Queue[BaseException] = queue.Queue(maxsize=1)
-    stderr_tail: list[str] = []
+    stderr_tail: list[str | bytes] = []
     stderr_tail_chars = 0
+    stderr_tail_limit = _HOSTED_STDERR_TAIL_CHARS * (4 if binary_output else 1)
 
     def _write_stdin() -> None:
         try:
+            request_text = json.dumps(
+                {
+                    "prompt": prompt,
+                    "session_id": str(session_id or "").strip(),
+                    "action": str(action or "chat").strip().lower(),
+                    "focus_topic": str(focus_topic or "").strip(),
+                    "capability_hints": [
+                        str(item)
+                        for item in (artifact_context or {}).get(
+                            "capability_hints", []
+                        )
+                        if str(item).strip()
+                    ],
+                    "allow_tools": str(
+                        (artifact_context or {}).get("allow_tools", "1")
+                    ).strip().lower() not in {"0", "false", "no"},
+                },
+                ensure_ascii=False,
+            )
             process.stdin.write(
-                json.dumps(
-                    {
-                        "prompt": prompt,
-                        "session_id": str(session_id or "").strip(),
-                        "action": str(action or "chat").strip().lower(),
-                        "focus_topic": str(focus_topic or "").strip(),
-                        "capability_hints": [
-                            str(item)
-                            for item in (artifact_context or {}).get(
-                                "capability_hints", []
-                            )
-                            if str(item).strip()
-                        ],
-                        "allow_tools": str(
-                            (artifact_context or {}).get("allow_tools", "1")
-                        ).strip().lower() not in {"0", "false", "no"},
-                    },
-                    ensure_ascii=False,
-                )
+                request_text.encode("utf-8") if binary_output else request_text
             )
             process.stdin.close()
         except BaseException as exc:
@@ -8599,7 +9207,7 @@ def run_profile_turn(
     def _read_stdout() -> None:
         try:
             for line in process.stdout:
-                line_queue.put(line)
+                line_queue.put(_decode_subprocess_output(line))
         finally:
             line_queue.put(None)
 
@@ -8616,10 +9224,14 @@ def run_profile_turn(
                 return
             if not chunk:
                 return
+            if binary_output:
+                chunk = bytes(chunk)
+            else:
+                chunk = _decode_subprocess_output(chunk)
             stderr_tail.append(chunk)
             stderr_tail_chars += len(chunk)
-            while stderr_tail and stderr_tail_chars > _HOSTED_STDERR_TAIL_CHARS:
-                overflow = stderr_tail_chars - _HOSTED_STDERR_TAIL_CHARS
+            while stderr_tail and stderr_tail_chars > stderr_tail_limit:
+                overflow = stderr_tail_chars - stderr_tail_limit
                 if overflow >= len(stderr_tail[0]):
                     stderr_tail_chars -= len(stderr_tail.pop(0))
                 else:
@@ -8692,7 +9304,18 @@ def run_profile_turn(
         stderr_reader.join(timeout=1)
         raise
     stderr_reader.join(timeout=1)
-    stderr = "".join(stderr_tail).strip()
+    if binary_output:
+        stderr = _decode_subprocess_output(
+            b"".join(
+                item if isinstance(item, bytes) else str(item).encode("utf-8")
+                for item in stderr_tail
+            )
+        ).strip()
+    else:
+        stderr = "".join(
+            item if isinstance(item, str) else _decode_subprocess_output(item)
+            for item in stderr_tail
+        ).strip()
     if return_code != 0:
         raise RuntimeError(sanitize_runtime_error(stderr or "Hermes profile execution failed"))
     if not response:
@@ -8720,22 +9343,27 @@ def run_single_turn(
         "--max-turns",
         "45",
     ]
-    result = runner(
-        command,
-        shell=False,
-        capture_output=True,
-        text=True,
-        timeout=600,
-        env={**os.environ, "HOME": os.environ.get("HOME", "/home/hermes")},
-    )
+    binary_output = os.name == "nt" and runner is subprocess.run
+    runner_kwargs = {
+        "shell": False,
+        "capture_output": True,
+        "text": not binary_output,
+        "timeout": 600,
+        "env": {
+            **os.environ,
+            "HOME": os.environ.get("HOME", "/home/hermes"),
+            "PYTHONIOENCODING": "utf-8",
+        },
+    }
+    if not binary_output:
+        runner_kwargs.update(encoding="utf-8", errors="replace")
+    result = runner(command, **runner_kwargs)
+    stdout = _decode_subprocess_output(result.stdout)
+    stderr = _decode_subprocess_output(result.stderr)
     if result.returncode != 0:
-        error = (
-            result.stderr
-            or result.stdout
-            or "Hermes profile execution failed"
-        ).strip()
+        error = (stderr or stdout or "Hermes profile execution failed").strip()
         raise RuntimeError(error[-2000:])
-    response = (result.stdout or "").strip()
+    response = stdout.strip()
     if not response:
         raise RuntimeError("Hermes profile returned an empty response")
     return response
@@ -9566,6 +10194,12 @@ def _invoke_profile_runner(
     return str(runner(profile, prompt, **kwargs))
 
 
+def _uses_runtime_session_boundary(runner: Callable[..., str]) -> bool:
+    """Only the production runner owns the external TUI session boundary."""
+
+    return runner is run_profile_turn
+
+
 def _run_local_intervention_reply(
     conversation_id: str,
     turn_id: str,
@@ -9601,9 +10235,13 @@ def _run_local_intervention_reply(
         apply_profile_event(reply_state, event)
 
     boundary_profile = runtime_profile or profile
-    before = _runtime_session_boundary(
-        boundary_profile,
-        str(reply_state.get("runtime_session_id") or ""),
+    before = (
+        _runtime_session_boundary(
+            boundary_profile,
+            str(reply_state.get("runtime_session_id") or ""),
+        )
+        if _uses_runtime_session_boundary(runner)
+        else {}
     )
     result = _invoke_profile_runner(
         runner,
@@ -9617,10 +10255,14 @@ def _run_local_intervention_reply(
     ).strip()
     if not result:
         raise RuntimeError("Hermes profile returned an empty intervention response")
-    boundary = _runtime_session_boundary(
-        boundary_profile,
-        str(reply_state.get("runtime_session_id") or ""),
-        after_message_id=int(before.get("tip_message_id") or 0),
+    boundary = (
+        _runtime_session_boundary(
+            boundary_profile,
+            str(reply_state.get("runtime_session_id") or ""),
+            after_message_id=int(before.get("tip_message_id") or 0),
+        )
+        if _uses_runtime_session_boundary(runner)
+        else {}
     )
     if boundary.get("session_id"):
         reply_state["runtime_session_id"] = str(boundary["session_id"])
@@ -10410,11 +11052,14 @@ def _run_hosted_role(
             role_stage=role_stage,
             profile=profile,
             runner=runner,
+            artifact_context=artifact_context,
         )
     for attempt in range(1, attempts + 1):
         try:
             boundary_profile = runtime_profile or profile
-            if not int(state.get("runtime_message_before") or 0):
+            if _uses_runtime_session_boundary(runner) and not int(
+                state.get("runtime_message_before") or 0
+            ):
                 before = _runtime_session_boundary(
                     boundary_profile,
                     str(state.get("runtime_session_id") or ""),
@@ -10443,10 +11088,14 @@ def _run_hosted_role(
                 raise _HostedRoleIntervention(intervention)
             if not result:
                 raise RuntimeError("Hermes profile returned an empty response")
-            boundary = _runtime_session_boundary(
-                boundary_profile,
-                str(state.get("runtime_session_id") or ""),
-                after_message_id=int(state.get("runtime_message_before") or 0),
+            boundary = (
+                _runtime_session_boundary(
+                    boundary_profile,
+                    str(state.get("runtime_session_id") or ""),
+                    after_message_id=int(state.get("runtime_message_before") or 0),
+                )
+                if _uses_runtime_session_boundary(runner)
+                else {}
             )
             if boundary.get("session_id"):
                 state["runtime_session_id"] = str(boundary["session_id"])
@@ -10753,6 +11402,7 @@ def _run_hosted_remote_role(
     rework_round: int = 0,
     connector_id: str = "",
     visible: bool = True,
+    remote_supervisor: bool = False,
 ) -> tuple[str, str, dict[str, Any]]:
     """Wait for a DBB3/PC connector run and project its checkpoints.
 
@@ -10783,6 +11433,7 @@ def _run_hosted_remote_role(
         attachment_ids=list(run_snapshot.get("attachment_ids") or []),
         attempt=rework_round + 1,
         connector_id=connector_id,
+        remote_supervisor=remote_supervisor,
     )
     active_remote_id = str(remote.get("id") or "")
     connector_provider = _observe_runtime_provider(
@@ -10922,6 +11573,7 @@ def _run_hosted_remote_role(
                 rework_round=rework_round,
                 connector_id=connector_id,
                 visible=visible,
+                remote_supervisor=remote_supervisor,
             )
         with _STATE_LOCK:
             state = load_single_state()
@@ -11237,6 +11889,7 @@ def _run_hosted_remote_role(
                             rework_round=rework_round,
                             connector_id=connector_id,
                             visible=visible,
+                            remote_supervisor=remote_supervisor,
                         )
                         intervention_reply = (
                             reply_result
@@ -11278,6 +11931,7 @@ def _run_hosted_remote_role(
                                 rework_round=rework_round,
                                 connector_id=connector_id,
                                 visible=visible,
+                                remote_supervisor=remote_supervisor,
                             )
                         )
                         _persist_hosted_role_state(
@@ -11511,7 +12165,9 @@ def create_hosted_kanban_task(
 ) -> dict[str, Any]:
     from hermes_cli import kanban_db, kanban_decompose
 
-    kanban_db.init_db()
+    # connect() owns idempotent schema creation and migration. Calling
+    # init_db() first forced a second full integrity/schema pass on every
+    # hosted turn, adding a multi-second tail before dispatch.
     conn = kanban_db.connect()
     try:
         lane_context = ", ".join(profiles or [])
@@ -11605,6 +12261,14 @@ def _notify_hosted_update(conversation_id: str = "") -> int:
     with _HOSTED_UPDATE_CONDITION:
         _HOSTED_UPDATE_REVISION += 1
         if normalized_conversation_id:
+            if (
+                normalized_conversation_id not in _HOSTED_UPDATE_REVISIONS
+                and len(_HOSTED_UPDATE_REVISIONS) >= 4096
+            ):
+                # Long-lived hosts only need revisions for conversations with
+                # active/waiting SSE readers. Dropping the oldest idle entry
+                # merely makes its next waiter observe a state change now.
+                _HOSTED_UPDATE_REVISIONS.pop(next(iter(_HOSTED_UPDATE_REVISIONS)))
             _HOSTED_UPDATE_REVISIONS[normalized_conversation_id] = (
                 _HOSTED_UPDATE_REVISIONS.get(normalized_conversation_id, 0) + 1
             )
@@ -12710,6 +13374,25 @@ def _connector_for_profile(profile: str) -> str:
     return "dbb3-primary"
 
 
+def _worker_queued_task_summary(record: Mapping[str, Any]) -> dict[str, Any]:
+    """Keep socket fan-out bounded; workers fetch the durable record via REST."""
+
+    objective = str(record.get("objective") or "")
+    return {
+        "id": str(record.get("id") or ""),
+        "idempotency_key": str(record.get("idempotency_key") or ""),
+        "conversation_id": str(record.get("conversation_id") or ""),
+        "turn_id": str(record.get("turn_id") or ""),
+        "profile": str(record.get("profile") or ""),
+        "status": str(record.get("status") or "queued"),
+        "title": str(record.get("title") or "")[:500],
+        "objective": objective[:4_000],
+        "attempt": max(1, int(record.get("attempt") or 1)),
+        "artifact_required": bool(record.get("artifact_required")),
+        "deadline_at": record.get("deadline_at"),
+    }
+
+
 def _remote_run_connector_id(remote_run: dict[str, Any]) -> str:
     return str(
         remote_run.get("connector_id")
@@ -12987,6 +13670,7 @@ def _ensure_remote_run(
     attachment_ids: Optional[list[str]] = None,
     attempt: int = 1,
     connector_id: str = "",
+    remote_supervisor: bool = False,
 ) -> dict[str, Any]:
     """Create or reuse the durable DBB3/PC queue item for one role phase."""
 
@@ -13023,9 +13707,19 @@ def _ensure_remote_run(
                 raise CollaborationAccountDeletionInProgress()
             if existing_generation and existing_generation != account_generation:
                 raise CollaborationAccountDeletionInProgress()
+            existing_changed = False
             if not existing_owner or not existing_generation:
                 existing["owner_id"] = owner_id
                 existing["account_generation"] = account_generation
+                existing_changed = True
+            if remote_supervisor and not _coerce_flag(
+                existing.get("remote_supervisor")
+            ):
+                # A supervisor queue record may have been created by an older
+                # server before the explicit marker was persisted.
+                existing["remote_supervisor"] = True
+                existing_changed = True
+            if existing_changed:
                 save_single_state(state)
             return dict(existing)
         now = int(time.time() * 1000)
@@ -13068,9 +13762,27 @@ def _ensure_remote_run(
             "created_at": now,
             "updated_at": now,
         }
+        if remote_supervisor:
+            record["remote_supervisor"] = True
         record["deadline_at"] = deadline_at
         remote_runs[role_stage] = record
         save_single_state(state)
+    # The durable remote-run record is authoritative.  When the matching
+    # worker is connected, also push the queued task immediately; a missing
+    # connection simply leaves the existing connector pull path responsible
+    # for recovery.
+    worker_node = str(profile or "").strip()
+    if worker_node in {"dbb3-worker", "pc-worker"}:
+        try:
+            _WORKER_CHANNEL.publish(
+                worker_node,
+                "worker.queued",
+                request_id=str(record.get("idempotency_key") or remote_id),
+                turn_id=turn_id,
+                payload={"task": _worker_queued_task_summary(record)},
+            )
+        except Exception:
+            logger.debug("Worker %s is not connected; task remains in durable queue", worker_node)
     _notify_hosted_update(conversation_id)
     _push_connector_event(
         str(record.get("connector_id") or ""),
@@ -14455,8 +15167,11 @@ def _supervisor_result_contradicts_verdict(result: str, verdict: str) -> bool:
 # the SAME mid-run steer delivery the user-facing endpoint uses.  Companion
 # failures must never break the stage: every path is best-effort.
 
-_HOSTED_COMPANION_POLL_SECONDS = 15.0
-_HOSTED_COMPANION_MIN_CALL_SECONDS = 40.0
+# Companion supervision must not put an extra model call in the critical path
+# of every short worker stage. A 60-second observation cadence still catches
+# drift on real work while leaving bounded tasks to the deterministic gate.
+_HOSTED_COMPANION_POLL_SECONDS = 60.0
+_HOSTED_COMPANION_MIN_CALL_SECONDS = 90.0
 _HOSTED_COMPANION_MAX_CALLS = 4
 _HOSTED_COMPANION_MAX_URGENT = 2
 _HOSTED_COMPANION_MAX_LIFETIME_SECONDS = 1800.0
@@ -14659,6 +15374,7 @@ def _hosted_companion_loop(
     role_stage: str,
     profile: str,
     runner: Callable[..., str],
+    artifact_context: Optional[dict[str, str]] = None,
 ) -> None:
     """Watch one running role; small delta checks; urgent steer when needed."""
 
@@ -14720,7 +15436,7 @@ def _hosted_companion_loop(
                 "",
                 "",
                 lambda: bool(handle["stop"].is_set()),
-                None,
+                artifact_context,
             )
             parsed = _hosted_companion_parse(result)
             if parsed is None:
@@ -14793,6 +15509,7 @@ def _start_hosted_companion(
     role_stage: str,
     profile: str,
     runner: Optional[Callable[..., str]],
+    artifact_context: Optional[dict[str, str]] = None,
 ) -> Optional[dict[str, Any]]:
     if runner is None:
         return None
@@ -14816,7 +15533,15 @@ def _start_hosted_companion(
         }
         thread = threading.Thread(
             target=_hosted_companion_loop,
-            args=(handle, conversation_id, turn_id, role_stage, profile, runner),
+            args=(
+                handle,
+                conversation_id,
+                turn_id,
+                role_stage,
+                profile,
+                runner,
+                artifact_context,
+            ),
             name=f"hosted-companion-{str(turn_id)[-8:]}-{str(role_stage).split(':', 1)[0]}",
             daemon=True,
         )
@@ -14830,9 +15555,6 @@ def _stop_hosted_companion(handle: Optional[dict[str, Any]]) -> None:
     if not isinstance(handle, dict):
         return
     handle["stop"].set()
-    thread = handle.get("thread")
-    if isinstance(thread, threading.Thread):
-        thread.join(timeout=2.0)
     key = handle.get("registry_key")
     if isinstance(key, tuple):
         with _HOSTED_COMPANION_REGISTRY_LOCK:
@@ -15092,6 +15814,7 @@ def _run_hosted_supervisor_check(
             attachment_context="",
             connector_id="dbb3-primary",
             visible=visible,
+            remote_supervisor=True,
         )
         supervisor_profile = _DBB3_MANAGER_PROFILE
     else:
@@ -15383,13 +16106,21 @@ def execute_hosted_workflow(
     ).strip()
     plan_only = slash_directive == "plan"
     goal_override = slash_argument if slash_directive == "goal" else ""
-    profiles = list(run.get("profiles") or ["default", "dbb3-worker", "reviewer"])
+    profiles = [
+        str(profile).strip()
+        for profile in list(run.get("profiles") or ["default", "dbb3-worker"])
+        if str(profile).strip()
+        and collaboration_role(str(profile)) != "retired"
+        and str(profile).strip().lower() != _LEGACY_DBB3_MANAGER_PROFILE
+    ]
     ordered = collaboration_execution_order(profiles)
     fallback_worker_profiles = [
         item for item in ordered if collaboration_role(item) == "worker"
     ] or ["dbb3-worker"]
-    reviewer_profile = "reviewer"
-    reviewer_connector_id = "dbb3-primary"
+    # Reviewer/Supervisor are retired AI roles. The default profile is the
+    # deterministic server-side result aggregator.
+    reviewer_profile = ""
+    reviewer_connector_id = ""
     reporter_profile = "default"
     artifact_required = _coerce_flag(run.get("artifact_required"))
     attachment_context = _hosted_chat_attachment_context(conversation_snapshot, run)
@@ -15443,33 +16174,29 @@ def execute_hosted_workflow(
             )
             if item
         )
-        if remote_workers:
-            manager_result, manager_status, _manager_state = _run_hosted_remote_role(
-                conversation_id,
-                turn_id,
-                profile=_DBB3_MANAGER_PROFILE,
-                role_stage="manager_planning",
-                role_label=f"{_HERMES_MANAGER_LABEL} · 规划",
-                prompt=manager_prompt,
-                kanban_task_id="",
-                start_text="正在评估难度并形成结构化执行计划。",
-                artifact_required=False,
-                delivery_context="Return only the requested JSON plan.",
-                attachment_context=attachment_context,
-                connector_id="dbb3-primary",
-            )
-        else:
-            manager_result, manager_status, _manager_state = _run_hosted_role(
-                conversation_id,
-                turn_id,
-                profile=_DBB3_MANAGER_PROFILE,
-                role_stage="manager_planning",
-                role_label=f"{_HERMES_MANAGER_LABEL} · 规划",
-                prompt=manager_prompt,
-                runner=manager_runner or runner,
-                kanban_task_id="",
-                start_text="正在评估难度并形成结构化执行计划。",
-            )
+        # Manager planning is always executed by the server-local Hermes
+        # profile. Remote connectors are reserved for worker lanes.
+        manager_result, manager_status, _manager_state = _run_hosted_role(
+            conversation_id,
+            turn_id,
+            profile=_HERMES_MANAGER_PROFILE,
+            role_stage="manager_planning",
+            role_label=f"{_HERMES_MANAGER_LABEL} · 规划",
+            prompt=manager_prompt,
+            runner=manager_runner or run_profile_turn,
+            kanban_task_id="",
+            start_text="正在评估难度并形成结构化执行计划。",
+            # ``hermes-manager`` is the canonical durable role label, not a
+            # separately installed Hermes profile.  The public runtime ships
+            # the deterministic ``default`` profile; use it only for the
+            # production runner while preserving the canonical role identity
+            # in state and in injected-runner tests.
+            runtime_profile=(
+                "default"
+                if manager_runner is None
+                else ""
+            ),
+        )
         if manager_status != "completed":
             raise RuntimeError(manager_result or f"{_HERMES_MANAGER_NAME} planning failed")
         manager_plan = _normalize_manager_plan(
@@ -15483,7 +16210,7 @@ def execute_hosted_workflow(
             patch={
                 "manager_result": manager_result,
                 "manager_plan": manager_plan,
-                "profiles": ["default", *manager_plan["workers"], "reviewer"],
+                "profiles": ["default", *manager_plan["workers"]],
                 "stage": "dispatching",
             },
         )
@@ -15560,8 +16287,6 @@ def execute_hosted_workflow(
         )
 
     worker_profiles = list(manager_plan.get("workers") or fallback_worker_profiles)
-    if manager_plan.get("reviewer_target") == "pc":
-        reviewer_connector_id = "pc-primary"
     turn_plan = build_hosted_turn_plan(
         turn_id=turn_id,
         worker_profiles=worker_profiles,
@@ -15679,7 +16404,7 @@ def execute_hosted_workflow(
             turn_id=turn_id,
             title=title,
             content=content,
-            profiles=[*worker_profiles, reviewer_profile],
+            profiles=list(worker_profiles),
             output_dir=str(run.get("output_dir") or ""),
             manager_plan=manager_plan,
         )
@@ -15720,8 +16445,10 @@ def execute_hosted_workflow(
         if _finish_hosted_turn_if_cancelled(conversation_id, turn_id):
             return
 
-    supervisor_statuses: dict[str, str] = {}
-    supervisor_findings: dict[str, str] = {}
+    # Completion is intentionally deterministic.  AI Supervisor/Reviewer
+    # roles are retired; workers report evidence and the server aggregates it.
+    validation_statuses: dict[str, str] = {}
+    validation_findings: dict[str, str] = {}
     # Remote lanes own their kanban on the executor node: the connector
     # creates the local root task and reports its id back via checkpoints.
     # Hand the supervisor the executor-local id (synced from the manager
@@ -15809,8 +16536,8 @@ def execute_hosted_workflow(
             "stage": "worker_running",
             # Dispatch is the authoritative join point: the manager and every
             # dispatched worker become first-class roster members here.
-            # 编排工作流重构：reviewer/reporter 通道不再执行，但仍在花名册中
-            # 登记（保持 iOS 参与者渲染协议不变），最终汇报由确定性看板生成。
+            # Manager and workers are the only runtime participants.  The
+            # reporter is a deterministic server-side projection, not a role.
             "participants": [
                 hosted_participant_descriptor(_DBB3_MANAGER_PROFILE),
                 *(
@@ -15818,12 +16545,8 @@ def execute_hosted_workflow(
                     for profile in worker_profiles
                 ),
                 hosted_participant_descriptor(
-                    reviewer_profile,
-                    role_stage="reviewer",
-                ),
-                hosted_participant_descriptor(
                     reporter_profile,
-                    role_stage="reporter",
+                    role_stage="aggregator",
                 ),
             ],
         },
@@ -15950,7 +16673,7 @@ def execute_hosted_workflow(
         else:
             role_stage = "worker" if len(worker_profiles) == 1 else f"worker:{profile}"
         if followup_round:
-            start_text = "收到监督者追问，正在核实该 Todo 项的缺口。"
+            start_text = "收到调度器追问，正在核实该 Todo 项的缺口。"
         elif rework_round:
             start_text = f"收到退回意见（第 {rework_round} 轮），正在返工。"
         else:
@@ -15984,7 +16707,7 @@ def execute_hosted_workflow(
                 "不要做最终总结；把结果、证据、耗时和遗留问题提交给调度者。",
                 f"用户任务：{content}",
                 (
-                    f"监督者追问（核实该 Todo 项是否确已完成）：\n{followup_question}"
+                    f"调度器追问（核实该 Todo 项是否确已完成）：\n{followup_question}"
                     if followup_question
                     else ""
                 ),
@@ -16105,14 +16828,9 @@ def execute_hosted_workflow(
             },
             protocol_events=protocol_events,
         )
-        if manager_plan.get("plan"):
-            _persist_hosted_plan_snapshot(
-                conversation_id,
-                turn_id,
-                manager_plan,
-                stage=stage,
-                worker_statuses=worker_statuses,
-            )
+        # The turn patch above already carries todo/worker state. Plan
+        # snapshots are durable at dispatch and terminal boundaries; writing a
+        # third copy after every dependency wave doubles checkpoint latency.
 
     def _supervisor_gap_text(check: dict[str, Any]) -> str:
         # 从监督记录中提取缺口描述（展示文本 + 结构化 required_actions/findings）。
@@ -16210,8 +16928,9 @@ def execute_hosted_workflow(
         item: dict[str, Any],
         claimed_result: str,
     ) -> dict[str, Any]:
-        # 事件驱动快检 (a)：单个 todo 项完成后的一次短检查。
-        # 输入只有「用户原话 + 该项声称的结果」，验收标准是 user_task_completed。
+        # Deterministic completion check.  A worker result is evidence, not a
+        # second model turn.  This keeps the manager as the sole scheduler and
+        # avoids reintroducing the retired Supervisor/Reviewer roles.
         sanitized_item_id = _sanitize_hosted_check_id(item["id"])
         item_check_attempts[item["id"]] += 1
         attempt = item_check_attempts[item["id"]]
@@ -16220,142 +16939,41 @@ def execute_hosted_workflow(
             if attempt == 1
             else f"todo_{sanitized_item_id}_{attempt}"
         )
-        _result, _status, check = _run_hosted_supervisor_check(
-            conversation_id,
-            turn_id,
-            check_id=check_id,
-            checkpoint_label=f"Todo 完成：{str(item['title'])[:40]}",
-            evidence={
-                "task_goal": content,
-                "todo_item": {
-                    "id": item["id"],
-                    "title": item["title"],
-                    "assignee": item["assignee"],
-                    "user_task_fragment": item.get("user_task_fragment") or "",
-                },
-                "claimed_result": str(claimed_result or "")[:4000],
-            },
-            runner=runner,
-            remote=remote_workers,
-            kanban_task_id=plan_sync_task_id,
-        )
-        supervisor_statuses[check_id] = _status
-        supervisor_findings[check_id] = str(
-            check.get("display_result") or _result
-        )
+        result_text = str(claimed_result or "").strip()
+        status = "completed" if result_text else "failed"
+        verdict = "pass" if result_text else "corrective_action"
+        check = {
+            "schema_version": "hermes.validation.v1",
+            "check_id": check_id,
+            "status": status,
+            "verdict": verdict,
+            "display_result": (
+                f"服务器确定性校验通过：{str(item['title'])[:120]}"
+                if result_text
+                else f"任务没有返回结果：{str(item['title'])[:120]}"
+            ),
+            "result": result_text[:4000],
+            "required_actions": [] if result_text else ["worker_result_required"],
+            "findings": [] if result_text else ["empty_worker_result"],
+        }
+        validation_statuses[check_id] = status
+        validation_findings[check_id] = str(check["display_result"])
         return check
 
     def settle_todo_item_after_check(
         item: dict[str, Any],
         initial_result: str,
     ) -> bool:
-        # 快检 (a) 的裁决路径：通过 → 记录；存疑 → 先追问 worker 再判；
-        # 确认未完成 → 有界返工；仍不收敛 → 监督门失败（fail closed）。
-        # 返回 False 表示本轮任务已被取消，调用方应立即退出。
-        nonlocal rework_round
+        # A non-empty worker result is complete. Empty results stay failed and
+        # are surfaced in the final deterministic report; no hidden model
+        # review or rework loop is introduced.
         item_id = item["id"]
         result = str(initial_result or "")
         check = run_todo_completion_check(item, result)
-        verdict = str(check.get("verdict") or "unknown")
-        check_status = str(check.get("status") or "failed")
-        if check_status == "completed" and verdict == "pass":
+        if check["status"] == "completed":
+            item_statuses[item_id] = "completed"
             return True
-        if verdict == "corrective_action":
-            gap = _supervisor_gap_text(check)
-            if item_followup_rounds[item_id] < 1:
-                # 不直接打回：先向对应 worker 追问，等回复后再判。
-                item_followup_rounds[item_id] = 1
-                _persist_supervisor_followup_message(item, gap)
-                if _finish_hosted_turn_if_cancelled(conversation_id, turn_id):
-                    return False
-                reply, reply_status = execute_todo_item(
-                    item,
-                    followup_question=gap,
-                    followup_round=1,
-                )
-                combined = "\n\n".join(entry for entry in (result, reply) if entry)
-                item_results[item_id] = combined
-                item_statuses[item_id] = (
-                    "completed" if reply_status == "completed" else reply_status
-                )
-                _persist_workflow_progress()
-                if _finish_hosted_turn_if_cancelled(conversation_id, turn_id):
-                    return False
-                check = run_todo_completion_check(item, combined)
-                verdict = str(check.get("verdict") or "unknown")
-                check_status = str(check.get("status") or "failed")
-                if check_status == "completed" and verdict == "pass":
-                    item_statuses[item_id] = "completed"
-                    _persist_workflow_progress()
-                    return True
-                gap = _supervisor_gap_text(check)
-                result = combined
-            while item_rework_rounds[item_id] < _HOSTED_REWORK_LIMIT:
-                # 追问后仍判定未完成：确认打回重做（有界）。
-                item_rework_rounds[item_id] += 1
-                round_number = item_rework_rounds[item_id]
-                rework_round = max(rework_round, round_number)
-                rework_history.append(
-                    {
-                        "round": round_number,
-                        "todo_id": item_id,
-                        "supervisor_feedback": gap[:4000],
-                        "requested_at": int(time.time() * 1000),
-                    }
-                )
-                _emit_rework_state_event(
-                    conversation_id,
-                    turn_id,
-                    phase="started",
-                    rework_round=round_number,
-                    checkpoint_label=f"Todo：{item['title']}"[:60],
-                    feedback=gap,
-                )
-                _persist_supervisor_rework_message(item, gap, round_number)
-                if _finish_hosted_turn_if_cancelled(conversation_id, turn_id):
-                    return False
-                rework_result, rework_status = execute_todo_item(
-                    item,
-                    rework_feedback=gap,
-                    rework_round=round_number,
-                )
-                item_results[item_id] = rework_result or result
-                item_statuses[item_id] = rework_status
-                _emit_rework_state_event(
-                    conversation_id,
-                    turn_id,
-                    phase="dispatched",
-                    rework_round=round_number,
-                    checkpoint_label="",
-                    feedback="",
-                )
-                _persist_workflow_progress()
-                if _finish_hosted_turn_if_cancelled(conversation_id, turn_id):
-                    return False
-                check = run_todo_completion_check(item, item_results[item_id])
-                verdict = str(check.get("verdict") or "unknown")
-                check_status = str(check.get("status") or "failed")
-                if check_status == "completed" and verdict == "pass":
-                    item_statuses[item_id] = "completed"
-                    _persist_workflow_progress()
-                    return True
-                gap = _supervisor_gap_text(check)
-            item_statuses[item_id] = "failed"
-            _persist_workflow_progress()
-            _require_supervisor_pass(
-                f"Todo 完成：{item['title']}"[:60],
-                check,
-                conversation_id=conversation_id,
-                turn_id=turn_id,
-            )
-            return True
-        # 无法形成可验证结论：fail closed。
-        _require_supervisor_pass(
-            f"Todo 完成：{item['title']}"[:60],
-            check,
-            conversation_id=conversation_id,
-            turn_id=turn_id,
-        )
+        item_statuses[item_id] = "failed"
         return True
 
     # ── 依赖驱动的波次派发：无依赖项并行，depends_on 项等前项完成 ──────────
@@ -16398,13 +17016,12 @@ def execute_hosted_workflow(
                 dispatched_item_ids.add(item["id"])
                 item_results[item["id"]] = result
                 item_statuses[item["id"]] = status
-                _persist_workflow_progress()
-                if _finish_hosted_turn_if_cancelled(conversation_id, turn_id):
-                    return
                 if status == "completed":
                     if not settle_todo_item_after_check(item, result):
                         return
-                    _persist_workflow_progress()
+                _persist_workflow_progress()
+                if _finish_hosted_turn_if_cancelled(conversation_id, turn_id):
+                    return
                 # 执行失败的项：留给最终快检 (b) 统一裁决（追问/返工）。
         if _finish_hosted_turn_if_cancelled(conversation_id, turn_id):
             return
@@ -16413,158 +17030,37 @@ def execute_hosted_workflow(
     if _finish_hosted_turn_if_cancelled(conversation_id, turn_id):
         return
 
-    # ── 事件驱动快检 (b)：最终汇报前的一次短检查 ──────────────────────────
-    # 输入只有「用户原话 + 全部 todo 项状态」，判定是否有未完成项。
-    final_followup_done = False
-    final_rework_round = 0
-    final_check_iterations = 0
-    while True:
-        final_check_iterations += 1
-        final_check_id = (
-            "final_report"
-            if final_check_iterations == 1
-            else f"final_report_{final_check_iterations}"
-        )
-        final_supervision, final_supervision_status, _final_supervision = (
-            _run_hosted_supervisor_check(
-                conversation_id,
-                turn_id,
-                check_id=final_check_id,
-                checkpoint_label="最终汇报前",
-                evidence={
-                    "task_goal": content,
-                    "todo_items": [
-                        {
-                            "id": item["id"],
-                            "title": item["title"],
-                            "assignee": item["assignee"],
-                            "user_task_fragment": item.get("user_task_fragment") or "",
-                            "status": item_statuses.get(item["id"]) or "pending",
-                        }
-                        for item in todo_items
-                    ],
-                    "artifact_required": artifact_required,
-                },
-                runner=runner,
-                remote=remote_workers,
-                kanban_task_id=plan_sync_task_id,
-            )
-        )
-        supervisor_statuses[final_check_id] = final_supervision_status
-        supervisor_findings[final_check_id] = str(
-            _final_supervision.get("display_result") or final_supervision
-        )
-        if _finish_hosted_turn_if_cancelled(conversation_id, turn_id):
-            return
-        final_verdict = str(_final_supervision.get("verdict") or "unknown")
-        final_check_status = str(_final_supervision.get("status") or "failed")
-        if final_check_status == "completed" and final_verdict == "pass":
-            break
-        if final_verdict != "corrective_action":
-            _require_supervisor_pass(
-                "最终汇报前",
-                _final_supervision,
-                conversation_id=conversation_id,
-                turn_id=turn_id,
-            )
-            return
-        final_gap = _supervisor_gap_text(_final_supervision)
-        unfinished_items = [
-            item
-            for item in todo_items
-            if item_statuses.get(item["id"]) != "completed"
-        ]
-        if not final_followup_done:
-            # 疑似未完成：先向对应 worker 追问，等回复后再判。
-            final_followup_done = True
-            followup_targets = unfinished_items or list(todo_items)
-            for item in followup_targets:
-                # 追问轮次递增，保证 role_stage 唯一，避免断点续跑短路重放。
-                item_followup_rounds[item["id"]] += 1
-                _persist_supervisor_followup_message(item, final_gap)
-                reply, reply_status = execute_todo_item(
-                    item,
-                    followup_question=final_gap,
-                    followup_round=item_followup_rounds[item["id"]],
-                )
-                combined = "\n\n".join(
-                    entry
-                    for entry in (item_results.get(item["id"], ""), reply)
-                    if entry
-                )
-                item_results[item["id"]] = combined
-                item_statuses[item["id"]] = reply_status
-            _persist_workflow_progress()
-            if _finish_hosted_turn_if_cancelled(conversation_id, turn_id):
-                return
-            continue
-        if final_rework_round < _HOSTED_REWORK_LIMIT and unfinished_items:
-            # 确认未完成：打回对应项重做（有界）。
-            final_rework_round += 1
-            rework_round = max(rework_round, final_rework_round)
-            for item in unfinished_items:
-                item_rework_rounds[item["id"]] += 1
-                round_number = item_rework_rounds[item["id"]]
-                rework_history.append(
-                    {
-                        "round": round_number,
-                        "todo_id": item["id"],
-                        "supervisor_feedback": final_gap[:4000],
-                        "requested_at": int(time.time() * 1000),
-                    }
-                )
-                _emit_rework_state_event(
-                    conversation_id,
-                    turn_id,
-                    phase="started",
-                    rework_round=round_number,
-                    checkpoint_label=f"Todo：{item['title']}"[:60],
-                    feedback=final_gap,
-                )
-                _persist_supervisor_rework_message(item, final_gap, round_number)
-            if _finish_hosted_turn_if_cancelled(conversation_id, turn_id):
-                return
-            with ThreadPoolExecutor(
-                max_workers=max(1, len(unfinished_items)),
-                thread_name_prefix=(
-                    f"hosted-rework-{turn_id[-8:]}-{final_rework_round}"
-                ),
-                initializer=_set_hosted_execution_generation,
-                initargs=(execution_generation,),
-            ) as executor:
-                futures = {
-                    executor.submit(
-                        execute_todo_item,
-                        item,
-                        rework_feedback=final_gap,
-                        rework_round=item_rework_rounds[item["id"]],
-                    ): item
-                    for item in unfinished_items
-                }
-                for future in as_completed(futures):
-                    item = futures[future]
-                    result, status = future.result()
-                    item_results[item["id"]] = result
-                    item_statuses[item["id"]] = status
-            _emit_rework_state_event(
-                conversation_id,
-                turn_id,
-                phase="dispatched",
-                rework_round=final_rework_round,
-                checkpoint_label="",
-                feedback="",
-            )
-            _persist_workflow_progress()
-            if _finish_hosted_turn_if_cancelled(conversation_id, turn_id):
-                return
-            continue
-        # 无法收敛（追问与返工均用尽仍未通过）：监督门失败。
-        _require_supervisor_pass(
-            "最终汇报前",
-            _final_supervision,
-            conversation_id=conversation_id,
-            turn_id=turn_id,
-        )
+    # ── 服务器确定性收口校验（零 LLM 调用）──────────────────────────────
+    # Worker 的结果、Todo 状态和必需产物是唯一事实来源；这里不再追问、返工
+    # 或调用已退役的 Supervisor/Reviewer 角色，避免额外模型延迟和角色漂移。
+    unfinished_items = [
+        item
+        for item in todo_items
+        if item_statuses.get(item["id"]) != "completed"
+    ]
+    final_check_findings = [
+        f"{item['id']}（{item['assignee']}）未完成"
+        for item in unfinished_items
+    ]
+    final_supervision_status = "completed" if not unfinished_items else "failed"
+    final_supervision = {
+        "schema_version": "hermes.validation.v1",
+        "status": final_supervision_status,
+        "verdict": "pass" if not unfinished_items else "corrective_action",
+        "display_result": (
+            "服务器确定性校验通过"
+            if not final_check_findings
+            else "服务器确定性校验未通过：" + "；".join(final_check_findings)
+        ),
+        "required_actions": [
+            {"todo_id": item["id"], "action": "worker_result_required"}
+            for item in unfinished_items
+        ],
+        "findings": final_check_findings,
+    }
+    validation_statuses["final_report"] = final_supervision_status
+    validation_findings["final_report"] = str(final_supervision["display_result"])
+    if _finish_hosted_turn_if_cancelled(conversation_id, turn_id):
         return
 
     # ── 确定性看板汇报（零 LLM 调用）：取代原 Reporter 通道 ────────────────
@@ -16604,7 +17100,7 @@ def execute_hosted_workflow(
         task_goal=content,
         plan=manager_plan,
         worker_results=worker_results,
-        review_verdict=str(_final_supervision.get("display_result") or "")[:4000],
+        review_verdict=str(final_supervision.get("display_result") or "")[:4000],
         rework_history=rework_history,
         artifacts=handoff_artifacts,
         failures=handoff_failures,
@@ -16651,8 +17147,7 @@ def execute_hosted_workflow(
         if (
             worker_status == "completed"
             and reporter_status == "completed"
-            and all(status == "completed" for status in supervisor_statuses.values())
-            and str(_final_supervision.get("verdict") or "") == "pass"
+            and all(status == "completed" for status in validation_statuses.values())
             and not missing_required_artifact
         )
         else "failed"
@@ -16666,21 +17161,10 @@ def execute_hosted_workflow(
             )
             if item
         )
-    with _STATE_LOCK:
-        current_state = load_single_state()
-        current_conversation = _conversation_by_id(current_state, conversation_id)
-        current_run = (current_conversation.get("hosted_turns") or {}).get(turn_id)
-        current_checks = (
-            current_run.get("supervisor_checks")
-            if isinstance(current_run, dict)
-            and isinstance(current_run.get("supervisor_checks"), dict)
-            else {}
-        )
-        supervisor_verdicts = {
-            str(check_id): str(check.get("verdict") or "unknown")
-            for check_id, check in current_checks.items()
-            if isinstance(check, dict)
-        }
+    validation_verdicts = {
+        str(check_id): ("pass" if status == "completed" else "failed")
+        for check_id, status in validation_statuses.items()
+    }
     now = int(time.time() * 1000)
     if manager_plan.get("plan"):
         _persist_hosted_plan_snapshot(
@@ -16698,8 +17182,8 @@ def execute_hosted_workflow(
         patch={
             "reporter_result": reporter_result,
             "reporter_status": reporter_status,
-            "supervisor_statuses": dict(supervisor_statuses),
-            "supervisor_verdicts": supervisor_verdicts,
+            "validation_statuses": dict(validation_statuses),
+            "validation_verdicts": validation_verdicts,
             "status": final_status,
             "stage": "completed" if final_status == "completed" else "failed",
             "completed_at": now,
@@ -16717,7 +17201,7 @@ def execute_hosted_workflow(
             "status": final_status,
             "kind": "message",
             "meta": {
-                "role_stage": "reporter",
+                "role_stage": "aggregator",
                 "role_label": "Hermes · 最终汇报",
                 "collapse_activities": True,
                 "final_report": True,
@@ -17923,6 +18407,11 @@ class ConnectorStatusBody(BaseModel):
     actual_model: str = ""
     actual_provider: str = ""
     observed_at: str = ""
+    # ``None`` distinguishes legacy connectors (which did not send steer
+    # acknowledgements) from current connectors explicitly reporting an empty
+    # acknowledgement set.  The distinction prevents a heartbeat from
+    # clearing a newer answer that is still pending on the remote run.
+    applied_steer_ids: list[str] | None = Field(default=None, max_length=32)
 
 
 class ConnectorCancelAckBody(BaseModel):
@@ -18238,6 +18727,7 @@ def _apply_remote_checkpoint(
             # was being consumed survives for the next pull.
             remote_run.pop("awaiting_input", None)
             remote_run.pop("choice_options", None)
+            applied_steer_ids_present = "applied_steer_ids" in payload
             applied_steer_ids = {
                 str(item).strip()[:64]
                 for item in (payload.get("applied_steer_ids") or [])
@@ -18245,7 +18735,7 @@ def _apply_remote_checkpoint(
             }
             pending_steers = remote_run.get("pending_steers")
             if isinstance(pending_steers, list) and pending_steers:
-                if applied_steer_ids:
+                if applied_steer_ids_present and applied_steer_ids:
                     kept = [
                         item
                         for item in pending_steers
@@ -18256,7 +18746,7 @@ def _apply_remote_checkpoint(
                         remote_run["pending_steers"] = kept
                     else:
                         remote_run.pop("pending_steers", None)
-                else:
+                elif not applied_steer_ids_present:
                     # Older connectors do not report acks: the resume itself
                     # proves the awaiting answer was consumed.
                     remote_run.pop("pending_steers", None)
@@ -18389,7 +18879,10 @@ def _connector_relative_path(value: str) -> str:
 _CONNECTOR_STREAM_QUEUES: dict[str, set["queue.Queue"]] = {}
 _CONNECTOR_STREAM_COUNTS: dict[str, int] = {}
 _CONNECTOR_STREAM_HISTORY: dict[str, deque[dict[str, Any]]] = {}
-_CONNECTOR_STREAM_SEQUENCE = 0
+# Millisecond epoch base keeps IDs monotonic across process restarts. A
+# client's pre-restart numeric Last-Event-ID can therefore never reject the
+# first post-restart event.
+_CONNECTOR_STREAM_SEQUENCE = int(time.time() * 1000)
 _CONNECTOR_STREAM_HISTORY_MAX = 200
 _CONNECTOR_STREAM_LOCK = threading.Lock()
 _CONNECTOR_METRICS_LOCK = threading.Lock()
@@ -18447,8 +18940,23 @@ def _push_connector_event(connector_id: str, event: dict[str, Any]) -> None:
             stream_queue.put_nowait(dict(stamped))
         except queue.Full:
             try:
-                stream_queue.get_nowait()
-                stream_queue.put_nowait(dict(stamped))
+                dropped = stream_queue.get_nowait()
+                dropped_id = str(dropped.get("id") or "") if isinstance(dropped, dict) else ""
+                try:
+                    # Keep the newest lifecycle wake in the live connection.
+                    # Intermediate frames remain recoverable from the bounded
+                    # history on reconnect, while a terminal frame must not
+                    # be hidden behind a gap sentinel (which otherwise forces
+                    # an unnecessary disconnect before the client can observe
+                    # the authoritative state).
+                    stream_queue.put_nowait(dict(stamped))
+                except queue.Full:
+                    pass
+                logger.warning(
+                    "Connector %s SSE consumer dropped event %s; retained newest wake",
+                    normalized,
+                    dropped_id,
+                )
             except Exception:
                 pass
         except Exception:
@@ -18515,6 +19023,11 @@ def connector_stream(request: Request):
                         return
                     yield ": keepalive\n\n"
                     continue
+                if event is None:
+                    # A bounded queue had to discard an intermediate lifecycle
+                    # event. A clean reconnect can replay authoritative history.
+                    yield "event: stream-gap\ndata: {\"type\":\"stream-gap\"}\nretry: 250\n\n"
+                    return
                 event_id = str(event.get("id") or "")
                 yield (
                     (f"id: {event_id}\n" if event_id else "")
@@ -18864,8 +19377,7 @@ def connector_pull_runs(payload: ConnectorPullBody, request: Request):
                 for remote_run in (hosted.get("remote_runs") or {}).values():
                     if not isinstance(remote_run, dict):
                         continue
-                    profile = str(remote_run.get("profile") or "")
-                    if profile not in _REMOTE_RUN_PROFILES:
+                    if not _remote_run_is_pullable(remote_run):
                         continue
                     if _remote_run_connector_id(remote_run) != connector_id:
                         continue
@@ -19009,7 +19521,12 @@ def connector_status_run(remote_run_id: str, payload: ConnectorStatusBody, reque
     _rate_limit_connector(request, connector_id, "status")
     _remote_run_for_connector(request, remote_run_id)
     _validate_connector_claim(payload.connector_id, connector_id)
-    persisted, applied = _apply_remote_checkpoint(remote_run_id, payload.model_dump())
+    checkpoint_payload = payload.model_dump()
+    if payload.applied_steer_ids is None:
+        # Preserve the pre-ack behavior for old connectors that omit this
+        # field entirely. Current connectors send [] or a concrete list.
+        checkpoint_payload.pop("applied_steer_ids", None)
+    persisted, applied = _apply_remote_checkpoint(remote_run_id, checkpoint_payload)
     _audit_connector(
         connector_id,
         "CONNECTOR_STATUS",
@@ -19584,7 +20101,7 @@ def route_message(payload: RouteMessageBody, request: Request = None):
         if mode == "chat":
             routed["profiles"] = ["default"]
         elif routed.get("profiles") == ["default"]:
-            routed["profiles"] = ["default", "dbb3-worker", "reviewer"]
+            routed["profiles"] = ["default", "dbb3-worker"]
         return routed
     model_calls = 0
 
@@ -19734,7 +20251,7 @@ def get_single_conversations(request: Request = None):
 @router.post("/single/conversations")
 def create_single_chat(payload: CreateSingleConversationBody, request: Request = None):
     known = {item["name"] for item in available_profiles()}
-    if payload.profile not in known:
+    if not _profile_is_known_or_legacy(payload.profile, known):
         raise HTTPException(status_code=400, detail="Hermes Profile 不存在")
     owner_id = owner_id_from_request(request)
     account_generation = _account_generation_for_owner(owner_id)
@@ -19796,7 +20313,10 @@ def create_single_chat(payload: CreateSingleConversationBody, request: Request =
     return {"conversation": _public_conversation(conversation), "created": True}
 
 
-@router.post("/single/conversations/adopt")
+@router.post(
+    "/single/conversations/adopt",
+    dependencies=[Depends(_enforce_general_json_body_size)],
+)
 def adopt_single_chat(
     payload: AdoptSingleConversationBody,
     request: Request = None,
@@ -19805,7 +20325,7 @@ def adopt_single_chat(
     if not session_id:
         raise HTTPException(status_code=400, detail="Session ID is required")
     known = {item["name"] for item in available_profiles()}
-    if payload.profile not in known:
+    if not _profile_is_known_or_legacy(payload.profile, known):
         raise HTTPException(status_code=400, detail="Hermes Profile does not exist")
     owner_id = owner_id_from_request(request)
     account_generation = _account_generation_for_owner(owner_id)
@@ -20029,7 +20549,10 @@ def download_conversation_attachment(
     )
 
 
-@router.post("/single/conversations/{conversation_id}/record")
+@router.post(
+    "/single/conversations/{conversation_id}/record",
+    dependencies=[Depends(_enforce_general_json_body_size)],
+)
 def record_single_message(
     conversation_id: str,
     payload: RecordMessageBody,
@@ -20197,6 +20720,7 @@ def _live_hosted_event_stream_frame(
     conversation_id: str,
     owner_id: str,
     *,
+    member_room_id: str = "",
     delivered_cursor: int,
     include_snapshot: bool,
     limit: int = 500,
@@ -20204,6 +20728,22 @@ def _live_hosted_event_stream_frame(
     """Build an SSE frame without contending on the durable state lock."""
 
     conversation = _live_conversation_snapshot(conversation_id, owner_id)
+    if conversation is None and member_room_id:
+        # A joined room member does not own the linked conversation, so it has
+        # no owner-scoped live projection. Resolve the same room-authorized
+        # snapshot used for the initial frame; otherwise the stream silently
+        # downgrades to polling after the first event.
+        with _STATE_LOCK:
+            state = _load_single_state_for_event_stream()
+            try:
+                conversation, _claimed = _conversation_for_event_reader(
+                    state,
+                    conversation_id,
+                    owner_id,
+                    member_room_id,
+                )
+            except HTTPException:
+                return None
     if conversation is None:
         return None
     return _hosted_event_stream_frame(
@@ -20337,6 +20877,12 @@ async def stream_hosted_conversation_events(
     else:
         member_room_id = ""
 
+    if not _acquire_hosted_sse_slot(owner_id, conversation_id):
+        raise HTTPException(
+            status_code=429,
+            detail="Too many live conversation streams",
+        )
+
     async def event_stream():
         revision = _hosted_update_revision(conversation_id)
         delivered_cursor = requested_cursor
@@ -20409,6 +20955,7 @@ async def stream_hosted_conversation_events(
                 live_frame = _live_hosted_event_stream_frame(
                     conversation_id,
                     owner_id,
+                    member_room_id=member_room_id,
                     delivered_cursor=delivered_cursor,
                     include_snapshot=False,
                     limit=500,
@@ -20453,6 +21000,7 @@ async def stream_hosted_conversation_events(
             live_frame = _live_hosted_event_stream_frame(
                 conversation_id,
                 owner_id,
+                member_room_id=member_room_id,
                 delivered_cursor=delivered_cursor,
                 # Live token/tool/reasoning batches are event-only. State-only
                 # updates and terminal boundaries still receive an
@@ -20502,6 +21050,7 @@ async def stream_hosted_conversation_events(
                 live_frame = _live_hosted_event_stream_frame(
                     conversation_id,
                     owner_id,
+                    member_room_id=member_room_id,
                     delivered_cursor=delivered_cursor,
                     include_snapshot=False,
                     limit=500,
@@ -20551,6 +21100,7 @@ async def stream_hosted_conversation_events(
                 yield frame
         finally:
             _sse_presence_leave(conversation_id)
+            _release_hosted_sse_slot(owner_id, conversation_id)
 
     return StreamingResponse(
         presence_tracked_stream(),
@@ -20631,7 +21181,7 @@ def _hosted_route_parameters(
             "default",
         )
         known_profiles = {str(item.get("name") or "") for item in available_profiles()}
-        if selected_profile not in known_profiles:
+        if not _profile_is_known_or_legacy(selected_profile, known_profiles):
             raise HTTPException(status_code=400, detail="Hermes Profile does not exist")
         selected_profiles = [selected_profile]
         route["profiles"] = selected_profiles
@@ -20655,9 +21205,9 @@ def _hosted_route_parameters(
         route["targets"] = [
             profile.removesuffix("-worker") for profile in worker_profiles
         ]
-        route["profiles"] = ["default", *worker_profiles, "reviewer"]
+        route["profiles"] = ["default", *worker_profiles]
         selected_profiles = list(
-            dict.fromkeys(["default", *worker_profiles, "reviewer"])
+            dict.fromkeys(["default", *worker_profiles])
         )
     artifact = route.get("artifact")
     artifact = dict(artifact) if isinstance(artifact, dict) else {}
@@ -20721,11 +21271,13 @@ def _required_runtime_binding(
             status_code=422,
             detail="required_provider and required_model must be supplied together",
         )
+    requested_profile = str(profile or "").strip()
+    runtime_profile = _legacy_hosted_request_profile(requested_profile) or requested_profile
     record = next(
         (
             item
             for item in available_profiles()
-            if str(item.get("name") or "").strip() == profile
+            if str(item.get("name") or "").strip() == runtime_profile
         ),
         None,
     )
@@ -20742,16 +21294,19 @@ def _required_runtime_binding(
             status_code=409,
             detail=(
                 "Behavior evaluation runtime mismatch: "
-                f"profile {profile!r} resolves to {actual_provider}/{actual_model}, "
+                f"profile {requested_profile!r} resolves to {actual_provider}/{actual_model}, "
                 f"not {required_provider}/{required_model}"
             ),
         )
-    return {
-        "profile": profile,
+    binding = {
+        "profile": requested_profile,
         "provider": actual_provider,
         "model": actual_model,
         "verified": verified,
     }
+    if runtime_profile != requested_profile:
+        binding["resolved_profile"] = runtime_profile
+    return binding
 
 
 def _enqueued_turn_response(
@@ -21337,6 +21892,11 @@ def enqueue_hosted_turn(
     if (
         str(deterministic_route.get("mode") or "") == "chat"
         and str(deterministic_route.get("lock_level") or "") == "hard_chat"
+        # A short prompt may use the deterministic fast path only for the
+        # default conversation.  An explicitly profiled/legacy conversation
+        # must still pass through the durable route outbox so its bound
+        # profile is authoritative and retryable.
+        and conversation_profile == "default"
     ):
         (
             hard_chat_route,
@@ -21663,7 +22223,10 @@ def enqueue_hosted_turn(
     return response
 
 
-@router.post("/single/conversations/{conversation_id}/hosted-turns")
+@router.post(
+    "/single/conversations/{conversation_id}/hosted-turns",
+    dependencies=[Depends(_enforce_general_json_body_size)],
+)
 def create_hosted_turn(
     conversation_id: str,
     payload: HostedTurnBody,
@@ -22515,7 +23078,9 @@ def _finalize_pending_conversation_deletion(conversation_id: str) -> bool:
         try:
             files_root = conversation_files_root(conversation_id)
             if files_root.exists():
-                shutil.rmtree(files_root)
+                from hermes_cli.safe_delete import safe_rmtree
+
+                safe_rmtree(files_root, files_root.parent)
             if files_root.exists():
                 return False
         except (OSError, ValueError):
@@ -22647,7 +23212,10 @@ def delete_single_conversation(
     return {"ok": True}
 
 
-@router.post("/single/conversations/{conversation_id}/messages")
+@router.post(
+    "/single/conversations/{conversation_id}/messages",
+    dependencies=[Depends(_enforce_general_json_body_size)],
+)
 async def send_single_message(
     conversation_id: str,
     payload: SendSingleMessageBody,
@@ -22769,7 +23337,11 @@ def get_rooms(request: Request):
 @router.post("/rooms")
 def create_room(payload: CreateRoomBody, request: Request):
     known = {item["name"] for item in available_profiles()}
-    selected = [name for name in payload.profiles if name in known]
+    selected = [
+        name
+        for name in payload.profiles
+        if _profile_is_known_or_legacy(name, known)
+    ]
     if not selected:
         raise HTTPException(status_code=400, detail="至少选择一个 Hermes Profile")
     owner_id = owner_id_from_request(request)
@@ -22897,7 +23469,10 @@ def get_room_mailbox(room_id: str, request: Request, recipient_id: str = "", aft
     return {"room_id": room_id, "recipient_id": recipient, "messages": messages}
 
 
-@router.post("/rooms/{room_id}/mailbox")
+@router.post(
+    "/rooms/{room_id}/mailbox",
+    dependencies=[Depends(_enforce_general_json_body_size)],
+)
 def send_room_mailbox_message(room_id: str, payload: MailboxMessageBody, request: Request):
     """Append one idempotent, generation-bound direct member message."""
 
@@ -23090,7 +23665,10 @@ def delete_room(room_id: str, request: Request):
     return {"ok": True}
 
 
-@router.post("/rooms/{room_id}/messages")
+@router.post(
+    "/rooms/{room_id}/messages",
+    dependencies=[Depends(_enforce_general_json_body_size)],
+)
 def send_message(room_id: str, payload: SendMessageBody, request: Request):
     content = payload.content.strip()
     if not content:
@@ -23412,6 +23990,31 @@ def _room_is_member(room: dict[str, Any], owner_id: str) -> bool:
     )
 
 
+def _room_membership_era_matches(
+    room: dict[str, Any],
+    owner_id: str,
+    account_generation: str,
+) -> bool:
+    """True when owner_id holds a membership valid for the current era.
+
+    Join binds each member row to the account generation that joined (B4).
+    Rows stored without account_generation (legacy memberships) stay valid;
+    bound rows must equal the member's CURRENT generation - the same era
+    notion the ownership fence enforces - so a deleted or re-registered
+    public account can never silently inherit an old room membership.
+    """
+
+    current = str(account_generation or "").strip()
+    for member in room.get("members") or []:
+        if not isinstance(member, dict):
+            continue
+        if str(member.get("user_id") or "") != owner_id:
+            continue
+        stored = str(member.get("account_generation") or "").strip()
+        return not stored or stored == current
+    return False
+
+
 def _accessible_room_in_state(
     state: dict[str, Any],
     room_id: str,
@@ -23436,10 +24039,13 @@ def _accessible_room_in_state(
     # fence; the room record carries the OWNER's era, which a member must
     # never be required to match — that comparison made every joined room
     # 404 for members of a different-generation owner.
+    current_generation = str(account_generation or "").strip()
     for candidate in state.get("rooms") or []:
         if not isinstance(candidate, dict) or candidate.get("id") != room_id:
             continue
-        if not _room_is_member(candidate, owner_id):
+        if not _room_membership_era_matches(
+            candidate, owner_id, current_generation
+        ):
             continue
         return candidate
     raise HTTPException(status_code=404, detail="Room not found")
@@ -23599,7 +24205,7 @@ def _room_workspace_child(room: dict[str, Any], relative: str, *, allow_root: bo
     # path while the operation touched another.
     if ".." in cleaned.split("/"):
         raise HTTPException(
-            status_code=422,
+            status_code=404,
             detail="Workspace path must not contain '..'",
         )
     parts = [part for part in cleaned.split("/") if part not in {"", "."}]
@@ -24012,6 +24618,14 @@ def rotate_room_invite_code(room_id: str, payload: RoomInviteCodeBody, request: 
         state = load_state()
         room = _owned_room_in_state(state, room_id, owner_id, account_generation)
         requested = payload.invite_code.strip()
+        if requested and (
+            len(requested) < 10
+            or any(not ch.isalnum() for ch in requested)
+        ):
+            raise HTTPException(
+                status_code=400,
+                detail="Invite code must be at least 10 alphanumeric characters",
+            )
         code = requested[:64] if requested else _generate_room_invite_code()
         existing_codes = {
             str(item.get("invite_code") or "")
@@ -24042,6 +24656,8 @@ def join_room_by_code(payload: RoomJoinBody, request: Request):
     code = payload.invite_code.strip()
     if not code:
         raise HTTPException(status_code=400, detail="invite_code is required")
+    if not _ROOM_JOIN_RATE_LIMITER.allow(f"room-join:{owner_id}"):
+        raise HTTPException(status_code=429, detail="Too many invite-code attempts")
     with _STATE_LOCK:
         state = load_state()
         room = next(
@@ -24086,11 +24702,31 @@ def join_room_by_code(payload: RoomJoinBody, request: Request):
 def remove_room_member(room_id: str, member_user_id: str, request: Request):
     owner_id = owner_id_from_request(request)
     account_generation = _account_generation_for_request(request, owner_id)
+    target = str(member_user_id or "").strip()
+    if not target:
+        raise HTTPException(status_code=400, detail="member_user_id is required")
     with _STATE_LOCK:
         state = load_state()
-        room = _owned_room_in_state(state, room_id, owner_id, account_generation)
-        target = str(member_user_id or "").strip()
-        if not target or target == str(room.get("owner_id") or ""):
+        room = _room_by_id(state, room_id)
+        if not isinstance(room, dict):
+            raise HTTPException(status_code=404, detail="Room not found")
+        room_owner = str(room.get("owner_id") or "").strip()
+        if target == owner_id and room_owner == owner_id:
+            # Owners close or delete their room instead of leaving it.
+            raise HTTPException(
+                status_code=400,
+                detail="The room owner cannot leave their own room",
+            )
+        if target == owner_id:
+            # Self-leave: any current member may remove themselves without
+            # owning the room. Era-aware lookup keeps stale memberships out.
+            room = _accessible_room_in_state(
+                state, room_id, owner_id, account_generation
+            )
+        else:
+            # Removing another member stays owner-only.
+            room = _owned_room_in_state(state, room_id, owner_id, account_generation)
+        if target == room_owner:
             raise HTTPException(status_code=409, detail="The room owner cannot be removed")
         members = [m for m in (room.get("members") or []) if isinstance(m, dict)]
         remaining = [m for m in members if str(m.get("user_id") or "") != target]
@@ -24758,7 +25394,15 @@ def delete_room_workspace_path(room_id: str, request: Request, path: str = "", r
     try:
         if target.is_dir():
             if recursive:
-                shutil.rmtree(target)
+                from hermes_cli.safe_delete import safe_rmtree
+
+                safe_rmtree(
+                    target,
+                    _contained_storage_path(
+                        conversation_files_root(str(room.get("conversation_id") or "")),
+                        "workspace",
+                    ),
+                )
             else:
                 target.rmdir()
         else:
@@ -26336,6 +26980,12 @@ async def stream_mobile_managed_resources(request: Request):
     except (TypeError, ValueError) as exc:
         raise HTTPException(status_code=422, detail="cursor must be a non-negative integer") from exc
 
+    async with _MOBILE_RESOURCE_STREAM_LOCK:
+        current_streams = _MOBILE_RESOURCE_STREAMS.get(owner_id, 0)
+        if current_streams >= _MOBILE_RESOURCE_STREAM_LIMIT:
+            raise HTTPException(status_code=429, detail="Too many resource event streams")
+        _MOBILE_RESOURCE_STREAMS[owner_id] = current_streams + 1
+
     async def event_stream():
         delivered_cursor = requested_cursor
         initial = True
@@ -26373,8 +27023,17 @@ async def stream_mobile_managed_resources(request: Request):
                 last_frame_at = time.monotonic()
             await asyncio.sleep(1.0)
 
+    async def release_stream_slot() -> None:
+        async with _MOBILE_RESOURCE_STREAM_LOCK:
+            remaining = _MOBILE_RESOURCE_STREAMS.get(owner_id, 1) - 1
+            if remaining > 0:
+                _MOBILE_RESOURCE_STREAMS[owner_id] = remaining
+            else:
+                _MOBILE_RESOURCE_STREAMS.pop(owner_id, None)
+
     return StreamingResponse(
         event_stream(),
+        background=BackgroundTask(release_stream_slot),
         media_type="text/event-stream",
         headers={
             "Cache-Control": "no-cache, no-transform",

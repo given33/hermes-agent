@@ -2309,7 +2309,13 @@ def _is_verification_artifact_cleanup(command: str) -> bool:
     operand = argv[2]
     temp_dir = os.path.realpath(tempfile.gettempdir())
     basename = os.path.basename(operand)
-    if operand != os.path.join(temp_dir, basename):
+    # Commands may use POSIX spelling even on Windows (for example a script
+    # generated for Git Bash). abspath() applies the host's drive/root rules
+    # without changing the basename or introducing traversal.
+    if ".." in operand.replace("\\", "/").split("/"):
+        return False
+    operand_path = os.path.abspath(operand)
+    if operand_path != os.path.join(temp_dir, basename):
         return False
 
     target = os.path.realpath(operand)
@@ -5203,6 +5209,60 @@ def check_execute_code_guard(code: str, env_type: str,
         notify_cb = _gateway_notify_cbs.get(session_key)
 
     if notify_cb is None:
+        approval_callback = _resolve_cli_approval_callback()
+        if _should_fall_through_to_cli_approval(
+            is_cli=_is_interactive_cli(),
+            approval_callback=approval_callback,
+            notify_cb=notify_cb,
+        ):
+            choice = prompt_dangerous_approval(
+                display_command,
+                display_description,
+                allow_permanent=not smart_denied_for_owner,
+                approval_callback=approval_callback,
+                smart_denied=smart_denied_for_owner,
+            )
+            if choice == "timeout":
+                breaker_addendum = _denial_breaker_addendum(session_key)
+                return {
+                    "approved": False,
+                    "message": (
+                        "BLOCKED: execute_code approval timed out without user "
+                        "response. Silence is not consent. Do NOT retry."
+                        f"{breaker_addendum}"
+                    ),
+                    "pattern_key": pattern_key,
+                    "description": description,
+                    "outcome": "timeout",
+                    "user_consent": False,
+                }
+            if choice == "deny":
+                return {
+                    "approved": False,
+                    "message": (
+                        "BLOCKED: User denied execute_code script execution. "
+                        "Do NOT retry."
+                    ),
+                    "pattern_key": pattern_key,
+                    "description": description,
+                    "outcome": "denied",
+                    "user_consent": False,
+                }
+            if not smart_denied_for_owner:
+                if choice == "session":
+                    approve_session(session_key, pattern_key)
+                elif choice == "always":
+                    approve_session(session_key, pattern_key)
+                    approve_permanent(pattern_key)
+                    save_permanent_allowlist(_permanent_approved)
+            _reset_denials(session_key)
+            return {
+                "approved": True,
+                "message": None,
+                "user_approved": True,
+                "description": description,
+            }
+
         # No gateway callback registered (e.g. ask-mode without a notifier):
         # surface a pending approval for backward compatibility.
         pending_data = {

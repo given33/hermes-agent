@@ -19,6 +19,7 @@ Covers:
 
 from __future__ import annotations
 
+import sys
 from pathlib import Path
 
 import pytest
@@ -223,6 +224,13 @@ def test_leading_slash_matches_the_bare_form(tmp_path, monkeypatch):
     assert slashed == bare
 
 
+@pytest.mark.skipif(__import__('sys').platform == 'win32', reason='POSIX absolute path resolution')
+# The premise "`/etc` exists" only holds on POSIX; on native Windows the
+# absolute reading correctly does NOT resolve and the cwd-relative fallback
+# is the intended behavior (see _abs_completion_prefix_exists).
+@pytest.mark.skipif(sys.platform == "win32",
+                    reason="/etc only exists on POSIX; on Windows the "
+                           "cwd-relative fallback is correct")
 def test_leading_slash_prefers_a_real_absolute_path(tmp_path, monkeypatch):
     """When the absolute reading resolves, it wins — no silent rewrite.
 
@@ -238,6 +246,30 @@ def test_leading_slash_prefers_a_real_absolute_path(tmp_path, monkeypatch):
 
     # `/etc` exists on any POSIX box, so the absolute reading must hold.
     assert not any("decoy.conf" in t for t in texts), texts
+
+
+def test_absolute_prefix_lists_that_directory_not_a_cwd_sibling(
+    tmp_path, monkeypatch,
+):
+    """Platform-neutral twin: an absolute prefix that really resolves lists
+    THAT directory, never a same-named cwd sibling (no silent rewrite).
+
+    Uses a native-absolute path (`C:/...` on Windows, `/tmp/...` on POSIX) so
+    the contract holds on every host without faking the platform.
+    """
+    monkeypatch.chdir(tmp_path)
+    real_abs = tmp_path / "absroot"
+    real_abs.mkdir()
+    (real_abs / "absolute.txt").write_text("x")
+    # Same-named directory under the cwd that must not shadow the abs read.
+    (tmp_path / "sibling_absroot").mkdir()
+    (tmp_path / "sibling_absroot" / "relative.txt").write_text("x")
+
+    server._fuzzy_cache.clear()
+    texts = [t for t, _, _ in _items("@" + real_abs.as_posix() + "/")]
+
+    assert any("absolute.txt" in t for t in texts), texts
+    assert not any("relative.txt" in t for t in texts), texts
 
 
 def test_completion_ignores_real_terminal_cwd(tmp_path, monkeypatch):

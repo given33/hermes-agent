@@ -8870,6 +8870,16 @@ def main(
     Toolset Examples:
         - "research": Web search, extract, crawl + vision tools
     """
+    # This entry point prints Unicode before it enters the normal CLI
+    # dispatch. Repair both the generic streams and Windows console settings
+    # before the first banner; a partial install must still reach the banner.
+    try:
+        from hermes_cli.stdio import ensure_utf8_stdio, configure_windows_stdio
+
+        ensure_utf8_stdio()
+        configure_windows_stdio()
+    except Exception:
+        pass
     print("🤖 AI Agent with Tool Calling")
     print("=" * 50)
     

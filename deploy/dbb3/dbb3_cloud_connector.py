@@ -11,6 +11,8 @@ and artifact keys instead of creating duplicate work or traffic.
 from __future__ import annotations
 
 import argparse
+import codecs
+import contextlib
 from collections import OrderedDict
 import hashlib
 import inspect
@@ -32,6 +34,14 @@ import urllib.request
 from datetime import datetime, timezone
 from typing import Any, Callable, Iterable, Optional
 
+# Optional latency-trace integration. The connector must stay runnable as a
+# standalone deploy script, so a missing package or disabled tracing degrades
+# to no instrumentation instead of failing startup.
+try:  # pragma: no cover - import environment dependent
+    from hermes_services import latency_trace as _latency_trace
+except Exception:  # noqa: BLE001 - tracing must never break the connector
+    _latency_trace = None
+
 
 CONTRACT_VERSION = 2
 MAX_ARTIFACT_BYTES = 64 * 1024 * 1024
@@ -41,6 +51,19 @@ _PROFILE_NAME_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,127}")
 _SESSION_ID_RE = re.compile(r"\b\d{8}_\d{6}_[a-z0-9]+\b", re.IGNORECASE)
 _SESSION_REFRESH_SECONDS = 5.0
 _SESSION_CACHE_MAX = 256
+_MAX_PENDING_STEERS = 256
+# The server emits connector keepalives every 25s. Leave margin for scheduler
+# and network jitter while bounding connect/read shutdown when no response is
+# available to close from another thread.
+_STREAM_TIMEOUT_SECONDS = 35.0
+# Do not reset reconnect backoff for a response that accepts and closes
+# immediately.  That pattern otherwise becomes a tight reconnect loop after a
+# proxy/server EOF; a stream that remains up through one scheduler heartbeat is
+# considered healthy and may restart at the short delay after a later drop.
+_STREAM_BACKOFF_RESET_SECONDS = 5.0
+# Connector lifecycle frames are compact. Keep a malformed/proxy-injected SSE
+# event from retaining unbounded data while waiting for its blank-line fence.
+_MAX_SSE_EVENT_BYTES = 4 * 1024 * 1024
 _DEFAULT_CANCEL_COMMAND = "hermes kanban block {root_id} {reason}"
 _SENSITIVE_KEYS = {
     "authorization",
@@ -295,17 +318,202 @@ def _content_length_bytes(value: Any) -> int | None:
 
 
 def run(command: list[str], timeout: int = 120) -> tuple[int, str]:
-    try:
-        proc = subprocess.run(
-            command,
-            text=True,
-            capture_output=True,
-            timeout=timeout,
-            check=False,
+    trace_enabled = _latency_trace is not None and _latency_trace.enabled()
+
+    def _span():
+        if not trace_enabled:
+            return contextlib.nullcontext()
+        return _latency_trace.span(
+            "worker.command", argv=command[0] if command else "", ceiling_s=timeout
         )
+
+    try:
+        with _span():
+            proc = subprocess.run(
+                command,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+                capture_output=True,
+                timeout=timeout,
+                check=False,
+                env={**os.environ, "PYTHONIOENCODING": "utf-8"},
+            )
         return proc.returncode, (proc.stdout + proc.stderr).strip()
     except Exception as exc:  # noqa: BLE001 - connector must keep polling
         return 124, f"{type(exc).__name__}: {exc}"
+
+
+def _iter_sse_events(response: Any) -> Iterable[tuple[str | None, str, str]]:
+    """Yield complete SSE events from a line- or chunk-oriented response.
+
+    ``urllib`` normally iterates an HTTP response by line, but test doubles and
+    a few proxy wrappers yield arbitrary chunks.  Buffering until a line ending and
+    dispatching only at the SSE blank-line delimiter handles both shapes and
+    preserves the protocol's multi-line ``data:`` joining rule.
+    """
+
+    current_id = ""
+    event_name = ""
+    data_lines: list[str] = []
+    buffer = ""
+    buffer_bytes = 0
+    event_bytes = 0
+    oversized = False
+    event_id_seen = False
+    pending_cr = False
+    decoder = codecs.getincrementaldecoder("utf-8")(errors="replace")
+    saw_bytes = False
+
+    def consume_line(line: str) -> tuple[str | None, str, str] | None:
+        nonlocal current_id, event_name, data_lines, event_bytes, oversized, event_id_seen
+        line = line.rstrip("\r")
+        event_bytes += len(line.encode("utf-8", "replace")) + 1
+        if event_bytes > _MAX_SSE_EVENT_BYTES:
+            oversized = True
+            data_lines = []
+            event_name = ""
+        if not line:
+            if oversized:
+                event_bytes = 0
+                oversized = False
+                event_name = ""
+                data_lines = []
+                event_id_seen = False
+                return None
+            if not data_lines:
+                event_name = ""
+                event_bytes = 0
+                event_id_seen = False
+                return None
+            event_id = current_id if event_id_seen or current_id else None
+            event = (event_id, event_name or "message", "\n".join(data_lines))
+            event_name = ""
+            data_lines = []
+            event_bytes = 0
+            event_id_seen = False
+            return event
+        if oversized:
+            return None
+        if line.startswith(":"):
+            return None
+        field, separator, value = line.partition(":")
+        if separator and value.startswith(" "):
+            value = value[1:]
+        if field == "id":
+            # The SSE spec ignores an id containing NUL.  Keep the previous
+            # cursor in that case so a malformed server line cannot regress a
+            # reconnect request.
+            if "\x00" not in value:
+                current_id = value
+                event_id_seen = True
+        elif field == "event":
+            event_name = value
+        elif field == "data":
+            data_lines.append(value)
+        return None
+
+    def consume_buffered_line() -> tuple[str | None, str, str] | None:
+        nonlocal buffer, buffer_bytes
+        line = buffer
+        buffer = ""
+        buffer_bytes = 0
+        return consume_line(line)
+
+    def append_fragment(fragment: str) -> None:
+        nonlocal buffer, buffer_bytes, event_bytes, oversized, data_lines, event_name
+        if not fragment:
+            return
+        remaining = _MAX_SSE_EVENT_BYTES - event_bytes - buffer_bytes
+        # Each Unicode code point needs at least one UTF-8 byte.  Reject a
+        # clearly oversized fragment before encoding it, avoiding a second
+        # unbounded allocation for a malformed delimiter-free response.
+        if oversized or remaining < 0 or len(fragment) > remaining:
+            oversized = True
+            event_bytes = _MAX_SSE_EVENT_BYTES + 1
+            data_lines = []
+            event_name = ""
+            buffer = ""
+            buffer_bytes = 0
+            return
+        fragment_bytes = len(fragment.encode("utf-8", "replace"))
+        if fragment_bytes > remaining:
+            oversized = True
+            event_bytes = _MAX_SSE_EVENT_BYTES + 1
+            data_lines = []
+            event_name = ""
+            buffer = ""
+            buffer_bytes = 0
+            return
+        buffer += fragment
+        buffer_bytes += fragment_bytes
+
+    def consume_chunk(chunk: str) -> Iterable[tuple[str | None, str, str]]:
+        nonlocal pending_cr
+        start = 0
+        while True:
+            if pending_cr:
+                # CRLF may be split across response chunks.  A bare CR is
+                # still a valid SSE line ending, so defer it until the next
+                # character tells us whether a following LF belongs to it.
+                if start >= len(chunk):
+                    return
+                if chunk[start] == "\n":
+                    start += 1
+                pending_cr = False
+                event = consume_buffered_line()
+                if event is not None:
+                    yield event
+                continue
+            if start >= len(chunk):
+                return
+            next_lf = chunk.find("\n", start)
+            next_cr = chunk.find("\r", start)
+            if next_lf < 0:
+                separator = next_cr
+            elif next_cr < 0:
+                separator = next_lf
+            else:
+                separator = min(next_lf, next_cr)
+            if separator < 0:
+                # Never copy a delimiter-free giant chunk into ``buffer``.
+                append_fragment(chunk[start:])
+                return
+            append_fragment(chunk[start:separator])
+            separator_char = chunk[separator]
+            start = separator + 1
+            if separator_char == "\r":
+                pending_cr = True
+                continue
+            event = consume_buffered_line()
+            if event is not None:
+                yield event
+
+    for raw in response:
+        if isinstance(raw, bytes):
+            saw_bytes = True
+            chunk = decoder.decode(raw)
+        else:
+            chunk = str(raw)
+        yield from consume_chunk(chunk)
+    if saw_bytes:
+        tail = decoder.decode(b"", final=True)
+        if tail:
+            yield from consume_chunk(tail)
+    if pending_cr:
+        pending_cr = False
+        event = consume_buffered_line()
+        if event is not None:
+            yield event
+    elif buffer:
+        event = consume_buffered_line()
+        if event is not None:
+            yield event
+    # An event without a trailing blank line is still useful when a server
+    # drops the connection after writing its final payload.
+    if data_lines:
+        event_id = current_id if event_id_seen or current_id else None
+        yield (event_id, event_name or "message", "\n".join(data_lines))
 
 
 class _FileBody:
@@ -336,6 +544,29 @@ class CloudRelayClient:
         self.token_path = Path(token_path) if token_path else None
         self.connector_id = _text(connector_id, 128) or "dbb3-primary"
         self.timeout = timeout
+        self._last_stream_event_id = ""
+        self._stream_response_lock = threading.Lock()
+        self._stream_response: Any | None = None
+
+    def close_stream(self) -> None:
+        """Interrupt an active SSE read so connector shutdown is prompt."""
+        with self._stream_response_lock:
+            response = self._stream_response
+            self._stream_response = None
+        if response is not None:
+            try:
+                response.close()
+            except Exception:
+                pass
+
+    def _register_stream_response(self, response: Any) -> None:
+        with self._stream_response_lock:
+            self._stream_response = response
+
+    def _clear_stream_response(self, response: Any) -> None:
+        with self._stream_response_lock:
+            if self._stream_response is response:
+                self._stream_response = None
 
     def _reload_token(self) -> bool:
         """Reload the token file so a rotated credential is picked up live."""
@@ -429,33 +660,47 @@ class CloudRelayClient:
                     method="GET",
                     headers=headers,
                 )
-                with urllib.request.urlopen(request, timeout=90) as response:
-                    backoff = 1.0
-                    current_id = ""
-                    for raw in response:
+                connected_at = time.monotonic()
+                response = urllib.request.urlopen(
+                    request,
+                    timeout=_STREAM_TIMEOUT_SECONDS,
+                )
+                self._register_stream_response(response)
+                if stop.is_set():
+                    self.close_stream()
+                    return
+                try:
+                    for event_id, _event_name, payload_text in _iter_sse_events(response):
                         if stop.is_set():
                             return
-                        if raw.startswith(b"id:"):
-                            current_id = raw[3:].strip().decode("utf-8", "replace")
+                        if event_id is not None:
+                            self._last_stream_event_id = event_id
+                        try:
+                            event = json.loads(payload_text)
+                        except (ValueError, TypeError):
                             continue
-                        if raw.startswith(b"data:") and b'"type"' in raw:
-                            try:
-                                event = json.loads(raw[5:].strip())
-                            except (ValueError, TypeError):
-                                continue
-                            event_id = str(event.get("id") or event.get("event_id") or current_id or "")
-                            if event_id:
-                                self._last_stream_event_id = event_id
-                            if event.get("type") in {"run.created", "run.terminal"}:
-                                wake.set()
-                            elif event.get("type") == "run.steer":
-                                # User answered an awaiting_input choice (or
-                                # sent a steer): unblock the local task with
-                                # the answer injected as a comment so the
-                                # worker continues with the decision.
-                                if on_steer is not None:
-                                    on_steer(dict(event))
-                                wake.set()
+                        if not isinstance(event, dict):
+                            continue
+                        event_id = str(event.get("id") or event.get("event_id") or event_id or "")
+                        if event_id:
+                            self._last_stream_event_id = event_id
+                        if event.get("type") in {"run.created", "run.terminal"}:
+                            wake.set()
+                        elif event.get("type") == "run.steer":
+                            # User answered an awaiting_input choice (or sent
+                            # a steer): unblock the local task with the answer
+                            # injected as a comment so it can continue.
+                            if on_steer is not None:
+                                on_steer(dict(event))
+                            wake.set()
+                finally:
+                    self._clear_stream_response(response)
+                    try:
+                        response.close()
+                    except Exception:
+                        pass
+                    if time.monotonic() - connected_at >= _STREAM_BACKOFF_RESET_SECONDS:
+                        backoff = 1.0
             except urllib.error.HTTPError as exc:
                 if exc.code == 401:
                     self._reload_token()
@@ -1524,6 +1769,11 @@ class DBB3CloudConnector:
 
     def _queue_steer(self, event: dict[str, Any]) -> None:
         with self._pending_steers_lock:
+            if len(self._pending_steers) >= _MAX_PENDING_STEERS:
+                # The server keeps steers durable until an applied id is
+                # acknowledged. The SSE copy is only a wake-up accelerator,
+                # so bound it and let the next pull recover an evicted item.
+                del self._pending_steers[: len(self._pending_steers) - _MAX_PENDING_STEERS + 1]
             self._pending_steers.append(dict(event))
         self._wake_event.set()
 
@@ -1532,6 +1782,9 @@ class DBB3CloudConnector:
         self._stream_stop.set()
         self._heartbeat_stop.set()
         self._wake_event.set()
+        close_stream = getattr(self.cloud_client, "close_stream", None)
+        if callable(close_stream):
+            close_stream()
         thread = self._stream_thread
         if thread is not None and thread is not threading.current_thread():
             thread.join(timeout=max(0.0, timeout))
@@ -1584,6 +1837,14 @@ class DBB3CloudConnector:
                 "terminal": False,
                 "summary": _text(local.get("last_summary"), 4000),
                 "observed_at": now,
+                # A heartbeat is still a running checkpoint.  Keep the same
+                # steer-ack capability marker as a normal status report so the
+                # server does not mistake this renewal for an old connector and
+                # discard a second answer that is still waiting in its durable
+                # queue.
+                "applied_steer_ids": list(
+                    (local.get("applied_steer_ids") or [])[-32:]
+                ),
             }
             try:
                 self.cloud_client.report_status(remote_id, payload)
@@ -2799,10 +3060,9 @@ class DBB3CloudConnector:
             # here and gets applied by _drain_steers below.
             pending_steers = run_payload.get("pending_steers")
             if isinstance(pending_steers, list) and pending_steers:
-                with self._pending_steers_lock:
-                    for steer in pending_steers:
-                        if isinstance(steer, dict):
-                            self._pending_steers.append(dict(steer))
+                for steer in pending_steers:
+                    if isinstance(steer, dict):
+                        self._queue_steer(steer)
             try:
                 made, uploaded = self._process_run(run_payload, state)
             except RuntimeError as exc:
@@ -2969,7 +3229,21 @@ def main(argv: list[str] | None = None) -> int:
 
     while True:
         try:
-            result = connector.sync_once()
+            if _latency_trace is not None and _latency_trace.enabled():
+                with _latency_trace.span(
+                    "worker.sync_once",
+                    node=str(getattr(connector, "connector_id", "") or ""),
+                ) as _sp:
+                    result = connector.sync_once()
+                    _sp.attr(
+                        **{
+                            key: int(value)
+                            for key, value in result.items()
+                            if isinstance(value, (int, float))
+                        }
+                    )
+            else:
+                result = connector.sync_once()
             if int(result.get("terminal_pushed") or 0) > 0:
                 # A terminal checkpoint was accepted; the cloud may have
                 # created the next role run. Poll again almost immediately.

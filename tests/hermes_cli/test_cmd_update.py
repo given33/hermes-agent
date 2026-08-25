@@ -89,6 +89,20 @@ def _patch_gateway_discovery():
         yield
 
 
+@pytest.fixture(autouse=True)
+def _patch_venv_process_detection():
+    """Hide this machine's real Hermes processes from the update preflight.
+
+    On a dev box the venv's own python.exe shows up as a venv holder, which
+    makes every cmd_update test exit(2) before reaching the code under test.
+    """
+    with patch("hermes_cli.update_cmd._detect_venv_python_processes",
+               create=True, return_value=[]), \
+         patch("hermes_cli.main._detect_venv_python_processes",
+               create=True, return_value=[]):
+        yield
+
+
 class TestCmdUpdateNpmLockfileCache:
     @staticmethod
     def _cache_file(hermes_root, project_root):

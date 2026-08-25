@@ -8,6 +8,7 @@ import json
 from threading import RLock
 from typing import Any, Callable
 
+from hermes_services.bounded_dict import BoundedDict
 
 EXECUTION_MODES = frozenset({"parallel", "sequential"})
 SIDE_EFFECT_CLASSES = frozenset({"none", "read", "write", "destructive", "external"})
@@ -50,7 +51,7 @@ class ToolExecutionContract:
 
 _LOCK = RLock()
 _CONTRACTS: dict[str, ToolExecutionContract] = {}
-_PUBLISHED_BINDINGS: dict[tuple[str, int], dict[str, Any]] = {}
+_PUBLISHED_BINDINGS: BoundedDict[tuple[str, int], dict[str, Any]] = BoundedDict(1024)
 _REGISTRY_GENERATION: Callable[[], int] | None = None
 _BUMP_REGISTRY_GENERATION: Callable[[], None] | None = None
 _REGISTRATION_FINGERPRINT: Callable[[str], str | None] | None = None

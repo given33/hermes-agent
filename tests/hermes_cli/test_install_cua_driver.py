@@ -148,7 +148,7 @@ class TestInstallCuaDriverUpgrade:
 
         with patch.object(tools_config.shutil, "which",
                           side_effect=lambda n: "/usr/local/bin/" + n
-                                                 if n in {"cua-driver", "curl"} else None), \
+                                                 if n in {"cua-driver", "curl", "powershell"} else None), \
              patch.object(
                  tools_config,
                  "_cua_driver_contract_status",
@@ -162,6 +162,10 @@ class TestInstallCuaDriverUpgrade:
             kwargs = runner.call_args.kwargs
             assert kwargs.get("verbose") is False
 
+    @pytest.mark.skipif(
+        __import__("sys").platform == "win32",
+        reason="POSIX shell installer execution",
+    )
     def test_upgrade_without_binary_runs_installer(self):
         from hermes_cli import tools_config
 
@@ -238,6 +242,10 @@ class TestInstallCuaDriverUpgrade:
 
         info.assert_not_called()
 
+    @pytest.mark.skipif(
+        __import__("sys").platform == "win32",
+        reason="POSIX shell installer execution",
+    )
     def test_upgrade_can_suppress_installer_progress(self):
         from hermes_cli import tools_config
 
@@ -415,6 +423,10 @@ class TestInstallCuaDriverUpgrade:
 
         runner.assert_not_called()
 
+    @pytest.mark.skipif(
+        __import__("sys").platform == "win32",
+        reason="POSIX shell installer execution",
+    )
     def test_non_upgrade_without_binary_runs_installer(self):
         from hermes_cli import tools_config
 
@@ -603,6 +615,10 @@ class TestUpdateCheckTimeoutDefaults:
         """
         assert self._captured_timeout() == 25.0
 
+    @pytest.mark.skipif(
+        __import__("sys").platform == "win32",
+        reason="POSIX-only timeout default",
+    )
     def test_posix_default_unchanged(self):
         # Unmarked: the POSIX default is what this (Linux) host already picks,
         # so no platform faking is involved.

@@ -1290,9 +1290,11 @@ class TestBuildSafeEnv:
         with patch.dict("os.environ", fake_env, clear=True):
             result = _build_safe_env(None)
 
-        assert result["ProgramFiles"] == r"C:\Program Files"
-        assert result["ProgramData"] == r"C:\ProgramData"
-        assert result["ProgramW6432"] == r"C:\Program Files"
+        # Windows normalizes os.environ keys to upper case; lookup semantics
+        # remain case-insensitive for child processes.
+        assert result["PROGRAMFILES"] == r"C:\Program Files"
+        assert result["PROGRAMDATA"] == r"C:\ProgramData"
+        assert result["PROGRAMW6432"] == r"C:\Program Files"
         assert result["LOCALAPPDATA"].endswith("Local")
         assert result["APPDATA"].endswith("Roaming")
         assert result["USERPROFILE"] == r"C:\Users\alice"

@@ -15,6 +15,7 @@ import json
 import os
 import stat
 import time
+from pathlib import Path
 
 import pytest
 
@@ -29,12 +30,71 @@ def _clean_env(monkeypatch):
     yield
 
 
+def _git_bash():
+    """Real Git Bash on this host (system32 bash.exe is the WSL stub)."""
+    candidates = (
+        r"C:\Program Files\Git\bin\bash.exe",
+        r"C:\Program Files\Git\usr\bin\bash.exe",
+        r"C:\Program Files (x86)\Git\bin\bash.exe",
+    )
+    for candidate in candidates:
+        if os.path.isfile(candidate):
+            return candidate
+    return None
+
+
+def _write_sh(tmp_path, stem, body):
+    """Write a POSIX-sh script into tmp_path; return a path subprocess can run.
+
+    Windows cannot exec shebang scripts natively, so there the identical
+    shell body runs through Git Bash via a .bat shim — stdin piping,
+    stdout/stderr capture, env vars, and exit codes all pass through.
+    newline="\n" keeps the script LF: sh chokes on CRLF bodies."""
+    script = tmp_path / stem
+    script.write_text("#!/bin/sh\n" + body, encoding="utf-8", newline="\n")
+    script.chmod(script.stat().st_mode | stat.S_IXUSR)
+    if os.name != "nt":
+        return str(script)
+    bash = _git_bash()
+    if bash is None:
+        pytest.skip("no POSIX sh available (Git Bash not installed)")
+    shim = tmp_path / (stem + ".bat")
+    shim.write_text('@echo off\r\n"%s" "%s" %%*\r\n' % (bash, script), encoding="ascii")
+    return str(shim)
+
+
 def _fake_cli(tmp_path, body):
     """Write an executable fake browser-use CLI and return its path."""
-    script = tmp_path / "browser-use"
-    script.write_text("#!/bin/sh\n" + body)
-    script.chmod(script.stat().st_mode | stat.S_IXUSR)
-    return str(script)
+    return _write_sh(tmp_path, "browser-use", body)
+
+
+def _bin_file(bin_dir, name):
+    """Fake installed binary called `name` in bin_dir — an extensionless
+    executable on POSIX, a PATHEXT-visible .exe on Windows (what real
+    installers actually link there)."""
+    exe = Path(bin_dir) / (name + (".exe" if os.name == "nt" else ""))
+    exe.write_text("#!/bin/sh\n", encoding="utf-8", newline="\n")
+    exe.chmod(exe.stat().st_mode | stat.S_IXUSR)
+    return exe
+
+
+def _normcase(path):
+    """Normalize a path for equality checks. Windows is case-insensitive and
+    shutil.which reports PATREXT casing ('browser-use.EXE') regardless of the
+    on-disk spelling; normcase is the identity on POSIX."""
+    return os.path.normcase(str(path))
+
+
+def _user_local_bin(tmp_path):
+    """The user-level tool bin dir `_find_cli` probes: ~/.local/bin on
+    POSIX; %APPDATA%\\uv\\bin — uv's Windows tool-bin default — on Windows."""
+    base = tmp_path / "userhome"
+    if os.name == "nt":
+        bin_dir = base / "uv" / "bin"
+    else:
+        bin_dir = base / ".local" / "bin"
+    bin_dir.mkdir(parents=True, exist_ok=True)
+    return bin_dir
 
 
 class TestModeDetection:
@@ -675,7 +735,8 @@ class TestNativeScreenshots:
         kinds = [part["type"] for part in result["content"]]
         assert kinds == ["text", "image_url"]
         assert result["meta"]["screenshot_path"] == shot
-        assert shot in result["text_summary"]
+        # text_summary is json.dumps(result): separators are escaped there.
+        assert json.dumps(shot) in result["text_summary"]
 
     def test_text_only_model_gets_plain_result_with_path(self, tmp_path, monkeypatch):
         shot = self._shot(tmp_path)
@@ -845,24 +906,26 @@ class TestFindCliManagedBin:
         """Pin HOME so the ~/.local/bin probe can't leak the host's real
         user-level installs into these real-PATH-probing tests."""
         monkeypatch.setenv("HOME", str(tmp_path / "userhome"))
+        # Windows probes %APPDATA%\\uv\\bin as the user tool dir — pin it so
+        # the host's real user-level installs can't leak in either.
+        monkeypatch.setenv("APPDATA", str(tmp_path / "userhome"))
         monkeypatch.setenv("HERMES_HOME", str(tmp_path / "home"))
         monkeypatch.setenv("PATH", str(tmp_path / "empty"))
 
     def test_managed_bin_browser_use_found(self, tmp_path, monkeypatch):
         bin_dir = tmp_path / "home" / "bin"
         bin_dir.mkdir(parents=True)
-        bu = bin_dir / "browser-use"
-        bu.write_text("#!/bin/sh\n")
-        bu.chmod(bu.stat().st_mode | stat.S_IXUSR)
-        assert bu_cli._find_cli_unpatched() == [str(bu)]
+        bu = _bin_file(bin_dir, "browser-use")
+        assert [_normcase(p) for p in bu_cli._find_cli_unpatched()] == [_normcase(bu)]
 
     def test_managed_bin_uvx_fallback(self, tmp_path, monkeypatch):
         bin_dir = tmp_path / "home" / "bin"
         bin_dir.mkdir(parents=True)
-        uvx = bin_dir / "uvx"
-        uvx.write_text("#!/bin/sh\n")
-        uvx.chmod(uvx.stat().st_mode | stat.S_IXUSR)
-        assert bu_cli._find_cli_unpatched() == [str(uvx), "browser-use"]
+        uvx = _bin_file(bin_dir, "uvx")
+        assert [_normcase(p) for p in bu_cli._find_cli_unpatched()] == [
+            _normcase(uvx),
+            "browser-use",
+        ]
 
     def test_nothing_found(self, tmp_path, monkeypatch):
         assert bu_cli._find_cli_unpatched() is None
@@ -871,52 +934,45 @@ class TestFindCliManagedBin:
         """#83788: Desktop/TUI workers spawn with a minimal PATH that omits
         ~/.local/bin, where `uv tool install browser-use` links the binary
         by default — _find_cli must probe it explicitly."""
-        cli_dir = tmp_path / "userhome" / ".local" / "bin"
-        cli_dir.mkdir(parents=True)
-        cli = cli_dir / "browser-use"
-        cli.write_text("#!/bin/sh\n")
-        cli.chmod(cli.stat().st_mode | stat.S_IXUSR)
-        assert bu_cli._find_cli_unpatched() == [str(cli)]
+        cli_dir = _user_local_bin(tmp_path)
+        cli = _bin_file(cli_dir, "browser-use")
+        assert [_normcase(p) for p in bu_cli._find_cli_unpatched()] == [_normcase(cli)]
 
     def test_managed_bin_precedes_user_local_bin(self, tmp_path, monkeypatch):
         """MANAGED-FIRST: Hermes' managed copy wins over a user-level side
         install — every backend selection provisions/updates the managed
         copy, so resolution must land on the binary we control (no version
         drift from stray `uv tool install` runs)."""
-        user_dir = tmp_path / "userhome" / ".local" / "bin"
-        user_dir.mkdir(parents=True)
-        user_cli = user_dir / "browser-use"
-        user_cli.write_text("#!/bin/sh\n")
-        user_cli.chmod(user_cli.stat().st_mode | stat.S_IXUSR)
+        user_cli = _bin_file(_user_local_bin(tmp_path), "browser-use")
         managed_dir = tmp_path / "home" / "bin"
         managed_dir.mkdir(parents=True)
-        managed_cli = managed_dir / "browser-use"
-        managed_cli.write_text("#!/bin/sh\n")
-        managed_cli.chmod(managed_cli.stat().st_mode | stat.S_IXUSR)
-        assert bu_cli._find_cli_unpatched() == [str(managed_cli)]
+        managed_cli = _bin_file(managed_dir, "browser-use")
+        assert [_normcase(p) for p in bu_cli._find_cli_unpatched()] == [
+            _normcase(managed_cli)
+        ]
+        assert str(managed_cli) != str(user_cli)
 
     def test_managed_bin_precedes_path(self, tmp_path, monkeypatch):
         """MANAGED-FIRST: the managed copy also wins over one on PATH."""
         path_dir = tmp_path / "onpath"
         path_dir.mkdir()
-        path_cli = path_dir / "browser-use"
-        path_cli.write_text("#!/bin/sh\n")
-        path_cli.chmod(path_cli.stat().st_mode | stat.S_IXUSR)
+        path_cli = _bin_file(path_dir, "browser-use")
         monkeypatch.setenv("PATH", str(path_dir))
         managed_dir = tmp_path / "home" / "bin"
         managed_dir.mkdir(parents=True)
-        managed_cli = managed_dir / "browser-use"
-        managed_cli.write_text("#!/bin/sh\n")
-        managed_cli.chmod(managed_cli.stat().st_mode | stat.S_IXUSR)
-        assert bu_cli._find_cli_unpatched() == [str(managed_cli)]
+        managed_cli = _bin_file(managed_dir, "browser-use")
+        assert [_normcase(p) for p in bu_cli._find_cli_unpatched()] == [
+            _normcase(managed_cli)
+        ]
+        assert str(managed_cli) != str(path_cli)
 
     def test_user_local_bin_uvx_fallback(self, tmp_path, monkeypatch):
-        cli_dir = tmp_path / "userhome" / ".local" / "bin"
-        cli_dir.mkdir(parents=True)
-        uvx = cli_dir / "uvx"
-        uvx.write_text("#!/bin/sh\n")
-        uvx.chmod(uvx.stat().st_mode | stat.S_IXUSR)
-        assert bu_cli._find_cli_unpatched() == [str(uvx), "browser-use"]
+        cli_dir = _user_local_bin(tmp_path)
+        uvx = _bin_file(cli_dir, "uvx")
+        assert [_normcase(p) for p in bu_cli._find_cli_unpatched()] == [
+            _normcase(uvx),
+            "browser-use",
+        ]
 
 
 class TestInstallCli:
@@ -941,9 +997,7 @@ class TestInstallCli:
     def test_already_installed_in_managed_bin(self, tmp_path, monkeypatch):
         bin_dir = tmp_path / "home" / "bin"
         bin_dir.mkdir(parents=True)
-        cli = bin_dir / "browser-use"
-        cli.write_text("#!/bin/sh\n")
-        cli.chmod(cli.stat().st_mode | stat.S_IXUSR)
+        cli = _bin_file(bin_dir, "browser-use")
         monkeypatch.setenv("HERMES_HOME", str(tmp_path / "home"))
         monkeypatch.setenv("PATH", str(tmp_path / "empty"))
         ok, msg = bu_cli.install_cli()
@@ -973,14 +1027,15 @@ class TestInstallCli:
         monkeypatch.setattr(bu_cli, "_find_cli", bu_cli._find_cli_unpatched)
         # fake uv: `uv tool install browser-use` drops a binary into UV_TOOL_BIN_DIR.
         # Absolute /bin/chmod: PATH is emptied above, so bare chmod won't resolve.
-        uv = tmp_path / "uv"
-        uv.write_text(
-            "#!/bin/sh\n"
-            'target="$UV_TOOL_BIN_DIR/browser-use"\n'
+        # Windows links a .exe (what real uv produces there).
+        linked = "browser-use.exe" if os.name == "nt" else "browser-use"
+        uv = _write_sh(
+            tmp_path,
+            "uv",
+            f'target="$UV_TOOL_BIN_DIR/{linked}"\n'
             'echo "#!/bin/sh" > "$target"\n'
-            '/bin/chmod +x "$target"\n'
+            '/bin/chmod +x "$target"\n',
         )
-        uv.chmod(uv.stat().st_mode | stat.S_IXUSR)
         import sys as _sys
         import types as _types
         fake = _types.ModuleType("hermes_cli.managed_uv")
@@ -988,15 +1043,13 @@ class TestInstallCli:
         monkeypatch.setitem(_sys.modules, "hermes_cli.managed_uv", fake)
         ok, msg = bu_cli.install_cli()
         assert ok is True, msg
-        assert (bin_dir / "browser-use").exists()
+        assert (bin_dir / linked).exists()
 
     def test_failed_install_surfaces_stderr_tail(self, tmp_path, monkeypatch):
         home = tmp_path / "home"
         monkeypatch.setenv("HERMES_HOME", str(home))
         monkeypatch.setenv("PATH", str(tmp_path / "empty"))
-        uv = tmp_path / "uv"
-        uv.write_text('#!/bin/sh\necho "no network" >&2\nexit 1\n')
-        uv.chmod(uv.stat().st_mode | stat.S_IXUSR)
+        uv = _write_sh(tmp_path, "uv", 'echo "no network" >&2\nexit 1\n')
         import sys as _sys
         import types as _types
         fake = _types.ModuleType("hermes_cli.managed_uv")

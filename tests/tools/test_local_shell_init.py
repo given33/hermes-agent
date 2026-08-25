@@ -18,6 +18,10 @@ from tools.environments.local import (
 )
 
 
+@pytest.mark.skipif(
+    __import__("sys").platform == "win32",
+    reason="bash init file resolution is POSIX-only",
+)
 class TestResolveShellInitFiles:
     def test_auto_sources_bashrc_when_present(self, tmp_path, monkeypatch):
         bashrc = tmp_path / ".bashrc"

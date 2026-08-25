@@ -18,6 +18,11 @@ const getUsageAnalytics = vi.fn()
 const getProfiles = vi.fn()
 const getSkillContent = vi.fn()
 
+// The Skills graph pulls in the full app shell and Radix dependencies. Under a
+// three-way Windows shard, one cold module transform can exceed the suite-wide
+// 15s test budget; keep every assertion unchanged while allowing that startup.
+vi.setConfig({ testTimeout: 60_000 })
+
 // Partial mock: keep the real module (SkillsView pulls in @/store/profile,
 // whose import-time subscription calls setApiRequestProfile) and stub only the
 // calls we assert on. Args are forwarded so the per-profile scope arg is

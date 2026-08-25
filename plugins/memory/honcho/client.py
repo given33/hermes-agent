@@ -114,7 +114,14 @@ def resolve_active_host() -> str:
 
 def resolve_global_config_path() -> Path:
     """Return the shared Honcho config path for the current HOME."""
-    return Path.home() / ".honcho" / "config.json"
+    try:
+        home = Path.home()
+    except (OSError, RuntimeError, ValueError):
+        # Minimal services and hardened Windows launchers can lack a usable
+        # HOME/USERPROFILE. Keep config resolution fail-open and profile-local
+        # rather than crashing startup or guessing another user's home.
+        home = get_hermes_home()
+    return home / ".honcho" / "config.json"
 
 
 def resolve_config_path() -> Path:

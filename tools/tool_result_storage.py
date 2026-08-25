@@ -43,8 +43,10 @@ Defense against context-window overflow operates at three levels:
 """
 
 import hashlib
+import json
 import logging
 import os
+from pathlib import Path
 import re
 import shlex
 import threading
@@ -56,6 +58,8 @@ from tools.budget_config import (
     BudgetConfig,
     DEFAULT_BUDGET,
 )
+from hermes_services.internal_hooks import run_internal_hooks
+from hermes_services.tool_contract import resolve_tool_contract
 
 logger = logging.getLogger(__name__)
 PERSISTED_OUTPUT_TAG = "<persisted-output>"
@@ -290,6 +294,65 @@ def _build_persisted_message(
     return msg
 
 
+def _account_artifact_context() -> dict[str, str] | None:
+    """Return hosted artifact scope only when explicitly configured."""
+
+    root = os.environ.get("HERMES_TOOL_ARTIFACT_ROOT", "").strip()
+    owner = os.environ.get("HERMES_TOOL_ARTIFACT_OWNER", "").strip()
+    if not root or not owner:
+        return None
+    return {
+        "root": root,
+        "owner_id": owner,
+        "conversation_id": os.environ.get(
+            "HERMES_TOOL_ARTIFACT_CONVERSATION", ""
+        ).strip(),
+        "turn_id": os.environ.get("HERMES_TOOL_ARTIFACT_TURN", "").strip(),
+        "account_generation": os.environ.get(
+            "HERMES_ACCOUNT_GENERATION", ""
+        ).strip(),
+    }
+
+
+def _persist_account_artifact(
+    content: str,
+    *,
+    tool_name: str,
+    tool_use_id: str,
+) -> tuple[str, bool]:
+    """Store complete output in the account vault; never leak on failure."""
+
+    context = _account_artifact_context()
+    if context is None:
+        return "", False
+    try:
+        from hermes_services.tool_output_artifacts import EncryptedToolArtifactStore
+
+        artifact = EncryptedToolArtifactStore(Path(context["root"])).put(
+            owner_id=context["owner_id"],
+            account_generation=context["account_generation"],
+            conversation_id=context["conversation_id"],
+            turn_id=context["turn_id"],
+            tool_call_id=tool_use_id,
+            tool_name=tool_name,
+            content=content,
+        )
+    except Exception as exc:
+        logger.warning(
+            "Account artifact storage failed for %s: %s", tool_use_id, exc
+        )
+        return "", True
+    size_kb = len(content) / 1024
+    size_str = f"{size_kb / 1024:.1f} MB" if size_kb >= 1024 else f"{size_kb:.1f} KB"
+    return (
+        f"{PERSISTED_OUTPUT_TAG}\n"
+        f"Account artifact: {artifact['id']} ({len(content):,} characters, {size_str}). "
+        "The complete output is retained in encrypted account storage.\n"
+        f"{PERSISTED_OUTPUT_CLOSING_TAG}",
+        True,
+    )
+
+
 def maybe_persist_tool_result(
     content: str,
     tool_name: str,
@@ -297,6 +360,8 @@ def maybe_persist_tool_result(
     env=None,
     config: BudgetConfig = DEFAULT_BUDGET,
     threshold: int | float | None = None,
+    *,
+    run_hooks: bool = True,
 ) -> str:
     """Layer 2: persist oversized result into the sandbox, return preview + path.
 
@@ -315,7 +380,29 @@ def maybe_persist_tool_result(
     Returns:
         Original content if small, or <persisted-output> replacement.
     """
+    # Plugin/embedding handlers occasionally return a structured value even
+    # though the public tool-result contract is text. Normalize at this final
+    # persistence boundary so hook validation and size accounting cannot turn a
+    # successful tool call into a post-execution exception.
+    if not isinstance(content, str):
+        if isinstance(content, (dict, list, tuple)):
+            content = json.dumps(content, ensure_ascii=False, default=str)
+        else:
+            content = str(content)
+
     effective_threshold = threshold if threshold is not None else config.resolve_threshold(tool_name)
+
+    if run_hooks:
+        # Internal observers see the authoritative tool result exactly once,
+        # before spill/account retention rewrites it into a bounded reference.
+        # Budget enforcement reuses this function on already observed content.
+        hook_result = run_internal_hooks(
+            "after_tool_result",
+            content,
+            tool_name=tool_name,
+            tool_use_id=tool_use_id,
+        )
+        content = str(hook_result.payload)
 
     if effective_threshold == float("inf"):
         return content
@@ -326,6 +413,29 @@ def maybe_persist_tool_result(
     filename = _safe_result_filename(tool_use_id)
     preview, has_more = generate_preview(content, max_chars=config.preview_size)
 
+    account_message, artifact_required = _persist_account_artifact(
+        content,
+        tool_name=tool_name,
+        tool_use_id=tool_use_id,
+    )
+    if artifact_required:
+        contract = resolve_tool_contract(tool_name)
+        if account_message:
+            logger.info(
+                "Persisted large tool result as account artifact: %s (%s, %d chars, policy=%s)",
+                tool_name,
+                tool_use_id,
+                len(content),
+                contract.output_policy,
+            )
+            return account_message
+        return (
+            f"{PERSISTED_OUTPUT_TAG}\n"
+            "This tool result was too large for inline context. "
+            "The full output was not retained.\n"
+            f"{PERSISTED_OUTPUT_CLOSING_TAG}"
+        )
+
     # Always persist host-side first: $HERMES_HOME/cache/spillover is the
     # single canonical home for spilled results (with the other Hermes-owned
     # caches, pruned by gateway housekeeping) regardless of backend.
@@ -333,9 +443,14 @@ def maybe_persist_tool_result(
 
     if _is_host_side_env(env):
         if host_path is not None:
+            contract = resolve_tool_contract(tool_name)
             logger.info(
-                "Persisted large tool result: %s (%s, %d chars -> %s)",
-                tool_name, tool_use_id, len(content), host_path,
+                "Persisted large tool result: %s (%s, %d chars -> %s, policy=%s)",
+                tool_name,
+                tool_use_id,
+                len(content),
+                host_path,
+                contract.output_policy,
             )
             return _build_persisted_message(preview, has_more, len(content), host_path)
     elif env is not None:
@@ -345,9 +460,15 @@ def maybe_persist_tool_result(
         if host_path is not None:
             visible = _sandbox_visible_spillover_path(host_path, env)
             if visible is not None:
+                contract = resolve_tool_contract(tool_name)
                 logger.info(
-                    "Persisted large tool result: %s (%s, %d chars -> %s [host: %s])",
-                    tool_name, tool_use_id, len(content), visible, host_path,
+                    "Persisted large tool result: %s (%s, %d chars -> %s [host: %s], policy=%s)",
+                    tool_name,
+                    tool_use_id,
+                    len(content),
+                    visible,
+                    host_path,
+                    contract.output_policy,
                 )
                 return _build_persisted_message(preview, has_more, len(content), visible)
         # Fallback: write into the sandbox temp dir (pre-existing containers
@@ -356,9 +477,14 @@ def maybe_persist_tool_result(
         remote_path = f"{storage_dir}/{filename}"
         try:
             if _write_to_sandbox(content, remote_path, env):
+                contract = resolve_tool_contract(tool_name)
                 logger.info(
-                    "Persisted large tool result: %s (%s, %d chars -> %s)",
-                    tool_name, tool_use_id, len(content), remote_path,
+                    "Persisted large tool result: %s (%s, %d chars -> %s, policy=%s)",
+                    tool_name,
+                    tool_use_id,
+                    len(content),
+                    remote_path,
+                    contract.output_policy,
                 )
                 return _build_persisted_message(preview, has_more, len(content), remote_path)
         except Exception as exc:
@@ -416,6 +542,7 @@ def enforce_turn_budget(
             env=env,
             config=config,
             threshold=0,
+            run_hooks=False,
         )
         if replacement != content:
             total_size -= size

@@ -141,7 +141,10 @@ class TestComputeRelativeDest:
     def test_preserves_category_structure(self):
         bundled = Path("/repo/skills")
         dest = _compute_relative_dest(Path("/repo/skills/mlops/axolotl"), bundled)
-        assert str(dest).endswith("mlops/axolotl")
+        # as_posix() keeps this separator-agnostic: the contract is the
+        # category structure "mlops/axolotl", whatever the native
+        # representation of a filesystem Path is on the host OS.
+        assert dest.as_posix().endswith("mlops/axolotl")
         # Flat (uncategorized) skills keep their own name.
         assert _compute_relative_dest(Path("/repo/skills/simple"), bundled).name == "simple"
 

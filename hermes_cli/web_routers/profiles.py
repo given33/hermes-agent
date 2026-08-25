@@ -38,6 +38,7 @@ from hermes_cli.web_models import (
     ProfileRename,
     ProfileSoulUpdate,
     ProfileDescriptionUpdate,
+    StudioMemoryUpdate,
     ProfileModelUpdate,
     ProfileDescribeAuto,
     SessionPrScanBody,
@@ -1058,6 +1059,69 @@ async def get_profile_soul(name: str):
         except OSError as e:
             raise HTTPException(status_code=500, detail=f"Could not read SOUL.md: {e}")
     return {"content": "", "exists": False}
+
+
+_STUDIO_MEMORY_FILES = {
+    "memory": Path("memories") / "MEMORY.md",
+    "soul": Path("SOUL.md"),
+    "user": Path("memories") / "USER.md",
+}
+
+
+def _studio_memory_snapshot(profile_dir: Path) -> dict[str, Any]:
+    payload: dict[str, Any] = {}
+    for section, relative_path in _STUDIO_MEMORY_FILES.items():
+        path = profile_dir / relative_path
+        try:
+            stat = path.stat()
+            content = path.read_text(encoding="utf-8")
+        except FileNotFoundError:
+            payload[section] = ""
+            payload[f"{section}_mtime"] = None
+        except OSError as exc:
+            raise HTTPException(
+                status_code=500,
+                detail=f"Could not read {section}: {exc}",
+            ) from exc
+        else:
+            payload[section] = content
+            payload[f"{section}_mtime"] = max(stat.st_mtime, 0)
+    return payload
+
+
+@router.get("/api/hermes/memory")
+async def get_studio_memory(profile: str = "default"):
+    return _studio_memory_snapshot(_resolve_profile_dir(profile))
+
+
+@router.put("/api/hermes/memory")
+async def update_studio_memory(
+    body: StudioMemoryUpdate,
+    profile: str = "default",
+):
+    section = body.section.strip().lower()
+    relative_path = _STUDIO_MEMORY_FILES.get(section)
+    if relative_path is None:
+        raise HTTPException(status_code=400, detail="Invalid memory section")
+    if len(body.content.encode("utf-8")) > 2 * 1024 * 1024:
+        raise HTTPException(status_code=413, detail="Memory document exceeds 2 MiB")
+
+    profile_dir = _resolve_profile_dir(profile)
+    target = profile_dir / relative_path
+    try:
+        from utils import atomic_write_text
+
+        atomic_write_text(
+            target,
+            body.content,
+            tmp_prefix=f".{target.stem}_",
+            preserve_mode=True,
+            create_mode=0o644,
+        )
+    except OSError as exc:
+        _log.exception("PUT /api/hermes/memory failed")
+        raise HTTPException(status_code=500, detail=f"Could not write {section}: {exc}") from exc
+    return _studio_memory_snapshot(profile_dir)
 
 
 @router.put("/api/profiles/{name}/soul")

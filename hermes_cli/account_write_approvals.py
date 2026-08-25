@@ -17,6 +17,7 @@ import os
 import sqlite3
 import threading
 import time
+from contextlib import contextmanager
 import uuid
 from pathlib import Path
 from typing import Any, Callable, Iterable
@@ -92,6 +93,24 @@ CREATE TABLE IF NOT EXISTS account_write_approval_effects (
     PRIMARY KEY(owner_id, profile, effect_key)
 );
 """
+
+
+def _is_link_like_path(path: Path) -> bool:
+    """Return true when a legacy pending root traverses a link/reparse point."""
+    try:
+        if path.is_symlink():
+            return True
+        lexical = Path(os.path.abspath(path))
+        resolved = path.resolve()
+        if os.name == "nt":
+            return os.path.normcase(os.path.realpath(path)) != os.path.normcase(
+                str(path)
+            )
+        # Comparing the full path catches a symlink in any parent directory,
+        # while ordinary absolute paths (the normal pending layout) match.
+        return resolved != lexical
+    except OSError:
+        return True
 
 _APPLY_LEASE_SECONDS = 60.0
 _MAX_OWNER_ID_LENGTH = 512
@@ -183,6 +202,38 @@ class ApprovalAccountDeleted(ApprovalConflict):
 
 class ApprovalDeletionInProgress(RuntimeError):
     """Account cleanup must retry after an active effect lease drains."""
+
+
+@contextmanager
+def _approval_schema_init_lock(db_path: Path) -> Iterator[None]:
+    """Serialize first-open schema DDL across account cleanup processes."""
+    lock_path = db_path.with_suffix(".init.lock")
+    lock_path.parent.mkdir(parents=True, exist_ok=True)
+    handle = open(lock_path, "a+b")
+    try:
+        if os.name == "nt":
+            import msvcrt
+
+            handle.seek(0)
+            msvcrt.locking(handle.fileno(), msvcrt.LK_LOCK, 1)
+        else:
+            import fcntl
+
+            fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
+        yield
+    finally:
+        try:
+            if os.name == "nt":
+                import msvcrt
+
+                handle.seek(0)
+                msvcrt.locking(handle.fileno(), msvcrt.LK_UNLCK, 1)
+            else:
+                import fcntl
+
+                fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+        finally:
+            handle.close()
 
 
 class AccountWriteApprovalStore:
@@ -290,7 +341,11 @@ class AccountWriteApprovalStore:
             raise ApprovalAccountDeleted("account approval scope was deleted")
 
     def _initialize(self) -> None:
-        with self._lock, self._connect() as conn:
+        with (
+            self._lock,
+            _approval_schema_init_lock(self.db_path),
+            self._connect() as conn,
+        ):
             conn.executescript(_SCHEMA)
             columns = {
                 str(row["name"])
@@ -1399,18 +1454,28 @@ class AccountWriteApprovalStore:
         which for multi-profile deployments can differ from the global home;
         cleanup must scan the global home AND this store's own root.
         """
-        candidates: list[Path] = []
+        candidates: list[tuple[Path, Path]] = []
         try:
-            candidates.append(get_hermes_home() / "pending" / subsystem)
+            home = Path(get_hermes_home()).resolve()
+            candidates.append((home / "pending" / subsystem, home))
         except Exception:
             pass
         try:
-            candidates.append(self.db_path.parent / "pending" / subsystem)
+            profile_root = self.db_path.parent.resolve()
+            candidates.append((profile_root / "pending" / subsystem, profile_root))
         except Exception:
             pass
         dirs: list[Path] = []
-        for candidate in candidates:
+        for candidate, allowed_root in candidates:
+            # A pending directory is legacy state, not permission to follow
+            # a user-created symlink/junction into an arbitrary tree.
+            if _is_link_like_path(candidate):
+                continue
             resolved = candidate.resolve()
+            try:
+                resolved.relative_to(allowed_root)
+            except (ValueError, OSError):
+                continue
             if resolved not in dirs:
                 dirs.append(resolved)
         return dirs

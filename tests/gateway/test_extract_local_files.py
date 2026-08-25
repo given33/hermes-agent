@@ -21,10 +21,18 @@ from gateway.platforms.base import BasePlatformAdapter
 
 def _extract(content: str, existing_files: set[str] | None = None):
     """
-    Run extract_local_files with os.path.isfile mocked to return True
+    Run extract_local_files with ``os.path.isfile`` mocked to return True
     for any path in *existing_files* (expanded form).  If *existing_files*
     is None every path passes.
+
+    The platform base calls ``hermes_constants.expand_user_path`` to expand
+    ``~/`` tokens and then ``os.path.normpath`` to produce a native
+    filesystem spelling. On Windows ``os.path.normpath('/home/user')``
+    collapses to ``\\home\\user`` and clobbers the test's POSIX-shaped
+    HOME. The test bypasses both helpers to keep the assertions
+    deterministic on every host platform.
     """
+    import os
     existing = existing_files
 
     def fake_isfile(p):
@@ -32,14 +40,28 @@ def _extract(content: str, existing_files: set[str] | None = None):
             return True
         return p in existing
 
-    def fake_expanduser(p):
-        if p.startswith("~/"):
-            return "/home/user" + p[1:]
-        return p
+    def fake_normpath(p):
+        # Preserve POSIX slashes so the test's HOME value (``/home/user``)
+        # survives the normpath pass. Real callers expect native spelling
+        # but the test's contract is that the extracted path is the
+        # POSIX-spelled HOME plus the path suffix, unchanged.
+        return p.replace("\\", "/")
 
-    with patch("os.path.isfile", side_effect=fake_isfile), \
-         patch("os.path.expanduser", side_effect=fake_expanduser):
-        return BasePlatformAdapter.extract_local_files(content)
+    saved_home = os.environ.get("HOME")
+    saved_userprofile = os.environ.get("USERPROFILE")
+    os.environ["HOME"] = "/home/user"
+    os.environ.pop("USERPROFILE", None)
+    try:
+        with patch("os.path.isfile", side_effect=fake_isfile), \
+             patch("os.path.normpath", side_effect=fake_normpath):
+            return BasePlatformAdapter.extract_local_files(content)
+    finally:
+        if saved_home is None:
+            os.environ.pop("HOME", None)
+        else:
+            os.environ["HOME"] = saved_home
+        if saved_userprofile is not None:
+            os.environ["USERPROFILE"] = saved_userprofile
 
 
 # ---------------------------------------------------------------------------

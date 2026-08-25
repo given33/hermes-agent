@@ -109,6 +109,7 @@ try:
         WebSocket, WebSocketDisconnect,
     )
     from fastapi.middleware.cors import CORSMiddleware
+    from fastapi.middleware.gzip import GZipMiddleware
     from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, Response
     from fastapi.staticfiles import StaticFiles
     from pydantic import BaseModel, SecretStr, field_validator
@@ -124,8 +125,9 @@ except ImportError:
             FastAPI, File, Form, HTTPException, Query, Request, UploadFile,
             WebSocket, WebSocketDisconnect,
         )
-        from fastapi.middleware.cors import CORSMiddleware
         from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, Response
+        from fastapi.middleware.cors import CORSMiddleware
+        from fastapi.middleware.gzip import GZipMiddleware
         from fastapi.staticfiles import StaticFiles
         from pydantic import BaseModel, SecretStr, field_validator
         from starlette.concurrency import run_in_threadpool
@@ -483,16 +485,8 @@ app = FastAPI(title="Hermes Agent", version=__version__, lifespan=_lifespan)
 
 # Memory-provider OAuth connect routes live in the memory layer, not here.
 from hermes_cli.memory_oauth import router as _memory_oauth_router  # noqa: E402
-from hermes_cli.dashboard_auth.owner_mobile import router as _owner_mobile_router  # noqa: E402
 
 app.include_router(_memory_oauth_router)
-app.include_router(_owner_mobile_router)  # /auth/mobile/* Bearer endpoints
-
-# Register the mobile token provider so the auth middleware's bearer
-# verification recognizes hma_* tokens for /api/* paths (RFC 8252 native-app
-# auth — the desktop/mobile client authenticates REST with Bearer, no cookie).
-from hermes_cli.dashboard_auth.owner_mobile import ensure_mobile_token_provider  # noqa: E402
-ensure_mobile_token_provider()
 
 # ---------------------------------------------------------------------------
 # Session token for protecting sensitive endpoints (reveal).
@@ -553,6 +547,11 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+# Large conversation/session snapshots dominate mobile cold-start on WAN.
+# Compress JSON responses at the app edge so loopback deployments without a
+# reverse proxy get the same transfer reduction as proxied deployments.
+app.add_middleware(GZipMiddleware, minimum_size=1024, compresslevel=6)
 
 # ---------------------------------------------------------------------------
 # Endpoints that do NOT require the session token.  Everything else under
@@ -624,6 +623,8 @@ def _require_token(request: Request) -> None:
       making plugin install/enable/disable and the other ``_require_token``
       endpoints permanently unreachable behind the gate. Defer to the gate.
     """
+    if getattr(request.state, "token_authenticated", False):
+        return
     if getattr(request.app.state, "auth_required", False):
         # Gate is authoritative. It attaches ``request.state.session`` on
         # success and 401s otherwise, so a request that reached us is already
@@ -1520,6 +1521,7 @@ from hermes_cli.web_models import (  # noqa: F401
     ChatImageUpload,
     ManagedDirectoryCreate,
     ManagedFileDelete,
+    ManagedInstallationRequest,
     ModelAssignment,
     MoaModelSlot,
     _MoaReferenceControls,
@@ -2564,6 +2566,63 @@ async def upload_chat_image(payload: ChatImageUpload, profile: Optional[str] = N
     return await asyncio.to_thread(_run)
 
 
+@app.post("/api/managed-installations", status_code=202)
+async def create_managed_installation_api(body: ManagedInstallationRequest):
+    """Persist a fleet installation before acknowledging the dashboard client."""
+    from hermes_cli.managed_installations import create_managed_installation
+
+    try:
+        operation = await asyncio.to_thread(
+            create_managed_installation,
+            kind=body.kind,
+            identifier=body.identifier,
+            profile=body.profile,
+            request_id=body.request_id,
+            scope=body.scope,
+            locality=body.locality,
+            targets=body.targets,
+            project_name=body.project_name,
+            require_topology=True,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except RuntimeError as exc:
+        raise HTTPException(status_code=503, detail=str(exc)) from exc
+    return {"accepted": True, "operation": operation}
+
+
+@app.get("/api/managed-installations")
+async def list_managed_installations_api(
+    kind: str = "",
+    profile: str = "",
+    limit: int = 50,
+):
+    from hermes_cli.managed_installations import list_managed_installations
+
+    try:
+        return await asyncio.to_thread(
+            list_managed_installations,
+            kind=kind,
+            profile=profile,
+            limit=limit,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@app.get("/api/managed-installations/{operation_id}")
+async def get_managed_installation_api(operation_id: str):
+    from hermes_cli.managed_installations import get_managed_installation
+
+    try:
+        return await asyncio.to_thread(get_managed_installation, operation_id)
+    except KeyError as exc:
+        raise HTTPException(
+            status_code=404,
+            detail="Installation operation not found",
+        ) from exc
+
+
 @app.get("/api/files")
 async def list_managed_files(request: Request, path: Optional[str] = None):
     policy, target, display_path = _resolve_managed_path(path, request)
@@ -2845,7 +2904,13 @@ async def delete_managed_file(payload: ManagedFileDelete, request: Request):
     try:
         if target.is_dir():
             if payload.recursive:
-                shutil.rmtree(target)
+                from hermes_cli.safe_delete import safe_rmtree
+
+                safe_rmtree(
+                    target,
+                    policy.locked_root
+                    or policy.default_path,
+                )
             else:
                 target.rmdir()
         else:
@@ -7819,7 +7884,11 @@ def _get_env_vars_sync(profile: Optional[str] = None):
         # gaps (description/url) and always supplies provider grouping hints.
         return {
             "is_set": bool(value),
-            "redacted_value": redact_key(value) if value else None,
+            "redacted_value": (
+                None
+                if info.get("password", cat_meta.get("is_password", False))
+                else (redact_key(value) if value else None)
+            ),
             "description": info.get("description") or cat_meta.get("description", ""),
             "url": info.get("url") if info.get("url") is not None else cat_meta.get("url"),
             "category": info.get("category") or cat_meta.get("category", ""),
@@ -8393,6 +8462,12 @@ async def reveal_env_var(
     """
     # --- Token check ---
     _require_token(request)
+    # A native API key is deliberately an API capability, not a browser
+    # secret-management credential.  Never allow it to reveal the very key
+    # (or any other environment secret) back to the mobile process.
+    token_principal = getattr(request.state, "token_principal", None)
+    if token_principal is not None and str(token_principal.provider) == "mobile-api":
+        raise HTTPException(status_code=403, detail="Environment secrets require an interactive dashboard session")
 
     # --- Rate limit ---
     now = time.time()
@@ -18519,6 +18594,13 @@ def _mount_plugin_api_routes():
     execution vector that bypasses the user's intent. (#46435,
     GHSA-mcfc-hp25-cjv7)
     """
+    # Seal trusted internal hooks before importing user/bundled dashboard API
+    # modules. Their module-level code executes during spec loading, so a
+    # later lazy bootstrap would expose an unsealed registry to dynamic code.
+    from hermes_services.startup import bootstrap_trusted_runtime
+
+    bootstrap_trusted_runtime()
+
     # Load the enabled/disabled sets once for the loop.
     try:
         from hermes_cli.plugins_cmd import _get_enabled_set, _get_disabled_set
@@ -18621,6 +18703,23 @@ _mount_plugin_api_routes()
 # not whether the routes exist.
 from hermes_cli.dashboard_auth.routes import router as _dashboard_auth_router  # noqa: E402
 app.include_router(_dashboard_auth_router)
+
+# Import the owner-mobile surface only after the dashboard-auth route module has
+# settled.  ``owner_mobile`` reuses rate-limit helpers from ``routes``; loading
+# it beside app construction creates a circular import in cold web-server
+# starts, and including its router before module initialisation can mount an
+# empty route set.
+from hermes_cli.dashboard_auth.owner_mobile import (  # noqa: E402
+    router as _owner_mobile_router_late,
+    ensure_mobile_token_provider,
+    register_mobile_api_provider_if_configured,
+)
+app.include_router(_owner_mobile_router_late)
+# Register native bearer providers after all auth modules are importable. The
+# middleware consults the registry per request, so this remains early enough
+# for the first request while avoiding import-time cycles.
+ensure_mobile_token_provider()
+register_mobile_api_provider_if_configured()
 
 mount_spa(app)
 

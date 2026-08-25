@@ -15,14 +15,14 @@ INSTALL_PS1 = REPO_ROOT / "scripts" / "install.ps1"
 
 class TestInstallSh:
     def test_has_skip_flag(self) -> None:
-        text = INSTALL_SH.read_text()
+        text = INSTALL_SH.read_text(encoding="utf-8")
         assert "--skip-computer-use)" in text
         assert "SKIP_COMPUTER_USE=true" in text
         assert "SKIP_COMPUTER_USE=false" in text  # default off
         assert "--skip-computer-use  Skip the cua-driver" in text
 
     def test_install_function_wired_into_main_and_stage(self) -> None:
-        text = INSTALL_SH.read_text()
+        text = INSTALL_SH.read_text(encoding="utf-8")
         assert "install_computer_use_driver() {" in text
         # main() flow and the node-deps stage both run it.
         assert text.count("install_computer_use_driver\n") >= 2
@@ -31,43 +31,43 @@ class TestInstallSh:
         """The upstream installer serializes on a lock with a 600s stale
         window; a ceiling below that reintroduces the self-perpetuating
         wedge (#58762). Must stay >= 660."""
-        text = INSTALL_SH.read_text()
+        text = INSTALL_SH.read_text(encoding="utf-8")
         assert "run_with_timeout 660 /bin/bash -c" in text
 
     def test_install_is_best_effort(self) -> None:
-        text = INSTALL_SH.read_text()
+        text = INSTALL_SH.read_text(encoding="utf-8")
         assert "Computer Use driver install failed" in text
         assert "hermes computer-use install" in text
 
     def test_skips_unwritable_applications_dir(self) -> None:
         """Non-admin macOS accounts can't receive CuaDriver.app (#47865
         class) — skip cleanly instead of failing every install."""
-        text = INSTALL_SH.read_text()
+        text = INSTALL_SH.read_text(encoding="utf-8")
         assert '[ -d /Applications ] && [ ! -w /Applications ]' in text
 
 
 class TestInstallPs1:
     def test_has_skip_switch(self) -> None:
-        text = INSTALL_PS1.read_text()
+        text = INSTALL_PS1.read_text(encoding="utf-8")
         assert "[switch]$SkipComputerUse," in text
         assert "if ($SkipComputerUse)" in text
 
     def test_install_function_wired_into_node_deps(self) -> None:
-        text = INSTALL_PS1.read_text()
+        text = INSTALL_PS1.read_text(encoding="utf-8")
         assert "function Install-CuaDriver {" in text
         assert "    Install-CuaDriver\n" in text
 
     def test_install_is_timeboxed_above_upstream_lock_window(self) -> None:
-        text = INSTALL_PS1.read_text()
+        text = INSTALL_PS1.read_text(encoding="utf-8")
         assert "Wait-Job $job -Timeout 660" in text
 
     def test_install_is_best_effort(self) -> None:
-        text = INSTALL_PS1.read_text()
+        text = INSTALL_PS1.read_text(encoding="utf-8")
         assert "Computer Use driver install timed out" in text
         assert "hermes computer-use install" in text
 
     def test_install_rechecks_runtime_contract_before_success(self) -> None:
-        text = INSTALL_PS1.read_text()
+        text = INSTALL_PS1.read_text(encoding="utf-8")
         assert "$installedCuaDriver = Get-Command cua-driver" in text
         assert (
             "Test-CuaDriverRuntimeContract -DriverPath $installedCuaDriver.Source"

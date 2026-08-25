@@ -30,7 +30,7 @@ import { Badge } from "@nous-research/ui/ui/components/badge";
 import { Card } from "@nous-research/ui/ui/components/card";
 
 import { ModelPickerDialog } from "@/components/ModelPickerDialog";
-import { ModelReloadConfirm } from "@/components/ModelReloadConfirm";
+import { ChatSessionList } from "@/components/ChatSessionList";
 import { ReasoningPicker } from "@/components/ReasoningPicker";
 import { GatewayClient, type ConnectionState } from "@/lib/gatewayClient";
 import { api, buildWsUrl } from "@/lib/api";
@@ -92,6 +92,9 @@ interface ChatSidebarProps {
   className?: string;
   onDashboardNewSessionRequest?: () => void;
   onSessionTitleChange?: (title: string | null) => void;
+  activeSessionId?: string | null;
+  onSessionPicked?: () => void;
+  onNewChat?: () => void;
 }
 
 /** Build the ``session.create`` params for the sidecar session.
@@ -115,6 +118,9 @@ export function ChatSidebar({
   className,
   onDashboardNewSessionRequest,
   onSessionTitleChange,
+  activeSessionId = null,
+  onSessionPicked,
+  onNewChat,
 }: ChatSidebarProps) {
   // `version` bumps on reconnect; gw is derived so we never call setState
   // for it inside an effect (React 19's set-state-in-effect rule). The
@@ -148,11 +154,7 @@ export function ChatSidebar({
   // Set after the picker saves a model and the user declines the reload: config
   // is updated but the running session keeps its model until rebuilt.
   const [modelNotice, setModelNotice] = useState<string | null>(null);
-  // Short name of a just-saved model awaiting confirm to reload (a fresh chat
-  // session is how the running chat adopts it; we confirm before discarding it).
-  const [pendingReloadModel, setPendingReloadModel] = useState<string | null>(
-    null,
-  );
+  const modelChangedRef = useRef(false);
 
   const refreshEffectiveModel = useCallback(() => {
     void api
@@ -440,7 +442,6 @@ export function ChatSidebar({
   const reconnect = useCallback(() => {
     setError(null);
     setModelNotice(null);
-    setPendingReloadModel(null);
     setVersion((v) => v + 1);
   }, []);
 
@@ -543,7 +544,6 @@ export function ChatSidebar({
           alwaysGlobal
           onApply={async ({ provider, model, confirmExpensiveModel }) => {
             setModelNotice(null);
-            setPendingReloadModel(null);
             const result = await api.setModelAssignment(
               {
                 confirm_expensive_model: confirmExpensiveModel,
@@ -557,28 +557,46 @@ export function ChatSidebar({
             // and calls back; don't announce until the user confirms.
             if (!result.confirm_required) {
               refreshEffectiveModel();
-              // Ask before reloading: applying the model starts a fresh chat.
-              setPendingReloadModel(model.split("/").slice(-1)[0]);
+              modelChangedRef.current = true;
+              window.dispatchEvent(
+                new CustomEvent("hermes:model-changed", {
+                  detail: { profile: profile || "default" },
+                }),
+              );
             }
             return result;
           }}
           onClose={() => {
             setModelOpen(false);
             refreshEffectiveModel();
+            if (modelChangedRef.current) {
+              modelChangedRef.current = false;
+              // The dialog close is a second lifecycle boundary: consumers
+              // that mounted after the REST write still rebind before the
+              // next turn, without replacing web history.
+              window.dispatchEvent(
+                new CustomEvent("hermes:model-changed", {
+                  detail: { profile: profile || "default" },
+                }),
+              );
+            }
           }}
         />
       )}
 
-      <ModelReloadConfirm
-        model={pendingReloadModel}
-        onCancel={() => {
-          const m = pendingReloadModel;
-          setPendingReloadModel(null);
-          setModelNotice(
-            `Model set to ${m}. Run /new or refresh the page to apply it to this chat.`,
-          );
-        }}
-      />
+      <div className="border-t border-current/10 pt-2" aria-label="工具事件流">
+        <div className="px-2 pb-1 text-[0.65rem] uppercase tracking-wider text-text-tertiary">
+          工具事件流
+        </div>
+        <div className="sr-only">新建对话</div>
+        <ChatSessionList
+          activeSessionId={activeSessionId}
+          profile={profile}
+          onPicked={onSessionPicked}
+          onNewChat={onNewChat}
+          className="min-h-0"
+        />
+      </div>
     </aside>
   );
 }

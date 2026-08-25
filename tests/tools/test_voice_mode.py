@@ -124,6 +124,10 @@ class TestPulseSocketReachable:
     def test_stale_socket_file_not_reachable(self, monkeypatch, tmp_path):
         """A socket file with no listener should not count as reachable."""
         import socket as _socket
+        if not hasattr(_socket, "AF_UNIX"):
+            # Real AF_UNIX endpoints cannot exist on native Windows;
+            # test_stale_socket_logic_twin covers the decision logic there.
+            pytest.skip("AF_UNIX sockets are POSIX-only")
         sock_path = tmp_path / "pulse" / "native"
         sock_path.parent.mkdir(parents=True)
         # Create + bind, then close so the path is a stale socket file.
@@ -139,6 +143,8 @@ class TestPulseSocketReachable:
     def test_listening_socket_reachable_via_xdg_runtime(self, monkeypatch, tmp_path):
         """A live PulseAudio-style socket under XDG_RUNTIME_DIR is reachable (#35622)."""
         import socket as _socket
+        if not hasattr(_socket, "AF_UNIX"):
+            pytest.skip("AF_UNIX sockets are POSIX-only")
         sock_path = tmp_path / "pulse" / "native"
         sock_path.parent.mkdir(parents=True)
         server = _socket.socket(_socket.AF_UNIX, _socket.SOCK_STREAM)
@@ -152,6 +158,90 @@ class TestPulseSocketReachable:
             assert _pulse_socket_reachable() is True
         finally:
             server.close()
+
+
+class _RecordingEndpoint:
+    """Stands in for an AF_UNIX peer on hosts that have none (Windows)."""
+
+    def __init__(self, refuse):
+        self._refuse = refuse
+        self.connect_attempts = []
+
+    def connect(self, path):
+        self.connect_attempts.append(str(path))
+        if self._refuse:
+            raise ConnectionRefusedError(str(path))
+
+
+def _run_pulse_reachability_twin(monkeypatch, tmp_path, refuse):
+    """Exercise _pulse_socket_reachable's decision logic without AF_UNIX.
+
+    A regular file impersonates the socket inode (os.stat reports
+    S_IFSOCK for existing paths) and a fake socket records connection
+    attempts, so both hosts pin the same contract: mere existence is not
+    reachability, and XDG_RUNTIME_DIR/pulse/native is probed.
+    """
+    import stat as _stat
+    import types
+
+    sock_path = tmp_path / "pulse" / "native"
+    sock_path.parent.mkdir(parents=True)
+    sock_path.write_bytes(b"")
+    monkeypatch.delenv("PULSE_SERVER", raising=False)
+    monkeypatch.delenv("PULSE_RUNTIME_PATH", raising=False)
+    monkeypatch.setenv("XDG_RUNTIME_DIR", str(tmp_path))
+
+    endpoint = _RecordingEndpoint(refuse=refuse)
+
+    class _FakeUnixSocket:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        def settimeout(self, timeout):
+            pass
+
+        def connect(self, path):
+            endpoint.connect(path)
+
+        def close(self):
+            pass
+
+    real_stat = __import__("os").stat
+
+    def _fake_stat(path, *args, **kwargs):
+        real_stat(path, *args, **kwargs)  # missing paths still raise
+        return types.SimpleNamespace(st_mode=_stat.S_IFSOCK)
+
+    monkeypatch.setattr("socket.socket", _FakeUnixSocket)
+    # The product reads socket.AF_UNIX while building the client; hosts
+    # without POSIX sockets lack the attribute entirely.
+    import socket as _socket_mod
+
+    if not hasattr(_socket_mod, "AF_UNIX"):
+        monkeypatch.setattr(_socket_mod, "AF_UNIX", 1, raising=False)
+    monkeypatch.setattr("os.stat", _fake_stat)
+
+    from tools.voice_mode import _pulse_socket_reachable
+    return _pulse_socket_reachable(), endpoint
+
+
+def test_stale_socket_logic_twin(monkeypatch, tmp_path):
+    """Windows twin: a stale socket inode is probed but NOT reachable."""
+    reachable, endpoint = _run_pulse_reachability_twin(
+        monkeypatch, tmp_path, refuse=True
+    )
+    assert reachable is False
+    # The stale file WAS connection-probed -- existence alone never counts.
+    assert endpoint.connect_attempts == [str(tmp_path / "pulse" / "native")]
+
+
+def test_live_socket_logic_twin(monkeypatch, tmp_path):
+    """Windows twin: a connectable socket under XDG_RUNTIME_DIR is reachable."""
+    reachable, endpoint = _run_pulse_reachability_twin(
+        monkeypatch, tmp_path, refuse=False
+    )
+    assert reachable is True
+    assert endpoint.connect_attempts == [str(tmp_path / "pulse" / "native")]
 
 class TestDetectAudioEnvironment:
     def test_clean_environment_is_available(self, monkeypatch):
@@ -207,6 +297,13 @@ class TestDetectAudioEnvironment:
         monkeypatch.setattr("tools.voice_mode._pulse_socket_reachable", lambda: False)
         monkeypatch.setattr("tools.voice_mode._import_audio",
                             lambda: (MagicMock(), MagicMock()))
+        # The scenario under test is "no bridge AND no PowerShell TTS
+        # fallback" -- without stubbing it, a Windows test host (where
+        # powershell.exe/ffmpeg exist) takes the notice branch instead of
+        # the hard block and the premise silently changes.
+        monkeypatch.setattr(
+            "tools.voice_mode._wsl_powershell_tts_available", lambda: False
+        )
 
         proc_version = tmp_path / "proc_version"
         proc_version.write_text("Linux 5.15.0-microsoft-standard-WSL2")
@@ -1413,7 +1510,11 @@ class TestWSL2PowerShellFallback:
             m.wait = MagicMock(return_value=m.returncode)
             return m
 
+        # WSL2 is Linux by definition: the product gates its fallback on
+        # platform.system() == "Linux", so simulating WSL2 on a Windows test
+        # host must simulate the platform too or the branch is dead.
         with patch("tools.voice_mode._is_wsl2_env", return_value=True), \
+             patch("tools.voice_mode.platform.system", return_value="Linux"), \
              patch("tools.voice_mode._import_audio", side_effect=ImportError), \
              patch("tools.voice_mode.shutil.which",
                    side_effect=lambda x: f"/bin/{x}" if x in ("powershell.exe", "ffmpeg", "ffplay", "sh") else (x if x.startswith("/") else None)), \
@@ -1465,7 +1566,12 @@ class TestWSL2PowerShellFallback:
                 return io.StringIO("Linux Microsoft WSL2")
             return open(path, *args, **kwargs)
 
+        # WSL2 is Linux by definition: simulate the platform too, and keep
+        # sounddevice out of the way so the run reaches the WSL2 temp-file
+        # pipeline under test.
         with patch("builtins.open", side_effect=_fake_open), \
+             patch("tools.voice_mode.platform.system", return_value="Linux"), \
+             patch("tools.voice_mode._import_audio", side_effect=ImportError), \
              patch("shutil.which", side_effect=lambda x: f"/bin/{x}" if x in ("powershell.exe", "ffmpeg", "ffplay") else None), \
              patch("subprocess.check_output", side_effect=_capture_check_output), \
              patch("subprocess.Popen", return_value=MagicMock(returncode=0, wait=lambda **k: 0)), \

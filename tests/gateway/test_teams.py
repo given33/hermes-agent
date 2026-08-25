@@ -385,6 +385,24 @@ class TestTeamsSend:
         assert result.message_id == "msg-123"
         mock_app.send.assert_awaited_once_with("conv-id", "Hello")
 
+    @pytest.mark.anyio
+    async def test_send_reports_success_after_all_chunks(self):
+        adapter = TeamsAdapter(_make_config(
+            client_id="id", client_secret="secret", tenant_id="tenant",
+        ))
+        mock_app = MagicMock()
+        mock_app.send = AsyncMock(side_effect=[
+            SimpleNamespace(id="msg-1"),
+            SimpleNamespace(id="msg-2"),
+        ])
+        adapter._app = mock_app
+
+        result = await adapter.send("conv-id", "x" * 5000)
+
+        assert result.success is True
+        assert result.message_id == "msg-2"
+        assert mock_app.send.await_count == 2
+
 
 def _make_summary_payload():
     return TeamsMeetingSummaryPayload(
@@ -747,5 +765,3 @@ class TestTeamsMediaAttachments:
         result = await adapter.send_document("19:abc@thread.v2", str(doc))
         assert result.success
         adapter._app.send.assert_awaited_once()
-
-

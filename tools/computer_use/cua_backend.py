@@ -43,6 +43,7 @@ import functools
 import json
 import logging
 import os
+import posixpath
 import re
 import shutil
 import subprocess
@@ -568,7 +569,11 @@ def _wsl_windows_path_to_posix(path: str) -> str:
     drive = (win.drive or "").rstrip(":").lower()
     if not drive:
         return path
-    return os.path.join("/mnt", drive, *(str(part) for part in win.parts[1:]))
+    # The result is consumed by a POSIX subprocess.  Use POSIX joining even
+    # when this helper is unit-tested from (or imported by) a Windows host;
+    # ``os.path.join`` would otherwise preserve backslashes and produce an
+    # invalid DrvFS command path.
+    return posixpath.join("/mnt", drive, *(str(part) for part in win.parts[1:]))
 
 
 class _EmbeddedCuaDaemon:

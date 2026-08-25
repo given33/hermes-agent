@@ -376,8 +376,10 @@ class TestGetProcessStartTime:
 
     def test_live_process_is_stable_int(self):
         import subprocess
+        import sys as _sys
         import time
-        p = subprocess.Popen(["sleep", "20"])
+        # Cross-platform live process (POSIX ``sleep`` is absent on Windows).
+        p = subprocess.Popen([_sys.executable, "-c", "import time; time.sleep(20)"])
         try:
             a = status._get_process_start_time(p.pid)
             time.sleep(0.2)
@@ -1036,6 +1038,11 @@ class TestPlannedStopMarker:
 class TestReadProcessCmdlinePsFallback:
     """Tests for _read_process_cmdline falling back to ps on non-Linux."""
 
+    @pytest.mark.skipif(
+        sys.platform == "win32",
+        reason="ps fallback is a POSIX contract — Windows has no /proc and no "
+        "ps binary by design; covered by the psutil twin below",
+    )
     def test_ps_fallback_when_proc_unavailable(self, monkeypatch):
         monkeypatch.setattr(status.Path, "read_bytes", lambda self: (_ for _ in ()).throw(FileNotFoundError))
         monkeypatch.setattr(
@@ -1045,6 +1052,14 @@ class TestReadProcessCmdlinePsFallback:
         result = status._read_process_cmdline(873)
         assert result == "/usr/libexec/bluetoothuserd"
 
+    @pytest.mark.windows_only
+    def test_psutil_fallback_when_proc_unavailable_windows(self):
+        """Windows twin for the lost ps-fallback coverage: on Windows there is
+        no /proc and no ``ps``, so _read_process_cmdline must resolve a real
+        process's command line through psutil (the documented Windows path)."""
+        result = status._read_process_cmdline(os.getpid())
+        assert result, "psutil fallback returned None for the live test process"
+        assert "python" in result.lower()
 
     def test_proc_cmdline_takes_priority_over_ps(self, monkeypatch):
         calls = []

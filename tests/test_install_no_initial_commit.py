@@ -13,10 +13,12 @@ re-clone fresh.
 
 from __future__ import annotations
 
+import os
 import re
 import shlex
 import shutil
 import subprocess
+import sys
 from pathlib import Path
 
 import pytest
@@ -25,9 +27,41 @@ REPO_ROOT = Path(__file__).resolve().parent.parent
 INSTALL_SH = REPO_ROOT / "scripts" / "install.sh"
 INSTALL_PS1 = REPO_ROOT / "scripts" / "install.ps1"
 
+
+def _working_bash() -> str | None:
+    """Locate a POSIX shell that can run extracted install.sh blocks.
+
+    On Windows, ``bash`` on PATH is frequently the WSL launcher stub
+    (``system32\\bash.exe``), which exits non-zero whenever WSL has no
+    installed distro -- so ``shutil.which('bash')`` alone proves nothing.
+    Validate candidates by executing them, preferring an explicit
+    Git-for-Windows installation over whatever PATH order says.
+    """
+    candidates: list[str] = []
+    if sys.platform == "win32":
+        pf = os.environ.get("ProgramFiles", "C:\\Program Files")
+        candidates.append(os.path.join(pf, "Git", "bin", "bash.exe"))
+        pf86 = os.environ.get("ProgramFiles(x86)")
+        if pf86:
+            candidates.append(os.path.join(pf86, "Git", "bin", "bash.exe"))
+    which_bash = shutil.which("bash")
+    if which_bash:
+        candidates.append(which_bash)
+    for cand in candidates:
+        try:
+            probe = subprocess.run([cand, "-c", ":"], capture_output=True, timeout=30)
+        except (OSError, subprocess.TimeoutExpired):
+            continue
+        if probe.returncode == 0:
+            return cand
+    return None
+
+
+_BASH = _working_bash()
+
 pytestmark = pytest.mark.skipif(
-    shutil.which("git") is None or shutil.which("bash") is None,
-    reason="needs git and bash",
+    shutil.which("git") is None or _BASH is None,
+    reason="needs git and a working bash",
 )
 
 
@@ -42,7 +76,7 @@ def _git(cwd: Path, *args: str) -> None:
 
 def _extract_no_commit_guard() -> str:
     """Pull the clone_repo() guard that drops a commit-less checkout."""
-    text = INSTALL_SH.read_text()
+    text = INSTALL_SH.read_text(encoding="utf-8")
     m = re.search(
         r'if \[ -d "\$INSTALL_DIR/\.git" \] && ! git -C "\$INSTALL_DIR" '
         r"rev-parse --verify HEAD.*?\n    fi",
@@ -60,7 +94,9 @@ def _run_guard(install_dir: Path) -> None:
         f"INSTALL_DIR={shlex.quote(str(install_dir))}\n"
         f"{block}\n"
     )
-    res = subprocess.run(["bash", "-c", script], capture_output=True, text=True)
+    res = subprocess.run(
+        [_BASH, "-c", script], capture_output=True, text=True, encoding="utf-8"
+    )
     assert res.returncode == 0, res.stderr
 
 
@@ -83,7 +119,10 @@ def test_install_sh_guard_moves_commitless_checkout_aside(tmp_path: Path) -> Non
     assert not install_dir.exists(), "commit-less checkout should be moved aside"
     backups = list(install_dir.parent.glob(install_dir.name + ".broken-*"))
     assert len(backups) == 1, "broken checkout should be moved to one backup dir"
-    assert (backups[0] / "leftover.txt").read_text() == "partial download"
+    assert (
+        (backups[0] / "leftover.txt").read_text(encoding="utf-8")
+        == "partial download"
+    )
 
 
 def test_install_sh_guard_keeps_repo_with_commits(tmp_path: Path) -> None:
@@ -116,7 +155,7 @@ def test_install_sh_guard_ignores_non_repo_dir(tmp_path: Path) -> None:
 
 def test_install_ps1_validity_requires_initial_commit() -> None:
     """The PowerShell repo-validity gate must also require a resolvable HEAD."""
-    text = INSTALL_PS1.read_text()
+    text = INSTALL_PS1.read_text(encoding="utf-8")
     assert "rev-parse --verify HEAD" in text, (
         "install.ps1 must probe for an initial commit (#40998)"
     )

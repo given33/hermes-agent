@@ -13,6 +13,10 @@ from __future__ import annotations
 
 import os
 import sys
+
+import pytest
+
+_IS_POSIX = sys.platform != "win32"
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -86,6 +90,7 @@ class TestApplyProfileOverrideHermesHomeGuard:
         )
 
 
+    @pytest.mark.skipif(not _IS_POSIX, reason="pwd module is POSIX-only")
     def test_sudo_explicit_profile_resolves_invoking_users_profile(self, tmp_path, monkeypatch):
         """sudo elias ... should resolve `-p elias` under SUDO_USER, not root."""
         root_home = tmp_path / "root"
@@ -126,6 +131,7 @@ class TestSupervisedChildIgnoresStickyProfile:
     """
 
 
+    @pytest.mark.skipif(not _IS_POSIX, reason="POSIX profile resolution")
     def test_non_supervised_run_still_follows_active_profile(
         self, tmp_path, monkeypatch
     ):
@@ -142,6 +148,7 @@ class TestSupervisedChildIgnoresStickyProfile:
         assert result is not None
         assert result.endswith("briefer")
 
+    @pytest.mark.skipif(not _IS_POSIX, reason="POSIX profile resolution")
     def test_supervised_named_profile_flag_still_wins(self, tmp_path, monkeypatch):
         """A supervised named-profile slot passes ``-p <name>`` explicitly;
         that must still resolve (the sentinel guard only skips the sticky
@@ -163,4 +170,3 @@ class TestSupervisedChildIgnoresStickyProfile:
         result = os.environ.get("HERMES_HOME")
         assert result is not None
         assert result.endswith("coder")
-

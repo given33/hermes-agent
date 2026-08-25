@@ -51,6 +51,7 @@ class TokenPrincipal:
     principal: str
     provider: str
     scopes: tuple[str, ...] = ()
+    account_generation: str = ""
 
 
 @dataclass(frozen=True)
@@ -183,6 +184,11 @@ class DashboardAuthProvider(ABC):
     # token-only credential (e.g. drain) is never offered a login. Mirrors
     # supports_token.
     supports_session: bool = True
+
+    # Whether an interactive session token may be reused as a native-app
+    # Authorization bearer. Password providers should set this to False when
+    # their access tokens are browser-only credentials.
+    supports_native_bearer: bool = True
 
     @abstractmethod
     def start_login(self, *, redirect_uri: str) -> LoginStart: ...

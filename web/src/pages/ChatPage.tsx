@@ -31,13 +31,15 @@ import { createPortal } from "react-dom";
 import { useSearchParams } from "react-router";
 
 import { ChatSidebar } from "@/components/ChatSidebar";
-import { ChatSessionList } from "@/components/ChatSessionList";
 import { usePageHeader } from "@/contexts/usePageHeader";
 import { useI18n } from "@/i18n";
 import { api } from "@/lib/api";
 import { latchChatActivation } from "@/lib/chat-activation";
+import { isDashboardEmbeddedChatEnabled } from "@/lib/dashboard-flags";
 import { copyTextToClipboard } from "@/lib/clipboard";
 import { normalizeSessionTitle } from "@/lib/chat-title";
+
+const PENDING_UNIFIED_SESSION_KEY = "hermes.pendingUnifiedSession";
 import { createPtyCompositionForwarder } from "@/lib/pty-composition";
 import { PtyResumeSanitizer } from "@/lib/pty-resume-sanitizer";
 import {
@@ -353,6 +355,45 @@ export default function ChatPage({ isActive = true }: { isActive?: boolean }) {
   // treat the current resume target as part of the PTY identity and rebuild the
   // terminal session when it changes.
   const resumeParam = searchParams.get("resume");
+  const unifiedChatActive = isDashboardEmbeddedChatEnabled();
+
+  useEffect(() => {
+    if (!unifiedChatActive) return;
+
+    const resumeUnifiedSession = (sessionId: string) => {
+      const normalized = String(sessionId || "").trim();
+      if (!normalized) return;
+      const next = new URLSearchParams(searchParams);
+      next.set("resume", normalized);
+      setSearchParams(next, { replace: true });
+    };
+    const onResumeUnifiedSession = (event: Event) => {
+      const sessionId = (event as CustomEvent<{ sessionId?: string }>).detail
+        ?.sessionId;
+      if (sessionId) resumeUnifiedSession(sessionId);
+    };
+
+    window.addEventListener(
+      "hermes:resume-unified-session",
+      onResumeUnifiedSession,
+    );
+    try {
+      const pending = window.sessionStorage.getItem(
+        PENDING_UNIFIED_SESSION_KEY,
+      );
+      if (pending && !resumeParam) {
+        window.sessionStorage.removeItem(PENDING_UNIFIED_SESSION_KEY);
+        resumeUnifiedSession(pending);
+      }
+    } catch {
+      // Storage can be unavailable in private browsing; route events still work.
+    }
+    return () =>
+      window.removeEventListener(
+        "hermes:resume-unified-session",
+        onResumeUnifiedSession,
+      );
+  }, [resumeParam, searchParams, setSearchParams, unifiedChatActive]);
   // Profile-scoped chat: spawn the PTY under the globally selected
   // management profile. Changing it remounts the terminal (key below /
   // effect dep) so the user explicitly starts a fresh scoped session.
@@ -1753,16 +1794,13 @@ export default function ChatPage({ isActive = true }: { isActive?: boolean }) {
               <ChatSidebar
                 channel={channel}
                 profile={scopedProfile}
+                activeSessionId={resumeParam}
+                onSessionPicked={closeMobilePanel}
+                onNewChat={startFreshDashboardChat}
                 onDashboardNewSessionRequest={startFreshDashboardChat}
                 onSessionTitleChange={handleSessionTitleChange}
               />
             </div>
-            <ChatSessionList
-              activeSessionId={resumeParam}
-              profile={scopedProfile}
-              onPicked={closeMobilePanel}
-              onNewChat={startFreshDashboardChat}
-            />
           </div>
         </div>
       </>,
@@ -1925,17 +1963,10 @@ export default function ChatPage({ isActive = true }: { isActive?: boolean }) {
               <ChatSidebar
                 channel={channel}
                 profile={scopedProfile}
+                activeSessionId={resumeParam}
+                onNewChat={startFreshDashboardChat}
                 onDashboardNewSessionRequest={startFreshDashboardChat}
                 onSessionTitleChange={handleSessionTitleChange}
-              />
-            </div>
-
-            {/* Session switcher fills the remaining height below the model box. */}
-            <div className="min-h-0 flex-1 overflow-hidden">
-              <ChatSessionList
-                activeSessionId={resumeParam}
-                profile={scopedProfile}
-                onNewChat={startFreshDashboardChat}
               />
             </div>
           </div>

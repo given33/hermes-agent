@@ -20,6 +20,11 @@ import pytest
 import tools.terminal_tool as tt
 from tools.environments.local import LocalEnvironment
 
+pytestmark = pytest.mark.skipif(
+    __import__("sys").platform == "win32",
+    reason="bash cd with Windows backslash paths mangles the path",
+)
+
 
 @pytest.fixture(autouse=True)
 def _clean_store(monkeypatch):

@@ -20,9 +20,12 @@ from typing import Any
 import zipfile
 
 try:
-    from mcp.server.fastmcp import FastMCP
-except ImportError:  # pragma: no cover
-    FastMCP = None  # type: ignore[assignment,misc]
+    from mcp.server import MCPServer as FastMCP
+except ImportError:  # pragma: no cover - MCP 1.x compatibility
+    try:
+        from mcp.server.fastmcp import FastMCP
+    except ImportError:  # pragma: no cover
+        FastMCP = None  # type: ignore[assignment,misc]
 
 
 PROVIDER_ID = "rea-local-readonly"

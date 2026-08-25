@@ -17,6 +17,12 @@ import pytest
 import hermes_cli.gateway as gateway_cli
 
 
+# These cases exercise Linux user-systemd ownership and /run/user semantics.
+# Running them on native Windows only produces harness failures because
+# os.getuid and the Linux runtime hierarchy do not exist there.
+pytestmark = pytest.mark.linux_only
+
+
 def _eacces(self):
     raise PermissionError(13, "Permission denied", str(self))
 

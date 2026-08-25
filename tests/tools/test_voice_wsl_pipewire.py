@@ -10,6 +10,13 @@ import builtins
 import io
 from unittest.mock import MagicMock
 
+import pytest
+
+pytestmark = pytest.mark.skipif(
+    __import__("sys").platform == "win32",
+    reason="WSL /proc/version detection requires POSIX host",
+)
+
 WSL = "Linux version 5.15.0-microsoft-standard-WSL2 (oe-user@oe-host)"
 
 

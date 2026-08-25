@@ -9,8 +9,18 @@ Covers:
 import time
 from unittest.mock import MagicMock, patch
 
+import pytest
 
 from hermes_cli.main import _session_browse_picker
+
+# The curses picker can only be simulated where a curses implementation is
+# importable (CPython's stdlib curses has no native Windows backend). The
+# fallback-mode tests above already cover the no-curses path on every host.
+try:
+    import curses as _curses  # noqa: F401
+    _HAS_CURSES = True
+except ImportError:
+    _HAS_CURSES = False
 
 
 # ─── Sample session data ──────────────────────────────────────────────────────
@@ -95,6 +105,11 @@ class TestSessionBrowsePicker:
 
 # ─── Curses-based picker (mocked curses) ────────────────────────────────────
 
+
+@pytest.mark.skipif(
+    not _HAS_CURSES,
+    reason="curses is not importable on this platform (no stdlib curses on Windows)",
+)
 class TestCursesBrowse:
     """Tests for the curses-based interactive picker via simulated key sequences."""
 

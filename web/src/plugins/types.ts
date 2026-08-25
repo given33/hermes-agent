@@ -18,7 +18,7 @@ export interface PluginManifest {
     hidden?: boolean;
   };
   /** Declared for discovery; actual slots use registerSlot in the plugin bundle. */
-  slots?: string[];
+  slots: string[];
   entry: string;
   css?: string | null;
   has_api: boolean;

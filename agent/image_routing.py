@@ -46,6 +46,8 @@ import re
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
+from hermes_constants import expand_user_path
+
 logger = logging.getLogger(__name__)
 
 
@@ -66,7 +68,13 @@ _IMAGE_EXT_PATTERN = "|".join(e.lstrip(".") for e in _IMAGE_EXTS)
 # extract_local_files() uses: anchors to ``~/`` or ``/``, ignores matches inside
 # URLs (the ``(?<![/:\w.])`` lookbehind), and case-insensitive on the extension.
 _LOCAL_IMAGE_PATH_RE = re.compile(
-    r"(?<![/:\w.])(?:~/|/)(?:[\w.\-]+/)*[\w.\-]+\.(?:" + _IMAGE_EXT_PATTERN + r")\b",
+    # Keep path matching permissive and let the filesystem check below be the
+    # oracle. This supports spaces and native Windows drive separators while
+    # the prefix guard still excludes URLs and relative examples.
+    r"(?<![/\\:\w.])(?:~/|/|[A-Za-z]:[\\/])"
+    r"(?:[^<>\"'\r\n]+?[\\/])*[^<>\"'\r\n]+?\.(?:"
+    + _IMAGE_EXT_PATTERN
+    + r")\b",
     re.IGNORECASE,
 )
 
@@ -119,7 +127,11 @@ def extract_image_refs(text: str) -> Tuple[List[str], List[str]]:
         if _in_code(match.start()):
             continue
         raw = match.group(0)
-        expanded = os.path.expanduser(raw)
+        # ``expand_user_path`` intentionally preserves the caller's slash
+        # style, but a Windows HOME override plus a POSIX ``~/`` token can
+        # produce a mixed path (``C:\\.../foo.png``). Normalize before both
+        # filesystem validation and returning the path to downstream tools.
+        expanded = os.path.normpath(expand_user_path(raw))
         try:
             if not os.path.isfile(expanded):
                 continue

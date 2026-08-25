@@ -243,7 +243,140 @@ def _discover_files(roots: List[Path]) -> List[Path]:
     return sorted(out)
 
 
-def _kill_tree(proc: "subprocess.Popen", pgid: int | None = None) -> None:
+class _WindowsProcessTreeJob:
+    """Kill-on-close Job Object owning one per-file pytest subprocess tree.
+
+    The Windows analog of the POSIX process group captured as ``pgid``:
+    every descendant the pytest worker spawns after assignment joins the
+    job automatically, so a single ``TerminateJobObject`` reaps the whole
+    tree — including grandchildren orphaned by an already-reaped worker.
+    ``taskkill /F /T /PID`` cannot do that: it anchors on the root PID,
+    and by the time the happy path cleans up, the root has been reaped,
+    so the tool errors "process not found" and nothing dies (observed:
+    a sleep(600) test grandchild outlived the runner).
+
+    Modeled on ``hermes_services/tool_isolation.py::_WindowsJob``;
+    duplicated rather than imported because this runner must stay
+    importable with nothing but the stdlib — it runs against checkouts
+    whose product code may itself be mid-breakage.
+    """
+
+    _JOB_OBJECT_EXTENDED_LIMIT_INFORMATION = 9
+    _JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE = 0x00002000
+
+    def __init__(self) -> None:
+        import ctypes
+        from ctypes import wintypes
+
+        class _IO_COUNTERS(ctypes.Structure):
+            _fields_ = [
+                ("ReadOperationCount", ctypes.c_uint64),
+                ("WriteOperationCount", ctypes.c_uint64),
+                ("OtherOperationCount", ctypes.c_uint64),
+                ("ReadTransferCount", ctypes.c_uint64),
+                ("WriteTransferCount", ctypes.c_uint64),
+                ("OtherTransferCount", ctypes.c_uint64),
+            ]
+
+        class _BASIC_LIMIT_INFORMATION(ctypes.Structure):
+            _fields_ = [
+                ("PerProcessUserTimeLimit", ctypes.c_int64),
+                ("PerJobUserTimeLimit", ctypes.c_int64),
+                ("LimitFlags", wintypes.DWORD),
+                ("MinimumWorkingSetSize", ctypes.c_size_t),
+                ("MaximumWorkingSetSize", ctypes.c_size_t),
+                ("ActiveProcessLimit", wintypes.DWORD),
+                ("Affinity", ctypes.c_size_t),
+                ("PriorityClass", wintypes.DWORD),
+                ("SchedulingClass", wintypes.DWORD),
+            ]
+
+        class _EXTENDED_LIMIT_INFORMATION(ctypes.Structure):
+            _fields_ = [
+                ("BasicLimitInformation", _BASIC_LIMIT_INFORMATION),
+                ("IoInfo", _IO_COUNTERS),
+                ("ProcessMemoryLimit", ctypes.c_size_t),
+                ("JobMemoryLimit", ctypes.c_size_t),
+                ("PeakProcessMemoryUsed", ctypes.c_size_t),
+                ("PeakJobMemoryUsed", ctypes.c_size_t),
+            ]
+
+        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        # argtypes are load-bearing on win64: without them ctypes passes
+        # HANDLEs as default c_int and truncates.
+        kernel32.CreateJobObjectW.argtypes = (ctypes.c_void_p, wintypes.LPCWSTR)
+        kernel32.CreateJobObjectW.restype = wintypes.HANDLE
+        kernel32.SetInformationJobObject.argtypes = (
+            wintypes.HANDLE, ctypes.c_int, ctypes.c_void_p, wintypes.DWORD,
+        )
+        kernel32.SetInformationJobObject.restype = wintypes.BOOL
+        kernel32.AssignProcessToJobObject.argtypes = (
+            wintypes.HANDLE, wintypes.HANDLE,
+        )
+        kernel32.AssignProcessToJobObject.restype = wintypes.BOOL
+        kernel32.TerminateJobObject.argtypes = (wintypes.HANDLE, wintypes.UINT)
+        kernel32.TerminateJobObject.restype = wintypes.BOOL
+        kernel32.OpenProcess.argtypes = (
+            wintypes.DWORD, wintypes.BOOL, wintypes.DWORD,
+        )
+        kernel32.OpenProcess.restype = wintypes.HANDLE
+        kernel32.CloseHandle.argtypes = (wintypes.HANDLE,)
+        kernel32.CloseHandle.restype = wintypes.BOOL
+        self._kernel32 = kernel32
+
+        self._handle = kernel32.CreateJobObjectW(None, None)
+        if not self._handle:
+            raise ctypes.WinError(ctypes.get_last_error())
+        limits = _EXTENDED_LIMIT_INFORMATION()
+        limits.BasicLimitInformation.LimitFlags = (
+            self._JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE
+        )
+        if not kernel32.SetInformationJobObject(
+            self._handle,
+            self._JOB_OBJECT_EXTENDED_LIMIT_INFORMATION,
+            ctypes.byref(limits),
+            ctypes.sizeof(limits),
+        ):
+            error = ctypes.get_last_error()
+            self.close()
+            raise ctypes.WinError(error)
+
+    def assign_pid(self, pid: int) -> None:
+        """Put the freshly-spawned worker (by pid) into the job."""
+        _PROCESS_TERMINATE = 0x0001
+        _PROCESS_SET_QUOTA = 0x0100
+        _PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
+        process_handle = self._kernel32.OpenProcess(
+            _PROCESS_TERMINATE | _PROCESS_SET_QUOTA
+            | _PROCESS_QUERY_LIMITED_INFORMATION,
+            False,
+            pid,
+        )
+        if not process_handle:
+            raise ctypes.WinError(ctypes.get_last_error())
+        try:
+            if not self._kernel32.AssignProcessToJobObject(
+                self._handle, process_handle
+            ):
+                raise ctypes.WinError(ctypes.get_last_error())
+        finally:
+            self._kernel32.CloseHandle(process_handle)
+
+    def terminate(self) -> None:
+        if self._handle:
+            self._kernel32.TerminateJobObject(self._handle, 1)
+
+    def close(self) -> None:
+        if self._handle:
+            self._kernel32.CloseHandle(self._handle)
+            self._handle = None
+
+
+def _kill_tree(
+    proc: "subprocess.Popen",
+    pgid: int | None = None,
+    job: "object | None" = None,
+) -> None:
     """Kill the pytest subprocess and every descendant it spawned.
 
     A test run can spin up uvicorn servers, async runtimes, or other
@@ -260,8 +393,12 @@ def _kill_tree(proc: "subprocess.Popen", pgid: int | None = None) -> None:
     the group are still alive. SIGKILL'ing the captured pgid takes out
     everything in that group atomically.
 
-    Windows: ``taskkill /F /T /PID`` walks the recorded ppid chain and
-    terminates the whole tree, even when the root has already exited.
+    Windows: the assigned Job Object (``job``) is primary — one
+    TerminateJobObject reaps every descendant, even after the worker has
+    exited and been reaped. ``taskkill /F /T /PID`` stays only as the
+    degraded-mode fallback (when job assignment was refused): it anchors
+    on the root PID, so once that root is reaped it reports "process not
+    found" and kills nothing.
 
     Why not psutil: psutil walks the parent-child tree, but in the
     happy path the root has already been reaped so ``psutil.Process(pid)``
@@ -274,6 +411,11 @@ def _kill_tree(proc: "subprocess.Popen", pgid: int | None = None) -> None:
         return
 
     if sys.platform == "win32":
+        if job is not None:
+            try:
+                job.terminate()
+            except OSError:
+                pass
         try:
             
             subprocess.run(
@@ -363,6 +505,18 @@ def _run_one_file(
     return file, rc, output, summary, subproc_wall
 
 
+def _job_debug_log(msg: str) -> None:
+    # TEMPORARY diagnostics — removed once the win32 leak probe is green.
+    try:
+        import tempfile as _tf
+        with open(
+            Path(_tf.gettempdir()) / "hermes-job-debug.log", "a", encoding="utf-8"
+        ) as _fh:
+            _fh.write(f"{time.strftime('%H:%M:%S')} {msg}\n")
+    except Exception:
+        pass
+
+
 # Files that failed once and passed on retry, with both attempts' output.
 # Keeping the traceback is load-bearing: a self-healed flake without its
 # failing assertion is only a filename, which forces another expensive full
@@ -407,11 +561,32 @@ def _run_one_file_once(
         except (ProcessLookupError, PermissionError):
             pgid = None
 
+    # Windows: own this file's whole process tree in a kill-on-close Job
+    # Object, assigned BEFORE the worker can spawn anything. Descendants
+    # inherit membership, so one TerminateJobObject reaps them all even
+    # after the worker itself has been reaped (the exact case taskkill
+    # cannot handle). Degrades to the legacy taskkill path on refusal.
+    job = None
+    if sys.platform == "win32":
+        candidate = None
+        try:
+            candidate = _WindowsProcessTreeJob()
+            candidate.assign_pid(proc.pid)
+            job = candidate
+            _job_debug_log(f"assigned pid={proc.pid}")
+        except Exception as _e:
+            _job_debug_log(f"DEGRADED pid={proc.pid}: {_e!r}")
+            try:
+                if candidate is not None:
+                    candidate.close()
+            except Exception:
+                pass
+
     try:
         output, _ = proc.communicate(timeout=file_timeout)
         rc = proc.returncode
     except subprocess.TimeoutExpired:
-        _kill_tree(proc, pgid=pgid)
+        _kill_tree(proc, pgid=pgid, job=job)
         try:
             output, _ = proc.communicate(timeout=10)
         except subprocess.TimeoutExpired:
@@ -424,14 +599,23 @@ def _run_one_file_once(
     except BaseException:
         # KeyboardInterrupt / runner crash — make sure no zombie
         # grandchildren outlive us.
-        _kill_tree(proc, pgid=pgid)
+        _kill_tree(proc, pgid=pgid, job=job)
         raise
     else:
         # Happy path: pytest exited on its own. Kill the group anyway in
         # case it left grandchildren behind; already-dead is a no-op.
-        _kill_tree(proc, pgid=pgid)
+        _kill_tree(proc, pgid=pgid, job=job)
 
         output +=  "\n"
+    finally:
+        # KILL_ON_JOB_CLOSE makes this its own safety net (closing also
+        # terminates anything still inside), so no tree can leak even if
+        # terminate() itself was skipped.
+        if job is not None:
+            try:
+                job.close()
+            except Exception:
+                pass
 
     if rc == 5:
         # No tests collected in THIS file — legitimate per-file: a

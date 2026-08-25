@@ -64,7 +64,9 @@ import json
 import logging
 import os
 import secrets
+import sqlite3
 import time
+from pathlib import Path
 from typing import Any, Optional
 
 from hermes_cli.dashboard_auth import (
@@ -204,6 +206,10 @@ class BasicAuthProvider(DashboardAuthProvider):
     name = "basic"
     display_name = "Username & Password"
     supports_password = True
+    # Password sessions are browser credentials.  They are deliberately not
+    # accepted as native-app Authorization bearers; mobile API sessions use
+    # the owner-mobile provider and its device-bound token store.
+    supports_native_bearer = False
 
     def __init__(
         self,
@@ -212,6 +218,7 @@ class BasicAuthProvider(DashboardAuthProvider):
         password_hash: str,
         secret: bytes,
         ttl_seconds: int = _DEFAULT_TTL_SECONDS,
+        revocation_state_dir: "str | os.PathLike[str] | None" = None,
     ) -> None:
         if not username:
             raise ValueError("username must be non-empty")
@@ -223,6 +230,13 @@ class BasicAuthProvider(DashboardAuthProvider):
         self._password_hash = password_hash
         self._secret = secret
         self._ttl = max(60, int(ttl_seconds))
+        if revocation_state_dir is not None:
+            state_dir = Path(revocation_state_dir)
+        else:
+            from hermes_constants import get_hermes_home
+
+            state_dir = get_hermes_home() / "dashboard-auth"
+        self._revocations_path = state_dir / "basic-refresh-revocations.db"
 
     # ---- OAuth methods: not used (pure-password provider) ------------------
 
@@ -278,15 +292,44 @@ class BasicAuthProvider(DashboardAuthProvider):
             payload is None
             or payload.get("kind") != "refresh"
             or payload.get("exp", 0) <= int(time.time())
+            or self._refresh_is_revoked(refresh_token, payload)
         ):
             raise RefreshExpiredError("refresh token expired or invalid")
         return self._mint_session(str(payload.get("sub", self._username)))
 
     def revoke_session(self, *, refresh_token: str) -> None:
-        # Stateless tokens — nothing to revoke server-side. The session
-        # expires within its TTL. Best-effort no-op, must not raise.
-        _ = refresh_token
-        return None
+        """Persistently revoke one refresh token until its natural expiry."""
+        try:
+            payload = _unsign(refresh_token, self._secret)
+            if payload is None or payload.get("kind") != "refresh":
+                return
+            self._revocations_path.parent.mkdir(parents=True, exist_ok=True)
+            expires_at = max(0, int(payload.get("exp") or 0))
+            with sqlite3.connect(
+                self._revocations_path, timeout=5.0
+            ) as db:
+                db.execute("PRAGMA busy_timeout=5000")
+                db.execute("""
+                    CREATE TABLE IF NOT EXISTS revoked_refresh_tokens (
+                        token_key TEXT PRIMARY KEY,
+                        expires_at INTEGER NOT NULL
+                    )
+                """)
+                db.executemany(
+                    "INSERT OR IGNORE INTO revoked_refresh_tokens "
+                    "(token_key, expires_at) VALUES (?, ?)",
+                    [(key, expires_at) for key in self._refresh_token_keys(refresh_token, payload)],
+                )
+                db.execute(
+                    "DELETE FROM revoked_refresh_tokens WHERE expires_at <= ?",
+                    (int(time.time()),),
+                )
+                db.commit()
+        except Exception:
+            # Logout must still clear cookies if the local revocation store is
+            # temporarily unavailable; refresh will fail closed on a signed but
+            # unverifiable store only when the check can read an explicit row.
+            logger.debug("Could not persist basic-auth refresh revocation", exc_info=True)
 
     # ---- internals ---------------------------------------------------------
 
@@ -297,7 +340,12 @@ class BasicAuthProvider(DashboardAuthProvider):
             {"sub": user_id, "kind": "access", "exp": exp}, self._secret
         )
         refresh_token = _sign(
-            {"sub": user_id, "kind": "refresh", "exp": now + _REFRESH_TTL_SECONDS},
+            {
+                "sub": user_id,
+                "kind": "refresh",
+                "exp": now + _REFRESH_TTL_SECONDS,
+                "jti": secrets.token_urlsafe(24),
+            },
             self._secret,
         )
         return Session(
@@ -310,6 +358,38 @@ class BasicAuthProvider(DashboardAuthProvider):
             access_token=access_token,
             refresh_token=refresh_token,
         )
+
+    def _refresh_token_keys(self, refresh_token: str, payload: dict) -> list[str]:
+        token_hash = hashlib.sha256(refresh_token.encode("utf-8")).hexdigest()
+        keys = [f"hash:{token_hash}"]
+        jti = str(payload.get("jti") or "").strip()
+        if jti:
+            keys.append(f"jti:{jti}")
+        return keys
+
+    def _refresh_is_revoked(self, refresh_token: str, payload: dict) -> bool:
+        """Fail closed when the persistent revocation store cannot be read."""
+        try:
+            if not self._revocations_path.exists():
+                return False
+            with sqlite3.connect(self._revocations_path, timeout=5.0) as db:
+                db.execute("PRAGMA busy_timeout=5000")
+                try:
+                    rows = db.execute(
+                        "SELECT 1 FROM revoked_refresh_tokens "
+                        "WHERE token_key IN (%s) AND expires_at > ? LIMIT 1"
+                        % ",".join("?" for _ in self._refresh_token_keys(refresh_token, payload)),
+                        (*self._refresh_token_keys(refresh_token, payload), int(time.time())),
+                    ).fetchall()
+                except sqlite3.OperationalError as exc:
+                    # A missing table means no token has been revoked yet.
+                    if "no such table" in str(exc).lower():
+                        return False
+                    raise
+                return bool(rows)
+        except Exception:
+            logger.exception("Unable to verify basic-auth refresh revocation state")
+            return True
 
     def _session_from_payload(
         self, access_token: str, refresh_token: str, payload: dict

@@ -3606,7 +3606,23 @@ class SessionStore:
             while session_id in reroutes and session_id not in seen:
                 seen.add(session_id)
                 session_id = reroutes[session_id]
-            self._append_to_transcript_serialized(session_id, message)
+            # Serialize writers per durable session before they both snapshot
+        # queue[0]. The global retry lock stays short so unrelated sessions
+        # can continue appending concurrently.
+            session_lock = self._transcript_session_lock(session_id)
+            with session_lock:
+                self._append_to_transcript_serialized(session_id, message)
+
+    def _transcript_session_lock(self, session_id: str) -> threading.RLock:
+        locks = getattr(self, "_transcript_session_locks", None)
+        if locks is None:
+            locks = {}
+            self._transcript_session_locks = locks
+        lock = locks.get(session_id)
+        if lock is None:
+            lock = threading.RLock()
+            locks[session_id] = lock
+        return lock
 
     def _append_to_transcript_serialized(
         self, session_id: str, message: Dict[str, Any]

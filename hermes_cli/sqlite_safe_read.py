@@ -334,7 +334,15 @@ def file_length_matches_header(conn: sqlite3.Connection) -> Optional[bool]:
     if path_str is None:
         return None
 
-    logical = page_count_bytes(conn)
+    # A migration-time invariant must never stall the hosted worker behind an
+    # unrelated background opener. Keep the check when the database is quiet;
+    # skip it (advisory failure) when SQLite cannot get a short read lock.
+    previous_timeout = conn.execute("PRAGMA busy_timeout").fetchone()[0]
+    conn.execute("PRAGMA busy_timeout=100")
+    try:
+        logical = page_count_bytes(conn)
+    finally:
+        conn.execute(f"PRAGMA busy_timeout={int(previous_timeout)}")
     if not logical:
         return None
     try:

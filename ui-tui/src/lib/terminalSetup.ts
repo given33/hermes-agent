@@ -1,6 +1,5 @@
 import { copyFile, mkdir, readFile, writeFile } from 'node:fs/promises'
 import { homedir } from 'node:os'
-import { join } from 'node:path'
 
 export type SupportedTerminal = 'cursor' | 'vscode' | 'windsurf'
 
@@ -25,6 +24,14 @@ export type TerminalSetupResult = {
 }
 
 const DEFAULT_FILE_OPS: FileOps = { copyFile, mkdir, readFile, writeFile }
+
+function joinForPlatform(_platform: NodeJS.Platform, ...parts: string[]): string {
+  // Node's path.join always uses the host OS separator. Terminal setup is
+  // also called with a simulated platform by diagnostics/tests, so keep the
+  // slash-separated VS Code path contract stable on every host.
+  return parts.filter(part => part.length > 0).join('/')
+}
+
 const COPY_SEQUENCE = '\u001b[99;13u'
 // Kitty keyboard protocol CSI u sequences for modified Enter keys.
 // Codepoint 13 = Enter; modifier encoding: 1 + (shift?1:0) + (alt?2:0) + (ctrl?4:0) + (super?8:0).
@@ -215,14 +222,14 @@ export function getVSCodeStyleConfigDir(
   homeDir: string = homedir()
 ): null | string {
   if (platform === 'darwin') {
-    return join(homeDir, 'Library', 'Application Support', appName, 'User')
+    return joinForPlatform(platform, homeDir, 'Library', 'Application Support', appName, 'User')
   }
 
   if (platform === 'win32') {
-    return env['APPDATA'] ? join(env['APPDATA'], appName, 'User') : null
+    return env['APPDATA'] ? joinForPlatform(platform, env['APPDATA'], appName, 'User') : null
   }
 
-  return join(homeDir, '.config', appName, 'User')
+  return joinForPlatform(platform, homeDir, '.config', appName, 'User')
 }
 
 function isKeybinding(value: unknown): value is Keybinding {
@@ -353,7 +360,7 @@ export async function configureTerminalKeybindings(
     }
   }
 
-  const keybindingsFile = join(configDir, 'keybindings.json')
+    const keybindingsFile = joinForPlatform(platform, configDir, 'keybindings.json')
 
   try {
     await ops.mkdir(configDir, { recursive: true })
@@ -489,7 +496,11 @@ export async function shouldPromptForTerminalSetup(options?: {
   }
 
   try {
-    const content = await ops.readFile(join(configDir, 'keybindings.json'), 'utf8')
+    const content = await ops.readFile(
+      joinForPlatform(platform, configDir, 'keybindings.json'),
+      'utf8'
+    )
+
     const parsed: unknown = JSON.parse(stripJsonComments(content))
 
     if (!Array.isArray(parsed)) {

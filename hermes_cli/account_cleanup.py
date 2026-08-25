@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import logging
+import os
 from pathlib import Path
 from typing import Any
 
@@ -12,6 +14,7 @@ from utils import fast_safe_load
 
 
 _MODEL_CONFIG_SECTIONS = ("model", "fallback_model", "auxiliary")
+logger = logging.getLogger(__name__)
 
 
 def _account_cleanup_plugins():
@@ -56,28 +59,39 @@ def purge_account_owned_cloud_data(
     normalized = str(owner_id or "").strip()
     if not normalized:
         raise ValueError("owner_id is required")
-    generation = str(account_generation or "").strip()
-    if not generation:
-        from hermes_cli.dashboard_auth.mobile_device_store import MobileDeviceStore
+    # Registration and deletion both commit account-owned state under this
+    # guard.  Without the same cross-process boundary, an old-generation
+    # cleanup can pass its read-only fence and replace a new generation's
+    # config between the check and atomic write.
+    from hermes_cli.account_lifecycle import account_lifecycle_commit_guard
 
-        generation = MobileDeviceStore().account_generation(normalized, create=False)
-    if not generation:
-        raise RuntimeError("active account generation is unavailable for deletion")
+    with account_lifecycle_commit_guard():
+        if _is_link_like_path(Path(get_hermes_home())):
+            raise RuntimeError(
+                "refusing account cleanup for link-like HERMES_HOME"
+            )
+        generation = str(account_generation or "").strip()
+        if not generation:
+            from hermes_cli.dashboard_auth.mobile_device_store import MobileDeviceStore
 
-    return {
-        "collaboration": _account_cleanup_plugins().plugin_api.delete_owner_account_data(
-            normalized,
-            account_generation=generation,
-        ),
-        "models": purge_owner_model_configuration(
-            normalized,
-            account_generation=generation,
-        ),
-        "operational": purge_owner_operational_state(
-            normalized,
-            account_generation=generation,
-        ),
-    }
+            generation = MobileDeviceStore().account_generation(normalized, create=False)
+        if not generation:
+            raise RuntimeError("active account generation is unavailable for deletion")
+
+        return {
+            "collaboration": _account_cleanup_plugins().plugin_api.delete_owner_account_data(
+                normalized,
+                account_generation=generation,
+            ),
+            "models": purge_owner_model_configuration(
+                normalized,
+                account_generation=generation,
+            ),
+            "operational": purge_owner_operational_state(
+                normalized,
+                account_generation=generation,
+            ),
+        }
 
 
 def _cleanup_generation_is_current(owner_id: str, account_generation: str) -> bool:
@@ -102,6 +116,161 @@ def _cleanup_generation_is_current(owner_id: str, account_generation: str) -> bo
     return active == generation
 
 
+def _is_link_like_path(path: Path) -> bool:
+    """Return true for symlink/junction roots; errors fail closed."""
+    try:
+        if path.is_symlink():
+            return True
+        # WSL bind mounts and POSIX mount points are not symlinks, but a
+        # profile root crossing one is still outside the managed tree's
+        # ownership proof.  Refuse it before opening any account database.
+        if os.path.ismount(os.fspath(path)):
+            return True
+        lexical = Path(os.path.abspath(path))
+        resolved = path.resolve()
+        if os.name == "nt":
+            return os.path.normcase(os.path.realpath(path)) != os.path.normcase(
+                str(path)
+            )
+        return resolved != lexical
+    except OSError:
+        return True
+
+
+def _crosses_nested_mount(path: Path, boundary: Path) -> bool:
+    """Return true when *path* crosses a mount below an owned boundary."""
+    current = Path(os.path.abspath(os.fspath(path)))
+    boundary_abs = Path(os.path.abspath(os.fspath(boundary)))
+    boundary_key = os.path.normcase(str(boundary_abs))
+    while os.path.normcase(str(current)) != boundary_key:
+        try:
+            if os.path.ismount(os.fspath(current)):
+                return True
+        except OSError:
+            return True
+        parent = current.parent
+        if parent == current:
+            break
+        current = parent
+    return False
+
+
+def _validated_profile_roots() -> list[tuple[Path, str]]:
+    """Return only profile roots within the managed profile layout.
+
+    ``list_profiles`` normally returns ``HERMES_HOME`` and
+    ``HERMES_HOME/profiles/<name>``.  A symlinked profile entry can otherwise
+    resolve outside that layout and make account cleanup rewrite an unrelated
+    user's config or databases.
+    """
+    active_root_path = Path(get_hermes_home())
+    if _is_link_like_path(active_root_path):
+        logger.warning(
+            "account cleanup: refusing link-like HERMES_HOME %s",
+            active_root_path,
+        )
+        return []
+    active_root = active_root_path.resolve()
+    profiles = list_profiles()
+    default_root: Path | None = None
+    for profile in profiles:
+        if not bool(getattr(profile, "is_default", False)):
+            continue
+        candidate = Path(profile.path)
+        if _is_link_like_path(candidate):
+            continue
+        try:
+            default_root = candidate.resolve()
+        except OSError:
+            continue
+        break
+
+    named_root = default_root / "profiles" if default_root is not None else None
+    named_root_link = (
+        named_root is not None and _is_link_like_path(named_root)
+    )
+    layout_root_allowed = False
+    if default_root is not None and not named_root_link:
+        if default_root == active_root:
+            layout_root_allowed = True
+        else:
+            try:
+                active_relative = active_root.relative_to(named_root)
+                # A named active profile proves that this default root is the
+                # same managed profile layout.  Do not accept an arbitrary
+                # ``is_default`` row supplied by mutable profile metadata.
+                layout_root_allowed = len(active_relative.parts) == 1
+            except (ValueError, OSError):
+                pass
+    roots: list[tuple[Path, str]] = []
+    visited: set[Path] = set()
+
+    for profile in profiles:
+        candidate = Path(profile.path)
+        if _is_link_like_path(candidate):
+            logger.warning("account cleanup: skipping linked profile root %s", candidate)
+            continue
+        try:
+            resolved = candidate.resolve()
+        except OSError:
+            logger.warning("account cleanup: skipping unresolved profile root %s", candidate)
+            continue
+        if _crosses_nested_mount(resolved, active_root) or (
+            default_root is not None
+            and _crosses_nested_mount(resolved, default_root)
+        ):
+            logger.warning("account cleanup: skipping mounted profile root %s", candidate)
+            continue
+
+        is_default = bool(getattr(profile, "is_default", False))
+        is_named_child = False
+        if named_root is not None and not named_root_link:
+            try:
+                relative = resolved.relative_to(named_root.resolve())
+                is_named_child = len(relative.parts) == 1
+            except (ValueError, OSError):
+                pass
+
+        if not (
+            resolved == active_root
+            or (
+                layout_root_allowed
+                and is_default
+                and default_root is not None
+                and resolved == default_root
+            )
+            or (layout_root_allowed and is_named_child)
+        ):
+            logger.warning("account cleanup: skipping out-of-layout profile root %s", candidate)
+            continue
+        if resolved in visited:
+            continue
+        visited.add(resolved)
+        roots.append((resolved, str(getattr(profile, "name", "default") or "default")))
+
+    if active_root not in visited:
+        roots.append((active_root, "default"))
+    return roots
+
+
+def _legacy_cleanup_path_allowed(path: Path, profile_root: Path) -> bool:
+    """Allow unlinking only a regular file under a trusted pending root."""
+    if _is_link_like_path(path):
+        return False
+    try:
+        resolved = path.resolve()
+        roots = [profile_root.resolve(), Path(get_hermes_home()).resolve()]
+        return any(
+            (
+                not _crosses_nested_mount(resolved, root)
+                and (resolved == root or resolved.is_relative_to(root))
+            )
+            for root in roots
+        )
+    except (OSError, ValueError):
+        return False
+
+
 def purge_owner_operational_state(
     owner_id: str,
     *,
@@ -121,23 +290,17 @@ def purge_owner_operational_state(
 
     from hermes_cli.account_session_facade import AccountSessionFacade
     from hermes_cli.account_write_approvals import AccountWriteApprovalStore
-    profile_roots: list[tuple[Path, str]] = []
-    visited: set[Path] = set()
-    for profile in list_profiles():
-        root = Path(profile.path).resolve()
-        if root in visited:
-            continue
-        visited.add(root)
-        profile_roots.append((root, str(profile.name or "default")))
-
-    active_root = Path(get_hermes_home()).resolve()
-    if active_root not in visited:
-        profile_roots.append((active_root, "default"))
+    profile_roots = _validated_profile_roots()
 
     approvals = {"rows": 0, "migrations": 0}
     session_branches = {"branch_sessions": 0, "fork_records": 0, "bindings": 0}
     workflows = {"definitions": 0, "runs": 0}
     for root, profile_name in profile_roots:
+        if not _cleanup_generation_is_current(normalized, generation):
+            return {
+                "skipped_stale_generation": True,
+                "account_generation": generation,
+            }
         approval_store = AccountWriteApprovalStore(root / "write-approvals.db")
         approval_result = approval_store.delete_owner(
             normalized,
@@ -158,6 +321,11 @@ def purge_owner_operational_state(
                 legacy_file,
                 legacy_file.with_name(legacy_file.name + ".migrated.json"),
             ):
+                if not _legacy_cleanup_path_allowed(victim, root):
+                    logger.warning(
+                        "account cleanup: skipping unsafe legacy path %s", victim
+                    )
+                    continue
                 try:
                     victim.unlink()
                     approvals["legacy_files"] = approvals.get("legacy_files", 0) + 1
@@ -213,14 +381,18 @@ def purge_owner_model_configuration(
             "account_generation": generation,
         }
 
-    roots = {Path(get_hermes_home()).resolve()}
-    roots.update(profile.path.resolve() for profile in list_profiles())
+    roots = {root for root, _name in _validated_profile_roots()}
     profiles_changed = 0
     sections_removed = 0
     credentials_removed = 0
 
     for root in sorted(roots, key=str):
         config_path = root / "config.yaml"
+        if _is_link_like_path(config_path) or _crosses_nested_mount(config_path, root):
+            logger.warning(
+                "account cleanup: skipping linked model config %s", config_path
+            )
+            continue
         if not config_path.exists():
             continue
         with config_path.open(encoding="utf-8") as handle:
@@ -238,6 +410,14 @@ def purge_owner_model_configuration(
             changed = True
         if not changed:
             continue
+        if not _cleanup_generation_is_current(normalized_owner, generation):
+            return {
+                "profiles_changed": 0,
+                "sections_removed": 0,
+                "credentials_removed": 0,
+                "skipped_stale_generation": True,
+                "account_generation": generation,
+            }
         atomic_config_write(
             config_path,
             config,

@@ -36,6 +36,7 @@ from gateway.platforms.base import (
     SendResult,
 )
 from gateway.platforms.helpers import redact_phone, strip_markdown
+from gateway.platforms.helpers import MessageDeduplicator
 
 from agent.secret_scope import UnscopedSecretError as _UnscopedSecretError
 from agent.secret_scope import get_secret as _scoped_get_secret
@@ -68,6 +69,7 @@ MAX_SMS_LENGTH = 1600  # ~10 SMS segments
 DEFAULT_WEBHOOK_PORT = 8080
 DEFAULT_WEBHOOK_HOST = "127.0.0.1"
 _TWILIO_WEBHOOK_MAX_BODY_BYTES = 65_536  # 64 KiB — Twilio payloads are small
+_TWILIO_DEDUP_TTL_SECONDS = 72 * 60 * 60
 
 
 def check_sms_requirements() -> bool:
@@ -101,6 +103,10 @@ class SmsAdapter(BasePlatformAdapter):
         self._webhook_url: str = os.getenv("SMS_WEBHOOK_URL", "").strip()
         self._runner = None
         self._http_session: Optional["aiohttp.ClientSession"] = None
+        self._dedup = MessageDeduplicator(
+            max_size=10_000,
+            ttl_seconds=_TWILIO_DEDUP_TTL_SECONDS,
+        )
 
     def _basic_auth_header(self) -> str:
         """Build HTTP Basic auth header value for Twilio."""
@@ -374,6 +380,16 @@ class SmsAdapter(BasePlatformAdapter):
         to_number = (form.get("To", [""]))[0].strip()
         text = (form.get("Body", [""]))[0].strip()
         message_sid = (form.get("MessageSid", [""]))[0].strip()
+
+        # Twilio retries webhook deliveries when the HTTP response is lost.
+        # Claim before dispatch so a replay cannot start a second agent turn;
+        # the bounded TTL covers Twilio's multi-day retry window.
+        if message_sid and self._dedup.is_duplicate(message_sid):
+            logger.info("[sms] ignoring duplicate MessageSid %s", message_sid)
+            return web.Response(
+                text='<?xml version="1.0" encoding="UTF-8"?><Response></Response>',
+                content_type="application/xml",
+            )
 
         if not from_number or not text:
             return web.Response(

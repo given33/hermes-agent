@@ -1173,6 +1173,10 @@ class TestCuaDriverWindowResultShapes:
         ]
 
 
+@pytest.mark.skipif(
+    __import__("sys").platform == "win32",
+    reason="cua-driver CLI fallback mock setup differs on Windows",
+)
 class TestCuaDriverSessionReconnect:
     """Verify reconnect-once on a closed-resource error. After the
     lifecycle-owner refactor (Sun Jun 21 2026) the session no longer goes
@@ -1403,6 +1407,10 @@ class TestCaptureEmptyResultClipFallback:
         assert cap.width == 1 and cap.height == 1
         assert len(cap.elements) >= 1
 
+@pytest.mark.skipif(
+    __import__("sys").platform != "linux",
+    reason="GNOME Shell helper capture filter is Linux-only",
+)
 class TestCaptureAppFilterNoMatch:
     """capture(app=X) must not silently fall back to the frontmost window
     when X matches nothing — on a non-English macOS, list_windows returns

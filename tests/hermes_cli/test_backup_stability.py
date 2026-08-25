@@ -53,7 +53,14 @@ def test_atomic_output_keeps_previous_file_after_failure(tmp_path) -> None:
 def test_quick_snapshot_is_published_with_manifest(tmp_path, monkeypatch) -> None:
     home = tmp_path / ".hermes"
     home.mkdir()
-    (home / "config.yaml").write_text("model: {}\n", encoding="utf-8")
+    # The fixture text is 10 ASCII chars; on POSIX the file size is 10
+    # bytes, but Windows text mode translates ``\n`` to ``\r\n`` so the
+    # on-disk file is 11 bytes. Use the actual bytes on disk rather than the
+    # logical character count so the manifest assertion stays correct on
+    # every host.
+    fixture_text = "model: {}\n"
+    (home / "config.yaml").write_text(fixture_text, encoding="utf-8")
+    expected_size = (home / "config.yaml").stat().st_size
     published: list[tuple[Path, Path]] = []
 
     from hermes_cli import backup
@@ -79,7 +86,7 @@ def test_quick_snapshot_is_published_with_manifest(tmp_path, monkeypatch) -> Non
         (home / "state-snapshots" / snapshot_id / "manifest.json").read_text(encoding="utf-8")
     )
     assert manifest["id"] == snapshot_id
-    assert manifest["files"] == {"config.yaml": 10}
+    assert manifest["files"] == {"config.yaml": expected_size}
 
 
 def test_quick_snapshot_listing_ignores_partial_directories(tmp_path) -> None:

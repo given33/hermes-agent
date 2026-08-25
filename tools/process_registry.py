@@ -2204,6 +2204,19 @@ class ProcessRegistry:
                 # pywinpty expects str on Windows; ptyprocess expects bytes on POSIX.
                 if _IS_WINDOWS:
                     pty_data = data.decode("utf-8") if isinstance(data, bytes) else str(data)
+                    # pywinpty's Rust boundary panics the interpreter on lone
+                    # surrogates. ConPTY input cannot represent those original
+                    # bytes anyway; fail the operation instead of killing Hermes.
+                    try:
+                        pty_data.encode("utf-8")
+                    except UnicodeEncodeError as exc:
+                        return {
+                            "status": "error",
+                            "error": (
+                                "Windows PTY input requires valid Unicode; "
+                                f"surrogateescape bytes cannot be round-tripped: {exc}"
+                            ),
+                        }
                 else:
                     # surrogateescape: a PTY is a byte stream — round-trip the
                     # original bytes instead of crashing on surrogate content.

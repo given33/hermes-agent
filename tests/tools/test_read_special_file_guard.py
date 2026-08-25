@@ -13,6 +13,8 @@ import pytest
 
 from tools.file_tools import _special_file_kind, read_file_tool
 
+_IS_POSIX = __import__("sys").platform != "win32"
+
 
 class TestSpecialFileKind:
     def test_regular_file(self, tmp_path):
@@ -26,11 +28,13 @@ class TestSpecialFileKind:
     def test_missing_path(self, tmp_path):
         assert _special_file_kind(tmp_path / "nope") is None
 
+    @pytest.mark.skipif(not _IS_POSIX, reason="os.mkfifo is POSIX-only")
     def test_fifo(self, tmp_path):
         fifo = tmp_path / "p.pipe"
         os.mkfifo(fifo)
         assert "FIFO" in (_special_file_kind(fifo) or "")
 
+    @pytest.mark.skipif(not _IS_POSIX, reason="AF_UNIX sockets are POSIX-only")
     def test_socket(self, tmp_path):
         sock_path = tmp_path / "s.sock"
         s = socket.socket(socket.AF_UNIX)
@@ -40,6 +44,7 @@ class TestSpecialFileKind:
         finally:
             s.close()
 
+    @pytest.mark.skipif(not _IS_POSIX, reason="os.mkfifo is POSIX-only")
     def test_symlink_to_fifo_followed(self, tmp_path):
         fifo = tmp_path / "p.pipe"
         os.mkfifo(fifo)
@@ -47,6 +52,7 @@ class TestSpecialFileKind:
         link.symlink_to(fifo)
         assert "FIFO" in (_special_file_kind(link) or "")
 
+    @pytest.mark.skipif(not _IS_POSIX, reason="/dev/null is POSIX-only")
     def test_char_device(self):
         if not os.path.exists("/dev/null"):
             pytest.skip("no /dev/null")
@@ -54,6 +60,7 @@ class TestSpecialFileKind:
 
 
 class TestReadFileToolFifoGuard:
+    @pytest.mark.skipif(not _IS_POSIX, reason="os.mkfifo is POSIX-only")
     def test_fifo_read_returns_note_instantly(self, tmp_path, monkeypatch):
         import time
 

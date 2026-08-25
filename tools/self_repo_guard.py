@@ -150,7 +150,14 @@ def get_running_source_root() -> Path | None:
 
 
 def _resolve(path_str: str, base: Path) -> Path:
-    path = Path(os.path.expanduser(path_str))
+    # Honor an explicit HOME even on Windows; launchers/tests use it to select
+    # an isolated profile home rather than the signed-in user profile.
+    expanded = (
+        os.path.join(os.environ["HOME"], path_str[2:])
+        if path_str.startswith("~/") and (home := os.environ.get("HOME"))
+        else os.path.expanduser(path_str)
+    )
+    path = Path(expanded)
     if not path.is_absolute():
         path = base / path
     try:
@@ -179,7 +186,17 @@ def _shell_words_at(command: str, start: int) -> list[str]:
             break
         if words and "\n" in command[cursor:word_start]:
             break
-        words.append(_deobfuscate_shell_word_for_detection(raw_word))
+        word = _deobfuscate_shell_word_for_detection(raw_word)
+        if (
+            os.name == "nt"
+            and ":\\" in raw_word
+            and "\\" not in word
+        ):
+            # POSIX deobfuscation treats Windows separators as escape
+            # characters. A native cmd/PowerShell path is not escaped that
+            # way; retaining it is the fail-closed direction for repo guards.
+            word = raw_word
+        words.append(word)
         cursor = word_end
     return words
 
@@ -744,5 +761,8 @@ def _block_message(operation: str, root: Path) -> str:
 def _scratch_dir_hint() -> str:
     """Disk-backed scratch location suggested to agents for temporary clones."""
     hermes_home = os.environ.get("HERMES_HOME", "").strip()
-    base = Path(hermes_home).expanduser() if hermes_home else Path.home() / ".hermes"
-    return str(base / "scratch")
+    if hermes_home:
+        # Preserve POSIX-style homes exactly; Path() would rewrite "/x" to the
+        # current drive ("C:\x") on Windows and confuse container/WSL configs.
+        return hermes_home.rstrip("/\\") + "/scratch"
+    return str((Path.home() / ".hermes" / "scratch"))

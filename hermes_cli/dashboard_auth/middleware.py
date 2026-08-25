@@ -16,7 +16,10 @@ binds.
 """
 from __future__ import annotations
 
+import hashlib
 import logging
+import threading
+import time
 from typing import Awaitable, Callable
 
 from fastapi import Request
@@ -38,6 +41,7 @@ from hermes_cli.dashboard_auth.cookies import (
     set_sso_attempt_cookie,
 )
 from hermes_cli.dashboard_auth.public_paths import PUBLIC_API_PATHS
+from hermes_cli.dashboard_auth.client_ip import client_ip as _client_ip
 
 _log = logging.getLogger(__name__)
 
@@ -52,6 +56,7 @@ _GATE_PUBLIC_PREFIXES: tuple[str, ...] = (
     "/auth/native/authorize",
     "/auth/native/token",
     "/auth/native/refresh",
+    "/auth/mobile/",
     "/auth/password-login",
     "/auth/logout",
     "/login",
@@ -62,6 +67,9 @@ _GATE_PUBLIC_PREFIXES: tuple[str, ...] = (
     "/ds-assets/",
     "/fonts/",
     "/fonts-terminal/",
+    "/manifest.webmanifest",
+    "/apple-touch-icon.png",
+    "/hermes-official.png",
 )
 
 
@@ -84,13 +92,6 @@ def _path_is_public(path: str) -> bool:
         path == prefix or path.startswith(prefix)
         for prefix in _GATE_PUBLIC_PREFIXES
     )
-
-
-def _client_ip(request: Request) -> str:
-    fwd = request.headers.get("x-forwarded-for", "")
-    if fwd:
-        return fwd.split(",")[0].strip()
-    return request.client.host if request.client else ""
 
 
 def _ordered_session_providers(
@@ -300,6 +301,11 @@ def _verify_bearer(request: Request, *, access_token: str):
     """
     unreachable_provider: str | None = None
     for provider in list_session_providers():
+        # Password providers mint browser-session credentials.  A provider
+        # must explicitly opt into native bearer reuse; otherwise an opaque
+        # password token could cross the mobile/API credential boundary.
+        if not getattr(provider, "supports_native_bearer", True):
+            continue
         try:
             session = provider.verify_session(access_token=access_token)
         except ProviderError as e:
@@ -337,6 +343,13 @@ async def gated_auth_middleware(
     # a cookie session and must not be bounced to /login. Pass it through; the
     # seam already attached ``request.state.token_principal``.
     if getattr(request.state, "token_authenticated", False):
+        return await call_next(request)
+
+    # The optional service-token seam may already have verified an
+    # interactive native bearer before handing the request back here. Reuse
+    # that session so the provider is not called twice (and so a transient
+    # provider outage cannot turn one successful verification into a 503).
+    if getattr(request.state, "session", None) is not None:
         return await call_next(request)
 
     path = request.url.path
@@ -544,7 +557,135 @@ def _expires_in_seconds(session) -> int:
     return max(60, int(session.expires_at) - int(time.time()))
 
 
-def _attempt_refresh(request: Request, *, refresh_token, provider_hint: str | None = None):
+# --- Refresh-token rotation single-flight ----------------------------------
+#
+# Portal rotates the refresh token on every refresh and runs reuse-detection
+# on the presented one. Concurrent requests carrying the SAME refresh cookie
+# must not each enter the rotation below: every loser would replay the
+# now-rotated token and (outside Portal's grace) revoke the whole session,
+# surfacing as forced-logout bursts. The first caller performs the rotation
+# process-wide; everyone else presenting the same token waits for and
+# receives the identical outcome (rotated session, clean rejection, or the
+# same provider-unreachable failure).
+
+_REFRESH_SINGLEFLIGHT_MAX_ENTRIES = 1024
+_REFRESH_SINGLEFLIGHT_TTL_SECONDS = 30.0
+
+
+class _RefreshFlight:
+    """Outcome box shared by every caller presenting one refresh token."""
+
+    __slots__ = ("done", "value", "error", "completed_at")
+
+    def __init__(self) -> None:
+        self.done = threading.Event()
+        self.value = None  # (new_session, provider_name) on success
+        self.error = None  # exception instance relayed verbatim to waiters
+        self.completed_at = 0.0
+
+
+_refresh_flights_lock = threading.Lock()
+_refresh_flights: dict[str, _RefreshFlight] = {}
+
+
+def _refresh_flight_key(refresh_token) -> str:
+    """Key flights on a hash so raw refresh secrets never linger in memory."""
+    return hashlib.sha256(
+        str(refresh_token or "").encode("utf-8", errors="replace")
+    ).hexdigest()
+
+
+def _sweep_refresh_flights_locked(now: float) -> None:
+    """Evict completed flights past the TTL, then enforce the entry cap."""
+
+    deadline = now - _REFRESH_SINGLEFLIGHT_TTL_SECONDS
+    for key in [
+        key
+        for key, flight in _refresh_flights.items()
+        if flight.done.is_set() and flight.completed_at <= deadline
+    ]:
+        del _refresh_flights[key]
+    while len(_refresh_flights) >= _REFRESH_SINGLEFLIGHT_MAX_ENTRIES:
+        finished = [
+            key
+            for key, flight in _refresh_flights.items()
+            if flight.done.is_set()
+        ]
+        if not finished:
+            # Every slot holds an in-flight rotation; allow a temporary
+            # overflow rather than dropping a live flight (the next insert
+            # sweeps once they settle).
+            break
+        oldest = min(
+            finished,
+            key=lambda k: (_refresh_flights[k].completed_at, k),
+        )
+        del _refresh_flights[oldest]
+
+
+def _attempt_refresh(
+    request: Request,
+    *,
+    refresh_token,
+    provider_hint: str | None = None,
+):
+    """Single-flight wrapper around the uncached rotation below.
+
+    Flights are keyed on a secure hash of the presented refresh token and
+    guarded process-wide by _refresh_flights_lock. The first caller runs
+    the real rotation; concurrent waiters block on the shared outcome box
+    and receive exactly the leader's result -- or its ProviderError --
+    without re-attempting. Completed flights stay resident briefly (TTL
+    cap) so requests landing just after completion reuse the settled
+    outcome; entries are bounded by _REFRESH_SINGLEFLIGHT_MAX_ENTRIES.
+    """
+    key = _refresh_flight_key(refresh_token)
+    now = time.monotonic()
+    with _refresh_flights_lock:
+        _sweep_refresh_flights_locked(now)
+        flight = _refresh_flights.get(key)
+        leader = flight is None
+        if leader:
+            flight = _RefreshFlight()
+            _refresh_flights[key] = flight
+    if not leader:
+        if not flight.done.wait(_REFRESH_SINGLEFLIGHT_TTL_SECONDS):
+            # Leader stalled beyond the TTL window; degrade to a direct
+            # attempt rather than hanging this request forever.
+            return _attempt_refresh_uncached(
+                request,
+                refresh_token=refresh_token,
+                provider_hint=provider_hint,
+            )
+        if flight.error is not None:
+            raise flight.error
+        return flight.value
+    try:
+        value = _attempt_refresh_uncached(
+            request,
+            refresh_token=refresh_token,
+            provider_hint=provider_hint,
+        )
+    except BaseException as exc:
+        flight.error = exc
+        flight.completed_at = time.monotonic()
+        flight.done.set()
+        raise
+    # Publish the value BEFORE signalling so a woken waiter can never see
+    # a half-written outcome (error=None, value=None would read as
+    # "every provider rejected").
+    flight.value = value
+    flight.completed_at = time.monotonic()
+    flight.done.set()
+    return value
+
+
+def _attempt_refresh_uncached(
+    request: Request,
+    *,
+    refresh_token,
+    provider_hint: str | None = None,
+):
     """Try to rotate an expired session via the refresh token.
 
     The provider hint only changes candidate order. ``RefreshExpiredError``

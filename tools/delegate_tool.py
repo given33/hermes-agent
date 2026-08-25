@@ -4761,6 +4761,46 @@ DELEGATE_TASK_SCHEMA = {
                     "specific you are, the better the subagent performs."
                 ),
             },
+            "name": {
+                "type": "string",
+                "description": (
+                    "Short Chinese occupational name for this subagent "
+                    "(e.g. 安全审计员). Shown in subagent_list output so you "
+                    "can identify each child at a glance."
+                ),
+            },
+            "expected_output": {
+                "type": "string",
+                "description": (
+                    "What deliverable the subagent must return (e.g. a file "
+                    "path, a JSON report, a patch summary). Stated up front so "
+                    "the child knows when it is done."
+                ),
+            },
+            "acceptance_criteria": {
+                "type": "string",
+                "description": (
+                    "How to verify the expected_output was met (tests that "
+                    "must pass, files that must exist, values that must "
+                    "match). The parent uses this to accept or reject."
+                ),
+            },
+            "inherit_turns": {
+                "type": "integer",
+                "description": (
+                    "Number of recent conversation turns the subagent inherits "
+                    "for context (default 0 — self-contained goal + context "
+                    "only). Use sparingly; inherited turns consume tokens."
+                ),
+            },
+            "context_variables": {
+                "type": "object",
+                "description": (
+                    "Small key-value pairs shared across sibling subagents "
+                    "(e.g. discovered file paths, API endpoints). Only pass "
+                    "what another subagent actually needs."
+                ),
+            },
             "tasks": {
                 "type": "array",
                 "items": {
@@ -4770,6 +4810,26 @@ DELEGATE_TASK_SCHEMA = {
                         "context": {
                             "type": "string",
                             "description": "Task-specific context",
+                        },
+                        "name": {
+                            "type": "string",
+                            "description": "Per-task Chinese occupational name.",
+                        },
+                        "expected_output": {
+                            "type": "string",
+                            "description": "Per-task expected deliverable.",
+                        },
+                        "acceptance_criteria": {
+                            "type": "string",
+                            "description": "Per-task verification criteria.",
+                        },
+                        "inherit_turns": {
+                            "type": "integer",
+                            "description": "Per-task conversation-turn inheritance.",
+                        },
+                        "context_variables": {
+                            "type": "object",
+                            "description": "Per-task shared state.",
                         },
                         "role": {
                             "type": "string",

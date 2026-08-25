@@ -34,8 +34,10 @@ import json
 import logging
 import os
 import re
+import shutil
 import sqlite3
 import subprocess
+import sys
 import threading
 import time
 import urllib.parse
@@ -121,6 +123,50 @@ def _profile_home(profile: str) -> Optional[str]:
             except Exception:
                 return None
         return os.path.expanduser(f"~/.hermes/profiles/{profile}")
+
+
+def _hermes_profile_command(args: list[str]) -> list[str]:
+    """Build a cross-platform command for a local profile dispatch.
+
+    Native Windows installs normally expose ``hermes.exe`` or ``hermes.cmd``
+    through PATHEXT. Test/dev environments and Git Bash often expose a
+    shebang-only ``hermes`` file instead; ``CreateProcess`` cannot execute that
+    file directly, so invoke it with the current Python interpreter.
+    """
+    resolved = shutil.which("hermes")
+    if os.name == "nt" and not resolved:
+        # ``shutil.which`` intentionally applies PATHEXT on Windows and thus
+        # skips an extensionless POSIX wrapper. Look only at PATH entries, and
+        # require a regular file before considering the fallback.
+        for entry in os.environ.get("PATH", "").split(os.pathsep):
+            candidate = os.path.join(entry, "hermes")
+            if os.path.isfile(candidate):
+                resolved = candidate
+                break
+
+    executable = resolved or "hermes"
+    if os.name != "nt":
+        return [executable, *args]
+
+    suffix = os.path.splitext(executable)[1].lower()
+    if suffix in {".cmd", ".bat"}:
+        command_line = subprocess.list2cmdline([executable, *args])
+        return [
+            os.environ.get("COMSPEC", "cmd.exe"),
+            "/d",
+            "/s",
+            "/c",
+            command_line,
+        ]
+    if not suffix:
+        try:
+            with open(executable, "rb") as handle:
+                first_line = handle.readline(256).decode("utf-8", "replace")
+        except OSError:
+            first_line = ""
+        if first_line.startswith("#!"):
+            return [sys.executable, executable, *args]
+    return [executable, *args]
 
 def _safe_context_slug(value: str, max_len: int = 96) -> str:
     """Sanitize attacker-provided context ids before using in session titles."""
@@ -864,7 +910,9 @@ class A2AAdapter(BasePlatformAdapter):
         lock = self._forward_lock(key)
         with lock:
             session_id = self._profile_sessions.get(key) or self._lookup_forward_session(profile, session_title)
-            cmd = ["hermes", "chat", "-q", framed_text, "-Q", "--source", "a2a"]
+            cmd = _hermes_profile_command(
+                ["chat", "-q", framed_text, "-Q", "--source", "a2a"]
+            )
             if session_id:
                 cmd.extend(["--resume", session_id])
 

@@ -81,6 +81,27 @@ class TestWinPtyBridgeUnavailable:
 # ---------------------------------------------------------------------------
 
 
+def _wait_for_child_console(bridge: WinPtyBridge, timeout: float = 5.0) -> None:
+    """Drain PTY output until the spawned child shows console startup signs.
+
+    The child setting its console title emits an OSC 0/2 escape
+    ("\x1b]0;...") once Python is far enough into startup that its console
+    is wired; input written before that point may be echoed by the terminal
+    but never delivered to the child. Returns on the title escape, child
+    EOF, or timeout - whichever comes first - so callers proceed even when
+    titles are suppressed.
+    """
+    deadline = time.monotonic() + timeout
+    buf = bytearray()
+    while time.monotonic() < deadline:
+        chunk = bridge.read(timeout=0.2)
+        if chunk is None:
+            return
+        buf.extend(chunk)
+        if b"\x1b]0;" in bytes(buf):
+            return
+
+
 @pytest.mark.windows_only
 class TestWinPtyBridgeSpawn:
 
@@ -112,6 +133,13 @@ class TestWinPtyBridgeIO:
         )
         bridge = WinPtyBridge.spawn([sys.executable, "-c", script])
         try:
+            # ConPTY drops input written before the client finishes wiring its
+            # console (observed on pywinpty 2.0.15): keystrokes are echoed by
+            # the terminal but never reach the child's stdin read. Wait for an
+            # in-band sign of interpreter startup — the child setting its
+            # console title (OSC 0/2) — before writing; fall back after a
+            # bounded wait so environments that suppress titles still run.
+            _wait_for_child_console(bridge)
             bridge.write(b"hello-pty\r\n")
             output = _read_until(bridge, b"GOT:hello-pty")
             assert b"GOT:hello-pty" in output
@@ -215,6 +243,8 @@ class TestWinPtyBridgeEnv:
         bridge = WinPtyBridge.spawn(
             [sys.executable, "-c", "import os; print(os.getcwd())"],
             cwd=str(tmp_path),
+            cols=240,
+            rows=48,
         )
         try:
             # Path is case-insensitive on Windows; compare lowercased.

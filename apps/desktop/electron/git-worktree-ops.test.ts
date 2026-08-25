@@ -168,6 +168,32 @@ test('listBranches: empty on a non-repo path', async () => {
   }
 })
 
+test('listBranches: waits for the other ref probe after a non-repo failure', async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'hermes-branches-settle-'))
+
+  try {
+    let remoteSettled = false
+
+    const probe = (_gitBin, args) => {
+      if (args.includes('refs/heads')) {
+        return Promise.reject(new Error('not a repository'))
+      }
+
+      return new Promise<string>(resolve => {
+        setTimeout(() => {
+          remoteSettled = true
+          resolve('')
+        }, 25)
+      })
+    }
+
+    assert.deepEqual(await listBranches(dir, 'git', probe), [])
+    assert.equal(remoteSettled, true, 'the second probe must settle before listBranches returns')
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true })
+  }
+})
+
 test('addWorktree: existingBranch checks the branch out without a new branch', async () => {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'hermes-convert-'))
   const git = (...args) => execFileSync('git', args, { cwd: dir }).toString().trim()

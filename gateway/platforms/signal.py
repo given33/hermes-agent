@@ -41,6 +41,7 @@ from gateway.platforms.base import (
     cache_audio_from_bytes,
     cache_document_from_bytes,
     cache_image_from_url,
+    _local_path_from_file_uri,
 )
 from gateway.platforms.helpers import redact_phone
 from gateway.platforms.media_cache import DEFAULT_EXT_TO_MIME, mime_for_ext
@@ -357,7 +358,8 @@ class SignalAdapter(BasePlatformAdapter):
                 return False
             lock_acquired = True
         except Exception as e:
-            logger.warning("Signal: Could not acquire phone lock (non-fatal): %s", e)
+            logger.error("Signal: Could not acquire phone lock: %s", e)
+            return False
 
         # Tighter keepalive so idle CLOSE_WAIT drains promptly (#18451).
         from gateway.platforms._http_client_limits import platform_httpx_limits
@@ -520,9 +522,12 @@ class SignalAdapter(BasePlatformAdapter):
 
     def _force_reconnect(self) -> None:
         """Force SSE reconnection by closing the current response."""
-        if self._sse_response and not self._sse_response.is_stream_consumed:
+        response = self._sse_response
+        if response is not None:
             try:
-                task = asyncio.create_task(self._sse_response.aclose())
+                # A consumed-but-stale stream can still hold the transport open;
+                # close unconditionally so the reconnect loop can replace it.
+                task = asyncio.create_task(response.aclose())
                 self._background_tasks.add(task)
                 task.add_done_callback(self._background_tasks.discard)
             except Exception:
@@ -1206,7 +1211,7 @@ class SignalAdapter(BasePlatformAdapter):
         skipped_oversize = 0
         for image_url, _alt_text in images:
             if image_url.startswith("file://"):
-                file_path = unquote(image_url[7:])
+                file_path = _local_path_from_file_uri(image_url)
             else:
                 try:
                     file_path = await cache_image_from_url(image_url)
@@ -1376,7 +1381,7 @@ class SignalAdapter(BasePlatformAdapter):
 
         # Resolve image to local path
         if image_url.startswith("file://"):
-            file_path = unquote(image_url[7:])
+            file_path = _local_path_from_file_uri(image_url)
         else:
             # Download remote image to cache
             try:

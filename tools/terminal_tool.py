@@ -1629,7 +1629,21 @@ def _get_env_config() -> Dict[str, Any]:
     host_cwd = None
     if env_type == "docker" and mount_docker_cwd:
         docker_cwd_source = os.getenv("TERMINAL_CWD") or _safe_getcwd()
-        candidate = os.path.abspath(os.path.expanduser(docker_cwd_source))
+        # The user supplied a remote-host style path (e.g. ``/Users/...``,
+        # ``/home/...``, ``C:\\...``) — these are *intentionally* host-anchored
+        # (e.g. a developer on a Linux dev box declaring a macOS path). Running
+        # them through ``os.path.abspath`` on a Windows host re-anchors the
+        # leading ``/`` to ``C:\\`` and mangles the value; the docker mount
+        # layer treats the mangled path as a Windows host path, which is not
+        # what was asked for. Pass POSIX-rooted host prefixes through verbatim
+        # (only Windows drive paths still need ntpath normalisation).
+        if any(docker_cwd_source.startswith(p) for p in _HOST_CWD_PREFIXES):
+            candidate = docker_cwd_source
+            if candidate.startswith(("C:\\\\", "C:/")):
+                import ntpath
+                candidate = ntpath.normpath(candidate)
+        else:
+            candidate = os.path.abspath(os.path.expanduser(docker_cwd_source))
         if (
             any(candidate.startswith(p) for p in _HOST_CWD_PREFIXES)
             or (os.path.isabs(candidate) and os.path.isdir(candidate) and not candidate.startswith(("/workspace", "/root")))

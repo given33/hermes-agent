@@ -562,7 +562,16 @@ class WhatsAppAdapter(WhatsAppBehaviorMixin, BasePlatformAdapter):
                 return False
             lock_acquired = True
         except Exception as e:
-            logger.warning("[%s] Could not acquire session lock (non-fatal): %s", self.name, e)
+            # A session-lock error is deliberately fail-closed: launching a
+            # second Baileys process against one credential directory can
+            # corrupt the session and produce duplicate inbound polling.
+            logger.error("[%s] Could not acquire WhatsApp session lock: %s", self.name, e)
+            self._set_fatal_error(
+                "whatsapp_session_lock",
+                f"Could not acquire WhatsApp session lock: {e}",
+                retryable=True,
+            )
+            return False
 
         try:
             # Auto-install npm dependencies when node_modules is missing OR

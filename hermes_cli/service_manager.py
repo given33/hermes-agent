@@ -488,6 +488,10 @@ def _seed_supervise_skeleton(svc_dir: Path) -> None:
             return
         path.mkdir(parents=False, exist_ok=False)
         path.chmod(mode)
+        if not hasattr(os, "chown"):
+            # s6 service trees are Linux-only; keep the filesystem layout
+            # helper harmless when imported by native-Windows tooling/tests.
+            return
         try:
             os.chown(path, _HERMES_UID, _HERMES_GID)
         except PermissionError:
@@ -515,13 +519,18 @@ def _seed_supervise_skeleton(svc_dir: Path) -> None:
     # being defensive here keeps the helper consistent under any
     # invocation context.
     control = supervise / "control"
-    if not control.exists():
+    if not control.exists() and hasattr(os, "mkfifo"):
+        # Native Windows has no mkfifo and never runs an s6 supervisor; skip
+        # the FIFO seed exactly like _mkdir_owned skips chown above so the
+        # filesystem-layout helper stays harmless when imported by
+        # native-Windows tooling/tests instead of dying on AttributeError.
         os.mkfifo(control, 0o660)
         control.chmod(0o660)
-        try:
-            os.chown(control, _HERMES_UID, _HERMES_GID)
-        except PermissionError:
-            pass
+        if hasattr(os, "chown"):
+            try:
+                os.chown(control, _HERMES_UID, _HERMES_GID)
+            except PermissionError:
+                pass
 
     # If a log/ subdir is present (the canonical s6 logger pattern —
     # see servicedir(7)), it gets its own s6-supervise instance and
@@ -535,13 +544,14 @@ def _seed_supervise_skeleton(svc_dir: Path) -> None:
         _mkdir_owned(log_supervise, 0o755)
         _mkdir_owned(log_supervise / "event", 0o3730)
         log_control = log_supervise / "control"
-        if not log_control.exists():
+        if not log_control.exists() and hasattr(os, "mkfifo"):
             os.mkfifo(log_control, 0o660)
             log_control.chmod(0o660)
-            try:
-                os.chown(log_control, _HERMES_UID, _HERMES_GID)
-            except PermissionError:
-                pass
+            if hasattr(os, "chown"):
+                try:
+                    os.chown(log_control, _HERMES_UID, _HERMES_GID)
+                except PermissionError:
+                    pass
 
 
 class S6Error(RuntimeError):

@@ -65,6 +65,8 @@ from gateway.platforms.base import (
     MessageEvent,
     MessageType,
     SendResult,
+    _local_path_from_file_uri,
+    local_path_to_file_uri,
 )
 
 logger = logging.getLogger(__name__)
@@ -1006,10 +1008,8 @@ class SimplexAdapter(BasePlatformAdapter):
         **kwargs,
     ) -> SendResult:
         """Send an image. Supports ``file://`` URLs and ``http(s)://`` URLs."""
-        from urllib.parse import unquote
-
         if image_url.startswith("file://"):
-            file_path = unquote(image_url[7:])
+            file_path = _local_path_from_file_uri(image_url)
         else:
             try:
                 from gateway.platforms.base import cache_image_from_url
@@ -1060,7 +1060,7 @@ class SimplexAdapter(BasePlatformAdapter):
     ) -> SendResult:
         """Send a local image file via SimpleX."""
         return await self.send_image(
-            chat_id, f"file://{image_path}", caption=caption, **kwargs
+            chat_id, local_path_to_file_uri(image_path), caption=caption, **kwargs
         )
 
     async def send_video(

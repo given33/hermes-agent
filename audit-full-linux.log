@@ -1,0 +1,147 @@
+Discovered 3148 test files (~31894 tests) under ['tests']; running with -j 4
+[  0.0% |     3/~31894 | ✓3 | ✗0] ✓ tests/acp/test_auth.py (3✓, 6.8s)
+[  0.0% |     7/~31894 | ✓7 | ✗0] ✓ tests/acp/test_entry.py (4✓, 9.4s)
+[  0.0% |    12/~31894 | ✓12 | ✗ 0] ✓ tests/acp/test_approval_isolation.py (5✓, 10.7s)
+[  0.1% |    19/~31894 | ✓19 | ✗ 0] ✓ tests/acp/test_events.py (7✓, 6.9s)
+[  0.1% |    30/~31894 | ✓30 | ✗ 0] ✓ tests/acp/test_named_provider_catalogs.py (11✓, 9.7s)
+[  0.1% |    35/~31894 | ✓35 | ✗ 0] ✓ tests/acp/test_permissions.py (5✓, 7.0s)
+[  0.1% |    39/~31894 | ✓39 | ✗ 0] ✓ tests/acp/test_edit_approval.py (4✓, 21.9s)
+[  0.1% |    42/~31894 | ✓44 | ✗ 0] ✓ tests/acp/test_ping_suppression.py (5✓, 6.7s)
+[  0.2% |    49/~31894 | ✓51 | ✗ 0] ✓ tests/acp/test_mcp_e2e.py (7✓, 23.3s)
+[  0.2% |    57/~31894 | ✓59 | ✗ 0] ✓ tests/acp/test_session_db_private_access.py (8✓, 15.3s)
+[  0.2% |    61/~31894 | ✓63 | ✗ 0] ✓ tests/acp/test_session_provenance.py (4✓, 11.9s)
+[  0.3% |    84/~31894 | ✓86 | ✗ 0] ✓ tests/acp/test_tools.py (23✓, 6.2s)
+[  0.3% |    88/~31894 | ✓90 | ✗ 0] ✓ tests/acp_adapter/test_acp_images.py (4✓, 6.9s)
+[  0.3% |   107/~31894 | ✓109 | ✗  0] ✓ tests/acp/test_session.py (19✓, 35.4s)
+[  0.3% |   110/~31894 | ✓112 | ✗  0] ✓ tests/acp_adapter/test_acp_commands.py (3✓, 12.9s)
+[  0.3% |   111/~31894 | ✓113 | ✗  0] ✓ tests/acp_adapter/test_acp_logging_redaction.py (1✓, 6.3s)
+[  0.4% |   141/~31894 | ✓143 | ✗  0] ✓ tests/acp/test_server.py (30✓, 42.5s)
+[  0.5% |   144/~31894 | ✓146 | ✗  0] ✓ tests/acp_adapter/test_detect_provider_entra.py (3✓, 6.3s)
+[  0.5% |   148/~31894 | ✓150 | ✗  0] ✓ tests/acp_adapter/test_acp_mcp_discovery.py (4✓, 9.0s)
+[  0.5% |   150/~31894 | ✓152 | ✗  0] ✓ tests/agent/lsp/test_backend_gate.py (2✓, 9.8s)
+[  0.5% |   153/~31894 | ✓155 | ✗  0] ✓ tests/agent/lsp/test_broken_set.py (3✓, 8.8s)
+[  0.5% |   160/~31894 | ✓162 | ✗  0] ✓ tests/agent/lsp/test_client_docs_bounds.py (7✓, 9.1s)
+[  0.5% |   162/~31894 | ✓164 | ✗  0] ✓ tests/agent/lsp/test_client_e2e.py (2✓, 10.0s)
+[  0.5% |   168/~31894 | ✓170 | ✗  0] ✓ tests/agent/lsp/test_delta_key.py (6✓, 8.4s)
+[  0.5% |   172/~31894 | ✓174 | ✗  0] ✓ tests/agent/lsp/test_diagnostics_field.py (4✓, 9.1s)
+[  0.6% |   178/~31894 | ✓180 | ✗  0] ✓ tests/agent/lsp/test_eventlog.py (6✓, 8.7s)
+[  0.6% |   183/~31894 | ✓184 | ✗  0] ✓ tests/agent/lsp/test_install_and_lint_fixes.py (4✓ 1s, 11.9s)
+[  0.6% |   186/~31894 | ✓187 | ✗  0] ✓ tests/agent/lsp/test_lifecycle.py (3✓, 8.9s)
+[  0.6% |   189/~31894 | ✓190 | ✗  0] ✓ tests/agent/lsp/test_powershell_server.py (3✓, 8.9s)
+[  0.6% |   195/~31894 | ✓196 | ✗  0] ✓ tests/agent/lsp/test_protocol.py (6✓, 9.4s)
+[  0.6% |   200/~31894 | ✓201 | ✗  0] ✓ tests/agent/lsp/test_reporter.py (5✓, 8.0s)
+[  0.6% |   204/~31894 | ✓205 | ✗  0] ✓ tests/agent/lsp/test_service.py (4✓, 8.4s)
+[  0.7% |   209/~31894 | ✓212 | ✗  0] ✓ tests/agent/lsp/test_shell_linter_lsp_skip.py (7✓, 8.9s)
+[  0.7% |   211/~31894 | ✓214 | ✗  0] ✓ tests/agent/lsp/test_stale_diagnostics.py (2✓, 10.7s)
+[  0.7% |   215/~31894 | ✓218 | ✗  0] ✓ tests/agent/lsp/test_workspace.py (4✓, 8.6s)
+[  0.7% |   219/~31894 | ✓222 | ✗  0] ✓ tests/agent/test_account_usage.py (4✓, 8.0s)
+[  1.0% |   314/~31894 | ✓317 | ✗  0] ✓ tests/agent/test_anthropic_adapter.py (95✓, 10.4s)
+[  1.0% |   322/~31894 | ✓325 | ✗  0] ✓ tests/agent/test_anthropic_billing_guidance.py (8✓, 9.2s)
+[  1.0% |   331/~31894 | ✓327 | ✗  0] ✓ tests/agent/test_anthropic_keychain.py (2✓ 7s, 8.1s)
+[  1.0% |   334/~31894 | ✓330 | ✗  0] ✓ tests/agent/test_anthropic_kimi_signed_thinking_replay.py (3✓, 8.4s)
+[  1.1% |   337/~31894 | ✓333 | ✗  0] ✓ tests/agent/test_anthropic_kwargs_sanitize.py (3✓, 8.1s)
+[  1.1% |   341/~31894 | ✓337 | ✗  0] ✓ tests/agent/test_anthropic_mcp_prefix_strip.py (4✓, 7.1s)
+[  1.1% |   344/~31894 | ✓340 | ✗  0] ✓ tests/agent/test_anthropic_oauth_pkce.py (3✓, 7.3s)
+[  1.1% |   346/~31894 | ✓342 | ✗  0] ✓ tests/agent/test_anthropic_oauth_ua_prefix.py (2✓, 8.5s)
+[  1.1% |   350/~31894 | ✓346 | ✗  0] ✓ tests/agent/test_anthropic_output_field_leak.py (4✓, 7.5s)
+[  1.1% |   355/~31894 | ✓351 | ✗  0] ✓ tests/agent/test_anthropic_request_blank_block_guard.py (5✓, 7.7s)
+[  1.1% |   362/~31894 | ✓358 | ✗  0] ✓ tests/agent/test_anthropic_structured_output.py (7✓, 8.5s)
+[  1.1% |   366/~31894 | ✓362 | ✗  0] ✓ tests/agent/test_anthropic_thinking_block_order.py (4✓, 8.2s)
+[  1.2% |   372/~31894 | ✓368 | ✗  0] ✓ tests/agent/test_anthropic_token_scope_isolation.py (6✓, 8.7s)
+[  1.2% |   378/~31894 | ✓374 | ✗  0] ✓ tests/agent/test_anthropic_request_client_reuse.py (6✓, 16.6s)
+[  1.2% |   385/~31894 | ✓384 | ✗  0] ✓ tests/agent/test_anthropic_whitespace_text_blocks.py (10✓, 9.6s)
+[  1.2% |   392/~31894 | ✓405 | ✗  0] ✓ tests/agent/test_arcee_trinity_overrides.py (21✓, 9.5s)
+[  1.2% |   394/~31894 | ✓407 | ✗  0] ✓ tests/agent/test_async_utils.py (2✓, 8.7s)
+[  1.3% |   410/~31894 | ✓423 | ✗  0] ✓ tests/agent/test_aux_progress_streaming.py (16✓, 10.4s)
+[  1.3% |   413/~31894 | ✓426 | ✗  0] ✓ tests/agent/test_auxiliary_anthropic_pool_fallback_regression.py (3✓, 9.1s)
+[  1.3% |   416/~31894 | ✓429 | ✗  0] ✓ tests/agent/test_auxiliary_client_anthropic_custom.py (3✓, 11.3s)
+[  1.3% |   423/~31894 | ✓436 | ✗  0] ✓ tests/agent/test_auxiliary_client_azure_foundry.py (7✓, 11.9s)
+[  1.4% |   438/~31894 | ✓451 | ✗  0] ✓ tests/agent/test_async_token_accounting.py (15✓, 52.9s)
+[  1.4% |   445/~31894 | ✓458 | ✗  0] ✓ tests/agent/test_auxiliary_client_base_url_host_validation_52608.py (7✓, 11.2s)
+[  1.4% |   447/~31894 | ✓460 | ✗  0] ✓ tests/agent/test_auxiliary_client_bootstrap_skew.py (2✓, 9.4s)
+[  1.4% |   449/~31894 | ✓462 | ✗  0] ✓ tests/agent/test_auxiliary_client_proxy_env.py (2✓, 8.9s)
+[  1.4% |   454/~31894 | ✓467 | ✗  0] ✓ tests/agent/test_auxiliary_client_resolve_dedup.py (5✓, 8.8s)
+[  1.4% |   456/~31894 | ✓469 | ✗  0] ✓ tests/agent/test_auxiliary_client_ssl_verify.py (2✓, 8.3s)
+[  1.5% |   465/~31894 | ✓478 | ✗  0] ✓ tests/agent/test_auxiliary_client_xai_oauth_recovery.py (9✓, 9.8s)
+[  1.5% |   470/~31894 | ✓483 | ✗  0] ✓ tests/agent/test_auxiliary_compression_timeout_floor.py (5✓, 20.5s)
+[  1.5% |   488/~31894 | ✓501 | ✗  0] ✓ tests/agent/test_auxiliary_concurrency.py (18✓, 15.4s)
+[  2.1% |   654/~31894 | ✓682 | ✗  1] ✗ tests/agent/test_auxiliary_client.py (181✓ 1✗, 85.9s)
+
+  ╔╍ Failed: tests/agent/test_auxiliary_client.py ╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍
+  ║ ........................................................................ [ 39%]
+  ║ ................................................................F....... [ 79%]
+  ║ ......................................                                   [100%]
+  ║ =================================== FAILURES ===================================
+  ║ ___ TestVisionAutoSkipsKimiCoding.test_skip_set_covers_exactly_known_entries ___
+  ║ 
+  ║ self = <tests.agent.test_auxiliary_client.TestVisionAutoSkipsKimiCoding object at 0x7f3c007b9dc0>
+  ║ 
+  ║     def test_skip_set_covers_exactly_known_entries(self):
+  ║         """Guard against accidental widening of the skip list."""
+  ║         from agent.auxiliary_client import _PROVIDERS_WITHOUT_VISION
+  ║ >       assert _PROVIDERS_WITHOUT_VISION == frozenset({
+  ║             "kimi-coding",
+  ║             "kimi-coding-cn",
+  ║         })
+  ║ E       AssertionError: assert frozenset({'d...i-coding-cn'}) == frozenset({'k...i-coding-cn'})
+  ║ E         
+  ║ E         Extra items in the left set:
+  ║ E         'deepseek'
+  ║ E         Use -v to get more diff
+  ║ 
+  ║ tests/agent/test_auxiliary_client.py:3130: AssertionError
+  ║ =========================== short test summary info ============================
+  ║ FAILED tests/agent/test_auxiliary_client.py::TestVisionAutoSkipsKimiCoding::test_skip_set_covers_exactly_known_entries
+  ║ 1 failed, 181 passed in 84.73s (0:01:24)
+  ║
+  ║  Repro: python -m pytest tests/agent/test_auxiliary_client.py -q
+  ╚╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍
+
+[  2.1% |   665/~31894 | ✓693 | ✗  1] ✓ tests/agent/test_auxiliary_config_bridge.py (11✓, 10.8s)
+[  2.1% |   669/~31894 | ✓697 | ✗  1] ✓ tests/agent/test_auxiliary_explicit_base_anthropic.py (4✓, 10.0s)
+[  2.1% |   681/~31894 | ✓710 | ✗  1] ✓ tests/agent/test_auxiliary_explicit_cancellation.py (13✓, 8.9s)
+[  2.2% |   698/~31894 | ✓727 | ✗  1] ✓ tests/agent/test_auxiliary_main_first.py (17✓, 20.5s)
+[  2.3% |   725/~31894 | ✓754 | ✗  1] ✓ tests/agent/test_api_content_sidecar.py (27✓, 129.8s)
+[  2.3% |   732/~31894 | ✓761 | ✗  1] ✓ tests/agent/test_auxiliary_relay.py (7✓, 14.7s)
+[  2.4% |   751/~31894 | ✓780 | ✗  1] ✓ tests/agent/test_auxiliary_named_custom_providers.py (19✓, 24.1s)
+[  2.4% |   756/~31894 | ✓785 | ✗  1] ✓ tests/agent/test_auxiliary_runtime_cache_key.py (5✓, 8.7s)
+[  2.4% |   758/~31894 | ✓787 | ✗  1] ✓ tests/agent/test_auxiliary_transient_retry.py (2✓, 7.6s)
+[  2.4% |   761/~31894 | ✓803 | ✗  1] ✓ tests/agent/test_auxiliary_transport_autodetect.py (16✓, 10.8s)
+[  2.4% |   766/~31894 | ✓808 | ✗  1] ✓ tests/agent/test_auxiliary_user_default_headers.py (5✓, 11.1s)
+[  2.4% |   781/~31894 | ✓823 | ✗  1] ✓ tests/agent/test_backend_identity.py (15✓, 8.7s)
+[  2.5% |   800/~31894 | ✓842 | ✗  1] ✓ tests/agent/test_azure_identity_adapter.py (19✓, 9.1s)
+[  2.5% |   803/~31894 | ✓853 | ✗  1] ✓ tests/agent/test_battery.py (11✓, 7.7s)
+[  2.5% |   805/~31894 | ✓855 | ✗  1] ✓ tests/agent/test_bedrock_1m_context.py (2✓, 7.4s)
+[  2.6% |   815/~31894 | ✓865 | ✗  1] ✓ tests/agent/test_background_review_usage.py (10✓, 13.2s)
+[  2.8% |   881/~31894 | ✓931 | ✗  1] ✓ tests/agent/test_bedrock_adapter.py (66✓, 9.2s)
+[  2.8% |   884/~31894 | ✓934 | ✗  1] ✓ tests/agent/test_bedrock_empty_text_blocks.py (3✓, 7.9s)
+[  2.8% |   886/~31894 | ✓936 | ✗  1] ✓ tests/agent/test_bedrock_interrupt_post_worker.py (2✓, 8.4s)
+[  2.8% |   889/~31894 | ✓939 | ✗  1] ✓ tests/agent/test_billing_links.py (3✓, 8.0s)
+[  2.9% |   920/~31894 | ✓970 | ✗  1] ✓ tests/agent/test_bedrock_integration.py (31✓, 17.3s)
+[  2.9% |   923/~31894 | ✓978 | ✗  1] ✓ tests/agent/test_billing_usage.py (8✓, 8.1s)
+[  2.9% |   935/~31894 | ✓1004 | ✗   1] ✓ tests/agent/test_billing_view.py (26✓, 8.8s)
+[  3.0% |   941/~31894 | ✓1010 | ✗   1] ✓ tests/agent/test_bot_profile_prompt_isolation.py (6✓, 9.1s)
+[  3.0% |   949/~31894 | ✓1018 | ✗   1] ✓ tests/agent/test_budget_reasoning_details_exclusion.py (8✓, 9.3s)
+[  3.0% |   951/~31894 | ✓1020 | ✗   1] ✓ tests/agent/test_bounded_response.py (2✓, 10.5s)
+[  3.0% |   957/~31894 | ✓1026 | ✗   1] ✓ tests/agent/test_billing_unverified_carrythrough.py (6✓, 25.9s)
+[  3.0% |   970/~31894 | ✓1039 | ✗   1] ✓ tests/agent/test_cache_disabled_on_stubs.py (13✓, 10.7s)
+[  3.1% |   983/~31894 | ✓1052 | ✗   1] ✓ tests/agent/test_canon_args_memo_parity.py (13✓, 10.3s)
+[  3.1% |   985/~31894 | ✓1054 | ✗   1] ✓ tests/agent/test_cascading_interrupt_6600.py (2✓, 13.0s)
+[  3.1% |   987/~31894 | ✓1056 | ✗   1] ✓ tests/agent/test_chat_completion_helpers_provider_sort.py (2✓, 11.0s)
+[  3.1% |   990/~31894 | ✓1059 | ✗   1] ✓ tests/agent/test_cjk_token_estimation.py (3✓, 9.2s)
+[  3.1% |   993/~31894 | ✓1062 | ✗   1] ✓ tests/agent/test_close_interrupted_tool_sequence.py (3✓, 8.7s)
+[  3.2% |  1011/~31894 | ✓1080 | ✗   1] ✓ tests/agent/test_codex_app_server_event_bridge.py (18✓, 11.1s)
+[  3.2% |  1013/~31894 | ✓1082 | ✗   1] ✓ tests/agent/test_codex_request_transport_diagnostics.py (2✓, 12.4s)
+[  3.2% |  1017/~31894 | ✓1086 | ✗   1] ✓ tests/agent/test_codex_gpt55_autoraise_notice.py (4✓, 25.4s)
+[  3.2% |  1033/~31894 | ✓1102 | ✗   1] ✓ tests/agent/test_codex_responses_adapter.py (16✓, 11.5s)
+[  3.2% |  1035/~31894 | ✓1104 | ✗   1] ✓ tests/agent/test_codex_runtime_live_events.py (2✓, 9.9s)
+[  3.3% |  1041/~31894 | ✓1110 | ✗   1] ✓ tests/agent/test_codex_app_server_persist.py (6✓, 42.8s)
+[  3.3% |  1048/~31894 | ✓1117 | ✗   1] ✓ tests/agent/test_codex_cloudflare_headers.py (7✓, 45.1s)
+[  3.4% |  1072/~31894 | ✓1144 | ✗   1] ✓ tests/agent/test_coding_context.py (27✓, 11.5s)
+[  3.5% |  1101/~31894 | ✓1173 | ✗   1] ✓ tests/agent/test_command_token_source.py (29✓, 14.7s)
+[  3.5% |  1108/~31894 | ✓1180 | ✗   1] ✓ tests/agent/test_compaction_anti_thrash.py (7✓, 12.7s)
+[  3.5% |  1116/~31894 | ✓1188 | ✗   1] ✓ tests/agent/test_compaction_redaction_boundaries.py (8✓, 23.5s)
+[  3.5% |  1118/~31894 | ✓1190 | ✗   1] ✓ tests/agent/test_compress_focus.py (2✓, 18.7s)
+[  3.6% |  1133/~31894 | ✓1205 | ✗   1] ✓ tests/agent/test_compress_context_progress_timeout.py (15✓, 25.6s)
+[  3.6% |  1134/~31894 | ✓1206 | ✗   1] ✓ tests/agent/test_compress_signal_leak.py (1✓, 12.8s)
+[  3.6% |  1143/~31894 | ✓1215 | ✗   1] ✓ tests/agent/test_compressed_summary_metadata.py (9✓, 26.0s)

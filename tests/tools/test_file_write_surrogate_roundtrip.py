@@ -16,6 +16,11 @@ from tools.environments.base import _pipe_stdin
 from tools.environments.local import LocalEnvironment
 from tools.file_operations import ShellFileOperations
 
+pytestmark = pytest.mark.skipif(
+    __import__("sys").platform == "win32",
+    reason="bash -c cat pipeline is POSIX-only",
+)
+
 
 def _cat_to_file_proc(out_path):
     """A real child that copies its stdin to a file, byte for byte."""

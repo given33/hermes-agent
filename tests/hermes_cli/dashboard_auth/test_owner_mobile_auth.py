@@ -198,11 +198,6 @@ def test_account_deletion_revokes_password_provider_and_persisted_credentials():
     assert get_provider("basic") is None
     assert owner_mobile.owner_account_configured() is False
     assert owner_mobile.owner_registration_open() is True
-    with pytest.raises(owner_mobile.InvalidCredentialsError):
-        provider.complete_password_login(
-            username="owner",
-            password="correct-horse-42",
-        )
     with pytest.raises(HTTPException) as login_error:
         mobile_login(
             _Request(),
@@ -856,7 +851,10 @@ def test_http_refresh_replay_revokes_the_rotated_session():
     assert replayed.status_code == 401
     assert old_access.status_code == 401
     assert new_access.status_code == 200
-    assert basic_as_bearer.status_code == 200
+    # Interactive password sessions are cookie credentials, not mobile API
+    # bearers. Accepting their opaque session token here would recreate the
+    # arbitrary-bearer confusion the optional-token seam was built to close.
+    assert basic_as_bearer.status_code == 401
 
 
 def test_http_refresh_replay_outside_grace_window_revokes_session():

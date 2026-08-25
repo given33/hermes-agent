@@ -15,6 +15,7 @@ in-memory object store + ref table. No live server, no network.
 
 import hashlib
 import json
+import os
 import threading
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from pathlib import Path
@@ -353,6 +354,7 @@ class TestDevGate:
 # ---------------------------------------------------------------------------
 
 class TestObjectBuilding:
+    @pytest.mark.skipif(os.name == "nt", reason="POSIX executable bits are not modeled by Windows stat")
     def test_build_tree_blob_and_exec(self, tmp_path):
         d = tmp_path / "skill"
         d.mkdir()

@@ -4,6 +4,7 @@ import os
 import shlex
 import shutil
 import subprocess
+import sys
 import time
 
 import pytest
@@ -15,7 +16,6 @@ from tools.approval import detect_dangerous_command, detect_hardline_command
     ("argv", "stdin", "expected_returncode", "expected_output"),
     [
         (["rg", "--", "--pre"], "ordinary text\n", 1, ""),
-        (["sort", "--", "--compress-program"], "", 2, ""),
         (["rg", "--pre-glob", "--pre", "needle"], "needle\n", 0, "needle\n"),
     ],
 )
@@ -26,10 +26,38 @@ def test_real_read_tool_binaries_confirm_option_ownership(
     if shutil.which(argv[0]) is None:
         pytest.skip(f"{argv[0]} is not installed")
 
-    completed = subprocess.run(argv, input=stdin, text=True, capture_output=True)
+    completed = subprocess.run(
+        argv, input=stdin, text=True, capture_output=True, encoding="utf-8"
+    )
 
     assert completed.returncode == expected_returncode
     assert completed.stdout == expected_output
+
+
+def test_sort_end_of_options_owns_flag_looking_operand():
+    """After ``--``, sort owns ``--compress-program`` as data, never an option."""
+    if shutil.which("sort") is None:
+        pytest.skip("sort is not installed")
+
+    completed = subprocess.run(
+        ["sort", "--", "--compress-program"],
+        input="",
+        text=True,
+        capture_output=True,
+        encoding="utf-8",
+    )
+
+    assert completed.stdout == ""
+    if sys.platform == "win32":
+        # ``where sort`` usually resolves to the native sort.exe, whose operand
+        # diagnostics differ from GNU coreutils ("Input file specified two
+        # times.", exit 1). Both builds agree on the contract under test: the
+        # flag-looking token stays an operand (nonzero exit plus a diagnostic)
+        # and is never parsed as an option after ``--``.
+        assert completed.returncode != 0
+        assert completed.stderr.strip() != ""
+    else:
+        assert completed.returncode == 2
 
 
 @pytest.mark.parametrize(
@@ -49,14 +77,33 @@ def test_real_binaries_execute_leading_dash_program_payload(
     """A PATH marker proves these binaries do not reparse '-program' as an option."""
     if shutil.which(tool) is None or (needs_tty and shutil.which("script") is None):
         pytest.skip(f"{tool} or script is not installed")
+    if sys.platform == "win32":
+        if needs_tty:
+            # The ``script`` PTY wrapper does not exist on native Windows.
+            pytest.skip("PTY pager payloads are POSIX-only")
+        if tool != "rg":
+            # Windows ships no GNU coreutils sort (``where sort`` resolves to
+            # the native sort.exe, which has no --compress-program) and no ag;
+            # there is no faithful twin of those grammars to exercise.
+            pytest.skip(f"{tool} program-payload grammar is POSIX-only")
 
+    # CreateProcess cannot honor a shebang, but ripgrep on Windows launches
+    # .cmd/.bat helpers natively — so the Windows twin keeps the exact contract
+    # under test (a leading-dash PATH helper IS executed) with a batch payload.
+    payload_name = "-payload-marker.cmd" if sys.platform == "win32" else "-payload-marker"
     marker = tmp_path / "executed"
-    payload = tmp_path / "-payload-marker"
-    payload.write_text("#!/bin/sh\nprintf executed > \"$MARKER\"\ncat\n")
-    payload.chmod(0o755)
+    payload = tmp_path / payload_name
+    if sys.platform == "win32":
+        payload.write_text('@echo executed> "%MARKER%"\r\n')
+    else:
+        payload.write_text("#!/bin/sh\nprintf executed > \"$MARKER\"\ncat\n")
+        payload.chmod(0o755)
     input_file = tmp_path / "input.txt"
     input_file.write_text("needle\n")
-    resolved_args = [arg.format(input=str(input_file)) for arg in args]
+    resolved_args = [
+        arg.format(input=str(input_file)).replace("-payload-marker", payload_name)
+        for arg in args
+    ]
     input_text = (
         "\n".join(str(number) for number in range(10_000, 0, -1)) + "\n"
         if stdin == "{bulk}"
@@ -72,9 +119,19 @@ def test_real_binaries_execute_leading_dash_program_payload(
     if needs_tty:
         argv = ["script", "-qec", shlex.join(argv), "/dev/null"]
 
-    subprocess.run(argv, input=input_text, text=True, capture_output=True, env=env, timeout=20)
+    subprocess.run(
+        argv,
+        input=input_text,
+        text=True,
+        capture_output=True,
+        encoding="utf-8",
+        errors="replace",
+        env=env,
+        timeout=20,
+    )
 
-    assert marker.read_text() == "executed"
+    # ``echo`` (batch twin) appends a newline where POSIX printf does not.
+    assert marker.read_text(encoding="utf-8").strip() == "executed"
 
 
 @pytest.mark.parametrize(

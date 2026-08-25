@@ -1,5 +1,6 @@
 import json
 import os
+import sys
 from pathlib import Path
 from unittest.mock import MagicMock
 
@@ -127,8 +128,13 @@ def test_large_process_output_is_bounded_before_sudo_and_plugin_hooks(
     monkeypatch.setitem(terminal_tool_module._active_environments, "default", env)
     monkeypatch.setitem(terminal_tool_module._last_activity, "default", 0.0)
     try:
+        # Use the running interpreter explicitly: bare ``python3`` only
+        # exists on POSIX, while Windows local execution goes through Git
+        # Bash where the venv ships ``python.exe``. Forward slashes keep the
+        # path shell-safe in bash on every platform.
+        python_exe = Path(sys.executable).as_posix()
         command = (
-            "python3 -c \"import sys; "
+            f'"{python_exe}" -c "import sys; '
             "sys.stdout.write('HEAD-SENTINEL\\n' + 'x' * 2000000 + "
             "'\\nTAIL-SENTINEL')\""
         )

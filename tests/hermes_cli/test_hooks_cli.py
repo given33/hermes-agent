@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import io
 import json
+import sys
 from contextlib import redirect_stdout
 from pathlib import Path
 from types import SimpleNamespace
@@ -79,6 +80,20 @@ class TestHooksList:
 # ── test ──────────────────────────────────────────────────────────────────
 
 
+def _py_hook_command(tmp_path: Path, body: str, name: str) -> str:
+    """Write a Python hook script and return its shell-quoted command line.
+
+    Hook commands run through CreateProcessW (no shell), so a POSIX
+    shebang script cannot execute natively on Windows. The payload-shape
+    and block-parsing contracts under test are host-independent; only the
+    script medium differs, so drive them through sys.executable instead of
+    skipping the contracts on Windows.
+    """
+    p = tmp_path / name
+    p.write_text(body, encoding="utf-8")
+    return f'"{sys.executable}" "{p}"'
+
+
 class TestHooksTest:
     def test_synthetic_payload_matches_production_shape(self, tmp_path):
         """`hermes hooks test` must feed the script stdin in the same
@@ -87,11 +102,14 @@ class TestHooksTest:
         scripts tested with `hermes hooks test` saw different top-level
         keys than at runtime, silently breaking in production."""
         capture = tmp_path / "captured.json"
-        script = _hook_script(
+        command = _py_hook_command(
             tmp_path,
-            f"#!/usr/bin/env bash\ncat - > {capture}\nprintf '{{}}\\n'\n",
+            "import sys\n"
+            f"open({str(capture)!r}, 'wb').write(sys.stdin.buffer.read())\n"
+            "print('{}')\n",
+            name="hook.py",
         )
-        cfg = {"hooks": {"subagent_stop": [{"command": str(script)}]}}
+        cfg = {"hooks": {"subagent_stop": [{"command": command}]}}
         with patch("hermes_cli.config.load_config", return_value=cfg):
             _run(SimpleNamespace(
                 hooks_action="test", event="subagent_stop",
@@ -112,16 +130,15 @@ class TestHooksTest:
         assert seen["tool_input"] is None
 
     def test_fires_real_subprocess_and_parses_block(self, tmp_path):
-        block_script = _hook_script(
+        command = _py_hook_command(
             tmp_path,
-            "#!/usr/bin/env bash\n"
-            'printf \'{"decision": "block", "reason": "nope"}\\n\'\n',
-            name="block.sh",
+            'print(\'{"decision": "block", "reason": "nope"}\')\n',
+            name="block.py",
         )
         cfg = {
             "hooks": {
                 "pre_tool_call": [
-                    {"matcher": "terminal", "command": str(block_script)},
+                    {"matcher": "terminal", "command": command},
                 ],
             },
         }

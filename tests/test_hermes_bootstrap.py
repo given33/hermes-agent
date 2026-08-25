@@ -120,6 +120,10 @@ class TestUserOptOut:
 
 
 
+@pytest.mark.skipif(
+    __import__("sys").platform == "win32",
+    reason="POSIX-only bootstrap no-op path",
+)
 class TestPosixNoOp:
     """POSIX: zero behavior change.  We don't touch LANG, LC_*, or any
     stdio.  The goal is that Linux/macOS behave identically before and
@@ -333,6 +337,10 @@ class TestHardenImportPath:
 
 
 
+@pytest.mark.skipif(
+    __import__("sys").platform == "win32",
+    reason="POSIX-only platform-version console suppression",
+)
 class TestSuppressPlatformVerConsole:
     """suppress_platform_ver_console: stub applied on Windows, no-op on POSIX."""
 
@@ -364,4 +372,3 @@ class TestSuppressPlatformVerConsole:
         finally:
             if original is not None:
                 platform._syscmd_ver = original
-

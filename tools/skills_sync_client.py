@@ -59,6 +59,7 @@ import hashlib
 import json
 import logging
 import os
+import sys
 import time
 import stat as _stat
 from datetime import datetime, timezone
@@ -1206,7 +1207,14 @@ def _skill_trees_of_root(
             return
         for e in entries:
             if e.get("kind") == KIND_TREE:
-                child_prefix = f"{prefix}/{e['name']}" if prefix else e["name"]
+                child_name = str(e.get("name") or "")
+                if not _is_safe_path_component(child_name):
+                    logger.warning(
+                        "skills_sync_client: skipping unsafe org tree entry %r",
+                        child_name,
+                    )
+                    continue
+                child_prefix = f"{prefix}/{child_name}" if prefix else child_name
                 _walk(e["hash"], child_prefix)
 
     _walk(root_tree_hash, "")
@@ -1740,6 +1748,81 @@ def list_org_skill_names() -> List[str]:
 
 ORG_DIR_NAME = "_org"
 
+_WINDOWS_RESERVED_NAMES = {
+    "CON", "PRN", "AUX", "NUL",
+    *(f"COM{i}" for i in range(1, 10)),
+    *(f"LPT{i}" for i in range(1, 10)),
+}
+
+
+def _is_safe_path_component(name: str) -> bool:
+    """Reject separators, traversal, hidden metadata, and Windows devices."""
+
+    if not name or name in {".", ".."} or "/" in name or "\\" in name:
+        return False
+    if name.startswith(".") or name[-1] in {" ", "."}:
+        return False
+    if name.upper() in _WINDOWS_RESERVED_NAMES:
+        return False
+    return all(
+        ch.isprintable() and ch not in {":", "*", "?", '"', "<", ">", "|"}
+        for ch in name
+    )
+
+
+def _validate_org_id(org_id: str) -> str:
+    if not _is_safe_path_component(org_id):
+        raise ValueError(f"unsafe organisation id: {org_id!r}")
+    return org_id
+
+
+def _safe_org_rel_path(skill_rel_path: str) -> PurePosixPath:
+    """Validate a remote/baseline skill path before filesystem use.
+
+    Remote sync trees are untrusted input.  ``PurePosixPath`` discards a
+    leading ``/``, which would otherwise let an absolute tree path replace
+    the destination root.
+    """
+    normalized = str(skill_rel_path)
+    if not normalized or PurePosixPath(normalized).is_absolute() or "\\" in normalized:
+        raise ValueError(f"unsafe org skill path: {skill_rel_path!r}")
+    parts = PurePosixPath(normalized).parts
+    if not parts or any(not _is_safe_path_component(part) for part in parts):
+        raise ValueError(f"unsafe org skill path: {skill_rel_path!r}")
+    return PurePosixPath(*parts)
+
+
+def _resolve_org_skill_dir(
+    org_id: str,
+    skill_rel_path: str | PurePosixPath,
+) -> Path:
+    """Resolve beneath ``_org/<org_id>`` while rejecting planted redirects."""
+    validated_org = _validate_org_id(org_id)
+    rel = (
+        skill_rel_path
+        if isinstance(skill_rel_path, PurePosixPath)
+        else _safe_org_rel_path(str(skill_rel_path))
+    )
+    root = (_org_dir() / validated_org).resolve()
+    target = root
+    for part in rel.parts:
+        target /= part
+        try:
+            if target.is_symlink() or (
+                sys.platform == "win32"
+                and os.path.normcase(os.path.realpath(target))
+                != os.path.normcase(str(target))
+            ):
+                raise ValueError(
+                    f"unsafe org skill path redirect: {skill_rel_path!r}"
+                )
+        except OSError as exc:
+            raise ValueError(f"unsafe org skill path: {skill_rel_path!r}") from exc
+    resolved = target.resolve(strict=False)
+    if resolved != root and not resolved.is_relative_to(root):
+        raise ValueError(f"unsafe org skill path: {skill_rel_path!r}")
+    return resolved
+
 
 def resolve_org_identity() -> Dict[str, Any]:
     """Resolve identity + org context for org-skill operations.
@@ -1844,15 +1927,16 @@ def pull_org_skills(
     root_tree = head_commit["tree"]
     skill_trees = _skill_trees_of_root(client, root_tree, org_scope=True)
 
-    dest_root = _org_dir() / org_id
+    dest_root = _org_dir() / _validate_org_id(org_id)
+    dest_root_resolved = dest_root.resolve()
     updated: List[str] = []
     # Skills the user/agent has edited locally and upstream also changed.
     # We do NOT overwrite them — the local work wins until the user resolves.
     conflicted: List[str] = []
     baseline = _read_org_baseline(org_id)
     for rel_path, tree_hash in sorted(skill_trees.items()):
-        dest = dest_root / PurePosixPath(rel_path)
         try:
+            dest = _resolve_org_skill_dir(org_id, rel_path)
             if dest.exists():
                 # Local edits are protected: never clobber work the user or
                 # agent did in place. Skip the update and report it so they
@@ -1865,9 +1949,9 @@ def pull_org_skills(
                     if prev.get("tree") != tree_hash:
                         conflicted.append(rel_path)
                     continue
-                import shutil
+                from hermes_cli.safe_delete import safe_rmtree
 
-                shutil.rmtree(dest)
+                safe_rmtree(dest, dest_root_resolved)
             dest.mkdir(parents=True, exist_ok=True)
             materialize_tree(client, tree_hash, dest, org_scope=True)
             baseline[rel_path] = {
@@ -1957,7 +2041,10 @@ def _write_org_baseline(org_id: str, baseline: Dict[str, Any]) -> None:
 
 def org_skill_is_locally_modified(skill_rel_path: str, org_id: str) -> bool:
     """True when the local copy of an org skill differs from what upstream sent."""
-    dest = _org_dir() / org_id / PurePosixPath(skill_rel_path)
+    try:
+        dest = _resolve_org_skill_dir(org_id, skill_rel_path)
+    except Exception:
+        return False
     if not dest.is_dir():
         return False
     entry = _read_org_baseline(org_id).get(skill_rel_path) or {}

@@ -297,6 +297,7 @@ from gateway.platforms.base import (
     SUPPORTED_DOCUMENT_TYPES,
     SUPPORTED_IMAGE_DOCUMENT_TYPES,
     _TEXT_INJECT_EXTENSIONS,
+    _local_path_from_file_uri,
     utf16_len,
 )
 from plugins.platforms.telegram.telegram_ids import (
@@ -7746,7 +7747,6 @@ class TelegramAdapter(BasePlatformAdapter):
         if not photos:
             return
 
-        from urllib.parse import unquote as _unquote
         _thread = self._metadata_thread_id(metadata)
 
         # Chunk into groups of 10 (Telegram's album limit)
@@ -7763,7 +7763,7 @@ class TelegramAdapter(BasePlatformAdapter):
                 for image_url, alt_text in chunk:
                     caption = alt_text[:1024] if alt_text else None
                     if image_url.startswith("file://"):
-                        local_path = _unquote(image_url[7:])
+                        local_path = _local_path_from_file_uri(image_url)
                         if not os.path.exists(local_path):
                             logger.warning(
                                 "[%s] Skipping missing image in media group: %s",

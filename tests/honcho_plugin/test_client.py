@@ -271,6 +271,17 @@ class TestResolveSessionName:
 
 
 class TestResolveConfigPath:
+    def test_global_fallback_survives_unavailable_home(self, tmp_path, monkeypatch):
+        hermes_home = tmp_path / "hermes"
+        monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+
+        def unavailable_home():
+            raise RuntimeError("home directory unavailable")
+
+        monkeypatch.setattr(Path, "home", unavailable_home)
+
+        assert resolve_global_config_path() == hermes_home / ".honcho" / "config.json"
+
     def test_prefers_hermes_home_when_exists(self, tmp_path):
         hermes_home = tmp_path / "hermes"
         hermes_home.mkdir()
@@ -776,4 +787,3 @@ class TestGetHonchoClientBaseUrlDoublePrefixFix:
         assert passed_base_url == expected, (
             f"Expected {expected!r}, got {passed_base_url!r}"
         )
-

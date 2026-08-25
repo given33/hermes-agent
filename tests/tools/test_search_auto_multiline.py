@@ -38,6 +38,10 @@ class TestAutoMultiline:
         assert r["total_count"] == 1
         assert "multiline" not in r.get("warning", "")
 
+    @pytest.mark.skipif(
+        __import__("sys").platform == "win32",
+        reason="Windows rg rejects literal \\n differently than POSIX rg",
+    )
     def test_escaped_backslash_n_stays_literal(self, proj):
         # \\n = literal backslash+n search, not a newline: no multiline mode.
         (proj / "strings.py").write_text('SEP = "a\\\\nb"\n')

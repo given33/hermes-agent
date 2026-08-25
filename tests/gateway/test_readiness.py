@@ -3,9 +3,32 @@ from __future__ import annotations
 import json
 import os
 import sqlite3
+from types import SimpleNamespace
 from pathlib import Path
 
 from gateway.readiness import collect_runtime_readiness
+
+
+def test_disk_pressure_is_advisory_for_runtime_readiness(tmp_path, monkeypatch):
+    home = tmp_path / ".hermes"
+    home.mkdir()
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    monkeypatch.setattr(
+        "gateway.readiness.shutil.disk_usage",
+        lambda _path: SimpleNamespace(total=100, used=95, free=5),
+    )
+
+    result = collect_runtime_readiness(
+        configured_model="test/model",
+        runtime_status={"gateway_state": "running", "platforms": {}},
+    )
+
+    assert result["status"] == "ok"
+    assert result["checks"]["disk"] == {
+        "status": "degraded",
+        "used_percent": 95.0,
+        "free_bytes": 5,
+    }
 
 
 def test_collect_runtime_readiness_reports_healthy_local_runtime(tmp_path, monkeypatch):
@@ -57,5 +80,4 @@ def test_collect_runtime_readiness_degrades_on_invalid_config_and_stopped_gatewa
     assert result["checks"]["gateway"]["status"] == "degraded"
     # Readiness is diagnostic data, not an exception or a destructive repair.
     assert (home / "config.yaml").read_text(encoding="utf-8") == "model: [unterminated"
-
 

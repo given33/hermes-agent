@@ -46,6 +46,9 @@ def test_install_npm_works_without_extras(tmp_path, monkeypatch):
 
     monkeypatch.setattr(install_mod.subprocess, "run", fake_run)
     monkeypatch.setattr(install_mod.shutil, "which", lambda c: "/usr/bin/npm" if c == "npm" else None)
+    # find_node_executable intentionally discovers managed/native Windows npm
+    # launchers; pin it so this contract tests package arguments, not PATH.
+    monkeypatch.setattr(install_mod, "find_node_executable", lambda _name: "/usr/bin/npm")
 
     install_mod._install_npm("pyright", "pyright-langserver")
 

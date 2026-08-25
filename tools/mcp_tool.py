@@ -121,6 +121,48 @@ from tools.ansi_strip import strip_unicode_tags
 
 logger = logging.getLogger(__name__)
 
+# Hard ceiling for pathological MCP payloads. Ordinary large results still
+# reach the budget/spillover layer intact; this only bounds multi-megabyte
+# floods before they are serialized into agent context.
+_MCP_HARD_RESULT_CAP_CHARS = 2_000_000
+
+
+def _truncate_mcp_text_result(
+    text: str,
+    max_chars: int = _MCP_HARD_RESULT_CAP_CHARS,
+) -> str:
+    """Preserve head/tail context while bounding a hostile MCP payload."""
+
+    if len(text) <= max_chars:
+        return text
+    head_budget = int(max_chars * 0.4)
+    tail_budget = max_chars - head_budget
+
+    # Adapted from DeerFlow: cut at line boundaries when the boundary is in
+    # the same half, so JSON/log excerpts remain readable instead of starting
+    # or ending with a partial record.
+    head_cut = head_budget
+    if 0 < head_cut < len(text):
+        newline = text.rfind("\n", head_cut // 2, head_cut)
+        if newline >= 0:
+            head_cut = newline + 1
+    tail_start = len(text) - tail_budget
+    if 0 <= tail_start < len(text):
+        newline = text.find("\n", tail_start, tail_start + (len(text) - tail_start) // 2)
+        if newline >= 0:
+            tail_start = newline + 1
+    head_chars = min(head_cut, len(text))
+    tail_chars = max(0, len(text) - max(head_chars, tail_start))
+    omitted = len(text) - head_chars - tail_chars
+    if omitted <= 0:
+        return text
+    return (
+        text[:head_chars]
+        + f"\n\n... [MCP RESULT TRUNCATED - {omitted:,} chars omitted "
+          f"out of {len(text):,} total] ...\n\n"
+        + text[-tail_chars:]
+    )
+
 # Upper bound for the OSV malware preflight during stdio MCP startup. The
 # check makes a blocking urllib HTTPS call whose own timeout can fail to
 # interrupt a stalled SSL handshake, which froze the asyncio event loop and
@@ -5866,7 +5908,7 @@ def _make_tool_handler(server_name: str, tool_name: str, tool_timeout: float):
                         "MCP %s: dropping unsupported content block type %r",
                         server_name, block_type,
                     )
-            text_result = "\n".join(parts) if parts else ""
+            text_result = _truncate_mcp_text_result("\n".join(parts) if parts else "")
 
             # Combine content + structuredContent when both are present.
             # MCP spec: content is model-oriented (text), structuredContent
@@ -5885,6 +5927,16 @@ def _make_tool_handler(server_name: str, tool_name: str, tool_timeout: float):
             # vendor-namespaced keys (`com.example.mcp/...`) pass through —
             # their semantics belong to the server.
             structured = mcp_field(result, "structured_content", "structuredContent")
+            if structured is not None:
+                try:
+                    structured_json = json.dumps(structured, ensure_ascii=False, default=str)
+                except (TypeError, ValueError):
+                    structured_json = None
+                if (
+                    structured_json is not None
+                    and len(structured_json) > _MCP_HARD_RESULT_CAP_CHARS
+                ):
+                    structured = _truncate_mcp_text_result(structured_json)
             meta = _strip_reserved_meta_keys(mcp_field(result, "meta", "meta"))
             if structured is not None or meta is not None:
                 payload: Dict[str, Any] = {}
@@ -7382,7 +7434,138 @@ def register_mcp_servers(servers: Dict[str, dict]) -> List[str]:
     return _existing_tool_names()
 
 
-def discover_mcp_tools() -> List[str]:
+def select_mcp_servers_for_capabilities(
+    servers: Dict[str, dict] | None,
+    capability_hints: Optional[List[str]] = None,
+) -> List[str]:
+    """Return enabled MCP server names relevant to capability hints.
+
+    Hosted chat uses this boundary to avoid starting every configured MCP
+    process for a request that only needs one capability.  Configurations may
+    advertise capabilities under any of the common ``capabilities``,
+    ``capability_hints`` or ``toolsets`` keys; server names are also matched
+    after normalizing ``.``/``_`` to ``-`` for compact configs such as
+    ``ios-location`` versus the route hint ``ios.location``.
+
+    An empty hint list deliberately preserves the legacy behavior and selects
+    every enabled server.
+    """
+    if not isinstance(servers, dict):
+        return []
+    hints = {
+        re.sub(r"[^a-z0-9]+", "-", str(item).strip().lower()).strip("-")
+        for item in (capability_hints or [])
+        if str(item).strip()
+    }
+    selected: List[str] = []
+    for raw_name, config in servers.items():
+        name = str(raw_name or "").strip()
+        if not name or not isinstance(config, dict):
+            continue
+        if not _parse_boolish(config.get("enabled", True), default=True):
+            continue
+        if not hints:
+            selected.append(name)
+            continue
+        advertised: List[str] = [name]
+        for key in ("capabilities", "capability_hints", "toolsets"):
+            value = config.get(key)
+            if isinstance(value, str):
+                advertised.append(value)
+            elif isinstance(value, (list, tuple, set)):
+                advertised.extend(str(item) for item in value)
+        normalized_advertised = {
+            re.sub(r"[^a-z0-9]+", "-", value.strip().lower()).strip("-")
+            for value in advertised
+            if value.strip()
+        }
+        if any(
+            hint == candidate
+            or hint in candidate
+            or candidate in hint
+            for hint in hints
+            for candidate in normalized_advertised
+        ):
+            selected.append(name)
+    return selected
+
+
+class MCPAvailabilitySnapshot:
+    """Metadata-only MCP readiness record for hosted routing consumers."""
+
+    __slots__ = ("name", "live", "state", "registered_tools", "transport")
+
+    def __init__(
+        self,
+        name: str,
+        *,
+        live: bool,
+        state: str,
+        registered_tools: Tuple[str, ...] = (),
+        transport: str = "",
+    ) -> None:
+        self.name = name
+        self.live = bool(live)
+        self.state = state
+        self.registered_tools = tuple(registered_tools)
+        self.transport = transport
+
+    def as_dict(self) -> dict:
+        return {
+            "name": self.name,
+            "live": self.live,
+            "state": self.state,
+            "registered_tools": list(self.registered_tools),
+            "transport": self.transport,
+        }
+
+
+def get_mcp_availability() -> List[MCPAvailabilitySnapshot]:
+    """Return live MCP metadata without exposing connection objects."""
+    snapshots: List[MCPAvailabilitySnapshot] = []
+    configured = _load_mcp_config()
+    if not configured:
+        return snapshots
+    with _lock:
+        active_servers = dict(_servers)
+        connecting = set(_server_connecting)
+        connect_errors = set(_server_connect_errors)
+    for name, config in configured.items():
+        server = active_servers.get(name)
+        tools = tuple(getattr(server, "_registered_tool_names", ()) or ())
+        if server is not None and getattr(server, "session", None) is not None:
+            state = "ready"
+            live = True
+        elif not _parse_boolish(config.get("enabled", True), default=True):
+            state = "disabled"
+            live = False
+        elif name in connecting:
+            state = "connecting"
+            live = False
+        elif name in connect_errors:
+            state = "failed"
+            live = False
+            tools = ()
+        else:
+            state = "configured"
+            live = False
+            tools = ()
+        transport = config.get("transport", "http") if "url" in config else "stdio"
+        snapshots.append(
+            MCPAvailabilitySnapshot(
+                str(name),
+                live=live,
+                state=state,
+                registered_tools=tools,
+                transport=str(transport),
+            )
+        )
+    return snapshots
+
+
+def discover_mcp_tools(
+    capability_hints: Optional[List[str]] = None,
+) -> List[str]:
     """Entry point: load config, connect to MCP servers, register tools.
 
     Called from ``model_tools`` after ``discover_builtin_tools()``. Safe to call even when
@@ -7395,6 +7578,9 @@ def discover_mcp_tools() -> List[str]:
         List of all registered MCP tool names.
     """
     servers = _load_mcp_config()
+    if capability_hints:
+        selected = set(select_mcp_servers_for_capabilities(servers, capability_hints))
+        servers = {name: config for name, config in servers.items() if name in selected}
     if not servers:
         logger.debug("No MCP servers configured")
         return []

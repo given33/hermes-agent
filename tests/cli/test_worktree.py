@@ -165,8 +165,8 @@ def _has_unpushed_commits(worktree_path, timeout=10):
 def _cleanup_worktree(info):
     """Test version of _cleanup_worktree.
 
-    Preserves the worktree only if it has unpushed commits.
-    Dirty working tree alone is not enough to keep it.
+    Mirrors production's durable-work guards: preserve both unpushed commits
+    and uncommitted working-tree files.
     """
     wt_path = info["path"]
     branch = info["branch"]
@@ -177,6 +177,13 @@ def _cleanup_worktree(info):
 
     if _has_unpushed_commits(wt_path, timeout=10):
         return False  # Did not clean up — has unpushed commits
+
+    status = subprocess.run(
+        ["git", "status", "--porcelain"], capture_output=True, text=True,
+        cwd=wt_path,
+    )
+    if status.returncode != 0 or status.stdout.strip():
+        return False
 
     subprocess.run(
         ["git", "worktree", "remove", wt_path, "--force"],
@@ -903,10 +910,10 @@ class TestWorktreeLockPredicate:
 
 
 
-    def test_foreign_lock_reason_returns_dead(self, git_repo):
+    def test_foreign_lock_reason_fails_safe_to_live(self, git_repo):
         import cli
         p = self._mk_locked(git_repo, "hermes-foreign", "some other tool")
-        assert cli._worktree_lock_is_live(str(git_repo), str(p)) == "dead"
+        assert cli._worktree_lock_is_live(str(git_repo), str(p)) == "live"
 
     def test_bad_repo_root_fails_safe_to_live(self, tmp_path):
         import cli

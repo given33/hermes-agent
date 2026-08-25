@@ -11,6 +11,11 @@ import subprocess
 import sys
 import threading
 
+# Windows' signal module has no SIGKILL; os.kill() with any non-CTRL_*
+# signal maps to TerminateProcess there, so the SIGTERM fallback below is
+# still a hard kill on every platform.
+_SIGKILL = getattr(signal, "SIGKILL", signal.SIGTERM)
+
 
 
 def _spawn_sleep(seconds: float = 60) -> subprocess.Popen:
@@ -58,7 +63,7 @@ class TestZombieReproduction:
         finally:
             for pid in pids:
                 try:
-                    os.kill(pid, signal.SIGKILL)
+                    os.kill(pid, _SIGKILL)
                 except (ProcessLookupError, PermissionError):
                     pass
 

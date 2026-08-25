@@ -13,6 +13,8 @@ from gateway.platforms.base import (
     cache_audio_from_bytes,
     cache_image_from_bytes,
     cache_video_from_bytes,
+    local_path_to_file_uri,
+    _local_path_from_file_uri,
     safe_url_for_log,
     utf16_len,
     validate_inbound_media_size,
@@ -20,6 +22,23 @@ from gateway.platforms.base import (
     _prefix_within_utf16_limit,
     cache_audio_from_bytes,
 )
+
+
+def test_local_file_uri_round_trips_native_windows_path_with_spaces(tmp_path):
+    """Batch media must use ``file:///C:/...`` without leaking backslashes."""
+    image = tmp_path / "image cache" / "poster one.png"
+    image.parent.mkdir()
+    image.write_bytes(b"png")
+
+    uri = local_path_to_file_uri(image)
+
+    assert uri.startswith("file:///")
+    assert "\\" not in uri
+    assert "%20" in uri
+    assert _local_path_from_file_uri(uri) == str(image.absolute())
+    assert _local_path_from_file_uri(
+        "file://" + str(image.absolute()),
+    ) == str(image.absolute())
 
 
 def test_media_delivery_denies_encrypted_bitwarden_cache(tmp_path, monkeypatch):
@@ -243,10 +262,27 @@ class TestExtractMedia:
 
     def test_dedup_uses_expanded_path_so_tilde_and_absolute_collapse(self):
         import os
-        home = os.path.expanduser("~")
-        content = f"MEDIA:~/foo.png\nMEDIA:{home}/foo.png"
-        media, _ = BasePlatformAdapter.extract_media(content)
-        assert media == [(f"{home}/foo.png", False)]
+        # Use a controlled HOME so this stays deterministic on every host
+        # (Windows would otherwise resolve via USERPROFILE to the account
+        # home, which uses backslashes). The production code is documented to
+        # return the tilde-expanded form on every platform, so we compare
+        # against the POSIX-shaped home.
+        saved_home = os.environ.get("HOME")
+        saved_userprofile = os.environ.get("USERPROFILE")
+        os.environ["HOME"] = "/home/test"
+        os.environ.pop("USERPROFILE", None)
+        try:
+            home = "/home/test"
+            content = f"MEDIA:~/foo.png\nMEDIA:{home}/foo.png"
+            media, _ = BasePlatformAdapter.extract_media(content)
+            assert media == [(f"{home}/foo.png", False)]
+        finally:
+            if saved_home is None:
+                os.environ.pop("HOME", None)
+            else:
+                os.environ["HOME"] = saved_home
+            if saved_userprofile is not None:
+                os.environ["USERPROFILE"] = saved_userprofile
 
     def test_as_document_directive_stripped_from_cleaned_text(self):
         """[[as_document]] is a routing directive — strip it from
@@ -771,7 +807,12 @@ class TestMediaDeliveryDefaultMode:
         workdir = fake_home / "work"
         workdir.mkdir()
         link = workdir / "innocent.pdf"
-        link.symlink_to(key)
+        try:
+            link.symlink_to(key)
+        except OSError as exc:
+            # Windows only grants symlink creation with Developer Mode/admin.
+            # The resolved-target guard is still exercised on POSIX hosts.
+            pytest.skip(f"host cannot create file symlinks: {exc}")
         monkeypatch.setenv("HOME", str(fake_home))
         monkeypatch.setattr(
             "gateway.platforms.base._MEDIA_DELIVERY_DENIED_PREFIXES",

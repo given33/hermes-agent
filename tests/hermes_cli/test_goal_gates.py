@@ -65,14 +65,23 @@ def test_run_gate_pass():
 
 
 def test_run_gate_fail_captures_output():
-    passed, code, out = run_gate(GoalGate(command="echo broken >&2; exit 3"))
+    # Cross-platform: gates run through the platform shell (sh vs cmd.exe),
+    # so use an interpreter one-liner instead of POSIX-only redirection.
+    # Inner string stays single-quoted: cmd.exe strips nested doubles.
+    fail_code = "import sys; print('broken', file=sys.stderr); sys.exit(3)"
+    passed, code, out = run_gate(
+        GoalGate(command=f'"{sys.executable}" -c "{fail_code}"')
+    )
     assert passed is False
     assert code == 3
     assert "broken" in out
 
 
 def test_run_gate_timeout():
-    passed, code, out = run_gate(GoalGate(command="sleep 5", timeout_seconds=1))
+    hang_cmd = f'"{sys.executable}" -c "import time; time.sleep(5)"'
+    passed, code, out = run_gate(
+        GoalGate(command=hang_cmd, timeout_seconds=1)
+    )
     assert passed is False
     assert code == -1
     assert "timed out" in out
@@ -173,7 +182,8 @@ def test_failing_gate_short_circuits_judge():
 
 def test_passing_gates_fall_through_to_judge():
     mgr = _mgr_with_goal("gate-pass-sid")
-    mgr.add_gate("true")
+    # "exit 0" succeeds under both sh and cmd.exe ("true" is POSIX-only).
+    mgr.add_gate("exit 0")
     with patch(
         "hermes_cli.goals.judge_goal",
         return_value=("done", "all good", False, None, False),

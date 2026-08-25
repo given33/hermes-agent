@@ -52,6 +52,13 @@ def _ensure_parallel_sdk_installed() -> None:
     raises ImportError that the caller can handle.
     """
     try:
+        import parallel  # noqa: F401 — presence check avoids unnecessary installs
+
+        return
+    except ImportError:
+        pass
+
+    try:
         from tools.lazy_deps import ensure as _lazy_ensure
 
         _lazy_ensure("search.parallel", prompt=False)

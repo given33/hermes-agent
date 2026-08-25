@@ -371,7 +371,7 @@ async function removeWorktree(repoPath, worktreePath, options, gitBin) {
 // Each branch carries a flag for a checkout in a worktree, and the path of that
 // worktree. Empty on a non-repo or a remote backend, where the probe cannot
 // run.
-async function listBranches(repoPath, gitBin) {
+async function listBranches(repoPath, gitBin, runGitFn = runGit) {
   let resolved
 
   try {
@@ -381,10 +381,20 @@ async function listBranches(repoPath, gitBin) {
   }
 
   try {
-    const [localOut, remoteOut] = await Promise.all([
-      runGit(gitBin, ['for-each-ref', '--format=%(refname:short)', '--sort=-committerdate', 'refs/heads'], resolved),
-      runGit(gitBin, ['for-each-ref', '--format=%(refname:short)', '--sort=-committerdate', 'refs/remotes'], resolved)
+    // Keep the probes concurrent, but do not let a fast non-repository error
+    // return while the other child still has the cwd open. That race makes
+    // temporary project cleanup fail with EPERM on Windows.
+    const [localResult, remoteResult] = await Promise.allSettled([
+      runGitFn(gitBin, ['for-each-ref', '--format=%(refname:short)', '--sort=-committerdate', 'refs/heads'], resolved),
+      runGitFn(gitBin, ['for-each-ref', '--format=%(refname:short)', '--sort=-committerdate', 'refs/remotes'], resolved)
     ])
+
+    if (localResult.status === 'rejected' || remoteResult.status === 'rejected') {
+      return []
+    }
+
+    const localOut = localResult.value
+    const remoteOut = remoteResult.value
 
     const trees = await listWorktrees(resolved, gitBin)
     const pathByBranch = new Map(trees.filter(tree => tree.branch).map(tree => [tree.branch, tree.path]))

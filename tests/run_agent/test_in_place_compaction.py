@@ -16,6 +16,12 @@ from unittest.mock import patch
 
 import pytest
 
+# Windows cannot unlink a file another handle still has open (WinError 32),
+# so every SessionDB here is owned by a ``with`` scope nested inside its
+# TemporaryDirectory: the handle closes deterministically BEFORE directory
+# cleanup runs, instead of leaking until GC (POSIX tolerates the leak;
+# Windows turns every teardown into PermissionError).
+
 
 def _make_agent(session_db, session_id, *, in_place):
     with patch.dict(os.environ, {"OPENROUTER_API_KEY": "test-key"}):
@@ -64,8 +70,8 @@ class TestInPlaceCompaction:
         from hermes_state import SessionDB
         from agent.conversation_compression import compress_context
 
-        with tempfile.TemporaryDirectory() as tmp:
-            db = SessionDB(db_path=Path(tmp) / "t.db")
+        with tempfile.TemporaryDirectory() as tmp, \
+                SessionDB(db_path=Path(tmp) / "t.db") as db:
             sid = "20260619_120000_aaaaaa"
             _seed(db, sid, "my-research")
             agent = _make_agent(db, sid, in_place=True)
@@ -129,8 +135,8 @@ class TestInPlaceCompaction:
         from hermes_state import SessionDB
         from agent.conversation_compression import compress_context
 
-        with tempfile.TemporaryDirectory() as tmp:
-            db = SessionDB(db_path=Path(tmp) / "t.db")
+        with tempfile.TemporaryDirectory() as tmp, \
+                SessionDB(db_path=Path(tmp) / "t.db") as db:
             sid = "20260619_120500_cccccc"
             _seed(db, sid, "alt")
             agent = _make_agent(db, sid, in_place=True)
@@ -148,8 +154,8 @@ class TestInPlaceCompaction:
         from hermes_state import SessionDB
         from agent.conversation_compression import compress_context
 
-        with tempfile.TemporaryDirectory() as tmp:
-            db = SessionDB(db_path=Path(tmp) / "t.db")
+        with tempfile.TemporaryDirectory() as tmp, \
+                SessionDB(db_path=Path(tmp) / "t.db") as db:
             _seed(db, "rot_flush", "f")
             agent = _make_agent(db, "rot_flush", in_place=False)
             calls = {"n": 0}
@@ -171,8 +177,8 @@ class TestRotationFallbackWhenFlagOff:
         from hermes_state import SessionDB
         from agent.conversation_compression import compress_context
 
-        with tempfile.TemporaryDirectory() as tmp:
-            db = SessionDB(db_path=Path(tmp) / "t.db")
+        with tempfile.TemporaryDirectory() as tmp, \
+                SessionDB(db_path=Path(tmp) / "t.db") as db:
             sid = "20260619_130000_bbbbbb"
             _seed(db, sid, "my-research")
             agent = _make_agent(db, sid, in_place=False)
@@ -215,8 +221,8 @@ class TestInPlaceSignalForGateway:
         from hermes_state import SessionDB
         from agent.conversation_compression import compress_context
 
-        with tempfile.TemporaryDirectory() as tmp:
-            db = SessionDB(db_path=Path(tmp) / "t.db")
+        with tempfile.TemporaryDirectory() as tmp, \
+                SessionDB(db_path=Path(tmp) / "t.db") as db:
             # in-place → flag True
             _seed(db, "s_ip", "ip")
             a_ip = _make_agent(db, "s_ip", in_place=True)
@@ -258,8 +264,8 @@ class TestInPlaceAntiGrowthGuard:
         from hermes_state import SessionDB
         from agent.conversation_compression import compress_context
 
-        with tempfile.TemporaryDirectory() as tmp:
-            db = SessionDB(db_path=Path(tmp) / "t.db")
+        with tempfile.TemporaryDirectory() as tmp, \
+                SessionDB(db_path=Path(tmp) / "t.db") as db:
             sid = "20260619_antigrow"
             _seed(db, sid, "grow")
             agent = _make_agent(db, sid, in_place=True)
@@ -299,8 +305,8 @@ class TestInPlaceAntiGrowthGuard:
         from hermes_state import SessionDB
         from agent.conversation_compression import compress_context
 
-        with tempfile.TemporaryDirectory() as tmp:
-            db = SessionDB(db_path=Path(tmp) / "t.db")
+        with tempfile.TemporaryDirectory() as tmp, \
+                SessionDB(db_path=Path(tmp) / "t.db") as db:
             sid = "20260619_shrink"
             _seed(db, sid, "shrink")
             agent = _make_agent(db, sid, in_place=True)
@@ -330,8 +336,8 @@ class TestCompactedTurnsStaySearchable:
     def test_compacted_turns_found_by_default_search(self):
         from hermes_state import SessionDB
 
-        with tempfile.TemporaryDirectory() as tmp:
-            db = SessionDB(db_path=Path(tmp) / "t.db")
+        with tempfile.TemporaryDirectory() as tmp, \
+                SessionDB(db_path=Path(tmp) / "t.db") as db:
             sid = "20260619_search"
             db.create_session(sid, "cli", model="test/model")
             for r, c in [
@@ -367,8 +373,8 @@ class TestCompactedTurnsStaySearchable:
         search — the distinction the compacted flag preserves."""
         from hermes_state import SessionDB
 
-        with tempfile.TemporaryDirectory() as tmp:
-            db = SessionDB(db_path=Path(tmp) / "t.db")
+        with tempfile.TemporaryDirectory() as tmp, \
+                SessionDB(db_path=Path(tmp) / "t.db") as db:
             sid = "20260619_undo"
             db.create_session(sid, "cli", model="test/model")
             db.append_message(session_id=sid, role="user", content="ZEBRAWORD remember this")

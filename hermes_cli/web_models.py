@@ -10,7 +10,7 @@ from __future__ import annotations
 import math
 from typing import Any, Dict, List, Literal, Optional
 
-from pydantic import BaseModel, SecretStr, field_validator
+from pydantic import BaseModel, Field, SecretStr, field_validator
 
 
 # --- from web_server.py (originally lines 1273-1372) ---
@@ -115,6 +115,17 @@ class ManagedDirectoryCreate(BaseModel):
 class ManagedFileDelete(BaseModel):
     path: str
     recursive: bool = False
+
+
+class ManagedInstallationRequest(BaseModel):
+    kind: str
+    identifier: str
+    profile: str = "default"
+    request_id: str = ""
+    scope: str = "auto"
+    locality: str = "portable"
+    targets: List[str] = Field(default_factory=list)
+    project_name: str = ""
 
 
 # --- from web_server.py (originally lines 1398-1491) ---
@@ -614,6 +625,11 @@ class ProfileSoulUpdate(BaseModel):
     content: str
 
 
+class StudioMemoryUpdate(BaseModel):
+    section: str
+    content: str
+
+
 class ProfileActiveUpdate(BaseModel):
     name: str
 
@@ -738,4 +754,3 @@ class _PluginProvidersPutBody(BaseModel):
 
 class _PluginVisibilityBody(BaseModel):
     hidden: bool
-

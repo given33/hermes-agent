@@ -77,17 +77,29 @@ class TestWrapCommandAdvertisesHarness:
         """Run the wrapped script through real bash both ways."""
         wrapped = self._wrap('echo "AI=$AI_AGENT HERMES=$HERMES_AGENT"')
 
+        # Resolve bash the way LocalEnvironment does.  A bare PATH lookup
+        # for "bash" on Windows can hit WSL's ``C:\Windows\system32\
+        # bash.exe``, which silently mangles multi-line ``-c`` scripts
+        # (drops the leading lines) — the product's ``_find_bash()`` prefers
+        # Git for Windows there and is a plain PATH lookup on POSIX.
+        from tools.environments.local import _find_bash
+
+        bash = _find_bash()
         clean_env = {k: v for k, v in os.environ.items()
                      if k not in ("AI_AGENT", "HERMES_AGENT")}
         out = subprocess.run(
-            ["bash", "-c", wrapped], capture_output=True, text=True,
+            [bash, "-c", wrapped], capture_output=True, text=True,
             env=clean_env, timeout=30,
         )
-        assert f"AI={HARNESS_ID} HERMES=true" in out.stdout
+        assert f"AI={HARNESS_ID} HERMES=true" in out.stdout, (
+            f"rc={out.returncode} stdout={out.stdout!r} stderr={out.stderr!r}"
+        )
 
         outer_env = dict(clean_env, AI_AGENT="pi", HERMES_AGENT="false")
         out = subprocess.run(
-            ["bash", "-c", wrapped], capture_output=True, text=True,
+            [bash, "-c", wrapped], capture_output=True, text=True,
             env=outer_env, timeout=30,
         )
-        assert "AI=pi HERMES=false" in out.stdout
+        assert "AI=pi HERMES=false" in out.stdout, (
+            f"rc={out.returncode} stdout={out.stdout!r} stderr={out.stderr!r}"
+        )

@@ -110,6 +110,10 @@ export function getVenvSitePackagesEntries(
   }
 
   const isWindows = opts.isWindows ?? process.platform === 'win32'
+  // The platform is injectable for callers/tests, so do not let the host
+  // process decide the path flavor. This matters when a POSIX test host
+  // exercises Windows venv layout (or vice versa).
+  const pathApi = isWindows ? path.win32 : path.posix
 
   const directoryExists =
     opts.directoryExists ??
@@ -132,7 +136,7 @@ export function getVenvSitePackagesEntries(
     })
 
   if (isWindows) {
-    const sitePackages = path.join(venvRoot, 'Lib', 'site-packages')
+    const sitePackages = pathApi.join(venvRoot, 'Lib', 'site-packages')
 
     if (directoryExists(sitePackages)) {
       entries.push(sitePackages)
@@ -141,7 +145,7 @@ export function getVenvSitePackagesEntries(
     return entries
   }
 
-  const cfg = readFile(path.join(venvRoot, 'pyvenv.cfg'))
+  const cfg = readFile(pathApi.join(venvRoot, 'pyvenv.cfg'))
 
   const version = (() => {
     if (!cfg) {
@@ -154,7 +158,7 @@ export function getVenvSitePackagesEntries(
   })()
 
   if (version) {
-    const sitePackages = path.join(venvRoot, 'lib', `python${version}`, 'site-packages')
+    const sitePackages = pathApi.join(venvRoot, 'lib', `python${version}`, 'site-packages')
 
     if (directoryExists(sitePackages)) {
       entries.push(sitePackages)
@@ -233,6 +237,8 @@ export function resolveVenvHermesCommand(
     rememberLog
   } = deps
 
+  const pathApi = isWindows ? path.win32 : path.posix
+
   if (!isWindows || !command || isCommandScript(command)) {
     return null
   }
@@ -261,9 +267,9 @@ export function resolveVenvHermesCommand(
   if (
     !canImportHermesCli(python, {
       env: {
-        PYTHONPATH: [...(directoryExists(root) ? [root] : []), process.env.PYTHONPATH]
-          .filter((entry): entry is string => Boolean(entry))
-          .join(path.delimiter)
+          PYTHONPATH: [...(directoryExists(root) ? [root] : []), process.env.PYTHONPATH]
+            .filter((entry): entry is string => Boolean(entry))
+            .join(pathApi.delimiter)
       }
     })
   ) {

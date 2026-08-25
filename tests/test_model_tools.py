@@ -30,6 +30,59 @@ class TestHandleFunctionCall:
         assert "error" in result
         assert "totally_fake_tool_xyz" in result["error"]
 
+    def test_tool_role_rechecks_capability_before_dispatch(self, monkeypatch):
+        entry = object()
+        dispatched = []
+        monkeypatch.setattr(
+            "model_tools.registry.get_entry",
+            lambda name: entry if name == "restricted_tool" else None,
+        )
+        monkeypatch.setattr(
+            "model_tools.registry.get_tool_names_for_role",
+            lambda role, names: set(),
+        )
+        monkeypatch.setattr(
+            "model_tools.registry.dispatch",
+            lambda *args, **kwargs: dispatched.append((args, kwargs)),
+        )
+
+        result = json.loads(
+            handle_function_call("restricted_tool", {}, tool_role="reporter")
+        )
+
+        assert "not available for role 'reporter'" in result["error"]
+        assert dispatched == []
+
+    def test_enabled_tools_is_a_hard_allowlist(self, monkeypatch):
+        dispatched = []
+        monkeypatch.setattr(
+            "model_tools.registry.dispatch",
+            lambda *args, **kwargs: dispatched.append(args) or '{"ok":true}',
+        )
+
+        blocked = json.loads(
+            handle_function_call(
+                "out_of_scope_tool",
+                {},
+                enabled_tools=[],
+                skip_pre_tool_call_hook=True,
+                skip_tool_request_middleware=True,
+                skip_tool_execution_middleware=True,
+            )
+        )
+        allowed = handle_function_call(
+            "allowed_tool",
+            {},
+            enabled_tools=["allowed_tool"],
+            skip_pre_tool_call_hook=True,
+            skip_tool_request_middleware=True,
+            skip_tool_execution_middleware=True,
+        )
+
+        assert "not available in this session" in blocked["error"]
+        assert allowed == '{"ok":true}'
+        assert [args[0] for args in dispatched] == ["allowed_tool"]
+
 
 
     def test_post_tool_call_receives_non_negative_integer_duration_ms(self):

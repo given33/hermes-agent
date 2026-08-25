@@ -95,9 +95,10 @@ html {
   font-size: var(--theme-base-size);
   line-height: var(--theme-line-height);
   letter-spacing: var(--theme-letter-spacing);
-  height: 100dvh;
-  max-height: 100dvh;
+  height: var(--hermes-viewport-height, 100dvh);
+  max-height: var(--hermes-viewport-height, 100dvh);
   overflow: hidden;
+  overscroll-behavior: none;
 }
 
 body {
@@ -129,15 +130,23 @@ code, kbd, pre, samp, .font-mono, .font-mono-ui {
   overflow: hidden;
 }
 
+@media (display-mode: standalone) {
+  body {
+    padding-top: env(safe-area-inset-top, 0px);
+    padding-bottom: env(safe-area-inset-bottom, 0px);
+  }
+}
+
 @media (max-width: 768px) {
   html,
   body,
   #root {
-    min-height: 100dvh;
-    height: auto;
-    max-height: none;
+    min-height: 0;
+    height: var(--hermes-viewport-height, 100dvh);
+    max-height: var(--hermes-viewport-height, 100dvh);
     overflow-x: hidden;
-    overflow-y: auto;
+    overflow-y: hidden;
+    overscroll-behavior: none;
   }
 }
 
@@ -252,4 +261,3 @@ code { font-size: 0.875rem; }
 html[dir="rtl"] {
   direction: rtl;
 }
-

@@ -65,14 +65,14 @@ class TestWriteFileCrossProfileGuard:
         result = json.loads(result_json)
         assert not result.get("error"), f"In-profile write should succeed: {result}"
         assert target.exists()
-        assert target.read_text() == "in-profile content"
+        assert target.read_text(encoding="utf-8") == "in-profile content"
 
     def test_cross_profile_write_blocked_by_default(self, fake_hermes):
         """The May 2026 incident — security-profile session edits default
         profile's skill. Must be blocked."""
         from tools.file_tools import write_file_tool
         target = fake_hermes["root"] / "skills" / "shared-skill" / "SKILL.md"
-        original = target.read_text()
+        original = target.read_text(encoding="utf-8")
         result_json = write_file_tool(str(target), "OVERWRITTEN")
         result = json.loads(result_json)
         assert result.get("error"), "Cross-profile write should be refused"
@@ -80,7 +80,7 @@ class TestWriteFileCrossProfileGuard:
         assert "default" in result["error"]
         assert "hermes-security" in result["error"]
         # File untouched.
-        assert target.read_text() == original
+        assert target.read_text(encoding="utf-8") == original
 
 
     def test_non_hermes_path_unaffected(self, fake_hermes, tmp_path):
@@ -102,7 +102,7 @@ class TestPatchCrossProfileGuard:
     def test_cross_profile_patch_blocked(self, fake_hermes):
         from tools.file_tools import patch_tool
         target = fake_hermes["root"] / "skills" / "shared-skill" / "SKILL.md"
-        original = target.read_text()
+        original = target.read_text(encoding="utf-8")
         result_json = patch_tool(
             mode="replace",
             path=str(target),
@@ -112,7 +112,7 @@ class TestPatchCrossProfileGuard:
         result = json.loads(result_json)
         assert result.get("error")
         assert "cross-profile" in result["error"].lower()
-        assert target.read_text() == original
+        assert target.read_text(encoding="utf-8") == original
 
     def test_cross_profile_patch_bypass(self, fake_hermes):
         from tools.file_tools import patch_tool
@@ -126,14 +126,14 @@ class TestPatchCrossProfileGuard:
         )
         result = json.loads(result_json)
         assert not result.get("error"), f"cross_profile=True bypass: {result}"
-        assert "user-directed update." in target.read_text()
+        assert "user-directed update." in target.read_text(encoding="utf-8")
 
     def test_v4a_patch_extracts_path_for_guard(self, fake_hermes):
         """V4A patches embed the target paths in the patch body, not in
         a ``path`` kwarg. The guard must still apply."""
         from tools.file_tools import patch_tool
         target = fake_hermes["root"] / "skills" / "shared-skill" / "SKILL.md"
-        original = target.read_text()
+        original = target.read_text(encoding="utf-8")
         v4a = (
             "*** Begin Patch\n"
             f"*** Update File: {target}\n"
@@ -146,7 +146,7 @@ class TestPatchCrossProfileGuard:
         result = json.loads(result_json)
         assert result.get("error"), f"V4A cross-profile must block: {result}"
         assert "cross-profile" in result["error"].lower()
-        assert target.read_text() == original
+        assert target.read_text(encoding="utf-8") == original
 
 
 # ---------------------------------------------------------------------------
@@ -224,7 +224,7 @@ class TestSystemPromptActiveProfile:
         # paths, (3) says "do not modify another profile's" without
         # explicit user direction.
         from pathlib import Path
-        src = Path("agent/system_prompt.py").read_text()
+        src = Path("agent/system_prompt.py").read_text(encoding="utf-8")
         assert "Active Hermes profile" in src
         assert "cross_profile=True" in src
         assert "~/.hermes/profiles/" in src

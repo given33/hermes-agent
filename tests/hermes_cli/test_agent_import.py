@@ -11,7 +11,9 @@ the real ~/.hermes.
 """
 
 import json
+import os
 from pathlib import Path
+import sys
 
 import pytest
 import yaml
@@ -498,6 +500,10 @@ approvals: [unclosed
 CONFIG_WRITING_KINDS = ("command-allowlist", "command-denylist", "mcp-servers")
 
 
+@pytest.mark.skipif(
+    not hasattr(os, "symlink") or sys.platform == "win32",
+    reason="Test creates a symlink to verify atomic_replace behavior; Windows requires elevated privileges for symlinks",
+)
 class TestExistingConfigPreserved:
     """An import must not destroy the config.yaml it merges into.
 

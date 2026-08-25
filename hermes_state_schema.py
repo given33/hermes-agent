@@ -145,6 +145,119 @@ class SessionSchemaMixin:
             except sqlite3.OperationalError:
                 pass
 
+    def _drop_corrupt_fts_schema(
+        self,
+        cursor: sqlite3.Cursor,
+        *,
+        include_trigram: bool = True,
+    ) -> None:
+        """Drop only the known FTS5 objects after normal DDL cannot do so.
+
+        A damaged FTS5 shadow table can make SQLite construct the virtual table
+        while executing ``DROP TABLE messages_fts`` and fail with
+        ``vtable constructor failed``.  Directly deleting ``sqlite_master``
+        rows is insufficient: the shadow B-trees remain attached to the file,
+        and the replacement virtual table then collides with those stale
+        roots.  Within one transaction, turn each *verified* FTS5 root into a
+        temporary ordinary table, drop it normally, then drop the exact shadow
+        table/view names.  The allowlist is deliberately explicit so unrelated
+        ``messages_fts_*`` objects are never touched; any failure rolls back
+        both the schema text surgery and the physical drops.
+        """
+        root_names = ("messages_fts",)
+        if include_trigram:
+            root_names += ("messages_fts_trigram",)
+        shadow_names = (
+            "messages_fts_config",
+            "messages_fts_content",
+            "messages_fts_data",
+            "messages_fts_docsize",
+            "messages_fts_idx",
+        )
+        if include_trigram:
+            shadow_names += (
+                "messages_fts_trigram_config",
+                "messages_fts_trigram_content",
+                "messages_fts_trigram_data",
+                "messages_fts_trigram_docsize",
+                "messages_fts_trigram_idx",
+            )
+        view_names = ("messages_fts_trigram_src",) if include_trigram else ()
+        all_names = root_names + shadow_names + view_names
+        placeholders = ",".join("?" for _ in all_names)
+
+        self._conn.execute("BEGIN IMMEDIATE")
+        writable_schema = False
+        try:
+            rows = cursor.execute(
+                "SELECT name, type, sql FROM sqlite_master "
+                f"WHERE name IN ({placeholders})",
+                all_names,
+            ).fetchall()
+            objects = {
+                row[0]: (row[1], row[2])
+                for row in rows
+            }
+
+            # Only rewrite an object whose stored DDL proves it is an FTS5
+            # virtual table. An ordinary table with a colliding name is not
+            # part of this recovery surface and must be left untouched.
+            virtual_roots = []
+            for name in root_names:
+                obj = objects.get(name)
+                if obj is None:
+                    continue
+                type_, sql = obj
+                if type_ != "table" or "using fts5" not in (sql or "").lower():
+                    raise sqlite3.DatabaseError(
+                        f"refusing FTS recovery for unexpected object {name!r}"
+                    )
+                virtual_roots.append(name)
+
+            schema_cookie = cursor.execute(
+                "PRAGMA schema_version"
+            ).fetchone()[0]
+            cursor.execute("PRAGMA writable_schema=ON")
+            writable_schema = True
+            for name in virtual_roots:
+                # Names come only from the literal allowlist above. Replacing
+                # the root definition lets ordinary DROP TABLE remove its
+                # root B-tree without asking the damaged FTS module to load.
+                cursor.execute(
+                    "UPDATE sqlite_master SET sql = ? "
+                    "WHERE type = 'table' AND name = ?",
+                    (f"CREATE TABLE {name} (_hermes_recovery BLOB)", name),
+                )
+            # Direct sqlite_master edits do not invalidate prepared schemas on
+            # their own. Bump the cookie before returning to ordinary DDL.
+            cursor.execute(
+                f"PRAGMA schema_version={(int(schema_cookie) + 1) & 0x7FFFFFFF}"
+            )
+            cursor.execute("PRAGMA writable_schema=OFF")
+            writable_schema = False
+
+            for name in root_names:
+                if name in virtual_roots:
+                    cursor.execute(f"DROP TABLE {name}")
+            for name in shadow_names:
+                if objects.get(name, (None, None))[0] == "table":
+                    cursor.execute(f"DROP TABLE {name}")
+            for name in view_names:
+                if objects.get(name, (None, None))[0] == "view":
+                    cursor.execute(f"DROP VIEW {name}")
+            self._conn.commit()
+        except BaseException:
+            if writable_schema:
+                try:
+                    cursor.execute("PRAGMA writable_schema=OFF")
+                except sqlite3.Error:
+                    pass
+            try:
+                self._conn.rollback()
+            except sqlite3.Error:
+                pass
+            raise
+
     @staticmethod
     def _fts_trigger_count(cursor: sqlite3.Cursor) -> int:
         placeholders = ",".join("?" for _ in _FTS_TRIGGERS)
@@ -443,12 +556,46 @@ class SessionSchemaMixin:
             # DDL transaction behavior differs.
             self._drop_all_fts_triggers(cursor)
             self._conn.commit()
-            logger.error(
-                "Automatic rebuild of stale FTS indexes failed (%s); "
-                "canonical writes remain enabled with FTS detached.",
-                exc,
+            try:
+                # A corrupt FTS5 shadow table can make DROP TABLE itself fail
+                # while the canonical messages table remains readable. Remove
+                # the derived schema through the same narrowly-scoped
+                # writable_schema fallback as the offline repair command, then
+                # recreate and backfill it from canonical rows.
+                self._drop_corrupt_fts_schema(
+                    cursor,
+                    include_trigram=include_trigram,
+                )
+                cursor.executescript(
+                    "BEGIN IMMEDIATE;"
+                    + rebuild_sql
+                    + f"DELETE FROM state_meta WHERE key = '{FTS_STALE_KEY}';"
+                    + "COMMIT;"
+                )
+            except sqlite3.DatabaseError as fallback_exc:
+                try:
+                    self._conn.rollback()
+                except sqlite3.Error:
+                    pass
+                self._drop_all_fts_triggers(cursor)
+                self._conn.commit()
+                logger.error(
+                    "Automatic rebuild of stale FTS indexes failed (%s; "
+                    "schema fallback: %s); canonical writes remain enabled "
+                    "with FTS detached.",
+                    exc,
+                    fallback_exc,
+                )
+                return False
+
+            self._fts_stale = False
+            self._fts_enabled = True
+            self._trigram_available = include_trigram
+            logger.warning(
+                "Rebuilt stale state.db FTS indexes through schema fallback "
+                "and restored sync triggers."
             )
-            return False
+            return True
 
         self._fts_stale = False
         self._fts_enabled = True

@@ -49,6 +49,7 @@ import mimetypes
 import os
 import re
 import shutil
+import tempfile
 import uuid
 from collections import OrderedDict
 from pathlib import Path
@@ -188,6 +189,7 @@ def _ext_for_mime(mime: str) -> Optional[str]:
 # Inbound media cache lives under the user's hermes dir so it survives
 # restarts and gateway reloads — same convention the Baileys bridge uses.
 _INBOUND_MEDIA_CACHE = Path(get_hermes_dir("platforms/whatsapp_cloud/media", "whatsapp_cloud/media"))
+_MAX_INBOUND_MEDIA_BYTES = 64 * 1024 * 1024
 
 
 def check_whatsapp_cloud_requirements() -> bool:
@@ -1369,20 +1371,6 @@ class WhatsAppCloudAdapter(WhatsAppBehaviorMixin, BasePlatformAdapter):
 
         # Step 2 — bytes (auth required even though URL is signed; Meta
         # documents this explicitly — the URL alone is not enough).
-        try:
-            blob_resp = await self._http_client.get(temp_url, headers=headers)
-        except Exception:
-            logger.exception(
-                "[whatsapp_cloud] media bytes fetch raised (id=%s)", media_id
-            )
-            return None, None
-        if blob_resp.status_code != 200:
-            logger.warning(
-                "[whatsapp_cloud] media bytes fetch failed (id=%s, status=%d)",
-                media_id, blob_resp.status_code,
-            )
-            return None, None
-
         # Decide the extension. Prefer the override map so audio/ogg
         # produces .ogg (not the technically-correct-but-broken .oga
         # mimetypes returns by default). Fall back to ext_hint then
@@ -1395,13 +1383,72 @@ class WhatsAppCloudAdapter(WhatsAppBehaviorMixin, BasePlatformAdapter):
 
         _INBOUND_MEDIA_CACHE.mkdir(parents=True, exist_ok=True)
         out_path = _INBOUND_MEDIA_CACHE / f"{media_id}{ext}"
+        temp_path: Path | None = None
+        completed = False
+        received = 0
         try:
-            out_path.write_bytes(blob_resp.content)
-        except OSError:
+            with tempfile.NamedTemporaryFile(
+                mode="wb",
+                prefix=f".{media_id}.",
+                suffix=ext,
+                dir=_INBOUND_MEDIA_CACHE,
+                delete=False,
+            ) as handle:
+                temp_path = Path(handle.name)
+                blob_resp = await self._http_client.get(temp_url, headers=headers)
+                try:
+                    raw_status = getattr(blob_resp, "status", None)
+                    status = raw_status if isinstance(raw_status, int) else None
+                    if status is None:
+                        legacy_status = getattr(blob_resp, "status_code", None)
+                        status = legacy_status if isinstance(legacy_status, int) else 0
+                    if status != 200:
+                        logger.warning(
+                            "[whatsapp_cloud] media bytes fetch failed (id=%s, status=%d)",
+                            media_id, status,
+                        )
+                        return None, None
+                    if isinstance(raw_status, int):
+                        async for chunk in blob_resp.aiter_bytes(64 * 1024):
+                            received += len(chunk)
+                            if received > _MAX_INBOUND_MEDIA_BYTES:
+                                logger.warning(
+                                    "[whatsapp_cloud] inbound media exceeds %d bytes (id=%s)",
+                                    _MAX_INBOUND_MEDIA_BYTES, media_id,
+                                )
+                                return None, None
+                            handle.write(chunk)
+                    else:
+                        content = blob_resp.content
+                        if isinstance(content, str):
+                            content = content.encode("utf-8")
+                        for offset in range(0, len(content), 64 * 1024):
+                            chunk = content[offset:offset + 64 * 1024]
+                            received += len(chunk)
+                            if received > _MAX_INBOUND_MEDIA_BYTES:
+                                logger.warning(
+                                    "[whatsapp_cloud] inbound media exceeds %d bytes (id=%s)",
+                                    _MAX_INBOUND_MEDIA_BYTES, media_id,
+                                )
+                                return None, None
+                            handle.write(chunk)
+                    completed = True
+                finally:
+                    pass
+            if completed:
+                os.replace(temp_path, out_path)
+                temp_path = None
+        except Exception:
             logger.exception(
-                "[whatsapp_cloud] failed to write cached media (id=%s)", media_id
+                "[whatsapp_cloud] failed to cache media (id=%s)", media_id
             )
             return None, None
+        finally:
+            if temp_path is not None:
+                try:
+                    temp_path.unlink(missing_ok=True)
+                except OSError:
+                    pass
 
         return str(out_path), mime or None
 

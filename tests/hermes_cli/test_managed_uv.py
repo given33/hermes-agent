@@ -90,11 +90,14 @@ class TestManagedUvPath:
 class TestResolveUv:
 
     def test_existing_executable(self, tmp_path):
-        _make_executable(tmp_path / "bin" / "uv")
+        # managed_uv_path() maps the binary name per platform (uv.exe on
+        # Windows); create whichever name this platform resolves.
+        uv_name = "uv.exe" if sys.platform == "win32" else "uv"
+        _make_executable(tmp_path / "bin" / uv_name)
         with patch("hermes_cli.managed_uv.get_hermes_home", return_value=tmp_path):
             from hermes_cli.managed_uv import resolve_uv
             result = resolve_uv()
-            assert result == str(tmp_path / "bin" / "uv")
+            assert result == str(tmp_path / "bin" / uv_name)
 
     def test_non_executable_file_returns_none(self, tmp_path):
         uv = tmp_path / "bin" / "uv"
@@ -124,7 +127,8 @@ class TestEnsureUv:
 
             from hermes_cli.managed_uv import ensure_uv
             path = ensure_uv()
-            assert path == str(tmp_path / "bin" / "uv")
+            expected = tmp_path / "bin" / ("uv.exe" if sys.platform == "win32" else "uv")
+            assert path == str(expected)
             mock_install.assert_called_once()
 
     def test_install_reports_runtime_repair_to_observer(self, tmp_path):
@@ -155,7 +159,8 @@ class TestEnsureUv:
         ):
             path = ensure_uv(repair_observer=observed.append)
 
-        assert path == str(tmp_path / "bin" / "uv")
+        expected = tmp_path / "bin" / ("uv.exe" if sys.platform == "win32" else "uv")
+        assert path == str(expected)
         assert observed == [repair]
 
 
@@ -266,7 +271,7 @@ class TestUpdateManagedUv:
         vulnerable-runtime repair probe still runs (CVE repair is never gated)."""
         from hermes_cli.managed_uv import RuntimeRepairResult, update_managed_uv
 
-        uv = tmp_path / "bin" / "uv"
+        uv = tmp_path / "bin" / ("uv.exe" if sys.platform == "win32" else "uv")
         _make_executable(uv)
         # Fresh stamp under the isolated HERMES_HOME.
         import hermes_constants
@@ -293,7 +298,7 @@ class TestUpdateManagedUv:
 
         from hermes_cli.managed_uv import UV_SELF_UPDATE_INTERVAL_SECONDS, update_managed_uv
 
-        uv = tmp_path / "bin" / "uv"
+        uv = tmp_path / "bin" / ("uv.exe" if sys.platform == "win32" else "uv")
         _make_executable(uv)
         import hermes_constants
         stamp = hermes_constants.get_hermes_home() / "cache" / ".uv_self_update_stamp"
@@ -606,6 +611,7 @@ class TestRuntimeCutover:
 # ---------------------------------------------------------------------------
 
 class TestInstallUvInternals:
+    @pytest.mark.skipif(sys.platform == "win32", reason="POSIX-only: _install_uv_posix branch")
     def test_posix_sets_uv_unmanaged_install(self, tmp_path):
         target = tmp_path / "bin" / "uv"
         with patch("hermes_cli.managed_uv._install_uv_posix") as mock_posix:
@@ -614,6 +620,19 @@ class TestInstallUvInternals:
             mock_posix.assert_called_once()
             call_env = mock_posix.call_args[0][0]
             assert call_env["UV_UNMANAGED_INSTALL"] == str(tmp_path / "bin")
+
+    @pytest.mark.skipif(sys.platform != "win32", reason="Windows-only: _install_uv_windows branch")
+    def test_windows_sets_uv_install_dir(self, tmp_path):
+        """win32 twin: the PowerShell installer branch must receive the
+        UV_INSTALL_DIR override so astral's script drops uv.exe into
+        $HERMES_HOME\\bin instead of the user profile."""
+        target = tmp_path / "bin" / "uv.exe"
+        with patch("hermes_cli.managed_uv._install_uv_windows") as mock_win:
+            from hermes_cli.managed_uv import _install_uv
+            _install_uv(target)
+            mock_win.assert_called_once()
+            call_env = mock_win.call_args[0][0]
+            assert call_env["UV_INSTALL_DIR"] == str(tmp_path / "bin")
 
 
 class TestRuntimeRequestMinorLine:
@@ -1181,13 +1200,19 @@ class TestDefaultLiveVenv:
     """
 
     def _checkout(self, tmp_path, *dirs):
+        # Mirror the real venv layout per platform (_venv_python resolves
+        # Scripts/python.exe on Windows, bin/python on POSIX) so the
+        # interpreter-presence checks are meaningful on both lanes.
+        windows = sys.platform == "win32"
+        bin_name = "Scripts" if windows else "bin"
+        python_name = "python.exe" if windows else "python"
         root = tmp_path / "checkout"
         root.mkdir()
         (root / "pyproject.toml").write_text("[project]\n", encoding="utf-8")
         for d in dirs:
-            bin_dir = root / d / "bin"
+            bin_dir = root / d / bin_name
             bin_dir.mkdir(parents=True)
-            (bin_dir / "python").write_text("py", encoding="utf-8")
+            (bin_dir / python_name).write_text("py", encoding="utf-8")
         return root
 
     def test_dot_venv_only_is_targeted(self, tmp_path):

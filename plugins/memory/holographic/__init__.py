@@ -13,6 +13,12 @@ Config in $HERMES_HOME/config.yaml (profile-scoped):
       default_trust: 0.5
       min_trust_threshold: 0.3
       temporal_decay_half_life: 0
+      scoping: auto   # auto (per-user actor isolation) | shared (one global store)
+
+With scoping=auto (default), each provider instance derives an actor from the
+session identity (user_id > user_id_alt > gateway_session_key > chat_id) and
+only sees facts it or a shared row owns -- required when one gateway process
+serves several users against a single memory_store.db.
 """
 
 from __future__ import annotations
@@ -118,6 +124,14 @@ class HolographicMemoryProvider(MemoryProvider):
         self._store = None
         self._retriever = None
         self._min_trust = float(self._config.get("min_trust_threshold", 0.3))
+        # Actor/conversation access scoping (resolved in initialize()):
+        # "auto" scopes this instance to the session's identity; "shared"
+        # keeps the historical single-user global store. Unrecognised values
+        # behave as auto.
+        self._scoping = str(
+            cfg_get(self._config, "scoping", default="auto") or "auto"
+        ).strip().lower()
+        self._actor = ""
 
     @property
     def name(self) -> str:
@@ -131,17 +145,23 @@ class HolographicMemoryProvider(MemoryProvider):
         from pathlib import Path
         config_path = Path(hermes_home) / "config.yaml"
         try:
-            import yaml
             # Write-back round-trip: raw read is correct (merged defaults
             # must not be persisted back into the user's file).
             from hermes_cli.config import read_user_config_raw
+            from utils import atomic_yaml_write
             existing = read_user_config_raw(config_path)
             existing.setdefault("plugins", {})
             existing["plugins"]["hermes-memory-store"] = values
-            with open(config_path, "w", encoding="utf-8") as f:
-                yaml.dump(existing, f, default_flow_style=False)
-        except Exception:
-            pass
+            atomic_yaml_write(
+                config_path,
+                existing,
+                sort_keys=False,
+                default_flow_style=False,
+            )
+            return True
+        except Exception as exc:
+            logger.warning("Could not save holographic memory config: %s", exc)
+            return False
 
     def get_config_schema(self):
         from hermes_constants import display_hermes_home
@@ -151,6 +171,7 @@ class HolographicMemoryProvider(MemoryProvider):
             {"key": "auto_extract", "description": "Auto-extract facts at session end", "default": "false", "choices": ["true", "false"]},
             {"key": "default_trust", "description": "Default trust score for new facts", "default": "0.5"},
             {"key": "hrr_dim", "description": "HRR vector dimensions", "default": "1024"},
+            {"key": "scoping", "description": "Per-user fact isolation for multi-user gateways", "default": "auto", "choices": ["auto", "shared"]},
         ]
 
     def initialize(self, session_id: str, **kwargs) -> None:
@@ -177,14 +198,36 @@ class HolographicMemoryProvider(MemoryProvider):
             hrr_dim=hrr_dim,
         )
         self._session_id = session_id
+        # Derive this instance's actor identity from the session kwargs the
+        # memory manager threads in (agent/agent_init.py): user_id >
+        # user_id_alt > gateway_session_key > chat_id > ''. With
+        # scoping="shared" the identity is ignored and every call stays
+        # unscoped (the historical one-global-store behaviour).
+        requested_actor = ""
+        if self._scoping != "shared":
+            for key in ("user_id", "user_id_alt", "gateway_session_key", "chat_id"):
+                value = kwargs.get(key)
+                if value:
+                    requested_actor = str(value)
+                    break
+        self._actor = self._normalize_actor(requested_actor)
+        if self._actor:
+            logger.info(
+                "Holographic memory scoped to actor %s (scoping=%s)",
+                self._actor[:32], self._scoping,
+            )
+
+    @staticmethod
+    def _normalize_actor(value) -> str:
+        """Normalize an actor identity: str/strip, capped at 191 chars so it
+        stays safe for indexed TEXT columns across SQLite builds."""
+        return str(value or "").strip()[:191]
 
     def system_prompt_block(self) -> str:
         if not self._store:
             return ""
         try:
-            total = self._store._conn.execute(
-                "SELECT COUNT(*) FROM facts"
-            ).fetchone()[0]
+            total = self._store.count_facts(actor=self._actor)
         except Exception:
             total = 0
         if total == 0:
@@ -205,7 +248,9 @@ class HolographicMemoryProvider(MemoryProvider):
         if not self._retriever or not query:
             return ""
         try:
-            results = self._retriever.search(query, min_trust=self._min_trust, limit=5)
+            results = self._retriever.search(
+                query, min_trust=self._min_trust, limit=5, actor=self._actor
+            )
             if not results:
                 return ""
             lines = []
@@ -219,7 +264,8 @@ class HolographicMemoryProvider(MemoryProvider):
 
     def sync_turn(self, user_content: str, assistant_content: str, *, session_id: str = "") -> None:
         # Holographic memory stores explicit facts via tools, not auto-sync.
-        # The on_session_end hook handles auto-extraction if configured.
+        # The on_session_end hook handles auto-extraction if configured
+        # (scoped to this instance's actor there). Nothing to sync here.
         pass
 
     def get_tool_schemas(self) -> List[Dict[str, Any]]:
@@ -247,7 +293,7 @@ class HolographicMemoryProvider(MemoryProvider):
         if action == "add" and self._store and content:
             try:
                 category = "user_pref" if target == "user" else "general"
-                self._store.add_fact(content, category=category)
+                self._store.add_fact(content, category=category, actor=self._actor)
             except Exception as e:
                 logger.debug("Holographic memory_write mirror failed: %s", e)
 
@@ -274,11 +320,14 @@ class HolographicMemoryProvider(MemoryProvider):
             store = self._store
             retriever = self._retriever
 
+            # Every read/write below is scoped to the actor derived at
+            # initialize() so a multi-user gateway never crosses tenants.
             if action == "add":
                 fact_id = store.add_fact(
                     args["content"],
                     category=args.get("category", "general"),
                     tags=args.get("tags", ""),
+                    actor=self._actor,
                 )
                 return json.dumps({"fact_id": fact_id, "status": "added"})
 
@@ -288,6 +337,7 @@ class HolographicMemoryProvider(MemoryProvider):
                     category=args.get("category"),
                     min_trust=float(args.get("min_trust", self._min_trust)),
                     limit=int(args.get("limit", 10)),
+                    actor=self._actor,
                 )
                 return json.dumps({"results": results, "count": len(results)})
 
@@ -296,6 +346,7 @@ class HolographicMemoryProvider(MemoryProvider):
                     args["entity"],
                     category=args.get("category"),
                     limit=int(args.get("limit", 10)),
+                    actor=self._actor,
                 )
                 return json.dumps({"results": results, "count": len(results)})
 
@@ -304,6 +355,7 @@ class HolographicMemoryProvider(MemoryProvider):
                     args["entity"],
                     category=args.get("category"),
                     limit=int(args.get("limit", 10)),
+                    actor=self._actor,
                 )
                 return json.dumps({"results": results, "count": len(results)})
 
@@ -315,6 +367,7 @@ class HolographicMemoryProvider(MemoryProvider):
                     entities,
                     category=args.get("category"),
                     limit=int(args.get("limit", 10)),
+                    actor=self._actor,
                 )
                 return json.dumps({"results": results, "count": len(results)})
 
@@ -322,6 +375,7 @@ class HolographicMemoryProvider(MemoryProvider):
                 results = retriever.contradict(
                     category=args.get("category"),
                     limit=int(args.get("limit", 10)),
+                    actor=self._actor,
                 )
                 return json.dumps({"results": results, "count": len(results)})
 
@@ -332,11 +386,12 @@ class HolographicMemoryProvider(MemoryProvider):
                     trust_delta=float(args["trust_delta"]) if "trust_delta" in args else None,
                     tags=args.get("tags"),
                     category=args.get("category"),
+                    actor=self._actor,
                 )
                 return json.dumps({"updated": updated})
 
             elif action == "remove":
-                removed = store.remove_fact(int(args["fact_id"]))
+                removed = store.remove_fact(int(args["fact_id"]), actor=self._actor)
                 return json.dumps({"removed": removed})
 
             elif action == "list":
@@ -344,6 +399,7 @@ class HolographicMemoryProvider(MemoryProvider):
                     category=args.get("category"),
                     min_trust=float(args.get("min_trust", 0.0)),
                     limit=int(args.get("limit", 10)),
+                    actor=self._actor,
                 )
                 return json.dumps({"facts": facts, "count": len(facts)})
 
@@ -359,7 +415,9 @@ class HolographicMemoryProvider(MemoryProvider):
         try:
             fact_id = int(args["fact_id"])
             helpful = args["action"] == "helpful"
-            result = self._store.record_feedback(fact_id, helpful=helpful)
+            result = self._store.record_feedback(
+                fact_id, helpful=helpful, actor=self._actor
+            )
             return json.dumps(result)
         except KeyError as exc:
             return tool_error(f"Missing required argument: {exc}")
@@ -432,7 +490,9 @@ class HolographicMemoryProvider(MemoryProvider):
             for pattern in _PREF_PATTERNS:
                 if pattern.search(content):
                     try:
-                        self._store.add_fact(content[:400], category="user_pref")
+                        self._store.add_fact(
+                            content[:400], category="user_pref", actor=self._actor
+                        )
                         extracted += 1
                     except Exception:
                         pass
@@ -441,7 +501,9 @@ class HolographicMemoryProvider(MemoryProvider):
             for pattern in _DECISION_PATTERNS:
                 if pattern.search(content):
                     try:
-                        self._store.add_fact(content[:400], category="project")
+                        self._store.add_fact(
+                            content[:400], category="project", actor=self._actor
+                        )
                         extracted += 1
                     except Exception:
                         pass

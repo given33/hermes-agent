@@ -5,11 +5,13 @@ import base64
 import errno
 import json
 import logging
+import ntpath
 import os
 import posixpath
+import re
 import sys
 import threading
-from pathlib import Path, PurePosixPath
+from pathlib import Path, PurePosixPath, PureWindowsPath
 
 from agent.file_safety import get_read_block_error
 from tools.binary_extensions import (
@@ -30,6 +32,12 @@ logger = logging.getLogger(__name__)
 
 _EXPECTED_WRITE_ERRNOS = {errno.EACCES, errno.EPERM, errno.EROFS}
 
+# Windows drive-letter (`C:/...`) or UNC (`\\server/share`)
+# absolute prefixes. Deliberately NOT `ntpath.isabs`: on Python <= 3.12 that
+# also returns True for rooted POSIX paths like `/workspace`, which are genuine
+# container paths.
+_WINDOWS_ABSOLUTE_PREFIX = re.compile(r"^(?:[A-Za-z]:[/\\]|\\\\)")
+
 
 def _expand_tilde(path: str) -> str:
     """Expand ``~`` using the effective profile home when available.
@@ -49,7 +57,9 @@ def _expand_tilde(path: str) -> str:
     except Exception:
         home = None
     if home and (path == "~" or path.startswith("~/")):
-        return home if path == "~" else os.path.join(home, path[2:])
+        # Profile homes may be remote/POSIX paths even on a Windows gateway.
+        # Preserve the caller's path namespace for the explicit ~/ form.
+        return home if path == "~" else posixpath.join(home, path[2:])
     return os.path.expanduser(path)
 
 
@@ -217,14 +227,23 @@ def _uses_container_paths(task_id: str = "default") -> bool:
     return _terminal_env_type_for_task(task_id) in container_backends
 
 
-def _normalize_without_host_deref(path: str | Path | PurePosixPath) -> PurePosixPath:
+def _normalize_without_host_deref(
+    path: str | Path | PurePosixPath | PureWindowsPath,
+) -> PurePosixPath | PureWindowsPath:
     """Normalize path syntax without following host symlinks.
 
     Container backends use paths that are meaningful inside the sandbox. Calling
     ``Path.resolve()`` on the host can dereference a host-side symlink such as
     ``/workspace`` and rewrite the path before Docker sees it.
     """
-    return PurePosixPath(posixpath.normpath(str(path)))
+    text = str(path)
+    if _WINDOWS_ABSOLUTE_PREFIX.match(text):
+        # Windows drive-letter/UNC input keeps its native flavour so a
+        # Windows-hosted container session can compare the resolved
+        # sandbox-local path against what the caller passed; normalization
+        # stays purely textual and never touches the filesystem.
+        return PureWindowsPath(ntpath.normpath(text))
+    return PurePosixPath(posixpath.normpath(text))
 
 
 def _sentinel_free_abs_cwd(raw: str | None) -> str | None:
@@ -343,8 +362,13 @@ def _resolve_base_dir(
     else:
         base_text = os.getcwd()
     if container_paths:
-        if not posixpath.isabs(base_text):
-            base_text = posixpath.join(os.getcwd(), base_text)
+        # An already-absolute anchor must never be re-anchored onto the process
+        # cwd. On a Windows host the anchor is drive-letter/UNC absolute, which
+        # posixpath.isabs does not recognize - joining it onto os.getcwd() used to
+        # produce garbage like "<cwd>/C:\\workdir" (Windows cwd-resolution class).
+        if posixpath.isabs(base_text) or _WINDOWS_ABSOLUTE_PREFIX.match(base_text):
+            return _normalize_without_host_deref(base_text)
+        base_text = posixpath.join(os.getcwd(), base_text)
         return _normalize_without_host_deref(base_text)
     # Git Bash ``pwd -P`` reports ``/c/Users/...``; translate before Path so
     # relative file-tool paths don't anchor under a nonexistent ``\\c\\Users``.
@@ -379,7 +403,10 @@ def _resolve_path_for_task(filepath: str, task_id: str = "default") -> Path | Pu
     container_paths = _uses_container_paths(task_id)
     if container_paths:
         expanded = _expand_tilde(filepath)
-        if posixpath.isabs(expanded):
+        # Sandbox-local absolute input: POSIX-rooted (/workspace/...) or, on a
+        # Windows host, drive-letter/UNC absolute. Both stay verbatim-normalized;
+        # neither may be re-anchored onto the process cwd nor host-dereferenced.
+        if posixpath.isabs(expanded) or _WINDOWS_ABSOLUTE_PREFIX.match(expanded):
             return _normalize_without_host_deref(expanded)
         resolved = _resolve_base_dir(task_id, container_paths=True) / expanded
         return _normalize_without_host_deref(resolved)
@@ -433,9 +460,11 @@ def _path_resolution_warning(filepath: str, resolved: Path, task_id: str = "defa
             resolved.relative_to(root)
             return None  # Inside the workspace — expected.
         except ValueError:
+            # Quote explicitly instead of using !r: repr() doubles every backslash,
+            # which rendered Windows paths unusable inside this user-facing warning.
             return (
-                f"Relative path {filepath!r} resolved to {str(resolved)!r}, which is "
-                f"OUTSIDE the active workspace ({str(root)!r}). The edit will land in "
+                f"Relative path '{filepath}' resolved to '{resolved}', which is "
+                f"OUTSIDE the active workspace ('{root}'). The edit will land in "
                 f"a different directory than the terminal's cwd. If this is not "
                 f"intended (e.g. a git-worktree session writing into the main "
                 f"checkout), pass an absolute path under the workspace instead."
@@ -519,7 +548,10 @@ def _rewrite_v4a_patch_paths_for_host(
 
 def _is_blocked_device_path(path: str) -> bool:
     """Return True for concrete device/fd paths that can hang reads."""
-    normalized = os.path.normpath(_expand_tilde(path))
+    # Windows os.path.normpath() rewrites POSIX separators to backslashes,
+    # so "/dev/zero" becomes "\dev\zero" and every prefix/exact check below
+    # misses. Normalise to forward slashes for pattern comparison.
+    normalized = os.path.normpath(_expand_tilde(path)).replace("\\", "/")
     if normalized in _BLOCKED_DEVICE_PATHS:
         return True
     # /proc/self/fd/0-2 and /proc/<pid>/fd/0-2 are Linux aliases for stdio
@@ -677,6 +709,15 @@ def _get_hermes_config_resolved() -> str | None:
     return _hermes_config_resolved
 
 
+def _same_guard_path(left: str | None, right: str | None) -> bool:
+    """Compare guard paths using the host filesystem's case rules."""
+    if not left or not right:
+        return False
+    return os.path.normcase(os.path.abspath(left)) == os.path.normcase(
+        os.path.abspath(right)
+    )
+
+
 def _check_sensitive_path(filepath: str, task_id: str = "default") -> str | None:
     """Return an error message if the path targets a sensitive system location."""
     try:
@@ -684,21 +725,37 @@ def _check_sensitive_path(filepath: str, task_id: str = "default") -> str | None
     except (OSError, ValueError):
         resolved = filepath
     normalized = os.path.normpath(_expand_tilde(filepath))
+    # Windows Path.resolve() prepends a drive letter to POSIX paths
+    # (e.g. /etc/passwd → C:\etc\passwd), so the prefix/exact checks above
+    # miss them on non-POSIX hosts. A lexical check on the raw string
+    # closes that defense-in-depth gap without affecting real Windows paths.
+    raw_normalized = filepath.replace("\\", "/")
     _err = (
         f"Refusing to write to sensitive system path: {filepath}\n"
         "Use the terminal tool with sudo if you need to modify system files."
     )
     for prefix in _SENSITIVE_PATH_PREFIXES:
-        if resolved.startswith(prefix) or normalized.startswith(prefix):
+        if (
+            resolved.startswith(prefix)
+            or normalized.startswith(prefix)
+            or raw_normalized.startswith(prefix)
+        ):
             return _err
-    if resolved in _SENSITIVE_EXACT_PATHS or normalized in _SENSITIVE_EXACT_PATHS:
+    if (
+        resolved in _SENSITIVE_EXACT_PATHS
+        or normalized in _SENSITIVE_EXACT_PATHS
+        or filepath in _SENSITIVE_EXACT_PATHS
+    ):
         return _err
     # Prevent agents from modifying the Hermes config file directly.
     # approvals.mode and other security settings live here; a malicious or
     # prompt-injected agent could silently disable exec approval by writing to
     # this file.
     hermes_config = _get_hermes_config_resolved()
-    if hermes_config and (resolved == hermes_config or normalized == hermes_config):
+    if hermes_config and (
+        _same_guard_path(resolved, hermes_config)
+        or _same_guard_path(normalized, hermes_config)
+    ):
         return (
             f"Refusing to write to Hermes config file: {filepath}\n"
             "Agent cannot modify security-sensitive configuration. "

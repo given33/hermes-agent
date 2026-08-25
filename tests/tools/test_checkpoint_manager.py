@@ -34,6 +34,39 @@ from tools.checkpoint_manager import (
 # Fixtures
 # =========================================================================
 
+@pytest.fixture(autouse=True)
+def _isolate_project_markers(tmp_path, monkeypatch):
+    """Hide real-home project markers so working-dir resolution stays inside tmp_path.
+
+    The host home may contain package.json / pyproject.toml etc.; without this
+    guard get_working_dir_for_path() walks out of the test's work_dir and the
+    agent-write ledger is stored under the wrong project hash on Windows.
+    """
+    _real_exists = Path.exists
+    # Snapshot the host's real profile dir at fixture setup time — before
+    # any test-specific fake_home monkeypatching can change os.environ.
+    _host_profile = (
+        os.environ.get("USERPROFILE") or os.environ.get("HOME") or ""
+    )
+
+    def _guarded_exists(self):
+        s = str(self)
+        if any(
+            s.endswith("\\" + m) or s.endswith("/" + m) or s == m
+            for m in (".git", "pyproject.toml", "package.json",
+                      "Cargo.toml", "go.mod", "Makefile", "pom.xml",
+                      ".hg", "Gemfile")
+        ):
+            # Only hide markers sitting directly in the host profile root;
+            # pytest tmp_path lives under the same tree so a prefix check
+            # would also hide test-created project roots.
+            if _host_profile and Path(s).parent == Path(_host_profile):
+                return False
+        return _real_exists(self)
+
+    monkeypatch.setattr(Path, "exists", _guarded_exists)
+
+
 @pytest.fixture()
 def work_dir(tmp_path):
     d = tmp_path / "project"
@@ -450,6 +483,7 @@ class TestWorkingDirResolution:
             stop = str(tmp_path)
             if not s.startswith(stop) and any(
                 s.endswith("/" + m) or s == "/" + m
+                or s.endswith("\\" + m) or s == "\\" + m
                 for m in (".git", "pyproject.toml", "package.json",
                           "Cargo.toml", "go.mod", "Makefile", "pom.xml",
                           ".hg", "Gemfile")
@@ -486,7 +520,7 @@ class TestGitEnvIsolation:
         env = _git_env(
             store, str(work), index_file=store / "indexes" / "abc",
         )
-        assert env["GIT_INDEX_FILE"].endswith("indexes/abc")
+        assert env["GIT_INDEX_FILE"].replace("\\", "/").endswith("indexes/abc")
 
         # ~ in the work tree is expanded.
         tilde_work = fake_home / "work"
@@ -943,6 +977,9 @@ class TestClearFunctions:
         monkeypatch.setattr("tools.checkpoint_manager.CHECKPOINT_BASE", base)
         m = CheckpointManager(enabled=True)
         m.ensure_checkpoint(str(work_dir), "initial")
+        # Drop the manager so any lingering git subprocess handles are
+        # released before the destructive rmtree (Windows lock avoidance).
+        del m
         assert base.exists()
 
         result = clear_all()

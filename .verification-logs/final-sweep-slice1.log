@@ -1,0 +1,216 @@
+Slice 1/4: 789 files (~7485s estimated of 29939s total)
+Discovered 789 test files (~7727 tests) under ['tests']; running with -j 32
+[  0.0% |     2/~7727 | ✓2 | ✗0] ✓ tests\run_agent\test_codex_silent_hang_hint.py (2✓, 43.9s)
+[  0.1% |     4/~7727 | ✓4 | ✗0] ✓ tests\hermes_cli\test_timeouts.py (2✓, 44.4s)
+[  0.3% |    20/~7727 | ✓25 | ✗ 0] ✓ tests\hermes_cli\test_dashboard_auth_middleware.py (21✓, 45.3s)
+[  0.3% |    27/~7727 | ✓32 | ✗ 0] ✓ tests\run_agent\test_verification_continuation_budget.py (7✓, 63.7s)
+[  0.6% |    43/~7727 | ✓51 | ✗ 0] ✓ tests\run_agent\test_codex_xai_oauth_recovery.py (19✓, 64.1s)
+[  0.6% |    49/~7727 | ✓57 | ✗ 0] ✓ tests\cli\test_oneshot_resumed_session_persist.py (6✓, 65.3s)
+[  0.7% |    54/~7727 | ✓62 | ✗ 0] ✓ tests\run_agent\test_70773_shared_client_fd_corruption.py (5✓, 65.6s)
+[  0.7% |    57/~7727 | ✓65 | ✗ 0] ✓ tests\hermes_cli\test_codex_cli_model_picker.py (3✓, 71.4s)
+[  0.9% |    69/~7727 | ✓77 | ✗ 0] ✓ tests\run_agent\test_plugin_stream_hooks.py (12✓, 81.8s)
+[  1.0% |    76/~7727 | ✓84 | ✗ 0] ✓ tests\agent\test_proactive_prune_restart_safety.py (7✓, 84.4s)
+[  1.4% |   106/~7727 | ✓116 | ✗  0] ✓ tests\run_agent\test_tool_batch_segmentation.py (32✓ 1s, 93.7s)
+[  1.6% |   120/~7727 | ✓130 | ✗  0] ✓ tests\run_agent\test_provider_fallback.py (14✓, 101.5s)
+[  1.6% |   127/~7727 | ✓137 | ✗  0] ✓ tests\run_agent\test_stream_single_writer_65991.py (7✓, 58.9s)
+[  1.7% |   134/~7727 | ✓144 | ✗  0] ✓ tests\agent\test_codex_cloudflare_headers.py (7✓, 37.5s)
+[  1.9% |   143/~7727 | ✓153 | ✗  0] ✓ tests\hermes_cli\test_bedrock_model_picker.py (9✓, 60.0s)
+[  3.5% |   269/~7727 | ✓289 | ✗  0] ✓ tests\agent\test_context_compressor.py (136✓, 106.2s)
+[  3.5% |   272/~7727 | ✓295 | ✗  0] ✓ tests\agent\test_empty_tool_name_loop_dampening.py (6✓, 106.8s)
+[  3.6% |   278/~7727 | ✓301 | ✗  0] ✓ tests\run_agent\test_identity_flush.py (6✓, 64.4s)
+[  4.3% |   335/~7727 | ✓364 | ✗  0] ✓ tests\hermes_cli\test_managed_installations.py (63✓, 110.5s)
+[  4.5% |   345/~7727 | ✓373 | ✗  1] ✗ tests\tools\test_cross_profile_guard.py (9✓ 1✗, 116.1s)
+
+  ╔╍ Failed: tests\tools\test_cross_profile_guard.py ╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍
+  ║     def test_named_profile_line_in_prompt_text(self, fake_hermes):
+  ║         """When active profile is 'hermes-security', the prompt warns
+  ║         explicitly about NOT modifying default's skills/plugins/cron/memories."""
+  ║         # Spot-check by reading the source �� the contract is:
+  ║         # (1) names the active profile, (2) names the default-profile
+  ║         # paths, (3) says "do not modify another profile's" without
+  ║         # explicit user direction.
+  ║         from pathlib import Path
+  ║ >       src = Path("agent/system_prompt.py").read_text()
+  ║               ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  ║ 
+  ║ tests\tools\test_cross_profile_guard.py:227: 
+  ║ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _
+  ║ 
+  ║ self = WindowsPath('agent/system_prompt.py'), encoding = 'locale', errors = None
+  ║ 
+  ║     def read_text(self, encoding=None, errors=None):
+  ║         """
+  ║         Open the file in text mode, read it, and close the file.
+  ║         """
+  ║         encoding = io.text_encoding(encoding)
+  ║         with self.open(mode='r', encoding=encoding, errors=errors) as f:
+  ║ >           return f.read()
+  ║                    ^^^^^^^^
+  ║ E           UnicodeDecodeError: 'gbk' codec can't decode byte 0x94 in position 131: illegal multibyte sequence
+  ║ 
+  ║ ..\..\AppData\Local\Programs\Python\Python311\Lib\pathlib.py:1059: UnicodeDecodeError
+  ║ =========================== short test summary info ===========================
+  ║ FAILED tests/tools/test_cross_profile_guard.py::TestSystemPromptActiveProfile::test_named_profile_line_in_prompt_text
+  ║ 1 failed, 9 passed in 41.69s
+  ║
+  ║  Repro: python -m pytest tests\tools\test_cross_profile_guard.py -q
+  ╚╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍
+
+[  4.5% |   349/~7727 | ✓377 | ✗  1] ✓ tests\agent\test_codex_gpt55_autoraise_notice.py (4✓, 34.1s)
+[  4.6% |   357/~7727 | ✓385 | ✗  1] ✓ tests\run_agent\test_compression_boundary_hook.py (8✓, 118.7s)
+[  4.7% |   361/~7727 | ✓389 | ✗  1] ✓ tests\tools\test_accretion_caps.py (4✓, 120.4s)
+[  4.7% |   366/~7727 | ✓394 | ✗  1] ✓ tests\run_agent\test_pre_compress_memory_context.py (5✓, 44.2s)
+[  5.0% |   388/~7727 | ✓412 | ✗  1] ✗ tests\hermes_cli\test_npm_engine.py (18✓ 4e, 65.9s)
+
+  ╔╍ Failed: tests\hermes_cli\test_npm_engine.py ╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍
+  ║         (node / "bin").mkdir(parents=True)
+  ║         (node / "lib" / "node_modules" / "npm" / "bin").mkdir(parents=True)
+  ║         cli = node / "lib" / "node_modules" / "npm" / "bin" / "npm-cli.js"
+  ║         cli.write_text("#!/usr/bin/env node\n", encoding="utf-8")
+  ║ >       (node / "bin" / "npm").symlink_to(cli)
+  ║ 
+  ║ tests\hermes_cli\test_npm_engine.py:101: 
+  ║ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _
+  ║ 
+  ║ self = WindowsPath('C:/Users/given/AppData/Local/Temp/pytest-of-given/pytest-48824/test_no_npm_is_not_managed0/.hermes/node/bin/npm')
+  ║ target = WindowsPath('C:/Users/given/AppData/Local/Temp/pytest-of-given/pytest-48824/test_no_npm_is_not_managed0/.hermes/node/lib/node_modules/npm/bin/npm-cli.js')
+  ║ target_is_directory = False
+  ║ 
+  ║     def symlink_to(self, target, target_is_directory=False):
+  ║         """
+  ║         Make this path a symlink pointing to the target path.
+  ║         Note the order of arguments (link, target) is the reverse of os.symlink.
+  ║         """
+  ║         if not hasattr(os, "symlink"):
+  ║             raise NotImplementedError("os.symlink() not available on this system")
+  ║ >       os.symlink(target, self, target_is_directory)
+  ║ E       OSError: [WinError 1314] �ͻ���û���������Ȩ��: 'C:\\Users\\given\\AppData\\Local\\Temp\\pytest-of-given\\pytest-48824\\test_no_npm_is_not_managed0\\.hermes\\node\\lib\\node_modules\\npm\\bin\\npm-cli.js' -> 'C:\\Users\\given\\AppData\\Local\\Temp\\pytest-of-given\\pytest-48824\\test_no_npm_is_not_managed0\\.hermes\\node\\bin\\npm'
+  ║ 
+  ║ ..\..\AppData\Local\Programs\Python\Python311\Lib\pathlib.py:1198: OSError
+  ║ =========================== short test summary info ===========================
+  ║ ERROR tests/hermes_cli/test_npm_engine.py::TestManagedDetection::test_direct_managed_bin_is_managed
+  ║ ERROR tests/hermes_cli/test_npm_engine.py::TestManagedDetection::test_symlink_from_local_bin_resolves_to_managed
+  ║ ERROR tests/hermes_cli/test_npm_engine.py::TestManagedDetection::test_system_npm_is_not_managed
+  ║ ERROR tests/hermes_cli/test_npm_engine.py::TestManagedDetection::test_no_npm_is_not_managed
+  ║ 18 passed, 4 errors in 30.25s
+  ║
+  ║  Repro: python -m pytest tests\hermes_cli\test_npm_engine.py -q
+  ╚╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍
+
+[  6.2% |   480/~7727 | ✓482 | ✗ 22] ✗ tests\tools\test_browser_use_cli.py (70✓ 21✗ 1e, 131.6s)
+
+  ╔╍ Failed: tests\tools\test_browser_use_cli.py ╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍
+  ║         ok, msg = bu_cli.install_cli()
+  ║         assert ok is False
+  ║ >       assert "no network" in msg
+  ║ E       AssertionError: assert 'no network' in 'Failed to run `uv tool install browser-use`: [WinError 193] %1 ������Ч�� Win32 Ӧ�ó���'
+  ║ 
+  ║ tests\tools\test_browser_use_cli.py:1007: AssertionError
+  ║ =========================== short test summary info ===========================
+  ║ FAILED tests/tools/test_browser_use_cli.py::TestLegacyCloudMigration::test_migrated_config_gets_bu_autospawn
+  ║ FAILED tests/tools/test_browser_use_cli.py::TestLegacyCloudMigration::test_explicit_backend_does_not_set_bu_autospawn
+  ║ FAILED tests/tools/test_browser_use_cli.py::TestBackendCdpResolution::test_named_session_composes_with_provider_backend
+  ║ FAILED tests/tools/test_browser_use_cli.py::TestOwnTabPreamble::test_named_shared_browser_gets_preamble
+  ║ FAILED tests/tools/test_browser_use_cli.py::TestOwnTabPreamble::test_unnamed_session_gets_no_preamble
+  ║ FAILED tests/tools/test_browser_use_cli.py::TestOwnTabPreamble::test_named_provider_browser_skips_preamble
+  ║ FAILED tests/tools/test_browser_use_cli.py::TestOwnTabPreamble::test_sentinel_never_reaches_subprocess_env
+  ║ FAILED tests/tools/test_browser_use_cli.py::TestNativeScreenshots::test_vision_model_gets_multimodal_envelope
+  ║ FAILED tests/tools/test_browser_use_cli.py::TestNativeScreenshots::test_text_only_model_gets_plain_result_with_path
+  ║ FAILED tests/tools/test_browser_use_cli.py::TestBrowserExec::test_session_sets_bu_name
+  ║ FAILED tests/tools/test_browser_use_cli.py::TestBrowserExec::test_nonzero_exit_reports_failure_and_stderr
+  ║ FAILED tests/tools/test_browser_use_cli.py::TestBrowserExec::test_timeout_returns_actionable_error
+  ║ FAILED tests/tools/test_browser_use_cli.py::TestFindCliManagedBin::test_managed_bin_browser_use_found
+  ║ FAILED tests/tools/test_browser_use_cli.py::TestFindCliManagedBin::test_managed_bin_uvx_fallback
+  ║ FAILED tests/tools/test_browser_use_cli.py::TestFindCliManagedBin::test_user_local_bin_browser_use_found
+  ║ FAILED tests/tools/test_browser_use_cli.py::TestFindCliManagedBin::test_managed_bin_precedes_user_local_bin
+  ║ FAILED tests/tools/test_browser_use_cli.py::TestFindCliManagedBin::test_managed_bin_precedes_path
+  ║ FAILED tests/tools/test_browser_use_cli.py::TestFindCliManagedBin::test_user_local_bin_uvx_fallback
+  ║ FAILED tests/tools/test_browser_use_cli.py::TestInstallCli::test_already_installed_in_managed_bin
+  ║ FAILED tests/tools/test_browser_use_cli.py::TestInstallCli::test_successful_install_via_fake_uv
+  ║ FAILED tests/tools/test_browser_use_cli.py::TestInstallCli::test_failed_install_surfaces_stderr_tail
+  ║ ERROR tests/tools/test_browser_use_cli.py::TestBrowserExec::test_code_piped_on_stdin
+  ║ 21 failed, 70 passed, 1 error in 53.32s
+  ║
+  ║  Repro: python -m pytest tests\tools\test_browser_use_cli.py -q
+  ╚╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍
+
+[  6.4% |   495/~7727 | ✓497 | ✗ 22] ✓ tests\tools\test_patch_already_applied.py (15✓, 76.4s)
+[  6.7% |   517/~7727 | ✓519 | ✗ 22] ✓ tests\run_agent\test_turn_completion_explainer.py (22✓, 41.7s)
+[  6.7% |   521/~7727 | ✓523 | ✗ 22] ✓ tests\agent\test_request_client_reuse.py (4✓, 38.6s)
+[  6.8% |   528/~7727 | ✓532 | ✗ 22] ✓ tests\hermes_cli\test_dashboard_param_clamps.py (9✓, 145.5s)
+[  6.9% |   534/~7727 | ✓538 | ✗ 22] ✓ tests\run_agent\test_switch_model_context.py (6✓, 40.2s)
+[  7.0% |   541/~7727 | ✓545 | ✗ 22] ✓ tests\run_agent\test_overflow_overhead_aware_tokens.py (7✓, 45.8s)
+[  7.4% |   569/~7727 | ✓580 | ✗ 22] ✓ tests\gateway\test_platform_registry.py (35✓, 47.5s)
+[  7.4% |   574/~7727 | ✓585 | ✗ 22] ✓ tests\run_agent\test_plugin_context_engine_init.py (5✓, 37.9s)
+[  7.5% |   578/~7727 | ✓588 | ✗ 23] ✗ tests\hermes_cli\test_session_recovery.py (3✓ 1✗, 156.6s)
+
+  ╔╍ Failed: tests\hermes_cli\test_session_recovery.py ╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍
+  ║         )
+  ║     
+  ║         assert result.returncode == 0, result.stdout + result.stderr
+  ║ >       assert "Partial recovery output verified" in result.stdout
+  ║                ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  ║ E       TypeError: argument of type 'NoneType' is not iterable
+  ║ 
+  ║ tests\hermes_cli\test_session_recovery.py:549: TypeError
+  ║ ============================== warnings summary ===============================
+  ║ tests/hermes_cli/test_session_recovery.py::test_cli_allow_partial_salvages_rows_across_a_corrupt_leaf
+  ║   C:\Users\given\hermes-audit\hermes-agent\.venv\Lib\site-packages\_pytest\threadexception.py:58: PytestUnhandledThreadExceptionWarning: Exception in thread Thread-5 (_readerthread)
+  ║   
+  ║   Traceback (most recent call last):
+  ║     File "C:\Users\given\AppData\Local\Programs\Python\Python311\Lib\threading.py", line 1045, in _bootstrap_inner
+  ║       self.run()
+  ║     File "C:\Users\given\AppData\Local\Programs\Python\Python311\Lib\threading.py", line 982, in run
+  ║       self._target(*self._args, **self._kwargs)
+  ║     File "C:\Users\given\AppData\Local\Programs\Python\Python311\Lib\subprocess.py", line 1599, in _readerthread
+  ║       buffer.append(fh.read())
+  ║                     ^^^^^^^^^
+  ║   UnicodeDecodeError: 'gbk' codec can't decode byte 0xa6 in position 55: illegal multibyte sequence
+  ║   
+  ║   Enable tracemalloc to get traceback where the object was allocated.
+  ║   See https://docs.pytest.org/en/stable/how-to/capture-warnings.html#resource-warnings for more info.
+  ║     warnings.warn(pytest.PytestUnhandledThreadExceptionWarning(msg))
+  ║ 
+  ║ -- Docs: https://docs.pytest.org/en/stable/how-to/capture-warnings.html
+  ║ =========================== short test summary info ===========================
+  ║ FAILED tests/hermes_cli/test_session_recovery.py::test_cli_allow_partial_salvages_rows_across_a_corrupt_leaf
+  ║ 1 failed, 3 passed, 1 warning in 64.58s (0:01:04)
+  ║
+  ║  Repro: python -m pytest tests\hermes_cli\test_session_recovery.py -q
+  ╚╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍
+
+[  7.5% |   583/~7727 | ✓593 | ✗ 23] ✓ tests\run_agent\test_context_token_tracking.py (5✓, 38.6s)
+[  7.9% |   610/~7727 | ✓620 | ✗ 23] ✓ tests\agent\test_api_content_sidecar.py (27✓, 157.8s)
+[  7.9% |   612/~7727 | ✓622 | ✗ 23] ✓ tests\hermes_cli\test_overlay_slug_resolution.py (2✓, 42.7s)
+[  8.6% |   661/~7727 | ✓673 | ✗ 24] ✗ tests\tools\test_windows_native_support.py (51✓ 1✗ 2s, 56.6s)
+
+  ╔╍ Failed: tests\tools\test_windows_native_support.py ╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍
+  ║ ............ss..................................F.....                   [100%]
+  ║ ================================== FAILURES ===================================
+  ║ __________ TestWindowlessGatewayRestartSpec.test_noop_on_non_windows __________
+  ║ 
+  ║ self = <tests.tools.test_windows_native_support.TestWindowlessGatewayRestartSpec object at 0x000001FB32E78F10>
+  ║ 
+  ║     def test_noop_on_non_windows(self):
+  ║         import hermes_cli.gateway_windows as gw
+  ║     
+  ║         argv = ["/path/venv/bin/python", "-m", "hermes_cli.main", "gateway", "run"]
+  ║         new_argv, cwd, env = gw.windowless_gateway_restart_spec(list(argv))
+  ║         assert new_argv == argv
+  ║ >       assert cwd == ""
+  ║ E       AssertionError: assert 'C:\\Users\\g...\\hermes_test' == ''
+  ║ E         
+  ║ E         + C:\Users\given\AppData\Local\Temp\pytest-of-given\pytest-48843\test_noop_on_non_windows0\hermes_test
+  ║ 
+  ║ tests\tools\test_windows_native_support.py:937: AssertionError
+  ║ =========================== short test summary info ===========================
+  ║ FAILED tests/tools/test_windows_native_support.py::TestWindowlessGatewayRestartSpec::test_noop_on_non_windows
+  ║ 1 failed, 51 passed, 2 skipped in 22.69s
+  ║
+  ║  Repro: python -m pytest tests\tools\test_windows_native_support.py -q
+  ╚╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍
+
+[  8.9% |   684/~7727 | ✓696 | ✗ 24] ✓ tests\tools\test_async_delegation.py (23✓, 36.7s)
+[  9.5% |   736/~7727 | ✓748 | ✗ 24] ✓ tests\run_agent\test_native_compaction.py (52✓, 42.9s)
+[  9.9% |   763/~7727 | ✓775 | ✗ 24] ✓ tests\hermes_cli\test_gateway.py (27✓ 5s, 30.3s)
+[ 11.9% |   922/~7727 | ✓940 | ✗ 24] ✓ tests\gateway\test_slack.py (165✓, 60.6s)

@@ -107,8 +107,9 @@ class TestRichSentStorePathResolution:
         import gateway.rich_sent_store as rss
 
         b_seen = _under_override(prof_b, lambda: rss._store_path())
-        assert b_seen.startswith(str(prof_b))
-        assert b_seen.endswith("state/rich_sent_index.json")
+        b_path = Path(b_seen)
+        assert b_path.is_relative_to(prof_b)
+        assert b_path.parts[-2:] == ("state", "rich_sent_index.json")
 
 
 # ---------------------------------------------------------------------------

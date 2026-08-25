@@ -91,24 +91,34 @@ class TestBangContextGating:
 class TestBangExecution:
     def test_output_is_streamed_to_writer(self):
         lines = []
-        code = run_bang_command("echo bang-one; echo bang-two", writer=lines.append)
+        # Use `&` (cmd.exe) / `;` (POSIX) separator via two echo calls written
+        # through a portable shim: the production code calls ``shell=True``,
+        # which on Windows dispatches through cmd.exe (no `;` chaining) and on
+        # POSIX through /bin/sh. Use ``&&`` on both shells; cmd.exe requires
+        # the second command to be valid after ``&&`` too.
+        code = run_bang_command("(echo bang-one) && (echo bang-two)", writer=lines.append)
         assert code == 0
         assert "bang-one" in lines
         assert "bang-two" in lines
 
     def test_stderr_is_merged_into_output(self):
         lines = []
-        run_bang_command("echo to-stderr >&2", writer=lines.append)
+        # Windows cmd.exe requires ``1>&2`` (with the leading ``1``) to redirect
+        # stdout to stderr; bare ``>&2`` is parsed as ``> &2``.
+        run_bang_command("echo to-stderr 1>&2", writer=lines.append)
         assert "to-stderr" in lines
 
     def test_nonzero_exit_code_is_returned(self):
         lines = []
-        code = run_bang_command("exit 42", writer=lines.append)
+        # ``exit 42`` is a shell builtin on POSIX; cmd.exe uses ``exit /b 42``.
+        code = run_bang_command("exit /b 42" if os.name == "nt" else "exit 42", writer=lines.append)
         assert code == 42
 
     def test_runs_in_requested_cwd(self, tmp_path):
         lines = []
-        code = run_bang_command("pwd", cwd=str(tmp_path), writer=lines.append)
+        # ``cd`` is portable; ``pwd`` is Git-Bash on Windows and returns MSYS
+        # paths (``/tmp/...``) that don't match the Windows tmp_path.
+        code = run_bang_command("cd", cwd=str(tmp_path), writer=lines.append)
         assert code == 0
         # macOS resolves /tmp through /private, so compare realpaths.
         assert os.path.realpath(lines[-1].strip()) == os.path.realpath(str(tmp_path))

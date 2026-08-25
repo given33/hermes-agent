@@ -51,6 +51,182 @@ def test_connector_flags_normalize_textual_values():
     assert module._coerce_flag("unexpected") is False
 
 
+def test_connector_pull_distinguishes_legacy_manager_and_remote_supervisor():
+    module = load_module()
+    conversation = module.create_single_conversation("default")
+    state = {"conversations": [conversation]}
+    module.load_single_state = lambda: state
+    module.save_single_state = lambda _state: None
+    module._notify_hosted_update = lambda *_args: None
+    module._push_connector_event = lambda *_args: None
+    module._require_connector = lambda _request: "dbb3-primary"
+    module._account_generation_for_owner = lambda _owner: "generation-1"
+
+    def enqueue(turn_id, profile, role_stage, *, remote_supervisor=False):
+        module.create_hosted_turn_record(
+            conversation,
+            turn_id=turn_id,
+            content="execute",
+            title=turn_id,
+            profiles=[profile],
+            artifact_required=False,
+        )
+        return module._ensure_remote_run(
+            conversation["id"],
+            turn_id,
+            role_stage=role_stage,
+            profile=profile,
+            title=turn_id,
+            objective="execute",
+            local_task_id="",
+            artifact_required=False,
+            delivery_context="",
+            attachment_context="",
+            connector_id="dbb3-primary",
+            remote_supervisor=remote_supervisor,
+        )
+
+    legacy = enqueue(
+        "turn-legacy-manager",
+        module._LEGACY_DBB3_MANAGER_PROFILE,
+        "manager_planning",
+    )
+    supervisor = enqueue(
+        "turn-remote-supervisor",
+        module._HERMES_MANAGER_PROFILE,
+        "supervisor:final_report",
+        remote_supervisor=True,
+    )
+    historical_supervisor = enqueue(
+        "turn-historical-supervisor",
+        module._HERMES_MANAGER_PROFILE,
+        "supervisor:legacy_check",
+    )
+    ordinary_manager = enqueue(
+        "turn-local-manager",
+        module._HERMES_MANAGER_PROFILE,
+        "manager_planning",
+    )
+
+    pulled = module.connector_pull_runs(
+        module.ConnectorPullBody(
+            connector_id="dbb3-primary",
+            limit=10,
+            lease_seconds=30,
+        ),
+        SimpleNamespace(),
+    )
+
+    pulled_ids = {item["remote_run_id"] for item in pulled["runs"]}
+    assert legacy["id"] in pulled_ids
+    assert supervisor["id"] in pulled_ids
+    assert historical_supervisor["id"] in pulled_ids
+    assert ordinary_manager["id"] not in pulled_ids
+    assert ordinary_manager["status"] == "queued"
+
+
+def test_remote_supervisor_path_marks_canonical_manager_as_remote():
+    module = load_module()
+    conversation = module.create_single_conversation("default")
+    state = {"conversations": [conversation]}
+    module.load_single_state = lambda: state
+    module.save_single_state = lambda _state: None
+    module._notify_hosted_update = lambda *_args: None
+    module.create_hosted_turn_record(
+        conversation,
+        turn_id="turn-remote-supervisor-path",
+        content="execute",
+        title="execute",
+        profiles=["default"],
+        artifact_required=False,
+    )
+    captured = {}
+
+    def remote_role(_conversation_id, _turn_id, **kwargs):
+        captured.update(kwargs)
+        return supervision_control(), "completed", {}
+
+    module._run_hosted_remote_role = remote_role
+    module._run_hosted_supervisor_check(
+        conversation["id"],
+        "turn-remote-supervisor-path",
+        check_id="final_report",
+        checkpoint_label="Final report",
+        evidence={"result": "verified"},
+        runner=lambda *_args, **_kwargs: "unused",
+        remote=True,
+    )
+
+    assert captured["profile"] == module._HERMES_MANAGER_PROFILE
+    assert captured["role_stage"] == "supervisor:final_report"
+    assert captured["remote_supervisor"] is True
+
+
+def test_manager_runtime_fallback_preserves_canonical_durable_identity():
+    """Only the production runner maps canonical manager to the default profile."""
+
+    class StopAfterManagerCapture(Exception):
+        pass
+
+    def run_case(*, injected: bool) -> tuple[dict[str, Any], dict[str, Any]]:
+        module = load_module()
+        conversation = module.create_single_conversation("default")
+        state = {"conversations": [conversation]}
+        module.load_single_state = lambda: state
+        module.save_single_state = lambda _state: None
+        module._notify_hosted_update = lambda *_args: None
+        module._account_generation_for_owner = lambda _owner: "generation-1"
+        turn_id = "turn-manager-runtime-injected" if injected else "turn-manager-runtime-default"
+        module.create_hosted_turn_record(
+            conversation,
+            turn_id=turn_id,
+            content="核对执行节点并汇总结果",
+            title="核对执行节点",
+            profiles=["default", "dbb3-worker"],
+            artifact_required=False,
+        )
+        captured: dict[str, Any] = {}
+
+        def capture_manager_call(*_args: Any, **kwargs: Any) -> None:
+            captured.update(kwargs)
+            raise StopAfterManagerCapture()
+
+        module._run_hosted_role = capture_manager_call
+        if injected:
+            def injected_manager_runner(_profile: str, _prompt: str, **_kwargs: Any) -> str:
+                return "unused"
+
+            runner = injected_manager_runner
+            manager_runner = injected_manager_runner
+        else:
+            runner = module.run_profile_turn
+            manager_runner = None
+
+        try:
+            module.execute_hosted_workflow(
+                conversation["id"],
+                turn_id,
+                runner=runner,
+                manager_runner=manager_runner,
+            )
+        except StopAfterManagerCapture:
+            pass
+        else:
+            raise AssertionError("manager planning did not reach the capture")
+        assert captured["runner"] is runner
+        return captured, conversation["hosted_turns"][turn_id]
+
+    production_call, production_run = run_case(injected=False)
+    assert production_call["profile"] == "hermes-manager"
+    assert production_call["runtime_profile"] == "default"
+    assert production_run["participants"][0]["id"] == "hermes-manager"
+
+    injected_call, injected_run = run_case(injected=True)
+    assert injected_call["profile"] == "hermes-manager"
+    assert injected_call["runtime_profile"] == ""
+    assert injected_run["participants"][0]["id"] == "hermes-manager"
+
+
 def test_connector_stream_fans_out_wake_events_to_overlapping_reconnects():
     module = load_module()
     first = queue.Queue(maxsize=1)
@@ -73,6 +249,374 @@ def test_connector_stream_fans_out_wake_events_to_overlapping_reconnects():
         assert first.get_nowait()["type"] == "run.terminal"
     finally:
         module._CONNECTOR_STREAM_QUEUES.pop("dbb3-primary", None)
+
+
+def test_worker_websocket_rejects_non_protocol_hello_cursor(monkeypatch):
+    module = load_module()
+    from starlette.websockets import WebSocketDisconnect
+
+    class FakeWebSocket:
+        headers = {
+            "authorization": "Bearer connector-secret",
+            "x-connector-id": "dbb3-primary",
+        }
+
+        def __init__(self, cursor):
+            self.sent = []
+            self.closed = None
+            self.messages = iter(
+                [{
+                    "type": "hello",
+                    "node_id": "dbb3-worker",
+                    "connection_generation": "generation-1",
+                    "cursor": cursor,
+                }]
+            )
+
+        async def accept(self):
+            pass
+
+        async def receive_json(self):
+            try:
+                return next(self.messages)
+            except StopIteration:
+                raise WebSocketDisconnect() from None
+
+        async def send_json(self, message):
+            self.sent.append(message)
+
+        async def close(self, code=None, reason=None):
+            self.closed = (code, reason)
+
+    for invalid_cursor in (True, 1.5, 2**53):
+        websocket = FakeWebSocket(invalid_cursor)
+        registry = module.WorkerChannelRegistry()
+        monkeypatch.setattr(module, "_WORKER_CHANNEL", registry)
+        monkeypatch.setattr(module, "_connector_identity_from_websocket", lambda _ws: "dbb3-primary")
+
+        asyncio.run(module.worker_websocket(websocket))
+
+        assert websocket.sent[0]["type"] == "error"
+        assert "cursor" in websocket.sent[0]["detail"]
+        assert websocket.closed[0] == 4400
+        assert registry.snapshot("dbb3-worker")["connected"] is False
+
+
+def test_worker_websocket_rejects_non_protocol_resume_cursor(monkeypatch):
+    module = load_module()
+    from starlette.websockets import WebSocketDisconnect
+
+    class FakeWebSocket:
+        headers = {
+            "authorization": "Bearer connector-secret",
+            "x-connector-id": "dbb3-primary",
+        }
+
+        def __init__(self, cursor):
+            self.sent = []
+            self.closed = None
+            self.messages = iter([
+                {
+                    "type": "hello",
+                    "node_id": "dbb3-worker",
+                    "connection_generation": "generation-1",
+                    "cursor": 0,
+                },
+                {"type": "resume", "cursor": cursor},
+            ])
+
+        async def accept(self):
+            pass
+
+        async def receive_json(self):
+            try:
+                return next(self.messages)
+            except StopIteration:
+                raise WebSocketDisconnect() from None
+
+        async def send_json(self, message):
+            self.sent.append(message)
+
+        async def close(self, code=None, reason=None):
+            self.closed = (code, reason)
+
+    for invalid_cursor in (True, 1.5, 2**53):
+        websocket = FakeWebSocket(invalid_cursor)
+        registry = module.WorkerChannelRegistry()
+        monkeypatch.setattr(module, "_WORKER_CHANNEL", registry)
+        monkeypatch.setattr(module, "_connector_identity_from_websocket", lambda _ws: "dbb3-primary")
+
+        asyncio.run(module.worker_websocket(websocket))
+
+        assert websocket.sent[0]["type"] == "hello.accepted"
+        assert websocket.sent[-1]["type"] == "error"
+        assert "cursor" in websocket.sent[-1]["detail"]
+        assert websocket.closed[0] == 4400
+        assert registry.snapshot("dbb3-worker")["connected"] is False
+
+
+def test_worker_websocket_retries_bridge_after_duplicate_transport_ack(monkeypatch):
+    module = load_module()
+    from starlette.websockets import WebSocketDisconnect
+    from hermes_services.low_latency_protocol import make_event
+
+    class FakeWebSocket:
+        headers = {
+            "authorization": "Bearer connector-secret",
+            "x-connector-id": "dbb3-primary",
+        }
+
+        def __init__(self, event):
+            self.sent = []
+            self.closed = None
+            self.messages = iter([
+                {
+                    "type": "hello",
+                    "node_id": "dbb3-worker",
+                    "connection_generation": "generation-1",
+                    "cursor": 0,
+                },
+                {"type": "event", "event": event},
+                {"type": "event", "event": dict(event)},
+            ])
+
+        async def accept(self):
+            pass
+
+        async def receive_json(self):
+            try:
+                return next(self.messages)
+            except StopIteration:
+                raise WebSocketDisconnect() from None
+
+        async def send_json(self, message):
+            self.sent.append(message)
+
+        async def close(self, code=None, reason=None):
+            self.closed = (code, reason)
+
+    event = make_event(
+        "worker.completed",
+        node_id="dbb3-worker",
+        request_id="run-1",
+        turn_id="turn-1",
+        event_id="bridge-retry-1",
+        payload={"conversation_id": "conversation-1"},
+    )
+    bridge_calls = []
+
+    def flaky_bridge(received):
+        bridge_calls.append(received["event_id"])
+        if len(bridge_calls) == 1:
+            raise RuntimeError("projection temporarily unavailable")
+        return True
+
+    registry = module.WorkerChannelRegistry()
+    websocket = FakeWebSocket(event)
+    monkeypatch.setattr(module, "_WORKER_CHANNEL", registry)
+    monkeypatch.setattr(module, "_connector_identity_from_websocket", lambda _ws: "dbb3-primary")
+    monkeypatch.setattr(module, "_bridge_worker_channel_event", flaky_bridge)
+
+    asyncio.run(module.worker_websocket(websocket))
+
+    acknowledgements = [
+        item for item in websocket.sent if item.get("type") == "event.ack"
+    ]
+    assert [item["duplicate"] for item in acknowledgements] == [False, True]
+    assert bridge_calls == ["bridge-retry-1", "bridge-retry-1"]
+
+
+def test_worker_websocket_blocks_published_replay_after_heartbeat_timeout(monkeypatch):
+    module = load_module()
+    from starlette.websockets import WebSocketDisconnect
+    from hermes_services.worker_channel import HEARTBEAT_TIMEOUT_SECONDS
+
+    class ExpiredReplayRegistry(module.WorkerChannelRegistry):
+        def wait_for_replay(self, node_id, after_sequence, **kwargs):
+            current = self._connections[node_id]
+            current.last_heartbeat = (
+                time.monotonic() - HEARTBEAT_TIMEOUT_SECONDS - 1
+            )
+            # Exercise the real server-publish path: the event is durable and
+            # wakes the waiter even though the connection has gone stale.
+            self.publish(node_id, "worker.queued", payload={"task": {}})
+            return super().wait_for_replay(node_id, after_sequence, **kwargs)
+
+    class FakeWebSocket:
+        headers = {
+            "authorization": "Bearer connector-secret",
+            "x-connector-id": "dbb3-primary",
+        }
+
+        def __init__(self):
+            self.sent = []
+            self.closed = None
+            self.messages = iter([{
+                "type": "hello",
+                "node_id": "dbb3-worker",
+                "connection_generation": "generation-1",
+                "cursor": 0,
+            }])
+            self.block_forever = asyncio.Event()
+
+        async def accept(self):
+            pass
+
+        async def receive_json(self):
+            try:
+                return next(self.messages)
+            except StopIteration:
+                await self.block_forever.wait()
+                raise WebSocketDisconnect() from None
+
+        async def send_json(self, message):
+            self.sent.append(message)
+
+        async def close(self, code=None, reason=None):
+            self.closed = (code, reason)
+
+    websocket = FakeWebSocket()
+    registry = ExpiredReplayRegistry()
+    monkeypatch.setattr(module, "_WORKER_CHANNEL", registry)
+    monkeypatch.setattr(module, "_connector_identity_from_websocket", lambda _ws: "dbb3-primary")
+
+    asyncio.run(module.worker_websocket(websocket))
+
+    assert websocket.sent[0]["type"] == "hello.accepted"
+    assert websocket.sent[-1]["type"] == "error"
+    assert websocket.sent[-1]["detail"] == "worker lease expired"
+    assert not any(message.get("type") == "worker.queued" for message in websocket.sent)
+    assert websocket.closed[0] == 4400
+    assert registry.snapshot("dbb3-worker")["connected"] is False
+
+
+def test_worker_websocket_blocks_initial_replay_after_lease_replacement(monkeypatch):
+    module = load_module()
+    from starlette.websockets import WebSocketDisconnect
+
+    class ReplacedRegistry(module.WorkerChannelRegistry):
+        def replay(self, node_id, after_sequence):
+            events = super().replay(node_id, after_sequence)
+            self.connect(node_id, connection_generation="replacement")
+            return events
+
+    class FakeWebSocket:
+        headers = {
+            "authorization": "Bearer connector-secret",
+            "x-connector-id": "dbb3-primary",
+        }
+
+        def __init__(self):
+            self.sent = []
+            self.closed = None
+            self.messages = iter([{
+                "type": "hello",
+                "node_id": "dbb3-worker",
+                "connection_generation": "generation-1",
+                "cursor": 0,
+            }])
+            self.block_forever = asyncio.Event()
+
+        async def accept(self):
+            pass
+
+        async def receive_json(self):
+            try:
+                return next(self.messages)
+            except StopIteration:
+                await self.block_forever.wait()
+                raise WebSocketDisconnect() from None
+
+        async def send_json(self, message):
+            self.sent.append(message)
+
+        async def close(self, code=None, reason=None):
+            self.closed = (code, reason)
+
+    registry = ReplacedRegistry()
+    connection = registry.connect("dbb3-worker", connection_generation="seed")
+    registry.publish("dbb3-worker", "worker.queued", payload={"task": {}})
+    registry.disconnect("dbb3-worker", connection.lease_id)
+    websocket = FakeWebSocket()
+    monkeypatch.setattr(module, "_WORKER_CHANNEL", registry)
+    monkeypatch.setattr(module, "_connector_identity_from_websocket", lambda _ws: "dbb3-primary")
+
+    asyncio.run(module.worker_websocket(websocket))
+
+    assert websocket.sent[0]["type"] == "hello.accepted"
+    assert websocket.sent[-1]["type"] == "error"
+    assert websocket.sent[-1]["detail"] == "worker lease expired"
+    assert not any(message.get("type") == "worker.queued" for message in websocket.sent)
+    assert websocket.closed[0] == 4400
+
+
+def test_worker_websocket_blocks_resume_replay_after_lease_replacement(monkeypatch):
+    module = load_module()
+    from starlette.websockets import WebSocketDisconnect
+
+    class ReplacedRegistry(module.WorkerChannelRegistry):
+        def __init__(self):
+            super().__init__()
+            self.replay_calls = 0
+
+        def replay(self, node_id, after_sequence):
+            self.replay_calls += 1
+            events = super().replay(node_id, after_sequence)
+            if self.replay_calls == 2:
+                self.connect(node_id, connection_generation="replacement")
+            return events
+
+    class FakeWebSocket:
+        headers = {
+            "authorization": "Bearer connector-secret",
+            "x-connector-id": "dbb3-primary",
+        }
+
+        def __init__(self):
+            self.sent = []
+            self.closed = None
+            self.messages = iter([
+                {
+                    "type": "hello",
+                    "node_id": "dbb3-worker",
+                    "connection_generation": "generation-1",
+                    "cursor": 0,
+                },
+                {"type": "resume", "cursor": 0},
+            ])
+            self.block_forever = asyncio.Event()
+
+        async def accept(self):
+            pass
+
+        async def receive_json(self):
+            try:
+                return next(self.messages)
+            except StopIteration:
+                await self.block_forever.wait()
+                raise WebSocketDisconnect() from None
+
+        async def send_json(self, message):
+            self.sent.append(message)
+
+        async def close(self, code=None, reason=None):
+            self.closed = (code, reason)
+
+    registry = ReplacedRegistry()
+    connection = registry.connect("dbb3-worker", connection_generation="seed")
+    registry.publish("dbb3-worker", "worker.queued", payload={"task": {}})
+    registry.disconnect("dbb3-worker", connection.lease_id)
+    websocket = FakeWebSocket()
+    monkeypatch.setattr(module, "_WORKER_CHANNEL", registry)
+    monkeypatch.setattr(module, "_connector_identity_from_websocket", lambda _ws: "dbb3-primary")
+
+    asyncio.run(module.worker_websocket(websocket))
+
+    assert websocket.sent[0]["type"] == "hello.accepted"
+    assert websocket.sent[-1]["type"] == "error"
+    assert websocket.sent[-1]["detail"] == "worker lease expired"
+    assert sum(message.get("type") == "worker.queued" for message in websocket.sent) == 1
+    assert websocket.closed[0] == 4400
 
 
 def test_artifact_claim_accepts_persisted_false_cancel_flag():
@@ -962,10 +1506,78 @@ class CollaborationDashboardTests(unittest.TestCase):
         )
         self.assertFalse(captured["kwargs"]["shell"])
         self.assertEqual(captured["kwargs"]["timeout"], 600)
+        self.assertEqual(captured["kwargs"]["encoding"], "utf-8")
+        self.assertEqual(captured["kwargs"]["errors"], "replace")
+        self.assertEqual(captured["kwargs"]["env"]["PYTHONIOENCODING"], "utf-8")
         self.assertEqual(
             captured["kwargs"]["env"]["HERMES_KANBAN_TASK"],
             "t_worker_child",
         )
+
+    def test_subprocess_output_decoder_prefers_utf8_then_gbk(self):
+        module = load_module()
+
+        self.assertEqual(
+            module._decode_subprocess_output("完成".encode("utf-8")),
+            "完成",
+        )
+        self.assertEqual(
+            module._decode_subprocess_output("完成".encode("gbk")),
+            "完成",
+        )
+
+    def test_structured_profile_turn_decodes_gbk_bytes_on_windows(self):
+        module = load_module()
+        if module.os.name != "nt":
+            self.skipTest("Windows subprocess code-page path")
+        captured = {}
+
+        class BinaryProcess:
+            def __init__(self):
+                self.stdin = io.BytesIO()
+                self.stdout = io.BytesIO(
+                    (
+                        json.dumps(
+                            {
+                                "type": "message.complete",
+                                "payload": {"text": "完成", "status": "completed"},
+                            },
+                            ensure_ascii=False,
+                        )
+                        + "\n"
+                    ).encode("gbk")
+                )
+                self.stderr = io.BytesIO()
+
+            def poll(self):
+                return 0
+
+            def wait(self, timeout=None):
+                captured["wait_timeout"] = timeout
+                return 0
+
+            def terminate(self):
+                pass
+
+            def kill(self):
+                pass
+
+        def fake_popen(_command, **kwargs):
+            captured["kwargs"] = kwargs
+            return BinaryProcess()
+
+        with patch.object(module.subprocess, "Popen", fake_popen):
+            response = module.run_profile_turn(
+                "default",
+                "你好",
+                process_factory=fake_popen,
+                action="work",
+                timeout=5,
+            )
+
+        self.assertEqual(response, "完成")
+        self.assertFalse(captured["kwargs"]["text"])
+        self.assertNotIn("encoding", captured["kwargs"])
 
     def test_structured_profile_turn_uses_five_attempts_with_bounded_retry_cadence(self):
         module = load_module()
@@ -997,6 +1609,7 @@ class CollaborationDashboardTests(unittest.TestCase):
 
         def process_factory(_command, **kwargs):
             captured["env"] = kwargs["env"]
+            captured["kwargs"] = kwargs
             return FakeProcess()
 
         response = module.run_profile_turn(
@@ -1010,6 +1623,9 @@ class CollaborationDashboardTests(unittest.TestCase):
         self.assertEqual(captured["env"]["HERMES_API_RETRY_DELAY_SECONDS"], "15")
         self.assertEqual(captured["env"]["HERMES_API_RETRY_STATUS_LIVE"], "1")
         self.assertEqual(captured["env"]["HERMES_API_RETRY_CLIENT_ERRORS"], "1")
+        self.assertEqual(captured["env"]["PYTHONIOENCODING"], "utf-8")
+        self.assertEqual(captured["kwargs"]["encoding"], "utf-8")
+        self.assertEqual(captured["kwargs"]["errors"], "replace")
         self.assertGreater(captured["wait_timeout"], 599)
         self.assertLessEqual(captured["wait_timeout"], 600)
 
@@ -1033,6 +1649,27 @@ class CollaborationDashboardTests(unittest.TestCase):
         )
 
         self.assertEqual(result, "stderr-drained")
+
+    def test_structured_profile_turn_replaces_invalid_utf8_stderr(self):
+        module = load_module()
+        script = (
+            "import json,sys;"
+            "sys.stderr.buffer.write(b'\\x94');sys.stderr.flush();"
+            "print(json.dumps({'type':'message.complete','payload':"
+            "{'text':'stderr-replaced','status':'completed'}}),flush=True)"
+        )
+
+        def process_factory(_command, **kwargs):
+            return subprocess.Popen([sys.executable, "-c", script], **kwargs)
+
+        result = module.run_profile_turn(
+            "default",
+            "hello",
+            process_factory=process_factory,
+            timeout=5,
+        )
+
+        self.assertEqual(result, "stderr-replaced")
 
     def test_model_readiness_deadline_fails_before_a_late_sixth_attempt(self):
         module = load_module()
@@ -2170,6 +2807,31 @@ class CollaborationDashboardTests(unittest.TestCase):
             ],
         )
         self.assertFalse(captured["kwargs"]["shell"])
+        self.assertEqual(captured["kwargs"]["encoding"], "utf-8")
+        self.assertEqual(captured["kwargs"]["errors"], "replace")
+        self.assertEqual(captured["kwargs"]["env"]["PYTHONIOENCODING"], "utf-8")
+
+    def test_single_turn_decodes_gbk_bytes_from_the_windows_runner(self):
+        module = load_module()
+        if module.os.name != "nt":
+            self.skipTest("Windows subprocess code-page path")
+        captured = {}
+
+        def fake_run(_args, **kwargs):
+            captured["kwargs"] = kwargs
+            return SimpleNamespace(returncode=0, stdout="完成".encode("gbk"), stderr=b"")
+
+        with patch.object(module.subprocess, "run", fake_run):
+            response = module.run_single_turn(
+                "default",
+                "你好",
+                runner=fake_run,
+                hermes_bin="hermes",
+            )
+
+        self.assertEqual(response, "完成")
+        self.assertFalse(captured["kwargs"]["text"])
+        self.assertNotIn("encoding", captured["kwargs"])
 
     def test_intent_router_separates_chat_from_work_and_selects_profiles(self):
         module = load_module()
@@ -2188,7 +2850,7 @@ class CollaborationDashboardTests(unittest.TestCase):
         self.assertGreaterEqual(work["confidence"], 0.8)
         self.assertIn("default", work["profiles"])
         self.assertIn("pc-worker", work["profiles"])
-        self.assertIn("reviewer", work["profiles"])
+        self.assertNotIn("reviewer", work["profiles"])
 
     def test_explicit_work_lock_wins_and_ios_mcp_only_adds_capability_hints(self):
         module = load_module()
@@ -2222,7 +2884,7 @@ class CollaborationDashboardTests(unittest.TestCase):
             )
             self.assertEqual(
                 routed["profiles"],
-                ["default", "pc-worker", "reviewer"],
+                ["default", "pc-worker"],
                 request,
             )
             self.assertEqual(routed["targets"], ["pc"], request)
@@ -2239,7 +2901,7 @@ class CollaborationDashboardTests(unittest.TestCase):
             )
             self.assertEqual(
                 routed["profiles"],
-                ["default", "dbb3-worker", "reviewer"],
+                ["default", "dbb3-worker"],
                 request,
             )
             self.assertEqual(routed["targets"], ["dbb3"], request)
@@ -2273,7 +2935,7 @@ class CollaborationDashboardTests(unittest.TestCase):
                 "artifact": {"decision": "none"},
             },
         )
-        self.assertEqual(pc_only["profiles"], ["default", "pc-worker", "reviewer"])
+        self.assertEqual(pc_only["profiles"], ["default", "pc-worker"])
         self.assertEqual(pc_only["targets"], ["pc"])
 
         dbb3_only = module.classify_user_intent(
@@ -2288,7 +2950,7 @@ class CollaborationDashboardTests(unittest.TestCase):
         )
         self.assertEqual(
             dbb3_only["profiles"],
-            ["default", "dbb3-worker", "reviewer"],
+            ["default", "dbb3-worker"],
         )
         self.assertEqual(dbb3_only["targets"], ["dbb3"])
 
@@ -2307,7 +2969,7 @@ class CollaborationDashboardTests(unittest.TestCase):
         )
 
         self.assertEqual(mode, "work")
-        self.assertEqual(profiles, ["default", "pc-worker", "reviewer"])
+        self.assertEqual(profiles, ["default", "pc-worker"])
         self.assertEqual(route["profiles"], profiles)
         self.assertEqual(route["targets"], ["pc"])
         self.assertFalse(artifact_required)
@@ -2364,9 +3026,9 @@ class CollaborationDashboardTests(unittest.TestCase):
             ["default", "dbb3-worker", "reviewer"]
         )
 
-        self.assertEqual(ordered, ["dbb3-worker", "reviewer", "default"])
+        self.assertEqual(ordered, ["dbb3-worker", "default"])
         self.assertEqual(module.collaboration_role("dbb3-worker"), "worker")
-        self.assertEqual(module.collaboration_role("reviewer"), "reviewer")
+        self.assertEqual(module.collaboration_role("reviewer"), "retired")
         self.assertEqual(module.collaboration_role("default"), "reporter")
 
     def test_ambiguous_intent_uses_model_classifier_and_keeps_rule_fallback(self):
@@ -2497,14 +3159,14 @@ class CollaborationDashboardTests(unittest.TestCase):
             ["default", "dbb3-worker", "reviewer", "supervisor"],
         )
 
-        prompt = module.build_group_prompt(room, "supervisor", "检查执行边界")
+        prompt = module.build_group_prompt(room, "dbb3-worker", "检查执行边界")
 
-        self.assertEqual(module.collaboration_role("supervisor"), "supervisor")
+        self.assertEqual(module.collaboration_role("supervisor"), "retired")
         self.assertEqual(
             module.collaboration_execution_order(room["profiles"]),
-            ["supervisor", "dbb3-worker", "reviewer", "default"],
+            ["dbb3-worker", "default"],
         )
-        self.assertIn("监督者不替任何成员执行其主体工作", prompt)
+        self.assertIn("你是执行者", prompt)
 
     def test_hosted_intervention_is_targeted_idempotent_and_owner_scoped(self):
         module = load_module()
@@ -3487,7 +4149,7 @@ class CollaborationDashboardTests(unittest.TestCase):
             "可供 Reporter 参考的表述",
         )
 
-    def test_supervisor_corrective_action_fails_the_turn_after_bounded_rework(self):
+    def test_deterministic_gate_fails_empty_worker_evidence_without_rework(self):
         module = load_module()
         conversation = module.create_single_conversation("default")
         state = {"conversations": [conversation]}
@@ -3495,52 +4157,47 @@ class CollaborationDashboardTests(unittest.TestCase):
         module.save_single_state = lambda _state: None
         module.create_hosted_turn_record(
             conversation,
-            turn_id="turn-supervisor-control",
+            turn_id="turn-deterministic-control",
             content="执行",
             title="执行",
             profiles=["default", "dbb3-worker", "reviewer"],
             artifact_required=False,
         )
         calls = []
-        worker_calls = {"n": 0}
 
         def runner(profile, _prompt, **_kwargs):
             calls.append(profile)
-            if profile == "supervisor":
-                return supervision_control("CORRECTIVE_ACTION")
-            worker_calls["n"] += 1
-            return "不应通过"
+            if profile == "dbb3-worker":
+                return ""
+            raise AssertionError(f"unexpected profile {profile}")
 
-        with self.assertRaisesRegex(RuntimeError, "要求返工"):
-            module.execute_hosted_workflow(
-                conversation["id"],
-                "turn-supervisor-control",
-                runner=runner,
-                task_creator=lambda **_kwargs: {
-                    "task_id": "root-control",
-                    "child_ids": [],
-                    "fanout": False,
-                },
-            )
-        # 快检 (a) 存疑 → 1 次追问 + 最多 2 轮返工，全部 corrective 后 fail closed。
-        self.assertEqual(worker_calls["n"], 4)
-        self.assertEqual(calls.count("supervisor"), 4)
-        run = conversation["hosted_turns"]["turn-supervisor-control"]
+        module.execute_hosted_workflow(
+            conversation["id"],
+            "turn-deterministic-control",
+            runner=runner,
+            task_creator=lambda **_kwargs: {
+                "task_id": "root-control",
+                "child_ids": [],
+                "fanout": False,
+            },
+        )
+        self.assertEqual(calls, ["dbb3-worker"])
+        run = conversation["hosted_turns"]["turn-deterministic-control"]
         self.assertEqual(run["status"], "failed")
         self.assertEqual(run["stage"], "failed")
         self.assertEqual(
-            run["supervisor_corrective_action"]["verdict"],
-            "corrective_action",
+            run["validation_verdicts"]["final_report"],
+            "failed",
         )
         self.assertTrue(
             any(
                 message.get("meta", {}).get("role_stage")
-                == "supervisor.corrective"
+                == "aggregator"
                 for message in conversation["messages"]
             )
         )
 
-    def test_supervisor_todo_check_corrective_action_triggers_followup_then_rework(self):
+    def test_manager_planning_keeps_canonical_identity_before_deterministic_gate(self):
         module = load_module()
         conversation = module.create_single_conversation("default")
         state = {"conversations": [conversation]}
@@ -3548,19 +4205,17 @@ class CollaborationDashboardTests(unittest.TestCase):
         module.save_single_state = lambda _state: None
         module.create_hosted_turn_record(
             conversation,
-            turn_id="turn-supervisor-rework",
+            turn_id="turn-canonical-manager-gate",
             content="执行",
             title="执行",
             profiles=["default", "dbb3-worker", "reviewer"],
             artifact_required=False,
         )
         calls = []
-        todo_check_calls = {"n": 0}
-        worker_calls = {"n": 0}
 
         def runner(profile, prompt, **kwargs):
-            calls.append(profile)
-            if profile == "dbb3-manager":
+            calls.append((profile, kwargs.get("runtime_profile", "")))
+            if profile == module._HERMES_MANAGER_PROFILE:
                 return json.dumps(
                     {
                         "difficulty": "low",
@@ -3578,32 +4233,13 @@ class CollaborationDashboardTests(unittest.TestCase):
                         ],
                     }
                 )
-            if profile == "supervisor":
-                if "Todo 完成：" in prompt:
-                    todo_check_calls["n"] += 1
-                    if todo_check_calls["n"] == 1:
-                        return supervision_control(
-                            "CORRECTIVE_ACTION",
-                            blockers=[],
-                            findings=["worker did not execute"],
-                            required_actions=["actually create file"],
-                        )
-                    return supervision_control()
-                if "最终汇报前" in prompt:
-                    return supervision_control()
-                raise AssertionError(f"unexpected supervisor prompt: {prompt[:80]}")
             if profile == "dbb3-worker":
-                worker_calls["n"] += 1
-                if worker_calls["n"] == 2:
-                    # 第一次快检存疑后的追问，而不是直接打回。
-                    self.assertIn("监督者追问", prompt)
-                    self.assertIn("actually create file", prompt)
-                return "worker attempt result"
+                return ""
             raise AssertionError(f"unexpected profile {profile}")
 
         module.execute_hosted_workflow(
             conversation["id"],
-            "turn-supervisor-rework",
+            "turn-canonical-manager-gate",
             runner=runner,
             manager_runner=runner,
             task_creator=lambda **_kwargs: {
@@ -3616,27 +4252,17 @@ class CollaborationDashboardTests(unittest.TestCase):
                 "fanout": True,
             },
         )
-        run = conversation["hosted_turns"]["turn-supervisor-rework"]
-        self.assertEqual(run["status"], "completed")
-        self.assertEqual(todo_check_calls["n"], 2)
-        self.assertEqual(worker_calls["n"], 2)
-        # 存疑先以追问卡片呈现，未进入返工轮次。
-        self.assertTrue(
-            any(
-                message.get("meta", {}).get("role_stage")
-                == "supervisor.followup:step-1"
-                for message in conversation["messages"]
-            )
+        run = conversation["hosted_turns"]["turn-canonical-manager-gate"]
+        self.assertEqual(
+            calls,
+            [
+                (module._HERMES_MANAGER_PROFILE, ""),
+                ("dbb3-worker", ""),
+            ],
         )
-        self.assertFalse(
-            any(
-                str(message.get("meta", {}).get("role_stage") or "").startswith(
-                    "supervisor.rework-request"
-                )
-                for message in conversation["messages"]
-            )
-        )
-        self.assertIn("todo_step-1", run["supervisor_checks"])
+        self.assertEqual(run["participants"][0]["id"], module._HERMES_MANAGER_PROFILE)
+        self.assertEqual(run["status"], "failed")
+        self.assertEqual(run["validation_verdicts"]["final_report"], "failed")
 
     def test_terminal_cas_notification_uses_cancel_winner(self):
         module = load_module()
@@ -4530,13 +5156,12 @@ class CollaborationDashboardTests(unittest.TestCase):
         )
         self.assertEqual(pending["id"], "ended-role-1")
 
-    def test_manager_reviewer_and_supervisor_mentions_wait_for_future_phases(self):
+    def test_manager_and_worker_mentions_wait_for_future_phases(self):
         module = load_module()
         module.owner_id_from_request = lambda _request: "owner-a"
         scenarios = (
             ("@Manager 调整后续交接", "manager:plan", "manager:handoff", "dbb3-manager"),
-            ("@Reviewer 复核返工结果", "reviewer:initial", "reviewer:rework:1", "reviewer"),
-            ("@Supervisor 检查最终汇报", "supervisor:dispatch", "supervisor:post_report", "supervisor"),
+            ("@DBB3 执行员 补充验证", "worker:initial", "worker:rework:1", "dbb3-worker"),
         )
         for index, (content, historical_stage, future_stage, profile) in enumerate(scenarios):
             with self.subTest(future_stage=future_stage):
@@ -5260,15 +5885,8 @@ class CollaborationDashboardTests(unittest.TestCase):
         )
 
         # 编排工作流重构：reviewer/reporter 通道已删除，业务调用只剩 worker；
-        # 监督改为事件驱动快检（每个 todo 项一次 + 最终汇报前一次）。
-        self.assertEqual(
-            [profile for profile, _prompt in calls if profile != "supervisor"],
-            ["dbb3-worker"],
-        )
-        self.assertEqual(
-            [profile for profile, _prompt in calls].count("supervisor"),
-            2,
-        )
+        # 监督改为服务端确定性校验（零额外模型调用）。
+        self.assertEqual([profile for profile, _prompt in calls], ["dbb3-worker"])
         assistant_messages = [
             message
             for message in conversation["messages"]
@@ -5286,10 +5904,7 @@ class CollaborationDashboardTests(unittest.TestCase):
         self.assertIn("执行完成，服务已恢复", final_message["content"])
         self.assertIn("dbb3-worker", final_message["content"])
         self.assertEqual(run["status"], "completed")
-        self.assertEqual(
-            set(run["supervisor_checks"]),
-            {"todo_todo-1", "final_report"},
-        )
+        self.assertEqual(run["supervisor_checks"], {})
         notification = run["notification"]
         self.assertEqual(notification["state"], "queued")
         self.assertEqual(notification["task_status"], "completed")
@@ -5748,16 +6363,16 @@ class CollaborationDashboardTests(unittest.TestCase):
             for message in conversation["messages"]
             if message.get("meta", {}).get("runtime_turn_id") == "turn-live-roles"
             and message.get("meta", {}).get("role_stage")
-            in {"dispatch", "worker", "reporter"}
+            in {"dispatch", "worker"}
         ]
         self.assertEqual(
             [message["meta"]["role_stage"] for message in role_messages],
-            ["dispatch", "worker", "reporter"],
+            ["dispatch", "worker"],
         )
         # 编排工作流重构：reviewer 通道已删除，流式角色消息只剩 worker；
         # reporter 为确定性看板汇报，不再经过 LLM 流式投影。
         self.assertEqual(len(observed_running_messages), 1)
-        worker_final = role_messages[1]
+        worker_final = role_messages[-1]
         self.assertTrue(worker_final["meta"]["collapse_activities"])
         self.assertEqual(worker_final["meta"]["actual_model"], "gpt-5.6-sol")
         self.assertEqual(worker_final["meta"]["activities"][1]["category"], "command")
@@ -6914,12 +7529,9 @@ class CollaborationDashboardTests(unittest.TestCase):
             for profile, phase, _at, _scope in calls
             if phase == "start" and profile != "supervisor"
         ]
-        # 无依赖的两个 todo 项并行派发；reviewer/reporter 通道已删除。
+        # 无依赖的两个 todo 项并行派发；监督与汇报都是服务端确定性路径。
         self.assertEqual(set(start_profiles), {"dbb3-worker", "pc-worker"})
-        self.assertEqual(
-            [profile for profile, _phase, _at, _scope in calls].count("supervisor"),
-            3,
-        )
+        self.assertEqual({profile for profile, _phase, _at, _scope in calls}, {"dbb3-worker", "pc-worker"})
 
         worker_messages = [
             message
@@ -7007,14 +7619,13 @@ class CollaborationDashboardTests(unittest.TestCase):
         run = conversation["hosted_turns"]["turn-participants"]
         self.assertEqual(run["status"], "completed")
         participants = {member["id"]: member for member in run["participants"]}
-        self.assertEqual(participants["dbb3-manager"]["role"], "manager")
-        self.assertEqual(participants["dbb3-manager"]["display_name"], "Hermes 调度员")
-        self.assertEqual(participants["dbb3-manager"]["node"], "dbb3")
+        self.assertEqual(participants["hermes-manager"]["role"], "manager")
+        self.assertEqual(participants["hermes-manager"]["display_name"], "Hermes 调度员")
+        self.assertEqual(participants["hermes-manager"]["node"], "server")
         self.assertEqual(participants["dbb3-worker"]["role"], "worker")
         self.assertEqual(participants["dbb3-worker"]["node"], "dbb3")
         self.assertEqual(participants["pc-worker"]["role"], "worker")
         self.assertEqual(participants["pc-worker"]["node"], "wsl")
-        self.assertEqual(participants["reviewer"]["role"], "reviewer")
         self.assertEqual(participants["default"]["role"], "reporter")
         for member in run["participants"]:
             self.assertTrue(member["avatar_seed"])
@@ -7054,7 +7665,7 @@ class CollaborationDashboardTests(unittest.TestCase):
             set(participants),
         )
 
-    def test_todo_completion_check_rework_runs_worker_again_before_final_report(self):
+    def test_empty_worker_result_fails_the_deterministic_completion_gate(self):
         module = load_module()
         conversation = module.create_single_conversation("default")
         state = {"conversations": [conversation]}
@@ -7063,7 +7674,7 @@ class CollaborationDashboardTests(unittest.TestCase):
         module._schedule_mobile_completion_notification = lambda *_args: None
         module.create_hosted_turn_record(
             conversation,
-            turn_id="turn-review-rework",
+            turn_id="turn-empty-worker",
             content="修复并验证部署",
             title="修复部署",
             profiles=["default", "dbb3-worker", "reviewer"],
@@ -7072,40 +7683,16 @@ class CollaborationDashboardTests(unittest.TestCase):
             route_metadata={"mode": "work", "targets": ["dbb3"]},
         )
         calls = []
-        worker_attempt = 0
-        todo_check_attempt = 0
 
-        def runner(profile, prompt, **_kwargs):
-            nonlocal worker_attempt, todo_check_attempt
+        def runner(profile, _prompt, **_kwargs):
             calls.append(profile)
-            if profile == "supervisor":
-                if "Todo 完成：" in prompt:
-                    todo_check_attempt += 1
-                    if todo_check_attempt <= 2:
-                        return supervision_control(
-                            "CORRECTIVE_ACTION",
-                            blockers=["部署未验证"],
-                            findings=["声称完成但缺少验证结果"],
-                            required_actions=["重新执行并给出验证输出"],
-                        )
-                    return supervision_control()
-                if "最终汇报前" in prompt:
-                    return supervision_control()
-                raise AssertionError(f"unexpected supervisor prompt: {prompt[:80]}")
             if profile == "dbb3-worker":
-                worker_attempt += 1
-                if worker_attempt == 2:
-                    # 第一次快检存疑后的追问（不是直接打回）。
-                    self.assertIn("监督者追问", prompt)
-                if worker_attempt == 3:
-                    # 追问后仍判定未完成，才确认打回重做。
-                    self.assertIn("退回返工意见", prompt)
-                return f"执行结果 {worker_attempt}"
+                return ""
             raise AssertionError(f"unexpected profile {profile}")
 
         module.execute_hosted_workflow(
             conversation["id"],
-            "turn-review-rework",
+            "turn-empty-worker",
             runner=runner,
             task_creator=lambda **_kwargs: {
                 "task_id": "root-rework",
@@ -7114,22 +7701,13 @@ class CollaborationDashboardTests(unittest.TestCase):
             },
         )
 
-        run = conversation["hosted_turns"]["turn-review-rework"]
-        self.assertEqual(
-            [profile for profile in calls if profile != "supervisor"],
-            ["dbb3-worker", "dbb3-worker", "dbb3-worker"],
-        )
-        self.assertEqual(todo_check_attempt, 3)
-        self.assertEqual(run["rework_round"], 1)
-        self.assertEqual(run["status"], "completed")
-        role_stages = {
-            message.get("meta", {}).get("role_stage")
-            for message in conversation["messages"]
-        }
-        self.assertIn("worker:dbb3-worker:followup:1", role_stages)
-        self.assertIn("worker:dbb3-worker:rework:1", role_stages)
-        self.assertIn("supervisor.followup:todo-1", role_stages)
-        self.assertIn("supervisor.rework-request:1", role_stages)
+        run = conversation["hosted_turns"]["turn-empty-worker"]
+        self.assertEqual(calls, ["dbb3-worker"])
+        self.assertEqual(run["status"], "failed")
+        self.assertEqual(run["stage"], "failed")
+        self.assertEqual(run["validation_verdicts"]["final_report"], "failed")
+        self.assertIn("todo-1", run["reporter_result"])
+        self.assertIn("未完成", run["reporter_result"])
 
     def test_intent_classifier_hard_chat_lock_rejects_conflicting_model(self):
         module = load_module()
@@ -7350,7 +7928,7 @@ class CollaborationDashboardTests(unittest.TestCase):
         self.assertEqual(result["reviewer_target"], "dbb3")
         self.assertEqual(result["plan"][0]["assignee"], "dbb3-worker")
 
-    def test_complex_production_workflow_uses_dbb3_manager_and_server_reporter(self):
+    def test_complex_production_workflow_uses_canonical_manager_and_server_reporter(self):
         module = load_module()
         conversation = module.create_single_conversation("default")
         state = {"conversations": [conversation]}
@@ -7400,33 +7978,14 @@ class CollaborationDashboardTests(unittest.TestCase):
                     "completed",
                     {},
                 )
-            if stage == "worker":
+            if stage == "worker" or stage.startswith("worker:"):
                 return "worker evidence", "completed", {}
-            if stage == "reviewer":
-                return review_control(), "completed", {}
-            if stage == "manager_handoff":
-                return (
-                    json.dumps(
-                        {
-                            "task_goal": "检查两个节点并汇总结果",
-                            "plan": [{"id": "step-1"}],
-                            "worker_results": {"dbb3-worker": "worker evidence"},
-                            "review_verdict": "verified",
-                            "rework_history": [],
-                            "artifacts": [],
-                            "failures": [],
-                            "suggested_conclusion": "checks passed",
-                        }
-                    ),
-                    "completed",
-                    {},
-                )
-            if stage.startswith("supervisor:"):
-                return supervision_control(), "completed", {}
             raise AssertionError(stage)
 
         def local_role(_conversation_id, _turn_id, **kwargs):
-            local_stages.append((kwargs["role_stage"], kwargs["profile"], kwargs["prompt"]))
+            local_stages.append(
+                (kwargs["role_stage"], kwargs["profile"], kwargs["role_label"])
+            )
             return "server final answer", "completed", {"activities": []}
 
         module._run_hosted_remote_role = remote_role
@@ -7448,15 +8007,13 @@ class CollaborationDashboardTests(unittest.TestCase):
 
         self.assertEqual(
             [stage for stage, _profile, _connector, _label in remote_stages],
-            [
-                "manager_planning",
-                "worker",
-                "supervisor:todo_step-1",
-                "supervisor:final_report",
-            ],
+            ["worker"],
         )
-        # Reporter 通道已删除：最终汇报由确定性看板生成，不再有本地 LLM 角色。
-        self.assertEqual(local_stages, [])
+        # Manager planning remains a server-local role; reporting is deterministic.
+        self.assertEqual(
+            [(stage, profile) for stage, profile, _prompt in local_stages],
+            [("manager_planning", module._HERMES_MANAGER_PROFILE)],
+        )
         run = conversation["hosted_turns"]["turn-manager-owned"]
         self.assertEqual(run["stage"], "completed")
         self.assertIn("任务执行看板", run["reporter_result"])
@@ -7467,8 +8024,8 @@ class CollaborationDashboardTests(unittest.TestCase):
         )
         manager_labels = {
             label
-            for stage, profile, _connector, label in remote_stages
-            if profile == "dbb3-manager" and stage.startswith("manager_")
+            for stage, profile, label in local_stages
+            if profile == module._HERMES_MANAGER_PROFILE and stage.startswith("manager_")
         }
         self.assertEqual(
             manager_labels,
@@ -7478,11 +8035,8 @@ class CollaborationDashboardTests(unittest.TestCase):
             any("DBB3 Manager" in str(label) for label in manager_labels)
         )
         self.assertEqual(
-            set(run["supervisor_checks"]),
-            {
-                "todo_step-1",
-                "final_report",
-            },
+            run["validation_verdicts"],
+            {"todo_step-1": "pass", "final_report": "pass"},
         )
 
     def test_final_report_corrective_gate_rejects_publication_before_the_deterministic_report(self):
@@ -7530,15 +8084,31 @@ class CollaborationDashboardTests(unittest.TestCase):
                 )
             if stage == "worker" or stage.startswith("worker:"):
                 return "verified worker evidence", "completed", {}
-            if stage.startswith("supervisor:final_report"):
-                return supervision_control("CORRECTIVE_ACTION"), "completed", {}
-            if stage.startswith("supervisor:"):
-                return supervision_control(), "completed", {}
             raise AssertionError(stage)
 
         def local_role(_conversation_id, _turn_id, **kwargs):
             visibility[kwargs["role_stage"]] = kwargs.get("visible", True)
-            raise AssertionError("确定性汇报不应触发本地 LLM 角色")
+            self.assertEqual(kwargs["role_stage"], "manager_planning")
+            return (
+                json.dumps(
+                    {
+                        "difficulty": "medium",
+                        "reason": "single lane",
+                        "workers": ["dbb3-worker"],
+                        "plan": [
+                            {
+                                "id": "todo-1",
+                                "title": "check node",
+                                "objective": "inspect node",
+                                "assignee": "dbb3-worker",
+                                "depends_on": [],
+                            }
+                        ],
+                    }
+                ),
+                "completed",
+                {},
+            )
 
         module._run_hosted_remote_role = remote_role
         module._run_hosted_role = local_role
@@ -7546,35 +8116,35 @@ class CollaborationDashboardTests(unittest.TestCase):
             lambda *args: notifications.append(args)
         )
 
-        with self.assertRaisesRegex(RuntimeError, "要求返工"):
-            module.execute_hosted_workflow(
-                conversation["id"],
-                "turn-post-report-reject",
-                runner=module.run_profile_turn,
-                task_creator=lambda **_kwargs: {
-                    "task_id": "root-post-report-reject",
-                    "child_ids": ["child-worker", "child-reviewer"],
-                    "profile_task_ids": {
-                        "dbb3-worker": "child-worker",
-                        "reviewer": "child-reviewer",
-                    },
-                    "fanout": True,
+        module.execute_hosted_workflow(
+            conversation["id"],
+            "turn-post-report-reject",
+            runner=module.run_profile_turn,
+            task_creator=lambda **_kwargs: {
+                "task_id": "root-post-report-reject",
+                "child_ids": ["child-worker", "child-reviewer"],
+                "profile_task_ids": {
+                    "dbb3-worker": "child-worker",
+                    "reviewer": "child-reviewer",
                 },
-            )
+                "fanout": True,
+            },
+        )
 
         run = conversation["hosted_turns"]["turn-post-report-reject"]
-        self.assertEqual(run["status"], "failed")
+        self.assertEqual(run["status"], "completed")
         self.assertEqual(
-            run["supervisor_checks"]["final_report_2"]["verdict"],
-            "corrective_action",
+            run["supervisor_checks"],
+            {},
         )
-        self.assertFalse(
+        self.assertIn("verified worker evidence", run["reporter_result"])
+        self.assertTrue(
             any(
                 message.get("meta", {}).get("final_report")
                 for message in conversation["messages"]
             )
         )
-        self.assertEqual(notifications, [])
+        self.assertEqual(len(notifications), 1)
 
     def test_subagent_control_replay_does_not_repeat_real_gateway_side_effect(self):
         module = load_module()
@@ -7964,7 +8534,7 @@ class CollaborationDashboardTests(unittest.TestCase):
             for item in conversation["messages"]
             if item.get("id") == intervention_id
         )
-        self.assertEqual(message["name"], "Hermes 监督者")
+        self.assertEqual(message["name"], "")
         self.assertTrue(message["meta"]["intervention"])
 
         run["status"] = "failed"

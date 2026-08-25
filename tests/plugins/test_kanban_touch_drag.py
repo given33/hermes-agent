@@ -19,8 +19,22 @@ class KanbanTouchDragTests(unittest.TestCase):
 
         self.assertIn("TOUCH_DRAG_HOLD_MS", bundle)
         self.assertIn("TOUCH_SCROLL_CANCEL_PX", bundle)
+        self.assertIn(
+            "holdTimer = window.setTimeout(startDrag, TOUCH_DRAG_HOLD_MS)",
+            bundle,
+        )
+        self.assertIn(
+            "if (Math.hypot(dx, dy) > TOUCH_SCROLL_CANCEL_PX) cancel();",
+            bundle,
+        )
         self.assertIn("clearTimeout(holdTimer)", bundle)
         self.assertIn("if (!dragging) return", bundle)
+        self.assertIn('const moveOptions = { passive: false }', bundle)
+        self.assertIn("if (activeCancel) activeCancel();", bundle)
+        self.assertIn("if (suppressTouchClick)", bundle)
+        self.assertIn('el.addEventListener("click", onCardClick, true)', bundle)
+        self.assertIn("if (el.setPointerCapture) el.setPointerCapture(pointerId)", bundle)
+        self.assertIn("suppressNextClick();", bundle)
 
     def test_manifest_cache_busts_touch_fix(self):
         manifest = json.loads(

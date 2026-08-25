@@ -146,7 +146,10 @@ class TestAllowlistOps:
 
     def test_tilde_path_approval_records_resolvable_mtime(self, tmp_path, monkeypatch):
         """If the command uses ~ the approval must still find the file."""
+        # Windows' expanduser() ignores HOME and reads USERPROFILE (Python
+        # 3.8+); patch both so '~' resolves into tmp_path on every platform.
         monkeypatch.setenv("HOME", str(tmp_path))
+        monkeypatch.setenv("USERPROFILE", str(tmp_path))
         target = tmp_path / "hook.sh"
         target.write_text("#!/usr/bin/env bash\n")
         target.chmod(0o755)

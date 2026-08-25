@@ -490,9 +490,14 @@ class TestRoomDetailProjection:
         room["typing"] = {
             "owner-a": {
                 "id": "owner-a",
+                "name": "Requester",
+                "expires_at": int(time.time() * 1000) + 5_000,
+            },
+            "owner-b": {
+                "id": "owner-b",
                 "name": "Given",
                 "expires_at": int(time.time() * 1000) + 5_000,
-            }
+            },
         }
         room["summary"] = {"text": "之前讨论了部署", "version": 3}
         patch_room_module(module, [room])
@@ -501,6 +506,7 @@ class TestRoomDetailProjection:
         assert {a["profile"] for a in detail["agents"]} == {"default", "pc-worker"}
         assert detail["agents"][0]["provider"] == "openai"
         assert [m["role"] for m in detail["members"]] == ["owner"]
+        # Presence is audience-scoped: a viewer never sees their own indicator.
         assert [t["name"] for t in detail["typing_users"]] == ["Given"]
         assert detail["summary_state"]["summary"] == "之前讨论了部署"
         assert detail["summary_state"]["version"] == 3

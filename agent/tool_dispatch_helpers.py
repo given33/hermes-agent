@@ -36,6 +36,10 @@ from agent.message_metadata import stamp_message_timestamp
 from agent.tool_result_classification import (
     FILE_MUTATING_TOOL_NAMES as _FILE_MUTATING_TOOLS,
 )
+from hermes_services.tool_contract import (
+    has_registered_tool_contract,
+    resolve_tool_contract,
+)
 from tools.threat_patterns import scan_for_threats
 
 logger = logging.getLogger(__name__)
@@ -216,7 +220,26 @@ def _plan_tool_batch_segments(tool_calls, *, execution_cwd: Optional[Path] = Non
             current.append(tool_call)
             continue
 
-        if tool_name in _PARALLEL_SAFE_TOOLS or _is_mcp_tool_parallel_safe(tool_name):
+        if has_registered_tool_contract(tool_name):
+            # An explicit registration is authoritative: it may admit an
+            # otherwise-unknown tool or tighten a historical default. Keep
+            # hard barriers for every contract that is not explicitly
+            # parallel and confined to immutable/read-only effects.
+            contract = resolve_tool_contract(tool_name)
+            if (
+                contract.execution_mode == "sequential"
+                or contract.side_effect_class not in {"none", "read"}
+            ):
+                _add_sequential(tool_call)
+                continue
+            current.append(tool_call)
+            continue
+
+        if tool_name in _PARALLEL_SAFE_TOOLS:
+            current.append(tool_call)
+            continue
+
+        if _is_mcp_tool_parallel_safe(tool_name):
             current.append(tool_call)
             continue
 
@@ -246,6 +269,11 @@ def _should_parallelize_tool_batch(tool_calls) -> bool:
         return False
     segments = _plan_tool_batch_segments(tool_calls)
     return len(segments) == 1 and segments[0][0] == "parallel"
+
+
+def _plan_tool_batch_execution(tool_calls):
+    """Backward-compatible name for the batch segment planner."""
+    return _plan_tool_batch_segments(tool_calls)
 
 
 def _canonical_path(raw_path: str, execution_cwd: Optional[Path] = None) -> Path:
@@ -717,6 +745,7 @@ __all__ = [
     "_REDIRECT_OVERWRITE",
     "_is_destructive_command",
     "_plan_tool_batch_segments",
+    "_plan_tool_batch_execution",
     "_should_parallelize_tool_batch",
     "_canonical_path",
     "_extract_parallel_scope_path",

@@ -1856,10 +1856,12 @@ def test_connector_credentials_and_profiles_are_bound_to_devices(tmp_path, monke
             json={"connector_id": "dbb3-primary", "limit": 5},
         )
         assert dbb3.status_code == 200
-        assert [run["profile"] for run in dbb3.json()["runs"]] == [
-            "dbb3-worker",
-            "dbb3-manager",
-        ]
+        # Canonical ``hermes-manager`` planning is server-local.  Ordinary
+        # DBB3 connector pulls therefore contain only its worker lane; the
+        # retired ``dbb3-manager`` alias remains an explicit legacy input.
+        dbb3_profiles = [run["profile"] for run in dbb3.json()["runs"]]
+        assert dbb3_profiles == ["dbb3-worker"]
+        assert "dbb3-manager" not in dbb3_profiles
 
         pc = client.post(
             f"{prefix}/connector/runs/pull",
@@ -3094,9 +3096,11 @@ def test_sidecar_cleanup_failure_returns_retryable_status_and_preserves_files(
     monkeypatch.setattr(module, "_file_library", lambda: SimpleNamespace(
         delete_conversation=lambda *_args, **_kwargs: None,
     ))
+    from hermes_cli import safe_delete
+
     monkeypatch.setattr(
-        module.shutil,
-        "rmtree",
+        safe_delete,
+        "safe_rmtree",
         lambda *_args, **_kwargs: (_ for _ in ()).throw(OSError("disk busy")),
     )
 

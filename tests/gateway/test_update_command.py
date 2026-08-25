@@ -43,6 +43,10 @@ def _make_runner():
 # ---------------------------------------------------------------------------
 
 
+@pytest.mark.skipif(
+    __import__("sys").platform == "win32",
+    reason="setsid + bash update command is POSIX-only",
+)
 class TestHandleUpdateCommand:
     """Tests for GatewayRunner._handle_update_command."""
 
@@ -262,6 +266,10 @@ class TestUpdateCommandPlatformGate:
 # ---------------------------------------------------------------------------
 
 
+@pytest.mark.skipif(
+    __import__("sys").platform == "win32",
+    reason="POSIX signal-based notification delivery",
+)
 class TestSendUpdateNotification:
     """Tests for GatewayRunner._send_update_notification."""
 

@@ -45,6 +45,7 @@ from gateway.platforms.base import (
     SendResult,
     cache_document_from_bytes,
     cache_image_from_bytes,
+    _local_path_from_file_uri,
 )
 from gateway.config import Platform, PlatformConfig
 from utils import is_truthy_value
@@ -1235,15 +1236,13 @@ class EmailAdapter(BasePlatformAdapter):
         if not images:
             return
 
-        from urllib.parse import unquote as _unquote
-
         body_parts: List[str] = []
         local_paths: List[str] = []
         for image_url, alt_text in images:
             if alt_text:
                 body_parts.append(alt_text)
             if image_url.startswith("file://"):
-                local_path = _unquote(image_url[7:])
+                local_path = _local_path_from_file_uri(image_url)
                 if Path(local_path).exists():
                     local_paths.append(local_path)
                 else:

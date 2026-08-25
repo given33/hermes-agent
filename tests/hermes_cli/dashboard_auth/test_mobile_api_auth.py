@@ -392,6 +392,14 @@ def test_loopback_legacy_bearer_survives_mobile_prefix(mobile_app):
                 "X-Hermes-Session-Token": web_server._SESSION_TOKEN,
             },
         )
+        basic_proxy_with_session_header = mobile_app.client.get(
+            "/api/sessions",
+            headers={
+                "Host": "127.0.0.1:9119",
+                "Authorization": "Basic cHJveHk6cGFzcw==",
+                "X-Hermes-Session-Token": web_server._SESSION_TOKEN,
+            },
+        )
 
         web_server.app.state.bound_host = "mobile.test"
         web_server.app.state.bound_port = 443
@@ -407,6 +415,7 @@ def test_loopback_legacy_bearer_survives_mobile_prefix(mobile_app):
 
     assert loopback.status_code == 200
     assert wrong_mobile_with_session_header.status_code == 401
+    assert basic_proxy_with_session_header.status_code == 200
     assert gated.status_code == 401
 
 

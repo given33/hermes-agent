@@ -654,7 +654,8 @@ function ProfileSquare({
 
   const { attributes, isDragging, listeners, setNodeRef, transform, transition } = useSortable({
     id: label,
-    transition: RAIL_TRANSITION
+    transition: RAIL_TRANSITION,
+    resizeObserverConfig: {}
   })
 
   const clearPress = () => {

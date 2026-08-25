@@ -17,6 +17,8 @@ from hermes_constants import (
     get_hermes_dir,
     get_hermes_home,
     get_process_hermes_home,
+    display_hermes_home,
+    expand_user_path,
     heal_hermes_managed_node,
     hermes_managed_node_tree_present,
     iter_hermes_node_dirs,
@@ -30,11 +32,32 @@ from hermes_constants import (
 )
 
 
+def test_expand_user_path_prefers_explicit_home_on_windows(monkeypatch, tmp_path):
+    scoped_home = tmp_path / "scoped-home"
+    ambient_home = tmp_path / "ambient-home"
+    monkeypatch.setenv("HOME", str(scoped_home))
+    monkeypatch.setenv("USERPROFILE", str(ambient_home))
+
+    # Windows normpath is intentional: callers pass this string to Win32
+    # APIs, not to a POSIX shell.
+    expected = os.path.normpath(str(scoped_home)) + "/project"
+    assert expand_user_path("~/project") == expected
+
+
+def test_display_hermes_home_keeps_explicit_scope_visible(monkeypatch, tmp_path):
+    explicit_home = tmp_path / ".hermes"
+    monkeypatch.setenv("HERMES_HOME", str(explicit_home))
+
+    assert display_hermes_home() == str(explicit_home)
+
+
 class TestGetDefaultHermesRoot:
     """Tests for get_default_hermes_root() — Docker/custom deployment awareness."""
 
     def test_no_hermes_home_returns_native(self, tmp_path, monkeypatch):
         """When HERMES_HOME is not set, returns ~/.hermes."""
+        if os.name == "nt":
+            pytest.skip("native Windows uses LOCALAPPDATA root")
         monkeypatch.delenv("HERMES_HOME", raising=False)
         monkeypatch.setattr(Path, "home", lambda: tmp_path)
 
@@ -59,6 +82,7 @@ class TestGetDefaultHermesRoot:
         """Native Windows falls back to %LOCALAPPDATA%\\hermes, not ~/.hermes."""
         local_appdata = tmp_path / "LocalAppData"
         monkeypatch.delenv("HERMES_HOME", raising=False)
+        monkeypatch.delenv("HOME", raising=False)
         monkeypatch.setenv("LOCALAPPDATA", str(local_appdata))
         monkeypatch.setattr(Path, "home", lambda: tmp_path / "Home")
 
@@ -132,6 +156,7 @@ class TestGetHermesHome:
         """When HERMES_HOME is unset on Windows, use %LOCALAPPDATA%\\hermes."""
         local_appdata = tmp_path / "LocalAppData"
         monkeypatch.delenv("HERMES_HOME", raising=False)
+        monkeypatch.delenv("HOME", raising=False)
         monkeypatch.setenv("LOCALAPPDATA", str(local_appdata))
         monkeypatch.setattr(Path, "home", lambda: tmp_path / "Home")
         monkeypatch.setattr(hermes_constants, "_profile_fallback_warned", False)
@@ -683,7 +708,10 @@ class TestGetHermesDir:
         """
         self._set_home(tmp_path, monkeypatch)
         legacy = tmp_path / "pairing"
-        legacy.symlink_to(tmp_path / "does-not-exist")
+        try:
+            legacy.symlink_to(tmp_path / "does-not-exist")
+        except OSError:
+            pytest.skip("symlink creation requires platform privileges")
         new = tmp_path / "platforms" / "pairing"
         new.mkdir(parents=True)
         (new / "discord-approved.json").write_text("[]")
@@ -697,7 +725,10 @@ class TestGetHermesDir:
         real.mkdir()
         (real / "cached.png").write_bytes(b"x")
         legacy = tmp_path / "image_cache"
-        legacy.symlink_to(real)
+        try:
+            legacy.symlink_to(real)
+        except OSError:
+            pytest.skip("symlink creation requires platform privileges")
         result = get_hermes_dir("cache/images", "image_cache")
         assert result == legacy
 

@@ -7,6 +7,19 @@ from pathlib import Path
 from typing import Optional
 
 
+def _fold(path: str | os.PathLike[str]) -> str:
+    """Canonicalize a path for case-insensitive safety comparisons.
+
+    ``normcase`` is a no-op on POSIX, while ``casefold`` closes the same
+    comparison gap on macOS and on tests that simulate POSIX semantics.
+    ``realpath`` also keeps prefix checks aligned with the existing symlink
+    policy.
+    """
+    return os.path.normcase(
+        os.path.realpath(os.path.expanduser(os.fspath(path)))
+    ).casefold()
+
+
 def _hermes_home_path() -> Path:
     """Resolve the active HERMES_HOME (profile-aware) without circular imports."""
     try:
@@ -132,20 +145,23 @@ def build_write_approval_paths(home: str) -> set[str]:
 def _classify_write_denial(path: str) -> Optional[str]:
     """Return ``'credential'``, ``'safe_root'``, or ``None`` if writes are allowed."""
     home = os.path.realpath(os.path.expanduser("~"))
-    resolved = os.path.realpath(os.path.expanduser(str(path)))
+    resolved = _fold(path)
 
     # Approval-gated paths (e.g. ~/.ssh/config) are NOT hard-denied here:
     # they are allowed at this layer so the interactive file tools can run
     # their approval prompt, and only blocked for non-interactive callers
     # via get_write_approval_error(). Checked before the credential deny so
     # the ``.ssh/`` directory prefix below doesn't swallow the config file.
-    if resolved in build_write_approval_paths(home):
+    if resolved in {_fold(item) for item in build_write_approval_paths(home)}:
         return None
 
-    if resolved in build_write_denied_paths(home):
+    if resolved in {_fold(item) for item in build_write_denied_paths(home)}:
         return "credential"
     for prefix in build_write_denied_prefixes(home):
-        if resolved.startswith(prefix):
+        folded_prefix = _fold(prefix)
+        if not folded_prefix.endswith(os.sep):
+            folded_prefix += os.sep
+        if resolved.startswith(folded_prefix):
             return "credential"
 
     mcp_tokens_dir_name = "mcp-tokens"
@@ -154,7 +170,7 @@ def _classify_write_denial(path: str) -> Optional[str]:
     for base in (_hermes_home_path(), _hermes_root_path()):
         try:
             real = os.path.realpath(base)
-            if real not in hermes_dirs:
+            if _fold(real) not in {_fold(item) for item in hermes_dirs}:
                 hermes_dirs.append(real)
         except Exception:
             continue
@@ -164,21 +180,21 @@ def _classify_write_denial(path: str) -> Optional[str]:
         # generic file tools rewrite state.db or legacy JSON snapshots can
         # falsify conversation history and invalidate resume/compression state.
         try:
-            if resolved == os.path.realpath(os.path.join(base_real, "state.db")):
-                return True
-            sessions_real = os.path.realpath(os.path.join(base_real, "sessions"))
+            if resolved == _fold(os.path.join(base_real, "state.db")):
+                return "session_state"
+            sessions_real = _fold(os.path.join(base_real, "sessions"))
             if resolved == sessions_real or resolved.startswith(sessions_real + os.sep):
-                return True
+                return "session_state"
         except Exception:
             pass
         try:
-            mcp_real = os.path.realpath(os.path.join(base_real, mcp_tokens_dir_name))
+            mcp_real = _fold(os.path.join(base_real, mcp_tokens_dir_name))
             if resolved == mcp_real or resolved.startswith(mcp_real + os.sep):
                 return "credential"
         except Exception:
             pass
         try:
-            pairing_real = os.path.realpath(os.path.join(base_real, "pairing"))
+            pairing_real = _fold(os.path.join(base_real, "pairing"))
             if resolved == pairing_real or resolved.startswith(pairing_real + os.sep):
                 return "credential"
         except Exception:
@@ -188,7 +204,8 @@ def _classify_write_denial(path: str) -> Optional[str]:
     if safe_roots:
         allowed = False
         for safe_root in safe_roots:
-            if resolved == safe_root or resolved.startswith(safe_root + os.sep):
+            folded_root = _fold(safe_root)
+            if resolved == folded_root or resolved.startswith(folded_root + os.sep):
                 allowed = True
                 break
         if not allowed:
@@ -212,6 +229,10 @@ def get_write_denied_error(path: str, *, verb: str = "Write") -> Optional[str]:
         return (
             f"{verb} denied: '{path}' is outside HERMES_WRITE_SAFE_ROOT "
             f"({roots_display}). Unset the variable or add this path's directory prefix."
+        )
+    if denial == "session_state":
+        return (
+            f"{verb} denied: '{path}' is Hermes session state and is read-only."
         )
     return f"{verb} denied: '{path}' is a protected system/credential file."
 
@@ -591,12 +612,15 @@ def _find_sandbox_mirror_segments(parts: tuple) -> Optional[int]:
     paths that do not contain the sandbox-mirror shape.
     """
     for i, part in enumerate(parts):
-        if part != "sandboxes":
+        if str(part).casefold() != "sandboxes":
             continue
         # Need at least: sandboxes / <backend> / <task> / home / .hermes / <thing>
         if i + 5 >= len(parts):
             continue
-        if parts[i + 3] == "home" and parts[i + 4] == ".hermes":
+        if (
+            str(parts[i + 3]).casefold() == "home"
+            and str(parts[i + 4]).casefold() == ".hermes"
+        ):
             return i + 4
     return None
 
@@ -627,8 +651,12 @@ def classify_sandbox_mirror_target(path: str) -> Optional[dict]:
     if inner_idx is None:
         return None
 
-    mirror_root = str(Path(*parts[: inner_idx + 1]))
-    inner_path = str(Path(*parts[inner_idx + 1 :])) if inner_idx + 1 < len(parts) else ""
+    mirror_root = Path(*parts[: inner_idx + 1]).as_posix()
+    inner_path = (
+        Path(*parts[inner_idx + 1 :]).as_posix()
+        if inner_idx + 1 < len(parts)
+        else ""
+    )
 
     return {
         "target_path": str(target),

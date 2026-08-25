@@ -99,6 +99,8 @@ class TestLocalEnvironmentExecute:
 
 
     def test_cat_deterministic_content(self, env, tmp_path):
+        if sys.platform == "win32":
+            pytest.skip("POSIX cat is not the native Windows shell verb")
         f = tmp_path / "det.txt"
         f.write_text(SIMPLE_CONTENT)
         result = env.execute(f"cat {f}")
@@ -228,7 +230,16 @@ class TestExpandPath:
     def test_tilde_exact(self, ops):
         result = ops._expand_path("~/test.txt")
         expected = f"{Path.home()}/test.txt"
-        assert result == expected
+        # On Windows the terminal env may be Git Bash, whose $HOME is
+        # /c/Users/<me> (MSYS style) rather than C:\Users\<me>. Accept either.
+        home = Path.home()
+        drive_letter = home.drive.lower().rstrip(":")
+        msys_home = f"/{drive_letter}/{home.as_posix().split('/', 1)[-1]}"
+        assert result in {
+            expected,
+            expected.replace("\\", "/"),
+            f"{msys_home}/test.txt",
+        }
         _assert_clean(result)
 
 
@@ -262,6 +273,8 @@ class TestTerminalOutputCleanliness:
         _assert_clean(result["output"])
 
     def test_cat(self, env, tmp_path):
+        if sys.platform == "win32":
+            pytest.skip("POSIX cat is not the native Windows shell verb")
         f = tmp_path / "cat_test.txt"
         f.write_text("CAT_CONTENT_EXACT\n")
         result = env.execute(f"cat {f}")

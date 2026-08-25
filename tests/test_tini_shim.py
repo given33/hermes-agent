@@ -7,7 +7,9 @@ handed to /init.
 from __future__ import annotations
 
 import os
+import shutil
 import subprocess
+import sys
 from pathlib import Path
 
 import pytest
@@ -15,6 +17,40 @@ import pytest
 REPO_ROOT = Path(__file__).resolve().parents[1]
 SHIM = REPO_ROOT / "docker" / "tini-shim.sh"
 
+
+def _working_sh() -> str | None:
+    """Locate a POSIX shell that can execute the "#!/bin/sh" shim.
+
+    On Windows, bare "sh" is usually not on PATH at all (and "bash"
+    on PATH may be the WSL launcher stub, which exits non-zero when WSL
+    has no installed distro), so candidates are validated by execution.
+    Git-for-Windows ships a real MSYS sh.exe; prefer it over whatever
+    PATH order says.
+    """
+    candidates: list[str] = []
+    if sys.platform == "win32":
+        pf = os.environ.get("ProgramFiles", "C:\\Program Files")
+        pf86 = os.environ.get("ProgramFiles(x86)")
+        for base in (pf, pf86):
+            if base:
+                candidates.append(os.path.join(base, "Git", "bin", "sh.exe"))
+                candidates.append(os.path.join(base, "Git", "usr", "bin", "sh.exe"))
+                candidates.append(os.path.join(base, "Git", "bin", "bash.exe"))
+    for name in ("sh", "bash"):
+        found = shutil.which(name)
+        if found:
+            candidates.append(found)
+    for cand in candidates:
+        try:
+            probe = subprocess.run([cand, "-c", ":"], capture_output=True, timeout=30)
+        except (OSError, subprocess.TimeoutExpired):
+            continue
+        if probe.returncode == 0:
+            return cand
+    return None
+
+
+_SH = _working_sh()
 
 @pytest.fixture
 def recorder(tmp_path: Path) -> tuple[Path, Path]:
@@ -36,8 +72,9 @@ def _run_shim(
     env = os.environ.copy()
     env["HERMES_TINI_SHIM_TARGET"] = str(init)
     env["HERMES_TINI_SHIM_WRAPPER"] = str(wrapper)
+    assert _SH is not None, "no working POSIX shell found"
     return subprocess.run(
-        ["sh", str(SHIM), *args],
+        [_SH, str(SHIM), *args],
         capture_output=True,
         text=True,
         timeout=10,
@@ -48,11 +85,12 @@ def _run_shim(
 
 def test_shim_script_is_executable_bit_friendly() -> None:
     assert SHIM.is_file()
-    text = SHIM.read_text()
+    text = SHIM.read_text(encoding="utf-8")
     assert text.startswith("#!/bin/sh")
     assert "HERMES_TINI_SHIM_TARGET" in text
 
 
+@pytest.mark.skipif(_SH is None, reason="needs a working POSIX shell (e.g. Git Bash) to execute the shim")
 def test_strips_g_and_double_dash(recorder: tuple[Path, Path]) -> None:
     """Legacy `tini -g -- gateway run` must not forward `-g` to /init."""
     r = _run_shim(recorder, ["-g", "--", "gateway", "run"])
@@ -69,6 +107,7 @@ def test_strips_g_and_double_dash(recorder: tuple[Path, Path]) -> None:
 
 
 
+@pytest.mark.skipif(_SH is None, reason="needs a working POSIX shell (e.g. Git Bash) to execute the shim")
 def test_does_not_double_wrap_existing_wrapper(
     recorder: tuple[Path, Path],
 ) -> None:
@@ -79,6 +118,7 @@ def test_does_not_double_wrap_existing_wrapper(
     assert lines == [str(wrapper), "gateway", "run"]
 
 
+@pytest.mark.skipif(_SH is None, reason="needs a working POSIX shell (e.g. Git Bash) to execute the shim")
 def test_strips_p_and_e_with_arguments(recorder: tuple[Path, Path]) -> None:
     r = _run_shim(
         recorder,

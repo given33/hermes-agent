@@ -70,11 +70,12 @@ class TestPasswordHashing:
 class TestProvider:
     def _make(self, basic, **kw):
         h = basic.hash_password("hunter2")
+        kwargs = {"secret": secrets.token_bytes(32)}
+        kwargs.update(kw)
         return basic.BasicAuthProvider(
             username="admin",
             password_hash=h,
-            secret=secrets.token_bytes(32),
-            **kw,
+            **kwargs,
         )
 
     def test_protocol_compliant(self, basic):
@@ -117,6 +118,30 @@ class TestProvider:
         r = p.refresh_session(refresh_token=s.refresh_token)
         assert r.user_id == "admin"
         assert p.verify_session(access_token=r.access_token) is not None
+
+
+    def test_revoked_refresh_cannot_be_replayed(self, basic, tmp_path):
+        shared_secret = secrets.token_bytes(32)
+        provider = self._make(
+            basic,
+            revocation_state_dir=tmp_path / "auth-state",
+            secret=shared_secret,
+        )
+        restarted = self._make(
+            basic,
+            revocation_state_dir=tmp_path / "auth-state",
+            secret=shared_secret,
+        )
+        session = provider.complete_password_login(
+            username="admin", password="hunter2"
+        )
+
+        provider.revoke_session(refresh_token=session.refresh_token)
+
+        with pytest.raises(RefreshExpiredError):
+            provider.refresh_session(refresh_token=session.refresh_token)
+        with pytest.raises(RefreshExpiredError):
+            restarted.refresh_session(refresh_token=session.refresh_token)
 
 
     def test_cross_secret_token_does_not_verify(self, basic):

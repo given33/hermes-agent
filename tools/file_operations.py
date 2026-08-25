@@ -27,6 +27,7 @@ Usage:
 
 import base64
 import binascii
+import fnmatch
 import os
 import re
 import difflib
@@ -853,6 +854,24 @@ def _pattern_has_regex_newline(pattern: str) -> bool:
     return "\n" in pattern or bool(_REGEX_NEWLINE_ESCAPE_RE.search(pattern))
 
 
+def _normalize_rg_newline_pattern(pattern: str) -> str:
+    """Make newline regexes match both LF and CRLF files.
+
+    ``rg --crlf`` adjusts line-boundary semantics but does not make a regex
+    ``\\n`` consume the carriage return in a CRLF file.  An optional ``\\r``
+    keeps the same pattern portable to POSIX files and remote environments.
+    Even backslash runs (for a literal ``\\n``) are left untouched.
+    """
+    def _replace(match: re.Match[str]) -> str:
+        token = match.group(0)
+        return token[:-2] + r"\r?\n"
+
+    # Handle escaped regex tokens first; otherwise the replacement's ``\\n``
+    # would be mistaken for another input token by the same expression.
+    normalized = _REGEX_NEWLINE_ESCAPE_RE.sub(_replace, pattern)
+    return normalized.replace("\n", r"\r?\n")
+
+
 def _is_line_oriented_newline_error(error: Optional[str]) -> bool:
     """Return True for rg's hard error when multiline mode is required."""
     if not error:
@@ -1145,6 +1164,17 @@ class ShellFileOperations(FileOperations):
         # Use single quotes and escape any single quotes in the string
         return "'" + arg.replace("'", "'\"'\"'") + "'"
 
+    @staticmethod
+    def _escape_shell_text_arg(arg: str) -> str:
+        """Quote a non-path shell argument without normalizing backslashes.
+
+        Search patterns are regular expressions, not filesystem paths. The
+        path-aware quoting above rewrites backslashes for Git Bash on Windows;
+        applying that to ``\\n`` or ``\\(`` changes the regex before ripgrep
+        sees it and breaks escaped/multiline searches.
+        """
+        return "'" + str(arg).replace("'", "'\"'\"'") + "'"
+
     def _escape_native_tool_arg(self, arg: str) -> str:
         """Escape a path argument destined for a NATIVE Windows binary.
 
@@ -1380,9 +1410,17 @@ class ShellFileOperations(FileOperations):
         if file_size > self._UTF16_MAX_BYTES:
             return None
 
+        # Build the snippet with chr()/bytes() instead of backslash escape
+        # sequences (\ufeff, \r\n, \xfe): those are fragile across the shell
+        # quoting chain on Windows (bash eats them even inside single quotes
+        # when MSYS argument conversion is active). chr(0x...) has no literal
+        # backslash so it survives any quoting.
         snippet = (
             "import sys, json, os\n"
-            f"p = {path!r}\n"
+            # NOTE: use forward slashes — Python open() accepts them on all
+            # platforms, and backslash paths trigger \U unicode escapes when
+            # MSYS passes arguments to native executables.
+            f"p = {path.replace(chr(92), '/')!r}\n"
             f"offset = {int(offset)}\n"
             f"limit = {int(limit)}\n"
             f"MAX = {self._UTF16_MAX_BYTES}\n"
@@ -1395,9 +1433,11 @@ class ShellFileOperations(FileOperations):
             "        data = f.read()\n"
             "    sample = data[:SAMPLE]\n"
             "    enc = None\n"
-            "    if sample[:2] == b'\\xfe\\xff':\n"
+            "    BOM_BE = bytes([0xFE, 0xFF])\n"
+            "    BOM_LE = bytes([0xFF, 0xFE])\n"
+            "    if sample[:2] == BOM_BE:\n"
             "        enc = 'utf-16-be'\n"
-            "    elif sample[:2] == b'\\xff\\xfe':\n"
+            "    elif sample[:2] == BOM_LE:\n"
             "        enc = 'utf-16-le'\n"
             "    else:\n"
             "        odd = sum(1 for i in range(1, len(sample), 2) if sample[i] == 0)\n"
@@ -1409,23 +1449,31 @@ class ShellFileOperations(FileOperations):
             "    if enc is None:\n"
             "        print('HERMES_UTF16:NO'); sys.exit(0)\n"
             "    text = data.decode(enc, 'replace')\n"
-            "    if text[:1] == '\\ufeff':\n"
+            "    BOM_CHAR = chr(0xFEFF)\n"
+            "    CRLF = chr(13) + chr(10)\n"
+            "    LF = chr(10)\n"
+            "    if text[:1] == BOM_CHAR:\n"
             "        text = text[1:]\n"
-            "    text = text.replace('\\r\\n', '\\n')\n"
-            "    lines = text.split('\\n')\n"
+            "    text = text.replace(CRLF, LF)\n"
+            "    lines = text.split(LF)\n"
             "    total = len(lines)\n"
             "    sel = lines[offset - 1: offset - 1 + limit]\n"
             "    out = {'total_lines': total, 'encoding': enc,\n"
-            "           'content': '\\n'.join(sel)}\n"
+            "           'content': LF.join(sel)}\n"
             "    print('HERMES_UTF16:OK')\n"
             "    print(json.dumps(out, ensure_ascii=True))\n"
             "except Exception:\n"
             "    print('HERMES_UTF16:NO'); sys.exit(0)\n"
         )
 
-        result = self._exec(f"python3 -c {self._escape_shell_arg(snippet)}")
+        # The snippet is inline Python code, not a filesystem path: use the
+        # text-safe quoting so _bash_safe_path() does not rewrite the
+        # backslash escapes (\ufeff, \r\n) inside it on Windows.
+        result = self._exec(f"python3 -c {self._escape_shell_text_arg(snippet)}")
         if result.exit_code != 0 and "python3" in (result.stdout or ""):
-            result = self._exec(f"python -c {self._escape_shell_arg(snippet)}")
+            result = self._exec(
+                f"python -c {self._escape_shell_text_arg(snippet)}"
+            )
 
         stdout = _strip_terminal_fence_leaks(result.stdout or "")
         marker = stdout.find("HERMES_UTF16:OK")
@@ -1862,7 +1910,9 @@ class ShellFileOperations(FileOperations):
         # snippet via ``repr()`` so quoting is correct on every shell.
         snippet = (
             "import shutil, pathlib, sys\n"
-            f"p = pathlib.Path({path!r})\n"
+            # Forward slashes: Python pathlib accepts them on all platforms;
+            # backslash paths trigger \U unicode escapes under MSYS arg pass.
+            f"p = pathlib.Path({path.replace(chr(92), '/')!r})\n"
             f"recursive = {bool(recursive)!r}\n"
             "try:\n"
             "    if p.is_dir() and not p.is_symlink():\n"
@@ -1882,12 +1932,16 @@ class ShellFileOperations(FileOperations):
             "    print(str(exc), file=sys.stderr); sys.exit(1)\n"
         )
 
-        result = self._exec(f"python3 -c {self._escape_shell_arg(snippet)}")
+        result = self._exec(
+            f"python3 -c {self._escape_shell_text_arg(snippet)}"
+        )
 
         # Fall back to ``python`` (Windows / older systems where there's no
         # ``python3`` symlink but a ``python`` binary is on PATH).
         if result.exit_code != 0 and "python3" in (result.stdout or ""):
-            result = self._exec(f"python -c {self._escape_shell_arg(snippet)}")
+            result = self._exec(
+                f"python -c {self._escape_shell_text_arg(snippet)}"
+            )
 
         if result.exit_code != 0:
             return WriteResult(error=f"Failed to delete {path}: {(result.stdout or '').strip() or 'unknown error'}")
@@ -2910,10 +2964,10 @@ class ShellFileOperations(FileOperations):
             extra = len(per_file) - cap
             return shown + (f" (+{extra} more)" if extra > 0 else "")
 
-        glob_expr = f" --glob {self._escape_shell_arg(file_glob)}" if file_glob else ""
+        glob_expr = f" --glob {self._escape_shell_text_arg(file_glob)}" if file_glob else ""
         probe = self._exec(
             f"rg -i --count-matches{glob_expr} "
-            f"{self._escape_shell_arg(pattern)} {self._escape_native_tool_arg(path)} "
+            f"{self._escape_shell_text_arg(pattern)} {self._escape_native_tool_arg(path)} "
             f"2>/dev/null | head -50",
             timeout=30,
         )
@@ -2930,7 +2984,7 @@ class ShellFileOperations(FileOperations):
         # missing from results).
         hidden = self._exec(
             f"rg --hidden --no-ignore --count-matches{glob_expr} "
-            f"{self._escape_shell_arg(pattern)} {self._escape_native_tool_arg(path)} "
+            f"{self._escape_shell_text_arg(pattern)} {self._escape_native_tool_arg(path)} "
             f"2>/dev/null | head -50",
             timeout=30,
         )
@@ -2944,7 +2998,7 @@ class ShellFileOperations(FileOperations):
         if re.search(r"[.\[\](){}?*+^$\\|]", pattern):
             fixed = self._exec(
                 f"rg -F --count-matches{glob_expr} "
-                f"{self._escape_shell_arg(pattern)} {self._escape_native_tool_arg(path)} "
+                f"{self._escape_shell_text_arg(pattern)} {self._escape_native_tool_arg(path)} "
                 f"2>/dev/null | head -50",
                 timeout=30,
             )
@@ -2978,12 +3032,16 @@ class ShellFileOperations(FileOperations):
         if self._has_command('rg'):
             return self._search_files_rg(search_pattern, path, limit, offset)
 
-        # Fallback: find (slower, no .gitignore awareness)
-        if not self._has_command('find'):
-            return SearchResult(
-                error="File search requires 'rg' (ripgrep) or 'find'. "
-                      "Install ripgrep for best results: "
-                      "https://github.com/BurntSushi/ripgrep#installation"
+        # Windows ships FIND.EXE, which has a different language from POSIX
+        # find.  Keep the optimized shell pipeline for POSIX and use a bounded
+        # native-Python walker elsewhere so file search remains functional.
+        if os.name != "posix" or not self._has_command("find"):
+            return self._search_files_python(
+                search_pattern,
+                search_root,
+                has_hidden_path_ancestor=has_hidden_path_ancestor,
+                limit=limit,
+                offset=offset,
             )
 
         # Exclude hidden directories (matching ripgrep's default behavior).
@@ -3042,6 +3100,41 @@ class ShellFileOperations(FileOperations):
             total_count=len(files),
             truncated=bool(limit_reason),
             limit_reason=limit_reason,
+        )
+
+    def _search_files_python(
+        self,
+        pattern: str,
+        root: Path,
+        *,
+        has_hidden_path_ancestor: bool,
+        limit: int,
+        offset: int,
+    ) -> SearchResult:
+        """Cross-platform fallback matching POSIX find's visible-file policy."""
+
+        all_files: list[tuple[float, str]] = []
+        for dirpath, dirnames, filenames in os.walk(root, followlinks=False):
+            current = Path(dirpath)
+            if not has_hidden_path_ancestor:
+                dirnames[:] = [name for name in dirnames if not name.startswith(".")]
+            for filename in filenames:
+                if not fnmatch.fnmatch(filename, pattern):
+                    continue
+                file_path = current / filename
+                try:
+                    mtime = file_path.stat().st_mtime
+                except OSError:
+                    mtime = 0.0
+                all_files.append((mtime, str(file_path)))
+
+        all_files.sort(key=lambda item: item[0], reverse=True)
+        paths = [path for _mtime, path in all_files]
+        page = paths[offset : offset + limit]
+        return SearchResult(
+            files=page,
+            total_count=len(paths),
+            truncated=len(paths) > offset + limit,
         )
 
     def _search_files_rg(self, pattern: str, path: str, limit: int, offset: int) -> SearchResult:
@@ -3139,8 +3232,12 @@ class ShellFileOperations(FileOperations):
         # the pattern clearly wants to cross lines, enable -U/--multiline
         # up front and note it in the result.
         multiline = _pattern_has_regex_newline(pattern)
+        rg_pattern = _normalize_rg_newline_pattern(pattern) if multiline else pattern
         if multiline:
-            cmd_parts.append("--multiline")
+            # Windows text files commonly use CRLF.  ripgrep's multiline
+            # ``\\n`` otherwise only matches LF, so enable its CRLF-aware
+            # mode whenever the pattern crosses line boundaries.
+            cmd_parts.extend(["--multiline", "--crlf"])
 
         # Add context if requested
         if context > 0:
@@ -3148,7 +3245,7 @@ class ShellFileOperations(FileOperations):
         
         # Add file glob filter (must be quoted to prevent shell expansion)
         if file_glob:
-            cmd_parts.extend(["--glob", self._escape_shell_arg(file_glob)])
+            cmd_parts.extend(["--glob", self._escape_shell_text_arg(file_glob)])
         
         # Output mode handling
         if output_mode == "files_only":
@@ -3157,7 +3254,7 @@ class ShellFileOperations(FileOperations):
             cmd_parts.append("-c")  # Count per file
         
         # Add pattern and path
-        cmd_parts.append(self._escape_shell_arg(pattern))
+        cmd_parts.append(self._escape_shell_text_arg(rg_pattern))
         # rg is a native Windows binary when installed via winget/cargo/choco:
         # it needs the C:/... path form, not the MSYS /c/... form (which
         # nothing converts back — Hermes sets MSYS_NO_PATHCONV for its bash).
@@ -3287,7 +3384,7 @@ class ShellFileOperations(FileOperations):
         
         # Add file pattern filter (must be quoted to prevent shell expansion)
         if file_glob:
-            cmd_parts.extend(["--include", self._escape_shell_arg(file_glob)])
+            cmd_parts.extend(["--include", self._escape_shell_text_arg(file_glob)])
         
         # Output mode handling
         if output_mode == "files_only":
@@ -3300,7 +3397,7 @@ class ShellFileOperations(FileOperations):
         # ``.*`` to exclude the entire search. Anchor relative paths at the
         # shell's live cwd; quoting $PWD separately keeps user paths escaped
         # while working across local, container, and remote backends.
-        cmd_parts.append(self._escape_shell_arg(pattern))
+        cmd_parts.append(self._escape_shell_text_arg(pattern))
         is_absolute = path.startswith(("/", "\\\\")) or bool(
             re.match(r"^[A-Za-z]:[\\/]", path)
         )

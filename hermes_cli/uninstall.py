@@ -13,6 +13,7 @@ import sys
 from pathlib import Path
 
 from hermes_constants import get_hermes_home
+from hermes_cli.safe_delete import safe_rmtree
 
 from hermes_cli.colors import Colors, color
 
@@ -423,7 +424,7 @@ def remove_portable_tooling_windows(hermes_home: Path) -> list[Path]:
         target = hermes_home / sub
         if target.exists():
             try:
-                shutil.rmtree(target, ignore_errors=False)
+                safe_rmtree(target, hermes_home)
                 removed.append(target)
             except Exception as e:
                 log_warn(f"Could not remove {target}: {e}")
@@ -503,7 +504,7 @@ def _uninstall_profile(profile) -> None:
     # 3. Wipe the profile's HERMES_HOME directory.
     try:
         if profile_home.exists():
-            shutil.rmtree(profile_home)
+            safe_rmtree(profile_home, profile_home.parent)
             log_success(f"  Removed {profile_home}")
     except Exception as e:
         log_warn(f"  Could not remove {profile_home}: {e}")
@@ -856,11 +857,11 @@ def _perform_uninstall(
         if project_root.exists():
             # If the install is inside ~/.hermes/, just remove the hermes-agent subdir
             if hermes_home in project_root.parents or project_root.parent == hermes_home:
-                shutil.rmtree(project_root)
+                safe_rmtree(project_root, project_root)
                 log_success(f"Removed {project_root}")
             else:
                 # Installation is somewhere else entirely
-                shutil.rmtree(project_root)
+                safe_rmtree(project_root, project_root)
                 log_success(f"Removed {project_root}")
     except Exception as e:
         log_warn(f"Could not fully remove {project_root}: {e}")
@@ -895,7 +896,7 @@ def _perform_uninstall(
         log_info("Removing configuration and data...")
         try:
             if hermes_home.exists():
-                shutil.rmtree(hermes_home)
+                safe_rmtree(hermes_home, hermes_home)
                 log_success(f"Removed {hermes_home}")
         except Exception as e:
             log_warn(f"Could not fully remove {hermes_home}: {e}")

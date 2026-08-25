@@ -232,7 +232,7 @@ function statusLetter(file) {
 
 const isStaged = file => Boolean(file.index && file.index !== ' ' && file.index !== '?')
 
-async function reviewList(repoPath, scope, baseRef, gitBin) {
+async function reviewList(repoPath, scope, baseRef, gitBin, deps: any = {}) {
   let cwd
 
   try {
@@ -241,7 +241,8 @@ async function reviewList(repoPath, scope, baseRef, gitBin) {
     return { files: [], base: null }
   }
 
-  const git = gitFor(cwd, gitBin)
+  const git = (deps.gitFor || gitFor)(cwd, gitBin)
+  const fillCounts = deps.fillUntrackedCounts || fillUntrackedCounts
 
   try {
     if (scope === 'branch' || scope === 'lastTurn') {
@@ -284,7 +285,7 @@ async function reviewList(repoPath, scope, baseRef, gitBin) {
       }
 
       files.sort((a, b) => a.path.localeCompare(b.path))
-      await fillUntrackedCounts(cwd, files)
+      await fillCounts(cwd, files)
 
       return { files, base }
     }
@@ -317,7 +318,7 @@ async function reviewList(repoPath, scope, baseRef, gitBin) {
     })
 
     files.sort((a, b) => a.path.localeCompare(b.path))
-    await fillUntrackedCounts(cwd, files)
+    await fillCounts(cwd, files)
 
     return { files, base: null }
   } catch {

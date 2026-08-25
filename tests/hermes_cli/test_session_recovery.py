@@ -540,7 +540,12 @@ def test_cli_allow_partial_salvages_rows_across_a_corrupt_leaf(
         cwd=Path(__file__).resolve().parents[2],
         env=env,
         capture_output=True,
-        text=True,
+        # The CLI pins its own stdout/stderr to UTF-8 (errors="replace") in
+        # hermes_cli/__init__.py, so decode the pipes as UTF-8 explicitly —
+        # text=True alone would use the host locale (e.g. GBK on zh-CN
+        # Windows) and blow up on glyphs like "✓"/"…".
+        encoding="utf-8",
+        errors="replace",
         timeout=60,
         check=False,
     )

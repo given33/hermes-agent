@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import os
 import stat
 from pathlib import Path
 
@@ -34,6 +35,32 @@ def _parse(entry_text: str) -> dict:
             values[key] = val
     return values
 
+def _first_exec_token(exec_line: str) -> str:
+    """Return Exec's argv[0] with desktop-entry quoting removed.
+
+    The spec escapes backslashes and double quotes inside double
+    quotes, so on Windows the raw token arrives double-escaped;
+    unquote (and unescape) before asserting absoluteness. Scan for
+    the closing quote instead of splitting on whitespace so a quoted
+    interpreter path containing spaces stays intact.
+    """
+    s = exec_line.lstrip()
+    if not s.startswith('"'):
+        return s.split(" ")[0]
+    out = []
+    i = 1
+    while i < len(s):
+        c = s[i]
+        if c == "\\" and i + 1 < len(s) and s[i + 1] in '"\\':
+            out.append(s[i + 1])
+            i += 2
+        elif c == '"':
+            break
+        else:
+            out.append(c)
+            i += 1
+    return "".join(out)
+
 
 def test_install_writes_entry_with_absolute_exec_and_icon(tmp_path, xdg_home, monkeypatch):
     root = _make_project(tmp_path)
@@ -52,8 +79,9 @@ def test_install_writes_entry_with_absolute_exec_and_icon(tmp_path, xdg_home, mo
 
     # Exec must be the absolute path of the resolved binary. The launcher
     # runs with a minimal PATH, so a bare `hermes` would not resolve.
-    assert values["Exec"] == f"{hermes_bin} desktop"
-    assert Path(values["Exec"].split(" ")[0]).is_absolute()
+    expected_bin = str(Path(str(hermes_bin)).resolve())
+    assert values["Exec"] == f"{lde._quote_exec_arg(expected_bin)} desktop"
+    assert Path(_first_exec_token(values["Exec"])).is_absolute()
 
     # Icon must be an absolute path to the real icon in the checkout.
     icon_path = Path(values["Icon"])
@@ -73,7 +101,16 @@ def test_installed_entry_is_executable(tmp_path, xdg_home, monkeypatch):
 
     entry = lde.install_desktop_entry(root)
 
-    assert entry.stat().st_mode & stat.S_IXUSR
+    # Some launchers (and older Plasma) offer the entry only when it is
+    # executable; install_desktop_entry chmods 0o755 for exactly this.
+    # NTFS cannot represent the POSIX exec bit, so on Windows assert the
+    # observable equivalent: the chmod ran without error and left the
+    # entry writable rather than read-only.
+    if os.name == "nt":
+        assert entry.is_file()
+        assert entry.stat().st_mode & stat.S_IWUSR
+    else:
+        assert entry.stat().st_mode & stat.S_IXUSR
 
 
 def test_exec_falls_back_to_interpreter_module(tmp_path, xdg_home, monkeypatch):
@@ -85,7 +122,7 @@ def test_exec_falls_back_to_interpreter_module(tmp_path, xdg_home, monkeypatch):
     exec_line = _parse(entry.read_text(encoding="utf-8"))["Exec"]
 
     assert exec_line.endswith("-m hermes_cli.main desktop")
-    assert Path(exec_line.split(" ")[0]).is_absolute()
+    assert Path(_first_exec_token(exec_line)).is_absolute()
 
 
 def test_install_is_idempotent_and_skips_cache_refresh(tmp_path, xdg_home, monkeypatch):
@@ -202,4 +239,12 @@ def test_exec_arg_quoting_handles_spaces(tmp_path, xdg_home, monkeypatch):
     entry = lde.install_desktop_entry(root)
     exec_line = _parse(entry.read_text(encoding="utf-8"))["Exec"]
 
-    assert exec_line == f'"{spaced}" desktop'
+    expected_bin = str(Path(str(spaced)).resolve())
+
+    # A space is a reserved character, so the argument must arrive
+    # double-quoted in the serialized form...
+    assert exec_line.startswith('"')
+    assert exec_line.endswith('" desktop')
+    # ...and the quoting must round-trip back to the resolved path,
+    # including the spec's backslash escaping on Windows paths.
+    assert _first_exec_token(exec_line) == expected_bin

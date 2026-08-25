@@ -106,6 +106,15 @@ class TestGuessCategory:
         p.write_text("x")
         assert dg.guess_category(p) == "test"
 
+    def test_root_directory_is_never_auto_tracked(self, _isolate_env):
+        """A user project named test_* at HERMES_HOME root is not scratch."""
+        dg = _load_lib()
+        project = _isolate_env / "test_customer_project"
+        project.mkdir()
+        (project / "source.py").write_text("keep", encoding="utf-8")
+
+        assert dg.guess_category(project) is None
+
     def test_skips_protected_top_level(self, _isolate_env):
         dg = _load_lib()
         logs_dir = _isolate_env / "logs"
@@ -226,6 +235,178 @@ class TestStaleCronEntryMigration:
 
 
 class TestTrackForgetQuick:
+    def test_quick_skips_empty_sweep_for_link_like_hermes_home(
+        self, _isolate_env, monkeypatch, tmp_path
+    ):
+        dg = _load_lib()
+        external_home = tmp_path / "external-home"
+        (external_home / "scratch" / "empty").mkdir(parents=True)
+        linked_home = tmp_path / "linked-home"
+        try:
+            linked_home.symlink_to(external_home, target_is_directory=True)
+        except OSError as exc:
+            pytest.skip(f"directory links unavailable: {exc}")
+
+        monkeypatch.setenv("HERMES_HOME", str(linked_home))
+        result = dg.quick()
+
+        assert result["empty_dirs"] == 0
+        assert (external_home / "scratch" / "empty").exists()
+
+    def test_corrupt_backup_is_shape_filtered_fail_closed(self, _isolate_env):
+        dg = _load_lib()
+        tracked_file = _isolate_env / "disk-cleanup" / "tracked.json"
+        tracked_file.parent.mkdir(parents=True, exist_ok=True)
+        tracked_file.write_text("{not-json", encoding="utf-8")
+        tracked_file.with_suffix(".json.bak").write_text(
+            json.dumps({"path": str(_isolate_env), "category": "test"}),
+            encoding="utf-8",
+        )
+
+        assert dg.load_tracked() == []
+        assert dg.quick()["deleted"] == 0
+        assert dg.status()["total_tracked"] == 0
+
+    def test_deep_malformed_size_row_still_saves_after_delete(self, _isolate_env):
+        dg = _load_lib()
+        profile = _isolate_env / "scratch" / "old-profile"
+        profile.mkdir(parents=True)
+        (profile / "state.json").write_text("stale", encoding="utf-8")
+
+        from datetime import datetime, timedelta, timezone
+
+        tracked_file = _isolate_env / "disk-cleanup" / "tracked.json"
+        tracked_file.parent.mkdir(parents=True, exist_ok=True)
+        tracked_file.write_text(json.dumps([{
+            "path": str(profile),
+            "category": "chrome-profile",
+            "timestamp": (
+                datetime.now(timezone.utc) - timedelta(days=60)
+            ).isoformat(),
+            "size": "not-a-number",
+        }]), encoding="utf-8")
+
+        result = dg.deep(confirm=lambda _item: True)
+        assert result["deep_deleted"] == 1
+        assert not profile.exists()
+        assert dg.load_tracked() == []
+
+    def test_track_rejects_home_root_and_protected_control_plane_dirs(
+        self, _isolate_env
+    ):
+        dg = _load_lib()
+        profiles = _isolate_env / "profiles"
+        profiles.mkdir()
+        (profiles / "replacement.yaml").write_text("keep", encoding="utf-8")
+
+        assert dg.track(str(_isolate_env), "chrome-profile", silent=True) is False
+        assert dg.track(str(profiles), "research", silent=True) is False
+        assert (_isolate_env / "profiles" / "replacement.yaml").exists()
+
+    def test_deep_ignores_forged_root_and_protected_directory_entries(
+        self, _isolate_env
+    ):
+        """Untrusted tracked.json rows must not turn deep into home rmtree."""
+        dg = _load_lib()
+        profiles = _isolate_env / "profiles"
+        profiles.mkdir()
+        keep = profiles / "worker" / "config.yaml"
+        keep.parent.mkdir()
+        keep.write_text("replacement", encoding="utf-8")
+
+        from datetime import datetime, timedelta, timezone
+
+        old = (datetime.now(timezone.utc) - timedelta(days=60)).isoformat()
+        tracked_file = _isolate_env / "disk-cleanup" / "tracked.json"
+        tracked_file.parent.mkdir(parents=True, exist_ok=True)
+        tracked_file.write_text(json.dumps([
+            {
+                "path": str(_isolate_env),
+                "category": "chrome-profile",
+                "timestamp": old,
+                "size": 0,
+            },
+            {
+                "path": str(profiles),
+                "category": "research",
+                "timestamp": old,
+                "size": 0,
+            },
+        ]), encoding="utf-8")
+
+        auto, prompt = dg.dry_run()
+        assert auto == []
+        assert prompt == []
+
+        result = dg.deep(confirm=lambda _item: pytest.fail("unsafe target prompted"))
+        assert result["deep_deleted"] == 0
+        assert keep.exists()
+
+    def test_deep_ignores_forged_unknown_durable_directory_entry(
+        self, _isolate_env
+    ):
+        dg = _load_lib()
+        durable = _isolate_env / "new-durable-store"
+        keep = durable / "replacement" / "config.yaml"
+        keep.parent.mkdir(parents=True)
+        keep.write_text("keep", encoding="utf-8")
+
+        from datetime import datetime, timedelta, timezone
+
+        tracked_file = _isolate_env / "disk-cleanup" / "tracked.json"
+        tracked_file.parent.mkdir(parents=True, exist_ok=True)
+        tracked_file.write_text(json.dumps([{
+            "path": str(durable),
+            "category": "chrome-profile",
+            "timestamp": (
+                datetime.now(timezone.utc) - timedelta(days=60)
+            ).isoformat(),
+            "size": 0,
+        }]), encoding="utf-8")
+
+        result = dg.deep(confirm=lambda _item: pytest.fail("unsafe target prompted"))
+        assert result["deep_deleted"] == 0
+        assert keep.exists()
+
+    def test_deep_uses_bounded_delete_for_allowed_profile_directory(
+        self, _isolate_env
+    ):
+        dg = _load_lib()
+        profile = _isolate_env / "scratch" / "browser-profile"
+        profile.mkdir(parents=True)
+        (profile / "state.json").write_text("stale", encoding="utf-8")
+
+        from datetime import datetime, timedelta, timezone
+
+        tracked_file = _isolate_env / "disk-cleanup" / "tracked.json"
+        tracked_file.parent.mkdir(parents=True, exist_ok=True)
+        tracked_file.write_text(json.dumps([{
+            "path": str(profile),
+            "category": "chrome-profile",
+            "timestamp": (
+                datetime.now(timezone.utc) - timedelta(days=60)
+            ).isoformat(),
+            "size": 0,
+        }]), encoding="utf-8")
+
+        result = dg.deep(confirm=lambda _item: True)
+        assert result["deep_deleted"] == 1
+        assert not profile.exists()
+
+    def test_malformed_tracking_rows_are_ignored(self, _isolate_env):
+        dg = _load_lib()
+        tracked_file = _isolate_env / "disk-cleanup" / "tracked.json"
+        tracked_file.parent.mkdir(parents=True, exist_ok=True)
+        tracked_file.write_text(json.dumps([
+            {"path": str(_isolate_env / "test_ok.py"), "category": "test",
+             "timestamp": "bad", "size": "not-a-number"},
+            {"path": 42, "category": "test"},
+            "not-an-object",
+        ]))
+        # A malformed timestamp is skipped and the cleanup hook remains alive.
+        summary = dg.quick()
+        assert summary["deleted"] == 0
+
     def test_track_then_quick_deletes_test(self, _isolate_env):
         dg = _load_lib()
         p = _isolate_env / "test_a.py"
@@ -287,12 +468,17 @@ class TestPostToolCallHook:
     def test_write_file_test_pattern_tracked(self, _isolate_env):
         pi = _load_plugin_init()
         p = _isolate_env / "test_created.py"
+        pi._on_pre_tool_call(
+            tool_name="write_file",
+            args={"path": str(p)},
+            task_id="t1", session_id="s1", tool_call_id="call-1",
+        )
         p.write_text("x")
         pi._on_post_tool_call(
             tool_name="write_file",
             args={"path": str(p), "content": "x"},
             result="OK",
-            task_id="t1", session_id="s1",
+            task_id="t1", session_id="s1", tool_call_id="call-1",
         )
         tracked_file = _isolate_env / "disk-cleanup" / "tracked.json"
         data = json.loads(tracked_file.read_text())
@@ -303,16 +489,41 @@ class TestPostToolCallHook:
     def test_terminal_command_picks_up_paths(self, _isolate_env):
         pi = _load_plugin_init()
         p = _isolate_env / "tmp_created.log"
+        pi._on_pre_tool_call(
+            tool_name="terminal",
+            args={"command": f"touch {p}"},
+            task_id="t3", session_id="s3", tool_call_id="call-3",
+        )
         p.write_text("x")
         pi._on_post_tool_call(
             tool_name="terminal",
             args={"command": f"touch {p}"},
             result=f"created {p}\n",
-            task_id="t3", session_id="s3",
+            task_id="t3", session_id="s3", tool_call_id="call-3",
         )
         tracked_file = _isolate_env / "disk-cleanup" / "tracked.json"
         data = json.loads(tracked_file.read_text())
         assert any(Path(i["path"]) == p.resolve() for i in data)
+
+    def test_pre_existing_home_test_file_is_not_auto_tracked(self, _isolate_env):
+        pi = _load_plugin_init()
+        p = _isolate_env / "test_important.py"
+        p.write_text("keep me")
+        pi._on_pre_tool_call(
+            tool_name="write_file",
+            args={"path": str(p)},
+            task_id="t5", session_id="s5", tool_call_id="call-5",
+        )
+        p.write_text("overwrite")
+        pi._on_post_tool_call(
+            tool_name="write_file",
+            args={"path": str(p), "content": "overwrite"},
+            result="OK",
+            task_id="t5", session_id="s5", tool_call_id="call-5",
+        )
+
+        tracked_file = _isolate_env / "disk-cleanup" / "tracked.json"
+        assert not tracked_file.exists() or tracked_file.read_text().strip() == "[]"
 
     def test_ignores_unrelated_tool(self, _isolate_env):
         pi = _load_plugin_init()
@@ -331,12 +542,17 @@ class TestOnSessionEndHook:
     def test_runs_quick_when_test_files_tracked(self, _isolate_env):
         pi = _load_plugin_init()
         p = _isolate_env / "test_cleanup.py"
+        pi._on_pre_tool_call(
+            tool_name="write_file",
+            args={"path": str(p)},
+            task_id="", session_id="s1", tool_call_id="session-call",
+        )
         p.write_text("x")
         pi._on_post_tool_call(
             tool_name="write_file",
             args={"path": str(p), "content": "x"},
             result="OK",
-            task_id="", session_id="s1",
+            task_id="", session_id="s1", tool_call_id="session-call",
         )
         assert p.exists()
         pi._on_session_end(session_id="s1", completed=True, interrupted=False)

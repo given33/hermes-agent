@@ -49,17 +49,27 @@ _RESPAWN_WINDOW_SECS = 300.0
 _SHUTDOWN_TIMEOUT_SECS = 10.0
 
 
+_APPEND_RECORD_LOCK = threading.Lock()
+
+
 def append_log_record(path: str | Path, record: str) -> None:
     """Append one log record using O_APPEND and exactly one os.write call."""
     p = Path(path)
     p.parent.mkdir(parents=True, exist_ok=True)
     text = record if record.endswith("\n") else f"{record}\n"
     data = text.encode("utf-8", errors="replace")
-    fd = os.open(str(p), os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o600)
-    try:
-        os.write(fd, data)
-    finally:
-        os.close(fd)
+    # Serialize open->write->close per process. POSIX O_APPEND alone already
+    # gives kernel-side atomic appends, but on Windows the CRT implements
+    # _O_APPEND as seek-to-end then write with no interlock across separate
+    # handles, so concurrent recorders clobber each other's bytes. The lock
+    # keeps every record intact on both platforms while preserving the
+    # exactly-one-os.write contract.
+    with _APPEND_RECORD_LOCK:
+        fd = os.open(str(p), os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o600)
+        try:
+            os.write(fd, data)
+        finally:
+            os.close(fd)
 
 
 def _repo_root() -> Path:

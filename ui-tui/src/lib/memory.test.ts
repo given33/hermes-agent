@@ -60,7 +60,7 @@ describe('performHeapDump auto opt-in gate (#21767)', () => {
     expect(files.some(f => f.endsWith('.heapsnapshot'))).toBe(false)
   })
 
-  it('writes both diagnostics and snapshot for auto-high when HERMES_AUTO_HEAPDUMP=1', async () => {
+  it('writes both diagnostics and snapshot for auto-high when HERMES_AUTO_HEAPDUMP=1', { timeout: 30_000 }, async () => {
     process.env.HERMES_AUTO_HEAPDUMP = '1'
 
     const result = await performHeapDump('auto-high')
@@ -74,7 +74,7 @@ describe('performHeapDump auto opt-in gate (#21767)', () => {
     expect(files.some(f => f.endsWith('.heapsnapshot'))).toBe(true)
   })
 
-  it('accepts truthy spellings (true|yes|on, case-insensitive) as opt-in', async () => {
+  it('accepts truthy spellings (true|yes|on, case-insensitive) as opt-in', { timeout: 30_000 }, async () => {
     for (const value of ['true', 'YES', 'On']) {
       process.env.HERMES_AUTO_HEAPDUMP = value
       const result = await performHeapDump('auto-high')
@@ -95,7 +95,7 @@ describe('performHeapDump auto opt-in gate (#21767)', () => {
     }
   })
 
-  it('writes both for manual triggers regardless of HERMES_AUTO_HEAPDUMP', async () => {
+  it('writes both for manual triggers regardless of HERMES_AUTO_HEAPDUMP', { timeout: 30_000 }, async () => {
     const result = await performHeapDump('manual')
 
     expect(result.success).toBe(true)

@@ -190,7 +190,6 @@ const BUILTIN_NAV_REST: NavItem[] = [
     label: "Sessions",
     icon: MessageSquare,
   },
-  { path: "/files", label: "Files", icon: FolderOpen },
   {
     path: "/analytics",
     labelKey: "analytics",
@@ -767,7 +766,7 @@ export default function App() {
                 className={cn(
                   "w-full min-w-0",
                   !isChatRoute &&
-                    "pb-[calc(2rem+env(safe-area-inset-bottom,0px))] lg:pb-8",
+                    "pt-[env(safe-area-inset-top,0px)] pb-[calc(2rem+env(safe-area-inset-bottom,0px))] lg:pb-8",
                   (isDocsRoute || isChatRoute) &&
                     "min-h-0 flex flex-1 flex-col",
                 )}

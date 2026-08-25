@@ -13,6 +13,7 @@ import { cn, themedBody } from "@/lib/utils";
 import { fuzzyRank } from "@/lib/fuzzy";
 import { queryMatchesProviderOnly } from "@/lib/model-picker-filter";
 import { modelSearchText } from "@/lib/model-search-text";
+import { useI18n } from "@/i18n";
 
 /**
  * Two-stage model picker modal.
@@ -91,6 +92,20 @@ interface Props {
 }
 
 export function ModelPickerDialog(props: Props) {
+  const { locale } = useI18n();
+  const copy = locale.toLowerCase().startsWith("zh")
+    ? {
+        title: "切换模型",
+        filter: "筛选提供方和模型…",
+        refresh: "刷新模型",
+        switchModel: "切换",
+      }
+    : {
+        title: "Switch Model",
+        filter: "Filter providers and models…",
+        refresh: "Refresh Models",
+        switchModel: "Switch",
+      };
   const {
     gw,
     sessionId,
@@ -98,7 +113,7 @@ export function ModelPickerDialog(props: Props) {
     loader,
     onApply,
     onClose,
-    title = "Switch Model",
+    title = copy.title,
     alwaysGlobal = false,
   } = props;
   const standalone = !!loader && !!onApply;
@@ -357,7 +372,7 @@ export function ModelPickerDialog(props: Props) {
       aria-modal="true"
       aria-labelledby="model-picker-title"
     >
-      <div className={cn(themedBody, "relative w-full max-w-3xl max-h-[80vh] border border-border bg-card shadow-2xl flex flex-col")}>
+      <div className={cn(themedBody, "relative w-full max-w-3xl max-h-[calc(var(--hermes-viewport-height,100dvh)-1rem)] border border-border bg-card shadow-2xl flex flex-col")}>
         <Button
           ghost
           size="icon"
@@ -386,7 +401,7 @@ export function ModelPickerDialog(props: Props) {
             <Search className="absolute left-2 top-1/2 -translate-y-1/2 h-3.5 w-3.5 text-muted-foreground" />
             <Input
               autoFocus
-              placeholder="Filter providers and models…"
+              placeholder={copy.filter}
               value={query}
               onChange={(e) => setQuery(e.target.value)}
               className="pl-7 h-8 text-sm"
@@ -394,7 +409,7 @@ export function ModelPickerDialog(props: Props) {
           </div>
         </div>
 
-        <div className="flex-1 min-h-0 grid grid-cols-[200px_1fr] overflow-hidden">
+        <div className="flex-1 min-h-0 grid grid-cols-1 grid-rows-[minmax(110px,0.7fr)_minmax(160px,1.3fr)] sm:grid-rows-1 sm:grid-cols-[200px_1fr] overflow-hidden">
           <ProviderColumn
             loading={loading}
             error={error}
@@ -459,13 +474,13 @@ export function ModelPickerDialog(props: Props) {
               disabled={applying || loading || refreshing}
             >
               {refreshing ? <Spinner /> : <RefreshCw className="h-3.5 w-3.5" />}
-              Refresh Models
+              {copy.refresh}
             </Button>
             <Button outlined onClick={onClose} disabled={applying}>
               Cancel
             </Button>
             <Button onClick={confirm} disabled={!canConfirm}>
-              {applying ? <Spinner /> : "Switch"}
+              {applying ? <Spinner /> : copy.switchModel}
             </Button>
           </div>
         </footer>

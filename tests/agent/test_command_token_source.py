@@ -14,6 +14,8 @@ behaviours that make the feature work:
 
 from __future__ import annotations
 
+import json
+import sys
 import time
 from types import SimpleNamespace
 
@@ -25,6 +27,12 @@ from agent.command_token_source import (
     _mint,
     build_command_token_provider,
 )
+
+
+def _python_key_cmd(script: str) -> str:
+    """Run test helpers through Python so parallel Windows runs are deterministic."""
+    escaped = script.replace('"', '\\"')
+    return f'"{sys.executable}" -c "{escaped}"'
 
 
 class TestMinting:
@@ -94,14 +102,21 @@ class TestCaching:
     def test_token_is_cached_between_calls(self):
         """Without caching the command would run on every request."""
         # A command whose output changes each run: equal results prove caching.
-        source = CommandTokenSource("date +%s%N", "dbx")
+        source = CommandTokenSource(
+            _python_key_cmd("import random; print(random.randrange(1, 10**18))"),
+            "dbx",
+        )
         assert source() == source()
 
     def test_expired_token_is_reminted(self):
         # date +%s%N changes every run; $RANDOM would be bash-only (empty
         # under dash, which is what /bin/sh is on Debian-family CI).
         source = CommandTokenSource(
-            """printf '{"access_token":"tok-%s","expires_in":3600}' "$(date +%s%N)" """,
+            _python_key_cmd(
+                "import json,random; print(json.dumps({"
+                "'access_token':'tok-%s' % random.randrange(1, 10**18),"
+                "'expires_in':3600}))".replace("'", '"')
+            ),
             "dbx",
         )
         first = source()
@@ -119,7 +134,10 @@ class TestCaching:
         """
         from agent.command_token_source import _NO_TTL_REFRESH_SECONDS
 
-        source = CommandTokenSource("date +%s%N", "dbx")
+        source = CommandTokenSource(
+            _python_key_cmd("import random; print(random.randrange(1, 10**18))"),
+            "dbx",
+        )
         first = source()
         assert 0 < source._expires_at - time.monotonic() <= _NO_TTL_REFRESH_SECONDS
         assert source() == first  # cached inside the window
@@ -282,9 +300,13 @@ class TestAbsoluteExpiry:
     def test_the_token_actually_gets_re_minted(self, tmp_path):
         """The regression that mattered: a deadline must expire the cache."""
         counter = tmp_path / "calls"
+        # key_cmd executes through a POSIX-compatible shell; use shell spelling
+        # for the probe path even when pytest supplies a WindowsPath.
         cmd = (
-            f"printf x >> {counter}; "
-            f"printf '%s' '{{\"access_token\":\"t\",\"expiry\":\"{self._iso(1)}\"}}'"
+            _python_key_cmd(
+                f"import json; open('{counter.as_posix()}', 'a').write('x'); "
+                f"print(json.dumps({{'access_token':'t','expiry':'{self._iso(1)}'}}))"
+            )
         )
         src = CommandTokenSource(cmd, "p")
         src()

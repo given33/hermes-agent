@@ -6,6 +6,8 @@ init_session() failure handling, and the CWD marker contract.
 
 from unittest.mock import MagicMock
 
+import pytest
+
 from tools.environments.base import BaseEnvironment, _BoundedOutputCollector
 
 
@@ -173,6 +175,10 @@ class TestAtomicSnapshotWrite:
         assert boot.index("umask 077") < boot.index("export -p")
 
 
+@pytest.mark.skipif(
+    __import__("sys").platform == "win32",
+    reason="bash -l session management is POSIX-only",
+)
 class TestAtomicSnapshotConcurrencyBehavioral:
     """Behavioral regression for #38249 — actually EXECUTES the generated
     snapshot write/read concurrently and asserts the file never tears.
@@ -251,6 +257,10 @@ class TestAtomicSnapshotConcurrencyBehavioral:
         assert "export GOOD=1" in out.stdout, "good snapshot was destroyed by a failed export"
 
 
+@pytest.mark.skipif(
+    __import__("sys").platform == "win32",
+    reason="bash -l session snapshot/cwd files are POSIX-only (0600 modes)",
+)
 class TestSnapshotFileModes:
     """Snapshot metadata files are private without changing user command umask."""
 

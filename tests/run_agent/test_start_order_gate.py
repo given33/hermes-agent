@@ -140,7 +140,7 @@ def test_wedged_dispatch_does_not_starve_later_tools(monkeypatch):
 
     agent = _make_agent(monkeypatch)
     monkeypatch.setattr(te, "_START_ORDER_GATE_TIMEOUT_S", 0.3)
-    monkeypatch.setattr(te, "_resolve_concurrent_tool_timeout", lambda: 6.0)
+    monkeypatch.setattr(te, "_resolve_concurrent_tool_timeout", lambda *a, **kw: 6.0)
 
     dispatched: list = []
     stop = threading.Event()
@@ -179,7 +179,7 @@ def test_gate_timeout_stays_under_the_batch_deadline(monkeypatch):
     import agent.tool_executor as te
 
     agent = _make_agent(monkeypatch)
-    monkeypatch.setattr(te, "_resolve_concurrent_tool_timeout", lambda: 2.0)
+    monkeypatch.setattr(te, "_resolve_concurrent_tool_timeout", lambda *a, **kw: 2.0)
 
     dispatched: list = []
     stop = threading.Event()
@@ -212,7 +212,7 @@ def test_abandoned_batch_does_not_dispatch_late(monkeypatch):
     agent = _make_agent(monkeypatch)
     # Long gate: only the abandonment signal can release the parked workers.
     monkeypatch.setattr(te, "_START_ORDER_GATE_TIMEOUT_S", 30.0)
-    monkeypatch.setattr(te, "_resolve_concurrent_tool_timeout", lambda: 60.0)
+    monkeypatch.setattr(te, "_resolve_concurrent_tool_timeout", lambda *a, **kw: 60.0)
 
     dispatched: list = []
     stop = threading.Event()
@@ -249,3 +249,36 @@ def test_abandoned_batch_does_not_dispatch_late(monkeypatch):
     assert agent._current_tool is None, (
         f"_current_tool left pointing at a dead tool: {agent._current_tool!r}"
     )
+
+
+def test_capacity_rejection_does_not_starve_later_workers(monkeypatch):
+    """A worker rejected by the execution lease still consumes its order.
+
+    Capacity failures have no dispatch side effect, so they may be skipped
+    immediately.  Before the skip marker, later workers waited for the gate
+    timeout even though no earlier worker could ever advance it.
+    """
+    import agent.tool_executor as te
+
+    agent = _make_agent(monkeypatch)
+    monkeypatch.setattr(
+        te,
+        "_PROCESS_TOOL_EXECUTION_SLOTS",
+        threading.BoundedSemaphore(0),
+    )
+    monkeypatch.setattr(te, "_resolve_concurrent_tool_timeout", lambda *a, **kw: 6.0)
+    monkeypatch.setattr(te, "_START_ORDER_GATE_TIMEOUT_S", 2.0)
+
+    msg = _FakeAssistantMsg([
+        _FakeToolCall("tool_a", "tc_a"),
+        _FakeToolCall("tool_b", "tc_b"),
+        _FakeToolCall("tool_c", "tc_c"),
+    ])
+    messages: list = []
+    started = time.monotonic()
+    agent._execute_tool_calls_concurrent(msg, messages, "task")
+
+    assert time.monotonic() - started < 1.0
+    assert [m["tool_call_id"] for m in messages] == ["tc_a", "tc_b", "tc_c"]
+    assert all(m["role"] == "tool" for m in messages)
+    assert all("timed out" not in m["content"] for m in messages)

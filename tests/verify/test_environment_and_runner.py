@@ -5,6 +5,8 @@ import json
 import threading
 import time
 
+import pytest
+
 from agent.verify.environment import (
     load_manifest,
     load_or_detect,
@@ -71,6 +73,7 @@ class TestManifest:
         assert recipe.kind == "go"
 
 
+@pytest.mark.skipif(__import__('sys').platform == 'win32', reason='bash verify runner is POSIX-only')
 class TestRunner:
     def test_all_phases_pass(self, tmp_path):
         recipe = Recipe(name="x", bootstrap=["true"], build=["true"], test=["true"])
@@ -127,6 +130,7 @@ def _free_port() -> int:
         return s.getsockname()[1]
 
 
+@pytest.mark.skipif(__import__('sys').platform == 'win32', reason='bash readiness probe is POSIX-only')
 class TestReadiness:
     def test_readiness_against_live_server(self, tmp_path):
         port = _free_port()

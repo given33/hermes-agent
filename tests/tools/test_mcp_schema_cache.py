@@ -4,6 +4,9 @@ The module landed in #56832's extraction without its tests; these cover the
 fingerprint keying, read/write round-trip, and invalidation behavior.
 """
 
+import os
+import stat
+
 import tools.mcp_schema_cache as msc
 
 
@@ -87,7 +90,19 @@ class TestCacheFileLocation:
         assert path == tmp_path / "cache" / "mcp_schema_cache.json"
         msc.write_cache_entry("srv", "fp", tools=[], utility_tools=[])
         assert path.exists()
-        assert (path.stat().st_mode & 0o777) == 0o600
+        if os.name == "nt":
+            # NTFS has no POSIX permission bits: os.chmod on Windows can
+            # only flip the read-only attribute, and st_mode reports 0666
+            # for any writable file regardless of the requested mode. The
+            # 0o600 contract is enforced through the default user ACL, so
+            # the strongest portable assertion here is "exists and is
+            # writable" (atomic_json_write already no-ops chmod errors).
+            mode = path.stat()
+            assert not (
+                mode.st_file_attributes & stat.FILE_ATTRIBUTE_READONLY
+            )
+        else:
+            assert (path.stat().st_mode & 0o777) == 0o600
 
 
 class TestWriteSkip:

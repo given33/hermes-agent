@@ -376,7 +376,7 @@ def _build_skill_message(
             if subdir_path.exists():
                 for f in sorted(subdir_path.rglob("*")):
                     if f.is_file() and not f.is_symlink():
-                        rel = str(f.relative_to(skill_dir))
+                        rel = f.relative_to(skill_dir).as_posix()
                         supporting.append(rel)
 
     if supporting and skill_dir:

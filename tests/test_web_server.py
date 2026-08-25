@@ -207,6 +207,7 @@ def test_start_server_runs_on_uvicorns_loop_factory(monkeypatch):
     )
 
 
+@pytest.mark.skipif(__import__('sys').platform == 'win32', reason='POSIX-only asyncio run path')
 def test_start_server_keeps_bare_asyncio_run_on_posix(monkeypatch):
     """POSIX continues to serve via the plain ``asyncio.run(_serve())`` path,
     never the Windows loop-factory branch.

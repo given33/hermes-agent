@@ -63,6 +63,18 @@ export function getManagementProfile(): string {
   return _managementProfile;
 }
 
+function safeLoginRedirect(value: string): string | null {
+  try {
+    const parsed = new URL(value, window.location.origin);
+    if (parsed.origin !== window.location.origin) return null;
+    if (parsed.username || parsed.password) return null;
+    if (parsed.pathname !== `${BASE}/login`) return null;
+    return `${parsed.pathname}${parsed.search}`;
+  } catch {
+    return null;
+  }
+}
+
 // Endpoint families that honor ?profile= on the backend (web_server.py
 // _profile_scope or explicit per-profile DB opens). Anything else — ops,
 // cron (which has its own per-job profile params), profiles themselves — is
@@ -136,6 +148,7 @@ export async function fetchJSON<T>(
       (body.error === "unauthenticated" || body.error === "session_expired") &&
       body.login_url
     ) {
+      const loginUrl = safeLoginRedirect(body.login_url);
       // Preserve where the user was so /auth/callback can land them back
       // after re-auth. The gate's login_url already carries a ``next=``
       // built from the request path, but the SPA may be deep inside a
@@ -150,7 +163,15 @@ export async function fetchJSON<T>(
       } catch {
         /* SSR / privacy mode — ignore */
       }
-      window.location.assign(body.login_url);
+      if (loginUrl) {
+        window.location.assign(loginUrl);
+      } else if (
+        !window.__HERMES_AUTH_REQUIRED__
+        && !options?.allowUnauthorized
+        && attemptDashboardTokenReloadOnce()
+      ) {
+        return new Promise<T>(() => {});
+      }
       // Never resolve — the page is about to unload.
       return new Promise<T>(() => {});
     }
@@ -366,7 +387,8 @@ export const api = {
       // /auth/logout returns 302 → /login. Follow that with a full-page
       // navigation rather than letting fetch() opaquely consume the
       // redirect — the SPA needs to leave the protected area.
-      window.location.assign("/login");
+      // Keep reverse-proxy deployments such as /hermes/ on the same app root.
+      window.location.assign(`${BASE}/login`);
       return r;
     }),
   getSessions: (

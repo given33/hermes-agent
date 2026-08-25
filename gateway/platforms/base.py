@@ -21,7 +21,8 @@ import time
 import uuid
 import weakref
 from abc import ABC, abstractmethod
-from urllib.parse import urlsplit
+from pathlib import PurePosixPath
+from urllib.parse import unquote, urlsplit
 
 from utils import normalize_proxy_url
 
@@ -188,6 +189,90 @@ def should_send_media_as_audio(platform, ext: str, is_voice: bool = False) -> bo
             return is_voice
         return normalized_ext in _TELEGRAM_AUDIO_ATTACHMENT_EXTS
     return True
+
+
+def _expand_gateway_user_path(raw_path: str) -> str:
+    """Expand ``~`` using an explicit HOME override on every platform.
+
+    ``expand_user_path`` preserves the slash style supplied after ``~`` so it
+    can also represent POSIX paths emitted by container agents.  A local
+    gateway delivery path, however, must be one native filesystem spelling:
+    on Windows a POSIX ``~/`` token otherwise produces a mixed
+    ``C:\\.../file`` path.  Normalize only home-relative paths; absolute
+    paths stay untouched because leading ``/`` is also the container-path
+    namespace used by the media translator below.
+
+    When the expanded home prefix is a POSIX-shaped path (no drive letter,
+    leading ``/``), keep the result in POSIX form rather than letting
+    ``os.path.normpath`` rewrite it to backslashes on Windows. This matches
+    the user-written absolute POSIX form (``MEDIA:/home/x/foo.png``) so the
+    two collapse to the same dedupe key.
+    """
+    raw = str(raw_path or "")
+    expanded = expand_user_path(raw)
+    if raw == "~" or raw.startswith(("~/", "~\\")):
+        # ``os.path.normpath`` is correct only when the expanded path is a
+        # native Windows path. If the home is a POSIX-shaped absolute path
+        # (no drive letter, leading ``/``), leave the forward slashes alone
+        # so a user-written POSIX absolute form and a tilde form dedupe
+        # together.
+        if re.match(r"^[A-Za-z]:[/\\]", expanded):
+            return os.path.normpath(expanded)
+        return expanded
+    return expanded
+
+
+def _local_path_from_file_uri(value: str) -> str:
+    """Convert a local ``file://`` URI to a native filesystem path.
+
+    ``Path.as_uri()`` emits ``file:///C:/...`` on Windows. Stripping only the
+    scheme leaves ``/C:/...``, which is not a native path and cannot be opened.
+    Remote file URI authorities remain untouched so the normal safe-path gate
+    rejects them instead of turning a network location into a local path.
+    """
+    raw = str(value or "")
+    if not raw.lower().startswith("file://"):
+        return raw
+    try:
+        parsed = urlsplit(raw)
+    except ValueError:
+        return raw
+    if parsed.scheme.lower() != "file":
+        return raw
+    authority = parsed.netloc or ""
+    if authority and authority.lower() not in {"localhost"}:
+        # The only authority form we accept as local is a Windows drive
+        # emitted by older callers as ``file://C:/...`` or
+        # ``file://C:\\...``.  urlsplit places the complete backslash form
+        # in ``netloc``, so accept a drive prefix with an attached path too.
+        if not (len(authority) >= 2 and authority[1] == ":" and authority[0].isalpha()):
+            return raw
+    path_text = unquote(parsed.path or "")
+    if len(authority) >= 2 and authority[1] == ":" and authority[0].isalpha():
+        path_text = authority + path_text
+    if len(path_text) >= 3 and path_text[0] == "/" and path_text[2] == ":" and path_text[1].isalpha():
+        path_text = path_text[1:]
+    if len(path_text) >= 2 and path_text[1] == ":" and path_text[0].isalpha():
+        drive = path_text[0].upper()
+        rest = path_text[2:].lstrip("/\\").replace("\\", "/")
+        if os.name == "nt":
+            return str(Path(f"{drive}:/") / rest)
+        return str(Path("/mnt") / drive.lower() / rest)
+    return path_text
+
+
+def local_path_to_file_uri(path: str | os.PathLike[str]) -> str:
+    """Encode a local path as a standards-compliant ``file:`` URI.
+
+    Batch senders pass these values through adapters that accept both remote
+    URLs and local files.  ``file://{path}`` is ambiguous on Windows (and
+    leaves spaces/backslashes unescaped); ``Path.as_uri`` preserves the native
+    drive form as ``file:///C:/...`` and percent-encodes path characters.
+    """
+    raw = os.fspath(path)
+    if str(raw).lower().startswith("file://"):
+        return str(raw)
+    return Path(raw).absolute().as_uri()
 
 
 def build_auto_tts_output_path(platform) -> str:
@@ -578,7 +663,12 @@ sys.path.insert(0, str(_Path(__file__).resolve().parents[2]))
 
 from gateway.config import Platform, PlatformConfig
 from gateway.session import SessionSource, build_session_key
-from hermes_constants import get_default_hermes_root, get_hermes_dir, get_hermes_home
+from hermes_constants import (
+    expand_user_path,
+    get_default_hermes_root,
+    get_hermes_dir,
+    get_hermes_home,
+)
 
 if TYPE_CHECKING:
     from agent.display import ToolPreview
@@ -1362,7 +1452,9 @@ def _media_delivery_strict_mode() -> bool:
 def _media_delivery_denied_paths() -> List[Path]:
     """Return absolute denylist paths under which delivery is never allowed."""
     denied = [Path(p) for p in _MEDIA_DELIVERY_DENIED_PREFIXES]
-    home = Path(os.path.expanduser("~"))
+    # Tests and container launchers use HOME to override the media sandbox.
+    # Windows normally prefers USERPROFILE, so honor an explicit HOME first.
+    home = Path(os.environ.get("HOME") or os.path.expanduser("~"))
     for sub in _MEDIA_DELIVERY_DENIED_HOME_SUBPATHS:
         denied.append(home / sub)
     # The active Hermes profile and shared Hermes root both contain control
@@ -1434,7 +1526,9 @@ def _path_under_denied_prefix(resolved: Path) -> bool:
     credential location or another user's home.
     """
     try:
-        home = Path(os.path.expanduser("~")).resolve(strict=False)
+        home = Path(
+            os.environ.get("HOME") or os.path.expanduser("~")
+        ).resolve(strict=False)
     except (OSError, RuntimeError, ValueError):
         home = None
     for denied in _media_delivery_denied_paths():
@@ -1522,7 +1616,8 @@ def _parse_docker_volume_mounts() -> List[Tuple[Path, Path]]:
             continue
         try:
             host_path = Path(host_expanded).resolve(strict=False)
-            container_path = Path(container_raw)
+            # Container paths are POSIX even when the gateway host is Windows.
+            container_path = PurePosixPath(container_raw)
         except (OSError, RuntimeError, ValueError):
             continue
         if not container_path.is_absolute():
@@ -1606,7 +1701,7 @@ def _cache_dir_container_mounts() -> List[Tuple[Path, Path]]:
         from tools.credential_files import get_cache_directory_mounts
 
         return [
-            (Path(m["host_path"]), Path(m["container_path"]))
+            (Path(m["host_path"]), PurePosixPath(m["container_path"]))
             for m in get_cache_directory_mounts()
         ]
     except Exception:
@@ -1639,8 +1734,10 @@ def _translate_docker_container_media_path(candidate: Path) -> Optional[Path]:
     mounts.extend(_cache_dir_container_mounts())
     # Synthetic /workspace mount for default persistent sandbox / cwd bind.
     default_ws = _default_docker_workspace_host_root()
-    if default_ws is not None and not any(c.as_posix() == "/workspace" for _, c in mounts):
-        mounts.append((default_ws, Path("/workspace")))
+    if default_ws is not None and not any(
+        c.as_posix() == "/workspace" for _, c in mounts
+    ):
+        mounts.append((default_ws, PurePosixPath("/workspace")))
     # Synthetic /root mount for the persistent home bind. Cache mounts above
     # are longer prefixes, so /root/.hermes/... still translates to the host
     # cache — this only catches stray home writes like /root/out.png.
@@ -1653,7 +1750,7 @@ def _translate_docker_container_media_path(candidate: Path) -> Optional[Path]:
         # host-side credential denylist prefixes — refuse instead so the
         # normal "container path doesn't exist on host" rejection applies.
         if not candidate.as_posix().startswith("/root/.hermes"):
-            mounts.append((default_home, Path("/root")))
+            mounts.append((default_home, PurePosixPath("/root")))
 
     if not mounts:
         return None
@@ -1712,17 +1809,24 @@ def validate_media_delivery_path(path: str) -> Optional[str]:
         return None
 
     try:
-        expanded = Path(os.path.expanduser(candidate))
+        expanded = Path(_expand_gateway_user_path(candidate))
     except (OSError, RuntimeError, ValueError):
         # expanduser raises ValueError("embedded null byte") for a ~\x00 path.
         return None
-    if not expanded.is_absolute():
+    # MEDIA directives emitted by containers are POSIX paths even when the
+    # gateway itself runs on Windows. Preserve that namespace until translated.
+    container_candidate = (
+        PurePosixPath(candidate) if candidate.startswith("/") else None
+    )
+    if not expanded.is_absolute() and container_candidate is None:
         return None
 
     # Docker agents emit MEDIA:/workspace/... (or other configured container
     # mount paths). Resolve those to host paths before the normal host-side
     # existence / denylist checks.
-    translated = _translate_docker_container_media_path(expanded)
+    translated = _translate_docker_container_media_path(
+        container_candidate or expanded
+    )
     if translated is not None:
         resolved = translated
     else:
@@ -4414,8 +4518,6 @@ class BasePlatformAdapter(ABC):
         Override in subclasses to bundle into a single native API call
         (e.g. Signal's multi-attachment RPC)
         """
-        from urllib.parse import unquote as _unquote
-
         for image_url, alt_text in images:
             if human_delay > 0:
                 await asyncio.sleep(human_delay)
@@ -4429,7 +4531,7 @@ class BasePlatformAdapter(ABC):
                 if image_url.startswith("file://"):
                     img_result = await self.send_image_file(
                         chat_id=chat_id,
-                        image_path=_unquote(image_url[7:]),
+                        image_path=_local_path_from_file_uri(image_url),
                         caption=alt_text if alt_text else None,
                         metadata=metadata,
                     )
@@ -5006,13 +5108,24 @@ class BasePlatformAdapter(ABC):
                 ext = os.path.splitext(path)[1].lower()
                 is_voice = has_voice_tag and ext in _AUDIO_EXTS
                 try:
-                    expanded = os.path.expanduser(path)
+                    expanded = _expand_gateway_user_path(path)
                 except (OSError, RuntimeError, ValueError):
                     # Skip a crafted ~\x00 path rather than aborting extraction
                     # and dropping every other attachment in the response.
                     continue
-                if expanded not in seen_paths:
-                    seen_paths.add(expanded)
+                # Windows accepts both slash styles and is case-insensitive;
+                # dedupe on the filesystem spelling while preserving the
+                # first path's original form for delivery/logging. Convert
+                # backslashes to forward slashes so a tilde-expanded
+                # ``/home/test/foo.png`` (which ``os.path.normpath`` would
+                # turn into ``\\home\\test\\foo.png`` on Windows) and the
+                # user-written absolute ``/home/test/foo.png`` collapse to
+                # the same dedupe key.
+                dedupe_key = os.path.normcase(
+                    os.path.normpath(expanded).replace("\\", "/")
+                )
+                if dedupe_key not in seen_paths:
+                    seen_paths.add(dedupe_key)
                     media.append((expanded, is_voice))
 
         for match in MEDIA_EXTENSIONLESS_TAG_RE.finditer(scan_content):
@@ -5023,10 +5136,11 @@ class BasePlatformAdapter(ABC):
             if resolved is None:
                 continue
             safe = resolved[0]
-            if safe not in seen_paths:
+            dedupe_key = os.path.normcase(os.path.normpath(safe))
+            if dedupe_key not in seen_paths:
                 _safe_ext = os.path.splitext(safe)[1].lower()
                 media.append((safe, has_voice_tag and _safe_ext in _AUDIO_EXTS))
-                seen_paths.add(safe)
+                seen_paths.add(dedupe_key)
 
         # Remove the delivered MEDIA tags from the user-visible text. Mask a
         # length-equal copy of ``cleaned`` (same union of protected regions) to
@@ -5127,7 +5241,7 @@ class BasePlatformAdapter(ABC):
             if _in_code(match.start()):
                 continue
             raw = match.group(0)
-            expanded = os.path.expanduser(raw)
+            expanded = _expand_gateway_user_path(raw)
             if os.path.isfile(expanded):
                 found.append((raw, expanded))
             else:
@@ -6691,7 +6805,6 @@ class BasePlatformAdapter(ABC):
                 # files skip the photo path and route to send_document below
                 # so they're delivered with original bytes (no Telegram
                 # sendPhoto recompression).
-                from urllib.parse import quote as _quote
                 _image_paths: list = []
                 _non_image_media: list = []
                 for media_path, is_voice in media_files:
@@ -6712,7 +6825,7 @@ class BasePlatformAdapter(ABC):
 
                 if _image_paths:
                     try:
-                        _batch = [(f"file://{_quote(p)}", "") for p in _image_paths]
+                        _batch = [(local_path_to_file_uri(p), "") for p in _image_paths]
                         await self.send_multiple_images(
                             chat_id=event.source.chat_id,
                             images=_batch,

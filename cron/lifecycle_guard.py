@@ -176,6 +176,19 @@ _BINARY_SNIFF_BYTES = 4096
 
 _ReadRemoteScriptFn = Callable[[str], Optional[str]]
 
+# Windows absolute paths are destroyed by POSIX-mode ``shlex`` (backslash =
+# escape char), so referenced-script scanning needs a direct regex pass.
+_WINDOWS_SCRIPT_PATH_RE = re.compile(
+    r"[A-Za-z]:\\[^\s;&|()\"']+\.(?:sh|bash|zsh)\b",
+    re.IGNORECASE,
+)
+
+
+def _iter_windows_script_paths(command: str) -> Iterator[str]:
+    """Yield Windows-style script paths that shlex would mangle."""
+    for match in _WINDOWS_SCRIPT_PATH_RE.finditer(command):
+        yield match.group(0)
+
 
 def _iter_command_segments(command: str) -> Iterator[list[str]]:
     """Yield shell-tokenized command segments, honoring quotes and comments."""
@@ -375,6 +388,16 @@ def _iter_referenced_shell_scripts(
     cwd: Optional[str] = None,
 ) -> Iterator[Path]:
     """Yield scripts executed directly or through a POSIX shell."""
+    windows_paths = list(_iter_windows_script_paths(command))
+    if windows_paths:
+        # POSIX-mode shlex destroys Windows paths (backslash = escape char),
+        # so skip the tokenized pass entirely and rely on the regex results.
+        for raw_path in windows_paths:
+            resolved = _resolve_terminal_script_path(raw_path, cwd)
+            if resolved is not None:
+                yield resolved
+        return
+
     for segment in _iter_command_segments(command):
         index = _command_token_index(segment)
         if index is None:
@@ -602,7 +625,10 @@ def _contains_unsafe_gateway_action(
         script_text, unsafe = _read_referenced_script(script_path)
         if unsafe:
             return True
-        if script_text is None and read_remote_script is not None:
+        if (
+            script_text is None
+            and read_remote_script is not None
+        ):
             # Local path missing; try the remote backend if one is available.
             # The callback's output crosses the same trust boundary as a
             # local read — sanitize it identically before it enters the

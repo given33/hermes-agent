@@ -4,6 +4,7 @@ import json
 import os
 import sqlite3
 import stat
+import sys
 import zipfile
 from argparse import Namespace
 from pathlib import Path
@@ -1015,8 +1016,10 @@ class TestProfileRestoration:
         run_import(args)
 
         # Only valid profile should get a wrapper
-        assert (wrapper_dir / "valid").exists()
-        assert not (wrapper_dir / "empty").exists()
+        import sys as _sys
+        ext = ".bat" if _sys.platform == "win32" else ""
+        assert (wrapper_dir / f"valid{ext}").exists()
+        assert not (wrapper_dir / f"empty{ext}").exists()
 
 
 # ---------------------------------------------------------------------------
@@ -1370,7 +1373,10 @@ class TestQuickSnapshotProjectsKanban:
         monkeypatch.setattr(bk, "_safe_copy_db", _spy)
         snap_id = create_quick_snapshot(hermes_home=hermes_home)
         # The board db was copied via _safe_copy_db (not raw copy).
-        assert any(s.endswith("boards/work/kanban.db") for s in called["db"]), called["db"]
+        assert any(
+            s.replace("\\", "/").endswith("boards/work/kanban.db")
+            for s in called["db"]
+        ), called["db"]
         copy = hermes_home / "state-snapshots" / snap_id / "kanban" / "boards" / "work" / "kanban.db"
         rows = sqlite3.connect(str(copy)).execute("SELECT * FROM tasks").fetchall()
         assert rows == [("w1", "ship")]
@@ -1678,6 +1684,8 @@ class TestMemoryProviderExternalPaths:
         (outside / "leak.json").unlink()
         outside.rmdir()
 
+    @pytest.mark.skipif(sys.platform == "win32",
+                        reason="POSIX file permission bits")
     def test_import_restores_external_to_home_relative_location(self, tmp_path, monkeypatch):
         """_external/ members restore to ~/<relpath>, not under HERMES_HOME,
         and credential-shaped files get 0600."""
@@ -1706,7 +1714,3 @@ class TestMemoryProviderExternalPaths:
         assert (restored.stat().st_mode & 0o777) == 0o600
         # External state did NOT leak into HERMES_HOME.
         assert not (hermes_home / "_external").exists()
-
-
-
-

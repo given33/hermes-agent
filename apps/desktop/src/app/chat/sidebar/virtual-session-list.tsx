@@ -202,7 +202,10 @@ interface VirtualSortableRowProps {
 }
 
 function VirtualSortableRow({ rowProps, session }: VirtualSortableRowProps) {
-  const { attributes, isDragging, listeners, setNodeRef, transform, transition } = useSortable({ id: session.id })
+  const { attributes, isDragging, listeners, setNodeRef, transform, transition } = useSortable({
+    id: session.id,
+    resizeObserverConfig: {}
+  })
 
   return (
     <SidebarSessionRow

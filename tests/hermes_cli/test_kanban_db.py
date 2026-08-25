@@ -51,37 +51,29 @@ def _init_git_repo(repo: Path) -> None:
 
 @pytest.mark.windows_only
 def test_cross_process_init_lock_uses_windows_byte_range_lock(tmp_path, monkeypatch):
-    """Windows must use a real (non-blocking) process lock, not a no-op open.
+    """Windows must use a real exclusive non-blocking process lock.
 
-    The init lock acquires with LK_NBLCK in a bounded retry loop (#36644) so a
-    wedged holder can never block connect() forever; a clean acquire takes the
-    lock once and releases it once.
-
-    ``windows_only``: ``msvcrt`` does not exist off Windows, so faking
-    ``_IS_WINDOWS`` on Linux meant injecting a fake ``msvcrt`` module too —
-    the test then asserted against its own stub rather than the byte-range
-    locking API. Here the platform is real; only ``msvcrt.locking`` is
-    instrumented so the call sequence is observable.
+    Portalocker wraps the Windows LockFileEx API and avoids the historical
+    msvcrt byte-range unlock crash. A clean acquire takes the lock once and
+    releases it once; a wedged holder still cannot block connect() forever.
     """
-    calls: list[tuple[int, int, int]] = []
-    import msvcrt as _msvcrt
-
-    fake_msvcrt = types.SimpleNamespace(
-        LK_NBLCK=_msvcrt.LK_NBLCK,
-        LK_UNLCK=_msvcrt.LK_UNLCK,
-        locking=lambda fd, mode, nbytes: calls.append((fd, mode, nbytes)),
+    calls: list[tuple[int, ...]] = []
+    fake_portalocker = types.SimpleNamespace(
+        LockFlags=types.SimpleNamespace(EXCLUSIVE=1, NON_BLOCKING=2),
+        lock=lambda fd, flags: calls.append((fd, flags)),
+        unlock=lambda fd: calls.append((fd, 0)),
     )
-    monkeypatch.setitem(sys.modules, "msvcrt", fake_msvcrt)
+    monkeypatch.setitem(sys.modules, "portalocker", fake_portalocker)
 
     db_path = tmp_path / "kanban.db"
     with kb._cross_process_init_lock(db_path):
         # Acquired exactly once via the non-blocking byte-range lock.
-        assert [call[1:] for call in calls] == [(fake_msvcrt.LK_NBLCK, 1)]
+        assert [call[1] for call in calls] == [3]
 
     # Released once on exit.
-    assert [call[1:] for call in calls] == [
-        (fake_msvcrt.LK_NBLCK, 1),
-        (fake_msvcrt.LK_UNLCK, 1),
+    assert [call[1] for call in calls] == [
+        3,
+        0,
     ]
 
 
@@ -566,7 +558,12 @@ def test_worktree_workspace_explicit_target_materializes_linked_worktree(kanban_
         capture_output=True,
         text=True,
     ).stdout
-    assert f"worktree {target}" in listed
+    worktrees = {
+        Path(line.removeprefix("worktree ")).resolve()
+        for line in listed.splitlines()
+        if line.startswith("worktree ")
+    }
+    assert target.resolve() in worktrees
     assert f"branch refs/heads/{branch}" in listed
 
 

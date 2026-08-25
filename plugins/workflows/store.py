@@ -10,6 +10,7 @@ import os
 import re
 import secrets
 import sqlite3
+import unicodedata
 import time
 import uuid
 from contextlib import contextmanager
@@ -1977,10 +1978,12 @@ class WorkflowStore:
 
     @staticmethod
     def _safe_change_path(value: str) -> str:
-        raw = str(value or "").replace("\\", "/").strip()
+        raw = unicodedata.normalize("NFC", str(value or "")).replace("\\", "/").strip()
         path = PurePosixPath(raw)
-        lowered = {part.lower() for part in path.parts}
-        name = path.name.lower()
+        if any(unicodedata.category(character) in {"Cf", "Cc"} for character in raw):
+            raise WorkflowSecurityError("workspace change path is not eligible for audit storage")
+        lowered = {part.casefold() for part in path.parts}
+        name = path.name.casefold()
         if (
             not raw
             or path.is_absolute()

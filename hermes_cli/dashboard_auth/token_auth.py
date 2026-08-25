@@ -39,6 +39,7 @@ seam remembers and surfaces as 503 only if NO provider accepts the token.
 from __future__ import annotations
 
 import logging
+import hmac
 import threading
 from typing import Awaitable, Callable, Optional, Tuple
 
@@ -48,6 +49,8 @@ from fastapi.responses import JSONResponse, Response
 from hermes_cli.dashboard_auth import list_token_providers
 from hermes_cli.dashboard_auth.audit import AuditEvent, audit_log
 from hermes_cli.dashboard_auth.base import ProviderError, TokenPrincipal
+from hermes_cli.dashboard_auth.client_ip import client_ip as _client_ip
+from hermes_cli.dashboard_auth.public_paths import PUBLIC_API_PATHS
 
 _log = logging.getLogger(__name__)
 
@@ -61,10 +64,15 @@ _lock = threading.Lock()
 # optional (i.e. the auth seam should try the bearer token if present but
 # fall back to cookie-gated access).
 _optional_token_prefixes: set[str] = set()
+_optional_token_scopes: dict[str, str | None] = {}
 _optional_prefix_lock = threading.Lock()
 
 
-def register_optional_token_prefix(prefix: str) -> None:
+def register_optional_token_prefix(
+    prefix: str,
+    *,
+    required_scope: str | None = None,
+) -> None:
     """Mark every path under ``prefix`` as accepting optional bearer auth.
 
     Idempotent. The prefix is matched with ``path.startswith(prefix)``
@@ -73,12 +81,42 @@ def register_optional_token_prefix(prefix: str) -> None:
     with _optional_prefix_lock:
         normalized = prefix.rstrip("/") or "/"
         _optional_token_prefixes.add(normalized)
+        if required_scope is not None:
+            _optional_token_scopes[normalized] = required_scope
 
 
 def is_optional_token_prefix(path: str) -> bool:
     """True if ``path`` falls under any registered optional-token prefix."""
     with _optional_prefix_lock:
-        return any(path.startswith(prefix) for prefix in _optional_token_prefixes)
+        return any(
+            path == prefix or path.startswith(prefix + "/")
+            for prefix in _optional_token_prefixes
+        )
+
+
+def is_optional_token_path(path: str) -> bool:
+    """Compatibility alias for callers that use path-oriented naming."""
+    return is_optional_token_prefix(path)
+
+
+def optional_token_scope(path: str) -> str | None:
+    """Return the most-specific scope required by an optional-token prefix."""
+    with _optional_prefix_lock:
+        matches = [
+            (prefix, scope)
+            for prefix, scope in _optional_token_scopes.items()
+            if path == prefix or path.startswith(prefix + "/")
+        ]
+        if not matches:
+            return None
+        return max(matches, key=lambda item: len(item[0]))[1]
+
+
+def clear_optional_token_prefixes() -> None:
+    """Clear optional token registrations (primarily for test isolation)."""
+    with _optional_prefix_lock:
+        _optional_token_prefixes.clear()
+        _optional_token_scopes.clear()
 
 
 def register_token_route(path: str) -> None:
@@ -104,13 +142,6 @@ def clear_token_routes() -> None:
         _token_routes.clear()
 
 
-def _client_ip(request: Request) -> str:
-    fwd = request.headers.get("x-forwarded-for", "")
-    if fwd:
-        return fwd.split(",")[0].strip()
-    return request.client.host if request.client else ""
-
-
 def extract_bearer_token(request: Request) -> str:
     """Return the bearer token from the ``Authorization`` header, or "".
 
@@ -123,6 +154,31 @@ def extract_bearer_token(request: Request) -> str:
     if len(parts) == 2 and parts[0].strip().lower() == "bearer":
         return parts[1].strip()
     return ""
+
+
+def _has_session_cookie(request: Request) -> bool:
+    """Return whether a browser session cookie is present on this request."""
+    from hermes_cli.dashboard_auth.cookies import read_session_cookies
+
+    access_token, refresh_token = read_session_cookies(request)
+    return bool(access_token or refresh_token)
+
+
+def _has_valid_dashboard_session_header(request: Request) -> bool:
+    """Return whether the dedicated dashboard session header is valid.
+
+    Resolve the legacy web-server token lazily to avoid importing the web
+    application while the auth package is being initialized.
+    """
+    try:
+        from hermes_cli import web_server
+
+        header = request.headers.get(web_server._SESSION_HEADER_NAME, "")
+        return bool(header) and hmac.compare_digest(
+            header.encode(), web_server._SESSION_TOKEN.encode()
+        )
+    except Exception:
+        return False
 
 
 def authenticate_token(
@@ -185,6 +241,94 @@ async def token_auth_middleware(
     """
     path = request.url.path
     if not is_token_route(path):
+        if is_optional_token_path(path):
+            principal = None
+            raw_authorization = request.headers.get("authorization", "")
+            # Reverse proxies commonly add ``Authorization: Basic ...`` to
+            # every request.  That header is not a Hermes bearer credential;
+            # when the dedicated dashboard session header is valid, let the
+            # normal session-token gate handle the request.  Do not apply
+            # this shortcut to an unknown Bearer value: combining a forged
+            # bearer with a valid-looking header must remain fail-closed.
+            if (
+                raw_authorization
+                and not extract_bearer_token(request)
+                and _has_valid_dashboard_session_header(request)
+            ):
+                return await call_next(request)
+            if raw_authorization:
+                principal, unreachable = authenticate_token(request)
+                if principal is None:
+                    if unreachable:
+                        return JSONResponse(
+                            {"error": "unavailable", "detail": "Auth provider unavailable"},
+                            status_code=503,
+                        )
+                    # The mobile/service token seam is optional on the whole
+                    # ``/api`` tree. In gated mode a native desktop may send
+                    # an interactive dashboard access token in the same
+                    # Authorization header. Let that token use the normal
+                    # session-provider stack instead of treating it as an
+                    # invalid service credential and short-circuiting the
+                    # cookie gate with a 401.
+                    if getattr(request.app.state, "auth_required", False):
+                        from hermes_cli.dashboard_auth.middleware import (
+                            _verify_bearer,
+                        )
+
+                        try:
+                            session = _verify_bearer(
+                                request,
+                                access_token=extract_bearer_token(request),
+                            )
+                        except ProviderError as exc:
+                            return JSONResponse(
+                                {
+                                    "error": "unavailable",
+                                    "detail": "Auth provider unavailable",
+                                },
+                                status_code=503,
+                            )
+                        if session is not None:
+                            request.state.session = session
+                            return await call_next(request)
+                    # Public API endpoints may have their own verifier. The
+                    # Chronos fire webhook is the important example: its NAS
+                    # JWT is deliberately not a dashboard/mobile token and
+                    # must reach the route handler. An unknown bearer on a
+                    # request carrying browser cookies still fails closed so
+                    # it cannot hide a credential mix-up behind cookie auth.
+                    if path in PUBLIC_API_PATHS and not _has_session_cookie(request):
+                        return await call_next(request)
+                    # Preserve the loopback dashboard's legacy Bearer token
+                    # while refusing an arbitrary bearer even when a stale
+                    # session header is also present.  The downstream legacy
+                    # middleware remains the authority for this token.
+                    legacy_ok = False
+                    if not getattr(request.app.state, "auth_required", False):
+                        try:
+                            from hermes_cli import web_server
+
+                            legacy_ok = hmac.compare_digest(
+                                raw_authorization.strip(),
+                                f"Bearer {web_server._SESSION_TOKEN}",
+                            )
+                        except Exception:
+                            legacy_ok = False
+                    if not legacy_ok:
+                        return JSONResponse(
+                            {"error": "unauthenticated", "detail": "Unauthorized"},
+                            status_code=401,
+                        )
+            required_scope = optional_token_scope(path)
+            if principal is not None and required_scope and required_scope not in principal.scopes:
+                return JSONResponse(
+                    {"error": "unauthenticated", "detail": "Unauthorized"},
+                    status_code=401,
+                )
+            if principal is not None:
+                request.state.token_principal = principal
+                request.state.token_authenticated = True
         return await call_next(request)
 
     principal, unreachable = authenticate_token(request)

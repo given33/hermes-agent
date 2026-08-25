@@ -466,17 +466,115 @@
   // standard `drop` event and our `hermes-kanban:drop` event.
   // -------------------------------------------------------------------------
 
+  // A touch tap should still scroll the board. Only a stationary long press
+  // promotes the pointer to a drag, and any movement before that hold expires
+  // is treated as the user's scroll gesture.
+  const TOUCH_DRAG_HOLD_MS = 180;
+  const TOUCH_SCROLL_CANCEL_PX = 10;
+
   function attachTouchDrag(el, taskId) {
     if (!el) return;
-    function onDown(e) {
-      if (e.pointerType !== "touch") return;
+    let activeCancel = null;
+    let suppressTouchClick = false;
+    let suppressClickTimer = null;
+
+    function onCardClick(e) {
+      if (!suppressTouchClick) return;
+      suppressTouchClick = false;
+      clearTimeout(suppressClickTimer);
+      suppressClickTimer = null;
       e.preventDefault();
-      const proxy = el.cloneNode(true);
-      proxy.classList.add("hermes-kanban-touch-proxy");
-      document.body.appendChild(proxy);
+      e.stopPropagation();
+    }
+
+    function suppressNextClick() {
+      suppressTouchClick = true;
+      clearTimeout(suppressClickTimer);
+      suppressClickTimer = window.setTimeout(function () {
+        suppressTouchClick = false;
+        suppressClickTimer = null;
+      }, 700);
+    }
+
+    function onDown(e) {
+      if (e.pointerType !== "touch" || e.isPrimary === false) return;
+      if (activeCancel) activeCancel();
+      if (suppressTouchClick) {
+        suppressTouchClick = false;
+        clearTimeout(suppressClickTimer);
+        suppressClickTimer = null;
+      }
+
+      const pointerId = e.pointerId;
+      const startX = e.clientX;
+      const startY = e.clientY;
+      let holdTimer = null;
+      let dragging = false;
+      let proxy = null;
       let lastTarget = null;
+      let finished = false;
+      const moveOptions = { passive: false };
+
+      function clearTarget() {
+        if (lastTarget) {
+          lastTarget.classList.remove("hermes-kanban-column--drop");
+          lastTarget = null;
+        }
+      }
+
+      function cleanup() {
+        if (finished) return;
+        finished = true;
+        clearTimeout(holdTimer);
+        document.removeEventListener("pointermove", move, moveOptions);
+        document.removeEventListener("pointerup", end);
+        document.removeEventListener("pointercancel", cancel);
+        try {
+          if (el.hasPointerCapture && el.hasPointerCapture(pointerId)) {
+            el.releasePointerCapture(pointerId);
+          }
+        } catch (_err) { /* pointer may already have been cancelled */ }
+        clearTarget();
+        if (proxy) {
+          proxy.remove();
+          proxy = null;
+        }
+        if (activeCancel === cancel) activeCancel = null;
+      }
+
+      function cancel(ev) {
+        if (ev && ev.pointerId !== pointerId) return;
+        if (dragging) suppressNextClick();
+        cleanup();
+      }
+
+      function startDrag() {
+        if (finished || dragging) return;
+        dragging = true;
+        proxy = el.cloneNode(true);
+        proxy.classList.add("hermes-kanban-touch-proxy");
+        proxy.style.position = "fixed";
+        proxy.style.pointerEvents = "none";
+        proxy.style.opacity = "0.85";
+        proxy.style.zIndex = "9999";
+        proxy.style.width = `${el.offsetWidth}px`;
+        proxy.style.left = `${startX - el.offsetWidth / 2}px`;
+        proxy.style.top = `${startY - 24}px`;
+        document.body.appendChild(proxy);
+        try {
+          if (el.setPointerCapture) el.setPointerCapture(pointerId);
+        } catch (_err) { /* capture is unavailable in some embedded hosts */ }
+      }
 
       function move(ev) {
+        if (finished || ev.pointerId !== pointerId) return;
+        if (!dragging) {
+          const dx = ev.clientX - startX;
+          const dy = ev.clientY - startY;
+          if (Math.hypot(dx, dy) > TOUCH_SCROLL_CANCEL_PX) cancel();
+          return;
+        }
+        ev.preventDefault();
         proxy.style.left = `${ev.clientX - proxy.offsetWidth / 2}px`;
         proxy.style.top = `${ev.clientY - 24}px`;
         proxy.style.display = "none";
@@ -491,42 +589,44 @@
           lastTarget = target;
         }
       }
-      function up() {
-        document.removeEventListener("pointermove", move);
-        document.removeEventListener("pointerup", up);
-        document.removeEventListener("pointercancel", up);
-        if (lastTarget) {
-          lastTarget.classList.remove("hermes-kanban-column--drop");
-          const status = lastTarget.getAttribute("data-kanban-column");
-          const isTrash = lastTarget.hasAttribute("data-kanban-trash");
+
+      function end(ev) {
+        if (ev && ev.pointerId !== pointerId) return;
+        if (!dragging) return cancel();
+        const target = lastTarget;
+        suppressNextClick();
+        cleanup();
+        if (target) {
+          const status = target.getAttribute("data-kanban-column");
+          const isTrash = target.hasAttribute("data-kanban-trash");
           if (isTrash) {
-            lastTarget.dispatchEvent(new CustomEvent("hermes-kanban:delete", {
+            target.dispatchEvent(new CustomEvent("hermes-kanban:delete", {
               detail: { taskId },
               bubbles: true,
             }));
           } else if (status) {
-            lastTarget.dispatchEvent(new CustomEvent("hermes-kanban:drop", {
+            target.dispatchEvent(new CustomEvent("hermes-kanban:drop", {
               detail: { taskId, status },
               bubbles: true,
             }));
           }
         }
-        proxy.remove();
       }
-      // Kick off proxy at the pointer origin.
-      proxy.style.position = "fixed";
-      proxy.style.pointerEvents = "none";
-      proxy.style.opacity = "0.85";
-      proxy.style.zIndex = "9999";
-      proxy.style.width = `${el.offsetWidth}px`;
-      proxy.style.left = `${e.clientX - el.offsetWidth / 2}px`;
-      proxy.style.top = `${e.clientY - 24}px`;
-      document.addEventListener("pointermove", move);
-      document.addEventListener("pointerup", up);
-      document.addEventListener("pointercancel", up);
+
+      holdTimer = window.setTimeout(startDrag, TOUCH_DRAG_HOLD_MS);
+      document.addEventListener("pointermove", move, moveOptions);
+      document.addEventListener("pointerup", end);
+      document.addEventListener("pointercancel", cancel);
+      activeCancel = cancel;
     }
     el.addEventListener("pointerdown", onDown);
-    return function () { el.removeEventListener("pointerdown", onDown); };
+    el.addEventListener("click", onCardClick, true);
+    return function () {
+      if (activeCancel) activeCancel();
+      if (suppressClickTimer) clearTimeout(suppressClickTimer);
+      el.removeEventListener("pointerdown", onDown);
+      el.removeEventListener("click", onCardClick, true);
+    };
   }
 
   // -------------------------------------------------------------------------

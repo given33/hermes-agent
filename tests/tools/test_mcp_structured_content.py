@@ -111,6 +111,65 @@ class TestStructuredContentPreservation:
         assert data["result"] == payload
 
 
+class TestHardResultCap:
+    def test_truncation_preserves_head_and_tail(self):
+        text = "HEAD" + ("x" * mcp_tool._MCP_HARD_RESULT_CAP_CHARS) + "TAIL"
+
+        bounded = mcp_tool._truncate_mcp_text_result(text)
+
+        assert len(bounded) <= mcp_tool._MCP_HARD_RESULT_CAP_CHARS + 200
+        assert bounded.startswith("HEAD")
+        assert bounded.endswith("TAIL")
+        assert "MCP RESULT TRUNCATED" in bounded
+
+    def test_truncation_prefers_complete_lines(self):
+        line = "x" * 1000 + "\n"
+        text = line * (mcp_tool._MCP_HARD_RESULT_CAP_CHARS // 500)
+
+        bounded = mcp_tool._truncate_mcp_text_result(text)
+
+        assert len(bounded) <= mcp_tool._MCP_HARD_RESULT_CAP_CHARS + 200
+        assert bounded.startswith(line[:100])
+        # Both cut points land on line boundaries so no log record is
+        # split: the last head line and the first tail line must each be
+        # a complete 1000-x record rather than a mid-line fragment.
+        # (The bounded result's FIRST line is always text's own first
+        # complete record, so it cannot discriminate cut placement.)
+        assert "MCP RESULT TRUNCATED" in bounded
+        lines = bounded.splitlines()
+        marker_idx = next(
+            i for i, l in enumerate(lines) if "MCP RESULT TRUNCATED" in l
+        )
+        head_lines = lines[:marker_idx]
+        while head_lines and head_lines[-1] == "":
+            head_lines.pop()
+        assert head_lines[-1] == "x" * 1000
+        tail_lines = lines[marker_idx + 1 :]
+        while tail_lines and tail_lines[0] == "":
+            tail_lines.pop(0)
+        assert tail_lines[0] == "x" * 1000
+
+    def test_oversized_structured_content_is_replaced_with_bounded_text(
+        self, _patch_mcp_server,
+    ):
+        session = _patch_mcp_server
+        payload = {"data": "x" * (mcp_tool._MCP_HARD_RESULT_CAP_CHARS + 100)}
+        session.call_tool = AsyncMock(
+            return_value=_FakeCallToolResult(
+                content=[_FakeContentBlock("done")],
+                structuredContent=payload,
+            )
+        )
+        handler = mcp_tool._make_tool_handler("test-server", "my-tool", 30.0)
+
+        data = json.loads(handler({}))
+
+        assert data["result"] == "done"
+        assert isinstance(data["structuredContent"], str)
+        assert len(data["structuredContent"]) <= mcp_tool._MCP_HARD_RESULT_CAP_CHARS + 200
+        assert "MCP RESULT TRUNCATED" in data["structuredContent"]
+
+
 class TestMetaPassthrough:
     """Server ``_meta`` is surfaced, minus protocol-reserved keys.
 

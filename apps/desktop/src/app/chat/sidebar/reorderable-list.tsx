@@ -62,7 +62,10 @@ export function ReorderableList({
 }
 
 export function useSortableBindings(id: string) {
-  const { attributes, isDragging, listeners, setNodeRef, transform, transition } = useSortable({ id })
+  const { attributes, isDragging, listeners, setNodeRef, transform, transition } = useSortable({
+    id,
+    resizeObserverConfig: {}
+  })
 
   return {
     dragging: isDragging,

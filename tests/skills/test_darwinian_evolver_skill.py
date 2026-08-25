@@ -21,7 +21,7 @@ SKILL_DIR = Path(__file__).resolve().parents[2] / "optional-skills" / "research"
 
 @pytest.fixture(scope="module")
 def frontmatter() -> dict:
-    src = (SKILL_DIR / "SKILL.md").read_text()
+    src = (SKILL_DIR / "SKILL.md").read_text(encoding="utf-8")
     m = re.search(r"^---\n(.*?)\n---", src, re.DOTALL)
     assert m, "SKILL.md missing YAML frontmatter"
     return yaml.safe_load(m.group(1))
@@ -64,12 +64,12 @@ def test_author_credits_contributor(frontmatter) -> None:
     ],
 )
 def test_shipped_scripts_parse(path: str) -> None:
-    src = (SKILL_DIR / path).read_text()
+    src = (SKILL_DIR / path).read_text(encoding="utf-8")
     ast.parse(src)  # raises SyntaxError on broken Python
 
 
 def test_parrot_script_uses_openrouter() -> None:
-    src = (SKILL_DIR / "scripts" / "parrot_openrouter.py").read_text()
+    src = (SKILL_DIR / "scripts" / "parrot_openrouter.py").read_text(encoding="utf-8")
     assert "OPENROUTER_API_KEY" in src, "parrot driver should read OPENROUTER_API_KEY"
     assert "openrouter.ai/api/v1" in src, "parrot driver should target OpenRouter"
     assert "EVOLVER_MODEL" in src, "model should be overridable via EVOLVER_MODEL"

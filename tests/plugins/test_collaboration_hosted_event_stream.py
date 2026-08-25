@@ -231,6 +231,8 @@ def test_process_exit_after_target_replace_recovers_durable_hook_outbox(
         check=False,
         capture_output=True,
         text=True,
+        encoding="utf-8",
+        errors="replace",
         timeout=30,
     )
     assert child.returncode == 73, child.stderr
@@ -693,6 +695,8 @@ def test_subprocess_exit_restarts_account_cleanup_workers_without_old_generation
         check=False,
         capture_output=True,
         text=True,
+        encoding="utf-8",
+        errors="replace",
         timeout=30,
     )
     assert child.returncode == 73, child.stderr
@@ -914,6 +918,41 @@ def test_behavior_eval_runtime_binding_fails_closed_on_profile_mismatch(monkeypa
             required_model="model-b",
         )
     assert exc_info.value.status_code == 409
+
+
+def test_explicit_legacy_profiles_use_default_runtime_without_catalog_reappearance(
+    monkeypatch,
+):
+    module = _load_module()
+    monkeypatch.setattr(
+        module,
+        "available_profiles",
+        lambda: [{
+            "name": "default",
+            "provider": "provider-a",
+            "model": "model-a",
+        }],
+    )
+
+    for profile in ("reviewer", "supervisor", "dbb3-manager"):
+        binding = module._required_runtime_binding(
+            profile,
+            required_provider="provider-a",
+            required_model="model-a",
+        )
+        assert binding["profile"] == profile
+        assert binding["resolved_profile"] == "default"
+        assert binding["verified"] is True
+
+        route, mode, selected, artifact = module._hosted_route_parameters(
+            route_metadata={"mode": "chat", "profiles": [profile]},
+            requested_mode="chat",
+            requested_profiles=[profile],
+        )
+        assert mode == "chat"
+        assert selected == [profile]
+        assert route["profiles"] == [profile]
+        assert artifact is False
 
 
 def test_local_intervention_reply_reuses_the_hosted_account_artifact_boundary(

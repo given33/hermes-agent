@@ -139,6 +139,7 @@ import json
 import logging
 import os
 import re
+import shutil
 import shlex
 import subprocess
 import sys
@@ -528,6 +529,15 @@ def _parse_single_entry(
 # ---------------------------------------------------------------------------
 
 _TOP_LEVEL_PAYLOAD_KEYS = {"tool_name", "args", "session_id", "parent_session_id"}
+_WINDOWS_SCRIPT_SUFFIXES = {".sh", ".bash", ".zsh", ".fish"}
+
+
+def _windows_posix_shell() -> str | None:
+    """Return Git for Windows' POSIX shell, not the WSL launcher."""
+    from tools.environments.local import _find_bash
+
+    bash = _find_bash()
+    return bash if bash and Path(bash).is_file() else None
 
 
 def _spawn(spec: ShellHookSpec, stdin_json: str) -> Dict[str, Any]:
@@ -559,6 +569,29 @@ def _spawn(spec: ShellHookSpec, stdin_json: str) -> Dict[str, Any]:
     if not argv:
         result["error"] = "empty command"
         return result
+    hook_env: Dict[str, str] | None = None
+    if IS_WINDOWS:
+        script_suffix = Path(argv[0]).suffix.lower()
+        if script_suffix in _WINDOWS_SCRIPT_SUFFIXES:
+            posix_shell = _windows_posix_shell()
+            if posix_shell is None:
+                result["error"] = "POSIX shell not found for script hook"
+                return result
+            if not Path(argv[0]).is_file():
+                result["error"] = "command not found"
+                return result
+            argv = [posix_shell, *argv]
+            # Git Bash's non-login shell does not inherit a useful POSIX
+            # tool PATH on Windows; coreutils such as cat/sleep are required
+            # by the documented Claude-compatible hook contract.
+            shell_root = Path(posix_shell).resolve().parents[2]
+            from tools.environments.local import build_subprocess_env
+
+            hook_env = build_subprocess_env(
+                scrub_secrets=False,
+                inherit_profile_home=False,
+            )
+            hook_env["PATH"] = str(shell_root / "usr" / "bin") + os.pathsep + hook_env.get("PATH", "")
 
     t0 = time.monotonic()
     # Spawn the hook in its own process group on POSIX (``process_group=0``,
@@ -579,6 +612,7 @@ def _spawn(spec: ShellHookSpec, stdin_json: str) -> Dict[str, Any]:
             stderr=subprocess.PIPE,
             text=True, encoding='utf-8', errors='replace',
             shell=False,
+            env=hook_env,
             **_popen_kwargs,
         )
     except FileNotFoundError:

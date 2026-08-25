@@ -80,7 +80,11 @@ class TestBrowserSourceLinesAreGuarded:
     def _read_file() -> str:
         import os
         base = os.path.dirname(os.path.dirname(os.path.dirname(__file__)))
-        with open(os.path.join(base, "tools", "browser_tool.py")) as f:
+        # encoding="utf-8" + errors="replace" — the host default codec is
+        # GBK (cp936) on this Windows machine and the file has a Windows-1252
+        # byte (0x94) that crashes a strict decode.
+        with open(os.path.join(base, "tools", "browser_tool.py"),
+                  encoding="utf-8", errors="replace") as f:
             return f.read()
 
     def test_extract_relevant_content_guarded(self):

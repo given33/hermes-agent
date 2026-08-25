@@ -32,8 +32,11 @@ def test_oneshot_replaces_lone_surrogate_and_exits_zero():
     )
 
     assert result.returncode == 0, result.stderr.decode("utf-8", errors="replace")
+    # Windows text-mode stdout emits CRLF; compare against normalized lines so
+    # the assertion checks the same content on every platform.
+    stdout_lf = result.stdout.replace(b"\r\n", b"\n")
     # U+FFFD as UTF-8; no raw surrogate bytes
-    assert "\ufffd".encode("utf-8") in result.stdout
-    assert b"answer " in result.stdout
-    assert b" here\n" in result.stdout
+    assert "\ufffd".encode("utf-8") in stdout_lf
+    assert b"answer " in stdout_lf
+    assert b" here\n" in stdout_lf
     assert b"Traceback" not in result.stderr

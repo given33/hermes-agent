@@ -5,12 +5,28 @@ The whole point is that changing one token never disturbs the rest of the look
 """
 
 import os
+from pathlib import Path
 
 import pytest
 import yaml
 
 from hermes_cli import skin_cmd
 from hermes_constants import get_hermes_home
+
+
+def _symlink_or_skip(target: Path, link: Path) -> None:
+    """symlink_to() that skips where the OS forbids symlinks.
+
+    Unprivileged Windows raises OSError winerror 1314 on any symlink
+    creation; the dotfiles-layout scenario can't even be constructed there,
+    so skip instead of failing (POSIX and Developer-Mode Windows still run).
+    """
+    try:
+        link.symlink_to(target)
+    except OSError as e:
+        if getattr(e, "winerror", None) == 1314:
+            pytest.skip("symbolic link privilege unavailable on this host")
+        raise
 
 
 def _skins():
@@ -31,7 +47,7 @@ def test_set_edits_active_user_skin_in_place_preserving_everything_else():
 
     assert skin_cmd._skin_set("ui_tool", "#00FFFF", None) == 0
 
-    data = yaml.safe_load((_skins() / "oasis.yaml").read_text())
+    data = yaml.safe_load((_skins() / "oasis.yaml").read_text(encoding="utf-8"))
     assert data["colors"]["ui_tool"] == "#00FFFF"
     assert data["colors"]["background"] == "#08201f"  # untouched — the whole point
     assert data["colors"]["banner_title"] == "#f2dfb3"
@@ -46,13 +62,13 @@ def test_set_forks_a_builtin_without_inventing_a_background():
 
     fork = _skins() / "default-custom.yaml"
     assert fork.exists()
-    data = yaml.safe_load(fork.read_text())
+    data = yaml.safe_load(fork.read_text(encoding="utf-8"))
     assert data["colors"]["ui_tool"] == "#00FFFF"
     # default has no background, so the fork must not invent one (terminal stays put).
     assert "background" not in data["colors"]
     # full palette carried over, and it became active.
     assert data["colors"].get("banner_title")
-    assert (get_hermes_home() / "config.yaml").read_text().find("default-custom") != -1
+    assert (get_hermes_home() / "config.yaml").read_text(encoding="utf-8").find("default-custom") != -1
 
 
 def test_set_rejects_non_hex():
@@ -113,7 +129,7 @@ def test_set_preserves_a_symlinked_skin_file():
         'name: oasis\ncolors:\n  background: "#08201f"\n', encoding="utf-8"
     )
     link = _skins() / "oasis.yaml"
-    link.symlink_to(real)
+    _symlink_or_skip(real, link)
     _activate("oasis")
 
     assert skin_cmd._skin_set("ui_tool", "#00FFFF", None) == 0

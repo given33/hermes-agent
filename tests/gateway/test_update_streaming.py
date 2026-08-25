@@ -9,6 +9,7 @@ Tests the new --gateway mode for hermes update, including:
 
 import json
 import os
+import sys
 import time
 import asyncio
 from unittest.mock import patch, MagicMock, AsyncMock
@@ -129,6 +130,11 @@ class TestRestoreStashWithInputFn:
 class TestUpdateCommandGatewayFlag:
     """Verify the gateway spawns hermes update --gateway."""
 
+    # The setsid/bash -c spawn string only exists on POSIX; Windows spawns a
+    # dedicated python helper (see test_windows_helper_spawns_with_gateway_flag).
+    @pytest.mark.skipif(sys.platform == "win32",
+                        reason="POSIX bash/setsid spawn shape; Windows uses its "
+                               "own detached python-helper branch")
     @pytest.mark.asyncio
     async def test_spawns_with_gateway_flag(self, tmp_path):
         """The spawned update command includes --gateway and PYTHONUNBUFFERED."""
@@ -158,6 +164,55 @@ class TestUpdateCommandGatewayFlag:
         assert "PYTHONUNBUFFERED" in cmd_string
         assert "rc=$?" in cmd_string
         assert "status=$?" not in cmd_string
+        assert "stream progress" in result
+
+    @pytest.mark.windows_only
+    @pytest.mark.asyncio
+    async def test_windows_helper_spawns_with_gateway_flag(self, tmp_path):
+        """Windows twin of test_spawns_with_gateway_flag.
+
+        On win32 there is no bash/setsid chain: the gateway spawns an inline
+        python helper that runs ``update --gateway`` with PYTHONUNBUFFERED and
+        writes the exit code file.  Assert the real argv/detach contract so
+        the --gateway IPC flag stays covered on the Windows lane too.
+        """
+        from hermes_cli._subprocess_compat import windows_detach_popen_kwargs
+
+        runner = _make_runner()
+        event = _make_event()
+
+        fake_root = tmp_path / "project"
+        fake_root.mkdir()
+        (fake_root / ".git").mkdir()
+        (fake_root / "gateway").mkdir()
+        (fake_root / "gateway" / "run.py").touch()
+        fake_file = str(fake_root / "gateway" / "run.py")
+        hermes_home = tmp_path / "hermes"
+        hermes_home.mkdir()
+
+        output_path = hermes_home / ".update_output.txt"
+        exit_code_path = hermes_home / ".update_exit_code"
+
+        mock_popen = MagicMock()
+        with patch("gateway.run._hermes_home", hermes_home), \
+             patch("gateway.run.__file__", fake_file), \
+             patch("subprocess.Popen", mock_popen):
+            result = await runner._handle_update_command(event)
+
+        mock_popen.assert_called_once()
+        call_args = mock_popen.call_args[0][0]
+        call_kwargs = mock_popen.call_args[1]
+        # Inline python helper carrying the update command with --gateway.
+        assert call_args[0] == sys.executable
+        assert call_args[1] == "-c"
+        assert "PYTHONUNBUFFERED" in call_args[2]
+        assert str(output_path) in call_args
+        assert str(exit_code_path) in call_args
+        assert call_args[-2:] == ["update", "--gateway"]
+        # Detached: the CREATE_NEW_PROCESS_GROUP | CREATE_NO_WINDOW bundle.
+        expected_detach = windows_detach_popen_kwargs()
+        for key, value in expected_detach.items():
+            assert call_kwargs.get(key) == value
         assert "stream progress" in result
 
 

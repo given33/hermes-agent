@@ -372,6 +372,37 @@ def _is_copilot_provider(agent: Any) -> bool:
         }
 
 
+def _hosted_should_retry_client_error(agent: Any, status_code: Optional[int]) -> bool:
+    """Return whether hosted auth errors should use the model retry path.
+
+    Hosted sessions may recover from a rotated credential after a 401/403.
+    Other client errors are handled by the normal classifier and must not be
+    retried blindly.
+    """
+    return bool(getattr(agent, "_api_retry_client_errors", False)) and status_code in {
+        401,
+        403,
+    }
+
+
+def _model_retry_wait_seconds(
+    agent: Any,
+    *,
+    retry_after: Optional[float],
+    retry_count: int,
+) -> float:
+    """Resolve provider retry delay while keeping the legacy backoff contract."""
+    if retry_after is not None:
+        return max(0.0, float(retry_after))
+    configured = getattr(agent, "_api_retry_delay_seconds", None)
+    if configured is not None:
+        try:
+            return max(0.0, float(configured))
+        except (TypeError, ValueError):
+            pass
+    return jittered_backoff(retry_count, base_delay=2.0, max_delay=60.0)
+
+
 def _is_stale_copilot_credential_error(status_code: Optional[int], error_message: str) -> bool:
     """Detect a Copilot 400 that is really a STALE / DEGRADED credential.
 
@@ -1028,7 +1059,15 @@ def _stored_prompt_matches_runtime(agent, prompt: str) -> bool:
     # rejected (they would always differ from the launch dir's os.getcwd()).
     stored_cwd = host_info_value("Current working directory")
     if stored_cwd:
-        if stored_cwd != str(resolve_agent_cwd()):
+        # Prompt fixtures and older persisted rows can use POSIX separators on
+        # Windows (for example, a gateway row restored from WSL). Compare
+        # paths using the host platform's spelling rules so equivalent paths
+        # do not cause a rebuild, while genuine path changes still invalidate
+        # the cache.
+        current_cwd = str(resolve_agent_cwd())
+        if os.path.normcase(os.path.normpath(stored_cwd)) != os.path.normcase(
+            os.path.normpath(current_cwd)
+        ):
             return False
 
     # Detect runtime-surface drift: the stored prompt records which platform it
@@ -5901,6 +5940,44 @@ def run_conversation(
                         }
                     )
                 ) and not is_context_length_error
+
+                # Hosted sessions rotate credentials out-of-band. A 401/403 can
+                # therefore be transient even though ordinary providers must
+                # treat it as terminal; keep this narrowly scoped to the flag.
+                if _hosted_should_retry_client_error(agent, status_code) and retry_count < max_retries:
+                    _resp_headers = getattr(getattr(api_error, "response", None), "headers", None)
+                    _retry_after = None
+                    if _resp_headers and hasattr(_resp_headers, "get"):
+                        _ra_raw = _resp_headers.get("retry-after") or _resp_headers.get("Retry-After")
+                        if _ra_raw:
+                            try:
+                                _retry_after = min(float(_ra_raw), 600.0)
+                            except (TypeError, ValueError):
+                                pass
+                    retry_count += 1
+                    wait_time = _model_retry_wait_seconds(
+                        agent,
+                        retry_after=_retry_after,
+                        retry_count=retry_count,
+                    )
+                    agent._buffer_status(
+                        f"🔐 Hosted credential rejected (HTTP {status_code}). "
+                        f"Retrying in {wait_time:.1f}s ({retry_count}/{max_retries})..."
+                    )
+                    logger.warning(
+                        "Retrying hosted client error in %ss (attempt %s/%s) %s",
+                        wait_time,
+                        retry_count,
+                        max_retries,
+                        agent._client_log_context(),
+                    )
+                    sleep_end = time.time() + wait_time
+                    while time.time() < sleep_end:
+                        if agent._interrupt_requested and agent.clear_interrupt(preserve_redirect=True):
+                            _retry.restart_with_redirected_messages = True
+                            break
+                        time.sleep(0.2)
+                    continue
 
                 if is_client_error:
                     # Copilot self-heal BEFORE fallback: a stale/degraded

@@ -27,6 +27,11 @@ import {
   validateSshTarget
 } from './ssh-connection'
 
+// ControlMaster and Unix socket ownership are POSIX-only in production. Keep
+// those lifecycle tests explicit rather than accidentally exercising the
+// Windows no-mux fallback and treating it as a mux regression.
+const testPosix = test.skipIf(process.platform === 'win32')
+
 test('redactSecrets scrubs the spawn-time session token env var', () => {
   const line = 'setsid env HERMES_DASHBOARD_SESSION_TOKEN=abc123deadbeef HERMES_DESKTOP=1 hermes dashboard'
   const out = redactSecrets(line)
@@ -80,7 +85,7 @@ test('redactSecrets leaves legitimate ssh target logging untouched', () => {
   )
 })
 
-test('controlSocketPath is stable, short, and host-distinct', () => {
+testPosix('controlSocketPath is stable, short, and host-distinct', () => {
   const a = controlSocketPath('me', 'box1', 22, '/tmp/d')
   const a2 = controlSocketPath('me', 'box1', 22, '/tmp/d')
   const b = controlSocketPath('me', 'box2', 22, '/tmp/d')
@@ -90,7 +95,7 @@ test('controlSocketPath is stable, short, and host-distinct', () => {
   assert.match(a, /\/[0-9a-f]{16}\.sock$/)
 })
 
-test('controlSocketPath default base stays under sun_path even with the temp-listener suffix', () => {
+testPosix('controlSocketPath default base stays under sun_path even with the temp-listener suffix', () => {
   // OpenSSH binds a temporary listener at `<ControlPath>.<16 random chars>` (a
   // 17-byte suffix) while opening the master. The macOS regression was the
   // default base under os.tmpdir() (/var/folders/.../T/) pushing it over 104.
@@ -264,7 +269,7 @@ function scriptedSpawn(scripts) {
   return fn
 }
 
-test('open() establishes the master when not already alive', async () => {
+testPosix('open() establishes the master when not already alive', async () => {
   // `-O check` fails first (not alive) → master opens (code 0). Track which
   // ssh ops ran rather than re-probing with the same always-failing check.
   const ops: string[] = []
@@ -302,7 +307,7 @@ test('open() abort kills an in-flight SSH child instead of waiting for timeout',
   assert.equal(child._killed, true)
 })
 
-test('open() is a no-op when the master is already alive and execs verify', async () => {
+testPosix('open() is a no-op when the master is already alive and execs verify', async () => {
   const ops: string[] = []
 
   const spawnFn = scriptedSpawn(args => {
@@ -316,7 +321,7 @@ test('open() is a no-op when the master is already alive and execs verify', asyn
   assert.deepEqual(ops, ['check', 'verify'], 'alive master is exec-verified, then trusted without reopening')
 })
 
-test('open() evicts a wedged master (check passes, exec hangs) and dials fresh', async () => {
+testPosix('open() evicts a wedged master (check passes, exec hangs) and dials fresh', async () => {
   // The macOS mode-switch wedge: ControlPersist master answers -O check but
   // every exec through it hangs. open() must verify, evict (-O exit), and
   // establish a fresh master instead of trusting the corpse.
@@ -356,7 +361,7 @@ test('open() evicts a wedged master (check passes, exec hangs) and dials fresh',
   )
 })
 
-test('close() removes the control socket when -O exit fails', async () => {
+testPosix('close() removes the control socket when -O exit fails', async () => {
   const dir = path.join(os.tmpdir(), `hermes-ssh-close-${process.pid}-${Date.now()}`)
   fs.mkdirSync(dir, { recursive: true, mode: 0o700 })
 
@@ -380,7 +385,7 @@ test('close() removes the control socket when -O exit fails', async () => {
   fs.rmSync(dir, { recursive: true, force: true })
 })
 
-test('open() creates the control-socket directory if it does not exist', async () => {
+testPosix('open() creates the control-socket directory if it does not exist', async () => {
   const dir = path.join(os.tmpdir(), `hermes-ssh-test-${process.pid}-${Date.now()}`)
   assert.ok(!fs.existsSync(dir), 'precondition: control dir absent')
   const spawnFn = scriptedSpawn(args => (args.includes('check') ? { code: 255 } : { code: 0 }))
@@ -449,7 +454,7 @@ test('exec() treats a hung ssh as a timeout (half-open connection)', async () =>
   )
 })
 
-test('forward() issues -O forward with a loopback-bound -L spec', async () => {
+testPosix('forward() issues -O forward with a loopback-bound -L spec', async () => {
   const spawnFn = scriptedSpawn([{ code: 0 }])
   const conn = new SshConnection({ host: 'box', user: 'me' }, { spawnFn, controlDir: '/tmp/d' })
   await conn.forward(5000, 6000)
@@ -461,7 +466,7 @@ test('forward() issues -O forward with a loopback-bound -L spec', async () => {
 
 test('lifecycle logging passes through redaction', async () => {
   const logs: string[] = []
-  const spawnFn = scriptedSpawn(args => (args.includes('check') ? { code: 255 } : { code: 0 }))
+  const spawnFn = scriptedSpawn((_args, index) => (index === 0 ? { code: 255 } : { code: 0 }))
 
   const conn = new SshConnection(
     { host: 'box', user: 'me' },
@@ -797,7 +802,7 @@ test('runSsh delivers stdinData to the child and does not log it', async () => {
   assert.equal(stdinWritten, 'secret-token-value', 'stdinData must be written to child.stdin')
 })
 
-test('open() rejects a control-dir that is a symlink', async () => {
+testPosix('open() rejects a control-dir that is a symlink', async () => {
   const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'ssh-test-'))
   const real = path.join(tmp, 'real')
   const link = path.join(tmp, 'link')
@@ -809,11 +814,7 @@ test('open() rejects a control-dir that is a symlink', async () => {
   fs.rmSync(tmp, { recursive: true, force: true })
 })
 
-test('open() enforces 0700 on an existing control dir with lax permissions', async () => {
-  if (process.platform === 'win32') {
-    return
-  }
-
+testPosix('open() enforces 0700 on an existing control dir with lax permissions', async () => {
   const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'ssh-test-'))
   const dir = path.join(tmp, 'ctrl')
   fs.mkdirSync(dir, { mode: 0o755 })
@@ -875,7 +876,7 @@ test('control socket identity separates installation scope and key identity', ()
   )
 })
 
-test('closing one scope addresses only that scope control master', async () => {
+testPosix('closing one scope addresses only that scope control master', async () => {
   const firstSpawn = scriptedSpawn({ code: 0 })
   const secondSpawn = scriptedSpawn({ code: 0 })
 
@@ -908,7 +909,7 @@ test('closing one scope addresses only that scope control master', async () => {
   assert.equal(second._opened, true)
 })
 
-test('failed ControlMaster close disowns the master instead of retrying it', async () => {
+testPosix('failed ControlMaster close disowns the master instead of retrying it', async () => {
   // Old contract kept _opened=true for a retry — which left wedged ControlPersist
   // masters trusted and reattachable (the macOS mode-switch livelock). New
   // contract: a master that refuses -O exit is disowned — socket dropped,

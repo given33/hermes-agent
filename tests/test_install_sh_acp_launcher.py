@@ -10,13 +10,51 @@ These tests drive the real block out of `scripts/install.sh` rather than
 asserting on a copy of it, so the shim cannot drift away from the test.
 """
 
+import os
 import re
+import shlex
+import shutil
 import stat
 import subprocess
+import sys
 from pathlib import Path
 from unittest.mock import patch
 
+import pytest
+
 INSTALL_SH = Path(__file__).resolve().parent.parent / "scripts" / "install.sh"
+
+
+def _working_bash() -> str | None:
+    """Locate a POSIX shell that can run extracted install.sh blocks.
+
+    On Windows, ``bash`` on PATH is frequently the WSL launcher stub
+    (``system32\\bash.exe``), which exits non-zero whenever WSL has no
+    installed distro -- so ``shutil.which('bash')`` alone proves nothing.
+    Validate candidates by executing them, preferring an explicit
+    Git-for-Windows installation over whatever PATH order says.
+    """
+    candidates: list[str] = []
+    if sys.platform == "win32":
+        pf = os.environ.get("ProgramFiles", "C:\\Program Files")
+        candidates.append(os.path.join(pf, "Git", "bin", "bash.exe"))
+        pf86 = os.environ.get("ProgramFiles(x86)")
+        if pf86:
+            candidates.append(os.path.join(pf86, "Git", "bin", "bash.exe"))
+    which_bash = shutil.which("bash")
+    if which_bash:
+        candidates.append(which_bash)
+    for cand in candidates:
+        try:
+            probe = subprocess.run([cand, "-c", ":"], capture_output=True, timeout=30)
+        except (OSError, subprocess.TimeoutExpired):
+            continue
+        if probe.returncode == 0:
+            return cand
+    return None
+
+
+_BASH = _working_bash()
 
 ACP_BLOCK = re.compile(
     r'(    rm -f "\$command_link_dir/hermes-acp".*?'
@@ -46,17 +84,18 @@ def _run_block(tmp_path: Path, use_venv: str) -> Path:
 
     script = (
         "set -e\n"
-        f"HERMES_BIN={hermes_bin}\n"
-        f"HERMES_ENTRYPOINT={entrypoint}\n"
-        f"command_link_dir={command_link_dir}\n"
-        f"command_link_display_dir={command_link_dir}\n"
+        f"HERMES_BIN={shlex.quote(str(hermes_bin))}\n"
+        f"HERMES_ENTRYPOINT={shlex.quote(str(entrypoint))}\n"
+        f"command_link_dir={shlex.quote(str(command_link_dir))}\n"
+        f"command_link_display_dir={shlex.quote(str(command_link_dir))}\n"
         f"USE_VENV={use_venv}\n"
         "log_success(){ :; }\n" + _extract_acp_shim_block()
     )
     result = subprocess.run(
-        ["bash", "-c", script],
+        [_BASH, "-c", script],
         capture_output=True,
         text=True,
+        encoding="utf-8",
         cwd=tmp_path,
     )
     assert result.returncode == 0, (
@@ -68,7 +107,10 @@ def _run_block(tmp_path: Path, use_venv: str) -> Path:
 def test_venv_install_writes_executable_acp_launcher(tmp_path):
     shim = _run_block(tmp_path, "true")
     assert shim.is_file()
-    assert shim.stat().st_mode & stat.S_IXUSR, "launcher must be user-executable"
+    # POSIX exec bits are unrepresentable on NTFS; install.sh did run
+    # `chmod +x` (set -e would have aborted otherwise).
+    if sys.platform != "win32":
+        assert shim.stat().st_mode & stat.S_IXUSR, "launcher must be user-executable"
 
     text = shim.read_text(encoding="utf-8")
     assert "unset PYTHONPATH" in text
@@ -84,6 +126,8 @@ def test_non_venv_install_writes_acp_launcher(tmp_path):
     assert re.search(r'exec .*\bacp\b', text), text
 
 
+@pytest.mark.require_symlinks
+@pytest.mark.skipif(_BASH is None, reason="needs a working bash")
 def test_acp_launcher_does_not_follow_a_symlink_into_the_venv(tmp_path):
     """Guards the #21454 failure mode for the new launcher.
 
@@ -109,15 +153,15 @@ def test_acp_launcher_does_not_follow_a_symlink_into_the_venv(tmp_path):
 
     script = (
         "set -e\n"
-        f"HERMES_BIN={hermes_bin}\n"
-        f"HERMES_ENTRYPOINT={entrypoint}\n"
-        f"command_link_dir={command_link_dir}\n"
-        f"command_link_display_dir={command_link_dir}\n"
+        f"HERMES_BIN={shlex.quote(str(hermes_bin))}\n"
+        f"HERMES_ENTRYPOINT={shlex.quote(str(entrypoint))}\n"
+        f"command_link_dir={shlex.quote(str(command_link_dir))}\n"
+        f"command_link_display_dir={shlex.quote(str(command_link_dir))}\n"
         "USE_VENV=true\n"
         "log_success(){ :; }\n" + _extract_acp_shim_block()
     )
     result = subprocess.run(
-        ["bash", "-c", script], capture_output=True, text=True, cwd=tmp_path
+        [_BASH, "-c", script], capture_output=True, text=True, encoding="utf-8", cwd=tmp_path
     )
     assert result.returncode == 0, result.stderr
 
@@ -166,17 +210,18 @@ def _run_hermes_agent_block(tmp_path: Path, use_venv: str) -> Path | None:
 
     script = (
         "set -e\n"
-        f"HERMES_BIN={hermes_bin}\n"
-        f"INSTALL_DIR={install_dir}\n"
-        f"command_link_dir={command_link_dir}\n"
-        f"command_link_display_dir={command_link_dir}\n"
+        f"HERMES_BIN={shlex.quote(str(hermes_bin))}\n"
+        f"INSTALL_DIR={shlex.quote(str(install_dir))}\n"
+        f"command_link_dir={shlex.quote(str(command_link_dir))}\n"
+        f"command_link_display_dir={shlex.quote(str(command_link_dir))}\n"
         f"USE_VENV={use_venv}\n"
         "log_success(){ :; }\n" + _extract_hermes_agent_shim_block()
     )
     result = subprocess.run(
-        ["bash", "-c", script],
+        [_BASH, "-c", script],
         capture_output=True,
         text=True,
+        encoding="utf-8",
         cwd=tmp_path,
     )
     assert result.returncode == 0, (
@@ -190,7 +235,10 @@ def test_venv_install_writes_executable_hermes_agent_launcher(tmp_path):
     shim = _run_hermes_agent_block(tmp_path, "true")
     assert shim is not None
     assert shim.is_file()
-    assert shim.stat().st_mode & stat.S_IXUSR, "launcher must be user-executable"
+    # POSIX exec bits are unrepresentable on NTFS; install.sh did run
+    # `chmod +x` (set -e would have aborted otherwise).
+    if sys.platform != "win32":
+        assert shim.stat().st_mode & stat.S_IXUSR, "launcher must be user-executable"
 
     text = shim.read_text(encoding="utf-8")
     assert "unset PYTHONPATH" in text

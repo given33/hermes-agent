@@ -192,6 +192,10 @@ def fake_subprocess_run(monkeypatch: pytest.MonkeyPatch):
 # tests/docker/test_s6_profile_gateway_integration.py.
 
 
+@pytest.mark.skipif(
+    __import__("sys").platform == "win32",
+    reason="os.mkfifo is POSIX-only (s6 service skeleton)",
+)
 def test_seed_supervise_skeleton_creates_expected_layout(tmp_path) -> None:
     """Verifies the dirs + FIFO + modes the helper lays down."""
     import stat
@@ -286,6 +290,10 @@ def test_render_finish_script_exits_125_on_ex_config() -> None:
     assert "exit 0" in text
 
 
+@pytest.mark.skipif(
+    __import__("sys").platform == "win32",
+    reason="s6 finish script requires POSIX shell execution",
+)
 def test_render_finish_script_does_not_restart_on_clean_exit(tmp_path) -> None:
     """Behavioral: the rendered finish script, executed for each run-exit
     code, must exit 125 (no restart) for clean exit 0 and EX_CONFIG 78,
@@ -350,6 +358,10 @@ def _log_run_setup_fragment(rendered: str) -> str:
     return "#!/bin/sh\n" + "".join(keep)
 
 
+@pytest.mark.skipif(
+    __import__("sys").platform == "win32",
+    reason="os.mkfifo is POSIX-only (s6 log pipeline)",
+)
 def test_s6_log_run_creates_leaf_as_hermes_without_chown(
     s6_scandir, fake_subprocess_run,
 ) -> None:
@@ -509,5 +521,4 @@ def test_s6_log_run_never_invokes_chown_with_symlinked_log_dir(tmp_path) -> None
     assert after.st_gid == before.st_gid
     assert (victim / "marker").read_text(encoding="utf-8") == "keep"
     assert (victim / "lock").read_text(encoding="utf-8") == "keep-lock"
-
 

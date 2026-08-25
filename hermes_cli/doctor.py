@@ -73,6 +73,37 @@ _PROVIDER_ENV_HINTS = (
 from hermes_constants import is_termux as _is_termux
 
 
+def _check_context_engineering(hermes_home: Path, cwd: Path) -> None:
+    """Report project context sources and their basic precedence/size health."""
+    print("Context Engineering")
+    sources = [cwd / name for name in (".hermes.md", "AGENTS.md", "CLAUDE.md", ".cursorrules")]
+    present = [path for path in sources if path.is_file()]
+    if present:
+        print(f"Always-on file context: {', '.join(path.name for path in present)}")
+        if (cwd / ".hermes.md").is_file() and (cwd / "AGENTS.md").is_file():
+            print("Hermes project context wins precedence over AGENTS.md")
+    else:
+        print("Always-on file context: none")
+    try:
+        from agent.skill_utils import get_all_skills_dirs
+        skill_dirs = list(get_all_skills_dirs())
+    except Exception:
+        skill_dirs = []
+    oversized = []
+    for path in present:
+        try:
+            if path.stat().st_size > 128_000:
+                oversized.append(path.name)
+        except OSError:
+            continue
+    if oversized:
+        print(f"Context sources need trimming: {', '.join(oversized)}")
+    else:
+        print("Context sources are right-sized")
+    if skill_dirs:
+        print(f"Skill context directories: {len(skill_dirs)}")
+
+
 def _python_install_cmd() -> str:
     return "python -m pip install" if _is_termux() else "uv pip install"
 
@@ -116,7 +147,7 @@ def _hermes_database_paths(hermes_home: Path) -> list[tuple[str, Path]]:
     ]
     # Non-default kanban boards each keep their own kanban.db.
     for board_db in sorted((hermes_home / "kanban" / "boards").glob("*/kanban.db")):
-        entries.append((str(board_db.relative_to(hermes_home)), board_db))
+        entries.append((board_db.relative_to(hermes_home).as_posix(), board_db))
     return entries
 
 

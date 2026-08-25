@@ -228,8 +228,20 @@ def _get_backend() -> str:
     keys manually without running setup.
     """
     configured = (_load_web_config().get("backend") or "").lower().strip()
-    if configured in _LEGACY_WEB_BACKENDS or _registered_web_provider(configured) is not None:
+    if configured:
+        # A stored selection is user intent. Let the selected vendor produce
+        # its own actionable error instead of silently changing provider and
+        # potentially billing/entitlement context.
+        from tools.tool_backend_helpers import NOUS_MANAGED_PROVIDER
+
+        if configured == NOUS_MANAGED_PROVIDER:
+            return "firecrawl"
         return configured
+
+    from tools.tool_backend_helpers import selection_exists
+
+    if selection_exists("web"):
+        return "firecrawl"
 
     # Fallback for manual / legacy config — pick the highest-priority
     # available backend. Explicit user credentials (TAVILY_API_KEY etc.)
@@ -303,8 +315,15 @@ def _get_capability_backend(capability: str) -> str:
     """
     cfg = _load_web_config()
     specific = (cfg.get(f"{capability}_backend") or "").lower().strip()
-    if specific and _is_backend_available(specific):
+    if specific:
+        if specific == "nous":
+            return "firecrawl"
         return specific
+    from tools.tool_backend_helpers import read_selection
+
+    shared = read_selection("web")
+    if shared:
+        return "firecrawl" if shared == "nous" else shared
     return _get_backend()
 
 

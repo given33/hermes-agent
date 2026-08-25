@@ -81,23 +81,33 @@ function collectSshConfigHosts(rootPath = '', deps: any = {}) {
     })
 
   const homeDir = deps.homeDir || os.homedir()
-  const root = rootPath || path.join(homeDir, '.ssh', 'config')
-  const sshDir = path.join(homeDir, '.ssh')
+  const explicitRoot = String(rootPath || '')
+  const isWindows = deps.isWindows ?? process.platform === 'win32'
+  // An explicit POSIX config path is meaningful even when the desktop process
+  // itself runs on Windows (for example a WSL-mounted SSH config). Use the
+  // path flavor of the injected/configured values instead of the host module's
+  // default, while retaining native Windows paths for the normal case.
+  const usePosix = !isWindows || explicitRoot.startsWith('/') || String(homeDir).startsWith('/')
+  const pathApi = usePosix ? path.posix : path.win32
+  const root = explicitRoot || pathApi.join(homeDir, '.ssh', 'config')
+  const sshDir = pathApi.join(homeDir, '.ssh')
 
   const out: string[] = []
   const seen = new Set()
   const visited = new Set()
 
   const resolveIncludePath = token => {
-    if (token.startsWith('~/')) {
-      return path.join(homeDir, token.slice(2))
+    if (token.startsWith('~/') || token.startsWith('~\\')) {
+      return pathApi.join(homeDir, token.slice(2))
     }
 
-    if (path.isAbsolute(token)) {
+    // OpenSSH accepts POSIX-looking absolute paths in its config on Windows;
+    // preserve those tokens verbatim rather than joining them to .ssh.
+    if (path.posix.isAbsolute(token) || path.win32.isAbsolute(token)) {
       return token
     }
 
-    return path.join(sshDir, token)
+    return pathApi.join(sshDir, token)
   }
 
   const walk = (filePath, depth) => {

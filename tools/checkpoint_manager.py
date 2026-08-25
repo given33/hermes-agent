@@ -2134,7 +2134,18 @@ def clear_all(checkpoint_base: Optional[Path] = None) -> Dict[str, int]:
         return out
     size = _dir_size_bytes(base)
     try:
-        shutil.rmtree(base)
+        def _retry_on_rmtree_error(func, path, _exc_info):
+            # Git writes pack/loose objects with the read-only attribute on
+            # Windows; rmtree cannot delete them until the bit is cleared.
+            import stat as _stat
+            import os as _os
+            try:
+                _os.chmod(path, _stat.S_IWRITE)
+            except OSError:
+                pass
+            func(path)
+
+        shutil.rmtree(base, onerror=_retry_on_rmtree_error)
         out["bytes_freed"] = size
         out["deleted"] = True
     except OSError as exc:

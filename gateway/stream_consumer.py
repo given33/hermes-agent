@@ -19,6 +19,7 @@ import asyncio
 import inspect
 import logging
 import queue
+import secrets
 import threading
 import time
 from dataclasses import dataclass
@@ -188,6 +189,7 @@ class GatewayStreamConsumer:
     # animates a draft when the same draft_id is reused across consecutive
     # calls in the same chat, so we need a fresh non-zero id per response.
     _draft_id_counter: int = 0
+    _draft_id_nonce: int = secrets.randbits(32)
 
     def __init__(
         self,
@@ -606,7 +608,7 @@ class GatewayStreamConsumer:
         # for the next one.
         if self._use_draft_streaming:
             type(self)._draft_id_counter += 1
-            self._draft_id = type(self)._draft_id_counter
+            self._draft_id = type(self)._draft_id_nonce + type(self)._draft_id_counter
 
     def on_delta(self, text: str) -> None:
         """Thread-safe callback — called from the agent's worker thread.
@@ -807,7 +809,7 @@ class GatewayStreamConsumer:
         self._use_draft_streaming = self._resolve_draft_streaming()
         if self._use_draft_streaming:
             type(self)._draft_id_counter += 1
-            self._draft_id = type(self)._draft_id_counter
+            self._draft_id = type(self)._draft_id_nonce + type(self)._draft_id_counter
             logger.debug(
                 "Stream consumer using native-draft transport (chat=%s draft_id=%s)",
                 self.chat_id, self._draft_id,

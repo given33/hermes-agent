@@ -813,7 +813,7 @@ def remove_attachment(attachment_id: int, board: Optional[str] = Query(None)):
     board = _resolve_board(board)
     conn = _conn(board=board)
     try:
-        att = kanban_db.delete_attachment(conn, attachment_id)
+        att = kanban_db.delete_attachment(conn, attachment_id, board=board)
         if att is None:
             raise HTTPException(status_code=404, detail="attachment not found")
         return {"ok": True, "id": attachment_id}

@@ -8,7 +8,11 @@ import time
 from types import SimpleNamespace
 
 import pytest
-from mcp.server.fastmcp.exceptions import ToolError
+
+try:
+    from mcp.server.mcpserver.exceptions import ToolError
+except ImportError:  # pragma: no cover - retained for MCP 1.x test environments
+    from mcp.server.fastmcp.exceptions import ToolError
 
 import hermes_cli.ios_mcp_server as ios_mcp_server_module
 from hermes_cli.ios_intelligence import IOSIntelligenceStore, ios_native_action_metadata
@@ -581,7 +585,8 @@ def test_supervised_http_process_enforces_restricted_scope_end_to_end(tmp_path):
     async def invoke_remote_tools():
         async with streamable_http_client(
             runtime.endpoint_for("ios-calendar")
-        ) as (read_stream, write_stream, _):
+        ) as streams:
+            read_stream, write_stream = streams[0], streams[1]
             async with ClientSession(read_stream, write_stream) as client:
                 await client.initialize()
                 listed = await client.call_tool(
@@ -604,8 +609,8 @@ def test_supervised_http_process_enforces_restricted_scope_end_to_end(tmp_path):
         assert health["ok"] is True
 
         listed, denied = asyncio.run(invoke_remote_tools())
-        assert listed.isError is False
-        assert denied.isError is True
+        assert listed.is_error is False
+        assert denied.is_error is True
         assert "missing calendar:write" in denied.content[0].text
         assert IOSIntelligenceStore(data_dir).pull_device_commands(
             "alice",

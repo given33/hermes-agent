@@ -111,6 +111,7 @@ def test_codex_turn_persists_each_message_exactly_once():
     real AIAgent._flush_messages_to_session_db to prove no #860/#42039
     duplicate-write regression on the codex path."""
     tmp = tempfile.mkdtemp(prefix="codex_persist_")
+    db = None
     try:
         db = SessionDB(Path(tmp) / "state.db")
         sid = "sess-codex-once"
@@ -161,6 +162,11 @@ def test_codex_turn_persists_each_message_exactly_once():
         hits = {r["session_id"] for r in db.search_messages("CODEX_ASSISTANT")}
         assert sid in hits
     finally:
+        # Close the SessionDB BEFORE removing its directory. On Windows an
+        # open SQLite file cannot be unlinked (WinError 32); POSIX tolerates
+        # it, so closing first makes the teardown deterministic everywhere.
+        if db is not None:
+            db.close()
         import shutil
 
         shutil.rmtree(tmp)

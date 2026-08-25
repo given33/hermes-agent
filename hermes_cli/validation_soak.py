@@ -51,7 +51,8 @@ async def _session(module: str, root: str) -> AsyncIterator[ClientSession]:
 
 
 def _decode_tool_result(result: Any) -> dict[str, Any]:
-    if getattr(result, "isError", False):
+    # MCP 2.0 renamed isError to is_error; support both SDK generations.
+    if getattr(result, "is_error", getattr(result, "isError", False)):
         raise RuntimeError("MCP tool returned an error")
     for block in getattr(result, "content", ()):
         text = getattr(block, "text", None)

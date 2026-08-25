@@ -276,7 +276,7 @@ class TestGenerate:
             result = _openrouter().generate(prompt="a pet")
 
         assert result["success"] is True
-        assert result["image"] == "/tmp/openrouter_gen.png"
+        assert result["image"].replace("\\", "/") == "/tmp/openrouter_gen.png"
         assert result["provider"] == "openrouter"
         mock_save.assert_called_once()
 

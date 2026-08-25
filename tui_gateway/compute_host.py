@@ -529,7 +529,20 @@ class ComputeHost:
             self.emit({"type": "turn.error", "sid": sid, "request_id": request_id, "reason": "exception", "message": str(exc)})
 
     def _ensure_server_session(self, server: Any, frame: dict[str, Any]) -> dict:
+        registry = getattr(server, "_session_creation_locks", None)
+        if registry is None:
+            with server._sessions_lock:
+                registry = getattr(server, "_session_creation_locks", None)
+                if registry is None:
+                    registry = {}
+                    server._session_creation_locks = registry
         sid = str(frame.get("sid") or "")
+        with server._sessions_lock:
+            creation_lock = registry.setdefault(sid, threading.RLock())
+        with creation_lock:
+            return self._ensure_server_session_locked(server, frame)
+
+    def _ensure_server_session_locked(self, server: Any, frame: dict[str, Any]) -> dict:
         key = str(frame.get("session_key") or sid)
         session = server._sessions.get(sid)
         if session is not None:

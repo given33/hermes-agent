@@ -1,0 +1,2811 @@
+Discovered 93 test files (~1480 tests) under ['tests\\test_log_isolation.py', 'tests\\test_managed_runtime_resolution.py', 'tests\\test_mcp_serve.py', 'tests\\test_message_reactions.py', 'tests\\test_mini_swe_runner.py', 'tests\\test_minimax_model_validation.py', 'tests\\test_minimax_oauth.py', 'tests\\test_minisweagent_path.py', 'tests\\test_moa_prepared_request_leak_78382.py', 'tests\\test_model_forces_max_completion_tokens.py', 'tests\\test_model_picker_scroll.py', 'tests\\test_model_tools_async_bridge.py', 'tests\\test_model_tools.py', 'tests\\test_no_shadowed_test_definitions.py', 'tests\\test_ollama_num_ctx.py', 'tests\\test_onepassword_secrets.py', 'tests\\test_os_marker_gating.py', 'tests\\test_output_cap_parsing.py', 'tests\\test_packaging_build_guard.py', 'tests\\test_packaging_metadata.py', 'tests\\test_plugin_skills.py', 'tests\\test_plugin_storage.py', 'tests\\test_plugin_utils.py', 'tests\\test_plugins_manage_profile_scope.py', 'tests\\test_process_loop_event_loop_warning.py', 'tests\\test_profile_isolation_runtime.py', 'tests\\test_project_metadata.py', 'tests\\test_prompt_consistency.py', 'tests\\test_pty_keepalive_ws.py', 'tests\\test_pty_session.py', 'tests\\test_redaction_registry.py', 'tests\\test_resource_limits.py', 'tests\\test_retry_utils.py', 'tests\\test_run_tests_parallel_stdio.py', 'tests\\test_run_tests_parallel.py', 'tests\\test_sanitize_tool_error.py', 'tests\\test_schema_read_probe.py', 'tests\\test_search_slow_query_log.py', 'tests\\test_secret_scope_plugin_families.py', 'tests\\test_session_db_context_manager.py', 'tests\\test_session_db_read_conn_pool.py', 'tests\\test_session_db_read_path_split.py', 'tests\\test_session_skill_previews.py', 'tests\\test_session_system_prompt_dedup.py', 'tests\\test_session_vacuum_config.py', 'tests\\test_session_workspace_binding.py', 'tests\\test_slack_thread_require_mention.py', 'tests\\test_slash_worker_watchdog.py', 'tests\\test_sql_injection.py', 'tests\\test_sqlite_lock_safe_inspection.py', 'tests\\test_sqlite_wal_reset_gate.py', 'tests\\test_stale_tool_call_marker_session_repair.py', 'tests\\test_stale_utils_module_import.py', 'tests\\test_state_db_malformed_repair.py', 'tests\\test_state_db_notadb_selfheal.py', 'tests\\test_state_db_repair_loop_cap.py', 'tests\\test_state_db_stats.py', 'tests\\test_subprocess_home_isolation.py', 'tests\\test_telegram_polling_progress_ptb.py', 'tests\\test_termux_all_extra_compat.py', 'tests\\test_timezone.py', 'tests\\test_tini_shim.py', 'tests\\test_toolset_distributions.py', 'tests\\test_toolsets.py', 'tests\\test_trajectory_compressor_async.py', 'tests\\test_trajectory_compressor.py', 'tests\\test_transform_api_error_classification_hook.py', 'tests\\test_transform_llm_output_hook.py', 'tests\\test_transform_tool_result_hook.py', 'tests\\test_tui_entry_mcp_owner.py', 'tests\\test_tui_gateway_loop_noise.py', 'tests\\test_tui_gateway_queue_on_busy.py', 'tests\\test_tui_gateway_server_crash_history.py', 'tests\\test_tui_gateway_server.py', 'tests\\test_tui_gateway_ws.py', 'tests\\test_tui_mcp_late_refresh.py', 'tests\\test_utils_atomic_roundtrip_yaml_save.py', 'tests\\test_utils_secret_write.py', 'tests\\test_utils_truthy_values.py', 'tests\\test_voice_max_recording_seconds.py', 'tests\\test_wal_checkpoint_strategy.py', 'tests\\test_web_server_sessiondb_eventloop.py', 'tests\\test_web_server_status_topology_cache.py', 'tests\\test_web_server.py', 'tests\\test_windows_subprocess_no_window_flags.py', 'tests\\test_yaml_indent_consistency_31999.py', 'tests\\test_yuanbao_integration.py', 'tests\\test_yuanbao_markdown.py', 'tests\\test_yuanbao_pipeline.py', 'tests\\test_yuanbao_proto.py', 'tests\\test_yuanbao_reconnect_set_active.py', 'tests\\test_yuanbao_shutdown.py', 'tests\\test_zeroed_state_db.py']; running with -j 16
+[  0.0% |     0/~1480 | ✓0 | ✗0] ✓ tests\test_minisweagent_path.py (3.8s)
+[  0.1% |     2/~1480 | ✓2 | ✗0] ✓ tests\test_log_isolation.py (2✓, 5.1s)
+[  0.7% |    10/~1480 | ✓10 | ✗ 0] ✓ tests\test_model_picker_scroll.py (8✓, 5.1s)
+[  1.4% |    21/~1480 | ✓21 | ✗ 0] ✓ tests\test_model_forces_max_completion_tokens.py (11✓, 5.3s)
+[  1.7% |    25/~1480 | ✓25 | ✗ 0] ✓ tests\test_minimax_model_validation.py (4✓, 5.4s)
+[  2.4% |    36/~1480 | ✓36 | ✗ 0] ✓ tests\test_onepassword_secrets.py (11✓, 5.4s)
+[  2.9% |    43/~1480 | ✓43 | ✗ 0] ✓ tests\test_ollama_num_ctx.py (7✓, 5.5s)
+[  3.0% |    45/~1480 | ✓45 | ✗ 0] ✓ tests\test_moa_prepared_request_leak_78382.py (2✓, 5.5s)
+[  3.2% |    47/~1480 | ✓47 | ✗ 0] ✓ tests\test_mini_swe_runner.py (2✓, 5.7s)
+[  3.4% |    51/~1480 | ✓51 | ✗ 0] ✓ tests\test_os_marker_gating.py (4✓, 2.6s)
+[  4.4% |    65/~1480 | ✓64 | ✗ 1] ✗ tests\test_minimax_oauth.py (13✓ 1✗, 8.0s)
+
+  ╔╍ Failed: tests\test_minimax_oauth.py ╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍
+  ║     @contextlib.contextmanager
+  ║     def map_httpcore_exceptions() -> typing.Iterator[None]:
+  ║         global HTTPCORE_EXC_MAP
+  ║         if len(HTTPCORE_EXC_MAP) == 0:
+  ║             HTTPCORE_EXC_MAP = _load_httpcore_exceptions()
+  ║         try:
+  ║             yield
+  ║         except Exception as exc:
+  ║             mapped_exc = None
+  ║     
+  ║             for from_exc, to_exc in HTTPCORE_EXC_MAP.items():
+  ║                 if not isinstance(exc, from_exc):
+  ║                     continue
+  ║                 # We want to map to the most specific exception we can find.
+  ║                 # Eg if `exc` is an `httpcore.ReadTimeout`, we want to map to
+  ║                 # `httpx.ReadTimeout`, not just `httpx.TimeoutException`.
+  ║                 if mapped_exc is None or issubclass(to_exc, mapped_exc):
+  ║                     mapped_exc = to_exc
+  ║     
+  ║             if mapped_exc is None:  # pragma: no cover
+  ║                 raise
+  ║     
+  ║             message = str(exc)
+  ║ >           raise mapped_exc(message) from exc
+  ║ E           httpx.ReadError: [WinError 10054] Զ������ǿ�ȹر���һ�����е����ӡ�
+  ║ 
+  ║ .venv\Lib\site-packages\httpx\_transports\default.py:118: ReadError
+  ║ =========================== short test summary info ===========================
+  ║ FAILED tests/test_minimax_oauth.py::test_refresh_error_body_bounded_and_readable_with_real_client
+  ║ ======================== 1 failed, 13 passed in 6.10s =========================
+  ║
+  ║  Repro: python -m pytest tests\test_minimax_oauth.py
+  ╚╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍
+
+[  5.3% |    78/~1480 | ✓77 | ✗ 1] ✓ tests\test_output_cap_parsing.py (13✓, 3.3s)
+[  5.7% |    85/~1480 | ✓84 | ✗ 1] ✓ tests\test_packaging_metadata.py (7✓, 3.5s)
+[  6.1% |    91/~1480 | ✓90 | ✗ 1] ✓ tests\test_plugin_utils.py (6✓, 3.9s)
+[  6.3% |    93/~1480 | ✓90 | ✗ 5] ✗ tests\test_packaging_build_guard.py (4✗, 4.3s)
+
+  ╔╍ Failed: tests\test_packaging_build_guard.py ╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍
+  ║ E        +  where 1 = CompletedProcess(args=['C:\\Users\\given\\hermes-audit\\hermes-agent\\.venv\\Scripts\\python.exe', '-c', "from setupto...ost recent call last):\n  File "<string>", line 1, in <module>\nModuleNotFoundError: No module named \'setuptools\'\n').returncode
+  ║ 
+  ║ tests\test_packaging_build_guard.py:73: AssertionError
+  ║ _ test_artifact_build_allows_explicit_nix_package_build_marker[wheel-hermes_agent-*.whl] _
+  ║ 
+  ║ kind = 'wheel', artifact_glob = 'hermes_agent-*.whl'
+  ║ tmp_path = WindowsPath('C:/Users/given/AppData/Local/Temp/pytest-of-given/pytest-44611/test_artifact_build_allows_exp1')
+  ║ 
+  ║     @pytest.mark.parametrize(
+  ║         ("kind", "artifact_glob"),
+  ║         [("sdist", "hermes_agent-*.tar.gz"), ("wheel", "hermes_agent-*.whl")],
+  ║     )
+  ║     def test_artifact_build_allows_explicit_nix_package_build_marker(kind, artifact_glob, tmp_path):
+  ║         result = _build_artifact(kind, tmp_path, nix_build=True)
+  ║     
+  ║ >       assert result.returncode == 0, result.stderr
+  ║ E       AssertionError: Traceback (most recent call last):
+  ║ E           File "<string>", line 1, in <module>
+  ║ E         ModuleNotFoundError: No module named 'setuptools'
+  ║ E         
+  ║ E       assert 1 == 0
+  ║ E        +  where 1 = CompletedProcess(args=['C:\\Users\\given\\hermes-audit\\hermes-agent\\.venv\\Scripts\\python.exe', '-c', "from setupto...ost recent call last):\n  File "<string>", line 1, in <module>\nModuleNotFoundError: No module named \'setuptools\'\n').returncode
+  ║ 
+  ║ tests\test_packaging_build_guard.py:73: AssertionError
+  ║ =========================== short test summary info ===========================
+  ║ FAILED tests/test_packaging_build_guard.py::test_artifact_build_rejects_nix_development_shell_environment[sdist]
+  ║ FAILED tests/test_packaging_build_guard.py::test_artifact_build_rejects_nix_development_shell_environment[wheel]
+  ║ FAILED tests/test_packaging_build_guard.py::test_artifact_build_allows_explicit_nix_package_build_marker[sdist-hermes_agent-*.tar.gz]
+  ║ FAILED tests/test_packaging_build_guard.py::test_artifact_build_allows_explicit_nix_package_build_marker[wheel-hermes_agent-*.whl]
+  ║ ============================== 4 failed in 2.45s ==============================
+  ║
+  ║  Repro: python -m pytest tests\test_packaging_build_guard.py
+  ╚╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍
+
+[  6.6% |    98/~1480 | ✓ 95 | ✗  5] ✓ tests\test_process_loop_event_loop_warning.py (5✓, 3.7s)
+[  7.0% |   103/~1480 | ✓106 | ✗  5] ✓ tests\test_plugin_storage.py (11✓, 4.0s)
+[  7.8% |   115/~1480 | ✓118 | ✗  5] ✓ tests\test_model_tools_async_bridge.py (12✓, 10.2s)
+[  8.0% |   118/~1480 | ✓121 | ✗  5] ✓ tests\test_plugins_manage_profile_scope.py (3✓, 4.8s)
+[  8.4% |   125/~1480 | ✓128 | ✗  5] ✓ tests\test_project_metadata.py (7✓, 3.4s)
+[  9.3% |   138/~1480 | ✓141 | ✗  5] ✓ tests\test_message_reactions.py (13✓, 11.7s)
+[  9.7% |   144/~1480 | ✓147 | ✗  5] ✓ tests\test_profile_isolation_runtime.py (6✓, 6.3s)
+[ 10.5% |   155/~1480 | ✓158 | ✗  5] ✓ tests\test_retry_utils.py (11✓, 4.2s)
+[ 11.1% |   164/~1480 | ✓167 | ✗  5] ✓ tests\test_pty_session.py (9✓, 4.3s)
+[ 11.3% |   167/~1480 | ✓170 | ✗  5] ✓ tests\test_run_tests_parallel_stdio.py (3✓, 3.5s)
+[ 12.6% |   186/~1480 | ✓189 | ✗  5] ✓ tests\test_redaction_registry.py (19✓, 4.5s)
+[ 12.9% |   191/~1480 | ✓194 | ✗  5] ✓ tests\test_schema_read_probe.py (5✓, 3.2s)
+[ 13.4% |   198/~1480 | ✓208 | ✗ 29] ✗ tests\test_prompt_consistency.py (14✓ 24✗, 7.3s)
+
+  ╔╍ Failed: tests\test_prompt_consistency.py ╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍
+  ║ E       assert False
+  ║ E        +  where False = any(<generator object test_delegate_schema_carries_capability.<locals>.<genexpr> at 0x00000167698DBAE0>)
+  ║ 
+  ║ tests\test_prompt_consistency.py:106: AssertionError
+  ║ =========================== short test summary info ===========================
+  ║ FAILED tests/test_prompt_consistency.py::test_kanban_guidance_mentions_capability[acceptance criteria]
+  ║ FAILED tests/test_prompt_consistency.py::test_kanban_guidance_mentions_capability[choice option format]
+  ║ FAILED tests/test_prompt_consistency.py::test_kanban_guidance_mentions_capability[expected output contract]
+  ║ FAILED tests/test_prompt_consistency.py::test_kanban_guidance_mentions_capability[needs_input block]
+  ║ FAILED tests/test_prompt_consistency.py::test_kanban_guidance_mentions_capability[selective inheritance]
+  ║ FAILED tests/test_prompt_consistency.py::test_kanban_guidance_mentions_capability[shared context variables]
+  ║ FAILED tests/test_prompt_consistency.py::test_kanban_guidance_mentions_capability[subagent kill]
+  ║ FAILED tests/test_prompt_consistency.py::test_kanban_guidance_mentions_capability[subagent list]
+  ║ FAILED tests/test_prompt_consistency.py::test_kanban_guidance_mentions_capability[subagent naming]
+  ║ FAILED tests/test_prompt_consistency.py::test_kanban_guidance_mentions_capability[subagent steering]
+  ║ FAILED tests/test_prompt_consistency.py::test_manager_prompt_mentions_capability[acceptance criteria]
+  ║ FAILED tests/test_prompt_consistency.py::test_manager_prompt_mentions_capability[choice option format]
+  ║ FAILED tests/test_prompt_consistency.py::test_manager_prompt_mentions_capability[expected output contract]
+  ║ FAILED tests/test_prompt_consistency.py::test_manager_prompt_mentions_capability[needs_input block]
+  ║ FAILED tests/test_prompt_consistency.py::test_manager_prompt_mentions_capability[selective inheritance]
+  ║ FAILED tests/test_prompt_consistency.py::test_manager_prompt_mentions_capability[shared context variables]
+  ║ FAILED tests/test_prompt_consistency.py::test_manager_prompt_mentions_capability[subagent kill]
+  ║ FAILED tests/test_prompt_consistency.py::test_manager_prompt_mentions_capability[subagent list]
+  ║ FAILED tests/test_prompt_consistency.py::test_manager_prompt_mentions_capability[subagent naming]
+  ║ FAILED tests/test_prompt_consistency.py::test_manager_prompt_mentions_capability[subagent steering]
+  ║ FAILED tests/test_prompt_consistency.py::test_delegate_schema_carries_capability[acceptance criteria]
+  ║ FAILED tests/test_prompt_consistency.py::test_delegate_schema_carries_capability[expected output contract]
+  ║ FAILED tests/test_prompt_consistency.py::test_delegate_schema_carries_capability[selective inheritance]
+  ║ FAILED tests/test_prompt_consistency.py::test_delegate_schema_carries_capability[shared context variables]
+  ║ ======================== 24 failed, 14 passed in 5.46s ========================
+  ║
+  ║  Repro: python -m pytest tests\test_prompt_consistency.py
+  ╚╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍
+
+[ 13.6% |   202/~1480 | ✓212 | ✗ 29] ✓ tests\test_pty_keepalive_ws.py (4✓, 7.2s)
+[ 14.4% |   213/~1480 | ✓223 | ✗ 29] ✓ tests\test_secret_scope_plugin_families.py (11✓, 3.7s)
+[ 20.4% |   302/~1480 | ✓311 | ✗ 30] ✗ tests\test_mcp_serve.py (88✓ 1✗, 17.8s)
+
+  ╔╍ Failed: tests\test_mcp_serve.py ╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍
+  ║                 return list(messages.get(sid, []))
+  ║     
+  ║         monkeypatch.setattr(mcp_serve, "_get_session_db", lambda: DB())
+  ║     
+  ║         bridge = mcp_serve.EventBridge()
+  ║         bridge._establish_baseline()  # no conversations exist yet
+  ║     
+  ║         # The gateway registers a brand-new conversation + its first message.
+  ║         sid = "20260329_150000_fresh"
+  ║         index["agent:main:telegram:dm:fresh"] = {
+  ║             "session_id": sid,
+  ║             "platform": "telegram",
+  ║             "origin": {"platform": "telegram", "chat_id": "fresh"},
+  ║         }
+  ║         messages[sid] = [{
+  ║             "id": 1, "role": "user", "content": "hello after baseline",
+  ║             "timestamp": "2026-03-29T15:10:00",
+  ║         }]
+  ║         os.utime(db_path, None)
+  ║         bridge._poll_once(DB())
+  ║     
+  ║         events = bridge.poll_events(after_cursor=0)["events"]
+  ║ >       assert len(events) == 1
+  ║ E       assert 0 == 1
+  ║ E        +  where 0 = len([])
+  ║ 
+  ║ tests\test_mcp_serve.py:1419: AssertionError
+  ║ =========================== short test summary info ===========================
+  ║ FAILED tests/test_mcp_serve.py::TestEventBridgePollE2E::test_new_conversation_after_baseline_is_delivered
+  ║ ======================== 1 failed, 88 passed in 15.78s ========================
+  ║
+  ║  Repro: python -m pytest tests\test_mcp_serve.py
+  ╚╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍
+
+[ 20.9% |   310/~1480 | ✓313 | ✗ 30] ✓ tests\test_session_db_read_path_split.py (2✓ 6s, 4.4s)
+[ 21.6% |   319/~1480 | ✓322 | ✗ 30] ✓ tests\test_sanitize_tool_error.py (9✓, 7.2s)
+[ 22.4% |   332/~1480 | ✓324 | ✗ 30] ✓ tests\test_session_db_read_conn_pool.py (2✓ 11s, 5.0s)
+[ 22.8% |   337/~1480 | ✓329 | ✗ 30] ✓ tests\test_search_slow_query_log.py (5✓, 6.1s)
+[ 23.0% |   341/~1480 | ✓333 | ✗ 30] ✓ tests\test_session_db_context_manager.py (4✓, 5.7s)
+[ 23.2% |   343/~1480 | ✓335 | ✗ 30] ✓ tests\test_session_vacuum_config.py (2✓, 3.5s)
+[ 24.2% |   358/~1480 | ✓356 | ✗ 31] ✗ tests\test_resource_limits.py (21✓ 1✗, 10.6s)
+
+  ╔╍ Failed: tests\test_resource_limits.py ╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍
+  ║ 
+  ║   File "<frozen runpy>", line 198, in _run_module_as_main
+  ║ 
+  ║   File "<frozen runpy>", line 88, in _run_code
+  ║ 
+  ║   File "C:\Users\given\hermes-audit\hermes-agent\hermes_cli\main.py", line 706, in <module>
+  ║ 
+  ║     load_hermes_dotenv(
+  ║ 
+  ║   File "C:\Users\given\hermes-audit\hermes-agent\hermes_cli\env_loader.py", line 489, in load_hermes_dotenv
+  ║ 
+  ║     home_path = Path(hermes_home or os.getenv("HERMES_HOME", Path.home() / ".hermes"))
+  ║ 
+  ║                                                              ^^^^^^^^^^^
+  ║ 
+  ║   File "C:\Users\given\AppData\Local\Programs\Python\Python311\Lib\pathlib.py", line 914, in home
+  ║ 
+  ║     return cls("~").expanduser()
+  ║ 
+  ║            ^^^^^^^^^^^^^^^^^^^^^
+  ║ 
+  ║   File "C:\Users\given\AppData\Local\Programs\Python\Python311\Lib\pathlib.py", line 1385, in expanduser
+  ║ 
+  ║     raise RuntimeError("Could not determine home directory.")
+  ║ 
+  ║ RuntimeError: Could not determine home directory.
+  ║ 
+  ║ =========================== short test summary info ===========================
+  ║ FAILED tests/test_resource_limits.py::test_named_profile_reroute_defers_limit_to_final_process
+  ║ ======================== 1 failed, 21 passed in 8.40s =========================
+  ║
+  ║  Repro: python -m pytest tests\test_resource_limits.py
+  ╚╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍
+
+[ 24.5% |   363/~1480 | ✓361 | ✗ 31] ✓ tests\test_session_workspace_binding.py (5✓, 3.3s)
+[ 26.2% |   388/~1480 | ✓386 | ✗ 31] ✓ tests\test_model_tools.py (25✓, 20.7s)
+[ 26.5% |   392/~1480 | ✓390 | ✗ 31] ✓ tests\test_sql_injection.py (4✓, 3.1s)
+[ 26.7% |   395/~1480 | ✓393 | ✗ 31] ✓ tests\test_slash_worker_watchdog.py (3✓, 3.6s)
+[ 27.0% |   400/~1480 | ✓398 | ✗ 31] ✓ tests\test_slack_thread_require_mention.py (5✓, 4.5s)
+[ 27.2% |   403/~1480 | ✓401 | ✗ 31] ✓ tests\test_stale_utils_module_import.py (3✓, 3.0s)
+[ 27.5% |   407/~1480 | ✓408 | ✗ 31] ✓ tests\test_managed_runtime_resolution.py (7✓, 23.4s)
+[ 29.5% |   436/~1480 | ✓435 | ✗ 33] ✗ tests\test_plugin_skills.py (27✓ 2✗, 18.5s)
+
+  ╔╍ Failed: tests\test_plugin_skills.py ╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍
+  ║ 
+  ║ self = <tests.test_plugin_skills.TestSkillViewQualifiedName object at 0x0000020454B4CA10>
+  ║ tmp_path = WindowsPath('C:/Users/given/AppData/Local/Temp/pytest-of-given/pytest-44615/test_platform_gate_applies_bef0')
+  ║ 
+  ║     def test_platform_gate_applies_before_supporting_file(self, tmp_path):
+  ║         from tools.skills_tool import skill_view
+  ║     
+  ║         md = self._register_skill(
+  ║             tmp_path,
+  ║             content=(
+  ║                 "---\nname: writing-plans\ndescription: desc\n"
+  ║                 "platforms: [windows]\n---\nBody.\n"
+  ║             ),
+  ║         )
+  ║         reference = md.parent / "references" / "guide.md"
+  ║         reference.parent.mkdir()
+  ║         reference.write_text("Windows only.")
+  ║     
+  ║         result = json.loads(
+  ║             skill_view("superpowers:writing-plans", file_path="references/guide.md")
+  ║         )
+  ║     
+  ║ >       assert result["success"] is False
+  ║ E       assert True is False
+  ║ 
+  ║ tests\test_plugin_skills.py:240: AssertionError
+  ║ =========================== short test summary info ===========================
+  ║ FAILED tests/test_plugin_skills.py::TestSkillViewQualifiedName::test_reads_supporting_file_with_containment
+  ║ FAILED tests/test_plugin_skills.py::TestSkillViewQualifiedName::test_platform_gate_applies_before_supporting_file
+  ║ ======================== 2 failed, 27 passed in 16.86s ========================
+  ║
+  ║  Repro: python -m pytest tests\test_plugin_skills.py
+  ╚╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍
+
+[ 30.1% |   445/~1480 | ✓444 | ✗ 33] ✓ tests\test_state_db_repair_loop_cap.py (9✓, 3.7s)
+[ 30.4% |   450/~1480 | ✓449 | ✗ 33] ✓ tests\test_no_shadowed_test_definitions.py (5✓, 24.7s)
+[ 31.0% |   459/~1480 | ✓458 | ✗ 33] ✓ tests\test_session_system_prompt_dedup.py (9✓, 9.5s)
+[ 31.1% |   461/~1480 | ✓458 | ✗ 35] ✗ tests\test_termux_all_extra_compat.py (2✗, 3.1s)
+
+  ╔╍ Failed: tests\test_termux_all_extra_compat.py ╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍
+  ║ E           UnicodeDecodeError: 'gbk' codec can't decode byte 0x94 in position 98: illegal multibyte sequence
+  ║ 
+  ║ ..\..\AppData\Local\Programs\Python\Python311\Lib\pathlib.py:1059: UnicodeDecodeError
+  ║ ____________ test_install_script_prefers_termux_all_then_fallbacks ____________
+  ║ 
+  ║     def test_install_script_prefers_termux_all_then_fallbacks() -> None:
+  ║ >       text = INSTALL_SH.read_text()
+  ║                ^^^^^^^^^^^^^^^^^^^^^^
+  ║ 
+  ║ tests\test_termux_all_extra_compat.py:20: 
+  ║ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _
+  ║ 
+  ║ self = WindowsPath('C:/Users/given/hermes-audit/hermes-agent/scripts/install.sh')
+  ║ encoding = 'locale', errors = None
+  ║ 
+  ║     def read_text(self, encoding=None, errors=None):
+  ║         """
+  ║         Open the file in text mode, read it, and close the file.
+  ║         """
+  ║         encoding = io.text_encoding(encoding)
+  ║         with self.open(mode='r', encoding=encoding, errors=errors) as f:
+  ║ >           return f.read()
+  ║                    ^^^^^^^^
+  ║ E           UnicodeDecodeError: 'gbk' codec can't decode byte 0xa0 in position 930: illegal multibyte sequence
+  ║ 
+  ║ ..\..\AppData\Local\Programs\Python\Python311\Lib\pathlib.py:1059: UnicodeDecodeError
+  ║ =========================== short test summary info ===========================
+  ║ FAILED tests/test_termux_all_extra_compat.py::test_pyproject_defines_termux_all_without_known_blockers
+  ║ FAILED tests/test_termux_all_extra_compat.py::test_install_script_prefers_termux_all_then_fallbacks
+  ║ ============================== 2 failed in 1.65s ==============================
+  ║
+  ║  Repro: python -m pytest tests\test_termux_all_extra_compat.py
+  ╚╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍
+
+[ 32.1% |   475/~1480 | ✓471 | ✗ 36] ✗ tests\test_subprocess_home_isolation.py (13✓ 1✗, 3.8s)
+
+  ╔╍ Failed: tests\test_subprocess_home_isolation.py ╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍
+  ║ monkeypatch = <_pytest.monkeypatch.MonkeyPatch object at 0x0000024901514590>
+  ║ 
+  ║     def test_two_profiles_get_different_homes(self, tmp_path, monkeypatch):
+  ║         self._container_mode(monkeypatch)
+  ║         base = tmp_path / ".hermes" / "profiles"
+  ║         for name in ("alpha", "beta"):
+  ║             p = base / name
+  ║             p.mkdir(parents=True)
+  ║             (p / "home").mkdir()
+  ║     
+  ║         from hermes_constants import get_subprocess_home
+  ║     
+  ║         monkeypatch.setenv("HERMES_HOME", str(base / "alpha"))
+  ║         home_a = get_subprocess_home()
+  ║     
+  ║         monkeypatch.setenv("HERMES_HOME", str(base / "beta"))
+  ║         home_b = get_subprocess_home()
+  ║     
+  ║         assert home_a is not None
+  ║         assert home_b is not None
+  ║         assert home_a != home_b
+  ║ >       assert home_a.endswith("alpha/home")
+  ║ E       AssertionError: assert False
+  ║ E        +  where False = <built-in method endswith of str object at 0x000002490141B260>('alpha/home')
+  ║ E        +    where <built-in method endswith of str object at 0x000002490141B260> = 'C:\\Users\\given\\AppData\\Local\\Temp\\pytest-of-given\\pytest-44651\\test_two_profiles_get_differen0\\.hermes\\profiles\\alpha\\home'.endswith
+  ║ 
+  ║ tests\test_subprocess_home_isolation.py:110: AssertionError
+  ║ =========================== short test summary info ===========================
+  ║ FAILED tests/test_subprocess_home_isolation.py::TestGetSubprocessHome::test_two_profiles_get_different_homes
+  ║ ======================== 1 failed, 13 passed in 2.28s =========================
+  ║
+  ║  Repro: python -m pytest tests\test_subprocess_home_isolation.py
+  ╚╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍
+
+[ 32.7% |   484/~1480 | ✓480 | ✗ 36] ✓ tests\test_state_db_notadb_selfheal.py (9✓, 5.4s)
+[ 33.4% |   495/~1480 | ✓489 | ✗ 36] ✓ tests\test_timezone.py (9✓ 2s, 3.7s)
+[ 33.9% |   502/~1480 | ✓496 | ✗ 36] ✓ tests\test_toolset_distributions.py (7✓, 2.9s)
+[ 34.2% |   506/~1480 | ✓496 | ✗ 40] ✗ tests\test_tini_shim.py (4✗, 3.9s)
+
+  ╔╍ Failed: tests\test_tini_shim.py ╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍
+  ║                     executable = comspec
+  ║             else:
+  ║                 comspec = executable
+  ║     
+  ║             args = '{} /c "{}"'.format (comspec, args)
+  ║     
+  ║         if cwd is not None:
+  ║             cwd = os.fsdecode(cwd)
+  ║     
+  ║         sys.audit("subprocess.Popen", executable, args, cwd, env)
+  ║     
+  ║         # Start the process
+  ║         try:
+  ║ >           hp, ht, pid, tid = _winapi.CreateProcess(executable, args,
+  ║                                      # no special security
+  ║                                      None, None,
+  ║                                      int(not close_fds),
+  ║                                      creationflags,
+  ║                                      env,
+  ║                                      cwd,
+  ║                                      startupinfo)
+  ║ E                                    FileNotFoundError: [WinError 2] ϵͳ�Ҳ���ָ�����ļ���
+  ║ 
+  ║ ..\..\AppData\Local\Programs\Python\Python311\Lib\subprocess.py:1538: FileNotFoundError
+  ║ =========================== short test summary info ===========================
+  ║ FAILED tests/test_tini_shim.py::test_shim_script_is_executable_bit_friendly
+  ║ FAILED tests/test_tini_shim.py::test_strips_g_and_double_dash - FileNotFoundE...
+  ║ FAILED tests/test_tini_shim.py::test_does_not_double_wrap_existing_wrapper - ...
+  ║ FAILED tests/test_tini_shim.py::test_strips_p_and_e_with_arguments - FileNotF...
+  ║ ============================== 4 failed in 2.15s ==============================
+  ║
+  ║  Repro: python -m pytest tests\test_tini_shim.py
+  ╚╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍
+
+[ 34.6% |   512/~1480 | ✓502 | ✗ 40] ✓ tests\test_session_skill_previews.py (6✓, 12.9s)
+[ 35.5% |   526/~1480 | ✓516 | ✗ 40] ✓ tests\test_stale_tool_call_marker_session_repair.py (14✓, 8.5s)
+[ 35.9% |   531/~1480 | ✓522 | ✗ 40] ✓ tests\test_telegram_polling_progress_ptb.py (6✓, 5.6s)
+[ 36.7% |   543/~1480 | ✓534 | ✗ 40] ✓ tests\test_state_db_stats.py (12✓, 6.4s)
+[ 38.1% |   564/~1480 | ✓555 | ✗ 40] ✓ tests\test_trajectory_compressor.py (21✓, 4.0s)
+[ 39.8% |   589/~1480 | ✓580 | ✗ 40] ✓ tests\test_toolsets.py (25✓, 5.9s)
+[ 40.1% |   593/~1480 | ✓584 | ✗ 40] ✓ tests\test_transform_llm_output_hook.py (4✓, 5.2s)
+[ 40.6% |   601/~1480 | ✓592 | ✗ 40] ✓ tests\test_transform_api_error_classification_hook.py (8✓, 5.7s)
+[ 41.0% |   607/~1480 | ✓598 | ✗ 40] ✓ tests\test_tui_entry_mcp_owner.py (6✓, 4.0s)
+[ 41.4% |   613/~1480 | ✓604 | ✗ 40] ✓ tests\test_tui_gateway_loop_noise.py (6✓, 3.7s)
+[ 41.6% |   615/~1480 | ✓606 | ✗ 40] ✓ tests\test_tui_gateway_server_crash_history.py (2✓, 3.6s)
+[ 42.1% |   623/~1480 | ✓612 | ✗ 42] ✗ tests\test_trajectory_compressor_async.py (6✓ 2✗, 6.2s)
+
+  ╔╍ Failed: tests\test_trajectory_compressor_async.py ╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍
+  ║                    ^^^^^^^^
+  ║ E           UnicodeDecodeError: 'gbk' codec can't decode byte 0x85 in position 14979: illegal multibyte sequence
+  ║ 
+  ║ tests\test_trajectory_compressor_async.py:94: UnicodeDecodeError
+  ║ _______ TestSourceLineVerification.test_get_async_client_method_exists ________
+  ║ 
+  ║ self = <tests.test_trajectory_compressor_async.TestSourceLineVerification object at 0x000002C9AB70CBD0>
+  ║ 
+  ║     def test_get_async_client_method_exists(self):
+  ║         """_get_async_client method should exist."""
+  ║ >       src = self._read_file()
+  ║               ^^^^^^^^^^^^^^^^^
+  ║ 
+  ║ tests\test_trajectory_compressor_async.py:114: 
+  ║ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _
+  ║ 
+  ║     @staticmethod
+  ║     def _read_file() -> str:
+  ║         import os
+  ║         base = os.path.dirname(os.path.dirname(__file__))
+  ║         with open(os.path.join(base, "trajectory_compressor.py")) as f:
+  ║ >           return f.read()
+  ║                    ^^^^^^^^
+  ║ E           UnicodeDecodeError: 'gbk' codec can't decode byte 0x85 in position 14979: illegal multibyte sequence
+  ║ 
+  ║ tests\test_trajectory_compressor_async.py:94: UnicodeDecodeError
+  ║ =========================== short test summary info ===========================
+  ║ FAILED tests/test_trajectory_compressor_async.py::TestSourceLineVerification::test_no_eager_async_openai_in_init
+  ║ FAILED tests/test_trajectory_compressor_async.py::TestSourceLineVerification::test_get_async_client_method_exists
+  ║ ========================= 2 failed, 6 passed in 4.34s =========================
+  ║
+  ║  Repro: python -m pytest tests\test_trajectory_compressor_async.py
+  ╚╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍
+
+[ 42.5% |   629/~1480 | ✓618 | ✗ 42] ✓ tests\test_tui_gateway_ws.py (6✓, 3.9s)
+[ 43.6% |   645/~1480 | ✓630 | ✗ 43] ✗ tests\test_state_db_malformed_repair.py (12✓ 1✗ 3s, 12.9s)
+
+  ╔╍ Failed: tests\test_state_db_malformed_repair.py ╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍
+  ║ 
+  ║ ================================== FAILURES ===================================
+  ║ __________________ test_repair_rebuilds_stale_btree_indexes ___________________
+  ║ 
+  ║ tmp_path = WindowsPath('C:/Users/given/AppData/Local/Temp/pytest-of-given/pytest-44647/test_repair_rebuilds_stale_btr0')
+  ║ 
+  ║     def test_repair_rebuilds_stale_btree_indexes(tmp_path):
+  ║         """repair_state_db_schema repairs a REAL stale B-tree index via REINDEX.
+  ║     
+  ║         End-to-end, no mocks: a genuinely stale index (empty b-tree under a full
+  ║         index definition �� the #63386 'wrong # of entries in index' class) is
+  ║         detected by the real _db_opens_cleanly, repaired by Strategy 0.5
+  ║         (REINDEX), and the DB verifies clean afterwards with real integrity
+  ║         checks.
+  ║         """
+  ║         db_path = tmp_path / "state.db"
+  ║         _build_healthy_db(db_path)
+  ║     
+  ║         _corrupt_btree_index(db_path, "idx_messages_session")
+  ║     
+  ║         # The real detector must see the real corruption...
+  ║         reason = hermes_state._db_opens_cleanly(db_path)
+  ║         assert reason is not None
+  ║ >       assert "wrong # of entries in index idx_messages_session" in reason
+  ║ E       AssertionError: assert 'wrong # of entries in index idx_messages_session' in 'row 1 missing from index idx_messages_session; row 2 missing from index idx_messages_session; row 3 missing from index idx_messages_session'
+  ║ 
+  ║ tests\test_state_db_malformed_repair.py:364: AssertionError
+  ║ =========================== short test summary info ===========================
+  ║ FAILED tests/test_state_db_malformed_repair.py::test_repair_rebuilds_stale_btree_indexes
+  ║ ================== 1 failed, 12 passed, 3 skipped in 11.24s ===================
+  ║
+  ║  Repro: python -m pytest tests\test_state_db_malformed_repair.py
+  ╚╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍
+
+[ 45.7% |   676/~1480 | ✓661 | ✗ 43] ✓ tests\test_tui_gateway_queue_on_busy.py (31✓, 5.9s)
+[ 46.4% |   687/~1480 | ✓671 | ✗ 43] ✓ tests\test_utils_atomic_roundtrip_yaml_save.py (10✓ 1s, 3.3s)
+[ 47.0% |   696/~1480 | ✓676 | ✗ 43] ✓ tests\test_utils_secret_write.py (5✓ 4s, 3.7s)
+[ 47.3% |   700/~1480 | ✓680 | ✗ 43] ✓ tests\test_utils_truthy_values.py (4✓, 3.6s)
+[ 47.5% |   703/~1480 | ✓683 | ✗ 43] ✓ tests\test_voice_max_recording_seconds.py (3✓, 3.6s)
+[ 47.9% |   709/~1480 | ✓689 | ✗ 43] ✓ tests\test_tui_mcp_late_refresh.py (6✓, 6.2s)
+[ 48.2% |   714/~1480 | ✓694 | ✗ 43] ✓ tests\test_transform_tool_result_hook.py (5✓, 9.3s)
+[ 48.7% |   721/~1480 | ✓701 | ✗ 43] ✓ tests\test_yaml_indent_consistency_31999.py (7✓, 3.2s)
+[ 49.4% |   731/~1480 | ✓711 | ✗ 43] ✓ tests\test_windows_subprocess_no_window_flags.py (10✓, 4.0s)
+[ 50.5% |   747/~1480 | ✓727 | ✗ 43] ✓ tests\test_yuanbao_integration.py (16✓, 4.4s)
+[ 50.7% |   751/~1480 | ✓731 | ✗ 43] ✓ tests\test_web_server_status_topology_cache.py (4✓, 6.8s)
+[ 52.3% |   774/~1480 | ✓754 | ✗ 43] ✓ tests\test_yuanbao_proto.py (23✓, 4.1s)
+[ 53.4% |   790/~1480 | ✓770 | ✗ 43] ✓ tests\test_yuanbao_markdown.py (16✓, 4.2s)
+[ 53.6% |   793/~1480 | ✓773 | ✗ 43] ✓ tests\test_web_server_sessiondb_eventloop.py (3✓, 7.8s)
+[ 54.2% |   802/~1480 | ✓781 | ✗ 44] ✗ tests\test_web_server.py (8✓ 1✗, 8.0s)
+
+  ╔╍ Failed: tests\test_web_server.py ╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍
+  ║         _stub_uvicorn(monkeypatch)
+  ║     
+  ║         # If the Windows branch were taken, the loop-factory runner would fire.
+  ║         runner_called = {"hit": False}
+  ║     
+  ║         def _fake_runner(coro, *, loop_factory=None):
+  ║             runner_called["hit"] = True
+  ║             coro.close()
+  ║     
+  ║         monkeypatch.setattr("uvicorn._compat.asyncio_run", _fake_runner, raising=False)
+  ║     
+  ║         bare_called = {"hit": False}
+  ║     
+  ║         def _fake_asyncio_run(coro):
+  ║             bare_called["hit"] = True
+  ║             coro.close()
+  ║             return None
+  ║     
+  ║         monkeypatch.setattr(asyncio, "run", _fake_asyncio_run)
+  ║     
+  ║         web_server.start_server(host="127.0.0.1", port=0, open_browser=False)
+  ║     
+  ║ >       assert bare_called["hit"] is True, "POSIX must serve via bare asyncio.run"
+  ║ E       AssertionError: POSIX must serve via bare asyncio.run
+  ║ E       assert False is True
+  ║ 
+  ║ tests\test_web_server.py:243: AssertionError
+  ║ =========================== short test summary info ===========================
+  ║ FAILED tests/test_web_server.py::test_start_server_keeps_bare_asyncio_run_on_posix
+  ║ ========================= 1 failed, 8 passed in 6.05s =========================
+  ║
+  ║  Repro: python -m pytest tests\test_web_server.py
+  ╚╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍
+
+[ 54.7% |   810/~1480 | ✓789 | ✗ 44] ✓ tests\test_wal_checkpoint_strategy.py (8✓, 8.5s)
+[ 54.9% |   813/~1480 | ✓792 | ✗ 44] ✓ tests\test_yuanbao_shutdown.py (3✓, 4.0s)
+[ 55.1% |   815/~1480 | ✓794 | ✗ 44] ✓ tests\test_yuanbao_reconnect_set_active.py (2✓, 5.3s)
+[ 58.8% |   870/~1480 | ✓864 | ✗ 44] ✓ tests\test_yuanbao_pipeline.py (70✓, 5.7s)
+[ 59.3% |   877/~1480 | ✓871 | ✗ 44] ✓ tests\test_sqlite_lock_safe_inspection.py (7✓, 22.5s)
+[ 59.5% |   881/~1480 | ✓875 | ✗ 44] ✓ tests\test_zeroed_state_db.py (4✓, 8.6s)
+[ 60.3% |   892/~1480 | ✓900 | ✗ 44] ✓ tests\test_sqlite_wal_reset_gate.py (25✓, 29.2s)
+[ 61.4% |   908/~1480 | ✓904 | ✗ 49] ✗ tests\test_run_tests_parallel.py (4✓ 5✗ 1s, 60.3s)
+
+  ╔╍ Failed: tests\test_run_tests_parallel.py ╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍
+  ║   
+  ║   Enable tracemalloc to get traceback where the object was allocated.
+  ║   See https://docs.pytest.org/en/stable/how-to/capture-warnings.html#resource-warnings for more info.
+  ║     warnings.warn(pytest.PytestUnhandledThreadExceptionWarning(msg))
+  ║ 
+  ║ tests/test_run_tests_parallel.py::test_explicit_k_wins_over_node_id_inference
+  ║   C:\Users\given\hermes-audit\hermes-agent\.venv\Lib\site-packages\_pytest\threadexception.py:58: PytestUnhandledThreadExceptionWarning: Exception in thread Thread-7 (_readerthread)
+  ║   
+  ║   Traceback (most recent call last):
+  ║     File "C:\Users\given\AppData\Local\Programs\Python\Python311\Lib\threading.py", line 1045, in _bootstrap_inner
+  ║       self.run()
+  ║     File "C:\Users\given\AppData\Local\Programs\Python\Python311\Lib\threading.py", line 982, in run
+  ║       self._target(*self._args, **self._kwargs)
+  ║     File "C:\Users\given\AppData\Local\Programs\Python\Python311\Lib\subprocess.py", line 1599, in _readerthread
+  ║       buffer.append(fh.read())
+  ║                     ^^^^^^^^^
+  ║   UnicodeDecodeError: 'gbk' codec can't decode byte 0x93 in position 447: illegal multibyte sequence
+  ║   
+  ║   Enable tracemalloc to get traceback where the object was allocated.
+  ║   See https://docs.pytest.org/en/stable/how-to/capture-warnings.html#resource-warnings for more info.
+  ║     warnings.warn(pytest.PytestUnhandledThreadExceptionWarning(msg))
+  ║ 
+  ║ -- Docs: https://docs.pytest.org/en/stable/how-to/capture-warnings.html
+  ║ =========================== short test summary info ===========================
+  ║ FAILED tests/test_run_tests_parallel.py::test_progress_output_tolerates_legacy_stdout_encoding
+  ║ FAILED tests/test_run_tests_parallel.py::test_bare_value_flag_keeps_its_value
+  ║ FAILED tests/test_run_tests_parallel.py::test_file_retry_self_heals_and_prints_both_attempts
+  ║ FAILED tests/test_run_tests_parallel.py::test_node_id_selector_runs_the_named_test
+  ║ FAILED tests/test_run_tests_parallel.py::test_explicit_k_wins_over_node_id_inference
+  ║ ============= 5 failed, 4 passed, 1 skipped, 4 warnings in 58.93s =============
+  ║
+  ║  Repro: python -m pytest tests\test_run_tests_parallel.py
+  ╚╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍
+
+[100.0% |  1480/~1480 | ✓904 | ✗ 49] ✗ tests\test_tui_gateway_server.py (572 tests, 90.2s)
+
+  ╔╍ Failed: tests\test_tui_gateway_server.py ╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍
+  ║ (90s exceeded; process tree SIGKILL'd)
+  ║ ============================= test session starts =============================
+  ║ platform win32 -- Python 3.11.9, pytest-9.1.1, pluggy-1.6.0
+  ║ rootdir: C:\Users\given\hermes-audit\hermes-agent
+  ║ configfile: pyproject.toml
+  ║ plugins: anyio-4.12.1, asyncio-1.3.0
+  ║ asyncio: mode=Mode.STRICT, debug=False, asyncio_default_fixture_loop_scope=None, asyncio_default_test_loop_scope=function
+  ║ collected 585 items
+  ║ 
+  ║ tests\test_tui_gateway_server.py ....................................... [  6%]
+  ║ ........................................................................ [ 18%]
+  ║ ........................................................................ [ 31%]
+  ║ ........................................................................ [ 43%]
+  ║ ........................................................................ [ 55%]
+  ║
+  ║  Repro: python -m pytest tests\test_tui_gateway_server.py
+  ╚╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍
+
+
+=== Summary: 93 files, 904 tests passed, 49 failed, 28 skipped (100% complete) in 118.1s (16 workers) ===
+
+  note: linux_only tests (in 1 file) were SKIPPED on this host (win32); they run on the main Linux CI lane.
+  Durations cached to test_durations.json (93 files)
+
+=== Per-file subprocess time distribution ===
+  Files:   93
+  Total subprocess CPU-wall: 756.6s  (runner wall: 118.1s, parallelism: 16x)
+  P50: 5.11s  P90: 12.91s  P95: 23.36s  P99: 90.17s  Max: 90.17s
+  <1s: 0 files (0%)  <2s: 0 files (0%)
+  Top 10 slowest:
+     90.17s  tests\test_tui_gateway_server.py
+     60.31s  tests\test_run_tests_parallel.py
+     29.25s  tests\test_sqlite_wal_reset_gate.py
+     24.67s  tests\test_no_shadowed_test_definitions.py
+     23.36s  tests\test_managed_runtime_resolution.py
+     22.51s  tests\test_sqlite_lock_safe_inspection.py
+     20.70s  tests\test_model_tools.py
+     18.47s  tests\test_plugin_skills.py
+     17.81s  tests\test_mcp_serve.py
+     12.91s  tests\test_state_db_malformed_repair.py
+
+=== Failure output ===
+
+--- tests\test_minimax_oauth.py ---
+============================= test session starts =============================
+platform win32 -- Python 3.11.9, pytest-9.1.1, pluggy-1.6.0
+rootdir: C:\Users\given\hermes-audit\hermes-agent
+configfile: pyproject.toml
+plugins: anyio-4.12.1, asyncio-1.3.0
+asyncio: mode=Mode.STRICT, debug=False, asyncio_default_fixture_loop_scope=None, asyncio_default_test_loop_scope=function
+collected 14 items
+
+tests\test_minimax_oauth.py ............F.                               [100%]
+
+================================== FAILURES ===================================
+________ test_refresh_error_body_bounded_and_readable_with_real_client ________
+
+    @contextlib.contextmanager
+    def map_httpcore_exceptions() -> typing.Iterator[None]:
+        global HTTPCORE_EXC_MAP
+        if len(HTTPCORE_EXC_MAP) == 0:
+            HTTPCORE_EXC_MAP = _load_httpcore_exceptions()
+        try:
+>           yield
+
+.venv\Lib\site-packages\httpx\_transports\default.py:101: 
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _
+.venv\Lib\site-packages\httpx\_transports\default.py:250: in handle_request
+    resp = self._pool.handle_request(req)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+.venv\Lib\site-packages\httpcore\_sync\connection_pool.py:256: in handle_request
+    raise exc from None
+.venv\Lib\site-packages\httpcore\_sync\connection_pool.py:236: in handle_request
+    response = connection.handle_request(
+.venv\Lib\site-packages\httpcore\_sync\connection.py:103: in handle_request
+    return self._connection.handle_request(request)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+.venv\Lib\site-packages\httpcore\_sync\http11.py:136: in handle_request
+    raise exc
+.venv\Lib\site-packages\httpcore\_sync\http11.py:106: in handle_request
+    ) = self._receive_response_headers(**kwargs)
+        ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+.venv\Lib\site-packages\httpcore\_sync\http11.py:177: in _receive_response_headers
+    event = self._receive_event(timeout=timeout)
+            ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+.venv\Lib\site-packages\httpcore\_sync\http11.py:217: in _receive_event
+    data = self._network_stream.read(
+.venv\Lib\site-packages\httpcore\_backends\sync.py:126: in read
+    with map_exceptions(exc_map):
+..\..\AppData\Local\Programs\Python\Python311\Lib\contextlib.py:158: in __exit__
+    self.gen.throw(typ, value, traceback)
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _
+
+map = {<class 'TimeoutError'>: <class 'httpcore.ReadTimeout'>, <class 'OSError'>: <class 'httpcore.ReadError'>}
+
+    @contextlib.contextmanager
+    def map_exceptions(map: ExceptionMapping) -> typing.Iterator[None]:
+        try:
+            yield
+        except Exception as exc:  # noqa: PIE786
+            for from_exc, to_exc in map.items():
+                if isinstance(exc, from_exc):
+>                   raise to_exc(exc) from exc
+E                   httpcore.ReadError: [WinError 10054] Զ������ǿ�ȹر���һ�����е����ӡ�
+
+.venv\Lib\site-packages\httpcore\_exceptions.py:14: ReadError
+
+The above exception was the direct cause of the following exception:
+
+    def test_refresh_error_body_bounded_and_readable_with_real_client():
+        """Refresh non-200 path over a REAL socket transport.
+    
+        The error body is obtained via a streamed response; the bounded read
+        must happen while the client context is still open.  A real socket is
+        required to bind this contract: closing the client tears the connection
+        down, so a read after the ``with httpx.Client(...)`` block raises
+        ReadError/StreamClosed.  (MockTransport buffers in memory and would NOT
+        catch the regression.)
+        """
+        import http.server
+        import socketserver
+        import threading
+    
+        import httpx
+    
+        from hermes_cli.auth import _refresh_minimax_oauth_state
+    
+        big_body = b"invalid_grant " + b"x" * (64 * 1024)  # 64KB error body
+    
+        class Handler(http.server.BaseHTTPRequestHandler):
+            def do_POST(self):
+                self.send_response(400)
+                self.send_header("Content-Length", str(len(big_body)))
+                self.end_headers()
+                self.wfile.write(big_body)
+    
+            def log_message(self, *args):
+                pass
+    
+        with socketserver.TCPServer(("127.0.0.1", 0), Handler) as server:
+            port = server.server_address[1]
+            thread = threading.Thread(target=server.serve_forever, daemon=True)
+            thread.start()
+            try:
+                state = {
+                    "access_token": "expired",
+                    "refresh_token": "burned-rt",
+                    "portal_base_url": f"http://127.0.0.1:{port}",
+                    "client_id": MINIMAX_OAUTH_CLIENT_ID,
+                    "inference_base_url": MINIMAX_OAUTH_GLOBAL_INFERENCE,
+                    "expires_at": _past_iso(100),
+                }
+                with pytest.raises(AuthError) as exc_info:
+>                   _refresh_minimax_oauth_state(state, force=True)
+
+tests\test_minimax_oauth.py:538: 
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _
+hermes_cli\auth.py:8715: in _refresh_minimax_oauth_state
+    response = _minimax_post_form(
+hermes_cli\auth.py:8462: in _minimax_post_form
+    response = client.send(request, stream=True)
+               ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+.venv\Lib\site-packages\httpx\_client.py:914: in send
+    response = self._send_handling_auth(
+.venv\Lib\site-packages\httpx\_client.py:942: in _send_handling_auth
+    response = self._send_handling_redirects(
+.venv\Lib\site-packages\httpx\_client.py:979: in _send_handling_redirects
+    response = self._send_single_request(request)
+               ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+.venv\Lib\site-packages\httpx\_client.py:1014: in _send_single_request
+    response = transport.handle_request(request)
+               ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+.venv\Lib\site-packages\httpx\_transports\default.py:249: in handle_request
+    with map_httpcore_exceptions():
+..\..\AppData\Local\Programs\Python\Python311\Lib\contextlib.py:158: in __exit__
+    self.gen.throw(typ, value, traceback)
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _
+
+    @contextlib.contextmanager
+    def map_httpcore_exceptions() -> typing.Iterator[None]:
+        global HTTPCORE_EXC_MAP
+        if len(HTTPCORE_EXC_MAP) == 0:
+            HTTPCORE_EXC_MAP = _load_httpcore_exceptions()
+        try:
+            yield
+        except Exception as exc:
+            mapped_exc = None
+    
+            for from_exc, to_exc in HTTPCORE_EXC_MAP.items():
+                if not isinstance(exc, from_exc):
+                    continue
+                # We want to map to the most specific exception we can find.
+                # Eg if `exc` is an `httpcore.ReadTimeout`, we want to map to
+                # `httpx.ReadTimeout`, not just `httpx.TimeoutException`.
+                if mapped_exc is None or issubclass(to_exc, mapped_exc):
+                    mapped_exc = to_exc
+    
+            if mapped_exc is None:  # pragma: no cover
+                raise
+    
+            message = str(exc)
+>           raise mapped_exc(message) from exc
+E           httpx.ReadError: [WinError 10054] Զ������ǿ�ȹر���һ�����е����ӡ�
+
+.venv\Lib\site-packages\httpx\_transports\default.py:118: ReadError
+=========================== short test summary info ===========================
+FAILED tests/test_minimax_oauth.py::test_refresh_error_body_bounded_and_readable_with_real_client
+======================== 1 failed, 13 passed in 6.10s =========================
+
+--- tests\test_packaging_build_guard.py ---
+============================= test session starts =============================
+platform win32 -- Python 3.11.9, pytest-9.1.1, pluggy-1.6.0
+rootdir: C:\Users\given\hermes-audit\hermes-agent
+configfile: pyproject.toml
+plugins: anyio-4.12.1, asyncio-1.3.0
+asyncio: mode=Mode.STRICT, debug=False, asyncio_default_fixture_loop_scope=None, asyncio_default_test_loop_scope=function
+collected 4 items
+
+tests\test_packaging_build_guard.py FFFF                                 [100%]
+
+================================== FAILURES ===================================
+____ test_artifact_build_rejects_nix_development_shell_environment[sdist] _____
+
+kind = 'sdist'
+tmp_path = WindowsPath('C:/Users/given/AppData/Local/Temp/pytest-of-given/pytest-44611/test_artifact_build_rejects_ni0')
+
+    @pytest.mark.parametrize("kind", ["sdist", "wheel"])
+    def test_artifact_build_rejects_nix_development_shell_environment(kind, tmp_path):
+        result = _build_artifact(kind, tmp_path, nix_build=False)
+    
+        assert result.returncode != 0
+>       assert "Building wheels or sdists for hermes-agent is not supported" in result.stderr
+E       assert 'Building wheels or sdists for hermes-agent is not supported' in 'Traceback (most recent call last):\n  File "<string>", line 1, in <module>\nModuleNotFoundError: No module named \'setuptools\'\n'
+E        +  where 'Traceback (most recent call last):\n  File "<string>", line 1, in <module>\nModuleNotFoundError: No module named \'setuptools\'\n' = CompletedProcess(args=['C:\\Users\\given\\hermes-audit\\hermes-agent\\.venv\\Scripts\\python.exe', '-c', "from setupto...ost recent call last):\n  File "<string>", line 1, in <module>\nModuleNotFoundError: No module named \'setuptools\'\n').stderr
+
+tests\test_packaging_build_guard.py:63: AssertionError
+____ test_artifact_build_rejects_nix_development_shell_environment[wheel] _____
+
+kind = 'wheel'
+tmp_path = WindowsPath('C:/Users/given/AppData/Local/Temp/pytest-of-given/pytest-44611/test_artifact_build_rejects_ni1')
+
+    @pytest.mark.parametrize("kind", ["sdist", "wheel"])
+    def test_artifact_build_rejects_nix_development_shell_environment(kind, tmp_path):
+        result = _build_artifact(kind, tmp_path, nix_build=False)
+    
+        assert result.returncode != 0
+>       assert "Building wheels or sdists for hermes-agent is not supported" in result.stderr
+E       assert 'Building wheels or sdists for hermes-agent is not supported' in 'Traceback (most recent call last):\n  File "<string>", line 1, in <module>\nModuleNotFoundError: No module named \'setuptools\'\n'
+E        +  where 'Traceback (most recent call last):\n  File "<string>", line 1, in <module>\nModuleNotFoundError: No module named \'setuptools\'\n' = CompletedProcess(args=['C:\\Users\\given\\hermes-audit\\hermes-agent\\.venv\\Scripts\\python.exe', '-c', "from setupto...ost recent call last):\n  File "<string>", line 1, in <module>\nModuleNotFoundError: No module named \'setuptools\'\n').stderr
+
+tests\test_packaging_build_guard.py:63: AssertionError
+_ test_artifact_build_allows_explicit_nix_package_build_marker[sdist-hermes_agent-*.tar.gz] _
+
+kind = 'sdist', artifact_glob = 'hermes_agent-*.tar.gz'
+tmp_path = WindowsPath('C:/Users/given/AppData/Local/Temp/pytest-of-given/pytest-44611/test_artifact_build_allows_exp0')
+
+    @pytest.mark.parametrize(
+        ("kind", "artifact_glob"),
+        [("sdist", "hermes_agent-*.tar.gz"), ("wheel", "hermes_agent-*.whl")],
+    )
+    def test_artifact_build_allows_explicit_nix_package_build_marker(kind, artifact_glob, tmp_path):
+        result = _build_artifact(kind, tmp_path, nix_build=True)
+    
+>       assert result.returncode == 0, result.stderr
+E       AssertionError: Traceback (most recent call last):
+E           File "<string>", line 1, in <module>
+E         ModuleNotFoundError: No module named 'setuptools'
+E         
+E       assert 1 == 0
+E        +  where 1 = CompletedProcess(args=['C:\\Users\\given\\hermes-audit\\hermes-agent\\.venv\\Scripts\\python.exe', '-c', "from setupto...ost recent call last):\n  File "<string>", line 1, in <module>\nModuleNotFoundError: No module named \'setuptools\'\n').returncode
+
+tests\test_packaging_build_guard.py:73: AssertionError
+_ test_artifact_build_allows_explicit_nix_package_build_marker[wheel-hermes_agent-*.whl] _
+
+kind = 'wheel', artifact_glob = 'hermes_agent-*.whl'
+tmp_path = WindowsPath('C:/Users/given/AppData/Local/Temp/pytest-of-given/pytest-44611/test_artifact_build_allows_exp1')
+
+    @pytest.mark.parametrize(
+        ("kind", "artifact_glob"),
+        [("sdist", "hermes_agent-*.tar.gz"), ("wheel", "hermes_agent-*.whl")],
+    )
+    def test_artifact_build_allows_explicit_nix_package_build_marker(kind, artifact_glob, tmp_path):
+        result = _build_artifact(kind, tmp_path, nix_build=True)
+    
+>       assert result.returncode == 0, result.stderr
+E       AssertionError: Traceback (most recent call last):
+E           File "<string>", line 1, in <module>
+E         ModuleNotFoundError: No module named 'setuptools'
+E         
+E       assert 1 == 0
+E        +  where 1 = CompletedProcess(args=['C:\\Users\\given\\hermes-audit\\hermes-agent\\.venv\\Scripts\\python.exe', '-c', "from setupto...ost recent call last):\n  File "<string>", line 1, in <module>\nModuleNotFoundError: No module named \'setuptools\'\n').returncode
+
+tests\test_packaging_build_guard.py:73: AssertionError
+=========================== short test summary info ===========================
+FAILED tests/test_packaging_build_guard.py::test_artifact_build_rejects_nix_development_shell_environment[sdist]
+FAILED tests/test_packaging_build_guard.py::test_artifact_build_rejects_nix_development_shell_environment[wheel]
+FAILED tests/test_packaging_build_guard.py::test_artifact_build_allows_explicit_nix_package_build_marker[sdist-hermes_agent-*.tar.gz]
+FAILED tests/test_packaging_build_guard.py::test_artifact_build_allows_explicit_nix_package_build_marker[wheel-hermes_agent-*.whl]
+============================== 4 failed in 2.45s ==============================
+
+--- tests\test_prompt_consistency.py ---
+============================= test session starts =============================
+platform win32 -- Python 3.11.9, pytest-9.1.1, pluggy-1.6.0
+rootdir: C:\Users\given\hermes-audit\hermes-agent
+configfile: pyproject.toml
+plugins: anyio-4.12.1, asyncio-1.3.0
+asyncio: mode=Mode.STRICT, debug=False, asyncio_default_fixture_loop_scope=None, asyncio_default_test_loop_scope=function
+collected 38 items
+
+tests\test_prompt_consistency.py FFFFFFFFFFFFFFFFFFFF..........FFFF....  [100%]
+
+================================== FAILURES ===================================
+________ test_kanban_guidance_mentions_capability[acceptance criteria] ________
+
+capability = 'acceptance criteria'
+
+    @pytest.mark.parametrize("capability", sorted(CAPABILITIES))
+    def test_kanban_guidance_mentions_capability(capability: str) -> None:
+        keywords = CAPABILITIES[capability]
+>       assert any(keyword in KANBAN_GUIDANCE for keyword in keywords), (
+            f"KANBAN_GUIDANCE missing capability '{capability}' "
+            f"(expected one of {keywords})"
+        )
+E       AssertionError: KANBAN_GUIDANCE missing capability 'acceptance criteria' (expected one of ('acceptance_criteria',))
+E       assert False
+E        +  where False = any(<generator object test_kanban_guidance_mentions_capability.<locals>.<genexpr> at 0x000001676960F780>)
+
+tests\test_prompt_consistency.py:65: AssertionError
+_______ test_kanban_guidance_mentions_capability[choice option format] ________
+
+capability = 'choice option format'
+
+    @pytest.mark.parametrize("capability", sorted(CAPABILITIES))
+    def test_kanban_guidance_mentions_capability(capability: str) -> None:
+        keywords = CAPABILITIES[capability]
+>       assert any(keyword in KANBAN_GUIDANCE for keyword in keywords), (
+            f"KANBAN_GUIDANCE missing capability '{capability}' "
+            f"(expected one of {keywords})"
+        )
+E       AssertionError: KANBAN_GUIDANCE missing capability 'choice option format' (expected one of ('ѡ��', 'A. ', 'A��'))
+E       assert False
+E        +  where False = any(<generator object test_kanban_guidance_mentions_capability.<locals>.<genexpr> at 0x000001676987F780>)
+
+tests\test_prompt_consistency.py:65: AssertionError
+_____ test_kanban_guidance_mentions_capability[expected output contract] ______
+
+capability = 'expected output contract'
+
+    @pytest.mark.parametrize("capability", sorted(CAPABILITIES))
+    def test_kanban_guidance_mentions_capability(capability: str) -> None:
+        keywords = CAPABILITIES[capability]
+>       assert any(keyword in KANBAN_GUIDANCE for keyword in keywords), (
+            f"KANBAN_GUIDANCE missing capability '{capability}' "
+            f"(expected one of {keywords})"
+        )
+E       AssertionError: KANBAN_GUIDANCE missing capability 'expected output contract' (expected one of ('expected_output',))
+E       assert False
+E        +  where False = any(<generator object test_kanban_guidance_mentions_capability.<locals>.<genexpr> at 0x00000167698ECEE0>)
+
+tests\test_prompt_consistency.py:65: AssertionError
+_________ test_kanban_guidance_mentions_capability[needs_input block] _________
+
+capability = 'needs_input block'
+
+    @pytest.mark.parametrize("capability", sorted(CAPABILITIES))
+    def test_kanban_guidance_mentions_capability(capability: str) -> None:
+        keywords = CAPABILITIES[capability]
+>       assert any(keyword in KANBAN_GUIDANCE for keyword in keywords), (
+            f"KANBAN_GUIDANCE missing capability '{capability}' "
+            f"(expected one of {keywords})"
+        )
+E       AssertionError: KANBAN_GUIDANCE missing capability 'needs_input block' (expected one of ('needs_input',))
+E       assert False
+E        +  where False = any(<generator object test_kanban_guidance_mentions_capability.<locals>.<genexpr> at 0x00000167698EE740>)
+
+tests\test_prompt_consistency.py:65: AssertionError
+_______ test_kanban_guidance_mentions_capability[selective inheritance] _______
+
+capability = 'selective inheritance'
+
+    @pytest.mark.parametrize("capability", sorted(CAPABILITIES))
+    def test_kanban_guidance_mentions_capability(capability: str) -> None:
+        keywords = CAPABILITIES[capability]
+>       assert any(keyword in KANBAN_GUIDANCE for keyword in keywords), (
+            f"KANBAN_GUIDANCE missing capability '{capability}' "
+            f"(expected one of {keywords})"
+        )
+E       AssertionError: KANBAN_GUIDANCE missing capability 'selective inheritance' (expected one of ('inherit_turns',))
+E       assert False
+E        +  where False = any(<generator object test_kanban_guidance_mentions_capability.<locals>.<genexpr> at 0x00000167699586C0>)
+
+tests\test_prompt_consistency.py:65: AssertionError
+_____ test_kanban_guidance_mentions_capability[shared context variables] ______
+
+capability = 'shared context variables'
+
+    @pytest.mark.parametrize("capability", sorted(CAPABILITIES))
+    def test_kanban_guidance_mentions_capability(capability: str) -> None:
+        keywords = CAPABILITIES[capability]
+>       assert any(keyword in KANBAN_GUIDANCE for keyword in keywords), (
+            f"KANBAN_GUIDANCE missing capability '{capability}' "
+            f"(expected one of {keywords})"
+        )
+E       AssertionError: KANBAN_GUIDANCE missing capability 'shared context variables' (expected one of ('context_variables',))
+E       assert False
+E        +  where False = any(<generator object test_kanban_guidance_mentions_capability.<locals>.<genexpr> at 0x00000167698ED700>)
+
+tests\test_prompt_consistency.py:65: AssertionError
+___________ test_kanban_guidance_mentions_capability[subagent kill] ___________
+
+capability = 'subagent kill'
+
+    @pytest.mark.parametrize("capability", sorted(CAPABILITIES))
+    def test_kanban_guidance_mentions_capability(capability: str) -> None:
+        keywords = CAPABILITIES[capability]
+>       assert any(keyword in KANBAN_GUIDANCE for keyword in keywords), (
+            f"KANBAN_GUIDANCE missing capability '{capability}' "
+            f"(expected one of {keywords})"
+        )
+E       AssertionError: KANBAN_GUIDANCE missing capability 'subagent kill' (expected one of ('subagent_kill',))
+E       assert False
+E        +  where False = any(<generator object test_kanban_guidance_mentions_capability.<locals>.<genexpr> at 0x000001676987C380>)
+
+tests\test_prompt_consistency.py:65: AssertionError
+___________ test_kanban_guidance_mentions_capability[subagent list] ___________
+
+capability = 'subagent list'
+
+    @pytest.mark.parametrize("capability", sorted(CAPABILITIES))
+    def test_kanban_guidance_mentions_capability(capability: str) -> None:
+        keywords = CAPABILITIES[capability]
+>       assert any(keyword in KANBAN_GUIDANCE for keyword in keywords), (
+            f"KANBAN_GUIDANCE missing capability '{capability}' "
+            f"(expected one of {keywords})"
+        )
+E       AssertionError: KANBAN_GUIDANCE missing capability 'subagent list' (expected one of ('subagent_list',))
+E       assert False
+E        +  where False = any(<generator object test_kanban_guidance_mentions_capability.<locals>.<genexpr> at 0x00000167698EDCB0>)
+
+tests\test_prompt_consistency.py:65: AssertionError
+__________ test_kanban_guidance_mentions_capability[subagent naming] __________
+
+capability = 'subagent naming'
+
+    @pytest.mark.parametrize("capability", sorted(CAPABILITIES))
+    def test_kanban_guidance_mentions_capability(capability: str) -> None:
+        keywords = CAPABILITIES[capability]
+>       assert any(keyword in KANBAN_GUIDANCE for keyword in keywords), (
+            f"KANBAN_GUIDANCE missing capability '{capability}' "
+            f"(expected one of {keywords})"
+        )
+E       AssertionError: KANBAN_GUIDANCE missing capability 'subagent naming' (expected one of ('name',))
+E       assert False
+E        +  where False = any(<generator object test_kanban_guidance_mentions_capability.<locals>.<genexpr> at 0x0000016769959490>)
+
+tests\test_prompt_consistency.py:65: AssertionError
+_________ test_kanban_guidance_mentions_capability[subagent steering] _________
+
+capability = 'subagent steering'
+
+    @pytest.mark.parametrize("capability", sorted(CAPABILITIES))
+    def test_kanban_guidance_mentions_capability(capability: str) -> None:
+        keywords = CAPABILITIES[capability]
+>       assert any(keyword in KANBAN_GUIDANCE for keyword in keywords), (
+            f"KANBAN_GUIDANCE missing capability '{capability}' "
+            f"(expected one of {keywords})"
+        )
+E       AssertionError: KANBAN_GUIDANCE missing capability 'subagent steering' (expected one of ('subagent_send',))
+E       assert False
+E        +  where False = any(<generator object test_kanban_guidance_mentions_capability.<locals>.<genexpr> at 0x000001676995C040>)
+
+tests\test_prompt_consistency.py:65: AssertionError
+________ test_manager_prompt_mentions_capability[acceptance criteria] _________
+
+capability = 'acceptance criteria'
+
+    @pytest.mark.parametrize("capability", sorted(CAPABILITIES))
+    def test_manager_prompt_mentions_capability(capability: str) -> None:
+        keywords = CAPABILITIES[capability]
+        manager_prompt = _surfaces()["manager_prompt"]
+>       assert any(keyword in manager_prompt for keyword in keywords), (
+            f"manager prompt missing capability '{capability}' "
+            f"(expected one of {keywords})"
+        )
+E       AssertionError: manager prompt missing capability 'acceptance criteria' (expected one of ('acceptance_criteria',))
+E       assert False
+E        +  where False = any(<generator object test_manager_prompt_mentions_capability.<locals>.<genexpr> at 0x000001676993C200>)
+
+tests\test_prompt_consistency.py:75: AssertionError
+________ test_manager_prompt_mentions_capability[choice option format] ________
+
+capability = 'choice option format'
+
+    @pytest.mark.parametrize("capability", sorted(CAPABILITIES))
+    def test_manager_prompt_mentions_capability(capability: str) -> None:
+        keywords = CAPABILITIES[capability]
+        manager_prompt = _surfaces()["manager_prompt"]
+>       assert any(keyword in manager_prompt for keyword in keywords), (
+            f"manager prompt missing capability '{capability}' "
+            f"(expected one of {keywords})"
+        )
+E       AssertionError: manager prompt missing capability 'choice option format' (expected one of ('ѡ��', 'A. ', 'A��'))
+E       assert False
+E        +  where False = any(<generator object test_manager_prompt_mentions_capability.<locals>.<genexpr> at 0x00000167698DBAE0>)
+
+tests\test_prompt_consistency.py:75: AssertionError
+______ test_manager_prompt_mentions_capability[expected output contract] ______
+
+capability = 'expected output contract'
+
+    @pytest.mark.parametrize("capability", sorted(CAPABILITIES))
+    def test_manager_prompt_mentions_capability(capability: str) -> None:
+        keywords = CAPABILITIES[capability]
+        manager_prompt = _surfaces()["manager_prompt"]
+>       assert any(keyword in manager_prompt for keyword in keywords), (
+            f"manager prompt missing capability '{capability}' "
+            f"(expected one of {keywords})"
+        )
+E       AssertionError: manager prompt missing capability 'expected output contract' (expected one of ('expected_output',))
+E       assert False
+E        +  where False = any(<generator object test_manager_prompt_mentions_capability.<locals>.<genexpr> at 0x00000167698DBE60>)
+
+tests\test_prompt_consistency.py:75: AssertionError
+_________ test_manager_prompt_mentions_capability[needs_input block] __________
+
+capability = 'needs_input block'
+
+    @pytest.mark.parametrize("capability", sorted(CAPABILITIES))
+    def test_manager_prompt_mentions_capability(capability: str) -> None:
+        keywords = CAPABILITIES[capability]
+        manager_prompt = _surfaces()["manager_prompt"]
+>       assert any(keyword in manager_prompt for keyword in keywords), (
+            f"manager prompt missing capability '{capability}' "
+            f"(expected one of {keywords})"
+        )
+E       AssertionError: manager prompt missing capability 'needs_input block' (expected one of ('needs_input',))
+E       assert False
+E        +  where False = any(<generator object test_manager_prompt_mentions_capability.<locals>.<genexpr> at 0x00000167698D8660>)
+
+tests\test_prompt_consistency.py:75: AssertionError
+_______ test_manager_prompt_mentions_capability[selective inheritance] ________
+
+capability = 'selective inheritance'
+
+    @pytest.mark.parametrize("capability", sorted(CAPABILITIES))
+    def test_manager_prompt_mentions_capability(capability: str) -> None:
+        keywords = CAPABILITIES[capability]
+        manager_prompt = _surfaces()["manager_prompt"]
+>       assert any(keyword in manager_prompt for keyword in keywords), (
+            f"manager prompt missing capability '{capability}' "
+            f"(expected one of {keywords})"
+        )
+E       AssertionError: manager prompt missing capability 'selective inheritance' (expected one of ('inherit_turns',))
+E       assert False
+E        +  where False = any(<generator object test_manager_prompt_mentions_capability.<locals>.<genexpr> at 0x00000167698DAC00>)
+
+tests\test_prompt_consistency.py:75: AssertionError
+______ test_manager_prompt_mentions_capability[shared context variables] ______
+
+capability = 'shared context variables'
+
+    @pytest.mark.parametrize("capability", sorted(CAPABILITIES))
+    def test_manager_prompt_mentions_capability(capability: str) -> None:
+        keywords = CAPABILITIES[capability]
+        manager_prompt = _surfaces()["manager_prompt"]
+>       assert any(keyword in manager_prompt for keyword in keywords), (
+            f"manager prompt missing capability '{capability}' "
+            f"(expected one of {keywords})"
+        )
+E       AssertionError: manager prompt missing capability 'shared context variables' (expected one of ('context_variables',))
+E       assert False
+E        +  where False = any(<generator object test_manager_prompt_mentions_capability.<locals>.<genexpr> at 0x000001676993C120>)
+
+tests\test_prompt_consistency.py:75: AssertionError
+___________ test_manager_prompt_mentions_capability[subagent kill] ____________
+
+capability = 'subagent kill'
+
+    @pytest.mark.parametrize("capability", sorted(CAPABILITIES))
+    def test_manager_prompt_mentions_capability(capability: str) -> None:
+        keywords = CAPABILITIES[capability]
+        manager_prompt = _surfaces()["manager_prompt"]
+>       assert any(keyword in manager_prompt for keyword in keywords), (
+            f"manager prompt missing capability '{capability}' "
+            f"(expected one of {keywords})"
+        )
+E       AssertionError: manager prompt missing capability 'subagent kill' (expected one of ('subagent_kill',))
+E       assert False
+E        +  where False = any(<generator object test_manager_prompt_mentions_capability.<locals>.<genexpr> at 0x000001676993C740>)
+
+tests\test_prompt_consistency.py:75: AssertionError
+___________ test_manager_prompt_mentions_capability[subagent list] ____________
+
+capability = 'subagent list'
+
+    @pytest.mark.parametrize("capability", sorted(CAPABILITIES))
+    def test_manager_prompt_mentions_capability(capability: str) -> None:
+        keywords = CAPABILITIES[capability]
+        manager_prompt = _surfaces()["manager_prompt"]
+>       assert any(keyword in manager_prompt for keyword in keywords), (
+            f"manager prompt missing capability '{capability}' "
+            f"(expected one of {keywords})"
+        )
+E       AssertionError: manager prompt missing capability 'subagent list' (expected one of ('subagent_list',))
+E       assert False
+E        +  where False = any(<generator object test_manager_prompt_mentions_capability.<locals>.<genexpr> at 0x00000167698DB300>)
+
+tests\test_prompt_consistency.py:75: AssertionError
+__________ test_manager_prompt_mentions_capability[subagent naming] ___________
+
+capability = 'subagent naming'
+
+    @pytest.mark.parametrize("capability", sorted(CAPABILITIES))
+    def test_manager_prompt_mentions_capability(capability: str) -> None:
+        keywords = CAPABILITIES[capability]
+        manager_prompt = _surfaces()["manager_prompt"]
+>       assert any(keyword in manager_prompt for keyword in keywords), (
+            f"manager prompt missing capability '{capability}' "
+            f"(expected one of {keywords})"
+        )
+E       AssertionError: manager prompt missing capability 'subagent naming' (expected one of ('name',))
+E       assert False
+E        +  where False = any(<generator object test_manager_prompt_mentions_capability.<locals>.<genexpr> at 0x00000167698D8820>)
+
+tests\test_prompt_consistency.py:75: AssertionError
+_________ test_manager_prompt_mentions_capability[subagent steering] __________
+
+capability = 'subagent steering'
+
+    @pytest.mark.parametrize("capability", sorted(CAPABILITIES))
+    def test_manager_prompt_mentions_capability(capability: str) -> None:
+        keywords = CAPABILITIES[capability]
+        manager_prompt = _surfaces()["manager_prompt"]
+>       assert any(keyword in manager_prompt for keyword in keywords), (
+            f"manager prompt missing capability '{capability}' "
+            f"(expected one of {keywords})"
+        )
+E       AssertionError: manager prompt missing capability 'subagent steering' (expected one of ('subagent_send',))
+E       assert False
+E        +  where False = any(<generator object test_manager_prompt_mentions_capability.<locals>.<genexpr> at 0x00000167698D84A0>)
+
+tests\test_prompt_consistency.py:75: AssertionError
+________ test_delegate_schema_carries_capability[acceptance criteria] _________
+
+capability = 'acceptance criteria'
+
+    @pytest.mark.parametrize("capability", sorted(SCHEMA_CAPABILITIES))
+    def test_delegate_schema_carries_capability(capability: str) -> None:
+        keywords = SCHEMA_CAPABILITIES[capability]
+        schema_text = _surfaces()["DELEGATE_TASK_SCHEMA"]
+>       assert any(keyword in schema_text for keyword in keywords), (
+            f"DELEGATE_TASK_SCHEMA missing parameter for '{capability}' "
+            f"(expected one of {keywords})"
+        )
+E       AssertionError: DELEGATE_TASK_SCHEMA missing parameter for 'acceptance criteria' (expected one of ('acceptance_criteria',))
+E       assert False
+E        +  where False = any(<generator object test_delegate_schema_carries_capability.<locals>.<genexpr> at 0x00000167698DBCA0>)
+
+tests\test_prompt_consistency.py:106: AssertionError
+______ test_delegate_schema_carries_capability[expected output contract] ______
+
+capability = 'expected output contract'
+
+    @pytest.mark.parametrize("capability", sorted(SCHEMA_CAPABILITIES))
+    def test_delegate_schema_carries_capability(capability: str) -> None:
+        keywords = SCHEMA_CAPABILITIES[capability]
+        schema_text = _surfaces()["DELEGATE_TASK_SCHEMA"]
+>       assert any(keyword in schema_text for keyword in keywords), (
+            f"DELEGATE_TASK_SCHEMA missing parameter for '{capability}' "
+            f"(expected one of {keywords})"
+        )
+E       AssertionError: DELEGATE_TASK_SCHEMA missing parameter for 'expected output contract' (expected one of ('expected_output',))
+E       assert False
+E        +  where False = any(<generator object test_delegate_schema_carries_capability.<locals>.<genexpr> at 0x000001676993CD60>)
+
+tests\test_prompt_consistency.py:106: AssertionError
+_______ test_delegate_schema_carries_capability[selective inheritance] ________
+
+capability = 'selective inheritance'
+
+    @pytest.mark.parametrize("capability", sorted(SCHEMA_CAPABILITIES))
+    def test_delegate_schema_carries_capability(capability: str) -> None:
+        keywords = SCHEMA_CAPABILITIES[capability]
+        schema_text = _surfaces()["DELEGATE_TASK_SCHEMA"]
+>       assert any(keyword in schema_text for keyword in keywords), (
+            f"DELEGATE_TASK_SCHEMA missing parameter for '{capability}' "
+            f"(expected one of {keywords})"
+        )
+E       AssertionError: DELEGATE_TASK_SCHEMA missing parameter for 'selective inheritance' (expected one of ('inherit_turns',))
+E       assert False
+E        +  where False = any(<generator object test_delegate_schema_carries_capability.<locals>.<genexpr> at 0x000001676993CE40>)
+
+tests\test_prompt_consistency.py:106: AssertionError
+______ test_delegate_schema_carries_capability[shared context variables] ______
+
+capability = 'shared context variables'
+
+    @pytest.mark.parametrize("capability", sorted(SCHEMA_CAPABILITIES))
+    def test_delegate_schema_carries_capability(capability: str) -> None:
+        keywords = SCHEMA_CAPABILITIES[capability]
+        schema_text = _surfaces()["DELEGATE_TASK_SCHEMA"]
+>       assert any(keyword in schema_text for keyword in keywords), (
+            f"DELEGATE_TASK_SCHEMA missing parameter for '{capability}' "
+            f"(expected one of {keywords})"
+        )
+E       AssertionError: DELEGATE_TASK_SCHEMA missing parameter for 'shared context variables' (expected one of ('context_variables',))
+E       assert False
+E        +  where False = any(<generator object test_delegate_schema_carries_capability.<locals>.<genexpr> at 0x00000167698DBAE0>)
+
+tests\test_prompt_consistency.py:106: AssertionError
+=========================== short test summary info ===========================
+FAILED tests/test_prompt_consistency.py::test_kanban_guidance_mentions_capability[acceptance criteria]
+FAILED tests/test_prompt_consistency.py::test_kanban_guidance_mentions_capability[choice option format]
+FAILED tests/test_prompt_consistency.py::test_kanban_guidance_mentions_capability[expected output contract]
+FAILED tests/test_prompt_consistency.py::test_kanban_guidance_mentions_capability[needs_input block]
+FAILED tests/test_prompt_consistency.py::test_kanban_guidance_mentions_capability[selective inheritance]
+FAILED tests/test_prompt_consistency.py::test_kanban_guidance_mentions_capability[shared context variables]
+FAILED tests/test_prompt_consistency.py::test_kanban_guidance_mentions_capability[subagent kill]
+FAILED tests/test_prompt_consistency.py::test_kanban_guidance_mentions_capability[subagent list]
+FAILED tests/test_prompt_consistency.py::test_kanban_guidance_mentions_capability[subagent naming]
+FAILED tests/test_prompt_consistency.py::test_kanban_guidance_mentions_capability[subagent steering]
+FAILED tests/test_prompt_consistency.py::test_manager_prompt_mentions_capability[acceptance criteria]
+FAILED tests/test_prompt_consistency.py::test_manager_prompt_mentions_capability[choice option format]
+FAILED tests/test_prompt_consistency.py::test_manager_prompt_mentions_capability[expected output contract]
+FAILED tests/test_prompt_consistency.py::test_manager_prompt_mentions_capability[needs_input block]
+FAILED tests/test_prompt_consistency.py::test_manager_prompt_mentions_capability[selective inheritance]
+FAILED tests/test_prompt_consistency.py::test_manager_prompt_mentions_capability[shared context variables]
+FAILED tests/test_prompt_consistency.py::test_manager_prompt_mentions_capability[subagent kill]
+FAILED tests/test_prompt_consistency.py::test_manager_prompt_mentions_capability[subagent list]
+FAILED tests/test_prompt_consistency.py::test_manager_prompt_mentions_capability[subagent naming]
+FAILED tests/test_prompt_consistency.py::test_manager_prompt_mentions_capability[subagent steering]
+FAILED tests/test_prompt_consistency.py::test_delegate_schema_carries_capability[acceptance criteria]
+FAILED tests/test_prompt_consistency.py::test_delegate_schema_carries_capability[expected output contract]
+FAILED tests/test_prompt_consistency.py::test_delegate_schema_carries_capability[selective inheritance]
+FAILED tests/test_prompt_consistency.py::test_delegate_schema_carries_capability[shared context variables]
+======================== 24 failed, 14 passed in 5.46s ========================
+
+--- tests\test_mcp_serve.py ---
+============================= test session starts =============================
+platform win32 -- Python 3.11.9, pytest-9.1.1, pluggy-1.6.0
+rootdir: C:\Users\given\hermes-audit\hermes-agent
+configfile: pyproject.toml
+plugins: anyio-4.12.1, asyncio-1.3.0
+asyncio: mode=Mode.STRICT, debug=False, asyncio_default_fixture_loop_scope=None, asyncio_default_test_loop_scope=function
+collected 89 items
+
+tests\test_mcp_serve.py ................................................ [ 53%]
+.......................................F.                                [100%]
+
+================================== FAILURES ===================================
+__ TestEventBridgePollE2E.test_new_conversation_after_baseline_is_delivered ___
+
+self = <tests.test_mcp_serve.TestEventBridgePollE2E object at 0x000002C31C59E810>
+tmp_path = WindowsPath('C:/Users/given/AppData/Local/Temp/pytest-of-given/pytest-44596/test_new_conversation_after_ba0')
+monkeypatch = <_pytest.monkeypatch.MonkeyPatch object at 0x000002C31F54C350>
+
+    def test_new_conversation_after_baseline_is_delivered(self, tmp_path, monkeypatch):
+        """A conversation that first appears AFTER the startup baseline is still
+        delivered on its state.db-change tick �� sessions absent from the
+        baseline default to last_seen=0.0."""
+        import mcp_serve
+    
+        db_path = tmp_path / "state.db"
+        db_path.write_text("placeholder")
+        index: dict = {}
+        messages: dict = {}
+        monkeypatch.setattr(mcp_serve, "_load_sessions_index", lambda: dict(index))
+    
+        class DB:
+            def get_messages(self, sid):
+                return list(messages.get(sid, []))
+    
+        monkeypatch.setattr(mcp_serve, "_get_session_db", lambda: DB())
+    
+        bridge = mcp_serve.EventBridge()
+        bridge._establish_baseline()  # no conversations exist yet
+    
+        # The gateway registers a brand-new conversation + its first message.
+        sid = "20260329_150000_fresh"
+        index["agent:main:telegram:dm:fresh"] = {
+            "session_id": sid,
+            "platform": "telegram",
+            "origin": {"platform": "telegram", "chat_id": "fresh"},
+        }
+        messages[sid] = [{
+            "id": 1, "role": "user", "content": "hello after baseline",
+            "timestamp": "2026-03-29T15:10:00",
+        }]
+        os.utime(db_path, None)
+        bridge._poll_once(DB())
+    
+        events = bridge.poll_events(after_cursor=0)["events"]
+>       assert len(events) == 1
+E       assert 0 == 1
+E        +  where 0 = len([])
+
+tests\test_mcp_serve.py:1419: AssertionError
+=========================== short test summary info ===========================
+FAILED tests/test_mcp_serve.py::TestEventBridgePollE2E::test_new_conversation_after_baseline_is_delivered
+======================== 1 failed, 88 passed in 15.78s ========================
+
+--- tests\test_resource_limits.py ---
+============================= test session starts =============================
+platform win32 -- Python 3.11.9, pytest-9.1.1, pluggy-1.6.0
+rootdir: C:\Users\given\hermes-audit\hermes-agent
+configfile: pyproject.toml
+plugins: anyio-4.12.1, asyncio-1.3.0
+asyncio: mode=Mode.STRICT, debug=False, asyncio_default_fixture_loop_scope=None, asyncio_default_test_loop_scope=function
+collected 22 items
+
+tests\test_resource_limits.py ...................F..                     [100%]
+
+================================== FAILURES ===================================
+__________ test_named_profile_reroute_defers_limit_to_final_process ___________
+
+monkeypatch = <_pytest.monkeypatch.MonkeyPatch object at 0x000001CD6D0DB790>
+tmp_path = WindowsPath('C:/Users/given/AppData/Local/Temp/pytest-of-given/pytest-44621/test_named_profile_reroute_def0')
+
+    def test_named_profile_reroute_defers_limit_to_final_process(monkeypatch, tmp_path):
+        """The launcher profile must not leak its limit across machine re-exec."""
+        from hermes_cli import main as cli_main
+        import hermes_cli.profiles
+        import hermes_constants
+        from tools.environments import local as local_environment
+    
+        calls: list[str] = []
+        exec_call: dict[str, object] = {}
+    
+        monkeypatch.delenv("HERMES_DESKTOP", raising=False)
+        monkeypatch.setattr(
+            resource_limits,
+            "apply_nofile_soft_limit",
+            lambda: calls.append("limit"),
+        )
+        monkeypatch.setattr(
+            hermes_cli.profiles,
+            "get_active_profile_name",
+            lambda: "worker",
+        )
+        monkeypatch.setattr(cli_main, "_dashboard_listening", lambda *args: False)
+        monkeypatch.setattr(
+            local_environment,
+            "build_subprocess_env",
+            lambda **kwargs: {},
+        )
+        monkeypatch.setattr(
+            hermes_constants,
+            "get_default_hermes_root",
+            lambda: tmp_path,
+        )
+    
+        class _ExecCalled(Exception):
+            pass
+    
+        def stop_at_exec(executable, argv, env):
+            exec_call.update(executable=executable, argv=argv, env=env)
+            raise _ExecCalled
+    
+        monkeypatch.setattr(cli_main.os, "execvpe", stop_at_exec)
+    
+        args = SimpleNamespace(
+            status=False,
+            stop=False,
+            headless_backend=True,
+            ssh_owner_nonce=None,
+            ssh_session_token_file=None,
+            host="127.0.0.1",
+            port=0,
+            no_open=True,
+            insecure=False,
+            open_profile="",
+            isolated=False,
+            skip_build=False,
+        )
+    
+        with pytest.raises(_ExecCalled):
+>           cli_main.cmd_dashboard(args)
+
+tests\test_resource_limits.py:310: 
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _
+
+args = namespace(status=False, stop=False, headless_backend=True, ssh_owner_nonce=None, ssh_session_token_file=None, host='127.0.0.1', port=0, no_open=True, insecure=False, open_profile='', isolated=False, skip_build=False)
+
+    def cmd_dashboard(args):
+        """Start the web UI server, or (with --stop/--status) manage running ones."""
+        _token_file = getattr(args, "ssh_session_token_file", None)
+        if _token_file and (
+            getattr(args, "status", False) or getattr(args, "stop", False)
+        ):
+            raise SystemExit("--ssh-session-token-file cannot be used with --status or --stop")
+    
+        # --status: report running dashboards and exit, no deps needed.
+        if getattr(args, "status", False):
+            count = _report_dashboard_status()
+            sys.exit(0 if count == 0 else 0)  # status is informational, always 0
+    
+        # --stop: kill any running dashboards and exit, no deps needed.
+        if getattr(args, "stop", False):
+            pids = _find_stale_dashboard_pids()
+            if not pids:
+                print("No hermes dashboard processes running.")
+                sys.exit(0)
+            # Reuse the same SIGTERM-grace-SIGKILL path used after `hermes update`.
+            _self()._kill_stale_dashboard_processes(reason="requested via --stop")
+            # _kill_stale_dashboard_processes prints outcomes itself.  Exit 0 if
+            # we killed at least one, 1 if they were all unkillable.
+            remaining = _find_stale_dashboard_pids()
+            sys.exit(1 if remaining else 0)
+    
+        # `serve` is the headless backend: no UI build, no SPA mount, neutral
+        # ready sentinel. Resolved once and threaded through the re-exec, the
+        # build gate, and start_server.
+        _headless_backend = getattr(args, "headless_backend", False)
+        _ssh_owner_nonce = getattr(args, "ssh_owner_nonce", None)
+        if _ssh_owner_nonce and not re.fullmatch(r"[0-9a-f]{16}", _ssh_owner_nonce):
+            raise SystemExit("--ssh-owner-nonce must be 16 lowercase hex characters")
+        _ssh_session_token = None
+        if _token_file and not _headless_backend:
+            raise SystemExit("--ssh-session-token-file is only valid with hermes serve")
+    
+        # ���� Sanitize Desktop-inherited env that hijacks a standalone launch ��
+        # Desktop Electron spawns its backend with HERMES_DESKTOP=1 plus
+        # HERMES_WEB_DIST=<packaged app.asar[/unpacked]/dist> (and often
+        # HERMES_SERVE_HEADLESS=1 on the serve path). A shell that inherits
+        # those vars then runs `hermes dashboard` would otherwise:
+        #   - serve the desktop renderer �� "Desktop IPC bridge is unavailable"
+        #     (issue #52945), or
+        #   - disable the SPA via inherited HERMES_SERVE_HEADLESS.
+        # Only strip Electron-packaged WEB_DIST contamination �� caller-managed
+        # HERMES_WEB_DIST overrides (dev / custom builds) must still work.
+        # The desktop-spawned backend itself (HERMES_DESKTOP=1) keeps its dist.
+        # Intentionally headless `serve` re-sets HERMES_SERVE_HEADLESS below.
+        if os.environ.get("HERMES_DESKTOP") != "1":
+            _inherited_web_dist = os.environ.get("HERMES_WEB_DIST", "")
+            if _is_electron_packaged_web_dist(_inherited_web_dist):
+                os.environ.pop("HERMES_WEB_DIST", None)
+        if not _headless_backend:
+            os.environ.pop("HERMES_SERVE_HEADLESS", None)
+    
+        # ���� Unified profile launch routing ����������������������������������������������������������������
+        # The dashboard is a MACHINE management surface: it can read/write any
+        # profile via the per-request ?profile= scoping. Running one dashboard
+        # per profile just fragments that (port collisions, N processes, and a
+        # "which dashboard am I on?" guessing game). So when a NAMED profile
+        # launches the dashboard (`worker dashboard` �� HERMES_HOME points into
+        # profiles/), default to the machine dashboard:
+        #   - already running �� open the browser at ?profile=<name> and exit
+        #   - not running     �� re-exec as the machine dashboard (pinned to the
+        #     default profile so _apply_profile_override can't re-route through
+        #     the sticky active_profile file) with the launching profile
+        #     preselected in the UI's switcher.
+        # `--isolated` opts out and preserves the old per-profile behavior.
+        try:
+            from hermes_cli.profiles import get_active_profile_name
+            _launch_profile = get_active_profile_name()
+        except Exception:
+            _launch_profile = "default"
+    
+        if (
+            _launch_profile not in ("default", "custom")
+            and not getattr(args, "isolated", False)
+            and not getattr(args, "open_profile", "")
+            # Desktop pool backends are intentionally per-profile.
+            and os.environ.get("HERMES_DESKTOP") != "1"
+        ):
+            url = f"http://{args.host or '127.0.0.1'}:{args.port}/?profile={_launch_profile}"
+            if _dashboard_listening(args.host, args.port):
+                print(f"Machine dashboard already running on port {args.port}.")
+                print(f"  Managing profile '{_launch_profile}': {url}")
+                if not args.no_open:
+                    try:
+                        import webbrowser
+                        webbrowser.open(url)
+                    except Exception:
+                        pass
+                sys.exit(0)
+    
+            print(
+                f"Routing to the machine dashboard (profile '{_launch_profile}' "
+                f"preselected). Use --isolated for a dedicated per-profile server."
+            )
+            reexec_argv = [
+                sys.executable, "-m", "hermes_cli.main",
+                "-p", "default",
+                # Preserve the lean serve path across the re-exec so a named-profile
+                # `serve` doesn't silently rebuild the UI as `dashboard`.
+                "serve" if _headless_backend else "dashboard",
+                "--port", str(args.port),
+                "--host", args.host,
+                "--open-profile", _launch_profile,
+            ]
+            if _ssh_owner_nonce:
+                reexec_argv.extend(["--ssh-owner-nonce", _ssh_owner_nonce])
+            if _token_file:
+                reexec_argv.extend(["--ssh-session-token-file", _token_file])
+            if args.no_open:
+                reexec_argv.append("--no-open")
+            if getattr(args, "insecure", False):
+                reexec_argv.append("--insecure")
+            if getattr(args, "skip_build", False):
+                reexec_argv.append("--skip-build")
+            from tools.environments.local import build_subprocess_env
+            # Exact env preservation: HERMES_HOME is explicitly pinned to the
+            # machine root below �� the factory must not re-inject a profile home.
+            env = build_subprocess_env(scrub_secrets=False, inherit_profile_home=False)
+            # Pin the child to the machine ROOT, not the launching profile's
+            # HERMES_HOME.  We must resolve the root explicitly instead of just
+            # dropping HERMES_HOME: in the Docker layout the machine root is
+            # /opt/data (set via `ENV HERMES_HOME=/opt/data`), so an unset
+            # HERMES_HOME falls back to $HOME/.hermes = /opt/data/.hermes �� an
+            # empty, auto-seeded home where the dashboard sees only the default
+            # profile and the install-method stamp is missing (so the Docker
+            # update-button guard also misfires).  get_default_hermes_root()
+            # returns the root for both layouts: ~/.hermes for a standard install
+            # and /opt/data for Docker (it strips a trailing profiles/<name>).
+            # See the support report for the double-mount workaround this avoids.
+            try:
+                from hermes_constants import get_default_hermes_root
+                env["HERMES_HOME"] = str(get_default_hermes_root())
+            except Exception:
+                # Best-effort: if root resolution fails, fall back to the prior
+                # behaviour (drop HERMES_HOME) rather than block the reroute.
+                env.pop("HERMES_HOME", None)
+            # On Windows, os.execvpe() does not truly replace the process �� it
+            # spawns via CreateProcess then the parent exits.  Under Python 3.14+
+            # this can crash with STATUS_ACCESS_VIOLATION (0xC0000005) when
+            # re-executing the dashboard for a non-default profile.  Use
+            # subprocess.Popen + sys.exit() on Windows to avoid the crash.
+            if sys.platform == "win32":
+                proc = subprocess.Popen(reexec_argv, env=env)
+>               sys.exit(proc.wait())
+E               SystemExit: 1
+
+hermes_cli\main.py:11199: SystemExit
+---------------------------- Captured stdout call -----------------------------
+Routing to the machine dashboard (profile 'worker' preselected). Use --isolated for a dedicated per-profile server.
+---------------------------- Captured stderr call -----------------------------
+Traceback (most recent call last):
+
+  File "<frozen runpy>", line 198, in _run_module_as_main
+
+  File "<frozen runpy>", line 88, in _run_code
+
+  File "C:\Users\given\hermes-audit\hermes-agent\hermes_cli\main.py", line 706, in <module>
+
+    load_hermes_dotenv(
+
+  File "C:\Users\given\hermes-audit\hermes-agent\hermes_cli\env_loader.py", line 489, in load_hermes_dotenv
+
+    home_path = Path(hermes_home or os.getenv("HERMES_HOME", Path.home() / ".hermes"))
+
+                                                             ^^^^^^^^^^^
+
+  File "C:\Users\given\AppData\Local\Programs\Python\Python311\Lib\pathlib.py", line 914, in home
+
+    return cls("~").expanduser()
+
+           ^^^^^^^^^^^^^^^^^^^^^
+
+  File "C:\Users\given\AppData\Local\Programs\Python\Python311\Lib\pathlib.py", line 1385, in expanduser
+
+    raise RuntimeError("Could not determine home directory.")
+
+RuntimeError: Could not determine home directory.
+
+=========================== short test summary info ===========================
+FAILED tests/test_resource_limits.py::test_named_profile_reroute_defers_limit_to_final_process
+======================== 1 failed, 21 passed in 8.40s =========================
+
+--- tests\test_plugin_skills.py ---
+============================= test session starts =============================
+platform win32 -- Python 3.11.9, pytest-9.1.1, pluggy-1.6.0
+rootdir: C:\Users\given\hermes-audit\hermes-agent
+configfile: pyproject.toml
+plugins: anyio-4.12.1, asyncio-1.3.0
+asyncio: mode=Mode.STRICT, debug=False, asyncio_default_fixture_loop_scope=None, asyncio_default_test_loop_scope=function
+collected 29 items
+
+tests\test_plugin_skills.py .............FF..............                [100%]
+
+================================== FAILURES ===================================
+___ TestSkillViewQualifiedName.test_reads_supporting_file_with_containment ____
+
+self = <tests.test_plugin_skills.TestSkillViewQualifiedName object at 0x0000020454B4FF10>
+tmp_path = WindowsPath('C:/Users/given/AppData/Local/Temp/pytest-of-given/pytest-44615/test_reads_supporting_file_wit0')
+
+    def test_reads_supporting_file_with_containment(self, tmp_path):
+        from tools.skills_tool import skill_view
+    
+        md = self._register_skill(tmp_path)
+        reference = md.parent / "references" / "api.md"
+        reference.parent.mkdir()
+        reference.write_text("API details.")
+    
+        main = json.loads(skill_view("superpowers:writing-plans"))
+>       assert main["linked_files"] == {"references": ["references/api.md"]}
+E       AssertionError: assert {'references'...ces\\api.md']} == {'references'...nces/api.md']}
+E         
+E         Differing items:
+E         {'references': ['references\\api.md']} != {'references': ['references/api.md']}
+E         Use -v to get more diff
+
+tests\test_plugin_skills.py:215: AssertionError
+_ TestSkillViewQualifiedName.test_platform_gate_applies_before_supporting_file _
+
+self = <tests.test_plugin_skills.TestSkillViewQualifiedName object at 0x0000020454B4CA10>
+tmp_path = WindowsPath('C:/Users/given/AppData/Local/Temp/pytest-of-given/pytest-44615/test_platform_gate_applies_bef0')
+
+    def test_platform_gate_applies_before_supporting_file(self, tmp_path):
+        from tools.skills_tool import skill_view
+    
+        md = self._register_skill(
+            tmp_path,
+            content=(
+                "---\nname: writing-plans\ndescription: desc\n"
+                "platforms: [windows]\n---\nBody.\n"
+            ),
+        )
+        reference = md.parent / "references" / "guide.md"
+        reference.parent.mkdir()
+        reference.write_text("Windows only.")
+    
+        result = json.loads(
+            skill_view("superpowers:writing-plans", file_path="references/guide.md")
+        )
+    
+>       assert result["success"] is False
+E       assert True is False
+
+tests\test_plugin_skills.py:240: AssertionError
+=========================== short test summary info ===========================
+FAILED tests/test_plugin_skills.py::TestSkillViewQualifiedName::test_reads_supporting_file_with_containment
+FAILED tests/test_plugin_skills.py::TestSkillViewQualifiedName::test_platform_gate_applies_before_supporting_file
+======================== 2 failed, 27 passed in 16.86s ========================
+
+--- tests\test_termux_all_extra_compat.py ---
+============================= test session starts =============================
+platform win32 -- Python 3.11.9, pytest-9.1.1, pluggy-1.6.0
+rootdir: C:\Users\given\hermes-audit\hermes-agent
+configfile: pyproject.toml
+plugins: anyio-4.12.1, asyncio-1.3.0
+asyncio: mode=Mode.STRICT, debug=False, asyncio_default_fixture_loop_scope=None, asyncio_default_test_loop_scope=function
+collected 2 items
+
+tests\test_termux_all_extra_compat.py FF                                 [100%]
+
+================================== FAILURES ===================================
+__________ test_pyproject_defines_termux_all_without_known_blockers ___________
+
+    def test_pyproject_defines_termux_all_without_known_blockers() -> None:
+>       text = PYPROJECT.read_text()
+               ^^^^^^^^^^^^^^^^^^^^^
+
+tests\test_termux_all_extra_compat.py:12: 
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _
+
+self = WindowsPath('C:/Users/given/hermes-audit/hermes-agent/pyproject.toml')
+encoding = 'locale', errors = None
+
+    def read_text(self, encoding=None, errors=None):
+        """
+        Open the file in text mode, read it, and close the file.
+        """
+        encoding = io.text_encoding(encoding)
+        with self.open(mode='r', encoding=encoding, errors=errors) as f:
+>           return f.read()
+                   ^^^^^^^^
+E           UnicodeDecodeError: 'gbk' codec can't decode byte 0x94 in position 98: illegal multibyte sequence
+
+..\..\AppData\Local\Programs\Python\Python311\Lib\pathlib.py:1059: UnicodeDecodeError
+____________ test_install_script_prefers_termux_all_then_fallbacks ____________
+
+    def test_install_script_prefers_termux_all_then_fallbacks() -> None:
+>       text = INSTALL_SH.read_text()
+               ^^^^^^^^^^^^^^^^^^^^^^
+
+tests\test_termux_all_extra_compat.py:20: 
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _
+
+self = WindowsPath('C:/Users/given/hermes-audit/hermes-agent/scripts/install.sh')
+encoding = 'locale', errors = None
+
+    def read_text(self, encoding=None, errors=None):
+        """
+        Open the file in text mode, read it, and close the file.
+        """
+        encoding = io.text_encoding(encoding)
+        with self.open(mode='r', encoding=encoding, errors=errors) as f:
+>           return f.read()
+                   ^^^^^^^^
+E           UnicodeDecodeError: 'gbk' codec can't decode byte 0xa0 in position 930: illegal multibyte sequence
+
+..\..\AppData\Local\Programs\Python\Python311\Lib\pathlib.py:1059: UnicodeDecodeError
+=========================== short test summary info ===========================
+FAILED tests/test_termux_all_extra_compat.py::test_pyproject_defines_termux_all_without_known_blockers
+FAILED tests/test_termux_all_extra_compat.py::test_install_script_prefers_termux_all_then_fallbacks
+============================== 2 failed in 1.65s ==============================
+
+--- tests\test_subprocess_home_isolation.py ---
+============================= test session starts =============================
+platform win32 -- Python 3.11.9, pytest-9.1.1, pluggy-1.6.0
+rootdir: C:\Users\given\hermes-audit\hermes-agent
+configfile: pyproject.toml
+plugins: anyio-4.12.1, asyncio-1.3.0
+asyncio: mode=Mode.STRICT, debug=False, asyncio_default_fixture_loop_scope=None, asyncio_default_test_loop_scope=function
+collected 14 items
+
+tests\test_subprocess_home_isolation.py ....F.........                   [100%]
+
+================================== FAILURES ===================================
+_________ TestGetSubprocessHome.test_two_profiles_get_different_homes _________
+
+self = <tests.test_subprocess_home_isolation.TestGetSubprocessHome object at 0x000002497FAE7D50>
+tmp_path = WindowsPath('C:/Users/given/AppData/Local/Temp/pytest-of-given/pytest-44651/test_two_profiles_get_differen0')
+monkeypatch = <_pytest.monkeypatch.MonkeyPatch object at 0x0000024901514590>
+
+    def test_two_profiles_get_different_homes(self, tmp_path, monkeypatch):
+        self._container_mode(monkeypatch)
+        base = tmp_path / ".hermes" / "profiles"
+        for name in ("alpha", "beta"):
+            p = base / name
+            p.mkdir(parents=True)
+            (p / "home").mkdir()
+    
+        from hermes_constants import get_subprocess_home
+    
+        monkeypatch.setenv("HERMES_HOME", str(base / "alpha"))
+        home_a = get_subprocess_home()
+    
+        monkeypatch.setenv("HERMES_HOME", str(base / "beta"))
+        home_b = get_subprocess_home()
+    
+        assert home_a is not None
+        assert home_b is not None
+        assert home_a != home_b
+>       assert home_a.endswith("alpha/home")
+E       AssertionError: assert False
+E        +  where False = <built-in method endswith of str object at 0x000002490141B260>('alpha/home')
+E        +    where <built-in method endswith of str object at 0x000002490141B260> = 'C:\\Users\\given\\AppData\\Local\\Temp\\pytest-of-given\\pytest-44651\\test_two_profiles_get_differen0\\.hermes\\profiles\\alpha\\home'.endswith
+
+tests\test_subprocess_home_isolation.py:110: AssertionError
+=========================== short test summary info ===========================
+FAILED tests/test_subprocess_home_isolation.py::TestGetSubprocessHome::test_two_profiles_get_different_homes
+======================== 1 failed, 13 passed in 2.28s =========================
+
+--- tests\test_tini_shim.py ---
+============================= test session starts =============================
+platform win32 -- Python 3.11.9, pytest-9.1.1, pluggy-1.6.0
+rootdir: C:\Users\given\hermes-audit\hermes-agent
+configfile: pyproject.toml
+plugins: anyio-4.12.1, asyncio-1.3.0
+asyncio: mode=Mode.STRICT, debug=False, asyncio_default_fixture_loop_scope=None, asyncio_default_test_loop_scope=function
+collected 4 items
+
+tests\test_tini_shim.py FFFF                                             [100%]
+
+================================== FAILURES ===================================
+_________________ test_shim_script_is_executable_bit_friendly _________________
+
+    def test_shim_script_is_executable_bit_friendly() -> None:
+        assert SHIM.is_file()
+>       text = SHIM.read_text()
+               ^^^^^^^^^^^^^^^^
+
+tests\test_tini_shim.py:51: 
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _
+
+self = WindowsPath('C:/Users/given/hermes-audit/hermes-agent/docker/tini-shim.sh')
+encoding = 'locale', errors = None
+
+    def read_text(self, encoding=None, errors=None):
+        """
+        Open the file in text mode, read it, and close the file.
+        """
+        encoding = io.text_encoding(encoding)
+        with self.open(mode='r', encoding=encoding, errors=errors) as f:
+>           return f.read()
+                   ^^^^^^^^
+E           UnicodeDecodeError: 'gbk' codec can't decode byte 0x94 in position 50: illegal multibyte sequence
+
+..\..\AppData\Local\Programs\Python\Python311\Lib\pathlib.py:1059: UnicodeDecodeError
+________________________ test_strips_g_and_double_dash ________________________
+
+recorder = (WindowsPath('C:/Users/given/AppData/Local/Temp/pytest-of-given/pytest-44654/test_strips_g_and_double_dash0/fake-init'...dowsPath('C:/Users/given/AppData/Local/Temp/pytest-of-given/pytest-44654/test_strips_g_and_double_dash0/fake-wrapper'))
+
+    def test_strips_g_and_double_dash(recorder: tuple[Path, Path]) -> None:
+        """Legacy `tini -g -- gateway run` must not forward `-g` to /init."""
+>       r = _run_shim(recorder, ["-g", "--", "gateway", "run"])
+            ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+tests\test_tini_shim.py:58: 
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _
+tests\test_tini_shim.py:39: in _run_shim
+    return subprocess.run(
+tests\conftest.py:1546: in _guarded
+    return real(cmd, *args, **kwargs)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^
+..\..\AppData\Local\Programs\Python\Python311\Lib\subprocess.py:548: in run
+    with Popen(*popenargs, **kwargs) as process:
+         ^^^^^^^^^^^^^^^^^^^^^^^^^^^
+tests\conftest.py:1564: in __init__
+    super().__init__(cmd, *args, **kwargs)
+..\..\AppData\Local\Programs\Python\Python311\Lib\subprocess.py:1026: in __init__
+    self._execute_child(args, executable, preexec_fn, close_fds,
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _
+
+self = <Popen: returncode: None args: ['sh', 'C:\\Users\\given\\hermes-audit\\herme...>
+args = 'sh C:\\Users\\given\\hermes-audit\\hermes-agent\\docker\\tini-shim.sh -g -- gateway run'
+executable = None, preexec_fn = None, close_fds = False, pass_fds = ()
+cwd = None
+env = {'ALLUSERSPROFILE': 'C:\\ProgramData', 'APPDATA': 'C:\\Users\\given\\AppData\\Roaming', 'CLAUDE_CODE_AUTO_COMPACT_WINDOW': '1000000', 'CLAUDE_CODE_ENABLE_GATEWAY_MODEL_DISCOVERY': '1', ...}
+startupinfo = <subprocess.STARTUPINFO object at 0x000001C9961D7C10>
+creationflags = 0, shell = False, p2cread = Handle(988), p2cwrite = -1
+c2pread = 11, c2pwrite = Handle(1000), errread = 12, errwrite = Handle(1012)
+unused_restore_signals = True, unused_gid = None, unused_gids = None
+unused_uid = None, unused_umask = -1, unused_start_new_session = False
+unused_process_group = -1
+
+    def _execute_child(self, args, executable, preexec_fn, close_fds,
+                       pass_fds, cwd, env,
+                       startupinfo, creationflags, shell,
+                       p2cread, p2cwrite,
+                       c2pread, c2pwrite,
+                       errread, errwrite,
+                       unused_restore_signals,
+                       unused_gid, unused_gids, unused_uid,
+                       unused_umask,
+                       unused_start_new_session, unused_process_group):
+        """Execute program (MS Windows version)"""
+    
+        assert not pass_fds, "pass_fds not supported on Windows."
+    
+        if isinstance(args, str):
+            pass
+        elif isinstance(args, bytes):
+            if shell:
+                raise TypeError('bytes args is not allowed on Windows')
+            args = list2cmdline([args])
+        elif isinstance(args, os.PathLike):
+            if shell:
+                raise TypeError('path-like args is not allowed when '
+                                'shell is true')
+            args = list2cmdline([args])
+        else:
+            args = list2cmdline(args)
+    
+        if executable is not None:
+            executable = os.fsdecode(executable)
+    
+        # Process startup details
+        if startupinfo is None:
+            startupinfo = STARTUPINFO()
+        else:
+            # bpo-34044: Copy STARTUPINFO since it is modified above,
+            # so the caller can reuse it multiple times.
+            startupinfo = startupinfo.copy()
+    
+        use_std_handles = -1 not in (p2cread, c2pwrite, errwrite)
+        if use_std_handles:
+            startupinfo.dwFlags |= _winapi.STARTF_USESTDHANDLES
+            startupinfo.hStdInput = p2cread
+            startupinfo.hStdOutput = c2pwrite
+            startupinfo.hStdError = errwrite
+    
+        attribute_list = startupinfo.lpAttributeList
+        have_handle_list = bool(attribute_list and
+                                "handle_list" in attribute_list and
+                                attribute_list["handle_list"])
+    
+        # If we were given an handle_list or need to create one
+        if have_handle_list or (use_std_handles and close_fds):
+            if attribute_list is None:
+                attribute_list = startupinfo.lpAttributeList = {}
+            handle_list = attribute_list["handle_list"] = \
+                list(attribute_list.get("handle_list", []))
+    
+            if use_std_handles:
+                handle_list += [int(p2cread), int(c2pwrite), int(errwrite)]
+    
+            handle_list[:] = self._filter_handle_list(handle_list)
+    
+            if handle_list:
+                if not close_fds:
+                    warnings.warn("startupinfo.lpAttributeList['handle_list'] "
+                                  "overriding close_fds", RuntimeWarning)
+    
+                # When using the handle_list we always request to inherit
+                # handles but the only handles that will be inherited are
+                # the ones in the handle_list
+                close_fds = False
+    
+        if shell:
+            startupinfo.dwFlags |= _winapi.STARTF_USESHOWWINDOW
+            startupinfo.wShowWindow = _winapi.SW_HIDE
+            if not executable:
+                # gh-101283: without a fully-qualified path, before Windows
+                # checks the system directories, it first looks in the
+                # application directory, and also the current directory if
+                # NeedCurrentDirectoryForExePathW(ExeName) is true, so try
+                # to avoid executing unqualified "cmd.exe".
+                comspec = os.environ.get('ComSpec')
+                if not comspec:
+                    system_root = os.environ.get('SystemRoot', '')
+                    comspec = os.path.join(system_root, 'System32', 'cmd.exe')
+                    if not os.path.isabs(comspec):
+                        raise FileNotFoundError('shell not found: neither %ComSpec% nor %SystemRoot% is set')
+                if os.path.isabs(comspec):
+                    executable = comspec
+            else:
+                comspec = executable
+    
+            args = '{} /c "{}"'.format (comspec, args)
+    
+        if cwd is not None:
+            cwd = os.fsdecode(cwd)
+    
+        sys.audit("subprocess.Popen", executable, args, cwd, env)
+    
+        # Start the process
+        try:
+>           hp, ht, pid, tid = _winapi.CreateProcess(executable, args,
+                                     # no special security
+                                     None, None,
+                                     int(not close_fds),
+                                     creationflags,
+                                     env,
+                                     cwd,
+                                     startupinfo)
+E                                    FileNotFoundError: [WinError 2] ϵͳ�Ҳ���ָ�����ļ���
+
+..\..\AppData\Local\Programs\Python\Python311\Lib\subprocess.py:1538: FileNotFoundError
+_________________ test_does_not_double_wrap_existing_wrapper __________________
+
+recorder = (WindowsPath('C:/Users/given/AppData/Local/Temp/pytest-of-given/pytest-44654/test_does_not_double_wrap_exis0/fake-init...owsPath('C:/Users/given/AppData/Local/Temp/pytest-of-given/pytest-44654/test_does_not_double_wrap_exis0/fake-wrapper'))
+
+    def test_does_not_double_wrap_existing_wrapper(
+        recorder: tuple[Path, Path],
+    ) -> None:
+        _, wrapper = recorder
+>       r = _run_shim(recorder, ["-g", "--", str(wrapper), "gateway", "run"])
+            ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+tests\test_tini_shim.py:76: 
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _
+tests\test_tini_shim.py:39: in _run_shim
+    return subprocess.run(
+tests\conftest.py:1546: in _guarded
+    return real(cmd, *args, **kwargs)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^
+..\..\AppData\Local\Programs\Python\Python311\Lib\subprocess.py:548: in run
+    with Popen(*popenargs, **kwargs) as process:
+         ^^^^^^^^^^^^^^^^^^^^^^^^^^^
+tests\conftest.py:1564: in __init__
+    super().__init__(cmd, *args, **kwargs)
+..\..\AppData\Local\Programs\Python\Python311\Lib\subprocess.py:1026: in __init__
+    self._execute_child(args, executable, preexec_fn, close_fds,
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _
+
+self = <Popen: returncode: None args: ['sh', 'C:\\Users\\given\\hermes-audit\\herme...>
+args = 'sh C:\\Users\\given\\hermes-audit\\hermes-agent\\docker\\tini-shim.sh -g -- C:\\Users\\given\\AppData\\Local\\Temp\\pytest-of-given\\pytest-44654\\test_does_not_double_wrap_exis0\\fake-wrapper gateway run'
+executable = None, preexec_fn = None, close_fds = False, pass_fds = ()
+cwd = None
+env = {'ALLUSERSPROFILE': 'C:\\ProgramData', 'APPDATA': 'C:\\Users\\given\\AppData\\Roaming', 'CLAUDE_CODE_AUTO_COMPACT_WINDOW': '1000000', 'CLAUDE_CODE_ENABLE_GATEWAY_MODEL_DISCOVERY': '1', ...}
+startupinfo = <subprocess.STARTUPINFO object at 0x000001C9962E9B10>
+creationflags = 0, shell = False, p2cread = Handle(980), p2cwrite = -1
+c2pread = 11, c2pwrite = Handle(1004), errread = 12, errwrite = Handle(1028)
+unused_restore_signals = True, unused_gid = None, unused_gids = None
+unused_uid = None, unused_umask = -1, unused_start_new_session = False
+unused_process_group = -1
+
+    def _execute_child(self, args, executable, preexec_fn, close_fds,
+                       pass_fds, cwd, env,
+                       startupinfo, creationflags, shell,
+                       p2cread, p2cwrite,
+                       c2pread, c2pwrite,
+                       errread, errwrite,
+                       unused_restore_signals,
+                       unused_gid, unused_gids, unused_uid,
+                       unused_umask,
+                       unused_start_new_session, unused_process_group):
+        """Execute program (MS Windows version)"""
+    
+        assert not pass_fds, "pass_fds not supported on Windows."
+    
+        if isinstance(args, str):
+            pass
+        elif isinstance(args, bytes):
+            if shell:
+                raise TypeError('bytes args is not allowed on Windows')
+            args = list2cmdline([args])
+        elif isinstance(args, os.PathLike):
+            if shell:
+                raise TypeError('path-like args is not allowed when '
+                                'shell is true')
+            args = list2cmdline([args])
+        else:
+            args = list2cmdline(args)
+    
+        if executable is not None:
+            executable = os.fsdecode(executable)
+    
+        # Process startup details
+        if startupinfo is None:
+            startupinfo = STARTUPINFO()
+        else:
+            # bpo-34044: Copy STARTUPINFO since it is modified above,
+            # so the caller can reuse it multiple times.
+            startupinfo = startupinfo.copy()
+    
+        use_std_handles = -1 not in (p2cread, c2pwrite, errwrite)
+        if use_std_handles:
+            startupinfo.dwFlags |= _winapi.STARTF_USESTDHANDLES
+            startupinfo.hStdInput = p2cread
+            startupinfo.hStdOutput = c2pwrite
+            startupinfo.hStdError = errwrite
+    
+        attribute_list = startupinfo.lpAttributeList
+        have_handle_list = bool(attribute_list and
+                                "handle_list" in attribute_list and
+                                attribute_list["handle_list"])
+    
+        # If we were given an handle_list or need to create one
+        if have_handle_list or (use_std_handles and close_fds):
+            if attribute_list is None:
+                attribute_list = startupinfo.lpAttributeList = {}
+            handle_list = attribute_list["handle_list"] = \
+                list(attribute_list.get("handle_list", []))
+    
+            if use_std_handles:
+                handle_list += [int(p2cread), int(c2pwrite), int(errwrite)]
+    
+            handle_list[:] = self._filter_handle_list(handle_list)
+    
+            if handle_list:
+                if not close_fds:
+                    warnings.warn("startupinfo.lpAttributeList['handle_list'] "
+                                  "overriding close_fds", RuntimeWarning)
+    
+                # When using the handle_list we always request to inherit
+                # handles but the only handles that will be inherited are
+                # the ones in the handle_list
+                close_fds = False
+    
+        if shell:
+            startupinfo.dwFlags |= _winapi.STARTF_USESHOWWINDOW
+            startupinfo.wShowWindow = _winapi.SW_HIDE
+            if not executable:
+                # gh-101283: without a fully-qualified path, before Windows
+                # checks the system directories, it first looks in the
+                # application directory, and also the current directory if
+                # NeedCurrentDirectoryForExePathW(ExeName) is true, so try
+                # to avoid executing unqualified "cmd.exe".
+                comspec = os.environ.get('ComSpec')
+                if not comspec:
+                    system_root = os.environ.get('SystemRoot', '')
+                    comspec = os.path.join(system_root, 'System32', 'cmd.exe')
+                    if not os.path.isabs(comspec):
+                        raise FileNotFoundError('shell not found: neither %ComSpec% nor %SystemRoot% is set')
+                if os.path.isabs(comspec):
+                    executable = comspec
+            else:
+                comspec = executable
+    
+            args = '{} /c "{}"'.format (comspec, args)
+    
+        if cwd is not None:
+            cwd = os.fsdecode(cwd)
+    
+        sys.audit("subprocess.Popen", executable, args, cwd, env)
+    
+        # Start the process
+        try:
+>           hp, ht, pid, tid = _winapi.CreateProcess(executable, args,
+                                     # no special security
+                                     None, None,
+                                     int(not close_fds),
+                                     creationflags,
+                                     env,
+                                     cwd,
+                                     startupinfo)
+E                                    FileNotFoundError: [WinError 2] ϵͳ�Ҳ���ָ�����ļ���
+
+..\..\AppData\Local\Programs\Python\Python311\Lib\subprocess.py:1538: FileNotFoundError
+_____________________ test_strips_p_and_e_with_arguments ______________________
+
+recorder = (WindowsPath('C:/Users/given/AppData/Local/Temp/pytest-of-given/pytest-44654/test_strips_p_and_e_with_argum0/fake-init...owsPath('C:/Users/given/AppData/Local/Temp/pytest-of-given/pytest-44654/test_strips_p_and_e_with_argum0/fake-wrapper'))
+
+    def test_strips_p_and_e_with_arguments(recorder: tuple[Path, Path]) -> None:
+>       r = _run_shim(
+            recorder,
+            ["-p", "SIGKILL", "-e", "143", "-v", "-v", "--", "sleep", "infinity"],
+        )
+
+tests\test_tini_shim.py:83: 
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _
+tests\test_tini_shim.py:39: in _run_shim
+    return subprocess.run(
+tests\conftest.py:1546: in _guarded
+    return real(cmd, *args, **kwargs)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^
+..\..\AppData\Local\Programs\Python\Python311\Lib\subprocess.py:548: in run
+    with Popen(*popenargs, **kwargs) as process:
+         ^^^^^^^^^^^^^^^^^^^^^^^^^^^
+tests\conftest.py:1564: in __init__
+    super().__init__(cmd, *args, **kwargs)
+..\..\AppData\Local\Programs\Python\Python311\Lib\subprocess.py:1026: in __init__
+    self._execute_child(args, executable, preexec_fn, close_fds,
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _
+
+self = <Popen: returncode: None args: ['sh', 'C:\\Users\\given\\hermes-audit\\herme...>
+args = 'sh C:\\Users\\given\\hermes-audit\\hermes-agent\\docker\\tini-shim.sh -p SIGKILL -e 143 -v -v -- sleep infinity'
+executable = None, preexec_fn = None, close_fds = False, pass_fds = ()
+cwd = None
+env = {'ALLUSERSPROFILE': 'C:\\ProgramData', 'APPDATA': 'C:\\Users\\given\\AppData\\Roaming', 'CLAUDE_CODE_AUTO_COMPACT_WINDOW': '1000000', 'CLAUDE_CODE_ENABLE_GATEWAY_MODEL_DISCOVERY': '1', ...}
+startupinfo = <subprocess.STARTUPINFO object at 0x000001C9929E1B50>
+creationflags = 0, shell = False, p2cread = Handle(744), p2cwrite = -1
+c2pread = 11, c2pwrite = Handle(1056), errread = 12, errwrite = Handle(1068)
+unused_restore_signals = True, unused_gid = None, unused_gids = None
+unused_uid = None, unused_umask = -1, unused_start_new_session = False
+unused_process_group = -1
+
+    def _execute_child(self, args, executable, preexec_fn, close_fds,
+                       pass_fds, cwd, env,
+                       startupinfo, creationflags, shell,
+                       p2cread, p2cwrite,
+                       c2pread, c2pwrite,
+                       errread, errwrite,
+                       unused_restore_signals,
+                       unused_gid, unused_gids, unused_uid,
+                       unused_umask,
+                       unused_start_new_session, unused_process_group):
+        """Execute program (MS Windows version)"""
+    
+        assert not pass_fds, "pass_fds not supported on Windows."
+    
+        if isinstance(args, str):
+            pass
+        elif isinstance(args, bytes):
+            if shell:
+                raise TypeError('bytes args is not allowed on Windows')
+            args = list2cmdline([args])
+        elif isinstance(args, os.PathLike):
+            if shell:
+                raise TypeError('path-like args is not allowed when '
+                                'shell is true')
+            args = list2cmdline([args])
+        else:
+            args = list2cmdline(args)
+    
+        if executable is not None:
+            executable = os.fsdecode(executable)
+    
+        # Process startup details
+        if startupinfo is None:
+            startupinfo = STARTUPINFO()
+        else:
+            # bpo-34044: Copy STARTUPINFO since it is modified above,
+            # so the caller can reuse it multiple times.
+            startupinfo = startupinfo.copy()
+    
+        use_std_handles = -1 not in (p2cread, c2pwrite, errwrite)
+        if use_std_handles:
+            startupinfo.dwFlags |= _winapi.STARTF_USESTDHANDLES
+            startupinfo.hStdInput = p2cread
+            startupinfo.hStdOutput = c2pwrite
+            startupinfo.hStdError = errwrite
+    
+        attribute_list = startupinfo.lpAttributeList
+        have_handle_list = bool(attribute_list and
+                                "handle_list" in attribute_list and
+                                attribute_list["handle_list"])
+    
+        # If we were given an handle_list or need to create one
+        if have_handle_list or (use_std_handles and close_fds):
+            if attribute_list is None:
+                attribute_list = startupinfo.lpAttributeList = {}
+            handle_list = attribute_list["handle_list"] = \
+                list(attribute_list.get("handle_list", []))
+    
+            if use_std_handles:
+                handle_list += [int(p2cread), int(c2pwrite), int(errwrite)]
+    
+            handle_list[:] = self._filter_handle_list(handle_list)
+    
+            if handle_list:
+                if not close_fds:
+                    warnings.warn("startupinfo.lpAttributeList['handle_list'] "
+                                  "overriding close_fds", RuntimeWarning)
+    
+                # When using the handle_list we always request to inherit
+                # handles but the only handles that will be inherited are
+                # the ones in the handle_list
+                close_fds = False
+    
+        if shell:
+            startupinfo.dwFlags |= _winapi.STARTF_USESHOWWINDOW
+            startupinfo.wShowWindow = _winapi.SW_HIDE
+            if not executable:
+                # gh-101283: without a fully-qualified path, before Windows
+                # checks the system directories, it first looks in the
+                # application directory, and also the current directory if
+                # NeedCurrentDirectoryForExePathW(ExeName) is true, so try
+                # to avoid executing unqualified "cmd.exe".
+                comspec = os.environ.get('ComSpec')
+                if not comspec:
+                    system_root = os.environ.get('SystemRoot', '')
+                    comspec = os.path.join(system_root, 'System32', 'cmd.exe')
+                    if not os.path.isabs(comspec):
+                        raise FileNotFoundError('shell not found: neither %ComSpec% nor %SystemRoot% is set')
+                if os.path.isabs(comspec):
+                    executable = comspec
+            else:
+                comspec = executable
+    
+            args = '{} /c "{}"'.format (comspec, args)
+    
+        if cwd is not None:
+            cwd = os.fsdecode(cwd)
+    
+        sys.audit("subprocess.Popen", executable, args, cwd, env)
+    
+        # Start the process
+        try:
+>           hp, ht, pid, tid = _winapi.CreateProcess(executable, args,
+                                     # no special security
+                                     None, None,
+                                     int(not close_fds),
+                                     creationflags,
+                                     env,
+                                     cwd,
+                                     startupinfo)
+E                                    FileNotFoundError: [WinError 2] ϵͳ�Ҳ���ָ�����ļ���
+
+..\..\AppData\Local\Programs\Python\Python311\Lib\subprocess.py:1538: FileNotFoundError
+=========================== short test summary info ===========================
+FAILED tests/test_tini_shim.py::test_shim_script_is_executable_bit_friendly
+FAILED tests/test_tini_shim.py::test_strips_g_and_double_dash - FileNotFoundE...
+FAILED tests/test_tini_shim.py::test_does_not_double_wrap_existing_wrapper - ...
+FAILED tests/test_tini_shim.py::test_strips_p_and_e_with_arguments - FileNotF...
+============================== 4 failed in 2.15s ==============================
+
+--- tests\test_trajectory_compressor_async.py ---
+============================= test session starts =============================
+platform win32 -- Python 3.11.9, pytest-9.1.1, pluggy-1.6.0
+rootdir: C:\Users\given\hermes-audit\hermes-agent
+configfile: pyproject.toml
+plugins: anyio-4.12.1, asyncio-1.3.0
+asyncio: mode=Mode.STRICT, debug=False, asyncio_default_fixture_loop_scope=None, asyncio_default_test_loop_scope=function
+collected 8 items
+
+tests\test_trajectory_compressor_async.py ...FF...                       [100%]
+
+================================== FAILURES ===================================
+________ TestSourceLineVerification.test_no_eager_async_openai_in_init ________
+
+self = <tests.test_trajectory_compressor_async.TestSourceLineVerification object at 0x000002C9AB70F5D0>
+
+    def test_no_eager_async_openai_in_init(self):
+        """__init__ should NOT create AsyncOpenAI eagerly."""
+>       src = self._read_file()
+              ^^^^^^^^^^^^^^^^^
+
+tests\test_trajectory_compressor_async.py:98: 
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _
+
+    @staticmethod
+    def _read_file() -> str:
+        import os
+        base = os.path.dirname(os.path.dirname(__file__))
+        with open(os.path.join(base, "trajectory_compressor.py")) as f:
+>           return f.read()
+                   ^^^^^^^^
+E           UnicodeDecodeError: 'gbk' codec can't decode byte 0x85 in position 14979: illegal multibyte sequence
+
+tests\test_trajectory_compressor_async.py:94: UnicodeDecodeError
+_______ TestSourceLineVerification.test_get_async_client_method_exists ________
+
+self = <tests.test_trajectory_compressor_async.TestSourceLineVerification object at 0x000002C9AB70CBD0>
+
+    def test_get_async_client_method_exists(self):
+        """_get_async_client method should exist."""
+>       src = self._read_file()
+              ^^^^^^^^^^^^^^^^^
+
+tests\test_trajectory_compressor_async.py:114: 
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _
+
+    @staticmethod
+    def _read_file() -> str:
+        import os
+        base = os.path.dirname(os.path.dirname(__file__))
+        with open(os.path.join(base, "trajectory_compressor.py")) as f:
+>           return f.read()
+                   ^^^^^^^^
+E           UnicodeDecodeError: 'gbk' codec can't decode byte 0x85 in position 14979: illegal multibyte sequence
+
+tests\test_trajectory_compressor_async.py:94: UnicodeDecodeError
+=========================== short test summary info ===========================
+FAILED tests/test_trajectory_compressor_async.py::TestSourceLineVerification::test_no_eager_async_openai_in_init
+FAILED tests/test_trajectory_compressor_async.py::TestSourceLineVerification::test_get_async_client_method_exists
+========================= 2 failed, 6 passed in 4.34s =========================
+
+--- tests\test_state_db_malformed_repair.py ---
+============================= test session starts =============================
+platform win32 -- Python 3.11.9, pytest-9.1.1, pluggy-1.6.0
+rootdir: C:\Users\given\hermes-audit\hermes-agent
+configfile: pyproject.toml
+plugins: anyio-4.12.1, asyncio-1.3.0
+asyncio: mode=Mode.STRICT, debug=False, asyncio_default_fixture_loop_scope=None, asyncio_default_test_loop_scope=function
+collected 16 items
+
+tests\test_state_db_malformed_repair.py .......F.sss....                 [100%]
+
+================================== FAILURES ===================================
+__________________ test_repair_rebuilds_stale_btree_indexes ___________________
+
+tmp_path = WindowsPath('C:/Users/given/AppData/Local/Temp/pytest-of-given/pytest-44647/test_repair_rebuilds_stale_btr0')
+
+    def test_repair_rebuilds_stale_btree_indexes(tmp_path):
+        """repair_state_db_schema repairs a REAL stale B-tree index via REINDEX.
+    
+        End-to-end, no mocks: a genuinely stale index (empty b-tree under a full
+        index definition �� the #63386 'wrong # of entries in index' class) is
+        detected by the real _db_opens_cleanly, repaired by Strategy 0.5
+        (REINDEX), and the DB verifies clean afterwards with real integrity
+        checks.
+        """
+        db_path = tmp_path / "state.db"
+        _build_healthy_db(db_path)
+    
+        _corrupt_btree_index(db_path, "idx_messages_session")
+    
+        # The real detector must see the real corruption...
+        reason = hermes_state._db_opens_cleanly(db_path)
+        assert reason is not None
+>       assert "wrong # of entries in index idx_messages_session" in reason
+E       AssertionError: assert 'wrong # of entries in index idx_messages_session' in 'row 1 missing from index idx_messages_session; row 2 missing from index idx_messages_session; row 3 missing from index idx_messages_session'
+
+tests\test_state_db_malformed_repair.py:364: AssertionError
+=========================== short test summary info ===========================
+FAILED tests/test_state_db_malformed_repair.py::test_repair_rebuilds_stale_btree_indexes
+================== 1 failed, 12 passed, 3 skipped in 11.24s ===================
+
+--- tests\test_web_server.py ---
+============================= test session starts =============================
+platform win32 -- Python 3.11.9, pytest-9.1.1, pluggy-1.6.0
+rootdir: C:\Users\given\hermes-audit\hermes-agent
+configfile: pyproject.toml
+plugins: anyio-4.12.1, asyncio-1.3.0
+asyncio: mode=Mode.STRICT, debug=False, asyncio_default_fixture_loop_scope=None, asyncio_default_test_loop_scope=function
+collected 9 items
+
+tests\test_web_server.py .....F...                                       [100%]
+
+================================== FAILURES ===================================
+______________ test_start_server_keeps_bare_asyncio_run_on_posix ______________
+
+monkeypatch = <_pytest.monkeypatch.MonkeyPatch object at 0x00000266219F1450>
+
+    def test_start_server_keeps_bare_asyncio_run_on_posix(monkeypatch):
+        """POSIX continues to serve via the plain ``asyncio.run(_serve())`` path,
+        never the Windows loop-factory branch.
+    
+        The #50641 fix is intentionally win32-scoped to keep the loop selection
+        unchanged �� Python's default loop on POSIX is already a SelectorEventLoop
+        (or uvloop), which is what uvicorn serves on.
+    
+        No platform patching: the Linux CI host is already POSIX, so this asserts
+        the real host's serve path.
+        """
+        _stub_uvicorn(monkeypatch)
+    
+        # If the Windows branch were taken, the loop-factory runner would fire.
+        runner_called = {"hit": False}
+    
+        def _fake_runner(coro, *, loop_factory=None):
+            runner_called["hit"] = True
+            coro.close()
+    
+        monkeypatch.setattr("uvicorn._compat.asyncio_run", _fake_runner, raising=False)
+    
+        bare_called = {"hit": False}
+    
+        def _fake_asyncio_run(coro):
+            bare_called["hit"] = True
+            coro.close()
+            return None
+    
+        monkeypatch.setattr(asyncio, "run", _fake_asyncio_run)
+    
+        web_server.start_server(host="127.0.0.1", port=0, open_browser=False)
+    
+>       assert bare_called["hit"] is True, "POSIX must serve via bare asyncio.run"
+E       AssertionError: POSIX must serve via bare asyncio.run
+E       assert False is True
+
+tests\test_web_server.py:243: AssertionError
+=========================== short test summary info ===========================
+FAILED tests/test_web_server.py::test_start_server_keeps_bare_asyncio_run_on_posix
+========================= 1 failed, 8 passed in 6.05s =========================
+
+--- tests\test_run_tests_parallel.py ---
+============================= test session starts =============================
+platform win32 -- Python 3.11.9, pytest-9.1.1, pluggy-1.6.0
+rootdir: C:\Users\given\hermes-audit\hermes-agent
+configfile: pyproject.toml
+plugins: anyio-4.12.1, asyncio-1.3.0
+asyncio: mode=Mode.STRICT, debug=False, asyncio_default_fixture_loop_scope=None, asyncio_default_test_loop_scope=function
+collected 10 items
+
+tests\test_run_tests_parallel.py FsF.F.FF..                              [100%]
+
+================================== FAILURES ===================================
+____________ test_progress_output_tolerates_legacy_stdout_encoding ____________
+
+tmp_path = WindowsPath('C:/Users/given/AppData/Local/Temp/pytest-of-given/pytest-44625/test_progress_output_tolerates0')
+
+    def test_progress_output_tolerates_legacy_stdout_encoding(tmp_path: Path) -> None:
+        """Progress glyphs must not crash the runner on non-UTF-8 consoles."""
+        repo_root = Path(__file__).resolve().parent.parent
+        runner = repo_root / "scripts" / "run_tests_parallel.py"
+    
+        probe_dir = tmp_path / "probe"
+        probe_dir.mkdir()
+        probe = probe_dir / "test_probe_smoke.py"
+        probe.write_text("def test_smoke():\n    assert True\n", encoding="utf-8")
+    
+        env = os.environ.copy()
+        env["PYTHONIOENCODING"] = "cp1252:strict"
+    
+        proc = subprocess.run(
+            [
+                sys.executable,
+                str(runner),
+                "--paths",
+                str(probe_dir),
+                "-j",
+                "1",
+                "--file-timeout",
+                "30",
+            ],
+            cwd=repo_root,
+            env=env,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+            timeout=60,
+        )
+    
+>       assert proc.returncode == 0, proc.stdout
+E       AssertionError: None
+E       assert 1 == 0
+E        +  where 1 = CompletedProcess(args=['C:\\Users\\given\\hermes-audit\\hermes-agent\\.venv\\Scripts\\python.exe', 'C:\\Users\\given\\...test-of-given\\pytest-44625\\test_progress_output_tolerates0\\probe', '-j', '1', '--file-timeout', '30'], returncode=1).returncode
+
+tests\test_run_tests_parallel.py:98: AssertionError
+____________________ test_bare_value_flag_keeps_its_value _____________________
+
+tmp_path = WindowsPath('C:/Users/given/AppData/Local/Temp/pytest-of-given/pytest-44625/test_bare_value_flag_keeps_its0')
+
+    def test_bare_value_flag_keeps_its_value(tmp_path: Path) -> None:
+        """``-k test_alpha`` reaches pytest as a selector, not as a path.
+    
+        The value token (``test_alpha``) must NOT be swallowed by the runner's
+        positional-path discovery �� if it were, discovery would look for a path
+        named ``test_alpha``, find nothing, and the run would degrade. We assert
+        the run succeeds AND only one of the two tests was selected (proving the
+        ``-k`` filter actually applied inside pytest).
+        """
+        probe_dir = _make_probe_dir(tmp_path)
+        proc = _run_runner(probe_dir, "-k", "test_alpha")
+>       assert proc.returncode == 0, proc.stdout
+E       AssertionError: Discovered 1 test files (~2 tests) under ['C:\\Users\\given\\AppData\\Local\\Temp\\pytest-of-given\\pytest-44625\\test_bare_value_flag_keeps_its0\\probe']; running with -j 1
+E         [100.0% |     2/~2 | \u27130 | \u27170] \u2717 C:\\Users\\given\\AppData\\Local\\Temp\\pytest-of-given\\pytest-44625\\test_bare_value_flag_keeps_its0\\probe\\test_flagprobe.py (1e, 11.7s)
+E         
+E           \u2554\u254d Failed: C:\\Users\\given\\AppData\\Local\\Temp\\pytest-of-given\\pytest-44625\\test_bare_value_flag_keeps_its0\\probe\\test_flagprobe.py \u254d\u254d\u254d\u254d\u254d\u254d\u254d\u254d\u254d\u254d\u254d\u254d\u254d\u254d\u254d\u254d\u254d\u254d\u254d\u254d\u254d\u254d\u254d\u254d\u254d\u254d\u254d\u254d\u254d\u254d\u254d\u254d\u254d\u254d\u254d\u254d\u254d\u254d\u254d\u254d\u254d\u254d\u254d\u254d\u254d\u254d\u254d\u254d\u254d
+E           �U ============================= test session starts =============================
+E           �U platform win32 -- Python 3.11.9, pytest-9.1.1, pluggy-1.6.0
+E           �U rootdir: C:\Users\given
+E           �U plugins: anyio-4.12.1, asyncio-1.3.0
+E           �U asyncio: mode=Mode.STRICT, debug=False, asyncio_default_fixture_loop_scope=None, asyncio_default_test_loop_scope=function
+E           �U collected 0 items / 1 error
+E           �U 
+E           �U =================================== ERRORS ====================================
+E           �U ________________________ ERROR collecting test session ________________________
+E           �U ..\..\AppData\Local\Programs\Python\Python311\Lib\pathlib.py:1163: in lstat
+E           �U     return self.stat(follow_symlinks=False)
+E           �U            ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+E           �U ..\..\AppData\Local\Programs\Python\Python311\Lib\pathlib.py:1013: in stat
+E           �U     return os.stat(self, follow_symlinks=follow_symlinks)
+E           �U            ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+E           \u2551 E   FileNotFoundError: [WinError 2] \u03f5\u0373\ufffd\u04b2\ufffd\ufffd\ufffd\u05b8\ufffd\ufffd\ufffd\ufffd\ufffd\u013c\ufffd\ufffd\ufffd: 'C:\\\\Users\\\\given\\\\AppData\\\\Local\\\\Temp\\\\hermes-test-home-wxglxbsg'
+E           �U =========================== short test summary info ===========================
+E           \u2551 ERROR ..\\.. - FileNotFoundError: [WinError 2] \u03f5\u0373\ufffd\u04b2\ufffd\ufffd\ufffd\u05b8\ufffd\ufffd\ufffd\ufffd\ufffd\u013c\ufffd\ufffd\ufffd: 'C:\\\\Us...
+E           �U !!!!!!!!!!!!!!!!!!! Interrupted: 1 error during collection !!!!!!!!!!!!!!!!!!!!
+E           �U ============================== 1 error in 4.39s ===============================
+E           �U
+E           �U  Repro: python -m pytest C:\Users\given\AppData\Local\Temp\pytest-of-given\pytest-44625\test_bare_value_flag_keeps_its0\probe\test_flagprobe.py -k test_alpha
+E           \u255a\u254d\u254d\u254d\u254d\u254d\u254d\u254d\u254d\u254d\u254d\u254d\u254d\u254d\u254d\u254d\u254d\u254d\u254d\u254d\u254d\u254d\u254d\u254d\u254d\u254d\u254d\u254d\u254d\u254d\u254d\u254d\u254d\u254d\u254d\u254d\u254d\u254d\u254d\u254d\u254d\u254d\u254d\u254d\u254d\u254d\u254d\u254d\u254d\u254d\u254d\u254d\u254d\u254d\u254d\u254d\u254d\u254d\u254d\u254d\u254d\u254d\u254d\u254d\u254d\u254d\u254d\u254d\u254d\u254d\u254d\u254d
+E         
+E         
+E         === Summary: 1 files, 0 tests passed, 0 failed (100% complete) in 11.7s (1 workers) ===
+E           Durations cached to test_durations.json (1 files)
+E         
+E         === Per-file subprocess time distribution ===
+E           Files:   1
+E           Total subprocess CPU-wall: 11.7s  (runner wall: 11.7s, parallelism: 1x)
+E           P50: 11.67s  P90: 11.67s  P95: 11.67s  P99: 11.67s  Max: 11.67s
+E           <1s: 0 files (0%)  <2s: 0 files (0%)
+E           Top 10 slowest:
+E              11.67s  C:\Users\given\AppData\Local\Temp\pytest-of-given\pytest-44625\test_bare_value_flag_keeps_its0\probe\test_flagprobe.py
+E         
+E         === Failure output ===
+E         
+E         --- C:\Users\given\AppData\Local\Temp\pytest-of-given\pytest-44625\test_bare_value_flag_keeps_its0\probe\test_flagprobe.py ---
+E         ============================= test session starts =============================
+E         platform win32 -- Python 3.11.9, pytest-9.1.1, pluggy-1.6.0
+E         rootdir: C:\Users\given
+E         plugins: anyio-4.12.1, asyncio-1.3.0
+E         asyncio: mode=Mode.STRICT, debug=False, asyncio_default_fixture_loop_scope=None, asyncio_default_test_loop_scope=function
+E         collected 0 items / 1 error
+E         
+E         =================================== ERRORS ====================================
+E         ________________________ ERROR collecting test session ________________________
+E         ..\..\AppData\Local\Programs\Python\Python311\Lib\pathlib.py:1163: in lstat
+E             return self.stat(follow_symlinks=False)
+E                    ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+E         ..\..\AppData\Local\Programs\Python\Python311\Lib\pathlib.py:1013: in stat
+E             return os.stat(self, follow_symlinks=follow_symlinks)
+E                    ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+E         E   FileNotFoundError: [WinError 2] \u03f5\u0373\ufffd\u04b2\ufffd\ufffd\ufffd\u05b8\ufffd\ufffd\ufffd\ufffd\ufffd\u013c\ufffd\ufffd\ufffd: 'C:\\\\Users\\\\given\\\\AppData\\\\Local\\\\Temp\\\\hermes-test-home-wxglxbsg'
+E         =========================== short test summary info ===========================
+E         ERROR ..\\.. - FileNotFoundError: [WinError 2] \u03f5\u0373\ufffd\u04b2\ufffd\ufffd\ufffd\u05b8\ufffd\ufffd\ufffd\ufffd\ufffd\u013c\ufffd\ufffd\ufffd: 'C:\\\\Us...
+E         !!!!!!!!!!!!!!!!!!! Interrupted: 1 error during collection !!!!!!!!!!!!!!!!!!!!
+E         ============================== 1 error in 4.39s ===============================
+E         
+E         === 1 file where no tests ran (collection/import error, timeout before collection, etc.) ===
+E           C:\Users\given\AppData\Local\Temp\pytest-of-given\pytest-44625\test_bare_value_flag_keeps_its0\probe\test_flagprobe.py
+E         
+E       assert 1 == 0
+E        +  where 1 = CompletedProcess(args=['C:\\Users\\given\\hermes-audit\\hermes-agent\\.venv\\Scripts\\python.exe', 'C:\\Users\\given\\...ven\\AppData\\Local\\Temp\\pytest-of-given\\pytest-44625\\test_bare_value_flag_keeps_its0\\probe\\test_flagprobe.py\n").returncode
+
+tests\test_run_tests_parallel.py:286: AssertionError
+_____________ test_file_retry_self_heals_and_prints_both_attempts _____________
+
+tmp_path = WindowsPath('C:/Users/given/AppData/Local/Temp/pytest-of-given/pytest-44625/test_file_retry_self_heals_and0')
+
+    def test_file_retry_self_heals_and_prints_both_attempts(tmp_path: Path) -> None:
+        """A pass-on-retry is green, loud, and retains the failing traceback."""
+        repo_root = Path(__file__).resolve().parent.parent
+        runner = repo_root / "scripts" / "run_tests_parallel.py"
+        marker = tmp_path / "ran-once"
+        probe = tmp_path / "test_flaky_probe.py"
+        probe.write_text(
+            textwrap.dedent(
+                f"""
+                from pathlib import Path
+    
+                def test_flaky_once():
+                    marker = Path({str(marker)!r})
+                    if not marker.exists():
+                        marker.write_text("failed once")
+                        assert False, "simulated first-attempt flake"
+                    assert True
+                """
+            ),
+            encoding="utf-8",
+        )
+    
+        proc = subprocess.run(
+            [
+                sys.executable,
+                str(runner),
+                "--files",
+                str(probe),
+                "--file-retries",
+                "1",
+                "-j",
+                "1",
+                "-q",
+            ],
+            cwd=repo_root,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+            timeout=60,
+        )
+    
+        assert proc.returncode == 0, proc.stdout
+>       assert "FLAKY file" in proc.stdout
+               ^^^^^^^^^^^^^^^^^^^^^^^^^^^
+E       TypeError: argument of type 'NoneType' is not iterable
+
+tests\test_run_tests_parallel.py:357: TypeError
+__________________ test_node_id_selector_runs_the_named_test __________________
+
+tmp_path = WindowsPath('C:/Users/given/AppData/Local/Temp/pytest-of-given/pytest-44625/test_node_id_selector_runs_the0')
+
+    def test_node_id_selector_runs_the_named_test(tmp_path: Path) -> None:
+        """``file.py::test_alpha`` runs that test instead of discovering nothing."""
+        probe_dir = _make_probe_dir(tmp_path)
+        target = probe_dir / "test_flagprobe.py"
+        repo_root = Path(__file__).resolve().parent.parent
+        proc = subprocess.run(
+            [sys.executable, str(repo_root / "scripts" / "run_tests_parallel.py"),
+             f"{target}::test_alpha", "-j", "1", "--file-timeout", "30"],
+            cwd=repo_root, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+            text=True, timeout=60,
+        )
+        assert proc.returncode == 0, proc.stdout
+>       assert "No test files to run" not in proc.stdout
+               ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+E       TypeError: argument of type 'NoneType' is not iterable
+
+tests\test_run_tests_parallel.py:397: TypeError
+_________________ test_explicit_k_wins_over_node_id_inference _________________
+
+tmp_path = WindowsPath('C:/Users/given/AppData/Local/Temp/pytest-of-given/pytest-44625/test_explicit_k_wins_over_node0')
+
+    def test_explicit_k_wins_over_node_id_inference(tmp_path: Path) -> None:
+        """A caller's own ``-k`` is not overridden by the node-id translation."""
+        probe_dir = _make_probe_dir(tmp_path)
+        target = probe_dir / "test_flagprobe.py"
+        repo_root = Path(__file__).resolve().parent.parent
+        proc = subprocess.run(
+            [sys.executable, str(repo_root / "scripts" / "run_tests_parallel.py"),
+             f"{target}::test_alpha", "-k", "test_beta",
+             "-j", "1", "--file-timeout", "30"],
+            cwd=repo_root, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+            text=True, timeout=60,
+        )
+        # -k test_beta wins: one test ran, and it wasn't filtered to nothing.
+        assert proc.returncode == 0, proc.stdout
+>       assert "1 tests passed" in proc.stdout
+               ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+E       TypeError: argument of type 'NoneType' is not iterable
+
+tests\test_run_tests_parallel.py:417: TypeError
+============================== warnings summary ===============================
+tests/test_run_tests_parallel.py::test_progress_output_tolerates_legacy_stdout_encoding
+  C:\Users\given\hermes-audit\hermes-agent\.venv\Lib\site-packages\_pytest\threadexception.py:58: PytestUnhandledThreadExceptionWarning: Exception in thread Thread-1 (_readerthread)
+  
+  Traceback (most recent call last):
+    File "C:\Users\given\AppData\Local\Programs\Python\Python311\Lib\threading.py", line 1045, in _bootstrap_inner
+      self.run()
+    File "C:\Users\given\AppData\Local\Programs\Python\Python311\Lib\threading.py", line 982, in run
+      self._target(*self._args, **self._kwargs)
+    File "C:\Users\given\AppData\Local\Programs\Python\Python311\Lib\subprocess.py", line 1599, in _readerthread
+      buffer.append(fh.read())
+                    ^^^^^^^^^
+  UnicodeDecodeError: 'gbk' codec can't decode byte 0x93 in position 198: illegal multibyte sequence
+  
+  Enable tracemalloc to get traceback where the object was allocated.
+  See https://docs.pytest.org/en/stable/how-to/capture-warnings.html#resource-warnings for more info.
+    warnings.warn(pytest.PytestUnhandledThreadExceptionWarning(msg))
+
+tests/test_run_tests_parallel.py::test_file_retry_self_heals_and_prints_both_attempts
+  C:\Users\given\hermes-audit\hermes-agent\.venv\Lib\site-packages\_pytest\threadexception.py:58: PytestUnhandledThreadExceptionWarning: Exception in thread Thread-4 (_readerthread)
+  
+  Traceback (most recent call last):
+    File "C:\Users\given\AppData\Local\Programs\Python\Python311\Lib\threading.py", line 1045, in _bootstrap_inner
+      self.run()
+    File "C:\Users\given\AppData\Local\Programs\Python\Python311\Lib\threading.py", line 982, in run
+      self._target(*self._args, **self._kwargs)
+    File "C:\Users\given\AppData\Local\Programs\Python\Python311\Lib\subprocess.py", line 1599, in _readerthread
+      buffer.append(fh.read())
+                    ^^^^^^^^^
+  UnicodeDecodeError: 'gbk' codec can't decode byte 0x93 in position 66: illegal multibyte sequence
+  
+  Enable tracemalloc to get traceback where the object was allocated.
+  See https://docs.pytest.org/en/stable/how-to/capture-warnings.html#resource-warnings for more info.
+    warnings.warn(pytest.PytestUnhandledThreadExceptionWarning(msg))
+
+tests/test_run_tests_parallel.py::test_node_id_selector_runs_the_named_test
+  C:\Users\given\hermes-audit\hermes-agent\.venv\Lib\site-packages\_pytest\threadexception.py:58: PytestUnhandledThreadExceptionWarning: Exception in thread Thread-6 (_readerthread)
+  
+  Traceback (most recent call last):
+    File "C:\Users\given\AppData\Local\Programs\Python\Python311\Lib\threading.py", line 1045, in _bootstrap_inner
+      self.run()
+    File "C:\Users\given\AppData\Local\Programs\Python\Python311\Lib\threading.py", line 982, in run
+      self._target(*self._args, **self._kwargs)
+    File "C:\Users\given\AppData\Local\Programs\Python\Python311\Lib\subprocess.py", line 1599, in _readerthread
+      buffer.append(fh.read())
+                    ^^^^^^^^^
+  UnicodeDecodeError: 'gbk' codec can't decode byte 0x93 in position 447: illegal multibyte sequence
+  
+  Enable tracemalloc to get traceback where the object was allocated.
+  See https://docs.pytest.org/en/stable/how-to/capture-warnings.html#resource-warnings for more info.
+    warnings.warn(pytest.PytestUnhandledThreadExceptionWarning(msg))
+
+tests/test_run_tests_parallel.py::test_explicit_k_wins_over_node_id_inference
+  C:\Users\given\hermes-audit\hermes-agent\.venv\Lib\site-packages\_pytest\threadexception.py:58: PytestUnhandledThreadExceptionWarning: Exception in thread Thread-7 (_readerthread)
+  
+  Traceback (most recent call last):
+    File "C:\Users\given\AppData\Local\Programs\Python\Python311\Lib\threading.py", line 1045, in _bootstrap_inner
+      self.run()
+    File "C:\Users\given\AppData\Local\Programs\Python\Python311\Lib\threading.py", line 982, in run
+      self._target(*self._args, **self._kwargs)
+    File "C:\Users\given\AppData\Local\Programs\Python\Python311\Lib\subprocess.py", line 1599, in _readerthread
+      buffer.append(fh.read())
+                    ^^^^^^^^^
+  UnicodeDecodeError: 'gbk' codec can't decode byte 0x93 in position 447: illegal multibyte sequence
+  
+  Enable tracemalloc to get traceback where the object was allocated.
+  See https://docs.pytest.org/en/stable/how-to/capture-warnings.html#resource-warnings for more info.
+    warnings.warn(pytest.PytestUnhandledThreadExceptionWarning(msg))
+
+-- Docs: https://docs.pytest.org/en/stable/how-to/capture-warnings.html
+=========================== short test summary info ===========================
+FAILED tests/test_run_tests_parallel.py::test_progress_output_tolerates_legacy_stdout_encoding
+FAILED tests/test_run_tests_parallel.py::test_bare_value_flag_keeps_its_value
+FAILED tests/test_run_tests_parallel.py::test_file_retry_self_heals_and_prints_both_attempts
+FAILED tests/test_run_tests_parallel.py::test_node_id_selector_runs_the_named_test
+FAILED tests/test_run_tests_parallel.py::test_explicit_k_wins_over_node_id_inference
+============= 5 failed, 4 passed, 1 skipped, 4 warnings in 58.93s =============
+
+--- tests\test_tui_gateway_server.py ---
+(90s exceeded; process tree SIGKILL'd)
+============================= test session starts =============================
+platform win32 -- Python 3.11.9, pytest-9.1.1, pluggy-1.6.0
+rootdir: C:\Users\given\hermes-audit\hermes-agent
+configfile: pyproject.toml
+plugins: anyio-4.12.1, asyncio-1.3.0
+asyncio: mode=Mode.STRICT, debug=False, asyncio_default_fixture_loop_scope=None, asyncio_default_test_loop_scope=function
+collected 585 items
+
+tests\test_tui_gateway_server.py ....................................... [  6%]
+........................................................................ [ 18%]
+........................................................................ [ 31%]
+........................................................................ [ 43%]
+........................................................................ [ 55%]
+
+=== 13 files with test failures (49 tests failed) ===
+  tests\test_minimax_oauth.py  (1 test failed)
+  tests\test_packaging_build_guard.py  (4 tests failed)
+  tests\test_prompt_consistency.py  (24 tests failed)
+  tests\test_mcp_serve.py  (1 test failed)
+  tests\test_resource_limits.py  (1 test failed)
+  tests\test_plugin_skills.py  (2 tests failed)
+  tests\test_termux_all_extra_compat.py  (2 tests failed)
+  tests\test_subprocess_home_isolation.py  (1 test failed)
+  tests\test_tini_shim.py  (4 tests failed)
+  tests\test_trajectory_compressor_async.py  (2 tests failed)
+  tests\test_state_db_malformed_repair.py  (1 test failed)
+  tests\test_web_server.py  (1 test failed)
+  tests\test_run_tests_parallel.py  (5 tests failed)
+=== 1 file where no tests ran (collection/import error, timeout before collection, etc.) ===
+  tests\test_tui_gateway_server.py

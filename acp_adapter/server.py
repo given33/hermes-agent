@@ -310,11 +310,17 @@ def _path_from_file_uri(uri: str) -> Path | None:
     if not raw:
         return None
 
-    parsed = urlparse(raw)
-    if parsed.scheme and parsed.scheme != "file":
+    # ``urlparse`` treats a native drive prefix (``C:\\...`` or
+    # ``C:/...``) as a URI scheme. Recognize it before URI parsing so raw
+    # Windows paths remain usable as well as ``file:///C:/...`` URIs.
+    is_drive_path = (
+        len(raw) >= 2 and raw[0].isalpha() and raw[1] == ":"
+    )
+    parsed = None if is_drive_path else urlparse(raw)
+    if parsed is not None and parsed.scheme and parsed.scheme != "file":
         return None
 
-    if parsed.scheme == "file":
+    if parsed is not None and parsed.scheme == "file":
         if parsed.netloc and parsed.netloc not in {"", "localhost"}:
             return None
         path_text = unquote(parsed.path or "")
@@ -325,25 +331,29 @@ def _path_from_file_uri(uri: str) -> Path | None:
     if len(path_text) >= 3 and path_text[0] == "/" and path_text[2] == ":" and path_text[1].isalpha():
         drive = path_text[1].lower()
         rest = path_text[3:].lstrip("/\\").replace("\\", "/")
+        if os.name == "nt":
+            return Path(f"{drive.upper()}:/") / rest
         return Path("/mnt") / drive / rest
     if len(path_text) >= 2 and path_text[1] == ":" and path_text[0].isalpha():
         drive = path_text[0].lower()
         rest = path_text[2:].lstrip("/\\").replace("\\", "/")
+        if os.name == "nt":
+            return Path(f"{drive.upper()}:/") / rest
         return Path("/mnt") / drive / rest
 
     return Path(path_text)
 
 
 def _decode_text_bytes(data: bytes, mime_type: str | None) -> str | None:
-    """Decode resource bytes if they are probably text; return None for binary."""
+    """Decode resource bytes if probably text, using stable prompt newlines."""
     if b"\x00" in data and not _is_text_resource(mime_type):
         return None
     for encoding in ("utf-8-sig", "utf-8", "latin-1"):
         try:
-            return data.decode(encoding)
+            return data.decode(encoding).replace("\r\n", "\n").replace("\r", "\n")
         except UnicodeDecodeError:
             continue
-    return data.decode("utf-8", errors="replace")
+    return data.decode("utf-8", errors="replace").replace("\r\n", "\n").replace("\r", "\n")
 
 
 def _format_resource_text(
@@ -1905,6 +1915,13 @@ class HermesACPAgent(acp.Agent):
                     state.queued_prompts.append(queued_text)
                     queued_depth = len(state.queued_prompts)
             else:
+                # Claim and consume any cancellation that raced this prompt
+                # under the same lock; clearing after release reopens the
+                # exact window where cancel() can be erased before dispatch.
+                if state.cancel_event and state.cancel_event.is_set():
+                    return PromptResponse(stop_reason="cancelled")
+                if state.cancel_event:
+                    state.cancel_event.clear()
                 state.is_running = True
                 state.current_prompt_text = user_text or "[Image attachment]"
 
@@ -1927,9 +1944,6 @@ class HermesACPAgent(acp.Agent):
 
         conn = self._conn
         loop = asyncio.get_running_loop()
-
-        if state.cancel_event:
-            state.cancel_event.clear()
 
         tool_call_ids: dict[str, Deque[str]] = defaultdict(deque)
         tool_call_meta: dict[str, dict[str, Any]] = {}
@@ -2003,9 +2017,10 @@ class HermesACPAgent(acp.Agent):
         interactive_token = None
         edit_approval_token = None
         previous_session_id = None
+        session_env_mirror_token = None
 
         def _run_agent() -> dict:
-            nonlocal previous_approval_cb, interactive_token, edit_approval_token, previous_session_id
+            nonlocal previous_approval_cb, interactive_token, edit_approval_token, previous_session_id, session_env_mirror_token
             # Bind HERMES_SESSION_KEY for this session so per-session caches
             # (e.g. the interactive sudo password cache in tools.terminal_tool)
             # scope to the ACP session rather than leaking across sessions
@@ -2030,6 +2045,12 @@ class HermesACPAgent(acp.Agent):
                     session_key=session_id, session_id=session_id, cwd=state.cwd,
                     cron_session="",
                 )
+                # ACP serves concurrent sessions in one process. Keep the
+                # authoritative session id task-local; the process-global env
+                # mirror would let one turn's save/restore clobber another's.
+                from gateway.session_context import disable_session_env_mirror
+
+                session_env_mirror_token = disable_session_env_mirror()
             except Exception:
                 session_tokens = None
                 clear_session_vars = None  # type: ignore[assignment]
@@ -2058,8 +2079,6 @@ class HermesACPAgent(acp.Agent):
             # the new task so clients can render a per-session board). Save
             # and restore around the agent call so a re-used executor thread
             # never leaks one session's id into the next session's tools.
-            previous_session_id = os.environ.get("HERMES_SESSION_ID")
-            os.environ["HERMES_SESSION_ID"] = session_id
             # Auto-titling fires inside the turn prologue now; give the agent
             # this session's notifier so a new title reaches the client as a
             # session-info update instead of waiting for the next one.
@@ -2086,11 +2105,6 @@ class HermesACPAgent(acp.Agent):
                 # Restore the interactive contextvar for this context.
                 if interactive_token is not None:
                     reset_hermes_interactive_context(interactive_token)
-                # Restore HERMES_SESSION_ID symmetrically.
-                if previous_session_id is None:
-                    os.environ.pop("HERMES_SESSION_ID", None)
-                else:
-                    os.environ["HERMES_SESSION_ID"] = previous_session_id
                 if approval_cb:
                     try:
                         from tools import terminal_tool as _terminal_tool
@@ -2109,6 +2123,10 @@ class HermesACPAgent(acp.Agent):
                         clear_session_vars(session_tokens)
                     except Exception:
                         logger.debug("Could not clear ACP session context", exc_info=True)
+                if session_env_mirror_token is not None:
+                    from gateway.session_context import restore_session_env_mirror
+
+                    restore_session_env_mirror(session_env_mirror_token)
 
         try:
             # Snapshot the internal Hermes DB session id before the turn so we

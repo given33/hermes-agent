@@ -336,7 +336,18 @@ KANBAN_GUIDANCE = (
     "specialist profile.\n"
     "- Do not call `delegate_task` as a board substitute. `delegate_task` is "
     "for short reasoning subtasks inside your own run; board tasks are for "
-    "cross-agent handoffs that outlive one API loop."
+    "cross-agent handoffs that outlive one API loop.\n"
+    "\n"
+    "## Delegation subtasks (when you do use `delegate_task`)\n"
+    "\n"
+    "Give each subagent a Chinese occupational `name`, a self-contained "
+    "`goal` + `context`, an `expected_output` describing the deliverable, and "
+    "`acceptance_criteria` for how you will verify it. Use `inherit_turns` to "
+    "share recent conversation context (default 0) and `context_variables` to "
+    "pass small shared state between siblings. While subagents run, use "
+    "`subagent_list` to check progress, `subagent_send` to steer, and "
+    "`subagent_kill` to terminate a stuck child. If you need a user decision, "
+    "call `kanban_block(kind=\"needs_input\", reason=\"问题 + 选项：A. ... B. ...\")`."
 )
 
 TOOL_USE_ENFORCEMENT_GUIDANCE = (

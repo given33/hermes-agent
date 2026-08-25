@@ -3125,9 +3125,17 @@ class TestVisionAutoSkipsKimiCoding:
 
 
     def test_skip_set_covers_exactly_known_entries(self):
-        """Guard against accidental widening of the skip list."""
+        """Guard against accidental widening of the skip list.
+
+        ``deepseek`` was added alongside the original Kimi Coding entries when
+        it was confirmed that the DeepSeek chat-completions endpoint does not
+        accept image input (its vision capability is a separate, model-keyed
+        gate). Update this assertion when adding a NEW skip target so the
+        intentional widening stays in sync with the production set.
+        """
         from agent.auxiliary_client import _PROVIDERS_WITHOUT_VISION
         assert _PROVIDERS_WITHOUT_VISION == frozenset({
+            "deepseek",
             "kimi-coding",
             "kimi-coding-cn",
         })

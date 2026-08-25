@@ -13,7 +13,7 @@ const SPRING = { stiffness: 320, damping: 30, mass: 0.5 } as const
 // worktree (same numbers) therefore doesn't animate.
 function AnimatedInt({ value }: { value: number }) {
   const spring = useSpring(value, SPRING)
-  const text = useTransform(spring, latest => Math.round(latest).toString())
+  const text = useTransform(spring, (latest: number) => Math.round(latest).toString())
 
   useEffect(() => {
     spring.set(value)

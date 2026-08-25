@@ -454,6 +454,7 @@ class TestF6ExecutorSaturation:
             assert returned is messages
             # The cancelled attempt must not leave the durable lock held.
             assert db.get_compression_lock_holder(session_id) is None
+            db.close()
 
 
 class TestS3IdleChargedFromLastProgress:

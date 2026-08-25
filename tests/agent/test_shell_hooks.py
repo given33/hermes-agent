@@ -207,7 +207,7 @@ class TestCallbackSubprocess:
         script = _write_script(
             tmp_path, "log.sh",
             f"#!/usr/bin/env bash\n"
-            f"echo \"$(cat -)\" >> {calls}\n"
+            f"echo \"$(cat -)\" >> {calls.as_posix()}\n"
             f"printf '{{}}\\n'\n",
         )
         spec = shell_hooks.ShellHookSpec(
@@ -227,7 +227,7 @@ class TestCallbackSubprocess:
         capture = tmp_path / "payload.json"
         script = _write_script(
             tmp_path, "capture.sh",
-            f"#!/usr/bin/env bash\ncat - > {capture}\nprintf '{{}}\\n'\n",
+            f"#!/usr/bin/env bash\ncat - > {capture.as_posix()}\nprintf '{{}}\\n'\n",
         )
         spec = shell_hooks.ShellHookSpec(
             event="pre_tool_call", command=str(script),
@@ -239,7 +239,7 @@ class TestCallbackSubprocess:
             session_id="sess-77",
             task_id="task-77",
         )
-        payload = json.loads(capture.read_text())
+        payload = json.loads(capture.read_text(encoding="utf-8"))
         assert payload["hook_event_name"] == "pre_tool_call"
         assert payload["tool_name"] == "terminal"
         assert payload["tool_input"] == {"command": "echo hi"}

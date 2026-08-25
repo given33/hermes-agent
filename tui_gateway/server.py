@@ -4829,6 +4829,83 @@ def _restore_agent_model_runtime(agent, snapshot: dict | None) -> None:
         )
 
 
+_MISSING_TURN_POLICY_VALUE = object()
+
+
+def _turn_tool_policy_snapshot(agent, allow_tools: bool | None) -> dict | None:
+    """Apply a per-turn hosted tool policy and return its restore snapshot.
+
+    Hosted fast/chat-only turns temporarily remove the model-visible tool
+    surface from the persistent agent. The snapshot is deliberately limited to
+    the fields owned by that policy; model transport and reasoning settings are
+    left untouched. ``None`` means the request did not specify a policy.
+    """
+    if allow_tools is None or agent is None:
+        return None
+
+    fields = (
+        "tools",
+        "valid_tool_names",
+        "enabled_toolsets",
+        "_last_content_with_tools",
+        "_last_content_tools_all_housekeeping",
+    )
+    snapshot = {
+        name: copy.copy(getattr(agent, name, _MISSING_TURN_POLICY_VALUE))
+        for name in fields
+    }
+    if not allow_tools:
+        agent.tools = []
+        agent.valid_tool_names = set()
+        agent.enabled_toolsets = []
+        agent._last_content_with_tools = None
+        agent._last_content_tools_all_housekeeping = False
+    return snapshot
+
+
+def _restore_turn_tool_policy(agent, snapshot: dict | None) -> None:
+    """Restore the fields changed by :func:`_turn_tool_policy_snapshot`."""
+    if agent is None or not snapshot:
+        return
+    for name, value in snapshot.items():
+        if value is _MISSING_TURN_POLICY_VALUE:
+            try:
+                delattr(agent, name)
+            except AttributeError:
+                pass
+        else:
+            setattr(agent, name, value)
+
+
+def _ensure_hosted_tools_for_turn(
+    sid: str,
+    session: dict,
+    agent,
+    allow_tools: bool | None,
+) -> None:
+    """Hydrate late MCP tools once, and only for an explicit tool turn.
+
+    Fast hosted chat turns intentionally avoid MCP discovery. A later turn
+    that explicitly enables tools must wait for the bounded discovery worker,
+    refresh the live agent snapshot, and remember that hydration completed so
+    repeated turn setup cannot duplicate refresh work.
+    """
+    if not allow_tools or agent is None or session.get("_hosted_tools_hydrated"):
+        return
+
+    from tui_gateway.entry import (
+        ensure_mcp_discovery_started,
+        wait_for_mcp_discovery,
+    )
+    from tools.mcp_tool import refresh_agent_mcp_tools
+
+    ensure_mcp_discovery_started()
+    wait_for_mcp_discovery()
+    refresh_agent_mcp_tools(agent)
+    session["_hosted_tools_hydrated"] = True
+    logger.debug("Hosted tool surface hydrated for session %s", sid)
+
+
 def _apply_model_switch(
     sid: str,
     session: dict,
@@ -6548,8 +6625,22 @@ def _cfg_max_turns(cfg: dict, default: int) -> int:
             return env_max
     except (TypeError, ValueError):
         pass
+    # Mirror cron/scheduler.py's max-turns parsing: "none"/"unlimited" are
+    # documented spellings for unbounded, an explicit 0 is preserved, and a
+    # non-numeric value falls back to the default. The old `or` chain both
+    # crashed every prompt submit on int("none") and collapsed 0 into the
+    # default; absent-key fallback (not falsy-key) matches the scheduler.
     agent_cfg = cfg.get("agent") or {}
-    return int(agent_cfg.get("max_turns") or cfg.get("max_turns") or default)
+    raw_max_turns = agent_cfg.get("max_turns", cfg.get("max_turns", default))
+    if isinstance(raw_max_turns, str) and raw_max_turns.strip().lower() in {
+        "none",
+        "unlimited",
+    }:
+        return 999_999
+    try:
+        return int(raw_max_turns)
+    except (TypeError, ValueError):
+        return default
 
 
 def _parse_tui_skills_env() -> list[str]:

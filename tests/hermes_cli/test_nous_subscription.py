@@ -308,9 +308,18 @@ def test_has_agent_browser_import_failure_falls_back_to_hermes_managed_node_path
     monkeypatch.setitem(sys.modules, "tools.browser_tool", None)
     managed_dir = tmp_path / "node"
     managed_dir.mkdir()
-    managed_bin = managed_dir / "agent-browser"
+    # shutil.which is PATHEXT-aware on Windows and will not resolve an
+    # extensionless file as executable, so name the stub as the real
+    # installer's shim would be named on each host.
+    managed_name = (
+        "agent-browser.cmd" if sys.platform == "win32" else "agent-browser"
+    )
+    managed_bin = managed_dir / managed_name
     managed_bin.write_text("#!/bin/sh\nexit 0\n")
-    managed_bin.chmod(0o755)
+    try:
+        managed_bin.chmod(0o755)
+    except OSError:
+        pass
 
     real_which = shutil.which
     monkeypatch.setattr(
@@ -327,7 +336,9 @@ def test_has_agent_browser_import_failure_falls_back_to_hermes_managed_node_path
     )
     monkeypatch.setattr(
         "hermes_constants.agent_browser_runnable",
-        lambda p: bool(p) and str(p) == str(managed_bin),
+        # PATHEXT matching on Windows resolves the shim to e.g.
+        # ``agent-browser.CMD`` — compare case-insensitively like NTFS paths.
+        lambda p: bool(p) and str(p).lower() == str(managed_bin).lower(),
     )
 
     assert ns._has_agent_browser() is True

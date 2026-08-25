@@ -35,7 +35,10 @@ piecemeal, the footer is sent as a separate trailing message via
 from __future__ import annotations
 
 import os
+import posixpath
 from typing import Any, Iterable, Optional
+
+from hermes_constants import expand_user_path
 
 _DEFAULT_FIELDS: tuple[str, ...] = ("model", "context_pct", "cwd")
 _SEP = " · "
@@ -45,12 +48,23 @@ def _home_relative_cwd(cwd: str) -> str:
     """Return *cwd* with ``$HOME`` collapsed to ``~``.  Empty string if unset."""
     if not cwd:
         return ""
+    raw = os.fspath(cwd)
+    # A gateway can display a cwd supplied by a remote POSIX agent even when
+    # the gateway process itself runs on Windows.  ``ntpath.abspath`` would
+    # silently turn ``/var/data`` into ``C:\\var\\data`` and change the
+    # namespace.  Preserve explicit single-root POSIX paths as display data;
+    # UNC paths (``//server/share``) remain native Windows paths.
+    if os.name == "nt" and raw.startswith("/") and not raw.startswith("//"):
+        return posixpath.normpath(raw)
     try:
-        home = os.path.expanduser("~")
+        home = os.path.abspath(expand_user_path("~"))
         p = os.path.abspath(cwd)
-        if home and (p == home or p.startswith(home + os.sep)):
-            return "~" + p[len(home):]
-        return p
+        home_key = os.path.normcase(home)
+        path_key = os.path.normcase(p)
+        if home and (path_key == home_key or path_key.startswith(home_key + os.sep)):
+            suffix = p[len(home):].replace("\\", "/")
+            return "~" + suffix
+        return p.replace("\\", "/") if os.name == "nt" else p
     except Exception:
         return cwd
 

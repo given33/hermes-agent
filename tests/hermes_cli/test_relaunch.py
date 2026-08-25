@@ -99,6 +99,11 @@ class TestBuildRelaunchArgv:
 
 
 class TestRelaunch:
+    @pytest.mark.skipif(
+        sys.platform == "win32",
+        reason="os.execvp process replacement is POSIX-only; the Windows route "
+               "is covered by test_windows_uses_subprocess_not_execvp",
+    )
     def test_calls_execvp(self, monkeypatch):
         calls = []
 

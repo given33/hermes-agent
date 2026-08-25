@@ -112,7 +112,10 @@ class TestDetectDangerousRm:
         real_temp = tmp_path / "real-temp"
         real_temp.mkdir()
         linked_temp = tmp_path / "linked-temp"
-        linked_temp.symlink_to(real_temp, target_is_directory=True)
+        try:
+            linked_temp.symlink_to(real_temp, target_is_directory=True)
+        except OSError:
+            pytest.skip("symlink creation requires platform privileges")
         basename = "hermes-verify-example.py"
 
         with mock_patch("tempfile.gettempdir", return_value=str(linked_temp)):

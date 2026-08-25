@@ -39,6 +39,10 @@ from hermes_constants import hermes_home_key
 logger = logging.getLogger(__name__)
 
 
+def _canonical_scope(scope: Optional[str]) -> Optional[str]:
+    return hermes_home_key(scope) if scope is not None else None
+
+
 def _plugin_scope_from_callable(callback: Callable) -> Optional[str]:
     """Infer a plugin profile from code registered outside PluginContext."""
     try:
@@ -279,6 +283,7 @@ class PlatformRegistry:
         *,
         create: bool = False,
     ) -> tuple[dict[str, PlatformEntry], dict[str, Callable[[], None]]]:
+        scope = _canonical_scope(scope)
         if scope is None:
             return self._entries, self._deferred
         if create:
@@ -309,6 +314,7 @@ class PlatformRegistry:
         registered directly (e.g. a built-in) takes precedence -- the deferred
         loader is then dropped.
         """
+        scope = _canonical_scope(scope)
         with self._lock:
             entries, deferred = self._scope_maps(scope, create=True)
             self._consumed_loaders.pop((scope, name), None)
@@ -330,6 +336,7 @@ class PlatformRegistry:
         importing the displaced adapter as a side effect of taking the
         snapshot.
         """
+        scope = _canonical_scope(scope)
         with self._lock:
             entries, deferred = self._scope_maps(scope)
             loader = deferred.get(name)
@@ -354,6 +361,7 @@ class PlatformRegistry:
         it displaced.  Both concrete entries and deferred loaders are part of
         the state because bundled platform plugins load lazily.
         """
+        scope = _canonical_scope(scope)
         with self._lock:
             entries, deferred = self._scope_maps(scope, create=True)
             entry = entries.get(name)
@@ -392,6 +400,7 @@ class PlatformRegistry:
 
     def _resolve(self, name: str, scope: Optional[str] = None) -> None:
         """Run the deferred loader for *name* if one is pending."""
+        scope = _canonical_scope(scope)
         loader: Optional[Callable[[], None]] = None
         event: Optional[threading.Event] = None
         load_key: tuple[Optional[str], str]
@@ -472,6 +481,7 @@ class PlatformRegistry:
         scope: Optional[str] = None,
     ) -> bool:
         """Return whether ownership teardown cancelled an in-flight loader."""
+        scope = _canonical_scope(scope)
         with self._lock:
             return (scope, name) in self._cancelled_inflight
 
@@ -518,6 +528,7 @@ class PlatformRegistry:
                     scope = _plugin_scope_from_callable(entry.adapter_factory)
                 if scope is None:
                     scope = _plugin_scope_from_callable(entry.check_fn)
+            scope = _canonical_scope(scope)
             # A concrete registration supersedes any pending deferred loader.
             entries, deferred = self._scope_maps(scope, create=True)
             self._consumed_loaders.pop((scope, entry.name), None)
@@ -537,6 +548,7 @@ class PlatformRegistry:
         """Remove a platform entry.  Returns True if it existed."""
         with self._lock:
             inferred_scope = scope if scope is not None else _caller_plugin_scope()
+            inferred_scope = _canonical_scope(inferred_scope)
             active_scope = inferred_scope or self.current_scope_key()
             entries, deferred = self._scope_maps(active_scope)
             if inferred_scope is not None or name in entries or name in deferred:

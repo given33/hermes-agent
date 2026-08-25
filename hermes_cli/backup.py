@@ -1440,7 +1440,11 @@ def _create_quick_snapshot_locked(
                             continue
                     else:
                         shutil.copy2(sub, dst)
-                    manifest[sub_rel] = dst.stat().st_size
+                    # Use src size: on Windows ``shutil.copy2`` appends a metadata
+                    # block that ``dst.stat().st_size`` reports, but the manifest
+                    # is the source-of-truth for restoration and must match the
+                    # bytes the user actually wrote.
+                    manifest[sub_rel] = sub.stat().st_size
                 except (OSError, PermissionError) as exc:
                     logger.warning("Could not snapshot %s: %s", sub_rel, exc)
             continue
@@ -1472,7 +1476,8 @@ def _create_quick_snapshot_locked(
                     continue
             else:
                 shutil.copy2(src, dst)
-            manifest[rel] = dst.stat().st_size
+            # Use src size for manifest accuracy (see Windows copy2 metadata note above).
+            manifest[rel] = src.stat().st_size
         except (OSError, PermissionError) as exc:
             logger.warning("Could not snapshot %s: %s", rel, exc)
 

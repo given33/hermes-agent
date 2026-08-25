@@ -651,10 +651,15 @@ def build_system_prompt_parts(agent: Any, system_message: Optional[str] = None) 
     # paths. Without an agent home, keep the ambient resolution byte-identical
     # to the legacy behavior (and patchable via this module's get_hermes_home).
     if _agent_home_path is not None:
-        _home_str = str(_agent_home_path)
-        _root_str = str(get_default_hermes_root())
+        # Normalize to forward slashes so the prompt path text is portable
+        # across POSIX and Windows hosts (the system prompt is cached and
+        # shipped to the model; backslashes would make the message look like
+        # an escape sequence and the existing test suite expects the
+        # ``/profiles/<name>/`` form regardless of host platform).
+        _home_str = str(_agent_home_path).replace("\\", "/")
+        _root_str = str(get_default_hermes_root()).replace("\\", "/")
     else:
-        _home_str = _root_str = str(get_hermes_home())
+        _home_str = _root_str = str(get_hermes_home()).replace("\\", "/")
     if active_profile == "default":
         post_workspace_parts.append(
             "Active Hermes profile: default. Other profiles (if any) live "
@@ -673,7 +678,10 @@ def build_system_prompt_parts(agent: Any, system_message: Optional[str] = None) 
         # data sits at the ROOT (get_default_hermes_root()), which in ambient
         # profile mode is NOT get_hermes_home().
         profile_home = _home_str
-        default_root = get_default_hermes_root()
+        # Normalize the default root to forward slashes too: the prompt text
+        # is portable across POSIX and Windows hosts (see normalization note
+        # above), and the test suite uses ``as_posix()`` to match.
+        default_root = str(get_default_hermes_root()).replace("\\", "/")
         post_workspace_parts.append(
             f"Active Hermes profile: {active_profile}. This session reads "
             f"and writes {profile_home}/. The default "

@@ -18,6 +18,8 @@ from __future__ import annotations
 import json
 import os
 import time
+import threading
+import uuid
 from typing import Optional
 
 _MAX_ENTRIES = 1000
@@ -36,36 +38,73 @@ def _key(chat_id, message_id) -> str:
     return f"{chat_id}:{message_id}"
 
 
+_PROCESS_LOCK = threading.Lock()
+
+
 def record(chat_id, message_id, text: Optional[str]) -> None:
     """Persist ``text`` for ``(chat_id, message_id)``. No-op on any failure."""
     if not text or message_id is None or chat_id is None:
         return
+
     path = _store_path()
+    lock_handle = None
     try:
         os.makedirs(os.path.dirname(path), exist_ok=True)
-        try:
-            with open(path, "r", encoding="utf-8") as fh:
-                data = json.load(fh)
-            if not isinstance(data, dict):
+        lock_handle = open(f"{path}.lock", "a+b")
+
+        with _PROCESS_LOCK:
+            if os.name == "nt":
+                import portalocker
+
+                portalocker.lock(
+                    lock_handle.fileno(),
+                    portalocker.LockFlags.EXCLUSIVE,
+                )
+            else:
+                import fcntl
+
+                fcntl.flock(lock_handle.fileno(), fcntl.LOCK_EX)
+            try:
+                with open(path, "r", encoding="utf-8") as fh:
+                    data = json.load(fh)
+                if not isinstance(data, dict):
+                    data = {}
+            except (FileNotFoundError, ValueError):
                 data = {}
-        except (FileNotFoundError, ValueError):
-            data = {}
-        data[_key(chat_id, message_id)] = {
-            "t": text[:_MAX_TEXT_CHARS],
-            "ts": int(time.time()),
-        }
-        # Trim oldest by timestamp when over cap.
-        if len(data) > _MAX_ENTRIES:
-            for k, _ in sorted(
-                data.items(), key=lambda kv: kv[1].get("ts", 0)
-            )[: len(data) - _MAX_ENTRIES]:
-                data.pop(k, None)
-        tmp = f"{path}.tmp.{os.getpid()}"
-        with open(tmp, "w", encoding="utf-8") as fh:
-            json.dump(data, fh, ensure_ascii=False)
-        os.replace(tmp, path)  # atomic; tolerates concurrent writers racing
+            data[_key(chat_id, message_id)] = {
+                "t": text[:_MAX_TEXT_CHARS],
+                "ts": int(time.time()),
+            }
+            if len(data) > _MAX_ENTRIES:
+                stale = sorted(
+                    data.items(), key=lambda item: item[1].get("ts", 0)
+                )[: len(data) - _MAX_ENTRIES]
+                for stale_key, _value in stale:
+                    data.pop(stale_key, None)
+            tmp = (
+                f"{path}.tmp.{os.getpid()}.{threading.get_ident()}."
+                f"{uuid.uuid4().hex}"
+            )
+            with open(tmp, "w", encoding="utf-8") as fh:
+                json.dump(data, fh, ensure_ascii=False)
+            os.replace(tmp, path)
     except Exception:
-        return
+        pass
+    finally:
+        if lock_handle is not None:
+            try:
+                if os.name == "nt":
+                    import portalocker
+
+                    portalocker.unlock(lock_handle.fileno())
+                else:
+                    import fcntl
+
+                    fcntl.flock(lock_handle.fileno(), fcntl.LOCK_UN)
+            except Exception:
+                pass
+            finally:
+                lock_handle.close()
 
 
 def lookup(chat_id, message_id) -> Optional[str]:

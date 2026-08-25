@@ -1,7 +1,9 @@
 """Shared SKILL.md preprocessing helpers."""
 
 import logging
+import os
 import re
+import shutil
 import subprocess
 from pathlib import Path
 
@@ -20,6 +22,35 @@ _INLINE_SHELL_RE = re.compile(r"!`([^`\n]+)`")
 
 # Cap inline-shell output so a runaway command can't blow out the context.
 _INLINE_SHELL_MAX_OUTPUT = 4000
+
+
+def _windows_git_bash() -> str | None:
+    """Return Git Bash; the bare ``bash`` shim may be WSL on Windows."""
+    from tools.environments.local import _find_bash
+
+    return _find_bash()
+
+
+def _windows_bash_env(bash: str) -> dict[str, str]:
+    """Give Git Bash snippets access to its bundled POSIX tools."""
+    from tools.environments.local import build_subprocess_env
+
+    env = build_subprocess_env(
+        scrub_secrets=False,
+        inherit_profile_home=False,
+    )
+    shell_root = Path(bash).resolve().parents[2]
+    env["PATH"] = str(shell_root / "usr" / "bin") + os.pathsep + env.get("PATH", "")
+    return env
+
+
+def _normalize_windows_bash_output(output: str) -> str:
+    """Convert Git Bash's /drive/... pwd spelling to native Windows paths."""
+    match = re.fullmatch(r"/([a-zA-Z])/(.*)", output)
+    if not match:
+        return output
+    drive, tail = match.groups()
+    return f"{drive.upper()}:\\" + tail.replace("/", "\\")
 
 
 def load_skills_config() -> dict:
@@ -70,14 +101,23 @@ def run_inline_shell(command: str, cwd: Path | None, timeout: int) -> str:
     """
     _popen_kwargs = {"creationflags": windows_hide_flags()} if IS_WINDOWS else {}
     try:
+        bash = _windows_git_bash() if IS_WINDOWS else "bash"
+        if not bash:
+            return "[inline-shell error: bash not found]"
+        # Git Bash exposes the temporary directory through a /tmp mount, so a
+        # plain pwd reports a POSIX alias rather than the native path authors
+        # need in generated skill text.
+        effective_command = "pwd -W" if IS_WINDOWS and command.strip() == "pwd" else command
+        native_pwd = IS_WINDOWS and effective_command == "pwd -W"
         completed = subprocess.run(
-            ["bash", "-c", command],
+            [bash, "-c", effective_command],
             cwd=str(cwd) if cwd else None,
             capture_output=True,
             text=True, encoding='utf-8', errors='replace',
             timeout=max(1, int(timeout)),
             check=False,
             stdin=subprocess.DEVNULL,
+            env=_windows_bash_env(bash) if IS_WINDOWS else None,
             **_popen_kwargs,
         )
     except subprocess.TimeoutExpired:
@@ -96,6 +136,10 @@ def run_inline_shell(command: str, cwd: Path | None, timeout: int) -> str:
         return f"[inline-shell error: {exc}]"
 
     output = (completed.stdout or "").rstrip("\n")
+    if IS_WINDOWS:
+        output = _normalize_windows_bash_output(output)
+        if native_pwd:
+            output = output.replace("/", "\\")
     if not output and completed.stderr:
         output = completed.stderr.rstrip("\n")
     if len(output) > _INLINE_SHELL_MAX_OUTPUT:

@@ -583,7 +583,7 @@ class TestLoginNousSkipKeepsCurrent:
         )
         _login_nous(args, PROVIDER_REGISTRY["nous"])
 
-        cfg_after = yaml.safe_load(config_path.read_text())
+        cfg_after = yaml.safe_load(config_path.read_text(encoding="utf-8"))
         assert cfg_after["model"]["provider"] == "nous"
         assert cfg_after["model"]["default"] == "xiaomi/mimo-v2-pro"
         assert free_tier_calls == [{"force_fresh": True}]
@@ -903,9 +903,12 @@ def test_shared_store_write_and_read_roundtrip(shared_store_env):
     path = _nous_shared_store_path()
     assert path.is_file()
 
-    # Permissions should be 0600 where the platform supports it.
+    # Permissions should be 0600/0644 where the platform supports POSIX
+    # modes. Windows has no chmod bit model (os.chmod only toggles the
+    # read-only flag), so the raw mode reads back 0o666 there.
     mode = path.stat().st_mode & 0o777
-    assert mode == 0o600 or mode == 0o644  # 0o644 on platforms without chmod
+    if sys.platform != "win32":
+        assert mode == 0o600 or mode == 0o644  # 0o644 on platforms without chmod
 
     loaded = _read_shared_nous_state()
     assert loaded is not None

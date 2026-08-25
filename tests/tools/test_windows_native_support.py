@@ -931,8 +931,23 @@ class TestWindowlessGatewayRestartSpec:
     def test_noop_on_non_windows(self):
         import hermes_cli.gateway_windows as gw
 
-        argv = ["/path/venv/bin/python", "-m", "hermes_cli.main", "gateway", "run"]
-        new_argv, cwd, env = gw.windowless_gateway_restart_spec(list(argv))
+        # The no-op contract is keyed on sys.platform != "win32", so pin
+        # that premise explicitly: on a native Windows host the real
+        # function correctly takes the spec-building branch (stable cwd +
+        # env overlay) instead of no-oping -- that Windows side is covered
+        # by test_windows_keeps_console_python_and_preserves_tail. Patching
+        # the platform token lets this POSIX-only branch stay asserted on
+        # every host; nothing else is reachable behind the early return, so
+        # the patch is complete.
+        with mock.patch.object(sys, "platform", "linux"):
+            argv = [
+                "/path/venv/bin/python",
+                "-m",
+                "hermes_cli.main",
+                "gateway",
+                "run",
+            ]
+            new_argv, cwd, env = gw.windowless_gateway_restart_spec(list(argv))
         assert new_argv == argv
         assert cwd == ""
         assert env == {}

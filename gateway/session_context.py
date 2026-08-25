@@ -128,6 +128,9 @@ _CRON_SESSION: ContextVar = ContextVar("HERMES_CRON_SESSION", default=_UNSET)
 # setting ``supports_async_delivery = False`` on the adapter class; the gateway
 # propagates that into this contextvar at session-bind time.
 _SESSION_ASYNC_DELIVERY: ContextVar = ContextVar("HERMES_SESSION_ASYNC_DELIVERY", default=_UNSET)
+_ENV_MIRROR_DISABLED: ContextVar[bool] = ContextVar(
+    "HERMES_SESSION_ENV_MIRROR_DISABLED", default=False
+)
 
 # Cron auto-delivery vars — set per-job in run_job() so concurrent jobs
 # don't clobber each other's delivery targets.
@@ -188,12 +191,23 @@ def set_current_session_id(session_id: str) -> None:
     try:
         from agent.delegation_context import is_delegated_child_context
 
-        if is_delegated_child_context():
+        if is_delegated_child_context() or _ENV_MIRROR_DISABLED.get():
             return
     except Exception:
         pass
 
     os.environ["HERMES_SESSION_ID"] = session_id
+
+
+def disable_session_env_mirror() -> object:
+    """Disable process-global session-env writes for this execution context."""
+    return _ENV_MIRROR_DISABLED.set(True)
+
+
+def restore_session_env_mirror(token: object) -> None:
+    """Restore a token returned by :func:`disable_session_env_mirror`."""
+    if token is not None:
+        _ENV_MIRROR_DISABLED.reset(token)  # type: ignore[arg-type]
 
 
 @contextmanager

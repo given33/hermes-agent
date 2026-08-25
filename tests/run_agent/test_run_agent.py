@@ -75,6 +75,10 @@ def agent():
             skip_memory=True,
         )
         a.client = MagicMock()
+        # The contract runtime now detects registry-generation drift. Tests
+        # register/deregister tools freely between fixture creation and test
+        # body, so disable binding validation for this mock agent.
+        a._tool_snapshot_generation = None
         return a
 
 

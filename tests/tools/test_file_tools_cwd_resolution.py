@@ -16,12 +16,31 @@ Core invariant these tests pin:
 """
 
 import os
+import sys
 from pathlib import Path, PurePosixPath
 
 import pytest
 
 import tools.file_tools as ft
 import tools.terminal_tool as terminal_tool
+
+
+def _make_host_dir_link(link: Path, target: Path) -> None:
+    """Create *link* -> *target* without symlink privileges.
+
+    The tests below need a host-side directory link to prove container-mode
+    resolution never dereferences it. Creating real symlinks on Windows
+    requires SeCreateSymbolicLinkPrivilege (admin or Developer Mode), which
+    test runners do not have; an NTFS junction is unprivileged and is followed
+    by every host dereference path (Path.resolve/os.path.realpath), so it
+    exercises exactly the premise under test.
+    """
+    if sys.platform == "win32":
+        import _winapi
+
+        _winapi.CreateJunction(str(target), str(link))
+    else:
+        link.symlink_to(target, target_is_directory=True)
 
 
 @pytest.fixture
@@ -100,7 +119,7 @@ def test_container_absolute_input_path_does_not_follow_host_symlink(tmp_path, mo
     host_project = tmp_path / "host-project"
     host_project.mkdir()
     container_mount = tmp_path / "workspace-projects"
-    container_mount.symlink_to(host_project, target_is_directory=True)
+    _make_host_dir_link(container_mount, host_project)
     monkeypatch.setattr(terminal_tool, "_get_env_config", lambda: {"env_type": "docker"})
     monkeypatch.setattr(terminal_tool, "_active_environments", {})
 
@@ -123,7 +142,7 @@ def test_container_relative_path_keeps_container_cwd_symlink(tmp_path, monkeypat
     host_project = tmp_path / "host-project"
     host_project.mkdir()
     container_mount = tmp_path / "workspace-projects"
-    container_mount.symlink_to(host_project, target_is_directory=True)
+    _make_host_dir_link(container_mount, host_project)
     monkeypatch.setattr(terminal_tool, "_get_env_config", lambda: {"env_type": "docker"})
     monkeypatch.setattr(terminal_tool, "_active_environments", {})
     terminal_tool.record_session_cwd("default", str(container_mount))

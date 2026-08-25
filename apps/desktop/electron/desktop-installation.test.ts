@@ -38,7 +38,12 @@ test('loadOrCreateInstallationId persists and reuses one installation ID', () =>
       loadOrCreateInstallationId(filePath, () => ID_B),
       ID_A
     )
-    assert.equal(fs.statSync(filePath).mode & 0o777, 0o600)
+
+    // Windows does not expose POSIX mode bits; the production reader only
+    // tightens permissions on POSIX and relies on the userData ACL on Windows.
+    if (process.platform !== 'win32') {
+      assert.equal(fs.statSync(filePath).mode & 0o777, 0o600)
+    }
   }))
 
 test('loadOrCreateInstallationId tightens an existing identity file', () =>
@@ -66,12 +71,8 @@ test('loadOrCreateInstallationId replaces a malformed existing record', () =>
     assert.equal(JSON.parse(fs.readFileSync(filePath, 'utf8')).installationId, ID_A)
   }))
 
-test('loadOrCreateInstallationId replaces an existing symlink', () =>
+test.skipIf(process.platform === 'win32')('loadOrCreateInstallationId replaces an existing symlink', () =>
   withTempDir(directory => {
-    if (process.platform === 'win32') {
-      return
-    }
-
     const target = path.join(directory, 'target.json')
     const filePath = path.join(directory, 'desktop-installation.json')
     fs.writeFileSync(target, JSON.stringify({ installationId: ID_B }), { mode: 0o600 })

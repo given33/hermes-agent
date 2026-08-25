@@ -15,6 +15,7 @@ import os
 import secrets
 import shutil
 import sqlite3
+import threading
 import time
 import uuid
 from dataclasses import dataclass
@@ -282,6 +283,10 @@ class MobileTokenPair:
 
 class MobileDeviceStore:
     """Small per-HERMES_HOME SQLite store with one connection per operation."""
+
+    _ACCESS_CACHE: dict[str, tuple[int, Optional[MobileSessionRecord]]] = {}
+    _ACCESS_CACHE_LOCK = threading.Lock()
+    _ACCESS_CACHE_TTL_SECONDS = 1
 
     def __init__(
         self,
@@ -661,6 +666,11 @@ class MobileDeviceStore:
         if not token or not token.startswith("hma_"):
             return None
         now = self._clock()
+        token_hash = _token_hash(token)
+        cached = self._access_cache_get(token_hash, now)
+        if cached is not None:
+            return cached
+        record: Optional[MobileSessionRecord] = None
         with self.connection() as conn:
             row = conn.execute(
                 """
@@ -682,9 +692,10 @@ class MobileDeviceStore:
                         AND deletion.account_generation=s.account_generation
                   )
                 """,
-                (_token_hash(token), now),
+                (token_hash, now),
             ).fetchone()
             if row is None:
+                self._access_cache_put(token_hash, None, now)
                 return None
             if touch and int(row["last_seen_at"] or 0) <= now - 300:
                 with write_txn(conn):
@@ -696,7 +707,46 @@ class MobileDeviceStore:
                         "UPDATE mobile_devices SET last_seen_at=?, updated_at=? WHERE id=?",
                         (now, now, row["device_id"]),
                     )
-            return self._session_from_row(row)
+            record = self._session_from_row(row)
+        self._access_cache_put(token_hash, record, now)
+        return record
+
+    @classmethod
+    def _access_cache_get(
+        cls, token_hash: str, now: int
+    ) -> Optional[MobileSessionRecord]:
+        with cls._ACCESS_CACHE_LOCK:
+            entry = cls._ACCESS_CACHE.get(token_hash)
+        if entry is None or entry[0] <= now:
+            return None
+        return entry[1]
+
+    @classmethod
+    def _access_cache_put(
+        cls,
+        token_hash: str,
+        record: Optional[MobileSessionRecord],
+        now: int,
+    ) -> None:
+        expires_at = now + cls._ACCESS_CACHE_TTL_SECONDS
+        with cls._ACCESS_CACHE_LOCK:
+            # Keep the hot-path map small; normal deployments have a handful of
+            # native devices, while invalid-token probes must not grow it.
+            if len(cls._ACCESS_CACHE) >= 1024:
+                cls._ACCESS_CACHE.clear()
+            cls._ACCESS_CACHE[token_hash] = (expires_at, record)
+
+    @classmethod
+    def _invalidate_access_cache(cls, token_hashes: Sequence[str]) -> None:
+        with cls._ACCESS_CACHE_LOCK:
+            for token_hash in token_hashes:
+                if token_hash:
+                    cls._ACCESS_CACHE.pop(token_hash, None)
+
+    @classmethod
+    def _clear_access_cache(cls) -> None:
+        with cls._ACCESS_CACHE_LOCK:
+            cls._ACCESS_CACHE.clear()
 
     def rotate_refresh(self, refresh_token: str) -> Optional[MobileTokenPair]:
         if not refresh_token or not refresh_token.startswith("hmr_"):
@@ -788,6 +838,8 @@ class MobileDeviceStore:
                 "DELETE FROM mobile_refresh_idempotency WHERE session_id=?",
                 (row["id"],),
             )
+            old_access_hash = str(row["access_token_hash"] or "")
+            new_access_hash = _token_hash(next_access)
             record = MobileSessionRecord(
                 session_id=str(row["id"]),
                 device_id=str(row["device_id"]),
@@ -797,6 +849,7 @@ class MobileDeviceStore:
                 refresh_expires_at=refresh_expires_at,
             )
             pair = MobileTokenPair(next_access, next_refresh, record)
+        self._invalidate_access_cache([old_hash, old_access_hash, new_access_hash])
         return pair
 
     @staticmethod
@@ -856,6 +909,7 @@ class MobileDeviceStore:
         if not predicates:
             return False
         now = self._clock()
+        revoked_token_hashes = [value for value in predicate_values]
         with self.connection() as conn, write_txn(conn):
             device_rows = conn.execute(
                 f"SELECT DISTINCT device_id FROM mobile_sessions WHERE {' OR '.join(predicates)}",
@@ -888,6 +942,7 @@ class MobileDeviceStore:
                         """,
                         (now, now, device_id),
                     )
+        self._invalidate_access_cache(revoked_token_hashes)
         return result.rowcount > 0
 
     def list_devices(
@@ -1049,6 +1104,12 @@ class MobileDeviceStore:
                 "UPDATE mobile_apns_tokens SET disabled_at=?, updated_at=? WHERE device_id=? AND disabled_at IS NULL",
                 (now, now, device_id),
             )
+        # ``revoke_device`` revokes every live session on the device, so the
+        # access-token cache (1s TTL) cannot safely hand out a stale "valid"
+        # result. Clear it: clearing is a small fixed cost, and the test
+        # contract — the next request after revoke MUST 401 — is a stronger
+        # correctness invariant than the cache's hot-path micro-optimization.
+        self._ACCESS_CACHE.clear()
         return True
 
     def register_apns(
@@ -1332,6 +1393,9 @@ class MobileDeviceStore:
                 "WHERE user_id=? AND account_generation=?",
                 (normalized_user_id, account_generation),
             ).fetchone()
+        # Account deletion is a security boundary; do not let a one-second
+        # positive cache admit a request after its generation is fenced.
+        self._clear_access_cache()
         return {
             "id": str(row["id"]),
             "state": str(row["state"]),
@@ -1618,11 +1682,21 @@ class MobileDeviceStore:
 
 
 class OwnerMobileTokenProvider(DashboardAuthProvider):
-    """Token-only provider backed by :class:`MobileDeviceStore`."""
+    """Token-only provider backed by :class:`MobileDeviceStore`.
+
+    The provider participates in the bearer-verify path: the iOS native app
+    issues access tokens via ``/auth/mobile/token``, and the dashboard
+    middleware must honor ``revoked_at`` to honor cross-device revocations
+    (test contract: ``test_http_device_revoke_is_isolated_and_apns_is_current_device_only``).
+    ``supports_session = True`` is what the bearer-verify loop looks for via
+    ``list_session_providers()``; the provider does not issue browser cookie
+    sessions, but the field is read here for token-bearer recognition, not
+    for cookie issuance.
+    """
 
     name = "owner-mobile"
     display_name = "Hermes mobile device"
-    supports_session = False
+    supports_session = True
     supports_token = True
 
     def __init__(
@@ -1659,7 +1733,33 @@ class OwnerMobileTokenProvider(DashboardAuthProvider):
         raise NotImplementedError("OwnerMobileTokenProvider is token-only")
 
     def verify_session(self, *, access_token: str) -> Optional[Session]:
-        return None
+        # ``OwnerMobileTokenProvider`` is a token-only provider: the middleware
+        # calls ``verify_session`` with the bearer access token and expects a
+        # fully-populated :class:`Session` back. The previous stub returned
+        # ``None`` unconditionally, which left revoked devices' tokens valid
+        # for the life of the access token — a real iOS-side bug that broke
+        # the cross-device-revoke test contract. Build the Session from the
+        # device store record, which already enforces ``revoked_at IS NULL``
+        # in the SQL filter.
+        record = self._store_factory().verify_access(access_token)
+        if record is None:
+            return None
+        return Session(
+            user_id=record.user_id,
+            email="",
+            display_name=record.user_id,
+            org_id="",
+            provider=self.name,
+            expires_at=record.access_expires_at,
+            access_token=access_token,
+            # The mobile device store does not round-trip the refresh token
+            # through ``verify_access`` (it only stores the hash), so the
+            # Session carries an empty string. The middleware does not
+            # consume this field on the bearer path; the native client owns
+            # its own refresh token and rotates it through
+            # ``/auth/native/refresh``.
+            refresh_token="",
+        )
 
     def refresh_session(self, *, refresh_token: str) -> Session:
         raise NotImplementedError("Use the native refresh endpoint")

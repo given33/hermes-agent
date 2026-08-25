@@ -85,6 +85,10 @@ SHUTDOWN_GRACE = 1.0  # seconds between SIGTERM and SIGKILL
 # Retry policy for transient ContentModified errors.
 MAX_CONTENT_MODIFIED_RETRIES = 3
 RETRY_BASE_DELAY = 0.5  # 0.5, 1.0, 2.0 — exponential
+# Bound diagnostic state for long editing sessions. Open documents are LRU;
+# diagnostics-only entries are trimmed first because the server can push them
+# for every related file even when the user never opened it.
+MAX_OPEN_DOCS = 32
 
 
 def file_uri(path: str) -> str:
@@ -211,6 +215,9 @@ class LSPClient:
         # Request/response correlation
         self._next_id: int = 0
         self._pending: Dict[int, asyncio.Future] = {}
+        # Event loops retain only weak references to tasks. Hold in-flight
+        # server-request dispatches strongly so a slow handler cannot vanish.
+        self._pending_dispatch: Set[asyncio.Task] = set()
 
         # Server-side request handlers (server → client requests).
         # Kept small and explicit; everything else returns method-not-found.
@@ -360,7 +367,11 @@ class LSPClient:
                 if kind == "response":
                     self._dispatch_response(key, msg)
                 elif kind == "request":
-                    asyncio.create_task(self._dispatch_request(key, msg))
+                    dispatch = asyncio.create_task(
+                        self._dispatch_request(key, msg)
+                    )
+                    self._pending_dispatch.add(dispatch)
+                    dispatch.add_done_callback(self._pending_dispatch.discard)
                 elif kind == "notification":
                     self._dispatch_notification(key, msg)
                 else:
@@ -480,6 +491,11 @@ class LSPClient:
                 await self._reader_task
             except (asyncio.CancelledError, Exception):  # noqa: BLE001
                 pass
+        for dispatch in list(self._pending_dispatch):
+            dispatch.cancel()
+        if self._pending_dispatch:
+            await asyncio.gather(*self._pending_dispatch, return_exceptions=True)
+        self._pending_dispatch.clear()
         if self._stderr_task is not None and not self._stderr_task.done():
             self._stderr_task.cancel()
             try:
@@ -715,6 +731,7 @@ class LSPClient:
         # they actually compare against to detect a fresh event.
         self._push_counter += 1
         self._push_event.set()
+        self._trim_document_store(protect=path)
 
     # ------------------------------------------------------------------
     # public file-sync API
@@ -739,6 +756,10 @@ class LSPClient:
         doc = self._docs.get(abs_path)
 
         if doc is not None and doc.version >= 0:
+            # Dict order is insertion order. Re-inserting makes this document
+            # MRU so later eviction follows actual editing recency.
+            self._docs.pop(abs_path)
+            self._docs[abs_path] = doc
             # Re-open: bump version, fire didChangeWatchedFiles + didChange.
             await self._send_notification(
                 "workspace/didChangeWatchedFiles",
@@ -773,6 +794,8 @@ class LSPClient:
             doc.text = text
             return new_version
 
+        await self._evict_oldest_open_document(exclude=abs_path)
+
         # First open: didChangeWatchedFiles CREATED + didOpen.
         await self._send_notification(
             "workspace/didChangeWatchedFiles",
@@ -793,6 +816,44 @@ class LSPClient:
             },
         )
         return 0
+
+    async def close_file(self, path: str) -> None:
+        """Drop one document and tell the server only if it was really open."""
+
+        abs_path = os.path.abspath(path)
+        doc = self._docs.pop(abs_path, None)
+        if doc is None or doc.version < 0 or not self.is_running:
+            return
+        await self._send_notification(
+            "textDocument/didClose",
+            {"textDocument": {"uri": file_uri(abs_path)}},
+        )
+
+    def _open_documents(self) -> list[str]:
+        return [path for path, doc in self._docs.items() if doc.version >= 0]
+
+    async def _evict_oldest_open_document(self, *, exclude: str) -> None:
+        opened = [path for path in self._open_documents() if path != exclude]
+        while len(opened) >= MAX_OPEN_DOCS:
+            victim = opened.pop(0)
+            await self.close_file(victim)
+
+    def _trim_document_store(self, *, protect: str) -> None:
+        """Bound diagnostics-only spillover without dropping open documents."""
+
+        if len(self._docs) <= MAX_OPEN_DOCS:
+            return
+        protected = {
+            path
+            for path, doc in self._docs.items()
+            if doc.version >= 0 or path == protect
+        }
+        for path in list(self._docs):
+            if len(self._docs) <= MAX_OPEN_DOCS:
+                break
+            if path in protected:
+                continue
+            self._docs.pop(path, None)
 
     async def save_file(self, path: str) -> None:
         """Send didSave for ``path``.  Some linters re-scan only on save."""
@@ -819,7 +880,7 @@ class LSPClient:
         endpoint).
         """
         abs_path = os.path.abspath(path)
-        doc = self._docs.get(abs_path)
+        doc = self._docs.setdefault(abs_path, _DocState(version=-1))
         sent_version = doc.version if doc else -1
         try:
             params: Dict[str, Any] = {
@@ -852,6 +913,7 @@ class LSPClient:
                     # Same send-anchored tagging: fresh only if that
                     # doc hasn't changed since the request went out.
                     rel.pull_version = rel.version
+        self._trim_document_store(protect=abs_path)
 
     async def wait_for_diagnostics(
         self,

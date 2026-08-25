@@ -153,6 +153,12 @@ def find_subprocess_calls(content: str, filepath: str) -> list[dict]:
 
 
 def main() -> int:
+    # Force UTF-8 output so the status glyphs (✅/❌) survive on consoles
+    # with a non-UTF-8 locale encoding (e.g. cp936/GBK on Windows).
+    for stream in (sys.stdout, sys.stderr):
+        if hasattr(stream, "reconfigure"):
+            stream.reconfigure(encoding="utf-8", errors="replace")
+
     fix_mode = "--fix" in sys.argv
     repo_root = Path(__file__).resolve().parent.parent
     os.chdir(repo_root)
@@ -170,7 +176,9 @@ def main() -> int:
             continue
 
         for py_file in dirpath.rglob("*.py"):
-            rel = str(py_file.relative_to(repo_root))
+            # POSIX-normalize so KNOWN_SAFE lookups match on every platform
+            # (Windows relative_to() produces backslash separators).
+            rel = py_file.relative_to(repo_root).as_posix()
 
             # Skip known-safe files.
             if rel in KNOWN_SAFE:
@@ -200,7 +208,7 @@ def main() -> int:
         seen_roots.add(resolved)
 
         for py_file in resolved.rglob("*.py"):
-            rel = str(py_file)
+            rel = py_file.as_posix()
             if py_file.name in ("conftest.py",) or "/tests/" in rel:
                 continue
 

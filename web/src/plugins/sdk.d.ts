@@ -161,9 +161,9 @@ export interface HermesPluginSDK {
   utils: {
     cn: (...classes: Array<string | false | null | undefined>) => string;
     /** Relative-time formatter. Accepts an epoch-ms number. */
-    timeAgo: (ts: number) => string;
+    timeAgo: (ts: number, locale?: string) => string;
     /** Relative-time formatter for an ISO-8601 string. */
-    isoTimeAgo: (iso: string) => string;
+    isoTimeAgo: (iso: string, locale?: string) => string;
   };
 
   /**

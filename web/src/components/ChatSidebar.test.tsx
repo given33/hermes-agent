@@ -1,12 +1,19 @@
 // @vitest-environment jsdom
 import { act, type ReactNode } from "react";
 import { createRoot, type Root } from "react-dom/client";
+import { MemoryRouter } from "react-router";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import { EVENTS_CONNECT_TIMEOUT_MS } from "@/lib/events-reconnect";
 
 const apiMocks = vi.hoisted(() => ({
   buildWsUrl: vi.fn(async () => "ws://localhost/api/events?channel=chat-1"),
+  getSessions: vi.fn(async () => ({
+    limit: 30,
+    offset: 0,
+    sessions: [],
+    total: 0,
+  })),
   getModelInfo: vi.fn(async () => ({
     capabilities: { supports_reasoning: false },
     model: "test/model",
@@ -36,7 +43,10 @@ const reloadMocks = vi.hoisted(() => ({
 }));
 
 vi.mock("@/lib/api", () => ({
-  api: { getModelInfo: apiMocks.getModelInfo },
+  api: {
+    getModelInfo: apiMocks.getModelInfo,
+    getSessions: apiMocks.getSessions,
+  },
   buildWsUrl: apiMocks.buildWsUrl,
 }));
 vi.mock("@/lib/dashboard-auth-reload", () => ({
@@ -109,13 +119,20 @@ async function render(ui: ReactNode) {
   container = document.createElement("div");
   document.body.append(container);
   root = createRoot(container);
-  await act(async () => root.render(ui));
+  await act(async () => root.render(<MemoryRouter>{ui}</MemoryRouter>));
 }
 
 beforeEach(() => {
   FakeWebSocket.instances = [];
   vi.clearAllMocks();
   apiMocks.buildWsUrl.mockReset();
+  apiMocks.getSessions.mockReset();
+  apiMocks.getSessions.mockResolvedValue({
+    limit: 30,
+    offset: 0,
+    sessions: [],
+    total: 0,
+  });
   apiMocks.buildWsUrl.mockResolvedValue(
     "ws://localhost/api/events?channel=chat-1",
   );

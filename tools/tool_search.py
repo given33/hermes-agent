@@ -828,8 +828,12 @@ def assemble_tool_defs(
     if config.listing != "off":
         listing, listing_form = build_catalog_listing_with_form(
             deferrable, max_tokens=listing_budget)
-    bridge = bridge_tool_schemas(len(deferrable), listing=listing,
-                                 listing_form=listing_form)
+    from hermes_services.tool_contract import annotate_tool_definitions
+
+    bridge = annotate_tool_definitions(
+        bridge_tool_schemas(len(deferrable), listing=listing,
+                            listing_form=listing_form)
+    )
     result = visible + bridge
     # Tier 1 = per-tool listing for at least part of the catalog (full,
     # names, or mixed). Tier 2 = search-only discovery; the server-level

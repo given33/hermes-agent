@@ -18,6 +18,21 @@ import pytest
 from hermes_cli import uninstall
 
 
+def _symlink_or_skip(target, link) -> None:
+    """symlink_to() that skips where the OS forbids symlinks.
+
+    Unprivileged Windows raises OSError winerror 1314 on any symlink
+    creation; the scenario under test can't even be constructed there,
+    so skip instead of failing (POSIX and Developer-Mode Windows run).
+    """
+    try:
+        link.symlink_to(target)
+    except OSError as e:
+        if getattr(e, "winerror", None) == 1314:
+            pytest.skip("symbolic link privilege unavailable on this host")
+        raise
+
+
 ZSHRC = (
     "export EDITOR=vim\n"
     "alias ll='ls -la'\n"
@@ -96,7 +111,7 @@ class TestCrashDurability:
         real = dotfiles / "zshrc"
         real.write_text(ZSHRC, encoding="utf-8")
         rc = fake_home / ".zshrc"
-        rc.symlink_to(real)
+        _symlink_or_skip(real, rc)
 
         removed = uninstall.remove_path_from_shell_configs()
 

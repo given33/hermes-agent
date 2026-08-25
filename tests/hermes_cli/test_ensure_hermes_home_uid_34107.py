@@ -27,6 +27,8 @@ import pytest
 
 
 class TestResolveHermesUidGid:
+    @pytest.mark.skipif(sys.platform == "win32",
+                        reason="_resolve_hermes_uid_gid short-circuits on Windows")
     def test_returns_parsed_values_when_both_set(self, monkeypatch):
         monkeypatch.setenv("HERMES_UID", "1000")
         monkeypatch.setenv("HERMES_GID", "911")
@@ -56,6 +58,8 @@ class TestResolveHermesUidGid:
 
 
 class TestChownToHermesUid:
+    @pytest.mark.skipif(sys.platform == "win32",
+                        reason="_chown_to_hermes_uid is a no-op on Windows")
     def test_calls_os_chown_when_both_set(self, tmp_path, monkeypatch):
         monkeypatch.setenv("HERMES_UID", "1000")
         monkeypatch.setenv("HERMES_GID", "911")
@@ -64,11 +68,13 @@ class TestChownToHermesUid:
         d = tmp_path / "subdir"
         d.mkdir()
 
-        with patch.object(cfg.os, "chown") as mock_chown:
+        with patch.object(cfg.os, "chown", create=True) as mock_chown:
             cfg._chown_to_hermes_uid(d)
         mock_chown.assert_called_once_with(d, 1000, 911)
 
 
+    @pytest.mark.skipif(sys.platform == "win32",
+                        reason="_chown_to_hermes_uid is a no-op on Windows")
     def test_eperm_is_silently_swallowed(self, tmp_path, monkeypatch):
         """When running as non-root, os.chown raises EPERM. That's fine —
         the entrypoint's startup chown -R will pick it up on restart, and
@@ -84,7 +90,8 @@ class TestChownToHermesUid:
         def _raises_eperm(*args, **kwargs):
             raise PermissionError("operation not permitted")
 
-        with patch.object(cfg.os, "chown", side_effect=_raises_eperm):
+        with patch.object(cfg.os, "chown", side_effect=_raises_eperm,
+                          create=True):
             # Must not raise — the catch is non-fatal.
             cfg._chown_to_hermes_uid(d)
 
@@ -98,7 +105,9 @@ class TestChownToHermesUid:
         d = tmp_path / "subdir"
         d.mkdir()
 
-        with patch.object(cfg.os, "chown", side_effect=AttributeError("no chown on this platform")):
+        with patch.object(cfg.os, "chown",
+                          side_effect=AttributeError("no chown on this platform"),
+                          create=True):
             cfg._chown_to_hermes_uid(d)  # must not raise
 
 

@@ -64,6 +64,10 @@ def _fake_psutil(monkeypatch, *, wait_gone=None, wait_alive=None):
     return fake
 
 
+@pytest.mark.skipif(
+    __import__("sys").platform == "win32",
+    reason="POSIX signal-based process reaping (SIGTERM/SIGKILL)",
+)
 class TestReapGatewayChildren:
     def test_reaps_orphaned_children_sigterm_then_wait(self, monkeypatch):
         fake = _fake_psutil(monkeypatch)
@@ -87,6 +91,10 @@ class TestReapGatewayChildren:
         assert reaped == 1
 
 
+@pytest.mark.skipif(
+    __import__("sys").platform == "win32",
+    reason="POSIX /proc descendant walking",
+)
 class TestSnapshotGatewayChildren:
     def test_snapshot_walks_descendants_recursively(self, monkeypatch):
         fake = _fake_psutil(monkeypatch)
@@ -244,5 +252,4 @@ async def test_start_gateway_replace_reaps_old_gateway_children_posix(
         ("terminate", 42, False),
         ("reap", 42, kids),
     ]
-
 

@@ -4620,11 +4620,19 @@ class TurnRunner:
             return
         finally:
             if hasattr(adapter, "stop_native_task_card_progress"):
-                await adapter.stop_native_task_card_progress(
-                    ctx.source.chat_id,
-                    reply_to=ctx._progress_reply_to,
-                    metadata=ctx._progress_metadata,
-                )
+                try:
+                    await adapter.stop_native_task_card_progress(
+                        ctx.source.chat_id,
+                        reply_to=ctx._progress_reply_to,
+                        metadata=ctx._progress_metadata,
+                    )
+                except asyncio.CancelledError:
+                    raise
+                except Exception:
+                    logger.exception(
+                        "Failed to stop native task card progress for %s",
+                        ctx.source.chat_id,
+                    )
 
     async def send_progress_messages(self):
         ctx = self._ctx
@@ -21980,7 +21988,6 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         attachment contract — trigger post-stream uploads.
         """
         from pathlib import Path
-        from urllib.parse import quote as _quote
 
         try:
             # Capture [[as_document]] before extract_media strips it, so the
@@ -21989,7 +21996,11 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             # send_multiple_images (Telegram sendPhoto recompresses to ~1280px).
             force_document_attachments = "[[as_document]]" in response
 
-            from gateway.platforms.base import BasePlatformAdapter, should_send_media_as_audio
+            from gateway.platforms.base import (
+                BasePlatformAdapter,
+                local_path_to_file_uri,
+                should_send_media_as_audio,
+            )
 
             media_files, cleaned = adapter.extract_media(response)
             media_files = BasePlatformAdapter.filter_media_delivery_paths(media_files)
@@ -22037,7 +22048,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
 
             if image_paths:
                 try:
-                    images = [(f"file://{_quote(p)}", "") for p in image_paths]
+                    images = [(local_path_to_file_uri(p), "") for p in image_paths]
                     await adapter.send_multiple_images(
                         chat_id=event.source.chat_id,
                         images=images,
@@ -23403,9 +23414,15 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         )
         if getattr(source, "platform", None) == Platform.SLACK:
             team_id = getattr(source, "scope_id", None)
+            author_id = getattr(source, "user_id", None)
             if team_id:
                 metadata = dict(metadata or {})
                 metadata["slack_team_id"] = str(team_id)
+            if author_id:
+                # Stamp the turn's actual sender before mutable per-chat caches
+                # can fill it from a later concurrent message in the channel.
+                metadata = dict(metadata or {})
+                metadata["user_id"] = str(author_id)
         return metadata
 
     def _thread_metadata_for_target(

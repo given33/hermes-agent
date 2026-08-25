@@ -75,6 +75,18 @@ import { usePageHeader } from "@/contexts/usePageHeader";
 import { PluginSlot } from "@/plugins";
 import { isDashboardEmbeddedChatEnabled } from "@/lib/dashboard-flags";
 
+export const PENDING_UNIFIED_SESSION_KEY = "hermes.pendingUnifiedSession";
+
+export function queueUnifiedSessionResume(sessionId: string): void {
+  const normalized = String(sessionId || "").trim();
+  if (!normalized || typeof window === "undefined") return;
+  try {
+    window.sessionStorage.setItem(PENDING_UNIFIED_SESSION_KEY, normalized);
+  } catch {
+    // Private browsing/storage quotas must not block the normal route.
+  }
+}
+
 const SOURCE_CONFIG: Record<string, { icon: typeof Terminal; color: string }> =
   {
     cli: { icon: Terminal, color: "text-primary" },
@@ -474,6 +486,7 @@ function SessionRow({
   onRename,
   onExport,
   resumeInChatEnabled,
+  onResume,
 }: SessionRowProps) {
   const [messages, setMessages] = useState<SessionMessage[] | null>(null);
   const [error, setError] = useState<string | null>(null);
@@ -537,7 +550,10 @@ function SessionRow({
           title={t.sessions.resumeInChat}
           onClick={(e) => {
             e.stopPropagation();
-            navigate(`/chat?resume=${encodeURIComponent(session.id)}`);
+            onResume?.(session.id);
+            if (!onResume) {
+              navigate(`/chat?resume=${encodeURIComponent(session.id)}`);
+            }
           }}
         >
           <Play />
@@ -874,6 +890,14 @@ export default function SessionsPage() {
   const { setAfterTitle, setEnd } = usePageHeader();
   const { activeAction, actionStatus, dismissLog } = useSystemActions();
   const resumeInChatEnabled = isDashboardEmbeddedChatEnabled();
+  const navigate = useNavigate();
+  const resumeSessionInChat = useCallback(
+    (sessionId: string) => {
+      queueUnifiedSessionResume(sessionId);
+      navigate("/chat");
+    },
+    [navigate],
+  );
   const selectedSources = sourceSelectionsByCategory[sessionCategory];
 
   const pinnedSourceSelections = useMemo(
@@ -2089,6 +2113,7 @@ export default function SessionsPage() {
                   onRename={handleRename}
                   onExport={handleExport}
                   resumeInChatEnabled={resumeInChatEnabled}
+                  onResume={() => resumeSessionInChat(s.id)}
                 />
               ))}
             </div>
@@ -2183,6 +2208,7 @@ interface SessionRowProps {
   onRename: (id: string, title: string) => Promise<void>;
   onSelectClick: (event: React.MouseEvent) => void;
   onToggle: () => void;
+  onResume?: (id: string) => void;
   resumeInChatEnabled: boolean;
   searchQuery?: string;
   session: SessionInfo;

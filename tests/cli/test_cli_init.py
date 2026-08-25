@@ -150,6 +150,11 @@ class TestBusyInputMode:
 
 
 class TestPromptToolkitTerminalCompatibility:
+    @pytest.mark.skipif(
+        sys.platform == "win32",
+        reason="POSIX premise: bare-LF/c-j submit is a thin-PTY contract; "
+               "the native-Windows arm is test_windows_leaves_ctrl_j_unbound",
+    )
     def test_lf_enter_binding_respects_multiline_shortcuts(self):
         """Ctrl+J is reserved by default, with legacy LF-submit available as an opt-out.
 
@@ -247,6 +252,12 @@ class TestPromptToolkitTerminalCompatibility:
 
 
 
+    @pytest.mark.skipif(
+        sys.platform == "win32",
+        reason="POSIX premise: _terminal_may_leak_cpr() is False on native "
+               "Windows by design; the Windows arm lives in "
+               "test_cpr_local_leak.py under windows_only",
+    )
     def test_cpr_gating_posix_suppresses_without_ssh(self, monkeypatch):
         """POSIX suppresses CPR without SSH.
 

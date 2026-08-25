@@ -3,6 +3,7 @@
 import hashlib
 import logging
 import os
+import posixpath
 
 # Windows OpenSSH has no Unix-domain-socket ControlMaster support —
 # passing ControlPath/ControlMaster options fails the connection outright
@@ -182,7 +183,7 @@ class SSHEnvironment(BaseEnvironment):
 
     def _scp_upload(self, host_path: str, remote_path: str) -> None:
         """Upload a single file via scp over ControlMaster."""
-        parent = str(Path(remote_path).parent)
+        parent = posixpath.dirname(remote_path)  # remote paths are POSIX
         mkdir_cmd = self._build_ssh_command()
         mkdir_cmd.append(f"mkdir -p {shlex.quote(parent)}")
         subprocess.run(

@@ -530,6 +530,13 @@ CREATE TABLE IF NOT EXISTS ios_cold_install_intents (
 CREATE INDEX IF NOT EXISTS idx_ios_cold_install_intents_owner
     ON ios_cold_install_intents(owner_id, created_at);
 
+CREATE TABLE IF NOT EXISTS ios_cold_storage_identity (
+    id INTEGER PRIMARY KEY CHECK (id = 1),
+    root_path TEXT NOT NULL,
+    storage_generation TEXT NOT NULL,
+    created_at INTEGER NOT NULL
+);
+
 CREATE TABLE IF NOT EXISTS ios_account_deletion_tombstones (
     owner_id TEXT PRIMARY KEY,
     owner_scope TEXT NOT NULL DEFAULT '',
@@ -936,6 +943,7 @@ class IOSIntelligenceStore:
                     "BEGIN SELECT RAISE(ABORT, 'account deletion tombstone is active'); END;"
                     for table in _ACCOUNT_OWNED_TABLES
                 ))
+                self._bind_cold_storage_identity(conn)
                 # Every isolated MCP process opens this database at startup. Hold
                 # one immediate writer lock across column checks and ALTERs so the
                 # first deployment of a new schema is race-free.
@@ -1018,6 +1026,30 @@ class IOSIntelligenceStore:
     @staticmethod
     def _cold_path_key(value: str | os.PathLike[str]) -> str:
         return os.path.normcase(os.path.abspath(os.fspath(value)))
+
+    def _bind_cold_storage_identity(self, conn: sqlite3.Connection) -> None:
+        """Bind cold files to a durable database identity before any sweep."""
+
+        root_key = self._cold_path_key(self.path.parent / "ios-cold")
+        row = conn.execute(
+            "SELECT root_path FROM ios_cold_storage_identity WHERE id=1"
+        ).fetchone()
+        if row is not None:
+            # A restored/foreign database must never claim unrelated encrypted
+            # segments as orphans. Cleanup is disabled until an operator moves
+            # the matching cold root back.
+            if os.path.normcase(str(row[0])) != root_key:
+                return
+            return
+        conn.execute(
+            "INSERT OR IGNORE INTO ios_cold_storage_identity"
+            "(id,root_path,storage_generation,created_at) VALUES (1,?,?,?)",
+            (
+                root_key,
+                uuid.uuid4().hex,
+                int(time.time()),
+            ),
+        )
 
     @staticmethod
     def _cold_owner_directory_name(owner_id: str) -> str:
@@ -1103,6 +1135,13 @@ class IOSIntelligenceStore:
         pending_intents = 0
         try:
             with self._connect() as conn, write_txn(conn):
+                identity = conn.execute(
+                    "SELECT root_path FROM ios_cold_storage_identity WHERE id=1"
+                ).fetchone()
+                identity_matches = bool(
+                    identity
+                    and os.path.normcase(str(identity[0])) == self._cold_path_key(root)
+                )
                 indexed = {
                     self._cold_path_key(str(row[0]))
                     for row in conn.execute("SELECT file_path FROM ios_cold_segments")
@@ -1158,19 +1197,14 @@ class IOSIntelligenceStore:
                     else:
                         pending_intents += 1
 
-                root_is_managed = False
-                try:
-                    root_stat = root.lstat()
-                    root_is_managed = stat.S_ISDIR(root_stat.st_mode) and not stat.S_ISLNK(root_stat.st_mode)
-                except FileNotFoundError:
-                    pass
-                if not str(intent_token or "").strip() and root_is_managed:
-                    if normalized_owner:
-                        owner_directories = [
-                            root / hashlib.sha256(normalized_owner.encode()).hexdigest()[:24]
-                        ]
-                    else:
-                        owner_directories = list(root.iterdir())
+                root_stat = root.lstat()
+                root_is_managed = stat.S_ISDIR(root_stat.st_mode) and not stat.S_ISLNK(root_stat.st_mode)
+                if not str(intent_token or "").strip() and root_is_managed and identity_matches:
+                    owner_directories = (
+                        [root / hashlib.sha256(normalized_owner.encode()).hexdigest()[:24]]
+                        if normalized_owner
+                        else list(root.iterdir())
+                    )
                     for owner_dir in owner_directories:
                         try:
                             owner_stat = owner_dir.lstat()
@@ -1181,15 +1215,15 @@ class IOSIntelligenceStore:
                         for candidate in owner_dir.iterdir():
                             if not candidate.is_file():
                                 continue
-                            if (
-                                candidate.name.startswith(".ios-cold-")
-                                or self._cold_path_key(candidate) not in indexed
-                            ):
-                                try:
-                                    candidate.unlink()
-                                    removed_files += 1
-                                except OSError:
-                                    continue
+                            if not candidate.name.startswith(".ios-cold-"):
+                                # Unrecorded ciphertext is not provably orphaned;
+                                # a restored/empty index must not destroy it.
+                                continue
+                            try:
+                                candidate.unlink()
+                                removed_files += 1
+                            except (FileNotFoundError, OSError):
+                                continue
                         try:
                             owner_dir.rmdir()
                         except OSError:

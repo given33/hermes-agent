@@ -217,13 +217,13 @@ def _ensure_uv_path(
     # Verify
     result = resolve_uv()
     if result:
-        version = subprocess.run(
-            [result, "--version"],
-            capture_output=True,
-            text=True, encoding='utf-8', errors='replace',
-            check=False,
-        ).stdout.strip()
-        print(f"  ✓ Managed uv installed ({version})")
+        # Decoration only: a freshly installed binary that exists and passes
+        # X_OK can still fail to exec (truncated download; WinError 216 on a
+        # non-PE file on Windows). Route the probe through the guarded
+        # helper so the cosmetic version report can never crash the
+        # caller's bootstrap/update flow after a successful install.
+        version = _uv_version_string(result)
+        print(f"  ✓ Managed uv installed ({version or 'version probe failed'})")
         # Compatibility boundary: an older, already-imported updater calls the
         # freshly pulled ``ensure_uv()`` after bootstrapping uv.  Repair here so
         # that first update can migrate a vulnerable runtime without requiring
@@ -348,13 +348,11 @@ def update_managed_uv(
             result = None
         if result is not None and result.returncode == 0:
             _touch_uv_self_update_stamp()
-            version = subprocess.run(
-                [existing, "--version"],
-                capture_output=True,
-                text=True, encoding='utf-8', errors='replace',
-                check=False,
-            ).stdout.strip()
-            print(f"  ✓ Managed uv updated ({version})")
+            # Same decoration-only contract as _ensure_uv_path(): the
+            # self-update already succeeded (rc == 0); an unguarded
+            # cosmetic probe here would crash a completed update.
+            version = _uv_version_string(existing)
+            print(f"  ✓ Managed uv updated ({version or 'version probe failed'})")
         elif result is not None:
             # Non-fatal — old uv still works fine.
             logger.debug(

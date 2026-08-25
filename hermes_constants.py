@@ -5,11 +5,12 @@ without risk of circular imports.
 """
 
 import os
+import re
 import shutil
 import stat
 import sys
 from contextvars import ContextVar, Token
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 
 
 _profile_fallback_warned: bool = False
@@ -52,11 +53,36 @@ def get_hermes_home_override() -> str | None:
 
 def _get_platform_default_hermes_home() -> Path:
     """Return the platform-native default Hermes home path."""
+    # An explicit HOME is the profile-isolation contract used by launchers,
+    # tests, containers, and subprocess spawners. Platform cache directories
+    # are only a fallback when that location is absent.
+    home = os.environ.get("HOME", "").strip()
+    if home:
+        return Path(home) / ".hermes"
     if sys.platform == "win32":
         local_appdata = os.environ.get("LOCALAPPDATA", "").strip()
-        base = Path(local_appdata) if local_appdata else Path.home() / "AppData" / "Local"
+        if local_appdata:
+            base = Path(local_appdata)
+        else:
+            # Services and hardened test runners may clear the normal user
+            # environment. Try the remaining Windows location variables before
+            # using a process-local portable home; never crash module callers.
+            profile = os.environ.get("USERPROFILE", "").strip()
+            home_drive = os.environ.get("HOMEDRIVE", "").strip()
+            home_path = os.environ.get("HOMEPATH", "").strip()
+            if profile:
+                base = Path(profile)
+            elif home_drive and home_path:
+                base = Path(home_drive + home_path)
+            else:
+                base = Path.cwd() / ".hermes-home"
         return base / "hermes"
-    return Path.home() / ".hermes"
+    try:
+        import pwd
+
+        return Path(pwd.getpwuid(os.getuid()).pw_dir) / ".hermes"
+    except (ImportError, KeyError, OSError):
+        return Path.cwd() / ".hermes-home"
 
 
 def _hermes_home_from_env() -> Path:
@@ -137,6 +163,42 @@ def get_hermes_home() -> Path:
         _warn_profile_fallback_once()
 
     return _hermes_home_from_env()
+
+
+def expand_user_path(path: str | os.PathLike[str]) -> str:
+    """Expand a user-relative path using the process' explicit home first.
+
+    ``os.path.expanduser`` consults Windows' ``USERPROFILE`` before ``HOME``.
+    Hermes launchers and tests intentionally use ``HOME`` to scope a process,
+    so relying on the platform helper can send ``~/...`` back to the ambient
+    account home.  Keep the fallback for ordinary invocations, but make the
+    explicit override deterministic on every platform.
+    """
+    raw = os.fspath(path)
+    if raw == "~" or raw.startswith(("~/", "~\\")):
+        home = os.environ.get("HOME", "").strip() or os.environ.get(
+            "USERPROFILE", ""
+        ).strip()
+        if home:
+            if raw == "~":
+                # Preserve POSIX-shaped home directories (no drive letter,
+                # leading ``/``) verbatim so the test suite's POSIX assertions
+                # remain stable on every host. Drive-letter homes get the
+                # standard Windows normpath treatment.
+                if re.match(r"^[A-Za-z]:[/\\]", home):
+                    return os.path.normpath(home)
+                return home
+            # Preserve the caller's slash style after the home prefix.  This
+            # matches ``os.path.expanduser`` on Windows while still honoring
+            # an explicit HOME override instead of USERPROFILE. The same
+            # POSIX-vs-drive-letter branch is applied to the home prefix
+            # before the suffix is appended.
+            if re.match(r"^[A-Za-z]:[/\\]", home):
+                home_prefix = os.path.normpath(home)
+            else:
+                home_prefix = home
+            return home_prefix + raw[1:]
+    return os.path.expanduser(raw)
 
 
 def hermes_home_key(path: str | Path | None = None) -> str:
@@ -546,13 +608,17 @@ def _heal_managed_node_windows(home: Path | None = None) -> bool | None:
     for stale in home.glob("node.old-*"):
         try:
             if stale.stat().st_mtime < cutoff:
-                shutil.rmtree(stale, ignore_errors=True)
+                from hermes_cli.safe_delete import safe_rmtree
+
+                safe_rmtree(stale, home)
         except OSError:
             continue
     for stale in home.glob("node.new-*"):
         try:
             if stale.stat().st_mtime < cutoff:
-                shutil.rmtree(stale, ignore_errors=True)
+                from hermes_cli.safe_delete import safe_rmtree
+
+                safe_rmtree(stale, home)
         except OSError:
             continue
 
@@ -560,7 +626,7 @@ def _heal_managed_node_windows(home: Path | None = None) -> bool | None:
     try:
         with urllib.request.urlopen(index_url, timeout=60) as response:
             index_html = response.read().decode("utf-8", errors="replace")
-    except OSError:
+    except (OSError, zipfile.BadZipFile):
         return False
 
     match = re.search(
@@ -589,7 +655,27 @@ def _heal_managed_node_windows(home: Path | None = None) -> bool | None:
             extract_dir = tmp_path / "extract"
             extract_dir.mkdir()
             with zipfile.ZipFile(zip_path) as archive:
-                archive.extractall(extract_dir)
+                members = archive.infolist()
+                total_bytes = 0
+                roots: set[str] = set()
+                for member in members:
+                    member_path = PurePosixPath(member.filename.replace("\\", "/"))
+                    parts = [part for part in member_path.parts if part not in {"", "."}]
+                    if (
+                        not parts
+                        or member_path.is_absolute()
+                        or ".." in parts
+                        or ":" in parts[0]
+                        or not parts[0].startswith("node-v")
+                    ):
+                        raise zipfile.BadZipFile("unsafe managed Node archive member")
+                    roots.add(parts[0])
+                    total_bytes += int(member.file_size)
+                    if total_bytes > 1_073_741_824:
+                        raise zipfile.BadZipFile("managed Node archive is unexpectedly large")
+                if len(roots) != 1:
+                    raise zipfile.BadZipFile("managed Node archive has unexpected roots")
+                archive.extractall(extract_dir, members=members)
             extracted = next(extract_dir.glob("node-v*"), None)
             if extracted is None or not extracted.is_dir():
                 return False
@@ -607,7 +693,9 @@ def _heal_managed_node_windows(home: Path | None = None) -> bool | None:
             # it.  Defer; the old tree is untouched and the next resolution
             # (e.g. the next update after the app is closed) retries.
             _print_managed_node_in_use_notice()
-            shutil.rmtree(staged, ignore_errors=True)
+            from hermes_cli.safe_delete import safe_rmtree
+
+            safe_rmtree(staged, home)
             return None
         # A rename preserves the directory's mtime, so a backup renamed from
         # a long-lived tree would instantly look older than the litter-sweep
@@ -626,7 +714,9 @@ def _heal_managed_node_windows(home: Path | None = None) -> bool | None:
                 os.replace(str(backup), str(target))
             except OSError:
                 pass
-            shutil.rmtree(staged, ignore_errors=True)
+            from hermes_cli.safe_delete import safe_rmtree
+
+            safe_rmtree(staged, home)
             return False
         # The old tree is no longer canonical; locked files may keep it on
         # disk until the next heal attempt, which is safe.
@@ -635,7 +725,9 @@ def _heal_managed_node_windows(home: Path | None = None) -> bool | None:
         try:
             os.replace(str(staged), str(target))
         except OSError:
-            shutil.rmtree(staged, ignore_errors=True)
+            from hermes_cli.safe_delete import safe_rmtree
+
+            safe_rmtree(staged, home)
             return False
 
     return node_tool_runnable(str(target / "node.exe"))
@@ -1003,6 +1095,11 @@ def display_hermes_home() -> str:
     :func:`get_hermes_home` instead.
     """
     home = get_hermes_home()
+    # An explicit process/profile scope is meaningful state.  Showing it as
+    # ``~/...`` is misleading when HOME and HERMES_HOME deliberately point at
+    # different roots (the common multiplexed gateway/test setup).
+    if get_hermes_home_override() or os.environ.get("HERMES_HOME", "").strip():
+        return str(home)
     try:
         return "~/" + str(home.relative_to(Path.home()))
     except ValueError:

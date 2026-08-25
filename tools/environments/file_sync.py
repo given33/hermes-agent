@@ -361,7 +361,12 @@ class FileSyncManager:
         except Exception:
             file_mapping = []
 
-        with tempfile.NamedTemporaryFile(suffix=".tar") as tf:
+        # Windows: NamedTemporaryFile(delete=True) holds an exclusive lock on
+        # the fd; tarfile.open() reopens by path and gets EACCES. Use
+        # delete=False and remove manually so the first handle is closed
+        # before tar extraction begins.
+        tf = tempfile.NamedTemporaryFile(suffix=".tar", delete=False)
+        try:
             self._bulk_download_fn(Path(tf.name))
 
             # Defensive size cap: a misbehaving sandbox could produce an
@@ -388,7 +393,11 @@ class FileSyncManager:
                 for dirpath, _dirnames, filenames in os.walk(staging):
                     for fname in filenames:
                         staged_file = os.path.join(dirpath, fname)
-                        rel = os.path.relpath(staged_file, staging)
+                        # Normalise to forward slashes so the string
+                        # comparison against container paths (which always
+                        # use ``/``) works on Windows where relpath()
+                        # produces backslash separators.
+                        rel = os.path.relpath(staged_file, staging).replace("\\", "/")
                         remote_path = "/" + rel
 
                         pushed_hash = self._pushed_hashes.get(remote_path)
@@ -441,6 +450,11 @@ class FileSyncManager:
                     logger.info("sync_back: applied %d changed file(s)", applied)
                 else:
                     logger.debug("sync_back: no remote changes detected")
+        finally:
+            try:
+                os.unlink(tf.name)
+            except OSError:
+                pass
 
     def _resolve_host_path(self, remote_path: str,
                            file_mapping: list[tuple[str, str]] | None = None) -> str | None:
@@ -468,7 +482,7 @@ class FileSyncManager:
         for host, remote in mapping:
             if self._is_upload_only_host_path(host, upload_only_host_paths):
                 continue
-            remote_dir = str(Path(remote).parent)
+            remote_dir = posixpath.dirname(remote)  # remote paths are POSIX
             if remote_path.startswith(remote_dir + "/"):
                 host_dir = str(Path(host).parent)
                 suffix = remote_path[len(remote_dir):]

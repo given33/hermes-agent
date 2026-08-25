@@ -365,12 +365,13 @@ function HighlightedText({ text, terms }: { text: string; terms?: string[] }) {
   // Build a regex that matches any of the search terms (case-insensitive)
   const escaped = terms.map((t) => t.replace(/[.*+?^${}()|[\]\\]/g, "\\$&"));
   const regex = new RegExp(`(${escaped.join("|")})`, "gi");
+  const lowerTerms = new Set(terms.map((term) => term.toLowerCase()));
   const parts = text.split(regex);
 
   return (
     <>
       {parts.map((part, i) =>
-        regex.test(part) ? (
+        lowerTerms.has(part.toLowerCase()) ? (
           <mark key={i} className="bg-warning/30 text-warning px-0.5">
             {part}
           </mark>

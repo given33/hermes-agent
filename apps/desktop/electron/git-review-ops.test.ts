@@ -107,13 +107,30 @@ test('reviewList reports an untracked directory without recursively listing its 
 })
 
 test('reviewList caps the file payload returned to the renderer', async () => {
-  const dir = makeRepo()
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'hermes-desktop-git-status-cap-'))
 
-  for (let i = 0; i < REVIEW_FILE_CAP + 10; i++) {
-    fs.writeFileSync(path.join(dir, `untracked-${String(i).padStart(4, '0')}.txt`), 'generated\n')
+  tempDirs.push(dir)
+
+  const statusFiles = Array.from({ length: REVIEW_FILE_CAP + 10 }, (_, i) => ({
+    path: `untracked-${String(i).padStart(4, '0')}.txt`,
+    index: '?',
+    working_dir: '?'
+  }))
+
+  const git = {
+    status: async () => ({ files: statusFiles }),
+    diffSummary: async () => ({ files: [] })
   }
 
-  const result = await reviewList(dir, 'uncommitted', null, 'git')
+  let countedFiles = -1
+
+  const result = await reviewList(dir, 'uncommitted', null, 'git', {
+    gitFor: () => git,
+    fillUntrackedCounts: async (_cwd, files) => {
+      countedFiles = files.length
+    }
+  })
 
   assert.equal(result.files.length, REVIEW_FILE_CAP)
+  assert.equal(countedFiles, REVIEW_FILE_CAP, 'line-count work must receive only the capped payload')
 })

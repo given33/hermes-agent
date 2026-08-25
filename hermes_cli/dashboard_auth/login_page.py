@@ -38,6 +38,8 @@ _LOGIN_HTML_TEMPLATE = """\
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
 <title>Sign in — Hermes Agent</title>
 <style>
   /* Brand fonts shipped by @nous-research/ui — same files the SPA loads. */
@@ -309,12 +311,14 @@ _LOGIN_HTML_TEMPLATE = """\
     <div class="provider-list">
 {provider_buttons}
     </div>
+{owner_registration}
   </div>
   <footer>
     <span class="sep"></span>Public bind &middot; Auth required<span class="sep"></span>
   </footer>
 </main>
 {password_script}
+{owner_registration_script}
 </body>
 </html>
 """
@@ -454,6 +458,57 @@ _PASSWORD_FORM_SCRIPT = """\
 </script>
 """
 
+_OWNER_REGISTRATION_SCRIPT = """\
+<script>
+(function () {
+  var form = document.getElementById('owner-registration-form');
+  if (!form) return;
+  var error = form.querySelector('.form-error');
+  function fail(message) {
+    if (error) { error.textContent = message; error.hidden = false; }
+  }
+  form.addEventListener('submit', function (event) {
+    event.preventDefault();
+    if (error) { error.hidden = true; }
+    var data = Object.fromEntries(new FormData(form).entries());
+    fetch('/auth/mobile/register', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        email: data.email || '',
+        verification_code: data.verification_code || '',
+        username: data.username || '',
+        password: data.password || ''
+      })
+    }).then(function (response) {
+      return response.json().then(function (body) {
+        if (!response.ok) throw new Error(body.detail || 'Registration failed');
+        sessionStorage.setItem('hermes-native-auth', JSON.stringify(body));
+        window.location.assign('/');
+      });
+    }).catch(function (issue) { fail(issue.message); });
+  });
+  var codeButton = document.getElementById('owner-registration-code');
+  if (codeButton) codeButton.addEventListener('click', function () {
+    if (error) { error.hidden = true; }
+    var email = form.querySelector('input[name=email]').value;
+    fetch('/auth/mobile/registration-code', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ email: email })
+    }).then(function (response) {
+      return response.json().then(function (body) {
+        if (!response.ok) throw new Error(body.detail || 'Could not send code');
+        return body;
+      });
+    }).then(function (body) {
+      window.alert('QQ 验证码已发送，' + (body.expires_in || 600) / 60 + ' 分钟内有效');
+    }).catch(function (issue) { fail(issue.message); });
+  });
+})();
+</script>
+"""
+
 
 def render_login_html(*, next_path: str = "") -> str:
     """Return the full HTML for ``GET /login``.
@@ -466,9 +521,18 @@ def render_login_html(*, next_path: str = "") -> str:
     emit it; we still HTML-escape it as defence in depth.
     """
     providers = list_session_providers()
-    if not providers:
-        return _EMPTY_HTML
+    owner_registration = ""
+    owner_registration_script = ""
+    try:
+        from hermes_cli.dashboard_auth.owner_mobile import mobile_registration_status
 
+        if mobile_registration_status().get("registration_open"):
+            owner_registration = _render_owner_registration_form(next_path)
+            owner_registration_script = _OWNER_REGISTRATION_SCRIPT
+    except Exception:
+        owner_registration = ""
+    if not providers and not owner_registration:
+        return _EMPTY_HTML
     if next_path:
         # URL-encode then HTML-escape. The URL-encode step matches the
         # gate's ``_safe_next_target`` output shape (also URL-encoded),
@@ -495,6 +559,8 @@ def render_login_html(*, next_path: str = "") -> str:
     return _LOGIN_HTML_TEMPLATE.format(
         provider_buttons="\n".join(buttons),
         password_script=script,
+        owner_registration=owner_registration,
+        owner_registration_script=owner_registration_script,
     )
 
 
@@ -531,4 +597,27 @@ def _render_password_form(provider, next_path: str) -> str:
         f'        <div class="form-error" role="alert" hidden></div>\n'
         f'        <button class="provider-btn" type="submit">Sign in</button>\n'
         f'      </form>'
+    )
+
+
+def _render_owner_registration_form(next_path: str) -> str:
+    safe_next = html.escape(next_path, quote=True) if next_path else ""
+    return (
+        '      <form id="owner-registration-form" class="provider-form" '
+        'autocomplete="on">\n'
+        '        <div class="form-title">创建此 Hermes 服务器的所有者账号</div>\n'
+        f'        <input type="hidden" name="next" value="{safe_next}">\n'
+        '        <label class="field"><span class="field-label">QQ 邮箱</span>'
+        '<input class="field-input" type="email" name="email" required></label>\n'
+        '        <label class="field"><span class="field-label">验证码</span>'
+        '<input class="field-input" inputmode="numeric" name="verification_code" required></label>\n'
+        '        <button class="provider-btn" type="button" '
+        'id="owner-registration-code">发送 QQ 验证码</button>\n'
+        '        <label class="field"><span class="field-label">用户名</span>'
+        '<input class="field-input" type="text" name="username" required></label>\n'
+        '        <label class="field"><span class="field-label">密码</span>'
+        '<input class="field-input" type="password" name="password" required></label>\n'
+        '        <div class="form-error" role="alert" hidden></div>\n'
+        '        <button class="provider-btn" type="submit">注册并登录</button>\n'
+        '      </form>'
     )

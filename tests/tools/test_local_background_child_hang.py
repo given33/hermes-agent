@@ -17,6 +17,11 @@ import pytest
 
 from tools.environments.local import LocalEnvironment
 
+pytestmark = pytest.mark.skipif(
+    __import__("sys").platform == "win32",
+    reason="python3/setsid/pkill are POSIX-only",
+)
+
 
 def _pkill(pattern: str) -> None:
     subprocess.run(f"pkill -9 -f {pattern!r} 2>/dev/null", shell=True)

@@ -13,6 +13,8 @@ Fix: _search_files (find) and _search_with_grep both now exclude hidden
 directories, matching ripgrep's default behavior.
 """
 
+import shutil
+import os
 import subprocess
 
 import pytest
@@ -53,6 +55,7 @@ def searchable_tree(tmp_path):
 class TestFindExcludesHiddenDirs:
     """_search_files uses find, which should exclude hidden directories."""
 
+    @pytest.mark.skipif(os.name == "nt", reason="POSIX find is unavailable on Windows")
     def test_find_skips_hub_cache_files(self, searchable_tree):
         """find should not return files from .hub/ directory."""
         cmd = (
@@ -63,6 +66,7 @@ class TestFindExcludesHiddenDirs:
         assert ".hub" not in result.stdout
 
 
+    @pytest.mark.skipif(os.name == "nt", reason="POSIX find is unavailable on Windows")
     def test_find_still_returns_visible_files(self, searchable_tree):
         """find should still return files from visible directories."""
         cmd = (
@@ -70,6 +74,33 @@ class TestFindExcludesHiddenDirs:
         )
         result = subprocess.run(cmd, shell=True, capture_output=True, text=True)
         assert "SKILL.md" in result.stdout
+
+
+class TestPythonFallbackExcludesHiddenDirs:
+    """Windows cannot run POSIX find, so its fallback preserves the policy."""
+
+    def _search(self, searchable_tree, pattern):
+        ops = ShellFileOperations(
+            LocalEnvironment(cwd=str(searchable_tree)),
+            cwd=str(searchable_tree),
+        )
+        return ops._search_files_python(
+            pattern,
+            searchable_tree,
+            has_hidden_path_ancestor=False,
+            limit=20,
+            offset=0,
+        )
+
+    def test_skips_hidden_directories(self, searchable_tree):
+        result = self._search(searchable_tree, "*.json")
+
+        assert result.files == []
+
+    def test_finds_visible_files(self, searchable_tree):
+        result = self._search(searchable_tree, "*.md")
+
+        assert any(path.endswith("SKILL.md") for path in result.files)
 
 
 class TestGrepExcludesHiddenDirs:
@@ -141,7 +172,7 @@ class TestRipgrepAlreadyExcludesHidden:
     """Verify ripgrep's default behavior is to skip hidden directories."""
 
     @pytest.mark.skipif(
-        subprocess.run(["which", "rg"], capture_output=True).returncode != 0,
+        shutil.which("rg") is None,
         reason="ripgrep not installed",
     )
     def test_rg_skips_hub_by_default(self, searchable_tree):
@@ -154,7 +185,7 @@ class TestRipgrepAlreadyExcludesHidden:
         assert "catalog.json" not in result.stdout
 
     @pytest.mark.skipif(
-        subprocess.run(["which", "rg"], capture_output=True).returncode != 0,
+        shutil.which("rg") is None,
         reason="ripgrep not installed",
     )
     def test_rg_finds_visible_content(self, searchable_tree):

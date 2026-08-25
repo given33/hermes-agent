@@ -3599,7 +3599,22 @@ def _run_job_script(
         # shutil.which returns None — fall back to a clear error rather
         # than a FileNotFoundError with a confusing "[WinError 2]"
         # traceback.
-        _bash = shutil.which("bash") or (
+        _bash = None
+        if sys.platform == "win32":
+            # System32\bash.exe is the WSL launcher and cannot consume a Win32
+            # path directly. Prefer the MSYS/Git Bash installation, which runs
+            # the script in its native Windows filesystem context.
+            for candidate in (
+                Path(os.environ.get("ProgramFiles", r"C:\Program Files"))
+                / "Git" / "bin" / "bash.exe",
+                Path(os.environ.get("ProgramFiles(x86)", r"C:\Program Files (x86)"))
+                / "Git" / "bin" / "bash.exe",
+                Path(os.environ.get("LOCALAPPDATA", "")) / "Programs" / "Git" / "bin" / "bash.exe",
+            ):
+                if candidate.is_file():
+                    _bash = str(candidate)
+                    break
+        _bash = _bash or shutil.which("bash") or (
             "/bin/bash" if os.path.isfile("/bin/bash") else None
         )
         if _bash is None:
@@ -3608,7 +3623,11 @@ def _run_job_script(
                 "On Windows, install Git for Windows (which ships Git Bash) "
                 "or rewrite the script as Python (.py)."
         )
-        argv = [_bash, str(path)]
+        # Bash on Windows is MSYS/Git Bash or WSL; neither reliably treats
+        # backslashes as separators inside an unquoted argument. Forward
+        # slashes preserve the drive form accepted by Git Bash and avoid the
+        # escape sequence that made scripts look like one nonexistent name.
+        argv = [_bash, str(path.as_posix()) if sys.platform == "win32" else str(path)]
         env_overlay: dict[str, str] = {}
     else:
         python_exe, env_overlay = _windows_cron_python_invocation(sys.executable)
@@ -5260,8 +5279,20 @@ def run_job(
                     logger.warning("Job '%s': failed to parse prefill messages file '%s': %s", job_id, pfpath, e)
                     prefill_messages = None
 
-        # Max iterations
-        max_iterations = _cfg.get("agent", {}).get("max_turns") or _cfg.get("max_turns") or 500
+        # Max iterations. Preserve explicit zero and unlimited spellings; the
+        # old `or` chain collapsed both into the default.
+        raw_max_turns = _cfg.get("agent", {}).get(
+            "max_turns", _cfg.get("max_turns", 500)
+        )
+        if isinstance(raw_max_turns, str) and raw_max_turns.strip().lower() in {
+            "none", "unlimited",
+        }:
+            max_iterations = 999_999
+        else:
+            try:
+                max_iterations = int(raw_max_turns)
+            except (TypeError, ValueError):
+                max_iterations = 500
 
         # Provider routing
         pr = _cfg.get("provider_routing") or {}

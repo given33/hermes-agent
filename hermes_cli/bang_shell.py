@@ -190,7 +190,12 @@ def run_bang_command(
     try:
         if proc.stdout is not None:
             for line in proc.stdout:
-                emit(line.rstrip("\n"))
+                # rstrip newlines + trailing whitespace: Windows ``echo`` and
+                # cmd.exe sometimes emit a trailing space (e.g. ``echo foo``
+                # becomes ``foo \n``); ``rstrip("\n")`` alone would leave
+                # the space in the writer, making ``"foo" in lines`` fail
+                # for users who reason about exact command output.
+                emit(line.rstrip())
         proc.wait(timeout=timeout)
     except subprocess.TimeoutExpired:
         proc.kill()

@@ -14,6 +14,7 @@ from hermes_constants import get_hermes_home
 
 
 _DISK_DEGRADED_PERCENT = 90.0
+_ADVISORY_CHECKS = frozenset({"disk"})
 
 
 def _check(status: str, detail: str | None = None, **extra: Any) -> dict[str, Any]:
@@ -115,7 +116,14 @@ def collect_runtime_readiness(
             active_delegations=max(0, int(active_delegations)),
         ),
     }
-    overall = "ok" if all(item.get("status") == "ok" for item in checks.values()) else "degraded"
+    # Disk pressure is useful telemetry but does not mean the gateway cannot
+    # serve requests. Keep the detailed disk verdict while allowing readiness
+    # to represent the availability of the runtime itself.
+    overall = "ok" if all(
+        item.get("status") == "ok"
+        for name, item in checks.items()
+        if name not in _ADVISORY_CHECKS
+    ) else "degraded"
     return {"status": overall, "checks": checks}
 
 

@@ -36,6 +36,7 @@ test('collectSshConfigHosts follows Include directives (read-only)', () => {
 
   const hosts = collectSshConfigHosts('/home/u/.ssh/config', {
     homeDir: '/home/u',
+    isWindows: true,
     readFile: p => files[p] ?? null
   })
 

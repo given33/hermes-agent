@@ -1391,6 +1391,11 @@ class PluginContext:
     def __init__(self, manifest: PluginManifest, manager: "PluginManager"):
         self.manifest = manifest
         self._manager = manager
+        # Keep a context-local view of the manager-owned registrations so a
+        # plugin can explicitly release prompt/runtime effects in tests or
+        # short-lived embedding contexts. The manager ledger remains the
+        # authoritative unload path for normal plugin lifetimes.
+        self._effect_registrations: list[PluginRegistration] = []
         # Lazy-built host-owned LLM facade — see ctx.llm property below.
         self._llm: Any = None
         self._subagent_lifecycle: Any = None
@@ -1534,9 +1539,11 @@ class PluginContext:
         release: Callable[[], None],
     ) -> PluginRegistration:
         """Record host-owned cleanup for a successful registration."""
-        return self._manager._track_registration(
+        registration = self._manager._track_registration(
             self.manifest, kind, key, release
         )
+        self._effect_registrations.append(registration)
+        return registration
 
     def _track_replacement(
         self,
@@ -1558,6 +1565,19 @@ class PluginContext:
             finalize=finalize,
         )
         return self._track(kind, key, lease.dispose)
+
+    def close_effects(self) -> None:
+        """Dispose registrations made through this context, once each.
+
+        ``PluginManager.unload`` still owns the normal lifecycle; this method
+        is the explicit scope boundary used by embedders and short-lived
+        plugin contexts. ``PluginRegistration.dispose`` is idempotent, so a
+        later manager unload remains safe.
+        """
+        registrations = self._effect_registrations
+        self._effect_registrations = []
+        for registration in reversed(registrations):
+            registration.dispose()
 
     # -- host-owned LLM access ----------------------------------------------
 
@@ -1787,6 +1807,64 @@ class PluginContext:
             self.manifest.name, name, " (override)" if override else "",
         )
         return handle
+
+    def register_prompt_fragment(self, fragment=None, **kwargs) -> PluginRegistration:
+        """Register a model-facing prompt fragment owned by this context."""
+        from hermes_runtime.prompt_runtime import PromptFragment, default_prompt_runtime
+
+        if isinstance(fragment, PromptFragment):
+            if kwargs:
+                raise TypeError("prompt fragment kwargs cannot accompany a PromptFragment")
+        elif fragment is None:
+            fragment = PromptFragment(**kwargs)
+        elif isinstance(fragment, str):
+            fragment = PromptFragment(name=fragment, **kwargs)
+        else:
+            raise TypeError("fragment must be a PromptFragment or a fragment name")
+        disposer = default_prompt_runtime().register_fragment(fragment)
+        return self._track(
+            "prompt_fragment",
+            f"{fragment.scope}:{fragment.name}",
+            disposer,
+        )
+
+    def register_prompt_variable(
+        self, name: str, provider, *, scope: str = "global"
+    ) -> PluginRegistration:
+        """Register a strict prompt variable owned by this context."""
+        from hermes_runtime.prompt_runtime import default_prompt_runtime
+
+        disposer = default_prompt_runtime().register_variable(
+            name, provider, scope=scope
+        )
+        return self._track(
+            "prompt_variable",
+            f"{scope}:{name}",
+            disposer,
+        )
+
+    def register_prompt_middleware(
+        self,
+        name: str,
+        callback,
+        *,
+        order: int = 0,
+        scope: str = "global",
+    ) -> PluginRegistration:
+        """Register deterministic prompt middleware owned by this context."""
+        from hermes_runtime.prompt_runtime import default_prompt_runtime
+
+        disposer = default_prompt_runtime().register_middleware(
+            name,
+            callback,
+            order=order,
+            scope=scope,
+        )
+        return self._track(
+            "prompt_middleware",
+            f"{scope}:{name}",
+            disposer,
+        )
 
     # -- capability probing (#64228) -----------------------------------------
 
@@ -3392,7 +3470,11 @@ class PluginManager:
         # Capture the home immutably. Unload can run from a different ambient
         # profile context, but every inverse must target the registration's
         # original scope.
-        self.scope_key = scope_key or hermes_home_key()
+        self.scope_key = (
+            hermes_home_key(scope_key)
+            if scope_key is not None
+            else hermes_home_key()
+        )
         self.home_path = Path(self.scope_key)
         self._discovery_lock = threading.RLock()
         self._plugins: Dict[str, LoadedPlugin] = {}
@@ -5673,6 +5755,13 @@ def discover_plugins(force: bool = False) -> None:
     :func:`start_background_plugin_discovery` is still running, this waits
     for it instead of racing a second scan.
     """
+    # Establish the trusted built-in hook registry before importing any
+    # plugin-provided Python code. Dynamic plugins may inspect/use hooks during
+    # module import or registration, so lazy bootstrap after discovery is too
+    # late and leaves the trust boundary observable as unsealed.
+    from hermes_services.startup import bootstrap_trusted_runtime
+
+    bootstrap_trusted_runtime()
     _join_background_discovery()
     get_plugin_manager().discover_and_load(force=force)
 

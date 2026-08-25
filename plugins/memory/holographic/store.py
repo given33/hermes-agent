@@ -1,6 +1,11 @@
-"""
-SQLite-backed fact store with entity resolution and trust scoring.
-Single-user Hermes memory store plugin.
+"""SQLite-backed fact store with entity resolution and trust scoring.
+
+Hermes memory store plugin. Rows carry an 'actor' column so a single
+database can serve a multi-user gateway deployment without leaking facts
+across users: an identified caller sees shared rows (actor='') plus its own
+rows; guarded mutations treat foreign rows as not-found. An empty caller
+actor keeps the historical unscoped single-user behaviour (every row
+visible).
 """
 
 import os
@@ -17,7 +22,8 @@ except ImportError:
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS facts (
     fact_id         INTEGER PRIMARY KEY AUTOINCREMENT,
-    content         TEXT NOT NULL UNIQUE,
+    content         TEXT NOT NULL,
+    actor           TEXT NOT NULL DEFAULT '',
     category        TEXT DEFAULT 'general',
     tags            TEXT DEFAULT '',
     trust_score     REAL DEFAULT 0.5,
@@ -31,6 +37,7 @@ CREATE TABLE IF NOT EXISTS facts (
 CREATE TABLE IF NOT EXISTS entities (
     entity_id   INTEGER PRIMARY KEY AUTOINCREMENT,
     name        TEXT NOT NULL,
+    actor       TEXT NOT NULL DEFAULT '',
     entity_type TEXT DEFAULT 'unknown',
     aliases     TEXT DEFAULT '',
     created_at  TIMESTAMP DEFAULT CURRENT_TIMESTAMP
@@ -44,7 +51,13 @@ CREATE TABLE IF NOT EXISTS fact_entities (
 
 CREATE INDEX IF NOT EXISTS idx_facts_trust    ON facts(trust_score DESC);
 CREATE INDEX IF NOT EXISTS idx_facts_category ON facts(category);
+CREATE INDEX IF NOT EXISTS idx_facts_actor    ON facts(actor);
 CREATE INDEX IF NOT EXISTS idx_entities_name  ON entities(name);
+CREATE INDEX IF NOT EXISTS idx_entities_actor ON entities(actor);
+
+-- Per-actor dedup: identical content may exist once per actor value, so the
+-- legacy inline UNIQUE(content) moved to this (content, actor) index.
+CREATE UNIQUE INDEX IF NOT EXISTS idx_facts_content_actor ON facts(content, actor);
 
 CREATE VIRTUAL TABLE IF NOT EXISTS facts_fts
     USING fts5(content, tags, content=facts, content_rowid=fact_id);
@@ -66,14 +79,46 @@ CREATE TRIGGER IF NOT EXISTS facts_au AFTER UPDATE ON facts BEGIN
         VALUES (new.fact_id, new.content, new.tags);
 END;
 
+-- Derived cache keyed (bank_name, actor): each actor bundles its visible
+-- fact vectors into its own category bank.
 CREATE TABLE IF NOT EXISTS memory_banks (
     bank_id    INTEGER PRIMARY KEY AUTOINCREMENT,
-    bank_name  TEXT NOT NULL UNIQUE,
+    bank_name  TEXT NOT NULL,
+    actor      TEXT NOT NULL DEFAULT '',
     vector     BLOB NOT NULL,
     dim        INTEGER NOT NULL,
     fact_count INTEGER DEFAULT 0,
-    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    UNIQUE(bank_name, actor)
 );
+"""
+
+# Staging-table DDL for the one-time legacy rebuild migrations below.
+_FACTS_STAGING_DDL = """
+CREATE TABLE facts_actor_migrated (
+    fact_id         INTEGER PRIMARY KEY AUTOINCREMENT,
+    content         TEXT NOT NULL,
+    actor           TEXT NOT NULL DEFAULT '',
+    category        TEXT DEFAULT 'general',
+    tags            TEXT DEFAULT '',
+    trust_score     REAL DEFAULT 0.5,
+    retrieval_count INTEGER DEFAULT 0,
+    helpful_count   INTEGER DEFAULT 0,
+    created_at      TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    updated_at      TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    hrr_vector      BLOB
+)
+"""
+
+_ENTITIES_STAGING_DDL = """
+CREATE TABLE entities_actor_migrated (
+    entity_id   INTEGER PRIMARY KEY AUTOINCREMENT,
+    name        TEXT NOT NULL,
+    actor       TEXT NOT NULL DEFAULT '',
+    entity_type TEXT DEFAULT 'unknown',
+    aliases     TEXT DEFAULT '',
+    created_at  TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+)
 """
 
 # Trust adjustment constants
@@ -94,7 +139,6 @@ _RE_AKA          = re.compile(
 
 def _clamp_trust(value: float) -> float:
     return max(_TRUST_MIN, min(_TRUST_MAX, value))
-
 
 class MemoryStore:
     """SQLite-backed fact store with entity resolution and trust scoring."""
@@ -168,19 +212,151 @@ class MemoryStore:
     # Initialisation
     # ------------------------------------------------------------------
 
+    def count_facts(self, actor: str = "") -> int:
+        """Return the fact count visible to actor under the shared lock."""
+
+        with self._lock:
+            vis_sql, vis_params = self._visibility_sql("actor", actor)
+            where = f"WHERE {vis_sql}" if vis_sql else ""
+            row = self._conn.execute(
+                f"SELECT COUNT(*) FROM facts {where}", vis_params
+            ).fetchone()
+            return int(row[0] if row else 0)
+
+    @staticmethod
+    def _normalize_actor(actor: str) -> str:
+        """Normalize a caller-supplied actor identity."""
+        return str(actor or "").strip()
+
+    @staticmethod
+    def _visibility_sql(column: str, actor: str) -> "tuple[str, list]":
+        """SQL fragment restricting column to rows actor may see.
+
+        A row is visible iff it is shared (actor='') or owned by the caller.
+        An empty caller identity means unscoped access: no filter is emitted,
+        which keeps the historical single-user behaviour for direct store
+        users and scoping="shared" deployments.
+        """
+        actor = MemoryStore._normalize_actor(actor)
+        if not actor:
+            return "", []
+        return f"({column} = '' OR {column} = ?)", [actor]
+
+    @staticmethod
+    def _table_columns(conn: sqlite3.Connection, table: str) -> list:
+        """Return the column names of table, or [] when it does not exist."""
+        try:
+            return [row[1] for row in conn.execute(f"PRAGMA table_info({table})").fetchall()]
+        except sqlite3.Error:
+            return []
+
+    def _rebuild_facts_table_with_actor(self, src_cols: set) -> None:
+        """One-transaction rebuild of a pre-actor facts table.
+
+        The inline UNIQUE(content) constraint cannot be dropped via ALTER, so
+        the table is rebuilt into a staging copy carrying the new shape (the
+        per-(content, actor) uniqueness lives in the index that _SCHEMA
+        creates afterwards). Fact ids are preserved so FTS5 external-content
+        rowids stay aligned.
+        """
+        dst_cols = ["fact_id", "content", "actor"]
+        src_exprs = ["fact_id", "content", "''"]
+        for col in (
+            "category", "tags", "trust_score", "retrieval_count",
+            "helpful_count", "created_at", "updated_at",
+        ):
+            if col in src_cols:
+                dst_cols.append(col)
+                src_exprs.append(col)
+        if "hrr_vector" in src_cols:
+            dst_cols.append("hrr_vector")
+            src_exprs.append("hrr_vector")
+
+        self._conn.execute("BEGIN IMMEDIATE")
+        try:
+            self._conn.execute("DROP TABLE IF EXISTS facts_actor_migrated")
+            self._conn.execute(_FACTS_STAGING_DDL)
+            self._conn.execute(
+                f"INSERT INTO facts_actor_migrated ({', '.join(dst_cols)}) "
+                f"SELECT {', '.join(src_exprs)} FROM facts"
+            )
+            self._conn.execute("DROP TABLE facts")
+            self._conn.execute("ALTER TABLE facts_actor_migrated RENAME TO facts")
+            self._conn.execute("COMMIT")
+        except Exception:
+            self._conn.execute("ROLLBACK")
+            raise
+
+    def _rebuild_entities_table_with_actor(self, src_cols: set) -> None:
+        """One-transaction rebuild of a pre-actor entities table."""
+        dst_cols = ["entity_id", "name", "actor"]
+        src_exprs = ["entity_id", "name", "''"]
+        for col in ("entity_type", "aliases", "created_at"):
+            if col in src_cols:
+                dst_cols.append(col)
+                src_exprs.append(col)
+
+        self._conn.execute("BEGIN IMMEDIATE")
+        try:
+            self._conn.execute("DROP TABLE IF EXISTS entities_actor_migrated")
+            self._conn.execute(_ENTITIES_STAGING_DDL)
+            self._conn.execute(
+                f"INSERT INTO entities_actor_migrated ({', '.join(dst_cols)}) "
+                f"SELECT {', '.join(src_exprs)} FROM entities"
+            )
+            self._conn.execute("DROP TABLE entities")
+            self._conn.execute("ALTER TABLE entities_actor_migrated RENAME TO entities")
+            self._conn.execute("COMMIT")
+        except Exception:
+            self._conn.execute("ROLLBACK")
+            raise
+
     def _init_db(self) -> None:
         """Create tables, indexes, and triggers if they do not exist. Enable WAL mode."""
         # Use the shared WAL-fallback helper so memory_store.db degrades
         # gracefully on NFS/SMB/FUSE-mounted HERMES_HOME (same issue as
-        # state.db / kanban.db — see hermes_state._WAL_INCOMPAT_MARKERS).
+        # state.db / kanban.db -- see hermes_state._WAL_INCOMPAT_MARKERS).
         from hermes_state import apply_wal_with_fallback
         apply_wal_with_fallback(self._conn, db_label="memory_store.db (holographic)")
+
+        # Legacy (pre-actor) tables must be rebuilt BEFORE the shipped schema
+        # executes: its actor-aware indexes cannot compile against tables
+        # missing the column. Runs inside __init__'s shared-connection lock;
+        # each rebuild is one explicit transaction so a failure leaves the
+        # legacy database untouched.
+        facts_migrated = False
+        facts_cols = self._table_columns(self._conn, "facts")
+        if facts_cols and "actor" not in facts_cols:
+            self._rebuild_facts_table_with_actor(set(facts_cols))
+            facts_migrated = True
+
+        ent_cols = self._table_columns(self._conn, "entities")
+        if ent_cols and "actor" not in ent_cols:
+            self._rebuild_entities_table_with_actor(set(ent_cols))
+
+        # memory_banks is a pure derived cache: drop the legacy layout and let
+        # _SCHEMA recreate it keyed (bank_name, actor), then refill below.
+        refill_banks = False
+        bank_cols = self._table_columns(self._conn, "memory_banks")
+        if bank_cols and "actor" not in bank_cols:
+            self._conn.execute("DROP TABLE memory_banks")
+            refill_banks = True
+
         self._conn.executescript(_SCHEMA)
+
         # Migrate: add hrr_vector column if missing (safe for existing databases)
         columns = {row[1] for row in self._conn.execute("PRAGMA table_info(facts)").fetchall()}
         if "hrr_vector" not in columns:
             self._conn.execute("ALTER TABLE facts ADD COLUMN hrr_vector BLOB")
-        self._conn.commit()
+
+        if facts_migrated:
+            # The rebuilt facts table kept its rowids; resync the external-
+            # content FTS index defensively so stale entries cannot linger.
+            self._conn.execute("INSERT INTO facts_fts(facts_fts) VALUES('rebuild')")
+        if refill_banks:
+            self.rebuild_all_vectors()
+        self._conn.commit();
+
 
     # ------------------------------------------------------------------
     # Public API
@@ -191,54 +367,62 @@ class MemoryStore:
         content: str,
         category: str = "general",
         tags: str = "",
+        actor: str = "",
     ) -> int:
-        """Insert a fact and return its fact_id.
+        """Insert a fact owned by actor and return its fact_id.
 
-        Deduplicates by content (UNIQUE constraint). On duplicate, returns
-        the existing fact_id without modifying the row. Extracts entities from
-        the content and links them to the fact.
+        Deduplication is scoped to the caller's actor: identical content
+        already stored by the SAME actor returns the existing fact_id without
+        modifying the row; another actor gets its own row (shared rows carry
+        actor=''). Extracts entities from the content and links them to the
+        fact.
         """
         with self._lock:
             content = content.strip()
+            actor = self._normalize_actor(actor)
             if not content:
                 raise ValueError("content must not be empty")
 
             try:
                 cur = self._conn.execute(
                     """
-                    INSERT INTO facts (content, category, tags, trust_score)
-                    VALUES (?, ?, ?, ?)
+                    INSERT INTO facts (content, actor, category, tags, trust_score)
+                    VALUES (?, ?, ?, ?, ?)
                     """,
-                    (content, category, tags, self.default_trust),
+                    (content, actor, category, tags, self.default_trust),
                 )
                 self._conn.commit()
                 fact_id: int = cur.lastrowid  # type: ignore[assignment]
             except sqlite3.IntegrityError:
-                # Duplicate content — return existing id
+                # Duplicate within THIS caller's scope -- return the existing id.
                 row = self._conn.execute(
-                    "SELECT fact_id FROM facts WHERE content = ?", (content,)
+                    "SELECT fact_id FROM facts WHERE content = ? AND actor = ?",
+                    (content, actor),
                 ).fetchone()
+                if row is None:
+                    raise
                 return int(row["fact_id"])
 
             # Entity extraction and linking
             for name in self._extract_entities(content):
-                entity_id = self._resolve_entity(name)
+                entity_id = self._resolve_entity(name, actor=actor)
                 self._link_fact_entity(fact_id, entity_id)
 
             # Compute HRR vector after entity linking
             self._compute_hrr_vector(fact_id, content)
-            self._rebuild_bank(category)
+            self._rebuild_bank(category, actor)
 
             return fact_id
 
     def search_facts(
         self,
         query: str,
-        category: str | None = None,
+        category: "str | None" = None,
         min_trust: float = 0.3,
         limit: int = 10,
-    ) -> list[dict]:
-        """Full-text search over facts using FTS5.
+        actor: str = "",
+    ) -> list:
+        """Full-text search over the facts visible to actor using FTS5.
 
         Returns a list of fact dicts ordered by FTS5 rank, then trust_score
         descending. Also increments retrieval_count for matched facts.
@@ -260,6 +444,9 @@ class MemoryStore:
             if category is not None:
                 category_clause = "AND f.category = ?"
                 params.append(category)
+            vis_sql, vis_params = self._visibility_sql("f.actor", actor)
+            vis_clause = f"AND {vis_sql}" if vis_sql else ""
+            params.extend(vis_params)
             params.append(limit)
 
             sql = f"""
@@ -271,6 +458,7 @@ class MemoryStore:
                 WHERE facts_fts MATCH ?
                   AND f.trust_score >= ?
                   {category_clause}
+                  {vis_clause}
                 ORDER BY fts.rank, f.trust_score DESC
                 LIMIT ?
             """
@@ -292,23 +480,29 @@ class MemoryStore:
     def update_fact(
         self,
         fact_id: int,
-        content: str | None = None,
-        trust_delta: float | None = None,
-        tags: str | None = None,
-        category: str | None = None,
+        content: "str | None" = None,
+        trust_delta: "float | None" = None,
+        tags: "str | None" = None,
+        category: "str | None" = None,
+        actor: str = "",
     ) -> bool:
-        """Partially update a fact. Trust is clamped to [0, 1].
+        """Partially update a fact visible to actor. Trust clamps to [0, 1].
 
-        Returns True if the row existed, False otherwise.
+        Returns True if the row existed and was updated, False otherwise.
+        Foreign rows (owned by another identified actor) act as not-found.
         """
         with self._lock:
+            vis_sql, vis_params = self._visibility_sql("actor", actor)
+            vis_and = f"AND {vis_sql}" if vis_sql else ""
             row = self._conn.execute(
-                "SELECT fact_id, trust_score FROM facts WHERE fact_id = ?", (fact_id,)
+                f"""SELECT fact_id, trust_score FROM facts
+                    WHERE fact_id = ? {vis_and}""",
+                [fact_id, *vis_params],
             ).fetchone()
             if row is None:
                 return False
 
-            assignments: list[str] = ["updated_at = CURRENT_TIMESTAMP"]
+            assignments: list = ["updated_at = CURRENT_TIMESTAMP"]
             params: list = []
 
             if content is not None:
@@ -332,13 +526,15 @@ class MemoryStore:
             )
             self._conn.commit()
 
+            caller_actor = self._normalize_actor(actor)
+
             # If content changed, re-extract entities
             if content is not None:
                 self._conn.execute(
                     "DELETE FROM fact_entities WHERE fact_id = ?", (fact_id,)
                 )
                 for name in self._extract_entities(content):
-                    entity_id = self._resolve_entity(name)
+                    entity_id = self._resolve_entity(name, actor=caller_actor)
                     self._link_fact_entity(fact_id, entity_id)
                 self._conn.commit()
 
@@ -346,18 +542,27 @@ class MemoryStore:
             if content is not None:
                 self._compute_hrr_vector(fact_id, content)
             # Rebuild bank for relevant category
-            cat = category or self._conn.execute(
-                "SELECT category FROM facts WHERE fact_id = ?", (fact_id,)
-            ).fetchone()["category"]
-            self._rebuild_bank(cat)
+            cat_row = self._conn.execute(
+                f"SELECT category FROM facts WHERE fact_id = ? {vis_and}",
+                [fact_id, *vis_params],
+            ).fetchone()
+            cat = category or cat_row["category"]
+            self._rebuild_bank(cat, caller_actor)
 
             return True
 
-    def remove_fact(self, fact_id: int) -> bool:
-        """Delete a fact and its entity links. Returns True if the row existed."""
+    def remove_fact(self, fact_id: int, actor: str = "") -> bool:
+        """Delete a fact visible to actor and its entity links.
+
+        Returns True if the row existed, False otherwise (foreign rows act as
+        not-found).
+        """
         with self._lock:
+            vis_sql, vis_params = self._visibility_sql("actor", actor)
+            vis_and = f"AND {vis_sql}" if vis_sql else ""
             row = self._conn.execute(
-                "SELECT fact_id, category FROM facts WHERE fact_id = ?", (fact_id,)
+                f"SELECT fact_id, category FROM facts WHERE fact_id = ? {vis_and}",
+                [fact_id, *vis_params],
             ).fetchone()
             if row is None:
                 return False
@@ -367,16 +572,17 @@ class MemoryStore:
             )
             self._conn.execute("DELETE FROM facts WHERE fact_id = ?", (fact_id,))
             self._conn.commit()
-            self._rebuild_bank(row["category"])
+            self._rebuild_bank(row["category"], actor)
             return True
 
     def list_facts(
         self,
-        category: str | None = None,
+        category: "str | None" = None,
         min_trust: float = 0.0,
         limit: int = 50,
-    ) -> list[dict]:
-        """Browse facts ordered by trust_score descending.
+        actor: str = "",
+    ) -> list:
+        """Browse the facts visible to actor, ordered by trust descending.
 
         Optionally filter by category and minimum trust score.
         """
@@ -386,6 +592,9 @@ class MemoryStore:
             if category is not None:
                 category_clause = "AND category = ?"
                 params.append(category)
+            vis_sql, vis_params = self._visibility_sql("actor", actor)
+            vis_clause = f"AND {vis_sql}" if vis_sql else ""
+            params.extend(vis_params)
             params.append(limit)
 
             sql = f"""
@@ -394,25 +603,30 @@ class MemoryStore:
                 FROM facts
                 WHERE trust_score >= ?
                   {category_clause}
+                  {vis_clause}
                 ORDER BY trust_score DESC
                 LIMIT ?
             """
             rows = self._conn.execute(sql, params).fetchall()
             return [self._row_to_dict(r) for r in rows]
 
-    def record_feedback(self, fact_id: int, helpful: bool) -> dict:
+    def record_feedback(self, fact_id: int, helpful: bool, actor: str = "") -> dict:
         """Record user feedback and adjust trust asymmetrically.
 
         helpful=True  -> trust += 0.05, helpful_count += 1
         helpful=False -> trust -= 0.10
 
         Returns a dict with fact_id, old_trust, new_trust, helpful_count.
-        Raises KeyError if fact_id does not exist.
+        Raises KeyError if the fact does not exist or belongs to another
+        actor (foreign rows act as not-found).
         """
         with self._lock:
+            vis_sql, vis_params = self._visibility_sql("actor", actor)
+            vis_and = f"AND {vis_sql}" if vis_sql else ""
             row = self._conn.execute(
-                "SELECT fact_id, trust_score, helpful_count FROM facts WHERE fact_id = ?",
-                (fact_id,),
+                f"""SELECT fact_id, trust_score, helpful_count FROM facts
+                    WHERE fact_id = ? {vis_and}""",
+                [fact_id, *vis_params],
             ).fetchone()
             if row is None:
                 raise KeyError(f"fact_id {fact_id} not found")
@@ -439,13 +653,14 @@ class MemoryStore:
                 "old_trust":    old_trust,
                 "new_trust":    new_trust,
                 "helpful_count": row["helpful_count"] + helpful_increment,
-            }
+            };
+
 
     # ------------------------------------------------------------------
     # Entity helpers
     # ------------------------------------------------------------------
 
-    def _extract_entities(self, text: str) -> list[str]:
+    def _extract_entities(self, text: str) -> list:
         """Extract entity candidates from text using simple regex rules.
 
         Rules applied (in order):
@@ -456,8 +671,8 @@ class MemoryStore:
 
         Returns a deduplicated list preserving first-seen order.
         """
-        seen: set[str] = set()
-        candidates: list[str] = []
+        seen: set = set()
+        candidates: list = []
 
         def _add(name: str) -> None:
             stripped = name.strip()
@@ -480,32 +695,39 @@ class MemoryStore:
 
         return candidates
 
-    def _resolve_entity(self, name: str) -> int:
-        """Find an existing entity by name or alias (case-insensitive) or create one.
+    def _resolve_entity(self, name: str, actor: str = "") -> int:
+        """Find an entity visible to actor by name or alias, or create one.
 
-        Returns the entity_id.
+        Entity resolution is scoped per actor: an identified caller resolves
+        against shared rows plus its own, and newly created entities carry the
+        caller's actor. Returns the entity_id.
         """
+        vis_sql, vis_params = self._visibility_sql("actor", actor)
+        vis_and = f"AND {vis_sql}" if vis_sql else ""
+
         # Exact name match
         row = self._conn.execute(
-            "SELECT entity_id FROM entities WHERE name LIKE ?", (name,)
+            f"SELECT entity_id FROM entities WHERE name LIKE ? {vis_and}",
+            [name, *vis_params],
         ).fetchone()
         if row is not None:
             return int(row["entity_id"])
 
-        # Search aliases — aliases stored as comma-separated; use LIKE with % boundaries
+        # Search aliases -- aliases stored as comma-separated; use LIKE with % boundaries
         alias_row = self._conn.execute(
-            """
+            f"""
             SELECT entity_id FROM entities
-            WHERE ',' || aliases || ',' LIKE '%,' || ? || ',%'
+            WHERE ',' || aliases || ',' LIKE '%,' || ? || ',%' {vis_and}
             """,
-            (name,),
+            [name, *vis_params],
         ).fetchone()
         if alias_row is not None:
             return int(alias_row["entity_id"])
 
-        # Create new entity
+        # Create new entity scoped to this actor
         cur = self._conn.execute(
-            "INSERT INTO entities (name) VALUES (?)", (name,)
+            "INSERT INTO entities (name, actor) VALUES (?, ?)",
+            (name, self._normalize_actor(actor)),
         )
         self._conn.commit()
         return int(cur.lastrowid)  # type: ignore[return-value]
@@ -545,20 +767,29 @@ class MemoryStore:
             )
             self._conn.commit()
 
-    def _rebuild_bank(self, category: str) -> None:
-        """Full rebuild of a category's memory bank from all its fact vectors."""
+    def _rebuild_bank(self, category: str, actor: str = "") -> None:
+        """Rebuild the (category, actor) memory bank from its visible vectors."""
         with self._lock:
             if not self._hrr_available:
                 return
 
+            actor = self._normalize_actor(actor)
             bank_name = f"cat:{category}"
+            vis_sql, vis_params = self._visibility_sql("actor", actor)
+            vis_and = f"AND {vis_sql}" if vis_sql else ""
             rows = self._conn.execute(
-                "SELECT hrr_vector FROM facts WHERE category = ? AND hrr_vector IS NOT NULL",
-                (category,),
+                f"""SELECT hrr_vector FROM facts
+                    WHERE category = ? AND hrr_vector IS NOT NULL {vis_and}""",
+                [category, *vis_params],
             ).fetchall()
 
             if not rows:
-                self._conn.execute("DELETE FROM memory_banks WHERE bank_name = ?", (bank_name,))
+                # Drop only THIS (bank_name, actor) key -- other actors' banks
+                # are independent caches.
+                self._conn.execute(
+                    "DELETE FROM memory_banks WHERE bank_name = ? AND actor = ?",
+                    (bank_name, actor),
+                )
                 self._conn.commit()
                 return
 
@@ -571,22 +802,23 @@ class MemoryStore:
 
             self._conn.execute(
                 """
-                INSERT INTO memory_banks (bank_name, vector, dim, fact_count, updated_at)
-                VALUES (?, ?, ?, ?, CURRENT_TIMESTAMP)
-                ON CONFLICT(bank_name) DO UPDATE SET
+                INSERT INTO memory_banks (bank_name, actor, vector, dim, fact_count, updated_at)
+                VALUES (?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
+                ON CONFLICT(bank_name, actor) DO UPDATE SET
                     vector = excluded.vector,
                     dim = excluded.dim,
                     fact_count = excluded.fact_count,
                     updated_at = excluded.updated_at
                 """,
-                (bank_name, hrr.phases_to_bytes(bank_vector), self.hrr_dim, fact_count),
+                (bank_name, actor, hrr.phases_to_bytes(bank_vector), self.hrr_dim, fact_count),
             )
             self._conn.commit()
 
-    def rebuild_all_vectors(self, dim: int | None = None) -> int:
+    def rebuild_all_vectors(self, dim: "int | None" = None) -> int:
         """Recompute all HRR vectors + banks from text. For recovery/migration.
 
-        Returns the number of facts processed.
+        Banks are rebuilt per distinct (category, actor) pair. Returns the
+        number of facts processed.
         """
         with self._lock:
             if not self._hrr_available:
@@ -596,16 +828,16 @@ class MemoryStore:
                 self.hrr_dim = dim
 
             rows = self._conn.execute(
-                "SELECT fact_id, content, category FROM facts"
+                "SELECT fact_id, content, category, actor FROM facts"
             ).fetchall()
 
-            categories: set[str] = set()
+            bank_keys: set = set()
             for row in rows:
                 self._compute_hrr_vector(row["fact_id"], row["content"])
-                categories.add(row["category"])
+                bank_keys.add((row["category"], self._normalize_actor(row["actor"])))
 
-            for category in categories:
-                self._rebuild_bank(category)
+            for category, actor in sorted(bank_keys):
+                self._rebuild_bank(category, actor)
 
             return len(rows)
 
@@ -617,18 +849,19 @@ class MemoryStore:
         """Convert a sqlite3.Row to a plain dict."""
         return dict(row)
 
+
     @classmethod
     def release_all_under(cls, directory: "str | Path") -> int:
-        """Force-close every shared connection whose database lives under ``directory``.
+        """Force-close every shared connection whose database lives under directory.
 
-        ``close()`` is refcount-driven, so a live holder (e.g. an agent's
+        close() is refcount-driven, so a live holder (e.g. an agent's
         memory provider) keeps a profile's SQLite handle open indefinitely.
         That is exactly what a profile delete must break on Windows: the
-        desktop's main ``serve`` process opens ``memory_store.db`` for every
-        known profile, and ``rmtree`` of the profile directory fails with
-        ``WinError 32`` while any of those handles is open (#88347). This
-        closes the matching connections unconditionally — the directory is
-        going away, so later use by a stale holder is expected to fail — and
+        desktop's main serve process opens memory_store.db for every
+        known profile, and rmtree of the profile directory fails with
+        WinError 32 while any of those handles is open (#88347). This
+        closes the matching connections unconditionally -- the directory is
+        going away, so later use by a stale holder is expected to fail -- and
         returns how many were closed. In a process that holds none (e.g. the
         CLI deleting from outside serve) this is a harmless no-op returning 0.
         """
@@ -675,7 +908,7 @@ class MemoryStore:
                     # closed this entry (profile delete, #88347) a same-path
                     # store may have re-registered a FRESH entry under the
                     # same key; a stale holder's late close() must not evict
-                    # it — that would silently reintroduce the multi-writer
+                    # it -- that would silently reintroduce the multi-writer
                     # contention this registry exists to prevent.
                     if MemoryStore._shared.get(self._key) is entry:
                         MemoryStore._shared.pop(self._key, None)

@@ -2272,7 +2272,19 @@ def _ensure_user_systemd_env() -> None:
     favour of our own ``/run/user/{uid}`` so ``systemctl --user`` targets the
     right instance instead of an unreadable foreign socket (#86558).
     """
-    uid = os.getuid()  # windows-footgun: ok — POSIX systemd helper, never invoked on Windows
+    # User-scope systemd is a Linux concern. Keep callers such as the generic
+    # install path safe on native Windows, where ``os.getuid`` is unavailable;
+    # WSL reports Linux here and retains the normal environment setup.
+    if not is_linux() or is_termux():
+        return
+
+    getuid = getattr(os, "getuid", None)
+    if getuid is None:
+        # Keep the generic install/restart path harmless on native Windows;
+        # user-scope systemd is unavailable there even though this helper is
+        # normally reached only after the Linux platform guard above.
+        return
+    uid = getuid()
     xdg = os.environ.get("XDG_RUNTIME_DIR")
     if not xdg or not _runtime_dir_is_ours(xdg):
         runtime_dir = f"/run/user/{uid}"

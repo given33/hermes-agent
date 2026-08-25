@@ -52,6 +52,37 @@ class TestWslSystemdOperational:
         assert gateway._wsl_systemd_operational() is True
 
 
+@pytest.mark.linux_only
+def test_wsl_user_systemd_env_uses_linux_uid_when_runtime_is_available(
+    monkeypatch,
+):
+    """WSL's Linux branch still configures user-systemd from the UID helper."""
+
+    monkeypatch.setattr(gateway, "is_linux", lambda: True)
+    monkeypatch.setattr(gateway, "is_termux", lambda: False)
+    monkeypatch.setattr(gateway, "is_wsl", lambda: True)
+    monkeypatch.setattr(gateway.os, "getuid", lambda: 1001, raising=False)
+    monkeypatch.delenv("XDG_RUNTIME_DIR", raising=False)
+    monkeypatch.delenv("DBUS_SESSION_BUS_ADDRESS", raising=False)
+    monkeypatch.setattr(
+        gateway,
+        "_runtime_dir_is_ours",
+        lambda path: path == "/run/user/1001",
+    )
+    monkeypatch.setattr(
+        gateway,
+        "_path_exists_safe",
+        lambda path: str(path).replace("\\", "/") == "/run/user/1001/bus",
+    )
+
+    gateway._ensure_user_systemd_env()
+
+    assert gateway.os.environ["XDG_RUNTIME_DIR"] == "/run/user/1001"
+    assert gateway.os.environ["DBUS_SESSION_BUS_ADDRESS"] == (
+        f"unix:path={gateway.Path('/run/user/1001') / 'bus'}"
+    )
+
+
 # =============================================================================
 # supports_systemd_services() WSL integration
 # =============================================================================
@@ -150,4 +181,3 @@ class TestGatewayCommandWSLMessages:
         out = capsys.readouterr().out
         assert "WSL note" in out
         assert "tmux or screen" in out
-

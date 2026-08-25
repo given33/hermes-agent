@@ -173,3 +173,28 @@ describe("api OAuth helpers", () => {
     }
   });
 });
+
+describe("api.logout", () => {
+  it("keeps reverse-proxy base paths when returning to login", async () => {
+    const assign = vi.fn();
+    const fetchMock = vi.fn(async () => new Response(null, { status: 302 }));
+    vi.stubGlobal("fetch", fetchMock);
+    vi.stubGlobal("window", {
+      __HERMES_BASE_PATH__: "/hermes",
+      location: { assign },
+    });
+    vi.resetModules();
+    try {
+      const { api: scopedApi } = await import("./api");
+      await scopedApi.logout();
+    } finally {
+      vi.resetModules();
+    }
+
+    expect(fetchMock).toHaveBeenCalledWith(
+      "/hermes/auth/logout",
+      expect.objectContaining({ method: "POST", credentials: "include" }),
+    );
+    expect(assign).toHaveBeenCalledWith("/hermes/login");
+  });
+});

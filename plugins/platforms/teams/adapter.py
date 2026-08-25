@@ -30,6 +30,7 @@ import logging
 import os
 import sys
 from contextlib import contextmanager
+from collections import OrderedDict
 from typing import Any, Dict, Iterator, Optional
 from urllib.parse import quote
 
@@ -89,6 +90,7 @@ from gateway.platforms.base import (
     MessageEvent,
     MessageType,
     SendResult,
+    _local_path_from_file_uri,
     cache_image_from_url,
     cache_media_bytes,
 )
@@ -755,6 +757,7 @@ class TeamsAdapter(BasePlatformAdapter):
 
     MAX_MESSAGE_LENGTH = 28000  # Teams text message limit (~28 KB)
     splits_long_messages = True  # send() chunks via truncate_message()
+    _MAX_CONVERSATION_REFS = 5_000
 
     def __init__(self, config: PlatformConfig):
         super().__init__(config, Platform("teams"))
@@ -773,7 +776,7 @@ class TeamsAdapter(BasePlatformAdapter):
         self._dedup = MessageDeduplicator(max_size=1000)
         # Maps chat_id → ConversationReference captured from incoming messages.
         # Used to send cards with the correct conversation type (personal/group/channel).
-        self._conv_refs: Dict[str, Any] = {}
+        self._conv_refs: OrderedDict[str, Any] = OrderedDict()
 
     async def connect(self, *, is_reconnect: bool = False) -> bool:
         # Defensive re-check: create_adapter() already ran the installer
@@ -913,7 +916,10 @@ class TeamsAdapter(BasePlatformAdapter):
         # Cache the conversation reference for proactive sends (approval cards, etc.)
         conv_id = getattr(activity.conversation, "id", None)
         if conv_id:
+            self._conv_refs.pop(conv_id, None)
             self._conv_refs[conv_id] = ctx.conversation_ref
+            while len(self._conv_refs) > self._MAX_CONVERSATION_REFS:
+                self._conv_refs.popitem(last=False)
 
         # Extract text — strip bot @mentions
         text = ""
@@ -1249,7 +1255,7 @@ class TeamsAdapter(BasePlatformAdapter):
                 last_message_id = getattr(result, "id", None)
             except Exception as e:
                 _is_timeout = isinstance(e, (asyncio.TimeoutError, TimeoutError)) or 'timed out' in str(e).lower() or 'timeout' in str(e).lower()
-            return SendResult(success=False, error=str(e), retryable=not _is_timeout)
+                return SendResult(success=False, error=str(e), retryable=not _is_timeout)
 
         return SendResult(success=True, message_id=last_message_id)
 
@@ -1290,7 +1296,7 @@ class TeamsAdapter(BasePlatformAdapter):
                 mime_type = mimetypes.guess_type(source.split("?")[0])[0] or default_mime
             else:
                 # Local path — encode as base64 data URI
-                path = source.removeprefix("file://")
+                path = _local_path_from_file_uri(source)
                 mime_type = mimetypes.guess_type(path)[0] or default_mime
                 with open(path, "rb") as f:
                     content_url = f"data:{mime_type};base64,{base64.b64encode(f.read()).decode()}"

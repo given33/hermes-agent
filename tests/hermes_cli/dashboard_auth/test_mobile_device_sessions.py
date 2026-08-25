@@ -308,7 +308,7 @@ def test_account_deletion_persists_generation_before_any_cleanup_store_is_touche
     assert deletion["account_generation"] == generation
 
 
-def test_refresh_replay_revokes_the_rotated_token_family(tmp_path):
+def test_refresh_replay_grace_preserves_the_winning_token_family(tmp_path):
     store = MobileDeviceStore(tmp_path / "mobile-auth.db")
     first = store.create_session(
         user_id="owner",
@@ -322,8 +322,8 @@ def test_refresh_replay_revokes_the_rotated_token_family(tmp_path):
     assert rotated.refresh_token != first.refresh_token
     assert store.verify_access(first.access_token, touch=False) is None
     assert store.rotate_refresh(first.refresh_token) is None
-    assert store.verify_access(rotated.access_token, touch=False) is None
-    assert store.rotate_refresh(rotated.refresh_token) is None
+    assert store.verify_access(rotated.access_token, touch=False) is not None
+    assert store.rotate_refresh(rotated.refresh_token) is not None
 
 
 def test_logout_revoke_invalidates_access_and_refresh(tmp_path):

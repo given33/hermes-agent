@@ -108,7 +108,10 @@ class TestResolveSubdirWithin:
         clone.mkdir()
         outside = tmp_path / "outside"
         outside.mkdir()
-        (clone / "link").symlink_to(outside)
+        try:
+            (clone / "link").symlink_to(outside)
+        except OSError:
+            pytest.skip("symlink creation requires platform privileges")
         with pytest.raises(PluginOperationError, match="escapes the repository"):
             _resolve_subdir_within(clone, "link")
 
@@ -447,18 +450,20 @@ class TestCmdRemove:
 
     @patch("hermes_cli.plugins_cmd._sanitize_plugin_name")
     @patch("hermes_cli.plugins_cmd._plugins_dir")
-    @patch("hermes_cli.plugins_cmd.shutil.rmtree")
-    def test_remove_deletes_plugin(self, mock_rmtree, mock_plugins_dir, mock_sanitize):
+    def test_remove_deletes_plugin(self, mock_plugins_dir, mock_sanitize, tmp_path):
         from hermes_cli.plugins_cmd import cmd_remove
 
-        mock_plugins_dir.return_value = MagicMock()
-        mock_target = MagicMock()
-        mock_target.exists.return_value = True
-        mock_sanitize.return_value = mock_target
+        plugins_dir = tmp_path / "plugins"
+        plugins_dir.mkdir()
+        target = plugins_dir / "test-plugin"
+        target.mkdir()
+        (target / "plugin.yaml").write_text("name: test-plugin\n", encoding="utf-8")
+        mock_plugins_dir.return_value = plugins_dir
+        mock_sanitize.return_value = target
 
         cmd_remove("test-plugin")
 
-        mock_rmtree.assert_called_once_with(mock_target)
+        assert not target.exists()
 
     @patch("hermes_cli.plugins_cmd._sanitize_plugin_name")
     @patch("hermes_cli.plugins_cmd._plugins_dir")

@@ -2037,8 +2037,8 @@ class GatewaySlashCommandsMixin:
                             try:
                                 # Write-back round-trip: raw read is correct
                                 # (merged defaults must not be persisted).
-                                from hermes_cli.config import read_user_config_raw
-                                _persist_cfg = read_user_config_raw(config_path)
+                                from hermes_cli.config import read_raw_config_strict
+                                _persist_cfg = read_raw_config_strict(config_path)
                                 _raw_model = _persist_cfg.get("model")
                                 if isinstance(_raw_model, dict):
                                     _persist_model_cfg = _raw_model
@@ -2363,8 +2363,8 @@ class GatewaySlashCommandsMixin:
                 try:
                     # Write-back round-trip: raw read is correct (merged
                     # defaults must not be persisted back to the user's file).
-                    from hermes_cli.config import read_user_config_raw
-                    cfg = read_user_config_raw(config_path)
+                    from hermes_cli.config import read_raw_config_strict
+                    cfg = read_raw_config_strict(config_path)
                     # Coerce scalar/None ``model:`` into a dict before mutation —
                     # otherwise ``cfg.setdefault("model", {})`` returns the existing
                     # scalar and the next assignment raises

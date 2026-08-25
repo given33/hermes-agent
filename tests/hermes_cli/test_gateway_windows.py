@@ -15,6 +15,21 @@ import hermes_cli.setup as setup
 _BREAKAWAY_MARKER = "_HERMES_GATEWAY_BREAKAWAY"
 
 
+@pytest.mark.windows_only
+def test_user_systemd_env_is_noop_without_posix_getuid(monkeypatch):
+    """Native Windows must not evaluate the Linux user-systemd UID path."""
+
+    monkeypatch.setattr(gateway, "is_linux", lambda: False)
+    monkeypatch.delattr(gateway.os, "getuid", raising=False)
+    monkeypatch.setenv("XDG_RUNTIME_DIR", "keep-on-windows")
+    monkeypatch.delenv("DBUS_SESSION_BUS_ADDRESS", raising=False)
+
+    gateway._ensure_user_systemd_env()
+
+    assert gateway.os.environ["XDG_RUNTIME_DIR"] == "keep-on-windows"
+    assert "DBUS_SESSION_BUS_ADDRESS" not in gateway.os.environ
+
+
 
 
 def test_schtasks_encoding_falls_back_to_utf8(monkeypatch):
@@ -362,7 +377,6 @@ def test_gateway_vbs_script_is_console_less(monkeypatch):
 # the gateway's marker-watcher thread to drain + exit cleanly, then escalates
 # to taskkill if drain times out.
 # ---------------------------------------------------------------------------
-
 
 
 

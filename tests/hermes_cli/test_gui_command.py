@@ -70,6 +70,23 @@ def _make_desktop_tree(tmp_path: Path) -> Path:
     return root
 
 
+def _minimal_pe_stub() -> bytes:
+    """Smallest byte layout ``_parse_pe_machine`` accepts as a structured PE.
+
+    The Windows post-build integrity gate (#69179) rejects artifacts under
+    512 bytes and walks MZ/PE headers; a real electron-builder exe starts
+    with exactly this shape, so the scaffold must too on win32.
+    """
+    import struct
+
+    dos = bytearray(64)
+    dos[:2] = b"MZ"
+    dos[0x3C:0x40] = struct.pack("<I", 64)  # e_lfanew → PE header right after
+    pe = b"PE\x00\x00" + struct.pack("<HHI", 0x8664, 0, 0)  # AMD64, no sections
+    pe += struct.pack("<H", 0)  # size_of_optional_header = 0
+    return (bytes(dos) + pe).ljust(512, b"\x00")
+
+
 def _make_packaged_executable(root: Path, monkeypatch) -> Path:
     """Create the packaged-app path layout electron-builder emits on THIS host.
 
@@ -91,7 +108,12 @@ def _make_packaged_executable(root: Path, monkeypatch) -> Path:
     else:
         exe = desktop_dir / "release" / "linux-unpacked" / "hermes"
     exe.parent.mkdir(parents=True, exist_ok=True)
-    exe.write_text("", encoding="utf-8")
+    if sys.platform == "win32":
+        # An empty file is precisely the corrupt artifact the Windows
+        # integrity gate exists to reject — lay down a minimal valid PE.
+        exe.write_bytes(_minimal_pe_stub())
+    else:
+        exe.write_text("", encoding="utf-8")
     if sys.platform not in ("darwin", "win32"):
         (exe.parent / "chrome-sandbox").write_text("", encoding="utf-8")
     return exe
@@ -107,7 +129,9 @@ def test_gui_installs_packages_and_launches_desktop_app(tmp_path, monkeypatch):
     pack_ok = subprocess.CompletedProcess(["npm", "run", "pack"], 0)
     launch_ok = subprocess.CompletedProcess([str(packaged_exe)], 0)
 
-    with patch("hermes_cli.main.shutil.which", return_value="/usr/bin/npm"), \
+    # cmd_gui resolves npm through the managed-Node-aware runtime resolver,
+    # not a bare shutil.which() — patch the seam it actually calls.
+    with patch("hermes_cli.main._resolve_node_runtime_npm", return_value="/usr/bin/npm"), \
          patch("hermes_cli.main._run_npm_install_deterministic", return_value=install_ok) as mock_install, \
          patch("hermes_cli.main._desktop_build_needed", return_value=True), \
          patch("hermes_cli.main._write_desktop_build_stamp"), \

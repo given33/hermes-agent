@@ -350,7 +350,27 @@ def _jobs_lock():
                                 break
                             time.sleep(0.1)
                 elif msvcrt is not None:
-                    getattr(msvcrt, "locking")(lock_fd.fileno(), getattr(msvcrt, "LK_LOCK"), 1)
+                    _deadline = time.monotonic() + _JOBS_LOCK_TIMEOUT_SECONDS
+                    while True:
+                        try:
+                            getattr(msvcrt, "locking")(
+                                lock_fd.fileno(), getattr(msvcrt, "LK_NBLCK"), 1
+                            )
+                            break
+                        except (OSError, IOError):
+                            if time.monotonic() >= _deadline:
+                                # Windows LK_LOCK is documented as a ~10s
+                                # blocking retry, not the configured 30s bound.
+                                # A timed-out cross-process mutation must skip,
+                                # not silently interleave with another process.
+                                logger.error(
+                                    "Timed out after %.0fs waiting for the cron "
+                                    "jobs lock (%s); skipping this operation",
+                                    _JOBS_LOCK_TIMEOUT_SECONDS,
+                                    _jobs_lock_file(),
+                                )
+                                raise TimeoutError(str(_jobs_lock_file()))
+                            time.sleep(0.1)
             except (OSError, IOError) as e:
                 # Never let a locking failure take down cron writes — fall back to
                 # in-process-only protection (still held via _jobs_file_lock).
@@ -1625,7 +1645,12 @@ def _normalize_workdir(workdir: Optional[str]) -> Optional[str]:
     raw = str(workdir).strip()
     if not raw:
         return None
-    expanded = Path(raw).expanduser()
+    if raw == "~" and os.getenv("HOME"):
+        # Windows expanduser() prefers USERPROFILE and ignores HOME, but HOME
+        # is the documented test/embedding override for portable installs.
+        expanded = Path(os.environ["HOME"])
+    else:
+        expanded = Path(raw).expanduser()
     if not expanded.is_absolute():
         raise ValueError(
             f"Cron workdir must be an absolute path (got {raw!r}). "

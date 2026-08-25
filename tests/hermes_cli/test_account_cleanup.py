@@ -1,6 +1,9 @@
+import os
+import subprocess
 from pathlib import Path
 from types import SimpleNamespace
 
+import pytest
 import yaml
 
 from hermes_cli import account_cleanup
@@ -14,12 +17,25 @@ def _write_config(path: Path, value: dict) -> None:
     )
 
 
+def _make_dir_link(link: Path, target: Path) -> None:
+    if os.name == "nt":
+        result = subprocess.run(
+            ["cmd", "/c", "mklink", "/J", str(link), str(target)],
+            capture_output=True,
+            text=True,
+        )
+        if result.returncode != 0:
+            pytest.skip(f"directory junctions unavailable: {result.stderr.strip()}")
+    else:
+        link.symlink_to(target, target_is_directory=True)
+
+
 def test_model_cleanup_visits_every_profile_and_preserves_unrelated_config(
     tmp_path,
     monkeypatch,
 ):
     default = tmp_path / "default"
-    worker = tmp_path / "worker"
+    worker = default / "profiles" / "worker"
     _write_config(default, {
         "model": {"provider": "custom", "api_key": "secret-a"},
         "fallback_model": {"provider": "openai", "key": "secret-b"},
@@ -33,7 +49,10 @@ def test_model_cleanup_visits_every_profile_and_preserves_unrelated_config(
     monkeypatch.setattr(
         account_cleanup,
         "list_profiles",
-        lambda: [SimpleNamespace(path=worker), SimpleNamespace(path=default)],
+        lambda: [
+            SimpleNamespace(path=worker, name="worker", is_default=False),
+            SimpleNamespace(path=default, name="default", is_default=True),
+        ],
     )
 
     result = account_cleanup.purge_owner_model_configuration("owner")
@@ -47,6 +66,154 @@ def test_model_cleanup_visits_every_profile_and_preserves_unrelated_config(
     worker_config = yaml.safe_load((worker / "config.yaml").read_text(encoding="utf-8"))
     assert default_config == {"dashboard": {"theme": "dark"}}
     assert worker_config == {"gateway": {"enabled": True}}
+
+
+def test_model_cleanup_skips_linked_and_out_of_layout_profile_roots(
+    tmp_path,
+    monkeypatch,
+):
+    home = tmp_path / "home"
+    outside = tmp_path / "outside"
+    linked = home / "profiles" / "linked"
+    _write_config(home, {"model": {"provider": "owner"}})
+    _write_config(outside, {"model": {"provider": "external"}})
+    linked.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        _make_dir_link(linked, outside)
+    except OSError:
+        # The out-of-layout regular root below still exercises the rejection
+        # on Windows installations without symlink privilege.
+        linked = None
+    stray = tmp_path / "stray"
+    _write_config(stray, {"model": {"provider": "stray"}})
+
+    monkeypatch.setattr(account_cleanup, "get_hermes_home", lambda: home)
+    profile_entries = [
+        SimpleNamespace(path=home, name="default", is_default=True),
+        SimpleNamespace(path=outside, name="outside", is_default=False),
+        SimpleNamespace(path=stray, name="stray", is_default=False),
+    ]
+    if linked is not None:
+        profile_entries.append(
+            SimpleNamespace(path=linked, name="linked", is_default=False)
+        )
+    monkeypatch.setattr(account_cleanup, "list_profiles", lambda: profile_entries)
+
+    result = account_cleanup.purge_owner_model_configuration("owner")
+
+    assert result["profiles_changed"] == 1
+    assert yaml.safe_load((outside / "config.yaml").read_text(encoding="utf-8")) == {
+        "model": {"provider": "external"}
+    }
+    assert yaml.safe_load((stray / "config.yaml").read_text(encoding="utf-8")) == {
+        "model": {"provider": "stray"}
+    }
+
+
+def test_model_cleanup_rejects_external_default_profile_root(
+    tmp_path, monkeypatch
+):
+    home = tmp_path / "home"
+    external_default = tmp_path / "external-default"
+    _write_config(home, {"model": {"provider": "managed"}})
+    _write_config(external_default, {"model": {"provider": "external"}})
+
+    monkeypatch.setattr(account_cleanup, "get_hermes_home", lambda: home)
+    monkeypatch.setattr(
+        account_cleanup,
+        "list_profiles",
+        lambda: [
+            SimpleNamespace(
+                path=external_default,
+                name="default",
+                is_default=True,
+            )
+        ],
+    )
+
+    result = account_cleanup.purge_owner_model_configuration("owner")
+
+    assert result["profiles_changed"] == 1
+    assert yaml.safe_load(
+        (external_default / "config.yaml").read_text(encoding="utf-8")
+    ) == {"model": {"provider": "external"}}
+
+
+def test_model_cleanup_skips_linked_config_leaf(tmp_path, monkeypatch):
+    home = tmp_path / "home"
+    outside = tmp_path / "external"
+    home.mkdir()
+    _write_config(outside, {"model": {"provider": "external"}})
+    config_link = home / "config.yaml"
+    try:
+        config_link.symlink_to(outside / "config.yaml")
+    except OSError:
+        pytest.skip("file symlinks unavailable")
+
+    monkeypatch.setattr(account_cleanup, "get_hermes_home", lambda: home)
+    monkeypatch.setattr(
+        account_cleanup,
+        "list_profiles",
+        lambda: [SimpleNamespace(path=home, name="default", is_default=True)],
+    )
+
+    result = account_cleanup.purge_owner_model_configuration("owner")
+
+    assert result["profiles_changed"] == 0
+    assert config_link.is_symlink()
+    assert yaml.safe_load((outside / "config.yaml").read_text(encoding="utf-8")) == {
+        "model": {"provider": "external"}
+    }
+
+
+def test_model_cleanup_fails_closed_for_link_like_hermes_home(
+    tmp_path, monkeypatch
+):
+    real_home = tmp_path / "real-home"
+    linked_home = tmp_path / "linked-home"
+    _write_config(real_home, {"model": {"provider": "keep"}})
+    try:
+        _make_dir_link(linked_home, real_home)
+    except OSError:
+        pytest.skip("directory symlinks unavailable")
+
+    monkeypatch.setattr(account_cleanup, "get_hermes_home", lambda: linked_home)
+    monkeypatch.setattr(
+        account_cleanup,
+        "list_profiles",
+        lambda: [SimpleNamespace(path=linked_home, name="default", is_default=True)],
+    )
+
+    result = account_cleanup.purge_owner_model_configuration("owner")
+
+    assert result["profiles_changed"] == 0
+    assert yaml.safe_load((real_home / "config.yaml").read_text(encoding="utf-8")) == {
+        "model": {"provider": "keep"}
+    }
+
+
+def test_global_cleanup_fails_closed_for_link_like_hermes_home(
+    tmp_path, monkeypatch
+):
+    real_home = tmp_path / "real-home"
+    linked_home = tmp_path / "linked-home"
+    _write_config(real_home, {"model": {"provider": "keep"}})
+    try:
+        _make_dir_link(linked_home, real_home)
+    except OSError:
+        pytest.skip("directory junctions unavailable")
+
+    monkeypatch.setattr(account_cleanup, "get_hermes_home", lambda: linked_home)
+    monkeypatch.setattr(
+        account_cleanup,
+        "_account_cleanup_plugins",
+        lambda: pytest.fail("linked HERMES_HOME reached collaboration cleanup"),
+    )
+
+    with pytest.raises(RuntimeError, match="link-like HERMES_HOME"):
+        account_cleanup.purge_account_owned_cloud_data(
+            "owner", account_generation="generation-1"
+        )
 
 
 def test_late_old_generation_model_cleanup_preserves_replacement_config(
@@ -140,6 +307,61 @@ def test_global_cleanup_combines_collaboration_and_model_domains(monkeypatch):
             "workflow_runs": 3,
         },
     }
+
+
+def test_global_cleanup_holds_account_lifecycle_guard(monkeypatch):
+    lifecycle = __import__(
+        "hermes_cli.account_lifecycle", fromlist=["account_lifecycle_commit_guard"]
+    )
+    entered: list[str] = []
+
+    class Guard:
+        def __enter__(self):
+            entered.append("enter")
+            return self
+
+        def __exit__(self, *_args):
+            entered.append("exit")
+
+    monkeypatch.setattr(
+        lifecycle,
+        "account_lifecycle_commit_guard",
+        lambda: Guard(),
+    )
+    monkeypatch.setattr(
+        account_cleanup,
+        "_account_cleanup_plugins",
+        lambda: SimpleNamespace(
+            plugin_api=SimpleNamespace(
+                delete_owner_account_data=lambda owner_id, *, account_generation: {
+                    "owner_id": owner_id,
+                    "account_generation": account_generation,
+                }
+            )
+        ),
+    )
+    monkeypatch.setattr(
+        account_cleanup,
+        "purge_owner_model_configuration",
+        lambda owner_id, *, account_generation: {
+            "owner_id": owner_id,
+            "account_generation": account_generation,
+        },
+    )
+    monkeypatch.setattr(
+        account_cleanup,
+        "purge_owner_operational_state",
+        lambda owner_id, *, account_generation: {
+            "owner_id": owner_id,
+            "account_generation": account_generation,
+        },
+    )
+
+    account_cleanup.purge_account_owned_cloud_data(
+        "owner", account_generation="generation-1"
+    )
+
+    assert entered == ["enter", "exit"]
 
 
 def test_real_cleanup_resolves_mobile_generation_and_tombstones_empty_pi_stores(

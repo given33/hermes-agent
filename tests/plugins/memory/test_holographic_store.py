@@ -11,6 +11,7 @@ visibility, concurrent multi-instance writers, and write-lock release after
 a failed write.
 """
 
+import os
 import sqlite3
 import threading
 
@@ -72,6 +73,8 @@ class TestSharedConnection:
         """A symlink to the same DB file must hit the same registry entry —
         otherwise two connections to one file silently reintroduce the
         multi-writer contention the registry exists to prevent."""
+        if os.name == "nt":
+            pytest.skip("Windows symlink creation requires elevated developer mode")
         real_dir = tmp_path / "real"
         real_dir.mkdir()
         link_dir = tmp_path / "link"
@@ -192,7 +195,9 @@ class TestConcurrency:
             monkeypatch.setattr(
                 MemoryStore,
                 "_rebuild_bank",
-                lambda self, category: (_ for _ in ()).throw(RuntimeError("boom")),
+                # (category, actor) since actor scoping landed; the stub only
+                # exists to blow up mid-add_fact.
+                lambda self, category, actor="": (_ for _ in ()).throw(RuntimeError("boom")),
             )
             with pytest.raises(RuntimeError, match="boom"):
                 broken.add_fact("write that fails after the INSERT")
@@ -224,4 +229,3 @@ class TestProviderShutdown:
 
         assert provider._store is None
         assert MemoryStore._shared == {}
-

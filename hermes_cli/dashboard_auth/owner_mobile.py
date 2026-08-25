@@ -38,9 +38,9 @@ from hermes_cli.dashboard_auth.mobile_device_store import (
 )
 from hermes_cli.dashboard_auth.routes import (
     _account_rate_key,
-    _client_ip,
     _password_rate_limited,
 )
+from hermes_cli.dashboard_auth.client_ip import client_ip as _client_ip
 from hermes_cli.dashboard_auth.token_auth import (
     extract_bearer_token,
     register_optional_token_prefix,
@@ -65,6 +65,34 @@ _VERIFICATION_CODE_TTL_SECONDS = 10 * 60
 _VERIFICATION_CODE_RESEND_SECONDS = 60
 _VERIFICATION_CODE_MAX_ATTEMPTS = 5
 _VERIFICATION_PEPPER = secrets.token_bytes(32)
+
+
+@router.get("/api/mobile/v1/handshake")
+def mobile_handshake(request: Request) -> dict[str, Any]:
+    """Return the small, secret-free capability contract used by iOS.
+
+    This endpoint is intentionally public so a freshly installed client can
+    discover the API before login.  Account/profile names are only returned
+    after a verified mobile bearer is attached by the optional token seam.
+    """
+    principal = getattr(request.state, "token_principal", None)
+    session = _current_mobile_session(request) if principal is not None else None
+    if session is not None or principal is not None:
+        from hermes_cli.profiles import list_profiles
+
+        profiles = [profile.name or "default" for profile in list_profiles()] or ["default"]
+    else:
+        profiles = []
+    return {
+        "api_version": 1,
+        "hermes_version": "unknown",
+        "server_time": int(time.time()),
+        "profiles": profiles,
+        # The public pre-login contract advertises that this server has an
+        # owner-capable profile without disclosing its name.
+        "profile_count": max(1, len(profiles)),
+        "capabilities": ["chat", "sessions", "studio", "workflows"],
+    }
 
 
 @dataclass
@@ -386,7 +414,7 @@ def ensure_mobile_token_provider() -> OwnerMobileTokenProvider:
     if existing is not None:
         if not isinstance(existing, OwnerMobileTokenProvider):
             raise RuntimeError("owner-mobile auth provider name is already in use")
-        register_optional_token_prefix("/api")
+        register_optional_token_prefix("/api", required_scope="dashboard:admin")
         return existing
     provider = OwnerMobileTokenProvider()
     try:
@@ -396,8 +424,26 @@ def ensure_mobile_token_provider() -> OwnerMobileTokenProvider:
         if not isinstance(existing, OwnerMobileTokenProvider):
             raise RuntimeError("owner-mobile auth provider registration failed")
         provider = existing
-    register_optional_token_prefix("/api")
+    register_optional_token_prefix("/api", required_scope="dashboard:admin")
     return provider
+
+
+def register_mobile_api_provider_if_configured() -> bool:
+    """Register the mobile API-key provider only when a key is configured."""
+    if not os.environ.get("HERMES_MOBILE_API_KEY", "").strip():
+        return False
+    from hermes_cli.dashboard_auth.mobile_api_provider import MobileApiKeyProvider
+
+    existing = get_provider(MobileApiKeyProvider.name)
+    if existing is None:
+        try:
+            register_provider(MobileApiKeyProvider())
+        except ValueError:
+            existing = get_provider(MobileApiKeyProvider.name)
+    register_optional_token_prefix("/api", required_scope="dashboard:admin")
+    return isinstance(
+        get_provider(MobileApiKeyProvider.name), MobileApiKeyProvider
+    )
 
 
 def _compatible_password_provider(

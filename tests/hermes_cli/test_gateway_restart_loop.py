@@ -8,6 +8,7 @@ Covers:
 
 import json
 import os
+import sys
 from argparse import Namespace
 
 import pytest
@@ -483,6 +484,9 @@ class TestTerminalToolGatewayLifecycleGuard:
 
         assert result["exit_code"] == 1
 
+    @pytest.mark.skipif(
+        sys.platform == "win32", reason="os.mkfifo is POSIX-only"
+    )
     def test_non_regular_referenced_script_fails_closed(self, monkeypatch, tmp_path):
         import tools.terminal_tool as tt
 
@@ -761,6 +765,9 @@ class TestLifecycleGuardModule:
         with pytest.raises(GatewayLifecycleBlocked):
             check_gateway_lifecycle("daily ops", str(script))
 
+    @pytest.mark.skipif(
+        sys.platform == "win32", reason="os.symlink needs elevated privileges"
+    )
     def test_cloud_backed_symlink_fails_closed_without_opening_target(
         self, tmp_path, monkeypatch
     ):
@@ -1188,7 +1195,8 @@ class TestTerminalToolGatewayLifecycleGuardRemote:
             cwd = str(tmp_path)
             def execute(self, command, **kwargs):
                 calls.append(command)
-                if "head -c" in command and "/remote/workspace/remote.sh" in command:
+                normalized = command.replace("\\", "/")
+                if "head -c" in normalized and "/remote/workspace/remote.sh" in normalized:
                     return {"output": "#!/bin/bash\\nhermes gateway restart\\n", "returncode": 0}
                 return {"output": "", "returncode": 0}
 

@@ -16,7 +16,7 @@ INSTALL_SH = REPO_ROOT / "scripts" / "install.sh"
 
 def test_install_script_honors_explicit_browser_override_only() -> None:
     """find_system_browser consults only an explicit AGENT_BROWSER_EXECUTABLE_PATH."""
-    text = INSTALL_SH.read_text()
+    text = INSTALL_SH.read_text(encoding='utf-8')
 
     assert 'override="${AGENT_BROWSER_EXECUTABLE_PATH:-}"' in text
     # An explicit override still skips the bundled download (override, not fallback).
@@ -26,7 +26,7 @@ def test_install_script_honors_explicit_browser_override_only() -> None:
 
 
 def test_playwright_installs_are_timeout_guarded() -> None:
-    text = INSTALL_SH.read_text()
+    text = INSTALL_SH.read_text(encoding='utf-8')
 
     # The timeout wrapper still exists and is used internally by the install
     # wrapper, so every Playwright download remains bounded.
@@ -47,7 +47,7 @@ def test_playwright_installs_are_timeout_guarded() -> None:
 
 def test_install_script_supports_skip_browser_flag() -> None:
     """--skip-browser (and --no-playwright alias) skips the Playwright install."""
-    text = INSTALL_SH.read_text()
+    text = INSTALL_SH.read_text(encoding='utf-8')
 
     assert "--skip-browser|--no-playwright)" in text
     assert "SKIP_BROWSER=true" in text
@@ -59,6 +59,11 @@ def test_install_script_supports_skip_browser_flag() -> None:
 
 
 
+import pytest
+
+_POSIX = __import__('sys').platform != 'win32'
+
+@pytest.mark.skipif(not _POSIX, reason='bash install.sh execution is POSIX-only')
 def test_browser_install_timeout_stays_interruptible() -> None:
     """The Playwright download must stay Ctrl+C-able and force-kill if wedged.
 
@@ -68,7 +73,7 @@ def test_browser_install_timeout_stays_interruptible() -> None:
     `-k 10` guarantees a SIGKILL after the deadline. Both are GNU-only, so the
     installer probes support once and falls back to plain `timeout`.
     """
-    text = INSTALL_SH.read_text()
+    text = INSTALL_SH.read_text(encoding='utf-8')
 
     # GNU-flag probe + the guarded invocation must both be present. The timeout
     # binary is parameterized ($timeout_bin) so macOS gtimeout works too (#39219).
@@ -105,7 +110,7 @@ def _run_install_fn(distro: str, version: str, *, native_fails: bool,
         "playwright_fallback_platform",
         "run_playwright_install",
     ]
-    src = INSTALL_SH.read_text()
+    src = INSTALL_SH.read_text(encoding='utf-8')
     import re
 
     extracted = []
@@ -158,7 +163,7 @@ echo "FINAL_RC=$?"
         env = dict(os.environ, RUNLOG=runlog)
         proc = subprocess.run(["bash", "-c", harness], capture_output=True,
                               text=True, env=env)
-        runs = Path(runlog).read_text().strip().splitlines()
+        runs = Path(runlog).read_text(encoding='utf-8').strip().splitlines()
         final_rc = None
         for line in proc.stdout.splitlines():
             if line.startswith("FINAL_RC="):
@@ -168,6 +173,7 @@ echo "FINAL_RC=$?"
         Path(runlog).unlink(missing_ok=True)
 
 
+@pytest.mark.skipif(not _POSIX, reason='bash install.sh')
 def test_override_retry_fires_on_ubuntu_26() -> None:
     """Ubuntu 26.04 (too new) → native fails → retry with ubuntu24.04 override."""
     r = _run_install_fn("ubuntu", "26.04", native_fails=True)
@@ -181,6 +187,7 @@ def test_override_retry_fires_on_ubuntu_26() -> None:
 
 
 
+@pytest.mark.skipif(not _POSIX, reason='bash install.sh')
 def test_override_retry_fires_on_debian_14() -> None:
     """Debian 14 (> 13) is the too-new apt case → retry with override."""
     r = _run_install_fn("debian", "14", native_fails=True)
@@ -189,6 +196,7 @@ def test_override_retry_fires_on_debian_14() -> None:
     assert r["final_rc"] == 0
 
 
+@pytest.mark.skipif(not _POSIX, reason='bash install.sh')
 def test_no_retry_when_native_succeeds_on_ubuntu_26() -> None:
     """Even on Ubuntu 26.04, a successful native install is never retried."""
     r = _run_install_fn("ubuntu", "26.04", native_fails=False)
@@ -206,6 +214,7 @@ def _extract_function_body(source: str, name: str) -> str:
     return m.group(0)
 
 
+@pytest.mark.skipif(not _POSIX, reason='bash install.sh')
 def test_ensure_browser_no_longer_npm_installs_agent_browser() -> None:
     """agent-browser resolves lazily via npx everywhere else in the system
     (tools/browser_tool.py::_find_agent_browser); this was the last place
@@ -213,7 +222,7 @@ def test_ensure_browser_no_longer_npm_installs_agent_browser() -> None:
     copy of it. Removed: agent-browser acquisition now happens only via
     `hermes update`'s npx cache warm or an actual browser-tool call's lazy
     npx resolution (PR #44772 review)."""
-    body = _extract_function_body(INSTALL_SH.read_text(), "ensure_browser")
+    body = _extract_function_body(INSTALL_SH.read_text(encoding='utf-8'), "ensure_browser")
 
     assert "agent-browser@" not in body
     assert "Installing Chromium via agent-browser install" not in body
@@ -224,22 +233,24 @@ def test_ensure_browser_no_longer_npm_installs_agent_browser() -> None:
     assert "configure_browser_env_from_system_browser" in body
 
 
+@pytest.mark.skipif(not _POSIX, reason='bash install.sh')
 def test_ensure_browser_still_ignore_scripts_and_timeout_guarded() -> None:
     """The removal of agent-browser must not have also dropped the
     supply-chain and hang-protection hardening that still applies to the
     remaining camofox install."""
-    body = _extract_function_body(INSTALL_SH.read_text(), "ensure_browser")
+    body = _extract_function_body(INSTALL_SH.read_text(encoding='utf-8'), "ensure_browser")
 
     assert "--ignore-scripts" in body
     assert "run_with_timeout" in body
 
 
+@pytest.mark.skipif(not _POSIX, reason='bash install.sh')
 def test_ensure_browser_no_longer_references_agent_browser_binary_path() -> None:
     """No dangling reference to a local agent-browser binary path should
     remain now that this function never installs it — a leftover reference
     would be dead code pointing at a binary that no longer gets placed
     there by this function."""
-    body = _extract_function_body(INSTALL_SH.read_text(), "ensure_browser")
+    body = _extract_function_body(INSTALL_SH.read_text(encoding='utf-8'), "ensure_browser")
 
     assert "$HERMES_HOME/node/bin/agent-browser" not in body
 

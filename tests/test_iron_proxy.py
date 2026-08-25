@@ -24,6 +24,8 @@ import pytest
 
 from agent.proxy_sources import iron_proxy as ip
 
+_IS_POSIX = sys.platform != "win32"
+
 
 # ---------------------------------------------------------------------------
 # Per-test isolation
@@ -341,6 +343,7 @@ def test_subprocess_env_strips_unrelated_secrets(hermes_home, monkeypatch):
 # ---------------------------------------------------------------------------
 
 
+@pytest.mark.skipif(not _IS_POSIX, reason="POSIX file permission bits")
 def test_ca_key_created_with_0o600(hermes_home, monkeypatch):
     """The CA private key must NEVER exist on disk with default umask
     permissions, even transiently.  Fix: open with explicit mode=0o600
@@ -376,6 +379,7 @@ def test_ca_key_created_with_0o600(hermes_home, monkeypatch):
 # ---------------------------------------------------------------------------
 
 
+@pytest.mark.skipif(not _IS_POSIX, reason="POSIX file permission bits")
 def test_ensure_audit_log_creates_with_0o600(hermes_home, tmp_path):
     audit = tmp_path / "audit.log"
     ip.ensure_audit_log(audit)
@@ -384,6 +388,7 @@ def test_ensure_audit_log_creates_with_0o600(hermes_home, tmp_path):
     assert mode == 0o600
 
 
+@pytest.mark.skipif(not _IS_POSIX, reason="POSIX file permission bits")
 def test_ensure_audit_log_tightens_existing_perms(hermes_home, tmp_path):
     audit = tmp_path / "audit.log"
     audit.write_text("preexisting content\n")
@@ -398,6 +403,7 @@ def test_ensure_audit_log_tightens_existing_perms(hermes_home, tmp_path):
 # ---------------------------------------------------------------------------
 
 
+@pytest.mark.skipif(not _IS_POSIX, reason="POSIX file permission bits")
 def test_proxy_state_dir_is_0o700(hermes_home):
     state = ip._proxy_state_dir()
     mode = state.stat().st_mode & 0o777
@@ -485,6 +491,7 @@ def test_mappings_roundtrip_preserves_headers_and_aliases(hermes_home):
 
 
 
+@pytest.mark.skipif(not _IS_POSIX, reason="POSIX file permission bits")
 def test_ensure_management_token_persists_and_is_stable(hermes_home):
     t1 = ip.ensure_management_token()
     t2 = ip.ensure_management_token()
@@ -539,6 +546,7 @@ def test_reload_proxy_posts_bearer_to_management_endpoint(hermes_home, monkeypat
     assert captured["auth"] == f"Bearer {token}"
 
 
+@pytest.mark.skipif(not _IS_POSIX, reason="POSIX shebang + exec-bit spawn")
 def test_start_proxy_injects_management_key_env(hermes_home, monkeypatch):
     """When the generated config has a management listener, start_proxy
     must inject the bearer key env var — v0.39 refuses to start when
@@ -812,5 +820,4 @@ def test_bitwarden_importerror_raise_without_fallback(
         ip._build_proxy_subprocess_env(
             refresh_from_bitwarden=True, bitwarden_config=bw_cfg,
         )
-
 

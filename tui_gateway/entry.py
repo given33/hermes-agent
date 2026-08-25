@@ -25,6 +25,35 @@ from tui_gateway.transport import TeeTransport
 
 logger = logging.getLogger(__name__)
 
+
+def _pin_stdio_utf8() -> None:
+    """Pin stdin/stdout/stderr to UTF-8 regardless of the ambient locale.
+
+    The Windows bootstrap (``hermes_bootstrap.apply_windows_utf8_bootstrap``)
+    gives win32 consoles this guarantee; POSIX needs it just as much because
+    a gateway started under ``LC_ALL=C``/``POSIX`` binds an ASCII stdout
+    codec, and the first non-ASCII JSON frame would raise
+    UnicodeEncodeError and kill the TUI before ``gateway.ready``.
+    ``errors="replace"`` keeps even a hostile stream non-fatal; the
+    transport additionally degrades per-frame as a second belt
+    (see ``tui_gateway.transport._sanitize_line``).
+    """
+    for name in ("stdout", "stderr", "stdin"):
+        stream = getattr(sys, name, None)
+        reconfigure = getattr(stream, "reconfigure", None)
+        if reconfigure is None:
+            # Not a TextIOWrapper (redirected in tests, or an embedded
+            # interpreter's non-standard stream). Nothing to pin.
+            continue
+        try:
+            reconfigure(encoding="utf-8", errors="replace")
+        except (OSError, ValueError):
+            # Already closed, or replaced mid-flight. Non-fatal.
+            pass
+
+
+_pin_stdio_utf8()
+
 # Handle for the background MCP tool-discovery thread (see
 # ensure_mcp_discovery_started).  The first agent build briefly joins this so
 # already-spawning fast servers land before the agent snapshots its tool list

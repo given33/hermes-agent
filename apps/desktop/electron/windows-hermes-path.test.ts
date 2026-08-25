@@ -138,6 +138,35 @@ test('resolveVenvHermesCommand: returns the resolved python backend descriptor w
   assert.deepEqual(result.env, { FAKE_ENV: '1' })
 })
 
+test('resolveVenvHermesCommand: uses the injected platform path delimiter', () => {
+  let probedEnv: Record<string, string> | undefined
+  const previousPythonPath = process.env.PYTHONPATH
+
+  const deps = makeDeps({
+    directoryExists: () => true,
+    canImportHermesCli: (_python, opts) => {
+      probedEnv = opts.env
+
+      return true
+    }
+  })
+
+  process.env.PYTHONPATH = 'C:/caller/path'
+
+  try {
+    resolveVenvHermesCommand('/root/venv/Scripts/hermes.exe', [], deps)
+  } finally {
+    if (previousPythonPath == null) {
+      delete process.env.PYTHONPATH
+    } else {
+      process.env.PYTHONPATH = previousPythonPath
+    }
+  }
+
+  assert.ok(probedEnv)
+  assert.match(probedEnv.PYTHONPATH, /^\/root;/)
+})
+
 test('resolveVenvHermesCommand: is case-insensitive on hermes.exe and the Scripts dir name', () => {
   const deps = makeDeps()
 

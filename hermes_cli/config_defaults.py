@@ -3562,6 +3562,14 @@ DEFAULT_CONFIG = {
 
 # Optional environment variables that enhance functionality
 OPTIONAL_ENV_VARS = {
+    "HERMES_MOBILE_API_KEY": {
+        "description": "Bearer key for native Hermes mobile API clients",
+        "prompt": "Hermes mobile API key",
+        "url": None,
+        "password": True,
+        "category": "security",
+        "advanced": True,
+    },
     # ── Provider (handled in provider selection, not shown in checklists) ──
     "NOUS_BASE_URL": {
         "description": "Nous Portal base URL override",

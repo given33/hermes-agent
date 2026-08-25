@@ -36,6 +36,9 @@ from __future__ import annotations
 
 import json
 import logging
+import os
+from pathlib import Path
+import shutil
 import subprocess
 import threading
 import time
@@ -66,13 +69,55 @@ class CommandTokenError(RuntimeError):
 def _mint(command: str, label: str) -> tuple[str, Optional[float]]:
     """Run *command*, returning ``(token, ttl_seconds_or_None)``."""
     try:
-        completed = subprocess.run(
-            command,
-            shell=True,
-            capture_output=True,
-            text=True,
-            timeout=_MINT_TIMEOUT_SECONDS,
-        )
+        if os.name == "nt":
+            # key_cmd examples and vendor helpers use POSIX shell syntax. When
+            # Git for Windows is installed, honor that contract instead of
+            # handing `printf`/`$(...)` to cmd.exe. Native cmd/PowerShell
+            # commands remain valid through their normal executable names.
+            # Prefer the POSIX shell bundled with Git for Windows. The WSL
+            # launcher also exposes "bash", but it expects /mnt/... spelling.
+                from tools.environments.local import _find_bash
+
+                bash = Path(_find_bash()) if os.name == "nt" else None
+                command_env = None
+                if bash:
+                    shell_root = bash.resolve().parents[2]
+                    from tools.environments.local import build_subprocess_env
+
+                    command_env = build_subprocess_env(
+                        scrub_secrets=False,
+                        inherit_profile_home=False,
+                    )
+                    command_env["PATH"] = (
+                        str(shell_root / "usr" / "bin")
+                        + os.pathsep
+                        + command_env.get("PATH", "")
+                    )
+                completed = (
+                    subprocess.run(
+                        [str(bash), "-c", command],
+                        capture_output=True,
+                        text=True,
+                        timeout=_MINT_TIMEOUT_SECONDS,
+                        env=command_env,
+                    )
+                if bash
+                else subprocess.run(
+                    command,
+                    shell=True,
+                    capture_output=True,
+                    text=True,
+                    timeout=_MINT_TIMEOUT_SECONDS,
+                )
+            )
+        else:
+            completed = subprocess.run(
+                command,
+                shell=True,
+                capture_output=True,
+                text=True,
+                timeout=_MINT_TIMEOUT_SECONDS,
+            )
     except subprocess.TimeoutExpired as exc:
         raise CommandTokenError(
             f"key_cmd for provider {label!r} timed out after "

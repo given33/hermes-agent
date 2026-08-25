@@ -3,6 +3,8 @@ from __future__ import annotations
 import io
 import json
 import os
+import threading
+import time
 from urllib.error import HTTPError, URLError
 
 import pytest
@@ -344,6 +346,80 @@ def test_retry_exhaustion_finishes_instead_of_polling_until_deadline():
     assert summary["retries"] == 2
     assert summary["attempts"] == 3
     assert summary["last_error"] == "offline"
+
+
+def test_noop_poll_sleep_yields_to_background_workflow(monkeypatch):
+    yielded = threading.Event()
+    completed = threading.Event()
+
+    class BackgroundAdapter:
+        def enqueue(self, **_kwargs):
+            def finish_after_scheduler_yield():
+                if yielded.wait(timeout=1):
+                    completed.set()
+
+            threading.Thread(target=finish_after_scheduler_yield, daemon=True).start()
+            return {
+                "accepted": True,
+                "conversation_id": "conversation-background",
+                "account_generation": "generation-1",
+            }
+
+        def events_after(self, *, conversation_id: str, cursor: int):
+            assert conversation_id == "conversation-background"
+            if completed.is_set():
+                return EvalEventPage(
+                    events=[
+                        {
+                            "cursor": 1,
+                            "event_id": "terminal-background",
+                            "event_type": "turn.completed",
+                            "role_stage": "worker",
+                            "account_generation": "generation-1",
+                            "payload": {},
+                        }
+                    ],
+                    cursor=1,
+                    account_generation="generation-1",
+                )
+            return EvalEventPage(
+                events=[],
+                cursor=cursor,
+                account_generation="generation-1",
+            )
+
+        def snapshot(self, *, conversation_id: str):
+            assert conversation_id == "conversation-background"
+            return {
+                "status": "completed" if completed.is_set() else "running",
+                "hosted_event_cursor": 1 if completed.is_set() else 0,
+                "account_generation": "generation-1",
+            }
+
+    real_sleep = time.sleep
+
+    def observe_scheduler_yield(delay: float):
+        if delay == 0.001:
+            yielded.set()
+        real_sleep(delay)
+
+    monkeypatch.setattr(
+        "hermes_services.behavior_eval.time.sleep",
+        observe_scheduler_yield,
+    )
+    summary = run_hosted_behavior_scenario(
+        BackgroundAdapter(),
+        provider="provider",
+        model="model",
+        scenario_id="background-yield",
+        prompt="run",
+        timeout_seconds=1,
+        poll_interval=0.01,
+        sleep=lambda _seconds: None,
+    )
+
+    assert summary["outcome"] == "completed"
+    assert yielded.is_set()
 
 
 def test_unconfigured_model_rejection_is_a_terminal_summary():

@@ -7,7 +7,8 @@
  * 4. Waits for plugins to call register() and resolves them
  */
 
-import { useState, useEffect, useRef } from "react";
+import { useState, useEffect, useMemo, useRef } from "react";
+import { useLocation } from "react-router";
 import { api, HERMES_BASE_PATH } from "@/lib/api";
 import type { PluginManifest, RegisteredPlugin } from "./types";
 import {
@@ -57,6 +58,10 @@ export function canSeedLoadedFromCache(
   return !cached.some((m) => m.tab?.override === "/chat");
 }
 
+function normalizePluginPath(path: string): string {
+  return path.replace(/\/$/, "") || "/";
+}
+
 export function usePlugins() {
   // Lazy initialisers run once at mount — safe to read sessionStorage here.
   // This avoids the "cannot access ref during render" lint error that would
@@ -78,6 +83,21 @@ export function usePlugins() {
     () => !canSeedLoadedFromCache(getCachedManifests()),
   );
   const loadedScripts = useRef<Set<string>>(new Set());
+  const normalizedPath = normalizePluginPath(useLocation().pathname);
+
+  // Plugin bundles are executable third-party code. Load slot providers and
+  // the route that is actually visible now; navigation loads the next route.
+  const requiredManifests = useMemo(
+    () =>
+      manifests.filter(
+        (manifest) =>
+          manifest.tab.override === normalizedPath ||
+          manifest.slots.length > 0 ||
+          (!manifest.tab.hidden &&
+            normalizePluginPath(manifest.tab.path) === normalizedPath),
+      ),
+    [manifests, normalizedPath],
+  );
 
   // Always re-fetch in the background to keep the cache fresh.
   // This handles: new plugins added, plugins removed, manifest changes.
@@ -95,11 +115,15 @@ export function usePlugins() {
 
   // Load plugin assets when manifests arrive.
   useEffect(() => {
-    if (manifests.length === 0) return;
+    let emptyRouteTimer: number | undefined;
+    if (requiredManifests.length === 0) {
+      emptyRouteTimer = window.setTimeout(() => setLoading(false), 0);
+      return () => window.clearTimeout(emptyRouteTimer);
+    }
 
     const injectedScripts: HTMLScriptElement[] = [];
 
-    for (const manifest of manifests) {
+    for (const manifest of requiredManifests) {
       // Inject CSS if specified.
       if (manifest.css) {
         const cssUrl = `${HERMES_BASE_PATH}/dashboard-plugins/${manifest.name}/${manifest.css}`;
@@ -164,13 +188,13 @@ export function usePlugins() {
         }
       }
     };
-  }, [manifests]);
+  }, [requiredManifests, normalizedPath]);
 
   // Listen for plugin registrations and resolve them against manifests.
   useEffect(() => {
     function resolvePlugins() {
       const resolved: RegisteredPlugin[] = [];
-      for (const manifest of manifests) {
+      for (const manifest of requiredManifests) {
         const component = getPluginComponent(manifest.name);
         if (component) {
           resolved.push({ manifest, component });
@@ -178,7 +202,7 @@ export function usePlugins() {
       }
       setPlugins(resolved);
       // If all plugins registered, stop loading early.
-      if (resolved.length === manifests.length && manifests.length > 0) {
+      if (resolved.length === requiredManifests.length) {
         setLoading(false);
       }
     }
@@ -186,7 +210,7 @@ export function usePlugins() {
     resolvePlugins();
     const unsub = onPluginRegistered(resolvePlugins);
     return unsub;
-  }, [manifests]);
+  }, [requiredManifests]);
 
   return { plugins, manifests, loading };
 }

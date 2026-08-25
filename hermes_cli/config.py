@@ -3164,7 +3164,7 @@ def resolve_ephemeral_system_prompt_from_config(cfg: Optional[Dict[str, Any]]) -
     return resolve_ephemeral_system_prompt(cfg)
 
 
-def read_raw_config() -> Dict[str, Any]:
+def read_raw_config(config_path: Optional[Path] = None) -> Dict[str, Any]:
     """Read ~/.hermes/config.yaml as-is, without merging defaults or migrating.
 
     Returns the raw YAML dict, or ``{}`` if the file doesn't exist or can't
@@ -3172,13 +3172,16 @@ def read_raw_config() -> Dict[str, Any]:
     single value and don't want the overhead of ``load_config()``'s deep-merge
     + migration pipeline.
 
+    ``config_path`` is optional for isolated callers; omitting it keeps the
+    profile-aware default from :func:`get_config_path`.
+
     Cached on the config file's (mtime_ns, size) — same strategy as
     ``load_config()``. Returns a deepcopy on every call since some callers
     mutate the result before passing to ``save_config()``.
     """
     with _CONFIG_LOCK:
         try:
-            config_path = get_config_path()
+            config_path = Path(config_path) if config_path is not None else get_config_path()
             st = config_path.stat()
             cache_key = (st.st_mtime_ns, st.st_size)
         except (FileNotFoundError, OSError):
@@ -3200,6 +3203,22 @@ def read_raw_config() -> Dict[str, Any]:
             data = {}
         _RAW_CONFIG_CACHE[path_key] = (cache_key[0], cache_key[1], copy.deepcopy(data))
         return data
+
+
+def read_raw_config_strict(config_path: Optional[Path] = None) -> Dict[str, Any]:
+    """Fail-closed raw config reader kept for legacy CLI callers."""
+    if config_path is None:
+        config_path = get_config_path()
+    try:
+        with open(config_path, encoding="utf-8") as handle:
+            data = fast_safe_load(handle)
+    except FileNotFoundError:
+        return {}
+    if data is None:
+        return {}
+    if not isinstance(data, dict):
+        raise ValueError("config.yaml root is not a YAML mapping")
+    return data
 
 
 def read_user_config_raw(config_path: Optional[Path] = None) -> Dict[str, Any]:

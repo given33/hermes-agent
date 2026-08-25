@@ -35,6 +35,10 @@ _scoped_providers: Dict[str, Dict[str, ImageGenProvider]] = {}
 _lock = threading.Lock()
 
 
+def _canonical_scope(scope: Optional[str]) -> Optional[str]:
+    return hermes_home_key(scope) if scope is not None else None
+
+
 def register_provider(provider: ImageGenProvider, *, scope: Optional[str] = None) -> None:
     """Register an image generation provider.
 
@@ -51,6 +55,7 @@ def register_provider(provider: ImageGenProvider, *, scope: Optional[str] = None
     if not isinstance(raw_name, str) or not raw_name.strip():
         raise ValueError("Image gen provider .name must be a non-empty string")
     name = raw_name.strip()
+    scope = _canonical_scope(scope)
     with _lock:
         target = _providers if scope is None else _scoped_providers.setdefault(scope, {})
         existing = target.get(name)
@@ -63,6 +68,7 @@ def register_provider(provider: ImageGenProvider, *, scope: Optional[str] = None
 
 def list_providers(*, scope: Optional[str] = None) -> List[ImageGenProvider]:
     """Return all registered providers, sorted by name."""
+    scope = _canonical_scope(scope)
     with _lock:
         merged = dict(_providers)
         merged.update(_scoped_providers.get(scope or hermes_home_key(), {}))
@@ -74,6 +80,7 @@ def get_provider(name: str, *, scope: Optional[str] = None) -> Optional[ImageGen
     """Return the provider registered under *name*, or None."""
     if not isinstance(name, str):
         return None
+    scope = _canonical_scope(scope)
     with _lock:
         key = name.strip()
         return _scoped_providers.get(scope or hermes_home_key(), {}).get(key) or _providers.get(key)
@@ -82,6 +89,7 @@ def get_provider(name: str, *, scope: Optional[str] = None) -> Optional[ImageGen
 def snapshot_registration(
     name: str, *, scope: Optional[str] = None
 ) -> Optional[ImageGenProvider]:
+    scope = _canonical_scope(scope)
     with _lock:
         target = _providers if scope is None else _scoped_providers.get(scope, {})
         return target.get(name.strip())
@@ -96,6 +104,7 @@ def restore_registration(
 ) -> bool:
     """Restore a plugin registration only when *current* is still installed."""
     key = name.strip()
+    scope = _canonical_scope(scope)
     with _lock:
         target = _providers if scope is None else _scoped_providers.setdefault(scope, {})
         if target.get(key) is not current:

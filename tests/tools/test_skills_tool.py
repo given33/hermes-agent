@@ -831,6 +831,10 @@ Do the legacy thing.
         assert result["readiness_status"] == "available"
 
 
+@pytest.mark.skipif(
+    __import__("sys").platform == "win32",
+    reason="path separator in collision detection differs on Windows",
+)
 class TestSkillViewCollisionDetection:
     """Regression tests for skill_view name collision handling.
 

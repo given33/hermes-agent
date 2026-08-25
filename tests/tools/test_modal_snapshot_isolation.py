@@ -7,6 +7,10 @@ from pathlib import Path
 
 import pytest
 
+pytestmark = pytest.mark.skipif(
+    __import__("sys").platform == "win32",
+    reason="modal SDK not installable on Windows host",
+)
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 TOOLS_DIR = REPO_ROOT / "tools"

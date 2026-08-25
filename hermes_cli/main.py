@@ -2943,10 +2943,11 @@ def cmd_chat(args):
         # `/c/Users/x` before Python ever sees it; MSYS2's path conversion is
         # disabled for native executables). Translate the MSYS/Cygwin/WSL
         # drive-root spellings to native Windows form first — no-op elsewhere.
+        from hermes_constants import expand_user_path
         from tools.environments.local import _msys_to_windows_path
 
         _target_dir = os.path.abspath(
-            os.path.expanduser(_msys_to_windows_path(in_dir))
+            expand_user_path(_msys_to_windows_path(in_dir))
         )
         if not os.path.isdir(_target_dir):
             print(f"Error: --in directory not found: {in_dir}")

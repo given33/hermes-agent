@@ -26,6 +26,7 @@ import json
 import os
 import sqlite3
 import stat
+import subprocess
 import sys
 
 import pytest
@@ -68,6 +69,33 @@ def test_legacy_approval_fails_closed_when_convergence_check_errors(monkeypatch)
     assert ok is False
     assert message == "convergence unavailable"
     assert not hasattr(commands, "_apply_one_unguarded")
+
+
+def test_legacy_approval_uses_converged_apply(monkeypatch):
+    from hermes_cli import write_approval_commands as commands
+    from tools import write_approval as wa
+
+    calls = []
+
+    def prepare(record):
+        calls.append(("prepare", record))
+        return {"subsystem": wa.MEMORY, "before": "before", "after": "after"}
+
+    def apply(record, plan):
+        calls.append(("apply", record, plan))
+        return True, ""
+
+    monkeypatch.setattr(commands, "prepare_write_approval", prepare)
+    monkeypatch.setattr(commands, "apply_write_approval", apply)
+
+    ok, message = commands._apply_one(
+        wa.MEMORY,
+        {"payload": {"action": "add", "content": "remember me"}},
+        object(),
+    )
+
+    assert (ok, message) == (True, "")
+    assert [call[0] for call in calls] == ["prepare", "apply"]
 
 
 @pytest.fixture
@@ -427,3 +455,42 @@ class TestLegacyJsonSidecarIsolation:
         assert not legacy.exists()
         assert not other.exists()
         assert stranger.exists()
+
+    def test_legacy_sidecar_scan_does_not_follow_linked_pending_root(
+        self, tmp_path, monkeypatch
+    ):
+        store = AccountWriteApprovalStore(db_path=tmp_path / "write-approvals.db")
+        home = tmp_path / "home"
+        external_pending = tmp_path / "external-pending"
+        external_pending.mkdir(parents=True)
+        source = external_pending / "foreign.json"
+        source.write_text("{}", encoding="utf-8")
+        (external_pending / "foreign.json.migrated.json").write_text(
+            json.dumps({
+                "schema": "hermes.legacy-approval-migration.v1",
+                "owner_id": "owner-a",
+            }),
+            encoding="utf-8",
+        )
+        pending = home / "pending" / "memory"
+        pending.parent.mkdir(parents=True)
+        if os.name == "nt":
+            result = subprocess.run(
+                ["cmd", "/c", "mklink", "/J", str(pending), str(external_pending)],
+                capture_output=True,
+                text=True,
+            )
+            if result.returncode != 0:
+                pytest.skip("directory junctions are unavailable")
+        else:
+            try:
+                pending.symlink_to(external_pending, target_is_directory=True)
+            except OSError:
+                pytest.skip("directory symlinks are unavailable")
+        monkeypatch.setattr(
+            "hermes_cli.account_write_approvals.get_hermes_home",
+            lambda: home,
+        )
+
+        assert store.legacy_json_sidecars_for_owner("owner-a") == []
+        assert source.exists()

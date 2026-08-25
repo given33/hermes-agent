@@ -16,6 +16,7 @@ Import chain (circular-import safe):
 
 import ast
 import functools
+import hashlib
 import importlib
 import json
 import logging
@@ -26,8 +27,27 @@ from pathlib import Path
 from typing import Callable, Dict, List, Optional, Set
 
 from hermes_constants import hermes_home_key
+from hermes_runtime.capabilities import normalize_capability_tags, normalize_role_names
 
 logger = logging.getLogger(__name__)
+
+
+def _canonical_scope(scope: Optional[str]) -> Optional[str]:
+    """Normalize an explicit profile scope to the registry key format."""
+    return hermes_home_key(scope) if scope is not None else None
+
+
+# These handlers address state owned by the long-lived agent/UI runtime. A
+# spawned registry would create a different session and cannot receive the
+# owner-only callbacks used by desktop tools. Keep this classification
+# explicit so ``isolate=True`` does not accidentally pickle a live callback or
+# split a stateful browser/terminal session across processes.
+_PARENT_RUNTIME_TOOLSETS = frozenset({
+    "browser",
+    "computer_use",
+    "terminal",
+    "desktop_ui",
+})
 
 # Cap on a tool error body; only trims runaway interpolated exceptions (static msgs are ~115 chars).
 _MAX_TOOL_ERROR_CHARS = 2048
@@ -208,11 +228,15 @@ class ToolEntry:
         "name", "toolset", "schema", "handler", "check_fn",
         "requires_env", "is_async", "description", "emoji",
         "max_result_size_chars", "dynamic_schema_overrides",
+        "prompt_guidance", "capability_tags", "allowed_roles",
+        "effect_metadata",
     )
 
     def __init__(self, name, toolset, schema, handler, check_fn,
                  requires_env, is_async, description, emoji,
-                 max_result_size_chars=None, dynamic_schema_overrides=None):
+                 max_result_size_chars=None, dynamic_schema_overrides=None,
+                 prompt_guidance=None, capability_tags=None, allowed_roles=None,
+                 effect_metadata=None):
         self.name = name
         self.toolset = toolset
         self.schema = schema
@@ -231,6 +255,45 @@ class ToolEntry:
         # on every get_definitions() call; results are merged shallow on top
         # of the base schema before the {"type": "function", ...} wrap.
         self.dynamic_schema_overrides = dynamic_schema_overrides
+        if prompt_guidance is not None and not isinstance(prompt_guidance, str):
+            raise TypeError("prompt_guidance must be a string or None")
+        self.prompt_guidance = prompt_guidance.strip() if prompt_guidance else None
+        self.capability_tags = normalize_capability_tags(capability_tags)
+        self.allowed_roles = normalize_role_names(allowed_roles)
+        self.effect_metadata = dict(effect_metadata) if effect_metadata else None
+
+
+def _resolve_isolated_registry_handler(identity: dict):
+    """Resolve a registry tool inside a spawned worker by stable name."""
+    name = str((identity or {}).get("tool_name") or "")
+    if not name:
+        raise RuntimeError("missing isolated tool name")
+    import importlib
+    import model_tools  # noqa: F401 - populate built-in registrations
+    module_name = str((identity or {}).get("handler_module") or "")
+    if module_name and module_name not in {"__main__", "builtins"}:
+        try:
+            importlib.import_module(module_name)
+        except Exception:
+            # The registry lookup below produces the typed resolution error;
+            # importing a third-party module must never escape as a raw error.
+            pass
+    entry = registry.get_entry(name)
+    if entry is None:
+        from hermes_services.tool_isolation import ToolIsolationResolutionError
+        raise ToolIsolationResolutionError(
+            f"tool {name!r} is not registered in the isolated worker"
+        )
+    return entry.handler, bool(entry.is_async)
+
+
+def _resolve_isolated_direct_handler(identity: dict):
+    """Resolve a pickleable handler for contract-deadline isolation."""
+    if "handler" not in (identity or {}):
+        from hermes_services.tool_isolation import ToolIsolationResolutionError
+
+        raise ToolIsolationResolutionError("missing direct isolated handler")
+    return identity["handler"], bool(identity.get("is_async"))
 
 
 class _PluginOverridePolicy:
@@ -461,7 +524,7 @@ class ToolRegistry:
 
     def _merged_tools(self, scope: Optional[str] = None) -> Dict[str, ToolEntry]:
         """Return global tools overlaid with one profile's plugin tools."""
-        active_scope = scope or self.current_scope_key()
+        active_scope = _canonical_scope(scope) or self.current_scope_key()
         merged = dict(self._tools)
         merged.update(self._scoped_tools.get(active_scope, {}))
         return merged
@@ -524,6 +587,7 @@ class ToolRegistry:
         scope: Optional[str] = None,
     ) -> Optional[ToolEntry]:
         """Return the local slot state without following global fallback."""
+        scope = _canonical_scope(scope)
         with self._lock:
             target = self._tools if scope is None else self._scoped_tools.get(scope, {})
             return target.get(name)
@@ -581,6 +645,7 @@ class ToolRegistry:
         The identity-bearing result lets plugin unload/reload revoke a stale
         authorization without losing durable module-to-profile attribution.
         """
+        scope = _canonical_scope(scope)
         with self._lock:
             policy = _PluginOverridePolicy(allowed)
             self._plugin_override_policy[(scope, module_namespace)] = policy
@@ -594,6 +659,7 @@ class ToolRegistry:
         scope: Optional[str] = None,
     ) -> Optional[_PluginOverridePolicy]:
         """Return one local authorization generation without fallback."""
+        scope = _canonical_scope(scope)
         with self._lock:
             return self._plugin_override_policy.get((scope, module_namespace))
 
@@ -606,6 +672,7 @@ class ToolRegistry:
         scope: Optional[str] = None,
     ) -> bool:
         """CAS-restore policy state while retaining durable scope attribution."""
+        scope = _canonical_scope(scope)
         with self._lock:
             key = (scope, module_namespace)
             if self._plugin_override_policy.get(key) is not current:
@@ -621,6 +688,7 @@ class ToolRegistry:
         scope: Optional[str],
         module_namespace: str,
     ) -> bool:
+        scope = _canonical_scope(scope)
         policy = self._plugin_override_policy.get((scope, module_namespace))
         if policy is None and scope is not None:
             policy = self._plugin_override_policy.get((None, module_namespace))
@@ -747,6 +815,10 @@ class ToolRegistry:
         emoji: str = "",
         max_result_size_chars: int | float | None = None,
         dynamic_schema_overrides: Callable = None,
+        prompt_guidance: str | None = None,
+        capability_tags: Set[str] | List[str] | None = None,
+        allowed_roles: Set[str] | List[str] | None = None,
+        effect_metadata: dict | None = None,
         override: bool = False,
         scope: Optional[str] = None,
     ):
@@ -758,6 +830,7 @@ class ToolRegistry:
         registrations that would shadow an existing tool from a different
         toolset are rejected to prevent accidental overwrites.
         """
+        scope = _canonical_scope(scope)
         handler_owner = self._plugin_owner_of(handler)
         caller_owner = self._plugin_namespace_of_module(self._caller_module())
         owner = caller_owner or handler_owner
@@ -844,6 +917,10 @@ class ToolRegistry:
                 emoji=emoji,
                 max_result_size_chars=max_result_size_chars,
                 dynamic_schema_overrides=dynamic_schema_overrides,
+                prompt_guidance=prompt_guidance,
+                capability_tags=capability_tags,
+                allowed_roles=allowed_roles,
+                effect_metadata=effect_metadata,
             )
             # Availability is now derived per-tool (_toolset_has_exposable_tools),
             # so this map no longer gates a toolset. It is still consumed by
@@ -960,6 +1037,7 @@ class ToolRegistry:
         newer entry under the same name, in which case unloading this entry
         must leave the newer entry untouched.
         """
+        scope = _canonical_scope(scope)
         with self._lock:
             target = (
                 self._tools
@@ -1105,6 +1183,7 @@ class ToolRegistry:
         args: dict,
         *,
         scope: Optional[str] = None,
+        isolate: bool = False,
         **kwargs,
     ) -> str | dict:
         """Execute a tool handler by name.
@@ -1119,6 +1198,67 @@ class ToolRegistry:
         if not entry:
             return tool_error(f"Unknown tool: {name}")
         try:
+            from hermes_services.tool_contract import resolve_tool_contract
+
+            # A published hard deadline is an execution guarantee, not schema
+            # decoration. Process isolation is what makes a non-cooperative
+            # handler terminable; cooperative parent-runtime calls cannot keep
+            # that promise.
+            contract = resolve_tool_contract(name)
+            if isolate:
+                identity = self.get_isolation_identity(name)
+                if identity.get("isolation_mode") != "registry_child":
+                    # Stateful parent-runtime tools intentionally reject child
+                    # rehydration; execute in the owning process.
+                    result = entry.handler(args or {}, **kwargs)
+                    return self._normalize_handler_result(name, result)
+                from hermes_services.tool_isolation import (
+                    ToolIsolationResolutionError,
+                    default_tool_timeout_seconds,
+                    run_tool_handler_isolated,
+                )
+                try:
+                    result = run_tool_handler_isolated(
+                        identity,
+                        dict(args or {}),
+                        dict(kwargs),
+                        timeout_seconds=(
+                            contract.timeout_seconds
+                            if contract.timeout_seconds is not None
+                            else default_tool_timeout_seconds()
+                        ),
+                        tool_name=name,
+                        handler_resolver=_resolve_isolated_registry_handler,
+                        interrupt_check=lambda: False,
+                    )
+                    return self._normalize_handler_result(name, result)
+                except ToolIsolationResolutionError as exc:
+                    return tool_error(
+                        str(exc),
+                        error_type="tool_isolation_resolution",
+                        retryable=False,
+                        tool=name,
+                    )
+            elif contract.timeout_seconds is not None:
+                from hermes_services.tool_isolation import (
+                    run_tool_handler_isolated,
+                )
+                from tools.interrupt import is_interrupted
+
+                result = run_tool_handler_isolated(
+                    {
+                        "tool_name": name,
+                        "handler": entry.handler,
+                        "is_async": entry.is_async,
+                    },
+                    dict(args or {}),
+                    dict(kwargs),
+                    timeout_seconds=contract.timeout_seconds,
+                    tool_name=name,
+                    handler_resolver=_resolve_isolated_direct_handler,
+                    interrupt_check=is_interrupted,
+                )
+                return self._normalize_handler_result(name, result)
             if entry.is_async:
                 from model_tools import _run_async
                 result = _run_async(entry.handler(args, **kwargs))
@@ -1158,6 +1298,108 @@ class ToolRegistry:
     def get_all_tool_names(self) -> List[str]:
         """Return sorted list of all registered tool names."""
         return sorted(entry.name for entry in self._snapshot_entries())
+
+    def registration_fingerprint(self, name: str) -> str | None:
+        """Return a digest of the registration metadata used by runtimes."""
+        entry = self.get_entry(name)
+        if entry is None:
+            return None
+        handler = entry.handler
+        dynamic = entry.dynamic_schema_overrides
+        payload = {
+            "name": entry.name,
+            "toolset": entry.toolset,
+            "schema": entry.schema,
+            "handler_module": getattr(handler, "__module__", ""),
+            "handler_qualname": getattr(handler, "__qualname__", ""),
+            "handler_identity": id(handler),
+            "is_async": bool(entry.is_async),
+            "requires_env": list(entry.requires_env),
+            "dynamic_schema_module": getattr(dynamic, "__module__", ""),
+            "dynamic_schema_qualname": getattr(dynamic, "__qualname__", ""),
+            "dynamic_schema_identity": id(dynamic) if dynamic else 0,
+            "prompt_guidance": entry.prompt_guidance,
+            "capability_tags": sorted(entry.capability_tags),
+            "allowed_roles": sorted(entry.allowed_roles),
+        }
+        encoded = json.dumps(
+            payload,
+            sort_keys=True,
+            separators=(",", ":"),
+            ensure_ascii=True,
+            default=str,
+        ).encode("utf-8")
+        return hashlib.sha256(encoded).hexdigest()
+
+    def get_prompt_guidance(self, tool_names: Set[str]) -> Dict[str, str]:
+        """Return non-empty prompt guidance for the selected tools."""
+        entries = {entry.name: entry for entry in self._snapshot_entries()}
+        return {
+            name: entries[name].prompt_guidance
+            for name in sorted(tool_names)
+            if name in entries and entries[name].prompt_guidance
+        }
+
+    def get_capability_metadata(self, tool_names: Set[str] | None = None) -> Dict[str, dict]:
+        """Return capability and role metadata for selected registered tools."""
+        names = set(self.get_all_tool_names() if tool_names is None else tool_names)
+        return {
+            entry.name: {
+                "toolset": entry.toolset,
+                "capability_tags": sorted(entry.capability_tags),
+                "allowed_roles": sorted(entry.allowed_roles),
+            }
+            for entry in self._snapshot_entries()
+            if entry.name in names
+        }
+
+    def get_tool_names_for_role(
+        self, role: str, tool_names: Set[str] | None = None
+    ) -> Set[str]:
+        """Return tools visible to *role*, retaining untagged legacy tools."""
+        from hermes_runtime.capabilities import role_allows
+
+        names = set(self.get_all_tool_names() if tool_names is None else tool_names)
+        result: Set[str] = set()
+        for entry in self._snapshot_entries():
+            if entry.name not in names:
+                continue
+            if not entry.capability_tags and not entry.allowed_roles:
+                result.add(entry.name)
+            elif role_allows(
+                role,
+                entry.capability_tags,
+                explicit_roles=entry.allowed_roles,
+            ):
+                result.add(entry.name)
+        return result
+
+    def get_isolation_identity(self, name: str) -> dict:
+        """Return a pickle-safe identity envelope for isolated dispatch."""
+        entry = self.get_entry(name)
+        if entry is None:
+            return {
+                "tool_name": name,
+                "handler_module": "",
+                "resolution": "unresolvable",
+                "isolation_mode": "registry_child",
+                "isolation_contract": "unsupported",
+            }
+        handler = entry.handler
+        module = getattr(handler, "__module__", "") or ""
+        qualname = getattr(handler, "__qualname__", "") or ""
+        parent_runtime = (
+            entry.toolset in _PARENT_RUNTIME_TOOLSETS
+            or str(entry.toolset).startswith("mcp-")
+        )
+        return {
+            "tool_name": entry.name,
+            "handler_module": module,
+            "handler_qualname": qualname,
+            "resolution": "module_qualname" if module and qualname else "unresolvable",
+            "isolation_mode": "parent_runtime" if parent_runtime else "registry_child",
+            "isolation_contract": "parent_cooperative" if parent_runtime else "child_rehydratable",
+        }
 
     def get_schema(self, name: str) -> Optional[dict]:
         """Return a tool's raw schema dict, bypassing check_fn filtering.
@@ -1261,6 +1503,23 @@ class ToolRegistry:
 
 # Module-level singleton
 registry = ToolRegistry()
+
+
+def _invalidate_registry_definitions() -> None:
+    """Signal that contract mutations require a fresh tool-definition snapshot."""
+
+    with registry._lock:
+        registry._generation += 1
+
+
+from hermes_services.tool_contract import configure_tool_contract_runtime as _configure_contract_runtime
+
+_configure_contract_runtime(
+    registry_generation=lambda: registry._generation,
+    bump_registry_generation=_invalidate_registry_definitions,
+    registration_fingerprint=registry.registration_fingerprint,
+    invalidate_definition_cache=lambda: None,
+)
 
 
 # ---------------------------------------------------------------------------

@@ -42,11 +42,18 @@ def no_terminal_env(monkeypatch):
 
 
 def _fake_no_tty(monkeypatch):
-    monkeypatch.setattr(tb.os, "ttyname", lambda fd: (_ for _ in ()).throw(OSError()))
+    def _raise(fd):
+        raise OSError(fd)
+
+    # os.ttyname does not exist on Windows; inject it so every platform
+    # exercises the same "tty probe fails" branch of get_terminal_id().
+    monkeypatch.setattr(tb.os, "ttyname", _raise, raising=False)
 
 
 def _fake_tty(monkeypatch, name="/dev/pts/7"):
-    monkeypatch.setattr(tb.os, "ttyname", lambda fd: name)
+    # Same injection on Windows: get_terminal_id() must behave identically
+    # whether os.ttyname is a real POSIX function or our fake.
+    monkeypatch.setattr(tb.os, "ttyname", lambda fd: name, raising=False)
 
 
 # ---------------------------------------------------------------- identity

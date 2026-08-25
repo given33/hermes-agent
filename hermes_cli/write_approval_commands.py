@@ -15,9 +15,13 @@ platform the gateway truncates it and points the user at the dashboard / file.
 
 from __future__ import annotations
 
-import json
 from typing import List, Optional
 
+from hermes_cli.account_write_approval_apply import (
+    WriteApprovalApplyError,
+    apply_write_approval,
+    prepare_write_approval,
+)
 from tools import write_approval as wa
 
 
@@ -139,20 +143,34 @@ def _approve(subsystem: str, rest: List[str], memory_store) -> str:
 
 
 def _apply_one(subsystem: str, rec, memory_store):
+    """Apply a legacy pending write only after before/after convergence.
+
+    The JSON pending store is shared by the interactive CLI and gateway. The
+    approval payload may have been staged earlier, so applying it directly
+    would overwrite a target changed after the user reviewed it. Re-derive a
+    plan from the payload, verify the current target against its before digest,
+    and apply under the subsystem's file lock.
+    """
     payload = rec.get("payload", {})
+    if subsystem == wa.MEMORY and memory_store is None:
+        return False, "memory store unavailable"
+    record = {"payload": payload, "subsystem": subsystem}
     try:
-        if subsystem == wa.MEMORY:
-            if memory_store is None:
-                return False, "memory store unavailable"
-            from tools.memory_tool import apply_memory_pending
-            result = apply_memory_pending(payload, memory_store)
-            return bool(result.get("success")), result.get("error", "")
-        else:
-            from tools.skill_manager_tool import apply_skill_pending
-            result = json.loads(apply_skill_pending(payload))
-            return bool(result.get("success")), result.get("error", "")
-    except Exception as e:
-        return False, str(e)
+        plan = prepare_write_approval(record)
+    except WriteApprovalApplyError as exc:
+        return False, str(exc)
+    except Exception as exc:  # noqa: BLE001 - surface failure, never bypass
+        return False, str(exc)
+    try:
+        ok, message = apply_write_approval(record, plan)
+    except Exception as exc:  # noqa: BLE001 - leave pending on any failure
+        return False, str(exc)
+    if ok and subsystem == wa.MEMORY and memory_store is not None:
+        try:
+            memory_store.load_from_disk()
+        except Exception:  # noqa: BLE001 - durable write already succeeded
+            pass
+    return ok, message
 
 
 def _reject(subsystem: str, rest: List[str]) -> str:

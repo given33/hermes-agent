@@ -10,6 +10,7 @@ module-level constants live in hermes_state_common.
 
 import logging
 import json
+import re
 import time
 from typing import Any, Dict, List, Optional
 
@@ -24,6 +25,8 @@ from hermes_state_common import (
 # Moved methods logged under the "hermes_state" logger before the split;
 # keep that logger identity so log filtering/capture behavior is unchanged.
 logger = logging.getLogger("hermes_state")
+
+_SAFE_IMPORTED_SESSION_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,199}$")
 
 
 class SessionPortabilityMixin:
@@ -440,6 +443,11 @@ class SessionPortabilityMixin:
             session_id = str(raw.get("id") or "").strip()
             if not session_id:
                 errors.append(self._import_error(index, "", "session id is required"))
+                continue
+            if not _SAFE_IMPORTED_SESSION_ID_RE.fullmatch(session_id):
+                errors.append(
+                    self._import_error(index, session_id, "unsafe session id")
+                )
                 continue
             if session_id in seen_ids:
                 errors.append(self._import_error(index, session_id, "duplicate session id"))

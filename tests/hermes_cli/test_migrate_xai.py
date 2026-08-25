@@ -13,6 +13,21 @@ from hermes_cli.xai_retirement import (
 )
 
 
+def _symlink_or_skip(target, link) -> None:
+    """symlink_to() that skips where the OS forbids symlinks.
+
+    Unprivileged Windows raises OSError winerror 1314 on any symlink
+    creation; the scenario under test can't even be constructed there,
+    so skip instead of failing (POSIX and Developer-Mode Windows run).
+    """
+    try:
+        link.symlink_to(target)
+    except OSError as e:
+        if getattr(e, "winerror", None) == 1314:
+            pytest.skip("symbolic link privilege unavailable on this host")
+        raise
+
+
 # ---------------------------------------------------------------------------
 # Fixtures
 # ---------------------------------------------------------------------------
@@ -260,7 +275,7 @@ class TestCrashDurability:
             encoding="utf-8",
         )
         link = tmp_path / "config.yaml"
-        link.symlink_to(real)
+        _symlink_or_skip(real, link)
 
         issues = find_retired_xai_refs(_parse(link))
         assert issues

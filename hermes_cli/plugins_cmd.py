@@ -866,7 +866,9 @@ def _install_plugin_core(
             _write_install_metadata(new_metadata)
         except Exception:
             if target.exists():
-                shutil.rmtree(target)
+                from hermes_cli.safe_delete import safe_rmtree
+
+                safe_rmtree(target, plugins_dir)
             if replaced_existing and backup.exists():
                 os.replace(backup, target)
             if old_metadata:
@@ -1203,11 +1205,13 @@ def cmd_update(name: str) -> None:
         console.print(f"[dim]{out}[/dim]")
 
 
-def _remove_plugin_core(target: Path) -> None:
+def _remove_plugin_core(target: Path, allowed_root: Path) -> None:
     """Remove one plugin and its metadata without splitting their state."""
     metadata = _read_install_metadata()
     if target.name not in metadata:
-        shutil.rmtree(target)
+        from hermes_cli.safe_delete import safe_rmtree
+
+        safe_rmtree(target, allowed_root)
         return
 
     updated = dict(metadata)
@@ -1246,7 +1250,7 @@ def cmd_remove(name: str) -> None:
         sys.exit(1)
 
     try:
-        _remove_plugin_core(target)
+        _remove_plugin_core(target, plugins_dir)
     except (OSError, PluginOperationError) as exc:
         console.print(f"[red]Error:[/red] Could not remove plugin '{name}': {exc}")
         sys.exit(1)
@@ -3023,7 +3027,7 @@ def dashboard_remove_user_plugin(name: str) -> dict[str, Any]:
         }
 
     try:
-        _remove_plugin_core(target)
+        _remove_plugin_core(target, plugins_dir)
     except (OSError, PluginOperationError) as exc:
         return {"ok": False, "error": f"Could not remove plugin '{name}': {exc}"}
     return {"ok": True, "name": name}

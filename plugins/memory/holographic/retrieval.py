@@ -1,7 +1,10 @@
 """Hybrid keyword/BM25 retrieval for the memory store.
 
-Ported from KIK memory_agent.py — combines FTS5 full-text search with
-Jaccard similarity reranking and trust-weighted scoring.
+Ported from KIK memory_agent.py -- combines FTS5 full-text search with
+Jaccard similarity reranking and trust-weighted scoring. Every entry point
+accepts an optional actor identity: when supplied, candidate facts are
+restricted to rows the actor may see (shared rows plus its own), and
+bank-vector scoring uses that actor's (category, actor) memory bank only.
 """
 
 from __future__ import annotations
@@ -17,6 +20,24 @@ try:
     from . import holographic as hrr
 except ImportError:
     import holographic as hrr  # type: ignore[no-redef]
+
+
+def _normalize_actor(actor: str) -> str:
+    """Normalize a caller-supplied actor identity (empty = unscoped)."""
+    return str(actor or "").strip()
+
+
+def _visibility_sql(column: str, actor: str) -> "tuple[str, list]":
+    """SQL fragment restricting column to rows visible to actor.
+
+    Mirrors MemoryStore._visibility_sql: shared rows (actor='') or owned by
+    the caller; an empty caller identity emits no filter so direct/unscoped
+    retriever users keep seeing every row.
+    """
+    actor = _normalize_actor(actor)
+    if not actor:
+        return "", []
+    return f"({column} = '' OR {column} = ?)", [actor]
 
 
 class FactRetriever:
@@ -51,8 +72,10 @@ class FactRetriever:
         category: str | None = None,
         min_trust: float = 0.3,
         limit: int = 10,
+        actor: str = "",
     ) -> list[dict]:
-        """Hybrid search: FTS5 candidates → Jaccard rerank → trust weighting.
+        """Hybrid search over actor-visible facts: FTS5 candidates ->
+        Jaccard rerank -> trust weighting.
 
         Pipeline:
         1. FTS5 search: Get limit*3 candidates from SQLite full-text search
@@ -63,14 +86,14 @@ class FactRetriever:
         Returns list of dicts with fact data + 'score' field, sorted by score desc.
         """
         # Stage 1: Get FTS5 candidates (more than limit for reranking headroom)
-        candidates = self._fts_candidates(query, category, min_trust, limit * 3)
+        candidates = self._fts_candidates(query, category, min_trust, limit * 3, actor)
 
         if not candidates:
             return []
 
         # Stage 2: Rerank with Jaccard + trust + optional decay
         query_tokens = self._tokenize(query)
-        # The query vector is loop-invariant — encode it at most once, on
+        # The query vector is loop-invariant -- encode it at most once, on
         # the first candidate that actually carries an HRR vector. Lazy on
         # purpose: migrated stores can have FTS candidates whose hrr_vector
         # was never backfilled (MemoryStore._init_db adds the column
@@ -116,7 +139,7 @@ class FactRetriever:
         # Sort by score descending, return top limit
         scored.sort(key=lambda x: x["score"], reverse=True)
         results = scored[:limit]
-        # Strip raw HRR bytes — callers expect JSON-serializable dicts
+        # Strip raw HRR bytes -- callers expect JSON-serializable dicts
         for fact in results:
             fact.pop("hrr_vector", None)
         return results
@@ -126,44 +149,52 @@ class FactRetriever:
         entity: str,
         category: str | None = None,
         limit: int = 10,
+        actor: str = "",
     ) -> list[dict]:
-        """Compositional entity query using HRR algebra.
+        """Compositional entity query over actor-visible facts using HRR algebra.
 
-        Unbinds entity from memory bank to extract associated content.
-        This is NOT keyword search — it uses algebraic structure to find facts
-        where the entity plays a structural role.
+        Unbinds entity from the caller's (category, actor) memory bank to
+        extract associated content. This is NOT keyword search -- it uses
+        algebraic structure to find facts where the entity plays a structural
+        role.
 
-        Falls back to FTS5 search if numpy unavailable.
+        Falls back gracefully when that bank is missing/empty (direct fact-
+        vector scoring, then keyword search) and entirely to FTS5 search if
+        numpy unavailable.
         """
         if not hrr._HAS_NUMPY:
             # Fallback to keyword search on entity name
-            return self.search(entity, category=category, limit=limit)
+            return self.search(entity, category=category, limit=limit, actor=actor)
 
         conn = self.store._conn
+        actor = _normalize_actor(actor)
 
         # Encode entity as role-bound vector
         role_entity = hrr.encode_atom("__hrr_role_entity__", self.hrr_dim)
         entity_vec = hrr.encode_atom(entity.lower(), self.hrr_dim)
         probe_key = hrr.bind(entity_vec, role_entity)
 
-        # Try category-specific bank first, then all facts
+        # Try THIS actor's category-specific bank first; a missing/empty bank
+        # falls through to direct fact-vector scoring below.
         if category:
             bank_name = f"cat:{category}"
             bank_row = conn.execute(
-                "SELECT vector FROM memory_banks WHERE bank_name = ?",
-                (bank_name,),
+                "SELECT vector FROM memory_banks WHERE bank_name = ? AND actor = ?",
+                (bank_name, actor),
             ).fetchone()
             if bank_row:
                 bank_vec = hrr.bytes_to_phases(bank_row["vector"], dim=self.hrr_dim)
                 extracted = hrr.unbind(bank_vec, probe_key)
                 # Use extracted signal to score individual facts
                 return self._score_facts_by_vector(
-                    extracted, category=category, limit=limit
+                    extracted, category=category, limit=limit, actor=actor
                 )
 
         # Score against individual fact vectors directly
-        where = "WHERE hrr_vector IS NOT NULL"
-        params: list = []
+        vis_sql, vis_params = _visibility_sql("actor", actor)
+        vis_and = f"AND {vis_sql}" if vis_sql else ""
+        where = f"WHERE hrr_vector IS NOT NULL {vis_and}"
+        params: list = [*vis_params]
         if category:
             where += " AND category = ?"
             params.append(category)
@@ -181,9 +212,9 @@ class FactRetriever:
 
         if not rows:
             # Final fallback: keyword search
-            return self.search(entity, category=category, limit=limit)
+            return self.search(entity, category=category, limit=limit, actor=actor)
 
-        # role_content is loop-invariant — encode it once (deterministic
+        # role_content is loop-invariant -- encode it once (deterministic
         # SHA-256-based atom) instead of once per fact row.
         role_content = hrr.encode_atom("__hrr_role_content__", self.hrr_dim)
         scored = []
@@ -206,26 +237,29 @@ class FactRetriever:
         entity: str,
         category: str | None = None,
         limit: int = 10,
+        actor: str = "",
     ) -> list[dict]:
-        """Discover facts that share structural connections with an entity.
+        """Discover actor-visible facts sharing structural connections with an entity.
 
         Unlike probe (which finds facts *about* an entity), related finds
-        facts that are connected through shared context — e.g., other entities
+        facts that are connected through shared context -- e.g., other entities
         mentioned alongside this one, or content that overlaps structurally.
 
         Falls back to FTS5 search if numpy unavailable.
         """
         if not hrr._HAS_NUMPY:
-            return self.search(entity, category=category, limit=limit)
+            return self.search(entity, category=category, limit=limit, actor=actor)
 
         conn = self.store._conn
 
-        # Encode entity as a bare atom (not role-bound — we want ANY structural match)
+        # Encode entity as a bare atom (not role-bound -- we want ANY structural match)
         entity_vec = hrr.encode_atom(entity.lower(), self.hrr_dim)
 
-        # Get all facts with vectors
-        where = "WHERE hrr_vector IS NOT NULL"
-        params: list = []
+        # Get all actor-visible facts with vectors
+        vis_sql, vis_params = _visibility_sql("actor", actor)
+        vis_and = f"AND {vis_sql}" if vis_sql else ""
+        where = f"WHERE hrr_vector IS NOT NULL {vis_and}"
+        params: list = [*vis_params]
         if category:
             where += " AND category = ?"
             params.append(category)
@@ -242,11 +276,11 @@ class FactRetriever:
         ).fetchall()
 
         if not rows:
-            return self.search(entity, category=category, limit=limit)
+            return self.search(entity, category=category, limit=limit, actor=actor)
 
         # Score each fact by how much the entity's atom appears in its vector
         # This catches both role-bound entity matches AND content word matches
-        # Both role atoms are loop-invariant — encode them once here
+        # Both role atoms are loop-invariant -- encode them once here
         # (deterministic SHA-256-based atoms) instead of twice per fact row.
         role_entity = hrr.encode_atom("__hrr_role_entity__", self.hrr_dim)
         role_content = hrr.encode_atom("__hrr_role_content__", self.hrr_dim)
@@ -262,7 +296,7 @@ class FactRetriever:
 
             entity_role_sim = hrr.similarity(residual, role_entity)
             content_role_sim = hrr.similarity(residual, role_content)
-            # Take the max — entity could appear in either role
+            # Take the max -- entity could appear in either role
             best_sim = max(entity_role_sim, content_role_sim)
 
             fact["score"] = (best_sim + 1.0) / 2.0 * fact["trust_score"]
@@ -276,22 +310,23 @@ class FactRetriever:
         entities: list[str],
         category: str | None = None,
         limit: int = 10,
+        actor: str = "",
     ) -> list[dict]:
-        """Multi-entity compositional query — vector-space JOIN.
+        """Multi-entity compositional query over actor-visible facts.
 
         Given multiple entities, algebraically intersects their structural
         connections to find facts related to ALL of them simultaneously.
         This is compositional reasoning that no embedding DB can do.
 
         Example: reason(["peppi", "backend"]) finds facts where peppi AND
-        backend both play structural roles — without keyword matching.
+        backend both play structural roles -- without keyword matching.
 
         Falls back to FTS5 search if numpy unavailable.
         """
         if not hrr._HAS_NUMPY or not entities:
             # Fallback: search with all entities as keywords
             query = " ".join(entities)
-            return self.search(query, category=category, limit=limit)
+            return self.search(query, category=category, limit=limit, actor=actor)
 
         conn = self.store._conn
         role_entity = hrr.encode_atom("__hrr_role_entity__", self.hrr_dim)
@@ -304,9 +339,11 @@ class FactRetriever:
             probe_key = hrr.bind(entity_vec, role_entity)
             entity_residuals.append(probe_key)
 
-        # Get all facts with vectors
-        where = "WHERE hrr_vector IS NOT NULL"
-        params: list = []
+        # Get all actor-visible facts with vectors
+        vis_sql, vis_params = _visibility_sql("actor", actor)
+        vis_and = f"AND {vis_sql}" if vis_sql else ""
+        where = f"WHERE hrr_vector IS NOT NULL {vis_and}"
+        params: list = [*vis_params]
         if category:
             where += " AND category = ?"
             params.append(category)
@@ -324,7 +361,7 @@ class FactRetriever:
 
         if not rows:
             query = " ".join(entities)
-            return self.search(query, category=category, limit=limit)
+            return self.search(query, category=category, limit=limit, actor=actor)
 
         # Score each fact by how much EACH entity is structurally present.
         # A fact scores high only if ALL entities have structural presence
@@ -354,12 +391,13 @@ class FactRetriever:
         category: str | None = None,
         threshold: float = 0.3,
         limit: int = 10,
+        actor: str = "",
     ) -> list[dict]:
-        """Find potentially contradictory facts via entity overlap + content divergence.
+        """Find potentially contradictory facts among actor-visible rows.
 
         Two facts contradict when they share entities (same subject) but have
         low content-vector similarity (different claims). This is automated
-        memory hygiene — no other memory system does this.
+        memory hygiene -- no other memory system does this.
 
         Returns pairs of facts with a contradiction score.
         Falls back to empty list if numpy unavailable.
@@ -369,9 +407,11 @@ class FactRetriever:
 
         conn = self.store._conn
 
-        # Get all facts with vectors and their linked entities
-        where = "WHERE f.hrr_vector IS NOT NULL"
-        params: list = []
+        # Get all actor-visible facts with vectors and their linked entities
+        vis_sql, vis_params = _visibility_sql("f.actor", actor)
+        vis_and = f"AND {vis_sql}" if vis_sql else ""
+        where = f"WHERE f.hrr_vector IS NOT NULL {vis_and}"
+        params: list = [*vis_params]
         if category:
             where += " AND f.category = ?"
             params.append(category)
@@ -389,8 +429,8 @@ class FactRetriever:
         if len(rows) < 2:
             return []
 
-        # Guard against O(n²) explosion on large fact stores.
-        # At 500 facts, that's ~125K comparisons — acceptable.
+        # Guard against O(n^2) explosion on large fact stores.
+        # At 500 facts, that's ~125K comparisons -- acceptable.
         # Above that, only check the most recently updated facts.
         _MAX_CONTRADICT_FACTS = 500
         if len(rows) > _MAX_CONTRADICT_FACTS:
@@ -460,12 +500,15 @@ class FactRetriever:
         target_vec: "np.ndarray",
         category: str | None = None,
         limit: int = 10,
+        actor: str = "",
     ) -> list[dict]:
-        """Score facts by similarity to a target vector."""
+        """Score actor-visible facts by similarity to a target vector."""
         conn = self.store._conn
 
-        where = "WHERE hrr_vector IS NOT NULL"
-        params: list = []
+        vis_sql, vis_params = _visibility_sql("actor", actor)
+        vis_and = f"AND {vis_sql}" if vis_sql else ""
+        where = f"WHERE hrr_vector IS NOT NULL {vis_and}"
+        params: list = [*vis_params]
         if category:
             where += " AND category = ?"
             params.append(category)
@@ -498,8 +541,9 @@ class FactRetriever:
         category: str | None,
         min_trust: float,
         limit: int,
+        actor: str = "",
     ) -> list[dict]:
-        """Get raw FTS5 candidates from the store.
+        """Get raw FTS5 candidates visible to actor from the store.
 
         Uses the store's database connection directly for FTS5 MATCH
         with rank scoring. Normalizes FTS5 rank to [0, 1] range.
@@ -520,6 +564,11 @@ class FactRetriever:
             where_clauses.append("f.category = ?")
             params.append(category)
 
+        vis_sql, vis_params = _visibility_sql("f.actor", actor)
+        if vis_sql:
+            where_clauses.append(vis_sql)
+            params.extend(vis_params)
+
         where_clauses.append("f.trust_score >= ?")
         params.append(min_trust)
 
@@ -538,7 +587,7 @@ class FactRetriever:
         try:
             rows = conn.execute(sql, params).fetchall()
         except Exception:
-            # FTS5 MATCH can fail on malformed queries — fall back to empty
+            # FTS5 MATCH can fail on malformed queries -- fall back to empty
             return []
 
         if not rows:
@@ -634,7 +683,7 @@ class FactRetriever:
 
     @staticmethod
     def _jaccard_similarity(set_a: set, set_b: set) -> float:
-        """Jaccard similarity coefficient: |A ∩ B| / |A ∪ B|."""
+        """Jaccard similarity coefficient: |A n B| / |A u B|."""
         if not set_a or not set_b:
             return 0.0
         intersection = len(set_a & set_b)

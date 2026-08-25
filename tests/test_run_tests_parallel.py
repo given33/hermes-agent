@@ -24,6 +24,7 @@ import json
 import os
 import subprocess
 import sys
+import tempfile
 import textwrap
 import time
 from pathlib import Path
@@ -32,9 +33,11 @@ import pytest
 
 
 # Both tests share the same handoff file: the leaker writes here, the
-# verifier reads here. We park it in $TMPDIR with a unique-per-run name
-# so concurrent invocations of the suite don't clobber each other.
-_HANDOFF_DIR = Path(os.environ.get("TMPDIR", "/tmp")) / "hermes-isolation-probe"
+# verifier reads here. We park it in the platform temp dir — tempfile.
+# gettempdir() honors $TMPDIR on POSIX AND %TEMP% on Windows (a literal
+# "/tmp" fallback would resolve to a drive-root C:\tmp here) — with a
+# unique-per-run name so concurrent invocations don't clobber each other.
+_HANDOFF_DIR = Path(tempfile.gettempdir()) / "hermes-isolation-probe"
 _HANDOFF_DIR.mkdir(exist_ok=True)
 
 
@@ -43,17 +46,19 @@ def _handoff_path_for(nonce: str) -> Path:
 
 
 def _pid_alive(pid: int) -> bool:
-    """POSIX: send signal 0 to probe whether ``pid`` is still alive.
+    """Platform-dispatched liveness probe for ``pid``.
 
-    ``os.kill(pid, 0)`` raises ``ProcessLookupError`` if the process is
-    gone, ``PermissionError`` if it exists but we can't signal it
-    (someone else's pid). We treat PermissionError as "alive" because
-    the process exists and that's all we need to know.
+    POSIX: send signal 0 — ``os.kill(pid, 0)`` raises
+    ``ProcessLookupError`` if the process is gone, ``PermissionError``
+    if it exists but we can't signal it (someone else's pid). We treat
+    PermissionError as "alive" because the process exists and that's
+    all we need to know.
+
+    Windows: OpenProcess + GetExitCodeProcess — no openable handle means
+    gone; STILL_ACTIVE (259) distinguishes live from exited.
     """
-    if sys.platform == "win32":  # pragma: no cover — POSIX-only test
-        # On Windows we'd use OpenProcess + GetExitCodeProcess; this
-        # test is skipped on Windows so the path is unreachable.
-        raise RuntimeError("_pid_alive POSIX-only")
+    if sys.platform == "win32":
+        return _pid_alive_win32(pid)
     try:
         os.kill(pid, 0)
     except ProcessLookupError:
@@ -61,6 +66,28 @@ def _pid_alive(pid: int) -> bool:
     except PermissionError:
         return True
     return True
+
+
+def _pid_alive_win32(pid: int) -> bool:
+    """Windows half of :func:`_pid_alive` (win32 twin of signal-0 probing)."""
+    import ctypes
+
+    PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
+    STILL_ACTIVE = 259
+    kernel32 = ctypes.windll.kernel32
+    handle = kernel32.OpenProcess(
+        PROCESS_QUERY_LIMITED_INFORMATION, False, int(pid)
+    )
+    if not handle:
+        # No openable handle -> no such process (or already reaped).
+        return False
+    try:
+        exit_code = ctypes.c_ulong()
+        if not kernel32.GetExitCodeProcess(handle, ctypes.byref(exit_code)):
+            return False
+        return exit_code.value == STILL_ACTIVE
+    finally:
+        kernel32.CloseHandle(handle)
 
 
 def test_progress_output_tolerates_legacy_stdout_encoding(tmp_path: Path) -> None:
@@ -91,7 +118,8 @@ def test_progress_output_tolerates_legacy_stdout_encoding(tmp_path: Path) -> Non
         env=env,
         stdout=subprocess.PIPE,
         stderr=subprocess.STDOUT,
-        text=True,
+        encoding="utf-8",
+        errors="replace",
         timeout=60,
     )
 
@@ -228,6 +256,102 @@ def test_grandchild_leak_is_killed_by_runner(tmp_path: Path) -> None:
         )
 
 
+@pytest.mark.skipif(sys.platform != "win32", reason="win32 twin of the POSIX grandchild-leak probe")
+@pytest.mark.live_system_guard_bypass
+def test_grandchild_leak_is_killed_by_runner_win32(tmp_path: Path) -> None:
+    """Windows twin: ``taskkill /F /T`` tree-walk reaps leaked grandchildren.
+
+    Same contract as the POSIX probe above, minus pgid diagnostics (no
+    process groups on Windows): the probe spawns a sleep(600) grandchild,
+    records its PID, and exits; the runner's happy-path ``_kill_tree``
+    must still terminate the orphaned descendant after the pytest worker
+    itself is gone — taskkill /T walks the recorded ppid chain even when
+    the root has already exited.
+    """
+    repo_root = Path(__file__).resolve().parent.parent
+    runner = repo_root / "scripts" / "run_tests_parallel.py"
+    assert runner.exists(), f"runner missing at {runner}"
+
+    probe_dir = tmp_path / "probe"
+    probe_dir.mkdir()
+    probe = probe_dir / "test_probe_leaker.py"
+    nonce = f"{os.getpid()}-{int(time.time() * 1000)}"
+    handoff = _handoff_path_for(nonce)
+    if handoff.exists():
+        handoff.unlink()
+
+    probe_src = textwrap.dedent(f"""
+        import json, subprocess, sys
+        from pathlib import Path
+
+        HANDOFF = Path({str(handoff)!r})
+
+        def test_spawns_grandchild_and_walks_away():
+            # Long-lived grandchild with DEVNULL stdio: no pipe kept
+            # open, nothing signals it — only the runner's taskkill
+            # /F /T tree-walk may reap it once the pytest worker exits.
+            child = subprocess.Popen(
+                [sys.executable, "-c", "import time; time.sleep(600)"],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+            )
+            HANDOFF.write_text(json.dumps({{"pid": child.pid}}))
+            assert child.pid > 0
+    """).strip()
+    probe.write_text(probe_src + "\n", encoding="utf-8")
+
+    proc = subprocess.run(
+        [
+            sys.executable,
+            str(runner),
+            "--paths",
+            str(probe_dir),
+            "-j",
+            "1",
+            "--file-timeout",
+            "30",
+        ],
+        cwd=repo_root,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        encoding="utf-8",
+        errors="replace",
+        timeout=60,
+    )
+
+    assert handoff.exists(), (
+        f"probe never wrote handoff file; runner output:\n{proc.stdout}"
+    )
+    handoff_data = json.loads(handoff.read_text(encoding="utf-8"))
+    grandchild_pid = handoff_data["pid"]
+    handoff.unlink()
+
+    # The runner must have exited cleanly (probe test passes).
+    assert proc.returncode == 0, (
+        f"runner exited {proc.returncode}; output:\n{proc.stdout}"
+    )
+
+    # The grandchild must be gone. Poll for a bit because taskkill +
+    # handle teardown isn't synchronous; on a loaded box it can take a beat.
+    deadline = time.monotonic() + 5.0
+    while time.monotonic() < deadline:
+        if not _pid_alive(grandchild_pid):
+            break
+        time.sleep(0.05)
+    else:
+        # Test cleanup: kill the leaked grandchild ourselves so a FAILED
+        # assertion doesn't leave a sleep(600) running. Windows os.kill
+        # raises plain OSError (not ProcessLookupError) for a dead pid.
+        try:
+            os.kill(grandchild_pid, 9)
+        except OSError:
+            pass
+        pytest.fail(
+            f"grandchild PID {grandchild_pid} survived runner exit; "
+            f"runner output:\n{proc.stdout}"
+        )
+
+
 # ── Bare pytest-flag passthrough ─────────────────────────────────────────────
 #
 # The runner routes any token starting with ``-`` that isn't one of its own
@@ -349,7 +473,8 @@ def test_file_retry_self_heals_and_prints_both_attempts(tmp_path: Path) -> None:
         cwd=repo_root,
         stdout=subprocess.PIPE,
         stderr=subprocess.STDOUT,
-        text=True,
+        encoding="utf-8",
+        errors="replace",
         timeout=60,
     )
 
@@ -391,7 +516,7 @@ def test_node_id_selector_runs_the_named_test(tmp_path: Path) -> None:
         [sys.executable, str(repo_root / "scripts" / "run_tests_parallel.py"),
          f"{target}::test_alpha", "-j", "1", "--file-timeout", "30"],
         cwd=repo_root, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-        text=True, timeout=60,
+        encoding="utf-8", errors="replace", timeout=60,
     )
     assert proc.returncode == 0, proc.stdout
     assert "No test files to run" not in proc.stdout
@@ -410,7 +535,7 @@ def test_explicit_k_wins_over_node_id_inference(tmp_path: Path) -> None:
          f"{target}::test_alpha", "-k", "test_beta",
          "-j", "1", "--file-timeout", "30"],
         cwd=repo_root, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-        text=True, timeout=60,
+        encoding="utf-8", errors="replace", timeout=60,
     )
     # -k test_beta wins: one test ran, and it wasn't filtered to nothing.
     assert proc.returncode == 0, proc.stdout

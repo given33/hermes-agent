@@ -808,9 +808,12 @@ class WebSocketRelayTransport:
     async def _read_loop(self) -> None:
         assert self._ws is not None
         buf = ""
+        max_buffer_bytes = 8 * 1024 * 1024
         try:
             async for chunk in self._ws:
                 buf += chunk if isinstance(chunk, str) else chunk.decode("utf-8")
+                if len(buf.encode("utf-8", errors="ignore")) > max_buffer_bytes:
+                    raise ValueError("relay WebSocket frame exceeded 8 MiB framing limit")
                 # Newline-delimited frames; keep any trailing partial line.
                 *lines, buf = buf.split("\n")
                 for line in lines:

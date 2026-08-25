@@ -92,17 +92,24 @@ class TestAbiStamp:
 
 
     def test_readonly_target_reports_error(self, tmp_path):
-        # A path under a non-writable parent should surface a clean error,
-        # not raise.
-        ro_parent = tmp_path / "ro"
-        ro_parent.mkdir()
-        os.chmod(ro_parent, 0o500)
+        # A target whose parent cannot host it must surface a clean error,
+        # not raise. POSIX: chmod the parent read-only. Windows ignores
+        # directory chmod bits, so there a file plays the un-creatable
+        # parent - mkdir fails with ENOTDIR/WinError on every platform.
+        blocker = tmp_path / "blocker"
+        target = blocker / "lazy"
+        if sys.platform == "win32":
+            blocker.write_text("not a dir", encoding="utf-8")
+        else:
+            blocker.mkdir()
+            os.chmod(blocker, 0o500)
         try:
-            err = ld._ensure_target_ready(ro_parent / "lazy")
+            err = ld._ensure_target_ready(target)
             assert err is not None
             assert "not writable" in err
         finally:
-            os.chmod(ro_parent, 0o700)  # let pytest clean up
+            if sys.platform != "win32":
+                os.chmod(blocker, 0o700)  # let pytest clean up
 
 
 # ---------------------------------------------------------------------------

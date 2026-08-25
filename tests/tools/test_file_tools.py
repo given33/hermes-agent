@@ -6,6 +6,7 @@ handling without requiring a running terminal environment.
 
 import json
 import logging
+from pathlib import Path
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -54,7 +55,10 @@ class TestWriteFileHandler:
         from tools.file_tools import write_file_tool
         result = json.loads(write_file_tool("/tmp/out.txt", "hello world!\n"))
         assert result["status"] == "ok"
-        mock_ops.write_file.assert_called_once_with("/tmp/out.txt", "hello world!\n")
+        # Windows Path() normalises the POSIX path to backslash separators.
+        mock_ops.write_file.assert_called_once_with(
+            str(Path("/tmp/out.txt")), "hello world!\n"
+        )
 
     @patch("tools.file_tools._get_file_ops")
     def test_permission_error_returns_error_json_without_error_log(self, mock_get, caplog):
@@ -145,7 +149,9 @@ class TestPatchHandler:
             old_string="foo", new_string="bar"
         ))
         assert result["status"] == "ok"
-        mock_ops.patch_replace.assert_called_once_with("/tmp/f.py", "foo", "bar", False)
+        mock_ops.patch_replace.assert_called_once_with(
+            str(Path("/tmp/f.py")), "foo", "bar", False
+        )
 
 
     @patch("tools.file_tools._get_file_ops")
@@ -455,6 +461,18 @@ class TestSensitivePathCheck:
         assert "Hermes config" in result["error"]
 
 
+    @pytest.mark.windows_only
+    def test_hermes_config_case_variant_blocked_on_windows(self, tmp_path, monkeypatch):
+        fake_config = tmp_path / "config.yaml"
+        monkeypatch.setattr("tools.file_tools._hermes_config_resolved", str(fake_config))
+        monkeypatch.setattr("tools.file_tools._hermes_config_resolved_loaded", True)
+
+        from tools.file_tools import write_file_tool
+
+        result = json.loads(write_file_tool(str(fake_config).upper(), "approvals:\n  mode: off\n"))
+        assert "error" in result
+        assert "Hermes config" in result["error"]
+
     def test_system_path_still_blocked(self, monkeypatch):
         monkeypatch.setattr("tools.file_tools._hermes_config_resolved", "/some/other/path")
         monkeypatch.setattr("tools.file_tools._hermes_config_resolved_loaded", True)
@@ -462,8 +480,17 @@ class TestSensitivePathCheck:
         from tools.file_tools import write_file_tool
         result = json.loads(write_file_tool("/etc/passwd", "evil"))
         assert "error" in result
-        assert "sensitive system path" in result["error"]
+        # agent/file_safety may fire before the file_tools guard on some
+        # platforms; both are valid security rejections of /etc/passwd.
+        assert (
+            "sensitive system path" in result["error"]
+            or "protected system" in result["error"]
+        )
 
+    @pytest.mark.skipif(
+        __import__("sys").platform != "darwin",
+        reason="/private/var realpath mapping is macOS-only",
+    )
     def test_macos_private_var_carveouts(self):
         """macOS temp dirs under /private/var must not be blanket-blocked,
         while the genuinely-sensitive /private/var subtrees still are."""

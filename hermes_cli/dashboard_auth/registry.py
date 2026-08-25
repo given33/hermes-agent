@@ -128,12 +128,34 @@ def clear_providers() -> None:
         _providers.clear()
         _scoped_providers.clear()
 
-def unregister_provider(name: str, *, expected: str | None = None) -> None:
+
+def register_mobile_api_provider_if_configured() -> bool:
+    """Compatibility entry point for web-server startup and tests."""
+    from hermes_cli.dashboard_auth.owner_mobile import (
+        register_mobile_api_provider_if_configured as _register,
+    )
+
+    return _register()
+
+def unregister_provider(
+    name: str,
+    *,
+    expected: DashboardAuthProvider | str | None = None,
+    scope: Optional[str] = None,
+) -> None:
     """Remove a registered dashboard auth provider by name."""
-    with _registry_lock:
-        current = _providers.get(name)
+    with _lock:
+        target = _providers if scope is None else _scoped_providers.get(scope, {})
+        current = target.get(name)
         if current is None:
             return
-        if expected is not None and current.name != expected:
-            raise ValueError(f"provider mismatch: {current.name!r} != {expected!r}")
-        del _providers[name]
+        if expected is not None:
+            if isinstance(expected, str):
+                matches = current.name == expected
+            else:
+                matches = current is expected
+            if not matches:
+                raise ValueError(f"provider mismatch for {name!r}")
+        del target[name]
+        if scope is not None and not target:
+            _scoped_providers.pop(scope, None)

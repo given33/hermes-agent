@@ -167,7 +167,9 @@ def build_oss_config(flags: dict[str, str]) -> tuple[dict, dict[str, str]]:
         if flags.get("oss_vector_user"):
             vector_config["user"] = flags["oss_vector_user"]
         if flags.get("oss_vector_password"):
-            vector_config["password"] = flags["oss_vector_password"]
+            password_env = str(vector_def.get("password_env_var") or "MEM0_PGVECTOR_PASSWORD")
+            vector_config["password"] = "${" + password_env + "}"
+            env_writes[password_env] = flags["oss_vector_password"]
         if flags.get("oss_vector_dbname"):
             vector_config["dbname"] = flags["oss_vector_dbname"]
 
@@ -825,7 +827,8 @@ def _setup_oss_interactive(hermes_home: str, config: dict) -> None:
             flags["oss_vector_password"] = pgvector_config["password"]
         flags["oss_vector_dbname"] = pgvector_config["dbname"]
 
-    oss_config, _ = build_oss_config(flags)
+    oss_config, setup_env_writes = build_oss_config(flags)
+    env_writes.update(setup_env_writes)
 
     if env_writes:
         _write_env(Path(hermes_home) / ".env", env_writes)

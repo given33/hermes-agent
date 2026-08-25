@@ -223,11 +223,11 @@ class TestBackendSelection:
             assert _get_backend() == "firecrawl"
 
     def test_invalid_config_falls_through_to_fallback(self):
-        """web.backend=invalid → ignored, uses key-based fallback."""
+        """A stored invalid backend is honored so its vendor path can explain it."""
         from tools.web_tools import _get_backend
         with patch("tools.web_tools._load_web_config", return_value={"backend": "nonexistent"}), \
              patch.dict(os.environ, {"PARALLEL_API_KEY": "test-key"}):
-            assert _get_backend() == "parallel"
+            assert _get_backend() == "nonexistent"
 
     def test_managed_gateway_does_not_preempt_explicit_tavily(self):
         """Regression: a Nous OAuth token (managed gateway "ready") must NOT

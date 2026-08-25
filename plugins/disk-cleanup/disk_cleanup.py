@@ -25,6 +25,7 @@ import json
 import logging
 import os
 import shutil
+import stat
 import sys
 import tempfile
 from datetime import datetime, timezone
@@ -126,6 +127,18 @@ def _log(message: str) -> None:
 # tracked.json — atomic read/write, backup scoped to tracked.json only
 # ---------------------------------------------------------------------------
 
+def _valid_tracked_rows(data: Any) -> List[Dict[str, Any]]:
+    """Filter untrusted tracked state to the row shape cleanup consumes."""
+    if not isinstance(data, list):
+        raise ValueError("tracked.json must contain a list")
+    return [
+        item
+        for item in data
+        if isinstance(item, dict)
+        and isinstance(item.get("path"), str)
+        and isinstance(item.get("category"), str)
+    ]
+
 def load_tracked() -> List[Dict[str, Any]]:
     """Load tracked.json.  Restores from ``.bak`` on corruption."""
     tf = get_tracked_file()
@@ -135,14 +148,17 @@ def load_tracked() -> List[Dict[str, Any]]:
         return []
 
     try:
-        return json.loads(tf.read_text(encoding="utf-8"))
+        data = json.loads(tf.read_text(encoding="utf-8"))
+        # tracked.json is user-writable state. Ignore malformed rows rather
+        # than allowing one forged object to abort the session-end hook.
+        return _valid_tracked_rows(data)
     except (json.JSONDecodeError, ValueError):
         bak = tf.with_suffix(".json.bak")
         if bak.exists():
             try:
                 data = json.loads(bak.read_text(encoding="utf-8"))
                 _log("WARN: tracked.json corrupted — restored from .bak")
-                return data
+                return _valid_tracked_rows(data)
             except Exception:
                 pass
         _log("WARN: tracked.json corrupted, no backup — starting fresh")
@@ -187,6 +203,12 @@ _EMPTY_DIR_PROTECTED_TOP_LEVEL = frozenset({
     "browser_screenshots", "chrome-debug", "moa-traces",
 })
 
+# Recursive deletion is only approved for explicitly disposable directory
+# roots. Files may still be explicitly tracked under other non-protected
+# HERMES_HOME paths, but a forged directory row must not turn a newly-added
+# durable top-level tree into an implicit rmtree target.
+_EPHEMERAL_DIRECTORY_TOP_LEVEL = frozenset({"scratch", "tmp", "temp"})
+
 _EMPTY_DIR_SWEEP_PRUNE_DIRS = frozenset({
     ".git", "node_modules", "venv", ".venv",
     "site-packages", "__pycache__",
@@ -204,6 +226,14 @@ def _is_symlink_like(p: Path) -> bool:
     """
     if p.is_symlink():
         return True
+    # WSL bind mounts and POSIX mount points are not symlinks, but traversing
+    # one would let the empty-dir sweep operate on a separately mounted user
+    # filesystem.  Treat them as link-like and prune only the mount entry.
+    try:
+        if os.path.ismount(os.fspath(p)):
+            return True
+    except OSError:
+        return True
     if sys.platform == "win32":
         try:
             return (
@@ -212,6 +242,29 @@ def _is_symlink_like(p: Path) -> bool:
             )
         except OSError:
             return True
+    return False
+
+
+def _crosses_nested_mount(path: Path, boundary: Path) -> bool:
+    """Return true when *path* traverses a mount below *boundary*.
+
+    ``HERMES_HOME`` itself may intentionally live on a mounted volume.  A
+    second mount below it is a different ownership boundary, however, and
+    must not be traversed by automatic cleanup.
+    """
+    current = Path(os.path.abspath(os.fspath(path)))
+    boundary_abs = Path(os.path.abspath(os.fspath(boundary)))
+    boundary_key = os.path.normcase(str(boundary_abs))
+    while os.path.normcase(str(current)) != boundary_key:
+        try:
+            if os.path.ismount(os.fspath(current)):
+                return True
+        except OSError:
+            return True
+        parent = current.parent
+        if parent == current:
+            break
+        current = parent
     return False
 
 
@@ -247,6 +300,117 @@ def _is_protected_cron_path(p: Path) -> bool:
     return resolved in _PROTECTED_CRON_PATHS
 
 
+def _cleanup_target_allowed(path: Path, category: str) -> bool:
+    """Return whether a tracked path is an eligible deletion target.
+
+    ``tracked.json`` is state, not an authority: old versions allowed manual
+    entries for arbitrary paths under ``HERMES_HOME``.  In particular, a
+    forged directory entry could make ``deep()`` recursively remove the
+    home itself or a durable control-plane tree.  Keep the explicit scratch
+    exceptions used by the automatic classifier, but fail closed for the
+    home root and all protected top-level trees.
+    """
+    if not is_safe_path(path):
+        return False
+
+    try:
+        resolved = path.resolve()
+        hermes_home = get_hermes_home().resolve()
+        relative = resolved.relative_to(hermes_home)
+    except ValueError:
+        # ``is_safe_path`` has already constrained this branch to an
+        # approved system-temp hermes-* scratch tree.
+        try:
+            temp_root = Path(tempfile.gettempdir()).resolve()
+            temp_relative = resolved.relative_to(temp_root)
+            if not temp_relative.parts or not temp_relative.parts[0].casefold().startswith(
+                "hermes-"
+            ):
+                return False
+            scratch_root = temp_root / temp_relative.parts[0]
+            return not _crosses_nested_mount(resolved, scratch_root)
+        except (ValueError, OSError):
+            return False
+    except OSError:
+        # A resolution failure is ambiguity, not proof that this is a
+        # disposable temp path.  Keep the cleanup hook fail-closed.
+        return False
+
+    if _crosses_nested_mount(resolved, hermes_home):
+        return False
+
+    if not relative.parts:
+        return False
+
+    top = relative.parts[0].casefold()
+    protected = {name.casefold() for name in _EMPTY_DIR_PROTECTED_TOP_LEVEL}
+    if path.is_dir() and top not in {
+        name.casefold() for name in _EPHEMERAL_DIRECTORY_TOP_LEVEL
+    }:
+        return False
+    if top not in protected:
+        return True
+
+    normalized_category = str(category or "").casefold()
+    # These are the only disposable files beneath protected trees.  A whole
+    # cache/cron tree, or anything in another durable tree, remains blocked.
+    if (
+        top == "cache"
+        and normalized_category == "temp"
+        and path.is_file()
+    ):
+        return True
+    if (
+        top in {"cron", "cronjobs"}
+        and normalized_category == "cron-output"
+        and len(relative.parts) >= 3
+        and relative.parts[1].casefold() == "output"
+        and path.is_file()
+    ):
+        return True
+    return False
+
+
+def _cleanup_allowed_root(path: Path) -> Optional[Path]:
+    """Return the approved recursive-delete root for *path*, if any."""
+    resolved = path.resolve()
+    hermes_home = get_hermes_home().resolve()
+    try:
+        resolved.relative_to(hermes_home)
+        return hermes_home
+    except (ValueError, OSError):
+        pass
+
+    try:
+        temp_root = Path(tempfile.gettempdir()).resolve()
+        relative = resolved.relative_to(temp_root)
+        if relative.parts and relative.parts[0].casefold().startswith("hermes-"):
+            return temp_root / relative.parts[0]
+    except (ValueError, OSError):
+        pass
+    return None
+
+
+def _delete_cleanup_target(path: Path, category: str) -> None:
+    """Delete one already-existing tracked target within its safe boundary."""
+    if not _cleanup_target_allowed(path, category):
+        raise ValueError(f"refusing protected or unsafe cleanup target: {path}")
+
+    if _is_symlink_like(path):
+        _unlink_link_like(path)
+    elif path.is_file():
+        path.unlink()
+    elif path.is_dir():
+        allowed_root = _cleanup_allowed_root(path)
+        if allowed_root is None:
+            raise ValueError(f"no approved recursive-delete root for: {path}")
+        # safe_rmtree checks containment and each child for links/junctions;
+        # shutil.rmtree is unsafe on Python 3.11 Windows configurations.
+        from hermes_cli.safe_delete import safe_rmtree
+
+        safe_rmtree(path, allowed_root)
+
+
 def _age_days(item, now) -> object:
     """Days since the entry's timestamp; None when malformed.
 
@@ -258,6 +422,26 @@ def _age_days(item, now) -> object:
         return (now - datetime.fromisoformat(str(item["timestamp"]))).days
     except (KeyError, TypeError, ValueError):
         return None
+
+
+def _entry_size(item: Dict[str, Any]) -> int:
+    """Return a bounded, numeric tracked size for untrusted state rows."""
+    try:
+        return max(0, int(item.get("size", 0)))
+    except (TypeError, ValueError, OverflowError):
+        return 0
+
+
+def _unlink_link_like(path: Path) -> None:
+    """Remove only a link/reparse point, never its target tree."""
+    try:
+        path.unlink()
+    except OSError as exc:
+        # Windows junctions are directories but rmdir removes the junction
+        # itself. Never fall back to shutil.rmtree, which can cross a mount.
+        if exc.errno not in {21, 1, 13}:
+            raise
+        path.rmdir()
 
 
 def fmt_size(n: float) -> str:
@@ -286,6 +470,9 @@ def track(path_str: str, category: str, silent: bool = False) -> bool:
 
     if not is_safe_path(path):
         _log(f"REJECT: {path} (outside HERMES_HOME)")
+        return False
+    if not _cleanup_target_allowed(path, category):
+        _log(f"REJECT: {path} (protected cleanup target)")
         return False
 
     size = path.stat().st_size if path.is_file() else 0
@@ -341,7 +528,12 @@ def dry_run() -> Tuple[List[Dict], List[Dict]]:
         if age is None:
             continue
         cat = item["category"]
-        size = item["size"]
+        size = _entry_size(item)
+
+        # ``tracked.json`` can outlive the code that created it.  Never show
+        # a forged root/control-plane target as user-confirmable work.
+        if not _cleanup_target_allowed(p, cat):
+            continue
 
         # Re-validate stale "cron-output" entries (fixes #37721).
         if cat == "cron-output":
@@ -370,6 +562,91 @@ def dry_run() -> Tuple[List[Dict], List[Dict]]:
 # ---------------------------------------------------------------------------
 # Quick cleanup
 # ---------------------------------------------------------------------------
+
+
+def _sweep_empty_dirs_under_home(hermes_home: Path) -> int:
+    """Remove empty ephemeral directories without traversing a linked home."""
+
+    if _is_symlink_like(hermes_home):
+        _log(f"SKIP empty-dir sweep for link-like HERMES_HOME: {hermes_home}")
+        return 0
+
+    empty_removed = 0
+    sweep_stack: List[Tuple[Path, bool]] = []
+    protected_lower = {name.lower() for name in _EMPTY_DIR_PROTECTED_TOP_LEVEL}
+    prune_lower = {name.lower() for name in _EMPTY_DIR_SWEEP_PRUNE_DIRS}
+
+    def sweep_allowed(path: Path) -> bool:
+        if _is_symlink_like(path):
+            return False
+        try:
+            path.relative_to(hermes_home)
+            path.resolve().relative_to(hermes_home.resolve())
+            if _crosses_nested_mount(path, hermes_home):
+                return False
+            return True
+        except (ValueError, OSError):
+            return False
+
+    def identity(path: Path) -> tuple[int, int, int, str]:
+        state = path.lstat()
+        return (
+            int(getattr(state, "st_dev", 0)),
+            int(getattr(state, "st_ino", 0)),
+            stat.S_IFMT(state.st_mode),
+            os.path.normcase(os.path.realpath(os.fspath(path))),
+        )
+
+    def children_if_stable(path: Path) -> list[Path] | None:
+        if not sweep_allowed(path):
+            return None
+        try:
+            before = identity(path)
+            children = list(path.iterdir())
+            if not sweep_allowed(path) or identity(path) != before:
+                return None
+            return children
+        except OSError:
+            return None
+
+    try:
+        for top in children_if_stable(hermes_home) or []:
+            if (
+                top.is_dir()
+                and sweep_allowed(top)
+                and top.name.lower() not in protected_lower
+                and top.name.lower() not in prune_lower
+            ):
+                sweep_stack.append((top, False))
+    except OSError:
+        sweep_stack = []
+
+    while sweep_stack:
+        dirpath, visited = sweep_stack.pop()
+        if visited:
+            try:
+                if not sweep_allowed(dirpath):
+                    continue
+                before = identity(dirpath)
+                if not any(dirpath.iterdir()) and sweep_allowed(dirpath):
+                    if identity(dirpath) != before:
+                        continue
+                    dirpath.rmdir()
+                    empty_removed += 1
+                    _log(f"DELETED: {dirpath} (empty dir)")
+            except OSError:
+                pass
+            continue
+
+        sweep_stack.append((dirpath, True))
+        for child in children_if_stable(dirpath) or []:
+            if (
+                child.is_dir()
+                and sweep_allowed(child)
+                and child.name.lower() not in prune_lower
+            ):
+                sweep_stack.append((child, False))
+    return empty_removed
 
 def quick() -> Dict[str, Any]:
     """Safe deterministic cleanup — no prompts.
@@ -442,6 +719,9 @@ def quick() -> Dict[str, Any]:
         if _is_protected_cron_path(p):
             _log(f"SKIP protected cron path: {p}")
             continue
+        if not _cleanup_target_allowed(p, cat):
+            _log(f"SKIP protected cleanup target: {p}")
+            continue
 
         should_delete = (
             cat == "test"
@@ -451,14 +731,11 @@ def quick() -> Dict[str, Any]:
 
         if should_delete:
             try:
-                if p.is_file():
-                    p.unlink()
-                elif p.is_dir():
-                    shutil.rmtree(p)
-                freed += item["size"]
+                _delete_cleanup_target(p, cat)
+                freed += _entry_size(item)
                 deleted += 1
-                _log(f"DELETED: {p} ({cat}, {fmt_size(item['size'])})")
-            except OSError as e:
+                _log(f"DELETED: {p} ({cat}, {fmt_size(_entry_size(item))})")
+            except (OSError, ValueError) as e:
                 _log(f"ERROR deleting {p}: {e}")
                 errors.append(f"{p}: {e}")
                 new_tracked.append(item)
@@ -469,46 +746,7 @@ def quick() -> Dict[str, Any]:
     # durable state trees.  Some installs place the Hermes checkout, venv,
     # and desktop build under HERMES_HOME; a full rglob over that tree can
     # stall the gateway event loop for minutes.
-    hermes_home = get_hermes_home()
-    empty_removed = 0
-    sweep_stack: List[Tuple[Path, bool]] = []
-    protected_lower = {name.lower() for name in _EMPTY_DIR_PROTECTED_TOP_LEVEL}
-    prune_lower = {name.lower() for name in _EMPTY_DIR_SWEEP_PRUNE_DIRS}
-    try:
-        for top in hermes_home.iterdir():
-            if (
-                top.is_dir()
-                and not _is_symlink_like(top)
-                and top.name.lower() not in protected_lower
-                and top.name.lower() not in prune_lower
-            ):
-                sweep_stack.append((top, False))
-    except OSError:
-        sweep_stack = []
-
-    while sweep_stack:
-        dirpath, visited = sweep_stack.pop()
-        if visited:
-            try:
-                if not any(dirpath.iterdir()):
-                    dirpath.rmdir()
-                    empty_removed += 1
-                    _log(f"DELETED: {dirpath} (empty dir)")
-            except OSError:
-                pass
-            continue
-
-        sweep_stack.append((dirpath, True))
-        try:
-            for child in dirpath.iterdir():
-                if (
-                    child.is_dir()
-                    and not _is_symlink_like(child)
-                    and child.name.lower() not in prune_lower
-                ):
-                    sweep_stack.append((child, False))
-        except OSError:
-            pass
+    empty_removed = _sweep_empty_dirs_under_home(get_hermes_home())
 
     save_tracked(new_tracked)
     _log(
@@ -557,11 +795,14 @@ def deep(
             continue
         cat = item["category"]
 
+        if not _cleanup_target_allowed(p, cat):
+            continue
+
         if cat == "research" and age > 30:
             research.append(item)
         elif cat == "chrome-profile" and age > 14:
             chrome.append(item)
-        elif item["size"] > 500 * 1024 * 1024:
+        elif _entry_size(item) > 500 * 1024 * 1024:
             large.append(item)
 
     research.sort(key=lambda x: x["timestamp"], reverse=True)
@@ -587,18 +828,18 @@ def deep(
                     if stored_cat in {"test", "temp", "cron-output"} and actual_cat != stored_cat:
                         _log(f"REJECT category mismatch in deep(): {p} stored={stored_cat} actual={actual_cat}")
                         continue
-                    if p.is_file():
-                        p.unlink()
-                    elif p.is_dir():
-                        shutil.rmtree(p)
+                    if not _cleanup_target_allowed(p, stored_cat):
+                        _log(f"REJECT protected cleanup target in deep(): {p}")
+                        continue
+                    _delete_cleanup_target(p, stored_cat)
                     to_remove.append(item)
-                    freed += item["size"]
+                    freed += _entry_size(item)
                     count += 1
                     _log(
                         f"DELETED: {p} ({item['category']}, "
-                        f"{fmt_size(item['size'])})"
+                        f"{fmt_size(_entry_size(item))})"
                     )
-                except OSError as e:
+                except (OSError, ValueError) as e:
                     _log(f"ERROR deleting {item['path']}: {e}")
 
     if to_remove:
@@ -620,10 +861,10 @@ def status() -> Dict[str, Any]:
         c = item["category"]
         cats.setdefault(c, {"count": 0, "size": 0})
         cats[c]["count"] += 1
-        cats[c]["size"] += item["size"]
+        cats[c]["size"] += _entry_size(item)
 
     existing = [
-        (i["path"], i["size"], i["category"])
+        (i["path"], _entry_size(i), i["category"])
         for i in tracked if Path(i["path"]).exists()
     ]
     existing.sort(key=lambda x: x[1], reverse=True)
@@ -685,6 +926,8 @@ def guess_category(path: Path) -> Optional[str]:
     ``/disk-cleanup track``.
     """
     if not is_safe_path(path):
+        return None
+    if _is_symlink_like(path) or not path.is_file():
         return None
 
     hermes_home = get_hermes_home()

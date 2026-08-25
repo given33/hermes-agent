@@ -284,6 +284,7 @@ def atomic_write_text(
     tmp_prefix: str = ".tmp_",
     preserve_mode: bool = False,
     create_mode: "int | None" = None,
+    mode: "int | None" = None,
 ) -> None:
     """Write *content* to *path* via temp file + fsync + atomic rename.
 
@@ -313,7 +314,7 @@ def atomic_write_text(
 
     original_mode = _preserve_file_mode(path) if preserve_mode else None
     original_owner = _preserve_file_owner(path) if preserve_mode else None
-    effective_mode = original_mode
+    effective_mode = mode if mode is not None else original_mode
     if effective_mode is None and create_mode is not None and not path.exists():
         effective_mode = create_mode
 
@@ -341,6 +342,17 @@ def atomic_write_text(
         except OSError:
             pass
         raise
+
+
+def write_secret_file(
+    path: Union[str, Path],
+    content: str,
+    *,
+    mode: int = 0o600,
+    encoding: str = "utf-8",
+) -> None:
+    """Write secret text atomically with restrictive permissions."""
+    atomic_write_text(path, content, encoding=encoding, mode=mode)
 
 
 def atomic_json_write(

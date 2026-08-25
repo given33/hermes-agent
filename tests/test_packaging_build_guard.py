@@ -50,6 +50,12 @@ def _build_artifact(kind: str, tmp_path, *, nix_build: bool) -> subprocess.Compl
         cwd=PROJECT_ROOT,
         env=env,
         text=True,
+        # Explicit UTF-8: earlier tests legitimately leave PYTHONIOENCODING=utf-8
+        # in os.environ (hermes_bootstrap), so the child may emit UTF-8 while
+        # text=True would otherwise decode with the Windows locale codec and
+        # lose stderr entirely on non-ASCII setup.py output.
+        encoding="utf-8",
+        errors="replace",
         capture_output=True,
         check=False,
     )

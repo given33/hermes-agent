@@ -22,6 +22,7 @@ Inspired by openai/symphony's tracker reconciliation (Apache-2.0), idea-level.
 from __future__ import annotations
 
 import subprocess
+import sys
 from pathlib import Path
 
 import pytest
@@ -119,7 +120,10 @@ class TestReconcileOrphanedRunning:
         """If the orphan row still records a live PID on this host, don't
         requeue beside a possibly-alive worker — defer to the next tick."""
         tid = kb.create_task(conn, title="maybe-alive", assignee="w")
-        sleeper = subprocess.Popen(["sleep", "30"])
+        # Cross-platform live process (POSIX ``sleep`` is absent on Windows).
+        sleeper = subprocess.Popen(
+            [sys.executable, "-c", "import time; time.sleep(30)"]
+        )
         try:
             _orphan_running(conn, tid, worker_pid=sleeper.pid)
             assert kb.reconcile_orphaned_running(conn) == []
@@ -133,7 +137,9 @@ class TestReconcileOrphanedRunning:
     def test_dead_worker_pid_orphan_requeued(self, conn):
         """Orphan with a recorded but dead PID is reconciled."""
         tid = kb.create_task(conn, title="dead-pid", assignee="w")
-        dead = subprocess.Popen(["true"])
+        # Cross-platform already-exited process (POSIX ``true`` is absent
+        # on Windows).
+        dead = subprocess.Popen([sys.executable, "-c", "pass"])
         dead.wait()
         _orphan_running(conn, tid, worker_pid=dead.pid)
 

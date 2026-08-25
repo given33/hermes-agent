@@ -252,6 +252,65 @@ def resolve_provider_secret(
     return ""
 
 
+NOUS_MANAGED_PROVIDER = "nous"
+_EXTRA_SELECTION_KEYS = {
+    "web": ("search_backend", "extract_backend"),
+}
+_SELECTION_NAME_KEYS = {
+    "web": ("backend",),
+}
+_DEFAULT_NAME_KEYS = ("provider", "backend", "cloud_provider")
+
+
+def read_selection(section: str) -> str | None:
+    """Return the persisted provider selection, or None when never configured.
+
+    Reads raw config rather than merged defaults so schema seeds cannot turn a
+    fresh install into an apparently configured one.
+    """
+    try:
+        from hermes_cli.config import read_raw_config_readonly
+
+        cfg = read_raw_config_readonly() or {}
+        raw = cfg.get(section) if isinstance(cfg, dict) else None
+    except Exception:
+        raw = None
+    if not isinstance(raw, dict):
+        return None
+
+    for key in _SELECTION_NAME_KEYS.get(section, _DEFAULT_NAME_KEYS):
+        value = raw.get(key)
+        if value is None:
+            continue
+        name = str(value).strip().lower()
+        if name:
+            return name
+
+    if is_truthy_value(raw.get("use_gateway"), default=False):
+        return NOUS_MANAGED_PROVIDER
+    return None
+
+
+def selection_exists(section: str) -> bool:
+    """True when any selection signal, including web overrides, exists."""
+
+    if read_selection(section) is not None:
+        return True
+    extra = _EXTRA_SELECTION_KEYS.get(section, ())
+    if not extra:
+        return False
+    try:
+        from hermes_cli.config import read_raw_config_readonly
+
+        cfg = read_raw_config_readonly() or {}
+        raw = cfg.get(section) if isinstance(cfg, dict) else None
+    except Exception:
+        return False
+    if not isinstance(raw, dict):
+        return False
+    return any(str(raw.get(key) or "").strip() for key in extra)
+
+
 def resolve_openai_audio_api_key() -> str:
     """Prefer the voice-tools key, but fall back to the normal OpenAI key.
 

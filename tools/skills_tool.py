@@ -1660,7 +1660,7 @@ def skill_view(
             if scripts_dir.exists():
                 for ext in ["*.py", "*.sh", "*.bash", "*.js", "*.ts", "*.rb"]:
                     script_files.extend(
-                        [str(f.relative_to(skill_dir)) for f in scripts_dir.glob(ext)]
+                        [f.relative_to(skill_dir).as_posix() for f in scripts_dir.glob(ext)]
                     )
 
         # Read tags/related_skills with backward compat:

@@ -26,6 +26,9 @@ def fresh_constants(monkeypatch, tmp_path):
     importlib.reload(hermes_constants)
     monkeypatch.setattr(Path, "home", lambda: tmp_path)
     monkeypatch.delenv("HERMES_HOME", raising=False)
+    # The location contract accepts an explicit HOME on every OS so launchers,
+    # containers, and tests can isolate profile state from the signed-in user.
+    monkeypatch.setenv("HOME", str(tmp_path))
     return hermes_constants
 
 
@@ -91,4 +94,3 @@ class TestGetHermesHomeProfileWarning:
         assert result == tmp_path / ".hermes"
         # Shouldn't crash; shouldn't warn either (can't tell what profile was intended)
         assert "HERMES_HOME fallback" not in capsys.readouterr().err
-
