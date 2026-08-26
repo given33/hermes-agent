@@ -235,8 +235,11 @@ runtime_service_assets+=("${staged_runtime_service_assets[@]}")
 declare -A runtime_asset_seen=()
 deduplicated_runtime_service_assets=()
 for relative in "${runtime_service_assets[@]}"; do
-  [[ -n "${relative}" && "${relative}" == *.py ]] \
-    || die "runtime source manifest contains a non-Python entry"
+  [[ -n "${relative}" ]] || die "runtime source manifest contains an empty entry"
+  case "${relative}" in
+    *.py|gateway/assets/*.yaml|hermes_cli/data/*.json) ;;
+    *) die "runtime source manifest contains an unsupported entry: ${relative}" ;;
+  esac
   [[ "${relative}" =~ ^[A-Za-z0-9_.+/-]+$ ]] \
     || die "runtime source path contains unsupported characters: ${relative}"
   case "/${relative}/" in
@@ -411,7 +414,9 @@ for name in sys.argv[1:]:
 PY
 runtime_compile_assets=()
 for relative in "${runtime_service_assets[@]}"; do
-  runtime_compile_assets+=("${snapshot}/${relative}")
+  if [[ "${relative}" == *.py ]]; then
+    runtime_compile_assets+=("${snapshot}/${relative}")
+  fi
 done
 "${runtime_python}" - "${runtime_compile_assets[@]}" <<'PY'
 import pathlib, sys
