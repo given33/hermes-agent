@@ -1448,10 +1448,10 @@ if [[ "${dependency_update_enabled}" == 1 ]]; then
   )
   "${candidate_venv}/bin/python" - <<'PY'
 import mcp  # noqa: F401
-from mcp.server.fastmcp import FastMCP
+from mcp.server import MCPServer
 from starlette.concurrency import run_in_threadpool
 
-assert FastMCP and run_in_threadpool
+assert MCPServer and run_in_threadpool
 PY
   # Root can import packages installed with mode 0700, while the systemd
   # service cannot. Validate the dashboard's real import surface as the
@@ -1477,11 +1477,11 @@ from fastapi.responses import (  # noqa: F401
     Response,
 )
 from fastapi.staticfiles import StaticFiles  # noqa: F401
-from mcp.server.fastmcp import FastMCP
+from mcp.server import MCPServer
 from pydantic import BaseModel, SecretStr  # noqa: F401
 from starlette.concurrency import run_in_threadpool  # noqa: F401
 
-assert FastAPI and FastMCP
+assert FastAPI and MCPServer
 PY
 fi
 
@@ -1494,8 +1494,8 @@ if [[ "${dependency_update_enabled}" == 1 ]]; then
   dependency_validation_python="${candidate_venv}/bin/python"
 fi
 if [[ "${ios_enabled}" == 1 ]]; then
-  "${dependency_validation_python}" -c 'from mcp.server.fastmcp import FastMCP; assert FastMCP' \
-    || die "Hermes runtime candidate is missing the locked FastMCP SDK required by iOS MCP services"
+  "${dependency_validation_python}" -c 'from mcp.server import MCPServer; assert MCPServer' \
+    || die "Hermes runtime candidate is missing the locked MCP SDK required by iOS MCP services"
   "${dependency_validation_python}" -c 'from cryptography.hazmat.primitives.ciphers.aead import AESGCM; assert AESGCM' \
     || die "Hermes runtime candidate is missing AES-GCM support required by encrypted iOS hot and cold storage"
   "${dependency_validation_python}" -c 'from agent.plugin_llm import PluginLlm; assert PluginLlm' \

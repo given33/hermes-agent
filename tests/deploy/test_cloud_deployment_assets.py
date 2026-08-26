@@ -592,7 +592,7 @@ def test_public_release_contains_the_complete_application_service_layer():
     assert "runtime-requirements.lock" in deployer
     assert "runtime-requirements.lock" in installer
     assert "runtime-requirements.lock" in harness
-    assert "from mcp.server.fastmcp import FastMCP" in installer
+    assert "from mcp.server import MCPServer" in installer
     assert "from starlette.concurrency import run_in_threadpool" in installer
     assert 'mv -f -- "${runtime_venv}" "${previous_venv}"' in installer
     assert 'mv -f -- "${previous_venv}" "${runtime_venv}"' in installer
@@ -1024,7 +1024,7 @@ def test_public_installer_registers_ios_mcps_in_the_service_hermes_home():
     assert "from agent.plugin_llm import PluginLlm" in installer
 
 
-def test_public_installer_validates_locked_fastmcp_in_the_dependency_candidate():
+def test_public_installer_validates_locked_mcp_server_in_the_dependency_candidate():
     installer = (PUBLIC / "install-collaboration-backend.sh").read_text(
         encoding="utf-8"
     )
@@ -1034,13 +1034,13 @@ def test_public_installer_validates_locked_fastmcp_in_the_dependency_candidate()
         'dependency_validation_python="${candidate_venv}/bin/python"'
     )
     mcp_validation = installer.index(
-        '"${dependency_validation_python}" -c \'from mcp.server.fastmcp import FastMCP; assert FastMCP\''
+        '"${dependency_validation_python}" -c \'from mcp.server import MCPServer; assert MCPServer\''
     )
     service_stop = installer.index('systemctl stop "${service}"', mcp_validation)
 
     assert candidate_install < select_candidate < mcp_validation < service_stop
     pre_candidate = installer[:candidate_install]
-    assert '"${runtime_python}" -c \'from mcp.server.fastmcp import FastMCP' not in pre_candidate
+    assert '"${runtime_python}" -c \'from mcp.server import MCPServer' not in pre_candidate
 
 
 def test_public_installer_makes_candidate_dependencies_readable_to_service_user():
@@ -1064,7 +1064,7 @@ def test_public_installer_makes_candidate_dependencies_readable_to_service_user(
     service_imports = installer[service_validation:service_stop]
     assert "import requests" in service_imports
     assert "from fastapi import (" in service_imports
-    assert "from mcp.server.fastmcp import FastMCP" in service_imports
+    assert "from mcp.server import MCPServer" in service_imports
 
 
 def test_public_runtime_dependency_lock_matches_the_canonical_uv_lock():
