@@ -1703,7 +1703,7 @@ assert data.get("api_version") == 1
 assert isinstance(data.get("hermes_version"), str) and data["hermes_version"]
 assert isinstance(data.get("profiles"), list)
 assert isinstance(data.get("capabilities"), list)
-assert isinstance(data.get("server_time"), str) and data["server_time"]
+assert isinstance(data.get("server_time"), int) and data["server_time"] > 0
 PY
 deployment_health_file="$(mktemp /run/hermes-agent-deployment-status.XXXXXX)"
 deployment_healthy=0
