@@ -54,6 +54,7 @@ def test_collect_runtime_readiness_reports_healthy_local_runtime(tmp_path, monke
 
     assert result["status"] == "ok"
     assert result["checks"]["state_db"]["status"] == "ok"
+    assert result["checks"]["session_store"]["status"] == "ok"
     assert result["checks"]["config"]["status"] == "ok"
     assert result["checks"]["model"]["status"] == "ok"
     assert result["checks"]["gateway"]["status"] == "ok"

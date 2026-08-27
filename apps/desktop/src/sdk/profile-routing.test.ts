@@ -14,7 +14,7 @@ vi.mock('@/components/pane-shell/tree/store', async () => {
   return { $narrowViewport: atom(false) }
 })
 vi.mock('@/contrib/events', () => ({ onGatewayEvent: vi.fn() }))
-vi.mock('@/hermes', () => ({ deleteProfile: vi.fn(), getLogs: vi.fn(), getStatus: vi.fn() }))
+vi.mock('@/hermes', () => ({ deleteProfile: vi.fn(), getLogs: vi.fn(), getStatus: vi.fn(), hermesApi: vi.fn() }))
 vi.mock('@/store/notifications', () => ({ notify: vi.fn(), notifyError: vi.fn() }))
 vi.mock('@/store/system-actions', () => ({ runGatewayRestart: vi.fn() }))
 vi.mock('@/store/session', async () => {
@@ -42,6 +42,7 @@ vi.mock('@/store/session-states', async () => {
     $focusedRuntimeId: atom(null),
     $focusedSessionState: atom(null),
     $focusedStoredSessionId: atom(null),
+    $sessionTiles: atom([]),
     $sessionStates: atom({})
   }
 })
@@ -66,6 +67,7 @@ vi.mock('@/store/profile', async () => {
     $profiles: profiles,
     ensureGatewayAgent: vi.fn(),
     ensureGatewayProfile: vi.fn(),
+    newSessionInAgent: vi.fn(),
     newSessionInProfile: vi.fn(),
     normalizeProfileKey: (value: null | string | undefined) => (value ?? '').trim() || 'default',
     refreshProfiles: vi.fn(async () => profiles.get()),
@@ -79,6 +81,7 @@ vi.mock('@/store/gateway', async () => {
 
   return {
     $gateway: atom(null),
+    activeGatewayConnectionId: vi.fn(() => 'local'),
     ensureGatewayForAgent: vi.fn(),
     openGatewayForAgent: vi.fn(),
     openGatewayForProfile: vi.fn(),
@@ -135,6 +138,7 @@ afterEach(() => {
   setMockAtom($selectedStoredSessionId, null)
   setMockAtom($messages, [])
   $profiles.set([profile('cached-only')])
+  setWorkspaceScope('sessions')
   delete (window as unknown as { hermesDesktop?: unknown }).hermesDesktop
 })
 
@@ -158,6 +162,18 @@ describe('connection-aware plugin host APIs', () => {
     // The rail paints from $profiles; skipping the refresh leaves a stale
     // badge whose click hot-loops against the deletion guard (#88769).
     expect(refreshProfiles).toHaveBeenCalled()
+  })
+
+  it('pins an ambient SSH profile delete to the active connection and target profile', async () => {
+    vi.mocked(activeGatewayConnectionId).mockReturnValue('ssh-vps')
+
+    await host.deleteProfile('worker')
+
+    expect(retireLocalProfileGateways).not.toHaveBeenCalled()
+    expect(deleteProfile).toHaveBeenCalledWith('worker', {
+      connectionId: 'ssh-vps',
+      profile: 'worker'
+    })
   })
 
   it('refreshes the profile inventory before asking Electron for routes', async () => {
@@ -224,6 +240,128 @@ describe('connection-aware plugin host APIs', () => {
       include_sessions: true
     })
     expect(requestGatewayForProfile).not.toHaveBeenCalled()
+  })
+
+  it('reads and hides persisted sessions through the source primary without activating the profile', async () => {
+    const route = {
+      connectionId: 'source-a',
+      mode: 'remote' as const,
+      profile: 'remote-worker',
+      targetProfile: 'backend-worker'
+    }
+
+    vi.mocked(hermesApi)
+      .mockResolvedValueOnce({ sessions: [{ id: 'bot-chat', profile: 'backend-worker', title: 'Bot Chat' }] })
+      .mockResolvedValueOnce({ ok: true, hidden: true })
+
+    await expect(host.listPersistedSessions(route, { profile: 'backend-worker', limit: 200 })).resolves.toMatchObject({
+      sessions: [{ id: 'bot-chat' }]
+    })
+    await expect(
+      host.setPersistedSessionHidden(route, { sessionId: 'bot-chat', profile: 'backend-worker', hidden: true })
+    ).resolves.toMatchObject({ ok: true, hidden: true })
+
+    expect(hermesApi).toHaveBeenNthCalledWith(
+      1,
+      expect.objectContaining({
+        connectionId: 'source-a',
+        path: expect.stringContaining('/api/profiles/sessions?')
+      })
+    )
+    expect(hermesApi).toHaveBeenNthCalledWith(2, {
+      connectionId: 'source-a',
+      path: '/api/sessions/bot-chat',
+      method: 'PATCH',
+      body: { hidden: true, profile: 'backend-worker' }
+    })
+    expect(vi.mocked(hermesApi).mock.calls.every(([request]) => !('profile' in request))).toBe(true)
+    expect(requestGatewayForAgent).not.toHaveBeenCalled()
+    expect(requestGatewayForProfile).not.toHaveBeenCalled()
+  })
+
+  it('fails closed when a descriptor omits connection or target profile identity', async () => {
+    await expect(
+      host.requestProfile(
+        { connectionId: '', mode: 'remote', profile: 'worker', targetProfile: 'worker' },
+        'profiles.configure',
+        {}
+      )
+    ).rejects.toThrow(/connectionId, profile, and targetProfile/)
+    await expect(
+      host.requestProfile(
+        { connectionId: 'source-a', mode: 'remote', profile: 'worker', targetProfile: '' },
+        'profiles.configure',
+        {}
+      )
+    ).rejects.toThrow(/connectionId, profile, and targetProfile/)
+
+    expect(requestGatewayForAgent).not.toHaveBeenCalled()
+    expect(requestGatewayForProfile).not.toHaveBeenCalled()
+  })
+
+  it('deletes a remote profile through its captured connection without retiring local pools', async () => {
+    const route = {
+      connectionId: 'source-a',
+      mode: 'remote' as const,
+      profile: 'worker',
+      targetProfile: 'backend-worker'
+    }
+
+    vi.mocked(deleteProfile).mockResolvedValueOnce({ ok: true, path: '/profiles/backend-worker' })
+
+    await host.deleteProfile(route)
+
+    expect(deleteProfile).toHaveBeenCalledWith('backend-worker', {
+      connectionId: 'source-a',
+      profile: 'worker'
+    })
+    expect(retireLocalProfileGateways).not.toHaveBeenCalled()
+  })
+
+  it('rejects a remote deletion route without a connection id', async () => {
+    await expect(
+      host.deleteProfile({
+        connectionId: '',
+        mode: 'remote',
+        profile: 'worker',
+        targetProfile: 'backend-worker'
+      })
+    ).rejects.toThrow(/connectionId, profile, and targetProfile/)
+
+    expect(deleteProfile).not.toHaveBeenCalled()
+    expect(retireLocalProfileGateways).not.toHaveBeenCalled()
+  })
+
+  it('rejects an alias to backend default before the transport helper runs', async () => {
+    await expect(
+      host.deleteProfile({
+        connectionId: 'source-a',
+        mode: 'remote',
+        profile: 'worker',
+        targetProfile: 'default'
+      })
+    ).rejects.toThrow(/default profile cannot be deleted/i)
+
+    expect(deleteProfile).not.toHaveBeenCalled()
+  })
+
+  it('retires and deletes a local alias by its backend target profile', async () => {
+    const route = {
+      connectionId: 'source-local',
+      mode: 'local' as const,
+      profile: 'worker',
+      targetProfile: 'backend-worker'
+    }
+
+    vi.mocked(deleteProfile).mockResolvedValueOnce({ ok: true, path: '/profiles/backend-worker' })
+
+    await host.deleteProfile(route)
+
+    expect(retireLocalProfileGateways).toHaveBeenCalledWith('backend-worker')
+    expect(deleteProfile).toHaveBeenCalledWith('backend-worker', {
+      connectionId: 'source-local',
+      profile: 'worker'
+    })
   })
 
   it('keeps the profile-only request overload as a legacy fallback', async () => {

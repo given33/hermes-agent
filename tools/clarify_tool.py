@@ -379,7 +379,11 @@ def clarify_tool(
         # Empty questions array → fall through to the single-question path.
 
     if not question or not question.strip():
-        return tool_error("Question text is required.")
+        return tool_error(
+            "No question provided. Pass questions=[{question: '...', "
+            "choices?: [...], multi_select?: bool}, ...] — a single question "
+            "is a one-entry array."
+        )
 
     question = question.strip()
 
@@ -469,38 +473,29 @@ CLARIFY_SCHEMA = {
     "parameters": {
         "type": "object",
         "properties": {
-            "question": {
-                "type": "string",
-                "description": (
-                    "The question itself, and ONLY the question (e.g. 'Which "
-                    "deployment target?'). Do NOT embed the answer options here "
-                    "— pass them as separate elements in `choices`."
-                ),
-            },
-            "choices": {
+            "questions": {
                 "type": "array",
-                "items": {"type": "string"},
-                "maxItems": MAX_CHOICES,
+                "minItems": 1,
+                "maxItems": MAX_QUESTIONS,
                 "description": (
-                    "REQUIRED whenever you are presenting selectable options: "
-                    "each distinct option is its own array element (up to 4). "
-                    "ORDER MATTERS: put the option you actually recommend "
-                    "FIRST — the UI labels it '(Recommended)' and pre-selects "
-                    "it, so a list ordered arbitrarily recommends the wrong "
-                    "thing to the user. Do not write '(Recommended)' yourself. "
-                    "The UI renders these as pickable rows and auto-appends an "
-                    "'Other (type your answer)' option. Omit this parameter "
-                    "entirely ONLY for a genuinely open-ended free-text question."
+                    "The question(s). Each: question text (options excluded), "
+                    "optional choices (recommended first; omit for free-text), "
+                    "optional multi_select. Responses come back in question "
+                    "order with the question text echoed."
                 ),
-            },
-            "multi_select": {
-                "type": "boolean",
-                "description": (
-                    "When true, the user can select MULTIPLE options (like checkboxes). "
-                    "The user_response will be a list of selected choices. "
-                    "When false (default), single selection (radio). "
-                    "Has no effect when choices is omitted (open-ended question)."
-                ),
+                "items": {
+                    "type": "object",
+                    "properties": {
+                        "question": {"type": "string"},
+                        "choices": {
+                            "type": "array",
+                            "items": {"type": "string"},
+                            "maxItems": MAX_CHOICES,
+                        },
+                        "multi_select": {"type": "boolean"},
+                    },
+                    "required": ["question"],
+                },
             },
             "questions": {
                 "type": "array",
@@ -541,7 +536,7 @@ CLARIFY_SCHEMA = {
                 },
             },
         },
-        "required": ["question"],
+        "required": ["questions"],
     },
 }
 

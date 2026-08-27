@@ -17,16 +17,58 @@ Reference grounding is the reason pet sprite generation cares about this
 backend: each animation row must stay the same character as the chosen base
 frame, which only works on models that accept image input. Gemini Flash Image
 ("nano-banana") does, so both providers advertise image-to-image support.
+
+Two request surfaces
+--------------------
+OpenRouter ships a *second*, entirely separate image surface: the **Dedicated
+Image API** at ``POST /api/v1/images/generations``, with its own catalog
+(``GET /api/v1/images/models``) and the full OpenAI-style parameter set.
+``openai/gpt-image-2``, ``openai/gpt-image-1-mini``, ``krea/krea-2-*``,
+``qwen/qwen-image-3-pro``, ``microsoft/mai-image-2.5*`` and
+``x-ai/grok-imagine-image-quality`` are reachable *only* there.
+
+Why routing is not "is it in the image catalog?"
+    The two catalogs **overlap**. As of 2026-08 ``GET /images/models`` lists 40
+    models, and that list includes this backend's own chat-completions defaults
+    (``openai/gpt-5.4-image-2`` and ``google/gemini-3-pro-image``). Routing on
+    catalog membership alone would therefore move every existing default call
+    off ``/chat/completions`` — a silent behaviour change for setups that work
+    today, and one that changes how reference images are passed (content parts
+    vs ``input_references``).
+
+So the surface is chosen conservatively, per model, by
+:func:`_select_surface`:
+
+* ``image_gen.openrouter.surface`` / ``OPENROUTER_IMAGE_API_SURFACE`` forces
+  ``images`` or ``chat`` when an operator wants to decide themselves;
+* otherwise (``auto``, the default) only ids in :data:`_IMAGE_API_MODELS` —
+  curated, and none of them reachable over chat-completions — take the new
+  path. The chat defaults stay pinned to chat-completions no matter what the
+  catalog says;
+* an id in neither group keeps today's behaviour, and the cached, best-effort
+  ``GET /images/models`` probe is used only to log a one-line hint that the
+  model is available on the Image API and how to switch. Nothing reroutes
+  itself behind the operator's back, and a failed probe costs nothing.
+
+On the Image API path the request gains exact per-model aspect ratios plus
+``resolution`` / ``quality`` / ``background`` / ``seed`` / ``n`` /
+``output_compression``, and up to 16 reference images instead of 3.
+
+The Image API is OpenRouter-only: Nous Portal proxies the chat-completions
+protocol and has no ``/images/generations`` route, so the second surface is
+enabled per provider (see ``supports_image_api``) and stays off for Nous.
 """
 
 from __future__ import annotations
 
 import base64
+import json
 import logging
 import mimetypes
 import os
+import time
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 from agent.image_gen_provider import (
     DEFAULT_ASPECT_RATIO,
@@ -257,6 +299,7 @@ class OpenRouterCompatImageProvider(ImageGenProvider):
         config_key: str,
         model_env_var: str,
         setup_schema: Dict[str, Any],
+        supports_image_api: bool = False,
     ) -> None:
         self._name = provider_name
         self._display = display_name
@@ -291,9 +334,18 @@ class OpenRouterCompatImageProvider(ImageGenProvider):
     def capabilities(self) -> Dict[str, Any]:
         # Both text-to-image and image-to-image (reference grounding) — the
         # latter is what makes this backend usable for pet sprite rows.
+        max_refs = _MAX_REFERENCE_IMAGES
+        if self._supports_image_api:
+            # Report the cap of the model that would actually service the next
+            # call, so the tool schema advertises the right number. Image API
+            # models take far more references than chat-completions does.
+            chain = self._resolve_model_chain()
+            resolved = chain[0] if chain else ""
+            if resolved in _IMAGE_API_MODELS:
+                max_refs = int(_image_api_model_meta(resolved).get("max_refs") or max_refs)
         return {
             "modalities": ["text", "image"],
-            "max_reference_images": _MAX_REFERENCE_IMAGES,
+            "max_reference_images": max_refs,
         }
 
     def list_models(self) -> List[Dict[str, Any]]:
@@ -319,6 +371,90 @@ class OpenRouterCompatImageProvider(ImageGenProvider):
                 "strengths": "Fast, reliable fallback with good layout adherence",
             },
         ]
+        if self._supports_image_api:
+            # Curated snapshot keeps the Image API models pickable offline.
+            models.extend(
+                {
+                    "id": model_id,
+                    "display": meta["display"],
+                    "strengths": f"{meta['strengths']} (Image API)",
+                }
+                for model_id, meta in _IMAGE_API_MODELS.items()
+                if model_id not in (DEFAULT_MODEL, _FALLBACK_MODEL)
+            )
+        return models
+
+    def _image_api_live_models(self) -> List[Dict[str, Any]]:
+        """Cached live ``GET /images/models`` entries (``[]`` when unreachable).
+
+        Curated metadata from :data:`_IMAGE_API_MODELS` wins for known ids;
+        unknown (newly released) models get the API-provided name and a
+        generic strengths line so they are pickable the day they launch.
+        """
+        import time
+
+        cached = self._image_api_models_cache
+        if cached is not None and time.monotonic() - cached[1] < _LIVE_CACHE_TTL:
+            return cached[0]
+        models: List[Dict[str, Any]] = []
+        try:
+            import requests
+
+            runtime = self._resolve_runtime()
+            api_key = str(runtime.get("api_key") or "").strip()
+            base_url = str(runtime.get("base_url") or "").strip().rstrip("/")
+            if base_url:
+                response = requests.get(
+                    f"{base_url}/images/models",
+                    headers={"Authorization": f"Bearer {api_key}"} if api_key else {},
+                    timeout=_LIVE_TIMEOUT,
+                )
+                response.raise_for_status()
+                for entry in response.json().get("data") or []:
+                    if not isinstance(entry, dict):
+                        continue
+                    model_id = entry.get("id")
+                    if not isinstance(model_id, str) or not model_id.strip():
+                        continue
+                    model_id = model_id.strip()
+                    meta = _IMAGE_API_MODELS.get(model_id, {})
+                    arch_raw = entry.get("architecture")
+                    arch: Dict[str, Any] = arch_raw if isinstance(arch_raw, dict) else {}
+                    models.append(
+                        {
+                            "id": model_id,
+                            "display": meta.get("display", entry.get("name") or model_id),
+                            "strengths": meta.get(
+                                "strengths", "Image API model (from live OpenRouter catalog)"
+                            ),
+                            "input_modalities": arch.get("input_modalities") or [],
+                        }
+                    )
+        except Exception as exc:  # noqa: BLE001 - offline/unauth → fallback path
+            logger.debug("%s live Image API catalog unavailable: %s", self._name, exc)
+            models = []
+        self._image_api_models_cache = (models, time.monotonic())
+        return models
+
+    def _live_models(self) -> List[Dict[str, Any]]:
+        """Cached live catalog for this backend (``[]`` when unreachable)."""
+        import time
+
+        cached = self._live_models_cache
+        if cached is not None and time.monotonic() - cached[1] < _LIVE_CACHE_TTL:
+            return cached[0]
+        models: List[Dict[str, Any]] = []
+        try:
+            runtime = self._resolve_runtime()
+            api_key = str(runtime.get("api_key") or "").strip()
+            base_url = str(runtime.get("base_url") or "").strip().rstrip("/")
+            if base_url:
+                models = _fetch_live_image_models(base_url, api_key)
+        except Exception as exc:  # noqa: BLE001 - offline/unauth → static fallback
+            logger.debug("%s live image model catalog unavailable: %s", self._name, exc)
+            models = []
+        self._live_models_cache = (models, time.monotonic())
+        return models
 
     def _live_models(self) -> List[Dict[str, Any]]:
         """Cached live catalog for this backend (``[]`` when unreachable)."""
@@ -378,6 +514,189 @@ class OpenRouterCompatImageProvider(ImageGenProvider):
         if isinstance(top, str) and top.strip():
             return [top.strip()]
         return _dedupe_models(list(_DEFAULT_MODEL_CHAIN))
+
+    def _generate_via_image_api(
+        self,
+        *,
+        model_id: str,
+        prompt: str,
+        semantic_aspect: str,
+        references: List[str],
+        base_url: str,
+        headers: Dict[str, str],
+        kwargs: Dict[str, Any],
+    ) -> Dict[str, Any]:
+        """Serve one model through ``POST {base_url}/images/generations``.
+
+        Returns the usual success/error dict. A failure that the caller may
+        retry on the next model of the chain carries a private ``_retryable``
+        flag, which :meth:`generate` strips before returning.
+        """
+        import requests
+
+        def _fail(error: str, error_type: str, retryable: bool = False) -> Dict[str, Any]:
+            response = error_response(
+                error=error,
+                error_type=error_type,
+                provider=self._name,
+                model=model_id,
+                prompt=prompt,
+                aspect_ratio=semantic_aspect,
+            )
+            if retryable:
+                response["_retryable"] = True
+            return response
+
+        # References become data URIs here rather than reusing the chat path's
+        # `content`, because that one is clamped to 3 and these models take up
+        # to 16.
+        usable_refs: List[str] = []
+        unreadable: List[str] = []
+        try:
+            for ref in references:
+                part = _to_image_url_part(ref)
+                if part:
+                    usable_refs.append(part)
+                else:
+                    unreadable.append(str(ref))
+        except Exception as exc:  # noqa: BLE001 - blocked by the file-safety guard
+            return _fail(f"Could not load reference image: {exc}", "io_error")
+
+        # An edit whose every source image failed to load must not quietly
+        # become a text-to-image generation: that bills a new picture unrelated
+        # to what the caller asked to edit, and success=True hides it.
+        if unreadable and not usable_refs:
+            return _fail(
+                "Could not read the reference image(s) requested for editing: "
+                + ", ".join(unreadable)
+                + ". Refusing to silently fall back to text-to-image.",
+                "io_error",
+            )
+
+        payload, notes = _build_image_api_payload(
+            model_id=model_id,
+            prompt=prompt,
+            semantic_aspect=semantic_aspect,
+            references=usable_refs,
+            config_key=self._config_key,
+            kwargs=kwargs,
+        )
+        if unreadable:
+            notes.insert(0, f"dropped unreadable reference image(s): {', '.join(unreadable)}")
+
+        timeout = _REQUEST_TIMEOUT
+        configured = _image_api_setting("timeout", kwargs.get("timeout"), self._config_key)
+        try:
+            if configured is not None:
+                timeout = max(1.0, float(configured))
+        except (TypeError, ValueError):
+            logger.debug("%s: ignoring non-numeric image API timeout %r", self._name, configured)
+
+        endpoint = f"{base_url}/images/generations"
+        try:
+            response = requests.post(
+                endpoint,
+                headers=headers,
+                json=payload,
+                # (connect, read): an unreachable endpoint fails in seconds
+                # instead of burning the whole read budget on a connection that
+                # will never be established.
+                timeout=(min(_IMAGE_API_CONNECT_TIMEOUT, timeout), timeout),
+            )
+            response.raise_for_status()
+        except requests.HTTPError as exc:
+            resp = exc.response
+            status = resp.status_code if resp is not None else 0
+            message = _extract_image_api_error(resp, str(exc))
+            logger.error(
+                "%s image API generation failed (%s) on %s: %s",
+                self._name, status, model_id, message,
+            )
+            # 401/403 are answered first so one account-level rejection does
+            # not get two different error_types depending on where in the chain
+            # it landed.
+            if status in (401, 403):
+                return _fail(f"{self._display} rejected the API key ({status}): {message}", "auth_error")
+            if status == 404:
+                return _fail(
+                    f"Model '{model_id}' does not exist on the OpenRouter Image API "
+                    f"(its catalog is separate from chat-completions — check "
+                    f"GET {base_url}/images/models).",
+                    "model_access",
+                    retryable=True,
+                )
+            return _fail(
+                f"{self._display} image generation failed ({status}): {message}",
+                "api_error",
+                retryable=status in _IMAGE_API_FALLBACK_STATUSES,
+            )
+        except requests.Timeout:
+            return _fail(
+                f"{self._display} image generation timed out ({int(timeout)}s)",
+                "timeout",
+                retryable=True,
+            )
+        except requests.ConnectionError as exc:
+            return _fail(f"{self._display} connection error: {exc}", "connection_error")
+        except requests.RequestException as exc:
+            return _fail(f"{self._display} request failed: {exc}", "api_error")
+
+        try:
+            body = response.json()
+        except Exception as exc:  # noqa: BLE001
+            return _fail(f"{self._display} returned invalid JSON: {exc}", "invalid_response")
+
+        entries = body.get("data") if isinstance(body, dict) else None
+        entries = [e for e in entries if isinstance(e, dict)] if isinstance(entries, list) else []
+        if not entries:
+            return _fail(
+                f"{self._display} returned no image data for '{model_id}'.",
+                "empty_response",
+                retryable=True,
+            )
+
+        prefix = f"{self._name}_{_model_slug(model_id)}"
+        try:
+            saved = [p for p in (_save_image_api_entry(e, prefix) for e in entries) if p]
+        except Exception as exc:  # noqa: BLE001
+            return _fail(f"Could not save generated image: {exc}", "io_error")
+
+        if not saved:
+            return _fail(
+                f"{self._display} response carried neither b64_json nor url.",
+                "empty_response",
+            )
+
+        extra: Dict[str, Any] = {
+            "endpoint": "images/generations",
+            "exact_aspect_ratio": payload.get("aspect_ratio"),
+        }
+        for key in ("resolution", "quality", "background", "output_format", "seed", "n"):
+            if key in payload:
+                extra[key] = payload[key]
+        if len(saved) > 1:
+            extra["additional_images"] = saved[1:]
+        if usable_refs:
+            extra["reference_images_used"] = len(payload.get("input_references") or [])
+        if notes:
+            extra["notes"] = notes
+
+        usage = body.get("usage") if isinstance(body, dict) else None
+        if isinstance(usage, dict):
+            if isinstance(usage.get("cost"), (int, float)):
+                extra["cost_usd"] = usage["cost"]
+            if isinstance(usage.get("total_tokens"), int):
+                extra["total_tokens"] = usage["total_tokens"]
+
+        return success_response(
+            image=saved[0],
+            model=model_id,
+            prompt=prompt,
+            aspect_ratio=semantic_aspect,
+            provider=self._name,
+            modality="image" if usable_refs else "text",
+            extra=extra,
+        )
 
     def generate(
         self,
@@ -442,13 +761,44 @@ class OpenRouterCompatImageProvider(ImageGenProvider):
         }
         last_error: Optional[Dict[str, Any]] = None
         for i, model_id in enumerate(model_chain):
+            is_last = i == len(model_chain) - 1
+
+            # Surface selection. An Image API model cannot be served by
+            # /chat/completions (and vice versa), so this is a routing
+            # decision, not a preference.
+            if self._supports_image_api and _select_surface(
+                model_id, base_url, api_key, self._config_key
+            ) == "images":
+                outcome = self._generate_via_image_api(
+                    model_id=model_id,
+                    prompt=prompt,
+                    semantic_aspect=aspect,
+                    references=references,
+                    base_url=base_url,
+                    headers=headers,
+                    kwargs=kwargs,
+                )
+                if outcome.get("success"):
+                    return outcome
+                if is_last or not outcome.get("_retryable"):
+                    outcome.pop("_retryable", None)
+                    return outcome
+                outcome.pop("_retryable", None)
+                logger.info(
+                    "%s model %s failed on the image API; retrying with fallback %s",
+                    self._name,
+                    model_id,
+                    model_chain[i + 1],
+                )
+                last_error = outcome
+                continue
+
             payload: Dict[str, Any] = {
                 "model": model_id,
                 "modalities": ["image", "text"],
                 "messages": [{"role": "user", "content": content}],
                 "image_config": {"aspect_ratio": or_aspect},
             }
-            is_last = i == len(model_chain) - 1
             try:
                 response = requests.post(
                     f"{base_url}/chat/completions",
@@ -590,10 +940,11 @@ def _build_providers() -> List[OpenRouterCompatImageProvider]:
             runtime_name="openrouter",
             config_key="openrouter",
             model_env_var="OPENROUTER_IMAGE_MODEL",
+            supports_image_api=True,
             setup_schema={
                 "name": "OpenRouter (image)",
                 "badge": "paid",
-                "tag": "Gemini Flash Image & more via OpenRouter; uses OPENROUTER_API_KEY",
+                "tag": "Gemini Flash Image, gpt-image-2, Krea 2, Qwen Image 3 & more via OpenRouter; uses OPENROUTER_API_KEY",
                 "env_vars": [
                     {
                         "key": "OPENROUTER_API_KEY",

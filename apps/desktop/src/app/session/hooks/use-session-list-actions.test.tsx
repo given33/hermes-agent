@@ -5,18 +5,31 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import type { SessionInfo, SidebarSessionsResponse } from '@/hermes'
 import { $cronJobs, setCronJobs } from '@/store/cron'
 import {
+  beginGatewaySwitch,
+  endGatewaySwitch,
+  recoverActiveSourceAfterFailedGatewaySwitch,
+  registerGatewaySwitchLifecycle
+} from '@/store/gateway-switch'
+import {
   $cronSessions,
   $messagingPlatformTotals,
   $messagingSessions,
+  $messagingTruncated,
+  $sessionProfilesTruncated,
+  $sessionProfilesUsage,
   $sessions,
   $sessionsLoading,
   setCronSessions,
   setMessagingPlatformTotals,
   setMessagingSessions,
   setMessagingTruncated,
+  setSessionProfilesTruncated,
+  setSessionProfilesUsage,
   setSessions,
   setSessionsLoading
 } from '@/store/session'
+
+import { deferred } from '../../../test/deferred'
 
 import { useSessionListActions } from './use-session-list-actions'
 
@@ -68,15 +81,6 @@ interface Deferred<T> {
 }
 
 /** Create a promise whose completion order the stale-response tests control. */
-function deferred<T>(): Deferred<T> {
-  let resolve!: (value: T) => void
-
-  const promise = new Promise<T>(done => {
-    resolve = done
-  })
-
-  return { promise, resolve }
-}
 
 vi.mock('@/hermes', async importOriginal => ({
   ...(await importOriginal<Record<string, unknown>>()),
@@ -111,6 +115,8 @@ beforeEach(() => {
   setMessagingSessions([])
   setMessagingPlatformTotals({})
   setMessagingTruncated(false)
+  setSessionProfilesTruncated({})
+  setSessionProfilesUsage({})
   setSessionsLoading(false)
 })
 
@@ -121,6 +127,8 @@ afterEach(() => {
   setMessagingSessions([])
   setMessagingPlatformTotals({})
   setMessagingTruncated(false)
+  setSessionProfilesTruncated({})
+  setSessionProfilesUsage({})
   setSessionsLoading(false)
 })
 

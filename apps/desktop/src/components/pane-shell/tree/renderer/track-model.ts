@@ -9,12 +9,12 @@
 
 import type * as React from 'react'
 
+import type { MenuKit } from '@/components/ui/actions-menu'
 import type { Contribution } from '@/contrib/types'
 
 import type { GroupNode, LayoutNode } from '../model'
 import { allPaneIds } from '../model'
 
-import type { DoubleTapContext } from './drag-session'
 import type { FloatingAnchor } from './floating-rect'
 
 export const MIN_PANE_PX = 80
@@ -76,12 +76,16 @@ interface PaneChrome extends PaneSizing {
    *  pin/branch/rename/archive/delete). The wrapper must render `tab` as its
    *  interactive child; the zone's own strip menu still owns non-tab space. */
   tabWrap?: (tab: React.ReactElement) => React.ReactNode
+  /** Extra rows at the top of the zone tab menu. Called when the menu opens
+   *  against the right-clicked pane — a Browser tab's Open-in-external, without
+   *  replacing Reload / Close / the strip. */
+  tabMenuPrefix?: (kit: MenuKit) => React.ReactNode
   /** Override this pane's TAB drag (a session tab drags like a sidebar row —
    *  stack / split / composer-link — not the generic pane move). Given the
-   *  tab's tap (activate) + double-tap (hide header) so those gestures survive.
-   *  Returns whether it took the drag; `false` (or absent) defers to
-   *  `startPaneDrag` — e.g. the workspace tab on a fresh draft, nothing to link. */
-  tabDrag?: (event: React.PointerEvent<HTMLElement>, onTap: () => void, double?: DoubleTapContext) => boolean
+   *  tab's tap (activate) so that gesture survives. Returns whether it took the
+   *  drag; `false` (or absent) defers to `startPaneDrag` — e.g. the workspace
+   *  tab on a fresh draft, nothing to link. */
+  tabDrag?: (event: React.PointerEvent<HTMLElement>, onTap: () => void) => boolean
   /** Suppress the zone header while THIS pane is active — full-page views
    *  (artifacts/skills/plugin pages) are not tab-able surfaces. The flag is
    *  live: the workspace contribution re-registers it on route changes. */
@@ -91,6 +95,11 @@ interface PaneChrome extends PaneSizing {
    *  the tab and the sidebar row render status/color from the ONE primitive
    *  (self-subscribing — it updates without the strip re-registering). */
   tabLead?: () => React.ReactNode
+  /** Mint another tab of THIS pane's kind — the strip's "+" while this pane is
+   *  active. A Browser tab makes another Browser tab; a pane that is one of a
+   *  kind (a file peek) leaves it absent and the strip falls back to the chat
+   *  "+" if the zone holds session tabs. */
+  newTab?: () => void
   /** This pane's TAB LABEL, when it changes faster than the contribution
    *  should. A session pane whose draft is being typed renames on every
    *  debounce beat; re-registering `title` that often would re-render the

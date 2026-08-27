@@ -26,14 +26,22 @@ import { openSession, type OpenSessionIntent } from '@/app/open-session'
 import type { ClientSessionState } from '@/app/types'
 import {
   $narrowViewport,
+  $newSessionTabAction,
   $paneVisible,
   registerPaneCloser,
   removeTreePane,
   revealTreePane
 } from '@/components/pane-shell/tree/store'
+import {
+  $workspaceMode,
+  $workspaceOwnerKey,
+  setWorkspaceScope as publishWorkspaceScope,
+  type WorkspaceNewSessionTarget
+} from '@/components/pane-shell/workspace-scope'
 import { onGatewayEvent } from '@/contrib/events'
 import { registry } from '@/contrib/registry'
-import { deleteProfile, getLogs, getStatus, type HermesGateway } from '@/hermes'
+import type { WorkspaceMode } from '@/contrib/types'
+import { deleteProfile, getLogs, getStatus, hermesApi, type HermesGateway } from '@/hermes'
 import {
   $gateway,
   activeGatewayConnectionId,
@@ -41,6 +49,8 @@ import {
   openGatewayForProfile,
   requestGatewayForAgent,
   requestGatewayForProfile,
+  retainGatewayForAgent,
+  retainGatewayForRelay,
   retireLocalProfileGateways
 } from '@/store/gateway'
 import { notify, notifyError } from '@/store/notifications'
@@ -50,6 +60,7 @@ import {
   $profiles,
   ensureGatewayAgent,
   ensureGatewayProfile,
+  newSessionInAgent,
   newSessionInProfile,
   normalizeProfileKey,
   refreshProfiles,
@@ -74,10 +85,13 @@ import {
   $focusedRuntimeId,
   $focusedSessionState,
   $focusedStoredSessionId,
-  $sessionStates
+  $sessionStates,
+  $sessionTiles
 } from '@/store/session-states'
 import { runGatewayRestart } from '@/store/system-actions'
-import type { UsageStats } from '@/types/hermes'
+import type { PaginatedSessions, UsageStats } from '@/types/hermes'
+
+import { planPluginOpenSession } from './plugin-open-session-plan'
 
 // -- state: readonly views over the app's live atoms -------------------------
 
@@ -165,6 +179,10 @@ async function requestPluginProfile<T>(
   params: Record<string, unknown>
 ): Promise<T> {
   if (typeof route !== 'string') {
+    if (!route.connectionId.trim() || !route.profile.trim() || !route.targetProfile.trim()) {
+      throw new Error('Profile route must include connectionId, profile, and targetProfile')
+    }
+
     return requestGatewayForAgent<T>(route.connectionId, route.profile, method, params)
   }
 
@@ -189,6 +207,31 @@ async function requestPluginProfile<T>(
   throw new Error(
     `Profile "${profile}" requires a route descriptor from host.profileRoutes(); profile-only routing is limited to legacy/local profiles.`
   )
+}
+
+/** Re-read Electron's current registry before retrying an exact-owner wake.
+ *  A route that was removed or replaced while the first hydration wait ran is
+ *  no longer authority to touch that backend, even when its labels still look
+ *  identical. */
+async function pluginRouteStillRegistered(route: PluginProfileRoute): Promise<boolean> {
+  const getProfileRoutes = window.hermesDesktop?.getProfileRoutes
+
+  if (!getProfileRoutes) {
+    return false
+  }
+
+  try {
+    const routes = await getProfileRoutes($profiles.get().map(profile => profile.name))
+
+    return routes.some(
+      candidate =>
+        candidate.connectionId === route.connectionId &&
+        candidate.profile === route.profile &&
+        candidate.targetProfile === route.targetProfile
+    )
+  } catch {
+    return false
+  }
 }
 
 if (typeof window !== 'undefined') {
@@ -375,14 +418,6 @@ export const host = {
     window.location.hash = path.startsWith('#') ? path : `#${path}`
   },
 
-  /** Open a stored session the way core surfaces do (focus an existing
-   *  tile/main, else load into main). When `profile` names a non-active
-   *  profile, its backend is activated first so the resume routes to the
-   *  right state.db — the same soft profile swap the unified sidebar does.
-   *  `keepAllProfilesScope` (default true) keeps the Sessions sidebar in the
-   *  unified all-profiles view instead of narrowing it to the target
-   *  profile's sessions — a cross-profile open from a plugin surface is a
-   *  navigation, not a scope choice; pass false to also scope the sidebar. */
   /** Pre-dial a profile's gateway socket in the background — pool-only, no
    *  activation, no navigation, no scope change (openGatewayForProfile; it
    *  already no-ops for shared-remote routes and the primary). Roster UIs
@@ -410,27 +445,66 @@ export const host = {
    *  entirely. When the deleted profile was the live gateway's, the app is
    *  re-homed to the default profile — same semantics as the core dialog.
    *  Rejects with the backend's error when the delete fails. */
-  deleteProfile: async (profile: string): Promise<void> => {
-    const name = (profile ?? '').trim()
+  deleteProfile: async (profile: string | PluginProfileRoute): Promise<void> => {
+    const route =
+      typeof profile === 'string'
+        ? null
+        : {
+            ...profile,
+            connectionId: String(profile.connectionId || '').trim(),
+            profile: String(profile.profile || '').trim(),
+            targetProfile: String(profile.targetProfile || '').trim()
+          }
+
+    const name = typeof profile === 'string' ? profile.trim() : route?.profile || ''
+
+    if (route && (!route.connectionId || !route.profile || !route.targetProfile)) {
+      throw new Error('deleteProfile: route requires connectionId, profile, and targetProfile')
+    }
+
+    const targetProfile = route?.targetProfile || name
+    // A name-only call is ambient, not local: Bot Mode's active SSH roster
+    // rows deliberately use the ambient gateway door and therefore carry no
+    // explicit owner route. Preserve the active registry connection so the
+    // profile teardown and DELETE both land on the VPS instead of retiring the
+    // unrelated local pool and leaving the warmed remote backend to recreate
+    // the deleted profile.
+    const ambientConnectionId = route ? null : String(activeGatewayConnectionId() || '').trim()
+
+    const ambientRemoteConnectionId =
+      ambientConnectionId && ambientConnectionId !== 'local' ? ambientConnectionId : null
 
     if (!name) {
       throw new Error('deleteProfile: profile name required')
     }
 
-    if (normalizeProfileKey(name) === 'default') {
+    if (normalizeProfileKey(targetProfile) === 'default') {
       throw new Error('The default profile cannot be deleted.')
     }
 
     // Capture before the delete; re-home after so our write is the last one
     // (mirrors DeleteProfileDialog — a refreshActiveProfile racing the dying
     // backend can't clobber the pill back to the deleted profile).
-    const wasActive = normalizeProfileKey(name) === normalizeProfileKey($activeGatewayProfile.get())
+    const wasActive = route
+      ? route.connectionId === ($activeConnectionId.get() || '') &&
+        normalizeProfileKey(route.profile) === normalizeProfileKey($activeGatewayProfile.get())
+      : normalizeProfileKey(name) === normalizeProfileKey($activeGatewayProfile.get())
 
     // A hover-warmed Bot Mode row owns a retained renderer socket. Retire it
     // before Electron stops the profile backend so the socket closure cannot
     // schedule a reconnect that resurrects the deleted profile.
-    retireLocalProfileGateways(name)
-    await deleteProfile(name)
+    if (route?.mode === 'local' || (!route && !ambientRemoteConnectionId)) {
+      retireLocalProfileGateways(targetProfile)
+    }
+
+    await deleteProfile(
+      targetProfile,
+      route
+        ? { connectionId: route.connectionId, profile: route.profile }
+        : ambientRemoteConnectionId
+          ? { connectionId: ambientRemoteConnectionId, profile: name }
+          : undefined
+    )
 
     // The profile rail paints from the shared $profiles cache; without a
     // refresh the deleted profile's badge survives and clicking it starts a
@@ -464,7 +538,10 @@ export const host = {
       throw new Error('This Desktop build has no connection registry. Update Hermes Desktop.')
     }
 
-    return bridge.list()
+    const registryPayload = await bridge.list()
+    const rows = Array.isArray(registryPayload?.connections) ? registryPayload.connections : []
+
+    return rows.map(connection => ({ ...connection, primary: connection.id === registryPayload.primary }))
   },
 
   /** The union agent roster across every registered connection: one row per
@@ -512,8 +589,73 @@ export const host = {
       await ensureGatewayProfile(profile)
       profileActiveAt = Date.now()
 
-      if (options.keepAllProfilesScope !== false) {
-        setShowAllProfiles(true)
+    // A local bot open passes only `profile` (no cross-connection route), but
+    // its RPCs STILL have to reach that profile's own local gateway while chrome
+    // stays on the launch profile. Synthesize a local owner route from the
+    // profile so the persisted tile carries it — the session-request router
+    // reads the tile route to dispatch on the owning backend, and the canonical
+    // Bot Chat is hidden (never in $sessions), so this is the only owner record
+    // it can consult. Without it, submit falls back to the active profile and
+    // 4001s / hangs against a backend that never owned the session.
+    //
+    // This is ROUTING metadata only (tile ownerRoute + owner hint); the dial
+    // path below still keys off the explicit cross-connection route, so a plain
+    // local open dials exactly as before (openGatewayForProfile), never the
+    // registry-secondary path.
+    const localConnectionId = activeGatewayConnectionId()
+
+    const ownerRoute =
+      explicitRoute ??
+      (options.workspaceMode === 'bots' && profile && localConnectionId
+        ? { connectionId: localConnectionId, mode: 'local' as const, profile: targetProfile }
+        : null)
+
+    const expectHistory = options.expectHistory ?? false
+
+    if (options.workspaceMode === 'bots') {
+      publishWorkspaceScope(
+        'bots',
+        options.workspaceOwnerKey ?? null,
+        ownerRoute ? { kind: 'route', route: ownerRoute } : null
+      )
+    }
+
+    const openingStillCurrent = () =>
+      generation === openSessionGeneration &&
+      (options.workspaceMode !== 'bots' ||
+        ($workspaceMode.get() === 'bots' && $workspaceOwnerKey.get() === (options.workspaceOwnerKey ?? null)))
+
+    const plan = planPluginOpenSession({
+      activeProfile: $activeGatewayProfile.get(),
+      keepAllProfilesScope: options.keepAllProfilesScope,
+      profile
+    })
+
+    // Wake-path phase timings. Logged ONLY on a hydration timeout (bridged
+    // into desktop.log via the renderer-console tap), so a support bundle
+    // pinpoints WHERE the budget went — profile activation vs hydration —
+    // instead of leaving us to infer it from process spawn timestamps.
+    const wakeStartedAt = Date.now()
+    let profileActiveAt = wakeStartedAt
+    const hydrationTimeoutMs = Math.max(1, options.hydrationTimeoutMs ?? DEFAULT_SESSION_HYDRATION_TIMEOUT_MS)
+    // Which half of the wake a timeout landed in. Only meaningful on the
+    // failure path, where the two phases have different remedies: a stuck dial
+    // is a gateway problem, a slow transcript is a backend-warmup one.
+    let wakePhase: 'activation' | 'hydration' = 'activation'
+
+    if (ownerRoute) {
+      setSessionOwnerHint(storedSessionId, ownerRoute)
+    } else if (profile) {
+      // Local plugin-owned opens (Bot Mode without a cross-connection route)
+      // still carry an explicit owning profile. Record it: hidden sessions
+      // (canonical Bot Chats) have no sidebar row, so this hint is the only
+      // durable owner record the session-RPC router can consult — without it
+      // a later prompt.submit resolves to the ACTIVE profile's backend and
+      // 4001s while the bot's own backend is healthy.
+      const connectionId = activeGatewayConnectionId()
+
+      if (connectionId) {
+        setSessionOwnerHint(storedSessionId, { connectionId, mode: 'local', profile: targetProfile })
       }
     }
 
@@ -612,7 +754,17 @@ export const host = {
    *  fallback. */
   openWorkspace: (
     id: string,
-    options: { minWidth?: string; onClose?: () => void; render: () => ReactNode; title?: string }
+    options: {
+      dock?: { before?: null | string; pane: string; pos: 'bottom' | 'center' | 'left' | 'right' | 'top' }
+      headerVeto?: boolean
+      minWidth?: string
+      onClose?: () => void
+      render: () => ReactNode
+      title?: string
+      uncloseable?: boolean
+      workspaceMode?: WorkspaceMode
+      workspaceOwnerKey?: string
+    }
   ): (() => void) => {
     const key = (id ?? '').trim()
 
@@ -627,13 +779,17 @@ export const host = {
       data: {
         // The session-tile shape: a full workspace surface docked beside main,
         // closeable so it keeps its tab when it lands in a zone of its own.
-        dock: { pane: 'workspace', pos: 'center' },
+        dock: options.dock ?? { pane: 'workspace', pos: 'center' },
+        headerVeto: options.headerVeto,
         minWidth: options.minWidth ?? '22rem',
-        placement: 'main'
+        placement: 'main',
+        uncloseable: options.uncloseable
       },
       id: paneId,
       render: options.render,
-      title: options.title ?? key
+      title: options.title ?? key,
+      workspaceMode: options.workspaceMode,
+      workspaceOwnerKey: options.workspaceOwnerKey
     })
 
     const close = () => {
@@ -652,11 +808,45 @@ export const host = {
     return close
   },
 
+  /** Switch the visible main-pane workspace without unregistering retained panes. */
+  setWorkspaceScope: (
+    mode: WorkspaceMode,
+    ownerKey: null | string = null,
+    newSessionTarget: WorkspaceNewSessionTarget | null = null
+  ): boolean => publishWorkspaceScope(mode, ownerKey, newSessionTarget),
+
   /** Start a fresh chat draft, optionally pointed at another profile (its
    *  backend spins up in the background — same door the sidebar's per-profile
    *  "+" uses). */
-  newChat: (profile?: null | string): void => {
-    newSessionInProfile((profile ?? '').trim() || $activeGatewayProfile.get())
+  newChat: (profile?: null | string | PluginProfileRoute, options: PluginNewChatOptions = {}): void => {
+    if (options.workspaceMode === 'bots') {
+      if (!profile || typeof profile === 'string' || !options.workspaceOwnerKey) {
+        notify({ kind: 'error', message: 'Select a Bot before starting another chat.' })
+
+        return
+      }
+
+      publishWorkspaceScope('bots', options.workspaceOwnerKey, { kind: 'route', route: { ...profile } })
+
+      const openTab = $newSessionTabAction.get()
+
+      if (!openTab) {
+        notify({ kind: 'error', message: 'Update Hermes Desktop to open another Bot chat.' })
+
+        return
+      }
+
+      openTab()
+
+      return
+    }
+
+    if (profile && typeof profile !== 'string') {
+      newSessionInAgent({ ...profile })
+    } else {
+      newSessionInProfile((profile ?? '').trim() || $activeGatewayProfile.get())
+    }
+
     window.location.hash = '#/'
   },
 
@@ -710,6 +900,98 @@ export const host = {
     method: string,
     params: Record<string, unknown> = {}
   ): Promise<T> => requestPluginProfile<T>(route, method, params),
+
+  /** Pin a route's pooled gateway socket open across repeated `requestProfile`
+   *  calls (#93594: the bot-relay drain loop was dialing and tearing down a
+   *  fresh WebSocket per registered connection per tick). Returns a once-only
+   *  release. Local routes are exempt (no-op release) so the idle reaper can
+   *  still reclaim spawned local backends. Feature-detect on older desktops
+   *  (`typeof host.retainProfileSocket === 'function'`). */
+  retainProfileSocket: (route: PluginProfileRoute | string): (() => void) => {
+    if (typeof route === 'string' || !route) {
+      // Bare-profile compatibility overload: local/legacy routing — exempt.
+      return () => undefined
+    }
+
+    return retainGatewayForRelay(route.connectionId, route.profile)
+  },
+
+  /** Hold a route's pooled socket open across a multi-RPC, session-scoped
+   *  sequence (#93602). Each requestProfile call is its own request lease, so
+   *  a non-retained secondary socket closes at refcount 0 between calls — and
+   *  the gateway reaps any runtime session that socket minted, failing the
+   *  next RPC with 4001. Acquire before the first session-scoped RPC, release
+   *  (idempotent) in a `finally`. Feature-detect: older hosts lack this. */
+  retainProfile: async (route: PluginProfileRoute | string): Promise<() => void> => {
+    if (typeof route !== 'string') {
+      if (!route.connectionId.trim() || !route.profile.trim()) {
+        throw new Error('Profile route must include connectionId and profile')
+      }
+
+      return retainGatewayForAgent(route.connectionId, route.profile)
+    }
+
+    return retainGatewayForAgent(null, route.trim() || 'default')
+  },
+
+  /** Read persisted sessions from a profile's owning source without dialing
+   *  that profile's gateway. The source primary opens state.db directly. */
+  listPersistedSessions: async (
+    route: PluginProfileRoute | null,
+    options: { profile: string; limit?: number }
+  ): Promise<PaginatedSessions> => {
+    if (route && (!route.connectionId.trim() || !route.profile.trim() || !route.targetProfile.trim())) {
+      throw new Error('Profile route must include connectionId, profile, and targetProfile')
+    }
+
+    const profile = options.profile.trim()
+
+    if (!profile) {
+      throw new Error('Persisted session reads require a profile')
+    }
+
+    const limit = Math.min(500, Math.max(0, options.limit ?? 200))
+
+    const query = new URLSearchParams({
+      limit: String(limit),
+      offset: '0',
+      min_messages: '0',
+      archived: 'exclude',
+      order: 'created',
+      profile
+    })
+
+    return hermesApi<PaginatedSessions>({
+      ...(route ? { connectionId: route.connectionId } : {}),
+      path: `/api/profiles/sessions?${query.toString()}`,
+      timeoutMs: 60_000
+    })
+  },
+
+  /** Mutate the durable hidden flag through the source primary. Keeping the
+   *  owner profile in the body (not request.profile) prevents Electron from
+   *  starting a profile backend merely to reconcile persisted visibility. */
+  setPersistedSessionHidden: async (
+    route: PluginProfileRoute | null,
+    options: { sessionId: string; profile: string; hidden: boolean }
+  ): Promise<{ ok: boolean; hidden: boolean }> => {
+    if (route && (!route.connectionId.trim() || !route.profile.trim() || !route.targetProfile.trim())) {
+      throw new Error('Profile route must include connectionId, profile, and targetProfile')
+    }
+
+    const profile = options.profile.trim()
+
+    if (!profile || !options.sessionId.trim()) {
+      throw new Error('Persisted session updates require a profile and session id')
+    }
+
+    return hermesApi<{ ok: boolean; hidden: boolean }>({
+      ...(route ? { connectionId: route.connectionId } : {}),
+      path: `/api/sessions/${encodeURIComponent(options.sessionId)}`,
+      method: 'PATCH',
+      body: { hidden: options.hidden, profile }
+    })
+  },
 
   /** Gateway JSON-RPC — sessions, config, skills, cron, kanban, everything
    *  the app itself uses. Lazy: resolves the LIVE socket per call. */
@@ -889,6 +1171,16 @@ export { type BudgetedLoop, type BudgetedLoopOptions, createBudgetedLoop } from 
 /** THE compact-number formatter — every user-facing count/token figure goes
  *  through here (1230 → "1.2k", 1_500_000 → "1.5M"). Don't hand-roll `/1000`. */
 export { compactNumber } from '@/lib/format'
+/** THE confirm flow for guarded model switches — when a gateway model-switch
+ *  RPC answers `confirm_required` (data-policy / expensive-model guard),
+ *  route it through this shared applier instead of forking a per-surface
+ *  dialog: it shows the warning and resends with
+ *  `confirm_expensive_model: true` on Confirm (#95293). */
+export {
+  type GuardedModelSwitchResult,
+  surfaceModelSwitchConfirm,
+  type SurfaceModelSwitchConfirmOptions
+} from '@/lib/guarded-model-switch'
 export { triggerHaptic as haptic } from '@/lib/haptics'
 export type { HermesOpenTarget } from '@/lib/hermes-open-target'
 /** The app's lucide icon set (RefreshCw, LayoutDashboard, Activity, …). */
@@ -930,6 +1222,36 @@ export {
   type TranscriptDirectiveProps
 } from '@/lib/transcript-directives'
 export { cn } from '@/lib/utils'
+/** Live accent override — set a hex and the ACTIVE theme repaints with its
+ *  accent family re-seeded from it (see `retintTheme`); `null` restores the
+ *  authored palette. Deliberately not persisted: it is an authoring knob, not
+ *  a setting, so a plugin that sets it must clear it on dispose. */
+export { $accentOverride, setAccentOverride } from '@/themes/accent-override'
+/** OKLCH colour maths, for anything deriving a palette rather than hardcoding
+ *  one: perceptual conversion, the sRGB gamut boundary, WCAG contrast, and
+ *  hue-stable blending. */
+export {
+  contrastRatio,
+  hexToOklch,
+  hueDelta,
+  maxChroma,
+  mixOklab,
+  normalizeHex,
+  type Oklch,
+  oklchToHex,
+  oklchToSrgb255,
+  readableOn
+} from '@/themes/color'
+/** The painted theme, its name, and the appearance it resolved to — plus
+ *  `setTheme` / `setMode` to change it from a component. */
+export { useTheme } from '@/themes/context'
+/** Switch the theme from outside React (a gateway event, a connection coming
+ *  up, any callback with no component around it). Returns false and leaves the
+ *  appearance alone when the name doesn't resolve, so it doubles as the "is
+ *  this theme installed?" check. */
+export { requestTheme } from '@/themes/request'
+export { retintTheme, themeHue } from '@/themes/retint'
+export type { DesktopTheme, DesktopThemeColors } from '@/themes/types'
 export { THEMES_AREA } from '@/themes/user-themes'
 export type { RpcEvent, StatusResponse } from '@/types/hermes'
 /** Subscribe a component to a `host.state` atom. */

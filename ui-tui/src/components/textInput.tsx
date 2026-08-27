@@ -52,7 +52,7 @@ type MinimalEnv = Record<string, string | undefined>
 
 const invert = (s: string) => INV + s + INV_OFF
 
-// Placeholder styling is EXPLICIT truecolor only — never SGR dim/inverse:
+// Placeholder styling is EXPLICIT color only — never SGR dim/inverse:
 // both are terminal-interpreted relative to the default fg/bg, and on
 // transparent profiles (terminal.background #00000000) they composite
 // against a black RGB the user never sees — the hint rendered as a slab.

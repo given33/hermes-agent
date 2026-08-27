@@ -6,6 +6,7 @@ import { ConfirmDialog } from '@/components/ui/confirm-dialog'
 import { Input } from '@/components/ui/input'
 import type {
   DesktopConnectionKind,
+  DesktopConnectionProbeResult,
   DesktopConnectionsRegistry,
   DesktopRegistryConnection,
   DesktopRegistryConnectionInput
@@ -238,6 +239,14 @@ export function ConnectionsRegistrySection() {
   // Inline duplicate rejection from the save path (dedupe is also enforced in
   // the main process, so a crafted payload can't slip past the UI check).
   const [dupeError, setDupeError] = useState<null | string>(null)
+  // A gated remote gateway (OAuth, or username/password) never accepts a
+  // session token: it authenticates with a browser sign-in and keeps the
+  // session itself. Probe the edited URL so this row can name the provider,
+  // and remember whether the login round-trip actually completed.
+  const [authProbe, setAuthProbe] = useState<DesktopConnectionProbeResult | null>(null)
+  const [signingIn, setSigningIn] = useState(false)
+  const [oauthConnected, setOauthConnected] = useState(false)
+  const probeSeq = useRef(0)
 
   const bridge = window.hermesDesktop?.connections
 
@@ -729,6 +738,34 @@ export function ConnectionsRegistrySection() {
                   }
                   description={t.settings.gateway.tokenDesc}
                   title={t.settings.gateway.tokenTitle}
+                />
+              )}
+              {editor.authMode === 'oauth' && (
+                <ListRow
+                  action={
+                    oauthConnected ? (
+                      <Pill tone="primary">
+                        <Check className="size-3" /> {t.settings.gateway.signedIn}
+                      </Pill>
+                    ) : (
+                      <Button disabled={signingIn || !editorUrl} onClick={() => void signInOauth()} size="sm">
+                        {signingIn ? <Loader2 className="size-4 animate-spin" /> : <LogIn className="size-4" />}
+                        {authProviderShape.isPassword
+                          ? t.settings.gateway.signIn
+                          : t.settings.gateway.signInWith(authProviderShape.providerLabel)}
+                      </Button>
+                    )
+                  }
+                  description={
+                    oauthConnected
+                      ? authProviderShape.isPassword
+                        ? t.settings.gateway.authSignedInPassword
+                        : t.settings.gateway.authSignedInOauth
+                      : authProviderShape.isPassword
+                        ? t.settings.gateway.authNeedsPassword
+                        : t.settings.gateway.authNeedsOauth(authProviderShape.providerLabel)
+                  }
+                  title={t.settings.gateway.authTitle}
                 />
               )}
             </>

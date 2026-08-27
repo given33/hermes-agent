@@ -35,6 +35,7 @@ import {
   normalizeSshConfig,
   normAuthMode
 } from './connection-config'
+import { matchingConnectionId, type StoredRoute } from './connection-route-identity'
 
 export const REGISTRY_VERSION = 2
 
@@ -72,6 +73,22 @@ export interface RegistryConnection {
   remoteProfile?: string
 }
 
+/**
+ * A registry entry that failed normalization (#94246). The raw entry is USER
+ * DATA — it is preserved verbatim here (and re-persisted on every write)
+ * instead of being silently dropped, so a malformed/corrupt entry never
+ * requires "delete connections.json" recovery and never loses the user's
+ * connection material.
+ */
+export interface QuarantinedRegistryEntry {
+  reason: string
+  entry: unknown
+}
+
+/** Upper bound on preserved quarantine entries so a pathological file cannot
+ * grow the registry without limit. Oldest-first within one load pass. */
+export const REGISTRY_QUARANTINE_CAP = 20
+
 export interface ConnectionRegistry {
   version: typeof REGISTRY_VERSION
   /** id of the connection that owns the window/primary backend. */
@@ -82,6 +99,8 @@ export interface ConnectionRegistry {
    * so registries written before multi-source switching still normalize. */
   lastUsed: string
   connections: RegistryConnection[]
+  /** Entries preserved from a malformed load — absent when empty. */
+  quarantined?: QuarantinedRegistryEntry[]
 }
 
 // ── Labels and ids ──────────────────────────────────────────────────────────
@@ -168,6 +187,24 @@ export function backendScopeKey(connectionId: null | string | undefined, profile
   }
 
   return `conn:${connection}::${profileKey}`
+}
+
+/**
+ * Inverse of backendScopeKey(): recover (connectionId, profile) from a pool
+ * key. A bare profile key (the local/primary scope) maps to a null
+ * connectionId. Used by the post-resume rebuild path (#93910) to re-dial a
+ * retired pool entry through the same claim-guarded ensure path a renderer
+ * would use.
+ */
+export function parseBackendScopeKey(key: string): { connectionId: null | string; profile: string } {
+  const value = String(key ?? '').trim()
+  const match = /^conn:(.+?)::(.+)$/.exec(value)
+
+  if (!match) {
+    return { connectionId: null, profile: value || 'default' }
+  }
+
+  return { connectionId: match[1], profile: match[2] }
 }
 
 /** All pool keys owned by a connection share this prefix (used to stop them on remove). */
@@ -318,6 +355,9 @@ export interface ConnectionAgents {
   /** Profile names enumerated from the connection, or null when unreachable /
    * connect-on-demand (ssh not yet dialed). */
   profiles: null | string[]
+  /** Credential-free profile metadata from the same connection. Kept separate
+   * from `profiles` so old enumerators can continue returning names only. */
+  profileMetadata?: Record<string, RosterProfileMetadata>
   /** Present when profiles is null: why enumeration was skipped. */
   error?: string
   /** Stable backend identity from the connection's /api/status (`install_id`).
@@ -333,16 +373,32 @@ export interface RosterAgent {
   connectionKind: ConnectionKind
   connectionLabel: string
   profile: string
+  /** Backend profile when the registry route maps the Desktop profile name. */
+  targetProfile?: string
   /** Bare profile name, or `<profile>-<label-slug>` when the profile name
    * exists on more than one registered source (the @name-device rule). */
   handle: string
+  /** Rich metadata for this exact connection + profile, when enumerated. */
+  profileMetadata?: RosterProfileMetadata
+}
+
+export interface RosterProfileMetadata {
+  display_name?: string
+  title?: string
+  ui_meta?: Record<string, unknown>
+  has_avatar?: boolean
 }
 
 /**
- * SSH roster enumeration skips undialed sources (connect-on-demand). Reuse the
- * last successful profile list so Bot Mode does not go empty the moment the
- * window switches back to local. Never-seen SSH sources still get a `default`
- * seed so the device is clickable.
+ * Roster enumeration skips undialed sources (connect-on-demand) and reports
+ * unreachable ones with `profiles: null`. Reuse the last successful profile
+ * list so Bot Mode does not go empty (or drop to a partial roster) the moment
+ * a source is briefly unreachable — SSH tunnels drop on sleep/wake, and a
+ * remote gateway bounce (VPS restart) otherwise erased its bots from the
+ * roster until the next successful enumeration ("my 4 bots show as 2", Aug
+ * 2026 bundle). Never-seen SSH sources still get a `default` seed so the
+ * device is clickable; never-seen remote sources stay empty (no seed) since
+ * an unreachable URL is not evidence a backend exists there.
  */
 export function rememberSshEnumeration(
   enumeration: Pick<ConnectionAgents, 'error' | 'profiles'>,
@@ -353,7 +409,7 @@ export function rememberSshEnumeration(
     return enumeration
   }
 
-  if (kind !== 'ssh') {
+  if (kind === 'local') {
     return enumeration
   }
 
@@ -361,7 +417,7 @@ export function rememberSshEnumeration(
     return { profiles: cached, error: enumeration.error }
   }
 
-  if (enumeration.error === 'connect-on-demand') {
+  if (kind === 'ssh' && enumeration.error === 'connect-on-demand') {
     return { profiles: ['default'], error: 'connect-on-demand' }
   }
 
@@ -427,18 +483,30 @@ export function buildAgentRoster(
   // counting names for @name-device disambiguation.
   const identities = new Map<
     string,
-    { connection: RegistryConnection; installId?: string; order: number; profile: string }
+    {
+      connection: RegistryConnection
+      installId?: string
+      order: number
+      profile: string
+      profileMetadata?: RosterProfileMetadata
+    }
   >()
 
   let order = 0
 
-  for (const { connection, installId, profiles } of enumerations) {
+  for (const { connection, installId, profiles, profileMetadata } of enumerations) {
     for (const profile of profiles || []) {
       const name = String(profile || '').trim() || 'default'
       const key = `${connection.id}\0${name}`
 
       if (!identities.has(key)) {
-        identities.set(key, { connection, installId, order, profile: name })
+        identities.set(key, {
+          connection,
+          installId,
+          order,
+          profile: name,
+          ...(profileMetadata?.[name] ? { profileMetadata: profileMetadata[name] } : {})
+        })
       }
     }
 
@@ -449,16 +517,19 @@ export function buildAgentRoster(
   // are the SAME physical install registered under two addresses, so their
   // (install, profile) rows are one bot, not two. Connections without an id
   // (older backends, undialed ssh) keep a per-connection key — no collapse.
-  const backends = new Map<string, { connection: RegistryConnection; order: number; profile: string }[]>()
+  const backends = new Map<
+    string,
+    { connection: RegistryConnection; order: number; profile: string; profileMetadata?: RosterProfileMetadata }[]
+  >()
 
-  for (const { connection, installId, order: rank, profile } of identities.values()) {
+  for (const { connection, installId, order: rank, profile, profileMetadata } of identities.values()) {
     const key = installId ? `id:${installId}\0${profile}` : `conn:${connection.id}\0${profile}`
     const group = backends.get(key)
 
     if (group) {
-      group.push({ connection, order: rank, profile })
+      group.push({ connection, order: rank, profile, profileMetadata })
     } else {
-      backends.set(key, [{ connection, order: rank, profile }])
+      backends.set(key, [{ connection, order: rank, profile, profileMetadata }])
     }
   }
 
@@ -475,13 +546,15 @@ export function buildAgentRoster(
 
   const roster: RosterAgent[] = []
 
-  for (const { connection, profile } of rows) {
+  for (const { connection, profile, profileMetadata } of rows) {
     roster.push({
       connectionId: connection.id,
       connectionKind: connection.kind,
       connectionLabel: connection.label,
       profile,
-      handle: agentHandle(profile, connection.label, (counts.get(profile) || 0) > 1)
+      targetProfile: connection.remoteProfile || profile,
+      handle: agentHandle(profile, connection.label, (counts.get(profile) || 0) > 1),
+      ...(profileMetadata ? { profileMetadata } : {})
     })
   }
 
@@ -814,82 +887,132 @@ export function normalizeRegistry(raw: unknown): ConnectionRegistry {
   const seenLabels = new Set<string>()
   const seenIds = new Set<string>()
   const connections: RegistryConnection[] = []
+  const quarantined: QuarantinedRegistryEntry[] = []
+
+  const quarantine = (reason: string, entry: unknown) => {
+    if (quarantined.length < REGISTRY_QUARANTINE_CAP) {
+      quarantined.push({ reason, entry })
+    }
+  }
+
+  // Entries quarantined by a previous load are user data too — carry them
+  // through every subsequent normalize/write cycle rather than dropping them
+  // the first time the file is rewritten.
+  if (Array.isArray(parsed.quarantined)) {
+    for (const item of parsed.quarantined) {
+      if (item && typeof item === 'object' && 'entry' in (item as Record<string, unknown>)) {
+        quarantine(
+          String((item as Record<string, unknown>).reason || 'unknown'),
+          (item as Record<string, unknown>).entry
+        )
+      }
+    }
+  }
+
+  // Best-effort plain-data copy for entries that blew up mid-normalization —
+  // the raw object may carry whatever poisoned it, so never persist it as-is.
+  const safeEntryCopy = (item: unknown) => {
+    try {
+      return JSON.parse(JSON.stringify(item))
+    } catch {
+      return { unserializable: true }
+    }
+  }
 
   for (const item of rawConnections) {
-    if (!item || typeof item !== 'object') {
+    if (!item) {
+      continue // null/false/'' carry no user data
+    }
+
+    if (typeof item !== 'object') {
+      // A string/number here is usually a mangled hand-edit — still user data.
+      quarantine('entry-malformed', item)
+
       continue
     }
 
-    const entry = item as Record<string, unknown>
-    const kind = entry.kind
+    // One bad entry must never abort the whole registry load (#94246): any
+    // unexpected throw quarantines THIS entry and the loop moves on.
+    try {
+      const entry = item as Record<string, unknown>
+      const kind = entry.kind
 
-    if (kind !== 'local' && kind !== 'remote' && kind !== 'cloud' && kind !== 'ssh') {
-      continue
-    }
+      if (kind !== 'local' && kind !== 'remote' && kind !== 'cloud' && kind !== 'ssh') {
+        quarantine('entry-unrecognized-kind', item)
 
-    let label = String(entry.label || '').trim()
-
-    if (!label) {
-      // Defensive: registry entries are always written with labels, but a
-      // hand-edited file may drop one. Derive rather than discard.
-      label =
-        kind === 'ssh' ? String(entry.host || 'ssh') : hostLabelFromBaseUrl(String(entry.url || '')) || String(kind)
-    }
-
-    label = uniqueLabel(label, seenLabels)
-
-    let id = kind === 'local' ? LOCAL_CONNECTION_ID : String(entry.id || '').trim()
-
-    if (!id || (seenIds.has(id) && kind !== 'local')) {
-      id = connectionIdForLabel(label, seenIds)
-    }
-
-    if (seenIds.has(id)) {
-      continue // second 'local' entry — first one wins
-    }
-
-    seenLabels.add(labelKey(label))
-    seenIds.add(id)
-
-    const clean: RegistryConnection = { id, kind, label }
-
-    if (kind === 'remote' || kind === 'cloud') {
-      const url = String(entry.url || '').trim()
-
-      if (!url) {
         continue
       }
 
-      clean.url = url
-      clean.authMode = normAuthMode(entry.authMode)
+      let label = String(entry.label || '').trim()
 
-      if (entry.token !== undefined) {
-        clean.token = entry.token
+      if (!label) {
+        // Defensive: registry entries are always written with labels, but a
+        // hand-edited file may drop one. Derive rather than discard.
+        label =
+          kind === 'ssh' ? String(entry.host || 'ssh') : hostLabelFromBaseUrl(String(entry.url || '')) || String(kind)
       }
 
-      const storedHeaders = normalizeRemoteHeaders(entry.headers)
+      label = uniqueLabel(label, seenLabels)
 
-      if (Object.keys(storedHeaders).length > 0) {
-        clean.headers = storedHeaders
+      let id = kind === 'local' ? LOCAL_CONNECTION_ID : String(entry.id || '').trim()
+
+      if (!id || (seenIds.has(id) && kind !== 'local')) {
+        id = connectionIdForLabel(label, seenIds)
       }
 
-      const org = String(entry.org || '').trim()
-
-      if (kind === 'cloud' && org) {
-        clean.org = org
-      }
-    } else if (kind === 'ssh') {
-      const ssh = normalizeSshConfig({ ...entry, mode: 'ssh' })
-
-      if (!ssh) {
-        continue
+      if (seenIds.has(id)) {
+        continue // second 'local' entry — first one wins
       }
 
-      const { mode: _mode, ...sshFields } = ssh
-      Object.assign(clean, sshFields)
+      seenLabels.add(labelKey(label))
+      seenIds.add(id)
+
+      const clean: RegistryConnection = { id, kind, label }
+
+      if (kind === 'remote' || kind === 'cloud') {
+        const url = String(entry.url || '').trim()
+
+        if (!url) {
+          quarantine('entry-missing-url', item)
+
+          continue
+        }
+
+        clean.url = url
+        clean.authMode = normAuthMode(entry.authMode)
+
+        if (entry.token !== undefined) {
+          clean.token = entry.token
+        }
+
+        const storedHeaders = normalizeRemoteHeaders(entry.headers)
+
+        if (Object.keys(storedHeaders).length > 0) {
+          clean.headers = storedHeaders
+        }
+
+        const org = String(entry.org || '').trim()
+
+        if (kind === 'cloud' && org) {
+          clean.org = org
+        }
+      } else if (kind === 'ssh') {
+        const ssh = normalizeSshConfig({ ...entry, mode: 'ssh' })
+
+        if (!ssh) {
+          quarantine('entry-missing-ssh-host', item)
+
+          continue
+        }
+
+        const { mode: _mode, ...sshFields } = ssh
+        Object.assign(clean, sshFields)
+      }
+
+      connections.push(clean)
+    } catch {
+      quarantine('entry-normalization-failed', safeEntryCopy(item))
     }
-
-    connections.push(clean)
   }
 
   if (!connections.some(c => c.kind === 'local')) {
@@ -900,13 +1023,19 @@ export function normalizeRegistry(raw: unknown): ConnectionRegistry {
   const primary = connections.some(c => c.id === storedPrimary) ? storedPrimary : LOCAL_CONNECTION_ID
   const storedLastUsed = String(parsed.lastUsed || '').trim()
 
-  return {
+  const normalized: ConnectionRegistry = {
     version: REGISTRY_VERSION,
     primary,
     launchMode: parsed.launchMode === 'last-used' ? 'last-used' : 'primary',
     lastUsed: connections.some(c => c.id === storedLastUsed) ? storedLastUsed : primary,
     connections
   }
+
+  if (quarantined.length > 0) {
+    normalized.quarantined = quarantined
+  }
+
+  return normalized
 }
 
 /**

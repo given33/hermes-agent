@@ -320,7 +320,15 @@ def _(rid, params: dict) -> dict:
         return _ok(rid, {"value": "on" if on else "off"})
     if key == "theme":
         display = _load_cfg().get("display")
-        raw = str(display.get("tui_theme", "auto") if isinstance(display, dict) else "auto").strip().lower()
+        raw = (
+            str(
+                display.get("tui_theme", "auto")
+                if isinstance(display, dict)
+                else "auto"
+            )
+            .strip()
+            .lower()
+        )
         return _ok(rid, {"value": raw if raw in {"auto", "light", "dark"} else "auto"})
     if key == "statusbar":
         display = _load_cfg().get("display")
@@ -330,10 +338,17 @@ def _(rid, params: dict) -> dict:
         return _ok(rid, {"value": _coerce_statusbar(raw)})
     if key == "focus":
         display = _load_cfg().get("display")
-        on = bool(display.get("focus_view", False)) if isinstance(display, dict) else False
+        on = (
+            bool(display.get("focus_view", False))
+            if isinstance(display, dict)
+            else False
+        )
         return _ok(
             rid,
-            {"value": "on" if on else "off", "tool_progress": _load_tool_progress_mode()},
+            {
+                "value": "on" if on else "off",
+                "tool_progress": _load_tool_progress_mode(),
+            },
         )
     if key == "mouse":
         display = _load_cfg().get("display")
@@ -383,10 +398,15 @@ def _(rid, params: dict) -> dict:
         provider_configured = bool(_has_any_provider_configured())
         provider = runtime.get("provider") or "provider"
         source = str(runtime.get("source") or "")
-        if not provider_configured and provider == "bedrock" and source in {
-            "iam-role",
-            "aws-sdk-default-chain",
-        }:
+        if (
+            not provider_configured
+            and provider == "bedrock"
+            and source
+            in {
+                "iam-role",
+                "aws-sdk-default-chain",
+            }
+        ):
             return _ok(
                 rid,
                 {

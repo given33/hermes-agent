@@ -37,6 +37,7 @@ import {
 } from '@/store/clarify'
 import { $gateway } from '@/store/gateway'
 import { notifyError } from '@/store/notifications'
+import { requestForOwnedSession } from '@/store/session-states'
 
 import { selectMessageRunning } from './tool/fallback-model'
 import { parseMaybeObject } from './tool/fallback-model/format'
@@ -286,17 +287,6 @@ export const ClarifyTool = (props: ToolCallMessagePartProps) => {
     return <ClarifyToolSettled {...props} />
   }
 
-  return <ClarifyToolLive {...props} />
-}
-
-function ClarifyToolLive(props: ToolCallMessagePartProps) {
-  const messageRunning = useAuiState(selectMessageRunning)
-
-  // Stopped mid-prompt with no result — don't leave a dead interactive panel.
-  if (!messageRunning) {
-    return <ToolFallback {...props} />
-  }
-
   return <ClarifyToolPending {...props} />
 }
 
@@ -435,11 +425,12 @@ function ClarifyToolSinglePending({ fromArgs, request }: { fromArgs: ClarifyArgs
   const textareaRef = useRef<HTMLTextAreaElement | null>(null)
 
   // Race: tool.start fires a tick before clarify.request, so request_id
-  // arrives slightly after the tool block mounts. Hold the whole panel on a
-  // spinner until the gateway request is wired — showing disabled choices or
-  // a "loading question" stub is worse than a brief wait.
+  // arrives slightly after the tool block mounts. If the question text is
+  // already in the tool args, paint the card immediately (disabled until
+  // the request is wired) — a spinner→question swap is a layout jump for
+  // no reason. Only spin when we have nothing to show yet.
   const ready = Boolean(matchingRequest?.requestId)
-  const loading = !ready && !submitting
+  const loading = !ready && !submitting && !question
 
   const respond = useCallback(
     async (answer: string) => {
@@ -458,11 +449,24 @@ function ClarifyToolSinglePending({ fromArgs, request }: { fromArgs: ClarifyArgs
       setSubmitting(true)
 
       try {
-        await gateway.request<{ ok?: boolean }>('clarify.respond', {
-          request_id: matchingRequest.requestId,
-          answer
-        })
+        // Route through the session's OWNER (tile route → hint → tagged row);
+        // legacy ambient is allowed only when it is provably the sole backend.
+        // The ambient socket follows foreground focus, so after a profile / Bot
+        // Chat switch it can point at a backend that never held this clarify —
+        // and the owner stays blocked (#91684 client half, like approval.respond).
+        await requestForOwnedSession<{ ok?: boolean }>(
+          matchingRequest.sessionId,
+          // Bound (not wrapped) so the ambient fallback keeps the exact 2-arg
+          // call shape gateway.request callers assert on.
+          gateway.request.bind(gateway) as typeof gateway.request,
+          'clarify.respond',
+          {
+            request_id: matchingRequest.requestId,
+            answer
+          }
+        )
         triggerHaptic('submit')
+        onAnswered()
         clearClarifyRequest(matchingRequest.requestId, matchingRequest.sessionId)
         // tool.complete lands next → ClarifyToolSettled.
       } catch (error) {
@@ -470,7 +474,7 @@ function ClarifyToolSinglePending({ fromArgs, request }: { fromArgs: ClarifyArgs
         setSubmitting(false)
       }
     },
-    [copy.gatewayDisconnected, copy.notReady, copy.sendFailed, gateway, matchingRequest, ready]
+    [copy.gatewayDisconnected, copy.notReady, copy.sendFailed, gateway, matchingRequest, onAnswered, ready]
   )
 
   const trimmedDraft = draft.trim()
@@ -708,7 +712,7 @@ function ClarifyToolSinglePending({ fromArgs, request }: { fromArgs: ClarifyArgs
                 active={activeIndex === index}
                 char={letterFor(index)}
                 choice={choice}
-                disabled={submitting}
+                disabled={submitting || !ready}
                 key={`${index}-${choice}`}
                 keyShortcuts={`${letterFor(index)} ${index + 1}`}
                 onClick={() => selectChoice(choice, index)}
@@ -732,7 +736,7 @@ function ClarifyToolSinglePending({ fromArgs, request }: { fromArgs: ClarifyArgs
                 aria-current={activeIndex === choices.length || undefined}
                 aria-keyshortcuts={`${letterFor(choices.length)} ${choices.length + 1}`}
                 className={CLARIFY_TEXTAREA_CLASS}
-                disabled={submitting}
+                disabled={submitting || !ready}
                 onBlur={() => setOtherFocused(false)}
                 onChange={event => onDraftChange(event.target.value)}
                 onFocus={() => {
@@ -752,7 +756,7 @@ function ClarifyToolSinglePending({ fromArgs, request }: { fromArgs: ClarifyArgs
         ) : (
           <Textarea
             className={CLARIFY_TEXTAREA_CLASS}
-            disabled={submitting}
+            disabled={submitting || !ready}
             onChange={event => onDraftChange(event.target.value)}
             onKeyDown={handleTextareaKey}
             placeholder={copy.placeholder}
@@ -765,10 +769,10 @@ function ClarifyToolSinglePending({ fromArgs, request }: { fromArgs: ClarifyArgs
       </ClarifyShell>
 
       <div className="flex items-center justify-end gap-1">
-        <Button disabled={submitting} onClick={() => void respond('')} size="xs" type="button" variant="text">
+        <Button disabled={submitting || !ready} onClick={() => void respond('')} size="xs" type="button" variant="text">
           {copy.skip}
         </Button>
-        <Button disabled={submitting || !pendingAnswer} size="xs" type="submit">
+        <Button disabled={submitting || !ready || !pendingAnswer} size="xs" type="submit">
           {submitting ? (
             <Loader2 className="size-3 animate-spin" />
           ) : (
