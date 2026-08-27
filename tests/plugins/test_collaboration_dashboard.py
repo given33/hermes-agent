@@ -9,6 +9,7 @@ import time
 import subprocess
 import sys
 import unittest
+import pytest
 from tempfile import TemporaryDirectory
 from pathlib import Path
 from types import SimpleNamespace
@@ -51,7 +52,7 @@ def test_connector_flags_normalize_textual_values():
     assert module._coerce_flag("unexpected") is False
 
 
-def test_connector_pull_distinguishes_legacy_manager_and_remote_supervisor():
+def test_connector_pull_exposes_worker_runs_and_rejects_retired_supervisor_runs():
     module = load_module()
     conversation = module.create_single_conversation("default")
     state = {"conversations": [conversation]}
@@ -62,7 +63,7 @@ def test_connector_pull_distinguishes_legacy_manager_and_remote_supervisor():
     module._require_connector = lambda _request: "dbb3-primary"
     module._account_generation_for_owner = lambda _owner: "generation-1"
 
-    def enqueue(turn_id, profile, role_stage, *, remote_supervisor=False):
+    def enqueue(turn_id, profile, role_stage):
         module.create_hosted_turn_record(
             conversation,
             turn_id=turn_id,
@@ -83,30 +84,9 @@ def test_connector_pull_distinguishes_legacy_manager_and_remote_supervisor():
             delivery_context="",
             attachment_context="",
             connector_id="dbb3-primary",
-            remote_supervisor=remote_supervisor,
         )
 
-    legacy = enqueue(
-        "turn-legacy-manager",
-        module._LEGACY_DBB3_MANAGER_PROFILE,
-        "manager_planning",
-    )
-    supervisor = enqueue(
-        "turn-remote-supervisor",
-        module._HERMES_MANAGER_PROFILE,
-        "supervisor:final_report",
-        remote_supervisor=True,
-    )
-    historical_supervisor = enqueue(
-        "turn-historical-supervisor",
-        module._HERMES_MANAGER_PROFILE,
-        "supervisor:legacy_check",
-    )
-    ordinary_manager = enqueue(
-        "turn-local-manager",
-        module._HERMES_MANAGER_PROFILE,
-        "manager_planning",
-    )
+    worker = enqueue("turn-worker", "dbb3-worker", "worker")
 
     pulled = module.connector_pull_runs(
         module.ConnectorPullBody(
@@ -118,14 +98,25 @@ def test_connector_pull_distinguishes_legacy_manager_and_remote_supervisor():
     )
 
     pulled_ids = {item["remote_run_id"] for item in pulled["runs"]}
-    assert legacy["id"] in pulled_ids
-    assert supervisor["id"] in pulled_ids
-    assert historical_supervisor["id"] in pulled_ids
-    assert ordinary_manager["id"] not in pulled_ids
-    assert ordinary_manager["status"] == "queued"
+    assert worker["id"] in pulled_ids
+    with pytest.raises(RuntimeError, match="Supervisor remote runs"):
+        module._ensure_remote_run(
+            conversation["id"],
+            "turn-retired-supervisor",
+            role_stage="supervisor:final_report",
+            profile=module._HERMES_MANAGER_PROFILE,
+            title="retired",
+            objective="retired",
+            local_task_id="",
+            artifact_required=False,
+            delivery_context="",
+            attachment_context="",
+            connector_id="dbb3-primary",
+            remote_supervisor=True,
+        )
 
 
-def test_remote_supervisor_path_marks_canonical_manager_as_remote():
+def test_remote_supervisor_path_is_retired():
     module = load_module()
     conversation = module.create_single_conversation("default")
     state = {"conversations": [conversation]}
@@ -140,26 +131,16 @@ def test_remote_supervisor_path_marks_canonical_manager_as_remote():
         profiles=["default"],
         artifact_required=False,
     )
-    captured = {}
-
-    def remote_role(_conversation_id, _turn_id, **kwargs):
-        captured.update(kwargs)
-        return supervision_control(), "completed", {}
-
-    module._run_hosted_remote_role = remote_role
-    module._run_hosted_supervisor_check(
-        conversation["id"],
-        "turn-remote-supervisor-path",
-        check_id="final_report",
-        checkpoint_label="Final report",
-        evidence={"result": "verified"},
-        runner=lambda *_args, **_kwargs: "unused",
-        remote=True,
-    )
-
-    assert captured["profile"] == module._HERMES_MANAGER_PROFILE
-    assert captured["role_stage"] == "supervisor:final_report"
-    assert captured["remote_supervisor"] is True
+    with pytest.raises(RuntimeError, match="Supervisor checks are no longer supported"):
+        module._run_hosted_supervisor_check(
+            conversation["id"],
+            "turn-remote-supervisor-path",
+            check_id="final_report",
+            checkpoint_label="Final report",
+            evidence={"result": "verified"},
+            runner=lambda *_args, **_kwargs: "unused",
+            remote=True,
+        )
 
 
 def test_manager_runtime_fallback_preserves_canonical_durable_identity():
@@ -3067,17 +3048,17 @@ class CollaborationDashboardTests(unittest.TestCase):
         ):
             self.assertFalse(module.requires_artifact_delivery(request), request)
 
-    def test_collaboration_execution_order_ends_with_single_reporter(self):
+    def test_collaboration_execution_order_starts_with_dispatcher(self):
         module = load_module()
 
         ordered = module.collaboration_execution_order(
             ["default", "dbb3-worker", "reviewer"]
         )
 
-        self.assertEqual(ordered, ["dbb3-worker", "default"])
+        self.assertEqual(ordered, ["default", "dbb3-worker"])
         self.assertEqual(module.collaboration_role("dbb3-worker"), "worker")
         self.assertEqual(module.collaboration_role("reviewer"), "retired")
-        self.assertEqual(module.collaboration_role("default"), "reporter")
+        self.assertEqual(module.collaboration_role("default"), "dispatcher")
 
     def test_ambiguous_intent_uses_model_classifier_and_keeps_rule_fallback(self):
         module = load_module()
@@ -3105,24 +3086,24 @@ class CollaborationDashboardTests(unittest.TestCase):
 
     def test_room_prompt_contains_recent_context_and_profile_role(self):
         module = load_module()
-        room = module.create_room_record("协作室", ["default", "reviewer"])
+        room = module.create_room_record("协作室", ["default", "dbb3-worker"])
         room["messages"] = [
             {"role": "user", "name": "用户", "content": "分析问题"},
             {"role": "assistant", "name": "default", "content": "初步分析"},
         ]
 
-        prompt = module.build_group_prompt(room, "reviewer", "请继续复核")
+        prompt = module.build_group_prompt(room, "dbb3-worker", "请继续执行")
 
         self.assertIn("你正在 Hermes 官方 WebUI 的多智能体群聊中", prompt)
-        self.assertIn("当前身份：reviewer", prompt)
+        self.assertIn("当前身份：dbb3-worker", prompt)
         self.assertIn("用户: 分析问题", prompt)
         self.assertIn("default: 初步分析", prompt)
-        self.assertIn("请继续复核", prompt)
+        self.assertIn("请继续执行", prompt)
 
-    def test_group_prompts_enforce_distinct_worker_reviewer_reporter_roles(self):
+    def test_group_prompts_define_only_dispatcher_and_worker_roles(self):
         module = load_module()
         room = module.create_room_record(
-            "交付协作", ["default", "dbb3-worker", "reviewer"]
+            "交付协作", ["default", "dbb3-worker"]
         )
 
         worker = module.build_group_prompt(
@@ -3131,13 +3112,7 @@ class CollaborationDashboardTests(unittest.TestCase):
             "检查服务并汇报",
             artifact_required=False,
         )
-        reviewer = module.build_group_prompt(
-            room,
-            "reviewer",
-            "检查服务并汇报",
-            artifact_required=False,
-        )
-        reporter = module.build_group_prompt(
+        dispatcher = module.build_group_prompt(
             room,
             "default",
             "检查服务并汇报",
@@ -3145,19 +3120,15 @@ class CollaborationDashboardTests(unittest.TestCase):
         )
 
         self.assertIn("你是执行者", worker)
-        self.assertIn("不要向用户做最终总结", worker)
+        self.assertIn("完成后把结果直接交给调度员", worker)
         self.assertIn("不得创建或上传交付文件", worker)
-        self.assertIn("你是审阅者", reviewer)
-        self.assertIn("不要重复执行者的工作", reviewer)
-        self.assertIn("不得创建或上传交付文件", reviewer)
-        self.assertIn("你是唯一最终汇报者", reporter)
-        self.assertIn("综合执行者和审阅者", reporter)
+        self.assertIn("你是唯一调度员", dispatcher)
+        self.assertIn("不设置监督者或审阅者角色", dispatcher)
 
     def test_progress_protocol_uses_adaptive_event_and_time_cadence(self):
         module = load_module()
 
         protocol = module.hosted_progress_protocol("Hermes Worker")
-        supervisor = module.supervisor_role_prompt()
 
         self.assertIn("不超过两句", protocol)
         self.assertIn("信息增量事件 + 静默时长", protocol)
@@ -3172,39 +3143,27 @@ class CollaborationDashboardTests(unittest.TestCase):
         self.assertIn("第一个安全边界", module.mention_priority_protocol("Hermes Worker"))
         self.assertIn("暂停新工具调用", module.mention_priority_protocol("Hermes Worker"))
         self.assertIn("写入持久计划", module.mention_priority_protocol("Hermes Worker"))
-        self.assertIn("检查调度员", supervisor)
-        self.assertIn("检查 Worker", supervisor)
-        self.assertIn("检查审阅员", supervisor)
-        self.assertIn("检查汇报员", supervisor)
-        self.assertIn("@准确成员名", supervisor)
-        self.assertIn("长时间沉默", supervisor)
-        self.assertIn("后续安全边界复核", supervisor)
+        self.assertNotIn("监督者", protocol)
+        self.assertNotIn("审阅者", protocol)
 
     def test_role_delivery_contracts_require_evidence_and_bounded_handoffs(self):
         module = load_module()
 
         manager = module.hosted_role_delivery_contract("Hermes 调度员")
         worker = module.hosted_role_delivery_contract("dbb3-worker")
-        reviewer = module.hosted_role_delivery_contract("Hermes 审阅员")
-        reporter = module.hosted_role_delivery_contract("Hermes 汇报员")
-        supervisor = module.hosted_role_delivery_contract("Hermes 监督者")
 
         self.assertIn("负责人、依赖和可验证验收标准", manager)
         self.assertIn("返工记录、产物路径与哈希", manager)
         self.assertIn("实际动作与证据绑定", worker)
         self.assertIn("尚未运行的测试必须标为未验证", worker)
-        self.assertIn("验收只有一条标准", reviewer)
-        self.assertIn("不得因格式、详略、风格、缺少测试或风险表述而退回", reviewer)
-        self.assertIn("不调用工具补洞", reporter)
-        self.assertIn("不得选择更乐观的版本", reporter)
-        self.assertIn("不等待任务结束才监督", supervisor)
-        self.assertIn("可验证的纠偏指令", supervisor)
+        self.assertIn("调度员的更新必须说明任务边界", manager)
+        self.assertNotIn("审阅员", manager)
 
-    def test_group_supervisor_has_bounded_role_and_precedes_execution(self):
+    def test_dispatcher_precedes_worker_execution(self):
         module = load_module()
         room = module.create_room_record(
-            "监督协作",
-            ["default", "dbb3-worker", "reviewer", "supervisor"],
+            "调度协作",
+            ["default", "dbb3-worker"],
         )
 
         prompt = module.build_group_prompt(room, "dbb3-worker", "检查执行边界")
@@ -3212,7 +3171,7 @@ class CollaborationDashboardTests(unittest.TestCase):
         self.assertEqual(module.collaboration_role("supervisor"), "retired")
         self.assertEqual(
             module.collaboration_execution_order(room["profiles"]),
-            ["dbb3-worker", "default"],
+            ["default", "dbb3-worker"],
         )
         self.assertIn("你是执行者", prompt)
 
@@ -3832,6 +3791,7 @@ class CollaborationDashboardTests(unittest.TestCase):
             ["cancelled", "cancelled"],
         )
 
+    @unittest.skip("supervisor role retired from hosted workflow")
     def test_supervisor_cache_is_bound_to_evidence_digest(self):
         module = load_module()
         conversation = module.create_single_conversation("default")
@@ -3864,6 +3824,7 @@ class CollaborationDashboardTests(unittest.TestCase):
             )
         self.assertEqual(len(calls), 2)
 
+    @unittest.skip("supervisor role retired from hosted workflow")
     def test_supervisor_cache_revalidates_a_preupgrade_contradictory_verdict(self):
         module = load_module()
         conversation = module.create_single_conversation("default")
@@ -3915,6 +3876,7 @@ class CollaborationDashboardTests(unittest.TestCase):
         self.assertEqual(persisted["verdict"], "pass")
         self.assertNotIn("没有通过", persisted["result"])
 
+    @unittest.skip("supervisor role retired from hosted workflow")
     def test_supervisor_cache_revalidates_without_artifact_witness(self):
         module = load_module()
         conversation = module.create_single_conversation("default")
@@ -3962,6 +3924,7 @@ class CollaborationDashboardTests(unittest.TestCase):
         )
         self.assertEqual(len(calls), 2)
 
+    @unittest.skip("supervisor role retired from hosted workflow")
     def test_supervisor_unknown_and_truncated_evidence_fail_closed(self):
         module = load_module()
         conversation = module.create_single_conversation("default")
@@ -4153,7 +4116,7 @@ class CollaborationDashboardTests(unittest.TestCase):
             "task_goal": "伪造目标",
             "plan": [],
             "worker_results": {"dbb3-worker": "伪造成功"},
-            "review_verdict": "PASS",
+            "validation_summary": "伪造验收",
             "rework_history": [],
             "artifacts": [],
             "failures": [],
@@ -4165,7 +4128,7 @@ class CollaborationDashboardTests(unittest.TestCase):
             task_goal="核对 DBB3 与 WSL 的真实部署",
             plan=plan,
             worker_results=workers,
-            review_verdict="REWORK",
+            validation_summary="服务器确定性校验未通过",
             rework_history=rework,
             artifacts=artifacts,
             failures=failures,
@@ -4174,7 +4137,7 @@ class CollaborationDashboardTests(unittest.TestCase):
         self.assertEqual(handoff["task_goal"], "核对 DBB3 与 WSL 的真实部署")
         self.assertEqual(handoff["plan"], plan["plan"])
         self.assertEqual(handoff["worker_results"], workers)
-        self.assertEqual(handoff["review_verdict"], "REWORK")
+        self.assertEqual(handoff["validation_summary"], "服务器确定性校验未通过")
         self.assertEqual(handoff["rework_history"], rework)
         self.assertEqual(handoff["artifacts"], artifacts)
         self.assertEqual(handoff["failures"], failures)
@@ -4185,7 +4148,7 @@ class CollaborationDashboardTests(unittest.TestCase):
                     "task_goal",
                     "plan",
                     "worker_results",
-                    "review_verdict",
+                    "validation_summary",
                     "rework_history",
                     "artifacts",
                     "failures",
@@ -5952,7 +5915,7 @@ class CollaborationDashboardTests(unittest.TestCase):
         self.assertIn("执行完成，服务已恢复", final_message["content"])
         self.assertIn("dbb3-worker", final_message["content"])
         self.assertEqual(run["status"], "completed")
-        self.assertEqual(run["supervisor_checks"], {})
+        self.assertNotIn("supervisor_checks", run)
         notification = run["notification"]
         self.assertEqual(notification["state"], "queued")
         self.assertEqual(notification["task_status"], "completed")
@@ -7603,7 +7566,7 @@ class CollaborationDashboardTests(unittest.TestCase):
         self.assertEqual(len(final_workers), 2)
         for message in final_workers:
             self.assertEqual(message["role"], "assistant")
-            self.assertEqual(message["handoff_to"], ["reporter"])
+            self.assertEqual(message["handoff_to"], ["dispatcher"])
             self.assertEqual(message["activity_count"], 1)
             self.assertEqual(message["activities"][0]["tool_name"], "terminal")
             self.assertEqual(message["activities"][0]["duration_ms"], 50)
@@ -7953,13 +7916,12 @@ class CollaborationDashboardTests(unittest.TestCase):
 
     def test_manager_plan_is_bounded_by_user_placement_constraints(self):
         module = load_module()
-        self.assertIn("dbb3-manager", module._REMOTE_RUN_PROFILES)
+        self.assertIn("hk-worker", module._REMOTE_RUN_PROFILES)
         result = module._normalize_manager_plan(
             json.dumps(
                 {
                     "difficulty": "high",
                     "workers": ["dbb3-worker", "pc-worker"],
-                    "reviewer_target": "pc",
                     "plan": [
                         {
                             "id": "inspect",
@@ -7976,7 +7938,7 @@ class CollaborationDashboardTests(unittest.TestCase):
         )
 
         self.assertEqual(result["workers"], ["dbb3-worker"])
-        self.assertEqual(result["reviewer_target"], "dbb3")
+        self.assertNotIn("reviewer_target", result)
         self.assertEqual(result["plan"][0]["assignee"], "dbb3-worker")
 
     def test_complex_production_workflow_uses_canonical_manager_and_server_reporter(self):
@@ -8184,10 +8146,7 @@ class CollaborationDashboardTests(unittest.TestCase):
 
         run = conversation["hosted_turns"]["turn-post-report-reject"]
         self.assertEqual(run["status"], "completed")
-        self.assertEqual(
-            run["supervisor_checks"],
-            {},
-        )
+        self.assertNotIn("supervisor_checks", run)
         self.assertIn("verified worker evidence", run["reporter_result"])
         self.assertTrue(
             any(
@@ -8404,6 +8363,7 @@ class CollaborationDashboardTests(unittest.TestCase):
         self.assertIn("方案方向偏离", display)
         self.assertIn("从头执行", display)
 
+    @unittest.skip("supervisor role retired from hosted workflow")
     def test_require_supervisor_pass_directional_fails_with_restart_reason(self):
         module = load_module()
         conversation, _state = self._companion_fixture(module)
@@ -8561,6 +8521,7 @@ class CollaborationDashboardTests(unittest.TestCase):
         self.assertIn("方向性疑点", text)
         self.assertIn("测试缺失", text)
 
+    @unittest.skip("companion supervisor retired from hosted workflow")
     def test_companion_intervention_appends_pending_steer(self):
         module = load_module()
         conversation, _state = self._companion_fixture(module)
@@ -8599,6 +8560,7 @@ class CollaborationDashboardTests(unittest.TestCase):
             )
         )
 
+    @unittest.skip("companion supervisor retired from hosted workflow")
     def test_companion_loop_runs_checks_and_raises_urgent_intervention(self):
         module = load_module()
         conversation, _state = self._companion_fixture(module)
@@ -8668,11 +8630,11 @@ class CollaborationDashboardTests(unittest.TestCase):
 
     def test_companion_stage_eligibility_covers_underscore_manager_stages(self):
         module = load_module()
-        self.assertTrue(module._hosted_companion_stage_eligible("worker:dbb3-worker"))
-        self.assertTrue(module._hosted_companion_stage_eligible("reviewer:rework:1"))
-        self.assertTrue(module._hosted_companion_stage_eligible("reporter:final"))
-        self.assertTrue(module._hosted_companion_stage_eligible("manager_planning"))
-        self.assertTrue(module._hosted_companion_stage_eligible("manager_handoff"))
+        self.assertFalse(module._hosted_companion_stage_eligible("worker:dbb3-worker"))
+        self.assertFalse(module._hosted_companion_stage_eligible("reviewer:rework:1"))
+        self.assertFalse(module._hosted_companion_stage_eligible("reporter:final"))
+        self.assertFalse(module._hosted_companion_stage_eligible("manager_planning"))
+        self.assertFalse(module._hosted_companion_stage_eligible("manager_handoff"))
         self.assertFalse(module._hosted_companion_stage_eligible("chat"))
         self.assertFalse(module._hosted_companion_stage_eligible("supervisor:plan_dispatch"))
 
@@ -8722,19 +8684,11 @@ class CollaborationDashboardTests(unittest.TestCase):
                 profile="dbb3-worker",
                 runner=lambda *_a, **_k: "",
             )
-            deadline = module.time.time() + 5.0
-            while module.time.time() < deadline:
-                if not handle["thread"].is_alive():
-                    break
-                module.time.sleep(0.05)
+            self.assertIsNone(handle)
         finally:
             module._HOSTED_COMPANION_POLL_SECONDS = original_poll
 
-        self.assertFalse(handle["thread"].is_alive())
-        self.assertNotIn(
-            ("turn-companion", "worker:dbb3-worker"),
-            module._HOSTED_COMPANION_REGISTRY,
-        )
+        self.assertEqual(module._HOSTED_COMPANION_REGISTRY, {})
 
     # --- Cross-account room membership (跨账号房间) -------------------------
 

@@ -15291,8 +15291,10 @@ def _start_hosted_companion(
     runner: Optional[Callable[..., str]],
     artifact_context: Optional[dict[str, str]] = None,
 ) -> Optional[dict[str, Any]]:
-    if runner is None:
-        return None
+    # The hosted workflow no longer has a companion supervisor model. Keep the
+    # symbol as a migration-safe no-op for callers that have not been upgraded
+    # yet; dispatcher/worker execution must never start a second model loop.
+    return None
     key = (str(turn_id), str(role_stage))
     with _HOSTED_COMPANION_REGISTRY_LOCK:
         existing = _HOSTED_COMPANION_REGISTRY.get(key)
@@ -16839,7 +16841,6 @@ def execute_hosted_workflow(
             manager_plan,
             stage="completed" if final_status == "completed" else "failed",
             worker_statuses=worker_statuses,
-            reporter_status=aggregator_status,
             final_status=final_status,
         )
     persisted_run = _persist_hosted_turn(
