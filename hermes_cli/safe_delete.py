@@ -142,6 +142,28 @@ def validate_deletion_root(path: Path, allowed_roots: Iterable[Path]) -> Path:
     )
 
 
+def _unlink_file(path: Path) -> None:
+    """Unlink *path*, clearing the Windows read-only attribute first.
+
+    Git for Windows marks loose objects and pack files read-only
+    (``st_mode`` 0o444 / ``FILE_ATTRIBUTE_READONLY``) to emulate POSIX object
+    protection; on Windows that attribute blocks ``unlink`` with WinError 5
+    even when the parent directory is writable, so deleting a git-cloned
+    plugin tree (uninstall, install rollback) would fail. Clearing the
+    attribute first is a no-op on POSIX, where a read-only file is already
+    removable when its directory is writable.
+    """
+    try:
+        path.unlink()
+    except PermissionError:
+        if sys.platform != "win32":
+            raise
+        # Best effort: only the attribute is under our control; other causes
+        # (open handles, ACLs) must surface as the original error.
+        os.chmod(path, stat.S_IWRITE)
+        path.unlink()
+
+
 def _rmtree_bounded(
     root: Path,
     onerror: DeleteErrorHandler | None,
@@ -163,7 +185,7 @@ def _rmtree_bounded(
         if stat.S_ISDIR(mode):
             _rmtree_bounded(path, onerror, boundary_root=boundary_root)
         else:
-            path.unlink()
+            _unlink_file(path)
 
     if boundary_root is not None:
         _assert_tree_path_bounded(root, boundary_root)
@@ -178,7 +200,7 @@ def _rmtree_bounded(
     if boundary_root is not None:
         _assert_tree_path_bounded(root, boundary_root)
     if not stat.S_ISDIR(mode):
-        root.unlink()
+        _unlink_file(root)
         return
 
     before_scan = _path_identity(root)

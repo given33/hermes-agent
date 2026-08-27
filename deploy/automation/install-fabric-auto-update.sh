@@ -5,7 +5,7 @@ umask 077
 die() { printf 'install-fabric-auto-update: %s\n' "$*" >&2; exit 1; }
 [[ "$(id -u)" == 0 ]] || die "must run as root"
 role="${1:-}"
-case "${role}" in dbb3|wsl) ;; *) die "role must be dbb3 or wsl" ;; esac
+case "${role}" in dbb3|wsl|hk) ;; *) die "role must be dbb3, wsl, or hk" ;; esac
 repo="${2:-$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)}"
 for relative in \
   deploy/automation/update-fabric-node.sh \

@@ -48,6 +48,20 @@ def test_worker_channel_rejects_manager_and_stale_lease():
     assert connection.node_id == "pc-worker"
 
 
+def test_worker_channel_accepts_hk_worker_with_its_own_node_identity():
+    registry = WorkerChannelRegistry()
+    connection = registry.connect(
+        "hk-worker",
+        connection_generation="hk-generation-1",
+        connector_id="hk-primary",
+        expected_connector_id="hk-primary",
+    )
+    queued = registry.publish("hk-worker", "worker.queued", payload={"id": "hk-1"})
+    assert queued["node_id"] == "hk-worker"
+    assert registry.replay("hk-worker", 0) == [queued]
+    assert registry.disconnect("hk-worker", connection.lease_id)
+
+
 def test_worker_channel_rejects_connector_node_mismatch():
     registry = WorkerChannelRegistry()
     try:

@@ -2209,7 +2209,16 @@ class ShellFileOperations(FileOperations):
         # rejection above guarantees this cannot raise; the try/except is
         # defense for future callers that bypass it.
         try:
-            content_bytes = content.encode("utf-8", "surrogateescape")
+            # ``subprocess.run(text=True)`` on Windows translates LF written
+            # to the child stdin into CRLF. Hash the bytes that the backend
+            # actually receives, otherwise a valid write is reported as
+            # corrupt even though the target contains the intended text.
+            transmitted_content = (
+                _normalize_line_endings(content, "\r\n")
+                if os.name == "nt"
+                else content
+            )
+            content_bytes = transmitted_content.encode("utf-8", "surrogateescape")
         except UnicodeEncodeError as exc:
             return WriteResult(
                 error=(
@@ -3201,14 +3210,28 @@ class ShellFileOperations(FileOperations):
         limit: int,
         offset: int,
     ) -> SearchResult:
-        """Cross-platform fallback matching POSIX find's visible-file policy."""
+        """Cross-platform fallback matching POSIX find's visible-file policy.
+
+        POSIX find's behavior: with a normal root it applies
+        ``-not -path '*/.*'`` (any path component starting with ``.`` is
+        invisible); with an explicit hidden root the ancestry exemption
+        starts AT the root, so hidden *descendants* are filtered by the
+        post-walk ``rel_parts`` check instead. ``os.walk`` starts at the
+        root and never visits its ancestors, so the same per-component
+        filter below the root is equivalent in both cases — hence the
+        ``has_hidden_path_ancestor`` argument only documents intent and the
+        pruning is unconditional.
+        """
 
         all_files: list[tuple[float, str]] = []
         for dirpath, dirnames, filenames in os.walk(root, followlinks=False):
             current = Path(dirpath)
-            if not has_hidden_path_ancestor:
-                dirnames[:] = [name for name in dirnames if not name.startswith(".")]
+            # Hidden subdirectories: prune (never descend). Hidden
+            # filenames: skip below. Both mirror ``-not -path '*/.*'``.
+            dirnames[:] = [name for name in dirnames if not name.startswith(".")]
             for filename in filenames:
+                if filename.startswith("."):
+                    continue
                 if not fnmatch.fnmatch(filename, pattern):
                     continue
                 file_path = current / filename

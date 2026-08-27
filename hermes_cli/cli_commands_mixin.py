@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import sys
 import threading
 import time
@@ -38,6 +39,45 @@ from hermes_cli.browser_connect import (
     local_port_in_use,
     manual_chrome_debug_command,
 )
+
+
+def _normalize_git_worktree_list_line(line: str) -> str:
+    """Convert the path token of a ``git worktree list`` line to the native
+    form the rest of the CLI displays.
+
+    Native Windows git emits drive-letter paths with forward slashes
+    (``C:/Users/...``), which don't match what ``os.getcwd()`` /
+    ``str(Path)`` show (``C:\\Users\\...``) and don't round-trip into the
+    same path the rest of the session uses; Git Bash / WSL-mounted repos
+    can additionally surface ``/c/Users/...``. No-op on POSIX, where git
+    already emits native separators, and no-op when the line carries no
+    path.
+    """
+    if sys.platform != "win32" or not line:
+        return line
+    stripped = line.strip()
+    if not stripped:
+        return line
+    quoted = stripped.startswith('"')
+    body = stripped[1:-1] if quoted else stripped
+    tokens = body.split(None, 1)
+    if not tokens:
+        return line
+    path = tokens[0]
+    normalized = path
+    m = re.match(r"^([A-Za-z]):/(.*)$", path)
+    if m:
+        normalized = f"{m.group(1)}:\\{m.group(2).replace('/', chr(92))}"
+    else:
+        m = re.match(r"^/([A-Za-z])/(.*)$", path)
+        if m:
+            normalized = (
+                f"{m.group(1).upper()}:\\{m.group(2).replace('/', chr(92))}"
+            )
+    if normalized == path:
+        return line
+    rebuilt = normalized + (f" {tokens[1]}" if len(tokens) > 1 else "")
+    return f'"{rebuilt}"' if quoted else rebuilt
 
 
 class CLICommandsMixin:
@@ -1339,7 +1379,7 @@ class CLICommandsMixin:
                 out = ""
             if out:
                 for line in out.splitlines():
-                    print(f"  {line}")
+                    print(f"  {_normalize_git_worktree_list_line(line)}")
             else:
                 print("  Could not list worktrees.")
             return
@@ -2802,38 +2842,6 @@ class CLICommandsMixin:
             f"  ⚗ Reviewing this conversation in the background{tail} — "
             f"any memory/skill updates will be reported when done."
         )
-
-    def _handle_review_command(self, cmd: str) -> None:
-        """Dispatch /review — spawn an independent reviewer subagent.
-
-        Snapshots the last N chat messages, wraps them (plus any argument
-        text as extra instructions) in a reviewer briefing, and dispatches a
-        full-privilege background subagent via the async delegation rail.
-        The review re-enters this session as a normal async-delegation
-        completion, addressed to the primary agent.
-        """
-        from cli import _DIM, _RST, _cprint
-
-        parts = (cmd or "").strip().split(None, 1)
-        prompt = parts[1].strip() if len(parts) > 1 else ""
-
-        agent = getattr(self, "agent", None)
-        if agent is None:
-            _cprint(f"  {_DIM}Nothing to review yet — send a message first.{_RST}")
-            return
-
-        snapshot = list(getattr(self, "conversation_history", None) or [])
-        try:
-            from agent.review_engine import format_dispatch_note, start_review
-
-            result = start_review(agent, snapshot, prompt)
-        except ValueError as exc:
-            _cprint(f"  {_DIM}{exc}{_RST}")
-            return
-        except Exception as exc:
-            _cprint(f"  /review failed to start: {exc}")
-            return
-        _cprint(f"  {format_dispatch_note(result, prompt)}")
 
     def _handle_goal_command(self, cmd: str) -> None:
         """Dispatch /goal subcommands: set / draft / show / gate / status / pause / resume / clear."""

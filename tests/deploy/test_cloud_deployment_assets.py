@@ -105,7 +105,8 @@ def test_upstream_sync_creates_a_reviewed_pr_without_direct_merge_or_deploy():
     workflow = UPSTREAM_WORKFLOW.read_text(encoding="utf-8")
     assert "cron: '17 18 * * *'" in workflow
     assert "https://github.com/NousResearch/hermes-agent.git" in workflow
-    assert 'branch="upstream-sync/$tag"' in workflow
+    assert 'branch="upstream-sync/main"' in workflow
+    assert "refs/heads/main:refs/remotes/upstream/main" in workflow
     assert "scripts/upstream_change_report.py" in workflow
     assert "tests/plugins/test_collaboration_dashboard.py" in workflow
     assert "tests/deploy/test_cloud_deployment_assets.py" in workflow
@@ -122,6 +123,8 @@ def test_deployment_shell_scripts_have_valid_syntax():
         return
     for path in (
         DBB3 / "install-dbb3-cloud-connector-user.sh",
+        ROOT / "deploy" / "hk" / "install-hk-cloud-connector-user.sh",
+        ROOT / "deploy" / "hk" / "install-hk-worker.sh",
         PC / "install-pc-cloud-connector-user.sh",
         PC / "run-pc-cloud-connector.sh",
         PUBLIC / "install-collaboration-backend.sh",
@@ -208,6 +211,8 @@ def test_three_endpoint_updates_follow_only_a_committed_main_release():
         "deploy/dbb3/dbb3-cloud-connector.service",
         "deploy/pc/install-pc-cloud-connector-user.sh",
         "deploy/pc/pc-cloud-connector.service",
+        "deploy/hk/install-hk-cloud-connector-user.sh",
+        "deploy/hk/hk-cloud-connector.service",
         "hermes_cli/__init__.py",
         "hermes_runtime",
         "hermes_services",
@@ -221,6 +226,8 @@ def test_three_endpoint_updates_follow_only_a_committed_main_release():
         in updater
     )
     assert 'bash "${stage}/deploy/recovery/install-wsl-managed-installation.sh"' in updater
+    assert 'bash "${preflight_root}/deploy/hk/install-hk-cloud-connector-user.sh"' in updater
+    assert 'case "${role}" in dbb3|wsl|hk)' in updater
     assert '"hermes_cli/managed_node_recovery_service.py"' in updater
     assert "hermes.fabric-release.v1" in updater
     updater_refresh = updater.index(
@@ -248,6 +255,7 @@ def test_three_endpoint_updates_follow_only_a_committed_main_release():
     assert "Persistent=true" in timer
     assert "ProtectSystem=strict" in service
     assert "TimeoutStartSec=5min" in service
+    assert "/opt/hk-team" in service
     assert "TimeoutStopSec=30s" in service
     assert "KillMode=control-group" in service
     assert 'git_network_timeout="${HERMES_FABRIC_GIT_TIMEOUT_SECONDS:-90}"' in updater

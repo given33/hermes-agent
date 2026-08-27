@@ -168,6 +168,7 @@ runtime_service_assets=(
   "hermes_services/http_policy.py"
   "hermes_services/internal_hooks.py"
   "hermes_services/jsonrpc.py"
+  "hermes_services/latency_trace.py"
   "hermes_services/low_latency_protocol.py"
   "hermes_services/middleware.py"
   "hermes_services/resource_catalog.py"

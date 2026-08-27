@@ -699,16 +699,16 @@
       default: "Hermes",
       "dbb3-worker": "DBB3 执行器",
       "pc-worker": "本地执行器",
-      reviewer: "Hermes 审阅器",
+      "hk-worker": "HK 执行器",
     };
     return names[profile] || profile || "Hermes";
   }
 
   function profileAvatar(profile, role) {
     if (role === "user") return "你";
-    if (profile === "reviewer") return "R";
     if (profile === "pc-worker") return "PC";
     if (profile === "dbb3-worker") return "DB";
+    if (profile === "hk-worker") return "HK";
     return "H";
   }
 
@@ -770,8 +770,7 @@
       decomposing: "正在创建并拆分根任务",
       dispatching: "正在匹配设备能力并派发",
       worker: "执行端正在处理任务",
-      reviewer: "审阅端正在验收结果",
-      reporter: "Hermes 正在整理最终汇报",
+      aggregating: "Hermes 正在汇总 worker 结果",
     };
     for (const run of Object.values(conversation?.hosted_turns || {})) {
       const runMode = String(
@@ -1363,13 +1362,12 @@
       {
         dispatch: "任务调度",
         worker: "任务执行",
-        reviewer: "结果审阅",
-        reporter: "最终汇报",
+        aggregating: "汇总结果",
         chat: "Hermes Agent",
       }[roleStage] ||
       "Hermes Agent";
     const collapseActivities = !isUser && activities.length > 0;
-    const useOfficialAvatar = !isUser && !["worker", "reviewer"].includes(roleStage);
+      const useOfficialAvatar = !isUser && roleStage !== "worker";
     const displayName = isUser ? "你" : profileDisplayName(message.name);
     const runtimeModel = [
       message.meta?.actual_provider,
@@ -2663,7 +2661,7 @@
           ...message,
           name: isWork ? "DBB3 服务端托管中" : "Hermes 服务端回复中",
           content: isWork
-            ? "执行、审阅和最终汇报将在服务器继续完成。"
+            ? "执行和结果汇总将在服务器继续完成。"
             : "回复将在服务器继续完成。",
           meta: {
             ...(message.meta || {}),

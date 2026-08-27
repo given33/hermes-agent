@@ -515,7 +515,7 @@ class TestInstall:
         # load_config resolves it; config.yaml itself stays secret-free.
         from hermes_cli.config import get_config_path
 
-        raw = get_config_path().read_text()
+        raw = get_config_path().read_text(encoding="utf-8")
         assert "${MCP_DEMO_API_KEY}" in raw
         assert "secret-val" not in raw
 

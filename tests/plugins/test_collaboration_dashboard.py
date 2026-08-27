@@ -962,22 +962,20 @@ class CollaborationDashboardTests(unittest.TestCase):
             live=True,
             registered_tools=("mcp__ios_location__current_location",),
         )
-
-        with patch(
-            "tools.mcp_tool.discover_mcp_tools",
-            side_effect=lambda **kwargs: calls.append(
+        backend = SimpleNamespace(
+            get_mcp_availability=lambda: [live],
+            select_mcp_servers_for_capabilities=lambda _config, _hints: {"ios-location"},
+            discover_mcp_tools=lambda **kwargs: calls.append(
                 ("discover", kwargs["capability_hints"])
             ) or ["current_location"],
-        ), patch(
-            "tools.mcp_tool.get_mcp_availability",
-            return_value=[live],
-        ), patch(
-            "hermes_cli.tools_config._get_platform_tools",
-            side_effect=lambda current, platform, **kwargs: (
+            _get_platform_tools=lambda current, platform, **kwargs: (
                 calls.append(("resolve", current, platform, kwargs))
                 or {"file", "ios-location", "ios-motion"}
             ),
-        ):
+            enabled_mcp_server_names=lambda _config: {"ios-location", "ios-motion"},
+        )
+
+        with patch.object(module, "_backend_api", return_value=backend):
             resolved = module._discover_profile_toolsets(config, ["ios.location"])
 
         self.assertEqual(resolved, ["file", "ios-location", "todo"])
@@ -2912,15 +2910,16 @@ class CollaborationDashboardTests(unittest.TestCase):
             "不要在 DBB3 执行，也不要在本地电脑或 WSL 执行。",
         ):
             workers, constraints = module._constrained_worker_profiles(request)
-            self.assertEqual(workers, [], request)
+            self.assertEqual(workers, ["hk-worker"], request)
             self.assertEqual(set(constraints["excluded"]), {"dbb3", "pc"})
-            with self.assertRaises(module.HTTPException) as raised:
-                module._hosted_route_parameters(
-                    route_metadata={"mode": "work"},
-                    content=request,
-                    requested_mode="work",
-                )
-            self.assertEqual(raised.exception.status_code, 422)
+            route, mode, profiles, _artifact_required = module._hosted_route_parameters(
+                route_metadata={"mode": "work"},
+                content=request,
+                requested_mode="work",
+            )
+            self.assertEqual(route["mode"], "work")
+            self.assertEqual(mode, "work")
+            self.assertEqual(profiles, ["default", "hk-worker"])
 
     def test_explicit_worker_constraint_overrides_model_profiles(self):
         module = load_module()
@@ -2953,6 +2952,55 @@ class CollaborationDashboardTests(unittest.TestCase):
             ["default", "dbb3-worker"],
         )
         self.assertEqual(dbb3_only["targets"], ["dbb3"])
+
+    def test_hk_worker_is_a_distinct_target_and_connector(self):
+        module = load_module()
+
+        routed = module._rule_based_user_intent(
+            "Deploy and verify this service only on the Hong Kong server."
+        )
+        self.assertEqual(routed["profiles"], ["default", "hk-worker"])
+        self.assertEqual(routed["targets"], ["hk"])
+        self.assertEqual(module._connector_for_profile("hk-worker"), "hk-primary")
+        self.assertEqual(module._connector_for_profile("HK-WORKER"), "hk-primary")
+        self.assertEqual(module._HOSTED_MEMBER_NODES["hk-worker"], "hk")
+        self.assertEqual(
+            module._artifact_producer_profiles(
+                {"artifact": {"producer_targets": ["hk"]}},
+                ["default", "hk-worker"],
+                required=True,
+            ),
+            ["hk-worker"],
+        )
+
+    def test_workflow_has_only_dispatcher_and_workers(self):
+        module = load_module()
+
+        self.assertEqual(
+            module.collaboration_execution_order(
+                ["default", "dbb3-worker", "pc-worker", "hk-worker", "reviewer", "supervisor"]
+            ),
+            ["default", "dbb3-worker", "pc-worker", "hk-worker"],
+        )
+        self.assertEqual(module.collaboration_role("default"), "dispatcher")
+        self.assertEqual(module.collaboration_role("reviewer"), "retired")
+        self.assertEqual(module.collaboration_role("supervisor"), "retired")
+        node_ids = {
+            node.node_id
+            for node in module.build_hosted_turn_plan(
+                turn_id="role-model",
+                worker_profiles=["dbb3-worker", "pc-worker", "hk-worker"],
+                artifact_required=False,
+            ).nodes
+        }
+        self.assertNotIn("report", node_ids)
+        self.assertNotIn("review", " ".join(node_ids))
+        with self.assertRaises(ValueError):
+            module.build_group_prompt(
+                module.create_room_record("roles", ["default"]),
+                "reviewer",
+                "continue",
+            )
 
     def test_hosted_route_reapplies_worker_target_constraint(self):
         module = load_module()
@@ -7619,14 +7667,17 @@ class CollaborationDashboardTests(unittest.TestCase):
         run = conversation["hosted_turns"]["turn-participants"]
         self.assertEqual(run["status"], "completed")
         participants = {member["id"]: member for member in run["participants"]}
-        self.assertEqual(participants["hermes-manager"]["role"], "manager")
+        self.assertEqual(participants["hermes-manager"]["role"], "dispatcher")
         self.assertEqual(participants["hermes-manager"]["display_name"], "Hermes 调度员")
         self.assertEqual(participants["hermes-manager"]["node"], "server")
         self.assertEqual(participants["dbb3-worker"]["role"], "worker")
         self.assertEqual(participants["dbb3-worker"]["node"], "dbb3")
         self.assertEqual(participants["pc-worker"]["role"], "worker")
         self.assertEqual(participants["pc-worker"]["node"], "wsl")
-        self.assertEqual(participants["default"]["role"], "reporter")
+        self.assertEqual(
+            sum(member["role"] == "dispatcher" for member in run["participants"]),
+            1,
+        )
         for member in run["participants"]:
             self.assertTrue(member["avatar_seed"])
             self.assertTrue(member["joined_at"])

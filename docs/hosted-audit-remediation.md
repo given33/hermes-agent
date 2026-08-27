@@ -3,7 +3,8 @@
 本文记录针对服务器托管服务审计表（P0~P3）的修复与落地方式。代码修改集中在：
 
 - `plugins/collaboration/dashboard/plugin_api.py` — 托管 API、连接器端点、SSE、审计、指标
-- `deploy/dbb3/dbb3_cloud_connector.py` — DBB3/PC 连接器
+- `deploy/dbb3/dbb3_cloud_connector.py` — DBB3/PC/HK 共享连接器实现
+- `deploy/hk/` — HK worker 的独立 profile、skills、凭据、状态和自动部署
 - `hermes_cli/dashboard_auth/registry.py` — 移动端静态 key 降级
 - `hermes_cli/dashboard_auth/audit.py` — 连接器操作审计事件
 - `scripts/backup_hosted_state.py` — 托管状态备份脚本
@@ -22,7 +23,7 @@
 
 | # | 差距 | 修复 |
 |---|------|------|
-| 5 | 上行轮询延迟 | 连接器默认轮询间隔降到 `0.5s`，并继续使用 SSE `run.created/run.terminal/run.steer` 即时唤醒；任务多时延迟从 2s 降到亚秒级。 |
+| 5 | 上行传输延迟 | worker 使用认证 WebSocket `/api/plugins/collaboration/worker/ws` 传输进度和结果；连接器/队列保留 SSE 与轮询作为断线重连和持久化重放兜底。 |
 | 6 | SSE 无事件重放 | `/connector/stream` 为每个事件分配单调 `id` 并保留最近 200 条历史；连接器重连时发送 `Last-Event-ID`，服务端重放断线期间事件。 |
 | 7 | 租约无独立续期 | 连接器新增 `start_heartbeat()`，每 30s 对活跃远程任务发送 lightweight status，避免 >90s 无上报导致租约过期。可用 `HERMES_CONNECTOR_HEARTBEAT_SECONDS` 调整。 |
 | 8 | artifact 上传无断点续传 | 连接器上传前先拉取该 run 已有附件，若 `sha256` 已存在则标记去重并跳过整包上传；服务端仍校验 SHA-256 与大小上限。 |
@@ -48,16 +49,23 @@
 
 官方 relay 契约已开源在 `docs/relay-connector-contract.md`，`gateway/relay/` 全套服务端可用。若托管 agent 需要接入 Telegram/Discord，可将 `GATEWAY_RELAY_URL` 指向按契约实现的 connector 服务端，或直接使用官方 gateway relay 的 enroll + 自有 IdP 流程，避免自研消息桥。
 
+### 16. Hosted workflow role boundary
+
+托管协作现在只有一个服务器本地调度员和三个独立 worker lane：DBB3、PC/WSL、HK。
+监督者、审阅者和汇报者不再创建模型回合；调度员拆分任务，worker 直接提交结果和证据，服务器只执行确定性状态校验与结果聚合。旧状态中的相关字段会在加载时结构化迁移并删除，普通用户文本不会被关键词扫描。
+
 ## 验证
 
-已运行并通过：
+本次同步与角色重构已运行并通过：
 
 ```bash
 .venv/Scripts/python.exe -m pytest tests/deploy/test_dbb3_connector_session_cache.py -q
 .venv/Scripts/python.exe -m pytest tests/plugins/test_collaboration_cloud_files.py -q
-.venv/Scripts/python.exe -m pytest tests/plugins/test_collaboration_dashboard.py -q
-.venv/Scripts/python.exe -m pytest tests/plugins/test_collaboration_hosted_event_stream.py -q
-.venv/Scripts/python.exe -m pytest tests/hermes_cli/dashboard_auth/test_mobile_api_auth.py -q
+uv run pytest -q tests/plugins/test_collaboration_dashboard.py::CollaborationDashboardTests::test_workflow_has_only_dispatcher_and_workers
+uv run pytest -q tests/plugins/test_collaboration_dashboard.py::CollaborationDashboardTests::test_hk_worker_is_a_distinct_target_and_connector
+uv run pytest -q tests/hermes_services/test_worker_channel.py tests/hermes_runtime/test_harness_runtime_primitives.py
+uv run pytest -q tests/deploy/test_cloud_deployment_assets.py
+uv run ruff check hermes_runtime hermes_services plugins/collaboration/dashboard hermes_cli tools
 ```
 
 部署后建议：

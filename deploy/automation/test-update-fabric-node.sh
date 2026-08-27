@@ -13,6 +13,7 @@ fake_bin="${work}/bin"
 archive="${work}/archive"
 mkdir -p "${fake_bin}" "${archive}/deploy/automation" \
   "${archive}/deploy/dbb3" "${archive}/deploy/pc" \
+  "${archive}/deploy/hk/profile" \
   "${archive}/deploy/recovery" "${archive}/hermes_cli" \
   "${archive}/hermes_runtime" "${archive}/hermes_services"
 
@@ -86,6 +87,10 @@ done
 printf '# connector source\n' >"${archive}/deploy/dbb3/dbb3_cloud_connector.py"
 printf '# connector unit\n' >"${archive}/deploy/dbb3/dbb3-cloud-connector.service"
 printf '# connector unit\n' >"${archive}/deploy/pc/pc-cloud-connector.service"
+printf '# connector unit\n' >"${archive}/deploy/hk/hk-cloud-connector.service"
+printf '#!/usr/bin/env bash\nexec bash "$(dirname "${BASH_SOURCE[0]}")/../dbb3/install-dbb3-cloud-connector-user.sh" ignored "${1:-}"\n' >"${archive}/deploy/hk/install-hk-cloud-connector-user.sh"
+printf 'profile: hk-worker\n' >"${archive}/deploy/hk/profile/config.yaml.example"
+printf '# HK worker\n' >"${archive}/deploy/hk/profile/SOUL.md"
 for asset in hermes-managed-installation-receiver.service \
   hermes-wsl-managed-installation-receiver.service \
   hermes-wsl-managed-installation-tunnel.service; do
@@ -149,6 +154,7 @@ exec bash "$(dirname "${BASH_SOURCE[0]}")/install-dbb3-managed-installation-rece
 SH
 chmod 0755 "${archive}/deploy/dbb3/install-dbb3-cloud-connector-user.sh" \
   "${archive}/deploy/pc/install-pc-cloud-connector-user.sh" \
+  "${archive}/deploy/hk/install-hk-cloud-connector-user.sh" \
   "${archive}/deploy/recovery/install-dbb3-managed-installation-receiver.sh" \
   "${archive}/deploy/recovery/install-wsl-managed-installation.sh"
 
@@ -200,6 +206,7 @@ run_case() {
   HERMES_CLOUD_TOKEN_FILE="${root}/cloud.token" \
   HERMES_DBB3_AGENT_ROOT="${root}/runtime" \
   HERMES_WSL_AGENT_ROOT="${root}/runtime" \
+  HERMES_HK_AGENT_ROOT="${root}/runtime" \
   HERMES_WSL_INSTALLATION_TOKEN_FILE="${root}/installation.token" \
   HERMES_WSL_INSTALLATION_KEY_FILE="${root}/home/.ssh/aliyun_hermes_ed25519" \
   HERMES_FABRIC_AUTOMATION_SCRIPT_TARGET="${root}/automation/update-fabric-node.sh" \
@@ -226,7 +233,9 @@ run_case() {
   if [[ -z "${failpoint}" ]]; then
     [[ "${status}" == 0 ]]
     grep -Fxq 'connector install' "${root}/components.log"
-    grep -Fxq 'receiver install' "${root}/components.log"
+    if [[ "${role}" != hk ]]; then
+      grep -Fxq 'receiver install' "${root}/components.log"
+    fi
     python3 - "${root}/state/${role}/release.json" \
       "${role}" "${release_commit}" "${release_version}" <<'PY'
 import json, sys
@@ -245,7 +254,9 @@ PY
     [[ "${status}" != 0 ]]
     [[ "$(cat "${root}/connector.state")" == old ]]
     [[ "$(cat "${root}/receiver.state")" == old ]]
-    grep -Fxq 'receiver rollback' "${root}/components.log"
+    if [[ "${role}" != hk ]]; then
+      grep -Fxq 'receiver rollback' "${root}/components.log"
+    fi
     grep -Fxq 'connector rollback' "${root}/components.log"
     grep -Fq 'RELEASE = "old"' "${root}/runtime/hermes_cli/managed_installations.py"
     grep -Fq 'RELEASE = "old"' "${root}/runtime/hermes_runtime/config.py"
@@ -263,6 +274,7 @@ PY
 
 run_case dbb3
 run_case wsl
+run_case hk
 run_case dbb3 after-receiver
 run_case dbb3 after-automation
 printf 'fabric updater transaction harness passed\n'

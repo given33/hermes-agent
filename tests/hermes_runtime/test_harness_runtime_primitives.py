@@ -47,14 +47,14 @@ def test_tool_execution_state_machine_rejects_terminal_reuse():
         envelope.transition("completed")
 
 
-def test_role_policy_keeps_legacy_tools_but_hides_explicit_sensitive_capabilities():
+def test_role_policy_keeps_dispatcher_worker_tools_and_hides_sensitive_capabilities():
     entries = [
         {"name": "read_file"},
         {"name": "execute_code", "capability_tags": {"process"}, "allowed_roles": {"dispatcher", "worker"}},
         {"name": "send_email", "capability_tags": {"external_emit"}},
     ]
-    assert "read_file" in filter_tools_for_role(entries, "reporter")
-    assert "execute_code" not in filter_tools_for_role(entries, "reviewer")
+    assert "read_file" in filter_tools_for_role(entries, "dispatcher")
+    assert "execute_code" in filter_tools_for_role(entries, "worker")
     assert "send_email" not in filter_tools_for_role(entries, "worker")
     assert role_allows("dispatcher", {"process"})
 
@@ -65,7 +65,7 @@ def test_role_policy_is_rechecked_at_dispatch_boundary(monkeypatch):
     monkeypatch.setattr(model_tools.registry, "get_entry", lambda name: object())
     monkeypatch.setattr(model_tools.registry, "get_tool_names_for_role", lambda role, names: set())
     monkeypatch.setattr(model_tools.registry, "dispatch", lambda *args, **kwargs: pytest.fail("hidden tool dispatched"))
-    result = model_tools.handle_function_call("hidden_tool", {}, tool_role="reporter")
+    result = model_tools.handle_function_call("hidden_tool", {}, tool_role="worker")
     assert "not available for role" in result
 
 
@@ -93,12 +93,12 @@ def test_dependency_graph_rejects_cycles_and_returns_ready_nodes():
 
 def test_mailbox_is_idempotent_and_generation_bound():
     messages: list[dict] = []
-    message = MailboxMessage("worker", "reviewer", {"artifact": "x"}, account_generation="g1")
+    message = MailboxMessage("worker", "dispatcher", {"artifact": "x"}, account_generation="g1")
     first = append_mailbox(messages, message)
     second = append_mailbox(messages, message)
     assert first == second
-    assert len(read_mailbox(messages, "reviewer", "g1")) == 1
-    assert read_mailbox(messages, "reviewer", "g2") == []
+    assert len(read_mailbox(messages, "dispatcher", "g1")) == 1
+    assert read_mailbox(messages, "dispatcher", "g2") == []
 
 
 def test_session_trace_requires_exact_workspace_and_generation_boundary():
@@ -134,14 +134,14 @@ def test_registry_exposes_capability_contract_and_fingerprint_changes():
     schema = {"name": "demo", "description": "demo", "parameters": {"type": "object"}}
     registry.register(
         "demo", "demo", schema, lambda args, **kwargs: "ok",
-        capability_tags={"read_fs"}, allowed_roles={"reviewer"},
+        capability_tags={"read_fs"}, allowed_roles={"dispatcher"},
     )
-    assert registry.get_tool_names_for_role("reviewer") == {"demo"}
-    assert registry.get_tool_names_for_role("reporter") == set()
+    assert registry.get_tool_names_for_role("dispatcher") == {"demo"}
+    assert registry.get_tool_names_for_role("worker") == set()
     assert registry.get_capability_metadata({"demo"})["demo"]["capability_tags"] == ["read_fs"]
     before = registry.registration_fingerprint("demo")
     registry.register(
         "demo", "demo", schema, lambda args, **kwargs: "ok",
-        override=True, capability_tags={"write_fs"}, allowed_roles={"reviewer"},
+        override=True, capability_tags={"write_fs"}, allowed_roles={"dispatcher"},
     )
     assert registry.registration_fingerprint("demo") != before

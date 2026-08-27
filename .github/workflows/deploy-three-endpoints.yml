@@ -1,4 +1,4 @@
-name: Deploy three Hermes endpoints
+name: Deploy Hermes endpoints
 
 on:
   push:
@@ -23,7 +23,7 @@ permissions:
   actions: read
 
 concurrency:
-  group: hermes-three-endpoint-production
+  group: hermes-endpoint-production
   cancel-in-progress: false
 
 jobs:
@@ -424,3 +424,56 @@ jobs:
           watch_release "${run_id}" unsigned
           echo "Observing iOS production EAS run ${production_run_id}"
           watch_release "${production_run_id}" production
+
+  deploy-hk-worker:
+    name: Deploy HK worker and enable GitHub auto-update
+    needs: deploy-public
+    # The production environment enables this only after the HK host, pinned
+    # SSH key, and /etc/hk-team/cloud_connector_token are provisioned.
+    if: needs.deploy-public.result == 'success' && vars.HERMES_HK_ENABLED == '1'
+    runs-on: ubuntu-latest
+    timeout-minutes: 35
+    environment: production
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+      - name: Configure pinned HK deployment SSH identity
+        env:
+          DEPLOY_KEY_B64: ${{ secrets.HERMES_HK_SSH_KEY_B64 }}
+          KNOWN_HOSTS: ${{ secrets.HERMES_HK_KNOWN_HOSTS }}
+        run: |
+          set -euo pipefail
+          test -n "$DEPLOY_KEY_B64"
+          test -n "$KNOWN_HOSTS"
+          install -d -m 0700 "$RUNNER_TEMP/hk-ssh"
+          printf '%s' "$DEPLOY_KEY_B64" | base64 --decode >"$RUNNER_TEMP/hk-ssh/id_ed25519"
+          printf '%s\n' "$KNOWN_HOSTS" >"$RUNNER_TEMP/hk-ssh/known_hosts"
+          chmod 0600 "$RUNNER_TEMP/hk-ssh/id_ed25519" "$RUNNER_TEMP/hk-ssh/known_hosts"
+          ssh-keygen -y -f "$RUNNER_TEMP/hk-ssh/id_ed25519" >/dev/null
+      - name: Bootstrap HK source, profile, connector, and update timer
+        env:
+          REMOTE: ${{ secrets.HERMES_HK_USER }}@${{ secrets.HERMES_HK_HOST }}
+          RELEASE_COMMIT: ${{ github.sha }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -n "${REMOTE%@*}" -a -n "${REMOTE#*@}"
+          ssh -i "$RUNNER_TEMP/hk-ssh/id_ed25519" \
+            -o UserKnownHostsFile="$RUNNER_TEMP/hk-ssh/known_hosts" \
+            -o StrictHostKeyChecking=yes "$REMOTE" \
+            "sudo -n /bin/bash -s -- '$RELEASE_COMMIT'" < deploy/hk/install-hk-worker.sh
+      - name: Verify HK update timer and release evidence
+        env:
+          REMOTE: ${{ secrets.HERMES_HK_USER }}@${{ secrets.HERMES_HK_HOST }}
+          EXPECTED_COMMIT: ${{ github.sha }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          ssh -i "$RUNNER_TEMP/hk-ssh/id_ed25519" \
+            -o UserKnownHostsFile="$RUNNER_TEMP/hk-ssh/known_hosts" \
+            -o StrictHostKeyChecking=yes "$REMOTE" \
+            'sudo -n systemctl is-active --quiet hermes-fabric-update.timer'
+          evidence="$(ssh -i "$RUNNER_TEMP/hk-ssh/id_ed25519" \
+            -o UserKnownHostsFile="$RUNNER_TEMP/hk-ssh/known_hosts" \
+            -o StrictHostKeyChecking=yes "$REMOTE" \
+            'sudo -n cat /var/lib/hermes-agent-fabric-update/hk/release.json')"
+          EXPECTED_COMMIT="$EXPECTED_COMMIT" python3 -c 'import json,os,sys; d=json.load(sys.stdin); assert d["commit"]==os.environ["EXPECTED_COMMIT"]; assert d["node_id"]=="hk"' <<<"$evidence"

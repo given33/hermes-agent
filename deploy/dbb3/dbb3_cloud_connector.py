@@ -2765,6 +2765,11 @@ class DBB3CloudConnector:
         fingerprint_payload = dict(payload)
         fingerprint_payload.pop("checkpoint_cursor", None)
         fingerprint_payload.pop("observed_at", None)
+        # Per-invocation observability fields are not part of the message the
+        # cloud stores; excluding them keeps the fingerprint stable so an
+        # unchanged run is never re-reported on every poll cycle.
+        fingerprint_payload.pop("latency_ms", None)
+        fingerprint_payload.pop("lease_conflicts", None)
         fingerprint = hashlib.sha256(
             json.dumps(fingerprint_payload, ensure_ascii=False, sort_keys=True).encode("utf-8")
         ).hexdigest()
@@ -2773,6 +2778,8 @@ class DBB3CloudConnector:
             pending_fingerprint_payload = dict(pending)
             pending_fingerprint_payload.pop("checkpoint_cursor", None)
             pending_fingerprint_payload.pop("observed_at", None)
+            pending_fingerprint_payload.pop("latency_ms", None)
+            pending_fingerprint_payload.pop("lease_conflicts", None)
             pending_fingerprint = str(local.get("pending_status_fingerprint") or "") or hashlib.sha256(
                 json.dumps(
                     pending_fingerprint_payload,

@@ -113,10 +113,6 @@ from hermes_services.session_entries import (
     normalize_session_entries,
 )
 from hermes_services.tool_output_artifacts import EncryptedToolArtifactStore
-from hermes_runtime.composability.supervisor_verdict import (
-    build_supervisor_verdict,
-    digest_json,
-)
 from hermes_runtime.composability import (
     EffectScope,
     ProviderCatalog,
@@ -736,7 +732,7 @@ def _hosted_chat_lease_ms() -> int:
 
 
 _HOSTED_CHAT_TIMEOUT_SECONDS = _hosted_chat_timeout_seconds()
-# Remote connector roles (supervisor checks, manager handoff, worker/reviewer)
+# Remote connector roles: one dispatcher schedules work and workers execute it.
 # must not wait forever for a claimed-but-stalled remote run. This is a
 # liveness threshold: if the remote run's persisted state stops advancing for
 # this many seconds, the server seals it as failed so iOS receives a terminal
@@ -1331,6 +1327,7 @@ _WORK_MARKERS = (
 )
 _PC_MARKERS = ("本地电脑", "windows", "wsl", "pc", "桌面", "处理器", "gpu")
 _DBB3_MARKERS = ("dbb3", "linux", "armbian", "网关", "gateway")
+_HK_MARKERS = ("hk", "hong kong", "香港", "香港服务器", "hk server")
 _COMPLEX_WORK_MARKERS = (
     "修改代码",
     "修复",
@@ -1471,7 +1468,7 @@ _MULTI_STEP_MARKERS = (
     "finally",
     "as well as",
 )
-_EXPLICIT_WORKFLOW_ROLE_MARKERS = ("worker", "reporter")
+_EXPLICIT_WORKFLOW_ROLE_MARKERS = ("worker", "dispatcher")
 _EXPLICIT_WORKFLOW_PHRASES = (
     "group workflow",
     "multi participant workflow",
@@ -1795,7 +1792,7 @@ def _connector_identity_from_websocket(websocket: WebSocket) -> str:
 
 @router.websocket("/worker/ws")
 async def worker_websocket(websocket: WebSocket) -> None:
-    """Low-latency DBB3/WSL worker channel with durable-queue fallback."""
+    """Low-latency DBB3/WSL/HK worker channel with durable-queue fallback."""
     connector_id = _connector_identity_from_websocket(websocket)
     if not connector_id:
         await websocket.close(code=4401, reason="Unauthorized worker connector")
@@ -2843,7 +2840,7 @@ def _load_state_store(
 
 
 _HOSTED_ROLE_MIGRATION_MARKER = "_hosted_role_migration_version"
-_HOSTED_ROLE_MIGRATION_VERSION = 1
+_HOSTED_ROLE_MIGRATION_VERSION = 2
 
 
 def _migrate_hosted_roles_on_load_locked(
@@ -3325,12 +3322,10 @@ _MAX_HOSTED_TURNS_PER_CONVERSATION = 20
 _MAX_HOSTED_MESSAGES_PER_CONVERSATION = 40
 _MAX_HOSTED_SESSION_ENTRIES_PER_CONVERSATION = 40
 _MAX_ROLE_EVENTS_PER_TURN = 10
-_MAX_SUPERVISOR_CHECKS_PER_TURN = 5
 _MAX_REMOTE_ACTIVITIES_PER_RUN = 30
 _MAX_ACTIVITY_FIELD_CHARS = 4000
 _MAX_MESSAGE_CONTENT_CHARS = 8000
 _MAX_ROLE_EVENT_ACTIVITY_CHARS = 4000
-_MAX_SUPERVISOR_EVIDENCE_CHARS = 4000
 # Conversations whose hosted turns are all terminal and which have been
 # idle for this long are archived out of the hot single.json document into
 # per-conversation archive files. Restoring one is a lazy, locked read.
@@ -3958,46 +3953,6 @@ def _trim_hosted_state(state: dict[str, Any]) -> None:
                             and len(content_value) > _MAX_MESSAGE_CONTENT_CHARS
                         ):
                             event["content"] = content_value[:_MAX_MESSAGE_CONTENT_CHARS]
-                supervisor_checks = turn.get("supervisor_checks")
-                if (
-                    isinstance(supervisor_checks, dict)
-                    and len(supervisor_checks) > _MAX_SUPERVISOR_CHECKS_PER_TURN
-                ):
-                    ordered_checks = sorted(supervisor_checks.keys())
-                    for check_id in ordered_checks[
-                        : len(supervisor_checks) - _MAX_SUPERVISOR_CHECKS_PER_TURN
-                    ]:
-                        supervisor_checks.pop(check_id, None)
-                if isinstance(supervisor_checks, dict):
-                    for _check_id, check in supervisor_checks.items():
-                        if not isinstance(check, dict):
-                            continue
-                        for field in ("result", "display_result", "evidence"):
-                            value = check.get(field)
-                            if (
-                                isinstance(value, str)
-                                and len(value) > _MAX_SUPERVISOR_EVIDENCE_CHARS
-                            ):
-                                check[field] = value[:_MAX_SUPERVISOR_EVIDENCE_CHARS]
-                        check_activities = check.get("activities")
-                        if isinstance(check_activities, list):
-                            if len(check_activities) > _MAX_REMOTE_ACTIVITIES_PER_RUN:
-                                check_activities = check_activities[
-                                    -_MAX_REMOTE_ACTIVITIES_PER_RUN:
-                                ]
-                                check["activities"] = check_activities
-                            for activity in check_activities:
-                                if not isinstance(activity, dict):
-                                    continue
-                                for field in ("output", "detail", "input", "summary"):
-                                    value = activity.get(field)
-                                    if (
-                                        isinstance(value, str)
-                                        and len(value) > _MAX_ROLE_EVENT_ACTIVITY_CHARS
-                                    ):
-                                        activity[field] = value[
-                                            :_MAX_ROLE_EVENT_ACTIVITY_CHARS
-                                        ]
                 remote_runs = turn.get("remote_runs")
                 if isinstance(remote_runs, dict):
                     for _stage, run in remote_runs.items():
@@ -5526,10 +5481,11 @@ def available_profiles() -> list[dict[str, Any]]:
     ]
 
 
-_WORKER_TARGETS = ("dbb3", "pc")
+_WORKER_TARGETS = ("dbb3", "pc", "hk")
 _WORKER_TARGET_PROFILES = {
     "dbb3": "dbb3-worker",
     "pc": "pc-worker",
+    "hk": "hk-worker",
 }
 # Canonical server-local scheduler.  The legacy name is accepted only by the
 # migration boundary and is never emitted in new profiles, participants, or
@@ -5539,16 +5495,11 @@ _LEGACY_DBB3_MANAGER_PROFILE = "dbb3-manager"
 _DBB3_MANAGER_PROFILE = _HERMES_MANAGER_PROFILE
 _HERMES_MANAGER_NAME = "Hermes Manager"
 _HERMES_MANAGER_LABEL = "Hermes 调度员"
-_HERMES_SUPERVISOR_NAME = ""
-_HERMES_SUPERVISOR_LABEL = ""
 _REMOTE_RUN_PROFILES = frozenset(
     {
         "dbb3-worker",
         "pc-worker",
-        # Keep pulling records written by the pre-canonicalization DBB3
-        # manager.  The canonical Hermes manager is handled separately below
-        # so ordinary server-local manager stages do not become remote work.
-        _LEGACY_DBB3_MANAGER_PROFILE,
+        "hk-worker",
     }
 )
 
@@ -5556,20 +5507,12 @@ _REMOTE_RUN_PROFILES = frozenset(
 def _remote_run_is_pullable(remote_run: Mapping[str, Any]) -> bool:
     """Return whether a persisted run belongs in a connector pull batch.
 
-    Worker lanes and legacy ``dbb3-manager`` records are explicit remote
-    profiles.  ``hermes-manager`` is normally server-local; only a supervisor
-    run explicitly marked by the remote supervisor path (or an older persisted
-    ``supervisor:`` record) is eligible for a connector.
+    Only worker lanes are eligible for remote connector delivery. Dispatcher
+    work is always server-local and there is no supervisor/reviewer lane.
     """
 
     profile = str(remote_run.get("profile") or "").strip().lower()
-    if profile in _REMOTE_RUN_PROFILES:
-        return True
-    if profile != _HERMES_MANAGER_PROFILE:
-        return False
-    return _coerce_flag(remote_run.get("remote_supervisor")) or str(
-        remote_run.get("role_stage") or ""
-    ).strip().lower().startswith("supervisor:")
+    return profile in _REMOTE_RUN_PROFILES
 
 
 def _bridge_worker_channel_event(event: Mapping[str, Any]) -> bool:
@@ -5651,7 +5594,7 @@ _MANAGER_HANDOFF_FIELDS = (
     "task_goal",
     "plan",
     "worker_results",
-    "review_verdict",
+    "validation_summary",
     "rework_history",
     "artifacts",
     "failures",
@@ -5660,17 +5603,7 @@ _MANAGER_HANDOFF_FIELDS = (
 
 
 def _legacy_hosted_request_profile(profile: Any) -> str:
-    """Map an explicitly requested retired profile to its live runtime.
-
-    Retired roles stay out of ``available_profiles`` so new clients cannot
-    select them from the catalog. Existing rooms and clients may still send
-    their persisted names, however; those requests use the deterministic
-    default runtime while retaining the original name in durable state.
-    """
-
-    normalized = str(profile or "").strip().lower()
-    if normalized in _RETIRED_AI_PROFILES or normalized == _LEGACY_DBB3_MANAGER_PROFILE:
-        return "default"
+    """Reject role names removed from the dispatcher/worker workflow."""
     return ""
 
 
@@ -5696,6 +5629,7 @@ def _target_constraints(content: str) -> dict[str, list[str]]:
     marker_groups = {
         "dbb3": _DBB3_MARKERS,
         "pc": _PC_MARKERS,
+        "hk": _HK_MARKERS,
     }
     mentioned: set[str] = set()
     excluded: set[str] = set()
@@ -5780,8 +5714,7 @@ def _constrained_worker_profiles(
 
 def _work_profiles(lowered: str) -> list[str]:
     worker_profiles, _constraints = _constrained_worker_profiles(lowered)
-    # ``default`` is the deterministic server-side reporter/aggregator, not
-    # an additional model role.  Supervisor and Reviewer are retired AI roles.
+    # ``default`` is the server-local dispatcher runtime.
     return ["default", *worker_profiles]
 
 
@@ -5835,36 +5768,33 @@ def collaboration_role(profile: str) -> str:
     if normalized in _RETIRED_AI_PROFILES or "supervis" in normalized or "review" in normalized or "监督" in normalized:
         return "retired"
     if normalized in {_HERMES_MANAGER_PROFILE, _LEGACY_DBB3_MANAGER_PROFILE, "dispatcher", "manager"}:
-        return "manager"
+        return "dispatcher"
     if normalized.endswith("worker") or "worker" in normalized:
         return "worker"
-    return "reporter"
+    return "dispatcher"
 
 
 def collaboration_execution_order(profiles: list[str]) -> list[str]:
-    """Order manager, workers, and one deterministic final reporter."""
+    """Order the dispatcher first, followed by independently routed workers."""
     selected = list(dict.fromkeys(str(item).strip() for item in profiles if str(item).strip()))
     if not selected:
         return []
-    reporter = next(
-        (item for item in selected if collaboration_role(item) == "reporter"),
-        selected[0],
-    )
     workers = [
         item
         for item in selected
-        if item != reporter and collaboration_role(item) == "worker"
+        if collaboration_role(item) == "worker"
     ]
-    managers = [
+    dispatchers = [
         item
         for item in selected
-        if item != reporter and collaboration_role(item) == "manager"
+        if collaboration_role(item) == "dispatcher"
     ]
     retired = {
         item for item in selected
         if collaboration_role(item) == "retired"
     }
-    return [item for item in [*managers, *workers, reporter] if item not in retired]
+    dispatcher = dispatchers[0] if dispatchers else "default"
+    return [item for item in [dispatcher, *workers] if item not in retired]
 
 
 # Execution node per hosted member Profile; the parity contract exposes it so
@@ -5874,27 +5804,29 @@ _HOSTED_MEMBER_NODES = {
     "dbb3-manager": "dbb3",
     "dbb3-worker": "dbb3",
     "pc-worker": "wsl",
+    "hk-worker": "hk",
 }
 _HOSTED_MEMBER_DISPLAY_NAMES = {
     "hermes-manager": _HERMES_MANAGER_LABEL,
     "dbb3-manager": _HERMES_MANAGER_LABEL,
     "dbb3-worker": "DBB3 执行员",
     "pc-worker": "PC/WSL 执行员",
-    "default": "Hermes 汇报员",
+    "hk-worker": "HK 执行员",
+    "default": "Hermes 调度员",
 }
 
 
 def hosted_member_role(profile: str, role_stage: str = "") -> str:
-    """Roster role of one hosted member: manager, worker, or reporter."""
+    """Roster role of one hosted member: dispatcher or worker."""
 
     normalized = str(profile or "").strip().lower()
     if normalized in {_HERMES_MANAGER_PROFILE, _LEGACY_DBB3_MANAGER_PROFILE, "dispatcher", "manager"}:
-        return "manager"
+        return "dispatcher"
     base_stage = str(role_stage or "").strip().lower().split(":", 1)[0].split(".", 1)[0]
-    if base_stage.startswith("manager") or base_stage in {"dispatch", "workflow"}:
-        return "manager"
-    if base_stage in {"worker", "reporter"}:
-        return base_stage
+    if base_stage.startswith("manager") or base_stage in {"dispatch", "dispatcher", "workflow", "aggregator", "reporting"}:
+        return "dispatcher"
+    if base_stage == "worker":
+        return "worker"
     if base_stage in _RETIRED_AI_PROFILES:
         return "retired"
     return collaboration_role(normalized)
@@ -5911,7 +5843,7 @@ def hosted_member_id(profile: str, role_stage: str = "") -> str:
     normalized = str(profile or "").strip().lower()
     if normalized == _LEGACY_DBB3_MANAGER_PROFILE:
         return _LEGACY_DBB3_MANAGER_PROFILE
-    if hosted_member_role(profile, role_stage) == "manager":
+    if hosted_member_role(profile, role_stage) == "dispatcher":
         return _HERMES_MANAGER_PROFILE
     return str(profile or "").strip() or "default"
 
@@ -6014,31 +5946,13 @@ def hosted_role_delivery_contract(role_name: str) -> str:
         rules = (
             "调度员的更新必须说明任务边界、拆分或路由发生了什么变化，以及每个子任务的负责人、依赖和可验证验收标准；不能只说“已经派发”。",
             "派发前检查目标是否完整覆盖、步骤是否可并行、产物归属是否唯一；返工时明确退回哪一项、依据什么证据、由谁修正。",
-            "结构化交接必须保留原始目标、计划版本、Worker 证据、审阅结论、返工记录、产物路径与哈希、失败和未完成项，不得把推测补成事实。",
-        )
-    elif "review" in normalized or "审阅" in normalized:
-        rules = (
-            "验收只有一条标准：用户的原始任务是否已经完成。用户要求的每一项都有对应完成结果即通过。",
-            "更新中说明用户任务的每一项对应的结果在哪里；不得因格式、详略、风格、缺少测试或风险表述而退回。",
-            "退回只用于用户任务存在未完成事项：列出未完成项即可执行地补做；复审只核对上轮列出的未完成项。",
-        )
-    elif "report" in normalized or "汇报" in normalized:
-        rules = (
-            "汇报员只消费已经持久化并经审阅的结构化交接，不重新执行任务、不调用工具补洞，也不依据常识补写缺失结果。",
-            "最终答案按已完成、失败、未完成/待决定、关键证据与产物组织；只有具备来源、执行结果和审阅结论的事项才能写成完成。",
-            "交接相互矛盾或证据不足时保留冲突并明确标注，不得选择更乐观的版本；面向用户的结论必须可追溯到交接字段。",
-        )
-    elif "supervis" in normalized or "监督" in normalized:
-        rules = (
-            "监督者在计划形成、首次派发、每次角色交接、返工、阻断和最终汇报前进行检查；连续执行期间按新进展抽查，不等待任务结束才监督。",
-            "监督更新只报告发现、证据、整改对象和复核结果；没有新增问题时不重复发“监督正常”，但不得因此停止检查。",
-            "监督者不得替代调度、执行、审阅或汇报；其产物是可验证的纠偏指令和对整改是否落实的复核记录。",
+            "结构化交接必须保留原始目标、计划版本、Worker 证据、确定性校验结论、返工记录、产物路径与哈希、失败和未完成项，不得把推测补成事实。",
         )
     else:
         rules = (
             "Worker 的更新必须把实际动作与证据绑定：说明验证了什么、观察到什么、这对任务结论有何影响，以及下一组操作是什么。",
             "修改、部署或生成产物后必须给出可复核位置、版本/哈希或测试结果；失败不得包装为完成，尚未运行的测试必须标为未验证。",
-            "交接审阅员时提交完成项、命令/测试证据摘要、产物、异常路径、残余风险和明确未完成项，不替审阅员宣布通过。",
+            "完成后把结果、证据、产物、异常路径和明确未完成项提交给调度员；不得把推测写成事实。",
         )
     return "\n".join((f"【{role_name} 角色交付契约】", *rules))
 
@@ -6049,29 +5963,10 @@ def mention_priority_protocol(role_name: str) -> str:
     return "\n".join(
         (
             f"【{role_name} @ 干预协议】",
-            f"当用户、监督者或其他成员使用 @{role_name}（含等价角色名）定向发言时，该内容是高优先级控制消息。",
+            f"当用户或其他成员使用 @{role_name}（含等价角色名）定向发言时，该内容是高优先级控制消息。",
             "除不可中断的原子操作外，立即暂停新工具调用；在当前不可中断操作结束后的第一个安全边界，先直接回复该 @ 消息，并说明接受、拒绝或需要澄清的原因及其对计划的影响。",
             "回应后把有效要求、优先级和受影响步骤写入持久计划，再恢复执行；不得忽略、延迟到最终汇报、继续排队旧工具，或由未被 @ 的成员代答。",
             "若 @ 指令与用户原始目标、权限或已验证事实冲突，明确指出冲突并等待可执行决策，不得静默改变任务边界。",
-        )
-    )
-
-
-def supervisor_role_prompt() -> str:
-    """Define the independent supervisor's duties and bounded authority."""
-
-    return "\n".join(
-        (
-            "【Hermes 监督者职责与权限】",
-            "群聊拉起即开始监督，持续检查调度员、Worker、审阅员和汇报员；在计划形成、派发、角色交接、返工、阻断和最终汇报前必须检查，连续执行期间根据新增证据抽查。监督者不替任何成员执行其主体工作，也不直接生成最终答案。",
-            "检查调度员是否完整理解目标和边界、合理拆分、明确依赖与验收标准、选择合适节点并处理遗漏。",
-            "检查 Worker 是否真实执行、保留证据、遵守范围、没有偏离目标或用进度话术替代工作。",
-            "检查审阅员是否独立复核、覆盖异常/并发/离线等必要场景、给出可复现证据，并对不合格结果明确退回。",
-            "检查汇报员是否只基于已验证交接，准确区分完成、失败、未完成和风险，不遗漏返工记录、产物及哈希。",
-            "发现偏离、偷懒、遗漏或证据不足时，立即用“@准确成员名：已观察到的事实；违反的职责边界；必须整改的动作；完成时需提交的验收证据”发出定向整改，并在后续安全边界复核是否落实。",
-            "同时监督过程回报是否存在长时间沉默、无信息增量刷屏、只报计划不报证据或失败后不说明影响；违反时必须 @对应成员要求按过程回报协议整改。",
-            "监督结论必须可验证；没有问题时简短写明检查范围和通过依据，不制造无意义返工。",
-            hosted_role_delivery_contract(_HERMES_SUPERVISOR_LABEL),
         )
     )
 
@@ -6090,12 +5985,7 @@ _MENTION_TARGET_ALIASES = {
         "PC/WSL 执行员",
         "dbb3-worker",
         "pc-worker",
-    ),
-    "reporter": (
-        "Hermes 汇报员",
-        "汇报员",
-        "Hermes Reporter",
-        "Reporter",
+        "hk-worker",
     ),
 }
 
@@ -6181,13 +6071,7 @@ def _hosted_stage_target_role(role_stage: str, profile: str = "") -> str:
     base = normalized.split(":", 1)[0]
     if base == "worker":
         return "worker"
-    if base == "reviewer":
-        return "reviewer"
-    if base == "reporter" or normalized.startswith("report"):
-        return "reporter"
-    if base == "supervisor" or normalized.startswith("supervis"):
-        return "supervisor"
-    if base == "dispatcher" or normalized.startswith(("dispatch", "manager")):
+    if base == "dispatcher" or normalized.startswith(("dispatch", "manager", "report", "aggregator")):
         return "dispatcher"
     return collaboration_role(profile)
 
@@ -6199,6 +6083,7 @@ def _mentioned_collaboration_profiles(content: str) -> list[str]:
     aliases = {
         "dbb3-worker": ("dbb3-worker", "dbb3 执行员"),
         "pc-worker": ("pc-worker", "pc/wsl 执行员", "pc 执行员", "wsl 执行员"),
+        "hk-worker": ("hk-worker", "hk 执行员", "香港执行员", "香港 worker"),
     }
     return [
         profile
@@ -7039,11 +6924,6 @@ def _normalize_manager_plan(
             for index, profile in enumerate(worker_profiles, start=1)
         ]
 
-    reviewer_target = str(parsed.get("reviewer_target") or "dbb3").strip().lower()
-    if reviewer_target not in {"dbb3", "pc", "spark"}:
-        reviewer_target = "dbb3"
-    if reviewer_target in {"pc", "spark"} and reviewer_target in set(constraints.get("excluded") or []):
-        reviewer_target = "dbb3"
     acceptance_criteria = [
         str(item).strip()[:2000]
         for item in parsed.get("acceptance_criteria") or []
@@ -7078,7 +6958,6 @@ def _normalize_manager_plan(
         "difficulty": difficulty,
         "reason": str(parsed.get("reason") or f"{_HERMES_MANAGER_NAME} selected a bounded execution plan.").strip()[:1000],
         "workers": worker_profiles,
-        "reviewer_target": reviewer_target,
         "approach": str(parsed.get("approach") or "").strip()[:12000],
         "task_requirements": str(parsed.get("task_requirements") or "").strip()[:12000],
         "acceptance_criteria": acceptance_criteria,
@@ -7160,7 +7039,7 @@ def _manager_plan_prompt(
             hosted_role_delivery_contract(_HERMES_MANAGER_LABEL),
             mention_priority_protocol(_HERMES_MANAGER_LABEL),
             # 可用执行节点由服务端按当前节点状态确定性注入（零 LLM 调用）。
-            f"可用执行节点（服务端确定性提供）：{', '.join(sorted(set(fallback_workers) | {'dbb3-worker', 'pc-worker'}))}",
+            f"可用执行节点（服务端确定性提供）：{', '.join(sorted(set(fallback_workers) | set(_WORKER_TARGET_PROFILES.values())))}",
             f"服务器路由建议：{', '.join(fallback_workers)}",
             f"是否要求交付文件：{'yes' if artifact_required else 'no'}",
             "最终输出一个 JSON 对象且不要附加解释；过程回报通过运行事件发送，不得混入最终 JSON。结构必须为：",
@@ -7333,7 +7212,7 @@ def _render_deterministic_hosted_report(
 ) -> str:
     """确定性看板汇报（纯 Python，零 LLM 调用）。
 
-    取代原 Reporter 通道：逐项列出「任务项 → 执行者 → 状态 → 结果摘录
+    由调度员直接汇总：逐项列出「任务项 → 执行者 → 状态 → 结果摘录
     （前 200 字）→ 产物」，最后附一行总计。
     """
 
@@ -7391,9 +7270,6 @@ def _hosted_manager_plan_todo_snapshot(
     *,
     stage: str,
     worker_statuses: Optional[dict[str, str]] = None,
-    reviewer_status: str = "",
-    reviewer_result: str = "",
-    reporter_status: str = "",
     final_status: str = "",
 ) -> dict[str, Any]:
     """Project the model-authored manager plan onto one durable Todo snapshot."""
@@ -7434,68 +7310,8 @@ def _hosted_manager_plan_todo_snapshot(
             }
         )
 
-    reviewer_verdict = (
-        _hosted_reviewer_verdict(reviewer_result)
-        if str(reviewer_result or "").strip()
-        else "unknown"
-    )
-    normalized_reviewer = str(reviewer_status or "").strip().lower()
-    review_completed = (
-        normalized_final == "completed"
-        or (normalized_reviewer == "completed" and reviewer_verdict == "pass")
-    )
-    review_cancelled = (
-        not review_completed
-        and (
-            normalized_reviewer in {"cancelled", "failed", "blocked"}
-            or terminal
-        )
-    )
-    todos.append(
-        {
-            "id": "workflow-review",
-            "content": "验收执行结果",
-            "status": (
-                "completed"
-                if review_completed
-                else "cancelled" if review_cancelled else "pending"
-            ),
-        }
-    )
-
-    normalized_reporter = str(reporter_status or "").strip().lower()
-    report_completed = normalized_final == "completed"
-    report_cancelled = (
-        not report_completed
-        and (
-            normalized_reporter in {"cancelled", "failed", "blocked"}
-            or terminal
-        )
-    )
-    todos.append(
-        {
-            "id": "workflow-report",
-            "content": "整理并汇报结果",
-            "status": (
-                "completed"
-                if report_completed
-                else "cancelled" if report_cancelled else "pending"
-            ),
-        }
-    )
-
     if not terminal and not any(item["status"] == "in_progress" for item in todos):
-        preferred_ids: list[str] = []
-        if normalized_stage in {"manager_handoff", "reporting"}:
-            preferred_ids.extend(("workflow-report", "workflow-review"))
-        elif normalized_stage == "reviewing":
-            preferred_ids.extend(("workflow-review", "workflow-report"))
-        preferred_ids.extend(
-            item["id"]
-            for item in todos
-            if item["id"] not in {"workflow-review", "workflow-report"}
-        )
-        preferred_ids.extend(("workflow-review", "workflow-report"))
+        preferred_ids = [item["id"] for item in todos]
         for item_id in preferred_ids:
             candidate = next(
                 (
@@ -7526,9 +7342,6 @@ def _persist_hosted_plan_snapshot(
     *,
     stage: str,
     worker_statuses: Optional[dict[str, str]] = None,
-    reviewer_status: str = "",
-    reviewer_result: str = "",
-    reporter_status: str = "",
     final_status: str = "",
 ) -> dict[str, Any]:
     """Persist one canonical Todo activity without adding a second plan bubble."""
@@ -7537,9 +7350,6 @@ def _persist_hosted_plan_snapshot(
         manager_plan,
         stage=stage,
         worker_statuses=worker_statuses,
-        reviewer_status=reviewer_status,
-        reviewer_result=reviewer_result,
-        reporter_status=reporter_status,
         final_status=final_status,
     )
     now = int(time.time() * 1000)
@@ -7675,7 +7485,7 @@ def _normalize_manager_handoff(
     task_goal: str,
     plan: dict[str, Any],
     worker_results: dict[str, str],
-    review_verdict: str,
+    validation_summary: str,
     rework_history: list[dict[str, Any]],
     artifacts: list[dict[str, Any]],
     failures: list[str],
@@ -7689,7 +7499,7 @@ def _normalize_manager_handoff(
         "task_goal": str(task_goal).strip(),
         "plan": list(plan.get("plan") or []),
         "worker_results": dict(worker_results),
-        "review_verdict": str(review_verdict).strip(),
+        "validation_summary": str(validation_summary).strip(),
         "rework_history": list(rework_history),
         "artifacts": list(artifacts),
         "failures": list(failures),
@@ -7723,7 +7533,7 @@ def _rule_based_user_intent(content: str) -> dict[str, Any]:
     ]
     device_matches = [
         marker
-        for marker in (*_PC_MARKERS, *_DBB3_MARKERS)
+        for marker in (*_PC_MARKERS, *_DBB3_MARKERS, *_HK_MARKERS)
         if marker in lowered
     ]
     multi_step_count = sum(
@@ -7928,7 +7738,7 @@ def classify_intent_with_context_model(
         "Return JSON only: {mode:'chat|work',needs_execution:boolean,needs_tools:boolean,mutates_state:boolean,"
         "targets:[],profiles:[],artifact:{decision:'required|optional|none',types:[],"
         "producer_targets:[],producer_profiles:[],reason:string},"
-        "confidence:0..1,reason:string}. Work profiles are dbb3-worker and pc-worker."
+        "confidence:0..1,reason:string}. Work profiles are dbb3-worker, pc-worker, and hk-worker."
     )
     if adjudicate:
         system += " This is a second adjudication for a low-confidence first result; resolve the boundary explicitly."
@@ -7957,12 +7767,14 @@ def classify_intent_with_context_model(
             normalized = "dbb3"
         elif normalized in {"windows", "wsl", "local"}:
             normalized = "pc"
-        if normalized in {"dbb3", "pc"} and normalized not in targets:
+        elif normalized in {"hk", "hong-kong", "hong kong", "香港"}:
+            normalized = "hk"
+        if normalized in set(_WORKER_TARGETS) and normalized not in targets:
             targets.append(normalized)
     profiles = [
         str(value).strip().lower()
         for value in parsed.get("profiles") or []
-        if str(value).strip().lower() in {"dbb3-worker", "pc-worker"}
+        if str(value).strip().lower() in set(_WORKER_TARGET_PROFILES.values())
     ]
     if mode == "work" and not profiles:
         profiles = [f"{target}-worker" for target in targets] or ["dbb3-worker"]
@@ -7989,12 +7801,12 @@ def classify_intent_with_context_model(
             "producer_targets": [
                 str(value).strip().lower()
                 for value in artifact.get("producer_targets") or []
-                if str(value).strip().lower() in {"dbb3", "pc"}
+                if str(value).strip().lower() in set(_WORKER_TARGETS)
             ],
             "producer_profiles": [
                 str(value).strip().lower()
                 for value in artifact.get("producer_profiles") or []
-                if str(value).strip().lower() in {"dbb3-worker", "pc-worker"}
+                if str(value).strip().lower() in set(_WORKER_TARGET_PROFILES.values())
             ],
             "reason": str(artifact.get("reason") or "")[:500],
         },
@@ -8611,21 +8423,13 @@ def build_group_prompt(
     recent = "\n".join(_message_line(item) for item in history[-_PROMPT_HISTORY:])
     members = "、".join(str(item) for item in room.get("profiles") or [])
     role = collaboration_role(profile)
-    # Retired reviewer/supervisor profiles remain accepted at the prompt
-    # boundary for old rooms and explicit API requests.  Their role-specific
-    # instructions are still valid even though new workflows use the
-    # deterministic server-side aggregator.
-    prompt_role = role
     if role == "retired":
-        prompt_role = (
-            "supervisor"
-            if str(profile or "").strip().lower() == "supervisor"
-            else "reviewer"
-        )
+        raise ValueError("监督者和审阅者角色已移除；请使用调度员或 worker")
+    prompt_role = "dispatcher" if role in {"dispatcher", "retired"} else "worker"
     role_instruction = {
         "worker": (
             "你是执行者。只负责实际执行、调用工具并提交证据、结果和遗留问题；"
-            "不要向用户做最终总结，也不要替审阅者下结论。"
+            "不要自行扩展任务范围；完成后把结果直接交给调度员。"
             "任务含可并行子步骤或需要独立调查时，可用 delegate_task 派 leaf 子代理"
             "并行执行（并发数量由你根据任务和节点资源自行判断），"
             "每个子代理用 name 给中文职业名，用 expected_output 写明交付物、"
@@ -8637,20 +8441,14 @@ def build_group_prompt(
             "方向或需求必须由用户拍板时用 kanban_block(kind=\"needs_input\") 提问，"
             "reason 用“问题 + 选项：A. ... B. ...”格式；能自行判断的不要打扰用户。"
         ),
-        "reviewer": (
-            "你是审阅者。基于执行者已经提交的结果做验收、风险检查和通过/退回判断；"
-            "不要重复执行者的工作，不要向用户做最终总结。"
-        ),
-        "supervisor": supervisor_role_prompt(),
-        "reporter": (
-            "你是唯一最终汇报者。综合执行者和审阅者的信息，向用户给出一次清晰的最终结论、"
-            "完成状态、关键证据、问题和下一步；不要重新执行已经完成的工作。"
+        "dispatcher": (
+            "你是唯一调度员。负责理解用户目标、拆分 Todo、选择 worker、处理依赖并直接汇总结果；"
+            "不设置监督者或审阅者角色，也不把任务再次转交给其他调度员。"
         ),
     }[prompt_role]
     if artifact_required:
         artifact_instruction = (
-            "用户明确要求文件交付。只有执行者可以创建所需的最终文件；审阅者只核验，"
-            "最终汇报者只引用执行者产物，不得重复生成同一文件。"
+            "用户明确要求文件交付。只有被调度的 worker 创建所需文件，调度员只汇总并引用已验证产物。"
         )
     else:
         artifact_instruction = (
@@ -10301,16 +10099,16 @@ def _persist_hosted_role_state(
         if isinstance(item, dict)
     ]
     base_stage = role_stage.split(":", 1)[0]
-    # 编排工作流重构：reviewer 通道已从工作流调用链移除，worker 的交接
-    # 对象直接指向最终汇报（reporter 阶段由确定性看板生成）。
+    # Workers hand their evidence directly to the dispatcher. The final
+    # response is a server-side projection, not another role.
     handoff_to = {
-        "worker": ["reporter"],
-        "reviewer": ["reporter"],
+        "worker": ["dispatcher"],
         "dispatch": ["worker"],
+        "dispatcher": ["worker"],
     }.get(base_stage, [])
     now = int(time.time() * 1000)
     if state_status in _HOSTED_TERMINAL_STATUSES:
-        phase = "handoff" if base_stage in {"worker", "reviewer"} else "completed"
+        phase = "handoff" if base_stage == "worker" else "completed"
     elif state_content or activities:
         phase = "progress"
     else:
@@ -11044,16 +10842,10 @@ def _run_hosted_role(
             ),
         )
     )
+    # The hosted workflow has no parallel supervisor/reviewer model. Worker
+    # progress is delivered directly over the low-latency channel and settled
+    # by the dispatcher from durable worker results.
     companion_handle: Optional[dict[str, Any]] = None
-    if _hosted_companion_stage_eligible(role_stage):
-        companion_handle = _start_hosted_companion(
-            conversation_id,
-            turn_id,
-            role_stage=role_stage,
-            profile=profile,
-            runner=runner,
-            artifact_context=artifact_context,
-        )
     for attempt in range(1, attempts + 1):
         try:
             boundary_profile = runtime_profile or profile
@@ -11404,12 +11196,15 @@ def _run_hosted_remote_role(
     visible: bool = True,
     remote_supervisor: bool = False,
 ) -> tuple[str, str, dict[str, Any]]:
-    """Wait for a DBB3/PC connector run and project its checkpoints.
+    """Wait for a worker connector run and project its checkpoints.
 
     The remote id is derived from the conversation, turn, role phase and
     profile. Restarting the dashboard therefore reattaches to the same queue
     item instead of creating another remote Kanban task.
     """
+
+    if remote_supervisor:
+        raise RuntimeError("Supervisor remote runs are no longer supported")
 
     with _STATE_LOCK:
         state = load_single_state()
@@ -12063,7 +11858,6 @@ def create_hosted_turn_record(
         "cancel_requested": False,
         "interventions": [],
         "active_roles": {},
-        "supervisor_checks": {},
         "participants": [],
         "created_at": now,
         "updated_at": now,
@@ -12074,7 +11868,7 @@ def create_hosted_turn_record(
             conversation,
             conversation_id=str(conversation.get("id") or "conversation"),
             turn_id=normalized_turn_id,
-            role_stage="manager",
+            role_stage="dispatcher",
             event_type="role.handoff",
             entity_id=f"{normalized_turn_id}:collaboration-lift",
             idempotency_key=f"turn:{normalized_turn_id}:collaboration-lift",
@@ -12083,7 +11877,7 @@ def create_hosted_turn_record(
                 "entity_id": f"{normalized_turn_id}:collaboration-lift",
                 "action": "collaboration_lift",
                 "from_role": "chat",
-                "to_role": "manager",
+                "to_role": "dispatcher",
             },
             occurred_at=now,
         )
@@ -12147,7 +11941,7 @@ def _artifact_producer_profiles(
     requested.extend(
         f"{str(value).strip().lower()}-worker"
         for value in artifact.get("producer_targets") or []
-        if str(value).strip().lower() in {"dbb3", "pc"}
+        if str(value).strip().lower() in {"dbb3", "pc", "hk"}
     )
     selected = [profile for profile in workers if profile.lower() in requested]
     return list(dict.fromkeys(selected or workers[:1]))
@@ -12473,6 +12267,7 @@ def _schedule_persisted_terminal_notification(
         task_status = actual_status
     result = str(
         notification.get("result")
+        or persisted_run.get("result")
         or persisted_run.get("reporter_result")
         or persisted_run.get("chat_result")
         or fallback_result
@@ -13371,6 +13166,8 @@ def _connector_for_profile(profile: str) -> str:
     normalized = str(profile or "").strip().lower()
     if normalized == "pc-worker":
         return "pc-primary"
+    if normalized == "hk-worker":
+        return "hk-primary"
     return "dbb3-primary"
 
 
@@ -13429,7 +13226,7 @@ def _remote_profile_server_cap_seconds(profile: str) -> int:
                 return value
         except (TypeError, ValueError):
             pass
-    return 1800 if str(profile or "").strip() == "pc-worker" else 900
+    return 1800 if str(profile or "").strip() in {"pc-worker", "hk-worker"} else 900
 
 
 def _positive_int(value: Any) -> Optional[int]:
@@ -13672,7 +13469,10 @@ def _ensure_remote_run(
     connector_id: str = "",
     remote_supervisor: bool = False,
 ) -> dict[str, Any]:
-    """Create or reuse the durable DBB3/PC queue item for one role phase."""
+    """Create or reuse the durable worker queue item for one role phase."""
+
+    if remote_supervisor:
+        raise RuntimeError("Supervisor remote runs are no longer supported")
 
     remote_id = _remote_run_id(conversation_id, turn_id, role_stage, profile)
     with _STATE_LOCK:
@@ -13711,13 +13511,6 @@ def _ensure_remote_run(
             if not existing_owner or not existing_generation:
                 existing["owner_id"] = owner_id
                 existing["account_generation"] = account_generation
-                existing_changed = True
-            if remote_supervisor and not _coerce_flag(
-                existing.get("remote_supervisor")
-            ):
-                # A supervisor queue record may have been created by an older
-                # server before the explicit marker was persisted.
-                existing["remote_supervisor"] = True
                 existing_changed = True
             if existing_changed:
                 save_single_state(state)
@@ -13762,8 +13555,6 @@ def _ensure_remote_run(
             "created_at": now,
             "updated_at": now,
         }
-        if remote_supervisor:
-            record["remote_supervisor"] = True
         record["deadline_at"] = deadline_at
         remote_runs[role_stage] = record
         save_single_state(state)
@@ -13772,7 +13563,7 @@ def _ensure_remote_run(
     # connection simply leaves the existing connector pull path responsible
     # for recovery.
     worker_node = str(profile or "").strip()
-    if worker_node in {"dbb3-worker", "pc-worker"}:
+    if worker_node in _WORKER_TARGET_PROFILES.values():
         try:
             _WORKER_CHANNEL.publish(
                 worker_node,
@@ -14201,7 +13992,7 @@ def _finish_hosted_turn_if_cancelled(
             "status": "cancelled",
             "kind": "message",
             "meta": {
-                "role_stage": "chat" if is_chat else "reporter",
+                "role_stage": "chat" if is_chat else "dispatcher",
                 "role_label": "Hermes" if is_chat else "Hermes · 任务取消",
                 "final_report": not is_chat,
             },
@@ -15184,19 +14975,8 @@ _HOSTED_COMPANION_STAGE_PREFIXES = frozenset(
 
 
 def _hosted_companion_stage_eligible(role_stage: str) -> bool:
-    """Companion runs for supervised stages only (never chat/supervisor).
-
-    Worker/reviewer/reporter stages use colon form ("worker:dbb3-worker"),
-    but local manager stages use underscore form ("manager_planning",
-    "manager_handoff") — cover both so the dispatcher really gets watched.
-    """
-
-    base = str(role_stage or "").split(":", 1)[0]
-    return (
-        base in _HOSTED_COMPANION_STAGE_PREFIXES
-        or base.startswith("manager")
-        or base.startswith("dispatch")
-    )
+    """Companion model checks are removed from the dispatcher/worker flow."""
+    return False
 _HOSTED_COMPANION_REGISTRY: dict[tuple[str, str], dict[str, Any]] = {}
 _HOSTED_COMPANION_REGISTRY_LOCK = threading.Lock()
 
@@ -15604,7 +15384,9 @@ def _run_hosted_supervisor_check(
     kanban_task_id: str = "",
     visible: bool = True,
 ) -> tuple[str, str, dict[str, Any]]:
-    """Execute, expose, and persist one independent supervisor check."""
+    """Retired compatibility entry point for the former supervisor lane."""
+
+    raise RuntimeError("Supervisor checks are no longer supported")
 
     redacted_evidence = _redact_sensitive(dict(evidence))
     with _STATE_LOCK:
@@ -16117,12 +15899,8 @@ def execute_hosted_workflow(
     fallback_worker_profiles = [
         item for item in ordered if collaboration_role(item) == "worker"
     ] or ["dbb3-worker"]
-    # Reviewer/Supervisor are retired AI roles. The default profile is the
-    # deterministic server-side result aggregator.
-    reviewer_profile = ""
-    reviewer_connector_id = ""
-    reporter_profile = "default"
     artifact_required = _coerce_flag(run.get("artifact_required"))
+    dispatcher_profile = "default"
     attachment_context = _hosted_chat_attachment_context(conversation_snapshot, run)
 
     manager_plan = (
@@ -16186,7 +15964,7 @@ def execute_hosted_workflow(
             runner=manager_runner or run_profile_turn,
             kanban_task_id="",
             start_text="正在评估难度并形成结构化执行计划。",
-            # ``hermes-manager`` is the canonical durable role label, not a
+            # ``hermes-manager`` is the canonical durable dispatcher label, not a
             # separately installed Hermes profile.  The public runtime ships
             # the deterministic ``default`` profile; use it only for the
             # production runner while preserving the canonical role identity
@@ -16217,7 +15995,7 @@ def execute_hosted_workflow(
 
     if plan_only:
         # /plan 模式：方案本身就是交付物。整理成最终答复并结束本轮，
-        # 不派发 worker，复用 reporter 阶段的完成持久化与推送路径。
+        # 不派发 worker，复用调度员阶段的完成持久化与推送路径。
         plan_report = _render_manager_plan_report(manager_plan, content, slash_argument)
         now = int(time.time() * 1000)
         _persist_hosted_plan_snapshot(
@@ -16226,17 +16004,13 @@ def execute_hosted_workflow(
             manager_plan,
             stage="completed",
             worker_statuses={},
-            reviewer_status="",
-            reviewer_result="",
-            reporter_status="completed",
             final_status="completed",
         )
         persisted_run = _persist_hosted_turn(
             conversation_id,
             turn_id,
             patch={
-                "reporter_result": plan_report,
-                "reporter_status": "completed",
+                "result": plan_report,
                 "status": "completed",
                 "stage": "completed",
                 "completed_at": now,
@@ -16254,7 +16028,7 @@ def execute_hosted_workflow(
                 "status": "completed",
                 "kind": "message",
                 "meta": {
-                    "role_stage": "reporter",
+                    "role_stage": "dispatcher",
                     "role_label": "Hermes · 方案",
                     "collapse_activities": True,
                     "final_report": True,
@@ -16280,9 +16054,6 @@ def execute_hosted_workflow(
                 if isinstance(run.get("worker_statuses"), dict)
                 else {}
             ),
-            reviewer_status=str(run.get("reviewer_status") or ""),
-            reviewer_result=str(run.get("reviewer_result") or ""),
-            reporter_status=str(run.get("reporter_status") or ""),
             final_status=str(run.get("status") or ""),
         )
 
@@ -16290,8 +16061,6 @@ def execute_hosted_workflow(
     turn_plan = build_hosted_turn_plan(
         turn_id=turn_id,
         worker_profiles=worker_profiles,
-        reviewer_profile=reviewer_profile,
-        reporter_profile=reporter_profile,
         artifact_required=artifact_required,
         revision=max(1, int(run.get("turn_plan_revision") or 1)),
     )
@@ -16358,15 +16127,6 @@ def execute_hosted_workflow(
         "官方 Kanban 是 DBB3 的唯一控制面。你可以读取根任务和已分配工作项，"
         "也可以向已分配工作项写入进度、证据和交接评论；"
         "不得创建、改派、关闭或删除根任务，也不得替 Manager 改变任务生命周期。"
-    )
-    reviewer_kanban_instruction = (
-        "官方 Kanban 是 DBB3 的唯一控制面。你可以读取任务、证据和评论，"
-        "并向已分配的审阅工作项写入验收结论；"
-        "不得创建、改派、关闭或删除根任务。"
-    )
-    reporter_kanban_instruction = (
-        "官方 Kanban 是 DBB3 的唯一控制面。你可以读取任务链用于最终汇总；"
-        "不得创建、改派、关闭或删除根任务，也不要替执行者重复工作。"
     )
 
     task_id = str(run.get("task_id") or "")
@@ -16534,10 +16294,8 @@ def execute_hosted_workflow(
         turn_id,
         patch={
             "stage": "worker_running",
-            # Dispatch is the authoritative join point: the manager and every
-            # dispatched worker become first-class roster members here.
-            # Manager and workers are the only runtime participants.  The
-            # reporter is a deterministic server-side projection, not a role.
+            # Dispatch is the authoritative join point: the dispatcher and
+            # every dispatched worker become first-class roster members.
             "participants": [
                 hosted_participant_descriptor(_DBB3_MANAGER_PROFILE),
                 *(
@@ -16545,14 +16303,14 @@ def execute_hosted_workflow(
                     for profile in worker_profiles
                 ),
                 hosted_participant_descriptor(
-                    reporter_profile,
+                    dispatcher_profile,
                     role_stage="aggregator",
                 ),
             ],
         },
         message={
             "role": "assistant",
-            "name": reporter_profile,
+            "name": dispatcher_profile,
             "content": (
                 f"任务已由 DBB3 托管并拆分为 {len(todo_items)} 个 Todo 项，"
                 f"无依赖的项已并行派发给 {', '.join(worker_profiles)}，完成后我直接汇总汇报。"
@@ -16832,98 +16590,6 @@ def execute_hosted_workflow(
         # snapshots are durable at dispatch and terminal boundaries; writing a
         # third copy after every dependency wave doubles checkpoint latency.
 
-    def _supervisor_gap_text(check: dict[str, Any]) -> str:
-        # 从监督记录中提取缺口描述（展示文本 + 结构化 required_actions/findings）。
-        control = _hosted_supervisor_control(str(check.get("result") or ""))
-        entries = [
-            str(check.get("display_result") or check.get("result") or "").strip(),
-        ]
-        if isinstance(control, dict):
-            entries.append(
-                "\n".join(
-                    f"- {action}"
-                    for action in control.get("required_actions") or []
-                    if str(action).strip()
-                )
-            )
-            entries.append(
-                "\n".join(
-                    f"- {finding}"
-                    for finding in control.get("findings") or []
-                    if str(finding).strip()
-                )
-            )
-        return "\n".join(entry for entry in entries if entry.strip())
-
-    def _persist_supervisor_followup_message(
-        item: dict[str, Any],
-        gap_text: str,
-    ) -> None:
-        # 快检存疑时的追问卡片：先问 worker，不直接打回。
-        _persist_hosted_turn(
-            conversation_id,
-            turn_id,
-            patch={"stage": "supervisor_followup"},
-            message={
-                "role": "assistant",
-                "name": _HERMES_SUPERVISOR_LABEL,
-                "content": (
-                    f"对「{item['title']}」的完成情况存疑，"
-                    f"正在向 {item['assignee']} 追问：\n{gap_text}"
-                ),
-                "status": "completed",
-                "kind": "message",
-                "meta": {
-                    "role_stage": (
-                        f"supervisor.followup:{_sanitize_hosted_check_id(item['id'])}"
-                    ),
-                    "base_role_stage": "supervisor",
-                    "phase": "followup",
-                    "message_key": f"{turn_id}:supervisor:followup:{item['id']}",
-                    "role_label": _HERMES_SUPERVISOR_LABEL,
-                    "profile": "supervisor",
-                    "handoff_to": [item["assignee"]],
-                    "final_report": False,
-                },
-            },
-        )
-
-    def _persist_supervisor_rework_message(
-        item: dict[str, Any],
-        feedback: str,
-        round_number: int,
-    ) -> None:
-        # 确认未完成后的打回消息（有界返工）。
-        _persist_hosted_turn(
-            conversation_id,
-            turn_id,
-            patch={
-                "stage": "rework",
-                "active_rework_round": round_number,
-                "supervisor_rework_round": round_number,
-                "supervisor_rework_feedback": feedback,
-            },
-            message={
-                "role": "assistant",
-                "name": _HERMES_SUPERVISOR_LABEL,
-                "content": (
-                    f"「{item['title']}」确认未完成，要求 {item['assignee']} "
-                    f"返工（第 {round_number} 轮）：\n{feedback}"
-                ),
-                "status": "completed",
-                "kind": "message",
-                "meta": {
-                    "role_stage": f"supervisor.rework-request:{round_number}",
-                    "base_role_stage": "supervisor",
-                    "phase": "rework",
-                    "message_key": f"{turn_id}:supervisor:rework:{round_number}",
-                    "role_label": _HERMES_SUPERVISOR_LABEL,
-                    "profile": "supervisor",
-                    "final_report": False,
-                },
-            },
-        )
-
     def run_todo_completion_check(
         item: dict[str, Any],
         claimed_result: str,
@@ -17042,10 +16708,10 @@ def execute_hosted_workflow(
         f"{item['id']}（{item['assignee']}）未完成"
         for item in unfinished_items
     ]
-    final_supervision_status = "completed" if not unfinished_items else "failed"
-    final_supervision = {
+    final_validation_status = "completed" if not unfinished_items else "failed"
+    final_validation = {
         "schema_version": "hermes.validation.v1",
-        "status": final_supervision_status,
+        "status": final_validation_status,
         "verdict": "pass" if not unfinished_items else "corrective_action",
         "display_result": (
             "服务器确定性校验通过"
@@ -17058,8 +16724,8 @@ def execute_hosted_workflow(
         ],
         "findings": final_check_findings,
     }
-    validation_statuses["final_report"] = final_supervision_status
-    validation_findings["final_report"] = str(final_supervision["display_result"])
+    validation_statuses["final_report"] = final_validation_status
+    validation_findings["final_report"] = str(final_validation["display_result"])
     if _finish_hosted_turn_if_cancelled(conversation_id, turn_id):
         return
 
@@ -17100,7 +16766,7 @@ def execute_hosted_workflow(
         task_goal=content,
         plan=manager_plan,
         worker_results=worker_results,
-        review_verdict=str(final_supervision.get("display_result") or "")[:4000],
+        validation_summary=str(final_validation.get("display_result") or "")[:4000],
         rework_history=rework_history,
         artifacts=handoff_artifacts,
         failures=handoff_failures,
@@ -17117,7 +16783,7 @@ def execute_hosted_workflow(
             "rework_history": list(rework_history),
             "rework_round": rework_round,
             "active_rework_round": 0,
-            "stage": "reporting",
+            "stage": "aggregating",
         },
     )
     if manager_plan.get("plan"):
@@ -17125,7 +16791,7 @@ def execute_hosted_workflow(
             conversation_id,
             turn_id,
             manager_plan,
-            stage="reporting",
+            stage="aggregating",
             worker_statuses=worker_statuses,
         )
     if _finish_hosted_turn_if_cancelled(conversation_id, turn_id):
@@ -17141,12 +16807,12 @@ def execute_hosted_workflow(
         item_results=item_results,
         attachments=attachments,
     )
-    reporter_status = "completed" if worker_status == "completed" else "failed"
+    aggregator_status = "completed" if worker_status == "completed" else "failed"
     final_status = (
         "completed"
         if (
             worker_status == "completed"
-            and reporter_status == "completed"
+            and aggregator_status == "completed"
             and all(status == "completed" for status in validation_statuses.values())
             and not missing_required_artifact
         )
@@ -17173,15 +16839,18 @@ def execute_hosted_workflow(
             manager_plan,
             stage="completed" if final_status == "completed" else "failed",
             worker_statuses=worker_statuses,
-            reporter_status=reporter_status,
+            reporter_status=aggregator_status,
             final_status=final_status,
         )
     persisted_run = _persist_hosted_turn(
         conversation_id,
         turn_id,
         patch={
+            "result": reporter_result,
+            # Keep the historical keys as read-only compatibility aliases;
+            # no reporter role or model turn is created.
             "reporter_result": reporter_result,
-            "reporter_status": reporter_status,
+            "reporter_status": aggregator_status,
             "validation_statuses": dict(validation_statuses),
             "validation_verdicts": validation_verdicts,
             "status": final_status,
@@ -17196,13 +16865,13 @@ def execute_hosted_workflow(
         },
         message={
             "role": "assistant",
-            "name": reporter_profile,
+            "name": dispatcher_profile,
             "content": reporter_result,
             "status": final_status,
             "kind": "message",
             "meta": {
                 "role_stage": "aggregator",
-                "role_label": "Hermes · 最终汇报",
+                "role_label": "Hermes · 调度结果",
                 "collapse_activities": True,
                 "final_report": True,
                 "attachments": attachments,
@@ -17435,9 +17104,9 @@ def start_hosted_workflow(conversation_id: str, turn_id: str) -> threading.Threa
                                     "status": "failed",
                                     "kind": "message",
                                     "meta": {
-                                        "role_stage": "reporter",
-                                        "base_role_stage": "reporter",
-                                        "role_label": "Hermes · 最终汇报",
+                                        "role_stage": "dispatcher",
+                                        "base_role_stage": "dispatcher",
+                                        "role_label": "Hermes · 调度结果",
                                         "final_report": True,
                                     },
                                 }
@@ -17994,10 +17663,12 @@ def _project_native_message(message: dict[str, Any]) -> dict[str, Any]:
     base_stage = stage.split(":", 1)[0]
     logical_role = {
         "dispatch": "dispatcher",
+        "dispatcher": "dispatcher",
         "workflow": "dispatcher",
+        "manager": "dispatcher",
         "worker": "worker",
-        "reviewer": "reviewer",
-        "reporter": "reporter",
+        "aggregator": "dispatcher",
+        "reporting": "dispatcher",
         "chat": "hermes",
         "user": "user",
         "system": "system",
@@ -18056,7 +17727,7 @@ def _project_native_message(message: dict[str, Any]) -> dict[str, Any]:
         member_id = (
             hosted_member_id(profile, stage)
             if canonical_role != "user"
-            and logical_role in {"dispatcher", "worker", "reviewer", "reporter", "supervisor"}
+            and logical_role in {"dispatcher", "worker"}
             else sender_id
         )
     model_display = " · ".join(item for item in (provider, model) if item)
@@ -24712,9 +24383,12 @@ def remove_room_member(room_id: str, member_user_id: str, request: Request):
             raise HTTPException(status_code=404, detail="Room not found")
         room_owner = str(room.get("owner_id") or "").strip()
         if target == owner_id and room_owner == owner_id:
-            # Owners close or delete their room instead of leaving it.
+            # Owners close or delete their room instead of leaving it. 409
+            # (state conflict), matching the sibling "cannot be removed"
+            # code — the request is well-formed but conflicts with the
+            # room's owner binding.
             raise HTTPException(
-                status_code=400,
+                status_code=409,
                 detail="The room owner cannot leave their own room",
             )
         if target == owner_id:

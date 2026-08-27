@@ -24,6 +24,10 @@ def oauth_file(monkeypatch, tmp_path):
     return target
 
 
+@pytest.mark.skipif(
+    os.name == "nt",
+    reason="Windows stat mode does not reflect 0o600 (no POSIX permission bits)",
+)
 def test_dashboard_oauth_write_uses_owner_only_permissions(oauth_file):
     old_umask = os.umask(0o022)
     try:

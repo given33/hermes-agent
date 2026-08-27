@@ -147,6 +147,7 @@ required_runtime_sources=(
   "hermes_services/http_policy.py"
   "hermes_services/internal_hooks.py"
   "hermes_services/jsonrpc.py"
+  "hermes_services/latency_trace.py"
   "hermes_services/low_latency_protocol.py"
   "hermes_services/middleware.py"
   "hermes_services/resource_catalog.py"
@@ -394,6 +395,7 @@ scp "${ssh_args[@]}" \
   "${repo}/hermes_services/http_policy.py" \
   "${repo}/hermes_services/internal_hooks.py" \
   "${repo}/hermes_services/jsonrpc.py" \
+  "${repo}/hermes_services/latency_trace.py" \
   "${repo}/hermes_services/low_latency_protocol.py" \
   "${repo}/hermes_services/middleware.py" \
   "${repo}/hermes_services/resource_catalog.py" \

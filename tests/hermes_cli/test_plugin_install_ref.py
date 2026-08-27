@@ -341,7 +341,7 @@ def test_metadata_write_failure_rolls_back_removal(monkeypatch, tmp_path):
     )
 
     with pytest.raises(OSError, match="disk full"):
-        _remove_plugin_core(target)
+        _remove_plugin_core(target, target.parent)
 
     assert target.exists()
     assert _git(target, "rev-parse", "HEAD") == old_sha
@@ -358,7 +358,14 @@ def test_reinstall_after_manual_directory_removal_retains_pin(monkeypatch, tmp_p
     target, _manifest, _name = _install_plugin_core(
         repo.as_uri(), force=False, ref=old_sha
     )
-    shutil.rmtree(target)
+    # Simulate the user deleting the installed plugin directory. Git-for-
+    # Windows clones carry read-only loose objects (0444) that plain
+    # shutil.rmtree cannot delete on Windows (WinError 5) — the product's
+    # own bounded deleter clears the attribute, which is also what a plugin
+    # uninstall path would use.
+    from hermes_cli.safe_delete import safe_rmtree
+
+    safe_rmtree(target, target.parent)
 
     target, _manifest, _name = _install_plugin_core(repo.as_uri(), force=False)
 

@@ -6,6 +6,7 @@ import json
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
 
+import pytest
 
 from tools.vision_tools import (
     _detect_video_mime_type,
@@ -158,7 +159,10 @@ class TestVideoAnalyzeTool:
         secret = tmp_path / ".env"
         secret.write_text("OPENAI_API_KEY=sk-super-secret\n", encoding="utf-8")
         disguised = tmp_path / "video.mp4"
-        disguised.symlink_to(secret)
+        try:
+            disguised.symlink_to(secret)
+        except OSError:
+            pytest.skip("symlink creation not permitted on this host (WinError 1314)")
 
         with patch("tools.vision_tools.async_call_llm", new_callable=AsyncMock) as mock_llm:
             result = self._run(video_analyze_tool(str(disguised), "What is this?"))

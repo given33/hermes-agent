@@ -7,7 +7,11 @@ on:
   workflow_dispatch:
     inputs:
       tag:
-        description: Optional exact NousResearch/hermes-agent tag
+        description: Optional exact NousResearch/hermes-agent tag (legacy input)
+        required: false
+        type: string
+      ref:
+        description: Optional upstream main ref or exact tag; defaults to upstream/main
         required: false
         type: string
 
@@ -32,27 +36,34 @@ jobs:
         with:
           fetch-depth: 0
 
-      - name: Fetch and select the upstream release
+      - name: Fetch and select the upstream revision
         id: release
         shell: bash
         env:
           REQUESTED_TAG: ${{ inputs.tag }}
+          REQUESTED_REF: ${{ inputs.ref }}
         run: |
           set -euo pipefail
           git remote remove upstream 2>/dev/null || true
           git remote add upstream https://github.com/NousResearch/hermes-agent.git
-          git fetch --force --tags upstream '+refs/tags/*:refs/tags/*'
-          tag="${REQUESTED_TAG:-}"
-          if [[ -z "$tag" ]]; then
-            tag="$(git tag --list 'v[0-9]*' --sort=-version:refname | head -n 1)"
+          git fetch --force --tags upstream \
+            '+refs/heads/main:refs/remotes/upstream/main' \
+            '+refs/tags/*:refs/tags/*'
+          requested="${REQUESTED_REF:-${REQUESTED_TAG:-}}"
+          ref="${requested:-refs/remotes/upstream/main}"
+          if [[ "$ref" =~ ^v[0-9]+([.][0-9]+)+$ ]]; then
+            ref="refs/tags/$ref"
           fi
-          [[ "$tag" =~ ^v[0-9]+([.][0-9]+)+$ ]] || {
-            echo "Invalid upstream tag: $tag" >&2
+          [[ "$ref" == refs/remotes/upstream/main || "$ref" == refs/tags/v[0-9]* ]] || {
+            echo "Invalid upstream ref: $ref" >&2
             exit 2
           }
-          git rev-parse --verify "refs/tags/$tag^{commit}" >/dev/null
-          echo "tag=$tag" >> "$GITHUB_OUTPUT"
-          if git merge-base --is-ancestor "$tag" origin/main; then
+          git rev-parse --verify "${ref}^{commit}" >/dev/null
+          label="${ref#refs/remotes/upstream/}"
+          label="${label#refs/tags/}"
+          echo "ref=$ref" >> "$GITHUB_OUTPUT"
+          echo "label=$label" >> "$GITHUB_OUTPUT"
+          if git merge-base --is-ancestor "$ref" origin/main; then
             echo "needed=false" >> "$GITHUB_OUTPUT"
           else
             echo "needed=true" >> "$GITHUB_OUTPUT"
@@ -60,14 +71,14 @@ jobs:
 
       - name: Stop when main already contains the release
         if: steps.release.outputs.needed != 'true'
-        run: echo "${{ steps.release.outputs.tag }} is already contained in main."
+        run: echo "${{ steps.release.outputs.label }} is already contained in main."
 
       - name: Generate the pre-merge risk report
         if: steps.release.outputs.needed == 'true'
         run: |
           python3 scripts/upstream_change_report.py \
             --base origin/main \
-            --tag '${{ steps.release.outputs.tag }}' \
+            --tag '${{ steps.release.outputs.ref }}' \
             --output "$RUNNER_TEMP/upstream-report.md"
 
       - name: Merge into the managed sync branch
@@ -76,13 +87,14 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          tag='${{ steps.release.outputs.tag }}'
-          branch="upstream-sync/$tag"
+          ref='${{ steps.release.outputs.ref }}'
+          label='${{ steps.release.outputs.label }}'
+          branch="upstream-sync/main"
           git config user.name github-actions[bot]
           git config user.email 41898282+github-actions[bot]@users.noreply.github.com
           git switch --force-create "$branch" origin/main
           set +e
-          git merge --no-ff --no-edit "$tag" >"$RUNNER_TEMP/merge.log" 2>&1
+          git merge --no-ff --no-edit "$ref" >"$RUNNER_TEMP/merge.log" 2>&1
           status=$?
           set -e
           if [[ $status -ne 0 ]]; then
@@ -99,7 +111,7 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          title="Upstream sync conflict: ${{ steps.release.outputs.tag }}"
+          title="Upstream sync conflict: ${{ steps.release.outputs.label }}"
           {
             cat "$RUNNER_TEMP/upstream-report.md"
             printf '\n## Merge conflicts\n\n```text\n'
@@ -142,7 +154,7 @@ jobs:
         run: |
           set -euo pipefail
           branch='${{ steps.merge.outputs.branch }}'
-          tag='${{ steps.release.outputs.tag }}'
+          label='${{ steps.release.outputs.label }}'
           {
             cat "$RUNNER_TEMP/upstream-report.md"
             printf '\n## Sync preflight\n\n- Product integration preflight: `%s`\n' '${{ steps.product.outcome }}'
@@ -157,7 +169,7 @@ jobs:
             gh pr create \
               --base main \
               --head "$branch" \
-              --title "chore: sync official Hermes $tag" \
+              --title "chore: sync official Hermes $label" \
               --body-file "$RUNNER_TEMP/pr-body.md" \
               --label upstream-sync \
               --label codex-review-required

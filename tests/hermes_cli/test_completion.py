@@ -16,6 +16,28 @@ from hermes_cli.completion import _walk, generate_bash, generate_zsh, generate_f
 # Helpers
 # ---------------------------------------------------------------------------
 
+def _usable_bash() -> "str | None":
+    """Locate a bash that can actually run scripts.
+
+    On Windows ``shutil.which("bash")`` commonly resolves the WSL shim
+    (``C:\\Windows\\System32\\bash.exe``), which only forwards to a WSL
+    distro and cannot syntax-check a host file when WSL is unavailable.
+    Prefer a real Git Bash — the same ladder ``tests/tools/
+    test_browser_use_cli.py::_git_bash`` uses — and fall back to the PATH
+    lookup off Windows.
+    """
+    if os.name == "nt":
+        for candidate in (
+            r"C:\Program Files\Git\bin\bash.exe",
+            r"C:\Program Files\Git\usr\bin\bash.exe",
+            r"C:\Program Files (x86)\Git\bin\bash.exe",
+        ):
+            if os.path.isfile(candidate):
+                return candidate
+        return None
+    return shutil.which("bash")
+
+
 def _make_parser() -> argparse.ArgumentParser:
     """Build a minimal parser that mirrors the real hermes structure."""
     p = argparse.ArgumentParser(prog="hermes")
@@ -86,12 +108,19 @@ class TestGenerateBash:
 
     def test_valid_bash_syntax(self):
         """Script must pass `bash -n` syntax check."""
+        bash = _usable_bash()
+        if not bash:
+            pytest.skip("no bash available (Git Bash not installed on Windows)")
         out = generate_bash(_make_parser())
-        with tempfile.NamedTemporaryFile(mode="w", suffix=".bash", delete=False) as f:
+        # newline="\n" keeps the script LF: sh chokes on CRLF bodies (same
+        # rule as tests/tools/test_browser_use_cli.py::_write_sh).
+        with tempfile.NamedTemporaryFile(
+            mode="w", suffix=".bash", delete=False, encoding="utf-8", newline="\n"
+        ) as f:
             f.write(out)
             path = f.name
         try:
-            result = subprocess.run(["bash", "-n", path], capture_output=True)
+            result = subprocess.run([bash, "-n", path], capture_output=True)
             assert result.returncode == 0, result.stderr.decode()
         finally:
             os.unlink(path)

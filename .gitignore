@@ -102,6 +102,11 @@ apps/desktop/src/**/*.d.ts
 # Repo-root build/debug artifacts that must never be committed
 /log.txt
 /sqlite_leak_fix.png
+/.tmp-motion-repair/
+/%SystemDrive%/
+/$tmp
+/.py
+/tmp_cli.log
 /*.png.bak
 /default.tar.gz
 apps/shared/src/**/*.js

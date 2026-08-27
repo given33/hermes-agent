@@ -40,7 +40,7 @@ HERMES_UID=$(id -u) HERMES_GID=$(id -g) docker compose up -d
 
 | 路径 | 用途(取自各文件头注释) |
 |---|---|
-| `deploy/dbb3/dbb3_cloud_connector.py` | DBB3/PC → Hermes 协作连接器:小型轮询桥,为每个租约的云 run 建幂等 Kanban 根、上报紧凑 checkpoint、上传产物;checkpoint 文件即恢复边界(重启复用同一 idempotency key/游标/产物键,不产生重复工作) |
+| `deploy/dbb3/dbb3_cloud_connector.py` | DBB3/PC/HK → Hermes 协作连接器:小型轮询桥,为每个租约的云 run 建幂等 Kanban 根、上报紧凑 checkpoint、上传产物;checkpoint 文件即恢复边界(重启复用同一 idempotency key/游标/产物键,不产生重复工作) |
 | `deploy/dbb3/dbb3-cloud-connector.service` | 上者的 systemd unit 模板 |
 | `deploy/dbb3/install-dbb3-cloud-connector-user.sh` | 把连接器装成 **user service**(root 只用于 root 属主源路径与既有 root:hermes token;长驻进程归 hermes 用户);带安装锁 `/run/lock/hermes-agent/cloud-connector-install.lock` |
 | `deploy/dbb3/test-install-dbb3-cloud-connector-user-rollback.sh` | 上述安装器的回滚测试 harness(需 root) |
@@ -49,6 +49,7 @@ HERMES_UID=$(id -u) HERMES_GID=$(id -g) docker compose up -d
 | `deploy/dbb3/hermes-services.sudoers`、`hermes-collaboration-deploy.sudoers` | 限定 sudo 白名单 |
 | `deploy/pc/install-pc-cloud-connector-user.sh` | 复用 dbb3 安装器,把共享连接器装进 WSL 的隔离 `pc-primary` user service |
 | `deploy/pc/run-pc-cloud-connector.sh` | WSL 侧运行包装:state 根、源路径、token 文件(默认 `/etc/pc-team/cloud_connector_token`)、云端 URL(默认 `https://…/api/plugins/collaboration`)、`HERMES_HOME` 均可 env 覆盖 |
+| `deploy/hk/install-hk-worker.sh`、`deploy/hk/install-hk-cloud-connector-user.sh` | 香港 worker 首次引导与隔离 `hk-primary` user service:独立源码 checkout、`hk-worker` profile/skills、token、state 和 fabric 自动更新 timer |
 | `deploy/public/install-collaboration-backend.sh` | 公网主机 root 侧**事务化安装器**:调用方以非特权账号上传 stage,经 sudo 调本脚本;staged Python/manifest 校验 + 带认证的 connector-health 预检通过前**不替换任何文件**;`mutated` 标志决定回滚是否执行 restore(修复"未变更也误回滚"误报,见 CHANGES) |
 | `deploy/public/deploy-collaboration-backend.sh` | 从本仓推送 stage 到公网主机(默认走 WireGuard 地址,`HERMES_PUBLIC_REMOTE` 覆盖) |
 | `deploy/public/configure-connector-credential.sh` | 写 connector 凭据:`/etc/hermes-agent/hermes-agent.env` + connector-token map `/etc/hermes-agent/collaboration-connector-tokens.json` |
@@ -69,7 +70,10 @@ The `deploy-three-endpoints.yml` workflow is the release gate for the public
 backend and its fabric nodes. A successful push to `main`, published release,
 or explicit manual run first waits for the same commit's complete `CI`
 workflow, then dispatches the unsigned release event to the iOS repository.
-By default the fan-out dispatches
+The hosted workflow is dispatcher-plus-workers only: DBB3, PC/WSL, and HK use
+independent profiles, skills, tokens, and state while sharing the same source
+commit. Worker updates use the authenticated WebSocket channel with the
+durable queue as replay fallback. By default the fan-out dispatches
 `hermes-backend-release-unsigned`; signed opt-in uses
 `hermes-backend-release` so both child workflows run. The unsigned artifact is
 the normal delivery because

@@ -11,8 +11,6 @@ def build_hosted_turn_plan(
     *,
     turn_id: str,
     worker_profiles: Iterable[str],
-    reviewer_profile: str = "",
-    reporter_profile: str = "default",
     artifact_required: bool,
     revision: int = 1,
 ) -> TurnPlan:
@@ -26,7 +24,7 @@ def build_hosted_turn_plan(
     nodes: list[TurnPlanNode] = [
         TurnPlanNode(
             node_id="manager_planning",
-            role="manager",
+            role="dispatcher",
             output_contract="manager-plan.v1",
             acceptance_contract="valid normalized manager plan",
             conflict_keys=(f"turn:{turn_id}:plan",),
@@ -79,19 +77,6 @@ def build_hosted_turn_plan(
                 parallel_group="handoff",
                 token_budget=8_000,
                 time_budget_seconds=120,
-            ),
-            TurnPlanNode(
-                node_id="report",
-                role=reporter_profile or "default",
-                depends_on=("worker_handoff",),
-                input_artifact_refs=("worker-handoff",),
-                output_contract="final-report.v1",
-                acceptance_contract="deterministic aggregation matches worker evidence and artifact contract",
-                conflict_keys=(f"turn:{turn_id}:report",),
-                risk_class="external_emission" if artifact_required else "read_only",
-                parallel_group="report",
-                token_budget=12_000,
-                time_budget_seconds=180,
             ),
         ]
     )

@@ -120,7 +120,11 @@ def test_read_file_raw_not_clamped(tmp_path, ops):
     max_len = get_max_line_length()
     p = tmp_path / "long_raw.txt"
     long_line = "z" * (10 * max_len)
-    p.write_text(long_line + "\n")
+    # write_bytes (not write_text): on Windows, text-mode write translates
+    # ``\n`` to ``\r\n`` on disk, and read_file_raw (cat) is byte-transparent,
+    # so the round-trip assertion below would see CRLF. The test is about the
+    # no-per-line-truncation contract, not about line-ending translation.
+    p.write_bytes((long_line + "\n").encode("utf-8"))
     result = ops.read_file_raw(str(p))
     assert result.error is None
     assert result.content == long_line + "\n"

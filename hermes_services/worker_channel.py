@@ -28,8 +28,9 @@ HOSTED_MEMBER_NODES = {
     "hermes-manager": "server",
     "dbb3-worker": "dbb3",
     "pc-worker": "wsl",
+    "hk-worker": "hk",
 }
-WORKER_NODE_IDS = frozenset({"dbb3-worker", "pc-worker"})
+WORKER_NODE_IDS = frozenset({"dbb3-worker", "pc-worker", "hk-worker"})
 MAX_BACKLOG = 4096
 MAX_EVENT_BYTES = 512 * 1024
 HEARTBEAT_TIMEOUT_SECONDS = 90.0
@@ -70,7 +71,8 @@ class WorkerChannelRegistry:
     ) -> WorkerConnection:
         node = str(node_id or "").strip()
         if node not in WORKER_NODE_IDS:
-            raise ProtocolError("only dbb3-worker and pc-worker may connect remotely")
+            allowed = ", ".join(sorted(WORKER_NODE_IDS))
+            raise ProtocolError(f"only {allowed} may connect remotely")
         generation = str(connection_generation or "").strip()
         if not generation:
             raise ProtocolError("connection_generation is required")

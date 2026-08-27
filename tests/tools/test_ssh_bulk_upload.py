@@ -148,7 +148,11 @@ class TestSSHBulkUpload:
                 staging_dir = cmd[c_idx + 1]
                 assert not os.path.exists(os.path.join(staging_dir, "home"))
                 expected = os.path.join(staging_dir, "cache/nested.txt")
-                assert os.path.islink(expected)
+                assert os.path.exists(expected)
+                if os.name != "nt":
+                    # POSIX staging uses symlinks; Windows without Developer
+                    # Mode falls back to a copy (winerror 1314) by design.
+                    assert os.path.islink(expected)
 
             mock = MagicMock()
             mock.stdout = MagicMock()

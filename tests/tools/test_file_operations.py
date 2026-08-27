@@ -587,8 +587,19 @@ class _DeletedTestGitBaselineCheck:
 # =========================================================================
 
 class TestAtomicWriteNewFilePermissions:
-    """_atomic_write should apply umask-default perms to new files (not 0600)."""
+    """_atomic_write should apply umask-default perms to new files (not 0600).
 
+    POSIX-only semantics: ``os.stat().st_mode`` on Windows only reports
+    ``0o666``/``0o444`` (read-only bit) and ``os.umask()`` does not
+    propagate to the Git Bash child that runs the atomic-write script, so
+    umask-derived mode bits cannot be asserted there.
+    """
+
+    @pytest.mark.skipif(
+        os.name == "nt",
+        reason="POSIX-only umask/mode-bit semantics: Windows st_mode has no "
+        "umask-derived bits and os.umask() does not propagate to the shell child",
+    )
     @pytest.mark.parametrize("test_umask", [0o022, 0o002, 0o077])
     def test_new_file_gets_umask_default_permissions(self, tmp_path, test_umask):
         """Newly created file should get umask-computed perms, not mktemp's 0600.
@@ -614,6 +625,11 @@ class TestAtomicWriteNewFilePermissions:
             f"got {actual_mode:04o}"
         )
 
+    @pytest.mark.skipif(
+        os.name == "nt",
+        reason="POSIX-only mode-bit semantics: Windows st_mode only reports "
+        "the read-only bit, so 0o755 cannot be observed",
+    )
     def test_overwrite_still_preserves_existing_mode(self, tmp_path):
         """The new-file branch must not disturb the overwrite path's
         mode preservation (e.g. an executable script stays 0755)."""
@@ -636,6 +652,7 @@ class TestAtomicWriteThroughSymlink:
     plain file, orphaning the real target and destroying the link (data-loss).
     """
 
+    @pytest.mark.require_symlinks
     def test_write_follows_symlink_and_preserves_link(self, tmp_path):
         ops = ShellFileOperations(make_real_subprocess_env(str(tmp_path)))
         real = tmp_path / "real.txt"
@@ -652,6 +669,7 @@ class TestAtomicWriteThroughSymlink:
         assert real.read_text() == "newcontent\n"
         assert os.path.realpath(link) == str(real)
 
+    @pytest.mark.require_symlinks
     def test_write_through_broken_symlink_falls_back(self, tmp_path):
         """A broken link resolves through readlink -f and creates the target."""
         ops = ShellFileOperations(make_real_subprocess_env(str(tmp_path)))

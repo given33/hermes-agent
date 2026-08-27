@@ -248,8 +248,8 @@ async def test_multiplex_picker_global_persists_only_named_profile(
         set_multiplex_active(False)
 
     assert "gpt-5.5" in confirmation
-    assert yaml.safe_load((default_home / "config.yaml").read_text()) == default_cfg
-    written = yaml.safe_load((named_home / "config.yaml").read_text())
+    assert yaml.safe_load((default_home / "config.yaml").read_text(encoding="utf-8")) == default_cfg
+    written = yaml.safe_load((named_home / "config.yaml").read_text(encoding="utf-8"))
     assert written["marker"] == "named"
     assert written["model"]["default"] == "gpt-5.5"
     assert written["model"]["provider"] == "openrouter"

@@ -298,7 +298,10 @@ class TestAtomicWrite:
         res = ops.patch_replace(str(target), "b = 2", "b = 22")
         assert res.success, res.error
         assert target.read_text(encoding="utf-8") == "a = 1\nb = 22\nc = 3\n"
-        assert (os.stat(target).st_mode & 0o777) == 0o600
+        # Mode-bit preservation is POSIX-only: Windows st_mode reports
+        # 0o666/0o444 (read-only bit only), so 0o600 cannot be observed.
+        if os.name != "nt":
+            assert (os.stat(target).st_mode & 0o777) == 0o600
 
 
 class TestBomHandling:
@@ -508,6 +511,7 @@ class TestProtectedInstructionFiles:
 
     # ---- adversarial path shapes ----------------------------------------
 
+    @pytest.mark.require_symlinks
     def test_symlink_to_protected_file_is_gated(self, tmp_path, approvals):
         """#41351 lesson: realpath first — innocent name, protected target."""
         real = tmp_path / "AGENTS.md"

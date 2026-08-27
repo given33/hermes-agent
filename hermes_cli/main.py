@@ -4276,7 +4276,6 @@ _AUX_TASKS: list[tuple[str, str, str]] = [
     ("approval", "Approval", "smart command approval"),
     ("mcp", "MCP", "MCP tool reasoning"),
     ("title_generation", "Title generation", "session titles"),
-    ("review", "Review", "/review reviewer subagent"),
     ("memory_query_rewrite", "Memory query rewrite", "memory retrieval queries"),
     ("tts_audio_tags", "TTS audio tags", "Gemini TTS tag insertion"),
     ("skills_hub", "Skills hub", "skills search/install"),
@@ -10747,7 +10746,6 @@ def cmd_update(args):
     """
     from hermes_cli.config import (
         is_managed,
-        is_nix_install_method,
         managed_error,
     )
 
@@ -10768,9 +10766,26 @@ def cmd_update(args):
             print_update_plan,
         )
 
-    if is_nix_install_method(install_method) or install_method == "apt":
-        print(recommended_update_command_for_method(install_method))
-        sys.exit(1)
+        print_update_plan(collect_runtime_inventory())
+        return
+
+    # Image-managed / package-managed admission gate (#91277 Phase 3): one
+    # shared decision for every mutation surface. Consults the baked image
+    # provenance marker first (authoritative, fail-closed on malformed),
+    # then the pre-existing docker/nix/apt heuristics. Prints the real
+    # update command, records a `refused` receipt so fleet tooling sees the
+    # blocked attempt, and exits 2 (refused-by-contract, distinct from
+    # exit 1 errors).
+    from hermes_cli.update_contract import (
+        evaluate_update_admission,
+        record_refusal_receipt,
+    )
+
+    refusal = evaluate_update_admission(PROJECT_ROOT)
+    if refusal is not None:
+        print(refusal.message)
+        record_refusal_receipt(refusal)
+        sys.exit(2)
 
     if getattr(args, "check", False):
         # --check honors --branch so the "any new commits?" answer matches

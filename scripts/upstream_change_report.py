@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Generate a deterministic risk report for an upstream Hermes tag."""
+"""Generate a deterministic risk report for an upstream Hermes revision."""
 
 from __future__ import annotations
 
@@ -48,10 +48,10 @@ def bullets(values: list[str], *, empty: str = "None") -> str:
     return "\n".join(f"- `{value}`" for value in values)
 
 
-def build_report(base: str, upstream_tag: str) -> str:
-    merge_base = git("merge-base", base, upstream_tag)
+def build_report(base: str, upstream_ref: str) -> str:
+    merge_base = git("merge-base", base, upstream_ref)
     fork_files = changed_files(merge_base, base)
-    upstream_files = changed_files(merge_base, upstream_tag)
+    upstream_files = changed_files(merge_base, upstream_ref)
     overlap = sorted(fork_files & upstream_files)
     ios_risk = sorted(path for path in upstream_files if matches_any(path, IOS_RISK_PREFIXES))
     deployment_risk = sorted(
@@ -61,7 +61,7 @@ def build_report(base: str, upstream_tag: str) -> str:
         "log",
         "--no-merges",
         "--pretty=format:%h %s",
-        f"{merge_base}..{upstream_tag}",
+        f"{merge_base}..{upstream_ref}",
     ).splitlines()
     commits = commits[:200]
     verdict = (
@@ -71,7 +71,7 @@ def build_report(base: str, upstream_tag: str) -> str:
     )
     return f"""# Upstream Hermes sync report
 
-- Upstream: `NousResearch/hermes-agent@{upstream_tag}`
+- Upstream revision: `NousResearch/hermes-agent@{upstream_ref}`
 - Product base: `{base}`
 - Merge base: `{merge_base}`
 - Upstream commits: `{len(commits)}` (report capped at 200)
@@ -108,17 +108,17 @@ decision even when the merge itself is conflict-free.
 - [ ] Codex reviewed direct overlap and the generated risk sections.
 - [ ] Any required Hermes iOS adaptation was explicitly accepted or deferred.
 - [ ] The approved `main` commit was deployed transactionally to the main server.
-- [ ] DBB3 and WSL report the exact approved commit and pass health probes.
+- [ ] DBB3, WSL, and HK report the exact approved commit and pass health probes.
 """
 
 
 def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--base", default="origin/main")
-    parser.add_argument("--tag", required=True)
+    parser.add_argument("--tag", "--ref", dest="upstream_ref", required=True)
     parser.add_argument("--output", type=Path, required=True)
     args = parser.parse_args()
-    report = build_report(args.base, args.tag)
+    report = build_report(args.base, args.upstream_ref)
     args.output.parent.mkdir(parents=True, exist_ok=True)
     args.output.write_text(report, encoding="utf-8", newline="\n")
     return 0

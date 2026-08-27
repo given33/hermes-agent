@@ -6,7 +6,7 @@ die() { printf 'update-fabric-node: %s\n' "$*" >&2; exit 1; }
 [[ "$(id -u)" == 0 ]] || die "must run as root"
 
 role="${HERMES_FABRIC_ROLE:-${1:-}}"
-case "${role}" in dbb3|wsl) ;; *) die "role must be dbb3 or wsl" ;; esac
+case "${role}" in dbb3|wsl|hk) ;; *) die "role must be dbb3, wsl, or hk" ;; esac
 repository_url="${HERMES_FABRIC_REPOSITORY:-https://github.com/given33/hermes-agent.git}"
 [[ "${repository_url}" == "https://github.com/given33/hermes-agent.git" ]] \
   || die "repository URL is not approved"
@@ -44,6 +44,10 @@ case "${role}" in
   wsl)
     token_file="${HERMES_CLOUD_TOKEN_FILE:-/etc/pc-team/cloud_connector_token}"
     connector_id="${DBB3_CONNECTOR_ID:-pc-primary}"
+    ;;
+  hk)
+    token_file="${HERMES_CLOUD_TOKEN_FILE:-/etc/hk-team/cloud_connector_token}"
+    connector_id="${DBB3_CONNECTOR_ID:-hk-primary}"
     ;;
 esac
 [[ -f "${token_file}" && ! -L "${token_file}" ]] || die "connector token is missing or unsafe"
@@ -106,6 +110,11 @@ cleanup() {
         ;;
       wsl)
         bash "${preflight_root}/deploy/pc/install-pc-cloud-connector-user.sh" \
+          "--rollback-backup=${connector_backup}" \
+          || rollback_failed=1
+        ;;
+      hk)
+        bash "${preflight_root}/deploy/hk/install-hk-cloud-connector-user.sh" \
           "--rollback-backup=${connector_backup}" \
           || rollback_failed=1
         ;;
@@ -286,6 +295,14 @@ if [[ "${role}" == wsl ]]; then
     "deploy/pc/pc-cloud-connector.service"
   )
 fi
+if [[ "${role}" == hk ]]; then
+  archive_paths+=(
+    "deploy/hk/install-hk-cloud-connector-user.sh"
+    "deploy/hk/hk-cloud-connector.service"
+    "deploy/hk/profile/config.yaml.example"
+    "deploy/hk/profile/SOUL.md"
+  )
+fi
 git --git-dir="${mirror}" archive --format=tar "${release_commit}" \
   -- "${archive_paths[@]}" | tar -xf - -C "${stage}"
 # The connector installer deliberately drops to the service account for its
@@ -339,6 +356,28 @@ case "${role}" in
       "${stage}/deploy/dbb3/dbb3-cloud-connector.service" \
       "${preflight_root}/deploy/dbb3/dbb3-cloud-connector.service"
     ;;
+  hk)
+    install -d -o root -g root -m 0755 "${preflight_root}/deploy/hk" "${preflight_root}/deploy/dbb3"
+    install -o root -g root -m 0755 \
+      "${stage}/deploy/hk/install-hk-cloud-connector-user.sh" \
+      "${preflight_root}/deploy/hk/install-hk-cloud-connector-user.sh"
+    install -o root -g root -m 0644 \
+      "${stage}/deploy/hk/hk-cloud-connector.service" \
+      "${preflight_root}/deploy/hk/hk-cloud-connector.service"
+    install -d -o root -g root -m 0755 "${preflight_root}/deploy/hk/profile"
+    install -o root -g root -m 0644 \
+      "${stage}/deploy/hk/profile/config.yaml.example" \
+      "${preflight_root}/deploy/hk/profile/config.yaml.example"
+    install -o root -g root -m 0644 \
+      "${stage}/deploy/hk/profile/SOUL.md" \
+      "${preflight_root}/deploy/hk/profile/SOUL.md"
+    install -o root -g root -m 0755 \
+      "${stage}/deploy/dbb3/install-dbb3-cloud-connector-user.sh" \
+      "${preflight_root}/deploy/dbb3/install-dbb3-cloud-connector-user.sh"
+    install -o root -g root -m 0644 \
+      "${stage}/deploy/dbb3/dbb3_cloud_connector.py" \
+      "${preflight_root}/deploy/dbb3/dbb3_cloud_connector.py"
+    ;;
 esac
 
 automation_assets=(
@@ -387,10 +426,11 @@ runtime_assets+=("hermes_auth_errors.py" "hermes_constants.py" "hermes_secret_co
 case "${role}" in
   dbb3) runtime_root="${HERMES_DBB3_AGENT_ROOT:-/usr/local/lib/hermes-agent}" ;;
   wsl) runtime_root="${HERMES_WSL_AGENT_ROOT:-/mnt/d/Hermes/hermes-agent}" ;;
+  hk) runtime_root="${HERMES_HK_AGENT_ROOT:-/opt/hk-team/hermes-agent}" ;;
 esac
 if [[ "${allow_test_paths}" != 1 ]]; then
   case "${role}:${runtime_root}" in
-    dbb3:/usr/local/lib/hermes-agent|wsl:/mnt/d/Hermes/hermes-agent) ;;
+    dbb3:/usr/local/lib/hermes-agent|wsl:/mnt/d/Hermes/hermes-agent|hk:/opt/hk-team/hermes-agent) ;;
     *) die "managed receiver runtime root override is not allowed" ;;
   esac
 fi
@@ -512,6 +552,15 @@ case "${role}" in
       "${wsl_secret_stage}/installation-key" \
       "--handle-file=${receiver_handle}"
     receiver_installed=1
+    ;;
+  hk)
+    bash "${preflight_root}/deploy/hk/install-hk-cloud-connector-user.sh" \
+      "--handle-file=${connector_handle}"
+    connector_installed=1
+    [[ "${HERMES_FABRIC_FAILPOINT:-}" != after-connector ]] \
+      || die "injected fabric failure after connector"
+    # HK is a worker-only Linux node; unlike DBB3 it has no managed-installation
+    # receiver. Its connector and shared runtime are updated transactionally.
     ;;
 esac
 [[ "${HERMES_FABRIC_FAILPOINT:-}" != after-receiver ]] \

@@ -23,6 +23,8 @@ def _run(*args):
         cwd=REPO_ROOT,
         text=True,
         capture_output=True,
+        encoding="utf-8",
+        errors="replace",
     )
 
 

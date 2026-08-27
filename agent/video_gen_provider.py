@@ -561,11 +561,14 @@ class OpenAICompatibleVideoGenProvider(VideoGenProvider):
             try:
                 if url:
                     # Materialise the (often short-lived) delivery URL locally.
-                    video_ref = str(save_url_video(url, prefix=self.name))
+                    # as_posix(): the reference handed to callers keeps forward
+                    # slashes on every platform (Windows str(Path) yields
+                    # backslashes, breaking path-based callers/downloaders).
+                    video_ref = save_url_video(url, prefix=self.name).as_posix()
                 else:
                     # OpenAI/Sora style: no public URL — pull bytes via the SDK.
                     raw = client.videos.download_content(video.id).read()
-                    video_ref = str(save_bytes_video(raw, prefix=self.name))
+                    video_ref = save_bytes_video(raw, prefix=self.name).as_posix()
             except Exception as exc:  # noqa: BLE001
                 if url:
                     # Best-effort: hand back the URL rather than fail outright.

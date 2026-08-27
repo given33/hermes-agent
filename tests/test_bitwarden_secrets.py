@@ -94,7 +94,9 @@ def test_platform_asset_name(system, machine, libc_text, expected):
 def _make_fake_zip(binary_bytes: bytes) -> bytes:
     buf = io.BytesIO()
     with zipfile.ZipFile(buf, "w") as zf:
-        zf.writestr("bws", binary_bytes)
+        # Mirror the layout upstream actually ships per platform: the
+        # Windows asset carries ``bws.exe``, every other asset ``bws``.
+        zf.writestr("bws.exe" if os.name == "nt" else "bws", binary_bytes)
     return buf.getvalue()
 
 
@@ -157,8 +159,13 @@ def test_install_bws_happy_path(hermes_home, monkeypatch):
     path = bw.install_bws()
     assert path.exists()
     assert path.read_bytes() == fake_binary
-    # Executable bit set
-    assert path.stat().st_mode & stat.S_IXUSR
+    # Executable bit set.  POSIX records it in st_mode; Windows stat carries
+    # no execute bits, so there the contract is the .exe name + os.access.
+    if os.name == "posix":
+        assert path.stat().st_mode & stat.S_IXUSR
+    else:
+        assert path.name == "bws.exe"
+        assert os.access(path, os.X_OK)
 
 
 
@@ -371,7 +378,14 @@ def test_encrypted_cache_writes_without_plaintext(monkeypatch, tmp_path):
     cache_path = bw._encrypted_disk_cache_path(home)
     assert cache_path.exists()
     mode = stat.S_IMODE(os.stat(cache_path).st_mode)
-    assert mode == 0o600, f"expected 0o600, got 0o{mode:o}"
+    if os.name == "posix":
+        assert mode == 0o600, f"expected 0o600, got 0o{mode:o}"
+    else:
+        # Windows stat carries no POSIX permission bits (chmod(0o600) is
+        # reflected only as the read-only attribute; stat reports 0o666 for an
+        # owner-writable file).  The enforceable contract there is "not
+        # read-only — the user's ACL on HERMES_HOME provides the isolation".
+        assert mode & stat.S_IWRITE, f"cache file must stay owner-writable, got 0o{mode:o}"
     text = cache_path.read_text()
     assert "secret-value" not in text
     assert "0.t" not in text

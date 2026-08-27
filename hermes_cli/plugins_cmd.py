@@ -1208,10 +1208,10 @@ def cmd_update(name: str) -> None:
 
 def _remove_plugin_core(target: Path, allowed_root: Path) -> None:
     """Remove one plugin and its metadata without splitting their state."""
+    from hermes_cli.safe_delete import safe_rmtree
+
     metadata = _read_install_metadata()
     if target.name not in metadata:
-        from hermes_cli.safe_delete import safe_rmtree
-
         safe_rmtree(target, allowed_root)
         return
 
@@ -1232,9 +1232,17 @@ def _remove_plugin_core(target: Path, allowed_root: Path) -> None:
                 f"Plugin metadata update failed and '{target.name}' could not be "
                 f"restored automatically; recovery copy remains at {backup}."
             ) from restore_exc
-        shutil.rmtree(staging, ignore_errors=True)
+        # Best-effort staging cleanup: the install was restored, so leftover
+        # staging must never mask the original metadata error below.
+        try:
+            safe_rmtree(staging, allowed_root)
+        except Exception:
+            pass
         raise
-    shutil.rmtree(staging)
+    # Git-for-Windows clones contain read-only loose objects (0444) that
+    # plain shutil.rmtree cannot delete on Windows (WinError 5); safe_rmtree
+    # clears the attribute first (see safe_delete._unlink_file).
+    safe_rmtree(staging, allowed_root)
 
 
 def cmd_remove(name: str) -> None:

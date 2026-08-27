@@ -15,6 +15,17 @@ from typing import Any, Mapping
 LEGACY_MANAGER_PROFILE = "dbb3-manager"
 CURRENT_MANAGER_PROFILE = "hermes-manager"
 RETIRED_ROLE_MARKERS = frozenset({"supervisor", "reviewer"})
+OBSOLETE_WORKFLOW_FIELDS = frozenset(
+    {
+        "supervisor_checks",
+        "supervisor_companion",
+        "reviewer_status",
+        "reviewer_result",
+        "reviewer_target",
+        "review_verdict",
+        "remote_supervisor",
+    }
+)
 ROLE_KEYS = frozenset(
     {
         "role",
@@ -80,6 +91,9 @@ def _migrate(value: Any, *, role_context: bool = False) -> tuple[Any, int, bool]
     removed = 0
     changed = False
     for key, raw in value.items():
+        if str(key).lower() in OBSOLETE_WORKFLOW_FIELDS:
+            changed = True
+            continue
         role_key = str(key).lower() in ROLE_KEYS
         next_value, count, entry_changed = _migrate(raw, role_context=role_key)
         removed += count

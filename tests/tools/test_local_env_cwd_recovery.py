@@ -14,6 +14,8 @@ import tempfile
 import threading
 from unittest.mock import MagicMock, patch
 
+import pytest
+
 from tools.environments.local import (
     LocalEnvironment,
     _resolve_safe_cwd,
@@ -28,6 +30,10 @@ class TestResolveSafeCwd:
         assert _resolve_safe_cwd(path) == path
 
 
+    @pytest.mark.skipif(
+        os.name == "nt",
+        reason="POSIX root walk premise; see the Windows twin below",
+    )
     def test_returns_root_when_only_root_exists(self, monkeypatch):
         """If every ancestor except the filesystem root is gone, the root
         itself is still a valid recovery target — don't skip it just because
@@ -35,6 +41,19 @@ class TestResolveSafeCwd:
         sep = os.path.sep
         monkeypatch.setattr(os.path, "isdir", lambda p: p == sep)
         assert _resolve_safe_cwd("/no/such/deep/dir") == sep
+
+    @pytest.mark.skipif(
+        os.name != "nt",
+        reason="Windows drive-root walk; the POSIX twin is above",
+    )
+    def test_returns_drive_root_when_only_root_exists(self, monkeypatch):
+        """Windows twin: when every ancestor except the current-drive root is
+        gone, the root (``C:\\``) is still the recovery target."""
+        drive_root = "C:\\"
+        def isdir(p):
+            return os.path.normcase(os.path.normpath(p)) == os.path.normcase(drive_root)
+        monkeypatch.setattr(os.path, "isdir", isdir)
+        assert _resolve_safe_cwd("C:\\no\\such\\deep\\dir") == drive_root
 
 
 def _fake_interrupt():

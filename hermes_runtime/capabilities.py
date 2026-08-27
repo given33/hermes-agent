@@ -9,13 +9,11 @@ CAPABILITY_TAGS = frozenset({
     "read_fs", "write_fs", "network", "secret", "external_emit",
     "process", "provider", "session", "visual_evidence", "artifact",
 })
-ROLE_NAMES = frozenset({"dispatcher", "worker", "reviewer", "reporter"})
+ROLE_NAMES = frozenset({"dispatcher", "worker"})
 
 # These are defaults, not a replacement for tool-specific approval and effect
 # contracts.  A caller may only narrow a role's set, never widen it implicitly.
 ROLE_DENY_TAGS = {
-    "reporter": frozenset({"write_fs", "external_emit", "secret", "process", "network", "provider"}),
-    "reviewer": frozenset({"write_fs", "external_emit", "secret", "process"}),
     "worker": frozenset({"external_emit", "secret"}),
     "dispatcher": frozenset({"secret"}),
 }

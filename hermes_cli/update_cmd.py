@@ -6112,8 +6112,11 @@ def _cold_start_windows_gateway_after_update() -> bool:
             f"Windows gateway cold-start PID {pid} did not become ready"
         )
     print()
+    # The update path can run under a stock Windows console using a legacy
+    # code page; keep this atexit message ASCII so restart success never turns
+    # into a secondary UnicodeEncodeError.
     print(
-        "✓ Gateway started via cold-start after update "
+        "[ok] Gateway started via cold-start after update "
         f"(PID: {', '.join(map(str, ready_pids))})"
     )
     return True
@@ -6841,7 +6844,7 @@ def _resume_windows_gateways_after_update(token: dict | None) -> None:
     if restarted_services:
         print()
         print(
-            "  ✓ Restarted Windows gateway service(s): "
+            "  [ok] Restarted Windows gateway service(s): "
             + ", ".join(restarted_services)
         )
 
@@ -6927,12 +6930,12 @@ def _resume_windows_gateways_after_update(token: dict | None) -> None:
 
     if relaunched:
         print()
-        print(f"  ✓ Restarting Windows gateway profile(s): {', '.join(relaunched)}")
+        print(f"  [ok] Restarting Windows gateway profile(s): {', '.join(relaunched)}")
     if unmapped_relaunched:
         if not relaunched:
             print()
         print(
-            f"  ✓ Restarting {unmapped_relaunched} unmapped Windows gateway process(es)"
+            f"  [ok] Restarting {unmapped_relaunched} unmapped Windows gateway process(es)"
         )
 
 def _discard_lockfile_churn(git_cmd, repo_root):
@@ -8634,157 +8637,6 @@ def _cmd_update_impl(args, gateway_mode: bool):
             gateway_mode=gateway_mode,
             pre_update_snapshot_id=pre_update_snapshot_id,
         )
-
-        _print_update_summary(
-            node_failures=node_failures,
-            desktop_build_ok=desktop_build_ok,
-            pre_update_version=pre_update_version,
-        )
-        needs_migration = has_new_options or current_ver < latest_ver
-
-        if version_bump_only:
-            # Nothing for the user to fill in — only the config format version
-            # changed (new defaults already merge in transparently). Asking
-            # "configure new options now?" here is misleading: saying yes just
-            # bumps the version and looks like a no-op (issue: ScottFive /
-            # Tt2021). Apply it silently and say what actually happened.
-            print()
-            print(
-                f"  ℹ Updating config format (v{current_ver} → v{latest_ver})…"
-            )
-            try:
-                _mig_results = _run_migrate_config_fresh(
-                    interactive=False, quiet=True
-                )
-                print("  ✓ Config format updated (no new settings to configure)")
-                # quiet=True also mutes migration steps that RESET or REMOVE an
-                # existing setting (e.g. the v33→v34 personality reset from
-                # #81946, which records its note only in the results dict).
-                # Re-surface those notes so an unattended update never silently
-                # changes user configuration (#86656). In this branch
-                # missing_config is empty, so config_added can only contain
-                # migration-step mutations, not missing-key listings.
-                for _note in _mig_results.get("config_added") or []:
-                    print(f"  ℹ {_note}")
-                for _warn in _mig_results.get("warnings") or []:
-                    print(f"  ⚠️  {_warn}")
-            except Exception as _mig_err:
-                print(f"  ⚠️  Config format update failed: {_mig_err}")
-                print("     Run 'hermes config migrate' to retry.")
-        elif needs_migration:
-            print()
-            # Show WHAT changed, not just a count, so the user can make an
-            # informed yes/no decision (previously the prompt named nothing).
-            def _print_items(items, label, key, fallback_key=None):
-                if not items:
-                    return
-                print(f"  {label}:")
-                shown = items[:8]
-                for it in shown:
-                    if isinstance(it, dict):
-                        name = it.get(key) or (fallback_key and it.get(fallback_key)) or "?"
-                        desc = (it.get("description") or "").strip()
-                    else:
-                        # Defensive: some callers/mocks pass bare name strings.
-                        name = str(it)
-                        desc = ""
-                    if desc:
-                        print(f"      • {name} — {desc}")
-                    else:
-                        print(f"      • {name}")
-                extra = len(items) - len(shown)
-                if extra > 0:
-                    print(f"      … and {extra} more")
-
-            if missing_env:
-                print(
-                    f"  ⚠️  {len(missing_env)} new required setting(s) need configuration"
-                )
-                _print_items(missing_env, "New settings", "name")
-            if missing_config:
-                print(f"  ℹ️  {len(missing_config)} new config option(s) available")
-                _print_items(missing_config, "New options", "key")
-
-            print()
-            if assume_yes:
-                print(
-                    "  ℹ --yes: auto-applying config migration (skipping API-key prompts)."
-                )
-                response = "y"
-            elif gateway_mode:
-                response = (
-                    _gateway_prompt(
-                        "Would you like to configure new options now? [Y/n]", "n"
-                    )
-                    .strip()
-                    .lower()
-                )
-            elif not (sys.stdin.isatty() and sys.stdout.isatty()):
-                print("  ℹ Non-interactive session — applying safe config migrations.")
-                response = "auto"
-            else:
-                try:
-                    response = (
-                        input("Would you like to configure them now? [Y/n]: ")
-                        .strip()
-                        .lower()
-                    )
-                except EOFError:
-                    response = "n"
-                except UnicodeDecodeError:
-                    # input() can raise this when the terminal encoding can't
-                    # decode the byte sequence (e.g. a non-UTF-8 locale, or an
-                    # embedded terminal). Without this, the exception escapes
-                    # here and crashes the update at this prompt.
-                    print(
-                        "  ⚠ Could not read input (encoding issue). Skipping. "
-                        "Run 'hermes config migrate' manually to configure."
-                    )
-                    response = "n"
-
-            if response in {"", "y", "yes", "auto"}:
-                print()
-                # Gateway mode, --yes, and non-interactive update contexts
-                # (dashboard / web server actions) cannot prompt for API keys.
-                # Still run the non-interactive migration pass before restarting
-                # so new default config fields and version bumps are written
-                # before the freshly updated gateway validates config at startup.
-                interactive_migration = not (
-                    gateway_mode or assume_yes or response == "auto"
-                )
-                results = _run_migrate_config_fresh(interactive=interactive_migration, quiet=False)
-
-                if results["env_added"] or results["config_added"]:
-                    print()
-                    print("✓ Configuration updated!")
-                if (gateway_mode or assume_yes or response == "auto") and missing_env:
-                    print("  ℹ API keys require manual entry: hermes config migrate")
-            else:
-                print()
-                print("Skipped. Run 'hermes config migrate' later to configure.")
-        else:
-            print("  ✓ Configuration is up to date")
-
-        # Safety net: config-version migrations have been observed to leave
-        # cron/jobs.json valid-but-empty, silently dropping every scheduled
-        # job (issue #34600). The desktop scheduler can also overwrite with
-        # its own small set, causing partial loss (issue #52144). If the
-        # live file now has fewer jobs than the pre-update snapshot, restore
-        # it and warn loudly.
-        try:
-            from hermes_cli.backup import restore_cron_jobs_if_emptied
-
-            cron_restore = restore_cron_jobs_if_emptied(pre_update_snapshot_id)
-            if cron_restore:
-                print()
-                print(
-                    "  ⚠️  cron/jobs.json lost jobs during this update — "
-                    f"restored {cron_restore['job_count']} job(s) from "
-                    f"pre-update snapshot {cron_restore['snapshot_id']}."
-                )
-        except Exception as exc:
-            # Never let the cron safety net break an otherwise-good update.
-            logger.debug("Cron jobs auto-restore check failed: %s", exc)
 
         _print_update_summary(
             node_failures=node_failures,

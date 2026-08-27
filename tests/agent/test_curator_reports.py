@@ -184,7 +184,7 @@ def test_curator_rewrites_cron_skills_when_skill_consolidated(curator_env_with_c
     assert loaded["skill"] == "foo-umbrella"
 
     # Rewrite is recorded in run.json
-    payload = json.loads((run_dir / "run.json").read_text())
+    payload = json.loads((run_dir / "run.json").read_text(encoding="utf-8"))
     assert payload["cron_rewrites"]["jobs_updated"] == 1
     assert payload["counts"]["cron_jobs_rewritten"] == 1
     rewrites = payload["cron_rewrites"]["rewrites"]
@@ -194,11 +194,11 @@ def test_curator_rewrites_cron_skills_when_skill_consolidated(curator_env_with_c
     # Separate cron_rewrites.json is written for convenience
     cron_file = run_dir / "cron_rewrites.json"
     assert cron_file.exists()
-    detail = json.loads(cron_file.read_text())
+    detail = json.loads(cron_file.read_text(encoding="utf-8"))
     assert detail["jobs_updated"] == 1
 
     # Markdown surfaces the change
-    md = (run_dir / "REPORT.md").read_text()
+    md = (run_dir / "REPORT.md").read_text(encoding="utf-8")
     assert "Cron job skill references rewritten" in md
     assert "foo-watcher" in md
     assert "foo-umbrella" in md

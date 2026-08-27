@@ -15,6 +15,8 @@ import pytest
 
 import plugins.platforms.photon.sidecar_paths as sidecar_paths
 
+_IS_POSIX = os.name == "posix"
+
 
 def _seed_source(source: Path, *, with_node_modules: bool = False) -> None:
     source.mkdir(parents=True, exist_ok=True)
@@ -88,6 +90,15 @@ def test_mirror_refresh_updates_changed_files_and_keeps_node_modules(
     assert (mirror / "node_modules" / "installed.txt").exists()
 
 
+@pytest.mark.skipif(
+    not _IS_POSIX,
+    reason=(
+        "chmod 0o555 read-only semantics are POSIX-only: on Windows the "
+        "read-only attribute does not block file creation in a directory, so "
+        "the touch-probe correctly reports writable and there is no "
+        "equivalent non-writable fixture without ACL changes"
+    ),
+)
 def test_dir_writable_probe(tmp_path) -> None:
     assert sidecar_paths.dir_writable(tmp_path) is True
     ro = tmp_path / "ro"

@@ -184,7 +184,9 @@ class TestBangHandlerDispatch:
 
     def test_zero_exit_prints_no_exit_line(self):
         cli = _make_cli()
-        cli.handle_bang_shell("!true")
+        # POSIX has `true`; on Windows cmd.exe has no `true`, so use `rem`
+        # (a no-op that always exits 0) to exercise the zero-exit path.
+        cli.handle_bang_shell("!rem" if os.name == "nt" else "!true")
         assert not any("exited" in line for line in _printed(cli))
 
     def test_disabled_context_falls_through(self, monkeypatch):

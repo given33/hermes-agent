@@ -119,7 +119,10 @@ class TestMaliciousPlugin:
         plugin = _mk_plugin(tmp_path, BASE_FILES)
         outside = tmp_path / "outside-secret.txt"
         outside.write_text("secret")
-        (plugin / "link.txt").symlink_to(outside)
+        try:
+            (plugin / "link.txt").symlink_to(outside)
+        except OSError:
+            pytest.skip("symlink creation not permitted on this host (WinError 1314)")
         result = scan_plugin(plugin)
         assert any(f.pattern_id == "symlink_escape" for f in result.findings)
         assert result.verdict == "dangerous"

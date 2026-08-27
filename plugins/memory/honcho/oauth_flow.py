@@ -49,7 +49,10 @@ def _display_config_path(path: object) -> str:
 
     p = _Path(str(path))
     try:
-        return "~/" + str(p.relative_to(_Path.home()))
+        # Display form is always POSIX-separated ("~/.hermes/..."), regardless
+        # of the host platform; this string goes into the authorization URL
+        # where backslashes would be a different path.
+        return "~/" + p.relative_to(_Path.home()).as_posix()
     except ValueError:
         return p.name
 

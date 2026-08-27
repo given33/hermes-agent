@@ -1,0 +1,5 @@
+# HK worker profile. Keep credentials in cloud_connector.env or the local
+# Hermes secret store; this file is intentionally safe to version-control.
+profile: hk-worker
+connector_id: hk-primary
+skills_dir: ~/.hermes/profiles/hk-worker/skills
