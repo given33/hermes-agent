@@ -968,6 +968,21 @@ class TestWriteProfileMetaDurability:
         assert "🧙" in raw
         assert profiles.read_profile_meta(profile_dir)["description"] == "Code wizard 🧙 ✨"
 
+    def test_ui_meta_merges_without_erasing_other_plugin_keys(self, tmp_path):
+        profile_dir = tmp_path / "bot"
+        profile_dir.mkdir()
+        profiles.write_profile_meta(
+            profile_dir,
+            ui_meta={"other-plugin": {"enabled": True}, "hermes-bots": {"title": "Old"}},
+        )
+        profiles.write_profile_meta(
+            profile_dir,
+            ui_meta={"hermes-bots": {"title": "HK Worker"}},
+        )
+        data = yaml.safe_load((profile_dir / "profile.yaml").read_text(encoding="utf-8"))
+        assert data["ui_meta"]["other-plugin"] == {"enabled": True}
+        assert data["ui_meta"]["hermes-bots"] == {"title": "HK Worker"}
+
     def test_symlinked_profile_yaml_survives_the_write(self, tmp_path):
         """Guard on the conversion, not a behavior change.
 
@@ -1166,5 +1181,4 @@ class TestResolveProfileEnvSpelling:
         # No HERMES_HOME: the platform default root applies (existing contract).
         monkeypatch.delenv("HERMES_HOME", raising=False)
         assert Path(resolve_profile_env("default")) == _get_default_hermes_home()
-
 

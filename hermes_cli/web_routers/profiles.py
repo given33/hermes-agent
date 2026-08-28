@@ -984,7 +984,22 @@ async def create_profile_endpoint(body: ProfileCreate):
 @router.post("/api/bots")
 async def create_bot_endpoint(body: ProfileCreate):
     """Create a Bot Mode bot using the canonical profile builder."""
-    return await create_profile_endpoint(body)
+    from hermes_cli import profiles as profiles_mod
+
+    result = await create_profile_endpoint(body)
+    path = Path(str(result.get("path") or "")) if isinstance(result, dict) else None
+    if path is not None and path.is_dir():
+        # The upstream Bot Mode protocol is gated by this profile-local
+        # marker.  REST-created bots must receive it too, otherwise their
+        # canonical Bot Chat would look like an ordinary profile and the
+        # message_agent tool would never be injected.
+        profiles_mod.write_profile_meta(
+            path,
+            ui_meta={"hermes-bots": {"title": body.name.strip()}},
+        )
+    if isinstance(result, dict):
+        return {**result, "bot_mode": True}
+    return result
 
 
 @router.get("/api/profiles/active")

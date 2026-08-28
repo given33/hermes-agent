@@ -81,6 +81,26 @@ async def test_bot_mobile_route_exposes_title_resolved_canonical_chat(monkeypatc
     assert result["profiles"][0]["canonical_session"]["resolved_id"] == "tip"
 
 
+@pytest.mark.asyncio
+async def test_bot_create_marks_profile_for_upstream_bot_mode(monkeypatch, tmp_path):
+    """REST-created bots must receive the same profile-local Bot Mode gate."""
+    from hermes_cli.web_routers import profiles as profiles_router
+
+    profile_dir = tmp_path / "hk-worker"
+    profile_dir.mkdir()
+
+    async def fake_create(_body):
+        return {"ok": True, "name": "hk-worker", "path": str(profile_dir)}
+
+    monkeypatch.setattr(profiles_router, "create_profile_endpoint", fake_create)
+    result = await profiles_router.create_bot_endpoint(
+        profiles_router.ProfileCreate(name="hk-worker")
+    )
+    assert result["bot_mode"] is True
+    data = yaml.safe_load((profile_dir / "profile.yaml").read_text(encoding="utf-8"))
+    assert data["ui_meta"]["hermes-bots"]["title"] == "hk-worker"
+
+
 # ---------------------------------------------------------------------------
 # Shared fixtures
 # ---------------------------------------------------------------------------

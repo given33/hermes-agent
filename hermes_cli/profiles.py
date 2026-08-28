@@ -923,6 +923,7 @@ def write_profile_meta(
     description: Optional[str] = None,
     description_auto: Optional[bool] = None,
     display_name: Optional[str] = None,
+    ui_meta: Optional[Dict[str, object]] = None,
 ) -> None:
     """Update ``<profile_dir>/profile.yaml`` in place.
 
@@ -953,6 +954,22 @@ def write_profile_meta(
             existing["display_name"] = display_name.strip()
         else:
             existing.pop("display_name", None)
+    if ui_meta is not None:
+        # UI metadata is a per-profile extension point used by the upstream
+        # Bot Mode plugin. Merge by key so a mobile-created bot does not erase
+        # unrelated plugin metadata that may already live in profile.yaml.
+        current = existing.get("ui_meta")
+        if not isinstance(current, dict):
+            current = {}
+        for key, value in ui_meta.items():
+            if value is None:
+                current.pop(str(key), None)
+            else:
+                current[str(key)] = value
+        if current:
+            existing["ui_meta"] = current
+        else:
+            existing.pop("ui_meta", None)
     # Atomic write: bare open("w") truncates before the dump, and the read
     # path above swallows parse errors as {}, so a crashed write would
     # silently drop unspecified fields on the next call (#51356, #16743).
