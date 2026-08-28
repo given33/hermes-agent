@@ -33,8 +33,10 @@ import {
   DropdownMenu,
   DropdownMenuContent,
   DropdownMenuItem,
+  DropdownMenuLabel,
   DropdownMenuRadioGroup,
   DropdownMenuRadioItem,
+  dropdownMenuSectionLabel,
   DropdownMenuSeparator,
   DropdownMenuTrigger
 } from '@/components/ui/dropdown-menu'
@@ -55,7 +57,13 @@ import {
   reorderStepHaptic
 } from '@/lib/reorder'
 import { cn } from '@/lib/utils'
-import { $hasMultipleConnections } from '@/store/connections'
+import {
+  $activeConnectionId,
+  $connectionsRegistry,
+  $hasMultipleConnections,
+  selectConnection
+} from '@/store/connections'
+import { $fleetRoster, refreshFleetRoster } from '@/store/fleet-roster'
 import { notify, notifyError } from '@/store/notifications'
 import {
   $activeGatewayProfile,
@@ -126,9 +134,17 @@ const stepThroughCells: Modifier = ({ containerNodeRect, draggingNodeRect, trans
 
 // Arc-Spaces-style profile rail at the sidebar foot: a default↔all toggle pinned
 // left, the colored named profiles scrolling between, and Manage pinned right.
-// The active profile pops in its own color — the "where am I" cue. Gateway
-// identity lives in the statusbar, so this strip remains entirely available to
-// profiles regardless of how many backends are registered.
+// The active profile pops in its own color — the "where am I" cue.
+//
+// With one registered gateway this is the whole story. With several, the rail
+// becomes the FLEET rail: the active gateway's profiles stay exactly as they
+// are, and every other registered gateway follows on the same strip as an
+// at-rest group — a hairline, that gateway's kind glyph, its default home
+// square and its named squares, dimmed. Clicking an at-rest square performs
+// the same re-home the statusbar switcher does, landing on that exact
+// (gateway, profile); the workspace still lives on one gateway at a time, only
+// the picker spans the fleet. Groups keep registry order regardless of which
+// one is active, so a square never moves under the pointer that clicked it.
 export function ProfileRail() {
   const { t } = useI18n()
   const p = t.profiles
@@ -137,7 +153,11 @@ export function ProfileRail() {
   const gatewayProfile = useStore($activeGatewayProfile)
   const order = useStore($profileOrder)
   const colors = useStore($profileColors)
+  const remoteOverrides = useStore($profileRemoteOverrides)
   const multipleConnections = useStore($hasMultipleConnections)
+  const registry = useStore($connectionsRegistry)
+  const activeConnectionId = useStore($activeConnectionId)
+  const roster = useStore($fleetRoster)
   const navigate = useNavigate()
   const [createOpen, setCreateOpen] = useState(false)
   const [pendingRename, setPendingRename] = useState<null | ProfileInfo>(null)
@@ -372,7 +392,29 @@ export function ProfileRail() {
   )
 
   return (
-    <div aria-label={p.title} className="flex min-w-0 items-center gap-0.5" data-slot="profile-rail" role="group">
+    // `data-tour` as well as `data-slot`: only the former is identity to the
+    // tour collector and the tip catalog, and the rail's one other durable
+    // handle is a TRANSLATED aria-label, which stops matching the moment the
+    // app isn't in English.
+    <div
+      aria-label={p.title}
+      className="flex min-w-0 items-center gap-0.5"
+      data-slot="profile-rail"
+      data-tip-region=""
+      data-tour="profile-rail"
+      role="group"
+    >
+      {/* Fleet: every gateway carries its own home square inside its group, so
+          the pinned pill is purely the "all profiles on this gateway" toggle. */}
+      {fleet && (
+        <ProfilePill
+          active={isAll}
+          glyph="layers"
+          label={p.fleet.allOnGateway}
+          onSelect={() => setShowAllProfiles(true)}
+        />
+      )}
+
       {/* One button toggles default ↔ all: home face when scoped to a profile,
           layers face when showing everything. Pinned left like Manage is right.
           Hidden until a second profile exists. */}
@@ -755,6 +797,34 @@ function ProfileDropdown({
             />
           ))}
         </DropdownMenuRadioGroup>
+        {restGroups.map(group => (
+          <div data-connection-id={group.connectionId} data-slot="profile-dropdown-gateway" key={group.connectionId}>
+            <DropdownMenuSeparator />
+            <DropdownMenuLabel className={cn(dropdownMenuSectionLabel, 'flex items-center gap-1.5')}>
+              <ConnectionGlyph connection={group} />
+              <span className="truncate">{group.label}</span>
+              {!group.reachable && <span aria-hidden="true" className="size-1.5 shrink-0 rounded-full bg-amber-500" />}
+            </DropdownMenuLabel>
+            {[group.defaultAgent, ...group.named].map(agent => (
+              <DropdownMenuItem
+                aria-label={p.fleet.onGateway(agent.profile, group.label)}
+                className="min-w-0"
+                key={agent.profile}
+                onSelect={() => onSelectRest(agent)}
+              >
+                <span className="flex min-w-0 items-center gap-1.5">
+                  <ProfileGlyph
+                    aria-hidden="true"
+                    color={resolveProfileColor(agent.profile, colors)}
+                    isDefault={agent.isDefault}
+                    name={agent.profile}
+                  />
+                  <span className="truncate">{agent.profile}</span>
+                </span>
+              </DropdownMenuItem>
+            ))}
+          </div>
+        ))}
       </DropdownMenuContent>
     </DropdownMenu>
   )
@@ -1111,8 +1181,7 @@ function ProfileSquare({
 
   const { attributes, isDragging, listeners, setNodeRef, transform, transition } = useSortable({
     id: label,
-    transition: RAIL_TRANSITION,
-    resizeObserverConfig: {}
+    transition: RAIL_TRANSITION
   })
 
   const clearPress = () => {
