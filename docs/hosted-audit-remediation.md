@@ -53,6 +53,9 @@
 
 托管协作现在只有一个服务器本地调度员和三个独立 worker lane：DBB3、PC/WSL、HK。
 监督者、审阅者和汇报者不再创建模型回合；调度员拆分任务，worker 直接提交结果和证据，服务器只执行确定性状态校验与结果聚合。旧状态中的相关字段会在加载时结构化迁移并删除，普通用户文本不会被关键词扫描。
+托管子进程创建 `AIAgent` 时还显式启用 `skip_background_review=True`，因此 worker
+完成后不会偷偷启动官方普通会话使用的后台 memory/skill review fork；该 fork
+仍保留给非托管的本地 CLI 会话。
 
 ## 验证
 

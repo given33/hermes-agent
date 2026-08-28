@@ -25736,6 +25736,11 @@ def _profile_event_runner_main() -> int:
             model=model,
             max_iterations=45,
             enabled_toolsets=enabled_toolsets,
+            # Hosted collaboration is intentionally dispatcher-plus-workers
+            # only.  The normal local CLI may use Hermes' post-turn memory /
+            # skill review fork, but a hosted worker must never start a hidden
+            # second model loop after it has reported its result.
+            skip_background_review=True,
             quiet_mode=True,
             platform="cli",
             session_db=session_db,
