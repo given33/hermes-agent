@@ -145,7 +145,10 @@ jobs:
           source .venv/bin/activate
           python -m pytest -q \
             tests/plugins/test_collaboration_dashboard.py \
-            tests/deploy/test_cloud_deployment_assets.py
+            tests/plugins/test_collaboration_cloud_files.py \
+            tests/plugins/test_collaboration_managed_resources.py \
+            tests/deploy/test_cloud_deployment_assets.py \
+            tests/deploy/test_managed_installation_topology.py
 
       - name: Push the verified upstream merge directly to main
         if: steps.release.outputs.needed == 'true' && steps.merge.outputs.conflict == 'false' && steps.product.outcome == 'success'
