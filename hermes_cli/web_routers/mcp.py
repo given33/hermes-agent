@@ -529,6 +529,31 @@ async def install_mcp_catalog_entry(body: MCPCatalogInstall, profile: Optional[s
 
     # Persist any supplied, declared env vars first.
     effective_profile = body.profile or profile
+    # The CLI installer can prompt for missing credentials, but an HTTP
+    # request (especially from iOS) has no interactive stdin. Fail closed with
+    # an actionable response instead of blocking a worker thread indefinitely.
+    if entry.auth.type == "api_key":
+        from hermes_cli.config import get_env_value
+
+        def _missing_required_env():
+            with _profile_scope(effective_profile):
+                return [
+                    spec.name
+                    for spec in (entry.auth.env or [])
+                    if spec.required
+                    and not body.env.get(spec.name)
+                    and not get_env_value(spec.name)
+                ]
+
+        missing = await asyncio.to_thread(_missing_required_env)
+        if missing:
+            raise HTTPException(
+                status_code=400,
+                detail=(
+                    f"Catalog entry '{name}' requires credential(s): "
+                    f"{', '.join(missing)}. Supply env values or configure them first."
+                ),
+            )
     if body.env:
         def _write_env():
             with _profile_scope(effective_profile):

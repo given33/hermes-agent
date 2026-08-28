@@ -164,6 +164,27 @@ def test_catalog_accepts_declared_credential(
     ).read_text(encoding="utf-8")
 
 
+def test_catalog_missing_required_credential_fails_without_entering_cli_prompt(
+    client: TestClient,
+    catalog_env: Path,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    import hermes_cli.mcp_catalog as mcp_catalog
+
+    def _unexpected_prompt(*_args, **_kwargs):
+        raise AssertionError("HTTP catalog install must never prompt on stdin")
+
+    monkeypatch.setattr(mcp_catalog, "_prompt_env_vars", _unexpected_prompt)
+    response = client.post(
+        "/api/mcp/catalog/install",
+        headers=HEADERS,
+        json={"name": "demo", "env": {}},
+    )
+
+    assert response.status_code == 400
+    assert "DEMO_API_KEY" in response.json()["detail"]
+
+
 @pytest.mark.parametrize(
     "protected_key",
     [
