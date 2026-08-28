@@ -18,7 +18,6 @@ on:
 permissions:
   contents: write
   issues: write
-  pull-requests: write
 
 concurrency:
   group: upstream-hermes-sync
@@ -148,39 +147,25 @@ jobs:
             tests/plugins/test_collaboration_dashboard.py \
             tests/deploy/test_cloud_deployment_assets.py
 
-      - name: Push the managed branch and create or update its pull request
-        if: steps.release.outputs.needed == 'true' && steps.merge.outputs.conflict == 'false'
+      - name: Push the verified upstream merge directly to main
+        if: steps.release.outputs.needed == 'true' && steps.merge.outputs.conflict == 'false' && steps.product.outcome == 'success'
         shell: bash
         run: |
           set -euo pipefail
           branch='${{ steps.merge.outputs.branch }}'
           label='${{ steps.release.outputs.label }}'
-          {
-            cat "$RUNNER_TEMP/upstream-report.md"
-            printf '\n## Sync preflight\n\n- Product integration preflight: `%s`\n' '${{ steps.product.outcome }}'
-            printf '%s\n' '- The pull request automatically runs the complete official CI matrix.'
-            printf '%s\n' '- Merge and production deployment remain blocked until Codex review.'
-          } >"$RUNNER_TEMP/pr-body.md"
-          git push --force-with-lease origin "HEAD:refs/heads/$branch"
-          gh label create upstream-sync --color 1D76DB --description 'Automated official Hermes release sync' --force
-          gh label create codex-review-required --color D93F0B --description 'Requires Codex product-overlap review' --force
-          pr="$(gh pr list --state open --head "$branch" --json number --jq '.[0].number // empty')"
-          if [[ -z "$pr" ]]; then
-            gh pr create \
-              --base main \
-              --head "$branch" \
-              --title "chore: sync official Hermes $label" \
-              --body-file "$RUNNER_TEMP/pr-body.md" \
-              --label upstream-sync \
-              --label codex-review-required
-            pr="$(gh pr list --state open --head "$branch" --json number --jq '.[0].number')"
-            gh pr comment "$pr" --body '@codex review the product overlap, iOS/API compatibility, and deployment risk in this upstream sync. Do not merge when any required adaptation or test is unresolved.'
-          else
-            gh pr edit "$pr" --body-file "$RUNNER_TEMP/pr-body.md" --add-label upstream-sync --add-label codex-review-required
-          fi
+          git push origin "HEAD:refs/heads/main"
+          echo "Verified official Hermes ${label} merge pushed from ${branch}."
+
+      - name: Publish the verified sync branch for diagnostics
+        if: steps.release.outputs.needed == 'true' && steps.merge.outputs.conflict == 'false'
+        shell: bash
+        run: |
+          set -euo pipefail
+          git push --force-with-lease origin "HEAD:refs/heads/${{ steps.merge.outputs.branch }}"
 
       - name: Fail the run when the product preflight failed
         if: steps.release.outputs.needed == 'true' && steps.merge.outputs.conflict == 'false' && steps.product.outcome != 'success'
         run: |
-          echo 'Product integration preflight failed; the sync PR remains blocked.' >&2
+          echo 'Product integration preflight failed; main was not promoted.' >&2
           exit 1
