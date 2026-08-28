@@ -17789,6 +17789,44 @@ async def gateway_ws(ws: WebSocket) -> None:
     )
 
 
+@app.websocket(
+    "/api/plugins/collaboration/single/conversations/{conversation_id}/hosted-events-ws"
+)
+async def hosted_conversation_events_ws(ws: WebSocket, conversation_id: str) -> None:
+    """Authenticated WebSocket mirror of the collaboration hosted-events SSE."""
+    if not _ws_request_is_allowed(ws):
+        await ws.close(code=4403)
+        return
+    auth_reason, _credential = _ws_auth_reason(ws)
+    if auth_reason is not None:
+        await ws.close(code=4401)
+        return
+    identity = getattr(ws, "_hermes_auth_identity", None) or {}
+    owner_id = str(identity.get("user_id") or "").strip()
+    if not owner_id:
+        from hermes_cli.cloud_file_library import LOCAL_OWNER_ID
+
+        owner_id = LOCAL_OWNER_ID
+    try:
+        requested_cursor = max(0, int(ws.query_params.get("cursor") or 0))
+    except (TypeError, ValueError):
+        await ws.close(code=4400, reason="cursor must be a non-negative integer")
+        return
+    from plugins.collaboration.dashboard.plugin_api import (
+        stream_hosted_conversation_events_websocket,
+    )
+
+    await stream_hosted_conversation_events_websocket(
+        ws,
+        conversation_id,
+        owner_id,
+        requested_cursor=requested_cursor,
+        expected_account_generation=ws.query_params.get(
+            "expected_account_generation", ""
+        ),
+    )
+
+
 # ---------------------------------------------------------------------------
 # /api/pub + /api/events — chat-tab event broadcast.
 #

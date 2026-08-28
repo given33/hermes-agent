@@ -20785,6 +20785,170 @@ async def stream_hosted_conversation_events(
     )
 
 
+async def stream_hosted_conversation_events_websocket(
+    websocket: WebSocket,
+    conversation_id: str,
+    owner_id: str,
+    *,
+    requested_cursor: int = 0,
+    expected_account_generation: str = "",
+) -> None:
+    """Serve the hosted conversation event contract over WebSocket.
+
+    This deliberately reuses the same cursor, snapshot, ownership and live
+    projection helpers as the SSE endpoint above.  The wire payload is the
+    JSON envelope itself (plus ``type=conversation``); clients can therefore
+    switch transports without changing reconciliation or replay semantics.
+    Authentication is performed by the web server before this helper is
+    called, because plugin router dependencies do not receive WebSocket
+    request state consistently across ASGI versions.
+    """
+    normalized_owner = str(owner_id or "").strip() or LOCAL_OWNER_ID
+    account_generation = _account_generation_for_owner(normalized_owner)
+    expected = str(expected_account_generation or "").strip()
+    if expected and expected != account_generation:
+        await websocket.close(code=4409, reason="account generation changed")
+        return
+    conversation_id = str(conversation_id or "").strip()
+    if not conversation_id:
+        await websocket.close(code=4400, reason="conversation id required")
+        return
+    delivered_cursor = max(0, int(requested_cursor))
+
+    live_conversation = _live_conversation_snapshot(conversation_id, normalized_owner)
+    member_room_id = ""
+    if live_conversation is None:
+        with _STATE_LOCK:
+            state = _load_single_state_for_event_stream()
+            try:
+                _conversation, claimed = _owned_conversation_in_state(
+                    state,
+                    conversation_id,
+                    normalized_owner,
+                )
+            except HTTPException as exc:
+                if exc.status_code != 404:
+                    await websocket.close(code=4404, reason="conversation not found")
+                    return
+                member_room_id = _room_membership_room_id(conversation_id, normalized_owner)
+                if not member_room_id:
+                    await websocket.close(code=4404, reason="conversation not found")
+                    return
+                _conversation, claimed = _conversation_for_event_reader(
+                    state,
+                    conversation_id,
+                    normalized_owner,
+                    member_room_id,
+                )
+            if claimed:
+                save_single_state(state)
+
+    if not _acquire_hosted_sse_slot(normalized_owner, conversation_id):
+        await websocket.close(code=4429, reason="too many live conversation streams")
+        return
+
+    async def build_frame() -> tuple[dict[str, Any], bool]:
+        live = _live_hosted_event_stream_frame(
+            conversation_id,
+            normalized_owner,
+            member_room_id=member_room_id,
+            delivered_cursor=delivered_cursor,
+            include_snapshot=delivered_cursor <= 0,
+            limit=500,
+        )
+        if live is not None:
+            return live
+
+        def read_frame() -> tuple[dict[str, Any], bool]:
+            with _STATE_LOCK:
+                state = _load_single_state_for_event_stream()
+                conversation, _claimed = _conversation_for_event_reader(
+                    state,
+                    conversation_id,
+                    normalized_owner,
+                    member_room_id,
+                )
+                return _hosted_event_stream_frame(
+                    conversation,
+                    delivered_cursor=delivered_cursor,
+                    include_snapshot=delivered_cursor <= 0,
+                    limit=500,
+                )
+
+        return await asyncio.get_running_loop().run_in_executor(
+            _HOSTED_UPDATE_WAIT_EXECUTOR,
+            read_frame,
+        )
+
+    _sse_presence_enter(conversation_id)
+    try:
+        await websocket.accept()
+        # Require an explicit subscription frame before the first snapshot so
+        # clients can install their message handler without racing the server's
+        # initial send immediately after the ASGI upgrade.
+        try:
+            await asyncio.wait_for(websocket.receive_text(), timeout=10.0)
+        except (asyncio.TimeoutError, WebSocketDisconnect, RuntimeError):
+            return
+        revision = _hosted_update_revision(conversation_id)
+        while True:
+            envelope, has_more_events = await build_frame()
+            current_cursor = int(envelope.get("cursor") or delivered_cursor)
+            frame_events = envelope.get("events")
+            if (
+                delivered_cursor <= 0
+                or envelope.get("conversation") is not None
+                or frame_events
+                or current_cursor > delivered_cursor
+            ):
+                await websocket.send_json({
+                    "type": "conversation",
+                    **envelope,
+                })
+            # A future-cursor recovery frame is authoritative even when its
+            # snapshot cursor is lower than the requested cursor. Keep the
+            # same reset semantics as the SSE transport so reconnecting
+            # clients can replay from the retained snapshot boundary.
+            delivered_cursor = (
+                current_cursor
+                if envelope.get("reset_cursor")
+                else max(delivered_cursor, current_cursor)
+            )
+
+            while has_more_events:
+                envelope, has_more_events = await build_frame()
+                current_cursor = int(envelope.get("cursor") or delivered_cursor)
+                await websocket.send_json({
+                    "type": "conversation",
+                    **envelope,
+                })
+                delivered_cursor = (
+                    current_cursor
+                    if envelope.get("reset_cursor")
+                    else max(delivered_cursor, current_cursor)
+                )
+
+            next_revision = await asyncio.get_running_loop().run_in_executor(
+                _HOSTED_UPDATE_WAIT_EXECUTOR,
+                _wait_for_hosted_update,
+                revision,
+                15.0,
+                conversation_id,
+            )
+            if next_revision == revision:
+                await websocket.send_json({
+                    "type": "keepalive",
+                    "cursor": delivered_cursor,
+                })
+                continue
+            revision = next_revision
+    except (WebSocketDisconnect, RuntimeError):
+        return
+    finally:
+        _sse_presence_leave(conversation_id)
+        _release_hosted_sse_slot(normalized_owner, conversation_id)
+
+
 @router.get("/single/conversations/{conversation_id}/session-entries")
 def list_conversation_session_entries(
     conversation_id: str,

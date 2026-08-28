@@ -62,7 +62,7 @@ PUBLIC_API_PATHS: frozenset[str] = frozenset({
 
 Cookie 门（`dashboard_auth/middleware.py`）额外放行：精确路径 `_GATE_PUBLIC_EXACT`（L65-78）：`/auth/login`、`/auth/callback`、`/auth/password-login`、`/auth/logout`、`/login`、`/api/auth/providers`、`/favicon.ico`、`/manifest.webmanifest`、`/apple-touch-icon.png`、`/hermes-official.png`;前缀 `_GATE_PUBLIC_PREFIXES`（L82-89）：`/auth/mobile/`、`/api/mcp/oauth/callback/`、`/assets/`、`/ds-assets/`、`/fonts/`、`/fonts-terminal/`。遗留回环门另豁免 `/api/mcp/oauth/callback/*`（L635）。`/dashboard-plugins/*` 静态资源有意不认证（L19564，后缀允许清单 + 防穿越）。
 
-### 2.4 WebSocket 端点（5 个）
+### 2.4 WebSocket 端点（6 个）
 
 | WS 路径 | 行号 | 用途 | 关闭码 |
 |---|---|---|---|
@@ -71,6 +71,7 @@ Cookie 门（`dashboard_auth/middleware.py`）额外放行：精确路径 `_GATE
 | `/api/ws` | 18404 | tui_gateway JSON-RPC 通道（桌面端与 SPA 主通道） | 4403 禁用、4401 认证、4403 来源/peer |
 | `/api/pub` | 18435 | PTY 子进程侧事件发布 sidecar | 4403 / 4401 / 4403 |
 | `/api/events` | 18463 | 浏览器事件订阅（侧栏） | 4403 / 4401 / 4403 |
+| `/api/plugins/collaboration/single/conversations/{id}/hosted-events-ws` | 约 20800 | iOS/移动端托管会话事件流；与 SSE hosted-events 共用快照、游标、权限和重放语义 | 4400/4401/4403/4404/4409/4429 |
 
 WS 认证（`_ws_auth_reason` L17242-17328）：回环模式 `?token=<_SESSION_TOKEN>`（常量时间比较）;gated 模式**无条件拒绝** `?token=`，改用 `?ticket=`（单次、30s TTL，`ws_tickets.py`，经 `POST /api/auth/ws-ticket` 铸造，拒绝记审计 `WS_TICKET_REJECTED`）或 `?internal=`（进程生命周期凭据，仅经子进程 env 下发，绝不进 HTML）。所有端点另过 Host/Origin 校验（L17210）与 peer IP 校验（L17133）。
 
@@ -290,6 +291,7 @@ WS 认证（`_ws_auth_reason` L17242-17328）：回环模式 `?token=<_SESSION_T
 | POST | `/single/conversations/{id}/record` | 11377 | 只记消息不跑 agent | 404/422 |
 | POST | `/single/conversations/{id}/runtime-session` | 11469 | 绑定/更新运行时会话映射 | 404/422 |
 | GET | `/single/conversations/{id}/hosted-events` | 11507 | **SSE** 托管回合事件流（游标经 query 或 `Last-Event-ID`） | 404/422 |
+| WebSocket | `/single/conversations/{id}/hosted-events-ws` | 约 20800 | **WebSocket** 托管回合事件流；首帧需发送 `{\"type\":\"subscribe\"}`，之后接收 `type=conversation` JSON envelope 与 `type=keepalive` | 4400/4401/4403/4404/4409/4429 |
 | POST | `/single/conversations/{id}/enqueue` | 11711 | 入队一个 hosted turn（request_id+指纹幂等） | 400/404/409/422 |
 | POST | `/single/conversations/{id}/hosted-turns` | 12013 | 直接开一个 hosted turn | 404/409/422 |
 | POST | `/single/conversations/{id}/hosted-turns/{turn_id}/cancel` | 12116 | 请求取消 | 404 |
