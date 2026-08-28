@@ -1382,24 +1382,28 @@ class WebhookAdapter(BasePlatformAdapter):
             )
 
         try:
-            def _run_gh_comment():
-                return subprocess.run(
-                    [
-                        "gh",
-                        "pr",
-                        "comment",
-                        str(pr_int),
-                        "--repo",
-                        repo,
-                        "--body",
-                        content,
-                    ],
-                    capture_output=True,
-                    text=True, encoding='utf-8', errors='replace',
-                    timeout=30,
-                )
-
-            result = await asyncio.to_thread(_run_gh_comment)
+            # Off-loop: `gh` does network I/O and can take its full 30s
+            # timeout. Running it inline froze every adapter and timer on
+            # the gateway event loop for the duration (Pattern A, #91912
+            # class). asyncio.to_thread keeps the loop serving while the
+            # subprocess runs; the worker thread is bounded by the
+            # subprocess timeout below.
+            result = await asyncio.to_thread(
+                subprocess.run,
+                [
+                    "gh",
+                    "pr",
+                    "comment",
+                    str(pr_int),
+                    "--repo",
+                    repo,
+                    "--body",
+                    content,
+                ],
+                capture_output=True,
+                text=True, encoding='utf-8', errors='replace',
+                 timeout=30,
+             )
             if result.returncode == 0:
                 logger.info(
                     "[webhook] Posted comment on %s#%s", repo, pr_number
