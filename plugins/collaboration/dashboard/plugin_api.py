@@ -10845,7 +10845,6 @@ def _run_hosted_role(
     # The hosted workflow has no parallel supervisor/reviewer model. Worker
     # progress is delivered directly over the low-latency channel and settled
     # by the dispatcher from durable worker results.
-    companion_handle: Optional[dict[str, Any]] = None
     for attempt in range(1, attempts + 1):
         try:
             boundary_profile = runtime_profile or profile
@@ -10913,7 +10912,6 @@ def _run_hosted_role(
             )
             persist()
             release_role_claim()
-            _stop_hosted_companion(companion_handle)
             return result, "completed", state
         except Exception as exc:
             intervention = (
@@ -11021,7 +11019,6 @@ def _run_hosted_role(
                 _finish_hosted_turn_if_cancelled(conversation_id, turn_id)
                 state["status"] = "cancelled"
                 release_role_claim()
-                _stop_hosted_companion(companion_handle)
                 return str(state.get("content") or "").strip(), "cancelled", state
             terminal_content = str(state.get("content") or "").strip()
             if str(state.get("status") or "") == "failed" and terminal_content:
@@ -11033,7 +11030,6 @@ def _run_hosted_role(
                 )
                 persist()
                 release_role_claim()
-                _stop_hosted_companion(companion_handle)
                 return terminal_content, "failed", state
             transient = _is_transient_runtime_error(exc)
             has_tool_activity = any(
@@ -11070,11 +11066,9 @@ def _run_hosted_role(
             )
             persist()
             release_role_claim()
-            _stop_hosted_companion(companion_handle)
             return result, "failed", state
 
     release_role_claim()
-    _stop_hosted_companion(companion_handle)
     raise RuntimeError("Hermes 托管角色执行状态异常")
 
 
