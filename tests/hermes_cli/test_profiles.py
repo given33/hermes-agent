@@ -166,7 +166,7 @@ class TestCreateProfile:
 
         profile_dir = create_profile("coder", no_alias=True)
 
-        cfg = yaml.safe_load((profile_dir / "config.yaml").read_text())
+        cfg = yaml.safe_load((profile_dir / "config.yaml").read_text(encoding="utf-8"))
         assert cfg["model"]["provider"] == "nous"
         assert cfg["model"]["default"] == "some/model"
 
@@ -187,7 +187,7 @@ class TestCreateProfile:
             "model:\n  provider: other\n  default: changed/model\n"
         )
 
-        cfg = yaml.safe_load((profile_dir / "config.yaml").read_text())
+        cfg = yaml.safe_load((profile_dir / "config.yaml").read_text(encoding="utf-8"))
         assert cfg["model"]["provider"] == "nous"
         assert cfg["model"]["default"] == "some/model"
 
@@ -1221,4 +1221,3 @@ class TestResolveProfileEnvSpelling:
         # No HERMES_HOME: the platform default root applies (existing contract).
         monkeypatch.delenv("HERMES_HOME", raising=False)
         assert Path(resolve_profile_env("default")) == _get_default_hermes_home()
-
