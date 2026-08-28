@@ -170,6 +170,8 @@ def test_deployment_shell_scripts_have_valid_syntax():
             command,
             capture_output=True,
             text=True,
+            encoding="utf-8",
+            errors="replace",
             check=False,
         )
         # Windows surfaces a failed WSL process as the unsigned DWORD
