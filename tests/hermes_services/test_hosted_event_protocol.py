@@ -255,19 +255,18 @@ def test_turn_cancelled_fences_every_later_event():
 
 
 def test_mobile_interactive_card_event_types_are_registered():
-    """awaiting/supervisor/rework card events must pass protocol validation.
+    """Current dispatcher/worker card events pass protocol validation.
 
-    These are the only events the iOS client renders as interactive cards
-    (decision card, verdict card, rework chips). If they are not registered
-    the append raises instead of persisting, and the cards silently never
-    appear — regression guard for the C-2 incident.
+    Supervisor/reviewer events were retired from the hosted workflow. The
+    mobile surface now receives the dispatcher handoff/rework and approval
+    events that remain in the canonical protocol.
     """
     conversation = _conversation()
     for event_type in (
         "awaiting.choice",
-        "supervisor.verdict",
-        "rework.started",
-        "rework.dispatched",
+        "role.handoff",
+        "role.rework_requested",
+        "approval.request",
     ):
         result = append_hosted_event(
             conversation,
