@@ -2020,14 +2020,16 @@ def _kill_process_group(proc, escalate: bool = False):
                 logger.debug("Could not kill process: %s", e2, exc_info=True)
 
     # sig is ignored on Windows (taskkill /F is already forceful).
-    _tree_signal(getattr(_signal, "SIGTERM", None))
+    sigterm = getattr(_signal, "SIGTERM", None)
+    sigkill = getattr(_signal, "SIGKILL", sigterm)
+    _tree_signal(sigterm)
 
     if escalate:
         # Give the process 5s to exit after SIGTERM, then SIGKILL
         try:
             proc.wait(timeout=5)
         except subprocess.TimeoutExpired:
-            _tree_signal(getattr(_signal, "SIGKILL", None))
+            _tree_signal(sigkill)
 
 
 def _load_config() -> dict:

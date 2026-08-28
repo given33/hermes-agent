@@ -150,7 +150,10 @@ class TestCodeExecutionDelegation:
         proc.pid = 6666
         proc.wait.side_effect = subprocess.TimeoutExpired(cmd="x", timeout=5)
         code_execution_tool._kill_process_group(proc, escalate=True)
-        assert calls == [(6666, _signal.SIGTERM), (6666, _signal.SIGKILL)]
+        # Windows has no SIGKILL constant; the production helper deliberately
+        # falls back to the platform's terminating signal in that case.
+        sigkill = getattr(_signal, "SIGKILL", _signal.SIGTERM)
+        assert calls == [(6666, _signal.SIGTERM), (6666, sigkill)]
         proc.wait.assert_called_once_with(timeout=5)
 
     def test_swallows_delegation_raise_falls_back_to_plain_kill(self, monkeypatch):

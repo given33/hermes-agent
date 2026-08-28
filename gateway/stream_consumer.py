@@ -218,7 +218,12 @@ class GatewayStreamConsumer:
     # Class-wide monotonic counter for native-streaming draft ids.  Telegram
     # animates a draft when the same draft_id is reused across consecutive
     # calls in the same chat, so we need a fresh non-zero id per response.
-    _draft_id_counter: int = 0
+    # Seed the wire-visible counter itself, not only a separate offset. The
+    # relay tombstones draft IDs across process restarts, so a fresh gateway
+    # must never begin at zero (or reuse a same-clock seed). Keep the seed
+    # below 2**49 so realistic per-process increments remain inside the
+    # connector's JavaScript-safe integer range.
+    _draft_id_counter: int = secrets.randbits(49) or 1
     _draft_id_nonce: int = secrets.randbits(32)
 
     def __init__(

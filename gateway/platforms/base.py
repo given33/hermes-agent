@@ -1807,12 +1807,14 @@ def _translate_docker_container_media_path(candidate: Path, session_key: str = "
 
     mounts = list(_parse_docker_volume_mounts())
     mounts.extend(_cache_dir_container_mounts())
-    # Synthetic /workspace mount for default persistent sandbox / cwd bind.
-    default_ws = _default_docker_workspace_host_root()
-    if default_ws is not None and not any(
+    # Synthetic /workspace mounts for the active profile and the legacy
+    # per-session sandbox layout. Keep every candidate: the first directory
+    # may exist while the requested artifact was produced in the other one.
+    workspace_roots = _default_docker_workspace_host_roots(session_key)
+    if workspace_roots and not any(
         c.as_posix() == "/workspace" for _, c in mounts
     ):
-        mounts.append((default_ws, PurePosixPath("/workspace")))
+        mounts.extend((root, PurePosixPath("/workspace")) for root in workspace_roots)
     # Synthetic /root mount for the persistent home bind. Cache mounts above
     # are longer prefixes, so /root/.hermes/... still translates to the host
     # cache — this only catches stray home writes like /root/out.png.
@@ -1824,7 +1826,10 @@ def _translate_docker_container_media_path(candidate: Path, session_key: str = "
         # host-side credential denylist prefixes — refuse instead so the
         # normal "container path doesn't exist on host" rejection applies.
         if not candidate.as_posix().startswith("/root/.hermes"):
-            mounts.append((default_home, PurePosixPath("/root")))
+            mounts.extend(
+                (root, PurePosixPath("/root"))
+                for root in _docker_persistent_home_host_roots(session_key)
+            )
 
     if not mounts:
         _warn_unresolved_docker_media(candidate, session_key, "no sandbox mounts resolved")
