@@ -4272,6 +4272,36 @@ def _display_system_platform(
     }
 
 
+@app.get("/api/managed-nodes/status")
+async def get_managed_nodes_status():
+    """Return redacted health for configured private Hermes workers.
+
+    This endpoint was accidentally dropped while syncing the upstream web
+    server, but the iOS System route and the four-worker deployment still use
+    it.  Keep the network/file work off the event loop and surface malformed
+    operator configuration as a clear 500 rather than an empty success.
+    """
+    from hermes_cli.managed_nodes import fetch_managed_nodes
+
+    try:
+        return await asyncio.to_thread(fetch_managed_nodes)
+    except ValueError as exc:
+        raise HTTPException(status_code=500, detail=str(exc)) from exc
+
+
+@app.post("/api/managed-nodes/recover")
+async def recover_managed_nodes_endpoint(body: Dict[str, Any] | None = None):
+    """Request reconnect recovery for one worker or all configured workers."""
+    from hermes_cli.managed_nodes import recover_managed_nodes
+
+    payload = body if isinstance(body, dict) else {}
+    node_id = str(payload.get("node_id") or "").strip().lower()
+    try:
+        return await asyncio.to_thread(recover_managed_nodes, node_id)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
 @app.get("/api/system/stats")
 async def get_system_stats():
     """Host + process system stats for the System page.

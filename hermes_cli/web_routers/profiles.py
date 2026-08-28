@@ -786,6 +786,86 @@ async def list_profiles_endpoint():
         return {"profiles": _fallback_profile_dicts(profiles_mod)}
 
 
+@router.get("/api/bots")
+async def list_bots_endpoint():
+    """Bot Mode roster over HTTP for mobile clients.
+
+    Upstream Bot Mode deliberately models each bot as a normal Hermes
+    profile.  The desktop consumes the ``profiles.list`` RPC; mobile clients
+    need a stable REST discovery point, so this endpoint returns the same
+    profile records with an explicit capability marker.  Keeping the profile
+    shape means existing model/SOUL/skill tooling remains interoperable.
+    """
+    result = await list_profiles_endpoint()
+    if not isinstance(result, dict):
+        return {"profiles": [], "bot_mode_protocol": True}
+    rows = result.get("profiles")
+    if not isinstance(rows, list):
+        rows = []
+
+    def canonical_session(row: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+        """Resolve Bot Chat by its title, never by a stored session pointer."""
+        path = str(row.get("path") or "").strip()
+        if not path:
+            return None
+        db_path = Path(path) / "state.db"
+        if not db_path.is_file():
+            return None
+        db = None
+        try:
+            db = _open_session_db_at_path(db_path, read_only=True)
+            session = db.get_session_by_title("Bot Chat")
+            if not session or session.get("archived"):
+                return None
+            if str(session.get("source") or "").strip().lower() in {"kanban", "tool"}:
+                return None
+            session_id = str(session.get("id") or "").strip()
+            if not session_id:
+                return None
+            try:
+                resolved_id = db.resolve_resume_session_id(session_id) or session_id
+            except Exception:
+                resolved_id = session_id
+            tip = db.get_session(resolved_id) or session
+            return {
+                "id": session_id,
+                "resolved_id": resolved_id,
+                "root_title": str(session.get("title") or ""),
+                "title": str(tip.get("title") or ""),
+                "preview": str(tip.get("preview") or ""),
+                "started_at": tip.get("started_at") or session.get("started_at") or 0,
+                "last_active": (
+                    tip.get("last_activity_at")
+                    or tip.get("started_at")
+                    or session.get("started_at")
+                    or 0
+                ),
+                "message_count": tip.get("message_count") or 0,
+            }
+        except Exception:
+            return None
+        finally:
+            if db is not None:
+                try:
+                    db.close()
+                except Exception:
+                    pass
+
+    # The upstream RPC includes this registry row.  Add the same shape to the
+    # mobile REST surface so iOS can show Bot Chat status and resume by name.
+    rows = [
+        {**row, "canonical_session": canonical_session(row)}
+        for row in rows
+        if isinstance(row, dict)
+    ]
+    return {
+        "profiles": rows,
+        "bot_mode": True,
+        "bot_mode_protocol": bool(result.get("bot_mode_protocol", True)),
+        "canonical_chat_title": "Bot Chat",
+    }
+
+
 @router.post("/api/profiles")
 async def create_profile_endpoint(body: ProfileCreate):
     from hermes_cli import profiles as profiles_mod
@@ -897,6 +977,12 @@ async def create_profile_endpoint(body: ProfileCreate):
         "skills_disabled": skills_disabled,
         "hub_installs": hub_installs,
     }
+
+
+@router.post("/api/bots")
+async def create_bot_endpoint(body: ProfileCreate):
+    """Create a Bot Mode bot using the canonical profile builder."""
+    return await create_profile_endpoint(body)
 
 
 @router.get("/api/profiles/active")
@@ -1032,6 +1118,12 @@ async def rename_profile_endpoint(name: str, body: ProfileRename):
     }
 
 
+@router.patch("/api/bots/{name}")
+async def rename_bot_endpoint(name: str, body: ProfileRename):
+    """Rename a bot while preserving the profile/registry identity rules."""
+    return await rename_profile_endpoint(name, body)
+
+
 @router.delete("/api/profiles/{name}")
 async def delete_profile_endpoint(name: str):
     """Delete a profile. The dashboard collects the user's confirmation in
@@ -1048,6 +1140,12 @@ async def delete_profile_endpoint(name: str):
         _log.exception("DELETE /api/profiles/%s failed", name)
         raise HTTPException(status_code=500, detail=str(e))
     return {"ok": True, "path": str(path)}
+
+
+@router.delete("/api/bots/{name}")
+async def delete_bot_endpoint(name: str):
+    """Delete a Bot Mode bot through the profile lifecycle."""
+    return await delete_profile_endpoint(name)
 
 
 @router.get("/api/profiles/{name}/soul")

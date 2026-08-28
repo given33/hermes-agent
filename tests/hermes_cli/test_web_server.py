@@ -23,6 +23,64 @@ from hermes_cli.config import (
 )
 
 
+@pytest.mark.asyncio
+async def test_managed_node_mobile_routes_delegate_to_health_and_recovery(monkeypatch):
+    """The iOS System route must have live managed-worker endpoints again."""
+    from hermes_cli import web_server
+
+    expected_health = {"configured": True, "nodes": [{"id": "hk"}], "sources": []}
+    expected_recovery = {"requested": True, "target": "hk", "outcomes": []}
+
+    def fake_fetch():
+        return expected_health
+
+    def fake_recover(node_id=""):
+        assert node_id == "hk"
+        return expected_recovery
+
+    monkeypatch.setattr("hermes_cli.managed_nodes.fetch_managed_nodes", fake_fetch)
+    monkeypatch.setattr("hermes_cli.managed_nodes.recover_managed_nodes", fake_recover)
+
+    assert await web_server.get_managed_nodes_status() == expected_health
+    assert await web_server.recover_managed_nodes_endpoint({"node_id": "hk"}) == expected_recovery
+
+
+@pytest.mark.asyncio
+async def test_bot_mobile_route_exposes_title_resolved_canonical_chat(monkeypatch, tmp_path):
+    """Mobile Bot Mode keeps the upstream title-based chat identity visible."""
+    from hermes_cli.web_routers import profiles as profiles_router
+
+    state_db = tmp_path / "state.db"
+    state_db.touch()
+
+    class FakeDb:
+        def get_session_by_title(self, title):
+            assert title == "Bot Chat"
+            return {"id": "root", "title": "Bot Chat", "started_at": 10}
+
+        def resolve_resume_session_id(self, session_id):
+            assert session_id == "root"
+            return "tip"
+
+        def get_session(self, session_id):
+            assert session_id == "tip"
+            return {"id": "tip", "title": "Bot Chat", "preview": "hello", "started_at": 11, "message_count": 2}
+
+        def close(self):
+            pass
+
+    async def fake_profiles():
+        return {"profiles": [{"name": "hk-worker", "path": str(tmp_path)}]}
+
+    monkeypatch.setattr(profiles_router, "list_profiles_endpoint", fake_profiles)
+    monkeypatch.setattr(profiles_router, "_open_session_db_at_path", lambda *_args, **_kwargs: FakeDb())
+
+    result = await profiles_router.list_bots_endpoint()
+    assert result["bot_mode"] is True
+    assert result["canonical_chat_title"] == "Bot Chat"
+    assert result["profiles"][0]["canonical_session"]["resolved_id"] == "tip"
+
+
 # ---------------------------------------------------------------------------
 # Shared fixtures
 # ---------------------------------------------------------------------------
