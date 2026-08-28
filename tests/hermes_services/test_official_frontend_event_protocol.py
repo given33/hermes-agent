@@ -34,7 +34,6 @@ from hermes_services.hosted_event_protocol import normalize_legacy_profile_event
         "sudo.expire",
         "secret.expire",
         "background.complete",
-        "review.summary",
     ],
 )
 def test_official_frontend_events_remain_structured(event_type: str):
@@ -63,7 +62,7 @@ def test_subagent_spawn_request_keeps_queued_semantics():
     canonical, payload, entity_id = normalize_legacy_profile_event(
         {
             "type": "subagent.spawn_requested",
-            "payload": {"child_session_id": "child-1", "profile": "reviewer"},
+            "payload": {"child_session_id": "child-1", "profile": "hk-worker"},
         }
     )
 

@@ -920,7 +920,7 @@ def test_behavior_eval_runtime_binding_fails_closed_on_profile_mismatch(monkeypa
     assert exc_info.value.status_code == 409
 
 
-def test_explicit_legacy_profiles_use_default_runtime_without_catalog_reappearance(
+def test_retired_profiles_are_rejected_without_catalog_reappearance(
     monkeypatch,
 ):
     module = _load_module()
@@ -935,24 +935,21 @@ def test_explicit_legacy_profiles_use_default_runtime_without_catalog_reappearan
     )
 
     for profile in ("reviewer", "supervisor", "dbb3-manager"):
-        binding = module._required_runtime_binding(
-            profile,
-            required_provider="provider-a",
-            required_model="model-a",
-        )
-        assert binding["profile"] == profile
-        assert binding["resolved_profile"] == "default"
-        assert binding["verified"] is True
+        with pytest.raises(module.HTTPException) as binding_error:
+            module._required_runtime_binding(
+                profile,
+                required_provider="provider-a",
+                required_model="model-a",
+            )
+        assert binding_error.value.status_code == 400
 
-        route, mode, selected, artifact = module._hosted_route_parameters(
-            route_metadata={"mode": "chat", "profiles": [profile]},
-            requested_mode="chat",
-            requested_profiles=[profile],
-        )
-        assert mode == "chat"
-        assert selected == [profile]
-        assert route["profiles"] == [profile]
-        assert artifact is False
+        with pytest.raises(module.HTTPException) as route_error:
+            module._hosted_route_parameters(
+                route_metadata={"mode": "chat", "profiles": [profile]},
+                requested_mode="chat",
+                requested_profiles=[profile],
+            )
+        assert route_error.value.status_code == 400
 
 
 def test_local_intervention_reply_reuses_the_hosted_account_artifact_boundary(
@@ -1539,15 +1536,15 @@ def test_all_at_once_has_independent_claim_and_completion_per_target():
         turn_id="turn-all-at-once",
         content="task",
         title="task",
-        profiles=["dbb3-worker", "reviewer"],
+        profiles=["dbb3-worker", "hk-worker"],
         artifact_required=False,
         mode="work",
     )
     run["interventions"].append({
         "id": "intervention-all-at-once",
-        "content": "update worker and reviewer",
-        "targets": ["worker", "reviewer"],
-        "target_profiles": [],
+        "content": "update DBB3 and HK workers",
+        "targets": ["worker"],
+        "target_profiles": ["dbb3-worker", "hk-worker"],
         "status": "pending",
         "delivery": "steer",
         "queue_mode": "all_at_once",
@@ -1566,19 +1563,19 @@ def test_all_at_once_has_independent_claim_and_completion_per_target():
         intervention_id="intervention-all-at-once",
         execution_owner="worker-owner",
     )
-    reviewer = module._claim_hosted_role_intervention(
+    hk_worker = module._claim_hosted_role_intervention(
         conversation["id"],
         "turn-all-at-once",
-        role_stage="reviewer",
-        profile="reviewer",
-        checkpoint={"content": "review checkpoint"},
+        role_stage="worker",
+        profile="hk-worker",
+        checkpoint={"content": "HK checkpoint"},
         intervention_id="intervention-all-at-once",
-        execution_owner="reviewer-owner",
+        execution_owner="hk-owner",
     )
 
-    assert worker is not None and worker["delivery_key"] == "role:worker"
-    assert reviewer is not None and reviewer["delivery_key"] == "role:reviewer"
-    assert worker["claim_token"] != reviewer["claim_token"]
+    assert worker is not None and worker["delivery_key"] == "profile:dbb3-worker"
+    assert hk_worker is not None and hk_worker["delivery_key"] == "profile:hk-worker"
+    assert worker["claim_token"] != hk_worker["claim_token"]
     module._complete_hosted_role_intervention(
         conversation["id"],
         "turn-all-at-once",
@@ -1596,13 +1593,13 @@ def test_all_at_once_has_independent_claim_and_completion_per_target():
         conversation["id"],
         "turn-all-at-once",
         intervention_id="intervention-all-at-once",
-        claim_token=reviewer["claim_token"],
-        execution_owner="reviewer-owner",
-        role_stage="reviewer",
-        role_label="Reviewer",
-        profile="reviewer",
-        reply="reviewer updated",
-        checkpoint={"content": "reviewer updated"},
+        claim_token=hk_worker["claim_token"],
+        execution_owner="hk-owner",
+        role_stage="worker",
+        role_label="HK Worker",
+        profile="hk-worker",
+        reply="HK worker updated",
+        checkpoint={"content": "HK worker updated"},
     )
 
     assert run["interventions"][0]["status"] == "completed"
@@ -1612,7 +1609,7 @@ def test_all_at_once_has_independent_claim_and_completion_per_target():
     ]
     assert {message["content"] for message in replies} == {
         "worker updated",
-        "reviewer updated",
+        "HK worker updated",
     }
 
 
