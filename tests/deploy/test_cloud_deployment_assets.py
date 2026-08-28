@@ -101,7 +101,7 @@ def test_upstream_report_flags_product_ios_and_deployment_overlap():
     assert "Manual Codex review required before merge" in report
 
 
-def test_upstream_sync_creates_a_reviewed_pr_without_direct_merge_or_deploy():
+def test_upstream_sync_promotes_verified_merge_without_review_or_deploy():
     workflow = UPSTREAM_WORKFLOW.read_text(encoding="utf-8")
     assert "cron: '17 18 * * *'" in workflow
     assert "https://github.com/NousResearch/hermes-agent.git" in workflow
@@ -110,9 +110,11 @@ def test_upstream_sync_creates_a_reviewed_pr_without_direct_merge_or_deploy():
     assert "scripts/upstream_change_report.py" in workflow
     assert "tests/plugins/test_collaboration_dashboard.py" in workflow
     assert "tests/deploy/test_cloud_deployment_assets.py" in workflow
-    assert "codex-review-required" in workflow
-    assert "@codex review" in workflow
-    assert "gh pr create" in workflow
+    assert "Push the verified upstream merge directly to main" in workflow
+    assert 'git push origin "HEAD:refs/heads/main"' in workflow
+    assert "gh pr create" not in workflow
+    assert "@codex review" not in workflow
+    assert "codex-review-required" not in workflow
     assert "gh pr merge" not in workflow
     assert "ssh " not in workflow
 
