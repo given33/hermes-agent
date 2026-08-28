@@ -101,6 +101,35 @@ async def test_bot_create_marks_profile_for_upstream_bot_mode(monkeypatch, tmp_p
     assert data["ui_meta"]["hermes-bots"]["title"] == "hk-worker"
 
 
+@pytest.mark.asyncio
+async def test_bot_meta_mobile_route_round_trips_upstream_presentation_state(monkeypatch, tmp_path):
+    """iOS can read/write the same Bot Mode metadata as the desktop plugin."""
+    from hermes_cli import profiles as profiles_mod
+    from hermes_cli.web_routers import profiles as profiles_router
+
+    profile_dir = tmp_path / "hk-worker"
+    profile_dir.mkdir()
+    profiles_mod.write_profile_meta(
+        profile_dir,
+        ui_meta={"hermes-bots": {"title": "Hong Kong", "hidden": False, "groups": ["ops"]}},
+    )
+    monkeypatch.setattr(profiles_router, "_resolve_profile_dir", lambda _name: profile_dir)
+
+    read = await profiles_router.get_bot_meta_endpoint("hk-worker")
+    assert read["meta"] == {"title": "Hong Kong", "hidden": False, "groups": ["ops"]}
+
+    updated = await profiles_router.update_bot_meta_endpoint(
+        "hk-worker",
+        profiles_router.BotMetaUpdate(title="HK Worker", hidden=True, pinned=True, groups=["ops", "infra", "ops"]),
+    )
+    assert updated["applied"] == {"ui_meta": True}
+    assert updated["meta"]["groups"] == ["ops", "infra"]
+    persisted = profiles_mod.read_profile_meta(profile_dir)["ui_meta"]["hermes-bots"]
+    assert persisted["title"] == "HK Worker"
+    assert persisted["hidden"] is True
+    assert persisted["pinned"] is True
+
+
 # ---------------------------------------------------------------------------
 # Shared fixtures
 # ---------------------------------------------------------------------------

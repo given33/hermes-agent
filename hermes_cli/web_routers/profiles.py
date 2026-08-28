@@ -36,6 +36,7 @@ from hermes_cli.web_models import (
     ProfileExport,
     ProfileImport,
     ProfileRename,
+    BotMetaUpdate,
     ProfileSoulUpdate,
     ProfileDescriptionUpdate,
     StudioMemoryUpdate,
@@ -855,7 +856,11 @@ async def list_bots_endpoint():
     # mobile REST surface so iOS can show Bot Chat status and resume by name.
     rows = await asyncio.to_thread(
         lambda: [
-            {**row, "canonical_session": canonical_session(row)}
+            {
+                **row,
+                "canonical_session": canonical_session(row),
+                "bot_meta": _bot_meta_for_row(row),
+            }
             for row in rows
             if isinstance(row, dict)
         ]
@@ -865,6 +870,112 @@ async def list_bots_endpoint():
         "bot_mode": True,
         "bot_mode_protocol": bool(result.get("bot_mode_protocol", True)),
         "canonical_chat_title": "Bot Chat",
+    }
+
+
+def _bot_meta_for_row(row: Dict[str, Any]) -> Dict[str, Any]:
+    """Return the upstream ``ui_meta['hermes-bots']`` mapping for a row.
+
+    Profile listing intentionally stays small for the dashboard. Bot Mode is
+    the one consumer that needs its presentation metadata, so this enrichment
+    is scoped to ``/api/bots`` and never changes the generic profile contract.
+    """
+    path = str(row.get("path") or "").strip()
+    if not path:
+        return {}
+    try:
+        from hermes_cli import profiles as profiles_mod
+
+        meta = profiles_mod.read_profile_meta(Path(path))
+        ui_meta = meta.get("ui_meta") if isinstance(meta, dict) else {}
+        bot_meta = ui_meta.get("hermes-bots") if isinstance(ui_meta, dict) else {}
+        return _safe_bot_meta(bot_meta)
+    except Exception:
+        return {}
+
+
+def _safe_bot_meta(value: Any) -> Dict[str, Any]:
+    """Keep the mobile metadata response JSON-safe and bounded."""
+    if not isinstance(value, dict):
+        return {}
+    out: Dict[str, Any] = {}
+    for key in ("title", "color", "shape"):
+        item = value.get(key)
+        if isinstance(item, str) and item.strip():
+            out[key] = item.strip()[:120]
+    for key in ("hidden", "pinned"):
+        if isinstance(value.get(key), bool):
+            out[key] = value[key]
+    groups = value.get("groups")
+    if isinstance(groups, list):
+        out["groups"] = list(dict.fromkeys(
+            str(group).strip()[:120] for group in groups
+            if str(group or "").strip()
+        ))[:32]
+    return out
+
+
+def _bot_meta_path(name: str) -> Path:
+    """Resolve and validate a Bot Mode profile directory."""
+    path = _resolve_profile_dir(name)
+    if not path.is_dir():
+        raise HTTPException(status_code=404, detail="Profile not found")
+    return path
+
+
+@router.get("/api/bots/{name}/meta")
+async def get_bot_meta_endpoint(name: str):
+    """Read the presentation metadata used by the upstream Bot Mode UI."""
+    from hermes_cli import profiles as profiles_mod
+
+    path = _bot_meta_path(name)
+    all_meta = profiles_mod.read_profile_meta(path)
+    ui_meta = all_meta.get("ui_meta") if isinstance(all_meta, dict) else {}
+    bot_meta = ui_meta.get("hermes-bots") if isinstance(ui_meta, dict) else {}
+    return {
+        "ok": True,
+        "name": profiles_mod.normalize_profile_name(name),
+        "meta": _safe_bot_meta(bot_meta),
+    }
+
+
+@router.patch("/api/bots/{name}/meta")
+async def update_bot_meta_endpoint(name: str, body: BotMetaUpdate):
+    """Persist Bot Mode title/visibility/pinning/group metadata.
+
+    This mirrors the desktop plugin's ``profiles.configure`` subset while
+    retaining unrelated ``profile.yaml`` and plugin metadata keys.
+    """
+    from hermes_cli import profiles as profiles_mod
+
+    path = _bot_meta_path(name)
+    all_meta = profiles_mod.read_profile_meta(path)
+    ui_meta = all_meta.get("ui_meta") if isinstance(all_meta, dict) else {}
+    current = ui_meta.get("hermes-bots") if isinstance(ui_meta, dict) else {}
+    merged: Dict[str, Any] = _safe_bot_meta(current)
+    for key, value in body.model_dump(exclude_unset=True).items():
+        if key == "title":
+            cleaned = str(value or "").strip()
+            if cleaned:
+                merged[key] = cleaned
+            else:
+                merged.pop(key, None)
+        elif key in {"color", "shape"}:
+            cleaned = str(value or "").strip()
+            if cleaned:
+                merged[key] = cleaned
+            else:
+                merged.pop(key, None)
+        elif key == "groups":
+            merged[key] = list(value or [])
+        else:
+            merged[key] = value
+    profiles_mod.write_profile_meta(path, ui_meta={"hermes-bots": merged})
+    return {
+        "ok": True,
+        "name": profiles_mod.normalize_profile_name(name),
+        "meta": merged,
+        "applied": {"ui_meta": True},
     }
 
 

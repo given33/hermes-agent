@@ -619,6 +619,36 @@ class ProfileRename(BaseModel):
     new_name: str
 
 
+class BotMetaUpdate(BaseModel):
+    """Mutable Bot Mode presentation metadata.
+
+    The desktop plugin stores these values below ``profile.yaml.ui_meta``.
+    Mobile uses the same names but sends a typed subset so arbitrary profile
+    configuration cannot be overwritten accidentally.
+    """
+
+    title: Optional[str] = Field(default=None, max_length=120)
+    hidden: Optional[bool] = None
+    pinned: Optional[bool] = None
+    color: Optional[str] = Field(default=None, max_length=32)
+    shape: Optional[str] = Field(default=None, max_length=64)
+    groups: Optional[List[str]] = None
+
+    @field_validator("groups")
+    @classmethod
+    def _normalize_groups(cls, value: Optional[List[str]]) -> Optional[List[str]]:
+        if value is None:
+            return None
+        result: List[str] = []
+        for item in value:
+            group = str(item or "").strip()
+            if group and group not in result:
+                result.append(group)
+        if len(result) > 32:
+            raise ValueError("groups must contain at most 32 entries")
+        return result
+
+
 class ProfileExport(BaseModel):
     # Optional extra root-level files to stage into the archive, filename →
     # text content (e.g. desktop.json — the desktop appearance overlay).

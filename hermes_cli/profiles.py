@@ -929,11 +929,11 @@ def read_profile_meta(profile_dir: Path) -> dict:
     """Read ``<profile_dir>/profile.yaml`` and return a dict.
 
     Returns ``{"description": "", "description_auto": False,
-    "display_name": ""}`` when the file is missing or unreadable. Never
+    "display_name": "", "ui_meta": {}}`` when the file is missing or unreadable. Never
     raises — a corrupt profile.yaml on an unrelated profile must not
     break ``hermes profile list``.
     """
-    empty = {"description": "", "description_auto": False, "display_name": ""}
+    empty = {"description": "", "description_auto": False, "display_name": "", "ui_meta": {}}
     path = _profile_yaml_path(profile_dir)
     if not path.is_file():
         return empty
@@ -949,6 +949,10 @@ def read_profile_meta(profile_dir: Path) -> dict:
         "description": str(data.get("description") or "").strip(),
         "description_auto": bool(data.get("description_auto", False)),
         "display_name": str(data.get("display_name") or "").strip(),
+        # Desktop extensions (including Bot Mode) persist presentation state
+        # in this namespace. Keep only mapping values so malformed YAML can
+        # never leak scalars/lists into API responses.
+        "ui_meta": data.get("ui_meta") if isinstance(data.get("ui_meta"), dict) else {},
     }
 
 
