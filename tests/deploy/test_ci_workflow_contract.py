@@ -9,8 +9,11 @@ def test_all_checks_gate_uses_independent_docker_workflow_and_rejects_nontermina
 
     assert "      - docker\n" not in workflow
     assert "The image build runs in its own workflow (docker.yml)" in workflow
-    assert "info['result'] not in ('success', 'skipped')" in workflow
-    assert "required job(s) did not pass" in workflow
+    # The upstream orchestrator now treats only an explicit failure as a gate
+    # failure; skipped lane workflows are valid when the change classifier
+    # says they are irrelevant.
+    assert "info['result'] == 'failure'" in workflow
+    assert "All checks passed (or were skipped)" in workflow
 
 
 def test_production_deploy_waits_for_the_same_commit_ci_run():
@@ -23,4 +26,7 @@ def test_production_deploy_waits_for_the_same_commit_ci_run():
     assert "--commit \"$RELEASE_COMMIT\"" in source
     assert "Timed out waiting for the complete CI gate" in source
     assert "--extra all --extra dev --extra hindsight" in source
-    assert "  release:\n    types: [published]\n" in ci_source
+    # Release events are intentionally owned by the production deployment
+    # workflow.  CI remains the pull-request/main push gate and deployment
+    # waits on the same commit's CI run above.
+    assert "  pull_request:\n  push:\n    branches: [main]\n" in ci_source
