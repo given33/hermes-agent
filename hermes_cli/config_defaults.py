@@ -1183,6 +1183,19 @@ DEFAULT_CONFIG = {
             "reasoning_effort": "",  # per-task thinking level: none|minimal|low|medium|high|xhigh|max|ultra (empty = provider default)
             "language": "",
         },
+        # Standalone ``/review`` command. This auxiliary slot configures the
+        # explicit user-invoked review utility only; hosted collaboration
+        # workflows remain dispatcher + worker lanes and never call it.
+        "review": {
+            "provider": "auto",
+            "model": "",
+            "base_url": "",
+            "api_key": "",
+            "api_mode": "",
+            "timeout": 120,
+            "extra_body": {},
+            "reasoning_effort": "",
+        },
         "memory_query_rewrite": {
             "provider": "auto",
             "model": "",
