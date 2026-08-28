@@ -1798,12 +1798,18 @@ def _translate_docker_container_media_path(candidate: Path, session_key: str = "
     # bridged terminal.* config into TERMINAL_* env vars — run the idempotent
     # bridge so the mount parsing below sees the active backend and volumes
     # (same guard _binary_reference_block applies for inbound attachments).
-    try:
-        from tools.terminal_tool import _ensure_terminal_env_bridged
+    # An explicit environment selection made by the caller is authoritative.
+    # Only consult config.yaml when no TERMINAL_ENV has been exported yet;
+    # otherwise the one-shot bridge can overwrite a test/request-scoped
+    # ``docker`` selection with the persistent local default before mount
+    # translation runs.
+    if not os.getenv("TERMINAL_ENV"):
+        try:
+            from tools.terminal_tool import _ensure_terminal_env_bridged
 
-        _ensure_terminal_env_bridged()
-    except Exception:
-        pass
+            _ensure_terminal_env_bridged()
+        except Exception:
+            pass
 
     mounts = list(_parse_docker_volume_mounts())
     mounts.extend(_cache_dir_container_mounts())
@@ -1907,7 +1913,8 @@ def validate_media_delivery_path(path: str, session_key: str = "") -> Optional[s
     # mount paths). Resolve those to host paths before the normal host-side
     # existence / denylist checks.
     translated = _translate_docker_container_media_path(
-        container_candidate or expanded
+        container_candidate or expanded,
+        session_key=session_key,
     )
     if translated is not None:
         resolved = translated
