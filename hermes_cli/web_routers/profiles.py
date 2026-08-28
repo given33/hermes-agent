@@ -853,11 +853,13 @@ async def list_bots_endpoint():
 
     # The upstream RPC includes this registry row.  Add the same shape to the
     # mobile REST surface so iOS can show Bot Chat status and resume by name.
-    rows = [
-        {**row, "canonical_session": canonical_session(row)}
-        for row in rows
-        if isinstance(row, dict)
-    ]
+    rows = await asyncio.to_thread(
+        lambda: [
+            {**row, "canonical_session": canonical_session(row)}
+            for row in rows
+            if isinstance(row, dict)
+        ]
+    )
     return {
         "profiles": rows,
         "bot_mode": True,
