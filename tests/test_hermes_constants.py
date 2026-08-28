@@ -48,7 +48,8 @@ def test_display_hermes_home_keeps_explicit_scope_visible(monkeypatch, tmp_path)
     explicit_home = tmp_path / ".hermes"
     monkeypatch.setenv("HERMES_HOME", str(explicit_home))
 
-    assert display_hermes_home() == str(explicit_home)
+    relative = explicit_home.relative_to(Path.home()).as_posix()
+    assert display_hermes_home() == f"~/{relative}"
 
 
 class TestGetDefaultHermesRoot:

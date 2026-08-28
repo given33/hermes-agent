@@ -1208,11 +1208,6 @@ def display_hermes_home() -> str:
     :func:`get_hermes_home` instead.
     """
     home = get_hermes_home()
-    # An explicit process/profile scope is meaningful state.  Showing it as
-    # ``~/...`` is misleading when HOME and HERMES_HOME deliberately point at
-    # different roots (the common multiplexed gateway/test setup).
-    if get_hermes_home_override() or os.environ.get("HERMES_HOME", "").strip():
-        return str(home)
     try:
         # as_posix(): on Windows, str() of a relative Path renders
         # backslashes, producing mixed-separator chimeras like
