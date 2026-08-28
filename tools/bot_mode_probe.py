@@ -232,15 +232,10 @@ def _peer_paragraph(root: Path) -> str:
     listed = ", ".join(f"`{p}`" for p in peers)
     return (
         "\n\nTeammates on OTHER machines: this install also has peer gateways "
-        f"registered ({listed}). Message an agent on a peer the same way — write "
-        "the message to a temp file first, then pipe it on stdin (same terminal-"
-        "tool pattern: background=true, notify_on_complete=true; the reply prints "
-        "on stdout when it completes):\n"
-        "```\n"
-        "hermes peer dm <peer>/<agent-name> < /tmp/dm.txt\n"
-        "```\n"
-        "Use `<peer>` alone for the peer's main agent. Run `hermes peer list` "
-        "for the live peer list."
+        f"registered ({listed}). Message an agent on a peer the same way — "
+        'message_agent with target "<peer>/<agent-name>" (or "<peer>" alone '
+        "for the peer's main agent). Run `hermes peer list` for the live "
+        "peer list."
     )
 
 
@@ -264,21 +259,28 @@ def _build_section(home: Path) -> str:
     return (
         f"{_PROTOCOL_HEADING}\n"
         "This install runs Bot Mode: each Hermes profile is an agent teammate with "
-        'one canonical "Bot Chat" conversation. To message a teammate: write the '
-        "message to a temp file with the file tool FIRST (never inline it into the "
-        "command — quotes truncate it and $( ) would execute), then run on the "
-        "terminal tool (background=true, notify_on_complete=true) and finish your "
-        "turn — the reply arrives later as a new message:\n"
-        "```\n"
-        f'hermes -p <agent-name> chat --in ~ -c "Bot Chat" --create-if-missing -Q --query-file /tmp/dm.txt\n'
-        "```\n"
-        f'The file must open with the "Message from 🤖 {handle} (@{handle}):" prefix so they '
-        "know who is talking. When YOU receive a message with that prefix, you are "
-        "being messaged by a teammate agent — address them (not the user) and reply "
-        "concisely. When the user says \"ask <name>\" or \"tell <name> ...\", that is a "
-        "handoff: message that agent, wait for the reply, and report back, saying "
-        "which agent it came from. Run `hermes profile list` for the LIVE teammate "
-        f"list before a handoff. Teammates at session start: {teammates}."
+        'one canonical "Bot Chat" conversation, and you have the `message_agent` '
+        "tool to DM any of them. It is FIRE-AND-FORGET: it delivers your message "
+        "with your attribution prefixed automatically and returns an acknowledgement "
+        "immediately — it never returns the reply. Send it, finish your turn, and "
+        "the reply arrives later as a background-process completion notification "
+        "that wakes you; relay it to the user then, attributed to that agent. "
+        "COMPOSE every message yourself — say what YOU need from that agent; never "
+        "forward the user's words verbatim, and never reveal private 1:1 chat "
+        "content. When the user says \"ask <name>\" or \"tell <name> ...\", that is "
+        "a handoff: pick the right teammate from the roster below, message them "
+        "with message_agent, and report back naming which agent replied. Message "
+        "ONE clearly relevant teammate; don't fan out to several unless the user "
+        "explicitly asked.\n"
+        f'When YOU receive a "Message from 🤖 <name> (@<handle>):" message, a '
+        "teammate agent is talking to you (not the user): address them, reply "
+        "concisely via message_agent to their handle, and if it is a pure FYI "
+        "with nothing to add, staying silent is fine — never ping-pong "
+        "acknowledgements.\n"
+        f"You are `@{handle}`. Your teammates (live roster; roles from their "
+        "profiles):\n"
+        f"{roster_block}"
+        + _remote_paragraph(root)
         + _peer_paragraph(root)
     )
 
