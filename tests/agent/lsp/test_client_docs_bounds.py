@@ -36,7 +36,12 @@ def _client(tmp_path) -> LSPClient:
 def _running(client: LSPClient) -> None:
     """Fake a running server so notifications are attempted."""
     client._state = "running"
-    client._proc = SimpleNamespace(returncode=None, stdin=None, stdout=None)
+    client._proc = SimpleNamespace(
+        returncode=None,
+        stdin=SimpleNamespace(is_closing=lambda: False),
+        stdout=None,
+    )
+    client._reader_task = SimpleNamespace(done=lambda: False)
 
 
 def _record_notifications(client: LSPClient) -> list:

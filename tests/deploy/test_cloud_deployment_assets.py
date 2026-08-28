@@ -271,7 +271,7 @@ def test_three_endpoint_updates_follow_only_a_committed_main_release():
     assert "needs: verify" in workflow
     assert "actions: read" in workflow
     assert "Wait for the complete CI gate" in workflow
-    assert "--workflow ci.yml" in workflow
+    assert "--workflow ci.yaml" in workflow
     assert "workflow_run:" not in workflow
     assert "tests/hermes_cli/test_config_read_guard.py" in workflow
     assert "tests/test_sqlite_wal_reset_gate.py" in workflow

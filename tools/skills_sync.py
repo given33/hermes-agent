@@ -716,26 +716,21 @@ def sync_skills(quiet: bool = False) -> dict:
         dict with keys: copied (list), updated (list), skipped (int),
                         user_modified (list), cleaned (list), total_bundled (int)
     """
-    # Opt-out: a profile (named or the default ~/.hermes) that wrote the
-    # .no-bundled-skills marker gets zero bundled-skill seeding. Returning the
-    # empty-result shape with skipped_opt_out lets callers report "opted out"
-    # instead of "synced 0 / failed". This is the default-profile counterpart
-    # to seed_profile_skills()'s marker check for named profiles.
-    if (_hermes_home() / NO_BUNDLED_SKILLS_MARKER).exists():
-        if not quiet:
-            print("  (skipped — profile opted out of bundled skills via .no-bundled-skills)")
-        return {
-            "copied": [], "updated": [], "skipped": 0,
-            "user_modified": [], "cleaned": [], "total_bundled": 0,
-            "optional_provenance_backfilled": [], "skipped_opt_out": True,
-        }
+    # Opt-out profiles do not receive the full bundled catalog, but the
+    # essential skills still have to be seeded.  In particular, a profile
+    # created with ``--no-skills`` must retain ``hermes-agent`` so the first
+    # conversation remains usable.  Keep the flag local and run the normal
+    # manifest/copy path below with the bundled list filtered to essentials.
+    essential_only = (_hermes_home() / NO_BUNDLED_SKILLS_MARKER).exists()
+    if essential_only and not quiet:
+        print("  (profile opted out of bundled skills; seeding essential skills only)")
 
     bundled_dir = _get_bundled_dir()
     if not bundled_dir.exists():
         return {
             "copied": [], "updated": [], "skipped": 0,
             "user_modified": [], "cleaned": [], "suppressed": [], "total_bundled": 0,
-            "optional_provenance_backfilled": [],
+            "optional_provenance_backfilled": [], "skipped_opt_out": essential_only,
         }
 
     _skills_dir().mkdir(parents=True, exist_ok=True)
@@ -978,6 +973,8 @@ def sync_skills(quiet: bool = False) -> dict:
     } if essential_only else None
     for desc_md in bundled_dir.rglob("DESCRIPTION.md"):
         rel = desc_md.relative_to(bundled_dir)
+        if essential_only and rel.parent not in (_essential_cat_dirs or set()):
+            continue
         dest_desc = _skills_dir() / rel
         if not dest_desc.exists():
             try:

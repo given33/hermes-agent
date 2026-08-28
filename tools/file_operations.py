@@ -2209,16 +2209,14 @@ class ShellFileOperations(FileOperations):
         # rejection above guarantees this cannot raise; the try/except is
         # defense for future callers that bypass it.
         try:
-            # ``subprocess.run(text=True)`` on Windows translates LF written
-            # to the child stdin into CRLF. Hash the bytes that the backend
-            # actually receives, otherwise a valid write is reported as
-            # corrupt even though the target contains the intended text.
-            transmitted_content = (
-                _normalize_line_endings(content, "\r\n")
-                if os.name == "nt"
-                else content
-            )
-            content_bytes = transmitted_content.encode("utf-8", "surrogateescape")
+            # ``_pipe_stdin`` writes through the underlying byte buffer, so
+            # it deliberately bypasses Python's Windows text-mode newline
+            # translation. Hash the exact post-shim content (including any
+            # preserved CRLF/BOM) that is sent to the atomic-write script.
+            # Re-introducing a Windows-only CRLF conversion here would make
+            # valid LF writes appear corrupt even though the on-disk bytes
+            # are correct.
+            content_bytes = content.encode("utf-8", "surrogateescape")
         except UnicodeEncodeError as exc:
             return WriteResult(
                 error=(

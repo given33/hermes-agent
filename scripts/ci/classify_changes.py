@@ -115,6 +115,10 @@ def _is_nix(p: str) -> bool:
 
 
 def _py_irrelevant(p: str) -> bool:
+    # The published website guide is exercised by the Python skill/document
+    # tests, even though the rest of the website tree is site-only.
+    if p.startswith("website/docs/"):
+        return False
     if p.startswith(_PY_RELEVANT_SITE):
         return False
     return (
@@ -210,6 +214,7 @@ def classify(files: list[str]) -> dict[str, bool]:
         ret["uv_lock"] = True
         ret["npm_lock"] = True
         ret["installer"] = True
+        ret["rust"] = True
         ret["nix"] = True
         ret["ci_review"] = True
 

@@ -947,6 +947,24 @@ class WebSocketRelayTransport:
                         "treating as a revoked relay credential (opt-out); not reconnecting"
                     )
             self._pending.clear()
+        finally:
+            # A reader task ending is the single source of truth that this
+            # socket is gone.  Keep the transport's state aligned with the
+            # actual socket and arm the reconnect supervisor for both
+            # unexpected closes and the deliberate go_dormant() close.  The
+            # identity check prevents an old reader from clearing a socket
+            # installed by a newer dial.
+            if self._ws is ws:
+                self._ws = None
+            if (
+                not self._closing
+                and self._reconnect
+                and not self._auth_revoked
+                and (self._supervisor is None or self._supervisor.done())
+            ):
+                self._supervisor = asyncio.create_task(
+                    self._reconnect_loop(), name="relay-ws-reconnect"
+                )
 
     @staticmethod
     def _close_code_of(exc: BaseException) -> Optional[int]:

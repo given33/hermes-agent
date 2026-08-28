@@ -506,34 +506,26 @@ class LSPClient:
             await self._cleanup_process()
 
     async def _cleanup_process(self) -> None:
-        if self._reader_task is not None and not self._reader_task.done():
-            self._reader_task.cancel()
-            try:
-                await self._reader_task
-            except (asyncio.CancelledError, Exception):  # noqa: BLE001
-                pass
-        for dispatch in list(self._pending_dispatch):
-            dispatch.cancel()
-        if self._pending_dispatch:
-            await asyncio.gather(*self._pending_dispatch, return_exceptions=True)
-        self._pending_dispatch.clear()
-        if self._stderr_task is not None and not self._stderr_task.done():
-            self._stderr_task.cancel()
-            try:
-                await self._stderr_task
-            except (asyncio.CancelledError, Exception):  # noqa: BLE001
-                pass
-        proc = self._proc
-        self._proc = None
-        if proc is None:
-            return
-        if proc.returncode is None:
-            try:
-                proc.terminate()
+        async with self._cleanup_lock:
+            reader_task = self._reader_task
+            self._reader_task = None
+            if (
+                reader_task is not None
+                and reader_task is not asyncio.current_task()
+                and not reader_task.done()
+            ):
+                reader_task.cancel()
                 try:
                     await reader_task
                 except (asyncio.CancelledError, Exception):  # noqa: BLE001
                     pass
+
+            for dispatch in list(self._pending_dispatch):
+                dispatch.cancel()
+            if self._pending_dispatch:
+                await asyncio.gather(*self._pending_dispatch, return_exceptions=True)
+            self._pending_dispatch.clear()
+
             stderr_task = self._stderr_task
             self._stderr_task = None
             if stderr_task is not None and not stderr_task.done():
@@ -542,23 +534,25 @@ class LSPClient:
                     await stderr_task
                 except (asyncio.CancelledError, Exception):  # noqa: BLE001
                     pass
+
             proc = self._proc
             self._proc = None
-            if proc is None:
+            if proc is None or proc.returncode is not None:
                 return
-            if proc.returncode is None:
+            try:
+                proc.terminate()
+            except ProcessLookupError:
+                return
+            try:
+                await asyncio.wait_for(proc.wait(), timeout=SHUTDOWN_GRACE)
+            except asyncio.TimeoutError:
                 try:
-                    proc.terminate()
-                    try:
-                        await asyncio.wait_for(proc.wait(), timeout=SHUTDOWN_GRACE)
-                    except asyncio.TimeoutError:
-                        try:
-                            proc.kill()
-                            await proc.wait()
-                        except ProcessLookupError:
-                            pass
+                    proc.kill()
+                    await proc.wait()
                 except ProcessLookupError:
                     pass
+            except ProcessLookupError:
+                pass
 
     # ------------------------------------------------------------------
     # request / notification plumbing
@@ -864,7 +858,7 @@ class LSPClient:
 
         abs_path = os.path.abspath(path)
         doc = self._docs.pop(abs_path, None)
-        if doc is None or doc.version < 0 or not self.is_running:
+        if doc is None or doc.version < 0:
             return
         await self._send_notification(
             "textDocument/didClose",

@@ -1784,6 +1784,18 @@ def _write_gateway_update_exit_code(ok: bool) -> None:
         pass
 
 
+def _restore_state_db_from_snapshot(state_path: Path, snap_state: Path) -> bool:
+    """Replace a state database with a verified pre-update snapshot."""
+    from hermes_cli.backup import verify_sqlite_integrity
+
+    _clear_stale_sqlite_sidecars(state_path)
+    shutil.copy2(snap_state, state_path)
+    restored = verify_sqlite_integrity(
+        state_path, check_header=True, run_pragma=True
+    )
+    return bool(restored.get("valid"))
+
+
 def _update_via_zip(args, *, had_desktop_app_before_update: bool = False) -> bool:
     """Update Hermes Agent by downloading a ZIP archive.
 

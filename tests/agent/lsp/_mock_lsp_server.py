@@ -113,7 +113,16 @@ def main():
                 if script == "malformed_frame":
                     sys.stdout.buffer.write(b"Content-Length: invalid\r\n\r\n")
                     sys.stdout.buffer.flush()
-                os.close(sys.stdout.fileno())
+                # Close the Python stream itself as well as its descriptor.
+                # On Windows, closing only the CRT fd can leave the buffered
+                # pipe handle alive in the child, so the client never sees
+                # the clean EOF this fixture is meant to model.
+                sys.stdout.flush()
+                sys.stdout.buffer.close()
+                if os.name == "nt":
+                    # Windows named-pipe transport cannot reliably model a
+                    # half-closed stdout while stdin remains readable.
+                    return 0
                 while read_message() is not None:
                     pass
                 return 0

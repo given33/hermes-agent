@@ -1,7 +1,7 @@
 from pathlib import Path
 
 
-WORKFLOW = Path(__file__).parents[2] / ".github" / "workflows" / "ci.yml"
+WORKFLOW = Path(__file__).parents[2] / ".github" / "workflows" / "ci.yaml"
 
 
 def test_all_checks_gate_uses_independent_docker_workflow_and_rejects_nonterminal_results():
@@ -19,7 +19,7 @@ def test_production_deploy_waits_for_the_same_commit_ci_run():
     ci_source = WORKFLOW.read_text(encoding="utf-8")
 
     assert "Wait for the complete CI gate" in source
-    assert "--workflow ci.yml" in source
+    assert "--workflow ci.yaml" in source
     assert "--commit \"$RELEASE_COMMIT\"" in source
     assert "Timed out waiting for the complete CI gate" in source
     assert "--extra all --extra dev --extra hindsight" in source

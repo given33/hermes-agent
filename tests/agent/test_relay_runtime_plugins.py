@@ -1007,6 +1007,9 @@ def test_real_binding_ignores_project_config_without_explicit_opt_in(
     working_directory = project_root / "workspace"
     config_directory = project_root / ".nemo-relay"
     atof_dir = tmp_path / "atof"
+    # TOML basic strings treat backslashes as escapes; normalize Windows paths
+    # before embedding temporary directories in the native Relay fixture.
+    atof_toml_dir = str(atof_dir).replace("\\", "/")
     working_directory.mkdir(parents=True)
     config_directory.mkdir()
     (config_directory / "plugins.toml").write_text(
@@ -1025,7 +1028,7 @@ enabled = true
 
 [[components.config.atof.sinks]]
 type = "file"
-output_directory = "{atof_dir}"
+output_directory = "{atof_toml_dir}"
 filename = "events.jsonl"
 mode = "overwrite"
 """.strip(),
@@ -1062,6 +1065,7 @@ def test_real_binding_layers_project_config_after_explicit_opt_in(
     config_directory = project_root / ".nemo-relay"
     selected_directory = tmp_path / "selected-config"
     atof_dir = tmp_path / "atof"
+    atof_toml_dir = str(atof_dir).replace("\\", "/")
     working_directory.mkdir(parents=True)
     config_directory.mkdir()
     selected_directory.mkdir()
@@ -1081,7 +1085,7 @@ enabled = true
 
 [[components.config.atof.sinks]]
 type = "file"
-output_directory = "{atof_dir}"
+output_directory = "{atof_toml_dir}"
 filename = "events.jsonl"
 mode = "overwrite"
 """.strip(),
@@ -1123,6 +1127,8 @@ def test_real_binding_keeps_two_profile_trajectories_separate_in_shared_exporter
     config_directory = tmp_path / "selected-config"
     atof_dir = tmp_path / "atof"
     atif_dir = tmp_path / "atif"
+    atof_toml_dir = str(atof_dir).replace("\\", "/")
+    atif_toml_dir = str(atif_dir).replace("\\", "/")
     working_directory.mkdir(parents=True)
     config_directory.mkdir()
     config_path = config_directory / "plugins.toml"
@@ -1142,13 +1148,13 @@ enabled = true
 
 [[components.config.atof.sinks]]
 type = "file"
-output_directory = "{atof_dir}"
+output_directory = "{atof_toml_dir}"
 filename = "events.jsonl"
 mode = "overwrite"
 
 [components.config.atif]
 enabled = true
-output_directory = "{atif_dir}"
+output_directory = "{atif_toml_dir}"
 filename_template = "trajectory-{{session_id}}.json"
 agent_name = "Hermes Native Test"
 agent_version = "test"

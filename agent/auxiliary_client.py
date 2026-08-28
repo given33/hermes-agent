@@ -3572,7 +3572,21 @@ def _compat_runtime_main() -> Optional[Dict[str, Any]]:
     )
     if values == _RUNTIME_MAIN_COMPAT_SNAPSHOT:
         return None
-    return dict(zip(_MAIN_RUNTIME_FIELDS, values))
+    # A direct legacy-global patch often changes just one field (for example
+    # a test or plugin supplies a custom endpoint/key) after an earlier turn
+    # left a mirrored provider/model snapshot behind. Returning every mirror
+    # here would then combine the new endpoint with that stale provider and
+    # route the next request to the wrong backend. Only values that differ
+    # from the last authoritative ``set_runtime_main`` snapshot are explicit
+    # compatibility overrides; unresolved fields continue through the normal
+    # config/runtime readers.
+    return {
+        field: value
+        for field, value, snapshot_value in zip(
+            _MAIN_RUNTIME_FIELDS, values, _RUNTIME_MAIN_COMPAT_SNAPSHOT
+        )
+        if value != snapshot_value
+    }
 
 
 def _runtime_main_value(field: str) -> Any:
@@ -4117,8 +4131,16 @@ def _normalize_main_runtime(main_runtime: Optional[Dict[str, Any]]) -> Dict[str,
         # back to compatibility mirrors here: another session may have written
         # them most recently, which would leak its endpoint/key into this call.
         main_runtime = _RUNTIME_MAIN_CONTEXT.get()
-        if main_runtime is None:
-            main_runtime = _compat_runtime_main()
+        # Legacy tests/plugins still patch the mirrored module globals. Merge
+        # only fields that differ from the last authoritative snapshot so a
+        # patched endpoint/key cannot inherit a stale provider/model from an
+        # earlier context, while an active context remains the source of
+        # truth for untouched fields.
+        compat_runtime = _compat_runtime_main()
+        if compat_runtime:
+            merged_runtime = dict(main_runtime or {})
+            merged_runtime.update(compat_runtime)
+            main_runtime = merged_runtime
     if not isinstance(main_runtime, dict):
         return {}
     normalized: Dict[str, Any] = {}
@@ -7590,7 +7612,10 @@ def resolve_vision_provider_client(
                     "vision support) — falling through to aggregator chain",
                     main_provider,
                 )
-            elif not _main_model_supports_vision(main_provider, vision_model):
+            elif (
+                not (main_provider == "custom" or main_provider.startswith("custom:"))
+                and not _main_model_supports_vision(main_provider, vision_model)
+            ):
                 # The main model is known to be text-only (e.g. DeepSeek V4,
                 # gpt-oss-120b without vision). Building a client and sending
                 # an image would produce a cryptic provider-side error like
@@ -8455,6 +8480,14 @@ def _get_auxiliary_task_config(task: str) -> Dict[str, Any]:
     task_config = aux.get(task, {}) if isinstance(aux, dict) else {}
     if not isinstance(task_config, dict):
         task_config = {}
+
+    # Compression is a built-in task. Its fallback route is read on the
+    # timeout path, where plugin discovery would add hundreds of milliseconds
+    # to the user's request even when no fallback is configured. Plugins may
+    # still register defaults for their own task keys below; there is no
+    # supported plugin-owned compression task to merge here.
+    if task == "compression":
+        return task_config
 
     # Layer plugin-declared defaults underneath user config so
     # ctx.register_auxiliary_task(defaults={...}) takes effect without

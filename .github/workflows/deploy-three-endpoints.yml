@@ -104,7 +104,7 @@ jobs:
           while :; do
             run_json="$(gh run list \
               --repo "$GITHUB_REPOSITORY" \
-              --workflow ci.yml \
+              --workflow ci.yaml \
               --commit "$RELEASE_COMMIT" \
               --limit 1 \
               --json status,conclusion,headSha)"
