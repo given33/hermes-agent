@@ -40,7 +40,7 @@ HERMES_UID=$(id -u) HERMES_GID=$(id -g) docker compose up -d
 
 | 路径 | 用途(取自各文件头注释) |
 |---|---|
-| `deploy/dbb3/dbb3_cloud_connector.py` | DBB3/PC/HK → Hermes 协作连接器:小型轮询桥,为每个租约的云 run 建幂等 Kanban 根、上报紧凑 checkpoint、上传产物;checkpoint 文件即恢复边界(重启复用同一 idempotency key/游标/产物键,不产生重复工作) |
+| `deploy/dbb3/dbb3_cloud_connector.py` | DBB3/PC/HK → Hermes 协作连接器:三端共享同一已审计源码,按 connector id/profile/`HERMES_HOME` 隔离,为每个租约的云 run 建幂等 Kanban 根、上报紧凑 checkpoint、上传产物;checkpoint 文件即恢复边界(重启复用同一 idempotency key/游标/产物键,不产生重复工作) |
 | `deploy/dbb3/dbb3-cloud-connector.service` | 上者的 systemd unit 模板 |
 | `deploy/dbb3/install-dbb3-cloud-connector-user.sh` | 把连接器装成 **user service**(root 只用于 root 属主源路径与既有 root:hermes token;长驻进程归 hermes 用户);带安装锁 `/run/lock/hermes-agent/cloud-connector-install.lock` |
 | `deploy/dbb3/test-install-dbb3-cloud-connector-user-rollback.sh` | 上述安装器的回滚测试 harness(需 root) |
