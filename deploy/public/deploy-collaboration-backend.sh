@@ -117,6 +117,11 @@ git -C "${repo}" ls-files -z -- \
       case "${relative}" in
         */tests/*|*/test_*.py|*/__pycache__/*) continue ;;
       esac
+      # ``git ls-files`` also reports paths staged for deletion during an
+      # upstream merge.  A release snapshot must describe the checked-out
+      # tree, not a soon-to-be-removed index entry (for example the retired
+      # reviewer engine).
+      [[ -f "${repo}/${relative}" && ! -L "${repo}/${relative}" ]] || continue
       [[ "${relative}" =~ ^[A-Za-z0-9_.+/-]+$ ]] \
         || die "runtime source path contains unsupported characters: ${relative}"
       case "/${relative}/" in

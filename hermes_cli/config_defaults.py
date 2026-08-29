@@ -1199,19 +1199,8 @@ DEFAULT_CONFIG = {
             "reasoning_effort": "",  # per-task thinking level: none|minimal|low|medium|high|xhigh|max|ultra (empty = provider default)
             "language": "",
         },
-        # Standalone ``/review`` command. This auxiliary slot configures the
-        # explicit user-invoked review utility only; hosted collaboration
-        # workflows remain dispatcher + worker lanes and never call it.
-        "review": {
-            "provider": "auto",
-            "model": "",
-            "base_url": "",
-            "api_key": "",
-            "api_mode": "",
-            "timeout": 120,
-            "extra_body": {},
-            "reasoning_effort": "",
-        },
+        # Retired: reviewer/supervisor execution is not part of this product.
+        # Keep historical config files readable without exposing a task slot.
         "memory_query_rewrite": {
             "provider": "auto",
             "model": "",
@@ -2777,7 +2766,7 @@ DEFAULT_CONFIG = {
         # Automatically claim tasks in the first-class review column and spawn
         # the assigned profile with the bundled sdlc-review skill. Disable for
         # boards where every review is performed manually from the dashboard.
-        "review_dispatch": True,
+        "review_dispatch": False,
         # Seconds between dispatcher ticks (idle or not). Lower = snappier
         # pickup of newly-ready tasks; higher = less SQL pressure.
         "dispatch_interval_seconds": 60,

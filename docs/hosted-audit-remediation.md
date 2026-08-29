@@ -222,3 +222,17 @@ uv run ruff check hermes_runtime hermes_services plugins/collaboration/dashboard
 - 会话路由、连接生命周期、预览浏览器栏、clarify 控件五组聚焦 Vitest 共
   `114 passed / 0 failed`。完整 UI suite 未作为发布门禁：Windows 下仍有历史
   shell/Canvas 环境测试需要 Linux/macOS CI；不会把这些平台限制误报为功能已验证。
+
+### 2026-08-30 续审：官方 hosted command bridge 与 reviewer 退役
+
+- 删除 CLI、Gateway、TUI 的 `/review` 执行入口和 `agent/review_engine.py` 专用模块；
+  Kanban review 列历史记录仍可读取/迁移，但 `review_dispatch_enabled()` 固定 fail-closed，
+  生产工作流只有 `hermes-manager` 调度员与 DBB3、PC/WSL、HK 三个独立 worker。
+- 新增 `run_hosted_gateway_command()` 与 account-scoped
+  `/mobile/conversations/{conversation_id}/commands`：`bg`/`btw` 调官方
+  `prompt.background`/`prompt.btw`，`busy` 调官方 `config.set`；异步结果经持久 reader
+  callback 写入 canonical event 和 assistant message，iOS WebSocket/SSE 游标可重放。
+- `btw.complete` 已注册到 hosted event protocol；`scripts/upstream_sync_gate.py` 在任何
+  自动 upstream merge 推送前检查官方命令、HK 部署资产、三 worker 角色和 reviewer
+  fail-closed 边界。后端 dashboard/TUI/command 回归 `877 passed, 7 skipped`，hosted
+  runtime/event protocol `22 passed`，ruff/compileall/sync gate 通过。

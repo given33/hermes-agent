@@ -9786,19 +9786,13 @@ def has_spawnable_review(conn: sqlite3.Connection) -> bool:
 
 
 def review_dispatch_enabled() -> bool:
-    """Return whether first-class review tasks should dispatch automatically.
+    """Return the product-owned review dispatch policy.
 
-    The default is true because Hermes ships the ``sdlc-review`` skill and the
-    review lifecycle includes a supported reviewer-owned changes-requested
-    transition. Operators can disable it for human-only review boards.
+    Reviewer/supervisor execution was retired from this product.  Keep this
+    compatibility hook fail-closed so historical callers cannot re-enable the
+    removed workflow through an old configuration file.
     """
-    try:
-        from hermes_cli.config import load_config
-        return bool(
-            (load_config() or {}).get("kanban", {}).get("review_dispatch", True)
-        )
-    except Exception:
-        return True
+    return False
 
 
 # ---------------------------------------------------------------------------

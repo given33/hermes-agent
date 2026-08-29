@@ -76,10 +76,9 @@ class TestCommandRegistry:
 
     def test_desktop_meta_lives_on_the_command_def(self):
         review = resolve_command("review")
-        assert review is not None
-        assert review.argument_mode is None
-        assert infer_argument_mode(review) == "text"
-        assert command_desktop_meta(review) == {"argument_mode": "text", "desktop": None}
+        # The former supervisor/reviewer lane was retired.  The command must
+        # stay absent from every surface; only dispatcher + workers remain.
+        assert review is None
 
         clear = resolve_command("clear")
         assert clear is not None
@@ -176,11 +175,14 @@ class TestGatewayHelpLines:
                 assert not re.search(pattern, joined), \
                     f"cli_only command /{cmd.name} should not be in gateway help"
 
-    def test_includes_alias_note_for_bg(self):
+    def test_bg_and_btw_are_separate_commands(self):
         lines = gateway_help_lines()
+        joined = "\n".join(lines)
+        assert "`/bg" in joined
+        assert "`/btw" in joined
+        # The retired /background canonical name must be gone.
         bg_line = [l for l in lines if "/background" in l]
-        assert len(bg_line) == 1
-        assert "/bg" in bg_line[0]
+        assert not bg_line
 
 
 class TestTelegramBotCommands:
@@ -198,11 +200,12 @@ class TestTelegramBotCommands:
 
 
     def test_includes_builtin_commands_with_required_args(self):
-        """Built-in arg-taking commands (e.g. /queue, /steer, /background)
+        """Built-in arg-taking commands (e.g. /queue, /steer, /bg, /btw)
         are now included because their handlers return usage text when
         invoked without arguments — issue #24312."""
         names = {name for name, _ in telegram_bot_commands()}
-        assert "background" in names
+        assert "bg" in names
+        assert "btw" in names
         assert "queue" in names
         assert "steer" in names
 

@@ -144,11 +144,40 @@ jobs:
           uv sync --locked --python 3.11 --extra all --extra dev
           source .venv/bin/activate
           python -m pytest -q \
+            tests/agent/test_side_question.py \
+            tests/agent/test_system_prompt.py \
+            tests/agent/test_prompt_builder.py \
+            tests/gateway/test_background_command.py \
+            tests/gateway/test_busy_command.py \
+            tests/gateway/test_multiplex_busy_input_mode.py \
+            tests/gateway/test_gateway_command_dispatch_minimal.py \
+            tests/gateway/test_slash_access_dispatch.py \
+            tests/gateway/relay/test_relay_slack_unfurl.py \
+            tests/hermes_cli/test_commands.py \
+            tests/hermes_cli/test_mobile_console.py \
+            tests/hermes_cli/test_router_provider.py \
+            tests/hermes_cli/test_nebius_token_factory_provider.py \
+            tests/hermes_cli/test_tencent_tokenhub_provider.py \
+            tests/providers/test_plugin_discovery.py \
+            tests/providers/test_transport_parity.py \
+            tests/tools/test_todo_nested.py \
+            tests/tools/test_skill_manage_batch.py \
             tests/plugins/test_collaboration_dashboard.py \
             tests/plugins/test_collaboration_cloud_files.py \
             tests/plugins/test_collaboration_managed_resources.py \
+            tests/plugins/test_hosted_events_websocket.py \
+            tests/hermes_services/test_hosted_role_migration.py \
+            tests/hermes_services/test_worker_channel.py \
+            tests/hermes_services/test_official_frontend_event_protocol.py \
             tests/deploy/test_cloud_deployment_assets.py \
             tests/deploy/test_managed_installation_topology.py
+
+      - name: Enforce product-owned workflow invariants after upstream merge
+        if: steps.release.outputs.needed == 'true' && steps.merge.outputs.conflict == 'false'
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 scripts/upstream_sync_gate.py
 
       - name: Push the verified upstream merge directly to main
         if: steps.release.outputs.needed == 'true' && steps.merge.outputs.conflict == 'false' && steps.product.outcome == 'success'

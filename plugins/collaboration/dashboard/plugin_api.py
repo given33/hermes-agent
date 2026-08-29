@@ -139,6 +139,7 @@ from plugins.collaboration.dashboard.hosted_tui_runtime import (
     control_hosted_subagents,
     prewarm_hosted_gateway,
     release_hosted_gateway_conversation,
+    run_hosted_gateway_command,
     run_hosted_gateway_turn,
 )
 
@@ -27940,6 +27941,168 @@ class MobileConsoleCompletionBody(BaseModel):
     line: str
     profile: str = "default"
     limit: int = Field(default=30, ge=1, le=50)
+
+
+class MobileHostedCommandBody(BaseModel):
+    """A deliberately tiny bridge to official TUI gateway session RPCs."""
+
+    command: str = Field(max_length=32)
+    text: str = Field(default="", max_length=64_000)
+    value: str = Field(default="", max_length=64)
+
+
+def _persist_mobile_gateway_event(
+    conversation_id: str,
+    owner_id: str,
+    account_generation: str,
+    profile: str,
+    event: dict[str, Any],
+) -> bool:
+    """Persist one asynchronous official ``btw``/``background`` result.
+
+    The callback runs on the persistent gateway reader thread after the RPC
+    acknowledgement.  It writes both the typed event (for cursor/WebSocket
+    clients) and an assistant message (for snapshot/reconnect clients), then
+    publishes a fresh live projection.  Returning ``True`` tells the gateway
+    to remove this one-shot callback.
+    """
+    event_type = str(event.get("type") or "").strip().lower()
+    payload = event.get("payload") if isinstance(event.get("payload"), dict) else {}
+    if event_type not in {"btw.complete", "background.complete"}:
+        return False
+    task_id = str(payload.get("task_id") or uuid.uuid4().hex[:12]).strip()
+    text = _structured_text(payload.get("text") or payload.get("output") or "")
+    command_name = "btw" if event_type == "btw.complete" else "bg"
+    turn_id = f"mobile-{command_name}-{task_id}"
+    with _STATE_LOCK:
+        state = load_single_state()
+        conversation, claimed = _owned_conversation_in_state(
+            state, conversation_id, owner_id
+        )
+        if claimed:
+            # Preserve the account-generation claim made by the callback's
+            # authenticated owner before publishing the result.
+            conversation["account_generation"] = account_generation
+        message_key = f"mobile-command:{command_name}:{task_id}"
+        _append_message(
+            conversation,
+            role="assistant",
+            name=profile or "Hermes",
+            content=text or "（命令已完成，但没有返回文本）",
+            status="completed" if not str(text).lower().startswith("error:") else "failed",
+            kind="command",
+            meta={
+                "command": command_name,
+                "task_id": task_id,
+                "message_key": message_key,
+                "role_stage": "chat",
+                "profile": profile,
+            },
+        )
+        append_hosted_event(
+            conversation,
+            conversation_id=conversation_id,
+            turn_id=turn_id,
+            role_stage="chat",
+            event_type=event_type,
+            entity_id=task_id,
+            idempotency_key=f"mobile-command-event:{command_name}:{task_id}",
+            account_generation=account_generation,
+            payload={
+                "task_id": task_id,
+                "text": text,
+                "question": str(payload.get("question") or ""),
+                "command": command_name,
+                "status": "failed" if str(text).lower().startswith("error:") else "completed",
+            },
+            occurred_at=int(time.time() * 1000),
+        )
+        conversation["updated_at"] = int(time.time() * 1000)
+        save_single_state(state)
+        _publish_live_conversations(state)
+    _notify_hosted_update(conversation_id)
+    return True
+
+
+@router.post("/mobile/conversations/{conversation_id}/commands")
+def mobile_hosted_command(
+    conversation_id: str,
+    body: MobileHostedCommandBody,
+    request: Request,
+):
+    """Run official Hermes ``/bg``, ``/btw`` and ``/busy`` over hosted WS.
+
+    This endpoint never invokes a second model implementation.  It resolves
+    the account-owned conversation and forwards directly to the persistent
+    ``tui_gateway`` JSON-RPC session.
+    """
+    owner_id, conversation = _owned_conversation(request, conversation_id)
+    account_generation = _account_generation_for_request(request, owner_id)
+    command = str(body.command or "").strip().lower().lstrip("/")
+    aliases = {"background": "bg", "side-question": "btw", "side_question": "btw"}
+    command = aliases.get(command, command)
+    if command not in {"bg", "btw", "busy"}:
+        raise HTTPException(status_code=422, detail="Unsupported hosted command")
+    profile = str(conversation.get("profile") or "default").strip() or "default"
+    runtime_context = {
+        "owner_id": owner_id,
+        "account_generation": account_generation,
+    }
+    runtime_home = _hosted_runtime_home(profile, runtime_context)
+    artifact_root = str(get_hermes_home())
+    if command == "busy":
+        value = str(body.value or body.text or "").strip().lower()
+        if value not in {"status", "queue", "steer", "interrupt"}:
+            raise HTTPException(status_code=422, detail="busy value must be status, queue, steer, or interrupt")
+        result = run_hosted_gateway_command(
+            method="config.set",
+            params={"key": "busy", "value": value},
+            runtime_home=runtime_home,
+            owner_id=owner_id,
+            account_generation=account_generation,
+            conversation_id=conversation_id,
+            profile=profile,
+            artifact_root=artifact_root,
+            import_root=_RUNTIME_IMPORT_ROOT,
+        )
+        return {"accepted": True, "command": command, "value": result.get("value", value)}
+
+    text = str(body.text or "").strip()
+    if not text:
+        raise HTTPException(status_code=422, detail=f"/{command} requires text")
+    task_prefix = "btw_" if command == "btw" else "bg_"
+    event_type = "btw.complete" if command == "btw" else "background.complete"
+    task_id_holder: dict[str, str] = {}
+
+    def on_event(event: dict[str, Any]) -> bool:
+        payload = event.get("payload") if isinstance(event.get("payload"), dict) else {}
+        task_id_holder.setdefault("task_id", str(payload.get("task_id") or ""))
+        return _persist_mobile_gateway_event(
+            conversation_id, owner_id, account_generation, profile, event
+        )
+
+    result = run_hosted_gateway_command(
+        method="prompt.btw" if command == "btw" else "prompt.background",
+        params={"text": text},
+        runtime_home=runtime_home,
+        owner_id=owner_id,
+        account_generation=account_generation,
+        conversation_id=conversation_id,
+        profile=profile,
+        artifact_root=artifact_root,
+        import_root=_RUNTIME_IMPORT_ROOT,
+        event_callback=on_event,
+    )
+    task_id = str(result.get("task_id") or task_id_holder.get("task_id") or "").strip()
+    if not task_id.startswith(task_prefix):
+        task_id = task_id or f"{task_prefix}{uuid.uuid4().hex[:6]}"
+    return {
+        "accepted": True,
+        "command": command,
+        "task_id": task_id,
+        "event_type": event_type,
+        "conversation_id": conversation_id,
+    }
 
 
 @router.get("/mobile/console/commands")

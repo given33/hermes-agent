@@ -68,6 +68,12 @@ class _HostedSessionState:
     message_complete_seen: threading.Event = field(default_factory=threading.Event)
     idle_after_turn: threading.Event = field(default_factory=threading.Event)
     current_sink: _TurnSink | None = None
+    # Async official RPCs (prompt.btw/background) complete after their JSON-RPC
+    # acknowledgement.  Keep a short-lived callback queue so those events are
+    # not dropped when no normal prompt turn owns the session sink.
+    async_event_callbacks: list[Callable[[dict[str, Any]], bool | None]] = field(
+        default_factory=list
+    )
 
 
 class _GatewayProcess:
@@ -218,6 +224,30 @@ class _GatewayProcess:
                 elif event_session_id:
                     with self._session_lock:
                         state = self._sessions_by_live.get(event_session_id)
+                # Async command callbacks are independent from the normal
+                # prompt sink.  They must run even when /btw is issued while a
+                # main turn is streaming (the event is also queued below so
+                # that the active turn's UI remains complete).
+                if state is not None and event_type in {
+                    "btw.complete",
+                    "background.complete",
+                }:
+                    with self._session_lock:
+                        callbacks = list(state.async_event_callbacks)
+                    for callback in callbacks:
+                        remove = False
+                        try:
+                            remove = bool(callback({"type": event_type, "payload": payload}))
+                        except Exception:
+                            # A persistence callback must never take down the
+                            # gateway reader or another client's event.
+                            remove = True
+                        if remove:
+                            with self._session_lock:
+                                try:
+                                    state.async_event_callbacks.remove(callback)
+                                except ValueError:
+                                    pass
                 sink = state.current_sink if state is not None else None
                 if sink is None:
                     continue
@@ -454,6 +484,41 @@ class _GatewayProcess:
         if method == "subagent.steer":
             params["text"] = str(message or "").strip()
         return self.rpc(method, params, timeout=10.0)
+
+    def command(
+        self,
+        conversation_id: str,
+        method: str,
+        params: dict[str, Any],
+        *,
+        artifact_context: dict[str, str],
+        event_callback: Optional[Callable[[dict[str, Any]], bool | None]] = None,
+    ) -> dict[str, Any]:
+        """Invoke one official session RPC for mobile command surfaces.
+
+        ``prompt.btw`` and ``prompt.background`` return before their worker
+        thread finishes.  Register the callback before sending the RPC so a
+        very fast completion cannot race the response and disappear.
+        """
+        state = self.ensure_session(
+            conversation_id,
+            str(params.get("stored_session_id") or ""),
+            artifact_context=artifact_context,
+        )
+        async_method = method in {"prompt.btw", "prompt.background"}
+        if async_method and event_callback is not None:
+            with self._session_lock:
+                state.async_event_callbacks.append(event_callback)
+        try:
+            return self.rpc(method, {**params, "session_id": state.live_session_id}, timeout=30.0)
+        except Exception:
+            if async_method and event_callback is not None:
+                with self._session_lock:
+                    try:
+                        state.async_event_callbacks.remove(event_callback)
+                    except ValueError:
+                        pass
+            raise
 
     def run_turn(
         self,
@@ -806,6 +871,46 @@ def run_hosted_gateway_turn(
             "account_generation": account_generation,
             "allow_tools": "1" if allow_tools else "0",
         },
+    )
+
+
+def run_hosted_gateway_command(
+    *,
+    method: str,
+    params: dict[str, Any],
+    runtime_home: str,
+    owner_id: str,
+    account_generation: str,
+    conversation_id: str,
+    profile: str,
+    artifact_root: str,
+    import_root: str,
+    event_callback: Optional[Callable[[dict[str, Any]], bool | None]] = None,
+    extra_env: Optional[dict[str, str]] = None,
+) -> dict[str, Any]:
+    """Route a mobile command through the official persistent gateway RPC."""
+    gateway = _gateway_for(
+        runtime_home=runtime_home,
+        owner_id=owner_id,
+        account_generation=account_generation,
+        conversation_id=conversation_id,
+        profile=profile,
+        artifact_root=artifact_root,
+        import_root=import_root,
+        extra_env=extra_env,
+    )
+    return gateway.command(
+        conversation_id,
+        method,
+        params,
+        artifact_context={
+            "root": artifact_root,
+            "owner_id": owner_id,
+            "conversation_id": conversation_id,
+            "account_generation": account_generation,
+            "allow_tools": "1",
+        },
+        event_callback=event_callback,
     )
 
 

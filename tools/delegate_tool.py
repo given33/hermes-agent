@@ -3732,9 +3732,7 @@ def delegate_task(
     #
     # ``credentials_cfg`` (internal callers only — never model-facing) is a
     # per-call override shaped like the delegation config section
-    # ({provider, model, base_url, api_key, api_mode}); the /review engine
-    # uses it to route its reviewer subagent onto ``auxiliary.review``
-    # without touching the global delegation pin.
+    # ({provider, model, base_url, api_key, api_mode}).
     try:
         creds = _resolve_delegation_credentials(
             credentials_cfg if credentials_cfg else cfg, parent_agent

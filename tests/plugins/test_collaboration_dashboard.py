@@ -922,6 +922,44 @@ class CollaborationDashboardTests(unittest.TestCase):
             profile="ios-native",
         )
 
+    def test_mobile_hosted_commands_use_official_gateway_rpc(self):
+        module = load_module()
+        request = SimpleNamespace()
+        conversation = {
+            "id": "conv-1",
+            "owner_id": "owner-a",
+            "account_generation": "gen-1",
+            "profile": "hk-worker",
+        }
+        module._owned_conversation = lambda _request, _conversation_id: ("owner-a", conversation)
+        module._account_generation_for_request = lambda _request, _owner: "gen-1"
+        module._hosted_runtime_home = lambda _profile, _context: "C:/runtime/hk"
+        module.get_hermes_home = lambda: Path("C:/hermes")
+        calls = []
+
+        def fake_command(**kwargs):
+            calls.append(kwargs)
+            return {"task_id": "btw_abc"} if kwargs["method"] == "prompt.btw" else {"value": "queue"}
+
+        module.run_hosted_gateway_command = fake_command
+        btw = module.mobile_hosted_command(
+            "conv-1",
+            module.MobileHostedCommandBody(command="btw", text="what changed?"),
+            request,
+        )
+        busy = module.mobile_hosted_command(
+            "conv-1",
+            module.MobileHostedCommandBody(command="busy", value="queue"),
+            request,
+        )
+
+        self.assertEqual(btw["task_id"], "btw_abc")
+        self.assertEqual(btw["event_type"], "btw.complete")
+        self.assertEqual(busy, {"accepted": True, "command": "busy", "value": "queue"})
+        self.assertEqual([item["method"] for item in calls], ["prompt.btw", "config.set"])
+        self.assertEqual(calls[0]["params"], {"text": "what changed?"})
+        self.assertEqual(calls[1]["params"], {"key": "busy", "value": "queue"})
+
     def test_short_chinese_greeting_keeps_its_first_character_in_title(self):
         module = load_module()
 
