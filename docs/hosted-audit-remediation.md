@@ -282,5 +282,6 @@ uv run ruff check hermes_runtime hermes_services plugins/collaboration/dashboard
 
 - 协作房间非 owner 成员最多同时运行 4 个 hosted turn；`sender_id` 随 room request 持久化，
   新 request id 不能绕过资源边界，owner 仍走正常 gateway quota。
-- `f3dd45f11c` 已推送；完整 dashboard 回归 `201 passed, 7 skipped, 44 subtests`，新增
-  跨账号成员 quota 测试通过。
+- `f3dd45f11c` 已推送；随后 `40b83dfe50` 修复达到上限时同一 request 仍需幂等 replay 的
+  边界。完整 dashboard 回归 `201 passed, 7 skipped, 44 subtests`，新增跨账号成员 quota
+  测试通过。
