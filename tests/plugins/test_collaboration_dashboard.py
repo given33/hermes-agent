@@ -8929,6 +8929,45 @@ class CollaborationDashboardTests(unittest.TestCase):
         self.assertIsNotNone(turn)
         self.assertEqual(str(turn.get("status") or ""), "queued")
 
+    def test_cross_account_member_active_turns_are_bounded(self):
+        module = load_module()
+        rooms_state = {"rooms": []}
+        single_state = {"conversations": []}
+        module.load_state = lambda: rooms_state
+        module.save_state = lambda _state: None
+        module.load_single_state = lambda: single_state
+        module.save_single_state = lambda _state: None
+        module._notify_hosted_update = lambda *_args: None
+        module.owner_id_from_request = lambda request: getattr(request, "owner", "owner-a")
+        generations = {"owner-a": "gen-a-1", "owner-b": "gen-b-1"}
+        module._account_generation_for_request = lambda _request, owner_id: generations[str(owner_id)]
+        module._account_generation_for_owner = lambda owner_id: generations[str(owner_id)]
+        module.CreateRoomBody.model_rebuild(_types_namespace={"Any": Any})
+        module.SendMessageBody.model_rebuild(_types_namespace={"Any": Any, "Optional": Optional})
+        request_a = SimpleNamespace(owner="owner-a", query_params={})
+        request_b = SimpleNamespace(owner="owner-b", query_params={})
+        created = module.create_room(
+            module.CreateRoomBody(name="quota", profiles=["default"], invite_code="QUOTEX"),
+            request_a,
+        )
+        room_id = str(created["room"]["id"])
+        module.join_room_by_code(module.RoomJoinBody(invite_code="QUOTEX"), request_b)
+        module.start_hosted_workflow = lambda *_args: None
+        for index in range(4):
+            response = module.send_message(
+                room_id,
+                module.SendMessageBody(content=f"member-{index}", request_id=f"member-{index}"),
+                request_b,
+            )
+            assert response["accepted"] is True
+        with self.assertRaises(module.HTTPException) as ctx:
+            module.send_message(
+                room_id,
+                module.SendMessageBody(content="member-over-limit", request_id="member-4"),
+                request_b,
+            )
+        self.assertEqual(ctx.exception.status_code, 429)
+
     def test_hosted_turn_consumer_marks_unresolvable_turn_failed(self):
         """A bad turn record must fail closed, never crash-loop the consumer."""
         module = load_module()
