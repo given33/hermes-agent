@@ -236,3 +236,7 @@ uv run ruff check hermes_runtime hermes_services plugins/collaboration/dashboard
   自动 upstream merge 推送前检查官方命令、HK 部署资产、三 worker 角色和 reviewer
   fail-closed 边界。后端 dashboard/TUI/command 回归 `877 passed, 7 skipped`，hosted
   runtime/event protocol `22 passed`，ruff/compileall/sync gate 通过。
+
+发布锚点：官方 `upstream/main` `1e21fe8624` 已合并，后端提交
+`1a13129011` 已推送到 `origin/main`；该提交同时包含部署器对 merge 暂存删除文件
+的防护，避免退役 reviewer 模块再次被误判为运行时缺失。
