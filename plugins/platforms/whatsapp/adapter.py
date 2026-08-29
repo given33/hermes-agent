@@ -20,6 +20,7 @@ import logging
 import os
 import platform
 import re
+import secrets
 import signal
 import subprocess
 
@@ -427,6 +428,13 @@ class WhatsAppAdapter(WhatsAppBehaviorMixin, BasePlatformAdapter):
             "session_path",
             get_hermes_dir("platforms/whatsapp/session", "whatsapp/session")
         ))
+        # Every profile gets an independent bearer token for the local
+        # Baileys bridge.  The bridge only binds loopback, but any local
+        # process (or browser with a DNS-rebinding trick) must not be able to
+        # drive the WhatsApp account by POSTing to /send or /read.
+        self._bridge_token_path: Path = self._session_path / "bridge.token"
+        configured_bridge_token = config.extra.get("bridge_token") or _wenv("WHATSAPP_BRIDGE_TOKEN")
+        self._bridge_token: Optional[str] = str(configured_bridge_token).strip() or None
         self._reply_prefix: Optional[str] = config.extra.get("reply_prefix")
         self._dm_policy = str(config.extra.get("dm_policy") or _wenv("WHATSAPP_DM_POLICY", "pairing")).strip().lower()
         # Prefer config.extra, then the documented WHATSAPP_ALLOWED_USERS env
@@ -486,6 +494,61 @@ class WhatsAppAdapter(WhatsAppBehaviorMixin, BasePlatformAdapter):
         )
         self._pending_text_batches: Dict[str, MessageEvent] = {}
         self._pending_text_batch_tasks: Dict[str, asyncio.Task] = {}
+
+    def _ensure_bridge_token(self) -> str:
+        """Load or create the profile-scoped token used by the Node bridge.
+
+        The token is intentionally kept beside the WhatsApp credentials with
+        restrictive permissions.  Creation uses ``O_EXCL`` so two gateway
+        workers racing during startup cannot overwrite a token already used
+        by a live bridge.
+        """
+        existing = getattr(self, "_bridge_token", None)
+        if existing:
+            return existing
+        path = Path(getattr(self, "_bridge_token_path", self._session_path / "bridge.token"))
+        self._session_path.mkdir(parents=True, exist_ok=True)
+        try:
+            token = path.read_text(encoding="utf-8").strip()
+            if len(token) >= 32:
+                self._bridge_token = token
+                try:
+                    os.chmod(path, 0o600)
+                except OSError:
+                    pass
+                return token
+        except OSError:
+            pass
+
+        token = secrets.token_urlsafe(32)
+        try:
+            fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+        except FileExistsError:
+            # Another adapter won the race; use its token so both processes
+            # can safely reuse the same bridge.
+            token = path.read_text(encoding="utf-8").strip()
+            if len(token) < 32:
+                raise RuntimeError(f"Invalid WhatsApp bridge token at {path}")
+        except FileNotFoundError:
+            # Test doubles (and a read-only installation tree) can provide a
+            # synthetic session path whose mkdir is a no-op.  Keep the token
+            # in memory for this process; normal managed deployments always
+            # have a writable session directory and persist it above.
+            logger.warning("[%s] Could not persist WhatsApp bridge token at %s; using an in-memory token", self.name, path)
+        else:
+            with os.fdopen(fd, "w", encoding="utf-8") as fh:
+                fh.write(token + "\n")
+            try:
+                os.chmod(path, 0o600)
+            except OSError:
+                pass
+        self._bridge_token = token
+        return token
+
+    def _bridge_headers(self) -> Dict[str, str]:
+        """Return authentication headers for bridge control-plane requests."""
+        token = getattr(self, "_bridge_token", None)
+        return {"Authorization": f"Bearer {token}"} if token else {}
 
     def _coerce_float_extra(self, key: str, default: float) -> float:
         """Read a float from ``config.extra``, guarding against bad/non-finite values.
@@ -632,6 +695,10 @@ class WhatsAppAdapter(WhatsAppBehaviorMixin, BasePlatformAdapter):
 
             # Ensure session directory exists
             self._session_path.mkdir(parents=True, exist_ok=True)
+            # Resolve the profile-scoped bridge token before probing/reusing a
+            # process.  A bridge started by another gateway instance must use
+            # this same token file or it is treated as stale and replaced.
+            bridge_token = self._ensure_bridge_token()
             
             # Check if bridge is already running and connected
             import aiohttp
@@ -657,11 +724,13 @@ class WhatsAppAdapter(WhatsAppBehaviorMixin, BasePlatformAdapter):
                                 running_hash = data.get("scriptHash", "")
                                 disk_hash = _file_content_hash(bridge_path)
                                 running_read_receipts = bool(data.get("sendReadReceipts", False))
+                                running_auth_enabled = bool(data.get("authEnabled", False))
                                 config_matches = running_read_receipts == self._send_read_receipts
                                 if (
                                     running_hash
                                     and disk_hash
                                     and running_hash == disk_hash
+                                    and running_auth_enabled
                                     and config_matches
                                 ):
                                     print(f"[{self.name}] Using existing bridge (status: {bridge_status})")
@@ -706,6 +775,7 @@ class WhatsAppAdapter(WhatsAppBehaviorMixin, BasePlatformAdapter):
             bridge_env["WHATSAPP_SEND_READ_RECEIPTS"] = (
                 "true" if self._send_read_receipts else "false"
             )
+            bridge_env["HERMES_BRIDGE_TOKEN"] = bridge_token
             # Under multiplexing, the bridge subprocess runs with a copy of
             # os.environ that does NOT contain the secondary profile's .env
             # vars.  Inject the resolved WHATSAPP_* values so the Node bridge
@@ -981,6 +1051,7 @@ class WhatsAppAdapter(WhatsAppBehaviorMixin, BasePlatformAdapter):
                 async with self._http_session.post(
                     f"http://127.0.0.1:{self._bridge_port}/send",
                     json=payload,
+                    headers=self._bridge_headers(),
                     timeout=aiohttp.ClientTimeout(total=30)
                 ) as resp:
                     if resp.status == 200:
@@ -1028,6 +1099,7 @@ class WhatsAppAdapter(WhatsAppBehaviorMixin, BasePlatformAdapter):
                     "messageId": message_id,
                     "message": content,
                 },
+                headers=self._bridge_headers(),
                 timeout=aiohttp.ClientTimeout(total=15)
             ) as resp:
                 if resp.status == 200:
@@ -1071,6 +1143,7 @@ class WhatsAppAdapter(WhatsAppBehaviorMixin, BasePlatformAdapter):
             async with self._http_session.post(
                 f"http://127.0.0.1:{self._bridge_port}/send-media",
                 json=payload,
+                headers=self._bridge_headers(),
                 timeout=aiohttp.ClientTimeout(total=120),
             ) as resp:
                 if resp.status == 200:
@@ -1118,6 +1191,7 @@ class WhatsAppAdapter(WhatsAppBehaviorMixin, BasePlatformAdapter):
             async with self._http_session.post(
                 f"http://127.0.0.1:{self._bridge_port}/send-poll",
                 json=payload,
+                headers=self._bridge_headers(),
                 timeout=aiohttp.ClientTimeout(total=30),
             ) as resp:
                 if resp.status == 200:
@@ -1205,6 +1279,7 @@ class WhatsAppAdapter(WhatsAppBehaviorMixin, BasePlatformAdapter):
             async with self._http_session.post(
                 f"http://127.0.0.1:{self._bridge_port}/send-location",
                 json=payload,
+                headers=self._bridge_headers(),
                 timeout=aiohttp.ClientTimeout(total=30),
             ) as resp:
                 if resp.status == 200:
@@ -1304,6 +1379,7 @@ class WhatsAppAdapter(WhatsAppBehaviorMixin, BasePlatformAdapter):
             async with self._http_session.post(
                 f"http://127.0.0.1:{self._bridge_port}/typing",
                 json={"chatId": to_whatsapp_jid(chat_id)},
+                headers=self._bridge_headers(),
                 timeout=aiohttp.ClientTimeout(total=5)
             ):
                 pass
@@ -1322,6 +1398,7 @@ class WhatsAppAdapter(WhatsAppBehaviorMixin, BasePlatformAdapter):
 
             async with self._http_session.get(
                 f"http://127.0.0.1:{self._bridge_port}/chat/{to_whatsapp_jid(chat_id)}",
+                headers=self._bridge_headers(),
                 timeout=aiohttp.ClientTimeout(total=10)
             ) as resp:
                 if resp.status == 200:
@@ -1350,6 +1427,7 @@ class WhatsAppAdapter(WhatsAppBehaviorMixin, BasePlatformAdapter):
             try:
                 async with self._http_session.get(
                     f"http://127.0.0.1:{self._bridge_port}/messages",
+                    headers=self._bridge_headers(),
                     timeout=aiohttp.ClientTimeout(total=30)
                 ) as resp:
                     if resp.status == 200:
@@ -1390,6 +1468,7 @@ class WhatsAppAdapter(WhatsAppBehaviorMixin, BasePlatformAdapter):
             async with self._http_session.post(
                 f"http://127.0.0.1:{self._bridge_port}/read",
                 json={"key": key},
+                headers=self._bridge_headers(),
                 timeout=aiohttp.ClientTimeout(total=5),
             ) as resp:
                 if resp.status != 200:
@@ -1733,6 +1812,25 @@ async def _standalone_send(
         return {"error": "aiohttp not installed. Run: pip install aiohttp"}
     try:
         bridge_port = extra.get("bridge_port", 3000)
+        configured_token = extra.get("bridge_token") or _wenv("WHATSAPP_BRIDGE_TOKEN")
+        bridge_token = str(configured_token).strip() if configured_token else ""
+        if not bridge_token:
+            token_path = Path(extra.get(
+                "session_path",
+                get_hermes_dir("platforms/whatsapp/session", "whatsapp/session"),
+            )) / "bridge.token"
+            try:
+                bridge_token = token_path.read_text(encoding="utf-8").strip()
+            except OSError:
+                bridge_token = ""
+        # Older standalone callers may not carry a session_path.  Keep their
+        # request shape compatible; an authenticated bridge will reject the
+        # call with HTTP 401, while managed adapters always provision a token
+        # during connect().
+        bridge_headers = (
+            {"Authorization": f"Bearer {bridge_token}"}
+            if len(bridge_token) >= 32 else {}
+        )
         normalized_chat_id = to_whatsapp_jid(chat_id)
         media = media_files or []
         text = message or ""
@@ -1747,6 +1845,7 @@ async def _standalone_send(
                 async with session.post(
                     f"http://localhost:{bridge_port}/send",
                     json={"chatId": normalized_chat_id, "message": text},
+                    headers=bridge_headers,
                     timeout=aiohttp.ClientTimeout(total=30),
                 ) as resp:
                     if resp.status != 200:
@@ -1770,6 +1869,7 @@ async def _standalone_send(
                             async with session.post(
                                 f"http://localhost:{bridge_port}/send",
                                 json={"chatId": normalized_chat_id, "message": media_caption},
+                                headers=bridge_headers,
                                 timeout=aiohttp.ClientTimeout(total=30),
                             ) as resp:
                                 if resp.status == 200:
@@ -1790,6 +1890,7 @@ async def _standalone_send(
                 async with session.post(
                     f"http://localhost:{bridge_port}/send-media",
                     json=payload,
+                    headers=bridge_headers,
                     timeout=aiohttp.ClientTimeout(total=120),
                 ) as resp:
                     if resp.status != 200:

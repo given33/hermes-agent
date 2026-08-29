@@ -18,10 +18,12 @@ and assert each enforces only its own lists, order-independently.
 """
 
 import os
+from types import SimpleNamespace
 
 import pytest
 
 from gateway.config import Platform, PlatformConfig
+from gateway.platforms.helpers import MessageDeduplicator
 from plugins.platforms.discord.adapter import DiscordAdapter, _GATE_ENV_KEYS
 
 
@@ -434,3 +436,75 @@ class TestTelegramGateIsolation:
         assert extras is None or "allowed_chats" not in extras
         assert os.getenv("TELEGRAM_ALLOWED_CHATS") is None
         assert os.getenv("TELEGRAM_ALLOWED_USERS") is None
+
+
+class TestDiscordRecoveryAdmission:
+    """Recovery claims happen after policy checks to close live-ingress races."""
+
+    @staticmethod
+    def _adapter(*, allowed: bool = True) -> DiscordAdapter:
+        discord = pytest.importorskip("discord")
+        adapter = object.__new__(DiscordAdapter)
+        adapter._dedup = MessageDeduplicator()
+        adapter._client = SimpleNamespace(
+            user=SimpleNamespace(id="bot", bot=True),
+        )
+        adapter._allowed_role_ids = set()
+        adapter._allowed_user_ids = set()
+        adapter._is_allowed_user = lambda *args, **kwargs: allowed
+        adapter._get_allow_bots = lambda: "none"
+        adapter._self_is_explicitly_mentioned = lambda _message: False
+        adapter._self_is_raw_mentioned = lambda _message: False
+        adapter._discord_bots_require_inline_mention = lambda: False
+        adapter._discord_require_mention = lambda: False
+        adapter._discord_free_response_channels = lambda: set()
+        adapter._discord_channel_keys = lambda _message, _parent: set()
+        adapter._get_parent_channel_id = lambda _channel: None
+        adapter._warn_if_fail_closed_default = lambda: None
+        adapter._discord_allow_all_users = lambda: False
+        adapter._gateway_allow_all_users = lambda: False
+        adapter._discord_message_type_default = discord.MessageType.default
+        return adapter
+
+    @staticmethod
+    def _message(message_id: str):
+        discord = pytest.importorskip("discord")
+        return SimpleNamespace(
+            id=message_id,
+            author=SimpleNamespace(id="user", bot=False),
+            channel=SimpleNamespace(id="channel"),
+            guild=None,
+            mentions=[],
+            type=discord.MessageType.default,
+        )
+
+    def test_recovery_claims_after_policy_and_rejects_a_live_claim(self):
+        adapter = self._adapter()
+        message = self._message("recovery-race")
+
+        admitted, _ = adapter._discord_message_admission(
+            message,
+            claim=False,
+            claim_after_policy=True,
+        )
+        assert admitted is True
+        assert adapter._dedup.contains(message.id)
+
+        admitted_again, _ = adapter._discord_message_admission(
+            message,
+            claim=False,
+            claim_after_policy=True,
+        )
+        assert admitted_again is False
+
+    def test_rejected_recovery_message_does_not_poison_dedup(self):
+        adapter = self._adapter(allowed=False)
+        message = self._message("recovery-filtered")
+
+        admitted, _ = adapter._discord_message_admission(
+            message,
+            claim=False,
+            claim_after_policy=True,
+        )
+        assert admitted is False
+        assert adapter._dedup.contains(message.id) is False

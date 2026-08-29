@@ -170,6 +170,40 @@ class TestWecomCallbackPollLoop:
             await task
         assert calls == ["test"]
 
+    @pytest.mark.asyncio
+    async def test_poll_loop_releases_dedup_claim_when_dispatch_fails(self, monkeypatch):
+        adapter = WecomCallbackAdapter(_config())
+        event = adapter._build_event(
+            _app(),
+            """
+            <xml>
+              <ToUserName>ww1234567890</ToUserName>
+              <FromUserName>lisi</FromUserName>
+              <CreateTime>1710000000</CreateTime>
+              <MsgType>text</MsgType>
+              <Content>retry me</Content>
+              <MsgId>m-failed</MsgId>
+            </xml>
+            """,
+        )
+        assert event is not None
+        adapter._seen_messages[event.message_id] = 1.0
+
+        async def fail_handle_message(_event):
+            raise RuntimeError("dispatch failed")
+
+        monkeypatch.setattr(adapter, "handle_message", fail_handle_message)
+        task = asyncio.create_task(adapter._poll_loop())
+        await adapter._message_queue.put(event)
+        for _ in range(20):
+            await asyncio.sleep(0.01)
+            if event.message_id not in adapter._seen_messages:
+                break
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+        assert event.message_id not in adapter._seen_messages
+
 
 class TestWecomCallbackBodySizeLimit:
     """Pre-auth oversized-body rejection (DoS hardening, PR #10192)."""
@@ -197,5 +231,4 @@ class TestWecomCallbackBodySizeLimit:
         oversized = b"<xml>" + b"A" * (_MAX_BODY + 1) + b"</xml>"
         response = await adapter._handle_callback(self._request(oversized))
         assert response.status == 413
-
 

@@ -1286,6 +1286,40 @@ class TestMatrixSyncLoop:
 
         assert called is True
 
+    def test_sync_checkpoint_is_atomic_and_account_bound(self, tmp_path, monkeypatch):
+        import plugins.platforms.matrix.adapter as matrix_mod
+
+        checkpoint = tmp_path / "sync-state.json"
+        monkeypatch.setattr(matrix_mod, "_STORE_DIR", tmp_path)
+        monkeypatch.setattr(matrix_mod, "_SYNC_STATE_PATH", checkpoint)
+        adapter = _make_adapter()
+        adapter._device_id = "DEVICE-A"
+
+        adapter._persist_sync_token("s.next_batch")
+        assert adapter._load_persisted_sync_token() == "s.next_batch"
+        assert checkpoint.exists()
+
+        # A profile reused for another Matrix account must never send the old
+        # account's token to the homeserver.
+        adapter._user_id = "@other:example.org"
+        assert adapter._load_persisted_sync_token() is None
+
+    def test_empty_or_malformed_sync_checkpoint_fails_closed(self, tmp_path, monkeypatch):
+        import plugins.platforms.matrix.adapter as matrix_mod
+
+        checkpoint = tmp_path / "sync-state.json"
+        monkeypatch.setattr(matrix_mod, "_SYNC_STATE_PATH", checkpoint)
+        adapter = _make_adapter()
+        checkpoint.write_text("{not-json", encoding="utf-8")
+        assert adapter._load_persisted_sync_token() is None
+
+        checkpoint.write_text(
+            '{"version":1,"identity":{"homeserver":"https://matrix.example.org",'
+            '"user_id":"@bot:example.org","device_id":""},"next_batch":""}',
+            encoding="utf-8",
+        )
+        assert adapter._load_persisted_sync_token() is None
+
     @pytest.mark.asyncio
     async def test_sync_loop_dispatches_registered_room_message_handler(self):
         """Inbound sync data should flow through handle_sync into message handling."""

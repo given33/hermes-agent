@@ -1100,6 +1100,9 @@ _ROOM_JOIN_RATE_LIMITER = _SlidingWindowRateLimiter(10, 60)
 _MOBILE_RESOURCE_STREAM_LIMIT = 8
 _MOBILE_RESOURCE_STREAMS: dict[str, int] = {}
 _MOBILE_RESOURCE_STREAM_LOCK = asyncio.Lock()
+_MOBILE_RESOURCE_PAGE_LIMIT = 200
+_MOBILE_RESOURCE_POLL_MIN_SECONDS = 1.0
+_MOBILE_RESOURCE_POLL_MAX_SECONDS = 5.0
 
 
 def append_hosted_event(
@@ -18701,6 +18704,17 @@ def connector_stream(request: Request):
                     resume_after = 0
                 with _CONNECTOR_STREAM_LOCK:
                     replay = list(_CONNECTOR_STREAM_HISTORY.get(connector_id, ()))
+                    # A host reboot or clock correction can make the new
+                    # process sequence lower than the client's previous
+                    # numeric cursor.  Treat that cursor as stale and replay
+                    # the retained authoritative window instead of silently
+                    # filtering every post-restart event forever.
+                    latest_id = max(
+                        (int(item.get("id") or 0) for item in replay),
+                        default=0,
+                    )
+                    if resume_after > latest_id:
+                        resume_after = 0
                 for event in replay:
                     try:
                         if int(event.get("id") or 0) > resume_after:
@@ -26896,13 +26910,14 @@ async def stream_mobile_managed_resources(request: Request):
         delivered_cursor = requested_cursor
         initial = True
         last_frame_at = time.monotonic()
+        poll_interval = _MOBILE_RESOURCE_POLL_MIN_SECONDS
         while not await request.is_disconnected():
             if _account_generation_for_owner(owner_id) != account_generation:
                 return
             page = await asyncio.to_thread(
                 _backend_api().list_managed_resources,
                 since_cursor=delivered_cursor,
-                limit=500,
+                limit=_MOBILE_RESOURCE_PAGE_LIMIT,
                 owner_id=owner_id,
                 account_generation=account_generation,
             )
@@ -26922,12 +26937,25 @@ async def stream_mobile_managed_resources(request: Request):
                 delivered_cursor = current_cursor
                 initial = False
                 last_frame_at = time.monotonic()
+                poll_interval = _MOBILE_RESOURCE_POLL_MIN_SECONDS
                 if page.get("has_more"):
                     continue
             elif time.monotonic() - last_frame_at >= 15:
                 yield ": keepalive\n\n"
                 last_frame_at = time.monotonic()
-            await asyncio.sleep(1.0)
+                poll_interval = min(
+                    _MOBILE_RESOURCE_POLL_MAX_SECONDS,
+                    poll_interval * 1.5,
+                )
+            else:
+                # Back off idle catalogs so stalled mobile clients do not
+                # consume one executor thread per second indefinitely.  A
+                # newly committed page resets to the low-latency interval.
+                poll_interval = min(
+                    _MOBILE_RESOURCE_POLL_MAX_SECONDS,
+                    poll_interval * 1.5,
+                )
+            await asyncio.sleep(poll_interval)
 
     async def release_stream_slot() -> None:
         async with _MOBILE_RESOURCE_STREAM_LOCK:

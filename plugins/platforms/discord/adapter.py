@@ -1562,8 +1562,17 @@ class DiscordAdapter(BasePlatformAdapter):
         message: Any,
         *,
         claim: bool,
+        claim_after_policy: bool = False,
     ) -> tuple[bool, bool]:
-        """Return ``(admitted, role_authorized)`` for one Discord event."""
+        """Return ``(admitted, role_authorized)`` for one Discord event.
+
+        Recovery scans run concurrently with the gateway callback.  They must
+        evaluate the same policy gates as live ingress without claiming the
+        message before those gates pass; otherwise a filtered recovery item
+        would poison the dedup cache.  ``claim_after_policy`` performs the
+        final atomic claim after all checks, closing the check-then-dispatch
+        race while preserving the live path's existing claim-first semantics.
+        """
         message_id = str(getattr(message, "id", ""))
         if claim:
             if self._dedup.is_duplicate(message_id):
@@ -1629,6 +1638,8 @@ class DiscordAdapter(BasePlatformAdapter):
                 if "*" not in free_channels and not (channel_keys & free_channels):
                     return False, False
 
+        if claim_after_policy and self._dedup.is_duplicate(message_id):
+            return False, False
         return True, role_authorized
 
     async def _dispatch_discord_message(self, message: Any) -> bool:
@@ -2704,7 +2715,9 @@ class DiscordAdapter(BasePlatformAdapter):
             ):
                 return False
         admitted, role_authorized = self._discord_message_admission(
-            message, claim=False,
+            message,
+            claim=False,
+            claim_after_policy=True,
         )
         if not admitted:
             return False

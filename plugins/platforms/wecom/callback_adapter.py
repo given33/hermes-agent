@@ -361,7 +361,16 @@ class WecomCallbackAdapter(BasePlatformAdapter):
                             str(app.get("corp_id") or ""), event.source.user_id,
                         )
                         self._user_app_map[map_key] = app["name"]
-                    await self._message_queue.put(event)
+                    try:
+                        await self._message_queue.put(event)
+                    except BaseException:
+                        # Admission is claimed before queueing so a duplicate
+                        # callback cannot enqueue the same event concurrently.
+                        # If queueing itself fails, release that claim so the
+                        # provider's retry can be accepted.
+                        if event.message_id:
+                            self._seen_messages.pop(event.message_id, None)
+                        raise
                 # Immediately acknowledge — the agent's reply will arrive
                 # later via the proactive message/send API.
                 return web.Response(text="success", content_type="text/plain")
@@ -377,11 +386,28 @@ class WecomCallbackAdapter(BasePlatformAdapter):
         while True:
             event = await self._message_queue.get()
             try:
-                task = asyncio.create_task(self.handle_message(event))
+                task = asyncio.create_task(self._dispatch_queued_event(event))
                 self._background_tasks.add(task)
                 task.add_done_callback(self._background_tasks.discard)
             except Exception:
                 logger.exception("[WecomCallback] Failed to enqueue event")
+
+    async def _dispatch_queued_event(self, event: Any) -> None:
+        """Dispatch one callback and release its dedup claim on failure.
+
+        The HTTP callback acknowledges after durable queue admission, while
+        the actual gateway work runs in the background.  Keeping a message ID
+        in ``_seen_messages`` until that work succeeds prevents provider
+        retries from creating concurrent turns; removing it on an exception or
+        cancellation lets a later retry recover a failed delivery.
+        """
+        try:
+            await self.handle_message(event)
+        except BaseException:
+            message_id = str(getattr(event, "message_id", "") or "")
+            if message_id:
+                self._seen_messages.pop(message_id, None)
+            raise
 
     # ------------------------------------------------------------------
     # XML / crypto helpers

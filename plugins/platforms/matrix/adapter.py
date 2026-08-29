@@ -54,6 +54,7 @@ from __future__ import annotations
 import asyncio
 import array
 import inspect
+import json
 import logging
 import mimetypes
 import os
@@ -71,6 +72,7 @@ from pathlib import Path
 from typing import Any, Dict, Optional, Set
 
 from agent.secret_scope import UnscopedSecretError, get_secret
+from utils import atomic_json_write
 
 try:
     from mautrix.types import (
@@ -600,6 +602,7 @@ from hermes_constants import get_hermes_dir as _get_hermes_dir
 
 _STORE_DIR = _get_hermes_dir("platforms/matrix/store", "matrix/store")
 _CRYPTO_DB_PATH = _STORE_DIR / "crypto.db"
+_SYNC_STATE_PATH = _STORE_DIR / "sync-state.json"
 
 # Grace period: ignore messages older than this many seconds before startup.
 _STARTUP_GRACE_SECONDS = 5
@@ -1214,6 +1217,10 @@ class MatrixAdapter(BasePlatformAdapter):
         self._device_id: str = config.extra.get("device_id", "") or os.getenv(
             "MATRIX_DEVICE_ID", ""
         )
+        # The configured device id remains user-visible and stable for legacy
+        # diagnostics.  Track the device actually authenticated by the token
+        # separately so restart checkpoints cannot cross device identities.
+        self._authenticated_device_id: str = ""
         self._device_id_unverified: bool = False
 
         self._client: Any = None  # mautrix.client.Client
@@ -1234,6 +1241,11 @@ class MatrixAdapter(BasePlatformAdapter):
         self._late_grace_skew: float = 0.0
         self._clock_skew_warned: bool = False
         self._last_sync_ts: float = 0.0
+        # A resumed sync must process events from the persisted `next_batch`
+        # window even when their server timestamps predate this process.  The
+        # startup grace filter remains active for a brand-new full sync, where
+        # old history is intentionally not replayed as live messages.
+        self._sync_replay_active: bool = False
 
         # Cache: room_id → bool (is DM)
         self._dm_rooms: Dict[str, bool] = {}
@@ -1795,6 +1807,10 @@ class MatrixAdapter(BasePlatformAdapter):
                     effective_device_id = self._device_id or resolved_device_id
                 if effective_device_id:
                     client.device_id = effective_device_id
+                    # Bind the durable sync checkpoint to the device actually
+                    # authenticated by the token, not only to an optional
+                    # MATRIX_DEVICE_ID setting that may be stale.
+                    self._authenticated_device_id = str(effective_device_id)
 
                 if not client.device_id:
                     try:
@@ -1849,6 +1865,8 @@ class MatrixAdapter(BasePlatformAdapter):
                 )
                 if resp and hasattr(resp, "device_id"):
                     client.device_id = resp.device_id
+                    if resp.device_id:
+                        self._authenticated_device_id = str(resp.device_id)
                 logger.info("Matrix: logged in as %s", self._user_id)
             except Exception as exc:
                 logger.error("Matrix: login failed — %s", exc)
@@ -2097,8 +2115,20 @@ class MatrixAdapter(BasePlatformAdapter):
         self._clock_skew_warned = False
         self._closing = False
 
+        persisted_next_batch = await asyncio.to_thread(self._load_persisted_sync_token)
+        self._sync_replay_active = bool(persisted_next_batch)
         try:
-            sync_data = await client.sync(timeout=10000, full_state=True)
+            sync_kwargs = {
+                "timeout": 10000,
+                "full_state": not bool(persisted_next_batch),
+            }
+            if persisted_next_batch:
+                # Resume from the last durably acknowledged token so messages
+                # received while Hermes was offline are delivered by the
+                # normal event machinery instead of being discarded by a new
+                # full-state startup sync.
+                sync_kwargs["since"] = persisted_next_batch
+            sync_data = await client.sync(**sync_kwargs)
             if isinstance(sync_data, dict):
                 self._last_sync_ts = time.time()
                 rooms_join = sync_data.get("rooms", {}).get("join", {})
@@ -2106,8 +2136,10 @@ class MatrixAdapter(BasePlatformAdapter):
                 self._joined_rooms.update(rooms_join.keys())
                 self._room_identities.clear()
                 self._room_identity_cached_at.clear()
-                # Store the next_batch token so incremental syncs start
-                # from where the initial sync left off.
+                # Store the next_batch token so incremental syncs start from
+                # where the initial/resumed sync left off.  Persist the same
+                # token outside mautrix's in-memory store so a process restart
+                # can resume the offline window.
                 nb = sync_data.get("next_batch")
                 if nb:
                     await client.sync_store.put_next_batch(nb)
@@ -2124,6 +2156,8 @@ class MatrixAdapter(BasePlatformAdapter):
                     await self._dispatch_sync(sync_data)
                 except Exception as exc:
                     logger.warning("Matrix: initial sync event dispatch error: %s", exc)
+                if nb:
+                    await asyncio.to_thread(self._persist_sync_token, str(nb))
                 self._schedule_pending_invite_joins(sync_data)
             else:
                 logger.warning(
@@ -2132,6 +2166,8 @@ class MatrixAdapter(BasePlatformAdapter):
                 )
         except Exception as exc:
             logger.warning("Matrix: initial sync error: %s", exc)
+        finally:
+            self._sync_replay_active = False
 
         # Share keys after initial sync if E2EE is enabled.
         if self._encryption and getattr(client, "crypto", None):
@@ -3020,11 +3056,64 @@ class MatrixAdapter(BasePlatformAdapter):
     # Sync loop
     # ------------------------------------------------------------------
 
+    def _sync_identity(self) -> dict[str, str]:
+        """Return the account binding for the durable Matrix sync token."""
+        return {
+            "homeserver": str(self._homeserver or "").rstrip("/"),
+            "user_id": str(self._user_id or "").strip().lower(),
+            "device_id": str(
+                self._authenticated_device_id or self._device_id or ""
+            ).strip(),
+        }
+
+    def _load_persisted_sync_token(self) -> Optional[str]:
+        """Read a restart-safe `next_batch` token, failing closed on drift."""
+        try:
+            payload = json.loads(_SYNC_STATE_PATH.read_text(encoding="utf-8"))
+        except (FileNotFoundError, OSError, ValueError, TypeError):
+            return None
+        if not isinstance(payload, dict) or payload.get("version") != 1:
+            return None
+        token = str(payload.get("next_batch") or "").strip()
+        identity = payload.get("identity")
+        if not token or not isinstance(identity, dict):
+            return None
+        expected = self._sync_identity()
+        if any(str(identity.get(key) or "") != value for key, value in expected.items()):
+            # A profile can be reconfigured for another Matrix account. Never
+            # send an old account's sync token to the new homeserver identity.
+            return None
+        return token
+
+    def _persist_sync_token(self, token: str) -> None:
+        """Atomically persist one validated Matrix `next_batch` token."""
+        normalized = str(token or "").strip()
+        if not normalized:
+            return
+        try:
+            _STORE_DIR.mkdir(parents=True, exist_ok=True)
+            atomic_json_write(
+                _SYNC_STATE_PATH,
+                {
+                    "version": 1,
+                    "identity": self._sync_identity(),
+                    "next_batch": normalized,
+                    "updated_at": time.time(),
+                },
+                indent=None,
+            )
+        except OSError as exc:
+            # Losing the checkpoint must not stop Matrix, but it is important
+            # enough to surface: the next process restart may need a full sync.
+            logger.warning("Matrix: could not persist sync token: %s", exc)
+
     async def _sync_loop(self) -> None:
         """Continuously sync with the homeserver."""
         client = self._client
         # Resume from the token stored during the initial sync.
         next_batch = await client.sync_store.get_next_batch()
+        if not next_batch:
+            next_batch = await asyncio.to_thread(self._load_persisted_sync_token)
         while not self._closing:
             try:
                 # Wrap in asyncio.wait_for to guard against TCP-level hangs
@@ -3060,11 +3149,10 @@ class MatrixAdapter(BasePlatformAdapter):
                         self._room_identity_cached_at.clear()
 
                     # Advance the sync token so the next request is
-                    # incremental instead of a full initial sync.
+                    # incremental instead of a full initial sync. Persist it
+                    # after dispatching the response, so a crash during event
+                    # handling leaves the previous token available for replay.
                     nb = sync_data.get("next_batch")
-                    if nb:
-                        next_batch = nb
-                        await client.sync_store.put_next_batch(nb)
 
                     # Dispatch events to registered handlers so that
                     # _on_room_message / _on_reaction / _on_invite fire.
@@ -3072,6 +3160,10 @@ class MatrixAdapter(BasePlatformAdapter):
                         await self._dispatch_sync(sync_data)
                     except Exception as exc:
                         logger.warning("Matrix: sync event dispatch error: %s", exc)
+                    if nb:
+                        next_batch = nb
+                        await client.sync_store.put_next_batch(nb)
+                        await asyncio.to_thread(self._persist_sync_token, str(nb))
                     self._schedule_pending_invite_joins(sync_data)
                     # Let freshly scheduled invite joins start before the next
                     # sync iteration without waiting for slow or stuck joins.
@@ -3258,7 +3350,11 @@ class MatrixAdapter(BasePlatformAdapter):
 
         # Startup grace: ignore old messages from initial sync.
         event_ts = _matrix_event_timestamp_seconds(event)
-        if event_ts and event_ts < self._startup_ts - _STARTUP_GRACE_SECONDS:
+        if (
+            event_ts
+            and event_ts < self._startup_ts - _STARTUP_GRACE_SECONDS
+            and not self._sync_replay_active
+        ):
             # If we are well past startup but events are still being dropped
             # by the grace check, the host clock is probably set ahead of
             # real time — every live event then looks "older than startup".

@@ -26,7 +26,7 @@ import pino from 'pino';
 import path from 'path';
 import { mkdirSync, readFileSync, existsSync, readdirSync, unlinkSync } from 'fs';
 import { fileURLToPath } from 'url';
-import { randomBytes, createHash } from 'crypto';
+import { randomBytes, createHash, timingSafeEqual } from 'crypto';
 import { execFileSync } from 'child_process';
 import { tmpdir } from 'os';
 import qrcode from 'qrcode-terminal';
@@ -124,6 +124,11 @@ const CHUNK_DELAY_MS = parseInt(process.env.WHATSAPP_CHUNK_DELAY_MS || '300', 10
 // which pins the bridge's HTTP handler until the upstream aiohttp timeout
 // fires. Fail fast instead so the gateway can surface a real error and retry.
 const SEND_TIMEOUT_MS = parseInt(process.env.WHATSAPP_SEND_TIMEOUT_MS || '60000', 10);
+// The Python adapter supplies a profile-scoped bearer token.  Keep the
+// control plane fail-closed when a bridge is launched manually without one;
+// /health remains unauthenticated so startup probes can distinguish a stale
+// process from a bridge that is still connecting.
+const BRIDGE_TOKEN = String(process.env.HERMES_BRIDGE_TOKEN || '').trim();
 
 // --- Send queue: serialise all sock.sendMessage() calls across concurrent
 //     HTTP handlers so a single Baileys socket never has overlapping sends.
@@ -813,6 +818,28 @@ app.use((req, res, next) => {
   next();
 });
 
+// Authenticate every control-plane endpoint.  Host validation above protects
+// against DNS rebinding, while this token prevents unrelated local processes
+// from sending messages, reading inbound queues, or issuing read receipts.
+app.use((req, res, next) => {
+  if (req.path === '/health') return next();
+  if (!BRIDGE_TOKEN) {
+    return res.status(503).json({ error: 'Bridge authentication is not configured' });
+  }
+  const header = String(req.headers.authorization || '');
+  const presented = header.startsWith('Bearer ') ? header.slice(7).trim() : '';
+  let valid = false;
+  try {
+    const expected = Buffer.from(BRIDGE_TOKEN);
+    const actual = Buffer.from(presented);
+    valid = expected.length === actual.length && timingSafeEqual(expected, actual);
+  } catch {
+    valid = false;
+  }
+  if (!valid) return res.status(401).json({ error: 'Unauthorized' });
+  next();
+});
+
 // Poll for new messages (long-poll style)
 app.get('/messages', (req, res) => {
   const msgs = messageQueue.splice(0, messageQueue.length);
@@ -1111,6 +1138,7 @@ app.get('/health', (req, res) => {
     uptime: process.uptime(),
     scriptHash: SCRIPT_HASH,
     sendReadReceipts: SEND_READ_RECEIPTS,
+    authEnabled: Boolean(BRIDGE_TOKEN),
   });
 });
 
