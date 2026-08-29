@@ -19840,6 +19840,18 @@ def compact_hosted_turns_for_index(
 
 def _conversation_index_projection(conversation: dict[str, Any]) -> dict[str, Any]:
     projected = dict(conversation)
+    # The index response uses a lighter projection than `_public_conversation`
+    # but must expose the same account Sessions flags. Keep the internal
+    # storage keys out of the mobile payload so list and detail snapshots
+    # cannot disagree after a pin/archive/read mutation.
+    if "session_archived" in conversation:
+        projected["archived"] = bool(conversation.get("session_archived"))
+    if "session_pinned" in conversation:
+        projected["pinned"] = bool(conversation.get("session_pinned"))
+    if "session_unread" in conversation:
+        projected["unread"] = bool(conversation.get("session_unread"))
+    for key in ("session_archived", "session_pinned", "session_unread"):
+        projected.pop(key, None)
     for key in (
         "history_message_count",
         "history_last_message",

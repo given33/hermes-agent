@@ -7079,6 +7079,9 @@ class CollaborationDashboardTests(unittest.TestCase):
         self.assertTrue(projected["unread"])
         self.assertNotIn("session_archived", projected)
         self.assertTrue(saved[-1]["conversations"][0]["session_archived"])
+        index_projection = module._conversation_index_projection(saved[-1]["conversations"][0])
+        self.assertTrue(index_projection["archived"])
+        self.assertNotIn("session_archived", index_projection)
         # The account flag must not collide with the internal archive
         # placeholder marker used by conversation lookup.
         self.assertIs(module._conversation_by_id(state, conversation["id"]), conversation)
