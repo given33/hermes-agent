@@ -978,7 +978,11 @@ def test_product_backed_behavior_matrix(
             handoff = run["manager_handoff"]
             assert handoff["task_goal"] == prompt
             assert handoff["worker_results"] == run["worker_results"]
-            assert "服务器确定性校验通过" in handoff["review_verdict"]
+            # The reporter/reviewer model lane was retired. The durable
+            # handoff now exposes the server-side validation summary instead
+            # of a legacy ``review_verdict`` field or hidden model call.
+            assert "服务器确定性校验通过" in handoff["validation_summary"]
+            assert "review_verdict" not in handoff
             assert handoff["failures"] == []
             assert "verified worker evidence" in str(handoff["worker_results"])
             assert not adapter.provider.reporter_prompts
