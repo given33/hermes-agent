@@ -137,6 +137,8 @@ cat >"${env_tmp}" <<EOF
 HERMES_CLOUD_URL=${cloud_url}
 HERMES_CLOUD_TOKEN_FILE=${token_file}
 DBB3_CONNECTOR_ID=${connector_id}
+# Official low-latency worker channel; REST pull remains the durable fallback.
+HERMES_CONNECTOR_WORKER_WS=${HERMES_CONNECTOR_WORKER_WS:-1}
 DBB3_CONNECTOR_ARTIFACT_ROOTS=${DBB3_CONNECTOR_ARTIFACT_ROOTS:-${user_home}/.hermes:/opt/dbb3-team}
 DBB3_CONNECTOR_STATE_FILE=${state_dir}/checkpoint.json
 EOF

@@ -295,3 +295,18 @@ Bedrock runtime/control client cache 现在由进程内可重入锁保护；同�
 SSRF/网站策略并在 ZIP 解析前限制 16 MiB 传输与展开总量。Agent/runtime 脱敏器先处理带
 空格的单/双引号环境变量值，避免只遮首 token；Provider caret range 对 `^0.0.z` 正确限制
 在同一补丁版本线。受影响回归 `486 passed, 3 skipped`。
+
+### 2026-08-30 续审：Worker WebSocket 低延迟通道
+
+官方 collaboration 后端早已提供 `/api/plugins/collaboration/worker/ws`，但 DBB3、PC/WSL
+和 HK 连接器此前仍只订阅 legacy `/connector/stream` SSE；新任务要等下一轮 REST pull
+才会被唤醒。连接器现在以 pinned `websockets.sync.client` 实现官方
+`hermes.low-latency.v1` hello/heartbeat/replay 协议，按 `dbb3-worker`、`pc-worker`、
+`hk-worker` 独立节点握手，并把 `worker.queued`/steer 事件即时转成同步唤醒；序列游标在
+重连时恢复，token 仍只放在握手 header，不进入 URL。
+
+WebSocket 只作为低延迟加速器，REST durable queue、checkpoint 和 legacy SSE fallback
+仍保留，因此依赖缺失、代理不支持或显式 `HERMES_CONNECTOR_WORKER_WS=0` 时不会丢任务。
+DBB3/HK systemd 模板和共享安装器默认写入 `HERMES_CONNECTOR_WORKER_WS=1`，PC 安装复用
+同一模板。新增 handshake、游标、节点映射和缺依赖 fallback 回归；部署资产套件
+`61 passed`，连接器专项 `29 passed`，ruff/compileall 通过。

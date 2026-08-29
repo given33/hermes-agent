@@ -31,6 +31,7 @@ import time
 import urllib.error
 import urllib.parse
 import urllib.request
+import uuid
 from datetime import datetime, timezone
 from typing import Any, Callable, Iterable, Optional
 
@@ -41,6 +42,15 @@ try:  # pragma: no cover - import environment dependent
     from hermes_services import latency_trace as _latency_trace
 except Exception:  # noqa: BLE001 - tracing must never break the connector
     _latency_trace = None
+
+# The low-latency worker channel is optional at import time so the connector
+# remains usable on a partially upgraded host.  Deployments pin websockets in
+# the project environment; when it is absent we keep the durable REST/SSE
+# paths alive and report no fatal startup error.
+try:  # pragma: no cover - import environment dependent
+    from websockets.sync.client import connect as _websocket_connect
+except Exception:  # noqa: BLE001 - REST polling is the recovery path
+    _websocket_connect = None
 
 
 CONTRACT_VERSION = 2
@@ -538,24 +548,58 @@ class CloudRelayClient:
         connector_id: str = "dbb3-primary",
         timeout: float = 20,
         token_path: str | Path | None = None,
+        worker_ws: bool | None = None,
+        worker_node_id: str | None = None,
     ) -> None:
         self.base_url = base_url.rstrip("/")
         self.token = token.strip()
         self.token_path = Path(token_path) if token_path else None
         self.connector_id = _text(connector_id, 128) or "dbb3-primary"
         self.timeout = timeout
+        # Keep the switch explicit for older manually-installed connectors;
+        # the maintained systemd installers set it to 1.  This also lets a
+        # host roll back to SSE-only without changing the code bundle.
+        self.worker_ws = (
+            _coerce_flag(os.environ.get("HERMES_CONNECTOR_WORKER_WS"))
+            if worker_ws is None
+            else bool(worker_ws)
+        )
+        self.worker_node_id = (
+            _text(worker_node_id, 128)
+            or _text(os.environ.get("HERMES_WORKER_NODE_ID"), 128)
+            or self._default_worker_node_id()
+        )
+        self._connection_generation = uuid.uuid4().hex
         self._last_stream_event_id = ""
         self._stream_response_lock = threading.Lock()
         self._stream_response: Any | None = None
+        self._stream_ws_lock = threading.Lock()
+        self._stream_ws: Any | None = None
+
+    def _default_worker_node_id(self) -> str:
+        normalized = self.connector_id.lower()
+        if normalized.startswith("pc-"):
+            return "pc-worker"
+        if normalized.startswith("hk-"):
+            return "hk-worker"
+        return "dbb3-worker"
 
     def close_stream(self) -> None:
-        """Interrupt an active SSE read so connector shutdown is prompt."""
+        """Interrupt active SSE/WS reads so connector shutdown is prompt."""
         with self._stream_response_lock:
             response = self._stream_response
             self._stream_response = None
         if response is not None:
             try:
                 response.close()
+            except Exception:
+                pass
+        with self._stream_ws_lock:
+            websocket = self._stream_ws
+            self._stream_ws = None
+        if websocket is not None:
+            try:
+                websocket.close()
             except Exception:
                 pass
 
@@ -567,6 +611,15 @@ class CloudRelayClient:
         with self._stream_response_lock:
             if self._stream_response is response:
                 self._stream_response = None
+
+    def _register_stream_ws(self, websocket: Any) -> None:
+        with self._stream_ws_lock:
+            self._stream_ws = websocket
+
+    def _clear_stream_ws(self, websocket: Any) -> None:
+        with self._stream_ws_lock:
+            if self._stream_ws is websocket:
+                self._stream_ws = None
 
     def _reload_token(self) -> bool:
         """Reload the token file so a rotated credential is picked up live."""
@@ -633,6 +686,25 @@ class CloudRelayClient:
         raise ConnectorAuthError(401, "connector token rotation retry exhausted")
 
     def _stream_events(
+        self,
+        wake: threading.Event,
+        stop: threading.Event,
+        on_steer: Callable[[dict[str, Any]], None] | None = None,
+    ) -> None:
+        """Subscribe to the official worker channel, with SSE compatibility.
+
+        Maintained deployments use ``/worker/ws`` as the low-latency wake-up
+        path.  The durable REST queue remains authoritative, so a missing
+        websocket dependency or an explicit opt-out safely falls back to the
+        existing SSE stream.  ``_stream_events`` is intentionally retained as
+        the public seam used by older connector tests and installations.
+        """
+        if self.worker_ws:
+            self._stream_worker_events(wake, stop, on_steer)
+            return
+        self._stream_sse_events(wake, stop, on_steer)
+
+    def _stream_sse_events(
         self,
         wake: threading.Event,
         stop: threading.Event,
@@ -706,6 +778,142 @@ class CloudRelayClient:
                     self._reload_token()
             except Exception:
                 pass
+            if stop.wait(backoff):
+                return
+            backoff = min(backoff * 2, 30.0)
+
+    def _worker_ws_url(self) -> str:
+        parsed = urllib.parse.urlsplit(self.base_url)
+        scheme = "wss" if parsed.scheme.lower() == "https" else "ws"
+        path = parsed.path.rstrip("/") + "/worker/ws"
+        return urllib.parse.urlunsplit((scheme, parsed.netloc, path, parsed.query, ""))
+
+    def _worker_ws_cursor(self) -> int:
+        try:
+            value = int(str(self._last_stream_event_id or "0"), 10)
+        except (TypeError, ValueError, OverflowError):
+            return 0
+        return max(0, value)
+
+    @staticmethod
+    def _decode_ws_frame(raw: Any) -> dict[str, Any] | None:
+        if isinstance(raw, bytes):
+            raw = raw.decode("utf-8", "replace")
+        if not isinstance(raw, str):
+            return None
+        try:
+            frame = json.loads(raw)
+        except (TypeError, ValueError):
+            return None
+        return frame if isinstance(frame, dict) else None
+
+    def _handle_worker_ws_frame(
+        self,
+        frame: dict[str, Any],
+        wake: threading.Event,
+        on_steer: Callable[[dict[str, Any]], None] | None,
+    ) -> None:
+        frame_type = str(frame.get("type") or "").strip().lower()
+        if frame_type in {"heartbeat", "heartbeat.ack", "hello.accepted"}:
+            return
+        # The worker channel uses the shared low-latency event envelope.  A
+        # payload copy keeps compatibility with older ``run.steer`` callers
+        # that expected remote_run_id/message at the top level.
+        event = dict(frame)
+        payload = frame.get("payload")
+        if isinstance(payload, dict):
+            for key, value in payload.items():
+                event.setdefault(str(key), value)
+        sequence = frame.get("sequence")
+        if sequence is not None:
+            try:
+                self._last_stream_event_id = str(max(0, int(sequence)))
+            except (TypeError, ValueError, OverflowError):
+                pass
+        elif frame.get("event_id"):
+            self._last_stream_event_id = _text(frame.get("event_id"), 256)
+        if frame_type == "run.steer" and on_steer is not None:
+            on_steer(event)
+        # worker.queued is the normal server->worker frame, while accepting
+        # any non-control event makes the channel forward-compatible.
+        wake.set()
+
+    def _stream_worker_events(
+        self,
+        wake: threading.Event,
+        stop: threading.Event,
+        on_steer: Callable[[dict[str, Any]], None] | None = None,
+    ) -> None:
+        """Long-lived official ``/worker/ws`` subscription with replay.
+
+        The websocket is a wake-up accelerator only.  Every frame is retained
+        by the server's bounded replay window and the connector still fetches
+        the canonical run through REST, so reconnects and WS outages cannot
+        lose work.
+        """
+        if _websocket_connect is None:
+            self._stream_sse_events(wake, stop, on_steer)
+            return
+        backoff = 1.0
+        while not stop.is_set():
+            websocket = None
+            connected_at = time.monotonic()
+            try:
+                headers = {
+                    "Authorization": f"Bearer {self.token}",
+                    "X-Connector-ID": self.connector_id,
+                    "User-Agent": "dbb3-cloud-connector/2.0",
+                }
+                websocket = _websocket_connect(
+                    self._worker_ws_url(),
+                    additional_headers=headers,
+                    open_timeout=min(10.0, max(1.0, float(self.timeout))),
+                    ping_interval=20.0,
+                    ping_timeout=20.0,
+                    close_timeout=5.0,
+                    max_size=1024 * 1024,
+                )
+                self._register_stream_ws(websocket)
+                websocket.send(json.dumps({
+                    "type": "hello",
+                    "node_id": self.worker_node_id,
+                    "cursor": self._worker_ws_cursor(),
+                    "connection_generation": self._connection_generation,
+                    "capabilities": ["worker.ws", "connector.pull", "connector.artifacts"],
+                    "version": "2.0",
+                }, separators=(",", ":")))
+                hello = self._decode_ws_frame(websocket.recv(timeout=10.0))
+                if not hello or hello.get("type") != "hello.accepted":
+                    raise RuntimeError("worker websocket handshake was rejected")
+                backoff = 1.0
+                while not stop.is_set():
+                    try:
+                        raw = websocket.recv(timeout=25.0)
+                    except TimeoutError:
+                        # The server emits a heartbeat every 30 seconds.  A
+                        # client heartbeat also refreshes the lease and keeps
+                        # proxies from declaring the otherwise idle socket dead.
+                        websocket.send(json.dumps({"type": "heartbeat"}, separators=(",", ":")))
+                        continue
+                    frame = self._decode_ws_frame(raw)
+                    if frame is not None:
+                        self._handle_worker_ws_frame(frame, wake, on_steer)
+            except Exception:
+                # A rotated connector credential may close the websocket
+                # during the HTTP upgrade.  Reload before the next backoff
+                # cycle; REST requests retain their own 401 retry boundary.
+                self._reload_token()
+                if stop.is_set():
+                    return
+            finally:
+                self._clear_stream_ws(websocket)
+                if websocket is not None:
+                    try:
+                        websocket.close()
+                    except Exception:
+                        pass
+                if time.monotonic() - connected_at >= _STREAM_BACKOFF_RESET_SECONDS:
+                    backoff = 1.0
             if stop.wait(backoff):
                 return
             backoff = min(backoff * 2, 30.0)

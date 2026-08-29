@@ -198,6 +198,90 @@ def test_stream_connection_uses_bounded_socket_timeout(monkeypatch):
     assert captured["timeout"] <= 35.0
 
 
+def test_worker_websocket_handshake_and_event_wakeup(monkeypatch):
+    client = connector_module.CloudRelayClient(
+        "https://example.test/api/plugins/collaboration",
+        "token",
+        connector_id="hk-primary",
+        worker_ws=True,
+    )
+    wake = threading.Event()
+    stop = threading.Event()
+    steers = []
+
+    class FakeWebSocket:
+        def __init__(self):
+            self.sent = []
+            self.closed = False
+            self.frames = [
+                json.dumps({"type": "hello.accepted"}),
+                json.dumps(
+                    {
+                        "schema_version": "hermes.low-latency.v1",
+                        "event_id": "evt-7",
+                        "sequence": 7,
+                        "type": "worker.queued",
+                        "node_id": "hk-worker",
+                        "payload": {"task": {"id": "run-7"}},
+                    }
+                ),
+            ]
+
+        def send(self, value):
+            self.sent.append(json.loads(value))
+
+        def recv(self, *, timeout):
+            if self.frames:
+                return self.frames.pop(0)
+            stop.set()
+            raise OSError("test disconnect")
+
+        def close(self):
+            self.closed = True
+
+    websocket = FakeWebSocket()
+    captured = {}
+
+    def fake_connect(url, **kwargs):
+        captured["url"] = url
+        captured["kwargs"] = kwargs
+        return websocket
+
+    monkeypatch.setattr(connector_module, "_websocket_connect", fake_connect)
+    client._stream_events(wake, stop, steers.append)
+
+    assert captured["url"] == "wss://example.test/api/plugins/collaboration/worker/ws"
+    assert captured["kwargs"]["additional_headers"]["X-Connector-ID"] == "hk-primary"
+    assert websocket.sent[0]["type"] == "hello"
+    assert websocket.sent[0]["node_id"] == "hk-worker"
+    assert websocket.sent[0]["cursor"] == 0
+    assert wake.is_set()
+    assert client._last_stream_event_id == "7"
+    assert websocket.closed is True
+
+
+def test_worker_websocket_falls_back_to_sse_when_dependency_missing(monkeypatch):
+    client = connector_module.CloudRelayClient(
+        "https://example.test",
+        "token",
+        worker_ws=True,
+    )
+    calls = []
+
+    monkeypatch.setattr(connector_module, "_websocket_connect", None)
+    monkeypatch.setattr(
+        client,
+        "_stream_sse_events",
+        lambda wake, stop, on_steer: calls.append((wake, stop, on_steer)),
+    )
+    wake = threading.Event()
+    stop = threading.Event()
+    callback = lambda _event: None
+    client._stream_events(wake, stop, callback)
+
+    assert calls == [(wake, stop, callback)]
+
+
 def test_stream_parser_joins_multiline_data_and_advances_last_event_id(monkeypatch):
     client = connector_module.CloudRelayClient("https://example.test", "token")
     wake = threading.Event()
