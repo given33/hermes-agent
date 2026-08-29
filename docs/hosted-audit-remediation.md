@@ -244,3 +244,18 @@ uv run ruff check hermes_runtime hermes_services plugins/collaboration/dashboard
 上游后续提交 `835a913ffd`、`0ffad55e09`、`4209d371aa`（压缩失败冷却、Portal
 推荐模型校验）已在 `273111e56f` 追加合并并通过上游新增回归 `61 passed`；同步门禁
 再次通过后已推送到 `origin/main`。
+
+### 2026-08-30 续审：统一会话状态接口
+
+- iOS 的 Sessions 页面是账户会话与官方运行时会话的统一索引。此前账户行的归档、
+  置顶、未读、批量删除和导出会误发到 `/api/sessions`，而官方 `official:*` 占位符
+  也会被原样当作 SQLite session id，真实网关上分别表现为 404 或“会话不存在”。
+- Collaboration 后端的单聊 PATCH 现在支持 `archived`、`pinned`、`unread`，并把它们
+  存在 `session_*` 命名空间，避免与内部归档占位行的 `archived` 标记冲突；公开快照
+  映射为 iOS 统一 Sessions 所需的布尔字段。
+- iOS action bridge 会解析官方占位符、按 profile 分组批量删除，并将账户会话删除/状态
+  修改路由到 collaboration API；账户导出从 `/single/conversations/:id` 读取，官方
+  导出仍走 `/api/sessions/:id/export`。相关 API surface、路由和后端回归已补齐。
+- 本轮验证：后端 collaboration dashboard `200 passed, 7 skipped, 44 subtests`，
+  cloud-files `74 passed`；iOS `pnpm test` `819 passed / 0 failed`，TypeScript 与
+  SwiftUI contract check 通过，ruff 通过。
