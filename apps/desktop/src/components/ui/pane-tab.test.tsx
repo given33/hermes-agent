@@ -139,6 +139,37 @@ describe('PaneTab hover close button', () => {
     expect(onClose).toHaveBeenCalledTimes(1)
   })
 
+  it('reserves a close-button runway only on closeable horizontal tabs', () => {
+    const onClose = vi.fn()
+
+    const { rerender } = render(
+      <PaneTab onClose={onClose}>
+        <PaneTabLabel>BROWSER</PaneTabLabel>
+      </PaneTab>
+    )
+
+    const horizontalTab = screen.getByText('BROWSER').parentElement?.parentElement
+    expect(horizontalTab?.className).toContain('pr-9')
+
+    rerender(
+      <PaneTab onClose={onClose} vertical>
+        <PaneTabLabel>BROWSER</PaneTabLabel>
+      </PaneTab>
+    )
+    const verticalTab = screen.getByText('BROWSER').parentElement?.parentElement
+    expect(verticalTab?.className).not.toContain('pr-9')
+  })
+
+  it('a closeable horizontal tab always shows its ✕ — the chip and the pointer gestures are one affordance', () => {
+    const onClose = vi.fn()
+    render(
+      <PaneTab onClose={onClose}>
+        <PaneTabLabel>tab</PaneTabLabel>
+      </PaneTab>
+    )
+    expect(screen.getByRole('button', { name: 'Close' })).toBeTruthy()
+  })
+
   it('renders no ✕ on a vertical rail tab (middle/⌘-click only there)', () => {
     const onClose = vi.fn()
     render(
