@@ -163,3 +163,30 @@ uv run ruff check hermes_runtime hermes_services plugins/collaboration/dashboard
 2. 设置 `HERMES_CONNECTOR_HEARTBEAT_SECONDS=30`（默认已为 30）。
 3. 配置 cron 定期执行 `scripts/backup_hosted_state.py --output-dir ...`。
 4. 在升级节点前写入 `.drain_request.json`，待连接器排空后再替换版本。
+
+### 2026-08-29 续审：上游同步与 iOS 官方 Git 对齐
+
+- 本次再次执行 `git fetch upstream main`，官方 `upstream/main` 为
+  `b1ff8722a53ee223485ac9804945acf07ef5c601`（短 SHA：`b1ff8722a5`）。
+  通过无冲突 merge 提交 `94a4bd93fd288a74f0e09682a2f5366b366442f8`
+  纳入本地 `main`；上游 optional skills、模型/提示词和桌面行为改动均保留，
+  本地 HK、worker channel、Bot Mode 与移动端接口未被覆盖。
+- `.github/workflows/deploy-three-endpoints.yml` 的 HK job 在生产变量
+  `HERMES_HK_ENABLED=1` 时使用固定 SSH host key 调用 `deploy/hk/install-hk-worker.sh`，
+  并验证 HK `hermes-fabric-update.timer` 和 `release.json`；三 worker 共用提交的源代码，
+  connector token、profile、skills、state 和 systemd unit 按 DBB3/PC-WSL/HK 分离。
+- hosted workflow 的实际路径仍是一个服务器本地 dispatcher + 三个 worker lane；
+  `_start_hosted_companion()` 是迁移兼容 no-op，不会创建 supervisor/reviewer 模型回合。
+  文件中保留的旧 reviewer/supervisor helper 只服务历史状态迁移/跳过的兼容测试，
+  不能由当前 dispatcher 路径调用。
+- iOS 已新增 `/git` 原生和 fallback 页面，直接消费官方 Git API 的 status、branches、
+  worktrees、review、ship-info、GitHub auth、commit context、rev-parse、PR list、
+  review/file diff，并提供暂存、取消暂存、还原、提交、推送、切分支、PR、worktree
+  操作。具体对齐矩阵和性能记录见审计目录中的
+  `HERMES-FEATURE-ALIGNMENT-MATRIX-2026-08-29.md` 与
+  `IOS-HERMES-PERFORMANCE-OPTIMIZATION-2026-08-29.md`。
+- 本轮证据：iOS `pnpm test` 为 `808 passed`，`pnpm typecheck` 与
+  `pnpm contract:check` 通过；后端上游/部署/worker/WebSocket 聚焦回归 `160 passed`，
+  上游 optional-skills/model 聚焦回归 `71 passed`，ruff 通过。Windows 没有 Xcode、
+  真机或生产四节点凭据，Swift archive、APNs、真实网络 RTT 和 HK 主机实测仍由 macOS CI
+  与生产演练验收。
