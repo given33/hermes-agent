@@ -681,6 +681,12 @@ class BotAssetUpdate(BaseModel):
     clear: bool = False
 
 
+class BotAvatarGenerate(BaseModel):
+    """Prompt envelope for the upstream ``image.generate`` avatar flow."""
+
+    prompt: Optional[str] = Field(default=None, max_length=2_000)
+
+
 class BotRelaySend(BaseModel):
     """Authenticated mobile envelope for the upstream Bot Mode relay.
 

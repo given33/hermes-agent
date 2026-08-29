@@ -252,6 +252,40 @@ async def test_bot_relay_mobile_surface_reads_and_enqueues_official_outbox(monke
     assert captured["sender_profile"] == "default"
 
 
+@pytest.mark.asyncio
+async def test_bot_avatar_generation_delegates_image_and_asset_handlers(monkeypatch, tmp_path):
+    """Generated avatars use the upstream image.generate + set_asset path."""
+    from hermes_cli.web_routers import profiles as profiles_router
+    from tui_gateway import server as gateway_server
+
+    profile_dir = tmp_path / "artist"
+    profile_dir.mkdir()
+    monkeypatch.setattr(profiles_router, "_resolve_profile_dir", lambda _name: profile_dir)
+    calls = []
+
+    def generate(rid, params):
+        calls.append(("generate", params))
+        return {"jsonrpc": "2.0", "id": rid, "result": {
+            "available": True, "success": True,
+            "image_data": "data:image/png;base64,AA==",
+        }}
+
+    def set_asset(rid, params):
+        calls.append(("set_asset", params))
+        return {"jsonrpc": "2.0", "id": rid, "result": {"ok": True, "size": 8}}
+
+    monkeypatch.setitem(gateway_server._methods, "image.generate", generate)
+    monkeypatch.setitem(gateway_server._methods, "profiles.set_asset", set_asset)
+    result = await profiles_router.generate_bot_avatar_endpoint(
+        "artist", profiles_router.BotAvatarGenerate(prompt="friendly robot"),
+    )
+    assert result["ok"] is True
+    assert result["image_data"].startswith("data:image/png")
+    assert calls[0] == ("generate", {"prompt": "friendly robot", "aspect_ratio": "square"})
+    assert calls[1][0] == "set_asset"
+    assert calls[1][1]["asset"] == "avatar"
+
+
 # ---------------------------------------------------------------------------
 # Shared fixtures
 # ---------------------------------------------------------------------------

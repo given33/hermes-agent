@@ -45,6 +45,7 @@ from hermes_cli.web_models import (
     ProfileDescribeAuto,
     BotProfileConfigure,
     BotAssetUpdate,
+    BotAvatarGenerate,
     BotRelaySend,
     SessionPrScanBody,
 )
@@ -1162,6 +1163,34 @@ async def clear_bot_asset_endpoint(name: str, asset: str = "avatar"):
         {"name": name, "asset": asset, "clear": True},
     )
     return {"ok": bool(result.get("ok", True)), "bot_mode": True, "asset": asset, **result}
+
+
+@router.post("/api/bots/{name}/assets/avatar/generate")
+async def generate_bot_avatar_endpoint(name: str, body: BotAvatarGenerate):
+    """Generate and persist a Bot Mode avatar through official RPC handlers."""
+
+    _bot_meta_path(name)
+    prompt = body.prompt.strip() if body.prompt else ""
+    if not prompt:
+        prompt = f'Cute minimal robot avatar for an AI agent named "{name}". Friendly simple mascot face, bold flat vector style, centered, no text.'
+
+    def generate() -> Dict[str, Any]:
+        generated = _invoke_profile_gateway_rpc(
+            "image.generate",
+            {"prompt": prompt, "aspect_ratio": "square"},
+        )
+        if generated.get("success") is not True:
+            return {"ok": False, "bot_mode": True, **generated}
+        image_data = str(generated.get("image_data") or "").strip()
+        if not image_data:
+            return {"ok": False, "bot_mode": True, "error": "image generator returned no inline image"}
+        stored = _invoke_profile_gateway_rpc(
+            "profiles.set_asset",
+            {"name": name, "asset": "avatar", "data": image_data},
+        )
+        return {"ok": bool(stored.get("ok", True)), "bot_mode": True, "asset": "avatar", "image_data": image_data, **stored}
+
+    return await asyncio.to_thread(generate)
 
 
 @router.post("/api/profiles")

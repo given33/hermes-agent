@@ -66,6 +66,10 @@
 outbox 写入和回复等待仍由官方 relay helper 负责；服务端不会向 iOS 暴露其他
 连接的 token。
 
+Bot avatar 生成同样保持官方链路：`/api/bots/{name}/assets/avatar/generate`
+调用注册的 `image.generate` handler，再把返回的 data URL 交给
+`profiles.set_asset`；生成器不可用时返回明确失败，不写入半成品。
+
 ## 验证
 
 ### 2026-08-29 上游同步核验
