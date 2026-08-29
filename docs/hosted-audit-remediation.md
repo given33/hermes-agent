@@ -190,3 +190,24 @@ uv run ruff check hermes_runtime hermes_services plugins/collaboration/dashboard
   上游 optional-skills/model 聚焦回归 `71 passed`，ruff 通过。Windows 没有 Xcode、
   真机或生产四节点凭据，Swift archive、APNs、真实网络 RTT 和 HK 主机实测仍由 macOS CI
   与生产演练验收。
+
+### 2026-08-29 续审：最新 upstream/main 与托管工作区文件闭环
+
+- 重新 fetch 后发现官方 `upstream/main` 已推进到 `5831d8365aea36fea48f9c3e839827d19ccb9a6c`
+  （短 SHA：`5831d8365a`），新增 `ccc367dce0`（platform-hint truth pass、
+  gateway universal voice-bubble transcode）、`447217b4cc`（桌面 pane-tab
+  关闭按钮预留空间）和 `5831d8365a` 格式化提交。本地以 merge 提交
+  `c8acb0520f` 纳入全部官方变更；`git rev-list --left-right --count
+  HEAD...upstream/main` 右侧为 `0`。
+- 上游通用语音气泡转码在 gateway/platform adapters 中保留官方实现，新增
+  `tests/gateway/test_voice_transcode.py` 与既有 TTS 路由回归共 `16 passed`；
+  `uv run ruff check` 覆盖运行时、适配器和测试文件全部通过。桌面 pane-tab
+  合并时保留本地 `showCloseButton` 兼容开关，同时采纳官方水平 tab runway，
+  相关 Vitest 因 Windows 工作区缺少 `@rolldown/plugin-babel` 依赖未能启动，
+  需在完整 Node 安装或 CI 环境补跑。
+- iOS 原生 Files 现在同时显示 collaboration account file library 和官方
+  `/api/files` managed workspace：目录父子导航、分块暂存上传、受限下载/分享、
+  文件/目录删除以及 folder.create 均通过官方 API；跨语言 route contract 新增
+  `managedFilesJSON` 与四个 `files.managed.*` action，并有 route/native source
+  回归覆盖。iOS 全量 `pnpm test` 为 `811 passed / 0 failed`，`pnpm typecheck`
+  与 `pnpm contract:check` 通过。
