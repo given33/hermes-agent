@@ -92,11 +92,19 @@ Petdex 头像选择也不重复实现官方逻辑：`/api/bot-mode/pets/gallery`
 
 ### 2026-08-29 上游同步核验
 
-- 已从 `upstream/main` 同步到官方提交 `9f90cd438c`，本地以合并提交 `bb468947da` 完成整合；`HEAD...upstream/main` 的右侧差异为 `0`，表示没有漏掉上游新增提交。
-- 合并冲突仅出现在 `hermes_cli/profiles.py`：保留本项目的安全 profile 归档辅助函数，同时保留官方 profile 实现；未覆盖 HK worker、三端部署、WebSocket worker 通道或调度员/worker 角色边界。
+- 已从 `upstream/main` 同步到官方最新提交 `91608eb20e`，本地以合并提交 `f7891d6aaf` 完成整合；最终修复提交为 `9d6aa62ef8`。推送前后均以 `git rev-list --left-right --count HEAD...upstream/main` 核验右侧差异为 `0`，表示没有漏掉上游新增提交。
+- 本次合并冲突仅出现在 `agent/agent_runtime_helpers.py` 的桌面预览工具清单：保留官方 `desktop_preview`、`drive_preview`、`annotate_preview`，并保留旧实现代码但不再把已下线的 `read_preview` 注册为独立后钩子工具；未覆盖 HK worker、三端部署、WebSocket worker 通道或调度员/worker 角色边界。
 - 合并后重新执行协作、云文件、受管资源、云部署资产和安装拓扑回归：`346 passed, 7 skipped, 44 subtests passed`。
 - 合并后的 Bot Mode 官方接口回归仍通过：`tests/hermes_cli/test_web_server.py -k "bot_"` 为 `8 passed`（含 relay、头像生成与 Petdex 选择）；部署资产回归为 `60 passed`（含 worker connector 隔离断言）。
 - 上游同步采用直接验证后的 fast-forward/merge 推送到本项目 `main`，不创建审阅者或 Codex 审查回合；推送完成后应再次确认 `HEAD...origin/main` 为 `0 0`。
+
+### 2026-08-29 二次基础回归
+
+- iOS Hermes：`pnpm typecheck`、`pnpm contract:check` 与全量 `pnpm test` 均通过，`805 passed / 0 failed`。
+- 后端合并受影响回归：`495 passed / 0 failed`；Windows 高分辨率进度围栏回归与可选
+  `flush_token_counts` 数据库适配器均已修复，随后针对性测试通过且不再产生线程未处理异常。
+- `uv run ruff check` 覆盖本次运行时、认证安全和测试改动，全部通过。Windows 环境未执行
+  Xcode 原生编译；iOS 原生编译仍需 macOS CI 或签名构建机验证。
 
 本次同步与角色重构已运行并通过：
 
