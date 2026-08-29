@@ -277,3 +277,10 @@ uv run ruff check hermes_runtime hermes_services plugins/collaboration/dashboard
 - 后端 `e8c73a4408` 已推送；本批整合回归 `394 passed, 8 skipped, 44 subtests`，ruff、
   py_compile、Node syntax 检查通过。Windows 仍不能替代 macOS Xcode、真机、APNs 及
   HK/DBB3/PC 生产网络验收。
+
+### 2026-08-30 续审：协作成员 hosted-turn quota
+
+- 协作房间非 owner 成员最多同时运行 4 个 hosted turn；`sender_id` 随 room request 持久化，
+  新 request id 不能绕过资源边界，owner 仍走正常 gateway quota。
+- `f3dd45f11c` 已推送；完整 dashboard 回归 `201 passed, 7 skipped, 44 subtests`，新增
+  跨账号成员 quota 测试通过。
