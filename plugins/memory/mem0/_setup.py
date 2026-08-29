@@ -191,37 +191,56 @@ def build_oss_config(flags: dict[str, str]) -> tuple[dict, dict[str, str]]:
 
 
 def _write_env(env_path: Path, env_writes: dict[str, str]) -> None:
-    """Append or update env vars in .env file."""
+    """Append or update env vars in ``.env`` atomically and owner-only.
+
+    Setup can run beside the gateway/dashboard, so the read/merge/replace
+    transaction must use the same cross-process advisory lock as the canonical
+    config writer.  ``Path.write_text`` left a partially-written secret file
+    on interruption and allowed a permissive pre-existing mode to survive.
+    """
+    if not env_writes:
+        return
+    from hermes_runtime.config import config_write_lock
+    from utils import atomic_write_text
+
     env_path.parent.mkdir(parents=True, exist_ok=True)
-    existing_lines: list[str] = []
-    if env_path.exists():
-        # Read as UTF-8 (BOM-tolerant), matching the canonical .env readers in
-        # hermes_cli/config.py. read_text() with no encoding falls back to the
-        # system locale (cp1252/GBK on Windows): it mangles or crashes on
-        # non-ASCII values while copying existing lines through, and a BOM'd
-        # first line would fail the key match and get duplicated.
-        existing_lines = env_path.read_text(
-            encoding="utf-8-sig"
-        ).splitlines()
+    with config_write_lock(env_path):
+        existing_lines: list[str] = []
+        if env_path.exists():
+            # Read as UTF-8 (BOM-tolerant), matching the canonical .env readers
+            # in hermes_cli/config.py.  The lock covers this read as well as
+            # the replacement so a sibling writer's key cannot be lost.
+            existing_lines = env_path.read_text(encoding="utf-8-sig").splitlines()
 
-    updated_keys: set[str] = set()
-    new_lines: list[str] = []
-    for line in existing_lines:
-        key_match = line.split("=", 1)[0].strip() if "=" in line and not line.startswith("#") else None
-        if key_match and key_match in env_writes:
-            new_lines.append(f"{key_match}={env_writes[key_match]}")
-            updated_keys.add(key_match)
-        else:
-            new_lines.append(line)
-    for k, v in env_writes.items():
-        if k not in updated_keys:
-            new_lines.append(f"{k}={v}")
+        updated_keys: set[str] = set()
+        new_lines: list[str] = []
+        for line in existing_lines:
+            key_match = (
+                line.split("=", 1)[0].strip()
+                if "=" in line and not line.startswith("#")
+                else None
+            )
+            if key_match and key_match in env_writes:
+                new_lines.append(f"{key_match}={env_writes[key_match]}")
+                updated_keys.add(key_match)
+            else:
+                new_lines.append(line)
+        for key, value in env_writes.items():
+            if key not in updated_keys:
+                new_lines.append(f"{key}={value}")
 
-    env_path.write_text("\n".join(new_lines) + "\n", encoding="utf-8")
+        atomic_write_text(
+            env_path,
+            "\n".join(new_lines) + "\n",
+            encoding="utf-8",
+            mode=0o600,
+        )
 
 
 def _save_mem0_json(hermes_home: str, data: dict) -> None:
-    """Merge-write to mem0.json."""
+    """Merge-write to mem0.json atomically."""
+    from utils import atomic_json_write
+
     config_path = Path(hermes_home) / "mem0.json"
     existing = {}
     if config_path.exists():
@@ -230,7 +249,7 @@ def _save_mem0_json(hermes_home: str, data: dict) -> None:
         except Exception:
             pass
     existing.update(data)
-    config_path.write_text(json.dumps(existing, indent=2) + "\n", encoding="utf-8")
+    atomic_json_write(config_path, existing, mode=0o600)
 
 
 def _setup_platform(hermes_home: str, config: dict, flags: dict[str, str]) -> None:

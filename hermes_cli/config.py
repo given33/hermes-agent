@@ -30,6 +30,7 @@ import tempfile
 import threading
 import time
 import unicodedata
+from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Dict, Any, Optional, List, Tuple, Set
@@ -304,6 +305,26 @@ _RAW_CONFIG_CACHE: Dict[str, Tuple[int, int, Dict[str, Any]]] = {}
 # calls read_raw_config. Also covers mutation of the module-level cache
 # dicts above.
 _CONFIG_LOCK = threading.RLock()
+
+
+@contextmanager
+def _cross_process_write_lock(path: Path):
+    """Serialize config/dotenv read-modify-write transactions across processes.
+
+    ``hermes_cli.config`` is still the compatibility import used by the CLI,
+    gateway, and most plugins.  The newer runtime module owns the shared
+    advisory-lock implementation; delegate to it here so both import paths
+    protect the same on-disk files without maintaining two subtly different
+    lock protocols.  If the optional compatibility module cannot be imported,
+    the local ``_CONFIG_LOCK`` remains the safe in-process fallback.
+    """
+    try:
+        from hermes_runtime.config import config_write_lock
+    except Exception:
+        yield
+        return
+    with config_write_lock(Path(path)):
+        yield
 # Env var names written to .env that aren't in OPTIONAL_ENV_VARS
 # (managed by setup/provider flows directly).
 _EXTRA_ENV_KEYS = frozenset({
@@ -4032,7 +4053,7 @@ _COMMENTED_SECTIONS = """
 """
 
 
-def save_config(
+def _save_config_unlocked(
     config: Dict[str, Any],
     *,
     strip_defaults: bool = True,
@@ -4146,6 +4167,25 @@ def save_config(
         _secure_file(config_path)
         _RAW_CONFIG_CACHE.pop(str(config_path), None)
         _LAST_EXPANDED_CONFIG_BY_PATH[str(config_path)] = copy.deepcopy(current_normalized)
+
+
+def save_config(
+    config: Dict[str, Any],
+    *,
+    strip_defaults: bool = True,
+    preserve_keys: Optional[Set[Tuple[str, ...]]] = None,
+    merge_existing: bool = False,
+):
+    """Persist config under the cross-process mutation lock."""
+    # Resolve the lock path before entering the compatibility implementation;
+    # ``_save_config_unlocked`` performs the full read/normalize/write cycle.
+    with _cross_process_write_lock(get_config_path()):
+        return _save_config_unlocked(
+            config,
+            strip_defaults=strip_defaults,
+            preserve_keys=preserve_keys,
+            merge_existing=merge_existing,
+        )
 
 
 def _parse_env_value(raw_value: str) -> str:
@@ -4272,7 +4312,7 @@ def _sanitize_env_lines(lines: list) -> list:
     return sanitized
 
 
-def sanitize_env_file() -> int:
+def _sanitize_env_file_unlocked() -> int:
     """Read, sanitize, and rewrite ~/.hermes/.env in place.
 
     Returns the number of lines whose safe formatting was normalized. Returns
@@ -4315,6 +4355,17 @@ def sanitize_env_file() -> int:
     _secure_file(env_path)
     invalidate_env_cache()
     return fixes
+
+
+def sanitize_env_file() -> int:
+    """Normalize ``.env`` while excluding concurrent writers."""
+    return _sanitize_env_file_locked()
+
+
+def _sanitize_env_file_locked() -> int:
+    env_path = get_env_path()
+    with _cross_process_write_lock(env_path):
+        return _sanitize_env_file_unlocked()
 
 
 def _check_non_ascii_credential(key: str, value: str) -> str:
@@ -4403,7 +4454,7 @@ def _env_line_defines_key(
     ) == _env_var_policy_name(key, is_windows=is_windows)
 
 
-def save_env_value(key: str, value: str):
+def _save_env_value_unlocked(key: str, value: str):
     """Save or update a value in ~/.hermes/.env."""
     if is_managed():
         managed_error(f"set {key}")
@@ -4475,11 +4526,12 @@ def save_env_value(key: str, value: str):
             f.flush()
             os.fsync(f.fileno())
         atomic_replace(tmp_path, env_path)
-        # Preserve the original file mode (e.g. 0640 for Docker volume mounts)
-        # instead of letting _secure_file unconditionally tighten to 0600.
+        # Credential-bearing files must never retain group/world read bits.
+        # Docker mounts may start at 0640/0644, but a rotation is an explicit
+        # secret write, so publish owner-only permissions after replacement.
         if original_mode is not None:
             try:
-                os.chmod(env_path, original_mode)
+                os.chmod(env_path, 0o600)
             except OSError:
                 pass
         else:
@@ -4493,6 +4545,12 @@ def save_env_value(key: str, value: str):
 
     os.environ[key] = value
     invalidate_env_cache()
+
+
+def save_env_value(key: str, value: str):
+    """Save or update a value in ``.env`` under a cross-process lock."""
+    with _cross_process_write_lock(get_env_path()):
+        return _save_env_value_unlocked(key, value)
 
 
 def custom_endpoint_key_env(identity: str) -> str:
@@ -4514,7 +4572,7 @@ def custom_endpoint_key_env(identity: str) -> str:
     return f"HERMES_CUSTOM_{slug}_API_KEY" if slug else "HERMES_CUSTOM_API_KEY"
 
 
-def remove_env_value(key: str) -> bool:
+def _remove_env_value_unlocked(key: str) -> bool:
     """Remove a key from ~/.hermes/.env and os.environ.
 
     Returns True if the key was found and removed, False otherwise.
@@ -4565,12 +4623,10 @@ def remove_env_value(key: str) -> bool:
                 f.flush()
                 os.fsync(f.fileno())
             atomic_replace(tmp_path, env_path)
-            # Preserve the original file mode (e.g. 0640 for Docker volume
-            # mounts) instead of letting _secure_file unconditionally tighten
-            # to 0600. Mirrors save_env_value().
+            # Keep secret-bearing .env files owner-only after rotation.
             if original_mode is not None:
                 try:
-                    os.chmod(env_path, original_mode)
+                    os.chmod(env_path, 0o600)
                 except OSError:
                     pass
             else:
@@ -4585,6 +4641,12 @@ def remove_env_value(key: str) -> bool:
     os.environ.pop(key, None)
     invalidate_env_cache()
     return found
+
+
+def remove_env_value(key: str) -> bool:
+    """Remove a value from ``.env`` under a cross-process lock."""
+    with _cross_process_write_lock(get_env_path()):
+        return _remove_env_value_unlocked(key)
 
 
 def save_anthropic_oauth_token(value: str, save_fn=None):

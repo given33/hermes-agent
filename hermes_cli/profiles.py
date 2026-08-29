@@ -2315,100 +2315,18 @@ def export_profile(name: str, output_path: str, extra_files: Optional[Dict[str, 
 
 
 def _normalize_profile_archive_parts(member_name: str) -> List[str]:
-    """Return safe path parts for a profile archive member."""
-    normalized_name = member_name.replace("\\", "/")
-    posix_path = PurePosixPath(normalized_name)
-    windows_path = PureWindowsPath(member_name)
-
-    if (
-        not normalized_name
-        or posix_path.is_absolute()
-        or windows_path.is_absolute()
-        or windows_path.drive
-    ):
-        raise ValueError(f"Unsafe archive member path: {member_name}")
-
-    parts = [part for part in posix_path.parts if part not in {"", "."}]
-    if not parts or any(part == ".." for part in parts):
-        raise ValueError(f"Unsafe archive member path: {member_name}")
-    return parts
+    """Backward-compatible alias for the shared archive path policy."""
+    return normalize_archive_parts(member_name)
 
 
 def _safe_extract_profile_archive(archive: Path, destination: Path) -> None:
-    """Extract a profile archive without allowing path escapes or links."""
-    import tarfile
-
-    # Profile archives are operator-supplied compressed trees.  Bound both the
-    # compressed upload and logical expansion so a small bomb cannot exhaust
-    # disk or hold the import executor indefinitely.
-    _MAX_ARCHIVE_BYTES = 256 * 1024 * 1024
-    _MAX_ARCHIVE_MEMBERS = 20_000
-    _MAX_MEMBER_BYTES = 64 * 1024 * 1024
-    _MAX_EXPANDED_BYTES = 512 * 1024 * 1024
-    if archive.stat().st_size > _MAX_ARCHIVE_BYTES:
-        raise ValueError("Profile archive exceeds 256 MiB")
-
-    expanded_bytes = 0
-    with tarfile.open(archive, "r:gz") as tf:
-        members = tf.getmembers()
-        if len(members) > _MAX_ARCHIVE_MEMBERS:
-            raise ValueError("Profile archive contains too many entries")
-        for member in members:
-            parts = _normalize_profile_archive_parts(member.name)
-            target = destination.joinpath(*parts)
-
-            if member.isdir():
-                target.mkdir(parents=True, exist_ok=True)
-                continue
-
-            if not member.isfile():
-                raise ValueError(
-                    f"Unsupported archive member type: {member.name}"
-                )
-
-            target.parent.mkdir(parents=True, exist_ok=True)
-            extracted = tf.extractfile(member)
-            if extracted is None:
-                raise ValueError(f"Cannot read archive member: {member.name}")
-
-            if member.size > _MAX_MEMBER_BYTES:
-                raise ValueError(f"Archive member exceeds 64 MiB: {member.name}")
-            expanded_bytes += member.size
-            if expanded_bytes > _MAX_EXPANDED_BYTES:
-                raise ValueError("Profile archive expands beyond 512 MiB")
-
-            with extracted, open(target, "wb") as dst:
-                shutil.copyfileobj(extracted, dst)
-
-            try:
-                os.chmod(target, member.mode & 0o777)
-            except OSError:
-                pass
+    """Backward-compatible wrapper around the shared bounded extractor."""
+    safe_extract_targz(archive, destination)
 
 
 def _inspect_profile_archive_roots(archive: Path) -> set[str]:
-    """Return the archive's top-level directory names.
-
-    Profile imports expect exactly one root directory. Inspecting the archive
-    before extraction lets us stage the import safely instead of mutating a
-    live profile tree first and reconciling names later.
-    """
-    import tarfile
-
-    with tarfile.open(archive, "r:gz") as tf:
-        top_dirs = {
-            parts[0]
-            for member in tf.getmembers()
-            for parts in [_normalize_profile_archive_parts(member.name)]
-            if len(parts) > 1 or member.isdir()
-        }
-        if not top_dirs:
-            top_dirs = {
-                _normalize_profile_archive_parts(member.name)[0]
-                for member in tf.getmembers()
-                if member.isdir()
-            }
-    return top_dirs
+    """Backward-compatible alias for the shared archive root inspector."""
+    return archive_root_dirs(archive)
 
 
 def import_profile(archive_path: str, name: Optional[str] = None) -> Path:

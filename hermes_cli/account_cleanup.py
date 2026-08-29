@@ -97,7 +97,13 @@ def purge_account_owned_cloud_data(
 def _cleanup_generation_is_current(owner_id: str, account_generation: str) -> bool:
     generation = str(account_generation or "").strip()
     if not generation:
-        return True
+        # The generation is the deletion fence.  Treating an omitted value as
+        # "current" makes a directly-called destructive helper equivalent to
+        # an unscoped owner delete and can replay an old tombstone against a
+        # newly registered account.  The audited cloud boundary resolves the
+        # active generation before invoking these helpers; every lower-level
+        # caller must provide that proof explicitly.
+        raise ValueError("account_generation is required for account cleanup")
     from hermes_cli.dashboard_auth.mobile_device_store import MobileDeviceStore
 
     active = MobileDeviceStore().account_generation(owner_id, create=False)
@@ -274,7 +280,7 @@ def _legacy_cleanup_path_allowed(path: Path, profile_root: Path) -> bool:
 def purge_owner_operational_state(
     owner_id: str,
     *,
-    account_generation: str = "",
+    account_generation: str,
 ) -> dict[str, Any]:
     """Remove account-scoped approvals, session branches, and workflows."""
 
@@ -282,6 +288,8 @@ def purge_owner_operational_state(
     if not normalized:
         raise ValueError("owner_id is required")
     generation = str(account_generation or "").strip()
+    if not generation:
+        raise ValueError("account_generation is required for account cleanup")
     if not _cleanup_generation_is_current(normalized, generation):
         return {
             "skipped_stale_generation": True,
@@ -359,7 +367,7 @@ def purge_owner_operational_state(
 def purge_owner_model_configuration(
     owner_id: str,
     *,
-    account_generation: str = "",
+    account_generation: str,
 ) -> dict[str, int | bool | str]:
     """Remove account-owned model assignments and inline credentials.
 
@@ -372,6 +380,8 @@ def purge_owner_model_configuration(
         raise ValueError("owner_id is required")
     normalized_owner = str(owner_id).strip()
     generation = str(account_generation or "").strip()
+    if not generation:
+        raise ValueError("account_generation is required for account cleanup")
     if not _cleanup_generation_is_current(normalized_owner, generation):
         return {
             "profiles_changed": 0,

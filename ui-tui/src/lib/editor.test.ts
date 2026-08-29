@@ -4,7 +4,7 @@ import { delimiter, join } from 'node:path'
 
 import { beforeEach, describe, expect, it } from 'vitest'
 
-import { resolveEditor } from './editor.js'
+import { resolveEditor, tokenizeEditorCommand } from './editor.js'
 
 const exe = (dir: string, name: string): string => {
   const path = join(dir, name)
@@ -33,6 +33,33 @@ describe('resolveEditor', () => {
   it('shell-tokenizes editors with arguments', () => {
     expect(resolveEditor({ EDITOR: 'code --wait', PATH: dir })).toEqual(['code', '--wait'])
     expect(resolveEditor({ PATH: dir, VISUAL: 'emacsclient -t' })).toEqual(['emacsclient', '-t'])
+  })
+
+  it('keeps quoted executable paths and arguments containing spaces intact', () => {
+    expect(
+      resolveEditor(
+        { EDITOR: '"C:\\Program Files\\Microsoft VS Code\\Code.cmd" --wait --reuse-window', PATH: dir },
+        'win32'
+      )
+    ).toEqual(['C:\\Program Files\\Microsoft VS Code\\Code.cmd', '--wait', '--reuse-window'])
+    expect(tokenizeEditorCommand("'/Applications/My Editor/bin/code' '--wait for attach'", 'darwin')).toEqual([
+      '/Applications/My Editor/bin/code',
+      '--wait for attach'
+    ])
+  })
+
+  it('repairs an unquoted Windows executable path when its extension is unambiguous', () => {
+    expect(resolveEditor({ EDITOR: 'C:\\Program Files\\Editor\\editor.exe --wait', PATH: dir }, 'win32')).toEqual([
+      'C:\\Program Files\\Editor\\editor.exe',
+      '--wait'
+    ])
+  })
+
+  it('falls back when an explicit command has an unterminated quote or empty executable', () => {
+    const expected = exe(dir, 'editor')
+
+    expect(resolveEditor({ EDITOR: '"broken command', PATH: dir }, 'linux')).toEqual([expected])
+    expect(resolveEditor({ EDITOR: '""', PATH: dir }, 'linux')).toEqual([expected])
   })
 
   it('ignores whitespace-only env vars', () => {

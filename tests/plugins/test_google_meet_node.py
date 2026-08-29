@@ -84,6 +84,63 @@ def test_server_ensure_token_generates_and_persists(tmp_path):
     assert "generated_at" in data
 
 
+def test_server_start_bot_preserves_realtime_controls_and_rejects_out_dir(tmp_path, monkeypatch):
+    """Remote RPC must not downgrade Bot Mode or write outside node storage."""
+    from plugins.google_meet.node.server import NodeServer
+
+    server = NodeServer(token_path=tmp_path / "tok.json")
+    token = server.ensure_token()
+    captured = {}
+
+    class _PM:
+        @staticmethod
+        def start(**kwargs):
+            captured.update(kwargs)
+            return {"ok": True, "mode": kwargs.get("mode")}
+
+    import plugins.google_meet.process_manager as pm
+    monkeypatch.setattr(pm, "start", _PM.start)
+
+    response = asyncio.run(
+        server._handle_request(
+            {
+                "type": "start_bot",
+                "id": "r1",
+                "token": token,
+                "payload": {
+                    "url": "https://meet.google.com/abc-defg-hij",
+                    "mode": "realtime",
+                    "realtime_model": "gpt-realtime",
+                    "realtime_voice": "alloy",
+                    "realtime_instructions": "answer concisely",
+                },
+            }
+        )
+    )
+    assert response["type"] == "response"
+    assert captured["mode"] == "realtime"
+    assert captured["realtime_model"] == "gpt-realtime"
+    assert captured["realtime_voice"] == "alloy"
+    assert captured["realtime_instructions"] == "answer concisely"
+    assert "out_dir" not in captured
+
+    rejected = asyncio.run(
+        server._handle_request(
+            {
+                "type": "start_bot",
+                "id": "r2",
+                "token": token,
+                "payload": {
+                    "url": "https://meet.google.com/abc-defg-hij",
+                    "out_dir": str(tmp_path / "outside"),
+                },
+            }
+        )
+    )
+    assert rejected["type"] == "error"
+    assert "out_dir" in rejected["error"]
+
+
 def _run(coro):
     return asyncio.new_event_loop().run_until_complete(coro) if False else asyncio.run(coro)
 
@@ -183,5 +240,4 @@ def test_cli_approve_list_remove(capsys):
     rc = args.func(args)
     assert rc == 0
     assert NodeRegistry().get("mac") is None
-
 

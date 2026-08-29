@@ -1,4 +1,5 @@
-import { copyFile, mkdir, readFile, writeFile } from 'node:fs/promises'
+import { randomUUID } from 'node:crypto'
+import { copyFile, mkdir, readFile, rename, unlink, writeFile } from 'node:fs/promises'
 import { homedir } from 'node:os'
 
 export type SupportedTerminal = 'cursor' | 'vscode' | 'windsurf'
@@ -7,6 +8,8 @@ export type FileOps = {
   copyFile: typeof copyFile
   mkdir: typeof mkdir
   readFile: typeof readFile
+  rename: typeof rename
+  unlink: typeof unlink
   writeFile: typeof writeFile
 }
 
@@ -23,7 +26,53 @@ export type TerminalSetupResult = {
   success: boolean
 }
 
-const DEFAULT_FILE_OPS: FileOps = { copyFile, mkdir, readFile, writeFile }
+const DEFAULT_FILE_OPS: FileOps = { copyFile, mkdir, readFile, rename, unlink, writeFile }
+
+const WINDOWS_RENAME_RETRY_CODES = new Set(['EACCES', 'EBUSY', 'EPERM'])
+
+async function renameWithRetry(source: string, target: string, ops: FileOps): Promise<void> {
+  for (let attempt = 0; ; attempt++) {
+    try {
+      await ops.rename(source, target)
+
+      return
+    } catch (error) {
+      const code = (error as NodeJS.ErrnoException | undefined)?.code
+
+      if (!WINDOWS_RENAME_RETRY_CODES.has(code ?? '') || attempt >= 4) {
+        throw error
+      }
+
+      await new Promise(resolve => setTimeout(resolve, 20 * 2 ** attempt))
+    }
+  }
+}
+
+async function atomicWriteFile(filePath: string, content: string, ops: FileOps): Promise<void> {
+  const temporaryPath = `${filePath}.tmp-${process.pid}-${randomUUID()}`
+  let published = false
+
+  try {
+    await ops.writeFile(temporaryPath, content, {
+      encoding: 'utf8',
+      flag: 'wx',
+      flush: true,
+      mode: 0o600
+    })
+    await renameWithRetry(temporaryPath, filePath, ops)
+    published = true
+  } finally {
+    if (!published) {
+      try {
+        await ops.unlink(temporaryPath)
+      } catch (error) {
+        if ((error as NodeJS.ErrnoException | undefined)?.code !== 'ENOENT') {
+          // Cleanup is best effort; preserve the original write/rename error.
+        }
+      }
+    }
+  }
+}
 
 function joinForPlatform(_platform: NodeJS.Platform, ...parts: string[]): string {
   // Node's path.join always uses the host OS separator. Terminal setup is
@@ -360,7 +409,7 @@ export async function configureTerminalKeybindings(
     }
   }
 
-    const keybindingsFile = joinForPlatform(platform, configDir, 'keybindings.json')
+  const keybindingsFile = joinForPlatform(platform, configDir, 'keybindings.json')
 
   try {
     await ops.mkdir(configDir, { recursive: true })
@@ -429,7 +478,7 @@ export async function configureTerminalKeybindings(
       await backupFile(keybindingsFile, ops)
     }
 
-    await ops.writeFile(keybindingsFile, `${JSON.stringify(keybindings, null, 2)}\n`, 'utf8')
+    await atomicWriteFile(keybindingsFile, `${JSON.stringify(keybindings, null, 2)}\n`, ops)
 
     const parts: string[] = []
 
@@ -496,10 +545,7 @@ export async function shouldPromptForTerminalSetup(options?: {
   }
 
   try {
-    const content = await ops.readFile(
-      joinForPlatform(platform, configDir, 'keybindings.json'),
-      'utf8'
-    )
+    const content = await ops.readFile(joinForPlatform(platform, configDir, 'keybindings.json'), 'utf8')
 
     const parsed: unknown = JSON.parse(stripJsonComments(content))
 

@@ -10,6 +10,7 @@ column or table.
 """
 
 import sqlite3
+import json
 
 import pytest
 
@@ -98,3 +99,32 @@ class TestSchemaReadProbeStatements:
 
     def test_probe_statements_are_cached(self):
         assert schema_read_probe_statements() is schema_read_probe_statements()
+
+
+def test_schema_column_parser_never_replays_disk_cache_sql(tmp_path, monkeypatch):
+    """Derived migration types must come from the shipped schema only."""
+    import hermes_state_schema as schema_module
+
+    # A legacy cache file may contain arbitrary strings in the type position.
+    # The parser must not read/replay it, even when its shape looks valid.
+    cache = tmp_path / "cache" / "schema_columns.json"
+    cache.parent.mkdir()
+    cache.write_text(
+        json.dumps(
+            {
+                "schema_hash": "irrelevant",
+                "tables": {
+                    "safe": {
+                        "id": "INTEGER); DROP TABLE users; --",
+                    }
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(schema_module, "get_hermes_home", lambda: tmp_path)
+
+    schema = "CREATE TABLE safe(id INTEGER NOT NULL);"
+    parsed = SessionSchemaMixin._parse_schema_columns(schema)
+
+    assert parsed == {"safe": {"id": "INTEGER NOT NULL"}}

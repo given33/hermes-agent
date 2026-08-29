@@ -144,6 +144,7 @@ def test_stop_signals_process_and_clears_pointer(tmp_path):
         "out_dir": str(tmp_path / "x-y-z"),
         "url": "https://meet.google.com/x-y-z",
         "started_at": 0,
+        "start_time": 7,
     })
 
     alive_seq = iter([True, True, False])  # alive at first, gone after SIGTERM
@@ -158,6 +159,7 @@ def test_stop_signals_process_and_clears_pointer(tmp_path):
         sent.append((pid, sig))
 
     with patch.object(pm, "_pid_alive", side_effect=_alive), \
+         patch.object(pm, "_pid_start_time", return_value=7), \
          patch.object(pm.os, "kill", side_effect=_kill), \
          patch.object(pm.time, "sleep", lambda _s: None):
         res = pm.stop()
@@ -165,6 +167,49 @@ def test_stop_signals_process_and_clears_pointer(tmp_path):
     assert res["ok"] is True
     assert (11111, signal.SIGTERM) in sent
     # .active.json cleared
+    assert pm._read_active() is None
+
+
+def test_stop_refuses_to_signal_reused_pid(tmp_path):
+    """A live PID with a different start fingerprint is never signalled."""
+    from plugins.google_meet import process_manager as pm
+
+    pm._write_active({
+        "pid": 22222,
+        "meeting_id": "x-y-z",
+        "out_dir": str(tmp_path / "x-y-z"),
+        "url": "https://meet.google.com/x-y-z",
+        "started_at": 0,
+        "start_time": 11,
+    })
+    with patch.object(pm, "_pid_alive", return_value=True), \
+         patch.object(pm, "_pid_start_time", return_value=12), \
+         patch.object(pm.os, "kill") as kill_mock:
+        res = pm.stop()
+
+    assert res["ok"] is False
+    assert "identity" in res["reason"]
+    kill_mock.assert_not_called()
+    assert pm._read_active() is None
+
+
+def test_stop_refuses_to_signal_legacy_pointer(tmp_path):
+    """Pointers written before start-time fingerprints fail closed."""
+    from plugins.google_meet import process_manager as pm
+
+    pm._write_active({
+        "pid": 33333,
+        "meeting_id": "x-y-z",
+        "out_dir": str(tmp_path / "x-y-z"),
+        "url": "https://meet.google.com/x-y-z",
+        "started_at": 0,
+    })
+    with patch.object(pm, "_pid_alive", return_value=True), \
+         patch.object(pm.os, "kill") as kill_mock:
+        res = pm.stop()
+
+    assert res["ok"] is False
+    kill_mock.assert_not_called()
     assert pm._read_active() is None
 
 
@@ -296,5 +341,3 @@ def test_cmd_install_refuses_windows(capsys):
     assert rc == 1
     out = capsys.readouterr().out
     assert "Windows" in out
-
-

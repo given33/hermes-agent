@@ -105,7 +105,7 @@ from gateway.status import (
     read_runtime_status,
     resolve_gateway_liveness,
 )
-from utils import env_var_enabled
+from utils import atomic_write_text, env_var_enabled
 
 try:
     from fastapi import (
@@ -2250,6 +2250,7 @@ _FS_TEXT_PREVIEW_MAX_BYTES = 512 * 1024
 # non-truncated text (<= the preview cap), so this is a safety ceiling against
 # a pasted-in megablob, not the expected payload size.
 _FS_TEXT_WRITE_MAX_BYTES = 8 * 1024 * 1024
+_FS_ALLOWED_ROOTS_ENV = "HERMES_DASHBOARD_FS_ROOTS"
 _FS_PREVIEW_LANGUAGE_BY_EXT = {
     ".c": "c",
     ".conf": "ini",
@@ -2326,6 +2327,68 @@ def _fs_path(raw_path: str) -> Path:
         raise HTTPException(status_code=400, detail="Invalid path")
 
 
+def _fs_allowed_roots(request: Request) -> tuple[Path, ...]:
+    """Return roots the remote spot editor may inspect or mutate.
+
+    The legacy endpoint historically accepted any absolute path. Keep normal
+    workspace editing available while constraining authenticated/remote
+    requests to Hermes state, the checked-out project, the configured terminal
+    cwd, and explicit operator roots.
+    """
+    raw = os.environ.get(_FS_ALLOWED_ROOTS_ENV, "")
+    if raw.strip():
+        candidates = [
+            Path(part.strip()).expanduser()
+            for part in raw.split(os.pathsep)
+            if part.strip()
+        ]
+    else:
+        candidates = [PROJECT_ROOT, get_hermes_home()]
+        try:
+            terminal_raw = str(
+                (load_config().get("terminal") or {}).get("cwd") or ""
+            ).strip()
+            if terminal_raw and terminal_raw not in {".", "auto", "cwd"}:
+                candidates.append(Path(terminal_raw).expanduser())
+        except Exception:
+            pass
+
+    # Loopback/no-auth dashboards retain the local editor's historical
+    # workspace picker. The broad roots are unavailable once auth is enabled.
+    if _local_dashboard_request(request):
+        candidates.extend((Path.home(), Path(tempfile.gettempdir()), Path.cwd()))
+
+    roots: list[Path] = []
+    seen: set[str] = set()
+    for candidate in candidates:
+        try:
+            resolved = candidate.resolve(strict=False)
+        except (OSError, RuntimeError):
+            continue
+        key = os.path.normcase(str(resolved))
+        if key not in seen and resolved.is_dir():
+            seen.add(key)
+            roots.append(resolved)
+    return tuple(roots)
+
+
+def _fs_scoped_path(
+    raw_path: str, request: Request, *, for_write: bool = False
+) -> Path:
+    """Resolve a filesystem path and require an approved root."""
+    target = _fs_path(raw_path)
+    if _is_sensitive_path(target):
+        raise HTTPException(status_code=403, detail="Path is not accessible")
+    probe = target
+    if for_write and not target.exists():
+        probe = target.parent
+    if not any(_path_is_under(root, probe) for root in _fs_allowed_roots(request)):
+        raise HTTPException(
+            status_code=403, detail="Path outside approved filesystem roots"
+        )
+    return target
+
+
 def _fs_mime_type(path: Path) -> str:
     suffix = path.suffix.lower()
     if suffix in _FS_MIME_TYPES:
@@ -2343,8 +2406,14 @@ def _fs_looks_binary(data: bytes) -> bool:
     return suspicious / len(data) > 0.12
 
 
-def _fs_regular_file(path: Path) -> tuple[Path, os.stat_result]:
-    target = _fs_path(str(path))
+def _fs_regular_file(
+    path: Path, request: Request | None = None
+) -> tuple[Path, os.stat_result]:
+    target = (
+        _fs_scoped_path(str(path), request)
+        if request is not None
+        else _fs_path(str(path))
+    )
     # Same sensitive-path interception as /api/fs/download (#57505):
     # read-text and read-data-url must not become a credential-exfiltration
     # bypass for paths the download endpoint already blocks.
@@ -3117,17 +3186,24 @@ async def delete_managed_file(payload: ManagedFileDelete, request: Request):
 
 
 @app.get("/api/fs/list")
-async def fs_list(path: str):
-    target = _fs_path(path)
+async def fs_list(path: str, request: Request):
+    target = _fs_scoped_path(path, request)
     try:
         entries = []
         with os.scandir(target) as scan:
             for entry in scan:
-                if entry.name in _FS_READDIR_HIDDEN:
+                if entry.name in _FS_READDIR_HIDDEN or _is_sensitive_filename(entry.name):
+                    continue
+                entry_path = target / entry.name
+                try:
+                    entry_target = _fs_scoped_path(str(entry_path), request)
+                except HTTPException:
+                    # Do not disclose symlink escapes or credential trees
+                    # merely because they appear in a browsed directory.
                     continue
                 entries.append({
                     "name": entry.name,
-                    "path": str(target / entry.name),
+                    "path": str(entry_target),
                     "isDirectory": entry.is_dir(follow_symlinks=False),
                 })
         entries.sort(key=lambda item: (not item["isDirectory"], item["name"].lower(), item["name"]))
@@ -3143,8 +3219,8 @@ async def fs_list(path: str):
 
 
 @app.get("/api/fs/read-text")
-async def fs_read_text(path: str):
-    target, st = _fs_regular_file(_fs_path(path))
+async def fs_read_text(path: str, request: Request):
+    target, st = _fs_regular_file(Path(path), request)
     if st.st_size > _FS_TEXT_SOURCE_MAX_BYTES:
         raise HTTPException(status_code=413, detail="File too large")
     bytes_to_read = min(st.st_size, _FS_TEXT_PREVIEW_MAX_BYTES)
@@ -3167,7 +3243,7 @@ async def fs_read_text(path: str):
 
 
 @app.post("/api/fs/write-text")
-async def fs_write_text(payload: FsWriteText):
+async def fs_write_text(payload: FsWriteText, request: Request):
     """Overwrite (or create) a UTF-8 text file for the in-app spot editor.
 
     Mirrors the local Electron ``hermes:fs:writeText`` hardening: the path is
@@ -3178,7 +3254,7 @@ async def fs_write_text(payload: FsWriteText):
     original. Stale-on-disk detection is the client's job (re-read before save),
     so both transports behave identically.
     """
-    target = _fs_path(payload.path)
+    target = _fs_scoped_path(payload.path, request, for_write=True)
     text = payload.content or ""
     if len(text.encode("utf-8")) > _FS_TEXT_WRITE_MAX_BYTES:
         raise HTTPException(status_code=413, detail="Content too large")
@@ -3199,23 +3275,19 @@ async def fs_write_text(payload: FsWriteText):
     if not target.parent.is_dir():
         raise HTTPException(status_code=400, detail="Parent directory does not exist")
 
-    tmp = target.with_name(f".{target.name}.hermes-tmp-{os.getpid()}")
     try:
-        tmp.write_text(text, encoding="utf-8")
-        os.replace(tmp, target)
+        atomic_write_text(target, text, encoding="utf-8", preserve_mode=True)
     except PermissionError:
-        tmp.unlink(missing_ok=True)
         raise HTTPException(status_code=403, detail="File is not writable")
     except OSError as exc:
-        tmp.unlink(missing_ok=True)
         raise HTTPException(status_code=500, detail=f"Could not write file: {exc}")
 
     return {"ok": True, "path": str(target), "byteSize": len(text.encode("utf-8"))}
 
 
 @app.get("/api/fs/read-data-url")
-async def fs_read_data_url(path: str):
-    target, st = _fs_regular_file(_fs_path(path))
+async def fs_read_data_url(path: str, request: Request):
+    target, st = _fs_regular_file(Path(path), request)
     if st.st_size > _FS_DATA_URL_MAX_BYTES:
         raise HTTPException(status_code=413, detail="File too large")
     try:
@@ -3228,8 +3300,8 @@ async def fs_read_data_url(path: str):
 
 
 @app.get("/api/fs/download")
-async def fs_download(path: str):
-    target, _st = _fs_regular_file(_fs_path(path))
+async def fs_download(path: str, request: Request):
+    target, _st = _fs_regular_file(Path(path), request)
     if _is_sensitive_path(target):
         raise HTTPException(status_code=403, detail="Access to sensitive files is not allowed")
     return FileResponse(
@@ -3241,8 +3313,8 @@ async def fs_download(path: str):
 
 
 @app.get("/api/fs/git-root")
-async def fs_git_root(path: str):
-    target = _fs_path(path)
+async def fs_git_root(path: str, request: Request):
+    target = _fs_scoped_path(path, request)
     try:
         st = target.stat()
         start = target if stat.S_ISDIR(st.st_mode) else target.parent
@@ -3252,8 +3324,8 @@ async def fs_git_root(path: str):
 
 
 @app.get("/api/fs/default-cwd")
-async def fs_default_cwd():
-    cwd = _fs_default_cwd()
+async def fs_default_cwd(request: Request):
+    cwd = str(_fs_scoped_path(_fs_default_cwd(), request))
     return {"cwd": cwd, "branch": _fs_git_branch(cwd)}
 
 
@@ -14635,30 +14707,33 @@ def _new_dashboard_backup_path() -> Path:
 
 @app.post("/api/ops/backup")
 async def run_backup(body: BackupRequest):
+    if (body.output or "").strip():
+        raise HTTPException(
+            status_code=400,
+            detail="Custom backup output paths are not allowed from the dashboard",
+        )
+
     args = ["backup"]
-    archive: Optional[Path] = None
-    output = (body.output or "").strip()
-    if output:
-        args.extend(["-o", output])
-    else:
-        archive = _new_dashboard_backup_path()
-        try:
-            archive.parent.mkdir(parents=True, exist_ok=True)
-        except OSError as exc:
-            raise HTTPException(
-                status_code=500,
-                detail=f"Could not create backup directory: {exc}",
-            )
-        args.extend(["-o", str(archive)])
+    archive = _new_dashboard_backup_path()
+    try:
+        archive.parent.mkdir(parents=True, exist_ok=True)
+    except OSError as exc:
+        raise HTTPException(
+            status_code=500,
+            detail=f"Could not create backup directory: {exc}",
+        )
+    args.extend(["-o", str(archive)])
     try:
         proc = _spawn_hermes_action(args, "backup")
     except Exception as exc:
         _log.exception("Failed to spawn backup")
         raise HTTPException(status_code=500, detail=f"Failed to run backup: {exc}")
-    response = {"ok": True, "pid": proc.pid, "name": "backup"}
-    if archive is not None:
-        response["archive"] = str(archive)
-    return response
+    return {
+        "ok": True,
+        "pid": proc.pid,
+        "name": "backup",
+        "archive": str(archive),
+    }
 
 
 @app.get("/api/ops/backup/download")

@@ -1,6 +1,8 @@
+import { lookup as dnsLookup } from 'node:dns/promises'
 import { isIP } from 'node:net'
 
 import { useEffect, useMemo, useState } from 'react'
+import { Agent } from 'undici'
 
 const titleCache = new Map<string, string>()
 const titleInflight = new Map<string, Promise<string>>()
@@ -10,6 +12,7 @@ const TITLE_CACHE_LIMIT = 500
 const TITLE_MAX_LENGTH = 240
 const TITLE_BYTE_BUDGET = 96 * 1024
 const TITLE_TIMEOUT_MS = 5000
+const TITLE_MAX_REDIRECTS = 5
 
 const TITLE_USER_AGENT =
   'Mozilla/5.0 (Macintosh; Intel Mac OS X 14_6_0) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/136.0.0.0 Safari/537.36'
@@ -171,8 +174,11 @@ function isPrivateIpv4(value: string): boolean {
     (a === 100 && b >= 64 && b <= 127) ||
     (a === 169 && b === 254) ||
     (a === 172 && b >= 16 && b <= 31) ||
-    (a === 192 && b === 168) ||
-    (a === 198 && (b === 18 || b === 19))
+    (a === 192 && (b === 0 || b === 168)) ||
+    (a === 198 && (b === 18 || b === 19)) ||
+    (a === 198 && b === 51) ||
+    (a === 203 && b === 0) ||
+    a >= 224
   )
 }
 
@@ -239,14 +245,120 @@ function isPrivateOrLocalHost(hostname: string): boolean {
   return !normalized.includes('.')
 }
 
+type ResolvedHostAddress = {
+  address: string
+  family: 4 | 6
+}
+
+type HostResolver = (hostname: string) => Promise<ResolvedHostAddress[]>
+
+const defaultHostResolver: HostResolver = async hostname => {
+  const family = isIP(hostname)
+
+  if (family === 4 || family === 6) {
+    return [{ address: normalizeHostname(hostname), family }]
+  }
+
+  const records = await dnsLookup(hostname, { all: true, verbatim: true })
+
+  return records
+    .filter((record): record is { address: string; family: 4 | 6 } => record.family === 4 || record.family === 6)
+    .map(record => ({ address: record.address, family: record.family }))
+}
+
+let hostResolver: HostResolver = defaultHostResolver
+
+function titleFetchUrl(value: string): null | URL {
+  const url = parseUrl(value)
+
+  if (!url || !/^https?:$/.test(url.protocol) || url.username || url.password || isPrivateOrLocalHost(url.hostname)) {
+    return null
+  }
+
+  return url
+}
+
+async function resolvePublicHost(url: URL): Promise<ResolvedHostAddress[] | null> {
+  const records = await hostResolver(url.hostname)
+
+  if (!records.length) {
+    return null
+  }
+
+  for (const record of records) {
+    if (isIP(record.address) !== record.family || isPrivateOrLocalHost(record.address)) {
+      return null
+    }
+  }
+
+  return records
+}
+
+type LookupOptions = {
+  all?: boolean
+  family?: number | string
+}
+
+type LookupCallback = (
+  error: NodeJS.ErrnoException | null,
+  address: string | { address: string; family: number }[],
+  family?: number
+) => void
+
+type LookupFunction = (hostname: string, options: LookupOptions, callback: LookupCallback) => void
+
+function pinnedDispatcher(hostname: string, records: ResolvedHostAddress[]): Agent {
+  const normalizedHostname = normalizeHostname(hostname)
+
+  const lookup: LookupFunction = (requestedHostname, options, callback) => {
+    if (normalizeHostname(requestedHostname) !== normalizedHostname) {
+      const error = Object.assign(new Error('pinned DNS host mismatch'), { code: 'EHOSTUNREACH' })
+      callback(error, [])
+
+      return
+    }
+
+    const requestedFamily =
+      options.family === 'IPv4' || options.family === 'IPv6'
+        ? Number(options.family === 'IPv4' ? 4 : 6)
+        : (options.family ?? 0)
+
+    const candidates =
+      requestedFamily === 4 || requestedFamily === 6
+        ? records.filter(record => record.family === requestedFamily)
+        : records
+
+    if (!candidates.length) {
+      const error = Object.assign(new Error('pinned DNS family unavailable'), { code: 'EAI_FAMILY' })
+      callback(error, [])
+
+      return
+    }
+
+    if (options.all) {
+      callback(null, candidates)
+    } else {
+      callback(null, candidates[0]!.address, candidates[0]!.family)
+    }
+  }
+
+  return new Agent({ connect: { lookup } })
+}
+
+async function closeDispatcher(dispatcher: Agent): Promise<void> {
+  try {
+    await dispatcher.close()
+  } catch {
+    // Closing a dispatcher after a cancelled redirect/body is best effort.
+  }
+}
+
 export function isTitleFetchable(value: string): boolean {
   if (!value || SKIP_PROTO_RE.test(value)) {
     return false
   }
 
-  const url = parseUrl(value)
-
-  return Boolean(url && /^https?:$/.test(url.protocol) && !isPrivateOrLocalHost(url.hostname))
+  return titleFetchUrl(value) !== null
 }
 
 function decodeHtmlEntities(value: string): string {
@@ -335,31 +447,83 @@ function usableTitle(value: string): string {
 async function fetchHtmlTitle(normalizedUrl: string): Promise<string> {
   const controller = new AbortController()
   const timeout = setTimeout(() => controller.abort(), TITLE_TIMEOUT_MS)
+  let currentUrl = normalizedUrl
 
   try {
-    const response = await fetch(normalizedUrl, {
-      headers: {
-        Accept: 'text/html,application/xhtml+xml;q=0.9,*/*;q=0.5',
-        'Accept-Language': 'en-US,en;q=0.7',
-        'User-Agent': TITLE_USER_AGENT
-      },
-      redirect: 'follow',
-      signal: controller.signal
-    })
+    for (let redirectCount = 0; redirectCount <= TITLE_MAX_REDIRECTS; redirectCount++) {
+      const url = titleFetchUrl(currentUrl)
 
-    if (!response.ok) {
-      return ''
+      if (!url) {
+        return ''
+      }
+
+      const records = await resolvePublicHost(url)
+
+      if (!records) {
+        return ''
+      }
+
+      const dispatcher = pinnedDispatcher(url.hostname, records)
+      let response: Response
+
+      try {
+        response = await fetch(currentUrl, {
+          credentials: 'omit',
+          headers: {
+            Accept: 'text/html,application/xhtml+xml;q=0.9,*/*;q=0.5',
+            'Accept-Language': 'en-US,en;q=0.7',
+            'User-Agent': TITLE_USER_AGENT
+          },
+          redirect: 'manual',
+          signal: controller.signal,
+          dispatcher
+        } as RequestInit & { dispatcher: Agent })
+      } catch (error) {
+        await closeDispatcher(dispatcher)
+        throw error
+      }
+
+      const status = response.status
+      const isRedirect = status >= 300 && status <= 399
+
+      if (isRedirect) {
+        const location = response.headers.get('location')
+        await response.body?.cancel()
+        await closeDispatcher(dispatcher)
+
+        if (!location || redirectCount === TITLE_MAX_REDIRECTS) {
+          return ''
+        }
+
+        try {
+          currentUrl = new URL(location, currentUrl).href
+        } catch {
+          return ''
+        }
+
+        continue
+      }
+
+      try {
+        if (!response.ok) {
+          return ''
+        }
+
+        const contentType = response.headers.get('content-type')
+
+        if (contentType && !/(?:html|xml|text\/html)/i.test(contentType)) {
+          return ''
+        }
+
+        const html = await readResponseSnippet(response)
+
+        return parseHtmlTitle(html).slice(0, TITLE_MAX_LENGTH)
+      } finally {
+        await closeDispatcher(dispatcher)
+      }
     }
 
-    const contentType = response.headers.get('content-type')
-
-    if (contentType && !/(?:html|xml|text\/html)/i.test(contentType)) {
-      return ''
-    }
-
-    const html = await readResponseSnippet(response)
-
-    return parseHtmlTitle(html).slice(0, TITLE_MAX_LENGTH)
+    return ''
   } catch {
     return ''
   } finally {
@@ -437,4 +601,10 @@ export function __resetLinkTitleCache(): void {
   titleCache.clear()
   titleInflight.clear()
   titleSubs.clear()
+  hostResolver = defaultHostResolver
+}
+
+/** Test-only DNS injection; production callers always use the system resolver. */
+export function __setLinkTitleHostResolverForTests(resolver?: HostResolver): void {
+  hostResolver = resolver ?? defaultHostResolver
 }

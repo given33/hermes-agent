@@ -9,6 +9,11 @@ import {
   stripJsonComments
 } from '../lib/terminalSetup.js'
 
+const atomicFileOps = () => ({
+  rename: vi.fn().mockResolvedValue(undefined),
+  unlink: vi.fn().mockResolvedValue(undefined)
+})
+
 // Tests run from developer shells as well as CI. An inherited SSH_* variable
 // must not silently force every configure call down the remote-session reject
 // path; remote behavior is tested explicitly with per-call env objects below.
@@ -82,7 +87,7 @@ describe('configureTerminalKeybindings', () => {
     const copyFile = vi.fn().mockResolvedValue(undefined)
 
     const result = await configureTerminalKeybindings('vscode', {
-      fileOps: { copyFile, mkdir, readFile, writeFile },
+      fileOps: { copyFile, mkdir, readFile, writeFile, ...atomicFileOps() },
       homeDir: '/Users/me',
       platform: 'darwin'
     })
@@ -111,7 +116,7 @@ describe('configureTerminalKeybindings', () => {
     const copyFile = vi.fn().mockResolvedValue(undefined)
 
     const result = await configureTerminalKeybindings('vscode', {
-      fileOps: { copyFile, mkdir, readFile, writeFile },
+      fileOps: { copyFile, mkdir, readFile, writeFile, ...atomicFileOps() },
       homeDir: '/home/me',
       platform: 'linux'
     })
@@ -142,7 +147,7 @@ describe('configureTerminalKeybindings', () => {
     const copyFile = vi.fn().mockResolvedValue(undefined)
 
     const result = await configureTerminalKeybindings('cursor', {
-      fileOps: { copyFile, mkdir, readFile, writeFile },
+      fileOps: { copyFile, mkdir, readFile, writeFile, ...atomicFileOps() },
       homeDir: '/Users/me',
       platform: 'darwin'
     })
@@ -172,7 +177,7 @@ describe('configureTerminalKeybindings', () => {
     const copyFile = vi.fn().mockResolvedValue(undefined)
 
     const result = await configureTerminalKeybindings('vscode', {
-      fileOps: { copyFile, mkdir, readFile, writeFile },
+      fileOps: { copyFile, mkdir, readFile, writeFile, ...atomicFileOps() },
       homeDir: '/Users/me',
       platform: 'darwin'
     })
@@ -204,7 +209,7 @@ describe('configureTerminalKeybindings', () => {
     const copyFile = vi.fn().mockResolvedValue(undefined)
 
     const result = await configureTerminalKeybindings('vscode', {
-      fileOps: { copyFile, mkdir, readFile, writeFile },
+      fileOps: { copyFile, mkdir, readFile, writeFile, ...atomicFileOps() },
       homeDir: '/Users/me',
       platform: 'darwin'
     })
@@ -235,7 +240,7 @@ describe('configureTerminalKeybindings', () => {
     const copyFile = vi.fn().mockResolvedValue(undefined)
 
     const result = await configureTerminalKeybindings('vscode', {
-      fileOps: { copyFile, mkdir, readFile, writeFile },
+      fileOps: { copyFile, mkdir, readFile, writeFile, ...atomicFileOps() },
       homeDir: '/Users/me',
       platform: 'darwin'
     })
@@ -264,7 +269,7 @@ describe('configureTerminalKeybindings', () => {
     const copyFile = vi.fn().mockResolvedValue(undefined)
 
     const result = await configureTerminalKeybindings('vscode', {
-      fileOps: { copyFile, mkdir, readFile, writeFile },
+      fileOps: { copyFile, mkdir, readFile, writeFile, ...atomicFileOps() },
       homeDir: '/Users/me',
       platform: 'darwin'
     })
@@ -280,7 +285,7 @@ describe('configureTerminalKeybindings', () => {
     const copyFile = vi.fn().mockResolvedValue(undefined)
 
     const result = await configureTerminalKeybindings('vscode', {
-      fileOps: { copyFile, mkdir, readFile, writeFile },
+      fileOps: { copyFile, mkdir, readFile, writeFile, ...atomicFileOps() },
       homeDir: '/Users/me',
       platform: 'darwin'
     })
@@ -290,6 +295,51 @@ describe('configureTerminalKeybindings', () => {
     expect(copyFile).toHaveBeenCalledTimes(1) // backup created before writing
   })
 
+  it('fsyncs an exclusive temporary file before atomically replacing keybindings.json', async () => {
+    const mkdir = vi.fn().mockResolvedValue(undefined)
+    const readFile = vi.fn().mockResolvedValue(JSON.stringify([]))
+    const writeFile = vi.fn().mockResolvedValue(undefined)
+    const copyFile = vi.fn().mockResolvedValue(undefined)
+    const rename = vi.fn().mockResolvedValue(undefined)
+    const unlink = vi.fn().mockResolvedValue(undefined)
+    const target = '/Users/me/Library/Application Support/Code/User/keybindings.json'
+
+    const result = await configureTerminalKeybindings('vscode', {
+      fileOps: { copyFile, mkdir, readFile, rename, unlink, writeFile },
+      homeDir: '/Users/me',
+      platform: 'darwin'
+    })
+
+    expect(result.success).toBe(true)
+    const temporaryPath = writeFile.mock.calls[0]?.[0] as string
+    expect(temporaryPath).toMatch(`${target}.tmp-`)
+    expect(writeFile.mock.calls[0]?.[2]).toMatchObject({ flag: 'wx', flush: true, mode: 0o600 })
+    expect(rename).toHaveBeenCalledWith(temporaryPath, target)
+    expect(unlink).not.toHaveBeenCalled()
+  })
+
+  it('leaves the original keybindings file untouched when staging fails', async () => {
+    const mkdir = vi.fn().mockResolvedValue(undefined)
+    const readFile = vi.fn().mockResolvedValue(JSON.stringify([]))
+    const writeFile = vi.fn().mockRejectedValue(Object.assign(new Error('disk failure'), { code: 'EIO' }))
+    const copyFile = vi.fn().mockResolvedValue(undefined)
+    const rename = vi.fn().mockResolvedValue(undefined)
+    const unlink = vi.fn().mockResolvedValue(undefined)
+    const target = '/Users/me/Library/Application Support/Code/User/keybindings.json'
+
+    const result = await configureTerminalKeybindings('vscode', {
+      fileOps: { copyFile, mkdir, readFile, rename, unlink, writeFile },
+      homeDir: '/Users/me',
+      platform: 'darwin'
+    })
+
+    expect(result.success).toBe(false)
+    expect(copyFile).toHaveBeenCalledTimes(1)
+    expect(writeFile.mock.calls[0]?.[0]).not.toBe(target)
+    expect(rename).not.toHaveBeenCalled()
+    expect(unlink).toHaveBeenCalledWith(expect.stringContaining(`${target}.tmp-`))
+  })
+
   it('reports error when keybindings.json is not readable (EACCES)', async () => {
     const mkdir = vi.fn().mockResolvedValue(undefined)
     const readFile = vi.fn().mockRejectedValue(Object.assign(new Error('permission denied'), { code: 'EACCES' }))
@@ -297,7 +347,7 @@ describe('configureTerminalKeybindings', () => {
     const copyFile = vi.fn().mockResolvedValue(undefined)
 
     const result = await configureTerminalKeybindings('vscode', {
-      fileOps: { copyFile, mkdir, readFile, writeFile },
+      fileOps: { copyFile, mkdir, readFile, writeFile, ...atomicFileOps() },
       homeDir: '/Users/me',
       platform: 'darwin'
     })
@@ -315,7 +365,7 @@ describe('configureTerminalKeybindings', () => {
 
     const result = await configureDetectedTerminalKeybindings({
       env: { CURSOR_TRACE_ID: 'trace' } as NodeJS.ProcessEnv,
-      fileOps: { copyFile, mkdir, readFile, writeFile },
+      fileOps: { copyFile, mkdir, readFile, writeFile, ...atomicFileOps() },
       homeDir: '/Users/me',
       platform: 'darwin'
     })
@@ -388,11 +438,11 @@ describe('configureTerminalKeybindings', () => {
     )
 
     await expect(
-        shouldPromptForTerminalSetup({
-          env: { TERM_PROGRAM: 'vscode' } as NodeJS.ProcessEnv,
-          fileOps: { readFile: readComplete },
-          homeDir: '/tmp/fake-home',
-          platform: 'darwin'
+      shouldPromptForTerminalSetup({
+        env: { TERM_PROGRAM: 'vscode' } as NodeJS.ProcessEnv,
+        fileOps: { readFile: readComplete },
+        homeDir: '/tmp/fake-home',
+        platform: 'darwin'
       })
     ).resolves.toBe(false)
   })
@@ -489,7 +539,7 @@ describe('configureTerminalKeybindings', () => {
     const copyFile = vi.fn().mockResolvedValue(undefined)
 
     const result = await configureTerminalKeybindings('vscode', {
-      fileOps: { copyFile, mkdir, readFile, writeFile },
+      fileOps: { copyFile, mkdir, readFile, writeFile, ...atomicFileOps() },
       homeDir: '/Users/me',
       platform: 'darwin'
     })

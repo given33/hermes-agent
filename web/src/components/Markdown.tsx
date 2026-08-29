@@ -362,10 +362,15 @@ function InlineContent({
 function HighlightedText({ text, terms }: { text: string; terms?: string[] }) {
   if (!terms || terms.length === 0) return <>{text}</>;
 
-  // Build a regex that matches any of the search terms (case-insensitive)
-  const escaped = terms.map((t) => t.replace(/[.*+?^${}()|[\]\\]/g, "\\$&"));
+  // Build a regex that matches any of the search terms (case-insensitive).
+  // Do not use a stateful global regex for the per-part check below: a global
+  // expression advances `lastIndex` on every test and can skip adjacent
+  // matches. Empty terms are ignored so they cannot match every boundary.
+  const normalizedTerms = [...new Set(terms.map((term) => term.trim()).filter(Boolean))];
+  if (normalizedTerms.length === 0) return <>{text}</>;
+  const escaped = normalizedTerms.map((t) => t.replace(/[.*+?^${}()|[\]\\]/g, "\\$&"));
   const regex = new RegExp(`(${escaped.join("|")})`, "gi");
-  const lowerTerms = new Set(terms.map((term) => term.toLowerCase()));
+  const lowerTerms = new Set(normalizedTerms.map((term) => term.toLowerCase()));
   const parts = text.split(regex);
 
   return (

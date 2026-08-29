@@ -33,7 +33,7 @@ from hermes_constants import get_hermes_home
 # .active.json holds:
 #   {"pid": 12345, "meeting_id": "abc-defg-hij", "out_dir": "...",
 #    "url": "https://meet.google.com/...", "started_at": 1714159200.0,
-#    "session_id": "optional"}
+#    "session_id": "optional", "start_time": 123456789}
 
 
 def _root() -> Path:
@@ -69,12 +69,118 @@ def _clear_active() -> None:
         pass
 
 
+def _path_within(path: Path, root: Path) -> bool:
+    """Return whether *path* is a strict descendant of *root*."""
+    try:
+        path.relative_to(root)
+    except ValueError:
+        return False
+    return path != root
+
+
+def _prepare_out_dir(out_dir: Optional[Path], meeting_id: str) -> Path:
+    """Create and return a meeting directory contained by the managed root.
+
+    ``out_dir`` remains an internal/testing override, but it is never allowed
+    to escape ``workspace/meetings``.  Resolving both before and after mkdir
+    rejects existing symlinks/junctions that cross the boundary.
+    """
+    root = _root()
+    root.mkdir(parents=True, exist_ok=True)
+    root_real = root.resolve(strict=True)
+    candidate = Path(out_dir) if out_dir is not None else root / meeting_id
+    if not candidate.is_absolute():
+        candidate = root / candidate
+    before = candidate.resolve(strict=False)
+    if not _path_within(before, root_real):
+        raise ValueError("meeting out_dir must remain under the managed meetings root")
+    candidate.mkdir(parents=True, exist_ok=True)
+    after = candidate.resolve(strict=True)
+    if not _path_within(after, root_real):
+        raise ValueError("meeting out_dir escaped the managed meetings root")
+    return after
+
+
+def _active_out_dir(
+    active: Optional[Dict[str, Any]], *, require_exists: bool = False
+) -> Optional[Path]:
+    """Resolve a persisted output directory only while it remains managed."""
+    if not isinstance(active, dict):
+        return None
+    raw = active.get("out_dir")
+    if not isinstance(raw, str) or not raw.strip():
+        return None
+    try:
+        root_real = _root().resolve(strict=False)
+        candidate = Path(raw).expanduser()
+        if not candidate.is_absolute():
+            candidate = _root() / candidate
+        resolved = candidate.resolve(strict=require_exists)
+    except (OSError, RuntimeError):
+        return None
+    if not _path_within(resolved, root_real):
+        return None
+    if require_exists and not resolved.is_dir():
+        return None
+    return resolved
+
+
 def _pid_alive(pid: int) -> bool:
     # ``os.kill(pid, 0)`` is NOT a no-op on Windows (bpo-14484) — it
     # routes through GenerateConsoleCtrlEvent and can kill the target.
     # Use the cross-platform existence check.
     from gateway.status import _pid_exists
     return _pid_exists(pid)
+
+
+def _pid_start_time(pid: int) -> Optional[int]:
+    """Return the host's stable process-identity fingerprint for *pid*.
+
+    The value is deliberately obtained through the shared gateway helper so
+    Meet uses the same ``/proc``/psutil semantics as the rest of Hermes.  A
+    missing value means the identity cannot be proven and callers must fail
+    closed rather than signalling a potentially recycled PID.
+    """
+    try:
+        from gateway.status import get_process_start_time
+
+        return get_process_start_time(int(pid))
+    except Exception:
+        return None
+
+
+def _recorded_pid(active: Optional[Dict[str, Any]]) -> int:
+    """Parse a PID from an active record without allowing malformed state to raise."""
+    if not isinstance(active, dict):
+        return 0
+    try:
+        pid = int(active.get("pid", 0))
+    except (TypeError, ValueError, OverflowError):
+        return 0
+    return pid if pid > 0 else 0
+
+
+def _active_identity_matches(active: Optional[Dict[str, Any]]) -> bool:
+    """Whether an active pointer still names the process it created.
+
+    Legacy pointers without ``start_time`` are intentionally not considered
+    safe to signal.  This prevents a stale ``.active.json`` from killing an
+    unrelated process after the original bot exited and its PID was reused.
+    """
+    if not isinstance(active, dict):
+        return False
+    pid = _recorded_pid(active)
+    recorded = active.get("start_time")
+    if not pid or recorded is None:
+        return False
+    try:
+        recorded_int = int(recorded)
+    except (TypeError, ValueError):
+        return False
+    if not _pid_alive(pid):
+        return False
+    current = _pid_start_time(pid)
+    return current is not None and current == recorded_int
 
 
 # ---------------------------------------------------------------------------
@@ -115,12 +221,22 @@ def start(
         }
 
     existing = _read_active()
-    if existing and _pid_alive(int(existing.get("pid", 0))):
-        stop(reason="replaced by new meet_join")
+    if existing:
+        # Only signal an existing process after proving both PID liveness and
+        # its recorded start-time identity.  A stale/legacy pointer is simply
+        # discarded; it must never be used as a kill authority.
+        if _active_identity_matches(existing):
+            stop(reason="replaced by new meet_join")
+        else:
+            # Whether the stale PID is dead, reused, or malformed, discard
+            # only our pointer and leave the unrelated process untouched.
+            _clear_active()
 
     meeting_id = _meeting_id_from_url(url)
-    out = out_dir or (_root() / meeting_id)
-    out.mkdir(parents=True, exist_ok=True)
+    try:
+        out = _prepare_out_dir(out_dir, meeting_id)
+    except (OSError, ValueError) as exc:
+        return {"ok": False, "error": str(exc)}
 
     # Wipe any stale transcript/status files from a previous run of this
     # meeting id so polling isn't confused.
@@ -198,6 +314,7 @@ def start(
         "session_id": session_id,
         "log_path": str(log_path),
         "mode": mode,
+        "start_time": _pid_start_time(proc.pid),
     }
     _write_active(record)
     return {"ok": True, **record}
@@ -209,12 +326,13 @@ def status() -> Dict[str, Any]:
     if not active:
         return {"ok": False, "reason": "no active meeting"}
 
-    pid = int(active.get("pid", 0))
-    alive = _pid_alive(pid) if pid else False
+    pid = _recorded_pid(active)
+    alive = _active_identity_matches(active)
 
-    status_path = Path(active.get("out_dir", "")) / "status.json"
+    out_dir = _active_out_dir(active, require_exists=True)
+    status_path = out_dir / "status.json" if out_dir is not None else None
     bot_status: Dict[str, Any] = {}
-    if status_path.is_file():
+    if status_path is not None and status_path.is_file():
         try:
             bot_status = json.loads(status_path.read_text(encoding="utf-8"))
         except Exception:
@@ -227,7 +345,7 @@ def status() -> Dict[str, Any]:
         "meetingId": active.get("meeting_id"),
         "url": active.get("url"),
         "startedAt": active.get("started_at"),
-        "outDir": active.get("out_dir"),
+        "outDir": str(out_dir) if out_dir is not None else None,
         **bot_status,
     }
 
@@ -238,7 +356,10 @@ def transcript(last: Optional[int] = None) -> Dict[str, Any]:
     if not active:
         return {"ok": False, "reason": "no active meeting"}
 
-    tp = Path(active.get("out_dir", "")) / "transcript.txt"
+    out_dir = _active_out_dir(active, require_exists=True)
+    if out_dir is None:
+        return {"ok": False, "reason": "active meeting out_dir is not managed"}
+    tp = out_dir / "transcript.txt"
     if not tp.is_file():
         return {
             "ok": True,
@@ -285,9 +406,9 @@ def enqueue_say(text: str) -> Dict[str, Any]:
             ),
         }
 
-    out_dir = Path(active.get("out_dir", ""))
-    if not out_dir.is_dir():
-        return {"ok": False, "reason": f"out_dir missing: {out_dir}"}
+    out_dir = _active_out_dir(active, require_exists=True)
+    if out_dir is None:
+        return {"ok": False, "reason": "active meeting out_dir is not managed"}
 
     queue_path = out_dir / "say_queue.jsonl"
     entry = {"id": uuid.uuid4().hex[:12], "text": text}
@@ -311,20 +432,33 @@ def stop(*, reason: str = "requested") -> Dict[str, Any]:
     if not active:
         return {"ok": False, "reason": "no active meeting"}
 
-    pid = int(active.get("pid", 0))
-    out_dir = active.get("out_dir")
-    transcript_path = Path(out_dir) / "transcript.txt" if out_dir else None
+    pid = _recorded_pid(active)
+    out_dir = _active_out_dir(active, require_exists=False)
+    transcript_path = out_dir / "transcript.txt" if out_dir is not None else None
 
-    if pid and _pid_alive(pid):
+    live = bool(pid and _pid_alive(pid))
+    identity_verified = bool(live and _active_identity_matches(active))
+    if live and not identity_verified:
+        # The PID is live but its identity cannot be proven (including legacy
+        # pointers without a start-time fingerprint).  Never signal it.
+        _clear_active()
+        return {
+            "ok": False,
+            "reason": "active meeting process identity could not be verified; not signalled",
+            "meetingId": active.get("meeting_id"),
+            "transcriptPath": str(transcript_path) if transcript_path else None,
+        }
+
+    if identity_verified:
         try:
             os.kill(pid, signal.SIGTERM)
         except ProcessLookupError:
             pass
         for _ in range(20):
-            if not _pid_alive(pid):
+            if not _active_identity_matches(active):
                 break
             time.sleep(0.5)
-        if _pid_alive(pid):
+        if _active_identity_matches(active):
             try:
                 os.kill(pid, signal.SIGKILL)  # windows-footgun: ok — POSIX-only plugin (google_meet registers no-op on Windows; see __init__.py)
             except ProcessLookupError:

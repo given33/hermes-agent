@@ -1858,3 +1858,33 @@ class TestMemoryProviderExternalPaths:
         assert (restored.stat().st_mode & 0o777) == 0o600
         # External state did NOT leak into HERMES_HOME.
         assert not (hermes_home / "_external").exists()
+
+    def test_import_blocks_unknown_external_home_paths(
+        self, tmp_path, monkeypatch, capsys
+    ):
+        dst_home = tmp_path / "dst"
+        dst_home.mkdir()
+        hermes_home = dst_home / ".hermes"
+        hermes_home.mkdir()
+
+        zip_path = tmp_path / "backup.zip"
+        with zipfile.ZipFile(zip_path, "w") as zf:
+            zf.writestr("config.yaml", "model: {}\n")
+            zf.writestr(".env", "X=1\n")
+            zf.writestr("state.db", "")
+            zf.writestr("_external/.honcho/config.json", '{"peer":"ok"}')
+            zf.writestr("_external/.ssh/authorized_keys", "attacker-key")
+            zf.writestr("_external/Documents/startup.ps1", "malicious")
+
+        monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+        monkeypatch.setattr(Path, "home", lambda: dst_home)
+
+        from hermes_cli.backup import run_import
+
+        run_import(Namespace(zipfile=str(zip_path), force=True))
+
+        assert (dst_home / ".honcho" / "config.json").read_text() == '{"peer":"ok"}'
+        assert not (dst_home / ".ssh" / "authorized_keys").exists()
+        assert not (dst_home / "Documents" / "startup.ps1").exists()
+        output = capsys.readouterr().out
+        assert "external provider path blocked" in output

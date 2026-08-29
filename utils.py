@@ -4,7 +4,6 @@ import errno
 import json
 import logging
 import os
-import shutil
 import stat
 import tempfile
 import time
@@ -140,6 +139,109 @@ def _is_contended_windows_replace_error(exc: OSError) -> bool:
     )
 
 
+def _capture_link_state(path: str) -> tuple[str, int, int, str | None]:
+    """Capture the final path component without following links."""
+    try:
+        st = os.lstat(path)
+    except FileNotFoundError:
+        return ("missing", 0, 0, None)
+    if stat.S_ISLNK(st.st_mode):
+        return ("link", st.st_dev, st.st_ino, os.readlink(path))
+    return ("plain", 0, 0, None)
+
+
+def _revalidate_link_state(
+    path: str, expected: tuple[str, int, int, str | None]
+) -> None:
+    """Fail closed if a destination changes to, from, or between links."""
+    current = _capture_link_state(path)
+    if expected[0] == "link":
+        if current != expected:
+            raise OSError(
+                errno.EAGAIN,
+                "Atomic write destination link changed during publication",
+                path,
+            )
+        return
+    if current[0] == "link":
+        raise OSError(
+            errno.ELOOP,
+            "Atomic write destination became a link during publication",
+            path,
+        )
+
+
+def _open_stable_fallback_target(path: str) -> tuple[int, bool]:
+    """Open a fallback destination without writing through a raced link.
+
+    Publication fallbacks cannot use rename semantics, so they open the
+    destination first, compare the resulting handle with the pre-open lstat,
+    and only then write. A path swap can therefore redirect the handle but
+    cannot modify the redirected file before the mismatch is detected.
+    """
+    flags = os.O_WRONLY | getattr(os, "O_BINARY", 0)
+    nofollow = getattr(os, "O_NOFOLLOW", 0)
+    try:
+        before = os.lstat(path)
+    except FileNotFoundError:
+        fd = os.open(path, flags | os.O_CREAT | os.O_EXCL | nofollow, 0o600)
+        return fd, True
+
+    if (
+        not stat.S_ISREG(before.st_mode)
+        or stat.S_ISLNK(before.st_mode)
+        or bool(getattr(before, "st_reparse_tag", 0))
+    ):
+        raise OSError(
+            errno.ELOOP,
+            "Atomic write fallback destination is not a stable regular file",
+            path,
+        )
+
+    fd = os.open(path, flags | nofollow)
+    try:
+        opened = os.fstat(fd)
+        if (
+            not stat.S_ISREG(opened.st_mode)
+            or (before.st_dev, before.st_ino) != (opened.st_dev, opened.st_ino)
+        ):
+            raise OSError(
+                errno.EAGAIN,
+                "Atomic write destination changed while opening fallback",
+                path,
+            )
+    except BaseException:
+        os.close(fd)
+        raise
+    return fd, False
+
+
+def _rewrite_fallback_target(
+    tmp_str: str, real_path: str, *, copy_source_mode: bool
+) -> None:
+    """Publish a temp file through a verified destination handle."""
+    with open(tmp_str, "rb") as src:
+        data = src.read()
+        source_mode = stat.S_IMODE(os.fstat(src.fileno()).st_mode)
+
+    fd, _created = _open_stable_fallback_target(real_path)
+    try:
+        os.lseek(fd, 0, os.SEEK_SET)
+        written = 0
+        while written < len(data):
+            written += os.write(fd, data[written:])
+        os.ftruncate(fd, len(data))
+        if copy_source_mode and hasattr(os, "fchmod"):
+            os.fchmod(fd, source_mode)
+        try:
+            os.fsync(fd)
+        except OSError:
+            pass
+    finally:
+        os.close(fd)
+    os.unlink(tmp_str)
+
+
 def _rewrite_in_place(tmp_str: str, real_path: str) -> None:
     """Overwrite *real_path* with the contents of *tmp_str*, in place.
 
@@ -157,38 +259,12 @@ def _rewrite_in_place(tmp_str: str, real_path: str) -> None:
     failed.  Writing through the target also preserves its ACL, which
     ``os.replace`` does not (the temp file's inherited ACL wins there).
     """
-    with open(tmp_str, "rb") as src:
-        data = src.read()
-    flags = os.O_WRONLY | getattr(os, "O_BINARY", 0)
-    fd = os.open(real_path, flags)
-    try:
-        os.lseek(fd, 0, os.SEEK_SET)
-        written = 0
-        while written < len(data):
-            written += os.write(fd, data[written:])
-        os.ftruncate(fd, len(data))
-        try:
-            os.fsync(fd)
-        except OSError:
-            pass
-    finally:
-        os.close(fd)
-    os.unlink(tmp_str)
+    _rewrite_fallback_target(tmp_str, real_path, copy_source_mode=False)
 
 
 def _copy_fallback(tmp_str: str, real_path: str) -> None:
     """Copy/fsync/unlink fallback for cross-device and bind-mount renames."""
-    shutil.copyfile(tmp_str, real_path)
-    try:
-        shutil.copystat(tmp_str, real_path)
-    except OSError:
-        pass
-    try:
-        with open(real_path, "rb") as f:
-            os.fsync(f.fileno())
-    except OSError:
-        pass
-    os.unlink(tmp_str)
+    _rewrite_fallback_target(tmp_str, real_path, copy_source_mode=True)
 
 
 def atomic_replace(tmp_path: Union[str, Path], target: Union[str, Path]) -> str:
@@ -224,9 +300,11 @@ def atomic_replace(tmp_path: Union[str, Path], target: Union[str, Path]) -> str:
     need to re-apply permissions can target it instead of the symlink.
     """
     target_str = str(target)
-    real_path = os.path.realpath(target_str) if os.path.islink(target_str) else target_str
+    link_state = _capture_link_state(target_str)
+    real_path = os.path.realpath(target_str) if link_state[0] == "link" else target_str
     tmp_str = str(tmp_path)
     try:
+        _revalidate_link_state(target_str, link_state)
         os.replace(tmp_str, real_path)
         return real_path
     except OSError as exc:
@@ -247,6 +325,7 @@ def atomic_replace(tmp_path: Union[str, Path], target: Union[str, Path]) -> str:
                     )
                 )
                 try:
+                    _revalidate_link_state(target_str, link_state)
                     os.replace(tmp_str, real_path)
                     return real_path
                 except OSError as retry_exc:
@@ -266,6 +345,7 @@ def atomic_replace(tmp_path: Union[str, Path], target: Union[str, Path]) -> str:
             or errno.errorcode.get(exc.errno or 0, exc.errno),
             "in-place rewrite" if contended else "copy",
         )
+        _revalidate_link_state(target_str, link_state)
         if contended:
             # Re-raises the rewrite's own error (not the rename's) when the
             # target is genuinely unwritable — an ACL denial stays an ACL

@@ -8,6 +8,7 @@ own; methods access the host's attributes (``self._conn``, ``self.db_path``,
 module-level constants live in hermes_state_common.
 """
 
+import functools
 import logging
 import json
 import sqlite3
@@ -732,6 +733,7 @@ class SessionSchemaMixin:
         return True
 
     @staticmethod
+    @functools.lru_cache(maxsize=8)
     def _parse_schema_columns(schema_sql: str) -> Dict[str, Dict[str, str]]:
         """Extract expected columns per table from SCHEMA_SQL.
 
@@ -744,38 +746,14 @@ class SessionSchemaMixin:
         Adding a column to SCHEMA_SQL is all that's needed; the
         reconciliation loop picks it up automatically.
 
-        The parse result is memoized on disk keyed by a hash of the DDL:
-        executing SCHEMA_SQL (FTS5 virtual tables included) in the scratch
-        DB costs ~85ms on every startup, but the output is a pure function
-        of the DDL text, which only changes when the shipped code changes.
-        Reconciliation itself (diffing the LIVE database) still runs every
-        startup — only the reference-side parse is cached. A corrupt or
-        stale cache degrades to recomputation.
+        The parse result is memoized only in this process.  A previous disk
+        cache stored reconstructed type expressions and replayed those strings
+        into ``ALTER TABLE``.  Its schema hash authenticated the shipped DDL,
+        not the cache contents, so a corrupt/synchronized/tampered JSON file
+        could become executable migration SQL.  Re-parsing once per process
+        keeps the shipped schema as the sole DDL authority while avoiding the
+        repeated ~85 ms scratch-database cost during that process.
         """
-        import hashlib as _hashlib
-        import json as _json
-
-        cache_path = None
-        schema_hash = _hashlib.sha256(schema_sql.encode("utf-8")).hexdigest()
-        try:
-            from hermes_constants import get_hermes_home
-            cache_path = get_hermes_home() / "cache" / "schema_columns.json"
-            blob = _json.loads(cache_path.read_text(encoding="utf-8"))
-            if (
-                isinstance(blob, dict)
-                and blob.get("schema_hash") == schema_hash
-                and isinstance(blob.get("tables"), dict)
-            ):
-                tables = blob["tables"]
-                if all(
-                    isinstance(cols, dict)
-                    and all(isinstance(v, str) for v in cols.values())
-                    for cols in tables.values()
-                ):
-                    return tables
-        except Exception:
-            pass  # missing/corrupt cache → recompute below
-
         ref = sqlite3.connect(":memory:")
         try:
             ref.executescript(schema_sql)
@@ -785,8 +763,9 @@ class SessionSchemaMixin:
                 "WHERE type='table' AND name NOT LIKE 'sqlite_%'"
             ).fetchall():
                 cols: Dict[str, str] = {}
+                safe_table = str(tbl).replace('"', '""')
                 for row in ref.execute(
-                    f'PRAGMA table_info("{tbl}")'
+                    f'PRAGMA table_info("{safe_table}")'
                 ).fetchall():
                     # row: (cid, name, type, notnull, dflt_value, pk)
                     col_name = row[1]
@@ -804,22 +783,6 @@ class SessionSchemaMixin:
                 table_columns[tbl] = cols
         finally:
             ref.close()
-
-        if cache_path is not None:
-            try:
-                import os as _os
-                import tempfile as _tempfile
-                cache_path.parent.mkdir(parents=True, exist_ok=True)
-                fd, tmp = _tempfile.mkstemp(
-                    dir=str(cache_path.parent), prefix=".schema_columns."
-                )
-                with _os.fdopen(fd, "w", encoding="utf-8") as fh:
-                    _json.dump(
-                        {"schema_hash": schema_hash, "tables": table_columns}, fh
-                    )
-                _os.replace(tmp, cache_path)
-            except Exception:
-                pass  # cache write is best-effort
         return table_columns
 
     def _reconcile_columns(self, cursor: sqlite3.Cursor) -> None:
@@ -837,10 +800,11 @@ class SessionSchemaMixin:
         """
         expected = self._parse_schema_columns(SCHEMA_SQL)
         for table_name, declared_cols in expected.items():
+            safe_table_name = table_name.replace('"', '""')
             # Get current columns from the live table
             try:
                 rows = cursor.execute(
-                    f'PRAGMA table_info("{table_name}")'
+                    f'PRAGMA table_info("{safe_table_name}")'
                 ).fetchall()
             except sqlite3.OperationalError:
                 continue  # Table doesn't exist yet (shouldn't happen after executescript)
@@ -855,7 +819,7 @@ class SessionSchemaMixin:
                     safe_name = col_name.replace('"', '""')
                     try:
                         cursor.execute(
-                            f'ALTER TABLE "{table_name}" ADD COLUMN "{safe_name}" {col_type}'
+                            f'ALTER TABLE "{safe_table_name}" ADD COLUMN "{safe_name}" {col_type}'
                         )
                     except sqlite3.OperationalError as exc:
                         message = str(exc).lower()

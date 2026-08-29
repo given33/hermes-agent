@@ -21,7 +21,7 @@ import time
 import zipfile
 from contextlib import contextmanager
 from datetime import datetime, timezone
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from typing import Any, Dict, List, Optional
 
 from hermes_constants import get_default_hermes_root, get_hermes_home, display_hermes_home
@@ -165,6 +165,34 @@ _SECRET_FILE_NAMES = {".env", "auth.json", "state.db"}
 # relative to the user's home directory, and restored to their original
 # home-relative location on import. Anything not under home is skipped.
 _EXTERNAL_PREFIX = "_external/"
+_EXTERNAL_IMPORT_ROOTS = frozenset({".hindsight", ".honcho", ".openviking"})
+
+
+def _external_import_target(home_dir: Path, member: str) -> Optional[Path]:
+    """Resolve an external provider member within a known provider root.
+
+    Backup archives are untrusted input. The ``_external/`` prefix alone is
+    not authority to overwrite arbitrary home-relative files, so imports are
+    limited to the external roots declared by bundled memory providers.
+    """
+    if not member.startswith(_EXTERNAL_PREFIX):
+        return None
+    raw = member[len(_EXTERNAL_PREFIX):].replace("\\", "/")
+    rel = PurePosixPath(raw)
+    if (
+        not raw
+        or rel.is_absolute()
+        or not rel.parts
+        or any(part in {"", ".", ".."} for part in rel.parts)
+        or rel.parts[0].casefold() not in _EXTERNAL_IMPORT_ROOTS
+    ):
+        return None
+    target = home_dir.joinpath(*rel.parts)
+    try:
+        target.resolve(strict=False).relative_to(home_dir)
+    except (OSError, RuntimeError, ValueError):
+        return None
+    return target
 
 
 class BackupInProgressError(RuntimeError):
@@ -1249,15 +1277,9 @@ def run_import(args) -> None:
             # ``_external/`` arc prefix restores to its original home-relative
             # location (e.g. ~/.honcho/config.json), NOT under HERMES_HOME.
             if member.startswith(_EXTERNAL_PREFIX):
-                ext_rel = member[len(_EXTERNAL_PREFIX):]
-                if not ext_rel:
-                    continue
-                target = home_dir / ext_rel
-                # Security: the resolved target must stay under the home dir.
-                try:
-                    target.resolve().relative_to(home_dir)
-                except ValueError:
-                    errors.append(f"  {member}: path traversal blocked")
+                target = _external_import_target(home_dir, member)
+                if target is None:
+                    errors.append(f"  {member}: external provider path blocked")
                     continue
                 try:
                     target.parent.mkdir(parents=True, exist_ok=True)

@@ -121,11 +121,36 @@ class NodeServer:
                         "payload": {"display_name": self.display_name,
                                     "ts": time.time()}}
             if t == "start_bot":
-                # Whitelist kwargs we pass through to pm.start.
+                # The node owns its meetings directory.  Accepting an
+                # arbitrary ``out_dir`` here lets a token-authenticated peer
+                # make the node create/delete/write files anywhere on the
+                # host.  Local ``process_manager.start`` may still support a
+                # caller-supplied path for interactive debugging, but the RPC
+                # boundary must derive the path from the managed root.
+                if payload.get("out_dir") not in (None, ""):
+                    return _proto.make_error(
+                        req_id,
+                        "out_dir is managed by the Meet node and cannot be supplied",
+                    )
+
+                # Whitelist kwargs we pass through to pm.start.  Keep the
+                # realtime controls in the remote path: dropping ``mode``
+                # silently downgraded remote Bot Mode requests to
+                # transcribe-only operation.
                 kwargs = {
                     k: payload[k]
-                    for k in ("url", "guest_name", "duration", "headed",
-                              "auth_state", "session_id", "out_dir")
+                    for k in (
+                        "url",
+                        "guest_name",
+                        "duration",
+                        "headed",
+                        "auth_state",
+                        "session_id",
+                        "mode",
+                        "realtime_model",
+                        "realtime_voice",
+                        "realtime_instructions",
+                    )
                     if k in payload
                 }
                 if "url" not in kwargs:
@@ -143,25 +168,12 @@ class NodeServer:
                 result = pm.transcript(last=last)
                 return _proto.make_response(req_id, result)
             if t == "say":
-                # v2 wiring: enqueue into say_queue.jsonl inside the
-                # active meeting's out_dir when present. The bot-side
-                # consumer is v3+ (for v1 this is a stub returning ok).
                 text = payload.get("text", "")
-                active = pm._read_active()  # type: ignore[attr-defined]
-                enqueued = False
-                if active and active.get("out_dir"):
-                    queue = Path(active["out_dir"]) / "say_queue.jsonl"
-                    try:
-                        queue.parent.mkdir(parents=True, exist_ok=True)
-                        with queue.open("a", encoding="utf-8") as fh:
-                            fh.write(json.dumps({"text": text, "ts": time.time()}) + "\n")
-                        enqueued = True
-                    except OSError:
-                        enqueued = False
-                return _proto.make_response(
-                    req_id,
-                    {"ok": True, "enqueued": enqueued, "text": text},
-                )
+                # Keep node speech on the same validated path/mode boundary
+                # as local calls.  Duplicating the queue write here used to
+                # trust a tampered ``.active.json`` out_dir and bypass the
+                # realtime-mode check.
+                return _proto.make_response(req_id, pm.enqueue_say(str(text)))
         except Exception as exc:  # noqa: BLE001 — surface any pm crash to client
             return _proto.make_error(req_id, f"{type(exc).__name__}: {exc}")
 

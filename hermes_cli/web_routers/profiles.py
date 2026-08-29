@@ -62,6 +62,12 @@ _log = logging.getLogger("hermes_cli.web_server")
 # errors.log without turning every sidebar poll into log spam.
 _profile_read_warned: set = set()
 
+# A mobile double-tap must join one canonical-chat creation. The title registry
+# still settles cross-process races; these locks only coalesce requests handled
+# by this dashboard process so we do not build duplicate lazy gateway sessions.
+_BOT_CANONICAL_CHAT_LOCKS: Dict[str, threading.Lock] = {}
+_BOT_CANONICAL_CHAT_LOCKS_GUARD = threading.Lock()
+
 
 def _warn_profile_read_error(profile: str, exc: Exception) -> None:
     key = (profile, str(exc))
@@ -1058,6 +1064,110 @@ def _bot_meta_path(name: str) -> Path:
     if not path.is_dir():
         raise HTTPException(status_code=404, detail="Profile not found")
     return path
+
+
+def _bot_canonical_chat_lock(name: str) -> threading.Lock:
+    with _BOT_CANONICAL_CHAT_LOCKS_GUARD:
+        return _BOT_CANONICAL_CHAT_LOCKS.setdefault(name, threading.Lock())
+
+
+def _find_bot_canonical_chat(profile: str) -> Optional[Dict[str, Any]]:
+    """Resolve the upstream title registry without a recency-window scan."""
+    result = _invoke_profile_gateway_rpc(
+        "session.list",
+        {
+            "profile": profile,
+            "title": "Bot Chat",
+            "limit": 200,
+            "include_hidden": True,
+        },
+    )
+    rows = result.get("sessions")
+    if not isinstance(rows, list):
+        raise HTTPException(status_code=502, detail="invalid upstream Bot Chat registry")
+    for value in rows:
+        if not isinstance(value, dict):
+            continue
+        session_id = str(value.get("id") or "").strip()
+        title = str(value.get("root_title") or value.get("title") or "").strip()
+        if session_id and title == "Bot Chat":
+            row = dict(value)
+            row["id"] = session_id
+            row["resolved_id"] = str(value.get("resolved_id") or session_id).strip()
+            row["root_title"] = "Bot Chat"
+            return row
+    return None
+
+
+def _ensure_bot_canonical_chat(profile: str) -> Dict[str, Any]:
+    """Find or create the profile's one durable ``Bot Chat`` registry row.
+
+    This is a REST adapter over the same ``session.list`` / ``session.create`` /
+    ``session.title`` contract used by upstream Desktop Bot Mode. In particular,
+    a lookup failure never means "missing", and a title race adopts the winner
+    instead of returning the losing lazy session.
+    """
+    with _bot_canonical_chat_lock(profile):
+        existing = _find_bot_canonical_chat(profile)
+        if existing is not None:
+            return {"created": False, "canonical_session": existing}
+
+        created = _invoke_profile_gateway_rpc(
+            "session.create",
+            {
+                "profile": profile,
+                "title": "Bot Chat",
+                "hidden": True,
+                "follow_profile_config": True,
+            },
+        )
+        runtime_id = str(created.get("session_id") or "").strip()
+        stored_id = str(created.get("stored_session_id") or "").strip()
+        if not runtime_id or not stored_id:
+            raise HTTPException(status_code=502, detail="upstream session.create returned no Bot Chat identity")
+
+        try:
+            _invoke_profile_gateway_rpc(
+                "session.title",
+                {"session_id": runtime_id, "title": "Bot Chat"},
+            )
+        except HTTPException as exc:
+            # Another client can claim the unique title between the exact
+            # lookup and our eager materialization. The winner is canonical;
+            # the losing zero-message lazy session is left for gateway pruning.
+            if "already in use" in str(exc.detail or "").lower():
+                winner = _find_bot_canonical_chat(profile)
+                if winner is not None:
+                    return {"created": False, "canonical_session": winner}
+            raise
+
+        canonical = _find_bot_canonical_chat(profile)
+        if canonical is None:
+            raise HTTPException(
+                status_code=502,
+                detail="Bot Chat was not materialized in the upstream registry",
+            )
+        return {"created": canonical.get("id") == stored_id, "canonical_session": canonical}
+
+
+@router.post("/api/bots/{name}/canonical-chat")
+async def ensure_bot_canonical_chat_endpoint(name: str):
+    """Resolve or create the canonical Bot Chat for an iOS Bot row tap."""
+    from hermes_cli import profiles as profiles_mod
+
+    profile = profiles_mod.normalize_profile_name(name)
+    _bot_meta_path(profile)
+    result = await asyncio.to_thread(_ensure_bot_canonical_chat, profile)
+    canonical = result["canonical_session"]
+    return {
+        "ok": True,
+        "bot_mode": True,
+        "profile": profile,
+        "created": bool(result["created"]),
+        "session_id": canonical["id"],
+        "resolved_session_id": canonical.get("resolved_id") or canonical["id"],
+        "canonical_session": canonical,
+    }
 
 
 @router.get("/api/bots/{name}/meta")

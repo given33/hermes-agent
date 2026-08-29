@@ -363,12 +363,8 @@ class TestSaveEnvValueSecure:
 
 
 
-    def test_save_env_value_preserves_existing_file_mode_on_posix(self, tmp_path):
-        """Regression for #31518: pre-existing .env mode (e.g. 0640 for a
-        Docker bind-mount that the operator chose) survives subsequent
-        writes. Previously _secure_file ran unconditionally after the
-        mode-restore branch and re-tightened to 0600.
-        """
+    def test_save_env_value_tightens_existing_file_mode_on_posix(self, tmp_path):
+        """Secret rotation must remediate a pre-existing world-readable .env."""
         if os.name == "nt":
             return
 
@@ -380,7 +376,7 @@ class TestSaveEnvValueSecure:
             save_env_value("TENOR_API_KEY", "sk-test-secret")
 
         env_mode = env_path.stat().st_mode & 0o777
-        assert env_mode == 0o640, f"expected 0o640, got {oct(env_mode)}"
+        assert env_mode == 0o600, f"expected 0o600, got {oct(env_mode)}"
 
     def test_save_env_value_quotes_values_containing_hash(self, tmp_path):
         """Regression test for #30355."""
@@ -446,13 +442,8 @@ class TestRemoveEnvValue:
             remove_env_value("ORPHAN_KEY")
             assert "ORPHAN_KEY" not in os.environ
 
-    def test_remove_env_value_preserves_existing_file_mode_on_posix(self, tmp_path):
-        """Regression: pre-existing .env mode (e.g. 0640 for a Docker
-        bind-mount the operator chose) survives a remove just as it does a
-        save. Previously _secure_file ran unconditionally after the
-        mode-restore branch and re-tightened to 0600 — the same bug fixed
-        in save_env_value (#33699), in the sibling remove path.
-        """
+    def test_remove_env_value_tightens_existing_file_mode_on_posix(self, tmp_path):
+        """Deleting a secret also leaves the remaining .env owner-only."""
         if os.name == "nt":
             return
 
@@ -466,7 +457,7 @@ class TestRemoveEnvValue:
         assert removed is True
         assert "DROP" not in env_path.read_text()
         env_mode = env_path.stat().st_mode & 0o777
-        assert env_mode == 0o640, f"expected 0o640, got {oct(env_mode)}"
+        assert env_mode == 0o600, f"expected 0o600, got {oct(env_mode)}"
 
 
 class TestSaveConfigAtomicity:

@@ -30,6 +30,17 @@ def _make_dir_link(link: Path, target: Path) -> None:
         link.symlink_to(target, target_is_directory=True)
 
 
+def _active_generation(tmp_path: Path, monkeypatch) -> str:
+    """Create an explicit account-generation fence for path-focused tests."""
+    from hermes_cli.dashboard_auth import mobile_device_store
+
+    mobile_db = tmp_path / "mobile-auth.db"
+    monkeypatch.setattr(mobile_device_store, "mobile_auth_db_path", lambda: mobile_db)
+    return mobile_device_store.MobileDeviceStore().account_generation(
+        "owner", create=True
+    )
+
+
 def test_model_cleanup_visits_every_profile_and_preserves_unrelated_config(
     tmp_path,
     monkeypatch,
@@ -55,7 +66,10 @@ def test_model_cleanup_visits_every_profile_and_preserves_unrelated_config(
         ],
     )
 
-    result = account_cleanup.purge_owner_model_configuration("owner")
+    generation = _active_generation(tmp_path, monkeypatch)
+    result = account_cleanup.purge_owner_model_configuration(
+        "owner", account_generation=generation
+    )
 
     assert result == {
         "profiles_changed": 2,
@@ -96,10 +110,13 @@ def test_model_cleanup_skips_linked_and_out_of_layout_profile_roots(
     if linked is not None:
         profile_entries.append(
             SimpleNamespace(path=linked, name="linked", is_default=False)
-        )
+    )
     monkeypatch.setattr(account_cleanup, "list_profiles", lambda: profile_entries)
 
-    result = account_cleanup.purge_owner_model_configuration("owner")
+    generation = _active_generation(tmp_path, monkeypatch)
+    result = account_cleanup.purge_owner_model_configuration(
+        "owner", account_generation=generation
+    )
 
     assert result["profiles_changed"] == 1
     assert yaml.safe_load((outside / "config.yaml").read_text(encoding="utf-8")) == {
@@ -131,7 +148,10 @@ def test_model_cleanup_rejects_external_default_profile_root(
         ],
     )
 
-    result = account_cleanup.purge_owner_model_configuration("owner")
+    generation = _active_generation(tmp_path, monkeypatch)
+    result = account_cleanup.purge_owner_model_configuration(
+        "owner", account_generation=generation
+    )
 
     assert result["profiles_changed"] == 1
     assert yaml.safe_load(
@@ -184,12 +204,41 @@ def test_model_cleanup_fails_closed_for_link_like_hermes_home(
         lambda: [SimpleNamespace(path=linked_home, name="default", is_default=True)],
     )
 
-    result = account_cleanup.purge_owner_model_configuration("owner")
+    generation = _active_generation(tmp_path, monkeypatch)
+    result = account_cleanup.purge_owner_model_configuration(
+        "owner", account_generation=generation
+    )
 
     assert result["profiles_changed"] == 0
     assert yaml.safe_load((real_home / "config.yaml").read_text(encoding="utf-8")) == {
         "model": {"provider": "keep"}
     }
+
+
+@pytest.mark.parametrize(
+    "helper",
+    [
+        account_cleanup.purge_owner_model_configuration,
+        account_cleanup.purge_owner_operational_state,
+    ],
+)
+def test_destructive_cleanup_helpers_require_generation_fence(
+    helper, tmp_path, monkeypatch
+):
+    """A direct helper call must never perform an unscoped owner delete."""
+    monkeypatch.setattr(
+        account_cleanup,
+        "_account_cleanup_plugins",
+        lambda: pytest.fail("unfenced cleanup reached plugin storage"),
+    )
+
+    with pytest.raises(ValueError, match="account_generation is required"):
+        helper("owner", account_generation="")
+
+    # Omitting the keyword is rejected by the required signature before any
+    # filesystem/database dependency is opened.
+    with pytest.raises(TypeError):
+        helper("owner")
 
 
 def test_global_cleanup_fails_closed_for_link_like_hermes_home(

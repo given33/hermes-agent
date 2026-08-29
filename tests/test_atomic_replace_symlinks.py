@@ -371,7 +371,7 @@ def test_contended_rename_retry_wins_keeps_write_atomic(
     monkeypatch.setattr("utils.os.replace", contended_twice)
     monkeypatch.setattr("utils._IS_WINDOWS", True)
     monkeypatch.setattr("utils._rewrite_in_place", forbid)
-    monkeypatch.setattr("utils.shutil.copyfile", forbid)
+    monkeypatch.setattr("utils._copy_fallback", forbid)
 
     assert Path(atomic_replace(tmp, target)) == target
     assert calls["n"] == 3
@@ -454,6 +454,71 @@ def test_non_contended_oserror_propagates_without_retry(
     assert excinfo.value.errno == errno.ENOSPC
     assert replace.call_count == 1, "a permanent error must not be retried"
     assert target.read_text(encoding="utf-8") == "old"
+    assert tmp.exists()
+
+
+def test_fallback_refuses_destination_swapped_during_open(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A fallback must validate the opened object before writing any byte."""
+    target = tmp_path / "target.json"
+    victim = tmp_path / "victim.json"
+    target.write_text("target-old", encoding="utf-8")
+    victim.write_text("victim-secret", encoding="utf-8")
+    tmp = _write_tmp(tmp_path, "replacement")
+
+    monkeypatch.setattr(
+        "utils.os.replace",
+        MagicMock(side_effect=OSError(errno.EXDEV, "cross-device")),
+    )
+    real_open = os.open
+
+    def open_swapped(path: str, flags: int, mode: int = 0o777) -> int:
+        if os.fspath(path) == os.fspath(target) and flags & os.O_WRONLY:
+            return real_open(victim, flags, mode)
+        return real_open(path, flags, mode)
+
+    monkeypatch.setattr("utils.os.open", open_swapped)
+
+    with pytest.raises(OSError) as caught:
+        atomic_replace(tmp, target)
+
+    assert caught.value.errno == errno.EAGAIN
+    assert target.read_text(encoding="utf-8") == "target-old"
+    assert victim.read_text(encoding="utf-8") == "victim-secret"
+    assert tmp.exists(), "the caller must retain the unpublished temp file"
+
+
+@pytest.mark.require_symlinks
+def test_atomic_replace_refuses_link_changed_during_resolution(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Changing a managed symlink after inspection must fail closed."""
+    first = tmp_path / "first.json"
+    second = tmp_path / "second.json"
+    link = tmp_path / "config.json"
+    first.write_text("first", encoding="utf-8")
+    second.write_text("second", encoding="utf-8")
+    link.symlink_to(first)
+    tmp = _write_tmp(tmp_path, "replacement")
+
+    real_realpath = os.path.realpath
+
+    def swap_after_resolution(path: str) -> str:
+        resolved = real_realpath(path)
+        link.unlink()
+        link.symlink_to(second)
+        return resolved
+
+    monkeypatch.setattr("utils.os.path.realpath", swap_after_resolution)
+
+    with pytest.raises(OSError) as caught:
+        atomic_replace(tmp, link)
+
+    assert caught.value.errno == errno.EAGAIN
+    assert first.read_text(encoding="utf-8") == "first"
+    assert second.read_text(encoding="utf-8") == "second"
+    assert link.is_symlink()
     assert tmp.exists()
 
 

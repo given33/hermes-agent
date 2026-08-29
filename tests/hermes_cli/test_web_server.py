@@ -82,6 +82,88 @@ async def test_bot_mobile_route_exposes_title_resolved_canonical_chat(monkeypatc
 
 
 @pytest.mark.asyncio
+async def test_bot_canonical_chat_endpoint_reuses_existing_registry_row(monkeypatch, tmp_path):
+    """A Bot tap resolves the exact-title registry without creating a draft."""
+    from hermes_cli.web_routers import profiles as profiles_router
+
+    monkeypatch.setattr(profiles_router, "_resolve_profile_dir", lambda _name: tmp_path)
+    calls = []
+
+    def invoke(method, params):
+        calls.append((method, params))
+        assert method == "session.list"
+        return {
+            "sessions": [{
+                "id": "bot-root",
+                "resolved_id": "bot-tip",
+                "title": "Bot Chat",
+            }]
+        }
+
+    monkeypatch.setattr(profiles_router, "_invoke_profile_gateway_rpc", invoke)
+    result = await profiles_router.ensure_bot_canonical_chat_endpoint("hk-worker")
+
+    assert result["created"] is False
+    assert result["session_id"] == "bot-root"
+    assert result["resolved_session_id"] == "bot-tip"
+    assert calls == [(
+        "session.list",
+        {
+            "profile": "hk-worker",
+            "title": "Bot Chat",
+            "limit": 200,
+            "include_hidden": True,
+        },
+    )]
+
+
+@pytest.mark.asyncio
+async def test_bot_canonical_chat_endpoint_materializes_new_chat_via_upstream_rpc(monkeypatch, tmp_path):
+    """A first Bot tap creates, titles, then resolves one persistent chat."""
+    from hermes_cli.web_routers import profiles as profiles_router
+
+    monkeypatch.setattr(profiles_router, "_resolve_profile_dir", lambda _name: tmp_path)
+    calls = []
+    list_count = 0
+
+    def invoke(method, params):
+        nonlocal list_count
+        calls.append((method, params))
+        if method == "session.list":
+            list_count += 1
+            if list_count == 1:
+                return {"sessions": []}
+            return {
+                "sessions": [{
+                    "id": "stored-bot-chat",
+                    "resolved_id": "stored-bot-chat",
+                    "title": "Bot Chat",
+                }]
+            }
+        if method == "session.create":
+            return {"session_id": "runtime-chat", "stored_session_id": "stored-bot-chat"}
+        if method == "session.title":
+            return {"pending": False, "title": "Bot Chat"}
+        raise AssertionError(method)
+
+    monkeypatch.setattr(profiles_router, "_invoke_profile_gateway_rpc", invoke)
+    result = await profiles_router.ensure_bot_canonical_chat_endpoint("hk-worker")
+
+    assert result["created"] is True
+    assert result["session_id"] == "stored-bot-chat"
+    assert [method for method, _params in calls] == [
+        "session.list", "session.create", "session.title", "session.list",
+    ]
+    assert calls[1][1] == {
+        "profile": "hk-worker",
+        "title": "Bot Chat",
+        "hidden": True,
+        "follow_profile_config": True,
+    }
+    assert calls[2][1] == {"session_id": "runtime-chat", "title": "Bot Chat"}
+
+
+@pytest.mark.asyncio
 async def test_bot_create_marks_profile_for_upstream_bot_mode(monkeypatch, tmp_path):
     """REST-created bots must receive the same profile-local Bot Mode gate."""
     from hermes_cli.web_routers import profiles as profiles_router

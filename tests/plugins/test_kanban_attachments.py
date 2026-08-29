@@ -13,6 +13,8 @@ The plugin router is attached to a bare FastAPI app — same approach as
 from __future__ import annotations
 
 import importlib.util
+import os
+import subprocess
 import sys
 from pathlib import Path
 
@@ -61,6 +63,26 @@ def client(kanban_home):
 
 def _make_task(conn, title="t") -> str:
     return kb.create_task(conn, title=title)
+
+
+def _make_dir_link(link: Path, target: Path) -> None:
+    if os.name == "nt":
+        result = subprocess.run(
+            ["cmd", "/c", "mklink", "/J", str(link), str(target)],
+            capture_output=True,
+            text=True,
+        )
+        if result.returncode != 0:
+            pytest.skip(f"Windows junctions unavailable: {result.stderr.strip()}")
+    else:
+        link.symlink_to(target, target_is_directory=True)
+
+
+def _remove_dir_link(link: Path) -> None:
+    try:
+        link.unlink()
+    except OSError:
+        link.rmdir()
 
 
 # ---------------------------------------------------------------------------
@@ -116,6 +138,65 @@ def test_delete_attachment_missing_returns_none(kanban_home):
         assert kb.delete_attachment(conn, 999999) is None
     finally:
         conn.close()
+
+
+def test_delete_attachment_does_not_unlink_a_tampered_external_path(
+    kanban_home, tmp_path
+):
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    victim = outside / "important.txt"
+    victim.write_text("keep", encoding="utf-8")
+
+    conn = kb.connect()
+    try:
+        task_id = _make_task(conn)
+        att_id = kb.add_attachment(
+            conn,
+            task_id,
+            filename=victim.name,
+            stored_path=str(victim),
+            size=victim.stat().st_size,
+        )
+
+        removed = kb.delete_attachment(conn, att_id)
+
+        assert removed is not None
+        assert kb.get_attachment(conn, att_id) is None
+        assert victim.read_text(encoding="utf-8") == "keep"
+    finally:
+        conn.close()
+
+
+def test_delete_attachment_does_not_follow_a_linked_parent(kanban_home, tmp_path):
+    root = kb.attachments_root()
+    root.mkdir(parents=True, exist_ok=True)
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    victim = outside / "important.txt"
+    victim.write_text("keep", encoding="utf-8")
+    linked_parent = root / "linked-task"
+    _make_dir_link(linked_parent, outside)
+
+    conn = kb.connect()
+    try:
+        task_id = _make_task(conn)
+        att_id = kb.add_attachment(
+            conn,
+            task_id,
+            filename=victim.name,
+            stored_path=str(linked_parent / victim.name),
+            size=victim.stat().st_size,
+        )
+
+        removed = kb.delete_attachment(conn, att_id)
+
+        assert removed is not None
+        assert kb.get_attachment(conn, att_id) is None
+        assert victim.read_text(encoding="utf-8") == "keep"
+    finally:
+        conn.close()
+        _remove_dir_link(linked_parent)
 
 
 def test_attachments_root_is_per_board(kanban_home, monkeypatch):
@@ -291,4 +372,3 @@ def test_cli_attach_attachments_and_rm(kanban_home, tmp_path):
         assert kb.list_attachments(conn, task_id) == []
     finally:
         conn.close()
-

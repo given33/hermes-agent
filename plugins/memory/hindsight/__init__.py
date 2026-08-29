@@ -43,6 +43,7 @@ import time
 
 from dataclasses import dataclass
 from datetime import datetime, timezone
+from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional
 
 from agent.secret_scope import get_secret
@@ -688,6 +689,50 @@ def _materialize_embedded_profile_env(config: dict[str, Any], *, llm_api_key: st
         raise
     return profile_env
 
+
+def _write_hermes_env_values(env_path, env_writes: dict[str, str]) -> None:
+    """Merge setup values into Hermes' ``.env`` atomically and safely.
+
+    Hindsight setup runs beside the gateway and other provider setup flows.
+    A plain ``Path.write_text`` could truncate the credential file on
+    interruption or lose a key written by a sibling process between the read
+    and write.  Reuse the runtime advisory lock and atomic writer, and always
+    publish owner-only permissions for this secret-bearing file.
+    """
+    if not env_writes:
+        return
+    from hermes_runtime.config import config_write_lock
+    from utils import atomic_write_text
+
+    env_path = Path(env_path)
+    env_path.parent.mkdir(parents=True, exist_ok=True)
+    with config_write_lock(env_path):
+        existing_lines: list[str] = []
+        if env_path.exists():
+            existing_lines = env_path.read_text(encoding="utf-8-sig").splitlines()
+        updated_keys: set[str] = set()
+        new_lines: list[str] = []
+        for line in existing_lines:
+            key_match = (
+                line.split("=", 1)[0].strip()
+                if "=" in line and not line.startswith("#")
+                else None
+            )
+            if key_match and key_match in env_writes:
+                new_lines.append(f"{key_match}={env_writes[key_match]}")
+                updated_keys.add(key_match)
+            else:
+                new_lines.append(line)
+        for key, value in env_writes.items():
+            if key not in updated_keys:
+                new_lines.append(f"{key}={value}")
+        atomic_write_text(
+            env_path,
+            "\n".join(new_lines) + "\n",
+            encoding="utf-8",
+            mode=0o600,
+        )
+
 def _sanitize_bank_segment(value: str) -> str:
     """Sanitize a bank_id_template placeholder value.
 
@@ -1110,27 +1155,7 @@ class HindsightMemoryProvider(MemoryProvider):
         self.save_config(provider_config, hermes_home)
 
         if env_writes:
-            env_path = Path(hermes_home) / ".env"
-            env_path.parent.mkdir(parents=True, exist_ok=True)
-            existing_lines = []
-            if env_path.exists():
-                # utf-8-sig: a Notepad BOM would glue U+FEFF onto the first
-                # key, defeating the in-place update below and appending a
-                # duplicate line instead.
-                existing_lines = env_path.read_text(encoding="utf-8-sig").splitlines()
-            updated_keys = set()
-            new_lines = []
-            for line in existing_lines:
-                key_match = line.split("=", 1)[0].strip() if "=" in line and not line.startswith("#") else None
-                if key_match and key_match in env_writes:
-                    new_lines.append(f"{key_match}={env_writes[key_match]}")
-                    updated_keys.add(key_match)
-                else:
-                    new_lines.append(line)
-            for k, v in env_writes.items():
-                if k not in updated_keys:
-                    new_lines.append(f"{k}={v}")
-            env_path.write_text("\n".join(new_lines) + "\n", encoding="utf-8")
+            _write_hermes_env_values(Path(hermes_home) / ".env", env_writes)
 
         # Step 5: Optional starter template. Only for cloud / local_external —
         # the API is reachable now; local_embedded's daemon isn't up during setup.

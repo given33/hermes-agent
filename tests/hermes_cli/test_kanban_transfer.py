@@ -16,6 +16,7 @@ with it":
 
 from __future__ import annotations
 
+import io
 import json
 import sys
 import tarfile
@@ -31,7 +32,11 @@ if str(_WORKTREE) not in sys.path:
 
 from hermes_cli import kanban_db as kb
 from hermes_cli import kanban_transfer as kt
-from hermes_cli.archive_safe import normalize_archive_parts, safe_extract_targz
+from hermes_cli.archive_safe import (
+    archive_root_dirs,
+    normalize_archive_parts,
+    safe_extract_targz,
+)
 
 
 @pytest.fixture
@@ -107,6 +112,16 @@ def _tasks_by_title(slug: str) -> dict[str, dict]:
             row["title"]: dict(row)
             for row in conn.execute("SELECT * FROM tasks").fetchall()
         }
+
+
+def _make_targz(tmp_path: Path, members: dict[str, bytes]) -> Path:
+    archive = tmp_path / "payload.tar.gz"
+    with tarfile.open(archive, "w:gz") as tf:
+        for name, payload in members.items():
+            info = tarfile.TarInfo(name)
+            info.size = len(payload)
+            tf.addfile(info, io.BytesIO(payload))
+    return archive
 
 
 # ---------------------------------------------------------------------------
@@ -318,18 +333,63 @@ def test_traversal_members_are_rejected(member):
 
 
 def test_extract_refuses_a_symlink_member(tmp_path):
-    payload = tmp_path / "payload"
-    payload.mkdir()
-    (payload / "real.txt").write_text("fine")
-    link = payload / "link"
-    link.symlink_to("/etc/passwd")
-
     archive = tmp_path / "evil.tar.gz"
     with tarfile.open(archive, "w:gz") as tf:
-        tf.add(payload, arcname="payload")
+        directory = tarfile.TarInfo("payload")
+        directory.type = tarfile.DIRTYPE
+        tf.addfile(directory)
+        link = tarfile.TarInfo("payload/link")
+        link.type = tarfile.SYMTYPE
+        link.linkname = "/etc/passwd"
+        tf.addfile(link)
 
     with pytest.raises(ValueError, match="Unsupported archive member"):
         safe_extract_targz(archive, tmp_path / "out")
+
+
+@pytest.mark.parametrize(
+    ("limit", "limit_value", "message"),
+    [
+        ("max_members", 1, "more than 1 entries"),
+        ("max_member_bytes", 2, "member exceeds"),
+        ("max_expanded_bytes", 3, "expands beyond"),
+    ],
+)
+def test_extract_refuses_archives_over_resource_limits(
+    tmp_path, limit, limit_value, message
+):
+    archive = _make_targz(
+        tmp_path,
+        {"payload/first.txt": b"abc", "payload/second.txt": b"def"},
+    )
+    destination = tmp_path / "out"
+
+    with pytest.raises(ValueError, match=message):
+        safe_extract_targz(archive, destination, **{limit: limit_value})
+
+    assert not destination.exists()
+
+
+def test_extract_refuses_an_oversize_compressed_archive_before_writes(tmp_path):
+    archive = _make_targz(tmp_path, {"payload/file.txt": b"payload"})
+    destination = tmp_path / "out"
+
+    with pytest.raises(ValueError, match="Archive exceeds"):
+        safe_extract_targz(
+            archive, destination, max_archive_bytes=archive.stat().st_size - 1
+        )
+
+    assert not destination.exists()
+
+
+def test_archive_root_inspection_enforces_the_same_resource_limits(tmp_path):
+    archive = _make_targz(
+        tmp_path,
+        {"payload/first.txt": b"a", "payload/second.txt": b"b"},
+    )
+
+    with pytest.raises(ValueError, match="more than 1 entries"):
+        archive_root_dirs(archive, max_members=1)
 
 
 def test_import_rejects_a_non_kanban_archive(kanban_root, tmp_path):

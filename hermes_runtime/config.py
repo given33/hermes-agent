@@ -8409,7 +8409,7 @@ def _env_line_defines_key(line: str, key: str) -> bool:
     return stripped.startswith(f"{key}=")
 
 
-def save_env_value(key: str, value: str):
+def _save_env_value_unlocked(key: str, value: str):
     """Save or update a value in ~/.hermes/.env."""
     if is_managed():
         managed_error(f"set {key}")
@@ -8483,11 +8483,12 @@ def save_env_value(key: str, value: str):
             f.flush()
             os.fsync(f.fileno())
         atomic_replace(tmp_path, env_path)
-        # Preserve the original file mode (e.g. 0640 for Docker volume mounts)
-        # instead of letting _secure_file unconditionally tighten to 0600.
+        # Credential-bearing files must never retain group/world read bits.
+        # A Docker volume may start at 0640/0644, but a rotation is an
+        # explicit secret write, so publish owner-only permissions.
         if original_mode is not None:
             try:
-                os.chmod(env_path, original_mode)
+                os.chmod(env_path, 0o600)
             except OSError:
                 pass
         else:
@@ -8503,6 +8504,12 @@ def save_env_value(key: str, value: str):
     invalidate_env_cache()
 
 
+def save_env_value(key: str, value: str):
+    """Save or update a value in ``.env`` under the advisory file lock."""
+    with config_write_lock(get_env_path()):
+        return _save_env_value_unlocked(key, value)
+
+
 def custom_endpoint_key_env(identity: str) -> str:
     """Return the environment key used for a custom model endpoint.
 
@@ -8513,7 +8520,7 @@ def custom_endpoint_key_env(identity: str) -> str:
     return f"HERMES_CUSTOM_{slug}_API_KEY" if slug else "HERMES_CUSTOM_API_KEY"
 
 
-def remove_env_value(key: str) -> bool:
+def _remove_env_value_unlocked(key: str) -> bool:
     """Remove a key from ~/.hermes/.env and os.environ.
 
     Returns True if the key was found and removed, False otherwise.
@@ -8564,12 +8571,10 @@ def remove_env_value(key: str) -> bool:
                 f.flush()
                 os.fsync(f.fileno())
             atomic_replace(tmp_path, env_path)
-            # Preserve the original file mode (e.g. 0640 for Docker volume
-            # mounts) instead of letting _secure_file unconditionally tighten
-            # to 0600. Mirrors save_env_value().
+            # Keep secret-bearing .env files owner-only after rotation.
             if original_mode is not None:
                 try:
-                    os.chmod(env_path, original_mode)
+                    os.chmod(env_path, 0o600)
                 except OSError:
                     pass
             else:
@@ -8584,6 +8589,12 @@ def remove_env_value(key: str) -> bool:
     os.environ.pop(key, None)
     invalidate_env_cache()
     return found
+
+
+def remove_env_value(key: str) -> bool:
+    """Remove a value from ``.env`` under the advisory file lock."""
+    with config_write_lock(get_env_path()):
+        return _remove_env_value_unlocked(key)
 
 
 def save_anthropic_oauth_token(value: str, save_fn=None):

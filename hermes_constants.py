@@ -519,6 +519,14 @@ def _candidate_node_command_names(command: str) -> list[str]:
 _HERMES_NODE_TARGET_MAJOR = int(os.environ.get("HERMES_NODE_TARGET_MAJOR", "22"))
 _managed_node_heal_attempted = False
 _NODE_BOOTSTRAP_SCRIPT = Path(__file__).resolve().parent / "scripts" / "lib" / "node-bootstrap.sh"
+# The Node distribution is large, but bounded extraction is still required:
+# ``ZipFile.extractall`` otherwise trusts archive names, symlink entries, and
+# declared uncompressed sizes supplied by a mirror/proxy.  Keep these limits
+# comfortably above the largest official Node archive while preventing a
+# decompression bomb from exhausting the profile disk.
+_MAX_MANAGED_NODE_ARCHIVE_BYTES = 512 * 1024 * 1024
+_MAX_MANAGED_NODE_MEMBER_BYTES = 256 * 1024 * 1024
+_MAX_MANAGED_NODE_MEMBERS = 100_000
 
 # Install tree root (this file lives at <install_root>/hermes_constants.py).
 # Used by secure_parent_dir() to skip chmod on the install dir — chmodding it
@@ -666,6 +674,103 @@ def _print_managed_node_in_use_notice() -> None:
     )
 
 
+def _safe_extract_managed_node_archive(archive, extract_dir: Path, *, expected_root: str) -> None:
+    """Extract an official Node zip without trusting archive path metadata.
+
+    ``ZipFile.extractall`` follows member names and materializes symlink
+    entries on some Python/platform combinations.  Validate every member,
+    then create directories/files ourselves beneath ``extract_dir`` using
+    exclusive file creation.  The caller has already authenticated the URL;
+    this is defense in depth for compromised mirrors and local archive
+    replacement races.
+    """
+    import stat as _stat
+    import zipfile
+
+    members = archive.infolist()
+    if not members or len(members) > _MAX_MANAGED_NODE_MEMBERS:
+        raise zipfile.BadZipFile("managed Node archive has an invalid member count")
+    seen: set[str] = set()
+    total_bytes = 0
+    root_names: set[str] = set()
+    base = extract_dir.resolve()
+
+    for member in members:
+        name = str(member.filename or "")
+        # Backslashes are rejected rather than normalized: accepting both
+        # separators makes validation and extraction disagree on Windows.
+        if not name or "\\" in name or "\x00" in name:
+            raise zipfile.BadZipFile("unsafe managed Node archive member")
+        pure = PurePosixPath(name)
+        parts = list(pure.parts)
+        if (
+            not parts
+            or pure.is_absolute()
+            or ".." in parts
+            or ":" in parts[0]
+            or any(any(ord(ch) < 32 for ch in part) for part in parts)
+            or parts[0] != expected_root
+        ):
+            raise zipfile.BadZipFile("unsafe managed Node archive member")
+        normalized = "/".join(parts)
+        if normalized in seen:
+            raise zipfile.BadZipFile("duplicate managed Node archive member")
+        seen.add(normalized)
+        root_names.add(parts[0])
+        declared_size = int(member.file_size)
+        if declared_size < 0 or declared_size > _MAX_MANAGED_NODE_MEMBER_BYTES:
+            raise zipfile.BadZipFile("managed Node archive member is too large")
+        total_bytes += declared_size
+        if total_bytes > _MAX_MANAGED_NODE_ARCHIVE_BYTES:
+            raise zipfile.BadZipFile("managed Node archive is unexpectedly large")
+        mode = (int(member.external_attr) >> 16) & 0o170000
+        if mode == _stat.S_IFLNK:
+            raise zipfile.BadZipFile("managed Node archive contains a symlink")
+        destination = (extract_dir.joinpath(*parts)).resolve(strict=False)
+        if destination != base and base not in destination.parents:
+            raise zipfile.BadZipFile("managed Node archive escapes extraction root")
+
+    if root_names != {expected_root}:
+        raise zipfile.BadZipFile("managed Node archive has unexpected roots")
+
+    for member in members:
+        parts = list(PurePosixPath(member.filename).parts)
+        destination = extract_dir.joinpath(*parts)
+        is_directory = member.is_dir() or str(member.filename).endswith("/")
+        if is_directory:
+            destination.mkdir(parents=True, exist_ok=True)
+            continue
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        # O_EXCL prevents a duplicate/race from replacing a previously-created
+        # file even if an unusual zip implementation reports the same member
+        # twice after validation.
+        flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
+        mode = 0o700 if (int(member.external_attr) >> 16) & _stat.S_IXUSR else 0o600
+        fd = os.open(os.fspath(destination), flags, mode)
+        try:
+            written = 0
+            with archive.open(member, "r") as source, os.fdopen(fd, "wb") as target_file:
+                fd = -1
+                while True:
+                    chunk = source.read(1024 * 1024)
+                    if not chunk:
+                        break
+                    written += len(chunk)
+                    if written > _MAX_MANAGED_NODE_MEMBER_BYTES:
+                        raise zipfile.BadZipFile("managed Node archive member expanded beyond limit")
+                    target_file.write(chunk)
+                target_file.flush()
+                os.fsync(target_file.fileno())
+            if written != int(member.file_size):
+                raise zipfile.BadZipFile("managed Node archive member size mismatch")
+        finally:
+            if fd >= 0:
+                try:
+                    os.close(fd)
+                except OSError:
+                    pass
+
+
 def _heal_managed_node_windows(home: Path | None = None) -> bool | None:
     """Redownload the portable Node zip into ``%HERMES_HOME%\\node`` on Windows.
 
@@ -756,6 +861,8 @@ def _heal_managed_node_windows(home: Path | None = None) -> bool | None:
             zip_bytes = response.read()
     except OSError:
         return False
+    if len(zip_bytes) > _MAX_MANAGED_NODE_ARCHIVE_BYTES:
+        return False
 
     token = uuid.uuid4().hex[:8]
     staged = home / f"node.new-{token}"
@@ -768,34 +875,17 @@ def _heal_managed_node_windows(home: Path | None = None) -> bool | None:
             extract_dir = tmp_path / "extract"
             extract_dir.mkdir()
             with zipfile.ZipFile(zip_path) as archive:
-                members = archive.infolist()
-                total_bytes = 0
-                roots: set[str] = set()
-                for member in members:
-                    member_path = PurePosixPath(member.filename.replace("\\", "/"))
-                    parts = [part for part in member_path.parts if part not in {"", "."}]
-                    if (
-                        not parts
-                        or member_path.is_absolute()
-                        or ".." in parts
-                        or ":" in parts[0]
-                        or not parts[0].startswith("node-v")
-                    ):
-                        raise zipfile.BadZipFile("unsafe managed Node archive member")
-                    roots.add(parts[0])
-                    total_bytes += int(member.file_size)
-                    if total_bytes > 1_073_741_824:
-                        raise zipfile.BadZipFile("managed Node archive is unexpectedly large")
-                if len(roots) != 1:
-                    raise zipfile.BadZipFile("managed Node archive has unexpected roots")
-                archive.extractall(extract_dir, members=members)
-            extracted = next(extract_dir.glob("node-v*"), None)
+                expected_root = zip_name[:-4]
+                _safe_extract_managed_node_archive(
+                    archive, extract_dir, expected_root=expected_root
+                )
+            extracted = extract_dir / expected_root
             if extracted is None or not extracted.is_dir():
                 return False
             # Move the fully-extracted tree to a sibling staging dir so the
             # swap below is a same-volume rename.
             shutil.move(str(extracted), str(staged))
-    except OSError:
+    except (OSError, zipfile.BadZipFile):
         return False
 
     if target.exists():
@@ -833,7 +923,15 @@ def _heal_managed_node_windows(home: Path | None = None) -> bool | None:
             return False
         # The old tree is no longer canonical; locked files may keep it on
         # disk until the next heal attempt, which is safe.
-        shutil.rmtree(backup, ignore_errors=True)
+        from hermes_cli.safe_delete import safe_rmtree
+
+        try:
+            safe_rmtree(backup, home)
+        except OSError:
+            # The old tree may still be held open by a process.  Leaving it
+            # under the validated staging name is safe; a later heal can reap
+            # it once no handles remain.
+            pass
     else:
         try:
             os.replace(str(staged), str(target))

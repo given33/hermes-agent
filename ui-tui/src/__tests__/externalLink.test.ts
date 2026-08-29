@@ -1,13 +1,20 @@
-import { afterEach, describe, expect, it, vi } from 'vitest'
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 
 import {
   __resetLinkTitleCache,
+  __setLinkTitleHostResolverForTests,
   fetchLinkTitle,
   hostPathLabel,
   isTitleFetchable,
   normalizeExternalUrl,
   urlSlugTitleLabel
 } from '../lib/externalLink.js'
+
+const PUBLIC_TEST_ADDRESS = { address: '93.184.216.34', family: 4 as const }
+
+beforeEach(() => {
+  __setLinkTitleHostResolverForTests(async () => [PUBLIC_TEST_ADDRESS])
+})
 
 afterEach(() => {
   __resetLinkTitleCache()
@@ -145,5 +152,60 @@ describe('external link helpers', () => {
     await expect(fetchLinkTitle('mailto:hello@example.com')).resolves.toBe('')
     await expect(fetchLinkTitle('file:///tmp/demo.html')).resolves.toBe('')
     expect(fetchMock).not.toHaveBeenCalled()
+  })
+
+  it('checks every redirect target before making another request', async () => {
+    const fetchMock = vi.fn().mockResolvedValue(
+      new Response(null, {
+        headers: { location: 'http://127.0.0.1:8080/admin' },
+        status: 302
+      })
+    )
+
+    vi.stubGlobal('fetch', fetchMock)
+
+    await expect(fetchLinkTitle('https://example.com/start')).resolves.toBe('')
+    expect(fetchMock).toHaveBeenCalledTimes(1)
+  })
+
+  it('rejects a public hostname whose DNS answer includes a private address', async () => {
+    const fetchMock = vi.fn()
+    vi.stubGlobal('fetch', fetchMock)
+    __setLinkTitleHostResolverForTests(async () => [
+      { address: '93.184.216.34', family: 4 },
+      { address: '169.254.169.254', family: 4 }
+    ])
+
+    await expect(fetchLinkTitle('https://rebound.example.com/')).resolves.toBe('')
+    expect(fetchMock).not.toHaveBeenCalled()
+  })
+
+  it('follows a bounded chain of public redirects with credentials omitted', async () => {
+    const fetchMock = vi
+      .fn()
+      .mockResolvedValueOnce(new Response(null, { headers: { location: '/next' }, status: 302 }))
+      .mockResolvedValueOnce(
+        new Response('<title>Redirected safely</title>', {
+          headers: { 'content-type': 'text/html' },
+          status: 200
+        })
+      )
+
+    vi.stubGlobal('fetch', fetchMock)
+
+    await expect(fetchLinkTitle('https://example.com/start')).resolves.toBe('Redirected safely')
+    expect(fetchMock).toHaveBeenCalledTimes(2)
+    expect(fetchMock.mock.calls[0]?.[1]).toMatchObject({ credentials: 'omit', redirect: 'manual' })
+  })
+
+  it('stops after the redirect budget', async () => {
+    const fetchMock = vi
+      .fn()
+      .mockImplementation(() => new Response(null, { headers: { location: '/again' }, status: 302 }))
+
+    vi.stubGlobal('fetch', fetchMock)
+
+    await expect(fetchLinkTitle('https://example.com/start')).resolves.toBe('')
+    expect(fetchMock).toHaveBeenCalledTimes(6)
   })
 })
