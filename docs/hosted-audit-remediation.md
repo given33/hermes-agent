@@ -9,6 +9,9 @@
 - `hermes_cli/dashboard_auth/audit.py` — 连接器操作审计事件
 - `scripts/backup_hosted_state.py` — 托管状态备份脚本
 - `docs/hosted-audit-remediation.md` — 本文档
+- `hermes_cli/dashboard_auth/client_ip.py` / `middleware.py` — 可信代理 IP
+  与公共路径边界校验
+- `gateway/platforms/bluebubbles.py` — webhook 空凭据拒绝与常量时间校验
 
 ## P0 安全
 
@@ -72,8 +75,18 @@ Bot avatar 生成同样保持官方链路：`/api/bots/{name}/assets/avatar/gene
 
 Petdex 头像选择也不重复实现官方逻辑：`/api/bot-mode/pets/gallery` 直接
 代理注册的 `pet.gallery`，`/api/bots/{name}/assets/avatar/pet` 使用官方
-`pet.thumb` 裁剪首帧后再调用 `profiles.set_asset`。移动端只传 slug 和可选
-manifest URL，不接触 petdex 凭据或本地存储细节。
+ `pet.thumb` 裁剪首帧后再调用 `profiles.set_asset`。移动端只传 slug 和可选
+ manifest URL，不接触 petdex 凭据或本地存储细节。
+
+### 18. 安全回归（2026-08-29）
+
+- 登录限流和审计日志统一使用可信代理感知的 `client_ip`：默认忽略
+  `X-Forwarded-For`，只有连接对端命中 `HERMES_TRUSTED_PROXIES` 时才从
+  右向左解析代理链；伪造请求头不能创建新的限流桶。
+- Dashboard 公共路径只允许完整路由或目录边界，避免类似
+  `/auth/logout-all`、`/api/auth/providers-evil` 的前缀碰撞。
+- BlueBubbles webhook 缺少配置密码、提交空 token 或 token 不匹配时均返回
+  401，并使用 `hmac.compare_digest`；既有消息解析和 mention gating 行为不变。
 
 ## 验证
 

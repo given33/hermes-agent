@@ -88,10 +88,19 @@ def _path_is_public(path: str) -> bool:
     """
     if path in PUBLIC_API_PATHS:
         return True
-    return any(
-        path == prefix or path.startswith(prefix)
-        for prefix in _GATE_PUBLIC_PREFIXES
-    )
+    def matches(prefix: str) -> bool:
+        # A prefix without a trailing slash denotes one route, not an
+        # arbitrary string prefix.  Keep nested resources working (for
+        # example ``/auth/mobile/register``) while preventing look-alikes such
+        # as ``/auth/logout-all`` or ``/api/auth/providers-evil`` from being
+        # silently admitted through the unauthenticated gate.
+        if path == prefix:
+            return True
+        if not prefix.endswith("/"):
+            return path.startswith(prefix + "/")
+        return path.startswith(prefix)
+
+    return any(matches(prefix) for prefix in _GATE_PUBLIC_PREFIXES)
 
 
 def _ordered_session_providers(

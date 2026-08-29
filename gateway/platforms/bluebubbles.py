@@ -9,6 +9,7 @@ downloading from PR #4588 (YuhangLin).
 """
 
 import asyncio
+import hmac
 import json
 import logging
 import os
@@ -909,7 +910,13 @@ class BlueBubblesAdapter(BasePlatformAdapter):
             or request.headers.get("x-guid")
             or request.headers.get("x-bluebubbles-guid")
         )
-        if token != self.password:
+        # A missing webhook password must fail closed.  ``hmac.compare_digest``
+        # keeps the configured secret out of a byte-by-byte timing oracle while
+        # the explicit non-empty checks prevent the historical ``"" == ""``
+        # fail-open when BlueBubbles was started without credentials.
+        expected = str(self.password or "")
+        supplied = str(token or "")
+        if not expected or not supplied or not hmac.compare_digest(supplied, expected):
             return web.json_response({"error": "unauthorized"}, status=401)
         try:
             raw = await request.read()

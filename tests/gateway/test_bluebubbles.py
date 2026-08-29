@@ -115,6 +115,21 @@ class TestBlueBubblesMentionGating:
         assert response.status == 200
         assert handled == []
 
+    @pytest.mark.asyncio
+    async def test_webhook_rejects_missing_configured_password(self, monkeypatch):
+        # An adapter created without a password must never accept an empty
+        # token.  This covers the fail-closed boundary independently of the
+        # normal authenticated path above.
+        adapter = _make_adapter(monkeypatch, password="")
+        response = await adapter._handle_webhook(_FakeBlueBubblesRequest({}, password=""))
+        assert response.status == 401
+
+    @pytest.mark.asyncio
+    async def test_webhook_uses_constant_time_secret_comparison(self, monkeypatch):
+        adapter = _make_adapter(monkeypatch)
+        response = await adapter._handle_webhook(_FakeBlueBubblesRequest({}, password="wrong"))
+        assert response.status == 401
+
 
 class TestBlueBubblesWebhookParsing:
 
@@ -565,5 +580,4 @@ class TestBlueBubblesTimeoutErrorNormalization:
 
         assert not result.success
         assert "500 Internal Server Error" in (result.error or "")
-
 
