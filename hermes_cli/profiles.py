@@ -32,10 +32,16 @@ import threading
 import time
 from collections import OrderedDict
 from dataclasses import dataclass
-from pathlib import Path, PurePosixPath, PureWindowsPath
+from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
 from agent.skill_utils import is_excluded_skill_path
+from hermes_cli.archive_safe import (
+    archive_root_dirs,
+    make_targz,
+    normalize_archive_parts,
+    safe_extract_targz,
+)
 from hermes_constants import (
     clear_named_profile_deleted,
     mark_named_profile_deleted,
@@ -2172,23 +2178,6 @@ def _default_export_ignore(root_dir: Path):
     return _ignore
 
 
-def _make_profile_archive(base: str, root_dir: str, base_dir: str) -> str:
-    """Create ``<base>.tar.gz`` of ``root_dir/base_dir`` — GNU tar format.
-
-    Not :func:`shutil.make_archive`: that writes PAX (Python's tarfile default
-    since 3.8), whose fractional-mtime records macOS Archive Utility rejects —
-    double-clicking an exported profile threw "Error 94 - Bad message." GNU
-    format keeps long paths working (longlink extensions) and stays integer-
-    mtime, so Finder, bsdtar, and gnutar all extract it.
-    """
-    import tarfile
-
-    archive_path = f"{base}.tar.gz"
-    with tarfile.open(archive_path, "w:gz", format=tarfile.GNU_FORMAT) as tf:
-        tf.add(str(Path(root_dir) / base_dir), arcname=base_dir)
-    return archive_path
-
-
 # Text / config suffixes walked during export secret scrubbing. Binary DBs,
 # images, and other non-text artifacts are left alone (they may still leave
 # via named-profile export — scrubbing those is a separate concern).
@@ -2287,7 +2276,7 @@ def export_profile(name: str, output_path: str, extra_files: Optional[Dict[str, 
 
     def _stage_extras(staged: Path) -> None:
         for rel, content in (extra_files or {}).items():
-            parts = _normalize_profile_archive_parts(rel)
+            parts = normalize_archive_parts(rel)
             target = staged.joinpath(*parts)
             target.parent.mkdir(parents=True, exist_ok=True)
             target.write_text(content, encoding="utf-8")
@@ -2306,7 +2295,7 @@ def export_profile(name: str, output_path: str, extra_files: Optional[Dict[str, 
             )
             _stage_extras(staged)
             _scrub_export_secrets(staged)
-            result = _make_profile_archive(base, tmpdir, "default")
+            result = make_targz(base, tmpdir, "default")
             return Path(result)
 
     # Named profiles — stage a filtered copy to exclude credentials
@@ -2321,7 +2310,7 @@ def export_profile(name: str, output_path: str, extra_files: Optional[Dict[str, 
         )
         _stage_extras(staged)
         _scrub_export_secrets(staged)
-        result = _make_profile_archive(base, tmpdir, canon)
+        result = make_targz(base, tmpdir, canon)
         return Path(result)
 
 
@@ -2434,7 +2423,7 @@ def import_profile(archive_path: str, name: Optional[str] = None) -> Path:
     if not archive.exists():
         raise FileNotFoundError(f"Archive not found: {archive}")
 
-    top_dirs = _inspect_profile_archive_roots(archive)
+    top_dirs = archive_root_dirs(archive)
     archive_root = top_dirs.pop() if len(top_dirs) == 1 else None
     inferred_name = name or archive_root
     if not inferred_name:
@@ -2467,7 +2456,7 @@ def import_profile(archive_path: str, name: Optional[str] = None) -> Path:
 
     with tempfile.TemporaryDirectory(prefix="hermes_profile_import_") as tmpdir:
         staging_root = Path(tmpdir)
-        _safe_extract_profile_archive(archive, staging_root)
+        safe_extract_targz(archive, staging_root)
 
         extracted = staging_root / archive_root
         if not extracted.is_dir():
