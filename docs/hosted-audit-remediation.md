@@ -259,3 +259,21 @@ uv run ruff check hermes_runtime hermes_services plugins/collaboration/dashboard
 - 本轮验证：后端 collaboration dashboard `200 passed, 7 skipped, 44 subtests`，
   cloud-files `74 passed`；iOS `pnpm test` `819 passed / 0 failed`，TypeScript 与
   SwiftUI contract check 通过，ruff 通过。当前后端发布提交为 `9e05ecd9a0`。
+
+### 2026-08-30 续审：适配器竞态、同步恢复与 WhatsApp bridge 鉴权
+
+- Discord backfill/live ingress 在策略过滤后执行最终原子 dedup claim；WeCom callback 入队
+  或 handler 失败会释放 claim，供应商重试可以恢复，不会因提前标记而静默丢消息。
+- Matrix 将按 homeserver/user/device 绑定的 `next_batch` checkpoint 原子持久化，重启使用
+  `since` 增量恢复；恢复中的离线房间事件跳过 startup-grace 丢弃，损坏或跨账号 checkpoint
+  fail-closed。
+- WhatsApp Node bridge 的 `/send`、`/messages`、媒体、poll、location、typing、chat、read
+  控制面要求 profile 独立 Bearer token，token 位于 `session/bridge.token`（0600）；`/health`
+  暴露 `authEnabled`，旧的无鉴权 bridge 不再复用。Python 适配器和 standalone sender 统一
+  发送 token。
+- Connector SSE 对时钟回拨/进程重启造成的 stale cursor 重放保留权威历史；mobile
+  managed-resource SSE 每 owner 限制 8 路、单页 200 条，并把空闲轮询从 1 秒自适应退避到
+  5 秒。以上均不改变 iOS WebSocket-first hosted chat 契约。
+- 后端 `e8c73a4408` 已推送；本批整合回归 `394 passed, 8 skipped, 44 subtests`，ruff、
+  py_compile、Node syntax 检查通过。Windows 仍不能替代 macOS Xcode、真机、APNs 及
+  HK/DBB3/PC 生产网络验收。
