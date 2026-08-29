@@ -21,6 +21,7 @@ PUBLIC = ROOT / "deploy" / "public"
 RECOVERY = ROOT / "deploy" / "recovery"
 AUTOMATION = ROOT / "deploy" / "automation"
 UPSTREAM_REPORT = ROOT / "scripts" / "upstream_change_report.py"
+UPSTREAM_GATE = ROOT / "scripts" / "upstream_sync_gate.py"
 UPSTREAM_WORKFLOW = ROOT / ".github" / "workflows" / "upstream-sync.yml"
 DEPLOY_WORKFLOW = ROOT / ".github" / "workflows" / "deploy-three-endpoints.yml"
 SITE_WORKFLOW = ROOT / ".github" / "workflows" / "deploy-site.yml"
@@ -117,6 +118,22 @@ def test_upstream_sync_promotes_verified_merge_without_review_or_deploy():
     assert "codex-review-required" not in workflow
     assert "gh pr merge" not in workflow
     assert "ssh " not in workflow
+
+
+def test_upstream_sync_gate_runs_when_invoked_as_workflow_script():
+    """The workflow executes the file path, so its imports must be root-safe."""
+    result = subprocess.run(
+        [sys.executable, str(UPSTREAM_GATE)],
+        cwd=ROOT,
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+        timeout=30,
+        check=False,
+    )
+    assert result.returncode == 0, result.stderr or result.stdout
+    assert "product-owned invariants passed" in result.stdout
 
 
 def test_deployment_shell_scripts_have_valid_syntax():

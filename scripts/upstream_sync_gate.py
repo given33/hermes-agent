@@ -10,9 +10,17 @@ to evolve.
 from __future__ import annotations
 
 from pathlib import Path
+import sys
 
 
 ROOT = Path(__file__).resolve().parents[1]
+
+# When this file is executed directly (the way the GitHub workflow invokes
+# it), Python puts ``scripts/`` on ``sys.path`` rather than the repository
+# root.  The gate imports the product packages below, so make the execution
+# mode deterministic instead of relying on callers to set PYTHONPATH.
+if str(ROOT) not in sys.path:
+    sys.path.insert(0, str(ROOT))
 
 
 def main() -> int:
