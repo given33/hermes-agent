@@ -8953,6 +8953,7 @@ class CollaborationDashboardTests(unittest.TestCase):
         room_id = str(created["room"]["id"])
         module.join_room_by_code(module.RoomJoinBody(invite_code="QUOTEX"), request_b)
         module.start_hosted_workflow = lambda *_args: None
+        first_response = None
         for index in range(4):
             response = module.send_message(
                 room_id,
@@ -8960,6 +8961,15 @@ class CollaborationDashboardTests(unittest.TestCase):
                 request_b,
             )
             assert response["accepted"] is True
+            if index == 0:
+                first_response = response
+        replay = module.send_message(
+            room_id,
+            module.SendMessageBody(content="member-0", request_id="member-0"),
+            request_b,
+        )
+        self.assertTrue(replay["replayed"])
+        self.assertEqual(replay["turn_id"], first_response["turn_id"])
         with self.assertRaises(module.HTTPException) as ctx:
             module.send_message(
                 room_id,

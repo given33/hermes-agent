@@ -23641,26 +23641,6 @@ def send_message(room_id: str, payload: SendMessageBody, request: Request):
             room_owner_id,
             str(room.get("account_generation") or account_generation),
         )
-        # A joined member may submit distinct request IDs, so idempotency
-        # alone is not a resource boundary. Cap concurrent hosted turns per
-        # non-owner member while leaving the room owner on the normal gateway
-        # quota path.
-        if owner_id != room_owner_id:
-            active_member_turns = sum(
-                1
-                for candidate in (conversation.get("hosted_turns") or {}).values()
-                if isinstance(candidate, dict)
-                and str(
-                    (candidate.get("room_request") or {}).get("sender_id") or ""
-                ) == owner_id
-                and str(candidate.get("status") or "queued")
-                not in _HOSTED_TERMINAL_STATUSES
-            )
-            if active_member_turns >= _ROOM_MEMBER_ACTIVE_TURN_LIMIT:
-                raise HTTPException(
-                    status_code=429,
-                    detail="Too many active hosted turns for this room member",
-                )
         room_requests = room.get("hosted_requests")
         if not isinstance(room_requests, dict):
             room_requests = {}
@@ -23722,6 +23702,26 @@ def send_message(room_id: str, payload: SendMessageBody, request: Request):
             save_single_state(single_state)
             save_state(state)
         else:
+            # A joined member may submit distinct request IDs, so idempotency
+            # alone is not a resource boundary. Cap concurrent hosted turns
+            # only for a genuinely new request; retries of an existing
+            # request must still return its idempotent replay response.
+            if owner_id != room_owner_id:
+                active_member_turns = sum(
+                    1
+                    for candidate in (conversation.get("hosted_turns") or {}).values()
+                    if isinstance(candidate, dict)
+                    and str(
+                        (candidate.get("room_request") or {}).get("sender_id") or ""
+                    ) == owner_id
+                    and str(candidate.get("status") or "queued")
+                    not in _HOSTED_TERMINAL_STATUSES
+                )
+                if active_member_turns >= _ROOM_MEMBER_ACTIVE_TURN_LIMIT:
+                    raise HTTPException(
+                        status_code=429,
+                        detail="Too many active hosted turns for this room member",
+                    )
             artifact_required = requires_artifact_delivery(content)
             worker_targets = [
                 profile.removesuffix("-worker")
