@@ -105,6 +105,9 @@ Petdex 头像选择也不重复实现官方逻辑：`/api/bot-mode/pets/gallery`
   `flush_token_counts` 数据库适配器均已修复，随后针对性测试通过且不再产生线程未处理异常。
 - `uv run ruff check` 覆盖本次运行时、认证安全和测试改动，全部通过。Windows 环境未执行
   Xcode 原生编译；iOS 原生编译仍需 macOS CI 或签名构建机验证。
+- 推送后的部署/角色快速回归：`87 passed`（云部署资产 + DBB3/worker 会话缓存），Bot Mode
+  官方接口 `8 passed`，BlueBubbles 与公共路径边界安全回归 `27 passed`。后端 `origin/main`
+  与本地 `HEAD` 已一致，且 `HEAD...upstream/main` 右侧为 `0`。
 
 本次同步与角色重构已运行并通过：
 
