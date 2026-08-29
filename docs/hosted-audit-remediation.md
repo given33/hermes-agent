@@ -240,3 +240,7 @@ uv run ruff check hermes_runtime hermes_services plugins/collaboration/dashboard
 发布锚点：官方 `upstream/main` `1e21fe8624` 已合并，后端提交
 `1a13129011` 已推送到 `origin/main`；该提交同时包含部署器对 merge 暂存删除文件
 的防护，避免退役 reviewer 模块再次被误判为运行时缺失。
+
+上游后续提交 `835a913ffd`、`0ffad55e09`、`4209d371aa`（压缩失败冷却、Portal
+推荐模型校验）已在 `273111e56f` 追加合并并通过上游新增回归 `61 passed`；同步门禁
+再次通过后已准备推送。
