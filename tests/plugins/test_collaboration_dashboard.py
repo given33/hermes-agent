@@ -220,14 +220,14 @@ def test_connector_stream_fans_out_wake_events_to_overlapping_reconnects():
         )
         assert first.get_nowait()["remote_run_id"] == "run-1"
         assert second.get_nowait()["remote_run_id"] == "run-1"
-        # A stalled stream is bounded; the newest wake replaces stale data
-        # instead of growing an unbounded process-local queue.
+        # A stalled stream is bounded; overflow is explicit so the connector
+        # reconnects with Last-Event-ID and replays authoritative history.
         first.put_nowait({"type": "stale"})
         module._push_connector_event(
             "dbb3-primary",
             {"type": "run.terminal", "remote_run_id": "run-1"},
         )
-        assert first.get_nowait()["type"] == "run.terminal"
+        assert first.get_nowait() is None
     finally:
         module._CONNECTOR_STREAM_QUEUES.pop("dbb3-primary", None)
 

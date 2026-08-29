@@ -18631,22 +18631,34 @@ def _push_connector_event(connector_id: str, event: dict[str, Any]) -> None:
             stream_queue.put_nowait(dict(stamped))
         except queue.Full:
             try:
-                dropped = stream_queue.get_nowait()
-                dropped_id = str(dropped.get("id") or "") if isinstance(dropped, dict) else ""
-                try:
-                    # Keep the newest lifecycle wake in the live connection.
-                    # Intermediate frames remain recoverable from the bounded
-                    # history on reconnect, while a terminal frame must not
-                    # be hidden behind a gap sentinel (which otherwise forces
-                    # an unnecessary disconnect before the client can observe
-                    # the authoritative state).
-                    stream_queue.put_nowait(dict(stamped))
-                except queue.Full:
-                    pass
+                # A slow consumer can no longer receive a contiguous stream.
+                # Drop the bounded backlog and enqueue a gap sentinel so the
+                # generator closes promptly.  The connector reconnects with
+                # Last-Event-ID and replays the authoritative history; keeping
+                # a newer wake in this queue would hide the loss and leave the
+                # consumer believing it had seen every lifecycle event.
+                dropped_ids: list[str] = []
+                gap_already_queued = False
+                while True:
+                    try:
+                        dropped = stream_queue.get_nowait()
+                    except queue.Empty:
+                        break
+                    if dropped is None:
+                        # A previous overflow already scheduled the close.
+                        # Do not append another sentinel or disturb it.
+                        gap_already_queued = True
+                        break
+                    if isinstance(dropped, dict):
+                        dropped_id = str(dropped.get("id") or "")
+                        if dropped_id:
+                            dropped_ids.append(dropped_id)
+                if not gap_already_queued:
+                    stream_queue.put_nowait(None)
                 logger.warning(
-                    "Connector %s SSE consumer dropped event %s; retained newest wake",
+                    "Connector %s SSE consumer queue overflow; forcing history replay (dropped=%s)",
                     normalized,
-                    dropped_id,
+                    ",".join(dropped_ids[-8:]) or "unknown",
                 )
             except Exception:
                 pass
