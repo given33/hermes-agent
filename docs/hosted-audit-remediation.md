@@ -92,7 +92,7 @@ Petdex 头像选择也不重复实现官方逻辑：`/api/bot-mode/pets/gallery`
 
 ### 2026-08-29 上游同步核验
 
-- 已从 `upstream/main` 同步到官方最新提交 `23bae43cfa`，本地先后以合并提交 `f7891d6aaf`、`08574b9995` 完成整合；最终修复提交为 `9d6aa62ef8`。推送前后均以 `git rev-list --left-right --count HEAD...upstream/main` 核验右侧差异为 `0`，表示没有漏掉上游新增提交。
+- 已从 `upstream/main` 同步到官方最新提交 `aff5125f8e`，本地先后以合并提交 `f7891d6aaf`、`08574b9995`、`2d6f08be4a` 完成整合；最终修复提交为 `9d6aa62ef8`。推送前后均以 `git rev-list --left-right --count HEAD...upstream/main` 核验右侧差异为 `0`，表示没有漏掉上游新增提交。
 - 本次合并冲突仅出现在 `agent/agent_runtime_helpers.py` 的桌面预览工具清单：保留官方 `desktop_preview`、`drive_preview`、`annotate_preview`，并保留旧实现代码但不再把已下线的 `read_preview` 注册为独立后钩子工具；未覆盖 HK worker、三端部署、WebSocket worker 通道或调度员/worker 角色边界。
 - 合并后重新执行协作、云文件、受管资源、云部署资产和安装拓扑回归：`346 passed, 7 skipped, 44 subtests passed`。
 - 合并后的 Bot Mode 官方接口回归仍通过：`tests/hermes_cli/test_web_server.py -k "bot_"` 为 `8 passed`（含 relay、头像生成与 Petdex 选择）；部署资产回归为 `60 passed`（含 worker connector 隔离断言）。
@@ -110,6 +110,8 @@ Petdex 头像选择也不重复实现官方逻辑：`/api/bot-mode/pets/gallery`
   与本地 `HEAD` 已一致，且 `HEAD...upstream/main` 右侧为 `0`。
 - 上游随后新增的 Vertex 凭据快照和 list-shaped streaming delta 修复也已再次合并；对应
   `tests/agent/test_vertex_adapter.py tests/run_agent/test_streaming.py` 回归为 `49 passed`。
+- 随后新增的 gateway turn-hold 上限、i18n deferred notice 与 `hygiene_max_turn_hold_seconds`
+  配置也已合并；`tests/gateway/test_session_hygiene.py` 回归为 `17 passed`。
 
 本次同步与角色重构已运行并通过：
 
