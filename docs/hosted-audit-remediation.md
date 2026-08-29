@@ -185,7 +185,7 @@ uv run ruff check hermes_runtime hermes_services plugins/collaboration/dashboard
   操作。具体对齐矩阵和性能记录见审计目录中的
   `HERMES-FEATURE-ALIGNMENT-MATRIX-2026-08-29.md` 与
   `IOS-HERMES-PERFORMANCE-OPTIMIZATION-2026-08-29.md`。
-- 本轮证据：iOS `pnpm test` 为 `808 passed`，`pnpm typecheck` 与
+- 本轮证据：iOS `pnpm test` 为 `809 passed`，`pnpm typecheck` 与
   `pnpm contract:check` 通过；后端上游/部署/worker/WebSocket 聚焦回归 `160 passed`，
   上游 optional-skills/model 聚焦回归 `71 passed`，ruff 通过。Windows 没有 Xcode、
   真机或生产四节点凭据，Swift archive、APNs、真实网络 RTT 和 HK 主机实测仍由 macOS CI
