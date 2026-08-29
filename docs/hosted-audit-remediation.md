@@ -243,4 +243,4 @@ uv run ruff check hermes_runtime hermes_services plugins/collaboration/dashboard
 
 上游后续提交 `835a913ffd`、`0ffad55e09`、`4209d371aa`（压缩失败冷却、Portal
 推荐模型校验）已在 `273111e56f` 追加合并并通过上游新增回归 `61 passed`；同步门禁
-再次通过后已准备推送。
+再次通过后已推送到 `origin/main`。
