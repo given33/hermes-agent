@@ -632,6 +632,10 @@ class BotMetaUpdate(BaseModel):
     pinned: Optional[bool] = None
     color: Optional[str] = Field(default=None, max_length=32)
     shape: Optional[str] = Field(default=None, max_length=64)
+    description: Optional[str] = Field(default=None, max_length=4096)
+    custom: Optional[bool] = None
+    imageKind: Optional[str] = Field(default=None, max_length=32)
+    group: Optional[str] = Field(default=None, max_length=120)
     groups: Optional[List[str]] = None
 
     @field_validator("groups")
@@ -647,6 +651,34 @@ class BotMetaUpdate(BaseModel):
         if len(result) > 32:
             raise ValueError("groups must contain at most 32 entries")
         return result
+
+
+class BotProfileConfigure(BaseModel):
+    """Mobile-safe subset of the upstream ``profiles.configure`` RPC.
+
+    The desktop Bot Mode editor sends these same fields over the gateway
+    JSON-RPC channel.  Keeping a typed REST envelope lets iOS use the
+    authenticated HTTP transport while the server still delegates to the
+    canonical upstream handler (no second config writer).
+    """
+
+    description: Optional[str] = Field(default=None, max_length=4096)
+    soul: Optional[str] = Field(default=None, max_length=2_000_000)
+    provider: Optional[str] = Field(default=None, max_length=120)
+    model: Optional[str] = Field(default=None, max_length=240)
+    disabled_skills: Optional[List[str]] = None
+    enabled_toolsets: Optional[List[str]] = None
+    enabled_mcp_servers: Optional[List[str]] = None
+    ui_meta: Optional[Dict[str, Any]] = None
+    ui_meta_expected_revisions: Optional[Dict[str, int]] = None
+    confirm_expensive_model: Optional[bool] = None
+
+
+class BotAssetUpdate(BaseModel):
+    """Avatar upload envelope matching upstream ``profiles.set_asset``."""
+
+    data: Optional[str] = Field(default=None, max_length=4_000_000)
+    clear: bool = False
 
 
 class ProfileExport(BaseModel):

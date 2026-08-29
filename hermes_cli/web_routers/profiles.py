@@ -42,6 +42,8 @@ from hermes_cli.web_models import (
     StudioMemoryUpdate,
     ProfileModelUpdate,
     ProfileDescribeAuto,
+    BotProfileConfigure,
+    BotAssetUpdate,
     SessionPrScanBody,
 )
 
@@ -860,6 +862,7 @@ async def list_bots_endpoint():
                 **row,
                 "canonical_session": canonical_session(row),
                 "bot_meta": _bot_meta_for_row(row),
+                "has_avatar": _bot_has_avatar_for_row(row),
             }
             for row in rows
             if isinstance(row, dict)
@@ -899,13 +902,15 @@ def _safe_bot_meta(value: Any) -> Dict[str, Any]:
     if not isinstance(value, dict):
         return {}
     out: Dict[str, Any] = {}
-    for key in ("title", "color", "shape"):
+    for key in ("title", "color", "shape", "description", "imageKind", "group"):
         item = value.get(key)
         if isinstance(item, str) and item.strip():
             out[key] = item.strip()[:120]
-    for key in ("hidden", "pinned"):
+    for key in ("hidden", "pinned", "custom"):
         if isinstance(value.get(key), bool):
             out[key] = value[key]
+    if isinstance(value.get("created"), (int, float)) and not isinstance(value.get("created"), bool):
+        out["created"] = value["created"]
     groups = value.get("groups")
     if isinstance(groups, list):
         out["groups"] = list(dict.fromkeys(
@@ -913,6 +918,43 @@ def _safe_bot_meta(value: Any) -> Dict[str, Any]:
             if str(group or "").strip()
         ))[:32]
     return out
+
+
+def _bot_has_avatar_for_row(row: Dict[str, Any]) -> bool:
+    path = str(row.get("path") or "").strip()
+    if not path:
+        return False
+    assets = Path(path) / "assets"
+    return any((assets / f"avatar.{ext}").is_file() for ext in ("png", "jpg", "webp"))
+
+
+def _invoke_profile_gateway_rpc(method: str, params: Dict[str, Any]) -> Dict[str, Any]:
+    """Invoke one canonical upstream profile RPC and unwrap its result.
+
+    Bot Mode's desktop implementation speaks JSON-RPC.  The mobile REST
+    bridge intentionally calls the exact registered handler instead of
+    reimplementing profile configuration/asset semantics in this router.
+    ``profiles.configure`` and asset calls are synchronous filesystem work,
+    so endpoints invoke this helper from ``asyncio.to_thread`` below.
+    """
+    from tui_gateway import server as gateway_server
+
+    handler = gateway_server._methods.get(method)
+    if handler is None:
+        raise HTTPException(status_code=503, detail=f"upstream RPC unavailable: {method}")
+    response = handler(f"rest-{method}", params)
+    if not isinstance(response, dict):
+        raise HTTPException(status_code=502, detail=f"invalid upstream response for {method}")
+    error = response.get("error")
+    if isinstance(error, dict):
+        message = str(error.get("message") or error.get("code") or "upstream RPC failed")
+        code = error.get("code")
+        status = 400 if isinstance(code, int) and 4000 <= code < 5000 else 502
+        raise HTTPException(status_code=status, detail=message)
+    result = response.get("result")
+    if not isinstance(result, dict):
+        raise HTTPException(status_code=502, detail=f"invalid upstream result for {method}")
+    return result
 
 
 def _bot_meta_path(name: str) -> Path:
@@ -960,7 +1002,7 @@ async def update_bot_meta_endpoint(name: str, body: BotMetaUpdate):
                 merged[key] = cleaned
             else:
                 merged.pop(key, None)
-        elif key in {"color", "shape"}:
+        elif key in {"color", "shape", "description", "imageKind", "group"}:
             cleaned = str(value or "").strip()
             if cleaned:
                 merged[key] = cleaned
@@ -977,6 +1019,69 @@ async def update_bot_meta_endpoint(name: str, body: BotMetaUpdate):
         "meta": merged,
         "applied": {"ui_meta": True},
     }
+
+
+@router.get("/api/bots/{name}/describe")
+async def describe_bot_endpoint(name: str):
+    """Return the full upstream Bot Mode profile capability snapshot."""
+    # Resolve the canonical profile id first so encoded/aliased names follow
+    # the same safety rules as every other Bot Mode endpoint.
+    _bot_meta_path(name)
+    result = await asyncio.to_thread(
+        _invoke_profile_gateway_rpc,
+        "profiles.describe",
+        {"name": name},
+    )
+    return {"ok": True, "bot_mode": True, **result}
+
+
+@router.patch("/api/bots/{name}/configure")
+async def configure_bot_endpoint(name: str, body: BotProfileConfigure):
+    """Apply the official ``profiles.configure`` contract to one bot."""
+    _bot_meta_path(name)
+    params = body.model_dump(exclude_unset=True)
+    params["name"] = name
+    result = await asyncio.to_thread(
+        _invoke_profile_gateway_rpc,
+        "profiles.configure",
+        params,
+    )
+    return {"ok": bool(result.get("ok", True)), "bot_mode": True, **result}
+
+
+@router.get("/api/bots/{name}/assets/{asset}")
+async def get_bot_asset_endpoint(name: str, asset: str = "avatar"):
+    """Fetch an upstream Bot Mode asset (currently ``avatar``)."""
+    _bot_meta_path(name)
+    result = await asyncio.to_thread(
+        _invoke_profile_gateway_rpc,
+        "profiles.get_asset",
+        {"name": name, "asset": asset},
+    )
+    return {"ok": True, "bot_mode": True, "asset": asset, **result}
+
+
+@router.put("/api/bots/{name}/assets/{asset}")
+async def set_bot_asset_endpoint(name: str, body: BotAssetUpdate, asset: str = "avatar"):
+    """Store an upstream Bot Mode asset atomically on the profile."""
+    _bot_meta_path(name)
+    params: Dict[str, Any] = {"name": name, "asset": asset, "clear": body.clear}
+    if body.data is not None:
+        params["data"] = body.data
+    result = await asyncio.to_thread(_invoke_profile_gateway_rpc, "profiles.set_asset", params)
+    return {"ok": bool(result.get("ok", True)), "bot_mode": True, "asset": asset, **result}
+
+
+@router.delete("/api/bots/{name}/assets/{asset}")
+async def clear_bot_asset_endpoint(name: str, asset: str = "avatar"):
+    """Delete an upstream Bot Mode asset without touching profile metadata."""
+    _bot_meta_path(name)
+    result = await asyncio.to_thread(
+        _invoke_profile_gateway_rpc,
+        "profiles.set_asset",
+        {"name": name, "asset": asset, "clear": True},
+    )
+    return {"ok": bool(result.get("ok", True)), "bot_mode": True, "asset": asset, **result}
 
 
 @router.post("/api/profiles")

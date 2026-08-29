@@ -120,7 +120,7 @@ async def test_bot_meta_mobile_route_round_trips_upstream_presentation_state(mon
 
     updated = await profiles_router.update_bot_meta_endpoint(
         "hk-worker",
-        profiles_router.BotMetaUpdate(title="HK Worker", hidden=True, pinned=True, groups=["ops", "infra", "ops"]),
+        profiles_router.BotMetaUpdate(title="HK Worker", hidden=True, pinned=True, groups=["ops", "infra", "ops"], description="Hong Kong worker", imageKind="photo", group="hk"),
     )
     assert updated["applied"] == {"ui_meta": True}
     assert updated["meta"]["groups"] == ["ops", "infra"]
@@ -128,6 +128,83 @@ async def test_bot_meta_mobile_route_round_trips_upstream_presentation_state(mon
     assert persisted["title"] == "HK Worker"
     assert persisted["hidden"] is True
     assert persisted["pinned"] is True
+    assert persisted["description"] == "Hong Kong worker"
+    assert persisted["imageKind"] == "photo"
+    assert persisted["group"] == "hk"
+
+
+@pytest.mark.asyncio
+async def test_bot_profile_capabilities_delegate_to_official_gateway_handlers(monkeypatch, tmp_path):
+    """Mobile Bot Mode must use the upstream describe/configure RPC contract."""
+    from hermes_cli.web_routers import profiles as profiles_router
+    from tui_gateway import server as gateway_server
+
+    profile_dir = tmp_path / "coder"
+    profile_dir.mkdir()
+    monkeypatch.setattr(profiles_router, "_resolve_profile_dir", lambda _name: profile_dir)
+    calls = []
+
+    def describe(rid, params):
+        calls.append(("profiles.describe", rid, params))
+        return {"jsonrpc": "2.0", "id": rid, "result": {
+            "name": "coder", "model": {"provider": "openai", "default": "gpt-5.6-sol"},
+            "skills": [{"name": "coding", "enabled": True}], "toolsets": [], "mcp_servers": [],
+        }}
+
+    def configure(rid, params):
+        calls.append(("profiles.configure", rid, params))
+        return {"jsonrpc": "2.0", "id": rid, "result": {"ok": True, "applied": {"soul": True}}}
+
+    monkeypatch.setitem(gateway_server._methods, "profiles.describe", describe)
+    monkeypatch.setitem(gateway_server._methods, "profiles.configure", configure)
+
+    snapshot = await profiles_router.describe_bot_endpoint("coder")
+    assert snapshot["bot_mode"] is True
+    assert snapshot["model"]["default"] == "gpt-5.6-sol"
+
+    updated = await profiles_router.configure_bot_endpoint(
+        "coder",
+        profiles_router.BotProfileConfigure(soul="# coder", enabled_toolsets=["web"]),
+    )
+    assert updated["ok"] is True
+    assert calls[0][0] == "profiles.describe"
+    assert calls[1][0] == "profiles.configure"
+    assert calls[1][2]["name"] == "coder"
+    assert calls[1][2]["enabled_toolsets"] == ["web"]
+
+
+@pytest.mark.asyncio
+async def test_bot_asset_routes_delegate_and_preserve_data_url_contract(monkeypatch, tmp_path):
+    """Avatar upload/read/clear use official profiles.set/get_asset handlers."""
+    from hermes_cli.web_routers import profiles as profiles_router
+    from tui_gateway import server as gateway_server
+
+    profile_dir = tmp_path / "artist"
+    profile_dir.mkdir()
+    monkeypatch.setattr(profiles_router, "_resolve_profile_dir", lambda _name: profile_dir)
+    calls = []
+
+    def set_asset(rid, params):
+        calls.append(("set", params))
+        return {"jsonrpc": "2.0", "id": rid, "result": {"ok": True, "asset": "avatar", "size": 8}}
+
+    def get_asset(rid, params):
+        calls.append(("get", params))
+        return {"jsonrpc": "2.0", "id": rid, "result": {"found": True, "mime": "image/png", "size": 8, "data": "data:image/png;base64,AA=="}}
+
+    monkeypatch.setitem(gateway_server._methods, "profiles.set_asset", set_asset)
+    monkeypatch.setitem(gateway_server._methods, "profiles.get_asset", get_asset)
+
+    uploaded = await profiles_router.set_bot_asset_endpoint(
+        "artist", profiles_router.BotAssetUpdate(data="data:image/png;base64,AA=="), "avatar"
+    )
+    fetched = await profiles_router.get_bot_asset_endpoint("artist", "avatar")
+    cleared = await profiles_router.clear_bot_asset_endpoint("artist", "avatar")
+    assert uploaded["size"] == 8
+    assert fetched["data"].startswith("data:image/png")
+    assert cleared["ok"] is True
+    assert calls[0][1]["data"].startswith("data:image/png")
+    assert calls[2][1]["clear"] is True
 
 
 # ---------------------------------------------------------------------------
