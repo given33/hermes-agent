@@ -114,8 +114,6 @@ AGENT_RUNTIME_POST_HOOK_TOOL_NAMES = frozenset(
         "memory",
         "clarify",
         "read_terminal",
-        # Legacy preview reader retained for existing clients.
-        "read_preview",
         # Official desktop preview tools added upstream.
         "desktop_preview",
         "drive_preview",

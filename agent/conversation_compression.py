@@ -671,7 +671,12 @@ class CompressionCommitFence:
         # ContextCompressor._call_summary_llm). Waiters use it to distinguish
         # a SLOW-but-alive summary model from a HUNG one, so slow models are
         # not killed by a fixed wall-clock deadline while tokens are moving.
-        self._last_progress = time.monotonic()
+        # ``time.monotonic`` is backed by GetTickCount64 on Windows and may
+        # only advance every 15.6 ms.  Progress checks are frequently sampled
+        # immediately after a keep-alive frame; using the high-resolution
+        # performance counter avoids reporting an exact zero idle interval and
+        # keeps the fence semantics platform-independent.
+        self._last_progress = time.perf_counter()
 
     def touch_progress(self) -> None:
         """Record forward progress (e.g. a streamed summary token arriving).
@@ -680,11 +685,11 @@ class CompressionCommitFence:
         :meth:`seconds_since_progress`. A bare float store is atomic in
         CPython, so no lock is needed.
         """
-        self._last_progress = time.monotonic()
+        self._last_progress = time.perf_counter()
 
     def seconds_since_progress(self) -> float:
         """Seconds since the worker last reported forward progress."""
-        return max(0.0, time.monotonic() - self._last_progress)
+        return max(0.0, time.perf_counter() - self._last_progress)
 
     def cancel_before_commit(self, cancel_event: Any = None) -> bool:
         """Cancel a pending commit, or wait for an active commit to finish.
