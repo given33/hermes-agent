@@ -285,3 +285,4 @@ uv run ruff check hermes_runtime hermes_services plugins/collaboration/dashboard
 - `f3dd45f11c` 已推送；随后 `40b83dfe50` 修复达到上限时同一 request 仍需幂等 replay 的
   边界。完整 dashboard 回归 `201 passed, 7 skipped, 44 subtests`，新增跨账号成员 quota
   测试通过。
+- WhatsApp stale-bridge 日志再由 `d6a5450e15` 明确区分鉴权关闭与配置漂移，便于升级后诊断。
