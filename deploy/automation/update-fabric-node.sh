@@ -43,11 +43,11 @@ case "${role}" in
     ;;
   wsl)
     token_file="${HERMES_CLOUD_TOKEN_FILE:-/etc/pc-team/cloud_connector_token}"
-    connector_id="${DBB3_CONNECTOR_ID:-pc-primary}"
+    connector_id="${PC_CONNECTOR_ID:-pc-primary}"
     ;;
   hk)
     token_file="${HERMES_CLOUD_TOKEN_FILE:-/etc/hk-team/cloud_connector_token}"
-    connector_id="${DBB3_CONNECTOR_ID:-hk-primary}"
+    connector_id="${HK_CONNECTOR_ID:-hk-primary}"
     ;;
 esac
 [[ -f "${token_file}" && ! -L "${token_file}" ]] || die "connector token is missing or unsafe"

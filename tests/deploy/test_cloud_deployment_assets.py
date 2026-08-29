@@ -657,6 +657,13 @@ def test_transactional_installers_serialize_deployments_and_use_unique_backups()
     assert 'flock -n 8 || die "another connector deployment is already running"' in connector
 
 
+def test_fabric_updater_uses_distinct_connector_id_overrides_per_worker():
+    updater = (AUTOMATION / "update-fabric-node.sh").read_text(encoding="utf-8")
+    assert 'connector_id="${DBB3_CONNECTOR_ID:-dbb3-primary}"' in updater
+    assert 'connector_id="${PC_CONNECTOR_ID:-pc-primary}"' in updater
+    assert 'connector_id="${HK_CONNECTOR_ID:-hk-primary}"' in updater
+
+
 def test_public_installer_reclaims_only_bounded_deployment_artifacts_on_disk_pressure():
     public = (PUBLIC / "install-collaboration-backend.sh").read_text(encoding="utf-8")
 
