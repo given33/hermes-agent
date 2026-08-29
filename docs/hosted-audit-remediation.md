@@ -70,6 +70,11 @@ Bot avatar 生成同样保持官方链路：`/api/bots/{name}/assets/avatar/gene
 调用注册的 `image.generate` handler，再把返回的 data URL 交给
 `profiles.set_asset`；生成器不可用时返回明确失败，不写入半成品。
 
+Petdex 头像选择也不重复实现官方逻辑：`/api/bot-mode/pets/gallery` 直接
+代理注册的 `pet.gallery`，`/api/bots/{name}/assets/avatar/pet` 使用官方
+`pet.thumb` 裁剪首帧后再调用 `profiles.set_asset`。移动端只传 slug 和可选
+manifest URL，不接触 petdex 凭据或本地存储细节。
+
 ## 验证
 
 ### 2026-08-29 上游同步核验
@@ -77,7 +82,7 @@ Bot avatar 生成同样保持官方链路：`/api/bots/{name}/assets/avatar/gene
 - 已从 `upstream/main` 同步到官方提交 `9f90cd438c`，本地以合并提交 `bb468947da` 完成整合；`HEAD...upstream/main` 的右侧差异为 `0`，表示没有漏掉上游新增提交。
 - 合并冲突仅出现在 `hermes_cli/profiles.py`：保留本项目的安全 profile 归档辅助函数，同时保留官方 profile 实现；未覆盖 HK worker、三端部署、WebSocket worker 通道或调度员/worker 角色边界。
 - 合并后重新执行协作、云文件、受管资源、云部署资产和安装拓扑回归：`346 passed, 7 skipped, 44 subtests passed`。
-- 合并后的 Bot Mode 官方接口回归仍通过：`tests/hermes_cli/test_web_server.py -k "bot_"` 为 `7 passed`（含 relay 与头像生成）；部署资产回归为 `58 passed, 1 skipped`。
+- 合并后的 Bot Mode 官方接口回归仍通过：`tests/hermes_cli/test_web_server.py -k "bot_"` 为 `8 passed`（含 relay、头像生成与 Petdex 选择）；部署资产回归为 `58 passed, 1 skipped`。
 - 上游同步采用直接验证后的 fast-forward/merge 推送到本项目 `main`，不创建审阅者或 Codex 审查回合；推送完成后应再次确认 `HEAD...origin/main` 为 `0 0`。
 
 本次同步与角色重构已运行并通过：

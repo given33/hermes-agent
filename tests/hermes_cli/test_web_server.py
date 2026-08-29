@@ -286,6 +286,58 @@ async def test_bot_avatar_generation_delegates_image_and_asset_handlers(monkeypa
     assert calls[1][1]["asset"] == "avatar"
 
 
+@pytest.mark.asyncio
+async def test_bot_pet_gallery_and_avatar_selection_delegate_to_official_handlers(monkeypatch, tmp_path):
+    """Petdex gallery + Bot avatar selection stay on upstream RPC semantics."""
+    from hermes_cli.web_routers import profiles as profiles_router
+    from tui_gateway import server as gateway_server
+
+    profile_dir = tmp_path / "pet-bot"
+    profile_dir.mkdir()
+    monkeypatch.setattr(profiles_router, "_resolve_profile_dir", lambda _name: profile_dir)
+    calls = []
+
+    def gallery(rid, params):
+        calls.append(("gallery", params))
+        return {"jsonrpc": "2.0", "id": rid, "result": {
+            "enabled": False,
+            "active": "",
+            "pets": [{"slug": "otter", "displayName": "Otter", "spritesheetUrl": "https://petdex/otter.webp"}],
+        }}
+
+    def thumb(rid, params):
+        calls.append(("thumb", params))
+        return {"jsonrpc": "2.0", "id": rid, "result": {
+            "ok": True,
+            "slug": params["slug"],
+            "dataUri": "data:image/png;base64,AA==",
+        }}
+
+    def set_asset(rid, params):
+        calls.append(("set_asset", params))
+        return {"jsonrpc": "2.0", "id": rid, "result": {"ok": True, "size": 8}}
+
+    monkeypatch.setitem(gateway_server._methods, "pet.gallery", gallery)
+    monkeypatch.setitem(gateway_server._methods, "pet.thumb", thumb)
+    monkeypatch.setitem(gateway_server._methods, "profiles.set_asset", set_asset)
+
+    listed = await profiles_router.get_bot_pet_gallery_endpoint()
+    assert listed["bot_mode"] is True
+    assert listed["pets"][0]["slug"] == "otter"
+
+    selected = await profiles_router.set_bot_pet_avatar_endpoint(
+        "pet-bot",
+        profiles_router.BotPetSelect(slug="otter", url="https://petdex/otter.webp"),
+    )
+    assert selected["ok"] is True
+    assert selected["pet"]["slug"] == "otter"
+    assert calls == [
+        ("gallery", {}),
+        ("thumb", {"slug": "otter", "url": "https://petdex/otter.webp"}),
+        ("set_asset", {"name": "pet-bot", "asset": "avatar", "data": "data:image/png;base64,AA=="}),
+    ]
+
+
 # ---------------------------------------------------------------------------
 # Shared fixtures
 # ---------------------------------------------------------------------------

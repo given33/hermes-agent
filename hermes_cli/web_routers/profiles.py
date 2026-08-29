@@ -46,6 +46,7 @@ from hermes_cli.web_models import (
     BotProfileConfigure,
     BotAssetUpdate,
     BotAvatarGenerate,
+    BotPetSelect,
     BotRelaySend,
     SessionPrScanBody,
 )
@@ -1009,6 +1010,19 @@ async def send_bot_relay_endpoint(body: BotRelaySend):
     return await asyncio.to_thread(enqueue)
 
 
+@router.get("/api/bot-mode/pets/gallery")
+async def get_bot_pet_gallery_endpoint():
+    """Expose the official Petdex gallery to mobile Bot Mode clients.
+
+    This is deliberately a thin REST adapter over ``pet.gallery``.  The
+    upstream handler owns manifest caching, offline fallback and installed
+    state, so iOS and desktop cannot drift into separate pet catalog logic.
+    """
+
+    result = await asyncio.to_thread(_invoke_profile_gateway_rpc, "pet.gallery", {})
+    return {"ok": True, "bot_mode": True, **result}
+
+
 def _invoke_profile_gateway_rpc(method: str, params: Dict[str, Any]) -> Dict[str, Any]:
     """Invoke one canonical upstream profile RPC and unwrap its result.
 
@@ -1191,6 +1205,41 @@ async def generate_bot_avatar_endpoint(name: str, body: BotAvatarGenerate):
         return {"ok": bool(stored.get("ok", True)), "bot_mode": True, "asset": "avatar", "image_data": image_data, **stored}
 
     return await asyncio.to_thread(generate)
+
+
+@router.post("/api/bots/{name}/assets/avatar/pet")
+async def set_bot_pet_avatar_endpoint(name: str, body: BotPetSelect):
+    """Use an official Petdex gallery entry as a Bot avatar.
+
+    The desktop picker crops a pet's first sprite frame and then calls the
+    canonical ``profiles.set_asset`` RPC.  Mobile uses ``pet.thumb`` for the
+    same crop (including server-side install/offline handling), then stores
+    the returned data URI through that exact asset handler.
+    """
+
+    _bot_meta_path(name)
+
+    def select() -> Dict[str, Any]:
+        thumb = _invoke_profile_gateway_rpc(
+            "pet.thumb",
+            {"slug": body.slug.strip(), "url": (body.url or "").strip()},
+        )
+        data_uri = str(thumb.get("dataUri") or "").strip()
+        if not data_uri:
+            raise HTTPException(status_code=404, detail="Pet thumbnail unavailable")
+        stored = _invoke_profile_gateway_rpc(
+            "profiles.set_asset",
+            {"name": name, "asset": "avatar", "data": data_uri},
+        )
+        return {
+            "ok": bool(stored.get("ok", True)),
+            "bot_mode": True,
+            "asset": "avatar",
+            "pet": {"slug": body.slug.strip(), "dataUri": data_uri},
+            **stored,
+        }
+
+    return await asyncio.to_thread(select)
 
 
 @router.post("/api/profiles")

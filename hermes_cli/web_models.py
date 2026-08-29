@@ -687,6 +687,18 @@ class BotAvatarGenerate(BaseModel):
     prompt: Optional[str] = Field(default=None, max_length=2_000)
 
 
+class BotPetSelect(BaseModel):
+    """Select a petdex companion as a Bot Mode avatar.
+
+    ``url`` is the manifest spritesheet URL for pets that are not installed
+    locally yet.  The server passes it only to the canonical ``pet.thumb``
+    handler; it is never persisted as configuration or fetched by iOS.
+    """
+
+    slug: str = Field(min_length=1, max_length=200)
+    url: Optional[str] = Field(default=None, max_length=2_000)
+
+
 class BotRelaySend(BaseModel):
     """Authenticated mobile envelope for the upstream Bot Mode relay.
 
