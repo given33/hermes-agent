@@ -826,6 +826,27 @@ class TestClientCache:
         assert len(_bedrock_runtime_client_cache) == 0
         assert len(_bedrock_control_client_cache) == 0
 
+    def test_runtime_client_cold_start_is_singleton_under_concurrency(self):
+        """Concurrent first calls must not race boto3's default Session."""
+        from concurrent.futures import ThreadPoolExecutor
+        import agent.bedrock_adapter as adapter
+
+        adapter.reset_client_cache()
+        calls = []
+
+        class _Boto:
+            def client(self, service, *, region_name):
+                calls.append((service, region_name))
+                return object()
+
+        with patch.object(adapter, "_require_boto3", return_value=_Boto()):
+            with ThreadPoolExecutor(max_workers=8) as pool:
+                clients = list(pool.map(lambda _: adapter._get_bedrock_runtime_client("us-east-1"), range(32)))
+
+        assert len({id(client) for client in clients}) == 1
+        assert calls == [("bedrock-runtime", "us-east-1")]
+        adapter.reset_client_cache()
+
 
 # ---------------------------------------------------------------------------
 # Streaming with callbacks

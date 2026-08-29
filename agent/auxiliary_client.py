@@ -4802,7 +4802,17 @@ def _is_invalid_aux_response_error(exc: Exception) -> bool:
 
 
 def _evict_cached_clients(provider: str) -> None:
-    """Drop cached auxiliary clients for a provider so fresh creds are used."""
+    """Drop cached auxiliary clients for a provider so fresh creds are used.
+
+    Eviction deliberately does *not* close the removed client.  Cache entries
+    are shared across synchronous/async callers and a sibling may still be
+    using the object it fetched just before a credential rotation.  Closing it
+    here marks the underlying httpx transport CLOSED and turns an otherwise
+    successful in-flight request into a spurious connection failure.  The
+    removed object remains owned by that caller and is released naturally when
+    the request completes; explicit lifecycle shutdown still closes clients
+    that are no longer reachable.
+    """
     normalized = _normalize_aux_provider(provider)
     with _client_cache_lock:
         stale_keys = [
@@ -4810,9 +4820,6 @@ def _evict_cached_clients(provider: str) -> None:
             if _normalize_aux_provider(str(key[0])) == normalized
         ]
         for key in stale_keys:
-            client = _client_cache.get(key, (None, None, None))[0]
-            if client is not None:
-                _close_cached_client(client)
             _client_cache.pop(key, None)
 
 
@@ -7950,9 +7957,11 @@ def _store_cached_client(cache_key: tuple, client: Any, default_model: Optional[
         # receive a non-functional client on the next cache hit.
         return
     with _client_cache_lock:
-        old_entry = _client_cache.get(cache_key)
-        if old_entry is not None and old_entry[0] is not client:
-            _close_cached_client(old_entry[0])
+        # Replacing a shared entry must not close the previous object: another
+        # thread may have obtained it immediately before this refresh and can
+        # still be mid-request.  This mirrors the capacity-eviction path in
+        # ``_get_cached_client``; callers that own a client directly are
+        # responsible for closing it during their lifecycle teardown.
         _client_cache[cache_key] = (client, default_model, bound_loop)
 
 

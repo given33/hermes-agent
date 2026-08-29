@@ -2602,7 +2602,9 @@ class TestAuxiliaryAuthRefreshRetry:
 
         mock_refresh_oauth.assert_called_once_with("refresh-token", use_json=False)
         mock_write.assert_called_once_with("fresh-token", "refresh-token-2", 9999999999999)
-        stale_client.close.assert_called_once()
+        # Rotation retires the entry without closing a shared client that an
+        # in-flight sibling may still be using.
+        stale_client.close.assert_not_called()
 
     def test_refresh_provider_credentials_remints_vertex_token_and_evicts_cache(self):
         """Vertex tokens live ~1h; on a long-running gateway the cached
@@ -2628,7 +2630,7 @@ class TestAuxiliaryAuthRefreshRetry:
             assert _refresh_provider_credentials("vertex") is True
 
         mock_get_config.assert_called_once()
-        stale_client.close.assert_called_once()
+        stale_client.close.assert_not_called()
 
     def test_refresh_provider_credentials_vertex_returns_false_when_unminted(self):
         """No usable token/base_url (e.g. ADC and the service-account file
@@ -3580,6 +3582,33 @@ class TestAuxiliaryClientPoisonedCacheEviction:
     ``Connection error`` even though the main provider route is healthy.
     See https://github.com/NousResearch/hermes-agent/issues/23432.
     """
+
+    def test_provider_rotation_does_not_close_shared_inflight_client(self):
+        """Credential rotation must only retire cache entries.
+
+        A sibling request may still hold the old client; closing its transport
+        from the eviction path causes a false connection failure mid-flight.
+        """
+        from agent.auxiliary_client import (
+            _client_cache,
+            _client_cache_lock,
+            _evict_cached_clients,
+        )
+
+        client = MagicMock(name="inflight")
+        key = ("openai", False, "", "", "", (), False)
+        with _client_cache_lock:
+            _client_cache.clear()
+            _client_cache[key] = (client, "model", None)
+        try:
+            with patch("agent.auxiliary_client._close_cached_client") as close:
+                _evict_cached_clients("openai")
+            close.assert_not_called()
+            with _client_cache_lock:
+                assert key not in _client_cache
+        finally:
+            with _client_cache_lock:
+                _client_cache.clear()
 
 
 

@@ -136,8 +136,15 @@ _PREFIX_PATTERNS = [
 # Uppercase keys tolerate spaces around "=" (e.g. ``FOO_SECRET = bar``) because
 # an all-caps key is almost never prose/code.
 _SECRET_ENV_NAMES = r"(?:API_?KEY|TOKEN|SECRET|PASSWORD|PASSWD|CREDENTIAL|AUTH)"
+# Quoted assignments need their own pass so values containing whitespace are
+# captured as one secret.  The historical optional-quote pattern below can
+# backtrack to an empty quote and redact only the first token of
+# ``TOKEN=\"alpha bravo\"``.
+_ENV_QUOTED_ASSIGN_RE = re.compile(
+    rf"([A-Z0-9_]{{0,50}}{_SECRET_ENV_NAMES}[A-Z0-9_]{{0,50}})\s*=\s*(['\"])([^'\"\r\n]*)\2"
+)
 _ENV_ASSIGN_RE = re.compile(
-    rf"([A-Z0-9_]{{0,50}}{_SECRET_ENV_NAMES}[A-Z0-9_]{{0,50}})\s*=\s*(['\"]?)(\S+)\2",
+    rf"([A-Z0-9_]{{0,50}}{_SECRET_ENV_NAMES}[A-Z0-9_]{{0,50}})\s*=\s*(?!['\"])(\S+)",
 )
 
 # Lowercase / dotted / hyphenated config keys from config files
@@ -171,12 +178,12 @@ _ENV_LOOKUP_VALUE_RE = re.compile(
 _CFG_DOTTED_RE = re.compile(
     rf"((?:[A-Za-z0-9_\-]+\.)+[A-Za-z0-9_.\-]*{_SECRET_CFG_NAMES}[A-Za-z0-9_.\-]*"
     rf"|[A-Za-z0-9_.\-]*{_SECRET_CFG_NAMES}[A-Za-z0-9_.\-]*\.[A-Za-z0-9_.\-]+)"
-    rf"={_CFG_VALUE}",
+    rf"=(?!['\"]){_CFG_VALUE}",
     re.IGNORECASE,
 )
 # Line-anchored bare key: ``password=…`` / ``export api_key=…`` at start of line.
 _CFG_ANCHORED_RE = re.compile(
-    rf"(^[ \t]*(?:export[ \t]+)?[A-Za-z0-9_\-]*{_SECRET_CFG_NAMES}[A-Za-z0-9_\-]*)={_CFG_VALUE}",
+    rf"(^[ \t]*(?:export[ \t]+)?[A-Za-z0-9_\-]*{_SECRET_CFG_NAMES}[A-Za-z0-9_\-]*)=(?!['\"]){_CFG_VALUE}",
     re.IGNORECASE | re.MULTILINE,
 )
 
@@ -635,7 +642,23 @@ def redact_sensitive_text(
                 if _ENV_LOOKUP_VALUE_RE.match(value):
                     return m.group(0)
                 return f"{name}={quote}{_mask_token(value)}{quote}"
-            text = _ENV_ASSIGN_RE.sub(_redact_env, text)
+            # Handle quoted values first; then process ordinary unquoted
+            # assignments.  Both regexes intentionally expose the same
+            # (name, quote, value) groups to the callback.
+            def _redact_quoted_env(m):
+                name, quote, value = m.group(1), m.group(2), m.group(3)
+                if _ENV_LOOKUP_VALUE_RE.match(value):
+                    return m.group(0)
+                return f"{name}={quote}{_mask_token(value)}{quote}"
+
+            text = _ENV_QUOTED_ASSIGN_RE.sub(_redact_quoted_env, text)
+            def _redact_unquoted_env(m):
+                name, value = m.group(1), m.group(2)
+                if _ENV_LOOKUP_VALUE_RE.match(value):
+                    return m.group(0)
+                return f"{name}={_mask_token(value)}"
+
+            text = _ENV_ASSIGN_RE.sub(_redact_unquoted_env, text)
             # Lowercase/dotted config keys (issue #16413). Skip URLs entirely —
             # web-URL query params are intentionally passed through (see note
             # near the bottom of this function); _DB_CONNSTR_RE still guards

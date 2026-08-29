@@ -589,7 +589,15 @@ def _version_satisfies(version: str, version_range: str) -> bool:
         base = _parse_version(requested[1:])
         if base is None:
             return False
-        upper = (base[0] + 1, 0, 0) if base[0] else (0, base[1] + 1, 0)
+        # Semver caret ranges preserve the left-most non-zero component.
+        # In particular ^0.0.z means >=0.0.z and <0.0.(z+1), not <0.1.0;
+        # the latter would admit every 0.0.x patch plus all 0.1.x releases.
+        if base[0] > 0:
+            upper = (base[0] + 1, 0, 0)
+        elif base[1] > 0:
+            upper = (0, base[1] + 1, 0)
+        else:
+            upper = (0, 0, base[2] + 1)
         return parsed >= base and parsed < upper
     if requested.startswith("~"):
         base = _parse_version(requested[1:])

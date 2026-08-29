@@ -286,3 +286,12 @@ uv run ruff check hermes_runtime hermes_services plugins/collaboration/dashboard
   边界。完整 dashboard 回归 `201 passed, 7 skipped, 44 subtests`，新增跨账号成员 quota
   测试通过。
 - WhatsApp stale-bridge 日志再由 `d6a5450e15` 明确区分鉴权关闭与配置漂移，便于升级后诊断。
+
+### 2026-08-30 续审：缓存并发、ClawHub 下载与密钥脱敏
+
+Bedrock runtime/control client cache 现在由进程内可重入锁保护；同一区域并发冷启动只会
+创建一个 boto3 client，reset/invalidate 也在同一锁下执行。辅助客户端 credential rotation
+只移除共享 cache entry，不从驱逐路径关闭可能仍在使用的 transport。ClawHub 下载复用
+SSRF/网站策略并在 ZIP 解析前限制 16 MiB 传输与展开总量。Agent/runtime 脱敏器先处理带
+空格的单/双引号环境变量值，避免只遮首 token；Provider caret range 对 `^0.0.z` 正确限制
+在同一补丁版本线。受影响回归 `486 passed, 3 skipped`。

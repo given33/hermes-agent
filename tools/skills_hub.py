@@ -29,7 +29,7 @@ from hermes_constants import get_hermes_home
 from hermes_cli._subprocess_compat import windows_hide_flags
 from agent.skill_utils import is_excluded_skill_path
 from typing import Any, Dict, List, Optional, Tuple, Union
-from urllib.parse import unquote, urljoin, urlparse, urlsplit, urlunparse
+from urllib.parse import unquote, urlencode, urljoin, urlparse, urlsplit, urlunparse
 
 import httpx
 import yaml
@@ -121,6 +121,11 @@ def __getattr__(name: str):
 
 _REDIRECT_STATUS_CODES = {301, 302, 303, 307, 308}
 _MAX_SKILL_FETCH_REDIRECTS = 5
+# Keep ClawHub bundles bounded before ZIP parsing.  Individual members are
+# capped below as well; this aggregate limit prevents a valid-looking archive
+# with thousands of small files from consuming unbounded memory/context.
+_CLAWHUB_MAX_ZIP_BYTES = 16 * 1024 * 1024
+_CLAWHUB_MAX_EXTRACTED_BYTES = 16 * 1024 * 1024
 
 
 # ---------------------------------------------------------------------------
@@ -2923,12 +2928,17 @@ class ClawHubSource(SkillSource):
         max_retries = 3
         for attempt in range(max_retries):
             try:
-                resp = httpx.get(
-                    f"{self.BASE_URL}/download",
-                    params={"slug": slug, "version": version},
-                    timeout=30,
-                    follow_redirects=True,
+                # Route the download through the shared SSRF/website-policy
+                # gate.  The old direct ``httpx.get(..., follow_redirects)``
+                # path bypassed redirect validation and could also allocate an
+                # arbitrarily large response before ZIP parsing.
+                download_url = (
+                    f"{self.BASE_URL}/download?"
+                    f"{urlencode({'slug': slug, 'version': version})}"
                 )
+                resp = _guarded_http_get(download_url, timeout=30)
+                if resp is None:
+                    return files
                 if resp.status_code == 429:
                     try:
                         retry_after = int(resp.headers.get("retry-after", "5"))
@@ -2945,7 +2955,32 @@ class ClawHubSource(SkillSource):
                     logger.debug("ClawHub ZIP download for %s v%s returned %s", slug, version, resp.status_code)
                     return files
 
-                with zipfile.ZipFile(io.BytesIO(resp.content)) as zf:
+                content_length = getattr(resp, "headers", {}).get("content-length")
+                try:
+                    if content_length is not None and int(content_length) > _CLAWHUB_MAX_ZIP_BYTES:
+                        logger.warning(
+                            "ClawHub ZIP for %s v%s exceeds %d-byte limit",
+                            slug,
+                            version,
+                            _CLAWHUB_MAX_ZIP_BYTES,
+                        )
+                        return files
+                except (TypeError, ValueError):
+                    # Ignore malformed advisory headers; the actual body-size
+                    # check below remains authoritative.
+                    pass
+                content = bytes(getattr(resp, "content", b"") or b"")
+                if len(content) > _CLAWHUB_MAX_ZIP_BYTES:
+                    logger.warning(
+                        "ClawHub ZIP for %s v%s exceeds %d-byte limit",
+                        slug,
+                        version,
+                        _CLAWHUB_MAX_ZIP_BYTES,
+                    )
+                    return files
+
+                extracted_bytes = 0
+                with zipfile.ZipFile(io.BytesIO(content)) as zf:
                     for info in zf.infolist():
                         if info.is_dir():
                             continue
@@ -2958,6 +2993,14 @@ class ClawHubSource(SkillSource):
                         if info.file_size > 500_000:
                             logger.debug("Skipping large file in ZIP: %s (%d bytes)", name, info.file_size)
                             continue
+                        extracted_bytes += int(info.file_size or 0)
+                        if extracted_bytes > _CLAWHUB_MAX_EXTRACTED_BYTES:
+                            logger.warning(
+                                "ClawHub ZIP for %s v%s exceeds extracted-size limit",
+                                slug,
+                                version,
+                            )
+                            return {}
                         try:
                             raw = zf.read(info.filename)
                             files[name] = raw.decode("utf-8")

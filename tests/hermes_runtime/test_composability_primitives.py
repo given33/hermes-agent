@@ -228,6 +228,16 @@ def test_provider_catalog_enforces_declared_version_range() -> None:
     assert catalog.resolve(DependencySpec(key="model:default", version_range="^3.0.0")) is None
 
 
+def test_provider_catalog_caret_zero_zero_range_is_patch_bounded() -> None:
+    """A ^0.0.z dependency must not admit a newer minor release."""
+    from hermes_runtime.composability.providers import _version_satisfies
+
+    assert _version_satisfies("0.0.3", "^0.0.3")
+    assert not _version_satisfies("0.0.4", "^0.0.3")
+    assert not _version_satisfies("0.1.0", "^0.0.3")
+    assert not _version_satisfies("1.0.0", "^0.0.3")
+
+
 def test_turn_plan_validates_ready_nodes_conflicts_and_critical_path() -> None:
     plan = TurnPlan(
         plan_id="plan-1",

@@ -113,6 +113,16 @@ class TestEnvAssignments:
         assert "SECRET_TOKEN=" in result
         assert "mypassword" not in result
 
+    def test_quoted_env_value_with_spaces_is_masked_as_one_value(self):
+        """Do not backtrack to the first token and leak quoted suffixes."""
+        for text in (
+            'MY_TOKEN="alpha bravo charlie delta"',
+            "MY_PASSWORD='alpha bravo charlie delta'",
+        ):
+            result = redact_sensitive_text(text, force=True)
+            assert "bravo charlie" not in result
+            assert "delta" not in result
+
 
 class TestBareSecretEnvSuffixes:
     """Bare *_KEY / *_PASS / *_PW env suffixes mask, incl. lowercase — #77484."""

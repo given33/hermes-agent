@@ -190,7 +190,13 @@ class TestClawHubSource(unittest.TestCase):
         self.assertIn("SKILL.md", bundle.files)
         self.assertEqual(bundle.files["SKILL.md"], "# Skill")
         self.assertEqual(bundle.files["README.md"], "hello")
-        mock_safe_get.assert_called_once_with("https://files.example/skill-md", timeout=20)
+        # The ZIP fallback is also routed through the guarded transport before
+        # the raw file URL, so assert the raw fetch specifically rather than
+        # assuming it is the only guarded request.
+        self.assertIn(
+            ("https://files.example/skill-md",),
+            [call.args for call in mock_safe_get.call_args_list],
+        )
 
     @patch("tools.skills_hub.httpx.get")
     def test_fetch_falls_back_to_versions_list(self, mock_get):
@@ -208,6 +214,17 @@ class TestClawHubSource(unittest.TestCase):
         bundle = self.src.fetch("caldav-calendar")
         self.assertIsNotNone(bundle)
         self.assertEqual(bundle.files["SKILL.md"], "# Skill")
+
+    @patch("tools.skills_hub._guarded_http_get")
+    def test_download_zip_rejects_oversized_response_before_zip_parse(self, guarded):
+        from tools.skills_hub import _CLAWHUB_MAX_ZIP_BYTES
+
+        response = _MockResponse(status_code=200, headers={"content-length": str(_CLAWHUB_MAX_ZIP_BYTES + 1)})
+        response.content = b"not-a-zip"
+        guarded.return_value = response
+
+        assert self.src._download_zip("huge-skill", "1.0.0") == {}
+        guarded.assert_called_once()
 
     @patch("tools.skills_hub.check_website_access", return_value=None)
     @patch("tools.skills_hub.is_safe_url")
@@ -242,8 +259,10 @@ class TestClawHubSource(unittest.TestCase):
         bundle = self.src.fetch("caldav-calendar")
 
         self.assertIsNone(bundle)
-        self.assertEqual(mock_get.call_count, 3)
-        mock_safe_get.assert_not_called()
+        # Detail + version endpoints use the ordinary API client; the ZIP
+        # fallback now goes through the guarded SSRF client instead.
+        self.assertEqual(mock_get.call_count, 2)
+        mock_safe_get.assert_called_once()
 
     @patch("tools.skills_hub._write_index_cache")
     @patch("tools.skills_hub._read_index_cache", return_value=None)

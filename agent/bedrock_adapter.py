@@ -31,6 +31,7 @@ import json
 import logging
 import os
 import re
+import threading
 from types import SimpleNamespace
 from typing import Any, Dict, List, Optional, Tuple
 from urllib.parse import urlparse
@@ -59,6 +60,11 @@ except Exception:
 
 _bedrock_runtime_client_cache: Dict[str, Any] = {}
 _bedrock_control_client_cache: Dict[str, Any] = {}
+# boto3's implicit default Session is not thread-safe while it is constructing
+# clients.  Gateway/MoA can hit the same region concurrently during cold start;
+# serialize cache misses (and cache invalidation) so only one client is built
+# per region and no partially-created entry can win a check-then-act race.
+_bedrock_client_cache_lock = threading.RLock()
 
 # Bedrock-hosted OpenAI GPT-5.5 is not exposed through the native Converse
 # runtime. AWS serves it from the Bedrock Mantle OpenAI-compatible Responses
@@ -115,28 +121,35 @@ def _get_bedrock_runtime_client(region: str):
 
     Uses the default AWS credential chain (env vars → profile → instance role).
     """
-    if region not in _bedrock_runtime_client_cache:
+    normalized = str(region or "").strip()
+    with _bedrock_client_cache_lock:
+        cached = _bedrock_runtime_client_cache.get(normalized)
+        if cached is not None:
+            return cached
         boto3 = _require_boto3()
-        _bedrock_runtime_client_cache[region] = boto3.client(
-            "bedrock-runtime", region_name=region,
-        )
-    return _bedrock_runtime_client_cache[region]
+        client = boto3.client("bedrock-runtime", region_name=normalized)
+        _bedrock_runtime_client_cache[normalized] = client
+        return client
 
 
 def _get_bedrock_control_client(region: str):
     """Get or create a cached ``bedrock`` control-plane client for model discovery."""
-    if region not in _bedrock_control_client_cache:
+    normalized = str(region or "").strip()
+    with _bedrock_client_cache_lock:
+        cached = _bedrock_control_client_cache.get(normalized)
+        if cached is not None:
+            return cached
         boto3 = _require_boto3()
-        _bedrock_control_client_cache[region] = boto3.client(
-            "bedrock", region_name=region,
-        )
-    return _bedrock_control_client_cache[region]
+        client = boto3.client("bedrock", region_name=normalized)
+        _bedrock_control_client_cache[normalized] = client
+        return client
 
 
 def reset_client_cache():
     """Clear cached boto3 clients. Used in tests and profile switches."""
-    _bedrock_runtime_client_cache.clear()
-    _bedrock_control_client_cache.clear()
+    with _bedrock_client_cache_lock:
+        _bedrock_runtime_client_cache.clear()
+        _bedrock_control_client_cache.clear()
 
 
 def invalidate_runtime_client(region: str) -> bool:
@@ -150,9 +163,11 @@ def invalidate_runtime_client(region: str) -> bool:
     Returns True if a cached entry was evicted, False if the region was not
     cached.
     """
-    existed = region in _bedrock_runtime_client_cache
-    _bedrock_runtime_client_cache.pop(region, None)
-    return existed
+    normalized = str(region or "").strip()
+    with _bedrock_client_cache_lock:
+        existed = normalized in _bedrock_runtime_client_cache
+        _bedrock_runtime_client_cache.pop(normalized, None)
+        return existed
 
 
 # ---------------------------------------------------------------------------
