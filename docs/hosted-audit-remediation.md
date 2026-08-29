@@ -88,11 +88,34 @@ Petdex 头像选择也不重复实现官方逻辑：`/api/bot-mode/pets/gallery`
 - BlueBubbles webhook 缺少配置密码、提交空 token 或 token 不匹配时均返回
   401，并使用 `hmac.compare_digest`；既有消息解析和 mention gating 行为不变。
 
+### 19. HK 受管节点状态与恢复闭环（2026-08-29）
+
+- `hermes_cli/managed_nodes.py` 的状态归一化现在识别 `hk`、`hk-worker`、
+  `hk-primary` 和香港别名。状态中出现 HK heartbeat/gateway 时，
+  `/api/managed-nodes/status` 会在保持 DBB3/WSL 行顺序与字段兼容的前提下追加
+  独立的 HK 行，并按 runtime/metrics 各自的时间戳判定 freshness；不会把缺少
+  明确 worker-ready/gateway-alive 的 HK 设备误报为在线。
+- `/api/managed-nodes/recover`、`recovery-hook` 和 recovery receiver 的
+  allow-list 已接受 `hk`，并且配置了 HK 专用 recovery URL 时，自动恢复会把
+  HK 纳入目标集合；没有该 URL 的旧配置仍只发送 DBB3/WSL，避免改变既有请求
+  契约。
+- HK 暂未伪装成 managed-installation receiver：`installation_urls` 仍严格限于
+  已部署并有认证 receiver 的 DBB3/WSL；HK 代码、profile、凭据、状态和版本
+  同步由 `deploy/hk/` 与 fabric auto-update 独立维护。这避免“配置接受 HK、
+  但实际安装端点不存在”的半支持状态。
+
 ## 验证
 
 ### 2026-08-29 上游同步核验
 
-- 已从 `upstream/main` 同步到官方最新提交 `aff5125f8e`，本地先后以合并提交 `f7891d6aaf`、`08574b9995`、`2d6f08be4a` 完成整合；最终修复提交为 `9d6aa62ef8`。推送前后均以 `git rev-list --left-right --count HEAD...upstream/main` 核验右侧差异为 `0`，表示没有漏掉上游新增提交。
+- 已从 `upstream/main` 同步到官方最新提交 `299c652a66`（在上一轮六个
+  提交基础上又包含 `3b362acf48`、`57746cbb84`、`067e58238e`、
+  `299c652a66` 四个官方提交：预览文件下载、远程 inline preview 和
+  user-stories 维护），并在本地以合并提交 `089108e956` 整合。
+  此前的合并提交 `f7891d6aaf`、
+  `08574b9995`、`2d6f08be4a` 以及最终修复提交 `9d6aa62ef8` 均保留；
+  推送前后均以 `git rev-list --left-right --count HEAD...upstream/main`
+  核验右侧差异为 `0`，表示没有漏掉上游新增提交。
 - 本次合并冲突仅出现在 `agent/agent_runtime_helpers.py` 的桌面预览工具清单：保留官方 `desktop_preview`、`drive_preview`、`annotate_preview`，并保留旧实现代码但不再把已下线的 `read_preview` 注册为独立后钩子工具；未覆盖 HK worker、三端部署、WebSocket worker 通道或调度员/worker 角色边界。
 - 合并后重新执行协作、云文件、受管资源、云部署资产和安装拓扑回归：`346 passed, 7 skipped, 44 subtests passed`。
 - 合并后的 Bot Mode 官方接口回归仍通过：`tests/hermes_cli/test_web_server.py -k "bot_"` 为 `8 passed`（含 relay、头像生成与 Petdex 选择）；部署资产回归为 `60 passed`（含 worker connector 隔离断言）。
@@ -112,6 +135,10 @@ Petdex 头像选择也不重复实现官方逻辑：`/api/bot-mode/pets/gallery`
   `tests/agent/test_vertex_adapter.py tests/run_agent/test_streaming.py` 回归为 `49 passed`。
 - 随后新增的 gateway turn-hold 上限、i18n deferred notice 与 `hygiene_max_turn_hold_seconds`
   配置也已合并；`tests/gateway/test_session_hygiene.py` 回归为 `17 passed`。
+- HK 受管节点状态/恢复闭环回归：
+  `tests/hermes_cli/test_managed_nodes.py tests/hermes_cli/test_managed_node_recovery_watchdog.py tests/hermes_cli/test_web_server.py`
+  为 `199 passed, 5 skipped`；新增测试覆盖 HK heartbeat 可见性、旧 DBB3/WSL
+  行兼容、HK recovery URL/receiver 校验，以及明确的 worker-ready/alive 在线判定。
 
 本次同步与角色重构已运行并通过：
 

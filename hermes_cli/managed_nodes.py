@@ -12,6 +12,7 @@ import ipaddress
 import json
 import math
 import os
+import re
 import stat
 import subprocess
 import threading
@@ -30,6 +31,14 @@ DEFAULT_TIMEOUT_SECONDS = 3.0
 MAX_RESPONSE_BYTES = 4 * 1024 * 1024
 DEFAULT_FRESHNESS_SECONDS = 60.0
 DEFAULT_RECOVERY_COOLDOWN_SECONDS = 90.0
+# Managed-node health/recovery has historically supported the DBB3 and WSL
+# lanes.  HK is a first-class worker now, so keep the allow-list in one place
+# and use it for both the status relay and the authenticated recovery hook.
+MANAGED_WORKER_TARGETS = frozenset({"dbb3", "wsl", "hk"})
+# The public managed-installation API still has only DBB3/WSL receivers. HK is
+# deployed by its dedicated fabric updater (deploy/hk) and must not be accepted
+# in installation_urls until a matching authenticated receiver exists there.
+MANAGED_INSTALLATION_TARGETS = frozenset({"dbb3", "wsl"})
 _RECOVERY_LOCK = threading.Lock()
 _RECOVERY_LAST_ATTEMPT: dict[str, float] = {}
 _RECOVERY_RECEIVER_LOCK = threading.Lock()
@@ -139,7 +148,7 @@ def load_managed_nodes_config(path: Path | None = None) -> list[dict[str, Any]]:
             normalized_target = str(target).strip().lower()
             normalized_url = str(target_url or "").strip()
             if (
-                normalized_target not in {"dbb3", "wsl"}
+                normalized_target not in MANAGED_WORKER_TARGETS
                 or not _is_secure_recovery_url(normalized_url)
             ):
                 raise ValueError(f"managed node {node_id!r} has an invalid recovery_urls entry")
@@ -149,7 +158,7 @@ def load_managed_nodes_config(path: Path | None = None) -> list[dict[str, Any]]:
             normalized_target = str(target).strip().lower()
             normalized_url = str(target_url or "").strip()
             if (
-                normalized_target not in {"dbb3", "wsl"}
+                normalized_target not in MANAGED_INSTALLATION_TARGETS
                 or not _is_secure_recovery_url(normalized_url)
             ):
                 raise ValueError(f"managed node {node_id!r} has an invalid installation_urls entry")
@@ -219,8 +228,8 @@ def load_managed_node_recovery_config(path: Path | None = None) -> dict[str, Any
     if not isinstance(raw, dict):
         raise ValueError("managed-nodes recovery_receiver must be an object")
     node_id = str(raw.get("node_id") or "").strip().lower()
-    if node_id not in {"dbb3", "wsl"}:
-        raise ValueError("recovery_receiver node_id must be dbb3 or wsl")
+    if node_id not in MANAGED_WORKER_TARGETS:
+        raise ValueError("recovery_receiver node_id must be dbb3, wsl, or hk")
     token_file = str(raw.get("token_file") or "").strip()
     if not token_file:
         raise ValueError("recovery_receiver requires token_file")
@@ -300,11 +309,12 @@ def fetch_managed_nodes(
             })
         except Exception as exc:
             recovery = None
-            if config["auto_recover"] and _has_recovery_route(config, ["dbb3", "wsl"]):
+            recovery_targets = _recovery_targets_for_config(config)
+            if config["auto_recover"] and _has_recovery_route(config, recovery_targets):
                 try:
                     recovery = _request_recovery(
                         config,
-                        targets=["dbb3", "wsl"],
+                        targets=recovery_targets,
                         reason="source_unreachable",
                     )
                 except Exception:
@@ -363,11 +373,11 @@ def recover_managed_nodes(
     """Manually request peer recovery through configured control planes."""
 
     target = str(node_id or "").strip().lower()
-    if target and target not in {"dbb3", "wsl"}:
-        raise ValueError("node_id must be dbb3 or wsl")
+    if target and target not in MANAGED_WORKER_TARGETS:
+        raise ValueError("node_id must be dbb3, wsl, or hk")
     outcomes = []
     for config in load_managed_nodes_config(path):
-        requested_targets = [target] if target else ["dbb3", "wsl"]
+        requested_targets = [target] if target else _recovery_targets_for_config(config)
         if not _has_recovery_route(config, requested_targets):
             outcomes.append({"id": config["id"], "state": "unconfigured"})
             continue
@@ -415,7 +425,7 @@ def accept_managed_node_recovery(
         raise ValueError("unsupported managed node recovery action")
     targets = payload.get("targets")
     if not isinstance(targets, list) or any(
-        str(target).strip().lower() not in {"dbb3", "wsl"} for target in targets
+        str(target).strip().lower() not in MANAGED_WORKER_TARGETS for target in targets
     ):
         raise ValueError("managed node recovery targets are invalid")
     normalized_targets = {str(target).strip().lower() for target in targets}
@@ -595,6 +605,22 @@ def _has_recovery_route(config: dict[str, Any], targets: list[str]) -> bool:
     return any(str(routes.get(target) or fallback) for target in targets)
 
 
+def _recovery_targets_for_config(config: dict[str, Any]) -> list[str]:
+    """Return the stable worker order while preserving legacy two-lane output.
+
+    Existing installations commonly have a single fallback recovery URL that
+    only controls DBB3/WSL.  Do not add an unconfigured HK target to those
+    requests (which would make old payloads noisy and fail closed); include HK
+    automatically when the operator supplied an HK-specific route or a
+    fallback route intended for it.
+    """
+    targets = ["dbb3", "wsl"]
+    routes = config.get("recovery_urls") or {}
+    if str(routes.get("hk") or "").strip():
+        targets.append("hk")
+    return targets
+
+
 def _request_recovery_route(
     config: dict[str, Any],
     *,
@@ -723,7 +749,7 @@ def _normalize_dbb3_status(
         and wsl_gateway.get("alive") is not False
     )
 
-    return [
+    normalized = [
         {
             "id": "dbb3",
             "label": "DBB3",
@@ -765,6 +791,63 @@ def _normalize_dbb3_status(
             },
         },
     ]
+
+    # HK uses the same connector status envelope, but it is optional in older
+    # relay payloads.  Emit it only when the source advertises an HK device or
+    # gateway so legacy DBB3/WSL fixtures and deployments keep their exact
+    # two-row response while a configured HK worker becomes visible to iOS.
+    hk_aliases = ("hk", "hk-worker", "hk_primary", "hk-primary", "hong_kong", "hong-kong", "hongkong")
+    hk_device = _first_dict(devices, *hk_aliases)
+    hk_gateway = _first_dict(gateways, *hk_aliases)
+    hk_runtime = _first_dict(payload, *hk_aliases)
+    if hk_device or hk_gateway or hk_runtime:
+        hk_source = {**hk_runtime, **hk_device}
+        hk_metrics = _device_metrics(hk_source)
+        hk_runtime_observation = _observation_status(
+            fetched_at,
+            hk_gateway,
+            hk_source,
+            fallback="",
+        )
+        hk_metrics_observation = _observation_status(
+            fetched_at,
+            hk_device,
+            hk_source,
+            fallback="",
+        )
+        hk_observed_at, hk_age_seconds, hk_fresh = _combine_observations(
+            hk_runtime_observation,
+            hk_metrics_observation,
+        )
+        # A worker can report either an explicit gateway alive flag or the
+        # connector's canonical `worker_ready`/`gateway_running` booleans.
+        hk_alive = hk_gateway.get("alive")
+        if hk_alive is None:
+            hk_alive = hk_source.get("online")
+        if hk_alive is None:
+            hk_alive = hk_source.get("worker_ready") or hk_source.get("gateway_running")
+        normalized.append({
+            "id": "hk",
+            "label": str(hk_source.get("label") or hk_gateway.get("label") or "Hong Kong Worker"),
+            "online": hk_fresh and hk_alive is not False and bool(hk_alive),
+            "gateway_state": str(hk_gateway.get("state") or hk_source.get("state") or "unknown"),
+            "version": str(hk_gateway.get("version") or hk_source.get("version") or ""),
+            "observed_at": hk_observed_at,
+            "fresh": hk_fresh,
+            "age_seconds": hk_age_seconds,
+            "metrics": hk_metrics,
+            "metrics_available": hk_metrics_observation[2] and hk_metrics.get("available") is not False,
+            "metrics_observed_at": hk_metrics_observation[0],
+            "runtime_fresh": hk_runtime_observation[2],
+            "active_tasks": int(hk_source.get("active_tasks") or hk_source.get("activeTasks") or 0),
+            "metrics_source": str(hk_source.get("source") or "hk_worker"),
+            "runtime": {
+                "worker_ready": bool(hk_source.get("worker_ready") or hk_source.get("workerReady")),
+                "gateway_running": bool(hk_source.get("gateway_running") or hk_source.get("gatewayRunning")),
+            },
+        })
+
+    return normalized
 
 
 def _combine_observations(
@@ -815,6 +898,11 @@ def _observation_value(*sources: dict[str, Any]) -> str:
             value = source.get(key)
             if isinstance(value, str) and value.strip():
                 return value.strip()
+            # Native/worker relays sometimes use Unix seconds instead of an
+            # ISO-8601 string. Preserve the value as text so the parser can
+            # apply the same future-skew and freshness fence.
+            if isinstance(value, (int, float)) and math.isfinite(float(value)):
+                return str(value)
     return ""
 
 
@@ -823,8 +911,11 @@ def _parse_observation_time(value: str) -> datetime | None:
     if not normalized:
         return None
     try:
-        parsed = datetime.fromisoformat(normalized.replace("Z", "+00:00"))
-    except ValueError:
+        if re.fullmatch(r"[+-]?\d+(?:\.\d+)?", normalized):
+            parsed = datetime.fromtimestamp(float(normalized), tz=timezone.utc)
+        else:
+            parsed = datetime.fromisoformat(normalized.replace("Z", "+00:00"))
+    except (ValueError, OverflowError, OSError):
         return None
     if parsed.tzinfo is None:
         parsed = parsed.replace(tzinfo=timezone.utc)
@@ -853,6 +944,15 @@ def _device_metrics(device: dict[str, Any]) -> dict[str, Any]:
 
 def _dict(value: Any) -> dict[str, Any]:
     return value if isinstance(value, dict) else {}
+
+
+def _first_dict(container: dict[str, Any], *keys: str) -> dict[str, Any]:
+    """Return the first object value under any compatibility alias."""
+    for key in keys:
+        value = container.get(key)
+        if isinstance(value, dict):
+            return value
+    return {}
 
 
 def _number(value: Any) -> float:

@@ -115,6 +115,153 @@ def test_managed_nodes_reads_live_dbb3_and_wsl_status(tmp_path):
     assert token not in json.dumps(result)
 
 
+def test_managed_nodes_reads_optional_hk_worker_status_without_changing_legacy_rows(tmp_path):
+    """The fourth worker is visible when the relay advertises its heartbeat."""
+    token = "test-private-token"
+    token_path = tmp_path / "status-token"
+    token_path.write_text(token, encoding="utf-8")
+
+    class Handler(BaseHTTPRequestHandler):
+        def do_GET(self):
+            body = json.dumps({
+                "timestamp": "2026-07-16T09:00:00+00:00",
+                "devices": {
+                    "dbb3": {"sampled_at": "2026-07-16T09:00:00+00:00"},
+                    "pc": {"available": True, "sampled_at": "2026-07-16T09:00:00+00:00"},
+                    "hk": {
+                        "available": True,
+                        "sampled_at": "2026-07-16T09:00:00+00:00",
+                        "source": "hk-cloud-connector",
+                    },
+                },
+                "gateways": {
+                    "agent": {"alive": True, "state": "active", "observed_at": "2026-07-16T09:00:00+00:00"},
+                    "rainday": {"alive": True, "state": "active", "observed_at": "2026-07-16T09:00:00+00:00"},
+                    "hk": {"alive": True, "state": "active", "version": "v0.20.0", "observed_at": "2026-07-16T09:00:00+00:00"},
+                },
+                "services": {"hermes_gateway": "active"},
+                "wsl": {"gateway_running": True, "worker_ready": True, "tunnel_up": True},
+            }).encode()
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
+        def log_message(self, _format, *_args):
+            return
+
+    server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    try:
+        config_path = tmp_path / "managed-nodes.json"
+        config_path.write_text(json.dumps({
+            "nodes": [{
+                "id": "home",
+                "status_url": f"http://127.0.0.1:{server.server_port}/status",
+                "token_file": str(token_path),
+            }],
+        }), encoding="utf-8")
+        result = fetch_managed_nodes(
+            config_path,
+            now=datetime(2026, 7, 16, 9, 0, 20, tzinfo=timezone.utc),
+        )
+    finally:
+        server.shutdown()
+        server.server_close()
+
+    assert [node["id"] for node in result["nodes"]] == ["dbb3", "wsl", "hk"]
+    hk = result["nodes"][-1]
+    assert hk["online"] is True
+    assert hk["fresh"] is True
+    assert hk["version"] == "v0.20.0"
+    assert hk["metrics_source"] == "hk-cloud-connector"
+
+
+def test_managed_nodes_accepts_unix_second_hk_heartbeat(tmp_path, monkeypatch):
+    token_path = tmp_path / "status-token"
+    token_path.write_text("test-private-token", encoding="utf-8")
+    config_path = tmp_path / "managed-nodes.json"
+    config_path.write_text(json.dumps({
+        "nodes": [{
+            "id": "home",
+            "status_url": "https://status.example/live",
+            "token_file": str(token_path),
+        }],
+    }), encoding="utf-8")
+    monkeypatch.setattr(
+        "hermes_cli.managed_nodes._fetch_status",
+        lambda _config: {
+            "devices": {
+                "hk": {
+                    "available": True,
+                    "sampled_at": 1784192400,
+                },
+            },
+            "gateways": {
+                "hk-primary": {
+                    "alive": True,
+                    "observed_at": 1784192400,
+                },
+            },
+        },
+    )
+
+    result = fetch_managed_nodes(
+        config_path,
+        now=datetime.fromtimestamp(1784192420, tz=timezone.utc),
+    )
+    hk = next(node for node in result["nodes"] if node["id"] == "hk")
+    assert hk["online"] is True
+    assert hk["fresh"] is True
+
+
+def test_managed_nodes_accept_hk_recovery_route_and_receiver(tmp_path):
+    token_path = tmp_path / "token"
+    token_path.write_text("peer-secret", encoding="utf-8")
+    config_path = tmp_path / "managed-nodes.json"
+    config_path.write_text(json.dumps({
+        "nodes": [{
+            "id": "home",
+            "status_url": "https://status.example/live",
+            "token_file": str(token_path),
+            "recovery_urls": {"hk": "https://hk.example/recover"},
+        }],
+        "recovery_receiver": {
+            "node_id": "hk",
+            "token_file": str(token_path),
+            "command": ["hermes", "gateway", "restart"],
+        },
+    }), encoding="utf-8")
+
+    config = load_managed_nodes_config(config_path)[0]
+    assert config["recovery_urls"] == {"hk": "https://hk.example/recover"}
+    receiver = managed_nodes.load_managed_node_recovery_config(config_path)
+    assert receiver and receiver["node_id"] == "hk"
+
+
+def test_managed_nodes_reject_hk_installation_without_a_receiver(tmp_path):
+    """HK deploys through its fabric updater, not the DBB3/WSL installer API."""
+    status_token = tmp_path / "status-token"
+    installation_token = tmp_path / "installation-token"
+    status_token.write_text("status-private-token-00000000000000000001", encoding="utf-8")
+    installation_token.write_text("install-private-token-00000000000000000001", encoding="utf-8")
+    config_path = tmp_path / "managed-nodes.json"
+    config_path.write_text(json.dumps({
+        "nodes": [{
+            "id": "home",
+            "status_url": "https://status.example/live",
+            "token_file": str(status_token),
+            "installation_token_file": str(installation_token),
+            "installation_urls": {"hk": "https://hk.example/install"},
+        }],
+    }), encoding="utf-8")
+
+    with pytest.raises(ValueError, match="installation_urls"):
+        load_managed_nodes_config(config_path)
+
+
 def test_managed_nodes_never_report_stale_heartbeats_online(tmp_path, monkeypatch):
     token_path = tmp_path / "status-token"
     token_path.write_text("token", encoding="utf-8")
