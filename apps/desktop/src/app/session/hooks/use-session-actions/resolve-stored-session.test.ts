@@ -62,31 +62,14 @@ describe('resolveStoredSession profile ownership', () => {
   it('treats a profile-less cache hit as unresolved when multiple profiles exist', async () => {
     $sessions.set([session({ id: 's1' })])
     mockGetSession.mockRejectedValueOnce(new Error('404: Session not found'))
-    mockGetSession.mockRejectedValueOnce(new Error('404: Session not found'))
     mockGetSession.mockResolvedValueOnce(session({ id: 's1', profile: 'default' }))
 
     const resolved = await resolveStoredSession('s1')
 
     expect(resolved?.profile).toBe('default')
-    // rung 2 (bare) then rung 3 (stamped probes: active profile first)
-    expect(mockGetSession).toHaveBeenNthCalledWith(1, 's1')
-    expect(mockGetSession).toHaveBeenNthCalledWith(2, 's1', 'meta')
-    expect(mockGetSession).toHaveBeenNthCalledWith(3, 's1', 'default')
-  })
-
-  it('probes the ACTIVE profile when the unscoped lookup 404s (hidden Bot Mode chat)', async () => {
-    // A hidden Bot Mode canonical chat is never in the sidebar cache, and the
-    // unscoped GET routes to the PRIMARY backend (404). The owner is the
-    // active profile itself — it must be probed, not skipped.
-    mockGetSession.mockRejectedValueOnce(new Error('404: Session not found'))
-    mockGetSession.mockResolvedValueOnce(session({ id: 's1', message_count: 2 }))
-
-    const resolved = await resolveStoredSession('s1')
-
-    expect(resolved?.profile).toBe('meta')
-    expect(mockGetSession).toHaveBeenNthCalledWith(1, 's1')
-    expect(mockGetSession).toHaveBeenNthCalledWith(2, 's1', 'meta')
-    expect($sessions.get().find(s => s.id === 's1')?.profile).toBe('meta')
+    // rung 2 (active profile) then rung 3 (stamped cross-profile probe)
+    expect(mockGetSession).toHaveBeenNthCalledWith(1, 's1', 'meta')
+    expect(mockGetSession).toHaveBeenNthCalledWith(2, 's1', 'default')
   })
 
   it('scopes the first by-id lookup so a miss does not skip the active profile', async () => {
@@ -133,7 +116,6 @@ describe('resolveStoredSession profile ownership', () => {
     // Per-profile remote override: Electron strips the desktop alias before
     // forwarding, so the standalone backend stamps its backend-local root.
     mockGetSession.mockRejectedValueOnce(new Error('404: Session not found'))
-    mockGetSession.mockRejectedValueOnce(new Error('404: Session not found'))
     mockGetSession.mockResolvedValueOnce(session({ id: 's1', profile: 'default' }))
     $activeGatewayProfile.set('default')
     $profiles.set(profiles('default', 'meta'))
@@ -146,7 +128,6 @@ describe('resolveStoredSession profile ownership', () => {
 
   it('stamps the probed profile on a scoped hit from an older backend that omits it', async () => {
     mockGetSession.mockRejectedValueOnce(new Error('404: Session not found'))
-    mockGetSession.mockRejectedValueOnce(new Error('404: Session not found'))
     mockGetSession.mockResolvedValueOnce(session({ id: 's1' }))
 
     const resolved = await resolveStoredSession('s1')
@@ -157,7 +138,6 @@ describe('resolveStoredSession profile ownership', () => {
   })
 
   it('resolveSessionProfile routes a default-profile session from a non-default gateway', async () => {
-    mockGetSession.mockRejectedValueOnce(new Error('404: Session not found'))
     mockGetSession.mockRejectedValueOnce(new Error('404: Session not found'))
     mockGetSession.mockResolvedValueOnce(session({ id: 's1', profile: 'default' }))
 

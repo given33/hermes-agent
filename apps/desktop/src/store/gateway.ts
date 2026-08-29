@@ -41,6 +41,19 @@ interface RegistryConfig {
    * (#89206: the stale-profile split-brain that stranded bot wake-ups).
    */
   onActiveRouteChanged?: (profile: string) => void
+  /**
+   * Scopes a FOREGROUND surface is bound to right now — every mounted
+   * session tile's owner and the primary thread's (foregroundSessionScopes in
+   * store/session-states; a config hook because that store imports this
+   * one). Consulted by EVERY dispose path — the live-work pruner and the
+   * dispose-at-refcount-0 request/relay leases alike (#93892): a tile's
+   * resume mints its runtime on its owner's socket, and any path that closes
+   * that socket makes the backend orphan-reap the runtime, whose
+   * `session.reclaimed` unbinds the tile and re-arms its resume — a spinner
+   * loop with no terminal state. Read at decision time, never cached: it
+   * follows the tile set, so closing the tile releases the socket.
+   */
+  foregroundScopes?: () => ReadonlySet<string>
 }
 
 // ── Secondary (pool) backends ──────────────────────────────────────────────
@@ -651,6 +664,7 @@ function createSecondary(profile: string, connectionId: null | string = null): S
     reconnecting: false,
     pendingConnectionRedial: false,
     retained: false,
+    relayRetainCount: 0,
     wantOpen: true,
     activationLeaseUntil: 0
   }
@@ -1334,6 +1348,12 @@ export async function ensureGatewayForAgent(
   // The activation is settling either way — release the prune lease.
   entry.activationLeaseUntil = 0
 
+  // A timed-out owner may leave the dial running, but it no longer has the
+  // right to move the foreground route when that work eventually settles.
+  if (signal?.aborted) {
+    return false
+  }
+
   // A source edit/remove may dispose this entry while its dial is still in
   // flight. Only the still-registered, still-owned activation may publish --
   // and only when the WebSocket actually reached open: entry.connection is
@@ -1414,10 +1434,16 @@ export async function ensureGatewayForProfile(profile: string): Promise<void> {
     entry.activationLeaseUntil = 0
   }
 
-  // The activation is settling either way — release the prune lease.
-  entry.activationLeaseUntil = 0
-
-  if (entry.wantOpen && g.secondaries.get(key) === entry && applyActive(key, activationEpoch) && entry.connection) {
+  // Only publish when the WebSocket actually reached open -- entry.connection
+  // is set before the dial completes, so a transient first-dial failure must
+  // not count as a successful activation (issue #92265).
+  if (
+    entry.wantOpen &&
+    g.secondaries.get(key) === entry &&
+    isOpen(entry.gateway) &&
+    applyActive(key, activationEpoch) &&
+    entry.connection
+  ) {
     publishActiveConnection(entry.connection)
   }
 }
@@ -1463,8 +1489,9 @@ export async function ensureActiveGatewayOpen(): Promise<HermesGateway | null> {
 // activation before reporting the gateway as unavailable.
 const ACTIVE_GATEWAY_OPEN_WAIT_MS = 8_000
 
-// Wake signal (sleep/network/visibility): nudge every live secondary back open.
-export function reconnectSecondaryGateways(): void {
+// Recovery signal: nudge every live secondary back open. Power-resume/network
+// signals can force sockets that still report open to retire before redialing.
+export function reconnectSecondaryGateways({ forceOpenSockets = false }: { forceOpenSockets?: boolean } = {}): void {
   for (const entry of g.secondaries.values()) {
     if (!entry.wantOpen) {
       continue
@@ -1548,7 +1575,13 @@ export function pruneSecondaryGateways(keep: Set<string>): void {
       key === g.activeKey ||
       keep.has(key) ||
       (!entry.connectionId && keep.has(entry.profile)) ||
-      entry.activeRequests > 0 ||
+      // Bot-relay retention (#93594): the relay pins its remote routes for
+      // its whole active lifetime; the live-work pruner must not undo that
+      // pin between drain ticks or the socket churn returns.
+      relayRetained(entry) ||
+      // A mounted tile / the primary thread is bound to a runtime on this
+      // socket (#93892) — pinned for as long as that surface is mounted.
+      foregroundPinned(entry) ||
       // Mid-dial activation target: the profile being switched TO is not yet
       // active and has no live work, so without this lease any recompute
       // during its cold spawn disposed the entry and the click died silently

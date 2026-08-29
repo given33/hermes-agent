@@ -1,3 +1,4 @@
+import { LOCAL_CONNECTION_ID } from '@hermes/shared'
 import { atom, batch, computed } from 'nanostores'
 
 import type { HermesConnection } from '@/global'
@@ -428,6 +429,13 @@ export function prewarmProfileBackend(name: string): void {
 
 let gatewaySwitch: Promise<void> | null = null
 
+// Descriptor lookups are IPC round-trips into Electron main. A wedged main
+// (the #93454 class: a ticket mint that never answers) must not latch the
+// gatewaySwitch mutex — and, through it, every later profile/source switch
+// and the switch barrier — so they are bounded and fail open like any other
+// lookup failure.
+const DESCRIPTOR_LOOKUP_TIMEOUT_MS = 20_000
+
 // The target profile's connection descriptor (mode / baseUrl / …), resolved
 // CONCURRENTLY with the socket work so the switch can publish the profile
 // pointer and $connection in one frame. Without this, $connection seeds from
@@ -451,7 +459,11 @@ async function resolveConnectionForProfile(profile: string): Promise<HermesConne
   }
 
   try {
-    return await getConnection(profile)
+    return await withTimeout(
+      getConnection(profile),
+      DESCRIPTOR_LOOKUP_TIMEOUT_MS,
+      `Timed out resolving the connection descriptor for profile "${profile}"`
+    )
   } catch (err) {
     console.warn(`[profile] descriptor lookup for "${profile}" failed; keeping the previous connection`, err)
 
@@ -545,7 +557,11 @@ async function resolveConnectionForAgent(connectionId: string, profile: string):
   }
 
   try {
-    return await getConnectionFor({ connectionId, profile })
+    return await withTimeout(
+      getConnectionFor({ connectionId, profile }),
+      DESCRIPTOR_LOOKUP_TIMEOUT_MS,
+      `Timed out resolving the connection descriptor for agent "${connectionId}:${profile}"`
+    )
   } catch (err) {
     console.warn(
       `[profile] descriptor lookup for agent "${connectionId}:${profile}" failed; keeping the previous connection`,
@@ -653,14 +669,32 @@ export async function ensureGatewayAgent(
     await gatewaySwitch.catch(() => undefined)
   }
 
+  if (signal?.aborted) {
+    return
+  }
+
   $gatewaySwapTarget.set(target)
-  gatewaySwitch = (async () => {
+
+  const activationWork = (async () => {
+    if (signal?.aborted) {
+      return
+    }
+
+    if (beforeActivate && !beforeActivate()) {
+      return
+    }
+
     // Descriptor resolves concurrently with the dial, same as the profile
     // path, so no await sits between the activation and the publication.
-    const [descriptor, activated] = await Promise.all([
-      resolveConnectionForAgent(connection, target),
-      ensureGatewayForAgent(connection, target)
-    ])
+    const activation = signal
+      ? ensureGatewayForAgent(connection, target, { signal })
+      : ensureGatewayForAgent(connection, target)
+
+    const [descriptor, activated] = await Promise.all([resolveConnectionForAgent(connection, target), activation])
+
+    if (signal?.aborted) {
+      return
+    }
 
     if (!activated) {
       // The target stopped existing mid-dial (source edited/removed). Keep

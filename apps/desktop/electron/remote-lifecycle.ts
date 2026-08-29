@@ -645,6 +645,12 @@ async function pidIsOurDashboard(
 
 // Kill the stale dashboard ONLY if provably ours, then drop the lockfile.
 async function cleanupStale(ssh, ownershipId, lock, pidAlive = true) {
+  // Defense in depth (#95532): a skew sentinel is foreign/corrupt state, not
+  // an ownership record — never reap or remove anything based on it.
+  if (isLockfileSkew(lock)) {
+    return
+  }
+
   if (
     pidAlive &&
     lock &&

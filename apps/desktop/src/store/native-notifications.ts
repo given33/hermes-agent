@@ -11,8 +11,6 @@ import { requestForOwnedSession } from './session-states'
 
 export type { HermesOpenTarget }
 
-export type { HermesOpenTarget }
-
 // Native OS notifications (Electron `Notification`), separate from the in-app
 // toast feed in `notifications.ts`. Each kind toggles independently.
 export type NativeNotificationKind =

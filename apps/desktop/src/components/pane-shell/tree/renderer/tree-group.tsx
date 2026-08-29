@@ -67,7 +67,6 @@ import {
   restoreTreePane,
   SESSION_TILE_DRAG,
   setStripTabHidden,
-  setTreeGroupHeaderHidden,
   setTreeGroupMinimized,
   setTreeGroupTabStrip,
   treeTabCloseTargets
@@ -624,7 +623,6 @@ export function TreeGroup({
                   }}
                   role="tab"
                   selected={isSelected}
-                  showCloseButton={chrome.showCloseButton !== false}
                   style={{ cursor: 'grab' }}
                 >
                   {chrome.tabLead ? (

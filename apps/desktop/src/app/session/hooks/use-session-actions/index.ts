@@ -41,6 +41,9 @@ import {
   $activeGatewayProfile,
   $gatewaySwapTarget,
   $newChatProfile,
+  $profiles,
+  $showAllProfiles,
+  type AgentProfileRoute,
   ensureGatewayAgent,
   ensureGatewayProfile,
   normalizeProfileKey,
@@ -94,7 +97,12 @@ import {
   setWorkspaceCwdOwner,
   setYoloActive
 } from '@/store/session'
-import { requestForSessionProfile } from '@/store/session-request-router'
+import { isSessionOwnerResolutionError } from '@/store/session-owner-resolution'
+import {
+  requestForSessionProfile,
+  type SessionOwnerScope,
+  type SessionProfileRoute
+} from '@/store/session-request-router'
 import {
   $sessionTiles,
   closeSessionTile,
@@ -109,7 +117,13 @@ import {
 } from '@/store/session-states'
 import { broadcastSessionsChanged } from '@/store/session-sync'
 import { forgetSessionUnread } from '@/store/session-unread'
-import { dropTranscriptTail, loadTranscriptTail, saveTranscriptTail } from '@/store/transcript-tail-cache'
+import { $archivedSessions } from '@/store/sidebar-archive'
+import {
+  dropTranscriptTail,
+  dropTranscriptTailEverywhere,
+  loadTranscriptTail,
+  saveTranscriptTail
+} from '@/store/transcript-tail-cache'
 import { isWatchWindow } from '@/store/windows'
 import type { SessionCreateResponse, SessionMessage, SessionResumeResponse, UsageStats } from '@/types/hermes'
 
@@ -904,11 +918,32 @@ export function useSessionActions({
         return
       }
 
+      const resolvedConnectionId = ownerRoute?.connectionId || storedForProfile?.connection_id || ambientConnectionId
+
       // A row spliced from a CONNECTED registry gateway (#88880) carries its
-      // owning connection — activate THAT gateway, not a same-named local
-      // profile. Rows without the tag keep the legacy profile path.
-      if (storedForProfile?.connection_id) {
-        await ensureGatewayAgent(storedForProfile.connection_id, sessionProfile || 'default')
+      // owning connection. A row fetched directly after activating a registry
+      // gateway can be untagged, so retain the captured ambient connection too.
+      // Either way, route by the composite (connection, profile), never by a
+      // same-named profile alone.
+      const sessionOwner: SessionOwnerScope =
+        ownerRoute ||
+        (resolvedConnectionId
+          ? {
+              connectionId: resolvedConnectionId,
+              profile: sessionProfile || 'default'
+            }
+          : sessionProfile)
+
+      // All-profiles / plugin navigation must not steal chrome API-home:
+      // dial the owning backend without moving $activeGatewayProfile.
+      if ($showAllProfiles.get()) {
+        if (resolvedConnectionId) {
+          await openGatewayForAgent(resolvedConnectionId, ownerRoute?.profile || sessionProfile || 'default')
+        } else if (sessionProfile) {
+          await openGatewayForProfile(normalizeProfileKey(sessionProfile))
+        }
+      } else if (resolvedConnectionId) {
+        await ensureGatewayAgent(resolvedConnectionId, ownerRoute?.profile || sessionProfile || 'default')
       } else {
         await ensureGatewayProfile(sessionProfile)
       }
@@ -926,7 +961,19 @@ export function useSessionActions({
       // own backend is healthy one port over (#89206: local pool AND SSH).
       // requestForSessionProfile re-resolves the route at each call.
       const requestForSession = <T>(method: string, params: Record<string, unknown> = {}): Promise<T> =>
-        requestForSessionProfile<T>(sessionProfile, requestGateway, method, params)
+        requestForSessionProfile<T>(sessionOwner, requestGateway, method, params)
+
+      const sessionRestScope = resolvedConnectionId
+        ? {
+            connectionId: resolvedConnectionId,
+            profile: ownerRoute?.targetProfile || ownerRoute?.profile || sessionProfile || 'default'
+          }
+        : storedForProfile?.connection_id
+          ? {
+              connectionId: storedForProfile.connection_id,
+              profile: sessionProfile || 'default'
+            }
+          : sessionProfile
 
       // Re-check after the profile-resolve / gateway-swap awaits above: the
       // cache may have changed, and takeWarmCache re-validates belongs-to and
@@ -1289,9 +1336,19 @@ export function useSessionActions({
               )
 
               syncSessionStateToView(cachedRuntimeId, activatedState)
-              // Durable tail refresh — same post-reconcile contract as the
-              // cold path's save below.
-              saveTranscriptTail(storedSessionId, activatedState.messages)
+              // Cache backend transcript truth only. The pending/running bit and
+              // any synthetic clarify row are a live resume projection and must
+              // not survive after the server-side request expires.
+              saveTranscriptTail(
+                storedSessionId,
+                stripPendingClarifyProjectionForCache(
+                  activatedMessages,
+                  pendingClarify?.requestId ??
+                    pendingClarifyState.cleared?.requestId ??
+                    $clarifyRequests.get()[cachedRuntimeId]?.requestId
+                ),
+                sessionRestScope
+              )
 
               return
             }
@@ -1349,7 +1406,7 @@ export function useSessionActions({
       let cachedTailPaint: ChatMessage[] | null = null
 
       if (!resumedSameSelectedSession && $messages.get().length === 0) {
-        const cachedTail = loadTranscriptTail(storedSessionId)
+        const cachedTail = loadTranscriptTail(storedSessionId, sessionRestScope)
 
         if (cachedTail && selectedStoredSessionIdRef.current === storedSessionId) {
           cachedTailPaint = cachedTail
@@ -1412,21 +1469,23 @@ export function useSessionActions({
         let resumeRuntimeBaselineMessages: ChatMessage[] = []
         const resumeStartedAt = Date.now() / 1000
 
-        const resumePromise = requestForSession<SessionResumeResponse>('session.resume', {
-          session_id: storedSessionId,
-          cols: 96,
-          source: 'desktop',
-          defer_history: !watchWindow,
-          // REST is the transcript authority for Desktop. Avoid duplicating a
-          // potentially huge compression lineage in the WebSocket response.
-          // Watch windows attach lazily (live mirror). Every other cold resume
-          // gets the gateway's default deferred build: the RPC returns the
-          // transcript immediately instead of blocking the switch on _make_agent
-          // (MCP discovery / prompt build), and the agent pre-warms in the
-          // background while the prefetch above paints the transcript.
-          ...(watchWindow ? { lazy: true } : { omit_messages: true }),
-          ...(sessionProfile ? { profile: sessionProfile } : {})
-        }).then(resumed => {
+        const resumePromise = singleFlightSessionResume(storedSessionId, () =>
+          requestForSession<SessionResumeResponse>('session.resume', {
+            session_id: storedSessionId,
+            cols: 96,
+            source: 'desktop',
+            defer_history: !watchWindow,
+            // REST is the transcript authority for Desktop. Avoid duplicating a
+            // potentially huge compression lineage in the WebSocket response.
+            // Watch windows attach lazily (live mirror). Every other cold resume
+            // gets the gateway's default deferred build: the RPC returns the
+            // transcript immediately instead of blocking the switch on _make_agent
+            // (MCP discovery / prompt build), and the agent pre-warms in the
+            // background while the prefetch above paints the transcript.
+            ...(watchWindow ? { lazy: true } : { omit_messages: true }),
+            ...(sessionProfile ? { profile: sessionProfile } : {})
+          })
+        ).then(resumed => {
           resumeRuntimeBaselineMessages =
             sessionStateByRuntimeIdRef.current.get(resumed.session_id)?.messages ?? resumeRuntimeBaselineMessages
 
@@ -1584,7 +1643,7 @@ export function useSessionActions({
           // mislead the retry (or the next wake).
           if (cachedTailPaint !== null && $messages.get() === cachedTailPaint) {
             setMessages([])
-            dropTranscriptTail(storedSessionId)
+            dropTranscriptTail(storedSessionId, sessionRestScope)
           }
 
           setActiveSessionId(null)
@@ -1683,11 +1742,18 @@ export function useSessionActions({
           setMessages(visibleMessagesForView)
         }
 
-        // Refresh the durable tail cache with the authoritative transcript so
-        // the NEXT wake of this session paints instantly (fresh launch,
-        // reaped backend). Post-reconcile only — never persist an optimistic
-        // or in-flight-recovered projection ahead of backend truth.
-        saveTranscriptTail(storedSessionId, messagesForView)
+        // Refresh the durable tail cache with backend transcript truth only;
+        // the live pending clarify projection expires with the server request.
+        saveTranscriptTail(
+          storedSessionId,
+          stripPendingClarifyProjectionForCache(
+            messagesForView,
+            pendingClarify?.requestId ??
+              pendingClarifyState.cleared?.requestId ??
+              $clarifyRequests.get()[resumed.session_id]?.requestId
+          ),
+          sessionRestScope
+        )
       } catch (err) {
         if (!isCurrentResume()) {
           return
@@ -2182,9 +2248,9 @@ export function useSessionActions({
           }).catch(() => undefined)
         }
 
-        await deleteSession(storedSessionId, removed?.profile)
-        // A deleted session's cached tail must not resurrect on a recycled id.
-        dropTranscriptTail(storedSessionId)
+        await deleteSession(storedSessionId, removedOwner)
+
+        dropTranscriptTailEverywhere(storedSessionId)
         // Only after the RPC lands — the optimistic eviction above can roll
         // back, and a rolled-back row must keep its watermark/marker.
         forgetSessionUnread(removedIds, profile)

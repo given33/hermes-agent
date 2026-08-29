@@ -17,8 +17,23 @@ import {
   connectionMatchesQuery,
   sortConnectionsForDisplay
 } from '@/lib/connection-display'
+import { deriveRemoteAuthProviderShape } from '@/lib/desktop-remote-auth'
 import { triggerHaptic } from '@/lib/haptics'
-import { Cloud, Globe, Loader2, Monitor, Pencil, Plus, RefreshCw, SearchIcon, Terminal, Trash2 } from '@/lib/icons'
+import {
+  Check,
+  Cloud,
+  Globe,
+  Loader2,
+  LogIn,
+  Monitor,
+  Pencil,
+  Plus,
+  RefreshCw,
+  SearchIcon,
+  Terminal,
+  Trash2
+} from '@/lib/icons'
+import { coerceRemoteUrlScheme } from '@/lib/remote-url'
 import { $activeConnectionId, setConnectionsRegistry } from '@/store/connections'
 import { notify, notifyError } from '@/store/notifications'
 
@@ -256,6 +271,92 @@ export function ConnectionsRegistrySection() {
     setRegistry(next)
     setConnectionsRegistry(next)
   }, [])
+
+  const editorUrl = editor?.kind === 'remote' ? coerceRemoteUrlScheme(editor.url) : ''
+  const editorWantsOauth = editor?.kind === 'remote' && editor.authMode === 'oauth'
+  const authProviderShape = deriveRemoteAuthProviderShape(authProbe?.providers, t.boot.failure.identityProvider)
+
+  // Probe only while the sign-in row is on screen, and debounce it so typing a
+  // URL doesn't fire a request per keystroke. Best-effort: a failed probe just
+  // leaves the generic provider label, it never blocks signing in.
+  useEffect(() => {
+    if (!editorWantsOauth || !editorUrl || !window.hermesDesktop?.probeConnectionConfig) {
+      setAuthProbe(null)
+
+      return
+    }
+
+    const seq = ++probeSeq.current
+    // Staleness is covered by probeSeq, but not unmount: a probe resolving
+    // after the editor closes would still call setAuthProbe on an unmounted
+    // component. Harmless in React 18, still worth not doing.
+    let cancelled = false
+
+    const timer = setTimeout(() => {
+      window.hermesDesktop
+        .probeConnectionConfig(editorUrl)
+        .then(result => {
+          if (!cancelled && seq === probeSeq.current) {
+            setAuthProbe(result)
+          }
+        })
+        .catch(() => {
+          if (!cancelled && seq === probeSeq.current) {
+            setAuthProbe(null)
+          }
+        })
+    }, 400)
+
+    return () => {
+      cancelled = true
+      clearTimeout(timer)
+    }
+  }, [editorUrl, editorWantsOauth])
+
+  // The session is scoped to an origin, so pointing the editor at a different
+  // URL invalidates the "signed in" state this row is reporting. Flipping the
+  // auth mode invalidates it too: a saved row edited token -> oauth must not
+  // present a stale "Signed in" pill from an earlier oauth stint.
+  useEffect(() => {
+    setOauthConnected(false)
+  }, [editorUrl, editorWantsOauth])
+
+  // Open the gateway's own login window and let the main process keep whatever
+  // it mints (native PKCE bearer tokens, or the legacy session cookies). This
+  // is the same IPC the first-run form and the gateway panel use — the
+  // registry editor simply had no affordance to reach it.
+  const signInOauth = useCallback(async () => {
+    if (!editorUrl) {
+      notify({ kind: 'warning', title: t.settings.gateway.authTitle, message: t.settings.gateway.enterUrlFirst })
+
+      return
+    }
+
+    setSigningIn(true)
+
+    try {
+      const result = await window.hermesDesktop.oauthLoginConnectionConfig(editorUrl)
+
+      setOauthConnected(Boolean(result.connected))
+
+      if (result.connected) {
+        notify({
+          title: t.settings.gateway.signedIn,
+          message: t.settings.gateway.connectedTo(authProviderShape.providerLabel)
+        })
+      } else {
+        notify({
+          kind: 'warning',
+          title: t.boot.failure.signInIncompleteTitle,
+          message: t.boot.failure.signInIncompleteMessage
+        })
+      }
+    } catch (err) {
+      notifyError(err, t.settings.gateway.signInFailed)
+    } finally {
+      setSigningIn(false)
+    }
+  }, [authProviderShape.providerLabel, editorUrl, t])
 
   const load = useCallback(async () => {
     if (!bridge) {
@@ -888,7 +989,11 @@ export function ConnectionsRegistrySection() {
         </div>
       )}
 
-      {!loading && registry && registry.connections.length > 1 && (
+      {/* Not gated on connections.length > 1: a registry that drifted down to
+          local-only is exactly the state where a user needs to see and change
+          the launch behavior, and hiding the control there left hand-editing
+          connections.json as the only recourse (#90174). */}
+      {!loading && registry && (
         <div className="mt-6 border-t border-border/60 pt-4">
           <ToggleRow
             checked={registry.launchMode === 'last-used'}

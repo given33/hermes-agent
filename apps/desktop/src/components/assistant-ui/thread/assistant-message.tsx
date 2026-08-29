@@ -11,6 +11,7 @@ import { type FC, type ReactNode, useCallback, useMemo, useState } from 'react'
 import { useInRouterContext, useNavigate } from 'react-router'
 
 import { useSessionView } from '@/app/chat/session-view'
+import { SETTINGS_ROUTE } from '@/app/routes'
 import { ChangedFilesCard } from '@/components/assistant-ui/thread/changed-files-card'
 import {
   contentHasVisibleText,
@@ -113,14 +114,77 @@ export const AssistantMessage: FC<AssistantMessageProps> = props => {
     return null
   })
 
-  // PERF: this component must NOT subscribe to the streaming text. Every
-  // selector here returns a value that stays referentially stable across
-  // token flushes (booleans, status strings, '' while running), so the
-  // 30 Hz delta stream only re-renders the markdown part and the tiny
-  // TurnActivityIndicator leaf — not the footer/preview/root subtree.
-  const messageStatus = useAuiState(s => s.message.status?.type)
-  const isRunning = messageStatus === 'running'
-  const isPlaceholder = useAuiState(s => s.message.status?.type === 'running' && s.message.content.length === 0)
+  // The collapse gate below needs the LIVE running status, but only an
+  // inter-agent reply can ever be collapsed. Dispatching on that first keeps
+  // the status subscription out of the standard path entirely — the standard
+  // message root now re-renders for content, never for a pending flip.
+  return interAgentSender ? (
+    <InterAgentAssistantMessage {...props} sender={interAgentSender} />
+  ) : (
+    <AssistantMessageBody {...props} />
+  )
+}
+
+/** The compact stand-in a settled inter-agent reply collapses to (Grok-bots
+ *  parity — the transcript shows the event; the text is one click away). */
+const InterAgentCollapsedNotice: FC<{ sender: string }> = ({ sender }) => (
+  <div className="flex max-w-[min(86%,44rem)] flex-col gap-0.5 self-center px-2 py-0.5 text-[0.6875rem] leading-5 text-muted-foreground/60">
+    <span className="flex items-center justify-center gap-1.5">
+      <Codicon className="shrink-0 text-muted-foreground/55" name="arrow-small-right" size="0.8125rem" />
+      <span className="wrap-anywhere">Replied to {sender}</span>
+    </span>
+    <details className="self-center">
+      <summary className="cursor-pointer select-none text-center text-muted-foreground/45 hover:text-muted-foreground/70">
+        show reply
+      </summary>
+      <div className="mt-1 max-w-[36rem] rounded-lg border border-(--ui-stroke-tertiary) px-3 py-2 text-left text-[0.75rem] leading-5 text-foreground/85">
+        {MESSAGE_PARTS}
+      </div>
+    </details>
+  </div>
+)
+
+/**
+ * An assistant reply that answers an inter-agent delivery. Owns the only
+ * root-level `isRunning` subscription left in this file, and it is confined to
+ * the rare inter-agent case: the reply renders collapsed once it settles, so
+ * the gate genuinely needs live status. Never collapse while streaming — the
+ * user should see progress.
+ *
+ * The collapse is expressed as a CHILD of the normal body, not as a competing
+ * root. Returning a bare MessagePrimitive.Root here for the settled case put a
+ * different element type in this position than the running case
+ * (AssistantMessageBody), so settling unmounted the whole row and mounted a
+ * fresh one — throwing away the DOM the scroll anchor was holding, which can
+ * jump the transcript under the reader. One component, one root, children
+ * vary: settling is now a prop change React applies in place.
+ */
+const InterAgentAssistantMessage: FC<AssistantMessageProps & { sender: string }> = ({ sender, ...props }) => {
+  const isRunning = useAuiState(s => s.message.status?.type === 'running')
+
+  return (
+    <AssistantMessageBody
+      {...props}
+      collapsedNotice={isRunning ? null : <InterAgentCollapsedNotice sender={sender} />}
+    />
+  )
+}
+
+const AssistantMessageBody: FC<AssistantMessageProps & { collapsedNotice?: null | ReactNode }> = ({
+  collapsedNotice = null,
+  onBranchInNewChat,
+  onDismissError
+}) => {
+  const messageId = useAuiState(s => s.message.id)
+  const messageRuntime = useMessageRuntime()
+  const { t } = useI18n()
+
+  // PERF: this component must NOT subscribe to the streaming text, and no
+  // longer subscribes to the streaming STATUS either. Every selector here
+  // returns a value that stays referentially stable across token flushes
+  // (booleans, '' while running), so the 30 Hz delta stream only re-renders
+  // the markdown part and the tiny status leaves — not the footer, the
+  // preview block, or this root.
   const hasVisibleText = useAuiState(s => contentHasVisibleText(s.message.content))
   // Sealed mid-turn commentary keeps its text but not the footer, so a
   // tool-heavy turn doesn't grow a copy/refresh bar per paragraph (see
@@ -380,67 +444,12 @@ const StreamingMarker: FC = () => {
   const isRunning = useAuiState(s => s.message.status?.type === 'running')
 
   return (
-    <MessagePrimitive.Root
-      className="group flex w-full min-w-0 max-w-full flex-col gap-0 self-start overflow-hidden"
-      data-role="assistant"
-      data-slot="aui_assistant-message-root"
-      data-streaming={isRunning ? 'true' : undefined}
-      onDoubleClick={onDoubleClick}
-      ref={enterRef}
-    >
-      <div
-        className="wrap-anywhere min-w-0 max-w-full overflow-hidden text-pretty text-[length:var(--conversation-text-font-size)] leading-(--dt-line-height) text-foreground"
-        data-slot="aui_assistant-message-content"
-      >
-        {/* Todos render in the composer status stack now, not inline. */}
-        <MessagePrimitive.Parts components={MESSAGE_PARTS_COMPONENTS} />
-        {/* The activity row is mounted by the TAIL of the thread and decides
-            for itself whether the turn owes the user a line. Gating the mount
-            on this bubble's own `running` status was the hole: a turn that
-            seals a bubble mid-flight (message.interim) or finishes one while
-            the agent keeps going leaves a settled message at the tail, so the
-            row unmounted and the seconds went uncounted while the composer's
-            arc border and Stop button said work was still happening. */}
-        {isLastMessage && (isPlaceholder ? <ResponseLoadingIndicator /> : <TurnActivityIndicator />)}
-        {previewTargets.length > 0 && (
-          <div className="mt-3 flex flex-wrap gap-2">
-            {previewTargets.map(target => (
-              <PreviewAttachment key={target} source="explicit-link" target={target} />
-            ))}
-          </div>
-        )}
-        <MessagePrimitive.Error>
-          <ErrorPrimitive.Root
-            className="mt-1.5 flex items-start gap-1.5 text-[0.78rem] leading-5 text-[color-mix(in_srgb,var(--dt-destructive)_78%,var(--ui-text-secondary))]"
-            role="alert"
-          >
-            <ErrorPrimitive.Message className="min-w-0 flex-1" />
-            {onDismissError && (
-              <TooltipIconButton
-                className="-my-0.5 shrink-0 text-current opacity-70 hover:opacity-100"
-                onClick={() => onDismissError(messageId)}
-                side="top"
-                tooltip={t.assistant.thread.dismissError}
-              >
-                <XIcon className="size-3.5" />
-              </TooltipIconButton>
-            )}
-          </ErrorPrimitive.Root>
-        </MessagePrimitive.Error>
-      </div>
-      <MessageTimelineTimestamp className="px-(--message-text-indent) pt-0.5" suppressIfDuplicatePart />
-      {hasVisibleText && !isInterim && (
-        <AssistantFooter
-          durationS={turnDurationS}
-          getMessageText={getMessageText}
-          messageId={messageId}
-          onBranchInNewChat={onBranchInNewChat}
-        />
-      )}
-      {/* Last thing in the turn — under the action bar, the way Cursor ends a
-          turn on its summary rather than burying it above the controls. */}
-      <ChangedFilesCard parts={settledParts} />
-    </MessagePrimitive.Root>
+    <span
+      aria-hidden="true"
+      className="hidden"
+      data-message-streaming={isRunning ? 'true' : undefined}
+      data-slot="aui_message-streaming-marker"
+    />
   )
 }
 

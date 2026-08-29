@@ -211,3 +211,14 @@ uv run ruff check hermes_runtime hermes_services plugins/collaboration/dashboard
   `managedFilesJSON` 与四个 `files.managed.*` action，并有 route/native source
   回归覆盖。iOS 全量 `pnpm test` 为 `811 passed / 0 failed`，`pnpm typecheck`
   与 `pnpm contract:check` 通过。
+
+### 2026-08-29 续审：桌面端上游合并冲突修复
+
+- 发现此前同步提交把上游完整的 session-owner route、连接注册表、transcript
+  tail、消息渲染和 Electron IPC 实现截成旧版，导致桌面 `typecheck` 出现 193
+  个缺失导出/变量错误。已按 `upstream/main` 恢复官方实现，并保留本地 HK/worker
+  部署、WebSocket 通道、Bot Mode 和 iOS 改动；当前 `npm run --workspace apps/desktop
+  typecheck`（renderer、Electron、e2e 三套 tsconfig）通过。
+- 会话路由、连接生命周期、预览浏览器栏、clarify 控件五组聚焦 Vitest 共
+  `114 passed / 0 failed`。完整 UI suite 未作为发布门禁：Windows 下仍有历史
+  shell/Canvas 环境测试需要 Linux/macOS CI；不会把这些平台限制误报为功能已验证。

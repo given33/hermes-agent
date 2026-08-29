@@ -1281,16 +1281,11 @@ function enforceDockedPanes(
     }
 
     if (dock.pos === 'center' && from.id === anchor.id) {
-      // Already stacked with its anchor — but an enforced tab must be
-      // REACHABLE, not just co-located. Community regression (Aug 2026):
-      // persisted trees where the enforced pane was center-stacked with the
-      // strip hidden and itself active left the ANCHOR invisible with no
-      // strip to switch back ("my ui only shows bots now... cant find the
-      // sessions"). An enforced zone always shows its strip.
-      if (anchor.headerHidden === true) {
-        next = setGroupHeaderHiddenOp(next, anchor.id, false) ?? next
-      }
-
+      // Already stacked with its anchor, and nothing to repair: the trees that
+      // produced the "my ui only shows bots now... cant find the sessions"
+      // regression carried an accidental `headerHidden: true`, which the load
+      // migration now drops outright. A surviving `never` here is deliberate
+      // and recoverable from the toggle command, so boot does not overrule it.
       continue
     }
 

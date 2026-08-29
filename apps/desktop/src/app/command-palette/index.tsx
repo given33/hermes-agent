@@ -561,6 +561,16 @@ function CommandPaletteBody({ onExited }: { onExited: () => void }) {
   const { availableThemes, clearThemePreview, mode, previewTheme, resolvedMode, setMode, setTheme, themeName } =
     useTheme()
 
+  // Mode rows preview like theme rows do: paint the committed skin at the
+  // highlighted brightness. `system` has to be resolved here — previewTheme
+  // paints a concrete light/dark.
+  const systemDark = useMediaQuery('(prefers-color-scheme: dark)')
+
+  const resolveThemeMode = useCallback(
+    (target: ThemeMode): 'light' | 'dark' => (target === 'system' ? (systemDark ? 'dark' : 'light') : target),
+    [systemDark]
+  )
+
   const [search, setSearch] = useState('')
   const [page, setPage] = useState<string | null>(null)
   const inputRef = useRef<HTMLInputElement>(null)
@@ -1359,7 +1369,7 @@ function CommandPaletteBody({ onExited }: { onExited: () => void }) {
                 keepOpen: true,
                 keywords: ['theme', 'appearance', 'palette', theme.label, theme.description ?? ''],
                 label: theme.label,
-                onHighlight: () => previewTheme(theme.name, groupMode),
+                onHighlight: () => previewTheme(theme.name, previewMode),
                 run: () => {
                   setTheme(theme.name)
 
@@ -1412,7 +1422,18 @@ function CommandPaletteBody({ onExited }: { onExited: () => void }) {
         groups: settingsPageGroups
       }
     }),
-    [availableThemes, mode, previewTheme, resolvedMode, setMode, setTheme, settingsPageGroups, t, themeName]
+    [
+      availableThemes,
+      mode,
+      previewTheme,
+      resolvedMode,
+      resolveThemeMode,
+      setMode,
+      setTheme,
+      settingsPageGroups,
+      t,
+      themeName
+    ]
   )
 
   const activePage = page ? subPages[page] : null

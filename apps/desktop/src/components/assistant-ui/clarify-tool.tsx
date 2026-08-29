@@ -374,17 +374,38 @@ function ClarifyToolPending(props: ToolCallMessagePartProps) {
   const $request = useMemo(() => sessionClarifyRequest(sessionId), [sessionId])
   const request = useStore($request)
   const fromArgs = useMemo(() => readClarifyArgs(props.args), [props.args])
+  const messageRunning = useAuiState(selectMessageRunning)
+  // Answering clears the request a beat before `tool.complete` swaps in the
+  // settled card. Latch submit so that gap doesn't demote; Stop also clears
+  // the request and must still collapse an unanswered card.
+  const [answered, setAnswered] = useState(false)
+
+  // Stopped mid-prompt with no result — don't leave a dead interactive panel.
+  // `session.info` reports running=false while clarify is blocking, so the
+  // running flag alone would remount the question as a tool row. Keep the
+  // card while a request is open or this instance already submitted.
+  if (!messageRunning && !request && !answered) {
+    return <ToolFallback {...props} />
+  }
 
   // Batch: the gateway request carries qid-keyed questions. Args alone can't
   // drive the form (no qids to respond with), so batch waits for the request.
   if (request?.questions?.length || fromArgs.questions) {
-    return <ClarifyToolBatchPending request={request} />
+    return <ClarifyToolBatchPending onAnswered={() => setAnswered(true)} request={request} />
   }
 
-  return <ClarifyToolSinglePending fromArgs={fromArgs} request={request} />
+  return <ClarifyToolSinglePending fromArgs={fromArgs} onAnswered={() => setAnswered(true)} request={request} />
 }
 
-function ClarifyToolSinglePending({ fromArgs, request }: { fromArgs: ClarifyArgs; request: ClarifyRequest | null }) {
+function ClarifyToolSinglePending({
+  fromArgs,
+  onAnswered,
+  request
+}: {
+  fromArgs: ClarifyArgs
+  onAnswered: () => void
+  request: ClarifyRequest | null
+}) {
   const { t } = useI18n()
   const copy = t.assistant.clarify
   const gateway = useStore($gateway)
@@ -911,14 +932,14 @@ const emptyStage = { choices: [] as string[], draft: '' }
  * back-to-back and completes the batch. Staged answers stay editable up to
  * that moment. The per-question wire protocol is unchanged (the TUI/CLI
  * still lock incrementally); this card just batches its locks at the end. */
-function ClarifyToolBatchPending({ request }: { request: ClarifyRequest | null }) {
+function ClarifyToolBatchPending({ onAnswered, request }: { onAnswered: () => void; request: ClarifyRequest | null }) {
   const { t } = useI18n()
   const copy = t.assistant.clarify
   const gateway = useStore($gateway)
 
   // qids only exist on the gateway request — args are a hydration-race
   // fallback for display, never answerable (no ids to respond with).
-  const questions = useMemo(() => request?.questions ?? [], [request?.questions])
+  const questions = request?.questions ?? []
   const ready = Boolean(request?.requestId) && questions.length > 0
 
   const [staged, setStaged] = useState<Record<string, { choices: string[]; draft: string }>>({})
@@ -944,8 +965,24 @@ function ClarifyToolBatchPending({ request }: { request: ClarifyRequest | null }
           continue
         }
 
-        const asChoice = (question.choices ?? []).find(choice => bareChoice(choice) === answer)
-        next[question.qid] = asChoice ? { choices: [asChoice], draft: '' } : { choices: [], draft: answer }
+        const options = question.choices ?? []
+        let replayedAnswers = [answer]
+
+        if (question.multiSelect) {
+          try {
+            const parsed = JSON.parse(answer)
+
+            if (Array.isArray(parsed) && parsed.every(value => typeof value === 'string')) {
+              replayedAnswers = parsed
+            }
+          } catch {
+            // Older/non-JSON replies remain a one-value replay below.
+          }
+        }
+
+        const matchedChoices = options.filter(choice => replayedAnswers.includes(bareChoice(choice)))
+        next[question.qid] =
+          matchedChoices.length > 0 ? { choices: matchedChoices, draft: '' } : { choices: [], draft: answer }
       }
 
       return next
@@ -987,24 +1024,34 @@ function ClarifyToolBatchPending({ request }: { request: ClarifyRequest | null }
       // server-side, so every earlier lock must already be accepted when it
       // lands — a reordered burst could complete the batch with a missing
       // answer.
+      //
+      // Each lock rides the session's OWNER socket, not the ambient one: a
+      // profile / Bot Chat switch re-points ambient at a backend that never
+      // held this batch, which would leave the owner blocked.
       for (const question of questions) {
         const answer = stagedAnswer(question)
 
-        await gateway.request<{ ok?: boolean }>('clarify.respond', {
-          answer: answer ?? '',
-          question_id: question.qid,
-          request_id: request.requestId
-        })
+        await requestForOwnedSession<{ ok?: boolean }>(
+          request.sessionId,
+          gateway.request.bind(gateway) as typeof gateway.request,
+          'clarify.respond',
+          {
+            answer: answer ?? '',
+            question_id: question.qid,
+            request_id: request.requestId
+          }
+        )
       }
 
       triggerHaptic('submit')
+      onAnswered()
       // tool.complete lands next → ClarifyToolBatchSettled.
       clearClarifyRequest(request.requestId, request.sessionId)
     } catch (error) {
       notifyError(error, copy.sendFailed)
       setSubmitting(false)
     }
-  }, [copy, gateway, questions, request, stagedAnswer])
+  }, [copy, gateway, onAnswered, questions, request, stagedAnswer])
 
   const toggleChoice = useCallback((question: ClarifyQuestion, choice: string) => {
     setStaged(current => {
@@ -1029,14 +1076,24 @@ function ClarifyToolBatchPending({ request }: { request: ClarifyRequest | null }
       return
     }
 
+    onAnswered()
     clearClarifyRequest(request.requestId, request.sessionId)
 
     try {
-      await gateway?.request('clarify.respond', { answer: '', request_id: request.requestId })
+      if (gateway) {
+        // Owner-routed like the locks above — a skip sent to the wrong backend
+        // is a silent no-op that leaves the agent waiting out its timeout.
+        await requestForOwnedSession(
+          request.sessionId,
+          gateway.request.bind(gateway) as typeof gateway.request,
+          'clarify.respond',
+          { answer: '', request_id: request.requestId }
+        )
+      }
     } catch {
       // The tool times out on its own; a failed skip must never block the UI.
     }
-  }, [gateway, request])
+  }, [gateway, onAnswered, request])
 
   const handleSubmit = useCallback(
     (event: FormEvent<HTMLFormElement>) => {
