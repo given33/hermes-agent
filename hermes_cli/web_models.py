@@ -681,6 +681,21 @@ class BotAssetUpdate(BaseModel):
     clear: bool = False
 
 
+class BotRelaySend(BaseModel):
+    """Authenticated mobile envelope for the upstream Bot Mode relay.
+
+    The desktop plugin normally reaches ``tools.bot_relay.enqueue_envelope``
+    through the ``message_agent`` tool.  iOS has no desktop tool runtime, so
+    this small REST envelope carries the same target/message fields while the
+    route delegates to that canonical helper (including ambiguity, liveness,
+    TTL and atomic outbox semantics).
+    """
+
+    target: str = Field(min_length=1, max_length=160)
+    message: str = Field(min_length=1, max_length=12000)
+    sender_profile: str = Field(default="default", min_length=1, max_length=64)
+
+
 class ProfileExport(BaseModel):
     # Optional extra root-level files to stage into the archive, filename →
     # text content (e.g. desktop.json — the desktop appearance overlay).

@@ -57,6 +57,15 @@
 完成后不会偷偷启动官方普通会话使用的后台 memory/skill review fork；该 fork
 仍保留给非托管的本地 CLI 会话。
 
+### 17. Mobile Bot Mode relay bridge
+
+移动端没有桌面插件里的 `message_agent` 工具运行时，因此新增的
+`/api/bot-mode/relay/roster` 与 `/api/bot-mode/relay/send` 只做薄 REST
+适配：读取桌面维护的 `bot_relay/roster.json`，并直接调用官方
+`tools.bot_relay.enqueue_envelope()`。目标歧义、连接器离线、信封 TTL、原子
+outbox 写入和回复等待仍由官方 relay helper 负责；服务端不会向 iOS 暴露其他
+连接的 token。
+
 ## 验证
 
 ### 2026-08-29 上游同步核验

@@ -18,6 +18,7 @@ import functools
 import inspect
 import json
 import logging
+import os
 import re
 import subprocess  # noqa: F401
 import sys  # noqa: F401
@@ -44,6 +45,7 @@ from hermes_cli.web_models import (
     ProfileDescribeAuto,
     BotProfileConfigure,
     BotAssetUpdate,
+    BotRelaySend,
     SessionPrScanBody,
 )
 
@@ -926,6 +928,84 @@ def _bot_has_avatar_for_row(row: Dict[str, Any]) -> bool:
         return False
     assets = Path(path) / "assets"
     return any((assets / f"avatar.{ext}").is_file() for ext in ("png", "jpg", "webp"))
+
+
+def _bot_relay_home() -> Path:
+    """Resolve the same Hermes root used by the upstream relay helpers."""
+
+    home = Path(os.getenv("HERMES_HOME") or os.path.expanduser("~/.hermes"))
+    return home.parent.parent if home.parent.name == "profiles" else home
+
+
+@router.get("/api/bot-mode/relay/roster")
+async def get_bot_relay_roster_endpoint():
+    """Expose the upstream Bot Mode cross-connection roster to iOS.
+
+    Desktop normally keeps this file fresh by calling
+    ``bot_relay.roster.sync`` over every gateway socket.  The mobile bridge
+    only reads it; it never receives or stores another connection's token.
+    """
+
+    def read() -> Dict[str, Any]:
+        from tools.bot_relay import read_remote_roster, relay_root
+
+        root = _bot_relay_home()
+        agents = read_remote_roster(root)
+        updated_at = 0
+        try:
+            payload = json.loads((relay_root(root) / "roster.json").read_text(encoding="utf-8"))
+            if isinstance(payload, dict):
+                updated_at = int(payload.get("updated_at") or 0)
+        except (OSError, ValueError, TypeError):
+            pass
+        return {"ok": True, "bot_mode": True, "agents": agents, "updated_at": updated_at}
+
+    return await asyncio.to_thread(read)
+
+
+@router.post("/api/bot-mode/relay/send")
+async def send_bot_relay_endpoint(body: BotRelaySend):
+    """Queue a cross-connection Bot Mode DM using the official relay helper."""
+
+    def enqueue() -> Dict[str, Any]:
+        from tools.bot_relay import (
+            EnvelopeRefusedError,
+            enqueue_envelope,
+            read_remote_roster,
+            resolve_remote_target,
+        )
+
+        root = _bot_relay_home()
+        sender_profile = body.sender_profile.strip()
+        sender_dir = _resolve_profile_dir(sender_profile)
+        if not sender_dir.is_dir():
+            raise HTTPException(status_code=404, detail="Sender profile not found")
+        roster = read_remote_roster(root)
+        target = resolve_remote_target(body.target, roster)
+        if target == "ambiguous":
+            raise HTTPException(status_code=409, detail="Target is ambiguous; use handle@connection-id")
+        if not isinstance(target, dict):
+            raise HTTPException(status_code=404, detail="Remote Bot Mode target not found")
+        sender_handle = "hermes" if sender_profile.lower() == "default" else sender_profile
+        try:
+            envelope = enqueue_envelope(
+                root,
+                target=target,
+                message=body.message.strip(),
+                sender_profile=sender_profile,
+                sender_handle=sender_handle,
+            )
+        except EnvelopeRefusedError as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+        return {
+            "ok": True,
+            "bot_mode": True,
+            "queued": True,
+            "envelope_id": envelope.get("id", ""),
+            "target": target,
+        }
+
+    return await asyncio.to_thread(enqueue)
 
 
 def _invoke_profile_gateway_rpc(method: str, params: Dict[str, Any]) -> Dict[str, Any]:

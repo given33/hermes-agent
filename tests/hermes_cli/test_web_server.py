@@ -207,6 +207,51 @@ async def test_bot_asset_routes_delegate_and_preserve_data_url_contract(monkeypa
     assert calls[2][1]["clear"] is True
 
 
+@pytest.mark.asyncio
+async def test_bot_relay_mobile_surface_reads_and_enqueues_official_outbox(monkeypatch, tmp_path):
+    """iOS relay calls use the upstream roster/queue helpers, not a shadow store."""
+    from hermes_cli.web_routers import profiles as profiles_router
+    import tools.bot_relay as relay
+
+    profile_dir = tmp_path / "default"
+    profile_dir.mkdir()
+    relay_root = tmp_path / "bot_relay"
+    relay_root.mkdir()
+    (relay_root / "roster.json").write_text(
+        json.dumps({
+            "updated_at": 123,
+            "agents": [{
+                "profile": "hk-worker",
+                "handle": "hk-worker",
+                "connection_id": "hk-primary",
+                "connection_label": "Hong Kong",
+            }],
+        }),
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    monkeypatch.setattr(profiles_router, "_resolve_profile_dir", lambda _name: profile_dir)
+
+    roster = await profiles_router.get_bot_relay_roster_endpoint()
+    assert roster["updated_at"] == 123
+    assert roster["agents"][0]["connection_id"] == "hk-primary"
+
+    captured = {}
+
+    def fake_enqueue(root, **kwargs):
+        captured.update(root=str(root), **kwargs)
+        return {"id": "a" * 32, **kwargs}
+
+    monkeypatch.setattr(relay, "enqueue_envelope", fake_enqueue)
+    queued = await profiles_router.send_bot_relay_endpoint(
+        profiles_router.BotRelaySend(target="hk-worker", message="hello from iOS")
+    )
+    assert queued["queued"] is True
+    assert queued["envelope_id"] == "a" * 32
+    assert captured["target"]["connection_id"] == "hk-primary"
+    assert captured["sender_profile"] == "default"
+
+
 # ---------------------------------------------------------------------------
 # Shared fixtures
 # ---------------------------------------------------------------------------
