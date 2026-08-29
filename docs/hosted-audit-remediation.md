@@ -141,8 +141,8 @@ Petdex 头像选择也不重复实现官方逻辑：`/api/bot-mode/pets/gallery`
   行兼容、HK recovery URL/receiver 校验，以及明确的 worker-ready/alive 在线判定。
 - 角色迁移 product-chain 回归为 `19 passed`；旧测试中的 `review_verdict`
   断言已改为 `validation_summary`，并显式确认没有 reviewer/supervisor 模型调用。
-- 最终推送核验（提交 `507567f854`）：`HEAD...origin/main = 0 0`，
-  `HEAD...upstream/main = 392 0`；本地没有未提交改动。
+- 最终推送核验（提交 `4e5f1e7de2`）：`HEAD...origin/main = 0 0`，
+  `HEAD...upstream/main = 394 0`；本地没有未提交改动。
 
 本次同步与角色重构已运行并通过：
 
