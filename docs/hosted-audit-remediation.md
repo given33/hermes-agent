@@ -258,4 +258,4 @@ uv run ruff check hermes_runtime hermes_services plugins/collaboration/dashboard
   导出仍走 `/api/sessions/:id/export`。相关 API surface、路由和后端回归已补齐。
 - 本轮验证：后端 collaboration dashboard `200 passed, 7 skipped, 44 subtests`，
   cloud-files `74 passed`；iOS `pnpm test` `819 passed / 0 failed`，TypeScript 与
-  SwiftUI contract check 通过，ruff 通过。
+  SwiftUI contract check 通过，ruff 通过。当前后端发布提交为 `9e05ecd9a0`。
