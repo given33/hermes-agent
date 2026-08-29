@@ -7060,6 +7060,29 @@ class CollaborationDashboardTests(unittest.TestCase):
         self.assertEqual(result["conversation"]["title"], "New title")
         self.assertEqual(saved[-1]["conversations"][0]["title"], "New title")
 
+    def test_single_conversation_session_flags_patch_without_title(self):
+        module = load_module()
+        conversation = module.create_single_conversation("default", "Chat")
+        state = {"conversations": [conversation]}
+        saved = []
+        module.load_single_state = lambda: state
+        module.save_single_state = lambda value: saved.append(value)
+
+        result = module.rename_single_conversation(
+            conversation["id"],
+            module.RenameSingleConversationBody(archived=True, pinned=True, unread=True),
+        )
+
+        projected = result["conversation"]
+        self.assertTrue(projected["archived"])
+        self.assertTrue(projected["pinned"])
+        self.assertTrue(projected["unread"])
+        self.assertNotIn("session_archived", projected)
+        self.assertTrue(saved[-1]["conversations"][0]["session_archived"])
+        # The account flag must not collide with the internal archive
+        # placeholder marker used by conversation lookup.
+        self.assertIs(module._conversation_by_id(state, conversation["id"]), conversation)
+
     def test_hosted_chat_uses_selected_profile_and_secure_file_ids_without_kanban(self):
         module = load_module()
         conversation = module.create_single_conversation("reviewer")

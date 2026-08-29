@@ -4367,6 +4367,12 @@ def create_single_conversation(
     return {
         "id": f"chat_{uuid.uuid4().hex[:12]}",
         "title": title.strip() or "新对话",
+        # Account-scoped session-list state. These additive flags let native
+        # iOS Sessions controls behave consistently for collaboration rows
+        # and official runtime sessions.
+        "session_archived": False,
+        "session_pinned": False,
+        "session_unread": False,
         "profile": profile.strip() or "default",
         "runtime_sessions": {},
         "runtime_runs": {},
@@ -17526,6 +17532,18 @@ def _public_hosted_turns(hosted_turns: Any) -> dict[str, dict[str, Any]]:
 
 def _public_conversation(conversation: dict[str, Any]) -> dict[str, Any]:
     projected = dict(conversation)
+    # Keep account Sessions-page flags in a separate storage namespace from
+    # the collaboration archive marker.  The latter is an internal archive
+    # placeholder consumed by `_conversation_by_id`; reusing `archived=True`
+    # for a UI flag would make an ordinary chat look like an archive file.
+    if "session_archived" in conversation:
+        projected["archived"] = bool(conversation.get("session_archived"))
+    if "session_pinned" in conversation:
+        projected["pinned"] = bool(conversation.get("session_pinned"))
+    if "session_unread" in conversation:
+        projected["unread"] = bool(conversation.get("session_unread"))
+    for key in ("session_archived", "session_pinned", "session_unread"):
+        projected.pop(key, None)
     # Append-only protocol/history collections have dedicated cursor endpoints.
     # Keeping them out of every snapshot prevents quadratic mobile payloads.
     for internal_key in (
@@ -17925,7 +17943,13 @@ class CreateSingleConversationBody(BaseModel):
 
 
 class RenameSingleConversationBody(BaseModel):
-    title: str = Field(max_length=500)
+    # A single PATCH powers both the title editor and the native iOS session
+    # controls. Keep every field optional so archive/pin/read-state changes do
+    # not have to send a throwaway title.
+    title: str | None = Field(default=None, max_length=500)
+    archived: bool | None = None
+    pinned: bool | None = None
+    unread: bool | None = None
 
 
 class AdoptSingleConversationBody(BaseModel):
@@ -20071,9 +20095,21 @@ def rename_single_conversation(
     payload: RenameSingleConversationBody,
     request: Request = None,
 ):
-    title = " ".join(payload.title.split()).strip()[:120]
-    if not title:
-        raise HTTPException(status_code=400, detail="Conversation title is required")
+    title = None
+    if payload.title is not None:
+        title = " ".join(payload.title.split()).strip()[:120]
+        if not title:
+            raise HTTPException(status_code=400, detail="Conversation title is required")
+    if (
+        title is None
+        and payload.archived is None
+        and payload.pinned is None
+        and payload.unread is None
+    ):
+        raise HTTPException(
+            status_code=400,
+            detail="Nothing to update; provide 'title', 'archived', 'pinned', or 'unread'.",
+        )
     with _STATE_LOCK:
         state = load_single_state()
         conversation, _claimed = _owned_conversation_in_state(
@@ -20081,7 +20117,14 @@ def rename_single_conversation(
             conversation_id,
             owner_id_from_request(request),
         )
-        conversation["title"] = title
+        if title is not None:
+            conversation["title"] = title
+        if payload.archived is not None:
+            conversation["session_archived"] = bool(payload.archived)
+        if payload.pinned is not None:
+            conversation["session_pinned"] = bool(payload.pinned)
+        if payload.unread is not None:
+            conversation["session_unread"] = bool(payload.unread)
         conversation["updated_at"] = int(time.time() * 1000)
         save_single_state(state)
         return {"conversation": _public_conversation(conversation)}
