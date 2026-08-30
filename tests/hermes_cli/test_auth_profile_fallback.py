@@ -200,6 +200,63 @@ def test_write_credential_pool_targets_profile_not_global(profile_env):
     assert [e["id"] for e in read_credential_pool("openrouter")] == ["prof-new"]
 
 
+def test_inherited_pool_runtime_mutations_remain_read_only(profile_env):
+    from agent.credential_pool import load_pool
+
+    _write(profile_env["global"] / "auth.json", _make_auth_store(pool={
+        "openrouter": [_pool_entry(
+            id="glob-1",
+            access_token="sk-global",
+            last_status="exhausted",
+            last_status_at=time.time(),
+            last_error_code=429,
+        )],
+    }))
+
+    pool = load_pool("openrouter")
+    assert [entry.id for entry in pool.entries()] == ["glob-1"]
+    assert pool.remove_index(1) is None
+    assert pool.reset_statuses() == 1
+    assert not (profile_env["profile"] / "auth.json").exists()
+
+    reloaded = load_pool("openrouter")
+    assert [entry.id for entry in reloaded.entries()] == ["glob-1"]
+    assert reloaded.entries()[0].last_status == "exhausted"
+
+
+def test_first_profile_pool_add_shadows_without_copying_global(profile_env):
+    from agent.credential_pool import (
+        AUTH_TYPE_API_KEY,
+        SOURCE_MANUAL,
+        PooledCredential,
+        load_pool,
+    )
+
+    _write(profile_env["global"] / "auth.json", _make_auth_store(pool={
+        "openrouter": [_pool_entry(id="glob-1", access_token="sk-global")],
+    }))
+
+    pool = load_pool("openrouter")
+    pool.add_entry(PooledCredential(
+        provider="openrouter",
+        id="profile-1",
+        label="profile",
+        auth_type=AUTH_TYPE_API_KEY,
+        priority=0,
+        source=SOURCE_MANUAL,
+        access_token="sk-profile",
+    ))
+
+    profile_store = json.loads(
+        (profile_env["profile"] / "auth.json").read_text(encoding="utf-8")
+    )
+    assert [
+        entry["id"]
+        for entry in profile_store["credential_pool"]["openrouter"]
+    ] == ["profile-1"]
+    assert [entry.id for entry in load_pool("openrouter").entries()] == ["profile-1"]
+
+
 
 
 def test_auth_lock_reentrancy_is_scoped_after_profile_context_switch(profile_env):

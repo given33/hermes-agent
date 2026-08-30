@@ -265,6 +265,65 @@ class TestCredentialPoolEndpoints:
         assert root_after["credential_pool"]["custom:dispatcher"][0]["label"] == "Dispatcher"
         assert profile_after.get("credential_pool", {}).get("custom:hk", []) == []
 
+    def test_profile_mutations_never_materialize_global_fallback(self):
+        from hermes_constants import get_hermes_home
+
+        root = get_hermes_home()
+        profile_home = root / "profiles" / "hk-worker"
+        profile_home.mkdir(parents=True)
+
+        assert self.client.post(
+            "/api/credentials/pool",
+            json={
+                "provider": "custom:shared",
+                "api_key": "global-" + "g" * 24,
+                "label": "Global shared",
+            },
+        ).status_code == 200
+
+        inherited = self.client.get(
+            "/api/credentials/pool?profile=hk-worker"
+        ).json()["providers"]
+        shared = next(row for row in inherited if row["provider"] == "custom:shared")
+        assert [entry["label"] for entry in shared["entries"]] == ["Global shared"]
+
+        # Global fallback rows are read-only to a named profile.
+        removed = self.client.delete(
+            "/api/credentials/pool/custom%3Ashared/1?profile=hk-worker"
+        )
+        assert removed.status_code == 404
+        assert not (profile_home / "auth.json").exists()
+
+        added = self.client.post(
+            "/api/credentials/pool?profile=hk-worker",
+            json={
+                "provider": "custom:shared",
+                "api_key": "local-" + "l" * 24,
+                "label": "HK local",
+            },
+        )
+        assert added.status_code == 200
+        assert added.json()["count"] == 1
+
+        root_store = json.loads((root / "auth.json").read_text(encoding="utf-8"))
+        profile_store = json.loads(
+            (profile_home / "auth.json").read_text(encoding="utf-8")
+        )
+        assert [
+            entry["label"]
+            for entry in root_store["credential_pool"]["custom:shared"]
+        ] == ["Global shared"]
+        assert [
+            entry["label"]
+            for entry in profile_store["credential_pool"]["custom:shared"]
+        ] == ["HK local"]
+
+        shadowed = self.client.get(
+            "/api/credentials/pool?profile=hk-worker"
+        ).json()["providers"]
+        shared = next(row for row in shadowed if row["provider"] == "custom:shared")
+        assert [entry["label"] for entry in shared["entries"]] == ["HK local"]
+
     def test_profile_query_rejects_invalid_profile_names(self):
         response = self.client.get("/api/credentials/pool?profile=../escape")
         assert response.status_code == 400

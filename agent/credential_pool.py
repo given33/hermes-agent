@@ -720,9 +720,20 @@ def _write_through_provider_state_to_global_root(
 
 
 class CredentialPool:
-    def __init__(self, provider: str, entries: List[PooledCredential]):
+    def __init__(
+        self,
+        provider: str,
+        entries: List[PooledCredential],
+        *,
+        read_only_entry_ids: Optional[Set[str]] = None,
+    ):
         self.provider = provider
         self._entries = sorted(entries, key=lambda entry: entry.priority)
+        # A named profile may read credentials inherited from the global auth
+        # store. Those rows are usable at runtime but remain owned by the
+        # global store: profile mutations must never materialize or delete
+        # them in the profile's auth.json.
+        self._read_only_entry_ids = set(read_only_entry_ids or ())
         self._current_id: Optional[str] = None
         self._strategy = get_pool_strategy(provider)
         # RLock: the mutation primitives below (_replace_entry/_persist)
@@ -844,15 +855,25 @@ class CredentialPool:
             for idx, entry in enumerate(self._entries):
                 if entry.id == old.id:
                     self._entries[idx] = new
+                    if old.id in self._read_only_entry_ids and new.id != old.id:
+                        self._read_only_entry_ids.remove(old.id)
+                        self._read_only_entry_ids.add(new.id)
                     return
 
     def _persist(self, *, removed_ids: Optional[List[str]] = None) -> None:
         # Self-locking (RLock): snapshotting self._entries must not race a
         # concurrent rotation when called from the deferred refresh path.
         with self._lock:
+            owned_entries = [
+                entry
+                for entry in self._entries
+                if entry.id not in self._read_only_entry_ids
+            ]
+            if self._read_only_entry_ids and not owned_entries:
+                return
             write_credential_pool(
                 self.provider,
-                [entry.to_dict() for entry in self._entries],
+                [entry.to_dict() for entry in owned_entries],
                 removed_ids=removed_ids,
             )
 
@@ -2713,6 +2734,8 @@ class CredentialPool:
         with self._lock:
             if index < 1 or index > len(self._entries):
                 return None
+            if self._entries[index - 1].id in self._read_only_entry_ids:
+                return None
             removed = self._entries.pop(index - 1)
             self._entries = [
                 replace(entry, priority=new_priority)
@@ -2755,6 +2778,15 @@ class CredentialPool:
 
     def add_entry(self, entry: PooledCredential) -> PooledCredential:
         with self._lock:
+            if self._read_only_entry_ids:
+                self._entries = [
+                    existing
+                    for existing in self._entries
+                    if existing.id not in self._read_only_entry_ids
+                ]
+                if self._current_id in self._read_only_entry_ids:
+                    self._current_id = None
+                self._read_only_entry_ids.clear()
             entry = replace(entry, priority=_next_priority(self._entries))
             self._entries.append(entry)
             self._persist()
@@ -3502,7 +3534,18 @@ def _seed_custom_pool(pool_key: str, entries: List[PooledCredential]) -> Tuple[b
 
 def load_pool(provider: str) -> CredentialPool:
     provider = (provider or "").strip().lower()
-    raw_entries = read_credential_pool(provider)
+    with _auth_store_lock():
+        active_store = _load_auth_store()
+        active_pool = active_store.get("credential_pool")
+        active_entries = (
+            active_pool.get(provider)
+            if isinstance(active_pool, dict)
+            else None
+        )
+        has_owned_entries = bool(
+            isinstance(active_entries, list) and active_entries
+        )
+        raw_entries = read_credential_pool(provider)
     disk_ids = {
         entry.get("id")
         for entry in raw_entries
@@ -3514,6 +3557,11 @@ def load_pool(provider: str) -> CredentialPool:
         for payload in raw_entries
     )
     entries = [PooledCredential.from_dict(provider, payload) for payload in raw_entries]
+    read_only_entry_ids = (
+        {entry.id for entry in entries}
+        if raw_entries and not has_owned_entries and _global_auth_file_path() is not None
+        else set()
+    )
     raw_needs_auth_normalization = any(
         isinstance(payload, dict)
         and _normalize_pool_auth_type(
@@ -3557,10 +3605,23 @@ def load_pool(provider: str) -> CredentialPool:
         changed |= _normalize_pool_priorities(provider, entries)
 
     if changed:
-        new_ids = {entry.id for entry in entries}
-        write_credential_pool(
-            provider,
-            [entry.to_dict() for entry in sorted(entries, key=lambda item: item.priority)],
-            removed_ids=disk_ids - new_ids,
-        )
-    return CredentialPool(provider, entries)
+        owned_entries = [
+            entry for entry in entries if entry.id not in read_only_entry_ids
+        ]
+        if owned_entries:
+            # The first profile-owned row shadows the provider's entire global
+            # fallback. Return and persist only owned rows from this point on.
+            entries = owned_entries
+            read_only_entry_ids.clear()
+        if not read_only_entry_ids:
+            new_ids = {entry.id for entry in entries}
+            write_credential_pool(
+                provider,
+                [entry.to_dict() for entry in sorted(entries, key=lambda item: item.priority)],
+                removed_ids=disk_ids - new_ids,
+            )
+    return CredentialPool(
+        provider,
+        entries,
+        read_only_entry_ids=read_only_entry_ids,
+    )
