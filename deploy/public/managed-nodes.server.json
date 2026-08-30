@@ -8,7 +8,11 @@
       "installation_token_file": "/etc/hermes-agent/managed-installation-token",
       "recovery_urls": {
         "dbb3": "https://daxueshenmai.top/_hermes/recovery/dbb3",
-        "wsl": "https://daxueshenmai.top/_hermes/recovery/wsl"
+        "wsl": "https://daxueshenmai.top/_hermes/recovery/wsl",
+        "hk": "https://daxueshenmai.top/_hermes/recovery/hk"
+      },
+      "recovery_token_files": {
+        "hk": "/etc/hermes-agent/hk-recovery-token"
       },
       "installation_urls": {
         "dbb3": "https://daxueshenmai.top/_hermes/installations/dbb3",

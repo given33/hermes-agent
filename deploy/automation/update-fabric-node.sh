@@ -40,17 +40,24 @@ case "${role}" in
   dbb3)
     token_file="${HERMES_CLOUD_TOKEN_FILE:-/etc/dbb3-team/cloud_connector_token}"
     connector_id="${DBB3_CONNECTOR_ID:-dbb3-primary}"
+    worker_node_id="dbb3-worker"
     ;;
   wsl)
     token_file="${HERMES_CLOUD_TOKEN_FILE:-/etc/pc-team/cloud_connector_token}"
     connector_id="${PC_CONNECTOR_ID:-pc-primary}"
+    worker_node_id="pc-worker"
     ;;
   hk)
     token_file="${HERMES_CLOUD_TOKEN_FILE:-/etc/hk-team/cloud_connector_token}"
     connector_id="${HK_CONNECTOR_ID:-hk-primary}"
+    worker_node_id="hk-worker"
     ;;
 esac
 [[ -f "${token_file}" && ! -L "${token_file}" ]] || die "connector token is missing or unsafe"
+worker_ws_timeout="${HERMES_FABRIC_WORKER_WS_TIMEOUT_SECONDS:-120}"
+[[ "${worker_ws_timeout}" =~ ^[1-9][0-9]*$ ]] \
+  && (( worker_ws_timeout >= 10 && worker_ws_timeout <= 300 )) \
+  || die "worker WebSocket deployment timeout must be between 10 and 300 seconds"
 
 evidence_file="$(mktemp /run/hermes-fabric-evidence.XXXXXX)"
 curl_config="$(mktemp /run/hermes-fabric-curl.XXXXXX)"
@@ -94,6 +101,14 @@ cleanup() {
         bash "${stage}/deploy/recovery/install-wsl-managed-installation.sh" \
           "${stage}" "${wsl_secret_stage}/installation-token" \
           "${wsl_secret_stage}/installation-key" \
+          "--rollback-backup=${receiver_backup}" \
+          || rollback_failed=1
+        ;;
+      hk)
+        bash "${stage}/deploy/recovery/install-hk-managed-recovery.sh" \
+          "${stage}" "${hk_secret_stage}/recovery-token" \
+          "${hk_secret_stage}/recovery-key" \
+          "${hk_secret_stage}/recovery-known-hosts" \
           "--rollback-backup=${receiver_backup}" \
           || rollback_failed=1
         ;;
@@ -198,7 +213,7 @@ unset connector_token
 curl --fail --silent --show-error --max-time 15 --noproxy '*' \
   --config "${curl_config}" \
   -o "${evidence_file}" "${cloud_url}/connector/deployment-health"
-readarray -t release_identity < <(python3 - "${evidence_file}" <<'PY'
+readarray -t release_identity < <(python3 - "${evidence_file}" "${worker_node_id}" <<'PY'
 import json
 import re
 import sys
@@ -210,17 +225,32 @@ commit = str(release.get("commit") or "")
 version = str(release.get("version") or "")
 assert re.fullmatch(r"[0-9a-f]{40}", commit)
 assert re.fullmatch(r"[0-9]+\.[0-9]+\.[0-9]+", version)
+worker = payload.get("worker_channel") or {}
+generation = str(worker.get("connection_generation") or "")
+worker_release = worker.get("release") or {}
+worker_current = (
+    worker.get("online") is True
+    and worker.get("fresh") is True
+    and str(worker.get("node_id") or "") == sys.argv[2]
+    and str(worker_release.get("commit") or "") == commit
+    and str(worker_release.get("version") or "") == version
+)
 print(commit)
 print(version)
+print(generation)
+print("1" if worker_current else "0")
 PY
 )
 release_commit="${release_identity[0]:-}"
 release_version="${release_identity[1]:-}"
+previous_connection_generation="${release_identity[2]:-}"
+initial_worker_current="${release_identity[3]:-0}"
 [[ "${release_commit}" =~ ^[0-9a-f]{40}$ ]] || die "release commit is invalid"
 [[ "${release_version}" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] || die "release version is invalid"
 if [[ -f "${deployed_file}" \
     && "$(cat -- "${deployed_file}")" == "${release_commit}" \
-    && -f "${release_evidence_file}" ]] \
+    && -f "${release_evidence_file}" \
+    && "${initial_worker_current}" == 1 ]] \
   && python3 - "${release_evidence_file}" "${role}" "${release_commit}" "${release_version}" <<'PY'
 import json, sys
 data = json.load(open(sys.argv[1], encoding="utf-8"))
@@ -301,6 +331,11 @@ if [[ "${role}" == hk ]]; then
     "deploy/hk/hk-cloud-connector.service"
     "deploy/hk/profile/config.yaml.example"
     "deploy/hk/profile/SOUL.md"
+    "deploy/recovery/install-hk-managed-recovery.sh"
+    "deploy/recovery/hermes-hk-managed-node-recovery.service"
+    "deploy/recovery/hermes-hk-managed-node-recovery-tunnel.service"
+    "deploy/recovery/managed-nodes.hk.json"
+    "deploy/recovery/recover-hk.sh"
   )
 fi
 git --git-dir="${mirror}" archive --format=tar "${release_commit}" \
@@ -559,8 +594,34 @@ case "${role}" in
     connector_installed=1
     [[ "${HERMES_FABRIC_FAILPOINT:-}" != after-connector ]] \
       || die "injected fabric failure after connector"
-    # HK is a worker-only Linux node; unlike DBB3 it has no managed-installation
-    # receiver. Its connector and shared runtime are updated transactionally.
+    hk_recovery_token="${HERMES_HK_RECOVERY_TOKEN_FILE:-/etc/hk-team/recovery_token}"
+    hk_recovery_key="${HERMES_HK_RECOVERY_KEY_FILE:-/home/hermes/.ssh/hk_recovery_ed25519}"
+    hk_recovery_known_hosts="${HERMES_HK_RECOVERY_KNOWN_HOSTS_FILE:-/home/hermes/.ssh/hk_recovery_known_hosts}"
+    if [[ "${allow_test_paths}" != 1 ]]; then
+      [[ "${hk_recovery_token}" == /etc/hk-team/recovery_token \
+          && "${hk_recovery_key}" == /home/hermes/.ssh/hk_recovery_ed25519 \
+          && "${hk_recovery_known_hosts}" == /home/hermes/.ssh/hk_recovery_known_hosts ]] \
+        || die "HK recovery credential override is not allowed"
+    fi
+    for secret in "${hk_recovery_token}" "${hk_recovery_key}" \
+      "${hk_recovery_known_hosts}"; do
+      [[ -f "${secret}" && ! -L "${secret}" ]] \
+        || die "HK recovery credential is missing or unsafe: ${secret}"
+    done
+    hk_secret_stage="${stage}/hk-recovery-secrets"
+    install -d -o root -g root -m 0700 "${hk_secret_stage}"
+    install -o root -g root -m 0600 \
+      "${hk_recovery_token}" "${hk_secret_stage}/recovery-token"
+    install -o root -g root -m 0600 \
+      "${hk_recovery_key}" "${hk_secret_stage}/recovery-key"
+    install -o root -g root -m 0600 \
+      "${hk_recovery_known_hosts}" "${hk_secret_stage}/recovery-known-hosts"
+    bash "${stage}/deploy/recovery/install-hk-managed-recovery.sh" \
+      "${stage}" "${hk_secret_stage}/recovery-token" \
+      "${hk_secret_stage}/recovery-key" \
+      "${hk_secret_stage}/recovery-known-hosts" \
+      "--handle-file=${receiver_handle}"
+    receiver_installed=1
     ;;
 esac
 [[ "${HERMES_FABRIC_FAILPOINT:-}" != after-receiver ]] \
@@ -616,6 +677,46 @@ mv -f -- "${release_evidence_temp}" "${release_evidence_file}"
 evidence_published=1
 [[ "${HERMES_FABRIC_FAILPOINT:-}" != after-evidence ]] \
   || die "injected fabric failure after evidence"
+
+# A running systemd unit and a healthy REST endpoint do not prove that the new
+# worker transport joined the backend. Wait for this authenticated connector's
+# own WS generation to change and advertise the target root-owned release file.
+worker_ws_deadline=$(( $(date +%s) + worker_ws_timeout ))
+while true; do
+  if curl --fail --silent --show-error --max-time 15 --noproxy '*' \
+      --config "${curl_config}" \
+      -o "${evidence_file}" "${cloud_url}/connector/deployment-health" \
+    && python3 - "${evidence_file}" "${connector_id}" "${worker_node_id}" \
+      "${role}" "${release_commit}" "${release_version}" \
+      "${previous_connection_generation}" <<'PY'
+import json
+import re
+import sys
+
+payload = json.load(open(sys.argv[1], encoding="utf-8"))
+assert payload.get("ok") is True
+assert str(payload.get("connector_id") or "") == sys.argv[2]
+worker = payload.get("worker_channel") or {}
+assert worker.get("online") is True
+assert worker.get("fresh") is True
+assert str(worker.get("node_id") or "") == sys.argv[3]
+assert str(worker.get("managed_node_id") or "") == sys.argv[4]
+generation = str(worker.get("connection_generation") or "")
+assert re.fullmatch(r"[A-Za-z0-9._:-]{1,128}", generation)
+previous_generation = sys.argv[7]
+assert not previous_generation or generation != previous_generation
+release = worker.get("release") or {}
+assert str(release.get("commit") or "") == sys.argv[5]
+assert str(release.get("version") or "") == sys.argv[6]
+PY
+  then
+    break
+  fi
+  (( $(date +%s) < worker_ws_deadline )) \
+    || die "connector restarted but target worker WebSocket generation/release did not become healthy"
+  sleep 2
+done
+
 printf '%s\n' "${release_commit}" >"${deployed_file}.new.$$"
 chmod 0600 "${deployed_file}.new.$$"
 mv -f -- "${deployed_file}.new.$$" "${deployed_file}"

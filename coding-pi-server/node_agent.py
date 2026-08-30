@@ -12,7 +12,6 @@ from __future__ import annotations
 import argparse
 import asyncio
 import base64
-import hmac
 import json
 import logging
 import os
@@ -25,8 +24,15 @@ from pathlib import Path
 from typing import Any
 from urllib.parse import quote, urlsplit, urlunsplit
 
-from fastapi import FastAPI, Header, HTTPException
+from fastapi import FastAPI, Header, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
+
+from network_auth import (
+    bearer_or_loopback_authorized,
+    bind_host_is_loopback,
+    require_coordinator_token,
+    require_safe_listener,
+)
 
 
 LOGGER = logging.getLogger("coding-pi-node-agent")
@@ -53,7 +59,7 @@ class PiNodeSupervisor:
                 return self.snapshot()
             command = [self.python_path, self.script, *self.args]
             try:
-                self.process = subprocess.Popen(
+                self.process = subprocess.Popen(  # noqa: ASYNC220 - retain the child handle
                     command,
                     cwd=self.cwd,
                     env=os.environ.copy(),
@@ -127,9 +133,18 @@ def advertised_origin() -> str:
     return f"http://{host}:{port}"
 
 
-def require_agent_token(token: str | None) -> None:
-    expected = os.environ.get("CODING_PI_NODE_AGENT_TOKEN", "").strip()
-    if expected and not hmac.compare_digest(token or "", f"Bearer {expected}"):
+def require_agent_token(
+    token: str | None,
+    peer_host: str | None,
+    *,
+    allow_unauthenticated_loopback: bool,
+) -> None:
+    if not bearer_or_loopback_authorized(
+        os.environ.get("CODING_PI_NODE_AGENT_TOKEN"),
+        token,
+        peer_host,
+        allow_unauthenticated_loopback=allow_unauthenticated_loopback,
+    ):
         raise HTTPException(status_code=401, detail="Pi node agent authentication required")
 
 
@@ -404,7 +419,11 @@ async def reverse_tunnel_loop(supervisor: PiNodeSupervisor) -> None:
         await asyncio.sleep(wait)
 
 
-def build_app(supervisor: PiNodeSupervisor) -> FastAPI:
+def build_app(
+    supervisor: PiNodeSupervisor,
+    *,
+    allow_unauthenticated_loopback: bool = False,
+) -> FastAPI:
     app = FastAPI(title="Pi Node Agent", version="1.0")
     app.add_middleware(
         CORSMiddleware,
@@ -424,13 +443,21 @@ def build_app(supervisor: PiNodeSupervisor) -> FastAPI:
 
     @app.post("/start")
     @app.post("/wake")
-    async def wake(authorization: str | None = Header(default=None)) -> dict[str, Any]:
-        require_agent_token(authorization)
+    async def wake(request: Request, authorization: str | None = Header(default=None)) -> dict[str, Any]:
+        require_agent_token(
+            authorization,
+            request.client.host if request.client else None,
+            allow_unauthenticated_loopback=allow_unauthenticated_loopback,
+        )
         return await supervisor.start()
 
     @app.post("/stop")
-    async def stop(authorization: str | None = Header(default=None)) -> dict[str, Any]:
-        require_agent_token(authorization)
+    async def stop(request: Request, authorization: str | None = Header(default=None)) -> dict[str, Any]:
+        require_agent_token(
+            authorization,
+            request.client.host if request.client else None,
+            allow_unauthenticated_loopback=allow_unauthenticated_loopback,
+        )
         return await supervisor.stop()
 
     return app
@@ -450,9 +477,21 @@ def parse_args() -> argparse.Namespace:
 
 def main() -> None:
     args = parse_args()
+    require_safe_listener(
+        args.host,
+        os.environ.get("CODING_PI_NODE_AGENT_TOKEN"),
+        "Coding Pi node agent",
+    )
+    require_coordinator_token(
+        os.environ.get("CODING_PI_COORDINATOR_URL"),
+        os.environ.get("CODING_PI_COORDINATOR_TOKEN"),
+    )
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s %(message)s")
     supervisor = PiNodeSupervisor(args.python_path, args.script, args.service_args, args.cwd)
-    app = build_app(supervisor)
+    app = build_app(
+        supervisor,
+        allow_unauthenticated_loopback=bind_host_is_loopback(args.host),
+    )
     if not args.no_autostart:
         # Uvicorn imports the app before serving; schedule startup from the
         # lifespan hook below so the child inherits the configured environment.
@@ -478,7 +517,13 @@ def main() -> None:
 
     import uvicorn
 
-    uvicorn.run(app, host=args.host, port=args.port, log_level="info")
+    uvicorn.run(
+        app,
+        host=args.host,
+        port=args.port,
+        log_level="info",
+        proxy_headers=False,
+    )
 
 
 if __name__ == "__main__":

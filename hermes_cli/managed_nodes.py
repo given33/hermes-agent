@@ -25,6 +25,10 @@ from urllib.request import Request, urlopen
 from urllib.parse import urlsplit
 
 from hermes_constants import get_hermes_home
+from hermes_services.worker_channel import (
+    WorkerChannelRegistry,
+    get_worker_channel_registry,
+)
 
 
 DEFAULT_TIMEOUT_SECONDS = 3.0
@@ -126,6 +130,7 @@ def load_managed_nodes_config(path: Path | None = None) -> list[dict[str, Any]]:
         )
         recovery_url = str(raw.get("recovery_url") or "").strip()
         raw_recovery_urls = raw.get("recovery_urls") or {}
+        raw_recovery_token_files = raw.get("recovery_token_files") or {}
         raw_installation_urls = raw.get("installation_urls") or {}
         if not node_id or node_id in seen:
             raise ValueError("managed node ids must be non-empty and unique")
@@ -141,6 +146,10 @@ def load_managed_nodes_config(path: Path | None = None) -> list[dict[str, Any]]:
             raise ValueError(f"managed node {node_id!r} has an invalid recovery_url")
         if not isinstance(raw_recovery_urls, dict):
             raise ValueError(f"managed node {node_id!r} recovery_urls must be an object")
+        if not isinstance(raw_recovery_token_files, dict):
+            raise ValueError(
+                f"managed node {node_id!r} recovery_token_files must be an object"
+            )
         if not isinstance(raw_installation_urls, dict):
             raise ValueError(f"managed node {node_id!r} installation_urls must be an object")
         recovery_urls: dict[str, str] = {}
@@ -153,6 +162,23 @@ def load_managed_nodes_config(path: Path | None = None) -> list[dict[str, Any]]:
             ):
                 raise ValueError(f"managed node {node_id!r} has an invalid recovery_urls entry")
             recovery_urls[normalized_target] = normalized_url
+        recovery_token_files: dict[str, str] = {}
+        for target, target_token_file in raw_recovery_token_files.items():
+            normalized_target = str(target).strip().lower()
+            normalized_token_file = str(target_token_file or "").strip()
+            if (
+                normalized_target not in MANAGED_WORKER_TARGETS
+                or not normalized_token_file
+                or not Path(normalized_token_file).expanduser().is_absolute()
+            ):
+                raise ValueError(
+                    f"managed node {node_id!r} has an invalid recovery_token_files entry"
+                )
+            if normalized_target not in recovery_urls:
+                raise ValueError(
+                    f"managed node {node_id!r} has a recovery credential without a route"
+                )
+            recovery_token_files[normalized_target] = normalized_token_file
         installation_urls: dict[str, str] = {}
         for target, target_url in raw_installation_urls.items():
             normalized_target = str(target).strip().lower()
@@ -187,6 +213,41 @@ def load_managed_nodes_config(path: Path | None = None) -> list[dict[str, Any]]:
                     f"managed node {node_id!r} must use different status and "
                     "installation credential contents"
                 )
+        if recovery_token_files:
+            status_token = read_private_token(
+                token_file,
+                label="managed-node status credential",
+            )
+            installation_token = (
+                read_private_token(
+                    installation_token_file,
+                    label="managed installation credential",
+                )
+                if installation_token_file
+                else ""
+            )
+            seen_recovery_tokens: list[str] = []
+            for target, recovery_token_file in recovery_token_files.items():
+                recovery_token = read_private_token(
+                    recovery_token_file,
+                    label=f"{target} recovery credential",
+                )
+                if hmac.compare_digest(status_token, recovery_token) or (
+                    installation_token
+                    and hmac.compare_digest(installation_token, recovery_token)
+                ):
+                    raise ValueError(
+                        f"managed node {node_id!r} must use a dedicated {target} "
+                        "recovery credential"
+                    )
+                if any(
+                    hmac.compare_digest(existing, recovery_token)
+                    for existing in seen_recovery_tokens
+                ):
+                    raise ValueError(
+                        f"managed node {node_id!r} recovery credentials must be unique"
+                    )
+                seen_recovery_tokens.append(recovery_token)
         timeout = float(raw.get("timeout_seconds") or DEFAULT_TIMEOUT_SECONDS)
         if not math.isfinite(timeout) or timeout <= 0 or timeout > 15:
             raise ValueError(f"managed node {node_id!r} has an invalid timeout")
@@ -205,6 +266,7 @@ def load_managed_nodes_config(path: Path | None = None) -> list[dict[str, Any]]:
             "timeout_seconds": timeout,
             "recovery_url": recovery_url,
             "recovery_urls": recovery_urls,
+            "recovery_token_files": recovery_token_files,
             "installation_urls": installation_urls,
             "auto_recover": raw.get("auto_recover") is not False,
             "recovery_cooldown_seconds": recovery_cooldown,
@@ -260,78 +322,140 @@ def fetch_managed_nodes(
     path: Path | None = None,
     *,
     now: datetime | None = None,
+    worker_registry: WorkerChannelRegistry | None = None,
 ) -> dict[str, Any]:
     fetched_datetime = now or datetime.now(timezone.utc)
     if fetched_datetime.tzinfo is None:
         fetched_datetime = fetched_datetime.replace(tzinfo=timezone.utc)
     fetched_datetime = fetched_datetime.astimezone(timezone.utc)
     fetched_at = fetched_datetime.isoformat(timespec="seconds")
-    nodes: list[dict[str, Any]] = []
+    configs = load_managed_nodes_config(path)
+    legacy_nodes: dict[str, dict[str, Any]] = {}
     sources: list[dict[str, Any]] = []
-    for config in load_managed_nodes_config(path):
+    source_configs: list[tuple[dict[str, Any], dict[str, Any]]] = []
+    for config in configs:
         try:
             payload = _fetch_status(config)
             normalized = _normalize_dbb3_status(payload, fetched_datetime)
-            stale_ids = [
-                str(node.get("id") or "")
-                for node in normalized
-                if not node.get("online")
-            ]
-            recovery = None
-            if stale_ids and config["auto_recover"] and _has_recovery_route(config, stale_ids):
-                try:
-                    recovery = _request_recovery(
-                        config,
-                        targets=stale_ids,
-                        reason="stale_observation",
-                    )
-                except Exception as exc:
-                    recovery = {"state": "failed", "error": _public_error(exc)}
-                for node in normalized:
-                    if str(node.get("id") or "") in stale_ids:
-                        node_id = str(node.get("id") or "")
-                        node["recovery_state"] = str(
-                            (recovery.get("target_states") or {}).get(node_id)
-                            or recovery["state"]
-                        )
-            nodes.extend(normalized)
+            for node in normalized:
+                node_id = str(node.get("id") or "")
+                previous = legacy_nodes.get(node_id)
+                if previous is None or (
+                    node.get("metrics_available") is True
+                    and previous.get("metrics_available") is not True
+                ):
+                    legacy_nodes[node_id] = node
             source_fresh = bool(normalized) and all(
-                node.get("fresh") is True for node in normalized
+                node.get("metrics_available") is True for node in normalized
             )
-            sources.append({
+            source = {
                 "id": config["id"],
                 "label": config["label"],
                 "online": source_fresh,
                 "observed_at": str(payload.get("timestamp") or fetched_at),
                 "fresh": source_fresh,
                 **({"error": "stale_observation"} if not source_fresh else {}),
-                **({"recovery": recovery} if recovery is not None else {}),
-            })
+            }
         except Exception as exc:
-            recovery = None
-            recovery_targets = _recovery_targets_for_config(config)
-            if config["auto_recover"] and _has_recovery_route(config, recovery_targets):
-                try:
-                    recovery = _request_recovery(
-                        config,
-                        targets=recovery_targets,
-                        reason="source_unreachable",
-                    )
-                except Exception:
-                    recovery = {"state": "failed", "error": "recovery_unreachable"}
-            sources.append({
+            source = {
                 "id": config["id"],
                 "label": config["label"],
                 "online": False,
                 "observed_at": fetched_at,
                 "error": _public_error(exc),
-                **({"recovery": recovery} if recovery is not None else {}),
-            })
+            }
+        sources.append(source)
+        source_configs.append((config, source))
+
+    registry = worker_registry or get_worker_channel_registry()
+    nodes = [
+        _merge_worker_status(snapshot, legacy_nodes.get(str(snapshot.get("id") or "")))
+        for snapshot in registry.managed_snapshots()
+    ]
+    offline_ids = {
+        str(node.get("id") or "")
+        for node in nodes
+        if node.get("online") is not True
+    }
+    for config, source in source_configs:
+        recovery_targets = [
+            target
+            for target in _recovery_targets_for_config(config)
+            if target in offline_ids
+        ]
+        if not (
+            recovery_targets
+            and config["auto_recover"]
+            and _has_recovery_route(config, recovery_targets)
+        ):
+            continue
+        try:
+            recovery = _request_recovery(
+                config,
+                targets=recovery_targets,
+                reason="worker_channel_offline",
+            )
+        except Exception as exc:
+            recovery = {"state": "failed", "error": _public_error(exc)}
+        source["recovery"] = recovery
+        target_states = recovery.get("target_states") or {}
+        for node in nodes:
+            node_id = str(node.get("id") or "")
+            if node_id in recovery_targets:
+                node["recovery_state"] = str(
+                    target_states.get(node_id) or recovery.get("state") or "failed"
+                )
     return {
         "fetched_at": fetched_at,
-        "configured": bool(sources),
+        # The three worker lanes are part of the hosted topology even when the
+        # optional legacy metrics/recovery source is not configured.
+        "configured": True,
         "nodes": nodes,
         "sources": sources,
+    }
+
+
+def _merge_worker_status(
+    worker: dict[str, Any],
+    legacy: dict[str, Any] | None,
+) -> dict[str, Any]:
+    """Combine authoritative WS liveness with optional legacy device metrics."""
+
+    legacy = legacy or {}
+    worker_metrics = _dict(worker.get("metrics"))
+    legacy_metrics = _dict(legacy.get("metrics"))
+    metrics = worker_metrics or legacy_metrics
+    if worker_metrics:
+        metrics_available = (
+            worker.get("fresh") is True
+            and worker_metrics.get("available") is not False
+        )
+        metrics_observed_at = str(
+            worker_metrics.get("sampled_at") or worker.get("observed_at") or ""
+        )
+        metrics_source = "worker_ws"
+    else:
+        metrics_available = legacy.get("metrics_available") is True
+        metrics_observed_at = str(legacy.get("metrics_observed_at") or "")
+        metrics_source = str(legacy.get("metrics_source") or "legacy_device_metrics")
+    return {
+        "id": str(worker.get("id") or ""),
+        "label": str(worker.get("label") or legacy.get("label") or ""),
+        "worker_node_id": str(worker.get("worker_node_id") or ""),
+        "online": worker.get("online") is True,
+        "gateway_state": str(worker.get("gateway_state") or "offline"),
+        "version": str(worker.get("version") or ""),
+        "observed_at": str(worker.get("observed_at") or ""),
+        "fresh": worker.get("fresh") is True,
+        "age_seconds": worker.get("age_seconds"),
+        "metrics": metrics,
+        "metrics_available": metrics_available,
+        "metrics_observed_at": metrics_observed_at,
+        "runtime_fresh": worker.get("fresh") is True,
+        "active_tasks": int(worker.get("active_tasks") or 0),
+        "metrics_source": metrics_source,
+        "runtime": _dict(worker.get("runtime")),
+        "release": _dict(worker.get("release")),
     }
 
 
@@ -561,8 +685,13 @@ def _request_recovery(
     target_states = {target: "unconfigured" for target in unconfigured_targets}
     for target, recovery_url in sorted(routes):
         try:
+            route_config = dict(config)
+            route_config["token_file"] = str(
+                (config.get("recovery_token_files") or {}).get(target)
+                or config["token_file"]
+            )
             outcome = _request_recovery_route(
-                config,
+                route_config,
                 recovery_url=recovery_url,
                 targets=[target],
                 reason=reason,
@@ -691,160 +820,73 @@ def _normalize_dbb3_status(
     payload: dict[str, Any],
     fetched_at: datetime,
 ) -> list[dict[str, Any]]:
+    """Extract optional device metrics without inferring worker liveness.
+
+    The historical relay also reports worker-side gateways. Those processes
+    no longer own the hosted runtime, so only the official worker WebSocket
+    lease may decide whether DBB3, WSL, or HK is online.
+    """
+
     devices = _dict(payload.get("devices"))
-    gateways = _dict(payload.get("gateways"))
-    services = _dict(payload.get("services"))
-    tasks = _dict(payload.get("tasks"))
-    wsl = _dict(payload.get("wsl"))
-    # The aggregate timestamp only proves that the relay answered. It is not
-    # a heartbeat for either nested device: a relay can serve cached WSL data
-    # while DBB3 remains live. Each device therefore needs its own observation
-    # timestamp before an online state can be asserted.
     dbb3_device = _dict(devices.get("dbb3"))
     dbb3_metrics = _device_metrics(dbb3_device)
-    dbb3_gateway = _dict(gateways.get("agent"))
-    dbb3_gateway_observation = _observation_status(
-        fetched_at,
-        dbb3_gateway,
-        fallback="",
-    )
     dbb3_metrics_observation = _observation_status(
         fetched_at,
         dbb3_device,
         fallback="",
     )
-    dbb3_observed_at, dbb3_age_seconds, dbb3_fresh = _combine_observations(
-        dbb3_gateway_observation,
-        dbb3_metrics_observation,
-    )
-    dbb3_online = (
-        dbb3_fresh
-        and bool(dbb3_gateway.get("alive"))
-        and services.get("hermes_gateway") == "active"
-    )
 
     pc_device = _dict(devices.get("pc"))
     pc_metrics = _device_metrics(pc_device)
-    wsl_gateway = _dict(gateways.get("rainday"))
-    wsl_runtime_observation = _observation_status(
-        fetched_at,
-        wsl_gateway,
-        wsl,
-        fallback="",
-    )
     pc_metrics_observation = _observation_status(
         fetched_at,
         pc_device,
         fallback="",
-    )
-    wsl_observed_at, wsl_age_seconds, wsl_fresh = _combine_observations(
-        wsl_runtime_observation,
-        pc_metrics_observation,
-    )
-    wsl_online = (
-        wsl_fresh
-        and bool(wsl.get("gateway_running"))
-        and bool(wsl.get("worker_ready"))
-        and pc_device.get("available") is not False
-        and wsl_gateway.get("alive") is not False
     )
 
     normalized = [
         {
             "id": "dbb3",
             "label": "DBB3",
-            "online": dbb3_online,
-            "gateway_state": str(dbb3_gateway.get("state") or services.get("hermes_gateway") or "unknown"),
-            "version": str(dbb3_gateway.get("version") or ""),
-            "observed_at": dbb3_observed_at,
-            "fresh": dbb3_fresh,
-            "age_seconds": dbb3_age_seconds,
             "metrics": dbb3_metrics,
             "metrics_available": dbb3_metrics_observation[2],
             "metrics_observed_at": dbb3_metrics_observation[0],
-            "runtime_fresh": dbb3_gateway_observation[2],
-            "active_tasks": int(tasks.get("running") or 0),
             "metrics_source": "linux_procfs",
         },
         {
             "id": "wsl",
             "label": "Windows PC + WSL",
-            "online": wsl_online,
-            "gateway_state": str(wsl_gateway.get("state") or wsl.get("state") or "unknown"),
-            "version": str(wsl_gateway.get("version") or ""),
-            "observed_at": wsl_observed_at,
-            "fresh": wsl_fresh,
-            "age_seconds": wsl_age_seconds,
             "metrics": pc_metrics,
             "metrics_available": (
                 pc_metrics_observation[2]
                 and pc_device.get("available") is not False
             ),
             "metrics_observed_at": pc_metrics_observation[0],
-            "runtime_fresh": wsl_runtime_observation[2],
-            "active_tasks": 0,
             "metrics_source": str(_dict(devices.get("pc")).get("source") or "windows_psutil_push"),
-            "runtime": {
-                "tunnel_up": bool(wsl.get("tunnel_up")),
-                "worker_ready": bool(wsl.get("worker_ready")),
-                "gateway_running": bool(wsl.get("gateway_running")),
-            },
         },
     ]
 
-    # HK uses the same connector status envelope, but it is optional in older
-    # relay payloads.  Emit it only when the source advertises an HK device or
-    # gateway so legacy DBB3/WSL fixtures and deployments keep their exact
-    # two-row response while a configured HK worker becomes visible to iOS.
+    # HK metrics are optional in older aggregate payloads. The WS registry
+    # still emits the HK worker row even when this enrichment is absent.
     hk_aliases = ("hk", "hk-worker", "hk_primary", "hk-primary", "hong_kong", "hong-kong", "hongkong")
     hk_device = _first_dict(devices, *hk_aliases)
-    hk_gateway = _first_dict(gateways, *hk_aliases)
     hk_runtime = _first_dict(payload, *hk_aliases)
-    if hk_device or hk_gateway or hk_runtime:
+    if hk_device or hk_runtime:
         hk_source = {**hk_runtime, **hk_device}
         hk_metrics = _device_metrics(hk_source)
-        hk_runtime_observation = _observation_status(
-            fetched_at,
-            hk_gateway,
-            hk_source,
-            fallback="",
-        )
         hk_metrics_observation = _observation_status(
             fetched_at,
             hk_device,
             hk_source,
             fallback="",
         )
-        hk_observed_at, hk_age_seconds, hk_fresh = _combine_observations(
-            hk_runtime_observation,
-            hk_metrics_observation,
-        )
-        # A worker can report either an explicit gateway alive flag or the
-        # connector's canonical `worker_ready`/`gateway_running` booleans.
-        hk_alive = hk_gateway.get("alive")
-        if hk_alive is None:
-            hk_alive = hk_source.get("online")
-        if hk_alive is None:
-            hk_alive = hk_source.get("worker_ready") or hk_source.get("gateway_running")
         normalized.append({
             "id": "hk",
-            "label": str(hk_source.get("label") or hk_gateway.get("label") or "Hong Kong Worker"),
-            "online": hk_fresh and hk_alive is not False and bool(hk_alive),
-            "gateway_state": str(hk_gateway.get("state") or hk_source.get("state") or "unknown"),
-            "version": str(hk_gateway.get("version") or hk_source.get("version") or ""),
-            "observed_at": hk_observed_at,
-            "fresh": hk_fresh,
-            "age_seconds": hk_age_seconds,
+            "label": str(hk_source.get("label") or "Hong Kong Worker"),
             "metrics": hk_metrics,
             "metrics_available": hk_metrics_observation[2] and hk_metrics.get("available") is not False,
             "metrics_observed_at": hk_metrics_observation[0],
-            "runtime_fresh": hk_runtime_observation[2],
-            "active_tasks": int(hk_source.get("active_tasks") or hk_source.get("activeTasks") or 0),
             "metrics_source": str(hk_source.get("source") or "hk_worker"),
-            "runtime": {
-                "worker_ready": bool(hk_source.get("worker_ready") or hk_source.get("workerReady")),
-                "gateway_running": bool(hk_source.get("gateway_running") or hk_source.get("gatewayRunning")),
-            },
         })
 
     return normalized

@@ -6,7 +6,7 @@ Wants=network-online.target
 [Service]
 Type=simple
 EnvironmentFile=%h/.config/pc-team/cloud_connector.env
-ExecStart=/usr/bin/python3 /opt/pc-team/pc_cloud_connector.py --interval 2 --quiet
+ExecStart=/mnt/d/Hermes/hermes-agent/venv/bin/python /opt/pc-team/pc_cloud_connector.py --interval 2 --quiet
 Restart=always
 RestartSec=3
 NoNewPrivileges=true

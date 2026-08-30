@@ -201,6 +201,49 @@ def test_deployment_shell_scripts_have_valid_syntax():
         assert result.returncode == 0, (path, result.stderr)
 
 
+def test_connector_credential_map_uses_a_bounded_root_owned_directory():
+    script = (PUBLIC / "configure-connector-credential.sh").read_text(
+        encoding="utf-8"
+    )
+
+    assert '[[ "${map_file}" == /* ]]' in script
+    assert '/|/etc|/var|/usr|/opt|/home|/root|/tmp)' in script
+    assert 'realpath -m -- "${map_dir}"' in script
+    assert 'stat -c \'%u\' -- "${map_dir}"' in script
+    assert 'stat -c \'%h\' -- "${map_file}"' in script
+    assert 'install -d -o root -g "${service_group}" -m 0750 "${map_dir}"' in script
+    assert "target.parent.mkdir" not in script
+
+
+def test_worker_recovery_does_not_restore_obsolete_worker_gateways():
+    dbb3 = (RECOVERY / "recover-dbb3.sh").read_text(encoding="utf-8")
+    wsl = (RECOVERY / "recover-wsl.ps1").read_text(encoding="utf-8")
+
+    for obsolete in (
+        "hermes-gateway.service",
+        "dbb3-proxy-relay.service",
+        "Hermes WSL SSH Relay",
+    ):
+        assert obsolete not in dbb3
+        assert obsolete not in wsl
+    assert "hermes-dashboard.service" not in dbb3
+    assert "dbb3-cloud-connector.service" in dbb3
+    assert "pc-cloud-connector.service" in wsl
+    assert "hermes-wsl-managed-installation-receiver.service" in wsl
+    assert "hermes-wsl-managed-installation-tunnel.service" in wsl
+    assert "Hermes Managed Recovery Watchdog" in wsl
+    assert "hermes-fabric-update.timer" in dbb3
+    assert "hermes-fabric-update.timer" in wsl
+    assert "systemctl restart hermes-fabric-update.timer" in dbb3
+    assert "systemctl restart hermes-fabric-update.timer" in wsl
+    assert "systemctl enable" not in dbb3
+    assert "systemctl enable" not in wsl
+
+
+def test_obsolete_wsl_dispatcher_guide_is_removed():
+    assert not (PC / "README-wsl-gateway.md").exists()
+
+
 def test_three_endpoint_updates_follow_only_a_committed_main_release():
     updater = (AUTOMATION / "update-fabric-node.sh").read_text(encoding="utf-8")
     bootstrap = (AUTOMATION / "install-fabric-auto-update.sh").read_text(

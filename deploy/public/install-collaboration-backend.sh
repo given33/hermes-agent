@@ -569,6 +569,7 @@ release_evidence_mode="$(stat -c '%a' "${release_evidence_dir}")"
   || die "release evidence directory must not be group/world-writable"
 managed_node_token_file="${HERMES_MANAGED_NODE_TOKEN_FILE:-/etc/hermes-agent/dbb3-status-token}"
 managed_installation_token_file="${HERMES_MANAGED_INSTALLATION_TOKEN_FILE:-/etc/hermes-agent/managed-installation-token}"
+hk_recovery_token_file="${HERMES_HK_RECOVERY_TOKEN_FILE:-/etc/hermes-agent/hk-recovery-token}"
 [[ "${managed_node_token_file}" != "${managed_installation_token_file}" ]] \
   || die "status and installation credentials must use different files"
 validate_managed_token_file() {
@@ -591,12 +592,20 @@ validate_managed_token_file() {
     || die "${label} credential must have one newline-terminated line"
   unset credential_value
 }
-for credential_file in "${managed_node_token_file}" "${managed_installation_token_file}"; do
+for credential_file in "${managed_node_token_file}" "${managed_installation_token_file}" \
+  "${hk_recovery_token_file}"; do
   runuser -u "${service_user}" -- test -r "${credential_file}" \
     || die "managed-node credential is not readable by ${service_user}"
 done
 validate_managed_token_file "${managed_node_token_file}" status
 validate_managed_token_file "${managed_installation_token_file}" installation
+validate_managed_token_file "${hk_recovery_token_file}" "HK recovery"
+for existing_credential in "${managed_node_token_file}" "${managed_installation_token_file}" \
+  "${token_file}"; do
+  if cmp -s -- "${existing_credential}" "${hk_recovery_token_file}"; then
+    die "HK recovery credentials must be dedicated"
+  fi
+done
 for existing_credential in "${managed_node_token_file}" "${token_file}"; do
   if cmp -s -- "${existing_credential}" "${managed_installation_token_file}"; then
     die "managed installation credentials must be dedicated"
@@ -1605,12 +1614,13 @@ managed_nodes_rendered="${transaction}/managed-nodes.json"
   "${snapshot}/deploy/public/managed-nodes.server.json" \
   "${managed_nodes_rendered}" \
   "${managed_node_token_file}" \
-  "${managed_installation_token_file}" <<'PY'
+  "${managed_installation_token_file}" \
+  "${hk_recovery_token_file}" <<'PY'
 import json
 import pathlib
 import sys
 
-source, destination, status_token_file, installation_token_file = map(
+source, destination, status_token_file, installation_token_file, hk_recovery_token_file = map(
     pathlib.Path, sys.argv[1:]
 )
 payload = json.loads(source.read_text(encoding="utf-8"))
@@ -1619,8 +1629,13 @@ for node in payload.get("nodes", []):
         raise SystemExit("managed-nodes template has an unexpected status token path")
     if node.get("installation_token_file") != "/etc/hermes-agent/managed-installation-token":
         raise SystemExit("managed-nodes template has an unexpected installation token path")
+    recovery_token_files = node.get("recovery_token_files") or {}
+    if recovery_token_files.get("hk") != "/etc/hermes-agent/hk-recovery-token":
+        raise SystemExit("managed-nodes template has an unexpected HK recovery token path")
     node["token_file"] = str(status_token_file)
     node["installation_token_file"] = str(installation_token_file)
+    recovery_token_files["hk"] = str(hk_recovery_token_file)
+    node["recovery_token_files"] = recovery_token_files
 destination.write_text(
     json.dumps(payload, indent=2, ensure_ascii=True) + "\n",
     encoding="utf-8",

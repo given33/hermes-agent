@@ -51,3 +51,33 @@ def test_removed_list_entry_is_counted_once():
     assert migrated == []
     assert removed == 1
     assert changed is True
+
+
+def test_legacy_reporter_alias_is_promoted_to_canonical_result_once():
+    migrated, removed, changed = migrate_hosted_container(
+        {
+            "status": "completed",
+            "reporter_result": "legacy deterministic summary",
+            "reporter_status": "completed",
+        }
+    )
+
+    assert migrated == {
+        "status": "completed",
+        "result": "legacy deterministic summary",
+    }
+    assert removed == 0
+    assert changed is True
+
+
+def test_canonical_result_wins_over_legacy_reporter_alias():
+    migrated, _removed, changed = migrate_hosted_container(
+        {
+            "result": "canonical",
+            "reporter_result": "stale alias",
+            "reporter_status": "completed",
+        }
+    )
+
+    assert migrated == {"result": "canonical"}
+    assert changed is True

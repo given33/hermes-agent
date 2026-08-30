@@ -11,6 +11,7 @@ from hermes_cli import managed_installations
 from hermes_cli import cloud_file_library
 from hermes_cli.dashboard_auth import mobile_device_store
 from plugins.collaboration.dashboard import plugin_api
+from hermes_services.worker_channel import WorkerChannelRegistry
 from tools.managed_installation_tool import managed_installation
 
 
@@ -58,11 +59,36 @@ def test_connector_deployment_health_proves_release_and_database_schemas(
             "capabilities": ["artifact-upload", "attachment-download"],
         },
     )
+    registry = WorkerChannelRegistry()
+    registry.connect(
+        "dbb3-worker",
+        connection_generation="deployment-generation",
+        release={
+            "node_id": "dbb3",
+            "commit": "a" * 40,
+            "version": "1.2.3",
+        },
+    )
+    monkeypatch.setattr(plugin_api, "_WORKER_CHANNEL", registry)
 
     result = plugin_api.connector_deployment_health(object())
 
     assert result["ok"] is True
     assert result["managed_catalog_readable"] is True
+    assert result["worker_channel"] == {
+        "node_id": "dbb3-worker",
+        "managed_node_id": "dbb3",
+        "online": True,
+        "fresh": True,
+        "connection_generation": "deployment-generation",
+        "observed_at": result["worker_channel"]["observed_at"],
+        "version": "1.2.3",
+        "release": {
+            "node_id": "dbb3",
+            "commit": "a" * 40,
+            "version": "1.2.3",
+        },
+    }
     assert result["manifest_version"]
     assert len(result["manifest_sha256"]) == 64
     assert set(result["databases"]) == {

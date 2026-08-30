@@ -12,7 +12,7 @@ Environment=LC_ALL=C.UTF-8
 Environment=PYTHONUTF8=1
 Environment=PATH=/opt/hk-team/hermes-agent/.venv/bin:/usr/local/bin:/usr/bin:/bin
 Environment=HERMES_CONNECTOR_WORKER_WS=1
-ExecStart=/usr/bin/python3 /opt/hk-team/hk_cloud_connector.py --interval 2 --quiet --state-file %h/.local/state/hk-cloud-connector/checkpoint.json
+ExecStart=/opt/hk-team/hermes-agent/.venv/bin/python /opt/hk-team/hk_cloud_connector.py --interval 2 --quiet --state-file %h/.local/state/hk-cloud-connector/checkpoint.json
 Restart=on-failure
 RestartSec=5
 RestartPreventExitStatus=65 78

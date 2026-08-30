@@ -35,6 +35,7 @@ exec env \
   DBB3_CONNECTOR_UNIT_TEMPLATE="${unit_template}" \
   DBB3_CONNECTOR_BACKUP_ROOT="${PC_CONNECTOR_BACKUP_ROOT:-/opt/pc-team/backups}" \
   DBB3_CONNECTOR_ARTIFACT_ROOTS="${artifact_roots}" \
+  HERMES_CONNECTOR_RUNTIME_PYTHON="${HERMES_WSL_RUNTIME_PYTHON:-/mnt/d/Hermes/hermes-agent/venv/bin/python}" \
   HERMES_CONNECTOR_UNIT_NAME="pc-cloud-connector.service" \
   HERMES_CONNECTOR_CONFIG_DIR="${user_home}/.config/pc-team" \
   HERMES_CONNECTOR_STATE_DIR="${user_home}/.local/state/pc-cloud-connector" \

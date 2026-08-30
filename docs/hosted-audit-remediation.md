@@ -176,9 +176,9 @@ uv run ruff check hermes_runtime hermes_services plugins/collaboration/dashboard
   并验证 HK `hermes-fabric-update.timer` 和 `release.json`；三 worker 共用提交的源代码，
   connector token、profile、skills、state 和 systemd unit 按 DBB3/PC-WSL/HK 分离。
 - hosted workflow 的实际路径仍是一个服务器本地 dispatcher + 三个 worker lane；
-  `_start_hosted_companion()` 是迁移兼容 no-op，不会创建 supervisor/reviewer 模型回合。
-  文件中保留的旧 reviewer/supervisor helper 只服务历史状态迁移/跳过的兼容测试，
-  不能由当前 dispatcher 路径调用。
+  `_start_hosted_companion()` 以及旧 reviewer/supervisor 执行 helper 已从生产运行时物理删除。
+  历史状态只通过结构化迁移器读取并归一化，不能创建旧角色模型回合，也不能由当前
+  dispatcher 路径重新启用。
 - iOS 已新增 `/git` 原生和 fallback 页面，直接消费官方 Git API 的 status、branches、
   worktrees、review、ship-info、GitHub auth、commit context、rev-parse、PR list、
   review/file diff，并提供暂存、取消暂存、还原、提交、推送、切分支、PR、worktree

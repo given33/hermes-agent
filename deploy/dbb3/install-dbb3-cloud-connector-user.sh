@@ -43,20 +43,27 @@ connector_id="${DBB3_CONNECTOR_ID:-dbb3-primary}"
 target="${DBB3_CONNECTOR_SOURCE_TARGET:-/opt/dbb3-team/dbb3_cloud_connector.py}"
 unit_name="${HERMES_CONNECTOR_UNIT_NAME:-dbb3-cloud-connector.service}"
 unit_template="${DBB3_CONNECTOR_UNIT_TEMPLATE:-$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/dbb3-cloud-connector.service}"
+runtime_python="${HERMES_CONNECTOR_RUNTIME_PYTHON:-/usr/local/lib/hermes-agent/venv/bin/python}"
 
 if [[ "${control_request}" != --rollback-backup=* ]]; then
   [[ -f "${source_file}" && ! -L "${source_file}" ]] || die "connector source is missing or a symlink"
   [[ -f "${unit_template}" && ! -L "${unit_template}" ]] || die "user unit template is missing"
+  [[ "${runtime_python}" == /* && -x "${runtime_python}" ]] \
+    || die "connector project runtime is missing or not executable: ${runtime_python}"
 fi
 id "${connector_user}" >/dev/null 2>&1 || die "connector user does not exist"
 [[ -r "${token_file}" ]] || die "connector user cannot read token file ${token_file}"
 runuser -u "${connector_user}" -- test -r "${token_file}" || die "connector token is not readable by ${connector_user}"
 
 if [[ "${control_request}" != --rollback-backup=* ]]; then
-python3 - "${source_file}" <<'PY'
+"${runtime_python}" - "${source_file}" <<'PY'
 import pathlib, sys
 compile(pathlib.Path(sys.argv[1]).read_text(encoding="utf-8"), sys.argv[1], "exec")
 PY
+
+runuser -u "${connector_user}" -- \
+  "${runtime_python}" -c 'from websockets.sync.client import connect' \
+  || die "connector project runtime does not provide websockets.sync.client"
 
 # This is the deployment gate. It is read-only and runs before disabling the
 # old root unit or replacing any source/config. A missing or changing backend
@@ -65,7 +72,8 @@ runuser -u "${connector_user}" -- env \
   HERMES_CLOUD_URL="${cloud_url}" \
   HERMES_CLOUD_TOKEN_FILE="${token_file}" \
   DBB3_CONNECTOR_ID="${connector_id}" \
-  python3 "${source_file}" --probe >/dev/null \
+  HERMES_CONNECTOR_WORKER_WS=1 \
+  "${runtime_python}" "${source_file}" --probe >/dev/null \
   || die "connector health/contract preflight failed; no service changes were made"
 fi
 

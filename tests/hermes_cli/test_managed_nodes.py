@@ -18,6 +18,7 @@ from hermes_cli.managed_nodes import (
 )
 from hermes_cli import managed_nodes
 from hermes_cli.managed_node_recovery_service import RecoveryHTTPServer
+from hermes_services.worker_channel import WorkerChannelRegistry
 
 
 def test_managed_nodes_reads_live_dbb3_and_wsl_status(tmp_path):
@@ -90,19 +91,34 @@ def test_managed_nodes_reads_live_dbb3_and_wsl_status(tmp_path):
             }],
         }), encoding="utf-8")
 
+        registry = WorkerChannelRegistry(
+            wall_clock=lambda: datetime(2026, 7, 16, 9, 0, 20, tzinfo=timezone.utc).timestamp()
+        )
+        registry.connect(
+            "dbb3-worker",
+            connection_generation="dbb3-generation",
+            release={"node_id": "dbb3", "commit": "a" * 40, "version": "v0.18.2"},
+            runtime={"worker_ready": True, "active_tasks": 2},
+        )
+        registry.connect(
+            "pc-worker",
+            connection_generation="pc-generation",
+            release={"node_id": "wsl", "commit": "b" * 40, "version": "v0.18.3"},
+        )
         result = fetch_managed_nodes(
             config_path,
             now=datetime(2026, 7, 16, 9, 0, 20, tzinfo=timezone.utc),
+            worker_registry=registry,
         )
     finally:
         server.shutdown()
         server.server_close()
 
     assert observed_headers == [token]
-    assert [node["id"] for node in result["nodes"]] == ["dbb3", "wsl"]
+    assert [node["id"] for node in result["nodes"]] == ["dbb3", "wsl", "hk"]
     assert result["nodes"][0]["online"] is True
     assert result["nodes"][0]["fresh"] is True
-    assert result["nodes"][0]["age_seconds"] == 20
+    assert result["nodes"][0]["age_seconds"] < 5
     assert result["nodes"][0]["active_tasks"] == 2
     assert result["nodes"][0]["metrics"]["cpu_percent"] == 12.5
     assert result["nodes"][0]["metrics_available"] is True
@@ -111,12 +127,12 @@ def test_managed_nodes_reads_live_dbb3_and_wsl_status(tmp_path):
     assert result["nodes"][1]["version"] == "v0.18.3"
     assert result["nodes"][1]["metrics_source"] == "windows_psutil_push"
     assert result["nodes"][1]["metrics_available"] is True
+    assert result["nodes"][2]["online"] is False
     assert "status_url" not in json.dumps(result)
     assert token not in json.dumps(result)
 
 
-def test_managed_nodes_reads_optional_hk_worker_status_without_changing_legacy_rows(tmp_path):
-    """The fourth worker is visible when the relay advertises its heartbeat."""
+def test_managed_nodes_reads_hk_metrics_while_ws_controls_worker_liveness(tmp_path):
     token = "test-private-token"
     token_path = tmp_path / "status-token"
     token_path.write_text(token, encoding="utf-8")
@@ -163,9 +179,18 @@ def test_managed_nodes_reads_optional_hk_worker_status_without_changing_legacy_r
                 "token_file": str(token_path),
             }],
         }), encoding="utf-8")
+        registry = WorkerChannelRegistry(
+            wall_clock=lambda: datetime(2026, 7, 16, 9, 0, 20, tzinfo=timezone.utc).timestamp()
+        )
+        registry.connect(
+            "hk-worker",
+            connection_generation="hk-generation",
+            release={"node_id": "hk", "commit": "c" * 40, "version": "v0.20.0"},
+        )
         result = fetch_managed_nodes(
             config_path,
             now=datetime(2026, 7, 16, 9, 0, 20, tzinfo=timezone.utc),
+            worker_registry=registry,
         )
     finally:
         server.shutdown()
@@ -179,7 +204,7 @@ def test_managed_nodes_reads_optional_hk_worker_status_without_changing_legacy_r
     assert hk["metrics_source"] == "hk-cloud-connector"
 
 
-def test_managed_nodes_accepts_unix_second_hk_heartbeat(tmp_path, monkeypatch):
+def test_managed_nodes_accepts_unix_second_hk_metrics_timestamp(tmp_path, monkeypatch):
     token_path = tmp_path / "status-token"
     token_path.write_text("test-private-token", encoding="utf-8")
     config_path = tmp_path / "managed-nodes.json"
@@ -213,8 +238,10 @@ def test_managed_nodes_accepts_unix_second_hk_heartbeat(tmp_path, monkeypatch):
         now=datetime.fromtimestamp(1784192420, tz=timezone.utc),
     )
     hk = next(node for node in result["nodes"] if node["id"] == "hk")
-    assert hk["online"] is True
-    assert hk["fresh"] is True
+    assert hk["online"] is False
+    assert hk["fresh"] is False
+    assert hk["metrics_available"] is True
+    assert hk["metrics_observed_at"] == "1784192400"
 
 
 def test_managed_nodes_accept_hk_recovery_route_and_receiver(tmp_path):
@@ -293,8 +320,8 @@ def test_managed_nodes_never_report_stale_heartbeats_online(tmp_path, monkeypatc
         now=datetime(2026, 7, 16, 9, 0, 20, tzinfo=timezone.utc),
     )
 
-    assert [node["online"] for node in result["nodes"]] == [False, False]
-    assert [node["fresh"] for node in result["nodes"]] == [False, False]
+    assert [node["online"] for node in result["nodes"]] == [False, False, False]
+    assert [node["fresh"] for node in result["nodes"]] == [False, False, False]
     assert result["sources"][0]["online"] is False
     assert result["sources"][0]["error"] == "stale_observation"
 
@@ -332,11 +359,11 @@ def test_managed_nodes_reject_shared_relay_time_without_device_heartbeats(
         now=datetime(2026, 7, 16, 9, 0, 30, tzinfo=timezone.utc),
     )
 
-    assert [node["online"] for node in result["nodes"]] == [False, False]
-    assert [node["fresh"] for node in result["nodes"]] == [False, False]
+    assert [node["online"] for node in result["nodes"]] == [False, False, False]
+    assert [node["fresh"] for node in result["nodes"]] == [False, False, False]
 
 
-def test_managed_nodes_use_each_device_heartbeat_instead_of_shared_payload_time(
+def test_managed_nodes_keep_device_metrics_separate_from_worker_liveness(
     tmp_path,
     monkeypatch,
 ):
@@ -383,12 +410,15 @@ def test_managed_nodes_use_each_device_heartbeat_instead_of_shared_payload_time(
         now=datetime(2026, 7, 16, 9, 0, 30, tzinfo=timezone.utc),
     )
 
-    assert result["nodes"][0]["online"] is True
-    assert result["nodes"][0]["observed_at"] == "2026-07-16T09:00:15+00:00"
+    assert result["nodes"][0]["online"] is False
+    assert result["nodes"][0]["observed_at"] == ""
+    assert result["nodes"][0]["metrics_observed_at"] == "2026-07-16T09:00:15+00:00"
+    assert result["nodes"][0]["metrics_available"] is True
     assert result["nodes"][1]["online"] is False
     assert result["nodes"][1]["fresh"] is False
-    assert result["nodes"][1]["observed_at"] == "2026-07-16T08:55:00+00:00"
-    assert result["nodes"][1]["runtime_fresh"] is True
+    assert result["nodes"][1]["observed_at"] == ""
+    assert result["nodes"][1]["metrics_observed_at"] == "2026-07-16T08:55:00+00:00"
+    assert result["nodes"][1]["runtime_fresh"] is False
     assert result["nodes"][1]["metrics_available"] is False
     assert result["nodes"][1]["label"] == "Windows PC + WSL"
 

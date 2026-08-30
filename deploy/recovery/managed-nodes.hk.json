@@ -1,0 +1,11 @@
+{
+  "nodes": [],
+  "recovery_receiver": {
+    "node_id": "hk",
+    "token_file": "/etc/hk-team/recovery_token",
+    "command": [
+      "/usr/local/sbin/hermes-recover-hk"
+    ],
+    "state_file": "/var/lib/hermes-hk-recovery/receiver-state.json"
+  }
+}

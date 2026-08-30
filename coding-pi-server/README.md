@@ -39,7 +39,7 @@ $env:DEEPSEEK_API_KEY = "<your DeepSeek API key>"
 
 ```powershell
 py -3.11 coding-pi-server\standalone_server.py `
-  --host 0.0.0.0 `
+  --host 127.0.0.1 `
   --port 8787 `
   --root C:\path\to\hemres-pi `
   --repository https://github.com/given33/hemres-pi.git `
@@ -82,8 +82,10 @@ process and delegates the official collab Agent Hub `chat`, `kill`, and
 Pi source itself is never edited. If that adapter is missing, Coding remains
 usable but Agent Hub actions fail closed with an explicit bridge error.
 
-For a development phone connected to the same LAN, the native Hermes Coding
-surface can use the LAN HTTP API with `EXPO_PUBLIC_HERMES_ALLOW_HTTP=1`, but
+For a development phone connected to the same LAN, set a long random
+`CODING_PI_SERVER_TOKEN` before binding the service to a LAN address. The
+native Hermes Coding surface can then use the LAN HTTP API with
+`EXPO_PUBLIC_HERMES_ALLOW_HTTP=1`, but
 the unmodified official browser client still requires WSS for a non-local
 relay. Use a trusted HTTPS/WSS origin when sharing the generated `web_link`
 with another device. `CODING_PI_LOCAL_RELAY_LINK=1` is reserved for an
@@ -132,7 +134,9 @@ written into the action without putting a provider secret in it:
 .\coding-pi-server\register_local_pi_task.ps1 -CoordinatorUrl "https://your-hermes-server"
 ```
 
-For a protected deployment, add `--token <long-random-token>`. The mobile app
+For a protected deployment, add `--token <long-random-token>`. A non-loopback
+listener refuses to start without it, and the request boundary also rejects
+non-loopback peers when an external ASGI runner bypasses the CLI preflight. The mobile app
 should normally reach the service through the deployment's authenticated
 reverse proxy rather than embedding a long-lived service token in an Expo
 bundle. The service token option is useful for local/private network testing.
@@ -152,9 +156,9 @@ platform path separator), `CODING_PI_HOME`, `CODING_PI_SERVER_TOKEN`, and
 `DEEPSEEK_API_KEY` remain deployment environment variables and are never
 written to the source checkout or the Hermes config file.
 
-The local bootstrap agent accepts `GET /health` and authenticated (when
-`CODING_PI_NODE_AGENT_TOKEN` is set) `POST /wake`, `POST /start`, and
-`POST /stop` on port 8786. It is a convenience supervisor only; all coding,
+The local bootstrap agent accepts public `GET /health` and authenticated
+`POST /wake`, `POST /start`, and `POST /stop` on port 8786. Without a configured
+token those control routes accept loopback peers only. It is a convenience supervisor only; all coding,
 tools, approvals, sessions, and collaboration continue to execute in the
 unmodified Pi checkout on the child service.
 

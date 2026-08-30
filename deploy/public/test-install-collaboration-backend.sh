@@ -250,6 +250,7 @@ sshd_original="${work}/sshd_config.original"
 token_file="${work}/connector.token"
 status_token_file="${work}/dbb3-status.token"
 installation_token_file="${work}/managed-installation.token"
+hk_recovery_token_file="${work}/hk-recovery.token"
 state_file="${work}/state/single.json"
 runtime_home="${work}/hermes-home"
 managed_installations_db="${runtime_home}/managed-installations.db"
@@ -271,7 +272,9 @@ install -d -m 0700 "$(dirname "${state_file}")"
 printf '%s' "connector-test-token" >"${token_file}"
 printf '%s\n' "status-test-token-00000000000000000001" >"${status_token_file}"
 printf '%s\n' "installation-test-token-000000000000001" >"${installation_token_file}"
-chmod 0640 "${status_token_file}" "${installation_token_file}"
+printf '%s\n' "hk-recovery-test-token-0000000000000001" >"${hk_recovery_token_file}"
+chmod 0640 "${status_token_file}" "${installation_token_file}" \
+  "${hk_recovery_token_file}"
 printf '%s\n' '{"conversations":[{"id":"old-state"}]}' >"${state_file}"
 printf '%s\n' '{"nodes":[]}' >"${managed_nodes_file}"
 assert_old_state() {
@@ -582,6 +585,7 @@ run_ssh_configurator() {
 
 run_ssh_configurator 0 >"${work}/sshd-success.stdout"
 grep -Eq 'PermitListen .*127\.0\.0\.1:19123' "${sshd_config}"
+grep -Eq 'PermitListen .*127\.0\.0\.1:19124' "${sshd_config}"
 sshd_hash="$(sha256sum "${sshd_config}" | cut -d' ' -f1)"
 run_ssh_configurator 0 >"${work}/sshd-idempotent.stdout"
 [[ "$(sha256sum "${sshd_config}" | cut -d' ' -f1)" == "${sshd_hash}" ]]
@@ -677,6 +681,7 @@ run_installer() {
     HERMES_COLLABORATION_CONNECTOR_TOKEN_FILE="${token_file}" \
     HERMES_MANAGED_NODE_TOKEN_FILE="${status_token_file}" \
     HERMES_MANAGED_INSTALLATION_TOKEN_FILE="${installation_token_file}" \
+    HERMES_HK_RECOVERY_TOKEN_FILE="${hk_recovery_token_file}" \
     HERMES_NGINX_SECURITY_TARGET="${nginx_security_target}" \
     HERMES_NGINX_SITE_TARGET="${nginx_site_target}" \
     HERMES_NGINX_SERVICE="nginx-test.service" \

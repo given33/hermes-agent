@@ -45,6 +45,7 @@ exec env \
   DBB3_CONNECTOR_UNIT_TEMPLATE="${unit_template}" \
   DBB3_CONNECTOR_BACKUP_ROOT="${HK_CONNECTOR_BACKUP_ROOT:-/opt/hk-team/backups}" \
   DBB3_CONNECTOR_ARTIFACT_ROOTS="${artifact_roots}" \
+  HERMES_CONNECTOR_RUNTIME_PYTHON="${HERMES_HK_RUNTIME_PYTHON:-/opt/hk-team/hermes-agent/.venv/bin/python}" \
   HERMES_CONNECTOR_UNIT_NAME="hk-cloud-connector.service" \
   HERMES_CONNECTOR_CONFIG_DIR="${user_home}/.config/hk-team" \
   HERMES_CONNECTOR_STATE_DIR="${user_home}/.local/state/hk-cloud-connector" \

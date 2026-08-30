@@ -23,6 +23,7 @@ set -e
 [[ "${1:-}" == "--" ]] && shift
 for argument in "$@"; do
   [[ "${argument}" == "--probe" ]] && exit 0
+  [[ "${argument}" == *"websockets.sync.client"* ]] && exit 0
 done
 exec "$@"
 SH
@@ -181,6 +182,7 @@ run_case() {
   DBB3_CONNECTOR_SOURCE_TARGET="${root}/opt/dbb3_cloud_connector.py" \
   DBB3_CONNECTOR_UNIT_TEMPLATE="${unit_template}" \
   DBB3_CONNECTOR_BACKUP_ROOT="${root}/backups" \
+  HERMES_CONNECTOR_RUNTIME_PYTHON=/usr/bin/python3 \
   bash "${installer}" "${source_file}" >"${root}/stdout" 2>"${root}/stderr"
   result=$?
   set -e

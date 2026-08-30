@@ -225,3 +225,20 @@ describe("api.logout", () => {
     expect(assign).toHaveBeenCalledWith("/hermes/login");
   });
 });
+
+describe("api.exportSessionUrl", () => {
+  it("keeps reverse-proxy base paths for direct browser downloads", async () => {
+    vi.stubGlobal("window", {
+      __HERMES_BASE_PATH__: "/hermes/",
+    });
+    vi.resetModules();
+    try {
+      const { api: scopedApi } = await import("./api");
+      expect(scopedApi.exportSessionUrl("session/one", "worker")).toBe(
+        "/hermes/api/sessions/session%2Fone/export?profile=worker",
+      );
+    } finally {
+      vi.resetModules();
+    }
+  });
+});

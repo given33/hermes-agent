@@ -23,6 +23,28 @@ legacy_file="${legacy_file#\"}"; legacy_file="${legacy_file%\"}"
 legacy_file="${legacy_file#\'}"; legacy_file="${legacy_file%\'}"
 [[ -f "${legacy_file}" && ! -L "${legacy_file}" ]] || die "legacy DBB3 credential is missing or unsafe"
 [[ ! -L "${map_file}" ]] || die "credential map must not be a symlink"
+[[ ! -e "${map_file}" || -f "${map_file}" ]] || die "credential map must be a regular file"
+if [[ -f "${map_file}" ]]; then
+  [[ "$(stat -c '%u' -- "${map_file}")" == 0 ]] || die "credential map must be root-owned"
+  [[ "$(stat -c '%h' -- "${map_file}")" == 1 ]] || die "credential map must not have hard links"
+fi
+[[ "${map_file}" == /* ]] || die "credential map path must be absolute"
+map_dir="$(dirname -- "${map_file}")"
+case "${map_dir}" in
+  /|/etc|/var|/usr|/opt|/home|/root|/tmp) die "credential map requires a dedicated directory" ;;
+esac
+[[ "$(realpath -m -- "${map_dir}")" == "${map_dir}" ]] \
+  || die "credential map directory must not contain symlinks or traversal"
+[[ ! -e "${map_dir}" || -d "${map_dir}" ]] || die "credential map parent is not a directory"
+[[ ! -L "${map_dir}" ]] || die "credential map directory must not be a symlink"
+if [[ -d "${map_dir}" ]]; then
+  [[ "$(stat -c '%u' -- "${map_dir}")" == 0 ]] \
+    || die "credential map directory must be root-owned"
+  chown "root:${service_group}" "${map_dir}"
+  chmod 0750 "${map_dir}"
+else
+  install -d -o root -g "${service_group}" -m 0750 "${map_dir}"
+fi
 
 stamp="$(date +%Y%m%d-%H%M%S)"
 backup="/var/backups/hermes-agent/connector-credentials-${stamp}-$$"
@@ -87,7 +109,6 @@ if len(set(tokens.values())) != len(tokens):
     raise SystemExit("each connector must have a distinct credential")
 
 target = output_path
-target.parent.mkdir(parents=True, exist_ok=True)
 with target.open("x", encoding="utf-8", newline="\n") as handle:
     os.chmod(target, 0o600)
     json.dump(tokens, handle, ensure_ascii=True, sort_keys=True, separators=(",", ":"))

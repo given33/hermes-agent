@@ -17870,6 +17870,26 @@ def _normalise_prefix(raw: Optional[str]) -> str:
     return normalise_prefix(raw)
 
 
+def _rewrite_spa_base_path(html: str, prefix: str) -> str:
+    """Keep every browser-owned SPA URL inside a reverse-proxy prefix."""
+    if not prefix:
+        return html
+    for attribute, path in (
+        ("href", "/assets/"),
+        ("src", "/assets/"),
+        ("href", "/favicon.ico"),
+        ("href", "/manifest.webmanifest"),
+        ("href", "/fonts/"),
+        ("href", "/ds-assets/"),
+        ("src", "/ds-assets/"),
+    ):
+        html = html.replace(
+            f'{attribute}="{path}',
+            f'{attribute}="{prefix}{path}',
+        )
+    return html
+
+
 def _render_active_theme_bootstrap_css() -> str:
     """Critical-CSS shim for the active user theme.
 
@@ -18061,15 +18081,9 @@ def mount_spa(application: FastAPI):
                 f"window.__HERMES_AUTH_REQUIRED__={gated_js};"
                 f"</script>"
             )
-        if prefix:
-            # Rewrite absolute asset URLs baked into the Vite build so the
-            # browser fetches them through the same proxy prefix.
-            html = html.replace('href="/assets/', f'href="{prefix}/assets/')
-            html = html.replace('src="/assets/', f'src="{prefix}/assets/')
-            html = html.replace('href="/favicon.ico"', f'href="{prefix}/favicon.ico"')
-            html = html.replace('href="/fonts/', f'href="{prefix}/fonts/')
-            html = html.replace('href="/ds-assets/', f'href="{prefix}/ds-assets/')
-            html = html.replace('src="/ds-assets/', f'src="{prefix}/ds-assets/')
+        # Rewrite absolute browser-owned URLs baked into the Vite build so
+        # assets and the PWA manifest stay on the same proxied application.
+        html = _rewrite_spa_base_path(html, prefix)
         # Theme flash mitigation: when the active theme is a user theme
         # (``HERMES_HOME/dashboard-themes/<name>.yaml``), inject a minimal
         # critical-CSS block so the first paint uses the target palette.

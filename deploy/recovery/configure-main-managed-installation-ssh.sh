@@ -12,7 +12,7 @@ sshd_service="${HERMES_SSHD_SERVICE:-}"
 lock_file="${HERMES_SSHD_LOCK_FILE:-/run/lock/hermes-agent/managed-installation-ssh.lock}"
 backup_root="${HERMES_BACKUP_ROOT:-/var/backups/hermes-agent}"
 anchor="${HERMES_SSHD_PERMIT_ANCHOR:-127.0.0.1:19122}"
-required="${HERMES_SSHD_PERMIT_REQUIRED:-127.0.0.1:19123}"
+required="${HERMES_SSHD_PERMIT_REQUIRED:-127.0.0.1:19123 127.0.0.1:19124}"
 match_user="${HERMES_SSHD_MATCH_USER:-admin}"
 match_address="${HERMES_SSHD_MATCH_ADDRESS:-10.66.0.3}"
 
@@ -45,18 +45,26 @@ reload_sshd() {
 }
 
 validate_effective() {
-  local effective
+  local effective listen
   "${sshd_binary}" -t -f "${sshd_config}"
   effective="$("${sshd_binary}" -T -f "${sshd_config}" \
     -C "user=${match_user},host=localhost,addr=${match_address}")"
   grep -Eq '^allowtcpforwarding (yes|remote)$' <<<"${effective}" \
     || die "remote forwarding is not enabled for ${match_user}"
-  grep -Eq "^permitlisten .*(${required//./\\.})([[:space:]]|$)" <<<"${effective}" \
-    || die "effective PermitListen does not contain ${required}"
+  for listen in ${required}; do
+    [[ "${listen}" =~ ^127\.0\.0\.1:[1-9][0-9]{0,4}$ ]] \
+      || die "invalid required PermitListen value: ${listen}"
+    grep -Eq "^permitlisten .*(${listen//./\\.})([[:space:]]|$)" <<<"${effective}" \
+      || die "effective PermitListen does not contain ${listen}"
+  done
 }
 
-if grep -Eiq "^[[:space:]]*PermitListen[[:space:]].*(^|[[:space:]])${required//./\\.}([[:space:]]|$)" \
-    "${sshd_config}"; then
+configured=1
+for listen in ${required}; do
+  grep -Eiq "^[[:space:]]*PermitListen[[:space:]].*(${listen//./\\.})([[:space:]]|$)" \
+    "${sshd_config}" || configured=0
+done
+if (( configured )); then
   validate_effective
   printf 'state=ready\nchanged=0\n'
   exit 0
@@ -146,7 +154,7 @@ cp --preserve=mode,ownership,timestamps -- "${sshd_config}" "${backup}"
 chmod 0600 "${backup}"
 prune_backups
 
-"${python_binary}" - "${sshd_config}" "${candidate}" "${anchor}" "${required}" <<'PY'
+"${python_binary}" - "${sshd_config}" "${candidate}" "${anchor}" ${required} <<'PY'
 from pathlib import Path
 import re
 import sys
@@ -154,7 +162,7 @@ import sys
 source = Path(sys.argv[1])
 target = Path(sys.argv[2])
 anchor = sys.argv[3]
-required = sys.argv[4]
+required = sys.argv[4:]
 lines = source.read_text(encoding="utf-8").splitlines(keepends=True)
 matches = []
 for index, line in enumerate(lines):
@@ -171,7 +179,10 @@ line = lines[index]
 newline = "\r\n" if line.endswith("\r\n") else "\n" if line.endswith("\n") else ""
 body = line[: -len(newline)] if newline else line
 configuration, marker, comment = body.partition("#")
-configuration = configuration.rstrip() + " " + required
+values = configuration.split()[1:]
+for required_value in required:
+    if required_value not in values:
+        configuration = configuration.rstrip() + " " + required_value
 if marker:
     configuration += " #" + comment
 lines[index] = configuration + newline

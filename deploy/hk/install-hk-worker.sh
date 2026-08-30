@@ -10,8 +10,16 @@ repository="${HERMES_HK_REPOSITORY:-https://github.com/given33/hermes-agent.git}
   || die "repository URL is not approved"
 service_user="${HERMES_FABRIC_SERVICE_USER:-hermes}"
 id "${service_user}" >/dev/null 2>&1 || die "service user does not exist: ${service_user}"
+[[ "${service_user}" == hermes ]] || die "HK production service user must be hermes"
 token_file="${HERMES_CLOUD_TOKEN_FILE:-/etc/hk-team/cloud_connector_token}"
 [[ -f "${token_file}" && ! -L "${token_file}" ]] || die "create the HK connector token first: ${token_file}"
+for recovery_credential in \
+  /etc/hk-team/recovery_token \
+  "/home/${service_user}/.ssh/hk_recovery_ed25519" \
+  "/home/${service_user}/.ssh/hk_recovery_known_hosts"; do
+  [[ -f "${recovery_credential}" && ! -L "${recovery_credential}" ]] \
+    || die "provision the HK recovery credential first: ${recovery_credential}"
+done
 install -d -o root -g root -m 0755 /opt/hk-team /etc/hk-team
 
 agent_root="${HERMES_HK_AGENT_ROOT:-/opt/hk-team/hermes-agent}"

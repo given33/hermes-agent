@@ -9,6 +9,7 @@ to evolve.
 
 from __future__ import annotations
 
+import ast
 from pathlib import Path
 import sys
 
@@ -23,6 +24,78 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 
+_RETIRED_HOSTED_EXECUTION_SYMBOLS = frozenset(
+    {
+        "_append_supervisor_companion_intervention",
+        "_hosted_companion_loop",
+        "_hosted_companion_notes_text",
+        "_hosted_companion_parse",
+        "_hosted_companion_protocol_prompt",
+        "_hosted_companion_role_snapshot",
+        "_hosted_reviewer_control",
+        "_hosted_reviewer_protocol_prompt",
+        "_hosted_reviewer_verdict",
+        "_hosted_supervisor_control",
+        "_hosted_supervisor_protocol_prompt",
+        "_hosted_supervisor_verdict",
+        "_persist_hosted_reviewer_display",
+        "_persist_hosted_supervisor_check",
+        "_require_supervisor_pass",
+        "_review_requests_rework",
+        "_run_hosted_supervisor_check",
+        "_start_hosted_companion",
+        "_stop_hosted_companion",
+    }
+)
+_RETIRED_HOSTED_STAGES = frozenset({"reviewer", "supervisor", "reporter"})
+_LEGACY_RESULT_FIELDS = frozenset({"reporter_result", "reporter_status"})
+
+
+def _literal_string(node: ast.AST | None) -> str:
+    return str(node.value) if isinstance(node, ast.Constant) and isinstance(node.value, str) else ""
+
+
+def _assert_retired_hosted_runtime_absent(path: Path) -> None:
+    tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
+    violations: list[str] = []
+    for node in ast.walk(tree):
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            if node.name in _RETIRED_HOSTED_EXECUTION_SYMBOLS:
+                violations.append(f"retired execution symbol {node.name}")
+            argument_names = {
+                argument.arg
+                for argument in (*node.args.posonlyargs, *node.args.args, *node.args.kwonlyargs)
+            }
+            if "remote_supervisor" in argument_names:
+                violations.append(f"remote_supervisor argument at line {node.lineno}")
+        if isinstance(node, ast.Call):
+            for keyword in node.keywords:
+                if keyword.arg == "remote_supervisor":
+                    violations.append(f"remote_supervisor keyword at line {node.lineno}")
+                if keyword.arg == "role_stage":
+                    stage = _literal_string(keyword.value).split(":", 1)[0].split(".", 1)[0]
+                    if stage in _RETIRED_HOSTED_STAGES:
+                        violations.append(f"retired role_stage {stage} at line {node.lineno}")
+        if isinstance(node, ast.Dict):
+            for key_node, value_node in zip(node.keys, node.values):
+                key = _literal_string(key_node)
+                if key in _LEGACY_RESULT_FIELDS:
+                    violations.append(f"legacy result write {key} at line {node.lineno}")
+                if key == "role_stage":
+                    stage = _literal_string(value_node).split(":", 1)[0].split(".", 1)[0]
+                    if stage in _RETIRED_HOSTED_STAGES:
+                        violations.append(f"retired role_stage {stage} at line {node.lineno}")
+        if isinstance(node, (ast.Assign, ast.AnnAssign, ast.AugAssign)):
+            targets = node.targets if isinstance(node, ast.Assign) else [node.target]
+            for target in targets:
+                if isinstance(target, ast.Subscript):
+                    key = _literal_string(target.slice)
+                    if key in _LEGACY_RESULT_FIELDS:
+                        violations.append(f"legacy result write {key} at line {node.lineno}")
+    if violations:
+        raise SystemExit("upstream sync gate: " + "; ".join(sorted(set(violations))))
+
+
 def main() -> int:
     required = (
         ROOT / ".github/workflows/upstream-sync.yml",
@@ -35,6 +108,10 @@ def main() -> int:
     missing = [str(path.relative_to(ROOT)) for path in required if not path.is_file()]
     if missing:
         raise SystemExit("upstream sync gate: missing product assets: " + ", ".join(missing))
+
+    _assert_retired_hosted_runtime_absent(
+        ROOT / "plugins/collaboration/dashboard/plugin_api.py"
+    )
 
     from hermes_cli.commands import resolve_command
     from hermes_cli.kanban_db import review_dispatch_enabled

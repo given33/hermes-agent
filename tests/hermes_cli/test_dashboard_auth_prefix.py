@@ -107,6 +107,22 @@ def gated_app_direct():
 
 
 class TestForwardedPrefixNormalisation:
+    def test_spa_manifest_and_assets_stay_inside_prefix(self):
+        html = (
+            '<link rel="manifest" href="/manifest.webmanifest">'
+            '<link rel="icon" href="/favicon.ico">'
+            '<link rel="stylesheet" href="/assets/app.css">'
+            '<script src="/assets/app.js"></script>'
+        )
+
+        rewritten = web_server._rewrite_spa_base_path(html, "/hermes")
+
+        assert 'href="/hermes/manifest.webmanifest"' in rewritten
+        assert 'href="/hermes/favicon.ico"' in rewritten
+        assert 'href="/hermes/assets/app.css"' in rewritten
+        assert 'src="/hermes/assets/app.js"' in rewritten
+        assert web_server._rewrite_spa_base_path(html, "") == html
+
     def test_home_assistant_ingress_prefix_with_subpath_is_accepted(
         self, caplog
     ):

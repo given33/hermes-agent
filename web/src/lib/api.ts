@@ -463,7 +463,7 @@ export const api = {
   getSessionStats: (profile = getManagementProfile()) =>
     fetchJSON<SessionStoreStats>(appendProfileParam("/api/sessions/stats", profile)),
   exportSessionUrl: (id: string, profile = getManagementProfile()) =>
-    appendProfileParam(`/api/sessions/${encodeURIComponent(id)}/export`, profile),
+    `${BASE}${appendProfileParam(`/api/sessions/${encodeURIComponent(id)}/export`, profile)}`,
   importSessions: (
     sessions: Array<Record<string, unknown>>,
     profile = getManagementProfile(),

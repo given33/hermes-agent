@@ -52,6 +52,11 @@ try:  # pragma: no cover - import environment dependent
 except Exception:  # noqa: BLE001 - REST polling is the recovery path
     _websocket_connect = None
 
+try:  # pragma: no cover - import environment dependent
+    import psutil as _psutil
+except Exception:  # noqa: BLE001 - metrics are optional status enrichment
+    _psutil = None
+
 
 CONTRACT_VERSION = 2
 MAX_ARTIFACT_BYTES = 64 * 1024 * 1024
@@ -74,6 +79,13 @@ _STREAM_BACKOFF_RESET_SECONDS = 5.0
 # Connector lifecycle frames are compact. Keep a malformed/proxy-injected SSE
 # event from retaining unbounded data while waiting for its blank-line fence.
 _MAX_SSE_EVENT_BYTES = 4 * 1024 * 1024
+_MAX_WORKER_STATUS_BYTES = 16 * 1024
+_WORKER_ROLE_BY_NODE = {
+    "dbb3-worker": "dbb3",
+    "pc-worker": "wsl",
+    "hk-worker": "hk",
+}
+_RELEASE_COMMIT_RE = re.compile(r"[0-9a-fA-F]{7,64}")
 _DEFAULT_CANCEL_COMMAND = "hermes kanban block {root_id} {reason}"
 _SENSITIVE_KEYS = {
     "authorization",
@@ -131,6 +143,97 @@ def now_iso() -> str:
 
 def _text(value: Any, limit: int = 4000) -> str:
     return str(value or "").replace("\x00", "").strip()[:limit]
+
+
+def _worker_release(worker_node_id: str) -> dict[str, str]:
+    role = _WORKER_ROLE_BY_NODE.get(worker_node_id, "")
+    if not role:
+        return {}
+    configured_path = _text(os.environ.get("HERMES_FABRIC_RELEASE_FILE"), 1024)
+    path = Path(
+        configured_path
+        or f"/var/lib/hermes-agent-fabric-update/{role}/release.json"
+    )
+    try:
+        if path.is_symlink() or not path.is_file() or path.stat().st_size > 8192:
+            return {}
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeError, ValueError):
+        return {}
+    if not isinstance(payload, dict):
+        return {}
+    node_id = _text(payload.get("node_id"), 32)
+    commit = _text(payload.get("commit"), 64)
+    version = _text(payload.get("version"), 128)
+    schema = _text(payload.get("schema"), 64)
+    if (
+        schema != "hermes.fabric-release.v1"
+        or node_id != role
+        or _RELEASE_COMMIT_RE.fullmatch(commit) is None
+    ):
+        return {}
+    return {
+        "schema": schema,
+        "node_id": node_id,
+        "commit": commit.lower(),
+        "version": version,
+    }
+
+
+def _worker_metrics() -> dict[str, Any]:
+    sampled_at = now_iso()
+    if _psutil is None:
+        return {"available": False, "sampled_at": sampled_at}
+    try:
+        memory = _psutil.virtual_memory()
+        disk_root = Path(os.environ.get("HERMES_HOME") or Path.home())
+        if not disk_root.exists():
+            disk_root = Path(disk_root.anchor or "/")
+        disk = _psutil.disk_usage(str(disk_root))
+        uptime_seconds = max(0, int(time.time() - float(_psutil.boot_time())))
+        metrics = {
+            "cpu_percent": max(0.0, min(100.0, float(_psutil.cpu_percent(interval=None)))),
+            "memory_percent": max(0.0, min(100.0, float(memory.percent))),
+            "memory_total_bytes": max(0, int(memory.total)),
+            "memory_available_bytes": max(0, int(memory.available)),
+            "disk_percent": max(0.0, min(100.0, float(disk.percent))),
+            "disk_total_bytes": max(0, int(disk.total)),
+            "disk_free_bytes": max(0, int(disk.free)),
+            "uptime_seconds": uptime_seconds,
+            "sampled_at": sampled_at,
+            "available": True,
+        }
+    except (AttributeError, OSError, TypeError, ValueError, OverflowError):
+        return {"available": False, "sampled_at": sampled_at}
+    return metrics
+
+
+def _bounded_worker_status(
+    worker_node_id: str,
+    runtime_overrides: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    runtime = {
+        "worker_ready": True,
+        "active_tasks": 0,
+        "sampled_at": now_iso(),
+    }
+    if runtime_overrides:
+        active_tasks = runtime_overrides.get("active_tasks")
+        if isinstance(active_tasks, int) and not isinstance(active_tasks, bool):
+            runtime["active_tasks"] = max(0, min(active_tasks, 1_000_000))
+    payload = {
+        "runtime": runtime,
+        "release": _worker_release(worker_node_id),
+        "metrics": _worker_metrics(),
+    }
+    encoded = json.dumps(payload, ensure_ascii=True, separators=(",", ":")).encode("utf-8")
+    if len(encoded) > _MAX_WORKER_STATUS_BYTES:
+        return {
+            "runtime": runtime,
+            "release": {},
+            "metrics": {"available": False, "sampled_at": runtime["sampled_at"]},
+        }
+    return payload
 
 
 def _redact_sensitive(value: Any) -> Any:
@@ -579,6 +682,7 @@ class CloudRelayClient:
         self._stream_response: Any | None = None
         self._stream_ws_lock = threading.Lock()
         self._stream_ws: Any | None = None
+        self._worker_runtime_provider: Callable[[], dict[str, Any]] | None = None
 
     def _default_worker_node_id(self) -> str:
         normalized = self.connector_id.lower()
@@ -587,6 +691,24 @@ class CloudRelayClient:
         if normalized.startswith("hk-"):
             return "hk-worker"
         return "dbb3-worker"
+
+    def set_worker_runtime_provider(
+        self,
+        provider: Callable[[], dict[str, Any]],
+    ) -> None:
+        self._worker_runtime_provider = provider
+
+    def _worker_status_fields(self) -> dict[str, Any]:
+        overrides: dict[str, Any] = {}
+        provider = self._worker_runtime_provider
+        if provider is not None:
+            try:
+                provided = provider()
+                if isinstance(provided, dict):
+                    overrides = provided
+            except Exception:
+                overrides = {}
+        return _bounded_worker_status(self.worker_node_id, overrides)
 
     def close_stream(self) -> None:
         """Interrupt active SSE/WS reads so connector shutdown is prompt."""
@@ -881,6 +1003,8 @@ class CloudRelayClient:
                     "connection_generation": self._connection_generation,
                     "capabilities": ["worker.ws", "connector.pull", "connector.artifacts"],
                     "version": "2.0",
+                    "protocol_version": "2.0",
+                    **self._worker_status_fields(),
                 }, separators=(",", ":")))
                 hello = self._decode_ws_frame(websocket.recv(timeout=10.0))
                 if not hello or hello.get("type") != "hello.accepted":
@@ -888,6 +1012,7 @@ class CloudRelayClient:
                 handshake_accepted = True
                 handshake_failures = 0
                 backoff = 1.0
+                last_heartbeat_sent = time.monotonic()
                 while not stop.is_set():
                     try:
                         raw = websocket.recv(timeout=25.0)
@@ -895,11 +1020,21 @@ class CloudRelayClient:
                         # The server emits a heartbeat every 30 seconds.  A
                         # client heartbeat also refreshes the lease and keeps
                         # proxies from declaring the otherwise idle socket dead.
-                        websocket.send(json.dumps({"type": "heartbeat"}, separators=(",", ":")))
+                        websocket.send(json.dumps({
+                            "type": "heartbeat",
+                            **self._worker_status_fields(),
+                        }, separators=(",", ":")))
+                        last_heartbeat_sent = time.monotonic()
                         continue
                     frame = self._decode_ws_frame(raw)
                     if frame is not None:
                         self._handle_worker_ws_frame(frame, wake, on_steer)
+                    if time.monotonic() - last_heartbeat_sent >= 25.0:
+                        websocket.send(json.dumps({
+                            "type": "heartbeat",
+                            **self._worker_status_fields(),
+                        }, separators=(",", ":")))
+                        last_heartbeat_sent = time.monotonic()
             except Exception:
                 # A rotated connector credential may close the websocket
                 # during the HTTP upgrade.  Reload before the next backoff
@@ -1964,6 +2099,13 @@ class DBB3CloudConnector:
             or os.environ.get("HERMES_CONNECTOR_CANCEL_COMMAND", "").strip()
             or _DEFAULT_CANCEL_COMMAND
         )
+        set_runtime_provider = getattr(
+            self.cloud_client,
+            "set_worker_runtime_provider",
+            None,
+        )
+        if callable(set_runtime_provider):
+            set_runtime_provider(self._worker_runtime_status)
         stream_events = getattr(self.cloud_client, "_stream_events", None)
         if callable(stream_events):
             stream_args: tuple[Any, ...] = (self._wake_event, self._stream_stop)
@@ -1984,6 +2126,16 @@ class DBB3CloudConnector:
                 daemon=True,
             )
             self._stream_thread.start()
+
+    def _worker_runtime_status(self) -> dict[str, Any]:
+        runs = self.checkpoints.load().get("runs") or {}
+        active_tasks = sum(
+            1
+            for value in runs.values()
+            if isinstance(value, dict)
+            and str(value.get("status") or "").lower() not in TERMINAL_STATUSES
+        )
+        return {"active_tasks": active_tasks}
 
     def _queue_steer(self, event: dict[str, Any]) -> None:
         with self._pending_steers_lock:

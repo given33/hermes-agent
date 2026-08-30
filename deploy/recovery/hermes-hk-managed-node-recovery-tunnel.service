@@ -1,0 +1,21 @@
+[Unit]
+Description=Hermes HK managed-node recovery reverse tunnel
+After=network-online.target hermes-hk-managed-node-recovery.service
+Wants=network-online.target
+Requires=hermes-hk-managed-node-recovery.service
+
+[Service]
+Type=simple
+User=hermes
+Group=hermes
+Environment=HOME=/home/hermes
+ExecStart=/usr/bin/ssh -i /home/hermes/.ssh/hk_recovery_ed25519 -o UserKnownHostsFile=/home/hermes/.ssh/hk_recovery_known_hosts -o GlobalKnownHostsFile=/dev/null -o IdentitiesOnly=yes -o BatchMode=yes -o StrictHostKeyChecking=yes -o ExitOnForwardFailure=yes -o ServerAliveInterval=20 -o ServerAliveCountMax=3 -N -R 127.0.0.1:19124:127.0.0.1:9121 admin@10.66.0.1
+Restart=always
+RestartSec=5
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=read-only
+
+[Install]
+WantedBy=multi-user.target

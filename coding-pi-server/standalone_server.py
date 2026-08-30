@@ -10,7 +10,6 @@ from __future__ import annotations
 
 import argparse
 import asyncio
-import hmac
 import json
 import logging
 import os
@@ -23,12 +22,19 @@ from typing import Any
 
 from fastapi import WebSocket as FastAPIWebSocket
 
+from network_auth import (
+    bearer_or_loopback_authorized,
+    bind_host_is_loopback,
+    require_coordinator_token,
+    require_safe_listener,
+)
+
 
 SERVICE_ROOT = Path(__file__).resolve().parents[1]
 PLUGIN_DASHBOARD_ROOT = SERVICE_ROOT / "plugins" / "coding-pi" / "dashboard"
 
 
-def build_app():
+def build_app(*, allow_unauthenticated_loopback: bool = False):
     """Create the standalone FastAPI app without importing Hermes modules."""
 
     os.environ.setdefault("CODING_PI_STANDALONE", "1")
@@ -40,12 +46,24 @@ def build_app():
     from fastapi.middleware.cors import CORSMiddleware
     from fastapi.responses import JSONResponse
 
-    from plugin_api import _MANAGER, _local_node_record, _local_node_id, _room_id_from_link_path, collab_room_socket, router
+    from plugin_api import (
+        _MANAGER,
+        _local_node_record,
+        _local_node_id,
+        _room_id_from_link_path,
+        collab_room_socket,
+        node_tunnel_socket,
+        router,
+    )
 
     service_logger = logging.getLogger("coding-pi-standalone")
 
     @asynccontextmanager
     async def lifespan(_app):
+        require_coordinator_token(
+            os.environ.get("CODING_PI_COORDINATOR_URL"),
+            os.environ.get("CODING_PI_COORDINATOR_TOKEN"),
+        )
         coordinator_task = None
         if os.environ.get("CODING_PI_COORDINATOR_URL", "").strip():
             coordinator_task = asyncio.create_task(_coordinator_loop(_local_node_record, _local_node_id))
@@ -80,12 +98,18 @@ def build_app():
 
     @app.middleware("http")
     async def require_service_token(request: Request, call_next):
-        expected = os.environ.get("CODING_PI_SERVER_TOKEN", "").strip()
-        if expected and request.url.path.startswith("/api/coding-pi"):
-            received = request.headers.get("authorization", "")
-            wanted = f"Bearer {expected}"
-            if not hmac.compare_digest(received, wanted):
-                return JSONResponse(status_code=401, content={"detail": "Pi service authentication required"})
+        path = str(request.scope.get("path") or "")
+        root_path = str(request.scope.get("root_path") or "").rstrip("/")
+        if root_path and (path == root_path or path.startswith(root_path + "/")):
+            path = path[len(root_path):] or "/"
+        protected = path == "/api/coding-pi" or path.startswith("/api/coding-pi/")
+        if protected and not bearer_or_loopback_authorized(
+            os.environ.get("CODING_PI_SERVER_TOKEN"),
+            request.headers.get("authorization"),
+            request.client.host if request.client else None,
+            allow_unauthenticated_loopback=allow_unauthenticated_loopback,
+        ):
+            return JSONResponse(status_code=401, content={"detail": "Pi service authentication required"})
         return await call_next(request)
 
     @app.get("/")
@@ -116,6 +140,31 @@ def build_app():
         # Reuse the adapter's local-or-reverse-tunnel decision so the official
         # root relay path has the same behavior as /api/coding-pi/r/*.
         await collab_room_socket(websocket, room_id)
+
+    @app.websocket("/api/coding-pi/nodes/{node_id}/tunnel")
+    async def authenticated_node_tunnel(
+        websocket: FastAPIWebSocket,
+        node_id: str,
+    ) -> None:
+        # HTTP middleware does not run for WebSocket upgrades. Keep the
+        # coordinator tunnel on the same fail-closed listener contract as the
+        # REST API before delegating to the unchanged Pi router implementation.
+        expected_token = (
+            os.environ.get("CODING_PI_COORDINATOR_TOKEN", "").strip()
+            or os.environ.get("CODING_PI_SERVER_TOKEN", "").strip()
+        )
+        if not bearer_or_loopback_authorized(
+            expected_token,
+            websocket.headers.get("authorization"),
+            websocket.client.host if websocket.client else None,
+            allow_unauthenticated_loopback=allow_unauthenticated_loopback,
+        ):
+            await websocket.close(
+                code=4401,
+                reason="Pi coordinator authentication required",
+            )
+            return
+        await node_tunnel_socket(websocket, node_id)
 
     app.include_router(router, prefix="/api/coding-pi")
 
@@ -254,9 +303,25 @@ def main() -> None:
     if args.local_relay_link:
         os.environ["CODING_PI_LOCAL_RELAY_LINK"] = "1"
 
+    require_safe_listener(
+        args.host,
+        os.environ.get("CODING_PI_SERVER_TOKEN"),
+        "Coding Pi standalone service",
+    )
+    require_coordinator_token(
+        os.environ.get("CODING_PI_COORDINATOR_URL"),
+        os.environ.get("CODING_PI_COORDINATOR_TOKEN"),
+    )
+
     import uvicorn
 
-    uvicorn.run(build_app(), host=args.host, port=args.port, log_level="info")
+    uvicorn.run(
+        build_app(allow_unauthenticated_loopback=bind_host_is_loopback(args.host)),
+        host=args.host,
+        port=args.port,
+        log_level="info",
+        proxy_headers=False,
+    )
 
 
 app = build_app()

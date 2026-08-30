@@ -24,6 +24,8 @@ OBSOLETE_WORKFLOW_FIELDS = frozenset(
         "reviewer_target",
         "review_verdict",
         "remote_supervisor",
+        "reporter_result",
+        "reporter_status",
     }
 )
 ROLE_KEYS = frozenset(
@@ -87,6 +89,16 @@ def _migrate(value: Any, *, role_context: bool = False) -> tuple[Any, int, bool]
         if str(key).lower() in ROLE_KEYS and _is_retired_marker(raw):
             return None, 1, True
 
+    # Legacy deterministic summaries were stored under a role-shaped alias
+    # even after the reporter model lane was retired. Promote that value once
+    # into the canonical result field, then remove both legacy aliases.
+    legacy_reporter_result = value.get("reporter_result")
+    promote_legacy_result = (
+        "result" not in value
+        and legacy_reporter_result is not None
+        and str(legacy_reporter_result).strip() != ""
+    )
+
     output: dict[Any, Any] = {}
     removed = 0
     changed = False
@@ -102,6 +114,9 @@ def _migrate(value: Any, *, role_context: bool = False) -> tuple[Any, int, bool]
             changed = True
             continue
         output[key] = next_value
+    if promote_legacy_result:
+        output["result"] = deepcopy(legacy_reporter_result)
+        changed = True
     return output, removed, changed
 
 

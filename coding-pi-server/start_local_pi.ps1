@@ -41,6 +41,9 @@ if (-not $env:CODING_PI_SERVER_TOKEN) {
   throw "Set CODING_PI_SERVER_TOKEN before starting the local Pi node"
 }
 $env:CODING_PI_NODE_AGENT_TOKEN = if ($env:CODING_PI_NODE_AGENT_TOKEN) { $env:CODING_PI_NODE_AGENT_TOKEN } else { $env:CODING_PI_SERVER_TOKEN }
+if ($CoordinatorUrl -and -not $env:CODING_PI_COORDINATOR_TOKEN) {
+  throw "Set CODING_PI_COORDINATOR_TOKEN before connecting the local Pi node to a coordinator"
+}
 
 # The API key is intentionally not embedded in this script or a scheduled-task
 # argument. The optional setup helper stores it as a Windows-user DPAPI blob.

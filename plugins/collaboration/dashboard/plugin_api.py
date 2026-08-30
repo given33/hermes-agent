@@ -102,9 +102,15 @@ from hermes_services.hosted_event_protocol import (
     preserve_persistence_hook_outbox,
     state_with_persistence_hook_outbox,
 )
-from hermes_services.hosted_role_migration import migrate_hosted_container
+from hermes_services.hosted_role_migration import (
+    RETIRED_ROLE_MARKERS,
+    migrate_hosted_container,
+)
 from hermes_services.low_latency_protocol import ProtocolError, protocol_int
-from hermes_services.worker_channel import WorkerChannelRegistry
+from hermes_services.worker_channel import (
+    WorkerChannelRegistry,
+    get_worker_channel_registry,
+)
 from hermes_services import latency_trace as _latency_trace
 from hermes_services.session_entries import (
     append_message_stream_entries,
@@ -116,7 +122,6 @@ from hermes_services.tool_output_artifacts import EncryptedToolArtifactStore
 from hermes_runtime.composability import (
     EffectScope,
     ProviderCatalog,
-    PromptMetrics,
     build_hosted_turn_plan,
     hosted_turn_plan_snapshot,
     next_ready_plan_nodes,
@@ -150,7 +155,6 @@ _ACCOUNT_DELETION_STORE_LOCK = threading.Lock()
 _ACCOUNT_DELETION_STORES: dict[str, Any] = {}
 _RUNTIME_PROVIDER_CATALOG = ProviderCatalog()
 _RUNTIME_PROVIDER_LOCK = threading.RLock()
-_HOSTED_PROMPT_METRICS = PromptMetrics()
 
 
 def _runtime_provider_id(kind: str, identity: str) -> str:
@@ -591,7 +595,12 @@ class _AccountStateLock:
 _STATE_LOCK = _AccountStateLock()
 _HOSTED_THREADS_LOCK = threading.Lock()
 _HOSTED_THREADS: dict[str, threading.Thread] = {}
-_WORKER_CHANNEL = WorkerChannelRegistry()
+_WORKER_CHANNEL = get_worker_channel_registry()
+_WORKER_NODE_BY_CONNECTOR = {
+    "dbb3-primary": "dbb3-worker",
+    "pc-primary": "pc-worker",
+    "hk-primary": "hk-worker",
+}
 _HOSTED_ROUTING_THREADS_LOCK = threading.Lock()
 _HOSTED_ROUTING_THREADS: dict[str, threading.Thread] = {}
 _HOSTED_EXECUTION_GENERATION = threading.local()
@@ -1843,6 +1852,9 @@ async def worker_websocket(websocket: WebSocket) -> None:
             version=str(hello.get("version") or ""),
             connector_id=connector_id,
             expected_connector_id=_connector_for_profile(node_id),
+            runtime=hello.get("runtime"),
+            release=hello.get("release"),
+            metrics=hello.get("metrics"),
         )
         lease_id = connection.lease_id
         await websocket.send_json({
@@ -1911,7 +1923,13 @@ async def worker_websocket(websocket: WebSocket) -> None:
                 raise ProtocolError("worker frame must be an object")
             message_type = str(message.get("type") or "").strip().lower()
             if message_type == "heartbeat":
-                if not _WORKER_CHANNEL.heartbeat(node_id, lease_id):
+                if not _WORKER_CHANNEL.heartbeat(
+                    node_id,
+                    lease_id,
+                    runtime=message.get("runtime"),
+                    release=message.get("release"),
+                    metrics=message.get("metrics"),
+                ):
                     raise ProtocolError("stale worker lease")
                 await websocket.send_json({"type": "heartbeat.ack", "node_id": node_id, "timestamp": int(time.time() * 1000)})
                 continue
@@ -5518,7 +5536,7 @@ def _remote_run_is_pullable(remote_run: Mapping[str, Any]) -> bool:
     """Return whether a persisted run belongs in a connector pull batch.
 
     Only worker lanes are eligible for remote connector delivery. Dispatcher
-    work is always server-local and there is no supervisor/reviewer lane.
+    work is always server-local and there is no secondary model-control lane.
     """
 
     profile = str(remote_run.get("profile") or "").strip().lower()
@@ -5598,7 +5616,7 @@ def _bridge_worker_channel_event(event: Mapping[str, Any]) -> bool:
         save_single_state(state)
     _notify_hosted_update(conversation_id)
     return True
-_RETIRED_AI_PROFILES = frozenset({"supervisor", "reviewer"})
+_RETIRED_AI_PROFILES = RETIRED_ROLE_MARKERS
 _MANAGER_DIFFICULTIES = {"low", "medium", "high", "critical"}
 _MANAGER_HANDOFF_FIELDS = (
     "task_goal",
@@ -7195,7 +7213,7 @@ def _hosted_workflow_todo_items(
 
 
 def _sanitize_hosted_check_id(value: str) -> str:
-    """把 todo 项 id 压成 supervisor check_id 的安全字符集。"""
+    """把 todo 项 id 压成确定性 validation check_id 的安全字符集。"""
 
     sanitized = re.sub(r"[^0-9A-Za-z_.-]+", "-", str(value or "").strip()).strip("-")
     return sanitized[:60] or "item"
@@ -8693,21 +8711,7 @@ def _hosted_runtime_home(
     from hermes_cli.profiles import resolve_profile_env
 
     requested_profile = str(profile or "default").strip() or "default"
-    try:
-        runtime_home = str(resolve_profile_env(requested_profile))
-    except FileNotFoundError:
-        # Reviewer/supervisor and the old DBB3 manager name are accepted at
-        # the API boundary for existing rooms, but their profile directories
-        # were retired by the hosted-role migration.  Run those explicit
-        # requests with the deterministic default runtime rather than
-        # returning a false prewarm/queue failure.
-        if (
-            requested_profile.lower() in _RETIRED_AI_PROFILES
-            or requested_profile.lower() == _LEGACY_DBB3_MANAGER_PROFILE
-        ):
-            runtime_home = str(resolve_profile_env("default"))
-        else:
-            raise
+    runtime_home = str(resolve_profile_env(requested_profile))
     runtime_owner = str((artifact_context or {}).get("owner_id") or "").strip()
     runtime_generation = str(
         (artifact_context or {}).get("account_generation") or ""
@@ -8946,7 +8950,7 @@ def run_profile_turn(
                     "HERMES_API_RETRY_ATTEMPT_OFFSET": str(
                         env.get("HERMES_API_RETRY_ATTEMPT_OFFSET") or "0"
                     ),
-                    # Hosted server-side roles (reporter, server fallback) use
+                    # Hosted server-side stages (aggregation, fallback) use
                     # the same provider stale-stream safety as normal turns:
                     # deepseek-v4-flash has a 600s reasoning floor, so long
                     # internal prompts are not killed by an artificial 120s
@@ -10852,7 +10856,7 @@ def _run_hosted_role(
             ),
         )
     )
-    # The hosted workflow has no parallel supervisor/reviewer model. Worker
+    # The hosted workflow has no parallel model-control lane. Worker
     # progress is delivered directly over the low-latency channel and settled
     # by the dispatcher from durable worker results.
     for attempt in range(1, attempts + 1):
@@ -11182,6 +11186,16 @@ def _request_remote_role_intervention_cancel(
     return claimed
 
 
+def _require_remote_worker_role(profile: str, role_stage: str) -> None:
+    if (
+        collaboration_role(profile) != "worker"
+        or str(role_stage or "").split(":", 1)[0] != "worker"
+    ):
+        raise RuntimeError(
+            "Remote execution requires a worker profile and worker role_stage"
+        )
+
+
 def _run_hosted_remote_role(
     conversation_id: str,
     turn_id: str,
@@ -11198,7 +11212,6 @@ def _run_hosted_remote_role(
     rework_round: int = 0,
     connector_id: str = "",
     visible: bool = True,
-    remote_supervisor: bool = False,
 ) -> tuple[str, str, dict[str, Any]]:
     """Wait for a worker connector run and project its checkpoints.
 
@@ -11207,8 +11220,7 @@ def _run_hosted_remote_role(
     item instead of creating another remote Kanban task.
     """
 
-    if remote_supervisor:
-        raise RuntimeError("Supervisor remote runs are no longer supported")
+    _require_remote_worker_role(profile, role_stage)
 
     with _STATE_LOCK:
         state = load_single_state()
@@ -11232,7 +11244,6 @@ def _run_hosted_remote_role(
         attachment_ids=list(run_snapshot.get("attachment_ids") or []),
         attempt=rework_round + 1,
         connector_id=connector_id,
-        remote_supervisor=remote_supervisor,
     )
     active_remote_id = str(remote.get("id") or "")
     connector_provider = _observe_runtime_provider(
@@ -11372,7 +11383,6 @@ def _run_hosted_remote_role(
                 rework_round=rework_round,
                 connector_id=connector_id,
                 visible=visible,
-                remote_supervisor=remote_supervisor,
             )
         with _STATE_LOCK:
             state = load_single_state()
@@ -11688,7 +11698,6 @@ def _run_hosted_remote_role(
                             rework_round=rework_round,
                             connector_id=connector_id,
                             visible=visible,
-                            remote_supervisor=remote_supervisor,
                         )
                         intervention_reply = (
                             reply_result
@@ -11730,7 +11739,6 @@ def _run_hosted_remote_role(
                                 rework_round=rework_round,
                                 connector_id=connector_id,
                                 visible=visible,
-                                remote_supervisor=remote_supervisor,
                             )
                         )
                         _persist_hosted_role_state(
@@ -12261,6 +12269,9 @@ def _schedule_persisted_terminal_notification(
 ) -> None:
     """Notify only the terminal state that won the durable state transition."""
 
+    migrated_run, _removed, _changed = migrate_hosted_container(persisted_run)
+    if isinstance(migrated_run, dict):
+        persisted_run = migrated_run
     actual_status = str(persisted_run.get("status") or "")
     if actual_status not in _HOSTED_TERMINAL_STATUSES:
         return
@@ -12272,7 +12283,6 @@ def _schedule_persisted_terminal_notification(
     result = str(
         notification.get("result")
         or persisted_run.get("result")
-        or persisted_run.get("reporter_result")
         or persisted_run.get("chat_result")
         or fallback_result
     )
@@ -13471,12 +13481,10 @@ def _ensure_remote_run(
     attachment_ids: Optional[list[str]] = None,
     attempt: int = 1,
     connector_id: str = "",
-    remote_supervisor: bool = False,
 ) -> dict[str, Any]:
     """Create or reuse the durable worker queue item for one role phase."""
 
-    if remote_supervisor:
-        raise RuntimeError("Supervisor remote runs are no longer supported")
+    _require_remote_worker_role(profile, role_stage)
 
     remote_id = _remote_run_id(conversation_id, turn_id, role_stage, profile)
     with _STATE_LOCK:
@@ -14019,324 +14027,6 @@ def _finish_hosted_turn_if_cancelled(
     return True
 
 
-_HOSTED_CONTROL_ROOT_KEYS = frozenset(
-    {"protocol", "verdict", "checks", "blockers", "findings", "required_actions"}
-)
-_HOSTED_REVIEW_CHECKS = (
-    # Sole acceptance standard: did the worker complete THE USER'S task?
-    # Everything else (format, style, extra detail, test coverage, risk
-    # wording, plan-letter adherence) is explicitly out of scope.
-    "user_task_completed",
-)
-_HOSTED_SUPERVISION_CHECKS = (
-    # Sole standard: every item of the user's task is addressed (at plan
-    # gates: covered by the plan; at output gates: completed with a result).
-    "user_task_completed",
-)
-
-
-def _strict_json_object(text: str) -> Optional[dict[str, Any]]:
-    """Decode exactly one JSON object and reject duplicate keys at every depth."""
-
-    class DuplicateKeyError(ValueError):
-        pass
-
-    def unique_object(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
-        result: dict[str, Any] = {}
-        for key, value in pairs:
-            if key in result:
-                raise DuplicateKeyError(key)
-            result[key] = value
-        return result
-
-    raw = str(text or "").strip()
-    # The control protocol is deliberately closed: accept only one bare JSON
-    # object or one complete Markdown JSON fence. Prefixes, suffixes, and
-    # narrative text must never reach the reviewer/supervisor gate.
-    if not raw.startswith("{"):
-        fence = re.fullmatch(
-            r"```(?:json)?[ \t]*\n?(.*?)\n?[ \t]*```", raw, re.DOTALL
-        )
-        if fence is None:
-            return None
-        raw = fence.group(1).strip()
-    if not raw.endswith("}"):
-        return None
-    try:
-        parsed = json.loads(raw, object_pairs_hook=unique_object)
-    except (DuplicateKeyError, json.JSONDecodeError, TypeError, ValueError):
-        return None
-    return parsed if isinstance(parsed, dict) else None
-
-
-def _strict_hosted_control_result(
-    result: str,
-    *,
-    protocol: str,
-    outcomes: tuple[str, ...],
-    required_checks: tuple[str, ...],
-    optional_keys: tuple[str, ...] = (),
-) -> Optional[dict[str, Any]]:
-    """Validate the closed verdict schema without interpreting narrative text."""
-
-    parsed = _strict_json_object(result)
-    allowed_keys = set(_HOSTED_CONTROL_ROOT_KEYS) | set(optional_keys)
-    if (
-        parsed is None
-        or not set(_HOSTED_CONTROL_ROOT_KEYS) <= set(parsed)
-        or not set(parsed) <= allowed_keys
-    ):
-        return None
-    if "directional" in parsed and type(parsed.get("directional")) is not bool:
-        return None
-    if parsed.get("protocol") != protocol or parsed.get("verdict") not in outcomes:
-        return None
-    checks = parsed.get("checks")
-    if not isinstance(checks, dict) or set(checks) != set(required_checks):
-        return None
-    if any(type(checks.get(key)) is not bool for key in required_checks):
-        return None
-    for key in ("blockers", "findings", "required_actions"):
-        values = parsed.get(key)
-        if (
-            not isinstance(values, list)
-            or len(values) > 50
-            or any(
-                not isinstance(value, str)
-                or not value.strip()
-                or len(value) > 2000
-                for value in values
-            )
-        ):
-            return None
-    verdict = str(parsed["verdict"])
-    issue_count = sum(
-        len(parsed[key]) for key in ("blockers", "findings", "required_actions")
-    )
-    if verdict == "PASS":
-        if issue_count or not all(checks[key] for key in required_checks):
-            return None
-    elif (
-        not parsed["required_actions"]
-        or issue_count == 0
-        or all(checks[key] for key in required_checks)
-    ):
-        # A negative control decision must identify a failed check and an
-        # actionable structured reason. `blockers` may be empty when the model
-        # puts the concrete problems in `findings` and the remediation steps in
-        # `required_actions`; only the union of the three arrays must be
-        # non-empty. Requiring `blockers` alone rejected valid CORRECTIVE_ACTION
-        # results and made remote supervisor checkpoints fail with "格式无效".
-        return None
-    return parsed
-
-
-def _control_result_has_json_envelope(text: str) -> bool:
-    """True when the text contains any JSON-object envelope.
-
-    The closed control protocol accepts exactly one strict JSON object.
-    When a model emits malformed JSON (string booleans, duplicate keys,
-    extra fields, prefixed/fenced envelopes), the narrative fallback must
-    never reinterpret the literal ``"PASS"`` inside that JSON as a passing
-    verdict. Any brace-delimited envelope defeats the relaxed path.
-    """
-    raw = str(text or "").strip()
-    if not raw:
-        return False
-    start = raw.find("{")
-    end = raw.rfind("}")
-    return start != -1 and end > start
-
-
-def _hosted_reviewer_control(result: str) -> Optional[dict[str, Any]]:
-    strict = _strict_hosted_control_result(
-        result,
-        protocol="hermes.review.v1",
-        outcomes=("PASS", "REWORK"),
-        required_checks=_HOSTED_REVIEW_CHECKS,
-    )
-    if strict is not None:
-        return strict
-    # Format drift on long contexts: reviewer models sometimes paraphrase the
-    # verdict, wrap the schema in extra keys (e.g. "checks": {"c1":"pass"}),
-    # or emit narrative only. Downgrade to a structured decision when the
-    # text carries an unambiguous verdict marker — same policy as the
-    # supervisor's relaxed interpretation.
-    if _control_result_has_json_envelope(result):
-        return None
-    text = str(result or "").strip()
-    if re.search(r"(?:判定|结论|结果为|verdict)\s*[:：]?\s*PASS\b", text, re.I):
-        return {
-            "protocol": "hermes.review.v1",
-            "verdict": "PASS",
-            "checks": {key: True for key in _HOSTED_REVIEW_CHECKS},
-            "blockers": [],
-            "findings": [],
-            "required_actions": [],
-            "_relaxed_interpretation": True,
-        }
-    if re.search(
-        r"(?:判定|结论|结果为|verdict)\s*[:：]?\s*REWORK\b",
-        text,
-        re.I,
-    ):
-        return {
-            "protocol": "hermes.review.v1",
-            "verdict": "REWORK",
-            "checks": {key: False for key in _HOSTED_REVIEW_CHECKS},
-            "blockers": [text[:2000]],
-            "findings": [text[:2000]],
-            "required_actions": ["依据审阅结论返工后重新提交。"],
-            "_relaxed_interpretation": True,
-        }
-    # Narrative fallback. A bare PASS verdict word at a sentence boundary
-    # with no rework/fail language nearby is a success marker; REWORK/FAIL
-    # wording maps to a rework decision. Negation guard mirrors the
-    # supervisor's: "未发现问题 / 无需返工 / 未要求整改" must not flip a PASS.
-    _rework_pattern = re.compile(
-        r"(?<![A-Za-z])(?:REWORK|FAILED|返工|不通过|未通过)(?![A-Za-z])",
-        re.I,
-    )
-    _rework_neutral = re.compile(
-        r"(?:返工交接|返工记录|返工历史|rework_history|rework_log|rework_items|返工列表)"
-        r"|(?:未|无|不|没有|无需|未发现|没有发现|不存在|避免|排除)[^。；;\n]{0,6}?"
-        r"(?<![A-Za-z])(?:REWORK|FAILED|返工|不通过|未通过)(?![A-Za-z])"
-        r"|(?:[A-Za-z]+/){0,2}(?:active|running|stopped|inactive|pending|completed)/failed\b",
-        re.I,
-    )
-    _rework_matches = [
-        m for m in _rework_pattern.finditer(text)
-        if not _rework_neutral.search(
-            text[max(0, m.start() - 24) : min(len(text), m.end() + 24)]
-        )
-    ]
-    if re.search(
-        r"(?<![A-Za-z])(?:PASS|通过了|通过检查|检查通过|验收通过)(?![A-Za-z])",
-        text,
-        re.I,
-    ) and not _rework_matches:
-        return {
-            "protocol": "hermes.review.v1",
-            "verdict": "PASS",
-            "checks": {key: True for key in _HOSTED_REVIEW_CHECKS},
-            "blockers": [],
-            "findings": [],
-            "required_actions": [],
-            "_relaxed_interpretation": True,
-            "_relaxed_reason": "narrative verdict marker",
-        }
-    if _rework_matches:
-        return {
-            "protocol": "hermes.review.v1",
-            "verdict": "REWORK",
-            "checks": {key: False for key in _HOSTED_REVIEW_CHECKS},
-            "blockers": [text[:2000]],
-            "findings": [text[:2000]],
-            "required_actions": ["依据审阅结论返工后重新提交。"],
-            "_relaxed_interpretation": True,
-            "_relaxed_reason": "narrative verdict marker",
-        }
-    return None
-
-
-def _hosted_reviewer_verdict(result: str) -> str:
-    control = _hosted_reviewer_control(result)
-    return str(control["verdict"]).lower() if control is not None else "unknown"
-
-
-def _hosted_control_display(
-    result: str,
-    *,
-    kind: str,
-    checkpoint_label: str = "",
-) -> str:
-    """Render user-visible Chinese text from a validated machine verdict."""
-
-    if kind == "reviewer":
-        control = _hosted_reviewer_control(result)
-        if control is None:
-            return "审阅控制结果格式无效，已按未通过处理。"
-        if control["verdict"] == "PASS":
-            return "审阅通过：全部验收、证据、测试和风险检查均已确认。"
-        prefix = "审阅要求返工"
-    else:
-        control = _hosted_supervisor_control(result)
-        label = f"“{checkpoint_label}”" if checkpoint_label else "当前检查点"
-        if control is None:
-            return f"监督控制结果格式无效，{label} 已按未通过处理。"
-        if control["verdict"] == "PASS":
-            return f"监督检查通过：{label} 的职责、覆盖、证据和流程均已确认。"
-        if control.get("directional"):
-            return (
-                f"监督判定方案方向偏离：{label} 的问题影响整个方案方向，"
-                "需回到计划阶段从头执行，不得局部返工。"
-            )
-        prefix = f"监督要求整改：{label}"
-    details = [
-        *control["blockers"],
-        *control["findings"],
-        *control["required_actions"],
-    ]
-    return f"{prefix}：" + "；".join(details)
-
-
-def _hosted_reviewer_protocol_prompt() -> str:
-    return (
-        "最终控制结果只允许输出一个 JSON 对象，不得使用 Markdown 代码块、引用、"
-        "解释正文、前后缀或第二个对象。严格 schema："
-        '{"protocol":"hermes.review.v1","verdict":"PASS|REWORK",'
-        '"checks":{"user_task_completed":true|false},'
-        '"blockers":["..."],"findings":["..."],"required_actions":["..."]}。'
-        "键集、类型和枚举必须完全一致。"
-        "验收只有一条标准：用户的原始任务是否已经完成——用户明确要求的每一项都有"
-        "对应的完成结果即为 PASS，checks 只含 user_task_completed 且为 true，三个数组"
-        "必须全空。禁止因为格式、详略、风格、额外信息、缺少测试、风险表述、证据形式"
-        "或与计划措辞不一致而退回。"
-        "REWORK 只用于用户任务中仍有未完成事项的情形：user_task_completed 为 false，"
-        "required_actions 只列出这些未完成的用户任务项。"
-    )
-
-
-def _persist_hosted_reviewer_display(
-    conversation_id: str,
-    turn_id: str,
-    *,
-    profile: str,
-    role_stage: str,
-    role_label: str,
-    raw_result: str,
-    status: str,
-    role_state: dict[str, Any],
-) -> tuple[str, Optional[dict[str, Any]]]:
-    """Keep the machine verdict private and expose a backend-rendered message."""
-
-    control = _hosted_reviewer_control(raw_result)
-    display_result = _hosted_control_display(raw_result, kind="reviewer")
-    display_state = dict(role_state)
-    display_state.update(
-        {
-            "content": display_result,
-            "status": "failed" if status == "completed" and control is None else status,
-        }
-    )
-    _persist_hosted_role_state(
-        conversation_id,
-        turn_id,
-        profile=profile,
-        role_stage=role_stage,
-        role_label=role_label,
-        state=display_state,
-        content_fallback=display_result,
-    )
-    return display_result, control
-
-
-def _review_requests_rework(result: str) -> bool:
-    """Fail closed unless the reviewer emits one strict, consistent PASS."""
-
-    return _hosted_reviewer_verdict(result) != "pass"
-
-
 def _hosted_chat_attachment_context(
     conversation: dict[str, Any],
     run: dict[str, Any],
@@ -14593,1217 +14283,6 @@ def execute_hosted_chat(
         persisted_run,
         fallback_result=result,
     )
-
-
-def _persist_hosted_supervisor_check(
-    conversation_id: str,
-    turn_id: str,
-    check_id: str,
-    patch: dict[str, Any],
-) -> dict[str, Any]:
-    """Merge one durable supervisor checkpoint without replacing its siblings."""
-
-    with _STATE_LOCK:
-        state = load_single_state()
-        conversation = _conversation_by_id(state, conversation_id)
-        run = (conversation.get("hosted_turns") or {}).get(turn_id)
-        if not isinstance(run, dict):
-            raise RuntimeError("托管任务记录不存在")
-        checks = run.get("supervisor_checks")
-        if not isinstance(checks, dict):
-            checks = {}
-            run["supervisor_checks"] = checks
-        current = checks.get(check_id)
-        record = dict(current) if isinstance(current, dict) else {"id": check_id}
-        record.update(_redact_sensitive(dict(patch)))
-        record["updated_at"] = int(time.time() * 1000)
-        checks[check_id] = record
-        run["updated_at"] = record["updated_at"]
-        conversation["updated_at"] = record["updated_at"]
-        save_single_state(state)
-        persisted = dict(record)
-    _notify_hosted_update(conversation_id)
-    return persisted
-
-
-def _hosted_supervisor_control(result: str) -> Optional[dict[str, Any]]:
-    strict = _strict_hosted_control_result(
-        result,
-        protocol="hermes.supervision.v1",
-        outcomes=("PASS", "CORRECTIVE_ACTION"),
-        required_checks=_HOSTED_SUPERVISION_CHECKS,
-        optional_keys=("directional",),
-    )
-    if strict is not None:
-        return strict
-    # Remote executor workers sometimes paraphrase the verdict instead of
-    # emitting the closed schema (format drift on long contexts). When the
-    # narrative carries an unambiguous verdict marker, downgrade to a
-    # structured decision so the control gate keeps working; the display
-    # layer marks these as relaxed-interpretation results.
-    if _control_result_has_json_envelope(result):
-        return None
-    text = str(result or "").strip()
-    if re.search(r"(?:判定|结论|结果为|verdict)\s*[:：]?\s*PASS\b", text, re.I):
-        return {
-            "protocol": "hermes.supervision.v1",
-            "verdict": "PASS",
-            "checks": {key: True for key in _HOSTED_SUPERVISION_CHECKS},
-            "blockers": [],
-            "findings": [],
-            "required_actions": [],
-            "directional": False,
-            "_relaxed_interpretation": True,
-        }
-    if re.search(
-        r"(?:判定|结论|结果为|verdict)\s*[:：]?\s*CORRECTIVE_ACTION\b",
-        text,
-        re.I,
-    ):
-        return {
-            "protocol": "hermes.supervision.v1",
-            "verdict": "CORRECTIVE_ACTION",
-            "checks": {key: False for key in _HOSTED_SUPERVISION_CHECKS},
-            "blockers": [text[:2000]],
-            "findings": [text[:2000]],
-            "required_actions": ["依据叙述事实整改后重新提交检查点。"],
-            "directional": False,
-            "_relaxed_interpretation": True,
-        }
-    # Broader narrative fallback: workers often write "checkpoint ...: PASS."
-    # or "verdict: PASS" with the JSON omitted entirely. A bare PASS verdict
-    # word at a sentence boundary, with no corrective language nearby, is an
-    # unambiguous success marker; CORRECTIVE_ACTION/REWORK/FAIL wording maps
-    # to a corrective decision. Keep this last so strict JSON and the
-    # prefixed markers above win when both are present.
-    #
-    # Negation guard: models commonly say "未发现问题 / 未制造返工 / 无需整改"
-    # when passing — those corrective words must not flip a PASS into a
-    # corrective decision. A corrective marker counts only when it is NOT
-    # negated within the preceding few characters (未/无/不/没有/无需/不存).
-    _corrective_pattern = re.compile(
-        r"(?<![A-Za-z])(?:CORRECTIVE_ACTION|REWORK|FAILED|失败|返工|整改|不通过)(?![A-Za-z])",
-        re.I,
-    )
-    # Neutral/structural uses of corrective wording that must NOT flip a PASS:
-    #  - checkpoint names like "审阅与返工交接" / "返工记录" / "rework_history"
-    #  - negated clauses "未发现问题" / "未制造返工" / "无需整改"
-    #  - status enums like "active/inactive/failed" or "running/stopped/failed"
-    #    (the failed token is a service/step state, not a control verdict)
-    _corrective_neutral = re.compile(
-        r"(?:返工交接|返工记录|返工历史|rework_history|rework_log|rework_items|返工列表)"
-        r"|(?:未|无|不|没有|无需|未发现|没有发现|不存在|避免|排除)[^。；;\n]{0,6}?"
-        r"(?<![A-Za-z])(?:CORRECTIVE_ACTION|REWORK|FAILED|失败|返工|整改|不通过)(?![A-Za-z])"
-        r"|(?:[A-Za-z]+/){0,2}(?:active|running|stopped|inactive|pending|completed)/failed\b",
-        re.I,
-    )
-    _corrective_matches = [
-        m for m in _corrective_pattern.finditer(text)
-        if not _corrective_neutral.search(
-            text[max(0, m.start() - 24) : min(len(text), m.end() + 24)]
-        )
-    ]
-    _has_plain_corrective = bool(_corrective_matches)
-    if re.search(
-        r"(?<![A-Za-z])(?:PASS|通过了|通过检查|检查通过)(?![A-Za-z])",
-        text,
-        re.I,
-    ) and not _has_plain_corrective:
-        return {
-            "protocol": "hermes.supervision.v1",
-            "verdict": "PASS",
-            "checks": {key: True for key in _HOSTED_SUPERVISION_CHECKS},
-            "blockers": [],
-            "findings": [],
-            "required_actions": [],
-            "directional": False,
-            "_relaxed_interpretation": True,
-            "_relaxed_reason": "narrative verdict marker",
-        }
-    if _has_plain_corrective:
-        return {
-            "protocol": "hermes.supervision.v1",
-            "verdict": "CORRECTIVE_ACTION",
-            "checks": {key: False for key in _HOSTED_SUPERVISION_CHECKS},
-            "blockers": [text[:2000]],
-            "findings": [text[:2000]],
-            "required_actions": ["依据叙述事实整改后重新提交检查点。"],
-            "directional": False,
-            "_relaxed_interpretation": True,
-            "_relaxed_reason": "narrative verdict marker",
-        }
-    return None
-
-
-def _hosted_supervisor_verdict(result: str) -> str:
-    control = _hosted_supervisor_control(result)
-    return str(control["verdict"]).lower() if control is not None else "unknown"
-
-
-def _hosted_supervisor_protocol_prompt() -> str:
-    return (
-        "最终控制结果只允许输出一个 JSON 对象，不得使用 Markdown 代码块、引用、"
-        "解释正文、前后缀或第二个对象。严格 schema："
-        '{"protocol":"hermes.supervision.v1",'
-        '"verdict":"PASS|CORRECTIVE_ACTION",'
-        '"checks":{"user_task_completed":true|false},"blockers":["..."],'
-        '"findings":["..."],"required_actions":["..."],'
-        '"directional":true|false}。'
-        "键集、类型和枚举必须完全一致（directional 为可选布尔键，省略时视为 false）。"
-        "监督只有一条标准：用户的原始任务。在计划/派发检查点，user_task_completed "
-        "的含义是计划覆盖了用户任务的每一项；在产出/交接/汇报检查点，含义是用户任务"
-        "的每一项已有完成的结果。"
-        "判定为 PASS 时：user_task_completed 为 true，三个数组必须全空，且除该 JSON "
-        "外不得输出任何解释文字——直接签字，不做汇报。禁止因流程、证据形式、边界、"
-        "格式、详略或风格问题要求整改。"
-        "判定为 CORRECTIVE_ACTION 时：user_task_completed 为 false（用户任务存在未覆"
-        "盖或未完成的事项），directional 仅在计划方向偏离用户目标时为 true；blockers "
-        "写清用户任务中哪一项未完成，required_actions 写清要接着完成的具体事项。"
-    )
-
-
-def _bounded_supervisor_evidence(
-    value: Any,
-    *,
-    depth: int = 0,
-) -> tuple[Any, bool]:
-    """Return field-preserving bounded evidence and whether anything was omitted."""
-
-    if depth >= 8:
-        return "[maximum depth exceeded]", True
-    if isinstance(value, dict):
-        bounded: dict[str, Any] = {}
-        truncated = len(value) > 100
-        for key in sorted(value, key=lambda item: str(item))[:100]:
-            child, child_truncated = _bounded_supervisor_evidence(
-                value[key],
-                depth=depth + 1,
-            )
-            bounded[str(key)[:256]] = child
-            truncated = truncated or child_truncated
-        return bounded, truncated
-    if isinstance(value, (list, tuple, set)):
-        values = list(value)
-        bounded_items: list[Any] = []
-        truncated = len(values) > 100
-        for item in values[:100]:
-            child, child_truncated = _bounded_supervisor_evidence(
-                item,
-                depth=depth + 1,
-            )
-            bounded_items.append(child)
-            truncated = truncated or child_truncated
-        return bounded_items, truncated
-    if isinstance(value, str) and len(value) > 4000:
-        return value[:4000], True
-    if value is None or isinstance(value, (str, int, float, bool)):
-        return value, False
-    rendered = str(value)
-    return (rendered[:4000], len(rendered) > 4000)
-
-
-def _require_supervisor_pass(
-    checkpoint_label: str,
-    check: dict[str, Any],
-    *,
-    conversation_id: str = "",
-    turn_id: str = "",
-) -> None:
-    """Make supervision a control gate instead of advisory prompt text."""
-
-    verdict = str(check.get("verdict") or "unknown")
-    status = str(check.get("status") or "failed")
-    if status == "completed" and verdict == "pass":
-        return
-    supervisor_verdict_record = (
-        check.get("supervisor_verdict")
-        if isinstance(check.get("supervisor_verdict"), dict)
-        else {}
-    )
-    directional = (
-        bool(supervisor_verdict_record.get("directional"))
-        and verdict == "corrective_action"
-    )
-    finding = str(
-        check.get("display_result") or check.get("result") or ""
-    ).strip()
-    reason = (
-        f"监督检查判定方案方向性问题，需回到计划阶段从头执行：{checkpoint_label}"
-        if directional
-        else f"监督检查要求返工：{checkpoint_label}"
-        if verdict == "corrective_action"
-        else f"监督检查未形成可验证结论：{checkpoint_label}"
-    )
-    if conversation_id and turn_id:
-        now = int(time.time() * 1000)
-        _persist_hosted_turn(
-            conversation_id,
-            turn_id,
-            patch={
-                "status": "failed",
-                "stage": "failed",
-                "error": reason,
-                "supervisor_corrective_action": {
-                    "checkpoint": checkpoint_label,
-                    "verdict": verdict,
-                    "directional": directional,
-                    "finding": finding,
-                    "required_action": reason,
-                    "created_at": now,
-                },
-                "completed_at": now,
-                "notification": _completion_notification_record(
-                    conversation_id,
-                    turn_id,
-                    "failed",
-                    reason,
-                ),
-            },
-            message={
-                "role": "assistant",
-                "name": "supervisor",
-                "content": "\n\n".join(item for item in (reason, finding) if item),
-                "status": "failed",
-                "kind": "message",
-                "meta": {
-                    "role_stage": "supervisor.corrective",
-                    "base_role_stage": "supervisor",
-                    "phase": "failed",
-                    "message_key": f"{turn_id}:supervisor:corrective:{checkpoint_label}",
-                    "role_label": _HERMES_SUPERVISOR_LABEL,
-                    "profile": "supervisor",
-                    "final_report": False,
-                },
-            },
-        )
-    if verdict == "corrective_action":
-        raise RuntimeError(reason)
-    raise RuntimeError(reason)
-
-
-def _emit_rework_state_event(
-    conversation_id: str,
-    turn_id: str,
-    *,
-    phase: str,
-    rework_round: int,
-    checkpoint_label: str,
-    feedback: str,
-) -> None:
-    """Emit rework state transitions for the mobile UI.
-
-    phase="started" → "正在打回给 worker"；phase="dispatched" → "已打回给
-    worker 重做"。Rendered as status chips on the rework card.
-    """
-    try:
-        with _STATE_LOCK:
-            state = load_single_state()
-            conversation = _conversation_by_id(state, conversation_id)
-            append_hosted_event(
-                conversation,
-                conversation_id=conversation_id,
-                turn_id=turn_id,
-                role_stage="rework",
-                event_type=f"rework.{phase}",
-                entity_id=f"rework:{rework_round}",
-                idempotency_key=f"rework-{phase}:{turn_id}:{rework_round}",
-                account_generation=_account_generation_for_owner(
-                    str(conversation.get("owner_id") or LOCAL_OWNER_ID)
-                ),
-                payload={
-                    "rework_round": int(rework_round),
-                    "checkpoint": str(checkpoint_label or ""),
-                    "feedback": str(feedback or "")[:4000],
-                },
-            )
-            save_single_state(state)
-            _notify_hosted_update(conversation_id)
-    except Exception:
-        logger.exception("rework state event failed")
-
-
-
-def _supervisor_result_contradicts_verdict(result: str, verdict: str) -> bool:
-    """Detect a cached supervisor verdict that contradicts its own text.
-
-    A pre-upgrade (or model-error) record may contain a PASS verdict while
-    the result text explicitly says the check did not pass. Trusting such a
-    cache would let the supervisor gate pass without revalidation.
-    """
-    if verdict not in {"pass", "corrective_action"}:
-        return False
-    text = str(result or "").strip()
-    if not text:
-        return False
-    fail_marker = re.compile(
-        r"(?:没有通过|未通过|不通过|不能通过|无法通过|检查失败|校验失败|"
-        r"测试失败|审核不通过|审阅不通过|FAILED|FAIL\b)",
-        re.I,
-    )
-    neutral = re.compile(
-        r"(?:没有发现|未发现|无|不存在|没有|未出现)"
-        r"[^。；;\n]{0,8}?(?:未通过|不通过|失败|FAILED)",
-        re.I,
-    )
-    for match in fail_marker.finditer(text):
-        window = text[max(0, match.start() - 12):match.end() + 12]
-        if neutral.search(window):
-            continue
-        return True
-    return False
-
-
-# --- Companion supervision (伴随监督) ---------------------------------------
-# The supervisor's stated design is continuous oversight ("群聊拉起即开始
-# 监督"), but the gate implementation only fires at stage boundaries.  These
-# helpers run a lightweight supervisor thread alongside each supervised local
-# role: it tails the persisted role state, makes a few small delta-scoped
-# checks while the stage runs, and can raise an urgent @ intervention through
-# the SAME mid-run steer delivery the user-facing endpoint uses.  Companion
-# failures must never break the stage: every path is best-effort.
-
-# Companion supervision must not put an extra model call in the critical path
-# of every short worker stage. A 60-second observation cadence still catches
-# drift on real work while leaving bounded tasks to the deterministic gate.
-_HOSTED_COMPANION_POLL_SECONDS = 60.0
-_HOSTED_COMPANION_MIN_CALL_SECONDS = 90.0
-_HOSTED_COMPANION_MAX_CALLS = 4
-_HOSTED_COMPANION_MAX_URGENT = 2
-_HOSTED_COMPANION_MAX_LIFETIME_SECONDS = 1800.0
-_HOSTED_COMPANION_DELTA_CHARS = 3000
-_HOSTED_COMPANION_NOTE_MAX_CHARS = 600
-_HOSTED_COMPANION_NOTES_KEPT = 20
-_HOSTED_COMPANION_STAGE_PREFIXES = frozenset(
-    {"worker", "reviewer", "reporter", "dispatcher", "manager"}
-)
-
-
-def _hosted_companion_stage_eligible(role_stage: str) -> bool:
-    """Companion model checks are removed from the dispatcher/worker flow."""
-    return False
-_HOSTED_COMPANION_REGISTRY: dict[tuple[str, str], dict[str, Any]] = {}
-_HOSTED_COMPANION_REGISTRY_LOCK = threading.Lock()
-
-
-def _hosted_companion_protocol_prompt() -> str:
-    return "\n".join(
-        (
-            "【伴随检查输出协议】",
-            "只输出一个 JSON 对象，无代码块、无解释文字。schema：",
-            '{"notes":"...","urgent":true|false,"urgent_message":"...","directional":true|false}',
-            "notes：仅记录本次新增观察，不超过 600 字；没有新发现就写“无新增发现”，不要复述已覆盖内容。",
-            "urgent：仅当发现可立即纠正的局部问题时为 true（不影响方案方向）；",
-            "urgent_message 按“@成员名：已观察到的事实；违反的职责边界；必须整改的动作；完成时需提交的验收证据”格式，"
-            "只指出问题位置和整改动作，不要求从头重做。",
-            "directional：仅当发现影响整个方案方向的问题时为 true（此时 urgent 必须为 false，留给关卡处理）。",
-        )
-    )
-
-
-def _hosted_companion_role_snapshot(
-    conversation_id: str,
-    turn_id: str,
-    role_stage: str,
-) -> Optional[dict[str, Any]]:
-    """Read-only view of the currently persisted role state for one stage."""
-
-    with _STATE_LOCK:
-        state = load_single_state()
-        conversation = _conversation_by_id(state, conversation_id)
-        run = (conversation.get("hosted_turns") or {}).get(turn_id)
-        if not isinstance(run, dict):
-            return None
-        role_state = (run.get("role_events") or {}).get(role_stage)
-        if not isinstance(role_state, dict):
-            return {
-                "status": "",
-                "turn_status": str(run.get("status") or ""),
-                "content_len": 0,
-                "milestone_count": 0,
-                "activities_len": 0,
-                "content_tail": "",
-            }
-        content = str(role_state.get("content") or "")
-        return {
-            "status": str(role_state.get("status") or ""),
-            "turn_status": str(run.get("status") or ""),
-            "content_len": len(content),
-            "milestone_count": int(role_state.get("milestone_count") or 0),
-            "activities_len": len(role_state.get("activities") or []),
-            "content_tail": content[-_HOSTED_COMPANION_DELTA_CHARS:],
-        }
-
-
-def _hosted_companion_parse(result: str) -> Optional[dict[str, Any]]:
-    parsed = _strict_json_object(str(result or ""))
-    if not isinstance(parsed, dict):
-        return None
-    if not {"notes", "urgent", "directional"} <= set(parsed):
-        return None
-    if type(parsed.get("urgent")) is not bool or type(parsed.get("directional")) is not bool:
-        return None
-    if not isinstance(parsed.get("notes"), str):
-        return None
-    message = parsed.get("urgent_message")
-    if message is not None and not isinstance(message, str):
-        return None
-    return {
-        "notes": parsed["notes"][:_HOSTED_COMPANION_NOTE_MAX_CHARS],
-        "urgent": parsed["urgent"] and not parsed["directional"],
-        "urgent_message": str(message or "").strip()[:1200],
-        "directional": parsed["directional"],
-    }
-
-
-def _persist_hosted_companion_record(
-    conversation_id: str,
-    turn_id: str,
-    role_stage: str,
-    patch: dict[str, Any],
-) -> None:
-    """Merge one companion record; never touches supervisor_checks trimming."""
-
-    now = int(time.time() * 1000)
-    with _STATE_LOCK:
-        state = load_single_state()
-        conversation = _conversation_by_id(state, conversation_id)
-        run = (conversation.get("hosted_turns") or {}).get(turn_id)
-        if not isinstance(run, dict):
-            return
-        bucket = run.get("supervisor_companion")
-        if not isinstance(bucket, dict):
-            bucket = {}
-            run["supervisor_companion"] = bucket
-        record = bucket.get(role_stage)
-        record = dict(record) if isinstance(record, dict) else {}
-        record.update(_redact_sensitive(dict(patch)))
-        record["role_stage"] = role_stage
-        record["updated_at"] = now
-        bucket[role_stage] = record
-        run["updated_at"] = now
-        conversation["updated_at"] = now
-        save_single_state(state)
-
-
-def _append_supervisor_companion_intervention(
-    conversation_id: str,
-    turn_id: str,
-    *,
-    role_stage: str,
-    profile: str,
-    message: str,
-) -> Optional[str]:
-    """Raise one urgent @ steer through the standard mid-run delivery path."""
-
-    content = f"【监督者当场纠偏】{str(message or '').strip()}"[:4000]
-    if not str(message or "").strip():
-        return None
-    target_role = _hosted_stage_target_role(role_stage, profile)
-    now = int(time.time() * 1000)
-    intervention_id = f"companion_{uuid.uuid4().hex[:20]}"
-    with _STATE_LOCK:
-        state = load_single_state()
-        conversation = _conversation_by_id(state, conversation_id)
-        run = (conversation.get("hosted_turns") or {}).get(turn_id)
-        if not isinstance(run, dict):
-            return None
-        if str(run.get("status") or "queued") in _HOSTED_TERMINAL_STATUSES:
-            return None
-        interventions = run.get("interventions")
-        if not isinstance(interventions, list):
-            interventions = []
-            run["interventions"] = interventions
-        interventions.append(
-            {
-                "id": intervention_id,
-                "content": content,
-                "targets": [target_role],
-                "target_profiles": [str(profile)],
-                "status": "pending",
-                "delivery": "steer",
-                "queue_mode": "one_at_a_time",
-                "queued_for_future_stage": False,
-                "source": "supervisor_companion",
-                "created_at": now,
-                "updated_at": now,
-            }
-        )
-        message_record = _append_message(
-            conversation,
-            role="assistant",
-            name=_HERMES_SUPERVISOR_LABEL,
-            content=content,
-            status="completed",
-            meta={
-                "intervention": True,
-                "intervention_for": [target_role],
-                "intervention_profiles": [str(profile)],
-                "runtime_turn_id": turn_id,
-                "source": "supervisor_companion",
-            },
-        )
-        message_record["id"] = intervention_id
-        _project_native_message(message_record)
-        run["updated_at"] = now
-        conversation["updated_at"] = now
-        save_single_state(state)
-    _notify_hosted_update(conversation_id)
-    return intervention_id
-
-
-def _hosted_companion_loop(
-    handle: dict[str, Any],
-    conversation_id: str,
-    turn_id: str,
-    role_stage: str,
-    profile: str,
-    runner: Callable[..., str],
-    artifact_context: Optional[dict[str, str]] = None,
-) -> None:
-    """Watch one running role; small delta checks; urgent steer when needed."""
-
-    logger = logging.getLogger(__name__)
-    try:
-        while not handle["stop"].wait(_HOSTED_COMPANION_POLL_SECONDS):
-            if time.time() - handle["started_at"] > _HOSTED_COMPANION_MAX_LIFETIME_SECONDS:
-                break
-            snapshot = _hosted_companion_role_snapshot(
-                conversation_id,
-                turn_id,
-                role_stage,
-            )
-            if snapshot is None:
-                break
-            if str(snapshot.get("turn_status") or "") in _HOSTED_TERMINAL_STATUSES:
-                break
-            if str(snapshot.get("status") or "") in _HOSTED_TERMINAL_STATUSES:
-                break
-            change_key = (
-                snapshot.get("content_len"),
-                snapshot.get("milestone_count"),
-                snapshot.get("activities_len"),
-            )
-            now = time.monotonic()
-            if (
-                change_key == handle["last_key"]
-                or handle["calls"] >= _HOSTED_COMPANION_MAX_CALLS
-                or now - handle["last_call_at"] < _HOSTED_COMPANION_MIN_CALL_SECONDS
-            ):
-                continue
-            handle["last_key"] = change_key
-            handle["last_call_at"] = now
-            handle["calls"] += 1
-            notes_text = "\n".join(
-                f"- {note}" for note in handle["notes"][-5:]
-            ) or "（暂无）"
-            prompt = "\n".join(
-                item
-                for item in (
-                    supervisor_role_prompt(),
-                    "【伴随检查（阶段进行中的滚动抽查）】",
-                    f"正在观察的角色阶段：{role_stage}（profile={profile}）。",
-                    "该角色仍在执行中。你只依据下方“新增内容”更新滚动观察记录，不重复检查已覆盖内容，"
-                    "不下最终验收结论（最终验收在关卡进行），不替代该角色执行任何工作。",
-                    _hosted_companion_protocol_prompt(),
-                    "【既有观察记录】",
-                    notes_text,
-                    "【自上次检查以来的新增内容】",
-                    str(snapshot.get("content_tail") or "") or "（无文本增量，仅有活动变化）",
-                )
-                if str(item or "").strip()
-            )
-            result = _invoke_profile_runner(
-                runner,
-                "supervisor",
-                prompt,
-                lambda event: None,
-                "",
-                "",
-                lambda: bool(handle["stop"].is_set()),
-                artifact_context,
-            )
-            parsed = _hosted_companion_parse(result)
-            if parsed is None:
-                continue
-            handle["notes"].append(
-                f"[{datetime.now().strftime('%H:%M:%S')}] {parsed['notes']}"
-            )
-            handle["notes"] = handle["notes"][-_HOSTED_COMPANION_NOTES_KEPT:]
-            if parsed["directional"]:
-                handle["directional_hint"] = True
-            _persist_hosted_companion_record(
-                conversation_id,
-                turn_id,
-                role_stage,
-                {
-                    "notes": list(handle["notes"]),
-                    "checks_made": handle["calls"],
-                    "urgent_sent": handle["urgent_sent"],
-                    "directional_hint": handle["directional_hint"],
-                    "profile": profile,
-                },
-            )
-            if (
-                parsed["urgent"]
-                and parsed["urgent_message"]
-                and handle["urgent_sent"] < _HOSTED_COMPANION_MAX_URGENT
-            ):
-                intervention_id = _append_supervisor_companion_intervention(
-                    conversation_id,
-                    turn_id,
-                    role_stage=role_stage,
-                    profile=profile,
-                    message=parsed["urgent_message"],
-                )
-                if intervention_id:
-                    handle["urgent_sent"] += 1
-                    _persist_hosted_companion_record(
-                        conversation_id,
-                        turn_id,
-                        role_stage,
-                        {
-                            "notes": list(handle["notes"]),
-                            "checks_made": handle["calls"],
-                            "urgent_sent": handle["urgent_sent"],
-                            "directional_hint": handle["directional_hint"],
-                            "last_intervention_id": intervention_id,
-                            "profile": profile,
-                        },
-                    )
-    except Exception:
-        logger.exception(
-            "hosted companion supervisor failed for %s/%s",
-            turn_id,
-            role_stage,
-        )
-    finally:
-        # Natural exit (terminal stage/turn, lifetime cap): unregister so the
-        # registry never retains dead handles in a long-lived process.
-        registry_key = handle.get("registry_key")
-        if isinstance(registry_key, tuple):
-            with _HOSTED_COMPANION_REGISTRY_LOCK:
-                if _HOSTED_COMPANION_REGISTRY.get(registry_key) is handle:
-                    del _HOSTED_COMPANION_REGISTRY[registry_key]
-
-
-def _start_hosted_companion(
-    conversation_id: str,
-    turn_id: str,
-    *,
-    role_stage: str,
-    profile: str,
-    runner: Optional[Callable[..., str]],
-    artifact_context: Optional[dict[str, str]] = None,
-) -> Optional[dict[str, Any]]:
-    # The hosted workflow no longer has a companion supervisor model. Keep the
-    # symbol as a migration-safe no-op for callers that have not been upgraded
-    # yet; dispatcher/worker execution must never start a second model loop.
-    return None
-    key = (str(turn_id), str(role_stage))
-    with _HOSTED_COMPANION_REGISTRY_LOCK:
-        existing = _HOSTED_COMPANION_REGISTRY.get(key)
-        if isinstance(existing, dict) and existing["thread"].is_alive():
-            return existing
-        stop = threading.Event()
-        handle: dict[str, Any] = {
-            "stop": stop,
-            "thread": None,
-            "notes": [],
-            "last_key": None,
-            "last_call_at": 0.0,
-            "calls": 0,
-            "urgent_sent": 0,
-            "directional_hint": False,
-            "started_at": time.time(),
-            "registry_key": key,
-        }
-        thread = threading.Thread(
-            target=_hosted_companion_loop,
-            args=(
-                handle,
-                conversation_id,
-                turn_id,
-                role_stage,
-                profile,
-                runner,
-                artifact_context,
-            ),
-            name=f"hosted-companion-{str(turn_id)[-8:]}-{str(role_stage).split(':', 1)[0]}",
-            daemon=True,
-        )
-        handle["thread"] = thread
-        _HOSTED_COMPANION_REGISTRY[key] = handle
-        thread.start()
-        return handle
-
-
-def _stop_hosted_companion(handle: Optional[dict[str, Any]]) -> None:
-    if not isinstance(handle, dict):
-        return
-    handle["stop"].set()
-    key = handle.get("registry_key")
-    if isinstance(key, tuple):
-        with _HOSTED_COMPANION_REGISTRY_LOCK:
-            if _HOSTED_COMPANION_REGISTRY.get(key) is handle:
-                del _HOSTED_COMPANION_REGISTRY[key]
-
-
-def _hosted_companion_notes_text(
-    conversation_id: str,
-    turn_id: str,
-) -> str:
-    """Render the turn's companion notes as bounded gate-prompt context."""
-
-    with _STATE_LOCK:
-        state = load_single_state()
-        conversation = _conversation_by_id(state, conversation_id)
-        run = (conversation.get("hosted_turns") or {}).get(turn_id)
-        bucket = run.get("supervisor_companion") if isinstance(run, dict) else None
-        if not isinstance(bucket, dict) or not bucket:
-            return ""
-        lines: list[str] = []
-        for stage in sorted(bucket):
-            record = bucket.get(stage)
-            if not isinstance(record, dict):
-                continue
-            notes = [
-                str(item).strip()
-                for item in record.get("notes") or []
-                if str(item).strip()
-            ]
-            if not notes:
-                continue
-            hint = "；含方向性疑点" if record.get("directional_hint") else ""
-            lines.append(f"- {stage}{hint}：" + " / ".join(notes[-3:]))
-    return "\n".join(lines)[:4000]
-
-
-def _run_hosted_supervisor_check(
-    conversation_id: str,
-    turn_id: str,
-    *,
-    check_id: str,
-    checkpoint_label: str,
-    evidence: dict[str, Any],
-    runner: Callable[..., str],
-    remote: bool,
-    kanban_task_id: str = "",
-    visible: bool = True,
-) -> tuple[str, str, dict[str, Any]]:
-    """Retired compatibility entry point for the former supervisor lane."""
-
-    raise RuntimeError("Supervisor checks are no longer supported")
-
-    redacted_evidence = _redact_sensitive(dict(evidence))
-    with _STATE_LOCK:
-        current_state = load_single_state()
-        current_conversation = _conversation_by_id(current_state, conversation_id)
-        current_run = (current_conversation.get("hosted_turns") or {}).get(turn_id)
-        current_run = current_run if isinstance(current_run, dict) else {}
-    plan_revision = int(current_run.get("turn_plan_revision") or 0)
-    source_revision = str(
-        redacted_evidence.get("source_revision")
-        or redacted_evidence.get("git_revision")
-        or redacted_evidence.get("revision")
-        or f"turn:{turn_id}:plan:{plan_revision or 0}"
-    ).strip()
-    prompt_version = str(
-        redacted_evidence.get("prompt_version")
-        or f"hermes.supervision.v1:{hashlib.sha256(_hosted_supervisor_protocol_prompt().encode('utf-8')).hexdigest()[:16]}"
-    ).strip()
-    if source_revision:
-        redacted_evidence.setdefault("source_revision", source_revision)
-    redacted_evidence.setdefault("prompt_version", prompt_version)
-    evidence_json = json.dumps(
-        redacted_evidence,
-        ensure_ascii=False,
-        default=str,
-        sort_keys=True,
-        separators=(",", ":"),
-    )
-    evidence_digest = hashlib.sha256(evidence_json.encode("utf-8")).hexdigest()
-    bounded_evidence, evidence_truncated = _bounded_supervisor_evidence(
-        redacted_evidence
-    )
-    bounded_evidence_json = json.dumps(
-        bounded_evidence,
-        ensure_ascii=False,
-        default=str,
-        sort_keys=True,
-        separators=(",", ":"),
-    )
-    if len(bounded_evidence_json.encode("utf-8")) > 20000:
-        evidence_truncated = True
-        bounded_evidence = {
-            "error": "bounded evidence exceeded the supervisor payload limit",
-            "evidence_sha256": evidence_digest,
-        }
-        bounded_evidence_json = json.dumps(
-            bounded_evidence,
-            ensure_ascii=False,
-            sort_keys=True,
-        )
-
-    cached_result_invalid = False
-    expected_artifact_digest = str(redacted_evidence.get("artifact_digest") or "").strip()
-    if not expected_artifact_digest:
-        expected_artifact_digest = (
-            digest_json(redacted_evidence.get("artifacts"))
-            if redacted_evidence.get("artifacts")
-            else "none"
-        )
-    with _STATE_LOCK:
-        state = load_single_state()
-        conversation = _conversation_by_id(state, conversation_id)
-        run = (conversation.get("hosted_turns") or {}).get(turn_id)
-        existing = (
-            (run.get("supervisor_checks") or {}).get(check_id)
-            if isinstance(run, dict)
-            else None
-        )
-        if (
-            isinstance(existing, dict)
-            and str(existing.get("status") or "") == "completed"
-            and str(existing.get("result") or "").strip()
-            and (
-                isinstance(existing.get("supervisor_verdict"), dict)
-                and bool((existing.get("supervisor_verdict") or {}).get("valid"))
-                and str((existing.get("supervisor_verdict") or {}).get("schema_version") or "")
-                == "hermes.supervisor-verdict.v1"
-                and str((existing.get("supervisor_verdict") or {}).get("artifact_digest") or "")
-                == expected_artifact_digest
-                and bool((existing.get("supervisor_verdict") or {}).get("evidence_refs"))
-                and str((existing.get("supervisor_verdict") or {}).get("source_revision") or "").strip()
-                and str((existing.get("supervisor_verdict") or {}).get("prompt_version") or "").strip()
-            )
-            and hmac.compare_digest(
-                str(existing.get("evidence_sha256") or ""),
-                evidence_digest,
-            )
-            and not existing.get("evidence_truncated")
-        ):
-            result = str(existing["result"])
-            cached_verdict = _hosted_supervisor_verdict(result)
-            if (
-                cached_verdict in {"pass", "corrective_action"}
-                and hmac.compare_digest(
-                    str(existing.get("verdict") or ""),
-                    cached_verdict,
-                )
-                and not _supervisor_result_contradicts_verdict(
-                    result,
-                    cached_verdict,
-                )
-            ):
-                display_result = str(existing.get("display_result") or "").strip()
-                if not display_result:
-                    display_result = _hosted_control_display(
-                        result,
-                        kind="supervisor",
-                        checkpoint_label=checkpoint_label,
-                    )
-                cached_state = dict(existing)
-                _HOSTED_PROMPT_METRICS.observe(
-                    schema_valid=True,
-                    verdict=cached_verdict,
-                    prompt_cache_hit=True,
-                    token_cost=0,
-                    context=f"{check_id}:cache",
-                )
-                return result, "completed", cached_state
-            cached_result_invalid = True
-        elif (
-            isinstance(existing, dict)
-            and str(existing.get("status") or "") == "completed"
-            and str(existing.get("result") or "").strip()
-        ):
-            # A completed pre-upgrade or partially migrated record is not a
-            # reusable role result. Mark it invalid so execution gets a fresh
-            # role_stage instead of returning the completed role projection.
-            cached_result_invalid = True
-
-    now = int(time.time() * 1000)
-    _persist_hosted_supervisor_check(
-        conversation_id,
-        turn_id,
-        check_id,
-        {
-            "checkpoint": checkpoint_label,
-            "status": "running",
-            "evidence_sha256": evidence_digest,
-            "evidence": bounded_evidence,
-            "evidence_truncated": evidence_truncated,
-            "started_at": now,
-        },
-    )
-    role_stage = f"supervisor:{check_id}"
-    if cached_result_invalid:
-        invalid_digest = hashlib.sha256(
-            str((existing or {}).get("result") or "").encode("utf-8")
-        ).hexdigest()[:12]
-        role_stage = f"{role_stage}:revalidate:{invalid_digest}"
-    elif isinstance(existing, dict) and not hmac.compare_digest(
-        str(existing.get("evidence_sha256") or ""),
-        evidence_digest,
-    ):
-        role_stage = f"{role_stage}:evidence:{evidence_digest[:12]}"
-    companion_notes_text = _hosted_companion_notes_text(conversation_id, turn_id)
-    companion_section = (
-        "\n".join(
-            (
-                "【伴随监督记录（本监督者在各阶段执行期间的滚动观察）】",
-                "以下是你自己在阶段进行中留下的抽查记录，可供本检查点直接引用；"
-                "它们不能替代下方持久化证据，最终判定仍必须基于证据核对。",
-                companion_notes_text,
-            )
-        )
-        if companion_notes_text
-        else ""
-    )
-    prompt = "\n".join(
-        item
-        for item in (
-            supervisor_role_prompt(),
-            hosted_progress_protocol(_HERMES_SUPERVISOR_LABEL),
-            mention_priority_protocol(_HERMES_SUPERVISOR_LABEL),
-            hosted_intervention_context(
-                conversation_id,
-                turn_id,
-                role_stage=role_stage,
-            ),
-            f"当前强制检查点：{checkpoint_label}",
-            "独立核对下方持久化证据。发现问题时必须点名责任角色、说明事实、整改动作和复核证据；没有问题时说明检查范围和通过依据。",
-            (
-                "本检查点在远程执行节点上运行：计划内出现的 task_id、child_ids 等"
-                "标识属于执行节点自管的本地 kanban，监督者无需、也不得在本节点"
-                "数据库验证它们的落库存在性（跨节点隔离），只审查计划结构、任务"
-                "覆盖、角色边界与证据充分性。"
-                if remote
-                else ""
-            ),
-            companion_section,
-            _hosted_supervisor_protocol_prompt(),
-            bounded_evidence_json,
-        )
-        if item
-    )
-    if remote:
-        result, status, role_state = _run_hosted_remote_role(
-            conversation_id,
-            turn_id,
-            profile=_DBB3_MANAGER_PROFILE,
-            role_stage=role_stage,
-            role_label=f"{_HERMES_SUPERVISOR_LABEL} · {checkpoint_label}",
-            prompt=prompt,
-            kanban_task_id=kanban_task_id,
-            start_text=f"正在监督检查：{checkpoint_label}。",
-            artifact_required=False,
-            delivery_context="Return only the supervisor finding; do not create artifacts.",
-            attachment_context="",
-            connector_id="dbb3-primary",
-            visible=visible,
-            remote_supervisor=True,
-        )
-        supervisor_profile = _DBB3_MANAGER_PROFILE
-    else:
-        supervisor_profile = "supervisor"
-        result, status, role_state = _run_hosted_role(
-            conversation_id,
-            turn_id,
-            profile=supervisor_profile,
-            role_stage=role_stage,
-            role_label=f"{_HERMES_SUPERVISOR_LABEL} · {checkpoint_label}",
-            prompt=prompt,
-            runner=runner,
-            kanban_task_id=kanban_task_id,
-            start_text=f"正在监督检查：{checkpoint_label}。",
-            previous_state=(
-                ((run or {}).get("role_events") or {}).get(role_stage)
-                if isinstance(run, dict)
-                else None
-            ),
-            visible=visible,
-        )
-    completed_at = int(time.time() * 1000)
-    verdict = (
-        "unknown"
-        if evidence_truncated or status != "completed"
-        else _hosted_supervisor_verdict(result)
-    )
-    control = _hosted_supervisor_control(result) if not evidence_truncated else None
-    runtime_verdict = build_supervisor_verdict(
-        control,
-        evidence=redacted_evidence,
-        evidence_digest=evidence_digest,
-        artifact_digest=str(redacted_evidence.get("artifact_digest") or ""),
-        source_revision=source_revision,
-        prompt_version=prompt_version,
-        model=str(
-            redacted_evidence.get("model")
-            or role_state.get("actual_model")
-            or ""
-        ),
-    )
-    # The runtime witness is authoritative. A legacy parser may recognize a
-    # narrative marker, but it cannot turn an invalid witness into PASS.
-    if not runtime_verdict.valid:
-        verdict = "unknown"
-    else:
-        verdict = runtime_verdict.verdict
-    persisted_status = (
-        "completed"
-        if status == "completed" and verdict in {"pass", "corrective_action"}
-        else "failed"
-    )
-    _HOSTED_PROMPT_METRICS.observe(
-        schema_valid=runtime_verdict.valid,
-        verdict=verdict,
-        false_pass=(_hosted_supervisor_verdict(result) == "pass" and not runtime_verdict.valid),
-        strict_reject=not runtime_verdict.valid,
-        rework_requested=verdict == "corrective_action",
-        rework_accepted=verdict == "corrective_action" and persisted_status == "completed",
-        prompt_cache_hit=(
-            bool(role_state.get("prompt_cache_hit"))
-            if "prompt_cache_hit" in role_state
-            else None
-        ),
-        token_cost=int(role_state.get("token_cost") or 0),
-        artifact_checked=bool(redacted_evidence.get("artifact_required") or redacted_evidence.get("artifacts")),
-        artifact_accepted=verdict == "pass" and runtime_verdict.artifact_digest not in {"", "none"},
-        context=check_id,
-    )
-    display_result = _hosted_control_display(
-        result,
-        kind="supervisor",
-        checkpoint_label=checkpoint_label,
-    )
-    display_state = dict(role_state)
-    display_state.update({"content": display_result, "status": persisted_status})
-    if visible:
-        _persist_hosted_role_state(
-            conversation_id,
-            turn_id,
-            profile=supervisor_profile,
-            role_stage=role_stage,
-            role_label=f"{_HERMES_SUPERVISOR_LABEL} · {checkpoint_label}",
-            state=display_state,
-            content_fallback=display_result,
-        )
-    else:
-        # Post-report supervision is a server-side publication gate. Its
-        # execution still remains in role_events/supervisor_checks for audit,
-        # but it must not appear after the Reporter answer in the chat stream.
-        with _STATE_LOCK:
-            state = load_single_state()
-            conversation = _conversation_by_id(state, conversation_id)
-            messages = conversation.get("messages") or []
-            retained = [
-                item
-                for item in messages
-                if not (
-                    isinstance(item, dict)
-                    and isinstance(item.get("meta"), dict)
-                    and str(item["meta"].get("runtime_turn_id") or "") == turn_id
-                    and (
-                        str(item["meta"].get("role_stage") or "") == role_stage
-                        or str(item["meta"].get("role_stage") or "").startswith(
-                            f"{role_stage}."
-                        )
-                    )
-                )
-            ]
-            if len(retained) != len(messages):
-                _rewrite_conversation_history_messages(
-                    conversation_id,
-                    lambda history_messages: [
-                        item
-                        for item in history_messages
-                        if not (
-                            isinstance(item.get("meta"), dict)
-                            and str(item["meta"].get("runtime_turn_id") or "") == turn_id
-                            and (
-                                str(item["meta"].get("role_stage") or "") == role_stage
-                                or str(item["meta"].get("role_stage") or "").startswith(
-                                    f"{role_stage}."
-                                )
-                            )
-                        )
-                    ],
-                )
-                conversation["messages"] = retained
-                conversation["updated_at"] = int(time.time() * 1000)
-                save_single_state(state)
-                _notify_hosted_update(conversation_id)
-    persisted = _persist_hosted_supervisor_check(
-        conversation_id,
-        turn_id,
-        check_id,
-        {
-            "checkpoint": checkpoint_label,
-            "status": persisted_status,
-            "result": result,
-            "display_result": display_result,
-            "verdict": verdict,
-            "supervisor_verdict": runtime_verdict.public_dict(),
-            "profile": supervisor_profile,
-            "role_stage": role_stage,
-            "evidence_sha256": evidence_digest,
-            "evidence": bounded_evidence,
-            "evidence_truncated": evidence_truncated,
-            "activities": list(role_state.get("activities") or []),
-            "prompt_metrics": _HOSTED_PROMPT_METRICS.snapshot(),
-            "completed_at": completed_at,
-        },
-    )
-    if visible and verdict in {"pass", "corrective_action"}:
-        # Supervisor verdict card: severity drives the mobile badge/color
-        # (pass = green, corrective = red with rework state changes).
-        try:
-            with _STATE_LOCK:
-                state = load_single_state()
-                conversation = _conversation_by_id(state, conversation_id)
-                append_hosted_event(
-                    conversation,
-                    conversation_id=conversation_id,
-                    turn_id=turn_id,
-                    role_stage=role_stage,
-                    event_type="supervisor.verdict",
-                    entity_id=f"supervisor:{check_id}",
-                    idempotency_key=f"supervisor-verdict:{turn_id}:{check_id}",
-                    account_generation=_account_generation_for_owner(
-                        str(conversation.get("owner_id") or LOCAL_OWNER_ID)
-                    ),
-                    payload={
-                        "checkpoint": str(checkpoint_label),
-                        "verdict": verdict,
-                        "severity": (
-                            "pass"
-                            if verdict == "pass"
-                            else "corrective"
-                        ),
-                        "directional": bool(
-                            (runtime_verdict.public_dict() or {}).get("directional")
-                        ),
-                        "display": str(display_result)[:4000],
-                        # The mobile client's output fallback chain reads
-                        # output/result/summary; duplicate the verdict body so
-                        # the card always renders its text.
-                        "summary": str(display_result)[:4000],
-                        "check_id": str(check_id),
-                        "schema_version": runtime_verdict.schema_version,
-                        "evidence_refs": list(runtime_verdict.evidence_refs),
-                        "artifact_digest": runtime_verdict.artifact_digest,
-                        "source_revision": runtime_verdict.source_revision,
-                        "prompt_version": runtime_verdict.prompt_version,
-                        "evidence_digest": runtime_verdict.evidence_digest,
-                        "witness_valid": runtime_verdict.valid,
-                    },
-                )
-                save_single_state(state)
-                _notify_hosted_update(conversation_id)
-        except Exception:
-            logger.exception("supervisor verdict event failed")
-    return result, persisted_status, persisted
 
 
 def execute_hosted_workflow(
@@ -16154,8 +14633,8 @@ def execute_hosted_workflow(
                 "status": "streaming",
                 "kind": "message",
                 "meta": {
-                    "role_stage": "dispatch.opening",
-                    "base_role_stage": "dispatch",
+                    "role_stage": "dispatcher.opening",
+                    "base_role_stage": "dispatcher",
                     "phase": "opening",
                     "message_key": f"{turn_id}:dispatch:opening",
                     "role_label": "Hermes · 调度",
@@ -16202,7 +14681,8 @@ def execute_hosted_workflow(
                 "status": "completed",
                 "kind": "workflow",
                 "meta": {
-                    "role_stage": "workflow",
+                    "role_stage": "dispatcher.workflow",
+                    "base_role_stage": "dispatcher",
                     "task_id": task_id,
                     "child_ids": child_ids,
                 },
@@ -16211,15 +14691,15 @@ def execute_hosted_workflow(
         if _finish_hosted_turn_if_cancelled(conversation_id, turn_id):
             return
 
-    # Completion is intentionally deterministic.  AI Supervisor/Reviewer
-    # roles are retired; workers report evidence and the server aggregates it.
+    # Completion is intentionally deterministic: workers report evidence and
+    # the server aggregates it without another model turn.
     validation_statuses: dict[str, str] = {}
     validation_findings: dict[str, str] = {}
     # Remote lanes own their kanban on the executor node: the connector
     # creates the local root task and reports its id back via checkpoints.
-    # Hand the supervisor the executor-local id (synced from the manager
-    # checkpoint) so its kanban evidence checks hit real rows instead of
-    # phantom server-side ids.
+    # Preserve the executor-local id (synced from the dispatcher checkpoint)
+    # so remote worker evidence checks hit real rows instead of phantom
+    # server-side ids.
     plan_sync_task_id = task_id
     if remote_workers:
         plan_sync_task_id = str(
@@ -16324,7 +14804,7 @@ def execute_hosted_workflow(
             "status": "completed",
             "kind": "message",
             "meta": {
-                "role_stage": "dispatch",
+                "role_stage": "dispatcher",
                 "role_label": "Hermes · 调度",
                 "profile": "dispatcher",
                 "handoff_to": worker_profiles,
@@ -16601,8 +15081,7 @@ def execute_hosted_workflow(
         claimed_result: str,
     ) -> dict[str, Any]:
         # Deterministic completion check.  A worker result is evidence, not a
-        # second model turn.  This keeps the manager as the sole scheduler and
-        # avoids reintroducing the retired Supervisor/Reviewer roles.
+        # second model turn. This keeps the manager as the sole scheduler.
         sanitized_item_id = _sanitize_hosted_check_id(item["id"])
         item_check_attempts[item["id"]] += 1
         attempt = item_check_attempts[item["id"]]
@@ -16703,8 +15182,7 @@ def execute_hosted_workflow(
         return
 
     # ── 服务器确定性收口校验（零 LLM 调用）──────────────────────────────
-    # Worker 的结果、Todo 状态和必需产物是唯一事实来源；这里不再追问、返工
-    # 或调用已退役的 Supervisor/Reviewer 角色，避免额外模型延迟和角色漂移。
+    # Worker 的结果、Todo 状态和必需产物是唯一事实来源；这里不再启动额外模型回合。
     unfinished_items = [
         item
         for item in todo_items
@@ -16735,7 +15213,7 @@ def execute_hosted_workflow(
     if _finish_hosted_turn_if_cancelled(conversation_id, turn_id):
         return
 
-    # ── 确定性看板汇报（零 LLM 调用）：取代原 Reporter 通道 ────────────────
+    # ── 确定性看板汇报（零 LLM 调用）──────────────────────────────────────
     worker_result = "\n\n".join(
         f"## {profile}\n{worker_results.get(profile, '')}".strip()
         for profile in worker_profiles
@@ -16806,29 +15284,29 @@ def execute_hosted_workflow(
     # 附件快照在汇报前一次性固化；确定性汇报不产生新文件，无 TOCTOU 风险。
     attachments = list(handoff_artifacts)
     missing_required_artifact = artifact_required and not attachments
-    reporter_result = _render_deterministic_hosted_report(
+    final_result = _render_deterministic_hosted_report(
         content=content,
         todo_items=todo_items,
         item_statuses=item_statuses,
         item_results=item_results,
         attachments=attachments,
     )
-    aggregator_status = "completed" if worker_status == "completed" else "failed"
+    aggregation_status = "completed"
     final_status = (
         "completed"
         if (
             worker_status == "completed"
-            and aggregator_status == "completed"
+            and aggregation_status == "completed"
             and all(status == "completed" for status in validation_statuses.values())
             and not missing_required_artifact
         )
         else "failed"
     )
     if missing_required_artifact:
-        reporter_result = "\n\n".join(
+        final_result = "\n\n".join(
             item
             for item in (
-                reporter_result,
+                final_result,
                 "The task required a deliverable file, but no verified file reached the account library.",
             )
             if item
@@ -16851,11 +15329,17 @@ def execute_hosted_workflow(
         conversation_id,
         turn_id,
         patch={
-            "result": reporter_result,
-            # Keep the historical keys as read-only compatibility aliases;
-            # no reporter role or model turn is created.
-            "reporter_result": reporter_result,
-            "reporter_status": aggregator_status,
+            "result": final_result,
+            "aggregation": {
+                "schema_version": "hermes.aggregation.v1",
+                "mode": "deterministic",
+                "status": aggregation_status,
+                "outcome_status": final_status,
+                "result_sha256": hashlib.sha256(
+                    final_result.encode("utf-8")
+                ).hexdigest(),
+                "completed_at": now,
+            },
             "validation_statuses": dict(validation_statuses),
             "validation_verdicts": validation_verdicts,
             "status": final_status,
@@ -16865,13 +15349,13 @@ def execute_hosted_workflow(
                 conversation_id,
                 turn_id,
                 final_status,
-                reporter_result,
+                final_result,
             ),
         },
         message={
             "role": "assistant",
             "name": dispatcher_profile,
-            "content": reporter_result,
+            "content": final_result,
             "status": final_status,
             "kind": "message",
             "meta": {
@@ -16891,7 +15375,7 @@ def execute_hosted_workflow(
         conversation_id,
         turn_id,
         persisted_run,
-        fallback_result=reporter_result,
+        fallback_result=final_result,
     )
 
 
@@ -18865,6 +17349,24 @@ def connector_deployment_health(request: Request) -> dict[str, Any]:
 
     connector = connector_health(request)
     backend = _backend_api()
+    worker_node_id = _WORKER_NODE_BY_CONNECTOR.get(
+        str(connector.get("connector_id") or ""),
+        "",
+    )
+    worker_channel = (
+        _WORKER_CHANNEL.deployment_snapshot(worker_node_id)
+        if worker_node_id
+        else {
+            "node_id": "",
+            "managed_node_id": "",
+            "online": False,
+            "fresh": False,
+            "connection_generation": "",
+            "observed_at": "",
+            "version": "",
+            "release": {},
+        }
+    )
 
     library = _file_library()
     with library.connection() as cloud_conn:
@@ -18953,6 +17455,10 @@ def connector_deployment_health(request: Request) -> dict[str, Any]:
         "manifest_sha256": hashlib.sha256(manifest_bytes).hexdigest(),
         "managed_catalog_readable": managed.get("catalog_rows") is not None,
         "release": release,
+        # This is scoped by the authenticated connector identity. It proves
+        # that the role's newly restarted worker channel, not merely REST and
+        # systemd, has joined this backend process.
+        "worker_channel": worker_channel,
         "databases": databases,
     }
 

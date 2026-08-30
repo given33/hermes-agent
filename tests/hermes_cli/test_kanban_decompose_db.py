@@ -21,13 +21,21 @@ def kanban_home(tmp_path, monkeypatch):
     return home
 
 
-def _create_triage(conn, title="rough idea", body=None, assignee=None, tenant=None):
+def _create_triage(
+    conn,
+    title="rough idea",
+    body=None,
+    assignee=None,
+    tenant=None,
+    session_id=None,
+):
     return kb.create_task(
         conn,
         title=title,
         body=body,
         assignee=assignee,
         tenant=tenant,
+        session_id=session_id,
         triage=True,
     )
 
@@ -88,5 +96,20 @@ def test_decompose_records_audit_comment_and_event(kanban_home):
     assert any(ev.kind == "decomposed" for ev in events)
 
 
-
-
+def test_decompose_children_inherit_hosted_conversation_session(kanban_home):
+    with kb.connect() as conn:
+        tid = _create_triage(conn, session_id="ios-conversation-123")
+        child_ids = kb.decompose_triage_task(
+            conn,
+            tid,
+            root_assignee="dispatcher",
+            children=[
+                {"title": "first worker task", "assignee": "worker-a"},
+                {"title": "second worker task", "assignee": "worker-b"},
+            ],
+        )
+        assert child_ids is not None
+        assert [kb.get_task(conn, child_id).session_id for child_id in child_ids] == [
+            "ios-conversation-123",
+            "ios-conversation-123",
+        ]

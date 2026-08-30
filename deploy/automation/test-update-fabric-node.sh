@@ -49,7 +49,18 @@ for argument in "$@"; do
   elif [[ "${argument}" == -o ]]; then next=1
   fi
 done
-payload="{\"ok\":true,\"release\":{\"commit\":\"${FAKE_RELEASE_COMMIT}\",\"version\":\"${FAKE_RELEASE_VERSION}\"}}"
+count=0
+if [[ -f "${FAKE_CURL_COUNT_FILE}" ]]; then count="$(cat "${FAKE_CURL_COUNT_FILE}")"; fi
+count=$((count + 1))
+printf '%s\n' "${count}" >"${FAKE_CURL_COUNT_FILE}"
+generation=old-generation
+(( count > 1 )) && generation=new-generation
+case "${HERMES_FABRIC_ROLE}" in
+  dbb3) worker_node=dbb3-worker ;;
+  wsl) worker_node=pc-worker ;;
+  hk) worker_node=hk-worker ;;
+esac
+payload="{\"ok\":true,\"connector_id\":\"${FAKE_CONNECTOR_ID}\",\"release\":{\"commit\":\"${FAKE_RELEASE_COMMIT}\",\"version\":\"${FAKE_RELEASE_VERSION}\"},\"worker_channel\":{\"node_id\":\"${worker_node}\",\"managed_node_id\":\"${HERMES_FABRIC_ROLE}\",\"online\":true,\"fresh\":true,\"connection_generation\":\"${generation}\",\"release\":{\"commit\":\"${FAKE_RELEASE_COMMIT}\",\"version\":\"${FAKE_RELEASE_VERSION}\"}}}"
 if [[ -n "${output}" ]]; then printf '%s\n' "${payload}" >"${output}"
 else printf '%s\n' "${payload}"
 fi
@@ -93,11 +104,15 @@ printf 'profile: hk-worker\n' >"${archive}/deploy/hk/profile/config.yaml.example
 printf '# HK worker\n' >"${archive}/deploy/hk/profile/SOUL.md"
 for asset in hermes-managed-installation-receiver.service \
   hermes-wsl-managed-installation-receiver.service \
-  hermes-wsl-managed-installation-tunnel.service; do
+  hermes-wsl-managed-installation-tunnel.service \
+  hermes-hk-managed-node-recovery.service \
+  hermes-hk-managed-node-recovery-tunnel.service; do
   printf '# receiver unit\n' >"${archive}/deploy/recovery/${asset}"
 done
 printf '{}\n' >"${archive}/deploy/recovery/managed-installations.dbb3.json"
 printf '{}\n' >"${archive}/deploy/recovery/managed-installations.wsl.json"
+printf '{"nodes":[]}\n' >"${archive}/deploy/recovery/managed-nodes.hk.json"
+printf '#!/usr/bin/env bash\nexit 0\n' >"${archive}/deploy/recovery/recover-hk.sh"
 for module in __init__.py managed_installations.py managed_nodes.py managed_node_recovery_service.py sqlite_util.py; do
   printf 'RELEASE = "new"\n' >"${archive}/hermes_cli/${module}"
 done
@@ -152,11 +167,19 @@ set -Eeuo pipefail
 control="${4:-}"
 exec bash "$(dirname "${BASH_SOURCE[0]}")/install-dbb3-managed-installation-receiver.sh" ignored "${control}"
 SH
+cat >"${archive}/deploy/recovery/install-hk-managed-recovery.sh" <<'SH'
+#!/usr/bin/env bash
+set -Eeuo pipefail
+control="${5:-}"
+exec bash "$(dirname "${BASH_SOURCE[0]}")/install-dbb3-managed-installation-receiver.sh" ignored "${control}"
+SH
 chmod 0755 "${archive}/deploy/dbb3/install-dbb3-cloud-connector-user.sh" \
   "${archive}/deploy/pc/install-pc-cloud-connector-user.sh" \
   "${archive}/deploy/hk/install-hk-cloud-connector-user.sh" \
   "${archive}/deploy/recovery/install-dbb3-managed-installation-receiver.sh" \
-  "${archive}/deploy/recovery/install-wsl-managed-installation.sh"
+  "${archive}/deploy/recovery/install-wsl-managed-installation.sh" \
+  "${archive}/deploy/recovery/install-hk-managed-recovery.sh" \
+  "${archive}/deploy/recovery/recover-hk.sh"
 
 release_commit="0123456789abcdef0123456789abcdef01234567"
 release_version="1.2.3"
@@ -186,14 +209,25 @@ run_case() {
   printf 'old\n' >"${root}/receiver.state"
   printf '%064d\n' 0 >"${root}/cloud.token"
   printf '%064d\n' 1 >"${root}/installation.token"
+  printf '%064d\n' 2 >"${root}/hk-recovery.token"
+  printf '%s\n' 'test-hk-recovery-private-key' >"${root}/home/.ssh/hk_recovery_ed25519"
+  printf '%s\n' '10.66.0.1 ssh-ed25519 test-public-key' >"${root}/home/.ssh/hk_recovery_known_hosts"
   printf 'test-private-key\n' >"${root}/home/.ssh/aliyun_hermes_ed25519"
   : >"${root}/components.log"
   : >"${root}/systemctl.log"
+  : >"${root}/curl.count"
+  case "${role}" in
+    dbb3) fake_connector_id=dbb3-primary ;;
+    wsl) fake_connector_id=pc-primary ;;
+    hk) fake_connector_id=hk-primary ;;
+  esac
   set +e
   PATH="${fake_bin}:/usr/sbin:/usr/bin:/sbin:/bin" \
   FAKE_ARCHIVE_ROOT="${archive}" \
   FAKE_RELEASE_COMMIT="${release_commit}" \
   FAKE_RELEASE_VERSION="${release_version}" \
+  FAKE_CONNECTOR_ID="${fake_connector_id}" \
+  FAKE_CURL_COUNT_FILE="${root}/curl.count" \
   FAKE_USER_HOME="${root}/home" \
   FAKE_BACKUP_ROOT="${root}/backups" \
   FAKE_CONNECTOR_STATE="${root}/connector.state" \
@@ -209,6 +243,9 @@ run_case() {
   HERMES_HK_AGENT_ROOT="${root}/runtime" \
   HERMES_WSL_INSTALLATION_TOKEN_FILE="${root}/installation.token" \
   HERMES_WSL_INSTALLATION_KEY_FILE="${root}/home/.ssh/aliyun_hermes_ed25519" \
+  HERMES_HK_RECOVERY_TOKEN_FILE="${root}/hk-recovery.token" \
+  HERMES_HK_RECOVERY_KEY_FILE="${root}/home/.ssh/hk_recovery_ed25519" \
+  HERMES_HK_RECOVERY_KNOWN_HOSTS_FILE="${root}/home/.ssh/hk_recovery_known_hosts" \
   HERMES_FABRIC_AUTOMATION_SCRIPT_TARGET="${root}/automation/update-fabric-node.sh" \
   HERMES_FABRIC_AUTOMATION_SERVICE_TARGET="${root}/automation/hermes-fabric-update.service" \
   HERMES_FABRIC_AUTOMATION_TIMER_TARGET="${root}/automation/hermes-fabric-update.timer" \
@@ -233,9 +270,7 @@ run_case() {
   if [[ -z "${failpoint}" ]]; then
     [[ "${status}" == 0 ]]
     grep -Fxq 'connector install' "${root}/components.log"
-    if [[ "${role}" != hk ]]; then
-      grep -Fxq 'receiver install' "${root}/components.log"
-    fi
+    grep -Fxq 'receiver install' "${root}/components.log"
     python3 - "${root}/state/${role}/release.json" \
       "${role}" "${release_commit}" "${release_version}" <<'PY'
 import json, sys
@@ -254,9 +289,7 @@ PY
     [[ "${status}" != 0 ]]
     [[ "$(cat "${root}/connector.state")" == old ]]
     [[ "$(cat "${root}/receiver.state")" == old ]]
-    if [[ "${role}" != hk ]]; then
-      grep -Fxq 'receiver rollback' "${root}/components.log"
-    fi
+    grep -Fxq 'receiver rollback' "${root}/components.log"
     grep -Fxq 'connector rollback' "${root}/components.log"
     grep -Fq 'RELEASE = "old"' "${root}/runtime/hermes_cli/managed_installations.py"
     grep -Fq 'RELEASE = "old"' "${root}/runtime/hermes_runtime/config.py"
@@ -277,4 +310,5 @@ run_case wsl
 run_case hk
 run_case dbb3 after-receiver
 run_case dbb3 after-automation
+run_case hk after-automation
 printf 'fabric updater transaction harness passed\n'
