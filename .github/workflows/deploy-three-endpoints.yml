@@ -93,7 +93,7 @@ jobs:
         with:
           enable-cache: true
           cache-dependency-glob: uv.lock
-      - name: Wait for the complete CI gate
+      - name: Wait for the fork-compatible backend test gate
         env:
           GH_TOKEN: ${{ github.token }}
           RELEASE_COMMIT: ${{ github.sha }}
@@ -104,7 +104,7 @@ jobs:
           while :; do
             run_json="$(gh run list \
               --repo "$GITHUB_REPOSITORY" \
-              --workflow ci.yaml \
+              --workflow linux-tests.yml \
               --commit "$RELEASE_COMMIT" \
               --limit 1 \
               --json status,conclusion,headSha)"
@@ -114,19 +114,19 @@ jobs:
               case "$status" in
                 completed)
                   if [ "$conclusion" = success ]; then
-                    echo "Complete CI gate passed for $RELEASE_COMMIT"
+                    echo "Backend test gate passed for $RELEASE_COMMIT"
                     break
                   fi
-                  echo "::error::Complete CI gate ended with conclusion '$conclusion' for $RELEASE_COMMIT"
+                  echo "::error::Backend test gate ended with conclusion '$conclusion' for $RELEASE_COMMIT"
                   exit 1
                   ;;
               esac
-              echo "CI gate is $status for $RELEASE_COMMIT; waiting"
+              echo "Backend test gate is $status for $RELEASE_COMMIT; waiting"
             else
-              echo "CI gate for $RELEASE_COMMIT has not been created; waiting"
+              echo "Backend test gate for $RELEASE_COMMIT has not been created; waiting"
             fi
             if [ "$(date +%s)" -ge "$deadline" ]; then
-              echo "::error::Timed out waiting for the complete CI gate for $RELEASE_COMMIT"
+              echo "::error::Timed out waiting for the backend test gate for $RELEASE_COMMIT"
               exit 1
             fi
             sleep 10

@@ -16,17 +16,18 @@ def test_all_checks_gate_uses_independent_docker_workflow_and_rejects_nontermina
     assert "All checks passed (or were skipped)" in workflow
 
 
-def test_production_deploy_waits_for_the_same_commit_ci_run():
+def test_production_deploy_waits_for_the_same_commit_fork_compatible_run():
     workflow = WORKFLOW.parent / "deploy-three-endpoints.yml"
     source = workflow.read_text(encoding="utf-8")
     ci_source = WORKFLOW.read_text(encoding="utf-8")
 
-    assert "Wait for the complete CI gate" in source
-    assert "--workflow ci.yaml" in source
+    assert "Wait for the fork-compatible backend test gate" in source
+    assert "--workflow linux-tests.yml" in source
     assert "--commit \"$RELEASE_COMMIT\"" in source
-    assert "Timed out waiting for the complete CI gate" in source
+    assert "Timed out waiting for the backend test gate" in source
     assert "--extra all --extra dev --extra hindsight" in source
     # Release events are intentionally owned by the production deployment
-    # workflow.  CI remains the pull-request/main push gate and deployment
-    # waits on the same commit's CI run above.
+    # workflow. Official CI remains the pull-request/main push gate, while
+    # deployment waits on the fork-compatible full backend test run for the
+    # same commit.
     assert "  pull_request:\n  push:\n    branches: [main]\n" in ci_source
