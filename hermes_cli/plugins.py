@@ -5980,10 +5980,23 @@ class PluginManager:
         return tuple(self._hooks.get(hook_name, ()))
 
     def render_system_prompt_sections(
-        self, session_info: Mapping[str, Any]
+        self,
+        session_info: Mapping[str, Any],
+        *,
+        previous_sections: Optional[Iterable[RenderedPluginSystemPromptSection]] = None,
     ) -> List[RenderedPluginSystemPromptSection]:
-        """Render all registered sections deterministically and fail open."""
+        """Render all registered sections deterministically and fail open.
+
+        A dynamic callback that raises may reuse its own last rendered bytes
+        at an explicit prompt-rebuild boundary. Other invalid results still
+        skip normally, so an empty return can intentionally remove a section.
+        """
         frozen_info = types.MappingProxyType(dict(session_info))
+        previous_by_id = {
+            previous.id: previous
+            for previous in previous_sections or ()
+            if isinstance(previous, RenderedPluginSystemPromptSection)
+        }
         rendered: List[RenderedPluginSystemPromptSection] = []
         total_chars = len(PLUGIN_SECTIONS_START) + len(PLUGIN_SECTIONS_END) + 2
         for section_id in sorted(self._system_prompt_sections):
@@ -6003,13 +6016,28 @@ class PluginManager:
                     else section.content
                 )
             except Exception as exc:
+                previous = previous_by_id.get(section.id)
+                if (
+                    previous is None
+                    or previous.position != section.position
+                    or previous.plugin not in {section.plugin, "persisted-prompt"}
+                ):
+                    logger.warning(
+                        "Plugin system prompt section %s (%s) raised and was "
+                        "skipped: %s",
+                        section.id,
+                        section.plugin,
+                        exc,
+                    )
+                    continue
                 logger.warning(
-                    "Plugin system prompt section %s (%s) raised and was skipped: %s",
+                    "Plugin system prompt section %s (%s) raised; keeping its "
+                    "previous rendered bytes: %s",
                     section.id,
                     section.plugin,
                     exc,
                 )
-                continue
+                value = previous.content
             if not isinstance(value, str):
                 logger.warning(
                     "Plugin system prompt section %s (%s) returned %s, not str; skipped",
@@ -6557,9 +6585,14 @@ def invoke_hook(hook_name: str, **kwargs: Any) -> List[Any]:
 
 def render_system_prompt_sections(
     session_info: Mapping[str, Any],
+    *,
+    previous_sections: Optional[Iterable[RenderedPluginSystemPromptSection]] = None,
 ) -> List[RenderedPluginSystemPromptSection]:
     """Render plugin prompt sections after idempotent plugin discovery."""
-    return _ensure_plugins_discovered().render_system_prompt_sections(session_info)
+    return _ensure_plugins_discovered().render_system_prompt_sections(
+        session_info,
+        previous_sections=previous_sections,
+    )
 
 
 def invoke_middleware(kind: str, **kwargs: Any) -> List[Any]:

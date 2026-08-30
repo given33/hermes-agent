@@ -87,6 +87,46 @@ def test_real_aiagent_freezes_section_within_life_and_rerenders_on_invalidate(mo
     assert "example.rules" not in agent._cached_system_prompt_static
 
 
+def test_real_plugin_callback_failure_keeps_only_its_last_good_section(monkeypatch):
+    monkeypatch.setattr(
+        "agent.coding_context.build_coding_workspace_block",
+        lambda cwd=None: "Workspace (snapshot at session start):\n- Root: /pinned",
+    )
+    state = {"flaky_raises": False, "healthy": "healthy v1"}
+
+    def flaky(_session_info):
+        if state["flaky_raises"]:
+            raise RuntimeError("temporary plugin failure")
+        return "flaky last-good bytes"
+
+    def healthy(_session_info):
+        return state["healthy"]
+
+    manager = PluginManager()
+    manager._discovered = True
+    ctx = PluginContext(
+        PluginManifest(name="example-plugin", key="example-plugin", source="user"),
+        manager,
+    )
+    ctx.register_system_prompt_section("example.flaky", flaky)
+    ctx.register_system_prompt_section("example.healthy", healthy)
+    monkeypatch.setattr(plugins, "_plugin_manager", manager)
+    agent = _real_agent(session_id="plugin-section-fallback")
+
+    first = build_system_prompt(agent)
+    assert "flaky last-good bytes" in first
+    assert "healthy v1" in first
+
+    state["flaky_raises"] = True
+    state["healthy"] = "healthy v2"
+    invalidate_system_prompt(agent)
+    rebuilt = build_system_prompt(agent)
+
+    assert "flaky last-good bytes" in rebuilt
+    assert "healthy v2" in rebuilt
+    assert "healthy v1" not in rebuilt
+
+
 def test_fresh_process_resume_restores_identical_full_prompt_without_callback(tmp_path):
     """The existing persisted full prompt is the only resume state required."""
     db_path = tmp_path / "state.db"

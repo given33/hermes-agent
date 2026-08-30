@@ -7,6 +7,8 @@ contract and the CLI-config parity (servers/keys written via the API are
 visible to the CLI data layer), not specific catalog values.
 """
 
+import json
+
 import pytest
 
 
@@ -208,6 +210,64 @@ class TestCredentialPoolEndpoints:
         save_env_value("OPENROUTER_API_KEY", fake_key)
         sources = sorted(e.source for e in load_pool("openrouter").entries())
         assert sources == ["env:OPENROUTER_API_KEY", "manual"]
+
+    def test_profile_query_isolates_pool_mutations(self):
+        from hermes_constants import get_hermes_home
+
+        root = get_hermes_home()
+        profile_home = root / "profiles" / "hk-worker"
+        profile_home.mkdir(parents=True)
+
+        dispatcher_key = "dispatcher-" + "d" * 24
+        hk_key = "hk-" + "h" * 24
+        assert self.client.post(
+            "/api/credentials/pool",
+            json={
+                "provider": "custom:dispatcher",
+                "api_key": dispatcher_key,
+                "label": "Dispatcher",
+            },
+        ).status_code == 200
+        assert self.client.post(
+            "/api/credentials/pool?profile=hk-worker",
+            json={
+                "provider": "custom:hk",
+                "api_key": hk_key,
+                "label": "Hong Kong",
+            },
+        ).status_code == 200
+
+        root_store = json.loads((root / "auth.json").read_text(encoding="utf-8"))
+        profile_store = json.loads(
+            (profile_home / "auth.json").read_text(encoding="utf-8")
+        )
+        assert "custom:dispatcher" in root_store["credential_pool"]
+        assert "custom:hk" not in root_store["credential_pool"]
+        assert "custom:hk" in profile_store["credential_pool"]
+        assert "custom:dispatcher" not in profile_store["credential_pool"]
+
+        default_rows = self.client.get("/api/credentials/pool").json()["providers"]
+        hk_rows = self.client.get(
+            "/api/credentials/pool?profile=hk-worker"
+        ).json()["providers"]
+        assert any(row["provider"] == "custom:dispatcher" for row in default_rows)
+        assert all(row["provider"] != "custom:hk" for row in default_rows)
+        assert any(row["provider"] == "custom:hk" for row in hk_rows)
+
+        removed = self.client.delete(
+            "/api/credentials/pool/custom%3Ahk/1?profile=hk-worker"
+        )
+        assert removed.status_code == 200
+        root_after = json.loads((root / "auth.json").read_text(encoding="utf-8"))
+        profile_after = json.loads(
+            (profile_home / "auth.json").read_text(encoding="utf-8")
+        )
+        assert root_after["credential_pool"]["custom:dispatcher"][0]["label"] == "Dispatcher"
+        assert profile_after.get("credential_pool", {}).get("custom:hk", []) == []
+
+    def test_profile_query_rejects_invalid_profile_names(self):
+        response = self.client.get("/api/credentials/pool?profile=../escape")
+        assert response.status_code == 400
 
 
 

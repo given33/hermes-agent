@@ -204,15 +204,20 @@ def _frozen_plugin_prompt_sections(agent: Any) -> tuple:
         rendered = _restore_plugin_prompt_sections(stored_prompt)
         setattr(agent, attr, rendered)
         return rendered
+    previous = getattr(agent, "_plugin_system_prompt_sections_previous", None)
     try:
         from hermes_cli.plugins import render_system_prompt_sections
 
-        rendered = tuple(render_system_prompt_sections(_plugin_session_info(agent)))
+        rendered = tuple(
+            render_system_prompt_sections(
+                _plugin_session_info(agent),
+                previous_sections=previous,
+            )
+        )
     except Exception as exc:
         # Fail-open: a plugin whose render raises at a rebuild boundary
         # keeps its last good bytes (stashed by invalidate_system_prompt)
         # instead of silently vanishing from the prompt.
-        previous = getattr(agent, "_plugin_system_prompt_sections_previous", None)
         if previous:
             logger.warning(
                 "Plugin system prompt sections failed to re-render (%s); "
