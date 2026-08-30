@@ -21,6 +21,7 @@ from hermes_cli.commands import (
     _sanitize_telegram_name,
     command_desktop_meta,
     discord_skill_commands,
+    discord_skill_commands_by_category,
     gateway_help_lines,
     infer_argument_mode,
     resolve_command,
@@ -737,6 +738,59 @@ class TestTelegramMenuCommands:
         assert "lookalike_skill" not in menu_names, (
             "prefix-match sibling directories must not be admitted"
         )
+
+    def test_discord_hub_filter_keeps_hub_sibling_skill(self, tmp_path, monkeypatch):
+        """Only the actual ``.hub`` tree is hidden from Discord categories.
+
+        A string-prefix check treated ``.hub-extra`` as part of ``.hub`` and
+        silently dropped a legitimate skill.  The collector must apply the
+        same native directory-boundary check as Telegram.
+        """
+        from unittest.mock import patch
+
+        skills_dir = tmp_path / "skills"
+        hidden_dir = skills_dir / ".hub" / "hidden"
+        visible_dir = skills_dir / ".hub-extra" / "visible"
+        hidden_dir.mkdir(parents=True)
+        visible_dir.mkdir(parents=True)
+        hidden_path = hidden_dir / "SKILL.md"
+        visible_path = visible_dir / "SKILL.md"
+        hidden_path.write_text("# hidden\n")
+        visible_path.write_text("# visible\n")
+
+        fake_cmds = {
+            "/hub-hidden": {
+                "name": "hub-hidden",
+                "description": "Hub skill",
+                "skill_md_path": str(hidden_path),
+                "skill_dir": str(hidden_dir),
+            },
+            "/hub-sibling": {
+                "name": "hub-sibling",
+                "description": "A regular skill next to hub",
+                "skill_md_path": str(visible_path),
+                "skill_dir": str(visible_dir),
+            },
+        }
+
+        with (
+            patch("agent.skill_commands.get_skill_commands", return_value=fake_cmds),
+            patch("tools.skills_tool.SKILLS_DIR", skills_dir),
+            patch("agent.skill_utils.get_external_skills_dirs", return_value=[]),
+            patch("agent.skill_utils.get_project_skills_dirs", return_value=[]),
+        ):
+            categories, uncategorized, _hidden = discord_skill_commands_by_category(
+                reserved_names=set()
+            )
+
+        names = {
+            name
+            for rows in categories.values()
+            for name, _description, _cmd_key in rows
+        }
+        names.update(name for name, _description, _cmd_key in uncategorized)
+        assert "hub-sibling" in names
+        assert "hub-hidden" not in names
 
     def test_special_chars_in_skill_names_sanitized(self, tmp_path, monkeypatch):
         """Skills with +, /, or other special chars produce valid Telegram names."""

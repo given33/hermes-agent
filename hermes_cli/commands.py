@@ -1010,18 +1010,24 @@ _clamp_telegram_names = _clamp_command_names
 # ---------------------------------------------------------------------------
 
 
-def _path_is_within(path_value: str | os.PathLike[str], root: Path) -> bool:
-    """Return whether *path_value* resolves below *root* on this platform.
+def _resolve_path(path_value: str | os.PathLike[str]) -> Path | None:
+    """Resolve a path once, returning ``None`` for unusable input."""
+    try:
+        return Path(path_value).resolve()
+    except (OSError, RuntimeError, TypeError, ValueError):
+        return None
 
-    Gateway skill menus previously compared absolute paths with hand-built
-    ``"/"``-terminated strings.  That works on POSIX, but Windows emits
-    backslashes, so every skill was silently filtered out by the allowlist.
-    Resolving and using ``relative_to`` also preserves the directory-boundary
-    check (``skills-extra`` must not match ``skills``) and rejects symlinks
-    which resolve outside a trusted root.
+
+def _path_is_within(path_value: Path, root: Path) -> bool:
+    """Return whether an already-resolved path is below an already-resolved root.
+
+    ``relative_to`` gives us a native, case-aware directory-boundary check:
+    ``skills-extra`` cannot match ``skills``.  Callers resolve each candidate
+    and trusted root once before entering a catalog loop so large skill sets do
+    not pay repeated filesystem resolution costs.
     """
     try:
-        Path(path_value).resolve().relative_to(root.resolve())
+        path_value.relative_to(root)
     except (OSError, RuntimeError, TypeError, ValueError):
         return False
     return True
@@ -1117,23 +1123,27 @@ def _collect_gateway_skill_entries(
             *get_external_skills_dirs(),
             *get_project_skills_dirs(),
         ):
-            try:
-                _allowed_roots.append(Path(_root).resolve())
-            except (OSError, RuntimeError, TypeError, ValueError):
-                continue
-        try:
-            _hub_dir = (Path(SKILLS_DIR) / ".hub").resolve()
-        except (OSError, RuntimeError, TypeError, ValueError):
-            _hub_dir = None
+            _resolved_root = _resolve_path(_root)
+            if _resolved_root is not None:
+                _allowed_roots.append(_resolved_root)
+        _hub_dir = _resolve_path(Path(SKILLS_DIR) / ".hub")
         skill_cmds = get_skill_commands()
         for cmd_key in sorted(skill_cmds):
             info = skill_cmds[cmd_key]
             skill_path = info.get("skill_md_path", "")
             if not skill_path:
                 continue
-            if not any(_path_is_within(skill_path, root) for root in _allowed_roots):
+            _resolved_skill_path = _resolve_path(skill_path)
+            if _resolved_skill_path is None:
                 continue
-            if _hub_dir is not None and _path_is_within(skill_path, _hub_dir):
+            if not any(
+                _path_is_within(_resolved_skill_path, root)
+                for root in _allowed_roots
+            ):
+                continue
+            if _hub_dir is not None and _path_is_within(
+                _resolved_skill_path, _hub_dir
+            ):
                 continue
             skill_name = info.get("name", "")
             if skill_name in _platform_disabled:
@@ -1344,7 +1354,7 @@ def discord_skill_commands_by_category(
             sp = _P(skill_path).resolve()
             # Hub skills are loaded via the skill hub, not surfaced as
             # slash commands.
-            if str(sp).startswith(str(_hub_dir)):
+            if _path_is_within(sp, _hub_dir):
                 continue
             # Accept skill if it lives under any scan root; record the
             # matching root so we can derive the category correctly.
