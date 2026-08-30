@@ -18,6 +18,7 @@ import subprocess
 import time
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Any, Dict, Optional, Tuple
 
 from utils import is_truthy_value
@@ -1008,6 +1009,24 @@ _clamp_telegram_names = _clamp_command_names
 # Shared skill/plugin collection for gateway platforms
 # ---------------------------------------------------------------------------
 
+
+def _path_is_within(path_value: str | os.PathLike[str], root: Path) -> bool:
+    """Return whether *path_value* resolves below *root* on this platform.
+
+    Gateway skill menus previously compared absolute paths with hand-built
+    ``"/"``-terminated strings.  That works on POSIX, but Windows emits
+    backslashes, so every skill was silently filtered out by the allowlist.
+    Resolving and using ``relative_to`` also preserves the directory-boundary
+    check (``skills-extra`` must not match ``skills``) and rejects symlinks
+    which resolve outside a trusted root.
+    """
+    try:
+        Path(path_value).resolve().relative_to(root.resolve())
+    except (OSError, RuntimeError, TypeError, ValueError):
+        return False
+    return True
+
+
 def _collect_gateway_skill_entries(
     platform: str,
     max_slots: int | None,
@@ -1088,31 +1107,33 @@ def _collect_gateway_skill_entries(
         from agent.skill_commands import get_skill_commands
         from tools.skills_tool import SKILLS_DIR
         from agent.skill_utils import get_external_skills_dirs, get_project_skills_dirs
-        _skills_dir = str(SKILLS_DIR.resolve())
-        _hub_dir = str((SKILLS_DIR / ".hub").resolve()).rstrip("/") + "/"
-        # Build set of allowed directory prefixes: local skills dir + any
-        # user-configured ``skills.external_dirs`` + trusted project dirs.
-        # Ensure each prefix ends
-        # with ``/`` so ``/my-skills`` does not also match ``/my-skills-extra``.
-        # Without this widening, external skills are visible in
-        # ``hermes skills list`` and the agent's ``/skill-name`` dispatch but
-        # silently excluded from gateway slash menus (#8110).
-        _allowed_prefixes = [_skills_dir.rstrip("/") + "/"]
-        _allowed_prefixes.extend(
-            str(d).rstrip("/") + "/" for d in get_external_skills_dirs()
-        )
-        _allowed_prefixes.extend(
-            str(d).rstrip("/") + "/" for d in get_project_skills_dirs()
-        )
+        # Build trusted roots using native path semantics.  The previous
+        # string-prefix implementation appended ``/`` to Windows paths,
+        # causing ``C:\\...\\skills\\foo\\SKILL.md`` to fail the check and
+        # disappear from every gateway catalog (#8110).
+        _allowed_roots: list[Path] = []
+        for _root in (
+            SKILLS_DIR,
+            *get_external_skills_dirs(),
+            *get_project_skills_dirs(),
+        ):
+            try:
+                _allowed_roots.append(Path(_root).resolve())
+            except (OSError, RuntimeError, TypeError, ValueError):
+                continue
+        try:
+            _hub_dir = (Path(SKILLS_DIR) / ".hub").resolve()
+        except (OSError, RuntimeError, TypeError, ValueError):
+            _hub_dir = None
         skill_cmds = get_skill_commands()
         for cmd_key in sorted(skill_cmds):
             info = skill_cmds[cmd_key]
             skill_path = info.get("skill_md_path", "")
             if not skill_path:
                 continue
-            if not any(skill_path.startswith(prefix) for prefix in _allowed_prefixes):
+            if not any(_path_is_within(skill_path, root) for root in _allowed_roots):
                 continue
-            if skill_path.startswith(_hub_dir):
+            if _hub_dir is not None and _path_is_within(skill_path, _hub_dir):
                 continue
             skill_name = info.get("name", "")
             if skill_name in _platform_disabled:
