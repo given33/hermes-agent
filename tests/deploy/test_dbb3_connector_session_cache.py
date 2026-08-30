@@ -256,7 +256,8 @@ def test_worker_websocket_handshake_and_event_wakeup(monkeypatch):
     assert websocket.sent[0]["node_id"] == "hk-worker"
     assert websocket.sent[0]["cursor"] == 0
     assert wake.is_set()
-    assert client._last_stream_event_id == "7"
+    assert client._last_worker_sequence == 7
+    assert client._last_stream_event_id == ""
     assert websocket.closed is True
 
 
@@ -280,6 +281,43 @@ def test_worker_websocket_falls_back_to_sse_when_dependency_missing(monkeypatch)
     client._stream_events(wake, stop, callback)
 
     assert calls == [(wake, stop, callback)]
+
+
+def test_worker_websocket_falls_back_after_repeated_handshake_failures(monkeypatch):
+    client = connector_module.CloudRelayClient(
+        "https://example.test",
+        "token",
+        worker_ws=True,
+    )
+    calls = []
+
+    def fake_connect(_url, **_kwargs):
+        raise OSError("proxy does not support websocket upgrade")
+
+    class StopAfterRetries:
+        def __init__(self):
+            self.waits = 0
+
+        def is_set(self):
+            return False
+
+        def wait(self, _timeout):
+            self.waits += 1
+            return False
+
+    monkeypatch.setattr(connector_module, "_websocket_connect", fake_connect)
+    monkeypatch.setattr(
+        client,
+        "_stream_sse_events",
+        lambda wake, stop, on_steer: calls.append((wake, stop, on_steer)),
+    )
+    wake = threading.Event()
+    stop = StopAfterRetries()
+    callback = lambda _event: None
+    client._stream_events(wake, stop, callback)
+
+    assert calls == [(wake, stop, callback)]
+    assert stop.waits == 2
 
 
 def test_stream_parser_joins_multiline_data_and_advances_last_event_id(monkeypatch):

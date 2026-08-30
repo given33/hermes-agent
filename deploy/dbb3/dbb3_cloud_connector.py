@@ -570,7 +570,11 @@ class CloudRelayClient:
             or self._default_worker_node_id()
         )
         self._connection_generation = uuid.uuid4().hex
+        # SSE has a process-global connector stream cursor; worker WS has a
+        # node-local replay cursor. Keep them separate so a WS->SSE fallback
+        # never sends a node sequence as ``Last-Event-ID`` (or skips events).
         self._last_stream_event_id = ""
+        self._last_worker_sequence = 0
         self._stream_response_lock = threading.Lock()
         self._stream_response: Any | None = None
         self._stream_ws_lock = threading.Lock()
@@ -789,11 +793,7 @@ class CloudRelayClient:
         return urllib.parse.urlunsplit((scheme, parsed.netloc, path, parsed.query, ""))
 
     def _worker_ws_cursor(self) -> int:
-        try:
-            value = int(str(self._last_stream_event_id or "0"), 10)
-        except (TypeError, ValueError, OverflowError):
-            return 0
-        return max(0, value)
+        return max(0, int(self._last_worker_sequence or 0))
 
     @staticmethod
     def _decode_ws_frame(raw: Any) -> dict[str, Any] | None:
@@ -827,11 +827,9 @@ class CloudRelayClient:
         sequence = frame.get("sequence")
         if sequence is not None:
             try:
-                self._last_stream_event_id = str(max(0, int(sequence)))
+                self._last_worker_sequence = max(0, int(sequence))
             except (TypeError, ValueError, OverflowError):
                 pass
-        elif frame.get("event_id"):
-            self._last_stream_event_id = _text(frame.get("event_id"), 256)
         if frame_type == "run.steer" and on_steer is not None:
             on_steer(event)
         # worker.queued is the normal server->worker frame, while accepting
@@ -855,9 +853,11 @@ class CloudRelayClient:
             self._stream_sse_events(wake, stop, on_steer)
             return
         backoff = 1.0
+        handshake_failures = 0
         while not stop.is_set():
             websocket = None
             connected_at = time.monotonic()
+            handshake_accepted = False
             try:
                 headers = {
                     "Authorization": f"Bearer {self.token}",
@@ -885,6 +885,8 @@ class CloudRelayClient:
                 hello = self._decode_ws_frame(websocket.recv(timeout=10.0))
                 if not hello or hello.get("type") != "hello.accepted":
                     raise RuntimeError("worker websocket handshake was rejected")
+                handshake_accepted = True
+                handshake_failures = 0
                 backoff = 1.0
                 while not stop.is_set():
                     try:
@@ -905,6 +907,14 @@ class CloudRelayClient:
                 self._reload_token()
                 if stop.is_set():
                     return
+                if not handshake_accepted:
+                    handshake_failures += 1
+                    # A proxy or older backend may not expose /worker/ws.
+                    # After a few bounded attempts, use the legacy SSE wakeup
+                    # stream rather than burning a reconnect loop forever.
+                    if handshake_failures >= 3:
+                        self._stream_sse_events(wake, stop, on_steer)
+                        return
             finally:
                 self._clear_stream_ws(websocket)
                 if websocket is not None:
