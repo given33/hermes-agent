@@ -770,7 +770,7 @@ def _resolve_anthropic_pool_token() -> Optional[str]:
         # consult the durable sidecar registry: the failed commit may have
         # happened in a DIFFERENT process, whose process-local verdict this
         # interpreter never saw.
-        entry_source_path = spent_rotation_source_path(getattr(entry, "source", None))
+        entry_source_path = pool._anthropic_rotation_source_path(entry)
         if is_rotation_consumed_uncommitted(
             token, source_path=entry_source_path
         ) or is_rotation_consumed_uncommitted(
@@ -1077,6 +1077,8 @@ def _write_hermes_oauth_credentials(
     access_token: str,
     refresh_token: Optional[str],
     expires_at_ms: Optional[int],
+    *,
+    target_path: Optional[Path] = None,
 ) -> None:
     """Write refreshed hermes_pkce tokens back to ~/.hermes/.anthropic_oauth.json.
 
@@ -1090,7 +1092,7 @@ def _write_hermes_oauth_credentials(
     file, for the same reason ``_write_claude_code_credentials`` does: this is
     the commit step of the refresh transaction.
     """
-    oauth_file = _get_hermes_oauth_file()
+    oauth_file = target_path or _get_hermes_oauth_file()
     try:
         oauth_data = {
             "accessToken": access_token,
@@ -1121,4 +1123,3 @@ def _write_hermes_oauth_credentials(
             "Failed to write refreshed Hermes OAuth credentials to %s: %s", oauth_file, e
         )
         raise CredentialPersistError(oauth_file, e) from e
-

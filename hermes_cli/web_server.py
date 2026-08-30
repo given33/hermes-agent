@@ -14254,7 +14254,12 @@ async def stop_gateway(profile: Optional[str] = None):
 # ---------------------------------------------------------------------------
 
 
-def _pool_entry_summary(entry: Any, index: int) -> Dict[str, Any]:
+def _pool_entry_summary(
+    entry: Any,
+    index: int,
+    *,
+    inherited: bool = False,
+) -> Dict[str, Any]:
     """Redacted, display-safe view of one PooledCredential.
 
     ``index`` is 1-based to match CredentialPool.remove_index().
@@ -14271,6 +14276,7 @@ def _pool_entry_summary(entry: Any, index: int) -> Dict[str, Any]:
         "request_count": getattr(entry, "request_count", 0),
         "token_preview": redact_key(token) if token else "",
         "has_refresh": bool(getattr(entry, "refresh_token", None)),
+        "inherited": inherited,
     }
 
 
@@ -14297,7 +14303,11 @@ async def list_credential_pool(profile: Optional[str] = None):
                 providers.append({
                     "provider": provider_id,
                     "entries": [
-                        _pool_entry_summary(entry, index)
+                        _pool_entry_summary(
+                            entry,
+                            index,
+                            inherited=pool.is_inherited(entry),
+                        )
                         for index, entry in enumerate(entries, start=1)
                     ],
                 })
@@ -14327,7 +14337,7 @@ async def add_credential_pool_entry(
 
     def _run() -> Dict[str, Any]:
         with _config_profile_scope(profile):
-            pool = load_pool(provider)
+            pool = load_pool(provider, include_global_fallback=False)
             label = (body.label or "").strip() or f"key #{len(pool.entries()) + 1}"
             entry = PooledCredential(
                 provider=provider,

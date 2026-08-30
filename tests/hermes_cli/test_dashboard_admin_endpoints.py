@@ -265,7 +265,7 @@ class TestCredentialPoolEndpoints:
         assert root_after["credential_pool"]["custom:dispatcher"][0]["label"] == "Dispatcher"
         assert profile_after.get("credential_pool", {}).get("custom:hk", []) == []
 
-    def test_profile_mutations_never_materialize_global_fallback(self):
+    def test_profile_mutations_never_materialize_global_fallback(self, monkeypatch):
         from hermes_constants import get_hermes_home
 
         root = get_hermes_home()
@@ -286,12 +286,27 @@ class TestCredentialPoolEndpoints:
         ).json()["providers"]
         shared = next(row for row in inherited if row["provider"] == "custom:shared")
         assert [entry["label"] for entry in shared["entries"]] == ["Global shared"]
+        assert shared["entries"][0]["inherited"] is True
+        assert "global-" not in shared["entries"][0]["token_preview"]
+
+        cleanup_called = False
+
+        def _unexpected_cleanup(*_args, **_kwargs):
+            nonlocal cleanup_called
+            cleanup_called = True
+            raise AssertionError("inherited delete reached source cleanup")
+
+        monkeypatch.setattr(
+            "agent.credential_sources.find_removal_step",
+            _unexpected_cleanup,
+        )
 
         # Global fallback rows are read-only to a named profile.
         removed = self.client.delete(
             "/api/credentials/pool/custom%3Ashared/1?profile=hk-worker"
         )
         assert removed.status_code == 404
+        assert cleanup_called is False
         assert not (profile_home / "auth.json").exists()
 
         added = self.client.post(

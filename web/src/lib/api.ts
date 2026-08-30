@@ -95,6 +95,7 @@ const PROFILE_SCOPED_PREFIXES = [
   // cancellation, and disconnect must all follow the selected management
   // profile rather than silently targeting the dashboard process's profile.
   "/api/providers/oauth",
+  "/api/credentials/pool",
   "/api/model/info",
   "/api/model/set",
   "/api/model/auxiliary",
@@ -1687,6 +1688,7 @@ export interface CredentialPoolEntry {
   request_count: number;
   token_preview: string;
   has_refresh: boolean;
+  inherited: boolean;
 }
 
 export interface CredentialPoolProvider {

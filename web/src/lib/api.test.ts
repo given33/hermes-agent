@@ -201,6 +201,25 @@ describe("api OAuth helpers", () => {
   });
 });
 
+describe("api credential pool helpers", () => {
+  it("keeps every operation on the selected management profile", async () => {
+    vi.stubGlobal("window", {});
+    const fetchMock = jsonFetchMock({ providers: [] });
+    vi.stubGlobal("fetch", fetchMock);
+    setManagementProfile("worker");
+
+    await api.getCredentialPool();
+    await api.addCredentialPoolEntry("openrouter", "sk-test", "worker key");
+    await api.removeCredentialPoolEntry("custom:worker", 2);
+
+    expect(fetchMock.mock.calls.map(([url]) => url)).toEqual([
+      "/api/credentials/pool?profile=worker",
+      "/api/credentials/pool?profile=worker",
+      "/api/credentials/pool/custom%3Aworker/2?profile=worker",
+    ]);
+  });
+});
+
 describe("api.logout", () => {
   it("keeps reverse-proxy base paths when returning to login", async () => {
     const assign = vi.fn();

@@ -1579,6 +1579,8 @@ def _save_provider_state_to_source(
     provider_id: str,
     state: Dict[str, Any],
     source_path: Optional[Path],
+    *,
+    set_active: bool = True,
 ) -> None:
     """Persist provider state back to the auth store it was read from."""
     active_path = _auth_file_path()
@@ -1589,7 +1591,12 @@ def _save_provider_state_to_source(
     except Exception:
         same_store = source_path == active_path
     if same_store:
-        _save_provider_state(auth_store, provider_id, state)
+        _store_provider_state(
+            auth_store,
+            provider_id,
+            state,
+            set_active=set_active,
+        )
         _save_auth_store(auth_store)
         return
 
@@ -1597,7 +1604,7 @@ def _save_provider_state_to_source(
         provider_id,
         state,
         source_path,
-        set_active=True,
+        set_active=set_active,
     )
 
 
@@ -1687,6 +1694,51 @@ def is_runtime_provider_routable(provider_id: str) -> bool:
     return True
 
 
+@dataclass(frozen=True)
+class CredentialPoolSlice:
+    """One provider's pool rows together with their owning auth store."""
+
+    entries: List[Dict[str, Any]]
+    source_path: Path
+    inherited: bool = False
+
+
+def read_credential_pool_with_source(provider_id: str) -> CredentialPoolSlice:
+    """Return one provider slice with explicit local/global provenance.
+
+    A named profile may consume global-root rows, but the source marker keeps
+    callers from treating that effective fallback view as profile-owned data.
+    """
+    auth_store = _load_auth_store()
+    pool = auth_store.get("credential_pool")
+    if not isinstance(pool, dict):
+        pool = {}
+
+    provider_entries = pool.get(provider_id)
+    if isinstance(provider_entries, list) and provider_entries:
+        return CredentialPoolSlice(
+            entries=list(provider_entries),
+            source_path=_auth_file_path(),
+        )
+
+    global_path = _global_auth_file_path()
+    global_store = _load_global_auth_store()
+    maybe_global_pool = global_store.get("credential_pool") if global_store else None
+    global_entries = (
+        maybe_global_pool.get(provider_id)
+        if isinstance(maybe_global_pool, dict)
+        else None
+    )
+    if global_path is not None and isinstance(global_entries, list) and global_entries:
+        return CredentialPoolSlice(
+            entries=list(global_entries),
+            source_path=global_path,
+            inherited=True,
+        )
+
+    return CredentialPoolSlice(entries=[], source_path=_auth_file_path())
+
+
 def read_credential_pool(provider_id: Optional[str] = None) -> Dict[str, Any]:
     """Return the persisted credential pool, or one provider slice.
 
@@ -1703,6 +1755,9 @@ def read_credential_pool(provider_id: Optional[str] = None) -> Dict[str, Any]:
     Writes always go to the profile (``write_credential_pool`` is unchanged).
     See issue #18594 follow-up.
     """
+    if provider_id is not None:
+        return read_credential_pool_with_source(provider_id).entries
+
     auth_store = _load_auth_store()
     pool = auth_store.get("credential_pool")
     if not isinstance(pool, dict):
@@ -1714,24 +1769,16 @@ def read_credential_pool(provider_id: Optional[str] = None) -> Dict[str, Any]:
     if isinstance(maybe_global_pool, dict):
         global_pool = maybe_global_pool
 
-    if provider_id is None:
-        merged = dict(pool)
-        for gp_key, gp_entries in global_pool.items():
-            if not isinstance(gp_entries, list) or not gp_entries:
-                continue
-            # Per-provider shadowing: profile wins whenever it has ANY entries.
-            existing = merged.get(gp_key)
-            if isinstance(existing, list) and existing:
-                continue
-            merged[gp_key] = list(gp_entries)
-        return merged
-
-    provider_entries = pool.get(provider_id)
-    if isinstance(provider_entries, list) and provider_entries:
-        return list(provider_entries)
-    # Profile has no entries for this provider — fall back to global.
-    global_entries = global_pool.get(provider_id)
-    return list(global_entries) if isinstance(global_entries, list) else []
+    merged = dict(pool)
+    for gp_key, gp_entries in global_pool.items():
+        if not isinstance(gp_entries, list) or not gp_entries:
+            continue
+        # Per-provider shadowing: profile wins whenever it has ANY entries.
+        existing = merged.get(gp_key)
+        if isinstance(existing, list) and existing:
+            continue
+        merged[gp_key] = list(gp_entries)
+    return merged
 
 
 _POOL_STATUS_FIELDS = (
@@ -1806,6 +1853,7 @@ def write_credential_pool(
     entries: List[Dict[str, Any]],
     *,
     removed_ids: Optional[Iterable[str]] = None,
+    target_path: Optional[Path] = None,
 ) -> Path:
     """Persist one provider's credential pool under auth.json.
 
@@ -1826,8 +1874,8 @@ def write_credential_pool(
     merge does not resurrect them from the on-disk copy.
     """
     removed = {rid for rid in (removed_ids or ()) if rid}
-    with _auth_store_lock():
-        auth_store = _load_auth_store()
+    with _auth_store_lock(target_path=target_path):
+        auth_store = _load_auth_store(target_path)
         pool = auth_store.get("credential_pool")
         if not isinstance(pool, dict):
             pool = {}
@@ -1865,7 +1913,7 @@ def write_credential_pool(
                 continue
             merged.append(sanitize_borrowed_credential_payload(disk_entry, provider_id))
         pool[provider_id] = merged
-        return _save_auth_store(auth_store)
+        return _save_auth_store(auth_store, target_path=target_path)
 
 
 def suppress_credential_source(provider_id: str, source: str) -> None:

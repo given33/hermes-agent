@@ -1183,10 +1183,13 @@ export default function SystemPage() {
                     <span className="text-sm font-medium">{entry.label}</span>
                     <span className="font-mono text-xs text-muted-foreground">{entry.token_preview}</span>
                     <Badge tone="outline">{entry.auth_type}</Badge>
+                    {entry.inherited && <Badge tone="outline">Inherited</Badge>}
                     {entry.last_status && <Badge tone="secondary">{entry.last_status}</Badge>}
-                    <Button ghost size="icon" className="ml-auto text-destructive" aria-label="Remove credential" onClick={() => credDelete.requestDelete(`${prov.provider}|${entry.index}`)}>
-                      <Trash2 />
-                    </Button>
+                    {!entry.inherited && (
+                      <Button ghost size="icon" className="ml-auto text-destructive" aria-label="Remove credential" onClick={() => credDelete.requestDelete(`${prov.provider}|${entry.index}`)}>
+                        <Trash2 />
+                      </Button>
+                    )}
                   </div>
                 ))}
               </div>
