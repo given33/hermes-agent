@@ -83,7 +83,8 @@ test.skipIf(process.platform === 'win32')('loadOrCreateInstallationId replaces a
     )
     assert.equal(fs.lstatSync(filePath).isSymbolicLink(), false)
     assert.equal(JSON.parse(fs.readFileSync(target, 'utf8')).installationId, ID_B)
-  }))
+  })
+)
 
 test('loadOrCreateInstallationId replaces a malformed destination without a repair lock', () =>
   withTempDir(directory => {

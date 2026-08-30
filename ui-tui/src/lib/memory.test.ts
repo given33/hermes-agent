@@ -60,19 +60,23 @@ describe('performHeapDump auto opt-in gate (#21767)', () => {
     expect(files.some(f => f.endsWith('.heapsnapshot'))).toBe(false)
   })
 
-  it('writes both diagnostics and snapshot for auto-high when HERMES_AUTO_HEAPDUMP=1', { timeout: 30_000 }, async () => {
-    process.env.HERMES_AUTO_HEAPDUMP = '1'
+  it(
+    'writes both diagnostics and snapshot for auto-high when HERMES_AUTO_HEAPDUMP=1',
+    { timeout: 30_000 },
+    async () => {
+      process.env.HERMES_AUTO_HEAPDUMP = '1'
 
-    const result = await performHeapDump('auto-high')
+      const result = await performHeapDump('auto-high')
 
-    expect(result.success).toBe(true)
-    expect(result.suppressed).toBeUndefined()
-    expect(result.diagPath).toBeDefined()
-    expect(result.heapPath).toBeDefined()
+      expect(result.success).toBe(true)
+      expect(result.suppressed).toBeUndefined()
+      expect(result.diagPath).toBeDefined()
+      expect(result.heapPath).toBeDefined()
 
-    const files = readdirSync(dir)
-    expect(files.some(f => f.endsWith('.heapsnapshot'))).toBe(true)
-  })
+      const files = readdirSync(dir)
+      expect(files.some(f => f.endsWith('.heapsnapshot'))).toBe(true)
+    }
+  )
 
   it('accepts truthy spellings (true|yes|on, case-insensitive) as opt-in', { timeout: 30_000 }, async () => {
     for (const value of ['true', 'YES', 'On']) {

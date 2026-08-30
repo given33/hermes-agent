@@ -238,17 +238,14 @@ describe('hintCursorCell', () => {
       ['#ff2d95', '#ffffff'], // accent chip ⇒ light ink
       ['#f5f5f5', '#000000'] // near-white chip ⇒ dark ink
     ]
+
     for (const [tone, ink] of cases) {
-      expect(hintCursorCell('\u2328', tone)).toBe(
-        colorize(colorize('\u2328', ink, 'foreground'), tone, 'background')
-      )
+      expect(hintCursorCell('\u2328', tone)).toBe(colorize(colorize('\u2328', ink, 'foreground'), tone, 'background'))
     }
   })
 
   it('uses the hint-gray fallback for invalid hex (never garbage SGR)', () => {
-    expect(hintCursorCell(' ', 'bogus')).toBe(
-      colorize(colorize(' ', '#ffffff', 'foreground'), '#808080', 'background')
-    )
+    expect(hintCursorCell(' ', 'bogus')).toBe(colorize(colorize(' ', '#ffffff', 'foreground'), '#808080', 'background'))
   })
 })
 
